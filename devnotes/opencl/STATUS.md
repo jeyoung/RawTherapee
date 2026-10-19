@@ -3,10 +3,23 @@
 ## Handover block
 
 - Branch: `opencl` (based on `dev`)
-- Milestone: M1 — program cache (complete); next M2 — Lanczos resize
-- Last verified: 2026-10-20, cache hit/miss and invalid-cache recovery
-- Next task: M2 — first accelerated stage (Lanczos)
-- Known limitations: no stage offload yet; OpenCL only enumerates devices
+- Milestone: M2 — Lanczos resize (complete); next M3 — transform
+- Last verified: 2026-10-20, downscale and upscale parity on POCL and AMD
+- Next task: M3 — perspective/rotation/lens transform
+- Known limitations: resize performance on the RX 550 is neutral because the
+  export pipeline is still CPU dominated; stage timing is 102 ms
+
+## M2 evidence — Lanczos
+
+- `WITH_OPENCL=ON` and `WITH_OPENCL=OFF` both build.
+- POCL, 0.5x downscale: `verify.sh --stage resize` PASS, PAE 0.
+- AMD RX 550, 0.5x downscale: PASS, PAE 0.
+- AMD RX 550, 1.5x upscale: PASS, PAE 0.
+- Resize program appears in the program cache; second run uses the cached
+  binary.
+- Stage timing with `RT_OPENCL_PROFILE=1`: 102 ms for 3896x2616 -> 1944x1304
+  on the RX 550. Total export time is unchanged because other stages dominate.
+- CPU-only build still passes `verify.sh --quick`.
 
 ## M1 evidence — program cache
 

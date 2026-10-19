@@ -99,6 +99,8 @@ driver version. Override the location for tests with
 `RT_OPENCL_CACHE_DIR=/path`. Removing that directory is always safe; kernels
 are compiled again on demand.
 
+Set `RT_OPENCL_PROFILE=1` to print the time spent in each accelerated stage.
+
 Check the build:
 
 ```bash
