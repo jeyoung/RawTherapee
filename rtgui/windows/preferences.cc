@@ -35,6 +35,7 @@
 #include "rtengine/dfmanager.h"
 #include "rtengine/ffmanager.h"
 #include "rtengine/iccstore.h"
+#include "rtengine/opencl/openclengine.h"
 #include "rtengine/procparams.h"
 
 #ifdef _OPENMP
@@ -897,6 +898,53 @@ Gtk::Widget* Preferences::getPerformancePanel()
     inspectorvb->pack_start(*insphb);
     finspect->add (*inspectorvb);
     vbPerformance->pack_start (*finspect, Gtk::PACK_SHRINK, 4);
+
+    Gtk::Frame* openclFrame = Gtk::manage(new Gtk::Frame(M("PREFERENCES_OPENCL")));
+    openclFrame->set_label_align(0.025, 0.5);
+    Gtk::Box* openclVB = Gtk::manage(new Gtk::Box(Gtk::ORIENTATION_VERTICAL));
+    openclVB->set_spacing(4);
+
+    useOpenCLCB = Gtk::manage(new Gtk::CheckButton(M("PREFERENCES_OPENCL_ENABLE")));
+    useOpenCLCB->set_tooltip_text(M("PREFERENCES_OPENCL_ENABLE_TOOLTIP"));
+    openclVB->pack_start(*useOpenCLCB, Gtk::PACK_SHRINK);
+
+    Gtk::Box* openclDeviceHB = Gtk::manage(new Gtk::Box());
+    openclDeviceHB->set_spacing(4);
+    openclDeviceHB->pack_start(*Gtk::manage(new Gtk::Label(M("PREFERENCES_OPENCL_DEVICE") + ":")), Gtk::PACK_SHRINK);
+    openCLDeviceCombo = Gtk::manage(new Gtk::ComboBoxText());
+    openCLDeviceCombo->append(M("PREFERENCES_OPENCL_DEVICE_AUTO"));
+    openCLDeviceNames.clear();
+    openCLDeviceNames.emplace_back(M("PREFERENCES_OPENCL_DEVICE_AUTO"));
+    for (const auto& device : rtengine::opencl::devices()) {
+        const Glib::ustring label = device.name + " (" + device.vendor + ")";
+        openCLDeviceCombo->append(label);
+        openCLDeviceNames.push_back(device.name);
+    }
+    openCLDeviceCombo->set_active(0);
+    openclDeviceHB->pack_start(*openCLDeviceCombo, Gtk::PACK_EXPAND_WIDGET);
+    openclVB->pack_start(*openclDeviceHB, Gtk::PACK_SHRINK);
+
+    Gtk::Box* openclModeHB = Gtk::manage(new Gtk::Box());
+    openclModeHB->set_spacing(4);
+    openclModeHB->pack_start(*Gtk::manage(new Gtk::Label(M("PREFERENCES_OPENCL_MODE") + ":")), Gtk::PACK_SHRINK);
+    openCLModeCombo = Gtk::manage(new Gtk::ComboBoxText());
+    openCLModeCombo->append(M("PREFERENCES_OPENCL_MODE_EXPORT"));
+    openCLModeCombo->append(M("PREFERENCES_OPENCL_MODE_ALL"));
+    openCLModeCombo->set_active(0);
+    openclModeHB->pack_start(*openCLModeCombo, Gtk::PACK_EXPAND_WIDGET);
+    openclVB->pack_start(*openclModeHB, Gtk::PACK_SHRINK);
+
+    openCLStatusLabel = Gtk::manage(new Gtk::Label(rtengine::opencl::statusText(), Gtk::ALIGN_START));
+    openCLStatusLabel->set_line_wrap(true);
+    openclVB->pack_start(*openCLStatusLabel, Gtk::PACK_SHRINK);
+
+    openclFrame->add(*openclVB);
+    vbPerformance->pack_start(*openclFrame, Gtk::PACK_SHRINK, 4);
+
+    const bool openclAvailable = rtengine::opencl::available();
+    useOpenCLCB->set_sensitive(openclAvailable);
+    openCLModeCombo->set_sensitive(openclAvailable);
+    openCLDeviceCombo->set_sensitive(openclAvailable);
 
     Gtk::Frame* threadsFrame = Gtk::manage ( new Gtk::Frame (M ("PREFERENCES_PERFORMANCE_THREADS")) );
     threadsFrame->set_label_align(0.025, 0.5);
@@ -2076,6 +2124,15 @@ void Preferences::storePreferences()
     moptions.rgbDenoiseThreadLimit = threadsSpinBtn->get_value_as_int();
     moptions.clutCacheSize = clutCacheSizeSB->get_value_as_int();
     moptions.measure = measureCB->get_active();
+    moptions.rtSettings.useOpenCL = useOpenCLCB->get_active();
+    moptions.rtSettings.openCLMode = openCLModeCombo->get_active_row_number() == 1 ? 1 : 0;
+
+    const int openCLDeviceRow = openCLDeviceCombo->get_active_row_number();
+    moptions.rtSettings.openCLDevice =
+        openCLDeviceRow > 0
+            && static_cast<size_t>(openCLDeviceRow) < openCLDeviceNames.size()
+            ? openCLDeviceNames[openCLDeviceRow]
+            : Glib::ustring();
     moptions.chunkSizeAMAZE = chunkSizeAMSB->get_value_as_int();
     moptions.chunkSizeCA = chunkSizeCASB->get_value_as_int();
     moptions.chunkSizeRCD = chunkSizeRCDSB->get_value_as_int();
@@ -2301,6 +2358,19 @@ void Preferences::fillPreferences()
     threadsSpinBtn->set_value (moptions.rgbDenoiseThreadLimit);
     clutCacheSizeSB->set_value (moptions.clutCacheSize);
     measureCB->set_active (moptions.measure);
+    useOpenCLCB->set_active(moptions.rtSettings.useOpenCL);
+    openCLModeCombo->set_active(moptions.rtSettings.openCLMode == 1 ? 1 : 0);
+    openCLDeviceCombo->set_active(0);
+
+    if (!moptions.rtSettings.openCLDevice.empty()) {
+        for (size_t i = 1; i < openCLDeviceNames.size(); ++i) {
+            if (openCLDeviceNames[i].find(moptions.rtSettings.openCLDevice)
+                    != Glib::ustring::npos) {
+                openCLDeviceCombo->set_active(static_cast<int>(i));
+                break;
+            }
+        }
+    }
     chunkSizeAMSB->set_value (moptions.chunkSizeAMAZE);
     chunkSizeCASB->set_value (moptions.chunkSizeCA);
     chunkSizeRGBSB->set_value (moptions.chunkSizeRGB);

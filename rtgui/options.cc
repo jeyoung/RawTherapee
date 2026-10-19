@@ -521,6 +521,9 @@ void Options::setDefaults()
     inspectorDelay = 0;
     serializeTiffRead = true;
     measure = false;
+    rtSettings.useOpenCL = true;
+    rtSettings.openCLMode = 0;
+    rtSettings.openCLDevice.clear();
     chunkSizeAMAZE = 2;
     chunkSizeCA = 2;
     chunkSizeRCD = 2;
@@ -1464,6 +1467,18 @@ void Options::readFromFile(Glib::ustring fname)
 
                 if (keyFile.has_key("Performance", "Measure")) {
                     measure = keyFile.get_boolean("Performance", "Measure");
+                }
+
+                if (keyFile.has_key("Performance", "UseOpenCL")) {
+                    rtSettings.useOpenCL = keyFile.get_boolean("Performance", "UseOpenCL");
+                }
+
+                if (keyFile.has_key("Performance", "OpenCLMode")) {
+                    rtSettings.openCLMode = keyFile.get_integer("Performance", "OpenCLMode");
+                }
+
+                if (keyFile.has_key("Performance", "OpenCLDevice")) {
+                    rtSettings.openCLDevice = keyFile.get_string("Performance", "OpenCLDevice");
                 }
 
                 if (keyFile.has_key("Performance", "ChunkSizeAMAZE")) {
@@ -2560,6 +2575,9 @@ void Options::saveToFile(Glib::ustring fname)
         keyFile.set_integer("Performance", "PreviewDemosaicFromSidecar", prevdemo);
         keyFile.set_boolean("Performance", "SerializeTiffRead", serializeTiffRead);
         keyFile.set_integer("Performance", "Measure", measure);
+        keyFile.set_boolean("Performance", "UseOpenCL", rtSettings.useOpenCL);
+        keyFile.set_integer("Performance", "OpenCLMode", rtSettings.openCLMode);
+        keyFile.set_string("Performance", "OpenCLDevice", rtSettings.openCLDevice);
         keyFile.set_integer("Performance", "ChunkSizeAMAZE", chunkSizeAMAZE);
         keyFile.set_integer("Performance", "ChunkSizeRCD", chunkSizeRCD);
         keyFile.set_integer("Performance", "ChunkSizeRGB", chunkSizeRGB);
@@ -2958,6 +2976,10 @@ void Options::load(bool lightweight)
     #endif
 #endif
     }
+
+    // Keep the engine independent of the GUI's Options class, but let the
+    // OpenCL backend place its program cache in the configured cache folder.
+    options.rtSettings.cacheDir = cacheBaseDir;
 
     // Read the user option file (the one located somewhere in the user's home folder)
     // Those values supersets those of the global option file

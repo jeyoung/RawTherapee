@@ -32,6 +32,8 @@
 #include <cstdlib>
 #include <locale.h>
 #include "rtengine/newdelete.h"
+#include "rtengine/formats.h"
+#include "rtengine/opencl/openclengine.h"
 #include "rtengine/procparams.h"
 #include "rtengine/profilestore.h"
 #include "rtengine/rtengine.h"
@@ -259,6 +261,69 @@ int processLineParams ( int argc, char **argv )
 #if ECLIPSE_ARGS
         currParam = currParam.substr (1, currParam.length() - 2);
 #endif
+
+        if ( currParam == "--list-formats" ) {
+            for (const auto& extension : rtengine::getKnownInputExtensions()) {
+                std::cout << extension << '\n';
+            }
+            return 0;
+        }
+
+        if ( currParam == "--gpu-info" ) {
+            const auto& devices = rtengine::opencl::devices();
+            const int selected = rtengine::opencl::selectedDevice();
+            std::cout << "OpenCL: " << rtengine::opencl::statusText() << std::endl;
+
+            for (size_t i = 0; i < devices.size(); ++i) {
+                const auto& device = devices[i];
+                std::cout << "  " << (static_cast<int>(i) == selected ? "*" : " ")
+                          << " [" << i << "] " << device.name
+                          << " (" << device.version << ", "
+                          << device.globalMemory / (1024 * 1024) << " MB)"
+                          << (device.cpu ? " [CPU]" : "") << std::endl;
+            }
+
+            return 0;
+        }
+
+        if ( currParam == "--gpu-test" ) {
+            std::string report;
+
+            if (!rtengine::opencl::available()) {
+                std::cout << "OpenCL: " << rtengine::opencl::statusText() << std::endl;
+                return 2;
+            }
+
+            if (!rtengine::opencl::selfTest(report)) {
+                std::cerr << "OpenCL self-test FAILED: " << report << std::endl;
+                return 1;
+            }
+
+            std::cout << "OpenCL self-test PASSED: " << report << std::endl;
+            return 0;
+        }
+
+        if ( currParam.compare(0, 6, "--gpu=") == 0 ) {
+            const Glib::ustring mode = currParam.substr(6);
+
+            if (mode == "off") {
+                options.rtSettings.useOpenCL = false;
+            } else if (mode == "auto") {
+                options.rtSettings.useOpenCL = true;
+                options.rtSettings.openCLMode = 0;
+            } else if (mode == "all") {
+                options.rtSettings.useOpenCL = true;
+                options.rtSettings.openCLMode = 1;
+            } else {
+                std::cerr << "Error: unknown --gpu mode \"" << mode
+                          << "\" (expected off, auto or all)" << std::endl;
+                return -1;
+            }
+        }
+
+        if ( currParam.compare(0, 13, "--gpu-device=") == 0 ) {
+            options.rtSettings.openCLDevice = currParam.substr(13);
+        }
 
         if ( currParam.at (0) == '-' && currParam.size() > 1) {
             switch ( currParam.at (1) ) {
@@ -520,6 +585,11 @@ int processLineParams ( int argc, char **argv )
                     std::cout << "Options:" << std::endl;
                     std::cout << "  " << Glib::path_get_basename (argv[0]) << "[-o <output>|-O <output>] [-q] [-a] [-s|-S] [-p <one.pp3> [-p <two.pp3> ...] ] [-d] [ -j[1-100] -js<1-3> | -t[z] -b<8|16|16f|32> | -n -b<8|16> ] [-Y] [-f] -c <input>" << std::endl;
                     std::cout << std::endl;
+                    std::cout << "  --list-formats   List the supported input file extensions and exit." << std::endl;
+                    std::cout << "  --gpu-info       List the OpenCL devices and exit." << std::endl;
+                    std::cout << "  --gpu-test       Run the OpenCL self-test and exit (0 pass, 1 fail, 2 unavailable)." << std::endl;
+                    std::cout << "  --gpu=<mode>     OpenCL mode: off, auto (export only) or all (preview too)." << std::endl;
+                    std::cout << "  --gpu-device=<n> Select an OpenCL device by name substring." << std::endl;
                     std::cout << "  -c <files>       Specify one or more input files or folders." << std::endl;
                     std::cout << "                   When specifying folders, Rawtherapee will look for image file types which comply" << std::endl;
                     std::cout << "                   with the selected extensions (see also '-a')." << std::endl;
@@ -704,7 +774,7 @@ int processLineParams ( int argc, char **argv )
         isRaw = true;
         Glib::ustring ext = getExtension (inputFile);
 
-        if (ext.lowercase() == "jpg" || ext.lowercase() == "jpeg" || ext.lowercase() == "tif" || ext.lowercase() == "tiff" || ext.lowercase() == "png") {
+        if (rtengine::isRasterExtension (ext.raw())) {
             isRaw = false;
         }
 

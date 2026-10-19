@@ -198,7 +198,24 @@ option(WITH_SYSTEM_FMT "Build using system FMT library." OFF)
 option(WITH_SYSTEM_KLT "Build using system KLT library." OFF)
 option(WITH_SYSTEM_LIBRAW "Build using system LibRaw library." OFF)
 option(OPTION_OMP "Build with OpenMP support" ON)
+option(WITH_OPENCL "Build optional OpenCL acceleration" ON)
 option(WITH_SIMDE "Build with SIMD Everywhere support" OFF)
+
+# OpenCL is loaded at runtime, so only the headers are needed at build time.
+# When the headers are missing the build quietly falls back to the CPU only
+# implementation; this keeps the default build working on minimal systems.
+set(RT_HAVE_OPENCL OFF)
+if(WITH_OPENCL)
+    find_path(OPENCL_INCLUDE_DIR CL/cl.h)
+    if(OPENCL_INCLUDE_DIR)
+        set(RT_HAVE_OPENCL ON)
+        message(STATUS "OpenCL support: enabled (headers: ${OPENCL_INCLUDE_DIR})")
+    else()
+        message(STATUS "OpenCL support: disabled (CL/cl.h not found)")
+    endif()
+else()
+    message(STATUS "OpenCL support: disabled by WITH_OPENCL=OFF")
+endif()
 
 # Profiling options
 option(WITH_BENCHMARK "Build with StopWatch benchmarking" OFF)

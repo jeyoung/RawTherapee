@@ -36,6 +36,7 @@
 #include "rtlensfun.h"
 #include "metadata.h"
 #include "procparams.h"
+#include "opencl/openclengine.h"
 
 namespace rtengine
 {
@@ -123,11 +124,18 @@ int init (const Settings* s, const Glib::ustring& baseDir, const Glib::ustring& 
     fftwMutex = new MyMutex;
     delete librawMutex;
     librawMutex = new MyMutex;
+
+    // The OpenCL backend is initialised lazily, on the first request for
+    // device information or the first accelerated stage. This keeps the
+    // CPU-only path completely clear of vendor drivers.
+
     return 0;
 }
 
 void cleanup ()
 {
+    opencl::shutdown();
+
     Exiv2Metadata::cleanup();
     ProcParams::cleanup ();
     Color::cleanup ();

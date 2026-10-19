@@ -53,6 +53,11 @@ public:
     Glib::ustring   lensProfilesPath;       ///< The default directory for lens profiles
     bool            enableLibRaw;           ///< Use LibRaw to decode raw images.
 
+    bool            useOpenCL;              ///< Enable OpenCL acceleration when available.
+    int             openCLMode;             ///< 0 = export only, 1 = preview and export.
+    Glib::ustring   openCLDevice;           ///< Selected OpenCL device, empty = automatic.
+    Glib::ustring   cacheDir;               ///< Base directory for cached data such as compiled kernels.
+
     Glib::ustring   adobe;                  // filename of AdobeRGB1998 profile (default to the bundled one)
     Glib::ustring   prophoto;               // filename of Prophoto     profile (default to the bundled one)
     Glib::ustring   widegamut;              // filename of WidegamutRGB profile (default to the bundled one)

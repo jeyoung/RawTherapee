@@ -46,6 +46,7 @@ set(RTENGINESOURCEFILES
     ffmanager.cc
     filmnegativeproc.cc
     flatcurves.cc
+    formats.cc
     FTblockDN.cc
     gamutwarning.cc
     gauss.cc
@@ -122,6 +123,15 @@ set(RTENGINESOURCEFILES
     ${PROCPARAM_SRCS}
 )
 
+if(RT_HAVE_OPENCL)
+    list(APPEND RTENGINESOURCEFILES
+        opencl/openclengine.cc
+        opencl/openclloader.cc
+    )
+else()
+    list(APPEND RTENGINESOURCEFILES opencl/openclengine_stub.cc)
+endif()
+
 if(LENSFUN_HAS_LOAD_DIRECTORY)
     set_source_files_properties(
         rtlensfun.cc PROPERTIES
@@ -168,6 +178,11 @@ endif()
 
 rt_setup_target(rtengine)
 target_compile_options(rtengine PRIVATE ${RTENGINE_CXX_FLAGS})
+
+if(RT_HAVE_OPENCL)
+    target_compile_definitions(rtengine PRIVATE RT_HAVE_OPENCL CL_TARGET_OPENCL_VERSION=120)
+    target_include_directories(rtengine PRIVATE ${OPENCL_INCLUDE_DIR})
+endif()
 
 if(WITH_BENCHMARK)
     target_compile_definitions(rtengine PUBLIC "BENCHMARK")

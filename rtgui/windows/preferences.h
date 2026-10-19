@@ -195,6 +195,11 @@ class Preferences final :
     Gtk::SpinButton*  threadsSpinBtn;
     Gtk::SpinButton*  clutCacheSizeSB;
     Gtk::CheckButton* measureCB;
+    Gtk::CheckButton* useOpenCLCB;
+    Gtk::ComboBoxText* openCLModeCombo;
+    Gtk::ComboBoxText* openCLDeviceCombo;
+    Gtk::Label* openCLStatusLabel;
+    std::vector<Glib::ustring> openCLDeviceNames;
     Gtk::SpinButton*  chunkSizeAMSB;
     Gtk::SpinButton*  chunkSizeCASB;
     Gtk::SpinButton*  chunkSizeRCDSB;
