@@ -83,6 +83,16 @@ sudo apt install pocl-opencl-icd                       # CPU device for tests
 clinfo -l
 ```
 
+On AMD/Mesa, Rusticl needs to be enabled explicitly:
+
+```bash
+export RUSTICL_ENABLE=radeonsi
+```
+
+POCL and Rusticl installed together can crash inside the ICD loader. The
+backend hides POCL when a GPU ICD is present. For explicit tests, point
+`OCL_ICD_VENDORS` at a directory containing only the wanted `.icd` file.
+
 Check the build:
 
 ```bash
