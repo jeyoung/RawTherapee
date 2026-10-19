@@ -24,6 +24,9 @@
 namespace rtengine
 {
 
+class Imagefloat;
+class LabImage;
+
 namespace opencl
 {
 
@@ -34,6 +37,7 @@ struct DeviceInfo {
     std::string version;
     std::string driver;
     unsigned long long globalMemory = 0;
+    unsigned long long maxAllocation = 0;
     bool cpu = false;
 };
 
@@ -60,6 +64,12 @@ int selectedDevice();
 
 /** @brief Run a small end-to-end test, including kernel compilation. */
 bool selfTest(std::string& report);
+
+/** @brief Resize an RGB image with Lanczos, matching ImProcFunctions::Lanczos. */
+bool resizeLanczos(const Imagefloat* src, Imagefloat* dst, float scale);
+
+/** @brief Resize a Lab image with Lanczos, matching ImProcFunctions::Lanczos. */
+bool resizeLanczos(const LabImage* src, LabImage* dst, float scale);
 
 /** @brief Short human readable state, also used by --gpu-info. */
 std::string statusText();

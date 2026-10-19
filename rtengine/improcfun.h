@@ -143,6 +143,7 @@ class ImProcFunctions
     const procparams::ProcParams* params;
     double scale;
     bool multiThread;
+    bool openCLAllowed = false;
 
     void calcVignettingParams(int oW, int oH, const procparams::VignettingParams& vignetting, double &w2, double &h2, double& maxRadius, double &v, double &b, double &mul);
     static void rgb2lab(const Image8 &src, int x, int y, int w, int h, float L[], float a[], float b[], const procparams::ColorManagementParams &icm, bool consider_histogram_settings, bool multithread);
@@ -202,6 +203,10 @@ enum class BlurType {
         return !(needsCA() || needsDistortion() || needsRotation() || needsPerspective() || needsLCP() || needsLensfun() || needsMetadata()) && (needsVignetting() || needsPCVignetting() || needsGradient());
     }
     void setScale(double iscale);
+    void setOpenCLAllowed(bool allowed)
+    {
+        openCLAllowed = allowed;
+    }
 
     bool needsTransform(int oW, int oH, int rawRotationDeg, const FramesMetaData *metadata) const;
     bool needsPCVignetting() const;

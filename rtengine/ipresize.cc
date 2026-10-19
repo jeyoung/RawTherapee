@@ -23,6 +23,7 @@
 #include "color.h"
 #include "imagefloat.h"
 #include "labimage.h"
+#include "opencl/openclengine.h"
 #include "opthelper.h"
 #include "rt_math.h"
 #include "procparams.h"
@@ -706,6 +707,10 @@ static inline float Lanc (float x, float a)
 void ImProcFunctions::Lanczos (const Imagefloat* src, Imagefloat* dst, float scale)
 {
 
+    if (openCLAllowed && opencl::resizeLanczos(src, dst, scale)) {
+        return;
+    }
+
     const float delta = 1.0f / scale;
     const float a = 3.0f;
     const float sc = min (scale, 1.0f);
@@ -841,6 +846,10 @@ void ImProcFunctions::Lanczos (const Imagefloat* src, Imagefloat* dst, float sca
 
 void ImProcFunctions::Lanczos (const LabImage* src, LabImage* dst, float scale)
 {
+    if (openCLAllowed && opencl::resizeLanczos(src, dst, scale)) {
+        return;
+    }
+
     const float delta = 1.0f / scale;
     constexpr float a = 3.0f;
     const float sc = min(scale, 1.0f);

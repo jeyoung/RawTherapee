@@ -349,6 +349,8 @@ void ImProcCoordinator::updatePreviewImage(int todo, bool panningRelatedChange)
     MyMutex::MyLock processingLock(mProcessing);
 
     const auto prevdemo = App::get().options().prevdemo;
+    ipf.setOpenCLAllowed(App::get().options().rtSettings.useOpenCL
+                         && App::get().options().rtSettings.openCLMode == 1);
     bool highDetailNeeded = prevdemo == PD_Sidecar ? true : (todo & M_HIGHQUAL);
     //    printf("metwb=%s \n", params->wb.method.c_str());
 

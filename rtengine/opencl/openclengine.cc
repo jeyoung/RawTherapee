@@ -20,15 +20,22 @@
 
 #include "rtengine/opencl/openclcache.h"
 #include "rtengine/opencl/openclloader.h"
+#include "rtengine/imagefloat.h"
+#include "rtengine/labimage.h"
 #include "rtengine/settings.h"
+#include "rt_math.h"
+#include "sleef.h"
 
 #include <glibmm/miscutils.h>
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cstdio>
 #include <glib/gstdio.h>
 #include <memory>
+#include <mutex>
+#include <unordered_map>
 #include <vector>
 
 namespace rtengine
@@ -46,6 +53,10 @@ struct Backend {
     std::vector<DeviceInfo> infos;
     std::vector<cl_platform_id> platforms;
     std::vector<cl_device_id> deviceIds;
+    cl_context context = nullptr;
+    cl_command_queue queue = nullptr;
+    std::unordered_map<std::string, cl_program> programs;
+    std::mutex mutex;
     bool attempted = false;
     bool loaded = false;
     int selected = -1;
@@ -65,6 +76,65 @@ __kernel void rt_probe(__global float* values)
     values[index] = values[index] + 1.0f;
 }
 )";
+
+const char* resizeKernelSource = R"(
+__kernel void rt_resize_vertical(__global const float* src,
+                                 __global float* temp,
+                                 __global const int* first,
+                                 __global const int* last,
+                                 __global const float* weights,
+                                 const int srcWidth,
+                                 const int support)
+{
+    const int x = get_global_id(0);
+    const int y = get_global_id(1);
+    const int start = first[y];
+    const int end = last[y];
+    float sum = 0.0f;
+
+    for (int i = start; i < end; ++i) {
+        sum += weights[y * support + (i - start)] * src[i * srcWidth + x];
+    }
+
+    temp[y * srcWidth + x] = sum;
+}
+
+__kernel void rt_resize_horizontal(__global const float* temp,
+                                   __global float* dst,
+                                   __global const int* first,
+                                   __global const int* last,
+                                   __global const float* weights,
+                                   const int srcWidth,
+                                   const int dstWidth,
+                                   const int support)
+{
+    const int x = get_global_id(0);
+    const int y = get_global_id(1);
+    const int start = first[x];
+    const int end = last[x];
+    float sum = 0.0f;
+
+    for (int j = start; j < end; ++j) {
+        sum += weights[x * support + (j - start)] * temp[y * srcWidth + j];
+    }
+
+    dst[y * dstWidth + x] = sum;
+}
+)";
+
+float lanczosWeight(float x, float a)
+{
+    if (x * x < 1e-6f) {
+        return 1.0f;
+    }
+
+    if (x * x > a * a) {
+        return 0.0f;
+    }
+
+    x = static_cast<float>(RT_PI) * x;
+    return a * xsinf(x) * xsinf(x / a) / (x * x);
+}
 
 struct Cleanup {
     const Api* api = nullptr;
@@ -166,6 +236,170 @@ bool programBinary(const Api& api, cl_program program,
     binary = std::move(data);
     return true;
 }
+
+bool ensureSession(Backend& state)
+{
+    if (state.context != nullptr && state.queue != nullptr) {
+        return true;
+    }
+
+    if (!state.loaded || state.selected < 0) {
+        return false;
+    }
+
+    const cl_device_id device = state.deviceIds[state.selected];
+    cl_int error = CL_SUCCESS;
+    state.context = state.api.CreateContext(nullptr, 1, &device, nullptr,
+                                            nullptr, &error);
+
+    if (state.context == nullptr || error != CL_SUCCESS) {
+        state.context = nullptr;
+        state.error = "could not create an OpenCL context";
+        return false;
+    }
+
+    state.queue = state.api.CreateCommandQueue(state.context, device, 0, &error);
+
+    if (state.queue == nullptr || error != CL_SUCCESS) {
+        state.api.ReleaseContext(state.context);
+        state.context = nullptr;
+        state.error = "could not create an OpenCL command queue";
+        return false;
+    }
+
+    return true;
+}
+
+cl_program programFor(Backend& state, const std::string& source,
+                      const std::string& options, std::string& error)
+{
+    const DeviceInfo& info = state.infos[state.selected];
+    const std::string key = programCacheKey(source, options, info);
+    const auto found = state.programs.find(key);
+
+    if (found != state.programs.end()) {
+        return found->second;
+    }
+
+    const cl_device_id device = state.deviceIds[state.selected];
+    cl_program program = nullptr;
+    std::vector<unsigned char> binary;
+
+    if (loadProgramBinary(key, binary)) {
+        const unsigned char* pointer = binary.data();
+        size_t size = binary.size();
+        cl_int binaryStatus = CL_SUCCESS;
+        cl_int status = CL_SUCCESS;
+        program = state.api.CreateProgramWithBinary(
+            state.context, 1, &device, &size, &pointer, &binaryStatus, &status);
+
+        if (program == nullptr || status != CL_SUCCESS
+                || binaryStatus != CL_SUCCESS
+                || state.api.BuildProgram(program, 1, &device, options.c_str(),
+                                          nullptr, nullptr) != CL_SUCCESS) {
+            if (program != nullptr) {
+                state.api.ReleaseProgram(program);
+                program = nullptr;
+            }
+        }
+    }
+
+    if (program == nullptr) {
+        const char* text = source.c_str();
+        cl_int status = CL_SUCCESS;
+        program = state.api.CreateProgramWithSource(state.context, 1, &text,
+                                                    nullptr, &status);
+
+        if (program == nullptr || status != CL_SUCCESS) {
+            error = "could not create an OpenCL program";
+            return nullptr;
+        }
+
+        if (state.api.BuildProgram(program, 1, &device, options.c_str(), nullptr,
+                                   nullptr) != CL_SUCCESS) {
+            error = "kernel build failed: "
+                + programBuildLog(state.api, program, device);
+            state.api.ReleaseProgram(program);
+            return nullptr;
+        }
+
+        std::vector<unsigned char> compiled;
+
+        if (programBinary(state.api, program, compiled)) {
+            storeProgramBinary(key, compiled);
+        }
+    }
+
+    state.programs.emplace(key, program);
+    return program;
+}
+
+struct BufferSet {
+    const Api* api = nullptr;
+    std::vector<cl_mem> items;
+
+    ~BufferSet()
+    {
+        for (const cl_mem memory : items) {
+            if (memory != nullptr) {
+                api->ReleaseMemObject(memory);
+            }
+        }
+    }
+
+    cl_mem add(cl_mem memory)
+    {
+        if (memory != nullptr) {
+            items.push_back(memory);
+        }
+        return memory;
+    }
+};
+
+struct KernelSet {
+    const Api* api = nullptr;
+    std::vector<cl_kernel> items;
+
+    ~KernelSet()
+    {
+        for (const cl_kernel kernel : items) {
+            if (kernel != nullptr) {
+                api->ReleaseKernel(kernel);
+            }
+        }
+    }
+
+    cl_kernel add(cl_kernel kernel)
+    {
+        if (kernel != nullptr) {
+            items.push_back(kernel);
+        }
+        return kernel;
+    }
+};
+
+struct StageTimer {
+    const char* name = nullptr;
+    bool enabled = false;
+    std::chrono::steady_clock::time_point start =
+        std::chrono::steady_clock::now();
+
+    StageTimer(const char* stageName, bool isEnabled)
+        : name(stageName), enabled(isEnabled)
+    {
+    }
+
+    ~StageTimer()
+    {
+        if (enabled) {
+            const auto end = std::chrono::steady_clock::now();
+            const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                end - start).count();
+            std::printf("opencl %s: %lld ms\n", name,
+                        static_cast<long long>(ms));
+        }
+    }
+};
 
 #ifdef __linux__
 
@@ -358,6 +592,14 @@ bool enumerate(Backend& state)
                 info.globalMemory = memory;
             }
 
+            cl_ulong maxAllocation = 0;
+
+            if (state.api.GetDeviceInfo(device, CL_DEVICE_MAX_MEM_ALLOC_SIZE,
+                                        sizeof(maxAllocation), &maxAllocation,
+                                        nullptr) == CL_SUCCESS) {
+                info.maxAllocation = maxAllocation;
+            }
+
             if (info.name.empty()) {
                 info.name = "Unknown OpenCL device";
             }
@@ -456,11 +698,28 @@ bool ensureInit()
 void shutdown()
 {
     Backend& state = backend();
+
+    for (auto& entry : state.programs) {
+        if (entry.second != nullptr) {
+            state.api.ReleaseProgram(entry.second);
+        }
+    }
+    state.programs.clear();
+
+    if (state.queue != nullptr) {
+        state.api.ReleaseCommandQueue(state.queue);
+    }
+    if (state.context != nullptr) {
+        state.api.ReleaseContext(state.context);
+    }
+
     state.deviceIds.clear();
     state.platforms.clear();
     state.infos.clear();
     state.module.reset();
     state.api = Api();
+    state.context = nullptr;
+    state.queue = nullptr;
     state.attempted = false;
     state.loaded = false;
     state.selected = -1;
@@ -482,7 +741,11 @@ bool available()
 
 bool enabled()
 {
-    return available() && settings != nullptr && settings->useOpenCL;
+    if (settings != nullptr && !settings->useOpenCL) {
+        return false;
+    }
+
+    return available();
 }
 
 const std::vector<DeviceInfo>& devices()
@@ -495,6 +758,308 @@ int selectedDevice()
 {
     ensureInit();
     return backend().selected;
+}
+
+bool resizeLanczosPlanes(const float* const sourcePointers[3],
+                         size_t sourceRowPitch, int srcWidth, int srcHeight,
+                         float* const destPointers[3], size_t destRowPitch,
+                         int dstWidth, int dstHeight, float scale);
+
+bool resizeLanczos(const Imagefloat* src, Imagefloat* dst, float scale)
+{
+    if (src == nullptr || dst == nullptr) {
+        return false;
+    }
+
+    const float* sourcePointers[3] = {src->r(0), src->g(0), src->b(0)};
+    float* destPointers[3] = {dst->r(0), dst->g(0), dst->b(0)};
+
+    return resizeLanczosPlanes(sourcePointers, src->getRowStride(),
+                               src->getWidth(), src->getHeight(),
+                               destPointers, dst->getRowStride(),
+                               dst->getWidth(), dst->getHeight(), scale);
+}
+
+bool resizeLanczos(const LabImage* src, LabImage* dst, float scale)
+{
+    if (src == nullptr || dst == nullptr) {
+        return false;
+    }
+
+    const float* sourcePointers[3] = {src->L[0], src->a[0], src->b[0]};
+    float* destPointers[3] = {dst->L[0], dst->a[0], dst->b[0]};
+
+    return resizeLanczosPlanes(sourcePointers,
+                               static_cast<size_t>(src->W) * sizeof(float),
+                               src->W, src->H,
+                               destPointers,
+                               static_cast<size_t>(dst->W) * sizeof(float),
+                               dst->W, dst->H, scale);
+}
+
+bool resizeLanczosPlanes(const float* const sourcePointers[3],
+                         size_t sourceRowPitch, int srcWidth, int srcHeight,
+                         float* const destPointers[3], size_t destRowPitch,
+                         int dstWidth, int dstHeight, float scale)
+{
+    if (!(scale > 0.0f) || srcWidth <= 0 || srcHeight <= 0
+            || dstWidth <= 0 || dstHeight <= 0) {
+        return false;
+    }
+
+    if (settings != nullptr && !settings->useOpenCL) {
+        return false;
+    }
+
+    if (!available()) {
+        return false;
+    }
+
+    Backend& state = backend();
+    std::lock_guard<std::mutex> lock(state.mutex);
+
+    if (!ensureSession(state) || state.selected < 0) {
+        return false;
+    }
+
+    StageTimer timer("resize", g_getenv("RT_OPENCL_PROFILE") != nullptr);
+
+    constexpr float a = 3.0f;
+    const float delta = 1.0f / scale;
+    const float sc = std::min(scale, 1.0f);
+    const int support = static_cast<int>(2.0f * a / sc) + 1;
+
+    if (support <= 0) {
+        return false;
+    }
+
+    std::vector<float> horizontalWeights(static_cast<size_t>(support) * dstWidth);
+    std::vector<cl_int> horizontalFirst(dstWidth);
+    std::vector<cl_int> horizontalLast(dstWidth);
+
+    for (int x = 0; x < dstWidth; ++x) {
+        const float x0 = (static_cast<float>(x) + 0.5f) * delta - 0.5f;
+        float* weights = &horizontalWeights[static_cast<size_t>(x) * support];
+        float sum = 0.0f;
+
+        horizontalFirst[x] = std::max(0, static_cast<int>(std::floor(x0 - a / sc)) + 1);
+        horizontalLast[x] = std::min(srcWidth, static_cast<int>(std::floor(x0 + a / sc)) + 1);
+
+        for (int j = horizontalFirst[x]; j < horizontalLast[x]; ++j) {
+            const int k = j - horizontalFirst[x];
+            const float z = sc * (x0 - static_cast<float>(j));
+            weights[k] = lanczosWeight(z, a);
+            sum += weights[k];
+        }
+
+        for (int k = 0; k < support; ++k) {
+            weights[k] /= sum;
+        }
+    }
+
+    std::vector<float> verticalWeights(static_cast<size_t>(support) * dstHeight);
+    std::vector<cl_int> verticalFirst(dstHeight);
+    std::vector<cl_int> verticalLast(dstHeight);
+
+    for (int y = 0; y < dstHeight; ++y) {
+        const float y0 = (static_cast<float>(y) + 0.5f) * delta - 0.5f;
+        float* weights = &verticalWeights[static_cast<size_t>(y) * support];
+        float sum = 0.0f;
+
+        verticalFirst[y] = std::max(0, static_cast<int>(std::floor(y0 - a / sc)) + 1);
+        verticalLast[y] = std::min(srcHeight, static_cast<int>(std::floor(y0 + a / sc)) + 1);
+
+        for (int i = verticalFirst[y]; i < verticalLast[y]; ++i) {
+            const int k = i - verticalFirst[y];
+            const float z = sc * (y0 - static_cast<float>(i));
+            weights[k] = lanczosWeight(z, a);
+            sum += weights[k];
+        }
+
+        for (int k = 0; k < support; ++k) {
+            weights[k] /= sum;
+        }
+    }
+
+    const size_t sourceBytes = static_cast<size_t>(srcWidth) * srcHeight * sizeof(float);
+    const size_t tempBytes = static_cast<size_t>(srcWidth) * dstHeight * sizeof(float);
+    const size_t destBytes = static_cast<size_t>(dstWidth) * dstHeight * sizeof(float);
+    const DeviceInfo& info = state.infos[state.selected];
+    const auto fits = [&info](size_t bytes) {
+        return info.maxAllocation == 0 || bytes <= info.maxAllocation;
+    };
+
+    if (!fits(sourceBytes) || !fits(tempBytes) || !fits(destBytes)) {
+        return false;
+    }
+
+    BufferSet buffers;
+    buffers.api = &state.api;
+    KernelSet kernels;
+    kernels.api = &state.api;
+
+    const auto createBuffer = [&](cl_mem_flags flags, size_t bytes,
+                                  const void* host) -> cl_mem {
+        cl_int error = CL_SUCCESS;
+        cl_mem memory = state.api.CreateBuffer(state.context, flags, bytes,
+                                               const_cast<void*>(host), &error);
+
+        if (memory == nullptr || error != CL_SUCCESS) {
+            if (memory != nullptr) {
+                state.api.ReleaseMemObject(memory);
+            }
+            return nullptr;
+        }
+
+        return buffers.add(memory);
+    };
+
+    cl_mem sourceBuffers[3] = {};
+    cl_mem tempBuffers[3] = {};
+    cl_mem destBuffers[3] = {};
+
+    const size_t sourceOrigin[3] = {0, 0, 0};
+    const size_t sourceRegion[3] = {
+        static_cast<size_t>(srcWidth) * sizeof(float),
+        static_cast<size_t>(srcHeight), 1};
+    const size_t destRegion[3] = {
+        static_cast<size_t>(dstWidth) * sizeof(float),
+        static_cast<size_t>(dstHeight), 1};
+    for (int plane = 0; plane < 3; ++plane) {
+        sourceBuffers[plane] = createBuffer(CL_MEM_READ_ONLY, sourceBytes, nullptr);
+        tempBuffers[plane] = createBuffer(CL_MEM_READ_WRITE, tempBytes, nullptr);
+        destBuffers[plane] = createBuffer(CL_MEM_WRITE_ONLY, destBytes, nullptr);
+
+        if (sourceBuffers[plane] == nullptr || tempBuffers[plane] == nullptr
+                || destBuffers[plane] == nullptr) {
+            return false;
+        }
+
+        if (state.api.EnqueueWriteBufferRect(
+                state.queue, sourceBuffers[plane], CL_TRUE, sourceOrigin,
+                sourceOrigin, sourceRegion, 0, 0, sourceRowPitch, 0,
+                sourcePointers[plane], 0, nullptr, nullptr) != CL_SUCCESS) {
+            return false;
+        }
+    }
+
+    cl_mem horizontalWeightBuffer = createBuffer(
+        CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+        horizontalWeights.size() * sizeof(float), horizontalWeights.data());
+    cl_mem horizontalFirstBuffer = createBuffer(
+        CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+        horizontalFirst.size() * sizeof(cl_int), horizontalFirst.data());
+    cl_mem horizontalLastBuffer = createBuffer(
+        CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+        horizontalLast.size() * sizeof(cl_int), horizontalLast.data());
+    cl_mem verticalWeightBuffer = createBuffer(
+        CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+        verticalWeights.size() * sizeof(float), verticalWeights.data());
+    cl_mem verticalFirstBuffer = createBuffer(
+        CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+        verticalFirst.size() * sizeof(cl_int), verticalFirst.data());
+    cl_mem verticalLastBuffer = createBuffer(
+        CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+        verticalLast.size() * sizeof(cl_int), verticalLast.data());
+
+    if (horizontalWeightBuffer == nullptr || horizontalFirstBuffer == nullptr
+            || horizontalLastBuffer == nullptr || verticalWeightBuffer == nullptr
+            || verticalFirstBuffer == nullptr || verticalLastBuffer == nullptr) {
+        return false;
+    }
+
+    std::string error;
+    cl_program program = programFor(state, resizeKernelSource, "-cl-std=CL1.2",
+                                    error);
+
+    if (program == nullptr) {
+        return false;
+    }
+
+    cl_int status = CL_SUCCESS;
+    cl_kernel vertical = kernels.add(
+        state.api.CreateKernel(program, "rt_resize_vertical", &status));
+
+    if (vertical == nullptr || status != CL_SUCCESS) {
+        return false;
+    }
+
+    cl_kernel horizontal = kernels.add(
+        state.api.CreateKernel(program, "rt_resize_horizontal", &status));
+
+    if (horizontal == nullptr || status != CL_SUCCESS) {
+        return false;
+    }
+
+    const cl_int sourceWidthArg = srcWidth;
+    const cl_int destWidthArg = dstWidth;
+    const cl_int supportArg = support;
+
+    for (int plane = 0; plane < 3; ++plane) {
+        status = CL_SUCCESS;
+        status |= state.api.SetKernelArg(vertical, 0, sizeof(cl_mem), &sourceBuffers[plane]);
+        status |= state.api.SetKernelArg(vertical, 1, sizeof(cl_mem), &tempBuffers[plane]);
+        status |= state.api.SetKernelArg(vertical, 2, sizeof(cl_mem), &verticalFirstBuffer);
+        status |= state.api.SetKernelArg(vertical, 3, sizeof(cl_mem), &verticalLastBuffer);
+        status |= state.api.SetKernelArg(vertical, 4, sizeof(cl_mem), &verticalWeightBuffer);
+        status |= state.api.SetKernelArg(vertical, 5, sizeof(cl_int), &sourceWidthArg);
+        status |= state.api.SetKernelArg(vertical, 6, sizeof(cl_int), &supportArg);
+
+        if (status != CL_SUCCESS) {
+            return false;
+        }
+
+        const size_t verticalGlobal[2] = {
+            static_cast<size_t>(srcWidth), static_cast<size_t>(dstHeight)};
+
+        status = state.api.EnqueueNDRangeKernel(state.queue, vertical, 2, nullptr,
+                                                verticalGlobal, nullptr, 0,
+                                                nullptr, nullptr);
+
+        if (status != CL_SUCCESS) {
+            return false;
+        }
+
+        status = CL_SUCCESS;
+        status |= state.api.SetKernelArg(horizontal, 0, sizeof(cl_mem), &tempBuffers[plane]);
+        status |= state.api.SetKernelArg(horizontal, 1, sizeof(cl_mem), &destBuffers[plane]);
+        status |= state.api.SetKernelArg(horizontal, 2, sizeof(cl_mem), &horizontalFirstBuffer);
+        status |= state.api.SetKernelArg(horizontal, 3, sizeof(cl_mem), &horizontalLastBuffer);
+        status |= state.api.SetKernelArg(horizontal, 4, sizeof(cl_mem), &horizontalWeightBuffer);
+        status |= state.api.SetKernelArg(horizontal, 5, sizeof(cl_int), &sourceWidthArg);
+        status |= state.api.SetKernelArg(horizontal, 6, sizeof(cl_int), &destWidthArg);
+        status |= state.api.SetKernelArg(horizontal, 7, sizeof(cl_int), &supportArg);
+
+        if (status != CL_SUCCESS) {
+            return false;
+        }
+
+        const size_t horizontalGlobal[2] = {
+            static_cast<size_t>(dstWidth), static_cast<size_t>(dstHeight)};
+
+        status = state.api.EnqueueNDRangeKernel(state.queue, horizontal, 2,
+                                                nullptr, horizontalGlobal,
+                                                nullptr, 0, nullptr, nullptr);
+
+        if (status != CL_SUCCESS) {
+            return false;
+        }
+    }
+
+    if (state.api.Finish(state.queue) != CL_SUCCESS) {
+        return false;
+    }
+
+    for (int plane = 0; plane < 3; ++plane) {
+        if (state.api.EnqueueReadBufferRect(
+                state.queue, destBuffers[plane], CL_TRUE, sourceOrigin,
+                sourceOrigin, destRegion, 0, 0, destRowPitch, 0,
+                destPointers[plane], 0, nullptr, nullptr) != CL_SUCCESS) {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 bool selfTest(std::string& report)

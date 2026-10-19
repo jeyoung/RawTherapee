@@ -57,6 +57,16 @@ struct Api {
                                  const void*, cl_uint, const cl_event*, cl_event*) = nullptr;
     cl_int (*EnqueueReadBuffer)(cl_command_queue, cl_mem, cl_bool, size_t, size_t,
                                 void*, cl_uint, const cl_event*, cl_event*) = nullptr;
+    cl_int (*EnqueueWriteBufferRect)(cl_command_queue, cl_mem, cl_bool,
+                                     const size_t*, const size_t*, const size_t*,
+                                     size_t, size_t, size_t, size_t,
+                                     const void*, cl_uint, const cl_event*,
+                                     cl_event*) = nullptr;
+    cl_int (*EnqueueReadBufferRect)(cl_command_queue, cl_mem, cl_bool,
+                                    const size_t*, const size_t*, const size_t*,
+                                    size_t, size_t, size_t, size_t,
+                                    void*, cl_uint, const cl_event*,
+                                    cl_event*) = nullptr;
     cl_int (*Finish)(cl_command_queue) = nullptr;
 
     cl_program (*CreateProgramWithSource)(cl_context, cl_uint, const char**,
