@@ -61,6 +61,10 @@ struct Api {
 
     cl_program (*CreateProgramWithSource)(cl_context, cl_uint, const char**,
                                           const size_t*, cl_int*) = nullptr;
+    cl_program (*CreateProgramWithBinary)(cl_context, cl_uint, const cl_device_id*,
+                                          const size_t*, const unsigned char**,
+                                          cl_int*, cl_int*) = nullptr;
+    cl_int (*GetProgramInfo)(cl_program, cl_program_info, size_t, void*, size_t*) = nullptr;
     cl_int (*BuildProgram)(cl_program, cl_uint, const cl_device_id*, const char*,
                            void (CL_CALLBACK*)(cl_program, void*), void*) = nullptr;
     cl_int (*GetProgramBuildInfo)(cl_program, cl_device_id, cl_program_build_info,

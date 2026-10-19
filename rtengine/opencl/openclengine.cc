@@ -18,6 +18,7 @@
  */
 #include "rtengine/opencl/openclengine.h"
 
+#include "rtengine/opencl/openclcache.h"
 #include "rtengine/opencl/openclloader.h"
 #include "rtengine/settings.h"
 
@@ -120,6 +121,50 @@ std::string deviceString(const Api& api, cl_device_id device, cl_device_info par
     }
 
     return trim(std::move(value));
+}
+
+std::string programBuildLog(const Api& api, cl_program program, cl_device_id device)
+{
+    size_t size = 0;
+
+    if (api.GetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, 0,
+                                nullptr, &size) != CL_SUCCESS
+            || size == 0) {
+        return {};
+    }
+
+    std::string log(size, '\0');
+
+    if (api.GetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, size,
+                                &log[0], nullptr) != CL_SUCCESS) {
+        return {};
+    }
+
+    return trim(std::move(log));
+}
+
+bool programBinary(const Api& api, cl_program program,
+                   std::vector<unsigned char>& binary)
+{
+    binary.clear();
+    size_t size = 0;
+
+    if (api.GetProgramInfo(program, CL_PROGRAM_BINARY_SIZES, sizeof(size),
+                           &size, nullptr) != CL_SUCCESS
+            || size == 0) {
+        return false;
+    }
+
+    std::vector<unsigned char> data(size);
+    unsigned char* pointer = data.data();
+
+    if (api.GetProgramInfo(program, CL_PROGRAM_BINARIES, sizeof(pointer),
+                           &pointer, nullptr) != CL_SUCCESS) {
+        return false;
+    }
+
+    binary = std::move(data);
+    return true;
 }
 
 #ifdef __linux__
@@ -503,33 +548,60 @@ bool selfTest(std::string& report)
         return false;
     }
 
-    const char* source = probeKernelSource;
-    cleanup.program = state.api.CreateProgramWithSource(cleanup.context, 1,
-                                                        &source, nullptr,
-                                                        &error);
+    const char* options = "-cl-std=CL1.2";
+    const DeviceInfo& deviceInfo = state.infos[index];
+    const std::string cacheKey = programCacheKey(probeKernelSource, options,
+                                                 deviceInfo);
+    std::vector<unsigned char> cachedBinary;
+    bool fromCache = loadProgramBinary(cacheKey, cachedBinary);
 
-    if (!cleanup.program || error != CL_SUCCESS) {
-        report = "could not create the test program";
-        return false;
+    if (fromCache) {
+        const unsigned char* pointer = cachedBinary.data();
+        size_t size = cachedBinary.size();
+        cl_int binaryStatus = CL_SUCCESS;
+        cleanup.program = state.api.CreateProgramWithBinary(
+            cleanup.context, 1, &device, &size, &pointer, &binaryStatus,
+            &error);
+
+        if (!cleanup.program || error != CL_SUCCESS
+                || binaryStatus != CL_SUCCESS) {
+            if (cleanup.program) {
+                state.api.ReleaseProgram(cleanup.program);
+                cleanup.program = nullptr;
+            }
+            fromCache = false;
+        } else if (state.api.BuildProgram(cleanup.program, 1, &device, options,
+                                          nullptr, nullptr) != CL_SUCCESS) {
+            state.api.ReleaseProgram(cleanup.program);
+            cleanup.program = nullptr;
+            fromCache = false;
+        }
     }
 
-    const char* options = "-cl-std=CL1.2";
-    error = state.api.BuildProgram(cleanup.program, 1, &device, options,
-                                   nullptr, nullptr);
+    if (!fromCache) {
+        const char* source = probeKernelSource;
+        cleanup.program = state.api.CreateProgramWithSource(
+            cleanup.context, 1, &source, nullptr, &error);
 
-    if (error != CL_SUCCESS) {
-        size_t logSize = 0;
-        state.api.GetProgramBuildInfo(cleanup.program, device,
-                                      CL_PROGRAM_BUILD_LOG, 0, nullptr,
-                                      &logSize);
-        std::string log(logSize, '\0');
-        if (logSize > 0) {
-            state.api.GetProgramBuildInfo(cleanup.program, device,
-                                          CL_PROGRAM_BUILD_LOG, logSize,
-                                          &log[0], nullptr);
+        if (!cleanup.program || error != CL_SUCCESS) {
+            report = "could not create the test program";
+            return false;
         }
-        report = "kernel build failed: " + trim(log);
-        return false;
+
+        error = state.api.BuildProgram(cleanup.program, 1, &device, options,
+                                       nullptr, nullptr);
+
+        if (error != CL_SUCCESS) {
+            report = "kernel build failed: "
+                + programBuildLog(state.api, cleanup.program, device);
+            return false;
+        }
+
+        std::vector<unsigned char> binary;
+
+        if (programBinary(state.api, cleanup.program, binary)) {
+            storeProgramBinary(cacheKey, binary);
+        }
     }
 
     cleanup.kernel = state.api.CreateKernel(cleanup.program, "rt_probe", &error);
@@ -570,7 +642,8 @@ bool selfTest(std::string& report)
         }
     }
 
-    report = "buffer round-trip and kernel compilation succeeded on "
+    report = std::string("buffer round-trip and kernel compilation succeeded ")
+        + (fromCache ? "(cached)" : "(compiled)") + " on "
         + state.infos[index].name;
     return true;
 }

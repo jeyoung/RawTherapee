@@ -125,6 +125,7 @@ set(RTENGINESOURCEFILES
 
 if(RT_HAVE_OPENCL)
     list(APPEND RTENGINESOURCEFILES
+        opencl/openclcache.cc
         opencl/openclengine.cc
         opencl/openclloader.cc
     )
