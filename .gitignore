@@ -22,6 +22,8 @@ install_manifest.txt
 build*
 cmake-build*
 Build*
+!tools/build-rt.sh
+!devnotes/build.md
 Debug
 RelWithDebInfo
 MinSizeRel
