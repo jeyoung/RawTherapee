@@ -54,3 +54,15 @@ Decision: the CPU path and `--gpu=off` must produce byte-identical output to a
 
 Consequences: no refactoring of CPU algorithms while porting them; GPU paths
 are additive and gated by tests.
+
+## D006 — Cache compiled program binaries
+
+Date: 2026-10-20
+
+Decision: cache OpenCL program binaries under the configured cache directory,
+keyed by kernel source, build options, device name, driver and device version.
+A corrupt or unreadable cache is ignored and the program is compiled again.
+
+Consequences: first use on a machine or after a driver update pays the
+compilation cost; later runs are fast. The cache is an optimisation only and
+must never fail the application.

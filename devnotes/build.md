@@ -93,6 +93,12 @@ POCL and Rusticl installed together can crash inside the ICD loader. The
 backend hides POCL when a GPU ICD is present. For explicit tests, point
 `OCL_ICD_VENDORS` at a directory containing only the wanted `.icd` file.
 
+Compiled kernels are cached in the RawTherapee cache directory, under
+`opencl/`. The cache key covers the kernel source, build options, device and
+driver version. Override the location for tests with
+`RT_OPENCL_CACHE_DIR=/path`. Removing that directory is always safe; kernels
+are compiled again on demand.
+
 Check the build:
 
 ```bash

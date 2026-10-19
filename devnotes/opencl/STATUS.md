@@ -3,10 +3,20 @@
 ## Handover block
 
 - Branch: `opencl` (based on `dev`)
-- Milestone: M0 — build plumbing and format registry (complete)
-- Last verified: 2026-10-20, CPU and OpenCL builds, POCL and AMD RX 550
-- Next task: M1 — program cache and the first accelerated stage (Lanczos)
+- Milestone: M1 — program cache (complete); next M2 — Lanczos resize
+- Last verified: 2026-10-20, cache hit/miss and invalid-cache recovery
+- Next task: M2 — first accelerated stage (Lanczos)
 - Known limitations: no stage offload yet; OpenCL only enumerates devices
+
+## M1 evidence — program cache
+
+- Fresh POCL cache: `--gpu-test` reports `(compiled)`; cache file created.
+- Second POCL run: reports `(cached)`.
+- Fresh AMD RX 550 cache: `(compiled)`, second run `(cached)`.
+- Corrupt cache file: ignored, kernel recompiled and cache rewritten.
+- Unwritable cache directory (`/proc/...`): kernel still compiles, no crash.
+- Cache key includes source, options, device and driver/version, so driver
+  updates invalidate it automatically.
 
 ## M0 evidence
 
