@@ -1,0 +1,7 @@
+[Resize]
+Enabled=true
+Scale=0.5
+AppliesTo=Full image
+Method=Lanczos
+DataSpecified=0
+AllowUpscaling=true

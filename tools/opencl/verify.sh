@@ -25,6 +25,7 @@ readonly PAE_LIMIT="${RT_PAE_LIMIT:-0.0000165}"   # 1 LSB at 16-bit
 readonly THREADS="${RT_VERIFY_THREADS:-1}"
 
 mode=""
+stage_name=""
 cli=""
 compare_cmd=()
 
@@ -77,20 +78,26 @@ compare_images() {
 run_pair() {
     local label="$1"
     local input="$2"
+    local profile="${3:-}"
     local outdir
     outdir="$(mktemp -d "${TMPDIR:-/tmp}/rtverify.XXXXXX")"
 
     local off="$outdir/off.tif"
     local auto="$outdir/auto.tif"
+    local -a profileArg=()
 
-    if ! OMP_NUM_THREADS="$THREADS" "$cli" --gpu=off -o "$off" -t -b16 -Y -c "$input" \
+    if [ -n "$profile" ]; then
+        profileArg=(-p "$profile")
+    fi
+
+    if ! OMP_NUM_THREADS="$THREADS" "$cli" --gpu=off "${profileArg[@]}" -o "$off" -t -b16 -Y -c "$input" \
             >"$outdir/off.log" 2>&1; then
         printf 'FAIL\t%s\tload or export failed (gpu=off)\n' "$label"
         rm -rf "$outdir"
         return 1
     fi
 
-    if ! OMP_NUM_THREADS="$THREADS" "$cli" --gpu=auto -o "$auto" -t -b16 -Y -c "$input" \
+    if ! OMP_NUM_THREADS="$THREADS" "$cli" --gpu=auto "${profileArg[@]}" -o "$auto" -t -b16 -Y -c "$input" \
             >"$outdir/auto.log" 2>&1; then
         printf 'FAIL\t%s\tload or export failed (gpu=auto)\n' "$label"
         rm -rf "$outdir"
@@ -120,6 +127,19 @@ quick() {
     "$cli" --gpu-info | tail -n +2 | sed 's/^/gpu\t/'
 
     run_pair "pef/neutral" "$sample"
+}
+
+stage() {
+    local name="$1"
+    local sample="$TESTDATA/colorspace_flowers.pef"
+    local profile="$ROOT/devnotes/opencl/pp3/$name.pp3"
+
+    [ -f "$sample" ] || die "missing $sample (run tools/opencl/fetch-testdata.sh)"
+    [ -f "$profile" ] || die "missing profile $profile"
+
+    printf 'binary\t%s\n' "$cli"
+    "$cli" --gpu-info | tail -n +2 | sed 's/^/gpu\t/'
+    run_pair "pef/$name" "$sample" "$profile"
 }
 
 formats() {
@@ -172,6 +192,12 @@ while [ "$#" -gt 0 ]; do
     case "$1" in
         --quick) mode="quick" ;;
         --formats) mode="formats" ;;
+        --stage)
+            [ "$#" -ge 2 ] || die "--stage needs a name"
+            mode="stage"
+            stage_name="$2"
+            shift
+            ;;
         --list-coverage) mode="coverage" ;;
         -h|--help) usage; exit 0 ;;
         *) die "unknown option '$1'" ;;
@@ -186,5 +212,6 @@ mkdir -p "$REPORT"
 case "$mode" in
     quick) quick ;;
     formats) formats ;;
+    stage) stage "$stage_name" ;;
     coverage) list_coverage ;;
 esac
