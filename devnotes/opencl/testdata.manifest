@@ -1,0 +1,10 @@
+# Test data manifest
+#
+# Tab separated. Paths are relative to $RT_TESTDATA (default ~/rt-testdata).
+# Fields: extension, file, variant, sha256, source, licence
+#
+# Only list files that may be redistributed or downloaded. Never add private
+# photographs to this file.
+#
+# The official RawTherapee sample is the baseline used by verify.sh --quick.
+pef	colorspace_flowers.pef	bayer14	ddefa07a8b48fd157b48354488b265be48a47c204d00d20d54ead8dfddd9f151	https://rawtherapee.com/shared/test_images/colorspace_flowers.pef	RawTherapee test image
