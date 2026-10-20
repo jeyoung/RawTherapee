@@ -342,12 +342,29 @@ DetailedCrop* ImProcCoordinator::createCrop(::EditDataProvider *editDataProvider
 
 
 // todo: bitmask containing desired actions, taken from changesSinceLast
-void ImProcCoordinator::updatePreviewImage(int todo, bool panningRelatedChange)
+void ImProcCoordinator::updatePreviewImage(int todo, bool panningRelatedChange,
+                                           unsigned request)
 {
     RT_PROFILE("proc::updatePreviewImage", PROCESS_IMAGE);
 
     // TODO Locallab printf
     MyMutex::MyLock processingLock(mProcessing);
+
+    // This augmentation must happen before a stale request is requeued, since
+    // the next request may only carry M_CROP and M_MONITOR.
+    if (todo == CROP && ipf.needsPCVignetting()) {
+        todo |= TRANSFORM;
+    }
+
+    if (previewRequest.load(std::memory_order_relaxed) != request) {
+        paramsUpdateMutex.lock();
+        changeSinceLast |= todo;
+        if (panningRelatedChange) {
+            changeSinceLast |= M_MONITOR;
+        }
+        paramsUpdateMutex.unlock();
+        return;
+    }
 
     const auto prevdemo = App::get().options().prevdemo;
     ipf.setOpenCLAllowed(App::get().options().rtSettings.useOpenCL
@@ -369,10 +386,6 @@ void ImProcCoordinator::updatePreviewImage(int todo, bool panningRelatedChange)
 
     if (((todo & ALL) == ALL) || (todo & M_MONITOR) || panningRelatedChange || (highDetailNeeded && prevdemo != PD_Sidecar)) {
         bwAutoR = bwAutoG = bwAutoB = -9000.f;
-
-        if (todo == CROP && ipf.needsPCVignetting()) {
-            todo |= TRANSFORM;    // Change about Crop does affect TRANSFORM
-        }
 
         RAWParams rp = params->raw;
         ColorManagementParams cmp = params->icm;
@@ -3514,6 +3527,11 @@ void ImProcCoordinator::startProcessing(int changeCode)
 {
     paramsUpdateMutex.lock();
     changeSinceLast |= changeCode;
+
+    if (changeCode & ~M_VOID) {
+        previewRequest.fetch_add(1, std::memory_order_relaxed);
+    }
+
     paramsUpdateMutex.unlock();
 
     startProcessing();
@@ -3575,6 +3593,7 @@ void ImProcCoordinator::process()
         *params = *nextParams;
         int change = changeSinceLast;
         changeSinceLast = 0;
+        const unsigned request = previewRequest.load(std::memory_order_relaxed);
 
         if (tweakOperator) {
             // TWEAKING THE PROCPARAMS FOR THE SPOT ADJUSTMENT MODE
@@ -3588,7 +3607,7 @@ void ImProcCoordinator::process()
 
         // M_VOID means no update, and is a bit higher that the rest
         if (change & (~M_VOID)) {
-            updatePreviewImage(change, panningRelatedChange);
+            updatePreviewImage(change, panningRelatedChange, request);
         }
 
         paramsUpdateMutex.lock();
@@ -3618,6 +3637,10 @@ void ImProcCoordinator::endUpdateParams(ProcEvent change)
 void ImProcCoordinator::endUpdateParams(int changeFlags)
 {
     changeSinceLast |= changeFlags;
+
+    if (changeFlags & ~M_VOID) {
+        previewRequest.fetch_add(1, std::memory_order_relaxed);
+    }
 
     paramsUpdateMutex.unlock();
     startProcessing();

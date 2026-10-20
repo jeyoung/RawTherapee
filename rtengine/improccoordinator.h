@@ -18,6 +18,7 @@
  */
 #pragma once
 
+#include <atomic>
 #include <memory>
 
 #include "array2D.h"
@@ -231,7 +232,7 @@ protected:
     /// Updates all waveforms. Returns true unless not updated.
     bool updateWaveforms();
     void setScale(int prevscale);
-    void updatePreviewImage (int todo, bool panningRelatedChange);
+    void updatePreviewImage (int todo, bool panningRelatedChange, unsigned request);
 
     MyMutex mProcessing;
     const std::unique_ptr<ProcParams> params;  // used for the rendering, can be eventually tweaked
@@ -250,6 +251,7 @@ protected:
     MyMutex updaterThreadStart;
     MyMutex paramsUpdateMutex;
     int  changeSinceLast;
+    std::atomic<unsigned> previewRequest{0};
     bool updaterRunning;
     const std::unique_ptr<ProcParams> nextParams;
     bool destroying;
