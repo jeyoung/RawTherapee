@@ -27,6 +27,11 @@ Use the same image and profile for every run. Do not commit images or sidecars.
 
 ## Current status
 
-Instrumentation only. The initial baseline has not yet been recorded; the next
-step is to run this procedure on the RX 550 host and store aggregate results in
-this file.
+Initial fit-zoom render of the 45.7 MP NEF under Xvfb, no OpenCL device:
+
+```text
+preview update: 5327 ms todo=0x10fff
+```
+
+This is a single cold-start observation, not a p50/p95 baseline. The next step
+is the repeated slider sequence on the RX 550 host.
