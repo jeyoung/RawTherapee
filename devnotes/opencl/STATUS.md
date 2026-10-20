@@ -26,6 +26,8 @@
 - CPU-only build (`WITH_OPENCL=OFF`) compiles and runs PASS.
 - AMD + Intel detection returns `radeonsi,iris`; Mesa accepts the comma-separated
   list.
+- Preferences screenshot under Xvfb shows the Rusticl field with
+  `Auto (radeonsi)` and the environment/restart hint.
 - The package recommends `mesa-opencl-icd`, so a normal install has a Rusticl
   ICD on current Debian.
 
