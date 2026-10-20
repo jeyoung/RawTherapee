@@ -162,7 +162,7 @@ void rt_capture(__global const float* oldLum,
                 const int width, const int height,
                 const int border, const int full,
                 const int iterations, const int checkStop,
-                const int radius, const int phase)
+                const int radius, const int phase, const int firstTileY)
 {
     __local float tmpI[RT_FULL * RT_FULL];
     __local float tmp[RT_FULL * RT_FULL];
@@ -174,7 +174,7 @@ void rt_capture(__global const float* oldLum,
     const int wx = get_local_id(0);
     const int wy = get_local_id(1);
     const int tileX = border + get_group_id(0) * RT_TILE;
-    const int tileY = border + get_group_id(1) * RT_TILE;
+    const int tileY = border + (firstTileY + get_group_id(1)) * RT_TILE;
     const int endX = (tileX + RT_TILE + border) >= width;
     const int endY = (tileY + RT_TILE + border) >= height;
     const int groupPhase = endY ? (endX ? 3 : 2) : (endX ? 1 : 0);
@@ -1166,6 +1166,12 @@ bool enumerate(Backend& state)
     state.selected = chooseDevice(state.infos);
     state.loaded = true;
     state.stageEnabled = settings == nullptr || settings->useOpenCL;
+
+    if (state.selected < 0) {
+        state.stageEnabled = false;
+        state.error = "No GPU OpenCL device found";
+    }
+
     return true;
 }
 
@@ -1196,7 +1202,14 @@ int chooseDevice(const std::vector<DeviceInfo>& infos)
         }
     }
 
-    return best >= 0 ? best : 0;
+    if (best >= 0) {
+        return best;
+    }
+
+    // A CPU OpenCL device is useful for testing but slower than the normal
+    // CPU path in production. Require an explicit opt-in or device selection.
+    const char* allowCpu = g_getenv("RT_OPENCL_ALLOW_CPU");
+    return g_strcmp0(allowCpu, "1") == 0 ? 0 : -1;
 }
 
 } // namespace
@@ -1313,7 +1326,8 @@ bool enabled()
         initLocked();
     }
 
-    return state.loaded && state.stageEnabled && !state.infos.empty();
+    return state.loaded && state.selected >= 0
+        && state.stageEnabled && !state.infos.empty();
 }
 
 std::vector<DeviceInfo> devices()
@@ -1971,11 +1985,7 @@ bool captureSharpening(float** luminance, const float* const* oldLuminance,
     const DeviceInfo& info = state.infos[state.selected];
 
     // The tiled kernel needs 1024 work-items and about 35 KiB of local memory.
-    // Large images also exceed the GPU watchdog on older AMD hardware.
-    constexpr unsigned long long maxPixels = 12000000ULL;
-
-    if (static_cast<unsigned long long>(width) * height > maxPixels
-            || (info.localMemory > 0 && info.localMemory < 36864ULL)
+    if ((info.localMemory > 0 && info.localMemory < 36864ULL)
             || (info.maxWorkGroup > 0 && info.maxWorkGroup < 1024ULL)) {
         return false;
     }
@@ -1985,6 +1995,27 @@ bool captureSharpening(float** luminance, const float* const* oldLuminance,
             || (info.globalMemory > 0 && 3 * planeBytes > info.globalMemory * 8 / 10)) {
         return false;
     }
+
+    const int tilesX = (width - 2 * border + tile - 1) / tile;
+    const int tilesY = (height - 2 * border + tile - 1) / tile;
+    const size_t globalX = static_cast<size_t>(tilesX) * tile;
+
+    // Bound the work per launch. Radius and iteration count are user settings;
+    // a fixed row count is not enough to keep the old AMD watchdog happy. The
+    // estimate counts both convolution passes and roughly 1.4 output pixels per
+    // work-item; the constant is empirical and deliberately conservative.
+    constexpr unsigned long long chunkBudget = 7000000000ULL;
+    const unsigned long long kernelSize2 =
+        static_cast<unsigned long long>(kernelSize) * kernelSize;
+    const unsigned long long perRow = static_cast<unsigned long long>(globalX)
+        * tile * iterations * kernelSize2 * 16ULL / 5ULL;
+
+    if (perRow > chunkBudget) {
+        return false;
+    }
+
+    const int chunkRows = static_cast<int>(
+        std::min<unsigned long long>(16, chunkBudget / perRow));
 
     std::string error;
     cl_program program = programFor(state, captureSharpeningKernelSource,
@@ -2000,9 +2031,18 @@ bool captureSharpening(float** luminance, const float* const* oldLuminance,
     StageTimer timer("capture sharpening",
                      g_getenv("RT_OPENCL_PROFILE") != nullptr);
 
-    std::vector<float> oldPlane(static_cast<size_t>(width) * height);
-    std::vector<float> blendPlane(static_cast<size_t>(width) * height);
-    std::vector<float> lumPlane(static_cast<size_t>(width) * height);
+    std::vector<float> oldPlane;
+    std::vector<float> blendPlane;
+    std::vector<float> lumPlane;
+
+    try {
+        const size_t pixels = static_cast<size_t>(width) * height;
+        oldPlane.resize(pixels);
+        blendPlane.resize(pixels);
+        lumPlane.resize(pixels);
+    } catch (const std::exception&) {
+        return false;
+    }
 
     for (int y = 0; y < height; ++y) {
         const size_t offset = static_cast<size_t>(y) * width;
@@ -2085,33 +2125,52 @@ bool captureSharpening(float** luminance, const float* const* oldLuminance,
         return false;
     }
 
-    const int tilesX = (width - 2 * border + tile - 1) / tile;
-    const int tilesY = (height - 2 * border + tile - 1) / tile;
-    const size_t global[2] = {
-        static_cast<size_t>(tilesX) * tile,
-        static_cast<size_t>(tilesY) * tile};
     const size_t local[2] = {tile, tile};
 
     // CPU tiles overlap at the right and bottom edges; run the non-overlapping
-    // tiles first, then the overlapping edge phases in the same order.
+    // tiles first, then the overlapping edge phases in the same order. Each
+    // phase is split into row chunks so one NDRange cannot trigger a watchdog.
     for (cl_int phase = 0; phase < 4; ++phase) {
         if (state.api.SetKernelArg(kernelObject, 11, sizeof(cl_int),
-                                   &phase) != CL_SUCCESS
-                || state.api.EnqueueNDRangeKernel(state.queue, kernelObject,
-                                                  2, nullptr, global, local,
-                                                  0, nullptr,
-                                                  nullptr) != CL_SUCCESS) {
+                                   &phase) != CL_SUCCESS) {
             return false;
+        }
+
+        const int firstChunk = phase >= 2
+            ? ((tilesY - 1) / chunkRows) * chunkRows : 0;
+
+        for (int firstTileY = firstChunk; firstTileY < tilesY;
+                firstTileY += chunkRows) {
+            const int rows = std::min(chunkRows, tilesY - firstTileY);
+            const cl_int firstRowArg = firstTileY;
+            const size_t global[2] = {
+                globalX,
+                static_cast<size_t>(rows) * tile};
+
+            if (state.api.SetKernelArg(kernelObject, 12, sizeof(cl_int),
+                                       &firstRowArg) != CL_SUCCESS
+                    || state.api.EnqueueNDRangeKernel(
+                            state.queue, kernelObject, 2, nullptr, global,
+                            local, 0, nullptr, nullptr) != CL_SUCCESS
+                    || state.api.Finish(state.queue) != CL_SUCCESS) {
+                state.stageEnabled = false;
+                state.error = "OpenCL device lost during capture sharpening";
+                return false;
+            }
         }
     }
 
-    if (state.api.Finish(state.queue) != CL_SUCCESS) {
-        return false;
+    if (settings != nullptr && settings->verbose && tilesY > chunkRows) {
+        std::fprintf(stderr,
+                     "OpenCL: capture sharpening split into %d row chunks\n",
+                     (tilesY + chunkRows - 1) / chunkRows);
     }
 
     if (state.api.EnqueueReadBuffer(state.queue, lumBuffer, CL_TRUE, 0,
                                     planeBytes, lumPlane.data(), 0, nullptr,
                                     nullptr) != CL_SUCCESS) {
+        state.stageEnabled = false;
+        state.error = "OpenCL readback failed during capture sharpening";
         return false;
     }
 
@@ -2135,7 +2194,12 @@ bool selfTest(std::string& report)
         return false;
     }
 
-    const int index = state.selected >= 0 ? state.selected : 0;
+    if (state.selected < 0) {
+        report = state.error.empty() ? "No GPU OpenCL device found" : state.error;
+        return false;
+    }
+
+    const int index = state.selected;
     const cl_device_id device = state.deviceIds[index];
     Cleanup cleanup;
     cleanup.api = &state.api;
@@ -2281,11 +2345,11 @@ std::string statusText()
     Backend& state = backend();
     std::lock_guard<std::recursive_mutex> lock(state.mutex);
 
-    if (!state.loaded || state.infos.empty()) {
+    if (!state.loaded || state.selected < 0 || state.infos.empty()) {
         return state.error;
     }
 
-    const int index = state.selected >= 0 ? state.selected : 0;
+    const int index = state.selected;
     const DeviceInfo& info = state.infos[index];
     char memory[32];
     std::snprintf(memory, sizeof(memory), "%llu MB",
