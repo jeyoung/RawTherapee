@@ -2,7 +2,7 @@
 
 ## Handover block
 
-- Branch: `opencl` (based on `dev`)
+- Branch: `opencl` (based on `dev` at `b2ee504c4`, 32 commits after tag 5.13)
 - Milestone: M2 — Lanczos resize (complete); next M3 — transform
 - Last verified: 2026-10-20, downscale and upscale parity on POCL and AMD
 - Next task: M3 — perspective/rotation/lens transform

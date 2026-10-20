@@ -126,6 +126,9 @@ Use `tools/build-rt.sh opencl --check-deps` to see what is missing.
 
 ## Troubleshooting
 
+- **The version reports an older release than expected**: the clone is
+  shallow, so `git describe` cannot see recent tags. Run
+  `git fetch --unshallow origin` and rebuild.
 - **OpenCL headers not found**: install `opencl-headers`, or set
   `OPENCL_INCLUDE_DIR` to the directory containing `CL/cl.h`.
 - **Build picks up old objects / wrong headers**: use `--clean`, and remove any

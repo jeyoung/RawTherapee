@@ -344,6 +344,11 @@ main() {
     root="$(repo_root)"
     [ -n "$build_root" ] || build_root="$root/build"
 
+    if [ -f "$root/.git/shallow" ]; then
+        printf 'warning: this is a shallow clone; the reported version may name an older release.\n' >&2
+        printf '         run "git fetch --unshallow origin" to restore the full history.\n' >&2
+    fi
+
     check_in_source_artifacts "$root"
 
     if [ "$do_update" -eq 1 ]; then
