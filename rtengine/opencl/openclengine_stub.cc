@@ -27,7 +27,6 @@ namespace opencl
 namespace
 {
 
-const std::vector<DeviceInfo> noDevices;
 const std::string notBuilt = "OpenCL support is not compiled in";
 
 } // namespace
@@ -55,9 +54,9 @@ bool enabled()
     return false;
 }
 
-const std::vector<DeviceInfo>& devices()
+std::vector<DeviceInfo> devices()
 {
-    return noDevices;
+    return {};
 }
 
 int selectedDevice()

@@ -29,6 +29,7 @@
 #include <glibmm/miscutils.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cstdio>
@@ -56,7 +57,8 @@ struct Backend {
     cl_context context = nullptr;
     cl_command_queue queue = nullptr;
     std::unordered_map<std::string, cl_program> programs;
-    std::mutex mutex;
+    std::recursive_mutex mutex;
+    std::atomic<bool> stageEnabled{true};
     bool attempted = false;
     bool loaded = false;
     int selected = -1;
@@ -319,6 +321,7 @@ cl_program programFor(Backend& state, const std::string& source,
                                    nullptr) != CL_SUCCESS) {
             error = "kernel build failed: "
                 + programBuildLog(state.api, program, device);
+            state.error = error;
             state.api.ReleaseProgram(program);
             return nullptr;
         }
@@ -403,15 +406,53 @@ struct StageTimer {
 
 #ifdef __linux__
 
+std::string trimText(std::string value)
+{
+    while (!value.empty()
+            && (value.back() == '\0' || value.back() == ' '
+                || value.back() == '\n' || value.back() == '\r'
+                || value.back() == '\t')) {
+        value.pop_back();
+    }
+
+    return value;
+}
+
+bool icdLibraryExists(const std::string& library)
+{
+    const std::string name = trimText(library);
+
+    if (name.empty()) {
+        return false;
+    }
+
+    if (g_path_is_absolute(name.c_str())) {
+        return g_file_test(name.c_str(), G_FILE_TEST_IS_REGULAR);
+    }
+
+    // Let the dynamic loader resolve the name, so multiarch and custom
+    // library paths work on every architecture.
+    Glib::Module module(name);
+    return static_cast<bool>(module);
+}
+
 /*
  * Some systems have both a CPU ICD (POCL) and a GPU ICD installed. With the
  * ocl-icd loader this combination can crash in the vendor dispatch table.
- * POCL is only a fallback for tests, so hide it when a GPU ICD is present.
- * An explicit OCL_ICD_VENDORS setting always wins.
+ * POCL is only a fallback for tests, so hide it when a *usable* GPU ICD is
+ * present. A GPU ICD whose library is missing is ignored, so it cannot hide
+ * a working CPU device. An explicit OCL_ICD_VENDORS setting always wins, and
+ * RT_OPENCL_VENDOR_FILTER=0 disables the workaround.
  */
 void prepareVendors()
 {
     if (g_getenv("OCL_ICD_VENDORS") != nullptr) {
+        return;
+    }
+
+    const char* filter = g_getenv("RT_OPENCL_VENDOR_FILTER");
+
+    if (filter != nullptr && std::string(filter) == "0") {
         return;
     }
 
@@ -422,8 +463,8 @@ void prepareVendors()
     }
 
     std::vector<std::string> gpuIcds;
+    std::string material;
     bool hasPocl = false;
-    bool hasGpu = false;
     const char* name = nullptr;
 
     while ((name = g_dir_read_name(directory)) != nullptr) {
@@ -437,15 +478,20 @@ void prepareVendors()
 
         if (g_file_get_contents(path, &contents, &length, nullptr)) {
             std::string text(contents, length);
-            std::transform(text.begin(), text.end(), text.begin(),
+            std::string lower = text;
+            std::transform(lower.begin(), lower.end(), lower.begin(),
                            [](unsigned char c) {
                                return static_cast<char>(std::tolower(c));
                            });
 
-            if (text.find("pocl") != std::string::npos) {
+            material += name;
+            material += ':';
+            material += text;
+            material += '\n';
+
+            if (lower.find("pocl") != std::string::npos) {
                 hasPocl = true;
-            } else {
-                hasGpu = true;
+            } else if (icdLibraryExists(text)) {
                 gpuIcds.emplace_back(path);
             }
         }
@@ -456,14 +502,27 @@ void prepareVendors()
 
     g_dir_close(directory);
 
-    if (!hasPocl || !hasGpu) {
+    if (!hasPocl || gpuIcds.empty()) {
         return;
     }
 
-    const Glib::ustring base = settings != nullptr && !settings->cacheDir.empty()
-        ? settings->cacheDir
-        : Glib::ustring(g_get_tmp_dir());
-    const Glib::ustring target = Glib::build_filename(base, "opencl-vendors");
+    Glib::ustring base;
+
+    if (settings != nullptr && !settings->cacheDir.empty()
+            && Glib::path_is_absolute(settings->cacheDir)) {
+        base = settings->cacheDir;
+    } else {
+        base = Glib::build_filename(g_get_user_cache_dir(), "rawtherapee");
+    }
+
+    gchar* checksum = g_compute_checksum_for_string(
+        G_CHECKSUM_SHA256, material.c_str(), static_cast<gssize>(material.size()));
+    const std::string suffix = checksum != nullptr
+        ? std::string(checksum).substr(0, 12) : std::string("default");
+    g_free(checksum);
+
+    const Glib::ustring target = Glib::build_filename(
+        base, "opencl-vendors-" + suffix);
 
     if (g_mkdir_with_parents(target.c_str(), 0700) != 0) {
         return;
@@ -538,7 +597,12 @@ bool openLoader(Backend& state)
 int chooseDevice(const std::vector<DeviceInfo>& infos);
 
 bool enumerate(Backend& state)
-{    cl_uint platformCount = 0;
+{
+    state.platforms.clear();
+    state.deviceIds.clear();
+    state.infos.clear();
+
+    cl_uint platformCount = 0;
 
     if (state.api.GetPlatformIDs(0, nullptr, &platformCount) != CL_SUCCESS
             || platformCount == 0) {
@@ -616,6 +680,7 @@ bool enumerate(Backend& state)
 
     state.selected = chooseDevice(state.infos);
     state.loaded = true;
+    state.stageEnabled = settings == nullptr || settings->useOpenCL;
     return true;
 }
 
@@ -651,7 +716,7 @@ int chooseDevice(const std::vector<DeviceInfo>& infos)
 
 } // namespace
 
-bool init()
+static bool initLocked()
 {
     Backend& state = backend();
 
@@ -661,6 +726,7 @@ bool init()
 
     state.attempted = true;
     state.error = "OpenCL is unavailable";
+    setProgramCacheDirectory(settings != nullptr ? settings->cacheDir.raw() : std::string());
 
     if (!openLoader(state)) {
         return false;
@@ -684,12 +750,20 @@ bool init()
     return true;
 }
 
+bool init()
+{
+    Backend& state = backend();
+    std::lock_guard<std::recursive_mutex> lock(state.mutex);
+    return initLocked();
+}
+
 bool ensureInit()
 {
     Backend& state = backend();
+    std::lock_guard<std::recursive_mutex> lock(state.mutex);
 
     if (!state.attempted) {
-        init();
+        initLocked();
     }
 
     return state.loaded;
@@ -698,6 +772,7 @@ bool ensureInit()
 void shutdown()
 {
     Backend& state = backend();
+    std::lock_guard<std::recursive_mutex> lock(state.mutex);
 
     for (auto& entry : state.programs) {
         if (entry.second != nullptr) {
@@ -728,46 +803,59 @@ void shutdown()
 
 void reconfigure()
 {
+    Backend& state = backend();
+    std::lock_guard<std::recursive_mutex> lock(state.mutex);
     shutdown();
-    init();
+    initLocked();
 }
 
 bool available()
 {
     ensureInit();
-    const Backend& state = backend();
+    Backend& state = backend();
+    std::lock_guard<std::recursive_mutex> lock(state.mutex);
     return state.loaded && !state.infos.empty();
 }
 
 bool enabled()
 {
-    if (settings != nullptr && !settings->useOpenCL) {
-        return false;
+    Backend& state = backend();
+    std::lock_guard<std::recursive_mutex> lock(state.mutex);
+
+    if (!state.attempted) {
+        initLocked();
     }
 
-    return available();
+    return state.loaded && state.stageEnabled && !state.infos.empty();
 }
 
-const std::vector<DeviceInfo>& devices()
+std::vector<DeviceInfo> devices()
 {
     ensureInit();
-    return backend().infos;
+    Backend& state = backend();
+    std::lock_guard<std::recursive_mutex> lock(state.mutex);
+    return state.infos;
 }
 
 int selectedDevice()
 {
     ensureInit();
-    return backend().selected;
+    Backend& state = backend();
+    std::lock_guard<std::recursive_mutex> lock(state.mutex);
+    return state.selected;
 }
 
-bool resizeLanczosPlanes(const float* const sourcePointers[3],
-                         size_t sourceRowPitch, int srcWidth, int srcHeight,
-                         float* const destPointers[3], size_t destRowPitch,
-                         int dstWidth, int dstHeight, float scale);
+static bool resizeLanczosPlanes(const float* const sourcePointers[3],
+                                size_t sourceRowPitch, int srcWidth, int srcHeight,
+                                float* const destPointers[3], size_t destRowPitch,
+                                int dstWidth, int dstHeight, float scale);
 
 bool resizeLanczos(const Imagefloat* src, Imagefloat* dst, float scale)
 {
-    if (src == nullptr || dst == nullptr) {
+    if (src == nullptr || dst == nullptr
+            || src->getWidth() <= 0 || src->getHeight() <= 0
+            || dst->getWidth() <= 0 || dst->getHeight() <= 0
+            || src->getRowStride() == 0 || dst->getRowStride() == 0) {
         return false;
     }
 
@@ -782,7 +870,9 @@ bool resizeLanczos(const Imagefloat* src, Imagefloat* dst, float scale)
 
 bool resizeLanczos(const LabImage* src, LabImage* dst, float scale)
 {
-    if (src == nullptr || dst == nullptr) {
+    if (src == nullptr || dst == nullptr
+            || src->W <= 0 || src->H <= 0 || dst->W <= 0 || dst->H <= 0
+            || src->L == nullptr || dst->L == nullptr) {
         return false;
     }
 
@@ -797,28 +887,25 @@ bool resizeLanczos(const LabImage* src, LabImage* dst, float scale)
                                dst->W, dst->H, scale);
 }
 
-bool resizeLanczosPlanes(const float* const sourcePointers[3],
-                         size_t sourceRowPitch, int srcWidth, int srcHeight,
-                         float* const destPointers[3], size_t destRowPitch,
-                         int dstWidth, int dstHeight, float scale)
+static bool resizeLanczosPlanes(const float* const sourcePointers[3],
+                                size_t sourceRowPitch, int srcWidth, int srcHeight,
+                                float* const destPointers[3], size_t destRowPitch,
+                                int dstWidth, int dstHeight, float scale)
 {
     if (!(scale > 0.0f) || srcWidth <= 0 || srcHeight <= 0
             || dstWidth <= 0 || dstHeight <= 0) {
         return false;
     }
 
-    if (settings != nullptr && !settings->useOpenCL) {
-        return false;
-    }
-
-    if (!available()) {
-        return false;
-    }
-
     Backend& state = backend();
-    std::lock_guard<std::mutex> lock(state.mutex);
+    std::lock_guard<std::recursive_mutex> lock(state.mutex);
 
-    if (!ensureSession(state) || state.selected < 0) {
+    if (!ensureInit() || state.infos.empty() || state.selected < 0
+            || !state.stageEnabled) {
+        return false;
+    }
+
+    if (!ensureSession(state)) {
         return false;
     }
 
@@ -890,6 +977,16 @@ bool resizeLanczosPlanes(const float* const sourcePointers[3],
     };
 
     if (!fits(sourceBytes) || !fits(tempBytes) || !fits(destBytes)) {
+        return false;
+    }
+
+    const size_t totalBytes = 3 * (sourceBytes + tempBytes + destBytes);
+    if (info.globalMemory > 0 && totalBytes > info.globalMemory * 8 / 10) {
+        if (settings != nullptr && settings->verbose) {
+            std::fprintf(stderr,
+                         "OpenCL: resize needs %zu bytes, device has %llu\n",
+                         totalBytes, info.globalMemory);
+        }
         return false;
     }
 
@@ -973,6 +1070,9 @@ bool resizeLanczosPlanes(const float* const sourcePointers[3],
                                     error);
 
     if (program == nullptr) {
+        if (settings != nullptr && settings->verbose && !error.empty()) {
+            std::fprintf(stderr, "OpenCL: %s\n", error.c_str());
+        }
         return false;
     }
 
@@ -1066,12 +1166,13 @@ bool selfTest(std::string& report)
 {
     report.clear();
 
+    Backend& state = backend();
+    std::lock_guard<std::recursive_mutex> lock(state.mutex);
+
     if (!ensureInit()) {
         report = statusText();
         return false;
     }
-
-    Backend& state = backend();
 
     const int index = state.selected >= 0 ? state.selected : 0;
     const cl_device_id device = state.deviceIds[index];
@@ -1216,7 +1317,8 @@ bool selfTest(std::string& report)
 std::string statusText()
 {
     ensureInit();
-    const Backend& state = backend();
+    Backend& state = backend();
+    std::lock_guard<std::recursive_mutex> lock(state.mutex);
 
     if (!state.loaded || state.infos.empty()) {
         return state.error;

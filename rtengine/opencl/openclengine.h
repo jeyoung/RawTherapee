@@ -57,7 +57,7 @@ bool available();
 bool enabled();
 
 /** @brief Devices discovered during the last init/reconfigure. */
-const std::vector<DeviceInfo>& devices();
+std::vector<DeviceInfo> devices();
 
 /** @brief Index of the selected device, or -1 when none is available. */
 int selectedDevice();

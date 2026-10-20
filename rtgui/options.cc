@@ -1474,7 +1474,7 @@ void Options::readFromFile(Glib::ustring fname)
                 }
 
                 if (keyFile.has_key("Performance", "OpenCLMode")) {
-                    rtSettings.openCLMode = keyFile.get_integer("Performance", "OpenCLMode");
+                    rtSettings.openCLMode = std::min(1, std::max(0, keyFile.get_integer("Performance", "OpenCLMode")));
                 }
 
                 if (keyFile.has_key("Performance", "OpenCLDevice")) {

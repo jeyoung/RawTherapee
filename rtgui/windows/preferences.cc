@@ -2483,7 +2483,10 @@ void Preferences::okPressed()
     auto& options = App::get().mut_options();
     storePreferences();
     workflowUpdate();
+    const Glib::ustring cacheDir = options.rtSettings.cacheDir;
     options.copyFrom(&moptions);
+    options.rtSettings.cacheDir = cacheDir;
+    rtengine::opencl::reconfigure();
     options.filterOutParsedExtensions();
 
     try {
@@ -2998,12 +3001,16 @@ void Preferences::onResetToDefaultClicked()
     int result = dialog.run();
 
     if (result == Gtk::RESPONSE_YES) {
+        const Glib::ustring cacheDir =
+            App::get().options().rtSettings.cacheDir;
         Options defaults;
         moptions.copyFrom(&defaults);
         fillPreferences();
         storePreferences();
 
         App::get().mut_options().copyFrom(&moptions);
+        App::get().mut_options().rtSettings.cacheDir = cacheDir;
         App::get().mut_options().save();
+        rtengine::opencl::reconfigure();
     }
 }

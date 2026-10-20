@@ -61,10 +61,7 @@ bool isRaster(const std::string& extension)
 {
     return extension == "jpg" || extension == "jpeg"
         || extension == "png" || extension == "tif" || extension == "tiff"
-#ifdef LIBJXL
-        || extension == "jxl"
-#endif
-        ;
+        || extension == "jxl";
 }
 
 } // namespace

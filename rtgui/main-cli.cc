@@ -308,15 +308,15 @@ int processLineParams ( int argc, char **argv )
 
             if (mode == "off") {
                 options.rtSettings.useOpenCL = false;
-            } else if (mode == "auto") {
+            } else if (mode == "auto" || mode == "export") {
                 options.rtSettings.useOpenCL = true;
                 options.rtSettings.openCLMode = 0;
-            } else if (mode == "all") {
+            } else if (mode == "all" || mode == "preview") {
                 options.rtSettings.useOpenCL = true;
                 options.rtSettings.openCLMode = 1;
             } else {
                 std::cerr << "Error: unknown --gpu mode \"" << mode
-                          << "\" (expected off, auto or all)" << std::endl;
+                          << "\" (expected off, export or preview; auto and all are aliases)" << std::endl;
                 return -1;
             }
         }
@@ -588,7 +588,7 @@ int processLineParams ( int argc, char **argv )
                     std::cout << "  --list-formats   List the supported input file extensions and exit." << std::endl;
                     std::cout << "  --gpu-info       List the OpenCL devices and exit." << std::endl;
                     std::cout << "  --gpu-test       Run the OpenCL self-test and exit (0 pass, 1 fail, 2 unavailable)." << std::endl;
-                    std::cout << "  --gpu=<mode>     OpenCL mode: off, auto (export only) or all (preview too)." << std::endl;
+                    std::cout << "  --gpu=<mode>     OpenCL mode: off, export or preview (auto/all are aliases)." << std::endl;
                     std::cout << "  --gpu-device=<n> Select an OpenCL device by name substring." << std::endl;
                     std::cout << "  -c <files>       Specify one or more input files or folders." << std::endl;
                     std::cout << "                   When specifying folders, Rawtherapee will look for image file types which comply" << std::endl;

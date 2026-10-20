@@ -40,6 +40,8 @@ constexpr unsigned char cacheMagic[4] = {'R', 'T', 'C', 'L'};
 constexpr std::uint32_t cacheVersion = 1;
 constexpr const char* cacheFormat = "rt-opencl-cache-v1";
 
+std::string configuredDirectory;
+
 void appendUint32(std::vector<unsigned char>& data, std::uint32_t value)
 {
     data.push_back(static_cast<unsigned char>(value & 0xff));
@@ -103,11 +105,20 @@ std::string programCacheDirectory()
         return override;
     }
 
+    if (!configuredDirectory.empty()) {
+        return configuredDirectory;
+    }
+
     if (settings != nullptr && !settings->cacheDir.empty()) {
         return Glib::build_filename(settings->cacheDir, "opencl");
     }
 
     return Glib::build_filename(g_get_user_cache_dir(), "rawtherapee", "opencl");
+}
+
+void setProgramCacheDirectory(const std::string& directory)
+{
+    configuredDirectory = directory;
 }
 
 bool loadProgramBinary(const std::string& key, std::vector<unsigned char>& binary)
@@ -164,7 +175,9 @@ bool storeProgramBinary(const std::string& key,
     contents.insert(contents.end(), binary.begin(), binary.end());
 
     const std::string path = Glib::build_filename(directory, fileNameForKey(key));
-    const std::string temporary = path + ".tmp";
+    const std::string temporary = path + "."
+        + std::to_string(g_get_monotonic_time()) + "-"
+        + std::to_string(g_random_int()) + ".tmp";
     GError* error = nullptr;
 
     if (!g_file_set_contents(temporary.c_str(),
@@ -176,8 +189,15 @@ bool storeProgramBinary(const std::string& key,
     }
 
     if (g_rename(temporary.c_str(), path.c_str()) != 0) {
-        g_remove(temporary.c_str());
-        return false;
+        // g_rename does not replace an existing file on Windows.
+        if (g_file_test(path.c_str(), G_FILE_TEST_EXISTS)) {
+            g_remove(path.c_str());
+        }
+
+        if (g_rename(temporary.c_str(), path.c_str()) != 0) {
+            g_remove(temporary.c_str());
+            return false;
+        }
     }
 
     return true;

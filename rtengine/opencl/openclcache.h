@@ -42,6 +42,9 @@ std::string programCacheKey(const std::string& source,
 /** @brief Directory containing cached program binaries. */
 std::string programCacheDirectory();
 
+/** @brief Set the configured cache directory (empty means the default). */
+void setProgramCacheDirectory(const std::string& directory);
+
 /** @brief Load a cached binary. Returns false when missing or invalid. */
 bool loadProgramBinary(const std::string& key, std::vector<unsigned char>& binary);
 
