@@ -815,7 +815,7 @@ void prepareRusticl()
 {
     const char* existing = g_getenv("RUSTICL_ENABLE");
 
-    if (existing != nullptr && !rusticlEnvInjected) {
+    if (existing != nullptr && existing[0] != '\0' && !rusticlEnvInjected) {
         return;
     }
 
@@ -864,6 +864,42 @@ bool icdLibraryExists(const std::string& library)
     return static_cast<bool>(module);
 }
 
+bool hasOpenCLGpuVendor()
+{
+    GDir* directory = g_dir_open("/sys/class/drm", 0, nullptr);
+
+    if (directory == nullptr) {
+        return false;
+    }
+
+    bool found = false;
+    const char* name = nullptr;
+
+    while (!found && (name = g_dir_read_name(directory)) != nullptr) {
+        if (!g_str_has_prefix(name, "card") || std::strchr(name, '-') != nullptr) {
+            continue;
+        }
+
+        gchar* path = g_build_filename(
+            "/sys/class/drm", name, "device", "vendor", nullptr);
+        gchar* contents = nullptr;
+        gsize length = 0;
+        const bool read = g_file_get_contents(path, &contents, &length, nullptr);
+        g_free(path);
+
+        if (!read) {
+            continue;
+        }
+
+        const std::string vendor = trimText(std::string(contents, length));
+        g_free(contents);
+        found = vendor == "0x1002" || vendor == "0x8086" || vendor == "0x10de";
+    }
+
+    g_dir_close(directory);
+    return found;
+}
+
 /*
  * Some systems have both a CPU ICD (POCL) and a GPU ICD installed. With the
  * ocl-icd loader this combination can crash in the vendor dispatch table.
@@ -881,6 +917,10 @@ void prepareVendors()
     const char* filter = g_getenv("RT_OPENCL_VENDOR_FILTER");
 
     if (filter != nullptr && std::string(filter) == "0") {
+        return;
+    }
+
+    if (!hasOpenCLGpuVendor()) {
         return;
     }
 

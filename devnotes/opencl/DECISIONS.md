@@ -85,10 +85,12 @@ Date: 2026-10-20
 
 Decision: before loading the ICD on Linux, set `RUSTICL_ENABLE` from the GPU
 vendor when the environment does not already define it. AMD systems use
-`radeonsi`, Intel systems use `iris`. A new Preferences field stores an
-explicit driver override; empty means auto-detection.
+`radeonsi`, Intel systems use `iris`, and hybrid systems use
+`radeonsi,iris`. A new Preferences field stores an explicit driver override;
+empty means auto-detection.
 
 Consequences: installing the package is enough for Mesa Rusticl to expose the
 GPU; no per-user shell or desktop-file environment is needed. An existing
 `RUSTICL_ENABLE`, for example one used for a POCL comparison, still wins. The
-setting is Linux-specific because it relies on `/sys/class/drm`.
+setting is Linux-specific because it relies on `/sys/class/drm`. Mesa 23.1
+or newer is needed for Rusticl; Debian 12's Mesa 22.3 uses Clover instead.

@@ -83,11 +83,12 @@ sudo apt install pocl-opencl-icd                       # CPU device for tests
 clinfo -l
 ```
 
-On AMD/Mesa, Rusticl needs to be enabled explicitly:
-
-```bash
-export RUSTICL_ENABLE=radeonsi
-```
+On AMD/Mesa, the application sets `RUSTICL_ENABLE=radeonsi` automatically
+before loading the ICD; Intel systems get `iris`. Leave the
+Preferences → Performance → OpenCL → Rusticl driver field empty for
+auto-detection, or enter an override. An existing `RUSTICL_ENABLE` environment
+variable takes precedence. Rusticl support in Mesa starts with Mesa 23.1;
+Debian 12 (Mesa 22.3) normally uses Clover instead.
 
 POCL and Rusticl installed together can crash inside the ICD loader. The
 backend hides POCL when a GPU ICD library is present and usable; this can

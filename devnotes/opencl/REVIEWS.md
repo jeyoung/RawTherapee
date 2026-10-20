@@ -120,6 +120,8 @@ hybrid-GPU handling that enabled only one driver.
 | Hardcoded English placeholder | Uses the translated `PREFERENCES_OPENCL_RUSTICL_AUTO` string |
 | `mesa-opencl-icd` listed twice | Removed from `Suggests`; remains in `Recommends` |
 | Uninitialised preference entry pointer | Initialised to `nullptr` |
+| Recommending Mesa could hide POCL on CPU-only hosts | POCL is filtered only when an AMD, Intel or NVIDIA DRM card is present |
+| Empty external `RUSTICL_ENABLE` disabled auto-detection | Empty is treated as unset |
 
 ## Outstanding
 

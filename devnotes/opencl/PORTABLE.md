@@ -49,13 +49,16 @@ The installed application detects the Rusticl driver before loading OpenCL:
 
 - AMD PCI vendor `0x1002` → `RUSTICL_ENABLE=radeonsi`
 - Intel PCI vendor `0x8086` → `RUSTICL_ENABLE=iris`
+- AMD plus Intel → `radeonsi,iris`
 
 `Preferences → Performance → OpenCL → Rusticl driver` overrides the detected
 value; leave it empty for automatic detection. An existing `RUSTICL_ENABLE`
 environment variable takes precedence. No shell profile or launcher wrapper is
 required after installing the package. The package recommends
 `mesa-opencl-icd` and `ocl-icd-libopencl1`; install them explicitly when using
-`--no-install-recommends`.
+`--no-install-recommends`. Rusticl needs Mesa 23.1 or newer; Debian 12's Mesa
+22.3 uses Clover instead, so automatic Rusticl setup applies on Debian 13 and
+newer.
 
 Binaries use `DT_RUNPATH=$ORIGIN/../lib/rawtherapee`; bundled libraries use
 `DT_RUNPATH=$ORIGIN`. OpenCL is loaded from the host at runtime, so the vendor
