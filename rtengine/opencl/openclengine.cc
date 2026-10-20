@@ -61,6 +61,8 @@ struct Backend {
     cl_context context = nullptr;
     cl_command_queue queue = nullptr;
     std::unordered_map<std::string, cl_program> programs;
+    std::vector<std::pair<cl_mem, size_t>> pooledBuffers;
+    size_t pooledBytes = 0;
     std::recursive_mutex mutex;
     std::atomic<bool> stageEnabled{true};
     bool attempted = false;
@@ -572,23 +574,126 @@ cl_program programFor(Backend& state, const std::string& source,
     return program;
 }
 
+constexpr size_t poolLimit = 512ULL * 1024 * 1024;
+
+size_t poolLimitFor(const Backend& state)
+{
+    if (state.selected >= 0 && state.selected < static_cast<int>(state.infos.size())
+            && state.infos[state.selected].globalMemory > 0) {
+        const size_t deviceLimit = state.infos[state.selected].globalMemory / 8;
+        return std::min(poolLimit, deviceLimit);
+    }
+
+    return poolLimit;
+}
+
+void clearPool(Backend& state)
+{
+    for (const auto& entry : state.pooledBuffers) {
+        if (entry.first != nullptr) {
+            state.api.ReleaseMemObject(entry.first);
+        }
+    }
+    state.pooledBuffers.clear();
+    state.pooledBytes = 0;
+}
+
+bool ensureBudget(Backend& state, size_t needed)
+{
+    if (state.selected < 0 || state.selected >= static_cast<int>(state.infos.size())
+            || state.infos[state.selected].globalMemory == 0) {
+        return true;
+    }
+
+    const size_t limit = state.infos[state.selected].globalMemory * 8 / 10;
+
+    if (needed + state.pooledBytes > limit) {
+        clearPool(state);
+    }
+
+    return needed <= limit;
+}
+
+cl_mem acquireBuffer(Backend& state, size_t bytes)
+{
+    for (size_t i = 0; i < state.pooledBuffers.size(); ++i) {
+        if (state.pooledBuffers[i].second == bytes) {
+            const cl_mem memory = state.pooledBuffers[i].first;
+            state.pooledBytes -= bytes;
+            state.pooledBuffers.erase(state.pooledBuffers.begin() + i);
+            return memory;
+        }
+    }
+
+    cl_int error = CL_SUCCESS;
+    cl_mem memory = state.api.CreateBuffer(
+        state.context, CL_MEM_READ_WRITE, bytes, nullptr, &error);
+
+    if (memory == nullptr || error != CL_SUCCESS) {
+        clearPool(state);
+        memory = state.api.CreateBuffer(
+            state.context, CL_MEM_READ_WRITE, bytes, nullptr, &error);
+    }
+
+    return error == CL_SUCCESS ? memory : nullptr;
+}
+
+void releaseBuffer(Backend& state, cl_mem memory, size_t bytes)
+{
+    if (memory == nullptr) {
+        return;
+    }
+
+    const size_t limit = poolLimitFor(state);
+
+    if (bytes == 0 || state.pooledBytes + bytes > limit) {
+        state.api.ReleaseMemObject(memory);
+        return;
+    }
+
+    try {
+        state.pooledBuffers.emplace_back(memory, bytes);
+        state.pooledBytes += bytes;
+    } catch (...) {
+        state.api.ReleaseMemObject(memory);
+    }
+}
+
 struct BufferSet {
+    BufferSet() = default;
+    BufferSet(const BufferSet&) = delete;
+    BufferSet& operator=(const BufferSet&) = delete;
+
+    Backend* owner = nullptr;
     const Api* api = nullptr;
-    std::vector<cl_mem> items;
+
+    struct Item {
+        cl_mem memory;
+        size_t bytes;
+        bool pooled;
+    };
+
+    std::vector<Item> items;
 
     ~BufferSet()
     {
-        for (const cl_mem memory : items) {
-            if (memory != nullptr) {
-                api->ReleaseMemObject(memory);
+        for (const Item& item : items) {
+            if (item.memory == nullptr) {
+                continue;
+            }
+
+            if (item.pooled) {
+                releaseBuffer(*owner, item.memory, item.bytes);
+            } else {
+                api->ReleaseMemObject(item.memory);
             }
         }
     }
 
-    cl_mem add(cl_mem memory)
+    cl_mem add(cl_mem memory, size_t bytes = 0, bool pooled = false)
     {
         if (memory != nullptr) {
-            items.push_back(memory);
+            items.push_back({memory, bytes, pooled});
         }
         return memory;
     }
@@ -1032,6 +1137,8 @@ void shutdown()
     }
     state.programs.clear();
 
+    clearPool(state);
+
     if (state.queue != nullptr) {
         state.api.ReleaseCommandQueue(state.queue);
     }
@@ -1232,7 +1339,8 @@ static bool resizeLanczosPlanes(const float* const sourcePointers[3],
     }
 
     const size_t totalBytes = 3 * (sourceBytes + tempBytes + destBytes);
-    if (info.globalMemory > 0 && totalBytes > info.globalMemory * 8 / 10) {
+    if (!ensureBudget(state, totalBytes)
+            || (info.globalMemory > 0 && totalBytes > info.globalMemory * 8 / 10)) {
         if (settings != nullptr && settings->verbose) {
             std::fprintf(stderr,
                          "OpenCL: resize needs %zu bytes, device has %llu\n",
@@ -1242,12 +1350,18 @@ static bool resizeLanczosPlanes(const float* const sourcePointers[3],
     }
 
     BufferSet buffers;
+    buffers.owner = &state;
     buffers.api = &state.api;
     KernelSet kernels;
     kernels.api = &state.api;
 
     const auto createBuffer = [&](cl_mem_flags flags, size_t bytes,
                                   const void* host) -> cl_mem {
+        if (host == nullptr && (flags & CL_MEM_COPY_HOST_PTR) == 0) {
+            cl_mem memory = acquireBuffer(state, bytes);
+            return buffers.add(memory, bytes, true);
+        }
+
         cl_int error = CL_SUCCESS;
         cl_mem memory = state.api.CreateBuffer(state.context, flags, bytes,
                                                const_cast<void*>(host), &error);
@@ -1449,12 +1563,14 @@ bool transformRotateScale(const Imagefloat* src, Imagefloat* dst,
     const size_t mapBytes = static_cast<size_t>(dstWidth) * dstHeight * 4 * sizeof(float);
     const DeviceInfo& info = state.infos[state.selected];
 
+    const size_t totalBytes = 3 * (sourceBytes + destBytes) + mapBytes;
+
     if ((info.maxAllocation > 0 && (sourceBytes > info.maxAllocation
                                     || destBytes > info.maxAllocation
                                     || mapBytes > info.maxAllocation))
+            || !ensureBudget(state, totalBytes)
             || (info.globalMemory > 0
-                && 3 * (sourceBytes + destBytes) + mapBytes
-                    > info.globalMemory * 8 / 10)) {
+                && totalBytes > info.globalMemory * 8 / 10)) {
         return false;
     }
 
@@ -1487,12 +1603,18 @@ bool transformRotateScale(const Imagefloat* src, Imagefloat* dst,
     }
 
     BufferSet buffers;
+    buffers.owner = &state;
     buffers.api = &state.api;
     KernelSet kernels;
     kernels.api = &state.api;
 
     const auto createBuffer = [&](cl_mem_flags flags, size_t bytes,
                                   const void* host) -> cl_mem {
+        if (host == nullptr && (flags & CL_MEM_COPY_HOST_PTR) == 0) {
+            cl_mem memory = acquireBuffer(state, bytes);
+            return buffers.add(memory, bytes, true);
+        }
+
         cl_int error = CL_SUCCESS;
         cl_mem memory = state.api.CreateBuffer(state.context, flags, bytes,
                                                const_cast<void*>(host), &error);
@@ -1721,6 +1843,7 @@ bool captureSharpening(float** luminance, const float* const* oldLuminance,
     }
 
     if ((info.maxAllocation > 0 && planeBytes > info.maxAllocation)
+            || !ensureBudget(state, 3 * planeBytes)
             || (info.globalMemory > 0 && 3 * planeBytes > info.globalMemory * 8 / 10)) {
         return false;
     }
@@ -1751,12 +1874,18 @@ bool captureSharpening(float** luminance, const float* const* oldLuminance,
     }
 
     BufferSet buffers;
+    buffers.owner = &state;
     buffers.api = &state.api;
     KernelSet kernels;
     kernels.api = &state.api;
 
     const auto createBuffer = [&](cl_mem_flags flags, size_t bytes,
                                   const void* host) -> cl_mem {
+        if (host == nullptr && (flags & CL_MEM_COPY_HOST_PTR) == 0) {
+            cl_mem memory = acquireBuffer(state, bytes);
+            return buffers.add(memory, bytes, true);
+        }
+
         cl_int error = CL_SUCCESS;
         cl_mem memory = state.api.CreateBuffer(state.context, flags, bytes,
                                                const_cast<void*>(host), &error);
