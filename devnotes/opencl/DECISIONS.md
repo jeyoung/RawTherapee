@@ -108,3 +108,17 @@ Consequences: 45.7 MP capture runs on the RX 550 without a context-loss reset.
 High radius/iteration settings that exceed the chunk budget fall back to CPU
 instead of risking a watchdog. POCL remains available for parity tests but does
 not slow normal exports on POCL-only systems.
+
+## D010 — Drop stale queued previews before rendering
+
+Date: 2026-10-20
+
+Decision: attach a generation counter to preview requests and discard a queued
+request when a newer one has arrived before rendering starts. Requeue the full
+change mask, adding `M_MONITOR` for panning changes so the final preview is
+still produced.
+
+Consequences: obsolete queued renders are avoided without aborting an active
+render or changing ownership of intermediate buffers. Mid-render cancellation
+was rejected during review because it interacted badly with preview teardown.
+A stage cache and measured latency harness are the next preview steps.

@@ -3,13 +3,26 @@
 ## Handover block
 
 - Branch: `perf` (based on `opencl`, which is based on `dev` at `b2ee504c4`)
-- Milestone: M7 — Rusticl auto-detection (complete); next release hardening
+- Milestone: M8 — preview request coalescing (incremental); next preview cache/benchmark
 - Last verified: 2026-10-20, downscale and upscale parity on POCL and AMD
-- Next task: release hardening, format matrix and optional residency
+- Next task: preview latency benchmark, stage cache and progressive preview
 - Known limitations: single-stage acceleration is roughly neutral end-to-end;
   transform is limited to rotation/scale/crop without LCP, CA, distortion,
   perspective or vignetting; capture sharpening is split into watchdog-safe
   chunks and sized by a work budget
+
+## M8 evidence — preview request coalescing
+
+- Preview changes carry a generation counter, incremented in both
+  `startProcessing(int)` and `endUpdateParams(int)`.
+- Before a render starts, `updatePreviewImage` discards a stale request and
+  requeues its complete mask; panning requests also requeue `M_MONITOR`.
+- The crop/post-crop-vignetting transform augmentation is applied before the
+  discarding check.
+- `WITH_OPENCL=ON` and `WITH_OPENCL=OFF` builds PASS.
+- Mid-render cancellation was prototyped but rejected during review because
+  it interfered with preview teardown and state ownership. The next increment
+  is a stage cache and a measured latency harness.
 
 ## M7 evidence — Rusticl auto-detection
 
@@ -169,6 +182,7 @@ choose at runtime whether to use a device.
 | M4 | complete | capture sharpening, work-chunked at all sizes |
 | M6 | complete | portable `/usr/local` `.deb` for Debian 12+ |
 | M7 | complete | Rusticl driver auto-detection and preference |
+| M8 | incremental | preview request coalescing; cache/benchmark pending |
 
 ## Review
 

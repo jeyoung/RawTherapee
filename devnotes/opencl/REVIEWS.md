@@ -150,3 +150,18 @@ large chunks were queued without completion points.
 
 Historical note: the R4 capture entry that said “45 MP watchdog reset — GPU
 capture limited to 12 MP” is superseded by this work.
+
+## R10 — Preview latest-wins
+
+A mid-render cancellation prototype was rejected. It required requeueing
+partial state and raced with preview stop/teardown.
+
+| Finding | Resolution |
+|---|---|
+| Mid-render abort leaked or partially updated preview state | Backed out; cancellation now happens only before a render starts |
+| Generation was not bumped on normal edits | Both `startProcessing(int)` and `endUpdateParams(int)` bump under the params mutex |
+| Panning output could be lost on requeue | Requeue adds `M_MONITOR` when panning-related |
+| Crop transform augmentation was skipped after requeue | Applied before the stale-request check |
+| `M_VOID`-only changes caused churn | Only non-`M_VOID` changes bump the generation |
+
+The remaining work is a stage cache and a scripted GUI latency measurement.
