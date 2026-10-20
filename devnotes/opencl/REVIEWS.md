@@ -62,6 +62,18 @@ fell back and the initial PAE 0 was a CPU-vs-CPU artefact.
 | Compile after costly uploads | Program is built before staging the planes; timer starts after success |
 | 45 MP watchdog reset | GPU capture is limited to 12 MP; larger images use CPU |
 
+## R5 — M5 buffer pool
+
+The pool review found that cached VRAM was invisible to the stage budget and
+the pool could grow without eviction.
+
+| Finding | Resolution |
+|---|---|
+| Pool not counted in stage memory budget | `ensureBudget()` clears the pool when a stage would exceed 80% of device memory |
+| Pool grow-only and exact-size only | Per-device cap (512 MiB or 1/8 VRAM) and eviction on allocation failure |
+| `emplace_back` in a destructor could throw | Release the buffer instead of growing the pool |
+| `BufferSet` implicitly copyable | Copy and assignment deleted |
+
 ## Outstanding
 
 - Automated Imagefloat resize coverage (the manual harness was not committed).

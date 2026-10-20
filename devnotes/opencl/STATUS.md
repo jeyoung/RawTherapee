@@ -3,13 +3,22 @@
 ## Handover block
 
 - Branch: `opencl` (based on `dev` at `b2ee504c4`, 32 commits after tag 5.13)
-- Milestone: M4 — capture sharpening (complete); next M5 — residency or M6 — packaging
+- Milestone: M5 — buffer pool (complete); next M6 — portable packaging
 - Last verified: 2026-10-20, downscale and upscale parity on POCL and AMD
-- Next task: M5 — buffer residency (optional) or M6 — portable package
+- Next task: M6 — portable Debian package and tarball
 - Known limitations: single-stage acceleration is roughly neutral end-to-end;
   transform is limited to rotation/scale/crop without LCP, CA, distortion,
   perspective or vignetting; capture sharpening uses the GPU only up to 12 MP
   because larger tiles exceed the AMD watchdog
+
+## M5 evidence — buffer pool
+
+- Device buffers are pooled by size and reused across stage calls.
+- Pool is capped at 512 MiB or one eighth of device memory, whichever is
+  smaller; stale entries are evicted when a stage needs budget.
+- Allocation failure clears the pool and retries once, then falls back to CPU.
+- PEF resize/rotate/capture parity remains PASS (PAE 0 / 1 LSB).
+- Effect is modest: resize 3.98 s CPU vs 4.06 s GPU; rotate 6.20 s vs 6.04 s.
 
 ## M4 evidence — capture sharpening
 

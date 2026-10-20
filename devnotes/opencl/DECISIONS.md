@@ -66,3 +66,15 @@ A corrupt or unreadable cache is ignored and the program is compiled again.
 Consequences: first use on a machine or after a driver update pays the
 compilation cost; later runs are fast. The cache is an optimisation only and
 must never fail the application.
+
+## D007 — Pool device buffers per size
+
+Date: 2026-10-20
+
+Decision: keep a small per-device pool of `cl_mem` buffers keyed by byte size,
+reused across stage calls. The pool is capped at 512 MiB or one eighth of
+device memory, and is cleared when it would push a stage over the 80 % budget.
+
+Consequences: fewer allocation calls and less fragmentation, without hiding
+device memory from the stage budget. The pool is not a substitute for keeping
+frames resident between stages.
