@@ -48,10 +48,13 @@ Use the same image and profile for every run. Do not commit images or sidecars.
 | Warm 4 | 53 ms | 53 ms |
 | Warm 5 | 54 ms | 54 ms |
 
-Warm fit-zoom p50 = 54 ms; p95 = 152 ms. The 100% sequence produced the same
-timings and `todo=0x1009f`; the exposure path did not trigger a distinct
-high-detail render in this harness, so this is **not yet a validated 100%
-baseline**. A Tone Curve or crop edit at 100% should be used for that row.
+Warm fit-zoom p50 = 54 ms; p95 = 152 ms.
+
+A 100% zoom run with the Shadows/Highlights tool, which exercises Lab-stage
+work, produced 63–68 ms per edit (`todo=0x7`). No distinct high-detail render
+appeared in the timer output; the high-detail path is already computed/cached
+for this image at the time of the edits. Treat the 100% row as an interactive
+Lab-edit measurement, not a cold high-detail render.
 
 The timer starts after stale-request rejection; cold renders include initial
 image loading and are reported separately.
