@@ -18,11 +18,11 @@ The first build downloads the Debian 12 image and installs build dependencies.
 The container is always based on Debian 12 so the package keeps the bookworm
 baseline.
 
-Verified artefact from commit `2e1900297`:
+Verified artefact from commit `6a0424eeb`:
 
 ```
-build/portable/rawtherapee-5.13-62-g2e1900297_5.13+git13083.2e1900297-1_amd64.deb
-sha256 d02d6a94b63391a9f9f0935a2e050660614d3c8b6724f14b94cf31c7d307d6c0
+build/portable/rawtherapee-5.13-64-g6a0424eeb_5.13+git13085.6a0424eeb-1_amd64.deb
+sha256 c1f92dc9ed1f822e02a8bcb0373e54209dbb9001bf5bdd6ccbbe35271552dec0
 ```
 
 ## Layout
