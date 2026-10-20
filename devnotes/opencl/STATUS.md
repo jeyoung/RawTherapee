@@ -13,15 +13,16 @@
 
 ## M6 evidence — portable package
 
-- `tools/build-rt.sh portable --format both` builds in Ubuntu 22.04 Docker.
-- Installs under `/usr/local`, with bundled libraries in
-  `/usr/local/lib/rawtherapee` and data in `/usr/local/share/rawtherapee`.
-- `.deb` and `.tar.gz` tested on Debian 12 and Ubuntu 22.04 containers.
+- `tools/build-rt.sh portable` builds a `.deb` in Debian 12 Docker for
+  Debian bookworm and newer.
+- Installs under `/usr/local`; GTK/gtkmm come from the host, while exiv2 and
+  JPEG XL are bundled because their sonames differ on Debian 13.
+- Tested on Debian 12 and Debian 13 containers: `apt-get install ./...deb`,
+  CPU export, `--list-formats` with JPEG XL, and GUI startup under Xvfb.
 - CPU export matches the host single-threaded export (PAE 0).
 - No-ICD `--gpu-info` starts and falls back cleanly.
-- Package depends only on `libc6 (>= 2.35)`; OpenCL ICD/driver libraries are
-  not bundled.
-- JPEG XL is not available in the Ubuntu 22.04 build environment.
+- OpenCL ICD/driver libraries are not bundled; the package suggests common
+  vendor ICD packages.
 
 ## M5 evidence — buffer pool
 
@@ -123,7 +124,7 @@ choose at runtime whether to use a device.
 | M2 | complete | Lanczos resize |
 | M3 | complete | rotation/scale/crop transform |
 | M4 | complete | capture sharpening (up to 12 MP) |
-| M6 | complete | portable /usr/local package and tarball |
+| M6 | complete | portable `/usr/local` `.deb` for Debian 12+ |
 
 ## Review
 

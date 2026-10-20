@@ -90,6 +90,23 @@ and an icon collision.
 | `--image` ignored | Dockerfile takes `BASE_IMAGE`; builds use `--platform linux/amd64` |
 | Wrapper relocation | Wrappers derive `/usr/local` from their own location |
 
+## R7 — Debian 12+ package
+
+The self-contained GTK bundle crashed on Debian 13 in `Gtk::Menu::attach`
+after SVG icon lookups returned null. The requirement is now one package for
+Debian 12 and newer, so the GTK bundle was replaced with host GTK and only
+soname-incompatible libraries are bundled.
+
+| Finding | Resolution |
+|---|---|
+| Bundled GTK/GLib mixed with host desktop stack, GUI segfault | Host GTK/gtkmm; bundle only exiv2 0.27 and JPEG XL 0.7 |
+| `debian/` shlibdeps scratch files installed at `/` | Removed before `dpkg-deb` |
+| Bundled JPEG XL needs `libbrotli1` | Added to `Depends` |
+| Lensfun compiled path pointed at an empty `/usr/local/share/lensfun` | Left empty so lensfun uses its system search path; data is recommended |
+| Stale tarball bundle could shadow host GTK | Documented removal before install; old same-name packages are replaced by dpkg |
+| Hardcoded package identity | Package name/version derived from the latest git tag and HEAD |
+| `--check-deps` checked the host for portable builds | Checks Docker instead |
+
 ## Outstanding
 
 - Automated Imagefloat resize coverage (the manual harness was not committed).

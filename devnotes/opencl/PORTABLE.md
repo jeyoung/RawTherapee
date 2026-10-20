@@ -1,54 +1,66 @@
 # Portable package
 
-Builds a self-contained RawTherapee for x86-64 Linux inside an Ubuntu 22.04
-container. No AppImage, no FUSE, no build dependencies on the target machine.
+Builds a RawTherapee `.deb` for Debian 12 (bookworm) and newer, inside a
+Debian 12 container. No AppImage and no build dependencies on the target
+machine.
 
 ## Build
 
 ```bash
-tools/build-rt.sh portable --format both
+tools/build-rt.sh portable
 ```
 
-Outputs in `build/portable/`:
+Output in `build/portable/`:
 
-- `rawtherapee-<version>-portable-linux-x86_64.tar.gz`
-- `rawtherapee-<version>_<version>_amd64.deb`
+- `rawtherapee-<git-describe>_<base-version>+git<count>.<hash>-1_amd64.deb`
 
-Use `--format tarball` or `--format deb` for one artefact. The first build
-downloads the Ubuntu 22.04 image and installs build dependencies.
+The first build downloads the Debian 12 image and installs build dependencies.
+The container is always based on Debian 12 so the package keeps the bookworm
+baseline.
 
 ## Layout
 
 ```
-/usr/local/bin/rawtherapee       (wrapper)
-/usr/local/bin/rawtherapee-cli   (wrapper)
-/usr/local/lib/rawtherapee/      bundled binaries, GTK/gtkmm/lcms/exiv2/lensfun/...
-/usr/local/share/rawtherapee/    profiles, ICC, DCP, languages, themes, images
-/usr/local/share/glib-2.0/schemas
-/usr/local/share/lensfun
-/usr/share/applications/rawtherapee-5.13.desktop
+/usr/local/bin/rawtherapee
+/usr/local/bin/rawtherapee-cli
+/usr/local/lib/rawtherapee/libexiv2.so.27      bundled (bookworm soname)
+/usr/local/lib/rawtherapee/libjxl.so.0.7       bundled (bookworm soname)
+/usr/local/lib/rawtherapee/libjxl_threads.so.0.7
+/usr/local/share/rawtherapee/                  profiles, ICC, DCP, languages, themes, images
+/usr/local/share/applications/rawtherapee.desktop
+/usr/local/share/icons/hicolor/...
 ```
 
-Binaries use `RPATH=$ORIGIN/lib`; the wrapper sets only GTK data paths. OpenCL
-is still loaded from the host at runtime, so the vendor driver must be
-installed separately.
+GTK, gtkmm, GLib, lensfun, lcms2, libtiff and the rest of the desktop stack
+come from the host. Exiv2 and JPEG XL are bundled because their sonames changed
+between Debian 12 and Debian 13 (`libexiv2.so.27`/`.28`,
+`libjxl.so.0.7`/`.0.11`); bundling those two keeps one package usable on both.
+
+Binaries use `DT_RUNPATH=$ORIGIN/../lib/rawtherapee`; bundled libraries use
+`DT_RUNPATH=$ORIGIN`. OpenCL is loaded from the host at runtime, so the vendor
+driver and an ICD loader must be installed separately.
 
 ## Portability baseline
 
-- Built on Ubuntu 22.04: glibc 2.35, GCC 11, `-mtune=generic`.
-- Bundled libraries are copied from the build container; glibc, the dynamic
-  loader, OpenCL, DRM/GL/EGL/Vulkan and vendor driver libraries are not.
-- Tested on Debian 12 and Ubuntu 22.04 containers, installed with
-  `dpkg -i`, CPU export and `--gpu-info` with no ICD. Extract the tarball at
-  `/`; it contains `usr/local/...` and the compiled data path is absolute.
-- Requires `libc6 >= 2.35`; not intended for older distributions.
+- Built on Debian 12: glibc 2.36, GCC 12, `-mtune=generic`.
+- Requires Debian 12 or newer. Debian 13 t64 packages are accepted through
+  their `Provides` entries.
+- Tested on Debian 12 and Debian 13 containers with `apt-get install ./...deb`,
+  CPU export, `--list-formats` (including JPEG XL) and a GUI smoke test under
+  Xvfb.
+- The package replaces `/usr/local/bin/rawtherapee` and
+  `/usr/local/bin/rawtherapee-cli`, like a normal `/usr/local` build.
+- Remove any old self-contained bundle in `/usr/local/lib/rawtherapee` before
+  installing; stale bundled GTK libraries there would still win at runtime.
 
 ## Limitations
 
-- JPEG XL is disabled because Ubuntu 22.04 has no libjxl development package.
-  `--list-formats` reflects the formats actually built.
-- The package replaces `/usr/local/bin/rawtherapee` and
-  `/usr/local/bin/rawtherapee-cli`, like a normal `/usr/local` build.
-- Bundled libraries do not receive distribution security updates.
+- Host GTK/gtkmm/lensfun/lcms2 must be installed; the `.deb` declares them as
+  dependencies and `apt` resolves them. If installing with
+  `--no-install-recommends`, also install `liblensfun-data-v1` and
+  `librsvg2-common` explicitly for lens correction and SVG icons.
+- The bundled exiv2 and JPEG XL copies do not receive distribution security
+  updates; rebuild the package to pick up fixes.
 - OpenCL support depends on the host ICD and driver; without one the CPU path
   is used.
+- `librsvg2-common` is recommended so the SVG icon theme renders correctly.

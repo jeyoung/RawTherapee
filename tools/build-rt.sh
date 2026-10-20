@@ -11,7 +11,7 @@
 #    tools/build-rt.sh cpu      [options]
 #    tools/build-rt.sh opencl   [options]
 #    tools/build-rt.sh both     [options]
-#    tools/build-rt.sh portable [--format tarball|deb|both] [options]
+#    tools/build-rt.sh portable [options]
 #
 #  Options:
 #    -j, --jobs N        Parallel build jobs (default: nproc)
@@ -22,8 +22,6 @@
 #    --update            Fetch upstream tags and report how far behind we are
 #    --build-root DIR    Where build directories are created
 #    --prefix PATH       CMAKE_INSTALL_PREFIX (default: /usr/local)
-#    --format FORMAT     Portable output: tarball, deb or both (default: both)
-#    --image IMAGE       Container image for portable builds (default: ubuntu:22.04)
 #    -h, --help          Show this help
 #
 #  Environment:
@@ -212,34 +210,29 @@ configure_build() {
     cmake "${args[@]}"
 }
 
-portable_image_tag() {
-    printf 'rt-portable-%s' "$(sanitise_ref "$1")"
-}
-
 build_portable() {
     local root="$1"
     local build_root="$2"
-    local image="$3"
-    local format="$4"
-
-    case "$format" in
-        tarball|deb|both) ;;
-        *) die "invalid --format '$format' (tarball, deb or both)" ;;
-    esac
 
     command -v docker >/dev/null 2>&1 || die "docker is required for portable builds"
 
-    local tag
-    tag="$(portable_image_tag "$image")"
-    info "building container image $tag from $image"
-    docker build --platform linux/amd64 --build-arg BASE_IMAGE="$image" \
-        -t "$tag" -f "$root/tools/portable/Dockerfile.ubuntu2204" "$root/tools/portable"
+    local tag="rt-portable-debian12"
+    info "building container image $tag"
+    docker build --platform linux/amd64 \
+        -t "$tag" -f "$root/tools/portable/Dockerfile.debian12" "$root/tools/portable"
 
     local output="$build_root/portable"
     mkdir -p "$output"
 
-    info "building portable $format with $image"
-    docker run --rm         --user "$(id -u):$(id -g)"         -e HOME=/tmp         -v "$root:/src:ro"         -v "$output:/out"         "$tag"         /src/tools/portable/build-in-container.sh "$format"
+    info "building Debian package"
+    docker run --rm \
+        --platform linux/amd64 \
+        --user "$(id -u):$(id -g)" \
+        -e HOME=/tmp \
+        -v "$root:/src:ro" \
+        -v "$output:/out" \
+        "$tag" \
+        /src/tools/portable/build-debian12.sh
 }
 
 build_variant() {
@@ -301,8 +294,6 @@ main() {
     local do_reconfigure=0
     local do_check=0
     local do_update=0
-    local portable_format="both"
-    local portable_image="ubuntu:22.04"
 
     jobs="$(nproc 2>/dev/null || echo 4)"
     build_root="${RT_BUILD_ROOT:-}"
@@ -358,22 +349,6 @@ main() {
             --prefix=*)
                 prefix="${1#*=}"
                 ;;
-            --format)
-                [ "$#" -ge 2 ] || die "$1 needs an argument"
-                portable_format="$2"
-                shift
-                ;;
-            --format=*)
-                portable_format="${1#*=}"
-                ;;
-            --image)
-                [ "$#" -ge 2 ] || die "$1 needs an argument"
-                portable_image="$2"
-                shift
-                ;;
-            --image=*)
-                portable_image="${1#*=}"
-                ;;
             -h|--help)
                 usage
                 exit 0
@@ -416,7 +391,10 @@ main() {
     fi
 
     if [ "$do_check" -eq 1 ]; then
-        if [ "$variant" = "both" ]; then
+        if [ "$variant" = "portable" ]; then
+            command -v docker >/dev/null 2>&1 || die "docker is required for portable builds"
+            docker info >/dev/null 2>&1 || die "cannot talk to the Docker daemon"
+        elif [ "$variant" = "both" ]; then
             check_deps opencl
         else
             check_deps "$variant"
@@ -426,7 +404,7 @@ main() {
 
     case "$variant" in
         portable)
-            build_portable "$root" "$build_root" "$portable_image" "$portable_format"
+            build_portable "$root" "$build_root"
             ;;
         cpu|opencl)
             if [ "$variant" = "opencl" ]; then
