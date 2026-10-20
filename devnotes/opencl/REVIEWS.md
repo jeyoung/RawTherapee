@@ -32,6 +32,19 @@ Second independent review of the fix diff (commit `c652e3505`).
 | Reset to defaults clobbered `cacheDir` | Preserved around the copy, then reconfigure |
 | Settings copy races with workers | Stage gating now uses an atomic backend flag and a cache-directory snapshot; the broader pre-existing `Options` copy race remains |
 
+## R3 — M3 transform
+
+Independent review of the transform stage.
+
+| Finding | Resolution |
+|---|---|
+| Wrong centre for cropped destinations (`dst` vs `oW/oH`) | `transformRotateScale` now takes `oW/oH` and uses them for the centre |
+| Log temp allocated before GPU availability was known | Hook now gates on `opencl::enabled()` before allocating the log copy |
+| Vertical cubic sum order differed from CPU SIMD | Changed to `(v0+v1)+(v2+v3)` for vertical and `(v0+v2)+(v1+v3)` for horizontal |
+| Log/bilinear paths unexercised | Added `rotate-standard.pp3` and `rotate-scale.pp3`; GPU log path tested on PEF and 45 MP NEF |
+| Manifest policy contradicted private rows | Header now distinguishes public and local private rows |
+| `DeviceInfo::fp64` unused | Removed |
+
 ## Outstanding
 
 - Automated Imagefloat resize coverage (the manual harness was not committed).

@@ -22,12 +22,14 @@ in `$RT_TESTDATA` (default `~/rt-testdata`).
 | ID | Extension | Variant | Source |
 |---|---|---|---|
 | RAW-1 | pef | Bayer 14-bit, 10 MP | RawTherapee test image |
-| RAW-2 | cr2/nef | Bayer 12/14-bit | own library |
-| RAW-3 | cr3 | Canon CR3 | own library |
-| RAW-4 | raf | Fuji X-Trans | own library |
-| RAW-5 | dng | linear DNG | own library |
-| RAW-6 | dng | monochrome, if available | own library |
-| RAW-7 | nef/arw | ≥ 40 MP | own library |
+| RAW-7 | nef | Bayer 14-bit, 45.7 MP (Nikon D850) | user library |
+| IMG-2 | jpg | 8-bit, 45.7 MP | user library |
+| IMG-3 | tif | 16-bit RGB scan | user library |
+| IMG-4 | tif | 16-bit grey scan | user library |
+| IMG-5 | png | 8-bit RGBA | user library |
+
+Local samples are copied into `$RT_TESTDATA/local/`; they are private and
+must not be committed or uploaded.
 
 Add rows as files are collected. Rare formats should use CC0 samples from
 raw.pixls.us, recorded with their URL, SHA-256 and licence.

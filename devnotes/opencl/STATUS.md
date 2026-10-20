@@ -3,11 +3,26 @@
 ## Handover block
 
 - Branch: `opencl` (based on `dev` at `b2ee504c4`, 32 commits after tag 5.13)
-- Milestone: M2 — Lanczos resize (complete); next M3 — transform
+- Milestone: M3 — transform (complete); next M4 — capture sharpening
 - Last verified: 2026-10-20, downscale and upscale parity on POCL and AMD
-- Next task: M3 — perspective/rotation/lens transform
-- Known limitations: resize performance on the RX 550 is about 4% slower
-  end-to-end because only one stage is accelerated; stage timing is 102 ms
+- Next task: M4 — capture sharpening
+- Known limitations: single-stage acceleration is roughly neutral end-to-end;
+  transform is limited to rotation/scale/crop without LCP, CA, distortion,
+  perspective or vignetting, and falls back to CPU for those
+
+## M3 evidence — transform
+
+- Scope: rotation, common-transform scale and crop offsets, with log or
+  standard encoding, cubic and bilinear sampling. LCP, CA, distortion,
+  perspective, vignetting, gradient and PC vignette fall back to CPU.
+- 5 degree rotation, PEF: POCL and AMD RX 550 PASS, PAE 1 LSB.
+- Standard (non-log) profile: PASS, PAE 0.
+- Log + 0.8 scale profile: PASS, PAE 1 LSB.
+- Nikon D850 NEF, 45.7 MP: rotate PASS, PAE 1 LSB; resize PASS, PAE 0.
+- All six local/public format samples load and export; parity PAE 0.
+- Coordinate mapping is computed on the host in double and uploaded as a
+  float map, so devices without fp64 (Rusticl Polaris) are supported.
+- Host map + buffers for 45 MP are checked against the 80% VRAM budget.
 
 ## M2 evidence — Lanczos
 
@@ -72,7 +87,7 @@ choose at runtime whether to use a device.
 | M0 | complete | build helper, CMake option, options/CLI/preferences, runtime loader |
 | M1 | complete | device discovery, program cache, self-test |
 | M2 | complete | Lanczos resize |
-| M3 | pending | transform |
+| M3 | complete | rotation/scale/crop transform |
 | M4 | pending | capture sharpening |
 | M6 | pending | portable package, CI, docs |
 

@@ -42,3 +42,24 @@ the saved CPU work when only one stage is accelerated.
 - Total time includes loading, demosaic, colour processing, resize and TIFF
   encoding.
 - Do not compare timings across different `OMP_NUM_THREADS` settings.
+
+## Transform, 5 degree rotation
+
+PEF, 3896x2616, log transform, three runs:
+
+| Mode | Wall (median) | Peak RSS |
+|---|---|---|
+| CPU | 11.97 s | 718 MB |
+| GPU | 11.61 s | 1.06 GB |
+
+D850 NEF, 8288x5520, log transform:
+
+| Mode | Wall | Peak RSS |
+|---|---|---|
+| CPU | 46.22 s | 2.22 GB |
+| GPU | 47.61 s | 3.55 GB |
+
+Transform stage on PEF is about 1 s; on the 45 MP NEF about 2.4 s. Single-stage
+offload remains roughly neutral because map transfer and the extra log image
+offset the GPU gain. Reducing map traffic (residency) and accelerating further
+stages is required for a clear end-to-end win.
