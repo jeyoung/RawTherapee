@@ -524,6 +524,7 @@ void Options::setDefaults()
     rtSettings.useOpenCL = true;
     rtSettings.openCLMode = 0;
     rtSettings.openCLDevice.clear();
+    rtSettings.openCLRusticlDriver.clear();
     chunkSizeAMAZE = 2;
     chunkSizeCA = 2;
     chunkSizeRCD = 2;
@@ -1479,6 +1480,10 @@ void Options::readFromFile(Glib::ustring fname)
 
                 if (keyFile.has_key("Performance", "OpenCLDevice")) {
                     rtSettings.openCLDevice = keyFile.get_string("Performance", "OpenCLDevice");
+                }
+
+                if (keyFile.has_key("Performance", "OpenCLRusticlDriver")) {
+                    rtSettings.openCLRusticlDriver = keyFile.get_string("Performance", "OpenCLRusticlDriver");
                 }
 
                 if (keyFile.has_key("Performance", "ChunkSizeAMAZE")) {
@@ -2578,6 +2583,7 @@ void Options::saveToFile(Glib::ustring fname)
         keyFile.set_boolean("Performance", "UseOpenCL", rtSettings.useOpenCL);
         keyFile.set_integer("Performance", "OpenCLMode", rtSettings.openCLMode);
         keyFile.set_string("Performance", "OpenCLDevice", rtSettings.openCLDevice);
+        keyFile.set_string("Performance", "OpenCLRusticlDriver", rtSettings.openCLRusticlDriver);
         keyFile.set_integer("Performance", "ChunkSizeAMAZE", chunkSizeAMAZE);
         keyFile.set_integer("Performance", "ChunkSizeRCD", chunkSizeRCD);
         keyFile.set_integer("Performance", "ChunkSizeRGB", chunkSizeRGB);

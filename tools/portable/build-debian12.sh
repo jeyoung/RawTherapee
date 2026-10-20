@@ -111,8 +111,8 @@ Maintainer: Local build <root@localhost>
 Section: graphics
 Priority: optional
 Depends: $SHLIBS
-Recommends: liblensfun-data-v1, librsvg2-common, ocl-icd-libopencl1
-Suggests: mesa-opencl-icd | nvidia-opencl-icd | intel-opencl-icd
+Recommends: liblensfun-data-v1, librsvg2-common, ocl-icd-libopencl1, mesa-opencl-icd
+Suggests: nvidia-opencl-icd | intel-opencl-icd
 Installed-Size: $(du -sk "$DEB/usr" | cut -f1)
 Description: RawTherapee 5.13
  Advanced raw photo development program, built for Debian bookworm and newer.

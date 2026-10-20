@@ -56,6 +56,7 @@ public:
     bool            useOpenCL;              ///< Enable OpenCL acceleration when available.
     int             openCLMode;             ///< 0 = export only, 1 = preview and export.
     Glib::ustring   openCLDevice;           ///< Selected OpenCL device, empty = automatic.
+    Glib::ustring   openCLRusticlDriver;    ///< Rusticl driver override, empty = auto-detect.
     Glib::ustring   cacheDir;               ///< Base directory for cached data such as compiled kernels.
 
     Glib::ustring   adobe;                  // filename of AdobeRGB1998 profile (default to the bundled one)

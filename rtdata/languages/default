@@ -2233,6 +2233,10 @@ PREFERENCES_OPENCL_DEVICE_AUTO;Automatic
 PREFERENCES_OPENCL_MODE;Accelerate
 PREFERENCES_OPENCL_MODE_EXPORT;Export only
 PREFERENCES_OPENCL_MODE_ALL;Preview and export
+PREFERENCES_OPENCL_RUSTICL;Rusticl driver
+PREFERENCES_OPENCL_RUSTICL_AUTO;Auto
+PREFERENCES_OPENCL_RUSTICL_TOOLTIP;Driver name passed to Mesa Rusticl through RUSTICL_ENABLE. Leave empty to detect the driver from the GPU vendor. An existing RUSTICL_ENABLE environment variable takes precedence.
+PREFERENCES_OPENCL_RUSTICL_HINT;Leave empty for automatic detection (Linux only). Mesa Rusticl needs an explicit driver; AMD uses radeonsi and Intel uses iris. Restart RawTherapee after changing this value.
 PREFERENCES_PREVDEMO;Preview Demosaic Method
 PREFERENCES_PREVDEMO_FAST;Fast
 PREFERENCES_PREVDEMO_LABEL;Demosaicing method used for the preview at <100% zoom:

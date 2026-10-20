@@ -43,6 +43,20 @@ come from the host. Exiv2 and JPEG XL are bundled because their sonames changed
 between Debian 12 and Debian 13 (`libexiv2.so.27`/`.28`,
 `libjxl.so.0.7`/`.0.11`); bundling those two keeps one package usable on both.
 
+## OpenCL auto-detection
+
+The installed application detects the Rusticl driver before loading OpenCL:
+
+- AMD PCI vendor `0x1002` → `RUSTICL_ENABLE=radeonsi`
+- Intel PCI vendor `0x8086` → `RUSTICL_ENABLE=iris`
+
+`Preferences → Performance → OpenCL → Rusticl driver` overrides the detected
+value; leave it empty for automatic detection. An existing `RUSTICL_ENABLE`
+environment variable takes precedence. No shell profile or launcher wrapper is
+required after installing the package. The package recommends
+`mesa-opencl-icd` and `ocl-icd-libopencl1`; install them explicitly when using
+`--no-install-recommends`.
+
 Binaries use `DT_RUNPATH=$ORIGIN/../lib/rawtherapee`; bundled libraries use
 `DT_RUNPATH=$ORIGIN`. OpenCL is loaded from the host at runtime, so the vendor
 driver and an ICD loader must be installed separately.

@@ -198,6 +198,7 @@ class Preferences final :
     Gtk::CheckButton* useOpenCLCB;
     Gtk::ComboBoxText* openCLModeCombo;
     Gtk::ComboBoxText* openCLDeviceCombo;
+    Gtk::Entry* openCLRusticlEntry = nullptr;
     Gtk::Label* openCLStatusLabel;
     std::vector<Glib::ustring> openCLDeviceNames;
     Gtk::SpinButton*  chunkSizeAMSB;

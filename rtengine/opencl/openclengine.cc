@@ -758,6 +758,94 @@ std::string trimText(std::string value)
     return value;
 }
 
+std::string detectRusticlDriver()
+{
+    GDir* directory = g_dir_open("/sys/class/drm", 0, nullptr);
+
+    if (directory == nullptr) {
+        return {};
+    }
+
+    bool hasIntel = false;
+    bool hasAmd = false;
+    const char* name = nullptr;
+
+    while ((name = g_dir_read_name(directory)) != nullptr) {
+        if (!g_str_has_prefix(name, "card") || std::strchr(name, '-') != nullptr) {
+            continue;
+        }
+
+        gchar* path = g_build_filename(
+            "/sys/class/drm", name, "device", "vendor", nullptr);
+        gchar* contents = nullptr;
+        gsize length = 0;
+        const bool read = g_file_get_contents(path, &contents, &length, nullptr);
+        g_free(path);
+
+        if (!read) {
+            continue;
+        }
+
+        const std::string vendor = trimText(std::string(contents, length));
+        g_free(contents);
+
+        if (vendor == "0x1002") {
+            hasAmd = true;
+        } else if (vendor == "0x8086") {
+            hasIntel = true;
+        }
+    }
+
+    g_dir_close(directory);
+
+    if (hasAmd && hasIntel) {
+        return "radeonsi,iris";
+    }
+
+    if (hasAmd) {
+        return "radeonsi";
+    }
+
+    return hasIntel ? std::string("iris") : std::string();
+}
+
+bool rusticlEnvInjected = false;
+
+void prepareRusticl()
+{
+    const char* existing = g_getenv("RUSTICL_ENABLE");
+
+    if (existing != nullptr && !rusticlEnvInjected) {
+        return;
+    }
+
+    std::string driver;
+
+    if (settings != nullptr) {
+        driver = trimText(settings->openCLRusticlDriver.raw());
+    }
+
+    if (g_ascii_strcasecmp(driver.c_str(), "auto") == 0) {
+        driver.clear();
+    }
+
+    if (driver.empty()) {
+        driver = detectRusticlDriver();
+    }
+
+    if (driver.empty()) {
+        if (rusticlEnvInjected) {
+            g_unsetenv("RUSTICL_ENABLE");
+        }
+        rusticlEnvInjected = false;
+        return;
+    }
+
+    if (g_setenv("RUSTICL_ENABLE", driver.c_str(), TRUE)) {
+        rusticlEnvInjected = true;
+    }
+}
+
 bool icdLibraryExists(const std::string& library)
 {
     const std::string name = trimText(library);
@@ -892,6 +980,7 @@ void prepareVendors()
 bool openLoader(Backend& state)
 {
 #ifdef __linux__
+    prepareRusticl();
     prepareVendors();
 #endif
 
@@ -1193,6 +1282,15 @@ std::vector<DeviceInfo> devices()
     Backend& state = backend();
     std::lock_guard<std::recursive_mutex> lock(state.mutex);
     return state.infos;
+}
+
+std::string autoRusticlDriver()
+{
+#ifdef __linux__
+    return detectRusticlDriver();
+#else
+    return {};
+#endif
 }
 
 int selectedDevice()

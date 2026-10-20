@@ -59,6 +59,11 @@ std::vector<DeviceInfo> devices()
     return {};
 }
 
+std::string autoRusticlDriver()
+{
+    return {};
+}
+
 int selectedDevice()
 {
     return -1;

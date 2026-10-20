@@ -107,6 +107,20 @@ soname-incompatible libraries are bundled.
 | Hardcoded package identity | Package name/version derived from the latest git tag and HEAD |
 | `--check-deps` checked the host for portable builds | Checks Docker instead |
 
+## R8 — Rusticl auto-detection
+
+The review found an inverted GLib return check, a missing CPU-build stub and
+hybrid-GPU handling that enabled only one driver.
+
+| Finding | Resolution |
+|---|---|
+| `g_setenv()` success test inverted | Uses the GLib `TRUE` result; explicit preference changes now update the injected value |
+| CPU-only Linux build missed `autoRusticlDriver()` | Stub returns an empty driver |
+| AMD + Intel systems enabled only `radeonsi` | Detection joins both as `radeonsi,iris` |
+| Hardcoded English placeholder | Uses the translated `PREFERENCES_OPENCL_RUSTICL_AUTO` string |
+| `mesa-opencl-icd` listed twice | Removed from `Suggests`; remains in `Recommends` |
+| Uninitialised preference entry pointer | Initialised to `nullptr` |
+
 ## Outstanding
 
 - Automated Imagefloat resize coverage (the manual harness was not committed).

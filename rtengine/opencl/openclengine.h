@@ -61,6 +61,9 @@ bool enabled();
 /** @brief Devices discovered during the last init/reconfigure. */
 std::vector<DeviceInfo> devices();
 
+/** @brief Rusticl driver detected for this machine, empty when unknown. */
+std::string autoRusticlDriver();
+
 /** @brief Index of the selected device, or -1 when none is available. */
 int selectedDevice();
 

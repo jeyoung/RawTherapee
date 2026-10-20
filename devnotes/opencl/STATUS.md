@@ -3,13 +3,31 @@
 ## Handover block
 
 - Branch: `opencl` (based on `dev` at `b2ee504c4`, 32 commits after tag 5.13)
-- Milestone: M6 — portable package (complete); next release hardening
+- Milestone: M7 — Rusticl auto-detection (complete); next release hardening
 - Last verified: 2026-10-20, downscale and upscale parity on POCL and AMD
 - Next task: release hardening, format matrix and optional residency
 - Known limitations: single-stage acceleration is roughly neutral end-to-end;
   transform is limited to rotation/scale/crop without LCP, CA, distortion,
   perspective or vignetting; capture sharpening uses the GPU only up to 12 MP
   because larger tiles exceed the AMD watchdog
+
+## M7 evidence — Rusticl auto-detection
+
+- Before loading the ICD, Linux builds read `/sys/class/drm/card*/device/vendor`
+  and set `RUSTICL_ENABLE` when the variable is not already present:
+  AMD `0x1002` → `radeonsi`, Intel `0x8086` → `iris`.
+- Preferences → Performance → OpenCL has a **Rusticl driver** text box. Empty
+  means auto; an explicit value overrides detection; an externally set
+  `RUSTICL_ENABLE` wins over both.
+- `--gpu-info` with no environment variables and POCL installed:
+  `AMD Radeon RX 550 ... (OpenCL 3.0)` PASS.
+- Explicit `RUSTICL_ENABLE=llvmpipe` is respected PASS.
+- Explicit preference `OpenCLRusticlDriver=llvmpipe` is respected PASS.
+- CPU-only build (`WITH_OPENCL=OFF`) compiles and runs PASS.
+- AMD + Intel detection returns `radeonsi,iris`; Mesa accepts the comma-separated
+  list.
+- The package recommends `mesa-opencl-icd`, so a normal install has a Rusticl
+  ICD on current Debian.
 
 ## M6 evidence — portable package
 
@@ -101,7 +119,11 @@
 
 ## Runtime notes
 
-- On AMD/Mesa, set `RUSTICL_ENABLE=radeonsi` before starting RawTherapee.
+- On AMD/Mesa, `RUSTICL_ENABLE` is set automatically to `radeonsi` when it is
+  not already present; Intel systems get `iris`.
+- Preferences → Performance → OpenCL → Rusticl driver overrides the detected
+  value. Leave it empty for auto-detection. An existing environment variable
+  takes precedence over both.
 - POCL and Rusticl installed together can crash inside the ICD loader. The
   backend hides POCL when a loadable GPU ICD is present. If the GPU runtime
   reports no device, POCL is also hidden; select it explicitly with
@@ -125,6 +147,7 @@ choose at runtime whether to use a device.
 | M3 | complete | rotation/scale/crop transform |
 | M4 | complete | capture sharpening (up to 12 MP) |
 | M6 | complete | portable `/usr/local` `.deb` for Debian 12+ |
+| M7 | complete | Rusticl driver auto-detection and preference |
 
 ## Review
 

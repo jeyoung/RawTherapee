@@ -934,6 +934,30 @@ Gtk::Widget* Preferences::getPerformancePanel()
     openclModeHB->pack_start(*openCLModeCombo, Gtk::PACK_EXPAND_WIDGET);
     openclVB->pack_start(*openclModeHB, Gtk::PACK_SHRINK);
 
+#ifdef __linux__
+    Gtk::Box* openclRusticlHB = Gtk::manage(new Gtk::Box());
+    openclRusticlHB->set_spacing(4);
+    openclRusticlHB->pack_start(*Gtk::manage(new Gtk::Label(M("PREFERENCES_OPENCL_RUSTICL") + ":")), Gtk::PACK_SHRINK);
+    openCLRusticlEntry = Gtk::manage(new Gtk::Entry());
+    openCLRusticlEntry->set_width_chars(16);
+    openCLRusticlEntry->set_tooltip_text(M("PREFERENCES_OPENCL_RUSTICL_TOOLTIP"));
+
+    const std::string detectedDriver = rtengine::opencl::autoRusticlDriver();
+    if (!detectedDriver.empty()) {
+        openCLRusticlEntry->set_placeholder_text(
+            Glib::ustring::compose("%1 (%2)", M("PREFERENCES_OPENCL_RUSTICL_AUTO"), detectedDriver));
+    } else {
+        openCLRusticlEntry->set_placeholder_text(M("PREFERENCES_OPENCL_RUSTICL_AUTO"));
+    }
+
+    openclRusticlHB->pack_start(*openCLRusticlEntry, Gtk::PACK_EXPAND_WIDGET);
+    openclVB->pack_start(*openclRusticlHB, Gtk::PACK_SHRINK);
+
+    Gtk::Label* openclRusticlHint = Gtk::manage(new Gtk::Label(M("PREFERENCES_OPENCL_RUSTICL_HINT"), Gtk::ALIGN_START));
+    openclRusticlHint->set_line_wrap(true);
+    openclVB->pack_start(*openclRusticlHint, Gtk::PACK_SHRINK);
+#endif
+
     openCLStatusLabel = Gtk::manage(new Gtk::Label(rtengine::opencl::statusText(), Gtk::ALIGN_START));
     openCLStatusLabel->set_line_wrap(true);
     openclVB->pack_start(*openCLStatusLabel, Gtk::PACK_SHRINK);
@@ -2126,6 +2150,9 @@ void Preferences::storePreferences()
     moptions.measure = measureCB->get_active();
     moptions.rtSettings.useOpenCL = useOpenCLCB->get_active();
     moptions.rtSettings.openCLMode = openCLModeCombo->get_active_row_number() == 1 ? 1 : 0;
+#ifdef __linux__
+    moptions.rtSettings.openCLRusticlDriver = openCLRusticlEntry->get_text();
+#endif
 
     const int openCLDeviceRow = openCLDeviceCombo->get_active_row_number();
     moptions.rtSettings.openCLDevice =
@@ -2360,6 +2387,9 @@ void Preferences::fillPreferences()
     measureCB->set_active (moptions.measure);
     useOpenCLCB->set_active(moptions.rtSettings.useOpenCL);
     openCLModeCombo->set_active(moptions.rtSettings.openCLMode == 1 ? 1 : 0);
+#ifdef __linux__
+    openCLRusticlEntry->set_text(moptions.rtSettings.openCLRusticlDriver);
+#endif
     openCLDeviceCombo->set_active(0);
 
     if (!moptions.rtSettings.openCLDevice.empty()) {
