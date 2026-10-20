@@ -79,6 +79,29 @@ D850 NEF, Rusticl RX 550 capture took 4.77 s; total 36.31 s GPU versus 36.69 s
 CPU, with PAE 1 LSB. POCL is test-only and intentionally skipped in auto mode:
 the same 45.7 MP case took 16.75 s capture and 50.76 s total on POCL.
 
+## sRGB output conversion
+
+The GPU stage replaces the lcms `Lab -> sRGB` transform for the shipped
+`RTv4_sRGB` profile. Profile-exact matrix and tone-curve values are used.
+Commands:
+
+```bash
+RT_OPENCL_PROFILE=1 OMP_NUM_THREADS=8 rawtherapee-cli \
+    --gpu=auto -d -Y -o out.tif -t -b16 -c input
+OMP_NUM_THREADS=8 rawtherapee-cli \
+    --gpu=off -d -Y -o out.tif -t -b16 -c input
+```
+
+| Image | Mode | Wall (median) | Stage |
+|---|---|---|---|
+| colorspace_flowers.pef, 10 MP | CPU | 2.84 s | — |
+| colorspace_flowers.pef, 10 MP | GPU | 2.48 s | 129 ms |
+| d850.nef, 45.7 MP | CPU | 8.12 s | — |
+| d850.nef, 45.7 MP | GPU | 6.58 s | 439 ms |
+
+Three alternating runs each. The 45 MP GPU total is about 19 % faster. All
+six `verify.sh --formats` entries PASS at 1 LSB PAE.
+
 ## Debian package smoke run
 
 `2026-10-04-173409.NEF` (8288x5520) with its `.pp3`, single-threaded,

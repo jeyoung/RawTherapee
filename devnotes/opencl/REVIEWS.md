@@ -177,3 +177,19 @@ colour conversion and was unreachable for ordinary edits.
 | Saved image was post-conversion | Avoided; a future cache must save the exact stage input |
 | Cache overhead even when disabled | No cache shipped |
 | Timing included lock wait and dropped requests | Timer starts after the stale-request check |
+
+## R12 — sRGB output conversion
+
+The first draft used the generic sRGB matrix and gamma LUT from
+`iccmatrices.h` and `Color::gammatab_srgb`. Eight-bit spot checks looked fine,
+but encoded 16-bit comparison showed a 26 LSB difference from lcms.
+
+| Finding | Resolution |
+|---|---|
+| Generic sRGB constants differ from the shipped profile | Use the exact `RTv4_sRGB` matrix and parametric curve; PAE drops to 1 LSB |
+| Gate included legacy and user-provided names | Limit to the shipped `RTv4_sRGB` profile |
+| `NoICMString` was offloaded | Kept on the manual CPU path, which is faster than an upload/download round trip |
+| 32-bit float output would be clipped | CLI records `tiffFloat`; float output keeps lcms |
+| Thread-local stage gate was not checked | Added `threadStageAllowed` to the stage precondition |
+| `compare_tiff.py` linearised samples through ImageMagick | Normalise to uncompressed 16-bit TIFF and read encoded samples |
+| LUT and matrix rebuilt on every call | Accepted for now; 256 KiB upload is small relative to the stage |

@@ -3,13 +3,33 @@
 ## Handover block
 
 - Branch: `perf` (based on `opencl`, which is based on `dev` at `b2ee504c4`)
-- Milestone: M9 — preview latency instrumentation; next preview stage cache
-- Last verified: 2026-10-20, downscale and upscale parity on POCL and AMD
-- Next task: preview latency benchmark, stage cache and progressive preview
+- Milestone: M10 — sRGB output conversion; next is the resident RGB/Lab segment
+- Last verified: 2026-10-21, six-format parity on AMD RX 550
+- Next task: device-resident RGB/Lab segment, then `rgbProc` core and the Lab
+  LUT stack
 - Known limitations: single-stage acceleration is roughly neutral end-to-end;
   transform is limited to rotation/scale/crop without LCP, CA, distortion,
   perspective or vignetting; capture sharpening is split into watchdog-safe
-  chunks and sized by a work budget
+  chunks and sized by a work budget; output conversion is limited to
+  `RTv4_sRGB`, relative colorimetric intent and integer output
+
+## M10 evidence — sRGB output conversion
+
+- Scope: `ImProcFunctions::lab2rgbOut` for the shipped `RTv4_sRGB` profile
+  with relative colorimetric intent and integer output. Other profiles and
+  float output keep the lcms path.
+- The kernel uses the exact matrix and parametric tone curve from
+  `rtdata/iccprofiles/output/RTv4_sRGB.icc`. Using the generic sRGB constants
+  instead differed from lcms by up to 26 LSB; the profile-exact values reduce
+  the error to 1 LSB.
+- 10 MP PEF, `OMP_NUM_THREADS=8`, 16-bit TIFF: CPU 2.73–2.84 s versus GPU
+  2.48–2.49 s; stage 129–132 ms.
+- 45.7 MP NEF, `OMP_NUM_THREADS=8`, 16-bit TIFF: CPU 8.09–8.13 s versus GPU
+  6.50–6.58 s; stage 431–449 ms.
+- `--formats` PASS on all six manifest entries with maximum PAE 1 LSB.
+- 32-bit float TIFF keeps the lcms path; `--gpu=auto` and `--gpu=off` pixel
+  data are identical.
+- `WITH_OPENCL=ON` and `WITH_OPENCL=OFF` both build.
 
 ## M9 evidence — preview latency instrumentation
 
@@ -195,6 +215,7 @@ choose at runtime whether to use a device.
 | M7 | complete | Rusticl driver auto-detection and preference |
 | M8 | incremental | preview request coalescing; cache/benchmark pending |
 | M9 | incremental | preview timing instrumentation; baseline pending |
+| M10 | complete | sRGB output conversion with profile-exact parity |
 
 ## Review
 

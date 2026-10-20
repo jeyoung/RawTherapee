@@ -147,3 +147,23 @@ full-resolution render when the interaction settles.
 
 Consequences: the preview cache remains deferred. The final frame must remain
 the full-quality render, and crop/detail windows must not show stale geometry.
+
+## D013 — Use profile-exact sRGB maths for output conversion
+
+Date: 2026-10-21
+
+Decision: the GPU output stage is limited to the shipped `RTv4_sRGB` profile
+with relative colorimetric intent and integer output. It uses the profile's
+exact XYZ matrix and parametric tone curve, not the generic `sRGB_xyz`
+constants.
+
+Alternatives: the generic sRGB constants are shorter to write but differ from
+lcms by up to 26 LSB at 16-bit. A 3D LUT would cover arbitrary profiles but
+needs interpolation-error testing and a larger cache.
+
+Consequences: output conversion is 1 LSB parity on the six-format corpus.
+`RTv2_sRGB`, other output profiles and 32-bit float output keep the lcms path.
+`NoICMString` is not offloaded because it already uses the faster manual CPU
+sRGB path; adding a GPU round trip would be slower. The profile values are
+duplicated in `openclengine.cc` and must be updated if the shipped profile
+changes.

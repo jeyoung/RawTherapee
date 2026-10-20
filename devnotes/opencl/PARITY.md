@@ -27,6 +27,9 @@ difference between two identical runs). The gate is the peak absolute error
 | 2026-10-20 | 83919dd98 | AMD RX 550 | colorspace_flowers.pef / capture 0.75, no early stop | off vs auto | 1 LSB | PASS |
 | 2026-10-20 | 83919dd98 | AMD RX 550 | 2026-10-04-173409.NEF / capture 0.62, 20 it | off vs auto | 1 LSB | PASS |
 | 2026-10-20 | 83919dd98 | POCL (`RT_OPENCL_ALLOW_CPU=1`) | 2026-10-04-173409.NEF / capture 0.62, 20 it | off vs auto | 1 LSB | PASS |
+| 2026-10-21 | uncommitted | AMD RX 550 | colorspace_flowers.pef / neutral | off vs auto | 1 LSB | PASS |
+| 2026-10-21 | uncommitted | AMD RX 550 | d850.nef / neutral | off vs auto | 1 LSB | PASS |
+| 2026-10-21 | uncommitted | AMD RX 550 | jpg, tif, png manifest entries | off vs auto | 1 LSB | PASS |
 
 `verify.sh` now reports `SKIP` instead of `PASS` when no OpenCL device is
 selected, so a CPU-only build cannot produce a vacuous parity claim.
@@ -43,3 +46,10 @@ Notes:
   effect.
 - The TIFF files still differ byte-wise because of embedded timestamps; do not
   use SHA-256 of the file as a gate.
+- Output conversion is compared only for the shipped `RTv4_sRGB` profile and
+  8/16-bit integer output. Other profiles and float output continue to use
+  lcms and are pixel-identical between `--gpu=off` and `--gpu=auto`.
+- `compare_tiff.py` now normalises through ImageMagick to uncompressed 16-bit
+  TIFF and reads the encoded samples. The previous ImageMagick `rgb:` path
+  linearised the samples, which amplified a 1 LSB difference into a 26 LSB
+  PAE.
