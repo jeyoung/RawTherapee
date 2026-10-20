@@ -63,3 +63,16 @@ Transform stage on PEF is about 1 s; on the 45 MP NEF about 2.4 s. Single-stage
 offload remains roughly neutral because map transfer and the extra log image
 offset the GPU gain. Reducing map traffic (residency) and accelerating further
 stages is required for a clear end-to-end win.
+
+## Capture sharpening, 0.75 radius, 20 iterations
+
+PEF, 3896x2616:
+
+| Mode | Wall | Peak RSS | Stage |
+|---|---|---|---|
+| CPU | 7.88 s | 730 MB | — |
+| GPU | 7.71 s | 942 MB | 1.15 s |
+
+The GPU path is about 2% faster end-to-end. Larger images fall back to CPU at
+12 MP because the 1024-work-item, 35 KiB-local-memory tile kernel can exceed
+the AMD watchdog on older cards.

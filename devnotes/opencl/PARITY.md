@@ -21,6 +21,11 @@ difference between two identical runs). The gate is the peak absolute error
 | 2026-10-20 | f6cc5e236 | AMD RX 550 | d850.nef / resize 0.5x | off vs auto | 0 | PASS |
 | 2026-10-20 | c652e3505 | CPU build vs OpenCL `--gpu=off` | colorspace_flowers.pef / resize 0.5x | cross-build | 0 | PASS |
 
+| 2026-10-20 | uncommitted | AMD RX 550 | colorspace_flowers.pef / capture 0.75, 20 it | off vs auto | 1 LSB | PASS |
+| 2026-10-20 | uncommitted | POCL | colorspace_flowers.pef / capture 0.75, 20 it | off vs auto | 1 LSB | PASS |
+| 2026-10-20 | uncommitted | AMD RX 550 | colorspace_flowers.pef / capture 1.5, 10 it | off vs auto | 1 LSB | PASS |
+| 2026-10-20 | uncommitted | AMD RX 550 | colorspace_flowers.pef / capture 2.0, 10 it | off vs auto | 1 LSB | PASS |
+| 2026-10-20 | uncommitted | AMD RX 550 | colorspace_flowers.pef / capture 0.75, no early stop | off vs auto | 1 LSB | PASS |
 `verify.sh` now reports `SKIP` instead of `PASS` when no OpenCL device is
 selected, so a CPU-only build cannot produce a vacuous parity claim.
 

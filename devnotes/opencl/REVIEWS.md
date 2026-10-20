@@ -45,6 +45,23 @@ Independent review of the transform stage.
 | Manifest policy contradicted private rows | Header now distinguishes public and local private rows |
 | `DeviceInfo::fp64` unused | Removed |
 
+## R4 — M4 capture sharpening
+
+Independent review found that the first kernel draft did not compile: the
+parameter name `kernel` is a reserved OpenCL keyword, so every call silently
+fell back and the initial PAE 0 was a CPU-vs-CPU artefact.
+
+| Finding | Resolution |
+|---|---|
+| `kernel` parameter name | Renamed to `weights`; stage kernels are exercised by `--stage capture` with a run assertion |
+| Uninitialised `tmp` halo | Local `tmp` is filled with 1.0f before iterations |
+| Iterations only updated the 32x32 centre | Div/mult now iterates the full `[radius, full-radius)` tile, matching CPU |
+| Overlapping end tiles raced | Four ordered phases: normal, right edge, bottom edge, corner |
+| No local-memory/workgroup check | `DeviceInfo` records local memory and max workgroup; stage falls back below 35 KiB/1024 |
+| Preview used GPU in export-only mode | Thread-local stage permission set by SimpleProcess/ImProcCoordinator |
+| Compile after costly uploads | Program is built before staging the planes; timer starts after success |
+| 45 MP watchdog reset | GPU capture is limited to 12 MP; larger images use CPU |
+
 ## Outstanding
 
 - Automated Imagefloat resize coverage (the manual harness was not committed).

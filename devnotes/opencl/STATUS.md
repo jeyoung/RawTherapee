@@ -3,12 +3,25 @@
 ## Handover block
 
 - Branch: `opencl` (based on `dev` at `b2ee504c4`, 32 commits after tag 5.13)
-- Milestone: M3 — transform (complete); next M4 — capture sharpening
+- Milestone: M4 — capture sharpening (complete); next M5 — residency or M6 — packaging
 - Last verified: 2026-10-20, downscale and upscale parity on POCL and AMD
-- Next task: M4 — capture sharpening
+- Next task: M5 — buffer residency (optional) or M6 — portable package
 - Known limitations: single-stage acceleration is roughly neutral end-to-end;
   transform is limited to rotation/scale/crop without LCP, CA, distortion,
-  perspective or vignetting, and falls back to CPU for those
+  perspective or vignetting; capture sharpening uses the GPU only up to 12 MP
+  because larger tiles exceed the AMD watchdog
+
+## M4 evidence — capture sharpening
+
+- Scope: `sigmaCornerOffset == 0`, fixed 3/5/7/9/13 kernels, tile size 32,
+  per-tile early stop. Other cases fall back to CPU.
+- PEF 10 MP: PASS, PAE 1 LSB on AMD RX 550 and POCL.
+- 0.75, 1.5 and 2.0 radii, with and without early stop: PASS, PAE 1 LSB.
+- 45.7 MP NEF: falls back to CPU by design (12 MP limit avoids an AMD GPU
+  watchdog reset); CPU output unchanged.
+- Kernel uses 1024 work-items and ~35 KiB local memory; devices below that
+  fall back.
+- Stage ~1.1 s on PEF; total 7.71 s GPU versus 7.88 s CPU (about 2% faster).
 
 ## M3 evidence — transform
 
@@ -88,7 +101,7 @@ choose at runtime whether to use a device.
 | M1 | complete | device discovery, program cache, self-test |
 | M2 | complete | Lanczos resize |
 | M3 | complete | rotation/scale/crop transform |
-| M4 | pending | capture sharpening |
+| M4 | complete | capture sharpening (up to 12 MP) |
 | M6 | pending | portable package, CI, docs |
 
 ## Review
