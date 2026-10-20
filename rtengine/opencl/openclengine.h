@@ -83,6 +83,10 @@ bool transformRotateScale(const Imagefloat* src, Imagefloat* dst,
                           double cost, double sint, bool highQuality,
                           bool useLog);
 
+/** @brief Convert a Lab sub-image to sRGB output, matching the CPU path. */
+bool labToSrgbOut(const LabImage* src, Imagefloat* dst,
+                  int cx, int cy, int cw, int ch);
+
 /** @brief Allow GPU stages in the current worker thread. */
 void setStageAllowed(bool allowed);
 

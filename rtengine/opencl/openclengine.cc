@@ -33,6 +33,7 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <glib/gstdio.h>
@@ -372,6 +373,67 @@ __kernel void rt_transform(__global const float* srcR,
         dstG[index] = rt_finish(rt_bilinear1(srcG, srcWidth, srcHeight, xc, yc, dx, dy), useLog);
         dstB[index] = rt_finish(rt_bilinear1(srcB, srcWidth, srcHeight, xc, yc, dx, dy), useLog);
     }
+}
+)";
+
+const char* labToSrgbKernelSource = R"(
+#pragma OPENCL FP_CONTRACT OFF
+
+inline float rt_f2xyz(const float f)
+{
+    return f > 0.20689655172413793f
+        ? f * f * f
+        : (116.0f * f - 16.0f) * (27.0f / 24389.0f);
+}
+
+inline float rt_gamma_lookup(__global const float* lut, const float value)
+{
+    const float clamped = clamp(value, 0.0f, 65535.0f);
+    const int index = (int)clamped;
+    const int upper = min(index + 1, 65535);
+    const float fraction = clamped - (float)index;
+    return lut[index] + (lut[upper] - lut[index]) * fraction;
+}
+
+__kernel void rt_lab_to_srgb(__global const float* labL,
+                             __global const float* labA,
+                             __global const float* labB,
+                             __global float* dstR,
+                             __global float* dstG,
+                             __global float* dstB,
+                             __global const float* gammaLut,
+                             __global const float* matrix,
+                             const int width,
+                             const int height)
+{
+    const int x = get_global_id(0);
+    const int y = get_global_id(1);
+
+    if (x >= width || y >= height) {
+        return;
+    }
+
+    const int index = y * width + x;
+    const float L = labL[index];
+    const float a = labA[index];
+    const float b = labB[index];
+    const float LL = L / 327.68f;
+    const float fy = (0.008620689655172414f * L) / 327.68f
+        + 0.13793103448275862f;
+    const float fx = (0.002f * a) / 327.68f + fy;
+    const float fz = fy - (0.005f * b) / 327.68f;
+    const float xyzX = 65535.0f * rt_f2xyz(fx) * 0.9642f;
+    const float xyzZ = 65535.0f * rt_f2xyz(fz) * 0.8249f;
+    const float xyzY = LL > 8.0f
+        ? 65535.0f * fy * fy * fy
+        : 65535.0f * LL / 903.2962962962963f;
+    const float r = matrix[0] * xyzX + matrix[1] * xyzY + matrix[2] * xyzZ;
+    const float g = matrix[3] * xyzX + matrix[4] * xyzY + matrix[5] * xyzZ;
+    const float bOut = matrix[6] * xyzX + matrix[7] * xyzY + matrix[8] * xyzZ;
+
+    dstR[index] = rt_gamma_lookup(gammaLut, r);
+    dstG[index] = rt_gamma_lookup(gammaLut, g);
+    dstB[index] = rt_gamma_lookup(gammaLut, bOut);
 }
 )";
 
@@ -1876,6 +1938,212 @@ bool transformRotateScale(const Imagefloat* src, Imagefloat* dst,
         if (state.api.EnqueueReadBufferRect(
                 state.queue, destBuffers[plane], CL_TRUE, origin, origin,
                 destRegion, 0, 0, dst->getRowStride(), 0,
+                destPointers[plane], 0, nullptr, nullptr) != CL_SUCCESS) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool labToSrgbOut(const LabImage* src, Imagefloat* dst,
+                  int cx, int cy, int cw, int ch)
+{
+    if (src == nullptr || dst == nullptr || cw <= 0 || ch <= 0
+            || cx < 0 || cy < 0 || cx + cw > src->W || cy + ch > src->H
+            || dst->getWidth() != cw || dst->getHeight() != ch
+            || src->L == nullptr || src->a == nullptr || src->b == nullptr
+            || src->L[0] == nullptr || src->a[0] == nullptr
+            || src->b[0] == nullptr || dst->r(0) == nullptr
+            || dst->g(0) == nullptr || dst->b(0) == nullptr
+            || dst->getRowStride() == 0) {
+        return false;
+    }
+
+    Backend& state = backend();
+    std::lock_guard<std::recursive_mutex> lock(state.mutex);
+
+    if (!ensureInit() || state.infos.empty() || state.selected < 0
+            || !state.stageEnabled || !threadStageAllowed) {
+        return false;
+    }
+
+    if (!ensureSession(state)) {
+        return false;
+    }
+
+    StageTimer timer("lab2srgb", g_getenv("RT_OPENCL_PROFILE") != nullptr);
+
+    const size_t planeBytes = static_cast<size_t>(cw) * ch * sizeof(float);
+    constexpr size_t gammaEntries = 65536;
+    const size_t gammaBytes = gammaEntries * sizeof(float);
+    constexpr size_t matrixEntries = 9;
+    const size_t matrixBytes = matrixEntries * sizeof(float);
+    const size_t totalBytes = 6 * planeBytes + gammaBytes + matrixBytes;
+    const DeviceInfo& info = state.infos[state.selected];
+
+    if ((info.maxAllocation > 0
+            && (planeBytes > info.maxAllocation
+                || gammaBytes > info.maxAllocation
+                || matrixBytes > info.maxAllocation))
+            || !ensureBudget(state, totalBytes)
+            || (info.globalMemory > 0
+                && totalBytes > info.globalMemory * 8 / 10)) {
+        if (settings != nullptr && settings->verbose) {
+            std::fprintf(stderr,
+                         "OpenCL: output conversion needs %zu bytes, device has %llu\n",
+                         totalBytes, info.globalMemory);
+        }
+        return false;
+    }
+
+    // The matrix and parametric tone curve below are the exact values from
+    // rtdata/iccprofiles/output/RTv4_sRGB.icc. The curve is evaluated in the
+    // inverse direction, from linear light to encoded sRGB.
+    constexpr double curveGamma = 2.399993896484375;
+    constexpr double curveA = 0.9478607177734375;
+    constexpr double curveB = 0.0521392822265625;
+    constexpr double curveC = 0.077392578125;
+    constexpr double curveD = 0.0392913818359375;
+    constexpr double curveThreshold = curveC * curveD;
+    std::vector<float> gammaLut(gammaEntries);
+
+    for (size_t i = 0; i < gammaEntries; ++i) {
+        const double x = static_cast<double>(i) / 65535.0;
+        const double y = x >= curveThreshold
+            ? (std::pow(x, 1.0 / curveGamma) - curveB) / curveA
+            : x / curveC;
+        gammaLut[i] = static_cast<float>(y * 65535.0);
+    }
+
+    const float matrix[matrixEntries] = {
+        3.13427424f, -1.61727405f, -0.490734816f,
+        -0.978795588f, 1.91616154f, 0.0334540494f,
+        0.0719785541f, -0.228989884f, 1.40574837f
+    };
+
+    BufferSet buffers;
+    buffers.owner = &state;
+    buffers.api = &state.api;
+    KernelSet kernels;
+    kernels.api = &state.api;
+
+    const auto createBuffer = [&](cl_mem_flags flags, size_t bytes,
+                                  const void* host) -> cl_mem {
+        if (host == nullptr && (flags & CL_MEM_COPY_HOST_PTR) == 0) {
+            cl_mem memory = acquireBuffer(state, bytes);
+            return buffers.add(memory, bytes, true);
+        }
+
+        cl_int error = CL_SUCCESS;
+        cl_mem memory = state.api.CreateBuffer(state.context, flags, bytes,
+                                               const_cast<void*>(host), &error);
+
+        if (memory == nullptr || error != CL_SUCCESS) {
+            if (memory != nullptr) {
+                state.api.ReleaseMemObject(memory);
+            }
+            return nullptr;
+        }
+
+        return buffers.add(memory);
+    };
+
+    cl_mem sourceBuffers[3] = {};
+    cl_mem destBuffers[3] = {};
+    const size_t zeroOrigin[3] = {0, 0, 0};
+    const size_t sourceOrigin[3] = {
+        static_cast<size_t>(cx) * sizeof(float),
+        static_cast<size_t>(cy), 0};
+    const size_t sourceRegion[3] = {
+        static_cast<size_t>(cw) * sizeof(float),
+        static_cast<size_t>(ch), 1};
+    const size_t destRegion[3] = {
+        static_cast<size_t>(cw) * sizeof(float),
+        static_cast<size_t>(ch), 1};
+    const size_t sourceRowPitch = static_cast<size_t>(src->W) * sizeof(float);
+    const size_t destRowPitch = dst->getRowStride();
+    const float* sourcePointers[3] = {src->L[0], src->a[0], src->b[0]};
+    float* destPointers[3] = {dst->r(0), dst->g(0), dst->b(0)};
+
+    for (int plane = 0; plane < 3; ++plane) {
+        sourceBuffers[plane] = createBuffer(CL_MEM_READ_ONLY, planeBytes, nullptr);
+        destBuffers[plane] = createBuffer(CL_MEM_WRITE_ONLY, planeBytes, nullptr);
+
+        if (sourceBuffers[plane] == nullptr || destBuffers[plane] == nullptr) {
+            return false;
+        }
+
+        if (state.api.EnqueueWriteBufferRect(
+                state.queue, sourceBuffers[plane], CL_TRUE, zeroOrigin,
+                sourceOrigin, sourceRegion, 0, 0, sourceRowPitch, 0,
+                sourcePointers[plane], 0, nullptr, nullptr) != CL_SUCCESS) {
+            return false;
+        }
+    }
+
+    cl_mem gammaBuffer = createBuffer(
+        CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, gammaBytes, gammaLut.data());
+    cl_mem matrixBuffer = createBuffer(
+        CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, matrixBytes, matrix);
+
+    if (gammaBuffer == nullptr || matrixBuffer == nullptr) {
+        return false;
+    }
+
+    std::string error;
+    cl_program program = programFor(state, labToSrgbKernelSource,
+                                    "-cl-std=CL1.2", error);
+
+    if (program == nullptr) {
+        if (settings != nullptr && settings->verbose && !error.empty()) {
+            std::fprintf(stderr, "OpenCL: %s\n", error.c_str());
+        }
+        return false;
+    }
+
+    cl_int status = CL_SUCCESS;
+    cl_kernel kernel = kernels.add(
+        state.api.CreateKernel(program, "rt_lab_to_srgb", &status));
+
+    if (kernel == nullptr || status != CL_SUCCESS) {
+        return false;
+    }
+
+    const cl_int widthArg = cw;
+    const cl_int heightArg = ch;
+    status = CL_SUCCESS;
+    status |= state.api.SetKernelArg(kernel, 0, sizeof(cl_mem), &sourceBuffers[0]);
+    status |= state.api.SetKernelArg(kernel, 1, sizeof(cl_mem), &sourceBuffers[1]);
+    status |= state.api.SetKernelArg(kernel, 2, sizeof(cl_mem), &sourceBuffers[2]);
+    status |= state.api.SetKernelArg(kernel, 3, sizeof(cl_mem), &destBuffers[0]);
+    status |= state.api.SetKernelArg(kernel, 4, sizeof(cl_mem), &destBuffers[1]);
+    status |= state.api.SetKernelArg(kernel, 5, sizeof(cl_mem), &destBuffers[2]);
+    status |= state.api.SetKernelArg(kernel, 6, sizeof(cl_mem), &gammaBuffer);
+    status |= state.api.SetKernelArg(kernel, 7, sizeof(cl_mem), &matrixBuffer);
+    status |= state.api.SetKernelArg(kernel, 8, sizeof(cl_int), &widthArg);
+    status |= state.api.SetKernelArg(kernel, 9, sizeof(cl_int), &heightArg);
+
+    if (status != CL_SUCCESS) {
+        return false;
+    }
+
+    const size_t global[2] = {
+        static_cast<size_t>(cw), static_cast<size_t>(ch)};
+
+    if (state.api.EnqueueNDRangeKernel(state.queue, kernel, 2, nullptr, global,
+                                       nullptr, 0, nullptr, nullptr) != CL_SUCCESS) {
+        return false;
+    }
+
+    if (state.api.Finish(state.queue) != CL_SUCCESS) {
+        return false;
+    }
+
+    for (int plane = 0; plane < 3; ++plane) {
+        if (state.api.EnqueueReadBufferRect(
+                state.queue, destBuffers[plane], CL_TRUE, zeroOrigin,
+                zeroOrigin, destRegion, 0, 0, destRowPitch, 0,
                 destPointers[plane], 0, nullptr, nullptr) != CL_SUCCESS) {
             return false;
         }

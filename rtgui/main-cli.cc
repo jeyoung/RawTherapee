@@ -688,6 +688,12 @@ int processLineParams ( int argc, char **argv )
         }
     }
 
+    if (!outputType.empty()) {
+        options.saveFormat.format = outputType;
+    }
+    options.saveFormat.tiffBits = bits;
+    options.saveFormat.tiffFloat = isFloat;
+
     if ( !App::get().argv1().empty() ) {
         return 1;
     }

@@ -26,6 +26,7 @@
 #include "imagefloat.h"
 #include "improcfun.h"
 #include "labimage.h"
+#include "opencl/openclengine.h"
 #include "procparams.h"
 #include "rtengine.h"
 #include "settings.h"
@@ -38,6 +39,12 @@ namespace rtengine
 
 namespace
 {
+
+bool outputUsesRtv4Srgb(const procparams::ColorManagementParams& icm)
+{
+    return icm.outputIntent == RI_RELATIVE
+        && icm.outputProfile == "RTv4_sRGB";
+}
 
 inline void copyAndClampLine(const float *src, unsigned char *dst, const int W)
 {
@@ -342,7 +349,7 @@ Image8* ImProcFunctions::lab2rgb(LabImage* lab, int cx, int cy, int cw, int ch, 
  * If a custom gamma profile can be created, divide by 327.68, convert to xyz and apply the custom gamma transform
  * otherwise divide by 327.68, convert to xyz and apply the sRGB transform, before converting with gamma2curve
  */
-Imagefloat* ImProcFunctions::lab2rgbOut(LabImage* lab, int cx, int cy, int cw, int ch, const procparams::ColorManagementParams &icm)
+Imagefloat* ImProcFunctions::lab2rgbOut(LabImage* lab, int cx, int cy, int cw, int ch, const procparams::ColorManagementParams &icm, bool allowGpu)
 {
 
     if (cx < 0) {
@@ -362,6 +369,13 @@ Imagefloat* ImProcFunctions::lab2rgbOut(LabImage* lab, int cx, int cy, int cw, i
     }
 
     Imagefloat* image = new Imagefloat(cw, ch);
+
+    if (allowGpu && openCLAllowed && opencl::enabled()
+            && outputUsesRtv4Srgb(icm)
+            && opencl::labToSrgbOut(lab, image, cx, cy, cw, ch)) {
+        return image;
+    }
+
     cmsHPROFILE oprof = ICCStore::getInstance()->getProfile(icm.outputProfile);
 
     if (oprof) {

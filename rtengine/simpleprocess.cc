@@ -2131,7 +2131,11 @@ private:
         // if Default gamma mode: we use the profile selected in the "Output profile" combobox;
         // gamma come from the selected profile, otherwise it comes from "Free gamma" tool
 
-        Imagefloat* readyImg = ipf.lab2rgbOut(labView, cx, cy, cw, ch, params.icm);
+        const auto& saveFormat = App::get().options().saveFormat;
+        const bool allowGpuOutput = !(saveFormat.format == "tif"
+                                      && saveFormat.tiffFloat);
+        Imagefloat* readyImg = ipf.lab2rgbOut(labView, cx, cy, cw, ch,
+                                              params.icm, allowGpuOutput);
 
         if (settings->verbose) {
             printf("Output profile_: \"%s\"\n", params.icm.outputProfile.c_str());

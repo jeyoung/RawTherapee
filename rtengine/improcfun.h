@@ -613,7 +613,7 @@ enum class BlurType {
     Image8*     lab2rgb(LabImage* lab, int cx, int cy, int cw, int ch, const procparams::ColorManagementParams &icm, bool consider_histogram_settings = true);
     void rgb2lab(const Image8 &src, int x, int y, int w, int h, float L[], float a[], float b[], const procparams::ColorManagementParams &icm, bool consider_histogram_settings = true) const;
     static void rgb2lab(std::uint8_t red, std::uint8_t green, std::uint8_t blue, float &L, float &a, float &b, const procparams::ColorManagementParams &icm, bool consider_histogram_settings = true);
-    Imagefloat*    lab2rgbOut(LabImage* lab, int cx, int cy, int cw, int ch, const procparams::ColorManagementParams &icm);
+    Imagefloat*    lab2rgbOut(LabImage* lab, int cx, int cy, int cw, int ch, const procparams::ColorManagementParams &icm, bool allowGpu = true);
     // CieImage *ciec;
     
     void gamutcompr( rtengine::Imagefloat *src, rtengine::Imagefloat *dst, int beginend, float powe, int nbsegam, float &mac, float &mac0, float &mac1, float &mac2) const;

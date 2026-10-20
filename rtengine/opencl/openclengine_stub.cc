@@ -91,6 +91,11 @@ bool transformRotateScale(const Imagefloat*, Imagefloat*, int, int, int, int,
     return false;
 }
 
+bool labToSrgbOut(const LabImage*, Imagefloat*, int, int, int, int)
+{
+    return false;
+}
+
 bool captureSharpening(float**, const float* const*, const float* const*,
                        int, int, float, float, int, bool)
 {
