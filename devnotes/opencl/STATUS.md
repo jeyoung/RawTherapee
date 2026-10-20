@@ -28,6 +28,8 @@
   list.
 - Preferences screenshot under Xvfb shows the Rusticl field with
   `Auto (radeonsi)` and the environment/restart hint.
+- Typing `llvmpipe` and pressing OK writes
+  `OpenCLRusticlDriver=llvmpipe` to the options file.
 - The package recommends `mesa-opencl-icd`, so a normal install has a Rusticl
   ICD on current Debian.
 
