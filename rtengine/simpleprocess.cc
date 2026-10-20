@@ -31,6 +31,7 @@
 #include "imagefloat.h"
 #include "imagesource.h"
 #include "improcfun.h"
+#include "opencl/openclengine.h"
 #include "labimage.h"
 #include "metadata.h"
 #include "mytime.h"
@@ -224,6 +225,7 @@ private:
         ipf_p.reset(new ImProcFunctions(&params, true));
         ImProcFunctions &ipf = * (ipf_p.get());
         ipf.setOpenCLAllowed(App::get().options().rtSettings.useOpenCL);
+        opencl::setStageAllowed(App::get().options().rtSettings.useOpenCL);
 
         imgsrc->setCurrentFrame(params.raw.bayersensor.imageNum);
         float reddeha = 0.f;

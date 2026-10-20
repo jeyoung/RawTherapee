@@ -22,6 +22,7 @@
 #include "rtengine/opencl/openclloader.h"
 #include "rtengine/imagefloat.h"
 #include "rtengine/labimage.h"
+#include "boxblur.h"
 #include "rtengine/settings.h"
 #include "rt_math.h"
 #include "sleef.h"
@@ -33,6 +34,7 @@
 #include <cctype>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <glib/gstdio.h>
 #include <memory>
 #include <mutex>
@@ -47,6 +49,8 @@ namespace opencl
 
 namespace
 {
+
+thread_local bool threadStageAllowed = false;
 
 struct Backend {
     std::unique_ptr<Glib::Module> module;
@@ -123,6 +127,136 @@ __kernel void rt_resize_horizontal(__global const float* temp,
     }
 
     dst[y * dstWidth + x] = sum;
+}
+)";
+
+const char* captureSharpeningKernelSource = R"(
+#pragma OPENCL FP_CONTRACT OFF
+
+#define RT_TILE 32
+#define RT_FULL 48
+
+inline float rt_conv(__local const float* src, const int x, const int y,
+                     const int radius, __global const float* weights)
+{
+    const int size = 2 * radius + 1;
+    float sum = 0.0f;
+
+    for (int i = -radius; i <= radius; ++i) {
+        for (int j = -radius; j <= radius; ++j) {
+            sum += weights[(i + radius) * size + (j + radius)]
+                * src[(y + i) * RT_FULL + (x + j)];
+        }
+    }
+
+    return sum;
+}
+
+__kernel __attribute__((reqd_work_group_size(RT_TILE, RT_TILE, 1)))
+void rt_capture(__global const float* oldLum,
+                __global const float* blend,
+                __global float* lum,
+                __global const float* weights,
+                const int width, const int height,
+                const int border, const int full,
+                const int iterations, const int checkStop,
+                const int radius, const int phase)
+{
+    __local float tmpI[RT_FULL * RT_FULL];
+    __local float tmp[RT_FULL * RT_FULL];
+    __local float lumLocal[RT_FULL * RT_FULL];
+    __local float iterCheck[RT_TILE * RT_TILE];
+    __local float maxBlend[RT_TILE * RT_TILE];
+    __local int stopFlag;
+
+    const int wx = get_local_id(0);
+    const int wy = get_local_id(1);
+    const int tileX = border + get_group_id(0) * RT_TILE;
+    const int tileY = border + get_group_id(1) * RT_TILE;
+    const int endX = (tileX + RT_TILE + border) >= width;
+    const int endY = (tileY + RT_TILE + border) >= height;
+    const int groupPhase = endY ? (endX ? 3 : 2) : (endX ? 1 : 0);
+
+    if (groupPhase != phase) {
+        return;
+    }
+
+    const int startX = endX ? width - full : tileX - border;
+    const int startY = endY ? height - full : tileY - border;
+
+    for (int y = wy; y < RT_FULL; y += RT_TILE) {
+        for (int x = wx; x < RT_FULL; x += RT_TILE) {
+            tmp[y * RT_FULL + x] = 1.0f;
+        }
+    }
+
+    for (int y = wy; y < full; y += RT_TILE) {
+        for (int x = wx; x < full; x += RT_TILE) {
+            const float value = oldLum[(startY + y) * width + startX + x];
+            tmpI[y * RT_FULL + x] = value;
+            lumLocal[y * RT_FULL + x] = value;
+        }
+    }
+
+    const int outX = startX + border + wx;
+    const int outY = startY + border + wy;
+    const float blendValue = blend[outY * width + outX];
+    iterCheck[wy * RT_TILE + wx] = oldLum[outY * width + outX]
+        * blendValue * 0.5f;
+    maxBlend[wy * RT_TILE + wx] = blendValue;
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    for (int stride = (RT_TILE * RT_TILE) / 2; stride > 0; stride >>= 1) {
+        if (wy * RT_TILE + wx < stride) {
+            maxBlend[wy * RT_TILE + wx] = fmax(
+                maxBlend[wy * RT_TILE + wx],
+                maxBlend[wy * RT_TILE + wx + stride]);
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    if (maxBlend[0] < 0.01f) {
+        return;
+    }
+
+    const int index = (border + wy) * RT_FULL + border + wx;
+
+    for (int iteration = 0; iteration < iterations; ++iteration) {
+        for (int y = radius + wy; y < full - radius; y += RT_TILE) {
+            for (int x = radius + wx; x < full - radius; x += RT_TILE) {
+                tmp[y * RT_FULL + x] = lumLocal[y * RT_FULL + x]
+                    / fmax(rt_conv(tmpI, x, y, radius, weights), 0.00001f);
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        for (int y = radius + wy; y < full - radius; y += RT_TILE) {
+            for (int x = radius + wx; x < full - radius; x += RT_TILE) {
+                tmpI[y * RT_FULL + x] *= rt_conv(tmp, x, y, radius, weights);
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        if (checkStop) {
+            if (wx == 0 && wy == 0) {
+                stopFlag = 0;
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
+
+            if (tmpI[index] < iterCheck[wy * RT_TILE + wx]) {
+                atomic_or(&stopFlag, 1);
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
+
+            if (stopFlag && iteration < iterations - 1) {
+                break;
+            }
+        }
+    }
+
+    const float current = lum[outY * width + outX];
+    lum[outY * width + outX] = blendValue * (tmpI[index] - current)
+        + current;
 }
 )";
 
@@ -763,6 +897,22 @@ bool enumerate(Backend& state)
                                         sizeof(maxAllocation), &maxAllocation,
                                         nullptr) == CL_SUCCESS) {
                 info.maxAllocation = maxAllocation;
+            }
+
+            cl_ulong localMemory = 0;
+
+            if (state.api.GetDeviceInfo(device, CL_DEVICE_LOCAL_MEM_SIZE,
+                                        sizeof(localMemory), &localMemory,
+                                        nullptr) == CL_SUCCESS) {
+                info.localMemory = localMemory;
+            }
+
+            size_t maxWorkGroup = 0;
+
+            if (state.api.GetDeviceInfo(device, CL_DEVICE_MAX_WORK_GROUP_SIZE,
+                                        sizeof(maxWorkGroup), &maxWorkGroup,
+                                        nullptr) == CL_SUCCESS) {
+                info.maxWorkGroup = maxWorkGroup;
             }
 
             if (info.name.empty()) {
@@ -1455,6 +1605,252 @@ bool transformRotateScale(const Imagefloat* src, Imagefloat* dst,
                 destPointers[plane], 0, nullptr, nullptr) != CL_SUCCESS) {
             return false;
         }
+    }
+
+    return true;
+}
+
+void setStageAllowed(bool allowed)
+{
+    threadStageAllowed = allowed;
+}
+
+bool stageAllowed()
+{
+    return threadStageAllowed;
+}
+
+bool captureSharpening(float** luminance, const float* const* oldLuminance,
+                       const float* const* blend, int width, int height,
+                       float sigma, float sigmaCornerOffset, int iterations,
+                       bool checkIterStop)
+{
+    if (luminance == nullptr || oldLuminance == nullptr || blend == nullptr
+            || width <= 0 || height <= 0 || sigmaCornerOffset != 0.0f
+            || iterations <= 0) {
+        return false;
+    }
+
+    int radius = 0;
+
+    if (sigma < 0.6f) {
+        radius = 1;
+    } else if (sigma <= 0.84f) {
+        radius = 2;
+    } else if (sigma <= 1.15f) {
+        radius = 3;
+    } else if (sigma <= 1.5f) {
+        radius = 4;
+    } else {
+        radius = 6;
+    }
+
+    const int border = radius <= 3 ? (iterations <= 30 ? 5 : 7) : 8;
+    constexpr int tile = 32;
+    const int full = tile + 2 * border;
+
+    if (width < full || height < full) {
+        return false;
+    }
+
+    const int kernelSize = 2 * radius + 1;
+    std::vector<float> flatKernel(static_cast<size_t>(kernelSize) * kernelSize);
+
+    if (radius == 1) {
+        float kernel[3][3];
+        compute3x3kernel2(sigma, kernel);
+        for (int y = 0; y < 3; ++y) {
+            for (int x = 0; x < 3; ++x) {
+                flatKernel[y * 3 + x] = kernel[y][x];
+            }
+        }
+    } else if (radius == 2) {
+        float kernel[5][5];
+        compute5x5kernel2(sigma, kernel);
+        for (int y = 0; y < 5; ++y) {
+            for (int x = 0; x < 5; ++x) {
+                flatKernel[y * 5 + x] = kernel[y][x];
+            }
+        }
+    } else if (radius == 3) {
+        float kernel[7][7];
+        compute7x7kernel2(sigma, kernel);
+        for (int y = 0; y < 7; ++y) {
+            for (int x = 0; x < 7; ++x) {
+                flatKernel[y * 7 + x] = kernel[y][x];
+            }
+        }
+    } else if (radius == 4) {
+        float kernel[9][9];
+        compute9x9kernel2(sigma, kernel);
+        for (int y = 0; y < 9; ++y) {
+            for (int x = 0; x < 9; ++x) {
+                flatKernel[y * 9 + x] = kernel[y][x];
+            }
+        }
+    } else {
+        float kernel[13][13];
+        compute13x13kernel2(sigma, kernel);
+        for (int y = 0; y < 13; ++y) {
+            for (int x = 0; x < 13; ++x) {
+                flatKernel[y * 13 + x] = kernel[y][x];
+            }
+        }
+    }
+
+    Backend& state = backend();
+    std::lock_guard<std::recursive_mutex> lock(state.mutex);
+
+    if (!threadStageAllowed || !ensureInit() || state.infos.empty()
+            || state.selected < 0 || !state.stageEnabled
+            || !ensureSession(state)) {
+        return false;
+    }
+
+    const size_t planeBytes = static_cast<size_t>(width) * height * sizeof(float);
+    const DeviceInfo& info = state.infos[state.selected];
+
+    // The tiled kernel needs 1024 work-items and about 35 KiB of local memory.
+    // Large images also exceed the GPU watchdog on older AMD hardware.
+    constexpr unsigned long long maxPixels = 12000000ULL;
+
+    if (static_cast<unsigned long long>(width) * height > maxPixels
+            || (info.localMemory > 0 && info.localMemory < 36864ULL)
+            || (info.maxWorkGroup > 0 && info.maxWorkGroup < 1024ULL)) {
+        return false;
+    }
+
+    if ((info.maxAllocation > 0 && planeBytes > info.maxAllocation)
+            || (info.globalMemory > 0 && 3 * planeBytes > info.globalMemory * 8 / 10)) {
+        return false;
+    }
+
+    std::string error;
+    cl_program program = programFor(state, captureSharpeningKernelSource,
+                                    "-cl-std=CL1.2", error);
+
+    if (program == nullptr) {
+        if (settings != nullptr && settings->verbose && !error.empty()) {
+            std::fprintf(stderr, "OpenCL: %s\n", error.c_str());
+        }
+        return false;
+    }
+
+    StageTimer timer("capture sharpening",
+                     g_getenv("RT_OPENCL_PROFILE") != nullptr);
+
+    std::vector<float> oldPlane(static_cast<size_t>(width) * height);
+    std::vector<float> blendPlane(static_cast<size_t>(width) * height);
+    std::vector<float> lumPlane(static_cast<size_t>(width) * height);
+
+    for (int y = 0; y < height; ++y) {
+        const size_t offset = static_cast<size_t>(y) * width;
+        std::memcpy(&oldPlane[offset], oldLuminance[y], width * sizeof(float));
+        std::memcpy(&blendPlane[offset], blend[y], width * sizeof(float));
+        std::memcpy(&lumPlane[offset], luminance[y], width * sizeof(float));
+    }
+
+    BufferSet buffers;
+    buffers.api = &state.api;
+    KernelSet kernels;
+    kernels.api = &state.api;
+
+    const auto createBuffer = [&](cl_mem_flags flags, size_t bytes,
+                                  const void* host) -> cl_mem {
+        cl_int error = CL_SUCCESS;
+        cl_mem memory = state.api.CreateBuffer(state.context, flags, bytes,
+                                               const_cast<void*>(host), &error);
+
+        if (memory == nullptr || error != CL_SUCCESS) {
+            if (memory != nullptr) {
+                state.api.ReleaseMemObject(memory);
+            }
+            return nullptr;
+        }
+
+        return buffers.add(memory);
+    };
+
+    cl_mem oldBuffer = createBuffer(CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                    planeBytes, oldPlane.data());
+    cl_mem blendBuffer = createBuffer(CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                      planeBytes, blendPlane.data());
+    cl_mem lumBuffer = createBuffer(CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR,
+                                    planeBytes, lumPlane.data());
+    cl_mem kernelBuffer = createBuffer(CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                       flatKernel.size() * sizeof(float),
+                                       flatKernel.data());
+
+    if (oldBuffer == nullptr || blendBuffer == nullptr || lumBuffer == nullptr
+            || kernelBuffer == nullptr) {
+        return false;
+    }
+
+    cl_int status = CL_SUCCESS;
+    cl_kernel kernelObject = kernels.add(
+        state.api.CreateKernel(program, "rt_capture", &status));
+
+    if (kernelObject == nullptr || status != CL_SUCCESS) {
+        return false;
+    }
+
+    const cl_int widthArg = width;
+    const cl_int heightArg = height;
+    const cl_int borderArg = border;
+    const cl_int fullArg = full;
+    const cl_int iterationsArg = iterations;
+    const cl_int checkStopArg = checkIterStop ? 1 : 0;
+    const cl_int radiusArg = radius;
+
+    status |= state.api.SetKernelArg(kernelObject, 0, sizeof(cl_mem), &oldBuffer);
+    status |= state.api.SetKernelArg(kernelObject, 1, sizeof(cl_mem), &blendBuffer);
+    status |= state.api.SetKernelArg(kernelObject, 2, sizeof(cl_mem), &lumBuffer);
+    status |= state.api.SetKernelArg(kernelObject, 3, sizeof(cl_mem), &kernelBuffer);
+    status |= state.api.SetKernelArg(kernelObject, 4, sizeof(cl_int), &widthArg);
+    status |= state.api.SetKernelArg(kernelObject, 5, sizeof(cl_int), &heightArg);
+    status |= state.api.SetKernelArg(kernelObject, 6, sizeof(cl_int), &borderArg);
+    status |= state.api.SetKernelArg(kernelObject, 7, sizeof(cl_int), &fullArg);
+    status |= state.api.SetKernelArg(kernelObject, 8, sizeof(cl_int), &iterationsArg);
+    status |= state.api.SetKernelArg(kernelObject, 9, sizeof(cl_int), &checkStopArg);
+    status |= state.api.SetKernelArg(kernelObject, 10, sizeof(cl_int), &radiusArg);
+
+    if (status != CL_SUCCESS) {
+        return false;
+    }
+
+    const int tilesX = (width - 2 * border + tile - 1) / tile;
+    const int tilesY = (height - 2 * border + tile - 1) / tile;
+    const size_t global[2] = {
+        static_cast<size_t>(tilesX) * tile,
+        static_cast<size_t>(tilesY) * tile};
+    const size_t local[2] = {tile, tile};
+
+    // CPU tiles overlap at the right and bottom edges; run the non-overlapping
+    // tiles first, then the overlapping edge phases in the same order.
+    for (cl_int phase = 0; phase < 4; ++phase) {
+        if (state.api.SetKernelArg(kernelObject, 11, sizeof(cl_int),
+                                   &phase) != CL_SUCCESS
+                || state.api.EnqueueNDRangeKernel(state.queue, kernelObject,
+                                                  2, nullptr, global, local,
+                                                  0, nullptr,
+                                                  nullptr) != CL_SUCCESS) {
+            return false;
+        }
+    }
+
+    if (state.api.Finish(state.queue) != CL_SUCCESS) {
+        return false;
+    }
+
+    if (state.api.EnqueueReadBuffer(state.queue, lumBuffer, CL_TRUE, 0,
+                                    planeBytes, lumPlane.data(), 0, nullptr,
+                                    nullptr) != CL_SUCCESS) {
+        return false;
+    }
+
+    for (int y = 0; y < height; ++y) {
+        std::memcpy(luminance[y], &lumPlane[static_cast<size_t>(y) * width],
+                    width * sizeof(float));
     }
 
     return true;

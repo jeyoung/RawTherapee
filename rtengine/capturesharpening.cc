@@ -31,6 +31,7 @@
 #include "opthelper.h"
 #include "rtgui/multilangmgr.h"
 #include "improcfun.h"
+#include "opencl/openclengine.h"
 #include "boxblur.h"
 #include "median.h"
 #include "imagefloat.h"
@@ -299,6 +300,17 @@ bool checkForStop(float** tmpIThr, float** iterCheck, int fullTileSize, int bord
 void CaptureDeconvSharpening (float** luminance, const float* const * oldLuminance, const float * const * blend, int W, int H, float sigma, float sigmaCornerOffset, int iterations, bool checkIterStop, rtengine::ProgressListener* plistener, double startVal, double endVal)
 {
 BENCHFUN
+
+    if (rtengine::opencl::stageAllowed()
+            && rtengine::opencl::captureSharpening(luminance, oldLuminance,
+                                                   blend, W, H, sigma,
+                                                   sigmaCornerOffset, iterations,
+                                                   checkIterStop)) {
+        if (plistener) {
+            plistener->setProgress(endVal);
+        }
+        return;
+    }
     const bool is9x9 = (sigma <= 1.5f && sigmaCornerOffset == 0.f);
     const bool is7x7 = (sigma <= 1.15f && sigmaCornerOffset == 0.f);
     const bool is5x5 = (sigma <= 0.84f && sigmaCornerOffset == 0.f);

@@ -86,6 +86,21 @@ bool transformRotateScale(const Imagefloat*, Imagefloat*, int, int, int, int,
     return false;
 }
 
+bool captureSharpening(float**, const float* const*, const float* const*,
+                       int, int, float, float, int, bool)
+{
+    return false;
+}
+
+void setStageAllowed(bool)
+{
+}
+
+bool stageAllowed()
+{
+    return false;
+}
+
 std::string statusText()
 {
     return notBuilt;

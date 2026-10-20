@@ -38,6 +38,8 @@ struct DeviceInfo {
     std::string driver;
     unsigned long long globalMemory = 0;
     unsigned long long maxAllocation = 0;
+    unsigned long long localMemory = 0;
+    unsigned long long maxWorkGroup = 0;
     bool cpu = false;
 };
 
@@ -77,6 +79,18 @@ bool transformRotateScale(const Imagefloat* src, Imagefloat* dst,
                           double hscale, double vscale,
                           double cost, double sint, bool highQuality,
                           bool useLog);
+
+/** @brief Allow GPU stages in the current worker thread. */
+void setStageAllowed(bool allowed);
+
+/** @brief Whether GPU stages are allowed in the current worker thread. */
+bool stageAllowed();
+
+/** @brief Capture-sharpening deconvolution on a raw luminance plane. */
+bool captureSharpening(float** luminance, const float* const* oldLuminance,
+                       const float* const* blend, int width, int height,
+                       float sigma, float sigmaCornerOffset, int iterations,
+                       bool checkIterStop);
 
 /** @brief Short human readable state, also used by --gpu-info. */
 std::string statusText();

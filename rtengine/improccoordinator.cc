@@ -21,6 +21,7 @@
 #include <glibmm/thread.h>
 
 #include "improccoordinator.h"
+#include "opencl/openclengine.h"
 
 #include "array2D.h"
 #include "cieimage.h"
@@ -351,6 +352,8 @@ void ImProcCoordinator::updatePreviewImage(int todo, bool panningRelatedChange)
     const auto prevdemo = App::get().options().prevdemo;
     ipf.setOpenCLAllowed(App::get().options().rtSettings.useOpenCL
                          && App::get().options().rtSettings.openCLMode == 1);
+    opencl::setStageAllowed(App::get().options().rtSettings.useOpenCL
+                            && App::get().options().rtSettings.openCLMode == 1);
     bool highDetailNeeded = prevdemo == PD_Sidecar ? true : (todo & M_HIGHQUAL);
     //    printf("metwb=%s \n", params->wb.method.c_str());
 
