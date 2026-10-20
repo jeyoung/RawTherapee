@@ -96,7 +96,8 @@ also hide POCL when the GPU runtime exists but reports no device. Auto mode
 ignores CPU OpenCL devices because the native CPU path is faster. To use POCL
 for testing, point `OCL_ICD_VENDORS` at a directory containing only
 `pocl.icd` and set `RT_OPENCL_ALLOW_CPU=1`, or select the POCL device
-explicitly. `RT_OPENCL_VENDOR_FILTER=0` disables the workaround, but the
+explicitly. The allow flag is a fallback when no GPU device is selected; on a
+mixed system use the explicit device selection. `RT_OPENCL_VENDOR_FILTER=0` disables the workaround, but the
 loader may then crash on broken vendor combinations.
 
 Compiled kernels are cached in the RawTherapee cache directory, under

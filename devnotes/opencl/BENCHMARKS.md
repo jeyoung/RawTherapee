@@ -10,7 +10,7 @@ CPU path is not reproducible.
 |---|---|
 | CPU | Intel Core i7-3770, 4 cores / 8 threads |
 | GPU | AMD Radeon RX 550 / 550 Series (Polaris 12), 4 GB |
-| Driver | Mesa 26.1.6, Rusticl, `RUSTICL_ENABLE=radeonsi` |
+| Driver | Mesa 26.1.6, Rusticl, auto-detected `RUSTICL_ENABLE=radeonsi` |
 | OS | Debian 13 trixie |
 
 ## Lanczos resize, 0.5x

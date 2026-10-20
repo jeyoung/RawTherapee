@@ -2,7 +2,7 @@
 
 ## Handover block
 
-- Branch: `opencl` (based on `dev` at `b2ee504c4`, 32 commits after tag 5.13)
+- Branch: `perf` (based on `opencl`, which is based on `dev` at `b2ee504c4`)
 - Milestone: M7 — Rusticl auto-detection (complete); next release hardening
 - Last verified: 2026-10-20, downscale and upscale parity on POCL and AMD
 - Next task: release hardening, format matrix and optional residency
@@ -68,9 +68,11 @@
 - Kernel uses 1024 work-items and ~35 KiB local memory; devices below that
   fall back. Work per chunk is bounded by `chunkBudget` so high radius/iteration
   settings can fall back to CPU instead of tripping the watchdog.
-- POCL remains a functional test target: `RT_OPENCL_ALLOW_CPU=1` selects the
-  CPU OpenCL device; it is intentionally not selected in auto mode because the
-  native CPU path is faster (45.7 MP: 16.75 s capture / 50.76 s total).
+- POCL remains a functional test target: `RT_OPENCL_ALLOW_CPU=1` permits a CPU
+  OpenCL device when no GPU is selected; with both present, select POCL
+  explicitly or use `OCL_ICD_VENDORS`. It is intentionally not selected in auto
+  mode because the native CPU path is faster (45.7 MP: 16.75 s capture /
+  50.76 s total).
 - PEF 10 MP: stage 1.15 s; PAE 1 LSB.
 - PEF radius 2.0, 100 iterations, early stop off: PASS, 5.73 s, PAE 1 LSB;
   this exercises the one-row chunk limit.
@@ -164,7 +166,7 @@ choose at runtime whether to use a device.
 | M1 | complete | device discovery, program cache, self-test |
 | M2 | complete | Lanczos resize |
 | M3 | complete | rotation/scale/crop transform |
-| M4 | complete | capture sharpening, work-chunked above 12 MP |
+| M4 | complete | capture sharpening, work-chunked at all sizes |
 | M6 | complete | portable `/usr/local` `.deb` for Debian 12+ |
 | M7 | complete | Rusticl driver auto-detection and preference |
 
