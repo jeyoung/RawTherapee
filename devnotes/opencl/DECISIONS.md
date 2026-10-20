@@ -122,3 +122,16 @@ Consequences: obsolete queued renders are avoided without aborting an active
 render or changing ownership of intermediate buffers. Mid-render cancellation
 was rejected during review because it interacted badly with preview teardown.
 A stage cache and measured latency harness are the next preview steps.
+
+## D011 — Defer the base-image cache
+
+Date: 2026-10-20
+
+Decision: do not land the first preview base-image cache. The base stage only
+runs for `M_INIT`, `M_LINDENOISE` and `M_HDR`, so ordinary RGB/Lab slider edits
+never read the cache. The review also found that the saved image was taken
+after colour conversion, which would double-apply that conversion on a hit.
+
+A useful next cache must sit at a stage that is actually recomputed for slider
+edits, most likely around the Lab processing boundary, and must be keyed by the
+RGB/Lab input flags. Keep preview output byte-identical when it lands.

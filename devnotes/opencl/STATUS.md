@@ -3,13 +3,21 @@
 ## Handover block
 
 - Branch: `perf` (based on `opencl`, which is based on `dev` at `b2ee504c4`)
-- Milestone: M8 — preview request coalescing (incremental); next preview cache/benchmark
+- Milestone: M9 — preview latency instrumentation; next preview stage cache
 - Last verified: 2026-10-20, downscale and upscale parity on POCL and AMD
 - Next task: preview latency benchmark, stage cache and progressive preview
 - Known limitations: single-stage acceleration is roughly neutral end-to-end;
   transform is limited to rotation/scale/crop without LCP, CA, distortion,
   perspective or vignetting; capture sharpening is split into watchdog-safe
   chunks and sized by a work budget
+
+## M9 evidence — preview latency instrumentation
+
+- `RT_PREVIEW_PROFILE=1` emits wall time and the `todo` mask after each actual
+  preview render, excluding rejected stale requests.
+- A Tracy zone covers `preview::base_image`.
+- Baseline procedure is in `devnotes/perf/PREVIEW.md`; the 45 MP p50/p95 run is
+  still pending.
 
 ## M8 evidence — preview request coalescing
 
@@ -183,6 +191,7 @@ choose at runtime whether to use a device.
 | M6 | complete | portable `/usr/local` `.deb` for Debian 12+ |
 | M7 | complete | Rusticl driver auto-detection and preference |
 | M8 | incremental | preview request coalescing; cache/benchmark pending |
+| M9 | incremental | preview timing instrumentation; baseline pending |
 
 ## Review
 

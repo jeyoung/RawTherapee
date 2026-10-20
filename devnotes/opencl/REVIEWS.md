@@ -165,3 +165,15 @@ partial state and raced with preview stop/teardown.
 | `M_VOID`-only changes caused churn | Only non-`M_VOID` changes bump the generation |
 
 The remaining work is a stage cache and a scripted GUI latency measurement.
+
+## R11 — Preview base cache
+
+The first preview cache was rejected before commit. It saved the image after
+colour conversion and was unreachable for ordinary edits.
+
+| Finding | Resolution |
+|---|---|
+| Base stage only runs for INIT/DENOISE/HDR | No cache committed; next cache must target the Lab/colour boundary |
+| Saved image was post-conversion | Avoided; a future cache must save the exact stage input |
+| Cache overhead even when disabled | No cache shipped |
+| Timing included lock wait and dropped requests | Timer starts after the stale-request check |
