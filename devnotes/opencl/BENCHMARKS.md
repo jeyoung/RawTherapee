@@ -80,12 +80,13 @@ the AMD watchdog on older cards.
 ## Debian package smoke run
 
 `2026-10-04-173409.NEF` (8288x5520) with its `.pp3`, single-threaded,
-Debian 12-built package run on the host through a private mount namespace:
+Debian 12-built package run on the host through a private mount namespace,
+with no `RUSTICL_ENABLE` or `OCL_ICD_VENDORS` in the environment:
 
 | Mode | Wall | Peak RSS | Stage |
 |---|---|---|---|
-| CPU (`--gpu=off`) | 39.14 s | 2.74 GB | — |
-| GPU (`--gpu=auto`, Rusticl RX 550) | 38.36 s | 2.74 GB | resize 427 ms |
+| CPU (`--gpu=off`) | 39.05 s | 2.74 GB | — |
+| GPU (`--gpu=auto`, Rusticl RX 550, auto-detected) | 37.60 s | 2.74 GB | resize 401 ms |
 
 `compare_tiff.py --bits 16`: maximum absolute error 0, differing samples 0.
 
