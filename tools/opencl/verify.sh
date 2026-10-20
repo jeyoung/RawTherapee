@@ -27,6 +27,7 @@ readonly THREADS="${RT_VERIFY_THREADS:-1}"
 mode=""
 stage_name=""
 cli=""
+sample_override=""
 compare_cmd=()
 has_device=0
 
@@ -57,10 +58,13 @@ find_cli() {
     fi
 }
 
+LAST_PAE=""
+
 compare_images() {
     local a="$1"
     local b="$2"
 
+    LAST_PAE=""
     [ -f "$a" ] && [ -f "$b" ] || return 1
 
     local size_a size_b
@@ -68,9 +72,28 @@ compare_images() {
     size_b="$(identify -format '%wx%h' "$b" 2>/dev/null || true)"
     [ "$size_a" = "$size_b" ] || return 1
 
+    local pixels
+    pixels="$(identify -format '%[fx:w*h]' "$a" 2>/dev/null | awk '{printf "%d", $1}')"
+
+    if [ "${pixels:-0}" -gt 30000000 ] && command -v python3 >/dev/null 2>&1 \
+            && python3 -c 'import numpy' >/dev/null 2>&1; then
+        local bits
+        bits="$(identify -format '%[bit-depth]' "$a" 2>/dev/null || echo 16)"
+        local metric rc=0
+        metric="$(python3 "$SCRIPT_DIR/compare_tiff.py" "$a" "$b" --bits "$bits")" || rc=$?
+        LAST_PAE="$(printf '%s\n' "$metric" | awk '{print $2}')"
+        return "$rc"
+    fi
+
     local pae
     pae="$("${compare_cmd[@]}" -metric PAE "$a" "$b" null: 2>&1 || true)"
-    pae="${pae%% *}"
+    if [[ "$pae" == *"("*")"* ]]; then
+        pae="${pae##*(}"
+        pae="${pae%%)*}"
+    else
+        pae="${pae%% *}"
+    fi
+    LAST_PAE="$pae"
 
     awk -v m="$pae" -v limit="$PAE_LIMIT" \
         'BEGIN { exit (m != "" && m <= limit ? 0 : 1) }'
@@ -139,17 +162,14 @@ run_pair() {
         result="FAIL"
     fi
 
-    local pae
-    pae="$("${compare_cmd[@]}" -metric PAE "$off" "$auto" null: 2>&1 || true)"
-    pae="${pae%% *}"
-    printf '%s\t%s\tmax_pae=%s\n' "$result" "$label" "$pae"
+    printf '%s\t%s\tmax_pae=%s\n' "$result" "$label" "${LAST_PAE:-unknown}"
 
     rm -rf "$outdir"
     [ "$result" = "PASS" ]
 }
 
 quick() {
-    local sample="$TESTDATA/colorspace_flowers.pef"
+    local sample="${sample_override:-$TESTDATA/colorspace_flowers.pef}"
     [ -f "$sample" ] || die "missing $sample (run tools/opencl/fetch-testdata.sh)"
 
     printf 'binary\t%s\n' "$cli"
@@ -162,7 +182,7 @@ quick() {
 
 stage() {
     local name="$1"
-    local sample="$TESTDATA/colorspace_flowers.pef"
+    local sample="${sample_override:-$TESTDATA/colorspace_flowers.pef}"
     local profile="$ROOT/devnotes/opencl/pp3/$name.pp3"
 
     [ -f "$sample" ] || die "missing $sample (run tools/opencl/fetch-testdata.sh)"
@@ -171,7 +191,7 @@ stage() {
     printf 'binary\t%s\n' "$cli"
     "$cli" --gpu-info | tail -n +2 | sed 's/^/gpu\t/'
     detect_device
-    run_pair "pef/$name" "$sample" "$profile"
+    run_pair "$(basename "$sample")/$name" "$sample" "$profile"
 }
 
 formats() {
@@ -238,6 +258,11 @@ while [ "$#" -gt 0 ]; do
             [ "$#" -ge 2 ] || die "--stage needs a name"
             mode="stage"
             stage_name="$2"
+            shift
+            ;;
+        --image)
+            [ "$#" -ge 2 ] || die "--image needs a path"
+            sample_override="$2"
             shift
             ;;
         --list-coverage) mode="coverage" ;;

@@ -1,0 +1,6 @@
+[Common Properties for Transformations]
+Method=log
+Autofill=false
+Scale=0.8
+[Rotation]
+Degree=5
