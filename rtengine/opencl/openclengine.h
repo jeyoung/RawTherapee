@@ -71,6 +71,13 @@ bool resizeLanczos(const Imagefloat* src, Imagefloat* dst, float scale);
 /** @brief Resize a Lab image with Lanczos, matching ImProcFunctions::Lanczos. */
 bool resizeLanczos(const LabImage* src, LabImage* dst, float scale);
 
+/** @brief Rotation and scale transform with bicubic or bilinear sampling. */
+bool transformRotateScale(const Imagefloat* src, Imagefloat* dst,
+                          int cx, int cy, int sx, int sy, int oW, int oH,
+                          double hscale, double vscale,
+                          double cost, double sint, bool highQuality,
+                          bool useLog);
+
 /** @brief Short human readable state, also used by --gpu-info. */
 std::string statusText();
 

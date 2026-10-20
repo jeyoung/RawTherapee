@@ -80,6 +80,12 @@ bool resizeLanczos(const LabImage*, LabImage*, float)
     return false;
 }
 
+bool transformRotateScale(const Imagefloat*, Imagefloat*, int, int, int, int,
+                          int, int, double, double, double, double, bool, bool)
+{
+    return false;
+}
+
 std::string statusText()
 {
     return notBuilt;

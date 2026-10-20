@@ -20,6 +20,7 @@
 
 #include "imagefloat.h"
 #include "improcfun.h"
+#include "opencl/openclengine.h"
 
 #include "homogeneouscoordinates.h"
 #include "procparams.h"
@@ -1173,6 +1174,28 @@ void ImProcFunctions::transformGeneral(bool highQuality, Imagefloat *original, I
     const bool useLog = params->commonTrans.method == "log" && highQuality;
     const double centerFactorx = cx - w2;
     const double centerFactory = cy - h2;
+
+    if (openCLAllowed && opencl::enabled() && !doCACorrection
+            && !enableLCPDist && !enableLCPCA
+            && perspectiveType == PerspType::NONE && !enableDistortion
+            && !enableVignetting && !enableGradient && !enablePCVignetting) {
+        Imagefloat* gpuOriginal = original;
+        std::unique_ptr<Imagefloat> gpuLog;
+
+        if (useLog) {
+            gpuLog.reset(new Imagefloat(original->getWidth(),
+                                        original->getHeight()));
+            logEncode(original, gpuLog.get(), multiThread);
+            gpuOriginal = gpuLog.get();
+        }
+
+        if (opencl::transformRotateScale(gpuOriginal, transformed, cx, cy, sx,
+                                         sy, oW, oH, hscale, vscale, cost, sint,
+                                         highQuality, useLog)) {
+            return;
+        }
+    }
+
 
     std::unique_ptr<Imagefloat> tempLog;
     if (useLog) {

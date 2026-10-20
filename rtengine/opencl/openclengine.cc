@@ -80,6 +80,8 @@ __kernel void rt_probe(__global float* values)
 )";
 
 const char* resizeKernelSource = R"(
+#pragma OPENCL FP_CONTRACT OFF
+
 __kernel void rt_resize_vertical(__global const float* src,
                                  __global float* temp,
                                  __global const int* first,
@@ -137,6 +139,105 @@ float lanczosWeight(float x, float a)
     x = static_cast<float>(RT_PI) * x;
     return a * xsinf(x) * xsinf(x / a) / (x * x);
 }
+
+const char* transformKernelSource = R"(
+#pragma OPENCL FP_CONTRACT OFF
+
+inline float rt_finish(const float value, const int useLog)
+{
+    return useLog ? exp(value) : value;
+}
+
+inline float rt_cubic1(__global const float* src, const int srcWidth,
+                       const int xs, const int ys,
+                       const float dx, const float dy)
+{
+    const float A = -0.85f;
+    const float t1v = A * (dy - dy * dy);
+    const float t2v = (3.0f - 2.0f * dy) * dy * dy;
+    const float w0v = t1v - (t1v * dy);
+    const float w1v = 1.0f - (t1v * dy) - t2v;
+    const float w2v = t1v * dy - t1v + t2v;
+    const float w3v = t1v * dy;
+    float values[4];
+
+    for (int i = 0; i < 4; ++i) {
+        values[i] = (w0v * src[ys * srcWidth + xs + i]
+            + w1v * src[(ys + 1) * srcWidth + xs + i])
+            + (w2v * src[(ys + 2) * srcWidth + xs + i]
+            + w3v * src[(ys + 3) * srcWidth + xs + i]);
+    }
+
+    const float t1h = A * (dx - dx * dx);
+    const float t2h = (3.0f - 2.0f * dx) * dx * dx;
+    const float w0h = t1h - (t1h * dx);
+    const float w1h = 1.0f - (t1h * dx) - t2h;
+    const float w2h = t1h * dx - t1h + t2h;
+    const float w3h = t1h * dx;
+
+    return (values[0] * w0h + values[2] * w2h)
+        + (values[1] * w1h + values[3] * w3h);
+}
+
+inline float rt_bilinear1(__global const float* src, const int srcWidth,
+                          const int srcHeight, const int xc, const int yc,
+                          const float dx, const float dy)
+{
+    const int x1 = clamp(xc, 0, srcWidth - 1);
+    const int x2 = clamp(xc + 1, 0, srcWidth - 1);
+    const int y1 = clamp(yc, 0, srcHeight - 1);
+    const int y2 = clamp(yc + 1, 0, srcHeight - 1);
+
+    return src[y1 * srcWidth + x1] * (1.0f - dx) * (1.0f - dy)
+        + src[y1 * srcWidth + x2] * dx * (1.0f - dy)
+        + src[y2 * srcWidth + x1] * (1.0f - dx) * dy
+        + src[y2 * srcWidth + x2] * dx * dy;
+}
+
+__kernel void rt_transform(__global const float* srcR,
+                           __global const float* srcG,
+                           __global const float* srcB,
+                           __global float* dstR,
+                           __global float* dstG,
+                           __global float* dstB,
+                           __global const float* map,
+                           const int srcWidth, const int srcHeight,
+                           const int dstWidth, const int dstHeight,
+                           const int highQuality, const int useLog)
+{
+    const int x = get_global_id(0);
+    const int y = get_global_id(1);
+    const int index = y * dstWidth + x;
+    const int mapIndex = index * 4;
+    const int xc = (int)map[mapIndex];
+    const int yc = (int)map[mapIndex + 1];
+    const float dx = map[mapIndex + 2];
+    const float dy = map[mapIndex + 3];
+
+    if (yc < 0 || yc >= srcHeight || xc < 0 || xc >= srcWidth) {
+        dstR[index] = 0.0f;
+        dstG[index] = 0.0f;
+        dstB[index] = 0.0f;
+        return;
+    }
+
+    if (yc > 0 && yc < srcHeight - 2 && xc > 0 && xc < srcWidth - 2) {
+        if (highQuality) {
+            dstR[index] = rt_finish(rt_cubic1(srcR, srcWidth, xc - 1, yc - 1, dx, dy), useLog);
+            dstG[index] = rt_finish(rt_cubic1(srcG, srcWidth, xc - 1, yc - 1, dx, dy), useLog);
+            dstB[index] = rt_finish(rt_cubic1(srcB, srcWidth, xc - 1, yc - 1, dx, dy), useLog);
+        } else {
+            dstR[index] = rt_finish(rt_bilinear1(srcR, srcWidth, srcHeight, xc, yc, dx, dy), useLog);
+            dstG[index] = rt_finish(rt_bilinear1(srcG, srcWidth, srcHeight, xc, yc, dx, dy), useLog);
+            dstB[index] = rt_finish(rt_bilinear1(srcB, srcWidth, srcHeight, xc, yc, dx, dy), useLog);
+        }
+    } else {
+        dstR[index] = rt_finish(rt_bilinear1(srcR, srcWidth, srcHeight, xc, yc, dx, dy), useLog);
+        dstG[index] = rt_finish(rt_bilinear1(srcG, srcWidth, srcHeight, xc, yc, dx, dy), useLog);
+        dstB[index] = rt_finish(rt_bilinear1(srcB, srcWidth, srcHeight, xc, yc, dx, dy), useLog);
+    }
+}
+)";
 
 struct Cleanup {
     const Api* api = nullptr;
@@ -1154,6 +1255,203 @@ static bool resizeLanczosPlanes(const float* const sourcePointers[3],
         if (state.api.EnqueueReadBufferRect(
                 state.queue, destBuffers[plane], CL_TRUE, sourceOrigin,
                 sourceOrigin, destRegion, 0, 0, destRowPitch, 0,
+                destPointers[plane], 0, nullptr, nullptr) != CL_SUCCESS) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool transformRotateScale(const Imagefloat* src, Imagefloat* dst,
+                          int cx, int cy, int sx, int sy, int oW, int oH,
+                          double hscale, double vscale,
+                          double cost, double sint, bool highQuality,
+                          bool useLog)
+{
+    if (src == nullptr || dst == nullptr
+            || src->getWidth() <= 0 || src->getHeight() <= 0
+            || dst->getWidth() <= 0 || dst->getHeight() <= 0
+            || src->getRowStride() == 0 || dst->getRowStride() == 0) {
+        return false;
+    }
+
+    Backend& state = backend();
+    std::lock_guard<std::recursive_mutex> lock(state.mutex);
+
+    if (!ensureInit() || state.infos.empty() || state.selected < 0
+            || !state.stageEnabled) {
+        return false;
+    }
+
+    if (!ensureSession(state)) {
+        return false;
+    }
+
+    StageTimer timer("transform", g_getenv("RT_OPENCL_PROFILE") != nullptr);
+
+    const int srcWidth = src->getWidth();
+    const int srcHeight = src->getHeight();
+    const int dstWidth = dst->getWidth();
+    const int dstHeight = dst->getHeight();
+    const size_t sourceBytes = static_cast<size_t>(srcWidth) * srcHeight * sizeof(float);
+    const size_t destBytes = static_cast<size_t>(dstWidth) * dstHeight * sizeof(float);
+    const size_t mapBytes = static_cast<size_t>(dstWidth) * dstHeight * 4 * sizeof(float);
+    const DeviceInfo& info = state.infos[state.selected];
+
+    if ((info.maxAllocation > 0 && (sourceBytes > info.maxAllocation
+                                    || destBytes > info.maxAllocation
+                                    || mapBytes > info.maxAllocation))
+            || (info.globalMemory > 0
+                && 3 * (sourceBytes + destBytes) + mapBytes
+                    > info.globalMemory * 8 / 10)) {
+        return false;
+    }
+
+    const double w2 = static_cast<double>(oW) / 2.0 - 0.5;
+    const double h2 = static_cast<double>(oH) / 2.0 - 0.5;
+    const double centerX = cx - w2;
+    const double centerY = cy - h2;
+    std::vector<float> map(static_cast<size_t>(dstWidth) * dstHeight * 4);
+
+    for (int y = 0; y < dstHeight; ++y) {
+        for (int x = 0; x < dstWidth; ++x) {
+            const size_t index = (static_cast<size_t>(y) * dstWidth + x) * 4;
+            const double xd = hscale * (static_cast<double>(x) + centerX);
+            const double yd = vscale * (static_cast<double>(y) + centerY);
+            const double dxr = xd * cost - yd * sint;
+            const double dyr = xd * sint + yd * cost;
+            double dx = dxr + w2;
+            double dy = dyr + h2;
+            int xc = static_cast<int>(dx);
+            dx -= xc;
+            xc -= sx;
+            int yc = static_cast<int>(dy);
+            dy -= yc;
+            yc -= sy;
+            map[index] = static_cast<float>(xc);
+            map[index + 1] = static_cast<float>(yc);
+            map[index + 2] = static_cast<float>(dx);
+            map[index + 3] = static_cast<float>(dy);
+        }
+    }
+
+    BufferSet buffers;
+    buffers.api = &state.api;
+    KernelSet kernels;
+    kernels.api = &state.api;
+
+    const auto createBuffer = [&](cl_mem_flags flags, size_t bytes,
+                                  const void* host) -> cl_mem {
+        cl_int error = CL_SUCCESS;
+        cl_mem memory = state.api.CreateBuffer(state.context, flags, bytes,
+                                               const_cast<void*>(host), &error);
+
+        if (memory == nullptr || error != CL_SUCCESS) {
+            if (memory != nullptr) {
+                state.api.ReleaseMemObject(memory);
+            }
+            return nullptr;
+        }
+
+        return buffers.add(memory);
+    };
+
+    cl_mem sourceBuffers[3] = {};
+    cl_mem destBuffers[3] = {};
+    const float* sourcePointers[3] = {src->r(0), src->g(0), src->b(0)};
+    float* destPointers[3] = {dst->r(0), dst->g(0), dst->b(0)};
+    const size_t origin[3] = {0, 0, 0};
+    const size_t sourceRegion[3] = {
+        static_cast<size_t>(srcWidth) * sizeof(float),
+        static_cast<size_t>(srcHeight), 1};
+    const size_t destRegion[3] = {
+        static_cast<size_t>(dstWidth) * sizeof(float),
+        static_cast<size_t>(dstHeight), 1};
+
+    for (int plane = 0; plane < 3; ++plane) {
+        sourceBuffers[plane] = createBuffer(CL_MEM_READ_ONLY, sourceBytes, nullptr);
+        destBuffers[plane] = createBuffer(CL_MEM_WRITE_ONLY, destBytes, nullptr);
+
+        if (sourceBuffers[plane] == nullptr || destBuffers[plane] == nullptr) {
+            return false;
+        }
+
+        if (state.api.EnqueueWriteBufferRect(
+                state.queue, sourceBuffers[plane], CL_TRUE, origin, origin,
+                sourceRegion, 0, 0, src->getRowStride(), 0,
+                sourcePointers[plane], 0, nullptr, nullptr) != CL_SUCCESS) {
+            return false;
+        }
+    }
+
+    cl_mem mapBuffer = createBuffer(CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                    mapBytes, map.data());
+
+    if (mapBuffer == nullptr) {
+        return false;
+    }
+
+    std::string error;
+    cl_program program = programFor(state, transformKernelSource, "-cl-std=CL1.2",
+                                    error);
+
+    if (program == nullptr) {
+        if (settings != nullptr && settings->verbose && !error.empty()) {
+            std::fprintf(stderr, "OpenCL: %s\n", error.c_str());
+        }
+        return false;
+    }
+
+    cl_int status = CL_SUCCESS;
+    cl_kernel kernel = kernels.add(
+        state.api.CreateKernel(program, "rt_transform", &status));
+
+    if (kernel == nullptr || status != CL_SUCCESS) {
+        return false;
+    }
+
+    const cl_int srcWidthArg = srcWidth;
+    const cl_int srcHeightArg = srcHeight;
+    const cl_int dstWidthArg = dstWidth;
+    const cl_int dstHeightArg = dstHeight;
+    const cl_int highQualityArg = highQuality ? 1 : 0;
+    const cl_int useLogArg = useLog ? 1 : 0;
+
+    status |= state.api.SetKernelArg(kernel, 0, sizeof(cl_mem), &sourceBuffers[0]);
+    status |= state.api.SetKernelArg(kernel, 1, sizeof(cl_mem), &sourceBuffers[1]);
+    status |= state.api.SetKernelArg(kernel, 2, sizeof(cl_mem), &sourceBuffers[2]);
+    status |= state.api.SetKernelArg(kernel, 3, sizeof(cl_mem), &destBuffers[0]);
+    status |= state.api.SetKernelArg(kernel, 4, sizeof(cl_mem), &destBuffers[1]);
+    status |= state.api.SetKernelArg(kernel, 5, sizeof(cl_mem), &destBuffers[2]);
+    status |= state.api.SetKernelArg(kernel, 6, sizeof(cl_mem), &mapBuffer);
+    status |= state.api.SetKernelArg(kernel, 7, sizeof(cl_int), &srcWidthArg);
+    status |= state.api.SetKernelArg(kernel, 8, sizeof(cl_int), &srcHeightArg);
+    status |= state.api.SetKernelArg(kernel, 9, sizeof(cl_int), &dstWidthArg);
+    status |= state.api.SetKernelArg(kernel, 10, sizeof(cl_int), &dstHeightArg);
+    status |= state.api.SetKernelArg(kernel, 11, sizeof(cl_int), &highQualityArg);
+    status |= state.api.SetKernelArg(kernel, 12, sizeof(cl_int), &useLogArg);
+
+    if (status != CL_SUCCESS) {
+        return false;
+    }
+
+    const size_t global[2] = {
+        static_cast<size_t>(dstWidth), static_cast<size_t>(dstHeight)};
+
+    if (state.api.EnqueueNDRangeKernel(state.queue, kernel, 2, nullptr, global,
+                                       nullptr, 0, nullptr, nullptr) != CL_SUCCESS) {
+        return false;
+    }
+
+    if (state.api.Finish(state.queue) != CL_SUCCESS) {
+        return false;
+    }
+
+    for (int plane = 0; plane < 3; ++plane) {
+        if (state.api.EnqueueReadBufferRect(
+                state.queue, destBuffers[plane], CL_TRUE, origin, origin,
+                destRegion, 0, 0, dst->getRowStride(), 0,
                 destPointers[plane], 0, nullptr, nullptr) != CL_SUCCESS) {
             return false;
         }
