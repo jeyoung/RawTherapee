@@ -48,13 +48,27 @@ Use the same image and profile for every run. Do not commit images or sidecars.
 | Warm 4 | 53 ms | 53 ms |
 | Warm 5 | 54 ms | 54 ms |
 
-Warm fit-zoom p50 = 54 ms; p95 = 152 ms.
+Automated harness, cold Xvfb start: warm fit-zoom p50 = 54 ms; p95 = 152 ms.
 
-A 100% zoom run with the Shadows/Highlights tool, which exercises Lab-stage
-work, produced 63–68 ms per edit (`todo=0x7`). No distinct high-detail render
-appeared in the timer output; the high-detail path is already computed/cached
-for this image at the time of the edits. Treat the 100% row as an interactive
-Lab-edit measurement, not a cold high-detail render.
+## Interactive host baseline
+
+45.7 MP NEF, real interactive session on the host, Exposure and
+Shadows/Highlights edits:
+
+| Sequence | Samples | p50 | p95 | Max |
+|---|---:|---:|---:|---:|
+| Cold initial render | 1 | 7392 ms | — | 7392 ms |
+| Fit zoom, Exposure (`0x1009f`) | 17 | 252 ms | 274 ms | 274 ms |
+| High-detail transition (`0x40000`) | 1 | 9001 ms | — | 9001 ms |
+| 100% zoom, Shadows/Highlights (`0x7`) | 11 | 243 ms | 255 ms | 255 ms |
+| 100% zoom, Exposure (`0x1009f`) | 24 | 335 ms | 373 ms | 3196 ms |
+| Monitor-only update (`0x1000`) | 2 | 86.5 ms | 89 ms | 89 ms |
+
+The 100% Exposure sequence contains one 3196 ms outlier; excluding it would
+lower the p95, but the raw sequence is reported. The current interactive
+target p95 <100 ms at fit and <250 ms at 100% is **not met**. The next preview
+change should be progressive/lower-resolution rendering rather than another
+cache.
 
 The timer starts after stale-request rejection; cold renders include initial
 image loading and are reported separately.

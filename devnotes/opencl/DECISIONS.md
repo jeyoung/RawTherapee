@@ -135,3 +135,15 @@ after colour conversion, which would double-apply that conversion on a hit.
 A useful next cache must sit at a stage that is actually recomputed for slider
 edits, most likely around the Lab processing boundary, and must be keyed by the
 RGB/Lab input flags. Keep preview output byte-identical when it lands.
+
+## D012 — Progressive preview before another cache
+
+Date: 2026-10-20
+
+Decision: the interactive baseline shows p95 latency of 274 ms at fit zoom and
+373 ms at 100%, so the next preview optimisation is progressive rendering:
+use a reduced-resolution preview while the user is adjusting, then request a
+full-resolution render when the interaction settles.
+
+Consequences: the preview cache remains deferred. The final frame must remain
+the full-quality render, and crop/detail windows must not show stale geometry.

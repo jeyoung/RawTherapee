@@ -17,8 +17,10 @@
   preview render, excluding rejected stale requests.
 - A Tracy zone covers `preview::base_image`.
 - Baseline procedure and results are in `devnotes/perf/PREVIEW.md`.
-  Warm fit-zoom Exposure slider: p50 54 ms, p95 152 ms. The 100% row still
-  needs a Tone Curve/crop edit to force high-detail processing.
+  Interactive host run: fit Exposure p50 252 ms / p95 274 ms; 100%
+  Shadows/Highlights p50 243 ms / p95 255 ms; 100% Exposure p50 335 ms /
+  p95 373 ms. Targets (100 ms fit, 250 ms at 100%) are not met; progressive
+  preview is the next increment.
 
 ## M8 evidence — preview request coalescing
 
