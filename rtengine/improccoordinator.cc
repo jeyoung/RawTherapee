@@ -352,7 +352,7 @@ void ImProcCoordinator::updatePreviewImage(int todo, bool panningRelatedChange,
 
     // This augmentation must happen before a stale request is requeued, since
     // the next request may only carry M_CROP and M_MONITOR.
-    if (todo == CROP && ipf.needsPCVignetting()) {
+    if ((todo & M_CROP) && ipf.needsPCVignetting()) {
         todo |= TRANSFORM;
     }
 
@@ -3613,8 +3613,8 @@ void ImProcCoordinator::process()
         paramsUpdateMutex.lock();
     }
 
-    paramsUpdateMutex.unlock();
     updaterRunning = false;
+    paramsUpdateMutex.unlock();
 
     if (plistener) {
         plistener->setProgressState(false);
