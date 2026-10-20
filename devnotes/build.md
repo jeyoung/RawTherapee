@@ -90,8 +90,11 @@ export RUSTICL_ENABLE=radeonsi
 ```
 
 POCL and Rusticl installed together can crash inside the ICD loader. The
-backend hides POCL when a GPU ICD is present. For explicit tests, point
-`OCL_ICD_VENDORS` at a directory containing only the wanted `.icd` file.
+backend hides POCL when a GPU ICD library is present and usable; this can
+also hide POCL when the GPU runtime exists but reports no device. To use POCL
+explicitly, point `OCL_ICD_VENDORS` at a directory containing only
+`pocl.icd`. `RT_OPENCL_VENDOR_FILTER=0` disables the workaround, but the
+loader may then crash on broken vendor combinations.
 
 Compiled kernels are cached in the RawTherapee cache directory, under
 `opencl/`. The cache key covers the kernel source, build options, device and

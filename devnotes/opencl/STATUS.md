@@ -6,8 +6,8 @@
 - Milestone: M2 — Lanczos resize (complete); next M3 — transform
 - Last verified: 2026-10-20, downscale and upscale parity on POCL and AMD
 - Next task: M3 — perspective/rotation/lens transform
-- Known limitations: resize performance on the RX 550 is neutral because the
-  export pipeline is still CPU dominated; stage timing is 102 ms
+- Known limitations: resize performance on the RX 550 is about 4% slower
+  end-to-end because only one stage is accelerated; stage timing is 102 ms
 
 ## M2 evidence — Lanczos
 
@@ -18,8 +18,10 @@
 - Resize program appears in the program cache; second run uses the cached
   binary.
 - Stage timing with `RT_OPENCL_PROFILE=1`: 102 ms for 3896x2616 -> 1944x1304
-  on the RX 550. Total export time is unchanged because other stages dominate.
-- CPU-only build still passes `verify.sh --quick`.
+  on the RX 550. End-to-end export is about 4% slower because only one stage is
+  accelerated.
+- CPU-only build still builds and runs; `verify.sh --quick` reports SKIP
+  because no device is present.
 
 ## M1 evidence — program cache
 
@@ -43,7 +45,7 @@
 - `--gpu-test` on AMD Radeon RX 550 (Rusticl): PASS.
 - Cross-build CPU vs OpenCL `--gpu=off`, single-threaded:
   `colorspace_flowers.pef`, PAE 0.
-- `verify.sh --quick`: PASS on the CPU build, POCL and Rusticl.
+- `verify.sh --quick`: SKIP on the CPU build, PASS on POCL and Rusticl.
 - Multi-threaded CPU output is not bit-reproducible (up to 5 LSB); see
   `PARITY.md`.
 
@@ -51,8 +53,9 @@
 
 - On AMD/Mesa, set `RUSTICL_ENABLE=radeonsi` before starting RawTherapee.
 - POCL and Rusticl installed together can crash inside the ICD loader. The
-  backend hides POCL when a GPU ICD is present; for explicit tests set
-  `OCL_ICD_VENDORS` to a directory containing only the wanted `.icd`.
+  backend hides POCL when a loadable GPU ICD is present. If the GPU runtime
+  reports no device, POCL is also hidden; select it explicitly with
+  `OCL_ICD_VENDORS` pointing at a directory containing only `pocl.icd`.
 - OpenCL is initialised lazily, so `--gpu=off` and CPU-only use never load a
   vendor driver.
 
@@ -66,12 +69,18 @@ choose at runtime whether to use a device.
 
 | M | State | Notes |
 |---|---|---|
-| M0 | in progress | build helper, CMake option, options/CLI/preferences, stub backend |
-| M1 | pending | loader, device discovery, program cache, self-test |
-| M2 | pending | Lanczos resize |
+| M0 | complete | build helper, CMake option, options/CLI/preferences, runtime loader |
+| M1 | complete | device discovery, program cache, self-test |
+| M2 | complete | Lanczos resize |
 | M3 | pending | transform |
 | M4 | pending | capture sharpening |
 | M6 | pending | portable package, CI, docs |
+
+## Review
+
+Two independent reviews are recorded in `REVIEWS.md`. The second pass found
+five medium items; all were addressed except the pre-existing cross-thread
+`Options` copy race, which is documented there.
 
 ## Verification
 

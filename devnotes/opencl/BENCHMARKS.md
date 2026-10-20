@@ -24,17 +24,17 @@ RT_OPENCL_PROFILE=1 OMP_NUM_THREADS=1 rawtherapee-cli \
     -o out.tif -c colorspace_flowers.pef
 ```
 
-| Run | OpenCL resize | Total wall |
-|---|---|---|
-| CPU (`--gpu=off`) | — | 4.45–4.54 s |
-| GPU, cold cache | 102 ms | 5.21 s |
-| GPU, warm cache | 102 ms | 4.50–4.58 s |
+| Run | OpenCL resize | Total wall | Peak RSS |
+|---|---|---|---|
+| CPU (`--gpu=off`) | — | 4.47–4.56 s (median 4.50) | 688 MB |
+| GPU, cold cache | 102 ms | 5.21 s | — |
+| GPU, warm cache | 102 ms | 4.61–4.72 s (median 4.67) | 697 MB |
 
-The GPU stage is faster than a rough share of the CPU pipeline, but the
-export is dominated by demosaic and colour processing, so total wall time is
-currently neutral. Transfer and context costs dominate at this image size.
-Pipeline residency and additional stages are needed before an overall
-speedup is expected.
+Measured with `/usr/bin/time -f '%e %M %P'`, three runs, `OMP_NUM_THREADS=1`.
+The GPU total is currently about 4 % slower than the CPU total at this image
+size, because the pipeline is dominated by demosaic and colour processing.
+The resize stage itself is fast, but transfer and context overhead outweigh
+the saved CPU work when only one stage is accelerated.
 
 ## Notes
 
