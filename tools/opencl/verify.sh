@@ -30,6 +30,7 @@ cli=""
 sample_override=""
 compare_cmd=()
 has_device=0
+expect_stage=0
 
 usage() {
     awk 'NR > 1 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "$0"
@@ -104,6 +105,7 @@ detect_device() {
         has_device=1
     else
         has_device=0
+expect_stage=0
     fi
 }
 
@@ -150,9 +152,20 @@ run_pair() {
         return 1
     fi
 
-    if ! OMP_NUM_THREADS="$THREADS" "$cli" --gpu=auto "${profileArg[@]}" -o "$auto" -t -b16 -Y -c "$input" \
+    local -a profileEnv=()
+    if [ "$expect_stage" -eq 1 ]; then
+        profileEnv=(RT_OPENCL_PROFILE=1)
+    fi
+
+    if ! env OMP_NUM_THREADS="$THREADS" "${profileEnv[@]}" "$cli" --gpu=auto "${profileArg[@]}" -o "$auto" -t -b16 -Y -c "$input" \
             >"$outdir/auto.log" 2>&1; then
         printf 'FAIL\t%s\tload or export failed (gpu=auto)\n' "$label"
+        rm -rf "$outdir"
+        return 1
+    fi
+
+    if [ "$expect_stage" -eq 1 ] && ! grep -q '^opencl ' "$outdir/auto.log"; then
+        printf 'FAIL\t%s\tOpenCL stage did not run\n' "$label"
         rm -rf "$outdir"
         return 1
     fi
@@ -191,6 +204,7 @@ stage() {
     printf 'binary\t%s\n' "$cli"
     "$cli" --gpu-info | tail -n +2 | sed 's/^/gpu\t/'
     detect_device
+    expect_stage=1
     run_pair "$(basename "$sample")/$name" "$sample" "$profile"
 }
 

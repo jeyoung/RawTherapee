@@ -1,0 +1,7 @@
+[PostDemosaicSharpening]
+Enabled=true
+Contrast=10
+DeconvRadius=0.75
+DeconvRadiusOffset=0
+DeconvIter=20
+DeconvIterCheck=true
