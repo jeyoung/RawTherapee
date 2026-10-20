@@ -11,7 +11,17 @@ The timer starts after a stale queued request has been rejected, so dropped
 requests are not included. Queued requests are coalesced by the preview
 generation counter.
 
-## Procedure
+## Harness
+
+```bash
+tools/perf/bench-preview.sh /usr/local/bin/rawtherapee \
+    /path/to/image.NEF 5
+```
+
+It starts a private Xvfb display, opens the Exposure tool, drags Exposure
+Compensation, and prints warm p50/p95. See `tools/perf/README.md`.
+
+## Manual procedure
 
 1. Build the normal GUI with GCC and OpenCL enabled.
 2. Start RawTherapee with `RT_PREVIEW_PROFILE=1` and open a 45 MP NEF.
