@@ -28,6 +28,7 @@ mode=""
 stage_name=""
 cli=""
 compare_cmd=()
+has_device=0
 
 usage() {
     awk 'NR > 1 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "$0"
@@ -75,10 +76,39 @@ compare_images() {
         'BEGIN { exit (m != "" && m <= limit ? 0 : 1) }'
 }
 
+detect_device() {
+    if "$cli" --gpu-info 2>/dev/null | grep -q '\* \['; then
+        has_device=1
+    else
+        has_device=0
+    fi
+}
+
+skip_if_no_device() {
+    if [ "$has_device" -eq 0 ] && [ "${RT_ALLOW_CPU_PARITY:-0}" != "1" ]; then
+        if [ "${RT_REQUIRE_GPU:-0}" = "1" ]; then
+            printf 'FAIL\t%s\tno OpenCL device\n' "$1"
+            return 1
+        fi
+        printf 'SKIP\t%s\tno OpenCL device (set RT_ALLOW_CPU_PARITY=1 to compare CPU paths)\n' "$1"
+        return 2
+    fi
+    return 0
+}
+
 run_pair() {
     local label="$1"
     local input="$2"
     local profile="${3:-}"
+    local skip_status=0
+    skip_if_no_device "$label" || skip_status=$?
+    if [ "$skip_status" -ne 0 ]; then
+        if [ "$skip_status" -eq 1 ]; then
+            return 1
+        fi
+        return 0
+    fi
+
     local outdir
     outdir="$(mktemp -d "${TMPDIR:-/tmp}/rtverify.XXXXXX")"
 
@@ -125,6 +155,7 @@ quick() {
     printf 'binary\t%s\n' "$cli"
     printf 'formats\t%s\n' "$("$cli" --list-formats | tail -n +2 | tr '\n' ' ')"
     "$cli" --gpu-info | tail -n +2 | sed 's/^/gpu\t/'
+    detect_device
 
     run_pair "pef/neutral" "$sample"
 }
@@ -139,11 +170,22 @@ stage() {
 
     printf 'binary\t%s\n' "$cli"
     "$cli" --gpu-info | tail -n +2 | sed 's/^/gpu\t/'
+    detect_device
     run_pair "pef/$name" "$sample" "$profile"
 }
 
 formats() {
     [ -f "$MANIFEST" ] || die "missing manifest: $MANIFEST"
+    detect_device
+
+    if [ "$has_device" -eq 0 ] && [ "${RT_ALLOW_CPU_PARITY:-0}" != "1" ]; then
+        if [ "${RT_REQUIRE_GPU:-0}" = "1" ]; then
+            printf 'FAIL\tformats\tno OpenCL device\n'
+            return 1
+        fi
+        printf 'SKIP\tformats\tno OpenCL device (set RT_ALLOW_CPU_PARITY=1 to compare CPU paths)\n'
+        return 0
+    fi
 
     local failures=0
     local rows=0
