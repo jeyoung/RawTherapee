@@ -16,6 +16,8 @@
  *  You should have received a copy of the GNU General Public License
  *  along with RawTherapee.  If not, see <https://www.gnu.org/licenses/>.
  */
+#include <chrono>
+#include <cstdio>
 #include <fstream>
 
 #include <glibmm/thread.h>
@@ -57,6 +59,37 @@ namespace
 constexpr int VECTORSCOPE_SIZE = 128;
 
 }
+
+namespace
+{
+
+struct PreviewTimer {
+    bool enabled = false;
+    bool cacheHit = false;
+    int todo = 0;
+    std::chrono::steady_clock::time_point start =
+        std::chrono::steady_clock::now();
+
+    PreviewTimer(int changeMask, bool isEnabled)
+        : enabled(isEnabled), todo(changeMask)
+    {
+    }
+
+    ~PreviewTimer()
+    {
+        if (!enabled) {
+            return;
+        }
+
+        const auto end = std::chrono::steady_clock::now();
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            end - start).count();
+        std::fprintf(stderr, "preview update: %lld ms todo=0x%x cache=%d\n",
+                     static_cast<long long>(ms), todo, cacheHit ? 1 : 0);
+    }
+};
+
+} // namespace
 
 namespace rtengine
 {
@@ -365,6 +398,9 @@ void ImProcCoordinator::updatePreviewImage(int todo, bool panningRelatedChange,
         paramsUpdateMutex.unlock();
         return;
     }
+
+    PreviewTimer previewTimer(todo,
+                              g_getenv("RT_PREVIEW_PROFILE") != nullptr);
 
     const auto prevdemo = App::get().options().prevdemo;
     ipf.setOpenCLAllowed(App::get().options().rtSettings.useOpenCL
@@ -790,7 +826,12 @@ void ImProcCoordinator::updatePreviewImage(int todo, bool panningRelatedChange,
             PreviewProps pp(0, 0, fw, fh, scale);
             // Tells to the ImProcFunctions' tools what is the preview scale, which may lead to some simplifications
             ipf.setScale(scale);
-            imgsrc->getImage(currWB, tr, orig_prev, pp, params->toneCurve, params->raw);
+
+            {
+                RT_PROFILE("preview::base_image", PROCESS_IMAGE);
+                imgsrc->getImage(currWB, tr, orig_prev, pp,
+                                 params->toneCurve, params->raw);
+            }
 
             if ((todo & M_SPOT) && params->spot.enabled && !params->spot.entries.empty()) {
                 spotsDone = true;
