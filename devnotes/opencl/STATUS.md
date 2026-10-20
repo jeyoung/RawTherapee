@@ -3,13 +3,25 @@
 ## Handover block
 
 - Branch: `opencl` (based on `dev` at `b2ee504c4`, 32 commits after tag 5.13)
-- Milestone: M5 — buffer pool (complete); next M6 — portable packaging
+- Milestone: M6 — portable package (complete); next release hardening
 - Last verified: 2026-10-20, downscale and upscale parity on POCL and AMD
-- Next task: M6 — portable Debian package and tarball
+- Next task: release hardening, format matrix and optional residency
 - Known limitations: single-stage acceleration is roughly neutral end-to-end;
   transform is limited to rotation/scale/crop without LCP, CA, distortion,
   perspective or vignetting; capture sharpening uses the GPU only up to 12 MP
   because larger tiles exceed the AMD watchdog
+
+## M6 evidence — portable package
+
+- `tools/build-rt.sh portable --format both` builds in Ubuntu 22.04 Docker.
+- Installs under `/usr/local`, with bundled libraries in
+  `/usr/local/lib/rawtherapee` and data in `/usr/local/share/rawtherapee`.
+- `.deb` and `.tar.gz` tested on Debian 12 and Ubuntu 22.04 containers.
+- CPU export matches the host single-threaded export (PAE 0).
+- No-ICD `--gpu-info` starts and falls back cleanly.
+- Package depends only on `libc6 (>= 2.35)`; OpenCL ICD/driver libraries are
+  not bundled.
+- JPEG XL is not available in the Ubuntu 22.04 build environment.
 
 ## M5 evidence — buffer pool
 
@@ -111,7 +123,7 @@ choose at runtime whether to use a device.
 | M2 | complete | Lanczos resize |
 | M3 | complete | rotation/scale/crop transform |
 | M4 | complete | capture sharpening (up to 12 MP) |
-| M6 | pending | portable package, CI, docs |
+| M6 | complete | portable /usr/local package and tarball |
 
 ## Review
 

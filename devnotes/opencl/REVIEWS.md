@@ -74,6 +74,22 @@ the pool could grow without eviction.
 | `emplace_back` in a destructor could throw | Release the buffer instead of growing the pool |
 | `BufferSet` implicitly copyable | Copy and assignment deleted |
 
+## R6 — M6 portable package
+
+The review found missing GTK caches, stale stripping paths, hardcoded identity,
+and an icon collision.
+
+| Finding | Resolution |
+|---|---|
+| Loader/IME caches absent | Absolute query tools, caches generated and rewritten to `/usr/local/lib/rawtherapee` |
+| Hardcoded version/prefix | Version derived from git; package version includes commit count/hash; prefix `/usr/local` per user request |
+| `strip` path wrong | Strips the real binaries under `/usr/local/lib/rawtherapee` and recomputes size |
+| Icon collision | Unique `rawtherapee-5.13` icon and desktop file |
+| Lensfun data missing | Bundled under `/usr/local/share/lensfun` and compiled path set |
+| Tarball xz missing on minimal systems | Switched to gzip |
+| `--image` ignored | Dockerfile takes `BASE_IMAGE`; builds use `--platform linux/amd64` |
+| Wrapper relocation | Wrappers derive `/usr/local` from their own location |
+
 ## Outstanding
 
 - Automated Imagefloat resize coverage (the manual harness was not committed).

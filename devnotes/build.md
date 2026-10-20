@@ -124,6 +124,18 @@ sudo apt install build-essential cmake pkg-config libgtkmm-3.0-dev \
 
 Use `tools/build-rt.sh opencl --check-deps` to see what is missing.
 
+## Portable package
+
+Build a self-contained tarball and Debian package inside Ubuntu 22.04:
+
+```bash
+tools/build-rt.sh portable --format both
+```
+
+Requires Docker. Outputs go to `build/portable/`. The package installs under
+`/usr/local` and bundles GTK and the other non-baseline libraries under
+`/usr/local/lib/rawtherapee`; OpenCL is still supplied by the host. See `devnotes/opencl/PORTABLE.md`.
+
 ## Troubleshooting
 
 - **The version reports an older release than expected**: the clone is
