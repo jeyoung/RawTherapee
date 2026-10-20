@@ -969,6 +969,11 @@ Gtk::Widget* Preferences::getPerformancePanel()
     useOpenCLCB->set_sensitive(openclAvailable);
     openCLModeCombo->set_sensitive(openclAvailable);
     openCLDeviceCombo->set_sensitive(openclAvailable);
+#ifdef __linux__
+    // Keep the driver override editable even when no device was found: the
+    // override may be what makes Rusticl expose one on the next start.
+    openCLRusticlEntry->set_sensitive(true);
+#endif
 
     Gtk::Frame* threadsFrame = Gtk::manage ( new Gtk::Frame (M ("PREFERENCES_PERFORMANCE_THREADS")) );
     threadsFrame->set_label_align(0.025, 0.5);
