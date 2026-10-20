@@ -76,3 +76,16 @@ PEF, 3896x2616:
 The GPU path is about 2% faster end-to-end. Larger images fall back to CPU at
 12 MP because the 1024-work-item, 35 KiB-local-memory tile kernel can exceed
 the AMD watchdog on older cards.
+
+## Debian package smoke run
+
+`2026-10-04-173409.NEF` (8288x5520) with its `.pp3`, single-threaded,
+Debian 12-built package run on the host through a private mount namespace:
+
+| Mode | Wall | Peak RSS | Stage |
+|---|---|---|---|
+| CPU (`--gpu=off`) | 39.14 s | 2.74 GB | — |
+| GPU (`--gpu=auto`, Rusticl RX 550) | 38.36 s | 2.74 GB | resize 427 ms |
+
+`compare_tiff.py --bits 16`: maximum absolute error 0, differing samples 0.
+
