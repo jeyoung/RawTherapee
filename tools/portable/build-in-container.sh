@@ -33,10 +33,11 @@ VERSION="$(git -C "$SRC" describe --tags --always --dirty 2>/dev/null || echo 5.
 VERSION="${VERSION#v}"
 COUNT="$(git -C "$SRC" rev-list --count HEAD 2>/dev/null || true)"
 HASH="$(git -C "$SRC" rev-parse --short HEAD 2>/dev/null || echo local)"
-PKG_VERSION="5.13+git${COUNT:-0}.${HASH}${VERSION##*-}-1"
+PKG_VERSION="5.13+git${COUNT:-0}.${HASH}"
 if [ "${VERSION%-dirty}" != "$VERSION" ]; then
-    PKG_VERSION="5.13+git${COUNT:-0}.${HASH}.dirty-1"
+    PKG_VERSION="${PKG_VERSION}.dirty"
 fi
+PKG_VERSION="${PKG_VERSION}-1"
 
 info "configuring"
 cmake -S "$SRC" -B "$BUILD" -G "Unix Makefiles" \
