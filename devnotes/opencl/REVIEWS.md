@@ -161,7 +161,7 @@ partial state and raced with preview stop/teardown.
 | Mid-render abort leaked or partially updated preview state | Backed out; cancellation now happens only before a render starts |
 | Generation was not bumped on normal edits | Both `startProcessing(int)` and `endUpdateParams(int)` bump under the params mutex |
 | Panning output could be lost on requeue | Requeue adds `M_MONITOR` when panning-related |
-| Crop transform augmentation was skipped after requeue | Applied before the stale-request check |
+| Crop transform augmentation was skipped after requeue | Applied whenever `M_CROP` is present, including combined masks |
 | `M_VOID`-only changes caused churn | Only non-`M_VOID` changes bump the generation |
 
 The remaining work is a stage cache and a scripted GUI latency measurement.
