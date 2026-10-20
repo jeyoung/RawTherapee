@@ -24,6 +24,7 @@ cmake-build*
 Build*
 !tools/build-rt.sh
 !devnotes/build.md
+!tools/portable/build-in-container.sh
 Debug
 RelWithDebInfo
 MinSizeRel

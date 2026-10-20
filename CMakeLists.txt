@@ -321,6 +321,11 @@ if(NOT DEFINED DATADIR)
     endif()
 endif()
 
+set(DATA_SEARCH_PATH
+    "${DATADIR}"
+    CACHE STRING "Runtime path to bundled data, relative to the executable when not absolute"
+)
+
 if(NOT DEFINED LIBDIR)
     if(BUILD_BUNDLE)
         if(APPLE)
