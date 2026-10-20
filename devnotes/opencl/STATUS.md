@@ -16,8 +16,9 @@
 - `RT_PREVIEW_PROFILE=1` emits wall time and the `todo` mask after each actual
   preview render, excluding rejected stale requests.
 - A Tracy zone covers `preview::base_image`.
-- Baseline procedure is in `devnotes/perf/PREVIEW.md`; one cold fit-zoom
-  render measured 5.33 s under Xvfb. Repeated p50/p95 slider runs are pending.
+- Baseline procedure and results are in `devnotes/perf/PREVIEW.md`.
+  Warm fit-zoom Exposure slider: p50 54 ms, p95 152 ms. The 100% row still
+  needs a Tone Curve/crop edit to force high-detail processing.
 
 ## M8 evidence — preview request coalescing
 
