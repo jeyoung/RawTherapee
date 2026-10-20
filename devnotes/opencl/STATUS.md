@@ -8,8 +8,8 @@
 - Next task: release hardening, format matrix and optional residency
 - Known limitations: single-stage acceleration is roughly neutral end-to-end;
   transform is limited to rotation/scale/crop without LCP, CA, distortion,
-  perspective or vignetting; capture sharpening uses the GPU only up to 12 MP
-  because larger tiles exceed the AMD watchdog
+  perspective or vignetting; capture sharpening is split into watchdog-safe
+  chunks and sized by a work budget
 
 ## M7 evidence — Rusticl auto-detection
 
@@ -61,11 +61,21 @@
   per-tile early stop. Other cases fall back to CPU.
 - PEF 10 MP: PASS, PAE 1 LSB on AMD RX 550 and POCL.
 - 0.75, 1.5 and 2.0 radii, with and without early stop: PASS, PAE 1 LSB.
-- 45.7 MP NEF: falls back to CPU by design (12 MP limit avoids an AMD GPU
-  watchdog reset); CPU output unchanged.
+- 45.7 MP NEF: PASS on Rusticl RX 550 after the 12 MP rejection was removed;
+  capture is split into adaptive 16-row (or smaller) launches and each launch
+  is finished before the next. Capture 4.77 s; total 36.31 s GPU versus
+  36.69 s CPU; PAE 1 LSB. End-to-end remains roughly neutral.
 - Kernel uses 1024 work-items and ~35 KiB local memory; devices below that
-  fall back.
-- Stage ~1.1 s on PEF; total 7.71 s GPU versus 7.88 s CPU (about 2% faster).
+  fall back. Work per chunk is bounded by `chunkBudget` so high radius/iteration
+  settings can fall back to CPU instead of tripping the watchdog.
+- POCL remains a functional test target: `RT_OPENCL_ALLOW_CPU=1` selects the
+  CPU OpenCL device; it is intentionally not selected in auto mode because the
+  native CPU path is faster (45.7 MP: 16.75 s capture / 50.76 s total).
+- PEF 10 MP: stage 1.15 s; PAE 1 LSB.
+- PEF radius 2.0, 100 iterations, early stop off: PASS, 5.73 s, PAE 1 LSB;
+  this exercises the one-row chunk limit.
+- POCL-only auto mode uses the native CPU path; explicit POCL selection and
+  `RT_OPENCL_ALLOW_CPU=1` remain available for tests.
 
 ## M3 evidence — transform
 
@@ -97,7 +107,8 @@
 
 ## M1 evidence — program cache
 
-- Fresh POCL cache: `--gpu-test` reports `(compiled)`; cache file created.
+- Fresh POCL cache (`RT_OPENCL_ALLOW_CPU=1`): `--gpu-test` reports
+  `(compiled)`; cache file created.
 - Second POCL run: reports `(cached)`.
 - Fresh AMD RX 550 cache: `(compiled)`, second run `(cached)`.
 - Corrupt cache file: ignored, kernel recompiled and cache rewritten.
@@ -113,11 +124,12 @@
 - `--list-formats`: 35 extensions, matching `rtengine/formats.{h,cc}`.
 - `--gpu-info` with no ICD: prints "No OpenCL platform found" and exits 0.
 - `--gpu-test` with no ICD: exits 2, no crash.
-- `--gpu-test` on POCL: PASS.
+- `--gpu-test` on POCL with `RT_OPENCL_ALLOW_CPU=1`: PASS.
 - `--gpu-test` on AMD Radeon RX 550 (Rusticl): PASS.
 - Cross-build CPU vs OpenCL `--gpu=off`, single-threaded:
   `colorspace_flowers.pef`, PAE 0.
-- `verify.sh --quick`: SKIP on the CPU build, PASS on POCL and Rusticl.
+- `verify.sh --quick`: SKIP on the CPU build, PASS on POCL with
+  `RT_OPENCL_ALLOW_CPU=1`, PASS on Rusticl.
 - Multi-threaded CPU output is not bit-reproducible (up to 5 LSB); see
   `PARITY.md`.
 
@@ -131,7 +143,10 @@
 - POCL and Rusticl installed together can crash inside the ICD loader. The
   backend hides POCL when a loadable GPU ICD is present. If the GPU runtime
   reports no device, POCL is also hidden; select it explicitly with
-  `OCL_ICD_VENDORS` pointing at a directory containing only `pocl.icd`.
+  `OCL_ICD_VENDORS` pointing at a directory containing only `pocl.icd` and
+  `RT_OPENCL_ALLOW_CPU=1`.
+- Auto mode ignores CPU OpenCL devices (POCL); use an explicit device selection
+  or `RT_OPENCL_ALLOW_CPU=1` for POCL tests.
 - OpenCL is initialised lazily, so `--gpu=off` and CPU-only use never load a
   vendor driver.
 
@@ -149,7 +164,7 @@ choose at runtime whether to use a device.
 | M1 | complete | device discovery, program cache, self-test |
 | M2 | complete | Lanczos resize |
 | M3 | complete | rotation/scale/crop transform |
-| M4 | complete | capture sharpening (up to 12 MP) |
+| M4 | complete | capture sharpening, work-chunked above 12 MP |
 | M6 | complete | portable `/usr/local` `.deb` for Debian 12+ |
 | M7 | complete | Rusticl driver auto-detection and preference |
 

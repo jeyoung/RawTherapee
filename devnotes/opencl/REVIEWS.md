@@ -129,3 +129,24 @@ hybrid-GPU handling that enabled only one driver.
 - Device probing before vendor filtering.
 - Buffer pool to avoid per-call allocation churn.
 - End-to-end speedup requires more stages or pipeline residency.
+
+## R9 — Tiled capture sharpening
+
+The first tiled version removed the pixel cap but still lost the context when
+large chunks were queued without completion points.
+
+| Finding | Resolution |
+|---|---|
+| Fixed 16-row chunks do not bound work for radius/iteration extremes | Chunk rows derive from a work budget; settings above the budget fall back to CPU |
+| Queue accumulated chunks without completion | `clFinish` after every chunk, preserving phase order and bounding watchdog exposure |
+| Host staging allocation could throw past the fallback | Allocations are guarded and return `false` |
+| A lost device left later stages retrying a dead session | Fatal enqueue/read failures disable the stage for the remainder of the run |
+| POCL was selected like a GPU in auto mode | CPU OpenCL devices require explicit selection or `RT_OPENCL_ALLOW_CPU=1`; native CPU is used otherwise |
+| Empty no-op edge chunks | Phases 2/3 start at the final chunk |
+| Chunk estimate ignored the two convolution passes and output pixels | Work estimate includes both passes and a 1.4 output-pixel factor; budget is empirical and conservative |
+| POCL-only GUI could not select POCL explicitly | Device availability and auto-selection are separate; the device combo remains enabled |
+| `RT_OPENCL_ALLOW_CPU=0` enabled POCL | Only the exact value `1` opts in |
+| Self-test fell back to device 0 with no selected device | Self-test now reports no GPU device |
+
+Historical note: the R4 capture entry that said “45 MP watchdog reset — GPU
+capture limited to 12 MP” is superseded by this work.

@@ -85,6 +85,7 @@ driver and an ICD loader must be installed separately.
   `librsvg2-common` explicitly for lens correction and SVG icons.
 - The bundled exiv2 and JPEG XL copies do not receive distribution security
   updates; rebuild the package to pick up fixes.
-- OpenCL support depends on the host ICD and driver; without one the CPU path
-  is used.
+- OpenCL support depends on the host ICD and driver; without a GPU device the
+  CPU path is used. POCL-only systems also use the CPU path by default; set
+  `RT_OPENCL_ALLOW_CPU=1` only for POCL testing.
 - `librsvg2-common` is recommended so the SVG icon theme renders correctly.

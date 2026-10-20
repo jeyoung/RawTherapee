@@ -13,6 +13,8 @@
 #    RT_BUILD_DIR   Build directory containing rtgui/rawtherapee-cli
 #    RT_TESTDATA    Test image directory (default: $HOME/rt-testdata)
 #    RT_REPORT      Output directory for CSV results (default: $RT_TESTDATA)
+#    RT_OPENCL_ALLOW_CPU=1  Select a CPU OpenCL device for testing
+#    RT_ALLOW_CPU_PARITY=1 Compare CPU paths when no OpenCL device is selected
 #
 set -euo pipefail
 

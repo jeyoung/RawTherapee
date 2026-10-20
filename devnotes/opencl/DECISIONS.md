@@ -94,3 +94,17 @@ GPU; no per-user shell or desktop-file environment is needed. An existing
 `RUSTICL_ENABLE`, for example one used for a POCL comparison, still wins. The
 setting is Linux-specific because it relies on `/sys/class/drm`. Mesa 23.1
 or newer is needed for Rusticl; Debian 12's Mesa 22.3 uses Clover instead.
+
+## D009 — Chunk GPU capture sharpening and skip CPU OpenCL devices
+
+Date: 2026-10-20
+
+Decision: launch capture-sharpening tiles in work-budgeted row chunks and finish
+each chunk before starting the next. Remove the old 12 MP rejection. Auto mode
+selects GPU devices; a CPU OpenCL device is used only when explicitly selected
+or when `RT_OPENCL_ALLOW_CPU=1` is set for testing.
+
+Consequences: 45.7 MP capture runs on the RX 550 without a context-loss reset.
+High radius/iteration settings that exceed the chunk budget fall back to CPU
+instead of risking a watchdog. POCL remains available for parity tests but does
+not slow normal exports on POCL-only systems.

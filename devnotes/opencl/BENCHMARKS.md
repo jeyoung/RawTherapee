@@ -73,9 +73,11 @@ PEF, 3896x2616:
 | CPU | 7.88 s | 730 MB | — |
 | GPU | 7.71 s | 942 MB | 1.15 s |
 
-The GPU path is about 2% faster end-to-end. Larger images fall back to CPU at
-12 MP because the 1024-work-item, 35 KiB-local-memory tile kernel can exceed
-the AMD watchdog on older cards.
+The GPU path is about 2% faster end-to-end. The stage is now split into
+watchdog-safe row chunks, so images above 12 MP use the GPU too. On the 45.7 MP
+D850 NEF, Rusticl RX 550 capture took 4.77 s; total 36.31 s GPU versus 36.69 s
+CPU, with PAE 1 LSB. POCL is test-only and intentionally skipped in auto mode:
+the same 45.7 MP case took 16.75 s capture and 50.76 s total on POCL.
 
 ## Debian package smoke run
 
