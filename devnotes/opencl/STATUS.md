@@ -59,9 +59,10 @@ An RCD full-image pass prototype was implemented and reverted before commit.
 - The monitor path is used for matrix-shaper profiles with relative
   colorimetric intent, no soft proof or gamut check, and either BPC off or a
   zero destination black point. LUT profiles and unsafe cases keep lcms.
-- The inverse TRC is built from the lcms estimated table by binary search and
-  cached per profile/settings key. Profile setup is 3–7 ms instead of the
-  50–83 ms bisection prototype.
+- The matrix and inverse TRC are extracted from the active profile through
+  the shared `buildGpuProfile()` helper, then cached per profile/settings key.
+  No profile colour values are compiled into the binary. The inverse table is
+  built at 16-bit precision and costs about 65 ms on a profile change.
 - 1024×768 random full-range Lab, 8 threads: GPU 12 ms versus lcms 26–46 ms.
   Maximum difference 1 byte on `RTv4_sRGB`, `RTv2_sRGB`, system `sRGB`,
   `sRGB2014`, and `RTv4_Medium` (BPC on and off).
@@ -80,10 +81,10 @@ An RCD full-image pass prototype was implemented and reverted before commit.
 - Scope: `ImProcFunctions::lab2rgbOut` for the shipped `RTv4_sRGB` profile
   with relative colorimetric intent and integer output. Other profiles and
   float output keep the lcms path.
-- The kernel uses the exact matrix and parametric tone curve from
-  `rtdata/iccprofiles/output/RTv4_sRGB.icc`. Using the generic sRGB constants
-  instead differed from lcms by up to 26 LSB; the profile-exact values reduce
-  the error to 1 LSB.
+- The kernel receives the matrix and inverse tone curve extracted at runtime
+  from the actual `rtdata/iccprofiles/output/RTv4_sRGB.icc`; no colour values
+  are hardcoded. Using generic sRGB constants instead differed from lcms by
+  up to 26 LSB; the profile-exact values reduce the error to 1 LSB.
 - 10 MP PEF, `OMP_NUM_THREADS=8`, 16-bit TIFF: CPU 2.73–2.84 s versus GPU
   2.48–2.49 s; stage 129–132 ms.
 - 45.7 MP NEF, `OMP_NUM_THREADS=8`, 16-bit TIFF: CPU 8.09–8.13 s versus GPU

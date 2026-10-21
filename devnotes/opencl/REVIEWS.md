@@ -186,7 +186,8 @@ but encoded 16-bit comparison showed a 26 LSB difference from lcms.
 
 | Finding | Resolution |
 |---|---|
-| Generic sRGB constants differ from the shipped profile | Use the exact `RTv4_sRGB` matrix and parametric curve; PAE drops to 1 LSB |
+| Generic sRGB constants differ from the shipped profile | Extract the actual profile matrix and inverse curve at runtime; PAE drops to 1 LSB |
+| Profile values were duplicated in the binary | Extracted from `RTv4_sRGB.icc` via `buildGpuProfile()`; no colour values are compiled in |
 | Gate included legacy and user-provided names | Limit to the shipped `RTv4_sRGB` profile |
 | `NoICMString` was offloaded | Kept on the manual CPU path, which is faster than an upload/download round trip |
 | 32-bit float output would be clipped | CLI records `tiffFloat`; float output keeps lcms |
@@ -203,7 +204,7 @@ matrix/TRC path, which only pays off when it replaces lcms.
 | Finding | Resolution |
 |---|---|
 | Generic sRGB path was 2 bytes from lcms and slower than the manual CPU path | Use the monitor profile matrix and inverse TRC; keep the manual CPU path when there is no monitor profile |
-| Bisection inversion cost 50–83 ms per profile update | Invert the lcms estimated table by binary search; setup is now 3–7 ms and is cached |
+| Bisection inversion cost 50–83 ms per profile update | Use it only for the 16-bit output path and cache the result; the monitor path reuses the cache while its profile key is unchanged |
 | `cmsIsMatrixShaper()` does not rule out LUT output tags | Reject profiles with `BToA*` or `BToD*` tags |
 | Sampled TRC checks could miss non-monotonic or unequal curves | Use `cmsIsToneCurveMonotonic()` and compare the full estimated tables |
 | BPC filename heuristic was fragile | Use `cmsDetectDestinationBlackPoint()` and require a zero black point when BPC is on |
@@ -228,3 +229,20 @@ without running the stage.
 | Budget omitted the identity LUT | Count nine LUT buffers |
 | Missing shadow LUT silently became identity | Reject `toneCurveBlack != 0` without a shadow LUT |
 | LUT copies and uploads happen per call | Accepted for the opt-in stage; cache later if fusion lands |
+
+## R15 — Runtime ICC extraction
+
+The output path originally duplicated the shipped sRGB matrix and parametric
+curve. That made a profile update or a same-name custom profile use stale
+colour data. The monitor path already read profile tags, but used a 16-bit
+estimated table that was not precise enough for 16-bit output.
+
+| Finding | Resolution |
+|---|---|
+| Output matrix and TRC were hardcoded | Extract matrix and inverse TRC from the actual profile via `buildGpuProfile()` |
+| Estimated-table inversion is too coarse for 16-bit output | Invert the monotonic profile curve numerically with 20 bisection steps and cache the table |
+| A calibrated monitor profile may have per-channel TRCs or LUT tags | Require identical monotonic TRCs and reject LUT tags; fall back to lcms |
+| BPC was assumed safe | Call `cmsDetectDestinationBlackPoint()` and require a zero black point when BPC is enabled |
+| Monitor BPC failure could retain a stale ready flag | Clear `monitorGpuReady` on every unsafe branch |
+| A silent output fallback would still pass parity | `verify.sh --quick` now asserts that `opencl lab2srgb:` runs |
+| Profile setup cost is paid per image | Accepted at about 65 ms; the output job caches it by profile handle. A process-wide cache remains future work |

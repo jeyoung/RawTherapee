@@ -153,20 +153,24 @@ the full-quality render, and crop/detail windows must not show stale geometry.
 Date: 2026-10-21
 
 Decision: the GPU output stage is limited to the shipped `RTv4_sRGB` profile
-with relative colorimetric intent and integer output. It uses the profile's
-exact XYZ matrix and parametric tone curve, not the generic `sRGB_xyz`
-constants.
+with relative colorimetric intent and integer output. Its matrix and inverse
+tone curve are extracted at runtime from the actual profile through lcms; no
+profile colour values are compiled into the code.
 
-Alternatives: the generic sRGB constants are shorter to write but differ from
-lcms by up to 26 LSB at 16-bit. A 3D LUT would cover arbitrary profiles but
-needs interpolation-error testing and a larger cache.
+Alternatives: compiling the values was fragile because a profile update or a
+custom profile with the same name would silently use stale data. The generic
+`sRGB_xyz` constants differ from lcms by up to 26 LSB at 16-bit. A 3D LUT
+would cover arbitrary profiles but needs interpolation-error testing and a
+larger cache.
 
 Consequences: output conversion is 1 LSB parity on the six-format corpus.
 `RTv2_sRGB`, other output profiles and 32-bit float output keep the lcms path.
 `NoICMString` is not offloaded because it already uses the faster manual CPU
-sRGB path; adding a GPU round trip would be slower. The profile values are
-duplicated in `openclengine.cc` and must be updated if the shipped profile
-changes.
+sRGB path; adding a GPU round trip would be slower. Profiles that are not
+matrix shapers, contain LUT tags, have non-identical or non-monotonic TRCs, or
+need black-point compensation with a non-zero destination black point fall
+back to lcms. The extracted table is cached per processing job; the first
+build costs about 65 ms.
 
 ## D014 — Offload matrix-shaper monitor conversion
 
@@ -176,8 +180,8 @@ Decision: `lab2monitorRgb()` uses the GPU when the monitor profile is a
 matrix shaper with same R/G/B TRCs, the intent is relative colorimetric, there
 is no soft proof or gamut check, and BPC is either off or has a zero
 destination black point. LUT-based profiles and unsafe cases keep lcms. The
-inverse TRC is built from the lcms estimated table and cached per profile and
-settings key.
+matrix and inverse TRC are extracted from the profile by the shared
+`buildGpuProfile()` helper and cached per profile and settings key.
 
 Alternatives: the manual CPU sRGB path is faster than the GPU for the
 no-profile case (about 2 ms versus 12 ms at 1 MP), so it is kept. A generic
@@ -187,8 +191,8 @@ the profile data is used instead.
 Consequences: matrix-shaper monitor conversion is about 2–3× faster than lcms
 at 1 MP (12 ms versus 26–46 ms) with a maximum 1-byte difference. The GPU path
 is only built when OpenCL is enabled; thumbnail and CPU-only paths do not pay
-the LUT construction cost. The LUT inversion assumes the estimated table is
-monotonic and the three TRCs are identical.
+the LUT construction cost. The shared extractor requires monotonic, identical
+R/G/B TRCs and rejects any LUT tags; other profiles keep lcms.
 
 ## D015 — Keep the GPU `rgbProc` core opt-in
 
@@ -225,3 +229,25 @@ thread; the multi-threaded CPU is faster still. The prototype also failed
 parity (maximum error about 17,972 LSB). GPU work stops at output conversion,
 monitor conversion and the opt-in `rgbProc` core. Wavelet/denoise is the only
 remaining compute-heavy candidate, and only if requested.
+
+## D017 — Never embed ICC colour values in the GPU path
+
+Date: 2026-10-21
+
+Decision: the GPU output and monitor conversions obtain their matrix and
+inverse TRC from the actual ICC profile through `buildGpuProfile()`. No
+profile colour values are compiled into the binary. A profile is accepted only
+when it is a matrix shaper without LUT tags, has finite colorants, and its
+three monotonic TRCs are identical and map 0→0 and 1→1. Otherwise the CPU
+lcms path is used.
+
+Alternatives: embedding the current `RTv4_sRGB` values was rejected. It made a
+profile update or a same-name custom profile silently use stale colour data,
+and it made a hardware-calibrated monitor profile impossible to validate.
+
+Consequences: a profile replacement takes effect without rebuilding
+RawTherapee. The inverse table is built at 16-bit precision by inverting the
+profile curve, costing about 65 ms on first use per processing job; it is then
+cached. Profiles that cannot be represented exactly by a matrix plus one
+shared TRC keep lcms, so calibrated LUT or per-channel profiles remain
+colour-correct rather than being approximated.
