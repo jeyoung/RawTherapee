@@ -231,6 +231,18 @@ private:
 /**
  * Reports an instantaneous event, relative to the start of the load.
  */
+inline void mark(const char* phase, const char* detail = nullptr)
+{
+    if (!isEnabled()) {
+        return;
+    }
+
+    report(phase, 0, detail, true);
+}
+
+/**
+ * Reports an instantaneous event only for the first occurrence.
+ */
 inline void markFirst(const char* phase, std::atomic<bool>& firstOnly,
                       const char* detail = nullptr)
 {

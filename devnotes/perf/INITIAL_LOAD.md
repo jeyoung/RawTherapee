@@ -137,3 +137,56 @@ dcraw fallback:
 The resulting JPEGs were pixel-identical (`compare -metric AE` returned 0 for
 both images). This is a decoder-path difference, not a profiling artefact:
 LibRaw's NEF decoder is about 4.5 times slower than dcraw on the 45.7 MP file.
+
+## Fast decoder experiment
+
+`RT_FAST_DECODER=1` makes an initial single-frame load try the internal dcraw
+decoder before LibRaw. The default remains LibRaw and the switch only affects
+`RawImageSource::load`; thumbnails, dark frames and flat frames keep the
+existing path.
+
+The dcraw attempt is restricted to Bayer, non-DNG, non-Foveon, non-pixel-shift
+Pentax and Nikon files for which LibRaw is enabled and the probe found one
+frame. After `identify()`, the attempt is rejected if there is no decoder,
+unexpected frame count, Fuji layout, metadata errors, invalid dimensions,
+unsupported CFA, missing input, invalid data offset, Hasselblad/Phase One/Leaf
+maker or an unverified maker.
+
+If dcraw identify or decode fails, or the decoded buffers are missing or
+`data_error` is set, the load is cleaned up and retried with LibRaw. The global
+`settings->enableLibRaw` is never modified. `RT_LOAD_PROFILE=1` prints:
+
+```text
+decoder selection [dcraw (fast)]
+decoder fallback [reason]
+decoder selection [libraw (fallback)]
+decoder dcraw [fast]
+```
+
+`rawtherapee-cli` load times (CPU build, cold and warm medians):
+
+| Image | LibRaw cold | dcraw cold | LibRaw warm | dcraw warm |
+|---|---:|---:|---:|---:|
+| 10 MP PEF | 515.5 ms | 232.6 ms | 502.8 ms | 227.4 ms |
+| 45.7 MP NEF | 2424.6 ms | 850.7 ms | 2294.5 ms | 824.0 ms |
+
+GUI under Xvfb, fit zoom:
+
+| Image | LibRaw load cold | dcraw load cold | LibRaw first preview cold | dcraw first preview cold |
+|---|---:|---:|---:|---:|
+| 10 MP PEF | 541.8 ms | 230.8 ms | 879.4 ms | 553.3 ms |
+| 45.7 MP NEF | 2357.3 ms | 894.9 ms | 3035.4 ms | 1591.4 ms |
+
+Warm medians were 519.3/234.4 ms load and 830.4/564.5 ms first preview for the
+10 MP PEF, and 2279.2/835.4 ms load and 2981.4/1568.1 ms first preview for the
+45.7 MP NEF.
+
+16-bit TIFF parity was checked with `OMP_NUM_THREADS=1` to remove the
+pre-existing multithreaded 1-LSB variation: fast dcraw matched the LibRaw
+baseline with `compare -metric AE` = 0 for both files. A forced dcraw failure
+also retried through LibRaw and matched the same baseline.
+
+Test gaps: X-Trans, DNG, Canon/Sony and other makes remain on LibRaw until
+parity is established; multi-frame and special layouts are excluded by design.
+dcraw allocation failure through its `longjmp` path is not recoverable and is
+not converted into a fallback.

@@ -581,12 +581,46 @@ skip_block:
     }
 }
 
-int RawImage::loadRaw(bool loadData, unsigned int imageNum, bool closeFile, ProgressListener *plistener, double progressRange, bool allowDirectRawPlane)
+int RawImage::loadRaw(bool loadData, unsigned int imageNum, bool closeFile, ProgressListener *plistener, double progressRange, bool allowDirectRawPlane, bool preferDcraw)
 {
+    const bool fastDcrawAttempt = loadData && preferDcraw
+        && settings->enableLibRaw;
+
+    auto fallbackToLibRaw = [&](const char* reason) -> int {
+        LoadProfile::mark("decoder fallback", reason);
+
+        if (image != nullptr) {
+            free(image);
+            image = nullptr;
+        }
+
+        if (raw_image != nullptr) {
+            free(raw_image);
+            raw_image = nullptr;
+        }
+
+        image_from_float.reset();
+        directRawImage = nullptr;
+        float_raw_image = nullptr;
+        meta_data = nullptr;
+        data_error = 0;
+
+        if (ifp != nullptr) {
+            fseek(ifp, 0, SEEK_SET);
+            ifp->eof = false;
+        }
+
+        LoadProfile::mark("decoder selection", "libraw (fallback)");
+
+        return loadRaw(loadData, imageNum, closeFile, plistener, progressRange,
+                       allowDirectRawPlane, false);
+    };
+
     ifname = filename.c_str();
     image = nullptr;
     image_from_float.reset();
     directRawImage = nullptr;
+    decoder = Decoder::DCRAW;
     verbose = settings->verbose;
     oprof = nullptr;
 
@@ -610,9 +644,11 @@ int RawImage::loadRaw(bool loadData, unsigned int imageNum, bool closeFile, Prog
 
     // The same metadata is parsed once for the probe and again when the data
     // is loaded, so label both occurrences.
-    LoadProfile::Timer metadataTimer("raw metadata", nullptr,
-                                     loadData ? "data load" : "probe",
-                                     true);
+    LoadProfile::Timer metadataTimer(
+        "raw metadata", nullptr,
+        fastDcrawAttempt ? "dcraw identify"
+                         : (loadData ? "data load" : "probe"),
+        true);
 
     imfile_set_plistener(ifp, plistener, 0.9 * progressRange);
 
@@ -629,11 +665,15 @@ int RawImage::loadRaw(bool loadData, unsigned int imageNum, bool closeFile, Prog
 
     shot_select = imageNum;
 
-    if (settings->enableLibRaw) {
+    if (fastDcrawAttempt) {
+        LoadProfile::mark("decoder selection", "dcraw (fast)");
+    }
+
+    if (settings->enableLibRaw && !fastDcrawAttempt) {
         libraw.reset(new LibRaw());
     }
     int libraw_error = [&]() -> int {
-        if (!settings->enableLibRaw) {
+        if (!settings->enableLibRaw || fastDcrawAttempt) {
             return LIBRAW_SUCCESS;
         }
 
@@ -857,10 +897,28 @@ int RawImage::loadRaw(bool loadData, unsigned int imageNum, bool closeFile, Prog
     }
 
     if (decoder == Decoder::DCRAW) {
-        identify();
+        try {
+            identify();
+        } catch (...) {
+            if (fastDcrawAttempt) {
+                metadataTimer.stop();
+                return fallbackToLibRaw("identify exception");
+            }
+            throw;
+        }
+
         const MakeModel normalized_make_model = normalize_make_model({make, model});
         normalized_make = normalized_make_model.make;
         normalized_model = normalized_make_model.model;
+    }
+
+    if (fastDcrawAttempt) {
+        const char* fallbackReason = fastDcrawFallbackReason();
+
+        if (fallbackReason != nullptr) {
+            metadataTimer.stop();
+            return fallbackToLibRaw(fallbackReason);
+        }
     }
 
     // in case dcraw didn't handle the above mentioned case...
@@ -921,8 +979,9 @@ int RawImage::loadRaw(bool loadData, unsigned int imageNum, bool closeFile, Prog
         }
 
         if (decoder == Decoder::DCRAW) {
-            LoadProfile::Timer dcrawTimer("decoder dcraw", nullptr, "fallback",
-                                          true);
+            LoadProfile::Timer dcrawTimer(
+                "decoder dcraw", nullptr,
+                fastDcrawAttempt ? "fast" : "fallback", true);
 
             if (filters || colors == 1) {
                 raw_image = (ushort *) calloc ((static_cast<unsigned int>(raw_height) + 7u) * static_cast<unsigned int>(raw_width), 2);
@@ -946,7 +1005,27 @@ int RawImage::loadRaw(bool loadData, unsigned int imageNum, bool closeFile, Prog
             */
             // Load raw pixels data
             fseek(ifp, data_offset, SEEK_SET);
-            (this->*load_raw)();
+
+            try {
+                (this->*load_raw)();
+            } catch (...) {
+                if (fastDcrawAttempt) {
+                    dcrawTimer.stop();
+                    unpackTimer.stop();
+                    return fallbackToLibRaw("decode exception");
+                }
+                throw;
+            }
+
+            if (fastDcrawAttempt) {
+                const char* fallbackReason = fastDcrawDataFallbackReason();
+
+                if (fallbackReason != nullptr) {
+                    dcrawTimer.stop();
+                    unpackTimer.stop();
+                    return fallbackToLibRaw(fallbackReason);
+                }
+            }
         } else if (decoder == Decoder::LIBRAW) {
             libraw->imgdata.rawparams.shot_select = shot_select;
             libraw->imgdata.rawparams.options &= ~LIBRAW_RAWOPTIONS_CONVERTFLOAT_TO_INT;
@@ -1352,6 +1431,112 @@ int RawImage::loadRaw(bool loadData, unsigned int imageNum, bool closeFile, Prog
 DCraw::dcrawImage_t RawImage::get_image()
 {
     return image ? image : image_from_float.get();
+}
+
+bool RawImage::isFastDcrawEligible() const
+{
+    if (!settings->enableLibRaw || decoder != Decoder::LIBRAW) {
+        return false;
+    }
+
+    if (is_raw != 1 || is_foveon || fuji_width != 0 || dng_version != 0) {
+        return false;
+    }
+
+    if (merged_pixelshift.is_merged_pixelshift) {
+        return false;
+    }
+
+    if (getSensorType() != ST_BAYER || filters == 0 || colors != 3) {
+        return false;
+    }
+
+    if (width <= 0 || height <= 0 || raw_width <= 0 || raw_height <= 0) {
+        return false;
+    }
+
+    const std::string maker = get_maker();
+    return maker == "Pentax" || maker == "Nikon";
+}
+
+const char* RawImage::fastDcrawFallbackReason() const
+{
+    if (load_raw == nullptr) {
+        return "no decoder";
+    }
+
+    if (is_raw != 1) {
+        return "multi-frame";
+    }
+
+    if (is_foveon) {
+        return "foveon";
+    }
+
+    if (fuji_width != 0) {
+        return "fuji layout";
+    }
+
+    if (dng_version != 0) {
+        return "dng";
+    }
+
+    if (data_error != 0) {
+        return "metadata errors";
+    }
+
+    if (width <= 0 || height <= 0 || raw_width <= 0 || raw_height <= 0) {
+        return "invalid dimensions";
+    }
+
+    if (filters == 0 && colors != 1) {
+        return "unsupported cfa";
+    }
+
+    if (ifp == nullptr || ifp->size <= 0) {
+        return "no input";
+    }
+
+    if (data_offset <= 0 || data_offset >= ifp->size) {
+        return "invalid data offset";
+    }
+
+    if (strcmp(make, "Hasselblad") == 0) {
+        return "hasselblad";
+    }
+
+    if (strcmp(make, "Phase One") == 0 || strcmp(make, "Leaf") == 0) {
+        return "phaseone";
+    }
+
+    const std::string maker = get_maker();
+
+    if (maker != "Pentax" && maker != "Nikon") {
+        return "unverified make";
+    }
+
+    return nullptr;
+}
+
+const char* RawImage::fastDcrawDataFallbackReason() const
+{
+    if (data_error != 0) {
+        return "data errors";
+    }
+
+    if (image == nullptr) {
+        return "no image";
+    }
+
+    if ((filters != 0 || colors == 1) && raw_image == nullptr) {
+        return "no raw image";
+    }
+
+    if (width <= 0 || height <= 0) {
+        return "invalid dimensions";
+    }
+
+    return nullptr;
 }
 
 const char* RawImage::directRawPlaneFallbackReason() const

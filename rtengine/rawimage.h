@@ -45,7 +45,7 @@ public:
     explicit RawImage(const Glib::ustring &name);
     ~RawImage();
 
-    int loadRaw(bool loadData, unsigned int imageNum = 0, bool closeFile = true, ProgressListener *plistener = nullptr, double progressRange = 1.0, bool allowDirectRawPlane = false);
+    int loadRaw(bool loadData, unsigned int imageNum = 0, bool closeFile = true, ProgressListener *plistener = nullptr, double progressRange = 1.0, bool allowDirectRawPlane = false, bool preferDcraw = false);
     void get_colorsCoeff(float* pre_mul_, float* scale_mul_, float* cblack_, bool forceAutoWB);
     void set_prefilters()
     {
@@ -59,6 +59,7 @@ public:
     float** data;             // holds pixel values, data[i][j] corresponds to the ith row and jth column
     unsigned prefilters;               // original filters saved ( used for 4 color processing )
     unsigned int getFrameCount() const { return is_raw; }
+    bool isFastDcrawEligible() const;
 
     double getBaselineExposure() const { return RT_baseline_exposure; }
  
@@ -76,6 +77,8 @@ protected:
     Decoder decoder{Decoder::DCRAW};
     std::unique_ptr<LibRaw> libraw;
     std::unique_ptr<std::remove_pointer<dcrawImage_t>::type[]> image_from_float;
+    const char* fastDcrawFallbackReason() const;
+    const char* fastDcrawDataFallbackReason() const;
     const char* directRawPlaneFallbackReason() const;
     const unsigned short* directRawImage = nullptr;
     int directRawPitch = 0;

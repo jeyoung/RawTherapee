@@ -21,6 +21,8 @@
 #include <cstdlib>
 #include <iostream>
 
+#include <glib.h>
+
 #include "camconst.h"
 #include "color.h"
 #include "curves.h"
@@ -59,6 +61,15 @@
 
 namespace
 {
+
+bool fastDecoderEnabled()
+{
+    static const bool enabled = []() {
+        const char* value = g_getenv("RT_FAST_DECODER");
+        return value != nullptr && g_strcmp0(value, "1") == 0;
+    }();
+    return enabled;
+}
 
 float clipitc(float x)
 {
@@ -1219,6 +1230,9 @@ int RawImageSource::load(const Glib::ustring &fname, bool firstFrameOnly)
 
     numFrames = firstFrameOnly && (numFrames < 7 || !isHasselblad) ? 1 : ri->getFrameCount();
 
+    const bool preferDcraw = fastDecoderEnabled() && numFrames == 1
+        && ri->isFastDcrawEligible();
+
     errCode = 0;
 
     if (numFrames >= 7 && isHasselblad) {
@@ -1294,7 +1308,7 @@ int RawImageSource::load(const Glib::ustring &fname, bool firstFrameOnly)
         riFrames.clear();
         riFrames.emplace_back(ri);
         errCode = riFrames.back()->loadRaw(true, 0, true, plistener, 0.8,
-                                           numFrames == 1);
+                                           numFrames == 1, preferDcraw);
     }
     rawDataFrames.resize(riFrames.size());
     rawDataBuffer.clear();
