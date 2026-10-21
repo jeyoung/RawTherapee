@@ -581,11 +581,12 @@ skip_block:
     }
 }
 
-int RawImage::loadRaw(bool loadData, unsigned int imageNum, bool closeFile, ProgressListener *plistener, double progressRange)
+int RawImage::loadRaw(bool loadData, unsigned int imageNum, bool closeFile, ProgressListener *plistener, double progressRange, bool allowDirectRawPlane)
 {
     ifname = filename.c_str();
     image = nullptr;
     image_from_float.reset();
+    directRawImage = nullptr;
     verbose = settings->verbose;
     oprof = nullptr;
 
@@ -1017,17 +1018,31 @@ int RawImage::loadRaw(bool loadData, unsigned int imageNum, bool closeFile, Prog
                     }
                 }
             } else {
-                LoadProfile::Timer raw2imageTimer("decoder raw2image", nullptr,
-                                                  "libraw", true);
-#ifdef LIBRAW_USE_OPENMP
-                MyMutex::MyLock lock(*librawMutex);
-#endif
                 float_raw_image = nullptr;
-                err = libraw->raw2image();
-                if (err) {
-                    return err;
+
+                const char* fallbackReason =
+                    allowDirectRawPlane
+                        ? directRawPlaneFallbackReason()
+                        : "not requested";
+
+                if (fallbackReason == nullptr) {
+                    directRawImage = rd.raw_image;
+                    directRawPitch =
+                        static_cast<int>(rd.sizes.raw_pitch / 2);
+                    directRawTopMargin = rd.sizes.top_margin;
+                    directRawLeftMargin = rd.sizes.left_margin;
+                } else {
+                    LoadProfile::Timer raw2imageTimer(
+                        "decoder raw2image", nullptr, fallbackReason, true);
+#ifdef LIBRAW_USE_OPENMP
+                    MyMutex::MyLock lock(*librawMutex);
+#endif
+                    err = libraw->raw2image();
+                    if (err) {
+                        return err;
+                    }
+                    image = libraw->imgdata.image;
                 }
-                image = libraw->imgdata.image;
             }
 
             LoadProfile::Timer postUnpackTimer("decoder post-unpack", nullptr,
@@ -1339,9 +1354,120 @@ DCraw::dcrawImage_t RawImage::get_image()
     return image ? image : image_from_float.get();
 }
 
+const char* RawImage::directRawPlaneFallbackReason() const
+{
+    if (decoder != Decoder::LIBRAW || !libraw) {
+        return "decoder";
+    }
+
+    const auto &rd = libraw->imgdata.rawdata;
+    const auto &sizes = rd.sizes;
+    const auto &iparams = rd.iparams;
+
+    if (rd.raw_image == nullptr || rd.color3_image != nullptr
+            || rd.color4_image != nullptr) {
+        return "no raw plane";
+    }
+
+    if (rd.float_image != nullptr || rd.float3_image != nullptr
+            || rd.float4_image != nullptr || float_raw_image != nullptr
+            || image_from_float) {
+        return "float image";
+    }
+
+    if (merged_pixelshift.is_merged_pixelshift || is_raw != 1) {
+        return "multi-frame";
+    }
+
+    if (is_foveon || rd.iparams.is_foveon) {
+        return "foveon";
+    }
+
+    if (colors != 3) {
+        return "unsupported colors";
+    }
+
+    if (filters <= 1 || filters != iparams.filters) {
+        return "cfa metadata";
+    }
+
+    if (isXtrans()) {
+        for (int row = 0; row < 6; ++row) {
+            for (int col = 0; col < 6; ++col) {
+                if (xtrans[row][col] != iparams.xtrans[row][col]) {
+                    return "xtrans metadata";
+                }
+            }
+        }
+    }
+
+    if (fuji_width != 0 || rd.ioparams.fuji_width != 0) {
+        return "fuji layout";
+    }
+
+    if (shrink != 0 || rd.ioparams.shrink != 0) {
+        return "shrink";
+    }
+
+    if (rotate_deg != 0) {
+        return "rotation";
+    }
+
+    if (width <= 0 || height <= 0
+            || int(sizes.width) != width || int(sizes.height) != height
+            || int(sizes.iwidth) != iwidth || int(sizes.iheight) != iheight
+            || sizes.iwidth != sizes.width || sizes.iheight != sizes.height) {
+        return "dimensions";
+    }
+
+    if (sizes.raw_pitch == 0 || (sizes.raw_pitch & 1u) != 0
+            || sizes.raw_pitch / 2 < sizes.raw_width) {
+        return "invalid pitch";
+    }
+
+    if (int(sizes.raw_width) < int(sizes.width) + int(sizes.left_margin)
+            || int(sizes.raw_height) < int(sizes.height) + int(sizes.top_margin)) {
+        return "invalid bounds";
+    }
+
+    if (strcmp(make, "Hasselblad") == 0) {
+        return "hasselblad";
+    }
+
+    if (strcmp(make, "Phase One") == 0 || strcmp(make, "Leaf") == 0) {
+        return "phaseone";
+    }
+
+    if (libraw->is_sraw()) {
+        return "sraw";
+    }
+
+    if (libraw->is_floating_point()) {
+        return "float image";
+    }
+
+    const char* unpack = libraw->unpack_function_name();
+
+    if (unpack != nullptr
+            && (strcmp(unpack, "canon_600_load_raw") == 0
+                || strcmp(unpack, "hasselblad_load_raw") == 0
+                || strncmp(unpack, "phase_one", 9) == 0)) {
+        return "special decoder";
+    }
+
+    CameraConstantsStore* ccs = CameraConstantsStore::getInstance();
+    const CameraConst* cc = ccs != nullptr ? ccs->get(make, model) : nullptr;
+
+    if (cc != nullptr && cc->has_rawCrop(raw_width, raw_height)) {
+        return "raw crop";
+    }
+
+    return nullptr;
+}
+
 float** RawImage::compress_image(unsigned int frameNum, bool freeImage)
 {
-    if (!image && !image_from_float) {
+    if (!image && !image_from_float && directRawImage == nullptr) {
         return nullptr;
     }
 
@@ -1403,6 +1529,25 @@ float** RawImage::compress_image(unsigned int frameNum, bool freeImage)
 
         delete [] float_raw_image;
         float_raw_image = nullptr;
+    } else if (directRawImage != nullptr) {
+        LoadProfile::Timer directTimer("direct_plane", nullptr, "libraw", true);
+
+        const int pitch = directRawPitch;
+        const int top = directRawTopMargin;
+        const int left = directRawLeftMargin;
+
+#ifdef _OPENMP
+        #pragma omp parallel for
+#endif
+
+        for (int row = 0; row < height; row++) {
+            const unsigned short* src =
+                directRawImage + (row + top) * pitch + left;
+
+            for (int col = 0; col < width; col++) {
+                data[row][col] = src[col];
+            }
+        }
     } else if (merged_pixelshift.is_merged_pixelshift) {
         // Frame 0 is not shifted. Frame 1 is shifted down. Frame 2 is shifted
         // down and right. Frame 3 is shifted right.
@@ -1493,6 +1638,7 @@ float** RawImage::compress_image(unsigned int frameNum, bool freeImage)
         }
         image = nullptr;
         image_from_float.reset();
+        directRawImage = nullptr;
     }
 
     return data;

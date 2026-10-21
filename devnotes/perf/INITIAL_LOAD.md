@@ -29,13 +29,17 @@ start. Instantaneous events, such as the first image hand-off, print only
 - `decoder setup` — common setup before the decoder branch.
 - `decoder open_buffer` — the second LibRaw `open_buffer` in the data pass.
 - `decoder unpack` — LibRaw `unpack`, i.e. decompression into `raw_image`.
-- `decoder raw2image` — LibRaw `raw2image`, i.e. the 4-channel expansion.
+- `decoder raw2image` — LibRaw `raw2image` fallback, i.e. the 4-channel
+  expansion. The detail is the fallback reason.
 - `decoder float conversion` — RawTherapee's float/float3 copy for float DNGs.
 - `decoder post-unpack` — camera matrices, embedded profile and black-stat
   fixups after image construction.
 - `decoder finish` — baseline exposure and progress reporting.
 - `decoder dcraw` — dcraw allocation plus `load_raw`, coarse fallback timing.
 - `raw unpack` — total decoder bucket, wrapping all of the above.
+- `direct_plane` — direct copy from LibRaw's single-channel `raw_image` into
+  the compressed frame layout, inside `compress_image`; this replaces
+  `raw2image` on the guarded path.
 - `compress_image` — conversion to the compressed per-frame layout.
 - `preprocess` — first `RawImageSource::preprocess`.
 - `demosaic` — first demosaic after the load, labelled with the method; the
@@ -53,6 +57,22 @@ load are printed. `RT_PREVIEW_PROFILE` remains the per-request preview timer.
 `open_buffer`/`unpack` and cannot be separated without touching the mapped
 pages.
 
+## Direct raw-plane path
+
+`RawImageSource::load` enables `allowDirectRawPlane` only for single-frame
+loads. `RawImage::loadRaw` then accepts the direct path only when the decoder
+is LibRaw, a single-channel `rawdata.raw_image` exists, the image is Bayer or
+X-Trans with matching `filters`/`xtrans` metadata, and there is no float image,
+Foveon data, Fuji layout, pixel-shift/multi-frame data, shrink, rotation,
+camera raw crop, special decoder, invalid pitch/bounds, or dimension mismatch.
+`compress_image` copies from `raw_image` using LibRaw's `raw_pitch` and
+`top_margin`/`left_margin`; `libraw->recycle()` still runs only after the copy.
+
+Every rejected case calls `raw2image` as before. `RT_LOAD_PROFILE` prints the
+reason on the `decoder raw2image` line, for example `[not requested]`,
+`[float image]`, `[foveon]`, `[cfa metadata]`, `[raw crop]` or
+`[invalid pitch]`.
+
 ## Baseline
 
 Representative run on an 8-thread Intel i7-3770, CPU build, no OpenCL stages
@@ -60,45 +80,51 @@ for these phases. Cold means the input file was evicted from the page cache and
 the RawTherapee cache was emptied; the process and shared libraries were warm.
 Warm means an immediately repeated run.
 
-`rawtherapee-cli`, default profile (AMaZE demosaic), warm values are medians of
-three runs:
+`rawtherapee-cli`, default profile (AMaZE demosaic), after the direct path,
+warm values are medians of three runs:
 
 | Phase | 10 MP cold | 10 MP warm | 45.7 MP cold | 45.7 MP warm |
 |---|---:|---:|---:|---:|
-| `initial_image.load` | 636.5 ms | 637.7 ms | 2900.6 ms | 2867.4 ms |
-| `raw metadata` (both passes) | 4.6 ms | 1.7 ms | 7.6 ms | 1.6 ms |
-| `file open` [mmap] | 0.0 ms | 0.0 ms | 0.0 ms | 0.0 ms |
-| `decoder open_buffer` | 0.3 ms | 0.3 ms | 0.3 ms | 0.3 ms |
-| `decoder unpack` | 471.1 ms | 477.3 ms | 2187.3 ms | 2161.5 ms |
-| `decoder raw2image` | 128.3 ms | 128.5 ms | 580.5 ms | 580.2 ms |
-| `decoder setup`/`post-unpack`/`finish` | 0.0 ms | 0.0 ms | 0.0 ms | 0.0 ms |
-| `raw unpack` (total) | 599.8 ms | 606.2 ms | 2768.2 ms | 2740.8 ms |
-| `compress_image` | 13.8 ms | 12.4 ms | 51.1 ms | 52.9 ms |
-| `preprocess` | 31.0 ms | 28.9 ms | 131.0 ms | 123.9 ms |
-| `demosaic` | 161.5 ms | 160.8 ms | 682.6 ms | 711.2 ms |
-| `getImage` | 43.2 ms | 42.6 ms | 177.1 ms | 170.8 ms |
+| `initial_image.load` | 514.8 ms | 508.8 ms | 2356.5 ms | 2367.4 ms |
+| `decoder unpack` | 482.0 ms | 480.7 ms | 2237.6 ms | 2255.6 ms |
+| `decoder raw2image` | — | — | — | — |
+| `direct_plane` | 7.6 ms | 7.8 ms | 36.0 ms | 35.7 ms |
+| `compress_image` | 8.0 ms | 8.5 ms | 36.8 ms | 36.4 ms |
+| `preprocess` | 32.2 ms | 27.0 ms | 126.5 ms | 134.1 ms |
+| `demosaic` | 158.2 ms | 161.9 ms | 683.2 ms | 693.5 ms |
+| `getImage` | 47.5 ms | 44.6 ms | 167.4 ms | 172.6 ms |
 
-GUI under Xvfb, fit zoom (FAST demosaic), warm values are medians of two runs:
+GUI under Xvfb, fit zoom (FAST demosaic), after the direct path, warm values
+are medians of two runs:
 
 | Phase | 10 MP cold | 10 MP warm | 45.7 MP cold | 45.7 MP warm |
 |---|---:|---:|---:|---:|
-| `initial_image.load` | 633.0 ms | 652.8 ms | 2863.9 ms | 2912.4 ms |
-| `decoder unpack` | 476.3 ms | 492.1 ms | 2166.1 ms | 2203.0 ms |
-| `decoder raw2image` | 126.8 ms | 129.1 ms | 573.1 ms | 581.7 ms |
-| `raw unpack` (total) | 603.4 ms | 621.5 ms | 2739.5 ms | 2785.1 ms |
-| `compress_image` | 11.4 ms | 12.1 ms | 51.4 ms | 53.0 ms |
-| `preprocess` | 38.5 ms | 37.6 ms | 157.4 ms | 168.1 ms |
-| `demosaic` [fast] | 41.2 ms | 38.2 ms | 163.4 ms | 167.4 ms |
-| `getImage` | 13.7 ms | 14.0 ms | 42.5 ms | 43.4 ms |
-| `preview pipeline` | 161.6 ms | 153.8 ms | 518.8 ms | 526.1 ms |
-| first `imageReady` (`t+`) | 939.0 ms | 953.7 ms | 3529.8 ms | 3588.9 ms |
+| `initial_image.load` | 503.5 ms | 536.4 ms | 2290.3 ms | 2362.4 ms |
+| `decoder unpack` | 475.3 ms | 506.2 ms | 2176.8 ms | 2248.0 ms |
+| `direct_plane` | 7.6 ms | 9.0 ms | 35.5 ms | 35.9 ms |
+| `compress_image` | 7.7 ms | 9.3 ms | 36.5 ms | 36.6 ms |
+| `preprocess` | 40.1 ms | 39.4 ms | 171.5 ms | 183.5 ms |
+| `demosaic` [fast] | 39.0 ms | 39.5 ms | 178.2 ms | 187.5 ms |
+| `getImage` | 11.0 ms | 13.3 ms | 45.0 ms | 49.0 ms |
+| `preview pipeline` | 154.0 ms | 164.8 ms | 555.6 ms | 590.4 ms |
+| first `imageReady` (`t+`) | 803.0 ms | 852.3 ms | 2999.6 ms | 3108.3 ms |
 
-Within the decoder bucket, `unpack` accounts for about 79% and `raw2image` for
-about 20%. The remaining phases are effectively zero. Metadata parsing and
-`open_buffer` are negligible; enabling LibRaw's `raw2image` step and then
-copying the result again in `compress_image` is the largest removable cost.
-File reading is hidden in the unpack page faults: cold `unpack` is only about
-0–30 ms slower than warm `unpack`.
+Before/after summary (cold load and first preview):
+
+| Workload | Load before | Load after | First preview before | First preview after |
+|---|---:|---:|---:|---:|
+| CLI 10 MP PEF | 636.5 ms | 514.8 ms | — | — |
+| CLI 45.7 MP NEF | 2900.6 ms | 2356.5 ms | — | — |
+| GUI 10 MP PEF | 633.0 ms | 503.5 ms | 939.0 ms | 803.0 ms |
+| GUI 45.7 MP NEF | 2863.9 ms | 2290.3 ms | 3529.8 ms | 2999.6 ms |
+
+The direct path removes `raw2image` completely for the two test files. Its cost
+moves into `direct_plane`, which is much cheaper than the previous
+`raw2image` plus `compress_image` combination. LibRaw `unpack` is now the
+remaining decoder cost: about 95% of the load for the 45.7 MP NEF.
+
+Metadata parsing and `open_buffer` remain negligible. File reading is hidden
+in the unpack page faults: cold `unpack` is only about 0–30 ms slower than warm.
 
 For comparison, setting `EnableLibRaw=false` in the settings file selects the
 dcraw fallback:

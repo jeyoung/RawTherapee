@@ -45,7 +45,7 @@ public:
     explicit RawImage(const Glib::ustring &name);
     ~RawImage();
 
-    int loadRaw(bool loadData, unsigned int imageNum = 0, bool closeFile = true, ProgressListener *plistener = nullptr, double progressRange = 1.0);
+    int loadRaw(bool loadData, unsigned int imageNum = 0, bool closeFile = true, ProgressListener *plistener = nullptr, double progressRange = 1.0, bool allowDirectRawPlane = false);
     void get_colorsCoeff(float* pre_mul_, float* scale_mul_, float* cblack_, bool forceAutoWB);
     void set_prefilters()
     {
@@ -76,6 +76,11 @@ protected:
     Decoder decoder{Decoder::DCRAW};
     std::unique_ptr<LibRaw> libraw;
     std::unique_ptr<std::remove_pointer<dcrawImage_t>::type[]> image_from_float;
+    const char* directRawPlaneFallbackReason() const;
+    const unsigned short* directRawImage = nullptr;
+    int directRawPitch = 0;
+    int directRawTopMargin = 0;
+    int directRawLeftMargin = 0;
     bool isFoveon() const
     {
         return is_foveon;

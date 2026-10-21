@@ -1293,7 +1293,8 @@ int RawImageSource::load(const Glib::ustring &fname, bool firstFrameOnly)
     } else {
         riFrames.clear();
         riFrames.emplace_back(ri);
-        errCode = riFrames.back()->loadRaw(true, 0, true, plistener, 0.8);
+        errCode = riFrames.back()->loadRaw(true, 0, true, plistener, 0.8,
+                                           numFrames == 1);
     }
     rawDataFrames.resize(riFrames.size());
     rawDataBuffer.clear();
