@@ -189,3 +189,23 @@ at 1 MP (12 ms versus 26–46 ms) with a maximum 1-byte difference. The GPU path
 is only built when OpenCL is enabled; thumbnail and CPU-only paths do not pay
 the LUT construction cost. The LUT inversion assumes the estimated table is
 monotonic and the three TRCs are identical.
+
+## D015 — Keep the GPU `rgbProc` core opt-in
+
+Date: 2026-10-21
+
+Decision: ship the basic GPU `rgbProc` core behind `RT_OPENCL_RGBPROC=1` and
+keep the CPU path as the default. The fast path covers channel mixer,
+highlight/shadow tone curves, `clampOOG`, standard tone curve, normal RGB
+curves and RGB→Lab conversion, and falls back for all other tools.
+
+Alternatives: enabling it by default would add 0.2–0.7 s to the GPU export
+path on the RX 550 because the stage is slower than the 8-thread CPU. Dropping
+the implementation would lose the groundwork for a future fused, resident
+segment on stronger GPUs.
+
+Consequences: parity is 1 LSB on neutral, exposure and all six formats. The
+stage is batch-only until the preview tone-curve histogram is handled. The
+next decision is whether fusion with the Lab→RGB segment can offset the
+standalone stage cost; otherwise the next milestone is the guided-filter
+family.

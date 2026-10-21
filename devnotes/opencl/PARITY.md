@@ -31,6 +31,9 @@ difference between two identical runs). The gate is the peak absolute error
 | 2026-10-21 | uncommitted | AMD RX 550 | d850.nef / neutral | off vs auto | 1 LSB | PASS |
 | 2026-10-21 | uncommitted | AMD RX 550 | jpg, tif, png manifest entries | off vs auto | 1 LSB | PASS |
 | 2026-10-21 | uncommitted | AMD RX 550 | random Lab / RTv4_sRGB, RTv2_sRGB, sRGB, sRGB2014, RTv4_Medium monitor | GPU vs lcms | 1 byte | PASS |
+| 2026-10-21 | uncommitted | AMD RX 550 | colorspace_flowers.pef / neutral, `RT_OPENCL_RGBPROC=1` | off vs auto | 1 LSB | PASS |
+| 2026-10-21 | uncommitted | AMD RX 550 | exposure/highlight/black profile, `RT_OPENCL_RGBPROC=1` | off vs auto | 1 LSB | PASS |
+| 2026-10-21 | uncommitted | AMD RX 550 | six-format corpus, `RT_OPENCL_RGBPROC=1` | off vs auto | 1 LSB | PASS |
 
 `verify.sh` now reports `SKIP` instead of `PASS` when no OpenCL device is
 selected, so a CPU-only build cannot produce a vacuous parity claim.
@@ -58,3 +61,6 @@ Notes:
   and `verify.sh --monitor` run `rawtherapee-cli --gpu-test-monitor`, which
   compares the GPU monitor conversion with lcms on a deterministic 256×256
   full-range Lab image.
+- `verify.sh --rgbproc` sets `RT_OPENCL_RGBPROC=1`, asserts that
+  `opencl rgbproc:` ran, and compares neutral and exposure profiles. The
+  stage is batch-only because preview supplies a tone-curve histogram.

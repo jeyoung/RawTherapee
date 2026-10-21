@@ -211,3 +211,20 @@ matrix/TRC path, which only pays off when it replaces lcms.
 | No minimum-size gate | Remaining work; small detail crops may still favour lcms |
 | No committed monitor regression test | `--gpu-test-monitor` and `verify.sh --monitor` compare CPU lcms with GPU on deterministic full-range Lab |
 | GPU-ready fields are unsynchronised | Current coordinator/crop call graph serialises them; document if a future caller changes ownership |
+
+## R14 — Opt-in GPU rgbProc
+
+The first fast path allowed `ClampOOG=false` and its verification could pass
+without running the stage.
+
+| Finding | Resolution |
+|---|---|
+| Tone curve group semantics differ when `ClampOOG=false` | Require `ClampOOG=true` for the fast path |
+| `verify.sh --rgbproc` did not assert the stage ran | Set `expect_stage=1` and require `opencl rgbproc:`; add an exposure profile |
+| Most kernel branches lacked committed tests | Neutral and exposure/highlight/black profiles are committed; mixer/RGB-curve coverage remains outstanding |
+| Preview never uses the stage | Documented as batch-only because of the tone-curve histogram |
+| A stage failure disabled all OpenCL stages | Latch only `rgbProcUnavailable`; other stages continue |
+| Stage-local unavailability was invisible to the caller | Add `rgbProcAvailable()` to the predicate |
+| Budget omitted the identity LUT | Count nine LUT buffers |
+| Missing shadow LUT silently became identity | Reject `toneCurveBlack != 0` without a shadow LUT |
+| LUT copies and uploads happen per call | Accepted for the opt-in stage; cache later if fusion lands |

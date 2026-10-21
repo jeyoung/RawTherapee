@@ -102,6 +102,20 @@ OMP_NUM_THREADS=8 rawtherapee-cli \
 Three alternating runs each. The 45 MP GPU total is about 19 % faster. All
 six `verify.sh --formats` entries PASS at 1 LSB PAE.
 
+## Opt-in RGB processing
+
+`RT_OPENCL_RGBPROC=1` enables the GPU `rgbProc` core. `OMP_NUM_THREADS=8`,
+dynamic default profile, 16-bit TIFF:
+
+| Image | CPU `rgbProc` | GPU stage | GPU total with stage | GPU output-only total |
+|---|---:|---:|---:|---:|
+| colorspace_flowers.pef, 10 MP | 80 ms | 319 ms | 2.71–2.80 s | 2.48 s |
+| d850.nef, 45.7 MP | 385 ms | 471 ms | 7.14–7.18 s | 6.5 s |
+
+The GPU stage is slower than the multi-threaded CPU, so it is opt-in. The
+overall GPU path remains faster than the CPU because it also accelerates
+output conversion.
+
 ## Monitor conversion
 
 1024×768 random full-range Lab, `OMP_NUM_THREADS=8`, matrix-shaper monitor

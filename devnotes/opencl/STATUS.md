@@ -3,19 +3,45 @@
 ## Handover block
 
 - Branch: `perf` (based on `opencl`, which is based on `dev` at `b2ee504c4`)
-- Milestone: M11 — shared Lab→RGB segment for output and monitor; next is
-  `rgbProc` core and the Lab LUT stack
-- Last verified: 2026-10-21, six-format export and matrix-shaper monitor parity
-  on AMD RX 550
-- Next task: device-resident Lab pipeline, starting with `rgbProc` core and the
-  Lab LUT stack
+- Milestone: M12 — opt-in GPU `rgbProc` core; next is a decision between
+  fusion/residency and the guided-filter family
+- Last verified: 2026-10-21, six-format export, monitor parity and opt-in
+  `rgbProc` parity on AMD RX 550
+- Next task: evaluate whether fusing `rgbProc` with the Lab→RGB segment can
+  offset its slower standalone stage; otherwise move to the guided-filter
+  family
 - Known limitations: single-stage acceleration is roughly neutral end-to-end;
   transform is limited to rotation/scale/crop without LCP, CA, distortion,
   perspective or vignetting; capture sharpening is split into watchdog-safe
   chunks and sized by a work budget; output conversion is limited to
   `RTv4_sRGB`, relative colorimetric intent and integer output; monitor
   conversion falls back to lcms for LUT profiles, soft proofing, gamut check,
-  non-relative intent, and black-point compensation with a non-zero black point
+  non-relative intent, and black-point compensation with a non-zero black
+  point; `rgbProc` is opt-in, batch-only because of the tone-curve histogram,
+  and slower than the 8-thread CPU on the RX 550
+
+## M12 evidence — opt-in GPU `rgbProc` core
+
+- Scope: channel mixer, highlight tone curve, shadow tone curve, `clampOOG`,
+  standard tone curve, normal RGB curves, and RGB→Lab conversion.
+- The stage is opt-in with `RT_OPENCL_RGBPROC=1`. Without it, `rgbProc` stays
+  on the CPU.
+- The fast path requires: no pipette, no B&W, no HSV equaliser, no film
+  simulation, no colour toning, no tone equaliser, no custom tone curves,
+  saturation 0, no RGB luminosity mode, not ProPhoto, `ClampOOG=true`, no
+  tone-curve histogram, and a DCP whose step 2 is identity.
+- `verify.sh --rgbproc` asserts that `opencl rgbproc:` actually runs and
+  compares neutral and exposure/highlight/black profiles. Both PASS at 1 LSB.
+- `RT_OPENCL_RGBPROC=1 verify.sh --formats` PASS on all six manifest entries
+  at 1 LSB.
+- Performance, 8 threads: 10 MP stage is 319 ms GPU versus 80 ms CPU; 45 MP
+  stage is 471 ms versus 385 ms. Total GPU wall time with `rgbProc` is
+  2.71–2.80 s versus 2.48 s for output conversion alone at 10 MP, and
+  7.14–7.18 s versus 6.5 s at 45 MP. The stage is therefore not enabled by
+  default on this hardware.
+- Preview does not use the stage because the preview passes a tone-curve
+  histogram; the GPU path is batch/thumbnail only for now.
+- `WITH_OPENCL=ON` and `WITH_OPENCL=OFF` both build.
 
 ## M11 evidence — shared Lab→RGB segment
 
@@ -244,6 +270,7 @@ choose at runtime whether to use a device.
 | M9 | incremental | preview timing instrumentation; baseline pending |
 | M10 | complete | sRGB output conversion with profile-exact parity |
 | M11 | complete | shared Lab→RGB segment for output and monitor |
+| M12 | complete | opt-in GPU `rgbProc` core; slower than CPU on RX 550 |
 
 ## Review
 
