@@ -590,6 +590,14 @@ int RawImage::loadRaw(bool loadData, unsigned int imageNum, bool closeFile, Prog
     oprof = nullptr;
 
     if (!ifp) {
+        LoadProfile::Timer openTimer(
+            "file open", nullptr,
+#ifdef MYFILE_MMAP
+            "mmap",
+#else
+            "read",
+#endif
+            true);
         ifp = gfopen(ifname);   // Maps to either file map or direct fopen
     } else  {
         fseek(ifp, 0, SEEK_SET);
@@ -895,17 +903,26 @@ int RawImage::loadRaw(bool loadData, unsigned int imageNum, bool closeFile, Prog
             "raw unpack", nullptr,
             decoder == Decoder::LIBRAW ? "libraw" : "dcraw", true);
 
-        use_camera_wb = 1;
-        shrink = 0;
+        {
+            LoadProfile::Timer setupTimer("decoder setup", nullptr, nullptr,
+                                          true);
 
-        if (settings->verbose) {
-            printf("Loading %s %s image from %s...\n", make, model, filename.c_str());
+            use_camera_wb = 1;
+            shrink = 0;
+
+            if (settings->verbose) {
+                printf("Loading %s %s image from %s...\n", make, model,
+                       filename.c_str());
+            }
+
+            iheight = height;
+            iwidth  = width;
         }
 
-        iheight = height;
-        iwidth  = width;
-
         if (decoder == Decoder::DCRAW) {
+            LoadProfile::Timer dcrawTimer("decoder dcraw", nullptr, "fallback",
+                                          true);
+
             if (filters || colors == 1) {
                 raw_image = (ushort *) calloc ((static_cast<unsigned int>(raw_height) + 7u) * static_cast<unsigned int>(raw_width), 2);
                 merror(raw_image, "main()");
@@ -933,11 +950,21 @@ int RawImage::loadRaw(bool loadData, unsigned int imageNum, bool closeFile, Prog
             libraw->imgdata.rawparams.shot_select = shot_select;
             libraw->imgdata.rawparams.options &= ~LIBRAW_RAWOPTIONS_CONVERTFLOAT_TO_INT;
 
-            int err = libraw->open_buffer(ifp->data, ifp->size);
+            int err;
+
+            {
+                LoadProfile::Timer openTimer("decoder open_buffer", nullptr,
+                                             "libraw", true);
+                err = libraw->open_buffer(ifp->data, ifp->size);
+            }
+
             if (err) {
                 return err;
             }
+
             {
+                LoadProfile::Timer unpackTimer("decoder unpack", nullptr,
+                                               "libraw", true);
 #ifdef LIBRAW_USE_OPENMP
                 MyMutex::MyLock lock(*librawMutex);
 #endif
@@ -960,6 +987,8 @@ int RawImage::loadRaw(bool loadData, unsigned int imageNum, bool closeFile, Prog
             auto &rd = libraw->imgdata.rawdata;
             raw_image = rd.raw_image;
             if (rd.float_image) {
+                LoadProfile::Timer conversionTimer(
+                    "decoder float conversion", nullptr, "float1", true);
                 float_raw_image = new float[raw_width * raw_height];
                 for (int y = 0; y < raw_height; ++y) {
                     for (int x = 0; x < raw_width; ++x) {
@@ -968,6 +997,8 @@ int RawImage::loadRaw(bool loadData, unsigned int imageNum, bool closeFile, Prog
                     }
                 }
             } else if (rd.float3_image) {
+                LoadProfile::Timer conversionTimer(
+                    "decoder float conversion", nullptr, "float3", true);
                 const auto image_size = static_cast<unsigned int>(height) * static_cast<unsigned int>(width);
                 try {
                     image_from_float.reset(new std::remove_pointer<dcrawImage_t>::type[image_size]);
@@ -986,6 +1017,8 @@ int RawImage::loadRaw(bool loadData, unsigned int imageNum, bool closeFile, Prog
                     }
                 }
             } else {
+                LoadProfile::Timer raw2imageTimer("decoder raw2image", nullptr,
+                                                  "libraw", true);
 #ifdef LIBRAW_USE_OPENMP
                 MyMutex::MyLock lock(*librawMutex);
 #endif
@@ -996,6 +1029,9 @@ int RawImage::loadRaw(bool loadData, unsigned int imageNum, bool closeFile, Prog
                 }
                 image = libraw->imgdata.image;
             }
+
+            LoadProfile::Timer postUnpackTimer("decoder post-unpack", nullptr,
+                                               nullptr, true);
 
             // get our custom camera matrices, but don't mess with black/white levels yet
             // (if we have custom levels in json files, we will get them later)
@@ -1033,12 +1069,17 @@ int RawImage::loadRaw(bool loadData, unsigned int imageNum, bool closeFile, Prog
             }
         }
 
-        if (!float_raw_image) { // apply baseline exposure only for float DNGs
-            RT_baseline_exposure = 0;
-        }
+        {
+            LoadProfile::Timer finishTimer("decoder finish", nullptr, nullptr,
+                                           true);
 
-        if (plistener) {
-            plistener->setProgress(0.9 * progressRange);
+            if (!float_raw_image) { // apply baseline exposure only for float DNGs
+                RT_baseline_exposure = 0;
+            }
+
+            if (plistener) {
+                plistener->setProgress(0.9 * progressRange);
+            }
         }
 
         unpackTimer.stop();
