@@ -41,6 +41,7 @@
 #include "imagesource.h"
 #include "improcfun.h"
 #include "labimage.h"
+#include "opencl/openclengine.h"
 #include "pipettebuffer.h"
 #include "procparams.h"
 #include "rt_math.h"
@@ -587,8 +588,8 @@ void ImProcFunctions::updateColorProfiles(const Glib::ustring& monitorProfile, R
 
         if (monitorTransform == nullptr) {
             monitorGpuReady = false;
-        } else if (openCLAllowed && !softProof && !gamutCheck
-                   && monitorIntent == RI_RELATIVE) {
+        } else if (openCLAllowed && opencl::enabled() && !softProof
+                   && !gamutCheck && monitorIntent == RI_RELATIVE) {
             bool blackPointSafe = true;
 
             if (settings->monitorBPC) {
