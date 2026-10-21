@@ -194,6 +194,7 @@ quick() {
     detect_device
 
     run_pair "pef/neutral" "$sample"
+    run_monitor
 }
 
 stage() {
@@ -211,11 +212,7 @@ stage() {
     run_pair "$(basename "$sample")/$name" "$sample" "$profile"
 }
 
-monitor() {
-    printf 'binary\t%s\n' "$cli"
-    "$cli" --gpu-info | tail -n +2 | sed 's/^/gpu\t/'
-    detect_device
-
+run_monitor() {
     if [ "$has_device" -eq 0 ]; then
         if [ "${RT_REQUIRE_GPU:-0}" = "1" ]; then
             printf 'FAIL\tmonitor\tno OpenCL device\n'
@@ -245,6 +242,13 @@ monitor() {
     printf 'FAIL\tmonitor\t%s\n' "$(tail -n 1 "$log")"
     rm -f "$log"
     return "$status"
+}
+
+monitor() {
+    printf 'binary\t%s\n' "$cli"
+    "$cli" --gpu-info | tail -n +2 | sed 's/^/gpu\t/'
+    detect_device
+    run_monitor
 }
 
 formats() {
