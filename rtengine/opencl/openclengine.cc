@@ -833,6 +833,40 @@ bool ensureSession(Backend& state)
     return true;
 }
 
+int openclVersionScore(const DeviceInfo& info)
+{
+    const size_t position = info.version.find("OpenCL ");
+
+    if (position == std::string::npos) {
+        return 0;
+    }
+
+    int major = 0;
+    int minor = 0;
+
+    if (std::sscanf(info.version.c_str() + position, "OpenCL %d.%d",
+                    &major, &minor) != 2) {
+        return 0;
+    }
+
+    return major * 10 + minor;
+}
+
+const char* standardOption(const DeviceInfo& info)
+{
+    const int version = openclVersionScore(info);
+
+    if (version >= 12) {
+        return "-cl-std=CL1.2";
+    }
+
+    if (version >= 11) {
+        return "-cl-std=CL1.1";
+    }
+
+    return "-cl-std=CL1.0";
+}
+
 cl_program programFor(Backend& state, const std::string& source,
                       const std::string& options, std::string& error)
 {
@@ -1517,11 +1551,21 @@ int chooseDevice(const std::vector<DeviceInfo>& infos)
     }
 
     int best = -1;
+    int bestVersion = -1;
     unsigned long long bestMemory = 0;
 
     for (size_t i = 0; i < infos.size(); ++i) {
-        if (!infos[i].cpu && infos[i].globalMemory >= bestMemory) {
+        if (infos[i].cpu) {
+            continue;
+        }
+
+        const int version = openclVersionScore(infos[i]);
+
+        if (best < 0 || version > bestVersion
+                || (version == bestVersion
+                    && infos[i].globalMemory > bestMemory)) {
             best = static_cast<int>(i);
+            bestVersion = version;
             bestMemory = infos[i].globalMemory;
         }
     }
@@ -1909,8 +1953,8 @@ static bool resizeLanczosPlanes(const float* const sourcePointers[3],
     }
 
     std::string error;
-    cl_program program = programFor(state, resizeKernelSource, "-cl-std=CL1.2",
-                                    error);
+    cl_program program = programFor(state, resizeKernelSource,
+                                    standardOption(info), error);
 
     if (program == nullptr) {
         if (settings != nullptr && settings->verbose && !error.empty()) {
@@ -2143,8 +2187,8 @@ bool transformRotateScale(const Imagefloat* src, Imagefloat* dst,
     }
 
     std::string error;
-    cl_program program = programFor(state, transformKernelSource, "-cl-std=CL1.2",
-                                    error);
+    cl_program program = programFor(state, transformKernelSource,
+                                    standardOption(info), error);
 
     if (program == nullptr) {
         if (settings != nullptr && settings->verbose && !error.empty()) {
@@ -2415,7 +2459,7 @@ bool labToRgb(const LabImage* src, int cx, int cy, int cw, int ch,
 
     std::string error;
     cl_program program = programFor(state, labToRgbKernelSource,
-                                    "-cl-std=CL1.2", error);
+                                    standardOption(info), error);
 
     if (program == nullptr) {
         if (settings != nullptr && settings->verbose && !error.empty()) {
@@ -2699,7 +2743,7 @@ bool rgbProc(const Imagefloat* src, LabImage* dst, const RgbProcData& data)
 
     std::string error;
     cl_program program = programFor(state, rgbProcKernelSource,
-                                    "-cl-std=CL1.2", error);
+                                    standardOption(info), error);
 
     if (program == nullptr) {
         if (settings != nullptr && settings->verbose && !error.empty()) {
@@ -2916,7 +2960,7 @@ bool captureSharpening(float** luminance, const float* const* oldLuminance,
 
     std::string error;
     cl_program program = programFor(state, captureSharpeningKernelSource,
-                                    "-cl-std=CL1.2", error);
+                                    standardOption(info), error);
 
     if (program == nullptr) {
         if (settings != nullptr && settings->verbose && !error.empty()) {
@@ -3136,8 +3180,8 @@ bool selfTest(std::string& report)
         return false;
     }
 
-    const char* options = "-cl-std=CL1.2";
     const DeviceInfo& deviceInfo = state.infos[index];
+    const char* options = standardOption(deviceInfo);
     const std::string cacheKey = programCacheKey(probeKernelSource, options,
                                                  deviceInfo);
     std::vector<unsigned char> cachedBinary;
