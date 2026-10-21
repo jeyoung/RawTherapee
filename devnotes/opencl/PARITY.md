@@ -54,6 +54,7 @@ Notes:
   TIFF and reads the encoded samples. The previous ImageMagick `rgb:` path
   linearised the samples, which amplified a 1 LSB difference into a 26 LSB
   PAE.
-- Monitor output is 8-bit, so its parity gate is 1 byte. `verify.sh --monitor`
-  runs `rawtherapee-cli --gpu-test-monitor`, which compares the GPU monitor
-  conversion with lcms on a deterministic 256×256 full-range Lab image.
+- Monitor output is 8-bit, so its parity gate is 1 byte. `verify.sh --quick`
+  and `verify.sh --monitor` run `rawtherapee-cli --gpu-test-monitor`, which
+  compares the GPU monitor conversion with lcms on a deterministic 256×256
+  full-range Lab image.

@@ -117,10 +117,10 @@ the reference and the fallback.
 | RTv4_Medium, BPC on/off | 39.3 ms | 12.0 ms | 1 |
 
 The profile matrix and TRC setup takes 3–7 ms and is cached per profile and
-settings key. `tools/opencl/verify.sh --monitor` runs the committed
-`--gpu-test-monitor` parity check. The GUI preview harness could not run
-because Xvfb is not installed, so interactive preview latency is not recorded
-yet.
+settings key. `tools/opencl/verify.sh --quick` includes the committed
+`--gpu-test-monitor` parity check; `--monitor` runs it alone. The GUI preview
+harness could not run because Xvfb is not installed, so interactive preview
+latency is not recorded yet.
 
 ## Debian package smoke run
 

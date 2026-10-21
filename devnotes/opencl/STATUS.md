@@ -33,8 +33,8 @@
 - No monitor profile keeps the manual CPU path; no GPU round trip is attempted.
 - Monitor parity is a committed self-test: `rawtherapee-cli
   --gpu-test-monitor` compares the GPU monitor output with the lcms CPU path
-  and reports the maximum byte difference. `verify.sh --monitor` runs it and
-  reports PASS at 1 byte.
+  and reports the maximum byte difference. `verify.sh --quick` includes it,
+  and `verify.sh --monitor` runs it alone; both report PASS at 1 byte.
 - `--quick`, `--formats` and the resize/rotate/capture stage tests PASS at
   1 LSB. `WITH_OPENCL=ON` and `WITH_OPENCL=OFF` both build.
 - The GUI preview harness was not run in this environment because Xvfb is not
