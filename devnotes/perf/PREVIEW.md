@@ -75,11 +75,12 @@ image loading and are reported separately.
 
 ## Loading placeholder
 
-Single-editor mode replaces the previous image immediately when a new image is
-selected. The placeholder is the selected image's filmstrip preview, which is
-derived from the embedded JPEG. An empty placeholder is shown first, then the
-preview pixbuf is installed when available, so a slow thumbnail lookup cannot
-leave the old image visible.
+Single-editor mode replaces the previous image immediately when a new raw
+image is selected. The placeholder is the full embedded JPEG extracted from
+the raw file on a worker thread. An empty placeholder is shown first, then the
+embedded JPEG is installed when available, so a slow extraction cannot leave
+the old image visible. JPEG inputs and other non-raw raster formats skip the
+placeholder and keep the normal loading behaviour.
 
 Editing is disabled while the placeholder is active: tool panels, crop and
 image-area input, history, save/export/queue and editing shortcuts are
@@ -94,7 +95,8 @@ old processor.
 
 Manual Xvfb test with a 10 MP PEF followed by a 45.7 MP NEF:
 
-- placeholder visible about 100 ms after the next-image command
+- empty placeholder visible about 100 ms after the next-image command
+- embedded JPEG visible after about 1 s
 - first full preview after about 10 s; the placeholder remained until then
 - rotate shortcut was ignored while loading
 - the clipped-highlight toggle was accepted during loading and applied to the
