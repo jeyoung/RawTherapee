@@ -94,6 +94,14 @@ protected:
     int scale;
     bool highDetailPreprocessComputed;
     bool highDetailRawComputed;
+    bool highDetailStateKnown;
+    bool lastHighDetailNeeded;
+
+    // Experimental, default-off cache of the preview base image returned by
+    // ImageSource::getImage(). One snapshot only; deep copies in and out.
+    class PreviewBaseCache;
+    std::unique_ptr<PreviewBaseCache> previewBaseCache;
+
     bool allocated;
 
     void freeAll();
