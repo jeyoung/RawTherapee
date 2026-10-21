@@ -75,6 +75,12 @@ bool selfTest(std::string& report)
     return false;
 }
 
+bool selfTestMonitor(std::string& report)
+{
+    report = notBuilt;
+    return false;
+}
+
 bool resizeLanczos(const Imagefloat*, Imagefloat*, float)
 {
     return false;

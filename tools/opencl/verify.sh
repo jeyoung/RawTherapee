@@ -7,6 +7,7 @@
 #  Usage:
 #    tools/opencl/verify.sh --quick
 #    tools/opencl/verify.sh --formats
+#    tools/opencl/verify.sh --monitor
 #    tools/opencl/verify.sh --list-coverage
 #
 #  Environment:
@@ -210,6 +211,42 @@ stage() {
     run_pair "$(basename "$sample")/$name" "$sample" "$profile"
 }
 
+monitor() {
+    printf 'binary\t%s\n' "$cli"
+    "$cli" --gpu-info | tail -n +2 | sed 's/^/gpu\t/'
+    detect_device
+
+    if [ "$has_device" -eq 0 ]; then
+        if [ "${RT_REQUIRE_GPU:-0}" = "1" ]; then
+            printf 'FAIL\tmonitor\tno OpenCL device\n'
+            return 1
+        fi
+        printf 'SKIP\tmonitor\tno OpenCL device\n'
+        return 0
+    fi
+
+    local log
+    log="$(mktemp "${TMPDIR:-/tmp}/rtmonitor.XXXXXX.log")"
+
+    if "$cli" --gpu-test-monitor >"$log" 2>&1; then
+        printf 'PASS\tmonitor\t%s\n' "$(tail -n 1 "$log")"
+        rm -f "$log"
+        return 0
+    fi
+
+    local status=$?
+
+    if [ "$status" -eq 2 ]; then
+        printf 'SKIP\tmonitor\t%s\n' "$(tail -n 1 "$log")"
+        rm -f "$log"
+        return 0
+    fi
+
+    printf 'FAIL\tmonitor\t%s\n' "$(tail -n 1 "$log")"
+    rm -f "$log"
+    return "$status"
+}
+
 formats() {
     [ -f "$MANIFEST" ] || die "missing manifest: $MANIFEST"
     detect_device
@@ -270,6 +307,7 @@ while [ "$#" -gt 0 ]; do
     case "$1" in
         --quick) mode="quick" ;;
         --formats) mode="formats" ;;
+        --monitor) mode="monitor" ;;
         --stage)
             [ "$#" -ge 2 ] || die "--stage needs a name"
             mode="stage"
@@ -295,6 +333,7 @@ mkdir -p "$REPORT"
 case "$mode" in
     quick) quick ;;
     formats) formats ;;
+    monitor) monitor ;;
     stage) stage "$stage_name" ;;
     coverage) list_coverage ;;
 esac

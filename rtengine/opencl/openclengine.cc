@@ -24,6 +24,9 @@
 #include "rtengine/imagefloat.h"
 #include "rtengine/labimage.h"
 #include "boxblur.h"
+#include "color.h"
+#include "improcfun.h"
+#include "rtengine/rtengine.h"
 #include "rtengine/settings.h"
 #include "rt_math.h"
 #include "sleef.h"
@@ -2760,6 +2763,99 @@ bool selfTest(std::string& report)
         + (fromCache ? "(cached)" : "(compiled)") + " on "
         + state.infos[index].name;
     return true;
+}
+
+bool selfTestMonitor(std::string& report)
+{
+    report.clear();
+
+    if (settings == nullptr || lcmsMutex == nullptr
+            || Color::gammatab_srgb[65535] <= 0.0f) {
+        report = "engine colour tables are not initialised";
+        return false;
+    }
+
+    Backend& state = backend();
+    std::lock_guard<std::recursive_mutex> lock(state.mutex);
+
+    if (!ensureInit() || state.selected < 0) {
+        report = statusText();
+        return false;
+    }
+
+    struct StageEnabledRestore {
+        std::atomic<bool>& flag;
+        bool previous;
+
+        explicit StageEnabledRestore(std::atomic<bool>& value)
+            : flag(value), previous(value.load())
+        {
+            flag = true;
+        }
+
+        ~StageEnabledRestore()
+        {
+            flag = previous;
+        }
+    } restoreStage(state.stageEnabled);
+
+    constexpr int width = 256;
+    constexpr int height = 256;
+    LabImage lab(width, height);
+    unsigned int seed = 123456789u;
+
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            seed = seed * 1664525u + 1013904223u;
+            const float r0 = static_cast<float>(seed >> 8) / 16777216.f;
+            seed = seed * 1664525u + 1013904223u;
+            const float r1 = static_cast<float>(seed >> 8) / 16777216.f;
+            seed = seed * 1664525u + 1013904223u;
+            const float r2 = static_cast<float>(seed >> 8) / 16777216.f;
+
+            lab.L[y][x] = 32768.f * r0;
+            lab.a[y][x] = 84000.f * (r1 - 0.5f);
+            lab.b[y][x] = 84000.f * (r2 - 0.5f);
+        }
+    }
+
+    ImProcFunctions ipf(nullptr, false);
+    ipf.setOpenCLAllowed(true);
+    ipf.updateColorProfiles("RTv4_sRGB", RI_RELATIVE, false, false);
+
+    if (!ipf.monitorGpuAvailable()) {
+        report = "RTv4_sRGB monitor profile is unavailable for the GPU path";
+        return false;
+    }
+
+    Image8 cpu(width, height);
+    Image8 gpu(width, height);
+
+    ipf.setOpenCLAllowed(false);
+    ipf.lab2monitorRgb(&lab, &cpu);
+
+    const bool previousStageAllowed = stageAllowed();
+    setStageAllowed(true);
+    ipf.setOpenCLAllowed(true);
+    ipf.lab2monitorRgb(&lab, &gpu);
+    setStageAllowed(previousStageAllowed);
+
+    int maximum = 0;
+    long long differing = 0;
+    const long long total = static_cast<long long>(width) * height * 3;
+
+    for (long long i = 0; i < total; ++i) {
+        const int difference = std::abs(static_cast<int>(cpu.data[i])
+                                        - static_cast<int>(gpu.data[i]));
+        maximum = std::max(maximum, difference);
+        differing += difference != 0;
+    }
+
+    report = "monitor parity max " + std::to_string(maximum)
+        + " byte(s), " + std::to_string(differing) + " of "
+        + std::to_string(total) + " samples differ";
+
+    return maximum <= 1;
 }
 
 std::string statusText()

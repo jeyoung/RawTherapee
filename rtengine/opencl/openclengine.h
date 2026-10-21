@@ -71,6 +71,9 @@ int selectedDevice();
 /** @brief Run a small end-to-end test, including kernel compilation. */
 bool selfTest(std::string& report);
 
+/** @brief Compare the GPU monitor conversion with the lcms CPU path. */
+bool selfTestMonitor(std::string& report);
+
 /** @brief Resize an RGB image with Lanczos, matching ImProcFunctions::Lanczos. */
 bool resizeLanczos(const Imagefloat* src, Imagefloat* dst, float scale);
 

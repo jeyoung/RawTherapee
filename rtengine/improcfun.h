@@ -214,6 +214,11 @@ enum class BlurType {
         openCLAllowed = allowed;
     }
 
+    bool monitorGpuAvailable() const
+    {
+        return monitorGpuReady;
+    }
+
     bool needsTransform(int oW, int oH, int rawRotationDeg, const FramesMetaData *metadata) const;
     bool needsPCVignetting() const;
 

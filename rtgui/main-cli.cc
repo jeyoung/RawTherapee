@@ -303,6 +303,23 @@ int processLineParams ( int argc, char **argv )
             return 0;
         }
 
+        if ( currParam == "--gpu-test-monitor" ) {
+            std::string report;
+
+            if (!rtengine::opencl::available()) {
+                std::cout << "OpenCL: " << rtengine::opencl::statusText() << std::endl;
+                return 2;
+            }
+
+            if (!rtengine::opencl::selfTestMonitor(report)) {
+                std::cerr << "OpenCL monitor self-test FAILED: " << report << std::endl;
+                return 1;
+            }
+
+            std::cout << "OpenCL monitor self-test PASSED: " << report << std::endl;
+            return 0;
+        }
+
         if ( currParam.compare(0, 6, "--gpu=") == 0 ) {
             const Glib::ustring mode = currParam.substr(6);
 
@@ -588,6 +605,7 @@ int processLineParams ( int argc, char **argv )
                     std::cout << "  --list-formats   List the supported input file extensions and exit." << std::endl;
                     std::cout << "  --gpu-info       List the OpenCL devices and exit." << std::endl;
                     std::cout << "  --gpu-test       Run the OpenCL self-test and exit (0 pass, 1 fail, 2 unavailable)." << std::endl;
+                    std::cout << "  --gpu-test-monitor  Compare GPU monitor output with the lcms CPU path." << std::endl;
                     std::cout << "  --gpu=<mode>     OpenCL mode: off, export or preview (auto/all are aliases)." << std::endl;
                     std::cout << "  --gpu-device=<n> Select an OpenCL device by name substring." << std::endl;
                     std::cout << "  -c <files>       Specify one or more input files or folders." << std::endl;
