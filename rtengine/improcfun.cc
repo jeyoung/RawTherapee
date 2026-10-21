@@ -319,6 +319,11 @@ void ImProcFunctions::setScale(double iscale)
 
 void ImProcFunctions::updateColorProfiles(const Glib::ustring& monitorProfile, RenderingIntent monitorIntent, bool softProof, bool gamutCheck)
 {
+    // The GPU conversion consumes a 16-bit table, and a destination black
+    // point above numerical zero requires lcms black-point compensation.
+    constexpr size_t gpuGammaEntries = 65536;
+    constexpr double zeroBlackPointTolerance = 1e-6;
+
     // set up monitor transform
     if (monitorTransform) {
         cmsDeleteTransform(monitorTransform);
@@ -487,12 +492,13 @@ void ImProcFunctions::updateColorProfiles(const Glib::ustring& monitorProfile, R
                 cmsCIEXYZ blackPoint = {};
                 blackPointSafe = cmsDetectDestinationBlackPoint(
                     &blackPoint, monitor, monitorIntent, 0)
-                    && blackPoint.Y <= 1e-6;
+                    && blackPoint.Y <= zeroBlackPointTolerance;
             }
 
             if (!blackPointSafe) {
                 monitorGpuReady = false;
-            } else if (!monitorGpuReady || monitorGamma.size() != 65536) {
+            } else if (!monitorGpuReady
+                       || monitorGamma.size() != gpuGammaEntries) {
                 monitorGpuReady = buildMonitorGpuProfile(
                     monitor, monitorMatrix, monitorGamma);
             }

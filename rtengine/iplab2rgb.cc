@@ -377,6 +377,10 @@ Imagefloat* ImProcFunctions::lab2rgbOut(LabImage* lab, int cx, int cy, int cw, i
     Imagefloat* image = new Imagefloat(cw, ch);
     cmsHPROFILE oprof = ICCStore::getInstance()->getProfile(icm.outputProfile);
 
+    // A destination black point above numerical zero makes BPC observable;
+    // the GPU path does not apply BPC, so it must fall back to lcms.
+    constexpr double zeroBlackPointTolerance = 1e-6;
+
     if (allowGpu && openCLAllowed && opencl::enabled()
             && opencl::stageAllowed() && outputUsesRtv4Srgb(icm) && oprof) {
         if (outputGpuProfile != oprof) {
@@ -396,7 +400,7 @@ Imagefloat* ImProcFunctions::lab2rgbOut(LabImage* lab, int cx, int cy, int cw, i
             MyMutex::MyLock lcmsLock(*lcmsMutex);
             safeForGpu = cmsDetectDestinationBlackPoint(
                     &blackPoint, oprof, icm.outputIntent, 0)
-                && blackPoint.Y <= 1e-6;
+                && blackPoint.Y <= zeroBlackPointTolerance;
         }
 
         if (safeForGpu

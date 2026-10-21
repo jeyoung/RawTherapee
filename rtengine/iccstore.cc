@@ -1255,6 +1255,16 @@ cmsHPROFILE rtengine::ICCStore::createFromMatrix(const double matrix[3][3], bool
 bool rtengine::buildGpuProfile(cmsHPROFILE profile, float matrix[9],
                                std::vector<float>& gamma)
 {
+    // The GPU kernel consumes a 16-bit lookup table.  Twenty bisection steps
+    // resolve the inverse curve well below one 16-bit code value; the table
+    // size and iteration count are algorithm invariants, not profile data.
+    constexpr size_t gammaTableSize = 65536;
+    constexpr int gammaInversionSteps = 20;
+    constexpr double encodedMaximum = 65535.0;
+    constexpr double matrixDeterminantTolerance = 1e-12;
+    constexpr double curveStartTolerance = 1e-6;
+    constexpr double curveEndTolerance = 1e-5;
+
     if (profile == nullptr || !cmsIsMatrixShaper(profile)) {
         return false;
     }
@@ -1295,7 +1305,7 @@ bool rtengine::buildGpuProfile(cmsHPROFILE profile, float matrix[9],
         - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
         + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
 
-    if (!std::isfinite(det) || std::fabs(det) < 1e-12) {
+    if (!std::isfinite(det) || std::fabs(det) < matrixDeterminantTolerance) {
         return false;
     }
 
@@ -1358,21 +1368,22 @@ bool rtengine::buildGpuProfile(cmsHPROFILE profile, float matrix[9],
     const double end = cmsEvalToneCurveFloat(redTrc, 1.0f);
 
     if (!std::isfinite(start) || !std::isfinite(end)
-            || std::fabs(start) > 1e-6 || std::fabs(end - 1.0) > 1e-5) {
+            || std::fabs(start) > curveStartTolerance
+            || std::fabs(end - 1.0) > curveEndTolerance) {
         return false;
     }
 
     // Invert the profile TRC at full 16-bit precision.  Evaluating the
     // parametric curve directly avoids the quantisation of the estimated
     // table, which is not fine enough for the 16-bit export path.
-    gamma.resize(65536);
+    gamma.resize(gammaTableSize);
 
     for (size_t i = 0; i < gamma.size(); ++i) {
-        const double target = static_cast<double>(i) / 65535.0;
+        const double target = static_cast<double>(i) / encodedMaximum;
         double lower = 0.0;
         double upper = 1.0;
 
-        for (int iteration = 0; iteration < 20; ++iteration) {
+        for (int iteration = 0; iteration < gammaInversionSteps; ++iteration) {
             const double middle = (lower + upper) * 0.5;
 
             if (cmsEvalToneCurveFloat(
@@ -1383,7 +1394,8 @@ bool rtengine::buildGpuProfile(cmsHPROFILE profile, float matrix[9],
             }
         }
 
-        gamma[i] = static_cast<float>((lower + upper) * 0.5 * 65535.0);
+        gamma[i] = static_cast<float>(
+            (lower + upper) * 0.5 * encodedMaximum);
     }
 
     for (size_t i = 0; i < gamma.size(); ++i) {
