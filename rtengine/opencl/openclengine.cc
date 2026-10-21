@@ -20,6 +20,7 @@
 
 #include "rtengine/opencl/openclcache.h"
 #include "rtengine/opencl/openclloader.h"
+#include "rtengine/image8.h"
 #include "rtengine/imagefloat.h"
 #include "rtengine/labimage.h"
 #include "boxblur.h"
@@ -52,6 +53,7 @@ namespace
 {
 
 thread_local bool threadStageAllowed = false;
+std::atomic<bool> labToRgbUnavailable{false};
 
 struct Backend {
     std::unique_ptr<Glib::Module> module;
@@ -376,7 +378,7 @@ __kernel void rt_transform(__global const float* srcR,
 }
 )";
 
-const char* labToSrgbKernelSource = R"(
+const char* labToRgbKernelSource = R"(
 #pragma OPENCL FP_CONTRACT OFF
 
 inline float rt_f2xyz(const float f)
@@ -393,6 +395,38 @@ inline float rt_gamma_lookup(__global const float* lut, const float value)
     const int upper = min(index + 1, 65535);
     const float fraction = clamped - (float)index;
     return lut[index] + (lut[upper] - lut[index]) * fraction;
+}
+
+inline unsigned char rt_to_u8(const float value)
+{
+    const unsigned int v = (unsigned int)clamp(value, 0.0f, 65535.0f);
+    return (unsigned char)(((v + 128u) - ((v + 128u) >> 8)) >> 8);
+}
+
+inline float3 rt_lab_to_linear(__global const float* labL,
+                               __global const float* labA,
+                               __global const float* labB,
+                               __global const float* matrix,
+                               const int index)
+{
+    const float L = labL[index];
+    const float a = labA[index];
+    const float b = labB[index];
+    const float LL = L / 327.68f;
+    const float fy = (0.008620689655172414f * L) / 327.68f
+        + 0.13793103448275862f;
+    const float fx = (0.002f * a) / 327.68f + fy;
+    const float fz = fy - (0.005f * b) / 327.68f;
+    const float xyzX = 65535.0f * rt_f2xyz(fx) * 0.9642f;
+    const float xyzZ = 65535.0f * rt_f2xyz(fz) * 0.8249f;
+    const float xyzY = LL > 8.0f
+        ? 65535.0f * fy * fy * fy
+        : 65535.0f * LL / 903.2962962962963f;
+
+    return (float3)(
+        matrix[0] * xyzX + matrix[1] * xyzY + matrix[2] * xyzZ,
+        matrix[3] * xyzX + matrix[4] * xyzY + matrix[5] * xyzZ,
+        matrix[6] * xyzX + matrix[7] * xyzY + matrix[8] * xyzZ);
 }
 
 __kernel void rt_lab_to_srgb(__global const float* labL,
@@ -414,26 +448,34 @@ __kernel void rt_lab_to_srgb(__global const float* labL,
     }
 
     const int index = y * width + x;
-    const float L = labL[index];
-    const float a = labA[index];
-    const float b = labB[index];
-    const float LL = L / 327.68f;
-    const float fy = (0.008620689655172414f * L) / 327.68f
-        + 0.13793103448275862f;
-    const float fx = (0.002f * a) / 327.68f + fy;
-    const float fz = fy - (0.005f * b) / 327.68f;
-    const float xyzX = 65535.0f * rt_f2xyz(fx) * 0.9642f;
-    const float xyzZ = 65535.0f * rt_f2xyz(fz) * 0.8249f;
-    const float xyzY = LL > 8.0f
-        ? 65535.0f * fy * fy * fy
-        : 65535.0f * LL / 903.2962962962963f;
-    const float r = matrix[0] * xyzX + matrix[1] * xyzY + matrix[2] * xyzZ;
-    const float g = matrix[3] * xyzX + matrix[4] * xyzY + matrix[5] * xyzZ;
-    const float bOut = matrix[6] * xyzX + matrix[7] * xyzY + matrix[8] * xyzZ;
+    const float3 rgb = rt_lab_to_linear(labL, labA, labB, matrix, index);
+    dstR[index] = rt_gamma_lookup(gammaLut, rgb.x);
+    dstG[index] = rt_gamma_lookup(gammaLut, rgb.y);
+    dstB[index] = rt_gamma_lookup(gammaLut, rgb.z);
+}
 
-    dstR[index] = rt_gamma_lookup(gammaLut, r);
-    dstG[index] = rt_gamma_lookup(gammaLut, g);
-    dstB[index] = rt_gamma_lookup(gammaLut, bOut);
+__kernel void rt_lab_to_srgb8(__global const float* labL,
+                              __global const float* labA,
+                              __global const float* labB,
+                              __global unsigned char* dst,
+                              __global const float* gammaLut,
+                              __global const float* matrix,
+                              const int width,
+                              const int height)
+{
+    const int x = get_global_id(0);
+    const int y = get_global_id(1);
+
+    if (x >= width || y >= height) {
+        return;
+    }
+
+    const int index = y * width + x;
+    const int out = index * 3;
+    const float3 rgb = rt_lab_to_linear(labL, labA, labB, matrix, index);
+    dst[out] = rt_to_u8(rt_gamma_lookup(gammaLut, rgb.x));
+    dst[out + 1] = rt_to_u8(rt_gamma_lookup(gammaLut, rgb.y));
+    dst[out + 2] = rt_to_u8(rt_gamma_lookup(gammaLut, rgb.z));
 }
 )";
 
@@ -1360,6 +1402,7 @@ void shutdown()
     state.attempted = false;
     state.loaded = false;
     state.selected = -1;
+    labToRgbUnavailable = false;
     state.error = "OpenCL is unavailable";
 }
 
@@ -1946,17 +1989,67 @@ bool transformRotateScale(const Imagefloat* src, Imagefloat* dst,
     return true;
 }
 
-bool labToSrgbOut(const LabImage* src, Imagefloat* dst,
-                  int cx, int cy, int cw, int ch)
+namespace
 {
-    if (src == nullptr || dst == nullptr || cw <= 0 || ch <= 0
+
+enum class LabOutputKind {
+    Float16,
+    Uchar8
+};
+
+std::vector<float> makeRtv4GammaLut()
+{
+    constexpr size_t entries = 65536;
+    std::vector<float> gammaLut(entries);
+
+    // The matrix and parametric tone curve below are the exact values from
+    // rtdata/iccprofiles/output/RTv4_sRGB.icc. The curve is evaluated in the
+    // inverse direction, from linear light to encoded sRGB.
+    constexpr double curveGamma = 2.399993896484375;
+    constexpr double curveA = 0.9478607177734375;
+    constexpr double curveB = 0.0521392822265625;
+    constexpr double curveC = 0.077392578125;
+    constexpr double curveD = 0.0392913818359375;
+    constexpr double curveThreshold = curveC * curveD;
+
+    for (size_t i = 0; i < entries; ++i) {
+        const double x = static_cast<double>(i) / 65535.0;
+        const double y = x >= curveThreshold
+            ? (std::pow(x, 1.0 / curveGamma) - curveB) / curveA
+            : x / curveC;
+        gammaLut[i] = static_cast<float>(y * 65535.0);
+    }
+
+    return gammaLut;
+}
+
+const std::vector<float>& rtv4GammaLut()
+{
+    static const std::vector<float> lut = makeRtv4GammaLut();
+    return lut;
+}
+
+bool labToRgb(const LabImage* src, int cx, int cy, int cw, int ch,
+              const float matrix[9], const std::vector<float>& gammaLut,
+              LabOutputKind kind, Imagefloat* dstFloat, Image8* dst8)
+{
+    if (src == nullptr || cw <= 0 || ch <= 0
             || cx < 0 || cy < 0 || cx + cw > src->W || cy + ch > src->H
-            || dst->getWidth() != cw || dst->getHeight() != ch
             || src->L == nullptr || src->a == nullptr || src->b == nullptr
             || src->L[0] == nullptr || src->a[0] == nullptr
-            || src->b[0] == nullptr || dst->r(0) == nullptr
-            || dst->g(0) == nullptr || dst->b(0) == nullptr
-            || dst->getRowStride() == 0) {
+            || src->b[0] == nullptr) {
+        return false;
+    }
+
+    if (kind == LabOutputKind::Float16) {
+        if (dstFloat == nullptr || dstFloat->getWidth() != cw
+                || dstFloat->getHeight() != ch || dstFloat->r(0) == nullptr
+                || dstFloat->g(0) == nullptr || dstFloat->b(0) == nullptr
+                || dstFloat->getRowStride() == 0) {
+            return false;
+        }
+    } else if (dst8 == nullptr || dst8->getWidth() != cw
+               || dst8->getHeight() != ch || dst8->data == nullptr) {
         return false;
     }
 
@@ -1972,18 +2065,28 @@ bool labToSrgbOut(const LabImage* src, Imagefloat* dst,
         return false;
     }
 
-    StageTimer timer("lab2srgb", g_getenv("RT_OPENCL_PROFILE") != nullptr);
+    if (labToRgbUnavailable || gammaLut.size() != 65536) {
+        return false;
+    }
+
+    const bool eightBit = kind == LabOutputKind::Uchar8;
+    StageTimer timer(eightBit ? "lab2srgb8" : "lab2srgb",
+                     g_getenv("RT_OPENCL_PROFILE") != nullptr);
 
     const size_t planeBytes = static_cast<size_t>(cw) * ch * sizeof(float);
-    constexpr size_t gammaEntries = 65536;
-    const size_t gammaBytes = gammaEntries * sizeof(float);
+    const size_t outputBytes = eightBit
+        ? static_cast<size_t>(cw) * ch * 3
+        : 3 * planeBytes;
+    const size_t gammaBytes = gammaLut.size() * sizeof(float);
     constexpr size_t matrixEntries = 9;
     const size_t matrixBytes = matrixEntries * sizeof(float);
-    const size_t totalBytes = 6 * planeBytes + gammaBytes + matrixBytes;
+    const size_t totalBytes = 3 * planeBytes + outputBytes + gammaBytes
+        + matrixBytes;
+    const size_t largestBuffer = std::max(planeBytes, outputBytes);
     const DeviceInfo& info = state.infos[state.selected];
 
     if ((info.maxAllocation > 0
-            && (planeBytes > info.maxAllocation
+            && (largestBuffer > info.maxAllocation
                 || gammaBytes > info.maxAllocation
                 || matrixBytes > info.maxAllocation))
             || !ensureBudget(state, totalBytes)
@@ -1997,36 +2100,17 @@ bool labToSrgbOut(const LabImage* src, Imagefloat* dst,
         return false;
     }
 
-    // The matrix and parametric tone curve below are the exact values from
-    // rtdata/iccprofiles/output/RTv4_sRGB.icc. The curve is evaluated in the
-    // inverse direction, from linear light to encoded sRGB.
-    constexpr double curveGamma = 2.399993896484375;
-    constexpr double curveA = 0.9478607177734375;
-    constexpr double curveB = 0.0521392822265625;
-    constexpr double curveC = 0.077392578125;
-    constexpr double curveD = 0.0392913818359375;
-    constexpr double curveThreshold = curveC * curveD;
-    std::vector<float> gammaLut(gammaEntries);
-
-    for (size_t i = 0; i < gammaEntries; ++i) {
-        const double x = static_cast<double>(i) / 65535.0;
-        const double y = x >= curveThreshold
-            ? (std::pow(x, 1.0 / curveGamma) - curveB) / curveA
-            : x / curveC;
-        gammaLut[i] = static_cast<float>(y * 65535.0);
-    }
-
-    const float matrix[matrixEntries] = {
-        3.13427424f, -1.61727405f, -0.490734816f,
-        -0.978795588f, 1.91616154f, 0.0334540494f,
-        0.0719785541f, -0.228989884f, 1.40574837f
-    };
-
     BufferSet buffers;
     buffers.owner = &state;
     buffers.api = &state.api;
     KernelSet kernels;
     kernels.api = &state.api;
+
+    const auto fatal = [&state]() {
+        state.stageEnabled = false;
+        labToRgbUnavailable = true;
+        return false;
+    };
 
     const auto createBuffer = [&](cl_mem_flags flags, size_t bytes,
                                   const void* host) -> cl_mem {
@@ -2058,19 +2142,19 @@ bool labToSrgbOut(const LabImage* src, Imagefloat* dst,
     const size_t sourceRegion[3] = {
         static_cast<size_t>(cw) * sizeof(float),
         static_cast<size_t>(ch), 1};
-    const size_t destRegion[3] = {
+    const size_t floatDestRegion[3] = {
         static_cast<size_t>(cw) * sizeof(float),
         static_cast<size_t>(ch), 1};
+    const size_t byteDestRegion[3] = {
+        static_cast<size_t>(cw) * 3,
+        static_cast<size_t>(ch), 1};
     const size_t sourceRowPitch = static_cast<size_t>(src->W) * sizeof(float);
-    const size_t destRowPitch = dst->getRowStride();
     const float* sourcePointers[3] = {src->L[0], src->a[0], src->b[0]};
-    float* destPointers[3] = {dst->r(0), dst->g(0), dst->b(0)};
 
     for (int plane = 0; plane < 3; ++plane) {
         sourceBuffers[plane] = createBuffer(CL_MEM_READ_ONLY, planeBytes, nullptr);
-        destBuffers[plane] = createBuffer(CL_MEM_WRITE_ONLY, planeBytes, nullptr);
 
-        if (sourceBuffers[plane] == nullptr || destBuffers[plane] == nullptr) {
+        if (sourceBuffers[plane] == nullptr) {
             return false;
         }
 
@@ -2079,6 +2163,23 @@ bool labToSrgbOut(const LabImage* src, Imagefloat* dst,
                 sourceOrigin, sourceRegion, 0, 0, sourceRowPitch, 0,
                 sourcePointers[plane], 0, nullptr, nullptr) != CL_SUCCESS) {
             return false;
+        }
+    }
+
+    if (eightBit) {
+        destBuffers[0] = createBuffer(CL_MEM_WRITE_ONLY, outputBytes, nullptr);
+
+        if (destBuffers[0] == nullptr) {
+            return false;
+        }
+    } else {
+        for (int plane = 0; plane < 3; ++plane) {
+            destBuffers[plane] = createBuffer(CL_MEM_WRITE_ONLY,
+                                               planeBytes, nullptr);
+
+            if (destBuffers[plane] == nullptr) {
+                return false;
+            }
         }
     }
 
@@ -2092,21 +2193,25 @@ bool labToSrgbOut(const LabImage* src, Imagefloat* dst,
     }
 
     std::string error;
-    cl_program program = programFor(state, labToSrgbKernelSource,
+    cl_program program = programFor(state, labToRgbKernelSource,
                                     "-cl-std=CL1.2", error);
 
     if (program == nullptr) {
         if (settings != nullptr && settings->verbose && !error.empty()) {
             std::fprintf(stderr, "OpenCL: %s\n", error.c_str());
         }
+        labToRgbUnavailable = true;
         return false;
     }
 
     cl_int status = CL_SUCCESS;
     cl_kernel kernel = kernels.add(
-        state.api.CreateKernel(program, "rt_lab_to_srgb", &status));
+        state.api.CreateKernel(program,
+                               eightBit ? "rt_lab_to_srgb8" : "rt_lab_to_srgb",
+                               &status));
 
     if (kernel == nullptr || status != CL_SUCCESS) {
+        labToRgbUnavailable = true;
         return false;
     }
 
@@ -2116,15 +2221,25 @@ bool labToSrgbOut(const LabImage* src, Imagefloat* dst,
     status |= state.api.SetKernelArg(kernel, 0, sizeof(cl_mem), &sourceBuffers[0]);
     status |= state.api.SetKernelArg(kernel, 1, sizeof(cl_mem), &sourceBuffers[1]);
     status |= state.api.SetKernelArg(kernel, 2, sizeof(cl_mem), &sourceBuffers[2]);
-    status |= state.api.SetKernelArg(kernel, 3, sizeof(cl_mem), &destBuffers[0]);
-    status |= state.api.SetKernelArg(kernel, 4, sizeof(cl_mem), &destBuffers[1]);
-    status |= state.api.SetKernelArg(kernel, 5, sizeof(cl_mem), &destBuffers[2]);
-    status |= state.api.SetKernelArg(kernel, 6, sizeof(cl_mem), &gammaBuffer);
-    status |= state.api.SetKernelArg(kernel, 7, sizeof(cl_mem), &matrixBuffer);
-    status |= state.api.SetKernelArg(kernel, 8, sizeof(cl_int), &widthArg);
-    status |= state.api.SetKernelArg(kernel, 9, sizeof(cl_int), &heightArg);
+
+    if (eightBit) {
+        status |= state.api.SetKernelArg(kernel, 3, sizeof(cl_mem), &destBuffers[0]);
+        status |= state.api.SetKernelArg(kernel, 4, sizeof(cl_mem), &gammaBuffer);
+        status |= state.api.SetKernelArg(kernel, 5, sizeof(cl_mem), &matrixBuffer);
+        status |= state.api.SetKernelArg(kernel, 6, sizeof(cl_int), &widthArg);
+        status |= state.api.SetKernelArg(kernel, 7, sizeof(cl_int), &heightArg);
+    } else {
+        status |= state.api.SetKernelArg(kernel, 3, sizeof(cl_mem), &destBuffers[0]);
+        status |= state.api.SetKernelArg(kernel, 4, sizeof(cl_mem), &destBuffers[1]);
+        status |= state.api.SetKernelArg(kernel, 5, sizeof(cl_mem), &destBuffers[2]);
+        status |= state.api.SetKernelArg(kernel, 6, sizeof(cl_mem), &gammaBuffer);
+        status |= state.api.SetKernelArg(kernel, 7, sizeof(cl_mem), &matrixBuffer);
+        status |= state.api.SetKernelArg(kernel, 8, sizeof(cl_int), &widthArg);
+        status |= state.api.SetKernelArg(kernel, 9, sizeof(cl_int), &heightArg);
+    }
 
     if (status != CL_SUCCESS) {
+        labToRgbUnavailable = true;
         return false;
     }
 
@@ -2133,23 +2248,63 @@ bool labToSrgbOut(const LabImage* src, Imagefloat* dst,
 
     if (state.api.EnqueueNDRangeKernel(state.queue, kernel, 2, nullptr, global,
                                        nullptr, 0, nullptr, nullptr) != CL_SUCCESS) {
-        return false;
+        return fatal();
     }
 
     if (state.api.Finish(state.queue) != CL_SUCCESS) {
-        return false;
+        return fatal();
     }
+
+    if (eightBit) {
+        // Image8 stores tightly packed interleaved RGB rows.
+        if (state.api.EnqueueReadBufferRect(
+                state.queue, destBuffers[0], CL_TRUE, zeroOrigin, zeroOrigin,
+                byteDestRegion, 0, 0, static_cast<size_t>(cw) * 3, 0,
+                dst8->data, 0, nullptr, nullptr) != CL_SUCCESS) {
+            return fatal();
+        }
+
+        return true;
+    }
+
+    float* destPointers[3] = {dstFloat->r(0), dstFloat->g(0), dstFloat->b(0)};
+    const size_t destRowPitch = dstFloat->getRowStride();
 
     for (int plane = 0; plane < 3; ++plane) {
         if (state.api.EnqueueReadBufferRect(
                 state.queue, destBuffers[plane], CL_TRUE, zeroOrigin,
-                zeroOrigin, destRegion, 0, 0, destRowPitch, 0,
+                zeroOrigin, floatDestRegion, 0, 0, destRowPitch, 0,
                 destPointers[plane], 0, nullptr, nullptr) != CL_SUCCESS) {
-            return false;
+            return fatal();
         }
     }
 
     return true;
+}
+
+} // namespace
+
+bool labToSrgbOut(const LabImage* src, Imagefloat* dst,
+                  int cx, int cy, int cw, int ch)
+{
+    const float matrix[9] = {
+        3.13427424f, -1.61727405f, -0.490734816f,
+        -0.978795588f, 1.91616154f, 0.0334540494f,
+        0.0719785541f, -0.228989884f, 1.40574837f
+    };
+    return labToRgb(src, cx, cy, cw, ch, matrix, rtv4GammaLut(),
+                    LabOutputKind::Float16, dst, nullptr);
+}
+
+bool labToRgb8(const LabImage* src, Image8* dst,
+               const float matrix[9], const std::vector<float>& gammaLut)
+{
+    if (src == nullptr || dst == nullptr) {
+        return false;
+    }
+
+    return labToRgb(src, 0, 0, src->W, src->H, matrix, gammaLut,
+                    LabOutputKind::Uchar8, nullptr, dst);
 }
 
 void setStageAllowed(bool allowed)

@@ -96,6 +96,12 @@ bool labToSrgbOut(const LabImage*, Imagefloat*, int, int, int, int)
     return false;
 }
 
+bool labToRgb8(const LabImage*, Image8*, const float[9],
+               const std::vector<float>&)
+{
+    return false;
+}
+
 bool captureSharpening(float**, const float* const*, const float* const*,
                        int, int, float, float, int, bool)
 {

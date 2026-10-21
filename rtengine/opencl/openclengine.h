@@ -24,6 +24,7 @@
 namespace rtengine
 {
 
+class Image8;
 class Imagefloat;
 class LabImage;
 
@@ -86,6 +87,16 @@ bool transformRotateScale(const Imagefloat* src, Imagefloat* dst,
 /** @brief Convert a Lab sub-image to sRGB output, matching the CPU path. */
 bool labToSrgbOut(const LabImage* src, Imagefloat* dst,
                   int cx, int cy, int cw, int ch);
+
+/**
+ * @brief Convert a Lab image to 8-bit RGB using a profile matrix and LUT.
+ *
+ * gammaLut has 65536 entries and maps linear light [0, 1] to encoded output
+ * [0, 65535].
+ */
+bool labToRgb8(const LabImage* src, Image8* dst,
+               const float matrix[9],
+               const std::vector<float>& gammaLut);
 
 /** @brief Allow GPU stages in the current worker thread. */
 void setStageAllowed(bool allowed);

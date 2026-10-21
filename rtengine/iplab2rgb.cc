@@ -176,6 +176,12 @@ vfloat gammalog(vfloat x, vfloat p, vfloat s, vfloat g3, vfloat g4)
 // otherwise divide by 327.68, convert to xyz and apply the sRGB transform, before converting with gamma2curve
 void ImProcFunctions::lab2monitorRgb(LabImage* lab, Image8* image)
 {
+    if (monitorGpuReady && !gamutWarning && openCLAllowed
+            && opencl::enabled() && opencl::stageAllowed()
+            && opencl::labToRgb8(lab, image, monitorMatrix, monitorGamma)) {
+        return;
+    }
+
     if (monitorTransform) {
 
         const int W = lab->W;
@@ -371,7 +377,7 @@ Imagefloat* ImProcFunctions::lab2rgbOut(LabImage* lab, int cx, int cy, int cw, i
     Imagefloat* image = new Imagefloat(cw, ch);
 
     if (allowGpu && openCLAllowed && opencl::enabled()
-            && outputUsesRtv4Srgb(icm)
+            && opencl::stageAllowed() && outputUsesRtv4Srgb(icm)
             && opencl::labToSrgbOut(lab, image, cx, cy, cw, ch)) {
         return image;
     }

@@ -20,6 +20,7 @@
 #pragma once
 
 #include <memory>
+#include <string>
 #include <vector>
 
 #include "coord2d.h"
@@ -144,6 +145,11 @@ class ImProcFunctions
     double scale;
     bool multiThread;
     bool openCLAllowed = false;
+    float monitorMatrix[9] = {};
+    // 65536 entries mapping linear light [0, 1] to encoded output [0, 65535].
+    std::vector<float> monitorGamma;
+    bool monitorGpuReady = false;
+    std::string monitorGpuKey;
 
     void calcVignettingParams(int oW, int oH, const procparams::VignettingParams& vignetting, double &w2, double &h2, double& maxRadius, double &v, double &b, double &mul);
     static void rgb2lab(const Image8 &src, int x, int y, int w, int h, float L[], float a[], float b[], const procparams::ColorManagementParams &icm, bool consider_histogram_settings, bool multithread);
