@@ -39,6 +39,16 @@ namespace procparams
 
 typedef const double(*TMatrix)[3];
 
+/** @brief Build the matrix and inverse TRC used by the GPU RGB conversion.
+ *
+ * The profile must be a matrix-shaper RGB profile without LUT tags.  The
+ * matrix is the inverse of the profile colorants and the table maps linear
+ * light to the profile's encoded output.  Returns false when the profile
+ * cannot be represented exactly by that model.
+ */
+bool buildGpuProfile(cmsHPROFILE profile, float matrix[9],
+                     std::vector<float>& gamma);
+
 class ProfileContent final
 {
 public:

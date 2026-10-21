@@ -16,6 +16,7 @@
  *  You should have received a copy of the GNU General Public License
  *  along with RawTherapee.  If not, see <https://www.gnu.org/licenses/>.
  */
+#include <cmath>
 #include <cstring>
 #include <map>
 #include <string>
@@ -1249,4 +1250,148 @@ cmsHPROFILE rtengine::ICCStore::createFromMatrix(const double matrix[3][3], bool
     cmsHPROFILE p = cmsOpenProfileFromMem(oprof, ntohl(oprof[0]));
     delete [] oprof;
     return p;
+}
+
+bool rtengine::buildGpuProfile(cmsHPROFILE profile, float matrix[9],
+                               std::vector<float>& gamma)
+{
+    if (profile == nullptr || !cmsIsMatrixShaper(profile)) {
+        return false;
+    }
+
+    const cmsTagSignature lutTags[] = {
+        cmsSigBToA0Tag, cmsSigBToA1Tag, cmsSigBToA2Tag,
+        cmsSigBToD0Tag, cmsSigBToD1Tag, cmsSigBToD2Tag, cmsSigBToD3Tag
+    };
+
+    for (const cmsTagSignature tag : lutTags) {
+        if (cmsIsTag(profile, tag)) {
+            return false;
+        }
+    }
+
+    auto* red = static_cast<cmsCIEXYZ*>(
+        cmsReadTag(profile, cmsSigRedColorantTag));
+    auto* green = static_cast<cmsCIEXYZ*>(
+        cmsReadTag(profile, cmsSigGreenColorantTag));
+    auto* blue = static_cast<cmsCIEXYZ*>(
+        cmsReadTag(profile, cmsSigBlueColorantTag));
+
+    if (red == nullptr || green == nullptr || blue == nullptr
+            || !std::isfinite(red->X) || !std::isfinite(red->Y)
+            || !std::isfinite(red->Z) || !std::isfinite(green->X)
+            || !std::isfinite(green->Y) || !std::isfinite(green->Z)
+            || !std::isfinite(blue->X) || !std::isfinite(blue->Y)
+            || !std::isfinite(blue->Z)) {
+        return false;
+    }
+
+    const double m[3][3] = {
+        {red->X, green->X, blue->X},
+        {red->Y, green->Y, blue->Y},
+        {red->Z, green->Z, blue->Z}
+    };
+    const double det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+        - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+        + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+
+    if (!std::isfinite(det) || std::fabs(det) < 1e-12) {
+        return false;
+    }
+
+    const double inv[3][3] = {
+        {(m[1][1] * m[2][2] - m[1][2] * m[2][1]) / det,
+         (m[0][2] * m[2][1] - m[0][1] * m[2][2]) / det,
+         (m[0][1] * m[1][2] - m[0][2] * m[1][1]) / det},
+        {(m[1][2] * m[2][0] - m[1][0] * m[2][2]) / det,
+         (m[0][0] * m[2][2] - m[0][2] * m[2][0]) / det,
+         (m[0][2] * m[1][0] - m[0][0] * m[1][2]) / det},
+        {(m[1][0] * m[2][1] - m[1][1] * m[2][0]) / det,
+         (m[0][1] * m[2][0] - m[0][0] * m[2][1]) / det,
+         (m[0][0] * m[1][1] - m[0][1] * m[1][0]) / det}
+    };
+
+    for (int r = 0; r < 3; ++r) {
+        for (int c = 0; c < 3; ++c) {
+            if (!std::isfinite(inv[r][c])) {
+                return false;
+            }
+
+            matrix[r * 3 + c] = static_cast<float>(inv[r][c]);
+        }
+    }
+
+    auto* redTrc = static_cast<cmsToneCurve*>(
+        cmsReadTag(profile, cmsSigRedTRCTag));
+    auto* greenTrc = static_cast<cmsToneCurve*>(
+        cmsReadTag(profile, cmsSigGreenTRCTag));
+    auto* blueTrc = static_cast<cmsToneCurve*>(
+        cmsReadTag(profile, cmsSigBlueTRCTag));
+
+    if (redTrc == nullptr || greenTrc == nullptr || blueTrc == nullptr
+            || !cmsIsToneCurveMonotonic(redTrc)
+            || !cmsIsToneCurveMonotonic(greenTrc)
+            || !cmsIsToneCurveMonotonic(blueTrc)) {
+        return false;
+    }
+
+    const cmsUInt32Number entries =
+        cmsGetToneCurveEstimatedTableEntries(redTrc);
+    const cmsUInt16Number* table = cmsGetToneCurveEstimatedTable(redTrc);
+    const cmsUInt16Number* greenTable =
+        cmsGetToneCurveEstimatedTable(greenTrc);
+    const cmsUInt16Number* blueTable =
+        cmsGetToneCurveEstimatedTable(blueTrc);
+
+    if (entries < 2 || table == nullptr || greenTable == nullptr
+            || blueTable == nullptr
+            || cmsGetToneCurveEstimatedTableEntries(greenTrc) != entries
+            || cmsGetToneCurveEstimatedTableEntries(blueTrc) != entries
+            || std::memcmp(table, greenTable,
+                            entries * sizeof(cmsUInt16Number)) != 0
+            || std::memcmp(table, blueTable,
+                            entries * sizeof(cmsUInt16Number)) != 0) {
+        return false;
+    }
+
+    const double start = cmsEvalToneCurveFloat(redTrc, 0.0f);
+    const double end = cmsEvalToneCurveFloat(redTrc, 1.0f);
+
+    if (!std::isfinite(start) || !std::isfinite(end)
+            || std::fabs(start) > 1e-6 || std::fabs(end - 1.0) > 1e-5) {
+        return false;
+    }
+
+    // Invert the profile TRC at full 16-bit precision.  Evaluating the
+    // parametric curve directly avoids the quantisation of the estimated
+    // table, which is not fine enough for the 16-bit export path.
+    gamma.resize(65536);
+
+    for (size_t i = 0; i < gamma.size(); ++i) {
+        const double target = static_cast<double>(i) / 65535.0;
+        double lower = 0.0;
+        double upper = 1.0;
+
+        for (int iteration = 0; iteration < 20; ++iteration) {
+            const double middle = (lower + upper) * 0.5;
+
+            if (cmsEvalToneCurveFloat(
+                    redTrc, static_cast<cmsFloat32Number>(middle)) < target) {
+                lower = middle;
+            } else {
+                upper = middle;
+            }
+        }
+
+        gamma[i] = static_cast<float>((lower + upper) * 0.5 * 65535.0);
+    }
+
+    for (size_t i = 0; i < gamma.size(); ++i) {
+        if (!std::isfinite(gamma[i])
+                || (i > 0 && gamma[i] < gamma[i - 1])) {
+            return false;
+        }
+    }
+
+    return true;
 }

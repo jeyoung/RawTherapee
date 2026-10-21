@@ -107,7 +107,8 @@ bool rgbProc(const Imagefloat*, LabImage*, const RgbProcData&)
     return false;
 }
 
-bool labToSrgbOut(const LabImage*, Imagefloat*, int, int, int, int)
+bool labToSrgbOut(const LabImage*, Imagefloat*, int, int, int, int,
+                  const float[9], const std::vector<float>&)
 {
     return false;
 }

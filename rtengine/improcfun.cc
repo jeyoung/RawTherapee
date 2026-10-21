@@ -76,128 +76,7 @@ std::vector<float> copyLut(const LUTf& lut)
 bool buildMonitorGpuProfile(cmsHPROFILE monitor, float matrix[9],
                             std::vector<float>& gamma)
 {
-    if (monitor == nullptr || !cmsIsMatrixShaper(monitor)) {
-        return false;
-    }
-
-    const cmsTagSignature lutTags[] = {
-        cmsSigBToA0Tag, cmsSigBToA1Tag, cmsSigBToA2Tag,
-        cmsSigBToD0Tag, cmsSigBToD1Tag, cmsSigBToD2Tag, cmsSigBToD3Tag
-    };
-
-    for (const cmsTagSignature tag : lutTags) {
-        if (cmsReadTag(monitor, tag) != nullptr) {
-            return false;
-        }
-    }
-
-    auto* red = static_cast<cmsCIEXYZ*>(
-        cmsReadTag(monitor, cmsSigRedColorantTag));
-    auto* green = static_cast<cmsCIEXYZ*>(
-        cmsReadTag(monitor, cmsSigGreenColorantTag));
-    auto* blue = static_cast<cmsCIEXYZ*>(
-        cmsReadTag(monitor, cmsSigBlueColorantTag));
-
-    if (red == nullptr || green == nullptr || blue == nullptr) {
-        return false;
-    }
-
-    const double m[3][3] = {
-        {red->X, green->X, blue->X},
-        {red->Y, green->Y, blue->Y},
-        {red->Z, green->Z, blue->Z}
-    };
-    const double det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
-        - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
-        + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
-
-    if (std::fabs(det) < 1e-12) {
-        return false;
-    }
-
-    const double inv[3][3] = {
-        {(m[1][1] * m[2][2] - m[1][2] * m[2][1]) / det,
-         (m[0][2] * m[2][1] - m[0][1] * m[2][2]) / det,
-         (m[0][1] * m[1][2] - m[0][2] * m[1][1]) / det},
-        {(m[1][2] * m[2][0] - m[1][0] * m[2][2]) / det,
-         (m[0][0] * m[2][2] - m[0][2] * m[2][0]) / det,
-         (m[0][2] * m[1][0] - m[0][0] * m[1][2]) / det},
-        {(m[1][0] * m[2][1] - m[1][1] * m[2][0]) / det,
-         (m[0][1] * m[2][0] - m[0][0] * m[2][1]) / det,
-         (m[0][0] * m[1][1] - m[0][1] * m[1][0]) / det}
-    };
-
-    auto* redTrc = static_cast<cmsToneCurve*>(
-        cmsReadTag(monitor, cmsSigRedTRCTag));
-    auto* greenTrc = static_cast<cmsToneCurve*>(
-        cmsReadTag(monitor, cmsSigGreenTRCTag));
-    auto* blueTrc = static_cast<cmsToneCurve*>(
-        cmsReadTag(monitor, cmsSigBlueTRCTag));
-
-    if (redTrc == nullptr || greenTrc == nullptr || blueTrc == nullptr
-            || !cmsIsToneCurveMonotonic(redTrc)
-            || !cmsIsToneCurveMonotonic(greenTrc)
-            || !cmsIsToneCurveMonotonic(blueTrc)) {
-        return false;
-    }
-
-    const cmsUInt32Number entries =
-        cmsGetToneCurveEstimatedTableEntries(redTrc);
-    const cmsUInt16Number* table = cmsGetToneCurveEstimatedTable(redTrc);
-    const cmsUInt16Number* greenTable =
-        cmsGetToneCurveEstimatedTable(greenTrc);
-    const cmsUInt16Number* blueTable =
-        cmsGetToneCurveEstimatedTable(blueTrc);
-
-    if (entries < 2 || table == nullptr || greenTable == nullptr
-            || blueTable == nullptr
-            || cmsGetToneCurveEstimatedTableEntries(greenTrc) != entries
-            || cmsGetToneCurveEstimatedTableEntries(blueTrc) != entries
-            || std::memcmp(table, greenTable,
-                            entries * sizeof(cmsUInt16Number)) != 0
-            || std::memcmp(table, blueTable,
-                            entries * sizeof(cmsUInt16Number)) != 0) {
-        return false;
-    }
-
-    // Invert the tone curve table: gamma[linear] = encoded.
-    gamma.resize(65536);
-    for (size_t i = 0; i < gamma.size(); ++i) {
-        const cmsUInt32Number target = static_cast<cmsUInt32Number>(i);
-        cmsUInt32Number lower = 0;
-        cmsUInt32Number upper = entries - 1;
-
-        while (lower < upper) {
-            const cmsUInt32Number middle = (lower + upper) / 2;
-
-            if (table[middle] < target) {
-                lower = middle + 1;
-            } else {
-                upper = middle;
-            }
-        }
-
-        if (lower == 0) {
-            gamma[i] = 0.0f;
-        } else {
-            const double previous = table[lower - 1];
-            const double current = table[lower];
-            const double fraction = current > previous
-                ? (target - previous) / (current - previous)
-                : 0.0;
-            const double position = lower - 1 + fraction;
-            gamma[i] = static_cast<float>(
-                position / (entries - 1) * 65535.0);
-        }
-    }
-
-    for (int r = 0; r < 3; ++r) {
-        for (int c = 0; c < 3; ++c) {
-            matrix[r * 3 + c] = static_cast<float>(inv[r][c]);
-        }
-    }
-
-    return true;
+    return buildGpuProfile(monitor, matrix, gamma);
 }
 
 
@@ -611,10 +490,14 @@ void ImProcFunctions::updateColorProfiles(const Glib::ustring& monitorProfile, R
                     && blackPoint.Y <= 1e-6;
             }
 
-            if (blackPointSafe) {
+            if (!blackPointSafe) {
+                monitorGpuReady = false;
+            } else if (!monitorGpuReady || monitorGamma.size() != 65536) {
                 monitorGpuReady = buildMonitorGpuProfile(
                     monitor, monitorMatrix, monitorGamma);
             }
+        } else {
+            monitorGpuReady = false;
         }
 
         cmsCloseProfile(iprof);

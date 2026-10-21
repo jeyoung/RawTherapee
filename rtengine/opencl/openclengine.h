@@ -114,9 +114,11 @@ bool rgbProcAvailable();
 /** @brief Run the basic RGB tone and Lab conversion stage on the GPU. */
 bool rgbProc(const Imagefloat* src, LabImage* dst, const RgbProcData& data);
 
-/** @brief Convert a Lab sub-image to sRGB output, matching the CPU path. */
+/** @brief Convert a Lab sub-image to RGB output using a profile matrix and LUT. */
 bool labToSrgbOut(const LabImage* src, Imagefloat* dst,
-                  int cx, int cy, int cw, int ch);
+                  int cx, int cy, int cw, int ch,
+                  const float matrix[9],
+                  const std::vector<float>& gammaLut);
 
 /**
  * @brief Convert a Lab image to 8-bit RGB using a profile matrix and LUT.

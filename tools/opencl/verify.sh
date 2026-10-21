@@ -201,7 +201,11 @@ quick() {
     "$cli" --gpu-info | tail -n +2 | sed 's/^/gpu\t/'
     detect_device
 
+    expect_stage=1
+    expect_stage_name="lab2srgb"
     run_pair "pef/neutral" "$sample"
+    expect_stage=0
+    expect_stage_name=""
     run_monitor
 }
 

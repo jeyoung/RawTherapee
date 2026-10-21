@@ -375,14 +375,37 @@ Imagefloat* ImProcFunctions::lab2rgbOut(LabImage* lab, int cx, int cy, int cw, i
     }
 
     Imagefloat* image = new Imagefloat(cw, ch);
+    cmsHPROFILE oprof = ICCStore::getInstance()->getProfile(icm.outputProfile);
 
     if (allowGpu && openCLAllowed && opencl::enabled()
-            && opencl::stageAllowed() && outputUsesRtv4Srgb(icm)
-            && opencl::labToSrgbOut(lab, image, cx, cy, cw, ch)) {
-        return image;
-    }
+            && opencl::stageAllowed() && outputUsesRtv4Srgb(icm) && oprof) {
+        if (outputGpuProfile != oprof) {
+            outputGpuProfile = oprof;
+            outputGpuReady = false;
+            outputGpuGamma.clear();
 
-    cmsHPROFILE oprof = ICCStore::getInstance()->getProfile(icm.outputProfile);
+            MyMutex::MyLock lcmsLock(*lcmsMutex);
+            outputGpuReady = buildGpuProfile(
+                oprof, outputGpuMatrix, outputGpuGamma);
+        }
+
+        bool safeForGpu = outputGpuReady;
+
+        if (safeForGpu && icm.outputBPC) {
+            cmsCIEXYZ blackPoint = {};
+            MyMutex::MyLock lcmsLock(*lcmsMutex);
+            safeForGpu = cmsDetectDestinationBlackPoint(
+                    &blackPoint, oprof, icm.outputIntent, 0)
+                && blackPoint.Y <= 1e-6;
+        }
+
+        if (safeForGpu
+                && opencl::labToSrgbOut(
+                    lab, image, cx, cy, cw, ch,
+                    outputGpuMatrix, outputGpuGamma)) {
+            return image;
+        }
+    }
 
     if (oprof) {
         cmsUInt32Number flags = cmsFLAGS_NOOPTIMIZE | cmsFLAGS_NOCACHE;

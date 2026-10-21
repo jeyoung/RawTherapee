@@ -2262,38 +2262,6 @@ enum class LabOutputKind {
     Uchar8
 };
 
-std::vector<float> makeRtv4GammaLut()
-{
-    constexpr size_t entries = 65536;
-    std::vector<float> gammaLut(entries);
-
-    // The matrix and parametric tone curve below are the exact values from
-    // rtdata/iccprofiles/output/RTv4_sRGB.icc. The curve is evaluated in the
-    // inverse direction, from linear light to encoded sRGB.
-    constexpr double curveGamma = 2.399993896484375;
-    constexpr double curveA = 0.9478607177734375;
-    constexpr double curveB = 0.0521392822265625;
-    constexpr double curveC = 0.077392578125;
-    constexpr double curveD = 0.0392913818359375;
-    constexpr double curveThreshold = curveC * curveD;
-
-    for (size_t i = 0; i < entries; ++i) {
-        const double x = static_cast<double>(i) / 65535.0;
-        const double y = x >= curveThreshold
-            ? (std::pow(x, 1.0 / curveGamma) - curveB) / curveA
-            : x / curveC;
-        gammaLut[i] = static_cast<float>(y * 65535.0);
-    }
-
-    return gammaLut;
-}
-
-const std::vector<float>& rtv4GammaLut()
-{
-    static const std::vector<float> lut = makeRtv4GammaLut();
-    return lut;
-}
-
 bool labToRgb(const LabImage* src, int cx, int cy, int cw, int ch,
               const float matrix[9], const std::vector<float>& gammaLut,
               LabOutputKind kind, Imagefloat* dstFloat, Image8* dst8)
@@ -2550,14 +2518,11 @@ bool labToRgb(const LabImage* src, int cx, int cy, int cw, int ch,
 } // namespace
 
 bool labToSrgbOut(const LabImage* src, Imagefloat* dst,
-                  int cx, int cy, int cw, int ch)
+                  int cx, int cy, int cw, int ch,
+                  const float matrix[9],
+                  const std::vector<float>& gammaLut)
 {
-    const float matrix[9] = {
-        3.13427424f, -1.61727405f, -0.490734816f,
-        -0.978795588f, 1.91616154f, 0.0334540494f,
-        0.0719785541f, -0.228989884f, 1.40574837f
-    };
-    return labToRgb(src, cx, cy, cw, ch, matrix, rtv4GammaLut(),
+    return labToRgb(src, cx, cy, cw, ch, matrix, gammaLut,
                     LabOutputKind::Float16, dst, nullptr);
 }
 

@@ -151,6 +151,13 @@ class ImProcFunctions
     bool monitorGpuReady = false;
     std::string monitorGpuKey;
 
+    // Cached output profile data, keyed by the profile handle returned by
+    // ICCStore.  The table is built from the profile and is never hardcoded.
+    cmsHPROFILE outputGpuProfile = nullptr;
+    float outputGpuMatrix[9] = {};
+    std::vector<float> outputGpuGamma;
+    bool outputGpuReady = false;
+
     void calcVignettingParams(int oW, int oH, const procparams::VignettingParams& vignetting, double &w2, double &h2, double& maxRadius, double &v, double &b, double &mul);
     static void rgb2lab(const Image8 &src, int x, int y, int w, int h, float L[], float a[], float b[], const procparams::ColorManagementParams &icm, bool consider_histogram_settings, bool multithread);
 
