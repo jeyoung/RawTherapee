@@ -3,13 +3,11 @@
 ## Handover block
 
 - Branch: `perf` (based on `opencl`, which is based on `dev` at `b2ee504c4`)
-- Milestone: M12 — opt-in GPU `rgbProc` core; next is a decision between
-  fusion/residency and the guided-filter family
+- Milestone: M12 — opt-in GPU `rgbProc` core complete; GPU porting paused
 - Last verified: 2026-10-21, six-format export, monitor parity and opt-in
   `rgbProc` parity on AMD RX 550
-- Next task: evaluate whether fusing `rgbProc` with the Lab→RGB segment can
-  offset its slower standalone stage; otherwise move to the guided-filter
-  family
+- Next task: none scheduled. RCD demosaic was evaluated and deferred; the next
+  candidate, only if requested, is wavelet/denoise
 - Known limitations: single-stage acceleration is roughly neutral end-to-end;
   transform is limited to rotation/scale/crop without LCP, CA, distortion,
   perspective or vignetting; capture sharpening is split into watchdog-safe
@@ -42,6 +40,17 @@
 - Preview does not use the stage because the preview passes a tone-curve
   histogram; the GPU path is batch/thumbnail only for now.
 - `WITH_OPENCL=ON` and `WITH_OPENCL=OFF` both build.
+
+## Deferred — RCD GPU demosaic
+
+An RCD full-image pass prototype was implemented and reverted before commit.
+
+- 10 MP GPU stage: 577 ms; CPU RCD single-thread: 202 ms. The 8-thread CPU is
+  faster still.
+- Parity against the CPU was not achieved (maximum error about 17,972 LSB), due
+  to RCD's tile, half-resolution P/Q indexing and border semantics.
+- Even with correct parity the stage would not beat the CPU on the RX 550.
+- AMaZE is not attempted for the same performance reason.
 
 ## M11 evidence — shared Lab→RGB segment
 

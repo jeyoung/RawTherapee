@@ -209,3 +209,19 @@ stage is batch-only until the preview tone-curve histogram is handled. The
 next decision is whether fusion with the Lab→RGB segment can offset the
 standalone stage cost; otherwise the next milestone is the guided-filter
 family.
+
+## D016 — Defer RCD and AMaZE GPU demosaic
+
+Date: 2026-10-21
+
+Decision: do not port RCD or AMaZE demosaicing to the GPU on the current
+target hardware. The RCD full-image pass prototype was reverted before commit.
+
+Alternatives: a tile-per-workgroup RCD port could fix the indexing and border
+issues, but it would still be slower than the 8-thread CPU.
+
+Consequences: 10 MP RCD measured 577 ms on the RX 550 versus 202 ms on one CPU
+thread; the multi-threaded CPU is faster still. The prototype also failed
+parity (maximum error about 17,972 LSB). GPU work stops at output conversion,
+monitor conversion and the opt-in `rgbProc` core. Wavelet/denoise is the only
+remaining compute-heavy candidate, and only if requested.
