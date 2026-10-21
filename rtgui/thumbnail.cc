@@ -19,6 +19,7 @@
 #include "cachemanager.h"
 #include "multilangmgr.h"
 #include "thumbnail.h"
+#include <cstring>
 #include <sstream>
 #include <iomanip>
 #include <cstdio>
@@ -928,6 +929,56 @@ rtengine::IImage8* Thumbnail::processThumbImage (const rtengine::procparams::Pro
     delete tpp;
     tpp = nullptr;
     return image;
+}
+
+Glib::RefPtr<Gdk::Pixbuf> Thumbnail::getQuickPreviewPixbuf(int maxHeight)
+{
+    MyMutex::MyLock lock(mutex);
+
+    if (maxHeight <= 0) {
+        return {};
+    }
+
+    if (!tpp) {
+        _loadThumbnail();
+    }
+
+    if (!tpp) {
+        return {};
+    }
+
+    rtengine::IImage8* image = tpp->quickProcessImage(
+        *pparams, maxHeight, rtengine::TI_Nearest);
+
+    if (!image) {
+        return {};
+    }
+
+    const int width = image->getWidth();
+    const int height = image->getHeight();
+
+    if (width <= 0 || height <= 0 || image->getData() == nullptr) {
+        delete image;
+        return {};
+    }
+
+    Glib::RefPtr<Gdk::Pixbuf> pixbuf = Gdk::Pixbuf::create(
+        Gdk::COLORSPACE_RGB, false, 8, width, height);
+
+    if (pixbuf) {
+        const unsigned char* source = image->getData();
+        unsigned char* destination = pixbuf->get_pixels();
+        const int sourceStride = width * 3;
+        const int destinationStride = pixbuf->get_rowstride();
+
+        for (int y = 0; y < height; ++y) {
+            std::memcpy(destination + y * destinationStride,
+                        source + y * sourceStride, sourceStride);
+        }
+    }
+
+    delete image;
+    return pixbuf;
 }
 
 rtengine::IImage8* Thumbnail::upgradeThumbImage (const rtengine::procparams::ProcParams& pparams, int h, double& scale, bool forceUpgrade)

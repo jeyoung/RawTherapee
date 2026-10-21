@@ -161,6 +161,7 @@ void PreviewHandler::imageReady(const CropParams& cp, const CropGuideParams& cgp
             *pih->phandler->cropGuideParams = cgp;
             if (pih->phandler->previewImg) {
                 pih->phandler->previewImageChanged();
+                pih->phandler->previewReadySignal();
             }
             --pih->pending;
 

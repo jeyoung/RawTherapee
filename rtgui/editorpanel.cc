@@ -379,6 +379,7 @@ private:
     Gtk::ToggleButton spGamutCheck;
     sigc::connection profileConn, intentConn, softproofConn;
     Glib::ustring defprof;
+    bool loading = false;
 
     rtengine::StagedImageProcessor* const& processor;
 
@@ -558,7 +559,7 @@ private:
                 break;
         }
 
-        if (!processor) {
+        if (loading || !processor) {
             return;
         }
 
@@ -587,7 +588,7 @@ private:
         if (profileBox.get_active_row_number () > 0) {
 #endif
 
-            if (processor) {
+            if (!loading && processor) {
                 if (!noEvent) {
                     processor->beginUpdateParams ();
                 }
@@ -641,6 +642,27 @@ public:
         if (processor) {
             updateParameters (true);
         }
+    }
+
+    void setLoading(bool value, bool applyDeferredState = true)
+    {
+        if (loading == value) {
+            return;
+        }
+
+        loading = value;
+
+        if (!loading && applyDeferredState) {
+            updateParameters ();
+        }
+    }
+
+    void setEditingEnabled(bool enabled)
+    {
+#if !defined(__APPLE__) // monitor profile not supported on apple
+        profileBox.set_sensitive(enabled);
+#endif
+        intentBox.set_sensitive(enabled);
     }
 
     void reset ()
@@ -1247,6 +1269,146 @@ void EditorPanel::on_realize ()
     tpc->updateToolState();
 }
 
+void EditorPanel::setEditingSensitive(bool sensitive)
+{
+    if (vsubboxright) {
+        vsubboxright->set_sensitive(sensitive);
+    }
+
+    if (history) {
+        history->set_sensitive(sensitive);
+    }
+
+    if (tpc) {
+        if (tpc->getToolBar()) {
+            tpc->getToolBar()->set_sensitive(sensitive);
+        }
+
+        if (tpc->coarse) {
+            tpc->coarse->set_sensitive(sensitive);
+        }
+    }
+
+    if (beforeAfter) {
+        beforeAfter->set_sensitive(sensitive);
+    }
+
+    if (tbBeforeLock) {
+        tbBeforeLock->set_sensitive(sensitive);
+    }
+
+    if (saveimgas) {
+        saveimgas->set_sensitive(sensitive);
+    }
+
+    if (queueimg) {
+        queueimg->set_sensitive(sensitive);
+    }
+
+    if (send_to_external) {
+        send_to_external->set_sensitive(
+            sensitive && send_to_external->getEntryCount());
+    }
+
+    if (navPrev) {
+        navPrev->set_sensitive(sensitive);
+    }
+
+    if (navSync) {
+        navSync->set_sensitive(sensitive);
+    }
+
+    if (navNext) {
+        navNext->set_sensitive(sensitive);
+    }
+
+    if (iareapanel && iareapanel->imageArea->zoomPanel) {
+        iareapanel->imageArea->zoomPanel->set_sensitive(sensitive);
+    }
+
+    if (colorMgmtToolBar) {
+        colorMgmtToolBar->setEditingEnabled(sensitive);
+    }
+}
+
+void EditorPanel::showLoadingPlaceholder(
+    const Glib::RefPtr<Gdk::Pixbuf>& pixbuf, const Glib::ustring& fileName)
+{
+    loadingPlaceholder = true;
+    loadingPlaceholderFile = fileName;
+    loadingPlaceholderIpc = nullptr;
+    ++loadingPlaceholderGeneration;
+
+    if (iareapanel) {
+        iareapanel->imageArea->setLoadingPlaceholder(pixbuf);
+    }
+
+    setEditingSensitive(false);
+
+    if (tpc) {
+        tpc->setLoading(true, false);
+    }
+
+    if (colorMgmtToolBar) {
+        colorMgmtToolBar->setLoading(true);
+    }
+}
+
+void EditorPanel::updateLoadingPlaceholder(
+    const Glib::RefPtr<Gdk::Pixbuf>& pixbuf, const Glib::ustring& fileName)
+{
+    if (!loadingPlaceholder
+            || (!fileName.empty() && fileName != loadingPlaceholderFile)) {
+        return;
+    }
+
+    if (iareapanel) {
+        iareapanel->imageArea->setLoadingPlaceholder(pixbuf);
+    }
+}
+
+void EditorPanel::endLoadingPlaceholder(bool applyDeferredState)
+{
+    if (!loadingPlaceholder) {
+        return;
+    }
+
+    loadingPlaceholder = false;
+    loadingPlaceholderFile.clear();
+    loadingPlaceholderIpc = nullptr;
+
+    if (iareapanel) {
+        iareapanel->imageArea->clearLoadingPlaceholder();
+    }
+
+    setEditingSensitive(true);
+
+    if (tpc) {
+        const bool sharpMask = iareapanel
+            ? iareapanel->imageArea->indClippedPanel->showSharpMask()
+            : false;
+        tpc->setLoading(false, sharpMask, applyDeferredState);
+    }
+
+    if (colorMgmtToolBar) {
+        colorMgmtToolBar->setLoading(false, applyDeferredState);
+    }
+}
+
+void EditorPanel::clearLoadingPlaceholder(
+    const Glib::ustring& fileName, bool applyDeferredState)
+{
+    if (!loadingPlaceholder) {
+        return;
+    }
+
+    if (!fileName.empty() && fileName != loadingPlaceholderFile) {
+        return;
+    }
+
+    endLoadingPlaceholder(applyDeferredState);
+}
+
 void EditorPanel::open (Thumbnail* tmb, rtengine::InitialImage* isrc)
 {
 
@@ -1265,15 +1427,36 @@ void EditorPanel::open (Thumbnail* tmb, rtengine::InitialImage* isrc)
 
     previewHandler = new PreviewHandler ();
 
+    const Glib::ustring openedFile = fname;
+    const unsigned long long placeholderGeneration =
+        loadingPlaceholderGeneration;
+    previewHandler->signalPreviewReady().connect(
+        [this, openedFile, placeholderGeneration]() {
+            if (loadingPlaceholder
+                    && placeholderGeneration == loadingPlaceholderGeneration
+                    && (loadingPlaceholderFile.empty()
+                        || loadingPlaceholderFile == openedFile)) {
+                endLoadingPlaceholder();
+            }
+        });
+
     this->isrc = isrc;
     ipc = rtengine::StagedImageProcessor::create (isrc);
+
+    if (loadingPlaceholder) {
+        loadingPlaceholderIpc = ipc;
+    }
+
     ipc->setProgressListener (this);
     colorMgmtToolBar->updateProcessor();
     ipc->setPreviewImageListener (previewHandler);
     ipc->setPreviewScale (10);  // Important
     tpc->initImage (ipc, tmb->getType() == FT_Raw);
     ipc->setHistogramListener (this);
-    iareapanel->imageArea->indClippedPanel->silentlyDisableSharpMask();
+
+    if (!loadingPlaceholder) {
+        iareapanel->imageArea->indClippedPanel->silentlyDisableSharpMask();
+    }
 
 //    iarea->fitZoom ();   // tell to the editorPanel that the next image has to be fitted to the screen
     iareapanel->imageArea->setPreviewHandler (previewHandler);
@@ -1567,6 +1750,13 @@ void EditorPanel::refreshProcessingState (bool inProcessingP)
 
     isProcessing = inProcessingP;
 
+    if (!inProcessingP && loadingPlaceholder
+            && loadingPlaceholderIpc != nullptr
+            && ipc == loadingPlaceholderIpc && openThm
+            && openThm->getFileName() == loadingPlaceholderFile) {
+        endLoadingPlaceholder();
+    }
+
     setprogressStrUI(val, str, progressLabel);
 }
 
@@ -1736,6 +1926,58 @@ bool EditorPanel::handleShortcutKey (GdkEventKey* event)
 #else
     bool altgr = event->state & GDK_MOD5_MASK;
 #endif
+
+    if (loadingPlaceholder) {
+        // Editing is disabled while the placeholder is shown.  Keep the
+        // display-only preview toggles usable and apply them to the incoming
+        // image when its first preview arrives.
+        if (!alt && !ctrl && !altgr && event->hardware_keycode == 0x12) {
+            iareapanel->imageArea->previewModePanel->togglebackColor();
+            return true;
+        }
+
+        switch (event->keyval) {
+            case GDK_KEY_i:
+            case GDK_KEY_I:
+                info->set_active(!info->get_active());
+                return true;
+
+            case GDK_KEY_r:
+                iareapanel->imageArea->previewModePanel->toggleR();
+                return true;
+
+            case GDK_KEY_g:
+                iareapanel->imageArea->previewModePanel->toggleG();
+                return true;
+
+            case GDK_KEY_b:
+                iareapanel->imageArea->previewModePanel->toggleB();
+                return true;
+
+            case GDK_KEY_v:
+                iareapanel->imageArea->previewModePanel->toggleL();
+                return true;
+
+            case GDK_KEY_p:
+                iareapanel->imageArea->indClippedPanel->toggleSharpMask();
+                return true;
+
+            case GDK_KEY_F:
+                iareapanel->imageArea->indClippedPanel->toggleFocusMask();
+                return true;
+
+            case GDK_KEY_less:
+                iareapanel->imageArea->indClippedPanel->toggleClipped(false);
+                return true;
+
+            case GDK_KEY_greater:
+                iareapanel->imageArea->indClippedPanel->toggleClipped(true);
+                return true;
+
+            default:
+                return true;
+        }
+    }
 
     // Editor Layout
     switch (event->keyval) {

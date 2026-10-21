@@ -63,11 +63,17 @@ protected:
     std::list<PreviewListener*> listeners;
     MyMutex previewImgMutex;
     Glib::RefPtr<Gdk::Pixbuf> previewImg;
+    sigc::signal<void> previewReadySignal;
 
 public:
 
     PreviewHandler ();
     ~PreviewHandler () override;
+
+    sigc::signal<void>& signalPreviewReady()
+    {
+        return previewReadySignal;
+    }
 
     void addPreviewImageListener (PreviewListener* l)
     {

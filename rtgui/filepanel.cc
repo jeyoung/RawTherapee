@@ -17,6 +17,7 @@
  *  along with RawTherapee.  If not, see <https://www.gnu.org/licenses/>.
  */
 #include "filepanel.h"
+#include "filebrowserentry.h"
 
 #include "batchtoolpanelcoord.h"
 #include "dirbrowser.h"
@@ -263,7 +264,35 @@ bool FilePanel::fileSelected (Thumbnail* thm)
     // Check if the image is already being opened and set the image loading status if it is not
     bool loading = thm->imageLoad( true );
 
-    if( !loading ) {
+    if (!App::get().options().tabbedUI && parent && parent->epanel) {
+        parent->epanel->showLoadingPlaceholder(
+            Glib::RefPtr<Gdk::Pixbuf>(), thm->getFileName());
+
+        Glib::RefPtr<Gdk::Pixbuf> preview;
+
+        if (fileCatalog && fileCatalog->fileBrowser) {
+            for (ThumbBrowserEntryBase* entry :
+                    fileCatalog->fileBrowser->getEntries()) {
+                if (entry && entry->thumbnail == thm) {
+                    preview = static_cast<FileBrowserEntry*>(entry)
+                        ->getPreviewPixbuf();
+                    break;
+                }
+            }
+        }
+
+        if (!preview) {
+            const auto& options = App::get().options();
+            preview = thm->getQuickPreviewPixbuf(options.maxThumbnailHeight);
+        }
+
+        if (preview) {
+            parent->epanel->updateLoadingPlaceholder(
+                preview, thm->getFileName());
+        }
+    }
+
+    if (!loading) {
         return false;
     }
 
@@ -349,6 +378,11 @@ bool FilePanel::imageLoaded( Thumbnail* thm, ProgressConnector<rtengine::Initial
                 parent->set_title_decorated(pl->thm->getFileName());
             }
         } else {
+            if (parent && parent->epanel) {
+                parent->epanel->clearLoadingPlaceholder(
+                    pl->thm->getFileName(), false);
+            }
+
             Glib::ustring msg_ = Glib::ustring("<b>") + M("MAIN_MSG_CANNOTLOAD") + " \"" + escapeHtmlChars(thm->getFileName()) + "\" .\n</b>";
             Gtk::MessageDialog msgd (*parent, msg_, true, Gtk::MESSAGE_ERROR, Gtk::BUTTONS_OK, true);
             msgd.run ();

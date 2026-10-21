@@ -18,8 +18,9 @@
  */
 #include "imagearea.h"
 
-#include <ctime>
+#include <algorithm>
 #include <cmath>
+#include <ctime>
 
 #include "rtengine/refreshmap.h"
 #include "rtengine/procparams.h"
@@ -147,6 +148,28 @@ void ImageArea::setPreviewHandler (PreviewHandler* ph)
     previewHandler = ph;
 }
 
+void ImageArea::setLoadingPlaceholder(const Glib::RefPtr<Gdk::Pixbuf>& pixbuf)
+{
+    loadingPixbuf = pixbuf;
+    loadingPlaceholder = true;
+    focusGrabber = nullptr;
+    flawnOverWindow = nullptr;
+    dirty = true;
+    queue_draw();
+}
+
+void ImageArea::clearLoadingPlaceholder()
+{
+    if (!loadingPlaceholder) {
+        return;
+    }
+
+    loadingPlaceholder = false;
+    loadingPixbuf.clear();
+    dirty = true;
+    queue_draw();
+}
+
 void ImageArea::on_style_updated ()
 {
 
@@ -249,11 +272,95 @@ void ImageArea::switchPickerVisibility (bool isVisible)
     redraw();
 }
 
+void ImageArea::drawLoadingPlaceholder(const Cairo::RefPtr<Cairo::Context>& cr)
+{
+    const int width = get_width();
+    const int height = get_height();
+
+    if (width <= 0 || height <= 0) {
+        return;
+    }
+
+    Gdk::RGBA background;
+    const int backgroundMode =
+        previewModePanel != nullptr ? previewModePanel->GetbackColor() : 0;
+
+    switch (backgroundMode) {
+        case 1:
+            background.set_rgba(0.0, 0.0, 0.0, 1.0);
+            break;
+        case 2:
+            background.set_rgba(1.0, 1.0, 1.0, 1.0);
+            break;
+        case 3:
+            background.set_rgba(0.5, 0.5, 0.5, 1.0);
+            break;
+        default:
+            background = get_style_context()->get_background_color(
+                Gtk::STATE_FLAG_NORMAL);
+
+            if (background.get_alpha() == 0.0) {
+                background.set_rgba(0.0, 0.0, 0.0, 1.0);
+            }
+            break;
+    }
+
+    cr->set_source_rgba(background.get_red(), background.get_green(),
+                        background.get_blue(), background.get_alpha());
+    cr->paint();
+
+    const double margin = std::max(8.0, std::min(width, height) * 0.04);
+
+    if (loadingPixbuf) {
+        const double availableWidth = width - 2.0 * margin;
+        const double availableHeight = height - 2.0 * margin;
+        const double scale = std::min(
+            availableWidth / loadingPixbuf->get_width(),
+            availableHeight / loadingPixbuf->get_height());
+
+        if (scale > 0.0) {
+            const double drawWidth = loadingPixbuf->get_width() * scale;
+            const double drawHeight = loadingPixbuf->get_height() * scale;
+            const double x = (width - drawWidth) * 0.5;
+            const double y = (height - drawHeight) * 0.5;
+
+            cr->save();
+            cr->translate(x, y);
+            cr->scale(scale, scale);
+            Gdk::Cairo::set_source_pixbuf(cr, loadingPixbuf, 0.0, 0.0);
+            cr->paint();
+            cr->restore();
+        }
+    }
+
+    Glib::RefPtr<Pango::Layout> layout =
+        create_pango_layout(M("PROGRESSBAR_LOADING"));
+    int textWidth = 0;
+    int textHeight = 0;
+    layout->get_pixel_size(textWidth, textHeight);
+
+    const double textX = (width - textWidth) * 0.5;
+    const double textY = height - textHeight - margin;
+
+    cr->set_source_rgba(0.0, 0.0, 0.0, 0.75);
+    cr->move_to(textX + 1.0, textY + 1.0);
+    layout->show_in_cairo_context(cr);
+
+    cr->set_source_rgba(1.0, 1.0, 1.0, 0.9);
+    cr->move_to(textX, textY);
+    layout->show_in_cairo_context(cr);
+}
+
 bool ImageArea::on_draw(const ::Cairo::RefPtr< Cairo::Context> &cr)
 {
     RT_PROFILE("editor::on_draw", GUI_EDITOR);
 
     dirty = false;
+
+    if (loadingPlaceholder) {
+        drawLoadingPlaceholder(cr);
+        return true;
+    }
 
     int deviceScale = RTScalable::getScaleForWidget(this);
 
@@ -288,6 +395,10 @@ bool ImageArea::on_draw(const ::Cairo::RefPtr< Cairo::Context> &cr)
 bool ImageArea::on_motion_notify_event (GdkEventMotion* event)
 {
 
+    if (loadingPlaceholder) {
+        return true;
+    }
+
     if (focusGrabber) {
         focusGrabber->pointerMoved (event->state, event->x, event->y);
     } else {
@@ -316,6 +427,10 @@ bool ImageArea::on_motion_notify_event (GdkEventMotion* event)
 bool ImageArea::on_button_press_event (GdkEventButton* event)
 {
 
+    if (loadingPlaceholder) {
+        return true;
+    }
+
     if (focusGrabber) {
         focusGrabber->buttonPress (event->button, event->type, event->state, event->x, event->y);
     } else {
@@ -332,6 +447,10 @@ bool ImageArea::on_button_press_event (GdkEventButton* event)
 bool ImageArea::on_scroll_event (GdkEventScroll* event)
 {
 
+    if (loadingPlaceholder) {
+        return true;
+    }
+
 //    printf("ImageArea::on_scroll_event / delta_x=%.5f, delta_y=%.5f, direction=%d, type=%d, send_event=%d\n",
 //            event->delta_x, event->delta_y, (int)event->direction, (int)event->type, event->send_event);
 
@@ -345,6 +464,10 @@ bool ImageArea::on_scroll_event (GdkEventScroll* event)
 
 bool ImageArea::on_button_release_event (GdkEventButton* event)
 {
+
+    if (loadingPlaceholder) {
+        return true;
+    }
 
     if (focusGrabber) {
         focusGrabber->buttonRelease (event->button, event->type, event->state, event->x, event->y);
@@ -361,6 +484,10 @@ bool ImageArea::on_button_release_event (GdkEventButton* event)
 
 bool ImageArea::on_leave_notify_event  (GdkEventCrossing* event)
 {
+    if (loadingPlaceholder) {
+        return true;
+    }
+
     if (flawnOverWindow) {
         flawnOverWindow->flawnOver(false);
         flawnOverWindow = nullptr;

@@ -75,6 +75,16 @@ public:
     ~EditorPanel () override;
 
     void open (Thumbnail* tmb, rtengine::InitialImage* isrc);
+    void showLoadingPlaceholder(const Glib::RefPtr<Gdk::Pixbuf>& pixbuf,
+                                const Glib::ustring& fileName);
+    void updateLoadingPlaceholder(const Glib::RefPtr<Gdk::Pixbuf>& pixbuf,
+                                  const Glib::ustring& fileName);
+    void clearLoadingPlaceholder(const Glib::ustring& fileName = {},
+                                 bool applyDeferredState = true);
+    bool isLoadingPlaceholder() const
+    {
+        return loadingPlaceholder;
+    }
     void setAspect ();
     void on_realize () override;
     void leftPaneButtonReleased (GdkEventButton *event);
@@ -309,6 +319,13 @@ private:
     sigc::connection ShowHideSidePanelsconn;
 
     bool isProcessing;
+    bool loadingPlaceholder = false;
+    Glib::ustring loadingPlaceholderFile;
+    unsigned long long loadingPlaceholderGeneration = 0;
+    rtengine::StagedImageProcessor* loadingPlaceholderIpc = nullptr;
+
+    void setEditingSensitive(bool sensitive);
+    void endLoadingPlaceholder(bool applyDeferredState = true);
 
     IdleRegister idle_register;
 

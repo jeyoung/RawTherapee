@@ -58,6 +58,10 @@ public:
     {
         return previewFocusMask->get_active ();
     }
+    bool showSharpMask()
+    {
+        return previewSharpMask->get_active();
+    }
     bool showClippedShadows()
     {
         return indClippedS->get_active();

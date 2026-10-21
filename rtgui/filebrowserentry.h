@@ -91,6 +91,7 @@ public:
     }
 
     FileThumbnailButtonSet* getThumbButtonSet ();
+    Glib::RefPtr<Gdk::Pixbuf> getPreviewPixbuf();
 
     void refreshThumbnailImage () override;
     void refreshQuickThumbnailImage () override;

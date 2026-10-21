@@ -1428,7 +1428,6 @@ void ToolPanelCoordinator::initImage(rtengine::StagedImageProcessor* ipc_, bool 
 
 void ToolPanelCoordinator::closeImage()
 {
-
     if (ipc) {
         ipc->stopProcessing();
         ipc = nullptr;
@@ -1548,7 +1547,20 @@ void ToolPanelCoordinator::spotWBselected(int x, int y, Thumbnail* thm)
 
 void ToolPanelCoordinator::sharpMaskSelected(bool sharpMask)
 {
-    if (!ipc) {
+    if (loading || !ipc) {
+        return;
+    }
+
+    ipc->beginUpdateParams();
+    ipc->endUpdateParams (ipc->setSharpMask(sharpMask));
+}
+
+void ToolPanelCoordinator::setLoading(bool loading, bool sharpMask,
+                                      bool applyDeferredState)
+{
+    this->loading = loading;
+
+    if (loading || !applyDeferredState || !ipc) {
         return;
     }
 

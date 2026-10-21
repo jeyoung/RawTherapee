@@ -221,6 +221,7 @@ protected:
 
     bool hasChanged;
     bool batch;
+    bool loading = false;
 
     void addPanel(Gtk::Box* where, FoldableToolPanel* panel, int level = 1);
     void foldThemAll(GdkEventButton* event);
@@ -455,6 +456,7 @@ public:
     // imageareatoollistener interface
     void spotWBselected(int x, int y, Thumbnail* thm = nullptr) override;
     void sharpMaskSelected(bool sharpMask) override final;
+    void setLoading(bool loading, bool sharpMask, bool applyDeferredState = true);
     int getSpotWBRectSize() const override;
     void cropSelectionReady() override;
     void rotateSelectionReady(double rotate_deg, Thumbnail* thm = nullptr) override;
