@@ -102,6 +102,24 @@ OMP_NUM_THREADS=8 rawtherapee-cli \
 Three alternating runs each. The 45 MP GPU total is about 19 % faster. All
 six `verify.sh --formats` entries PASS at 1 LSB PAE.
 
+## Monitor conversion
+
+1024×768 random full-range Lab, `OMP_NUM_THREADS=8`, matrix-shaper monitor
+profiles. The GPU path uses the profile matrix and inverse TRC; lcms remains
+the reference and the fallback.
+
+| Profile | lcms | GPU | Max byte difference |
+|---|---:|---:|---:|
+| RTv4_sRGB, BPC on | 38.5 ms | 12.0 ms | 1 |
+| RTv2_sRGB, BPC on | 38.1 ms | 12.0 ms | 1 |
+| system sRGB, BPC on | 26.6 ms | 12.1 ms | 1 |
+| sRGB2014, BPC on | 28.0 ms | 11.9 ms | 1 |
+| RTv4_Medium, BPC on/off | 39.3 ms | 12.0 ms | 1 |
+
+The profile matrix and TRC setup takes 3–7 ms and is cached per profile and
+settings key. The GUI preview harness could not run because Xvfb is not
+installed, so interactive preview latency is not recorded yet.
+
 ## Debian package smoke run
 
 `2026-10-04-173409.NEF` (8288x5520) with its `.pp3`, single-threaded,

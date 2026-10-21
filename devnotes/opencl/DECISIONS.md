@@ -167,3 +167,25 @@ Consequences: output conversion is 1 LSB parity on the six-format corpus.
 sRGB path; adding a GPU round trip would be slower. The profile values are
 duplicated in `openclengine.cc` and must be updated if the shipped profile
 changes.
+
+## D014 — Offload matrix-shaper monitor conversion
+
+Date: 2026-10-21
+
+Decision: `lab2monitorRgb()` uses the GPU when the monitor profile is a
+matrix shaper with same R/G/B TRCs, the intent is relative colorimetric, there
+is no soft proof or gamut check, and BPC is either off or has a zero
+destination black point. LUT-based profiles and unsafe cases keep lcms. The
+inverse TRC is built from the lcms estimated table and cached per profile and
+settings key.
+
+Alternatives: the manual CPU sRGB path is faster than the GPU for the
+no-profile case (about 2 ms versus 12 ms at 1 MP), so it is kept. A generic
+sRGB matrix for all monitor profiles differed by up to 2 bytes from lcms, so
+the profile data is used instead.
+
+Consequences: matrix-shaper monitor conversion is about 2–3× faster than lcms
+at 1 MP (12 ms versus 26–46 ms) with a maximum 1-byte difference. The GPU path
+is only built when OpenCL is enabled; thumbnail and CPU-only paths do not pay
+the LUT construction cost. The LUT inversion assumes the estimated table is
+monotonic and the three TRCs are identical.

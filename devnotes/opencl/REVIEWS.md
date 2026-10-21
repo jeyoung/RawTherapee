@@ -193,3 +193,20 @@ but encoded 16-bit comparison showed a 26 LSB difference from lcms.
 | Thread-local stage gate was not checked | Added `threadStageAllowed` to the stage precondition |
 | `compare_tiff.py` linearised samples through ImageMagick | Normalise to uncompressed 16-bit TIFF and read encoded samples |
 | LUT and matrix rebuilt on every call | Accepted for now; 256 KiB upload is small relative to the stage |
+
+## R13 — Monitor Lab output
+
+The first monitor implementation used the generic sRGB matrix and was slower
+than the multi-threaded CPU manual path. It was replaced with a profile-aware
+matrix/TRC path, which only pays off when it replaces lcms.
+
+| Finding | Resolution |
+|---|---|
+| Generic sRGB path was 2 bytes from lcms and slower than the manual CPU path | Use the monitor profile matrix and inverse TRC; keep the manual CPU path when there is no monitor profile |
+| Bisection inversion cost 50–83 ms per profile update | Invert the lcms estimated table by binary search; setup is now 3–7 ms and is cached |
+| `cmsIsMatrixShaper()` does not rule out LUT output tags | Reject profiles with `BToA*` or `BToD*` tags |
+| Sampled TRC checks could miss non-monotonic or unequal curves | Use `cmsIsToneCurveMonotonic()` and compare the full estimated tables |
+| BPC filename heuristic was fragile | Use `cmsDetectDestinationBlackPoint()` and require a zero black point when BPC is on |
+| GPU could run when lcms transform creation failed | Require `monitorTransform != nullptr` before setting the GPU-ready flag |
+| No minimum-size gate | Remaining work; small detail crops may still favour lcms |
+| GPU-ready fields are unsynchronised | Current coordinator/crop call graph serialises them; document if a future caller changes ownership |

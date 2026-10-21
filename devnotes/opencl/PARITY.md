@@ -30,6 +30,7 @@ difference between two identical runs). The gate is the peak absolute error
 | 2026-10-21 | uncommitted | AMD RX 550 | colorspace_flowers.pef / neutral | off vs auto | 1 LSB | PASS |
 | 2026-10-21 | uncommitted | AMD RX 550 | d850.nef / neutral | off vs auto | 1 LSB | PASS |
 | 2026-10-21 | uncommitted | AMD RX 550 | jpg, tif, png manifest entries | off vs auto | 1 LSB | PASS |
+| 2026-10-21 | uncommitted | AMD RX 550 | random Lab / RTv4_sRGB, RTv2_sRGB, sRGB, sRGB2014, RTv4_Medium monitor | GPU vs lcms | 1 byte | PASS |
 
 `verify.sh` now reports `SKIP` instead of `PASS` when no OpenCL device is
 selected, so a CPU-only build cannot produce a vacuous parity claim.
@@ -53,3 +54,6 @@ Notes:
   TIFF and reads the encoded samples. The previous ImageMagick `rgb:` path
   linearised the samples, which amplified a 1 LSB difference into a 26 LSB
   PAE.
+- Monitor output is 8-bit, so its parity gate is 1 byte. The random-Lab
+  monitor harness covers 1024×768 full-range values; it is not part of
+  `verify.sh`.

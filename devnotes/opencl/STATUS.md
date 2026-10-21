@@ -3,15 +3,38 @@
 ## Handover block
 
 - Branch: `perf` (based on `opencl`, which is based on `dev` at `b2ee504c4`)
-- Milestone: M10 — sRGB output conversion; next is the resident RGB/Lab segment
-- Last verified: 2026-10-21, six-format parity on AMD RX 550
-- Next task: device-resident RGB/Lab segment, then `rgbProc` core and the Lab
-  LUT stack
+- Milestone: M11 — shared Lab→RGB segment for output and monitor; next is
+  `rgbProc` core and the Lab LUT stack
+- Last verified: 2026-10-21, six-format export and matrix-shaper monitor parity
+  on AMD RX 550
+- Next task: device-resident Lab pipeline, starting with `rgbProc` core and the
+  Lab LUT stack
 - Known limitations: single-stage acceleration is roughly neutral end-to-end;
   transform is limited to rotation/scale/crop without LCP, CA, distortion,
   perspective or vignetting; capture sharpening is split into watchdog-safe
   chunks and sized by a work budget; output conversion is limited to
-  `RTv4_sRGB`, relative colorimetric intent and integer output
+  `RTv4_sRGB`, relative colorimetric intent and integer output; monitor
+  conversion falls back to lcms for LUT profiles, soft proofing, gamut check,
+  non-relative intent, and black-point compensation with a non-zero black point
+
+## M11 evidence — shared Lab→RGB segment
+
+- One `labToRgb()` helper and one kernel source serve 16-bit output and 8-bit
+  monitor output. The 16-bit path keeps the profile-exact `RTv4_sRGB` maths.
+- The monitor path is used for matrix-shaper profiles with relative
+  colorimetric intent, no soft proof or gamut check, and either BPC off or a
+  zero destination black point. LUT profiles and unsafe cases keep lcms.
+- The inverse TRC is built from the lcms estimated table by binary search and
+  cached per profile/settings key. Profile setup is 3–7 ms instead of the
+  50–83 ms bisection prototype.
+- 1024×768 random full-range Lab, 8 threads: GPU 12 ms versus lcms 26–46 ms.
+  Maximum difference 1 byte on `RTv4_sRGB`, `RTv2_sRGB`, system `sRGB`,
+  `sRGB2014`, and `RTv4_Medium` (BPC on and off).
+- No monitor profile keeps the manual CPU path; no GPU round trip is attempted.
+- `--quick`, `--formats` and the resize/rotate/capture stage tests PASS at
+  1 LSB. `WITH_OPENCL=ON` and `WITH_OPENCL=OFF` both build.
+- The GUI preview harness was not run in this environment because Xvfb is not
+  installed; the monitor path is covered by a direct engine harness.
 
 ## M10 evidence — sRGB output conversion
 
@@ -216,6 +239,7 @@ choose at runtime whether to use a device.
 | M8 | incremental | preview request coalescing; cache/benchmark pending |
 | M9 | incremental | preview timing instrumentation; baseline pending |
 | M10 | complete | sRGB output conversion with profile-exact parity |
+| M11 | complete | shared Lab→RGB segment for output and monitor |
 
 ## Review
 
