@@ -72,3 +72,31 @@ cache.
 
 The timer starts after stale-request rejection; cold renders include initial
 image loading and are reported separately.
+
+## Loading placeholder
+
+Single-editor mode replaces the previous image immediately when a new image is
+selected. The placeholder is the selected image's filmstrip preview, which is
+derived from the embedded JPEG. An empty placeholder is shown first, then the
+preview pixbuf is installed when available, so a slow thumbnail lookup cannot
+leave the old image visible.
+
+Editing is disabled while the placeholder is active: tool panels, crop and
+image-area input, history, save/export/queue and editing shortcuts are
+blocked. The preview-only toggles remain usable: clipped highlights/shadows,
+focus mask, RGB/L channel view, background colour and sharp mask. Sharp mask,
+soft proof and gamut check are deferred until the new processor exists.
+
+The placeholder clears on the first real preview, on initial-image load
+failure, or when processing finishes without producing a preview. Load
+failures clear the placeholder without applying deferred preview state to the
+old processor.
+
+Manual Xvfb test with a 10 MP PEF followed by a 45.7 MP NEF:
+
+- placeholder visible about 100 ms after the next-image command
+- first full preview after about 10 s; the placeholder remained until then
+- rotate shortcut was ignored while loading
+- the clipped-highlight toggle was accepted during loading and applied to the
+  new preview
+- editing controls were insensitive during loading and re-enabled afterwards
