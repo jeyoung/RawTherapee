@@ -21,7 +21,6 @@
 #include <memory>
 #include <string>
 
-#include <gdkmm/pixbuf.h>
 #include <glibmm/ustring.h>
 #include <glibmm/datetime.h>
 
@@ -153,7 +152,6 @@ public:
 //        unsigned char*  getThumbnailImage (int &w, int &h, int fixwh=1); // fixwh = 0: fix w and calculate h, =1: fix h and calculate w
     rtengine::IImage8* processThumbImage    (const rtengine::procparams::ProcParams& pparams, int h, double& scale);
     rtengine::IImage8* upgradeThumbImage    (const rtengine::procparams::ProcParams& pparams, int h, double& scale, bool forceUpgrade);
-    Glib::RefPtr<Gdk::Pixbuf> getQuickPreviewPixbuf(int maxHeight);
     void            getThumbnailSize        (int &w, int &h, const rtengine::procparams::ProcParams *pparams = nullptr);
     void            getFinalSize            (const rtengine::procparams::ProcParams& pparams, int& w, int& h);
     void            getOriginalSize         (int& w, int& h) const;

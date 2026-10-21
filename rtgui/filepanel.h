@@ -35,6 +35,7 @@
 class BatchToolPanelCoordinator;
 class RTWindow;
 class DirBrowser;
+struct EmbeddedPreviewData;
 
 class FilePanel final :
     public Gtk::Paned,
@@ -107,6 +108,11 @@ private:
     };
     MyMutex pendingLoadMutex;
     std::vector<struct pendingLoad*> pendingLoads;
+    unsigned long long embeddedPreviewRequest = 0;
+
+    bool embeddedPreviewLoaded(
+        ProgressConnector<EmbeddedPreviewData*>* pc,
+        unsigned long long request, const Glib::ustring& fileName);
 
     int error;
 

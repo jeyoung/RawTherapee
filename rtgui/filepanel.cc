@@ -17,19 +17,73 @@
  *  along with RawTherapee.  If not, see <https://www.gnu.org/licenses/>.
  */
 #include "filepanel.h"
-#include "filebrowserentry.h"
+
+#include <cstring>
 
 #include "batchtoolpanelcoord.h"
 #include "dirbrowser.h"
 #include "editorpanel.h"
 #include "inspector.h"
+#include "pathutils.h"
 #include "placesbrowser.h"
 #include "thumbnail.h"
 #include "windows/rtwindow.h"
 
+#include "rtengine/image8.h"
+#include "rtengine/rawimage.h"
+
 #ifdef _WIN32
 #include "rtengine/leanwindows.h"
 #endif // _WIN32
+
+struct EmbeddedPreviewData {
+    int width = 0;
+    int height = 0;
+    std::vector<unsigned char> pixels;
+};
+
+namespace
+{
+
+EmbeddedPreviewData* loadEmbeddedPreview(const Glib::ustring& fileName)
+{
+    rtengine::RawImage raw(fileName);
+
+    if (raw.loadRaw(false, 0, false) != 0) {
+        return nullptr;
+    }
+
+    rtengine::Image8* image = raw.getThumbnail();
+
+    if (image == nullptr) {
+        return nullptr;
+    }
+
+    const std::string suffix = getExtension(fileName).lowercase();
+
+    if (suffix != "mos" && suffix != "mef" && suffix != "iiq"
+            && raw.get_rotateDegree() > 0) {
+        image->rotate(raw.get_rotateDegree());
+    }
+
+    const int width = image->getWidth();
+    const int height = image->getHeight();
+    const unsigned char* data = image->getData();
+
+    if (width <= 0 || height <= 0 || data == nullptr) {
+        delete image;
+        return nullptr;
+    }
+
+    EmbeddedPreviewData* preview = new EmbeddedPreviewData;
+    preview->width = width;
+    preview->height = height;
+    preview->pixels.assign(data, data + static_cast<size_t>(width) * height * 3);
+    delete image;
+    return preview;
+}
+
+}
 
 FilePanel::FilePanel () : parent(nullptr), error(0)
 {
@@ -265,30 +319,25 @@ bool FilePanel::fileSelected (Thumbnail* thm)
     bool loading = thm->imageLoad( true );
 
     if (!App::get().options().tabbedUI && parent && parent->epanel) {
-        parent->epanel->showLoadingPlaceholder(
-            Glib::RefPtr<Gdk::Pixbuf>(), thm->getFileName());
+        ++embeddedPreviewRequest;
+        const unsigned long long request = embeddedPreviewRequest;
 
-        Glib::RefPtr<Gdk::Pixbuf> preview;
+        if (thm->getType() == FT_Raw) {
+            parent->epanel->showLoadingPlaceholder(
+                Glib::RefPtr<Gdk::Pixbuf>(), thm->getFileName());
 
-        if (fileCatalog && fileCatalog->fileBrowser) {
-            for (ThumbBrowserEntryBase* entry :
-                    fileCatalog->fileBrowser->getEntries()) {
-                if (entry && entry->thumbnail == thm) {
-                    preview = static_cast<FileBrowserEntry*>(entry)
-                        ->getPreviewPixbuf();
-                    break;
-                }
-            }
-        }
-
-        if (!preview) {
-            const auto& options = App::get().options();
-            preview = thm->getQuickPreviewPixbuf(options.maxThumbnailHeight);
-        }
-
-        if (preview) {
-            parent->epanel->updateLoadingPlaceholder(
-                preview, thm->getFileName());
+            ProgressConnector<EmbeddedPreviewData*>* embeddedLoader =
+                new ProgressConnector<EmbeddedPreviewData*>();
+            embeddedLoader->startFunc(
+                sigc::bind(sigc::ptr_fun(&loadEmbeddedPreview),
+                           thm->getFileName()),
+                sigc::bind(
+                    sigc::mem_fun(*this, &FilePanel::embeddedPreviewLoaded),
+                    embeddedLoader, request, thm->getFileName()));
+        } else {
+            // Only raw files have a useful embedded JPEG.  JPEG inputs and
+            // other raster formats keep the normal loading behaviour.
+            parent->epanel->clearLoadingPlaceholder({}, false);
         }
     }
 
@@ -411,6 +460,42 @@ MAXGDIHANDLESREACHED:
     }
 
     return false; // MUST return false from idle function
+}
+
+bool FilePanel::embeddedPreviewLoaded(
+    ProgressConnector<EmbeddedPreviewData*>* pc, unsigned long long request,
+    const Glib::ustring& fileName)
+{
+    EmbeddedPreviewData* data = pc->returnValue();
+    delete pc;
+
+    if (data == nullptr) {
+        return false;
+    }
+
+    if (request != embeddedPreviewRequest || parent == nullptr
+            || parent->epanel == nullptr) {
+        delete data;
+        return false;
+    }
+
+    Glib::RefPtr<Gdk::Pixbuf> pixbuf = Gdk::Pixbuf::create(
+        Gdk::COLORSPACE_RGB, false, 8, data->width, data->height);
+
+    if (pixbuf) {
+        const int sourceStride = data->width * 3;
+        unsigned char* destination = pixbuf->get_pixels();
+
+        for (int y = 0; y < data->height; ++y) {
+            std::memcpy(destination + y * pixbuf->get_rowstride(),
+                        data->pixels.data() + y * sourceStride, sourceStride);
+        }
+
+        parent->epanel->updateLoadingPlaceholder(pixbuf, fileName);
+    }
+
+    delete data;
+    return false;
 }
 
 void FilePanel::saveOptions ()

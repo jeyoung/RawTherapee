@@ -18,7 +18,6 @@
  */
 #include "filebrowserentry.h"
 
-#include <algorithm>
 #include <cstring>
 #include <iomanip>
 
@@ -138,44 +137,6 @@ void FileBrowserEntry::calcThumbnailSize ()
             refreshThumbnailImage();
         }
     }
-}
-
-Glib::RefPtr<Gdk::Pixbuf> FileBrowserEntry::getPreviewPixbuf()
-{
-    MYREADERLOCK(l, lockRW);
-
-    const int width = previewDataLayout.width;
-    const int height = previewDataLayout.height;
-
-    if (width <= 0 || height <= 0
-            || preview.size() < static_cast<size_t>(width) * height * 3) {
-        return {};
-    }
-
-    Glib::RefPtr<Gdk::Pixbuf> pixbuf = Gdk::Pixbuf::create(
-        Gdk::COLORSPACE_RGB, false, 8, width, height);
-
-    if (!pixbuf) {
-        return {};
-    }
-
-    const int sourceStride = width * 3;
-    unsigned char* destination = pixbuf->get_pixels();
-
-    for (int y = 0; y < height; ++y) {
-        std::memcpy(destination + y * pixbuf->get_rowstride(),
-                    preview.data() + y * sourceStride, sourceStride);
-    }
-
-    const int deviceScale = activeDeviceScale > 0 ? activeDeviceScale : 1;
-
-    if (deviceScale > 1) {
-        return pixbuf->scale_simple(
-            std::max(1, width / deviceScale),
-            std::max(1, height / deviceScale), Gdk::INTERP_BILINEAR);
-    }
-
-    return pixbuf;
 }
 
 std::vector<std::shared_ptr<RTSurface>> FileBrowserEntry::getIconsOnImageArea ()
