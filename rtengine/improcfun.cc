@@ -61,6 +61,18 @@ namespace
 
 using namespace rtengine;
 
+std::vector<float> copyLut(const LUTf& lut)
+{
+    constexpr size_t entries = 65536;
+    std::vector<float> result(entries);
+
+    for (size_t i = 0; i < entries; ++i) {
+        result[i] = lut[static_cast<int>(i)];
+    }
+
+    return result;
+}
+
 bool buildMonitorGpuProfile(cmsHPROFILE monitor, float matrix[9],
                             std::vector<float>& gamma)
 {
@@ -2535,6 +2547,78 @@ void ImProcFunctions::rgbProc(Imagefloat* working, LabImage* lab, PipetteBuffer 
     if (toneCurveHistSize > 0) {
         histToneCurve.clear();
         histToneCurveCompression = log2(65536 / toneCurveHistSize);
+    }
+
+    const bool gpuRgbProc = g_getenv("RT_OPENCL_RGBPROC") != nullptr
+        && g_strcmp0(g_getenv("RT_OPENCL_RGBPROC"), "1") == 0
+        && openCLAllowed && opencl::enabled()
+        && opencl::stageAllowed() && opencl::rgbProcAvailable()
+        && (dcpProf == nullptr || asIn.isIdentity())
+        && pipetteBuffer == nullptr && !params->blackwhite.enabled
+        && !params->hsvequalizer.enabled
+        && !params->filmSimulation.enabled
+        && !params->colorToning.enabled
+        && !params->toneEqualizer.enabled && !hasColorToning
+        && !hasToneCurve1 && !hasToneCurve2 && sat == 0
+        && !params->rgbCurves.lumamode && !isProPhoto
+        && params->toneCurve.clampOOG
+        && !(params->dirpyrequalizer.cbdlMethod == "bef"
+             && params->dirpyrequalizer.enabled)
+        && toneCurveHistSize == 0;
+
+    if (gpuRgbProc) {
+        int rgbCurveMask = 0;
+
+        if (params->rgbCurves.enabled) {
+            rgbCurveMask = (rCurve ? 1 : 0) | (gCurve ? 2 : 0)
+                | (bCurve ? 4 : 0);
+        }
+
+        const std::vector<float> hlLut = copyLut(hltonecurve);
+        const std::vector<float> shLut = tone_curve_black != 0
+            ? copyLut(shtonecurve) : std::vector<float>();
+        const std::vector<float> toneLut = copyLut(tonecurve);
+        const std::vector<float> rLut = (rgbCurveMask & 1) != 0
+            ? copyLut(rCurve) : std::vector<float>();
+        const std::vector<float> gLut = (rgbCurveMask & 2) != 0
+            ? copyLut(gCurve) : std::vector<float>();
+        const std::vector<float> bLut = (rgbCurveMask & 4) != 0
+            ? copyLut(bCurve) : std::vector<float>();
+        const std::vector<float> cachefLut = copyLut(Color::cachef);
+        const std::vector<float> cachefyLut = copyLut(Color::cachefy);
+        const float mixer[9] = {
+            chMixRR, chMixRG, chMixRB,
+            chMixGR, chMixGG, chMixGB,
+            chMixBR, chMixBG, chMixBB
+        };
+        const float toxyzf[9] = {
+            toxyz[0][0], toxyz[0][1], toxyz[0][2],
+            toxyz[1][0], toxyz[1][1], toxyz[1][2],
+            toxyz[2][0], toxyz[2][1], toxyz[2][2]
+        };
+
+        opencl::RgbProcData gpuData;
+        gpuData.hlToneCurve = hlLut.data();
+        gpuData.shToneCurve = tone_curve_black != 0 ? shLut.data() : nullptr;
+        gpuData.toneCurve = toneLut.data();
+        gpuData.rCurve = (rgbCurveMask & 1) != 0 ? rLut.data() : nullptr;
+        gpuData.gCurve = (rgbCurveMask & 2) != 0 ? gLut.data() : nullptr;
+        gpuData.bCurve = (rgbCurveMask & 4) != 0 ? bLut.data() : nullptr;
+        gpuData.cachef = cachefLut.data();
+        gpuData.cachefy = cachefyLut.data();
+        gpuData.channelMixer = mixer;
+        gpuData.toxyz = toxyzf;
+        gpuData.expScale = exp_scale;
+        gpuData.comp = comp;
+        gpuData.hlRange = hlrange;
+        gpuData.toneCurveBlack = tone_curve_black;
+        gpuData.clampOog = params->toneCurve.clampOOG;
+        gpuData.mixChannels = mixchannels;
+        gpuData.rgbCurveMask = rgbCurveMask;
+
+        if (opencl::rgbProc(working, lab, gpuData)) {
+            return;
+        }
     }
 
     // For tonecurve histogram

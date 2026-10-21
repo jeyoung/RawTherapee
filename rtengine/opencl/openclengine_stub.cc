@@ -97,6 +97,16 @@ bool transformRotateScale(const Imagefloat*, Imagefloat*, int, int, int, int,
     return false;
 }
 
+bool rgbProcAvailable()
+{
+    return false;
+}
+
+bool rgbProc(const Imagefloat*, LabImage*, const RgbProcData&)
+{
+    return false;
+}
+
 bool labToSrgbOut(const LabImage*, Imagefloat*, int, int, int, int)
 {
     return false;

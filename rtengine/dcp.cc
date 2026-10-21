@@ -832,6 +832,12 @@ DCPProfileApplyState::DCPProfileApplyState() :
 
 DCPProfileApplyState::~DCPProfileApplyState() = default;
 
+bool DCPProfileApplyState::isIdentity() const
+{
+    return !data->use_tone_curve && !data->apply_look_table
+        && data->bl_scale == 1.0f;
+}
+
 DCPProfile::DCPProfile(const Glib::ustring& filename) :
     has_color_matrix_1(false),
     has_color_matrix_2(false),

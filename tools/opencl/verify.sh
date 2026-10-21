@@ -8,6 +8,7 @@
 #    tools/opencl/verify.sh --quick
 #    tools/opencl/verify.sh --formats
 #    tools/opencl/verify.sh --monitor
+#    tools/opencl/verify.sh --rgbproc
 #    tools/opencl/verify.sh --list-coverage
 #
 #  Environment:
@@ -34,6 +35,7 @@ sample_override=""
 compare_cmd=()
 has_device=0
 expect_stage=0
+expect_stage_name=""
 
 usage() {
     awk 'NR > 1 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "$0"
@@ -167,10 +169,16 @@ run_pair() {
         return 1
     fi
 
-    if [ "$expect_stage" -eq 1 ] && ! grep -q '^opencl ' "$outdir/auto.log"; then
-        printf 'FAIL\t%s\tOpenCL stage did not run\n' "$label"
-        rm -rf "$outdir"
-        return 1
+    if [ "$expect_stage" -eq 1 ]; then
+        local stage_pattern="^opencl "
+        if [ -n "$expect_stage_name" ]; then
+            stage_pattern="^opencl ${expect_stage_name}:"
+        fi
+        if ! grep -q "$stage_pattern" "$outdir/auto.log"; then
+            printf 'FAIL\t%s\tOpenCL stage did not run\n' "$label"
+            rm -rf "$outdir"
+            return 1
+        fi
     fi
 
     local result="PASS"
@@ -251,6 +259,25 @@ monitor() {
     run_monitor
 }
 
+rgbproc() {
+    local sample="${sample_override:-$TESTDATA/colorspace_flowers.pef}"
+    local profile="$ROOT/devnotes/opencl/pp3/rgbproc-exposure.pp3"
+
+    [ -f "$sample" ] || die "missing $sample (run tools/opencl/fetch-testdata.sh)"
+    [ -f "$profile" ] || die "missing profile $profile"
+
+    printf 'binary\t%s\n' "$cli"
+    "$cli" --gpu-info | tail -n +2 | sed 's/^/gpu\t/'
+    detect_device
+
+    export RT_OPENCL_RGBPROC=1
+    expect_stage=1
+    expect_stage_name="rgbproc"
+
+    run_pair "pef/rgbproc-neutral" "$sample"
+    run_pair "pef/rgbproc-exposure" "$sample" "$profile"
+}
+
 formats() {
     [ -f "$MANIFEST" ] || die "missing manifest: $MANIFEST"
     detect_device
@@ -312,6 +339,7 @@ while [ "$#" -gt 0 ]; do
         --quick) mode="quick" ;;
         --formats) mode="formats" ;;
         --monitor) mode="monitor" ;;
+        --rgbproc) mode="rgbproc" ;;
         --stage)
             [ "$#" -ge 2 ] || die "--stage needs a name"
             mode="stage"
@@ -338,6 +366,7 @@ case "$mode" in
     quick) quick ;;
     formats) formats ;;
     monitor) monitor ;;
+    rgbproc) rgbproc ;;
     stage) stage "$stage_name" ;;
     coverage) list_coverage ;;
 esac

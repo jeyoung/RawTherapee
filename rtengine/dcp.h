@@ -142,6 +142,9 @@ public:
     DCPProfileApplyState();
     ~DCPProfileApplyState();
 
+    /** @brief True when step 2 would leave the pixel values unchanged. */
+    bool isIdentity() const;
+
 private:
     struct Data;
 

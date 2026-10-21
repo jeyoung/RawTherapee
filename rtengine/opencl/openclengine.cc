@@ -57,6 +57,7 @@ namespace
 
 thread_local bool threadStageAllowed = false;
 std::atomic<bool> labToRgbUnavailable{false};
+std::atomic<bool> rgbProcUnavailable{false};
 
 struct Backend {
     std::unique_ptr<Glib::Module> module;
@@ -479,6 +480,222 @@ __kernel void rt_lab_to_srgb8(__global const float* labL,
     dst[out] = rt_to_u8(rt_gamma_lookup(gammaLut, rgb.x));
     dst[out + 1] = rt_to_u8(rt_gamma_lookup(gammaLut, rgb.y));
     dst[out + 2] = rt_to_u8(rt_gamma_lookup(gammaLut, rgb.z));
+}
+)";
+
+const char* rgbProcKernelSource = R"(
+#pragma OPENCL FP_CONTRACT OFF
+
+inline float rt_lut(__global const float* lut, const float value)
+{
+    const float clamped = clamp(value, 0.0f, 65535.0f);
+    const int index = (int)clamped;
+    const int upper = min(index + 1, 65535);
+    const float fraction = clamped - (float)index;
+    return lut[index] + (lut[upper] - lut[index]) * fraction;
+}
+
+inline float rt_hlcurve(const float expScale, const float comp,
+                        const float hlRange, const float level)
+{
+    if (comp > 0.0f) {
+        float val = level + (hlRange - 65536.0f);
+
+        if (val == 0.0f) {
+            val = 0.000001f;
+        }
+
+        float Y = val * expScale / hlRange;
+        Y *= comp;
+
+        if (Y <= -1.0f) {
+            Y = -0.999999f;
+        }
+
+        const float R = hlRange / (val * comp);
+        return log1p(Y) * R;
+    }
+
+    return expScale;
+}
+
+inline void rt_filmlike_clip_tone(float* r, float* g, float* b, const float L)
+{
+    const float rr = *r > L ? L : *r;
+    const float bb = *b > L ? L : *b;
+    const float gg = bb + ((rr - bb) * (*g - *b) / (*r - *b));
+    *r = rr;
+    *g = gg;
+    *b = bb;
+}
+
+inline void rt_filmlike_clip(float* r, float* g, float* b)
+{
+    const float L = 65535.0f;
+
+    if (*r >= *g) {
+        if (*g > *b) {
+            rt_filmlike_clip_tone(r, g, b, L);
+        } else if (*b > *r) {
+            rt_filmlike_clip_tone(b, r, g, L);
+        } else if (*b > *g) {
+            rt_filmlike_clip_tone(r, b, g, L);
+        } else {
+            *r = *r > L ? L : *r;
+            *g = *g > L ? L : *g;
+            *b = *g;
+        }
+    } else {
+        if (*r >= *b) {
+            rt_filmlike_clip_tone(g, r, b, L);
+        } else if (*b > *g) {
+            rt_filmlike_clip_tone(b, g, r, L);
+        } else {
+            rt_filmlike_clip_tone(g, b, r, L);
+        }
+    }
+}
+
+inline float rt_compute_f(__global const float* cachef, const float value)
+{
+    if (value < 0.0f) {
+        return 327.68f * ((903.2962962962963f * value / 65535.0f + 16.0f)
+                          / 116.0f);
+    }
+    if (value > 65535.0f) {
+        return 327.68f * cbrt(value / 65535.0f);
+    }
+    return rt_lut(cachef, value);
+}
+
+inline float rt_compute_fy(__global const float* cachefy, const float value)
+{
+    if (value < 0.0f) {
+        return 327.68f * (903.2962962962963f * value / 65535.0f);
+    }
+    if (value > 65535.0f) {
+        return 327.68f * (116.0f * cbrt(value / 65535.0f) - 16.0f);
+    }
+    return rt_lut(cachefy, value);
+}
+
+__kernel void rt_rgb_proc(__global const float* srcR,
+                          __global const float* srcG,
+                          __global const float* srcB,
+                          __global float* dstL,
+                          __global float* dstA,
+                          __global float* dstB,
+                          __global const float* hlLut,
+                          __global const float* shLut,
+                          __global const float* toneLut,
+                          __global const float* rLut,
+                          __global const float* gLut,
+                          __global const float* bLut,
+                          __global const float* cachef,
+                          __global const float* cachefy,
+                          __global const float* channelMixer,
+                          __global const float* toxyz,
+                          const int width,
+                          const int height,
+                          const float expScale,
+                          const float comp,
+                          const float hlRange,
+                          const int toneCurveBlack,
+                          const int clampOog,
+                          const int mixChannels,
+                          const int rgbCurveMask)
+{
+    const int x = get_global_id(0);
+    const int y = get_global_id(1);
+
+    if (x >= width || y >= height) {
+        return;
+    }
+
+    const int index = y * width + x;
+    float r = srcR[index];
+    float g = srcG[index];
+    float b = srcB[index];
+
+    if (mixChannels) {
+        const float rmix = (r * channelMixer[0] + g * channelMixer[1]
+                            + b * channelMixer[2]) / 100.0f;
+        const float gmix = (r * channelMixer[3] + g * channelMixer[4]
+                            + b * channelMixer[5]) / 100.0f;
+        const float bmix = (r * channelMixer[6] + g * channelMixer[7]
+                            + b * channelMixer[8]) / 100.0f;
+        r = rmix;
+        g = gmix;
+        b = bmix;
+    }
+
+    float toneFactor;
+
+    if (fmax(r, fmax(g, b)) >= 65535.0f) {
+        toneFactor = ((r < 65535.0f ? rt_lut(hlLut, r)
+                                    : rt_hlcurve(expScale, comp, hlRange, r))
+                      + (g < 65535.0f ? rt_lut(hlLut, g)
+                                      : rt_hlcurve(expScale, comp, hlRange, g))
+                      + (b < 65535.0f ? rt_lut(hlLut, b)
+                                      : rt_hlcurve(expScale, comp, hlRange, b)))
+            / 3.0f;
+    } else {
+        toneFactor = (rt_lut(hlLut, r) + rt_lut(hlLut, g)
+                      + rt_lut(hlLut, b)) / 3.0f;
+    }
+
+    r *= toneFactor;
+    g *= toneFactor;
+    b *= toneFactor;
+
+    if (toneCurveBlack != 0) {
+        const float Y = 0.299f * r + 0.587f * g + 0.114f * b;
+        toneFactor = rt_lut(shLut, Y);
+        r *= toneFactor;
+        g *= toneFactor;
+        b *= toneFactor;
+    }
+
+    if (clampOog != 0) {
+        r = fmax(r, 0.0f);
+        g = fmax(g, 0.0f);
+        b = fmax(b, 0.0f);
+
+        if (r > 65535.0f || g > 65535.0f || b > 65535.0f) {
+            rt_filmlike_clip(&r, &g, &b);
+        }
+    }
+
+    if (r >= 0.0f && r <= 65535.0f) {
+        r = rt_lut(toneLut, r);
+    }
+    if (g >= 0.0f && g <= 65535.0f) {
+        g = rt_lut(toneLut, g);
+    }
+    if (b >= 0.0f && b <= 65535.0f) {
+        b = rt_lut(toneLut, b);
+    }
+
+    if ((rgbCurveMask & 1) != 0 && r >= 0.0f && r <= 65535.0f) {
+        r = rt_lut(rLut, r);
+    }
+    if ((rgbCurveMask & 2) != 0 && g >= 0.0f && g <= 65535.0f) {
+        g = rt_lut(gLut, g);
+    }
+    if ((rgbCurveMask & 4) != 0 && b >= 0.0f && b <= 65535.0f) {
+        b = rt_lut(bLut, b);
+    }
+
+    const float X = toxyz[0] * r + toxyz[1] * g + toxyz[2] * b;
+    const float Y = toxyz[3] * r + toxyz[4] * g + toxyz[5] * b;
+    const float Z = toxyz[6] * r + toxyz[7] * g + toxyz[8] * b;
+    const float fx = rt_compute_f(cachef, X);
+    const float fy = rt_compute_f(cachef, Y);
+    const float fz = rt_compute_f(cachef, Z);
+
+    dstL[index] = rt_compute_fy(cachefy, Y);
+    dstA[index] = 500.0f * (fx - fy);
+    dstB[index] = 200.0f * (fy - fz);
 }
 )";
 
@@ -1406,6 +1623,7 @@ void shutdown()
     state.loaded = false;
     state.selected = -1;
     labToRgbUnavailable = false;
+    rgbProcUnavailable = false;
     state.error = "OpenCL is unavailable";
 }
 
@@ -2308,6 +2526,259 @@ bool labToRgb8(const LabImage* src, Image8* dst,
 
     return labToRgb(src, 0, 0, src->W, src->H, matrix, gammaLut,
                     LabOutputKind::Uchar8, nullptr, dst);
+}
+
+bool rgbProcAvailable()
+{
+    return !rgbProcUnavailable;
+}
+
+bool rgbProc(const Imagefloat* src, LabImage* dst, const RgbProcData& data)
+{
+    if (src == nullptr || dst == nullptr || data.hlToneCurve == nullptr
+            || data.toneCurve == nullptr || data.cachef == nullptr
+            || data.cachefy == nullptr || data.toxyz == nullptr
+            || src->getWidth() <= 0 || src->getHeight() <= 0
+            || dst->W != src->getWidth() || dst->H != src->getHeight()
+            || src->getRowStride() == 0 || dst->L[0] == nullptr
+            || dst->a[0] == nullptr || dst->b[0] == nullptr
+            || (data.mixChannels && data.channelMixer == nullptr)
+            || (data.toneCurveBlack != 0 && data.shToneCurve == nullptr)
+            || ((data.rgbCurveMask & 1) != 0 && data.rCurve == nullptr)
+            || ((data.rgbCurveMask & 2) != 0 && data.gCurve == nullptr)
+            || ((data.rgbCurveMask & 4) != 0 && data.bCurve == nullptr)) {
+        return false;
+    }
+
+    Backend& state = backend();
+    std::lock_guard<std::recursive_mutex> lock(state.mutex);
+
+    if (!ensureInit() || state.infos.empty() || state.selected < 0
+            || !state.stageEnabled || !threadStageAllowed
+            || rgbProcUnavailable) {
+        return false;
+    }
+
+    if (!ensureSession(state)) {
+        return false;
+    }
+
+    StageTimer timer("rgbproc", g_getenv("RT_OPENCL_PROFILE") != nullptr);
+
+    const int width = src->getWidth();
+    const int height = src->getHeight();
+    const size_t planeBytes = static_cast<size_t>(width) * height * sizeof(float);
+    constexpr size_t lutEntries = 65536;
+    const size_t lutBytes = lutEntries * sizeof(float);
+    constexpr size_t matrixEntries = 9;
+    const size_t matrixBytes = matrixEntries * sizeof(float);
+    const size_t totalBytes = 6 * planeBytes + 9 * lutBytes
+        + 2 * matrixBytes;
+    const DeviceInfo& info = state.infos[state.selected];
+
+    if ((info.maxAllocation > 0
+            && (planeBytes > info.maxAllocation
+                || lutBytes > info.maxAllocation
+                || matrixBytes > info.maxAllocation))
+            || !ensureBudget(state, totalBytes)
+            || (info.globalMemory > 0
+                && totalBytes > info.globalMemory * 8 / 10)) {
+        return false;
+    }
+
+    BufferSet buffers;
+    buffers.owner = &state;
+    buffers.api = &state.api;
+    KernelSet kernels;
+    kernels.api = &state.api;
+
+    const auto fatal = []() {
+        rgbProcUnavailable = true;
+        return false;
+    };
+
+    const auto createBuffer = [&](cl_mem_flags flags, size_t bytes,
+                                  const void* host) -> cl_mem {
+        if (host == nullptr && (flags & CL_MEM_COPY_HOST_PTR) == 0) {
+            cl_mem memory = acquireBuffer(state, bytes);
+            return buffers.add(memory, bytes, true);
+        }
+
+        cl_int error = CL_SUCCESS;
+        cl_mem memory = state.api.CreateBuffer(state.context, flags, bytes,
+                                               const_cast<void*>(host), &error);
+
+        if (memory == nullptr || error != CL_SUCCESS) {
+            if (memory != nullptr) {
+                state.api.ReleaseMemObject(memory);
+            }
+            return nullptr;
+        }
+
+        return buffers.add(memory);
+    };
+
+    std::vector<float> identityLut(lutEntries);
+
+    for (size_t i = 0; i < identityLut.size(); ++i) {
+        identityLut[i] = static_cast<float>(i);
+    }
+
+    cl_mem identityBuffer = createBuffer(
+        CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, lutBytes,
+        identityLut.data());
+
+    if (identityBuffer == nullptr) {
+        return false;
+    }
+
+    const auto lutBuffer = [&](const float* lut) -> cl_mem {
+        if (lut == nullptr) {
+            return identityBuffer;
+        }
+
+        return createBuffer(CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                            lutBytes, lut);
+    };
+
+    const float identityMixer[matrixEntries] = {
+        100.0f, 0.0f, 0.0f,
+        0.0f, 100.0f, 0.0f,
+        0.0f, 0.0f, 100.0f
+    };
+    const float* mixer = data.mixChannels ? data.channelMixer : identityMixer;
+
+    cl_mem sourceBuffers[3] = {};
+    cl_mem destBuffers[3] = {};
+    const float* sourcePointers[3] = {src->r(0), src->g(0), src->b(0)};
+    float* destPointers[3] = {dst->L[0], dst->a[0], dst->b[0]};
+    const size_t zeroOrigin[3] = {0, 0, 0};
+    const size_t sourceRegion[3] = {
+        static_cast<size_t>(width) * sizeof(float),
+        static_cast<size_t>(height), 1};
+    const size_t destRegion[3] = {
+        static_cast<size_t>(width) * sizeof(float),
+        static_cast<size_t>(height), 1};
+    const size_t sourceRowPitch = src->getRowStride();
+
+    for (int plane = 0; plane < 3; ++plane) {
+        sourceBuffers[plane] = createBuffer(CL_MEM_READ_ONLY, planeBytes, nullptr);
+        destBuffers[plane] = createBuffer(CL_MEM_WRITE_ONLY, planeBytes, nullptr);
+
+        if (sourceBuffers[plane] == nullptr || destBuffers[plane] == nullptr) {
+            return false;
+        }
+
+        if (state.api.EnqueueWriteBufferRect(
+                state.queue, sourceBuffers[plane], CL_TRUE, zeroOrigin,
+                zeroOrigin, sourceRegion, 0, 0, sourceRowPitch, 0,
+                sourcePointers[plane], 0, nullptr, nullptr) != CL_SUCCESS) {
+            return false;
+        }
+    }
+
+    cl_mem hlBuffer = lutBuffer(data.hlToneCurve);
+    cl_mem shBuffer = lutBuffer(data.shToneCurve);
+    cl_mem toneBuffer = lutBuffer(data.toneCurve);
+    cl_mem rBuffer = lutBuffer(data.rCurve);
+    cl_mem gBuffer = lutBuffer(data.gCurve);
+    cl_mem bBuffer = lutBuffer(data.bCurve);
+    cl_mem cachefBuffer = lutBuffer(data.cachef);
+    cl_mem cachefyBuffer = lutBuffer(data.cachefy);
+    cl_mem mixerBuffer = createBuffer(
+        CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, matrixBytes, mixer);
+    cl_mem toxyzBuffer = createBuffer(
+        CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, matrixBytes, data.toxyz);
+
+    if (hlBuffer == nullptr || shBuffer == nullptr || toneBuffer == nullptr
+            || rBuffer == nullptr || gBuffer == nullptr || bBuffer == nullptr
+            || cachefBuffer == nullptr || cachefyBuffer == nullptr
+            || mixerBuffer == nullptr || toxyzBuffer == nullptr) {
+        return false;
+    }
+
+    std::string error;
+    cl_program program = programFor(state, rgbProcKernelSource,
+                                    "-cl-std=CL1.2", error);
+
+    if (program == nullptr) {
+        if (settings != nullptr && settings->verbose && !error.empty()) {
+            std::fprintf(stderr, "OpenCL: %s\n", error.c_str());
+        }
+        rgbProcUnavailable = true;
+        return false;
+    }
+
+    cl_int status = CL_SUCCESS;
+    cl_kernel kernel = kernels.add(
+        state.api.CreateKernel(program, "rt_rgb_proc", &status));
+
+    if (kernel == nullptr || status != CL_SUCCESS) {
+        rgbProcUnavailable = true;
+        return false;
+    }
+
+    const cl_int widthArg = width;
+    const cl_int heightArg = height;
+    const cl_int toneCurveBlackArg = data.toneCurveBlack;
+    const cl_int clampOogArg = data.clampOog ? 1 : 0;
+    const cl_int mixChannelsArg = data.mixChannels ? 1 : 0;
+    const cl_int rgbCurveMaskArg = data.rgbCurveMask;
+    status = CL_SUCCESS;
+    status |= state.api.SetKernelArg(kernel, 0, sizeof(cl_mem), &sourceBuffers[0]);
+    status |= state.api.SetKernelArg(kernel, 1, sizeof(cl_mem), &sourceBuffers[1]);
+    status |= state.api.SetKernelArg(kernel, 2, sizeof(cl_mem), &sourceBuffers[2]);
+    status |= state.api.SetKernelArg(kernel, 3, sizeof(cl_mem), &destBuffers[0]);
+    status |= state.api.SetKernelArg(kernel, 4, sizeof(cl_mem), &destBuffers[1]);
+    status |= state.api.SetKernelArg(kernel, 5, sizeof(cl_mem), &destBuffers[2]);
+    status |= state.api.SetKernelArg(kernel, 6, sizeof(cl_mem), &hlBuffer);
+    status |= state.api.SetKernelArg(kernel, 7, sizeof(cl_mem), &shBuffer);
+    status |= state.api.SetKernelArg(kernel, 8, sizeof(cl_mem), &toneBuffer);
+    status |= state.api.SetKernelArg(kernel, 9, sizeof(cl_mem), &rBuffer);
+    status |= state.api.SetKernelArg(kernel, 10, sizeof(cl_mem), &gBuffer);
+    status |= state.api.SetKernelArg(kernel, 11, sizeof(cl_mem), &bBuffer);
+    status |= state.api.SetKernelArg(kernel, 12, sizeof(cl_mem), &cachefBuffer);
+    status |= state.api.SetKernelArg(kernel, 13, sizeof(cl_mem), &cachefyBuffer);
+    status |= state.api.SetKernelArg(kernel, 14, sizeof(cl_mem), &mixerBuffer);
+    status |= state.api.SetKernelArg(kernel, 15, sizeof(cl_mem), &toxyzBuffer);
+    status |= state.api.SetKernelArg(kernel, 16, sizeof(cl_int), &widthArg);
+    status |= state.api.SetKernelArg(kernel, 17, sizeof(cl_int), &heightArg);
+    status |= state.api.SetKernelArg(kernel, 18, sizeof(cl_float), &data.expScale);
+    status |= state.api.SetKernelArg(kernel, 19, sizeof(cl_float), &data.comp);
+    status |= state.api.SetKernelArg(kernel, 20, sizeof(cl_float), &data.hlRange);
+    status |= state.api.SetKernelArg(kernel, 21, sizeof(cl_int), &toneCurveBlackArg);
+    status |= state.api.SetKernelArg(kernel, 22, sizeof(cl_int), &clampOogArg);
+    status |= state.api.SetKernelArg(kernel, 23, sizeof(cl_int), &mixChannelsArg);
+    status |= state.api.SetKernelArg(kernel, 24, sizeof(cl_int), &rgbCurveMaskArg);
+
+    if (status != CL_SUCCESS) {
+        rgbProcUnavailable = true;
+        return false;
+    }
+
+    const size_t global[2] = {
+        static_cast<size_t>(width), static_cast<size_t>(height)};
+
+    if (state.api.EnqueueNDRangeKernel(state.queue, kernel, 2, nullptr, global,
+                                       nullptr, 0, nullptr, nullptr) != CL_SUCCESS) {
+        return fatal();
+    }
+
+    if (state.api.Finish(state.queue) != CL_SUCCESS) {
+        return fatal();
+    }
+
+    for (int plane = 0; plane < 3; ++plane) {
+        if (state.api.EnqueueReadBufferRect(
+                state.queue, destBuffers[plane], CL_TRUE, zeroOrigin,
+                zeroOrigin, destRegion, 0, 0,
+                static_cast<size_t>(width) * sizeof(float), 0,
+                destPointers[plane], 0, nullptr, nullptr) != CL_SUCCESS) {
+            return fatal();
+        }
+    }
+
+    return true;
 }
 
 void setStageAllowed(bool allowed)

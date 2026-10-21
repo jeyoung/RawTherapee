@@ -87,6 +87,33 @@ bool transformRotateScale(const Imagefloat* src, Imagefloat* dst,
                           double cost, double sint, bool highQuality,
                           bool useLog);
 
+/** @brief Inputs for the basic RGB tone and Lab conversion stage. */
+struct RgbProcData {
+    const float* hlToneCurve = nullptr;
+    const float* shToneCurve = nullptr;
+    const float* toneCurve = nullptr;
+    const float* rCurve = nullptr;
+    const float* gCurve = nullptr;
+    const float* bCurve = nullptr;
+    const float* cachef = nullptr;
+    const float* cachefy = nullptr;
+    const float* channelMixer = nullptr;
+    const float* toxyz = nullptr;
+    float expScale = 1.0f;
+    float comp = 0.0f;
+    float hlRange = 65536.0f;
+    int toneCurveBlack = 0;
+    bool clampOog = true;
+    bool mixChannels = false;
+    int rgbCurveMask = 0;
+};
+
+/** @brief True when the basic RGB tone stage has not been disabled by a failure. */
+bool rgbProcAvailable();
+
+/** @brief Run the basic RGB tone and Lab conversion stage on the GPU. */
+bool rgbProc(const Imagefloat* src, LabImage* dst, const RgbProcData& data);
+
 /** @brief Convert a Lab sub-image to sRGB output, matching the CPU path. */
 bool labToSrgbOut(const LabImage* src, Imagefloat* dst,
                   int cx, int cy, int cw, int ch);

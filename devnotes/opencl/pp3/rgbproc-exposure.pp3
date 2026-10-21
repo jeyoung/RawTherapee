@@ -1,0 +1,6 @@
+[Exposure]
+Compensation=1.0
+HighlightCompr=50
+HighlightComprThreshold=20
+Black=15
+ClampOOG=true
