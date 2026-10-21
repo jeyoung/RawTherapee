@@ -186,7 +186,26 @@ pre-existing multithreaded 1-LSB variation: fast dcraw matched the LibRaw
 baseline with `compare -metric AE` = 0 for both files. A forced dcraw failure
 also retried through LibRaw and matched the same baseline.
 
+### dcraw longjmp containment
+
+`RawImage::runDcrawLoadRaw` is a noinline helper that installs
+`setjmp(failure)` and calls `load_raw`. It has no C++ objects with destructors
+between the jump point and the decoder call; the `LoadProfile` timers remain in
+the caller. A nonzero jump is converted into a normal load result.
+
+The `raw_image` and `image` allocations are checked before the helper and use
+the same error path. On a jump or allocation failure with
+`RT_FAST_DECODER=1`, the partial dcraw state is freed, the file position is
+reset, and the load retries through LibRaw with
+`decoder fallback [dcraw allocation]`. If LibRaw is disabled, the load returns
+`RAWIMAGE_LOAD_ERROR` instead of falling back.
+
+A temporary test hook forced `merror(nullptr, "test")` inside the helper. Both
+the PEF and NEF retried through LibRaw with exact 16-bit TIFF parity, while the
+forced-dcraw path returned an error and produced no output. The hook was
+removed before committing.
+
 Test gaps: X-Trans, DNG, Canon/Sony and other makes remain on LibRaw until
 parity is established; multi-frame and special layouts are excluded by design.
-dcraw allocation failure through its `longjmp` path is not recoverable and is
-not converted into a fallback.
+The longjmp path is contained, but scratch buffers allocated inside the failing
+dcraw decoder may still leak until process exit.

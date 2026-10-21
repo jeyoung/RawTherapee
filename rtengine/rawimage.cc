@@ -23,9 +23,18 @@
 #include "utils.h"
 #include "rtengine.h"
 
+#if defined(_MSC_VER)
+#define RT_RAWIMAGE_NOINLINE __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+#define RT_RAWIMAGE_NOINLINE __attribute__((noinline))
+#else
+#define RT_RAWIMAGE_NOINLINE
+#endif
 
 namespace
 {
+
+constexpr int RAWIMAGE_LOAD_ERROR = 200;
 
 const std::string MAKE_PENTAX = "Pentax";
 const std::string MAKE_SAMSUNG = "Samsung";
@@ -581,6 +590,17 @@ skip_block:
     }
 }
 
+RT_RAWIMAGE_NOINLINE int RawImage::runDcrawLoadRaw()
+{
+    const int jump = setjmp(failure);
+
+    if (jump == 0) {
+        (this->*load_raw)();
+    }
+
+    return jump;
+}
+
 int RawImage::loadRaw(bool loadData, unsigned int imageNum, bool closeFile, ProgressListener *plistener, double progressRange, bool allowDirectRawPlane, bool preferDcraw)
 {
     const bool fastDcrawAttempt = loadData && preferDcraw
@@ -985,29 +1005,40 @@ int RawImage::loadRaw(bool loadData, unsigned int imageNum, bool closeFile, Prog
 
             if (filters || colors == 1) {
                 raw_image = (ushort *) calloc ((static_cast<unsigned int>(raw_height) + 7u) * static_cast<unsigned int>(raw_width), 2);
-                merror(raw_image, "main()");
+
+                if (raw_image == nullptr) {
+                    if (fastDcrawAttempt) {
+                        dcrawTimer.stop();
+                        unpackTimer.stop();
+                        return fallbackToLibRaw("dcraw allocation");
+                    }
+
+                    return RAWIMAGE_LOAD_ERROR;
+                }
             }
 
             // dcraw needs this global variable to hold pixel data
             image = (dcrawImage_t)calloc (static_cast<unsigned int>(height) * static_cast<unsigned int>(width) * sizeof * image + meta_length, 1);
-            if(!image) {
-                return 200;
+
+            if (!image) {
+                if (fastDcrawAttempt) {
+                    dcrawTimer.stop();
+                    unpackTimer.stop();
+                    return fallbackToLibRaw("dcraw allocation");
+                }
+
+                return RAWIMAGE_LOAD_ERROR;
             }
+
             meta_data = (char *) (image + static_cast<unsigned int>(height) * static_cast<unsigned int>(width));
 
-            /* Issue 2467
-                  if (setjmp (failure)) {
-                      if (image) { free (image); image=NULL; }
-                      if (raw_image) { free(raw_image); raw_image=NULL; }
-                      fclose(ifp); ifp=NULL;
-                      return 100;
-                  }
-            */
             // Load raw pixels data
             fseek(ifp, data_offset, SEEK_SET);
 
+            int jump = 0;
+
             try {
-                (this->*load_raw)();
+                jump = runDcrawLoadRaw();
             } catch (...) {
                 if (fastDcrawAttempt) {
                     dcrawTimer.stop();
@@ -1015,6 +1046,16 @@ int RawImage::loadRaw(bool loadData, unsigned int imageNum, bool closeFile, Prog
                     return fallbackToLibRaw("decode exception");
                 }
                 throw;
+            }
+
+            if (jump != 0) {
+                if (fastDcrawAttempt) {
+                    dcrawTimer.stop();
+                    unpackTimer.stop();
+                    return fallbackToLibRaw("dcraw allocation");
+                }
+
+                return RAWIMAGE_LOAD_ERROR;
             }
 
             if (fastDcrawAttempt) {
@@ -1083,7 +1124,7 @@ int RawImage::loadRaw(bool loadData, unsigned int imageNum, bool closeFile, Prog
                 try {
                     image_from_float.reset(new std::remove_pointer<dcrawImage_t>::type[image_size]);
                 } catch (const std::bad_alloc &e) {
-                    return 200;
+                    return RAWIMAGE_LOAD_ERROR;
                 }
                 std::fill(&image_from_float[0][0], &image_from_float[0][0] + image_size, 0);
 

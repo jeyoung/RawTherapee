@@ -77,6 +77,7 @@ protected:
     Decoder decoder{Decoder::DCRAW};
     std::unique_ptr<LibRaw> libraw;
     std::unique_ptr<std::remove_pointer<dcrawImage_t>::type[]> image_from_float;
+    int runDcrawLoadRaw();
     const char* fastDcrawFallbackReason() const;
     const char* fastDcrawDataFallbackReason() const;
     const char* directRawPlaneFallbackReason() const;
