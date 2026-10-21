@@ -794,6 +794,17 @@ Gtk::Widget* Preferences::getImageProcessingPanel ()
     enableLibRaw = Gtk::manage(new Gtk::CheckButton());
     enableLibRaw->add(*Gtk::manage(new Gtk::Label(M("PREFERENCES_RAW_DECODER_ENABLE_LIBRAW"))));
     rawDecoderContainer->pack_start(*enableLibRaw);
+
+    fastRawDecoder = Gtk::manage(new Gtk::CheckButton());
+    fastRawDecoder->add(*Gtk::manage(new Gtk::Label(M("PREFERENCES_RAW_DECODER_FAST"))));
+    fastRawDecoder->set_tooltip_text(M("PREFERENCES_RAW_DECODER_FAST_TOOLTIP"));
+    fastRawDecoder->set_sensitive(enableLibRaw->get_active());
+    enableLibRaw->signal_toggled().connect(
+        [this]() {
+            fastRawDecoder->set_sensitive(enableLibRaw->get_active());
+        });
+    rawDecoderContainer->pack_start(*fastRawDecoder);
+
     vbImageProcessing->pack_start(*rawDecoderFrame, Gtk::PACK_SHRINK, 4);
 
     // Other: max zoom
@@ -2186,6 +2197,7 @@ void Preferences::storePreferences()
     moptions.maxZoomLimit = Options::MaxZoom(maxZoomCombo->get_active_row_number());
 
     moptions.rtSettings.enableLibRaw = enableLibRaw->get_active();
+    moptions.rtSettings.fastRawDecoder = fastRawDecoder->get_active();
 
     toolLocationPreference->updateOptions();
 
@@ -2446,6 +2458,8 @@ void Preferences::fillPreferences()
     maxZoomCombo->set_active(static_cast<int>(options.maxZoomLimit));
 
     enableLibRaw->set_active(moptions.rtSettings.enableLibRaw);
+    fastRawDecoder->set_active(moptions.rtSettings.fastRawDecoder);
+    fastRawDecoder->set_sensitive(enableLibRaw->get_active());
 
     addc.block(false);
     setc.block(false);

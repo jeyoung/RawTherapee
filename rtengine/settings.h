@@ -52,6 +52,7 @@ public:
     Glib::ustring   cameraProfilesPath;     ///< The default directory for camera profiles
     Glib::ustring   lensProfilesPath;       ///< The default directory for lens profiles
     bool            enableLibRaw;           ///< Use LibRaw to decode raw images.
+    bool            fastRawDecoder;         ///< Prefer the legacy decoder when supported.
 
     bool            useOpenCL;              ///< Enable OpenCL acceleration when available.
     int             openCLMode;             ///< 0 = export only, 1 = preview and export.

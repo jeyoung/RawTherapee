@@ -64,11 +64,13 @@ namespace
 
 bool fastDecoderEnabled()
 {
-    static const bool enabled = []() {
-        const char* value = g_getenv("RT_FAST_DECODER");
-        return value != nullptr && g_strcmp0(value, "1") == 0;
-    }();
-    return enabled;
+    const char* value = g_getenv("RT_FAST_DECODER");
+
+    if (value != nullptr && g_strcmp0(value, "1") == 0) {
+        return true;
+    }
+
+    return rtengine::settings != nullptr && rtengine::settings->fastRawDecoder;
 }
 
 float clipitc(float x)

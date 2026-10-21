@@ -252,6 +252,7 @@ class Preferences final :
     Gtk::CheckButton *cropAutoFitCB;
 
     Gtk::CheckButton *enableLibRaw;
+    Gtk::CheckButton *fastRawDecoder;
 
     Gtk::ComboBoxText *maxZoomCombo;
 
