@@ -32,6 +32,7 @@
 #include "imagefloat.h"
 #include "improcfun.h"
 #include "jaggedarray.h"
+#include "loadprofile.h"
 #include "median.h"
 #include "mytime.h"
 #include "pdaflinesfilter.h"
@@ -759,6 +760,9 @@ void RawImageSource::getImage(const ColorTemp &ctemp, int tran, Imagefloat* imag
 {
     assert(checkRawDataDimensions(rawData, *ri, W, H));
 
+    LoadProfile::Timer profileTimer("getImage",
+                                    &LoadProfile::state().getImageSeen);
+
     MyMutex::MyLock lock(getImageMutex);
 
     tran = defTransform(ri, tran);
@@ -1296,6 +1300,9 @@ int RawImageSource::load(const Glib::ustring &fname, bool firstFrameOnly)
     rawDataBuffer.resize(riFrames.size() - 1);
 
     if (!errCode) {
+        LoadProfile::Timer compressTimer("compress_image", nullptr, nullptr,
+                                         true);
+
         for (unsigned int i = 0; i < numFrames; ++i) {
             riFrames[i]->compress_image(i);
         }
@@ -1439,6 +1446,9 @@ int RawImageSource::load(const Glib::ustring &fname, bool firstFrameOnly)
 void RawImageSource::preprocess(const RAWParams &raw, const LensProfParams &lensProf, const CoarseTransformParams& coarse, float &reddeha, float &greendeha, float &bluedeha,  bool prepareDenoise)
 {
 //    BENCHFUN
+    LoadProfile::Timer profileTimer("preprocess",
+                                    &LoadProfile::state().preprocessSeen);
+
     MyTime t1, t2;
     t1.set();
 
@@ -1799,6 +1809,20 @@ void RawImageSource::demosaic(const RAWParams &raw, bool autoContrast, double &c
 
     MyTime t1, t2;
     t1.set();
+
+    const char* demosaicMethod = "rgb";
+
+    if (ri->getSensorType() == ST_BAYER) {
+        demosaicMethod = raw.bayersensor.method.c_str();
+    } else if (ri->getSensorType() == ST_FUJI_XTRANS) {
+        demosaicMethod = raw.xtranssensor.method.c_str();
+    } else if (ri->get_colors() == 1) {
+        demosaicMethod = "mono";
+    }
+
+    LoadProfile::Timer profileTimer("demosaic",
+                                    &LoadProfile::state().demosaicSeen,
+                                    demosaicMethod);
 
     const auto& options = App::get().options();
     if (ri->getSensorType() == ST_BAYER) {

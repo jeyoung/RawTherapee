@@ -17,6 +17,7 @@
  *  along with RawTherapee.  If not, see <https://www.gnu.org/licenses/>.
  */
 #include "rtengine.h"
+#include "loadprofile.h"
 #include "stdimagesource.h"
 #include "rawimagesource.h"
 
@@ -25,6 +26,10 @@ namespace rtengine
 
 InitialImage* InitialImage::load (const Glib::ustring& fname, bool isRaw, int* errorCode, ProgressListener* pl)
 {
+
+    LoadProfile::Session profileSession;
+    LoadProfile::Timer totalTimer("initial_image.load", nullptr,
+                                  fname.c_str());
 
     ImageSource* isrc;
 

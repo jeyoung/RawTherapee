@@ -16,6 +16,7 @@
 #include <libraw/libraw.h>
 
 #include "image8.h"
+#include "loadprofile.h"
 #include "rawimage.h"
 #include "settings.h"
 #include "camconst.h"
@@ -598,6 +599,12 @@ int RawImage::loadRaw(bool loadData, unsigned int imageNum, bool closeFile, Prog
         return 3;
     }
 
+    // The same metadata is parsed once for the probe and again when the data
+    // is loaded, so label both occurrences.
+    LoadProfile::Timer metadataTimer("raw metadata", nullptr,
+                                     loadData ? "data load" : "probe",
+                                     true);
+
     imfile_set_plistener(ifp, plistener, 0.9 * progressRange);
 
     thumb_length = 0;
@@ -881,7 +888,12 @@ int RawImage::loadRaw(bool loadData, unsigned int imageNum, bool closeFile, Prog
         this->rotate_deg = 0;
     }
 
+    metadataTimer.stop();
+
     if (loadData) {
+        LoadProfile::Timer unpackTimer(
+            "raw unpack", nullptr,
+            decoder == Decoder::LIBRAW ? "libraw" : "dcraw", true);
 
         use_camera_wb = 1;
         shrink = 0;
@@ -1028,6 +1040,8 @@ int RawImage::loadRaw(bool loadData, unsigned int imageNum, bool closeFile, Prog
         if (plistener) {
             plistener->setProgress(0.9 * progressRange);
         }
+
+        unpackTimer.stop();
 
         CameraConstantsStore* ccs = CameraConstantsStore::getInstance();
         const CameraConst *cc = ccs->get(make, model);

@@ -39,6 +39,7 @@
 #include "metadata.h"
 #include "labimage.h"
 #include "lcp.h"
+#include "loadprofile.h"
 #include "procparams.h"
 #include "profiling.h"
 #include "tweakoperator.h"
@@ -401,6 +402,8 @@ void ImProcCoordinator::updatePreviewImage(int todo, bool panningRelatedChange,
 
     PreviewTimer previewTimer(todo,
                               g_getenv("RT_PREVIEW_PROFILE") != nullptr);
+    LoadProfile::Timer pipelineTimer(
+        "preview pipeline", &LoadProfile::state().pipelineSeen);
 
     const auto prevdemo = App::get().options().prevdemo;
     ipf.setOpenCLAllowed(App::get().options().rtSettings.useOpenCL
@@ -2834,6 +2837,9 @@ void ImProcCoordinator::updatePreviewImage(int todo, bool panningRelatedChange,
 
             if (imageListener) {
                 imageListener->setImage(previmg, scale, params->crop, params->cropGuide);
+                LoadProfile::markFirst(
+                    "preview setImage",
+                    LoadProfile::state().setImageSeen);
             }
         }
 
@@ -2841,6 +2847,9 @@ void ImProcCoordinator::updatePreviewImage(int todo, bool panningRelatedChange,
             // TODO: The WB tool should be advertised too in order to get the AutoWB's temp and green values
         {
             imageListener->imageReady(params->crop, params->cropGuide);
+            LoadProfile::markFirst(
+                "preview imageReady",
+                LoadProfile::state().imageReadySeen);
         }
 
         hist_lrgb_dirty = vectorscope_hc_dirty = vectorscope_hs_dirty = waveform_dirty = true;
