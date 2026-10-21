@@ -209,4 +209,5 @@ matrix/TRC path, which only pays off when it replaces lcms.
 | BPC filename heuristic was fragile | Use `cmsDetectDestinationBlackPoint()` and require a zero black point when BPC is on |
 | GPU could run when lcms transform creation failed | Require `monitorTransform != nullptr` before setting the GPU-ready flag |
 | No minimum-size gate | Remaining work; small detail crops may still favour lcms |
+| No committed monitor regression test | `--gpu-test-monitor` and `verify.sh --monitor` compare CPU lcms with GPU on deterministic full-range Lab |
 | GPU-ready fields are unsynchronised | Current coordinator/crop call graph serialises them; document if a future caller changes ownership |
