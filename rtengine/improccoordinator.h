@@ -104,8 +104,11 @@ protected:
     std::atomic<bool> viewportStateValid;
     std::atomic<bool> viewportHighDetail;
     std::atomic<bool> forceFullPreview;
+    std::atomic<unsigned> viewportDeferredRequest;
+    std::atomic<bool> deferredCropRendered;
     ProcParams viewportFullParams;
     ProcParams viewportLutParams;
+    ProcParams viewportDeferredParams;
     LUTu viewportZeroLhist;
 
     // Experimental, default-off cache of the preview base image returned by
@@ -255,6 +258,7 @@ protected:
     bool canUseViewportFastPath(int todo, bool highDetailNeeded,
                                 const char*& reason) const;
     void prepareViewportLuts(int todo);
+    void updateViewportLutSnapshot(int todo);
     void renderCrops(int todo, bool force);
     int queueViewportDeferredAnalysis(int todo);
     void markViewportStateValid(bool highDetailNeeded);

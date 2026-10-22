@@ -99,8 +99,10 @@ the same code.
 arrives, the normal bailout merges the old todo into `changeSinceLast`, so the
 deferred analysis is either kept queued or coalesced with the newer request.
 The deferred pass always includes `M_MONITOR` so it cannot be skipped by the
-outer full-frame block condition. It re-renders crops as a correctness check;
-suppressing that second render is a later optimisation.
+outer full-frame block condition. When the deferred request still matches the
+request generation and the full parameter snapshot of the fast path, the full
+pass suppresses the duplicate crop render; a newer request gets a normal crop
+render.
 
 ## State validity and invalidation
 
@@ -108,19 +110,23 @@ The fast path has two snapshots:
 
 - `viewportFullParams`, the pre-pass base/global inputs of the last completed
   full-frame pass;
-- `viewportLutParams`, the last parameter set whose parent LUTs were rebuilt.
+- `viewportLutParams`, per-family snapshots of the last parameters whose tone,
+  Lab and wavelet parent LUTs were actually rebuilt.
 
 State is invalidated on image switch (`assign()`), `freeAll()`, destruction,
 `stopProcessing()`, and `setScale()` dimension or scale changes. It also
 becomes invalid whenever a request bypasses the fast path with a missing or
 mismatched base snapshot. In that case the request is augmented with
-`M_INIT | M_HDR | M_MONITOR`, forcing a real base/analysis rebuild rather than
-marking stale state valid.
+`M_INIT | M_HDR | M_MONITOR` (and `M_SPOT` when spot parameters differ),
+forcing a real base/analysis rebuild rather than marking stale state valid.
 
-`viewportStateValid`, `viewportHighDetail` and `forceFullPreview` are atomic.
-The state is marked valid only after the full-frame block actually ran; a
-request that skipped that block cannot publish a snapshot. High-detail
-preprocess/demosaic flags are reset whenever the state is invalidated.
+`viewportStateValid`, `viewportHighDetail`, `forceFullPreview`,
+`viewportDeferredRequest` and `deferredCropRendered` are atomic. The state is
+marked valid only after the full-frame block actually ran; a request that
+skipped that block cannot publish a snapshot. High-detail preprocess/demosaic
+flags are reset on a new image source (`assign()`) and after
+`saveInputICCReference()`; buffer reallocations do not reset them because the
+source planes remain valid.
 
 ## Profiling
 
@@ -155,7 +161,7 @@ and a fresh settings directory:
 
 - at fit zoom, fast-path hits took about 40 ms for the visible crop, followed
   by a 92 ms deferred analysis; the existing path took about 113 ms;
-- at 100 % zoom, the visible crop took 33 ms and the deferred analysis 69 ms;
+- at 100 % zoom, the visible crop took 29 ms and the deferred analysis 30 ms;
 - the first edit after opening can fall back once while the startup/default
   profile settles the base snapshot; subsequent edits take the fast path;
 - auto levels produced `viewport=fallback reason=auto-exposure`;
@@ -173,8 +179,6 @@ and a fresh settings directory:
 - Handle active Fattal/dehaze/spot correctly rather than falling back.
 - Validate crop ROI moves, panning/zooming cache reuse and detail windows on a
   wider image set, including OpenCL.
-- Remove the deferred crop re-render once fast-crop exactness has been proven
-  for every supported request class.
 - Validate the spot-reset and base-refresh path and add an automated
   fast-on/off regression for it.
 - Evaluate whether the deferred pass can skip `M_AUTOEXP` entirely when the

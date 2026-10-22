@@ -501,6 +501,8 @@ ImProcCoordinator::ImProcCoordinator() :
     viewportStateValid(false),
     viewportHighDetail(false),
     forceFullPreview(false),
+    viewportDeferredRequest(0),
+    deferredCropRendered(false),
     viewportZeroLhist(32768),
     previewBaseCache(new PreviewBaseCache()),
     allocated(false),
@@ -725,6 +727,12 @@ void ImProcCoordinator::assign(ImageSource* imgsrc)
     this->imgsrc = imgsrc;
     previewBaseCache->clear("image-switch");
     invalidateViewportState();
+
+    // A new image source has no completed high-detail base state. Buffer
+    // reallocations (freeAll) do not change this because the source planes are
+    // still valid.
+    highDetailPreprocessComputed = false;
+    highDetailRawComputed = false;
 }
 
 void ImProcCoordinator::getParams(procparams::ProcParams* dst, bool tweaked)
@@ -1118,6 +1126,26 @@ void ImProcCoordinator::prepareViewportLuts(int todo)
         wavcontlutili = CurveFactory::diagonalCurve2Lut(
             params->wavelet.wavclCurve, wavclCurve, scale == 1 ? 1 : 16);
     }
+
+    updateViewportLutSnapshot(todo);
+}
+
+void ImProcCoordinator::updateViewportLutSnapshot(int todo)
+{
+    if (todo & (M_RGBCURVE | M_CROP)) {
+        viewportLutParams.toneCurve = params->toneCurve;
+        viewportLutParams.rgbCurves = params->rgbCurves;
+        viewportLutParams.colorToning = params->colorToning;
+        viewportLutParams.blackwhite = params->blackwhite;
+    }
+    if (todo & M_LUMACURVE) {
+        // M_CROP rebuilds lumacurve but not clcurve/sgn curves, so it cannot
+        // prove the whole Lab family current.
+        viewportLutParams.labCurve = params->labCurve;
+    }
+    if (todo & (M_LUMINANCE | M_COLOR | M_AUTOEXP)) {
+        viewportLutParams.wavelet = params->wavelet;
+    }
 }
 
 void ImProcCoordinator::renderCrops(int todo, bool force)
@@ -1161,9 +1189,10 @@ void ImProcCoordinator::markViewportStateValid(bool highDetailNeeded)
         return;
     }
 
-    viewportLutParams = *params;
     viewportHighDetail.store(highDetailNeeded, std::memory_order_relaxed);
     viewportStateValid.store(true, std::memory_order_relaxed);
+    viewportDeferredRequest.store(0, std::memory_order_relaxed);
+    deferredCropRendered.store(false, std::memory_order_relaxed);
 }
 
 void ImProcCoordinator::invalidateViewportState()
@@ -1171,12 +1200,8 @@ void ImProcCoordinator::invalidateViewportState()
     viewportStateValid.store(false, std::memory_order_relaxed);
     viewportHighDetail.store(false, std::memory_order_relaxed);
     forceFullPreview.store(false, std::memory_order_relaxed);
-
-    // These flags describe the raw/base state. They must not survive an
-    // image, scale or buffer reset, otherwise a later fast path can believe a
-    // full-detail base is ready when it is not.
-    highDetailPreprocessComputed = false;
-    highDetailRawComputed = false;
+    viewportDeferredRequest.store(0, std::memory_order_relaxed);
+    deferredCropRendered.store(false, std::memory_order_relaxed);
 }
 
 DetailedCrop* ImProcCoordinator::createCrop(::EditDataProvider *editDataProvider, bool isDetailWindow)
@@ -1259,10 +1284,14 @@ void ImProcCoordinator::updatePreviewImage(int todo, bool panningRelatedChange,
     const char* viewportFallback = nullptr;
     if (canUseViewportFastPath(eligibilityTodo, highDetailNeeded,
                                viewportFallback)) {
-        const int cropTodo = todo & VIEWPORT_CROP_TODO;
+        int cropTodo = todo & VIEWPORT_CROP_TODO;
+        if (cropTodo & (M_LUMACURVE | M_AUTOEXP)) {
+            // Crop::update applies luminance/colour work for these bits only
+            // through M_LUMINANCE/M_COLOR; keep the mask consistent.
+            cropTodo |= M_LUMINANCE | M_COLOR;
+        }
 
         prepareViewportLuts(eligibilityTodo);
-        viewportLutParams = *params;
         ipf.setScale(scale);
 
         const auto cropStart = std::chrono::steady_clock::now();
@@ -1274,6 +1303,9 @@ void ImProcCoordinator::updatePreviewImage(int todo, bool panningRelatedChange,
                 cropEnd - cropStart).count();
         previewTimer.viewportDeferredTodo =
             queueViewportDeferredAnalysis(eligibilityTodo);
+        viewportDeferredParams = *params;
+        viewportDeferredRequest.store(request, std::memory_order_relaxed);
+        deferredCropRendered.store(true, std::memory_order_relaxed);
         return;
     }
 
@@ -1293,10 +1325,19 @@ void ImProcCoordinator::updatePreviewImage(int todo, bool panningRelatedChange,
         // event did not carry an init/HDR bit. The added bits make sure the
         // base image and analysis are rebuilt from the current parameters.
         todo |= M_INIT | M_HDR | M_MONITOR;
+        if (params->spot != viewportFullParams.spot) {
+            todo |= M_SPOT;
+        }
         if (previewBaseCache->enabled()) {
             previewBaseCache->markDirty("viewport-base-refresh");
         }
     }
+
+    const bool suppressDeferredCropRender =
+        forceFullPreview.load(std::memory_order_relaxed)
+        && deferredCropRendered.load(std::memory_order_relaxed)
+        && viewportDeferredRequest.load(std::memory_order_relaxed) == request
+        && *params == viewportDeferredParams;
 
     bool fullPipelineRan = false;
     if (((todo & ALL) == ALL) || (todo & M_MONITOR) || panningRelatedChange || (highDetailNeeded && prevdemo != PD_Sidecar)) {
@@ -2996,6 +3037,7 @@ void ImProcCoordinator::updatePreviewImage(int todo, bool panningRelatedChange,
 
             CurveFactory::complexsgnCurve(autili, butili, ccutili, cclutili, params->labCurve.acurve, params->labCurve.bcurve, params->labCurve.cccurve,
                                           params->labCurve.lccurve, chroma_acurve, chroma_bcurve, satcurve, lhskcurve, scale == 1 ? 1 : 16);
+            updateViewportLutSnapshot(M_LUMACURVE);
         }
 
         //scale = 1;
@@ -3033,6 +3075,7 @@ void ImProcCoordinator::updatePreviewImage(int todo, bool panningRelatedChange,
             }
 
             wavcontlutili = CurveFactory::diagonalCurve2Lut(params->wavelet.wavclCurve, wavclCurve, scale == 1 ? 1 : 16);
+            updateViewportLutSnapshot(M_LUMINANCE | M_COLOR);
 
             if ((params->wavelet.enabled)) {
                 WaveletParams WaveParams = params->wavelet;
@@ -3752,8 +3795,10 @@ void ImProcCoordinator::updatePreviewImage(int todo, bool panningRelatedChange,
     }
 
 // process crop, if needed
-    renderCrops(todo, panningRelatedChange
-                    || (highDetailNeeded && prevdemo != PD_Sidecar));
+    if (!suppressDeferredCropRender) {
+        renderCrops(todo, panningRelatedChange
+                        || (highDetailNeeded && prevdemo != PD_Sidecar));
+    }
 
     if (panningRelatedChange || (todo & M_MONITOR)) {
         if ((todo != CROP && todo != MINUPDATE) || (todo & M_MONITOR)) {
@@ -3829,6 +3874,7 @@ void ImProcCoordinator::updatePreviewImage(int todo, bool panningRelatedChange,
         // blocking the next fast path forever.
         forceFullPreview.store(false, std::memory_order_relaxed);
         viewportStateValid.store(false, std::memory_order_relaxed);
+        deferredCropRendered.store(false, std::memory_order_relaxed);
     }
 }
 
@@ -4388,6 +4434,9 @@ void ImProcCoordinator::saveInputICCReference(const Glib::ustring& fname, bool a
     // This path reprocesses and demosaics the shared ImageSource at full
     // resolution, so any preview base snapshot is no longer representative.
     previewBaseCache->markDirty("input-icc-reference");
+    invalidateViewportState();
+    highDetailPreprocessComputed = false;
+    highDetailRawComputed = false;
 
     int fW, fH;
     std::unique_ptr<ProcParams> validParams(new ProcParams());
