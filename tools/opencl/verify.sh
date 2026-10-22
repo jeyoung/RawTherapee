@@ -36,6 +36,7 @@ compare_cmd=()
 has_device=0
 expect_stage=0
 expect_stage_name=""
+expect_stage_absent=""
 
 usage() {
     awk 'NR > 1 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "$0"
@@ -130,6 +131,7 @@ run_pair() {
     local label="$1"
     local input="$2"
     local profile="${3:-}"
+    local -a extraArgs=("${@:4}")
     local skip_status=0
     skip_if_no_device "$label" || skip_status=$?
     if [ "$skip_status" -ne 0 ]; then
@@ -158,11 +160,11 @@ run_pair() {
     fi
 
     local -a profileEnv=()
-    if [ "$expect_stage" -eq 1 ]; then
+    if [ "$expect_stage" -eq 1 ] || [ -n "$expect_stage_absent" ]; then
         profileEnv=(RT_OPENCL_PROFILE=1)
     fi
 
-    if ! env OMP_NUM_THREADS="$THREADS" "${profileEnv[@]}" "$cli" --gpu=auto "${profileArg[@]}" -o "$auto" -t -b16 -Y -c "$input" \
+    if ! env OMP_NUM_THREADS="$THREADS" "${profileEnv[@]}" "$cli" --gpu=auto "${extraArgs[@]}" "${profileArg[@]}" -o "$auto" -t -b16 -Y -c "$input" \
             >"$outdir/auto.log" 2>&1; then
         printf 'FAIL\t%s\tload or export failed (gpu=auto)\n' "$label"
         rm -rf "$outdir"
@@ -179,6 +181,13 @@ run_pair() {
             rm -rf "$outdir"
             return 1
         fi
+    fi
+
+    if [ -n "$expect_stage_absent" ] \
+            && grep -q "^opencl ${expect_stage_absent}:" "$outdir/auto.log"; then
+        printf 'FAIL\t%s\tOpenCL stage ran when it should be disabled\n' "$label"
+        rm -rf "$outdir"
+        return 1
     fi
 
     local result="PASS"
@@ -213,6 +222,7 @@ stage() {
     local name="$1"
     local sample="${sample_override:-$TESTDATA/colorspace_flowers.pef}"
     local profile="$ROOT/devnotes/opencl/pp3/$name.pp3"
+    local -a extraArgs=()
 
     [ -f "$sample" ] || die "missing $sample (run tools/opencl/fetch-testdata.sh)"
     [ -f "$profile" ] || die "missing profile $profile"
@@ -220,8 +230,32 @@ stage() {
     printf 'binary\t%s\n' "$cli"
     "$cli" --gpu-info | tail -n +2 | sed 's/^/gpu\t/'
     detect_device
+    expect_stage_absent=""
     expect_stage=1
-    run_pair "$(basename "$sample")/$name" "$sample" "$profile"
+    case "$name" in
+        capture)
+            expect_stage=0
+            expect_stage_name=""
+            expect_stage_absent="capture sharpening"
+            extraArgs=(--gpu-capture=off)
+            run_pair "$(basename "$sample")/$name-default-off" "$sample" "$profile" "${extraArgs[@]}"
+
+            expect_stage=1
+            expect_stage_absent=""
+            expect_stage_name="capture sharpening"
+            extraArgs=(--gpu-capture=on)
+            ;;
+        resize)
+            expect_stage_name="resize"
+            ;;
+        rotate*)
+            expect_stage_name="transform"
+            ;;
+        *)
+            expect_stage_name=""
+            ;;
+    esac
+    run_pair "$(basename "$sample")/$name" "$sample" "$profile" "${extraArgs[@]}"
 }
 
 run_monitor() {

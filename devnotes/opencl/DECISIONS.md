@@ -251,3 +251,21 @@ profile curve, costing about 65 ms on first use per processing job; it is then
 cached. Profiles that cannot be represented exactly by a matrix plus one
 shared TRC keep lcms, so calibrated LUT or per-channel profiles remain
 colour-correct rather than being approximated.
+
+## D018 — Make GPU Capture Sharpening opt-in
+
+Date: 2026-10-22
+
+Decision: keep GPU Capture Sharpening disabled by default. The Preferences
+checkbox and `--gpu-capture=on` enable it explicitly; `--gpu-capture=off`
+overrides a saved setting. The CPU path remains the automatic choice when the
+setting is off or OpenCL is disabled.
+
+Alternatives: reinstating the old 12 MP rejection, or selecting by pixel count
+alone. Both miss the 10–12 MP regression and penalise large images on systems
+where the GPU is faster.
+
+Consequences: default GPU exports keep the faster output-conversion and resize
+stages without paying the slower capture stage. Opt-in capture remains
+available for comparison. A future thread- and workload-aware policy may
+re-enable it automatically after the kernel is optimised.

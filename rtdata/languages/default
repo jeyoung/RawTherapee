@@ -2228,6 +2228,8 @@ PREFERENCES_PERFORMANCE_THREADS_LABEL;Maximum number of threads for Noise Reduct
 PREFERENCES_OPENCL;OpenCL acceleration
 PREFERENCES_OPENCL_ENABLE;Use OpenCL acceleration
 PREFERENCES_OPENCL_ENABLE_TOOLTIP;Accelerate selected image processing stages on the GPU when an OpenCL device is available. The CPU path remains available and is used as a fallback.
+PREFERENCES_OPENCL_CAPTURE;Use GPU for Capture Sharpening (experimental)
+PREFERENCES_OPENCL_CAPTURE_TOOLTIP;Opt in to GPU Capture Sharpening. This stage is slower than the multi-threaded CPU path on many systems, so it is disabled by default. Use RT_OPENCL_PROFILE=1 to compare stage timings.
 PREFERENCES_OPENCL_DEVICE;Device
 PREFERENCES_OPENCL_DEVICE_AUTO;Automatic
 PREFERENCES_OPENCL_MODE;Accelerate

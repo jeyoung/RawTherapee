@@ -1082,17 +1082,19 @@ struct KernelSet {
 struct StageTimer {
     const char* name = nullptr;
     bool enabled = false;
+    bool succeeded = true;
     std::chrono::steady_clock::time_point start =
         std::chrono::steady_clock::now();
 
-    StageTimer(const char* stageName, bool isEnabled)
-        : name(stageName), enabled(isEnabled)
+    StageTimer(const char* stageName, bool isEnabled,
+               bool successRequired = false)
+        : name(stageName), enabled(isEnabled), succeeded(!successRequired)
     {
     }
 
     ~StageTimer()
     {
-        if (enabled) {
+        if (enabled && succeeded) {
             const auto end = std::chrono::steady_clock::now();
             const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 end - start).count();
@@ -2811,6 +2813,14 @@ bool captureSharpening(float** luminance, const float* const* oldLuminance,
         return false;
     }
 
+    if (settings == nullptr || !settings->useOpenCLCaptureSharpening) {
+        if (settings != nullptr && settings->verbose) {
+            std::fprintf(stderr,
+                         "OpenCL: capture sharpening disabled by preference\n");
+        }
+        return false;
+    }
+
     int radius = 0;
 
     if (sigma < 0.6f) {
@@ -2935,7 +2945,7 @@ bool captureSharpening(float** luminance, const float* const* oldLuminance,
     }
 
     StageTimer timer("capture sharpening",
-                     g_getenv("RT_OPENCL_PROFILE") != nullptr);
+                     g_getenv("RT_OPENCL_PROFILE") != nullptr, true);
 
     std::vector<float> oldPlane;
     std::vector<float> blendPlane;
@@ -3085,6 +3095,7 @@ bool captureSharpening(float** luminance, const float* const* oldLuminance,
                     width * sizeof(float));
     }
 
+    timer.succeeded = true;
     return true;
 }
 

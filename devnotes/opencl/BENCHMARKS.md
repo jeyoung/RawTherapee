@@ -64,20 +64,45 @@ offload remains roughly neutral because map transfer and the extra log image
 offset the GPU gain. Reducing map traffic (residency) and accelerating further
 stages is required for a clear end-to-end win.
 
-## Capture sharpening, 0.75 radius, 20 iterations
+## Capture sharpening (opt-in)
 
-PEF, 3896x2616:
+GPU Capture Sharpening is opt-in as of 2026-10-22. It is slower than the
+multi-threaded CPU path on the RX 550 for the common 5×5, 20-iteration case, so
+auto mode keeps it on the CPU. Enable it with `--gpu-capture=on` or
+Preferences → Performance → OpenCL.
+
+PEF, 3896x2616, 10.2 MP, `capture.pp3`, `OMP_NUM_THREADS=8`, 16-bit TIFF:
+
+```bash
+RT_OPENCL_PROFILE=1 OMP_NUM_THREADS=8 rawtherapee-cli \
+    --gpu=auto --gpu-capture=on -p devnotes/opencl/pp3/capture.pp3 \
+    -t -b16 -Y -o out.tif -c colorspace_flowers.pef
+```
+
+| Mode | Wall | Peak RSS | Capture stage |
+|---|---|---|---|
+| CPU (`--gpu=off`) | 3.13 s | 751 MB | — |
+| GPU default (`--gpu=auto`) | 2.88 s | 841 MB | — |
+| GPU opt-in (`--gpu-capture=on`) | 3.74 s | 968 MB | **1.12 s** |
+
+The default GPU path is faster overall because of output conversion, but
+enabling the GPU capture stage makes the total slower. Parity at
+`OMP_NUM_THREADS=1` is 1 LSB. The earlier table below was recorded when auto
+mode selected GPU capture; its absolute totals are not comparable with the
+new opt-in runs.
+
+Historical PEF measurement:
 
 | Mode | Wall | Peak RSS | Stage |
 |---|---|---|---|
 | CPU | 7.88 s | 730 MB | — |
 | GPU | 7.71 s | 942 MB | 1.15 s |
 
-The GPU path is about 2% faster end-to-end. The stage is now split into
-watchdog-safe row chunks, so images above 12 MP use the GPU too. On the 45.7 MP
-D850 NEF, Rusticl RX 550 capture took 4.77 s; total 36.31 s GPU versus 36.69 s
-CPU, with PAE 1 LSB. POCL is test-only and intentionally skipped in auto mode:
-the same 45.7 MP case took 16.75 s capture and 50.76 s total on POCL.
+On the 45.7 MP D850 NEF, Rusticl RX 550 capture took 4.77 s when the stage was
+selected automatically. That measurement predates the opt-in change; with the
+current default the stage stays on the CPU. POCL is test-only and intentionally
+skipped in auto mode: the same 45.7 MP case took 16.75 s capture and 50.76 s
+total on POCL.
 
 ## sRGB output conversion
 

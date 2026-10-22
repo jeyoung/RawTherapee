@@ -55,6 +55,7 @@ public:
     bool            fastRawDecoder;         ///< Prefer the legacy decoder when supported.
 
     bool            useOpenCL;              ///< Enable OpenCL acceleration when available.
+    bool            useOpenCLCaptureSharpening = false; ///< Opt-in GPU capture sharpening.
     int             openCLMode;             ///< 0 = export only, 1 = preview and export.
     Glib::ustring   openCLDevice;           ///< Selected OpenCL device, empty = automatic.
     Glib::ustring   openCLRusticlDriver;    ///< Rusticl driver override, empty = auto-detect.

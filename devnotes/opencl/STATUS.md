@@ -9,7 +9,9 @@
 - Next task: none scheduled. RCD demosaic was evaluated and deferred; the next
   candidate, only if requested, is wavelet/denoise
 - Known limitations: single-stage acceleration is roughly neutral end-to-end;
-  transform is limited to rotation/scale/crop without LCP, CA, distortion,
+  GPU Capture Sharpening is opt-in and slower than the multi-threaded CPU on
+  the RX 550; transform is limited to rotation/scale/crop without LCP, CA,
+  distortion,
   perspective or vignetting; capture sharpening is split into watchdog-safe
   chunks and sized by a work budget; output conversion is limited to
   `RTv4_sRGB`, relative colorimetric intent and integer output; monitor
@@ -166,6 +168,12 @@ An RCD full-image pass prototype was implemented and reverted before commit.
 
 - Scope: `sigmaCornerOffset == 0`, fixed 3/5/7/9/13 kernels, tile size 32,
   per-tile early stop. Other cases fall back to CPU.
+- GPU capture is opt-in as of 2026-10-22 (`--gpu-capture=on` or Preferences).
+  Default auto mode keeps capture on the CPU because the stage is slower than
+  the 8-thread CPU on the RX 550.
+- PEF 10.2 MP, `capture.pp3`, OMP=8: CPU total 3.13 s; GPU default 2.88 s with
+  no capture stage; GPU with `--gpu-capture=on` 3.74 s and a 1.12 s capture
+  stage. Parity at OMP=1 is 1 LSB.
 - PEF 10 MP: PASS, PAE 1 LSB on AMD RX 550 and POCL.
 - 0.75, 1.5 and 2.0 radii, with and without early stop: PASS, PAE 1 LSB.
 - 45.7 MP NEF: PASS on Rusticl RX 550 after the 12 MP rejection was removed;
