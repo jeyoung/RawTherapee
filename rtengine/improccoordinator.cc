@@ -101,6 +101,11 @@ namespace
 struct PreviewTimer {
     bool enabled = false;
     bool cacheHit = false;
+    bool viewportFast = false;
+    bool viewportDeferred = false;
+    const char* viewportFallback = nullptr;
+    long long viewportCropMs = -1;
+    int viewportDeferredTodo = 0;
     int todo = 0;
     std::chrono::steady_clock::time_point start =
         std::chrono::steady_clock::now();
@@ -119,8 +124,20 @@ struct PreviewTimer {
         const auto end = std::chrono::steady_clock::now();
         const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             end - start).count();
-        std::fprintf(stderr, "preview update: %lld ms todo=0x%x cache=%d\n",
+        std::fprintf(stderr, "preview update: %lld ms todo=0x%x cache=%d",
                      static_cast<long long>(ms), todo, cacheHit ? 1 : 0);
+        if (viewportFast) {
+            std::fprintf(stderr,
+                         " viewport=fast crop_ms=%lld deferred_todo=0x%x\n",
+                         viewportCropMs, viewportDeferredTodo);
+        } else if (viewportDeferred) {
+            std::fprintf(stderr, " viewport=deferred-analysis\n");
+        } else if (viewportFallback) {
+            std::fprintf(stderr, " viewport=fallback reason=%s\n",
+                         viewportFallback);
+        } else {
+            std::fputc('\n', stderr);
+        }
     }
 };
 
@@ -481,6 +498,11 @@ ImProcCoordinator::ImProcCoordinator() :
     highDetailRawComputed(false),
     highDetailStateKnown(false),
     lastHighDetailNeeded(false),
+    viewportStateValid(false),
+    viewportHighDetail(false),
+    forceFullPreview(false),
+    pendingAnalysisTodo(0),
+    viewportZeroLhist(32768),
     previewBaseCache(new PreviewBaseCache()),
     allocated(false),
     bwAutoR(-9000.f),
@@ -655,6 +677,7 @@ ImProcCoordinator::ImProcCoordinator() :
     locallcieMask(0),
     retistrsav(nullptr)
 {
+    viewportZeroLhist.clear();
 }
 
 ImProcCoordinator::~ImProcCoordinator()
@@ -702,6 +725,7 @@ void ImProcCoordinator::assign(ImageSource* imgsrc)
 {
     this->imgsrc = imgsrc;
     previewBaseCache->clear("image-switch");
+    invalidateViewportState();
 }
 
 void ImProcCoordinator::getParams(procparams::ProcParams* dst, bool tweaked)
@@ -735,6 +759,361 @@ void ImProcCoordinator::restoreParams()
     *params = *paramsBackup;
 }
 
+namespace
+{
+
+bool sameHighlightRecovery(const procparams::ToneCurveParams& a,
+                           const procparams::ToneCurveParams& b)
+{
+    return a.hrenabled == b.hrenabled
+        && a.method == b.method
+        && a.hlbl == b.hlbl
+        && a.hlth == b.hlth
+        && a.clampOOG == b.clampOOG;
+}
+
+bool viewportFastEnabled()
+{
+    static const bool enabled = envEnabled("RT_VIEWPORT_FAST");
+    return enabled;
+}
+
+constexpr int VIEWPORT_FAST_ALLOWED_TODO =
+    M_AUTOEXP | M_RGBCURVE | M_LUMACURVE | M_LUMINANCE | M_COLOR
+    | M_CROP | M_MINUPDATE | M_HDR | M_SPOT;
+
+constexpr int VIEWPORT_FAST_REJECTED_TODO =
+    M_PREPROC | M_RAW | M_WB | M_INIT | M_LINDENOISE | M_MONITOR
+    | M_TRANSFORM | M_CSHARP | M_RETINEX | M_HIGHQUAL | M_BLURMAP;
+
+// Bits that are safe for Crop::update once the parent LUTs have been rebuilt.
+// Base/init and over-approximated HDR/spot bits are deliberately dropped.
+constexpr int VIEWPORT_CROP_TODO =
+    M_CROP | M_TRANSFORM | M_RGBCURVE | M_LUMACURVE | M_LUMINANCE | M_COLOR;
+
+} // namespace
+
+bool ImProcCoordinator::canUseViewportFastPath(int todo,
+                                               bool highDetailNeeded,
+                                               const char*& reason) const
+{
+    reason = nullptr;
+
+    if (!viewportFastEnabled()) {
+        reason = "switch-off";
+        return false;
+    }
+    if (forceFullPreview) {
+        reason = "deferred-analysis";
+        return false;
+    }
+    if (!viewportStateValid) {
+        reason = "no-complete-full-state";
+        return false;
+    }
+    if (highDetailNeeded != viewportHighDetail) {
+        reason = "high-detail-transition";
+        return false;
+    }
+    if (highDetailNeeded
+            && (!highDetailPreprocessComputed || !highDetailRawComputed)) {
+        reason = "high-detail-pending";
+        return false;
+    }
+    if (todo & VIEWPORT_FAST_REJECTED_TODO) {
+        reason = "base-request";
+        return false;
+    }
+    if (todo & ~VIEWPORT_FAST_ALLOWED_TODO) {
+        reason = "unsupported-request";
+        return false;
+    }
+
+    if (params->toneCurve.autoexp
+            || viewportFullParams.toneCurve.autoexp) {
+        reason = "auto-exposure";
+        return false;
+    }
+    if (params->toneCurve.histmatching
+            || viewportFullParams.toneCurve.histmatching
+            || params->toneCurve.fromHistMatching
+            || viewportFullParams.toneCurve.fromHistMatching) {
+        reason = "histogram-matching";
+        return false;
+    }
+    if ((params->blackwhite.enabled && params->blackwhite.autoc)
+            || (viewportFullParams.blackwhite.enabled
+                && viewportFullParams.blackwhite.autoc)) {
+        reason = "auto-black-white";
+        return false;
+    }
+    if ((params->colorToning.enabled && params->colorToning.autosat)
+            || (viewportFullParams.colorToning.enabled
+                && viewportFullParams.colorToning.autosat)) {
+        reason = "auto-colour-toning";
+        return false;
+    }
+    if (params->colorappearance.enabled) {
+        reason = "cie";
+        return false;
+    }
+    if (params->locallab.enabled) {
+        reason = "local-lab";
+        return false;
+    }
+    if (params->labCurve.contrast != 0) {
+        reason = "lab-contrast";
+        return false;
+    }
+
+    // Active full-frame filters would either be skipped here or re-applied
+    // differently from the normal path, so leave them to the full pipeline.
+    if (params->fattal.enabled || params->dehaze.enabled) {
+        reason = "hdr-processing";
+        return false;
+    }
+    if (params->spot.enabled && !params->spot.entries.empty()) {
+        reason = "spot-removal";
+        return false;
+    }
+
+    const ProcParams& last = viewportFullParams;
+
+    if (params->raw != last.raw) {
+        reason = "raw";
+        return false;
+    }
+    if (params->wb != last.wb) {
+        reason = "white-balance";
+        return false;
+    }
+    if (params->icm != last.icm) {
+        reason = "color-management";
+        return false;
+    }
+    if (params->coarse != last.coarse) {
+        reason = "coarse-transform";
+        return false;
+    }
+    if (params->commonTrans != last.commonTrans) {
+        reason = "common-transform";
+        return false;
+    }
+    if (params->rotate != last.rotate) {
+        reason = "rotate";
+        return false;
+    }
+    if (params->distortion != last.distortion) {
+        reason = "distortion";
+        return false;
+    }
+    if (params->lensProf != last.lensProf) {
+        reason = "lens-profile";
+        return false;
+    }
+    if (params->perspective != last.perspective) {
+        reason = "perspective";
+        return false;
+    }
+    if (params->gradient != last.gradient) {
+        reason = "gradient";
+        return false;
+    }
+    if (params->pcvignette != last.pcvignette) {
+        reason = "post-crop-vignette";
+        return false;
+    }
+    if (params->cacorrection != last.cacorrection) {
+        reason = "ca-correction";
+        return false;
+    }
+    if (params->vignetting != last.vignetting) {
+        reason = "vignetting";
+        return false;
+    }
+    if (params->spot != last.spot) {
+        reason = "spot";
+        return false;
+    }
+    if (params->filmNegative != last.filmNegative) {
+        reason = "film-negative";
+        return false;
+    }
+    if (params->dehaze != last.dehaze) {
+        reason = "dehaze";
+        return false;
+    }
+    if (params->fattal != last.fattal) {
+        reason = "fattal";
+        return false;
+    }
+    if (params->retinex != last.retinex) {
+        reason = "retinex";
+        return false;
+    }
+    if (params->pdsharpening != last.pdsharpening) {
+        reason = "capture-sharpening";
+        return false;
+    }
+    if (params->dirpyrDenoise != last.dirpyrDenoise) {
+        reason = "denoise";
+        return false;
+    }
+    if (params->cg != last.cg) {
+        reason = "gamut-compression";
+        return false;
+    }
+    if (params->locallab != last.locallab) {
+        reason = "local-lab-params";
+        return false;
+    }
+    if (!sameHighlightRecovery(params->toneCurve, last.toneCurve)) {
+        reason = "highlight-recovery";
+        return false;
+    }
+    if (params->toneCurve.autoexp != last.toneCurve.autoexp
+            || params->toneCurve.histmatching
+                != last.toneCurve.histmatching
+            || params->blackwhite.autoc != last.blackwhite.autoc
+            || params->colorToning.autosat != last.colorToning.autosat) {
+        reason = "auto-flags";
+        return false;
+    }
+
+    return true;
+}
+
+void ImProcCoordinator::prepareViewportLuts(int todo)
+{
+    if (todo & (M_RGBCURVE | M_CROP)) {
+        // vhist16 is cached from the last completed full-frame pass and is a
+        // function of the base image and working profile only.
+        CurveFactory::complexCurve(
+            params->toneCurve.expcomp, params->toneCurve.black / 65535.0,
+            params->toneCurve.hlcompr, params->toneCurve.hlcomprthresh,
+            params->toneCurve.shcompr, params->toneCurve.brightness,
+            params->toneCurve.contrast, params->toneCurve.curve,
+            params->toneCurve.curve2, vhist16, hltonecurve, shtonecurve,
+            tonecurve, histToneCurve, customToneCurve1, customToneCurve2, 1);
+
+        CurveFactory::RGBCurve(params->rgbCurves.rcurve, rCurve, 1);
+        CurveFactory::RGBCurve(params->rgbCurves.gcurve, gCurve, 1);
+        CurveFactory::RGBCurve(params->rgbCurves.bcurve, bCurve, 1);
+
+        opautili = false;
+
+        if (params->colorToning.enabled) {
+            TMatrix wprof = ICCStore::getInstance()->workingSpaceMatrix(
+                params->icm.workingProfile);
+            double wp[3][3] = {
+                {wprof[0][0], wprof[0][1], wprof[0][2]},
+                {wprof[1][0], wprof[1][1], wprof[1][2]},
+                {wprof[2][0], wprof[2][1], wprof[2][2]}
+            };
+            params->colorToning.getCurves(ctColorCurve, ctOpacityCurve, wp,
+                                          opautili);
+            CurveFactory::diagonalCurve2Lut(params->colorToning.clcurve,
+                                            clToningcurve,
+                                            scale == 1 ? 1 : 16);
+            CurveFactory::diagonalCurve2Lut(params->colorToning.cl2curve,
+                                            cl2Toningcurve,
+                                            scale == 1 ? 1 : 16);
+        }
+
+        if (params->blackwhite.enabled) {
+            CurveFactory::curveBW(params->blackwhite.beforeCurve,
+                                  params->blackwhite.afterCurve, vhist16bw,
+                                  histToneCurveBW, beforeToneCurveBW,
+                                  afterToneCurveBW, 1);
+        }
+
+        colourToningSatLimit = float(params->colorToning.satProtectionThreshold)
+            / 100.f * 0.7f + 0.3f;
+        colourToningSatLimitOpacity =
+            1.f - (float(params->colorToning.saturatedOpacity) / 100.f);
+    }
+
+    if (todo & (M_LUMACURVE | M_CROP)) {
+        // Lab contrast is restricted to zero by the eligibility check, so the
+        // histogram cannot influence lumacurve. histLCurve is refreshed by the
+        // deferred full pass.
+        CurveFactory::complexLCurve(
+            params->labCurve.brightness, params->labCurve.contrast,
+            params->labCurve.lcurve, viewportZeroLhist, lumacurve, histLCurve,
+            scale == 1 ? 1 : 16, utili);
+    }
+
+    if (todo & M_LUMACURVE) {
+        clcutili = CurveFactory::diagonalCurve2Lut(
+            params->labCurve.clcurve, clcurve, scale == 1 ? 1 : 16);
+
+        CurveFactory::complexsgnCurve(
+            autili, butili, ccutili, cclutili, params->labCurve.acurve,
+            params->labCurve.bcurve, params->labCurve.cccurve,
+            params->labCurve.lccurve, chroma_acurve, chroma_bcurve, satcurve,
+            lhskcurve, scale == 1 ? 1 : 16);
+    }
+
+    if (todo & (M_LUMINANCE | M_COLOR | M_AUTOEXP)) {
+        wavcontlutili = CurveFactory::diagonalCurve2Lut(
+            params->wavelet.wavclCurve, wavclCurve, scale == 1 ? 1 : 16);
+    }
+}
+
+void ImProcCoordinator::renderCrops(int todo, bool force)
+{
+    for (size_t i = 0; i < crops.size(); i++) {
+        if (crops[i]->hasListener()
+                && (force
+                    || (todo & (M_MONITOR | M_RGBCURVE | M_LUMACURVE))
+                    || crops[i]->get_skip() == 1)) {
+            crops[i]->update(todo);     // may call ourselves
+        }
+    }
+}
+
+void ImProcCoordinator::queueViewportDeferredAnalysis(int todo)
+{
+    // Rebuild the full-frame analysis from the base image already held in
+    // oprevi. Base bits such as M_HDR/M_SPOT are over-approximated by several
+    // event masks and their parameters are known to be unchanged here, so the
+    // deferred pass only forces the monitor conversion and the curve/Lab
+    // pipeline.
+    int deferred = todo | M_MONITOR | M_RGBCURVE | M_LUMACURVE
+        | M_LUMINANCE | M_COLOR;
+    deferred &= ~(M_HDR | M_SPOT | M_PREPROC | M_RAW | M_WB | M_INIT
+                  | M_LINDENOISE | M_CSHARP | M_RETINEX | M_TRANSFORM
+                  | M_HIGHQUAL | M_BLURMAP);
+
+    paramsUpdateMutex.lock();
+    forceFullPreview = true;
+    pendingAnalysisTodo = deferred;
+    changeSinceLast |= deferred;
+    paramsUpdateMutex.unlock();
+}
+
+void ImProcCoordinator::markViewportStateValid(bool highDetailNeeded)
+{
+    forceFullPreview = false;
+    pendingAnalysisTodo = 0;
+
+    if (!viewportFastEnabled()) {
+        viewportStateValid = false;
+        return;
+    }
+
+    viewportHighDetail = highDetailNeeded;
+    viewportStateValid = true;
+}
+
+void ImProcCoordinator::invalidateViewportState()
+{
+    viewportStateValid = false;
+    viewportHighDetail = false;
+    forceFullPreview = false;
+    pendingAnalysisTodo = 0;
+}
+
 DetailedCrop* ImProcCoordinator::createCrop(::EditDataProvider *editDataProvider, bool isDetailWindow)
 {
 
@@ -753,8 +1132,10 @@ void ImProcCoordinator::updatePreviewImage(int todo, bool panningRelatedChange,
 
     // Keep the requested event mask for cache invalidation. The augmentation
     // below turns a crop-only change into a transform request, but the base
-    // image itself does not change.
+    // image itself does not change. Eligibility is evaluated on this
+    // un-augmented mask so a derived transform does not force a full render.
     const int baseCacheTodo = todo;
+    const int eligibilityTodo = todo;
 
     // This augmentation must happen before a stale request is requeued, since
     // the next request may only carry M_CROP and M_MONITOR.
@@ -806,6 +1187,43 @@ void ImProcCoordinator::updatePreviewImage(int todo, bool panningRelatedChange,
     }
     lastHighDetailNeeded = highDetailNeeded;
     highDetailStateKnown = true;
+
+    previewTimer.viewportDeferred = forceFullPreview;
+
+    const char* viewportFallback = nullptr;
+    if (canUseViewportFastPath(eligibilityTodo, highDetailNeeded,
+                               viewportFallback)) {
+        const int cropTodo = todo & VIEWPORT_CROP_TODO;
+
+        prepareViewportLuts(eligibilityTodo);
+        ipf.setScale(scale);
+
+        const auto cropStart = std::chrono::steady_clock::now();
+        renderCrops(cropTodo, true);
+        const auto cropEnd = std::chrono::steady_clock::now();
+        previewTimer.viewportFast = true;
+        previewTimer.viewportCropMs =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                cropEnd - cropStart).count();
+        previewTimer.viewportDeferredTodo = eligibilityTodo;
+
+        queueViewportDeferredAnalysis(eligibilityTodo);
+        return;
+    }
+
+    previewTimer.viewportFallback = viewportFallback;
+
+    // Snapshot the request inputs before the pass normalises white balance
+    // (and similar deterministic values). The GUI keeps the un-normalised
+    // values, so comparing against the post-pass copy would reject every
+    // subsequent request. The state only becomes valid once the pass ends.
+    if (viewportFastEnabled()) {
+        viewportFullParams = *params;
+    }
+
+    // The full pass below re-establishes the parent state. It is only marked
+    // valid again after the pass has completed.
+    viewportStateValid = false;
 
     if (((todo & ALL) == ALL) || (todo & M_MONITOR) || panningRelatedChange || (highDetailNeeded && prevdemo != PD_Sidecar)) {
         bwAutoR = bwAutoG = bwAutoB = -9000.f;
@@ -2368,38 +2786,9 @@ void ImProcCoordinator::updatePreviewImage(int todo, bool panningRelatedChange,
 
         }
         if ((todo & M_RGBCURVE) || (todo & M_CROP)) {
-            //complexCurve also calculated pre-curves histogram depending on crop
-            CurveFactory::complexCurve(params->toneCurve.expcomp, params->toneCurve.black / 65535.0,
-                                       params->toneCurve.hlcompr, params->toneCurve.hlcomprthresh,
-                                       params->toneCurve.shcompr, params->toneCurve.brightness, params->toneCurve.contrast,
-                                       params->toneCurve.curve, params->toneCurve.curve2,
-                                       vhist16, hltonecurve, shtonecurve, tonecurve, histToneCurve, customToneCurve1, customToneCurve2, 1);
-
-            CurveFactory::RGBCurve(params->rgbCurves.rcurve, rCurve, 1);
-            CurveFactory::RGBCurve(params->rgbCurves.gcurve, gCurve, 1);
-            CurveFactory::RGBCurve(params->rgbCurves.bcurve, bCurve, 1);
-
-
-            opautili = false;
-
-            if (params->colorToning.enabled) {
-                TMatrix wprof = ICCStore::getInstance()->workingSpaceMatrix(params->icm.workingProfile);
-                double wp[3][3] = {
-                    {wprof[0][0], wprof[0][1], wprof[0][2]},
-                    {wprof[1][0], wprof[1][1], wprof[1][2]},
-                    {wprof[2][0], wprof[2][1], wprof[2][2]}
-                };
-                params->colorToning.getCurves(ctColorCurve, ctOpacityCurve, wp, opautili);
-                CurveFactory::diagonalCurve2Lut(params->colorToning.clcurve, clToningcurve, scale == 1 ? 1 : 16);
-                CurveFactory::diagonalCurve2Lut(params->colorToning.cl2curve, cl2Toningcurve, scale == 1 ? 1 : 16);
-            }
-
-            if (params->blackwhite.enabled) {
-                CurveFactory::curveBW(params->blackwhite.beforeCurve, params->blackwhite.afterCurve, vhist16bw, histToneCurveBW, beforeToneCurveBW, afterToneCurveBW, 1);
-            }
-
-            colourToningSatLimit = float (params->colorToning.satProtectionThreshold) / 100.f * 0.7f + 0.3f;
-            colourToningSatLimitOpacity = 1.f - (float (params->colorToning.saturatedOpacity) / 100.f);
+            // complexCurve also calculates the pre-curves histogram depending
+            // on crop; the tone/LUT part is shared with the viewport fast path.
+            prepareViewportLuts(M_RGBCURVE);
 
             int satTH = 80;
             int satPR = 30;
@@ -3279,10 +3668,8 @@ void ImProcCoordinator::updatePreviewImage(int todo, bool panningRelatedChange,
     }
 
 // process crop, if needed
-    for (size_t i = 0; i < crops.size(); i++)
-        if (crops[i]->hasListener() && (panningRelatedChange || (highDetailNeeded && prevdemo != PD_Sidecar) || (todo & (M_MONITOR | M_RGBCURVE | M_LUMACURVE)) || crops[i]->get_skip() == 1)) {
-            crops[i]->update(todo);     // may call ourselves
-        }
+    renderCrops(todo, panningRelatedChange
+                    || (highDetailNeeded && prevdemo != PD_Sidecar));
 
     if (panningRelatedChange || (todo & M_MONITOR)) {
         if ((todo != CROP && todo != MINUPDATE) || (todo & M_MONITOR)) {
@@ -3349,6 +3736,8 @@ void ImProcCoordinator::updatePreviewImage(int todo, bool panningRelatedChange,
         delete oprevi;
         oprevi = nullptr;
     }
+
+    markViewportStateValid(highDetailNeeded);
 }
 
 void ImProcCoordinator::setTweakOperator(TweakOperator *tOperator)
@@ -3368,6 +3757,7 @@ void ImProcCoordinator::unsetTweakOperator(TweakOperator *tOperator)
 void ImProcCoordinator::freeAll()
 {
     previewBaseCache->clear("free-all");
+    invalidateViewportState();
 
     if (allocated) {
         if (spotprev && spotprev != oprevi) {
@@ -3459,6 +3849,7 @@ void ImProcCoordinator::setScale(int prevscale)
         allocated = true;
     } else if (prevscale != oldScale) {
         previewBaseCache->clear("scale-change");
+        invalidateViewportState();
     }
 
     scale = prevscale;

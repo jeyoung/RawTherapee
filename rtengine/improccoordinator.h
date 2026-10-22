@@ -97,6 +97,17 @@ protected:
     bool highDetailStateKnown;
     bool lastHighDetailNeeded;
 
+    // Experimental viewport-aware preview fast path (RT_VIEWPORT_FAST=1).
+    // The snapshot describes the state produced by the last completed
+    // full-frame pass, so the parent LUTs can be rebuilt without redoing the
+    // base image or the full-frame analysis.
+    bool viewportStateValid;
+    bool viewportHighDetail;
+    bool forceFullPreview;
+    int pendingAnalysisTodo;
+    ProcParams viewportFullParams;
+    LUTu viewportZeroLhist;
+
     // Experimental, default-off cache of the preview base image returned by
     // ImageSource::getImage(). One snapshot only; deep copies in and out.
     class PreviewBaseCache;
@@ -241,6 +252,13 @@ protected:
     bool updateWaveforms();
     void setScale(int prevscale);
     void updatePreviewImage (int todo, bool panningRelatedChange, unsigned request);
+    bool canUseViewportFastPath(int todo, bool highDetailNeeded,
+                                const char*& reason) const;
+    void prepareViewportLuts(int todo);
+    void renderCrops(int todo, bool force);
+    void queueViewportDeferredAnalysis(int todo);
+    void markViewportStateValid(bool highDetailNeeded);
+    void invalidateViewportState();
 
     MyMutex mProcessing;
     const std::unique_ptr<ProcParams> params;  // used for the rendering, can be eventually tweaked
