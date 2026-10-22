@@ -1,12 +1,13 @@
 # Viewport-aware preview fast path
 
-`RT_VIEWPORT_FAST=1` enables an experimental, default-off fast path for safe
-post-base parameter changes. It rebuilds the parent LUTs that visible
-`rtengine::Crop` objects consume from the cached full-frame analysis state,
-renders the crop ROI first, and then queues one normal full-frame pass so the
-navigator, preview image, `workimg`, histograms, scopes and listeners catch up.
+The viewport fast path is enabled by default for safe post-base parameter
+changes. `RT_VIEWPORT_FAST=0` disables it for comparison or troubleshooting.
+It rebuilds the parent LUTs that visible `rtengine::Crop` objects consume from
+the cached full-frame analysis state, renders the crop ROI first, and then
+queues one normal full-frame pass so the navigator, preview image, `workimg`,
+histograms, scopes and listeners catch up.
 
-Without the environment variable every request takes the existing full path
+With the kill switch set to `0`, every request takes the existing full path
 unchanged. Export is not involved: the fast path lives in
 `ImProcCoordinator::updatePreviewImage()` and only affects the interactive
 preview.
@@ -33,7 +34,7 @@ locallab, CIE, Fattal/dehaze, spot removal or film-negative processing.
 last completed full-frame pass. It rejects the request if any of the following
 holds:
 
-- `RT_VIEWPORT_FAST` is off, no full pass completed, a deferred pass is
+- the kill switch is set to `0`, no full pass completed, a deferred pass is
   pending, or the high-detail state changed or is still being computed;
 - the request contains `M_PREPROC`, `M_RAW`, `M_WB`, `M_INIT`,
   `M_LINDENOISE`, `M_MONITOR`, `M_TRANSFORM`, `M_CSHARP`, `M_RETINEX`,
@@ -169,6 +170,9 @@ and a fresh settings directory:
 - final main-window screenshots after the same two-step Exposure Compensation
   sequence were pixel-identical with `RT_VIEWPORT_FAST` on and off at fit and
   100 % zoom (`compare -metric AE` = 0);
+- with the feature enabled by default (no environment variable), the same
+  100 % sequence took 26 ms for the visible crop and 30 ms for the deferred
+  pass, and matched the `RT_VIEWPORT_FAST=0` screenshot with AE = 0;
 - CLI exports with the switch on and off were pixel-identical
   (`compare -metric AE` = 0; only the TIFF `DateTime` tag differed);
 - known user-modified files were left unstaged.

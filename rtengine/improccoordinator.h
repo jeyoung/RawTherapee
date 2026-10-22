@@ -97,7 +97,7 @@ protected:
     bool highDetailStateKnown;
     bool lastHighDetailNeeded;
 
-    // Experimental viewport-aware preview fast path (RT_VIEWPORT_FAST=1).
+    // Viewport-aware preview fast path (disable with RT_VIEWPORT_FAST=0).
     // The snapshot describes the state produced by the last completed
     // full-frame pass, so the parent LUTs can be rebuilt without redoing the
     // base image or the full-frame analysis.

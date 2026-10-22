@@ -811,7 +811,13 @@ bool sameBaseInputs(const procparams::ProcParams& a,
 
 bool viewportFastEnabled()
 {
-    static const bool enabled = envEnabled("RT_VIEWPORT_FAST");
+    // Enabled by default. RT_VIEWPORT_FAST=0 is the kill switch for
+    // comparison and troubleshooting; other non-empty values keep it on.
+    static const bool enabled = []() {
+        const char* value = g_getenv("RT_VIEWPORT_FAST");
+        return value == nullptr || value[0] == '\0'
+            || g_strcmp0(value, "0") != 0;
+    }();
     return enabled;
 }
 
