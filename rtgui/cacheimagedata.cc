@@ -41,6 +41,7 @@ CacheImageData::CacheImageData() :
     format(FT_Invalid),
     rankOld(-1),
     inTrashOld(false),
+    inTrash(false),
     recentlySaved(false),
     timeValid(false),
     year(0),
@@ -116,7 +117,8 @@ int CacheImageData::load (const Glib::ustring& fname)
                 }
 
                 if (keyFile.has_key ("General", "InTrash")) {
-                    inTrashOld  = keyFile.get_boolean ("General", "InTrash");
+                    inTrash     = keyFile.get_boolean ("General", "InTrash");
+                    inTrashOld  = inTrash;
                 }
 
                 if (keyFile.has_key ("General", "RecentlySaved")) {
@@ -296,16 +298,13 @@ int CacheImageData::save (const Glib::ustring& fname)
     keyFile.set_boolean ("General", "RecentlySaved", recentlySaved);
     keyFile.set_integer ("General", "Rating", rating);
     keyFile.set_integer ("General", "ColorLabel", colorLabel);
+    keyFile.set_boolean ("General", "InTrash", inTrash);
 
     keyFile.set_string(INI_GROUP_XMP_SIDECAR, INI_XMP_SIDECAR_MD5, xmpSidecarMd5);
 
-    // remove the old implementation of Rank and InTrash from cache
+    // remove the old implementation of Rank from cache
     if (keyFile.has_key ("General", "Rank")) {
         keyFile.remove_key("General", "Rank");
-    }
-
-    if (keyFile.has_key ("General", "InTrash")) {
-        keyFile.remove_key("General", "InTrash");
     }
 
     if (timeValid) {

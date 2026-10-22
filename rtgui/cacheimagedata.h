@@ -38,6 +38,7 @@ public:
     ThFileType  format;
     char  rankOld; // old implementation of rank
     bool  inTrashOld; // old implementation of inTrash
+    bool  inTrash;
     bool  recentlySaved;
 
     // XMP sidecar info.

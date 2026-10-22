@@ -141,7 +141,9 @@ void getRankAndColorFromMetadata(
         }
     };
 
-    if (cfs.exifValid) {
+    // The rating and colour label are also kept in the cache when they are
+    // stored in a profile, so use them even for formats without EXIF.
+    if (cfs.exifValid || cfs.rating != 0 || cfs.colorLabel > 0) {
         rank = rtengine::LIM(cfs.getRating(), 0, 5);
         color = rtengine::LIM(cfs.getColorLabel(), 0, 5);
         setHasMetadataFlags(true, true);
@@ -296,6 +298,7 @@ Thumbnail::Thumbnail(CacheManager* cm, const Glib::ustring& fname, CacheImageDat
     tpp(nullptr),
     pparams(new ProcParams),
     pparamsValid(false),
+    profileCleared(false),
     imageLoading(false),
     lastImg(nullptr),
     lastW(0),
@@ -336,6 +339,7 @@ Thumbnail::Thumbnail(CacheManager* cm, const Glib::ustring& fname, const std::st
     tpp(nullptr),
     pparams(new ProcParams),
     pparamsValid(false),
+    profileCleared(false),
     imageLoading(false),
     lastImg(nullptr),
     lastW(0),
@@ -550,6 +554,10 @@ rtengine::procparams::ProcParams* Thumbnail::createProcParamsForUpdate(bool retu
         g_remove (tmpFileName.c_str ());
     }
 
+    if (hasProcParams()) {
+        profileCleared = false;
+    }
+
     if (returnParams && hasProcParams()) {
         ldprof = new ProcParams ();
         *ldprof = getProcParams ();
@@ -598,25 +606,26 @@ void Thumbnail::loadProcParams()
             pparamsValid = !ppres && pparams->ppVersion >= 220;
         }
     }
+
+    if (pparamsValid) {
+        profileCleared = false;
+    }
 }
 
 void Thumbnail::clearProcParams (int whoClearedIt)
 {
 
-    /*  Clarification on current "clear profile" functionality:
-        a. if rank/colorlabel/inTrash are NOT set,
-        the "clear profile" will delete the pp3 file (as before).
-
-        b. if any of the rank/colorlabel/inTrash ARE set,
-        the "clear profile" will lead to execution of ProcParams::setDefaults
-        (the CPB is NOT called) to set the params values and will preserve
-        rank/colorlabel/inTrash in the param file. */
+    /*  Clear always removes the processing profile, including rank and
+        colour labels that were stored in it. The metadata itself is kept in
+        the cache so that ratings survive the clear, but it no longer makes
+        the file look edited. */
 
     {
         MyMutex::MyLock lock(mutex);
 
         cfs.recentlySaved = false;
         pparamsValid = false;
+        profileCleared = true;
 
         //TODO: run though customprofilebuilder?
         // probably not as this is the only option to set param values to default
@@ -624,33 +633,59 @@ void Thumbnail::clearProcParams (int whoClearedIt)
         // reset the params to defaults
         pparams->setDefaults();
 
-        // preserve rank, colorlabel and inTrash across clear
-        updateProcParamsProperties(true);
+        // remove param file from cache
+        Glib::ustring fname_ = getCacheFileName ("profiles", App::PARAM_FILE_EXTENSION);
+        g_remove (fname_.c_str ());
 
-        // params could get validated by updateProcParamsProperties
-        if (pparamsValid) {
-            updateCache();
-        } else {
-            // remove param file from cache
-            Glib::ustring fname_ = getCacheFileName ("profiles", App::PARAM_FILE_EXTENSION);
-            g_remove (fname_.c_str ());
+        // remove param file located next to the file
+        fname_ = fname + App::PARAM_FILE_EXTENSION;
+        g_remove (fname_.c_str ());
 
-            // remove param file located next to the file
-            fname_ = fname + App::PARAM_FILE_EXTENSION;
-            g_remove (fname_.c_str ());
+        fname_ = removeExtension(fname) + App::PARAM_FILE_EXTENSION;
+        g_remove (fname_.c_str ());
 
-            fname_ = removeExtension(fname) + App::PARAM_FILE_EXTENSION;
-            g_remove (fname_.c_str ());
-
-            if (cfs.format == FT_Raw && App::get().options().internalThumbIfUntouched && cfs.thumbImgType != CacheImageData::QUICK_THUMBNAIL) {
-                // regenerate thumbnail, ie load the quick thumb again. For the rare formats not supporting quick thumbs this will
-                // be a bit slow as a new full thumbnail will be generated unnecessarily, but currently there is no way to pre-check
-                // if the format supports quick thumbs.
-                initial_ = true;
-                _generateThumbnailImage();
-                initial_ = false;
-            }
+        if (cfs.format == FT_Raw && App::get().options().internalThumbIfUntouched && cfs.thumbImgType != CacheImageData::QUICK_THUMBNAIL) {
+            // regenerate thumbnail, ie load the quick thumb again. For the rare formats not supporting quick thumbs this will
+            // be a bit slow as a new full thumbnail will be generated unnecessarily, but currently there is no way to pre-check
+            // if the format supports quick thumbs.
+            initial_ = true;
+            _generateThumbnailImage();
+            initial_ = false;
         }
+
+        // Keep rank and colour labels in the cache, not in a processing
+        // profile. Updating the processing parameters here would validate
+        // them again, leaving a profile and the edited tick on the thumbnail
+        // even though Clear was requested. The cache keeps the metadata for
+        // the next session while the profile itself is removed. Do this after
+        // thumbnail regeneration, which reloads metadata from the image.
+        // Persist rank and colour labels in the XMP sidecar as well as the
+        // cache so they survive cache invalidation. The XMP sidecar is not a
+        // processing profile, so it does not bring the edited tick back. Do
+        // not create one when there is no metadata to preserve.
+        const auto xmpPath = rtengine::Exiv2Metadata::xmpSidecarPath(fname);
+        if (properties.rank.value > 0 || properties.color.value > 0
+                || Glib::file_test(xmpPath, Glib::FILE_TEST_EXISTS)) {
+            saveXMPSidecarProperties(true);
+            if (rtengine::settings->metadata_xmp_sync != rtengine::Settings::MetadataXmpSync::NONE) {
+                cfs.xmpSidecarMd5 = ::getMD5(xmpPath);
+            } else {
+                cfs.xmpSidecarMd5.clear();
+            }
+        } else {
+            cfs.xmpSidecarMd5.clear();
+        }
+
+        cfs.rating = properties.rank.value;
+        cfs.colorLabel = properties.color.value;
+        cfs.inTrash = properties.trashed.value;
+        cfs.save(getCacheFileName("data", ".txt"));
+
+        // The values are now metadata, not pending profile changes. Keep the
+        // flags clear so a later cache update does not recreate a profile.
+        properties.rank.edited = false;
+        properties.color.edited = false;
+        properties.trashed.edited = false;
 
     } // end of mutex lock
 
@@ -663,6 +698,12 @@ bool Thumbnail::hasProcParams () const
 {
 
     return pparamsValid;
+}
+
+bool Thumbnail::isProfileCleared () const
+{
+
+    return profileCleared;
 }
 
 void Thumbnail::setProcParams (const ProcParams& pp, ParamsEdited* pe, int whoChangedIt, bool updateCacheNow, bool resetToDefault)
@@ -733,6 +774,7 @@ void Thumbnail::setProcParams (const ProcParams& pp, ParamsEdited* pe, int whoCh
         }
 
         pparamsValid = true;
+        profileCleared = false;
 
         // do not update rank, colorlabel and inTrash
         updateProcParamsProperties(true);
@@ -1417,7 +1459,8 @@ void Thumbnail::loadProperties()
     const auto& options = App::get().options();
 
     // update rank and color from procparams or xmp sidecar
-    // load trash from procparams
+    // load trash from procparams, or from the cache when Clear removed the
+    // profile but kept the metadata
     if (pparamsValid) {
         if (options.thumbnailRankColorMode == Options::ThumbnailPropertyMode::PROCPARAMS) {
             if (pparams->rank >= 0) {
@@ -1427,9 +1470,14 @@ void Thumbnail::loadProperties()
 
         properties.trashed.value = pparams->inTrash;
         properties.color.value = pparams->colorlabel;
+    } else {
+        properties.trashed.value = cfs.inTrash;
     }
 
-    if (options.thumbnailRankColorMode == Options::ThumbnailPropertyMode::XMP) {
+    // An XMP sidecar is also the durable store used by Clear, so read it
+    // when there is no profile even if the user normally keeps rank/colour in
+    // processing profiles.
+    if (options.thumbnailRankColorMode == Options::ThumbnailPropertyMode::XMP || !pparamsValid) {
         try {
             auto xmp = rtengine::Exiv2Metadata::getXmpSidecar(fname);
             getRankFromXmp(xmp, properties.rank.value);
@@ -1495,23 +1543,25 @@ void Thumbnail::updateProcParamsProperties(bool forceUpdate)
     }
 }
 
-void Thumbnail::saveXMPSidecarProperties()
+void Thumbnail::saveXMPSidecarProperties(bool force)
 {
-    if (!properties.edited()) {
-        return;
-    }
+    if (!force) {
+        if (!properties.edited()) {
+            return;
+        }
 
-    if (App::get().options().thumbnailRankColorMode != Options::ThumbnailPropertyMode::XMP) {
-        return;
+        if (App::get().options().thumbnailRankColorMode != Options::ThumbnailPropertyMode::XMP) {
+            return;
+        }
     }
 
     auto fn = rtengine::Exiv2Metadata::xmpSidecarPath(fname);
     try {
         auto xmp = rtengine::Exiv2Metadata::getXmpSidecar(fname);
-        if (properties.rank.edited) {
+        if (force || properties.rank.edited) {
             xmp["Xmp.xmp.Rating"] = std::to_string(properties.rank);
         }
-        if (properties.color.edited) {
+        if (force || properties.color.edited) {
             xmp["Xmp.xmp.Label"] = rtengine::FramesData::xmp_color2label(properties.color);
         }
 

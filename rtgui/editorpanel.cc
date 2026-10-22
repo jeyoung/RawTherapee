@@ -1504,7 +1504,13 @@ void EditorPanel::open (Thumbnail* tmb, rtengine::InitialImage* isrc)
 void EditorPanel::close ()
 {
     if (ipc) {
-        saveProfile ();
+        // A profile cleared from the File Browser must stay cleared until the
+        // image is opened again. Do not write the neutral editor fallback back
+        // to the thumbnail during the close that precedes a reload; otherwise
+        // the dynamic default rule would be skipped.
+        if (!openThm || !openThm->isProfileCleared()) {
+            saveProfile ();
+        }
         // close image processor and the current thumbnail
         tpc->closeImage ();    // this call stops image processing
         tpc->writeOptions ();

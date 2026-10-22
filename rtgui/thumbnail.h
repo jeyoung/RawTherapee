@@ -63,6 +63,7 @@ class Thumbnail
 
     const std::unique_ptr<rtengine::procparams::ProcParams>      pparams;
     bool            pparamsValid;
+    bool            profileCleared;
     bool            imageLoading;
 
     // these are the data of the result image of the last getthumbnailimage  call (for caching purposes)
@@ -116,7 +117,7 @@ class Thumbnail
     void saveMetadata();
     void loadProperties();
     void updateProcParamsProperties(bool forceUpdate = false);
-    void saveXMPSidecarProperties();
+    void saveXMPSidecarProperties(bool force = false);
 
 public:
     Thumbnail (CacheManager* cm, const Glib::ustring& fname, CacheImageData* cf);
@@ -127,6 +128,7 @@ public:
     static Glib::ustring xmpSidecarPath(const Glib::ustring &imagePath);
 
     bool              hasProcParams () const;
+    bool              isProfileCleared () const;
     const rtengine::procparams::ProcParams& getProcParams ();
     const rtengine::procparams::ProcParams& getProcParamsU ();  // Unprotected version
 
