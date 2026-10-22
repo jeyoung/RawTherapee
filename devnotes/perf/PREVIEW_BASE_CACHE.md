@@ -1,7 +1,8 @@
-# Preview base-image cache experiment
+# Preview base-image cache
 
-`RT_PREVIEW_BASE_CACHE=1` enables an experimental, default-off cache of the
-display preview's base image. The snapshot is taken in
+The preview base-image cache is enabled by default. Set
+`RT_PREVIEW_BASE_CACHE=0` (or `false`, `off`, `no`) to disable it for one
+process. The snapshot is taken in
 `ImProcCoordinator::updatePreviewImage()` immediately after
 `ImageSource::getImage()` and before spot removal, colour-space conversion,
 film negative processing, gamut compression, `firstAnalysis()` and the rest of
@@ -112,9 +113,9 @@ GUI under Xvfb, CPU build, Contrast by Detail Levels enabled and changed:
 
 The full GUI screenshots for the PEF sequence were pixel-identical with the
 cache off and on. The saving is modest because `getImage()` at preview scale is
-only a small part of the pipeline. The cache remains opt-in; enabling it by
-default would require the complete GUI transition matrix, including detail
-crops and OpenCL, to be automated and green.
+only a small part of the pipeline. The cache is enabled by default after the
+generation/locking hardening; detail crops and export remain outside its
+scope. Use the environment opt-out if a workload regresses.
 
 Post-hardening CPU checks (45.7 MP NEF, maximised Xephyr window, cache on and
 off): an Exposure edit produced a cache hit and cropped preview screenshots

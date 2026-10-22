@@ -44,9 +44,10 @@ class ImageSource;
  * ImageSource::getImage() before spot removal, colour conversion, film
  * negative processing and the rest of the preview pipeline.
  *
- * The cache is opt-in through RT_PREVIEW_BASE_CACHE=1. It holds at most one
- * deep copy, so no pointer into orig_prev/oprevi is ever retained. A cache hit
- * restores the snapshot and lets the normal pipeline run from there.
+ * The cache is enabled by default. Set RT_PREVIEW_BASE_CACHE=0 (or false/off/no)
+ * to disable it for a process. It holds at most one deep copy, so no pointer
+ * into orig_prev/oprevi is ever retained. A cache hit restores the snapshot and
+ * lets the normal pipeline run from there.
  *
  * The coordinator serialises all cache access with mProcessing. The internal
  * mutex additionally makes each operation atomic for future callers and keeps
@@ -170,7 +171,7 @@ public:
     };
 
     PreviewBaseCache()
-        : enabled_(envEnabled(PREVIEW_BASE_CACHE_ENV)),
+        : enabled_(!envDisabled(PREVIEW_BASE_CACHE_ENV)),
           profileEnabled_(profileEnvironmentEnabled())
     {
     }
@@ -469,6 +470,19 @@ private:
         const char* value = g_getenv(name);
         return value != nullptr && value[0] != '\0'
             && g_strcmp0(value, "0") != 0;
+    }
+
+    static bool envDisabled(const char* name)
+    {
+        const char* value = g_getenv(name);
+        if (value == nullptr || value[0] == '\0') {
+            return false;
+        }
+
+        return g_ascii_strcasecmp(value, "0") == 0
+            || g_ascii_strcasecmp(value, "false") == 0
+            || g_ascii_strcasecmp(value, "off") == 0
+            || g_ascii_strcasecmp(value, "no") == 0;
     }
 
     static bool profileEnvironmentEnabled()

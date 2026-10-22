@@ -71,6 +71,28 @@ PreviewBaseCache::Key makeKey(std::uint64_t generation)
     return key;
 }
 
+bool testDefaultAndOptOut()
+{
+    g_unsetenv("RT_PREVIEW_BASE_CACHE");
+    PreviewBaseCache enabledByDefault;
+    CHECK(enabledByDefault.enabled());
+
+    g_setenv("RT_PREVIEW_BASE_CACHE", "0", TRUE);
+    PreviewBaseCache optOut;
+    CHECK(!optOut.enabled());
+
+    g_setenv("RT_PREVIEW_BASE_CACHE", "off", TRUE);
+    PreviewBaseCache optOutOff;
+    CHECK(!optOutOff.enabled());
+
+    g_setenv("RT_PREVIEW_BASE_CACHE", "1", TRUE);
+    PreviewBaseCache optIn;
+    CHECK(optIn.enabled());
+
+    g_unsetenv("RT_PREVIEW_BASE_CACHE");
+    return true;
+}
+
 bool testDisabled()
 {
     PreviewBaseCache cache(false, false);
@@ -159,7 +181,8 @@ bool testSizeBound()
 
 int main()
 {
-    if (!testDisabled()
+    if (!testDefaultAndOptOut()
+            || !testDisabled()
             || !testStoreRestoreAndGeneration()
             || !testDestinationMismatchInvalidates()
             || !testDirtyAndClear()
