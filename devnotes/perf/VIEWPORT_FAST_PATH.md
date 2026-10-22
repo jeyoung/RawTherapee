@@ -177,7 +177,7 @@ and a fresh settings directory:
   (`compare -metric AE` = 0; only the TIFF `DateTime` tag differed);
 - known user-modified files were left unstaged.
 
-## Follow-ups before enabling by default
+## Known limitations and follow-ups
 
 - Add a cached `lhist16` so non-zero Lab contrast can use the fast path.
 - Handle active Fattal/dehaze/spot correctly rather than falling back.
