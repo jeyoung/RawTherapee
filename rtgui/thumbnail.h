@@ -64,6 +64,7 @@ class Thumbnail
     const std::unique_ptr<rtengine::procparams::ProcParams>      pparams;
     bool            pparamsValid;
     bool            profileCleared;
+    bool            metadataReadError;
     bool            imageLoading;
 
     // these are the data of the result image of the last getthumbnailimage  call (for caching purposes)
@@ -117,7 +118,7 @@ class Thumbnail
     void saveMetadata();
     void loadProperties();
     void updateProcParamsProperties(bool forceUpdate = false);
-    void saveXMPSidecarProperties(bool force = false);
+    bool saveXMPSidecarProperties(bool force = false);
 
 public:
     Thumbnail (CacheManager* cm, const Glib::ustring& fname, CacheImageData* cf);
@@ -185,6 +186,7 @@ public:
     void            setColorLabel  (int colorlabel);
 
     bool            getTrashed () const;
+    bool            refreshMetadataProperties ();
     void            setTrashed (bool trashed);
 
     void            addThumbnailListener (ThumbnailListener* tnl);

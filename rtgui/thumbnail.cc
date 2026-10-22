@@ -223,15 +223,14 @@ bool getRankFromXmpOrMetadata(
     const Glib::ustring &fname,
     int &rank)
 {
+    (void)options;
     bool got_rank_from_xmp = false;
-    if (options.thumbnailRankColorMode == Options::ThumbnailPropertyMode::XMP) {
-        try {
-            got_rank_from_xmp = getRankFromXmp(xmp, rank);
-        } catch (std::exception &exc) {
-            std::cerr << "ERROR loading rank from "
-                      << rtengine::Exiv2Metadata::xmpSidecarPath(fname)
-                      << ": " << exc.what() << std::endl;
-        }
+    try {
+        got_rank_from_xmp = getRankFromXmp(xmp, rank);
+    } catch (std::exception &exc) {
+        std::cerr << "ERROR loading rank from "
+                  << rtengine::Exiv2Metadata::xmpSidecarPath(fname)
+                  << ": " << exc.what() << std::endl;
     }
     return got_rank_from_xmp || getRankFromMetadata(cfs, fname, rank);
 }
@@ -273,16 +272,42 @@ bool getColorFromXmpOrNone(
     const Glib::ustring &fname,
     int &color)
 {
-    if (options.thumbnailRankColorMode == Options::ThumbnailPropertyMode::XMP) {
-        try {
-            return getColorFromXmp(xmp, color);
-        } catch (std::exception &exc) {
-            std::cerr << "ERROR loading color label from "
-                      << rtengine::Exiv2Metadata::xmpSidecarPath(fname)
-                      << ": " << exc.what() << std::endl;
-        }
+    (void)options;
+    try {
+        return getColorFromXmp(xmp, color);
+    } catch (std::exception &exc) {
+        std::cerr << "ERROR loading color label from "
+                  << rtengine::Exiv2Metadata::xmpSidecarPath(fname)
+                  << ": " << exc.what() << std::endl;
     }
     return false;
+}
+
+constexpr const char *RT_XMP_NS = "https://rawtherapee.com/xmp/1.0/";
+constexpr const char *RT_XMP_PREFIX = "rt";
+constexpr const char *RT_XMP_TRASH_KEY = "Xmp.rt.InTrash";
+
+void ensureRawTherapeeXmpNamespace()
+{
+    static const bool registered = []() {
+        Exiv2::XmpProperties::registerNs(RT_XMP_NS, RT_XMP_PREFIX);
+        return true;
+    }();
+    (void)registered;
+}
+
+bool getTrashFromXmp(const Exiv2::XmpData &xmp, bool &trashed)
+{
+    ensureRawTherapeeXmpNamespace();
+    auto pos = xmp.findKey(Exiv2::XmpKey(RT_XMP_TRASH_KEY));
+    if (pos == xmp.end()) {
+        return false;
+    }
+
+    std::string value = pos->toString();
+    std::transform(value.begin(), value.end(), value.begin(), ::tolower);
+    trashed = value == "true" || value == "1";
+    return true;
 }
 
 } // namespace
@@ -299,6 +324,7 @@ Thumbnail::Thumbnail(CacheManager* cm, const Glib::ustring& fname, CacheImageDat
     pparams(new ProcParams),
     pparamsValid(false),
     profileCleared(false),
+    metadataReadError(false),
     imageLoading(false),
     lastImg(nullptr),
     lastW(0),
@@ -340,6 +366,7 @@ Thumbnail::Thumbnail(CacheManager* cm, const Glib::ustring& fname, const std::st
     pparams(new ProcParams),
     pparamsValid(false),
     profileCleared(false),
+    metadataReadError(false),
     imageLoading(false),
     lastImg(nullptr),
     lastW(0),
@@ -623,6 +650,31 @@ void Thumbnail::clearProcParams (int whoClearedIt)
     {
         MyMutex::MyLock lock(mutex);
 
+        const auto xmpPath = rtengine::Exiv2Metadata::xmpSidecarPath(fname);
+        const bool hasMetadata =
+            properties.rank.value > 0
+            || properties.color.value > 0
+            || properties.trashed.value
+            || Glib::file_test(xmpPath, Glib::FILE_TEST_EXISTS);
+
+        // Write the metadata before removing the profile. If the XMP write
+        // fails, leave the profile intact rather than destroying the only
+        // copy of the metadata.
+        if (hasMetadata) {
+            if (!saveXMPSidecarProperties(true)) {
+                std::cerr << "ERROR clearing profile for " << fname
+                          << ": metadata could not be saved" << std::endl;
+                return;
+            }
+            if (rtengine::settings->metadata_xmp_sync != rtengine::Settings::MetadataXmpSync::NONE) {
+                cfs.xmpSidecarMd5 = ::getMD5(xmpPath);
+            } else {
+                cfs.xmpSidecarMd5.clear();
+            }
+        } else {
+            cfs.xmpSidecarMd5.clear();
+        }
+
         cfs.recentlySaved = false;
         pparamsValid = false;
         profileCleared = true;
@@ -653,29 +705,7 @@ void Thumbnail::clearProcParams (int whoClearedIt)
             initial_ = false;
         }
 
-        // Keep rank and colour labels in the cache, not in a processing
-        // profile. Updating the processing parameters here would validate
-        // them again, leaving a profile and the edited tick on the thumbnail
-        // even though Clear was requested. The cache keeps the metadata for
-        // the next session while the profile itself is removed. Do this after
-        // thumbnail regeneration, which reloads metadata from the image.
-        // Persist rank and colour labels in the XMP sidecar as well as the
-        // cache so they survive cache invalidation. The XMP sidecar is not a
-        // processing profile, so it does not bring the edited tick back. Do
-        // not create one when there is no metadata to preserve.
-        const auto xmpPath = rtengine::Exiv2Metadata::xmpSidecarPath(fname);
-        if (properties.rank.value > 0 || properties.color.value > 0
-                || Glib::file_test(xmpPath, Glib::FILE_TEST_EXISTS)) {
-            saveXMPSidecarProperties(true);
-            if (rtengine::settings->metadata_xmp_sync != rtengine::Settings::MetadataXmpSync::NONE) {
-                cfs.xmpSidecarMd5 = ::getMD5(xmpPath);
-            } else {
-                cfs.xmpSidecarMd5.clear();
-            }
-        } else {
-            cfs.xmpSidecarMd5.clear();
-        }
-
+        // Keep a cache fallback, but XMP remains authoritative.
         cfs.rating = properties.rank.value;
         cfs.colorLabel = properties.color.value;
         cfs.inTrash = properties.trashed.value;
@@ -1274,15 +1304,15 @@ void Thumbnail::updateCache (bool updatePParams, bool updateCacheImageData)
         );
     }
 
-    if (updateCacheImageData) {
-        cfs.save (getCacheFileName ("data", ".txt"));
-    }
-
     if (updatePParams && pparamsValid) {
         saveMetadata();
     }
 
     saveXMPSidecarProperties();
+
+    if (updateCacheImageData) {
+        cfs.save (getCacheFileName ("data", ".txt"));
+    }
 }
 
 Thumbnail::~Thumbnail ()
@@ -1329,6 +1359,13 @@ void Thumbnail::setColorLabel(int colorlabel)
 bool Thumbnail::getTrashed() const
 {
     return properties.trashed;
+}
+
+bool Thumbnail::refreshMetadataProperties()
+{
+    MyMutex::MyLock lock(mutex);
+    loadProperties();
+    return !metadataReadError && properties.trashed.value;
 }
 
 void Thumbnail::setTrashed(bool trashed)
@@ -1450,6 +1487,7 @@ void Thumbnail::getCamWB(double& temp, double& green, rtengine::StandardObserver
 
 void Thumbnail::loadProperties()
 {
+    metadataReadError = false;
     properties = Properties();
 
     // get initial rank and color from cache or image metadata
@@ -1474,19 +1512,19 @@ void Thumbnail::loadProperties()
         properties.trashed.value = cfs.inTrash;
     }
 
-    // An XMP sidecar is also the durable store used by Clear, so read it
-    // when there is no profile even if the user normally keeps rank/colour in
-    // processing profiles.
-    if (options.thumbnailRankColorMode == Options::ThumbnailPropertyMode::XMP || !pparamsValid) {
-        try {
-            auto xmp = rtengine::Exiv2Metadata::getXmpSidecar(fname);
-            getRankFromXmp(xmp, properties.rank.value);
-            getColorFromXmp(xmp, properties.color.value);
-        } catch (std::exception &exc) {
-            std::cerr << "ERROR loading thumbnail properties data from "
-                      << rtengine::Exiv2Metadata::xmpSidecarPath(fname)
-                      << ": " << exc.what() << std::endl;
-        }
+    // XMP is the canonical metadata store. Read it even when a legacy
+    // processing profile still contains metadata; a value present in XMP
+    // wins over the profile.
+    try {
+        auto xmp = rtengine::Exiv2Metadata::getXmpSidecar(fname);
+        getRankFromXmp(xmp, properties.rank.value);
+        getColorFromXmp(xmp, properties.color.value);
+        getTrashFromXmp(xmp, properties.trashed.value);
+    } catch (std::exception &exc) {
+        metadataReadError = true;
+        std::cerr << "ERROR loading thumbnail properties data from "
+                  << rtengine::Exiv2Metadata::xmpSidecarPath(fname)
+                  << ": " << exc.what() << std::endl;
     }
 }
 
@@ -1543,17 +1581,13 @@ void Thumbnail::updateProcParamsProperties(bool forceUpdate)
     }
 }
 
-void Thumbnail::saveXMPSidecarProperties(bool force)
+bool Thumbnail::saveXMPSidecarProperties(bool force)
 {
-    if (!force) {
-        if (!properties.edited()) {
-            return;
-        }
-
-        if (App::get().options().thumbnailRankColorMode != Options::ThumbnailPropertyMode::XMP) {
-            return;
-        }
+    if (!force && !properties.edited()) {
+        return true;
     }
+
+    ensureRawTherapeeXmpNamespace();
 
     auto fn = rtengine::Exiv2Metadata::xmpSidecarPath(fname);
     try {
@@ -1564,13 +1598,24 @@ void Thumbnail::saveXMPSidecarProperties(bool force)
         if (force || properties.color.edited) {
             xmp["Xmp.xmp.Label"] = rtengine::FramesData::xmp_color2label(properties.color);
         }
+        if (force || properties.trashed.edited) {
+            xmp[RT_XMP_TRASH_KEY] = properties.trashed ? "True" : "False";
+        }
 
         rtengine::Exiv2Metadata meta;
         meta.xmpData() = std::move(xmp);
         meta.saveToXmp(fn);
+
+        if (rtengine::settings->metadata_xmp_sync != rtengine::Settings::MetadataXmpSync::NONE) {
+            cfs.xmpSidecarMd5 = ::getMD5(fn);
+        } else {
+            cfs.xmpSidecarMd5.clear();
+        }
+        return true;
     } catch (std::exception &exc) {
         std::cerr << "ERROR saving thumbnail properties data to " << fn
                   << ": " << exc.what() << std::endl;
+        return false;
     }
 }
 

@@ -1030,7 +1030,7 @@ void FileCatalog::openRequested(const std::vector<Thumbnail*>& tmb)
     );
 }
 
-void FileCatalog::deleteRequested(const std::vector<FileBrowserEntry*>& tbe, bool inclBatchProcessed, bool onlySelected)
+void FileCatalog::deleteRequested(const std::vector<FileBrowserEntry*>& tbe, bool inclBatchProcessed, bool onlySelected, bool requireTrashed)
 {
     if (tbe.empty()) {
         return;
@@ -1044,18 +1044,39 @@ void FileCatalog::deleteRequested(const std::vector<FileBrowserEntry*>& tbe, boo
     }
 
     if (msd.run() == Gtk::RESPONSE_YES) {
+        unsigned int skipped = 0;
+
         for (unsigned int i = 0; i < tbe.size(); i++) {
             const auto fname = tbe[i]->filename;
+
+            if (requireTrashed) {
+                // Re-read the authoritative metadata immediately before a
+                // destructive action. An external change must win over a
+                // stale thumbnail selection.
+                if (!tbe[i]->thumbnail->refreshMetadataProperties() || !tbe[i]->thumbnail->getTrashed()) {
+                    ++skipped;
+                    continue;
+                }
+            }
+
             const auto md5 = tbe[i]->thumbnail->getMD5();
-            // remove from browser
+            const bool existed = Glib::file_test(fname, Glib::FILE_TEST_EXISTS);
+            if (existed && ::g_remove(fname.c_str()) != 0) {
+                std::cerr << "ERROR deleting " << fname << std::endl;
+                ++skipped;
+                continue;
+            }
+
+            // Remove from browser and cache only after the image itself has
+            // been deleted successfully.
             delete fileBrowser->delEntry (fname);
-            // remove from cache
             cacheMgr->clearFromCache (fname, md5, true);
-            // delete from file system
-            ::g_remove (fname.c_str ());
-            // delete paramfile if found
+
+            // Delete the metadata sidecars. They must not outlive the image.
             ::g_remove ((fname + App::PARAM_FILE_EXTENSION).c_str ());
             ::g_remove ((removeExtension(fname) + App::PARAM_FILE_EXTENSION).c_str ());
+            ::g_remove (Thumbnail::xmpSidecarPath(fname).c_str ());
+
             // delete .thm file
             ::g_remove ((removeExtension(fname) + ".thm").c_str ());
             ::g_remove ((removeExtension(fname) + ".THM").c_str ());
@@ -1070,6 +1091,10 @@ void FileCatalog::deleteRequested(const std::vector<FileBrowserEntry*>& tbe, boo
             }
 
             previewsLoaded--;
+        }
+
+        if (skipped) {
+            std::cerr << "Skipped " << skipped << " file(s) whose trash state could not be refreshed" << std::endl;
         }
 
         _refreshProgressBar();
@@ -1123,6 +1148,8 @@ void FileCatalog::copyMoveRequested(const std::vector<FileBrowserEntry*>& tbe, b
             // construct  destination File Paths
             Glib::ustring dest_fPath = Glib::build_filename (options.lastCopyMovePath, fname);
             Glib::ustring dest_fPath_param = dest_fPath + App::PARAM_FILE_EXTENSION;
+            Glib::ustring dest_xmpPath = Thumbnail::xmpSidecarPath(dest_fPath);
+            const Glib::ustring src_xmpPath = Thumbnail::xmpSidecarPath(src_fPath);
 
             if (moveRequested && (src_Dir == options.lastCopyMovePath)) {
                 continue;
@@ -1136,7 +1163,9 @@ void FileCatalog::copyMoveRequested(const std::vector<FileBrowserEntry*>& tbe, b
 
             while(!filecopymovecomplete) {
                 // check for filename conflicts at destination - prevent overwriting (actually RT will crash on overwriting attempt)
-                if (!Glib::file_test(dest_fPath, Glib::FILE_TEST_EXISTS) && !Glib::file_test(dest_fPath_param, Glib::FILE_TEST_EXISTS)) {
+                if (!Glib::file_test(dest_fPath, Glib::FILE_TEST_EXISTS)
+                        && !Glib::file_test(dest_fPath_param, Glib::FILE_TEST_EXISTS)
+                        && !Glib::file_test(dest_xmpPath, Glib::FILE_TEST_EXISTS)) {
                     // copy/move file to destination
                     Glib::RefPtr<Gio::File> dest_file = Gio::File::create_for_path ( dest_fPath );
 
@@ -1174,6 +1203,23 @@ void FileCatalog::copyMoveRequested(const std::vector<FileBrowserEntry*>& tbe, b
                         }
                     }
 
+                    // Move or copy the XMP metadata sidecar with the image.
+                    if (Glib::file_test(src_xmpPath, Glib::FILE_TEST_EXISTS)) {
+                        auto src_xmp = Gio::File::create_for_path(src_xmpPath);
+                        auto dest_xmp = Gio::File::create_for_path(dest_xmpPath);
+                        try {
+                            if (moveRequested) {
+                                src_xmp->move(dest_xmp);
+                            } else {
+                                src_xmp->copy(dest_xmp);
+                            }
+                        } catch (const Gio::Error &exc) {
+                            std::cerr << "ERROR moving/copying XMP sidecar from "
+                                      << src_xmpPath << " to " << dest_xmpPath
+                                      << ": " << exc.what() << std::endl;
+                        }
+                    }
+
                     filecopymovecomplete = true;
                 } else {
                     // adjust destination fname to avoid conflicts (append "_<index>", preserve extension)
@@ -1181,6 +1227,7 @@ void FileCatalog::copyMoveRequested(const std::vector<FileBrowserEntry*>& tbe, b
                     // re-construct  destination File Paths
                     dest_fPath = Glib::build_filename (options.lastCopyMovePath, dest_fname);
                     dest_fPath_param = dest_fPath + App::PARAM_FILE_EXTENSION;
+                    dest_xmpPath = Thumbnail::xmpSidecarPath(dest_fPath);
                     i_copyindex++;
                 }
             }//while
@@ -1362,7 +1409,8 @@ void FileCatalog::renameRequested(const std::vector<FileBrowserEntry*>& tbe)
                 Glib::ustring nfname = Glib::build_filename (dirName, nBaseName);
 
                 /* check if filename already exists*/
-                if (Glib::file_test (nfname, Glib::FILE_TEST_EXISTS)) {
+                if (Glib::file_test(nfname, Glib::FILE_TEST_EXISTS)
+                        || Glib::file_test(Thumbnail::xmpSidecarPath(nfname), Glib::FILE_TEST_EXISTS)) {
                     Glib::ustring msg_ = Glib::ustring("<b>") + escapeHtmlChars(nfname) + ": " + M("MAIN_MSG_ALREADYEXISTS") + "</b>";
                     Gtk::MessageDialog msgd (msg_, true, Gtk::MESSAGE_ERROR, Gtk::BUTTONS_OK, true);
                     msgd.run ();
@@ -1371,6 +1419,20 @@ void FileCatalog::renameRequested(const std::vector<FileBrowserEntry*>& tbe)
 
                     if (::g_rename (ofname.c_str (), nfname.c_str ()) == 0) {
                         cacheMgr->renameEntry (ofname, tbe[i]->thumbnail->getMD5(), nfname);
+
+                        const auto old_xmp = Thumbnail::xmpSidecarPath(ofname);
+                        const auto new_xmp = Thumbnail::xmpSidecarPath(nfname);
+                        if (Glib::file_test(old_xmp, Glib::FILE_TEST_EXISTS)
+                                && !Glib::file_test(new_xmp, Glib::FILE_TEST_EXISTS)) {
+                            if (::g_rename(old_xmp.c_str(), new_xmp.c_str()) != 0) {
+                                std::cerr << "ERROR renaming XMP sidecar from "
+                                          << old_xmp << " to " << new_xmp << std::endl;
+                            }
+                        } else if (Glib::file_test(old_xmp, Glib::FILE_TEST_EXISTS)) {
+                            std::cerr << "ERROR renaming XMP sidecar: destination already exists: "
+                                      << new_xmp << std::endl;
+                        }
+
                         ::g_remove((ofname + App::PARAM_FILE_EXTENSION).c_str ());
                         reparseDirectory ();
                     }
@@ -1980,7 +2042,7 @@ void FileCatalog::emptyTrash ()
         }
     }
     if (toDel.size() > 0) {
-        deleteRequested(toDel, false, false);
+        deleteRequested(toDel, false, false, true);
         trashChanged();
     }
 }
