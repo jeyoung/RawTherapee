@@ -2874,7 +2874,7 @@ bool stageAllowed()
 bool captureSharpening(float** luminance, const float* const* oldLuminance,
                        const float* const* blend, int width, int height,
                        float sigma, float sigmaCornerOffset, int iterations,
-                       bool checkIterStop)
+                       bool checkIterStop, bool force)
 {
     if (luminance == nullptr || oldLuminance == nullptr || blend == nullptr
             || width <= 0 || height <= 0 || sigmaCornerOffset != 0.0f
@@ -2882,7 +2882,8 @@ bool captureSharpening(float** luminance, const float* const* oldLuminance,
         return false;
     }
 
-    if (settings == nullptr || !settings->useOpenCLCaptureSharpening) {
+    if (settings == nullptr
+            || (!force && settings->openCLCaptureMode == 0)) {
         if (settings != nullptr && settings->verbose) {
             std::fprintf(stderr,
                          "OpenCL: capture sharpening disabled by preference\n");

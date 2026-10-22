@@ -120,7 +120,7 @@ bool labToRgb8(const LabImage*, Image8*, const float[9],
 }
 
 bool captureSharpening(float**, const float* const*, const float* const*,
-                       int, int, float, float, int, bool)
+                       int, int, float, float, int, bool, bool)
 {
     return false;
 }

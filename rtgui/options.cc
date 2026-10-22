@@ -522,7 +522,7 @@ void Options::setDefaults()
     serializeTiffRead = true;
     measure = false;
     rtSettings.useOpenCL = true;
-    rtSettings.useOpenCLCaptureSharpening = false;
+    rtSettings.openCLCaptureMode = 0;
     rtSettings.openCLMode = 0;
     rtSettings.openCLDevice.clear();
     rtSettings.openCLRusticlDriver.clear();
@@ -1476,8 +1476,11 @@ void Options::readFromFile(Glib::ustring fname)
                     rtSettings.useOpenCL = keyFile.get_boolean("Performance", "UseOpenCL");
                 }
 
-                if (keyFile.has_key("Performance", "UseOpenCLCaptureSharpening")) {
-                    rtSettings.useOpenCLCaptureSharpening = keyFile.get_boolean("Performance", "UseOpenCLCaptureSharpening");
+                if (keyFile.has_key("Performance", "OpenCLCaptureMode")) {
+                    rtSettings.openCLCaptureMode = std::min(2, std::max(0, keyFile.get_integer("Performance", "OpenCLCaptureMode")));
+                } else if (keyFile.has_key("Performance", "UseOpenCLCaptureSharpening")) {
+                    rtSettings.openCLCaptureMode =
+                        keyFile.get_boolean("Performance", "UseOpenCLCaptureSharpening") ? 2 : 0;
                 }
 
                 if (keyFile.has_key("Performance", "OpenCLMode")) {
@@ -2592,7 +2595,7 @@ void Options::saveToFile(Glib::ustring fname)
         keyFile.set_boolean("Performance", "SerializeTiffRead", serializeTiffRead);
         keyFile.set_integer("Performance", "Measure", measure);
         keyFile.set_boolean("Performance", "UseOpenCL", rtSettings.useOpenCL);
-        keyFile.set_boolean("Performance", "UseOpenCLCaptureSharpening", rtSettings.useOpenCLCaptureSharpening);
+        keyFile.set_integer("Performance", "OpenCLCaptureMode", rtSettings.openCLCaptureMode);
         keyFile.set_integer("Performance", "OpenCLMode", rtSettings.openCLMode);
         keyFile.set_string("Performance", "OpenCLDevice", rtSettings.openCLDevice);
         keyFile.set_string("Performance", "OpenCLRusticlDriver", rtSettings.openCLRusticlDriver);

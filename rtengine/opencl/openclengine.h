@@ -140,7 +140,7 @@ bool stageAllowed();
 bool captureSharpening(float** luminance, const float* const* oldLuminance,
                        const float* const* blend, int width, int height,
                        float sigma, float sigmaCornerOffset, int iterations,
-                       bool checkIterStop);
+                       bool checkIterStop, bool force = false);
 
 /** @brief Short human readable state, also used by --gpu-info. */
 std::string statusText();

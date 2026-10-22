@@ -346,12 +346,14 @@ int processLineParams ( int argc, char **argv )
             const Glib::ustring mode = currParam.substr(14);
 
             if (mode == "on") {
-                options.rtSettings.useOpenCLCaptureSharpening = true;
+                options.rtSettings.openCLCaptureMode = 2;
             } else if (mode == "off") {
-                options.rtSettings.useOpenCLCaptureSharpening = false;
+                options.rtSettings.openCLCaptureMode = 0;
+            } else if (mode == "auto") {
+                options.rtSettings.openCLCaptureMode = 1;
             } else {
                 std::cerr << "Error: unknown --gpu-capture mode \"" << mode
-                          << "\" (expected off or on)" << std::endl;
+                          << "\" (expected off, auto or on)" << std::endl;
                 return -1;
             }
         }
@@ -622,7 +624,7 @@ int processLineParams ( int argc, char **argv )
                     std::cout << "  --gpu-test-monitor  Compare GPU monitor output with the lcms CPU path." << std::endl;
                     std::cout << "  --gpu=<mode>     OpenCL mode: off, export or preview (auto/all are aliases)." << std::endl;
                     std::cout << "  --gpu-device=<n> Select an OpenCL device by name substring." << std::endl;
-                    std::cout << "  --gpu-capture=<mode> Use GPU Capture Sharpening: off or on (default off)." << std::endl;
+                    std::cout << "  --gpu-capture=<mode> Capture Sharpening: off, auto or on (default off)." << std::endl;
                     std::cout << "  -c <files>       Specify one or more input files or folders." << std::endl;
                     std::cout << "                   When specifying folders, Rawtherapee will look for image file types which comply" << std::endl;
                     std::cout << "                   with the selected extensions (see also '-a')." << std::endl;

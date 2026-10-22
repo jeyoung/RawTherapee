@@ -258,6 +258,11 @@ stage() {
                 return "$default_status"
             fi
 
+            expect_stage=0
+            expect_stage_absent=""
+            extraArgs=(--gpu-capture=auto)
+            run_pair "$(basename "$sample")/$name-auto" "$sample" "$profile" "${extraArgs[@]}"
+
             expect_stage=1
             expect_stage_absent=""
             expect_stage_name="capture sharpening"

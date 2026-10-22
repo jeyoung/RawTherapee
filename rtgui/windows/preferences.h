@@ -196,7 +196,7 @@ class Preferences final :
     Gtk::SpinButton*  clutCacheSizeSB;
     Gtk::CheckButton* measureCB;
     Gtk::CheckButton* useOpenCLCB;
-    Gtk::CheckButton* useOpenCLCaptureSharpeningCB;
+    Gtk::ComboBoxText* openCLCaptureModeCombo;
     Gtk::ComboBoxText* openCLModeCombo;
     Gtk::ComboBoxText* openCLDeviceCombo;
     Gtk::Entry* openCLRusticlEntry = nullptr;

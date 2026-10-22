@@ -919,9 +919,17 @@ Gtk::Widget* Preferences::getPerformancePanel()
     useOpenCLCB->set_tooltip_text(M("PREFERENCES_OPENCL_ENABLE_TOOLTIP"));
     openclVB->pack_start(*useOpenCLCB, Gtk::PACK_SHRINK);
 
-    useOpenCLCaptureSharpeningCB = Gtk::manage(new Gtk::CheckButton(M("PREFERENCES_OPENCL_CAPTURE")));
-    useOpenCLCaptureSharpeningCB->set_tooltip_text(M("PREFERENCES_OPENCL_CAPTURE_TOOLTIP"));
-    openclVB->pack_start(*useOpenCLCaptureSharpeningCB, Gtk::PACK_SHRINK);
+    Gtk::Box* captureModeHB = Gtk::manage(new Gtk::Box());
+    captureModeHB->set_spacing(4);
+    captureModeHB->pack_start(*Gtk::manage(new Gtk::Label(M("PREFERENCES_OPENCL_CAPTURE") + ":")), Gtk::PACK_SHRINK);
+    openCLCaptureModeCombo = Gtk::manage(new Gtk::ComboBoxText());
+    openCLCaptureModeCombo->append(M("PREFERENCES_OPENCL_CAPTURE_OFF"));
+    openCLCaptureModeCombo->append(M("PREFERENCES_OPENCL_CAPTURE_AUTO"));
+    openCLCaptureModeCombo->append(M("PREFERENCES_OPENCL_CAPTURE_ON"));
+    openCLCaptureModeCombo->set_active(0);
+    openCLCaptureModeCombo->set_tooltip_text(M("PREFERENCES_OPENCL_CAPTURE_TOOLTIP"));
+    captureModeHB->pack_start(*openCLCaptureModeCombo, Gtk::PACK_EXPAND_WIDGET);
+    openclVB->pack_start(*captureModeHB, Gtk::PACK_SHRINK);
 
     Gtk::Box* openclDeviceHB = Gtk::manage(new Gtk::Box());
     openclDeviceHB->set_spacing(4);
@@ -2170,7 +2178,7 @@ void Preferences::storePreferences()
     moptions.clutCacheSize = clutCacheSizeSB->get_value_as_int();
     moptions.measure = measureCB->get_active();
     moptions.rtSettings.useOpenCL = useOpenCLCB->get_active();
-    moptions.rtSettings.useOpenCLCaptureSharpening = useOpenCLCaptureSharpeningCB->get_active();
+    moptions.rtSettings.openCLCaptureMode = openCLCaptureModeCombo->get_active_row_number();
     moptions.rtSettings.openCLMode = openCLModeCombo->get_active_row_number() == 1 ? 1 : 0;
 #ifdef __linux__
     moptions.rtSettings.openCLRusticlDriver = openCLRusticlEntry->get_text();
@@ -2409,7 +2417,7 @@ void Preferences::fillPreferences()
     clutCacheSizeSB->set_value (moptions.clutCacheSize);
     measureCB->set_active (moptions.measure);
     useOpenCLCB->set_active(moptions.rtSettings.useOpenCL);
-    useOpenCLCaptureSharpeningCB->set_active(moptions.rtSettings.useOpenCLCaptureSharpening);
+    openCLCaptureModeCombo->set_active(std::min(2, std::max(0, moptions.rtSettings.openCLCaptureMode)));
     openCLModeCombo->set_active(moptions.rtSettings.openCLMode == 1 ? 1 : 0);
 #ifdef __linux__
     openCLRusticlEntry->set_text(moptions.rtSettings.openCLRusticlDriver);
@@ -2520,7 +2528,7 @@ void Preferences::autoMonProfileToggled()
 void Preferences::updateOpenCLSensitivity()
 {
     const bool enabled = openCLAvailable && useOpenCLCB->get_active();
-    useOpenCLCaptureSharpeningCB->set_sensitive(enabled);
+    openCLCaptureModeCombo->set_sensitive(enabled);
     openCLModeCombo->set_sensitive(enabled);
     openCLDeviceCombo->set_sensitive(enabled);
 #ifdef __linux__

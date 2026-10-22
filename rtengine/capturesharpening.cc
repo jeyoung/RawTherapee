@@ -17,13 +17,23 @@
  *  along with RawTherapee.  If not, see <http://www.gnu.org/licenses/>.
 */
 #include <cmath>
+#include <algorithm>
+#include <chrono>
 #include <iostream>
+#include <map>
+#include <mutex>
+#include <tuple>
+#include <vector>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #include "rtengine.h"
 #include "rawimage.h"
 #include "rawimagesource.h"
 #include "rt_math.h"
 #include "procparams.h"
+#include "settings.h"
 #include "color.h"
 #include "rt_algo.h"
 //#define BENCHMARK
@@ -37,9 +47,6 @@
 #include "imagefloat.h"
 #include "labimage.h"
 #include "cplx_wavelet_dec.h"
-#ifdef _OPENMP
-#include <omp.h>
-#endif
 
 namespace 
 {
@@ -297,20 +304,10 @@ bool checkForStop(float** tmpIThr, float** iterCheck, int fullTileSize, int bord
     return false;
 }
 
-void CaptureDeconvSharpening (float** luminance, const float* const * oldLuminance, const float * const * blend, int W, int H, float sigma, float sigmaCornerOffset, int iterations, bool checkIterStop, rtengine::ProgressListener* plistener, double startVal, double endVal)
+static void CaptureDeconvSharpeningCPU (float** luminance, const float* const * oldLuminance, const float * const * blend, int W, int H, float sigma, float sigmaCornerOffset, int iterations, bool checkIterStop, rtengine::ProgressListener* plistener, double startVal, double endVal)
 {
 BENCHFUN
 
-    if (rtengine::opencl::stageAllowed()
-            && rtengine::opencl::captureSharpening(luminance, oldLuminance,
-                                                   blend, W, H, sigma,
-                                                   sigmaCornerOffset, iterations,
-                                                   checkIterStop)) {
-        if (plistener) {
-            plistener->setProgress(endVal);
-        }
-        return;
-    }
     const bool is9x9 = (sigma <= 1.5f && sigmaCornerOffset == 0.f);
     const bool is7x7 = (sigma <= 1.15f && sigmaCornerOffset == 0.f);
     const bool is5x5 = (sigma <= 0.84f && sigmaCornerOffset == 0.f);
@@ -542,6 +539,180 @@ BENCHFUN
                 }
             }
         }
+    }
+}
+
+namespace
+{
+
+int captureRadiusForAuto(float sigma)
+{
+    if (sigma < 0.6f) {
+        return 1;
+    }
+    if (sigma <= 0.84f) {
+        return 2;
+    }
+    if (sigma <= 1.15f) {
+        return 3;
+    }
+    if (sigma <= 1.5f) {
+        return 4;
+    }
+    return 6;
+}
+
+bool captureAutoWorthwhile(float sigma, float sigmaCornerOffset, int iterations,
+                           bool checkIterStop)
+{
+    if (sigmaCornerOffset != 0.0f || iterations <= 0) {
+        return false;
+    }
+
+    if (!rtengine::opencl::enabled()
+            || rtengine::opencl::selectedDevice() < 0) {
+        return false;
+    }
+
+    const int radius = captureRadiusForAuto(sigma);
+    int threads = 1;
+#ifdef _OPENMP
+    threads = omp_get_max_threads();
+#endif
+    const int device = rtengine::opencl::selectedDevice();
+
+    using Key = std::tuple<int, int, int, bool, int>;
+    static std::mutex cacheMutex;
+    static std::map<Key, bool> cache;
+    const Key key(radius, iterations, threads, checkIterStop, device);
+
+    std::lock_guard<std::mutex> lock(cacheMutex);
+    const auto found = cache.find(key);
+
+    if (found != cache.end()) {
+        return found->second;
+    }
+
+    // Compare the real CPU and GPU deconvolution on a representative 2.3 MP
+    // sample. The sample includes transfer and kernel launch costs; require a
+    // clear GPU win so that a close result keeps the CPU path.
+    constexpr int sampleSize = 1536;
+    constexpr double requiredGpuGain = 1.10;
+    constexpr int sampleModulus = 97;
+    constexpr float sampleValue = 0.25f;
+
+    bool useGpu = false;
+
+    try {
+        std::vector<float> oldData(static_cast<size_t>(sampleSize) * sampleSize);
+        std::vector<float> blendData(oldData.size());
+        std::vector<float> lumData(oldData.size());
+        std::vector<float*> oldRows(sampleSize);
+        std::vector<float*> blendRows(sampleSize);
+        std::vector<float*> lumRows(sampleSize);
+
+        for (int y = 0; y < sampleSize; ++y) {
+            oldRows[y] = oldData.data() + static_cast<size_t>(y) * sampleSize;
+            blendRows[y] = blendData.data() + static_cast<size_t>(y) * sampleSize;
+            lumRows[y] = lumData.data() + static_cast<size_t>(y) * sampleSize;
+
+            for (int x = 0; x < sampleSize; ++x) {
+                const float value = sampleValue
+                    + 0.5f * static_cast<float>((x * 17 + y * 31) % sampleModulus)
+                        / static_cast<float>(sampleModulus);
+                oldRows[y][x] = value;
+                blendRows[y][x] = 1.0f;
+                lumRows[y][x] = value;
+            }
+        }
+
+        const auto resetLum = [&]() {
+            std::copy(oldData.begin(), oldData.end(), lumData.begin());
+        };
+
+        const auto startCpu = std::chrono::steady_clock::now();
+        CaptureDeconvSharpeningCPU(lumRows.data(), oldRows.data(),
+                                   blendRows.data(), sampleSize, sampleSize,
+                                   sigma, 0.0f, iterations, checkIterStop,
+                                   nullptr, 0.0, 1.0);
+        const auto endCpu = std::chrono::steady_clock::now();
+
+        // Warm up compilation and allocation before measuring the GPU path.
+        resetLum();
+        if (rtengine::opencl::captureSharpening(
+                lumRows.data(), oldRows.data(), blendRows.data(),
+                sampleSize, sampleSize, sigma, 0.0f, iterations,
+                checkIterStop, true)) {
+            resetLum();
+            const auto startGpu = std::chrono::steady_clock::now();
+            const bool gpuOk = rtengine::opencl::captureSharpening(
+                lumRows.data(), oldRows.data(), blendRows.data(),
+                sampleSize, sampleSize, sigma, 0.0f, iterations,
+                checkIterStop, true);
+            const auto endGpu = std::chrono::steady_clock::now();
+
+            if (gpuOk) {
+                const double cpuMs = std::chrono::duration<double, std::milli>(
+                    endCpu - startCpu).count();
+                const double gpuMs = std::chrono::duration<double, std::milli>(
+                    endGpu - startGpu).count();
+                useGpu = gpuMs * requiredGpuGain < cpuMs;
+
+                if ((rtengine::settings != nullptr && rtengine::settings->verbose)
+                        || g_getenv("RT_OPENCL_PROFILE") != nullptr) {
+                    std::fprintf(stderr,
+                                 "OpenCL: capture auto radius %d: CPU %.1f ms, "
+                                 "GPU %.1f ms -> %s\n",
+                                 radius, cpuMs, gpuMs,
+                                 useGpu ? "GPU" : "CPU");
+                }
+            }
+        }
+    } catch (const std::exception&) {
+        useGpu = false;
+    }
+
+    cache.emplace(key, useGpu);
+    return useGpu;
+}
+
+} // namespace
+
+void CaptureDeconvSharpening (float** luminance, const float* const * oldLuminance, const float * const * blend, int W, int H, float sigma, float sigmaCornerOffset, int iterations, bool checkIterStop, rtengine::ProgressListener* plistener, double startVal, double endVal)
+{
+    BENCHFUN
+
+    const int captureMode = rtengine::settings != nullptr
+        ? rtengine::settings->openCLCaptureMode : 0;
+    bool useGpu = captureMode == 2;
+
+    if (captureMode == 1 && rtengine::opencl::stageAllowed()) {
+        useGpu = captureAutoWorthwhile(sigma, sigmaCornerOffset, iterations,
+                                       checkIterStop);
+    }
+
+    if (useGpu && rtengine::opencl::stageAllowed()
+            && rtengine::opencl::captureSharpening(
+                luminance, oldLuminance, blend, W, H, sigma,
+                sigmaCornerOffset, iterations, checkIterStop)) {
+        if (plistener) {
+            plistener->setProgress(endVal);
+        }
+        return;
+    }
+
+    const bool profile = g_getenv("RT_OPENCL_PROFILE") != nullptr;
+    const auto cpuStart = std::chrono::steady_clock::now();
+    CaptureDeconvSharpeningCPU(luminance, oldLuminance, blend, W, H, sigma,
+                               sigmaCornerOffset, iterations, checkIterStop,
+                               plistener, startVal, endVal);
+
+    if (profile) {
+        const auto cpuEnd = std::chrono::steady_clock::now();
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            cpuEnd - cpuStart).count();
+        std::printf("opencl capture sharpening cpu: %lld ms\n",
+                    static_cast<long long>(ms));
     }
 }
 
