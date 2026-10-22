@@ -18,20 +18,20 @@ The first build downloads the Debian 12 image and installs build dependencies.
 The container is always based on Debian 12 so the package keeps the bookworm
 baseline.
 
-Verified artefact from commit `941a4f4f9`:
+Verified artefact from commit `9bf381b7e`:
 
 ```
-build/portable/rawtherapee-5.13-130-g941a4f4f9_5.13+git13151.941a4f4f9-1_amd64.deb
-sha256 ae1040360ede9886aae49c6c5f0ec774a3fe47420226f003b9b018522240cc12
+build/portable/rawtherapee-5.13-131-g9bf381b7e_5.13+git13152.9bf381b7e-1_amd64.deb
+sha256 8ab8116e7f0a19c8a6d4acf6f5f7b873af00823850c3f4fdb42030c238ef9868
 ```
 
 The Debian 12 and Debian 13 package tests installed the `.deb`, listed formats
-(including JPEG XL), exported the 10.2 MP PEF with the Capture Sharpening
-profile (pixel-exact against the host single-threaded export), exported the
-45.7 MP NEF with the full user profile and matching DCP/Lensfun paths
-(pixel-exact), and started the GUI under Xvfb. The test containers have no
-OpenCL ICD, so `--gpu-test` and `--gpu-test-monitor` were recorded as not run
-rather than passed.
+(including JPEG XL), and exported the 10.2 MP PEF with the Capture Sharpening
+profile; both were pixel-exact against the host single-threaded export. The
+final Debian 13 package also exported the 45.7 MP NEF with the full user
+profile and matching DCP/Lensfun paths, pixel-exact. The GUI started under
+Xvfb. The test containers have no OpenCL ICD, so `--gpu-test` and
+`--gpu-test-monitor` were recorded as not run rather than passed.
 
 ## Layout
 
