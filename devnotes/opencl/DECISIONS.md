@@ -266,6 +266,24 @@ alone. Both miss the 10–12 MP regression and penalise large images on systems
 where the GPU is faster.
 
 Consequences: default GPU exports keep the faster output-conversion and resize
-stages without paying the slower capture stage. Opt-in capture remains
-available for comparison. A future thread- and workload-aware policy may
-re-enable it automatically after the kernel is optimised.
+stages without paying the capture stage. D019 now makes the 5×5 path faster
+than the CPU, but opt-in capture remains the default until the larger radii
+are optimised or a workload-aware policy is added.
+
+## D019 — Specialise the 5×5 capture kernel
+
+Date: 2026-10-22
+
+Decision: compile the capture kernel with a 5×5 symmetric convolution
+(`RT_CAPTURE5`) when the selected radius is 2, and launch only the four
+non-empty tile ranges instead of enqueueing the full grid for every edge
+phase. Reuse pooled buffers for the three full-image planes.
+
+Alternatives: leave the generic 13×13-capable loop for every radius. It is
+required for the other radii but wastes most of its operations on the common
+5×5 case.
+
+Consequences: PEF 10 MP, 20 iterations, capture stage fell from about 1.12 s
+to 0.25 s on the RX 550, which is now faster than the 8-thread CPU stage. The
+generic 7×7, 9×9 and 13×13 paths remain slower and stay behind the opt-in
+setting. Parity remains 1 LSB at 16-bit.

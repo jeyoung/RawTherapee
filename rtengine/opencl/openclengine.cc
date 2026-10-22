@@ -161,6 +161,34 @@ inline float rt_conv(__local const float* src, const int x, const int y,
     return sum;
 }
 
+inline float rt_conv5(__local const float* src, const int x, const int y,
+                      __global const float* weights)
+{
+    const float c21 = weights[1];
+    const float c20 = weights[2];
+    const float c11 = weights[6];
+    const float c10 = weights[7];
+    const float c00 = weights[12];
+
+    return c21 * ((src[(y - 2) * RT_FULL + (x - 1)] + src[(y - 2) * RT_FULL + (x + 1)])
+        + (src[(y - 1) * RT_FULL + (x - 2)] + src[(y - 1) * RT_FULL + (x + 2)])
+        + (src[(y + 1) * RT_FULL + (x - 2)] + src[(y + 1) * RT_FULL + (x + 2)])
+        + (src[(y + 2) * RT_FULL + (x - 1)] + src[(y + 2) * RT_FULL + (x + 1)]))
+        + c20 * (src[(y - 2) * RT_FULL + x] + src[y * RT_FULL + (x - 2)]
+            + src[y * RT_FULL + (x + 2)] + src[(y + 2) * RT_FULL + x])
+        + c11 * (src[(y - 1) * RT_FULL + (x - 1)] + src[(y - 1) * RT_FULL + (x + 1)]
+            + src[(y + 1) * RT_FULL + (x - 1)] + src[(y + 1) * RT_FULL + (x + 1)])
+        + c10 * (src[(y - 1) * RT_FULL + x] + src[y * RT_FULL + (x - 1)]
+            + src[y * RT_FULL + (x + 1)] + src[(y + 1) * RT_FULL + x])
+        + c00 * src[y * RT_FULL + x];
+}
+
+#ifdef RT_CAPTURE5
+#define RT_CONV(src, x, y, radius, weights) rt_conv5(src, x, y, weights)
+#else
+#define RT_CONV(src, x, y, radius, weights) rt_conv(src, x, y, radius, weights)
+#endif
+
 __kernel __attribute__((reqd_work_group_size(RT_TILE, RT_TILE, 1)))
 void rt_capture(__global const float* oldLum,
                 __global const float* blend,
@@ -169,7 +197,8 @@ void rt_capture(__global const float* oldLum,
                 const int width, const int height,
                 const int border, const int full,
                 const int iterations, const int checkStop,
-                const int radius, const int phase, const int firstTileY)
+                const int radius, const int phase, const int firstTileY,
+                const int firstTileX)
 {
     __local float tmpI[RT_FULL * RT_FULL];
     __local float tmp[RT_FULL * RT_FULL];
@@ -180,7 +209,7 @@ void rt_capture(__global const float* oldLum,
 
     const int wx = get_local_id(0);
     const int wy = get_local_id(1);
-    const int tileX = border + get_group_id(0) * RT_TILE;
+    const int tileX = border + (firstTileX + get_group_id(0)) * RT_TILE;
     const int tileY = border + (firstTileY + get_group_id(1)) * RT_TILE;
     const int endX = (tileX + RT_TILE + border) >= width;
     const int endY = (tileY + RT_TILE + border) >= height;
@@ -234,14 +263,14 @@ void rt_capture(__global const float* oldLum,
         for (int y = radius + wy; y < full - radius; y += RT_TILE) {
             for (int x = radius + wx; x < full - radius; x += RT_TILE) {
                 tmp[y * RT_FULL + x] = lumLocal[y * RT_FULL + x]
-                    / fmax(rt_conv(tmpI, x, y, radius, weights), 0.00001f);
+                    / fmax(RT_CONV(tmpI, x, y, radius, weights), 0.00001f);
             }
         }
         barrier(CLK_LOCAL_MEM_FENCE);
 
         for (int y = radius + wy; y < full - radius; y += RT_TILE) {
             for (int x = radius + wx; x < full - radius; x += RT_TILE) {
-                tmpI[y * RT_FULL + x] *= rt_conv(tmp, x, y, radius, weights);
+                tmpI[y * RT_FULL + x] *= RT_CONV(tmp, x, y, radius, weights);
             }
         }
         barrier(CLK_LOCAL_MEM_FENCE);
@@ -2934,8 +2963,12 @@ bool captureSharpening(float** luminance, const float* const* oldLuminance,
         std::min<unsigned long long>(16, chunkBudget / perRow));
 
     std::string error;
+    std::string captureOptions = standardOption(info);
+    if (radius == 2) {
+        captureOptions += " -DRT_CAPTURE5";
+    }
     cl_program program = programFor(state, captureSharpeningKernelSource,
-                                    standardOption(info), error);
+                                    captureOptions, error);
 
     if (program == nullptr) {
         if (settings != nullptr && settings->verbose && !error.empty()) {
@@ -2994,15 +3027,35 @@ bool captureSharpening(float** luminance, const float* const* oldLuminance,
         return buffers.add(memory);
     };
 
-    cl_mem oldBuffer = createBuffer(CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-                                    planeBytes, oldPlane.data());
-    cl_mem blendBuffer = createBuffer(CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-                                      planeBytes, blendPlane.data());
-    cl_mem lumBuffer = createBuffer(CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR,
-                                    planeBytes, lumPlane.data());
-    cl_mem kernelBuffer = createBuffer(CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-                                       flatKernel.size() * sizeof(float),
-                                       flatKernel.data());
+    cl_mem oldBuffer = nullptr;
+    cl_mem blendBuffer = nullptr;
+    cl_mem lumBuffer = nullptr;
+    cl_mem kernelBuffer = nullptr;
+
+    const auto createPooledPlane = [&](const float* host) -> cl_mem {
+        cl_mem memory = acquireBuffer(state, planeBytes);
+
+        if (memory == nullptr) {
+            return nullptr;
+        }
+
+        memory = buffers.add(memory, planeBytes, true);
+
+        if (state.api.EnqueueWriteBuffer(state.queue, memory, CL_TRUE, 0,
+                                         planeBytes, host, 0, nullptr,
+                                         nullptr) != CL_SUCCESS) {
+            return nullptr;
+        }
+
+        return memory;
+    };
+
+    oldBuffer = createPooledPlane(oldPlane.data());
+    blendBuffer = createPooledPlane(blendPlane.data());
+    lumBuffer = createPooledPlane(lumPlane.data());
+    kernelBuffer = createBuffer(CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                flatKernel.size() * sizeof(float),
+                                flatKernel.data());
 
     if (oldBuffer == nullptr || blendBuffer == nullptr || lumBuffer == nullptr
             || kernelBuffer == nullptr) {
@@ -3043,24 +3096,52 @@ bool captureSharpening(float** luminance, const float* const* oldLuminance,
 
     const size_t local[2] = {tile, tile};
 
-    // CPU tiles overlap at the right and bottom edges; run the non-overlapping
-    // tiles first, then the overlapping edge phases in the same order. Each
-    // phase is split into row chunks so one NDRange cannot trigger a watchdog.
-    for (cl_int phase = 0; phase < 4; ++phase) {
+    // CPU tiles overlap at the right and bottom edges. Run the non-overlapping
+    // tiles first, then the right, bottom and corner edges. Each range is split
+    // into row chunks so one NDRange cannot trigger a watchdog.
+    struct PhaseRange {
+        cl_int phase;
+        int firstX;
+        int nx;
+        int firstY;
+        int ny;
+    };
+
+    const int nonEdgeX = tilesX - 1;
+    const int nonEdgeY = tilesY - 1;
+    const PhaseRange ranges[4] = {
+        {0, 0, nonEdgeX, 0, nonEdgeY},
+        {1, tilesX - 1, 1, 0, nonEdgeY},
+        {2, 0, nonEdgeX, tilesY - 1, nonEdgeX > 0 ? 1 : 0},
+        {3, tilesX - 1, 1, tilesY - 1, 1}
+    };
+
+    int chunkLaunches = 0;
+
+    for (const PhaseRange& range : ranges) {
+        if (range.nx <= 0 || range.ny <= 0) {
+            continue;
+        }
+
+        const cl_int phaseArg = range.phase;
+        const cl_int firstTileXArg = range.firstX;
+
         if (state.api.SetKernelArg(kernelObject, 11, sizeof(cl_int),
-                                   &phase) != CL_SUCCESS) {
+                                   &phaseArg) != CL_SUCCESS
+                || state.api.SetKernelArg(kernelObject, 13, sizeof(cl_int),
+                                          &firstTileXArg) != CL_SUCCESS) {
             return false;
         }
 
-        const int firstChunk = phase >= 2
-            ? ((tilesY - 1) / chunkRows) * chunkRows : 0;
+        const size_t phaseGlobalX = static_cast<size_t>(range.nx) * tile;
+        const int lastTileY = range.firstY + range.ny;
 
-        for (int firstTileY = firstChunk; firstTileY < tilesY;
+        for (int firstTileY = range.firstY; firstTileY < lastTileY;
                 firstTileY += chunkRows) {
-            const int rows = std::min(chunkRows, tilesY - firstTileY);
+            const int rows = std::min(chunkRows, lastTileY - firstTileY);
             const cl_int firstRowArg = firstTileY;
             const size_t global[2] = {
-                globalX,
+                phaseGlobalX,
                 static_cast<size_t>(rows) * tile};
 
             if (state.api.SetKernelArg(kernelObject, 12, sizeof(cl_int),
@@ -3073,13 +3154,15 @@ bool captureSharpening(float** luminance, const float* const* oldLuminance,
                 state.error = "OpenCL device lost during capture sharpening";
                 return false;
             }
+
+            ++chunkLaunches;
         }
     }
 
-    if (settings != nullptr && settings->verbose && tilesY > chunkRows) {
+    if (settings != nullptr && settings->verbose && chunkLaunches > 1) {
         std::fprintf(stderr,
                      "OpenCL: capture sharpening split into %d row chunks\n",
-                     (tilesY + chunkRows - 1) / chunkRows);
+                     chunkLaunches);
     }
 
     if (state.api.EnqueueReadBuffer(state.queue, lumBuffer, CL_TRUE, 0,

@@ -9,9 +9,9 @@
 - Next task: none scheduled. RCD demosaic was evaluated and deferred; the next
   candidate, only if requested, is wavelet/denoise
 - Known limitations: single-stage acceleration is roughly neutral end-to-end;
-  GPU Capture Sharpening is opt-in and slower than the multi-threaded CPU on
-  the RX 550; transform is limited to rotation/scale/crop without LCP, CA,
-  distortion,
+  GPU Capture Sharpening is opt-in — the 5×5 path is now faster than the CPU,
+  while larger radii remain slower on the RX 550; transform is limited to
+  rotation/scale/crop without LCP, CA, distortion,
   perspective or vignetting; capture sharpening is split into watchdog-safe
   chunks and sized by a work budget; output conversion is limited to
   `RTv4_sRGB`, relative colorimetric intent and integer output; monitor
@@ -169,17 +169,19 @@ An RCD full-image pass prototype was implemented and reverted before commit.
 - Scope: `sigmaCornerOffset == 0`, fixed 3/5/7/9/13 kernels, tile size 32,
   per-tile early stop. Other cases fall back to CPU.
 - GPU capture is opt-in as of 2026-10-22 (`--gpu-capture=on` or Preferences).
-  Default auto mode keeps capture on the CPU because the stage is slower than
-  the 8-thread CPU on the RX 550.
+  Default auto mode keeps capture on the CPU. The 5×5 path is now faster than
+  the CPU after specialisation; the 7×7, 9×9 and 13×13 paths remain slower.
 - PEF 10.2 MP, `capture.pp3`, OMP=8: CPU total 3.13 s; GPU default 2.88 s with
-  no capture stage; GPU with `--gpu-capture=on` 3.74 s and a 1.12 s capture
-  stage. Parity at OMP=1 is 1 LSB.
+  no capture stage; GPU with `--gpu-capture=on` 2.88 s and a 0.25 s capture
+  stage. Parity at OMP=1 is 1 LSB. The 5×5 path is specialised; other radii
+  still use the generic kernel and remain slower than the CPU.
 - PEF 10 MP: PASS, PAE 1 LSB on AMD RX 550 and POCL.
 - 0.75, 1.5 and 2.0 radii, with and without early stop: PASS, PAE 1 LSB.
 - 45.7 MP NEF: PASS on Rusticl RX 550 after the 12 MP rejection was removed;
   capture is split into adaptive 16-row (or smaller) launches and each launch
-  is finished before the next. Capture 4.77 s; total 36.31 s GPU versus
-  36.69 s CPU; PAE 1 LSB. End-to-end remains roughly neutral.
+  is finished before the next. After the 5×5 specialisation the opt-in stage
+  takes 1.71 s at OMP=8 (17.98 s total). The earlier automatic-selection result
+  was 4.77 s capture and 36.31 s GPU versus 36.69 s CPU; PAE 1 LSB.
 - Kernel uses 1024 work-items and ~35 KiB local memory; devices below that
   fall back. Work per chunk is bounded by `chunkBudget` so high radius/iteration
   settings can fall back to CPU instead of tripping the watchdog.
@@ -188,7 +190,7 @@ An RCD full-image pass prototype was implemented and reverted before commit.
   explicitly or use `OCL_ICD_VENDORS`. It is intentionally not selected in auto
   mode because the native CPU path is faster (45.7 MP: 16.75 s capture /
   50.76 s total).
-- PEF 10 MP: stage 1.15 s; PAE 1 LSB.
+- Historical PEF 10 MP generic-kernel stage: 1.15 s; PAE 1 LSB.
 - PEF radius 2.0, 100 iterations, early stop off: PASS, 5.73 s, PAE 1 LSB;
   this exercises the one-row chunk limit.
 - POCL-only auto mode uses the native CPU path; explicit POCL selection and

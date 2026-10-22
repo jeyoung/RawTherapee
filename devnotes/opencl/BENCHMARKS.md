@@ -66,10 +66,10 @@ stages is required for a clear end-to-end win.
 
 ## Capture sharpening (opt-in)
 
-GPU Capture Sharpening is opt-in as of 2026-10-22. It is slower than the
-multi-threaded CPU path on the RX 550 for the common 5×5, 20-iteration case, so
-auto mode keeps it on the CPU. Enable it with `--gpu-capture=on` or
-Preferences → Performance → OpenCL.
+GPU Capture Sharpening is opt-in as of 2026-10-22. Before the 5×5
+specialisation it was slower than the multi-threaded CPU path on the RX 550;
+it remains opt-in because the other radii still use the generic kernel. Enable
+it with `--gpu-capture=on` or Preferences → Performance → OpenCL.
 
 PEF, 3896x2616, 10.2 MP, `capture.pp3`, `OMP_NUM_THREADS=8`, 16-bit TIFF:
 
@@ -83,13 +83,15 @@ RT_OPENCL_PROFILE=1 OMP_NUM_THREADS=8 rawtherapee-cli \
 |---|---|---|---|
 | CPU (`--gpu=off`) | 3.13 s | 751 MB | — |
 | GPU default (`--gpu=auto`) | 2.88 s | 841 MB | — |
-| GPU opt-in (`--gpu-capture=on`) | 3.74 s | 968 MB | **1.12 s** |
+| GPU opt-in (`--gpu-capture=on`) | 2.88 s | — | **0.25 s** |
 
-The default GPU path is faster overall because of output conversion, but
-enabling the GPU capture stage makes the total slower. Parity at
-`OMP_NUM_THREADS=1` is 1 LSB. The earlier table below was recorded when auto
-mode selected GPU capture; its absolute totals are not comparable with the
-new opt-in runs.
+The default GPU path is faster overall because of output conversion. After the
+5×5 specialisation, opt-in GPU capture is also faster than the CPU stage on
+this image: 0.25 s versus about 0.36 s. Other kernel radii still use the generic
+loop and remain slower than the 8-thread CPU, so GPU capture stays opt-in.
+Parity at `OMP_NUM_THREADS=1` is 1 LSB. The earlier table below was recorded
+when auto mode selected GPU capture; its absolute totals are not comparable
+with the new opt-in runs.
 
 Historical PEF measurement:
 
@@ -98,11 +100,11 @@ Historical PEF measurement:
 | CPU | 7.88 s | 730 MB | — |
 | GPU | 7.71 s | 942 MB | 1.15 s |
 
-On the 45.7 MP D850 NEF, Rusticl RX 550 capture took 4.77 s when the stage was
-selected automatically. That measurement predates the opt-in change; with the
-current default the stage stays on the CPU. POCL is test-only and intentionally
-skipped in auto mode: the same 45.7 MP case took 16.75 s capture and 50.76 s
-total on POCL.
+On the 45.7 MP D850 NEF, the opt-in 5×5 capture stage took 1.71 s at OMP=8
+after the specialisation, with a 17.98 s total. Before the specialisation it
+took 4.77 s when selected automatically; that older measurement predates the
+opt-in change. POCL is test-only and intentionally skipped in auto mode: the
+same 45.7 MP case took 16.75 s capture and 50.76 s total on POCL.
 
 ## sRGB output conversion
 
