@@ -86,12 +86,25 @@ RT_OPENCL_PROFILE=1 OMP_NUM_THREADS=8 rawtherapee-cli \
 | GPU opt-in (`--gpu-capture=on`) | 2.88 s | — | **0.25 s** |
 
 The default GPU path is faster overall because of output conversion. After the
-5×5 specialisation, opt-in GPU capture is also faster than the CPU stage on
-this image: 0.25 s versus about 0.36 s. Other kernel radii still use the generic
-loop and remain slower than the 8-thread CPU, so GPU capture stays opt-in.
-Parity at `OMP_NUM_THREADS=1` is 1 LSB. The earlier table below was recorded
-when auto mode selected GPU capture; its absolute totals are not comparable
-with the new opt-in runs.
+kernel specialisations, opt-in GPU capture is faster than the CPU for 3×3, 5×5
+and 9×9 at 8 threads; 7×7 and 13×13 are still slower. Parity at
+`OMP_NUM_THREADS=1` is 1 LSB. The earlier table below was recorded when auto
+mode selected GPU capture; its absolute totals are not comparable with the new
+opt-in runs.
+
+Capture stage at `OMP_NUM_THREADS=8`, approximate CPU stage derived from
+capture-on minus capture-off totals:
+
+| Kernel | GPU stage | CPU stage | Result |
+|---|---:|---:|---|
+| 3×3 | 0.32 s | 0.46 s | GPU |
+| 5×5 | 0.26 s | 0.62 s | GPU |
+| 7×7 | 0.69 s | 0.54 s | CPU |
+| 9×9 | 0.98 s | 1.20 s | GPU |
+| 13×13 | 1.78 s | 1.48 s | CPU |
+
+The mixed result is why automatic selection cannot use a pixel or radius rule
+without calibration.
 
 Historical PEF measurement:
 

@@ -170,11 +170,13 @@ An RCD full-image pass prototype was implemented and reverted before commit.
   per-tile early stop. Other cases fall back to CPU.
 - GPU capture is opt-in as of 2026-10-22 (`--gpu-capture=on` or Preferences).
   Default auto mode keeps capture on the CPU. The 5×5 path is now faster than
-  the CPU after specialisation; the 7×7, 9×9 and 13×13 paths remain slower.
+  the CPU after specialisation; the other radii use a symmetric kernel, with
+  7×7 and 13×13 still slower at 8 threads.
 - PEF 10.2 MP, `capture.pp3`, OMP=8: CPU total 3.13 s; GPU default 2.88 s with
   no capture stage; GPU with `--gpu-capture=on` 2.88 s and a 0.25 s capture
-  stage. Parity at OMP=1 is 1 LSB. The 5×5 path is specialised; other radii
-  still use the generic kernel and remain slower than the CPU.
+  stage. Parity at OMP=1 is 1 LSB. Kernel coverage at OMP=8: 3×3 GPU 0.32 s vs
+  CPU 0.46 s; 5×5 0.25 s vs 0.62 s; 7×7 0.69 s vs 0.54 s; 9×9 0.98 s vs
+  1.20 s; 13×13 1.78 s vs 1.48 s.
 - PEF 10 MP: PASS, PAE 1 LSB on AMD RX 550 and POCL.
 - 0.75, 1.5 and 2.0 radii, with and without early stop: PASS, PAE 1 LSB.
 - 45.7 MP NEF: PASS on Rusticl RX 550 after the 12 MP rejection was removed;

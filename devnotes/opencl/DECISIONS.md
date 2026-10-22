@@ -275,15 +275,15 @@ are optimised or a workload-aware policy is added.
 Date: 2026-10-22
 
 Decision: compile the capture kernel with a 5×5 symmetric convolution
-(`RT_CAPTURE5`) when the selected radius is 2, and launch only the four
+(`RT_CAPTURE5`) when the selected radius is 2, and a symmetric triangular
+convolution (`RT_CAPTURE_SYM`) for the other radii. Launch only the four
 non-empty tile ranges instead of enqueueing the full grid for every edge
 phase. Reuse pooled buffers for the three full-image planes.
 
-Alternatives: leave the generic 13×13-capable loop for every radius. It is
-required for the other radii but wastes most of its operations on the common
-5×5 case.
+Alternatives: leave the generic loop for every radius. It wastes most of its
+operations on symmetric weights.
 
-Consequences: PEF 10 MP, 20 iterations, capture stage fell from about 1.12 s
-to 0.25 s on the RX 550, which is now faster than the 8-thread CPU stage. The
-generic 7×7, 9×9 and 13×13 paths remain slower and stay behind the opt-in
-setting. Parity remains 1 LSB at 16-bit.
+Consequences: PEF 10 MP, 20 iterations, OMP=8 capture stage: 5×5 0.25 s (was
+1.12 s), 7×7 0.69 s (was 1.91 s), 9×9 0.98 s (was 3.00 s), 13×13 1.78 s (was
+5.89 s). The GPU wins for 3×3, 5×5 and 9×9 at 8 threads; 7×7 and 13×13 remain
+slower than the CPU. Parity remains 1 LSB at 16-bit.

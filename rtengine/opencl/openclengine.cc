@@ -183,8 +183,48 @@ inline float rt_conv5(__local const float* src, const int x, const int y,
         + c00 * src[y * RT_FULL + x];
 }
 
+inline float rt_conv_sym(__local const float* src, const int x, const int y,
+                         const int radius, __global const float* weights)
+{
+    const int size = 2 * radius + 1;
+    float sum = weights[radius * size + radius] * src[y * RT_FULL + x];
+
+    for (int i = 1; i <= radius; ++i) {
+        const float vertical = weights[(radius + i) * size + radius];
+        const float horizontal = weights[radius * size + radius + i];
+        sum += vertical * (src[(y + i) * RT_FULL + x]
+            + src[(y - i) * RT_FULL + x]);
+        sum += horizontal * (src[y * RT_FULL + x + i]
+            + src[y * RT_FULL + x - i]);
+
+        for (int j = 1; j < i; ++j) {
+            const float weight = weights[(radius + i) * size + radius + j];
+            sum += weight * (
+                src[(y + i) * RT_FULL + x + j]
+                + src[(y + i) * RT_FULL + x - j]
+                + src[(y - i) * RT_FULL + x + j]
+                + src[(y - i) * RT_FULL + x - j]
+                + src[(y + j) * RT_FULL + x + i]
+                + src[(y + j) * RT_FULL + x - i]
+                + src[(y - j) * RT_FULL + x + i]
+                + src[(y - j) * RT_FULL + x - i]);
+        }
+
+        const float diagonal = weights[(radius + i) * size + radius + i];
+        sum += diagonal * (
+            src[(y + i) * RT_FULL + x + i]
+            + src[(y + i) * RT_FULL + x - i]
+            + src[(y - i) * RT_FULL + x + i]
+            + src[(y - i) * RT_FULL + x - i]);
+    }
+
+    return sum;
+}
+
 #ifdef RT_CAPTURE5
 #define RT_CONV(src, x, y, radius, weights) rt_conv5(src, x, y, weights)
+#elif defined(RT_CAPTURE_SYM)
+#define RT_CONV(src, x, y, radius, weights) rt_conv_sym(src, x, y, radius, weights)
 #else
 #define RT_CONV(src, x, y, radius, weights) rt_conv(src, x, y, radius, weights)
 #endif
@@ -2966,6 +3006,8 @@ bool captureSharpening(float** luminance, const float* const* oldLuminance,
     std::string captureOptions = standardOption(info);
     if (radius == 2) {
         captureOptions += " -DRT_CAPTURE5";
+    } else {
+        captureOptions += " -DRT_CAPTURE_SYM";
     }
     cl_program program = programFor(state, captureSharpeningKernelSource,
                                     captureOptions, error);
