@@ -289,13 +289,14 @@ run_monitor() {
     local log
     log="$(mktemp "${TMPDIR:-/tmp}/rtmonitor.XXXXXX.log")"
 
-    if "$cli" --gpu-test-monitor >"$log" 2>&1; then
+    local status=0
+    "$cli" --gpu-test-monitor >"$log" 2>&1 || status=$?
+
+    if [ "$status" -eq 0 ]; then
         printf 'PASS\tmonitor\t%s\n' "$(tail -n 1 "$log")"
         rm -f "$log"
         return 0
     fi
-
-    local status=$?
 
     if [ "$status" -eq 2 ]; then
         printf 'SKIP\tmonitor\t%s\n' "$(tail -n 1 "$log")"
