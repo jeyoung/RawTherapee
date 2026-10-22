@@ -234,11 +234,29 @@ stage() {
     expect_stage=1
     case "$name" in
         capture)
+            local settings_dir
+            settings_dir="$(mktemp -d "${TMPDIR:-/tmp}/rtcap.XXXXXX")"
+            local saved_settings="${RT_SETTINGS-}"
+            export RT_SETTINGS="$settings_dir"
+
             expect_stage=0
             expect_stage_name=""
             expect_stage_absent="capture sharpening"
-            extraArgs=(--gpu-capture=off)
-            run_pair "$(basename "$sample")/$name-default-off" "$sample" "$profile" "${extraArgs[@]}"
+            extraArgs=()
+            local default_status=0
+            run_pair "$(basename "$sample")/$name-default" "$sample" "$profile" "${extraArgs[@]}" \
+                || default_status=$?
+
+            if [ -n "$saved_settings" ]; then
+                export RT_SETTINGS="$saved_settings"
+            else
+                unset RT_SETTINGS
+            fi
+            rm -rf "$settings_dir"
+
+            if [ "$default_status" -ne 0 ]; then
+                return "$default_status"
+            fi
 
             expect_stage=1
             expect_stage_absent=""

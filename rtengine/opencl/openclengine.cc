@@ -3161,7 +3161,7 @@ bool captureSharpening(float** luminance, const float* const* oldLuminance,
 
     if (settings != nullptr && settings->verbose && chunkLaunches > 1) {
         std::fprintf(stderr,
-                     "OpenCL: capture sharpening split into %d row chunks\n",
+                     "OpenCL: capture sharpening split into %d launches\n",
                      chunkLaunches);
     }
 

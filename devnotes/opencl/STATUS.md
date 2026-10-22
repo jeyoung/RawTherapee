@@ -4,8 +4,8 @@
 
 - Branch: `perf` (based on `opencl`, which is based on `dev` at `b2ee504c4`)
 - Milestone: M12 — opt-in GPU `rgbProc` core complete; GPU porting paused
-- Last verified: 2026-10-21, six-format export, monitor parity and opt-in
-  `rgbProc` parity on AMD RX 550
+- Last verified: 2026-10-22, six-format export, monitor parity and opt-in
+  `rgbProc` parity on AMD RX 550; capture opt-in and 5×5 fast path
 - Next task: none scheduled. RCD demosaic was evaluated and deferred; the next
   candidate, only if requested, is wavelet/denoise
 - Known limitations: single-stage acceleration is roughly neutral end-to-end;
