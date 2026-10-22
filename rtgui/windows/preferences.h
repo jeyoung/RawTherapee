@@ -200,6 +200,7 @@ class Preferences final :
     Gtk::ComboBoxText* openCLDeviceCombo;
     Gtk::Entry* openCLRusticlEntry = nullptr;
     Gtk::Label* openCLStatusLabel;
+    bool openCLAvailable = false;
     std::vector<Glib::ustring> openCLDeviceNames;
     Gtk::SpinButton*  chunkSizeAMSB;
     Gtk::SpinButton*  chunkSizeCASB;
@@ -280,6 +281,7 @@ class Preferences final :
     void updateDFinfos ();
     void updateFFinfos ();
     void workflowUpdate();
+    void updateOpenCLSensitivity();
     void themeChanged  ();
     void fontChanged   ();
     void cpFontChanged ();

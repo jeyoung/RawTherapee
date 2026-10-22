@@ -976,15 +976,16 @@ Gtk::Widget* Preferences::getPerformancePanel()
     openclFrame->add(*openclVB);
     vbPerformance->pack_start(*openclFrame, Gtk::PACK_SHRINK, 4);
 
-    const bool openclAvailable = rtengine::opencl::available();
-    useOpenCLCB->set_sensitive(openclAvailable);
-    openCLModeCombo->set_sensitive(openclAvailable);
-    openCLDeviceCombo->set_sensitive(openclAvailable);
+    openCLAvailable = rtengine::opencl::available();
+    useOpenCLCB->set_sensitive(openCLAvailable);
 #ifdef __linux__
     // Keep the driver override editable even when no device was found: the
     // override may be what makes Rusticl expose one on the next start.
     openCLRusticlEntry->set_sensitive(true);
 #endif
+    useOpenCLCB->signal_toggled().connect(
+        sigc::mem_fun(*this, &Preferences::updateOpenCLSensitivity));
+    updateOpenCLSensitivity();
 
     Gtk::Frame* threadsFrame = Gtk::manage ( new Gtk::Frame (M ("PREFERENCES_PERFORMANCE_THREADS")) );
     threadsFrame->set_label_align(0.025, 0.5);
@@ -2418,6 +2419,7 @@ void Preferences::fillPreferences()
             }
         }
     }
+    updateOpenCLSensitivity();
     chunkSizeAMSB->set_value (moptions.chunkSizeAMAZE);
     chunkSizeCASB->set_value (moptions.chunkSizeCA);
     chunkSizeRGBSB->set_value (moptions.chunkSizeRGB);
@@ -2507,6 +2509,19 @@ void Preferences::savePressed () {
 void Preferences::autoMonProfileToggled()
 {
     monProfile->set_sensitive(!cbAutoMonProfile->get_active());
+}
+
+void Preferences::updateOpenCLSensitivity()
+{
+    const bool enabled = openCLAvailable && useOpenCLCB->get_active();
+    openCLModeCombo->set_sensitive(enabled);
+    openCLDeviceCombo->set_sensitive(enabled);
+#ifdef __linux__
+    // Keep the driver override editable when no device is available: it may be
+    // what makes Rusticl expose one on the next start. Once OpenCL is enabled
+    // and available, follow the checkbox like the other dependent controls.
+    openCLRusticlEntry->set_sensitive(!openCLAvailable || enabled);
+#endif
 }
 
 /*
