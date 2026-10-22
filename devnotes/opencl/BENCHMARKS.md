@@ -66,10 +66,17 @@ stages is required for a clear end-to-end win.
 
 ## Capture sharpening (opt-in)
 
-GPU Capture Sharpening is opt-in as of 2026-10-22. Before the 5×5
-specialisation it was slower than the multi-threaded CPU path on the RX 550;
-it remains opt-in because the other radii still use the generic kernel. Enable
-it with `--gpu-capture=on` or Preferences → Performance → OpenCL.
+GPU Capture Sharpening has three modes:
+
+- **Off** — always CPU.
+- **On** — GPU when the stage is supported.
+- **Auto** — compare the real CPU and GPU deconvolution on a 2.3 MP sample,
+  require a 10 % GPU win, and cache the decision per radius, iteration count
+  and CPU thread count. On is available through `--gpu-capture=on`; Auto uses
+  `--gpu-capture=auto`.
+
+Off remains the default because a wrong automatic choice would regress export
+time. The first Auto use per workload pays a small calibration cost.
 
 PEF, 3896x2616, 10.2 MP, `capture.pp3`, `OMP_NUM_THREADS=8`, 16-bit TIFF:
 
@@ -82,29 +89,32 @@ RT_OPENCL_PROFILE=1 OMP_NUM_THREADS=8 rawtherapee-cli \
 | Mode | Wall | Peak RSS | Capture stage |
 |---|---|---|---|
 | CPU (`--gpu=off`) | 3.13 s | 751 MB | — |
-| GPU default (`--gpu=auto`) | 2.88 s | 841 MB | — |
-| GPU opt-in (`--gpu-capture=on`) | 2.88 s | — | **0.25 s** |
+| GPU default | 2.88 s | 841 MB | — |
+| GPU forced (`--gpu-capture=on`) | 2.88 s | — | **0.25 s** |
 
 The default GPU path is faster overall because of output conversion. After the
-kernel specialisations, opt-in GPU capture is faster than the CPU for 3×3, 5×5
+kernel specialisations, forced GPU capture is faster than the CPU for 3×3, 5×5
 and 9×9 at 8 threads; 7×7 and 13×13 are still slower. Parity at
 `OMP_NUM_THREADS=1` is 1 LSB. The earlier table below was recorded when auto
-mode selected GPU capture; its absolute totals are not comparable with the new
-opt-in runs.
+mode always selected GPU capture; its absolute totals are not comparable with
+the current runs.
 
 Capture stage at `OMP_NUM_THREADS=8`, approximate CPU stage derived from
 capture-on minus capture-off totals:
 
-| Kernel | GPU stage | CPU stage | Result |
-|---|---:|---:|---|
-| 3×3 | 0.32 s | 0.46 s | GPU |
-| 5×5 | 0.26 s | 0.62 s | GPU |
-| 7×7 | 0.69 s | 0.54 s | CPU |
-| 9×9 | 0.98 s | 1.20 s | GPU |
-| 13×13 | 1.78 s | 1.48 s | CPU |
+| Kernel | GPU stage | CPU stage | Forced winner | Auto at 8 threads |
+|---|---:|---:|---|---|
+| 3×3 | 0.32 s | 0.46 s | GPU | CPU |
+| 5×5 | 0.26 s | 0.31 s | GPU | CPU |
+| 7×7 | 0.69 s | 0.54 s | CPU | CPU |
+| 9×9 | 0.98 s | 1.20 s | GPU | GPU |
+| 13×13 | 1.78 s | 1.48 s | CPU | CPU |
 
-The mixed result is why automatic selection cannot use a pixel or radius rule
-without calibration.
+The mixed result is why automatic selection uses calibration. Auto is
+conservative at 8 threads: the 2.3 MP sample keeps 3×3 and 5×5 on the CPU even
+though a full-image forced GPU run is slightly faster. At one thread the same
+sample selects the GPU for 5×5. Forced On remains available when the user has
+measured a win.
 
 Historical PEF measurement:
 
@@ -114,10 +124,13 @@ Historical PEF measurement:
 | GPU | 7.71 s | 942 MB | 1.15 s |
 
 On the 45.7 MP D850 NEF, the opt-in 5×5 capture stage took 1.71 s at OMP=8
-after the specialisation, with a 17.98 s total. Before the specialisation it
-took 4.77 s when selected automatically; that older measurement predates the
-opt-in change. POCL is test-only and intentionally skipped in auto mode: the
-same 45.7 MP case took 16.75 s capture and 50.76 s total on POCL.
+after the specialisation, with a 17.98 s total in the earlier run. Final
+Auto checks on the same image: at OMP=1 the CPU stage was 5.74 s, forced GPU
+1.63 s and Auto 1.35 s, all at 1 LSB; at OMP=8 the CPU stage was 1.29 s, forced
+GPU 1.32 s and Auto correctly kept the CPU. Before the specialisation the
+stage took 4.77 s when selected automatically. POCL is test-only and
+intentionally skipped in auto mode: the same 45.7 MP case took 16.75 s capture
+and 50.76 s total on POCL.
 
 ## sRGB output conversion
 

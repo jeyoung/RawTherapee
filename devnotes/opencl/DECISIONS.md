@@ -256,19 +256,17 @@ colour-correct rather than being approximated.
 
 Date: 2026-10-22
 
-Decision: keep GPU Capture Sharpening disabled by default. The Preferences
-checkbox and `--gpu-capture=on` enable it explicitly; `--gpu-capture=off`
-overrides a saved setting. The CPU path remains the automatic choice when the
-setting is off or OpenCL is disabled.
+Decision: keep GPU Capture Sharpening off by default and expose Off, Auto and
+On modes. Off always uses the CPU; On forces the GPU when supported; Auto
+calibrates the CPU and GPU paths and chooses conservatively. `--gpu-capture`
+and the Preferences combo select the mode.
 
-Alternatives: reinstating the old 12 MP rejection, or selecting by pixel count
-alone. Both miss the 10–12 MP regression and penalise large images on systems
-where the GPU is faster.
+Alternatives: reinstating the old 12 MP rejection, selecting by pixel count
+alone, or forcing the GPU by default. All ignore the actual CPU/GPU crossover.
 
 Consequences: default GPU exports keep the faster output-conversion and resize
-stages without paying the capture stage. D019 now makes the 5×5 path faster
-than the CPU, but opt-in capture remains the default until the larger radii
-are optimised or a workload-aware policy is added.
+stages without paying the capture stage. Auto is available for users who want
+automatic selection; D020 records the calibration policy.
 
 ## D019 — Specialise the 5×5 capture kernel
 
@@ -287,3 +285,22 @@ Consequences: PEF 10 MP, 20 iterations, OMP=8 capture stage: 5×5 0.25 s (was
 1.12 s), 7×7 0.69 s (was 1.91 s), 9×9 0.98 s (was 3.00 s), 13×13 1.78 s (was
 5.89 s). The GPU wins for 3×3, 5×5 and 9×9 at 8 threads; 7×7 and 13×13 remain
 slower than the CPU. Parity remains 1 LSB at 16-bit.
+
+## D020 — Calibrate Auto capture mode
+
+Date: 2026-10-22
+
+Decision: Auto compares the real CPU and GPU deconvolution on a 2.3 MP
+synthetic sample, including transfer and launch costs. It caches the choice per
+device, radius, iteration count, CPU thread count and early-stop setting, and
+requires the GPU to be at least 10% faster. Calibration failure or a marginal
+result keeps the CPU.
+
+Alternatives: a pixel or radius threshold, or a hardware-name table. The
+measured crossover is non-monotonic across kernel sizes and depends on the
+host CPU, so those rules are not portable.
+
+Consequences: the first Auto capture for each workload pays a one-off
+calibration cost. The 2.3 MP sample is conservative at 8 threads and keeps
+3×3/5×5 on the CPU even when a full-image forced GPU run is slightly faster;
+this is accepted to avoid a regression.

@@ -28,6 +28,9 @@ difference between two identical runs). The gate is the peak absolute error
 | 2026-10-20 | 83919dd98 | AMD RX 550 | 2026-10-04-173409.NEF / capture 0.62, 20 it | off vs auto | 1 LSB | PASS |
 | 2026-10-20 | 83919dd98 | POCL (`RT_OPENCL_ALLOW_CPU=1`) | 2026-10-04-173409.NEF / capture 0.62, 20 it | off vs auto | 1 LSB | PASS |
 | 2026-10-21 | uncommitted | AMD RX 550 | colorspace_flowers.pef / neutral | off vs auto | 1 LSB | PASS |
+| 2026-10-22 | f416c9fcb | AMD RX 550 | colorspace_flowers.pef / capture 3x3-13x13 | off vs forced GPU | 1 LSB | PASS |
+| 2026-10-22 | uncommitted | AMD RX 550 | colorspace_flowers.pef / capture Auto | off vs auto | 1 LSB | PASS |
+| 2026-10-22 | uncommitted | AMD RX 550 | d850.nef / capture 0.75, 20 it | off vs forced GPU and Auto | 1 LSB | PASS |
 | 2026-10-21 | uncommitted | AMD RX 550 | d850.nef / neutral | off vs auto | 1 LSB | PASS |
 | 2026-10-21 | uncommitted | AMD RX 550 | jpg, tif, png manifest entries | off vs auto | 1 LSB | PASS |
 | 2026-10-21 | uncommitted | AMD RX 550 | random Lab / RTv4_sRGB, RTv2_sRGB, sRGB, sRGB2014, RTv4_Medium monitor | GPU vs lcms | 1 byte | PASS |
