@@ -43,6 +43,7 @@ namespace rtengine
 using namespace procparams;
 
 class Crop;
+class PreviewBaseCache;
 class TweakOperator;
 
 /** @brief Manages the image processing, espc. of the preview windows
@@ -113,7 +114,6 @@ protected:
 
     // Experimental, default-off cache of the preview base image returned by
     // ImageSource::getImage(). One snapshot only; deep copies in and out.
-    class PreviewBaseCache;
     std::unique_ptr<PreviewBaseCache> previewBaseCache;
 
     bool allocated;

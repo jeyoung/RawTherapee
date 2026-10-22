@@ -134,7 +134,12 @@ public:
     void        flush      () override;
     void        HLRecovery_Global (const procparams::ToneCurveParams &hrp) override;
     void        refinement(int PassCount);
-    void        setBorder(unsigned int rawBorder) override {border = rawBorder;}
+    void        setBorder(unsigned int rawBorder) override {
+        if (border != static_cast<int>(rawBorder)) {
+            border = static_cast<int>(rawBorder);
+            markSourceChanged();
+        }
+    }
     bool        isRGBSourceModified() const override
     {
         return rgbSourceModified;   // tracks whether cached rgb output of demosaic has been modified
@@ -205,12 +210,19 @@ public:
     static void init ();
     static void cleanup ();
     void setCurrentFrame(unsigned int frameNum) override {
+        const unsigned int previousFrame = currFrame;
+        RawImage* previousRaw = ri;
+
         if (numFrames == 2 && frameNum == 2 && riFrames.size() >= 1) { // special case for averaging of two frames
             currFrame = frameNum;
             ri = riFrames[0].get();
         } else if (riFrames.size() > std::min(numFrames - 1, frameNum)) {
             currFrame = std::min(numFrames - 1, frameNum);
             ri = riFrames[currFrame].get();
+        }
+
+        if (currFrame != previousFrame || ri != previousRaw) {
+            markSourceChanged();
         }
     }
     int getFrameCount() override {return numFrames;}

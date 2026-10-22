@@ -608,6 +608,8 @@ void RawImageSource::captureSharpening(const procparams::CaptureSharpeningParams
         return;
     }
 
+    markSourceChanged();
+
     if (plistener) {
         plistener->setProgressStr(M("TP_PDSHARPENING_LABEL88"));
         plistener->setProgress(0.0);

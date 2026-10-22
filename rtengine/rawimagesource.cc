@@ -895,6 +895,7 @@ void RawImageSource::getImage(const ColorTemp &ctemp, int tran, Imagefloat* imag
             }
 
             rgbSourceModified = true;
+            markSourceChanged();
         }
     }
 
@@ -1212,6 +1213,8 @@ void RawImageSource::vflip(Imagefloat* image)
 int RawImageSource::load(const Glib::ustring &fname, bool firstFrameOnly)
 {
 
+    markSourceChanged();
+
     MyTime t1, t2;
     t1.set();
     fileName = fname;
@@ -1463,6 +1466,7 @@ int RawImageSource::load(const Glib::ustring &fname, bool firstFrameOnly)
 void RawImageSource::preprocess(const RAWParams &raw, const LensProfParams &lensProf, const CoarseTransformParams& coarse, float &reddeha, float &greendeha, float &bluedeha,  bool prepareDenoise)
 {
 //    BENCHFUN
+    markSourceChanged();
     LoadProfile::Timer profileTimer("preprocess",
                                     &LoadProfile::state().preprocessSeen);
 
@@ -1823,6 +1827,7 @@ void RawImageSource::preprocess(const RAWParams &raw, const LensProfParams &lens
 void RawImageSource::demosaic(const RAWParams &raw, bool autoContrast, double &contrastThreshold, bool cache)
 {
     assert(checkRawDataDimensions(rawData, *ri, W, H));
+    markSourceChanged();
 
     MyTime t1, t2;
     t1.set();
@@ -2244,6 +2249,7 @@ void RawImageSource::retinexPrepareCurves(const RetinexParams &retinexParams, LU
 
 void RawImageSource::retinex(const ColorManagementParams& cmp, const RetinexParams &deh, const ToneCurveParams& Tc, LUTf & cdcurve, LUTf & mapcurve, const RetinextransmissionCurve & dehatransmissionCurve, const RetinexgaintransmissionCurve & dehagaintransmissionCurve, multi_array2D<float, 4> &conversionBuffer, bool dehacontlutili, bool mapcontlutili, bool useHsl, float &minCD, float &maxCD, float &mini, float &maxi, float &Tmean, float &Tsigma, float &Tmin, float &Tmax, LUTu &histLRETI)
 {
+    markSourceChanged();
     MyTime t4, t5;
     t4.set();
 
@@ -2628,6 +2634,8 @@ void RawImageSource::retinex(const ColorManagementParams& cmp, const RetinexPara
 
 void RawImageSource::flush()
 {
+    markSourceChanged();
+
     for (auto &buffer : rawDataBuffer) {
         buffer.reset();
     }

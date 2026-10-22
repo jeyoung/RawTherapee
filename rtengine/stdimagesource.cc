@@ -113,6 +113,7 @@ void StdImageSource::getSampleFormat (const Glib::ustring &fname, IIOSampleForma
 int StdImageSource::load (const Glib::ustring &fname)
 {
 
+    markSourceChanged();
     fileName = fname;
 
     // First let's find out the input image's type
@@ -372,6 +373,7 @@ ColorTemp StdImageSource::getSpotWB (std::vector<Coord2D> &red, std::vector<Coor
 }
 
 void StdImageSource::flush() {
+    markSourceChanged();
     img->allocate(0, 0);
 };
 

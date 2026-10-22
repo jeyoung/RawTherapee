@@ -1,5 +1,15 @@
 # Performance tools
 
+## Preview base-cache regression
+
+```bash
+tools/perf/test-preview-base-cache.sh build/cpu
+```
+
+This builds the optional `preview-base-cache-test` target and checks key
+equality, source-generation invalidation, store/restore, destination rejection
+and the row-padded memory bound.
+
 ## Preview baseline
 
 ```bash

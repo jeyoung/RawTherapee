@@ -19,6 +19,8 @@
 #pragma once
 
 #include <array>
+#include <atomic>
+#include <cstdint>
 #include <vector>
 
 #include <glibmm/ustring.h>
@@ -76,8 +78,20 @@ class ImageSource : public InitialImage
 
 private:
     int references;
+    std::atomic<std::uint64_t> sourceGeneration{0};
 
 protected:
+    // Mark a mutation of the source's pixel planes or of the state used to
+    // produce them. Consumers such as the preview base cache use this token to
+    // detect changes that are not represented by their own parameter keys.
+    // This is an invalidation token, not a publication barrier for the pixel
+    // writes; callers must still serialise source access with the coordinator's
+    // mProcessing lock.
+    void markSourceChanged()
+    {
+        sourceGeneration.fetch_add(1, std::memory_order_release);
+    }
+
     double redAWBMul, greenAWBMul, blueAWBMul; // local copy of the multipliers, to avoid recomputing the values
     cmsHPROFILE embProfile;
     Glib::ustring fileName;
@@ -100,6 +114,11 @@ public:
     virtual void        HLRecovery_Global  (const procparams::ToneCurveParams &hrp) {};
 
     virtual bool        isRGBSourceModified () const = 0; // tracks whether cached rgb output of demosaic has been modified
+
+    std::uint64_t getSourceGeneration() const
+    {
+        return sourceGeneration.load(std::memory_order_acquire);
+    }
 
     virtual void        setBorder (unsigned int border) {}
     virtual void        setCurrentFrame (unsigned int frameNum) = 0;

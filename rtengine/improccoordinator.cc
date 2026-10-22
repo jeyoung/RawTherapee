@@ -43,6 +43,7 @@
 #include "lcp.h"
 #include "loadprofile.h"
 #include "procparams.h"
+#include "previewbasecache.h"
 #include "profiling.h"
 #include "tweakoperator.h"
 #include "refreshmap.h"
@@ -60,19 +61,6 @@ namespace
 {
 
 constexpr int VECTORSCOPE_SIZE = 128;
-
-constexpr const char* PREVIEW_BASE_CACHE_ENV = "RT_PREVIEW_BASE_CACHE";
-// One snapshot, at preview resolution. Refuse larger entries so a 100% zoom
-// cannot double the memory of a large image.
-constexpr size_t PREVIEW_BASE_CACHE_MAX_BYTES =
-    256u * 1024u * 1024u;
-
-bool envEnabled(const char* name)
-{
-    const char* value = g_getenv(name);
-    return value != nullptr && value[0] != '\0'
-        && g_strcmp0(value, "0") != 0;
-}
 
 const char* baseCacheTodoReason(int todo)
 {
@@ -145,334 +133,6 @@ struct PreviewTimer {
 
 namespace rtengine
 {
-
-/**
- * Experimental cache for the display preview's base image, i.e. the output of
- * ImageSource::getImage() before spot removal, colour conversion, film
- * negative processing and the rest of the preview pipeline.
- *
- * The cache is opt-in through RT_PREVIEW_BASE_CACHE=1. It holds at most one
- * deep copy, so no pointer into orig_prev/oprevi is ever retained. A cache hit
- * restores the snapshot and lets the normal pipeline run from there.
- */
-class ImProcCoordinator::PreviewBaseCache
-{
-public:
-    struct Key {
-        const ImageSource* source = nullptr;
-        int frame = 0;
-        int sensorType = 0;
-        bool raw = false;
-
-        double wbTemp = 0.0;
-        double wbGreen = 0.0;
-        double wbEqual = 0.0;
-        StandardObserver wbObserver = StandardObserver::TWO_DEGREES;
-
-        bool highDetailNeeded = false;
-        bool highDetailPreprocessComputed = false;
-        bool highDetailRawComputed = false;
-
-        Glib::ustring bayerMethod;
-        int bayerCcSteps = 0;
-        Glib::ustring xtransMethod;
-        int xtransCcSteps = 0;
-        double rawExposure = 0.0;
-
-        bool hrEnabled = false;
-        Glib::ustring hrMethod;
-        int hrBlend = 0;
-        double hrThreshold = 0.0;
-        bool clampOOG = false;
-
-        bool rgbSourceModified = false;
-
-        int transform = 0;
-        int scale = 0;
-        int fullWidth = 0;
-        int fullHeight = 0;
-        int width = 0;
-        int height = 0;
-
-        bool operator==(const Key& other) const
-        {
-            return source == other.source
-                && frame == other.frame
-                && sensorType == other.sensorType
-                && raw == other.raw
-                && wbTemp == other.wbTemp
-                && wbGreen == other.wbGreen
-                && wbEqual == other.wbEqual
-                && wbObserver == other.wbObserver
-                && highDetailNeeded == other.highDetailNeeded
-                && highDetailPreprocessComputed == other.highDetailPreprocessComputed
-                && highDetailRawComputed == other.highDetailRawComputed
-                && bayerMethod == other.bayerMethod
-                && bayerCcSteps == other.bayerCcSteps
-                && xtransMethod == other.xtransMethod
-                && xtransCcSteps == other.xtransCcSteps
-                && rawExposure == other.rawExposure
-                && hrEnabled == other.hrEnabled
-                && hrMethod == other.hrMethod
-                && hrBlend == other.hrBlend
-                && hrThreshold == other.hrThreshold
-                && clampOOG == other.clampOOG
-                && rgbSourceModified == other.rgbSourceModified
-                && transform == other.transform
-                && scale == other.scale
-                && fullWidth == other.fullWidth
-                && fullHeight == other.fullHeight
-                && width == other.width
-                && height == other.height;
-        }
-    };
-
-    enum class Probe {
-        HIT,
-        MISS
-    };
-
-    static bool enabled()
-    {
-        static const bool value = envEnabled(PREVIEW_BASE_CACHE_ENV);
-        return value;
-    }
-
-    static bool profileEnabled()
-    {
-        static const bool value = envEnabled("RT_LOAD_PROFILE")
-            || envEnabled("RT_PREVIEW_PROFILE");
-        return value;
-    }
-
-    static bool fits(int width, int height)
-    {
-        if (width <= 0 || height <= 0) {
-            return false;
-        }
-
-        const size_t bytes = static_cast<size_t>(width)
-            * static_cast<size_t>(height) * 3u * sizeof(float);
-        return bytes <= PREVIEW_BASE_CACHE_MAX_BYTES;
-    }
-
-    Probe probe(const Key& key, std::string& reason)
-    {
-        if (!valid_) {
-            ++misses_;
-            if (dirty_) {
-                reason = "invalidated:" + dirtyReason_;
-                dirty_ = false;
-                dirtyReason_.clear();
-            } else {
-                reason = "no-entry";
-            }
-            noteMiss(reason);
-            return Probe::MISS;
-        }
-
-        if (!(key_ == key)) {
-            ++misses_;
-            reason = "key-mismatch";
-            noteMiss(reason);
-            return Probe::MISS;
-        }
-
-        if (!entry_
-                || entry_->getWidth() != key.width
-                || entry_->getHeight() != key.height) {
-            ++misses_;
-            reason = "size-mismatch";
-            noteMiss(reason);
-            return Probe::MISS;
-        }
-
-        return Probe::HIT;
-    }
-
-    bool restore(Imagefloat* destination)
-    {
-        if (!entry_) {
-            ++misses_;
-            noteMiss("restore-failed");
-            return false;
-        }
-
-        entry_->copyData(destination);
-
-        if (destination->getWidth() != entry_->getWidth()
-                || destination->getHeight() != entry_->getHeight()) {
-            ++misses_;
-            noteMiss("restore-failed");
-            entry_.reset();
-            valid_ = false;
-            return false;
-        }
-
-        ++hits_;
-        logProbe("hit", std::string());
-        return true;
-    }
-
-    void store(const Key& key, const Imagefloat* source)
-    {
-        if (!enabled()) {
-            return;
-        }
-
-        dirty_ = false;
-        dirtyReason_.clear();
-
-        if (!fits(source->getWidth(), source->getHeight())) {
-            entry_.reset();
-            valid_ = false;
-            return;
-        }
-
-        std::unique_ptr<Imagefloat> next(new Imagefloat());
-        source->copyData(next.get());
-
-        if (next->getWidth() != source->getWidth()
-                || next->getHeight() != source->getHeight()) {
-            entry_.reset();
-            valid_ = false;
-            ++misses_;
-            noteMiss("store-failed");
-            return;
-        }
-
-        entry_ = std::move(next);
-        key_ = key;
-        valid_ = true;
-        ++stores_;
-
-        if (profileEnabled()) {
-            std::fprintf(stderr,
-                         "preview-base-cache: store %dx%d scale=%d\n",
-                         key.width, key.height, key.scale);
-        }
-    }
-
-    void noteBypass(const std::string& reason)
-    {
-        if (!enabled()) {
-            return;
-        }
-
-        ++bypasses_;
-        ++bypassReasons_[reason];
-        logProbe("bypass", reason);
-    }
-
-    void markDirty(const char* reason)
-    {
-        if (!enabled() || dirty_) {
-            return;
-        }
-
-        dirty_ = true;
-        dirtyReason_ = reason ? reason : "unknown";
-        entry_.reset();
-        valid_ = false;
-        ++invalidations_;
-        ++invalidationReasons_[dirtyReason_];
-
-        if (profileEnabled()) {
-            std::fprintf(stderr, "preview-base-cache: invalidate [%s]\n",
-                         dirtyReason_.c_str());
-        }
-    }
-
-    void clear(const char* reason)
-    {
-        if (!enabled() || (!entry_ && !valid_ && !dirty_)) {
-            return;
-        }
-
-        entry_.reset();
-        valid_ = false;
-        dirty_ = false;
-        dirtyReason_.clear();
-        ++invalidations_;
-
-        const std::string text = reason ? reason : "unknown";
-        ++invalidationReasons_[text];
-
-        if (profileEnabled()) {
-            std::fprintf(stderr, "preview-base-cache: clear [%s]\n",
-                         text.c_str());
-        }
-    }
-
-    void printSummary() const
-    {
-        if (!enabled() || !profileEnabled()) {
-            return;
-        }
-
-        std::fprintf(
-            stderr,
-            "preview-base-cache: summary hits=%llu misses=%llu "
-            "bypasses=%llu stores=%llu invalidations=%llu\n",
-            static_cast<unsigned long long>(hits_),
-            static_cast<unsigned long long>(misses_),
-            static_cast<unsigned long long>(bypasses_),
-            static_cast<unsigned long long>(stores_),
-            static_cast<unsigned long long>(invalidations_));
-
-        printReasons("miss", missReasons_);
-        printReasons("bypass", bypassReasons_);
-        printReasons("invalidate", invalidationReasons_);
-    }
-
-private:
-    void noteMiss(const std::string& reason)
-    {
-        ++missReasons_[reason];
-        logProbe("miss", reason);
-    }
-
-    static void logProbe(const char* result, const std::string& reason)
-    {
-        if (!profileEnabled()) {
-            return;
-        }
-
-        if (reason.empty()) {
-            std::fprintf(stderr, "preview-base-cache: %s\n", result);
-        } else {
-            std::fprintf(stderr, "preview-base-cache: %s [%s]\n",
-                         result, reason.c_str());
-        }
-    }
-
-    static void printReasons(
-        const char* label,
-        const std::map<std::string, unsigned long long>& reasons)
-    {
-        for (const auto& item : reasons) {
-            std::fprintf(stderr, "preview-base-cache: %s [%s]=%llu\n",
-                         label, item.first.c_str(),
-                         static_cast<unsigned long long>(item.second));
-        }
-    }
-
-    std::unique_ptr<Imagefloat> entry_;
-    Key key_;
-    bool valid_ = false;
-    bool dirty_ = false;
-    std::string dirtyReason_;
-
-    unsigned long long hits_ = 0;
-    unsigned long long misses_ = 0;
-    unsigned long long bypasses_ = 0;
-    unsigned long long stores_ = 0;
-    unsigned long long invalidations_ = 0;
-
-    std::map<std::string, unsigned long long> missReasons_;
-    std::map<std::string, unsigned long long> bypassReasons_;
-    std::map<std::string, unsigned long long> invalidationReasons_;
-};
 
 ImProcCoordinator::ImProcCoordinator() :
     orig_prev(nullptr),
@@ -1763,7 +1423,12 @@ void ImProcCoordinator::updatePreviewImage(int todo, bool panningRelatedChange,
             // Will (re)allocate the preview's buffers
             setScale(scale);
             PreviewProps pp(0, 0, fw, fh, scale);
-            // Tells to the ImProcFunctions' tools what is the preview scale, which may lead to some simplifications
+            const bool baseCacheFullFrame =
+                pp.getX() == 0 && pp.getY() == 0
+                && pp.getWidth() == fw && pp.getHeight() == fh
+                && pp.getSkip() == scale;
+            // Tells to the ImProcFunctions' tools what the preview scale is,
+            // which may lead to some simplifications.
             ipf.setScale(scale);
 
             const bool baseCacheEnabled = previewBaseCache->enabled();
@@ -1773,6 +1438,7 @@ void ImProcCoordinator::updatePreviewImage(int todo, bool panningRelatedChange,
                 key.source = imgsrc;
                 key.frame = params->raw.bayersensor.imageNum;
                 key.sensorType = static_cast<int>(imgsrc->getSensorType());
+                key.rotateDegree = imgsrc->getRotateDegree();
                 key.raw = imgsrc->isRAW();
 
                 key.wbTemp = currWB.getTemp();
@@ -1798,6 +1464,7 @@ void ImProcCoordinator::updatePreviewImage(int todo, bool panningRelatedChange,
                 key.clampOOG = params->toneCurve.clampOOG;
 
                 key.rgbSourceModified = imgsrc->isRGBSourceModified();
+                key.sourceGeneration = imgsrc->getSourceGeneration();
 
                 key.transform = tr;
                 key.scale = scale;
@@ -1810,6 +1477,7 @@ void ImProcCoordinator::updatePreviewImage(int todo, bool panningRelatedChange,
 
             std::string baseCacheBypass;
             bool baseCacheHit = false;
+            PreviewBaseCache::Key baseCacheKey;
 
             if (baseCacheEnabled) {
                 if (params->spot.enabled) {
@@ -1823,6 +1491,8 @@ void ImProcCoordinator::updatePreviewImage(int todo, bool panningRelatedChange,
                 } else if (params->retinex.enabled) {
                     // Retinex modifies the shared raw planes before getImage().
                     baseCacheBypass = "retinex";
+                } else if (!baseCacheFullFrame) {
+                    baseCacheBypass = "roi";
                 } else if (!PreviewBaseCache::fits(pW, pH)) {
                     baseCacheBypass = "too-large";
                 }
@@ -1830,14 +1500,10 @@ void ImProcCoordinator::updatePreviewImage(int todo, bool panningRelatedChange,
                 if (!baseCacheBypass.empty()) {
                     previewBaseCache->noteBypass(baseCacheBypass);
                 } else {
+                    baseCacheKey = makeBaseCacheKey();
                     std::string missReason;
-                    const auto result =
-                        previewBaseCache->probe(makeBaseCacheKey(),
-                                                missReason);
-                    if (result == PreviewBaseCache::Probe::HIT) {
-                        baseCacheHit =
-                            previewBaseCache->restore(orig_prev);
-                    }
+                    baseCacheHit = previewBaseCache->tryRestore(
+                        baseCacheKey, orig_prev, missReason);
                 }
             }
 
@@ -1849,7 +1515,11 @@ void ImProcCoordinator::updatePreviewImage(int todo, bool panningRelatedChange,
                 }
 
                 if (baseCacheEnabled && baseCacheBypass.empty()) {
-                    previewBaseCache->store(makeBaseCacheKey(), orig_prev);
+                    // Capture the key immediately after getImage(). HLR can
+                    // mutate the shared source during getImage(), so the
+                    // store key must use the post-call generation.
+                    const PreviewBaseCache::Key storeKey = makeBaseCacheKey();
+                    previewBaseCache->store(storeKey, orig_prev);
                 }
             }
 

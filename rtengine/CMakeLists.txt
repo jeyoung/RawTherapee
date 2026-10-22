@@ -161,6 +161,23 @@ add_library(rtengine STATIC "${RTENGINESOURCEFILES}")
 
 add_dependencies(rtengine UpdateInfo)
 
+# Standalone regression test for the opt-in preview base cache. It is not part
+# of the normal build; use the target explicitly or tools/perf/test-preview-base-cache.sh.
+add_executable(preview-base-cache-test EXCLUDE_FROM_ALL
+    "${PROJECT_SOURCE_DIR}/tools/perf/preview-base-cache-test.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/editcallbacks.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/multilangmgr.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/options.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/paramsedited.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/pathutils.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/threadutils.cc"
+)
+target_include_directories(preview-base-cache-test BEFORE PRIVATE
+    "${CMAKE_BINARY_DIR}/rtgui"
+)
+target_link_libraries(preview-base-cache-test PRIVATE rtengine)
+rt_setup_target(preview-base-cache-test)
+
 target_include_directories(rtengine
     PUBLIC
         # Other libraries should use #include "rtengine/header.h"
