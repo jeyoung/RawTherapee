@@ -1172,34 +1172,21 @@ void FileCatalog::copyMoveRequested(const std::vector<FileBrowserEntry*>& tbe, b
                     if (moveRequested) {
                         // move file
                         src_file->move(dest_file);
-                        // re-attach cache files
-                        cacheMgr->renameEntry (src_fPath, tbe[i]->thumbnail->getMD5(), dest_fPath);
-                        // remove from browser
-                        fileBrowser->delEntry (src_fPath);
-
-                        previewsLoaded--;
                     } else {
                         src_file->copy(dest_file);
                     }
 
+                    // copy/move the processing profile before updating the
+                    // cache, so CacheManager can never recreate it in the
+                    // source location.
+                    if (Glib::file_test(src_fPath + App::PARAM_FILE_EXTENSION, Glib::FILE_TEST_EXISTS)) {
+                        auto src_param = Gio::File::create_for_path(src_fPath + App::PARAM_FILE_EXTENSION);
+                        auto dest_param = Gio::File::create_for_path(dest_fPath_param);
 
-                    // attempt to copy/move paramFile only if it exist next to the src
-                    Glib::RefPtr<Gio::File> scr_param = Gio::File::create_for_path (  src_fPath + App::PARAM_FILE_EXTENSION );
-
-                    if (Glib::file_test( src_fPath + App::PARAM_FILE_EXTENSION, Glib::FILE_TEST_EXISTS)) {
-                        Glib::RefPtr<Gio::File> dest_param = Gio::File::create_for_path ( dest_fPath_param);
-
-                        // copy/move paramFile to destination
                         if (moveRequested) {
-                            if (Glib::file_test( dest_fPath + App::PARAM_FILE_EXTENSION, Glib::FILE_TEST_EXISTS)) {
-                                // profile already got copied to destination from cache after cacheMgr->renameEntry
-                                // delete source profile as cleanup
-                                ::g_remove ((src_fPath + App::PARAM_FILE_EXTENSION).c_str ());
-                            } else {
-                                scr_param->move(dest_param);
-                            }
+                            src_param->move(dest_param);
                         } else {
-                            scr_param->copy(dest_param);
+                            src_param->copy(dest_param);
                         }
                     }
 
@@ -1218,6 +1205,15 @@ void FileCatalog::copyMoveRequested(const std::vector<FileBrowserEntry*>& tbe, b
                                       << src_xmpPath << " to " << dest_xmpPath
                                       << ": " << exc.what() << std::endl;
                         }
+                    }
+
+                    if (moveRequested) {
+                        // Re-attach cache files only after the sidecars have
+                        // moved. An open thumbnail may then rewrite them at
+                        // the destination without recreating source files.
+                        cacheMgr->renameEntry(src_fPath, tbe[i]->thumbnail->getMD5(), dest_fPath);
+                        fileBrowser->delEntry(src_fPath);
+                        previewsLoaded--;
                     }
 
                     filecopymovecomplete = true;
@@ -1408,33 +1404,92 @@ void FileCatalog::renameRequested(const std::vector<FileBrowserEntry*>& tbe)
 
                 Glib::ustring nfname = Glib::build_filename (dirName, nBaseName);
 
-                /* check if filename already exists*/
-                if (Glib::file_test(nfname, Glib::FILE_TEST_EXISTS)
-                        || Glib::file_test(Thumbnail::xmpSidecarPath(nfname), Glib::FILE_TEST_EXISTS)) {
+                /* only a real image at the destination is a hard conflict */
+                if (Glib::file_test(nfname, Glib::FILE_TEST_EXISTS)) {
                     Glib::ustring msg_ = Glib::ustring("<b>") + escapeHtmlChars(nfname) + ": " + M("MAIN_MSG_ALREADYEXISTS") + "</b>";
                     Gtk::MessageDialog msgd (msg_, true, Gtk::MESSAGE_ERROR, Gtk::BUTTONS_OK, true);
                     msgd.run ();
                 } else {
-                    success = true;
-
-                    if (::g_rename (ofname.c_str (), nfname.c_str ()) == 0) {
-                        cacheMgr->renameEntry (ofname, tbe[i]->thumbnail->getMD5(), nfname);
-
-                        const auto old_xmp = Thumbnail::xmpSidecarPath(ofname);
-                        const auto new_xmp = Thumbnail::xmpSidecarPath(nfname);
-                        if (Glib::file_test(old_xmp, Glib::FILE_TEST_EXISTS)
-                                && !Glib::file_test(new_xmp, Glib::FILE_TEST_EXISTS)) {
-                            if (::g_rename(old_xmp.c_str(), new_xmp.c_str()) != 0) {
-                                std::cerr << "ERROR renaming XMP sidecar from "
-                                          << old_xmp << " to " << new_xmp << std::endl;
-                            }
-                        } else if (Glib::file_test(old_xmp, Glib::FILE_TEST_EXISTS)) {
-                            std::cerr << "ERROR renaming XMP sidecar: destination already exists: "
-                                      << new_xmp << std::endl;
+                    // Collect the sidecars that belong to this image. Move them
+                    // before updating the cache, because CacheManager can
+                    // rewrite the profile and metadata for an open thumbnail.
+                    std::vector<std::pair<Glib::ustring, Glib::ustring>> sidecars;
+                    bool sidecarConflict = false;
+                    Glib::ustring sidecarConflictPath;
+                    const auto addSidecar = [&](const Glib::ustring& oldPath,
+                                                const Glib::ustring& newPath) {
+                        if (oldPath == newPath) {
+                            return;
                         }
 
-                        ::g_remove((ofname + App::PARAM_FILE_EXTENSION).c_str ());
-                        reparseDirectory ();
+                        const bool oldExists = Glib::file_test(oldPath, Glib::FILE_TEST_EXISTS);
+                        const bool newExists = Glib::file_test(newPath, Glib::FILE_TEST_EXISTS);
+
+                        if (oldExists) {
+                            // A sidecar without its image is an orphan left by
+                            // an earlier rename. It is safe to replace it.
+                            sidecars.emplace_back(oldPath, newPath);
+                        } else if (newExists) {
+                            sidecarConflict = true;
+                            sidecarConflictPath = newPath;
+                            std::cerr << "ERROR renaming " << ofname
+                                      << ": destination sidecar already exists: "
+                                      << newPath << std::endl;
+                        }
+                    };
+
+                    addSidecar(Thumbnail::xmpSidecarPath(ofname), Thumbnail::xmpSidecarPath(nfname));
+                    addSidecar(ofname + App::PARAM_FILE_EXTENSION,
+                               nfname + App::PARAM_FILE_EXTENSION);
+                    addSidecar(removeExtension(ofname) + App::PARAM_FILE_EXTENSION,
+                               removeExtension(nfname) + App::PARAM_FILE_EXTENSION);
+
+                    if (sidecarConflict) {
+                        Glib::ustring msg_ = Glib::ustring("<b>") + escapeHtmlChars(sidecarConflictPath) + ": " + M("MAIN_MSG_ALREADYEXISTS") + "</b>";
+                        Gtk::MessageDialog msgd (msg_, true, Gtk::MESSAGE_ERROR, Gtk::BUTTONS_OK, true);
+                        msgd.run ();
+                    } else if (::g_rename(ofname.c_str(), nfname.c_str()) != 0) {
+                        Glib::ustring msg_ = Glib::ustring("<b>") + escapeHtmlChars(ofname) + ": " + M("MAIN_MSG_OPERATIONCANCELLED") + "</b>";
+                        Gtk::MessageDialog msgd (msg_, true, Gtk::MESSAGE_ERROR, Gtk::BUTTONS_OK, true);
+                        msgd.run ();
+                    } else {
+                        bool sidecarsMoved = true;
+                        std::vector<std::pair<Glib::ustring, Glib::ustring>> moved;
+
+                        for (const auto& sidecar : sidecars) {
+                            if (::g_rename(sidecar.first.c_str(), sidecar.second.c_str()) != 0) {
+                                std::cerr << "ERROR renaming sidecar from "
+                                          << sidecar.first << " to " << sidecar.second
+                                          << std::endl;
+                                sidecarsMoved = false;
+                                break;
+                            }
+                            moved.push_back(sidecar);
+                        }
+
+                        if (!sidecarsMoved) {
+                            // Roll back the completed sidecar moves and the
+                            // image rename; never leave the image and its
+                            // metadata with different base names.
+                            for (auto it = moved.rbegin(); it != moved.rend(); ++it) {
+                                if (::g_rename(it->second.c_str(), it->first.c_str()) != 0) {
+                                    std::cerr << "ERROR rolling back sidecar rename from "
+                                              << it->second << " to " << it->first << std::endl;
+                                }
+                            }
+                            if (::g_rename(nfname.c_str(), ofname.c_str()) != 0) {
+                                std::cerr << "ERROR rolling back image rename from "
+                                          << nfname << " to " << ofname << std::endl;
+                            }
+
+                            Glib::ustring msg_ = Glib::ustring("<b>") + escapeHtmlChars(ofname) + ": " + M("MAIN_MSG_OPERATIONCANCELLED") + "</b>";
+                            Gtk::MessageDialog msgd (msg_, true, Gtk::MESSAGE_ERROR, Gtk::BUTTONS_OK, true);
+                            msgd.run ();
+                        } else {
+                            cacheMgr->renameEntry(ofname, tbe[i]->thumbnail->getMD5(), nfname);
+                            reparseDirectory ();
+                            success = true;
+                        }
                     }
                 }
             } else {

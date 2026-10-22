@@ -1627,9 +1627,6 @@ void FileBrowser::toTrashRequested (std::vector<FileBrowserEntry*> tbe)
 {
 
     for (size_t i = 0; i < tbe.size(); i++) {
-        // try to load the last saved parameters from the cache or from the paramfile file
-        tbe[i]->thumbnail->createProcParamsForUpdate(false, false, true);  // this can execute customprofilebuilder to generate param file in "flagging" mode
-
         // no need to notify listeners as item goes to trash, likely to be deleted
 
         if (tbe[i]->thumbnail->getTrashed()) {
@@ -1642,8 +1639,11 @@ void FileBrowser::toTrashRequested (std::vector<FileBrowserEntry*> tbe)
             tbe[i]->getThumbButtonSet()->setRank (tbe[i]->thumbnail->getRank());
             tbe[i]->getThumbButtonSet()->setColorLabel (tbe[i]->thumbnail->getColorLabel());
             tbe[i]->getThumbButtonSet()->setInTrash (true);
-            tbe[i]->thumbnail->updateCache (); // needed to save the colorlabel to disk in the procparam file(s) and the cache image data file
         }
+
+        // Trash is metadata, not a processing change. Do not create a profile
+        // just because the file was moved to the trash.
+        tbe[i]->thumbnail->saveMetadataProperties ();
     }
 
     trash_changed().emit();
@@ -1654,8 +1654,6 @@ void FileBrowser::fromTrashRequested (std::vector<FileBrowserEntry*> tbe)
 {
 
     for (size_t i = 0; i < tbe.size(); i++) {
-        // if thumbnail was marked inTrash=true then param file must be there, no need to run customprofilebuilder
-
         if (!tbe[i]->thumbnail->getTrashed()) {
             continue;
         }
@@ -1666,8 +1664,9 @@ void FileBrowser::fromTrashRequested (std::vector<FileBrowserEntry*> tbe)
             tbe[i]->getThumbButtonSet()->setRank (tbe[i]->thumbnail->getRank());
             tbe[i]->getThumbButtonSet()->setColorLabel (tbe[i]->thumbnail->getColorLabel());
             tbe[i]->getThumbButtonSet()->setInTrash (false);
-            tbe[i]->thumbnail->updateCache (); // needed to save the colorlabel to disk in the procparam file(s) and the cache image data file
         }
+
+        tbe[i]->thumbnail->saveMetadataProperties ();
     }
 
     trash_changed().emit();
@@ -1690,22 +1689,12 @@ void FileBrowser::sortOrderRequested (int order)
 
 void FileBrowser::rankingRequested (std::vector<FileBrowserEntry*> tbe, int rank)
 {
-
-    if (!tbe.empty() && bppcl) {
-        bppcl->beginBatchPParamsChange(tbe.size());
-    }
-
     for (size_t i = 0; i < tbe.size(); i++) {
-
-        // try to load the last saved parameters from the cache or from the paramfile file
-        tbe[i]->thumbnail->createProcParamsForUpdate(false, false, true);  // this can execute customprofilebuilder to generate param file in "flagging" mode
-
-        // notify listeners TODO: should do this ONLY when params changed by customprofilebuilder?
-        tbe[i]->thumbnail->notifylisterners_procParamsChanged(FILEBROWSER);
-
+        // Ranking is metadata. It must not create or validate a processing
+        // profile; otherwise a dynamic default profile is applied just
+        // because the user clicked a star.
         tbe[i]->thumbnail->setRank (rank);
-        tbe[i]->thumbnail->updateCache (); // needed to save the colorlabel to disk in the procparam file(s) and the cache image data file
-        //TODO? - should update pparams instead?
+        tbe[i]->thumbnail->saveMetadataProperties ();
 
         if (tbe[i]->getThumbButtonSet()) {
             tbe[i]->getThumbButtonSet()->setRank (tbe[i]->thumbnail->getRank());
@@ -1713,40 +1702,21 @@ void FileBrowser::rankingRequested (std::vector<FileBrowserEntry*> tbe, int rank
     }
 
     applyFilter (filter);
-
-    if (!tbe.empty() && bppcl) {
-        bppcl->endBatchPParamsChange();
-    }
 }
 
 void FileBrowser::colorlabelRequested (std::vector<FileBrowserEntry*> tbe, int colorlabel)
 {
-
-    if (!tbe.empty() && bppcl) {
-        bppcl->beginBatchPParamsChange(tbe.size());
-    }
-
     for (size_t i = 0; i < tbe.size(); i++) {
-        // try to load the last saved parameters from the cache or from the paramfile file
-        tbe[i]->thumbnail->createProcParamsForUpdate(false, false, true);  // this can execute customprofilebuilder to generate param file in "flagging" mode
-
-        // notify listeners TODO: should do this ONLY when params changed by customprofilebuilder?
-        tbe[i]->thumbnail->notifylisterners_procParamsChanged(FILEBROWSER);
-
+        // Colour labels are metadata for the same reason as rankings.
         tbe[i]->thumbnail->setColorLabel (colorlabel);
-        tbe[i]->thumbnail->updateCache(); // needed to save the colorlabel to disk in the procparam file(s) and the cache image data file
+        tbe[i]->thumbnail->saveMetadataProperties();
 
-        //TODO? - should update pparams instead?
         if (tbe[i]->getThumbButtonSet()) {
             tbe[i]->getThumbButtonSet()->setColorLabel (tbe[i]->thumbnail->getColorLabel());
         }
     }
 
     applyFilter (filter);
-
-    if (!tbe.empty() && bppcl) {
-        bppcl->endBatchPParamsChange();
-    }
 }
 
 void FileBrowser::requestRanking(int rank)

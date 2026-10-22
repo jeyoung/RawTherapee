@@ -165,24 +165,6 @@ void getRankAndColorFromMetadata(
 }
 
 /**
- * Gets the rank from the image metadata, if it exists.
- *
- * @param cfs The cached image data.
- * @param fname The image's file name.
- * @param rank Where the rank will be stored. If there is no rank in the
- * metadata, the value will not be changed.
- * @returns If the rank is in the metadata.
- */
-bool getRankFromMetadata(
-    const CacheImageData &cfs, const Glib::ustring &fname, int &rank)
-{
-    bool has_rank = false;
-    int color;
-    getRankAndColorFromMetadata(cfs, fname, rank, color, &has_rank, nullptr);
-    return has_rank;
-}
-
-/**
  * Gets the rank from the XMP.
  *
  * @param xmp The XMP data.
@@ -202,40 +184,6 @@ bool getRankFromXmp(const Exiv2::XmpData &xmp, int &rank)
 }
 
 /**
- * Gets the rank from the XMP or image metadata.
- *
- * The priority is to load from the XMP. The XMP will only be used if the
- * option's thumbnail rank/color mode is set to XMP. If no rank is retrieved
- * from the XMP, an attempt to get the rank from the metadata will be made.
- *
- * @param options Options.
- * @param xmp The XMP data.
- * @param cfs The cached image data.
- * @param fname The image's file name.
- * @param rank Where the rank will be stored. If there is no rank retrieved from
- * the XMP and there is no rank in the metadata, the value will not be changed.
- * @returns If a rank was retrieved.
- */
-bool getRankFromXmpOrMetadata(
-    const Options &options,
-    const Exiv2::XmpData &xmp,
-    const CacheImageData &cfs,
-    const Glib::ustring &fname,
-    int &rank)
-{
-    (void)options;
-    bool got_rank_from_xmp = false;
-    try {
-        got_rank_from_xmp = getRankFromXmp(xmp, rank);
-    } catch (std::exception &exc) {
-        std::cerr << "ERROR loading rank from "
-                  << rtengine::Exiv2Metadata::xmpSidecarPath(fname)
-                  << ": " << exc.what() << std::endl;
-    }
-    return got_rank_from_xmp || getRankFromMetadata(cfs, fname, rank);
-}
-
-/**
  * Gets the color label from the XMP.
  *
  * @param xmp The XMP data.
@@ -249,36 +197,6 @@ bool getColorFromXmp(const Exiv2::XmpData &xmp, int &color)
     if (pos != xmp.end()) {
         color = rtengine::FramesData::xmp_label2color(pos->toString());
         return true;
-    }
-    return false;
-}
-
-/**
- * Gets the color label from the XMP.
- *
- * The XMP will only be used if the option's thumbnail rank/color mode is set to
- * XMP.
- *
- * @param options Options.
- * @param xmp The XMP data.
- * @param fname The image's file name.
- * @param color Where the color will be stored. If there is no color in the XMP,
- * the value will not be changed.
- * @returns If the color is in the XMP.
- */
-bool getColorFromXmpOrNone(
-    const Options &options,
-    const Exiv2::XmpData &xmp,
-    const Glib::ustring &fname,
-    int &color)
-{
-    (void)options;
-    try {
-        return getColorFromXmp(xmp, color);
-    } catch (std::exception &exc) {
-        std::cerr << "ERROR loading color label from "
-                  << rtengine::Exiv2Metadata::xmpSidecarPath(fname)
-                  << ": " << exc.what() << std::endl;
     }
     return false;
 }
@@ -340,15 +258,12 @@ Thumbnail::Thumbnail(CacheManager* cm, const Glib::ustring& fname, CacheImageDat
     generateExifDateTimeStrings ();
 
     if (cfs.rankOld >= 0) {
-        // rank and inTrash were found in cache (old style), move them over to pparams or xmp sidecar
-
-        // try to load the last saved parameters from the cache or from the paramfile file
-        createProcParamsForUpdate(false, false); // this can execute customprofilebuilder to generate param file
-
-        // TODO? should we call notifylisterners_procParamsChanged here?
-
-        setRank(cfs.rankOld);
-        setTrashed(cfs.inTrashOld);
+        // Move old cache-only metadata into the cache fields used by the
+        // current loader. Do not create a processing profile just to carry
+        // metadata: XMP is the canonical store and is written on the next
+        // metadata change or when the profile is cleared.
+        cfs.rating = cfs.rankOld;
+        cfs.inTrash = cfs.inTrashOld;
     }
 
     loadProperties();
@@ -1285,6 +1200,21 @@ void Thumbnail::saveThumbnail ()
     _saveThumbnail();
 }
 
+bool Thumbnail::saveMetadataProperties()
+{
+    MyMutex::MyLock lock(mutex);
+
+    if (!saveXMPSidecarProperties()) {
+        return false;
+    }
+
+    cfs.rating = properties.rank.value;
+    cfs.colorLabel = properties.color.value;
+    cfs.inTrash = properties.trashed.value;
+    cfs.save(getCacheFileName("data", ".txt"));
+    return true;
+}
+
 /*
  * Update the cached files
  *  - updatePParams==true (default)        : write the procparams file (sidecar or cache, depending on the options)
@@ -1534,62 +1464,41 @@ void Thumbnail::updateProcParamsProperties(bool forceUpdate)
         return;
     }
 
+    // Metadata is stored in XMP, not in the processing profile. When a
+    // profile is being saved for an unrelated reason, keep a compatibility
+    // copy of the metadata in it, but never let metadata make an absent
+    // profile valid.
     if ((properties.trashed.edited || forceUpdate) && properties.trashed != pparams->inTrash) {
         pparams->inTrash = properties.trashed;
-        pparamsValid = true;
     }
 
-    const rtengine::MemoizingSupplier<Exiv2::XmpData> getXmpSidecar([this]() {
-        return rtengine::Exiv2Metadata::getXmpSidecar(fname);
-    });
-
-    const auto& options = App::get().options();
-
-    // save procparams rank and color also when options.thumbnailRankColorMode == Options::ThumbnailPropertyMode::XMP
-    // so they'll be kept in sync
-    // Rank can be -1 to prioritize the rank in the metadata. If the metadata
-    // rank doesn't exist, it is interpreted as 0.
     if ((properties.rank.edited || forceUpdate) &&
         rtengine::LIM(properties.rank.value, 0, 5) != rtengine::LIM(pparams->rank, 0, 5)) {
         pparams->rank = properties.rank;
-        if (!forceUpdate) {
-            pparamsValid |= properties.rank.edited;
-        }
-        else if (!pparamsValid && forceUpdate) {
-            // When force-updating, the processing parameters' rank needs not be
-            // used if the embedded rank is the same.
-            int initial_rank = 0;
-            bool has_initial_rank = getRankFromXmpOrMetadata(
-                options, getXmpSidecar(), cfs, fname, initial_rank);
-            pparamsValid |= !(has_initial_rank && properties.rank == initial_rank);
-        }
     }
 
     if ((properties.color.edited || forceUpdate) && properties.color != pparams->colorlabel) {
         pparams->colorlabel = properties.color;
-        if (!forceUpdate) {
-            pparamsValid |= properties.color.edited;
-        }
-        else if (!pparamsValid && forceUpdate) {
-            // When force-updating, the processing parameters' color label needs
-            // not be used if the embedded color label is the same.
-            int initial_color = 0;
-            bool has_initial_color = getColorFromXmpOrNone(
-                options, getXmpSidecar(), fname, initial_color);
-            pparamsValid |= !(has_initial_color && properties.color == initial_color);
-        }
     }
 }
 
 bool Thumbnail::saveXMPSidecarProperties(bool force)
 {
+    auto fn = rtengine::Exiv2Metadata::xmpSidecarPath(fname);
+
     if (!force && !properties.edited()) {
+        // Keep the cache association correct even when only the file name
+        // changed and there is no metadata write to perform.
+        if (rtengine::settings->metadata_xmp_sync != rtengine::Settings::MetadataXmpSync::NONE) {
+            cfs.xmpSidecarMd5 = ::getMD5(fn);
+        } else {
+            cfs.xmpSidecarMd5.clear();
+        }
         return true;
     }
 
     ensureRawTherapeeXmpNamespace();
 
-    auto fn = rtengine::Exiv2Metadata::xmpSidecarPath(fname);
     try {
         auto xmp = rtengine::Exiv2Metadata::getXmpSidecar(fname);
         if (force || properties.rank.edited) {
@@ -1611,6 +1520,10 @@ bool Thumbnail::saveXMPSidecarProperties(bool force)
         } else {
             cfs.xmpSidecarMd5.clear();
         }
+
+        properties.rank.edited = false;
+        properties.color.edited = false;
+        properties.trashed.edited = false;
         return true;
     } catch (std::exception &exc) {
         std::cerr << "ERROR saving thumbnail properties data to " << fn
