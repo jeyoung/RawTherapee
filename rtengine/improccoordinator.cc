@@ -501,7 +501,6 @@ ImProcCoordinator::ImProcCoordinator() :
     viewportStateValid(false),
     viewportHighDetail(false),
     forceFullPreview(false),
-    pendingAnalysisTodo(0),
     viewportZeroLhist(32768),
     previewBaseCache(new PreviewBaseCache()),
     allocated(false),
@@ -772,6 +771,36 @@ bool sameHighlightRecovery(const procparams::ToneCurveParams& a,
         && a.clampOOG == b.clampOOG;
 }
 
+bool sameBaseInputs(const procparams::ProcParams& a,
+                    const procparams::ProcParams& b)
+{
+    return a.raw == b.raw
+        && a.wb == b.wb
+        && a.icm == b.icm
+        && a.coarse == b.coarse
+        && a.commonTrans == b.commonTrans
+        && a.rotate == b.rotate
+        && a.distortion == b.distortion
+        && a.lensProf == b.lensProf
+        && a.perspective == b.perspective
+        && a.gradient == b.gradient
+        && a.pcvignette == b.pcvignette
+        && a.cacorrection == b.cacorrection
+        && a.vignetting == b.vignetting
+        && a.spot == b.spot
+        && a.filmNegative == b.filmNegative
+        && a.dehaze == b.dehaze
+        && a.fattal == b.fattal
+        && a.retinex == b.retinex
+        && a.pdsharpening == b.pdsharpening
+        && a.dirpyrDenoise == b.dirpyrDenoise
+        && a.cg == b.cg
+        && a.locallab == b.locallab
+        && a.toneCurve.autoexp == b.toneCurve.autoexp
+        && a.toneCurve.histmatching == b.toneCurve.histmatching
+        && sameHighlightRecovery(a.toneCurve, b.toneCurve);
+}
+
 bool viewportFastEnabled()
 {
     static const bool enabled = envEnabled("RT_VIEWPORT_FAST");
@@ -789,7 +818,8 @@ constexpr int VIEWPORT_FAST_REJECTED_TODO =
 // Bits that are safe for Crop::update once the parent LUTs have been rebuilt.
 // Base/init and over-approximated HDR/spot bits are deliberately dropped.
 constexpr int VIEWPORT_CROP_TODO =
-    M_CROP | M_TRANSFORM | M_RGBCURVE | M_LUMACURVE | M_LUMINANCE | M_COLOR;
+    M_CROP | M_MINUPDATE | M_AUTOEXP | M_TRANSFORM | M_RGBCURVE
+    | M_LUMACURVE | M_LUMINANCE | M_COLOR;
 
 } // namespace
 
@@ -803,15 +833,16 @@ bool ImProcCoordinator::canUseViewportFastPath(int todo,
         reason = "switch-off";
         return false;
     }
-    if (forceFullPreview) {
+    if (forceFullPreview.load(std::memory_order_relaxed)) {
         reason = "deferred-analysis";
         return false;
     }
-    if (!viewportStateValid) {
+    if (!viewportStateValid.load(std::memory_order_relaxed)) {
         reason = "no-complete-full-state";
         return false;
     }
-    if (highDetailNeeded != viewportHighDetail) {
+    if (highDetailNeeded
+            != viewportHighDetail.load(std::memory_order_relaxed)) {
         reason = "high-detail-transition";
         return false;
     }
@@ -980,6 +1011,30 @@ bool ImProcCoordinator::canUseViewportFastPath(int todo,
         return false;
     }
 
+    // The fast path rebuilds LUTs based on the request mask. If a LUT input
+    // changed without its corresponding mask bit, fall back instead of
+    // rendering with stale curves.
+    const ProcParams& lastLut = viewportLutParams;
+
+    if ((params->toneCurve != lastLut.toneCurve
+            || params->rgbCurves != lastLut.rgbCurves
+            || params->colorToning != lastLut.colorToning
+            || params->blackwhite != lastLut.blackwhite)
+            && !(todo & M_RGBCURVE)) {
+        reason = "tone-curve-mask";
+        return false;
+    }
+    if (params->labCurve != lastLut.labCurve
+            && !(todo & M_LUMACURVE)) {
+        reason = "lab-curve-mask";
+        return false;
+    }
+    if (params->wavelet != lastLut.wavelet
+            && !(todo & (M_LUMINANCE | M_COLOR))) {
+        reason = "wavelet-mask";
+        return false;
+    }
+
     return true;
 }
 
@@ -1036,7 +1091,12 @@ void ImProcCoordinator::prepareViewportLuts(int todo)
     if (todo & (M_LUMACURVE | M_CROP)) {
         // Lab contrast is restricted to zero by the eligibility check, so the
         // histogram cannot influence lumacurve. histLCurve is refreshed by the
-        // deferred full pass.
+        // deferred full pass. Guard the shared helper as well: a non-zero
+        // contrast with the zero histogram would be visibly wrong.
+        assert(params->labCurve.contrast == 0);
+        if (params->labCurve.contrast != 0) {
+            return;
+        }
         CurveFactory::complexLCurve(
             params->labCurve.brightness, params->labCurve.contrast,
             params->labCurve.lcurve, viewportZeroLhist, lumacurve, histLCurve,
@@ -1072,7 +1132,7 @@ void ImProcCoordinator::renderCrops(int todo, bool force)
     }
 }
 
-void ImProcCoordinator::queueViewportDeferredAnalysis(int todo)
+int ImProcCoordinator::queueViewportDeferredAnalysis(int todo)
 {
     // Rebuild the full-frame analysis from the base image already held in
     // oprevi. Base bits such as M_HDR/M_SPOT are over-approximated by several
@@ -1086,32 +1146,37 @@ void ImProcCoordinator::queueViewportDeferredAnalysis(int todo)
                   | M_HIGHQUAL | M_BLURMAP);
 
     paramsUpdateMutex.lock();
-    forceFullPreview = true;
-    pendingAnalysisTodo = deferred;
+    forceFullPreview.store(true, std::memory_order_relaxed);
     changeSinceLast |= deferred;
     paramsUpdateMutex.unlock();
+    return deferred;
 }
 
 void ImProcCoordinator::markViewportStateValid(bool highDetailNeeded)
 {
-    forceFullPreview = false;
-    pendingAnalysisTodo = 0;
+    forceFullPreview.store(false, std::memory_order_relaxed);
 
     if (!viewportFastEnabled()) {
-        viewportStateValid = false;
+        viewportStateValid.store(false, std::memory_order_relaxed);
         return;
     }
 
-    viewportHighDetail = highDetailNeeded;
-    viewportStateValid = true;
+    viewportLutParams = *params;
+    viewportHighDetail.store(highDetailNeeded, std::memory_order_relaxed);
+    viewportStateValid.store(true, std::memory_order_relaxed);
 }
 
 void ImProcCoordinator::invalidateViewportState()
 {
-    viewportStateValid = false;
-    viewportHighDetail = false;
-    forceFullPreview = false;
-    pendingAnalysisTodo = 0;
+    viewportStateValid.store(false, std::memory_order_relaxed);
+    viewportHighDetail.store(false, std::memory_order_relaxed);
+    forceFullPreview.store(false, std::memory_order_relaxed);
+
+    // These flags describe the raw/base state. They must not survive an
+    // image, scale or buffer reset, otherwise a later fast path can believe a
+    // full-detail base is ready when it is not.
+    highDetailPreprocessComputed = false;
+    highDetailRawComputed = false;
 }
 
 DetailedCrop* ImProcCoordinator::createCrop(::EditDataProvider *editDataProvider, bool isDetailWindow)
@@ -1188,7 +1253,8 @@ void ImProcCoordinator::updatePreviewImage(int todo, bool panningRelatedChange,
     lastHighDetailNeeded = highDetailNeeded;
     highDetailStateKnown = true;
 
-    previewTimer.viewportDeferred = forceFullPreview;
+    previewTimer.viewportDeferred =
+        forceFullPreview.load(std::memory_order_relaxed);
 
     const char* viewportFallback = nullptr;
     if (canUseViewportFastPath(eligibilityTodo, highDetailNeeded,
@@ -1196,6 +1262,7 @@ void ImProcCoordinator::updatePreviewImage(int todo, bool panningRelatedChange,
         const int cropTodo = todo & VIEWPORT_CROP_TODO;
 
         prepareViewportLuts(eligibilityTodo);
+        viewportLutParams = *params;
         ipf.setScale(scale);
 
         const auto cropStart = std::chrono::steady_clock::now();
@@ -1205,27 +1272,44 @@ void ImProcCoordinator::updatePreviewImage(int todo, bool panningRelatedChange,
         previewTimer.viewportCropMs =
             std::chrono::duration_cast<std::chrono::milliseconds>(
                 cropEnd - cropStart).count();
-        previewTimer.viewportDeferredTodo = eligibilityTodo;
-
-        queueViewportDeferredAnalysis(eligibilityTodo);
+        previewTimer.viewportDeferredTodo =
+            queueViewportDeferredAnalysis(eligibilityTodo);
         return;
     }
 
     previewTimer.viewportFallback = viewportFallback;
 
-    // Snapshot the request inputs before the pass normalises white balance
-    // (and similar deterministic values). The GUI keeps the un-normalised
-    // values, so comparing against the post-pass copy would reject every
-    // subsequent request. The state only becomes valid once the pass ends.
-    if (viewportFastEnabled()) {
-        viewportFullParams = *params;
+    // A request that bypasses the fast path must not leave a previous fast
+    // state looking valid when its base inputs changed. If the base snapshot
+    // is missing or differs, force the base/analysis stage even if the
+    // original event mask did not include an init/HDR bit (for example a spot
+    // reset or an image/scale transition).
+    const bool stateWasValid =
+        viewportStateValid.load(std::memory_order_relaxed);
+    if (viewportFastEnabled()
+            && (!stateWasValid || !sameBaseInputs(*params, viewportFullParams))) {
+        viewportStateValid.store(false, std::memory_order_relaxed);
+        // M_MONITOR also forces the full-frame block even when the original
+        // event did not carry an init/HDR bit. The added bits make sure the
+        // base image and analysis are rebuilt from the current parameters.
+        todo |= M_INIT | M_HDR | M_MONITOR;
+        if (previewBaseCache->enabled()) {
+            previewBaseCache->markDirty("viewport-base-refresh");
+        }
     }
 
-    // The full pass below re-establishes the parent state. It is only marked
-    // valid again after the pass has completed.
-    viewportStateValid = false;
-
+    bool fullPipelineRan = false;
     if (((todo & ALL) == ALL) || (todo & M_MONITOR) || panningRelatedChange || (highDetailNeeded && prevdemo != PD_Sidecar)) {
+        fullPipelineRan = true;
+
+        // Snapshot the request inputs before the pass normalises white balance
+        // (and similar deterministic values). The GUI keeps the un-normalised
+        // values, so comparing against the post-pass copy would reject every
+        // subsequent request. The state only becomes valid once the pass ends.
+        if (viewportFastEnabled()) {
+            viewportFullParams = *params;
+        }
+
         bwAutoR = bwAutoG = bwAutoB = -9000.f;
 
         RAWParams rp = params->raw;
@@ -3737,7 +3821,15 @@ void ImProcCoordinator::updatePreviewImage(int todo, bool panningRelatedChange,
         oprevi = nullptr;
     }
 
-    markViewportStateValid(highDetailNeeded);
+    if (fullPipelineRan) {
+        markViewportStateValid(highDetailNeeded);
+    } else {
+        // This request did not rebuild the base/analysis state. Never publish
+        // it as a valid snapshot, and do not leave a stale deferred request
+        // blocking the next fast path forever.
+        forceFullPreview.store(false, std::memory_order_relaxed);
+        viewportStateValid.store(false, std::memory_order_relaxed);
+    }
 }
 
 void ImProcCoordinator::setTweakOperator(TweakOperator *tOperator)
@@ -4418,10 +4510,13 @@ void ImProcCoordinator::stopProcessing()
     updaterThreadStart.lock();
 
     if (updaterRunning && thread) {
+        paramsUpdateMutex.lock();
         changeSinceLast = 0;
+        paramsUpdateMutex.unlock();
         thread->join();
     }
 
+    invalidateViewportState();
     updaterThreadStart.unlock();
 }
 

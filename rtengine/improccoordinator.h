@@ -101,11 +101,11 @@ protected:
     // The snapshot describes the state produced by the last completed
     // full-frame pass, so the parent LUTs can be rebuilt without redoing the
     // base image or the full-frame analysis.
-    bool viewportStateValid;
-    bool viewportHighDetail;
-    bool forceFullPreview;
-    int pendingAnalysisTodo;
+    std::atomic<bool> viewportStateValid;
+    std::atomic<bool> viewportHighDetail;
+    std::atomic<bool> forceFullPreview;
     ProcParams viewportFullParams;
+    ProcParams viewportLutParams;
     LUTu viewportZeroLhist;
 
     // Experimental, default-off cache of the preview base image returned by
@@ -256,7 +256,7 @@ protected:
                                 const char*& reason) const;
     void prepareViewportLuts(int todo);
     void renderCrops(int todo, bool force);
-    void queueViewportDeferredAnalysis(int todo);
+    int queueViewportDeferredAnalysis(int todo);
     void markViewportStateValid(bool highDetailNeeded);
     void invalidateViewportState();
 
