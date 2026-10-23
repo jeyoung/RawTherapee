@@ -56,7 +56,8 @@ Environment: Debian 13 container with Xvfb 1600x1000x24 and openbox, CPU build
 `colorspace_flowers.pef` sample, and project-local settings and cache
 directories. `RT_LOAD_PROFILE=1` reports each `InitialImage::load()`.
 Functional GUI checks ran in the container because host Xvfb is not installed;
-they are functional checks, not host performance measurements.
+they are functional checks, not host performance measurements. The CPU and
+OpenCL builds (`tools/build-rt.sh cpu`, `tools/build-rt.sh opencl`) passed.
 
 | Check | Result | Evidence |
 |---|---|---|
@@ -68,6 +69,22 @@ they are functional checks, not host performance measurements.
 | Multi-tab regression | PASS | Two images opened in two tabs; selecting the first tab again added no load. |
 | Cleared profile | PASS | Clear Profile left one load; reopening reloaded (second load) and regenerated the default profile sidecar; reopening again added no load. |
 | Reference stability | PASS | Twenty reuse cycles kept one load and the process remained alive. |
+| Debian 12 package | PASS | Fresh Debian 12 container installed the `.deb`, listed formats, exported the public sample and passed the same reuse check (one load, 641.7 ms). |
+| Debian 13 package | PASS | Fresh Debian 13 container installed the `.deb`, listed formats, exported the public sample and passed the same reuse check (one load, 692.7 ms). |
+| CLI export parity | PASS | Package exports from Debian 12 and 13 and the host CPU build, all with `OMP_NUM_THREADS=1`, compared at 16 bits: `max_abs=0`, `differing=0` for all three pairs. |
+
+## Package verification
+
+Package: `rawtherapee-5.13-147-ge648b8442_5.13+git13168.e648b8442-1_amd64.deb`
+(26 MiB), built with `tools/build-rt.sh portable` from the clean tree at
+`e648b8442` (behaviour commit `80f6cad6e`).
+
+SHA-256:
+`8d743c948cb12c653f337e2e051ac7cad30421cdb781791b030a09c4d6ea1aae`
+
+Both package tests used fresh `debian:12` and `debian:13` containers with
+Xvfb and openbox. GPU self-tests were not run because the containers have no
+OpenCL device; they are recorded as not run, not as PASS.
 
 ## Change history
 
