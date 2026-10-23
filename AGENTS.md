@@ -2,9 +2,9 @@
 
 How work is carried out in this repository. The global
 `~/.config/opencode/AGENTS.md` remains in force for general workflow, design
-method and code style. This file adds the project's process. Architecture,
-behaviour and invariants belong in `devnotes/`; coding style and C++ language
-constraints are defined in `devnotes/coding-conventions.md` and
+method, code style and security. This file adds the project's process.
+Architecture, behaviour and invariants belong in `devnotes/`; coding style and
+C++ language constraints are defined in `devnotes/coding-conventions.md` and
 `devnotes/cpp.md`.
 
 ## Development loop
@@ -88,7 +88,7 @@ tools/build-rt.sh cpu --install
 - Do not use `tools/build-rt.sh portable` as an inner-loop build; it compiles
   from scratch in a Debian container and is for release artefacts only.
 - Skip the build for documentation-only changes and run only the checks the
-  change needs.
+  change needs; the publication gate still applies.
 - Cap parallelism at the physical-core count, up to six jobs: on a 4C/8T
   machine use `-j 4` to `-j 6`, not `-j 8`, because SMT plus limited RAM
   thrashes. Check `lscpu` for cores per socket rather than `nproc`, and pass
@@ -219,8 +219,38 @@ absolute paths in a project-local scratch directory such as
   `opencl`, `docs`, `tools`, `test` and `build`.
 - Create or reuse an issue for the work. If the work is already complete, add
   a retrospective issue with commit links and evidence.
-- Scan for secrets and personal paths before publishing. Push only when asked.
+- Scan for secrets and personal information before publishing, following the
+  publication gate in the global `AGENTS.md`. Push only when asked.
 - Merge completed work fast-forward into `dev`; do not rewrite shared history.
+
+### Publication gate
+
+The global gate applies in full, to every ref, tag, issue, release and
+workflow log, including documentation-only changes. In this project:
+
+- Scan the working tree, the complete history of every ref being published,
+  commit messages and tags before pushing.
+- Inspect the author and committer of every commit in the range, not only the
+  configured `user.name` and `user.email`. Prefer a project-owned or provider
+  noreply address for this public fork.
+- New and modified source headers must not add personal contact details such
+  as an email address, phone number or postal address; a name alone is
+  permitted. Do not rewrite existing headers except to remove a leak.
+- The tracked `testdata.manifest` and `TESTDATA.md` must list only public or
+  synthetic samples. Keep private `local/` rows in a gitignored manifest under
+  `$RT_TESTDATA`. Replace them with public samples where coverage is required
+  and record any remaining gap as uncovered, never as PASS.
+- Remove the existing private rows from `testdata.manifest` and `TESTDATA.md`
+  before the next push.
+- Never commit or upload raw files, sidecars, captures, exported previews or
+  screenshots that show private paths or file names.
+- Model-level hardware detail is permitted for benchmark reproducibility.
+  Never publish host names, serial numbers, UUIDs or raw `lscpu`/`dmidecode`
+  output.
+- Record the scan scope and result as evidence.
+- Treat a leak as an incident. Rotate or revoke a secret. For personal
+  information, remove it from current content and ask the provider to purge
+  it. Do not rewrite pushed history; assume published data stays public.
 
 ## Review and delegation
 
@@ -239,4 +269,5 @@ absolute paths in a project-local scratch directory such as
 - [ ] Build and package tested when user-visible.
 - [ ] Documentation updated in a separate commit.
 - [ ] Ticket created or linked.
-- [ ] Only intended changes in the tree; no secrets or private paths.
+- [ ] Publication gate passed: no secrets or personal information; identity
+      checked; scan recorded.
