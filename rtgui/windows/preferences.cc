@@ -2810,9 +2810,14 @@ void Preferences::switchFontTo(const Glib::ustring &newFontFamily, const int new
 
 void Preferences::workflowUpdate()
 {
-    const auto& options = App::get().options();
+    auto& options = App::get().mut_options();
 
     if (moptions.tabbedUI != options.tabbedUI) {
+        // Apply the layout fields before switching so callbacks and the editor
+        // teardown see the target mode rather than the previous one.
+        options.tabbedUI = moptions.tabbedUI;
+        options.multiDisplayMode = moptions.multiDisplayMode;
+        options.mainNBVertical = moptions.mainNBVertical;
         parent->setEditorMode(moptions.tabbedUI);
     }
 

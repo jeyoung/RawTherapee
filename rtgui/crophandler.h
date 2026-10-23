@@ -55,6 +55,8 @@ public:
     CropHandler ();
     ~CropHandler () override;
 
+    void close ();
+
     void    setDisplayHandler (CropDisplayHandler* l)
     {
         displayHandler = l;

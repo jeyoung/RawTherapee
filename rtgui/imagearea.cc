@@ -158,6 +158,13 @@ void ImageArea::setImProcCoordinator(rtengine::StagedImageProcessor* ipc_)
 
         mainCropWindow->deleteColorPickers ();
         mainCropWindow->setObservedCropWin (nullptr);
+
+        // The main crop handler outlives the processor in EditorPanel::close().
+        // Close it before the processor is destroyed so its destructor does not
+        // call into a dead object or use a crop owned by that processor.
+        if (mainCropWindow) {
+            mainCropWindow->cropHandler.close ();
+        }
     }
 
     ipc = ipc_;

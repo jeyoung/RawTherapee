@@ -193,6 +193,7 @@ public:
     void toggleSidePanelsZoomFit();
 
     void saveProfile ();
+    void close ();
     Glib::ustring getShortName ();
     Glib::ustring getFileName () const;
     bool handleShortcutKey (GdkEventKey* event);
@@ -215,8 +216,6 @@ public:
     Gtk::Paned* catalogPane;
 
 private:
-    void close ();
-
     BatchQueueEntry*    createBatchQueueEntry ();
     bool                idle_imageSaved (ProgressConnector<int> *pc, rtengine::IImagefloat* img, Glib::ustring fname, SaveFormat sf, rtengine::procparams::ProcParams &pparams);
     bool                idle_saveImage (ProgressConnector<rtengine::IImagefloat*> *pc, Glib::ustring fname, SaveFormat sf, rtengine::procparams::ProcParams &pparams);

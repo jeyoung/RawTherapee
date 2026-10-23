@@ -62,8 +62,14 @@ CropHandler::~CropHandler ()
 {
     idle_register.destroy();
 
+    close ();
+}
+
+void CropHandler::close ()
+{
     if (ipc) {
         ipc->delSizeListener (this);
+        ipc = nullptr;
     }
 
     setEnabled (false);

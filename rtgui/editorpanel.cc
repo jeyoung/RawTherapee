@@ -1165,7 +1165,16 @@ EditorPanel::EditorPanel (FilePanel* filePanel)
 
 EditorPanel::~EditorPanel ()
 {
+    // GTK may destroy the panel's child widgets before this destructor runs
+    // when the panel is removed from the notebook. Do not let close() touch
+    // the fast-preview button after that point.
+    toggleFastPreview = nullptr;
+
     idle_register.destroy();
+
+    // Close the image while the image area and its crop handler are still
+    // alive. The processor must not be destroyed after its crop handler.
+    close ();
 
     history->setHistoryBeforeLineListener (nullptr);
     // the order is important!
@@ -1192,8 +1201,6 @@ EditorPanel::~EditorPanel ()
     }
 
     beforeIpc = nullptr;
-
-    close ();
 
     if (epih->pending) {
         epih->destroyed = true;

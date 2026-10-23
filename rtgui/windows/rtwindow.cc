@@ -1314,6 +1314,18 @@ bool RTWindow::isEditorPanel (guint pageNum)
 
 void RTWindow::setEditorMode (bool tabbedUI)
 {
+    if (tabbedUI) {
+        if (!epanel) {
+            return;
+        }
+
+        // Close the persistent single-tab editor while its widget hierarchy is
+        // still alive. close() stops processing and releases the thumbnail
+        // reference; removing the panel first would destroy these widgets
+        // before the destructor could do so.
+        epanel->close();
+    }
+
     MoveFileBrowserToMain();
     closeOpenEditors();
     SetMainCurrent();
