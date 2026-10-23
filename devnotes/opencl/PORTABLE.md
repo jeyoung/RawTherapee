@@ -18,20 +18,19 @@ The first build downloads the Debian 12 image and installs build dependencies.
 The container is always based on Debian 12 so the package keeps the bookworm
 baseline.
 
-Verified artefact from commit `9bf381b7e`:
+Verified artefact from commit `6ed4b80c2` (FAST preview toggle):
 
 ```
-build/portable/rawtherapee-5.13-131-g9bf381b7e_5.13+git13152.9bf381b7e-1_amd64.deb
-sha256 8ab8116e7f0a19c8a6d4acf6f5f7b873af00823850c3f4fdb42030c238ef9868
+build/portable/rawtherapee-5.13-143-g6ed4b80c2_5.13+git13164.6ed4b80c2-1_amd64.deb
+sha256 683134642cdaf1266aee0d39eace33786a76d4996858154b0e1592ecdea3d242
 ```
 
 The Debian 12 and Debian 13 package tests installed the `.deb`, listed formats
-(including JPEG XL), and exported the 10.2 MP PEF with the Capture Sharpening
-profile; both were pixel-exact against the host single-threaded export. The
-final Debian 13 package also exported the 45.7 MP NEF with the full user
-profile and matching DCP/Lensfun paths, pixel-exact. The GUI started under
-Xvfb. The test containers have no OpenCL ICD, so `--gpu-test` and
-`--gpu-test-monitor` were recorded as not run rather than passed.
+(including JPEG XL), exported the 10.2 MP PEF through the CLI and started the
+GUI under Xvfb. The test containers have no OpenCL ICD, so `--gpu-test` and
+`--gpu-test-monitor` were recorded as not run rather than passed. Interactive
+toggle checks used host Xvfb; the package test is a functional install and
+startup smoke test.
 
 ## Layout
 
