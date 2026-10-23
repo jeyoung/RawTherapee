@@ -77,14 +77,15 @@ required.
 
 ## Verification
 
-Environment: Debian 13 container with Xvfb 1600x1000x24 and openbox, CPU builds
-`build/cpu-issue-19-single-tab-reuse` and
-`build/cpu-issue-20-editor-mode-crash`, the public 10.1 MP
-`colorspace_flowers.pef` sample, and project-local settings and cache
-directories. `RT_LOAD_PROFILE=1` reports each `InitialImage::load()`.
-Functional GUI checks ran in the container because host Xvfb is not installed;
-they are functional checks, not host performance measurements. The CPU and
-OpenCL builds (`tools/build-rt.sh cpu`, `tools/build-rt.sh opencl`) passed.
+Environment: the #19 functional checks ran in Debian 13 containers with
+Xvfb 1600x1000x24 and openbox. The #20 mode-switch checks used the host CPU
+build under Xephyr with gdb, because host Xvfb is not installed; the package
+smoke tests ran in Debian 12 and 13 containers. The public 10.1 MP
+`colorspace_flowers.pef` sample and project-local settings and cache
+directories were used throughout. `RT_LOAD_PROFILE=1` reports each
+`InitialImage::load()`. These are functional checks, not host performance
+measurements. The CPU and OpenCL builds (`tools/build-rt.sh cpu`,
+`tools/build-rt.sh opencl`) passed.
 
 | Check | Result | Evidence |
 |---|---|---|
