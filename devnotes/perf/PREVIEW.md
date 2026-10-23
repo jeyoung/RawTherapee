@@ -73,32 +73,50 @@ cache.
 The timer starts after stale-request rejection; cold renders include initial
 image loading and are reported separately.
 
-## Loading placeholder
+## Initial-load reveal
 
 Single-editor mode replaces the previous image immediately when a new raw
-image is selected. The placeholder is the full embedded JPEG extracted from
-the raw file on a worker thread. An empty placeholder is shown first, then the
-embedded JPEG is installed when available, so a slow extraction cannot leave
-the old image visible. JPEG inputs and other non-raw raster formats skip the
-placeholder and keep the normal loading behaviour.
+image is selected. The image area shows a neutral canvas using the current
+preview background colour. No embedded JPEG is extracted and no "Loading
+image..." text is drawn.
 
-Editing is disabled while the placeholder is active: tool panels, crop and
-image-area input, history, save/export/queue and editing shortcuts are
-blocked. The preview-only toggles remain usable: clipped highlights/shadows,
-focus mask, RGB/L channel view, background colour and sharp mask. Sharp mask,
-soft proof and gamut check are deferred until the new processor exists.
+A small spinner appears after 150 ms if decoding is still running. It is a
+low-contrast 24-28 px arc and has no text or percentage. The spinner is
+removed as soon as the first real image is available.
 
-The placeholder clears on the first real preview, on initial-image load
-failure, or when processing finishes without producing a preview. Load
-failures clear the placeholder without applying deferred preview state to the
-old processor.
+The first real image is a deliberately rough raw render. It is produced at
+twice the final preview skip, so its linear resolution is about half the final
+fit preview. It uses the same decoded raw, white balance, profiles, tone curve
+and monitor conversion as the final image. The rough pass bypasses
+`PreviewBaseCache`; only the final pass may populate it.
 
-Manual Xvfb test with a 10 MP PEF followed by a 45.7 MP NEF:
+The rough image is kept on screen while the normal fit-quality render is
+requested. That final image replaces the rough image in place. There is no
+crossfade and no intermediate three-stage blur-up, matching the existing rough
+preview -> detailed-crop handoff. Editing remains disabled during decoding and
+the rough preview, and is enabled only when the final image arrives.
 
-- empty placeholder visible about 100 ms after the next-image command
-- embedded JPEG visible after about 1 s
-- first full preview after about 10 s; the placeholder remained until then
-- rotate shortcut was ignored while loading
-- the clipped-highlight toggle was accepted during loading and applied to the
-  new preview
-- editing controls were insensitive during loading and re-enabled afterwards
+A new image with no remembered zoom/pan is fitted to the viewport using the
+same path as the `f` shortcut. When `RememberZoomAndPan` is enabled and the new
+image has the same dimensions as the previous image, the remembered zoom and
+pan are kept instead. In that case the rough fitted frame is not shown, because
+it would jump to the remembered view at handoff; the neutral canvas/spinner
+stays until the final remembered-view frame.
+
+Selecting another image during the sequence discards the old request. Load
+errors clear the loading state on the GUI thread and use the existing error
+dialog. Non-raw inputs keep their normal loading behaviour.
+
+Manual CPU test with a 45.7 MP NEF selected from the file browser, cold cache,
+`RT_VIEWPORT_FAST=0`:
+
+- neutral canvas and spinner visible while the raw decoded
+- no embedded JPEG and no loading text
+- rough frame handed over after about 12.1 s
+- final fit frame handed over about 54 ms later
+- editing controls insensitive during decoding and rough preview, enabled at
+  the final frame
+
+A 10 MP PEF gave a rough frame after about 7.0 s and the final frame about
+63 ms later. The long first interval is the existing raw decode and first
+full pipeline; the two-stage reveal does not try to hide it.
