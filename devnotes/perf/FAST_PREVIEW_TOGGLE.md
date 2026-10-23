@@ -50,6 +50,23 @@ stored session state.
   - FAST off produces the configured full method;
   - at 100%, FAST on produces `method: fast`;
   - at 100%, FAST off produces the configured full method.
-- Export, package and host parity checks are recorded in the issue/handover.
-  Container runs are functional checks only; performance is measured on the
-  host.
+- Host verification on the OpenCL build, single-threaded:
+  - `--quick`: PASS, `pef/neutral max_pae=1.5259e-05`; monitor self-test PASS,
+    max 1 byte, 14 of 196608 samples differ.
+  - `--formats`: PASS for `pef/bayer14`, `max_pae=1.5259e-05`; the remaining
+    corpus entries were not available locally and are not counted as PASS.
+  - `--rgbproc`: PASS for `pef/rgbproc-neutral` and
+    `pef/rgbproc-exposure`, both `max_pae=1.5259e-05`.
+  - `--list-coverage`: not PASS; the local test-data corpus is incomplete.
+- Debian 12 package tests: install, `--list-formats` with JPEG XL, CLI export,
+  GPU diagnostics and GUI startup under Xvfb PASS.
+- Debian 13 package tests: the same install/CLI/GUI-startup smoke checks PASS.
+- Interactive host Xvfb checks at 100% showed `method: fast` with FAST on and
+  the full method with FAST off. The automated fit-zoom pointer interaction was
+  unreliable under Xvfb without a window manager; the fit behaviour is covered
+  by the truth-table test. Xephyr runs are not counted.
+- Package artefact:
+  `rawtherapee-5.13-143-g6ed4b80c2_5.13+git13164.6ed4b80c2-1_amd64.deb`
+  SHA-256 `683134642cdaf1266aee0d39eace33786a76d4996858154b0e1592ecdea3d242`.
+- Container runs are functional checks only; performance is measured on the
+  host. No host performance timing is claimed for this change.
