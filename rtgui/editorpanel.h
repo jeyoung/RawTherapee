@@ -75,10 +75,7 @@ public:
     ~EditorPanel () override;
 
     void open (Thumbnail* tmb, rtengine::InitialImage* isrc);
-    void showLoadingPlaceholder(const Glib::RefPtr<Gdk::Pixbuf>& pixbuf,
-                                const Glib::ustring& fileName);
-    void updateLoadingPlaceholder(const Glib::RefPtr<Gdk::Pixbuf>& pixbuf,
-                                  const Glib::ustring& fileName);
+    void beginLoading(const Glib::ustring& fileName);
     void clearLoadingPlaceholder(const Glib::ustring& fileName = {},
                                  bool applyDeferredState = true);
     bool isLoadingPlaceholder() const
@@ -319,13 +316,26 @@ private:
     sigc::connection ShowHideSidePanelsconn;
 
     bool isProcessing;
+
+    enum class LoadingStage {
+        Idle,
+        Decoding,
+        RoughPreview,
+        FinalPreview
+    };
+
     bool loadingPlaceholder = false;
+    LoadingStage loadingStage = LoadingStage::Idle;
     Glib::ustring loadingPlaceholderFile;
-    unsigned long long loadingPlaceholderGeneration = 0;
     rtengine::StagedImageProcessor* loadingPlaceholderIpc = nullptr;
+    int loadingFinalScale = 0;
+    int loadingRoughScale = 0;
+    bool loadingRoughShown = false;
+    bool loadingRememberedView = false;
 
     void setEditingSensitive(bool sensitive);
     void endLoadingPlaceholder(bool applyDeferredState = true);
+    void onPreviewReady();
 
     IdleRegister idle_register;
 

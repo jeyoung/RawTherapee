@@ -23,6 +23,7 @@
 
 #include "rtengine/array2D.h"
 #include "rtengine/imagesource.h"
+#include "rtengine/refreshmap.h"
 #include "rtengine/iccstore.h"
 #include "batchqueue.h"
 #include "batchqueueentry.h"
@@ -54,6 +55,8 @@ using ScopeType = Options::ScopeType;
 
 namespace
 {
+
+constexpr int INITIAL_ROUGH_SCALE_MULTIPLIER = 2;
 
 void setprogressStrUI(double val, const Glib::ustring str, MyProgressBar* pProgress)
 {
@@ -1331,16 +1334,19 @@ void EditorPanel::setEditingSensitive(bool sensitive)
     }
 }
 
-void EditorPanel::showLoadingPlaceholder(
-    const Glib::RefPtr<Gdk::Pixbuf>& pixbuf, const Glib::ustring& fileName)
+void EditorPanel::beginLoading(const Glib::ustring& fileName)
 {
     loadingPlaceholder = true;
+    loadingStage = LoadingStage::Decoding;
     loadingPlaceholderFile = fileName;
     loadingPlaceholderIpc = nullptr;
-    ++loadingPlaceholderGeneration;
+    loadingFinalScale = 0;
+    loadingRoughScale = 0;
+    loadingRoughShown = false;
+    loadingRememberedView = false;
 
     if (iareapanel) {
-        iareapanel->imageArea->setLoadingPlaceholder(pixbuf);
+        iareapanel->imageArea->showLoadingCanvas();
     }
 
     setEditingSensitive(false);
@@ -1354,17 +1360,67 @@ void EditorPanel::showLoadingPlaceholder(
     }
 }
 
-void EditorPanel::updateLoadingPlaceholder(
-    const Glib::RefPtr<Gdk::Pixbuf>& pixbuf, const Glib::ustring& fileName)
+void EditorPanel::onPreviewReady()
 {
-    if (!loadingPlaceholder
-            || (!fileName.empty() && fileName != loadingPlaceholderFile)) {
+    if (!loadingPlaceholder || !previewHandler
+            || loadingPlaceholderIpc == nullptr
+            || loadingPlaceholderIpc != ipc
+            || (!loadingPlaceholderFile.empty()
+                && loadingPlaceholderFile != fname)) {
         return;
     }
 
-    if (iareapanel) {
-        iareapanel->imageArea->setLoadingPlaceholder(pixbuf);
+    const int previewScale = static_cast<int>(previewHandler->getPreviewScale());
+
+    if (loadingStage == LoadingStage::Decoding
+            && !loadingRoughShown
+            && loadingRoughScale > loadingFinalScale
+            && previewScale > loadingFinalScale) {
+        Glib::RefPtr<Gdk::Pixbuf> preview = previewHandler->getPreviewImage();
+
+        const bool cropActive = iareapanel
+            && iareapanel->imageArea->mainCropWindow
+            && iareapanel->imageArea->mainCropWindow->cropHandler
+                .cropParams->enabled;
+
+        if (preview && iareapanel && !loadingRememberedView && !cropActive) {
+            iareapanel->imageArea->setLoadingPlaceholder(preview);
+
+            if (iareapanel->imageArea->mainCropWindow) {
+                iareapanel->imageArea->mainCropWindow->zoomFitCrop();
+            }
+        }
+
+        loadingRoughShown = true;
+        loadingStage = LoadingStage::RoughPreview;
+
+        if (!ipc) {
+            endLoadingPlaceholder();
+            return;
+        }
+
+        // The rough pass is complete. Keep its copied image on screen while
+        // the normal fit-quality pass replaces it in place.
+        ipc->stopProcessing();
+        ipc->setPreviewScale(loadingFinalScale);
+        loadingStage = LoadingStage::FinalPreview;
+        ipc->startProcessing(M_INIT | M_MONITOR);
+        return;
     }
+
+    if (previewScale > loadingFinalScale) {
+        // Ignore additional rough frames; the final pass is in flight.
+        return;
+    }
+
+    if (ipc && loadingFinalScale > 0) {
+        // Clear the rough-preview cache policy even when the first pass
+        // already arrived at the final scale.
+        ipc->setPreviewScale(loadingFinalScale);
+    }
+
+    loadingStage = LoadingStage::FinalPreview;
+    endLoadingPlaceholder();
 }
 
 void EditorPanel::endLoadingPlaceholder(bool applyDeferredState)
@@ -1374,8 +1430,13 @@ void EditorPanel::endLoadingPlaceholder(bool applyDeferredState)
     }
 
     loadingPlaceholder = false;
+    loadingStage = LoadingStage::Idle;
     loadingPlaceholderFile.clear();
     loadingPlaceholderIpc = nullptr;
+    loadingFinalScale = 0;
+    loadingRoughScale = 0;
+    loadingRoughShown = false;
+    loadingRememberedView = false;
 
     if (iareapanel) {
         iareapanel->imageArea->clearLoadingPlaceholder();
@@ -1427,18 +1488,8 @@ void EditorPanel::open (Thumbnail* tmb, rtengine::InitialImage* isrc)
 
     previewHandler = new PreviewHandler ();
 
-    const Glib::ustring openedFile = fname;
-    const unsigned long long placeholderGeneration =
-        loadingPlaceholderGeneration;
     previewHandler->signalPreviewReady().connect(
-        [this, openedFile, placeholderGeneration]() {
-            if (loadingPlaceholder
-                    && placeholderGeneration == loadingPlaceholderGeneration
-                    && (loadingPlaceholderFile.empty()
-                        || loadingPlaceholderFile == openedFile)) {
-                endLoadingPlaceholder();
-            }
-        });
+        sigc::mem_fun(*this, &EditorPanel::onPreviewReady));
 
     this->isrc = isrc;
     ipc = rtengine::StagedImageProcessor::create (isrc);
@@ -1450,7 +1501,31 @@ void EditorPanel::open (Thumbnail* tmb, rtengine::InitialImage* isrc)
     ipc->setProgressListener (this);
     colorMgmtToolBar->updateProcessor();
     ipc->setPreviewImageListener (previewHandler);
-    ipc->setPreviewScale (10);  // Important
+
+    if (loadingPlaceholder) {
+        loadingStage = LoadingStage::Decoding;
+        loadingRoughShown = false;
+
+        // Keep the existing final preview scale, then derive a deliberately
+        // smaller first pass from the scale the coordinator actually chose.
+        ipc->setPreviewScale (10);  // Important
+        loadingFinalScale = ipc->getPreviewScale();
+
+        loadingRememberedView = iareapanel
+            && iareapanel->imageArea->hasRememberedView(
+                ipc->getFullWidth(), ipc->getFullHeight());
+
+        loadingRoughScale = !loadingRememberedView && loadingFinalScale > 1
+            ? loadingFinalScale * INITIAL_ROUGH_SCALE_MULTIPLIER
+            : loadingFinalScale;
+
+        if (loadingRoughScale > loadingFinalScale) {
+            ipc->setPreviewScale (loadingRoughScale, true);
+        }
+    } else {
+        ipc->setPreviewScale (10);  // Important
+    }
+
     tpc->initImage (ipc, tmb->getType() == FT_Raw);
     ipc->setHistogramListener (this);
 
@@ -1663,6 +1738,16 @@ void EditorPanel::setProgressState(bool inProcessing)
 
 void EditorPanel::error(const Glib::ustring& descr)
 {
+    if (loadingPlaceholder) {
+        idle_register.add(
+            [this]() -> bool
+            {
+                clearLoadingPlaceholder({}, false);
+                return false;
+            }
+        );
+    }
+
     parent->error(descr);
 }
 
@@ -1693,6 +1778,8 @@ void EditorPanel::error(const Glib::ustring& title, const Glib::ustring& descr)
 
 void EditorPanel::displayError(const Glib::ustring& title, const Glib::ustring& descr)
 {
+    clearLoadingPlaceholder({}, false);
+
     GtkWidget* msgd = gtk_message_dialog_new_with_markup (nullptr,
                       GTK_DIALOG_DESTROY_WITH_PARENT,
                       GTK_MESSAGE_ERROR,
@@ -1755,13 +1842,6 @@ void EditorPanel::refreshProcessingState (bool inProcessingP)
     }
 
     isProcessing = inProcessingP;
-
-    if (!inProcessingP && loadingPlaceholder
-            && loadingPlaceholderIpc != nullptr
-            && ipc == loadingPlaceholderIpc && openThm
-            && openThm->getFileName() == loadingPlaceholderFile) {
-        endLoadingPlaceholder();
-    }
 
     setprogressStrUI(val, str, progressLabel);
 }

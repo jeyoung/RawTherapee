@@ -227,6 +227,12 @@ hidpi::DevicePixbuf PreviewHandler::getRoughImage (hidpi::LogicalSize desiredSiz
     return result;
 }
 
+Glib::RefPtr<Gdk::Pixbuf> PreviewHandler::getPreviewImage()
+{
+    MyMutex::MyLock lock(previewImgMutex);
+    return previewImg ? previewImg->copy() : Glib::RefPtr<Gdk::Pixbuf>();
+}
+
 void PreviewHandler::previewImageChanged ()
 {
 

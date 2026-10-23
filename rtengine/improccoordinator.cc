@@ -386,6 +386,7 @@ void ImProcCoordinator::assign(ImageSource* imgsrc)
 {
     this->imgsrc = imgsrc;
     previewBaseCache->clear("image-switch");
+    initialRoughPreview = false;
     invalidateViewportState();
 
     // A new image source has no completed high-detail base state. Buffer
@@ -1420,8 +1421,9 @@ void ImProcCoordinator::updatePreviewImage(int todo, bool panningRelatedChange,
 
             imgsrc->getFullSize(fw, fh, tr);
 
-            // Will (re)allocate the preview's buffers
-            setScale(scale);
+            // Will (re)allocate the preview's buffers. Preserve the
+            // deliberately small initial-preview policy across this call.
+            setScale(scale, initialRoughPreview);
             PreviewProps pp(0, 0, fw, fh, scale);
             const bool baseCacheFullFrame =
                 pp.getX() == 0 && pp.getY() == 0
@@ -1480,7 +1482,9 @@ void ImProcCoordinator::updatePreviewImage(int todo, bool panningRelatedChange,
             PreviewBaseCache::Key baseCacheKey;
 
             if (baseCacheEnabled) {
-                if (params->spot.enabled) {
+                if (initialRoughPreview) {
+                    baseCacheBypass = "initial-rough";
+                } else if (params->spot.enabled) {
                     baseCacheBypass = "spot";
                 } else if (params->filmNegative.enabled) {
                     baseCacheBypass = "film-negative";
@@ -1514,7 +1518,8 @@ void ImProcCoordinator::updatePreviewImage(int todo, bool panningRelatedChange,
                                      params->toneCurve, params->raw);
                 }
 
-                if (baseCacheEnabled && baseCacheBypass.empty()) {
+                if (baseCacheEnabled && baseCacheBypass.empty()
+                        && !initialRoughPreview) {
                     // Capture the key immediately after getImage(). HLR can
                     // mutate the shared source during getImage(), so the
                     // store key must use the post-call generation.
@@ -3627,7 +3632,7 @@ void ImProcCoordinator::allocCache(Imagefloat* &imgfloat)
  *
  * @param prevscale New Preview's scale.
  */
-void ImProcCoordinator::setScale(int prevscale)
+void ImProcCoordinator::setScale(int prevscale, bool allowSmall)
 {
     const int oldScale = scale;
 
@@ -3636,13 +3641,14 @@ void ImProcCoordinator::setScale(int prevscale)
     int nW, nH;
     imgsrc->getFullSize(fw, fh, tr);
 
-    prevscale++;
+    prevscale = std::max(2, prevscale + 1);
 
     do {
         prevscale--;
         PreviewProps pp(0, 0, fw, fh, prevscale);
         imgsrc->getSize(pp, nW, nH);
-    } while (nH < 400 && prevscale > 1 && (nW * nH < 1000000));  // actually hardcoded values, perhaps a better choice is possible
+    } while (!allowSmall && nH < 400 && prevscale > 1
+             && (nW * nH < 1000000));  // actually hardcoded values, perhaps a better choice is possible
 
     if (nW != pW || nH != pH) {
 

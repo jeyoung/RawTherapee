@@ -75,6 +75,13 @@ public:
         return previewReadySignal;
     }
 
+    double getPreviewScale() const
+    {
+        return previewScale;
+    }
+
+    Glib::RefPtr<Gdk::Pixbuf> getPreviewImage();
+
     void addPreviewImageListener (PreviewListener* l)
     {
         listeners.push_back (l);

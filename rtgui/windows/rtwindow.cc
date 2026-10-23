@@ -335,6 +335,10 @@ RTWindow::RTWindow ()
         Thumbnail* thm = cm->getEntry ( App::get().argv1() );
 
         if (thm) {
+            if (thm->getType() == FT_Raw) {
+                epanel->beginLoading(App::get().argv1());
+            }
+
             int error;
             rtengine::InitialImage *ii = rtengine::InitialImage::load (App::get().argv1(), thm->getType() == FT_Raw, &error, nullptr);
             epanel->open ( thm, ii );

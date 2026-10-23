@@ -58,7 +58,12 @@ protected:
     rtengine::StagedImageProcessor* ipc;
 
     bool loadingPlaceholder = false;
+    bool loadingFitMode = false;
     Glib::RefPtr<Gdk::Pixbuf> loadingPixbuf;
+    bool loadingSpinnerVisible = false;
+    double loadingSpinnerPhase = 0.0;
+    sigc::connection loadingSpinnerDelayConn;
+    sigc::connection loadingSpinnerAnimConn;
 
     bool        dirty;
     CropWindow* focusGrabber;
@@ -69,6 +74,9 @@ protected:
 
     CropWindow* getCropWindow (int x, int y);
     void drawLoadingPlaceholder(const Cairo::RefPtr<Cairo::Context>& cr);
+    void startLoadingSpinner();
+    void stopLoadingSpinner();
+    bool onLoadingSpinnerTick();
     Gtk::SizeRequestMode get_request_mode_vfunc () const override;
     void get_preferred_height_vfunc (int &minimum_height, int &natural_height) const override;
     void get_preferred_width_vfunc (int &minimum_width, int &natural_width) const override;
@@ -132,6 +140,8 @@ public:
         return previewHandler;
     }
 
+    void showLoadingCanvas();
+    bool hasRememberedView(int width, int height) const;
     void setLoadingPlaceholder(const Glib::RefPtr<Gdk::Pixbuf>& pixbuf);
     void clearLoadingPlaceholder();
     bool isLoadingPlaceholder() const

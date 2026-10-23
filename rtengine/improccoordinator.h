@@ -116,6 +116,10 @@ protected:
     // ImageSource::getImage(). One snapshot only; deep copies in and out.
     std::unique_ptr<PreviewBaseCache> previewBaseCache;
 
+    // True while the initial rough preview is being rendered. Rough previews
+    // must not populate the preview base cache.
+    bool initialRoughPreview = false;
+
     bool allocated;
 
     void freeAll();
@@ -253,7 +257,7 @@ protected:
     bool updateVectorscopeHS();
     /// Updates all waveforms. Returns true unless not updated.
     bool updateWaveforms();
-    void setScale(int prevscale);
+    void setScale(int prevscale, bool allowSmall = false);
     void updatePreviewImage (int todo, bool panningRelatedChange, unsigned request);
     bool canUseViewportFastPath(int todo, bool highDetailNeeded,
                                 const char*& reason) const;
@@ -451,7 +455,12 @@ public:
 
     void setPreviewScale    (int scale) override
     {
-        setScale(scale);
+        setPreviewScale(scale, false);
+    }
+    void setPreviewScale    (int scale, bool allowSmall) override
+    {
+        initialRoughPreview = allowSmall;
+        setScale(scale, allowSmall);
     }
     int  getPreviewScale    () override
     {

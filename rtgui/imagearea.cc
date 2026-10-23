@@ -25,12 +25,29 @@
 #include "rtengine/refreshmap.h"
 #include "rtengine/procparams.h"
 #include "rtengine/profiling.h"
+#include "rtengine/rt_math.h"
 
 #include "cropwindow.h"
 #include "hidpi.h"
 #include "multilangmgr.h"
 #include "options.h"
 #include "rtscalable.h"
+
+namespace
+{
+
+constexpr int LOADING_SPINNER_DELAY_MS = 150;
+constexpr int LOADING_SPINNER_FRAME_MS = 50;
+constexpr double LOADING_SPINNER_STEP = 0.14;
+constexpr double LOADING_SPINNER_SWEEP = 1.55 * rtengine::RT_PI;
+constexpr double LOADING_SPINNER_RADIUS_RATIO = 0.025;
+constexpr double LOADING_SPINNER_RADIUS_MIN = 10.0;
+constexpr double LOADING_SPINNER_RADIUS_MAX = 18.0;
+constexpr double LOADING_SPINNER_LINE_WIDTH = 2.5;
+constexpr double LOADING_SPINNER_OPACITY = 0.55;
+constexpr double LOADING_SPINNER_DARK_THRESHOLD = 0.55;
+
+}
 
 ImageArea::ImageArea (ImageAreaPanel* p) : parent(p), fullImageWidth(0), fullImageHeight(0)
 {
@@ -62,6 +79,7 @@ ImageArea::ImageArea (ImageAreaPanel* p) : parent(p), fullImageWidth(0), fullIma
 
 ImageArea::~ImageArea ()
 {
+    stopLoadingSpinner();
 
     for (auto cropWin : cropWins) {
         delete cropWin;
@@ -114,6 +132,10 @@ void ImageArea::on_resized (Gtk::Allocation& req)
             mainCropWindow->setSize (get_width(), get_height());  // this execute the refresh itself
         }
 
+        if (loadingPlaceholder && loadingFitMode && mainCropWindow) {
+            mainCropWindow->zoomFitCrop();
+        }
+
         parent->syncBeforeAfterViews();
     }
 }
@@ -148,8 +170,33 @@ void ImageArea::setPreviewHandler (PreviewHandler* ph)
     previewHandler = ph;
 }
 
+bool ImageArea::hasRememberedView(int width, int height) const
+{
+    const auto& options = App::get().options();
+
+    if (!options.rememberZoomAndPan || options.prevdemo != PD_Sidecar
+            || fullImageWidth <= 0 || fullImageHeight <= 0) {
+        return false;
+    }
+
+    return width == fullImageWidth && height == fullImageHeight;
+}
+
+void ImageArea::showLoadingCanvas()
+{
+    loadingPlaceholder = true;
+    loadingFitMode = false;
+    loadingPixbuf.clear();
+    focusGrabber = nullptr;
+    flawnOverWindow = nullptr;
+    startLoadingSpinner();
+    dirty = true;
+    queue_draw();
+}
+
 void ImageArea::setLoadingPlaceholder(const Glib::RefPtr<Gdk::Pixbuf>& pixbuf)
 {
+    stopLoadingSpinner();
     loadingPixbuf = pixbuf;
     loadingPlaceholder = true;
     focusGrabber = nullptr;
@@ -160,14 +207,58 @@ void ImageArea::setLoadingPlaceholder(const Glib::RefPtr<Gdk::Pixbuf>& pixbuf)
 
 void ImageArea::clearLoadingPlaceholder()
 {
+    stopLoadingSpinner();
+
     if (!loadingPlaceholder) {
         return;
     }
 
     loadingPlaceholder = false;
+    loadingFitMode = false;
     loadingPixbuf.clear();
     dirty = true;
     queue_draw();
+}
+
+void ImageArea::startLoadingSpinner()
+{
+    stopLoadingSpinner();
+
+    loadingSpinnerDelayConn = Glib::signal_timeout().connect(
+        [this]() -> bool
+        {
+            if (!loadingPlaceholder || loadingPixbuf) {
+                return false;
+            }
+
+            loadingSpinnerVisible = true;
+            loadingSpinnerPhase = 0.0;
+            loadingSpinnerAnimConn = Glib::signal_timeout().connect(
+                sigc::mem_fun(*this, &ImageArea::onLoadingSpinnerTick),
+                LOADING_SPINNER_FRAME_MS);
+            redraw();
+            return false;
+        },
+        LOADING_SPINNER_DELAY_MS);
+}
+
+void ImageArea::stopLoadingSpinner()
+{
+    loadingSpinnerDelayConn.disconnect();
+    loadingSpinnerAnimConn.disconnect();
+    loadingSpinnerVisible = false;
+    loadingSpinnerPhase = 0.0;
+}
+
+bool ImageArea::onLoadingSpinnerTick()
+{
+    if (!loadingPlaceholder || loadingPixbuf || !loadingSpinnerVisible) {
+        return false;
+    }
+
+    loadingSpinnerPhase = std::fmod(loadingSpinnerPhase + LOADING_SPINNER_STEP, 1.0);
+    redraw();
+    return true;
 }
 
 void ImageArea::on_style_updated ()
@@ -309,11 +400,9 @@ void ImageArea::drawLoadingPlaceholder(const Cairo::RefPtr<Cairo::Context>& cr)
                         background.get_blue(), background.get_alpha());
     cr->paint();
 
-    const double margin = std::max(8.0, std::min(width, height) * 0.04);
-
     if (loadingPixbuf) {
-        const double availableWidth = width - 2.0 * margin;
-        const double availableHeight = height - 2.0 * margin;
+        const double availableWidth = width;
+        const double availableHeight = height;
         const double scale = std::min(
             availableWidth / loadingPixbuf->get_width(),
             availableHeight / loadingPixbuf->get_height());
@@ -331,24 +420,32 @@ void ImageArea::drawLoadingPlaceholder(const Cairo::RefPtr<Cairo::Context>& cr)
             cr->paint();
             cr->restore();
         }
+        return;
     }
 
-    Glib::RefPtr<Pango::Layout> layout =
-        create_pango_layout(M("PROGRESSBAR_LOADING"));
-    int textWidth = 0;
-    int textHeight = 0;
-    layout->get_pixel_size(textWidth, textHeight);
+    if (!loadingSpinnerVisible) {
+        return;
+    }
 
-    const double textX = (width - textWidth) * 0.5;
-    const double textY = height - textHeight - margin;
+    const double luminance = 0.2126 * background.get_red()
+        + 0.7152 * background.get_green()
+        + 0.0722 * background.get_blue();
+    const double spinner = luminance > LOADING_SPINNER_DARK_THRESHOLD ? 0.0 : 1.0;
+    const double radius = std::clamp(
+        std::min(width, height) * LOADING_SPINNER_RADIUS_RATIO,
+        LOADING_SPINNER_RADIUS_MIN, LOADING_SPINNER_RADIUS_MAX);
+    const double centreX = width * 0.5;
+    const double centreY = height * 0.5;
+    const double start = -rtengine::RT_PI / 2.0
+        + 2.0 * rtengine::RT_PI * loadingSpinnerPhase;
 
-    cr->set_source_rgba(0.0, 0.0, 0.0, 0.75);
-    cr->move_to(textX + 1.0, textY + 1.0);
-    layout->show_in_cairo_context(cr);
-
-    cr->set_source_rgba(1.0, 1.0, 1.0, 0.9);
-    cr->move_to(textX, textY);
-    layout->show_in_cairo_context(cr);
+    cr->save();
+    cr->set_source_rgba(spinner, spinner, spinner, LOADING_SPINNER_OPACITY);
+    cr->set_line_width(LOADING_SPINNER_LINE_WIDTH);
+    cr->set_line_cap(Cairo::LINE_CAP_ROUND);
+    cr->arc(centreX, centreY, radius, start, start + LOADING_SPINNER_SWEEP);
+    cr->stroke();
+    cr->restore();
 }
 
 bool ImageArea::on_draw(const ::Cairo::RefPtr< Cairo::Context> &cr)
@@ -841,17 +938,31 @@ void ImageArea::initialImageArrived ()
 {
     if (mainCropWindow) {
         const auto& options = App::get().options();
-        ImageSize size = mainCropWindow->cropHandler.getFullImageSize();
-        if(options.prevdemo != PD_Sidecar || !options.rememberZoomAndPan ||
-                size.width != fullImageWidth || size.height != fullImageHeight) {
+        const ImageSize size = mainCropWindow->cropHandler.getFullImageSize();
+        const bool remembered = hasRememberedView(size.width, size.height);
+
+        if (loadingPlaceholder) {
+            loadingFitMode = !remembered;
+
+            if (!remembered) {
+                // A new image with no remembered view starts fitted like the
+                // "f" shortcut (fit crop when a crop is enabled).
+                mainCropWindow->zoomFitCrop();
+            }
+        } else if (options.prevdemo != PD_Sidecar
+                || !options.rememberZoomAndPan
+                || size.width != fullImageWidth
+                || size.height != fullImageHeight) {
             if (options.cropAutoFit || options.bgcolor != 0) {
                 mainCropWindow->zoomFitCrop();
             } else {
                 mainCropWindow->zoomFit();
             }
-        } else if ((options.cropAutoFit || options.bgcolor != 0) && mainCropWindow->cropHandler.cropParams->enabled) {
+        } else if ((options.cropAutoFit || options.bgcolor != 0)
+                && mainCropWindow->cropHandler.cropParams->enabled) {
             mainCropWindow->zoomFitCrop();
         }
+
         fullImageWidth = size.width;
         fullImageHeight = size.height;
     }

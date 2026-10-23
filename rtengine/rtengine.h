@@ -765,6 +765,13 @@ public:
     /** Sets the scale of the preview image. The larger the number is, the faster the image updates are (typical values are 4-5).
       * @param scale is the scale of the preview image */
     virtual void        setPreviewScale (int scale) = 0;
+    /** Sets the preview scale for a deliberately small initial or rough preview.
+      * Implementations that cannot provide a smaller preview may ignore @p allowSmall. */
+    virtual void        setPreviewScale (int scale, bool allowSmall)
+    {
+        (void)allowSmall;
+        setPreviewScale (scale);
+    }
     /** Returns the scale of the preview image.
       * @return the current scale of the preview image */
     virtual int         getPreviewScale () = 0;
