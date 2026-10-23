@@ -1,7 +1,7 @@
 /*
  *  This file is part of RawTherapee.
  *
- *  Copyright (c) 2026 Eddy Young <jeyoung@priscimon.com>
+ *  Copyright (c) 2026 Eddy Young
  *
  *  RawTherapee is free software: you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
