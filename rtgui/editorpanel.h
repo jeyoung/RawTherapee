@@ -223,6 +223,7 @@ private:
     bool                idle_sendToGimp ( ProgressConnector<rtengine::IImagefloat*> *pc, Glib::ustring fname);
     bool                idle_sentToGimp (ProgressConnector<int> *pc, rtengine::IImagefloat* img, Glib::ustring filename);
     void                histogramProfile_toggled ();
+    void                fastPreviewToggled ();
     RTAppChooserDialog *getAppChooserDialog();
     void onAppChooserDialogResponse(int resposneId);
     void updateExternalEditorSelection();
@@ -285,6 +286,8 @@ private:
     Gtk::Box* beforeHeaderBox;
     Gtk::Box* afterHeaderBox;
     Gtk::ToggleButton* toggleHistogramProfile;
+    Gtk::ToggleButton* toggleFastPreview = nullptr;
+    bool fastPreviewEnabled = false;
 
     Gtk::Frame* ppframe;
     ProfilePanel* profilep;

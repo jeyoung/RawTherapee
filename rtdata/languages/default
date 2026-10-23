@@ -1953,6 +1953,8 @@ MAIN_TOOLTIP_BACKCOLOR1;Background color of the preview: <b>black</b>\nShortcut:
 MAIN_TOOLTIP_BACKCOLOR2;Background color of the preview: <b>white</b>\nShortcut: <b>9</b>
 MAIN_TOOLTIP_BACKCOLOR3;Background color of the preview: <b>middle grey</b>\nShortcut: <b>9</b>
 MAIN_TOOLTIP_BEFOREAFTERLOCK;<b>Lock</b> / <b>Unlock</b> the <b>Before</b> view\n\n<b>Lock</b>: keep the <b>Before</b> view unchanged.\nUseful to evaluate the cumulative effect of multiple tools.\nAdditionally, comparisons can be made to any state in the History.\n\n<b>Unlock</b>: the <b>Before</b> view will follow the <b>After</b> view one step behind, showing the image before the effect of the currently used tool.
+MAIN_FASTPREVIEW;FAST
+MAIN_TOOLTIP_FASTPREVIEW;Use <b>fast demosaicing</b> for the preview at <b>100% and above</b>.\nTurn off to render the full demosaic method.\n\nBelow 100% zoom the <b>Preview Demosaic Method</b> preference applies. This setting is per editor tab and lasts for the current session.
 MAIN_TOOLTIP_HIDEHP;Show/Hide the left panel (including the history).\nShortcut: <b>l</b>
 MAIN_TOOLTIP_INDCLIPPEDH;Clipped highlight indication.\nShortcut: <b>&gt;</b>
 MAIN_TOOLTIP_INDCLIPPEDS;Clipped shadow indication.\nShortcut: <b>&lt;</b>

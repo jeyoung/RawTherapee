@@ -25,6 +25,7 @@
 #include "rtengine/imagesource.h"
 #include "rtengine/refreshmap.h"
 #include "rtengine/iccstore.h"
+#include "rtengine/previewquality.h"
 #include "batchqueue.h"
 #include "batchqueueentry.h"
 #include "soundman.h"
@@ -866,6 +867,15 @@ EditorPanel::EditorPanel (FilePanel* filePanel)
     toggleHistogramProfile->set_active (options.rtSettings.HistogramWorking);
     toggleHistogramProfile->set_tooltip_markup ( (M ("PREFERENCES_HISTOGRAM_TOOLTIP")));
 
+    toggleFastPreview = Gtk::manage (new Gtk::ToggleButton ());
+    Gtk::Label* fastPreviewLabel = Gtk::manage (new Gtk::Label (M ("MAIN_FASTPREVIEW")));
+    toggleFastPreview->add (*fastPreviewLabel);
+    toggleFastPreview->get_style_context()->add_class("text-button");
+    toggleFastPreview->set_relief (Gtk::RELIEF_NONE);
+    toggleFastPreview->set_tooltip_markup (M ("MAIN_TOOLTIP_FASTPREVIEW"));
+    toggleFastPreview->set_active (fastPreviewEnabled);
+    toggleFastPreview->set_sensitive (false);
+
     Gtk::Separator* vsep3 = Gtk::manage (new Gtk::Separator(Gtk::ORIENTATION_VERTICAL));
 
     iareapanel = new ImageAreaPanel ();
@@ -898,6 +908,10 @@ EditorPanel::EditorPanel (FilePanel* filePanel)
     toolBarPanel->pack_end   (*vsepz, Gtk::PACK_SHRINK, 2);
     toolBarPanel->pack_end   (*iareapanel->imageArea->previewModePanel, Gtk::PACK_SHRINK, 0);
     toolBarPanel->pack_end   (*vsepz4, Gtk::PACK_SHRINK, 2);
+
+    Gtk::Separator* vsepFast = Gtk::manage (new Gtk::Separator(Gtk::ORIENTATION_VERTICAL));
+    toolBarPanel->pack_end   (*toggleFastPreview, Gtk::PACK_SHRINK, 1);
+    toolBarPanel->pack_end   (*vsepFast, Gtk::PACK_SHRINK, 2);
 
     afterBox = Gtk::manage (new Gtk::Box (Gtk::ORIENTATION_VERTICAL));
     afterBox->pack_start (*iareapanel);
@@ -1127,6 +1141,7 @@ EditorPanel::EditorPanel (FilePanel* filePanel)
     send_to_external->signal_changed().connect(sigc::mem_fun(*this, &EditorPanel::sendToExternalChanged));
     send_to_external->signal_pressed().connect(sigc::mem_fun(*this, &EditorPanel::sendToExternalPressed));
     toggleHistogramProfile->signal_toggled().connect( sigc::mem_fun (*this, &EditorPanel::histogramProfile_toggled) );
+    toggleFastPreview->signal_toggled().connect( sigc::mem_fun (*this, &EditorPanel::fastPreviewToggled) );
 
     if (navPrev) {
         navPrev->signal_pressed().connect ( sigc::mem_fun (*this, &EditorPanel::openPreviousEditorImage) );
@@ -1499,6 +1514,12 @@ void EditorPanel::open (Thumbnail* tmb, rtengine::InitialImage* isrc)
     // initialize everything
     openThm = tmb;
 
+    if (toggleFastPreview) {
+        toggleFastPreview->set_sensitive(
+            rtengine::fastPreviewAllowed()
+            && openThm->getType() == FT_Raw);
+    }
+
     fname = openThm->getFileName();
     if (fPanel && fPanel->fileCatalog) {
         fPanel->fileCatalog->saveResetState();
@@ -1512,6 +1533,12 @@ void EditorPanel::open (Thumbnail* tmb, rtengine::InitialImage* isrc)
 
     this->isrc = isrc;
     ipc = rtengine::StagedImageProcessor::create (isrc);
+
+    if (iareapanel && iareapanel->imageArea->mainCropWindow) {
+        ipc->setMainPreviewFullResolution(
+            iareapanel->imageArea->mainCropWindow->getZoom() >= 1.0);
+    }
+    ipc->setFastPreview(fastPreviewEnabled);
 
     if (loadingPlaceholder) {
         loadingPlaceholderIpc = ipc;
@@ -1597,6 +1624,10 @@ void EditorPanel::open (Thumbnail* tmb, rtengine::InitialImage* isrc)
 
 void EditorPanel::close ()
 {
+    if (toggleFastPreview) {
+        toggleFastPreview->set_sensitive(false);
+    }
+
     if (ipc) {
         // A profile cleared from the File Browser must stay cleared until the
         // image is opened again. Do not write the neutral editor fallback back
@@ -2701,6 +2732,19 @@ void EditorPanel::histogramProfile_toggled()
     colorMgmtToolBar->updateHistogram();
 }
 
+void EditorPanel::fastPreviewToggled()
+{
+    fastPreviewEnabled = toggleFastPreview->get_active();
+
+    if (ipc) {
+        ipc->setFastPreview(fastPreviewEnabled);
+    }
+
+    if (beforeIpc) {
+        beforeIpc->setFastPreview(fastPreviewEnabled);
+    }
+}
+
 bool EditorPanel::idle_sendToGimp ( ProgressConnector<rtengine::IImagefloat*> *pc, Glib::ustring fname)
 {
 
@@ -2941,6 +2985,7 @@ void EditorPanel::beforeAfterToggled ()
         beforePreviewHandler = new PreviewHandler ();
 
         beforeIpc = rtengine::StagedImageProcessor::create (beforeImg);
+        beforeIpc->setFastPreview(fastPreviewEnabled);
         beforeIpc->setPreviewScale (10);
         beforeIpc->setPreviewImageListener (beforePreviewHandler);
         Glib::ustring monitorProfile;
