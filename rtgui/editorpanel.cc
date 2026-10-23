@@ -58,6 +58,21 @@ namespace
 
 constexpr int INITIAL_ROUGH_SCALE_MULTIPLIER = 2;
 
+// The rough pass has already decoded and preprocessed the raw source, but the
+// final preview scale change reallocates the Lab buffers. Rebuild the
+// post-base pipeline for the final frame; COMPR deliberately omits M_PREPROC
+// and M_RAW.
+constexpr int INITIAL_FINAL_PIPELINE = COMPR;
+
+static_assert(
+    (INITIAL_FINAL_PIPELINE
+        & (M_RGBCURVE | M_LUMACURVE | M_LUMINANCE | M_COLOR | M_MONITOR))
+        == (M_RGBCURVE | M_LUMACURVE | M_LUMINANCE | M_COLOR | M_MONITOR),
+    "The final rough-load pass must rebuild every post-base preview stage");
+static_assert(
+    (INITIAL_FINAL_PIPELINE & (M_PREPROC | M_RAW)) == 0,
+    "The final rough-load pass must not repeat raw preprocessing");
+
 void setprogressStrUI(double val, const Glib::ustring str, MyProgressBar* pProgress)
 {
     if (!str.empty()) {
@@ -1403,8 +1418,9 @@ void EditorPanel::onPreviewReady()
         // the normal fit-quality pass replaces it in place.
         ipc->stopProcessing();
         ipc->setPreviewScale(loadingFinalScale);
+        loadingFinalScale = ipc->getPreviewScale();
         loadingStage = LoadingStage::FinalPreview;
-        ipc->startProcessing(M_INIT | M_MONITOR);
+        ipc->startProcessing(INITIAL_FINAL_PIPELINE);
         return;
     }
 
@@ -1414,8 +1430,11 @@ void EditorPanel::onPreviewReady()
     }
 
     if (ipc && loadingFinalScale > 0) {
-        // Clear the rough-preview cache policy even when the first pass
-        // already arrived at the final scale.
+        // setScale() can normalise the requested scale, especially when the
+        // profile changes the full dimensions. Adopt the scale of the frame
+        // that actually arrived rather than asking for a stale value; the
+        // matching scale does not reallocate the Lab buffers.
+        loadingFinalScale = previewScale;
         ipc->setPreviewScale(loadingFinalScale);
     }
 
