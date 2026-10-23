@@ -96,6 +96,23 @@ crossfade and no intermediate three-stage blur-up, matching the existing rough
 preview -> detailed-crop handoff. Editing remains disabled during decoding and
 the rough preview, and is enabled only when the final image arrives.
 
+The final pass must request the complete post-base preview pipeline
+(`M_RGBCURVE`, `M_LUMACURVE`, `M_LUMINANCE`, `M_COLOR` and `M_MONITOR`, plus
+the optional HDR/spot/denoise stages), not just `M_INIT | M_MONITOR`. The
+preview scale change reallocates the Lab buffers, so reducing the request to
+the base and monitor stages leaves `oprevl` and `nprevl` empty. The navigator
+and the 100% panning fallback both use the resulting preview image and would
+show a black frame until an unrelated edit rebuilds the pipeline. The final
+request uses the canonical `COMPR` mask and deliberately omits `M_PREPROC` and
+`M_RAW`; the rough pass has already decoded and preprocessed the source. The
+handoff adopts the coordinator's actual scale after `setPreviewScale()`, so a
+profile-induced scale normalisation is not compared with a stale request.
+
+Regression check on the 45.7 MP NEF and 10 MP PEF: the navigator is populated
+as soon as the final frame arrives, and dragging at 100% no longer turns the
+image black. The parent package without the final-pipeline fix reproduced the
+black navigator and black drag frame.
+
 A new image with no remembered zoom/pan is fitted to the viewport using the
 same path as the `f` shortcut. When `RememberZoomAndPan` is enabled and the new
 image has the same dimensions as the previous image, the remembered zoom and
