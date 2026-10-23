@@ -40,6 +40,31 @@ inline bool needFullDemosaic(bool prevdemoFull,
 }
 
 /**
+ * @brief Return true when a 100% crossing needs a preview base refresh.
+ *
+ * The crossing itself needs a refresh only if it changes the effective
+ * demosaic decision. A preference change since the last pass always forces
+ * one, because the below-100% decision depends on the Preview Demosaic Method
+ * and the base was built with the old value.
+ */
+inline bool mainPreviewCrossingNeedsRefresh(bool prevdemoFull,
+                                            bool fastPreviewEffective,
+                                            bool wasFullResolution,
+                                            bool isFullResolution,
+                                            bool prevdemoKnown,
+                                            bool prevdemoUsedForBase)
+{
+    if (!prevdemoKnown || prevdemoFull != prevdemoUsedForBase) {
+        return true;
+    }
+
+    return needFullDemosaic(prevdemoFull, fastPreviewEffective,
+                            wasFullResolution)
+        != needFullDemosaic(prevdemoFull, fastPreviewEffective,
+                            isFullResolution);
+}
+
+/**
  * @brief Return false when the FAST preview is disabled by the environment.
  *
  * RT_FAST_PREVIEW=0 is the kill switch. Any other value, and an unset

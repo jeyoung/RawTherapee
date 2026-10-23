@@ -39,11 +39,48 @@ bool testTruthTable()
     return true;
 }
 
+bool testCrossingRefresh()
+{
+    // Preference unchanged and the crossing leaves the decision unchanged.
+    CHECK(!rtengine::mainPreviewCrossingNeedsRefresh(true, false, false, true,
+                                                     true, true));
+    CHECK(!rtengine::mainPreviewCrossingNeedsRefresh(false, true, false, true,
+                                                     true, false));
+
+    // Preference unchanged and the crossing changes the decision.
+    CHECK(rtengine::mainPreviewCrossingNeedsRefresh(true, true, false, true,
+                                                    true, true));
+    CHECK(rtengine::mainPreviewCrossingNeedsRefresh(false, false, false, true,
+                                                    true, false));
+
+    // Both directions of the crossing are symmetric.
+    CHECK(rtengine::mainPreviewCrossingNeedsRefresh(false, false, true, false,
+                                                    true, false));
+    CHECK(rtengine::mainPreviewCrossingNeedsRefresh(true, true, true, false,
+                                                    true, true));
+
+    // The base was built with a different Preview Demosaic Method.
+    CHECK(rtengine::mainPreviewCrossingNeedsRefresh(true, false, false, true,
+                                                    true, false));
+    CHECK(rtengine::mainPreviewCrossingNeedsRefresh(false, true, false, true,
+                                                    true, true));
+
+    // No pass has published the preference yet.
+    CHECK(rtengine::mainPreviewCrossingNeedsRefresh(true, false, false, true,
+                                                    false, false));
+
+    return true;
+}
+
 } // namespace
 
 int main()
 {
     if (!testTruthTable()) {
+        return 1;
+    }
+
+    if (!testCrossingRefresh()) {
         return 1;
     }
 

@@ -105,6 +105,12 @@ protected:
     std::atomic<bool> mainPreviewFullResolution;
     std::atomic<bool> paramsReady;
 
+    // Preview Demosaic Method in force when the preview base was last built or
+    // restored from the cache. The zoom-crossing guard must not compare
+    // decisions derived from a preference the base was not built with.
+    enum class PrevdemoBase { UNKNOWN, FAST, SIDECAR };
+    std::atomic<PrevdemoBase> lastPassPrevdemoBase;
+
     // Viewport-aware preview fast path (disable with RT_VIEWPORT_FAST=0).
     // The snapshot describes the state produced by the last completed
     // full-frame pass, so the parent LUTs can be rebuilt without redoing the

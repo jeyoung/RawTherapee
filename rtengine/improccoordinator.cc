@@ -162,6 +162,7 @@ ImProcCoordinator::ImProcCoordinator() :
     fastPreviewEnabled(false),
     mainPreviewFullResolution(false),
     paramsReady(false),
+    lastPassPrevdemoBase(PrevdemoBase::UNKNOWN),
     viewportStateValid(false),
     viewportHighDetail(false),
     forceFullPreview(false),
@@ -401,6 +402,8 @@ void ImProcCoordinator::assign(ImageSource* imgsrc)
 
     mainPreviewFullResolution.store(false, std::memory_order_relaxed);
     paramsReady.store(false, std::memory_order_relaxed);
+    lastPassPrevdemoBase.store(PrevdemoBase::UNKNOWN,
+                               std::memory_order_relaxed);
 }
 
 void ImProcCoordinator::getParams(procparams::ProcParams* dst, bool tweaked)
@@ -931,12 +934,13 @@ void ImProcCoordinator::updatePreviewImage(int todo, bool panningRelatedChange,
     // Below 100% the Preview Demosaic Method preference is authoritative.
     // At 100% and above the per-tab FAST toggle decides. Detail windows use
     // the same shared base and do not override this choice.
+    const bool prevdemoFull = prevdemo == PD_Sidecar;
     const bool fastPreview = fastPreviewEnabled.load(std::memory_order_acquire)
         && fastPreviewAllowed();
     const bool mainFull = mainPreviewFullResolution.load(
         std::memory_order_acquire);
     bool highDetailNeeded = needFullDemosaic(
-        prevdemo == PD_Sidecar, fastPreview, mainFull);
+        prevdemoFull, fastPreview, mainFull);
     //    printf("metwb=%s \n", params->wb.method.c_str());
 
     if (previewBaseCache->enabled()) {
@@ -1533,6 +1537,14 @@ void ImProcCoordinator::updatePreviewImage(int todo, bool panningRelatedChange,
                     previewBaseCache->store(storeKey, orig_prev);
                 }
             }
+
+            // The base image now matches the decision computed above, either
+            // rebuilt or restored from the base cache, so record the
+            // preference it was built with. Passes that reuse the base,
+            // including the viewport fast path, must not update this.
+            lastPassPrevdemoBase.store(
+                prevdemoFull ? PrevdemoBase::SIDECAR : PrevdemoBase::FAST,
+                std::memory_order_release);
 
             previewTimer.cacheHit = baseCacheHit;
 
@@ -4441,14 +4453,34 @@ void ImProcCoordinator::setFastPreview(bool enabled)
 
 void ImProcCoordinator::setMainPreviewFullResolution(bool full)
 {
-    if (mainPreviewFullResolution.exchange(full, std::memory_order_acq_rel)
-            == full) {
+    const bool wasFull = mainPreviewFullResolution.exchange(
+        full, std::memory_order_acq_rel);
+
+    if (wasFull == full) {
         return;
     }
 
-    if (paramsReady.load(std::memory_order_acquire)) {
-        queueFullPreviewRefresh();
+    if (!paramsReady.load(std::memory_order_acquire)) {
+        return;
     }
+
+    const bool prevdemoFull =
+        App::get().options().prevdemo == PD_Sidecar;
+    const bool fastPreview =
+        fastPreviewEnabled.load(std::memory_order_acquire)
+        && fastPreviewAllowed();
+    const PrevdemoBase basePrevdemo =
+        lastPassPrevdemoBase.load(std::memory_order_acquire);
+    const bool prevdemoKnown = basePrevdemo != PrevdemoBase::UNKNOWN;
+    const bool prevdemoUsedForBase = basePrevdemo == PrevdemoBase::SIDECAR;
+
+    if (!mainPreviewCrossingNeedsRefresh(prevdemoFull, fastPreview,
+                                         wasFull, full, prevdemoKnown,
+                                         prevdemoUsedForBase)) {
+        return;
+    }
+
+    queueFullPreviewRefresh();
 }
 
 void ImProcCoordinator::queueFullPreviewRefresh()
