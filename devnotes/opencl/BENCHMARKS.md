@@ -149,11 +149,12 @@ OMP_NUM_THREADS=8 rawtherapee-cli \
 |---|---|---|---|
 | colorspace_flowers.pef, 10 MP | CPU | 2.84 s | — |
 | colorspace_flowers.pef, 10 MP | GPU | 2.48 s | 129 ms |
-| d850.nef, 45.7 MP | CPU | 8.12 s | — |
-| d850.nef, 45.7 MP | GPU | 6.58 s | 439 ms |
+| 45.7 MP NEF | CPU | 8.12 s | — |
+| 45.7 MP NEF | GPU | 6.58 s | 439 ms |
 
-Three alternating runs each. The 45 MP GPU total is about 19 % faster. All
-six `verify.sh --formats` entries PASS at 1 LSB PAE.
+Three alternating runs each. The 45 MP GPU total is about 19 % faster. The
+public PEF baseline passes `verify.sh --formats`; private local format samples
+are outside the public corpus and are recorded as uncovered.
 
 ## Opt-in RGB processing
 
@@ -163,7 +164,7 @@ dynamic default profile, 16-bit TIFF:
 | Image | CPU `rgbProc` | GPU stage | GPU total with stage | GPU output-only total |
 |---|---:|---:|---:|---:|
 | colorspace_flowers.pef, 10 MP | 80 ms | 319 ms | 2.71–2.80 s | 2.48 s |
-| d850.nef, 45.7 MP | 385 ms | 471 ms | 7.14–7.18 s | 6.5 s |
+| 45.7 MP NEF | 385 ms | 471 ms | 7.14–7.18 s | 6.5 s |
 
 The GPU stage is slower than the multi-threaded CPU, so it is opt-in. The
 overall GPU path remains faster than the CPU because it also accelerates
@@ -191,7 +192,7 @@ latency is not recorded yet.
 
 ## Debian package smoke run
 
-`2026-10-04-173409.NEF` (8288x5520) with its `.pp3`, single-threaded,
+A private 45.7 MP NEF (8288x5520) with its `.pp3`, single-threaded,
 Debian 12-built package run on the host through a private mount namespace,
 with no `RUSTICL_ENABLE` or `OCL_ICD_VENDORS` in the environment:
 

@@ -4,8 +4,8 @@
 
 - Branch: `perf` (based on `opencl`, which is based on `dev` at `b2ee504c4`)
 - Milestone: M12 — opt-in GPU `rgbProc` core complete; GPU porting paused
-- Last verified: 2026-10-22, six-format export, monitor parity and opt-in
-  `rgbProc` parity on AMD RX 550; capture opt-in and 5×5 fast path
+- Last verified: 2026-10-22, public PEF baseline export, monitor parity and
+  opt-in `rgbProc` parity on AMD RX 550; capture opt-in and 5×5 fast path
 - Next task: none scheduled. RCD demosaic was evaluated and deferred; the next
   candidate, only if requested, is wavelet/denoise
 - Known limitations: single-stage acceleration is roughly neutral end-to-end;
@@ -33,8 +33,8 @@
   tone-curve histogram, and a DCP whose step 2 is identity.
 - `verify.sh --rgbproc` asserts that `opencl rgbproc:` actually runs and
   compares neutral and exposure/highlight/black profiles. Both PASS at 1 LSB.
-- `RT_OPENCL_RGBPROC=1 verify.sh --formats` PASS on all six manifest entries
-  at 1 LSB.
+- `RT_OPENCL_RGBPROC=1 verify.sh --formats` passes the public PEF baseline at
+  1 LSB; private local format samples are not public PASS evidence.
 - Performance, 8 threads: 10 MP stage is 319 ms GPU versus 80 ms CPU; 45 MP
   stage is 471 ms versus 385 ms. Total GPU wall time with `rgbProc` is
   2.71–2.80 s versus 2.48 s for output conversion alone at 10 MP, and
@@ -92,7 +92,8 @@ An RCD full-image pass prototype was implemented and reverted before commit.
   2.48–2.49 s; stage 129–132 ms.
 - 45.7 MP NEF, `OMP_NUM_THREADS=8`, 16-bit TIFF: CPU 8.09–8.13 s versus GPU
   6.50–6.58 s; stage 431–449 ms.
-- `--formats` PASS on all six manifest entries with maximum PAE 1 LSB.
+- `--formats` passes the public PEF baseline; private local format samples
+  are not public PASS evidence.
 - 32-bit float TIFF keeps the lcms path; `--gpu=auto` and `--gpu=off` pixel
   data are identical.
 - `WITH_OPENCL=ON` and `WITH_OPENCL=OFF` both build.
@@ -211,7 +212,8 @@ An RCD full-image pass prototype was implemented and reverted before commit.
 - Standard (non-log) profile: PASS, PAE 0.
 - Log + 0.8 scale profile: PASS, PAE 1 LSB.
 - Nikon D850 NEF, 45.7 MP: rotate PASS, PAE 1 LSB; resize PASS, PAE 0.
-- All six local/public format samples load and export; parity PAE 0.
+- The public PEF baseline loads and exports; private local samples are not
+  part of the public corpus and are not recorded as format PASS evidence.
 - Coordinate mapping is computed on the host in double and uploaded as a
   float map, so devices without fp64 (Rusticl Polaris) are supported.
 - Host map + buffers for 45 MP are checked against the 80% VRAM budget.

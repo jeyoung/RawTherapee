@@ -42,7 +42,7 @@ Independent review of the transform stage.
 | Log temp allocated before GPU availability was known | Hook now gates on `opencl::enabled()` before allocating the log copy |
 | Vertical cubic sum order differed from CPU SIMD | Changed to `(v0+v1)+(v2+v3)` for vertical and `(v0+v2)+(v1+v3)` for horizontal |
 | Log/bilinear paths unexercised | Added `rotate-standard.pp3` and `rotate-scale.pp3`; GPU log path tested on PEF and 45 MP NEF |
-| Manifest policy contradicted private rows | Header now distinguishes public and local private rows |
+| Manifest policy contradicted private rows | Private rows removed from the public manifest and marked uncovered |
 | `DeviceInfo::fp64` unused | Removed |
 
 ## R4 — M4 capture sharpening

@@ -3,14 +3,8 @@
 # Tab separated. Paths are relative to $RT_TESTDATA (default ~/rt-testdata).
 # Fields: extension, file, variant, sha256, source, licence
 #
-# Only list files that may be redistributed or downloaded, except for rows
-# under local/ which are private test samples referenced by symlink. Those
-# rows must never be used to upload or commit the referenced file.
+# Only list files that may be redistributed or downloaded. Keep private
+# samples in a gitignored manifest under $RT_TESTDATA.
 #
 # The official RawTherapee sample is the baseline used by verify.sh --quick.
 pef	colorspace_flowers.pef	bayer14	ddefa07a8b48fd157b48354488b265be48a47c204d00d20d54ead8dfddd9f151	https://rawtherapee.com/shared/test_images/colorspace_flowers.pef	RawTherapee test image
-nef	local/d850.nef	bayer45	d2c5a173a5e91b9064bc4662111a17c7f54035e0522c5f92b6fa0b98aec28ffe	user library	private test sample
-jpg	local/d850.jpg	jpeg8	63ac7c14ced452c1e28da78976ab8d6eb6a593195637bafa22319e5846c25b21	user library	private test sample
-tif	local/scan-rgb16.tif	tiff16rgb	6f4be336bec6fed8e3484dd5a41db6edf93e167b8c67875f223c79268785cf08	user library	private test sample
-tif	local/scan-grey16.tif	tiff16grey	bbe63799ab013339c4d14fac1d4a8ab35350a434b9e1e4c980293bd1debb7c99	user library	private test sample
-png	local/png8.png	png8alpha	974c2caff2018d327aaaafd08e01916a167fdcc464f44be77f7286a2ad1c344f	user library	private test sample

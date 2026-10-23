@@ -163,7 +163,7 @@ custom profile with the same name would silently use stale data. The generic
 would cover arbitrary profiles but needs interpolation-error testing and a
 larger cache.
 
-Consequences: output conversion is 1 LSB parity on the six-format corpus.
+Consequences: output conversion is 1 LSB parity on the public PEF baseline.
 `RTv2_sRGB`, other output profiles and 32-bit float output keep the lcms path.
 `NoICMString` is not offloaded because it already uses the faster manual CPU
 sRGB path; adding a GPU round trip would be slower. Profiles that are not
@@ -208,11 +208,11 @@ path on the RX 550 because the stage is slower than the 8-thread CPU. Dropping
 the implementation would lose the groundwork for a future fused, resident
 segment on stronger GPUs.
 
-Consequences: parity is 1 LSB on neutral, exposure and all six formats. The
-stage is batch-only until the preview tone-curve histogram is handled. The
-next decision is whether fusion with the Lab→RGB segment can offset the
-standalone stage cost; otherwise the next milestone is the guided-filter
-family.
+Consequences: parity is 1 LSB on neutral, exposure and the public PEF
+baseline. The stage is batch-only until the preview tone-curve histogram is
+handled. The next decision is whether fusion with the Lab→RGB segment can
+offset the standalone stage cost; otherwise the next milestone is the
+guided-filter family.
 
 ## D016 — Defer RCD and AMaZE GPU demosaic
 

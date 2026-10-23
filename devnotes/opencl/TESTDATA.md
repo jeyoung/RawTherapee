@@ -17,22 +17,23 @@ in `$RT_TESTDATA` (default `~/rt-testdata`).
 `verify.sh --list-coverage` compares the manifest with
 `rawtherapee-cli --list-formats` and reports extensions without a sample.
 
-## Current corpus
+## Current public corpus
 
 | ID | Extension | Variant | Source |
 |---|---|---|---|
 | RAW-1 | pef | Bayer 14-bit, 10 MP | RawTherapee test image |
-| RAW-7 | nef | Bayer 14-bit, 45.7 MP (Nikon D850) | user library |
-| IMG-2 | jpg | 8-bit, 45.7 MP | user library |
-| IMG-3 | tif | 16-bit RGB scan | user library |
-| IMG-4 | tif | 16-bit grey scan | user library |
-| IMG-5 | png | 8-bit RGBA | user library |
 
-Local samples are copied into `$RT_TESTDATA/local/`; they are private and
-must not be committed or uploaded.
+Private samples are kept in `$RT_TESTDATA/local/` and in a gitignored manifest;
+they are not listed here and must not be committed or uploaded.
 
-Add rows as files are collected. Rare formats should use CC0 samples from
-raw.pixls.us, recorded with their URL, SHA-256 and licence.
+Add rows as public or synthetic files are collected. Rare formats should use
+CC0 samples from raw.pixls.us, recorded with their URL, SHA-256 and licence.
+
+## Coverage gaps
+
+The private 45.7 MP NEF, JPEG, 16-bit TIFF and PNG samples are not part of the
+public corpus. Their format coverage is uncovered until public or synthetic
+samples are added; do not record it as PASS.
 
 ## Fetching
 

@@ -7,11 +7,10 @@ sample and a comparison result.
 | Extension | Variant | Sample | Load | Export | GPU parity | Notes |
 |---|---|---|---|---|---|---|
 | pef | Bayer 14-bit | colorspace_flowers.pef | PASS | PASS | PASS | baseline |
-| nef | Bayer 14-bit, 45.7 MP | local/d850.nef | PASS | PASS | PASS | stress sample |
-| jpg | 8-bit, 45.7 MP | local/d850.jpg | PASS | PASS | PASS | |
-| tif | 16-bit RGB | local/scan-rgb16.tif | PASS | PASS | PASS | |
-| tif | 16-bit grey | local/scan-grey16.tif | PASS | PASS | PASS | |
-| png | 8-bit RGBA | local/png8.png | PASS | PASS | PASS | alpha stripped |
+
+The private 45.7 MP NEF, JPEG, 16-bit TIFF and PNG samples are not part of the
+public corpus. Their format rows are uncovered until public or synthetic
+samples are recorded; do not mark them PASS.
 
 ## Variants still to collect
 
