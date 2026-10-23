@@ -248,14 +248,29 @@ void FilePanel::on_NB_switch_page(Gtk::Widget* page, guint page_num)
     }
 }
 
+bool FilePanel::hasPendingLoads()
+{
+    MyMutex::MyLock lock(pendingLoadMutex);
+    return !pendingLoads.empty();
+}
+
 bool FilePanel::fileSelected (Thumbnail* thm)
 {
     if (!parent) {
         return false;
     }
 
-    // Check if it's already open BEFORE loading the file
-    if (App::get().options().tabbedUI && parent->selectEditorPanel(thm->getFileName())) {
+    const auto& options = App::get().options();
+
+    // Reuse an editor that already shows this image. In single-tab mode this
+    // also avoids decoding it again, but a queued load must still win, and an
+    // image whose profile was just cleared must be reloaded so the configured
+    // default rule can run.
+    const bool canReuseEditor =
+        options.tabbedUI
+        || (!thm->isProfileCleared() && !hasPendingLoads());
+
+    if (canReuseEditor && parent->selectEditorPanel(thm->getFileName())) {
         thm->decreaseRef();
         return true;
     }
@@ -263,7 +278,7 @@ bool FilePanel::fileSelected (Thumbnail* thm)
     // Check if the image is already being opened and set the image loading status if it is not
     bool loading = thm->imageLoad( true );
 
-    if (!App::get().options().tabbedUI && parent && parent->epanel) {
+    if (!options.tabbedUI && parent->epanel) {
         if (thm->getType() == FT_Raw) {
             parent->epanel->beginLoading(thm->getFileName());
         } else {

@@ -108,6 +108,8 @@ private:
     MyMutex pendingLoadMutex;
     std::vector<struct pendingLoad*> pendingLoads;
 
+    bool hasPendingLoads();
+
     int error;
 
     IdleRegister idle_register;

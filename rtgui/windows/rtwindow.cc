@@ -725,9 +725,15 @@ bool RTWindow::selectEditorPanel (const std::string &name)
             mainNB->set_current_page (mainNB->page_num (*iep->second));
             set_title_decorated (name);
             return true;
-        } else {
-            //set_title_decorated(name);
-            //printf("RTWindow::selectEditorPanel - plain set\n");
+        }
+
+        // Single-tab mode keeps one persistent editor panel. Reuse it when it
+        // already shows the requested image instead of decoding it again.
+        if (isSingleTabMode() && mainNB && epanel
+                && epanel->getFileName() == name) {
+            SetEditorCurrent();
+            set_title_decorated (name);
+            return true;
         }
     }
 
