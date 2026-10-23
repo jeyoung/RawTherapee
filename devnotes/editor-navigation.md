@@ -102,6 +102,9 @@ OpenCL builds (`tools/build-rt.sh cpu`, `tools/build-rt.sh opencl`) passed.
 | Debian 12 package | PASS | Fresh Debian 12 container installed the `.deb`, listed formats, exported the public sample and passed the same reuse check (one load, 641.7 ms). |
 | Debian 13 package | PASS | Fresh Debian 13 container installed the `.deb`, listed formats, exported the public sample and passed the same reuse check (one load, 692.7 ms). |
 | CLI export parity | PASS | Package exports from Debian 12 and 13 and the host CPU build, all with `OMP_NUM_THREADS=1`, compared at 16 bits: `max_abs=0`, `differing=0` for all three pairs. |
+| Debian 12 package (#20) | PASS | Fresh Debian 12 container installed the #20 `.deb`, listed formats, exported the public sample with `OMP_NUM_THREADS=1`, and opened the image in the GUI. |
+| Debian 13 package (#20) | PASS | Fresh Debian 13 container installed the #20 `.deb`, listed formats, exported the public sample with `OMP_NUM_THREADS=1`, and opened the image in the GUI. |
+| Packaged mode switch | Not run | The Preferences switch was not scripted in the package containers. The crash fix was verified with the host build under gdb; the package smoke only opened the image. |
 
 ## Package verification
 
@@ -116,6 +119,23 @@ Both package tests used fresh `debian:12` and `debian:13` containers with
 Xvfb and openbox. GPU self-tests were not run because the containers have no
 OpenCL device; they are recorded as not run, not as PASS.
 
+### #20 package
+
+Package: `rawtherapee-5.13-150-g79c27250c_5.13+git13171.79c27250c-1_amd64.deb`
+(26 MiB), built from the clean tree at `79c27250c` (behaviour commit
+`975545582`).
+
+SHA-256:
+`3bccddfb3331180b2b6115b61b2305f3523bd4414a03e5c31a555671c056539d`
+
+Debian 12 and 13 installed the package, listed the raw formats, exported the
+public sample with `OMP_NUM_THREADS=1` and opened the image in the GUI. The
+two exports compare at 16 bits with `max_abs=0` and `differing=0`. The
+packaged Preferences switch was not scripted; the switch itself was verified
+on the host build under gdb.
+
 ## Change history
 
 - Issue #19: reuse the open editor in single-tab mode.
+- Issue #20: close the editor and crop handler safely when switching editor
+  modes.
