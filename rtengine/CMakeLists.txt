@@ -178,6 +178,13 @@ target_include_directories(preview-base-cache-test BEFORE PRIVATE
 target_link_libraries(preview-base-cache-test PRIVATE rtengine)
 rt_setup_target(preview-base-cache-test)
 
+# Standalone regression test for the 100% FAST preview decision.
+add_executable(fast-preview-test EXCLUDE_FROM_ALL
+    "${PROJECT_SOURCE_DIR}/tools/perf/fast-preview-test.cc"
+)
+target_link_libraries(fast-preview-test PRIVATE rtengine)
+rt_setup_target(fast-preview-test)
+
 target_include_directories(rtengine
     PUBLIC
         # Other libraries should use #include "rtengine/header.h"

@@ -98,6 +98,13 @@ protected:
     bool highDetailStateKnown;
     bool lastHighDetailNeeded;
 
+    // Per-editor-tab FAST preview state for 100% and above, plus the
+    // explicitly tracked main-preview resolution. Crop geometry is updated
+    // asynchronously, so it cannot be used to infer this at request time.
+    std::atomic<bool> fastPreviewEnabled;
+    std::atomic<bool> mainPreviewFullResolution;
+    std::atomic<bool> paramsReady;
+
     // Viewport-aware preview fast path (disable with RT_VIEWPORT_FAST=0).
     // The snapshot describes the state produced by the last completed
     // full-frame pass, so the parent LUTs can be rebuilt without redoing the
@@ -299,6 +306,7 @@ protected:
     bool wavcontlutili;
     void startProcessing();
     void process();
+    void queueFullPreviewRefresh();
     float colourToningSatLimit;
     float colourToningSatLimitOpacity;
     bool highQualityComputed;
@@ -498,6 +506,8 @@ public:
     void getAutoCrop (double ratio, int &x, int &y, int &w, int &h) override;
     bool getHighQualComputed() override;
     void setHighQualComputed() override;
+    void setFastPreview(bool enabled) override;
+    void setMainPreviewFullResolution(bool full) override;
     void setMonitorProfile (const Glib::ustring& profile, RenderingIntent intent) override;
     void getMonitorProfile (Glib::ustring& profile, RenderingIntent& intent) const override;
     void setSoftProofing   (bool softProof, bool gamutCheck) override;

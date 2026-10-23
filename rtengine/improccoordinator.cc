@@ -44,6 +44,7 @@
 #include "loadprofile.h"
 #include "procparams.h"
 #include "previewbasecache.h"
+#include "previewquality.h"
 #include "profiling.h"
 #include "tweakoperator.h"
 #include "refreshmap.h"
@@ -158,6 +159,9 @@ ImProcCoordinator::ImProcCoordinator() :
     highDetailRawComputed(false),
     highDetailStateKnown(false),
     lastHighDetailNeeded(false),
+    fastPreviewEnabled(false),
+    mainPreviewFullResolution(false),
+    paramsReady(false),
     viewportStateValid(false),
     viewportHighDetail(false),
     forceFullPreview(false),
@@ -394,6 +398,9 @@ void ImProcCoordinator::assign(ImageSource* imgsrc)
     // still valid.
     highDetailPreprocessComputed = false;
     highDetailRawComputed = false;
+
+    mainPreviewFullResolution.store(false, std::memory_order_relaxed);
+    paramsReady.store(false, std::memory_order_relaxed);
 }
 
 void ImProcCoordinator::getParams(procparams::ProcParams* dst, bool tweaked)
@@ -920,18 +927,17 @@ void ImProcCoordinator::updatePreviewImage(int todo, bool panningRelatedChange,
                          && App::get().options().rtSettings.openCLMode == 1);
     opencl::setStageAllowed(App::get().options().rtSettings.useOpenCL
                             && App::get().options().rtSettings.openCLMode == 1);
-    bool highDetailNeeded = prevdemo == PD_Sidecar ? true : (todo & M_HIGHQUAL);
-    //    printf("metwb=%s \n", params->wb.method.c_str());
 
-    // Check if any detail crops need high detail. If not, take a fast path short cut
-    if (!highDetailNeeded) {
-        for (size_t i = 0; i < crops.size(); i++) {
-            if (crops[i]->get_skip() == 1) {   // skip=1 -> full  resolution
-                highDetailNeeded = true;
-                break;
-            }
-        }
-    }
+    // Below 100% the Preview Demosaic Method preference is authoritative.
+    // At 100% and above the per-tab FAST toggle decides. Detail windows use
+    // the same shared base and do not override this choice.
+    const bool fastPreview = fastPreviewEnabled.load(std::memory_order_acquire)
+        && fastPreviewAllowed();
+    const bool mainFull = mainPreviewFullResolution.load(
+        std::memory_order_acquire);
+    bool highDetailNeeded = needFullDemosaic(
+        prevdemo == PD_Sidecar, fastPreview, mainFull);
+    //    printf("metwb=%s \n", params->wb.method.c_str());
 
     if (previewBaseCache->enabled()) {
         if (const char* reason = baseCacheTodoReason(baseCacheTodo)) {
@@ -4382,6 +4388,7 @@ void ImProcCoordinator::endUpdateParams(ProcEvent change)
 void ImProcCoordinator::endUpdateParams(int changeFlags)
 {
     changeSinceLast |= changeFlags;
+    paramsReady.store(true, std::memory_order_release);
 
     if (changeFlags & ~M_VOID) {
         previewRequest.fetch_add(1, std::memory_order_relaxed);
@@ -4414,6 +4421,46 @@ bool ImProcCoordinator::getHighQualComputed()
 void ImProcCoordinator::setHighQualComputed()
 {
     highQualityComputed = true;
+}
+
+void ImProcCoordinator::setFastPreview(bool enabled)
+{
+    if (fastPreviewEnabled.exchange(enabled, std::memory_order_acq_rel)
+            == enabled) {
+        return;
+    }
+
+    if (!paramsReady.load(std::memory_order_acquire)
+            || !mainPreviewFullResolution.load(std::memory_order_acquire)
+            || !fastPreviewAllowed()) {
+        return;
+    }
+
+    queueFullPreviewRefresh();
+}
+
+void ImProcCoordinator::setMainPreviewFullResolution(bool full)
+{
+    if (mainPreviewFullResolution.exchange(full, std::memory_order_acq_rel)
+            == full) {
+        return;
+    }
+
+    if (paramsReady.load(std::memory_order_acquire)) {
+        queueFullPreviewRefresh();
+    }
+}
+
+void ImProcCoordinator::queueFullPreviewRefresh()
+{
+    invalidateViewportState();
+
+    paramsUpdateMutex.lock();
+    changeSinceLast |= ALL | M_MONITOR;
+    previewRequest.fetch_add(1, std::memory_order_relaxed);
+    paramsUpdateMutex.unlock();
+
+    startProcessing();
 }
 
 void ImProcCoordinator::requestUpdateWaveform()

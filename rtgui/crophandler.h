@@ -149,6 +149,7 @@ private:
     PendingUpdate pendingUpdate;
     int deviceScale;
     bool isLowUpdatePriority;
+    bool isDetailWindow = false;
 
     rtengine::StagedImageProcessor* ipc;
     rtengine::DetailedCrop* crop;

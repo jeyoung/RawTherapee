@@ -797,10 +797,10 @@ void ImageArea::addCropWindow ()
 
     mainCropWindow->setObservedCropWin (cropWins.front());
 
-    if(!ipc->getHighQualComputed()) {
-        ipc->startProcessing(M_HIGHQUAL);
-        ipc->setHighQualComputed();
-    }
+    // Detail windows need a crop refresh. This no longer forces the demosaic
+    // method; that is decided by the main preview zoom and the FAST toggle.
+    ipc->startProcessing(M_HIGHQUAL);
+    ipc->setHighQualComputed();
 }
 
 

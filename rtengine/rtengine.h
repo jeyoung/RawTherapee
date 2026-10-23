@@ -791,6 +791,11 @@ public:
     virtual bool        getHighQualComputed() = 0;
     virtual void        setHighQualComputed() = 0;
 
+    /** Selects the per-editor-tab FAST preview for 100% and above. */
+    virtual void        setFastPreview (bool enabled) = 0;
+    /** Records whether the main preview is at 100% or above. */
+    virtual void        setMainPreviewFullResolution (bool full) = 0;
+
     virtual bool        updateTryLock() = 0;
 
     virtual void        updateUnLock() = 0;

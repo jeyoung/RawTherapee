@@ -84,11 +84,16 @@ void CropHandler::newImage (StagedImageProcessor* ipc_, bool isDetailWindow)
 {
 
     ipc = ipc_;
+    this->isDetailWindow = isDetailWindow;
     cx = 0;
     cy = 0;
 
     if (!ipc) {
         return;
+    }
+
+    if (!isDetailWindow) {
+        ipc->setMainPreviewFullResolution(zoom >= 1000);
     }
 
     EditDataProvider *editDataProvider = nullptr;
@@ -168,10 +173,13 @@ void CropHandler::setZoom (int z, int centerx, int centery)
         cay = centery + int(distToAnchor);
     }
 
-    // maybe demosaic etc. if we cross the border to >100%
-    bool needsFullRefresh = (z >= 1000 && zoom < 1000);
-
     zoom = z;
+
+    if (!isDetailWindow) {
+        // Record the main preview resolution. The coordinator decides the
+        // demosaic method from this and the per-tab FAST state.
+        ipc->setMainPreviewFullResolution(z >= 1000);
+    }
 
     hidpi::DeviceSize output = getDeviceWSize();
     if (zoom >= 1000) {
@@ -194,13 +202,7 @@ void CropHandler::setZoom (int z, int centerx, int centery)
     compDim ();
 
     if (enabled && (oldZoom != zoom || oldcax != cax || oldcay != cay || oldCropX != cropX || oldCropY != cropY || oldCropW != cropW || oldCropH != cropH)) {
-        if (needsFullRefresh && !ipc->getHighQualComputed()) {
-            cropPixbuf.clear ();
-            ipc->startProcessing(M_HIGHQUAL);
-            ipc->setHighQualComputed();
-        } else {
-            update ();
-        }
+        update ();
     }
 }
 
