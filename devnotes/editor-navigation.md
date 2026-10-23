@@ -99,6 +99,7 @@ OpenCL builds (`tools/build-rt.sh cpu`, `tools/build-rt.sh opencl`) passed.
 | Single-tab to multi-tab, image open | PASS | Pre-fix build crashed in `gtk_widget_set_sensitive` from `EditorPanel::close()`, then in `CropHandler::~CropHandler()` after the first guard. After the full fix, both the direct `setEditorMode(true)` call and the real `Preferences::okPressed` path returned, `TabbedEditor=true` was saved and the process stayed alive. |
 | Single-tab to multi-tab, no image | PASS | The direct mode-switch call returned with the empty persistent editor. |
 | Mode switch during loading | PASS | The direct switch returned while the image was loading. The layout fields are applied before removal, so the pending load completion enters the multi-tab branch instead of dereferencing the removed single-tab panel. |
+| Multi-tab to single-tab | PASS | With a multi-tab image tab open, the direct `setEditorMode(false)` call closed the tab, created the persistent single-tab editor and returned; the process stayed alive. |
 | Debian 12 package | PASS | Fresh Debian 12 container installed the `.deb`, listed formats, exported the public sample and passed the same reuse check (one load, 641.7 ms). |
 | Debian 13 package | PASS | Fresh Debian 13 container installed the `.deb`, listed formats, exported the public sample and passed the same reuse check (one load, 692.7 ms). |
 | CLI export parity | PASS | Package exports from Debian 12 and 13 and the host CPU build, all with `OMP_NUM_THREADS=1`, compared at 16 bits: `max_abs=0`, `differing=0` for all three pairs. |
