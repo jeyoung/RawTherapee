@@ -187,3 +187,11 @@ and a fresh settings directory:
   fast-on/off regression for it.
 - Evaluate whether the deferred pass can skip `M_AUTOEXP` entirely when the
   corresponding auto flags are off.
+
+## FAST preview toggle interaction
+
+The per-tab FAST preview toggle and a 100% zoom crossing change the effective
+`highDetailNeeded`. The coordinator invalidates the viewport state and queues
+`ALL | M_MONITOR` when the effective full/fast result changes, so a cache entry
+from the other mode is never reused. A no-op transition does not queue a
+render. See `devnotes/perf/FAST_PREVIEW_TOGGLE.md`.

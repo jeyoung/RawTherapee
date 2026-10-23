@@ -137,3 +137,10 @@ Manual CPU test with a 45.7 MP NEF selected from the file browser, cold cache,
 A 10 MP PEF gave a rough frame after about 7.0 s and the final frame about
 63 ms later. The long first interval is the existing raw decode and first
 full pipeline; the two-stage reveal does not try to hide it.
+
+## FAST preview toggle
+
+The per-tab **FAST** control overrides the preview demosaic at every zoom.
+With it off, below 100% the Preview Demosaic Method preference applies and at
+100% and above the full `.pp3` method is used. See
+`devnotes/perf/FAST_PREVIEW_TOGGLE.md` for the truth table and evidence.
