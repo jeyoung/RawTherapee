@@ -42,6 +42,32 @@ own reference, so the release cannot destroy the thumbnail.
 Multi-tab and multi-display paths keep their previous behaviour, including
 selecting an open image while another load is pending.
 
+## Editor mode switching
+
+Preferences applies the editor layout through
+`Preferences::workflowUpdate()`, which calls `RTWindow::setEditorMode()`. The
+layout fields are written to the live options before the switch, so
+`isSingleTabMode()`, `createSetmEditor()` and pending image-load callbacks
+agree on the target mode.
+
+When switching from single-tab to multi-tab, the persistent editor is closed
+while its widget hierarchy is alive:
+
+- `EditorPanel::close()` stops processing, closes the crop handler and
+  releases the thumbnail reference;
+- the panel is then removed from the notebook;
+- `~EditorPanel()` clears `toggleFastPreview` before calling `close()`,
+  because GTK may already have destroyed that managed child;
+- `close()` runs before `delete iareapanel`, so the image area and its crop
+  handler are still valid;
+- `ImageArea::setImProcCoordinator(nullptr)` calls `CropHandler::close()`
+  to detach the processor and delete the crop before the processor is
+  destroyed.
+
+Without this ordering, pressing OK with an image open crashed in
+`Gtk::Widget::set_sensitive()` from `EditorPanel::close()`. After that was
+fixed, the next teardown step crashed in `CropHandler::~CropHandler()`.
+
 ## Known limits
 
 Selecting the image that is already open does not re-read it from disk, so
@@ -51,8 +77,9 @@ required.
 
 ## Verification
 
-Environment: Debian 13 container with Xvfb 1600x1000x24 and openbox, CPU build
-`build/cpu-issue-19-single-tab-reuse`, the public 10.1 MP
+Environment: Debian 13 container with Xvfb 1600x1000x24 and openbox, CPU builds
+`build/cpu-issue-19-single-tab-reuse` and
+`build/cpu-issue-20-editor-mode-crash`, the public 10.1 MP
 `colorspace_flowers.pef` sample, and project-local settings and cache
 directories. `RT_LOAD_PROFILE=1` reports each `InitialImage::load()`.
 Functional GUI checks ran in the container because host Xvfb is not installed;
@@ -69,6 +96,9 @@ OpenCL builds (`tools/build-rt.sh cpu`, `tools/build-rt.sh opencl`) passed.
 | Multi-tab regression | PASS | Two images opened in two tabs; selecting the first tab again added no load. |
 | Cleared profile | PASS | Clear Profile left one load; reopening reloaded (second load) and regenerated the default profile sidecar; reopening again added no load. |
 | Reference stability | PASS | Twenty reuse cycles kept one load and the process remained alive. |
+| Single-tab to multi-tab, image open | PASS | Pre-fix build crashed in `gtk_widget_set_sensitive` from `EditorPanel::close()`, then in `CropHandler::~CropHandler()` after the first guard. After the full fix, both the direct `setEditorMode(true)` call and the real `Preferences::okPressed` path returned, `TabbedEditor=true` was saved and the process stayed alive. |
+| Single-tab to multi-tab, no image | PASS | The direct mode-switch call returned with the empty persistent editor. |
+| Mode switch during loading | PASS | The direct switch returned while the image was loading. The layout fields are applied before removal, so the pending load completion enters the multi-tab branch instead of dereferencing the removed single-tab panel. |
 | Debian 12 package | PASS | Fresh Debian 12 container installed the `.deb`, listed formats, exported the public sample and passed the same reuse check (one load, 641.7 ms). |
 | Debian 13 package | PASS | Fresh Debian 13 container installed the `.deb`, listed formats, exported the public sample and passed the same reuse check (one load, 692.7 ms). |
 | CLI export parity | PASS | Package exports from Debian 12 and 13 and the host CPU build, all with `OMP_NUM_THREADS=1`, compared at 16 bits: `max_abs=0`, `differing=0` for all three pairs. |
