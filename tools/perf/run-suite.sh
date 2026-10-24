@@ -3,12 +3,14 @@
 #
 # Usage:
 #   tools/perf/run-suite.sh --build-dir build/cpu-perf-stage-runtime \
-#       --image "$RT_TEST_IMAGE_45MP" [--pp3 FILE] [--baseline-dir DIR] \
-#       [--mode smoke|gate] [--report DIR] [--skip-preview] [--skip-stage-tests] \
-#       [--graph]
+#       --image "$RT_TEST_IMAGE_45MP" [--pp3 FILE] [--denoise-pp3 FILE] \
+#       [--baseline-dir DIR] [--mode smoke|gate] [--report DIR] \
+#       [--skip-preview] [--skip-stage-tests] [--graph]
 #
 # --graph adds an opt-in parity gate: export once with RT_STAGE_GRAPH=0 and
 # once with RT_STAGE_GRAPH=1, then require AE=0 between the two TIFFs.
+# --denoise-pp3 adds a thread-determinism matrix for a profile that enables
+# directional-pyramid denoising (see devnotes/perf/DETERMINISM.md).
 
 set -euo pipefail
 
@@ -19,6 +21,7 @@ build_dir=""
 baseline_dir="$ROOT/../../baseline-dev"
 image=""
 pp3=""
+denoise_pp3=""
 mode="smoke"
 report=""
 skip_preview=0
@@ -32,12 +35,13 @@ while [ "$#" -gt 0 ]; do
         --baseline-dir) baseline_dir="$2"; shift 2 ;;
         --image) image="$2"; shift 2 ;;
         --pp3) pp3="$2"; shift 2 ;;
+        --denoise-pp3) denoise_pp3="$2"; shift 2 ;;
         --mode) mode="$2"; shift 2 ;;
         --report) report="$2"; shift 2 ;;
         --skip-preview) skip_preview=1; shift ;;
         --skip-stage-tests) skip_stage_tests=1; shift ;;
         --graph) graph_parity=1; shift ;;
-        -h|--help) sed -n '2,9p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
         *) die "unknown option: $1" ;;
     esac
 done
@@ -156,6 +160,28 @@ for threads in $threads_list; do
         fail "thread determinism comparison t=$threads"
     fi
 done
+
+# --------------------------------------------------- denoise determinism
+if [ -n "$denoise_pp3" ]; then
+    info "denoise thread determinism"
+    denoise_ref="$report/denoise-t1.tif"
+    "$ROOT/tools/perf/export-one.sh" --build-dir "$build_dir" --image "$image" \
+        --out "$denoise_ref" --pp3 "$denoise_pp3" --gpu off --threads 1
+    for threads in $threads_list; do
+        [ "$threads" = "1" ] && continue
+        out="$report/denoise-t$threads.tif"
+        "$ROOT/tools/perf/export-one.sh" --build-dir "$build_dir" --image "$image" \
+            --out "$out" --pp3 "$denoise_pp3" --gpu off --threads "$threads"
+        if result=$(python3 "$ROOT/tools/opencl/compare_tiff.py" "$denoise_ref" "$out" --bits 16); then
+            set -- $result
+            if [ "$3" = "0" ]; then pass "denoise thread determinism t=$threads"; else fail "denoise thread determinism t=$threads differing=$3"; fi
+        else
+            fail "denoise thread determinism comparison t=$threads"
+        fi
+    done
+else
+    skip "denoise thread determinism: no --denoise-pp3"
+fi
 
 # ------------------------------------------------------------------- timing
 info "export timing"
