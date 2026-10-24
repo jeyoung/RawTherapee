@@ -161,10 +161,10 @@ inputs, transform, scale and dimensions. The process-local `ImageSource`
 pointer and the transient source-generation counter are excluded; the image
 identity is the path plus file size and mtime.
 
-`RT_STAGE_STORE_MAX_MB` sets the write cap (default 512 MiB). Once the cap is
-reached, new writes are skipped rather than evicting an entry the caller
-cannot enumerate. This is deliberately conservative until an eviction policy
-exists.
+`RT_STAGE_STORE_MAX_MB` sets the budget (default 512 MiB). Before a write that
+would exceed it, the store removes the oldest files until the new entry fits.
+The store's tests cover `prune(0)` and the preview cache exercises the budget
+path.
 
 The store is opt-in and does not change the default path. A warm reopen
 produced `preview-base-cache: persistent-hit` and the normal second preview
@@ -257,10 +257,10 @@ parity.
   graph-driven only when `RT_STAGE_GRAPH=1`; the legacy path is the default
   and the graph path does not yet cache or reuse buffers.
 - The persistent preview cache is opt-in and covers only the preview base
-  image. It has no eviction beyond the write cap, and the store itself has no
-  key derivation; `PreviewBaseCache` owns the key. A store shared by two
-  processes is atomic per entry but is not range-locked, so two writers of the
-  same key race by rename order.
+  image. The store prunes oldest files to the configured budget, but the store
+  itself has no key derivation; `PreviewBaseCache` owns the key. A store
+  shared by two processes is atomic per entry but is not range-locked, so two
+  writers of the same key race by rename order.
 - The persistent cache does not speed up the first rough preview, because that
   pass deliberately bypasses the base cache. Its measured benefit is later
   preview requests and reopen after a base has been stored.
