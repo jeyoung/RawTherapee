@@ -109,6 +109,49 @@ gate.
 splits blocks into full and cheap work. It is the hook for selective
 denoise/wavelet work; it is not yet wired into those tools.
 
+## Persistent store
+
+`StageStore` is a standalone on-disk store for stage buffers, intended for a
+future preview-cache tier. It is not wired into any pipeline yet: nothing in
+the engine creates or reads a store.
+
+- The root is supplied by the caller, for example `RT_CACHE/stages`. The store
+  owns that tree; `clear()` empties it.
+- A key is exactly 64 hexadecimal digits computed by the caller. The key is
+  canonicalised to lower case and sharded two levels deep
+  (`<root>/ab/cd/<key>.stage`), so no directory grows without bound and no
+  caller text ever reaches the file system.
+- The entry is little-endian and self-describing: magic `RTSTG001`, format
+  version, fixed header size, CRCs of the header and the payload, stage name
+  and version, width, height, planes, pixel format, packed row bytes and
+  payload length. The payload follows the name and version text.
+- `put()` writes a temporary file in the destination shard, flushes and syncs
+  it, then renames it over the final name. A reader never sees a partial
+  entry, and a failed write leaves the previous entry intact. The directory is
+  synced after the rename so the entry survives a power loss.
+- `get()` validates magic, version, header size, descriptor, row geometry,
+  total length, header CRC and payload CRC before it writes anything. The
+  payload is verified in a first pass and copied in a second, so a corrupt or
+  truncated entry leaves the destination untouched. Only the packed row bytes
+  are copied, row by row, so destination padding outside its row and plane
+  pitches is never written.
+- `F32`, `U16` and `U8` are supported with one to three planes and any source
+  or destination pitch that is at least the packed row. A single-plane `U8`
+  buffer is packed RGB with three bytes per pixel, matching
+  `stage::row_bytes()` and the engine's `Image8`; a three-plane `U8` buffer is
+  one byte per plane.
+- `erase()`, `contains()`, `clear()` and `bytes()` complete the API.
+  `bytes()` sums every regular file below the root so a caller can enforce a
+  size budget; it includes a temporary file left by a crashed writer.
+- All operations are serialised by one mutex. The store holds no engine state
+  and can be used from any thread.
+
+`stage-store-test` covers the round trip for all three formats with one and
+three planes and mismatched source/destination pitches, metadata, sharding,
+case-insensitive keys, invalid and traversal keys, a corrupted payload byte,
+two truncations, wrong geometry, short destination pitches, atomic overwrite,
+erase, contains, clear, a small byte budget and concurrent writers.
+
 ## Export profiling
 
 `RT_STAGE_PROFILE=1` now prints the main export phases:
@@ -144,7 +187,13 @@ parity.
 ## Evidence
 
 - `stage-abi-test`, `stage-parity-test`, `stage-cache-test`,
-  `stage-graph-test` and `stage-indexer-test` pass on the CPU build.
+  `stage-graph-test`, `stage-indexer-test` and `stage-store-test` pass on the
+  CPU build.
+- `stage-store-test` also covers the store's failure paths: a flipped payload
+  byte, two truncations, wrong geometry, short destination pitches, invalid
+  and traversal keys and concurrent writers are all rejected or kept intact,
+  and the temporary directory is removed afterwards. The test builds and
+  passes in both the CPU and OpenCL configurations.
 - `stage-parity-test` compares the host and `lanczos3.so` output over a
   64×48 synthetic image: zero differing pixels and zero maximum difference.
 - A 45.7 MP sidecar export with the resize profile is pixel-identical
@@ -176,6 +225,10 @@ parity.
 - Preview, crop and thumbnail pipelines are not graph-driven. Export is
   graph-driven only when `RT_STAGE_GRAPH=1`; the legacy path is the default
   and the graph path does not yet cache or reuse buffers.
+- The persistent store has no pipeline integration, eviction policy or key
+  derivation of its own: the caller owns the key, the budget check and the
+  decision to delete. A store shared by two processes is atomic per entry but
+  is not range-locked, so two writers of the same key race by rename order.
 - Only Lanczos is exposed as a loadable stage. Denoise, wavelet, local
   adjustments and the output conversion still use the existing code paths.
 - The block scorer is not connected to denoise or wavelet; it has no runtime

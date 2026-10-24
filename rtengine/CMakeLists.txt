@@ -124,6 +124,7 @@ set(RTENGINESOURCEFILES
     stage/stage_parity.cc
     stage/stage_profile.cc
     stage/stage_runtime.cc
+    stage/stage_store.cc
     svgrender.cc
     tmo_fattal02.cc
     utils.cc
@@ -251,6 +252,13 @@ target_compile_definitions(stage-parity-test PRIVATE
     RT_STAGE_BUILD_DIR="${CMAKE_BINARY_DIR}/stages"
 )
 rt_setup_target(stage-parity-test)
+
+add_executable(stage-store-test EXCLUDE_FROM_ALL
+    "${CMAKE_CURRENT_SOURCE_DIR}/stage/tests/stage_store_test.cc"
+)
+target_link_libraries(stage-store-test PRIVATE rtengine)
+target_include_directories(stage-store-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/stage")
+rt_setup_target(stage-store-test)
 
 target_include_directories(rtengine
     PUBLIC
