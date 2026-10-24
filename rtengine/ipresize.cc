@@ -28,6 +28,8 @@
 #include "rt_math.h"
 #include "procparams.h"
 #include "sleef.h"
+#include "stage/stage_buffer.h"
+#include "stage/stage_runtime.h"
 
 //#define PROFILE
 
@@ -704,10 +706,38 @@ static inline float Lanc (float x, float a)
     }
 }
 
+namespace
+{
+
+bool run_lanczos_stage(const RtStageBuffer& src, const RtStageBuffer& dst, float scale)
+{
+    RtStageArg args[4]{};
+    args[0].kind = RT_STAGE_ARG_BUFFER;
+    args[0].u.buffer = src;
+    args[1].kind = RT_STAGE_ARG_BUFFER;
+    args[1].u.buffer = dst;
+    args[2].kind = RT_STAGE_ARG_DOUBLE;
+    args[2].u.f = scale;
+    args[3].kind = RT_STAGE_ARG_INT;
+    args[3].u.i = 0;
+
+    RtStageProfiling profiling{};
+    return rtengine::stage::run("lanczos3",
+                                {args[0], args[1], args[2], args[3]},
+                                &profiling) == RT_STAGE_OK;
+}
+
+} // namespace
+
 void ImProcFunctions::Lanczos (const Imagefloat* src, Imagefloat* dst, float scale)
 {
 
     if (openCLAllowed && opencl::resizeLanczos(src, dst, scale)) {
+        return;
+    }
+
+    if (run_lanczos_stage(rtengine::stage::view(*src),
+                          rtengine::stage::view(*dst), scale)) {
         return;
     }
 
@@ -847,6 +877,11 @@ void ImProcFunctions::Lanczos (const Imagefloat* src, Imagefloat* dst, float sca
 void ImProcFunctions::Lanczos (const LabImage* src, LabImage* dst, float scale)
 {
     if (openCLAllowed && opencl::resizeLanczos(src, dst, scale)) {
+        return;
+    }
+
+    if (run_lanczos_stage(rtengine::stage::view(*src),
+                          rtengine::stage::view(*dst), scale)) {
         return;
     }
 

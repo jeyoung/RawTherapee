@@ -40,7 +40,11 @@
 #include "profiling.h"
 #include "rawimagesource.h"
 #include "rtengine.h"
+#include "stage/stage_profile.h"
 #include "utils.h"
+
+#include <chrono>
+#include <type_traits>
 
 #include "rtgui/multilangmgr.h"
 #include "rtgui/options.h"
@@ -122,13 +126,35 @@ private:
     {
         RT_PROFILE("proc::normal_pipeline", PROCESS_IMAGE);
 
-        if (!stage_init()) {
+        const auto timed = [](const char* name, auto&& fn) {
+            const auto begin = std::chrono::steady_clock::now();
+            if constexpr (std::is_void_v<decltype(fn())>) {
+                fn();
+                const auto end = std::chrono::steady_clock::now();
+                stage::profile_duration(
+                    name, static_cast<uint64_t>(
+                              std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                  end - begin)
+                                  .count()));
+            } else {
+                auto result = fn();
+                const auto end = std::chrono::steady_clock::now();
+                stage::profile_duration(
+                    name, static_cast<uint64_t>(
+                              std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                  end - begin)
+                                  .count()));
+                return result;
+            }
+        };
+
+        if (!timed("export.init", [this] { return stage_init(); })) {
             return nullptr;
         }
 
-        stage_denoise();
-        stage_transform();
-        return stage_finish();
+        timed("export.denoise", [this] { stage_denoise(); });
+        timed("export.transform", [this] { stage_transform(); });
+        return timed("export.finish", [this] { return stage_finish(); });
     }
 
     Imagefloat *fast_pipeline()
@@ -1493,7 +1519,10 @@ private:
         LUTu histToneCurve;
 
         const auto& options = App::get().options();
-        ipf.rgbProc(baseImg, labView, nullptr, curve1, curve2, curve, params.toneCurve.saturation, rCurve, gCurve, bCurve, satLimit, satLimitOpacity, ctColorCurve, ctOpacityCurve, opautili, clToningcurve, cl2Toningcurve, customToneCurve1, customToneCurve2, customToneCurvebw1, customToneCurvebw2, rrm, ggm, bbm, autor, autog, autob, expcomp, hlcompr, hlcomprthresh, dcpProf, as, histToneCurve, options.chunkSizeRGB, options.measure);
+        {
+            stage::ScopedProfile profile("finish.rgbproc");
+            ipf.rgbProc(baseImg, labView, nullptr, curve1, curve2, curve, params.toneCurve.saturation, rCurve, gCurve, bCurve, satLimit, satLimitOpacity, ctColorCurve, ctOpacityCurve, opautili, clToningcurve, cl2Toningcurve, customToneCurve1, customToneCurve2, customToneCurvebw1, customToneCurvebw2, rrm, ggm, bbm, autor, autog, autob, expcomp, hlcompr, hlcomprthresh, dcpProf, as, histToneCurve, options.chunkSizeRGB, options.measure);
+        }
 
         if (settings->verbose) {
             printf("Output image / Auto B&W coefs:   R=%.2f   G=%.2f   B=%.2f\n", static_cast<double>(autor), static_cast<double>(autog), static_cast<double>(autob));
@@ -1609,6 +1638,7 @@ private:
 
       //  if (((params.colorappearance.enabled && !settings->autocielab) || (!params.colorappearance.enabled)) && params.sharpening.enabled) {
         if (((params.colorappearance.enabled && !settings->autocielab) || (!cam02)) && params.sharpening.enabled) {
+            stage::ScopedProfile profile("finish.sharpening");
             ipf.sharpening(labView, params.sharpening);
 
         }
@@ -1624,6 +1654,7 @@ private:
         }
 
         if ((params.wavelet.enabled)){
+            stage::ScopedProfile profile("finish.wavelet");
             LabImage *unshar = nullptr;
             WaveletParams WaveParams = params.wavelet;
             WavCurve wavCLVCurve;
@@ -2098,6 +2129,7 @@ private:
         }
 
         if (labResize) { // resize lab data
+            stage::ScopedProfile profile("finish.resize");
             int imw = framingData.imgWidth;
             int imh = framingData.imgHeight;
             if (labView->W != imw || labView->H != imh) {
@@ -2134,8 +2166,12 @@ private:
         const auto& saveFormat = App::get().options().saveFormat;
         const bool allowGpuOutput = !(saveFormat.format == "tif"
                                       && saveFormat.tiffFloat);
-        Imagefloat* readyImg = ipf.lab2rgbOut(labView, cx, cy, cw, ch,
-                                              params.icm, allowGpuOutput);
+        Imagefloat* readyImg = nullptr;
+        {
+            stage::ScopedProfile profile("finish.output");
+            readyImg = ipf.lab2rgbOut(labView, cx, cy, cw, ch,
+                                      params.icm, allowGpuOutput);
+        }
 
         if (settings->verbose) {
             printf("Output profile_: \"%s\"\n", params.icm.outputProfile.c_str());

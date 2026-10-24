@@ -29,7 +29,7 @@ fi
 command -v Xvfb >/dev/null || { echo "Xvfb is required" >&2; exit 2; }
 command -v xdotool >/dev/null || { echo "xdotool is required" >&2; exit 2; }
 
-display="${RT_PREVIEW_DISPLAY:-:99}"
+display="${RT_PREVIEW_DISPLAY:-:98}"
 load_delay="${RT_PREVIEW_DELAY:-15}"
 edit_wait="${RT_PREVIEW_WAIT:-10}"
 log="$(mktemp "${TMPDIR:-/tmp}/rt-preview.XXXXXX.log")"
@@ -51,6 +51,17 @@ sleep 2
 RT_PREVIEW_PROFILE=1 "$binary" "$image" >"$log" 2>&1 &
 gui_pid=$!
 sleep "$load_delay"
+
+# Dismiss the first-run notice and pin the window. Without this the notice
+# owns the pointer and every later click lands on the modal dialog.
+xdotool key Escape >/dev/null 2>&1 || true
+sleep 1
+window_id="$(xdotool search --name '^RawTherapee' 2>/dev/null | head -1 || true)"
+if [ -n "$window_id" ]; then
+    xdotool windowsize "$window_id" 1600 1000 >/dev/null 2>&1 || true
+    xdotool windowmove "$window_id" 0 0 >/dev/null 2>&1 || true
+    xdotool windowfocus "$window_id" >/dev/null 2>&1 || true
+fi
 
 # Open the Exposure tool, then drag Exposure Compensation to the right and
 # back. The coordinates are for the 1600x1000 Xvfb layout used above.
