@@ -277,9 +277,14 @@ protected:
     void prepareViewportLuts(int todo);
     void updateViewportLutSnapshot(int todo);
     void renderCrops(int todo, bool force);
-    int queueViewportDeferredAnalysis(int todo);
+    int queueViewportDeferredAnalysis(int todo, unsigned request);
     void markViewportStateValid(bool highDetailNeeded);
     void invalidateViewportState();
+    void ensureDeferredWatcher();
+    void deferredWatcherLoop();
+    void flushDeferredAnalysis();
+    void dropPendingDeferred();
+    void absorbPendingDeferred(int& todo);
 
     MyMutex mProcessing;
     const std::unique_ptr<ProcParams> params;  // used for the rendering, can be eventually tweaked
@@ -302,6 +307,22 @@ protected:
     bool updaterRunning;
     const std::unique_ptr<ProcParams> nextParams;
     bool destroying;
+
+    // Deferred full-frame analysis, see rtengine/viewportdefer.h.
+    //
+    // A viewport fast-path hit serves the crop immediately and accumulates the
+    // analysis stages it skipped. The mask is run once the interaction settles,
+    // so a drag costs one analysis pass instead of one per update. The fields
+    // below are guarded by paramsUpdateMutex unless they are atomic.
+    int pendingDeferredMask;
+    int pendingDeferredHits;
+    gint64 pendingDeferredFirstUs;
+    gint64 pendingDeferredDeadlineUs;
+    bool deferredWatcherStarted;
+    bool deferredWatcherPaused;
+    std::atomic<bool> deferredWatcherStop;
+    Glib::Thread* deferredWatcher;
+    std::atomic<bool> deferredCropReusable;
     bool utili;
     bool autili;
     bool butili;

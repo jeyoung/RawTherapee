@@ -50,6 +50,7 @@
 #include "refreshmap.h"
 #include "utils.h"
 #include "rt_algo.h"
+#include "viewportdefer.h"
 #include "rtgui/labgrid.h"
 
 #include "rtgui/options.h"
@@ -95,6 +96,7 @@ struct PreviewTimer {
     const char* viewportFallback = nullptr;
     long long viewportCropMs = -1;
     int viewportDeferredTodo = 0;
+    int viewportDeferredHits = 0;
     int todo = 0;
     std::chrono::steady_clock::time_point start =
         std::chrono::steady_clock::now();
@@ -117,8 +119,10 @@ struct PreviewTimer {
                      static_cast<long long>(ms), todo, cacheHit ? 1 : 0);
         if (viewportFast) {
             std::fprintf(stderr,
-                         " viewport=fast crop_ms=%lld deferred_todo=0x%x\n",
-                         viewportCropMs, viewportDeferredTodo);
+                         " viewport=fast crop_ms=%lld deferred_todo=0x%x"
+                         " deferred_hits=%d\n",
+                         viewportCropMs, viewportDeferredTodo,
+                         viewportDeferredHits);
         } else if (viewportDeferred) {
             std::fprintf(stderr, " viewport=deferred-analysis\n");
         } else if (viewportFallback) {
@@ -273,6 +277,15 @@ ImProcCoordinator::ImProcCoordinator() :
     updaterRunning(false),
     nextParams(new procparams::ProcParams),
     destroying(false),
+    pendingDeferredMask(0),
+    pendingDeferredHits(0),
+    pendingDeferredFirstUs(0),
+    pendingDeferredDeadlineUs(0),
+    deferredWatcherStarted(false),
+    deferredWatcherPaused(false),
+    deferredWatcherStop(false),
+    deferredWatcher(nullptr),
+    deferredCropReusable(false),
     utili(false),
     autili(false),
     butili(false),
@@ -350,6 +363,25 @@ ImProcCoordinator::~ImProcCoordinator()
 {
 
     destroying = true;
+    deferredWatcherStop.store(true, std::memory_order_release);
+
+    Glib::Thread* watcher = nullptr;
+    {
+        MyMutex::MyLock lock(paramsUpdateMutex);
+        watcher = deferredWatcher;
+        deferredWatcher = nullptr;
+        deferredWatcherStarted = false;
+        deferredWatcherPaused = true;
+        pendingDeferredMask = 0;
+        pendingDeferredHits = 0;
+        pendingDeferredFirstUs = 0;
+        pendingDeferredDeadlineUs = 0;
+    }
+
+    if (watcher) {
+        watcher->join();
+    }
+
     updaterThreadStart.lock();
 
     if (updaterRunning && thread) {
@@ -492,6 +524,44 @@ bool viewportFastEnabled()
     return enabled;
 }
 
+int viewportDeferredEnvMs(const char* name, int defaultValue)
+{
+    const char* value = g_getenv(name);
+
+    if (value == nullptr || value[0] == '\0') {
+        return defaultValue;
+    }
+
+    char* end = nullptr;
+    const long long parsed = g_ascii_strtoll(value, &end, 10);
+
+    if (end == value) {
+        return defaultValue;
+    }
+
+    return static_cast<int>(std::clamp<long long>(
+        parsed, VIEWPORT_DEFERRED_SETTLE_MS_MIN,
+        VIEWPORT_DEFERRED_SETTLE_MS_MAX));
+}
+
+int viewportDeferredSettleMs()
+{
+    // Unit: ms. Range: VIEWPORT_DEFERRED_SETTLE_MS_MIN..MAX. 0 queues the
+    // deferred analysis immediately, reproducing the pre-deferral behaviour.
+    static const int value = viewportDeferredEnvMs(
+        "RT_VIEWPORT_DEFER_MS", VIEWPORT_DEFERRED_SETTLE_MS_DEFAULT);
+    return value;
+}
+
+int viewportDeferredMaxWaitMs()
+{
+    // Unit: ms, measured from the oldest deferral hit. Range:
+    // VIEWPORT_DEFERRED_SETTLE_MS_MIN..MAX.
+    static const int value = viewportDeferredEnvMs(
+        "RT_VIEWPORT_DEFER_MAX_MS", VIEWPORT_DEFERRED_MAX_WAIT_MS_DEFAULT);
+    return value;
+}
+
 constexpr int VIEWPORT_FAST_ALLOWED_TODO =
     M_AUTOEXP | M_RGBCURVE | M_LUMACURVE | M_LUMINANCE | M_COLOR
     | M_CROP | M_MINUPDATE | M_HDR | M_SPOT;
@@ -516,10 +586,6 @@ bool ImProcCoordinator::canUseViewportFastPath(int todo,
 
     if (!viewportFastEnabled()) {
         reason = "switch-off";
-        return false;
-    }
-    if (forceFullPreview.load(std::memory_order_relaxed)) {
-        reason = "deferred-analysis";
         return false;
     }
     if (!viewportStateValid.load(std::memory_order_relaxed)) {
@@ -611,6 +677,8 @@ bool ImProcCoordinator::canUseViewportFastPath(int todo,
         reason = "coarse-transform";
         return false;
     }
+    // The transform-stage parameters stay rejected until the ROI parity of
+    // Crop::update() with a live transform change is validated on the GUI.
     if (params->commonTrans != last.commonTrans) {
         reason = "common-transform";
         return false;
@@ -837,23 +905,144 @@ void ImProcCoordinator::renderCrops(int todo, bool force)
     }
 }
 
-int ImProcCoordinator::queueViewportDeferredAnalysis(int todo)
+void ImProcCoordinator::ensureDeferredWatcher()
+{
+    paramsUpdateMutex.lock();
+
+    if (!deferredWatcherStarted
+            && !deferredWatcherStop.load(std::memory_order_acquire)) {
+        deferredWatcherStarted = true;
+        deferredWatcher = Glib::Thread::create(
+            sigc::mem_fun(*this, &ImProcCoordinator::deferredWatcherLoop),
+            0, true, true, Glib::THREAD_PRIORITY_LOW);
+    }
+
+    paramsUpdateMutex.unlock();
+}
+
+void ImProcCoordinator::deferredWatcherLoop()
+{
+    int sleepMs = VIEWPORT_DEFERRED_IDLE_POLL_MS;
+
+    while (!deferredWatcherStop.load(std::memory_order_acquire)) {
+        g_usleep(static_cast<gulong>(sleepMs) * 1000);
+
+        if (deferredWatcherStop.load(std::memory_order_acquire)) {
+            break;
+        }
+
+        bool due = false;
+        {
+            MyMutex::MyLock lock(paramsUpdateMutex);
+            due = pendingDeferredMask != 0 && !deferredWatcherPaused
+                && g_get_monotonic_time() >= pendingDeferredDeadlineUs;
+            sleepMs = pendingDeferredMask != 0
+                ? VIEWPORT_DEFERRED_POLL_MS : VIEWPORT_DEFERRED_IDLE_POLL_MS;
+        }
+
+        if (due) {
+            flushDeferredAnalysis();
+        }
+    }
+}
+
+void ImProcCoordinator::flushDeferredAnalysis()
+{
+    int mask = 0;
+
+    paramsUpdateMutex.lock();
+
+    if (pendingDeferredMask == 0 || deferredWatcherPaused
+            || deferredWatcherStop.load(std::memory_order_acquire)) {
+        paramsUpdateMutex.unlock();
+        return;
+    }
+
+    mask = pendingDeferredMask;
+    pendingDeferredMask = 0;
+    pendingDeferredHits = 0;
+    pendingDeferredFirstUs = 0;
+    pendingDeferredDeadlineUs = 0;
+    forceFullPreview.store(true, std::memory_order_relaxed);
+    changeSinceLast |= mask;
+
+    paramsUpdateMutex.unlock();
+
+    startProcessing();
+}
+
+void ImProcCoordinator::dropPendingDeferred()
+{
+    paramsUpdateMutex.lock();
+    pendingDeferredMask = 0;
+    pendingDeferredHits = 0;
+    pendingDeferredFirstUs = 0;
+    pendingDeferredDeadlineUs = 0;
+    deferredCropReusable.store(false, std::memory_order_relaxed);
+    paramsUpdateMutex.unlock();
+}
+
+void ImProcCoordinator::absorbPendingDeferred(int& todo)
+{
+    paramsUpdateMutex.lock();
+
+    if (pendingDeferredMask != 0) {
+        // The request that is about to run will rebuild the whole-frame
+        // analysis, so it must also cover the stages the fast path skipped.
+        todo |= pendingDeferredMask;
+        pendingDeferredMask = 0;
+        pendingDeferredHits = 0;
+        pendingDeferredFirstUs = 0;
+        pendingDeferredDeadlineUs = 0;
+    }
+
+    paramsUpdateMutex.unlock();
+}
+
+int ImProcCoordinator::queueViewportDeferredAnalysis(int todo,
+                                                     unsigned request)
 {
     // Rebuild the full-frame analysis from the base image already held in
     // oprevi. Base bits such as M_HDR/M_SPOT are over-approximated by several
     // event masks and their parameters are known to be unchanged here, so the
     // deferred pass only forces the monitor conversion and the curve/Lab
     // pipeline.
-    int deferred = todo | M_MONITOR | M_RGBCURVE | M_LUMACURVE
-        | M_LUMINANCE | M_COLOR;
-    deferred &= ~(M_HDR | M_SPOT | M_PREPROC | M_RAW | M_WB | M_INIT
-                  | M_LINDENOISE | M_CSHARP | M_RETINEX | M_TRANSFORM
-                  | M_HIGHQUAL | M_BLURMAP);
+    const int deferred = viewportDeferredMask(todo);
+    const gint64 now = g_get_monotonic_time();
 
     paramsUpdateMutex.lock();
-    forceFullPreview.store(true, std::memory_order_relaxed);
-    changeSinceLast |= deferred;
+
+    if (pendingDeferredMask == 0) {
+        pendingDeferredFirstUs = now;
+    }
+
+    pendingDeferredMask |= deferred;
+    ++pendingDeferredHits;
+
+    // The crop rendered by this hit is reusable only while it is the only hit
+    // of the burst; with accumulated hits the last render may not cover the
+    // earlier stages, so the deferred pass renders the crops again.
+    deferredCropReusable.store(viewportCropRenderReusable(pendingDeferredHits),
+                               std::memory_order_relaxed);
+
+    pendingDeferredDeadlineUs = viewportDeferredDeadline(
+        pendingDeferredFirstUs, now, viewportDeferredSettleMs(),
+        viewportDeferredMaxWaitMs());
+
+    viewportDeferredParams = *params;
+    viewportDeferredRequest.store(request, std::memory_order_relaxed);
+    deferredCropRendered.store(true, std::memory_order_relaxed);
+
+    const bool flushNow = viewportDeferredSettleMs() == 0;
+
     paramsUpdateMutex.unlock();
+
+    if (flushNow) {
+        flushDeferredAnalysis();
+    } else {
+        ensureDeferredWatcher();
+    }
+
     return deferred;
 }
 
@@ -868,8 +1057,16 @@ void ImProcCoordinator::markViewportStateValid(bool highDetailNeeded)
 
     viewportHighDetail.store(highDetailNeeded, std::memory_order_relaxed);
     viewportStateValid.store(true, std::memory_order_relaxed);
-    viewportDeferredRequest.store(0, std::memory_order_relaxed);
-    deferredCropRendered.store(false, std::memory_order_relaxed);
+
+    // A fast hit may have queued a newer deferred burst while this pass was
+    // running. Only clear the per-hit bookkeeping when nothing is pending,
+    // otherwise the newer burst would lose its suppression and request data.
+    MyMutex::MyLock lock(paramsUpdateMutex);
+    if (pendingDeferredMask == 0) {
+        viewportDeferredRequest.store(0, std::memory_order_relaxed);
+        deferredCropRendered.store(false, std::memory_order_relaxed);
+        deferredCropReusable.store(false, std::memory_order_relaxed);
+    }
 }
 
 void ImProcCoordinator::invalidateViewportState()
@@ -879,6 +1076,7 @@ void ImProcCoordinator::invalidateViewportState()
     forceFullPreview.store(false, std::memory_order_relaxed);
     viewportDeferredRequest.store(0, std::memory_order_relaxed);
     deferredCropRendered.store(false, std::memory_order_relaxed);
+    dropPendingDeferred();
 }
 
 DetailedCrop* ImProcCoordinator::createCrop(::EditDataProvider *editDataProvider, bool isDetailWindow)
@@ -979,10 +1177,11 @@ void ImProcCoordinator::updatePreviewImage(int todo, bool panningRelatedChange,
             std::chrono::duration_cast<std::chrono::milliseconds>(
                 cropEnd - cropStart).count();
         previewTimer.viewportDeferredTodo =
-            queueViewportDeferredAnalysis(eligibilityTodo);
-        viewportDeferredParams = *params;
-        viewportDeferredRequest.store(request, std::memory_order_relaxed);
-        deferredCropRendered.store(true, std::memory_order_relaxed);
+            queueViewportDeferredAnalysis(eligibilityTodo, request);
+        {
+            MyMutex::MyLock lock(paramsUpdateMutex);
+            previewTimer.viewportDeferredHits = pendingDeferredHits;
+        }
         return;
     }
 
@@ -1010,11 +1209,20 @@ void ImProcCoordinator::updatePreviewImage(int todo, bool panningRelatedChange,
         }
     }
 
-    const bool suppressDeferredCropRender =
-        forceFullPreview.load(std::memory_order_relaxed)
-        && deferredCropRendered.load(std::memory_order_relaxed)
-        && viewportDeferredRequest.load(std::memory_order_relaxed) == request
-        && *params == viewportDeferredParams;
+    // A request that takes the normal path satisfies any deferred analysis
+    // work: it rebuilds the whole-frame pipeline, so the accumulated stages
+    // must be part of its mask rather than left for a later pass.
+    absorbPendingDeferred(todo);
+
+    bool suppressDeferredCropRender = false;
+    {
+        MyMutex::MyLock lock(paramsUpdateMutex);
+        suppressDeferredCropRender =
+            deferredCropReusable.load(std::memory_order_relaxed)
+            && deferredCropRendered.load(std::memory_order_relaxed)
+            && viewportDeferredRequest.load(std::memory_order_relaxed) == request
+            && *params == viewportDeferredParams;
+    }
 
     bool fullPipelineRan = false;
     if (((todo & ALL) == ALL) || (todo & M_MONITOR) || panningRelatedChange || (highDetailNeeded && prevdemo != PD_Sidecar)) {
@@ -3581,6 +3789,10 @@ void ImProcCoordinator::setTweakOperator(TweakOperator *tOperator)
 {
     if (tOperator) {
         tweakOperator = tOperator;
+        // The tweak changes how the next pass renders the parameters, so an
+        // analysis accumulated for the untweaked inputs must not be flushed
+        // with the tweak applied. The tool's refresh request rebuilds it.
+        dropPendingDeferred();
     }
 }
 
@@ -3588,6 +3800,7 @@ void ImProcCoordinator::unsetTweakOperator(TweakOperator *tOperator)
 {
     if (tOperator && tOperator == tweakOperator) {
         tweakOperator = nullptr;
+        dropPendingDeferred();
     }
 }
 
@@ -4258,10 +4471,19 @@ void ImProcCoordinator::stopProcessing()
 
     updaterThreadStart.lock();
 
+    // Teardown or an image/scale transition invalidates the viewport state, so
+    // any deferred analysis is dropped rather than run against soon-to-be
+    // rebuilt buffers. The watcher must not flush while processing is stopped.
+    paramsUpdateMutex.lock();
+    deferredWatcherPaused = true;
+    changeSinceLast = 0;
+    pendingDeferredMask = 0;
+    pendingDeferredHits = 0;
+    pendingDeferredFirstUs = 0;
+    pendingDeferredDeadlineUs = 0;
+    paramsUpdateMutex.unlock();
+
     if (updaterRunning && thread) {
-        paramsUpdateMutex.lock();
-        changeSinceLast = 0;
-        paramsUpdateMutex.unlock();
         thread->join();
     }
 
@@ -4271,24 +4493,27 @@ void ImProcCoordinator::stopProcessing()
 
 void ImProcCoordinator::startProcessing()
 {
-    if (!destroying) {
-        if (!updaterRunning) {
-            updaterThreadStart.lock();
-            thread = nullptr;
-            updaterRunning = true;
-            updaterThreadStart.unlock();
+    updaterThreadStart.lock();
 
-            //batchThread->yield(); //the running batch should wait other threads to avoid conflict
+    if (!destroying && !updaterRunning) {
+        updaterRunning = true;
 
-            thread = Glib::Thread::create(sigc::mem_fun(*this, &ImProcCoordinator::process), 0, true, true, Glib::THREAD_PRIORITY_NORMAL);
-
-        }
+        // Create the thread while holding updaterThreadStart. The GUI request
+        // path and the deferred watcher can now call this concurrently; with
+        // the check outside the lock both could create an updater thread, and
+        // the second would overwrite `thread`, leaving the first unjoinable.
+        thread = Glib::Thread::create(
+            sigc::mem_fun(*this, &ImProcCoordinator::process), 0, true, true,
+            Glib::THREAD_PRIORITY_NORMAL);
     }
+
+    updaterThreadStart.unlock();
 }
 
 void ImProcCoordinator::startProcessing(int changeCode)
 {
     paramsUpdateMutex.lock();
+    deferredWatcherPaused = false;
     changeSinceLast |= changeCode;
 
     if (changeCode & ~M_VOID) {
