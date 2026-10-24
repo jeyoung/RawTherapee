@@ -89,6 +89,23 @@ int main()
     check(result.differing == 0, "built-in and module pixels match exactly");
     check(result.max_abs == 0, "built-in and module maximum difference is zero");
 
+    float one = 1.0f;
+    float one_and_half = 1.5f;
+    RtStageBuffer a{};
+    a.size = sizeof(a);
+    a.data = &one;
+    a.width = 1;
+    a.height = 1;
+    a.row_pitch = sizeof(float);
+    a.plane_pitch = sizeof(float);
+    a.planes = 1;
+    a.format = RT_STAGE_F32;
+    RtStageBuffer b = a;
+    b.data = &one_and_half;
+    const auto fractional = rtengine::stage::compare(a, b);
+    check(fractional.differing == 1, "fractional difference is detected");
+    check(fractional.max_abs == 0.5, "fractional maximum difference is exact");
+
     if (failures == 0) {
         std::puts("stage-parity-test: PASS");
     }

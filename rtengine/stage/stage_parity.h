@@ -8,7 +8,7 @@ namespace rtengine::stage
 {
 
 struct ParityResult {
-    int64_t max_abs = 0;
+    double max_abs = 0.0;
     uint64_t differing = 0;
     uint64_t total = 0;
     uint64_t hash_a = 0;
@@ -17,6 +17,6 @@ struct ParityResult {
 };
 
 ParityResult compare(const RtStageBuffer& a, const RtStageBuffer& b);
-bool passes(const ParityResult& result, int64_t tolerance);
+bool passes(const ParityResult& result, double tolerance);
 
 } // namespace rtengine::stage

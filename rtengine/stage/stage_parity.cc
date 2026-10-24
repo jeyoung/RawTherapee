@@ -2,6 +2,7 @@
 
 #include "stage_profile.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <type_traits>
@@ -32,23 +33,30 @@ void compare_typed(const RtStageBuffer& a, const RtStageBuffer& b, ParityResult&
             for (int x = 0; x < a.width; ++x) {
                 ++result.total;
                 if constexpr (std::is_floating_point_v<T>) {
-                    if (std::isnan(static_cast<double>(ra[x])) ||
-                        std::isnan(static_cast<double>(rb[x]))) {
-                        if (!(std::isnan(static_cast<double>(ra[x])) &&
-                              std::isnan(static_cast<double>(rb[x])))) {
+                    const double av = static_cast<double>(ra[x]);
+                    const double bv = static_cast<double>(rb[x]);
+                    const bool anan = std::isnan(av);
+                    const bool bnan = std::isnan(bv);
+                    if (anan || bnan) {
+                        if (!(anan && bnan)) {
                             ++result.differing;
                         }
                         continue;
                     }
-                }
-                const int64_t diff = static_cast<int64_t>(ra[x]) -
-                                     static_cast<int64_t>(rb[x]);
-                const int64_t magnitude = diff < 0 ? -diff : diff;
-                if (magnitude != 0) {
-                    ++result.differing;
-                }
-                if (magnitude > result.max_abs) {
-                    result.max_abs = magnitude;
+                    const double magnitude = std::abs(av - bv);
+                    if (av != bv) {
+                        ++result.differing;
+                    }
+                    result.max_abs = std::max(result.max_abs, magnitude);
+                } else {
+                    const int64_t diff = static_cast<int64_t>(ra[x]) -
+                                         static_cast<int64_t>(rb[x]);
+                    const double magnitude =
+                        static_cast<double>(diff < 0 ? -diff : diff);
+                    if (magnitude != 0.0) {
+                        ++result.differing;
+                    }
+                    result.max_abs = std::max(result.max_abs, magnitude);
                 }
             }
         }
@@ -82,7 +90,7 @@ ParityResult compare(const RtStageBuffer& a, const RtStageBuffer& b)
     return result;
 }
 
-bool passes(const ParityResult& result, int64_t tolerance)
+bool passes(const ParityResult& result, double tolerance)
 {
     return result.same_geometry && result.differing == 0 && result.max_abs <= tolerance;
 }
