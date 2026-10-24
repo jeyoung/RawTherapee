@@ -1324,6 +1324,37 @@ BENCHFUN
                                 //pixel weight
                                 array2D<float> totwt(width, height, ARRAY2D_CLEAR_DATA); //weight for combining DCT blocks
 
+                                // The block weights are a function of the block geometry only, and the
+                                // block loop accumulates them per block row. Compute them here instead,
+                                // with one thread per destination row, so that every pixel keeps the
+                                // serial accumulation order (block row ascending, then block column
+                                // ascending) and no longer depends on the OpenMP partition.
+                                {
+#ifdef _OPENMP
+                                    #pragma omp parallel for schedule(static) num_threads(denoiseNestedLevels) if (denoiseNestedLevels>1)
+#endif
+
+                                    for (int row = 0; row < height; ++row) {
+                                        for (int vblk = 0; vblk < numblox_H; ++vblk) {
+                                            const int i = row - (vblk - blkrad) * offset;
+
+                                            if (i < 0 || i >= TS) {
+                                                continue;
+                                            }
+
+                                            for (int hblk = 0; hblk < numblox_W; ++hblk) {
+                                                const int left = (hblk - blkrad) * offset;
+                                                const int jmin = MAX(0, -left);
+                                                const int jmax = MIN(TS, width - left);
+
+                                                for (int j = jmin; j < jmax; ++j) {
+                                                    totwt[row][left + j] += tilemask_in[i][j] * tilemask_out[i][j];
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
                                 if (numtiles == 1) {
                                     for (int i = 0; i < denoiseNestedLevels * numthreads; ++i) {
                                         LbloxArray[i]  = reinterpret_cast<float*>(fftwf_malloc(max_numblox_W * TS * TS * sizeof(float)));
@@ -1347,7 +1378,10 @@ BENCHFUN
                                     float pBuf[width + TS + 2 * blkrad * offset] ALIGNED16;
 //                                    float nbrwt[TS * TS] ALIGNED64;
 #ifdef _OPENMP
-                                    #pragma omp for
+                                    // Dynamic single-iteration chunks keep the compute of
+                                    // several block rows in flight, while the ordered section
+                                    // below merges them in ascending block-row order.
+                                    #pragma omp for schedule(dynamic, 1) ordered
 #endif
 
                                     for (int vblk = 0; vblk < numblox_H; ++vblk) {
@@ -1391,7 +1425,6 @@ BENCHFUN
 
                                                     for (; j < min(TS, width - left); ++j) {
                                                         Lblox[(indx + i)*TS + j] = tilemask_in[i][j] * datarow[left + j]; // luma data
-                                                        totwt[top + i][left + j] += tilemask_in[i][j] * tilemask_out[i][j];
                                                     }
 
                                                     for (; j < TS; ++j) {
@@ -1436,7 +1469,15 @@ BENCHFUN
                                         int topproc = (vblk - blkrad) * offset;
 
                                         //add row of blocks to output image tile
-                                        RGBoutput_tile_row(Lblox, Ldetail, tilemask_out, height, width, topproc);
+                                        // Adjacent block rows overlap, so their contributions to a
+                                        // pixel must be summed in block-row order to be independent
+                                        // of the thread partition.
+#ifdef _OPENMP
+                                        #pragma omp ordered
+#endif
+                                        {
+                                            RGBoutput_tile_row(Lblox, Ldetail, tilemask_out, height, width, topproc);
+                                        }
 
                                         //%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
