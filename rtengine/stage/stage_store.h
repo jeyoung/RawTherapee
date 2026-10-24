@@ -86,6 +86,13 @@ public:
     /* Removes one entry; true when an entry was removed. */
     bool erase(const std::string& key);
 
+    /*
+     * Evicts the oldest files until the total size is at most max_bytes.
+     * Returns the number of files removed. Used by the preview cache to keep
+     * the store within its configured budget.
+     */
+    std::size_t prune(uint64_t max_bytes);
+
     /* True when an entry file exists; only get() validates its contents. */
     bool contains(const std::string& key) const;
 

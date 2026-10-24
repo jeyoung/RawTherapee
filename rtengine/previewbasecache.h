@@ -473,7 +473,10 @@ public:
             const std::size_t rowBytes = stage::row_bytes(buffer);
             const std::uint64_t entryBytes =
                 static_cast<std::uint64_t>(rowBytes) * buffer.height * buffer.planes;
-            if (store_->bytes() + entryBytes <= storeMaxBytes_) {
+            if (entryBytes <= storeMaxBytes_) {
+                if (store_->bytes() + entryBytes > storeMaxBytes_) {
+                    store_->prune(storeMaxBytes_ - entryBytes);
+                }
                 store_->put(key.persistentKey(), buffer,
                             stage::StageStoreMetadata{"preview-base", "1"});
             }

@@ -774,4 +774,64 @@ uint64_t StageStore::bytes() const
     return total;
 }
 
+std::size_t StageStore::prune(uint64_t max_bytes)
+{
+    if (!safe_root(root_)) {
+        return 0;
+    }
+
+    struct FileInfo {
+        std::filesystem::path path;
+        uint64_t bytes = 0;
+        std::filesystem::file_time_type modified{};
+    };
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::error_code error;
+    std::vector<FileInfo> files;
+    uint64_t total = 0;
+
+    std::filesystem::recursive_directory_iterator it(root_, error);
+    const std::filesystem::recursive_directory_iterator end;
+    while (!error && it != end) {
+        std::error_code entry_error;
+        if (it->is_regular_file(entry_error) && !entry_error) {
+            FileInfo file;
+            file.path = it->path();
+            file.bytes = it->file_size(entry_error);
+            file.modified = it->last_write_time(entry_error);
+            if (!entry_error) {
+                total += file.bytes;
+                files.push_back(std::move(file));
+            }
+        }
+        it.increment(error);
+    }
+
+    if (total <= max_bytes) {
+        return 0;
+    }
+
+    std::sort(files.begin(), files.end(),
+              [](const FileInfo& a, const FileInfo& b) {
+                  if (a.modified != b.modified) {
+                      return a.modified < b.modified;
+                  }
+                  return a.path < b.path;
+              });
+
+    std::size_t removed = 0;
+    for (const FileInfo& file : files) {
+        if (total <= max_bytes) {
+            break;
+        }
+        std::error_code remove_error;
+        if (std::filesystem::remove(file.path, remove_error) && !remove_error) {
+            total -= file.bytes;
+            ++removed;
+        }
+    }
+    return removed;
+}
+
 } // namespace rtengine::stage

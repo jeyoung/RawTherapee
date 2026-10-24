@@ -553,6 +553,20 @@ int main()
               "shared key holds one complete writer's payload");
     }
 
+    /* prune() evicts oldest files down to the requested budget. */
+    {
+        store.clear();
+        Buffer source = make_buffer(16, 8, 3, RT_STAGE_F32, 0, 0, 0x21);
+        check(store.put(hex_key(801), source.view, metadata),
+              "prune fixture first entry");
+        check(store.put(hex_key(802), source.view, metadata),
+              "prune fixture second entry");
+        check(store.bytes() > 0, "prune fixture has bytes");
+        const std::size_t removed = store.prune(0);
+        check(removed >= 2, "prune removes every file for a zero budget");
+        check(store.bytes() == 0, "prune reaches the zero budget");
+    }
+
     /* clear() removes every file and leaves a usable store. */
     {
         store.clear();
