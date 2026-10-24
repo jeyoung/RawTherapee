@@ -115,6 +115,15 @@ set(RTENGINESOURCEFILES
     simpleprocess.cc
     spot.cc
     stdimagesource.cc
+    stage/stage_buffer.cc
+    stage/stage_builtins.cc
+    stage/stage_cache.cc
+    stage/stage_graph.cc
+    stage/stage_indexer.cc
+    stage/stage_lanczos.cc
+    stage/stage_parity.cc
+    stage/stage_profile.cc
+    stage/stage_runtime.cc
     svgrender.cc
     tmo_fattal02.cc
     utils.cc
@@ -157,9 +166,16 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_G
     )
 endif()
 
+add_subdirectory(stage)
+
 add_library(rtengine STATIC "${RTENGINESOURCEFILES}")
 
 add_dependencies(rtengine UpdateInfo)
+
+target_link_libraries(rtengine PRIVATE rtstage_algorithms)
+target_compile_definitions(rtengine PRIVATE
+    RT_STAGE_BUILD_DIR="${CMAKE_BINARY_DIR}/stages"
+)
 
 # Standalone regression test for the opt-in preview base cache. It is not part
 # of the normal build; use the target explicitly or tools/perf/test-preview-base-cache.sh.
@@ -184,6 +200,57 @@ add_executable(fast-preview-test EXCLUDE_FROM_ALL
 )
 target_link_libraries(fast-preview-test PRIVATE rtengine)
 rt_setup_target(fast-preview-test)
+
+# Runtime stage ABI and built-in/module parity tests.
+add_executable(stage-abi-test EXCLUDE_FROM_ALL
+    "${CMAKE_CURRENT_SOURCE_DIR}/stage/tests/stage_abi_test.cc"
+)
+target_link_libraries(stage-abi-test PRIVATE rtengine)
+target_include_directories(stage-abi-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/stage")
+target_compile_definitions(stage-abi-test PRIVATE
+    RT_STAGE_BUILD_DIR="${CMAKE_BINARY_DIR}/stages"
+)
+rt_setup_target(stage-abi-test)
+
+add_executable(stage-cache-test EXCLUDE_FROM_ALL
+    "${CMAKE_CURRENT_SOURCE_DIR}/stage/tests/stage_cache_test.cc"
+)
+target_link_libraries(stage-cache-test PRIVATE rtengine)
+target_include_directories(stage-cache-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/stage")
+rt_setup_target(stage-cache-test)
+
+add_executable(stage-graph-test EXCLUDE_FROM_ALL
+    "${CMAKE_CURRENT_SOURCE_DIR}/stage/tests/stage_graph_test.cc"
+)
+target_link_libraries(stage-graph-test PRIVATE rtengine)
+target_include_directories(stage-graph-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/stage")
+rt_setup_target(stage-graph-test)
+
+add_executable(stage-indexer-test EXCLUDE_FROM_ALL
+    "${CMAKE_CURRENT_SOURCE_DIR}/stage/tests/stage_indexer_test.cc"
+)
+target_link_libraries(stage-indexer-test PRIVATE rtengine)
+target_include_directories(stage-indexer-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/stage")
+rt_setup_target(stage-indexer-test)
+
+add_executable(stage-parity-test EXCLUDE_FROM_ALL
+    "${CMAKE_CURRENT_SOURCE_DIR}/stage/tests/stage_parity_test.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/editcallbacks.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/multilangmgr.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/options.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/paramsedited.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/pathutils.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/threadutils.cc"
+)
+target_include_directories(stage-parity-test BEFORE PRIVATE
+    "${CMAKE_BINARY_DIR}/rtgui"
+)
+target_link_libraries(stage-parity-test PRIVATE rtengine)
+target_include_directories(stage-parity-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/stage")
+target_compile_definitions(stage-parity-test PRIVATE
+    RT_STAGE_BUILD_DIR="${CMAKE_BINARY_DIR}/stages"
+)
+rt_setup_target(stage-parity-test)
 
 target_include_directories(rtengine
     PUBLIC

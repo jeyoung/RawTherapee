@@ -12,6 +12,21 @@ tools/build-rt.sh opencl              # build with the OpenCL backend
 tools/build-rt.sh both                # both configurations
 ```
 
+For development builds, enable the compiler cache and the runtime stage
+modules:
+
+```bash
+tools/build-rt.sh cpu -j 6 --ccache --stage-modules
+tools/build-rt.sh opencl -j 6 --ccache --stage-modules
+```
+
+The cache lives in `build/ccache` by default and is bounded to 10 GiB. The
+helper uses `tools/ccache-rt.sh`, so later `cmake --build` invocations keep
+using the project cache without extra environment variables. Use
+`--ccache-stats` to print the hit rate. Stage modules are built into
+`<build-dir>/stages/` and can be rebuilt independently of the GUI and CLI, for
+example `cmake --build build/cpu-<branch> --target stage_lanczos`.
+
 Build directories are named after the variant and the current branch, for
 example `build/cpu-dev/` and `build/opencl-dev/`. Binaries are written to
 `<build-dir>/rtgui/rawtherapee` and `<build-dir>/rtgui/rawtherapee-cli`.

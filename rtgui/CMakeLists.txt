@@ -261,6 +261,10 @@ target_include_directories(rth-cli PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 # Add dependencies to executables targets
 add_dependencies(rth UpdateInfo)
 add_dependencies(rth-cli UpdateInfo)
+if(RT_STAGE_MODULES)
+    add_dependencies(rth stage_modules)
+    add_dependencies(rth-cli stage_modules)
+endif()
 
 # Create config.h which defines where data are stored
 configure_file("${CMAKE_CURRENT_SOURCE_DIR}/config.h.in" "${CMAKE_CURRENT_BINARY_DIR}/config.h")

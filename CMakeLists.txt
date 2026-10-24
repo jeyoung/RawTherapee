@@ -198,6 +198,7 @@ option(WITH_SYSTEM_FMT "Build using system FMT library." OFF)
 option(WITH_SYSTEM_KLT "Build using system KLT library." OFF)
 option(WITH_SYSTEM_LIBRAW "Build using system LibRaw library." OFF)
 option(OPTION_OMP "Build with OpenMP support" ON)
+option(RT_STAGE_MODULES "Build runtime-loadable image stage modules" ON)
 option(WITH_OPENCL "Build optional OpenCL acceleration" ON)
 option(WITH_SIMDE "Build with SIMD Everywhere support" OFF)
 

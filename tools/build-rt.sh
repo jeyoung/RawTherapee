@@ -22,6 +22,9 @@
 #    --update            Fetch upstream tags and report how far behind we are
 #    --build-root DIR    Where build directories are created
 #    --prefix PATH       CMAKE_INSTALL_PREFIX (default: /usr/local)
+#    --ccache            Use ccache and keep it under <build-root>/ccache
+#    --stage-modules     Build runtime-loadable stage modules
+#    --ccache-stats      Print ccache statistics after the build
 #    -h, --help          Show this help
 #
 #  Environment:
@@ -29,6 +32,8 @@
 #    RT_INSTALL_PREFIX  Same as --prefix
 #    RT_DESTDIR         Passed as DESTDIR to cmake --install
 #    OPENCL_INCLUDE_DIR OpenCL header directory, if not in a standard place
+#    CCACHE_DIR         Override the ccache directory
+#    CCACHE_MAXSIZE     Override the ccache size limit (default: 10G)
 #
 #  Examples:
 #    tools/build-rt.sh cpu --install
@@ -188,6 +193,8 @@ configure_build() {
     local dir="$2"
     local variant="$3"
     local prefix="$4"
+    local use_ccache="$5"
+    local stage_modules="$6"
 
     local -a args=(
         -S "$root"
@@ -199,6 +206,18 @@ configure_build() {
         -DCMAKE_CXX_COMPILER=g++
         -DCMAKE_INSTALL_PREFIX="$prefix"
     )
+
+    if [ "$use_ccache" -eq 1 ]; then
+        args+=(
+            "-DCMAKE_C_COMPILER_LAUNCHER=$root/tools/ccache-rt.sh"
+            "-DCMAKE_CXX_COMPILER_LAUNCHER=$root/tools/ccache-rt.sh"
+        )
+    fi
+
+    if [ "$stage_modules" -eq 1 ]; then
+        args+=("-DRT_STAGE_MODULES=ON")
+    fi
+
     # shellcheck disable=SC2207
     args+=($(variant_cmake_args "$variant"))
 
@@ -208,6 +227,24 @@ configure_build() {
 
     info "configuring $variant in $dir"
     cmake "${args[@]}"
+}
+
+enable_ccache() {
+    local root="$1"
+    local build_root="$2"
+
+    command -v ccache >/dev/null 2>&1 || die "ccache is not installed"
+    export CCACHE_DIR="${CCACHE_DIR:-$build_root/ccache}"
+    export CCACHE_MAXSIZE="${CCACHE_MAXSIZE:-10G}"
+    export CCACHE_BASEDIR="${CCACHE_BASEDIR:-$root}"
+    export CCACHE_COMPILERCHECK="${CCACHE_COMPILERCHECK:-content}"
+    mkdir -p "$CCACHE_DIR"
+    info "ccache dir $CCACHE_DIR (max $CCACHE_MAXSIZE)"
+}
+
+print_ccache_stats() {
+    command -v ccache >/dev/null 2>&1 || return 0
+    ccache -s
 }
 
 build_portable() {
@@ -244,6 +281,8 @@ build_variant() {
     local do_clean="$6"
     local do_reconfigure="$7"
     local do_install="$8"
+    local use_ccache="$9"
+    local stage_modules="${10}"
 
     local branch dir
     branch="$(git -C "$root" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
@@ -259,8 +298,14 @@ build_variant() {
 
     mkdir -p "$dir"
 
+    if [ "$use_ccache" -eq 1 ] && [ -f "$dir/CMakeCache.txt" ] \
+        && ! grep -q "ccache-rt.sh" "$dir/CMakeCache.txt"; then
+        info "enabling the project ccache wrapper in the existing CMake cache"
+        do_reconfigure=1
+    fi
+
     if [ "$do_reconfigure" -eq 1 ] || [ ! -f "$dir/CMakeCache.txt" ]; then
-        configure_build "$root" "$dir" "$variant" "$prefix"
+        configure_build "$root" "$dir" "$variant" "$prefix" "$use_ccache" "$stage_modules"
     else
         info "reusing CMake cache in $dir (use --reconfigure to refresh)"
     fi
@@ -294,6 +339,9 @@ main() {
     local do_reconfigure=0
     local do_check=0
     local do_update=0
+    local use_ccache=0
+    local stage_modules=0
+    local show_ccache=0
 
     jobs="$(nproc 2>/dev/null || echo 4)"
     build_root="${RT_BUILD_ROOT:-}"
@@ -333,6 +381,15 @@ main() {
             --update)
                 do_update=1
                 ;;
+            --ccache)
+                use_ccache=1
+                ;;
+            --stage-modules)
+                stage_modules=1
+                ;;
+            --ccache-stats)
+                show_ccache=1
+                ;;
             --build-root)
                 [ "$#" -ge 2 ] || die "$1 needs an argument"
                 build_root="$2"
@@ -369,6 +426,10 @@ main() {
     local root
     root="$(repo_root)"
     [ -n "$build_root" ] || build_root="$root/build"
+
+    if [ "$use_ccache" -eq 1 ]; then
+        enable_ccache "$root" "$build_root"
+    fi
 
     if [ -f "$root/.git/shallow" ]; then
         printf 'warning: this is a shallow clone; the reported version may name an older release.\n' >&2
@@ -411,16 +472,23 @@ main() {
                 check_opencl_headers
             fi
             build_variant "$root" "$variant" "$build_root" "$prefix" \
-                "$jobs" "$do_clean" "$do_reconfigure" "$do_install"
+                "$jobs" "$do_clean" "$do_reconfigure" "$do_install" \
+                "$use_ccache" "$stage_modules"
             ;;
         both)
             check_opencl_headers
             build_variant "$root" cpu "$build_root" "$prefix" \
-                "$jobs" "$do_clean" "$do_reconfigure" "$do_install"
+                "$jobs" "$do_clean" "$do_reconfigure" "$do_install" \
+                "$use_ccache" "$stage_modules"
             build_variant "$root" opencl "$build_root" "$prefix" \
-                "$jobs" "$do_clean" "$do_reconfigure" "$do_install"
+                "$jobs" "$do_clean" "$do_reconfigure" "$do_install" \
+                "$use_ccache" "$stage_modules"
             ;;
     esac
+
+    if [ "$show_ccache" -eq 1 ]; then
+        print_ccache_stats
+    fi
 }
 
 main "$@"
