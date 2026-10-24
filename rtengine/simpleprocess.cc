@@ -40,11 +40,14 @@
 #include "profiling.h"
 #include "rawimagesource.h"
 #include "rtengine.h"
+#include "stage/stage_graph.h"
 #include "stage/stage_profile.h"
 #include "utils.h"
 
+#include <cassert>
 #include <chrono>
 #include <type_traits>
+#include <vector>
 
 #include "rtgui/multilangmgr.h"
 #include "rtgui/options.h"
@@ -62,6 +65,21 @@ void adjust_radius(const T &default_param, double scale_factor, T &param)
     param = default_param + delta;
 }
 
+/*
+ * Opt-in switch for the graph-driven export path. The legacy pipeline stays
+ * the default: only a value other than empty, "0" or "off"
+ * (case-insensitive) selects the graph.
+ */
+bool stageGraphEnabled()
+{
+    static const bool enabled = []() {
+        const char* value = g_getenv("RT_STAGE_GRAPH");
+        return value != nullptr && value[0] != '\0'
+            && g_ascii_strcasecmp(value, "0") != 0
+            && g_ascii_strcasecmp(value, "off") != 0;
+    }();
+    return enabled;
+}
 
 class ImageProcessor
 {
@@ -126,6 +144,10 @@ private:
     {
         RT_PROFILE("proc::normal_pipeline", PROCESS_IMAGE);
 
+        if (stageGraphEnabled()) {
+            return graph_pipeline();
+        }
+
         const auto timed = [](const char* name, auto&& fn) {
             const auto begin = std::chrono::steady_clock::now();
             if constexpr (std::is_void_v<decltype(fn())>) {
@@ -155,6 +177,67 @@ private:
         timed("export.denoise", [this] { stage_denoise(); });
         timed("export.transform", [this] { stage_transform(); });
         return timed("export.finish", [this] { return stage_finish(); });
+    }
+
+    /*
+     * Graph-driven form of the export pipeline. The four export stages are
+     * nodes with explicit reuse modes, connected in execution order, and the
+     * plan decides what runs. The graph is built per job, so every node
+     * starts dirty and the plan recomputes every stage, which matches the
+     * legacy pipeline exactly. Node names double as the RT_STAGE_PROFILE keys
+     * so the two paths stay comparable.
+     */
+    Imagefloat *graph_pipeline()
+    {
+        stage::StageGraph graph;
+
+        const size_t init = graph.addNode("export.init", RT_STAGE_RECOMPUTE);
+        const size_t denoise = graph.addNode("export.denoise", RT_STAGE_RECOMPUTE);
+        const size_t transform = graph.addNode("export.transform", RT_STAGE_RECOMPUTE);
+        const size_t finish = graph.addNode("export.finish", RT_STAGE_RECOMPUTE);
+
+        graph.connect(init, denoise);
+        graph.connect(denoise, transform);
+        graph.connect(transform, finish);
+
+        std::vector<size_t> order;
+        const bool acyclic = graph.topologicalOrder(order);
+        assert(acyclic);
+        if (!acyclic) {
+            return nullptr;
+        }
+
+        const std::vector<stage::StageDecision> plan = graph.plan();
+
+        for (size_t index : order) {
+            if (plan[index].action != stage::StageAction::Recompute) {
+                // A fresh graph is fully dirty, so every node must recompute.
+                // Reuse would need a buffer cache this path does not have yet;
+                // fail closed instead of silently skipping a stage.
+                assert(plan[index].action == stage::StageAction::Recompute);
+                return nullptr;
+            }
+
+            const char* name = graph.node(index).name.c_str();
+
+            if (index == init) {
+                stage::ScopedProfile profile(name);
+                if (!stage_init()) {
+                    return nullptr;
+                }
+            } else if (index == denoise) {
+                stage::ScopedProfile profile(name);
+                stage_denoise();
+            } else if (index == transform) {
+                stage::ScopedProfile profile(name);
+                stage_transform();
+            } else if (index == finish) {
+                stage::ScopedProfile profile(name);
+                return stage_finish();
+            }
+        }
+
+        return nullptr;
     }
 
     Imagefloat *fast_pipeline()

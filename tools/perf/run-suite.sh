@@ -4,7 +4,11 @@
 # Usage:
 #   tools/perf/run-suite.sh --build-dir build/cpu-perf-stage-runtime \
 #       --image "$RT_TEST_IMAGE_45MP" [--pp3 FILE] [--baseline-dir DIR] \
-#       [--mode smoke|gate] [--report DIR] [--skip-preview] [--skip-stage-tests]
+#       [--mode smoke|gate] [--report DIR] [--skip-preview] [--skip-stage-tests] \
+#       [--graph]
+#
+# --graph adds an opt-in parity gate: export once with RT_STAGE_GRAPH=0 and
+# once with RT_STAGE_GRAPH=1, then require AE=0 between the two TIFFs.
 
 set -euo pipefail
 
@@ -19,6 +23,7 @@ mode="smoke"
 report=""
 skip_preview=0
 skip_stage_tests=0
+graph_parity=0
 threads_list="1 2 4 8"
 
 while [ "$#" -gt 0 ]; do
@@ -31,7 +36,8 @@ while [ "$#" -gt 0 ]; do
         --report) report="$2"; shift 2 ;;
         --skip-preview) skip_preview=1; shift ;;
         --skip-stage-tests) skip_stage_tests=1; shift ;;
-        -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
+        --graph) graph_parity=1; shift ;;
+        -h|--help) sed -n '2,9p' "$0"; exit 0 ;;
         *) die "unknown option: $1" ;;
     esac
 done
@@ -110,6 +116,29 @@ if [ -n "$pp3" ]; then
     fi
 else
     skip "sidecar parity: no profile supplied"
+fi
+
+# -------------------------------------------------------------- graph parity
+info "graph parity"
+if [ "$graph_parity" -eq 1 ]; then
+    legacy="$report/graph-legacy.tif"
+    graphed="$report/graph-stage.tif"
+    graph_args=(--image "$image" --gpu off --threads 1)
+    if [ -n "$pp3" ]; then
+        graph_args+=(--pp3 "$pp3")
+    fi
+    RT_STAGE_GRAPH=0 "$ROOT/tools/perf/export-one.sh" --build-dir "$build_dir" \
+        --out "$legacy" "${graph_args[@]}"
+    RT_STAGE_GRAPH=1 "$ROOT/tools/perf/export-one.sh" --build-dir "$build_dir" \
+        --out "$graphed" "${graph_args[@]}"
+    if result=$(python3 "$ROOT/tools/opencl/compare_tiff.py" "$legacy" "$graphed" --bits 16); then
+        set -- $result
+        if [ "$3" = "0" ]; then pass "graph export AE=0"; else fail "graph export differing=$3"; fi
+    else
+        fail "graph export comparison"
+    fi
+else
+    skip "graph parity (--graph)"
 fi
 
 # -------------------------------------------------------------- thread matrix
