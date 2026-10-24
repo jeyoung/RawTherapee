@@ -275,7 +275,10 @@ public:
             return false;
         }
 
-        entry_->copyData(destination);
+        // Swap rather than copy: the cache keeps the previous destination
+        // allocation for the next miss, and the caller receives the cached
+        // image without a full-frame copy.
+        entry_->swap(*destination);
 
         if (destination->getWidth() != key.width
                 || destination->getHeight() != key.height

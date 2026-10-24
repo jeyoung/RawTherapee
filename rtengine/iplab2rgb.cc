@@ -18,6 +18,10 @@
  */
 #include <glibmm/ustring.h>
 
+#include <map>
+#include <mutex>
+#include <string>
+
 #include "alignedbuffer.h"
 #include "color.h"
 #include "iccmatrices.h"
@@ -39,6 +43,73 @@ namespace rtengine
 
 namespace
 {
+
+struct TransformKey {
+    std::string profile;
+    cmsUInt32Number inputType = 0;
+    cmsUInt32Number outputType = 0;
+    int intent = 0;
+    bool bpc = false;
+
+    bool operator<(const TransformKey& other) const
+    {
+        if (profile != other.profile) {
+            return profile < other.profile;
+        }
+        if (inputType != other.inputType) {
+            return inputType < other.inputType;
+        }
+        if (outputType != other.outputType) {
+            return outputType < other.outputType;
+        }
+        if (intent != other.intent) {
+            return intent < other.intent;
+        }
+        return bpc < other.bpc;
+    }
+};
+
+std::map<TransformKey, cmsHTRANSFORM> transformCache;
+std::mutex transformCacheMutex;
+
+/*
+ * Output transforms are immutable and lcms supports concurrent execution of
+ * the same transform when NOCACHE is set. Reusing them removes transform
+ * construction from every preview request.
+ */
+cmsHTRANSFORM cachedLabTransform(const std::string& profile, cmsHPROFILE output,
+                                 cmsUInt32Number inputType,
+                                 cmsUInt32Number outputType, int intent,
+                                 bool bpc)
+{
+    const TransformKey key{profile, inputType, outputType, intent, bpc};
+    {
+        std::lock_guard<std::mutex> lock(transformCacheMutex);
+        auto found = transformCache.find(key);
+        if (found != transformCache.end()) {
+            return found->second;
+        }
+    }
+
+    cmsUInt32Number flags = cmsFLAGS_NOOPTIMIZE | cmsFLAGS_NOCACHE;
+    if (bpc) {
+        flags |= cmsFLAGS_BLACKPOINTCOMPENSATION;
+    }
+
+    lcmsMutex->lock();
+    cmsHPROFILE labProfile = cmsCreateLab4Profile(nullptr);
+    cmsHTRANSFORM transform =
+        cmsCreateTransform(labProfile, inputType, output, outputType, intent, flags);
+    cmsCloseProfile(labProfile);
+    lcmsMutex->unlock();
+
+    if (transform == nullptr) {
+        return nullptr;
+    }
+
+    std::lock_guard<std::mutex> lock(transformCacheMutex);
+    return transformCache.emplace(key, transform).first->second;
+}
 
 bool outputUsesRtv4Srgb(const procparams::ColorManagementParams& icm)
 {
@@ -286,13 +357,9 @@ Image8* ImProcFunctions::lab2rgb(LabImage* lab, int cx, int cy, int cw, int ch, 
     }
 
     if (oprof) {
-        const cmsUInt32Number flags = cmsFLAGS_NOOPTIMIZE | cmsFLAGS_NOCACHE | (icm.outputBPC ? cmsFLAGS_BLACKPOINTCOMPENSATION : 0); // NOCACHE is important for thread safety
-
-        lcmsMutex->lock();
-        cmsHPROFILE LabIProf  = cmsCreateLab4Profile(nullptr);
-        cmsHTRANSFORM hTransform = cmsCreateTransform(LabIProf, TYPE_Lab_DBL, oprof, TYPE_RGB_FLT, icm.outputIntent, flags);
-        cmsCloseProfile(LabIProf);
-        lcmsMutex->unlock();
+        cmsHTRANSFORM hTransform = cachedLabTransform(
+            profile, oprof, TYPE_Lab_DBL, TYPE_RGB_FLT, icm.outputIntent,
+            icm.outputBPC);
 
         unsigned char *data = image->data;
 
@@ -328,8 +395,6 @@ Image8* ImProcFunctions::lab2rgb(LabImage* lab, int cx, int cy, int cw, int ch, 
                 copyAndClampLine(outbuffer, data + ix, cw);
             }
         } // End of parallelization
-
-        cmsDeleteTransform(hTransform);
 
     } else {
         const auto xyz_rgb = ICCStore::getInstance()->workingSpaceInverseMatrix(profile);
@@ -412,20 +477,10 @@ Imagefloat* ImProcFunctions::lab2rgbOut(LabImage* lab, int cx, int cy, int cw, i
     }
 
     if (oprof) {
-        cmsUInt32Number flags = cmsFLAGS_NOOPTIMIZE | cmsFLAGS_NOCACHE;
-
-        if (icm.outputBPC) {
-            flags |= cmsFLAGS_BLACKPOINTCOMPENSATION;
-        }
-
-        lcmsMutex->lock();
-        cmsHPROFILE iprof = cmsCreateLab4Profile(nullptr);
-        cmsHTRANSFORM hTransform = cmsCreateTransform(iprof, TYPE_Lab_FLT, oprof, TYPE_RGB_FLT, icm.outputIntent, flags);
-        lcmsMutex->unlock();
-
+        cmsHTRANSFORM hTransform = cachedLabTransform(
+            icm.outputProfile, oprof, TYPE_Lab_FLT, TYPE_RGB_FLT,
+            icm.outputIntent, icm.outputBPC);
         image->ExecCMSTransform(hTransform, *lab, cx, cy);
-        cmsDeleteTransform(hTransform);
-        cmsCloseProfile(iprof);
         image->normalizeFloatTo65535();
     } else {
 
