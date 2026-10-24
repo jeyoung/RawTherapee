@@ -125,6 +125,7 @@ set(RTENGINESOURCEFILES
     stage/stage_lanczos.cc
     stage/stage_param_hash.cc
     stage/stage_parity.cc
+    stage/stage_pipeline.cc
     stage/stage_profile.cc
     stage/stage_runtime.cc
     stage/stage_store.cc
@@ -282,6 +283,15 @@ target_compile_definitions(stage-parity-test PRIVATE
     RT_STAGE_BUILD_DIR="${CMAKE_BINARY_DIR}/stages"
 )
 rt_setup_target(stage-parity-test)
+
+# The pipeline specification is data only, so the test compiles the
+# specification unit directly instead of linking the whole engine.
+add_executable(stage-pipeline-test EXCLUDE_FROM_ALL
+    "${CMAKE_CURRENT_SOURCE_DIR}/stage/tests/stage_pipeline_test.cc"
+    "${CMAKE_CURRENT_SOURCE_DIR}/stage/stage_pipeline.cc"
+)
+target_include_directories(stage-pipeline-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/stage")
+rt_setup_target(stage-pipeline-test)
 
 add_executable(stage-store-test EXCLUDE_FROM_ALL
     "${CMAKE_CURRENT_SOURCE_DIR}/stage/tests/stage_store_test.cc"
