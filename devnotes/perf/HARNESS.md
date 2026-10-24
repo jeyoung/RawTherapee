@@ -47,6 +47,13 @@ cmake --build build/cpu-perf-stage-runtime \
 
 # Build KPI
 tools/perf/kpi-build.sh --build-dir build/cpu-perf-stage-runtime
+
+# Interleaved baseline/candidate timing
+tools/perf/compare-timing.sh \
+    --baseline-dir /path/to/baseline-build \
+    --build-dir build/cpu-perf-stage-runtime \
+    --image "$RT_TEST_IMAGE_45MP" --pp3 devnotes/opencl/pp3/resize.pp3 \
+    --threads 8 --runs 3
 ```
 
 ## Tolerances
