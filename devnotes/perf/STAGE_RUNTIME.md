@@ -83,6 +83,63 @@ The graph returns a plan; it does not yet drive the four production
 pipelines. That migration is the next step, and is intentionally separate
 from the armature so the existing pipelines remain unchanged by default.
 
+## Parameter fingerprint
+
+`rtengine/stage/stage_param_hash.h` provides `ParamHasher`, the primitive that
+will replace the `ProcParams` bitset as the invalidation and cache-key input.
+It is utility code only: no pipeline calls it yet, and no `ProcParams`
+descriptor is defined in this phase.
+
+A fingerprint is 128 bits, two opaque `uint64_t` words with equality and a
+mixed `hash()` for containers. `hexString()` gives exactly 32 lower-case
+characters for logs.
+
+The hasher absorbs typed fields in call order:
+
+```cpp
+ParamHasher hasher;
+hasher.addSectionLabel("denoise");   // domain separation, one per stage
+hasher.add(params.denoise.enabled);  // bool
+hasher.add(params.denoise.radius);   // int32
+hasher.add(params.denoise.strength); // double
+hasher.addString(params.outputProfile);
+const ParamFingerprint key = hasher.finish();
+```
+
+Rules that make a fingerprint a cache key:
+
+- each overload writes a distinct type tag, so `int32_t{1}`, `int64_t{1}`,
+  `uint32_t{1}`, `true`, `1.0f` and `1.0` all differ;
+- field order is significant, and every 64-bit word is mixed into both lanes,
+  so a change propagates to all later bytes;
+- numbers are written as fixed-width little-endian bit patterns, never as
+  formatted text, so results do not depend on locale, host byte order or
+  compiler;
+- strings and section labels are tagged and length-prefixed, so prefixes,
+  trailing zero bytes and characters moved across a call boundary cannot
+  collide; labels are tagged separately from strings, so a label never aliases
+  a string field;
+- the total byte length is mixed in, so a trailing zero byte stays
+  significant;
+- `finish()` is `const` and non-destructive.
+
+`add(float)` and `add(double)` hash the bit pattern exactly as stored, so
+`0.0` and `-0.0` differ. A caller that wants them to agree must normalise the
+value before adding it. The hash is not cryptographic; it claims only the
+128-bit birthday bound.
+
+The test pins one published fingerprint
+(`553f1f9e677666f509db98fafda02b42`), so changing a tag, constant or framing
+byte fails the test instead of silently invalidating stored keys.
+
+`addBytes()` is the raw escape hatch for arrays and packed data. It is
+untagged and byte-order agnostic, so the caller is responsible for framing and
+for passing the same platform-independent byte order everywhere.
+
+`stage-param-hash-test` covers identical inputs, one-field changes, order,
+type, shared string prefixes, float and double bit patterns, labelled
+sections, raw-byte framing, repeated `finish()` and 100k repeated calls.
+
 ## Graph-driven export
 
 `ImageProcessor::normal_pipeline()` now has an opt-in graph-driven form. With
@@ -302,8 +359,14 @@ parity.
 ## Evidence
 
 - `stage-abi-test`, `stage-parity-test`, `stage-cache-test`,
-  `stage-graph-test`, `stage-indexer-test` and `stage-store-test` pass on the
-  CPU build.
+  `stage-graph-test`, `stage-indexer-test`, `stage-param-hash-test` and
+  `stage-store-test` pass on the CPU build.
+- `stage-param-hash-test` exercises the fingerprint contract in 41 checks:
+  identical descriptors agree, a published golden value pins the format, every
+  field type and order changes the fingerprint, shared string prefixes and
+  trailing zero bytes differ, adjacent floats and doubles differ, the same
+  value in two labelled sections differs, and 100k repeated calls give one
+  value. It also passes in the OpenCL configuration.
 - `stage-store-test` also covers the store's failure paths: a flipped payload
   byte, two truncations, wrong geometry, short destination pitches, invalid
   and traversal keys and concurrent writers are all rejected or kept intact,
@@ -387,6 +450,9 @@ parity.
   preview requests and reopen after a base has been stored.
 - Only Lanczos is exposed as a loadable stage. Denoise, wavelet, local
   adjustments and the output conversion still use the existing code paths.
+- `ParamHasher` is a standalone primitive. No `ProcParams` descriptor is
+  defined yet, so no cache key or invalidation decision uses a fingerprint;
+  the existing bitset remains the production invalidation input.
 - Tile ordering is connected to denoise and wavelet behind `RT_TILE_ORDER=1`,
   but it is opt-in and has no reduced-work mode. The deterministic merge is
   always on.

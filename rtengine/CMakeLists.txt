@@ -121,6 +121,7 @@ set(RTENGINESOURCEFILES
     stage/stage_graph.cc
     stage/stage_indexer.cc
     stage/stage_lanczos.cc
+    stage/stage_param_hash.cc
     stage/stage_parity.cc
     stage/stage_profile.cc
     stage/stage_runtime.cc
@@ -233,6 +234,14 @@ add_executable(stage-indexer-test EXCLUDE_FROM_ALL
 target_link_libraries(stage-indexer-test PRIVATE rtengine)
 target_include_directories(stage-indexer-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/stage")
 rt_setup_target(stage-indexer-test)
+
+# Stable parameter fingerprint used by per-stage cache keys.
+add_executable(stage-param-hash-test EXCLUDE_FROM_ALL
+    "${CMAKE_CURRENT_SOURCE_DIR}/stage/tests/stage_param_hash_test.cc"
+)
+target_link_libraries(stage-param-hash-test PRIVATE rtengine)
+target_include_directories(stage-param-hash-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/stage")
+rt_setup_target(stage-param-hash-test)
 
 add_executable(stage-parity-test EXCLUDE_FROM_ALL
     "${CMAKE_CURRENT_SOURCE_DIR}/stage/tests/stage_parity_test.cc"
