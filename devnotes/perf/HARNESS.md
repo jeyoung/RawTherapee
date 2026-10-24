@@ -23,7 +23,18 @@ tools/perf/run-suite.sh \
     --baseline-dir /path/to/baseline-build \
     --image "$RT_TEST_IMAGE_45MP" \
     --pp3 devnotes/opencl/pp3/resize.pp3 \
+    --graph \
     --report build/test-scratch/reports/run1
+
+# Optional denoise thread matrix (expects a local profile)
+tools/perf/run-suite.sh ... --denoise-pp3 /path/to/denoise.pp3
+
+# Preview state controls
+RT_PREVIEW_GRAPH=1       # opt-in graph decision layer
+RT_PREVIEW_DUMP=/path    # exact preview/work/crop TIFF dumps
+RT_STAGE_STORE=1         # persistent preview base cache
+RT_STAGE_STORE_MAX_MB=512
+RT_TILE_ORDER=1          # opt-in tile ordering, when merged
 
 # One export
 tools/perf/export-one.sh --build-dir build/cpu-perf-stage-runtime \
