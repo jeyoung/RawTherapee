@@ -105,6 +105,15 @@ reconstruction measured a 56 ms crop and a 99 ms deferred analysis, and the
 Preferences label showed `Recommended: 155 ms`. The same dialog stored 200 ms
 at the Slow end, 100 ms at the Fast end, and returned to 125 ms after Reset to
 default. The three options values were read back from
-`Performance/PreviewRefreshMs` and the legacy keys. Persistence, reset and live application are GUI-level
-checks; the CLI and batch paths do not read the preference and their output is
-unchanged.
+`Performance/PreviewRefreshMs` and the legacy keys. Persistence, reset and live
+application are GUI-level checks; the CLI and batch paths do not read the
+preference and their output is unchanged.
+
+The Debian package
+`rawtherapee-5.13-160-gdaeadbf15_5.13+git13181.daeadbf15-1_amd64.deb`
+(SHA-256 `4121079da613592dd978a6d7aa1dc4db180dec7917d173e6a6b2acbfa2673c41`)
+passed install, `--list-formats` with JPEG XL, a single-threaded 16-bit TIFF
+export compared with the host export (`AE=0`), and a GUI startup under Xvfb on
+Debian 12 and Debian 13. The containers have no OpenCL ICD, so `--gpu-test` and
+`--gpu-test-monitor` were not run. The `ISOSpeedRatings` TIFF warning from
+ImageMagick is metadata-only; the image comparison is pixel-identical.
