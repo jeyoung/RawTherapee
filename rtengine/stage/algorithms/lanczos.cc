@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <vector>
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -50,36 +51,45 @@ void lanczos3(const float* const src[3], int src_width, int src_height,
     float* const dst1 = dst[1];
     float* const dst2 = dst[2];
 
+    /*
+     * The horizontal taps are identical for every output row. Computing them
+     * once outside the row loop avoids repeating the same transcendental
+     * work in every worker thread.
+     */
+    std::vector<float> wwh(static_cast<size_t>(support) * dst_width);
+    std::vector<int> jj0(dst_width);
+    std::vector<int> jj1(dst_width);
+
+#ifdef _OPENMP
+#pragma omp parallel for num_threads(threads > 0 ? threads : omp_get_max_threads())
+#endif
+    for (int j = 0; j < dst_width; ++j) {
+        const float x0 = (static_cast<float>(j) + 0.5f) * delta - 0.5f;
+        float* const w = wwh.data() + static_cast<size_t>(j) * support;
+        float ws = 0.0f;
+
+        jj0[j] = std::max(0, static_cast<int>(floorf(x0 - a / sc)) + 1);
+        jj1[j] = std::min(src_width,
+                          static_cast<int>(floorf(x0 + a / sc)) + 1);
+
+        for (int jj = jj0[j]; jj < jj1[j]; ++jj) {
+            const int k = jj - jj0[j];
+            const float z = sc * (x0 - static_cast<float>(jj));
+            w[k] = lanc(z, a);
+            ws += w[k];
+        }
+        for (int k = 0; k < support; ++k) {
+            w[k] /= ws;
+        }
+    }
+
 #ifdef _OPENMP
 #pragma omp parallel num_threads(threads > 0 ? threads : omp_get_max_threads())
 #endif
     {
-        float* const wwh = new float[support * dst_width];
-        int* const jj0 = new int[dst_width];
-        int* const jj1 = new int[dst_width];
         float* const lr = new float[src_width];
         float* const lg = new float[src_width];
         float* const lb = new float[src_width];
-
-        for (int j = 0; j < dst_width; ++j) {
-            const float x0 = (static_cast<float>(j) + 0.5f) * delta - 0.5f;
-            float* const w = wwh + j * support;
-            float ws = 0.0f;
-
-            jj0[j] = std::max(0, static_cast<int>(floorf(x0 - a / sc)) + 1);
-            jj1[j] = std::min(src_width,
-                              static_cast<int>(floorf(x0 + a / sc)) + 1);
-
-            for (int jj = jj0[j]; jj < jj1[j]; ++jj) {
-                const int k = jj - jj0[j];
-                const float z = sc * (x0 - static_cast<float>(jj));
-                w[k] = lanc(z, a);
-                ws += w[k];
-            }
-            for (int k = 0; k < support; ++k) {
-                w[k] /= ws;
-            }
-        }
 
 #ifdef _OPENMP
 #pragma omp for
@@ -126,7 +136,8 @@ void lanczos3(const float* const src[3], int src_width, int src_height,
             float* const out1 = dst1 + static_cast<size_t>(i) * dst_pitch;
             float* const out2 = dst2 + static_cast<size_t>(i) * dst_pitch;
             for (int j = 0; j < dst_width; ++j) {
-                const float* const wh = wwh + support * j;
+                const float* const wh =
+                    wwh.data() + static_cast<size_t>(support) * j;
                 float r = 0.0f;
                 float g = 0.0f;
                 float b = 0.0f;
@@ -142,9 +153,6 @@ void lanczos3(const float* const src[3], int src_width, int src_height,
             }
         }
 
-        delete[] wwh;
-        delete[] jj0;
-        delete[] jj1;
         delete[] lr;
         delete[] lg;
         delete[] lb;
