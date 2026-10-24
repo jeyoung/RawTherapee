@@ -3,11 +3,13 @@
 ## Handover block
 
 - Branch: `perf` (based on `opencl`, which is based on `dev` at `b2ee504c4`)
-- Milestone: M12 — opt-in GPU `rgbProc` core complete; GPU porting paused
-- Last verified: 2026-10-22, public PEF baseline export, monitor parity and
-  opt-in `rgbProc` parity on AMD RX 550; capture opt-in and 5×5 fast path
-- Next task: none scheduled. RCD demosaic was evaluated and deferred; the next
-  candidate, only if requested, is wavelet/denoise
+- Milestone: M13 — export buffer-traffic review; GPU porting paused
+- Last verified: 2026-10-24, exact CPU export parity for the early-resize
+  fusion, public PEF `--quick`/`--formats` parity, monitor parity and 45.7 MP
+  export parity on AMD RX 550
+- Next task: none scheduled. The next candidate, only if requested, is a
+  device-resident Lab segment between `rgbProc` and the output conversion,
+  which needs a stage-split change; then wavelet/denoise
 - Known limitations: single-stage acceleration is roughly neutral end-to-end;
   GPU Capture Sharpening has Off/Auto/On modes; Auto uses a 2.3 MP CPU/GPU
   calibration and is conservative for 3×3, while 7×7 and 13×13 remain slower
@@ -19,7 +21,27 @@
   conversion falls back to lcms for LUT profiles, soft proofing, gamut check,
   non-relative intent, and black-point compensation with a non-zero black
   point; `rgbProc` is opt-in, batch-only because of the tone-curve histogram,
-  and slower than the 8-thread CPU on the RX 550
+  and slower than the 8-thread CPU on the RX 550; the Lab buffer between
+  `rgbProc` and the output conversion still crosses the bus twice per image
+
+## M13 evidence — export buffer traffic (CPU only, OpenCL unchanged)
+
+- Scope: buffer traffic in `ImageProcessor`'s export stages. Commit
+  `47c50ee77` converts only the crop rectangle of the working-space frame in
+  the fast export's early resize and drops an unused pre-TRC copy.
+  `devnotes/perf/FUSION.md` carries the full candidate list and evidence.
+- The early-resize stage falls from 3056 ms to 1148 ms (median of five
+  interleaved runs on a 45.7 MP frame with an 8213×4620 crop); the whole fast
+  export falls from 46.82 s to 43.81 s over eight interleaved pairs and peak
+  RSS drops 124 MB in every pair. The default (non `-f`) export is untouched.
+- CPU 16-bit export is `AE=0` against the pre-change binary for neutral,
+  sidecar, sidecar `-f` and both `WorkingTRC` profiles.
+- No OpenCL transfer code changed. The immutable payload is 256 KB per output
+  conversion and about 2.25 MB per opt-in `rgbProc` call, against 26–272 MB of
+  image planes per call, so a content-keyed buffer cache is below the
+  measurement floor. The traffic worth removing is the Lab buffer crossing to
+  the host and back between `rgbProc` and the output conversion; that needs a
+  device-resident segment and a stage-split change.
 
 ## M12 evidence — opt-in GPU `rgbProc` core
 

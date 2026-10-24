@@ -67,6 +67,55 @@ void adjust_radius(const T &default_param, double scale_factor, T &param)
 }
 
 /*
+ * Convert one rectangle of a working-space RGB image to Lab.
+ *
+ * This is the per-pixel body of ImProcFunctions::rgb2lab(Imagefloat&,
+ * LabImage&, workingSpace) restricted to a region. It exists so that the
+ * early-resize stage can convert only the pixels a crop keeps instead of a
+ * full-frame Lab image plus a copy out of it. Both paths fetch the same
+ * working-space matrix and call the same Color helpers in the same order per
+ * pixel, so the region result is bit-identical to converting the whole image
+ * and copying the rectangle.
+ *
+ * @param src           Linear working-space RGB source.
+ * @param dst           Lab destination; its size is the rectangle size.
+ * @param x, y          Top-left corner of the rectangle in @p src, in pixels.
+ * @param workingSpace  Working profile name.
+ */
+void rgbToLabRegion(const Imagefloat& src, LabImage& dst, int x, int y,
+                    const Glib::ustring& workingSpace)
+{
+    assert(x >= 0 && y >= 0);
+    assert(x + dst.W <= src.getWidth());
+    assert(y + dst.H <= src.getHeight());
+
+    const TMatrix wprof = ICCStore::getInstance()->workingSpaceMatrix(workingSpace);
+    const float wp[3][3] = {
+        {static_cast<float>(wprof[0][0]), static_cast<float>(wprof[0][1]), static_cast<float>(wprof[0][2])},
+        {static_cast<float>(wprof[1][0]), static_cast<float>(wprof[1][1]), static_cast<float>(wprof[1][2])},
+        {static_cast<float>(wprof[2][0]), static_cast<float>(wprof[2][1]), static_cast<float>(wprof[2][2])}
+    };
+
+    const int W = dst.W;
+    const int H = dst.H;
+
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(dynamic,16)
+#endif
+
+    for (int i = 0; i < H; i++) {
+        const int row = i + y;
+
+        for (int j = 0; j < W; j++) {
+            float X, Y, Z;
+            Color::rgbxyz(src.r(row, j + x), src.g(row, j + x), src.b(row, j + x),
+                          X, Y, Z, wp);
+            Color::XYZ2Lab(X, Y, Z, dst.L[i][j], dst.a[i][j], dst.b[i][j]);
+        }
+    }
+}
+
+/*
  * Opt-in switch for the graph-driven export path. The legacy pipeline stays
  * the default: only a value other than empty, "0" or "off"
  * (case-insensitive) selects the graph.
@@ -1918,10 +1967,18 @@ private:
             }
 
             const std::unique_ptr<Imagefloat> tmpImage1(new Imagefloat(GW, GH));
-            const std::unique_ptr<Imagefloat> tmpImage2(new Imagefloat(GW, GH));
 
             ipf.lab2rgb(*labView, *tmpImage1, params.icm.workingProfile);
-            tmpImage1.get()->copyData(tmpImage2.get());
+
+            const float satu = params.icm.wapsat;
+            // apsatur() needs the pre-TRC image as a reference; keep the copy
+            // only when that pass will actually run.
+            std::unique_ptr<Imagefloat> tmpImage2;
+
+            if (satu > 0.f) {
+                tmpImage2.reset(new Imagefloat(GW, GH));
+                tmpImage1.get()->copyData(tmpImage2.get());
+            }
 
             const float gamtone = params.icm.wGamma;
             const float slotone = params.icm.wSlope;
@@ -1962,9 +2019,9 @@ private:
 
             ipf.workingtrc(0, tmpImage1.get(), tmpImage1.get(), GW, GH, -5, prof, 2.4, 12.92310, 0, ill, 0, 0, rdx, rdy, grx, gry, blx, bly, meanx, meany, meanxe, meanye, maxdat, p, dummy, true, false, false, false);
             ipf.workingtrc(0, tmpImage1.get(), tmpImage1.get(), GW, GH, 5, prof, gamtone, slotone, catc, illum, prim, locprim, rdx, rdy, grx, gry, blx, bly, meanx, meany, meanxe, meanye, maxdat,  p, dummy, false, true, true, gamutcontrol);
-            float satu = params.icm.wapsat;
 
             if(satu > 0.f) {
+                assert(tmpImage2);
                 ipf.apsatur(0, tmpImage1.get(), tmpImage2.get(), GW, GH, satu) ;
             }
 
@@ -2379,6 +2436,10 @@ private:
 
     void stage_early_resize()
     {
+        // The fast pipeline has no outer stage timings, so time this stage here
+        // to keep it comparable with export.transform and export.finish.
+        stage::ScopedProfile profile("export.early_resize");
+
         procparams::ProcParams& params = job->pparams;
         //ImProcFunctions ipf (&params, true);
         ImProcFunctions &ipf = * (ipf_p.get());
@@ -2386,26 +2447,25 @@ private:
         int imw, imh;
         double scale_factor = ipf.resizeScale(&params, fw, fh, imw, imh);
 
-        std::unique_ptr<LabImage> tmplab(new LabImage(fw, fh));
-        ipf.rgb2lab(*baseImg, *tmplab, params.icm.workingProfile);
+        std::unique_ptr<LabImage> tmplab;
 
         if (params.crop.enabled) {
-            int cx = params.crop.x;
-            int cy = params.crop.y;
-            int cw = params.crop.w;
-            int ch = params.crop.h;
+            // The crop rectangle is the only part of the frame that survives
+            // the resize, so convert that rectangle instead of the whole
+            // frame and copying it afterwards. stage_init() has already
+            // clamped the rectangle to the frame.
+            const int cx = params.crop.x;
+            const int cy = params.crop.y;
+            const int cw = params.crop.w;
+            const int ch = params.crop.h;
+            assert(cx >= 0 && cy >= 0);
+            assert(cx + cw <= fw && cy + ch <= fh);
 
-            std::unique_ptr<LabImage> cropped(new LabImage(cw, ch));
-
-            for (int row = 0; row < ch; row++) {
-                for (int col = 0; col < cw; col++) {
-                    cropped->L[row][col] = tmplab->L[row + cy][col + cx];
-                    cropped->a[row][col] = tmplab->a[row + cy][col + cx];
-                    cropped->b[row][col] = tmplab->b[row + cy][col + cx];
-                }
-            }
-
-            tmplab = std::move(cropped);
+            tmplab.reset(new LabImage(cw, ch));
+            rgbToLabRegion(*baseImg, *tmplab, cx, cy, params.icm.workingProfile);
+        } else {
+            tmplab.reset(new LabImage(fw, fh));
+            ipf.rgb2lab(*baseImg, *tmplab, params.icm.workingProfile);
         }
 
         assert(params.resize.enabled);

@@ -13,6 +13,34 @@ CPU path is not reproducible.
 | Driver | Mesa 26.1.6, Rusticl, auto-detected `RUSTICL_ENABLE=radeonsi` |
 | OS | Debian 13 trixie |
 
+## Export buffer traffic, 45.7 MP (phase 9)
+
+Input: 45.7 MP NEF (8256×5504 frame), 16-bit TIFF, 16-bit sRGB output,
+`OMP_NUM_THREADS=8`, commit `47c50ee77`. The host carried an unrelated load
+average of 11–20 during these runs, so absolute wall times are inflated. A
+same-binary A/B on the resize export spread 9.11–13.81 s, i.e. a 7–25 % noise
+floor; treat whole-export deltas below that as indicative only.
+
+Fast export (`-f`) with a crop sidecar (8213×4620 → 1920×1080). The stage
+figure is the reliable one; it was measured on both arms with
+`RT_STAGE_PROFILE=1`, five interleaved runs each:
+
+| Arm | `export.early_resize` median | Whole export median (8 pairs) | Peak RSS |
+|---|---:|---:|---:|
+| before | 3056 ms | 46.82 s | 2.87 GB |
+| after (`47c50ee77`) | 1148 ms | 43.81 s | 2.77 GB |
+
+Every "after" stage run was below every "before" run. The saving is one
+full-frame RGB→Lab conversion and the Lab crop copy: about 1.09 GB of reads
+and writes and a 545 MB full-frame Lab allocation per export.
+
+OpenCL on the same 45.7 MP resize export (`RT_OPENCL_PROFILE=1`): `opencl
+resize` 1153 ms and `opencl lab2srgb` 849 ms. Immutable uploads on that path
+are one 256 KB gamma LUT plus a 36-byte matrix against about 61 MB of image
+planes, so a content-keyed buffer cache cannot be measured here. The repeated
+traffic that matters is the Lab buffer between `rgbProc` and the output
+conversion (about 136 MB each way at 11.3 MP). See `devnotes/perf/FUSION.md`.
+
 ## Lanczos resize, 0.5x
 
 Input: `colorspace_flowers.pef`, 3896x2616 -> 1944x1304, 16-bit TIFF.
