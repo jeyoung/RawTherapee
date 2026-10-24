@@ -43,8 +43,28 @@ namespace rtengine
 using namespace procparams;
 
 class Crop;
+class Image8;
 class PreviewBaseCache;
 class TweakOperator;
+
+/*
+ * Opt-in preview dump hook (RT_PREVIEW_DUMP).
+ *
+ * Writes the full-frame preview and working image, and the visible crop, as
+ * uncompressed 16-bit TIFF with a small JSON descriptor. The descriptor
+ * carries only generated file names and image geometry: never the source
+ * path, the dump directory or other environment-derived strings.
+ */
+namespace preview_dump
+{
+
+bool enabled();
+void dump_full_frame(const Image8* preview, const Image8* work, int scale,
+                     int todo);
+void dump_crop(const Image8* crop, const char* tag, int visibleX,
+               int visibleY, int visibleWidth, int visibleHeight, int skip);
+
+} // namespace preview_dump
 
 /** @brief Manages the image processing, espc. of the preview windows
   *

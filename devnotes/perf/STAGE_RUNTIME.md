@@ -109,6 +109,99 @@ gate.
 splits blocks into full and cheap work. It is the hook for selective
 denoise/wavelet work; it is not yet wired into those tools.
 
+## Preview decision layer and dump
+
+`RT_PREVIEW_GRAPH=1` adds an opt-in decision layer to
+`ImProcCoordinator::updatePreviewImage()`. Unset, empty, `0` and `off`
+(case-insensitive) keep the legacy path, which is the default. The layer
+models the full-frame preview as six `StageGraph` nodes connected in
+execution order:
+
+```text
+preview.base -> preview.analysis -> preview.local
+             -> preview.rgb -> preview.lab -> preview.output
+```
+
+Dirty state comes from the event mask and the base-cache result:
+
+- `base` is dirty only when the pass does not restore the base from the
+  preview base cache;
+- `analysis` is dirty when any preprocessing, demosaic, white-balance,
+  retinex, spot or first-analysis bit is set;
+- `local`, `rgb` and `lab` are dirty when the pass carries any bit that
+  starts work in that region (`ALL` and the tool bit sets);
+- `output` is dirty for a monitor conversion or a panning-related change.
+
+`plan()` then resolves the actions. Every block the legacy code executes
+must be allowed to run: if the plan returns `ReuseOutput` for such a block,
+the layer logs `preview-graph: fallback to legacy: plan would skip ...` and
+rejects the plan. Rejection changes no pixels, because this version is a
+decision and parity layer, not a rewrite: the legacy block sequence is the
+only implementation, the graph never reorders stages and no arithmetic or
+thread count changes. Once per process, the accepted plan is logged as
+`preview-graph: active, 6 blocks in execution order: ...`.
+`RT_STAGE_PROFILE=1` also records `preview.graph.decide`; measured on the
+45.7 MP image it costs 0.008-0.010 ms per full-frame pass.
+
+`RT_PREVIEW_DUMP=<dir>` writes the completed full-frame pass and the visible
+crop for parity work. It is off when unset, empty, `0` or `off`.
+
+```text
+preview.tif        previmg, uncompressed 16-bit TIFF
+work.tif           workimg, uncompressed 16-bit TIFF
+preview.json       pass, scale, todo, dimensions and generated file names
+crop-main.tif      visible main-preview crop, same format
+crop-main.json     tag, dimensions, visible rectangle and scale
+crop-detail.tif    detail-window crop when one exists
+crop-detail.json
+```
+
+The 8-bit `Image8` samples are widened exactly to 16-bit (`v * 257`), so the
+dump is byte-comparable between runs. The JSON descriptors contain only
+generated file names, image geometry and the event mask: never the source
+path, the dump directory, a user name or a host name. The TIFF writer adds
+only the RawTherapee version tag because the preview images carry no
+metadata. The dump path holds the existing preview mutex and is disabled by
+default; writing a dump adds disk I/O to the pass and is not part of the
+latency gate.
+
+Reproduce under Xvfb with a fresh settings directory, a fresh cache and
+`OMP_NUM_THREADS=1` for every run, loading the same image and waiting for
+`preview imageReady`:
+
+```bash
+RT_SETTINGS=... RT_CACHE=... RT_PREVIEW_PROFILE=1 \
+RT_PREVIEW_GRAPH=0 RT_PREVIEW_DUMP=/tmp/dump-legacy rawtherapee "$RT_TEST_IMAGE_45MP"
+RT_SETTINGS=... RT_CACHE=... RT_PREVIEW_PROFILE=1 \
+RT_PREVIEW_GRAPH=1 RT_PREVIEW_DUMP=/tmp/dump-graph rawtherapee "$RT_TEST_IMAGE_45MP"
+cmp /tmp/dump-legacy/preview.tif /tmp/dump-graph/preview.tif
+```
+
+Evidence on the 45.7 MP NEF under Xvfb, single-threaded, fresh settings and
+cache for every run:
+
+- `RT_PREVIEW_GRAPH=0` versus `1`: `preview.tif`, `work.tif` and
+  `crop-main.tif` are byte-identical (`cmp`, `AE=0`) over five independent
+  pairs.
+- Two legacy runs are byte-identical to each other, and two graph runs are
+  byte-identical to each other, so the comparison is not measuring
+  run-to-run noise.
+- `RT_PREVIEW_GRAPH=off` matches the unset default byte for byte, and
+  `RT_PREVIEW_GRAPH=1` logs the active plan without a fallback on those
+  passes.
+- A deliberate dirty-rule mutation that under-reported the base block
+  produced `preview-graph: fallback to legacy: plan would skip preview.base
+  but the legacy path runs it (todo=118783)` exactly once; the pixels were
+  unchanged.
+- Preview latency on the same build and image, driven through the Exposure
+  slider: four paired legacy/graph GUI runs gave p50 372-487 ms and
+  415-493 ms respectively. The direction changes between pairs and the
+  spread is about 25%, while the decision costs 0.008-0.010 ms, so the
+  difference is host and GUI noise rather than a regression. The standard
+  `bench-preview.sh` gate exits zero in both modes; its drag coordinates
+  only produce two samples on this host, so the paired harness above is the
+  useful measurement.
+
 ## Persistent store
 
 `StageStore` is a standalone on-disk store for stage buffers, intended for a
@@ -253,9 +346,14 @@ parity.
 
 ## Limitations
 
-- Preview, crop and thumbnail pipelines are not graph-driven. Export is
-  graph-driven only when `RT_STAGE_GRAPH=1`; the legacy path is the default
-  and the graph path does not yet cache or reuse buffers.
+- The preview has a graph-backed decision layer, not a graph-driven
+  execution path: with `RT_PREVIEW_GRAPH=1` the plan certifies which blocks
+  may run but the legacy block sequence still performs every computation.
+  Crop and thumbnail pipelines are still hand-ordered. Export is graph-driven
+  only when `RT_STAGE_GRAPH=1`; the legacy path is the default and neither
+  graph path caches or reuses buffers yet.
+- The preview dump writes at most one file per crop tag, so two detail
+  windows overwrite each other's `crop-detail.*` pair.
 - The persistent preview cache is opt-in and covers only the preview base
   image. It has no eviction beyond the write cap, and the store itself has no
   key derivation; `PreviewBaseCache` owns the key. A store shared by two

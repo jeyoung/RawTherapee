@@ -16,13 +16,19 @@
  *  You should have received a copy of the GNU General Public License
  *  along with RawTherapee.  If not, see <https://www.gnu.org/licenses/>.
  */
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <fstream>
 #include <map>
+#include <mutex>
+#include <set>
+#include <sstream>
 #include <string>
 #include <sys/stat.h>
+#include <vector>
 
+#include <glib.h>
 #include <glibmm/thread.h>
 
 #include "improccoordinator.h"
@@ -47,6 +53,8 @@
 #include "previewbasecache.h"
 #include "previewquality.h"
 #include "profiling.h"
+#include "stage/stage_graph.h"
+#include "stage/stage_profile.h"
 #include "tweakoperator.h"
 #include "refreshmap.h"
 #include "utils.h"
@@ -1091,6 +1099,372 @@ DetailedCrop* ImProcCoordinator::createCrop(::EditDataProvider *editDataProvider
 }
 
 
+namespace
+{
+
+/*
+ * Opt-in preview decision layer (RT_PREVIEW_GRAPH).
+ *
+ * The legacy path stays authoritative: this layer models the full-frame
+ * preview as six blocks, marks them dirty from the event mask and the base
+ * cache state, and asks StageGraph::plan() which blocks are allowed to run.
+ * A pass whose plan would skip a block the legacy code executes fails closed:
+ * the plan is rejected, the reason is logged, and the unchanged legacy block
+ * sequence runs. No arithmetic, ordering or thread count is changed by this
+ * layer.
+ */
+bool previewGraphEnabled()
+{
+    static const bool enabled = []() {
+        const char* value = g_getenv("RT_PREVIEW_GRAPH");
+        return value != nullptr && value[0] != '\0'
+            && g_ascii_strcasecmp(value, "0") != 0
+            && g_ascii_strcasecmp(value, "off") != 0;
+    }();
+    return enabled;
+}
+
+enum PreviewBlock {
+    PREVIEW_BASE = 0,
+    PREVIEW_ANALYSIS,
+    PREVIEW_LOCAL,
+    PREVIEW_RGB,
+    PREVIEW_LAB,
+    PREVIEW_OUTPUT,
+    PREVIEW_BLOCK_COUNT
+};
+
+constexpr const char* PREVIEW_BLOCK_NAMES[PREVIEW_BLOCK_COUNT] = {
+    "preview.base",
+    "preview.analysis",
+    "preview.local",
+    "preview.rgb",
+    "preview.lab",
+    "preview.output"
+};
+
+/*
+ * Bits that can start work in the analysis block. The set is deliberately a
+ * superset of the legacy gates: extra dirt only makes the plan recompute a
+ * block, while a missing bit would let the plan skip a block the legacy path
+ * executes and is rejected by the validation below.
+ */
+constexpr int PREVIEW_ANALYSIS_BITS =
+    M_PREPROC | M_RAW | M_WB | M_INIT | M_LINDENOISE | M_HDR | M_RETINEX
+    | M_SPOT | M_CSHARP | M_AUTOEXP | M_HIGHQUAL | M_BLURMAP;
+
+/*
+ * Bits that can start work in the middle blocks. The local-adjustment region
+ * runs as a whole inside a full-frame pass, so any processing bit dirtied
+ * through ALL is treated as local work. RGB and Lab list their own tool bits
+ * plus the upstream analysis bits that rebuild their inputs.
+ */
+constexpr int PREVIEW_LOCAL_BITS = ALL;
+constexpr int PREVIEW_RGB_BITS =
+    M_RGBCURVE | M_AUTOEXP | M_LUMACURVE | M_LUMINANCE | M_COLOR
+    | M_TRANSFORM | M_HDR | M_SPOT | M_LINDENOISE | M_RETINEX;
+constexpr int PREVIEW_LAB_BITS =
+    M_LUMACURVE | M_LUMINANCE | M_COLOR | M_RGBCURVE | M_AUTOEXP
+    | M_TRANSFORM | M_HDR | M_SPOT | M_LINDENOISE | M_RETINEX;
+
+struct PreviewGraphResult {
+    bool valid = true;
+    const char* reason = nullptr;
+    stage::StageAction action[PREVIEW_BLOCK_COUNT] = {};
+};
+
+PreviewGraphResult planPreviewGraph(int todo, bool panningRelatedChange,
+                                    bool fullPipeline, bool baseCacheHit)
+{
+    PreviewGraphResult result;
+    if (!previewGraphEnabled()) {
+        return result;
+    }
+
+    stage::StageGraph graph;
+    size_t nodes[PREVIEW_BLOCK_COUNT];
+    for (int block = 0; block < PREVIEW_BLOCK_COUNT; ++block) {
+        nodes[block] = graph.addNode(PREVIEW_BLOCK_NAMES[block],
+                                     RT_STAGE_RECOMPUTE);
+    }
+    // Execution order of the full-frame preview pipeline.
+    for (int block = 1; block < PREVIEW_BLOCK_COUNT; ++block) {
+        graph.connect(nodes[block - 1], nodes[block]);
+    }
+
+    const auto mark = [&graph, &nodes](int block, bool dirty) {
+        if (dirty) {
+            graph.markDirty(nodes[block]);
+        } else {
+            graph.markClean(nodes[block]);
+        }
+    };
+
+    // Base: rebuilt only when the base cache did not supply the image.
+    mark(PREVIEW_BASE, fullPipeline && !baseCacheHit);
+    // Analysis: preprocessing, demosaic, white balance and first analysis.
+    mark(PREVIEW_ANALYSIS,
+         fullPipeline && (todo & PREVIEW_ANALYSIS_BITS) != 0);
+    mark(PREVIEW_LOCAL, fullPipeline && (todo & PREVIEW_LOCAL_BITS) != 0);
+    mark(PREVIEW_RGB, fullPipeline && (todo & PREVIEW_RGB_BITS) != 0);
+    mark(PREVIEW_LAB, fullPipeline && (todo & PREVIEW_LAB_BITS) != 0);
+    // Output: monitor conversion and the analysis image.
+    mark(PREVIEW_OUTPUT,
+         panningRelatedChange || (todo & M_MONITOR) != 0);
+
+    std::vector<size_t> order;
+    if (!graph.topologicalOrder(order)
+            || order.size() != PREVIEW_BLOCK_COUNT) {
+        result.valid = false;
+        result.reason = "cycle";
+        return result;
+    }
+
+    const std::vector<stage::StageDecision> plan = graph.plan();
+    if (plan.size() != PREVIEW_BLOCK_COUNT) {
+        result.valid = false;
+        result.reason = "incomplete-plan";
+        return result;
+    }
+    for (int block = 0; block < PREVIEW_BLOCK_COUNT; ++block) {
+        result.action[block] = plan[nodes[block]].action;
+    }
+
+    // Independent statement of what the legacy code executes. These mirror
+    // the guards on the corresponding blocks, not the dirty rules above, so a
+    // future change to either side is caught here.
+    const bool legacyRuns[PREVIEW_BLOCK_COUNT] = {
+        fullPipeline && !baseCacheHit,
+        fullPipeline && (todo & PREVIEW_ANALYSIS_BITS) != 0,
+        fullPipeline,
+        fullPipeline,
+        fullPipeline,
+        panningRelatedChange || (todo & M_MONITOR) != 0
+    };
+
+    for (int block = 0; block < PREVIEW_BLOCK_COUNT; ++block) {
+        if (legacyRuns[block]
+                && result.action[block] == stage::StageAction::ReuseOutput) {
+            result.valid = false;
+            result.reason = PREVIEW_BLOCK_NAMES[block];
+            return result;
+        }
+    }
+
+    return result;
+}
+
+void logPreviewGraph(const PreviewGraphResult& result, int todo)
+{
+    static std::mutex mutex;
+    static std::set<std::string> loggedFallbacks;
+    static bool loggedActive = false;
+
+    std::lock_guard<std::mutex> lock(mutex);
+
+    if (!result.valid) {
+        const std::string reason = result.reason != nullptr
+                                       ? result.reason
+                                       : "unknown";
+        if (!loggedFallbacks.insert(reason).second) {
+            return;
+        }
+        std::fprintf(stderr,
+                     "preview-graph: fallback to legacy: plan would skip %s "
+                     "but the legacy path runs it (todo=%d)\n",
+                     reason.c_str(), todo);
+        return;
+    }
+
+    if (loggedActive) {
+        return;
+    }
+    loggedActive = true;
+    std::fprintf(stderr,
+                 "preview-graph: active, 6 blocks in execution order:");
+    for (int block = 0; block < PREVIEW_BLOCK_COUNT; ++block) {
+        std::fprintf(stderr, " %s=%s", PREVIEW_BLOCK_NAMES[block],
+                     result.action[block] == stage::StageAction::Recompute
+                         ? "recompute"
+                         : "reuse");
+    }
+    std::fprintf(stderr, "\n");
+}
+
+} // namespace
+
+namespace preview_dump
+{
+
+namespace
+{
+
+struct DumpState {
+    bool enabled = false;
+    std::string directory;
+    uint64_t pass = 0;
+    std::mutex mutex;
+    bool writeFailed = false;
+};
+
+DumpState& storage()
+{
+    static DumpState dump;
+    return dump;
+}
+
+DumpState& state()
+{
+    static std::once_flag once;
+    std::call_once(once, []() {
+        DumpState& dump = storage();
+        const char* value = g_getenv("RT_PREVIEW_DUMP");
+        if (value == nullptr || value[0] == '\0'
+                || g_ascii_strcasecmp(value, "0") == 0
+                || g_ascii_strcasecmp(value, "off") == 0) {
+            return;
+        }
+        dump.directory = value;
+        if (g_mkdir_with_parents(dump.directory.c_str(), 0700) != 0) {
+            std::fprintf(stderr,
+                         "preview-dump: cannot create the dump directory: "
+                         "%s\n", g_strerror(errno));
+            return;
+        }
+        dump.enabled = true;
+    });
+    return storage();
+}
+
+std::string dump_path(const std::string& directory, const char* name)
+{
+    char* path = g_build_filename(directory.c_str(), name, nullptr);
+    std::string result = path != nullptr ? path : "";
+    g_free(path);
+    return result;
+}
+
+bool write_tiff(const std::string& path, const Image8* image)
+{
+    if (image == nullptr || image->getWidth() < 1 || image->getHeight() < 1) {
+        return false;
+    }
+    // Uncompressed 16-bit keeps the dump byte-comparable between runs and
+    // preserves every 8-bit sample exactly (v * 257).
+    return image->saveTIFF(Glib::ustring(path), 16, false, true, false)
+           == IMIO_SUCCESS;
+}
+
+bool write_text(const std::string& path, const std::string& body)
+{
+    std::ofstream out(path.c_str(),
+                      std::ios::out | std::ios::trunc | std::ios::binary);
+    if (!out) {
+        return false;
+    }
+    out << body;
+    return out.good();
+}
+
+void report_failure()
+{
+    DumpState& dump = state();
+    if (!dump.writeFailed) {
+        dump.writeFailed = true;
+        std::fprintf(stderr, "preview-dump: failed to write a dump file\n");
+    }
+}
+
+} // namespace
+
+bool enabled()
+{
+    return state().enabled;
+}
+
+void dump_full_frame(const Image8* preview, const Image8* work, int scale,
+                     int todo)
+{
+    DumpState& dump = state();
+    if (!dump.enabled) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(dump.mutex);
+    if (preview == nullptr || work == nullptr) {
+        return;
+    }
+
+    const uint64_t pass = ++dump.pass;
+    const std::string previewPath = dump_path(dump.directory, "preview.tif");
+    const std::string workPath = dump_path(dump.directory, "work.tif");
+
+    if (!write_tiff(previewPath, preview) || !write_tiff(workPath, work)) {
+        report_failure();
+        return;
+    }
+
+    std::ostringstream json;
+    json << "{\n"
+         << "  \"schema\": \"rt-preview-dump/1\",\n"
+         << "  \"pass\": " << pass << ",\n"
+         << "  \"scale\": " << scale << ",\n"
+         << "  \"todo\": " << todo << ",\n"
+         << "  \"format\": \"uint16-tiff\",\n"
+         << "  \"preview\": {\"file\": \"preview.tif\", \"width\": "
+         << preview->getWidth() << ", \"height\": " << preview->getHeight()
+         << ", \"channels\": 3},\n"
+         << "  \"work\": {\"file\": \"work.tif\", \"width\": "
+         << work->getWidth() << ", \"height\": " << work->getHeight()
+         << ", \"channels\": 3}\n"
+         << "}\n";
+
+    if (!write_text(dump_path(dump.directory, "preview.json"), json.str())) {
+        report_failure();
+    }
+}
+
+void dump_crop(const Image8* crop, const char* tag, int visibleX,
+               int visibleY, int visibleWidth, int visibleHeight, int skip)
+{
+    DumpState& dump = state();
+    if (!dump.enabled || crop == nullptr || tag == nullptr) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(dump.mutex);
+
+    const std::string imageName = std::string("crop-") + tag + ".tif";
+    const std::string jsonName = std::string("crop-") + tag + ".json";
+    const std::string imagePath = dump_path(dump.directory, imageName.c_str());
+
+    if (!write_tiff(imagePath, crop)) {
+        report_failure();
+        return;
+    }
+
+    std::ostringstream json;
+    json << "{\n"
+         << "  \"schema\": \"rt-preview-dump/1\",\n"
+         << "  \"format\": \"uint16-tiff\",\n"
+         << "  \"file\": \"" << imageName << "\",\n"
+         << "  \"tag\": \"" << tag << "\",\n"
+         << "  \"width\": " << crop->getWidth() << ",\n"
+         << "  \"height\": " << crop->getHeight() << ",\n"
+         << "  \"channels\": 3,\n"
+         << "  \"visible\": {\"x\": " << visibleX << ", \"y\": "
+         << visibleY << ", \"width\": " << visibleWidth << ", \"height\": "
+         << visibleHeight << "},\n"
+         << "  \"scale\": " << skip << "\n"
+         << "}\n";
+
+    if (!write_text(dump_path(dump.directory, jsonName.c_str()), json.str())) {
+        report_failure();
+    }
+}
+
+} // namespace preview_dump
+
 // todo: bitmask containing desired actions, taken from changesSinceLast
 void ImProcCoordinator::updatePreviewImage(int todo, bool panningRelatedChange,
                                            unsigned request)
@@ -1777,6 +2151,24 @@ void ImProcCoordinator::updatePreviewImage(int todo, bool panningRelatedChange,
                 std::memory_order_release);
 
             previewTimer.cacheHit = baseCacheHit;
+
+            // The base cache state is known now, so the decision layer can be
+            // evaluated for the blocks that follow. A rejected plan never
+            // changes execution: the legacy block sequence below is the only
+            // implementation, and the log records why the plan was refused.
+            if (previewGraphEnabled()) {
+                const auto graphBegin = std::chrono::steady_clock::now();
+                const PreviewGraphResult decision = planPreviewGraph(
+                    todo, panningRelatedChange, fullPipelineRan, baseCacheHit);
+                const auto graphEnd = std::chrono::steady_clock::now();
+                stage::profile_duration(
+                    "preview.graph.decide",
+                    static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            graphEnd - graphBegin)
+                            .count()));
+                logPreviewGraph(decision, todo);
+            }
 
             if ((todo & M_SPOT) && params->spot.enabled && !params->spot.entries.empty()) {
                 spotsDone = true;
@@ -3744,6 +4136,10 @@ void ImProcCoordinator::updatePreviewImage(int todo, bool panningRelatedChange,
                 workimg = ipf.lab2rgb(nprevl, 0, 0, pW, pH, params->icm);
             } catch (std::exception&) {
                 return;
+            }
+
+            if (preview_dump::enabled()) {
+                preview_dump::dump_full_frame(previmg, workimg, scale, todo);
             }
         }
 
