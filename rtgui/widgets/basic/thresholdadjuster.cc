@@ -186,6 +186,9 @@ double ThresholdAdjuster::shapeValue (double a)
 
 void ThresholdAdjuster::selectorChanged ()
 {
+    // The Preview Refresh preference is read per change so a live update
+    // applies to threshold widgets too.
+    delay = App::get().options().rtSettings.previewRefreshMs;
 
     if (delayConnection.connected()) {
         delayConnection.disconnect ();

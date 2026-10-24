@@ -1258,6 +1258,11 @@ void RTWindow::setWindowSize ()
     onConfEventConn.block(false);
 }
 
+int RTWindow::getRecommendedPreviewRefreshMs() const
+{
+    return epanel ? epanel->getRecommendedPreviewRefreshMs() : -1;
+}
+
 void RTWindow::get_position(int& x, int& y) const
 {
     // Call native function

@@ -45,6 +45,7 @@
 #include "procparams.h"
 #include "previewbasecache.h"
 #include "previewquality.h"
+#include "previewrefresh.h"
 #include "profiling.h"
 #include "tweakoperator.h"
 #include "refreshmap.h"
@@ -524,41 +525,55 @@ bool viewportFastEnabled()
     return enabled;
 }
 
-int viewportDeferredEnvMs(const char* name, int defaultValue)
+int viewportDeferredEnvMs(const char* name, int& value)
 {
-    const char* value = g_getenv(name);
+    const char* env = g_getenv(name);
 
-    if (value == nullptr || value[0] == '\0') {
-        return defaultValue;
+    if (env == nullptr || env[0] == '\0') {
+        return 0;
     }
 
     char* end = nullptr;
-    const long long parsed = g_ascii_strtoll(value, &end, 10);
+    const long long parsed = g_ascii_strtoll(env, &end, 10);
 
-    if (end == value) {
-        return defaultValue;
+    if (end == env) {
+        // A malformed override falls back to the preference value.
+        return 0;
     }
 
-    return static_cast<int>(std::clamp<long long>(
+    value = static_cast<int>(std::clamp<long long>(
         parsed, VIEWPORT_DEFERRED_SETTLE_MS_MIN,
         VIEWPORT_DEFERRED_SETTLE_MS_MAX));
+    return 1;
 }
 
-int viewportDeferredSettleMs()
+int viewportDeferredSettleMs(int configuredMs)
 {
     // Unit: ms. Range: VIEWPORT_DEFERRED_SETTLE_MS_MIN..MAX. 0 queues the
     // deferred analysis immediately, reproducing the pre-deferral behaviour.
-    static const int value = viewportDeferredEnvMs(
-        "RT_VIEWPORT_DEFER_MS", VIEWPORT_DEFERRED_SETTLE_MS_DEFAULT);
+    // The Preview Refresh preference is authoritative unless the environment
+    // override is set. The caller snapshots the preference once per request
+    // so the settle and cap cannot see different values mid-pass.
+    int value = 0;
+    if (!viewportDeferredEnvMs("RT_VIEWPORT_DEFER_MS", value)) {
+        value = std::clamp(configuredMs,
+                           VIEWPORT_DEFERRED_SETTLE_MS_MIN,
+                           VIEWPORT_DEFERRED_SETTLE_MS_MAX);
+    }
     return value;
 }
 
-int viewportDeferredMaxWaitMs()
+int viewportDeferredMaxWaitMs(int configuredMs)
 {
     // Unit: ms, measured from the oldest deferral hit. Range:
-    // VIEWPORT_DEFERRED_SETTLE_MS_MIN..MAX.
-    static const int value = viewportDeferredEnvMs(
-        "RT_VIEWPORT_DEFER_MAX_MS", VIEWPORT_DEFERRED_MAX_WAIT_MS_DEFAULT);
+    // VIEWPORT_DEFERRED_SETTLE_MS_MIN..MAX. The deferred pass uses the same
+    // Preview Refresh period for its settle and its cap.
+    int value = 0;
+    if (!viewportDeferredEnvMs("RT_VIEWPORT_DEFER_MAX_MS", value)) {
+        value = std::clamp(configuredMs,
+                           VIEWPORT_DEFERRED_SETTLE_MS_MIN,
+                           VIEWPORT_DEFERRED_SETTLE_MS_MAX);
+    }
     return value;
 }
 
@@ -1000,7 +1015,8 @@ void ImProcCoordinator::absorbPendingDeferred(int& todo)
 }
 
 int ImProcCoordinator::queueViewportDeferredAnalysis(int todo,
-                                                     unsigned request)
+                                                     unsigned request,
+                                                     int previewRefreshMs)
 {
     // Rebuild the full-frame analysis from the base image already held in
     // oprevi. Base bits such as M_HDR/M_SPOT are over-approximated by several
@@ -1026,14 +1042,15 @@ int ImProcCoordinator::queueViewportDeferredAnalysis(int todo,
                                std::memory_order_relaxed);
 
     pendingDeferredDeadlineUs = viewportDeferredDeadline(
-        pendingDeferredFirstUs, now, viewportDeferredSettleMs(),
-        viewportDeferredMaxWaitMs());
+        pendingDeferredFirstUs, now,
+        viewportDeferredSettleMs(previewRefreshMs),
+        viewportDeferredMaxWaitMs(previewRefreshMs));
 
     viewportDeferredParams = *params;
     viewportDeferredRequest.store(request, std::memory_order_relaxed);
     deferredCropRendered.store(true, std::memory_order_relaxed);
 
-    const bool flushNow = viewportDeferredSettleMs() == 0;
+    const bool flushNow = viewportDeferredSettleMs(previewRefreshMs) == 0;
 
     paramsUpdateMutex.unlock();
 
@@ -1076,7 +1093,22 @@ void ImProcCoordinator::invalidateViewportState()
     forceFullPreview.store(false, std::memory_order_relaxed);
     viewportDeferredRequest.store(0, std::memory_order_relaxed);
     deferredCropRendered.store(false, std::memory_order_relaxed);
+    timingGeneration.fetch_add(1, std::memory_order_relaxed);
+    lastCropMs.store(-1, std::memory_order_relaxed);
+    lastAnalysisMs.store(-1, std::memory_order_relaxed);
     dropPendingDeferred();
+}
+
+int ImProcCoordinator::getRecommendedPreviewRefreshMs() const
+{
+    const int crop = lastCropMs.load(std::memory_order_relaxed);
+    const int analysis = lastAnalysisMs.load(std::memory_order_relaxed);
+
+    if (crop < 0 || analysis < 0) {
+        return -1;
+    }
+
+    return previewRefreshClamp(crop + analysis);
 }
 
 DetailedCrop* ImProcCoordinator::createCrop(::EditDataProvider *editDataProvider, bool isDetailWindow)
@@ -1117,6 +1149,17 @@ void ImProcCoordinator::updatePreviewImage(int todo, bool panningRelatedChange,
         paramsUpdateMutex.unlock();
         return;
     }
+
+    // A deferred catch-up pass is the full-frame analysis the fast path
+    // skipped. Its wall time, added to the crop time of the last fast hit,
+    // feeds the measured Preview Refresh recommendation.
+    const bool wasDeferred =
+        forceFullPreview.load(std::memory_order_relaxed);
+    const unsigned timingGenerationAtStart =
+        timingGeneration.load(std::memory_order_relaxed);
+    const int previewRefreshMs = settings
+        ? settings->previewRefreshMs : PREVIEW_REFRESH_DEFAULT_MS;
+    const auto analysisStart = std::chrono::steady_clock::now();
 
     PreviewTimer previewTimer(todo,
                               g_getenv("RT_PREVIEW_PROFILE") != nullptr);
@@ -1176,8 +1219,14 @@ void ImProcCoordinator::updatePreviewImage(int todo, bool panningRelatedChange,
         previewTimer.viewportCropMs =
             std::chrono::duration_cast<std::chrono::milliseconds>(
                 cropEnd - cropStart).count();
+        if (timingGeneration.load(std::memory_order_relaxed)
+                == timingGenerationAtStart) {
+            lastCropMs.store(static_cast<int>(previewTimer.viewportCropMs),
+                             std::memory_order_relaxed);
+        }
         previewTimer.viewportDeferredTodo =
-            queueViewportDeferredAnalysis(eligibilityTodo, request);
+            queueViewportDeferredAnalysis(eligibilityTodo, request,
+                                          previewRefreshMs);
         {
             MyMutex::MyLock lock(paramsUpdateMutex);
             previewTimer.viewportDeferredHits = pendingDeferredHits;
@@ -3775,6 +3824,17 @@ void ImProcCoordinator::updatePreviewImage(int todo, bool panningRelatedChange,
 
     if (fullPipelineRan) {
         markViewportStateValid(highDetailNeeded);
+
+        if (wasDeferred
+                && timingGeneration.load(std::memory_order_relaxed)
+                    == timingGenerationAtStart) {
+            lastAnalysisMs.store(
+                static_cast<int>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - analysisStart)
+                        .count()),
+                std::memory_order_relaxed);
+        }
     } else {
         // This request did not rebuild the base/analysis state. Never publish
         // it as a valid snapshot, and do not leave a stale deferred request

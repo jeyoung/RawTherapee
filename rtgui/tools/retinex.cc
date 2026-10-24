@@ -527,10 +527,10 @@ Retinex::Retinex () : FoldableToolPanel (this, TOOL_NAME, M ("TP_RETINEX_LABEL")
     grads->setDelay(std::max(options.adjusterMinDelay, options.adjusterMaxDelay));
 
     gam->setAdjusterListener (this);
-    gam->setDelay(std::max(options.adjusterMinDelay, options.adjusterMaxDelay) * 2.5f);
+    gam->setDelay(std::max(options.adjusterMinDelay, options.adjusterMaxDelay));
 
     slope->setAdjusterListener (this);
-    slope->setDelay(std::max(options.adjusterMinDelay, options.adjusterMaxDelay) * 2.5f);
+    slope->setDelay(std::max(options.adjusterMinDelay, options.adjusterMaxDelay));
 
     neigh->setAdjusterListener (this);
     neigh->setDelay(std::max(options.adjusterMinDelay, options.adjusterMaxDelay));

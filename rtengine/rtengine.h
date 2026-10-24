@@ -787,6 +787,13 @@ public:
     /** Returns the height of the preview image.
       * @return the height of the preview image */
     virtual int         getPreviewHeight () = 0;
+    /** Returns the measured Preview Refresh recommendation in milliseconds,
+      * clamped to the supported range, or -1 when no complete refresh has
+      * been measured yet. The default implementation has no measurement. */
+    virtual int         getRecommendedPreviewRefreshMs () const
+    {
+        return -1;
+    }
 
     virtual bool        getHighQualComputed() = 0;
     virtual void        setHighQualComputed() = 0;

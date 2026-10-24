@@ -103,6 +103,7 @@ public:
     void on_realize () override;
     void toggle_fullscreen ();
     void get_position(int& x, int& y) const;
+    int getRecommendedPreviewRefreshMs() const;
 
     void setProgress(double p) override;
     void setProgressStr(const Glib::ustring& str) override;

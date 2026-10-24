@@ -28,28 +28,16 @@ namespace rtengine
 {
 
 /**
- * @brief Delay before the deferred full-frame analysis pass runs.
+ * @brief Bounds of the deferred settle window and max-wait cap.
  *
- * Unit: milliseconds. Range: 0 to VIEWPORT_DEFERRED_SETTLE_MS_MAX. Zero
- * reproduces the pre-deferral behaviour (the analysis is queued immediately).
- *
- * The default must stay above the adjuster's maximum debounce interval
- * (Options::adjusterMaxDelay, 200 ms by default). A shorter settle would fire
- * between two debounced slider updates and coalesce nothing: the drag would
- * still cost one analysis pass per update, just later.
+ * Unit: milliseconds. Both values follow Settings::previewRefreshMs, which the
+ * Preview Refresh preference clamps to 100 to 200 ms. The wider 0 to 1000 ms
+ * range remains for the RT_VIEWPORT_DEFER_MS and RT_VIEWPORT_DEFER_MAX_MS
+ * environment overrides. Zero reproduces the pre-deferral behaviour: the
+ * analysis is queued immediately.
  */
-constexpr int VIEWPORT_DEFERRED_SETTLE_MS_DEFAULT = 250;
 constexpr int VIEWPORT_DEFERRED_SETTLE_MS_MIN = 0;
 constexpr int VIEWPORT_DEFERRED_SETTLE_MS_MAX = 1000;
-
-/**
- * @brief Upper bound on how long the analysis may be postponed while the user
- * keeps interacting.
- *
- * Unit: milliseconds, measured from the oldest deferred hit. Without it a
- * continuous drag would never refresh the navigator, histograms and scopes.
- */
-constexpr int VIEWPORT_DEFERRED_MAX_WAIT_MS_DEFAULT = 500;
 
 /**
  * @brief Granularity of the deferred worker's sleep.

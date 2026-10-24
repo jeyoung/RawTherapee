@@ -425,6 +425,11 @@ public:
         }
     }
 
+    int getRecommendedPreviewRefreshMs() const
+    {
+        return ipc ? ipc->getRecommendedPreviewRefreshMs() : -1;
+    }
+
     //DFProvider interface
     const rtengine::RawImage* getDF() override;
 

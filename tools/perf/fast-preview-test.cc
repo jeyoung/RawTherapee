@@ -9,6 +9,7 @@
 #include <iostream>
 
 #include "rtengine/previewquality.h"
+#include "rtengine/previewrefresh.h"
 #include "rtengine/viewportdefer.h"
 
 namespace
@@ -139,6 +140,19 @@ bool testCropReuse()
     return true;
 }
 
+bool testPreviewRefreshClamp()
+{
+    using namespace rtengine;
+
+    CHECK(previewRefreshClamp(50) == 100);
+    CHECK(previewRefreshClamp(100) == 100);
+    CHECK(previewRefreshClamp(125) == 125);
+    CHECK(previewRefreshClamp(200) == 200);
+    CHECK(previewRefreshClamp(250) == 200);
+
+    return true;
+}
+
 } // namespace
 
 int main()
@@ -160,6 +174,10 @@ int main()
     }
 
     if (!testCropReuse()) {
+        return 1;
+    }
+
+    if (!testPreviewRefreshClamp()) {
         return 1;
     }
 

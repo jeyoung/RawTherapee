@@ -31,11 +31,13 @@
 #include "rtwindow.h"
 #include "splash.h"
 #include "toollocationpref.h"
+#include "widgets/basic/adjuster.h"
 
 #include "rtengine/dfmanager.h"
 #include "rtengine/ffmanager.h"
 #include "rtengine/iccstore.h"
 #include "rtengine/opencl/openclengine.h"
+#include "rtengine/previewrefresh.h"
 #include "rtengine/procparams.h"
 
 #ifdef _OPENMP
@@ -842,6 +844,47 @@ Gtk::Widget* Preferences::getPerformancePanel()
 
     Gtk::Box* vbPerformance = Gtk::manage ( new Gtk::Box(Gtk::ORIENTATION_VERTICAL) );
     vbPerformance->set_spacing (4);
+
+    Gtk::Frame* fpreviewrefresh = Gtk::manage(
+        new Gtk::Frame(M("PREFERENCES_PREVIEW_REFRESH")));
+    Gtk::Box* vbpreviewrefresh = Gtk::manage(
+        new Gtk::Box(Gtk::ORIENTATION_VERTICAL));
+    vbpreviewrefresh->set_spacing(4);
+
+    Gtk::Label* lpreviewrefresh = Gtk::manage(new Gtk::Label(
+        M("PREFERENCES_PREVIEW_REFRESH_LABEL"), Gtk::ALIGN_START));
+    lpreviewrefresh->set_tooltip_text(
+        M("PREFERENCES_PREVIEW_REFRESH_TOOLTIP"));
+    vbpreviewrefresh->pack_start(*lpreviewrefresh, Gtk::PACK_SHRINK);
+
+    previewRefreshScale = Gtk::manage(
+        new Gtk::Scale(Gtk::ORIENTATION_HORIZONTAL));
+    previewRefreshScale->set_tooltip_text(
+        M("PREFERENCES_PREVIEW_REFRESH_TOOLTIP"));
+    previewRefreshScale->set_draw_value(false);
+    previewRefreshScale->set_digits(0);
+    previewRefreshScale->set_range(rtengine::PREVIEW_REFRESH_MIN_MS,
+                                   rtengine::PREVIEW_REFRESH_MAX_MS);
+    previewRefreshScale->set_increments(1, 10);
+    previewRefreshScale->set_value(rtengine::PREVIEW_REFRESH_DEFAULT_MS);
+    // Slow (longest interval) on the left, fast on the right.
+    previewRefreshScale->set_inverted(true);
+    previewRefreshScale->add_mark(rtengine::PREVIEW_REFRESH_MAX_MS,
+                                  Gtk::POS_BOTTOM,
+                                  M("PREFERENCES_PREVIEW_REFRESH_SLOW"));
+    previewRefreshScale->add_mark(rtengine::PREVIEW_REFRESH_MIN_MS,
+                                  Gtk::POS_BOTTOM,
+                                  M("PREFERENCES_PREVIEW_REFRESH_FAST"));
+    vbpreviewrefresh->pack_start(*previewRefreshScale, Gtk::PACK_SHRINK);
+
+    previewRefreshRecommendedLabel = Gtk::manage(
+        new Gtk::Label("", Gtk::ALIGN_START));
+    vbpreviewrefresh->pack_start(*previewRefreshRecommendedLabel,
+                                 Gtk::PACK_SHRINK);
+
+    fpreviewrefresh->add(*vbpreviewrefresh);
+    vbPerformance->pack_start(*fpreviewrefresh, Gtk::PACK_SHRINK, 4);
+    updatePreviewRefreshRecommended();
 
     Gtk::Frame* fprevdemo = Gtk::manage(new Gtk::Frame(M("PREFERENCES_PREVDEMO")));
     Gtk::Box* hbprevdemo = Gtk::manage(new Gtk::Box());
@@ -1970,6 +2013,10 @@ void Preferences::storePreferences()
 
     moptions.dateFormat = dateformat->get_text();
     moptions.panAccelFactor = (int)panFactor->get_value();
+    moptions.rtSettings.previewRefreshMs = rtengine::previewRefreshClamp(
+        static_cast<int>(previewRefreshScale->get_value()));
+    moptions.adjusterMinDelay = moptions.adjusterMaxDelay =
+        moptions.rtSettings.previewRefreshMs;
     moptions.rememberZoomAndPan = rememberZoomPanCheckbutton->get_active();
     moptions.fbShowDateTime = showDateTime->get_active();
     moptions.fbShowBasicExif = showBasicExif->get_active();
@@ -2221,6 +2268,24 @@ void Preferences::storePreferences()
     moptions.thumbnailRankColorMode = thumbnailRankColorMode->get_active() ? Options::ThumbnailPropertyMode::XMP : Options::ThumbnailPropertyMode::PROCPARAMS;
 }
 
+void Preferences::updatePreviewRefreshRecommended()
+{
+    if (!previewRefreshRecommendedLabel) {
+        return;
+    }
+
+    const int recommended =
+        parent ? parent->getRecommendedPreviewRefreshMs() : -1;
+
+    if (recommended < 0) {
+        previewRefreshRecommendedLabel->set_text(
+            M("PREFERENCES_PREVIEW_REFRESH_RECOMMENDED_NONE"));
+    } else {
+        previewRefreshRecommendedLabel->set_text(Glib::ustring::compose(
+            M("PREFERENCES_PREVIEW_REFRESH_RECOMMENDED"), recommended));
+    }
+}
+
 void Preferences::fillPreferences()
 {
 
@@ -2292,6 +2357,8 @@ void Preferences::fillPreferences()
     }
 
     cprevdemo->set_active (moptions.prevdemo);
+    previewRefreshScale->set_value(moptions.rtSettings.previewRefreshMs);
+    updatePreviewRefreshRecommended();
     languages->set_active_id(moptions.language);
     ckbLangAutoDetect->set_active(moptions.languageAutoDetect);
     int themeNbr = getThemeRowNumber(moptions.theme);
@@ -2565,6 +2632,7 @@ void Preferences::okPressed()
     const Glib::ustring cacheDir = options.rtSettings.cacheDir;
     options.copyFrom(&moptions);
     options.rtSettings.cacheDir = cacheDir;
+    Adjuster::setGlobalDelay(options.rtSettings.previewRefreshMs);
     rtengine::opencl::reconfigure();
     options.filterOutParsedExtensions();
 
@@ -3094,6 +3162,8 @@ void Preferences::onResetToDefaultClicked()
 
         App::get().mut_options().copyFrom(&moptions);
         App::get().mut_options().rtSettings.cacheDir = cacheDir;
+        Adjuster::setGlobalDelay(
+            App::get().options().rtSettings.previewRefreshMs);
         App::get().mut_options().save();
         rtengine::opencl::reconfigure();
     }

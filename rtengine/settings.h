@@ -20,6 +20,9 @@
 #pragma once
 
 #include <glibmm/ustring.h>
+
+#include "previewrefresh.h"
+
 namespace rtengine
 {
 
@@ -60,6 +63,8 @@ public:
     Glib::ustring   openCLDevice;           ///< Selected OpenCL device, empty = automatic.
     Glib::ustring   openCLRusticlDriver;    ///< Rusticl driver override, empty = auto-detect.
     Glib::ustring   cacheDir;               ///< Base directory for cached data such as compiled kernels.
+    int             previewRefreshMs = PREVIEW_REFRESH_DEFAULT_MS;
+                                            ///< Preview debounce in ms; also the deferred analysis settle and max wait.
 
     Glib::ustring   adobe;                  // filename of AdobeRGB1998 profile (default to the bundled one)
     Glib::ustring   prophoto;               // filename of Prophoto     profile (default to the bundled one)

@@ -120,6 +120,13 @@ protected:
     std::atomic<bool> forceFullPreview;
     std::atomic<unsigned> viewportDeferredRequest;
     std::atomic<bool> deferredCropRendered;
+    // Durations of the last complete refresh, in milliseconds. -1 means no
+    // measurement yet; getRecommendedPreviewRefreshMs() combines them.
+    // timingGeneration invalidates an in-flight pass when the image or scale
+    // changes, so the label cannot mix measurements from two images.
+    std::atomic<unsigned> timingGeneration{0};
+    std::atomic<int> lastCropMs{-1};
+    std::atomic<int> lastAnalysisMs{-1};
     ProcParams viewportFullParams;
     ProcParams viewportLutParams;
     ProcParams viewportDeferredParams;
@@ -277,7 +284,8 @@ protected:
     void prepareViewportLuts(int todo);
     void updateViewportLutSnapshot(int todo);
     void renderCrops(int todo, bool force);
-    int queueViewportDeferredAnalysis(int todo, unsigned request);
+    int queueViewportDeferredAnalysis(int todo, unsigned request,
+                                      int previewRefreshMs);
     void markViewportStateValid(bool highDetailNeeded);
     void invalidateViewportState();
     void ensureDeferredWatcher();
@@ -521,6 +529,8 @@ public:
     {
         return pH;
     }
+
+    int getRecommendedPreviewRefreshMs() const override;
 
     DetailedCrop* createCrop  (::EditDataProvider *editDataProvider, bool isDetailWindow) override;
 

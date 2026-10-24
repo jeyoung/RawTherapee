@@ -1712,6 +1712,11 @@ Glib::ustring EditorPanel::getFileName () const
     }
 }
 
+int EditorPanel::getRecommendedPreviewRefreshMs() const
+{
+    return tpc ? tpc->getRecommendedPreviewRefreshMs() : -1;
+}
+
 // TODO!!!
 void EditorPanel::procParamsChanged(
     const rtengine::procparams::ProcParams* params,

@@ -20,6 +20,7 @@
 
 #include <sigc++/slot.h>
 #include <cmath>
+#include <unordered_set>
 
 #include "multilangmgr.h"
 #include "options.h"
@@ -30,6 +31,15 @@
 namespace {
 
 constexpr int MIN_RESET_BUTTON_HEIGHT = 17;
+
+// Every live adjuster, so a preference change can reach them without a
+// restart. Adjusters are created and destroyed on the GUI thread. The set is
+// leaked deliberately so widget teardown at exit cannot outlive it.
+std::unordered_set<Adjuster*>& adjusterRegistry()
+{
+    static auto* registry = new std::unordered_set<Adjuster*>();
+    return *registry;
+}
 
 double one2one(double val)
 {
@@ -71,6 +81,7 @@ Adjuster::Adjuster(
     slider2value(slider2value ? slider2value : &one2one)
 
 {
+    adjusterRegistry().insert(this);
     set_hexpand(true);
     set_vexpand(false);
 
@@ -183,6 +194,7 @@ Adjuster::Adjuster(
 
 Adjuster::~Adjuster ()
 {
+    adjusterRegistry().erase(this);
 
     sliderChange.block();
     spinChange.block();
@@ -694,6 +706,13 @@ void Adjuster::setDelay(unsigned int min_delay_ms, unsigned int max_delay_ms)
 {
     spinChange.setDelay(min_delay_ms, max_delay_ms);
     sliderChange.setDelay(min_delay_ms, max_delay_ms);
+}
+
+void Adjuster::setGlobalDelay(unsigned int ms)
+{
+    for (Adjuster* adjuster : adjusterRegistry()) {
+        adjuster->setDelay(ms, ms);
+    }
 }
 
 void Adjuster::showIcons(bool yes)

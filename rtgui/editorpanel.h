@@ -196,6 +196,7 @@ public:
     void close ();
     Glib::ustring getShortName ();
     Glib::ustring getFileName () const;
+    int getRecommendedPreviewRefreshMs() const;
     bool handleShortcutKey (GdkEventKey* event);
 
     bool getIsProcessing() const

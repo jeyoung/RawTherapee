@@ -135,5 +135,8 @@ public:
     void trimValue (int &val) const;
     void setLogScale(double base, double pivot, bool anchorMiddle = false);
     void setDelay(unsigned int min_delay_ms, unsigned int max_delay_ms = 0);
+    // Apply one debounce period to every live adjuster. The Preview Refresh
+    // preference is authoritative, so this overrides per-tool setDelay calls.
+    static void setGlobalDelay(unsigned int ms);
     void showIcons(bool yes);
 };

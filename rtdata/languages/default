@@ -2248,6 +2248,13 @@ PREFERENCES_PREVDEMO;Preview Demosaic Method
 PREFERENCES_PREVDEMO_FAST;Fast
 PREFERENCES_PREVDEMO_LABEL;Demosaicing method used for the preview at <100% zoom:
 PREFERENCES_PREVDEMO_SIDECAR;As in PP3
+PREFERENCES_PREVIEW_REFRESH;Preview Refresh
+PREFERENCES_PREVIEW_REFRESH_FAST;Fast
+PREFERENCES_PREVIEW_REFRESH_LABEL;Refresh interval:
+PREFERENCES_PREVIEW_REFRESH_RECOMMENDED;Recommended: %1 ms
+PREFERENCES_PREVIEW_REFRESH_RECOMMENDED_NONE;Recommended: —
+PREFERENCES_PREVIEW_REFRESH_SLOW;Slow
+PREFERENCES_PREVIEW_REFRESH_TOOLTIP;Sets how long RawTherapee waits after a slider or spin-box change before refreshing the preview. The histogram and navigator use the same period. The recommended value is measured from the last refresh and avoids queueing.
 PREFERENCES_PRINTER;Printer (Soft-Proofing)
 PREFERENCES_PROFILEHANDLING;Processing Profile Handling
 PREFERENCES_PROFILELOADPR;Processing profile loading priority
