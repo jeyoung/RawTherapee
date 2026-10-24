@@ -3,8 +3,9 @@
 The viewport fast path is enabled by default for safe post-base parameter
 changes. `RT_VIEWPORT_FAST=0` disables it for comparison or troubleshooting.
 It rebuilds the parent LUTs that visible `rtengine::Crop` objects consume from
-the cached full-frame analysis state, renders the crop ROI first, and then
-queues one normal full-frame pass so the navigator, preview image, `workimg`,
+the cached full-frame analysis state, renders the crop ROI immediately, and
+accumulates the analysis stages it skipped. The accumulated pass runs once
+after the interaction settles so that the navigator, preview image, `workimg`,
 histograms, scopes and listeners catch up.
 
 With the kill switch set to `0`, every request takes the existing full path
@@ -14,8 +15,8 @@ preview.
 
 ## Scope
 
-This first implementation covers requests that cannot change the base image or
-the full-frame analysis inputs:
+This implementation covers requests that cannot change the base image or the
+full-frame analysis inputs:
 
 - `M_AUTOEXP`, `M_RGBCURVE`, `M_LUMACURVE`, `M_LUMINANCE`, `M_COLOR`,
   `M_CROP` and `M_MINUPDATE`;
@@ -23,6 +24,11 @@ the full-frame analysis inputs:
   with them, but only when the corresponding parameters are unchanged. Active
   Fattal, dehaze or spot removal is rejected, because the normal path would
   re-apply those filters.
+
+The transform-stage family (`M_TRANSFORM`) is not promoted. `Crop::update()`
+does render ROI transforms, but the full validation could not be completed
+with the available headless GUI tooling, so the gate stays closed and the
+follow-up is recorded below.
 
 The fast path never calls `ipf.rgbProc` on the full preview, `firstAnalysis()`,
 locallab, CIE, Fattal/dehaze, spot removal or film-negative processing.
@@ -34,8 +40,8 @@ locallab, CIE, Fattal/dehaze, spot removal or film-negative processing.
 last completed full-frame pass. It rejects the request if any of the following
 holds:
 
-- the kill switch is set to `0`, no full pass completed, a deferred pass is
-  pending, or the high-detail state changed or is still being computed;
+- the kill switch is set to `0`, no full pass completed, or the high-detail
+  state changed or is still being computed;
 - the request contains `M_PREPROC`, `M_RAW`, `M_WB`, `M_INIT`,
   `M_LINDENOISE`, `M_MONITOR`, `M_TRANSFORM`, `M_CSHARP`, `M_RETINEX`,
   `M_HIGHQUAL` or `M_BLURMAP`, or any bit outside the allowed set above;
@@ -86,24 +92,57 @@ the same code.
 3. The crop todo is sanitised to
    `M_CROP|M_MINUPDATE|M_AUTOEXP|M_TRANSFORM|M_RGBCURVE|M_LUMACURVE|M_LUMINANCE|M_COLOR`;
    over-approximated `M_HDR`/`M_SPOT` and all base bits are removed.
-4. Crops with a listener are updated immediately.
-5. A deferred analysis todo of
-   `M_MONITOR|M_RGBCURVE|M_LUMACURVE|M_LUMINANCE|M_COLOR` (plus the original
-   downstream bits) is merged into `changeSinceLast` under
-   `paramsUpdateMutex`, and `forceFullPreview` is set.
-6. The normal `process()` loop runs that request through the full path. It
-   updates `previmg`, `workimg`, histograms/scopes and listeners, re-renders
-   the crops for correctness, and only then marks the viewport state valid
-   again.
+4. Crops with a listener are updated immediately. This is the only work the
+   interaction pays for.
+5. The analysis stages the hit skipped are accumulated in
+   `pendingDeferredMask` under `paramsUpdateMutex`, with a deadline. The hit
+   does not queue a full-frame pass and does not block further fast hits.
+6. When the deadline expires, `flushDeferredAnalysis()` merges the accumulated
+   mask into `changeSinceLast`, sets `forceFullPreview` and starts the normal
+   `process()` loop. It updates `previmg`, `workimg`, histograms/scopes and
+   listeners, re-renders the crops, and only then marks the viewport state
+   valid again.
 
-`forceFullPreview` is not cleared by stale-request bailouts. If a newer request
-arrives, the normal bailout merges the old todo into `changeSinceLast`, so the
-deferred analysis is either kept queued or coalesced with the newer request.
-The deferred pass always includes `M_MONITOR` so it cannot be skipped by the
-outer full-frame block condition. When the deferred request still matches the
-request generation and the full parameter snapshot of the fast path, the full
-pass suppresses the duplicate crop render; a newer request gets a normal crop
-render.
+`forceFullPreview` is set when the analysis is queued, not when the hit is
+served, and it no longer blocks eligibility. `absorbPendingDeferred()` folds a
+pending mask into any request that takes the normal path, so a base-changing
+edit cannot skip the stages a fast hit already applied to the crop.
+`markViewportStateValid()` publishes the snapshot only after the full-frame
+block ran, and it keeps the per-hit bookkeeping when a newer burst was queued
+while the pass was running.
+
+## Deferred analysis
+
+`rtengine/viewportdefer.h` holds the pure decision logic:
+
+- `viewportDeferredMask()` forces `M_MONITOR|M_RGBCURVE|M_LUMACURVE
+  |M_LUMINANCE|M_COLOR` and strips every base bit;
+- `viewportDeferredDeadline()` re-arms the settle window on each hit and caps
+  the wait from the first hit of the burst;
+- `viewportCropRenderReusable()` allows the deferred pass to skip the crop
+  render only while the burst contains a single hit.
+
+| Setting | Default | Unit | Range | Purpose |
+|---|---:|---|---|---|
+| `VIEWPORT_DEFERRED_SETTLE_MS` | 250 | ms | 0–1000 | Quiet period before the analysis runs |
+| `VIEWPORT_DEFERRED_MAX_WAIT_MS` | 500 | ms | 0–1000 | Cap from the first hit |
+| `VIEWPORT_DEFERRED_POLL_MS` | 10 | ms | — | Watcher sleep while an analysis is pending |
+| `VIEWPORT_DEFERRED_IDLE_POLL_MS` | 100 | ms | — | Watcher sleep while idle |
+
+The settle default must stay above the adjuster's maximum debounce interval
+(`Options::adjusterMaxDelay`, 200 ms). A shorter window fires between two
+debounced updates and coalesces nothing. `RT_VIEWPORT_DEFER_MS` and
+`RT_VIEWPORT_DEFER_MAX_MS` override the two settings; `RT_VIEWPORT_DEFER_MS=0`
+queues the analysis immediately and reproduces the pre-deferral behaviour.
+`RT_VIEWPORT_FAST=0` still disables the whole path.
+
+The watcher is one low-priority `Glib::Thread` per coordinator, created on the
+first deferred hit and joined in the destructor. `stopProcessing()` sets a
+pause flag and drops the pending mask before joining the render thread, so an
+image switch or the rough/final loading handoff cannot resurrect work against
+buffers that are about to be rebuilt. `startProcessing(int)` clears the pause.
+`invalidateViewportState()`, `assign()`, `freeAll()`, `setScale()` and
+`setTweakOperator()` drop the pending mask as well.
 
 ## State validity and invalidation
 
@@ -134,12 +173,14 @@ source planes remain valid.
 With `RT_PREVIEW_PROFILE=1` each completed request reports one of:
 
 ```text
-preview update: 40 ms todo=0x1009f cache=0 viewport=fast crop_ms=39 deferred_todo=0x1009f
-preview update: 92 ms todo=0x401f cache=0 viewport=deferred-analysis
+preview update: 40 ms todo=0x1009f cache=0 viewport=fast crop_ms=39 deferred_todo=0x1005f deferred_hits=3
+preview update: 92 ms todo=0x1005f cache=0 viewport=deferred-analysis
 preview update: 113 ms todo=0x1009f cache=0 viewport=fallback reason=switch-off
 ```
 
-Fallback reasons include `no-complete-full-state`, `base-request`,
+`deferred_hits` is the size of the burst the hit belongs to; `1` means the
+deferred pass may reuse the crop render, greater values mean it renders the
+crops again. Fallback reasons include `no-complete-full-state`, `base-request`,
 `auto-exposure`, `lab-contrast`, `highlight-recovery`, `cie`, `local-lab`,
 `hdr-processing`, `spot-removal` and the individual base-parameter names.
 
@@ -177,9 +218,49 @@ and a fresh settings directory:
   (`compare -metric AE` = 0; only the TIFF `DateTime` tag differed);
 - known user-modified files were left unstaged.
 
+### Deferred analysis (issue #23)
+
+Unit test: `tools/perf/test-fast-preview.sh build/cpu-issue-23-viewport-defer`
+PASS, covering the deferred mask, the deadline cap, and the single-hit crop
+reuse rule.
+
+Method: CPU build, 10.2 MP PEF, neutral profile
+(`HistogramMatching=false`), Xvfb 1600x1000 with `GDK_BACKEND=x11`, one
+sustained 57-event Exposure Compensation drag, default threading. The counts
+come from `RT_PREVIEW_PROFILE=1`; each configuration was run once, so the
+timings are context rather than a benchmark. `GDK_BACKEND=x11` is required on
+a Wayland host: without it GDK connects to the host compositor and the Xvfb
+window tree stays empty.
+
+| Configuration | fast hits | analyses | fallbacks | samples | p50 | p95 |
+|---|---:|---:|---:|---:|---:|---:|
+| `RT_VIEWPORT_FAST=0` | 0 | 0 | 13 | 13 | 59 ms | 75 ms |
+| `RT_VIEWPORT_DEFER_MS=0` | 9 | 9 | 4 | 22 | 26 ms | 74 ms |
+| default (250 / 500 ms) | 8 | 3 | 4 | 15 | 16 ms | 79 ms |
+
+- Fast hits cost 12–15 ms for the visible crop; the deferred analysis costs
+  39–41 ms because a burst of more than one hit re-renders the crops.
+- The 250 ms settle coalesces the burst into one analysis, as designed
+  (8–9 hits, 3 analyses); the 500 ms cap fires during a continuous drag.
+- p95 includes the one-time first-edit `no-complete-full-state` pass, so it
+  is not the interaction latency; the per-kind figures above are.
+- `compare -metric AE` = 0 for the full 1600x1000 final frame between
+  `RT_VIEWPORT_DEFER_MS=0` and the default, and between `RT_VIEWPORT_FAST=0`
+  and the default. The comparison includes the histogram, navigator and
+  status text.
+- The two `fallbacks` beyond the initial load are the first-edit
+  `no-complete-full-state` pass and a monitor-only update, both expected.
+
 ## Known limitations and follow-ups
 
-- Add a cached `lhist16` so non-zero Lab contrast can use the fast path.
+- Promote `M_TRANSFORM` once ROI-transform parity is validated on the GUI.
+  The crop path already accepts the bit, but the headless checks could not
+  drive the Lens/Geometry sliders reliably, so the gate remains closed rather
+  than accepted unmeasured.
+- Add a cached `lhist16` so non-zero Lab contrast can use the fast path. The
+  histogram is built from `oprevl` after `rgbProc()`, so it includes the tone
+  curve; a cached copy is only exact for Lab-only edits and needs a
+  `rgbProc()` refresh when the request also carries `M_RGBCURVE`.
 - Handle active Fattal/dehaze/spot correctly rather than falling back.
 - Validate crop ROI moves, panning/zooming cache reuse and detail windows on a
   wider image set, including OpenCL.
@@ -187,6 +268,10 @@ and a fresh settings directory:
   fast-on/off regression for it.
 - Evaluate whether the deferred pass can skip `M_AUTOEXP` entirely when the
   corresponding auto flags are off.
+- Progressive crop resolution during a drag is not implemented. It would
+  multiply `CropHandler::getWindow()`'s skip while a gesture is active and
+  must keep the colour picker and the edit-subscriber object map at full
+  resolution.
 
 ## FAST preview toggle interaction
 

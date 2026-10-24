@@ -19,7 +19,9 @@ tools/perf/bench-preview.sh /usr/local/bin/rawtherapee \
 ```
 
 It starts a private Xvfb display, opens the Exposure tool, drags Exposure
-Compensation, and prints warm p50/p95. See `tools/perf/README.md`.
+Compensation, and prints warm p50/p95. See `tools/perf/README.md`. On a
+Wayland host, export `GDK_BACKEND=x11` and unset `WAYLAND_DISPLAY`; otherwise
+GDK connects to the host compositor and the Xvfb window tree stays empty.
 
 ## Manual procedure
 
@@ -66,9 +68,14 @@ Shadows/Highlights edits:
 
 The 100% Exposure sequence contains one 3196 ms outlier; excluding it would
 lower the p95, but the raw sequence is reported. The current interactive
-target p95 <100 ms at fit and <250 ms at 100% is **not met**. The next preview
-change should be progressive/lower-resolution rendering rather than another
-cache.
+target p95 <100 ms at fit and <250 ms at 100% is **not met**.
+
+The analysis pass is now deferred to the end of the interaction burst, so a
+drag no longer pays one whole-frame pass per update (see
+`devnotes/perf/VIEWPORT_FAST_PATH.md`, "Deferred analysis"). The table above
+still counts each completed request, so its p50 includes both the viewport
+crop and the analysis. The remaining interactive lever is progressive
+lower-resolution crop rendering during the gesture, not another cache.
 
 The timer starts after stale-request rejection; cold renders include initial
 image loading and are reported separately.
