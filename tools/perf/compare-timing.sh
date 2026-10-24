@@ -3,7 +3,7 @@
 #
 # Usage:
 #   tools/perf/compare-timing.sh --baseline-dir DIR --build-dir DIR \
-#       --image FILE [--pp3 FILE] [--threads 8] [--runs 3] [--out DIR]
+#       --image FILE [--pp3 FILE] [--threads 8] [--runs 3] [--out DIR] [--fast]
 
 set -euo pipefail
 
@@ -16,6 +16,7 @@ image=""
 pp3=""
 threads=8
 runs=3
+fast=0
 out=""
 
 while [ "$#" -gt 0 ]; do
@@ -27,6 +28,7 @@ while [ "$#" -gt 0 ]; do
         --threads) threads="$2"; shift 2 ;;
         --runs) runs="$2"; shift 2 ;;
         --out) out="$2"; shift 2 ;;
+        --fast) fast=1; shift ;;
         -h|--help) sed -n '2,8p' "$0"; exit 0 ;;
         *) die "unknown option: $1" ;;
     esac
@@ -50,6 +52,9 @@ for run in $(seq 1 "$runs"); do
         target="$out/out/$variant-$run.tif"
         args=(--build-dir "$dir" --image "$image" --out "$target"
               --gpu off --threads "$threads")
+        if [ "$fast" -eq 1 ]; then
+            args+=(--fast)
+        fi
         if [ -n "$pp3" ]; then
             args+=(--pp3 "$pp3")
         fi
