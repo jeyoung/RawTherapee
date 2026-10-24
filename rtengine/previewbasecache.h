@@ -33,6 +33,8 @@
 
 #include "colortemp.h"
 #include "imagefloat.h"
+#include "stage/stage_buffer.h"
+#include "stage/stage_store.h"
 
 namespace rtengine
 {
@@ -62,6 +64,7 @@ public:
 
     struct Key {
         const ImageSource* source = nullptr;
+        Glib::ustring sourceIdentity;
         std::uint64_t sourceGeneration = 0;
         int frame = 0;
         int sensorType = 0;
@@ -103,9 +106,69 @@ public:
             return tie() == other.tie();
         }
 
+        /*
+         * Stable key for the persistent store. It deliberately excludes the
+         * process-local ImageSource pointer and the transient generation
+         * counter; sourceIdentity carries the file identity instead.
+         */
+        std::string persistentKey() const
+        {
+            std::string material;
+            const auto add = [&material](const void* data, std::size_t bytes) {
+                material.append(static_cast<const char*>(data), bytes);
+            };
+            const auto addString = [&add, &material](const Glib::ustring& value) {
+                const std::uint32_t bytes = static_cast<std::uint32_t>(value.bytes());
+                add(&bytes, sizeof(bytes));
+                material.append(value.data(), value.bytes());
+            };
+            const auto addPod = [&add](const auto& value) {
+                add(&value, sizeof(value));
+            };
+
+            addString(sourceIdentity);
+            addPod(frame);
+            addPod(sensorType);
+            addPod(rotateDegree);
+            addPod(raw);
+            addPod(wbTemp);
+            addPod(wbGreen);
+            addPod(wbEqual);
+            addPod(wbObserver);
+            addPod(highDetailNeeded);
+            addPod(highDetailPreprocessComputed);
+            addPod(highDetailRawComputed);
+            addString(bayerMethod);
+            addPod(bayerCcSteps);
+            addString(xtransMethod);
+            addPod(xtransCcSteps);
+            addPod(rawExposure);
+            addPod(hrEnabled);
+            addString(hrMethod);
+            addPod(hrBlend);
+            addPod(hrThreshold);
+            addPod(clampOOG);
+            addPod(rgbSourceModified);
+            addPod(transform);
+            addPod(scale);
+            addPod(fullWidth);
+            addPod(fullHeight);
+            addPod(width);
+            addPod(height);
+
+            gchar* digest = g_compute_checksum_for_data(
+                G_CHECKSUM_SHA256,
+                reinterpret_cast<const guchar*>(material.data()),
+                static_cast<gsize>(material.size()));
+            std::string key = digest != nullptr ? digest : "";
+            g_free(digest);
+            return key;
+        }
+
     private:
         auto tie() const -> decltype(std::tie(
             source,
+            sourceIdentity,
             sourceGeneration,
             frame,
             sensorType,
@@ -138,6 +201,7 @@ public:
         {
             return std::tie(
                 source,
+                sourceIdentity,
                 sourceGeneration,
                 frame,
                 sensorType,
@@ -172,8 +236,16 @@ public:
 
     PreviewBaseCache()
         : enabled_(!envDisabled(PREVIEW_BASE_CACHE_ENV)),
-          profileEnabled_(profileEnvironmentEnabled())
+          profileEnabled_(profileEnvironmentEnabled()),
+          persistentEnabled_(envEnabled("RT_STAGE_STORE"))
     {
+        const char* maxMb = g_getenv("RT_STAGE_STORE_MAX_MB");
+        if (maxMb != nullptr && maxMb[0] != '\0') {
+            const long long value = g_ascii_strtoll(maxMb, nullptr, 10);
+            if (value > 0) {
+                storeMaxBytes_ = static_cast<std::uint64_t>(value) * 1024u * 1024u;
+            }
+        }
     }
 
     // Used by the standalone regression test to exercise both modes without
@@ -192,6 +264,26 @@ public:
     bool profileEnabled() const
     {
         return profileEnabled_;
+    }
+
+    void setPersistentRoot(const std::string& root)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!persistentEnabled_ || root.empty()) {
+            store_.reset();
+            persistentRoot_.clear();
+            return;
+        }
+        if (store_ && persistentRoot_ == root) {
+            return;
+        }
+        try {
+            store_ = std::make_unique<stage::StageStore>(root);
+            persistentRoot_ = root;
+        } catch (...) {
+            store_.reset();
+            persistentRoot_.clear();
+        }
     }
 
     static bool fits(int width, int height)
@@ -228,6 +320,13 @@ public:
         }
 
         std::lock_guard<std::mutex> lock(mutex_);
+
+        if (store_ && (!valid_ || !(key_ == key))) {
+            std::string persistentReason;
+            if (tryPersistent(key, destination, persistentReason)) {
+                return true;
+            }
+        }
 
         if (!valid_ || !entry_) {
             entry_.reset();
@@ -369,6 +468,17 @@ public:
         dirtyReason_.clear();
         ++stores_;
 
+        if (store_ && !key.sourceIdentity.empty()) {
+            const RtStageBuffer buffer = stage::view(*entry_);
+            const std::size_t rowBytes = stage::row_bytes(buffer);
+            const std::uint64_t entryBytes =
+                static_cast<std::uint64_t>(rowBytes) * buffer.height * buffer.planes;
+            if (store_->bytes() + entryBytes <= storeMaxBytes_) {
+                store_->put(key.persistentKey(), buffer,
+                            stage::StageStoreMetadata{"preview-base", "1"});
+            }
+        }
+
         if (profileEnabled_) {
             std::fprintf(stderr,
                          "preview-base-cache: store %dx%d scale=%d gen=%llu\n",
@@ -494,6 +604,42 @@ private:
             || envEnabled("RT_PREVIEW_PROFILE");
     }
 
+    bool tryPersistent(const Key& key, Imagefloat* destination, std::string& reason)
+    {
+        if (!store_ || key.sourceIdentity.empty() || destination == nullptr
+                || destination->getWidth() != key.width
+                || destination->getHeight() != key.height) {
+            reason = "persistent-destination-mismatch";
+            return false;
+        }
+
+        std::unique_ptr<Imagefloat> restored;
+        try {
+            restored = std::make_unique<Imagefloat>(key.width, key.height);
+        } catch (const std::bad_alloc&) {
+            reason = "persistent-alloc-failed";
+            return false;
+        }
+
+        stage::StageStoreMetadata metadata;
+        RtStageBuffer restoredView = stage::view(*restored);
+        if (!store_->get(key.persistentKey(), restoredView, metadata)
+                || metadata.stage != "preview-base") {
+            reason = "persistent-miss";
+            return false;
+        }
+
+        restored->copyData(destination);
+        entry_ = std::move(restored);
+        key_ = key;
+        valid_ = true;
+        dirty_ = false;
+        dirtyReason_.clear();
+        ++hits_;
+        logProbe("persistent-hit", std::string());
+        return true;
+    }
+
     void noteMiss(const std::string& reason)
     {
         ++missReasons_[reason];
@@ -527,6 +673,10 @@ private:
 
     const bool enabled_;
     const bool profileEnabled_;
+    const bool persistentEnabled_ = false;
+    std::uint64_t storeMaxBytes_ = 512u * 1024u * 1024u;
+    std::unique_ptr<stage::StageStore> store_;
+    std::string persistentRoot_;
 
     mutable std::mutex mutex_;
     std::unique_ptr<Imagefloat> entry_;

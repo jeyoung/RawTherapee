@@ -177,7 +177,36 @@ bool testSizeBound()
     return true;
 }
 
-} // namespace
+
+bool testPersistentKey()
+{
+    PreviewBaseCache::Key base;
+    base.sourceIdentity = "image:1";
+    base.wbTemp = 5500.0;
+    base.scale = 10;
+    const std::string key = base.persistentKey();
+
+    CHECK(key.size() == 64);
+    CHECK(base.persistentKey() == key);
+
+    PreviewBaseCache::Key other = base;
+    other.sourceIdentity = "image:2";
+    CHECK(other.persistentKey() != key);
+
+    other = base;
+    other.wbTemp = 5600.0;
+    CHECK(other.persistentKey() != key);
+
+    other = base;
+    other.scale = 5;
+    CHECK(other.persistentKey() != key);
+
+    other = base;
+    other.sourceGeneration = 99;
+    CHECK(other.persistentKey() == key);
+    return true;
+}
+}
 
 int main()
 {
@@ -186,7 +215,8 @@ int main()
             || !testStoreRestoreAndGeneration()
             || !testDestinationMismatchInvalidates()
             || !testDirtyAndClear()
-            || !testSizeBound()) {
+            || !testSizeBound()
+            || !testPersistentKey()) {
         std::cout << "preview-base-cache-test: FAIL\n";
         return 1;
     }

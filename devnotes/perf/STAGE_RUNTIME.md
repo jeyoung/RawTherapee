@@ -152,6 +152,28 @@ case-insensitive keys, invalid and traversal keys, a corrupted payload byte,
 two truncations, wrong geometry, short destination pitches, atomic overwrite,
 erase, contains, clear, a small byte budget and concurrent writers.
 
+## Persistent preview cache
+
+`RT_STAGE_STORE=1` enables a checksummed copy of the preview base image in
+`$RT_CACHE/stages` (or the configured settings cache directory). The key is a
+SHA-256 of the stable image identity, white balance, demosaic and high-detail
+inputs, transform, scale and dimensions. The process-local `ImageSource`
+pointer and the transient source-generation counter are excluded; the image
+identity is the path plus file size and mtime.
+
+`RT_STAGE_STORE_MAX_MB` sets the write cap (default 512 MiB). Once the cap is
+reached, new writes are skipped rather than evicting an entry the caller
+cannot enumerate. This is deliberately conservative until an eviction policy
+exists.
+
+The store is opt-in and does not change the default path. A warm reopen
+produced `preview-base-cache: persistent-hit` and the normal second preview
+request fell from about 235 ms to about 198 ms on the 45.7 MP image. Initial
+load is unchanged because the rough preview deliberately bypasses the base
+cache. `preview-base-cache-test` covers the persistent key derivation:
+changing the image identity, white balance or scale changes the key, while a
+change to the transient generation counter does not.
+
 ## Export profiling
 
 `RT_STAGE_PROFILE=1` now prints the main export phases:
@@ -225,10 +247,14 @@ parity.
 - Preview, crop and thumbnail pipelines are not graph-driven. Export is
   graph-driven only when `RT_STAGE_GRAPH=1`; the legacy path is the default
   and the graph path does not yet cache or reuse buffers.
-- The persistent store has no pipeline integration, eviction policy or key
-  derivation of its own: the caller owns the key, the budget check and the
-  decision to delete. A store shared by two processes is atomic per entry but
-  is not range-locked, so two writers of the same key race by rename order.
+- The persistent preview cache is opt-in and covers only the preview base
+  image. It has no eviction beyond the write cap, and the store itself has no
+  key derivation; `PreviewBaseCache` owns the key. A store shared by two
+  processes is atomic per entry but is not range-locked, so two writers of the
+  same key race by rename order.
+- The persistent cache does not speed up the first rough preview, because that
+  pass deliberately bypasses the base cache. Its measured benefit is later
+  preview requests and reopen after a base has been stored.
 - Only Lanczos is exposed as a loadable stage. Denoise, wavelet, local
   adjustments and the output conversion still use the existing code paths.
 - The block scorer is not connected to denoise or wavelet; it has no runtime

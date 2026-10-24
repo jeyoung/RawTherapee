@@ -21,6 +21,7 @@
 #include <fstream>
 #include <map>
 #include <string>
+#include <sys/stat.h>
 
 #include <glibmm/thread.h>
 
@@ -357,6 +358,10 @@ ImProcCoordinator::ImProcCoordinator() :
     retistrsav(nullptr)
 {
     viewportZeroLhist.clear();
+    if (settings != nullptr && !settings->cacheDir.empty()) {
+        previewBaseCache->setPersistentRoot(
+            (settings->cacheDir + "/stages").raw());
+    }
 }
 
 ImProcCoordinator::~ImProcCoordinator()
@@ -1095,6 +1100,11 @@ void ImProcCoordinator::updatePreviewImage(int todo, bool panningRelatedChange,
     // TODO Locallab printf
     MyMutex::MyLock processingLock(mProcessing);
 
+    if (settings != nullptr && !settings->cacheDir.empty()) {
+        previewBaseCache->setPersistentRoot(
+            (settings->cacheDir + "/stages").raw());
+    }
+
     // Keep the requested event mask for cache invalidation. The augmentation
     // below turns a crop-only change into a transform request, but the base
     // image itself does not change. Eligibility is evaluated on this
@@ -1656,6 +1666,18 @@ void ImProcCoordinator::updatePreviewImage(int todo, bool panningRelatedChange,
             const auto makeBaseCacheKey = [&]() {
                 PreviewBaseCache::Key key;
                 key.source = imgsrc;
+
+                // Stable identity for the persistent store. The pointer and
+                // the transient generation counter are process-local.
+                std::string identity = imgsrc->getFileName().raw();
+                struct stat fileStat {};
+                if (!identity.empty()
+                        && ::stat(identity.c_str(), &fileStat) == 0) {
+                    identity += ":" + std::to_string(fileStat.st_size)
+                              + ":" + std::to_string(fileStat.st_mtime);
+                }
+                key.sourceIdentity = identity;
+
                 key.frame = params->raw.bayersensor.imageNum;
                 key.sensorType = static_cast<int>(imgsrc->getSensorType());
                 key.rotateDegree = imgsrc->getRotateDegree();
