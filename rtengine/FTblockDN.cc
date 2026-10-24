@@ -22,7 +22,9 @@
 //
 ////////////////////////////////////////////////////////////////
 
+#include <algorithm>
 #include <cmath>
+#include <vector>
 
 #include <fftw3.h>
 
@@ -43,6 +45,7 @@
 #include "procparams.h"
 #include "rt_math.h"
 #include "sleef.h"
+#include "stage/stage_indexer.h"
 #include "rtgui/threadutils.h"
 #include "rtgui/options.h"
 
@@ -61,6 +64,12 @@
 
 namespace rtengine
 {
+
+// Number of tile rows whose contributions are buffered before the
+// deterministic overlap merge. Two rows keep twice as many tiles in flight as
+// one row, which restores load balance for a tile row narrower than the thread
+// count, while bounding the extra memory to two tile rows.
+constexpr int TILE_MERGE_BAND_ROWS = 2;
 
 // %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 // %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -724,6 +733,50 @@ BENCHFUN
             memoryAllocationFailed = false;
             const int numtiles = numtiles_W * numtiles_H;
 
+            // Opt-in tile ordering (RT_TILE_ORDER=1): rank the tiles of each
+            // merge band by descending cheap score. A band is the unit that the
+            // deterministic merge commits to dsttmp, so bands stay in ascending
+            // row order and only the visitation order inside a band changes.
+            std::vector<std::vector<stage::TileOrigin>> band_orders;
+            const int tile_rows = (imheight + tileHskip - 1) / tileHskip;
+            const int tile_cols = (imwidth + tileWskip - 1) / tileWskip;
+
+            if (numtiles > 1 && stage::tileOrderingEnabled()) {
+                const int lum_w = stage::tileLuminanceWidth(imwidth);
+                const int lum_h = stage::tileLuminanceHeight(imheight);
+                std::vector<float> luminance(static_cast<size_t>(lum_w) * static_cast<size_t>(lum_h));
+                // Rec. 709 luminance weights: ranking only, never output.
+                constexpr float luma_red = 0.2126f;
+                constexpr float luma_green = 0.7152f;
+                constexpr float luma_blue = 0.0722f;
+
+                for (int y = 0; y < lum_h; ++y) {
+                    const int sy = std::min(imheight - 1, y * stage::TILE_LUMINANCE_STEP);
+                    for (int x = 0; x < lum_w; ++x) {
+                        const int sx = std::min(imwidth - 1, x * stage::TILE_LUMINANCE_STEP);
+                        luminance[static_cast<size_t>(y) * static_cast<size_t>(lum_w) + x] =
+                            luma_red * src->r(sy, sx) + luma_green * src->g(sy, sx) + luma_blue * src->b(sy, sx);
+                    }
+                }
+
+                const std::vector<stage::TileOrigin> ranked =
+                    stage::orderTilesByScore(luminance.data(), imwidth, imheight,
+                                             tileWskip, tileHskip);
+
+                if (ranked.size() != static_cast<size_t>(numtiles) ||
+                    tile_rows * tile_cols != numtiles) {
+                    // Never risk skipping or duplicating a tile: keep the
+                    // historical order when the grid does not match.
+                    band_orders.clear();
+                } else {
+                    band_orders.resize((tile_rows + TILE_MERGE_BAND_ROWS - 1) / TILE_MERGE_BAND_ROWS);
+
+                    for (const stage::TileOrigin& origin : ranked) {
+                        band_orders[(origin.y / tileHskip) / TILE_MERGE_BAND_ROWS].push_back(origin);
+                    }
+                }
+            }
+
             //output buffer
             Imagefloat * dsttmp;
 
@@ -741,6 +794,24 @@ BENCHFUN
                         dsttmp->g(i, j) = 0.f;
                         dsttmp->b(i, j) = 0.f;
                     }
+                }
+            }
+
+            // Deterministic overlap merge: every tile of a band writes its
+            // weighted contribution into a private buffer and the band is then
+            // merged into dsttmp in ascending tile row and column order. That
+            // keeps the historical row-major float association at any thread
+            // count and for any tile visitation order. Only the region the
+            // tile actually covers is read back, so the buffers need no
+            // initialisation. Peak extra memory is one merge band.
+            std::vector<Imagefloat*> tile_contributions;
+
+            if (numtiles > 1) {
+                const int band_buffers = TILE_MERGE_BAND_ROWS * tile_cols;
+                tile_contributions.reserve(band_buffers);
+
+                for (int t = 0; t < band_buffers; ++t) {
+                    tile_contributions.push_back(new Imagefloat(tilewidth, tileheight));
                 }
             }
 
@@ -866,14 +937,36 @@ BENCHFUN
                     noisevarchrom = new float[((tileheight + 1) / 2) * ((tilewidth + 1) / 2)];
                 }
 
+                for (int band_start = 0; band_start < tile_rows; band_start += TILE_MERGE_BAND_ROWS) {
+                    const int band_rows = MIN(TILE_MERGE_BAND_ROWS, tile_rows - band_start);
+                    const int band_tiles = band_rows * tile_cols;
+                    const int band_top = band_start * tileHskip;
+                    const int band_bottom = MIN(imheight, (band_start + band_rows - 1) * tileHskip + tileheight);
+                    const std::vector<stage::TileOrigin>* band_order =
+                        band_orders.empty() ? nullptr : &band_orders[band_start / TILE_MERGE_BAND_ROWS];
+
 #ifdef _OPENMP
-                #pragma omp for schedule(dynamic) collapse(2)
+                    #pragma omp for schedule(dynamic)
 #endif
 
-                for (int tiletop = 0; tiletop < imheight; tiletop += tileHskip) {
-                    for (int tileleft = 0; tileleft < imwidth ; tileleft += tileWskip) {
+                    for (int t = 0; t < band_tiles; ++t) {
+                        int band_row = t / tile_cols;
+                        int grid_col = t % tile_cols;
+
+                        if (band_order != nullptr) {
+                            // Dynamic scheduling hands out a band's tiles in
+                            // descending score order.
+                            const stage::TileOrigin& origin = (*band_order)[t];
+                            band_row = origin.y / tileHskip - band_start;
+                            grid_col = origin.x / tileWskip;
+                        }
+
+                        int tiletop = (band_start + band_row) * tileHskip;
+                        int tileleft = grid_col * tileWskip;
+                        Imagefloat* dsttile = numtiles > 1 ? tile_contributions[band_row * tile_cols + grid_col] : dsttmp;
+
                         //printf("titop=%d tileft=%d\n",tiletop/tileHskip, tileleft/tileWskip);
-                        pos = (tiletop / tileHskip) * numtiles_W + tileleft / tileWskip ;
+                        pos = (band_start + band_row) * numtiles_W + grid_col;
                         int tileright = MIN(imwidth, tileleft + tilewidth);
                         int tilebottom = MIN(imheight, tiletop + tileheight);
                         int width  = tileright - tileleft;
@@ -1649,14 +1742,14 @@ BENCHFUN
                                             b_ = Color::denoiseGammaTab[b_];
 
                                             if (numtiles == 1) {
-                                                dsttmp->r(i, j) = newGain * r_;
-                                                dsttmp->g(i, j) = newGain * g_;
-                                                dsttmp->b(i, j) = newGain * b_;
+                                                dsttile->r(i1, j1) = newGain * r_;
+                                                dsttile->g(i1, j1) = newGain * g_;
+                                                dsttile->b(i1, j1) = newGain * b_;
                                             } else {
                                                 float factor = Vmask[i1] * Hmask[j1];
-                                                dsttmp->r(i, j) += factor * r_;
-                                                dsttmp->g(i, j) += factor * g_;
-                                                dsttmp->b(i, j) += factor * b_;
+                                                dsttile->r(i1, j1) = factor * r_;
+                                                dsttile->g(i1, j1) = factor * g_;
+                                                dsttile->b(i1, j1) = factor * b_;
                                             }
                                         }
                                     }
@@ -1687,14 +1780,14 @@ BENCHFUN
                                             Z = Z < 32768.f ? igamcurve[Z] : (Color::gammaf(Z / 32768.f, igam, igamthresh, igamslope) * 65535.f);
 
                                             if (numtiles == 1) {
-                                                dsttmp->r(i, j) = newGain * X;
-                                                dsttmp->g(i, j) = newGain * Y;
-                                                dsttmp->b(i, j) = newGain * Z;
+                                                dsttile->r(i1, j1) = newGain * X;
+                                                dsttile->g(i1, j1) = newGain * Y;
+                                                dsttile->b(i1, j1) = newGain * Z;
                                             } else {
                                                 float factor = Vmask[i1] * Hmask[j1];
-                                                dsttmp->r(i, j) += factor * X;
-                                                dsttmp->g(i, j) += factor * Y;
-                                                dsttmp->b(i, j) += factor * Z;
+                                                dsttile->r(i1, j1) = factor * X;
+                                                dsttile->g(i1, j1) = factor * Y;
+                                                dsttile->b(i1, j1) = factor * Z;
                                             }
                                         }
                                     }
@@ -1732,14 +1825,14 @@ BENCHFUN
                                         b_ = b_ < 32768.f ? igamcurve[b_] : (Color::gammanf(b_ / 32768.f, igam) * 65535.f);
 
                                         if (numtiles == 1) {
-                                            dsttmp->r(i, j) = newGain * r_;
-                                            dsttmp->g(i, j) = newGain * g_;
-                                            dsttmp->b(i, j) = newGain * b_;
+                                            dsttile->r(i1, j1) = newGain * r_;
+                                            dsttile->g(i1, j1) = newGain * g_;
+                                            dsttile->b(i1, j1) = newGain * b_;
                                         } else {
                                             float factor = Vmask[i1] * Hmask[j1];
-                                            dsttmp->r(i, j) += factor * r_;
-                                            dsttmp->g(i, j) += factor * g_;
-                                            dsttmp->b(i, j) += factor * b_;
+                                            dsttile->r(i1, j1) = factor * r_;
+                                            dsttile->g(i1, j1) = factor * g_;
+                                            dsttile->b(i1, j1) = factor * b_;
                                         }
                                     }
                                 }
@@ -1751,8 +1844,47 @@ BENCHFUN
                         delete labdn;
                         delete Lin;
 
-                    }//end of tile row
-                }//end of tile loop
+                    }//end of band tiles
+
+                    if (numtiles > 1) {
+#ifdef _OPENMP
+                        #pragma omp for schedule(static)
+#endif
+
+                        for (int y = band_top; y < band_bottom; ++y) {
+                            float* dst_r = dsttmp->r(y);
+                            float* dst_g = dsttmp->g(y);
+                            float* dst_b = dsttmp->b(y);
+
+                            // Ascending tile row, then ascending tile column:
+                            // the historical row-major float association.
+                            for (int band_row = 0; band_row < band_rows; ++band_row) {
+                                const int tiletop = (band_start + band_row) * tileHskip;
+
+                                if (y < tiletop || y >= tiletop + tileheight) {
+                                    continue;
+                                }
+
+                                const int contribution_row = y - tiletop;
+
+                                for (int c = 0; c < tile_cols; ++c) {
+                                    const int left = c * tileWskip;
+                                    const int right = MIN(imwidth, left + tilewidth);
+                                    const Imagefloat* contribution = tile_contributions[band_row * tile_cols + c];
+                                    const float* src_r = contribution->r(contribution_row);
+                                    const float* src_g = contribution->g(contribution_row);
+                                    const float* src_b = contribution->b(contribution_row);
+
+                                    for (int x = left; x < right; ++x) {
+                                        dst_r[x] += src_r[x - left];
+                                        dst_g[x] += src_g[x - left];
+                                        dst_b[x] += src_b[x - left];
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }//end of merge bands
 
                 if (numtiles > 1 || !isRAW || (!useNoiseCCurve && !useNoiseLCurve)) {
                     delete[] noisevarlum;
@@ -1773,6 +1905,10 @@ BENCHFUN
 #ifdef _OPENMP
             omp_set_nested(oldNested);
 #endif
+
+            for (Imagefloat* contribution : tile_contributions) {
+                delete contribution;
+            }
 
             //copy denoised image to output
             if (numtiles > 1) {

@@ -23,8 +23,10 @@
 //
 ////////////////////////////////////////////////////////////////
 
+#include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <vector>
 
 #include "array2D.h"
 #include "color.h"
@@ -43,6 +45,7 @@
 #include "rt_math.h"
 #include "rtengine.h"
 #include "sleef.h"
+#include "stage/stage_indexer.h"
 #include "rtgui/options.h"
 #include "guidedfilter.h"
 #ifdef _OPENMP
@@ -734,6 +737,46 @@ void ImProcFunctions::ip_wavelet(LabImage * lab, LabImage * dst, int kall, const
     Tile_calc(tilesize, overlap, kall, imwidth, imheight, numtiles_W, numtiles_H, tilewidth, tileheight, tileWskip, tileHskip);
 
     const int numtiles = numtiles_W * numtiles_H;
+
+    // Opt-in tile ordering (RT_TILE_ORDER=1): rank the tiles of each tile row
+    // by descending cheap score. A row is the unit that the deterministic merge
+    // commits to dsttmp, so rows stay in ascending order and only the column
+    // visitation order inside a row changes.
+    std::vector<std::vector<stage::TileOrigin>> row_order;
+    const int tile_rows = (imheight + tileHskip - 1) / tileHskip;
+    const int tile_cols = (imwidth + tileWskip - 1) / tileWskip;
+
+    if (numtiles > 1 && stage::tileOrderingEnabled()) {
+        const int lum_w = stage::tileLuminanceWidth(imwidth);
+        const int lum_h = stage::tileLuminanceHeight(imheight);
+        std::vector<float> luminance(static_cast<size_t>(lum_w) * static_cast<size_t>(lum_h));
+
+        for (int y = 0; y < lum_h; ++y) {
+            const int sy = rtengine::min(imheight - 1, y * stage::TILE_LUMINANCE_STEP);
+            for (int x = 0; x < lum_w; ++x) {
+                const int sx = rtengine::min(imwidth - 1, x * stage::TILE_LUMINANCE_STEP);
+                luminance[static_cast<size_t>(y) * static_cast<size_t>(lum_w) + x] = lab->L[sy][sx];
+            }
+        }
+
+        const std::vector<stage::TileOrigin> ranked =
+            stage::orderTilesByScore(luminance.data(), imwidth, imheight,
+                                     tileWskip, tileHskip);
+
+        if (ranked.size() != static_cast<size_t>(numtiles) ||
+            tile_rows * tile_cols != numtiles) {
+            // Never risk skipping or duplicating a tile: keep the historical
+            // order when the grid does not match.
+            row_order.clear();
+        } else {
+            row_order.resize(tile_rows);
+
+            for (const stage::TileOrigin& origin : ranked) {
+                row_order[origin.y / tileHskip].push_back(origin);
+            }
+        }
+    }
+
     LabImage * dsttmp;
 
     if (numtiles == 1) {
@@ -743,6 +786,22 @@ void ImProcFunctions::ip_wavelet(LabImage * lab, LabImage * dst, int kall, const
 
         for (int n = 0; n < 3 * imwidth * imheight; n++) {
             dsttmp->data[n] = 0;
+        }
+    }
+
+    // Deterministic overlap merge: every tile of a row writes its weighted
+    // contribution into a private buffer and the row is then merged into
+    // dsttmp in ascending tile-column order. That keeps the historical
+    // row-major float association at any thread count and for any tile
+    // visitation order. Only the region the tile covers is read back, so the
+    // buffers need no initialisation. Peak extra memory is one tile row.
+    std::vector<LabImage*> tile_contributions;
+
+    if (numtiles > 1) {
+        tile_contributions.reserve(tile_cols);
+
+        for (int c = 0; c < tile_cols; ++c) {
+            tile_contributions.push_back(new LabImage(tilewidth, tileheight));
         }
     }
 
@@ -880,12 +939,29 @@ void ImProcFunctions::ip_wavelet(LabImage * lab, LabImage * dst, int kall, const
 
 
 
+        for (int tile_row = 0; tile_row < tile_rows; ++tile_row) {
+            const int band_top = tile_row * tileHskip;
+            const int band_bottom = rtengine::min(imheight, band_top + tileheight);
+
 #ifdef _OPENMP
-        #pragma omp for schedule(dynamic) collapse(2)
+            #pragma omp for schedule(dynamic)
 #endif
 
-        for (int tiletop = 0; tiletop < imheight; tiletop += tileHskip) {
-            for (int tileleft = 0; tileleft < imwidth ; tileleft += tileWskip) {
+            for (int tile_col = 0; tile_col < tile_cols; ++tile_col) {
+                int tiletop = band_top;
+                int tileleft = tile_col * tileWskip;
+                int grid_col = tile_col;
+
+                if (!row_order.empty()) {
+                    // Dynamic scheduling hands out a row's tiles in descending
+                    // score order.
+                    const stage::TileOrigin& origin = row_order[tile_row][tile_col];
+                    tileleft = origin.x;
+                    grid_col = origin.x / tileWskip;
+                }
+
+                LabImage* dsttile = numtiles > 1 ? tile_contributions[grid_col] : dsttmp;
+
                 int tileright = rtengine::min(imwidth, tileleft + tilewidth);
                 int tilebottom = rtengine::min(imheight, tiletop + tileheight);
                 int width  = tileright - tileleft;
@@ -2060,16 +2136,16 @@ void ImProcFunctions::ip_wavelet(LabImage * lab, LabImage * dst, int kall, const
                                 if(L <= 0.f) {
                                     L= 1.f;
                                 }
-                                dsttmp->L[i][j] += factor * L;
-                                dsttmp->a[i][j] += factor * a;
-                                dsttmp->b[i][j] += factor * b;
+                                dsttile->L[i1][j1] = factor * L;
+                                dsttile->a[i1][j1] = factor * a;
+                                dsttile->b[i1][j1] = factor * b;
                             } else {
                                 if(L <= 0.f) {
                                     L= 1.f;
                                 }
-                                dsttmp->L[i][j] = L;
-                                dsttmp->a[i][j] = a;
-                                dsttmp->b[i][j] = b;
+                                dsttile->L[i1][j1] = L;
+                                dsttile->a[i1][j1] = a;
+                                dsttile->b[i1][j1] = b;
 
                             }
                         }
@@ -2084,8 +2160,36 @@ void ImProcFunctions::ip_wavelet(LabImage * lab, LabImage * dst, int kall, const
                 if (numtiles > 1) {
                     delete labco;
                 }
+            }//end of tile columns
+
+            if (numtiles > 1) {
+#ifdef _OPENMP
+                #pragma omp for schedule(static)
+#endif
+
+                for (int y = band_top; y < band_bottom; ++y) {
+                    const int contribution_row = y - band_top;
+                    float* dst_L = dsttmp->L[y];
+                    float* dst_a = dsttmp->a[y];
+                    float* dst_b = dsttmp->b[y];
+
+                    for (int c = 0; c < tile_cols; ++c) {
+                        const int left = c * tileWskip;
+                        const int right = rtengine::min(imwidth, left + tilewidth);
+                        const LabImage* contribution = tile_contributions[c];
+                        const float* src_L = contribution->L[contribution_row];
+                        const float* src_a = contribution->a[contribution_row];
+                        const float* src_b = contribution->b[contribution_row];
+
+                        for (int x = left; x < right; ++x) {
+                            dst_L[x] += src_L[x - left];
+                            dst_a[x] += src_a[x - left];
+                            dst_b[x] += src_b[x - left];
+                        }
+                    }
+                }
             }
-        }
+        }//end of tile rows
 
         for (int i = 0; i < tileheight; i++)
             if (varhue[i] != nullptr) {
@@ -2097,6 +2201,10 @@ void ImProcFunctions::ip_wavelet(LabImage * lab, LabImage * dst, int kall, const
 #ifdef _OPENMP
     omp_set_nested(oldNested);
 #endif
+
+    for (LabImage* contribution : tile_contributions) {
+        delete contribution;
+    }
 
     if (numtiles != 1) {
         dst->CopyFrom(dsttmp);
