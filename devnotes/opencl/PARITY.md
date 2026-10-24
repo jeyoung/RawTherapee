@@ -36,6 +36,17 @@ difference between two identical runs). The gate is the peak absolute error
 | 2026-10-21 | uncommitted | AMD RX 550 | colorspace_flowers.pef / neutral, `RT_OPENCL_RGBPROC=1` | off vs auto | 1 LSB | PASS |
 | 2026-10-21 | uncommitted | AMD RX 550 | exposure/highlight/black profile, `RT_OPENCL_RGBPROC=1` | off vs auto | 1 LSB | PASS |
 | 2026-10-21 | uncommitted | AMD RX 550 | public PEF baseline, `RT_OPENCL_RGBPROC=1` | off vs auto | 1 LSB | PASS |
+| 2026-10-24 | 47c50ee77 | AMD RX 550 | colorspace_flowers.pef / neutral (`--quick`) | off vs auto | 1 LSB | PASS |
+| 2026-10-24 | 47c50ee77 | AMD RX 550 | colorspace_flowers.pef / bayer14 (`--formats`) | off vs auto | 1 LSB | PASS |
+| 2026-10-24 | 47c50ee77 | AMD RX 550 | 45.7 MP NEF / resize 0.5x | off vs auto | 1 LSB | PASS |
+| 2026-10-24 | 47c50ee77 | AMD RX 550 | 45.7 MP NEF / sidecar (crop + resize) | off vs auto | 1 LSB | PASS |
+
+`47c50ee77` changes only CPU export buffer handling; the OpenCL rows above
+re-run the existing GPU stages against the new CPU neighbour.
+`verify.sh --quick` also re-ran the monitor self-test: max 1 byte, 14 of
+196608 samples. The exact CPU export parity for that commit (neutral, sidecar,
+sidecar `-f`, both `WorkingTRC` profiles, `AE=0`) is recorded in
+`devnotes/perf/FUSION.md`.
 
 `verify.sh` now reports `SKIP` instead of `PASS` when no OpenCL device is
 selected, so a CPU-only build cannot produce a vacuous parity claim.
