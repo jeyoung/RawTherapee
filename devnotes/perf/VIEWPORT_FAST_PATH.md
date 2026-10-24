@@ -122,19 +122,19 @@ while the pass was running.
 - `viewportCropRenderReusable()` allows the deferred pass to skip the crop
   render only while the burst contains a single hit.
 
-Both the settle window and the max-wait cap follow
-`Settings::previewRefreshMs`, the Preview Refresh preference (100-200 ms,
-default 125 ms). The value is taken once per request, so a live change applies
-to the next hit, and the two values always match: the deadline is one period
-after the first hit of a burst, so a continuous drag produces one analysis per
-period. This intentionally gives up the earlier burst coalescing for cadence
+Both the settle window and the max-wait cap follow the measured session
+preview period (100-1000 ms, 125 ms fallback, smoothed per coordinator). The
+value is taken once per request, so a completed refresh applies to the next
+hit, and the two values always match: the deadline is one period after the
+first hit of a burst, so a continuous drag produces one analysis per period.
+This intentionally gives up the earlier burst coalescing for cadence
 alignment; `RT_VIEWPORT_DEFER_MS` restores a longer settle when coalescing
 matters more.
 
 | Value | Source | Unit | Range | Purpose |
 |---|---|---|---|---|
-| Settle window | `Settings::previewRefreshMs` | ms | 100–200 | Quiet period before the analysis runs |
-| Max-wait cap | `Settings::previewRefreshMs` | ms | 100–200 | Cap from the first hit |
+| Settle window | measured session period | ms | 100–1000 | Quiet period before the analysis runs |
+| Max-wait cap | measured session period | ms | 100–1000 | Cap from the first hit |
 | `VIEWPORT_DEFERRED_POLL_MS` | 10 | ms | — | Watcher sleep while an analysis is pending |
 | `VIEWPORT_DEFERRED_IDLE_POLL_MS` | 100 | ms | — | Watcher sleep while idle |
 
@@ -142,10 +142,11 @@ matters more.
 independently and keep the wider 0 to 1000 ms range; `RT_VIEWPORT_DEFER_MS=0`
 queues the analysis immediately and reproduces the pre-deferral behaviour.
 The old fixed 250 ms settle and 500 ms cap are gone; they added a 250 to
-500 ms timer mismatch between the debounce and the catch-up. The residual
-histogram lag is now the analysis time minus the crop time: about 23 ms at
-10 MP and 65 to 70 ms at 45.7 MP at fit and 100 %. See
-`devnotes/perf/PREVIEW_REFRESH.md`.
+500 ms timer mismatch between the debounce and the catch-up. Under the
+historical fixed-timer model the residual histogram lag was about 23 ms at
+10 MP and 65 to 70 ms at 45.7 MP at fit and 100 %; those figures are not the
+current model. The dynamic model's residual is analysis-minus-crop and is
+measured per session. See `devnotes/perf/PREVIEW_REFRESH.md`.
 `RT_VIEWPORT_FAST=0` still disables the whole path.
 
 The watcher is one low-priority `Glib::Thread` per coordinator, created on the
@@ -254,10 +255,11 @@ rather than a benchmark.
 `GDK_BACKEND=x11` is required on a Wayland host: without it GDK connects to
 the host compositor and the Xvfb window tree stays empty.
 
-These runs predate the single Preview Refresh preference and used a fixed
-250 ms settle with a 500 ms cap. The current default is 125 ms for both; the
-tables are historical and record the previous coalescing behaviour. The
-current model produces one analysis per period, as described above.
+These runs predate the dynamic session period and used a fixed 250 ms settle
+with a 500 ms cap. The current model starts from the 125 ms fallback and then
+follows the measured cost; the tables are historical and record the previous
+coalescing behaviour. The current model produces one analysis per period, as
+described above.
 
 ### 10.2 MP, fit
 

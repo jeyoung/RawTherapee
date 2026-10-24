@@ -88,10 +88,11 @@ navigator/histogram MAE note.
 
 ### Preview Refresh
 
-The adjuster debounce and the deferred analysis settle/max-wait are one
-preference: Preferences, Performance, Preview Refresh (100-200 ms, default
-125 ms). The engine measures the last complete refresh and shows a
-recommendation under the slider. See `devnotes/perf/PREVIEW_REFRESH.md`.
+The adjuster debounce and the deferred analysis settle/max-wait share one
+dynamic session period: the engine measures the current image's full refresh
+(crop plus deferred analysis), smooths it, and clamps it to 100-1000 ms, with a
+125 ms fallback until a measurement exists. The period follows the active tab.
+There is no preference. See `devnotes/perf/PREVIEW_REFRESH.md`.
 
 
 ## Initial-load reveal
