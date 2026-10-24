@@ -122,18 +122,30 @@ while the pass was running.
 - `viewportCropRenderReusable()` allows the deferred pass to skip the crop
   render only while the burst contains a single hit.
 
-| Setting | Default | Unit | Range | Purpose |
-|---|---:|---|---|---|
-| `VIEWPORT_DEFERRED_SETTLE_MS` | 250 | ms | 0–1000 | Quiet period before the analysis runs |
-| `VIEWPORT_DEFERRED_MAX_WAIT_MS` | 500 | ms | 0–1000 | Cap from the first hit |
+Both the settle window and the max-wait cap follow
+`Settings::previewRefreshMs`, the Preview Refresh preference (100-200 ms,
+default 125 ms). The value is taken once per request, so a live change applies
+to the next hit, and the two values always match: the deadline is one period
+after the first hit of a burst, so a continuous drag produces one analysis per
+period. This intentionally gives up the earlier burst coalescing for cadence
+alignment; `RT_VIEWPORT_DEFER_MS` restores a longer settle when coalescing
+matters more.
+
+| Value | Source | Unit | Range | Purpose |
+|---|---|---|---|---|
+| Settle window | `Settings::previewRefreshMs` | ms | 100–200 | Quiet period before the analysis runs |
+| Max-wait cap | `Settings::previewRefreshMs` | ms | 100–200 | Cap from the first hit |
 | `VIEWPORT_DEFERRED_POLL_MS` | 10 | ms | — | Watcher sleep while an analysis is pending |
 | `VIEWPORT_DEFERRED_IDLE_POLL_MS` | 100 | ms | — | Watcher sleep while idle |
 
-The settle default must stay above the adjuster's maximum debounce interval
-(`Options::adjusterMaxDelay`, 200 ms). A shorter window fires between two
-debounced updates and coalesces nothing. `RT_VIEWPORT_DEFER_MS` and
-`RT_VIEWPORT_DEFER_MAX_MS` override the two settings; `RT_VIEWPORT_DEFER_MS=0`
+`RT_VIEWPORT_DEFER_MS` and `RT_VIEWPORT_DEFER_MAX_MS` override the two values
+independently and keep the wider 0 to 1000 ms range; `RT_VIEWPORT_DEFER_MS=0`
 queues the analysis immediately and reproduces the pre-deferral behaviour.
+The old fixed 250 ms settle and 500 ms cap are gone; they added a 250 to
+500 ms timer mismatch between the debounce and the catch-up. The residual
+histogram lag is now the analysis time minus the crop time: about 23 ms at
+10 MP and 65 to 70 ms at 45.7 MP at fit and 100 %. See
+`devnotes/perf/PREVIEW_REFRESH.md`.
 `RT_VIEWPORT_FAST=0` still disables the whole path.
 
 The watcher is one low-priority `Glib::Thread` per coordinator, created on the
@@ -242,13 +254,18 @@ rather than a benchmark.
 `GDK_BACKEND=x11` is required on a Wayland host: without it GDK connects to
 the host compositor and the Xvfb window tree stays empty.
 
+These runs predate the single Preview Refresh preference and used a fixed
+250 ms settle with a 500 ms cap. The current default is 125 ms for both; the
+tables are historical and record the previous coalescing behaviour. The
+current model produces one analysis per period, as described above.
+
 ### 10.2 MP, fit
 
 | Configuration | fast hits | analyses | fallbacks | samples | p50 | p95 |
 |---|---:|---:|---:|---:|---:|---:|
 | `RT_VIEWPORT_FAST=0` | 0 | 0 | 9 | 9 | 54 ms | 64 ms |
 | `RT_VIEWPORT_DEFER_MS=0` | 5 | 5 | 4 | 14 | 24 ms | 93 ms |
-| default (250 / 500 ms) | 5 | 2 | 4 | 11 | 20 ms | 69 ms |
+| fixed settle 250 / cap 500 ms (pre-#24) | 5 | 2 | 4 | 11 | 20 ms | 69 ms |
 
 ### 45.7 MP, fit
 
@@ -256,7 +273,7 @@ the host compositor and the Xvfb window tree stays empty.
 |---|---:|---:|---:|---:|---:|---:|
 | `RT_VIEWPORT_FAST=0` | 0 | 0 | 10 | 10 | 151 ms | 206 ms |
 | `RT_VIEWPORT_DEFER_MS=0` | 7 | 7 | 4 | 18 | 110 ms | 299 ms |
-| default (250 / 500 ms) | 6 | 2 | 4 | 12 | 42 ms | 203 ms |
+| fixed settle 250 / cap 500 ms (pre-#24) | 6 | 2 | 4 | 12 | 42 ms | 203 ms |
 
 ### 45.7 MP, 100 %
 
@@ -264,7 +281,7 @@ the host compositor and the Xvfb window tree stays empty.
 |---|---:|---:|---:|---:|---:|---:|
 | `RT_VIEWPORT_FAST=0` | 0 | 0 | 11 | 11 | 144 ms | 196 ms |
 | `RT_VIEWPORT_DEFER_MS=0` | 7 | 7 | 4 | 18 | 74 ms | 219 ms |
-| default (250 / 500 ms) | 6 | 2 | 4 | 12 | 92 ms | 204 ms |
+| fixed settle 250 / cap 500 ms (pre-#24) | 6 | 2 | 4 | 12 | 92 ms | 204 ms |
 
 A second default run at 100 % gave p50 63 ms / p95 291 ms; the p50 spread is
 run noise, the 6 hits / 2 analyses ratio is stable.

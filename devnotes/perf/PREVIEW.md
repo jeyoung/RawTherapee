@@ -86,6 +86,13 @@ fallback; the served hit cost 37-40 ms at fit and 57-61 ms at 100 %. See
 `VIEWPORT_FAST_PATH.md`, "Deferred analysis", for the full tables and the
 navigator/histogram MAE note.
 
+### Preview Refresh
+
+The adjuster debounce and the deferred analysis settle/max-wait are one
+preference: Preferences, Performance, Preview Refresh (100-200 ms, default
+125 ms). The engine measures the last complete refresh and shows a
+recommendation under the slider. See `devnotes/perf/PREVIEW_REFRESH.md`.
+
 
 ## Initial-load reveal
 
