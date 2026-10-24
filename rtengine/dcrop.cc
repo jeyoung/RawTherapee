@@ -18,6 +18,8 @@
  *  along with RawTherapee.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+#include <algorithm>
+
 #include <glibmm/ustring.h>
 #include <glibmm/timer.h>
 
@@ -1938,6 +1940,22 @@ void Crop::update(int todo)
 
     // Computing the preview image, i.e. converting from lab->Monitor color space (soft-proofing disabled) or lab->Output profile->Monitor color space (soft-proofing enabled)
     parent->ipf.lab2monitorRgb(labnCrop, cropImg);
+
+    // Opt-in parity hook: the dump carries the whole crop buffer including
+    // the processing border, plus the clamped visible rectangle in its
+    // descriptor. The requested crop can be larger than the allocated buffer
+    // when the image edge falls inside the request.
+    if (preview_dump::enabled() && cropImg != nullptr) {
+        const int visibleW =
+            std::min(rqcropw, cropImg->getWidth() - leftBorder);
+        const int visibleH =
+            std::min(rqcroph, cropImg->getHeight() - upperBorder);
+        preview_dump::dump_crop(cropImg,
+                                isDetailWindow ? "detail" : "main",
+                                leftBorder, upperBorder,
+                                std::max(0, visibleW), std::max(0, visibleH),
+                                skip);
+    }
 
     if (cropImageListener) {
         // Computing the internal image for analysis, i.e. conversion from lab->Output profile (rtSettings.HistogramWorking disabled) or lab->WCS (rtSettings.HistogramWorking enabled)
