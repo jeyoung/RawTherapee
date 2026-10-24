@@ -46,6 +46,7 @@
 
 #include <cassert>
 #include <chrono>
+#include <cstring>
 #include <type_traits>
 #include <vector>
 
@@ -2196,12 +2197,15 @@ private:
             if (labResize) { // crop lab data
                 tmplab = new LabImage(cw, ch);
 
-                for (int row = 0; row < ch; row++) {
-                    for (int col = 0; col < cw; col++) {
-                        tmplab->L[row][col] = labView->L[row + cy][col + cx];
-                        tmplab->a[row][col] = labView->a[row + cy][col + cx];
-                        tmplab->b[row][col] = labView->b[row + cy][col + cx];
-                    }
+                const std::size_t rowBytes =
+                    static_cast<std::size_t>(cw) * sizeof(float);
+                for (int row = 0; row < ch; ++row) {
+                    std::memcpy(tmplab->L[row], labView->L[row + cy] + cx,
+                                rowBytes);
+                    std::memcpy(tmplab->a[row], labView->a[row + cy] + cx,
+                                rowBytes);
+                    std::memcpy(tmplab->b[row], labView->b[row + cy] + cx,
+                                rowBytes);
                 }
 
                 delete labView;
