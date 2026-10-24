@@ -1,9 +1,9 @@
 # Denoise export thread determinism
 
-Status: analysis record. The denoise-stage fix is prepared and verified but is
-**not committed**, because the export as a whole is still non-deterministic for
-a reason outside the denoise code (see *Blocker*). Nothing here changes the
-default path.
+Status: the denoise-stage merge is now deterministic and committed
+(`perf: #0: order denoise block merge`). The export as a whole is still not
+bit-identical across thread counts because the raw-to-RGB path is
+thread-order dependent (see *Blocker*).
 
 ## Symptom
 
@@ -58,11 +58,12 @@ runs and only the denoise stage is exercised.
    Both are unsynchronised read-modify-write reductions whose order follows the
    OpenMP partition (`totwt` also races outright).
 
-3. **Stage-level check on deterministic input.** With the NEF export used as a
-   TIFF input, the unpatched build gives 215 (`t=4`) and 414 (`t=8`) differing
-   pixels at 1 LSB, and with the prepared change `AE=0` at `t=1`, `t=4` and
-   `t=8`. The single-thread export is bit-identical before and after the change
-   (`AE=0`), i.e. only the thread-order dependence is removed.
+3. **Stage-level check on deterministic input.** With a full-frame NEF export
+   used as a TIFF input, the unpatched build gives 215 (`t=4`) and 414 (`t=8`)
+   differing pixels at 1 LSB. The committed change reduces that to 6 (`t=4`)
+   and 12 (`t=8`) pixels at 1 LSB on the full-frame 45.7 MP TIFF. The
+   single-thread export is bit-identical before and after the change
+   (`AE=0`), i.e. the change removes only thread-order dependence.
 
 4. **The whole export is still not deterministic.** Hashing the image at
    `RGB_denoise` entry shows the input already differs between `t=1` and `t=8`
@@ -94,9 +95,9 @@ Ruled out or noted during the bisect:
   reached by the default wavelet tool settings; a wavelet-only export from a
   deterministic TIFF input is `AE=0` at `t=1`, `t=4` and `t=8`.
 
-## Prepared change (not committed)
+## Committed change
 
-A local, uncommitted patch touching only `rtengine/FTblockDN.cc`:
+A patch touching only `rtengine/FTblockDN.cc`:
 
 - block weights (`totwt`) are computed in a separate pass with one thread per
   destination row, keeping the serial order (block row ascending, then block
@@ -105,10 +106,12 @@ A local, uncommitted patch touching only `rtengine/FTblockDN.cc`:
   `RGBoutput_tile_row` runs in an `omp ordered` region, so overlapping block
   rows merge in ascending block-row order while their compute stays parallel.
 
-Evidence for the prepared change: TIFF input `AE=0` at 1/4/8; single-thread
-output unchanged (`AE=0`); NEF export at 8 threads, three runs each, median
-24.4 s with the change and 24.6 s without (run-to-run spread 23-31 s on a
-loaded 4C/8T host), i.e. no measurable regression.
+Evidence: single-thread output unchanged (`AE=0`); full-frame TIFF input
+reduced from 215/414 differing pixels to 6/12 at 1 LSB for t=4/t=8; NEF export
+at 8 threads, three runs each, median 24.4 s with the change and 24.6 s
+without (run-to-run spread 23-31 s on a loaded 4C/8T host), i.e. no measurable
+regression. The residual 6/12 pixels are not attributed to the block merge and
+remain under investigation.
 
 ## Uncovered
 
