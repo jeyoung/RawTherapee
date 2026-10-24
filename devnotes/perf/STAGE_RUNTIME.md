@@ -241,6 +241,14 @@ parity.
 - Whole-suite export timing on the same run: baseline 7.82–8.24 s,
   candidate 7.74–8.04 s at 8 threads. The fair interleaved run above is the
   cleaner comparison because it removes the suite's disk and cache noise.
+- Cropped sidecar export at 8 threads: baseline 17.14 s, candidate 15.31 s
+  (about 11% faster), with `AE=0` over 6.2 M pixels. The gain includes the
+  row-wise Lab crop copy, the cached output transform and the shared Lanczos
+  taps; it is not attributed to any one change.
+- Persistent preview cache: first run stores one entry; a second run reports
+  `preview-base-cache: persistent-hit`, and the second preview request falls
+  from about 235 ms to about 198 ms. The initial rough preview remains
+  bypassed and unchanged.
 
 ## Limitations
 
