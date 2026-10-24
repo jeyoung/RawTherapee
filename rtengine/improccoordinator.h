@@ -121,12 +121,13 @@ protected:
     std::atomic<unsigned> viewportDeferredRequest;
     std::atomic<bool> deferredCropRendered;
     // Durations of the last complete refresh, in milliseconds. -1 means no
-    // measurement yet; getRecommendedPreviewRefreshMs() combines them.
+    // measurement yet; getSessionPreviewRefreshMs() reports the smoothed sum.
     // timingGeneration invalidates an in-flight pass when the image or scale
-    // changes, so the label cannot mix measurements from two images.
+    // changes, so the period cannot mix measurements from two images.
     std::atomic<unsigned> timingGeneration{0};
     std::atomic<int> lastCropMs{-1};
     std::atomic<int> lastAnalysisMs{-1};
+    std::atomic<int> sessionRefreshMs{-1};
     ProcParams viewportFullParams;
     ProcParams viewportLutParams;
     ProcParams viewportDeferredParams;
@@ -285,7 +286,7 @@ protected:
     void updateViewportLutSnapshot(int todo);
     void renderCrops(int todo, bool force);
     int queueViewportDeferredAnalysis(int todo, unsigned request,
-                                      int previewRefreshMs);
+                                      int sessionRefreshMs);
     void markViewportStateValid(bool highDetailNeeded);
     void invalidateViewportState();
     void ensureDeferredWatcher();
@@ -530,7 +531,7 @@ public:
         return pH;
     }
 
-    int getRecommendedPreviewRefreshMs() const override;
+    int getSessionPreviewRefreshMs() const override;
 
     DetailedCrop* createCrop  (::EditDataProvider *editDataProvider, bool isDetailWindow) override;
 

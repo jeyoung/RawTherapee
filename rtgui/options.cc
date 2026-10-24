@@ -33,7 +33,6 @@
 #include "version.h"
 
 #include "rtengine/procparams.h"
-#include "rtengine/previewrefresh.h"
 #include "rtengine/rtengine.h"
 #include "rtengine/utils.h"
 
@@ -48,6 +47,16 @@
 
 namespace
 {
+
+/**
+ * @brief Legacy adjuster debounce fallback.
+ *
+ * Unit: milliseconds. The measured session preview period overrides these for
+ * the active tab; the legacy pair keeps per-tool setDelay() calls and adjusters
+ * outside a measured session working.
+ */
+constexpr int LEGACY_ADJUSTER_MIN_DELAY_MS = 100;
+constexpr int LEGACY_ADJUSTER_MAX_DELAY_MS = 200;
 
 /**
  * Removes invalid entries from the extensions and enabled vectors and adds and
@@ -370,10 +379,10 @@ void Options::setDefaults()
     defProfRaw = DEFPROFILE_RAW;
     defProfImg = DEFPROFILE_IMG;
     dateFormat = "%y-%m-%d";
-    // The single Preview Refresh preference replaces the legacy adjuster
-    // minimum/maximum pair. Both legacy values stay in sync with it.
-    rtSettings.previewRefreshMs = rtengine::PREVIEW_REFRESH_DEFAULT_MS;
-    adjusterMinDelay = adjusterMaxDelay = rtSettings.previewRefreshMs;
+    // Invisible fallback for adjusters outside a measured preview session.
+    // The active tab's measured session period overrides it at run time.
+    adjusterMinDelay = LEGACY_ADJUSTER_MIN_DELAY_MS;
+    adjusterMaxDelay = LEGACY_ADJUSTER_MAX_DELAY_MS;
     startupDir = STARTUPDIR_LAST;
     startupPath = "";
     useBundledProfiles = true;
@@ -1521,52 +1530,6 @@ void Options::readFromFile(Glib::ustring fname)
                 if (keyFile.has_key("Performance", "ThumbnailInspectorMode")) {
                     rtSettings.thumbnail_inspector_mode = static_cast<rtengine::Settings::ThumbnailInspectorMode>(keyFile.get_integer("Performance", "ThumbnailInspectorMode"));
                 }
-
-                if (keyFile.has_key("Performance", "PreviewRefreshMs")) {
-                    rtSettings.previewRefreshMs = keyFile.get_integer("Performance", "PreviewRefreshMs");
-                } else if (keyFile.has_key("General", "AdjusterMinDelay")
-                        || keyFile.has_key("General", "AdjusterMaxDelay")) {
-                    // Migrate the legacy adjuster pair. A missing key keeps
-                    // the old build's default, not the new single default.
-                    const int legacyMin =
-                        keyFile.has_key("General", "AdjusterMinDelay")
-                            ? adjusterMinDelay
-                            : rtengine::PREVIEW_REFRESH_MIN_MS;
-                    const int legacyMax =
-                        keyFile.has_key("General", "AdjusterMaxDelay")
-                            ? adjusterMaxDelay
-                            : rtengine::PREVIEW_REFRESH_MAX_MS;
-                    rtSettings.previewRefreshMs =
-                        std::max(legacyMin, legacyMax);
-                }
-
-                rtSettings.previewRefreshMs =
-                    rtengine::previewRefreshClamp(rtSettings.previewRefreshMs);
-                adjusterMinDelay = adjusterMaxDelay =
-                    rtSettings.previewRefreshMs;
-            }
-
-            if (!keyFile.has_group("Performance")) {
-                // A file saved before the Performance group existed carries
-                // only the legacy adjuster pair. Migrate its slower value so
-                // the single period keeps the old maximum, then keep both
-                // legacy values in sync.
-                if (keyFile.has_key("General", "AdjusterMinDelay")
-                        || keyFile.has_key("General", "AdjusterMaxDelay")) {
-                    const int legacyMin =
-                        keyFile.has_key("General", "AdjusterMinDelay")
-                            ? adjusterMinDelay
-                            : rtengine::PREVIEW_REFRESH_MIN_MS;
-                    const int legacyMax =
-                        keyFile.has_key("General", "AdjusterMaxDelay")
-                            ? adjusterMaxDelay
-                            : rtengine::PREVIEW_REFRESH_MAX_MS;
-                    rtSettings.previewRefreshMs = rtengine::previewRefreshClamp(
-                        std::max(legacyMin, legacyMax));
-                }
-
-                adjusterMinDelay = adjusterMaxDelay =
-                    rtSettings.previewRefreshMs;
             }
 
             if (keyFile.has_group("GUI")) {
@@ -2654,7 +2617,6 @@ void Options::saveToFile(Glib::ustring fname)
         keyFile.set_integer("Performance", "ChunkSizeXT", chunkSizeXT);
         keyFile.set_integer("Performance", "ChunkSizeCA", chunkSizeCA);
         keyFile.set_integer("Performance", "ThumbnailInspectorMode", int(rtSettings.thumbnail_inspector_mode));
-        keyFile.set_integer("Performance", "PreviewRefreshMs", rtSettings.previewRefreshMs);
 
 
         keyFile.set_string("Output", "Format", saveFormat.format);

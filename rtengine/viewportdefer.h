@@ -30,8 +30,8 @@ namespace rtengine
 /**
  * @brief Bounds of the deferred settle window and max-wait cap.
  *
- * Unit: milliseconds. Both values follow Settings::previewRefreshMs, which the
- * Preview Refresh preference clamps to 100 to 200 ms. The wider 0 to 1000 ms
+ * Unit: milliseconds. Both values follow the measured session preview period,
+ * which previewrefresh.h clamps to 100 to 1000 ms. The wider 0 to 1000 ms
  * range remains for the RT_VIEWPORT_DEFER_MS and RT_VIEWPORT_DEFER_MAX_MS
  * environment overrides. Zero reproduces the pre-deferral behaviour: the
  * analysis is queued immediately.

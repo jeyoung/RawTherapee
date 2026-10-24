@@ -425,9 +425,9 @@ public:
         }
     }
 
-    int getRecommendedPreviewRefreshMs() const
+    int getSessionPreviewRefreshMs() const
     {
-        return ipc ? ipc->getRecommendedPreviewRefreshMs() : -1;
+        return ipc ? ipc->getSessionPreviewRefreshMs() : -1;
     }
 
     //DFProvider interface

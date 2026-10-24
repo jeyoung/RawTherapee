@@ -787,10 +787,13 @@ public:
     /** Returns the height of the preview image.
       * @return the height of the preview image */
     virtual int         getPreviewHeight () = 0;
-    /** Returns the measured Preview Refresh recommendation in milliseconds,
-      * clamped to the supported range, or -1 when no complete refresh has
-      * been measured yet. The default implementation has no measurement. */
-    virtual int         getRecommendedPreviewRefreshMs () const
+    /** Returns the smoothed period of the current editing session in
+      * milliseconds, clamped to the supported range, or -1 when no complete
+      * refresh has been measured yet. The period is derived from the measured
+      * crop plus deferred-analysis cost and is used for the adjuster debounce
+      * of the active tab and for the deferred settle and max-wait. The default
+      * implementation has no measurement. */
+    virtual int         getSessionPreviewRefreshMs () const
     {
         return -1;
     }

@@ -32,7 +32,9 @@
 #include "editorpanel.h"
 #include "filepanel.h"
 #include "tools/filmsimulation.h"
+#include "widgets/basic/adjuster.h"
 
+#include "rtengine/previewrefresh.h"
 #include "rtengine/profiling.h"
 #include "rtengine/settings.h"
 
@@ -327,6 +329,7 @@ RTWindow::RTWindow ()
         epanel->setParent (this);
         epanel->setParentWindow (this);
         add (*epanel);
+        setActiveEditorPanel(epanel);
         show_all ();
 
         pldBridge = nullptr; // No progress listener
@@ -605,6 +608,10 @@ void RTWindow::on_mainNB_switch_page (Gtk::Widget* widget, guint page_num)
             EditorPanel *ep = static_cast<EditorPanel*> (mainNB->get_nth_page (page_num));
             ep->setAspect();
 
+            // The adjuster debounce follows the newly active tab's measured
+            // session period; a tab with no measurement uses the fallback.
+            setActiveEditorPanel(ep);
+
             if (!isSingleTabMode()) {
                 if (filesEdited.size() > 0) {
                     set_title_decorated (ep->getFileName());
@@ -612,6 +619,8 @@ void RTWindow::on_mainNB_switch_page (Gtk::Widget* widget, guint page_num)
             }
         } else {
             // in single tab mode with command line filename epanel does not exist yet
+            setActiveEditorPanel(nullptr);
+
             if (isSingleTabMode() && epanel) {
                 // Save profile on leaving the editor panel
                 epanel->saveProfile();
@@ -672,6 +681,7 @@ void RTWindow::addEditorPanel (EditorPanel* ep, const std::string &name)
         filesEdited.insert ( name );
         fpanel->refreshEditedState (filesEdited);
         ep->tbTopPanel_1_visible (false); //hide the toggle Top Panel button
+        setActiveEditorPanel(ep);
     }
 }
 
@@ -687,6 +697,7 @@ void RTWindow::remEditorPanel (EditorPanel* ep)
     } else {
         bool queueHadFocus = (mainNB->get_current_page() == mainNB->page_num (*bpanel));
         ep->setExternalEditorChangedSignal(nullptr);
+        ep->setActive(false);
         epanels.erase (ep->getFileName());
         filesEdited.erase (ep->getFileName ());
         fpanel->refreshEditedState (filesEdited);
@@ -1258,9 +1269,31 @@ void RTWindow::setWindowSize ()
     onConfEventConn.block(false);
 }
 
-int RTWindow::getRecommendedPreviewRefreshMs() const
+int RTWindow::getSessionPreviewRefreshMs() const
 {
-    return epanel ? epanel->getRecommendedPreviewRefreshMs() : -1;
+    return epanel ? epanel->getSessionPreviewRefreshMs() : -1;
+}
+
+void RTWindow::setActiveEditorPanel(EditorPanel* panel)
+{
+    // The simple editor and the single-tab editor are hosted directly or as
+    // the persistent editor page; tabbed editors live in epanels.
+    if (epanel) {
+        epanel->setActive(panel == epanel);
+    }
+
+    for (auto& entry : epanels) {
+        entry.second->setActive(entry.second == panel);
+    }
+
+    if (!panel) {
+        return;
+    }
+
+    // A panel may be activated before it is inserted in epanels.
+    panel->setActive(true);
+    Adjuster::setSessionDelay(rtengine::previewRefreshResolved(
+        panel->getSessionPreviewRefreshMs()));
 }
 
 void RTWindow::get_position(int& x, int& y) const
@@ -1338,6 +1371,7 @@ void RTWindow::setEditorMode (bool tabbedUI)
     if (tabbedUI) {
         mainNB->remove_page (*epanel);
         epanel = nullptr;
+        setActiveEditorPanel(nullptr);
         set_title_decorated ("");
     } else {
         createSetmEditor();
@@ -1372,6 +1406,7 @@ void RTWindow::createSetmEditor()
     editorLabelGrid->show_all ();
     epanel->tbTopPanel_1_visible (true); //show the toggle Top Panel button
     mainNB->append_page (*epanel, *editorLabelGrid);
+    setActiveEditorPanel(epanel);
 
 }
 

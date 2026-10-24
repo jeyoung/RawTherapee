@@ -24,6 +24,7 @@
 #include "options.h"
 #include "guiutils.h"
 #include "rtimage.h"
+#include "widgets/basic/adjuster.h"
 
 #define MIN_RESET_BUTTON_HEIGHT 17
 
@@ -186,9 +187,9 @@ double ThresholdAdjuster::shapeValue (double a)
 
 void ThresholdAdjuster::selectorChanged ()
 {
-    // The Preview Refresh preference is read per change so a live update
-    // applies to threshold widgets too.
-    delay = App::get().options().rtSettings.previewRefreshMs;
+    // The active tab's measured session period is read per change so a live
+    // update applies to threshold widgets too.
+    delay = Adjuster::sessionDelayMs();
 
     if (delayConnection.connected()) {
         delayConnection.disconnect ();

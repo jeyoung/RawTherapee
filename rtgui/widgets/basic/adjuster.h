@@ -135,8 +135,23 @@ public:
     void trimValue (int &val) const;
     void setLogScale(double base, double pivot, bool anchorMiddle = false);
     void setDelay(unsigned int min_delay_ms, unsigned int max_delay_ms = 0);
-    // Apply one debounce period to every live adjuster. The Preview Refresh
-    // preference is authoritative, so this overrides per-tool setDelay calls.
-    static void setGlobalDelay(unsigned int ms);
+    // Apply one measured session period to every live adjuster. The value is
+    // the active tab's smoothed preview period; it overrides per-tool
+    // setDelay calls until the next active preview updates it.
+    static void setSessionDelay(unsigned int ms);
+    // The period set by the last setSessionDelay() call, in milliseconds.
+    static int sessionDelayMs();
     void showIcons(bool yes);
+
+private:
+    // Smoothed session period in milliseconds; see setSessionDelay().
+    static int sessionDelayValue;
+    // Delays currently applied to this adjuster, so the session update can
+    // skip adjusters that already match and leave an in-flight delayed
+    // callback untouched.
+    int appliedMinDelayMs = 0;
+    int appliedMaxDelayMs = 0;
+
+    // Apply the session period without disconnecting pending timeouts.
+    void applySessionDelay(unsigned int ms);
 };

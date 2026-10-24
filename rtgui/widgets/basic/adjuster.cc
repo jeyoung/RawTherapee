@@ -26,13 +26,14 @@
 #include "options.h"
 #include "rtimage.h"
 #include "rtscalable.h"
+#include "rtengine/previewrefresh.h"
 #include "rtengine/rt_math.h"
 
 namespace {
 
 constexpr int MIN_RESET_BUTTON_HEIGHT = 17;
 
-// Every live adjuster, so a preference change can reach them without a
+// Every live adjuster, so the measured session period can reach them without a
 // restart. Adjusters are created and destroyed on the GUI thread. The set is
 // leaked deliberately so widget teardown at exit cannot outlive it.
 std::unordered_set<Adjuster*>& adjusterRegistry()
@@ -46,6 +47,8 @@ double one2one(double val)
     return val;
 }
 }
+
+int Adjuster::sessionDelayValue = rtengine::PREVIEW_REFRESH_DEFAULT_MS;
 
 Adjuster::Adjuster(
     Glib::ustring vlabel,
@@ -704,15 +707,40 @@ bool Adjuster::getAddMode() const
 
 void Adjuster::setDelay(unsigned int min_delay_ms, unsigned int max_delay_ms)
 {
+    appliedMinDelayMs = static_cast<int>(min_delay_ms);
+    appliedMaxDelayMs = static_cast<int>(max_delay_ms);
     spinChange.setDelay(min_delay_ms, max_delay_ms);
     sliderChange.setDelay(min_delay_ms, max_delay_ms);
 }
 
-void Adjuster::setGlobalDelay(unsigned int ms)
+void Adjuster::applySessionDelay(unsigned int ms)
 {
+    appliedMinDelayMs = static_cast<int>(ms);
+    appliedMaxDelayMs = static_cast<int>(ms);
+    spinChange.setDelayValues(ms, ms);
+    sliderChange.setDelayValues(ms, ms);
+}
+
+void Adjuster::setSessionDelay(unsigned int ms)
+{
+    sessionDelayValue = rtengine::previewRefreshClamp(static_cast<int>(ms));
+
     for (Adjuster* adjuster : adjusterRegistry()) {
-        adjuster->setDelay(ms, ms);
+        // setDelay() disconnects pending timeouts, so an update that matches
+        // is skipped and a changed period is applied without cancelling the
+        // user's last edit. A new adjuster still receives the session period
+        // on the next active preview.
+        if (adjuster->appliedMinDelayMs != sessionDelayValue
+                || adjuster->appliedMaxDelayMs != sessionDelayValue) {
+            adjuster->applySessionDelay(
+                static_cast<unsigned int>(sessionDelayValue));
+        }
     }
+}
+
+int Adjuster::sessionDelayMs()
+{
+    return sessionDelayValue;
 }
 
 void Adjuster::showIcons(bool yes)

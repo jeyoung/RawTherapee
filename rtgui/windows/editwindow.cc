@@ -18,11 +18,13 @@
 #include "editwindow.h"
 #include "editorpanel.h"
 #include "filepanel.h"
+#include "rtengine/previewrefresh.h"
 #include "rtengine/procparams.h"
 #include "options.h"
 #include "preferences.h"
 #include "cursormanager.h"
 #include "rtwindow.h"
+#include "widgets/basic/adjuster.h"
 #include <gtk/gtk.h>
 #include "threadutils.h"
 
@@ -197,6 +199,18 @@ void EditWindow::on_mainNB_switch_page(Gtk::Widget* widget, guint page_num)
         set_title_decorated(ep->getFileName());
     }
 
+    ep->setActive(true);
+
+    for (auto& entry : epanels) {
+        if (entry.second != ep) {
+            entry.second->setActive(false);
+        }
+    }
+
+    // Multi-display editors follow their own measured session period too.
+    Adjuster::setSessionDelay(rtengine::previewRefreshResolved(
+        ep->getSessionPreviewRefreshMs()));
+
     ep->setAspect();
     //}
 }
@@ -235,6 +249,12 @@ void EditWindow::addEditorPanel (EditorPanel* ep, const std::string &name)
     filesEdited.insert ( name );
     parent->fpanel->refreshEditedState (filesEdited);
 
+    // set_current_page() normally emits switch_page, but make the new page
+    // authoritative even when the notebook was empty.
+    ep->setActive(true);
+    Adjuster::setSessionDelay(rtengine::previewRefreshResolved(
+        ep->getSessionPreviewRefreshMs()));
+
     show_all();
 }
 
@@ -245,6 +265,7 @@ void EditWindow::remEditorPanel (EditorPanel* ep)
     }
 
     ep->setExternalEditorChangedSignal(nullptr);
+    ep->setActive(false);
     epanels.erase (ep->getFileName());
     filesEdited.erase (ep->getFileName ());
     parent->fpanel->refreshEditedState (filesEdited);

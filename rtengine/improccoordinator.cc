@@ -98,6 +98,7 @@ struct PreviewTimer {
     long long viewportCropMs = -1;
     int viewportDeferredTodo = 0;
     int viewportDeferredHits = 0;
+    int sessionRefreshMs = rtengine::PREVIEW_REFRESH_DEFAULT_MS;
     int todo = 0;
     std::chrono::steady_clock::time_point start =
         std::chrono::steady_clock::now();
@@ -121,11 +122,13 @@ struct PreviewTimer {
         if (viewportFast) {
             std::fprintf(stderr,
                          " viewport=fast crop_ms=%lld deferred_todo=0x%x"
-                         " deferred_hits=%d\n",
+                         " deferred_hits=%d session_refresh_ms=%d\n",
                          viewportCropMs, viewportDeferredTodo,
-                         viewportDeferredHits);
+                         viewportDeferredHits, sessionRefreshMs);
         } else if (viewportDeferred) {
-            std::fprintf(stderr, " viewport=deferred-analysis\n");
+            std::fprintf(stderr,
+                         " viewport=deferred-analysis session_refresh_ms=%d\n",
+                         sessionRefreshMs);
         } else if (viewportFallback) {
             std::fprintf(stderr, " viewport=fallback reason=%s\n",
                          viewportFallback);
@@ -551,9 +554,9 @@ int viewportDeferredSettleMs(int configuredMs)
 {
     // Unit: ms. Range: VIEWPORT_DEFERRED_SETTLE_MS_MIN..MAX. 0 queues the
     // deferred analysis immediately, reproducing the pre-deferral behaviour.
-    // The Preview Refresh preference is authoritative unless the environment
-    // override is set. The caller snapshots the preference once per request
-    // so the settle and cap cannot see different values mid-pass.
+    // The measured session period is authoritative unless the environment
+    // override is set. The caller snapshots the period once per request so the
+    // settle and cap cannot see different values mid-pass.
     int value = 0;
     if (!viewportDeferredEnvMs("RT_VIEWPORT_DEFER_MS", value)) {
         value = std::clamp(configuredMs,
@@ -567,7 +570,7 @@ int viewportDeferredMaxWaitMs(int configuredMs)
 {
     // Unit: ms, measured from the oldest deferral hit. Range:
     // VIEWPORT_DEFERRED_SETTLE_MS_MIN..MAX. The deferred pass uses the same
-    // Preview Refresh period for its settle and its cap.
+    // measured session period for its settle and its cap.
     int value = 0;
     if (!viewportDeferredEnvMs("RT_VIEWPORT_DEFER_MAX_MS", value)) {
         value = std::clamp(configuredMs,
@@ -1016,7 +1019,7 @@ void ImProcCoordinator::absorbPendingDeferred(int& todo)
 
 int ImProcCoordinator::queueViewportDeferredAnalysis(int todo,
                                                      unsigned request,
-                                                     int previewRefreshMs)
+                                                     int sessionRefreshMs)
 {
     // Rebuild the full-frame analysis from the base image already held in
     // oprevi. Base bits such as M_HDR/M_SPOT are over-approximated by several
@@ -1043,14 +1046,14 @@ int ImProcCoordinator::queueViewportDeferredAnalysis(int todo,
 
     pendingDeferredDeadlineUs = viewportDeferredDeadline(
         pendingDeferredFirstUs, now,
-        viewportDeferredSettleMs(previewRefreshMs),
-        viewportDeferredMaxWaitMs(previewRefreshMs));
+        viewportDeferredSettleMs(sessionRefreshMs),
+        viewportDeferredMaxWaitMs(sessionRefreshMs));
 
     viewportDeferredParams = *params;
     viewportDeferredRequest.store(request, std::memory_order_relaxed);
     deferredCropRendered.store(true, std::memory_order_relaxed);
 
-    const bool flushNow = viewportDeferredSettleMs(previewRefreshMs) == 0;
+    const bool flushNow = viewportDeferredSettleMs(sessionRefreshMs) == 0;
 
     paramsUpdateMutex.unlock();
 
@@ -1096,19 +1099,17 @@ void ImProcCoordinator::invalidateViewportState()
     timingGeneration.fetch_add(1, std::memory_order_relaxed);
     lastCropMs.store(-1, std::memory_order_relaxed);
     lastAnalysisMs.store(-1, std::memory_order_relaxed);
+    sessionRefreshMs.store(-1, std::memory_order_relaxed);
     dropPendingDeferred();
 }
 
-int ImProcCoordinator::getRecommendedPreviewRefreshMs() const
+int ImProcCoordinator::getSessionPreviewRefreshMs() const
 {
-    const int crop = lastCropMs.load(std::memory_order_relaxed);
-    const int analysis = lastAnalysisMs.load(std::memory_order_relaxed);
-
-    if (crop < 0 || analysis < 0) {
-        return -1;
-    }
-
-    return previewRefreshClamp(crop + analysis);
+    // The smoothed period of the last complete refresh. -1 means the current
+    // image and zoom have no measurement yet; callers fall back to
+    // PREVIEW_REFRESH_DEFAULT_MS. The value lives per coordinator, so a
+    // background tab keeps its own period.
+    return sessionRefreshMs.load(std::memory_order_relaxed);
 }
 
 DetailedCrop* ImProcCoordinator::createCrop(::EditDataProvider *editDataProvider, bool isDetailWindow)
@@ -1152,17 +1153,19 @@ void ImProcCoordinator::updatePreviewImage(int todo, bool panningRelatedChange,
 
     // A deferred catch-up pass is the full-frame analysis the fast path
     // skipped. Its wall time, added to the crop time of the last fast hit,
-    // feeds the measured Preview Refresh recommendation.
+    // feeds the measured session period used by both the adjuster debounce and
+    // the deferred settle/cap.
     const bool wasDeferred =
         forceFullPreview.load(std::memory_order_relaxed);
     const unsigned timingGenerationAtStart =
         timingGeneration.load(std::memory_order_relaxed);
-    const int previewRefreshMs = settings
-        ? settings->previewRefreshMs : PREVIEW_REFRESH_DEFAULT_MS;
+    const int requestSessionMs =
+        previewRefreshResolved(getSessionPreviewRefreshMs());
     const auto analysisStart = std::chrono::steady_clock::now();
 
     PreviewTimer previewTimer(todo,
                               g_getenv("RT_PREVIEW_PROFILE") != nullptr);
+    previewTimer.sessionRefreshMs = requestSessionMs;
     LoadProfile::Timer pipelineTimer(
         "preview pipeline", &LoadProfile::state().pipelineSeen);
 
@@ -1226,7 +1229,7 @@ void ImProcCoordinator::updatePreviewImage(int todo, bool panningRelatedChange,
         }
         previewTimer.viewportDeferredTodo =
             queueViewportDeferredAnalysis(eligibilityTodo, request,
-                                          previewRefreshMs);
+                                          requestSessionMs);
         {
             MyMutex::MyLock lock(paramsUpdateMutex);
             previewTimer.viewportDeferredHits = pendingDeferredHits;
@@ -3828,12 +3831,24 @@ void ImProcCoordinator::updatePreviewImage(int todo, bool panningRelatedChange,
         if (wasDeferred
                 && timingGeneration.load(std::memory_order_relaxed)
                     == timingGenerationAtStart) {
-            lastAnalysisMs.store(
-                static_cast<int>(
-                    std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::steady_clock::now() - analysisStart)
-                        .count()),
-                std::memory_order_relaxed);
+            const int analysisMs = static_cast<int>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - analysisStart)
+                    .count());
+            lastAnalysisMs.store(analysisMs, std::memory_order_relaxed);
+
+            const int cropMs = lastCropMs.load(std::memory_order_relaxed);
+            if (cropMs >= 0) {
+                // A complete refresh is the visible crop plus the deferred
+                // full-frame analysis. Blend it into the session period so a
+                // single noisy pass cannot swing the debounce or the settle.
+                const int measured = previewRefreshClamp(cropMs + analysisMs);
+                sessionRefreshMs.store(
+                    previewRefreshSmooth(
+                        sessionRefreshMs.load(std::memory_order_relaxed),
+                        measured),
+                    std::memory_order_relaxed);
+            }
         }
     } else {
         // This request did not rebuild the base/analysis state. Never publish

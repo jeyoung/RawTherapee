@@ -82,6 +82,16 @@ public:
     {
         return loadingPlaceholder;
     }
+    // The hosting window marks the page the user is editing. The GUI adjuster
+    // debounce follows only the active editor's session period.
+    void setActive(bool isActive)
+    {
+        active = isActive;
+    }
+    bool isActive() const
+    {
+        return active;
+    }
     void setAspect ();
     void on_realize () override;
     void leftPaneButtonReleased (GdkEventButton *event);
@@ -196,7 +206,7 @@ public:
     void close ();
     Glib::ustring getShortName ();
     Glib::ustring getFileName () const;
-    int getRecommendedPreviewRefreshMs() const;
+    int getSessionPreviewRefreshMs() const;
     bool handleShortcutKey (GdkEventKey* event);
 
     bool getIsProcessing() const
@@ -300,6 +310,7 @@ private:
     FilePanel* fPanel;
 
     bool firstProcessingDone;
+    bool active = false;  // true when this panel is the active editor page
 
     Thumbnail* openThm;  // may get invalid on external delete event
     Glib::ustring fname;  // must be saved separately
@@ -339,6 +350,7 @@ private:
     void setEditingSensitive(bool sensitive);
     void endLoadingPlaceholder(bool applyDeferredState = true);
     void onPreviewReady();
+    void onSessionPreviewReady();
 
     IdleRegister idle_register;
 

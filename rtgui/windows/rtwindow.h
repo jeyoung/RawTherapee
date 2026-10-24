@@ -96,6 +96,9 @@ public:
     bool on_delete_event (GdkEventAny* event) override;
     bool on_window_state_event (GdkEventWindowState* event) override;
     void on_mainNB_switch_page (Gtk::Widget* widget, guint page_num);
+    // Mark the active editor page and apply its session period to the GUI
+    // adjuster debounce. A null panel deactivates every editor.
+    void setActiveEditorPanel (EditorPanel* panel);
 
     void showRawPedia();
     void showICCProfileCreator ();
@@ -103,7 +106,7 @@ public:
     void on_realize () override;
     void toggle_fullscreen ();
     void get_position(int& x, int& y) const;
-    int getRecommendedPreviewRefreshMs() const;
+    int getSessionPreviewRefreshMs() const;
 
     void setProgress(double p) override;
     void setProgressStr(const Glib::ustring& str) override;

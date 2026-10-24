@@ -26,6 +26,7 @@
 #include "rtengine/refreshmap.h"
 #include "rtengine/iccstore.h"
 #include "rtengine/previewquality.h"
+#include "rtengine/previewrefresh.h"
 #include "batchqueue.h"
 #include "batchqueueentry.h"
 #include "soundman.h"
@@ -41,6 +42,7 @@
 #include "pathutils.h"
 #include "thumbnail.h"
 #include "toolpanelcoord.h"
+#include "widgets/basic/adjuster.h"
 #include "widgets/basic/popupbutton.h"
 #include "windows/rtappchooserdialog.h"
 #include "windows/rtwindow.h"
@@ -1464,6 +1466,19 @@ void EditorPanel::onPreviewReady()
     endLoadingPlaceholder();
 }
 
+void EditorPanel::onSessionPreviewReady()
+{
+    // Follow the active editor only. A background tab keeps its own
+    // engine-side deferred period, but the GUI debounce belongs to the panel
+    // the user is working in. RTWindow and EditWindow mark the active page.
+    if (!isActive()) {
+        return;
+    }
+
+    Adjuster::setSessionDelay(rtengine::previewRefreshResolved(
+        getSessionPreviewRefreshMs()));
+}
+
 void EditorPanel::endLoadingPlaceholder(bool applyDeferredState)
 {
     if (!loadingPlaceholder) {
@@ -1537,6 +1552,8 @@ void EditorPanel::open (Thumbnail* tmb, rtengine::InitialImage* isrc)
 
     previewHandler->signalPreviewReady().connect(
         sigc::mem_fun(*this, &EditorPanel::onPreviewReady));
+    previewHandler->signalPreviewReady().connect(
+        sigc::mem_fun(*this, &EditorPanel::onSessionPreviewReady));
 
     this->isrc = isrc;
     ipc = rtengine::StagedImageProcessor::create (isrc);
@@ -1712,9 +1729,9 @@ Glib::ustring EditorPanel::getFileName () const
     }
 }
 
-int EditorPanel::getRecommendedPreviewRefreshMs() const
+int EditorPanel::getSessionPreviewRefreshMs() const
 {
-    return tpc ? tpc->getRecommendedPreviewRefreshMs() : -1;
+    return tpc ? tpc->getSessionPreviewRefreshMs() : -1;
 }
 
 // TODO!!!

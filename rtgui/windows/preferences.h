@@ -161,8 +161,6 @@ class Preferences final :
 
     Gtk::ComboBoxText* cprevdemo;
     Gtk::CheckButton* ctiffserialize;
-    Gtk::Scale* previewRefreshScale = nullptr;
-    Gtk::Label* previewRefreshRecommendedLabel = nullptr;
     Gtk::ComboBoxText* curveBBoxPosC;
     Gtk::ComboBoxText* curveBBoxPosS;
 
@@ -278,7 +276,6 @@ class Preferences final :
     ToolLocationPreference *toolLocationPreference;
 
     void fillPreferences ();
-    void updatePreviewRefreshRecommended ();
     void storePreferences ();
     void parseDir       (Glib::ustring dirname, std::vector<Glib::ustring>& items, Glib::ustring ext);
     void parseThemeDir  (Glib::ustring dirname);

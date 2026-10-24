@@ -44,6 +44,7 @@
 #include "options.h"
 #include "rtimage.h"
 #include "rtscalable.h"
+#include "widgets/basic/adjuster.h"
 
 using rtengine::Color;
 
@@ -631,11 +632,12 @@ bool LabGridArea::on_motion_notify_event(GdkEventMotion *event)
         }
         edited = true;
         grab_focus();
-        const auto& options = App::get().options();
-        if (options.adjusterMinDelay == 0) {
+        const int delay = Adjuster::sessionDelayMs();
+
+        if (delay == 0) {
             notifyListener();
         } else {
-            delayconn = Glib::signal_timeout().connect(sigc::mem_fun(*this, &LabGridArea::notifyListener), options.adjusterMinDelay);
+            delayconn = Glib::signal_timeout().connect(sigc::mem_fun(*this, &LabGridArea::notifyListener), delay);
         }
         queue_draw();
     } else {

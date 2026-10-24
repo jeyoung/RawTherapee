@@ -190,6 +190,15 @@ public:
         max_timeout.disconnect();
     }
 
+    // Update the delays without touching pending timeouts. A running callback
+    // still fires with the timeout it was armed with, so the last edit of a
+    // burst is not dropped when the period changes mid-interaction.
+    void setDelayValues(unsigned int min_delay_ms, unsigned int max_delay_ms = 0)
+    {
+        this->min_delay_ms = min_delay_ms;
+        this->max_delay_ms = max_delay_ms;
+    }
+
 private:
     void onSignal(Ts... ts)
     {

@@ -147,8 +147,32 @@ bool testPreviewRefreshClamp()
     CHECK(previewRefreshClamp(50) == 100);
     CHECK(previewRefreshClamp(100) == 100);
     CHECK(previewRefreshClamp(125) == 125);
-    CHECK(previewRefreshClamp(200) == 200);
-    CHECK(previewRefreshClamp(250) == 200);
+    CHECK(previewRefreshClamp(1000) == 1000);
+    CHECK(previewRefreshClamp(1200) == 1000);
+
+    // An unmeasured session falls back to the default period.
+    CHECK(previewRefreshResolved(-1) == PREVIEW_REFRESH_DEFAULT_MS);
+    CHECK(previewRefreshResolved(125) == 125);
+
+    return true;
+}
+
+bool testPreviewRefreshSmooth()
+{
+    using namespace rtengine;
+
+    // The first measurement seeds the average.
+    CHECK(previewRefreshSmooth(-1, 240) == 240);
+
+    // A repeated measurement is a fixed point.
+    CHECK(previewRefreshSmooth(240, 240) == 240);
+
+    // One quarter of the step is applied per refresh.
+    CHECK(previewRefreshSmooth(100, 900) == 300);
+    CHECK(previewRefreshSmooth(1000, 100) == 775);
+
+    // The measurement is clamped before it is blended.
+    CHECK(previewRefreshSmooth(100, 5000) == 325);
 
     return true;
 }
@@ -178,6 +202,10 @@ int main()
     }
 
     if (!testPreviewRefreshClamp()) {
+        return 1;
+    }
+
+    if (!testPreviewRefreshSmooth()) {
         return 1;
     }
 
