@@ -83,6 +83,28 @@ The graph returns a plan; it does not yet drive the four production
 pipelines. That migration is the next step, and is intentionally separate
 from the armature so the existing pipelines remain unchanged by default.
 
+## Graph-driven export
+
+`ImageProcessor::normal_pipeline()` now has an opt-in graph-driven form. With
+`RT_STAGE_GRAPH=1` the four export stages become `StageGraph` nodes
+(`export.init`, `export.denoise`, `export.transform`, `export.finish`), each
+declared with an explicit `RT_STAGE_RECOMPUTE` reuse mode and connected in
+execution order. The graph is built per job, so every node is dirty and
+`plan()` returns `Recompute` for all four. Execution follows
+`topologicalOrder()`; a reuse decision fails closed with `nullptr` because
+this path has no stage buffer cache yet. The node id selects the same
+`stage_*` member the legacy path calls, so the arithmetic is untouched.
+
+Unset, empty, `0` and `off` (case-insensitive) keep the legacy hand-ordered
+pipeline, which remains the default. `RT_STAGE_PROFILE=1` prints the same
+`export.*` keys from the graph nodes, timed with `stage::ScopedProfile`.
+
+Evidence: the 45.7 MP sidecar export with `devnotes/opencl/pp3/resize.pp3`
+at 8 threads is pixel-identical (`AE=0`, 0 differing of 34 229 520 samples)
+between `RT_STAGE_GRAPH=0` and `RT_STAGE_GRAPH=1`, and also against unset and
+`off`. `tools/perf/run-suite.sh --graph` runs that comparison as an optional
+gate.
+
 `buildTilePlan()` produces a cheap block score from a luminance plane and
 splits blocks into full and cheap work. It is the hook for selective
 denoise/wavelet work; it is not yet wired into those tools.
@@ -151,8 +173,9 @@ parity.
 
 ## Limitations
 
-- The four production pipelines are not yet graph-driven. The graph and cache
-  are armature plus tests, not a live replacement.
+- Preview, crop and thumbnail pipelines are not graph-driven. Export is
+  graph-driven only when `RT_STAGE_GRAPH=1`; the legacy path is the default
+  and the graph path does not yet cache or reuse buffers.
 - Only Lanczos is exposed as a loadable stage. Denoise, wavelet, local
   adjustments and the output conversion still use the existing code paths.
 - The block scorer is not connected to denoise or wavelet; it has no runtime
