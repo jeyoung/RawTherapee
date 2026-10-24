@@ -70,6 +70,9 @@ The 100% Exposure sequence contains one 3196 ms outlier; excluding it would
 lower the p95, but the raw sequence is reported. The current interactive
 target p95 <100 ms at fit and <250 ms at 100% is **not met**.
 
+The timer starts after stale-request rejection; cold renders include initial
+image loading and are reported separately.
+
 The analysis pass is now deferred to the end of the interaction burst, so a
 drag no longer pays one whole-frame pass per update (see
 `devnotes/perf/VIEWPORT_FAST_PATH.md`, "Deferred analysis"). The table above
@@ -77,8 +80,12 @@ still counts each completed request, so its p50 includes both the viewport
 crop and the analysis. The remaining interactive lever is progressive
 lower-resolution crop rendering during the gesture, not another cache.
 
-The timer starts after stale-request rejection; cold renders include initial
-image loading and are reported separately.
+On a private 45.7 MP NEF the debounced burst went from seven analysis passes
+to two at fit and at 100 %, and the viewport was pixel-identical to the
+fallback; the served hit cost 37-40 ms at fit and 57-61 ms at 100 %. See
+`VIEWPORT_FAST_PATH.md`, "Deferred analysis", for the full tables and the
+navigator/histogram MAE note.
+
 
 ## Initial-load reveal
 

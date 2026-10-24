@@ -222,34 +222,84 @@ and a fresh settings directory:
 
 Unit test: `tools/perf/test-fast-preview.sh build/cpu-issue-23-viewport-defer`
 PASS, covering the deferred mask, the deadline cap, and the single-hit crop
-reuse rule.
+reuse rule. The OpenCL build passed `tools/opencl/verify.sh --quick` on the
+AMD Radeon RX 550: `pef/neutral max_pae=1.5259e-05` and the monitor self-test
+(1 byte, 14 of 196608 samples).
 
-Method: CPU build, 10.2 MP PEF, neutral profile
-(`HistogramMatching=false`), Xvfb 1600x1000 with `GDK_BACKEND=x11`, one
-sustained 57-event Exposure Compensation drag, default threading. The counts
-come from `RT_PREVIEW_PROFILE=1`; each configuration was run once, so the
-timings are context rather than a benchmark. `GDK_BACKEND=x11` is required on
-a Wayland host: without it GDK connects to the host compositor and the Xvfb
-window tree stays empty.
+Method: CPU build, 4C/8T host, GUI under Xvfb 1600x1000 with
+`GDK_BACKEND=x11`, default threading. The edit is 30 Up presses on the
+Exposure compensation spin box, which produces the same debounced burst as a
+slider drag without depending on the panel layout. The counts come from
+`RT_PREVIEW_PROFILE=1`; one run per configuration, so the timings are context
+rather than a benchmark.
+
+- 10.2 MP PEF, neutral profile (`HistogramMatching=false`), final value
+  +1.50 EV.
+- 45.7 MP NEF (private sample, 8288x5520) with its sidecar, final value
+  +1.86 EV. Sidecars and raw files stay under `build/test-scratch/` and are
+  never tracked.
+
+`GDK_BACKEND=x11` is required on a Wayland host: without it GDK connects to
+the host compositor and the Xvfb window tree stays empty.
+
+### 10.2 MP, fit
 
 | Configuration | fast hits | analyses | fallbacks | samples | p50 | p95 |
 |---|---:|---:|---:|---:|---:|---:|
-| `RT_VIEWPORT_FAST=0` | 0 | 0 | 13 | 13 | 59 ms | 75 ms |
-| `RT_VIEWPORT_DEFER_MS=0` | 9 | 9 | 4 | 22 | 26 ms | 74 ms |
-| default (250 / 500 ms) | 8 | 3 | 4 | 15 | 16 ms | 79 ms |
+| `RT_VIEWPORT_FAST=0` | 0 | 0 | 9 | 9 | 54 ms | 64 ms |
+| `RT_VIEWPORT_DEFER_MS=0` | 5 | 5 | 4 | 14 | 24 ms | 93 ms |
+| default (250 / 500 ms) | 5 | 2 | 4 | 11 | 20 ms | 69 ms |
 
-- Fast hits cost 12–15 ms for the visible crop; the deferred analysis costs
-  39–41 ms because a burst of more than one hit re-renders the crops.
-- The 250 ms settle coalesces the burst into one analysis, as designed
-  (8–9 hits, 3 analyses); the 500 ms cap fires during a continuous drag.
-- p95 includes the one-time first-edit `no-complete-full-state` pass, so it
-  is not the interaction latency; the per-kind figures above are.
-- `compare -metric AE` = 0 for the full 1600x1000 final frame between
-  `RT_VIEWPORT_DEFER_MS=0` and the default, and between `RT_VIEWPORT_FAST=0`
-  and the default. The comparison includes the histogram, navigator and
-  status text.
-- The two `fallbacks` beyond the initial load are the first-edit
-  `no-complete-full-state` pass and a monitor-only update, both expected.
+### 45.7 MP, fit
+
+| Configuration | fast hits | analyses | fallbacks | samples | p50 | p95 |
+|---|---:|---:|---:|---:|---:|---:|
+| `RT_VIEWPORT_FAST=0` | 0 | 0 | 10 | 10 | 151 ms | 206 ms |
+| `RT_VIEWPORT_DEFER_MS=0` | 7 | 7 | 4 | 18 | 110 ms | 299 ms |
+| default (250 / 500 ms) | 6 | 2 | 4 | 12 | 42 ms | 203 ms |
+
+### 45.7 MP, 100 %
+
+| Configuration | fast hits | analyses | fallbacks | samples | p50 | p95 |
+|---|---:|---:|---:|---:|---:|---:|
+| `RT_VIEWPORT_FAST=0` | 0 | 0 | 11 | 11 | 144 ms | 196 ms |
+| `RT_VIEWPORT_DEFER_MS=0` | 7 | 7 | 4 | 18 | 74 ms | 219 ms |
+| default (250 / 500 ms) | 6 | 2 | 4 | 12 | 92 ms | 204 ms |
+
+A second default run at 100 % gave p50 63 ms / p95 291 ms; the p50 spread is
+run noise, the 6 hits / 2 analyses ratio is stable.
+
+- Served hits cost 12-19 ms at 10 MP, 37-40 ms at 45.7 MP fit and 57-61 ms at
+  45.7 MP 100 %. The deferred analysis costs 41-43 ms at 10 MP, 104-105 ms at
+  45.7 MP fit and 129-133 ms at 45.7 MP 100 %.
+- The settle coalesces the burst into one analysis per window as designed; at
+  45.7 MP fit it removes five of seven analysis passes.
+- p95 includes the one-time first-edit `no-complete-full-state` pass and the
+  zoom transition, so it is not the interaction latency; the hit counts and
+  the per-kind figures are the evidence.
+- AE = 0 for the full 1600x1000 frame at 10 MP (fit) between every pair of
+  configurations, and for the 45.7 MP viewport at fit and 100 %.
+- At 45.7 MP 100 % the navigator and histogram are not bit-identical between
+  the fast and fallback paths: navigator MAE 0.0005, histogram panel MAE
+  0.012. The viewport itself is AE = 0. The difference tracks the base cache
+  (`cache=1` on the fallback, `cache=0` on the fast path's deferred pass) and
+  is within the engine's OpenMP rounding variation seen on CLI exports; it is
+  not a stale pass, because two runs of either configuration are identical.
+- Fallbacks beyond the initial load are the first-edit
+  `no-complete-full-state` pass and a monitor-only update.
+
+### Debian package
+
+`tools/build-rt.sh portable` built
+`rawtherapee-5.13-157-gfbe080bdf_5.13+git13178.fbe080bdf-1_amd64.deb`,
+SHA-256 `163ad2a19b7b736de04ced488ff3246733f7dfb26e5b03dd64c52863be661dc0`.
+
+Debian 12 and Debian 13 containers: `apt-get install ./...deb` PASS,
+`--list-formats` includes JPEG XL PASS, single-threaded 16-bit TIFF export
+compared with the host single-threaded export AE = 0, GUI startup under Xvfb
+PASS. The containers have no OpenCL ICD, so `--gpu-test` and
+`--gpu-test-monitor` were not run there; GPU parity was checked on the host
+with `verify.sh --quick` as above.
 
 ## Known limitations and follow-ups
 
