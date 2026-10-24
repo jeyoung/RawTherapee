@@ -225,19 +225,20 @@ parity.
 - Fair interleaved 45.7 MP export with the resize profile, 8 threads:
   baseline 5.14–5.42 s, candidate 4.94–5.04 s, with `AE=0` on every pair.
   The gain is about 5% on this workload.
-- Thread matrix on the same profile: `AE=0` at 1, 2, 4 and 8 threads. With a
-  denoise profile the existing engine varies by 1 LSB between thread counts
-  (about 7–9 k pixels of 6.2 M); that is a pre-existing denoise reduction
-  order issue, not introduced here, and is recorded as a limitation.
+- Thread matrix on the same profile: `AE=0` at 1, 2, 4 and 8 threads. The
+  denoise block merge is now ordered; on a deterministic full-frame TIFF input
+  the residual falls from 215/414 differing pixels to 6/12 at 1 LSB. The raw
+  path still has upstream thread-order variation, so the full NEF denoise
+  export is not yet bit-identical; see `devnotes/perf/DETERMINISM.md`.
 - Build KPI on the 4C/8T host: no-op `rth-cli` build 0.56–0.80 s, one module
   rebuild 0.25 s, one translation-unit rebuild 1.48–2.28 s. The project
   ccache is `build/ccache`; the first builds after the wrapper change are
   cold, so the hit rate is not yet representative.
 - Identical preview runs on the same image, display and settings:
-  baseline p50 148 ms / p95 224 ms; candidate p50 142 ms / p95 197 ms over
-  12 samples. The p95 gain is about 12%; the p50 gain is about 4%. The GUI
-  harness is timing-sensitive, so these are indicative rather than a
-  controlled microbenchmark.
+  baseline p50 148 ms / p95 224 ms; the final merged candidate reports
+  p50 135 ms / p95 184 ms over 12 samples. The p95 gain is about 18%; the
+  p50 gain is about 9%. The GUI harness is timing-sensitive, so these are
+  indicative rather than a controlled microbenchmark.
 - Whole-suite export timing on the same run: baseline 7.82–8.24 s,
   candidate 7.74–8.04 s at 8 threads. The fair interleaved run above is the
   cleaner comparison because it removes the suite's disk and cache noise.
