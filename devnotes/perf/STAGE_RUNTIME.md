@@ -344,6 +344,29 @@ parity.
   from about 235 ms to about 198 ms. The initial rough preview remains
   bypassed and unchanged.
 
+## Merged phase results
+
+- Preview graph (`RT_PREVIEW_GRAPH=1`): five independent legacy/graph
+  dump pairs were byte-identical for `preview.tif`, `work.tif` and the main
+  crop. The decision costs 0.008–0.010 ms per pass. The layer is advisory in
+  this version: it certifies blocks and fails closed, while execution keeps
+  the legacy arithmetic order.
+- Tile merge and ordering: the tiled denoise and wavelet overlap merge now
+  accumulates per-tile contributions in ascending tile-row/column order.
+  `RT_TILE_ORDER=0` and `1` are `AE=0` at 1 and 8 threads, and the default
+  output is unchanged. Peak RSS rises by about 200 MB for the band buffers.
+  Ordering gives about 8% of the wavelet stage and is neutral for denoise.
+- Fast export: converting only the crop region to Lab removes about 1.1 GB of
+  buffer traffic. The `export.early_resize` stage fell from 3056 ms to
+  1148 ms (−62%), whole fast export from 46.82 s to 43.81 s in the isolated
+  eight-pair set, and peak RSS fell by 124 MB. CPU fast-export parity is
+  `AE=0`.
+- Final interleaved medians under a loaded host: default export 7.16 s →
+  6.81 s (5.2% faster); fast export 39.11 s → 36.01 s (8.6% faster, high
+  variance). The isolated stage figures above are the stronger evidence.
+- Final OpenCL `verify.sh --quick` and `--formats` pass at 1 LSB; monitor
+  parity is 1 byte.
+
 ## Limitations
 
 - The preview has a graph-backed decision layer, not a graph-driven
@@ -364,8 +387,8 @@ parity.
   preview requests and reopen after a base has been stored.
 - Only Lanczos is exposed as a loadable stage. Denoise, wavelet, local
   adjustments and the output conversion still use the existing code paths.
-- The block scorer is not connected to denoise or wavelet; it has no runtime
-  effect yet.
-- The preview parity screenshot harness is present but needs a stable Xvfb
-  display and the first-run notice dismissed; use
-  `RT_PREVIEW_DISPLAY` and the existing GUI procedure.
+- Tile ordering is connected to denoise and wavelet behind `RT_TILE_ORDER=1`,
+  but it is opt-in and has no reduced-work mode. The deterministic merge is
+  always on.
+- Preview parity is measured through `RT_PREVIEW_DUMP`, not screenshots; the
+  screenshot harness was not stable enough to commit.
