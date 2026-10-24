@@ -53,7 +53,9 @@ relinking the GUI or CLI.
 `rtengine/stage/algorithms/lanczos.cc` and is compiled into both the host and
 the `lanczos3.so` module. This gives exact built-in/module parity by
 construction. `ImProcFunctions::Lanczos` calls the runtime and falls back to
-the existing loop if the stage cannot be resolved.
+the existing loop if the stage cannot be resolved. The horizontal taps are
+computed once per resize and shared by all worker threads instead of being
+recomputed independently by each thread.
 
 Controls:
 
