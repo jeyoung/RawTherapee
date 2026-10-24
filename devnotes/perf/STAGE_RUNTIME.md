@@ -47,6 +47,60 @@ the CPU device without changing the graph or the cache.
 rebuild one shared object and have the next request pick it up without
 relinking the GUI or CLI.
 
+## Device and buffer state
+
+`rtengine/stage/stage_device.h` adds the device abstraction the graph plan
+needs, without changing any production path. The object model is the OpenCL
+one: a device creates contexts and queues, a queue executes a compiled
+program, and an event carries status and timing.
+
+| Type | Role |
+| --- | --- |
+| `StageDevice` | type, name, availability, capabilities, context and queue factory |
+| `CPUStageDevice` | always available, resolves built-ins and modules through `StageCompiler`, executes synchronously, deterministic and full precision |
+| `OpenCLStageDevice` | skeleton; availability maps to `opencl::enabled()` and it adds no OpenCL call |
+| `StageContext` | owns a device, a per-context program cache and a buffer allocator |
+| `StageQueue` | CPU executes inline; the OpenCL queue returns `RT_STAGE_FALLBACK` |
+| `StageEvent` | status and elapsed time; no asynchronous dependency yet |
+
+`StageContext::compile()` calls the existing `StageCompiler`, so the
+resolution order and the built-in/module fallback are unchanged. The context
+caches the resulting program by stage name and explicit implementation;
+`clear_program_cache()` forces the next compile to resolve again. The default
+context selects CPU, and `select_device(StageDeviceType::OPENCL)` falls back
+to CPU with a reason when the existing OpenCL backend is not enabled.
+
+`rtengine/stage/stage_buffer_state.h` associates an `RtStageBuffer` with a
+location, a device generation and an intrusive reference count. The header
+contains no OpenCL types:
+
+| Location | Meaning |
+| --- | --- |
+| `HostValid` | the host copy is current |
+| `DeviceValid` | the device copy is current and the host copy is stale |
+| `Both` | both copies are current |
+| `Dirty` | neither copy may be read |
+
+The CPU `ensure_host()` performs no copy: it reports `RT_STAGE_OK` for a
+host-valid or shared buffer, `RT_STAGE_FALLBACK` for a stale device copy and
+`RT_STAGE_INVALID` for dirty contents. `ensure_device()` reports
+`RT_STAGE_FALLBACK` because the CPU has no device memory and the OpenCL
+upload is not wired. `mark_host_write()`, `mark_device_write()`,
+`mark_both_valid()` and `mark_dirty()` record the transitions, and the device
+generation lets a later implementation invalidate copies from an earlier
+device session. The wrapper does not own memory; the descriptor stays a
+non-owning view over an engine image or an allocator block.
+
+`StageBufferAllocator` is owned by the context. The CPU allocator returns
+zeroed host memory with 64-byte aligned rows and planes and supports `F32`,
+`U16` and `U8` with one to three planes; single-plane `U8` is packed RGB,
+matching `stage::row_bytes()`. The OpenCL allocator refuses allocation until a
+device allocator exists.
+
+Nothing creates a non-CPU context and no call site changed: `ImProcFunctions`,
+the export graph and the preview layer still use `StageCompiler` and `run()`
+exactly as before. The new types are infrastructure for the next phase.
+
 ## Pilot stage
 
 `lanczos3` is the pilot. The arithmetic lives in
@@ -304,6 +358,19 @@ parity.
 - `stage-abi-test`, `stage-parity-test`, `stage-cache-test`,
   `stage-graph-test`, `stage-indexer-test` and `stage-store-test` pass on the
   CPU build.
+- `stage-device-test` passes in both the CPU and OpenCL configurations. It
+  checks that the CPU device is available, deterministic and full precision;
+  that Lanczos compiles, caches, executes through the context and the inline
+  CPU queue; that the default context and explicit selection pick CPU; that
+  the OpenCL queue reports `RT_STAGE_FALLBACK`; that selection falls back to
+  CPU with a reason when OpenCL is unavailable; that the buffer state machine,
+  generation and reference count behave as documented; and that the context
+  output is pixel-identical to a direct `StageCompiler` execution (`AE=0`,
+  0 differing of 2304 samples). The OpenCL build on this host reports
+  `opencl-stage-device: available (execution not wired)` and still passes;
+  the CPU-only build exercises the unavailable/fallback branch.
+- Existing stage tests, including `stage-abi-test` and `stage-parity-test`,
+  pass unchanged in both configurations.
 - `stage-store-test` also covers the store's failure paths: a flipped payload
   byte, two truncations, wrong geometry, short destination pitches, invalid
   and traversal keys and concurrent writers are all rejected or kept intact,
@@ -387,6 +454,17 @@ parity.
   preview requests and reopen after a base has been stored.
 - Only Lanczos is exposed as a loadable stage. Denoise, wavelet, local
   adjustments and the output conversion still use the existing code paths.
+- The OpenCL device is a skeleton: it mirrors the existing backend's enabled
+  state, advertises no execution capability, and its queue always reports
+  `RT_STAGE_FALLBACK`. Its allocator refuses allocation. No OpenCL execution
+  or device-side buffer is implemented in this phase.
+- The context program cache is keyed by stage name and explicit
+  implementation, so it reads `RT_STAGE_*` and `RT_STAGE_PATH` on the first
+  compile of a key. Call `clear_program_cache()` to re-resolve after changing
+  the environment or rebuilding a module.
+- `StageBufferState` is non-owning and has no readback path: `ensure_host()`
+  reports `RT_STAGE_FALLBACK` while the device copy is authoritative, and
+  `ensure_device()` reports `RT_STAGE_FALLBACK` on CPU.
 - Tile ordering is connected to denoise and wavelet behind `RT_TILE_ORDER=1`,
   but it is opt-in and has no reduced-work mode. The deterministic merge is
   always on.
