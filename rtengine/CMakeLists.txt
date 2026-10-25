@@ -120,6 +120,7 @@ set(RTENGINESOURCEFILES
     stage/stage_builtins.cc
     stage/stage_cache.cc
     stage/stage_device.cc
+    stage/stage_dirty_blocks.cc
     stage/stage_graph.cc
     stage/stage_indexer.cc
     stage/stage_lanczos.cc
@@ -324,6 +325,25 @@ target_include_directories(stage-param-map-test BEFORE PRIVATE
 target_link_libraries(stage-param-map-test PRIVATE rtengine)
 target_include_directories(stage-param-map-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/stage")
 rt_setup_target(stage-param-map-test)
+
+# Dirty-block derivation from parameter fingerprints and render state.
+add_executable(stage-dirty-blocks-test EXCLUDE_FROM_ALL
+    "${CMAKE_CURRENT_SOURCE_DIR}/stage/tests/stage_dirty_blocks_test.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/editcallbacks.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/multilangmgr.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/options.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/paramsedited.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/pathutils.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/threadutils.cc"
+)
+target_include_directories(stage-dirty-blocks-test BEFORE PRIVATE
+    "${CMAKE_BINARY_DIR}/rtgui"
+)
+target_link_libraries(stage-dirty-blocks-test PRIVATE rtengine)
+target_include_directories(stage-dirty-blocks-test PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/stage"
+)
+rt_setup_target(stage-dirty-blocks-test)
 
 add_executable(stage-parity-test EXCLUDE_FROM_ALL
     "${CMAKE_CURRENT_SOURCE_DIR}/stage/tests/stage_parity_test.cc"

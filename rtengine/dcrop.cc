@@ -22,6 +22,8 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdio>
+#include <iterator>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <string>
@@ -43,6 +45,7 @@
 #include "mytime.h"
 #include "procparams.h"
 #include "refreshmap.h"
+#include "stage/stage_dirty_blocks.h"
 #include "stage/stage_graph.h"
 #include "stage/stage_pipeline.h"
 #include "rt_math.h"
@@ -147,6 +150,23 @@ struct CropStageContext {
         delete[] centerTile_Y;
         centerTile_Y = nullptr;
     }
+};
+
+/*
+ * The inputs of the previous dirty-block derivation of one crop.
+ *
+ * The parameter side keeps one fingerprint per canonical crop block instead of
+ * a copy of ProcParams: the next update only needs to know whether a block's
+ * inputs moved, and hashing the current parameters once per update is enough.
+ * The render state is kept whole because every aspect is compared by field.
+ *
+ * The snapshot is only meaningful after a derivation has run; `valid` is false
+ * until then, which makes the next derivation a forced full recompute.
+ */
+struct CropDirtyState {
+    bool valid = false;
+    rtengine::stage::BlockFingerprints fingerprints;
+    rtengine::stage::RenderStateKey renderState;
 };
 
 Crop::Crop(ImProcCoordinator* parent, EditDataProvider *editDataProvider, bool isDetailWindow)
@@ -254,6 +274,64 @@ bool cropGraphEnabled()
 }
 
 /*
+ * How the crop graph obtains its dirty block set (RT_CROP_DIRTY).
+ *
+ * - `legacy` executes the set the mask-derived gates have always produced and
+ *   skips the derivation entirely. It is the A/B baseline for parity runs.
+ * - `shadow` executes the legacy set and compares it with the derived set,
+ *   which is how equivalence is established without changing pixels.
+ * - `fingerprint`, the default once the shadow run is clean, executes the
+ *   derived set. If the derived set would skip a block the legacy set runs, the
+ *   update fails closed to the legacy set and the event is counted.
+ *
+ * The mask still drives GUI notification and coalescing in all three modes; it
+ * just stops being the only source of block dirtiness.
+ */
+enum class CropDirtyMode {
+    Legacy,
+    Shadow,
+    Fingerprint
+};
+
+CropDirtyMode cropDirtyMode()
+{
+    const char* value = g_getenv("RT_CROP_DIRTY");
+    if (value == nullptr || value[0] == '\0') {
+        return CropDirtyMode::Fingerprint;
+    }
+    if (g_ascii_strcasecmp(value, "legacy") == 0
+            || g_ascii_strcasecmp(value, "mask") == 0) {
+        return CropDirtyMode::Legacy;
+    }
+    if (g_ascii_strcasecmp(value, "shadow") == 0) {
+        return CropDirtyMode::Shadow;
+    }
+    if (g_ascii_strcasecmp(value, "fingerprint") == 0
+            || g_ascii_strcasecmp(value, "derived") == 0) {
+        return CropDirtyMode::Fingerprint;
+    }
+    std::fprintf(stderr,
+                 "crop-dirty: unknown RT_CROP_DIRTY value '%s', using "
+                 "fingerprint\n",
+                 value);
+    return CropDirtyMode::Fingerprint;
+}
+
+const char* cropDirtyModeName(CropDirtyMode mode)
+{
+    switch (mode) {
+    case CropDirtyMode::Legacy:
+        return "legacy";
+    case CropDirtyMode::Shadow:
+        return "shadow";
+    case CropDirtyMode::Fingerprint:
+        return "fingerprint";
+    }
+
+    return "unknown";
+}
+
+/*
  * Execution order of the crop blocks.
  *
  * This is the order of the legacy sequence, not the order of the canonical
@@ -308,6 +386,58 @@ constexpr const char* CROP_FOLDED_NODES[] = {
 constexpr size_t CROP_FOLDED_COUNT =
     sizeof(CROP_FOLDED_NODES) / sizeof(CROP_FOLDED_NODES[0]);
 
+/*
+ * The dirty-block set in the terms the crop execution list uses.
+ *
+ * The derivation works on canonical descriptor ids, while the crop sequence is
+ * a list of stage blocks in its own order. These helpers translate between the
+ * two and drop the folded nodes, which the crop never executes on their own.
+ * They deliberately keep the canonical pipeline order, so two sets from
+ * different sources can be printed and compared without a second sort.
+ */
+
+/* Stage-owned ids of `blocks`, in canonical crop pipeline order. */
+std::vector<std::string> cropStageOrder(const std::vector<std::string>& blocks)
+{
+    const std::set<std::string> wanted(blocks.begin(), blocks.end());
+    std::vector<std::string> ordered;
+    for (const auto& node : rtengine::stage::buildPipelineSpec(
+             rtengine::stage::StagePath::Crop).nodes) {
+        if (wanted.find(node.id) == wanted.end()) {
+            continue;
+        }
+        for (int stage = 0; stage < CROP_STAGE_COUNT; ++stage) {
+            if (node.id == CROP_STAGE_IDS[stage]) {
+                ordered.push_back(node.id);
+                break;
+            }
+        }
+    }
+    return ordered;
+}
+
+/* The ids the given execution list names, in canonical order. */
+std::vector<std::string> cropBlocksOf(const bool runs[CROP_STAGE_COUNT])
+{
+    std::vector<std::string> blocks;
+    for (int stage = 0; stage < CROP_STAGE_COUNT; ++stage) {
+        if (runs[stage]) {
+            blocks.emplace_back(CROP_STAGE_IDS[stage]);
+        }
+    }
+    return blocks;
+}
+
+/* Execution list implied by a set of canonical ids. */
+void cropRunsOf(const std::vector<std::string>& blocks,
+                bool runs[CROP_STAGE_COUNT])
+{
+    const std::set<std::string> dirty(blocks.begin(), blocks.end());
+    for (int stage = 0; stage < CROP_STAGE_COUNT; ++stage) {
+        runs[stage] = dirty.find(CROP_STAGE_IDS[stage]) != dirty.end();
+    }
+}
+
 struct CropGraphPlan {
     bool valid = false;
     std::string reason;
@@ -317,21 +447,25 @@ struct CropGraphPlan {
 
 /*
  * Build the canonical crop spec, connect it into a StageGraph and ask
- * StageGraph::plan() which blocks this invocation may run. Every block the
- * legacy sequence executes is marked dirty; every other node is clean, either
+ * StageGraph::plan() which blocks this invocation may run. Every node named by
+ * the chosen dirty set is marked dirty; every other node is clean, either
  * because it is folded into a block that is already scheduled or because its
  * output is reused.
  *
- * A plan is rejected, and the caller runs the unchanged legacy sequence, when
- * a block the legacy path executes would be skipped (ReuseOutput): that is the
- * only way the graph could change the result.
+ * `dirtyIds` is the execution set in canonical ids and must contain every
+ * block in `runs`: the crop always runs what the execution list names. A plan
+ * is rejected, and the caller runs the unchanged legacy sequence, when a block
+ * the execution list names would be skipped (ReuseOutput): that is the only
+ * way the graph could change the result.
  */
-CropGraphPlan planCropGraph(const bool runs[CROP_STAGE_COUNT])
+CropGraphPlan planCropGraph(const std::vector<std::string>& dirtyIds,
+                            const bool runs[CROP_STAGE_COUNT])
 {
     using namespace rtengine::stage;
 
     CropGraphPlan result;
     const StagePipelineSpec spec = buildPipelineSpec(StagePath::Crop);
+    const std::set<std::string> dirty(dirtyIds.begin(), dirtyIds.end());
 
     const auto indexOf = [&spec](const std::string& id) -> size_t {
         for (size_t i = 0; i < spec.nodes.size(); ++i) {
@@ -370,11 +504,34 @@ CropGraphPlan planCropGraph(const bool runs[CROP_STAGE_COUNT])
         if (runs[stage]) {
             active[index] = true;
             ++activeCount;
-            graph.markDirty(nodes[index]);
+            /*
+             * The execution list must be part of the dirty set; otherwise the
+             * graph would be asked to run a block it believes is current.
+             */
+            if (dirty.find(CROP_STAGE_IDS[stage]) == dirty.end()) {
+                result.reason = std::string("dirty-missing:")
+                                + CROP_STAGE_IDS[stage];
+                return result;
+            }
         }
     }
+    for (const std::string& id : dirty) {
+        if (indexOf(id) == spec.nodes.size()) {
+            result.reason = "unknown-dirty-node:" + id;
+            return result;
+        }
+    }
+
+    /*
+     * Dirtiness comes from the chosen dirty set, not from the execution list.
+     * The two normally agree on the stage-owned ids; the dirty set also names
+     * the folded nodes, which are marked dirty so the plan sees the raw core as
+     * invalid even though the crop carries them inside source.select.
+     */
     for (size_t i = 0; i < spec.nodes.size(); ++i) {
-        if (!active[i]) {
+        if (dirty.find(spec.nodes[i].id) != dirty.end()) {
+            graph.markDirty(nodes[i]);
+        } else {
             graph.markClean(nodes[i]);
         }
     }
@@ -448,6 +605,60 @@ void logCropGraph(const CropGraphPlan& plan)
 std::atomic<unsigned> cropGraphRuns{0};
 std::atomic<unsigned> cropGraphFallbacks{0};
 
+std::atomic<unsigned> cropDirtyChecks{0};
+std::atomic<unsigned> cropDirtyEquivalent{0};
+std::atomic<unsigned> cropDirtyMissing{0};
+std::atomic<unsigned> cropDirtyExtra{0};
+std::atomic<unsigned> cropDirtyFallbacks{0};
+
+/*
+ * One diagnostic line per mode and mismatch signature.
+ *
+ * A clean comparison is logged once per mode, so a long run does not repeat it
+ * per keystroke. A mismatch logs the two block sets once per distinct
+ * signature: the missing set is the one that must be empty before the derived
+ * set can be trusted, and the extra set is the documented over-approximation.
+ */
+void logCropDirty(CropDirtyMode mode,
+                  const rtengine::stage::DirtyBlocks& derived,
+                  const rtengine::stage::DirtyShadow& shadow,
+                  bool executedDerived)
+{
+    static std::mutex mutex;
+    static std::set<std::string> logged;
+
+    std::lock_guard<std::mutex> lock(mutex);
+
+    const std::string signature =
+        std::string(cropDirtyModeName(mode)) + "|"
+        + rtengine::stage::format_block_ids(shadow.missing) + "|"
+        + rtengine::stage::format_block_ids(shadow.extra) + "|"
+        + (executedDerived ? "derived" : "legacy");
+    if (!logged.insert(signature).second) {
+        return;
+    }
+
+    std::fprintf(stderr,
+                 "crop-dirty: mode=%s executed=%s derived=%s forced=%d "
+                 "params=%s state=%s groups=%s closure=%s\n",
+                 cropDirtyModeName(mode),
+                 executedDerived ? "derived" : "legacy",
+                 rtengine::stage::format_block_ids(derived.blocks).c_str(),
+                 derived.forced ? 1 : 0,
+                 rtengine::stage::format_block_ids(derived.fromParams).c_str(),
+                 rtengine::stage::format_block_ids(derived.fromState).c_str(),
+                 rtengine::stage::format_block_ids(derived.fromGroups).c_str(),
+                 rtengine::stage::format_block_ids(derived.fromClosure).c_str());
+    if (shadow.equivalent() && shadow.extra.empty()) {
+        std::fprintf(stderr, "crop-dirty: shadow equivalent\n");
+        return;
+    }
+    std::fprintf(stderr,
+                 "crop-dirty: shadow missing=%s extra=%s\n",
+                 rtengine::stage::format_block_ids(shadow.missing).c_str(),
+                 rtengine::stage::format_block_ids(shadow.extra).c_str());
+}
+
 } // namespace
 
 namespace crop_graph
@@ -461,6 +672,31 @@ unsigned runs()
 unsigned fallbacks()
 {
     return cropGraphFallbacks.load();
+}
+
+unsigned dirtyChecks()
+{
+    return cropDirtyChecks.load();
+}
+
+unsigned dirtyEquivalent()
+{
+    return cropDirtyEquivalent.load();
+}
+
+unsigned dirtyMissing()
+{
+    return cropDirtyMissing.load();
+}
+
+unsigned dirtyExtra()
+{
+    return cropDirtyExtra.load();
+}
+
+unsigned dirtyFallbacks()
+{
+    return cropDirtyFallbacks.load();
 }
 
 } // namespace crop_graph
@@ -517,26 +753,182 @@ void Crop::update(int todo)
     ctx.heiIm = heiIm;
 
     /*
-     * What the legacy sequence executes for this request. A folded node is not
-     * listed: it is carried by the block that owns its implementation.
+     * What the legacy mask-derived gates execute for this request. A folded
+     * node is not listed: it is carried by the block that owns its
+     * implementation. This stays the fail-closed set: it is what the graph ran
+     * before the dirty-block derivation existed, and what it still runs when
+     * the derivation would skip a block.
      */
-    bool runs[CROP_STAGE_COUNT] = {};
-    runs[CROP_SOURCE_SELECT] = (todo & (M_INIT | M_LINDENOISE | M_HDR)) != 0;
-    runs[CROP_ANALYSIS] = runs[CROP_SOURCE_SELECT];
-    runs[CROP_RAW_BASE] = true;
-    runs[CROP_TRANSFORM] = true;
-    runs[CROP_LOCAL_ADJUSTMENTS] = (todo & (M_AUTOEXP | M_RGBCURVE)) != 0
-                                   && params.locallab.enabled
-                                   && !params.locallab.spots.empty();
-    runs[CROP_RGB_PROC] = (todo & M_RGBCURVE) != 0;
+    bool runsMask[CROP_STAGE_COUNT] = {};
+    runsMask[CROP_SOURCE_SELECT] = (todo & (M_INIT | M_LINDENOISE | M_HDR)) != 0;
+    runsMask[CROP_ANALYSIS] = runsMask[CROP_SOURCE_SELECT];
+    runsMask[CROP_RAW_BASE] = true;
+    runsMask[CROP_TRANSFORM] = true;
+    runsMask[CROP_LOCAL_ADJUSTMENTS] = (todo & (M_AUTOEXP | M_RGBCURVE)) != 0
+                                       && params.locallab.enabled
+                                       && !params.locallab.spots.empty();
+    runsMask[CROP_RGB_PROC] = (todo & M_RGBCURVE) != 0;
     const bool labRuns = (todo & (M_LUMINANCE + M_COLOR)) != 0;
-    runs[CROP_LAB_TOOLS] = labRuns;
-    runs[CROP_LAB_SHARPENING] = labRuns;
-    runs[CROP_LAB_WAVELET] = labRuns;
-    runs[CROP_WORKING_TRC] = labRuns;
-    runs[CROP_CIE_CAM] = labRuns;
-    runs[CROP_GAMUT] = labRuns;
-    runs[CROP_VIEWPORT_OUTPUT] = true;
+    runsMask[CROP_LAB_TOOLS] = labRuns;
+    runsMask[CROP_LAB_SHARPENING] = labRuns;
+    runsMask[CROP_LAB_WAVELET] = labRuns;
+    runsMask[CROP_WORKING_TRC] = labRuns;
+    runsMask[CROP_CIE_CAM] = labRuns;
+    runsMask[CROP_GAMUT] = labRuns;
+    runsMask[CROP_VIEWPORT_OUTPUT] = true;
+
+    /*
+     * The dirty-block set the graph will use, and the execution list it
+     * implies. The mask-derived list stays available as the fail-closed
+     * answer, so the two are computed together and compared in every mode that
+     * derives.
+     */
+    bool runs[CROP_STAGE_COUNT];
+    std::copy(std::begin(runsMask), std::end(runsMask), std::begin(runs));
+    std::vector<std::string> graphDirty = cropStageOrder(cropBlocksOf(runsMask));
+
+    /*
+     * Render state of one crop pass.
+     *
+     * The crop owns the ROI geometry and reads the coordinator's source and
+     * display state, so this is the complete set of inputs that are not in
+     * ProcParams. It is built once before the derivation and once after the
+     * pass, because the stage bodies can update the source generation and the
+     * high-detail flags while they run.
+     */
+    const auto cropRenderState = [this, &todo]() {
+        rtengine::stage::RenderStateKey state;
+        state.previewScale = skip;
+        state.previewWidth = cropw;
+        state.previewHeight = croph;
+        state.fullWidth = parent->fw;
+        state.fullHeight = parent->fh;
+        state.cropX = rqcropx;
+        state.cropY = rqcropy;
+        state.cropWidth = rqcropw;
+        state.cropHeight = rqcroph;
+        state.cropSkip = skip;
+        state.borderRequested = borderRequested;
+        state.borderLeft = leftBorder;
+        state.borderTop = upperBorder;
+        /*
+         * The high-detail decision is the coordinator's, but it decides which
+         * raw pixels this crop receives, so it is part of the crop state.
+         */
+        state.highDetailNeeded = parent->lastHighDetailNeeded;
+        state.highDetailPreprocessComputed =
+            parent->highDetailPreprocessComputed;
+        state.highDetailRawComputed = parent->highDetailRawComputed;
+        state.highDetailStateKnown = parent->highDetailStateKnown;
+        state.sourceGeneration = parent->imgsrc
+                                     ? parent->imgsrc->getSourceGeneration()
+                                     : 0;
+        state.rgbSourceModified = parent->imgsrc
+                                      ? parent->imgsrc->isRGBSourceModified()
+                                      : false;
+        state.monitorProfile = parent->monitorProfile.raw();
+        state.monitorIntent = static_cast<int32_t>(parent->monitorIntent);
+        state.softProof = parent->softProof;
+        state.gamutCheck = parent->gamutCheck;
+        state.sharpMask = parent->sharpMask;
+        /*
+         * The fast-preview and main-preview switches are preview request
+         * state; the crop viewport does not consult them.
+         *
+         * The request kind is the one thing the crop takes from the legacy
+         * mask rather than from ProcParams: M_INIT, M_LINDENOISE and M_HDR ask
+         * for the destructive raw stage to be reloaded, which is a request,
+         * not a parameter delta. It is carried as FullCrop so the derivation
+         * treats the path as a rebuild instead of silently skipping the
+         * reload.
+         */
+        const bool reloadRequested = (todo & (M_INIT | M_LINDENOISE | M_HDR)) != 0;
+        state.requestKind = (todo & M_HIGHQUAL) != 0
+                                ? rtengine::stage::RequestKind::HighQuality
+                                : reloadRequested
+                                      ? rtengine::stage::RequestKind::FullCrop
+                                      : todo == M_MINUPDATE
+                                            ? rtengine::stage::RequestKind::RepaintOnly
+                                            : rtengine::stage::RequestKind::ParamsOnly;
+        return state;
+    };
+
+    const CropDirtyMode dirtyMode = cropDirtyMode();
+    if (dirtyMode != CropDirtyMode::Legacy && cropGraphEnabled()) {
+        /*
+         * The derivation reads the parameters before any stage body can touch
+         * them, and the render state the crop itself owns. The fingerprint
+         * vector is kept as the next update's history instead of a ProcParams
+         * copy; it is stored again after the pass, because several stage bodies
+         * write corrected values back into the parameters (auto white balance,
+         * automatic denoise) and those corrections are not new inputs on the
+         * next update.
+         */
+        const rtengine::stage::BlockFingerprints current =
+            rtengine::stage::stage_fingerprints(
+                rtengine::stage::StagePath::Crop, params);
+        const rtengine::stage::RenderStateKey state = cropRenderState();
+
+        if (!dirtyState) {
+            dirtyState.reset(new CropDirtyState());
+        }
+
+        rtengine::stage::DirtyBlockInputs inputs;
+        inputs.path = rtengine::stage::StagePath::Crop;
+        inputs.currentFingerprints = &current;
+        inputs.previousFingerprints =
+            dirtyState->valid ? &dirtyState->fingerprints : nullptr;
+        inputs.previousState = dirtyState->valid ? &dirtyState->renderState
+                                                 : nullptr;
+        inputs.currentState = &state;
+        inputs.forceFull = needsinitupdate || (todo & M_HIGHQUAL) != 0;
+
+        const rtengine::stage::DirtyBlocks derived =
+            rtengine::stage::derive_dirty_blocks(inputs);
+
+        if (g_getenv("RT_CROP_DIRTY_TRACE") != nullptr) {
+            std::fprintf(stderr,
+                         "crop-dirty-trace: todo=0x%x init=%d forced=%d "
+                         "wb=%d sharp=%d cie=%d spots=%zu crop=%d "
+                         "params=%s\n",
+                         todo, needsinitupdate ? 1 : 0, derived.forced ? 1 : 0,
+                         params.wb.temperature, params.sharpening.amount,
+                         params.colorappearance.enabled ? 1 : 0,
+                         params.locallab.spots.size(),
+                         params.crop.enabled ? 1 : 0,
+                         rtengine::stage::format_block_ids(derived.fromParams)
+                             .c_str());
+        }
+
+        dirtyState->fingerprints = current;
+        dirtyState->renderState = state;
+        dirtyState->valid = true;
+
+        const std::vector<std::string> legacy = graphDirty;
+        const std::vector<std::string> stageDerived =
+            cropStageOrder(derived.blocks);
+        const rtengine::stage::DirtyShadow shadow =
+            rtengine::stage::compare_dirty_shadow(legacy, stageDerived);
+
+        ++cropDirtyChecks;
+        if (shadow.equivalent()) {
+            ++cropDirtyEquivalent;
+        }
+        cropDirtyMissing += static_cast<unsigned>(shadow.missing.size());
+        cropDirtyExtra += static_cast<unsigned>(shadow.extra.size());
+
+        const bool executeDerived =
+            dirtyMode == CropDirtyMode::Fingerprint && shadow.equivalent();
+        if (dirtyMode == CropDirtyMode::Fingerprint && !executeDerived) {
+            ++cropDirtyFallbacks;
+        }
+        logCropDirty(dirtyMode, derived, shadow, executeDerived);
+
+        if (executeDerived) {
+            graphDirty = derived.blocks;
+            cropRunsOf(cropStageOrder(derived.blocks), runs);
+        }
+    }
 
     const auto runStage = [this, &ctx](CropStage stage) {
         switch (stage) {
@@ -587,7 +979,7 @@ void Crop::update(int todo)
     bool planned = false;
 
     if (cropGraphEnabled()) {
-        const CropGraphPlan plan = planCropGraph(runs);
+        const CropGraphPlan plan = planCropGraph(graphDirty, runs);
         logCropGraph(plan);
 
         if (plan.valid) {
@@ -639,6 +1031,23 @@ void Crop::update(int todo)
         delete final;
         delete finaltrue;
         delete cropImgtrue;
+    }
+
+    /*
+     * Store the inputs as this pass left them.
+     *
+     * Several stage bodies write corrected values back into the parameters -
+     * auto white balance replaces the temperature, the automatic denoise
+     * method replaces its strengths, auto exposure replaces the curve - and a
+     * source mutation bumps the generation. Those corrections were consumed by
+     * this pass, so they are part of the state the buffers hold and must not
+     * read as new inputs on the next update.
+     */
+    if (dirtyMode != CropDirtyMode::Legacy && dirtyState) {
+        dirtyState->fingerprints = rtengine::stage::stage_fingerprints(
+            rtengine::stage::StagePath::Crop, params);
+        dirtyState->renderState = cropRenderState();
+        dirtyState->valid = true;
     }
 }
 

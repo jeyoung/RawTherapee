@@ -523,6 +523,49 @@ pass. The image, sidecar and dumps stay outside the repository.
   `tools/build-rt.sh opencl -j 6 --ccache --stage-modules` both complete, and
   the stage tests pass on both.
 
+## Crop dirty blocks
+
+The crop graph no longer takes its dirty set from the `M_*` mask. `Crop`
+derives it from the previous and current per-block parameter fingerprints and
+from the crop `RenderStateKey`, and uses it to mark the canonical nodes dirty.
+The derivation itself lives in `rtengine/stage/stage_dirty_blocks.h/.cc` and
+is shared with the preview path; the rules and tables are in
+`devnotes/perf/STAGE_PIPELINE.md`.
+
+`RT_CROP_DIRTY` selects the execution set:
+
+- `legacy` runs the mask-derived set and skips the derivation. It is the A/B
+  baseline for parity runs.
+- `shadow` runs the mask-derived set and compares it with the derived set,
+  logging `missing` (unsafe) and `extra` (over-approximation) block lists once
+  per distinct signature.
+- `fingerprint` is the default: it runs the derived set, and falls back to the
+  mask-derived set for that update when the derived set would skip a block the
+  legacy set runs.
+
+The mask keeps its two remaining jobs: GUI notification and coalescing, and
+the raw-reload request. `M_INIT`, `M_LINDENOISE` and `M_HDR` ask for the
+destructive raw stage to be reloaded; the crop carries that as
+`RequestKind::FullCrop`, so the derivation rebuilds the path instead of
+skipping a reload no fingerprint describes. The legacy sequence, the
+fail-closed plan rejection and the `todo` gates inside the stage bodies are
+unchanged.
+
+`crop_graph` exposes the diagnostics as process-wide counters:
+`dirtyChecks()`, `dirtyEquivalent()`, `dirtyMissing()`, `dirtyExtra()` and
+`dirtyFallbacks()`. `RT_CROP_DIRTY_TRACE=1` prints one line per derivation with
+the mask, the forced flag, the key parameter values and the directly dirty
+blocks.
+
+`crop-stage-test --sequences [--only=<scenario>]` drives one edit per scenario
+inside a live session and compares the legacy incremental crop, the candidate
+incremental crop and a fresh render. `--bench=<n> [--bench-edit=crop]
+[--dirty=<mode>]` times repeated updates for the performance gate. Evidence:
+21 of 21 comparisons equivalent, 0 missing blocks, 0 fallbacks and `AE=0` for
+display and output-space images in all three tool configurations; the
+derivation is below the noise of a crop pass (`-0.9%` on a full-path exposure
+edit and `-1.7%` on a short crop-rectangle edit, both inside the 5% gate).
+
 ## Persistent store
 
 `StageStore` is a standalone on-disk store for stage buffers, intended for a
@@ -749,6 +792,13 @@ parity.
 - The preview plan has no buffer cache behind it: a dirty node recomputes and
   a clean node is not executed at all, so a skipped node still relies on the
   state the previous pass left in the coordinator.
+- The crop dirty-block derivation replaces the mask as the source of block
+  dirtiness, not as the source of work: the stage bodies keep their `todo`
+  gates, so the derived set can only be trusted as a superset of the legacy
+  set in this phase, and a missing block fails the update closed. The
+  derivation also cannot express the raw reload as a parameter delta; the crop
+  carries the reload bits as a rebuild request. Removing the bodies' gates and
+  making the raw stage incremental are the next steps.
 - Five export blocks are folded inside a neighbouring node rather than
   having an execution boundary of their own: the framing geometry (in
   `crop`), the Nearest output resize (in `output.convert`), the three

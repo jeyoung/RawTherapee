@@ -46,6 +46,7 @@
 #include <filesystem>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <string>
 #include <vector>
 
@@ -223,7 +224,7 @@ Difference compare(const Pixels& a, const Pixels& b)
     return difference;
 }
 
-/* Waits for the first full-frame preview pass. */
+/* Waits for full-frame preview passes. */
 class PreviewWait final : public rtengine::PreviewImageListener
 {
 public:
@@ -238,22 +239,29 @@ public:
     {
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            ready_ = true;
+            ++ready_;
         }
         condition_.notify_all();
     }
 
-    bool wait(int timeoutMs)
+    /* Waits until at least `target` passes have completed. */
+    bool waitFor(unsigned target, int timeoutMs)
     {
         std::unique_lock<std::mutex> lock(mutex_);
         return condition_.wait_for(lock, std::chrono::milliseconds(timeoutMs),
-                                   [this] { return ready_; });
+                                   [this, target] { return ready_ >= target; });
+    }
+
+    unsigned ready() const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return ready_;
     }
 
 private:
-    std::mutex mutex_;
+    mutable std::mutex mutex_;
     std::condition_variable condition_;
-    bool ready_ = false;
+    unsigned ready_ = 0;
 };
 
 /* Supplies the viewport window and keeps the delivered detailed crop. */
@@ -273,13 +281,19 @@ public:
         const rtengine::procparams::CropGuideParams&,
         int cx, int cy, int cw, int ch, int skip) override
     {
-        displayCaptured_ = capture(img, display_);
-        outputCaptured_ = capture(imgtrue, output_);
-        window_.x = cx;
-        window_.y = cy;
-        window_.width = cw;
-        window_.height = ch;
-        window_.skip = skip;
+        const bool displayCaptured = capture(img, display_);
+        const bool outputCaptured = capture(imgtrue, output_);
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            window_.x = cx;
+            window_.y = cy;
+            window_.width = cw;
+            window_.height = ch;
+            window_.skip = skip;
+            captured_ = displayCaptured && outputCaptured;
+            ++generation_;
+        }
+        condition_.notify_all();
     }
 
     void getWindow(int& cx, int& cy, int& cw, int& ch, int& skip) override
@@ -294,38 +308,68 @@ public:
         skip = window.skip;
     }
 
-    bool captured() const
+    /* Waits until at least `target` crops have been delivered. */
+    bool waitFor(unsigned target, int timeoutMs)
     {
-        return displayCaptured_ && outputCaptured_;
+        std::unique_lock<std::mutex> lock(mutex_);
+        return condition_.wait_for(lock, std::chrono::milliseconds(timeoutMs),
+                                   [this, target] {
+                                       return captured_ && generation_ >= target;
+                                   });
     }
 
-    const Pixels& display() const
+    bool captured() const
     {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return captured_;
+    }
+
+    Pixels display() const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
         return display_;
     }
 
-    const Pixels& output() const
+    Pixels output() const
     {
+        std::lock_guard<std::mutex> lock(mutex_);
         return output_;
     }
 
-    const Window& window() const
+    Window window() const
     {
+        std::lock_guard<std::mutex> lock(mutex_);
         return window_;
+    }
+
+    unsigned generation() const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return generation_;
+    }
+
+    void setState(CropState state)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        state_ = state;
     }
 
 private:
     rtengine::StagedImageProcessor* processor_;
     CropState state_;
+    mutable std::mutex mutex_;
+    std::condition_variable condition_;
     Pixels display_;
     Pixels output_;
     Window window_;
-    bool displayCaptured_ = false;
-    bool outputCaptured_ = false;
+    bool captured_ = false;
+    unsigned generation_ = 0;
 };
 
 constexpr int PREVIEW_SCALE = 4;
 constexpr int PREVIEW_TIMEOUT_MS = 600000;
+/* A sequence step waits for one preview pass and one crop delivery. */
+constexpr int UPDATE_TIMEOUT_MS = 600000;
 
 struct Result {
     bool ok = false;
@@ -333,6 +377,48 @@ struct Result {
     Pixels display;
     Pixels output;
 };
+
+/* Which dirty-block source the crop graph uses (RT_CROP_DIRTY). */
+enum class DirtyMode {
+    Legacy,
+    Shadow,
+    Fingerprint
+};
+
+const char* dirtyModeName(DirtyMode mode)
+{
+    switch (mode) {
+    case DirtyMode::Legacy:
+        return "legacy";
+    case DirtyMode::Shadow:
+        return "shadow";
+    case DirtyMode::Fingerprint:
+        return "fingerprint";
+    }
+    return "unknown";
+}
+
+bool parseDirtyMode(const std::string& text, DirtyMode& mode)
+{
+    if (text == "legacy") {
+        mode = DirtyMode::Legacy;
+        return true;
+    }
+    if (text == "shadow") {
+        mode = DirtyMode::Shadow;
+        return true;
+    }
+    if (text == "fingerprint") {
+        mode = DirtyMode::Fingerprint;
+        return true;
+    }
+    return false;
+}
+
+void selectDirtyMode(DirtyMode mode)
+{
+    g_setenv("RT_CROP_DIRTY", dirtyModeName(mode), TRUE);
+}
 
 void enableStageCoverage(rtengine::procparams::ProcParams& params, bool afterRgb,
                          bool ciecam)
@@ -369,65 +455,180 @@ void enableStageCoverage(rtengine::procparams::ProcParams& params, bool afterRgb
     params.locallab.spots.emplace_back();
 }
 
+/*
+ * One loaded image, one processor and one detailed crop.
+ *
+ * The crop is created with a listener for `state`, the initial parameters are
+ * applied with FIRST and the first crop is produced by fullUpdate(). A
+ * sequence step then applies the next parameter set with the mask the GUI
+ * would send and waits for the crop the coordinator renders in response, so
+ * the incremental path under test is the real one, not a synthetic ALL pass.
+ */
+class Session
+{
+public:
+    Session(const std::string& file,
+            const rtengine::procparams::ProcParams& params,
+            CropState state,
+            DirtyMode mode)
+        : state_(state)
+    {
+        selectDirtyMode(mode);
+
+        int errorCode = 0;
+        image_ = rtengine::InitialImage::load(Glib::ustring(file), true,
+                                             &errorCode);
+        if (image_ == nullptr || errorCode != 0) {
+            std::fprintf(stderr,
+                         "crop-stage-test: failed to load the image (error %d)\n",
+                         errorCode);
+            if (image_ != nullptr) {
+                image_->decreaseRef();
+                image_ = nullptr;
+            }
+            return;
+        }
+
+        processor_ = rtengine::StagedImageProcessor::create(image_);
+        processor_->setPreviewImageListener(&preview_);
+        // A fixed monitor transform: the parity comparison must not depend on
+        // the host display profile.
+        processor_->setMonitorProfile(
+            App::get().options().rtSettings.monitorProfile,
+            rtengine::RI_RELATIVE);
+        processor_->setPreviewScale(PREVIEW_SCALE);
+
+        rtengine::procparams::ProcParams* editing =
+            processor_->beginUpdateParams();
+        *editing = params;
+        processor_->endUpdateParams(FIRST);
+
+        if (!preview_.waitFor(1, PREVIEW_TIMEOUT_MS)) {
+            std::fprintf(stderr,
+                         "crop-stage-test: the preview pass timed out\n");
+            return;
+        }
+
+        crop_ = processor_->createCrop(nullptr, false);
+        capture_.reset(new CropCapture(processor_, state));
+        crop_->setListener(capture_.get());
+        crop_->fullUpdate();
+        ready_ = capture_->waitFor(1, UPDATE_TIMEOUT_MS);
+    }
+
+    ~Session()
+    {
+        if (crop_ != nullptr) {
+            delete crop_;
+            crop_ = nullptr;
+        }
+        if (processor_ != nullptr) {
+            /*
+             * The coordinator owns the image-source reference and releases it
+             * in its destructor, so the harness must not release it again.
+             */
+            rtengine::StagedImageProcessor::destroy(processor_);
+            processor_ = nullptr;
+            image_ = nullptr;
+        }
+        if (image_ != nullptr) {
+            image_->decreaseRef();
+            image_ = nullptr;
+        }
+    }
+
+    Session(const Session&) = delete;
+    Session& operator=(const Session&) = delete;
+
+    bool ready() const
+    {
+        return ready_;
+    }
+
+    /*
+     * Apply a new parameter set and wait for the coordinator to render it.
+     *
+     * `todo` is the mask the GUI would send for this edit. At 100% zoom the
+     * coordinator renders the crop for every non-void mask, which is the path
+     * this harness measures.
+     */
+    bool apply(const rtengine::procparams::ProcParams& params, int todo)
+    {
+        const unsigned previewTarget = preview_.ready() + 1;
+        const unsigned cropTarget = capture_->generation() + 1;
+
+        rtengine::procparams::ProcParams* editing =
+            processor_->beginUpdateParams();
+        *editing = params;
+        processor_->endUpdateParams(todo);
+
+        if (!preview_.waitFor(previewTarget, UPDATE_TIMEOUT_MS)) {
+            std::fprintf(stderr,
+                         "crop-stage-test: the incremental preview timed out\n");
+            return false;
+        }
+        if (!capture_->waitFor(cropTarget, UPDATE_TIMEOUT_MS)) {
+            std::fprintf(stderr,
+                         "crop-stage-test: the incremental crop timed out\n");
+            return false;
+        }
+        return true;
+    }
+
+    Result result() const
+    {
+        Result out;
+        out.ok = ready_;
+        out.window = capture_->window();
+        out.display = capture_->display();
+        out.output = capture_->output();
+        return out;
+    }
+
+    /*
+     * Move the viewport to another state and repaint it, the way a zoom or a
+     * pan does. The crop reallocates its buffers, so this exercises the forced
+     * full path and the reallocation rather than the incremental one.
+     */
+    bool refresh(CropState state)
+    {
+        const unsigned cropTarget = capture_->generation() + 1;
+        capture_->setState(state);
+        crop_->fullUpdate();
+        if (!capture_->waitFor(cropTarget, UPDATE_TIMEOUT_MS)) {
+            std::fprintf(stderr,
+                         "crop-stage-test: the geometry crop timed out\n");
+            return false;
+        }
+        return true;
+    }
+
+    Window window() const
+    {
+        return capture_->window();
+    }
+
+private:
+    rtengine::InitialImage* image_ = nullptr;
+    rtengine::StagedImageProcessor* processor_ = nullptr;
+    rtengine::DetailedCrop* crop_ = nullptr;
+    std::unique_ptr<CropCapture> capture_;
+    PreviewWait preview_;
+    CropState state_;
+    bool ready_ = false;
+};
+
 bool runCrop(const std::string& file,
              const rtengine::procparams::ProcParams& params,
              CropState state,
-             bool graph,
+             DirtyMode mode,
              Result& result)
 {
-    g_setenv("RT_STAGE_GRAPH", graph ? "1" : "0", TRUE);
-
-    int errorCode = 0;
-    rtengine::InitialImage* image =
-        rtengine::InitialImage::load(Glib::ustring(file), true, &errorCode);
-    if (image == nullptr || errorCode != 0) {
-        std::fprintf(stderr, "crop-stage-test: failed to load the image (error %d)\n",
-                     errorCode);
-        if (image != nullptr) {
-            image->decreaseRef();
-        }
+    Session session(file, params, state, mode);
+    if (!session.ready()) {
         return false;
     }
-
-    rtengine::StagedImageProcessor* processor =
-        rtengine::StagedImageProcessor::create(image);
-
-    PreviewWait preview;
-    processor->setPreviewImageListener(&preview);
-    // A fixed monitor transform: the parity comparison must not depend on the
-    // host display profile, and both passes must use the same one.
-    processor->setMonitorProfile(App::get().options().rtSettings.monitorProfile,
-                                 rtengine::RI_RELATIVE);
-    processor->setPreviewScale(PREVIEW_SCALE);
-
-    rtengine::procparams::ProcParams* editing = processor->beginUpdateParams();
-    *editing = params;
-    processor->endUpdateParams(FIRST);
-
-    if (!preview.wait(PREVIEW_TIMEOUT_MS)) {
-        std::fprintf(stderr, "crop-stage-test: the preview pass timed out\n");
-        rtengine::StagedImageProcessor::destroy(processor);
-        return false;
-    }
-
-    rtengine::DetailedCrop* crop = processor->createCrop(nullptr, false);
-    CropCapture capture(processor, state);
-    crop->setListener(&capture);
-    crop->fullUpdate();
-
-    result.ok = capture.captured();
-    result.window = capture.window();
-    result.display = capture.display();
-    result.output = capture.output();
-
-    delete crop;
-    rtengine::StagedImageProcessor::destroy(processor);
-
-    if (!result.ok) {
-        std::fprintf(stderr, "crop-stage-test: the crop was not delivered (graph=%d)\n",
-                     graph ? 1 : 0);
-    }
-
+    result = session.result();
     return result.ok;
 }
 
@@ -437,51 +638,308 @@ void reportWindow(const Window& window)
                 window.x, window.y, window.skip);
 }
 
-bool compareState(CropState state, const Result& legacy, const Result& graph,
-                  const std::string& outDir)
+bool compareState(CropState state, const Result& baseline,
+                  const Result& candidate, const std::string& outDir)
 {
     bool ok = true;
 
-    if (legacy.window.x != graph.window.x || legacy.window.y != graph.window.y
-            || legacy.window.width != graph.window.width
-            || legacy.window.height != graph.window.height
-            || legacy.window.skip != graph.window.skip) {
+    if (baseline.window.x != candidate.window.x
+            || baseline.window.y != candidate.window.y
+            || baseline.window.width != candidate.window.width
+            || baseline.window.height != candidate.window.height
+            || baseline.window.skip != candidate.window.skip) {
         std::fprintf(stderr,
-                     "FAIL %s: the requested window differs: legacy ",
+                     "FAIL %s: the requested window differs: baseline ",
                      stateName(state));
-        reportWindow(legacy.window);
-        std::fprintf(stderr, ", graph ");
-        reportWindow(graph.window);
+        reportWindow(baseline.window);
+        std::fprintf(stderr, ", candidate ");
+        reportWindow(candidate.window);
         std::fprintf(stderr, "\n");
         ok = false;
     }
 
-    const Difference display = compare(legacy.display, graph.display);
-    const Difference output = compare(legacy.output, graph.output);
+    const Difference display = compare(baseline.display, candidate.display);
+    const Difference output = compare(baseline.output, candidate.output);
 
     if (display.differingBytes != 0 || output.differingBytes != 0) {
         std::fprintf(stderr,
-                     "FAIL %s: legacy and graph differ: display %zu bytes "
-                     "(max delta %d), output %zu bytes (max delta %d)\n",
+                     "FAIL %s: baseline and candidate differ: display %zu "
+                     "bytes (max delta %d), output %zu bytes (max delta %d)\n",
                      stateName(state), display.differingBytes, display.maxDelta,
                      output.differingBytes, output.maxDelta);
         ok = false;
     } else {
         std::printf("PASS %s: ", stateName(state));
-        reportWindow(legacy.window);
+        reportWindow(baseline.window);
         std::printf(", display %dx%d fingerprint %016llx, output %dx%d "
                     "fingerprint %016llx, AE=0\n",
-                    legacy.display.width, legacy.display.height,
-                    static_cast<unsigned long long>(fingerprint(legacy.display)),
-                    legacy.output.width, legacy.output.height,
-                    static_cast<unsigned long long>(fingerprint(legacy.output)));
+                    baseline.display.width, baseline.display.height,
+                    static_cast<unsigned long long>(
+                        fingerprint(baseline.display)),
+                    baseline.output.width, baseline.output.height,
+                    static_cast<unsigned long long>(
+                        fingerprint(baseline.output)));
     }
 
-    ok = writePpm(outDir + "/" + stateName(state) + "-legacy.ppm",
-                  legacy.display) && ok;
-    ok = writePpm(outDir + "/" + stateName(state) + "-graph.ppm",
-                  graph.display) && ok;
+    ok = writePpm(outDir + "/" + stateName(state) + "-baseline.ppm",
+                  baseline.display) && ok;
+    ok = writePpm(outDir + "/" + stateName(state) + "-candidate.ppm",
+                  candidate.display) && ok;
     return ok;
+}
+
+/*
+ * One incremental edit: the mask the GUI sends for that edit and the parameter
+ * change behind it.
+ *
+ * The masks are the real composites from refreshmap.h, not single bits: a
+ * white-balance or demosaic edit carries M_INIT because the source has to be
+ * reloaded, and a sharpening edit carries the whole Lab chain. Using the real
+ * mask is what makes the shadow comparison meaningful.
+ */
+struct EditScenario {
+    const char* name;
+    int todo;
+    void (*mutate)(rtengine::procparams::ProcParams&);
+};
+
+const std::vector<EditScenario>& editScenarios()
+{
+    static const std::vector<EditScenario> scenarios = {
+        {"wb", WB,
+         [](rtengine::procparams::ProcParams& p) {
+             /*
+              * A manual white balance: with the automatic method the engine
+              * recomputes the temperature from the image on every pass and the
+              * edit would not reach the pipeline.
+              */
+             p.wb.enabled = true;
+             p.wb.method = "Custom";
+             p.wb.temperature += 800;
+         }},
+        {"demosaic", DEMOSAIC,
+         [](rtengine::procparams::ProcParams& p) {
+             p.pdsharpening.enabled = true;
+         }},
+        {"transform", TRANSFORM,
+         [](rtengine::procparams::ProcParams& p) { p.rotate.degree = 1.5; }},
+        {"local", AUTOEXP,
+         [](rtengine::procparams::ProcParams& p) {
+             p.locallab.enabled = true;
+             if (p.locallab.spots.empty()) {
+                 p.locallab.spots.emplace_back();
+             }
+             p.locallab.spots.back().struc += 10.0;
+         }},
+        {"sharpening", SHARPENING,
+         [](rtengine::procparams::ProcParams& p) {
+             p.sharpening.enabled = true;
+             p.sharpening.amount += 100;
+         }},
+        {"ciecam", AUTOEXP,
+         [](rtengine::procparams::ProcParams& p) {
+             p.colorappearance.enabled = true;
+             p.colorappearance.modelmethod = "02";
+         }},
+        {"ciecam-off", AUTOEXP,
+         [](rtengine::procparams::ProcParams& p) {
+             p.colorappearance.enabled = false;
+         }},
+        {"crop", CROP,
+         [](rtengine::procparams::ProcParams& p) {
+             p.crop.enabled = true;
+             p.crop.fixratio = true;
+             p.crop.ratio = "3:2";
+         }}
+    };
+    return scenarios;
+}
+
+/* Compares the display and output images, not the requested window. */
+Difference difference(const Result& a, const Result& b)
+{
+    const Difference display = compare(a.display, b.display);
+    const Difference output = compare(a.output, b.output);
+    Difference total;
+    total.differingBytes = display.differingBytes + output.differingBytes;
+    total.maxDelta = std::max(display.maxDelta, output.maxDelta);
+    return total;
+}
+
+/*
+ * Reports one incremental comparison.
+ *
+ * `baseline` is the legacy incremental update, `candidate` the derived one and
+ * `reference` a fresh render of the final state. Parity is the gate: the
+ * candidate must match the current graph default exactly. The two fresh
+ * columns are evidence: they show whether the incremental result converged,
+ * and they attribute a stale result to the legacy path when the candidate
+ * matches it.
+ */
+bool reportSequence(const std::string& label, int todo,
+                    const Result& baseline, const Result& candidate,
+                    const Result& reference, const std::string& outDir)
+{
+    const Difference parity = difference(baseline, candidate);
+    const Difference legacyFresh = difference(baseline, reference);
+    const Difference derivedFresh = difference(candidate, reference);
+
+    const bool geometryDiffers =
+        baseline.display.width != candidate.display.width
+        || baseline.display.height != candidate.display.height
+        || baseline.output.width != candidate.output.width
+        || baseline.output.height != candidate.output.height;
+
+    const bool ok = parity.differingBytes == 0 && parity.maxDelta == 0
+                    && !geometryDiffers;
+
+    std::printf("%s seq %s: todo=0x%x parity AE=%d (%zu bytes), "
+                "fresh candidate AE=%d (%zu bytes), "
+                "fresh baseline AE=%d (%zu bytes)%s\n",
+                ok ? "PASS" : "FAIL", label.c_str(), todo,
+                parity.maxDelta, parity.differingBytes, derivedFresh.maxDelta,
+                derivedFresh.differingBytes, legacyFresh.maxDelta,
+                legacyFresh.differingBytes,
+                legacyFresh.differingBytes == 0
+                    ? ""
+                    : " [legacy incremental is stale for this mask]");
+
+    writePpm(outDir + "/seq-" + label + "-baseline.ppm", baseline.display);
+    writePpm(outDir + "/seq-" + label + "-candidate.ppm", candidate.display);
+    writePpm(outDir + "/seq-" + label + "-reference.ppm", reference.display);
+    return ok;
+}
+
+bool runSequence(const std::string& file,
+                 const rtengine::procparams::ProcParams& params,
+                 const EditScenario& scenario,
+                 DirtyMode mode,
+                 const std::string& outDir)
+{
+    rtengine::procparams::ProcParams changed = params;
+    scenario.mutate(changed);
+
+    Session baseline(file, params, CropState::Full, DirtyMode::Legacy);
+    if (!baseline.ready() || !baseline.apply(changed, scenario.todo)) {
+        std::fprintf(stderr, "FAIL seq %s: the baseline session failed\n",
+                     scenario.name);
+        return false;
+    }
+    const Result incrementalLegacy = baseline.result();
+
+    Session candidate(file, params, CropState::Full, mode);
+    if (!candidate.ready() || !candidate.apply(changed, scenario.todo)) {
+        std::fprintf(stderr, "FAIL seq %s: the candidate session failed\n",
+                     scenario.name);
+        return false;
+    }
+    const Result incrementalDerived = candidate.result();
+
+    Result reference;
+    if (!runCrop(file, changed, CropState::Full, DirtyMode::Legacy,
+                 reference)) {
+        std::fprintf(stderr, "FAIL seq %s: the reference session failed\n",
+                     scenario.name);
+        return false;
+    }
+
+    return reportSequence(scenario.name, scenario.todo, incrementalLegacy,
+                          incrementalDerived, reference, outDir);
+}
+
+/*
+ * Zoom and pan inside one editor session, then compare with a fresh render at
+ * the new viewport. The crop reallocates its buffers here, so the derivation
+ * is forced: this is the regression check for the resize path, not for the
+ * incremental one.
+ */
+bool runGeometrySequence(const std::string& file,
+                         const rtengine::procparams::ProcParams& params,
+                         DirtyMode mode, const std::string& outDir)
+{
+    Session baseline(file, params, CropState::Full, DirtyMode::Legacy);
+    if (!baseline.ready() || !baseline.refresh(CropState::Zoomed)) {
+        std::fprintf(stderr, "FAIL seq geometry: the baseline session failed\n");
+        return false;
+    }
+    const Result incrementalLegacy = baseline.result();
+
+    Session candidate(file, params, CropState::Full, mode);
+    if (!candidate.ready() || !candidate.refresh(CropState::Zoomed)) {
+        std::fprintf(stderr,
+                     "FAIL seq geometry: the candidate session failed\n");
+        return false;
+    }
+    const Result incrementalDerived = candidate.result();
+
+    Result reference;
+    if (!runCrop(file, params, CropState::Zoomed, DirtyMode::Legacy,
+                 reference)) {
+        std::fprintf(stderr,
+                     "FAIL seq geometry: the reference session failed\n");
+        return false;
+    }
+
+    return reportSequence("geometry", 0, incrementalLegacy, incrementalDerived,
+                          reference, outDir);
+}
+
+/*
+ * Times a fixed number of identical-shaped incremental updates.
+ *
+ * The measured interval covers the whole coordinator pass (preview and crop),
+ * which is identical in every mode; the difference between two runs isolates
+ * the cost of the dirty-block derivation plus any extra inert stage call the
+ * derived set adds. Alternating the exposure keeps a real parameter change in
+ * every iteration so the derivation has work to do.
+ */
+bool runBenchmark(const std::string& file,
+                  const rtengine::procparams::ProcParams& params,
+                  DirtyMode mode, int count, const std::string& edit)
+{
+    Session session(file, params, CropState::Full, mode);
+    if (!session.ready()) {
+        std::fprintf(stderr, "FAIL bench: the session failed\n");
+        return false;
+    }
+
+    constexpr int WARMUP = 2;
+    std::vector<double> timings;
+    timings.reserve(static_cast<size_t>(count));
+
+    for (int i = 0; i < count + WARMUP; ++i) {
+        rtengine::procparams::ProcParams changed = params;
+        int todo = M_RGBCURVE;
+        if (edit == "crop") {
+            changed.crop.enabled = (i % 2 == 0);
+            todo = M_CROP;
+        } else {
+            changed.toneCurve.expcomp = (i % 2 == 0) ? 0.05 : -0.05;
+        }
+
+        const auto start = std::chrono::steady_clock::now();
+        if (!session.apply(changed, todo)) {
+            std::fprintf(stderr, "FAIL bench: update %d failed\n", i);
+            return false;
+        }
+        const auto end = std::chrono::steady_clock::now();
+        if (i >= WARMUP) {
+            timings.push_back(
+                std::chrono::duration<double, std::milli>(end - start).count());
+        }
+    }
+
+    std::sort(timings.begin(), timings.end());
+    const double total =
+        std::accumulate(timings.begin(), timings.end(), 0.0);
+    const double mean = total / static_cast<double>(timings.size());
+    const double median = timings[timings.size() / 2];
+
+    std::printf("bench %s edit=%s: %d updates, mean %.1f ms, median %.1f ms, "
+                "min %.1f ms, max %.1f ms\n",
+                dirtyModeName(mode), edit.c_str(), count, mean, median,
+                timings.front(), timings.back());
+    return true;
 }
 
 } // namespace
@@ -490,8 +948,10 @@ int main(int argc, char** argv)
 {
     if (argc < 2) {
         std::fprintf(stderr,
-                     "usage: %s <raw> [pp3] [out-dir] [--stages] [--cbdl=aft] "
-                     "[--no-ciecam]\n",
+                     "usage: %s <raw> [pp3] [out-dir] [--stages] [--sequences] "
+                     "[--only=<scenario>] [--bench=<n>] [--bench-edit=crop] "
+                     "[--dirty=legacy|shadow|fingerprint] [--out=<dir>] "
+                     "[--cbdl=aft] [--no-ciecam]\n",
                      argv[0]);
         return 2;
     }
@@ -500,17 +960,49 @@ int main(int argc, char** argv)
     std::string pp3;
     std::string outDir = ".";
     bool stageCoverage = false;
+    bool sequences = false;
     bool afterRgb = false;
     bool ciecam = true;
+    std::string onlyScenario;
+    int benchCount = 0;
+    std::string benchEdit = "exposure";
+    DirtyMode dirtyMode = DirtyMode::Fingerprint;
 
     for (int i = 2; i < argc; ++i) {
         const std::string argument = argv[i];
         if (argument == "--stages") {
             stageCoverage = true;
+        } else if (argument == "--sequences") {
+            sequences = true;
         } else if (argument == "--cbdl=aft") {
             afterRgb = true;
         } else if (argument == "--no-ciecam") {
             ciecam = false;
+        } else if (argument.rfind("--only=", 0) == 0) {
+            onlyScenario = argument.substr(7);
+        } else if (argument.rfind("--bench-edit=", 0) == 0) {
+            benchEdit = argument.substr(13);
+            if (benchEdit != "exposure" && benchEdit != "crop") {
+                std::fprintf(stderr, "unknown benchmark edit: %s\n",
+                             benchEdit.c_str());
+                return 2;
+            }
+        } else if (argument.rfind("--bench=", 0) == 0) {
+            benchCount = std::atoi(argument.substr(8).c_str());
+            if (benchCount < 1) {
+                std::fprintf(stderr, "invalid benchmark count\n");
+                return 2;
+            }
+            sequences = true;
+        } else if (argument.rfind("--dirty=", 0) == 0) {
+            const std::string value = argument.substr(8);
+            if (!parseDirtyMode(value, dirtyMode)) {
+                std::fprintf(stderr, "unknown dirty mode: %s\n",
+                             value.c_str());
+                return 2;
+            }
+        } else if (argument.rfind("--out=", 0) == 0) {
+            outDir = argument.substr(6);
         } else if (argument.rfind("--", 0) == 0) {
             std::fprintf(stderr, "unknown option: %s\n", argument.c_str());
             return 2;
@@ -564,30 +1056,85 @@ int main(int argc, char** argv)
     const CropState states[] = {CropState::Fit, CropState::Full, CropState::Zoomed};
     bool ok = true;
 
-    for (CropState state : states) {
-        Result legacy;
-        Result graph;
+    std::printf("candidate dirty mode: %s\n", dirtyModeName(dirtyMode));
 
-        if (!runCrop(file, params, state, false, legacy)
-                || !runCrop(file, params, state, true, graph)) {
+    if (benchCount > 0) {
+        const bool benchOk =
+            runBenchmark(file, params, dirtyMode, benchCount, benchEdit);
+        std::printf("crop-stage-test: %s\n", benchOk ? "PASS" : "FAIL");
+        return benchOk ? 0 : 1;
+    }
+
+    const unsigned dirtyChecksBefore = rtengine::crop_graph::dirtyChecks();
+    const unsigned dirtyEquivalentBefore =
+        rtengine::crop_graph::dirtyEquivalent();
+    const unsigned dirtyMissingBefore = rtengine::crop_graph::dirtyMissing();
+    const unsigned dirtyExtraBefore = rtengine::crop_graph::dirtyExtra();
+    const unsigned dirtyFallbacksBefore =
+        rtengine::crop_graph::dirtyFallbacks();
+
+    for (CropState state : states) {
+        Result baseline;
+        Result candidate;
+
+        if (!onlyScenario.empty()) {
+            continue;
+        }
+
+        if (!runCrop(file, params, state, DirtyMode::Legacy, baseline)
+                || !runCrop(file, params, state, dirtyMode, candidate)) {
             return 2;
         }
 
-        ok = compareState(state, legacy, graph, outDir) && ok;
+        ok = compareState(state, baseline, candidate, outDir) && ok;
+    }
+
+    /*
+     * A static state always starts from no history, so its derivation is
+     * forced. The incremental scenarios are the ones that exercise the
+     * parameter and render-state comparison.
+     */
+    if (sequences) {
+        if (onlyScenario.empty() || onlyScenario == "geometry") {
+            ok = runGeometrySequence(file, params, dirtyMode, outDir) && ok;
+        }
+        for (const EditScenario& scenario : editScenarios()) {
+            if (!onlyScenario.empty() && onlyScenario != scenario.name) {
+                continue;
+            }
+            ok = runSequence(file, params, scenario, dirtyMode, outDir) && ok;
+        }
     }
 
     g_unsetenv("RT_STAGE_GRAPH");
+    g_unsetenv("RT_CROP_DIRTY");
 
     // Parity is only evidence when the graph actually ran: a rejected plan
     // falls back to the legacy sequence and would compare legacy with itself.
     const unsigned graphRuns = rtengine::crop_graph::runs();
     const unsigned graphFallbacks = rtengine::crop_graph::fallbacks();
-    const unsigned expectedRuns = sizeof(states) / sizeof(states[0]);
-    std::printf("crop graph: %u plans executed, %u fallbacks (expected %u/0)\n",
-                graphRuns, graphFallbacks, expectedRuns);
-    if (graphRuns != expectedRuns || graphFallbacks != 0) {
+    std::printf("crop graph: %u plans executed, %u plan fallbacks\n",
+                graphRuns, graphFallbacks);
+    if (graphRuns == 0 || graphFallbacks != 0) {
         std::fprintf(stderr,
-                     "FAIL: the crop graph did not execute every state\n");
+                     "FAIL: the crop graph did not execute every update\n");
+        ok = false;
+    }
+
+    const unsigned dirtyChecks =
+        rtengine::crop_graph::dirtyChecks() - dirtyChecksBefore;
+    const unsigned dirtyFallbacks =
+        rtengine::crop_graph::dirtyFallbacks() - dirtyFallbacksBefore;
+    std::printf("crop dirty: %u comparisons, %u equivalent, %u missing blocks, "
+                "%u extra blocks, %u fail-closed fallbacks\n",
+                dirtyChecks,
+                rtengine::crop_graph::dirtyEquivalent() - dirtyEquivalentBefore,
+                rtengine::crop_graph::dirtyMissing() - dirtyMissingBefore,
+                rtengine::crop_graph::dirtyExtra() - dirtyExtraBefore,
+                dirtyFallbacks);
+    if (dirtyMode != DirtyMode::Legacy && dirtyChecks == 0) {
+        std::fprintf(stderr,
+                     "FAIL: the dirty-block derivation did not run\n");
         ok = false;
     }
 
