@@ -240,18 +240,17 @@ namespace
 {
 
 /*
- * Opt-in switch for the graph-driven crop path (RT_STAGE_GRAPH).
+ * Switch for the graph-driven crop path (RT_STAGE_GRAPH).
  *
- * The legacy sequence stays the default: only a value other than empty, "0" or
- * "off" (case-insensitive) selects the graph. The value is read per call so a
- * harness can compare both paths in one process.
+ * The graph is the default; set RT_STAGE_GRAPH=0 or off for the legacy
+ * sequence. The value is read per call so a harness can compare both paths.
  */
 bool cropGraphEnabled()
 {
     const char* value = g_getenv("RT_STAGE_GRAPH");
-    return value != nullptr && value[0] != '\0'
-        && g_ascii_strcasecmp(value, "0") != 0
-        && g_ascii_strcasecmp(value, "off") != 0;
+    return value == nullptr || value[0] == '\0'
+        || (g_ascii_strcasecmp(value, "0") != 0
+            && g_ascii_strcasecmp(value, "off") != 0);
 }
 
 /*

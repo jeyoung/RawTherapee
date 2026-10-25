@@ -274,19 +274,17 @@ namespace
 {
 
 /*
- * Opt-in switch for the graph-driven thumbnail path (RT_STAGE_GRAPH).
+ * Switch for the graph-driven thumbnail path (RT_STAGE_GRAPH).
  *
- * The legacy thumbnail sequence stays the default: only a value other than
- * empty, "0" or "off" (case-insensitive) selects the graph. The value is read
- * per call so a harness can compare both paths in one process; the lookup is
- * negligible next to thumbnail generation.
+ * The graph is the default; set RT_STAGE_GRAPH=0 or off for the legacy
+ * sequence. The value is read per call so a harness can compare both paths.
  */
 bool thumbnailGraphEnabled()
 {
     const char* value = g_getenv("RT_STAGE_GRAPH");
-    return value != nullptr && value[0] != '\0'
-        && g_ascii_strcasecmp(value, "0") != 0
-        && g_ascii_strcasecmp(value, "off") != 0;
+    return value == nullptr || value[0] == '\0'
+        || (g_ascii_strcasecmp(value, "0") != 0
+            && g_ascii_strcasecmp(value, "off") != 0);
 }
 
 struct ThumbnailGraphPlan {

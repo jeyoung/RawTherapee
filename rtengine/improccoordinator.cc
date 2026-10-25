@@ -1307,10 +1307,9 @@ namespace
 {
 
 /*
- * Opt-in switch for the graph-driven full-frame preview. The legacy sequence
- * stays the default. RT_PREVIEW_GRAPH takes precedence; RT_STAGE_GRAPH names
- * the same switch for the other pipelines, so a harness can drive them
- * together.
+ * Switch for the graph-driven full-frame preview. The graph is the default.
+ * RT_PREVIEW_GRAPH takes precedence; RT_STAGE_GRAPH names the same switch for
+ * the other pipelines. Set either to 0/off for the legacy sequence.
  */
 bool previewGraphEnabled()
 {
@@ -1319,9 +1318,9 @@ bool previewGraphEnabled()
         if (value == nullptr || value[0] == '\0') {
             value = g_getenv("RT_STAGE_GRAPH");
         }
-        return value != nullptr && value[0] != '\0'
-            && g_ascii_strcasecmp(value, "0") != 0
-            && g_ascii_strcasecmp(value, "off") != 0;
+        return value == nullptr || value[0] == '\0'
+            || (g_ascii_strcasecmp(value, "0") != 0
+                && g_ascii_strcasecmp(value, "off") != 0);
     }();
     return enabled;
 }

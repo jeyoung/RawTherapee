@@ -121,17 +121,16 @@ void rgbToLabRegion(const Imagefloat& src, LabImage& dst, int x, int y,
 }
 
 /*
- * Opt-in switch for the graph-driven export path. The legacy pipeline stays
- * the default: only a value other than empty, "0" or "off"
- * (case-insensitive) selects the graph.
+ * Switch for the graph-driven export path. The graph is the default; set
+ * RT_STAGE_GRAPH=0 or off to use the legacy sequence.
  */
 bool stageGraphEnabled()
 {
     static const bool enabled = []() {
         const char* value = g_getenv("RT_STAGE_GRAPH");
-        return value != nullptr && value[0] != '\0'
-            && g_ascii_strcasecmp(value, "0") != 0
-            && g_ascii_strcasecmp(value, "off") != 0;
+        return value == nullptr || value[0] == '\0'
+            || (g_ascii_strcasecmp(value, "0") != 0
+                && g_ascii_strcasecmp(value, "off") != 0);
     }();
     return enabled;
 }
