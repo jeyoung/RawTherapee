@@ -5,13 +5,18 @@
 #   tools/perf/run-suite.sh --build-dir build/cpu-perf-stage-runtime \
 #       --image "$RT_TEST_IMAGE_45MP" [--pp3 FILE] [--denoise-pp3 FILE] \
 #       [--baseline-dir DIR] [--mode smoke|gate] [--report DIR] \
-#       [--skip-preview] [--skip-stage-tests] [--graph] [--thumbnail-graph]
+#       [--skip-preview] [--skip-stage-tests] [--graph] [--thumbnail-graph] \
+#       [--crop-graph]
 #
 # --graph adds an opt-in parity gate: export once with RT_STAGE_GRAPH=0 and
 # once with RT_STAGE_GRAPH=1, then require AE=0 between the two TIFFs.
 # --thumbnail-graph builds thumbnail-stage-test and requires byte-identical
 # embedded-JPEG and raw-fallback thumbnails between the legacy sequence and
 # the thumbnail stage graph.
+# --crop-graph builds crop-stage-test and requires byte-identical detailed crop
+# images for fit, 100% and zoomed/panned viewports between the legacy sequence
+# and the crop stage graph, then repeats the check with the Lab, CIE CAM, gamut
+# and local-adjustment blocks enabled.
 # --denoise-pp3 adds a thread-determinism matrix for a profile that enables
 # directional-pyramid denoising (see devnotes/perf/DETERMINISM.md).
 
@@ -31,6 +36,7 @@ skip_preview=0
 skip_stage_tests=0
 graph_parity=0
 thumbnail_graph_parity=0
+crop_graph_parity=0
 threads_list="1 2 4 8"
 
 while [ "$#" -gt 0 ]; do
@@ -46,6 +52,7 @@ while [ "$#" -gt 0 ]; do
         --skip-stage-tests) skip_stage_tests=1; shift ;;
         --graph) graph_parity=1; shift ;;
         --thumbnail-graph) thumbnail_graph_parity=1; shift ;;
+        --crop-graph) crop_graph_parity=1; shift ;;
         -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
         *) die "unknown option: $1" ;;
     esac
@@ -176,6 +183,53 @@ if [ "$thumbnail_graph_parity" -eq 1 ]; then
     fi
 else
     skip "thumbnail graph parity (--thumbnail-graph)"
+fi
+
+# --------------------------------------------------------- crop graph parity
+info "crop graph parity"
+if [ "$crop_graph_parity" -eq 1 ]; then
+    crop_dir="$report/crop"
+    mkdir -p "$crop_dir"
+    log="$report/crop-stage-test.log"
+    crop_args=("$image")
+    if [ -n "$pp3" ]; then
+        crop_args+=("$pp3")
+    fi
+    crop_args+=("$crop_dir")
+    if cmake --build "$build_dir" --target crop-stage-test -j 6 \
+            >"$report/crop-stage-test.build.log" 2>&1 \
+        && OMP_NUM_THREADS=1 "$build_dir/rtengine/crop-stage-test" \
+            "${crop_args[@]}" >"$log" 2>&1; then
+        if grep -q "crop-stage-test: PASS" "$log"; then
+            pass "crop graph parity (fit, 100%, zoomed)"
+        else
+            fail "crop graph parity (see $log)"
+        fi
+        if grep -q "crop-graph: active," "$log"; then
+            pass "crop graph plan active"
+        else
+            fail "crop graph plan not active (see $log)"
+        fi
+    else
+        fail "crop-stage-test (see $log)"
+    fi
+
+    stages_dir="$report/crop-stages"
+    mkdir -p "$stages_dir"
+    stages_log="$report/crop-stage-test-stages.log"
+    stages_args=("$image")
+    if [ -n "$pp3" ]; then
+        stages_args+=("$pp3")
+    fi
+    stages_args+=("$stages_dir" --stages)
+    if OMP_NUM_THREADS=1 "$build_dir/rtengine/crop-stage-test" \
+            "${stages_args[@]}" >"$stages_log" 2>&1; then
+        pass "crop graph parity (Lab, CIE CAM, gamut, local adjustments)"
+    else
+        fail "crop graph parity with stage coverage (see $stages_log)"
+    fi
+else
+    skip "crop graph parity (--crop-graph)"
 fi
 
 # -------------------------------------------------------------- thread matrix

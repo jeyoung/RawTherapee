@@ -302,6 +302,85 @@ Evidence (CPU build with OpenCL disabled, single-threaded host run,
   `tools/build-rt.sh opencl -j 6 --ccache --stage-modules` both complete;
   `stage-pipeline-test` and `stage-graph-test` pass.
 
+## Graph-driven crop / viewport
+
+`RT_STAGE_GRAPH=1` also switches the detailed crop path to the canonical
+fifteen-node crop specification. `Crop::update()` was split into the private
+`Crop::stage*` methods listed in `STAGE_PIPELINE.md`; the legacy sequence calls
+every method in order and the graph sequence calls the same methods according
+to `StageGraph::plan()`. The extraction is a move: no arithmetic, ROI geometry,
+skip/scale handling, crop buffer or thread changed.
+
+Per invocation the path builds `buildPipelineSpec(StagePath::Crop)`, connects
+every node and edge into a `StageGraph`, marks the blocks this request executes
+dirty, asks `plan()` for the actions and runs the accepted blocks. The
+activation predicates mirror the legacy guards:
+
+| Block | Runs when |
+|-------|-----------|
+| `source.select`, `analysis` | `todo & (M_INIT \| M_LINDENOISE \| M_HDR)` |
+| `raw.base`, `transform`, `viewport.output` | always |
+| `local.adjustments` | `todo & (M_AUTOEXP \| M_RGBCURVE)` and a local spot |
+| `rgb.proc` | `todo & M_RGBCURVE` |
+| the six Lab/CIE CAM/gamut blocks | `todo & (M_LUMINANCE + M_COLOR)` |
+
+Thirteen canonical nodes can be executed; `raw.preprocess` and `raw.demosaic`
+are folded into `source.select` because the ROI arrives through one opaque
+`ImageSource::getImage()` call. The plan is rejected, and the unchanged legacy
+sequence runs, if it would return `ReuseOutput` for a block this request
+executes. `crop_graph::runs()` and `crop_graph::fallbacks()` expose the two
+counters for the harness, and `logCropGraph()` prints one
+`crop-graph: active, N canonical nodes executed, M folded` or
+`crop-graph: fallback to legacy: plan would skip <node>` line per outcome.
+
+The parent preview is not changed: `ImProcCoordinator`'s viewport fast path,
+deferred analysis and preview dump are untouched, and the crop keeps reusing
+the parent LUTs and analysis it already consumed.
+
+Evidence (CPU build, 4C/8T host, `OMP_NUM_THREADS=1`, 45.7 MP NEF, stage
+modules on). Viewport states: fit (window 8280x5512, skip 9, 920x613 crop),
+100% (960x640 at 3660,2436, skip 1) and zoomed/panned (4140x2756 at 2070,1102,
+skip 2, 2102x1410 crop).
+
+| Profile | Nodes executed | Folded | Plans | Fallbacks | AE |
+|---------|----------------|--------|-------|-----------|----|
+| image sidecar | 12 | 2 | 3/3 | 0 | 0 |
+| `--stages` | 13 | 2 | 3/3 | 0 | 0 |
+| `--stages --no-ciecam` | 13 | 2 | 3/3 | 0 | 0 |
+| `--stages --cbdl=aft` | 13 | 2 | 3/3 | 0 | 0 |
+
+`local.adjustments` is inactive with the sidecar (no local spot), so that run
+executes twelve of the thirteen executable nodes. The `--stages` profiles
+enable a local spot, denoising, the Lab tools, working TRC, CIE CAM and gamut
+compression, so they execute all thirteen. `--no-ciecam` leaves CIE CAM off so
+that the before-RGB directional pyramid and sharpening run; `--cbdl=aft`
+selects the after-RGB pyramid position. Display and output-space crop images
+were byte-identical for every state (AE=0, 0 differing bytes). Example FNV-1a
+fingerprints of the 8-bit display image: fit `76ea0597566f792c`, 100 %
+`a00593349ce04058`, zoomed `303a87a6e1ce8ece`.
+
+The legacy sequence was captured from the unmodified tree before the
+extraction. After it, all twelve PPM dumps of the default profile and the
+initial coverage profile (three states x legacy/graph x two profiles) were
+byte-identical to the baseline (`cmp`), so the extraction changed no legacy
+output.
+
+Fail-closed check: marking the scheduled nodes clean (temporary experiment, not
+committed) made `plan()` return `ReuseOutput` for `source.select`; the run
+logged `crop-graph: fallback to legacy: plan would skip source.select`, ran the
+legacy sequence and left the pixels unchanged. `crop_graph::runs()` stayed 0,
+`fallbacks()` reached 3, and the harness failed instead of reporting a vacuous
+`AE=0`.
+
+OpenCL configuration: both builds complete with
+`tools/build-rt.sh <cpu|opencl> -j 4 --ccache --stage-modules`. The same
+harness passes in the OpenCL build for all four profiles, 3/3 plans executed,
+`AE=0`, with the same fingerprints as the CPU build. This is a
+configuration/build check: it does not claim GPU parity.
+
+`tools/perf/run-suite.sh --crop-graph` runs the plain and `--stages` harness as
+part of the standard gate; the suite report was `PASS` with `failures: 0`.
+
 ## Preview decision layer and dump
 
 `RT_PREVIEW_GRAPH=1` adds an opt-in decision layer to
@@ -582,9 +661,11 @@ parity.
 - The preview has a graph-backed decision layer, not a graph-driven
   execution path: with `RT_PREVIEW_GRAPH=1` the plan certifies which blocks
   may run but the legacy block sequence still performs every computation.
-  Crop and thumbnail pipelines are still hand-ordered. Export is graph-driven
-  only when `RT_STAGE_GRAPH=1`; the legacy path is the default and neither
-  graph path caches or reuses buffers yet.
+  Crop and thumbnail are graph-driven only when `RT_STAGE_GRAPH=1`; the legacy
+  path is the default and no graph path caches or reuses buffers yet. The crop
+  graph executes thirteen canonical nodes and folds `raw.preprocess`,
+  `raw.demosaic` into `source.select`, because the region load is one opaque
+  `ImageSource::getImage()` call.
 - The preview dump writes at most one file per crop tag, so two detail
   windows overwrite each other's `crop-detail.*` pair.
 - The persistent preview cache is opt-in and covers only the preview base

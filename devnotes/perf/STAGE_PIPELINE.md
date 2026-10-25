@@ -7,10 +7,11 @@ specified and tested here, before any production pipeline is rewired.
 
 The specification is data only. `rtengine/stage/stage_pipeline.cc` builds it and
 `rtengine/stage/tests/stage_pipeline_test.cc` proves its shape. The thumbnail
-path now executes this graph through `StageGraph::plan()` behind
+and crop paths now execute this graph through `StageGraph::plan()` behind
 `RT_STAGE_GRAPH=1`; the legacy sequence remains the default and is
-byte-identical (see `STAGE_RUNTIME.md`). The other three paths are still
-specification only.
+byte-identical (see `STAGE_RUNTIME.md`). Export and preview execute their own
+graph-driven forms; the preview path is a decision layer over the legacy block
+sequence.
 
 ## Scope
 
@@ -32,7 +33,7 @@ implementation:
 |-----------|---------------------------|--------------|
 | Export    | `rtengine/simpleprocess.cc` | `processImage()` and the batch worker |
 | Preview   | `rtengine/improccoordinator.cc` | `processImage()` / `worker()` |
-| Crop      | `rtengine/dcrop.cc`       | `Crop::cropImage()` |
+| Crop      | `rtengine/dcrop.cc`       | `Crop::update()` |
 | Thumbnail | `rtengine/rtthumbnail.cc` | `loadQuickFromRaw()`, `quickProcessImage()`, `processImage()` |
 | Invalidation | `rtengine/refreshmap.h`, `refreshmap.cc` | `M_*` block mask |
 
@@ -175,6 +176,48 @@ Code evidence:
   preservation `:1812`
 - CIE CAM `:1855`, gamut `:1921`
 - `lab2monitorRgb()` `:1942`
+
+### Crop runtime mapping
+
+The whole crop pipeline runs inside `Crop::update()`. The blocks are the private
+`Crop::stage*` methods in `rtengine/dcrop.cc`; each is the only implementation
+of that step, shared by the legacy sequence and the graph-driven sequence.
+
+| Node | Method | Runs when (legacy guard) |
+|------|--------|--------------------------|
+| `source.select` | `stageSourceSelect()` | `todo & (M_INIT \| M_LINDENOISE \| M_HDR)` |
+| `analysis` | `stageAnalysis()` | same as `source.select` |
+| `raw.base` | `stageRawBase()` | always |
+| `transform` | `stageTransform()` | always |
+| `local.adjustments` | `stageLocalAdjustments()` | `todo & (M_AUTOEXP \| M_RGBCURVE)` and a local spot |
+| `rgb.proc` | `stageRgbProc()` | `todo & M_RGBCURVE` |
+| `lab.tools` | `stageLabTools()` | `todo & (M_LUMINANCE + M_COLOR)` |
+| `lab.sharpening` | `stageLabSharpening()` | same as `lab.tools` (the method keeps the `skip == 1` guard) |
+| `lab.wavelet` | `stageLabWavelet()` | same as `lab.tools` |
+| `working.trc` | `stageWorkingTrc()` | same as `lab.tools` |
+| `ciecam` | `stageCieCam()` | same as `lab.tools` |
+| `gamut` | `stageGamut()` | same as `lab.tools` |
+| `viewport.output` | `stageViewportOutput()` | always |
+
+`raw.base` always runs because `createBuffer()`, the spot buffer and the
+Fattal/Dehaze block run outside the `M_INIT` guard. `source.select` owns the
+region load; `raw.preprocess` and `raw.demosaic` are folded into it because the
+crop obtains its region through one opaque `ImageSource::getImage()` call, so
+the two steps have no separately dispatchable call. The PRE/PREV denoise branch
+reloads the same region from inside `stageAnalysis()`, exactly as the legacy
+sequence did.
+
+Execution order is the legacy order, which places `analysis` before the rest of
+`raw.base`: the auto-noise analysis measures the freshly loaded region, and the
+base finish consumes its result. The specification already records this
+interleaving as folded. The graph decides *whether* a block runs, never the
+order in which the blocks run; a plan that would skip a block the legacy
+sequence executes is rejected and the legacy sequence runs.
+
+`stageTransform()` also runs the pre-RGB directional-pyramid equaliser, and
+`stageWorkingTrc()` starts with `softLight()`. Both calls sit between blocks in
+the legacy order and are folded into the node that is executed at that position,
+rather than moving them and changing the result.
 
 ### Thumbnail: 12 nodes, 11 edges, two roots
 
@@ -436,6 +479,16 @@ silently dropped.
   `improccoordinator.cc:2292-2293`, `dcrop.cc:798-799`) run after
   `firstAnalysis()` in the current order but are folded into `raw.base`.
   The spec records the parameter dependency, not the interleaving.
+- On the crop path `raw.preprocess` and `raw.demosaic` are folded into
+  `source.select`: the region is obtained with one `ImageSource::getImage()`
+  call, which performs both steps, and the PRE/PREV denoise branch reloads the
+  same region from inside `stageAnalysis()`. There is no separable call to
+  dispatch.
+- On the crop path the pre-RGB directional-pyramid equaliser runs inside
+  `stageTransform()`, and `softLight()` runs at the start of
+  `stageWorkingTrc()`. Both are position-sensitive in the legacy order, so the
+  block executed at that position owns the call instead of the node the
+  catalogue names.
 - `imgsrc->convertColorSpace()` (`dcrop.cc:693`) is the working-space
   conversion performed for the crop and is folded into `raw.base`.
 - `ipf.moyeqt()` saturation statistics and `ipf.calc_ref()` local-adjustment
@@ -527,3 +580,23 @@ The harness runs `loadQuickFromRaw()` + `quickProcessImage()` and
 plan falls back. Result on the CPU build: `PASS` for both branches, with all
 four plans active; hashes and the image profile are recorded in
 `STAGE_RUNTIME.md`.
+
+The crop runtime mapping is exercised by a focused harness:
+
+```bash
+cmake --build <build-dir> --target crop-stage-test -j 6
+<build-dir>/rtengine/crop-stage-test <raw> [pp3] [out-dir] [--stages] \
+    [--cbdl=aft] [--no-ciecam]
+tools/perf/run-suite.sh --build-dir <build-dir> --image <raw> --crop-graph
+```
+
+The harness loads the image twice, runs the full-frame preview once per copy,
+then the detailed crop for fit, 100% and zoomed/panned viewports with
+`RT_STAGE_GRAPH=0` and `RT_STAGE_GRAPH=1`. It compares the display image and
+the output-space image byte for byte and requires the two diagnostics counters
+to show one executed plan per state and no fallback. `--stages` enables the
+Lab, CIE CAM, gamut, working-TRC and local-adjustment blocks, `--cbdl=aft`
+selects the after-RGB directional pyramid and `--no-ciecam` leaves CIE CAM off
+so the before-RGB position and sharpening are reached. Result on the CPU and
+OpenCL builds: `AE=0` for every state and profile; the node counts, windows
+and fingerprints are recorded in `STAGE_RUNTIME.md`.

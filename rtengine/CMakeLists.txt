@@ -223,6 +223,22 @@ target_include_directories(thumbnail-stage-test BEFORE PRIVATE
 target_link_libraries(thumbnail-stage-test PRIVATE rtengine)
 rt_setup_target(thumbnail-stage-test)
 
+# Focused legacy-vs-graph parity harness for the crop stage graph.
+add_executable(crop-stage-test EXCLUDE_FROM_ALL
+    "${PROJECT_SOURCE_DIR}/tools/perf/crop-stage-test.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/editcallbacks.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/multilangmgr.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/options.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/paramsedited.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/pathutils.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/threadutils.cc"
+)
+target_include_directories(crop-stage-test BEFORE PRIVATE
+    "${CMAKE_BINARY_DIR}/rtgui"
+)
+target_link_libraries(crop-stage-test PRIVATE rtengine)
+rt_setup_target(crop-stage-test)
+
 # Runtime stage ABI and built-in/module parity tests.
 add_executable(stage-abi-test EXCLUDE_FROM_ALL
     "${CMAKE_CURRENT_SOURCE_DIR}/stage/tests/stage_abi_test.cc"
