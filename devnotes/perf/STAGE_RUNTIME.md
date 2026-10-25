@@ -196,25 +196,105 @@ sections, raw-byte framing, repeated `finish()` and 100k repeated calls.
 
 ## Graph-driven export
 
-`ImageProcessor::normal_pipeline()` now has an opt-in graph-driven form. With
-`RT_STAGE_GRAPH=1` the four export stages become `StageGraph` nodes
-(`export.init`, `export.denoise`, `export.transform`, `export.finish`), each
-declared with an explicit `RT_STAGE_RECOMPUTE` reuse mode and connected in
-execution order. The graph is built per job, so every node is dirty and
-`plan()` returns `Recompute` for all four. Execution follows
-`topologicalOrder()`; a reuse decision fails closed with `nullptr` because
-this path has no stage buffer cache yet. The node id selects the same
-`stage_*` member the legacy path calls, so the arithmetic is untouched.
+`ImageProcessor::normal_pipeline()` has an opt-in graph-driven form. With
+`RT_STAGE_GRAPH=1` the canonical export inventory becomes a `StageGraph`:
+`stage::buildPipelineSpec(StagePath::Export)` supplies all 20 node ids, the 19
+edges and each node's reuse mode, so the graph is not restated in the
+processing code. The graph is built per job, so every node is dirty and
+`plan()` must let every node run.
 
-Unset, empty, `0` and `off` (case-insensitive) keep the legacy hand-ordered
-pipeline, which remains the default. `RT_STAGE_PROFILE=1` prints the same
-`export.*` keys from the graph nodes, timed with `stage::ScopedProfile`.
+Execution is guarded before any node runs:
 
-Evidence: the 45.7 MP sidecar export with `devnotes/opencl/pp3/resize.pp3`
-at 8 threads is pixel-identical (`AE=0`, 0 differing of 34 229 520 samples)
-between `RT_STAGE_GRAPH=0` and `RT_STAGE_GRAPH=1`, and also against unset and
-`off`. `tools/perf/run-suite.sh --graph` runs that comparison as an optional
-gate.
+1. the spec node count must be 20 and every node id must have an executor;
+2. the graph must be acyclic and the topological order must cover every node;
+3. every decision must be `Recompute` or `ReuseInput` (a reuse-input node
+   writes in place). A `ReuseOutput` would skip a block the legacy path runs;
+   this path has no stage buffer cache, so that plan is rejected, one line is
+   logged (`stage-graph: fallback to legacy: plan would skip the node
+   (<id>)`), and the legacy sequence runs instead.
+
+Execution follows `topologicalOrder()`, and each node id selects the same
+private method the legacy path calls, so the arithmetic is untouched. An
+accepted plan logs `stage-graph: active, 20 nodes executed from the canonical
+export inventory` once per process. Unset, empty, `0` and `off`
+(case-insensitive) keep the legacy hand-ordered pipeline, which remains the
+default. Fast export (`-f`) still uses its own order: it calls the same node
+methods, but runs denoise after the early resize, so it is not routed through
+the graph in this phase.
+
+`RT_STAGE_PROFILE=1` records one key per node, named by node id
+(`source.select` ... `output.icc`), from inside the node method, so both paths
+emit comparable figures. The legacy path keeps its coarse `export.init`,
+`export.denoise`, `export.transform` and `export.finish` scopes around the same
+methods, and the pre-existing `finish.rgbproc`, `finish.sharpening`,
+`finish.wavelet`, `finish.resize` and `finish.output` scopes remain inside
+their nodes.
+
+All 20 nodes execute real work. Blocks that stay folded inside a neighbour,
+because one topological order has to reproduce the implementation's pixel
+order, are listed in `devnotes/perf/STAGE_PIPELINE.md`: the framing geometry
+is computed in `crop`, the Nearest output resize is in `output.convert`,
+`raw.base` is three calls, the histogram allocation is in `analysis`, and the
+forced B&W pass is in `output.convert`.
+
+### Export graph evidence
+
+Image: the 45.7 MP NEF (`RT_TEST_IMAGE_45MP`), `-t -b16 -Y`, `--gpu=off`.
+Variants: neutral (no profile), sidecar (`-s`), cropped (3001x2001), output
+profile (`RTv4_sRGB`), and cropped plus output profile. Host: 4C/8T, load
+average 3-8 during the runs.
+
+`RT_STAGE_GRAPH=0` versus `RT_STAGE_GRAPH=1`, all ten pairs `AE=0`:
+
+| Variant | 1 thread | 8 threads |
+|---------|----------|-----------|
+| neutral | `AE=0`, 136 918 080 samples | `AE=0`, 136 918 080 |
+| sidecar | `AE=0`, 6 220 800 | `AE=0`, 6 220 800 |
+| cropped | `AE=0`, 18 015 003 | `AE=0`, 18 015 003 |
+| output profile | `AE=0`, 136 918 080 | `AE=0`, 136 918 080 |
+| cropped + output profile | `AE=0`, 18 015 003 | `AE=0`, 18 015 003 |
+
+Legacy byte-identity: the pre-change binary (same commit, built before the
+decomposition) and the decomposed legacy path (`RT_STAGE_GRAPH=0`) produced
+identical files for neutral, sidecar, cropped and output-profile at 1 and 8
+threads, after normalising the TIFF DateTime tag that records the render time.
+Every pair was also `AE=0`.
+
+Per-node profile, `resize.pp3`, 8 threads, one run (ms):
+
+```text
+source.select 0.009   raw.preprocess 359.381   raw.demosaic 1095.558
+raw.base 902.565      analysis 79.675         transform 0.026
+local.adjustments 0.044   rgb.proc 545.215    lab.tools 0.487
+lab.sharpening 0.003  lab.wavelet 0.002       working.trc 0.005
+ciecam 0.010          gamut 0.000             crop 0.003
+resize 1053.657       output.sharpen 0.000    output.convert 1241.654
+framing 0.000         output.icc 0.040
+```
+
+Legacy performance: 11 interleaved pairs of the pre-change and decomposed
+binaries, both on the legacy path, `resize.pp3`, 8 threads, wall time in ms.
+The medians are 4856 (pre-change) and 4781 (decomposed), a 1.5% difference in
+favour of the decomposed build, inside the 20% spread caused by host load.
+The legacy path runs the same statements; the only added work is one
+`ScopedProfile` pair per node and the method call frames.
+
+Run-to-run note: with an unrelated eight-job build saturating the host, one
+sidecar pair differed by 4 samples at 1 LSB out of 6 220 800. Under that load
+the pre-change binary also differed from itself by 4-8 samples at 1 LSB, so
+this is the documented upstream floating-point/thread-order noise, not the
+decomposition. On the idle host, five repeated pairs of each kind were exact.
+
+`stage-pipeline-test` and `stage-graph-test` pass with the corrected export
+order. `tools/perf/run-suite.sh --graph` runs the neutral comparison as an
+optional gate.
+
+The OpenCL configuration compiles with `--stage-modules` and gives the same
+result: all ten legacy/graph pairs are `AE=0`, the graph logs 20 executed
+nodes, `stage-device-test` reports `opencl-stage-device: available (execution
+not wired)`, and `stage-pipeline-test`, `stage-graph-test` and
+`stage-device-test` pass. The parity runs use `--gpu=off`; the graph path does
+not use the GPU backend in this phase.
 
 `buildTilePlan()` produces a cheap block score from a luminance plane and
 splits blocks into full and cheap work. It is the hook for selective
@@ -380,18 +460,39 @@ change to the transient generation counter does not.
 
 ## Export profiling
 
-`RT_STAGE_PROFILE=1` now prints the main export phases:
+`RT_STAGE_PROFILE=1` prints one line per export node plus the legacy coarse
+scopes and the finer scopes that were already there:
 
 ```text
-stage export.init: ...
-stage export.denoise: ...
-stage export.transform: ...
-stage finish.rgbproc: ...
-stage finish.sharpening: ...
-stage finish.wavelet: ...
-stage finish.resize: ...
-stage finish.output: ...
-stage export.finish: ...
+stage source.select: ...
+stage raw.preprocess: ...
+stage raw.demosaic: ...
+stage raw.base: ...
+stage analysis: ...
+stage transform: ...
+stage local.adjustments: ...
+stage rgb.proc: ...
+stage finish.rgbproc: ...          (inside rgb.proc)
+stage lab.tools: ...
+stage lab.sharpening: ...
+stage finish.sharpening: ...       (inside lab.sharpening)
+stage lab.wavelet: ...
+stage finish.wavelet: ...          (inside lab.wavelet)
+stage working.trc: ...
+stage ciecam: ...
+stage gamut: ...
+stage crop: ...
+stage resize: ...
+stage finish.resize: ...           (inside resize)
+stage output.sharpen: ...
+stage output.convert: ...
+stage finish.output: ...           (inside output.convert)
+stage framing: ...
+stage output.icc: ...
+stage export.init: ...             (legacy only, around the first nodes)
+stage export.denoise: ...          (legacy only)
+stage export.transform: ...        (legacy only)
+stage export.finish: ...           (legacy only, around the finish nodes)
 ```
 
 The numbers are wall time on the host and are not a substitute for a full
@@ -474,6 +575,14 @@ parity.
 
 ## Merged phase results
 
+- Export graph (`RT_STAGE_GRAPH=1`): the graph executes the 20 canonical
+  nodes in topological order and logs `stage-graph: active, 20 nodes executed
+  from the canonical export inventory`. Ten legacy/graph pairs (neutral,
+  sidecar, cropped, output-profile, cropped plus output-profile; 1 and 8
+  threads) are `AE=0`, and the legacy path is byte-identical to the pre-change
+  binary. A plan that would skip a node is rejected before execution and
+  falls back to the legacy sequence with a logged reason.
+
 - Preview graph (`RT_PREVIEW_GRAPH=1`): five independent legacy/graph
   dump pairs were byte-identical for `preview.tif`, `work.tif` and the main
   crop. The decision costs 0.008–0.010 ms per pass. The layer is advisory in
@@ -501,8 +610,14 @@ parity.
   execution path: with `RT_PREVIEW_GRAPH=1` the plan certifies which blocks
   may run but the legacy block sequence still performs every computation.
   Crop and thumbnail pipelines are still hand-ordered. Export is graph-driven
-  only when `RT_STAGE_GRAPH=1`; the legacy path is the default and neither
-  graph path caches or reuses buffers yet.
+  only when `RT_STAGE_GRAPH=1`; the legacy path is the default. The export
+  graph executes all 20 nodes but neither graph path caches or reuses buffers
+  yet, so a fresh job recomputes every node.
+- Five export blocks are folded inside a neighbouring node rather than
+  having an execution boundary of their own: the framing geometry (in
+  `crop`), the Nearest output resize (in `output.convert`), the three
+  `raw.base` sub-blocks, the histogram allocation (in `analysis`) and the
+  forced B&W pass (in `output.convert`). See `devnotes/perf/STAGE_PIPELINE.md`.
 - The preview dump writes at most one file per crop tag, so two detail
   windows overwrite each other's `crop-detail.*` pair.
 - The persistent preview cache is opt-in and covers only the preview base

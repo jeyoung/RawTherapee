@@ -41,12 +41,17 @@
 #include "rawimagesource.h"
 #include "rtengine.h"
 #include "stage/stage_graph.h"
+#include "stage/stage_pipeline.h"
 #include "stage/stage_profile.h"
 #include "utils.h"
 
 #include <cassert>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
+#include <mutex>
+#include <set>
+#include <string>
 #include <type_traits>
 #include <vector>
 
@@ -131,6 +136,79 @@ bool stageGraphEnabled()
     return enabled;
 }
 
+/*
+ * Number of blocks in the canonical export inventory (devnotes/perf/
+ * STAGE_PIPELINE.md). The executor below covers exactly this many nodes; a
+ * mismatch falls back to the legacy sequence.
+ */
+constexpr size_t EXPORT_NODE_COUNT = 20;
+
+/*
+ * Export node ids the graph executor implements. buildPipelineSpec() names the
+ * nodes; this list is the executor's side of the contract. The graph path
+ * validates every planned node against it before executing anything, so an
+ * inventory change that this file does not implement falls back to the legacy
+ * sequence instead of silently skipping a block.
+ */
+const char* const EXPORT_NODE_IDS[] = {
+    "source.select", "raw.preprocess", "raw.demosaic", "raw.base",
+    "analysis", "transform", "local.adjustments", "rgb.proc", "lab.tools",
+    "lab.sharpening", "lab.wavelet", "working.trc", "ciecam", "gamut",
+    "crop", "resize", "output.sharpen", "output.convert", "framing",
+    "output.icc"
+};
+
+static_assert(sizeof(EXPORT_NODE_IDS) / sizeof(EXPORT_NODE_IDS[0]) ==
+                  EXPORT_NODE_COUNT,
+              "the export executor must cover the canonical node inventory");
+
+bool isExportNode(const std::string& id)
+{
+    for (const char* known : EXPORT_NODE_IDS) {
+        if (id == known) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * Report that the graph cannot run the whole export and that the legacy
+ * sequence is used instead. Each reason is reported once per process, so a
+ * batch does not repeat the same line for every image.
+ */
+void logStageGraphFallback(const char* node, const char* reason)
+{
+    static std::mutex mutex;
+    static std::set<std::string> logged;
+
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!logged.insert(std::string(reason) + ": " + node).second) {
+        return;
+    }
+
+    std::fprintf(stderr, "stage-graph: fallback to legacy: %s (%s)\n",
+                 reason, node);
+}
+
+/* Report the accepted plan once per process, for operations and evidence. */
+void logStageGraphActive(size_t nodes)
+{
+    static std::mutex mutex;
+    static bool logged = false;
+
+    std::lock_guard<std::mutex> lock(mutex);
+    if (logged) {
+        return;
+    }
+    logged = true;
+
+    std::fprintf(stderr,
+                 "stage-graph: active, %zu nodes executed from the canonical "
+                 "export inventory\n",
+                 nodes);
+}
+
 class ImageProcessor
 {
 public:
@@ -174,6 +252,13 @@ public:
         hlcomprthresh(0),
         baseImg(nullptr),
         labView(nullptr),
+        cx(0),
+        cy(0),
+        cw(0),
+        ch(0),
+        labResize(false),
+        framingData(),
+        readyImg(nullptr),
         ctColorCurve(),
         autili(false),
         butili(false)
@@ -198,96 +283,179 @@ private:
             return graph_pipeline();
         }
 
-        const auto timed = [](const char* name, auto&& fn) {
-            const auto begin = std::chrono::steady_clock::now();
-            if constexpr (std::is_void_v<decltype(fn())>) {
-                fn();
-                const auto end = std::chrono::steady_clock::now();
-                stage::profile_duration(
-                    name, static_cast<uint64_t>(
-                              std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                  end - begin)
-                                  .count()));
-            } else {
-                auto result = fn();
-                const auto end = std::chrono::steady_clock::now();
-                stage::profile_duration(
-                    name, static_cast<uint64_t>(
-                              std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                  end - begin)
-                                  .count()));
-                return result;
-            }
-        };
-
-        if (!timed("export.init", [this] { return stage_init(); })) {
-            return nullptr;
-        }
-
-        timed("export.denoise", [this] { stage_denoise(); });
-        timed("export.transform", [this] { stage_transform(); });
-        return timed("export.finish", [this] { return stage_finish(); });
+        return legacy_export();
     }
 
     /*
-     * Graph-driven form of the export pipeline. The four export stages are
-     * nodes with explicit reuse modes, connected in execution order, and the
-     * plan decides what runs. The graph is built per job, so every node
-     * starts dirty and the plan recomputes every stage, which matches the
-     * legacy pipeline exactly. Node names double as the RT_STAGE_PROFILE keys
-     * so the two paths stay comparable.
+     * Legacy export order. The stage runtime is off, so the blocks run in the
+     * order the hand-written pipeline always used. Every block is one of the
+     * node methods the graph executor also calls, so there is a single
+     * implementation of the export pipeline.
+     */
+    Imagefloat *legacy_export()
+    {
+        {
+            stage::ScopedProfile profile("export.init");
+
+            if (!stage_source_select()) {
+                return nullptr;
+            }
+
+            stage_raw_preprocess();
+            stage_raw_demosaic();
+            stage_raw_base_source();
+        }
+
+        {
+            stage::ScopedProfile profile("export.denoise");
+            stage_denoise();
+        }
+
+        {
+            stage::ScopedProfile profile("export.transform");
+            stage_raw_color();
+            stage_analysis();
+            stage_transform();
+        }
+
+        return stage_finish();
+    }
+
+    /*
+     * Graph-driven form of the export pipeline. The graph is built from the
+     * canonical export inventory every job, so its 20 nodes, 19 edges and
+     * reuse modes come from buildPipelineSpec() rather than from this file.
+     * A fresh graph is fully dirty, so the plan must let every node recompute;
+     * a plan that would skip a block the legacy path runs is rejected before
+     * anything executes, and the legacy sequence runs instead. Node ids double
+     * as the RT_STAGE_PROFILE keys so both paths stay comparable.
      */
     Imagefloat *graph_pipeline()
     {
+        const stage::StagePipelineSpec spec =
+            stage::buildPipelineSpec(stage::StagePath::Export);
+
+        if (spec.nodes.size() != EXPORT_NODE_COUNT) {
+            logStageGraphFallback("inventory", "unexpected node count");
+            return legacy_export();
+        }
+
         stage::StageGraph graph;
+        std::vector<size_t> node;
+        node.reserve(spec.nodes.size());
 
-        const size_t init = graph.addNode("export.init", RT_STAGE_RECOMPUTE);
-        const size_t denoise = graph.addNode("export.denoise", RT_STAGE_RECOMPUTE);
-        const size_t transform = graph.addNode("export.transform", RT_STAGE_RECOMPUTE);
-        const size_t finish = graph.addNode("export.finish", RT_STAGE_RECOMPUTE);
+        for (const auto& descriptor : spec.nodes) {
+            node.push_back(graph.addNode(descriptor.id, descriptor.reuse));
+        }
 
-        graph.connect(init, denoise);
-        graph.connect(denoise, transform);
-        graph.connect(transform, finish);
+        for (const auto& edge : spec.edges) {
+            size_t from = spec.nodes.size();
+            size_t to = spec.nodes.size();
+
+            for (size_t i = 0; i < spec.nodes.size(); ++i) {
+                if (spec.nodes[i].id == edge.first) {
+                    from = i;
+                }
+
+                if (spec.nodes[i].id == edge.second) {
+                    to = i;
+                }
+            }
+
+            assert(from < spec.nodes.size() && to < spec.nodes.size());
+            graph.connect(node[from], node[to]);
+        }
 
         std::vector<size_t> order;
-        const bool acyclic = graph.topologicalOrder(order);
-        assert(acyclic);
-        if (!acyclic) {
-            return nullptr;
+
+        if (!graph.topologicalOrder(order) || order.size() != spec.nodes.size()) {
+            logStageGraphFallback("inventory", "graph is not acyclic");
+            return legacy_export();
         }
 
         const std::vector<stage::StageDecision> plan = graph.plan();
 
         for (size_t index : order) {
-            if (plan[index].action != stage::StageAction::Recompute) {
-                // A fresh graph is fully dirty, so every node must recompute.
-                // Reuse would need a buffer cache this path does not have yet;
-                // fail closed instead of silently skipping a stage.
-                assert(plan[index].action == stage::StageAction::Recompute);
-                return nullptr;
+            const std::string& id = graph.node(index).name;
+
+            if (!isExportNode(id)) {
+                logStageGraphFallback(id.c_str(), "node has no executor");
+                return legacy_export();
             }
 
-            const char* name = graph.node(index).name.c_str();
-
-            if (index == init) {
-                stage::ScopedProfile profile(name);
-                if (!stage_init()) {
-                    return nullptr;
-                }
-            } else if (index == denoise) {
-                stage::ScopedProfile profile(name);
-                stage_denoise();
-            } else if (index == transform) {
-                stage::ScopedProfile profile(name);
-                stage_transform();
-            } else if (index == finish) {
-                stage::ScopedProfile profile(name);
-                return stage_finish();
+            // ReuseInput still means the node runs (it writes in place); only
+            // ReuseOutput skips a block. This path has no stage buffer cache,
+            // so a skip would silently drop work the legacy path does.
+            if (plan[index].action == stage::StageAction::ReuseOutput) {
+                logStageGraphFallback(id.c_str(), "plan would skip the node");
+                return legacy_export();
             }
         }
 
-        return nullptr;
+        for (size_t index : order) {
+            if (!executeExportNode(graph.node(index).name)) {
+                return nullptr;
+            }
+        }
+
+        logStageGraphActive(order.size());
+
+        return readyImg;
+    }
+
+    /*
+     * Run one canonical export node. The ids come from buildPipelineSpec(); an
+     * unknown id has already been rejected by graph_pipeline(), so this only
+     * maps a planned node to the method that implements it.
+     */
+    bool executeExportNode(const std::string& id)
+    {
+        if (id == "source.select") {
+            return stage_source_select();
+        } else if (id == "raw.preprocess") {
+            stage_raw_preprocess();
+        } else if (id == "raw.demosaic") {
+            stage_raw_demosaic();
+        } else if (id == "raw.base") {
+            stage_raw_base();
+        } else if (id == "analysis") {
+            stage_analysis();
+        } else if (id == "transform") {
+            stage_transform();
+        } else if (id == "local.adjustments") {
+            stage_local_adjustments();
+        } else if (id == "rgb.proc") {
+            stage_rgb_proc();
+        } else if (id == "lab.tools") {
+            stage_lab_tools();
+        } else if (id == "lab.sharpening") {
+            stage_lab_sharpening();
+        } else if (id == "lab.wavelet") {
+            stage_lab_wavelet();
+        } else if (id == "working.trc") {
+            stage_working_trc();
+        } else if (id == "ciecam") {
+            stage_ciecam();
+        } else if (id == "gamut") {
+            stage_gamut();
+        } else if (id == "crop") {
+            stage_crop();
+        } else if (id == "resize") {
+            stage_resize();
+        } else if (id == "output.sharpen") {
+            stage_output_sharpen();
+        } else if (id == "output.convert") {
+            stage_output_convert();
+        } else if (id == "framing") {
+            stage_framing();
+        } else if (id == "output.icc") {
+            return stage_output_icc() != nullptr;
+        } else {
+            assert(false);
+            return false;
+        }
+
+        return true;
     }
 
     Imagefloat *fast_pipeline()
@@ -300,18 +468,34 @@ private:
 
         pl = nullptr;
 
-        if (!stage_init()) {
+        // The fast path keeps its own order: the early resize runs after the
+        // transform and before denoise, so it calls the same node methods in a
+        // different sequence rather than through the export graph.
+        if (!stage_source_select()) {
             return nullptr;
         }
 
+        stage_raw_preprocess();
+        stage_raw_demosaic();
+        stage_raw_base_source();
+        stage_raw_color();
+        stage_analysis();
         stage_transform();
         stage_early_resize();
         stage_denoise();
         return stage_finish();
     }
 
-    bool stage_init()
+    /*
+     * source.select: load or take the initial image, resolve the raw source,
+     * create the processing functions and clamp the crop rectangle to the
+     * frame. Extracted from stage_init() so the legacy path and the graph node
+     * share one implementation.
+     */
+    bool stage_source_select()
     {
+        stage::ScopedProfile node_profile("source.select");
+
         errorCode = 0;
 
         if (pl) {
@@ -387,6 +571,19 @@ private:
         opencl::setStageAllowed(App::get().options().rtSettings.useOpenCL);
 
         imgsrc->setCurrentFrame(params.raw.bayersensor.imageNum);
+        return true;
+    }
+
+    /*
+     * raw.preprocess: black/white level, hot and dead pixels, chromatic
+     * aberration and flat field. Extracted from stage_init() unchanged.
+     */
+    void stage_raw_preprocess()
+    {
+        stage::ScopedProfile node_profile("raw.preprocess");
+
+        procparams::ProcParams& params = job->pparams;
+
         float reddeha = 0.f;
         float greendeha = 0.f;
         float bluedeha = 0.f;
@@ -395,6 +592,17 @@ private:
         if (pl) {
             pl->setProgress(0.20);
         }
+    }
+
+    /*
+     * raw.demosaic: demosaic and capture sharpening. Extracted from
+     * stage_init() unchanged.
+     */
+    void stage_raw_demosaic()
+    {
+        stage::ScopedProfile node_profile("raw.demosaic");
+
+        procparams::ProcParams& params = job->pparams;
 
         bool autoContrast = imgsrc->getSensorType() == ST_BAYER ? params.raw.bayersensor.dualDemosaicAutoContrast : params.raw.xtranssensor.dualDemosaicAutoContrast;
         double contrastThreshold = imgsrc->getSensorType() == ST_BAYER ? params.raw.bayersensor.dualDemosaicContrast : params.raw.xtranssensor.dualDemosaicContrast;
@@ -409,6 +617,18 @@ private:
         if (pl) {
             pl->setProgress(0.30);
         }
+    }
+
+    /*
+     * raw.base, first part: white balance, denoise preparation, the base
+     * image and the tone-curve analysis. Extracted from stage_init() unchanged.
+     * raw.base also runs stage_denoise() and stage_raw_color(); this split
+     * exists so the fast export can run denoise after its early resize.
+     */
+    void stage_raw_base_source()
+    {
+        procparams::ProcParams& params = job->pparams;
+        ImProcFunctions &ipf = * (ipf_p.get());
 
         pp = PreviewProps(0, 0, fw, fh, 1);
 
@@ -1049,8 +1269,20 @@ private:
         if (flush) {
             imgsrc->flush();
         }
+    }
 
-        return true;
+    /*
+     * raw.base: the base image, denoise and source colour conversion. This is
+     * one canonical block; the three calls are its real sub-blocks and run in
+     * the order the hand-written pipeline always used.
+     */
+    void stage_raw_base()
+    {
+        stage::ScopedProfile node_profile("raw.base");
+
+        stage_raw_base_source();
+        stage_denoise();
+        stage_raw_color();
     }
 
     void stage_denoise()
@@ -1108,10 +1340,16 @@ private:
         delete [] pcsk;
     }
 
-    void stage_transform()
+    /*
+     * raw.base, source colour: convert to the working space, optionally
+     * through film-negative processing, then compress the source gamut.
+     * Extracted from stage_transform() unchanged. The histogram allocation
+     * moved to stage_analysis() so this block ends before analysis begins; it
+     * only allocates a LUT, so the pixel order is unchanged.
+     */
+    void stage_raw_color()
     {
         const procparams::ProcParams& params = job->pparams;
-        //ImProcFunctions ipf (&params, true);
         ImProcFunctions &ipf = * (ipf_p.get());
 
         if (params.filmNegative.enabled) {
@@ -1132,9 +1370,6 @@ private:
             imgsrc->convertColorSpace(baseImg, params.icm, currWB);
         }
 
-        // perform first analysis
-        hist16(65536);
-
         if (params.cg.enabled) {//gamut compression
             float mac = 0.f;
             float mac0 = 0.f;
@@ -1145,9 +1380,35 @@ private:
             float powe = 1.f;
             ipf.gamutcompr(baseImg, baseImg, beginend, powe, nbsegam, mac, mac0, mac1, mac2);
         }
+    }
 
+    /*
+     * analysis: allocate the working histogram and run the first analysis.
+     * Extracted from stage_transform() unchanged.
+     */
+    void stage_analysis()
+    {
+        stage::ScopedProfile node_profile("analysis");
+
+        const procparams::ProcParams& params = job->pparams;
+        ImProcFunctions &ipf = * (ipf_p.get());
+
+        hist16(65536);
         ipf.firstAnalysis(baseImg, params, hist16);
+    }
 
+    /*
+     * transform: dehaze and Fattal tone mapping, then the geometry transform.
+     * The two tone operations run after firstAnalysis() in the implementation
+     * and so are the prologue of this node rather than part of raw.base; see
+     * devnotes/perf/STAGE_RUNTIME.md.
+     */
+    void stage_transform()
+    {
+        stage::ScopedProfile node_profile("transform");
+
+        const procparams::ProcParams& params = job->pparams;
+        ImProcFunctions &ipf = * (ipf_p.get());
 
         ipf.dehaze(baseImg, params.dehaze);
         ipf.ToneMapFattal02(baseImg, params.fattal, 3, 0, nullptr, 0, 0, 0, false);
@@ -1172,8 +1433,50 @@ private:
         }
     }
 
+    /*
+     * CIE CAM 02 is active when it is enabled and set to the 02 model. Several
+     * blocks test it, so the predicate has one definition instead of a local
+     * copy recomputed in each node.
+     */
+    bool usesCieCam02() const
+    {
+        const procparams::ProcParams& params = job->pparams;
+        return params.colorappearance.modelmethod == "02" && params.colorappearance.enabled;
+    }
+
+    /*
+     * Export finish sequence. The legacy path and the graph node methods are
+     * the same implementation: stage_finish() is the legacy order, and
+     * graph_pipeline() calls the identical methods through the inventory.
+     */
     Imagefloat *stage_finish()
     {
+        stage_local_adjustments();
+        stage_rgb_proc();
+        stage_lab_tools();
+        stage_lab_sharpening();
+        stage_lab_wavelet();
+        stage_working_trc();
+        stage_ciecam();
+        stage_gamut();
+        stage_crop();
+        stage_resize();
+        stage_output_sharpen();
+        stage_output_convert();
+        stage_framing();
+
+        return stage_output_icc();
+    }
+
+    /*
+     * local.adjustments: the local-lab parameter fixups, the optional
+     * before-CBDL directional pyramid equaliser and Lab_Local() over every
+     * spot. Extracted from stage_finish() unchanged.
+     */
+    void stage_local_adjustments()
+    {
+        stage::ScopedProfile node_profile("local.adjustments");
+
         procparams::ProcParams& params = job->pparams;
         //ImProcFunctions ipf (&params, true);
         ImProcFunctions &ipf = * (ipf_p.get());
@@ -1580,6 +1883,20 @@ private:
         }
 
 
+    }
+
+    /*
+     * rgb.proc: tone and RGB curve setup, colour-toning curves, black and
+     * white conversion, saturation limits and rgbProc(). Extracted from
+     * stage_finish() unchanged; the base image is released afterwards.
+     */
+    void stage_rgb_proc()
+    {
+        stage::ScopedProfile node_profile("rgb.proc");
+
+        procparams::ProcParams& params = job->pparams;
+        ImProcFunctions &ipf = * (ipf_p.get());
+
         curve1(65536);
         curve2(65536);
         curve(65536, 0);
@@ -1683,6 +2000,21 @@ private:
         if (pl) {
             pl->setProgress(0.55);
         }
+    }
+
+    /*
+     * lab.tools: the Lab curve tables, Lab-grid colour toning, shadows and
+     * highlights, local contrast, the chrominance/luminance curve, EPD tone
+     * mapping, vibrance and Lab colour-correction regions. Extracted from
+     * stage_finish() unchanged.
+     */
+    void stage_lab_tools()
+    {
+        stage::ScopedProfile node_profile("lab.tools");
+
+        procparams::ProcParams& params = job->pparams;
+        ImProcFunctions &ipf = * (ipf_p.get());
+        const bool cam02 = usesCieCam02();
 
         //%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
         //%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -1739,8 +2071,6 @@ private:
 
         ipf.chromiLuminanceCurve(nullptr, 1, labView, labView, curve1, curve2, satcurve, lhskcurve, clcurve, lumacurve, utili, autili, butili, ccutili, cclutili, clcutili, dummy, dummy);
 
-        const bool cam02 = params.colorappearance.modelmethod == "02" && params.colorappearance.enabled;
-
     //    if ((params.colorappearance.enabled && !params.colorappearance.tonecie) || (!params.colorappearance.enabled)) {
         if ((params.colorappearance.enabled && !params.colorappearance.tonecie) || (!cam02)) {
             ipf.EPDToneMap(labView, 0, 1);
@@ -1749,6 +2079,20 @@ private:
 
         ipf.vibrance(labView, params.vibrance, params.toneCurve.hrenabled, params.icm.workingProfile);
         ipf.labColorCorrectionRegions(labView);
+    }
+
+    /*
+     * lab.sharpening: impulse denoise, defringe, edge and microcontrast
+     * sharpening and the main sharpening pass. Extracted from stage_finish()
+     * unchanged.
+     */
+    void stage_lab_sharpening()
+    {
+        stage::ScopedProfile node_profile("lab.sharpening");
+
+        procparams::ProcParams& params = job->pparams;
+        ImProcFunctions &ipf = * (ipf_p.get());
+        const bool cam02 = usesCieCam02();
 
         // for all treatments Defringe, Sharpening, Contrast detail ,Microcontrast they are activated if "CIECAM" function are disabled
 
@@ -1775,8 +2119,19 @@ private:
             ipf.sharpening(labView, params.sharpening);
 
         }
+    }
 
+    /*
+     * lab.wavelet: the after-CBDL directional pyramid equaliser and the
+     * wavelet tool. Extracted from stage_finish() unchanged.
+     */
+    void stage_lab_wavelet()
+    {
+        stage::ScopedProfile node_profile("lab.wavelet");
 
+        procparams::ProcParams& params = job->pparams;
+        ImProcFunctions &ipf = * (ipf_p.get());
+        const bool cam02 = usesCieCam02();
 
         // directional pyramid wavelet
         if (params.dirpyrequalizer.cbdlMethod == "aft") {
@@ -1940,6 +2295,19 @@ private:
 
             wavCLVCurve.Reset();
         }
+    }
+
+    /*
+     * working.trc: soft light, the working-TRC conversion with its local
+     * contrast, tone equaliser, saturation, preservation and black-and-white
+     * output. Extracted from stage_finish() unchanged.
+     */
+    void stage_working_trc()
+    {
+        stage::ScopedProfile node_profile("working.trc");
+
+        procparams::ProcParams& params = job->pparams;
+        ImProcFunctions &ipf = * (ipf_p.get());
 
         ipf.softLight(labView, params.softlight);
 
@@ -2068,6 +2436,19 @@ private:
             }
         }
 
+    }
+
+    /*
+     * ciecam: the colour-appearance model and its tone mapping. Extracted
+     * from stage_finish() unchanged.
+     */
+    void stage_ciecam()
+    {
+        stage::ScopedProfile node_profile("ciecam");
+
+        procparams::ProcParams& params = job->pparams;
+        ImProcFunctions &ipf = * (ipf_p.get());
+
         //Colorappearance and tone-mapping associated
 
         int f_w = 1, f_h = 1;
@@ -2125,6 +2506,18 @@ private:
 
         delete cieView;
         cieView = nullptr;
+    }
+
+    /*
+     * gamut: the final working-space gamut compression and gain. Extracted
+     * from stage_finish() unchanged.
+     */
+    void stage_gamut()
+    {
+        stage::ScopedProfile node_profile("gamut");
+
+        procparams::ProcParams& params = job->pparams;
+        ImProcFunctions &ipf = * (ipf_p.get());
 
         bool exec = params.icm.wgamut != ColorManagementParams::Wwgamut::NONE  || params.icm.wgamgain != 0.f;
 
@@ -2200,13 +2593,29 @@ private:
         // end tile processing...???
         //%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
         //%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+    }
+
+    /*
+     * crop: the crop rectangle, the framing geometry the resize depends on,
+     * the decision to crop and resize in Lab, and the Lab-space crop copy.
+     * Extracted from stage_finish() unchanged.
+     */
+    void stage_crop()
+    {
+        stage::ScopedProfile node_profile("crop");
+
+        procparams::ProcParams& params = job->pparams;
+        ImProcFunctions &ipf = * (ipf_p.get());
 
         if (pl) {
             pl->setProgress(0.60);
         }
 
         // crop and convert to rgb16
-        int cx = 0, cy = 0, cw = labView->W, ch = labView->H;
+        cx = 0;
+        cy = 0;
+        cw = labView->W;
+        ch = labView->H;
         if (params.crop.enabled) {
             cx = params.crop.x;
             cy = params.crop.y;
@@ -2234,7 +2643,9 @@ private:
         }
 
         // If framing is not enabled, resize values simply pass through to output
-        ImProcFunctions::FramingData framingData = ipf.framing(framingArgs);
+        // The geometry is consumed by crop, resize, output.convert and
+        // framing, so it lives on the processor rather than in a local.
+        framingData = ipf.framing(framingArgs);
         if (settings->verbose) {
             printf("Framing Parameters (enabled=%s)\n", framingData.enabled ? "yes" : "no");
             printf("  Crop: w=%d h=%d\n", cw, ch);
@@ -2246,13 +2657,12 @@ private:
                    framingData.framedWidth, framingData.framedHeight);
         }
 
-        bool labResize = params.resize.enabled && params.resize.method != "Nearest" &&
+        labResize = params.resize.enabled && params.resize.method != "Nearest" &&
             (framingData.scale != 1.0 || params.prsharpening.enabled || framingData.enabled);
 
-        LabImage *tmplab = nullptr;
         if (params.crop.enabled) {
             if (labResize) { // crop lab data
-                tmplab = new LabImage(cw, ch);
+                LabImage *tmplab = new LabImage(cw, ch);
 
                 const std::size_t rowBytes =
                     static_cast<std::size_t>(cw) * sizeof(float);
@@ -2271,6 +2681,18 @@ private:
                 cy = 0;
             }
         }
+    }
+
+    /*
+     * resize: the Lab resize when the crop survives as a Lab image. When the
+     * output resize uses Nearest, the resize runs on the output RGB buffer
+     * instead and is folded into output.convert; see STAGE_RUNTIME.md.
+     */
+    void stage_resize()
+    {
+        stage::ScopedProfile node_profile("resize");
+
+        ImProcFunctions &ipf = * (ipf_p.get());
 
         if (labResize) { // resize lab data
             stage::ScopedProfile profile("finish.resize");
@@ -2278,28 +2700,54 @@ private:
             int imh = framingData.imgHeight;
             if (labView->W != imw || labView->H != imh) {
                 // resize image
-                tmplab = new LabImage(imw, imh);
-                ipf.Lanczos(labView, tmplab, framingData.scale);
+                LabImage* resized = new LabImage(imw, imh);
+                ipf.Lanczos(labView, resized, framingData.scale);
                 delete labView;
-                labView = tmplab;
+                labView = resized;
             }
 
             cw = labView->W;
             ch = labView->H;
-
-            if (params.prsharpening.enabled) {
-                for (int i = 0; i < ch; i++) {
-                    for (int j = 0; j < cw; j++) {
-                        labView->L[i][j] = labView->L[i][j] < 0.f ? 0.f : labView->L[i][j];
-                    }
-                }
-
-                ipf.sharpening(labView, params.prsharpening);
-            }
         }
+    }
+
+    /*
+     * output.sharpen: the post-resize sharpening pass. Extracted from
+     * stage_finish() unchanged.
+     */
+    void stage_output_sharpen()
+    {
+        stage::ScopedProfile node_profile("output.sharpen");
+
+        procparams::ProcParams& params = job->pparams;
+        ImProcFunctions &ipf = * (ipf_p.get());
+
+        if (labResize && params.prsharpening.enabled) {
+            for (int i = 0; i < ch; i++) {
+                for (int j = 0; j < cw; j++) {
+                    labView->L[i][j] = labView->L[i][j] < 0.f ? 0.f : labView->L[i][j];
+                }
+            }
+
+            ipf.sharpening(labView, params.prsharpening);
+        }
+    }
+
+    /*
+     * output.convert: convert the Lab image to the output RGB space and
+     * profile, force black and white when the only colour work was a B&W
+     * conversion, and run the output-space Nearest resize. Extracted from
+     * stage_finish() unchanged.
+     */
+    void stage_output_convert()
+    {
+        stage::ScopedProfile node_profile("output.convert");
+
+        procparams::ProcParams& params = job->pparams;
+        ImProcFunctions &ipf = * (ipf_p.get());
 
       //  bool bwonly = params.blackwhite.enabled && !params.colorToning.enabled && !autili && !butili && !params.colorappearance.enabled;
-        bool bwonly = params.blackwhite.enabled && !params.colorToning.enabled && !autili && !butili && !cam02;
+        bool bwonly = params.blackwhite.enabled && !params.colorToning.enabled && !autili && !butili && !usesCieCam02();
 
         ///////////// Custom output gamma has been removed, the user now has to create
         ///////////// a new output profile with the ICCProfileCreator
@@ -2310,7 +2758,6 @@ private:
         const auto& saveFormat = App::get().options().saveFormat;
         const bool allowGpuOutput = !(saveFormat.format == "tif"
                                       && saveFormat.tiffFloat);
-        Imagefloat* readyImg = nullptr;
         {
             stage::ScopedProfile profile("finish.output");
             readyImg = ipf.lab2rgbOut(labView, cx, cy, cw, ch,
@@ -2341,6 +2788,10 @@ private:
             pl->setProgress(0.70);
         }
 
+        // The Nearest-method output resize runs on the gamma-applied RGB
+        // buffer, which only exists after lab2rgbOut(). The canonical resize
+        // node runs before the conversion, so this pass is folded into
+        // output.convert and recorded as a fold in STAGE_RUNTIME.md.
         if (framingData.scale != 1.0 && params.resize.method == "Nearest") {
             int imw = framingData.imgWidth;
             int imh = framingData.imgHeight;
@@ -2352,10 +2803,34 @@ private:
                 readyImg = tempImage;
             }
         }
+    }
+
+    /*
+     * framing: draw the frame around the output image. Extracted from
+     * stage_finish() unchanged.
+     */
+    void stage_framing()
+    {
+        stage::ScopedProfile node_profile("framing");
+
+        const procparams::ProcParams& params = job->pparams;
+        ImProcFunctions &ipf = * (ipf_p.get());
 
         if (framingData.enabled) {
             readyImg = ipf.drawFrame(readyImg, params.framing, framingData);
         }
+    }
+
+    /*
+     * output.icc: attach metadata and the output ICC profile, release the
+     * source image and the job, and hand back the finished image. Extracted
+     * from stage_finish() unchanged.
+     */
+    Imagefloat *stage_output_icc()
+    {
+        stage::ScopedProfile node_profile("output.icc");
+
+        const procparams::ProcParams& params = job->pparams;
 
         Exiv2Metadata info(imgsrc->getFileName());
 
@@ -2615,6 +3090,22 @@ private:
     ColorTemp currWB;
     Imagefloat *baseImg;
     LabImage* labView;
+
+    /* Crop rectangle consumed by the output nodes; see stage_crop(). */
+    int cx;
+    int cy;
+    int cw;
+    int ch;
+    /*
+     * True when the Lab image is cropped and resized before the output
+     * conversion. False when resize is disabled or uses Nearest, in which case
+     * the resize runs on the output RGB buffer.
+     */
+    bool labResize;
+    /* Framing geometry shared by crop, resize, output.convert and framing. */
+    ImProcFunctions::FramingData framingData;
+    /* Output image produced by output.convert and completed by output.icc. */
+    Imagefloat* readyImg;
 
     LUTu hist16;
 
