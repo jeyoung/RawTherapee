@@ -211,8 +211,8 @@ EXPATLIB="$(cmake .. -LA -N | grep pkgcfg_lib_EXPAT_expat)"; EXPATLIB="${EXPATLI
 #Out: Developer ID Application: Doctor Who (1234567890)
 CODESIGNID="$(cmake .. -L -N | grep CODESIGNID)"; CODESIGNID="${CODESIGNID#*=}"
 
-#In: NOTARY:STRING="--apple-id drwho@bbc.com --password abcd-efgh-hijk-lmno --team-id ABCDE12345"
-#Out: --apple-id drwho@bbc.com --password abcd-efgh-hijk-lmno --team-id ABCDE12345
+#In: NOTARY:STRING="--apple-id <apple-id> --password <app-password> --team-id <team-id>"
+#Out: --apple-id <apple-id> --password <app-password> --team-id <team-id>
 NOTARY="$(cmake .. -L -N | grep NOTARY)"; NOTARY="${NOTARY#*=}"
 
 # In: FANCY_DMG:BOOL=ON
