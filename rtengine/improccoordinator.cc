@@ -1307,48 +1307,6 @@ void dump_crop(const Image8* crop, const char* tag, int visibleX,
 namespace
 {
 
-/*
- * Authority for the graph's dirty marking.
- *
- * The fingerprint and render-state derivation is the default: the plan no
- * longer reads the event mask. RT_PREVIEW_DIRTY=mask restores the event-mask
- * gates for comparison and troubleshooting, exactly as the previous graph
- * tranche ran them; every other value (or unset) keeps the derivation.
- *
- * The mask itself still drives the viewport fast path, the crop render and the
- * notifications. Only the full-frame graph plan is affected by this switch.
- */
-bool previewDirtyExecution()
-{
-    static const bool fingerprint = []() {
-        const char* value = g_getenv("RT_PREVIEW_DIRTY");
-        return value == nullptr || value[0] == '\0'
-            || g_ascii_strcasecmp(value, "mask") != 0;
-    }();
-    return fingerprint;
-}
-
-/*
- * Shadow comparison of both dirty derivations.
- *
- * Enabled by default in this phase: each full-frame pass computes the
- * event-mask set and the fingerprint/render-state set, and logs a `missing`
- * entry when a block the mask marks dirty would not run. The log is the
- * evidence that the switch of authority is safe. RT_PREVIEW_DIRTY_SHADOW=0
- * (or off) disables it; the comparison costs one pass over the tables and
- * never changes the image.
- */
-bool previewDirtyShadowEnabled()
-{
-    static const bool enabled = []() {
-        const char* value = g_getenv("RT_PREVIEW_DIRTY_SHADOW");
-        return value == nullptr || value[0] == '\0'
-            || (g_ascii_strcasecmp(value, "0") != 0
-                && g_ascii_strcasecmp(value, "off") != 0);
-    }();
-    return enabled;
-}
-
 /* Canonical preview inventory, in the execution order of the engine. */
 const char* const PREVIEW_NODE_IDS[] = {
     "source.select", "raw.preprocess", "raw.demosaic", "raw.base", "analysis",
@@ -1394,9 +1352,8 @@ bool rawWorkRuns(int todo, bool highDetailNeeded,
 /*
  * raw.demosaic owns the demosaic, the capture sharpening and the retinex
  * buffer preparation. The predicate is the union of the three guards inside
- * the node, not a superset of them: a may-run form that is always true once
- * high-light recovery has modified the source would schedule the node on every
- * pass and hide a real scheduling difference from the shadow comparison.
+ * the node. The graph plan decides whether the node is entered; the predicate
+ * decides how much of the node's body the event mask permits.
  *
  * A white-balance change can force a demosaic through the Color/Coloropp
  * highlight-recovery path, and a modified RGB source re-demosaics only when
@@ -1468,11 +1425,6 @@ bool labToolsRun(int todo)
     return (todo & (M_LUMACURVE | M_CROP)) != 0 || labPipelineRuns(todo);
 }
 
-bool monitorOutputRuns(int todo, bool panningRelatedChange)
-{
-    return panningRelatedChange || (todo & M_MONITOR) != 0;
-}
-
 /*
  * Report a plan the executor cannot run, and stop.
  *
@@ -1506,119 +1458,6 @@ void logPreviewGraphActive(size_t nodes)
                  "preview-graph: active, %zu of %zu canonical nodes executed "
                  "from the preview inventory (analysis folded into raw.base)\n",
                  nodes, PREVIEW_NODE_COUNT);
-}
-
-/* One comma-separated id list, without spaces, for a single log line. */
-std::string formatIdSet(const std::set<std::string>& ids)
-{
-    std::string text;
-
-    for (const std::string& id : ids) {
-        if (!text.empty()) {
-            text += ',';
-        }
-        text += id;
-    }
-
-    return text;
-}
-
-std::set<std::string> difference(const std::set<std::string>& left,
-                                 const std::set<std::string>& right)
-{
-    std::set<std::string> result;
-
-    for (const std::string& id : left) {
-        if (right.count(id) == 0) {
-            result.insert(id);
-        }
-    }
-
-    return result;
-}
-
-/* Announce the shadow mode once per process, so a quiet log is provable. */
-void logPreviewDirtyShadowActive()
-{
-    static std::mutex mutex;
-    static bool logged = false;
-
-    std::lock_guard<std::mutex> lock(mutex);
-    if (logged) {
-        return;
-    }
-    logged = true;
-
-    std::fprintf(stderr,
-                 "preview-dirty: shadow active, %s authority\n",
-                 previewDirtyExecution() ? "fingerprint" : "mask");
-}
-
-/*
- * Report one disagreement between the two plans.
- *
- * `missing` is the dangerous direction: the event mask would execute a block
- * that the fingerprint and render-state derivation leaves out, which would
- * show a stale frame. `extra` is the documented over-approximation: the
- * derivation executes a block whose own event-mask gate then declines to work
- * on it, so the pixels are unchanged and only the function call is spent.
- *
- * The detail line names the three sets that explain the difference: the
- * executed nodes of both plans and the direct dirty set of the derivation.
- */
-void logPreviewDirtyDifference(const std::set<std::string>& missing,
-                               const std::set<std::string>& extra,
-                               const std::set<std::string>& maskExecuted,
-                               const std::set<std::string>& fingerprintExecuted,
-                               const std::set<std::string>& direct, int mask)
-{
-    constexpr int LOG_LIMIT = 500;
-
-    static std::mutex mutex;
-    static int logged = 0;
-    static int mismatches = 0;
-    static int over = 0;
-    static bool limitLogged = false;
-
-    std::lock_guard<std::mutex> lock(mutex);
-
-    if (!missing.empty()) {
-        ++mismatches;
-    } else {
-        ++over;
-    }
-
-    if (logged >= LOG_LIMIT) {
-        if (!limitLogged) {
-            limitLogged = true;
-            std::fprintf(stderr,
-                         "preview-dirty: log limit reached, further "
-                         "differences are not printed\n");
-        }
-        return;
-    }
-
-    ++logged;
-
-    if (!missing.empty()) {
-        std::fprintf(stderr,
-                     "preview-dirty: mismatch #%d missing=[%s] extra=[%s] "
-                     "mask=0x%x\n",
-                     mismatches, formatIdSet(missing).c_str(),
-                     formatIdSet(extra).c_str(), mask);
-    } else {
-        std::fprintf(stderr,
-                     "preview-dirty: over-approximation #%d extra=[%s] "
-                     "mask=0x%x\n",
-                     over, formatIdSet(extra).c_str(), mask);
-    }
-
-    std::fprintf(stderr,
-                 "preview-dirty: detail mask=[%s] fingerprint=[%s] "
-                 "direct=[%s]\n",
-                 formatIdSet(maskExecuted).c_str(),
-                 formatIdSet(fingerprintExecuted).c_str(),
-                 formatIdSet(direct).c_str());
 }
 
 } // namespace
@@ -4318,12 +4157,9 @@ void ImProcCoordinator::invalidatePreviewDirtyState()
  * Resolve the node sequence for this pass from the canonical preview spec.
  *
  * Every node is marked dirty from the parameter fingerprints and the render
- * state (the authority), and in parallel from the event-mask gates the legacy
- * sequence uses (the shadow reference). Both graphs are asked for a plan and
- * the plans are validated before anything executes: a node the pass must run
- * may never come back reusable, and every scheduled node must have an executor.
- * A refused plan leaves the legacy sequence in place, so a rejected plan can
- * only cost work, never change the image.
+ * state. The plan is validated before anything executes: a dirty node may
+ * never come back reusable, and every node must have an executor. A refused
+ * plan aborts, because the graph is the only full-frame sequence.
  */
 ImProcCoordinator::PreviewPassPlan ImProcCoordinator::planPreviewPass(
     PreviewPassState& pass)
@@ -4367,9 +4203,6 @@ ImProcCoordinator::PreviewPassPlan ImProcCoordinator::planPreviewPass(
         graph.connect(nodes[from], nodes[to]);
     }
 
-    std::vector<bool> dirty(spec.nodes.size(), false);
-    const bool rgbSourceModified = imgsrc->isRGBSourceModified();
-
     if (!pass.dirty.valid) {
         result.reason = "dirty set invalid: " + pass.dirty.reason;
         return result;
@@ -4382,79 +4215,23 @@ ImProcCoordinator::PreviewPassPlan ImProcCoordinator::planPreviewPass(
         }
     }
 
-    /*
-     * The event-mask gates stay in the loop even when the fingerprint set is
-     * the authority, because the shadow comparison reports against them and
-     * RT_PREVIEW_DIRTY=mask still selects them. `maskGraph` and
-     * `fingerprintGraph` share the nodes and edges and differ only in which
-     * blocks they mark dirty; the chosen plan is the authority's. Comparing
-     * the two plans accounts for the downstream propagation, so a direct
-     * difference that both resolve to the same executed nodes is not reported.
-     */
-    const bool fingerprintAuthority = previewDirtyExecution();
-    const bool shadow = previewDirtyShadowEnabled();
-    stage::StageGraph maskGraph = graph;
-    stage::StageGraph fingerprintGraph = graph;
-
-    if (shadow) {
-        logPreviewDirtyShadowActive();
-    }
+    std::vector<bool> dirty(spec.nodes.size(), false);
 
     for (size_t i = 0; i < spec.nodes.size(); ++i) {
         const std::string& id = spec.nodes[i].id;
-        bool runs = false;
 
-        if (id == "source.select" || id == "raw.preprocess") {
-            runs = rawWorkRuns(pass.todo, pass.highDetailNeeded,
-                               highDetailPreprocessComputed);
-        } else if (id == "raw.demosaic") {
-            runs = rawSourceWorkRuns(pass.todo, pass.highDetailNeeded,
-                                     highDetailRawComputed,
-                                     rgbSourceModified, *params);
-        } else if (id == "raw.base") {
-            runs = baseWorkMayRun(pass.todo, spotprev != nullptr);
-        } else if (id == "analysis") {
-            // Folded into raw.base: dirty with the base rebuild that runs it.
-            runs = baseRebuildRuns(pass.todo);
-        } else if (id == "transform") {
-            runs = transformMayRun(pass.todo, pass.transformNeeded);
-        } else if (id == "local.adjustments") {
-            runs = localAdjustmentsMayRun(pass.todo, *params);
-        } else if (id == "rgb.proc") {
-            runs = rgbProcRuns(pass.todo);
-        } else if (id == "lab.tools") {
-            runs = labToolsRun(pass.todo);
-        } else if (id == "lab.wavelet" || id == "working.trc"
-                   || id == "ciecam" || id == "gamut") {
-            runs = labPipelineRuns(pass.todo);
-        } else if (id == "monitor.output") {
-            runs = monitorOutputRuns(pass.todo, pass.panningRelatedChange);
-        } else {
+        if (!isPreviewNode(id)) {
             result.reason = "node has no executor: " + id;
             return result;
         }
 
-        const bool fromFingerprints = pass.dirty.ids.count(id) != 0;
-        const bool nodeDirty = fingerprintAuthority ? fromFingerprints : runs;
-
+        const bool nodeDirty = pass.dirty.ids.count(id) != 0;
         dirty[i] = nodeDirty;
 
         if (nodeDirty) {
             graph.markDirty(nodes[i]);
         } else {
             graph.markClean(nodes[i]);
-        }
-
-        if (runs) {
-            maskGraph.markDirty(nodes[i]);
-        } else {
-            maskGraph.markClean(nodes[i]);
-        }
-
-        if (fromFingerprints) {
-            fingerprintGraph.markDirty(nodes[i]);
-        } else {
-            fingerprintGraph.markClean(nodes[i]);
         }
     }
 
@@ -4466,54 +4243,11 @@ ImProcCoordinator::PreviewPassPlan ImProcCoordinator::planPreviewPass(
         return result;
     }
 
-    const std::vector<stage::StageDecision> maskDecisions = maskGraph.plan();
-    const std::vector<stage::StageDecision> fingerprintDecisions =
-        fingerprintGraph.plan();
-    const std::vector<stage::StageDecision>& decisions =
-        fingerprintAuthority ? fingerprintDecisions : maskDecisions;
+    const std::vector<stage::StageDecision> decisions = graph.plan();
 
-    if (decisions.size() != spec.nodes.size()
-            || maskDecisions.size() != spec.nodes.size()
-            || fingerprintDecisions.size() != spec.nodes.size()) {
+    if (decisions.size() != spec.nodes.size()) {
         result.reason = "incomplete plan";
         return result;
-    }
-
-    /*
-     * Shadow equivalence compares the two *plans*, not the two direct sets.
-     * The graph propagates dirtiness downstream, so a direct difference that
-     * both plans resolve to the same executed nodes is not a difference in
-     * work; only a node that one plan executes and the other skips matters.
-     */
-    if (shadow) {
-        std::set<std::string> maskExecuted;
-        std::set<std::string> fingerprintExecuted;
-
-        for (size_t i = 0; i < spec.nodes.size(); ++i) {
-            if (isFoldedPreviewNode(spec.nodes[i].id)) {
-                continue;
-            }
-            if (maskDecisions[i].action != stage::StageAction::ReuseOutput) {
-                maskExecuted.insert(spec.nodes[i].id);
-            }
-            if (fingerprintDecisions[i].action
-                    != stage::StageAction::ReuseOutput) {
-                fingerprintExecuted.insert(spec.nodes[i].id);
-            }
-        }
-
-        const std::set<std::string> missing =
-            difference(maskExecuted, fingerprintExecuted);
-        const std::set<std::string> extra =
-            difference(fingerprintExecuted, maskExecuted);
-
-        if (!missing.empty() || !extra.empty()) {
-            const std::set<std::string> direct = pass.dirty.ids;
-
-            logPreviewDirtyDifference(missing, extra, maskExecuted,
-                                      fingerprintExecuted, direct,
-                                      pass.todo);
-        }
     }
 
     for (size_t index : order) {
@@ -4522,11 +4256,6 @@ ImProcCoordinator::PreviewPassPlan ImProcCoordinator::planPreviewPass(
 
         if (isFoldedPreviewNode(id)) {
             continue;
-        }
-
-        if (!isPreviewNode(id)) {
-            result.reason = "node has no executor: " + id;
-            return result;
         }
 
         if (dirty[index] && action == stage::StageAction::ReuseOutput) {
