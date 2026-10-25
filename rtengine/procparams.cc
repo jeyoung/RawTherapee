@@ -1277,7 +1277,12 @@ SharpeningParams::SharpeningParams() :
     deconvamount(100),
     deconvradius(0.75),
     deconviter(30),
-    deconvdamping(0)
+    deconvdamping(0),
+    deconvAutoRadius(false),
+    deconvCornerBoost(0.0),
+    deconvCornerLatitude(0),
+    psf_kernel(),
+    psf_iterations(0.0)
 {
 }
 
