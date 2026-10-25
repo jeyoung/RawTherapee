@@ -439,6 +439,7 @@ void ImProcCoordinator::assign(ImageSource* imgsrc)
     previewBaseCache->clear("image-switch");
     initialRoughPreview = false;
     invalidateViewportState();
+    invalidatePreviewDirtyState();
 
     // A new image source has no completed high-detail base state. Buffer
     // reallocations (freeAll) do not change this because the source planes are
@@ -1325,6 +1326,49 @@ bool previewGraphEnabled()
     return enabled;
 }
 
+/*
+ * Authority for the graph's dirty marking.
+ *
+ * The fingerprint and render-state derivation is the default: the plan no
+ * longer reads the event mask. RT_PREVIEW_DIRTY=mask restores the event-mask
+ * gates for comparison and troubleshooting, exactly as the previous graph
+ * tranche ran them; every other value (or unset) keeps the derivation.
+ *
+ * The mask itself still drives the legacy sequence, the viewport fast path,
+ * the crop render and the notifications. Only the full-frame graph plan is
+ * affected by this switch.
+ */
+bool previewDirtyExecution()
+{
+    static const bool fingerprint = []() {
+        const char* value = g_getenv("RT_PREVIEW_DIRTY");
+        return value == nullptr || value[0] == '\0'
+            || g_ascii_strcasecmp(value, "mask") != 0;
+    }();
+    return fingerprint;
+}
+
+/*
+ * Shadow comparison of both dirty derivations.
+ *
+ * Enabled by default in this phase: each full-frame pass computes the
+ * event-mask set and the fingerprint/render-state set, and logs a `missing`
+ * entry when a block the mask marks dirty would not run. The log is the
+ * evidence that the switch of authority is safe. RT_PREVIEW_DIRTY_SHADOW=0
+ * (or off) disables it; the comparison costs one pass over the tables and
+ * never changes the image.
+ */
+bool previewDirtyShadowEnabled()
+{
+    static const bool enabled = []() {
+        const char* value = g_getenv("RT_PREVIEW_DIRTY_SHADOW");
+        return value == nullptr || value[0] == '\0'
+            || (g_ascii_strcasecmp(value, "0") != 0
+                && g_ascii_strcasecmp(value, "off") != 0);
+    }();
+    return enabled;
+}
+
 /* Canonical preview inventory, in the execution order of the engine. */
 const char* const PREVIEW_NODE_IDS[] = {
     "source.select", "raw.preprocess", "raw.demosaic", "raw.base", "analysis",
@@ -1369,16 +1413,29 @@ bool rawWorkRuns(int todo, bool highDetailNeeded,
 
 /*
  * raw.demosaic owns the demosaic, the capture sharpening and the retinex
- * buffer preparation. M_WB is part of the gate because a white-balance change
- * can force a demosaic through the Color/Coloropp highlight-recovery path, and
- * a modified RGB source always re-demosaics.
+ * buffer preparation. The predicate is the union of the three guards inside
+ * the node, not a superset of them: a may-run form that is always true once
+ * high-light recovery has modified the source would schedule the node on every
+ * pass and hide a real scheduling difference from the shadow comparison.
+ *
+ * A white-balance change can force a demosaic through the Color/Coloropp
+ * highlight-recovery path, and a modified RGB source re-demosaics only when
+ * the recovery method matches the current one.
  */
-bool rawSourceWorkMayRun(int todo, bool highDetailNeeded,
-                         bool highDetailRawComputed, bool rgbSourceModified)
+bool rawSourceWorkRuns(int todo, bool highDetailNeeded,
+                       bool highDetailRawComputed, bool rgbSourceModified,
+                       const ProcParams& params)
 {
-    return (todo & (M_RAW | M_CSHARP | M_WB)) != 0
-        || rgbSourceModified
-        || (!highDetailRawComputed && highDetailNeeded);
+    const bool isColor = params.toneCurve.method == "Color"
+        || params.toneCurve.method == "Coloropp";
+    const bool demosaic = (todo & M_RAW) != 0
+        || (!highDetailRawComputed && highDetailNeeded)
+        || (params.toneCurve.hrenabled && !isColor && rgbSourceModified)
+        || (!params.toneCurve.hrenabled && isColor && rgbSourceModified);
+    const bool captureSharpening = (todo & (M_RAW | M_CSHARP)) != 0
+        && params.pdsharpening.enabled;
+
+    return demosaic || captureSharpening;
 }
 
 bool baseRebuildRuns(int todo)
@@ -1469,6 +1526,119 @@ void logPreviewGraphActive(size_t nodes)
                  nodes, PREVIEW_NODE_COUNT);
 }
 
+/* One comma-separated id list, without spaces, for a single log line. */
+std::string formatIdSet(const std::set<std::string>& ids)
+{
+    std::string text;
+
+    for (const std::string& id : ids) {
+        if (!text.empty()) {
+            text += ',';
+        }
+        text += id;
+    }
+
+    return text;
+}
+
+std::set<std::string> difference(const std::set<std::string>& left,
+                                 const std::set<std::string>& right)
+{
+    std::set<std::string> result;
+
+    for (const std::string& id : left) {
+        if (right.count(id) == 0) {
+            result.insert(id);
+        }
+    }
+
+    return result;
+}
+
+/* Announce the shadow mode once per process, so a quiet log is provable. */
+void logPreviewDirtyShadowActive()
+{
+    static std::mutex mutex;
+    static bool logged = false;
+
+    std::lock_guard<std::mutex> lock(mutex);
+    if (logged) {
+        return;
+    }
+    logged = true;
+
+    std::fprintf(stderr,
+                 "preview-dirty: shadow active, %s authority\n",
+                 previewDirtyExecution() ? "fingerprint" : "mask");
+}
+
+/*
+ * Report one disagreement between the two plans.
+ *
+ * `missing` is the dangerous direction: the event mask would execute a block
+ * that the fingerprint and render-state derivation leaves out, which would
+ * show a stale frame. `extra` is the documented over-approximation: the
+ * derivation executes a block whose own event-mask gate then declines to work
+ * on it, so the pixels are unchanged and only the function call is spent.
+ *
+ * The detail line names the three sets that explain the difference: the
+ * executed nodes of both plans and the direct dirty set of the derivation.
+ */
+void logPreviewDirtyDifference(const std::set<std::string>& missing,
+                               const std::set<std::string>& extra,
+                               const std::set<std::string>& maskExecuted,
+                               const std::set<std::string>& fingerprintExecuted,
+                               const std::set<std::string>& direct, int mask)
+{
+    constexpr int LOG_LIMIT = 500;
+
+    static std::mutex mutex;
+    static int logged = 0;
+    static int mismatches = 0;
+    static int over = 0;
+    static bool limitLogged = false;
+
+    std::lock_guard<std::mutex> lock(mutex);
+
+    if (!missing.empty()) {
+        ++mismatches;
+    } else {
+        ++over;
+    }
+
+    if (logged >= LOG_LIMIT) {
+        if (!limitLogged) {
+            limitLogged = true;
+            std::fprintf(stderr,
+                         "preview-dirty: log limit reached, further "
+                         "differences are not printed\n");
+        }
+        return;
+    }
+
+    ++logged;
+
+    if (!missing.empty()) {
+        std::fprintf(stderr,
+                     "preview-dirty: mismatch #%d missing=[%s] extra=[%s] "
+                     "mask=0x%x\n",
+                     mismatches, formatIdSet(missing).c_str(),
+                     formatIdSet(extra).c_str(), mask);
+    } else {
+        std::fprintf(stderr,
+                     "preview-dirty: over-approximation #%d extra=[%s] "
+                     "mask=0x%x\n",
+                     over, formatIdSet(extra).c_str(), mask);
+    }
+
+    std::fprintf(stderr,
+                 "preview-dirty: detail mask=[%s] fingerprint=[%s] "
+                 "direct=[%s]\n",
+                 formatIdSet(maskExecuted).c_str(),
+                 formatIdSet(fingerprintExecuted).c_str(),
+                 formatIdSet(direct).c_str());
+}
+
 } // namespace
 
 /* State owned by one full-frame preview pass. */
@@ -1481,6 +1651,18 @@ struct ImProcCoordinator::PreviewPassState {
     bool cam02 = false;
     bool transformNeeded = false;
     PreviewTimer* timer = nullptr;
+
+    /*
+     * Dirty-block derivation for this pass. `fingerprints` is the parameter
+     * snapshot taken before any node runs, because the pass normalises the
+     * live ProcParams; it becomes the snapshot of the next pass once the pass
+     * completes. `renderState` is the state the pass is about to run with and
+     * is rebuilt after the pass to record the work it completed.
+     */
+    stage::ParamSnapshot fingerprints;
+    stage::RenderStateKey renderState;
+    stage::RequestKind requestKind = stage::RequestKind::FullPreview;
+    stage::DirtyBlocks dirty;
 };
 
 /* The resolved node sequence for one pass. */
@@ -1552,13 +1734,14 @@ void ImProcCoordinator::stageRawPreprocess(PreviewPassState& pass)
  * highlight-recovery method changed the RGB the cache holds: a colour HLR
  * alters the demosaic output, so turning it off, changing its method or
  * disabling it needs a rebuild. A white-balance change can reach the same path
- * through the Color/Coloropp method, which is why M_WB is part of the gate.
+ * through the Color/Coloropp method; the caller's DEMOSAIC augmentation has
+ * already turned that into the raw bits the predicate reads.
  */
 void ImProcCoordinator::stageRawDemosaic(PreviewPassState& pass)
 {
-    if (!rawSourceWorkMayRun(pass.todo, pass.highDetailNeeded,
-                             highDetailRawComputed,
-                             imgsrc->isRGBSourceModified())) {
+    if (!rawSourceWorkRuns(pass.todo, pass.highDetailNeeded,
+                           highDetailRawComputed,
+                           imgsrc->isRGBSourceModified(), *params)) {
         return;
     }
 
@@ -4020,13 +4203,145 @@ void ImProcCoordinator::stageMonitorOutput(PreviewPassState& pass)
 }
 
 /*
+ * Render state of the pass about to run, in the form the dirty-block
+ * derivation consumes.
+ *
+ * Every field mirrors a coordinator member or a ProcParams member that the
+ * full-frame preview actually uses. The preview is a full-frame request at
+ * `scale` with no processing border, so the crop rectangle is the requested
+ * one and the border fields are zero; both are part of the key because a crop
+ * change does not alter any preview stage's parameter fingerprint.
+ */
+stage::RenderStateKey ImProcCoordinator::previewRenderState(
+    const PreviewPassState& pass) const
+{
+    stage::RenderStateKey key;
+
+    key.previewScale = scale;
+    key.previewWidth = pW;
+    key.previewHeight = pH;
+    key.fullWidth = fw;
+    key.fullHeight = fh;
+
+    key.cropX = params->crop.x;
+    key.cropY = params->crop.y;
+    key.cropWidth = params->crop.w;
+    key.cropHeight = params->crop.h;
+    key.cropSkip = scale;
+    key.borderRequested = 0;
+    key.borderLeft = 0;
+    key.borderTop = 0;
+
+    key.highDetailNeeded = pass.highDetailNeeded;
+    key.highDetailPreprocessComputed = highDetailPreprocessComputed;
+    key.highDetailRawComputed = highDetailRawComputed;
+    key.highDetailStateKnown = highDetailStateKnown;
+
+    key.sourceGeneration = imgsrc != nullptr ? imgsrc->getSourceGeneration() : 0;
+    key.rgbSourceModified = imgsrc != nullptr && imgsrc->isRGBSourceModified();
+
+    key.monitorProfile = monitorProfile.raw();
+    key.monitorIntent = static_cast<int32_t>(monitorIntent);
+    key.softProof = softProof;
+    key.gamutCheck = gamutCheck;
+
+    key.sharpMask = sharpMask;
+    key.fastPreviewEnabled =
+        fastPreviewEnabled.load(std::memory_order_acquire);
+    key.mainPreviewFullResolution =
+        mainPreviewFullResolution.load(std::memory_order_acquire);
+    key.initialRoughPreview = initialRoughPreview;
+
+    key.requestKind = pass.requestKind;
+    key.previousDemoBase = static_cast<int32_t>(
+        lastPassPrevdemoBase.load(std::memory_order_acquire));
+
+    return key;
+}
+
+/*
+ * Blocks the graph must execute for this pass.
+ *
+ * The parameter fingerprints are compared against the snapshot of the last
+ * completed full-frame pass, and the render state against its matching
+ * snapshot. There is no previous pass on the first request and after an image
+ * switch or a buffer reallocation, so everything is dirty then.
+ */
+stage::DirtyBlocks ImProcCoordinator::previewDirtyBlocks(
+    const PreviewPassState& pass) const
+{
+    if (!previewDirtyFingerprintsValid || !previewDirtyStateValid) {
+        stage::DirtyBlocks result =
+            stage::allDirtyBlocks(stage::StagePath::Preview);
+        result.reason = "no previous full-frame pass";
+        return result;
+    }
+
+    const stage::DirtyBlocks fromParams = stage::dirtyBlocksFromSnapshot(
+        previewDirtyFingerprints, *params, stage::StagePath::Preview);
+    const stage::DirtyBlocks fromState = stage::dirtyBlocksFromRenderState(
+        previewDirtyState, pass.renderState, stage::StagePath::Preview);
+
+    stage::DirtyBlocks result =
+        stage::mergeDirtyBlocks(fromParams, fromState);
+
+    /*
+     * `analysis` is folded into raw.base: firstAnalysis() is the last statement
+     * of the base rebuild, so a dirty analysis must enter raw.base as well or
+     * the histogram would never be recomputed. The same applies to the base
+     * rebuild that the LUT consumers depend on.
+     */
+    if (result.ids.count("analysis") != 0) {
+        result.ids.insert("raw.base");
+    }
+
+    /*
+     * A spot buffer left over from an earlier base pass is restored into
+     * orig_prev by the next raw.base execution. It is coordinator-owned state
+     * that RenderStateKey does not carry yet, so it is added here rather than
+     * silently ignored; the staging record lists it as a residual input.
+     */
+    if (spotprev != nullptr) {
+        result.ids.insert("raw.base");
+    }
+
+    return result;
+}
+
+/*
+ * Record the input of the pass that just completed.
+ *
+ * The parameter snapshot is the one taken before the nodes ran; the render
+ * state is rebuilt now so the high-detail fields describe the work the pass
+ * finished. A pass that did not take the full-frame path must not call this:
+ * its buffers still belong to the previous snapshot.
+ */
+void ImProcCoordinator::recordPreviewDirtyState(const PreviewPassState& pass)
+{
+    previewDirtyFingerprints = pass.fingerprints;
+    previewDirtyState = previewRenderState(pass);
+    previewDirtyFingerprintsValid = true;
+    previewDirtyStateValid = true;
+}
+
+/* The buffers the snapshot describes are gone; the next pass is all-dirty. */
+void ImProcCoordinator::invalidatePreviewDirtyState()
+{
+    previewDirtyFingerprints.clear();
+    previewDirtyFingerprintsValid = false;
+    previewDirtyStateValid = false;
+}
+
+/*
  * Resolve the node sequence for this pass from the canonical preview spec.
  *
- * Every node is marked dirty from the event mask and the pass state, the graph
- * is asked for its plan, and the plan is validated before anything executes: a
- * node this pass must run may never come back reusable, and every scheduled
- * node must have an executor. A refused plan leaves the legacy sequence in
- * place, so a rejected plan can only cost work, never change the image.
+ * Every node is marked dirty from the parameter fingerprints and the render
+ * state (the authority), and in parallel from the event-mask gates the legacy
+ * sequence uses (the shadow reference). Both graphs are asked for a plan and
+ * the plans are validated before anything executes: a node the pass must run
+ * may never come back reusable, and every scheduled node must have an executor.
+ * A refused plan leaves the legacy sequence in place, so a rejected plan can
+ * only cost work, never change the image.
  */
 ImProcCoordinator::PreviewPassPlan ImProcCoordinator::planPreviewPass(
     PreviewPassState& pass)
@@ -4073,6 +4388,36 @@ ImProcCoordinator::PreviewPassPlan ImProcCoordinator::planPreviewPass(
     std::vector<bool> dirty(spec.nodes.size(), false);
     const bool rgbSourceModified = imgsrc->isRGBSourceModified();
 
+    if (!pass.dirty.valid) {
+        result.reason = "dirty set invalid: " + pass.dirty.reason;
+        return result;
+    }
+
+    for (const std::string& id : pass.dirty.ids) {
+        if (!isPreviewNode(id)) {
+            result.reason = "dirty set names an unknown block: " + id;
+            return result;
+        }
+    }
+
+    /*
+     * The event-mask gates stay in the loop even when the fingerprint set is
+     * the authority, because the shadow comparison reports against them and
+     * RT_PREVIEW_DIRTY=mask still selects them. `maskGraph` and
+     * `fingerprintGraph` share the nodes and edges and differ only in which
+     * blocks they mark dirty; the chosen plan is the authority's. Comparing
+     * the two plans accounts for the downstream propagation, so a direct
+     * difference that both resolve to the same executed nodes is not reported.
+     */
+    const bool fingerprintAuthority = previewDirtyExecution();
+    const bool shadow = previewDirtyShadowEnabled();
+    stage::StageGraph maskGraph = graph;
+    stage::StageGraph fingerprintGraph = graph;
+
+    if (shadow) {
+        logPreviewDirtyShadowActive();
+    }
+
     for (size_t i = 0; i < spec.nodes.size(); ++i) {
         const std::string& id = spec.nodes[i].id;
         bool runs = false;
@@ -4081,9 +4426,9 @@ ImProcCoordinator::PreviewPassPlan ImProcCoordinator::planPreviewPass(
             runs = rawWorkRuns(pass.todo, pass.highDetailNeeded,
                                highDetailPreprocessComputed);
         } else if (id == "raw.demosaic") {
-            runs = rawSourceWorkMayRun(pass.todo, pass.highDetailNeeded,
-                                       highDetailRawComputed,
-                                       rgbSourceModified);
+            runs = rawSourceWorkRuns(pass.todo, pass.highDetailNeeded,
+                                     highDetailRawComputed,
+                                     rgbSourceModified, *params);
         } else if (id == "raw.base") {
             runs = baseWorkMayRun(pass.todo, spotprev != nullptr);
         } else if (id == "analysis") {
@@ -4107,12 +4452,27 @@ ImProcCoordinator::PreviewPassPlan ImProcCoordinator::planPreviewPass(
             return result;
         }
 
-        dirty[i] = runs;
+        const bool fromFingerprints = pass.dirty.ids.count(id) != 0;
+        const bool nodeDirty = fingerprintAuthority ? fromFingerprints : runs;
 
-        if (runs) {
+        dirty[i] = nodeDirty;
+
+        if (nodeDirty) {
             graph.markDirty(nodes[i]);
         } else {
             graph.markClean(nodes[i]);
+        }
+
+        if (runs) {
+            maskGraph.markDirty(nodes[i]);
+        } else {
+            maskGraph.markClean(nodes[i]);
+        }
+
+        if (fromFingerprints) {
+            fingerprintGraph.markDirty(nodes[i]);
+        } else {
+            fingerprintGraph.markClean(nodes[i]);
         }
     }
 
@@ -4124,11 +4484,54 @@ ImProcCoordinator::PreviewPassPlan ImProcCoordinator::planPreviewPass(
         return result;
     }
 
-    const std::vector<stage::StageDecision> decisions = graph.plan();
+    const std::vector<stage::StageDecision> maskDecisions = maskGraph.plan();
+    const std::vector<stage::StageDecision> fingerprintDecisions =
+        fingerprintGraph.plan();
+    const std::vector<stage::StageDecision>& decisions =
+        fingerprintAuthority ? fingerprintDecisions : maskDecisions;
 
-    if (decisions.size() != spec.nodes.size()) {
+    if (decisions.size() != spec.nodes.size()
+            || maskDecisions.size() != spec.nodes.size()
+            || fingerprintDecisions.size() != spec.nodes.size()) {
         result.reason = "incomplete plan";
         return result;
+    }
+
+    /*
+     * Shadow equivalence compares the two *plans*, not the two direct sets.
+     * The graph propagates dirtiness downstream, so a direct difference that
+     * both plans resolve to the same executed nodes is not a difference in
+     * work; only a node that one plan executes and the other skips matters.
+     */
+    if (shadow) {
+        std::set<std::string> maskExecuted;
+        std::set<std::string> fingerprintExecuted;
+
+        for (size_t i = 0; i < spec.nodes.size(); ++i) {
+            if (isFoldedPreviewNode(spec.nodes[i].id)) {
+                continue;
+            }
+            if (maskDecisions[i].action != stage::StageAction::ReuseOutput) {
+                maskExecuted.insert(spec.nodes[i].id);
+            }
+            if (fingerprintDecisions[i].action
+                    != stage::StageAction::ReuseOutput) {
+                fingerprintExecuted.insert(spec.nodes[i].id);
+            }
+        }
+
+        const std::set<std::string> missing =
+            difference(maskExecuted, fingerprintExecuted);
+        const std::set<std::string> extra =
+            difference(fingerprintExecuted, maskExecuted);
+
+        if (!missing.empty() || !extra.empty()) {
+            const std::set<std::string> direct = pass.dirty.ids;
+
+            logPreviewDirtyDifference(missing, extra, maskExecuted,
+                                      fingerprintExecuted, direct,
+                                      pass.todo);
+        }
     }
 
     for (size_t index : order) {
@@ -4441,6 +4844,38 @@ void ImProcCoordinator::updatePreviewImage(int todo, bool panningRelatedChange,
         // raw.base is not executed.
         oprevi = orig_prev;
 
+        /*
+         * Snapshot the pass input before any node normalises it, then derive
+         * the blocks the graph must execute. The event mask is no longer the
+         * scheduler input; it still decides what each node does internally and
+         * still drives the legacy sequence, the crop render and notifications.
+         *
+         * The request kind is the one part of the derivation the render state
+         * cannot express as a field delta: the mask carries request-level bits
+         * rather than a parameter or geometry change. `M_HIGHQUAL` asks for the
+         * accurate chain, and `M_INIT`, `M_LINDENOISE` and `M_HDR` ask for the
+         * destructive raw stage and the base to be rebuilt. Both are absolute
+         * requests and dirty the whole path, exactly as the crop carries its
+         * reload bits as `RequestKind::FullCrop`. An ordinary pass carries
+         * neither and is a delta, so the fingerprint and render-state
+         * comparison decides it.
+         */
+        const bool rebuildRequested =
+            (pass.todo & (M_INIT | M_LINDENOISE | M_HDR)) != 0;
+        if ((pass.todo & M_HIGHQUAL) != 0) {
+            pass.requestKind = stage::RequestKind::HighQuality;
+        } else if (rebuildRequested) {
+            pass.requestKind = stage::RequestKind::FullPreview;
+        } else if (pass.todo == M_MINUPDATE) {
+            pass.requestKind = stage::RequestKind::RepaintOnly;
+        } else {
+            pass.requestKind = stage::RequestKind::ParamsOnly;
+        }
+        pass.fingerprints = stage::snapshotParams(
+            *params, stage::StagePath::Preview);
+        pass.renderState = previewRenderState(pass);
+        pass.dirty = previewDirtyBlocks(pass);
+
         PreviewPassPlan plan;
 
         if (previewGraphEnabled()) {
@@ -4478,6 +4913,9 @@ void ImProcCoordinator::updatePreviewImage(int todo, bool panningRelatedChange,
             ipf.updateColorProfiles(monitorProfile, monitorIntent, softProof, gamutCheck);
         }
 
+        // The full-frame buffers now match this pass input. Record it after
+        // the nodes ran, so the high-detail fields describe the work done.
+        recordPreviewDirtyState(pass);
     }
 
 // process crop, if needed
@@ -4586,6 +5024,8 @@ void ImProcCoordinator::freeAll()
 {
     previewBaseCache->clear("free-all");
     invalidateViewportState();
+    // The buffers the dirty snapshot describes are about to be released.
+    invalidatePreviewDirtyState();
 
     if (allocated) {
         if (spotprev && spotprev != oprevi) {
@@ -5126,6 +5566,7 @@ void ImProcCoordinator::saveInputICCReference(const Glib::ustring& fname, bool a
     // resolution, so any preview base snapshot is no longer representative.
     previewBaseCache->markDirty("input-icc-reference");
     invalidateViewportState();
+    invalidatePreviewDirtyState();
     highDetailPreprocessComputed = false;
     highDetailRawComputed = false;
 
@@ -5266,6 +5707,9 @@ void ImProcCoordinator::stopProcessing()
     }
 
     invalidateViewportState();
+    // Processing restart may follow an image switch or a settings change that
+    // reallocates the buffers; the next pass must be all-dirty.
+    invalidatePreviewDirtyState();
     updaterThreadStart.unlock();
 }
 

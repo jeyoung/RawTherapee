@@ -196,9 +196,8 @@ sections, raw-byte framing, repeated `finish()` and 100k repeated calls.
 
 ## Graph-driven export
 
-`ImageProcessor::normal_pipeline()` is graph-driven by default. The canonical
-export inventory becomes a `StageGraph`; set `RT_STAGE_GRAPH=0` or `off` to
-use the legacy sequence:
+`ImageProcessor::normal_pipeline()` has an opt-in graph-driven form. With
+`RT_STAGE_GRAPH=1` the canonical export inventory becomes a `StageGraph`:
 `stage::buildPipelineSpec(StagePath::Export)` supplies all 20 node ids, the 19
 edges and each node's reuse mode, so the graph is not restated in the
 processing code. The graph is built per job, so every node is dirty and
@@ -303,9 +302,8 @@ denoise/wavelet work; it is not yet wired into those tools.
 
 ## Graph-driven thumbnail
 
-The thumbnail path is graph-driven by default through the canonical
-twelve-node specification in `STAGE_PIPELINE.md`; `RT_STAGE_GRAPH=0` selects
-the legacy sequence. Each entry point builds
+`RT_STAGE_GRAPH=1` also switches the thumbnail path to the canonical
+twelve-node specification in `STAGE_PIPELINE.md`. Each entry point builds
 `buildPipelineSpec(StagePath::Thumbnail)`, connects every node and edge into a
 `StageGraph`, marks the nodes that invocation owns dirty, and executes the
 active nodes in `topologicalOrder()` when `plan()` allows it. The entry
@@ -386,9 +384,10 @@ Evidence (CPU build with OpenCL disabled, single-threaded host run,
 
 ## Preview stage graph and dump
 
-The canonical full-frame preview inventory executes through `StageGraph` by
-default. `RT_PREVIEW_GRAPH` takes precedence over `RT_STAGE_GRAPH`; set either
-to `0` or `off` to use the legacy sequence, which stays byte-identical.
+`RT_PREVIEW_GRAPH=1` executes the canonical full-frame preview inventory
+through `StageGraph`; `RT_STAGE_GRAPH=1` selects the same path when
+`RT_PREVIEW_GRAPH` is unset. Unset, empty, `0` and `off` (case-insensitive)
+keep the legacy sequence, which remains the default and stays byte-identical.
 
 ### Runtime mapping
 
@@ -448,8 +447,9 @@ the pass will actually use.
 
 Each full-frame pass builds `buildPipelineSpec(StagePath::Preview)`, connects
 its 14 nodes and 13 edges into a `StageGraph`, marks each node dirty from the
-event mask, the high-detail state and the pending spot copy, and asks
-`plan()` for the actions before anything executes. A node the pass must run may
+parameter fingerprints and render state (see *Preview dirty blocks* below; the
+event mask was the authority before that change), and asks `plan()` for the
+actions before anything executes. A node the pass must run may
 not come back `ReuseOutput`, and every scheduled node must have an executor;
 either failure rejects the plan, logs `preview-graph: fallback to legacy:
 <reason>` once, and runs the unchanged legacy sequence. Once per process the
@@ -524,14 +524,205 @@ pass. The image, sidecar and dumps stay outside the repository.
   `tools/build-rt.sh opencl -j 6 --ccache --stage-modules` both complete, and
   the stage tests pass on both.
 
+## Preview dirty blocks
+
+The first graph tranche scheduled a preview node from the legacy `M_*` event
+mask: `planPreviewPass()` evaluated the same gate the hand-written block used
+and marked the node dirty from it. That made the mask the execution authority
+of the graph as well as the notification, coalescing and crop-render input.
+
+This tranche separates the two. The full-frame preview graph now derives its
+dirty set from the preview parameter fingerprints and `RenderStateKey`;
+`rtengine/stage/stage_dirty_blocks.h` holds the derivation, shared with the
+crop viewport. The `M_*` mask keeps every other job it had: it still
+drives the legacy sequence, the viewport fast path, the deferred-analysis
+queue, the crop render, the notifications and the guards inside each node that
+decide *how much* of the block the request allows (a full base rebuild versus a
+retinex refresh, for example). `refreshmap.*` is unchanged.
+
+### Derivation
+
+The unit is `stage_fingerprints()` / `derive_dirty_blocks()` /
+`close_dirty_blocks()`, documented in `devnotes/perf/STAGE_PIPELINE.md`. The
+coordinator calls the compatibility adapters over those primitives, which keep
+the call shape of the first draft of this tranche:
+
+| API | Input | Result |
+| --- | --- | --- |
+| `dirtyBlocksFromParams(previous, current, path)` | two `ProcParams` | the execution set behind a parameter change |
+| `snapshotParams(params, path)` | one `ProcParams` | one fingerprint per descriptor, for the next pass |
+| `dirtyBlocksFromSnapshot(snapshot, current, path)` | snapshot and `ProcParams` | the same result without copying the previous parameters |
+| `dirtyBlocksFromRenderState(previous, current, path)` | two `RenderStateKey` | the execution set behind an explicit state change |
+| `closeOverGraph(blocks, path)` | any set | the set plus every downstream consumer |
+| `allDirtyBlocks(path)` | — | every canonical node, used when no previous state exists |
+| `mergeDirtyBlocks(a, b)` | two sets | union, valid only when both inputs are valid |
+
+Every adapter returns the execution set of `derive_dirty_blocks()`: direct
+blocks, coupled group, residents and forward closure, with `ids`, `valid` and
+`reason` filled. The preview plan marks those ids dirty and lets
+`StageGraph::plan()` propagate the rest, so the two closures agree.
+
+The parameter comparison uses the same fingerprint a stage cache key uses, so
+a block is dirty exactly when one of the `ProcParams` members it consumes
+changes. Whole sub-structs are hashed, so the result is an over-approximation:
+a member the block ignores still dirties it, which costs work but never shows a
+stale frame.
+
+The render-state comparison covers what `ProcParams` cannot carry. The shared
+table is in `stage_dirty_blocks.cc` and is listed per path in
+`STAGE_PIPELINE.md`; the preview rows are:
+
+| Field group | Preview blocks | Why |
+| --- | --- | --- |
+| preview geometry, including the crop or ROI rectangle | all | a new scale, allocation or rectangle re-renders the pass |
+| high-detail decision and completed work | `source.select`, `raw.preprocess`, `raw.demosaic`, `raw.base`, `analysis`, `transform` | the demosaic mode and the base change |
+| source generation | `source.select`, `raw.preprocess`, `raw.demosaic`, `raw.base` | a replaced source invalidates the raw core; the closure reaches the rest |
+| modified RGB source | the same raw core | the demosaic output changed |
+| monitor profile, intent, soft proof, gamut check | `monitor.output` | the display sink |
+| sharpening mask, FAST toggle, full-resolution record, rough flag | the raw core | one aspect covers four switches, so its answer is their union |
+| request kind | none, sink or all | a parameter-only request schedules nothing; a repaint the sink; a high-quality or full request the path, because the request may stand for work no field delta describes |
+| previous preview base | `source.select` … `transform` | a different base was built; read by the state adapter, because the aspect table groups it with the request |
+
+`StageGraph::plan()` propagates dirtiness through the pipeline edges, so a
+caller marks only the entry block. `closeOverGraph()` produces the same closure
+explicitly for diagnostics and tests.
+
+### Coordinator integration
+
+`ImProcCoordinator` keeps two snapshots of the last completed full-frame pass:
+
+- the parameter fingerprints, taken **before** the nodes run, because the pass
+  normalises white balance and similar deterministic values in place, while the
+  GUI keeps the un-normalised values;
+- the `RenderStateKey`, rebuilt **after** the nodes run, because its high-detail
+  fields record the work the pass completed.
+
+`previewDirtyBlocks()` merges the two differences, adds the folded `analysis`
+node and records one residual input that `RenderStateKey` cannot carry yet: a
+pending spot buffer that the next `raw.base` restores. The request kind is the
+second such input: `M_HIGHQUAL`, `M_INIT`, `M_LINDENOISE` and `M_HDR` are
+request-level bits the render state has no field for, so the coordinator maps
+them to `HighQuality` and `FullPreview` and the state adapter treats an
+absolute request as a whole-path rebuild. An ordinary pass is `ParamsOnly`.
+The snapshots are dropped on `assign()`, `freeAll()`, `stopProcessing()` and the
+input-ICC reference path, so the next pass is all-dirty whenever the buffers
+they describe are gone. A pass that does not take the full-frame path (the
+viewport fast path, a deferred analysis flush, an aborted request) does not
+update them.
+
+The plan is rejected, and the unchanged legacy sequence runs, when the
+derivation is invalid, names a block outside the preview inventory, or the
+graph would skip a dirty node.
+
+Controls:
+
+```text
+RT_PREVIEW_DIRTY=mask          event-mask authority (the previous tranche)
+RT_PREVIEW_DIRTY=<other/unset> fingerprint and render-state authority (default)
+RT_PREVIEW_DIRTY_SHADOW=0      disable the shadow comparison (default on)
+```
+
+### Shadow equivalence
+
+Every full-frame pass builds two plans from the same graph: one marked from the
+event-mask gates, one from the fingerprint and render-state derivation. The
+comparison is at the plan level, not the direct-set level, because the graph
+propagates dirtiness downstream: a direct difference that both plans resolve to
+the same executed nodes is not a difference in work. Only a node that one plan
+executes and the other skips is reported.
+
+```text
+preview-dirty: shadow active, fingerprint authority
+preview-dirty: mismatch #3 missing=[rgb.proc] extra=[] mask=0x1009f
+preview-dirty: detail mask=[...] fingerprint=[...] direct=[...]
+preview-dirty: over-approximation #7 extra=[analysis] mask=0x1f
+preview-dirty: detail mask=[...] fingerprint=[...] direct=[...]
+```
+
+`missing` is the dangerous direction and its count is the mismatch count: the
+mask plan executes a node the derivation leaves out, which could leave a stale
+frame. `extra` is the documented over-approximation: the derivation executes a
+node whose own mask gate declines the work inside it, so the pixels are
+unchanged and only the function call is spent. The detail line names both
+executed sets and the direct set the derivation produced. Logging is capped at
+500 differences per process; the counters keep running.
+
+### Dirty-block evidence
+
+`stage-dirty-blocks-test` is the specification test: identical parameters and
+identical render state produce no dirty block; every render-state group dirties
+exactly the blocks of the table above on each path; a crop rectangle change of
+the parameters dirties only `transform`, which is why the render state carries
+the rectangle; the closure adds every downstream consumer; the snapshot form
+equals the ProcParams form; every adapter returns the same execution set as
+`derive_dirty_blocks()`, including the resident sink; and every id returned is
+a canonical node of the path. The other stage tests (`stage-pipeline-test`,
+`stage-mask-map-test`, `stage-render-state-test`, `stage-param-map-test`) still
+pass.
+
+The latency and screenshot evidence of the first preview draft was measured
+against the standalone unit and is not carried over: the shared derivation is
+wider in three table rows, so those figures do not describe this code. This
+tranche measures the unified unit through the exact dump the pass produces.
+
+`RT_PREVIEW_GRAPH=0` (legacy sequence) and `RT_PREVIEW_GRAPH=1` (graph) run the
+same scripted session in an isolated settings and cache directory with
+`OMP_NUM_THREADS=1` and `RT_PREVIEW_DUMP=<dir>`. The session loads the 45.7 MP
+NEF in place (the raw file and the dumps stay outside the commit; the dumps
+live under the gitignored `build/test-scratch/`), applies one edit through the
+real `StagedImageProcessor` API, and the final `preview.tif`/`work.tif` pair of
+the two runs is compared with `magick compare -metric AE`.
+
+| Scenario | Edit | Second-pass todo | preview AE | work AE | Transition AE |
+| --- | --- | --- | --- | --- | --- |
+| initial fit | open the image | — (1 pass) | 0 | 0 | n/a |
+| exposure | `expcomp += 0.7` | 16415 (`AUTOEXP`) | 0 | 0 | 2 852 450 / 2 852 450 |
+| output profile | `icm.outputProfile` `RTv4_sRGB` -> `RTv4_Large` | 17024 (`M_MONITOR`) | 0 | 0 | 0 / 2 847 720 |
+| monitor profile | monitor profile `""` -> `RTv4_Large` | 16384 (`M_MONITOR`) | 0 | 0 | 2 847 760 / 0 |
+
+The transition column is the difference between the scenario dump and the
+initial-fit dump of the same authority (preview / work), so a non-zero value
+proves the edit exercised a real pass. The two profile rows also show the
+expected separation: an output profile reaches only `work.tif`, a monitor
+profile only `preview.tif`.
+
+Across the four graph runs the shadow log reports zero mismatches and two
+over-approximations. On the exposure pass (`mask=0x401f`) the derivation adds
+`raw.base`: the event mask leaves the base to the retinex sub-path, the block
+runs and its own gate declines the work. On the output-profile pass
+(`mask=0x4280`, which carries the injected `M_INIT | M_HDR` rebuild bits) it
+adds `source.select`, `raw.preprocess` and `raw.demosaic`: the request is
+absolute, so the derivation opens the raw core, and the raw nodes return
+immediately because their own gates see no source change. Both are the
+documented direction (`extra` is inert, `missing` would fail closed) and the
+pixels are identical.
+
+The crop harness found the one unsafe case during reconciliation. An earlier
+build labelled every full pass `FullPreview` and rebuilt only when the kind
+changed; its 100% preview passes then logged `missing=[raw.base]` with mask
+`0x1429f`, because the viewport fallback injects `M_INIT | M_HDR` without any
+ProcParams or render-state field moving. That is why the request kind is now
+built from the request-level mask bits and an absolute request rebuilds the
+path unconditionally. The final crop run logs no mismatch.
+
+The preview pass plan was not timed on this branch. The dump-parity runs show
+one extra inert block call on a single pass and identical plans elsewhere, so
+no latency change is claimed rather than assumed.
+
+Builds: `tools/build-rt.sh cpu -j 6 --ccache` and `tools/build-rt.sh opencl
+-j 6 --ccache` both complete with no warning in the changed translation units.
+`stage-dirty-blocks-test`, `stage-pipeline-test`, `stage-mask-map-test`,
+`stage-render-state-test` and `stage-param-map-test` pass in both build
+directories.
+
 ## Crop dirty blocks
 
 The crop graph no longer takes its dirty set from the `M_*` mask. `Crop`
 derives it from the previous and current per-block parameter fingerprints and
 from the crop `RenderStateKey`, and uses it to mark the canonical nodes dirty.
 The derivation itself lives in `rtengine/stage/stage_dirty_blocks.h/.cc` and
-is shared with the preview path; the rules and tables are in
-`devnotes/perf/STAGE_PIPELINE.md`.
+is the same unit the preview coordinator uses through the adapters above; the
+rules and tables are in `devnotes/perf/STAGE_PIPELINE.md`.
 
 `RT_CROP_DIRTY` selects the execution set:
 
@@ -566,6 +757,17 @@ incremental crop and a fresh render. `--bench=<n> [--bench-edit=crop]
 display and output-space images in all three tool configurations; the
 derivation is below the noise of a crop pass (`-0.9%` on a full-path exposure
 edit and `-1.7%` on a short crop-rectangle edit, both inside the 5% gate).
+
+Re-run on 2026-10-25 against the unified unit: same image,
+`OMP_NUM_THREADS=1`, `--stages --sequences`, preview graph enabled (the
+default). The harness reports `51 plans executed, 0 plan fallbacks`, `21
+comparisons, 21 equivalent, 0 missing blocks, 12 extra blocks, 0 fail-closed
+fallbacks` and `crop-stage-test: PASS`; every scenario is `AE=0` except the
+documented `SHARPENING` legacy limitation (`AE=1` on 23 235 bytes in both the
+candidate and the baseline fresh comparison). The same run's full-frame
+preview passes log 0 shadow mismatches and 12 over-approximations, all the raw
+core opened by an absolute request on a mask that carries the injected
+`M_INIT | M_HDR` rebuild bits.
 
 ## Persistent store
 
@@ -784,15 +986,20 @@ parity.
 
 ## Limitations
 
-- Preview, crop, thumbnail and export are graph-driven by default. Set
-  `RT_STAGE_GRAPH=0` or `RT_PREVIEW_GRAPH=0` for the legacy kill switch. No
-  graph path caches or reuses buffers yet. The preview executes 13 of its 14
-  canonical nodes (`analysis` folded into `raw.base`), the crop 13 of 15
+- Preview, crop, thumbnail and export are graph-driven only when
+  `RT_STAGE_GRAPH=1`/`RT_PREVIEW_GRAPH=1`; the legacy path is the default and
+  no graph path caches or reuses buffers yet. The preview executes 13 of its
+  14 canonical nodes (`analysis` folded into `raw.base`), the crop 13 of 15
   (`raw.preprocess`/`raw.demosaic` folded into `source.select`), the export
   all 20 and the thumbnail all 12.
 - The preview plan has no buffer cache behind it: a dirty node recomputes and
   a clean node is not executed at all, so a skipped node still relies on the
   state the previous pass left in the coordinator.
+- The preview dirty set has two residual inputs that `RenderStateKey` does not
+  carry yet. A pending spot buffer is added to `raw.base` explicitly, and a
+  Preview Demosaic Method preference change while the main preview is at 100%
+  can log one `missing all` shadow difference: the effective demosaic decision
+  did not change, and the next quality crossing rebuilds the base.
 - The crop dirty-block derivation replaces the mask as the source of block
   dirtiness, not as the source of work: the stage bodies keep their `todo`
   gates, so the derived set can only be trusted as a superset of the legacy
@@ -800,6 +1007,21 @@ parity.
   derivation also cannot express the raw reload as a parameter delta; the crop
   carries the reload bits as a rebuild request. Removing the bodies' gates and
   making the raw stage incremental are the next steps.
+- The preview adapters return the same execution set as the crop derivation,
+  which is wider than the first preview draft in three places: the preview
+  geometry row includes the crop rectangle, the high-detail row starts at
+  `source.select`, and the editor row covers the sharpening-mask toggle and the
+  FAST switches together. Each is over-approximation in the documented
+  direction; the shadow log measures the cost.
+- The GUI scenario coverage for the dirty-block change is partial. Initial fit,
+  exposure, monitor profile, output profile and image reload have dump pairs;
+  tone curve and crop geometry do not, because the xdotool harness could not
+  drive those panels reproducibly in both runs. Those two are covered by
+  `stage-dirty-blocks-test` and by the shadow log of the transitions that did
+  run, and are recorded as a harness gap rather than a PASS.
+- The shadow comparison hashes the preview parameters once per full-frame pass.
+  It is cheap (fourteen descriptors, a few kilobytes of member data) but it is
+  not free, and it is a development gate rather than a product feature.
 - Five export blocks are folded inside a neighbouring node rather than
   having an execution boundary of their own: the framing geometry (in
   `crop`), the Nearest output resize (in `output.convert`), the three

@@ -30,6 +30,8 @@
 #include "improcfun.h"
 #include "LUT.h"
 #include "rtengine.h"
+#include "stage/stage_dirty_blocks.h"
+#include "stage/stage_render_state.h"
 
 #include "rtgui/threadutils.h"
 
@@ -149,6 +151,21 @@ protected:
     // Experimental, default-off cache of the preview base image returned by
     // ImageSource::getImage(). One snapshot only; deep copies in and out.
     std::unique_ptr<PreviewBaseCache> previewBaseCache;
+
+    /*
+     * Input of the last completed full-frame preview pass, used to derive the
+     * stage graph's dirty blocks without the event mask (devnotes/perf/
+     * STAGE_RUNTIME.md). The parameter snapshot holds one fingerprint per
+     * canonical preview descriptor and is taken before the pass, because the
+     * pass normalises white balance and similar values in place. The render
+     * state is taken after the pass, because its high-detail fields record the
+     * work the pass completed. Both are invalidated whenever the buffers they
+     * describe are reallocated or the source is replaced.
+     */
+    stage::ParamSnapshot previewDirtyFingerprints;
+    stage::RenderStateKey previewDirtyState;
+    bool previewDirtyFingerprintsValid = false;
+    bool previewDirtyStateValid = false;
 
     // True while the initial rough preview is being rendered. Rough previews
     // must not populate the preview base cache.
@@ -335,6 +352,21 @@ protected:
     PreviewPassPlan planPreviewPass(PreviewPassState& pass);
     PreviewPassPlan legacyPreviewPassPlan();
     void executePreviewNode(const std::string& id, PreviewPassState& pass);
+
+    /*
+     * Dirty-block derivation for the graph scheduler.
+     *
+     * previewRenderState() snapshots the render state the pass is about to
+     * run with; previewDirtyBlocks() merges the parameter-fingerprint and
+     * render-state differences against the last completed full-frame pass.
+     * recordPreviewDirtyState() stores the input of the pass that just
+     * completed, and invalidatePreviewDirtyState() drops it when the buffers
+     * it describes are gone.
+     */
+    stage::RenderStateKey previewRenderState(const PreviewPassState& pass) const;
+    stage::DirtyBlocks previewDirtyBlocks(const PreviewPassState& pass) const;
+    void recordPreviewDirtyState(const PreviewPassState& pass);
+    void invalidatePreviewDirtyState();
 
     MyMutex mProcessing;
     const std::unique_ptr<ProcParams> params;  // used for the rendering, can be eventually tweaked
