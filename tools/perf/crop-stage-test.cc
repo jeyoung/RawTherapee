@@ -16,7 +16,7 @@
  */
 
 /*
- * Focused legacy-vs-graph parity harness for the crop/viewport stage graph.
+ * Focused crop/viewport stage-graph parity harness.
  *
  * For every viewport state (fit, 100%, zoomed and panned) it loads the image
  * twice, runs the full-frame preview once per copy and then the detailed crop,
@@ -377,48 +377,6 @@ struct Result {
     Pixels output;
 };
 
-/* Which dirty-block source the crop graph uses (RT_CROP_DIRTY). */
-enum class DirtyMode {
-    Legacy,
-    Shadow,
-    Fingerprint
-};
-
-const char* dirtyModeName(DirtyMode mode)
-{
-    switch (mode) {
-    case DirtyMode::Legacy:
-        return "legacy";
-    case DirtyMode::Shadow:
-        return "shadow";
-    case DirtyMode::Fingerprint:
-        return "fingerprint";
-    }
-    return "unknown";
-}
-
-bool parseDirtyMode(const std::string& text, DirtyMode& mode)
-{
-    if (text == "legacy") {
-        mode = DirtyMode::Legacy;
-        return true;
-    }
-    if (text == "shadow") {
-        mode = DirtyMode::Shadow;
-        return true;
-    }
-    if (text == "fingerprint") {
-        mode = DirtyMode::Fingerprint;
-        return true;
-    }
-    return false;
-}
-
-void selectDirtyMode(DirtyMode mode)
-{
-    g_setenv("RT_CROP_DIRTY", dirtyModeName(mode), TRUE);
-}
-
 void enableStageCoverage(rtengine::procparams::ProcParams& params, bool afterRgb,
                          bool ciecam)
 {
@@ -468,12 +426,9 @@ class Session
 public:
     Session(const std::string& file,
             const rtengine::procparams::ProcParams& params,
-            CropState state,
-            DirtyMode mode)
+            CropState state)
         : state_(state)
     {
-        selectDirtyMode(mode);
-
         int errorCode = 0;
         image_ = rtengine::InitialImage::load(Glib::ustring(file), true,
                                              &errorCode);
@@ -620,10 +575,9 @@ private:
 bool runCrop(const std::string& file,
              const rtengine::procparams::ProcParams& params,
              CropState state,
-             DirtyMode mode,
              Result& result)
 {
-    Session session(file, params, state, mode);
+    Session session(file, params, state);
     if (!session.ready()) {
         return false;
     }
@@ -693,8 +647,8 @@ bool compareState(CropState state, const Result& baseline,
  *
  * The masks are the real composites from refreshmap.h, not single bits: a
  * white-balance or demosaic edit carries M_INIT because the source has to be
- * reloaded, and a sharpening edit carries the whole Lab chain. Using the real
- * mask is what makes the shadow comparison meaningful.
+ * reloaded, and a sharpening edit carries the whole Lab chain. They exercise
+ * the per-block work inside the nodes; the graph plan no longer reads them.
  */
 struct EditScenario {
     const char* name;
@@ -768,42 +722,29 @@ Difference difference(const Result& a, const Result& b)
 /*
  * Reports one incremental comparison.
  *
- * `baseline` is the legacy incremental update, `candidate` the derived one and
- * `reference` a fresh render of the final state. Parity is the gate: the
- * candidate must match the current graph default exactly. The two fresh
- * columns are evidence: they show whether the incremental result converged,
- * and they attribute a stale result to the legacy path when the candidate
- * matches it.
+ * `candidate` is the incremental graph result and `reference` a fresh render
+ * of the final state. The two must match exactly; there is no legacy execution
+ * path to compare against.
  */
 bool reportSequence(const std::string& label, int todo,
-                    const Result& baseline, const Result& candidate,
-                    const Result& reference, const std::string& outDir)
+                    const Result& candidate, const Result& reference,
+                    const std::string& outDir)
 {
-    const Difference parity = difference(baseline, candidate);
-    const Difference legacyFresh = difference(baseline, reference);
-    const Difference derivedFresh = difference(candidate, reference);
+    const Difference fresh = difference(candidate, reference);
 
     const bool geometryDiffers =
-        baseline.display.width != candidate.display.width
-        || baseline.display.height != candidate.display.height
-        || baseline.output.width != candidate.output.width
-        || baseline.output.height != candidate.output.height;
+        candidate.display.width != reference.display.width
+        || candidate.display.height != reference.display.height
+        || candidate.output.width != reference.output.width
+        || candidate.output.height != reference.output.height;
 
-    const bool ok = parity.differingBytes == 0 && parity.maxDelta == 0
+    const bool ok = fresh.differingBytes == 0 && fresh.maxDelta == 0
                     && !geometryDiffers;
 
-    std::printf("%s seq %s: todo=0x%x parity AE=%d (%zu bytes), "
-                "fresh candidate AE=%d (%zu bytes), "
-                "fresh baseline AE=%d (%zu bytes)%s\n",
+    std::printf("%s seq %s: todo=0x%x fresh AE=%d (%zu bytes)\n",
                 ok ? "PASS" : "FAIL", label.c_str(), todo,
-                parity.maxDelta, parity.differingBytes, derivedFresh.maxDelta,
-                derivedFresh.differingBytes, legacyFresh.maxDelta,
-                legacyFresh.differingBytes,
-                legacyFresh.differingBytes == 0
-                    ? ""
-                    : " [legacy incremental is stale for this mask]");
+                fresh.maxDelta, fresh.differingBytes);
 
-    writePpm(outDir + "/seq-" + label + "-baseline.ppm", baseline.display);
     writePpm(outDir + "/seq-" + label + "-candidate.ppm", candidate.display);
     writePpm(outDir + "/seq-" + label + "-reference.ppm", reference.display);
     return ok;
@@ -812,21 +753,12 @@ bool reportSequence(const std::string& label, int todo,
 bool runSequence(const std::string& file,
                  const rtengine::procparams::ProcParams& params,
                  const EditScenario& scenario,
-                 DirtyMode mode,
                  const std::string& outDir)
 {
     rtengine::procparams::ProcParams changed = params;
     scenario.mutate(changed);
 
-    Session baseline(file, params, CropState::Full, DirtyMode::Legacy);
-    if (!baseline.ready() || !baseline.apply(changed, scenario.todo)) {
-        std::fprintf(stderr, "FAIL seq %s: the baseline session failed\n",
-                     scenario.name);
-        return false;
-    }
-    const Result incrementalLegacy = baseline.result();
-
-    Session candidate(file, params, CropState::Full, mode);
+    Session candidate(file, params, CropState::Full);
     if (!candidate.ready() || !candidate.apply(changed, scenario.todo)) {
         std::fprintf(stderr, "FAIL seq %s: the candidate session failed\n",
                      scenario.name);
@@ -835,15 +767,14 @@ bool runSequence(const std::string& file,
     const Result incrementalDerived = candidate.result();
 
     Result reference;
-    if (!runCrop(file, changed, CropState::Full, DirtyMode::Legacy,
-                 reference)) {
+    if (!runCrop(file, changed, CropState::Full, reference)) {
         std::fprintf(stderr, "FAIL seq %s: the reference session failed\n",
                      scenario.name);
         return false;
     }
 
-    return reportSequence(scenario.name, scenario.todo, incrementalLegacy,
-                          incrementalDerived, reference, outDir);
+    return reportSequence(scenario.name, scenario.todo, incrementalDerived,
+                          reference, outDir);
 }
 
 /*
@@ -854,16 +785,9 @@ bool runSequence(const std::string& file,
  */
 bool runGeometrySequence(const std::string& file,
                          const rtengine::procparams::ProcParams& params,
-                         DirtyMode mode, const std::string& outDir)
+                         const std::string& outDir)
 {
-    Session baseline(file, params, CropState::Full, DirtyMode::Legacy);
-    if (!baseline.ready() || !baseline.refresh(CropState::Zoomed)) {
-        std::fprintf(stderr, "FAIL seq geometry: the baseline session failed\n");
-        return false;
-    }
-    const Result incrementalLegacy = baseline.result();
-
-    Session candidate(file, params, CropState::Full, mode);
+    Session candidate(file, params, CropState::Full);
     if (!candidate.ready() || !candidate.refresh(CropState::Zoomed)) {
         std::fprintf(stderr,
                      "FAIL seq geometry: the candidate session failed\n");
@@ -872,15 +796,14 @@ bool runGeometrySequence(const std::string& file,
     const Result incrementalDerived = candidate.result();
 
     Result reference;
-    if (!runCrop(file, params, CropState::Zoomed, DirtyMode::Legacy,
-                 reference)) {
+    if (!runCrop(file, params, CropState::Zoomed, reference)) {
         std::fprintf(stderr,
                      "FAIL seq geometry: the reference session failed\n");
         return false;
     }
 
-    return reportSequence("geometry", 0, incrementalLegacy, incrementalDerived,
-                          reference, outDir);
+    return reportSequence("geometry", 0, incrementalDerived, reference,
+                          outDir);
 }
 
 /*
@@ -894,9 +817,9 @@ bool runGeometrySequence(const std::string& file,
  */
 bool runBenchmark(const std::string& file,
                   const rtengine::procparams::ProcParams& params,
-                  DirtyMode mode, int count, const std::string& edit)
+                  int count, const std::string& edit)
 {
-    Session session(file, params, CropState::Full, mode);
+    Session session(file, params, CropState::Full);
     if (!session.ready()) {
         std::fprintf(stderr, "FAIL bench: the session failed\n");
         return false;
@@ -934,9 +857,9 @@ bool runBenchmark(const std::string& file,
     const double mean = total / static_cast<double>(timings.size());
     const double median = timings[timings.size() / 2];
 
-    std::printf("bench %s edit=%s: %d updates, mean %.1f ms, median %.1f ms, "
+    std::printf("bench edit=%s: %d updates, mean %.1f ms, median %.1f ms, "
                 "min %.1f ms, max %.1f ms\n",
-                dirtyModeName(mode), edit.c_str(), count, mean, median,
+                edit.c_str(), count, mean, median,
                 timings.front(), timings.back());
     return true;
 }
@@ -949,8 +872,7 @@ int main(int argc, char** argv)
         std::fprintf(stderr,
                      "usage: %s <raw> [pp3] [out-dir] [--stages] [--sequences] "
                      "[--only=<scenario>] [--bench=<n>] [--bench-edit=crop] "
-                     "[--dirty=legacy|shadow|fingerprint] [--out=<dir>] "
-                     "[--cbdl=aft] [--no-ciecam]\n",
+                     "[--out=<dir>] [--cbdl=aft] [--no-ciecam]\n",
                      argv[0]);
         return 2;
     }
@@ -965,7 +887,6 @@ int main(int argc, char** argv)
     std::string onlyScenario;
     int benchCount = 0;
     std::string benchEdit = "exposure";
-    DirtyMode dirtyMode = DirtyMode::Fingerprint;
 
     for (int i = 2; i < argc; ++i) {
         const std::string argument = argv[i];
@@ -993,13 +914,6 @@ int main(int argc, char** argv)
                 return 2;
             }
             sequences = true;
-        } else if (argument.rfind("--dirty=", 0) == 0) {
-            const std::string value = argument.substr(8);
-            if (!parseDirtyMode(value, dirtyMode)) {
-                std::fprintf(stderr, "unknown dirty mode: %s\n",
-                             value.c_str());
-                return 2;
-            }
         } else if (argument.rfind("--out=", 0) == 0) {
             outDir = argument.substr(6);
         } else if (argument.rfind("--", 0) == 0) {
@@ -1019,8 +933,7 @@ int main(int argc, char** argv)
 
     // Keep the run self-contained: no settings, cache or preview-base files
     // outside the output directory, and no persistent preview base reuse
-    // between the legacy and graph passes. The engine requires RT_SETTINGS
-    // to be absolute.
+    // between passes. The engine requires RT_SETTINGS to be absolute.
     {
         std::error_code error;
         const std::filesystem::path absolute =
@@ -1055,22 +968,15 @@ int main(int argc, char** argv)
     const CropState states[] = {CropState::Fit, CropState::Full, CropState::Zoomed};
     bool ok = true;
 
-    std::printf("candidate dirty mode: %s\n", dirtyModeName(dirtyMode));
-
     if (benchCount > 0) {
         const bool benchOk =
-            runBenchmark(file, params, dirtyMode, benchCount, benchEdit);
+            runBenchmark(file, params, benchCount, benchEdit);
         std::printf("crop-stage-test: %s\n", benchOk ? "PASS" : "FAIL");
         return benchOk ? 0 : 1;
     }
 
-    const unsigned dirtyChecksBefore = rtengine::crop_graph::dirtyChecks();
-    const unsigned dirtyEquivalentBefore =
-        rtengine::crop_graph::dirtyEquivalent();
-    const unsigned dirtyMissingBefore = rtengine::crop_graph::dirtyMissing();
-    const unsigned dirtyExtraBefore = rtengine::crop_graph::dirtyExtra();
-    const unsigned dirtyFallbacksBefore =
-        rtengine::crop_graph::dirtyFallbacks();
+    const unsigned dirtyDerivationsBefore =
+        rtengine::crop_graph::dirtyDerivations();
 
     for (CropState state : states) {
         Result baseline;
@@ -1080,8 +986,8 @@ int main(int argc, char** argv)
             continue;
         }
 
-        if (!runCrop(file, params, state, DirtyMode::Legacy, baseline)
-                || !runCrop(file, params, state, dirtyMode, candidate)) {
+        if (!runCrop(file, params, state, baseline)
+                || !runCrop(file, params, state, candidate)) {
             return 2;
         }
 
@@ -1095,44 +1001,28 @@ int main(int argc, char** argv)
      */
     if (sequences) {
         if (onlyScenario.empty() || onlyScenario == "geometry") {
-            ok = runGeometrySequence(file, params, dirtyMode, outDir) && ok;
+            ok = runGeometrySequence(file, params, outDir) && ok;
         }
         for (const EditScenario& scenario : editScenarios()) {
             if (!onlyScenario.empty() && onlyScenario != scenario.name) {
                 continue;
             }
-            ok = runSequence(file, params, scenario, dirtyMode, outDir) && ok;
+            ok = runSequence(file, params, scenario, outDir) && ok;
         }
     }
 
-    g_unsetenv("RT_CROP_DIRTY");
-
     // Parity is only evidence when the graph actually ran: a rejected plan
-    // falls back to the legacy sequence and would compare legacy with itself.
+    // aborts the process.
     const unsigned graphRuns = rtengine::crop_graph::runs();
     const unsigned graphFallbacks = rtengine::crop_graph::fallbacks();
-    std::printf("crop graph: %u plans executed, %u plan fallbacks\n",
-                graphRuns, graphFallbacks);
-    if (graphRuns == 0 || graphFallbacks != 0) {
+    const unsigned dirtyDerivations =
+        rtengine::crop_graph::dirtyDerivations() - dirtyDerivationsBefore;
+    std::printf("crop graph: %u plans executed, %u plan fallbacks, "
+                "%u dirty derivations\n",
+                graphRuns, graphFallbacks, dirtyDerivations);
+    if (graphRuns == 0 || graphFallbacks != 0 || dirtyDerivations == 0) {
         std::fprintf(stderr,
-                     "FAIL: the crop graph did not execute every update\n");
-        ok = false;
-    }
-
-    const unsigned dirtyChecks =
-        rtengine::crop_graph::dirtyChecks() - dirtyChecksBefore;
-    const unsigned dirtyFallbacks =
-        rtengine::crop_graph::dirtyFallbacks() - dirtyFallbacksBefore;
-    std::printf("crop dirty: %u comparisons, %u equivalent, %u missing blocks, "
-                "%u extra blocks, %u fail-closed fallbacks\n",
-                dirtyChecks,
-                rtengine::crop_graph::dirtyEquivalent() - dirtyEquivalentBefore,
-                rtengine::crop_graph::dirtyMissing() - dirtyMissingBefore,
-                rtengine::crop_graph::dirtyExtra() - dirtyExtraBefore,
-                dirtyFallbacks);
-    if (dirtyMode != DirtyMode::Legacy && dirtyChecks == 0) {
-        std::fprintf(stderr,
-                     "FAIL: the dirty-block derivation did not run\n");
+                     "FAIL: the crop graph or dirty derivation did not run\n");
         ok = false;
     }
 

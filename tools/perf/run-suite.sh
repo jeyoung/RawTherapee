@@ -15,9 +15,10 @@
 # embedded-JPEG and raw-fallback thumbnails between two runs of the thumbnail
 # stage graph.
 # --crop-graph builds crop-stage-test and requires byte-identical detailed crop
-# images for fit, 100% and zoomed/panned viewports between the mask-derived
-# dirty set and the derived dirty set on the crop stage graph, then repeats the
-# check with the Lab, CIE CAM, gamut and local-adjustment blocks enabled.
+# images for fit, 100% and zoomed/panned viewports on the crop stage graph, then
+# repeats the check with the Lab, CIE CAM, gamut and local-adjustment blocks
+# enabled. Incremental scenarios compare the derived dirty set with a fresh
+# render of the final state.
 # --denoise-pp3 adds a thread-determinism matrix for a profile that enables
 # directional-pyramid denoising (see devnotes/perf/DETERMINISM.md).
 
@@ -218,20 +219,18 @@ if [ "$crop_graph_parity" -eq 1 ]; then
     fi
 
     # Incremental dirty-block scenarios: one parameter or render-state change
-    # inside a live session, compared with the legacy graph default and with a
-    # fresh render of the final state. This is the shadow-equivalence gate for
-    # the crop path.
+    # inside a live session, compared with a fresh render of the final state.
     log="$report/crop-dirty-test.log"
     if OMP_NUM_THREADS=1 "$build_dir/rtengine/crop-stage-test" \
             "${crop_args[@]}" --sequences >"$log" 2>&1; then
         if grep -q "crop-stage-test: PASS" "$log" \
-                && grep -Eq "crop dirty: [1-9][0-9]* comparisons" "$log"; then
-            pass "crop dirty shadow (geometry, wb, demosaic, transform, local, sharpening, ciecam, crop)"
+                && grep -Eq "crop graph: .*[1-9][0-9]* dirty derivations" "$log"; then
+            pass "crop dirty derivation (geometry, wb, demosaic, transform, local, sharpening, ciecam, crop)"
         else
-            fail "crop dirty shadow (see $log)"
+            fail "crop dirty derivation (see $log)"
         fi
     else
-        fail "crop dirty shadow (see $log)"
+        fail "crop dirty derivation (see $log)"
     fi
 
     stages_dir="$report/crop-stages"

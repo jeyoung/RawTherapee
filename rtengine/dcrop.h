@@ -133,26 +133,12 @@ public:
  * whose plan was accepted and executed; fallbacks() counts the calls whose plan
  * was rejected, which now aborts the process and is therefore always zero in a
  * passing run. Both are process-wide and monotonic.
- *
- * The dirty-block counters belong to the same instrumentation:
- *
- * - dirtyChecks() counts the updates on which the fingerprint/state set was
- *   compared with the legacy mask-derived set;
- * - dirtyEquivalent() counts the comparisons with no missing block;
- * - dirtyMissing() and dirtyExtra() sum the per-comparison block counts of the
- *   two mismatch classes;
- * - dirtyFallbacks() counts the updates that executed the legacy set because
- *   the derived set would have skipped a block.
  */
 namespace crop_graph
 {
 unsigned runs();
 unsigned fallbacks();
-unsigned dirtyChecks();
-unsigned dirtyEquivalent();
-unsigned dirtyMissing();
-unsigned dirtyExtra();
-unsigned dirtyFallbacks();
+unsigned dirtyDerivations();
 } // namespace crop_graph
 
 }
