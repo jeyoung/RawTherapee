@@ -21,6 +21,7 @@
 #include <cassert>
 #include <clocale>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <initializer_list>
 #include <memory>
@@ -273,20 +274,6 @@ void scale_colors (rtengine::RawImage *ri, float scale_mul[4], float cblack[4], 
 namespace
 {
 
-/*
- * Switch for the graph-driven thumbnail path (RT_STAGE_GRAPH).
- *
- * The graph is the default; set RT_STAGE_GRAPH=0 or off for the legacy
- * sequence. The value is read per call so a harness can compare both paths.
- */
-bool thumbnailGraphEnabled()
-{
-    const char* value = g_getenv("RT_STAGE_GRAPH");
-    return value == nullptr || value[0] == '\0'
-        || (g_ascii_strcasecmp(value, "0") != 0
-            && g_ascii_strcasecmp(value, "off") != 0);
-}
-
 struct ThumbnailGraphPlan {
     bool valid = false;
     std::string reason;
@@ -297,14 +284,14 @@ struct ThumbnailGraphPlan {
 
 /*
  * Build the canonical thumbnail spec, connect it into a StageGraph and ask
- * StageGraph::plan() which nodes this invocation may run. The nodes the
- * legacy code executes for this invocation are marked dirty; every other
- * canonical node is clean because its data is either already held by the
- * Thumbnail (thumbImg) or belongs to a branch this invocation does not take.
+ * StageGraph::plan() which nodes this invocation may run. The nodes this
+ * invocation executes are marked dirty; every other canonical node is clean
+ * because its data is either already held by the Thumbnail (thumbImg) or
+ * belongs to a branch this invocation does not take.
  *
- * A plan is rejected, and the caller falls back to the unchanged legacy
- * sequence, when an active node would be skipped: that is the only way the
- * graph could change the result.
+ * A plan is rejected, and the caller aborts, when an active node would be
+ * skipped: that is the only way the graph could change the result, and the
+ * graph is the only sequence left.
  */
 ThumbnailGraphPlan planThumbnailGraph(
     std::initializer_list<const char*> active)
@@ -389,7 +376,25 @@ ThumbnailGraphPlan planThumbnailGraph(
     return result;
 }
 
-/* One diagnostic line per entry point and outcome, so a log stays readable. */
+/*
+ * Report a rejected thumbnail plan, and stop.
+ *
+ * The graph is the only thumbnail sequence, so a plan the executor cannot run
+ * is a programming error. Aborting keeps it visible instead of caching a
+ * partly processed thumbnail.
+ */
+[[noreturn]] void abortThumbnailGraph(const char* entry,
+                                      const std::string& reason)
+{
+    std::fprintf(stderr, "thumbnail-graph: %s: fatal: plan rejected: %s\n",
+                 entry, reason.c_str());
+    std::fprintf(stderr,
+                 "thumbnail-graph: the graph is the only thumbnail sequence, "
+                 "so there is nothing to fall back to\n");
+    std::abort();
+}
+
+/* One diagnostic line per entry point, so a log stays readable. */
 void logThumbnailGraph(const char* entry, const ThumbnailGraphPlan& plan)
 {
     static std::mutex mutex;
@@ -398,15 +403,8 @@ void logThumbnailGraph(const char* entry, const ThumbnailGraphPlan& plan)
     std::lock_guard<std::mutex> lock(mutex);
 
     std::string key(entry);
-    key += plan.valid ? ":active" : ":fallback:" + plan.reason;
+    key += ":active";
     if (!logged.insert(key).second) {
-        return;
-    }
-
-    if (!plan.valid) {
-        std::fprintf(stderr,
-                     "thumbnail-graph: %s: fallback to legacy: plan would skip %s\n",
-                     entry, plan.reason.c_str());
         return;
     }
 
@@ -755,28 +753,29 @@ Thumbnail* Thumbnail::loadQuickFromRaw (const Glib::ustring& fname, eSensorType 
      * full-resolution raw conversion. Both are outside the reduced-domain
      * graph, so only normal thumbnails take the graph path.
      */
-    if (!inspectorMode && thumbnailGraphEnabled()) {
+    if (!inspectorMode) {
         const ThumbnailGraphPlan plan = planThumbnailGraph(
             {"source.embedded", "thumbnail.decode"});
+        if (!plan.valid) {
+            abortThumbnailGraph("loadQuickFromRaw", plan.reason);
+        }
         logThumbnailGraph("loadQuickFromRaw", plan);
 
-        if (plan.valid) {
-            for (const auto& id : plan.execute) {
-                if (id == "source.embedded") {
-                    if (!stageSourceEmbedded(state)) {
-                        delete state.tpp;
-                        return nullptr;
-                    }
-                } else if (id == "thumbnail.decode") {
-                    stageThumbnailDecode(state);
-                } else {
-                    assert(false);
+        for (const auto& id : plan.execute) {
+            if (id == "source.embedded") {
+                if (!stageSourceEmbedded(state)) {
                     delete state.tpp;
                     return nullptr;
                 }
+            } else if (id == "thumbnail.decode") {
+                stageThumbnailDecode(state);
+            } else {
+                assert(false);
+                delete state.tpp;
+                return nullptr;
             }
-            return state.tpp;
         }
+        return state.tpp;
     }
 
     if (!stageSourceEmbedded(state)) {
@@ -784,7 +783,11 @@ Thumbnail* Thumbnail::loadQuickFromRaw (const Glib::ustring& fname, eSensorType 
         return nullptr;
     }
 
-    if (inspectorMode) {
+    /*
+     * Inspector mode only: non-inspector requests returned through the graph
+     * above.
+     */
+    {
         RawImage*& ri = state.ri;
         Image8*& img = state.img;
         int& w = *state.w;
@@ -840,9 +843,6 @@ Thumbnail* Thumbnail::loadQuickFromRaw (const Glib::ustring& fname, eSensorType 
 
         return tpp;
     }
-
-    stageThumbnailDecode(state);
-    return tpp;
 }
 
 
@@ -1470,42 +1470,29 @@ Thumbnail* Thumbnail::loadFromRaw (const Glib::ustring& fname, eSensorType &sens
     state.rawParams = rawParams;
     state.forHistogramMatching = forHistogramMatching;
 
-    bool executed = false;
-
-    if (thumbnailGraphEnabled()) {
-        const ThumbnailGraphPlan plan = planThumbnailGraph(
-            {"source.select", "raw.preprocess", "raw.demosaic", "raw.base"});
-        logThumbnailGraph("loadFromRaw", plan);
-
-        if (plan.valid) {
-            for (const auto& id : plan.execute) {
-                if (id == "source.select") {
-                    if (!stageSourceSelect(state)) {
-                        return nullptr;
-                    }
-                } else if (id == "raw.preprocess") {
-                    stageRawPreprocess(state);
-                } else if (id == "raw.demosaic") {
-                    stageRawDemosaic(state);
-                } else if (id == "raw.base") {
-                    stageRawBase(state);
-                } else {
-                    assert(false);
-                    delete state.tpp;
-                    return nullptr;
-                }
-            }
-            executed = true;
-        }
+    const ThumbnailGraphPlan plan = planThumbnailGraph(
+        {"source.select", "raw.preprocess", "raw.demosaic", "raw.base"});
+    if (!plan.valid) {
+        abortThumbnailGraph("loadFromRaw", plan.reason);
     }
+    logThumbnailGraph("loadFromRaw", plan);
 
-    if (!executed) {
-        if (!stageSourceSelect(state)) {
+    for (const auto& id : plan.execute) {
+        if (id == "source.select") {
+            if (!stageSourceSelect(state)) {
+                return nullptr;
+            }
+        } else if (id == "raw.preprocess") {
+            stageRawPreprocess(state);
+        } else if (id == "raw.demosaic") {
+            stageRawDemosaic(state);
+        } else if (id == "raw.base") {
+            stageRawBase(state);
+        } else {
+            assert(false);
+            delete state.tpp;
             return nullptr;
         }
-        stageRawPreprocess(state);
-        stageRawDemosaic(state);
-        stageRawBase(state);
     }
 
     return state.tpp;
@@ -1646,31 +1633,22 @@ IImage8* Thumbnail::quickProcessImage (const procparams::ProcParams& params, int
     state.rheight = rheight;
     state.interp = interp;
 
-    bool executed = false;
-
-    if (thumbnailGraphEnabled()) {
-        const ThumbnailGraphPlan plan = planThumbnailGraph(
-            {"thumbnail.scale", "thumbnail.transform"});
-        logThumbnailGraph("quickProcessImage", plan);
-
-        if (plan.valid) {
-            for (const auto& id : plan.execute) {
-                if (id == "thumbnail.scale") {
-                    stageQuickScale(state);
-                } else if (id == "thumbnail.transform") {
-                    stageQuickTransform(state);
-                } else {
-                    assert(false);
-                    return nullptr;
-                }
-            }
-            executed = true;
-        }
+    const ThumbnailGraphPlan plan = planThumbnailGraph(
+        {"thumbnail.scale", "thumbnail.transform"});
+    if (!plan.valid) {
+        abortThumbnailGraph("quickProcessImage", plan.reason);
     }
+    logThumbnailGraph("quickProcessImage", plan);
 
-    if (!executed) {
-        stageQuickScale(state);
-        stageQuickTransform(state);
+    for (const auto& id : plan.execute) {
+        if (id == "thumbnail.scale") {
+            stageQuickScale(state);
+        } else if (id == "thumbnail.transform") {
+            stageQuickTransform(state);
+        } else {
+            assert(false);
+            return nullptr;
+        }
     }
 
     return state.img;
@@ -2826,44 +2804,31 @@ IImage8* Thumbnail::processImage (const procparams::ProcParams& params, eSensorT
     state.iso = metadata->getISOSpeed();
     state.fcomp = metadata->getExpComp();
 
-    bool executed = false;
-
-    if (thumbnailGraphEnabled()) {
-        const ThumbnailGraphPlan plan = planThumbnailGraph(
-            {"thumbnail.scale", "thumbnail.transform", "thumbnail.whitebalance",
-             "thumbnail.rgb", "thumbnail.lab", "thumbnail.output"});
-        logThumbnailGraph("processImage", plan);
-
-        if (plan.valid) {
-            for (const auto& id : plan.execute) {
-                if (id == "thumbnail.scale") {
-                    stageScale(state);
-                } else if (id == "thumbnail.transform") {
-                    stageTransform(state);
-                } else if (id == "thumbnail.whitebalance") {
-                    stageWhiteBalance(state);
-                } else if (id == "thumbnail.rgb") {
-                    stageRgb(state);
-                } else if (id == "thumbnail.lab") {
-                    stageLab(state);
-                } else if (id == "thumbnail.output") {
-                    state.readyImg = stageOutput(state);
-                } else {
-                    assert(false);
-                    return nullptr;
-                }
-            }
-            executed = true;
-        }
+    const ThumbnailGraphPlan plan = planThumbnailGraph(
+        {"thumbnail.scale", "thumbnail.transform", "thumbnail.whitebalance",
+         "thumbnail.rgb", "thumbnail.lab", "thumbnail.output"});
+    if (!plan.valid) {
+        abortThumbnailGraph("processImage", plan.reason);
     }
+    logThumbnailGraph("processImage", plan);
 
-    if (!executed) {
-        stageScale(state);
-        stageTransform(state);
-        stageWhiteBalance(state);
-        stageRgb(state);
-        stageLab(state);
-        state.readyImg = stageOutput(state);
+    for (const auto& id : plan.execute) {
+        if (id == "thumbnail.scale") {
+            stageScale(state);
+        } else if (id == "thumbnail.transform") {
+            stageTransform(state);
+        } else if (id == "thumbnail.whitebalance") {
+            stageWhiteBalance(state);
+        } else if (id == "thumbnail.rgb") {
+            stageRgb(state);
+        } else if (id == "thumbnail.lab") {
+            stageLab(state);
+        } else if (id == "thumbnail.output") {
+            state.readyImg = stageOutput(state);
+        } else {
+            assert(false);
+            return nullptr;
+        }
     }
 
     return state.readyImg;

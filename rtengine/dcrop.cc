@@ -22,6 +22,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdio>
+#include <cstdlib>
 #include <iterator>
 #include <memory>
 #include <mutex>
@@ -260,20 +261,6 @@ namespace
 {
 
 /*
- * Switch for the graph-driven crop path (RT_STAGE_GRAPH).
- *
- * The graph is the default; set RT_STAGE_GRAPH=0 or off for the legacy
- * sequence. The value is read per call so a harness can compare both paths.
- */
-bool cropGraphEnabled()
-{
-    const char* value = g_getenv("RT_STAGE_GRAPH");
-    return value == nullptr || value[0] == '\0'
-        || (g_ascii_strcasecmp(value, "0") != 0
-            && g_ascii_strcasecmp(value, "off") != 0);
-}
-
-/*
  * How the crop graph obtains its dirty block set (RT_CROP_DIRTY).
  *
  * - `legacy` executes the set the mask-derived gates have always produced and
@@ -285,7 +272,9 @@ bool cropGraphEnabled()
  *   update fails closed to the legacy set and the event is counted.
  *
  * The mask still drives GUI notification and coalescing in all three modes; it
- * just stops being the only source of block dirtiness.
+ * just stops being the only source of block dirtiness. The modes choose the
+ * dirty set only: every mode executes through the graph, which is the only
+ * crop sequence.
  */
 enum class CropDirtyMode {
     Legacy,
@@ -454,9 +443,9 @@ struct CropGraphPlan {
  *
  * `dirtyIds` is the execution set in canonical ids and must contain every
  * block in `runs`: the crop always runs what the execution list names. A plan
- * is rejected, and the caller runs the unchanged legacy sequence, when a block
- * the execution list names would be skipped (ReuseOutput): that is the only
- * way the graph could change the result.
+ * is rejected, and the caller aborts, when a block the execution list names
+ * would be skipped (ReuseOutput): that is the only way the graph could change
+ * the result, and there is no second sequence to run.
  */
 CropGraphPlan planCropGraph(const std::vector<std::string>& dirtyIds,
                             const bool runs[CROP_STAGE_COUNT])
@@ -569,25 +558,17 @@ CropGraphPlan planCropGraph(const std::vector<std::string>& dirtyIds,
     return result;
 }
 
-/* One diagnostic line per outcome, so a log stays readable. */
+/* One diagnostic line per process, so a log stays readable. */
 void logCropGraph(const CropGraphPlan& plan)
 {
     static std::mutex mutex;
-    static std::set<std::string> logged;
+    static bool logged = false;
 
     std::lock_guard<std::mutex> lock(mutex);
-
-    const std::string key = plan.valid ? "active" : "fallback:" + plan.reason;
-    if (!logged.insert(key).second) {
+    if (logged) {
         return;
     }
-
-    if (!plan.valid) {
-        std::fprintf(stderr,
-                     "crop-graph: fallback to legacy: plan would skip %s\n",
-                     plan.reason.c_str());
-        return;
-    }
+    logged = true;
 
     std::fprintf(stderr,
                  "crop-graph: active, %zu canonical nodes executed, %zu "
@@ -602,7 +583,29 @@ void logCropGraph(const CropGraphPlan& plan)
     std::fprintf(stderr, "\n");
 }
 
+/*
+ * Report a rejected crop plan, and stop.
+ *
+ * The graph is the only crop sequence, so a plan that would skip a scheduled
+ * block is a programming error: aborting keeps it visible instead of
+ * publishing a partly processed viewport.
+ */
+[[noreturn]] void abortCropGraph(const CropGraphPlan& plan)
+{
+    std::fprintf(stderr, "crop-graph: fatal: plan rejected: %s\n",
+                 plan.reason.c_str());
+    std::fprintf(stderr,
+                 "crop-graph: the graph is the only crop sequence, so there is "
+                 "nothing to fall back to\n");
+    std::abort();
+}
+
 std::atomic<unsigned> cropGraphRuns{0};
+/*
+ * Rejected plans. A rejection now aborts the process, so a passing run always
+ * reads zero; the counter and its accessor remain for the crop harness, which
+ * fails the gate if either the graph did not run or a plan was rejected.
+ */
 std::atomic<unsigned> cropGraphFallbacks{0};
 
 std::atomic<unsigned> cropDirtyChecks{0};
@@ -854,7 +857,7 @@ void Crop::update(int todo)
     };
 
     const CropDirtyMode dirtyMode = cropDirtyMode();
-    if (dirtyMode != CropDirtyMode::Legacy && cropGraphEnabled()) {
+    if (dirtyMode != CropDirtyMode::Legacy) {
         /*
          * The derivation reads the parameters before any stage body can touch
          * them, and the render state the crop itself owns. The fingerprint
@@ -976,27 +979,16 @@ void Crop::update(int todo)
         }
     };
 
-    bool planned = false;
-
-    if (cropGraphEnabled()) {
-        const CropGraphPlan plan = planCropGraph(graphDirty, runs);
-        logCropGraph(plan);
-
-        if (plan.valid) {
-            ++cropGraphRuns;
-            planned = true;
-            for (CropStage stage : plan.execute) {
-                runStage(stage);
-            }
-        } else {
-            ++cropGraphFallbacks;
-        }
+    const CropGraphPlan plan = planCropGraph(graphDirty, runs);
+    if (!plan.valid) {
+        ++cropGraphFallbacks;
+        abortCropGraph(plan);
     }
+    logCropGraph(plan);
 
-    if (!planned) {
-        for (int stage = 0; stage < CROP_STAGE_COUNT; ++stage) {
-            runStage(static_cast<CropStage>(stage));
-        }
+    ++cropGraphRuns;
+    for (CropStage stage : plan.execute) {
+        runStage(stage);
     }
 
     if (cropImageListener) {

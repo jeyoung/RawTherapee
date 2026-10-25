@@ -84,9 +84,8 @@ protected:
     void freeAll();
 
     /*
-     * The crop pipeline as ordered blocks. The legacy sequence calls every
-     * block in this order and the opt-in stage graph (RT_STAGE_GRAPH) calls
-     * the same blocks according to its plan, so the two share one
+     * The crop pipeline as ordered blocks. The stage graph executes these
+     * blocks according to its plan, so the plan and the block bodies share one
      * implementation. See devnotes/perf/STAGE_RUNTIME.md.
      */
     void stageSourceSelect(CropStageContext& ctx);
@@ -130,10 +129,10 @@ public:
 };
 
 /*
- * Diagnostics for the opt-in crop stage graph (RT_STAGE_GRAPH). runs() counts
- * the Crop::update() calls whose plan was accepted and executed; fallbacks()
- * counts the calls that fell back to the unchanged legacy sequence. Both are
- * process-wide and monotonic.
+ * Diagnostics for the crop stage graph. runs() counts the Crop::update() calls
+ * whose plan was accepted and executed; fallbacks() counts the calls whose plan
+ * was rejected, which now aborts the process and is therefore always zero in a
+ * passing run. Both are process-wide and monotonic.
  *
  * The dirty-block counters belong to the same instrumentation:
  *

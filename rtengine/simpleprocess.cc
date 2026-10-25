@@ -20,6 +20,8 @@
 #include <glibmm/thread.h>
 #include <glibmm/ustring.h>
 
+#include <cstdlib>
+
 #include "cieimage.h"
 #include "clutstore.h"
 #include "color.h"
@@ -121,24 +123,9 @@ void rgbToLabRegion(const Imagefloat& src, LabImage& dst, int x, int y,
 }
 
 /*
- * Switch for the graph-driven export path. The graph is the default; set
- * RT_STAGE_GRAPH=0 or off to use the legacy sequence.
- */
-bool stageGraphEnabled()
-{
-    static const bool enabled = []() {
-        const char* value = g_getenv("RT_STAGE_GRAPH");
-        return value == nullptr || value[0] == '\0'
-            || (g_ascii_strcasecmp(value, "0") != 0
-                && g_ascii_strcasecmp(value, "off") != 0);
-    }();
-    return enabled;
-}
-
-/*
  * Number of blocks in the canonical export inventory (devnotes/perf/
  * STAGE_PIPELINE.md). The executor below covers exactly this many nodes; a
- * mismatch falls back to the legacy sequence.
+ * mismatch aborts, because the graph is the only export sequence.
  */
 constexpr size_t EXPORT_NODE_COUNT = 20;
 
@@ -146,8 +133,8 @@ constexpr size_t EXPORT_NODE_COUNT = 20;
  * Export node ids the graph executor implements. buildPipelineSpec() names the
  * nodes; this list is the executor's side of the contract. The graph path
  * validates every planned node against it before executing anything, so an
- * inventory change that this file does not implement falls back to the legacy
- * sequence instead of silently skipping a block.
+ * inventory change that this file does not implement aborts instead of
+ * silently skipping a block.
  */
 const char* const EXPORT_NODE_IDS[] = {
     "source.select", "raw.preprocess", "raw.demosaic", "raw.base",
@@ -172,22 +159,31 @@ bool isExportNode(const std::string& id)
 }
 
 /*
- * Report that the graph cannot run the whole export and that the legacy
- * sequence is used instead. Each reason is reported once per process, so a
- * batch does not repeat the same line for every image.
+ * Report a plan this executor cannot run, and stop.
+ *
+ * The graph is the only export sequence now, so there is no legacy pass to
+ * fall back to. A rejected plan means the inventory and this executor
+ * disagree, which is a programming error: aborting keeps it visible instead of
+ * exporting a partly processed image. The reason is reported once per process
+ * so a batch logs it a single time before the abort.
  */
-void logStageGraphFallback(const char* node, const char* reason)
+[[noreturn]] void abortStageGraph(const char* node, const char* reason)
 {
     static std::mutex mutex;
     static std::set<std::string> logged;
 
-    std::lock_guard<std::mutex> lock(mutex);
-    if (!logged.insert(std::string(reason) + ": " + node).second) {
-        return;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (logged.insert(std::string(reason) + ": " + node).second) {
+            std::fprintf(stderr, "stage-graph: fatal: %s (%s)\n",
+                         reason, node);
+            std::fprintf(stderr,
+                         "stage-graph: the graph is the only export sequence, "
+                         "so there is nothing to fall back to\n");
+        }
     }
 
-    std::fprintf(stderr, "stage-graph: fallback to legacy: %s (%s)\n",
-                 reason, node);
+    std::abort();
 }
 
 /* Report the accepted plan once per process, for operations and evidence. */
@@ -278,46 +274,7 @@ private:
     {
         RT_PROFILE("proc::normal_pipeline", PROCESS_IMAGE);
 
-        if (stageGraphEnabled()) {
-            return graph_pipeline();
-        }
-
-        return legacy_export();
-    }
-
-    /*
-     * Legacy export order. The stage runtime is off, so the blocks run in the
-     * order the hand-written pipeline always used. Every block is one of the
-     * node methods the graph executor also calls, so there is a single
-     * implementation of the export pipeline.
-     */
-    Imagefloat *legacy_export()
-    {
-        {
-            stage::ScopedProfile profile("export.init");
-
-            if (!stage_source_select()) {
-                return nullptr;
-            }
-
-            stage_raw_preprocess();
-            stage_raw_demosaic();
-            stage_raw_base_source();
-        }
-
-        {
-            stage::ScopedProfile profile("export.denoise");
-            stage_denoise();
-        }
-
-        {
-            stage::ScopedProfile profile("export.transform");
-            stage_raw_color();
-            stage_analysis();
-            stage_transform();
-        }
-
-        return stage_finish();
+        return graph_pipeline();
     }
 
     /*
@@ -325,9 +282,9 @@ private:
      * canonical export inventory every job, so its 20 nodes, 19 edges and
      * reuse modes come from buildPipelineSpec() rather than from this file.
      * A fresh graph is fully dirty, so the plan must let every node recompute;
-     * a plan that would skip a block the legacy path runs is rejected before
-     * anything executes, and the legacy sequence runs instead. Node ids double
-     * as the RT_STAGE_PROFILE keys so both paths stay comparable.
+     * a plan that would skip a block is rejected before anything executes and
+     * aborts, because there is no second sequence to run. Node ids double as
+     * the RT_STAGE_PROFILE keys.
      */
     Imagefloat *graph_pipeline()
     {
@@ -335,8 +292,7 @@ private:
             stage::buildPipelineSpec(stage::StagePath::Export);
 
         if (spec.nodes.size() != EXPORT_NODE_COUNT) {
-            logStageGraphFallback("inventory", "unexpected node count");
-            return legacy_export();
+            abortStageGraph("inventory", "unexpected node count");
         }
 
         stage::StageGraph graph;
@@ -368,8 +324,7 @@ private:
         std::vector<size_t> order;
 
         if (!graph.topologicalOrder(order) || order.size() != spec.nodes.size()) {
-            logStageGraphFallback("inventory", "graph is not acyclic");
-            return legacy_export();
+            abortStageGraph("inventory", "graph is not acyclic");
         }
 
         const std::vector<stage::StageDecision> plan = graph.plan();
@@ -378,16 +333,14 @@ private:
             const std::string& id = graph.node(index).name;
 
             if (!isExportNode(id)) {
-                logStageGraphFallback(id.c_str(), "node has no executor");
-                return legacy_export();
+                abortStageGraph(id.c_str(), "node has no executor");
             }
 
             // ReuseInput still means the node runs (it writes in place); only
             // ReuseOutput skips a block. This path has no stage buffer cache,
-            // so a skip would silently drop work the legacy path does.
+            // so a skip would silently drop work the pipeline must do.
             if (plan[index].action == stage::StageAction::ReuseOutput) {
-                logStageGraphFallback(id.c_str(), "plan would skip the node");
-                return legacy_export();
+                abortStageGraph(id.c_str(), "plan would skip the node");
             }
         }
 
@@ -488,8 +441,8 @@ private:
     /*
      * source.select: load or take the initial image, resolve the raw source,
      * create the processing functions and clamp the crop rectangle to the
-     * frame. Extracted from stage_init() so the legacy path and the graph node
-     * share one implementation.
+     * frame. Extracted from stage_init() so the graph node has a single
+     * implementation.
      */
     bool stage_source_select()
     {
@@ -1444,9 +1397,9 @@ private:
     }
 
     /*
-     * Export finish sequence. The legacy path and the graph node methods are
-     * the same implementation: stage_finish() is the legacy order, and
-     * graph_pipeline() calls the identical methods through the inventory.
+     * Finish sequence of the fast export pipeline. The graph calls the same
+     * node methods through the inventory; this wrapper keeps the fast path's
+     * fixed order in one place.
      */
     Imagefloat *stage_finish()
     {
