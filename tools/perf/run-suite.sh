@@ -5,10 +5,13 @@
 #   tools/perf/run-suite.sh --build-dir build/cpu-perf-stage-runtime \
 #       --image "$RT_TEST_IMAGE_45MP" [--pp3 FILE] [--denoise-pp3 FILE] \
 #       [--baseline-dir DIR] [--mode smoke|gate] [--report DIR] \
-#       [--skip-preview] [--skip-stage-tests] [--graph]
+#       [--skip-preview] [--skip-stage-tests] [--graph] [--thumbnail-graph]
 #
 # --graph adds an opt-in parity gate: export once with RT_STAGE_GRAPH=0 and
 # once with RT_STAGE_GRAPH=1, then require AE=0 between the two TIFFs.
+# --thumbnail-graph builds thumbnail-stage-test and requires byte-identical
+# embedded-JPEG and raw-fallback thumbnails between the legacy sequence and
+# the thumbnail stage graph.
 # --denoise-pp3 adds a thread-determinism matrix for a profile that enables
 # directional-pyramid denoising (see devnotes/perf/DETERMINISM.md).
 
@@ -27,6 +30,7 @@ report=""
 skip_preview=0
 skip_stage_tests=0
 graph_parity=0
+thumbnail_graph_parity=0
 threads_list="1 2 4 8"
 
 while [ "$#" -gt 0 ]; do
@@ -41,6 +45,7 @@ while [ "$#" -gt 0 ]; do
         --skip-preview) skip_preview=1; shift ;;
         --skip-stage-tests) skip_stage_tests=1; shift ;;
         --graph) graph_parity=1; shift ;;
+        --thumbnail-graph) thumbnail_graph_parity=1; shift ;;
         -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
         *) die "unknown option: $1" ;;
     esac
@@ -143,6 +148,34 @@ if [ "$graph_parity" -eq 1 ]; then
     fi
 else
     skip "graph parity (--graph)"
+fi
+
+# ---------------------------------------------------- thumbnail graph parity
+info "thumbnail graph parity"
+if [ "$thumbnail_graph_parity" -eq 1 ]; then
+    thumb_dir="$report/thumbnail"
+    mkdir -p "$thumb_dir"
+    log="$report/thumbnail-stage-test.log"
+    if cmake --build "$build_dir" --target thumbnail-stage-test -j 6 \
+            >"$report/thumbnail-stage-test.build.log" 2>&1 \
+        && OMP_NUM_THREADS=1 "$build_dir/rtengine/thumbnail-stage-test" \
+            "$image" "" 160 "$thumb_dir" >"$log" 2>&1; then
+        if cmp -s "$thumb_dir/embedded-legacy.ppm" "$thumb_dir/embedded-graph.ppm" \
+            && cmp -s "$thumb_dir/raw-legacy.ppm" "$thumb_dir/raw-graph.ppm"; then
+            pass "thumbnail graph parity (embedded and raw fallback)"
+        else
+            fail "thumbnail graph parity (PPM differs, see $thumb_dir)"
+        fi
+        for entry in loadQuickFromRaw quickProcessImage loadFromRaw processImage; do
+            if ! grep -q "thumbnail-graph: $entry: active," "$log"; then
+                fail "thumbnail graph not active for $entry (see $log)"
+            fi
+        done
+    else
+        fail "thumbnail-stage-test (see $log)"
+    fi
+else
+    skip "thumbnail graph parity (--thumbnail-graph)"
 fi
 
 # -------------------------------------------------------------- thread matrix

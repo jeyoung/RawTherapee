@@ -6,8 +6,11 @@ Phase A artefact for the stage runtime: the graph and its block boundaries are
 specified and tested here, before any production pipeline is rewired.
 
 The specification is data only. `rtengine/stage/stage_pipeline.cc` builds it and
-`rtengine/stage/tests/stage_pipeline_test.cc` proves its shape. No processing
-code calls it yet.
+`rtengine/stage/tests/stage_pipeline_test.cc` proves its shape. The thumbnail
+path now executes this graph through `StageGraph::plan()` behind
+`RT_STAGE_GRAPH=1`; the legacy sequence remains the default and is
+byte-identical (see `STAGE_RUNTIME.md`). The other three paths are still
+specification only.
 
 ## Scope
 
@@ -47,7 +50,7 @@ spec: `buildPipelineSpec()` returns the rooted subgraph, not the union.
 | `raw.base` | Full/Full/Roi/Reduced | path | reuse-output | `getImage()`, spot removal, denoise, film negative, Retinex, dehaze, Fattal, source-side gamut |
 | `analysis` | Full/Full/Roi/- | path | reuse-output | histogram and auto-exposure analysis |
 | `transform` | Full/Full/Roi/- | path | reuse-input | rotation, distortion, perspective, CA, vignetting, gradient, post-crop vignette |
-| `local.adjustments` | Full/Full/Roi/Reduced | path | reuse-input | local lab / selective editing |
+| `local.adjustments` | Full/Full/Roi/- | path | reuse-input | local lab / selective editing |
 | `rgb.proc` | Full/Full/Roi/Reduced | path | reuse-input | RGB curves, tone curve, colour toning, B&W, channel mixer, HSV, film simulation |
 | `lab.tools` | Full/Full/Roi/Reduced | path | reuse-input | shadows/highlights, Lab curves, local contrast, vibrance, EPD, soft light |
 | `lab.sharpening` | Full/-/Roi/- | path | reuse-input | impulse denoise, defringe, microcontrast, sharpening |
@@ -188,24 +191,72 @@ thumbnail.scale -> thumbnail.transform -> thumbnail.whitebalance
   -> thumbnail.rgb -> thumbnail.lab -> thumbnail.output
 ```
 
-Code evidence:
+Code evidence. The blocks are the private `Thumbnail::stage*` methods in
+`rtengine/rtthumbnail.cc`; each is the only implementation of that step,
+shared by the legacy sequence and the graph-driven sequence.
 
-- embedded extraction `rtthumbnail.cc:456-575` (`loadQuickFromRaw()`,
-  `getThumbnail()` at `:487`, nearest resize at `:542`)
-- raw fallback `:577-648` (`loadFromRaw()`)
-- embedded post-processing `quickProcessImage()` `:1129-1155`
-- shared thumbnail processing `processImage()` `:1160`
-- scale `:1250`, film negative `:1255-1257`, coarse rotate/flip `:1263-1272`,
-  white balance `:1274-1295`
-- `Lab_Local()` `:1657`
-- `rgbProc()` `:1835`, Lab-grid colour toning `:1871`
-- `lab2rgb()` `:2139`, 8-bit gamma output `:2336-2421`
+- `source.embedded` `stageSourceEmbedded()`: open the raw container and
+  select its embedded JPEG (`RawImage::getThumbnail()`). The container load is
+  folded into this root because it exists only to reach the embedded image.
+- `thumbnail.decode` `stageThumbnailDecode()`: nearest-neighbour resize to the
+  requested size, coarse rotation and the Leaf `.mos`, Mamiya `.mef` and
+  Phase One `.iiq` already-rotated exceptions.
+- `source.select` `stageSourceSelect()`: open the raw container, resolve the
+  frame (including the Hasselblad H6D-100cMS second frame) and record the
+  sensor and crop geometry.
+- `raw.preprocess` `stageRawPreprocess()`: black and white levels, scale
+  multipliers, colour scaling and pre-interpolation.
+- `raw.demosaic` `stageRawDemosaic()`: the reduced sampled demosaic and the
+  Fuji geometry remap.
+- `raw.base` `stageRawBase()`: finish the reduced raw image, including the
+  histogram and auto white-balance analysis folded into this block.
+- `thumbnail.scale` `stageScale()` (raw fallback) and `stageQuickScale()`
+  (embedded branch): reduce `thumbImg` to the requested height. The embedded
+  branch continues in 8-bit and the raw fallback in float, so the two entry
+  points keep their own legacy arithmetic. `stageScale()` also runs the
+  film-negative V1/V2 inversion before any geometry.
+- `thumbnail.transform` `stageTransform()` / `stageQuickTransform()`: coarse
+  rotate and flip, after `thumbnail.scale`.
+- `thumbnail.whitebalance` `stageWhiteBalance()`: resolve the multipliers and
+  apply them with the highlight-recovery magenta guard.
+- `thumbnail.rgb` `stageRgb()`: colour-space conversion, first analysis,
+  dehaze, Fattal tone mapping, geometry transform, local adjustments and
+  `rgbProc()`.
+- `thumbnail.lab` `stageLab()`: Lab tools, local contrast, working TRC,
+  CIE CAM and gamut compression in one reduced-scale pass.
+- `thumbnail.output` `stageOutput()`: Lab to 8-bit monitor or output RGB, the
+  reported scale factor and the crop mask.
 
 `thumbnail.lab` folds the Lab tools, working TRC, CIE CAM and gamut work that
 the export and preview paths split into separate blocks, because the thumbnail
-path runs them at reduced scale in one pass (`rtthumbnail.cc:1856-2114`).
-`thumbnail.output` folds both the monitor and output conversions
-(`:2137` and `:2139`) and the 8-bit gamma table.
+path runs them at reduced scale in one pass.
+`thumbnail.output` folds both the monitor and output conversions and the
+8-bit gamma table.
+
+### Thumbnail runtime mapping
+
+The thumbnail lifecycle is split across four entry points and two alternative
+continuations, so one invocation cannot run all twelve nodes: `source.select`
+and `source.embedded` are alternative roots, and `quickProcessImage()` and
+`processImage()` are alternative successors of `thumbnail.scale`. With
+`RT_STAGE_GRAPH=1` each entry point builds the canonical twelve-node spec,
+connects it into a `StageGraph`, marks the nodes it owns dirty and asks
+`StageGraph::plan()` for the actions:
+
+| Entry point | Nodes it executes | Count |
+|-------------|-------------------|-------|
+| `loadQuickFromRaw()` | `source.embedded`, `thumbnail.decode` | 2 |
+| `loadFromRaw()` | `source.select`, `raw.preprocess`, `raw.demosaic`, `raw.base` | 4 |
+| `quickProcessImage()` | `thumbnail.scale`, `thumbnail.transform` | 2 |
+| `processImage()` | `thumbnail.scale`, `thumbnail.transform`, `thumbnail.whitebalance`, `thumbnail.rgb`, `thumbnail.lab`, `thumbnail.output` | 6 |
+
+The union is the full twelve-node graph; no node is faked. Every node an
+entry point owns must be allowed to run: if `plan()` returns `ReuseOutput`
+for one, the plan is rejected and the unchanged legacy sequence runs. The
+remaining nodes are marked clean because their data is already held by the
+`Thumbnail` (`thumbImg`) or belongs to the branch this invocation does not
+take. The legacy sequence calls the same `stage*` blocks in the same order,
+so the graph and the legacy path share one implementation.
 
 ## Parameter fields
 
@@ -250,8 +301,22 @@ silently dropped.
 - The preview soft-proof `lab2rgb()` (`improccoordinator.cc:4136`) is folded
   into `monitor.output`. A separate soft-proof sink is not modelled.
 - Embedded-thumbnail rotation exceptions for Leaf `.mos`, Mamiya `.mef` and
-  Phase One `.iiq` (`rtthumbnail.cc:554-563`) are folded into
-  `thumbnail.decode` / `thumbnail.transform`.
+  Phase One `.iiq` are folded into `thumbnail.decode` / `thumbnail.transform`.
+- On the embedded branch the raw container load is folded into
+  `source.embedded`: `source.select` is a separate root and is not executed,
+  because the container is opened only to reach the embedded JPEG.
+- `Thumbnail::firstAnalysis()`, `dehaze()`, `ToneMapFattal02()`, the
+  lens-geometry `ipf.transform()` and `Lab_Local()` run between the colour
+  conversion and `rgbProc()` in `stageRgb()`. The canonical thumbnail path has
+  no `analysis`, `transform` or `local.adjustments` node, so they are folded
+  into `thumbnail.rgb`. Only the coarse rotate/flip is `thumbnail.transform`.
+- The raw fallback histogram and auto white-balance analysis in
+  `stageRawBase()` is folded into `raw.base`; there is no `analysis` node on
+  the thumbnail path.
+- Inspector mode (`ThumbnailInspectorMode::RAW` and the
+  `RAW_IF_NOT_JPEG_FULLSIZE` fallback) loads a full-resolution image, which is
+  outside the reduced-domain graph. It keeps the legacy path and executes no
+  graph node.
 - Output ICC attachment and metadata (`simpleprocess.cc:2387-2410`) are one
   block, `output.icc`, even though they are two calls.
 - Post-crop vignette and gradient are computed by `iptransform.cc:1023` and
@@ -304,3 +369,18 @@ both. The test checks, per path:
 10. the dump is deterministic and contains every node and edge.
 
 Node counts: export 20, preview 14, crop 15, thumbnail 12.
+
+The thumbnail runtime mapping is exercised separately:
+
+```bash
+cmake --build <build-dir> --target thumbnail-stage-test -j 6
+<build-dir>/rtengine/thumbnail-stage-test <raw> [pp3] [height] [out-dir]
+tools/perf/run-suite.sh --build-dir <build-dir> --image <raw> --thumbnail-graph
+```
+
+The harness runs `loadQuickFromRaw()` + `quickProcessImage()` and
+`loadFromRaw()` + `processImage()` once with the legacy sequence and once with
+`RT_STAGE_GRAPH=1`, compares the 8-bit output byte for byte and fails if a
+plan falls back. Result on the CPU build: `PASS` for both branches, with all
+four plans active; hashes and the image profile are recorded in
+`STAGE_RUNTIME.md`.

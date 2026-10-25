@@ -31,9 +31,9 @@ namespace rtengine::stage
  *
  * The specification is data only: it names the blocks each pipeline runs, the
  * order they run in, the spatial domain of the buffer they consume and the
- * consumer they serve. It does not execute anything and it is not wired into
- * the processing code yet. The inventory behind every block, and the blocks
- * that could not be mapped, are recorded in devnotes/perf/STAGE_PIPELINE.md.
+ * consumer they serve. It does not execute anything. The thumbnail path
+ * consumes it behind RT_STAGE_GRAPH=1; see devnotes/perf/STAGE_PIPELINE.md for
+ * the inventory and the blocks that could not be mapped.
  */
 
 enum class StagePath {

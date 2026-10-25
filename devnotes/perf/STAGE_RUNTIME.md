@@ -220,6 +220,88 @@ gate.
 splits blocks into full and cheap work. It is the hook for selective
 denoise/wavelet work; it is not yet wired into those tools.
 
+## Graph-driven thumbnail
+
+`RT_STAGE_GRAPH=1` also switches the thumbnail path to the canonical
+twelve-node specification in `STAGE_PIPELINE.md`. Each entry point builds
+`buildPipelineSpec(StagePath::Thumbnail)`, connects every node and edge into a
+`StageGraph`, marks the nodes that invocation owns dirty, and executes the
+active nodes in `topologicalOrder()` when `plan()` allows it. The entry
+points and node counts are:
+
+| Entry point | Nodes | Use |
+|-------------|-------|-----|
+| `loadQuickFromRaw()` | `source.embedded`, `thumbnail.decode` | embedded-JPEG fast path |
+| `loadFromRaw()` | `source.select`, `raw.preprocess`, `raw.demosaic`, `raw.base` | raw fallback |
+| `quickProcessImage()` | `thumbnail.scale`, `thumbnail.transform` | embedded continuation |
+| `processImage()` | `thumbnail.scale` … `thumbnail.output` (6) | profile continuation |
+
+The union is all twelve nodes. The nodes an invocation does not own are
+marked clean: their data is already held by the `Thumbnail` (`thumbImg`) or
+belongs to the branch that invocation does not take, so skipping them is
+correct and matches the legacy code. If `plan()` would skip a node the legacy
+code executes, the plan is rejected, `thumbnail-graph: <entry>: fallback to
+legacy: plan would skip <node>` is logged once, and the unchanged legacy
+sequence runs.
+
+The extraction is a move, not a rewrite: `loadQuickFromRaw()`,
+`loadFromRaw()`, `quickProcessImage()` and `processImage()` were split into
+the private `Thumbnail::stage*` methods, and both the legacy sequence and the
+graph sequence call those same methods in the same order. No arithmetic,
+buffer type, thread count or ordering changed, and `thumbnail.scale` keeps
+one implementation per continuation (8-bit nearest for the embedded branch,
+float bilinear for the profile path).
+
+Reduced domain only: the graph covers the normal embedded-JPEG and raw
+fallback thumbnails. Inspector mode (`ThumbnailInspectorMode::RAW` and its
+`RAW_IF_NOT_JPEG_FULLSIZE` fallback) loads a full-resolution image and stays
+on the legacy path; it executes no graph node. The graph does not touch the
+file-browser thumbnail cache, its `.rtti` files or the cache invalidation
+keys.
+
+Unset, empty, `0` and `off` (case-insensitive) keep the legacy thumbnail
+sequence, which remains the default.
+
+Evidence (CPU build with OpenCL disabled, single-threaded host run,
+`OMP_NUM_THREADS=1`, representative NEF sample):
+
+- `thumbnail-stage-test` reports `PASS embedded` and `PASS raw` and the saved
+  PPM files are byte-identical between the two passes. Neutral parameters at
+  160 px: embedded `240x160`, sha256
+  `f433fb4d519f1af8b51f3f1cada112a02df39824277a1837702c50d4e5540b3f` for
+  both passes; raw fallback `240x160`, sha256
+  `a60c8d6612fd979ca1e694108bf8b193442dca7bb497c8614c8b2567a1185165` for
+  both passes.
+- The sample sidecar at 200 px (`[Exposure]`, `[Vibrance]`,
+  `[White Balance]`, `[Shadows & Highlights]`, `[Wavelet]`, `[RGB Curves]`)
+  gives embedded `300x200`, sha256
+  `6a41827293458268929be4fa5857547c4b43cc7e83c3a1a7f00f593ede402159` for
+  both passes, and raw fallback `300x200`, sha256
+  `3861307ec90fb952af876f1a2c5bfcbbc2fc73dc5cec09f45d113a41b6628a20` for
+  both passes.
+- The four accepted plans are logged as 2 (`source.embedded`,
+  `thumbnail.decode`), 2 (`thumbnail.scale`, `thumbnail.transform`), 4
+  (`source.select`, `raw.preprocess`, `raw.demosaic`, `raw.base`) and 6
+  (`thumbnail.scale` … `thumbnail.output`) canonical nodes: 12 distinct nodes,
+  no fallback and no faked node.
+- The harness is `tools/perf/thumbnail-stage-test.cc`; build it with
+  `cmake --build <build-dir> --target thumbnail-stage-test` and run
+  `build/<dir>/rtengine/thumbnail-stage-test <raw> [pp3] [height] [out-dir]`.
+  `tools/perf/run-suite.sh --thumbnail-graph` wraps it as an optional gate.
+- The same harness passes on the OpenCL build and produces byte-identical
+  PPM files to the CPU build (embedded and raw fallback), so the thumbnail
+  path is not variant-dependent.
+- Fail-closed check: a temporary, uncommitted change that marked the owned
+  nodes clean made all four entry points log
+  `thumbnail-graph: <entry>: fallback to legacy: plan would skip <node>` and
+  run the legacy sequence; the harness still reported `PASS embedded` and
+  `PASS raw` with unchanged pixels. The change was reverted before commit.
+- No `rtgui/` file changed, so the thumbnail cache keys, `.rtti` contents and
+  invalidation rules are untouched.
+- Builds: `tools/build-rt.sh cpu -j 6 --ccache --stage-modules` and
+  `tools/build-rt.sh opencl -j 6 --ccache --stage-modules` both complete;
+  `stage-pipeline-test` and `stage-graph-test` pass.
+
 ## Preview decision layer and dump
 
 `RT_PREVIEW_GRAPH=1` adds an opt-in decision layer to
