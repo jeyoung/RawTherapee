@@ -56,3 +56,5 @@ clean
 # Must be last to override all previous settings!
 !external/libraw/
 !external/libraw/**
+
+.worktrees/
