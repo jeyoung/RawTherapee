@@ -1077,7 +1077,7 @@ void Crop::stageSourceSelect(CropStageContext& ctx)
     if (!needsinitupdate) {
         setCropSizes(rqcropx, rqcropy, rqcropw, rqcroph, skip, true);
     }
-    
+
 
     //       printf("x=%d y=%d crow=%d croh=%d skip=%d\n",rqcropx, rqcropy, rqcropw, rqcroph, skip);
     //      printf("trafx=%d trafyy=%d trafwsk=%d trafHs=%d \n",trafx, trafy, trafw*skip, trafh*skip);
@@ -1794,7 +1794,7 @@ void Crop::stageLocalAdjustments(CropStageContext& ctx)
 
         //I made a little change here. Rather than have luminanceCurve (and others) use in/out lab images, we can do more if we copy right here.
         parent->ipf.rgb2lab(*baseCrop, *laboCrop, params.icm.workingProfile);
- 
+
 
         labnCrop->CopyFrom(laboCrop);
 
@@ -1876,7 +1876,7 @@ void Crop::stageLocalAdjustments(CropStageContext& ctx)
         auto& locccmascieCurve = parent->locccmascieCurve;
         auto& locllmascieCurve = parent->locllmascieCurve;
         auto& lochhmascieCurve = parent->lochhmascieCurve;
-        
+
         auto& locccmas_Curve = parent->locccmas_Curve;
         auto& locllmas_Curve = parent->locllmas_Curve;
         auto& lochhmas_Curve = parent->lochhmas_Curve;
@@ -1943,7 +1943,7 @@ void Crop::stageLocalAdjustments(CropStageContext& ctx)
             const bool lcmascieutili = locccmascieCurve.Set(params.locallab.spots.at(sp).CCmaskciecurve);
             const bool llmascieutili = locllmascieCurve.Set(params.locallab.spots.at(sp).LLmaskciecurve);
             const bool lhmascieutili = lochhmascieCurve.Set(params.locallab.spots.at(sp).HHmaskciecurve);
-            
+
             const bool lcmas_utili = locccmas_Curve.Set(params.locallab.spots.at(sp).CCmask_curve);
             const bool llmas_utili = locllmas_Curve.Set(params.locallab.spots.at(sp).LLmask_curve);
             const bool lhmas_utili = lochhmas_Curve.Set(params.locallab.spots.at(sp).HHmask_curve);
@@ -2034,7 +2034,7 @@ void Crop::stageLocalAdjustments(CropStageContext& ctx)
             float Tmax;
             int lastsav;
             float resi[8];
-            
+
             float contsig = params.locallab.spots.at(sp).contsigqcie;
             float slopeg = 1.f;
             bool linkrgb = true;
@@ -2043,7 +2043,7 @@ void Crop::stageLocalAdjustments(CropStageContext& ctx)
             float denocont = 0.f;
             int ghsbpwp[2];
             float ghsbpwpvalue[2];
-            float savmadl[21]  = {100.f, 100.f, 100.f, 100.f, 100.f, 100.f, 100.f, 100.f, 100.f, 100.f, 100.f, 100.f, 100.f, 100.f, 100.f, 100.f, 100.f, 100.f, 100.f, 100.f, 100.f}; 
+            float savmadl[21]  = {100.f, 100.f, 100.f, 100.f, 100.f, 100.f, 100.f, 100.f, 100.f, 100.f, 100.f, 100.f, 100.f, 100.f, 100.f, 100.f, 100.f, 100.f, 100.f, 100.f, 100.f};
             float ghsbwslider[2];
             float michbwslider[2]= {0.f, 0.f};//added to facilitate a possible modification requested by users, but is not currently in use
             float ghscolor[4];
@@ -2052,13 +2052,13 @@ void Crop::stageLocalAdjustments(CropStageContext& ctx)
             float ghsmaxrgb;
             float ghs3sig;
             bool ghsautsp;
-            float maxdatend2 = 0.f; 
+            float maxdatend2 = 0.f;
             float satdatend2 = 0.f;
             bool gamaut2 = false;
 /*            huerefp[sp] = huere;
             chromarefp[sp] = chromare;
             lumarefp[sp] = lumare;
-*/            
+*/
             CurveFactory::complexCurvelocal(ecomp, black / 65535., hlcompr, hlcomprthresh, shcompr, br, cont, lumare,
                                             hltonecurveloc2, shtonecurveloc2, tonecurveloc2, lightCurveloc2, avge,
                                             skip);
@@ -2067,34 +2067,34 @@ void Crop::stageLocalAdjustments(CropStageContext& ctx)
             int fw = parent->fw;
 
             if (sp == params.locallab.selspot) {
-                
+
                 parent->ipf.Lab_Local(1, sp, (float**)shbuffer, labnCrop, labnCrop, reservCrop.get(), savenormtmCrop.get(), savenormretiCrop.get(), lastorigCrop.get(), fw, fh, cropx / skip, cropy / skip, skips(parent->fw, skip), skips(parent->fh, skip), trafx, trafy, trafw, trafh , skip, locRETgainCurve, locRETtransCurve,
-                        lllocalcurve2,locallutili, 
+                        lllocalcurve2,locallutili,
                         cllocalcurve2, localclutili,
                         lclocalcurve2, locallcutili,
                         loclhCurve, lochhCurve, locchCurve,
                         lochhCurvejz, locchCurvejz, loclhCurvejz,
 
-                        lmasklocalcurve2, localmaskutili, 
-                        lmaskexplocalcurve2, localmaskexputili, 
-                        lmaskSHlocalcurve2, localmaskSHutili, 
-                        lmaskviblocalcurve2, localmaskvibutili, 
-                        lmasktmlocalcurve2, localmasktmutili, 
-                        lmaskretilocalcurve2, localmaskretiutili, 
-                        lmaskcblocalcurve2, localmaskcbutili, 
-                        lmaskbllocalcurve2, localmaskblutili, 
+                        lmasklocalcurve2, localmaskutili,
+                        lmaskexplocalcurve2, localmaskexputili,
+                        lmaskSHlocalcurve2, localmaskSHutili,
+                        lmaskviblocalcurve2, localmaskvibutili,
+                        lmasktmlocalcurve2, localmasktmutili,
+                        lmaskretilocalcurve2, localmaskretiutili,
+                        lmaskcblocalcurve2, localmaskcbutili,
+                        lmaskbllocalcurve2, localmaskblutili,
                         lmasklclocalcurve2, localmasklcutili,
                         lmaskloglocalcurve2, localmasklogutili,
-                        lmasklocal_curve2, localmask_utili, 
-                        lmaskcielocalcurve2, localmaskcieutili, 
-                        cielocalcurve2,localcieutili, 
-                        cielocalcurve22,localcieutili2, 
-                        jzlocalcurve2,localjzutili, 
-                        czlocalcurve2,localczutili, 
-                        czjzlocalcurve2,localczjzutili, 
-                        redlocalcurve2,localredutili, 
-                        greenlocalcurve2,localgreenutili, 
-                        bluelocalcurve2,localblueutili, 
+                        lmasklocal_curve2, localmask_utili,
+                        lmaskcielocalcurve2, localmaskcieutili,
+                        cielocalcurve2,localcieutili,
+                        cielocalcurve22,localcieutili2,
+                        jzlocalcurve2,localjzutili,
+                        czlocalcurve2,localczutili,
+                        czjzlocalcurve2,localczjzutili,
+                        redlocalcurve2,localredutili,
+                        greenlocalcurve2,localgreenutili,
+                        bluelocalcurve2,localblueutili,
 
                         locccmasCurve, lcmasutili, locllmasCurve, llmasutili, lochhmasCurve, lhmasutili, lochhhmasCurve, lhhmasutili, lochhhmascieCurve, lhhmascieutili, locccmasexpCurve, lcmasexputili, locllmasexpCurve, llmasexputili, lochhmasexpCurve, lhmasexputili,
                         locccmasSHCurve, lcmasSHutili, locllmasSHCurve, llmasSHutili, lochhmasSHCurve, lhmasSHutili,
@@ -2105,7 +2105,7 @@ void Crop::stageLocalAdjustments(CropStageContext& ctx)
                         locccmasblCurve, lcmasblutili, locllmasblCurve, llmasblutili, lochhmasblCurve, lhmasblutili,
                         locccmaslcCurve, lcmaslcutili, locllmaslcCurve, llmaslcutili, lochhmaslcCurve, lhmaslcutili,
                         locccmaslogCurve, lcmaslogutili, locllmaslogCurve, llmaslogutili, lochhmaslogCurve, lhmaslogutili,
-                        
+
                         locccmas_Curve, lcmas_utili, locllmas_Curve, llmas_utili, lochhmas_Curve, lhmas_utili,
                         locccmascieCurve, lcmascieutili, locllmascieCurve, llmasSHutili, lochhmascieCurve, lhmascieutili,
 
@@ -2125,7 +2125,7 @@ void Crop::stageLocalAdjustments(CropStageContext& ctx)
                         locedgwavCurve, locedgwavutili,
                         loclmasCurve_wav,lmasutili_wav,
                         LHutili, HHutili, CHutili, HHutilijz, CHutilijz, LHutilijz, cclocalcurve2, localcutili, rgblocalcurve2, localrgbutili, localexutili, exlocalcurve2, hltonecurveloc2, shtonecurveloc2, tonecurveloc2, lightCurveloc2,
-                        huerefblu, chromarefblu, lumarefblu, huere, chromare, lumare, sobelre, lastsav, 
+                        huerefblu, chromarefblu, lumarefblu, huere, chromare, lumare, sobelre, lastsav,
                         parent->previewDeltaE, parent->locallColorMask, parent->locallColorMaskinv, parent->locallExpMask, parent->locallExpMaskinv, parent->locallSHMask, parent->locallSHMaskinv, parent->locallvibMask,  parent->localllcMask, parent->locallsharMask, parent->locallcbMask, parent->locallretiMask, parent->locallsoftMask, parent->localltmMask, parent->locallblMask,
                         parent->localllogMask, parent->locall_Mask, parent->locallcieMask, minCD, maxCD, mini, maxi, Tmean, Tsigma, Tmin, Tmax,
                         meantme, stdtme, meanretie, stdretie, fab, maxicam,rdx, rdy, grx, gry, blx, bly, meanx, meany, meanxe, meanye, maxdat, prim, ill, contsig, lightsig, slopeg, linkrgb,
@@ -2162,33 +2162,33 @@ void Crop::stageLocalAdjustments(CropStageContext& ctx)
                         */
             } else {
                 parent->ipf.Lab_Local(1, sp, (float**)shbuffer, labnCrop, labnCrop, reservCrop.get(), savenormtmCrop.get(), savenormretiCrop.get(), lastorigCrop.get(), fw, fh, cropx / skip, cropy / skip, skips(parent->fw, skip), skips(parent->fh, skip), trafx, trafy, trafw , trafh, skip, locRETgainCurve, locRETtransCurve,
-                        lllocalcurve2,locallutili, 
+                        lllocalcurve2,locallutili,
                         cllocalcurve2, localclutili,
                         lclocalcurve2, locallcutili,
                         loclhCurve, lochhCurve, locchCurve,
                         lochhCurvejz, locchCurvejz, loclhCurvejz,
                         lmasklocalcurve2, localmaskutili,
-                        lmaskexplocalcurve2, localmaskexputili, 
-                        lmaskSHlocalcurve2, localmaskSHutili, 
-                        lmaskviblocalcurve2, localmaskvibutili, 
-                        lmasktmlocalcurve2, localmasktmutili, 
-                        lmaskretilocalcurve2, localmaskretiutili, 
-                        lmaskcblocalcurve2, localmaskcbutili, 
-                        lmaskbllocalcurve2, localmaskblutili, 
+                        lmaskexplocalcurve2, localmaskexputili,
+                        lmaskSHlocalcurve2, localmaskSHutili,
+                        lmaskviblocalcurve2, localmaskvibutili,
+                        lmasktmlocalcurve2, localmasktmutili,
+                        lmaskretilocalcurve2, localmaskretiutili,
+                        lmaskcblocalcurve2, localmaskcbutili,
+                        lmaskbllocalcurve2, localmaskblutili,
                         lmasklclocalcurve2, localmasklcutili,
                         lmaskloglocalcurve2, localmasklogutili,
-                        lmasklocal_curve2, localmask_utili, 
-                        lmaskcielocalcurve2, localmaskcieutili, 
-                        cielocalcurve2,localcieutili, 
-                        cielocalcurve22,localcieutili2, 
-                        jzlocalcurve2,localjzutili, 
-                        czlocalcurve2,localczutili, 
-                        czjzlocalcurve2,localczjzutili, 
-                        redlocalcurve2,localredutili, 
-                        greenlocalcurve2,localgreenutili, 
-                        bluelocalcurve2,localblueutili, 
+                        lmasklocal_curve2, localmask_utili,
+                        lmaskcielocalcurve2, localmaskcieutili,
+                        cielocalcurve2,localcieutili,
+                        cielocalcurve22,localcieutili2,
+                        jzlocalcurve2,localjzutili,
+                        czlocalcurve2,localczutili,
+                        czjzlocalcurve2,localczjzutili,
+                        redlocalcurve2,localredutili,
+                        greenlocalcurve2,localgreenutili,
+                        bluelocalcurve2,localblueutili,
 
-                        locccmasCurve, lcmasutili, locllmasCurve, llmasutili, lochhmasCurve, lhmasutili,lochhhmasCurve, lhhmasutili, lochhhmascieCurve, lhhmascieutili, locccmasexpCurve, lcmasexputili, locllmasexpCurve, llmasexputili, lochhmasexpCurve, lhmasexputili, 
+                        locccmasCurve, lcmasutili, locllmasCurve, llmasutili, lochhmasCurve, lhmasutili,lochhhmasCurve, lhhmasutili, lochhhmascieCurve, lhhmascieutili, locccmasexpCurve, lcmasexputili, locllmasexpCurve, llmasexputili, lochhmasexpCurve, lhmasexputili,
                         locccmasSHCurve, lcmasSHutili, locllmasSHCurve, llmasSHutili, lochhmasSHCurve, lhmasSHutili,
                         locccmasvibCurve, lcmasvibutili, locllmasvibCurve, llmasvibutili, lochhmasvibCurve, lhmasvibutili,
                         locccmascbCurve, lcmascbutili, locllmascbCurve, llmascbutili, lochhmascbCurve, lhmascbutili,
@@ -2197,7 +2197,7 @@ void Crop::stageLocalAdjustments(CropStageContext& ctx)
                         locccmasblCurve, lcmasblutili, locllmasblCurve, llmasblutili, lochhmasblCurve, lhmasblutili,
                         locccmaslcCurve, lcmaslcutili, locllmaslcCurve, llmaslcutili, lochhmaslcCurve, lhmaslcutili,
                         locccmaslogCurve, lcmaslogutili, locllmaslogCurve, llmaslogutili, lochhmaslogCurve, lhmaslogutili,
-                        
+
                         locccmas_Curve, lcmas_utili, locllmas_Curve, llmas_utili, lochhmas_Curve, lhmas_utili,
                         locccmascieCurve, lcmascieutili, locllmascieCurve, llmascieutili, lochhmascieCurve, lhmascieutili,
                         lochhhmas_Curve, lhhmas_utili,
@@ -2230,7 +2230,7 @@ void Crop::stageLocalAdjustments(CropStageContext& ctx)
                         LocallabListener::locallabDenoiseLC2 denoiselc2;
                         denoiselc2.denocontrastaft = denocont;
                         localldenoiselc2.push_back(denoiselc2);
-            
+
                         LocallabListener::locallabDenoiseLC denoiselc;
                         denoiselc.highres = resi[0];
                         denoiselc.nres = resi[1];
@@ -2241,7 +2241,7 @@ void Crop::stageLocalAdjustments(CropStageContext& ctx)
                         denoiselc.Lhighres46 = resi[6];
                         denoiselc.Lnres46 = resi[7];
                         localldenoiselc.push_back(denoiselc);
- 
+
                         LocallabListener::locallabDenoiseMAD madllc;
                         madllc.mad0 = savmadl[0];
                         madllc.mad1 = savmadl[1];
@@ -2266,7 +2266,7 @@ void Crop::stageLocalAdjustments(CropStageContext& ctx)
                         madllc.mad20 = savmadl[20];
                         madllc.madlock = params.locallab.spots.at(sp).madllock;
                         localldenoisemadl.push_back(madllc);
- 
+
                         LocallabListener::locallabsharAFT locsharaft;
                         locsharaft.autocontrastaft = params.locallab.spots.at(sp).deconvAutoshar;
                         locsharaft.sharcontrastaft = sharc;
@@ -2286,7 +2286,7 @@ void Crop::stageLocalAdjustments(CropStageContext& ctx)
                                 }
                                 parent->locallListener->den2Changed(localldenoiselc2, params.locallab.selspot);
                             }
-                            parent->locallListener->sharaftChanged(locallsharaft,params.locallab.selspot); 
+                            parent->locallListener->sharaftChanged(locallsharaft,params.locallab.selspot);
                         }
 
             if (sp + 1u < params.locallab.spots.size()) {
@@ -2304,7 +2304,7 @@ void Crop::stageLocalAdjustments(CropStageContext& ctx)
                 delete [] lumarefp;
                 delete [] fabrefp;
         */
-        
+
         parent->ipf.lab2rgb(*labnCrop, *baseCrop, params.icm.workingProfile);
     }
 }
@@ -2352,7 +2352,7 @@ void Crop::stageLabTools(CropStageContext& ctx)
     }
 
     parent->ipf.shadowsHighlights(labnCrop, params.sh.enabled, params.sh.lab,params.sh.highlights ,params.sh.shadows, params.sh.radius, skip, params.sh.htonalwidth, params.sh.stonalwidth);
-    
+
     if (params.localContrast.enabled) {
     // Alberto's local contrast
         parent->ipf.localContrast(labnCrop, labnCrop->L, params.localContrast, false, skip);
@@ -2503,7 +2503,7 @@ void Crop::stageLabWavelet(CropStageContext& ctx)
         bool proedge = WaveParams.expedge;
         bool profin = WaveParams.expfinal;
         bool proton = WaveParams.exptoning;
-        bool pronois = WaveParams.expnoise; 
+        bool pronois = WaveParams.expnoise;
 
         if (WaveParams.showmask) {
        //     WaveParams.showmask = false;
@@ -2531,13 +2531,13 @@ void Crop::stageLabWavelet(CropStageContext& ctx)
             WaveParams.expedge = false;
             WaveParams.expfinal = false;
             WaveParams.exptoning = false;
-            WaveParams.expnoise = false; 
+            WaveParams.expnoise = false;
         }
 
 
-    
+
 //        parent->ipf.ip_wavelet(labnCrop, labnCrop, kall, WaveParams, wavCLVCurve, wavblcurve, waOpacityCurveRG, waOpacityCurveBY, waOpacityCurveW, waOpacityCurveWL, parent->wavclCurve, skip);
-    
+
     parent->ipf.ip_wavelet(labnCrop, labnCrop, kall, WaveParams, wavCLVCurve, wavdenoise, wavdenoiseh, wavblcurve, waOpacityCurveRG, waOpacityCurveSH, waOpacityCurveBY, waOpacityCurveW, waOpacityCurveWL, parent->wavclCurve, skip);
 
         if ((WaveParams.ushamethod == "sharp" || WaveParams.ushamethod == "clari") && WaveParams.expclari && WaveParams.CLmethod != "all") {
@@ -2580,7 +2580,7 @@ void Crop::stageLabWavelet(CropStageContext& ctx)
                 double aepsil = (epsilmax - epsilmin) / 100.f;
                 double bepsil = epsilmin; //epsilmax - 100.f * aepsil;
                 double epsil = aepsil * WaveParams.softrad + bepsil;
-                
+
                 float blur = 10.f / skip * (0.5f + 0.8f * WaveParams.softrad);
                 rtengine::guidedFilter(guid, ble, ble, blur, epsil, false);
 
@@ -2601,7 +2601,7 @@ void Crop::stageLabWavelet(CropStageContext& ctx)
                     }
                 delete tmpImage;
             }
-            
+
         }
 
 
@@ -2612,7 +2612,7 @@ void Crop::stageLabWavelet(CropStageContext& ctx)
             float mL0;
             float mC0;
             float background = 0.f;
-            int show = 0; 
+            int show = 0;
 
             if ((WaveParams.CLmethod == "one" || WaveParams.CLmethod == "inf")  && WaveParams.Backmethod == "black") {
                 mL0 = mC0 = 0.f;
@@ -2678,7 +2678,7 @@ void Crop::stageWorkingTrc(CropStageContext& ctx)
         if(params.icm.trcExp) {//local contrast
             int level_hr = 7;
             int maxlevpo = 9;
-            bool wavcurvecont = false; 
+            bool wavcurvecont = false;
             WaveletParams WaveParams = params.wavelet;
             ColorManagementParams Colparams = params.icm;
             WavOpacityCurveWL icmOpacityCurveWL;
@@ -2691,7 +2691,7 @@ void Crop::stageWorkingTrc(CropStageContext& ctx)
             }
 
         }
-        
+
         std::unique_ptr<LabImage> provis;
         const float pres = 0.01f * params.icm.preser;
         if (pres > 0.f && params.icm.wprim != ColorManagementParams::Primaries::DEFAULT) {
@@ -2718,7 +2718,7 @@ void Crop::stageWorkingTrc(CropStageContext& ctx)
         int locprim = 0;
         bool gamutcontrol = params.icm.gamut;
         int catc = rtengine::toUnderlying(params.icm.wcat);
-        
+
         const int midton = params.icm.wmidtcie;
 
         if(midton != 0) {
@@ -2734,11 +2734,11 @@ void Crop::stageWorkingTrc(CropStageContext& ctx)
             int threshmid = 50;
             if(mid > threshmid) {
                 params.bands[1] = sign(midton) * (mid - threshmid);
-                params.bands[3] = sign(midton) * (mid - threshmid);     
+                params.bands[3] = sign(midton) * (mid - threshmid);
             }
             parent->ipf.toneEqualizer(tmpImage1.get(), params, prof, skip, false);
         }
-        
+
         float rdx, rdy, grx, gry, blx, bly = 0.f;
         float meanx, meany, meanxe, meanye, maxdat = 0.f;
         double p[6] = {0., 0., 0., 0., 0., 0.};
@@ -2747,7 +2747,7 @@ void Crop::stageWorkingTrc(CropStageContext& ctx)
         parent->ipf.workingtrc(0, tmpImage1.get(), tmpImage1.get(), GW, GH, 5, prof, gamtone, slotone, catc,  illum, prim, locprim, rdx, rdy, grx, gry, blx, bly, meanx, meany, meanxe, meanye, maxdat, p, cmsDummy, false, true, true, gamutcontrol);
         float satu = params.icm.wapsat;
         if(satu > 0.f) {
-            parent->ipf.apsatur(0, tmpImage1.get(), tmpImage2.get(), GW, GH, satu) ;    
+            parent->ipf.apsatur(0, tmpImage1.get(), tmpImage2.get(), GW, GH, satu) ;
         }
 
 
@@ -2767,9 +2767,9 @@ void Crop::stageWorkingTrc(CropStageContext& ctx)
             if(Evsix) {//EV = 6 majority of images
                 params.bands[4] = -30 * smoothisli;
                 float smmothsli5 = std::min(smoothisli, 1.f);
-                params.bands[5] = -80 * smmothsli5;                     
+                params.bands[5] = -80 * smmothsli5;
             }
-            
+
             parent->ipf.toneEqualizer(tmpImage1.get(), params, prof, skip, false);
         }
 
@@ -2883,7 +2883,7 @@ void Crop::stageGamut(CropStageContext& ctx)
 
         const float gainev = pow_F(2.f, (float) params.icm.wgamgain);
         if (params.icm.wgamgain != 0.f) {//Final gain in Ev
-       
+
 #ifdef _OPENMP
     #   pragma omp parallel for
 #endif

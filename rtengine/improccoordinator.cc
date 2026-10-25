@@ -1918,12 +1918,12 @@ void ImProcCoordinator::stageRawBase(PreviewPassState& pass)
                     lastAwbauto = "";
                     autoWB.useDefaults(params->wb.equal, params->wb.observer);
 
-                } 
+                }
 
                 //double rr,gg,bb;
                 //autoWB.getMultipliers(rr,gg,bb);
             }
-            currWB = autoWB;               
+            currWB = autoWB;
            // lastAwbauto = ""; //reinitialize auto
         } else if (params->wb.method == "autitcgreen") { //(// autowb) {
             double rm;
@@ -2379,7 +2379,7 @@ void ImProcCoordinator::stageLocalAdjustments(PreviewPassState& pass)
                     params->icm.trcExp = false;//disabled Abstract profile, if hismatching
                 }
                 imgsrc->getAutoMatchedToneCurve(params->icm, params->raw, params->wb.observer, params->toneCurve.curve);
-                params->icm.trcExp = exectrcexp;//restore Abstract profile 
+                params->icm.trcExp = exectrcexp;//restore Abstract profile
             }
 
             if (params->toneCurve.autoexp) {
@@ -2509,7 +2509,7 @@ void ImProcCoordinator::stageLocalAdjustments(PreviewPassState& pass)
                     locallsharbef.push_back(locsharbef);
 
                     if (locallListener) {
-                        locallListener->sharbefChanged(locallsharbef,params->locallab.selspot); 
+                        locallListener->sharbefChanged(locallsharbef,params->locallab.selspot);
                     }
 
 
@@ -2570,7 +2570,7 @@ void ImProcCoordinator::stageLocalAdjustments(PreviewPassState& pass)
                     locallciebef.push_back(locciebef);
 
                     if (locallListener) {
-                        locallListener->ciebefChanged(locallciebef,params->locallab.selspot); 
+                        locallListener->ciebefChanged(locallciebef,params->locallab.selspot);
                     }
                 }
             }
@@ -2900,11 +2900,11 @@ void ImProcCoordinator::stageLocalAdjustments(PreviewPassState& pass)
             float Tmax;
             int lastsav;
 
-            float resi[8];             
+            float resi[8];
             float sharc = 0.f;
             float denocont = 0.f;
             int ghsbpwp[2] = {0, 0};
-            float ghsbpwpvalue[2] = {0.f, 1.f};                
+            float ghsbpwpvalue[2] = {0.f, 1.f};
             float savmadl[21];//just to intialize, not used here - but in dcrop.cc
             float ghsbwslider[2] = {0.f, 1.f};// Black and white point auto sliders
             float ghssym = 0.f;//info symmetry point
@@ -3008,7 +3008,7 @@ void ImProcCoordinator::stageLocalAdjustments(PreviewPassState& pass)
                 w_x = 0.293756f;
                 w_y = 0.309185f;
             } else if(ill == 7) {//D120
-                w_x = 0.269669f;                 
+                w_x = 0.269669f;
                 w_y = 0.28078f;
             } else if(ill == 8) {//stdA
                 w_x = 0.447573f;
@@ -3154,7 +3154,7 @@ void ImProcCoordinator::stageLocalAdjustments(PreviewPassState& pass)
 
             }
 
-            // new used linked to global and scope 
+            // new used linked to global and scope
             mainfp[sp] = 0;
             if (params->locallab.spots.at(sp).spotMethod == "main") {
                 mainfp[sp] = 3;
@@ -3178,7 +3178,7 @@ void ImProcCoordinator::stageLocalAdjustments(PreviewPassState& pass)
             bool isci = params->locallab.spots.at(sp).expcie;
           // bool isset = iscolor || issh || isvib;
 
-            //set select spot settings 
+            //set select spot settings
             LocallabListener::locallabsetLC locsetlc;
             locsetlc.mainf = mainfp[sp];
             locsetlc.iscolo = iscolor;
@@ -3201,7 +3201,7 @@ void ImProcCoordinator::stageLocalAdjustments(PreviewPassState& pass)
                 locallListener->refChanged2(huerefp, chromarefp, lumarefp, fabrefp, params->locallab.selspot);
                 locallListener->minmaxChanged(locallretiminmax, params->locallab.selspot);
                 if (params->locallab.spots.at(sp).expprecam) {
-                    locallListener->cieChanged(locallcielc,params->locallab.selspot); 
+                    locallListener->cieChanged(locallcielc,params->locallab.selspot);
                 }
 
                 if (params->locallab.spots.at(sp).expcie) {
@@ -3230,9 +3230,9 @@ void ImProcCoordinator::stageLocalAdjustments(PreviewPassState& pass)
                         //params->locallab.spots.at(sp).colorscope = 30;
                 }
                */
-               // if (mainfp[sp] >= 0) {//minimize call to idle register 
+               // if (mainfp[sp] >= 0) {//minimize call to idle register
                     //used by Global fullimage.
-                locallListener->maiChanged(locallsetlc,params->locallab.selspot); 
+                locallListener->maiChanged(locallsetlc,params->locallab.selspot);
                // }
 
             }
@@ -3714,7 +3714,7 @@ void ImProcCoordinator::stageWorkingTrc(PreviewPassState& pass)
             int threshmid = 50;
             if(mid > threshmid) {
                 params.bands[1] = sign(midton) * (mid - threshmid);
-                params.bands[3] = sign(midton) * (mid - threshmid);     
+                params.bands[3] = sign(midton) * (mid - threshmid);
             }
             ipf.toneEqualizer(tmpImage1.get(), params, prof, scale, false);
         }
@@ -3724,7 +3724,7 @@ void ImProcCoordinator::stageWorkingTrc(PreviewPassState& pass)
         ipf.workingtrc(0, tmpImage1.get(), tmpImage1.get(), GW, GH, 5, prof, gamtone, slotone, catc, illum, prim, locprim,  rdx, rdy, grx, gry, blx, bly, meanx, meany, meanxe, meanye, maxdat, p, dummy, false, true, true, gamutcontrol);
         float satu = params->icm.wapsat;
         if(satu > 0.f) {
-            ipf.apsatur(0, tmpImage1.get(), tmpImage2.get(), GW, GH, satu) ;      
+            ipf.apsatur(0, tmpImage1.get(), tmpImage2.get(), GW, GH, satu) ;
         }
 
         const float smoothisli = params->icm.wsmoothciesli;
@@ -3744,7 +3744,7 @@ void ImProcCoordinator::stageWorkingTrc(PreviewPassState& pass)
                 params.bands[4] = -30 * smoothisli;
                 float smmothsli5 = std::min(smoothisli, 1.f);
                 params.bands[5] = -80 * smmothsli5;
-            }               
+            }
             ipf.toneEqualizer(tmpImage1.get(), params, prof, scale, false);
         }
 
