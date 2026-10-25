@@ -984,12 +984,21 @@ parity.
 - Final OpenCL `verify.sh --quick` and `--formats` pass at 1 LSB; monitor
   parity is 1 byte.
 
+## Final default gate
+
+The merged branch runs the graph paths by default. `run-suite.sh --graph
+--thumbnail-graph --crop-graph` passes every stage test plus neutral, sidecar
+and graph export `AE=0`, thumbnail parity, crop parity and the crop dirty
+shadow. Preview dumps remain `AE=0` with zero shadow mismatches. The final
+preview run reported p50 147 ms and p95 183 ms over 12 samples. OpenCL
+`--quick` and `--formats` both pass at 1 LSB.
+
 ## Limitations
 
-- Preview, crop, thumbnail and export are graph-driven only when
-  `RT_STAGE_GRAPH=1`/`RT_PREVIEW_GRAPH=1`; the legacy path is the default and
-  no graph path caches or reuses buffers yet. The preview executes 13 of its
-  14 canonical nodes (`analysis` folded into `raw.base`), the crop 13 of 15
+- Preview, crop, thumbnail and export are graph-driven by default. Set
+  `RT_STAGE_GRAPH=0` or `RT_PREVIEW_GRAPH=0` for the legacy kill switch. No
+  graph path caches or reuses buffers yet. The preview executes 13 of its 14
+  canonical nodes (`analysis` folded into `raw.base`), the crop 13 of 15
   (`raw.preprocess`/`raw.demosaic` folded into `source.select`), the export
   all 20 and the thumbnail all 12.
 - The preview plan has no buffer cache behind it: a dirty node recomputes and
@@ -1053,9 +1062,11 @@ parity.
 - `StageBufferState` is non-owning and has no readback path: `ensure_host()`
   reports `RT_STAGE_FALLBACK` while the device copy is authoritative, and
   `ensure_device()` reports `RT_STAGE_FALLBACK` on CPU.
-- `ParamHasher` is a standalone primitive. No `ProcParams` descriptor is
-  defined yet, so no cache key or invalidation decision uses a fingerprint;
-  the existing bitset remains the production invalidation input.
+- Parameter fingerprints now drive the preview and crop dirty-block sets, and
+  the graph paths are default. `refreshmap.*` and the `todo` mask remain as
+  the legacy kill-switch path, GUI notification and request coalescing; the
+  stage bodies still carry their `todo` gates, so the derived set is trusted
+  only as a superset until those gates are removed.
 - Tile ordering is connected to denoise and wavelet behind `RT_TILE_ORDER=1`,
   but it is opt-in and has no reduced-work mode. The deterministic merge is
   always on.
