@@ -680,303 +680,27 @@ the render state as `RequestKind::FullCrop`, so the derivation treats the pass
 as a rebuild instead of silently skipping the reload. Every other input is
 derived.
 
-`RT_CROP_DIRTY` selects the source of the execution set:
-
-| Value | Execution set | Use |
-| --- | --- | --- |
-| `legacy` | the mask-derived set of the hand-written gates | A/B baseline; no derivation |
-| `shadow` | the mask-derived set; the derived set is compared and logged | establishing equivalence |
-| `fingerprint` | the derived set, or the mask-derived set when a block would be skipped | default |
-
-The fail-closed rule is asymmetric on purpose. `missing` (in the legacy set,
-not in the derived set) would skip work the current graph default performs, so
-the update executes the legacy set instead and increments a counter. `extra`
-(in the derived set, not in the legacy set) is recorded but executed: the
-stage bodies keep their own mask gates in this phase, so the extra calls are
-inert, and the closure is what makes a skipped middle block impossible.
+The derived set is the execution-set authority. There is no
+`RT_CROP_DIRTY` mode and no runtime mask baseline. `crop-stage-test --sequences`
+applies the real `refreshmap.h` composite mask to the stage bodies, then
+compares the incremental crop with a fresh render of the final state.
 
 The `todo` coalescing and the plan validation in `planCropGraph()` are
-unchanged. A rejected plan now aborts instead of running a full legacy loop,
-and the graph's dirty flags still come from the chosen dirty set rather than
-from the execution list.
+unchanged. A rejected plan aborts instead of running a full legacy loop, and
+the graph's dirty flags come from the derived set.
 
-### Shadow evidence
+### Dirty-block evidence
 
 `crop-stage-test --sequences` drives one parameter or viewport change inside a
-live session for each scenario, applies the real `refreshmap.h` composite mask,
-and compares three images: the legacy incremental crop, the candidate
-incremental crop and a fresh render of the final state. Parity is the gate;
-the fresh comparison attributes a stale result to the legacy path when both
-incremental paths agree.
+live session for each scenario, applies the real `refreshmap.h` composite mask
+to the stage bodies, and compares the incremental crop with a fresh render of
+the final state.
 
-Image: 45.7 MP NEF, 100% viewport 960x640, `OMP_NUM_THREADS=1`. Three
-configurations: `--stages` (denoise, local adjustments and CIE CAM active),
-`--stages --no-ciecam`, and the default configuration (all three inactive).
-
-| Scenario | Mask | Comparison | Missing | Extra |
-| --- | --- | --- | --- | --- |
-| geometry (100% -> 200% pan) | none | forced full | 0 | 0 |
-| white balance | `WB` | rebuild request | 0 | 0 |
-| demosaic / capture sharpening | `DEMOSAIC` | rebuild request | 0 | 0 |
-| transform (rotate 1.5 deg) | `TRANSFORM` | reallocation | 0 | 0 |
-| local adjustments | `AUTOEXP` | rebuild request | 0 | 0 |
-| sharpening | `SHARPENING` | Lab chain + closure | 0 | 3 |
-| CIE CAM on | `AUTOEXP` | rebuild request | 0 | 0 |
-| CIE CAM off | `AUTOEXP` | rebuild request | 0 | 0 |
-| crop rectangle | `M_CROP` | transform + closure | 0 | 3 to 9 |
-
-All three configurations report 21 comparisons, 21 equivalent, 0 missing
-blocks, 0 fail-closed fallbacks, and `AE=0` for display and output-space
-images in every scenario and in the static fit/100%/zoomed states. The `extra`
-list is the documented over-approximation: `analysis`, `local.adjustments` and
-`rgb.proc` for a Lab-only mask, and the Lab chain for a crop-rectangle mask.
-`--dirty=fingerprint` and `--dirty=shadow` produce byte-identical images.
-
-The `SHARPENING` mask shows a pre-existing `AE=1` on 23 235 of ~3.7 M bytes
-between the incremental and the fresh render in the CIE CAM configuration. The
-legacy incremental path has the same difference, so it is not caused by the
-derivation: it is the LUT rebuild scale of an incremental pass versus a full
-`ALL` pass. It is recorded as a legacy limitation, not as a pass.
-
-No stale crop was found for any scenario: the derived pass matches the current
-graph default byte for byte, including where the legacy incremental path
-differs from a fresh render.
-
-### Verification
-
-```bash
-tools/build-rt.sh cpu -j 6 --ccache
-tools/build-rt.sh opencl -j 6 --ccache
-cmake --build build/cpu-<branch> --target stage-dirty-blocks-test -j 6
-build/cpu-<branch>/rtengine/stage-dirty-blocks-test
-build/cpu-<branch>/rtengine/crop-stage-test <raw> --stages --sequences \
-    --out=<dir>
-```
-
-`stage-dirty-blocks-test` pins the contract without pixels: fingerprints are
-per path, deterministic and ordered; every parameter family dirties exactly the
-blocks that list the changed member; every render-state field belongs to
-exactly one aspect; the coupled group expands as a unit; the closure reaches
-consumers and stops at sinks; the shadow comparison separates `missing` from
-`extra`; and the preview adapters answer with the same execution set as
-`derive_dirty_blocks()`, including the resident sink, the whole path behind an
-absolute request and the rollover of an incomplete snapshot to a full
-recompute. The OpenCL configuration compiles and the test passes there too.
-
-Performance on the same image and viewport, 15 alternating edits per mode
-after two warm-up updates:
-
-| Edit | `legacy` mean | `fingerprint` mean | Delta |
-| --- | --- | --- | --- |
-| exposure (full path) | 1356.6 ms | 1344.2 ms | -0.9% |
-| crop rectangle (short) | 468.9 ms | 460.7 ms | -1.7% |
-
-The derivation costs one fingerprint pass per update plus two set comparisons,
-which is below the measurement noise of a crop pass. No regression above the
-5% gate was observed.
-
-## Reuse and consumer semantics
-
-- `recompute`: must run for every request (sources and final sinks).
-- `reuse-output`: the block has a cacheable output buffer (raw load,
-  demosaic, base finish, analysis, output conversion, crop, resize, framing,
-  thumbnail decode and scale).
-- `reuse-input`: the block may alias its input when inactive (geometry,
-  local adjustments, RGB, Lab, sharpening, wavelet, working TRC, CIE CAM,
-  gamut, thumbnail transform/white balance/RGB/Lab).
-- Export is `Exact`; preview, crop and thumbnail are `Interactive`. This is
-  the Phase A contract; promoting an interactive block to a cached exact
-  result needs parity evidence before it becomes default.
-
-## Blocks that are folded, not separate
-
-These are real processing calls that the canonical graph represents inside a
-neighbouring block. They are recorded here so the gap is explicit rather than
-silently dropped.
-
-- `imgsrc->captureSharpening()` (`improccoordinator.cc:1750`) runs inside
-  `raw.demosaic`, because it is a post-demosaic raw operation.
-- Global Retinex (`simpleprocess.cc:415-427`, `improccoordinator.cc:1788-1797`)
-  runs on the raw source before `getImage()` and is folded into `raw.base`.
-- Dehaze and Fattal tone mapping (`simpleprocess.cc:1152-1153`,
-  `improccoordinator.cc:2292-2293`, `dcrop.cc:798-799`) run after
-  `firstAnalysis()` in the current order. The export chain therefore carries
-  them as the prologue of `transform`, not inside `raw.base`, so a single
-  topological order reproduces the implementation's pixel order. The
-  provenance moved with them: `transform` lists `dehaze` and `fattal`.
-- On the crop path `raw.preprocess` and `raw.demosaic` are folded into
-  `source.select`: the region is obtained with one `ImageSource::getImage()`
-  call, which performs both steps, and the PRE/PREV denoise branch reloads the
-  same region from inside `stageAnalysis()`. There is no separable call to
-  dispatch.
-- On the crop path the pre-RGB directional-pyramid equaliser runs inside
-  `stageTransform()`, and `softLight()` runs at the start of
-  `stageWorkingTrc()`. Both are position-sensitive in the legacy order, so the
-  block executed at that position owns the call instead of the node the
-  catalogue names.
-- `imgsrc->convertColorSpace()` (`dcrop.cc:693`) is the working-space
-  conversion performed for the crop and is folded into `raw.base`.
-- `ipf.moyeqt()` saturation statistics and `ipf.calc_ref()` local-adjustment
-  reference values are folded into `rgb.proc` and `local.adjustments`
-  respectively; they are derived data, not image blocks.
-- The preview soft-proof `lab2rgb()` is folded into `monitor.output`, in the
-  same method as the monitor conversion. A separate soft-proof sink is not
-  modelled.
-- Embedded-thumbnail rotation exceptions for Leaf `.mos`, Mamiya `.mef` and
-  Phase One `.iiq` are folded into `thumbnail.decode` / `thumbnail.transform`.
-- On the embedded branch the raw container load is folded into
-  `source.embedded`: `source.select` is a separate root and is not executed,
-  because the container is opened only to reach the embedded JPEG.
-- `Thumbnail::firstAnalysis()`, `dehaze()`, `ToneMapFattal02()`, the
-  lens-geometry `ipf.transform()` and `Lab_Local()` run between the colour
-  conversion and `rgbProc()` in `stageRgb()`. The canonical thumbnail path has
-  no `analysis`, `transform` or `local.adjustments` node, so they are folded
-  into `thumbnail.rgb`. Only the coarse rotate/flip is `thumbnail.transform`.
-- The raw fallback histogram and auto white-balance analysis in
-  `stageRawBase()` is folded into `raw.base`; there is no `analysis` node on
-  the thumbnail path.
-- Inspector mode (`ThumbnailInspectorMode::RAW` and the
-  `RAW_IF_NOT_JPEG_FULLSIZE` fallback) loads a full-resolution image, which is
-  outside the reduced-domain graph. It keeps its own code path and executes no
-  graph node.
-- Output ICC attachment and metadata (`simpleprocess.cc:2387-2410`) are one
-  block, `output.icc`, even though they are two calls.
-- Post-crop vignette and gradient are computed by `iptransform.cc:1023` and
-  `:1030`, so they are parameters of `transform`, not separate blocks.
-
-No processing block found in the four entry points is missing from the
-inventory. The only intentional omissions are derived statistics, metadata
-application and the soft-proof sink listed above.
-
-## Execution boundaries (Phase B)
-
-`rtengine/simpleprocess.cc` has one private `ImageProcessor` method per
-export node. The graph executor (`graph_pipeline()`) calls those methods; fast
-export keeps its own wrapper (`stage_finish()` after the early resize), so the
-export pipeline still has one implementation per block and the graph only
-changes which code invokes it.
-
-| Node | Method |
-|------|--------|
-| `source.select` | `stage_source_select()` |
-| `raw.preprocess` | `stage_raw_preprocess()` |
-| `raw.demosaic` | `stage_raw_demosaic()` |
-| `raw.base` | `stage_raw_base()`, calling `stage_raw_base_source()`, `stage_denoise()`, `stage_raw_color()` |
-| `analysis` | `stage_analysis()` |
-| `transform` | `stage_transform()` |
-| `local.adjustments` | `stage_local_adjustments()` |
-| `rgb.proc` | `stage_rgb_proc()` |
-| `lab.tools` | `stage_lab_tools()` |
-| `lab.sharpening` | `stage_lab_sharpening()` |
-| `lab.wavelet` | `stage_lab_wavelet()` |
-| `working.trc` | `stage_working_trc()` |
-| `ciecam` | `stage_ciecam()` |
-| `gamut` | `stage_gamut()` |
-| `crop` | `stage_crop()` |
-| `resize` | `stage_resize()` |
-| `output.sharpen` | `stage_output_sharpen()` |
-| `output.convert` | `stage_output_convert()` |
-| `framing` | `stage_framing()` |
-| `output.icc` | `stage_output_icc()` |
-
-Blocks that remain folded inside a node, and why:
-
-- `raw.base` is three calls in order: the base image and tone-curve analysis,
-  denoise, and the source colour conversion plus source gamut compression.
-  The split exists so the fast export can run denoise after its early resize.
-- `analysis` allocates the working histogram as well as running
-  `firstAnalysis()`. The allocation moved ahead of the source gamut
-  compression that ends `raw.base`; it allocates a LUT and reads no pixels, so
-  the pixel order is unchanged.
-- `crop` also computes the framing geometry (`FramingArgs` and
-  `FramingData`), because the Lab crop and the resize targets depend on it
-  before the output conversion. The `framing` node draws the frame.
-- `resize` performs the Lab resize only. When the resize method is Nearest,
-  the resize runs on the gamma-applied RGB buffer, which exists only after
-  `lab2rgbOut()`, so that pass is part of `output.convert`.
-- `output.convert` also forces the B&W output and releases the Lab image.
-
-## Determinism
-
-`dumpPipelineSpec()` walks the node and edge vectors in insertion order,
-which is fixed by `definitionFor()`. Node order, edge order, roots and sinks
-are therefore stable, and the test asserts that two dumps of the same path are
-byte-identical. The dump is Graphviz DOT with a comment line per node carrying
-domain, consumer, reuse and parameter fields.
-
-## Verification
-
-Build and test:
-
-```bash
-tools/build-rt.sh cpu -j 6 --ccache --stage-modules
-cmake --build build/cpu-phaseA-inventory --target stage-pipeline-test -j 6
-build/cpu-phaseA-inventory/rtengine/stage-pipeline-test
-```
-
-Result:
-
-```text
-stage-pipeline-test: PASS
-```
-
-Both `cpu-*` and `opencl-*` configurations compile and the test passes in
-both. The test checks, per path:
-
-1. unique node ids;
-2. every edge endpoint is a known node and no edge is duplicated;
-3. node inputs mirror the incoming edges;
-4. one root, except the thumbnail path with its embedded root and raw
-   fallback; every root has no input and every sink no output;
-5. every export block is present, and export-only blocks are absent from
-   preview;
-6. preview, crop and export share the common core ids;
-7. the thumbnail path has a reduced domain, an embedded branch and the raw
-   fallback;
-8. the graph is acyclic, every node is reachable from a root and every node
-   can reach a sink;
-9. every parameter field is a known `ProcParams` member;
-10. the dump is deterministic and contains every node and edge.
-
-Node counts: export 20, preview 14, crop 15, thumbnail 12.
-
-The thumbnail runtime mapping is exercised separately:
-
-```bash
-cmake --build <build-dir> --target thumbnail-stage-test -j 6
-<build-dir>/rtengine/thumbnail-stage-test <raw> [pp3] [height] [out-dir]
-tools/perf/run-suite.sh --build-dir <build-dir> --image <raw> --thumbnail-graph
-```
-
-The harness runs `loadQuickFromRaw()` + `quickProcessImage()` and
-`loadFromRaw()` + `processImage()` twice, now both through the graph, compares
-the 8-bit output byte for byte and fails if a plan is rejected. Result on the
-CPU build: `PASS` for both branches, with all four plans active; hashes and the
-image profile are recorded in `STAGE_RUNTIME.md`.
-
-Phase B corrected the export chain to the implementation's order (see
-"Execution boundaries" above). The node and edge counts, roots, sinks and
-reuse modes are unchanged, and `stage-pipeline-test` passes in the CPU and
-OpenCL configurations. The export graph parity evidence is in
-`devnotes/perf/STAGE_RUNTIME.md`.
-
-### Crop runtime mapping
-
-`Crop::update()` was split into thirteen private `Crop::stage*` blocks sharing
-one `CropStageContext`. There is no other crop sequence: `update()` builds
-`buildPipelineSpec(StagePath::Crop)`, marks the
-blocks the request executes dirty, asks `StageGraph::plan()`, and dispatches
-only the accepted blocks. A rejected plan aborts.
-
-Thirteen canonical nodes execute; two are folded:
-
-- `raw.preprocess` and `raw.demosaic` into `source.select`, because the ROI
-  arrives through one opaque `ImageSource::getImage()` call;
-- the pre-RGB directional-pyramid equaliser into `stageTransform()` and
-  `softLight()` into `stageWorkingTrc()`, because moving either changes the
-  result;
-- `analysis` runs before the rest of `raw.base`, matching the legacy
-  interleaving.
+Image: 45.7 MP NEF, 100% viewport 960x640, `OMP_NUM_THREADS=1`. The current
+run reports `33 plans executed, 0 plan fallbacks, 33 dirty derivations` and
+`AE=0` for display and output-space images in every scenario and in the static
+fit/100%/zoomed states. The stage-coverage run also passes with denoise, local
+adjustments, CIE CAM, gamut and the Lab chain active.
 
 The focused harness:
 
@@ -988,10 +712,11 @@ tools/perf/run-suite.sh --build-dir <build-dir> --image <raw> --crop-graph
 ```
 
 It loads the image twice, runs the full-frame preview once per copy, then the
-detailed crop for fit, 100% and zoomed/panned viewports with the mask-derived
-and the derived dirty sets. It compares display and output-space images byte
-for byte and requires one executed plan per state and no plan rejection. Result
-on CPU and OpenCL builds: `AE=0` for every state and profile.
+detailed crop for fit, 100% and zoomed/panned viewports through the derived
+execution set. It compares display and output-space images byte for byte and
+requires one executed plan per state, one dirty derivation per update, and no
+plan rejection. Result on CPU and OpenCL builds: `AE=0` for every state and
+profile.
 
 ## Mask-to-block equivalence map (Phase F)
 

@@ -610,38 +610,11 @@ The plan is refused, and the process aborts, when the derivation is invalid,
 names a block outside the preview inventory, or the graph would skip a dirty
 node.
 
-Controls:
-
-```text
-RT_PREVIEW_DIRTY=mask          event-mask authority (the previous tranche)
-RT_PREVIEW_DIRTY=<other/unset> fingerprint and render-state authority (default)
-RT_PREVIEW_DIRTY_SHADOW=0      disable the shadow comparison (default on)
-```
-
-### Shadow equivalence
-
-Every full-frame pass builds two plans from the same graph: one marked from the
-event-mask gates, one from the fingerprint and render-state derivation. The
-comparison is at the plan level, not the direct-set level, because the graph
-propagates dirtiness downstream: a direct difference that both plans resolve to
-the same executed nodes is not a difference in work. Only a node that one plan
-executes and the other skips is reported.
-
-```text
-preview-dirty: shadow active, fingerprint authority
-preview-dirty: mismatch #3 missing=[rgb.proc] extra=[] mask=0x1009f
-preview-dirty: detail mask=[...] fingerprint=[...] direct=[...]
-preview-dirty: over-approximation #7 extra=[analysis] mask=0x1f
-preview-dirty: detail mask=[...] fingerprint=[...] direct=[...]
-```
-
-`missing` is the dangerous direction and its count is the mismatch count: the
-mask plan executes a node the derivation leaves out, which could leave a stale
-frame. `extra` is the documented over-approximation: the derivation executes a
-node whose own mask gate declines the work inside it, so the pixels are
-unchanged and only the function call is spent. The detail line names both
-executed sets and the direct set the derivation produced. Logging is capped at
-500 differences per process; the counters keep running.
+The preview plan has one authority: the parameter fingerprints and the render
+state. There is no mask-authority switch and no shadow plan. The event mask
+still drives the viewport fast path, the crop render, GUI notification and the
+per-node work inside a scheduled node, but it no longer decides which
+full-frame nodes are scheduled.
 
 ### Dirty-block evidence
 
@@ -683,8 +656,8 @@ proves the edit exercised a real pass. The two profile rows also show the
 expected separation: an output profile reaches only `work.tif`, a monitor
 profile only `preview.tif`.
 
-Across the four graph runs the shadow log reports zero mismatches and two
-over-approximations. On the exposure pass (`mask=0x401f`) the derivation adds
+Historical evidence from the shadow tranche: across the four graph runs the
+shadow log reported zero mismatches and two over-approximations. On the exposure pass (`mask=0x401f`) the derivation adds
 `raw.base`: the event mask leaves the base to the retinex sub-path, the block
 runs and its own gate declines the work. On the output-profile pass
 (`mask=0x4280`, which carries the injected `M_INIT | M_HDR` rebuild bits) it
@@ -721,51 +694,28 @@ The derivation itself lives in `rtengine/stage/stage_dirty_blocks.h/.cc` and
 is the same unit the preview coordinator uses through the adapters above; the
 rules and tables are in `devnotes/perf/STAGE_PIPELINE.md`.
 
-`RT_CROP_DIRTY` selects the execution set:
+The crop plan has one authority: the derived dirty set. There is no
+`RT_CROP_DIRTY` mode and no mask comparison. The mask keeps its two remaining
+jobs: GUI notification and coalescing, and the raw-reload request. `M_INIT`,
+`M_LINDENOISE` and `M_HDR` ask for the destructive raw stage to be reloaded;
+the crop carries that as `RequestKind::FullCrop`, so the derivation rebuilds
+the path instead of skipping a reload no fingerprint describes.
 
-- `legacy` runs the mask-derived set and skips the derivation. It is the A/B
-  baseline for parity runs.
-- `shadow` runs the mask-derived set and compares it with the derived set,
-  logging `missing` (unsafe) and `extra` (over-approximation) block lists once
-  per distinct signature.
-- `fingerprint` is the default: it runs the derived set, and falls back to the
-  mask-derived set for that update when the derived set would skip a block the
-  legacy set runs.
-
-The mask keeps its two remaining jobs: GUI notification and coalescing, and
-the raw-reload request. `M_INIT`, `M_LINDENOISE` and `M_HDR` ask for the
-destructive raw stage to be reloaded; the crop carries that as
-`RequestKind::FullCrop`, so the derivation rebuilds the path instead of
-skipping a reload no fingerprint describes. The `RT_CROP_DIRTY` modes choose
-the dirty set only: every mode executes through the crop graph, which is the
-only crop sequence, and the fail-closed plan refusal aborts. The `todo` gates
-inside the stage bodies are unchanged.
-
-`crop_graph` exposes the diagnostics as process-wide counters:
-`dirtyChecks()`, `dirtyEquivalent()`, `dirtyMissing()`, `dirtyExtra()` and
-`dirtyFallbacks()`. `RT_CROP_DIRTY_TRACE=1` prints one line per derivation with
-the mask, the forced flag, the key parameter values and the directly dirty
+`crop_graph` exposes `runs()`, `fallbacks()` and `dirtyDerivations()` as
+process-wide counters. `RT_CROP_DIRTY_TRACE=1` prints one line per derivation
+with the mask, the forced flag, the key parameter values and the directly dirty
 blocks.
 
 `crop-stage-test --sequences [--only=<scenario>]` drives one edit per scenario
-inside a live session and compares the legacy incremental crop, the candidate
-incremental crop and a fresh render. `--bench=<n> [--bench-edit=crop]
-[--dirty=<mode>]` times repeated updates for the performance gate. Evidence:
-21 of 21 comparisons equivalent, 0 missing blocks, 0 fallbacks and `AE=0` for
-display and output-space images in all three tool configurations; the
-derivation is below the noise of a crop pass (`-0.9%` on a full-path exposure
-edit and `-1.7%` on a short crop-rectangle edit, both inside the 5% gate).
+inside a live session and compares the incremental crop with a fresh render of
+the final state. `--bench=<n> [--bench-edit=crop]` times repeated updates.
+There is no legacy execution path or runtime mask baseline.
 
 Re-run on 2026-10-25 against the unified unit: same image,
-`OMP_NUM_THREADS=1`, `--stages --sequences`, preview graph enabled (the
-default). The harness reports `51 plans executed, 0 plan fallbacks`, `21
-comparisons, 21 equivalent, 0 missing blocks, 12 extra blocks, 0 fail-closed
-fallbacks` and `crop-stage-test: PASS`; every scenario is `AE=0` except the
-documented `SHARPENING` legacy limitation (`AE=1` on 23 235 bytes in both the
-candidate and the baseline fresh comparison). The same run's full-frame
-preview passes log 0 shadow mismatches and 12 over-approximations, all the raw
-core opened by an absolute request on a mask that carries the injected
-`M_INIT | M_HDR` rebuild bits.
+`OMP_NUM_THREADS=1`, `--sequences`. The harness reports `33 plans executed, 0
+plan fallbacks, 33 dirty derivations` and `crop-stage-test: PASS`; every static
+and incremental scenario is `AE=0` for display and output-space images. The
+full preview/crop/thumbnail gate also passes with the mask switches removed.
 
 ## Persistent store
 
@@ -988,9 +938,9 @@ parity.
 The merged branch runs the graph paths by default. `run-suite.sh --graph
 --thumbnail-graph --crop-graph` passes every stage test plus neutral, sidecar
 and graph export `AE=0`, thumbnail parity, crop parity and the crop dirty
-shadow. Preview dumps remain `AE=0` with zero shadow mismatches. The final
-preview run reported p50 147 ms and p95 183 ms over 12 samples. OpenCL
-`--quick` and `--formats` both pass at 1 LSB.
+derivation. Preview dumps remain `AE=0`. The final preview run reported p50
+147 ms and p95 183 ms over 12 samples. OpenCL `--quick` and `--formats` both
+pass at 1 LSB.
 
 ## Graph-only execution
 
@@ -1007,11 +957,10 @@ cannot produce a complete topological order logs one diagnostic and aborts
 `crop-graph: fatal: plan rejected: ...`, `thumbnail-graph: <entry>: fatal:
 plan rejected: ...`). A partly processed image is never produced.
 
-`refreshmap.*` and the `todo` event mask stay: they still drive GUI
-notification, request coalescing, the viewport fast path, the deferred
-analysis queue and the dirty-block derivation. `RT_CROP_DIRTY` and
-`RT_PREVIEW_DIRTY` also stay: they select which dirty set the graph is given,
-not whether the graph runs.
+`refreshmap.*` and the `todo` event mask stay for GUI notification, request
+coalescing, the viewport fast path, the deferred analysis queue and the
+per-node work inside a scheduled node. They no longer decide the preview or
+crop execution set: `RT_PREVIEW_DIRTY` and `RT_CROP_DIRTY` are gone.
 
 The gate is unchanged in shape. `run-suite.sh --graph` now requires the export
 log to report the 20-node inventory and the export to be byte-identical to the
@@ -1033,9 +982,8 @@ where the harness fixes `OMP_NUM_THREADS=1`.
   inventory`; the thumbnail harness logs all four plans active (2, 2, 4 and 6
   nodes); the crop harness logs `6 plans executed, 0 plan fallbacks` for the
   viewport states and for the stage-coverage run.
-- Crop dirty shadow: `21 comparisons, 21 equivalent, 0 missing blocks,
-  31 extra blocks, 0 fail-closed fallbacks`, with `AE=0` parity and fresh
-  renders for every scenario.
+- Crop dirty derivation: `33 plans executed, 0 plan fallbacks, 33 dirty
+  derivations`, with `AE=0` for every static and incremental scenario.
 - Threads: neutral export `AE=0` at 1, 2, 4 and 8 threads.
 - Preview latency over 12 samples: p50 144 ms, p95 232 ms.
 - OpenCL: the OpenCL build compiles with no new warnings in the four changed
@@ -1081,30 +1029,25 @@ follow-up should give the harness a completion signal that does not depend on
 - The preview dirty set has two residual inputs that `RenderStateKey` does not
   carry yet. A pending spot buffer is added to `raw.base` explicitly, and a
   Preview Demosaic Method preference change while the main preview is at 100%
-  can log one `missing all` shadow difference: the effective demosaic decision
-  did not change, and the next quality crossing rebuilds the base.
-- The crop dirty-block derivation replaces the mask as the source of block
-  dirtiness, not as the source of work: the stage bodies keep their `todo`
-  gates, so the derived set can only be trusted as a superset of the legacy
-  set in this phase, and a missing block fails the update closed. The
-  derivation also cannot express the raw reload as a parameter delta; the crop
-  carries the reload bits as a rebuild request. Removing the bodies' gates and
-  making the raw stage incremental are the next steps.
+  can still require a base rebuild: the effective demosaic decision may not
+  change, but the next quality crossing handles it.
+- The crop dirty-block derivation is the execution-set authority, but the
+  stage bodies still keep their `todo` gates for the work inside a scheduled
+  block. The derivation cannot express the raw reload as a parameter delta;
+  the crop carries the reload bits as a rebuild request. Removing the bodies'
+  gates and making the raw stage incremental are still the next steps.
 - The preview adapters return the same execution set as the crop derivation,
   which is wider than the first preview draft in three places: the preview
   geometry row includes the crop rectangle, the high-detail row starts at
   `source.select`, and the editor row covers the sharpening-mask toggle and the
-  FAST switches together. Each is over-approximation in the documented
-  direction; the shadow log measures the cost.
+  FAST switches together. Each is an over-approximation; the graph plan
+  remains the authority and the body's own gate decides how much work runs.
 - The GUI scenario coverage for the dirty-block change is partial. Initial fit,
   exposure, monitor profile, output profile and image reload have dump pairs;
   tone curve and crop geometry do not, because the xdotool harness could not
   drive those panels reproducibly in both runs. Those two are covered by
-  `stage-dirty-blocks-test` and by the shadow log of the transitions that did
+  `stage-dirty-blocks-test` and by the dump pairs of the transitions that did
   run, and are recorded as a harness gap rather than a PASS.
-- The shadow comparison hashes the preview parameters once per full-frame pass.
-  It is cheap (fourteen descriptors, a few kilobytes of member data) but it is
-  not free, and it is a development gate rather than a product feature.
 - Five export blocks are folded inside a neighbouring node rather than
   having an execution boundary of their own: the framing geometry (in
   `crop`), the Nearest output resize (in `output.convert`), the three
