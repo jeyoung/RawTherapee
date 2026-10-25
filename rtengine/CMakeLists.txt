@@ -206,6 +206,22 @@ add_executable(fast-preview-test EXCLUDE_FROM_ALL
 target_link_libraries(fast-preview-test PRIVATE rtengine)
 rt_setup_target(fast-preview-test)
 
+# Focused legacy-vs-graph parity harness for the thumbnail stage graph.
+add_executable(thumbnail-stage-test EXCLUDE_FROM_ALL
+    "${PROJECT_SOURCE_DIR}/tools/perf/thumbnail-stage-test.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/editcallbacks.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/multilangmgr.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/options.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/paramsedited.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/pathutils.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/threadutils.cc"
+)
+target_include_directories(thumbnail-stage-test BEFORE PRIVATE
+    "${CMAKE_BINARY_DIR}/rtgui"
+)
+target_link_libraries(thumbnail-stage-test PRIVATE rtengine)
+rt_setup_target(thumbnail-stage-test)
+
 # Runtime stage ABI and built-in/module parity tests.
 add_executable(stage-abi-test EXCLUDE_FROM_ALL
     "${CMAKE_CURRENT_SOURCE_DIR}/stage/tests/stage_abi_test.cc"

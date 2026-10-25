@@ -18,7 +18,15 @@
  */
 #include <algorithm>
 #include <array>
+#include <cassert>
 #include <clocale>
+#include <cstdio>
+#include <cstring>
+#include <initializer_list>
+#include <memory>
+#include <mutex>
+#include <set>
+#include <string>
 
 #include <lcms2.h>
 
@@ -46,6 +54,8 @@
 #include "rtengine.h"
 #include "rtthumbnail.h"
 #include "settings.h"
+#include "stage/stage_graph.h"
+#include "stage/stage_pipeline.h"
 #include "stdimagesource.h"
 #include "StopWatch.h"
 #include "utils.h"
@@ -260,6 +270,158 @@ void scale_colors (rtengine::RawImage *ri, float scale_mul[4], float cblack[4], 
 
 }
 
+namespace
+{
+
+/*
+ * Opt-in switch for the graph-driven thumbnail path (RT_STAGE_GRAPH).
+ *
+ * The legacy thumbnail sequence stays the default: only a value other than
+ * empty, "0" or "off" (case-insensitive) selects the graph. The value is read
+ * per call so a harness can compare both paths in one process; the lookup is
+ * negligible next to thumbnail generation.
+ */
+bool thumbnailGraphEnabled()
+{
+    const char* value = g_getenv("RT_STAGE_GRAPH");
+    return value != nullptr && value[0] != '\0'
+        && g_ascii_strcasecmp(value, "0") != 0
+        && g_ascii_strcasecmp(value, "off") != 0;
+}
+
+struct ThumbnailGraphPlan {
+    bool valid = false;
+    std::string reason;
+    rtengine::stage::StagePipelineSpec spec;
+    /* Active node ids in plan (topological) order. */
+    std::vector<std::string> execute;
+};
+
+/*
+ * Build the canonical thumbnail spec, connect it into a StageGraph and ask
+ * StageGraph::plan() which nodes this invocation may run. The nodes the
+ * legacy code executes for this invocation are marked dirty; every other
+ * canonical node is clean because its data is either already held by the
+ * Thumbnail (thumbImg) or belongs to a branch this invocation does not take.
+ *
+ * A plan is rejected, and the caller falls back to the unchanged legacy
+ * sequence, when an active node would be skipped: that is the only way the
+ * graph could change the result.
+ */
+ThumbnailGraphPlan planThumbnailGraph(
+    std::initializer_list<const char*> active)
+{
+    using namespace rtengine::stage;
+
+    ThumbnailGraphPlan result;
+    result.spec = buildPipelineSpec(StagePath::Thumbnail);
+
+    const auto indexOf = [&result](const std::string& id) -> size_t {
+        for (size_t i = 0; i < result.spec.nodes.size(); ++i) {
+            if (result.spec.nodes[i].id == id) {
+                return i;
+            }
+        }
+        return result.spec.nodes.size();
+    };
+
+    StageGraph graph;
+    std::vector<size_t> nodes;
+    nodes.reserve(result.spec.nodes.size());
+    for (const auto& node : result.spec.nodes) {
+        nodes.push_back(graph.addNode(node.id, node.reuse));
+    }
+
+    for (const auto& edge : result.spec.edges) {
+        const size_t from = indexOf(edge.first);
+        const size_t to = indexOf(edge.second);
+        if (from == result.spec.nodes.size() || to == result.spec.nodes.size()) {
+            result.reason = "unknown-edge";
+            return result;
+        }
+        graph.connect(nodes[from], nodes[to]);
+    }
+
+    std::vector<bool> activeNode(result.spec.nodes.size(), false);
+    for (const char* id : active) {
+        const size_t index = indexOf(id);
+        if (index == result.spec.nodes.size()) {
+            result.reason = std::string("unknown-node:") + id;
+            return result;
+        }
+        activeNode[index] = true;
+        graph.markDirty(nodes[index]);
+    }
+    for (size_t i = 0; i < result.spec.nodes.size(); ++i) {
+        if (!activeNode[i]) {
+            graph.markClean(nodes[i]);
+        }
+    }
+
+    std::vector<size_t> order;
+    if (!graph.topologicalOrder(order)
+            || order.size() != result.spec.nodes.size()) {
+        result.reason = "cycle";
+        return result;
+    }
+
+    const std::vector<StageDecision> plan = graph.plan();
+    if (plan.size() != result.spec.nodes.size()) {
+        result.reason = "incomplete-plan";
+        return result;
+    }
+
+    for (size_t index : order) {
+        if (!activeNode[index]) {
+            continue;
+        }
+        if (plan[index].action == StageAction::ReuseOutput) {
+            result.reason = result.spec.nodes[index].id;
+            return result;
+        }
+        result.execute.push_back(result.spec.nodes[index].id);
+    }
+
+    if (result.execute.size() != active.size()) {
+        result.reason = "missing-node";
+        return result;
+    }
+
+    result.valid = true;
+    return result;
+}
+
+/* One diagnostic line per entry point and outcome, so a log stays readable. */
+void logThumbnailGraph(const char* entry, const ThumbnailGraphPlan& plan)
+{
+    static std::mutex mutex;
+    static std::set<std::string> logged;
+
+    std::lock_guard<std::mutex> lock(mutex);
+
+    std::string key(entry);
+    key += plan.valid ? ":active" : ":fallback:" + plan.reason;
+    if (!logged.insert(key).second) {
+        return;
+    }
+
+    if (!plan.valid) {
+        std::fprintf(stderr,
+                     "thumbnail-graph: %s: fallback to legacy: plan would skip %s\n",
+                     entry, plan.reason.c_str());
+        return;
+    }
+
+    std::fprintf(stderr, "thumbnail-graph: %s: active, %zu canonical nodes:",
+                 entry, plan.execute.size());
+    for (const auto& id : plan.execute) {
+        std::fprintf(stderr, " %s", id.c_str());
+    }
+    std::fprintf(stderr, "\n");
+}
+
+} // namespace
+
 namespace rtengine
 {
 
@@ -453,6 +615,112 @@ Image8 *load_inspector_mode(const Glib::ustring &fname, eSensorType &sensorType,
 
 } // namespace
 
+struct Thumbnail::EmbeddedStageState {
+    const Glib::ustring* fname = nullptr;
+    eSensorType* sensorType = nullptr;
+    int* w = nullptr;
+    int* h = nullptr;
+    int fixwh = 1;
+    bool rotate = false;
+    Thumbnail* tpp = nullptr;
+    RawImage* ri = nullptr;
+    Image8* img = nullptr;
+};
+
+/*
+ * source.embedded for the reduced thumbnail path: open the raw container and
+ * select its embedded JPEG. The container load is folded into this root
+ * because it exists only to reach the embedded image.
+ */
+bool Thumbnail::stageSourceEmbedded(EmbeddedStageState& state)
+{
+    const Glib::ustring& fname = *state.fname;
+    eSensorType& sensorType = *state.sensorType;
+    RawImage*& ri = state.ri;
+    Image8*& img = state.img;
+
+    ri = new RawImage (fname);
+    unsigned int imageNum = 0;
+    int r = ri->loadRaw (false, imageNum, false);
+
+    if ( r ) {
+        delete ri;
+        ri = nullptr;
+        sensorType = ST_NONE;
+        return false;
+    }
+
+    sensorType = ri->getSensorType();
+
+    img = ri->getThumbnail();
+
+    // did we succeed?
+    if (!img) {
+        if (settings->verbose) {
+            std::cout << "Could not extract thumb from " << fname.c_str() << std::endl;
+        }
+        delete ri;
+        ri = nullptr;
+        return false;
+    }
+    return true;
+}
+
+/*
+ * thumbnail.decode: scale the embedded JPEG to the requested size and apply
+ * the coarse rotation, with the Leaf, Mamiya and Phase One exceptions that
+ * store an already-rotated embedded image.
+ */
+void Thumbnail::stageThumbnailDecode(EmbeddedStageState& state)
+{
+    RawImage*& ri = state.ri;
+    Thumbnail* tpp = state.tpp;
+    Image8*& img = state.img;
+    int& w = *state.w;
+    int& h = *state.h;
+    const int fixwh = state.fixwh;
+    const bool rotate = state.rotate;
+
+    if (fixwh == 1) {
+        w = h * img->getWidth() / img->getHeight();
+        tpp->scale = (double)img->getHeight() / h;
+    } else {
+        h = w * img->getHeight() / img->getWidth();
+        tpp->scale = (double)img->getWidth() / w;
+    }
+
+    if (tpp->thumbImg) {
+        delete tpp->thumbImg;
+        tpp->thumbImg = nullptr;
+    }
+
+    tpp->thumbImg = resizeTo<Image8> (w, h, TI_Nearest, img);
+    delete img;
+
+    if (rotate && ri->get_rotateDegree() > 0) {
+        std::string fname = ri->get_filename();
+        std::string suffix = fname.length() > 4 ? fname.substr (fname.length() - 3) : "";
+
+        for (unsigned int i = 0; i < suffix.length(); i++) {
+            suffix[i] = std::tolower (suffix[i]);
+        }
+
+        // Leaf .mos, Mamiya .mef and Phase One .iiq files have thumbnails already rotated.
+        if (suffix != "mos" && suffix != "mef" && suffix != "iiq")  {
+            tpp->thumbImg->rotate (ri->get_rotateDegree());
+            // width/height may have changed after rotating
+            w = tpp->thumbImg->getWidth();
+            h = tpp->thumbImg->getHeight();
+        }
+    }
+
+    tpp->init ();
+
+    delete ri;
+    ri = nullptr;
+}
+
+
 Thumbnail* Thumbnail::loadQuickFromRaw (const Glib::ustring& fname, eSensorType &sensorType, int &w, int &h, int fixwh, bool rotate, bool inspectorMode, bool forHistogramMatching)
 {
     Thumbnail* tpp = new Thumbnail ();
@@ -475,32 +743,55 @@ Thumbnail* Thumbnail::loadQuickFromRaw (const Glib::ustring& fname, eSensorType 
         return tpp;
     }
 
-    RawImage *ri = new RawImage (fname);
-    unsigned int imageNum = 0;
-    int r = ri->loadRaw (false, imageNum, false);
+    EmbeddedStageState state;
+    state.fname = &fname;
+    state.sensorType = &sensorType;
+    state.w = &w;
+    state.h = &h;
+    state.fixwh = fixwh;
+    state.rotate = rotate;
+    state.tpp = tpp;
 
-    if ( r ) {
-        delete tpp;
-        delete ri;
-        sensorType = ST_NONE;
-        return nullptr;
+    /*
+     * Inspector mode wants either the embedded JPEG at its native size or a
+     * full-resolution raw conversion. Both are outside the reduced-domain
+     * graph, so only normal thumbnails take the graph path.
+     */
+    if (!inspectorMode && thumbnailGraphEnabled()) {
+        const ThumbnailGraphPlan plan = planThumbnailGraph(
+            {"source.embedded", "thumbnail.decode"});
+        logThumbnailGraph("loadQuickFromRaw", plan);
+
+        if (plan.valid) {
+            for (const auto& id : plan.execute) {
+                if (id == "source.embedded") {
+                    if (!stageSourceEmbedded(state)) {
+                        delete state.tpp;
+                        return nullptr;
+                    }
+                } else if (id == "thumbnail.decode") {
+                    stageThumbnailDecode(state);
+                } else {
+                    assert(false);
+                    delete state.tpp;
+                    return nullptr;
+                }
+            }
+            return state.tpp;
+        }
     }
 
-    sensorType = ri->getSensorType();
-
-    Image8 *img = ri->getThumbnail();
-
-    // did we succeed?
-    if (!img) {
-        if (settings->verbose) {
-            std::cout << "Could not extract thumb from " << fname.c_str() << std::endl;
-        }
-        delete tpp;
-        delete ri;
+    if (!stageSourceEmbedded(state)) {
+        delete state.tpp;
         return nullptr;
     }
 
     if (inspectorMode) {
+        RawImage*& ri = state.ri;
+        Image8*& img = state.img;
+        int& w = *state.w;
+        int& h = *state.h;
+
         // Special case, meaning that we want a full sized thumbnail image (e.g. for the Inspector feature)
         w = img->getWidth();
         h = img->getHeight();
@@ -521,70 +812,112 @@ Thumbnail* Thumbnail::loadQuickFromRaw (const Glib::ustring& fname, eSensorType 
 
             return tpp;
         }
-    } else {
-        if (fixwh == 1) {
-            w = h * img->getWidth() / img->getHeight();
-            tpp->scale = (double)img->getHeight() / h;
-        } else {
-            h = w * img->getHeight() / img->getWidth();
-            tpp->scale = (double)img->getWidth() / w;
+
+        if (tpp->thumbImg) {
+            delete tpp->thumbImg;
+            tpp->thumbImg = nullptr;
         }
-    }
 
-    if (tpp->thumbImg) {
-        delete tpp->thumbImg;
-        tpp->thumbImg = nullptr;
-    }
-
-    if (inspectorMode) {
         tpp->thumbImg = img;
-    } else {
-        tpp->thumbImg = resizeTo<Image8> (w, h, TI_Nearest, img);
-        delete img;
-    }
 
-    if (rotate && ri->get_rotateDegree() > 0) {
-        std::string fname = ri->get_filename();
-        std::string suffix = fname.length() > 4 ? fname.substr (fname.length() - 3) : "";
+        if (rotate && ri->get_rotateDegree() > 0) {
+            std::string fname = ri->get_filename();
+            std::string suffix = fname.length() > 4 ? fname.substr (fname.length() - 3) : "";
 
-        for (unsigned int i = 0; i < suffix.length(); i++) {
-            suffix[i] = std::tolower (suffix[i]);
+            for (unsigned int i = 0; i < suffix.length(); i++) {
+                suffix[i] = std::tolower (suffix[i]);
+            }
+
+            // Leaf .mos, Mamiya .mef and Phase One .iiq files have thumbnails already rotated.
+            if (suffix != "mos" && suffix != "mef" && suffix != "iiq")  {
+                tpp->thumbImg->rotate (ri->get_rotateDegree());
+                // width/height may have changed after rotating
+                w = tpp->thumbImg->getWidth();
+                h = tpp->thumbImg->getHeight();
+            }
         }
 
-        // Leaf .mos, Mamiya .mef and Phase One .iiq files have thumbnails already rotated.
-        if (suffix != "mos" && suffix != "mef" && suffix != "iiq")  {
-            tpp->thumbImg->rotate (ri->get_rotateDegree());
-            // width/height may have changed after rotating
-            w = tpp->thumbImg->getWidth();
-            h = tpp->thumbImg->getHeight();
-        }
+        delete ri;
+        ri = nullptr;
+
+        return tpp;
     }
 
-    if (!inspectorMode) {
-        tpp->init ();
-    }
-
-    delete ri;
-
+    stageThumbnailDecode(state);
     return tpp;
 }
+
 
 #define FISRED(filter,row,col) \
     ((filter >> ((((row) << 1 & 14) + ((col) & 1)) << 1) & 3)==0 || !filter)
 #define FISGREEN(filter,row,col) \
     ((filter >> ((((row) << 1 & 14) + ((col) & 1)) << 1) & 3)==1 || !filter)
 
-Thumbnail* Thumbnail::loadFromRaw (const Glib::ustring& fname, eSensorType &sensorType, int &w, int &h, int fixwh, double wbEq, StandardObserver wbObserver, bool rotate, const RAWParams *rawParams, bool forHistogramMatching)
+struct Thumbnail::RawStageState {
+    const Glib::ustring* fname = nullptr;
+    eSensorType* sensorType = nullptr;
+    int* w = nullptr;
+    int* h = nullptr;
+    int fixwh = 1;
+    double wbEq = 1.0;
+    StandardObserver wbObserver = StandardObserver::TWO_DEGREES;
+    bool rotate = false;
+    const RAWParams* rawParams = nullptr;
+    bool forHistogramMatching = false;
+
+    Thumbnail* tpp = nullptr;
+    RawImage* ri = nullptr;
+
+    int width = 0;
+    int height = 0;
+    int iwidth = 0;
+    int iheight = 0;
+    int left_margin = 0;
+    int top_margin = 0;
+
+    float pre_mul[4] = {1.f, 1.f, 1.f, 1.f};
+    float scale_mul[4] = {1.f, 1.f, 1.f, 1.f};
+    float cblack[4] = {0.f, 0.f, 0.f, 0.f};
+
+    unsigned filter = 0;
+    int firstgreen = 1;
+    int hskip = 1;
+    int vskip = 1;
+
+    Imagefloat* tmpImg = nullptr;
+    int tmpw = 0;
+    int tmph = 0;
+    bool rotate_90 = false;
+
+    DCraw::dcrawImage_t image = nullptr;
+};
+
+/*
+ * source.select for the raw fallback: open the raw container, resolve the
+ * frame to decode and record the sensor and crop geometry.
+ */
+bool Thumbnail::stageSourceSelect(RawStageState& state)
 {
-    RawImage *ri = new RawImage (fname);
+    const Glib::ustring& fname = *state.fname;
+    eSensorType& sensorType = *state.sensorType;
+    RawImage*& ri = state.ri;
+    int& width = state.width;
+    int& height = state.height;
+    int& iwidth = state.iwidth;
+    int& iheight = state.iheight;
+    int& left_margin = state.left_margin;
+    int& top_margin = state.top_margin;
+
+    ri = new RawImage (fname);
     unsigned int tempImageNum = 0;
 
     int r = ri->loadRaw (1, tempImageNum, 0);
 
     if ( r ) {
         delete ri;
+        ri = nullptr;
         sensorType = ST_NONE;
-        return nullptr;
+        return false;
     }
 
     if (ri->getFrameCount() == 7) {
@@ -594,20 +927,40 @@ Thumbnail* Thumbnail::loadFromRaw (const Glib::ustring& fname, eSensorType &sens
 
         if ( r ) {
             delete ri;
+            ri = nullptr;
             sensorType = ST_NONE;
-            return nullptr;
+            return false;
         }
     }
     sensorType = ri->getSensorType();
 
-    int width = ri->get_width();
-    int height = ri->get_height();
-    int iwidth = ri->get_iwidth();
-    int iheight = ri->get_iheight();
-    int left_margin = ri->get_leftmargin();
-    int top_margin = ri->get_topmargin();
+    width = ri->get_width();
+    height = ri->get_height();
+    iwidth = ri->get_iwidth();
+    iheight = ri->get_iheight();
+    left_margin = ri->get_leftmargin();
+    top_margin = ri->get_topmargin();
+    return true;
+}
 
-    rtengine::Thumbnail* tpp = new rtengine::Thumbnail;
+/*
+ * raw.preprocess: black and white levels, scale multipliers, colour scaling
+ * and the Bayer/X-Trans pre-interpolation performed by the raw preprocessor.
+ */
+void Thumbnail::stageRawPreprocess(RawStageState& state)
+{
+    RawImage* const ri = state.ri;
+    Thumbnail*& tpp = state.tpp;
+    const RAWParams* rawParams = state.rawParams;
+    const bool forHistogramMatching = state.forHistogramMatching;
+    float (&pre_mul)[4] = state.pre_mul;
+    float (&scale_mul)[4] = state.scale_mul;
+    float (&cblack)[4] = state.cblack;
+    const eSensorType sensorType = *state.sensorType;
+    unsigned& filter = state.filter;
+    int& firstgreen = state.firstgreen;
+
+    tpp = new rtengine::Thumbnail;
 
     tpp->isRaw = true;
     tpp->embProfile = nullptr;
@@ -628,7 +981,6 @@ Thumbnail* Thumbnail::loadFromRaw (const Glib::ustring& fname, eSensorType &sens
              rawParams->xtranssensor.method == RAWParams::XTransSensor::getMethodString(RAWParams::XTransSensor::Method::MONO)) ||
             (ri->getSensorType() == ST_BAYER &&
                 rawParams->bayersensor.method == RAWParams::BayerSensor::getMethodString(RAWParams::BayerSensor::Method::MONO)));
-    float pre_mul[4], scale_mul[4], cblack[4];
     ri->get_colorsCoeff (pre_mul, scale_mul, cblack, false);
     adjustBlackLevels(cblack, sensorType, rawParams);
     calculate_scale_mul(scale_mul, pre_mul, cblack, isMono, ri);
@@ -647,14 +999,43 @@ Thumbnail* Thumbnail::loadFromRaw (const Glib::ustring& fname, eSensorType &sens
 
     tpp->gammaCorrected = true;
 
-    unsigned filter = ri->get_filters();
-    int firstgreen = 1;
+    filter = ri->get_filters();
+    firstgreen = 1;
 
     // locate first green location in the first row
     if (ri->getSensorType() == ST_BAYER)
         while (!FISGREEN (filter, 1, firstgreen) && firstgreen < 3) {
             firstgreen++;
         }
+}
+
+/*
+ * raw.demosaic: the reduced sampled demosaic of the raw fallback, including
+ * the Fuji geometry remap.
+ */
+void Thumbnail::stageRawDemosaic(RawStageState& state)
+{
+    RawImage* const ri = state.ri;
+    const int width = state.width;
+    const int height = state.height;
+    const int iwidth = state.iwidth;
+    const int iheight = state.iheight;
+    const int left_margin = state.left_margin;
+    const int top_margin = state.top_margin;
+    const int fixwh = state.fixwh;
+    const bool rotate = state.rotate;
+    const eSensorType sensorType = *state.sensorType;
+    unsigned& filter = state.filter;
+    int& firstgreen = state.firstgreen;
+    int& w = *state.w;
+    int& h = *state.h;
+    int& hskip = state.hskip;
+    int& vskip = state.vskip;
+    int& tmpw = state.tmpw;
+    int& tmph = state.tmph;
+    Imagefloat*& tmpImg = state.tmpImg;
+    bool& rotate_90 = state.rotate_90;
+    DCraw::dcrawImage_t& image = state.image;
 
     int skip = 1;
 
@@ -680,19 +1061,20 @@ Thumbnail* Thumbnail::loadFromRaw (const Glib::ustring& fname, eSensorType &sens
         skip = 2;
     }
 
-    int hskip = skip, vskip = skip;
+    hskip = skip;
+    vskip = skip;
 
     if (!ri->get_model().compare ("D1X")) {
         hskip *= 2;
     }
 
     int rofs = 0;
-    int tmpw = (width - 2) / hskip;
-    int tmph = (height - 2) / vskip;
+    tmpw = (width - 2) / hskip;
+    tmph = (height - 2) / vskip;
 
-    DCraw::dcrawImage_t image = ri->get_image();
+    image = ri->get_image();
 
-    Imagefloat* tmpImg = new Imagefloat (tmpw, tmph);
+    tmpImg = new Imagefloat (tmpw, tmph);
 
     if (ri->getSensorType() == ST_BAYER) {
         // demosaicing! (sort of)
@@ -844,7 +1226,7 @@ Thumbnail* Thumbnail::loadFromRaw (const Glib::ustring& fname, eSensorType &sens
         tmph = high;
     }
 
-    const bool rotate_90 =
+    rotate_90 =
         rotate
         && (
             ri->get_rotateDegree() == 90
@@ -854,6 +1236,31 @@ Thumbnail* Thumbnail::loadFromRaw (const Glib::ustring& fname, eSensorType &sens
     if (rotate_90) {
         std::swap (tmpw, tmph);
     }
+}
+
+/*
+ * raw.base: finish the reduced raw image, including the histogram and auto
+ * white-balance analysis folded into this block by the canonical spec.
+ */
+void Thumbnail::stageRawBase(RawStageState& state)
+{
+    RawImage*& ri = state.ri;
+    Thumbnail*& tpp = state.tpp;
+    Imagefloat*& tmpImg = state.tmpImg;
+    int& tmpw = state.tmpw;
+    int& tmph = state.tmph;
+    bool& rotate_90 = state.rotate_90;
+    int& w = *state.w;
+    int& h = *state.h;
+    const int fixwh = state.fixwh;
+    const int width = state.width;
+    const int height = state.height;
+    const unsigned filter = state.filter;
+    const bool forHistogramMatching = state.forHistogramMatching;
+    const bool rotate = state.rotate;
+    const double wbEq = state.wbEq;
+    const StandardObserver wbObserver = state.wbObserver;
+    const DCraw::dcrawImage_t image = state.image;
 
     if (fixwh == 1) { // fix height, scale width
         w = tmpw * h / tmph;
@@ -1048,8 +1455,64 @@ Thumbnail* Thumbnail::loadFromRaw (const Glib::ustring& fname, eSensorType &sens
     RawImageSource::computeFullSize(ri, TR_NONE, tpp->full_width, tpp->full_height);
 
     delete ri;
-    return tpp;
+    ri = nullptr;
 }
+
+Thumbnail* Thumbnail::loadFromRaw (const Glib::ustring& fname, eSensorType &sensorType, int &w, int &h, int fixwh, double wbEq, StandardObserver wbObserver, bool rotate, const RAWParams *rawParams, bool forHistogramMatching)
+{
+    RawStageState state;
+    state.fname = &fname;
+    state.sensorType = &sensorType;
+    state.w = &w;
+    state.h = &h;
+    state.fixwh = fixwh;
+    state.wbEq = wbEq;
+    state.wbObserver = wbObserver;
+    state.rotate = rotate;
+    state.rawParams = rawParams;
+    state.forHistogramMatching = forHistogramMatching;
+
+    bool executed = false;
+
+    if (thumbnailGraphEnabled()) {
+        const ThumbnailGraphPlan plan = planThumbnailGraph(
+            {"source.select", "raw.preprocess", "raw.demosaic", "raw.base"});
+        logThumbnailGraph("loadFromRaw", plan);
+
+        if (plan.valid) {
+            for (const auto& id : plan.execute) {
+                if (id == "source.select") {
+                    if (!stageSourceSelect(state)) {
+                        return nullptr;
+                    }
+                } else if (id == "raw.preprocess") {
+                    stageRawPreprocess(state);
+                } else if (id == "raw.demosaic") {
+                    stageRawDemosaic(state);
+                } else if (id == "raw.base") {
+                    stageRawBase(state);
+                } else {
+                    assert(false);
+                    delete state.tpp;
+                    return nullptr;
+                }
+            }
+            executed = true;
+        }
+    }
+
+    if (!executed) {
+        if (!stageSourceSelect(state)) {
+            return nullptr;
+        }
+        stageRawPreprocess(state);
+        stageRawDemosaic(state);
+        stageRawBase(state);
+    }
+
+    return state.tpp;
+}
+
 #undef FISRED
 #undef FISGREEN
 #undef FISBLUE
@@ -1126,9 +1589,23 @@ Thumbnail::~Thumbnail ()
     }
 }
 
-// Simple processing of RAW internal JPGs
-IImage8* Thumbnail::quickProcessImage (const procparams::ProcParams& params, int rheight, rtengine::TypeInterpolation interp)
+struct Thumbnail::QuickStageState {
+    const procparams::ProcParams* params = nullptr;
+    int rheight = 0;
+    TypeInterpolation interp = TI_Nearest;
+    Image8* img = nullptr;
+};
+
+/*
+ * thumbnail.scale for the embedded JPEG branch. The embedded image continues
+ * in 8-bit, so this block rescales to the requested height with the same
+ * arithmetic as the legacy quick path.
+ */
+void Thumbnail::stageQuickScale(QuickStageState& state)
 {
+    const procparams::ProcParams& params = *state.params;
+    Image8*& baseImg = state.img;
+    int& rheight = state.rheight;
 
     int rwidth;
 
@@ -1139,7 +1616,16 @@ IImage8* Thumbnail::quickProcessImage (const procparams::ProcParams& params, int
         rwidth = thumbImg->getWidth() * rheight / thumbImg->getHeight();
     }
 
-    Image8* baseImg = resizeTo<Image8> (rwidth, rheight, interp, thumbImg);
+    baseImg = resizeTo<Image8> (rwidth, rheight, state.interp, thumbImg);
+}
+
+/*
+ * thumbnail.transform for the embedded JPEG branch.
+ */
+void Thumbnail::stageQuickTransform(QuickStageState& state)
+{
+    const procparams::ProcParams& params = *state.params;
+    Image8*& baseImg = state.img;
 
     if (params.coarse.rotate) {
         baseImg->rotate (params.coarse.rotate);
@@ -1152,18 +1638,151 @@ IImage8* Thumbnail::quickProcessImage (const procparams::ProcParams& params, int
     if (params.coarse.vflip) {
         baseImg->vflip ();
     }
-
-    return baseImg;
 }
 
-// Full thumbnail processing, second stage if complete profile exists
-IImage8* Thumbnail::processImage (const procparams::ProcParams& params, eSensorType sensorType, int rheight, TypeInterpolation interp, const FramesMetaData *metadata, double& myscale, bool forMonitor, bool forHistogramMatching)
+// Simple processing of RAW internal JPGs
+IImage8* Thumbnail::quickProcessImage (const procparams::ProcParams& params, int rheight, rtengine::TypeInterpolation interp)
 {
-    const std::string camName = metadata->getCamera();
-    const float shutter = metadata->getShutterSpeed();
-    const float fnumber = metadata->getFNumber();
-    const float iso = metadata->getISOSpeed();
-    const float fcomp = metadata->getExpComp();
+    QuickStageState state;
+    state.params = &params;
+    state.rheight = rheight;
+    state.interp = interp;
+
+    bool executed = false;
+
+    if (thumbnailGraphEnabled()) {
+        const ThumbnailGraphPlan plan = planThumbnailGraph(
+            {"thumbnail.scale", "thumbnail.transform"});
+        logThumbnailGraph("quickProcessImage", plan);
+
+        if (plan.valid) {
+            for (const auto& id : plan.execute) {
+                if (id == "thumbnail.scale") {
+                    stageQuickScale(state);
+                } else if (id == "thumbnail.transform") {
+                    stageQuickTransform(state);
+                } else {
+                    assert(false);
+                    return nullptr;
+                }
+            }
+            executed = true;
+        }
+    }
+
+    if (!executed) {
+        stageQuickScale(state);
+        stageQuickTransform(state);
+    }
+
+    return state.img;
+}
+
+struct Thumbnail::StageState {
+    /*
+     * ipf is declared first so that it is destroyed last, as in the original
+     * single-function implementation.
+     */
+    std::unique_ptr<ImProcFunctions> ipf;
+    LUTu hist16;
+    LUTu dummy;
+    LUTf curve1;
+    LUTf curve2;
+
+    const procparams::ProcParams* params = nullptr;
+    const FramesMetaData* metadata = nullptr;
+    TypeInterpolation interp = TI_Bilinear;
+    bool forMonitor = true;
+    bool forHistogramMatching = false;
+
+    int rwidth = 0;
+    int rheight = 0;
+    double* myscale = nullptr;
+
+    std::string camName;
+    float shutter = 0.f;
+    float fnumber = 0.f;
+    float iso = 0.f;
+    float fcomp = 0.f;
+
+    ColorTemp currWB;
+    Imagefloat* baseImg = nullptr;
+    LabImage* labView = nullptr;
+    Image8* readyImg = nullptr;
+    int fw = 0;
+    int fh = 0;
+};
+
+/*
+ * thumbnail.scale: reduce the cached thumbnail to the requested height and run
+ * the legacy film-negative inversion before any geometry.
+ */
+void Thumbnail::stageScale(StageState& state)
+{
+    const procparams::ProcParams& params = *state.params;
+    Imagefloat*& baseImg = state.baseImg;
+    int& rwidth = state.rwidth;
+    int& rheight = state.rheight;
+
+    // resize to requested width and perform coarse transformation
+    if (params.coarse.rotate == 90 || params.coarse.rotate == 270) {
+        rwidth = rheight;
+        rheight = int (size_t (thumbImg->getHeight()) * size_t (rwidth) / size_t (thumbImg->getWidth()));
+    } else {
+        rwidth = int (size_t (thumbImg->getWidth()) * size_t (rheight) / size_t (thumbImg->getHeight()));
+    }
+
+    if (rwidth < 1) rwidth = 1;
+    if (rheight < 1) rheight = 1;
+
+    baseImg = resizeTo<Imagefloat> (rwidth, rheight, state.interp, thumbImg);
+
+    // Film negative legacy mode, for backwards compatibility RT v5.8
+    if (params.filmNegative.enabled) {
+        if (params.filmNegative.backCompat == FilmNegativeParams::BackCompat::V1) {
+            processFilmNegative(params, baseImg, rwidth, rheight);
+        } else if (params.filmNegative.backCompat == FilmNegativeParams::BackCompat::V2) {
+            processFilmNegativeV2(params, baseImg, rwidth, rheight);
+        }
+    }
+}
+
+/*
+ * thumbnail.transform: coarse rotate and flip of the reduced image.
+ */
+void Thumbnail::stageTransform(StageState& state)
+{
+    const procparams::ProcParams& params = *state.params;
+    Imagefloat*& baseImg = state.baseImg;
+    int& rwidth = state.rwidth;
+    int& rheight = state.rheight;
+
+    if (params.coarse.rotate) {
+        baseImg->rotate (params.coarse.rotate);
+        rwidth = baseImg->getWidth();
+        rheight = baseImg->getHeight();
+    }
+
+    if (params.coarse.hflip) {
+        baseImg->hflip ();
+    }
+
+    if (params.coarse.vflip) {
+        baseImg->vflip ();
+    }
+}
+
+/*
+ * thumbnail.whitebalance: resolve the white-balance multipliers and apply
+ * them, including the highlight-recovery magenta guard.
+ */
+void Thumbnail::stageWhiteBalance(StageState& state)
+{
+    const procparams::ProcParams& params = *state.params;
+    Imagefloat*& baseImg = state.baseImg;
+    int& rwidth = state.rwidth;
+    int& rheight = state.rheight;
+    ColorTemp& currWB = state.currWB;
 
     // check if the WB's equalizer, temperature bias, or observer value has changed
     if (wbEqual < (params.wb.equal - 5e-4) || wbEqual > (params.wb.equal + 5e-4) || wbTempBias < (params.wb.tempBias - 5e-4) || wbTempBias > (params.wb.tempBias + 5e-4) || wbObserver != params.wb.observer) {
@@ -1177,7 +1796,7 @@ IImage8* Thumbnail::processImage (const procparams::ProcParams& params, eSensorT
     }
 
     // compute WB multipliers
-    ColorTemp currWB = ColorTemp (params.wb.temperature, params.wb.green, params.wb.equal, params.wb.method, params.wb.observer);
+    currWB = ColorTemp (params.wb.temperature, params.wb.green, params.wb.equal, params.wb.method, params.wb.observer);
 
     if (!params.wb.enabled) {
         currWB = ColorTemp();
@@ -1234,45 +1853,6 @@ IImage8* Thumbnail::processImage (const procparams::ProcParams& params, eSensorT
         bmi *= params.raw.expos;
     }
 
-    // resize to requested width and perform coarse transformation
-    int rwidth;
-
-    if (params.coarse.rotate == 90 || params.coarse.rotate == 270) {
-        rwidth = rheight;
-        rheight = int (size_t (thumbImg->getHeight()) * size_t (rwidth) / size_t (thumbImg->getWidth()));
-    } else {
-        rwidth = int (size_t (thumbImg->getWidth()) * size_t (rheight) / size_t (thumbImg->getHeight()));
-    }
-
-    if (rwidth < 1) rwidth = 1;
-    if (rheight < 1) rheight = 1;
-
-    Imagefloat* baseImg = resizeTo<Imagefloat> (rwidth, rheight, interp, thumbImg);
-
-    // Film negative legacy mode, for backwards compatibility RT v5.8
-    if (params.filmNegative.enabled) {
-        if (params.filmNegative.backCompat == FilmNegativeParams::BackCompat::V1) {
-            processFilmNegative(params, baseImg, rwidth, rheight);
-        } else if (params.filmNegative.backCompat == FilmNegativeParams::BackCompat::V2) {
-            processFilmNegativeV2(params, baseImg, rwidth, rheight);
-        }
-    }
-
-    if (params.coarse.rotate) {
-        baseImg->rotate (params.coarse.rotate);
-        rwidth = baseImg->getWidth();
-        rheight = baseImg->getHeight();
-    }
-
-    if (params.coarse.hflip) {
-        baseImg->hflip ();
-    }
-
-    if (params.coarse.vflip) {
-        baseImg->vflip ();
-    }
-
-
     // apply white balance and raw white point (simulated)
     for (int i = 0; i < rheight; i++) {
 #ifdef _OPENMP
@@ -1294,14 +1874,36 @@ IImage8* Thumbnail::processImage (const procparams::ProcParams& params, eSensorT
             }
         }
     }
+}
+
+/*
+ * thumbnail.rgb: colour-space conversion, analysis, geometry, local
+ * adjustments and RGB processing. The analysis, geometry and local-adjustment
+ * calls are folded into this block by the canonical thumbnail spec.
+ */
+void Thumbnail::stageRgb(StageState& state)
+{
+    const procparams::ProcParams& params = *state.params;
+    const FramesMetaData* metadata = state.metadata;
+    state.ipf.reset(new ImProcFunctions (state.params, state.forHistogramMatching));
+    ImProcFunctions& ipf = *state.ipf;
+    Imagefloat*& baseImg = state.baseImg;
+    LabImage*& labView = state.labView;
+    LUTu& hist16 = state.hist16;
+    LUTu& dummy = state.dummy;
+    LUTf& curve1 = state.curve1;
+    LUTf& curve2 = state.curve2;
+    ColorTemp& currWB = state.currWB;
+    const std::string& camName = state.camName;
+    int& fw = state.fw;
+    int& fh = state.fh;
 
     // if luma denoise has to be done for thumbnails, it should be right here
 
-    int fw = baseImg->getWidth();
-    int fh = baseImg->getHeight();
+    fw = baseImg->getWidth();
+    fh = baseImg->getHeight();
     //ColorTemp::CAT02 (baseImg, &params)   ;//perhaps not good!
 
-    ImProcFunctions ipf (&params, forHistogramMatching); // enable multithreading when forHistogramMatching is true
     ipf.setScale (sqrt (double (fw * fw + fh * fh)) / sqrt (double (thumbImg->getWidth() * thumbImg->getWidth() + thumbImg->getHeight() * thumbImg->getHeight()))*scale);
     ipf.updateColorProfiles (ICCStore::getInstance()->getDefaultMonitorProfileName(), RenderingIntent(settings->monitorIntent), false, false);
 
@@ -1326,7 +1928,7 @@ IImage8* Thumbnail::processImage (const procparams::ProcParams& params, eSensorT
 
 
 
-    LUTu hist16 (65536);
+    hist16(65536);
 
     ipf.firstAnalysis (baseImg, params, hist16);
 
@@ -1732,30 +2334,19 @@ IImage8* Thumbnail::processImage (const procparams::ProcParams& params, eSensorT
     }
     //end Thumbnail Selective Editing
 
-    LUTf curve1 (65536);
-    LUTf curve2 (65536);
+    curve1(65536);
+    curve2(65536);
     LUTf curve (65536);
 
-    LUTf satcurve (65536);
-    LUTf lhskcurve (65536);
-    LUTf lumacurve (32770, 0); // lumacurve[32768] and lumacurve[32769] will be set to 32768 and 32769 later to allow linear interpolation
-    LUTf clcurve (65536);
     LUTf clToningcurve;
     LUTf cl2Toningcurve;
-    LUTu dummy;
 
     ToneCurve customToneCurve1, customToneCurve2;
     ColorGradientCurve ctColorCurve;
     OpacityCurve ctOpacityCurve;
-
-    ColorAppearance customColCurve1;
-    ColorAppearance customColCurvered;
-    ColorAppearance customColCurvegreen;
-    ColorAppearance customColCurveblue;
-    ColorAppearance customColCurve2;
-    ColorAppearance customColCurve3;
     ToneCurve customToneCurvebw1;
     ToneCurve customToneCurvebw2;
+
     CurveFactory::complexCurve (expcomp, black / 65535.0, hlcompr, hlcomprthresh,
                                 params.toneCurve.shcompr, bright, contr,
                                 params.toneCurve.curve,
@@ -1818,7 +2409,7 @@ IImage8* Thumbnail::processImage (const procparams::ProcParams& params, eSensorT
 
     autor = autog = autob = -9000.f; // This will ask to compute the "auto" values for the B&W tool
 
-    LabImage* labView = new LabImage (fw, fh);
+    labView = new LabImage (fw, fh);
     DCPProfile *dcpProf = nullptr;
     DCPProfileApplyState as;
 
@@ -1841,6 +2432,39 @@ IImage8* Thumbnail::processImage (const procparams::ProcParams& params, eSensorT
     ctOpacityCurve.Reset();
     customToneCurvebw1.Reset();
     customToneCurvebw2.Reset();
+}
+
+/*
+ * thumbnail.lab: Lab tools, working-TRC conversion, CIE CAM and gamut
+ * compression in one reduced-scale pass.
+ */
+void Thumbnail::stageLab(StageState& state)
+{
+    const procparams::ProcParams& params = *state.params;
+    ImProcFunctions& ipf = *state.ipf;
+    LabImage*& labView = state.labView;
+    LUTu& hist16 = state.hist16;
+    LUTu& dummy = state.dummy;
+    LUTf& curve1 = state.curve1;
+    LUTf& curve2 = state.curve2;
+    int& fw = state.fw;
+    int& fh = state.fh;
+    const float shutter = state.shutter;
+    const float fnumber = state.fnumber;
+    const float iso = state.iso;
+    const float fcomp = state.fcomp;
+
+    ColorAppearance customColCurve1;
+    ColorAppearance customColCurvered;
+    ColorAppearance customColCurvegreen;
+    ColorAppearance customColCurveblue;
+    ColorAppearance customColCurve2;
+    ColorAppearance customColCurve3;
+
+    LUTf satcurve (65536);
+    LUTf lhskcurve (65536);
+    LUTf lumacurve (32770, 0); // lumacurve[32768] and lumacurve[32769] will be set to 32768 and 32769 later to allow linear interpolation
+    LUTf clcurve (65536);
 
     // luminance histogram update
     if (params.labCurve.contrast != 0) {
@@ -2125,7 +2749,22 @@ IImage8* Thumbnail::processImage (const procparams::ProcParams& params, eSensorT
             }
         }
     }
+}
 
+/*
+ * thumbnail.output: Lab to 8-bit output, the scale factor reported to the
+ * caller and the crop mask.
+ */
+Image8* Thumbnail::stageOutput(StageState& state)
+{
+    const procparams::ProcParams& params = *state.params;
+    ImProcFunctions& ipf = *state.ipf;
+    LabImage*& labView = state.labView;
+    Imagefloat*& baseImg = state.baseImg;
+    int& fw = state.fw;
+    int& fh = state.fh;
+    double& myscale = *state.myscale;
+    const bool forMonitor = state.forMonitor;
 
     // color processing
     //ipf.colorCurve (labView, labView);
@@ -2139,7 +2778,9 @@ IImage8* Thumbnail::processImage (const procparams::ProcParams& params, eSensorT
         readyImg = ipf.lab2rgb(labView, 0, 0, fw, fh, params.icm, false);
     }
     delete labView;
+    labView = nullptr;
     delete baseImg;
+    baseImg = nullptr;
 
     // calculate scale
     if (params.coarse.rotate == 90 || params.coarse.rotate == 270) {
@@ -2165,9 +2806,71 @@ IImage8* Thumbnail::processImage (const procparams::ProcParams& params, eSensorT
         }
     }
 
-
     return readyImg;
 }
+
+// Full thumbnail processing, second stage if complete profile exists
+IImage8* Thumbnail::processImage (const procparams::ProcParams& params, eSensorType sensorType, int rheight, TypeInterpolation interp, const FramesMetaData *metadata, double& myscale, bool forMonitor, bool forHistogramMatching)
+{
+    (void)sensorType;
+
+    StageState state;
+    state.params = &params;
+    state.metadata = metadata;
+    state.interp = interp;
+    state.forMonitor = forMonitor;
+    state.forHistogramMatching = forHistogramMatching;
+    state.rheight = rheight;
+    state.myscale = &myscale;
+    state.camName = metadata->getCamera();
+    state.shutter = metadata->getShutterSpeed();
+    state.fnumber = metadata->getFNumber();
+    state.iso = metadata->getISOSpeed();
+    state.fcomp = metadata->getExpComp();
+
+    bool executed = false;
+
+    if (thumbnailGraphEnabled()) {
+        const ThumbnailGraphPlan plan = planThumbnailGraph(
+            {"thumbnail.scale", "thumbnail.transform", "thumbnail.whitebalance",
+             "thumbnail.rgb", "thumbnail.lab", "thumbnail.output"});
+        logThumbnailGraph("processImage", plan);
+
+        if (plan.valid) {
+            for (const auto& id : plan.execute) {
+                if (id == "thumbnail.scale") {
+                    stageScale(state);
+                } else if (id == "thumbnail.transform") {
+                    stageTransform(state);
+                } else if (id == "thumbnail.whitebalance") {
+                    stageWhiteBalance(state);
+                } else if (id == "thumbnail.rgb") {
+                    stageRgb(state);
+                } else if (id == "thumbnail.lab") {
+                    stageLab(state);
+                } else if (id == "thumbnail.output") {
+                    state.readyImg = stageOutput(state);
+                } else {
+                    assert(false);
+                    return nullptr;
+                }
+            }
+            executed = true;
+        }
+    }
+
+    if (!executed) {
+        stageScale(state);
+        stageTransform(state);
+        stageWhiteBalance(state);
+        stageRgb(state);
+        stageLab(state);
+        state.readyImg = stageOutput(state);
+    }
+
+    return state.readyImg;
+}
+
 
 int Thumbnail::getImageWidth (const procparams::ProcParams& params, int rheight, float &ratio)
 {

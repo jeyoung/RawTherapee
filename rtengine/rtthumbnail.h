@@ -82,6 +82,39 @@ class Thumbnail
     void processFilmNegative(const procparams::ProcParams& params, const Imagefloat* baseImg, int rwidth, int rheight);
     void processFilmNegativeV2(const procparams::ProcParams& params, const Imagefloat* baseImg, int rwidth, int rheight);
 
+    /*
+     * Canonical stage blocks of the thumbnail path (devnotes/perf/STAGE_PIPELINE.md).
+     *
+     * Each block is the single implementation of that step: the legacy
+     * sequence and the opt-in RT_STAGE_GRAPH sequence call the same methods in
+     * the same order, so the two paths cannot drift apart. The state structs
+     * are defined in rtthumbnail.cc. thumbnail.scale has one implementation per
+     * entry point because the embedded branch continues in 8-bit and the raw
+     * fallback continues in float, exactly as the legacy code does.
+     */
+    struct StageState;
+    struct RawStageState;
+    struct EmbeddedStageState;
+    struct QuickStageState;
+
+    static bool stageSourceSelect(RawStageState& state);
+    static void stageRawPreprocess(RawStageState& state);
+    static void stageRawDemosaic(RawStageState& state);
+    static void stageRawBase(RawStageState& state);
+
+    static bool stageSourceEmbedded(EmbeddedStageState& state);
+    static void stageThumbnailDecode(EmbeddedStageState& state);
+
+    void stageQuickScale(QuickStageState& state);
+    void stageQuickTransform(QuickStageState& state);
+
+    void stageScale(StageState& state);
+    void stageTransform(StageState& state);
+    void stageWhiteBalance(StageState& state);
+    void stageRgb(StageState& state);
+    void stageLab(StageState& state);
+    Image8* stageOutput(StageState& state);
+
 public:
 
     bool isRaw;
