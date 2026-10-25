@@ -19,6 +19,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <map>
 #include <mutex>
@@ -1280,11 +1281,10 @@ void dump_crop(const Image8* crop, const char* tag, int visibleX,
  *
  * devnotes/perf/STAGE_PIPELINE.md names fourteen nodes for the preview path
  * and devnotes/perf/STAGE_RUNTIME.md records the runtime mapping. Thirteen of
- * them are one private method each: the hand-written pass and the opt-in
- * RT_PREVIEW_GRAPH pass call the same methods in the same order, so the two
- * paths cannot drift apart.
+ * them are one private method each, called in the order the graph plan
+ * schedules, so the inventory and the executor cannot drift apart.
  *
- * A node method keeps the event-mask gate the hand-written block used, because
+ * A node method keeps the event-mask gate the block always used, because
  * a preview node decides *how much* of its output the current mask allows, not
  * only whether it runs at all. raw.base is the clearest example: it rebuilds
  * the base image for one class of bits, re-prepares retinex for another and
@@ -1298,33 +1298,14 @@ void dump_crop(const Image8* crop, const char* tag, int visibleX,
  * the node and the plan tracks its dirty state, but its body runs inside
  * raw.base; no separate executor exists for it.
  *
- * The two assignments that were unconditional in the hand-written pass stay in
- * the caller, not in a node: the working-pointer reset (oprevi = orig_prev)
- * and the local-adjustment damping floor. Both must run whether or not a node
+ * The two assignments that were unconditional in the pass stay in the caller,
+ * not in a node: the working-pointer reset (oprevi = orig_prev) and the
+ * local-adjustment damping floor. Both must run whether or not a node
  * executes.
  */
 
 namespace
 {
-
-/*
- * Switch for the graph-driven full-frame preview. The graph is the default.
- * RT_PREVIEW_GRAPH takes precedence; RT_STAGE_GRAPH names the same switch for
- * the other pipelines. Set either to 0/off for the legacy sequence.
- */
-bool previewGraphEnabled()
-{
-    static const bool enabled = []() {
-        const char* value = g_getenv("RT_PREVIEW_GRAPH");
-        if (value == nullptr || value[0] == '\0') {
-            value = g_getenv("RT_STAGE_GRAPH");
-        }
-        return value == nullptr || value[0] == '\0'
-            || (g_ascii_strcasecmp(value, "0") != 0
-                && g_ascii_strcasecmp(value, "off") != 0);
-    }();
-    return enabled;
-}
 
 /*
  * Authority for the graph's dirty marking.
@@ -1334,9 +1315,8 @@ bool previewGraphEnabled()
  * gates for comparison and troubleshooting, exactly as the previous graph
  * tranche ran them; every other value (or unset) keeps the derivation.
  *
- * The mask itself still drives the legacy sequence, the viewport fast path,
- * the crop render and the notifications. Only the full-frame graph plan is
- * affected by this switch.
+ * The mask itself still drives the viewport fast path, the crop render and the
+ * notifications. Only the full-frame graph plan is affected by this switch.
  */
 bool previewDirtyExecution()
 {
@@ -1493,19 +1473,21 @@ bool monitorOutputRuns(int todo, bool panningRelatedChange)
     return panningRelatedChange || (todo & M_MONITOR) != 0;
 }
 
-/* Report a refused plan once per reason. */
-void logPreviewGraphFallback(const std::string& reason)
+/*
+ * Report a plan the executor cannot run, and stop.
+ *
+ * The graph is the only full-frame preview sequence, so a rejected plan means
+ * the inventory and this executor disagree; aborting keeps the error visible
+ * instead of publishing a partly processed frame.
+ */
+[[noreturn]] void abortPreviewGraph(const std::string& reason)
 {
-    static std::mutex mutex;
-    static std::set<std::string> logged;
-
-    std::lock_guard<std::mutex> lock(mutex);
-    if (!logged.insert(reason).second) {
-        return;
-    }
-
-    std::fprintf(stderr, "preview-graph: fallback to legacy: %s\n",
+    std::fprintf(stderr, "preview-graph: fatal: plan rejected: %s\n",
                  reason.c_str());
+    std::fprintf(stderr,
+                 "preview-graph: the graph is the only preview sequence, so "
+                 "there is nothing to fall back to\n");
+    std::abort();
 }
 
 /* Report the first accepted plan once per process, for evidence. */
@@ -4561,21 +4543,6 @@ ImProcCoordinator::PreviewPassPlan ImProcCoordinator::planPreviewPass(
     return result;
 }
 
-/* The canonical sequence, in the order the hand-written pass used. */
-ImProcCoordinator::PreviewPassPlan ImProcCoordinator::legacyPreviewPassPlan()
-{
-    PreviewPassPlan result;
-    result.valid = true;
-
-    for (const char* id : PREVIEW_NODE_IDS) {
-        if (!isFoldedPreviewNode(id)) {
-            result.order.emplace_back(id);
-        }
-    }
-
-    return result;
-}
-
 /* Run one scheduled node under its own profile key. */
 void ImProcCoordinator::executePreviewNode(const std::string& id,
                                            PreviewPassState& pass)
@@ -4848,7 +4815,8 @@ void ImProcCoordinator::updatePreviewImage(int todo, bool panningRelatedChange,
          * Snapshot the pass input before any node normalises it, then derive
          * the blocks the graph must execute. The event mask is no longer the
          * scheduler input; it still decides what each node does internally and
-         * still drives the legacy sequence, the crop render and notifications.
+         * still drives the viewport fast path, the crop render and the
+         * notifications.
          *
          * The request kind is the one part of the derivation the render state
          * cannot express as a field delta: the mask carries request-level bits
@@ -4878,21 +4846,15 @@ void ImProcCoordinator::updatePreviewImage(int todo, bool panningRelatedChange,
 
         PreviewPassPlan plan;
 
-        if (previewGraphEnabled()) {
-            {
-                stage::ScopedProfile planning("preview.graph.plan");
-                plan = planPreviewPass(pass);
-            }
-
-            if (!plan.valid) {
-                logPreviewGraphFallback(plan.reason);
-                plan = legacyPreviewPassPlan();
-            } else {
-                logPreviewGraphActive(plan.order.size());
-            }
-        } else {
-            plan = legacyPreviewPassPlan();
+        {
+            stage::ScopedProfile planning("preview.graph.plan");
+            plan = planPreviewPass(pass);
         }
+
+        if (!plan.valid) {
+            abortPreviewGraph(plan.reason);
+        }
+        logPreviewGraphActive(plan.order.size());
 
         for (const std::string& id : plan.order) {
             if (id == "monitor.output") {

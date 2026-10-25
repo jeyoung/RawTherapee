@@ -6,11 +6,10 @@ Phase A artefact for the stage runtime: the graph and its block boundaries are
 specified and tested here, before any production pipeline is rewired.
 
 The specification is data only. `rtengine/stage/stage_pipeline.cc` builds it and
-`rtengine/stage/tests/stage_pipeline_test.cc` proves its shape. The thumbnail
-path now executes this graph through `StageGraph::plan()` behind
-`RT_STAGE_GRAPH=1`; the legacy sequence remains the default and is
-byte-identical (see `STAGE_RUNTIME.md`). The other three paths are still
-specification only.
+`rtengine/stage/tests/stage_pipeline_test.cc` proves its shape. All four engine
+paths execute this graph through `StageGraph::plan()`; the hand-ordered
+sequences and their `RT_STAGE_GRAPH`/`RT_PREVIEW_GRAPH` switches have been
+removed (see `STAGE_RUNTIME.md`).
 
 ## Scope
 
@@ -159,10 +158,10 @@ absent from the preview spec and present in the crop spec.
 
 ### Preview runtime mapping
 
-`RT_PREVIEW_GRAPH=1` drives the inventory through `StageGraph`; the legacy
-sequence stays the default. Each block is one private
-`ImProcCoordinator::stage*()` method, so both paths call the same
-implementation in the same order:
+`StageGraph` drives the inventory through the executor; there is no other
+sequence. Each block is one private
+`ImProcCoordinator::stage*()` method, so the inventory and the executor cannot
+drift apart:
 
 | Node | Method |
 |------|--------|
@@ -251,8 +250,8 @@ thumbnail.scale -> thumbnail.transform -> thumbnail.whitebalance
 ```
 
 Code evidence. The blocks are the private `Thumbnail::stage*` methods in
-`rtengine/rtthumbnail.cc`; each is the only implementation of that step,
-shared by the legacy sequence and the graph-driven sequence.
+`rtengine/rtthumbnail.cc`; each is the only implementation of that step, called
+by the graph executor.
 
 - `source.embedded` `stageSourceEmbedded()`: open the raw container and
   select its embedded JPEG (`RawImage::getThumbnail()`). The container load is
@@ -297,8 +296,8 @@ path runs them at reduced scale in one pass.
 The thumbnail lifecycle is split across four entry points and two alternative
 continuations, so one invocation cannot run all twelve nodes: `source.select`
 and `source.embedded` are alternative roots, and `quickProcessImage()` and
-`processImage()` are alternative successors of `thumbnail.scale`. With
-`RT_STAGE_GRAPH=1` each entry point builds the canonical twelve-node spec,
+`processImage()` are alternative successors of `thumbnail.scale`. Each entry
+point builds the canonical twelve-node spec,
 connects it into a `StageGraph`, marks the nodes it owns dirty and asks
 `StageGraph::plan()` for the actions:
 
@@ -311,11 +310,11 @@ connects it into a `StageGraph`, marks the nodes it owns dirty and asks
 
 The union is the full twelve-node graph; no node is faked. Every node an
 entry point owns must be allowed to run: if `plan()` returns `ReuseOutput`
-for one, the plan is rejected and the unchanged legacy sequence runs. The
+for one, the plan is rejected and the process aborts. The
 remaining nodes are marked clean because their data is already held by the
 `Thumbnail` (`thumbImg`) or belongs to the branch this invocation does not
-take. The legacy sequence calls the same `stage*` blocks in the same order,
-so the graph and the legacy path share one implementation.
+take. The graph executor calls the same `stage*` blocks, so there is one
+implementation.
 
 ## Parameter fields
 
@@ -598,8 +597,8 @@ crop path, 14 for the preview) rather than twice.
    `lab.tools`, `lab.sharpening`, `lab.wavelet`, `working.trc`, `ciecam`,
    `gamut`; preview the same without `lab.sharpening`.
 5. **Residents.** `raw.base`, `transform` and `viewport.output` on the crop,
-   and `monitor.output` on the preview, are executed on every invocation by
-   the legacy sequences. They are part of the execution set but do not seed
+   and `monitor.output` on the preview, are executed on every invocation.
+   They are part of the execution set but do not seed
    the closure: their bodies are still mask-gated, so a resident alone does
    not regenerate anything.
 6. **Forward closure.** Every consumer of a directly dirty block is dirty,
@@ -696,9 +695,9 @@ the update executes the legacy set instead and increments a counter. `extra`
 stage bodies keep their own mask gates in this phase, so the extra calls are
 inert, and the closure is what makes a skipped middle block impossible.
 
-The legacy sequence, the unchanged `todo` coalescing and the plan rejection in
-`planCropGraph()` are untouched. A rejected plan still runs the full legacy
-loop, and the graph's dirty flags now come from the derived set rather than
+The `todo` coalescing and the plan validation in `planCropGraph()` are
+unchanged. A rejected plan now aborts instead of running a full legacy loop,
+and the graph's dirty flags still come from the chosen dirty set rather than
 from the execution list.
 
 ### Shadow evidence
@@ -838,7 +837,7 @@ silently dropped.
   the thumbnail path.
 - Inspector mode (`ThumbnailInspectorMode::RAW` and the
   `RAW_IF_NOT_JPEG_FULLSIZE` fallback) loads a full-resolution image, which is
-  outside the reduced-domain graph. It keeps the legacy path and executes no
+  outside the reduced-domain graph. It keeps its own code path and executes no
   graph node.
 - Output ICC attachment and metadata (`simpleprocess.cc:2387-2410`) are one
   block, `output.icc`, even though they are two calls.
@@ -851,11 +850,11 @@ application and the soft-proof sink listed above.
 
 ## Execution boundaries (Phase B)
 
-`rtengine/simpleprocess.cc` now has one private `ImageProcessor` method per
-export node. The legacy sequence (`stage_finish()` and `legacy_export()`) and
-the graph executor (`graph_pipeline()`) call the same methods, so the export
-pipeline has one implementation and the graph only changes which code invokes
-it.
+`rtengine/simpleprocess.cc` has one private `ImageProcessor` method per
+export node. The graph executor (`graph_pipeline()`) calls those methods; fast
+export keeps its own wrapper (`stage_finish()` after the early resize), so the
+export pipeline still has one implementation per block and the graph only
+changes which code invokes it.
 
 | Node | Method |
 |------|--------|
@@ -950,11 +949,10 @@ tools/perf/run-suite.sh --build-dir <build-dir> --image <raw> --thumbnail-graph
 ```
 
 The harness runs `loadQuickFromRaw()` + `quickProcessImage()` and
-`loadFromRaw()` + `processImage()` once with the legacy sequence and once with
-`RT_STAGE_GRAPH=1`, compares the 8-bit output byte for byte and fails if a
-plan falls back. Result on the CPU build: `PASS` for both branches, with all
-four plans active; hashes and the image profile are recorded in
-`STAGE_RUNTIME.md`.
+`loadFromRaw()` + `processImage()` twice, now both through the graph, compares
+the 8-bit output byte for byte and fails if a plan is rejected. Result on the
+CPU build: `PASS` for both branches, with all four plans active; hashes and the
+image profile are recorded in `STAGE_RUNTIME.md`.
 
 Phase B corrected the export chain to the implementation's order (see
 "Execution boundaries" above). The node and edge counts, roots, sinks and
@@ -965,10 +963,10 @@ OpenCL configurations. The export graph parity evidence is in
 ### Crop runtime mapping
 
 `Crop::update()` was split into thirteen private `Crop::stage*` blocks sharing
-one `CropStageContext`. The legacy path calls them in order;
-`RT_STAGE_GRAPH=1` builds `buildPipelineSpec(StagePath::Crop)`, marks the
+one `CropStageContext`. There is no other crop sequence: `update()` builds
+`buildPipelineSpec(StagePath::Crop)`, marks the
 blocks the request executes dirty, asks `StageGraph::plan()`, and dispatches
-only the accepted blocks. Rejection falls back to the unchanged legacy loop.
+only the accepted blocks. A rejected plan aborts.
 
 Thirteen canonical nodes execute; two are folded:
 
@@ -990,10 +988,10 @@ tools/perf/run-suite.sh --build-dir <build-dir> --image <raw> --crop-graph
 ```
 
 It loads the image twice, runs the full-frame preview once per copy, then the
-detailed crop for fit, 100% and zoomed/panned viewports with
-`RT_STAGE_GRAPH=0` and `1`. It compares display and output-space images byte
-for byte and requires one executed plan per state and no fallback. Result on
-CPU and OpenCL builds: `AE=0` for every state and profile.
+detailed crop for fit, 100% and zoomed/panned viewports with the mask-derived
+and the derived dirty sets. It compares display and output-space images byte
+for byte and requires one executed plan per state and no plan rejection. Result
+on CPU and OpenCL builds: `AE=0` for every state and profile.
 
 ## Mask-to-block equivalence map (Phase F)
 

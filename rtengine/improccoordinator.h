@@ -327,10 +327,9 @@ protected:
     /*
      * Canonical full-frame preview nodes (devnotes/perf/STAGE_PIPELINE.md).
      *
-     * Each block of the full-frame preview is one method, so the legacy
-     * sequence and the opt-in RT_PREVIEW_GRAPH sequence run the same
-     * implementation in the same order. The per-pass state and the resolved
-     * node plan are defined in improccoordinator.cc.
+     * Each block of the full-frame preview is one method, and the stage graph
+     * executes the plan's order through them. The per-pass state and the
+     * resolved node plan are defined in improccoordinator.cc.
      */
     struct PreviewPassState;
     struct PreviewPassPlan;
@@ -350,7 +349,6 @@ protected:
     void stageMonitorOutput(PreviewPassState& pass);
 
     PreviewPassPlan planPreviewPass(PreviewPassState& pass);
-    PreviewPassPlan legacyPreviewPassPlan();
     void executePreviewNode(const std::string& id, PreviewPassState& pass);
 
     /*

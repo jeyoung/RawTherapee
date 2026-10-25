@@ -8,15 +8,16 @@
 #       [--skip-preview] [--skip-stage-tests] [--graph] [--thumbnail-graph] \
 #       [--crop-graph]
 #
-# --graph adds an opt-in parity gate: export once with RT_STAGE_GRAPH=0 and
-# once with RT_STAGE_GRAPH=1, then require AE=0 between the two TIFFs.
+# --graph requires the export to execute the canonical graph inventory and to
+# be byte-identical to the suite reference export; there is no legacy sequence
+# left to compare against.
 # --thumbnail-graph builds thumbnail-stage-test and requires byte-identical
-# embedded-JPEG and raw-fallback thumbnails between the legacy sequence and
-# the thumbnail stage graph.
+# embedded-JPEG and raw-fallback thumbnails between two runs of the thumbnail
+# stage graph.
 # --crop-graph builds crop-stage-test and requires byte-identical detailed crop
-# images for fit, 100% and zoomed/panned viewports between the legacy sequence
-# and the crop stage graph, then repeats the check with the Lab, CIE CAM, gamut
-# and local-adjustment blocks enabled.
+# images for fit, 100% and zoomed/panned viewports between the mask-derived
+# dirty set and the derived dirty set on the crop stage graph, then repeats the
+# check with the Lab, CIE CAM, gamut and local-adjustment blocks enabled.
 # --denoise-pp3 adds a thread-determinism matrix for a profile that enables
 # directional-pyramid denoising (see devnotes/perf/DETERMINISM.md).
 
@@ -137,17 +138,17 @@ fi
 # -------------------------------------------------------------- graph parity
 info "graph parity"
 if [ "$graph_parity" -eq 1 ]; then
-    legacy="$report/graph-legacy.tif"
+    log="$report/graph-export.log"
     graphed="$report/graph-stage.tif"
-    graph_args=(--image "$image" --gpu off --threads 1)
-    if [ -n "$pp3" ]; then
-        graph_args+=(--pp3 "$pp3")
+    RT_EXPORT_LOG="$log" "$ROOT/tools/perf/export-one.sh" \
+        --build-dir "$build_dir" --image "$image" --out "$graphed" \
+        --gpu off --threads 1
+    if grep -q "stage-graph: active, 20 nodes" "$log"; then
+        pass "export graph executed the canonical inventory"
+    else
+        fail "export graph not active (see $log)"
     fi
-    RT_STAGE_GRAPH=0 "$ROOT/tools/perf/export-one.sh" --build-dir "$build_dir" \
-        --out "$legacy" "${graph_args[@]}"
-    RT_STAGE_GRAPH=1 "$ROOT/tools/perf/export-one.sh" --build-dir "$build_dir" \
-        --out "$graphed" "${graph_args[@]}"
-    if result=$(python3 "$ROOT/tools/opencl/compare_tiff.py" "$legacy" "$graphed" --bits 16); then
+    if result=$(python3 "$ROOT/tools/opencl/compare_tiff.py" "$neutral" "$graphed" --bits 16); then
         set -- $result
         if [ "$3" = "0" ]; then pass "graph export AE=0"; else fail "graph export differing=$3"; fi
     else
