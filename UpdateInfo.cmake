@@ -4,8 +4,16 @@ if(APPLE AND (NOT DEFINED PROJECT_SOURCE_DIR OR PROJECT_SOURCE_DIR STREQUAL ""))
     set(PROJECT_SOURCE_DIR "${CMAKE_CURRENT_LIST_DIR}")
 endif()
 
-# If we find ReleaseInfo.cmake we use the info from there and don't need Git to be installed
-find_file(REL_INFO_FILE ReleaseInfo.cmake PATHS "${PROJECT_SOURCE_DIR}" NO_DEFAULT_PATH)
+# If we find ReleaseInfo.cmake we use the info from there and don't need Git to be installed.
+# Packaging from a worktree can also pass it explicitly, because the worktree's
+# .git file is not available inside the build container.
+if(DEFINED ENV{RT_RELEASE_INFO} AND NOT "$ENV{RT_RELEASE_INFO}" STREQUAL "")
+    set(REL_INFO_FILE "$ENV{RT_RELEASE_INFO}")
+    message(STATUS "Using release info from ${REL_INFO_FILE}")
+endif()
+if(NOT DEFINED REL_INFO_FILE)
+    find_file(REL_INFO_FILE ReleaseInfo.cmake PATHS "${PROJECT_SOURCE_DIR}" NO_DEFAULT_PATH)
+endif()
 if(REL_INFO_FILE STREQUAL REL_INFO_FILE-NOTFOUND)
     # we look for the git command in this paths by order of preference
     if(WIN32)
@@ -126,7 +134,7 @@ if(REL_INFO_FILE STREQUAL REL_INFO_FILE-NOTFOUND)
         message(STATUS "CACHE_NAME_SUFFIX is \"${CACHE_NAME_SUFFIX}\"")
     endif()
 else()
-    include("${PROJECT_SOURCE_DIR}/ReleaseInfo.cmake")
+    include("${REL_INFO_FILE}")
 endif()
 
 if(WIN32)

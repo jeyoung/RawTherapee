@@ -263,14 +263,32 @@ build_portable() {
 
     # A worktree's .git file points outside the source mount, so derive the
     # version on the host and pass it to the container.
-    local pkg_version base_version commit_count commit_hash
+    local pkg_version base_version branch commit_count commit_hash commit_date
+    local commits_since_tag commits_since_branch release_info
     pkg_version="$(git -C "$root" describe --tags --always --dirty 2>/dev/null || echo 5.13)"
     pkg_version="${pkg_version#v}"
     base_version="$(git -C "$root" describe --tags --abbrev=0 2>/dev/null || true)"
     base_version="${base_version#v}"
     base_version="${base_version:-5.13}"
+    branch="$(git -C "$root" symbolic-ref --short -q HEAD 2>/dev/null || true)"
+    branch="${branch:-$pkg_version}"
     commit_count="$(git -C "$root" rev-list --count HEAD 2>/dev/null || echo 0)"
     commit_hash="$(git -C "$root" rev-parse --short HEAD 2>/dev/null || echo local)"
+    commit_date="$(git -C "$root" show -s --format=%cd --date=format:%Y-%m-%d 2>/dev/null || date -u +%Y-%m-%d)"
+    commits_since_tag="$(git -C "$root" rev-list --count HEAD --not $(git -C "$root" tag --merged HEAD) 2>/dev/null || echo 0)"
+    commits_since_branch="$(git -C "$root" rev-list --count HEAD --not --tags 2>/dev/null || echo 0)"
+
+    # A worktree's .git file points outside the source mount, so provide the
+    # version information through the source-archive mechanism.
+    release_info="$output/ReleaseInfo.cmake"
+    cat > "$release_info" <<EOF
+set(GIT_DESCRIBE $pkg_version)
+set(GIT_BRANCH $branch)
+set(GIT_COMMIT $commit_hash)
+set(GIT_COMMIT_DATE $commit_date)
+set(GIT_COMMITS_SINCE_TAG $commits_since_tag)
+set(GIT_COMMITS_SINCE_BRANCH $commits_since_branch)
+EOF
 
     info "building Debian package $pkg_version"
     docker run --rm \
@@ -281,10 +299,13 @@ build_portable() {
         -e RT_PACKAGE_BASE_VERSION="$base_version" \
         -e RT_PACKAGE_COMMIT_COUNT="$commit_count" \
         -e RT_PACKAGE_COMMIT_HASH="$commit_hash" \
+        -e RT_RELEASE_INFO=/tmp/ReleaseInfo.cmake \
         -v "$root:/src:ro" \
+        -v "$release_info:/tmp/ReleaseInfo.cmake:ro" \
         -v "$output:/out" \
         "$tag" \
         /src/tools/portable/build-debian12.sh
+    rm -f "$release_info"
 }
 
 build_variant() {
