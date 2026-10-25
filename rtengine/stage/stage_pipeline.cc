@@ -87,15 +87,15 @@ const std::vector<BlockMeta>& blockTable()
         {"source.embedded",        "Select embedded JPEG",       RT_STAGE_RECOMPUTE,    {}},
         {"raw.preprocess",         "Raw preprocess",             RT_STAGE_REUSE_OUTPUT, {"raw", "lensProf", "coarse", "dirpyrDenoise"}},
         {"raw.demosaic",           "Demosaic",                   RT_STAGE_REUSE_OUTPUT, {"raw", "pdsharpening"}},
-        {"raw.base",               "Base image finish",          RT_STAGE_REUSE_OUTPUT, {"raw", "wb", "toneCurve", "spot", "dirpyrDenoise", "filmNegative", "retinex", "dehaze", "fattal", "cg", "icm"}},
+        {"raw.base",               "Base image finish",          RT_STAGE_REUSE_OUTPUT, {"raw", "wb", "toneCurve", "spot", "dirpyrDenoise", "filmNegative", "retinex", "cg", "icm"}},
         {"analysis",               "Analysis",                   RT_STAGE_REUSE_OUTPUT, {"toneCurve"}},
-        {"transform",              "Geometry transform",         RT_STAGE_REUSE_INPUT,  {"coarse", "commonTrans", "rotate", "distortion", "perspective", "cacorrection", "vignetting", "gradient", "pcvignette", "lensProf"}},
+        {"transform",              "Geometry transform",         RT_STAGE_REUSE_INPUT,  {"coarse", "commonTrans", "rotate", "distortion", "perspective", "cacorrection", "vignetting", "gradient", "pcvignette", "lensProf", "dehaze", "fattal"}},
         {"local.adjustments",      "Local adjustments",          RT_STAGE_REUSE_INPUT,  {"locallab"}},
         {"rgb.proc",               "RGB processing",             RT_STAGE_REUSE_INPUT,  {"toneCurve", "rgbCurves", "colorToning", "blackwhite", "chmixer", "hsvequalizer", "filmSimulation", "icm"}},
-        {"lab.tools",              "Lab tools",                  RT_STAGE_REUSE_INPUT,  {"sh", "labCurve", "localContrast", "vibrance", "epd", "softlight"}},
+        {"lab.tools",              "Lab tools",                  RT_STAGE_REUSE_INPUT,  {"sh", "labCurve", "localContrast", "vibrance", "epd", "colorToning"}},
         {"lab.sharpening",         "Sharpening",                 RT_STAGE_REUSE_INPUT,  {"sharpening", "sharpenEdge", "sharpenMicro", "impulseDenoise", "defringe"}},
         {"lab.wavelet",            "Wavelet",                    RT_STAGE_REUSE_INPUT,  {"wavelet", "dirpyrequalizer"}},
-        {"working.trc",            "Working TRC",                RT_STAGE_REUSE_INPUT,  {"toneEqualizer", "icm"}},
+        {"working.trc",            "Working TRC",                RT_STAGE_REUSE_INPUT,  {"toneEqualizer", "icm", "softlight"}},
         {"ciecam",                 "CIE CAM",                    RT_STAGE_REUSE_INPUT,  {"colorappearance", "icm"}},
         {"gamut",                  "Gamut compression",          RT_STAGE_REUSE_INPUT,  {"cg", "icm"}},
         {"output.convert",         "Output conversion",          RT_STAGE_REUSE_OUTPUT, {"icm"}},
@@ -205,6 +205,10 @@ PathDefinition definitionFor(StagePath path)
 {
     switch (path) {
     case StagePath::Export: {
+        // The export implementation crops, resizes and post-sharpens the Lab
+        // image before converting to the output space, because lab2rgbOut()
+        // consumes the crop rectangle directly. The output blocks follow that
+        // order; the catalogue ids, edges and reuse modes are unchanged.
         const std::vector<StageBlock> nodes = withTail(coreBlocks(), {
             StageBlock::LocalAdjustments,
             StageBlock::RgbProc,
@@ -214,10 +218,10 @@ PathDefinition definitionFor(StagePath path)
             StageBlock::WorkingTrc,
             StageBlock::CieCam,
             StageBlock::Gamut,
-            StageBlock::OutputConvert,
             StageBlock::Crop,
             StageBlock::Resize,
             StageBlock::OutputSharpen,
+            StageBlock::OutputConvert,
             StageBlock::Framing,
             StageBlock::OutputIcc
         });

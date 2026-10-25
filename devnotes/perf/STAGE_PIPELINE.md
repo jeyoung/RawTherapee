@@ -47,15 +47,15 @@ spec: `buildPipelineSpec()` returns the rooted subgraph, not the union.
 | `source.embedded` | -/-/-/Reduced | interactive | recompute | select the embedded JPEG |
 | `raw.preprocess` | Full/Full/Full/Full | path | reuse-output | raw black/white, hot/dead pixel, CA, flat field |
 | `raw.demosaic` | Full/Full/Full/Full | path | reuse-output | demosaic and capture sharpening |
-| `raw.base` | Full/Full/Roi/Reduced | path | reuse-output | `getImage()`, spot removal, denoise, film negative, Retinex, dehaze, Fattal, source-side gamut |
+| `raw.base` | Full/Full/Roi/Reduced | path | reuse-output | `getImage()`, spot removal, denoise, film negative, Retinex, source-side gamut |
 | `analysis` | Full/Full/Roi/- | path | reuse-output | histogram and auto-exposure analysis |
-| `transform` | Full/Full/Roi/- | path | reuse-input | rotation, distortion, perspective, CA, vignetting, gradient, post-crop vignette |
-| `local.adjustments` | Full/Full/Roi/- | path | reuse-input | local lab / selective editing |
+| `transform` | Full/Full/Roi/- | path | reuse-input | rotation, distortion, perspective, CA, vignetting, gradient, post-crop vignette, dehaze, Fattal |
+| `local.adjustments` | Full/Full/Roi/Reduced | path | reuse-input | local lab / selective editing |
 | `rgb.proc` | Full/Full/Roi/Reduced | path | reuse-input | RGB curves, tone curve, colour toning, B&W, channel mixer, HSV, film simulation |
-| `lab.tools` | Full/Full/Roi/Reduced | path | reuse-input | shadows/highlights, Lab curves, local contrast, vibrance, EPD, soft light |
+| `lab.tools` | Full/Full/Roi/Reduced | path | reuse-input | shadows/highlights, Lab curves, local contrast, vibrance, EPD, Lab-grid colour toning |
 | `lab.sharpening` | Full/-/Roi/- | path | reuse-input | impulse denoise, defringe, microcontrast, sharpening |
 | `lab.wavelet` | Full/Full/Roi/Reduced | path | reuse-input | directional pyramid equaliser and wavelet |
-| `working.trc` | Full/Full/Roi/- | path | reuse-input | tone equaliser and working-TRC conversion |
+| `working.trc` | Full/Full/Roi/- | path | reuse-input | soft light, tone equaliser and working-TRC conversion |
 | `ciecam` | Full/Full/Roi/- | path | reuse-input | CIE CAM 02 |
 | `gamut` | Full/Full/Roi/Reduced | path | reuse-input | working-space gamut compression |
 | `output.convert` | Full/-/-/- | exact | reuse-output | Lab to output RGB and output profile conversion |
@@ -84,9 +84,16 @@ Root `source.select`, sink `output.icc`.
 source.select -> raw.preprocess -> raw.demosaic -> raw.base -> analysis
   -> transform -> local.adjustments -> rgb.proc -> lab.tools
   -> lab.sharpening -> lab.wavelet -> working.trc -> ciecam -> gamut
-  -> output.convert -> crop -> resize -> output.sharpen -> framing
+  -> crop -> resize -> output.sharpen -> output.convert -> framing
   -> output.icc
 ```
+
+The last five nodes follow the implementation's data flow: the Lab image is
+cropped, resized and post-sharpened before it is converted to the output
+space, because `lab2rgbOut()` consumes the crop rectangle directly. The
+catalogue ids, edges and reuse modes are unchanged from the inventory; only
+the position of `output.convert` moved, from before `crop` to after
+`output.sharpen`. Execution evidence is in `devnotes/perf/STAGE_RUNTIME.md`.
 
 Code evidence, in order:
 
@@ -106,9 +113,15 @@ Code evidence, in order:
 - tone equaliser `:2012` and `:2048`, working TRC `:2020-2021`, saturation
   `:2025`, preservation `:2055`
 - CIE CAM `:2123`, gamut `:2184`
-- crop/resize/framing `:2223-2357`, `lab2rgbOut()` `:2316`, frame drawing
+- crop `:2210-2273`, Lab resize `:2275-2289`, post-resize sharpening
+  `:2290-2298`
+- `lab2rgbOut()` `:2316`, Nearest output resize `:2344-2354`, frame drawing
   `:2357`
 - output ICC and metadata `:2387-2410`
+
+The line numbers refer to the hand-written pipeline before the Phase B
+decomposition; `devnotes/perf/STAGE_RUNTIME.md` records the method boundaries
+that replace them.
 
 ### Preview: 14 nodes, 13 edges
 
@@ -434,8 +447,10 @@ silently dropped.
   runs on the raw source before `getImage()` and is folded into `raw.base`.
 - Dehaze and Fattal tone mapping (`simpleprocess.cc:1152-1153`,
   `improccoordinator.cc:2292-2293`, `dcrop.cc:798-799`) run after
-  `firstAnalysis()` in the current order but are folded into `raw.base`.
-  The spec records the parameter dependency, not the interleaving.
+  `firstAnalysis()` in the current order. The export chain therefore carries
+  them as the prologue of `transform`, not inside `raw.base`, so a single
+  topological order reproduces the implementation's pixel order. The
+  provenance moved with them: `transform` lists `dehaze` and `fattal`.
 - `imgsrc->convertColorSpace()` (`dcrop.cc:693`) is the working-space
   conversion performed for the crop and is folded into `raw.base`.
 - `ipf.moyeqt()` saturation statistics and `ipf.calc_ref()` local-adjustment
@@ -468,6 +483,54 @@ silently dropped.
 No processing block found in the four entry points is missing from the
 inventory. The only intentional omissions are derived statistics, metadata
 application and the soft-proof sink listed above.
+
+## Execution boundaries (Phase B)
+
+`rtengine/simpleprocess.cc` now has one private `ImageProcessor` method per
+export node. The legacy sequence (`stage_finish()` and `legacy_export()`) and
+the graph executor (`graph_pipeline()`) call the same methods, so the export
+pipeline has one implementation and the graph only changes which code invokes
+it.
+
+| Node | Method |
+|------|--------|
+| `source.select` | `stage_source_select()` |
+| `raw.preprocess` | `stage_raw_preprocess()` |
+| `raw.demosaic` | `stage_raw_demosaic()` |
+| `raw.base` | `stage_raw_base()`, calling `stage_raw_base_source()`, `stage_denoise()`, `stage_raw_color()` |
+| `analysis` | `stage_analysis()` |
+| `transform` | `stage_transform()` |
+| `local.adjustments` | `stage_local_adjustments()` |
+| `rgb.proc` | `stage_rgb_proc()` |
+| `lab.tools` | `stage_lab_tools()` |
+| `lab.sharpening` | `stage_lab_sharpening()` |
+| `lab.wavelet` | `stage_lab_wavelet()` |
+| `working.trc` | `stage_working_trc()` |
+| `ciecam` | `stage_ciecam()` |
+| `gamut` | `stage_gamut()` |
+| `crop` | `stage_crop()` |
+| `resize` | `stage_resize()` |
+| `output.sharpen` | `stage_output_sharpen()` |
+| `output.convert` | `stage_output_convert()` |
+| `framing` | `stage_framing()` |
+| `output.icc` | `stage_output_icc()` |
+
+Blocks that remain folded inside a node, and why:
+
+- `raw.base` is three calls in order: the base image and tone-curve analysis,
+  denoise, and the source colour conversion plus source gamut compression.
+  The split exists so the fast export can run denoise after its early resize.
+- `analysis` allocates the working histogram as well as running
+  `firstAnalysis()`. The allocation moved ahead of the source gamut
+  compression that ends `raw.base`; it allocates a LUT and reads no pixels, so
+  the pixel order is unchanged.
+- `crop` also computes the framing geometry (`FramingArgs` and
+  `FramingData`), because the Lab crop and the resize targets depend on it
+  before the output conversion. The `framing` node draws the frame.
+- `resize` performs the Lab resize only. When the resize method is Nearest,
+  the resize runs on the gamma-applied RGB buffer, which exists only after
+  `lab2rgbOut()`, so that pass is part of `output.convert`.
+- `output.convert` also forces the B&W output and releases the Lab image.
 
 ## Determinism
 
@@ -527,3 +590,9 @@ The harness runs `loadQuickFromRaw()` + `quickProcessImage()` and
 plan falls back. Result on the CPU build: `PASS` for both branches, with all
 four plans active; hashes and the image profile are recorded in
 `STAGE_RUNTIME.md`.
+
+Phase B corrected the export chain to the implementation's order (see
+"Execution boundaries" above). The node and edge counts, roots, sinks and
+reuse modes are unchanged, and `stage-pipeline-test` passes in the CPU and
+OpenCL configurations. The export graph parity evidence is in
+`devnotes/perf/STAGE_RUNTIME.md`.
