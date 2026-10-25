@@ -96,6 +96,16 @@ RenderStateKey sample()
     key.requestKind = RequestKind::FullPreview;
     key.previousDemoBase =
         static_cast<int32_t>(PreviousDemoBase::Fast);
+
+    key.sourceRotateDegree = 90;
+    key.sourceSensorType = 2;
+    key.sourceFullWidth = 6048;
+    key.sourceFullHeight = 4024;
+    key.sourceFrameCount = 3;
+    key.dirPyrDenoiseExpComp = 0.5;
+    key.denoiseAnalysisValid = true;
+    key.spotPending = true;
+    key.spotBufferLive = true;
     return key;
 }
 
@@ -147,6 +157,16 @@ ParamFingerprint canonicalFingerprint(const RenderStateKey& key)
 
     hasher.add(static_cast<int32_t>(key.requestKind));
     hasher.add(key.previousDemoBase);
+
+    hasher.add(key.sourceRotateDegree);
+    hasher.add(key.sourceSensorType);
+    hasher.add(key.sourceFullWidth);
+    hasher.add(key.sourceFullHeight);
+    hasher.add(key.sourceFrameCount);
+    hasher.add(key.dirPyrDenoiseExpComp);
+    hasher.add(key.denoiseAnalysisValid);
+    hasher.add(key.spotPending);
+    hasher.add(key.spotBufferLive);
 
     return hasher.finish();
 }
@@ -209,7 +229,16 @@ static_assert(noPointers<
                   decltype(RenderStateKey::mainPreviewFullResolution),
                   decltype(RenderStateKey::initialRoughPreview),
                   decltype(RenderStateKey::requestKind),
-                  decltype(RenderStateKey::previousDemoBase)>(),
+                  decltype(RenderStateKey::previousDemoBase),
+                  decltype(RenderStateKey::sourceRotateDegree),
+                  decltype(RenderStateKey::sourceSensorType),
+                  decltype(RenderStateKey::sourceFullWidth),
+                  decltype(RenderStateKey::sourceFullHeight),
+                  decltype(RenderStateKey::sourceFrameCount),
+                  decltype(RenderStateKey::dirPyrDenoiseExpComp),
+                  decltype(RenderStateKey::denoiseAnalysisValid),
+                  decltype(RenderStateKey::spotPending),
+                  decltype(RenderStateKey::spotBufferLive)>(),
               "RenderStateKey must not contain pointers");
 
 } // namespace
@@ -237,7 +266,7 @@ int main()
      */
     {
         const ParamFingerprint golden = sample().fingerprint();
-        const std::string expected = "7d18d6df20ff6afdb471515b8cdae2b8";
+        const std::string expected = "8c627c1fcf85b119ab0fd826c54a2d55";
         if (golden.hexString() != expected) {
             std::fprintf(stderr, "golden fingerprint is %s\n",
                          golden.hexString().c_str());
@@ -313,6 +342,26 @@ int main()
         key.previousDemoBase =
             static_cast<int32_t>(PreviousDemoBase::Sidecar);
     });
+
+    /* Criterion: every request fact participates in the fingerprint. */
+    expectChange("sourceRotateDegree",
+                 [](RenderStateKey& key) { key.sourceRotateDegree = 180; });
+    expectChange("sourceSensorType",
+                 [](RenderStateKey& key) { ++key.sourceSensorType; });
+    expectChange("sourceFullWidth",
+                 [](RenderStateKey& key) { ++key.sourceFullWidth; });
+    expectChange("sourceFullHeight",
+                 [](RenderStateKey& key) { ++key.sourceFullHeight; });
+    expectChange("sourceFrameCount",
+                 [](RenderStateKey& key) { --key.sourceFrameCount; });
+    expectChange("dirPyrDenoiseExpComp",
+                 [](RenderStateKey& key) { key.dirPyrDenoiseExpComp = -0.5; });
+    expectChange("denoiseAnalysisValid",
+                 [](RenderStateKey& key) { key.denoiseAnalysisValid = false; });
+    expectChange("spotPending",
+                 [](RenderStateKey& key) { key.spotPending = false; });
+    expectChange("spotBufferLive",
+                 [](RenderStateKey& key) { key.spotBufferLive = false; });
 
     /* Criterion: sourceGeneration is significant at both ends. */
     {

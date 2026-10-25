@@ -4077,6 +4077,28 @@ stage::RenderStateKey ImProcCoordinator::previewRenderState(
     key.previousDemoBase = static_cast<int32_t>(
         lastPassPrevdemoBase.load(std::memory_order_acquire));
 
+    /*
+     * Request facts. The source is read at its current frame, so these fields
+     * describe the pixels this pass would load. The automatic-denoise analysis
+     * is built by the crop, not by the full-frame pass, so the preview reports
+     * it invalid here; the crop records the real value.
+     */
+    if (imgsrc != nullptr) {
+        key.sourceRotateDegree = imgsrc->getRotateDegree();
+        key.sourceSensorType = static_cast<int32_t>(imgsrc->getSensorType());
+        int sourceFullWidth = 0;
+        int sourceFullHeight = 0;
+        imgsrc->getFullSize(sourceFullWidth, sourceFullHeight, TR_NONE);
+        key.sourceFullWidth = sourceFullWidth;
+        key.sourceFullHeight = sourceFullHeight;
+        key.sourceFrameCount = imgsrc->getFrameCount();
+        key.dirPyrDenoiseExpComp = imgsrc->getDirPyrDenoiseExpComp();
+    }
+    key.denoiseAnalysisValid = false;
+    key.spotPending = (pass.todo & M_SPOT) != 0 && params->spot.enabled
+        && !params->spot.entries.empty();
+    key.spotBufferLive = spotprev != nullptr;
+
     return key;
 }
 

@@ -622,7 +622,7 @@ void Crop::update(int todo)
      * pass, because the stage bodies can update the source generation and the
      * high-detail flags while they run.
      */
-    const auto cropRenderState = [this, &todo]() {
+    const auto cropRenderState = [this, &todo, &params]() {
         rtengine::stage::RenderStateKey state;
         state.previewScale = skip;
         state.previewWidth = cropw;
@@ -676,6 +676,31 @@ void Crop::update(int todo)
                                       : todo == M_MINUPDATE
                                             ? rtengine::stage::RequestKind::RepaintOnly
                                             : rtengine::stage::RequestKind::ParamsOnly;
+
+        /*
+         * Request facts. The source is read at its current frame. The
+         * automatic-denoise analysis is coordinator-owned and is built by a
+         * crop pass at skip 1; this crop consumes it to set the automatic
+         * strengths, so its validity decides whether that work can be reused.
+         */
+        if (parent->imgsrc) {
+            state.sourceRotateDegree = parent->imgsrc->getRotateDegree();
+            state.sourceSensorType =
+                static_cast<int32_t>(parent->imgsrc->getSensorType());
+            int sourceFullWidth = 0;
+            int sourceFullHeight = 0;
+            parent->imgsrc->getFullSize(sourceFullWidth, sourceFullHeight,
+                                        TR_NONE);
+            state.sourceFullWidth = sourceFullWidth;
+            state.sourceFullHeight = sourceFullHeight;
+            state.sourceFrameCount = parent->imgsrc->getFrameCount();
+            state.dirPyrDenoiseExpComp =
+                parent->imgsrc->getDirPyrDenoiseExpComp();
+        }
+        state.denoiseAnalysisValid = parent->denoiseInfoStore.valid;
+        state.spotPending = (todo & M_SPOT) != 0 && params.spot.enabled
+            && !params.spot.entries.empty();
+        state.spotBufferLive = spotCrop != nullptr;
         return state;
     };
 

@@ -66,6 +66,21 @@ ParamFingerprint RenderStateKey::fingerprint() const
     hasher.add(static_cast<int32_t>(requestKind));
     hasher.add(previousDemoBase);
 
+    /*
+     * Request facts. Appending them changed the fingerprint format: the same
+     * key hashed before and after the change yields different values, so a
+     * stored key must not be compared with one written by an older build.
+     */
+    hasher.add(sourceRotateDegree);
+    hasher.add(sourceSensorType);
+    hasher.add(sourceFullWidth);
+    hasher.add(sourceFullHeight);
+    hasher.add(sourceFrameCount);
+    hasher.add(dirPyrDenoiseExpComp);
+    hasher.add(denoiseAnalysisValid);
+    hasher.add(spotPending);
+    hasher.add(spotBufferLive);
+
     return hasher.finish();
 }
 

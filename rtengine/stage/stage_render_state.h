@@ -67,6 +67,9 @@ enum class PreviousDemoBase : int32_t {
  * soft-proofing configuration, the sharpening mask toggle, the fast-preview
  * switches and the request kind. This struct carries all of them so a stage
  * cache key or an invalidation decision can be derived without the bitset.
+ * The request-facts section at the end adds the source geometry and sensor
+ * facts plus the denoise and spot facts, which the work flags will need and
+ * which live in the coordinator or the crop rather than in ProcParams.
  *
  * All fields are plain values or an owning string: there are no pointers, no
  * ImageSource, and no coordinator state. The struct is therefore safe to copy,
@@ -75,7 +78,10 @@ enum class PreviousDemoBase : int32_t {
  *
  * Field order in fingerprint() is part of the persisted format. Keep the
  * member order and the hashing order in step, and never reuse a field slot for
- * a different meaning without changing the section label.
+ * a different meaning without changing the section label. Adding the
+ * request-facts fields changed the format: a key persisted before that change
+ * hashes to a different value than the same key after it, so stored render
+ * states must be discarded rather than compared across the change.
  */
 struct RenderStateKey {
     /* Preview geometry, in pixels at `previewScale`. */
@@ -124,6 +130,51 @@ struct RenderStateKey {
     /* Request and the base the preceding preview pass used. */
     RequestKind requestKind = RequestKind::ParamsOnly;
     int32_t previousDemoBase = static_cast<int32_t>(PreviousDemoBase::Unknown);
+
+    /*
+     * Request facts.
+     *
+     * These are the inputs the exact preview and crop work flags need and that
+     * neither ProcParams nor an earlier field carries. The section is data
+     * only for now: stage_dirty_blocks.cc does not map it to a
+     * RenderStateAspect, so a difference in these fields cannot change a dirty
+     * set yet.
+     *
+     * `sourceRotateDegree` is the source rotation in degrees, `sourceFullWidth`
+     * and `sourceFullHeight` are its unrotated full size in pixels, which the
+     * preview dimensions do not express once a rotation swaps the axes,
+     * `sourceSensorType` is an eSensorType value and `sourceFrameCount` the
+     * number of frames the source offers. `dirPyrDenoiseExpComp` is the
+     * exposure compensation the source contributes to denoise; its infinity
+     * sentinel means the source has not measured it yet, and the fingerprint
+     * hashes its bit pattern like every other typed value. The source is read
+     * at its current frame, so a frame change that only alters the metadata
+     * does not appear here.
+     *
+     * `denoiseAnalysisValid` is true when the coordinator holds a usable
+     * automatic-denoise analysis for this request; only the crop builds it.
+     * `spotPending` is true when the request asked for spot removal and the
+     * parameters still name spots; `spotBufferLive` is true when a spot buffer
+     * exists, because restoring it changes the next base pass.
+     *
+     * Panning and repaint are an explicit gap, not a modelled fact. The
+     * preview knows only a `panningRelatedChange` heuristic, which can force a
+     * full pipeline and can accompany a FullPreview request, while the crop
+     * knows only the `M_MINUPDATE` mask bit; those do not describe the same
+     * fact, so no repaint field is carried until one shared definition exists.
+     *
+     * Every field defaults to the value an unpopulated key had before the
+     * field existed, so an old and a new key differ only through these fields.
+     */
+    int32_t sourceRotateDegree = 0;
+    int32_t sourceSensorType = 0;
+    int32_t sourceFullWidth = 0;
+    int32_t sourceFullHeight = 0;
+    int32_t sourceFrameCount = 0;
+    double dirPyrDenoiseExpComp = 0.0;
+    bool denoiseAnalysisValid = false;
+    bool spotPending = false;
+    bool spotBufferLive = false;
 
     bool operator==(const RenderStateKey& other) const
     {
@@ -176,7 +227,16 @@ private:
         mainPreviewFullResolution,
         initialRoughPreview,
         requestKind,
-        previousDemoBase))
+        previousDemoBase,
+        sourceRotateDegree,
+        sourceSensorType,
+        sourceFullWidth,
+        sourceFullHeight,
+        sourceFrameCount,
+        dirPyrDenoiseExpComp,
+        denoiseAnalysisValid,
+        spotPending,
+        spotBufferLive))
     {
         return std::tie(
             previewScale,
@@ -207,7 +267,16 @@ private:
             mainPreviewFullResolution,
             initialRoughPreview,
             requestKind,
-            previousDemoBase);
+            previousDemoBase,
+            sourceRotateDegree,
+            sourceSensorType,
+            sourceFullWidth,
+            sourceFullHeight,
+            sourceFrameCount,
+            dirPyrDenoiseExpComp,
+            denoiseAnalysisValid,
+            spotPending,
+            spotBufferLive);
     }
 };
 
