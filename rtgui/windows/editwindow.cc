@@ -441,7 +441,7 @@ void EditWindow::set_title_decorated(Glib::ustring fname)
         subtitle = " - " + fname;
     }
 
-    set_title("RawTherapee " + M("EDITWINDOW_TITLE") + subtitle);
+    set_title("RawTherapeeGraph " + M("EDITWINDOW_TITLE") + subtitle);
 }
 
 void EditWindow::updateExternalEditorWidget(int selectedIndex, const std::vector<ExternalEditor> &editors)

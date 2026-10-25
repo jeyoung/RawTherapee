@@ -126,7 +126,7 @@ init (void)
 
   gimp_install_procedure (LOAD_THUMB_PROC,
                           "Load thumbnail from a raw image via rawtherapee",
-                          "This plug-in loads a thumbnail from a raw image by calling rawtherapee-cli.",
+                          "This plug-in loads a thumbnail from a raw image by calling rawtherapee-graph-cli.",
                           "Alberto Griggio",
                           "Alberto Griggio",
                           "2017",
@@ -371,7 +371,7 @@ load_thumbnail_image (const gchar   *filename,
 
   gchar *argv[] =
     {
-      "rawtherapee-cli",
+      "rawtherapee-graph-cli",
       "-o", filename_out,
       "-d",
       "-s",

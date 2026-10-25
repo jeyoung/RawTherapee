@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
 	<key>com.apple.application-identifier</key>
-	<string>com.rawtherapee.RawTherapee</string>
+	<string>com.rawtherapee.RawTherapeeGraph</string>
 	<key>com.apple.security.app-sandbox</key>
 	<true/>
 	<key>com.apple.security.cs.allow-dyld-environment-variables</key>

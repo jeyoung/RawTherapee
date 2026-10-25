@@ -1359,7 +1359,7 @@ void ICCProfileCreator::savePressed()
 
     cmsMLU *dmnd;
     dmnd = cmsMLUalloc(nullptr, 1);
-    cmsMLUsetASCII(dmnd, "en", "US", "RawTherapee");
+    cmsMLUsetASCII(dmnd, "en", "US", "RawTherapeeGraph");
 
     if (!v2except) {
         cmsWriteTag(newProfile, cmsSigDeviceMfgDescTag, dmnd);

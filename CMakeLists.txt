@@ -19,7 +19,7 @@ if(${CMAKE_EXTRA_GENERATOR} MATCHES "Eclipse CDT4")
     # set(CMAKE_ECLIPSE_VERSION "4.6.0" CACHE STRING "Eclipse version" FORCE)
 endif()
 
-project(RawTherapee)
+project(RawTherapeeGraph)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -318,7 +318,7 @@ if(NOT DEFINED DATADIR)
             set(DATADIR .)
         endif()
     else()
-        set(DATADIR "${CMAKE_INSTALL_PREFIX}/share/rawtherapee")
+        set(DATADIR "${CMAKE_INSTALL_PREFIX}/share/rawtherapee-graph")
     endif()
 endif()
 
@@ -356,7 +356,7 @@ if(NOT DEFINED DOCDIR)
             set(DOCDIR "${DATADIR}/share/doc")
         endif()
     else()
-        set(DOCDIR "${CMAKE_INSTALL_PREFIX}/share/doc/rawtherapee")
+        set(DOCDIR "${CMAKE_INSTALL_PREFIX}/share/doc/rawtherapee-graph")
     endif()
 endif()
 
@@ -368,7 +368,7 @@ if(NOT DEFINED CREDITSDIR)
             set(CREDITSDIR "${DATADIR}")
         endif()
     else()
-        set(CREDITSDIR "${CMAKE_INSTALL_PREFIX}/share/doc/rawtherapee")
+        set(CREDITSDIR "${CMAKE_INSTALL_PREFIX}/share/doc/rawtherapee-graph")
     endif()
 endif()
 
@@ -380,7 +380,7 @@ if(NOT DEFINED LICENCEDIR)
             set(LICENCEDIR "${DATADIR}")
         endif()
     else()
-        set(LICENCEDIR "${CMAKE_INSTALL_PREFIX}/share/doc/rawtherapee")
+        set(LICENCEDIR "${CMAKE_INSTALL_PREFIX}/share/doc/rawtherapee-graph")
     endif()
 endif()
 
@@ -516,14 +516,14 @@ install(
 # to see the search paths for man pages on your system.
 if(BUILD_BUNDLE)
     if(APPLE)
-        install(FILES "${PROJECT_SOURCE_DIR}/doc/manpage/rawtherapee.1"
+        install(FILES "${PROJECT_SOURCE_DIR}/doc/manpage/rawtherapee-graph.1"
                 DESTINATION "${DATADIR}/man/man1")
     else()
-        install(FILES "${PROJECT_SOURCE_DIR}/doc/manpage/rawtherapee.1"
+        install(FILES "${PROJECT_SOURCE_DIR}/doc/manpage/rawtherapee-graph.1"
                 DESTINATION "${DATADIR}/share/man/man1")
     endif()
 else()
-    install(FILES "${PROJECT_SOURCE_DIR}/doc/manpage/rawtherapee.1"
+    install(FILES "${PROJECT_SOURCE_DIR}/doc/manpage/rawtherapee-graph.1"
             DESTINATION "${CMAKE_INSTALL_PREFIX}/share/man/man1")
 endif()
 
@@ -532,6 +532,6 @@ if(WIN32)
 endif()
 
 if(UNIX)
-    install(FILES com.rawtherapee.RawTherapee.appdata.xml
+    install(FILES com.rawtherapee.RawTherapeeGraph.appdata.xml
             DESTINATION "${APPDATADIR}")
 endif()

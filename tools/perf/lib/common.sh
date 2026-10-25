@@ -24,16 +24,20 @@ require() {
 
 cli_for_build() {
     local build_dir="$1"
-    [ -x "$build_dir/rtgui/rawtherapee-cli" ] || \
-        die "no rawtherapee-cli in $build_dir"
-    printf '%s\n' "$build_dir/rtgui/rawtherapee-cli"
+    if [ -x "$build_dir/rtgui/rawtherapee-graph-cli" ]; then
+        printf '%s\n' "$build_dir/rtgui/rawtherapee-graph-cli"
+    elif [ -x "$build_dir/rtgui/rawtherapee-cli" ]; then
+        printf '%s\n' "$build_dir/rtgui/rawtherapee-cli"
+    else
+        die "no rawtherapee-graph-cli or rawtherapee-cli in $build_dir"
+    fi
 }
 
 gui_for_build() {
     local build_dir="$1"
-    [ -x "$build_dir/rtgui/rawtherapee" ] || \
+    [ -x "$build_dir/rtgui/rawtherapee-graph" ] || \
         die "no rawtherapee GUI binary in $build_dir"
-    printf '%s\n' "$build_dir/rtgui/rawtherapee"
+    printf '%s\n' "$build_dir/rtgui/rawtherapee-graph"
 }
 
 test_image() {

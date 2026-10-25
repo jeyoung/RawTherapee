@@ -305,7 +305,7 @@ RTWindow::RTWindow ()
 
     }
 #endif
-    versionStr = "RawTherapee " + App::VERSION;
+    versionStr = "RawTherapeeGraph " + App::VERSION;
 
     set_title_decorated ("");
     set_resizable (true);

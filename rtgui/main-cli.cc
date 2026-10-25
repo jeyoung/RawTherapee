@@ -192,7 +192,7 @@ int main (int argc, char **argv)
     int ret = 0;
 
     // printing RT's version in all case, particularly useful for the 'verbose' mode, but also for the batch processing
-    std::cout << "RawTherapee, version " << RTVERSION << ", command line." << std::endl;
+    std::cout << "RawTherapeeGraph, version " << RTVERSION << ", command line." << std::endl;
 
     if (argc > 1) {
         ret = processLineParams (argc, argv);
@@ -666,7 +666,7 @@ int processLineParams ( int argc, char **argv )
                     std::cout << "  -Y               Overwrite output if present." << std::endl;
                     std::cout << "  -f               Use the custom fast-export processing pipeline." << std::endl;
                     std::cout << std::endl;
-                    std::cout << "Your " << pparamsExt << " files can be incomplete, RawTherapee will build the final values as follows:" << std::endl;
+                    std::cout << "Your " << pparamsExt << " files can be incomplete, RawTherapeeGraph will build the final values as follows:" << std::endl;
                     std::cout << "  1- A new processing profile is created using neutral values," << std::endl;
                     std::cout << "  2- If the \"-d\" option is set, the values are overridden by those found in" << std::endl;
                     std::cout << "     the default raw or non-raw processing profile." << std::endl;

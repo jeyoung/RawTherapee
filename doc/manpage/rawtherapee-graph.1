@@ -1,8 +1,8 @@
-.TH RAWTHERAPEE 1 "May 10, 2017"
+.TH RAWTTHERAPEEGRAPH 1 "May 10, 2017"
 .SH NAME
-RawTherapee - An advanced, cross-platform program for developing raw photos.
+RawTherapeeGraph - An advanced, cross-platform program for developing raw photos.
 .SH DESCRIPTION
-\fBRawTherapee\fP is an advanced program for developing raw photos and for processing non-raw photos. It is non-destructive, makes use of OpenMP, supports all the cameras supported by dcraw and more, and carries out its calculations in a high precision 32-bit floating point engine.
+\fBRawTherapeeGraph\fP is an advanced program for developing raw photos and for processing non-raw photos. It is non-destructive, makes use of OpenMP, supports all the cameras supported by dcraw and more, and carries out its calculations in a high precision 32-bit floating point engine.
 .SH LINKS
   Website: http://www.rawtherapee.com/
   Documentation: http://rawpedia.rawtherapee.com/
@@ -14,14 +14,14 @@ RawTherapee - An advanced, cross-platform program for developing raw photos.
   The pipe symbol | indicates a choice of one or the other.
   The dash symbol - denotes a range of possible values from one to the other.
 .SH SYNOPSIS
-  RawTherapee GUI
-  rawtherapee <folder>           Start File Browser inside folder.
-  rawtherapee <file>             Start Image Editor with file.
+  RawTherapeeGraph GUI
+  rawtherapee-graph <folder>           Start File Browser inside folder.
+  rawtherapee-graph <file>             Start Image Editor with file.
 
-  RawTherapee CLI
-  rawtherapee-cli -c <dir>|<files>   Convert files in batch using default parameters.
-  rawtherapee-cli <other options> -c <dir>|<files>  Convert files in batch using your own settings.
-  rawtherapee-cli [-o <output>|-O <output>] [-q] [-a] [-s|-S] [-p <one.pp3> [-p <two.pp3> ...] ] [-d] [ -j[1-100] [-js<1-3>] | [-b<8|16>] [-t[z] | [-n]] ] [-Y] -c <input>
+  RawTherapeeGraph CLI
+  rawtherapee-graph-cli -c <dir>|<files>   Convert files in batch using default parameters.
+  rawtherapee-graph-cli <other options> -c <dir>|<files>  Convert files in batch using your own settings.
+  rawtherapee-graph-cli [-o <output>|-O <output>] [-q] [-a] [-s|-S] [-p <one.pp3> [-p <two.pp3> ...] ] [-d] [ -j[1-100] [-js<1-3>] | [-b<8|16>] [-t[z] | [-n]] ] [-Y] -c <input>
 .SH OPTIONS
   -c <files>       Specify one or more input files.
                    -c must be the last option.
@@ -68,6 +68,6 @@ Your pp3 files can be incomplete, RawTherapee will build the final values as fol
      found in the sidecar files.
   The processing profiles are processed in the order specified on the command line.
 .SH AUTHOR
-\fBRawTherapee\fP was originally written by Gabor Horvath of Budapest, Hungary, before being re-licensed as free and open-source software in January 2010.
+\fBRawTherapeeGraph\fP was originally written by Gabor Horvath of Budapest, Hungary, before being re-licensed as free and open-source software in January 2010.
 .br
 The RawTherapee development team comprises of passionate people from all around the world.

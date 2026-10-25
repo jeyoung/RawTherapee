@@ -3233,7 +3233,7 @@ Glib::ustring Options::getICCProfileCopyright()
 {
     Glib::Date now;
     now.set_time_current();
-    return Glib::ustring::compose("Copyright RawTherapee %1, CC0", now.get_year());
+    return Glib::ustring::compose("Copyright RawTherapeeGraph %1, CC0", now.get_year());
 }
 
 ExternalEditor::ExternalEditor() = default;

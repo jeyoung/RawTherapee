@@ -315,8 +315,8 @@ build_variant() {
 
     local bin_dir="$dir/rtgui"
     printf '\nbuilt:\n'
-    printf '  %s\n' "$bin_dir/rawtherapee"
-    printf '  %s\n' "$bin_dir/rawtherapee-cli"
+    printf '  %s\n' "$bin_dir/rawtherapee-graph"
+    printf '  %s\n' "$bin_dir/rawtherapee-graph-cli"
 
     if [ "$do_install" -eq 1 ]; then
         if [ -n "${RT_DESTDIR:-}" ]; then

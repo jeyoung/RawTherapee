@@ -11,7 +11,7 @@
 # www.rawtherapee.com
 
 inFile='http://rawtherapee.com/shared/test_images/colorspace_flowers.pef'
-rtExe="rawtherapee-cli"
+rtExe="rawtherapee-graph-cli"
 OPTIND=1 # Reset in case getopts has been used previously in the shell.
 tmpDir="/tmp/rawtherapee-benchmark"
 runs=5

@@ -12,7 +12,7 @@
 #    tools/opencl/verify.sh --list-coverage
 #
 #  Environment:
-#    RT_BUILD_DIR   Build directory containing rtgui/rawtherapee-cli
+#    RT_BUILD_DIR   Build directory containing rtgui/rawtherapee-graph-cli
 #    RT_TESTDATA    Test image directory (default: $HOME/rt-testdata)
 #    RT_REPORT      Output directory for CSV results (default: $RT_TESTDATA)
 #    RT_OPENCL_ALLOW_CPU=1  Select a CPU OpenCL device for testing
@@ -49,12 +49,12 @@ die() {
 
 find_cli() {
     if [ -n "${RT_BUILD_DIR:-}" ]; then
-        cli="$RT_BUILD_DIR/rtgui/rawtherapee-cli"
+        cli="$RT_BUILD_DIR/rtgui/rawtherapee-graph-cli"
     else
-        cli="$(find "$ROOT/build" -maxdepth 2 -path '*/rtgui/rawtherapee-cli' -type f -executable 2>/dev/null | sort | tail -1 || true)"
+        cli="$(find "$ROOT/build" -maxdepth 2 -path '*/rtgui/rawtherapee-graph-cli' -type f -executable 2>/dev/null | sort | tail -1 || true)"
     fi
 
-    [ -n "$cli" ] && [ -x "$cli" ] || die "rawtherapee-cli not found; set RT_BUILD_DIR"
+    [ -n "$cli" ] && [ -x "$cli" ] || die "rawtherapee-graph-cli not found; set RT_BUILD_DIR"
 
     if command -v magick >/dev/null 2>&1; then
         compare_cmd=(magick compare)

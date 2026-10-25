@@ -35,7 +35,7 @@ function CheckLink {
 }
 
 function ModifyInstallNames {
-    find -E "${CONTENTS}" -type f -regex '.*/(rawtherapee-cli|rawtherapee|.*\.(dylib|so))' | while read -r x; do
+    find -E "${CONTENTS}" -type f -regex '.*/(rawtherapee-graph-cli|rawtherapee-graph|.*\.(dylib|so))' | while read -r x; do
         msg "Modifying install names: ${x}"
         {
             # id
@@ -170,7 +170,7 @@ CMAKE_OSX_DEPLOYMENT_TARGET="$(cmake .. -L -N | grep CMAKE_OSX_DEPLOYMENT_TARGET
 #Out: x86_64
 CMAKE_OSX_ARCHITECTURES="$(cmake .. -L -N | grep CMAKE_OSX_ARCHITECTURES)"; CMAKE_OSX_ARCHITECTURES="${CMAKE_OSX_ARCHITECTURES#*=}"
 
-MINIMUM_SYSTEM_VERSION="$(otool -l "${CMAKE_BUILD_TYPE}"/MacOS/rawtherapee | grep -A2 'LC_VERSION_MIN_MACOSX' | awk '$1 ~ /version/ { printf $2 }')"
+MINIMUM_SYSTEM_VERSION="$(otool -l "${CMAKE_BUILD_TYPE}"/MacOS/rawtherapee-graph | grep -A2 'LC_VERSION_MIN_MACOSX' | awk '$1 ~ /version/ { printf $2 }')"
 if [[ -z $MINIMUM_SYSTEM_VERSION ]]; then
     MINIMUM_SYSTEM_VERSION=${CMAKE_OSX_DEPLOYMENT_TARGET}
 fi
@@ -243,7 +243,7 @@ RESOURCES="${CONTENTS}/Resources"
 MACOS="${CONTENTS}/MacOS"
 LIB="${CONTENTS}/Frameworks"
 ETC="${RESOURCES}/etc"
-EXECUTABLE="${MACOS}/rawtherapee"
+EXECUTABLE="${MACOS}/rawtherapee-graph"
 
 msg "Removing old files:"
 rm -rf "${APP}" *.dmg *.zip *.app
@@ -424,12 +424,12 @@ sudo codesign --sign "${CODESIGNID}" --force "${LIB}"/*
 # Build databases
 "${LOCAL_PREFIX}"/bin/gdk-pixbuf-query-loaders "${LIB}"/libpixbufloader*[^dylib] > "${ETC}"/gtk-3.0/gdk-pixbuf.loaders
 "${LOCAL_PREFIX}"/bin/gtk-query-immodules-3.0 "${LIB}"/im-* > "${ETC}"/gtk-3.0/gtk.immodules || "${LOCAL_PREFIX}"/bin/gtk-query-immodules "${LIB}"/im-* > "${ETC}"/gtk-3.0/gtk.immodules
-sed -i.bak -e "s|${PWD}/RawTherapee.app/Contents/|/Applications/RawTherapee.app/Contents/|" "${ETC}"/gtk-3.0/gdk-pixbuf.loaders "${ETC}/gtk-3.0/gtk.immodules"
-sed -i.bak -e "s|${LOCAL_PREFIX}/share/|/Applications/RawTherapee.app/Contents/Resources/share/|" "${ETC}"/gtk-3.0/gtk.immodules
-sed -i.bak -e "s|${LOCAL_PREFIX}/|/Applications/RawTherapee.app/Contents/Frameworks/|" "${ETC}"/gtk-3.0/gtk.immodules
+sed -i.bak -e "s|${PWD}/RawTherapeeGraph.app/Contents/|/Applications/RawTherapeeGraph.app/Contents/|" "${ETC}"/gtk-3.0/gdk-pixbuf.loaders "${ETC}/gtk-3.0/gtk.immodules"
+sed -i.bak -e "s|${LOCAL_PREFIX}/share/|/Applications/RawTherapeeGraph.app/Contents/Resources/share/|" "${ETC}"/gtk-3.0/gtk.immodules
+sed -i.bak -e "s|${LOCAL_PREFIX}/|/Applications/RawTherapeeGraph.app/Contents/Frameworks/|" "${ETC}"/gtk-3.0/gtk.immodules
 rm "${ETC}"/*/*.bak
 # Remove a relative path for the SVG pixbufloader
-install_name_tool -change @rpath/librsvg-2.2.dylib /Applications/RawTherapee.app/Contents/Frameworks/librsvg-2.2.dylib "${LIB}"/libpixbufloader_svg.so
+install_name_tool -change @rpath/librsvg-2.2.dylib /Applications/RawTherapeeGraph.app/Contents/Frameworks/librsvg-2.2.dylib "${LIB}"/libpixbufloader_svg.so
 # Modify the libpixbufloader_svg librsvg install_name
 install_name_tool -change "${PWD}"/"${LIB}"/librsvg-2.2.dylib /Applications/"${LIB}"/librsvg-2.2.dylib "${LIB}"/libpixbufloader_svg.so
 
@@ -477,11 +477,11 @@ for frameworklibs in "${LIB}"/*{dylib,so,cli}; do
     install_name_tool -delete_rpath ${LOCAL_PREFIX}/lib "${frameworklibs}" 2>/dev/null
     install_name_tool -add_rpath /Applications/"${LIB}" "${frameworklibs}" 2>/dev/null
 done
-install_name_tool -delete_rpath RawTherapee.app/Contents/Frameworks "${EXECUTABLE}"-cli 2>/dev/null
+install_name_tool -delete_rpath RawTherapeeGraph.app/Contents/Frameworks "${EXECUTABLE}"-cli 2>/dev/null
 install_name_tool -add_rpath /Applications/"${LIB}" "${EXECUTABLE}"-cli 2>/dev/null
 
 # Link to libomp instead of libgomp
-sudo install_name_tool -change /Applications/RawTherapee.app/Contents/Frameworks/libgomp.1.dylib /Applications/RawTherapee.app/Contents/Frameworks/libomp.dylib RawTherapee.app/Contents/Frameworks/libfftw3f_omp.3.dylib
+sudo install_name_tool -change /Applications/RawTherapeeGraph.app/Contents/Frameworks/libgomp.1.dylib /Applications/RawTherapeeGraph.app/Contents/Frameworks/libomp.dylib RawTherapeeGraph.app/Contents/Frameworks/libfftw3f_omp.3.dylib
 if [[ -e "${LIB}/libgomp.1.dylib" ]]; then
     rm "${LIB}/libgomp.1.dylib"
 fi
@@ -494,38 +494,38 @@ if [[ -n $UNIVERSAL_URL ]]; then
     unzip univ.zip -d univapp
     hdiutil attach -mountpoint ./RawTherapeeuniv univapp/*folder/*dmg
     if [[ $arch = "arm64" ]]; then
-        cp -R RawTherapee.app RawTherapee-arm64.app
+        cp -R RawTherapeeGraph.app RawTherapee-arm64.app
         minimum_arm64_version=$(f=$(cat RawTherapee-arm64.app/Contents/Resources/AboutThisBuild.txt | grep mmacosx-version); echo "${f#*min=}" | cut -d ' ' -f1)
-        cp -R RawTherapeeuniv/RawTherapee.app RawTherapee-x86_64.app
+        cp -R RawTherapeeuniv/RawTherapeeGraph.app RawTherapee-x86_64.app
         minimum_x86_64_version=$(f=$(cat RawTherapee-x86_64.app/Contents/Resources/AboutThisBuild.txt | grep mmacosx-version); echo "${f#*min=}" | cut -d ' ' -f1)
-        echo "\n\n=====================================\n\n" >> RawTherapee.app/Contents/Resources/AboutThisBuild.txt
-        cat RawTherapee-x86_64.app/Contents/Resources/AboutThisBuild.txt >> RawTherapee.app/Contents/Resources/AboutThisBuild.txt
+        echo "\n\n=====================================\n\n" >> RawTherapeeGraph.app/Contents/Resources/AboutThisBuild.txt
+        cat RawTherapee-x86_64.app/Contents/Resources/AboutThisBuild.txt >> RawTherapeeGraph.app/Contents/Resources/AboutThisBuild.txt
     else
-        cp -R RawTherapee.app RawTherapee-x86_64.app
+        cp -R RawTherapeeGraph.app RawTherapee-x86_64.app
         minimum_x86_64_version=$(f=$(cat RawTherapee-x86_64.app/Contents/Resources/AboutThisBuild.txt | grep mmacosx-version); echo "${f#*min=}" | cut -d ' ' -f1)
-        cp -R RawTherapeeuniv/RawTherapee.app RawTherapee-arm64.app
+        cp -R RawTherapeeuniv/RawTherapeeGraph.app RawTherapee-arm64.app
         minimum_arm64_version=$(f=$(cat RawTherapee-arm64.app/Contents/Resources/AboutThisBuild.txt | grep mmacosx-version); echo "${f#*min=}" | cut -d ' ' -f1)
-        echo "\n\n=====================================\n\n" >> RawTherapee.app/Contents/Resources/AboutThisBuild.txt
-        cat RawTherapee-arm64.app/Contents/Resources/AboutThisBuild.txt >> RawTherapee.app/Contents/Resources/AboutThisBuild.txt
+        echo "\n\n=====================================\n\n" >> RawTherapeeGraph.app/Contents/Resources/AboutThisBuild.txt
+        cat RawTherapee-arm64.app/Contents/Resources/AboutThisBuild.txt >> RawTherapeeGraph.app/Contents/Resources/AboutThisBuild.txt
     fi
     cmake -DPROJECT_SOURCE_DATA_DIR=${PROJECT_SOURCE_DATA_DIR} -DCONTENTS=${CONTENTS} -Dversion=${PROJECT_FULL_VERSION} -DshortVersion=${PROJECT_VERSION} -Dminimum_arm64_version=${minimum_arm64_version} -Dminimum_x86_64_version=${minimum_x86_64_version} -Darch=${arch} -P ${PROJECT_SOURCE_DATA_DIR}/info-plist.cmake
     plutil -convert xml1 ${APP}/Contents/Info.plist
     hdiutil unmount ./RawTherapeeuniv
     rm -r univapp
     # Create the fat main RawTherapee binary and move it into the new bundle
-    lipo -create -output RawTherapee RawTherapee-arm64.app/Contents/MacOS/rawtherapee RawTherapee-x86_64.app/Contents/MacOS/rawtherapee
-    lipo -create -output rawtherapee-cli RawTherapee-arm64.app/Contents/MacOS/rawtherapee-cli RawTherapee-x86_64.app/Contents/MacOS/rawtherapee-cli
-    mv rawtherapee RawTherapee.app/Contents/MacOS
+    lipo -create -output RawTherapeeGraph RawTherapee-arm64.app/Contents/MacOS/rawtherapee-graph RawTherapee-x86_64.app/Contents/MacOS/rawtherapee-graph
+    lipo -create -output rawtherapee-graph-cli RawTherapee-arm64.app/Contents/MacOS/rawtherapee-graph-cli RawTherapee-x86_64.app/Contents/MacOS/rawtherapee-graph-cli
+    mv rawtherapee RawTherapeeGraph.app/Contents/MacOS
     # Create all the fat dependencies and move them into the bundle
     for lib in RawTherapee-arm64.app/Contents/Frameworks/* ; do
         lipo -create -output $(basename $lib) RawTherapee-arm64.app/Contents/Frameworks/$(basename $lib) RawTherapee-x86_64.app/Contents/Frameworks/$(basename $lib)
     done
-    sudo mv *so *dylib RawTherapee.app/Contents/Frameworks
-    sudo mv *-cli RawTherapee.app/Contents/MacOS
+    sudo mv *so *dylib RawTherapeeGraph.app/Contents/Frameworks
+    sudo mv *-cli RawTherapeeGraph.app/Contents/MacOS
     rm -r RawTherapee-arm64.app
     rm -r RawTherapee-x86_64.app
 else
-    minimum_arm64_version=$(f=$(cat RawTherapee.app/Contents/Resources/AboutThisBuild.txt | grep mmacosx-version); echo "${f#*min=}" | cut -d ' ' -f1)
+    minimum_arm64_version=$(f=$(cat RawTherapeeGraph.app/Contents/Resources/AboutThisBuild.txt | grep mmacosx-version); echo "${f#*min=}" | cut -d ' ' -f1)
     minimum_x86_64_version=${minimum_arm64_version}
         cmake -DPROJECT_SOURCE_DATA_DIR=${PROJECT_SOURCE_DATA_DIR} -DCONTENTS=${CONTENTS} -Dversion=${PROJECT_FULL_VERSION} -DshortVersion=${PROJECT_VERSION} -Dminimum_arm64_version=${minimum_arm64_version} -Dminimum_x86_64_version=${minimum_x86_64_version} -Darch=${arch} -P ${PROJECT_SOURCE_DATA_DIR}/info-plist.cmake
 fi
@@ -544,23 +544,23 @@ if [[ -n $CODESIGNID ]]; then
     plutil -convert xml1 "${CMAKE_BUILD_TYPE}"/rt.entitlements
     for frame in ${APP}/Contents/Frameworks/* ; do
         echo $frame
-        codesign --preserve-metadata=identifier --digest-algorithm=sha256 --force --timestamp --strict -v -s "${CODESIGNID}" -i com.rawtherapee.RawTherapee -o runtime --entitlements "${CMAKE_BUILD_TYPE}"/rt.entitlements "$frame"
+        codesign --preserve-metadata=identifier --digest-algorithm=sha256 --force --timestamp --strict -v -s "${CODESIGNID}" -i com.rawtherapee.RawTherapeeGraph -o runtime --entitlements "${CMAKE_BUILD_TYPE}"/rt.entitlements "$frame"
     done
     for resource in ${APP}/Contents/Resources/* ; do
         echo $resource
         if [ ! -d "$resource" ]; then
-            codesign --preserve-metadata=identifier --digest-algorithm=sha256 --force --timestamp --strict -v -s "${CODESIGNID}" -i com.rawtherapee.RawTherapee -o runtime --entitlements "${CMAKE_BUILD_TYPE}"/rt.entitlements "$resource"
+            codesign --preserve-metadata=identifier --digest-algorithm=sha256 --force --timestamp --strict -v -s "${CODESIGNID}" -i com.rawtherapee.RawTherapeeGraph -o runtime --entitlements "${CMAKE_BUILD_TYPE}"/rt.entitlements "$resource"
         else
             for subresource in ${APP}/Contents/Resources/$(basename "$resource")/* ; do
                 if [ ! -d "$subresource" ]; then
-                    codesign --preserve-metadata=identifier --digest-algorithm=sha256 --force --timestamp --strict -v -s "${CODESIGNID}" -i com.rawtherapee.RawTherapee -o runtime --entitlements "${CMAKE_BUILD_TYPE}"/rt.entitlements "$subresource"
+                    codesign --preserve-metadata=identifier --digest-algorithm=sha256 --force --timestamp --strict -v -s "${CODESIGNID}" -i com.rawtherapee.RawTherapeeGraph -o runtime --entitlements "${CMAKE_BUILD_TYPE}"/rt.entitlements "$subresource"
                 fi
             done
         fi
     done
-    codesign --preserve-metadata=identifier --digest-algorithm=sha256 --force --timestamp --strict -v -s "${CODESIGNID}" -i com.rawtherapee.RawTherapee -o runtime --entitlements "${CMAKE_BUILD_TYPE}"/rt.entitlements "${APP}"/Contents/MacOS/rawtherapee-cli
-    codesign --preserve-metadata=identifier --digest-algorithm=sha256 --force --timestamp --strict -v -s "${CODESIGNID}" -i com.rawtherapee.RawTherapee -o runtime --entitlements "${CMAKE_BUILD_TYPE}"/rt.entitlements "${APP}"/Contents/MacOS/rawtherapee
-    codesign --preserve-metadata=identifier --digest-algorithm=sha256 --force --timestamp --strict -v -s "${CODESIGNID}" -i com.rawtherapee.RawTherapee -o runtime --entitlements "${CMAKE_BUILD_TYPE}"/rt.entitlements "${APP}"
+    codesign --preserve-metadata=identifier --digest-algorithm=sha256 --force --timestamp --strict -v -s "${CODESIGNID}" -i com.rawtherapee.RawTherapeeGraph -o runtime --entitlements "${CMAKE_BUILD_TYPE}"/rt.entitlements "${APP}"/Contents/MacOS/rawtherapee-graph-cli
+    codesign --preserve-metadata=identifier --digest-algorithm=sha256 --force --timestamp --strict -v -s "${CODESIGNID}" -i com.rawtherapee.RawTherapeeGraph -o runtime --entitlements "${CMAKE_BUILD_TYPE}"/rt.entitlements "${APP}"/Contents/MacOS/rawtherapee-graph
+    codesign --preserve-metadata=identifier --digest-algorithm=sha256 --force --timestamp --strict -v -s "${CODESIGNID}" -i com.rawtherapee.RawTherapeeGraph -o runtime --entitlements "${CMAKE_BUILD_TYPE}"/rt.entitlements "${APP}"
     spctl -a -vvvv "${APP}"
 fi
 
@@ -615,7 +615,7 @@ function CreateDmg {
         --window-size 1000 697 \
         --text-size 16 \
         --icon-size 80 \
-        --icon RawTherapee.app 250 238 \
+        --icon RawTherapeeGraph.app 250 238 \
         --icon Applications 700 238 \
         --icon Website.webloc 300 487 \
         --icon Forum.webloc 420 487 \
@@ -651,9 +651,9 @@ function CreateDmg {
     # Zip disk image for redistribution
     msg "Zipping disk image for redistribution:"
     mkdir "${PROJECT_NAME}_macOS_${MINIMUM_SYSTEM_VERSION}_${arch}_${PROJECT_FULL_VERSION}_folder"
-    cp {"${PROJECT_NAME}_macOS_${MINIMUM_SYSTEM_VERSION}_${arch}_${PROJECT_FULL_VERSION}.dmg","${PROJECT_NAME}.app/Contents/MacOS/rawtherapee-cli","${PROJECT_SOURCE_DATA_DIR}/INSTALL.readme.rtf"} "${PROJECT_NAME}_macOS_${MINIMUM_SYSTEM_VERSION}_${arch}_${PROJECT_FULL_VERSION}_folder"
+    cp {"${PROJECT_NAME}_macOS_${MINIMUM_SYSTEM_VERSION}_${arch}_${PROJECT_FULL_VERSION}.dmg","${PROJECT_NAME}.app/Contents/MacOS/rawtherapee-graph-cli","${PROJECT_SOURCE_DATA_DIR}/INSTALL.readme.rtf"} "${PROJECT_NAME}_macOS_${MINIMUM_SYSTEM_VERSION}_${arch}_${PROJECT_FULL_VERSION}_folder"
     mv "${PROJECT_NAME}_macOS_${MINIMUM_SYSTEM_VERSION}_${arch}_${PROJECT_FULL_VERSION}_folder/INSTALL.readme.rtf" "${PROJECT_NAME}_macOS_${MINIMUM_SYSTEM_VERSION}_${arch}_${PROJECT_FULL_VERSION}_folder/install-readme.txt"
-    codesign -s "${CODESIGNID}" -i com.rawtherapee.rawtherapee-cli -f "${PROJECT_NAME}_macOS_${MINIMUM_SYSTEM_VERSION}_${arch}_${PROJECT_FULL_VERSION}_folder/rawtherapee-cli"
+    codesign -s "${CODESIGNID}" -i com.rawtherapee.rawtherapee-graph-cli -f "${PROJECT_NAME}_macOS_${MINIMUM_SYSTEM_VERSION}_${arch}_${PROJECT_FULL_VERSION}_folder/rawtherapee-graph-cli"
     zip -r "${PROJECT_NAME}_macOS_${MINIMUM_SYSTEM_VERSION}_${arch}_${PROJECT_FULL_VERSION}.zip" "${PROJECT_NAME}_macOS_${MINIMUM_SYSTEM_VERSION}_${arch}_${PROJECT_FULL_VERSION}_folder/"
     if [[ -n $NIGHTLY ]]; then
         cp "${PROJECT_NAME}_macOS_${MINIMUM_SYSTEM_VERSION}_${arch}_${PROJECT_FULL_VERSION}.zip" "${PROJECT_NAME}_macOS_${arch}_latest.zip"

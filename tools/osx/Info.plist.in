@@ -5,29 +5,29 @@
     <key>LSEnvironment</key>
     <dict>
         <key>DYLD_FALLBACK_LIBRARY_PATH</key>
-        <string>/Applications/RawTherapee.app/Contents/Frameworks</string>
+        <string>/Applications/RawTherapeeGraph.app/Contents/Frameworks</string>
         <key>XDG_CONFIG_DIRS</key>
-        <string>/Applications/RawTherapee.app/Contents/Resources/share/gtk-3.0</string>
+        <string>/Applications/RawTherapeeGraph.app/Contents/Resources/share/gtk-3.0</string>
         <key>XDG_CONFIG_HOME</key>
-        <string>/Applications/RawTherapee.app/Contents/Resources/share</string>
+        <string>/Applications/RawTherapeeGraph.app/Contents/Resources/share</string>
         <key>XDG_DATA_DIRS</key>
-        <string>/Applications/RawTherapee.app/Contents/Resources/share/gtk-3.0</string>
+        <string>/Applications/RawTherapeeGraph.app/Contents/Resources/share/gtk-3.0</string>
         <key>GTK_PATH</key>
-        <string>/Applications/RawTherapee.app/Contents/Resources/share/gtk-3.0</string>
+        <string>/Applications/RawTherapeeGraph.app/Contents/Resources/share/gtk-3.0</string>
         <key>GTK_IM_MODULE_FILE</key>
-        <string>/Applications/RawTherapee.app/Contents/Resources/etc/gtk-3.0/gtk.immodules</string>
+        <string>/Applications/RawTherapeeGraph.app/Contents/Resources/etc/gtk-3.0/gtk.immodules</string>
         <key>XDG_DATA_HOME</key>
-        <string>/Applications/RawTherapee.app/Contents/Resources/share</string>
+        <string>/Applications/RawTherapeeGraph.app/Contents/Resources/share</string>
         <key>GSETTINGS_SCHEMA_DIR</key>
-        <string>/Applications/RawTherapee.app/Contents/Resources/share/glib-2.0/schemas</string>
+        <string>/Applications/RawTherapeeGraph.app/Contents/Resources/share/glib-2.0/schemas</string>
         <key>GDK_PIXBUF_MODULE_FILE</key>
-        <string>/Applications/RawTherapee.app/Contents/Resources/etc/gtk-3.0/gdk-pixbuf.loaders</string>
+        <string>/Applications/RawTherapeeGraph.app/Contents/Resources/etc/gtk-3.0/gdk-pixbuf.loaders</string>
         <key>GDK_PIXBUF_MODULEDIR</key>
-        <string>/Applications/RawTherapee.app/Contents/Frameworks</string>
+        <string>/Applications/RawTherapeeGraph.app/Contents/Frameworks</string>
         <key>LIBDIR</key>
-        <string>/Applications/RawTherapee.app/Contents/Frameworks</string>
+        <string>/Applications/RawTherapeeGraph.app/Contents/Frameworks</string>
         <key>DATADIR</key>
-        <string>/Applications/RawTherapee.app/Contents/Resources</string>
+        <string>/Applications/RawTherapeeGraph.app/Contents/Resources</string>
         <key>GDK_RENDERING</key>
         <string>similar</string>
         <key>GTK_OVERLAY_SCROLLING</key>
@@ -45,7 +45,7 @@
     <key>CFBundleAllowMixedLocalizations</key>
     <true />
     <key>CFBundleDisplayName</key>
-    <string>RawTherapee</string>
+    <string>RawTherapeeGraph</string>
     <key>CFBundleDocumentTypes</key>
     <array>
         <dict>
@@ -59,7 +59,7 @@
             <key>LSHandlerRank</key>
             <string>Owner</string>
             <key>CFBundleTypeName</key>
-            <string>RawTherapee Profile Data</string>
+            <string>RawTherapeeGraph Profile Data</string>
             <key>CFBundleTypeRole</key>
             <string>Editor</string>
             <key>LSIsAppleDefaultForType</key>
@@ -167,19 +167,19 @@
         </dict>
     </array>
     <key>CFBundleExecutable</key>
-    <string>rawtherapee</string>
+    <string>rawtherapee-graph</string>
     <key>CFBundleGetInfoString</key>
     <string>@version@, Copyright © 2004-2010 Gábor Horváth, 2010-2026 RawTherapee Development Team</string>
     <key>LSApplicationCategoryType</key>
     <string>public.app-category.photography</string>
     <key>CFBundleIconFile</key>
-    <string>rawtherapee.icns</string>
+    <string>rawtherapee-graph.icns</string>
     <key>CFBundleIdentifier</key>
-    <string>com.rawtherapee.RawTherapee</string>
+    <string>com.rawtherapee.RawTherapeeGraph</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
-    <string>RawTherapee</string>
+    <string>RawTherapeeGraph</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
@@ -207,7 +207,7 @@
                 <string>public.data</string>
             </array>
             <key>UTTypeDescription</key>
-            <string>RawTherapee Profile Data</string>
+            <string>RawTherapeeGraph Profile Data</string>
             <key>UTTypeIconFile</key>
             <string>Icons.icns</string>
             <key>UTTypeIdentifier</key>

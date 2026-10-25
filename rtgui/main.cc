@@ -126,7 +126,7 @@ int processLineParams ( int argc, char **argv )
 #endif
 
                 case 'v':
-                    printf("RawTherapee, version %s\n", RTVERSION);
+                    printf("RawTherapeeGraph, version %s\n", RTVERSION);
                     ret = 0;
                     break;
 
@@ -168,9 +168,9 @@ int processLineParams ( int argc, char **argv )
 #ifdef _WIN32
                     printf("  -w Do not open the Windows console\n");
 #endif
-                    printf("  -v Print RawTherapee version number and exit\n");
+                    printf("  -v Print RawTherapeeGraph version number and exit\n");
 #ifndef __APPLE__
-                    printf("  -R Raise an already running RawTherapee instance (if available)\n");
+                    printf("  -R Raise an already running RawTherapeeGraph instance (if available)\n");
 #endif
                     printf("  -h -? Display this help message\n");
 
@@ -436,7 +436,7 @@ int main (int argc, char **argv)
                     SetConsoleCtrlHandler ( NULL, true );
                     // Set title of console
                     char consoletitle[128];
-                    snprintf(consoletitle, sizeof(consoletitle), "RawTherapee %s Console", RTVERSION);
+                    snprintf(consoletitle, sizeof(consoletitle), "RawTherapeeGraph %s Console", RTVERSION);
                     SetConsoleTitle (consoletitle);
                     // increase size of screen buffer
                     COORD c;
@@ -464,7 +464,7 @@ int main (int argc, char **argv)
         if ( ret <= 0 ) {
             fflush(stdout);
             if (consoleOpened) {
-                printf ("Press any key to exit RawTherapee\n");
+                printf ("Press any key to exit RawTherapeeGraph\n");
                 FlushConsoleInputBuffer (GetStdHandle (STD_INPUT_HANDLE));
                 getch();
             }
@@ -553,7 +553,7 @@ int main (int argc, char **argv)
 #ifdef _WIN32
 
     if (consoleOpened) {
-        printf ("Press any key to exit RawTherapee\n");
+        printf ("Press any key to exit RawTherapeeGraph\n");
         fflush(stdout);
         FlushConsoleInputBuffer (GetStdHandle (STD_INPUT_HANDLE));
         getch();

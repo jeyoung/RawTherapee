@@ -27,7 +27,7 @@ ROOT="$(git rev-parse --show-toplevel)"
 source "$ROOT/tools/perf/lib/common.sh"
 
 build_dir=""
-baseline_dir="$ROOT/../../baseline-dev"
+baseline_dir="$ROOT/../../build/baseline-dev"
 image=""
 pp3=""
 denoise_pp3=""
@@ -71,7 +71,9 @@ export RT_PREVIEW_DISPLAY="${RT_PREVIEW_DISPLAY:-:98}"
 
 cli="$(cli_for_build "$build_dir")"
 baseline_cli=""
-if [ -x "$baseline_dir/rtgui/rawtherapee-cli" ]; then
+if [ -x "$baseline_dir/rtgui/rawtherapee-graph-cli" ]; then
+    baseline_cli="$baseline_dir/rtgui/rawtherapee-graph-cli"
+elif [ -x "$baseline_dir/rtgui/rawtherapee-cli" ]; then
     baseline_cli="$baseline_dir/rtgui/rawtherapee-cli"
 fi
 
@@ -304,11 +306,11 @@ for threads in 1 8; do
 done
 
 # ------------------------------------------------------------------- preview
-if [ "$skip_preview" -eq 0 ] && [ -x "$build_dir/rtgui/rawtherapee" ] \
+if [ "$skip_preview" -eq 0 ] && [ -x "$build_dir/rtgui/rawtherapee-graph" ] \
     && command -v Xvfb >/dev/null 2>&1 && command -v xdotool >/dev/null 2>&1; then
     info "preview latency"
     if RT_PREVIEW_DELAY=20 RT_PREVIEW_WAIT=6 \
-        "$ROOT/tools/perf/bench-preview.sh" "$build_dir/rtgui/rawtherapee" "$image" 5 \
+        "$ROOT/tools/perf/bench-preview.sh" "$build_dir/rtgui/rawtherapee-graph" "$image" 5 \
         >"$report/preview.log" 2>&1; then
         pass "preview latency run"
     else

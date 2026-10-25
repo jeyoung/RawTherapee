@@ -299,7 +299,7 @@ void Exiv2Metadata::saveToImage(const Glib::ustring &path, bool preserve_all_tag
         dst->setXmpData(xmp_data_);
     }
 
-    dst->exifData()["Exif.Image.Software"] = "RawTherapee " RTVERSION;
+    dst->exifData()["Exif.Image.Software"] = "RawTherapeeGraph " RTVERSION;
 
     std::time_t t = std::time(nullptr);
     char mbstr[20];

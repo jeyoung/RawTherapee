@@ -221,12 +221,12 @@ if(WIN32)
     message(STATUS "Using version ${WINDOWS_APPLICATION_VERSION} for manifest template")
 
     # Create the manifest files
-    set(WINDOWS_APPLICATION_NAME "RawTherapee.RawTherapee.rawtherapee")
+    set(WINDOWS_APPLICATION_NAME "RawTherapee.RawTherapeeGraph.rawtherapee-graph")
     configure_file(
         ${CMAKE_CURRENT_SOURCE_DIR}/app.manifest.in
         ${CMAKE_CURRENT_BINARY_DIR}/app.manifest
     )
-    set(WINDOWS_APPLICATION_NAME "RawTherapee.RawTherapee.rawtherapee-cli")
+    set(WINDOWS_APPLICATION_NAME "RawTherapee.RawTherapeeGraph.rawtherapee-graph-cli")
     configure_file(
         ${CMAKE_CURRENT_SOURCE_DIR}/app.manifest.in
         ${CMAKE_CURRENT_BINARY_DIR}/app_cli.manifest
@@ -284,8 +284,8 @@ target_compile_definitions(rth-cli PUBLIC CLIVERSION)
 if((WIN32) AND NOT (CMAKE_BUILD_TYPE STREQUAL "Debug"))
     set_target_properties(rth PROPERTIES LINK_FLAGS "-mwindows")
 endif()
-set_target_properties(rth PROPERTIES OUTPUT_NAME rawtherapee)
-set_target_properties(rth-cli PROPERTIES OUTPUT_NAME rawtherapee-cli)
+set_target_properties(rth PROPERTIES OUTPUT_NAME rawtherapee-graph)
+set_target_properties(rth-cli PROPERTIES OUTPUT_NAME rawtherapee-graph-cli)
 
 target_include_directories(rth PRIVATE ${EXTRA_INCDIR})
 target_include_directories(rth-cli PRIVATE ${EXTRA_INCDIR})

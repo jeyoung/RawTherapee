@@ -73,9 +73,13 @@ gui_start_display || die "cannot start Xvfb on $gui_display"
 trap gui_stop_display EXIT
 
 info "capturing baseline"
-capture "$baseline_dir/rtgui/rawtherapee" baseline
+if [ -x "$baseline_dir/rtgui/rawtherapee-graph" ]; then
+    capture "$baseline_dir/rtgui/rawtherapee-graph" baseline
+else
+    capture "$baseline_dir/rtgui/rawtherapee" baseline
+fi
 info "capturing candidate"
-capture "$build_dir/rtgui/rawtherapee" candidate
+capture "$build_dir/rtgui/rawtherapee-graph" candidate
 
 failures=0
 for scene in fit 100 zoom pan fit2; do
