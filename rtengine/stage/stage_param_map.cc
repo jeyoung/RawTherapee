@@ -2343,10 +2343,10 @@ const std::array<TableEntry, 20>& table()
         {"ciecam", {"colorappearance", "icm", "toneCurve", "raw", "epd"},
          hashCieCam},
         {"gamut", {"cg", "icm"}, hashGamut},
-        {"output.convert", {"icm"}, hashOutputConvert},
         {"crop", {"crop"}, hashCrop},
         {"resize", {"resize", "crop", "framing"}, hashResize},
         {"output.sharpen", {"prsharpening"}, hashOutputSharpen},
+        {"output.convert", {"icm"}, hashOutputConvert},
         {"framing", {"framing", "crop", "resize"}, hashFraming},
         {"output.icc", {"icm", "metadata"}, hashOutputIcc}
     }};
