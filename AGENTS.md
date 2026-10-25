@@ -41,7 +41,18 @@ C++ language constraints are defined in `devnotes/coding-conventions.md` and
   if the tree is dirty, work in a separate worktree.
 - Always work inside `~/source/github/RawTherapee`. Do not create or use
   worktrees outside it. If isolation is needed, place the worktree under
-  `~/source/github/RawTherapee/build/worktrees/<name>`.
+  `~/source/github/RawTherapee/.worktrees/<name>`. The `.worktrees/`
+  directory is gitignored. Never create worktrees under `build/`.
+- Remove a worktree as soon as its branch is committed and merged or
+  explicitly superseded. Do not accumulate finished phase worktrees.
+- `build/` is for build trees only. Remove stale build trees at phase
+  boundaries; keep `build/ccache`, `build/rt-testdata`, the active build
+  trees and `build/portable` for final `.deb` artefacts.
+- The graph workstream uses `perf-graph`. It is intentionally isolated from
+  `dev` and `perf` until the workstream closes; do not merge or rebase those
+  integration lines into it before then.
+- Build final packages into `build/portable`; do not scatter `.deb` files
+  under `build/`.
 
 ## Build process
 
