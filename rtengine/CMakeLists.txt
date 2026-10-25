@@ -124,6 +124,7 @@ set(RTENGINESOURCEFILES
     stage/stage_indexer.cc
     stage/stage_lanczos.cc
     stage/stage_param_hash.cc
+    stage/stage_param_map.cc
     stage/stage_parity.cc
     stage/stage_pipeline.cc
     stage/stage_profile.cc
@@ -280,6 +281,23 @@ add_executable(stage-param-hash-test EXCLUDE_FROM_ALL
 target_link_libraries(stage-param-hash-test PRIVATE rtengine)
 target_include_directories(stage-param-hash-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/stage")
 rt_setup_target(stage-param-hash-test)
+
+# Export descriptor to ProcParams member mapping, proved by mutation.
+add_executable(stage-param-map-test EXCLUDE_FROM_ALL
+    "${CMAKE_CURRENT_SOURCE_DIR}/stage/tests/stage_param_map_test.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/editcallbacks.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/multilangmgr.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/options.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/paramsedited.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/pathutils.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/threadutils.cc"
+)
+target_include_directories(stage-param-map-test BEFORE PRIVATE
+    "${CMAKE_BINARY_DIR}/rtgui"
+)
+target_link_libraries(stage-param-map-test PRIVATE rtengine)
+target_include_directories(stage-param-map-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/stage")
+rt_setup_target(stage-param-map-test)
 
 add_executable(stage-parity-test EXCLUDE_FROM_ALL
     "${CMAKE_CURRENT_SOURCE_DIR}/stage/tests/stage_parity_test.cc"
