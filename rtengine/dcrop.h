@@ -32,6 +32,9 @@ using namespace procparams;
 
 class ImProcCoordinator;
 
+/* Per-update state shared by the extracted crop stage blocks. */
+struct CropStageContext;
+
 class Crop final : public DetailedCrop, public PipetteBuffer
 {
 
@@ -69,6 +72,26 @@ protected:
     bool setCropSizes(const int cropX, const int cropY, const int cropW, const int cropH, const int skip, const bool internal);
     void freeAll();
 
+    /*
+     * The crop pipeline as ordered blocks. The legacy sequence calls every
+     * block in this order and the opt-in stage graph (RT_STAGE_GRAPH) calls
+     * the same blocks according to its plan, so the two share one
+     * implementation. See devnotes/perf/STAGE_RUNTIME.md.
+     */
+    void stageSourceSelect(CropStageContext& ctx);
+    void stageAnalysis(CropStageContext& ctx);
+    void stageRawBase(CropStageContext& ctx);
+    void stageTransform(CropStageContext& ctx);
+    void stageLocalAdjustments(CropStageContext& ctx);
+    void stageRgbProc(CropStageContext& ctx);
+    void stageLabTools(CropStageContext& ctx);
+    void stageLabSharpening(CropStageContext& ctx);
+    void stageLabWavelet(CropStageContext& ctx);
+    void stageWorkingTrc(CropStageContext& ctx);
+    void stageCieCam(CropStageContext& ctx);
+    void stageGamut(CropStageContext& ctx);
+    void stageViewportOutput(CropStageContext& ctx);
+
 public:
     Crop(ImProcCoordinator* parent, EditDataProvider *editDataProvider, bool isDetailWindow);
     ~Crop    () override;
@@ -94,4 +117,17 @@ public:
     int getLeftBorder();
     int getUpperBorder();
 };
+
+/*
+ * Diagnostics for the opt-in crop stage graph (RT_STAGE_GRAPH). runs() counts
+ * the Crop::update() calls whose plan was accepted and executed; fallbacks()
+ * counts the calls that fell back to the unchanged legacy sequence. Both are
+ * process-wide and monotonic.
+ */
+namespace crop_graph
+{
+unsigned runs();
+unsigned fallbacks();
+} // namespace crop_graph
+
 }

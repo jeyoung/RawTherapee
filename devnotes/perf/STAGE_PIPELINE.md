@@ -528,6 +528,16 @@ silently dropped.
   them as the prologue of `transform`, not inside `raw.base`, so a single
   topological order reproduces the implementation's pixel order. The
   provenance moved with them: `transform` lists `dehaze` and `fattal`.
+- On the crop path `raw.preprocess` and `raw.demosaic` are folded into
+  `source.select`: the region is obtained with one `ImageSource::getImage()`
+  call, which performs both steps, and the PRE/PREV denoise branch reloads the
+  same region from inside `stageAnalysis()`. There is no separable call to
+  dispatch.
+- On the crop path the pre-RGB directional-pyramid equaliser runs inside
+  `stageTransform()`, and `softLight()` runs at the start of
+  `stageWorkingTrc()`. Both are position-sensitive in the legacy order, so the
+  block executed at that position owns the call instead of the node the
+  catalogue names.
 - `imgsrc->convertColorSpace()` (`dcrop.cc:693`) is the working-space
   conversion performed for the crop and is folded into `raw.base`.
 - `ipf.moyeqt()` saturation statistics and `ipf.calc_ref()` local-adjustment
@@ -673,6 +683,39 @@ Phase B corrected the export chain to the implementation's order (see
 reuse modes are unchanged, and `stage-pipeline-test` passes in the CPU and
 OpenCL configurations. The export graph parity evidence is in
 `devnotes/perf/STAGE_RUNTIME.md`.
+
+### Crop runtime mapping
+
+`Crop::update()` was split into thirteen private `Crop::stage*` blocks sharing
+one `CropStageContext`. The legacy path calls them in order;
+`RT_STAGE_GRAPH=1` builds `buildPipelineSpec(StagePath::Crop)`, marks the
+blocks the request executes dirty, asks `StageGraph::plan()`, and dispatches
+only the accepted blocks. Rejection falls back to the unchanged legacy loop.
+
+Thirteen canonical nodes execute; two are folded:
+
+- `raw.preprocess` and `raw.demosaic` into `source.select`, because the ROI
+  arrives through one opaque `ImageSource::getImage()` call;
+- the pre-RGB directional-pyramid equaliser into `stageTransform()` and
+  `softLight()` into `stageWorkingTrc()`, because moving either changes the
+  result;
+- `analysis` runs before the rest of `raw.base`, matching the legacy
+  interleaving.
+
+The focused harness:
+
+```bash
+cmake --build <build-dir> --target crop-stage-test -j 6
+<build-dir>/rtengine/crop-stage-test <raw> [pp3] [out-dir] [--stages] \
+    [--cbdl=aft] [--no-ciecam]
+tools/perf/run-suite.sh --build-dir <build-dir> --image <raw> --crop-graph
+```
+
+It loads the image twice, runs the full-frame preview once per copy, then the
+detailed crop for fit, 100% and zoomed/panned viewports with
+`RT_STAGE_GRAPH=0` and `1`. It compares display and output-space images byte
+for byte and requires one executed plan per state and no fallback. Result on
+CPU and OpenCL builds: `AE=0` for every state and profile.
 
 ## Mask-to-block equivalence map (Phase F)
 

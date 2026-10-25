@@ -691,15 +691,19 @@ parity.
 - The preview has a graph-backed decision layer, not a graph-driven
   execution path: with `RT_PREVIEW_GRAPH=1` the plan certifies which blocks
   may run but the legacy block sequence still performs every computation.
-  Crop and thumbnail pipelines are still hand-ordered. Export is graph-driven
-  only when `RT_STAGE_GRAPH=1`; the legacy path is the default. The export
-  graph executes all 20 nodes but neither graph path caches or reuses buffers
-  yet, so a fresh job recomputes every node.
+  Crop, thumbnail and export are graph-driven only when
+  `RT_STAGE_GRAPH=1`; the legacy path is the default and no graph path caches
+  or reuses buffers yet. The export graph executes all 20 nodes, the crop
+  graph 13 of 15 (raw preprocess/demosaic folded into `source.select`), and
+  the thumbnail graph all 12.
 - Five export blocks are folded inside a neighbouring node rather than
   having an execution boundary of their own: the framing geometry (in
   `crop`), the Nearest output resize (in `output.convert`), the three
   `raw.base` sub-blocks, the histogram allocation (in `analysis`) and the
   forced B&W pass (in `output.convert`). See `devnotes/perf/STAGE_PIPELINE.md`.
+- The crop path folds the pre-RGB directional-pyramid equaliser into
+  `stageTransform()` and `softLight()` into `stageWorkingTrc()` because both
+  are position-sensitive in the legacy order.
 - The preview dump writes at most one file per crop tag, so two detail
   windows overwrite each other's `crop-detail.*` pair.
 - The persistent preview cache is opt-in and covers only the preview base
