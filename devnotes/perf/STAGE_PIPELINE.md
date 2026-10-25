@@ -157,6 +157,52 @@ The full-frame preview does not run `lab.sharpening`: sharpening is only
 applied by the crop viewport at 100% (`dcrop.cc:1435-1444`). It is therefore
 absent from the preview spec and present in the crop spec.
 
+### Preview runtime mapping
+
+`RT_PREVIEW_GRAPH=1` drives the inventory through `StageGraph`; the legacy
+sequence stays the default. Each block is one private
+`ImProcCoordinator::stage*()` method, so both paths call the same
+implementation in the same order:
+
+| Node | Method |
+|------|--------|
+| `source.select` | `stageSourceSelect()` |
+| `raw.preprocess` | `stageRawPreprocess()` |
+| `raw.demosaic` | `stageRawDemosaic()` |
+| `raw.base` | `stageRawBase()` |
+| `transform` | `stageTransform()` |
+| `local.adjustments` | `stageLocalAdjustments()` |
+| `rgb.proc` | `stageRgbProc()` |
+| `lab.tools` | `stageLabTools()` |
+| `lab.wavelet` | `stageLabWavelet()` |
+| `working.trc` | `stageWorkingTrc()` |
+| `ciecam` | `stageCieCam()` |
+| `gamut` | `stageGamut()` |
+| `monitor.output` | `stageMonitorOutput()` |
+
+`source.select` is the per-pass half of the source selection: the image
+source itself is bound once by `ImProcCoordinator::assign()`, and the node
+resolves the raw frame for the pass. `analysis` is folded into `raw.base`,
+because `firstAnalysis()` is the last statement of the base-rebuild guard and
+the spot pass that closes `raw.base` mutates `orig_prev` immediately
+afterwards; a separate boundary would reorder the pass. The plan still
+carries the node and tracks its dirty state, but no executor exists for it, so
+the preview executes 13 of its 14 canonical nodes.
+
+The nodes keep their own event-mask gates because a preview block decides how
+much of its output a mask allows, not only whether it runs: `raw.base`
+rebuilds the base for one class of bits, re-prepares retinex for another and
+re-applies spots for a third. The plan decides whether a node is executed; the
+node decides what the mask permits inside it. `monitor.output` executes at its
+legacy site, after the crop render, so the monitor profile cache refresh it
+follows still feeds the crop viewport.
+
+Three statements that were unconditional in the hand-written pass stay in the
+caller, never in a node: the `oprevi = orig_prev` working-pointer reset, the
+local-adjustment damping floor, and the frame-count and image-type notices.
+The Color/Coloropp `todo |= DEMOSAIC` augmentation also runs there so the plan
+sees the mask the pass will use.
+
 ### Crop: 15 nodes, 14 edges
 
 Root `source.select`, sink `viewport.output`. Only raw loading is full-frame;
@@ -543,8 +589,9 @@ silently dropped.
 - `ipf.moyeqt()` saturation statistics and `ipf.calc_ref()` local-adjustment
   reference values are folded into `rgb.proc` and `local.adjustments`
   respectively; they are derived data, not image blocks.
-- The preview soft-proof `lab2rgb()` (`improccoordinator.cc:4136`) is folded
-  into `monitor.output`. A separate soft-proof sink is not modelled.
+- The preview soft-proof `lab2rgb()` is folded into `monitor.output`, in the
+  same method as the monitor conversion. A separate soft-proof sink is not
+  modelled.
 - Embedded-thumbnail rotation exceptions for Leaf `.mos`, Mamiya `.mef` and
   Phase One `.iiq` are folded into `thumbnail.decode` / `thumbnail.transform`.
 - On the embedded branch the raw container load is folded into

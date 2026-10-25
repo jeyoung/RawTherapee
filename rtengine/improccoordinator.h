@@ -20,6 +20,7 @@
 
 #include <atomic>
 #include <memory>
+#include <string>
 
 #include "array2D.h"
 #include "colortemp.h"
@@ -305,6 +306,35 @@ protected:
     void flushDeferredAnalysis();
     void dropPendingDeferred();
     void absorbPendingDeferred(int& todo);
+
+    /*
+     * Canonical full-frame preview nodes (devnotes/perf/STAGE_PIPELINE.md).
+     *
+     * Each block of the full-frame preview is one method, so the legacy
+     * sequence and the opt-in RT_PREVIEW_GRAPH sequence run the same
+     * implementation in the same order. The per-pass state and the resolved
+     * node plan are defined in improccoordinator.cc.
+     */
+    struct PreviewPassState;
+    struct PreviewPassPlan;
+
+    void stageSourceSelect(PreviewPassState& pass);
+    void stageRawPreprocess(PreviewPassState& pass);
+    void stageRawDemosaic(PreviewPassState& pass);
+    void stageRawBase(PreviewPassState& pass);
+    void stageTransform(PreviewPassState& pass);
+    void stageLocalAdjustments(PreviewPassState& pass);
+    void stageRgbProc(PreviewPassState& pass);
+    void stageLabTools(PreviewPassState& pass);
+    void stageLabWavelet(PreviewPassState& pass);
+    void stageWorkingTrc(PreviewPassState& pass);
+    void stageCieCam(PreviewPassState& pass);
+    void stageGamut(PreviewPassState& pass);
+    void stageMonitorOutput(PreviewPassState& pass);
+
+    PreviewPassPlan planPreviewPass(PreviewPassState& pass);
+    PreviewPassPlan legacyPreviewPassPlan();
+    void executePreviewNode(const std::string& id, PreviewPassState& pass);
 
     MyMutex mProcessing;
     const std::unique_ptr<ProcParams> params;  // used for the rendering, can be eventually tweaked

@@ -382,39 +382,83 @@ Evidence (CPU build with OpenCL disabled, single-threaded host run,
   `tools/build-rt.sh opencl -j 6 --ccache --stage-modules` both complete;
   `stage-pipeline-test` and `stage-graph-test` pass.
 
-## Preview decision layer and dump
+## Preview stage graph and dump
 
-`RT_PREVIEW_GRAPH=1` adds an opt-in decision layer to
-`ImProcCoordinator::updatePreviewImage()`. Unset, empty, `0` and `off`
-(case-insensitive) keep the legacy path, which is the default. The layer
-models the full-frame preview as six `StageGraph` nodes connected in
-execution order:
+`RT_PREVIEW_GRAPH=1` executes the canonical full-frame preview inventory
+through `StageGraph`; `RT_STAGE_GRAPH=1` selects the same path when
+`RT_PREVIEW_GRAPH` is unset. Unset, empty, `0` and `off` (case-insensitive)
+keep the legacy sequence, which remains the default and stays byte-identical.
 
-```text
-preview.base -> preview.analysis -> preview.local
-             -> preview.rgb -> preview.lab -> preview.output
-```
+### Runtime mapping
 
-Dirty state comes from the event mask and the base-cache result:
+Every block of the full-frame pass is now one private
+`ImProcCoordinator` method. The legacy sequence and the graph sequence call
+the same methods in the same order, so the two paths cannot drift apart.
 
-- `base` is dirty only when the pass does not restore the base from the
-  preview base cache;
-- `analysis` is dirty when any preprocessing, demosaic, white-balance,
-  retinex, spot or first-analysis bit is set;
-- `local`, `rgb` and `lab` are dirty when the pass carries any bit that
-  starts work in that region (`ALL` and the tool bit sets);
-- `output` is dirty for a monitor conversion or a panning-related change.
+| Node | Method | Event-mask gate |
+|------|--------|-----------------|
+| `source.select` | `stageSourceSelect()` | preprocess bits or high detail newly needed |
+| `raw.preprocess` | `stageRawPreprocess()` | same |
+| `raw.demosaic` | `stageRawDemosaic()` | `M_RAW`, `M_CSHARP`, `M_WB`, modified RGB source, high detail |
+| `raw.base` | `stageRawBase()` | `M_INIT`, `M_LINDENOISE`, `M_HDR`, `M_RETINEX`, `M_SPOT`, pending spot copy |
+| `analysis` | folded into `raw.base` | the base rebuild |
+| `transform` | `stageTransform()` | `M_HDR`, `M_TRANSFORM`, `M_RGBCURVE`, base rebuild, `needsTransform()` |
+| `local.adjustments` | `stageLocalAdjustments()` | `M_AUTOEXP`, or `M_RGBCURVE`/`M_CROP` with local spots |
+| `rgb.proc` | `stageRgbProc()` | `M_RGBCURVE`, `M_CROP` |
+| `lab.tools` | `stageLabTools()` | `M_LUMACURVE`, `M_CROP`, the Lab chain |
+| `lab.wavelet` | `stageLabWavelet()` | the Lab chain |
+| `working.trc` | `stageWorkingTrc()` | the Lab chain |
+| `ciecam` | `stageCieCam()` | the Lab chain |
+| `gamut` | `stageGamut()` | the Lab chain |
+| `monitor.output` | `stageMonitorOutput()` | monitor conversion or a panning-related change |
 
-`plan()` then resolves the actions. Every block the legacy code executes
-must be allowed to run: if the plan returns `ReuseOutput` for such a block,
-the layer logs `preview-graph: fallback to legacy: plan would skip ...` and
-rejects the plan. Rejection changes no pixels, because this version is a
-decision and parity layer, not a rewrite: the legacy block sequence is the
-only implementation, the graph never reorders stages and no arithmetic or
-thread count changes. Once per process, the accepted plan is logged as
-`preview-graph: active, 6 blocks in execution order: ...`.
-`RT_STAGE_PROFILE=1` also records `preview.graph.decide`; measured on the
-45.7 MP image it costs 0.008-0.010 ms per full-frame pass.
+The Lab chain is the hand-written mask `(todo & (M_LUMINANCE + M_COLOR)) ||
+(todo & M_AUTOEXP)`.
+
+A node keeps the event-mask gate the hand-written block used, because a
+preview block decides how much of its output a mask allows, not only whether
+it runs: `raw.base` rebuilds the base for one class of bits, re-prepares
+retinex for another and re-applies spots for a third. The plan decides whether
+the node is executed; the node decides what the mask permits inside it. The
+gates used for dirty marking are the same predicates the nodes use, and are
+documented supersets of the block's internal guards, so a plan can only skip a
+node that would have done nothing.
+
+`analysis` is folded into `raw.base`. `firstAnalysis()` is the final statement
+of the base-rebuild guard, and the spot pass that closes `raw.base` mutates
+`orig_prev` immediately afterwards; extracting it would reorder the pass and
+change the analysis input. The inventory keeps the node and the plan tracks its
+dirty state, but the body runs inside `raw.base`. Folded nodes: one
+(`analysis`), for that reason.
+
+Three statements that were unconditional in the hand-written pass stay in the
+caller rather than in a node, because a node can be skipped:
+
+- the working-pointer reset `oprevi = orig_prev` (the previous pass may have
+  left `oprevi` on a deleted fork);
+- the local-adjustment damping floor for selective-editing capture sharpening;
+- the frame-count and image-type notices.
+
+The Color/Coloropp white-balance augmentation (`todo |= DEMOSAIC`) also runs in
+the caller: it is a pure function of the mask, and the plan must see the mask
+the pass will actually use.
+
+### Plan and validation
+
+Each full-frame pass builds `buildPipelineSpec(StagePath::Preview)`, connects
+its 14 nodes and 13 edges into a `StageGraph`, marks each node dirty from the
+event mask, the high-detail state and the pending spot copy, and asks
+`plan()` for the actions before anything executes. A node the pass must run may
+not come back `ReuseOutput`, and every scheduled node must have an executor;
+either failure rejects the plan, logs `preview-graph: fallback to legacy:
+<reason>` once, and runs the unchanged legacy sequence. Once per process the
+accepted plan is logged as `preview-graph: active, N of 14 canonical nodes
+executed from the preview inventory (analysis folded into raw.base)`.
+
+Execution walks the plan's topological order. `monitor.output` runs at its
+legacy site, after the crop render, because the monitor profile cache refresh
+it follows feeds the crop viewport. `RT_STAGE_PROFILE=1` records
+`preview.graph.plan` and one key per node id.
 
 `RT_PREVIEW_DUMP=<dir>` writes the completed full-frame pass and the visible
 crop for parity work. It is off when unset, empty, `0` or `off`.
@@ -438,42 +482,46 @@ metadata. The dump path holds the existing preview mutex and is disabled by
 default; writing a dump adds disk I/O to the pass and is not part of the
 latency gate.
 
-Reproduce under Xvfb with a fresh settings directory, a fresh cache and
-`OMP_NUM_THREADS=1` for every run, loading the same image and waiting for
-`preview imageReady`:
+### Evidence
 
-```bash
-RT_SETTINGS=... RT_CACHE=... RT_PREVIEW_PROFILE=1 \
-RT_PREVIEW_GRAPH=0 RT_PREVIEW_DUMP=/tmp/dump-legacy rawtherapee "$RT_TEST_IMAGE_45MP"
-RT_SETTINGS=... RT_CACHE=... RT_PREVIEW_PROFILE=1 \
-RT_PREVIEW_GRAPH=1 RT_PREVIEW_DUMP=/tmp/dump-graph rawtherapee "$RT_TEST_IMAGE_45MP"
-cmp /tmp/dump-legacy/preview.tif /tmp/dump-graph/preview.tif
-```
+Harness: one Xvfb instance per configuration, a fresh settings directory and
+cache, a copy of the 45.7 MP NEF, `OMP_NUM_THREADS=1`, and a fixed sequence of
+editor actions. After each action the harness waits for `preview.json` to stop
+changing and copies `preview.tif`, `work.tif` and `preview.json`; the event
+mask recorded in `preview.json` proves the scenario produced the intended
+pass. The image, sidecar and dumps stay outside the repository.
 
-Evidence on the 45.7 MP NEF under Xvfb, single-threaded, fresh settings and
-cache for every run:
+| Scenario | Editor action | Recorded mask |
+|----------|---------------|---------------|
+| initial fit | none | `0x4000`-`0x4003` |
+| output-profile change | Color Management output profile | `0x4280` |
+| exposure change | Exposure compensation stepper | `0x1009f` |
+| tone-curve change | tone curve control point | `0x401f` |
+| monitor-profile change | soft-proof profile selection | `0x4000` |
 
-- `RT_PREVIEW_GRAPH=0` versus `1`: `preview.tif`, `work.tif` and
-  `crop-main.tif` are byte-identical (`cmp`, `AE=0`) over five independent
-  pairs.
-- Two legacy runs are byte-identical to each other, and two graph runs are
-  byte-identical to each other, so the comparison is not measuring
-  run-to-run noise.
-- `RT_PREVIEW_GRAPH=off` matches the unset default byte for byte, and
-  `RT_PREVIEW_GRAPH=1` logs the active plan without a fallback on those
-  passes.
-- A deliberate dirty-rule mutation that under-reported the base block
-  produced `preview-graph: fallback to legacy: plan would skip preview.base
-  but the legacy path runs it (todo=118783)` exactly once; the pixels were
-  unchanged.
+- CPU build: all five scenarios are byte-identical between
+  `RT_PREVIEW_GRAPH=0` and `1` for both `preview.tif` and `work.tif`
+  (`cmp`, `AE=0`).
+- OpenCL build: the same five scenarios are byte-identical between the two
+  paths, and the legacy dumps are `AE=0` against the CPU build, so the change
+  is variant-independent.
+- The scenarios are not vacuous: the output-profile pass changes `work.tif`
+  (`AE=456992`) while leaving the monitor image untouched, and the exposure,
+  tone-curve and monitor-transform passes change both dumps by about
+  457 000 samples.
+- `preview-graph: active, 13 of 14 canonical nodes executed` appears once per
+  run and `preview-graph: fallback` never appears.
 - Preview latency on the same build and image, driven through the Exposure
-  slider: four paired legacy/graph GUI runs gave p50 372-487 ms and
-  415-493 ms respectively. The direction changes between pairs and the
-  spread is about 25%, while the decision costs 0.008-0.010 ms, so the
-  difference is host and GUI noise rather than a regression. The standard
-  `bench-preview.sh` gate exits zero in both modes; its drag coordinates
-  only produce two samples on this host, so the paired harness above is the
-  useful measurement.
+  stepper without a dump: five paired GUI runs. Legacy p50
+  391/376/481/348/350 ms and p95 435/481/859/408/393 ms; graph p50
+  367/371/367/356/347 ms and p95 445/448/481/407/372 ms. Median p50 is
+  376 ms legacy to 367 ms graph (-2.4%) and median p95 435 ms to 445 ms
+  (+2.3%), both inside the 5% tolerance: the graph skips nodes whose gates
+  are false and the plan itself costs microseconds. One legacy p95 sample of
+  859 ms is host noise and is kept in the set rather than dropped.
+- Builds: `tools/build-rt.sh cpu -j 6 --ccache --stage-modules` and
+  `tools/build-rt.sh opencl -j 6 --ccache --stage-modules` both complete, and
+  the stage tests pass on both.
 
 ## Persistent store
 
@@ -665,11 +713,15 @@ parity.
   binary. A plan that would skip a node is rejected before execution and
   falls back to the legacy sequence with a logged reason.
 
-- Preview graph (`RT_PREVIEW_GRAPH=1`): five independent legacy/graph
-  dump pairs were byte-identical for `preview.tif`, `work.tif` and the main
-  crop. The decision costs 0.008–0.010 ms per pass. The layer is advisory in
-  this version: it certifies blocks and fails closed, while execution keeps
-  the legacy arithmetic order.
+- Preview graph (`RT_PREVIEW_GRAPH=1`): the graph executes the 13 executable
+  canonical nodes in topological order and logs `preview-graph: active, 13 of
+  14 canonical nodes executed`; `analysis` is folded into `raw.base`. On the
+  CPU and OpenCL builds, five legacy/graph dump pairs (initial fit,
+  output-profile, exposure, tone-curve and monitor-profile changes) are
+  byte-identical for `preview.tif` and `work.tif`, and no fallback is logged.
+  Median p50/p95 are 376/435 ms legacy and 367/445 ms graph (-2.4%/+2.3%),
+  inside the 5% tolerance, so the plan-driven skip of idle nodes is not a
+  regression.
 - Tile merge and ordering: the tiled denoise and wavelet overlap merge now
   accumulates per-tile contributions in ascending tile-row/column order.
   `RT_TILE_ORDER=0` and `1` are `AE=0` at 1 and 8 threads, and the default
@@ -688,14 +740,15 @@ parity.
 
 ## Limitations
 
-- The preview has a graph-backed decision layer, not a graph-driven
-  execution path: with `RT_PREVIEW_GRAPH=1` the plan certifies which blocks
-  may run but the legacy block sequence still performs every computation.
-  Crop, thumbnail and export are graph-driven only when
-  `RT_STAGE_GRAPH=1`; the legacy path is the default and no graph path caches
-  or reuses buffers yet. The export graph executes all 20 nodes, the crop
-  graph 13 of 15 (raw preprocess/demosaic folded into `source.select`), and
-  the thumbnail graph all 12.
+- Preview, crop, thumbnail and export are graph-driven only when
+  `RT_STAGE_GRAPH=1`/`RT_PREVIEW_GRAPH=1`; the legacy path is the default and
+  no graph path caches or reuses buffers yet. The preview executes 13 of its
+  14 canonical nodes (`analysis` folded into `raw.base`), the crop 13 of 15
+  (`raw.preprocess`/`raw.demosaic` folded into `source.select`), the export
+  all 20 and the thumbnail all 12.
+- The preview plan has no buffer cache behind it: a dirty node recomputes and
+  a clean node is not executed at all, so a skipped node still relies on the
+  state the previous pass left in the coordinator.
 - Five export blocks are folded inside a neighbouring node rather than
   having an execution boundary of their own: the framing geometry (in
   `crop`), the Nearest output resize (in `output.convert`), the three
