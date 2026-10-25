@@ -214,6 +214,23 @@ if [ "$crop_graph_parity" -eq 1 ]; then
         fail "crop-stage-test (see $log)"
     fi
 
+    # Incremental dirty-block scenarios: one parameter or render-state change
+    # inside a live session, compared with the legacy graph default and with a
+    # fresh render of the final state. This is the shadow-equivalence gate for
+    # the crop path.
+    log="$report/crop-dirty-test.log"
+    if OMP_NUM_THREADS=1 "$build_dir/rtengine/crop-stage-test" \
+            "${crop_args[@]}" --sequences >"$log" 2>&1; then
+        if grep -q "crop-stage-test: PASS" "$log" \
+                && grep -Eq "crop dirty: [1-9][0-9]* comparisons" "$log"; then
+            pass "crop dirty shadow (geometry, wb, demosaic, transform, local, sharpening, ciecam, crop)"
+        else
+            fail "crop dirty shadow (see $log)"
+        fi
+    else
+        fail "crop dirty shadow (see $log)"
+    fi
+
     stages_dir="$report/crop-stages"
     mkdir -p "$stages_dir"
     stages_log="$report/crop-stage-test-stages.log"

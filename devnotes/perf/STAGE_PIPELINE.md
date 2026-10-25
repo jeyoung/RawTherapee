@@ -984,3 +984,200 @@ The test checks:
 
 The OpenCL configuration compiles as well. The map is data only, so no parity
 run applies.
+
+## Dirty-block derivation (Phase F)
+
+The mask-to-block map above describes what the `M_*` bits mean, but it cannot
+replace them: a bit names a parameter family, not the inputs of a block, and
+its gates over-approximate. `rtengine/stage/stage_dirty_blocks.h/.cc` derives
+the block set from the inputs instead, and the crop viewport is the first
+consumer.
+
+The derivation reads three sources and nothing else:
+
+1. the per-block parameter fingerprints of `stage_param_map.h`, compared
+   against the previous update's snapshot;
+2. the previous and current `RenderStateKey` of `stage_render_state.h`,
+   compared by field group;
+3. the path structure of `stage_pipeline.h` for the forward closure and the
+   canonical order.
+
+It does not read the legacy mask, does not read pixels and executes nothing, so
+the crop and the preview path share one implementation and one log format.
+
+### API
+
+| Function | Meaning |
+|----------|---------|
+| `stage_fingerprints(path, params)` | Ids and fingerprints of every canonical block of the path, once |
+| `changed_render_state_aspects(a, b)` | Field groups that differ between two render states |
+| `blocks_for_render_state(path, aspect)` | Blocks one changed aspect names, per path |
+| `request_rebuilds_path(kind)` | Whether a request kind asks for a whole-path rebuild |
+| `coupled_block_groups(path)` | Blocks that share one gate and one buffer seed |
+| `resident_blocks(path)` | Blocks the caller executes on every invocation |
+| `close_dirty_blocks(path, blocks)` | Forward closure over the pipeline edges |
+| `derive_dirty_blocks(inputs)` | The derivation: params, state, groups, residents, closure |
+| `compare_dirty_shadow(legacy, derived)` | `missing` (unsafe) and `extra` (over-approximation) |
+| `format_block_ids(blocks)` | One-line log rendering, `[a b c]` |
+
+`derive_dirty_blocks()` is a pure function of its inputs. A caller keeps the
+previous `BlockFingerprints` and `RenderStateKey` instead of a `ProcParams`
+copy, so an update hashes the current parameters once (15 descriptors for the
+crop path) rather than twice.
+
+### Rules
+
+1. **Parameter delta.** A block is directly dirty when its fingerprint differs
+   from the previous snapshot. Equal parameters give an empty set.
+2. **Render-state delta.** A changed `RenderStateKey` group dirties the blocks
+   its aspect names. The groups are geometry, source, high detail, display,
+   editor and request; every key field belongs to exactly one group.
+3. **Rebuild request.** A `FullCrop`, `FullPreview` or `HighQuality` request
+   dirties the whole path. A request is absolute, not a delta: it says "this
+   pass rebuilds the path", so it cannot be expressed as an input change.
+4. **Coupled group.** The Lab chain shares one `laboCrop -> labnCrop` seed and
+   one gate. Seeding any member seeds the whole group: crop
+   `lab.tools`, `lab.sharpening`, `lab.wavelet`, `working.trc`, `ciecam`,
+   `gamut`; preview the same without `lab.sharpening`.
+5. **Residents.** `raw.base`, `transform` and `viewport.output` on the crop,
+   and `monitor.output` on the preview, are executed on every invocation by
+   the legacy sequences. They are part of the execution set but do not seed
+   the closure: their bodies are still mask-gated, so a resident alone does
+   not regenerate anything.
+6. **Forward closure.** Every consumer of a directly dirty block is dirty,
+   because the path carries one in-place image and no intermediate cache yet.
+   The closure stops at the sinks and never reaches a producer.
+7. **Canonical output.** Every returned id is a canonical descriptor of the
+   requested path, in pipeline order, without duplicates, so two sets compare
+   with `==`.
+
+### Per-path tables
+
+Changed render-state aspect to blocks, crop path:
+
+| Aspect | Crop blocks |
+|--------|-------------|
+| geometry | `raw.base`, `analysis`, `transform`, `local.adjustments`, `rgb.proc`, `lab.tools`, `lab.sharpening`, `lab.wavelet`, `working.trc`, `ciecam`, `gamut`, `viewport.output` |
+| source | `source.select`, `raw.preprocess`, `raw.demosaic`, `raw.base` |
+| high detail | `raw.preprocess`, `raw.demosaic`, `raw.base`, `analysis`, `transform` |
+| display | `viewport.output` |
+| editor | `lab.sharpening` |
+| request | `viewport.output` |
+
+The crop geometry aspect covers every ROI block and deliberately leaves the
+full-frame source alone: a pan or zoom reallocates the ROI buffers but does not
+reload the raw planes. The preview geometry aspect covers the whole preview
+pass, because a preview-scale change re-renders it.
+
+`StagePath::Export` and `StagePath::Thumbnail` do not carry a
+`RenderStateKey`; every aspect returns the whole path there, which is the
+conservative answer for a caller that passes one anyway.
+
+### Crop wiring
+
+`Crop::update()` builds the current snapshot from `parent->params` and the
+coordinator state (ROI rectangle, skip, borders, high-detail flags, source
+generation, monitor configuration, sharpening mask) and derives the set before
+any stage body can touch the parameters. It stores the snapshot again after
+the pass, because several stage bodies write corrected values back into the
+parameters (automatic white balance, automatic denoise) and those corrections
+belong to the state the buffers hold, not to the next update's inputs.
+
+The one thing the crop still takes from the mask is the raw-reload request:
+`M_INIT`, `M_LINDENOISE` and `M_HDR` ask for the destructive raw stage to be
+reloaded, which no parameter fingerprint can express. The mask is carried into
+the render state as `RequestKind::FullCrop`, so the derivation treats the pass
+as a rebuild instead of silently skipping the reload. Every other input is
+derived.
+
+`RT_CROP_DIRTY` selects the source of the execution set:
+
+| Value | Execution set | Use |
+|-------|---------------|-----|
+| `legacy` | the mask-derived set of the hand-written gates | A/B baseline; no derivation |
+| `shadow` | the mask-derived set; the derived set is compared and logged | establishing equivalence |
+| `fingerprint` | the derived set, or the mask-derived set when a block would be skipped | default |
+
+The fail-closed rule is asymmetric on purpose. `missing` (in the legacy set,
+not in the derived set) would skip work the current graph default performs, so
+the update executes the legacy set instead and increments a counter. `extra`
+(in the derived set, not in the legacy set) is recorded but executed: the
+stage bodies keep their own mask gates in this phase, so the extra calls are
+inert, and the closure is what makes a skipped middle block impossible.
+
+The legacy sequence, the unchanged `todo` coalescing and the plan rejection in
+`planCropGraph()` are untouched. A rejected plan still runs the full legacy
+loop, and the graph's dirty flags now come from the derived set rather than
+from the execution list.
+
+### Shadow evidence
+
+`crop-stage-test --sequences` drives one parameter or viewport change inside a
+live session for each scenario, applies the real `refreshmap.h` composite mask,
+and compares three images: the legacy incremental crop, the candidate
+incremental crop and a fresh render of the final state. Parity is the gate;
+the fresh comparison attributes a stale result to the legacy path when both
+incremental paths agree.
+
+Image: 45.7 MP NEF, 100% viewport 960x640, `OMP_NUM_THREADS=1`. Three
+configurations: `--stages` (denoise, local adjustments and CIE CAM active),
+`--stages --no-ciecam`, and the default configuration (all three inactive).
+
+| Scenario | Mask | Comparison | Missing | Extra |
+|----------|------|------------|---------|-------|
+| geometry (100% -> 200% pan) | none | forced full | 0 | 0 |
+| white balance | `WB` | rebuild request | 0 | 0 |
+| demosaic / capture sharpening | `DEMOSAIC` | rebuild request | 0 | 0 |
+| transform (rotate 1.5 deg) | `TRANSFORM` | reallocation | 0 | 0 |
+| local adjustments | `AUTOEXP` | rebuild request | 0 | 0 |
+| sharpening | `SHARPENING` | Lab chain + closure | 0 | 3 |
+| CIE CAM on | `AUTOEXP` | rebuild request | 0 | 0 |
+| CIE CAM off | `AUTOEXP` | rebuild request | 0 | 0 |
+| crop rectangle | `M_CROP` | transform + closure | 0 | 3 to 9 |
+
+All three configurations report 21 comparisons, 21 equivalent, 0 missing
+blocks, 0 fail-closed fallbacks, and `AE=0` for display and output-space
+images in every scenario and in the static fit/100%/zoomed states. The `extra`
+list is the documented over-approximation: `analysis`, `local.adjustments` and
+`rgb.proc` for a Lab-only mask, and the Lab chain for a crop-rectangle mask.
+`--dirty=fingerprint` and `--dirty=shadow` produce byte-identical images.
+
+The `SHARPENING` mask shows a pre-existing `AE=1` on 23 235 of ~3.7 M bytes
+between the incremental and the fresh render in the CIE CAM configuration. The
+legacy incremental path has the same difference, so it is not caused by the
+derivation: it is the LUT rebuild scale of an incremental pass versus a full
+`ALL` pass. It is recorded as a legacy limitation, not as a pass.
+
+No stale crop was found for any scenario: the derived pass matches the current
+graph default byte for byte, including where the legacy incremental path
+differs from a fresh render.
+
+### Verification
+
+```bash
+tools/build-rt.sh cpu -j 6 --ccache --stage-modules
+tools/build-rt.sh opencl -j 6 --ccache --stage-modules
+cmake --build build/cpu-<branch> --target stage-dirty-blocks-test -j 6
+build/cpu-<branch>/rtengine/stage-dirty-blocks-test
+build/cpu-<branch>/rtengine/crop-stage-test <raw> --stages --sequences \
+    --out=<dir>
+```
+
+`stage-dirty-blocks-test` pins the contract without pixels: fingerprints are
+per path, deterministic and ordered; every parameter family dirties exactly the
+blocks that list the changed member; every render-state field belongs to
+exactly one aspect; the coupled group expands as a unit; the closure reaches
+consumers and stops at sinks; and the shadow comparison separates `missing`
+from `extra`. The OpenCL configuration compiles and the test passes there too.
+
+Performance on the same image and viewport, 15 alternating edits per mode
+after two warm-up updates:
+
+| Edit | `legacy` mean | `fingerprint` mean | Delta |
+|------|---------------|--------------------|-------|
+| exposure (full path) | 1356.6 ms | 1344.2 ms | -0.9% |
+| crop rectangle (short) | 468.9 ms | 460.7 ms | -1.7% |
+
+The derivation costs one 15-descriptor fingerprint pass per update plus two set
+comparisons, which is below the measurement noise of a crop pass. No
+regression above the 5% gate was observed.

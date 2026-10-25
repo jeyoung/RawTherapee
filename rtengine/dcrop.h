@@ -18,6 +18,8 @@
  */
 #pragma once
 
+#include <memory>
+
 #include "rtengine.h"
 #include "pipettebuffer.h"
 #include "rtgui/threadutils.h"
@@ -27,6 +29,9 @@ namespace rtengine
 
 class Image8;
 class CieImage;
+
+/* Per-update snapshot of the crop dirty-block derivation. Defined in dcrop.cc. */
+struct CropDirtyState;
 
 using namespace procparams;
 
@@ -68,6 +73,12 @@ protected:
     MyMutex cropMutex;
     ImProcCoordinator* const parent;
     const bool isDetailWindow;
+    /*
+     * Previous parameter fingerprints and render state, used to derive the
+     * dirty block set of the next update. Null until the first update has
+     * been observed.
+     */
+    std::unique_ptr<CropDirtyState> dirtyState;
     EditUniqueID getCurrEditID() const;
     bool setCropSizes(const int cropX, const int cropY, const int cropW, const int cropH, const int skip, const bool internal);
     void freeAll();
@@ -123,11 +134,26 @@ public:
  * the Crop::update() calls whose plan was accepted and executed; fallbacks()
  * counts the calls that fell back to the unchanged legacy sequence. Both are
  * process-wide and monotonic.
+ *
+ * The dirty-block counters belong to the same instrumentation:
+ *
+ * - dirtyChecks() counts the updates on which the fingerprint/state set was
+ *   compared with the legacy mask-derived set;
+ * - dirtyEquivalent() counts the comparisons with no missing block;
+ * - dirtyMissing() and dirtyExtra() sum the per-comparison block counts of the
+ *   two mismatch classes;
+ * - dirtyFallbacks() counts the updates that executed the legacy set because
+ *   the derived set would have skipped a block.
  */
 namespace crop_graph
 {
 unsigned runs();
 unsigned fallbacks();
+unsigned dirtyChecks();
+unsigned dirtyEquivalent();
+unsigned dirtyMissing();
+unsigned dirtyExtra();
+unsigned dirtyFallbacks();
 } // namespace crop_graph
 
 }
