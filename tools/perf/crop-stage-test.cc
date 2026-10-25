@@ -43,6 +43,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -527,7 +528,16 @@ int main(int argc, char** argv)
 
     // Keep the run self-contained: no settings, cache or preview-base files
     // outside the output directory, and no persistent preview base reuse
-    // between the legacy and graph passes.
+    // between the legacy and graph passes. The engine requires RT_SETTINGS
+    // to be absolute.
+    {
+        std::error_code error;
+        const std::filesystem::path absolute =
+            std::filesystem::absolute(outDir, error);
+        if (!error) {
+            outDir = absolute.string();
+        }
+    }
     const std::string settingsDir = outDir + "/settings";
     const std::string cacheDir = outDir + "/cache";
     g_setenv("RT_SETTINGS", settingsDir.c_str(), TRUE);
