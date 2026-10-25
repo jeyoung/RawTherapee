@@ -20,8 +20,7 @@
  *
  * For every viewport state (fit, 100%, zoomed and panned) it loads the image
  * twice, runs the full-frame preview once per copy and then the detailed crop,
- * with RT_STAGE_GRAPH unset on the first copy and RT_STAGE_GRAPH=1 on the
- * second. The two detailed crop images (display and output space) are compared
+ * twice through the graph, once per copy. The two detailed crop images (display and output space) are compared
  * byte for byte and written as PPM so the result can be inspected.
  *
  *   crop-stage-test <raw> [pp3] [out-dir] [--stages] [--cbdl=aft]
@@ -1106,7 +1105,6 @@ int main(int argc, char** argv)
         }
     }
 
-    g_unsetenv("RT_STAGE_GRAPH");
     g_unsetenv("RT_CROP_DIRTY");
 
     // Parity is only evidence when the graph actually ran: a rejected plan

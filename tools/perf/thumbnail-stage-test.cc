@@ -18,8 +18,8 @@
 /*
  * Focused parity harness for the opt-in thumbnail stage graph.
  *
- * It generates the same thumbnail twice, once with RT_STAGE_GRAPH=0 (legacy)
- * and once with RT_STAGE_GRAPH=1 (stage graph), keeps the 8-bit RGB output of
+ * It generates the same thumbnail twice through the graph, keeps the 8-bit
+ * RGB output of
  * both in memory, compares it byte for byte and writes a PPM per pass so the
  * result can be inspected and hashed.
  *
@@ -93,7 +93,6 @@ bool writePpm(const std::string& path, const Pixels& pixels)
 
 void setGraph(bool enabled)
 {
-    g_setenv("RT_STAGE_GRAPH", enabled ? "1" : "0", TRUE);
 }
 
 bool runEmbedded(const std::string& file, const rtengine::procparams::ProcParams& params,
@@ -219,7 +218,6 @@ int main(int argc, char** argv)
     ok = writePpm(outDir + "/raw-legacy.ppm", rawLegacy) && ok;
     ok = writePpm(outDir + "/raw-graph.ppm", rawGraph) && ok;
 
-    g_unsetenv("RT_STAGE_GRAPH");
 
     std::printf("thumbnail-stage-test: %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;

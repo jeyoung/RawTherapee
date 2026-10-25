@@ -85,9 +85,9 @@ class Thumbnail
     /*
      * Canonical stage blocks of the thumbnail path (devnotes/perf/STAGE_PIPELINE.md).
      *
-     * Each block is the single implementation of that step: the legacy
-     * sequence and the opt-in RT_STAGE_GRAPH sequence call the same methods in
-     * the same order, so the two paths cannot drift apart. The state structs
+     * Each block is the single implementation of that step. The graph path
+     * calls them in canonical order, so the inventory and the code cannot
+     * drift apart. The state structs
      * are defined in rtthumbnail.cc. thumbnail.scale has one implementation per
      * entry point because the embedded branch continues in 8-bit and the raw
      * fallback continues in float, exactly as the legacy code does.
