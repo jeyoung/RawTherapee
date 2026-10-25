@@ -379,6 +379,16 @@ These are recorded rather than hidden:
 - `resize`/`framing` and `crop` overlap deliberately: the finishing geometry
   reads all three members. A change to any of them moves more than one
   fingerprint. The mutation test records those cases as non-exclusive.
+- `sharpening` and `prsharpening` omit five `SharpeningParams` members that
+  the constructor leaves uninitialised and that no code reads:
+  `deconvAutoRadius`, `deconvCornerBoost`, `deconvCornerLatitude`,
+  `psf_kernel` and `psf_iterations`. Hashing them made the fingerprint depend
+  on stack contents, so the two sharpening export fingerprints changed when
+  the defect was found. The regression table pins their new values, a test
+  writes the five members to prove they are excluded, and another constructs
+  `ProcParams` over two differently poisoned buffers to check the remaining
+  fields. Restore them when the constructor initialises them and a processing
+  path reads them.
 
 ### Fingerprint format
 
@@ -408,8 +418,8 @@ The OpenCL configuration compiles (`tools/build-rt.sh opencl -j 6 --ccache`)
 and the same target builds and passes in `build/opencl-phaseB-param-map`. The
 test checks:
 
-1. every canonical export descriptor has a fingerprint, and non-export ids
-   (preview, crop, thumbnail, monitor, viewport, unknown) do not;
+1. every canonical export descriptor has an export fingerprint, and ids
+   outside the export path do not;
 2. repeated calls and an equal `ProcParams` copy give identical fingerprints;
 3. the table has twenty unique ids in pipeline order, all inside the export
    spec, and every field name is a `ProcParams` member;
@@ -421,6 +431,42 @@ test checks:
 6. members outside a descriptor's list do not change it.
 
 The sub-struct hashers read 55 `ProcParams` types and 1567 data members.
+
+### Preview and crop tables
+
+The parameter map also covers the preview and crop graphs. The preview table
+has fourteen descriptors and the crop table fifteen. Both reuse the export
+definition of every shared block, so `raw.base`, `transform`,
+`local.adjustments`, `rgb.proc`, `lab.tools`, `lab.wavelet`, `working.trc`,
+`ciecam` and `gamut` have one field list on all paths. The crop path adds
+`lab.sharpening`; preview omits it. `monitor.output` (preview) and
+`viewport.output` (crop) are separate display sinks that currently read `icm`.
+
+API:
+
+```cpp
+bool has_preview_fingerprint(const std::string& id);
+ParamFingerprint preview_fingerprint(const std::string& id,
+                                     const procparams::ProcParams& params);
+bool has_crop_fingerprint(const std::string& id);
+ParamFingerprint crop_fingerprint(const std::string& id,
+                                  const procparams::ProcParams& params);
+const std::vector<StageParamMapEntry>& previewParamMap();
+const std::vector<StageParamMapEntry>& cropParamMap();
+```
+
+The monitor profile, monitor intent and the soft-proof and gamut-check
+switches are application or GUI state, not `ProcParams`, so they cannot enter
+these fingerprints. The crop ROI rectangle is a request input for the same
+reason. Both belong to the separate `RenderStateKey` task. The crop table
+still hashes the crop rectangle through `transform`, because post-crop
+vignetting reads it.
+
+The test checks every descriptor and table order against
+`buildPipelineSpec()`, neutral-parameter stability, a mutation matrix across
+the parameter families of both paths, and a regression guard that pins the
+twenty neutral-parameter export fingerprints. It runs as
+`stage-param-map-test` in `build/cpu-phaseF-preview-map`.
 
 ## Reuse and consumer semantics
 
