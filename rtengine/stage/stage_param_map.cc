@@ -16,14 +16,19 @@
  */
 
 /*
- * Export stage parameter map.
+ * Stage parameter map.
  *
- * Every export descriptor from the canonical pipeline specification is mapped
- * here to the ProcParams members its block reads, and the mapping is turned
- * into a stable fingerprint with ParamHasher. The block boundaries and the
- * starting field lists come from devnotes/perf/STAGE_PIPELINE.md; the extra
- * members were added from rtengine/simpleprocess.cc and the tool implementations
- * that the export path calls.
+ * Every canonical stage descriptor from the export, preview and crop
+ * specifications is mapped here to the ProcParams members its block reads, and
+ * the mapping is turned into a stable fingerprint with ParamHasher. The block
+ * boundaries and the starting field lists come from
+ * devnotes/perf/STAGE_PIPELINE.md; the extra members were added from
+ * rtengine/simpleprocess.cc, rtengine/improccoordinator.cc, rtengine/dcrop.cc
+ * and the tool implementations that those paths call.
+ *
+ * A descriptor that two paths share has one definition, so a shared block
+ * hashes the same members everywhere. The export table keeps twenty entries,
+ * preview selects fourteen and crop fifteen.
  *
  * Whole ProcParams sub-structs are hashed field by field. The field lists below
  * were generated once from the declarations in procparams.h, the params
@@ -46,6 +51,7 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <initializer_list>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -1701,6 +1707,15 @@ void addField(ParamHasher& hasher, const procparams::SoftLightParams& value)
     addField(hasher, value.strength);
 }
 
+/*
+ * SharpeningParams leaves five members uninitialised and never reads them:
+ * deconvAutoRadius, deconvCornerBoost, deconvCornerLatitude, psf_kernel and
+ * psf_iterations. Its constructor does not set them, operator==() ignores
+ * them, the parameter file does not save or load them, and no processing path
+ * reads them. Hashing them would make the fingerprint depend on stack garbage,
+ * so they are deliberately omitted. Add them back only when the constructor
+ * initialises them and a processing path consumes them.
+ */
 void addField(ParamHasher& hasher, const procparams::SharpeningParams& value)
 {
     addField(hasher, value.enabled);
@@ -1721,11 +1736,6 @@ void addField(ParamHasher& hasher, const procparams::SharpeningParams& value)
     addField(hasher, value.deconvradius);
     addField(hasher, value.deconviter);
     addField(hasher, value.deconvdamping);
-    addField(hasher, value.deconvAutoRadius);
-    addField(hasher, value.deconvCornerBoost);
-    addField(hasher, value.deconvCornerLatitude);
-    addField(hasher, value.psf_kernel);
-    addField(hasher, value.psf_iterations);
 }
 
 void addField(ParamHasher& hasher, const procparams::SharpenEdgeParams& value)
@@ -2244,6 +2254,22 @@ void hashOutputConvert(ParamHasher& hasher, const ProcParams& params)
 }
 
 /*
+ * Monitor and viewport output.
+ *
+ * `lab2monitorRgb()` converts the finished Lab image to the display space.
+ * With soft proofing the image passes through the output profile first;
+ * without it the monitor profile is the only target. The output profile,
+ * intent, black-point compensation and gamut flag are ProcParams members and
+ * are hashed here. The monitor profile, monitor intent and the soft-proof and
+ * gamut-check switches live in application or GUI state, not in ProcParams, so
+ * they cannot enter this fingerprint; they belong to the future RenderStateKey.
+ */
+void hashDisplayOutput(ParamHasher& hasher, const ProcParams& params)
+{
+    addField(hasher, params.icm);
+}
+
+/*
  * Crop rectangle. cropGuide is not included: it is an editor overlay and no
  * export path reads it.
  */
@@ -2290,20 +2316,24 @@ void hashOutputIcc(ParamHasher& hasher, const ProcParams& params)
 
 using HashFn = void (*)(ParamHasher&, const ProcParams&);
 
-struct TableEntry {
+struct DescriptorDefinition {
     const char* id;
     std::vector<const char*> fields;
     HashFn hash;
 };
 
 /*
- * The table is the review surface: id, consumed ProcParams members and the
- * hasher that reads them. Order follows the export pipeline so a diff reads
- * like the processing order.
+ * One definition per distinct stage descriptor across the canonical paths.
+ *
+ * A descriptor that two paths share appears once, so preview, crop and export
+ * cannot drift apart while their semantics are the same. The two display sinks
+ * are separate entries so the paths can diverge later; both currently read only
+ * `icm`.
  */
-const std::array<TableEntry, 20>& table()
+const std::vector<DescriptorDefinition>& definitions()
 {
-    static const std::array<TableEntry, 20> entries = {{
+    static const std::vector<DescriptorDefinition> catalogue = {
+        // Export pipeline order.
         {"source.select", {"raw"}, hashSourceSelect},
         {"raw.preprocess",
          {"raw", "lensProf", "coarse", "dirpyrDenoise"},
@@ -2348,59 +2378,208 @@ const std::array<TableEntry, 20>& table()
         {"output.sharpen", {"prsharpening"}, hashOutputSharpen},
         {"output.convert", {"icm"}, hashOutputConvert},
         {"framing", {"framing", "crop", "resize"}, hashFraming},
-        {"output.icc", {"icm", "metadata"}, hashOutputIcc}
-    }};
-    return entries;
+        {"output.icc", {"icm", "metadata"}, hashOutputIcc},
+        // Display sinks. Preview ends at monitor.output; the crop viewport
+        // ends at viewport.output.
+        {"monitor.output", {"icm"}, hashDisplayOutput},
+        {"viewport.output", {"icm"}, hashDisplayOutput}
+    };
+    return catalogue;
 }
 
-const TableEntry* findEntry(const std::string& id)
+const DescriptorDefinition* findDefinition(const std::string& id)
 {
-    for (const TableEntry& entry : table()) {
-        if (id == entry.id) {
-            return &entry;
+    for (const DescriptorDefinition& definition : definitions()) {
+        if (id == definition.id) {
+            return &definition;
         }
     }
     return nullptr;
 }
 
-} // namespace
+using PathTable = std::vector<const DescriptorDefinition*>;
 
-const std::vector<ExportParamMapEntry>& exportParamMap()
+PathTable buildPath(std::initializer_list<const char*> ids)
 {
-    static const std::vector<ExportParamMapEntry> entries = [] {
-        std::vector<ExportParamMapEntry> projected;
-        projected.reserve(table().size());
-        for (const TableEntry& entry : table()) {
-            projected.push_back(
-                {entry.id,
-                 std::vector<std::string>(entry.fields.begin(),
-                                          entry.fields.end())});
+    PathTable path;
+    path.reserve(ids.size());
+    for (const char* id : ids) {
+        const DescriptorDefinition* definition = findDefinition(id);
+        assert(definition != nullptr);
+        if (definition != nullptr) {
+            path.push_back(definition);
         }
-        return projected;
-    }();
+    }
+    return path;
+}
+
+/*
+ * Path tables. The order is the execution order of
+ * buildPipelineSpec(StagePath::...) and every id must exist in the catalogue.
+ */
+const PathTable& exportPath()
+{
+    static const PathTable path = buildPath({
+        "source.select",
+        "raw.preprocess",
+        "raw.demosaic",
+        "raw.base",
+        "analysis",
+        "transform",
+        "local.adjustments",
+        "rgb.proc",
+        "lab.tools",
+        "lab.sharpening",
+        "lab.wavelet",
+        "working.trc",
+        "ciecam",
+        "gamut",
+        "crop",
+        "resize",
+        "output.sharpen",
+        "output.convert",
+        "framing",
+        "output.icc"
+    });
+    return path;
+}
+
+const PathTable& previewPath()
+{
+    static const PathTable path = buildPath({
+        "source.select",
+        "raw.preprocess",
+        "raw.demosaic",
+        "raw.base",
+        "analysis",
+        "transform",
+        "local.adjustments",
+        "rgb.proc",
+        "lab.tools",
+        "lab.wavelet",
+        "working.trc",
+        "ciecam",
+        "gamut",
+        "monitor.output"
+    });
+    return path;
+}
+
+const PathTable& cropPath()
+{
+    static const PathTable path = buildPath({
+        "source.select",
+        "raw.preprocess",
+        "raw.demosaic",
+        "raw.base",
+        "analysis",
+        "transform",
+        "local.adjustments",
+        "rgb.proc",
+        "lab.tools",
+        "lab.sharpening",
+        "lab.wavelet",
+        "working.trc",
+        "ciecam",
+        "gamut",
+        "viewport.output"
+    });
+    return path;
+}
+
+const DescriptorDefinition* findInPath(const PathTable& path,
+                                       const std::string& id)
+{
+    for (const DescriptorDefinition* definition : path) {
+        if (id == definition->id) {
+            return definition;
+        }
+    }
+    return nullptr;
+}
+
+std::vector<StageParamMapEntry> project(const PathTable& path)
+{
+    std::vector<StageParamMapEntry> entries;
+    entries.reserve(path.size());
+    for (const DescriptorDefinition* definition : path) {
+        entries.push_back(
+            {definition->id,
+             std::vector<std::string>(definition->fields.begin(),
+                                      definition->fields.end())});
+    }
     return entries;
 }
 
-bool has_export_fingerprint(const std::string& id)
+ParamFingerprint fingerprint(const PathTable& path, const std::string& id,
+                             const ProcParams& params)
 {
-    return findEntry(id) != nullptr;
-}
+    const DescriptorDefinition* definition = findInPath(path, id);
+    assert(definition != nullptr);
 
-ParamFingerprint export_fingerprint(const std::string& id,
-                                    const procparams::ProcParams& params)
-{
-    const TableEntry* entry = findEntry(id);
-    assert(entry != nullptr);
-
-    if (entry == nullptr) {
+    if (definition == nullptr) {
         return ParamFingerprint{};
     }
 
     ParamHasher hasher;
     /* The section label is the descriptor id itself, verbatim. */
-    hasher.addSectionLabel(entry->id);
-    entry->hash(hasher, params);
+    hasher.addSectionLabel(definition->id);
+    definition->hash(hasher, params);
     return hasher.finish();
+}
+
+} // namespace
+
+const std::vector<StageParamMapEntry>& exportParamMap()
+{
+    static const std::vector<StageParamMapEntry> entries = project(exportPath());
+    return entries;
+}
+
+const std::vector<StageParamMapEntry>& previewParamMap()
+{
+    static const std::vector<StageParamMapEntry> entries =
+        project(previewPath());
+    return entries;
+}
+
+const std::vector<StageParamMapEntry>& cropParamMap()
+{
+    static const std::vector<StageParamMapEntry> entries = project(cropPath());
+    return entries;
+}
+
+bool has_export_fingerprint(const std::string& id)
+{
+    return findInPath(exportPath(), id) != nullptr;
+}
+
+bool has_preview_fingerprint(const std::string& id)
+{
+    return findInPath(previewPath(), id) != nullptr;
+}
+
+bool has_crop_fingerprint(const std::string& id)
+{
+    return findInPath(cropPath(), id) != nullptr;
+}
+
+ParamFingerprint export_fingerprint(const std::string& id,
+                                    const procparams::ProcParams& params)
+{
+    return fingerprint(exportPath(), id, params);
+}
+
+ParamFingerprint preview_fingerprint(const std::string& id,
+                                     const procparams::ProcParams& params)
+{
+    return fingerprint(previewPath(), id, params);
+}
+
+ParamFingerprint crop_fingerprint(const std::string& id,
+                                  const procparams::ProcParams& params)
+{
+    return fingerprint(cropPath(), id, params);
 }
 
 } // namespace rtengine::stage
