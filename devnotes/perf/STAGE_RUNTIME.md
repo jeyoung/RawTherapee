@@ -196,8 +196,9 @@ sections, raw-byte framing, repeated `finish()` and 100k repeated calls.
 
 ## Graph-driven export
 
-`ImageProcessor::normal_pipeline()` has an opt-in graph-driven form. With
-`RT_STAGE_GRAPH=1` the canonical export inventory becomes a `StageGraph`:
+`ImageProcessor::normal_pipeline()` is graph-driven by default. The canonical
+export inventory becomes a `StageGraph`; set `RT_STAGE_GRAPH=0` or `off` to
+use the legacy sequence:
 `stage::buildPipelineSpec(StagePath::Export)` supplies all 20 node ids, the 19
 edges and each node's reuse mode, so the graph is not restated in the
 processing code. The graph is built per job, so every node is dirty and
@@ -302,8 +303,9 @@ denoise/wavelet work; it is not yet wired into those tools.
 
 ## Graph-driven thumbnail
 
-`RT_STAGE_GRAPH=1` also switches the thumbnail path to the canonical
-twelve-node specification in `STAGE_PIPELINE.md`. Each entry point builds
+The thumbnail path is graph-driven by default through the canonical
+twelve-node specification in `STAGE_PIPELINE.md`; `RT_STAGE_GRAPH=0` selects
+the legacy sequence. Each entry point builds
 `buildPipelineSpec(StagePath::Thumbnail)`, connects every node and edge into a
 `StageGraph`, marks the nodes that invocation owns dirty, and executes the
 active nodes in `topologicalOrder()` when `plan()` allows it. The entry
@@ -384,10 +386,9 @@ Evidence (CPU build with OpenCL disabled, single-threaded host run,
 
 ## Preview stage graph and dump
 
-`RT_PREVIEW_GRAPH=1` executes the canonical full-frame preview inventory
-through `StageGraph`; `RT_STAGE_GRAPH=1` selects the same path when
-`RT_PREVIEW_GRAPH` is unset. Unset, empty, `0` and `off` (case-insensitive)
-keep the legacy sequence, which remains the default and stays byte-identical.
+The canonical full-frame preview inventory executes through `StageGraph` by
+default. `RT_PREVIEW_GRAPH` takes precedence over `RT_STAGE_GRAPH`; set either
+to `0` or `off` to use the legacy sequence, which stays byte-identical.
 
 ### Runtime mapping
 
@@ -783,10 +784,10 @@ parity.
 
 ## Limitations
 
-- Preview, crop, thumbnail and export are graph-driven only when
-  `RT_STAGE_GRAPH=1`/`RT_PREVIEW_GRAPH=1`; the legacy path is the default and
-  no graph path caches or reuses buffers yet. The preview executes 13 of its
-  14 canonical nodes (`analysis` folded into `raw.base`), the crop 13 of 15
+- Preview, crop, thumbnail and export are graph-driven by default. Set
+  `RT_STAGE_GRAPH=0` or `RT_PREVIEW_GRAPH=0` for the legacy kill switch. No
+  graph path caches or reuses buffers yet. The preview executes 13 of its 14
+  canonical nodes (`analysis` folded into `raw.base`), the crop 13 of 15
   (`raw.preprocess`/`raw.demosaic` folded into `source.select`), the export
   all 20 and the thumbnail all 12.
 - The preview plan has no buffer cache behind it: a dirty node recomputes and
