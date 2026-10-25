@@ -287,8 +287,13 @@ void testNoHistory()
     const DirtyBlocks forced = derive_dirty_blocks(inputs);
 
     check(forced.forced, "no history: the result is forced");
+    check(forced.valid, "no history: a forced result is still usable");
+    check(!forced.reason.empty(), "no history: the reason is recorded");
     check(forced.blocks == pipelineIds(StagePath::Crop),
           "no history: the whole path is dirty");
+    check(forced.ids == std::set<std::string>(forced.blocks.begin(),
+                                              forced.blocks.end()),
+          "no history: ids and blocks agree");
     checkOrdered(StagePath::Crop, forced.blocks, "no history");
 
     /* A previous fingerprint table of another path is not usable history. */
@@ -317,6 +322,11 @@ void testStableState()
     const DirtyBlocks derived = deriveCrop(fingerprints, fingerprints, state,
                                            state);
     check(!derived.forced, "stable: not forced");
+    check(derived.valid, "stable: the derivation is valid");
+    check(derived.reason.empty(), "stable: no fallback reason");
+    check(derived.ids == std::set<std::string>(derived.blocks.begin(),
+                                               derived.blocks.end()),
+          "stable: ids and blocks agree");
     check(derived.fromParams.empty(), "stable: no parameter block is dirty");
     check(derived.fromState.empty(), "stable: no render-state block is dirty");
     check(derived.fromClosure.empty(), "stable: the closure adds nothing");
@@ -535,12 +545,16 @@ void testAspectBlocks()
            aspect only its sink. */
         {StagePath::Preview, RenderStateAspect::Geometry,
          pipelineIds(StagePath::Preview)},
+        {StagePath::Preview, RenderStateAspect::HighDetail,
+         setOf({"source.select", "raw.preprocess", "raw.demosaic", "raw.base",
+                "analysis", "transform"})},
         {StagePath::Preview, RenderStateAspect::Source,
          setOf({"source.select", "raw.preprocess", "raw.demosaic", "raw.base"})},
         {StagePath::Preview, RenderStateAspect::Display,
          setOf({"monitor.output"})},
         {StagePath::Preview, RenderStateAspect::Editor,
-         setOf({"raw.base", "analysis", "transform"})},
+         setOf({"source.select", "raw.preprocess", "raw.demosaic", "raw.base",
+                "analysis", "transform"})},
         {StagePath::Preview, RenderStateAspect::Request,
          setOf({"monitor.output"})}
     };
@@ -704,6 +718,197 @@ void testRequestKind()
           "request: a repaint does not rebuild the Lab chain");
 }
 
+/*
+ * The compatibility forms the preview coordinator uses. They must answer with
+ * the same execution-set contract as derive_dirty_blocks(): membership in
+ * `ids` equals the ordered `blocks`, residents are included, and the forward
+ * closure reaches every consumer.
+ */
+void testPreviewWrappers()
+{
+    procparams::ProcParams params;
+
+    /* The snapshot is one fingerprint per canonical preview block. */
+    const ParamSnapshot snapshot = snapshotParams(params, StagePath::Preview);
+    const std::vector<std::string> previewIds = pipelineIds(StagePath::Preview);
+    check(snapshot.size() == previewIds.size(),
+          "snapshot: one fingerprint per preview block");
+
+    const BlockFingerprints fingerprints =
+        stage_fingerprints(StagePath::Preview, params);
+    bool snapshotMatches = true;
+    for (size_t i = 0; i < previewIds.size(); ++i) {
+        const auto stored = snapshot.find(previewIds[i]);
+        snapshotMatches = snapshotMatches && stored != snapshot.end()
+            && stored->second == fingerprints.values[i];
+    }
+    check(snapshotMatches,
+          "snapshot: values equal the per-block fingerprint table");
+
+    /* The whole-path form is explicit about being a fallback. */
+    const DirtyBlocks all = allDirtyBlocks(StagePath::Preview);
+    check(all.valid && all.forced,
+          "all: the whole path is a valid forced result");
+    check(all.ids == std::set<std::string>(previewIds.begin(),
+                                           previewIds.end()),
+          "all: every canonical preview block is named");
+
+    /* Stable parameters derive no block, and the residents remain. */
+    const DirtyBlocks stable =
+        dirtyBlocksFromSnapshot(snapshot, params, StagePath::Preview);
+    check(stable.valid && !stable.forced,
+          "snapshot: a stable pass is a valid derivation");
+    check(stable.fromParams.empty(),
+          "snapshot: stable parameters name no block");
+    check(stable.ids.count("monitor.output") == 1,
+          "snapshot: the display resident is part of the execution set");
+    check(stable.ids
+              == std::set<std::string>(stable.blocks.begin(),
+                                       stable.blocks.end()),
+          "snapshot: ids and blocks agree");
+
+    /* An incomplete snapshot cannot be history: the whole path is the
+       answer. */
+    ParamSnapshot incomplete = snapshot;
+    incomplete.erase(previewIds.front());
+    const DirtyBlocks fallback =
+        dirtyBlocksFromSnapshot(incomplete, params, StagePath::Preview);
+    check(fallback.forced,
+          "snapshot: an incomplete snapshot forces a full recompute");
+    check(fallback.ids == allDirtyBlocks(StagePath::Preview).ids,
+          "snapshot: an incomplete snapshot dirties the whole path");
+
+    /* A parameter change reaches the blocks the preview fingerprint lists. */
+    procparams::ProcParams changed = params;
+    changed.wb.temperature += 500;
+    const DirtyBlocks fromWb =
+        dirtyBlocksFromParams(params, changed, StagePath::Preview);
+    check(fromWb.valid && !fromWb.forced,
+          "params: a change is a valid derivation");
+    check(contains(fromWb.blocks, "raw.base"),
+          "params: white balance dirties the base");
+    check(fromWb.ids
+              == std::set<std::string>(fromWb.blocks.begin(),
+                                       fromWb.blocks.end()),
+          "params: ids and blocks agree");
+
+    /* Equal render state derives only the resident sink. */
+    const RenderStateKey base;
+    const DirtyBlocks equalState =
+        dirtyBlocksFromRenderState(base, base, StagePath::Preview);
+    check(equalState.valid, "state: an equal state is valid");
+    check(equalState.fromState.empty(),
+          "state: an equal state names no block");
+    check(equalState.ids == std::set<std::string>({"monitor.output"}),
+          "state: an equal state keeps only the display resident");
+
+    /* Display: only the display sink. */
+    RenderStateKey display;
+    display.monitorProfile = "Adobe RGB";
+    const DirtyBlocks fromDisplay =
+        dirtyBlocksFromRenderState(base, display, StagePath::Preview);
+    check(fromDisplay.fromState == setOf({"monitor.output"}),
+          "state display: dirties the display sink");
+    check(fromDisplay.ids.count("raw.base") == 0,
+          "state display: does not reach the raw core");
+
+    /* A coupled group is expanded as a unit on any path. */
+    RenderStateKey sharpMask;
+    sharpMask.sharpMask = true;
+    const DirtyBlocks cropSharpMask =
+        dirtyBlocksFromRenderState(base, sharpMask, StagePath::Crop);
+    check(cropSharpMask.fromState == setOf({"lab.sharpening"}),
+          "state crop editor: the sharpening block is the seed");
+    check(cropSharpMask.ids.count("lab.tools") == 1
+              && cropSharpMask.ids.count("gamut") == 1,
+          "state crop editor: the whole Lab chain is in the set");
+    check(cropSharpMask.fromGroups.size() == 5,
+          "state crop editor: the group reports the added members");
+
+    /* Geometry: a crop-rectangle change re-renders the preview pass. */
+    RenderStateKey crop;
+    crop.cropX += 1;
+    const DirtyBlocks fromCrop =
+        dirtyBlocksFromRenderState(base, crop, StagePath::Preview);
+    check(fromCrop.ids == allDirtyBlocks(StagePath::Preview).ids,
+          "state geometry: the preview answers with the whole path");
+
+    /* An absolute request rebuilds the path, whatever the deltas say. */
+    RenderStateKey highQuality;
+    highQuality.requestKind = RequestKind::HighQuality;
+    const DirtyBlocks fromHighQuality =
+        dirtyBlocksFromRenderState(base, highQuality, StagePath::Preview);
+    check(fromHighQuality.ids == allDirtyBlocks(StagePath::Preview).ids,
+          "state high quality: the whole path is dirty");
+    check(fromHighQuality.ids.count("source.select") == 1,
+          "state high quality: re-selects the frame");
+    check(!fromHighQuality.forced,
+          "state high quality: a derivation, not a forced result");
+
+    /* A parameter-only request dirties nothing beyond the resident. */
+    RenderStateKey paramsOnly;
+    paramsOnly.requestKind = RequestKind::ParamsOnly;
+    const DirtyBlocks fromParamsOnly =
+        dirtyBlocksFromRenderState(highQuality, paramsOnly,
+                                   StagePath::Preview);
+    check(fromParamsOnly.ids == std::set<std::string>({"monitor.output"}),
+          "state params only: schedules nothing");
+
+    /* A preview base change reaches the raw core. */
+    RenderStateKey baseChanged;
+    baseChanged.previousDemoBase = 2;
+    const DirtyBlocks fromBase =
+        dirtyBlocksFromRenderState(base, baseChanged, StagePath::Preview);
+    check(fromBase.ids.count("raw.demosaic") == 1,
+          "state base: a different preview base re-runs the raw core");
+
+    /* Merge unions both inputs and stays valid while both are valid. */
+    const DirtyBlocks merged =
+        mergeDirtyBlocks(fromDisplay, fromHighQuality);
+    check(merged.valid, "merge: two valid sets are valid");
+    check(merged.ids.count("monitor.output") == 1,
+          "merge: keeps the first display sink");
+    check(merged.ids.count("raw.demosaic") == 1,
+          "merge: keeps the second raw block");
+    DirtyBlocks invalid;
+    invalid.reason = "unsupported";
+    check(!mergeDirtyBlocks(fromDisplay, invalid).valid,
+          "merge: one invalid input makes the union invalid");
+    check(mergeDirtyBlocks(fromDisplay, invalid).reason == "unsupported",
+          "merge: the invalid reason is kept");
+
+    /* The explicit closure adds consumers and stops at producers. */
+    DirtyBlocks lab;
+    lab.valid = true;
+    lab.ids.insert("lab.tools");
+    lab.blocks = setOf({"lab.tools"});
+    const DirtyBlocks closed = closeOverGraph(lab, StagePath::Preview);
+    check(closed.ids.count("lab.wavelet") == 1,
+          "closure: reaches the next Lab block");
+    check(closed.ids.count("monitor.output") == 1,
+          "closure: reaches the sink");
+    check(closed.ids.count("rgb.proc") == 0,
+          "closure: does not reach a producer");
+
+    /* Unsupported forms fail closed with the whole path. */
+    const DirtyBlocks thumbnail =
+        dirtyBlocksFromSnapshot(snapshotParams(params, StagePath::Thumbnail),
+                                params, StagePath::Thumbnail);
+    check(!thumbnail.valid,
+          "thumbnail: the parameter form reports the unsupported path");
+    check(thumbnail.ids == allDirtyBlocks(StagePath::Thumbnail).ids,
+          "thumbnail: the answer is still the whole path");
+
+    const DirtyBlocks exportState =
+        dirtyBlocksFromRenderState(base, display, StagePath::Export);
+    const std::vector<std::string> exportIds = pipelineIds(StagePath::Export);
+    check(!exportState.valid,
+          "export: the render state is not modelled");
+    check(exportState.ids
+              == std::set<std::string>(exportIds.begin(), exportIds.end()),
+          "export: the answer is still the whole path");
+}
+
 void testVocabulary()
 {
     std::set<std::string> maskIds;
@@ -750,6 +955,7 @@ int main()
     testResidents();
     testCoupledGroups();
     testRequestKind();
+    testPreviewWrappers();
     testVocabulary();
 
     if (failures != 0) {

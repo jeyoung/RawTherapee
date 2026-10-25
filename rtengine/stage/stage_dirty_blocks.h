@@ -20,6 +20,8 @@
 #include "stage_pipeline.h"
 #include "stage_render_state.h"
 
+#include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -206,6 +208,26 @@ struct DirtyBlockInputs {
 };
 
 struct DirtyBlocks {
+    /*
+     * The execution set as a set, for a caller that unions two derivations.
+     *
+     * It is the same membership as `blocks`, which stays the ordered form the
+     * execution list and the diagnostics use.
+     */
+    std::set<std::string> ids;
+    /*
+     * Whether the result may be used as a derivation.
+     *
+     * False only when the requested path cannot be derived at all; `reason`
+     * then names the limitation. A forced result is valid: it is the whole
+     * path, which is the conservative answer rather than a failure.
+     * derive_dirty_blocks() always returns valid; the compatibility adapters
+     * return false for a form the path does not support, such as a render
+     * state on the export path.
+     */
+    bool valid = false;
+    /* Why the result is not a derivation, for the log and the plan refusal. */
+    std::string reason;
     /* True when the result is the whole path instead of a derivation. */
     bool forced = false;
     /* Blocks whose parameter fingerprint changed. */
@@ -224,6 +246,62 @@ struct DirtyBlocks {
 
 /* Derive the dirty block set. See the unit comment for the contract. */
 DirtyBlocks derive_dirty_blocks(const DirtyBlockInputs& inputs);
+
+/*
+ * Compatibility forms of the same derivation.
+ *
+ * The preview coordinator was written against a first, standalone draft of
+ * this unit that took a fingerprint map and a render state per call. The
+ * functions below keep that call shape so the coordinator compiles unchanged,
+ * while every answer is computed by the shared rules above: the parameter
+ * forms run stage_fingerprints() and derive_dirty_blocks(), the state form runs
+ * changed_render_state_aspects() and blocks_for_render_state(), and the closing
+ * and merging forms run close_dirty_blocks(). They return the execution set,
+ * residents and forward closure included, exactly as derive_dirty_blocks()
+ * does, so a caller that marks every returned id dirty is never missing work.
+ *
+ * A path that cannot be derived for the requested form answers with the whole
+ * path and sets `valid` false, so a caller fails closed instead of mistaking a
+ * fallback for a derivation. derive_dirty_blocks() itself always answers with
+ * `valid` true and marks a full-path fallback as `forced`.
+ */
+
+/* One fingerprint per canonical block of `path`, keyed by block id. */
+using ParamSnapshot = std::map<std::string, ParamFingerprint>;
+
+ParamSnapshot snapshotParams(const procparams::ProcParams& params,
+                             StagePath path);
+
+/* Parameter delta between two full parameter sets. */
+DirtyBlocks dirtyBlocksFromParams(const procparams::ProcParams& previous,
+                                  const procparams::ProcParams& current,
+                                  StagePath path);
+
+/*
+ * Parameter delta against a stored snapshot.
+ *
+ * A snapshot that does not carry every canonical block of the path is not
+ * usable history; the answer is then the whole path, which is the conservative
+ * reading of "the missing ids changed".
+ */
+DirtyBlocks dirtyBlocksFromSnapshot(const ParamSnapshot& previous,
+                                    const procparams::ProcParams& current,
+                                    StagePath path);
+
+/* Render-state delta; no parameters are consulted. */
+DirtyBlocks dirtyBlocksFromRenderState(const RenderStateKey& previous,
+                                       const RenderStateKey& current,
+                                       StagePath path);
+
+/* Every canonical block of `path`, for a caller with no previous snapshot. */
+DirtyBlocks allDirtyBlocks(StagePath path);
+
+/* Union of two dirty sets; valid only when both inputs are valid. */
+DirtyBlocks mergeDirtyBlocks(const DirtyBlocks& first,
+                             const DirtyBlocks& second);
+
+/* Forward closure of a set over the pipeline edges. */
+DirtyBlocks closeOverGraph(const DirtyBlocks& blocks, StagePath path);
 
 /*
  * Shadow comparison of the legacy execution set with the derived one.

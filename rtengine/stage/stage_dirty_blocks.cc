@@ -351,21 +351,39 @@ std::vector<std::string> blocks_for_render_state(StagePath path,
         return select(path, {"source.select", "raw.preprocess",
                              "raw.demosaic", "raw.base"});
     case RenderStateAspect::HighDetail:
-        /* The high-detail pass feeds the raw core and the analysis. */
-        return select(path, {"raw.preprocess", "raw.demosaic", "raw.base",
-                             "analysis", "transform"});
+        /*
+         * The high-detail pass feeds the raw core and the analysis. The
+         * preview also re-selects the frame: source.select is the per-pass
+         * half of source resolution (improccoordinator.cc: stageSourceSelect),
+         * so a newly needed high-detail pass runs it before the preprocessing
+         * it belongs to. A crop never reloads the full-frame source for an
+         * ROI repaint, which is why its row starts at raw.preprocess.
+         */
+        return path == StagePath::Preview
+                   ? select(path, {"source.select", "raw.preprocess",
+                                   "raw.demosaic", "raw.base", "analysis",
+                                   "transform"})
+                   : select(path, {"raw.preprocess", "raw.demosaic", "raw.base",
+                                   "analysis", "transform"});
     case RenderStateAspect::Display:
         return path == StagePath::Preview
                    ? select(path, {"monitor.output"})
                    : select(path, {"viewport.output"});
     case RenderStateAspect::Editor:
         /*
-         * The sharpening mask changes the sharpening block. The fast-preview
-         * family only exists on the preview path, where it re-renders the raw
-         * core, the analysis and the transform before the reduced pass.
+         * The crop sharpening-mask toggle changes the sharpening block. The
+         * preview family covers three switches with different consumers: the
+         * sharpening mask replaces the demosaiced planes (raw.demosaic), while
+         * the FAST toggle, the main-preview full-resolution record and the
+         * rough-preview flag decide the demosaic mode before the reduced pass
+         * runs. One aspect cannot name a different set per switch, so the
+         * preview answer is their union: an over-approximation that costs one
+         * inert call, never a skipped block.
          */
         return path == StagePath::Preview
-                   ? select(path, {"raw.base", "analysis", "transform"})
+                   ? select(path, {"source.select", "raw.preprocess",
+                                   "raw.demosaic", "raw.base", "analysis",
+                                   "transform"})
                    : select(path, {"lab.sharpening"});
     case RenderStateAspect::Request:
         /* A changed request kind is a repaint until a full request is made. */
@@ -491,11 +509,15 @@ std::vector<std::string> close_dirty_blocks(
 DirtyBlocks derive_dirty_blocks(const DirtyBlockInputs& inputs)
 {
     DirtyBlocks result;
+    result.valid = true;
 
     assert(inputs.currentFingerprints != nullptr);
     if (inputs.currentFingerprints == nullptr) {
         result.forced = true;
+        result.reason = "no current fingerprints";
         result.blocks = pathIds(inputs.path);
+        result.ids = std::set<std::string>(result.blocks.begin(),
+                                          result.blocks.end());
         return result;
     }
 
@@ -521,7 +543,16 @@ DirtyBlocks derive_dirty_blocks(const DirtyBlockInputs& inputs)
      */
     if (inputs.forceFull || !haveHistory || current.empty()) {
         result.forced = true;
+        if (inputs.forceFull) {
+            result.reason = "forced full recompute";
+        } else if (!haveHistory) {
+            result.reason = "no parameter history";
+        } else {
+            result.reason = "no parameter fingerprints on this path";
+        }
         result.blocks = pathIds(inputs.path);
+        result.ids = std::set<std::string>(result.blocks.begin(),
+                                          result.blocks.end());
         return result;
     }
 
@@ -612,6 +643,271 @@ DirtyBlocks derive_dirty_blocks(const DirtyBlockInputs& inputs)
     }
 
     result.blocks = ordered(inputs.path, execution);
+    result.ids = std::set<std::string>(result.blocks.begin(),
+                                      result.blocks.end());
+    return result;
+}
+
+/*
+ * Compatibility forms. See stage_dirty_blocks.h for the contract.
+ */
+
+ParamSnapshot snapshotParams(const procparams::ProcParams& params,
+                             StagePath path)
+{
+    ParamSnapshot snapshot;
+    const BlockFingerprints fingerprints = stage_fingerprints(path, params);
+
+    for (size_t i = 0; i < fingerprints.ids.size(); ++i) {
+        snapshot.emplace(fingerprints.ids[i], fingerprints.values[i]);
+    }
+
+    return snapshot;
+}
+
+DirtyBlocks dirtyBlocksFromParams(const procparams::ProcParams& previous,
+                                  const procparams::ProcParams& current,
+                                  StagePath path)
+{
+    return dirtyBlocksFromSnapshot(snapshotParams(previous, path), current,
+                                   path);
+}
+
+DirtyBlocks dirtyBlocksFromSnapshot(const ParamSnapshot& previous,
+                                    const procparams::ProcParams& current,
+                                    StagePath path)
+{
+    const BlockFingerprints currentFingerprints =
+        stage_fingerprints(path, current);
+
+    if (currentFingerprints.empty()) {
+        /* No parameter table on this path: the whole path is the answer. */
+        DirtyBlocks result;
+        result.valid = false;
+        result.forced = true;
+        result.reason = "no parameter fingerprints on this path";
+        result.blocks = pathIds(path);
+        result.ids = std::set<std::string>(result.blocks.begin(),
+                                          result.blocks.end());
+        return result;
+    }
+
+    /*
+     * Rebuild the previous fingerprint vector in the current canonical order.
+     * A snapshot that does not carry every id is not usable history: passing
+     * no previous fingerprints makes the derivation a forced full recompute,
+     * which is the conservative reading of "the missing ids changed".
+     */
+    BlockFingerprints previousFingerprints;
+    previousFingerprints.ids = currentFingerprints.ids;
+    previousFingerprints.values.reserve(currentFingerprints.ids.size());
+    bool complete = true;
+    for (const std::string& id : currentFingerprints.ids) {
+        const auto stored = previous.find(id);
+        if (stored == previous.end()) {
+            complete = false;
+            break;
+        }
+        previousFingerprints.values.push_back(stored->second);
+    }
+
+    /*
+     * The state side is held equal at both ends and carries a delta request,
+     * so only the fingerprints contribute. A rebuild request belongs to
+     * DirtyBlockInputs::forceFull, not to a parameter delta.
+     */
+    RenderStateKey delta;
+    delta.requestKind = RequestKind::ParamsOnly;
+
+    DirtyBlockInputs inputs;
+    inputs.path = path;
+    inputs.previousFingerprints = complete ? &previousFingerprints : nullptr;
+    inputs.currentFingerprints = &currentFingerprints;
+    inputs.previousState = &delta;
+    inputs.currentState = &delta;
+
+    return derive_dirty_blocks(inputs);
+}
+
+DirtyBlocks dirtyBlocksFromRenderState(const RenderStateKey& previous,
+                                       const RenderStateKey& current,
+                                       StagePath path)
+{
+    DirtyBlocks result;
+
+    /*
+     * Export and thumbnail do not carry a render state. The caller asked for a
+     * derivation that cannot exist, so it gets the whole path and is told not
+     * to use it as one.
+     */
+    if (path == StagePath::Export || path == StagePath::Thumbnail) {
+        result.forced = true;
+        result.reason = "render state is not modelled on this path";
+        result.blocks = pathIds(path);
+        result.ids = std::set<std::string>(result.blocks.begin(),
+                                          result.blocks.end());
+        return result;
+    }
+
+    result.valid = true;
+
+    std::set<std::string> seeds;
+
+    /*
+     * The request fields are not table rows: the blocks depend on the kind the
+     * pass now asks for, not on the direction of the change, and a different
+     * preview base feeds the raw core rather than the request sink. They are
+     * therefore read here, and the request aspect is skipped in the loop.
+     *
+     * request_rebuilds_path() is the shared rule: an absolute request (the
+     * accurate high-quality chain, or a destructive raw reload) rebuilds the
+     * whole path, because the work it stands for may not appear in ProcParams
+     * or in the render state at all. A repaint schedules the display sink. A
+     * parameter-only request schedules nothing and the deltas decide.
+     */
+    if (request_rebuilds_path(current.requestKind)) {
+        for (const std::string& id : pathIds(path)) {
+            seeds.insert(id);
+        }
+    } else if (current.requestKind == RequestKind::RepaintOnly) {
+        for (const std::string& id : blocks_for_render_state(
+                 path, RenderStateAspect::Request)) {
+            seeds.insert(id);
+        }
+    }
+
+    /*
+     * A different preview base was the reduced pass's input. The parameter map
+     * cannot express it and the aspect table groups it with the request, so it
+     * is mapped to the raw core explicitly.
+     */
+    if (previous.previousDemoBase != current.previousDemoBase) {
+        for (const std::string& id : blocks_for_render_state(
+                 path, RenderStateAspect::HighDetail)) {
+            seeds.insert(id);
+        }
+    }
+
+    for (RenderStateAspect aspect : changed_render_state_aspects(previous,
+                                                                current)) {
+        if (aspect == RenderStateAspect::Request) {
+            continue;
+        }
+
+        for (const std::string& id : blocks_for_render_state(path, aspect)) {
+            seeds.insert(id);
+        }
+    }
+
+    result.fromState = ordered(path, seeds);
+
+    /*
+     * Expand a seeded coupled group, exactly as derive_dirty_blocks() does: the
+     * members share one Lab seed, so running a subset would leave the rest
+     * reading a stale buffer. On the preview path the Lab rows already name
+     * the whole chain; on the crop path the editor aspect seeds one member.
+     */
+    std::set<std::string> grouped;
+    for (const std::vector<std::string>& group : coupled_block_groups(path)) {
+        const bool seeded = std::any_of(
+            group.begin(), group.end(),
+            [&seeds](const std::string& id) {
+                return seeds.find(id) != seeds.end();
+            });
+        if (!seeded) {
+            continue;
+        }
+        for (const std::string& id : group) {
+            if (!onPath(path, id)) {
+                assert(false && "coupled group names a block outside the path");
+                continue;
+            }
+            if (seeds.insert(id).second) {
+                grouped.insert(id);
+            }
+        }
+    }
+    result.fromGroups = ordered(path, grouped);
+
+    /*
+     * Match derive_dirty_blocks(): the execution set is the seeds plus the
+     * caller's unconditional blocks plus the forward closure of the seeds.
+     * Residents do not seed the closure, because a resident alone does not
+     * regenerate its output.
+     */
+    std::set<std::string> execution = seeds;
+    for (const std::string& id : resident_blocks(path)) {
+        execution.insert(id);
+    }
+    for (const std::string& id : close_dirty_blocks(
+             path, BlockList(seeds.begin(), seeds.end()))) {
+        execution.insert(id);
+    }
+
+    result.blocks = ordered(path, execution);
+    result.ids = std::set<std::string>(result.blocks.begin(),
+                                      result.blocks.end());
+    return result;
+}
+
+DirtyBlocks allDirtyBlocks(StagePath path)
+{
+    DirtyBlocks result;
+    result.valid = true;
+    result.forced = true;
+    result.blocks = pathIds(path);
+    result.ids = std::set<std::string>(result.blocks.begin(),
+                                      result.blocks.end());
+    return result;
+}
+
+DirtyBlocks mergeDirtyBlocks(const DirtyBlocks& first,
+                             const DirtyBlocks& second)
+{
+    DirtyBlocks result;
+
+    result.ids = first.ids;
+    result.ids.insert(second.ids.begin(), second.ids.end());
+
+    /*
+     * The ordered form needs the path, which this signature does not carry.
+     * Keep a deterministic union in the callers' order; `ids` is the
+     * authoritative membership and the caller orders it where it needs to.
+     */
+    result.blocks = first.blocks;
+    for (const std::string& id : second.blocks) {
+        if (std::find(result.blocks.begin(), result.blocks.end(), id)
+                == result.blocks.end()) {
+            result.blocks.push_back(id);
+        }
+    }
+
+    result.valid = first.valid && second.valid;
+    if (!first.valid) {
+        result.reason = first.reason;
+    } else if (!second.valid) {
+        result.reason = second.reason;
+    } else if (!first.reason.empty()) {
+        result.reason = first.reason;
+    } else {
+        result.reason = second.reason;
+    }
+
+    return result;
+}
+
+DirtyBlocks closeOverGraph(const DirtyBlocks& blocks, StagePath path)
+{
+    DirtyBlocks result = blocks;
+
+    if (!blocks.valid) {
+        return result;
+    }
+
+    const BlockList closed = close_dirty_blocks(
+        path, BlockList(blocks.ids.begin(), blocks.ids.end()));
+    result.blocks = closed;
+    result.ids = std::set<std::string>(closed.begin(), closed.end());
     return result;
 }
 
