@@ -17,13 +17,13 @@ info() {
     printf '==> %s\n' "$*"
 }
 
-VERSION="$(git -C "$SRC" describe --tags --always --dirty 2>/dev/null || echo 5.13)"
+VERSION="${RT_PACKAGE_VERSION:-$(git -C "$SRC" describe --tags --always --dirty 2>/dev/null || echo 5.13)}"
 VERSION="${VERSION#v}"
-BASE_VERSION="$(git -C "$SRC" describe --tags --abbrev=0 2>/dev/null || true)"
+BASE_VERSION="${RT_PACKAGE_BASE_VERSION:-$(git -C "$SRC" describe --tags --abbrev=0 2>/dev/null || true)}"
 BASE_VERSION="${BASE_VERSION#v}"
 BASE_VERSION="${BASE_VERSION:-5.13}"
-COUNT="$(git -C "$SRC" rev-list --count HEAD 2>/dev/null || true)"
-HASH="$(git -C "$SRC" rev-parse --short HEAD 2>/dev/null || echo local)"
+COUNT="${RT_PACKAGE_COMMIT_COUNT:-$(git -C "$SRC" rev-list --count HEAD 2>/dev/null || true)}"
+HASH="${RT_PACKAGE_COMMIT_HASH:-$(git -C "$SRC" rev-parse --short HEAD 2>/dev/null || echo local)}"
 PKG_VERSION="${BASE_VERSION}+git${COUNT:-0}.${HASH}"
 if [ "${VERSION%-dirty}" != "$VERSION" ]; then
     PKG_VERSION="${PKG_VERSION}.dirty"

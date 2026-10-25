@@ -261,11 +261,26 @@ build_portable() {
     local output="$build_root/portable"
     mkdir -p "$output"
 
-    info "building Debian package"
+    # A worktree's .git file points outside the source mount, so derive the
+    # version on the host and pass it to the container.
+    local pkg_version base_version commit_count commit_hash
+    pkg_version="$(git -C "$root" describe --tags --always --dirty 2>/dev/null || echo 5.13)"
+    pkg_version="${pkg_version#v}"
+    base_version="$(git -C "$root" describe --tags --abbrev=0 2>/dev/null || true)"
+    base_version="${base_version#v}"
+    base_version="${base_version:-5.13}"
+    commit_count="$(git -C "$root" rev-list --count HEAD 2>/dev/null || echo 0)"
+    commit_hash="$(git -C "$root" rev-parse --short HEAD 2>/dev/null || echo local)"
+
+    info "building Debian package $pkg_version"
     docker run --rm \
         --platform linux/amd64 \
         --user "$(id -u):$(id -g)" \
         -e HOME=/tmp \
+        -e RT_PACKAGE_VERSION="$pkg_version" \
+        -e RT_PACKAGE_BASE_VERSION="$base_version" \
+        -e RT_PACKAGE_COMMIT_COUNT="$commit_count" \
+        -e RT_PACKAGE_COMMIT_HASH="$commit_hash" \
         -v "$root:/src:ro" \
         -v "$output:/out" \
         "$tag" \
