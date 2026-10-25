@@ -123,6 +123,7 @@ set(RTENGINESOURCEFILES
     stage/stage_graph.cc
     stage/stage_indexer.cc
     stage/stage_lanczos.cc
+    stage/stage_mask_map.cc
     stage/stage_param_hash.cc
     stage/stage_param_map.cc
     stage/stage_parity.cc
@@ -335,6 +336,20 @@ add_executable(stage-pipeline-test EXCLUDE_FROM_ALL
 )
 target_include_directories(stage-pipeline-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/stage")
 rt_setup_target(stage-pipeline-test)
+
+# The mask map is data only as well. Compile it with the pipeline
+# specification so the test does not link the engine, and add the rtengine
+# include directory for refreshmap.h.
+add_executable(stage-mask-map-test EXCLUDE_FROM_ALL
+    "${CMAKE_CURRENT_SOURCE_DIR}/stage/tests/stage_mask_map_test.cc"
+    "${CMAKE_CURRENT_SOURCE_DIR}/stage/stage_mask_map.cc"
+    "${CMAKE_CURRENT_SOURCE_DIR}/stage/stage_pipeline.cc"
+)
+target_include_directories(stage-mask-map-test PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/stage"
+    "${CMAKE_CURRENT_SOURCE_DIR}"
+)
+rt_setup_target(stage-mask-map-test)
 
 add_executable(stage-store-test EXCLUDE_FROM_ALL
     "${CMAKE_CURRENT_SOURCE_DIR}/stage/tests/stage_store_test.cc"
