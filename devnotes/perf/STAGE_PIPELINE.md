@@ -215,6 +215,149 @@ sub-struct than listed is not mis-specified, but a name that is not a
 `ProcParams` member is a defect. The test enforces that with a whitelist built
 from `procparams.h`.
 
+## Parameter map and fingerprints
+
+`rtengine/stage/stage_param_map.h/.cc` turns the export inventory into stable
+parameter fingerprints. Each export descriptor gets one `ParamFingerprint`
+built from a `ParamHasher` whose section label is the descriptor id, followed by
+the `ProcParams` members that block reads. The mapping is conservative: whole
+sub-structs are hashed, field by field, so a field the block ignores still
+changes the fingerprint. A spurious cache miss is cheaper than a stale cache
+entry.
+
+API:
+
+```cpp
+bool has_export_fingerprint(const std::string& id);
+ParamFingerprint export_fingerprint(const std::string& id,
+                                    const procparams::ProcParams& params);
+const std::vector<ExportParamMapEntry>& exportParamMap();
+```
+
+`exportParamMap()` is the review surface: descriptor id, consumed member names
+and pipeline order. `has_export_fingerprint()` accepts only the twenty export
+ids; preview, crop, thumbnail, monitor and viewport ids are rejected.
+
+| Descriptor | `ProcParams` members |
+|------------|----------------------|
+| `source.select` | raw |
+| `raw.preprocess` | raw, lensProf, coarse, dirpyrDenoise |
+| `raw.demosaic` | raw, pdsharpening |
+| `raw.base` | raw, wb, toneCurve, spot, dirpyrDenoise, filmNegative, retinex, dehaze, fattal, cg, icm |
+| `analysis` | icm, toneCurve |
+| `transform` | coarse, commonTrans, rotate, distortion, perspective, cacorrection, vignetting, gradient, pcvignette, lensProf, crop |
+| `local.adjustments` | locallab, icm, toneCurve, raw, wb, dirpyrequalizer, dehaze, epd, rgbCurves, hsvequalizer, chmixer, colorToning |
+| `rgb.proc` | toneCurve, rgbCurves, colorToning, blackwhite, chmixer, hsvequalizer, filmSimulation, icm |
+| `lab.tools` | sh, labCurve, localContrast, vibrance, epd, softlight, icm, toneCurve |
+| `lab.sharpening` | sharpening, sharpenEdge, sharpenMicro, impulseDenoise, defringe, icm |
+| `lab.wavelet` | wavelet, dirpyrequalizer, icm, toneCurve |
+| `working.trc` | toneEqualizer, icm, wavelet |
+| `ciecam` | colorappearance, icm, toneCurve, raw, epd |
+| `gamut` | cg, icm |
+| `output.convert` | icm |
+| `crop` | crop |
+| `resize` | resize, crop, framing |
+| `output.sharpen` | prsharpening |
+| `framing` | framing, crop, resize |
+| `output.icc` | icm, metadata |
+
+### Refinements over the inventory
+
+The inventory list above is a lower bound. These members were added from the
+export entry point and the tool implementations:
+
+- `icm` is a member of every stage that converts between working spaces or
+  reads the working profile: `raw.base` (`convertColorSpace()` and Retinex),
+  `analysis` (`firstAnalysis()` luminance weights), `local.adjustments`,
+  `rgb.proc` (working-space matrix and DCP), `lab.tools` (vibrance),
+  `lab.sharpening`, `lab.wavelet`, `working.trc`, `ciecam`, `gamut`,
+  `output.convert` and `output.icc`.
+- `transform` also hashes `crop`: post-crop vignetting needs the crop
+  rectangle (`iptransform.cc:1030`, `:1103`).
+- `local.adjustments` hashes the global members its spots borrow: working
+  profile, CIE adaptation from `toneCurve` and `raw.expos`, the WB observer,
+  `dirpyrequalizer`/`dehaze`/`epd` enable flags, and the RGB tool enables
+  that decide negative-value handling (`iplocallab.cc:2648`, `:2788-2789`,
+  `:3510`, `:15684-15687`, `:16688`, `:23816-23826`).
+- `lab.tools` adds `icm` and `toneCurve` because `vibrance()` takes the
+  working profile and `toneCurve.hrenabled` (`simpleprocess.cc:1750`).
+- `lab.sharpening` adds `icm`; `ipsharpen.cc` reads the working profile.
+- `lab.wavelet` adds `icm` and `toneCurve` (`ipwavelet.cc:223`, `:2017`).
+- `working.trc` adds `wavelet`: the TRC completion path copies `WaveParams`
+  for `complete_local_contrast()` (`simpleprocess.cc:1956-1960`).
+- `ciecam` adds `toneCurve` and `raw` for adapting luminance
+  (`simpleprocess.cc:2113-2114`), and `epd` for `EPDToneMapCIE()`
+  (`improcfun.cc:1869`, `:5312-5328`).
+- `resize` hashes `crop` and `framing`: `resizeScale()` reads the crop
+  dimensions when resize applies to the cropped area, and the finishing path
+  derives the scale from the framing data (`ipresize.cc:1034-1077`,
+  `simpleprocess.cc:2223-2253`).
+- `framing` hashes `crop` and `resize` because the framed size is derived from
+  both (`simpleprocess.cc:2223-2357`).
+- `crop` drops `cropGuide`: guides are an editor overlay and no export path
+  reads them.
+
+### Fields that are uncertain
+
+These are recorded rather than hidden:
+
+- `epd` is listed for `lab.tools` because the inventory says so and
+  `EPDToneMap()` runs in that section (`simpleprocess.cc:1746`). It is also
+  listed for `ciecam`, where `EPDToneMapCIE()` runs when CIE tone mapping is
+  enabled. Both are conservative.
+- `toneCurve` is listed for `analysis` although `firstAnalysis()` itself reads
+  only `icm.workingProfile`. The inventory ties the analysis histogram to the
+  auto-exposure parameters, so the whole member stays in the fingerprint.
+- `dirpyrDenoise` is listed for `raw.preprocess` although only its `enabled`
+  flag is passed to `preprocess()`. The whole member is hashed.
+- `metadata` in `output.icc` changes the file metadata, not pixels. It is a
+  real input of the sink and is kept.
+- `resize`/`framing` and `crop` overlap deliberately: the finishing geometry
+  reads all three members. A change to any of them moves more than one
+  fingerprint. The mutation test records those cases as non-exclusive.
+
+### Fingerprint format
+
+The section label is added by `export_fingerprint()` from the table id, so a
+hasher body cannot forget it or use a different string. Field order is the
+order in the table and in the generated sub-struct hashers. The sub-struct
+hashers cover every data member of the types they name; a member added to
+`ProcParams` or to one of its sub-structs must be added to
+`stage_param_map.cc` at the same time, otherwise fingerprints would silently
+ignore it. The mutation test proves the current lists, not future additions.
+
+### Verification
+
+```bash
+tools/build-rt.sh cpu -j 6 --ccache --stage-modules
+cmake --build build/cpu-phaseB-param-map --target stage-param-map-test -j 6
+build/cpu-phaseB-param-map/rtengine/stage-param-map-test
+```
+
+Result:
+
+```text
+stage-param-map-test: PASS
+```
+
+The OpenCL configuration compiles (`tools/build-rt.sh opencl -j 6 --ccache`)
+and the same target builds and passes in `build/opencl-phaseB-param-map`. The
+test checks:
+
+1. every canonical export descriptor has a fingerprint, and non-export ids
+   (preview, crop, thumbnail, monitor, viewport, unknown) do not;
+2. repeated calls and an equal `ProcParams` copy give identical fingerprints;
+3. the table has twenty unique ids in pipeline order, all inside the export
+   spec, and every field name is a `ProcParams` member;
+4. a mutation table covering WB, demosaic, transform, local adjustments,
+   RGB/tone curve, wavelet, CIE CAM, gamut, output profile, crop, resize,
+   framing and the remaining descriptors changes the named descriptor;
+5. an exclusive field changes no other descriptor, and a non-exclusive field
+   is only required to change its own;
+6. members outside a descriptor's list do not change it.
+
+The sub-struct hashers read 55 `ProcParams` types and 1567 data members.
+
 ## Reuse and consumer semantics
 
 - `recompute`: must run for every request (sources and final sinks).
