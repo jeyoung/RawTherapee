@@ -128,6 +128,7 @@ set(RTENGINESOURCEFILES
     stage/stage_parity.cc
     stage/stage_pipeline.cc
     stage/stage_profile.cc
+    stage/stage_render_state.cc
     stage/stage_runtime.cc
     stage/stage_store.cc
     svgrender.cc
@@ -281,6 +282,14 @@ add_executable(stage-param-hash-test EXCLUDE_FROM_ALL
 target_link_libraries(stage-param-hash-test PRIVATE rtengine)
 target_include_directories(stage-param-hash-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/stage")
 rt_setup_target(stage-param-hash-test)
+
+# Explicit render state that is not represented in ProcParams.
+add_executable(stage-render-state-test EXCLUDE_FROM_ALL
+    "${CMAKE_CURRENT_SOURCE_DIR}/stage/tests/stage_render_state_test.cc"
+)
+target_link_libraries(stage-render-state-test PRIVATE rtengine)
+target_include_directories(stage-render-state-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/stage")
+rt_setup_target(stage-render-state-test)
 
 # Export descriptor to ProcParams member mapping, proved by mutation.
 add_executable(stage-param-map-test EXCLUDE_FROM_ALL

@@ -458,7 +458,7 @@ const std::vector<StageParamMapEntry>& cropParamMap();
 The monitor profile, monitor intent and the soft-proof and gamut-check
 switches are application or GUI state, not `ProcParams`, so they cannot enter
 these fingerprints. The crop ROI rectangle is a request input for the same
-reason. Both belong to the separate `RenderStateKey` task. The crop table
+reason. Both are carried by `RenderStateKey` (see below). The crop table
 still hashes the crop rectangle through `transform`, because post-crop
 vignetting reads it.
 
@@ -467,6 +467,37 @@ The test checks every descriptor and table order against
 the parameter families of both paths, and a regression guard that pins the
 twenty neutral-parameter export fingerprints. It runs as
 `stage-param-map-test` in `build/cpu-phaseF-preview-map`.
+
+### Render state key
+
+`rtengine/stage/stage_render_state.h` defines `RenderStateKey`, the explicit
+render state that the parameter tables cannot represent. It is a plain value
+type with no pointers and no `ImageSource`: preview scale, preview and full
+dimensions, the crop/ROI rectangle with its skip and processing border, the
+high-detail decision and what has already been computed for it,
+`sourceGeneration`, `rgbSourceModified`, the monitor profile name and intent,
+soft proof, gamut check, `sharpMask`, the fast-preview switches, whether the
+pass is the initial rough preview, the request kind and the previous-demo
+base.
+
+`RequestKind` has five values (`ParamsOnly`, `RepaintOnly`, `FullCrop`,
+`FullPreview`, `HighQuality`). `previousDemoBase` is stored as an `int32_t`
+that mirrors `PreviousDemoBase` (`Unknown`, `Fast`, `Sidecar`). Both value
+sets are part of the persisted format and must not be renumbered.
+
+`RenderStateKey::fingerprint()` hashes every field, in declaration order, into
+a `ParamHasher` stream labelled `render-state`. It uses only the typed
+overloads, so struct padding, host byte order and pointer values cannot affect
+the result. The fingerprint is utility code only: no pipeline, cache or
+invalidation site consumes it yet, and the existing bitset remains the
+production input.
+
+`stage-render-state-test` proves identical states agree, every field changes
+the fingerprint when changed alone, every request kind is distinct,
+`sourceGeneration` is significant, equal strings at different addresses agree,
+and the fingerprint equals a field-by-field canonical stream. It also pins the
+published fingerprint `7d18d6df20ff6afdb471515b8cdae2b8` for the populated
+sample key; update it only with a deliberate format change.
 
 ## Reuse and consumer semantics
 
