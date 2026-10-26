@@ -17,6 +17,8 @@
 
 #include "stage_render_state.h"
 
+#include "procparams.h"
+
 namespace rtengine::stage
 {
 
@@ -81,7 +83,55 @@ ParamFingerprint RenderStateKey::fingerprint() const
     hasher.add(spotPending);
     hasher.add(spotBufferLive);
 
+    hasher.add(deferredAnalysisMask);
+    hasher.add(cropGuideFingerprint);
+    hasher.add(viewportMoved);
+
     return hasher.finish();
+}
+
+/*
+ * The guide state is hashed field by field with typed overloads. A vector's
+ * length is added as an explicit uint64_t so that a truncated or extended
+ * vector cannot alias one of the same fields with a moved element.
+ */
+uint64_t cropGuideFingerprint(const procparams::CropGuideParams& guide)
+{
+    ParamHasher hasher;
+    hasher.addSectionLabel("crop-guide");
+
+    hasher.add(guide.enabled);
+    hasher.add(guide.mirror_golden_triangle);
+    hasher.add(guide.rotate_golden_ratio);
+    hasher.add(guide.mirror_golden_ratio);
+    hasher.add(static_cast<int32_t>(guide.bleed));
+    hasher.add(static_cast<int32_t>(guide.basis));
+
+    hasher.add(static_cast<uint64_t>(guide.presets.size()));
+
+    for (const procparams::CropGuideParams::PresetParams& preset :
+         guide.presets) {
+        hasher.add(preset.enabled);
+        hasher.add(preset.red);
+        hasher.add(preset.green);
+        hasher.add(preset.blue);
+        hasher.add(preset.alpha);
+    }
+
+    hasher.add(static_cast<uint64_t>(guide.aspect_ratios.size()));
+
+    for (const procparams::CropGuideParams::AspectRatioParams& ratio :
+         guide.aspect_ratios) {
+        hasher.add(ratio.enabled);
+        hasher.add(ratio.is_portrait);
+        hasher.add(static_cast<uint64_t>(ratio.preset_index));
+        hasher.add(ratio.red);
+        hasher.add(ratio.green);
+        hasher.add(ratio.blue);
+        hasher.add(ratio.alpha);
+    }
+
+    return hasher.finish().hash();
 }
 
 } // namespace rtengine::stage

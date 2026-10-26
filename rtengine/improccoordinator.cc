@@ -4099,6 +4099,29 @@ stage::RenderStateKey ImProcCoordinator::previewRenderState(
         && !params->spot.entries.empty();
     key.spotBufferLive = spotprev != nullptr;
 
+    /*
+     * The deferred analysis the coordinator had queued at this point, read
+     * without the coordinator mutex. The mask is data only in this revision,
+     * and the full-frame path has already absorbed any pending burst into the
+     * request mask, so it is normally zero here.
+     */
+    key.deferredAnalysisMask = deferredAnalysisMask();
+
+    /*
+     * The crop-guide fingerprint is formed by the crop request, which reads
+     * CropGuideParams; a full-frame preview does not carry it.
+     */
+    key.cropGuideFingerprint = 0;
+
+    /*
+     * The preview's viewport-moved fact. `panningRelatedChange` is the
+     * heuristic process() derives from the parameter delta; it has no mask bit
+     * and can force the full pipeline. It records that the viewport moved and
+     * buffers may be reused, not that a repaint must happen now. What the pass
+     * does with it is unchanged in this revision.
+     */
+    key.viewportMoved = pass.panningRelatedChange;
+
     return key;
 }
 

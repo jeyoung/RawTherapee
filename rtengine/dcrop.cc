@@ -567,6 +567,13 @@ void Crop::update(int todo)
     ProcParams& params = *parent->params;
 //       CropGUIListener* cropgl;
 
+    /*
+     * The incoming mask names a repaint-only viewport move. Read it before the
+     * ALL augmentation below replaces the request mask; the fact describes the
+     * request, not the work the augmentation adds.
+     */
+    const bool viewportMovedRequest = (todo & M_MINUPDATE) != 0;
+
     // No need to update todo here, since it has already been changed in ImprocCoordinator::updatePreviewImage,
     // and Crop::update ask to do ALL anyway
 
@@ -622,7 +629,8 @@ void Crop::update(int todo)
      * pass, because the stage bodies can update the source generation and the
      * high-detail flags while they run.
      */
-    const auto cropRenderState = [this, &todo, &params]() {
+    const auto cropRenderState = [this, &todo, &params,
+                                  viewportMovedRequest]() {
         rtengine::stage::RenderStateKey state;
         state.previewScale = skip;
         state.previewWidth = cropw;
@@ -701,6 +709,32 @@ void Crop::update(int todo)
         state.spotPending = (todo & M_SPOT) != 0 && params.spot.enabled
             && !params.spot.entries.empty();
         state.spotBufferLive = spotCrop != nullptr;
+
+        /*
+         * The crop has no deferred analysis of its own, so this stays at the
+         * default. The mask is coordinator request state, which the preview
+         * key carries.
+         */
+        state.deferredAnalysisMask = 0;
+
+        /*
+         * Crop guides are an overlay that no stage consumes, so cropGuide is
+         * deliberately absent from the parameter fingerprint. It is carried
+         * here as a pure state value instead. The previous key kept in
+         * CropDirtyState retains the guide value of the last completed pass,
+         * so a later phase can tell a guide-only change from a geometry
+         * change; nothing reads the value for invalidation in this revision.
+         */
+        state.cropGuideFingerprint =
+            rtengine::stage::cropGuideFingerprint(params.cropGuide);
+
+        /*
+         * The crop's viewport-moved fact. M_MINUPDATE is an imperative
+         * "refresh without changing the image" request, so the existing buffers
+         * may be reused. What the pass does with it is unchanged, and the
+         * imperative itself is not modelled by this field.
+         */
+        state.viewportMoved = viewportMovedRequest;
         return state;
     };
 
@@ -710,7 +744,9 @@ void Crop::update(int todo)
      * is kept as the next update's history instead of a ProcParams copy; it is
      * stored again after the pass, because several stage bodies write corrected
      * values back into the parameters (auto white balance, automatic denoise)
-     * and those corrections are not new inputs on the next update.
+     * and those corrections are not new inputs on the next update. The stored
+     * render state is also what retains the last completed pass's crop-guide
+     * fingerprint, which the parameter fingerprints cannot express.
      */
     const rtengine::stage::BlockFingerprints current =
         rtengine::stage::stage_fingerprints(

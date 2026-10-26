@@ -23,6 +23,11 @@
 #include <string>
 #include <tuple>
 
+namespace rtengine::procparams
+{
+struct CropGuideParams;
+}
+
 namespace rtengine::stage
 {
 
@@ -68,8 +73,10 @@ enum class PreviousDemoBase : int32_t {
  * switches and the request kind. This struct carries all of them so a stage
  * cache key or an invalidation decision can be derived without the bitset.
  * The request-facts section at the end adds the source geometry and sensor
- * facts plus the denoise and spot facts, which the work flags will need and
- * which live in the coordinator or the crop rather than in ProcParams.
+ * facts, the denoise and spot facts, the deferred analysis the coordinator had
+ * queued, the crop-guide state and the shared viewport-moved flag, which the
+ * work flags will need and which live in the coordinator or the crop rather
+ * than in ProcParams.
  *
  * All fields are plain values or an owning string: there are no pointers, no
  * ImageSource, and no coordinator state. The struct is therefore safe to copy,
@@ -157,11 +164,23 @@ struct RenderStateKey {
      * parameters still name spots; `spotBufferLive` is true when a spot buffer
      * exists, because restoring it changes the next base pass.
      *
-     * Panning and repaint are an explicit gap, not a modelled fact. The
-     * preview knows only a `panningRelatedChange` heuristic, which can force a
-     * full pipeline and can accompany a FullPreview request, while the crop
-     * knows only the `M_MINUPDATE` mask bit; those do not describe the same
-     * fact, so no repaint field is carried until one shared definition exists.
+     * `deferredAnalysisMask` is the full-frame analysis mask the coordinator
+     * had queued for its deferred viewport pass when the key was built; zero
+     * means nothing was queued. The coordinator publishes it from an atomic
+     * member without the coordinator mutex, so it is an advisory snapshot that
+     * can change immediately after it is read; that mutex also guards the
+     * viewport fast-path state, and reading this fact never requires it.
+     * `cropGuideFingerprint` is a 64-bit fingerprint of CropGuideParams.
+     * Guides are an editor overlay and no stage consumes them, so they stay
+     * out of the parameter fingerprint; the value is carried here so a later
+     * phase can distinguish a guide-only change from a geometry change.
+     * `viewportMoved` is the one shared panning/repaint fact: true when the
+     * viewport moved and the existing buffers may be reused, not when a repaint
+     * must happen now. The preview reports the `panningRelatedChange`
+     * heuristic, a ProcParams diff that has no mask bit, and the crop reports
+     * the `M_MINUPDATE` mask bit, which is an imperative repaint request; both
+     * are reported under this one name and the repaint imperative itself stays
+     * out of scope.
      *
      * Every field defaults to the value an unpopulated key had before the
      * field existed, so an old and a new key differ only through these fields.
@@ -175,6 +194,9 @@ struct RenderStateKey {
     bool denoiseAnalysisValid = false;
     bool spotPending = false;
     bool spotBufferLive = false;
+    int32_t deferredAnalysisMask = 0;
+    uint64_t cropGuideFingerprint = 0;
+    bool viewportMoved = false;
 
     bool operator==(const RenderStateKey& other) const
     {
@@ -236,7 +258,10 @@ private:
         dirPyrDenoiseExpComp,
         denoiseAnalysisValid,
         spotPending,
-        spotBufferLive))
+        spotBufferLive,
+        deferredAnalysisMask,
+        cropGuideFingerprint,
+        viewportMoved))
     {
         return std::tie(
             previewScale,
@@ -276,8 +301,23 @@ private:
             dirPyrDenoiseExpComp,
             denoiseAnalysisValid,
             spotPending,
-            spotBufferLive);
+            spotBufferLive,
+            deferredAnalysisMask,
+            cropGuideFingerprint,
+            viewportMoved);
     }
 };
+
+/*
+ * Stable 64-bit fingerprint of the crop-guide overlay state.
+ *
+ * CropGuideParams has no ProcParams fingerprint: guides are an editor overlay
+ * that no stage consumes. This function hashes the state with ParamHasher's
+ * typed overloads under its own section label, so the result is portable and
+ * independent of struct padding and of the process that computes it. It is
+ * used for the RenderStateKey::cropGuideFingerprint field; the 64-bit width is
+ * a compact change detector, not a collision-resistant identifier.
+ */
+uint64_t cropGuideFingerprint(const procparams::CropGuideParams& guide);
 
 } // namespace rtengine::stage

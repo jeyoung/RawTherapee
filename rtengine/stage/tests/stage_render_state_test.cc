@@ -106,6 +106,9 @@ RenderStateKey sample()
     key.denoiseAnalysisValid = true;
     key.spotPending = true;
     key.spotBufferLive = true;
+    key.deferredAnalysisMask = 0x00084000;
+    key.cropGuideFingerprint = UINT64_C(0x0123456789abcdef);
+    key.viewportMoved = true;
     return key;
 }
 
@@ -167,6 +170,10 @@ ParamFingerprint canonicalFingerprint(const RenderStateKey& key)
     hasher.add(key.denoiseAnalysisValid);
     hasher.add(key.spotPending);
     hasher.add(key.spotBufferLive);
+
+    hasher.add(key.deferredAnalysisMask);
+    hasher.add(key.cropGuideFingerprint);
+    hasher.add(key.viewportMoved);
 
     return hasher.finish();
 }
@@ -238,7 +245,10 @@ static_assert(noPointers<
                   decltype(RenderStateKey::dirPyrDenoiseExpComp),
                   decltype(RenderStateKey::denoiseAnalysisValid),
                   decltype(RenderStateKey::spotPending),
-                  decltype(RenderStateKey::spotBufferLive)>(),
+                  decltype(RenderStateKey::spotBufferLive),
+                  decltype(RenderStateKey::deferredAnalysisMask),
+                  decltype(RenderStateKey::cropGuideFingerprint),
+                  decltype(RenderStateKey::viewportMoved)>(),
               "RenderStateKey must not contain pointers");
 
 } // namespace
@@ -266,7 +276,7 @@ int main()
      */
     {
         const ParamFingerprint golden = sample().fingerprint();
-        const std::string expected = "8c627c1fcf85b119ab0fd826c54a2d55";
+        const std::string expected = "7ad04e9ccb3fb3abd888a235cc2f2b25";
         if (golden.hexString() != expected) {
             std::fprintf(stderr, "golden fingerprint is %s\n",
                          golden.hexString().c_str());
@@ -362,6 +372,12 @@ int main()
                  [](RenderStateKey& key) { key.spotPending = false; });
     expectChange("spotBufferLive",
                  [](RenderStateKey& key) { key.spotBufferLive = false; });
+    expectChange("deferredAnalysisMask",
+                 [](RenderStateKey& key) { key.deferredAnalysisMask = 0; });
+    expectChange("cropGuideFingerprint",
+                 [](RenderStateKey& key) { key.cropGuideFingerprint = 0; });
+    expectChange("viewportMoved",
+                 [](RenderStateKey& key) { key.viewportMoved = false; });
 
     /* Criterion: sourceGeneration is significant at both ends. */
     {

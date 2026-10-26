@@ -363,6 +363,26 @@ protected:
      */
     stage::RenderStateKey previewRenderState(const PreviewPassState& pass) const;
     stage::DirtyBlocks previewDirtyBlocks(const PreviewPassState& pass) const;
+
+    /*
+     * Deferred analysis mask queued for the viewport fast path.
+     *
+     * Lock-free and safe to call on the render path: it does not take
+     * paramsUpdateMutex, so building a RenderStateKey never blocks a request
+     * update. That mutex also guards the viewport fast-path state, so this
+     * accessor must read nothing but the atomic below. Every mutation of the
+     * mask still happens under the mutex, so the burst bookkeeping stays
+     * coherent. The load is relaxed because the mask carries no other data: the
+     * returned value is an advisory snapshot that a concurrent fast-path hit
+     * may change immediately after it is read, and nothing may treat it as a
+     * claim about a later pass.
+     */
+    int32_t deferredAnalysisMask() const
+    {
+        return static_cast<int32_t>(
+            pendingDeferredMask.load(std::memory_order_relaxed));
+    }
+
     void recordPreviewDirtyState(const PreviewPassState& pass);
     void invalidatePreviewDirtyState();
 
@@ -394,7 +414,11 @@ protected:
     // analysis stages it skipped. The mask is run once the interaction settles,
     // so a drag costs one analysis pass instead of one per update. The fields
     // below are guarded by paramsUpdateMutex unless they are atomic.
-    int pendingDeferredMask;
+    //
+    // The mask itself is atomic so the render path can read it without taking
+    // paramsUpdateMutex (see deferredAnalysisMask()); every mutation still
+    // happens under that mutex, so there is still one source of truth.
+    std::atomic<int> pendingDeferredMask;
     int pendingDeferredHits;
     gint64 pendingDeferredFirstUs;
     gint64 pendingDeferredDeadlineUs;
