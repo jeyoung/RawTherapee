@@ -76,17 +76,28 @@ namespace rtengine::stage
 enum class RenderStateAspect : int32_t {
     /* Preview scale and dimensions, crop or ROI rectangle, skip and borders. */
     Geometry = 0,
-    /* Source generation and a modified RGB source. */
+    /*
+     * Source identity: generation, a modified RGB source, rotation, sensor
+     * type, unrotated full size and frame count. The source facts move with
+     * the generation, so they cannot widen a dirty set beyond a reload.
+     */
     Source = 1,
     /* The high-detail decision and the work already done for it. */
     HighDetail = 2,
+    /*
+     * Derived analysis inputs: the source exposure compensation the denoise
+     * analysis consumes, the validity of that analysis and the live spot
+     * buffer. They dirty the analysis and the base that consumes it without
+     * naming a new source.
+     */
+    Derived = 3,
     /* Monitor profile, intent, soft proof and gamut check. */
-    Display = 3,
+    Display = 4,
     /* Editor-only switches: sharpening mask and the fast-preview family. */
-    Editor = 4,
+    Editor = 5,
     /* Request kind and the base the previous pass used. */
-    Request = 5,
-    Count = 6
+    Request = 6,
+    Count = 7
 };
 
 /* Stable lower-case name for diagnostics. */

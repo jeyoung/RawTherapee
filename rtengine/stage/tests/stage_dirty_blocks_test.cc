@@ -153,6 +153,24 @@ RenderStateKey changedKey()
     key.initialRoughPreview = true;
     key.requestKind = RequestKind::FullPreview;
     key.previousDemoBase = 2;
+    /*
+     * The request facts. Every field is set to a value the default key does
+     * not have, including the four that are deliberately unmapped: the
+     * "reports every aspect" test then proves that the unmapped facts add no
+     * group, rather than passing because they were left at their defaults.
+     */
+    key.sourceRotateDegree = 90;
+    key.sourceSensorType = 2;
+    key.sourceFullWidth = 6048;
+    key.sourceFullHeight = 4024;
+    key.sourceFrameCount = 3;
+    key.dirPyrDenoiseExpComp = 0.5;
+    key.denoiseAnalysisValid = true;
+    key.spotPending = true;
+    key.spotBufferLive = true;
+    key.deferredAnalysisMask = 0x00084000;
+    key.cropGuideFingerprint = UINT64_C(0x0123456789abcdef);
+    key.viewportMoved = true;
     return key;
 }
 
@@ -177,6 +195,8 @@ const std::vector<AspectMutation>& aspectMutations()
          [](RenderStateKey& key) { key.sourceGeneration += 1; }},
         {RenderStateAspect::HighDetail,
          [](RenderStateKey& key) { key.highDetailNeeded = true; }},
+        {RenderStateAspect::Derived,
+         [](RenderStateKey& key) { key.denoiseAnalysisValid = true; }},
         {RenderStateAspect::Display,
          [](RenderStateKey& key) { key.monitorProfile = "Adobe RGB"; }},
         {RenderStateAspect::Editor,
@@ -516,6 +536,98 @@ void testAspects()
     }
 }
 
+/*
+ * The request facts and the aspects they join.
+ *
+ * The five source facts move with the source, so each must report Source and
+ * nothing else; a wider group would dirty blocks a reload does not touch. The
+ * three derived facts report the Derived analysis aspect. The four explicitly
+ * unmapped facts report no aspect at all, which is the documented decision:
+ * they are covered elsewhere or are advisory only.
+ */
+void testRequestFacts()
+{
+    struct Fact {
+        const char* name;
+        void (*mutate)(RenderStateKey&);
+    };
+
+    const std::vector<Fact> sourceFacts = {
+        {"sourceRotateDegree",
+         [](RenderStateKey& key) { key.sourceRotateDegree = 90; }},
+        {"sourceSensorType",
+         [](RenderStateKey& key) { key.sourceSensorType = 2; }},
+        {"sourceFullWidth",
+         [](RenderStateKey& key) { key.sourceFullWidth = 6048; }},
+        {"sourceFullHeight",
+         [](RenderStateKey& key) { key.sourceFullHeight = 4024; }},
+        {"sourceFrameCount",
+         [](RenderStateKey& key) { key.sourceFrameCount = 3; }}
+    };
+
+    for (const Fact& fact : sourceFacts) {
+        RenderStateKey changed;
+        fact.mutate(changed);
+        const std::vector<RenderStateAspect> aspects =
+            changed_render_state_aspects(RenderStateKey(), changed);
+        check(aspects.size() == 1 && aspects[0] == RenderStateAspect::Source,
+              std::string("source fact ") + fact.name
+                  + ": reports the Source aspect only");
+    }
+
+    const std::vector<Fact> derivedFacts = {
+        {"dirPyrDenoiseExpComp",
+         [](RenderStateKey& key) { key.dirPyrDenoiseExpComp = 0.5; }},
+        {"denoiseAnalysisValid",
+         [](RenderStateKey& key) { key.denoiseAnalysisValid = true; }},
+        {"spotBufferLive",
+         [](RenderStateKey& key) { key.spotBufferLive = true; }}
+    };
+
+    for (const Fact& fact : derivedFacts) {
+        RenderStateKey changed;
+        fact.mutate(changed);
+        const std::vector<RenderStateAspect> aspects =
+            changed_render_state_aspects(RenderStateKey(), changed);
+        check(aspects.size() == 1 && aspects[0] == RenderStateAspect::Derived,
+              std::string("derived fact ") + fact.name
+                  + ": reports the Derived aspect only");
+    }
+
+    const std::vector<Fact> unmappedFacts = {
+        {"spotPending",
+         [](RenderStateKey& key) { key.spotPending = true; }},
+        {"deferredAnalysisMask",
+         [](RenderStateKey& key) { key.deferredAnalysisMask = 0x00084000; }},
+        {"cropGuideFingerprint",
+         [](RenderStateKey& key) {
+             key.cropGuideFingerprint = UINT64_C(0x0123456789abcdef);
+         }},
+        {"viewportMoved",
+         [](RenderStateKey& key) { key.viewportMoved = true; }}
+    };
+
+    for (const Fact& fact : unmappedFacts) {
+        RenderStateKey changed;
+        fact.mutate(changed);
+        check(changed_render_state_aspects(RenderStateKey(), changed).empty(),
+              std::string("unmapped fact ") + fact.name
+                  + ": deliberately reports no aspect");
+    }
+
+    /*
+     * The Derived row is the analysis and the base, in canonical order. Both
+     * paths carry the same row: the base is listed even though it precedes the
+     * analysis in the pipeline, because the closure never walks backwards.
+     */
+    for (StagePath path : {StagePath::Crop, StagePath::Preview}) {
+        check(blocks_for_render_state(path, RenderStateAspect::Derived)
+                  == setOf({"raw.base", "analysis"}),
+              std::string(stagePathName(path))
+                  + " derived: the row is the base and the analysis");
+    }
+}
+
 void testAspectBlocks()
 {
     struct Expected {
@@ -535,6 +647,10 @@ void testAspectBlocks()
         {StagePath::Crop, RenderStateAspect::HighDetail,
          setOf({"raw.preprocess", "raw.demosaic", "raw.base", "analysis",
                 "transform"})},
+        /* Derived: the analysis and the base it feeds, on both paths. raw.base
+           is explicit because the closure from analysis never pulls it. */
+        {StagePath::Crop, RenderStateAspect::Derived,
+         setOf({"raw.base", "analysis"})},
         {StagePath::Crop, RenderStateAspect::Display,
          setOf({"viewport.output"})},
         {StagePath::Crop, RenderStateAspect::Editor,
@@ -548,6 +664,8 @@ void testAspectBlocks()
         {StagePath::Preview, RenderStateAspect::HighDetail,
          setOf({"source.select", "raw.preprocess", "raw.demosaic", "raw.base",
                 "analysis", "transform"})},
+        {StagePath::Preview, RenderStateAspect::Derived,
+         setOf({"raw.base", "analysis"})},
         {StagePath::Preview, RenderStateAspect::Source,
          setOf({"source.select", "raw.preprocess", "raw.demosaic", "raw.base"})},
         {StagePath::Preview, RenderStateAspect::Display,
@@ -619,6 +737,30 @@ void testStateMutation()
     check(contains(fromGeometry.blocks, "viewport.output"),
           "state geometry: reaches the sink");
     checkOrdered(StagePath::Crop, fromGeometry.blocks, "state geometry");
+
+    /*
+     * A live spot buffer is a standing rule, not a delta: the same key at both
+     * ends still schedules the base, because the next pass restores the spots
+     * into it. This is independent of the Derived aspect, which reports only
+     * the transition that creates or drops the buffer.
+     */
+    RenderStateKey spot;
+    spot.spotBufferLive = true;
+    const DirtyBlocks fromSpot =
+        deriveCrop(fingerprints, fingerprints, spot, spot);
+    check(fromSpot.fromState == setOf({"raw.base"}),
+          "state spot: a live buffer schedules the base without a delta");
+    check(contains(fromSpot.blocks, "raw.base"),
+          "state spot: the base is in the execution set");
+    check(contains(fromSpot.blocks, "analysis"),
+          "state spot: the base closure reaches the analysis");
+
+    const DirtyBlocks previewSpot =
+        dirtyBlocksFromRenderState(spot, spot, StagePath::Preview);
+    check(previewSpot.fromState == setOf({"raw.base"}),
+          "state spot preview: a live buffer schedules the base");
+    check(previewSpot.ids.count("analysis") == 1,
+          "state spot preview: the analysis runs with the base");
 }
 
 void testShadow()
@@ -949,6 +1091,7 @@ int main()
     testParamMutation();
     testClosure();
     testAspects();
+    testRequestFacts();
     testAspectBlocks();
     testStateMutation();
     testShadow();

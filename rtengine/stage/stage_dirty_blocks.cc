@@ -160,9 +160,26 @@ bool isSourceBlock(const std::string& id)
 }
 
 /*
- * Aspect comparison helpers. Each group is a pure predicate over the two keys,
- * so a new RenderStateKey field must be added to exactly one group here and to
- * the RenderStateKey test at the same time.
+ * Aspect comparison helpers. Each group is a pure predicate over the two keys.
+ *
+ * Every RenderStateKey field must either join exactly one group below or be
+ * listed as deliberately unmapped with a reason, and the RenderStateKey test
+ * must cover it at the same time. Joining one group is what keeps a dirty set
+ * from widening: two groups that both compare the same field would report the
+ * change twice and, through their different block rows, over-dirty the path.
+ *
+ * Deliberately unmapped, with the reason:
+ *
+ * - `spotPending` is derivable from the spot parameter fingerprint, so a
+ *   change always arrives as a parameter delta;
+ * - `deferredAnalysisMask` is a scheduling fact that the coordinator absorbs
+ *   before it builds the key, and it is published from an advisory atomic
+ *   snapshot, so it cannot order a dirty set;
+ * - `cropGuideFingerprint` names an editor overlay that no stage consumes;
+ *   its later job is to suppress a repaint, not to dirty a block;
+ * - `viewportMoved` is already represented by RequestKind::RepaintOnly on the
+ *   crop (the preview heuristic also fires on guide edits), so mapping it
+ *   again would double-count the repaint.
  */
 bool geometryChanged(const RenderStateKey& a, const RenderStateKey& b)
 {
@@ -178,8 +195,18 @@ bool geometryChanged(const RenderStateKey& a, const RenderStateKey& b)
 
 bool sourceChanged(const RenderStateKey& a, const RenderStateKey& b)
 {
-    return std::tie(a.sourceGeneration, a.rgbSourceModified)
-           != std::tie(b.sourceGeneration, b.rgbSourceModified);
+    /*
+     * The geometry facts of the source move with the generation: a reload is
+     * already the widest answer this group can give, so grouping them here
+     * keeps the total-assignment property without widening a dirty set.
+     */
+    return std::tie(a.sourceGeneration, a.rgbSourceModified,
+                    a.sourceRotateDegree, a.sourceSensorType,
+                    a.sourceFullWidth, a.sourceFullHeight, a.sourceFrameCount)
+           != std::tie(b.sourceGeneration, b.rgbSourceModified,
+                       b.sourceRotateDegree, b.sourceSensorType,
+                       b.sourceFullWidth, b.sourceFullHeight,
+                       b.sourceFrameCount);
 }
 
 bool highDetailChanged(const RenderStateKey& a, const RenderStateKey& b)
@@ -188,6 +215,14 @@ bool highDetailChanged(const RenderStateKey& a, const RenderStateKey& b)
                     a.highDetailRawComputed, a.highDetailStateKnown)
            != std::tie(b.highDetailNeeded, b.highDetailPreprocessComputed,
                        b.highDetailRawComputed, b.highDetailStateKnown);
+}
+
+bool derivedChanged(const RenderStateKey& a, const RenderStateKey& b)
+{
+    return std::tie(a.dirPyrDenoiseExpComp, a.denoiseAnalysisValid,
+                    a.spotBufferLive)
+           != std::tie(b.dirPyrDenoiseExpComp, b.denoiseAnalysisValid,
+                       b.spotBufferLive);
 }
 
 bool displayChanged(const RenderStateKey& a, const RenderStateKey& b)
@@ -248,6 +283,8 @@ const char* renderStateAspectName(RenderStateAspect aspect)
         return "source";
     case RenderStateAspect::HighDetail:
         return "high-detail";
+    case RenderStateAspect::Derived:
+        return "derived";
     case RenderStateAspect::Display:
         return "display";
     case RenderStateAspect::Editor:
@@ -274,6 +311,9 @@ std::vector<RenderStateAspect> changed_render_state_aspects(
     }
     if (highDetailChanged(previous, current)) {
         aspects.push_back(RenderStateAspect::HighDetail);
+    }
+    if (derivedChanged(previous, current)) {
+        aspects.push_back(RenderStateAspect::Derived);
     }
     if (displayChanged(previous, current)) {
         aspects.push_back(RenderStateAspect::Display);
@@ -365,6 +405,14 @@ std::vector<std::string> blocks_for_render_state(StagePath path,
                                    "transform"})
                    : select(path, {"raw.preprocess", "raw.demosaic", "raw.base",
                                    "analysis", "transform"});
+    case RenderStateAspect::Derived:
+        /*
+         * The analysis measures the noise the denoise base consumes, and the
+         * base restores a live spot buffer, so the derived inputs dirty both.
+         * raw.base is named explicitly: the canonical edge is raw.base ->
+         * analysis, so the closure from the analysis never pulls the base.
+         */
+        return select(path, {"analysis", "raw.base"});
     case RenderStateAspect::Display:
         return path == StagePath::Preview
                    ? select(path, {"monitor.output"})
@@ -570,6 +618,16 @@ DirtyBlocks derive_dirty_blocks(const DirtyBlockInputs& inputs)
                                                              aspect)) {
             fromState.insert(id);
         }
+    }
+
+    /*
+     * A live spot buffer changes the next base pass whatever the deltas say:
+     * raw.base restores the spots before it finishes. This is the standing
+     * rule next to the Derived aspect, which only reports the change that
+     * creates or drops the buffer; it mirrors the rebuild request below.
+     */
+    if (inputs.currentState->spotBufferLive) {
+        fromState.insert("raw.base");
     }
 
     /*
@@ -786,6 +844,17 @@ DirtyBlocks dirtyBlocksFromRenderState(const RenderStateKey& previous,
                  path, RenderStateAspect::HighDetail)) {
             seeds.insert(id);
         }
+    }
+
+    /*
+     * The standing spot rule, shared with derive_dirty_blocks(): a live spot
+     * buffer means the next base pass restores the spots, so raw.base is
+     * scheduled even when no aspect changed. The Derived aspect reports the
+     * transition that creates or drops the buffer; this rule reports the
+     * state itself.
+     */
+    if (current.spotBufferLive) {
+        seeds.insert("raw.base");
     }
 
     for (RenderStateAspect aspect : changed_render_state_aspects(previous,
