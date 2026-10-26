@@ -142,10 +142,18 @@ struct RenderStateKey {
      * Request facts.
      *
      * These are the inputs the exact preview and crop work flags need and that
-     * neither ProcParams nor an earlier field carries. The section is data
-     * only for now: stage_dirty_blocks.cc does not map it to a
-     * RenderStateAspect, so a difference in these fields cannot change a dirty
-     * set yet.
+     * neither ProcParams nor an earlier field carries. Eight of the twelve
+     * are mapped to a RenderStateAspect by stage_dirty_blocks.cc: the five
+     * source facts join Source, and `dirPyrDenoiseExpComp`,
+     * `denoiseAnalysisValid` and `spotBufferLive` form Derived.
+     *
+     * The other four are deliberately exempt, each for its own reason:
+     * `spotPending`, whose false->true transition is carried by the spot
+     * parameter delta; `deferredAnalysisMask`, a scheduling fact the
+     * coordinator absorbs before it builds the key, published from an
+     * advisory atomic snapshot; `cropGuideFingerprint`, an overlay value
+     * whose later job is to suppress a repaint; and `viewportMoved`, which
+     * RequestKind::RepaintOnly already represents on the crop.
      *
      * `sourceRotateDegree` is the source rotation in degrees, `sourceFullWidth`
      * and `sourceFullHeight` are its unrotated full size in pixels, which the

@@ -353,7 +353,7 @@ ids; preview, crop, thumbnail, monitor and viewport ids are rejected.
 | `raw.preprocess` | raw, lensProf, coarse, dirpyrDenoise |
 | `raw.demosaic` | raw, pdsharpening |
 | `raw.base` | raw, wb, toneCurve, spot, dirpyrDenoise, filmNegative, retinex, dehaze, fattal, cg, icm |
-| `analysis` | icm, toneCurve |
+| `analysis` | icm, toneCurve, dirpyrDenoise |
 | `transform` | coarse, commonTrans, rotate, distortion, perspective, cacorrection, vignetting, gradient, pcvignette, lensProf, crop |
 | `local.adjustments` | locallab, icm, toneCurve, raw, wb, dirpyrequalizer, dehaze, epd, rgbCurves, hsvequalizer, chmixer, colorToning |
 | `rgb.proc` | toneCurve, rgbCurves, colorToning, blackwhite, chmixer, hsvequalizer, filmSimulation, icm |
@@ -381,6 +381,10 @@ export entry point and the tool implementations:
   `rgb.proc` (working-space matrix and DCP), `lab.tools` (vibrance),
   `lab.sharpening`, `lab.wavelet`, `working.trc`, `ciecam`, `gamut`,
   `output.convert` and `output.icc`.
+- `dirpyrDenoise` is a member of `analysis`: the crop builds the
+  automatic-denoise analysis from the denoise configuration, and enabling that
+  denoise leaves `denoiseAnalysisValid` false, so only the parameter delta can
+  dirty the analysis node directly (see the request facts below).
 - `transform` also hashes `crop`: post-crop vignetting needs the crop
   rectangle (`iptransform.cc:1030`, `:1103`).
 - `local.adjustments` hashes the global members its spots borrow: working
@@ -522,8 +526,8 @@ dimensions, the crop/ROI rectangle with its skip and processing border, the
 high-detail decision and what has already been computed for it,
 `sourceGeneration`, `rgbSourceModified`, the monitor profile name and intent,
 soft proof, gamut check, `sharpMask`, the fast-preview switches, whether the
-pass is the initial rough preview, the request kind and the previous-demo
-base.
+pass is the initial rough preview, the request kind, the previous-demo base
+and twelve request facts.
 
 `RequestKind` has five values (`ParamsOnly`, `RepaintOnly`, `FullCrop`,
 `FullPreview`, `HighQuality`). `previousDemoBase` is stored as an `int32_t`
@@ -538,8 +542,10 @@ the result.
 The preview full-frame graph consumes the key field by field through
 `rtengine/stage/stage_dirty_blocks.h`: a changed field group dirties the blocks
 that read it, and the set is merged with the parameter-fingerprint difference
-before the graph plan runs. No cache key uses the fingerprint yet, and the
-existing bitset remains the production input of the legacy and crop paths.
+before the graph plan runs. No cache key uses the fingerprint yet. The bitset
+still drives the viewport fast path, GUI notification and the per-node gates,
+and it carries the crop raw-reload request, but it no longer selects the
+scheduled nodes.
 
 `stage-render-state-test` proves identical states agree, every field changes
 the fingerprint when changed alone, every request kind is distinct,
@@ -547,6 +553,57 @@ the fingerprint when changed alone, every request kind is distinct,
 and the fingerprint equals a field-by-field canonical stream. It also pins the
 published fingerprint `7d18d6df20ff6afdb471515b8cdae2b8` for the populated
 sample key; update it only with a deliberate format change.
+
+#### Request facts and their aspects
+
+Twelve fields carry inputs that neither `ProcParams` nor an earlier field
+expresses. Eight are mapped to a `RenderStateAspect`; four are deliberately
+exempt.
+
+Mapped to Source, alongside `sourceGeneration` and `rgbSourceModified`:
+`sourceRotateDegree`, `sourceSensorType`, `sourceFullWidth`,
+`sourceFullHeight` and `sourceFrameCount`. They describe the source that the
+generation identifies, so they cannot widen a dirty set beyond the reload the
+generation already schedules.
+
+Mapped to Derived, a new aspect between high detail and display:
+`dirPyrDenoiseExpComp`, the exposure compensation the source contributes to
+the automatic-denoise analysis; `denoiseAnalysisValid`, whether the
+coordinator holds a usable analysis for this request; and `spotBufferLive`,
+whether a spot buffer exists that the next base pass restores. The row is
+`{raw.base, analysis}` on both the preview and the crop path. `raw.base` is
+named explicitly because the canonical edge is `raw.base -> analysis`, so the
+closure from the analysis never pulls the base. `spotBufferLive` is base
+state, not an analysis input: it changes the next base pass whether or not the
+analysis moves.
+
+`spotBufferLive` also drives a standing rule: whenever the current key reports
+a live buffer, `derive_dirty_blocks()` and `dirtyBlocksFromRenderState()`
+schedule `raw.base` whatever the deltas say. The Derived aspect reports the
+transition that creates or drops the buffer; the rule reports the state that
+changes the next base pass. The preview coordinator's own insertion of
+`raw.base` when it holds a spot buffer (`improccoordinator.cc`) is redundant
+now and is retained until the gate-removal phase.
+
+The four exempt facts:
+
+- `spotPending`: only the false->true transition matters, and the spot
+  parameter delta already carries it; the true->false transition has no
+  parameter delta and no block consumes the cleared flag.
+- `deferredAnalysisMask`: a scheduling fact the coordinator absorbs before it
+  builds the key, published from an advisory atomic snapshot, so it cannot
+  order a dirty set.
+- `cropGuideFingerprint`: names an editor overlay that no stage consumes; its
+  later job is to suppress a repaint, not to dirty a block.
+- `viewportMoved`: already represented by `RequestKind::RepaintOnly` on the
+  crop; mapping it again would double-count the repaint.
+
+`dirpyrDenoise` is now a member of the `analysis` fingerprint and field list
+(`hashAnalysis`), alongside `icm` and `toneCurve`. The crop builds the
+automatic-denoise analysis from the denoise configuration, but enabling the
+automatic denoise leaves `denoiseAnalysisValid` false->false, so no request
+fact moves and the analysis node was not directly dirtied before the change;
+it was reached only through the `raw.base` closure.
 
 ### Dirty-block derivation (Phase F)
 
@@ -583,8 +640,11 @@ crop path, 14 for the preview) rather than twice.
 1. **Parameter delta.** A block is directly dirty when its fingerprint differs
    from the previous snapshot. Equal parameters give an empty set.
 2. **Render-state delta.** A changed `RenderStateKey` group dirties the blocks
-   its aspect names. The groups are geometry, source, high detail, display,
-   editor and request; every key field belongs to exactly one group.
+   its aspect names. The groups are geometry, source, high detail, derived,
+   display, editor and request. Every key field joins exactly one group or is
+   listed in the header as deliberately exempt; joining two groups would
+   report one change twice and, through their different block rows,
+   over-dirty the path.
 3. **Rebuild request.** A `FullCrop`, `FullPreview` or `HighQuality` request
    dirties the whole path. A request is absolute, not a delta: it says "this
    pass rebuilds the path", so it cannot be expressed as an input change. The
@@ -625,12 +685,13 @@ and fills `DirtyBlocks::ids`, `valid` and `reason`.
 | `mergeDirtyBlocks(a, b)` | set union |
 | `closeOverGraph(blocks, path)` | `close_dirty_blocks()` |
 
-The state adapter reads one field that the aspect tables cannot express: a
+The state adapter reads two inputs that the aspect tables cannot express: a
 changed `previousDemoBase` maps to the high-detail blocks, because the preview
-base feeds the raw core. The request aspect is likewise evaluated per kind
-rather than per row, as rule 3 describes. There is no mask equivalence form in
-this unit; the mask map remains a separate description and the shadow
-comparison compares plans, not tables.
+base feeds the raw core, and a live spot buffer schedules `raw.base` directly.
+The request aspect is likewise evaluated per kind rather than per row, as
+rule 3 describes. There is no mask equivalence form in this unit; the mask map
+remains a separate description and the shadow comparison compares plans, not
+tables.
 
 ### Per-path tables
 
@@ -641,6 +702,7 @@ Changed render-state aspect to blocks:
 | geometry | `raw.base`, `analysis`, `transform`, `local.adjustments`, `rgb.proc`, `lab.tools`, `lab.sharpening`, `lab.wavelet`, `working.trc`, `ciecam`, `gamut`, `viewport.output` | every node |
 | source | `source.select`, `raw.preprocess`, `raw.demosaic`, `raw.base` | `source.select`, `raw.preprocess`, `raw.demosaic`, `raw.base` |
 | high detail | `raw.preprocess`, `raw.demosaic`, `raw.base`, `analysis`, `transform` | `source.select`, `raw.preprocess`, `raw.demosaic`, `raw.base`, `analysis`, `transform` |
+| derived | `raw.base`, `analysis` | `raw.base`, `analysis` |
 | display | `viewport.output` | `monitor.output` |
 | editor | `lab.sharpening` | `source.select`, `raw.preprocess`, `raw.demosaic`, `raw.base`, `analysis`, `transform` |
 | request | `viewport.output` | see rule 3 |
@@ -696,11 +758,13 @@ live session for each scenario, applies the real `refreshmap.h` composite mask
 to the stage bodies, and compares the incremental crop with a fresh render of
 the final state.
 
-Image: 45.7 MP NEF, 100% viewport 960x640, `OMP_NUM_THREADS=1`. The current
-run reports `33 plans executed, 0 plan fallbacks, 33 dirty derivations` and
-`AE=0` for display and output-space images in every scenario and in the static
-fit/100%/zoomed states. The stage-coverage run also passes with denoise, local
-adjustments, CIE CAM, gamut and the Lab chain active.
+Image: the public 10.2 MP PEF sample `colorspace_flowers.pef` (listed in
+`devnotes/opencl/testdata.manifest`), 100% viewport 960x640,
+`OMP_NUM_THREADS=1`. The run reports `33 plans executed, 0 plan fallbacks,
+33 dirty derivations` and `AE=0` for display and output-space images in every
+scenario and in the static fit/100%/zoomed states. The stage-coverage run also
+passes with denoise, local adjustments, CIE CAM, gamut and the Lab chain
+active.
 
 The focused harness:
 
@@ -717,6 +781,30 @@ execution set. It compares display and output-space images byte for byte and
 requires one executed plan per state, one dirty derivation per update, and no
 plan rejection. Result on CPU and OpenCL builds: `AE=0` for every state and
 profile.
+
+#### Request-fact change evidence
+
+The request-fact mapping and the analysis fingerprint change were checked on
+the CPU build unless stated:
+
+- `stage-abi-test`, `stage-cache-test`, `stage-device-test`,
+  `stage-dirty-blocks-test`, `stage-graph-test`, `stage-indexer-test`,
+  `stage-mask-map-test`, `stage-param-hash-test`, `stage-param-map-test`,
+  `stage-parity-test`, `stage-pipeline-test`, `stage-render-state-test` and
+  `stage-store-test`: 13 PASS.
+- `crop-stage-test --sequences`: PASS, `33 plans executed, 0 plan fallbacks,
+  33 dirty derivations`, `AE=0` in the static fit/100%/zoomed states and in
+  every sequence state.
+- `thumbnail-stage-test`: PASS embedded and raw.
+- `crop-stage-test --stages`: PASS with denoise, local adjustments, CIE CAM,
+  gamut and the Lab chain active, `6 plans executed, 0 plan fallbacks`.
+- The CPU and OpenCL configurations both compile. The OpenCL run rebuilt the
+  engine and linked `stage-dirty-blocks-test`, `stage-param-map-test`,
+  `stage-pipeline-test` and `stage-render-state-test`.
+
+The preview bench is not usable evidence for this change. The harness captured
+only two samples because its hard-coded slider coordinates miss on this
+layout, so no timing claim is made.
 
 ## Mask-to-block equivalence map (Phase F)
 

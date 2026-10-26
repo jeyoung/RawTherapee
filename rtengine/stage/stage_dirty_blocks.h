@@ -85,10 +85,11 @@ enum class RenderStateAspect : int32_t {
     /* The high-detail decision and the work already done for it. */
     HighDetail = 2,
     /*
-     * Derived analysis inputs: the source exposure compensation the denoise
-     * analysis consumes, the validity of that analysis and the live spot
-     * buffer. They dirty the analysis and the base that consumes it without
-     * naming a new source.
+     * Derived state. The source exposure compensation the denoise analysis
+     * consumes and the validity of that analysis dirty the analysis and the
+     * base that consumes it without naming a new source. The live spot
+     * buffer is base state, not an analysis input: it changes the next base
+     * pass whether or not the analysis moves.
      */
     Derived = 3,
     /* Monitor profile, intent, soft proof and gamut check. */
@@ -243,7 +244,7 @@ struct DirtyBlocks {
     bool forced = false;
     /* Blocks whose parameter fingerprint changed. */
     std::vector<std::string> fromParams;
-    /* Blocks a changed render-state aspect names. */
+    /* Blocks the render state schedules. */
     std::vector<std::string> fromState;
     /* Blocks added because a coupled group was seeded, excluding the seeds. */
     std::vector<std::string> fromGroups;

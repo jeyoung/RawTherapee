@@ -170,8 +170,9 @@ bool isSourceBlock(const std::string& id)
  *
  * Deliberately unmapped, with the reason:
  *
- * - `spotPending` is derivable from the spot parameter fingerprint, so a
- *   change always arrives as a parameter delta;
+ * - `spotPending` is only turned on by the spot parameter delta, which is
+ *   already mapped; the opposite transition carries no parameter delta and is
+ *   harmless because no block reads the cleared flag;
  * - `deferredAnalysisMask` is a scheduling fact that the coordinator absorbs
  *   before it builds the key, and it is published from an advisory atomic
  *   snapshot, so it cannot order a dirty set;

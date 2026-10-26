@@ -88,7 +88,7 @@ const std::vector<BlockMeta>& blockTable()
         {"raw.preprocess",         "Raw preprocess",             RT_STAGE_REUSE_OUTPUT, {"raw", "lensProf", "coarse", "dirpyrDenoise"}},
         {"raw.demosaic",           "Demosaic",                   RT_STAGE_REUSE_OUTPUT, {"raw", "pdsharpening"}},
         {"raw.base",               "Base image finish",          RT_STAGE_REUSE_OUTPUT, {"raw", "wb", "toneCurve", "spot", "dirpyrDenoise", "filmNegative", "retinex", "cg", "icm"}},
-        {"analysis",               "Analysis",                   RT_STAGE_REUSE_OUTPUT, {"toneCurve"}},
+        {"analysis",               "Analysis",                   RT_STAGE_REUSE_OUTPUT, {"icm", "toneCurve", "dirpyrDenoise"}},
         {"transform",              "Geometry transform",         RT_STAGE_REUSE_INPUT,  {"coarse", "commonTrans", "rotate", "distortion", "perspective", "cacorrection", "vignetting", "gradient", "pcvignette", "lensProf", "dehaze", "fattal"}},
         {"local.adjustments",      "Local adjustments",          RT_STAGE_REUSE_INPUT,  {"locallab"}},
         {"rgb.proc",               "RGB processing",             RT_STAGE_REUSE_INPUT,  {"toneCurve", "rgbCurves", "colorToning", "blackwhite", "chmixer", "hsvequalizer", "filmSimulation", "icm"}},

@@ -4163,9 +4163,10 @@ stage::DirtyBlocks ImProcCoordinator::previewDirtyBlocks(
 
     /*
      * A spot buffer left over from an earlier base pass is restored into
-     * orig_prev by the next raw.base execution. It is coordinator-owned state
-     * that RenderStateKey does not carry yet, so it is added here rather than
-     * silently ignored; the staging record lists it as a residual input.
+     * orig_prev by the next raw.base execution. RenderStateKey carries this
+     * as spotBufferLive and the dirty-block unit already schedules raw.base
+     * from it, so the insertion below is redundant; it is retained until the
+     * gate-removal phase drops this coordinator-side path.
      */
     if (spotprev != nullptr) {
         result.ids.insert("raw.base");
