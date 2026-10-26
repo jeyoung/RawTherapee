@@ -33,17 +33,24 @@ namespace rtengine::stage
 /*
  * Parameter provenance of one stage descriptor.
  *
- * `fields` names the ProcParams members the block reads, not individual
- * members of those sub-structs. Whole sub-structs are hashed, so a fingerprint
- * is a conservative over-approximation: a field that the block ignores still
- * changes it. That is deliberate, because a stale cache entry is a correctness
- * failure while a spurious cache miss is only a performance cost.
+ * `fields` names the ProcParams members the block reads. Most entries name a
+ * whole sub-struct, so the fingerprint is a conservative over-approximation:
+ * a field that the block ignores still changes it. That is deliberate,
+ * because a stale cache entry is a correctness failure while a spurious cache
+ * miss is only a performance cost.
+ *
+ * The exceptions are the members whose parts feed different bodies. `raw` is
+ * split into the source-select frame number, the preprocess-only fields and
+ * the demosaic fields, and `lensProf` lists only the fields preprocess reads;
+ * a dotted name identifies such a sub-field. The split keeps the raw consumer
+ * fingerprints at the same boundary as the legacy M_PREPROC/M_RAW/M_CSHARP
+ * gates, so a raw edit cannot name a block the mask does not run.
  *
  * One entry type serves every canonical pipeline. A descriptor shared by two
  * paths has exactly one definition in the implementation, so the paths cannot
  * drift apart silently. Ids are the canonical descriptor ids from
  * rtengine/stage/stage_pipeline.cc, and every field name is a ProcParams
- * member.
+ * member or a dotted sub-field of one.
  */
 struct StageParamMapEntry {
     std::string id;

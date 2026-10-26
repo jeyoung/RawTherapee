@@ -163,6 +163,59 @@ const std::set<std::string>& knownParamFields()
     return fields;
 }
 
+/* Sub-fields of ProcParams members with per-consumer hashing. */
+const std::set<std::string>& knownParamSubFields()
+{
+    static const std::set<std::string> fields = {
+        "raw.bayersensor.imageNum", "raw.bayersensor.black0",
+        "raw.bayersensor.black1", "raw.bayersensor.black2",
+        "raw.bayersensor.black3", "raw.bayersensor.twogreen",
+        "raw.bayersensor.Dehablack", "raw.bayersensor.greenthresh",
+        "raw.bayersensor.linenoise", "raw.bayersensor.linenoiseDirection",
+        "raw.bayersensor.pdafLinesFilter", "raw.bayersensor.border",
+        "raw.bayersensor.method", "raw.bayersensor.dcb_iterations",
+        "raw.bayersensor.dcb_enhance", "raw.bayersensor.lmmse_iterations",
+        "raw.bayersensor.dualDemosaicAutoContrast",
+        "raw.bayersensor.dualDemosaicContrast",
+        "raw.bayersensor.pixelShiftMotionCorrectionMethod",
+        "raw.bayersensor.pixelShiftEperIso",
+        "raw.bayersensor.pixelShiftSigma",
+        "raw.bayersensor.pixelShiftShowMotion",
+        "raw.bayersensor.pixelShiftShowMotionMaskOnly",
+        "raw.bayersensor.pixelShiftHoleFill",
+        "raw.bayersensor.pixelShiftMedian",
+        "raw.bayersensor.pixelShiftAverage",
+        "raw.bayersensor.pixelShiftGreen",
+        "raw.bayersensor.pixelShiftBlur",
+        "raw.bayersensor.pixelShiftSmoothFactor",
+        "raw.bayersensor.pixelShiftEqualBright",
+        "raw.bayersensor.pixelShiftEqualBrightChannel",
+        "raw.bayersensor.pixelShiftNonGreenCross",
+        "raw.bayersensor.pixelShiftDemosaicMethod",
+        "raw.xtranssensor.blackred", "raw.xtranssensor.blackgreen",
+        "raw.xtranssensor.blackblue", "raw.xtranssensor.Dehablackx",
+        "raw.xtranssensor.method", "raw.xtranssensor.border",
+        "raw.xtranssensor.dualDemosaicAutoContrast",
+        "raw.xtranssensor.dualDemosaicContrast", "raw.dark_frame",
+        "raw.df_autoselect", "raw.ff_file", "raw.ff_AutoSelect",
+        "raw.ff_FromMetaData", "raw.ff_BlurRadius", "raw.ff_BlurType",
+        "raw.ff_AutoClipControl", "raw.ff_clipControl",
+        "raw.ca_autocorrect", "raw.ca_avoidcolourshift",
+        "raw.caautoiterations", "raw.cared", "raw.cablue", "raw.expos",
+        "raw.preprocessWB", "raw.hotPixelFilter", "raw.deadPixelFilter",
+        "raw.hotdeadpix_thresh", "lensProf.lcMode", "lensProf.lcpFile",
+        "lensProf.useVign", "lensProf.lfCameraMake",
+        "lensProf.lfCameraModel", "lensProf.lfLens"
+    };
+    return fields;
+}
+
+bool isKnownParamField(const std::string& field)
+{
+    return knownParamFields().count(field) != 0
+        || knownParamSubFields().count(field) != 0;
+}
+
 void checkShape(const StagePipelineSpec& spec, StagePath requested)
 {
     const std::string label = stagePathName(spec.path);
@@ -177,7 +230,7 @@ void checkShape(const StagePipelineSpec& spec, StagePath requested)
         check(node.outputs.size() == 1 && node.outputs[0] == node.id,
               label + ": node " + node.id + " produces its own buffer id");
         for (const auto& field : node.paramFields) {
-            check(contains(knownParamFields(), field),
+            check(isKnownParamField(field),
                   label + ": node " + node.id + " uses a known ProcParams member: " +
                       field);
         }

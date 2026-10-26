@@ -87,6 +87,64 @@ const std::set<std::string>& knownParamFields()
     return fields;
 }
 
+/*
+ * Sub-fields of the ProcParams members whose consumers read disjoint parts.
+ * `raw` and `lensProf` are split per consumer; the dotted spelling is the same
+ * one the mutation table uses for documentation. A name outside this set and
+ * outside knownParamFields() has been invented.
+ */
+const std::set<std::string>& knownParamSubFields()
+{
+    static const std::set<std::string> fields = {
+        "raw.bayersensor.imageNum", "raw.bayersensor.black0",
+        "raw.bayersensor.black1", "raw.bayersensor.black2",
+        "raw.bayersensor.black3", "raw.bayersensor.twogreen",
+        "raw.bayersensor.Dehablack", "raw.bayersensor.greenthresh",
+        "raw.bayersensor.linenoise", "raw.bayersensor.linenoiseDirection",
+        "raw.bayersensor.pdafLinesFilter", "raw.bayersensor.border",
+        "raw.bayersensor.method", "raw.bayersensor.dcb_iterations",
+        "raw.bayersensor.dcb_enhance", "raw.bayersensor.lmmse_iterations",
+        "raw.bayersensor.dualDemosaicAutoContrast",
+        "raw.bayersensor.dualDemosaicContrast",
+        "raw.bayersensor.pixelShiftMotionCorrectionMethod",
+        "raw.bayersensor.pixelShiftEperIso",
+        "raw.bayersensor.pixelShiftSigma",
+        "raw.bayersensor.pixelShiftShowMotion",
+        "raw.bayersensor.pixelShiftShowMotionMaskOnly",
+        "raw.bayersensor.pixelShiftHoleFill",
+        "raw.bayersensor.pixelShiftMedian",
+        "raw.bayersensor.pixelShiftAverage",
+        "raw.bayersensor.pixelShiftGreen",
+        "raw.bayersensor.pixelShiftBlur",
+        "raw.bayersensor.pixelShiftSmoothFactor",
+        "raw.bayersensor.pixelShiftEqualBright",
+        "raw.bayersensor.pixelShiftEqualBrightChannel",
+        "raw.bayersensor.pixelShiftNonGreenCross",
+        "raw.bayersensor.pixelShiftDemosaicMethod",
+        "raw.xtranssensor.blackred", "raw.xtranssensor.blackgreen",
+        "raw.xtranssensor.blackblue", "raw.xtranssensor.Dehablackx",
+        "raw.xtranssensor.method", "raw.xtranssensor.border",
+        "raw.xtranssensor.dualDemosaicAutoContrast",
+        "raw.xtranssensor.dualDemosaicContrast", "raw.dark_frame",
+        "raw.df_autoselect", "raw.ff_file", "raw.ff_AutoSelect",
+        "raw.ff_FromMetaData", "raw.ff_BlurRadius", "raw.ff_BlurType",
+        "raw.ff_AutoClipControl", "raw.ff_clipControl",
+        "raw.ca_autocorrect", "raw.ca_avoidcolourshift",
+        "raw.caautoiterations", "raw.cared", "raw.cablue", "raw.expos",
+        "raw.preprocessWB", "raw.hotPixelFilter", "raw.deadPixelFilter",
+        "raw.hotdeadpix_thresh", "lensProf.lcMode", "lensProf.lcpFile",
+        "lensProf.useVign", "lensProf.lfCameraMake",
+        "lensProf.lfCameraModel", "lensProf.lfLens"
+    };
+    return fields;
+}
+
+bool isKnownParamField(const std::string& field)
+{
+    return knownParamFields().count(field) != 0
+        || knownParamSubFields().count(field) != 0;
+}
+
 std::vector<std::string> pipelineIds(StagePath path)
 {
     std::vector<std::string> ids;
@@ -155,7 +213,7 @@ void checkTable(const PathUnderTest& path, size_t expectedCount)
         check(!entry.fields.empty(),
               label + " descriptor lists at least one member: " + entry.id);
         for (const std::string& field : entry.fields) {
-            check(knownParamFields().count(field) != 0,
+            check(isKnownParamField(field),
                   label + " descriptor " + entry.id +
                       " names a known ProcParams member: " + field);
         }
@@ -297,14 +355,16 @@ void checkNeutralStability()
  * checkSharpeningExclusions() proves the dead members stay out of the hash.
  * The analysis value changed when the denoise parameters joined its field
  * list: the automatic denoise measurement reads them, so the deliberate
- * format change is recorded here rather than reverted.
+ * format change is recorded here rather than reverted. The three raw consumer
+ * values changed when `raw` was split into its per-consumer sub-fields; see
+ * checkRawConsumerSplit() and the field lists in stage_param_map.cc.
  */
 const std::map<std::string, std::string>& neutralExportFingerprints()
 {
     static const std::map<std::string, std::string> expected = {
-        {"source.select", "d4757417f831f98e01ca36e7c7288cdf"},
-        {"raw.preprocess", "6e1c2ab900680311b61ad035af35abdb"},
-        {"raw.demosaic", "c45c97915e008007116693df91ceefb5"},
+        {"source.select", "a28f2a11dca1007b39a8e9fff24e578c"},
+        {"raw.preprocess", "88942882c721eb8ec614f59d30600242"},
+        {"raw.demosaic", "78ac13127d9722d02402b459d1989afa"},
         {"raw.base", "8786a9e2404ada652d318a74b1005f4e"},
         {"analysis", "653441262d4cd6d9713a0afe66ae9d3f"},
         {"transform", "a6a394fbf372e1052ebe4fb397d7ef00"},
@@ -340,9 +400,11 @@ void checkExportRegression()
         check(found != expected.end(),
               "export regression has a value for " + entry.id);
         if (found != expected.end()) {
-            check(export_fingerprint(entry.id, params).hexString() ==
-                      found->second,
-                  "neutral export fingerprint is unchanged: " + entry.id);
+            const std::string actual =
+                export_fingerprint(entry.id, params).hexString();
+            check(actual == found->second,
+                  "neutral export fingerprint is unchanged: " + entry.id +
+                      " expected " + found->second + ", got " + actual);
         }
     }
 }
@@ -446,9 +508,9 @@ const std::vector<Mutation>& mutations()
              p.framing.borderRed = 200;
          },
          false},
-        /* Raw preprocess */
-        {"raw.preprocess", "lensProf.useCA",
-         [](procparams::ProcParams& p) { p.lensProf.useCA = true; }, false},
+        /* Raw preprocess: a preprocess-only raw field. */
+        {"raw.preprocess", "raw.hotPixelFilter",
+         [](procparams::ProcParams& p) { p.raw.hotPixelFilter = true; }, false},
         /* Raw base, exclusive member */
         {"raw.base", "spot.enabled",
          [](procparams::ProcParams& p) { p.spot.enabled = true; }, true},
@@ -584,6 +646,92 @@ void checkMutations()
               cropCovered.count("lab.wavelet") != 0 &&
               cropCovered.count("viewport.output") != 0,
           "crop mutations cover the required parameter families");
+}
+
+/*
+ * The three raw consumer fingerprints must not be coarser than the legacy
+ * raw gates. Each edit below is one event family; it may move its own block
+ * (and raw.base, which reads the whole raw member), but must leave the other
+ * raw consumers alone. Before the split, every raw edit moved all three.
+ */
+void checkRawConsumerSplit()
+{
+    const procparams::ProcParams baseline;
+    const FingerprintMap base =
+        fingerprints(exportParamMap(), export_fingerprint, baseline);
+
+    const auto after = [&baseline](auto mutate) {
+        procparams::ProcParams changed = baseline;
+        mutate(changed);
+        return fingerprints(exportParamMap(), export_fingerprint, changed);
+    };
+
+    /* A demosaic-method edit is M_RAW, not M_PREPROC or a frame selection. */
+    {
+        const FingerprintMap changed = after([](procparams::ProcParams& p) {
+            p.raw.bayersensor.method = "RCD";
+        });
+        check(base.at("raw.demosaic") != changed.at("raw.demosaic"),
+              "demosaic method moves raw.demosaic");
+        check(base.at("raw.preprocess") == changed.at("raw.preprocess"),
+              "demosaic method leaves raw.preprocess unchanged");
+        check(base.at("source.select") == changed.at("source.select"),
+              "demosaic method leaves source.select unchanged");
+    }
+
+    /* The denoise family is M_LINDENOISE, not a raw preprocessing family. */
+    {
+        const FingerprintMap changed = after([](procparams::ProcParams& p) {
+            p.dirpyrDenoise.luma += 5;
+        });
+        check(base.at("raw.base") != changed.at("raw.base"),
+              "denoise moves raw.base");
+        check(base.at("analysis") != changed.at("analysis"),
+              "denoise moves analysis");
+        check(base.at("raw.preprocess") == changed.at("raw.preprocess"),
+              "denoise leaves raw.preprocess unchanged");
+        check(base.at("raw.demosaic") == changed.at("raw.demosaic"),
+              "denoise leaves raw.demosaic unchanged");
+        check(base.at("source.select") == changed.at("source.select"),
+              "denoise leaves source.select unchanged");
+    }
+
+    /* A coarse rotate is applied after the raw stage: M_TRANSFORM only. */
+    {
+        const FingerprintMap changed = after([](procparams::ProcParams& p) {
+            p.coarse.rotate = 90;
+        });
+        check(base.at("transform") != changed.at("transform"),
+              "coarse rotate moves transform");
+        check(base.at("raw.preprocess") == changed.at("raw.preprocess"),
+              "coarse rotate leaves raw.preprocess unchanged");
+        check(base.at("raw.demosaic") == changed.at("raw.demosaic"),
+              "coarse rotate leaves raw.demosaic unchanged");
+    }
+
+    /* Selecting another frame is the source-select family. */
+    {
+        const FingerprintMap changed = after([](procparams::ProcParams& p) {
+            p.raw.bayersensor.imageNum = 1;
+        });
+        check(base.at("source.select") != changed.at("source.select"),
+              "frame selection moves source.select");
+        check(base.at("raw.preprocess") == changed.at("raw.preprocess"),
+              "frame selection leaves raw.preprocess unchanged");
+        check(base.at("raw.demosaic") == changed.at("raw.demosaic"),
+              "frame selection leaves raw.demosaic unchanged");
+    }
+
+    /* Capture sharpening is a demosaic-body input. */
+    {
+        const FingerprintMap changed = after([](procparams::ProcParams& p) {
+            p.pdsharpening.contrast += 0.1;
+        });
+        check(base.at("raw.demosaic") != changed.at("raw.demosaic"),
+              "capture sharpening moves raw.demosaic");
+        check(base.at("raw.preprocess") == changed.at("raw.preprocess"),
+              "capture sharpening leaves raw.preprocess unchanged");
+    }
 }
 
 /* Criterion 7: a member outside a descriptor's list must not move it. */
@@ -735,6 +883,7 @@ int main()
     checkNeutralStability();
     checkExportRegression();
     checkMutations();
+    checkRawConsumerSplit();
     checkUnrelated();
     checkSharpeningExclusions();
 

@@ -42,6 +42,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <initializer_list>
 #include <string>
 #include <tuple>
@@ -192,6 +193,20 @@ void setAll(WorkOrder& order, std::initializer_list<WorkItem> items)
     }
 }
 
+/*
+ * Whether a request carries the destructive raw reload bits.
+ *
+ * FullPreview and FullCrop stand for `M_INIT | M_LINDENOISE | M_HDR`, the
+ * legacy reload gate. HighQuality stands for `M_HIGHQUAL`, which asks for the
+ * accurate chain but is not part of that gate: the preview maps a bare
+ * M_HIGHQUAL request to it (imagearea.cc:809) and the crop does the same, so a
+ * HighQuality-only pass must not be treated as a raw reload.
+ */
+bool requestReloadsRaw(RequestKind kind)
+{
+    return kind == RequestKind::FullCrop || kind == RequestKind::FullPreview;
+}
+
 } // namespace
 
 const char* workItemName(WorkItem item)
@@ -338,29 +353,57 @@ void WorkShadow::report(const char* path, const WorkOrder& order) const
     if (forced_) {
         std::fprintf(stderr,
                      "work-shadow %s pass=%llu typedOnly=0 legacyOnly=0 "
-                     "agree=0 items=forced-no-history\n",
+                     "unprobed=0 agree=0 items=forced-no-history\n",
                      path, static_cast<unsigned long long>(pass));
         return;
     }
 
+    const bool preview = std::strcmp(path, "preview") == 0;
+    const bool crop = std::strcmp(path, "crop") == 0;
+
+    const auto applicable = [preview, crop](WorkItem item) {
+        if (!preview && !crop) {
+            return true;
+        }
+        if (item == WorkItem::denoiseRun) {
+            return crop;
+        }
+        if (item == WorkItem::rawPreprocess || item == WorkItem::rawDemosaic
+            || item == WorkItem::retinexPrepare) {
+            return preview;
+        }
+        return true;
+    };
+
+    /* The bodies that live inside the preview raw.base node. */
+    const auto insideRawBaseNode = [](WorkItem item) {
+        return item == WorkItem::rawBaseRebuild
+            || item == WorkItem::retinexPrepare
+            || item == WorkItem::spotApply || item == WorkItem::spotRestore
+            || item == WorkItem::analysisRun;
+    };
+
     std::string typedOnly;
     std::string legacyOnly;
+    std::string unprobed;
     size_t typedCount = 0;
     size_t legacyCount = 0;
+    size_t unprobedCount = 0;
     size_t agree = 0;
+
+    const auto append = [](std::string& list, const char* name) {
+        if (!list.empty()) {
+            list += ' ';
+        }
+        list += name;
+    };
 
     const auto classify = [&](const char* name, bool typed, bool legacy) {
         if (typed && !legacy) {
-            if (!typedOnly.empty()) {
-                typedOnly += ' ';
-            }
-            typedOnly += name;
+            append(typedOnly, name);
             ++typedCount;
         } else if (!typed && legacy) {
-            if (!legacyOnly.empty()) {
-                legacyOnly += ' ';
-            }
-            legacyOnly += name;
+            append(legacyOnly, name);
             ++legacyCount;
         } else {
             ++agree;
@@ -368,20 +411,30 @@ void WorkShadow::report(const char* path, const WorkOrder& order) const
     };
 
     for (size_t i = 0; i < workItemCount; ++i) {
-        if (!probed_[i]) {
+        const WorkItem item = static_cast<WorkItem>(i);
+        if (!applicable(item)) {
             continue;
         }
-        const WorkItem item = static_cast<WorkItem>(i);
-        classify(workItemName(item), order.has(item), legacy_[i]);
-    }
 
-    if (nodeProbed_) {
-        const bool nodeTyped = order.has(WorkItem::rawBaseRebuild)
-            || order.has(WorkItem::retinexPrepare)
-            || order.has(WorkItem::spotApply)
-            || order.has(WorkItem::spotRestore)
-            || order.has(WorkItem::analysisRun);
-        classify("rawBaseNode", nodeTyped, nodeLegacy_);
+        bool known = probed_[i];
+        bool legacy = legacy_[i];
+        /*
+         * The raw.base node was not entered, so none of the bodies inside it
+         * ran. That is a definite legacy answer, not a missing probe.
+         */
+        if (!known && insideRawBaseNode(item) && nodeProbed_
+            && !nodeLegacy_) {
+            known = true;
+            legacy = false;
+        }
+
+        if (!known) {
+            append(unprobed, workItemName(item));
+            ++unprobedCount;
+            continue;
+        }
+
+        classify(workItemName(item), order.has(item), legacy);
     }
 
     std::string items;
@@ -394,15 +447,21 @@ void WorkShadow::report(const char* path, const WorkOrder& order) const
         }
         items += "legacyOnly[" + legacyOnly + "]";
     }
+    if (!unprobed.empty()) {
+        if (!items.empty()) {
+            items += ' ';
+        }
+        items += "unprobed[" + unprobed + "]";
+    }
     if (items.empty()) {
         items = "none";
     }
 
     std::fprintf(stderr,
                  "work-shadow %s pass=%llu typedOnly=%zu legacyOnly=%zu "
-                 "agree=%zu items=%s\n",
+                 "unprobed=%zu agree=%zu items=%s\n",
                  path, static_cast<unsigned long long>(pass), typedCount,
-                 legacyCount, agree, items.c_str());
+                 legacyCount, unprobedCount, agree, items.c_str());
 }
 
 WorkOrder derive_preview_work(const WorkInputs& inputs)
@@ -420,9 +479,13 @@ WorkOrder derive_preview_work(const WorkInputs& inputs)
 
     /*
      * Fail closed on a violated precondition: every item the preview path can
-     * run. denoiseRun is absent because the preview has no denoise body.
+     * run. denoiseRun is absent because the preview has no denoise body. The
+     * null parameters case is included even though the assert above names it,
+     * because a release build must not derive an empty order from a missing
+     * parameter set.
      */
-    if (inputs.currentState == nullptr || inputs.currentFingerprints == nullptr) {
+    if (inputs.currentState == nullptr || inputs.currentFingerprints == nullptr
+        || inputs.params == nullptr) {
         setAll(order, {WorkItem::sourceSelect, WorkItem::rawPreprocess,
                        WorkItem::rawDemosaic, WorkItem::rawBaseRebuild,
                        WorkItem::retinexPrepare, WorkItem::spotApply,
@@ -438,9 +501,9 @@ WorkOrder derive_preview_work(const WorkInputs& inputs)
     const RenderStateKey& previous =
         history ? *inputs.previousState : current;
 
-    const ProcParams* params = inputs.params;
-    const bool retinexEnabled = params == nullptr || params->retinex.enabled;
-    const bool hlr = params != nullptr && hlrDemandsDemosaic(*params, current);
+    const ProcParams& params = *inputs.params;
+    const bool retinexEnabled = params.retinex.enabled;
+    const bool hlr = hlrDemandsDemosaic(params, current);
 
     /*
      * A change of the high-detail decision only schedules the raw core when
@@ -454,35 +517,61 @@ WorkOrder derive_preview_work(const WorkInputs& inputs)
     const bool sourceReload = history && sourceReloaded(previous, current);
 
     /*
-     * A rebuild request is absolute, not a delta: FullPreview, FullCrop and
-     * HighQuality all name a pass that rebuilds the path even when no input
-     * moved. The legacy request bits are M_INIT, M_LINDENOISE and M_HDR for
-     * the reload and M_HIGHQUAL for the accurate chain.
+     * A reload request is absolute, not a delta. The legacy request bits are
+     * M_INIT, M_LINDENOISE and M_HDR, which the caller folds into FullPreview
+     * or FullCrop. M_HIGHQUAL is a separate request: it asks for the accurate
+     * chain, and the legacy base gate does not consult it, so HighQuality is
+     * deliberately not a raw reload here.
      */
-    const bool rebuild = request_rebuilds_path(inputs.requestKind);
+    const bool rawReload = requestReloadsRaw(inputs.requestKind);
+
+    const bool selectChanged = blockChanged(inputs, "source.select");
+    const bool preprocessBlockChanged = blockChanged(inputs, "raw.preprocess");
+    const bool demosaicBlockChanged = blockChanged(inputs, "raw.demosaic");
+
+    const bool hdPrePending = current.highDetailNeeded
+        && !current.highDetailPreprocessComputed;
+    const bool hdRawPending = current.highDetailNeeded
+        && !current.highDetailRawComputed;
 
     /*
-     * rawWorkRuns(): M_PREPROC or a high-detail preprocess that is still
-     * pending. The source facts join because a reload re-selects the frame
-     * before it preprocesses. A rebuild request is deliberately absent:
-     * RequestKind folds M_INIT/M_LINDENOISE/M_HDR into FullPreview, and those
-     * bits rebuild the base without selecting or preprocessing the source.
+     * source.select and raw.preprocess move together: rawWorkRuns() feeds
+     * both. A selected-frame change (`raw.bayersensor.imageNum`) is a
+     * DARKFRAME event, which also sets M_PREPROC and M_RAW, so it regenerates
+     * the source selection and the preprocessed planes. A rebuild request is
+     * not a disjunct: RequestKind folds M_INIT/M_LINDENOISE/M_HDR into
+     * FullPreview/FullCrop, and those bits rebuild the base without selecting
+     * or preprocessing the source.
      */
-    const bool preprocess = blockChanged(inputs, "raw.preprocess")
-        || (current.highDetailNeeded && !current.highDetailPreprocessComputed)
-        || sourceReload;
+    const bool source = selectChanged || sourceReload;
+    const bool preprocess = preprocessBlockChanged || source || hdPrePending;
 
     /*
-     * rawSourceWorkRuns(): M_RAW/M_CSHARP, a pending high-detail demosaic, the
-     * colour highlight-recovery condition of a modified RGB source, and a
-     * reload. A rebuild request is absent for the same reason as in
-     * `preprocess`. The caller's extra DEMOSAIC augmentation for a white
-     * balance on the Coloropp path is a mask fact and is deliberately not
-     * copied: it appears as a legacy-only run in the shadow.
+     * rawSourceWorkRuns(): the sensor demosaic fields, capture sharpening, a
+     * pending high-detail demosaic, the colour highlight-recovery condition of
+     * a modified RGB source, and the forward edges from a selected frame or a
+     * preprocessed source. Every DARKFRAME/FLATFIELD event sets M_RAW as well
+     * as M_PREPROC, so a preprocess change also runs the demosaic gate.
+     *
+     * Capture sharpening is ANDed with the enable flag by the legacy gate, so
+     * a disabled-tool parameter edit does not name the body. `pdSharpeningChanged`
+     * separates that family from the sensor fields: when only it moved and the
+     * tool is off, rawSourceWorkRuns() is false.
      */
-    const bool demosaic = blockChanged(inputs, "raw.demosaic")
-        || (current.highDetailNeeded && !current.highDetailRawComputed)
-        || hlr || sourceReload;
+    /*
+     * Only claim a pdsharpening-only delta when the previous parameter set is
+     * actually available. Without it the family comparison is conservatively
+     * true, which would otherwise hide a sensor demosaic delta carried by the
+     * same block fingerprint.
+     */
+    const bool pdSharpeningChanged = history && inputs.previousParams != nullptr
+        && paramFamilyChanged(inputs, &ProcParams::pdsharpening);
+    const bool sensorDemosaicChanged =
+        demosaicBlockChanged && !pdSharpeningChanged;
+    const bool captureSharpening =
+        pdSharpeningChanged && params.pdsharpening.enabled;
+    const bool demosaic = sensorDemosaicChanged || captureSharpening || source
+        || preprocessBlockChanged || hdRawPending || hlr;
 
     /*
      * baseRebuildRuns(): the raw.base families that actually rebuild, plus the
@@ -490,24 +579,27 @@ WorkOrder derive_preview_work(const WorkInputs& inputs)
      * block fingerprint is not used: it merges spot and retinex with the
      * rebuilding families. A preprocess or a demosaic regenerates the planes
      * the base consumes (the forward-edge rule of stage_dirty_blocks.h,
-     * close_dirty_blocks).
+     * close_dirty_blocks). `dirpyrDenoise` is one of the families because the
+     * legacy base gate includes M_LINDENOISE. A HighQuality-only request is not
+     * a rebuild: `rawReload` excludes it.
      */
     const bool base = preprocess || demosaic
         || paramFamilyChanged(inputs, &ProcParams::wb)
         || paramFamilyChanged(inputs, &ProcParams::toneCurve)
+        || paramFamilyChanged(inputs, &ProcParams::dirpyrDenoise)
         || paramFamilyChanged(inputs, &ProcParams::filmNegative)
         || paramFamilyChanged(inputs, &ProcParams::retinex)
         || paramFamilyChanged(inputs, &ProcParams::cg)
         || baseIcmChanged(inputs)
-        || rebuild;
+        || rawReload;
 
     /*
      * A spot delta does not rebuild the base: the legacy M_SPOT bit only
      * enters the spot gates inside raw.base and the buffer restore. The
      * request fact `spotPending` already carries the enabled/entries test.
      */
-    const bool spotsConfigured = inputs.params != nullptr
-        && inputs.params->spot.enabled && !inputs.params->spot.entries.empty();
+    const bool spotsConfigured =
+        params.spot.enabled && !params.spot.entries.empty();
     const bool spotChanged = spotsConfigured
         && paramFamilyChanged(inputs, &ProcParams::spot);
     const bool spotApply = current.spotPending || spotChanged;
@@ -576,9 +668,13 @@ WorkOrder derive_crop_work(const WorkInputs& inputs)
 
     /*
      * Fail closed on a violated precondition: every item the crop path can
-     * run. The crop never preprocesses, demosaics or prepares retinex.
+     * run. The crop never preprocesses, demosaics or prepares retinex. The
+     * null parameters case is included even though the assert above names it,
+     * because a release build must not derive an empty order from a missing
+     * parameter set.
      */
-    if (inputs.currentState == nullptr || inputs.currentFingerprints == nullptr) {
+    if (inputs.currentState == nullptr || inputs.currentFingerprints == nullptr
+        || inputs.params == nullptr) {
         setAll(order, {WorkItem::sourceSelect, WorkItem::rawBaseRebuild,
                        WorkItem::spotApply, WorkItem::spotRestore,
                        WorkItem::analysisRun, WorkItem::denoiseRun});
@@ -590,28 +686,26 @@ WorkOrder derive_crop_work(const WorkInputs& inputs)
 
     const RenderStateKey& current = *inputs.currentState;
     const bool history = usableHistory(inputs);
-    const RenderStateKey& previous =
-        history ? *inputs.previousState : current;
 
-    const ProcParams* params = inputs.params;
-    const bool denoiseEnabled = params == nullptr || params->dirpyrDenoise.enabled;
-    const bool spotsConfigured = params != nullptr
-        && params->spot.enabled && !params->spot.entries.empty();
+    const ProcParams& params = *inputs.params;
+    const bool denoiseEnabled = params.dirpyrDenoise.enabled;
+    const bool spotsConfigured =
+        params.spot.enabled && !params.spot.entries.empty();
     const bool spotChanged = spotsConfigured
         && paramFamilyChanged(inputs, &ProcParams::spot);
 
     /*
-     * The crop folds its reload bits (M_INIT | M_LINDENOISE | M_HDR) into
-     * RequestKind::FullCrop before it builds the key (dcrop.cc:679-686). A
-     * source reload and a high-detail decision change the pixels the ROI is
-     * cut from, so they reload it as well. No history means the first update,
-     * which the legacy path runs with ALL.
+     * The crop gates are mask-only: every destructive body tests
+     * `M_INIT | M_LINDENOISE | M_HDR` directly (dcrop.cc: stageSourceSelect,
+     * stageAnalysis, stageRawBase). The crop folds those bits into
+     * RequestKind::FullCrop before it builds the key. A source reload or a
+     * high-detail transition reaches the crop through the same bits, so it is
+     * not an independent disjunct here; the dirty-block derivation models
+     * those render-state aspects separately. HighQuality maps M_HIGHQUAL,
+     * which no crop gate consults, and is therefore not a reload. No history
+     * means the first update, which the legacy path runs with ALL.
      */
-    const bool highDetailMoved = history
-        && previous.highDetailNeeded != current.highDetailNeeded;
-    const bool reload = !history
-        || request_rebuilds_path(inputs.requestKind)
-        || (history && sourceReloaded(previous, current)) || highDetailMoved;
+    const bool reload = !history || requestReloadsRaw(inputs.requestKind);
 
     if (reload) {
         order.set(WorkItem::sourceSelect);

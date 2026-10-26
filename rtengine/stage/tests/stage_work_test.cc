@@ -40,6 +40,7 @@
 #include "stage_work.h"
 
 #include "rtengine/procparams.h"
+#include "rtengine/refreshmap.h"
 
 #include <cstdio>
 #include <initializer_list>
@@ -84,6 +85,72 @@ void expectOrder(const WorkOrder& actual,
     check(false, message + ": expected " + workOrderName(wanted)
                      + ", derived " + workOrderName(actual));
 }
+
+/*
+ * The legacy gate answers for the raw/core items of one edit, read from the
+ * refreshmap action the GUI sends. This is the oracle the typed order must
+ * never exceed: `typedOnly` is exactly the set of items the typed order names
+ * that this function does not set.
+ *
+ * Only the raw/core items are modelled. Spot state is carried in the render
+ * key rather than in the action, so spot cases keep their explicit checks in
+ * testSpotTransitions().
+ */
+WorkOrder legacyPreviewRawOrder(const procparams::ProcParams& params, int mask)
+{
+    WorkOrder order;
+
+    const bool preprocess = (mask & M_PREPROC) != 0;
+    const bool demosaic = (mask & M_RAW) != 0
+        || ((mask & M_CSHARP) != 0 && params.pdsharpening.enabled);
+    const bool base = (mask & (M_INIT | M_LINDENOISE | M_HDR)) != 0;
+    const bool spotConfigured =
+        params.spot.enabled && !params.spot.entries.empty();
+    const bool spotApply = (mask & M_SPOT) != 0 && spotConfigured;
+    const bool retinex = ((mask & (M_RETINEX | M_INIT)) != 0)
+        && params.retinex.enabled;
+
+    if (preprocess) {
+        order.set(WorkItem::sourceSelect);
+        order.set(WorkItem::rawPreprocess);
+    }
+    if (demosaic) {
+        order.set(WorkItem::rawDemosaic);
+    }
+    if (base) {
+        order.set(WorkItem::rawBaseRebuild);
+        order.set(WorkItem::analysisRun);
+    }
+    if (spotApply) {
+        order.set(WorkItem::spotApply);
+        /* Without a base rebuild the spots are applied to the buffer and
+         * copied back; a base rebuild applies them directly. */
+        if (!base) {
+            order.set(WorkItem::spotRestore);
+        }
+    }
+    if (retinex) {
+        order.set(WorkItem::retinexPrepare);
+    }
+
+    return order;
+}
+
+void expectNoTypedOnly(const WorkOrder& typed, const WorkOrder& legacy,
+                       const std::string& message)
+{
+    WorkOrder extra;
+    for (size_t i = 0; i < workItemCount; ++i) {
+        const WorkItem item = static_cast<WorkItem>(i);
+        if (typed.has(item) && !legacy.has(item)) {
+            extra.set(item);
+        }
+    }
+    check(extra.empty(), message + ": typedOnly " + workOrderName(extra)
+                             + " against legacy " + workOrderName(legacy)
+                             + ", derived " + workOrderName(typed));
+}
+
 
 /*
  * One derivation under test.
@@ -215,6 +282,10 @@ void testParameterChanges()
         std::initializer_list<WorkItem> previewExpected;
         /* The crop stage bodies still read the spot families without a reload. */
         std::initializer_list<WorkItem> cropExpected = {};
+        /* The refreshmap action the editor sends for this edit. */
+        int mask = 0;
+        /* False for facts the raw/core oracle does not model (spot state). */
+        bool useOracle = true;
     };
 
     const ParamCase cases[] = {
@@ -222,51 +293,78 @@ void testParameterChanges()
          [](procparams::ProcParams& params) {
              params.wb.temperature += 500;
          },
-         {WorkItem::rawBaseRebuild, WorkItem::analysisRun}},
+         {WorkItem::rawBaseRebuild, WorkItem::analysisRun}, {}, WB},
         {"raw sensor level (raw.preprocess, raw.demosaic, raw.base)",
          [](procparams::ProcParams& params) {
              params.raw.bayersensor.black0 += 1.0;
          },
          {WorkItem::sourceSelect, WorkItem::rawPreprocess,
           WorkItem::rawDemosaic, WorkItem::rawBaseRebuild,
-          WorkItem::analysisRun}},
-        {"capture sharpening (raw.demosaic)",
+          WorkItem::analysisRun}, {}, DARKFRAME},
+        {"capture sharpening enabled (raw.demosaic)",
          [](procparams::ProcParams& params) {
+             params.pdsharpening.enabled = true;
              params.pdsharpening.contrast += 0.1;
          },
          {WorkItem::rawDemosaic, WorkItem::rawBaseRebuild,
-          WorkItem::analysisRun}},
+          WorkItem::analysisRun}, {}, CAPTURESHARPEN},
+        {"capture sharpening disabled (no demosaic body)",
+         [](procparams::ProcParams& params) {
+             params.pdsharpening.contrast += 0.1;
+         },
+         {}, {}, CAPTURESHARPEN},
         {"retinex (raw.base, enabled)",
          [](procparams::ProcParams& params) {
              params.retinex.enabled = true;
          },
          {WorkItem::rawBaseRebuild, WorkItem::retinexPrepare,
-          WorkItem::analysisRun}},
-        {"lens profile (raw.preprocess only)",
+          WorkItem::analysisRun}, {}, DEMOSAIC},
+        {"lens profile (raw.preprocess, forward edge to demosaic)",
          [](procparams::ProcParams& params) {
              params.lensProf.lcMode =
                  procparams::LensProfParams::LcMode::LENSFUNMANUAL;
          },
          {WorkItem::sourceSelect, WorkItem::rawPreprocess,
-          WorkItem::rawBaseRebuild, WorkItem::analysisRun}},
+          WorkItem::rawDemosaic, WorkItem::rawBaseRebuild,
+          WorkItem::analysisRun}, {}, DARKFRAME},
+        {"lens CA flag (transform, not preprocess)",
+         [](procparams::ProcParams& params) {
+             params.lensProf.useCA = true;
+         },
+         {}, {}, HDR},
         {"colour management (raw.base, analysis)",
          [](procparams::ProcParams& params) {
              params.icm.workingProfile = "ProPhoto";
          },
-         {WorkItem::rawBaseRebuild, WorkItem::analysisRun}},
-        {"denoise strength (raw.preprocess, raw.base, analysis)",
+         {WorkItem::rawBaseRebuild, WorkItem::analysisRun}, {}, DEMOSAIC},
+        {"denoise strength (raw.base, analysis)",
          [](procparams::ProcParams& params) {
              params.dirpyrDenoise.luma += 5;
          },
-         {WorkItem::sourceSelect, WorkItem::rawPreprocess,
-          WorkItem::rawBaseRebuild, WorkItem::analysisRun}},
+         {WorkItem::rawBaseRebuild, WorkItem::analysisRun}, {}, ALLNORAW},
+        {"demosaic method (raw.demosaic, raw.base)",
+         [](procparams::ProcParams& params) {
+             params.raw.bayersensor.method = "RCD";
+         },
+         {WorkItem::rawDemosaic, WorkItem::rawBaseRebuild,
+          WorkItem::analysisRun}, {}, DEMOSAIC},
+        {"coarse rotate (transform, not preprocess)",
+         [](procparams::ProcParams& params) {
+             params.coarse.rotate = 90;
+         },
+         {}, {}, ALLNORAW},
+        {"fine rotate (transform, not preprocess)",
+         [](procparams::ProcParams& params) {
+             params.rotate.degree = 1.5;
+         },
+         {}, {}, HDR},
         {"spot entry (spot buffer, no base rebuild)",
          [](procparams::ProcParams& params) {
              params.spot.enabled = true;
              params.spot.entries.emplace_back();
          },
          {WorkItem::spotApply, WorkItem::spotRestore},
-         {WorkItem::spotApply, WorkItem::spotRestore}},
+         {WorkItem::spotApply, WorkItem::spotRestore}, SPOTADJUST, false},
         {"dehaze (transform, not raw.base)",
          [](procparams::ProcParams& params) {
              params.dehaze.enabled = true;
@@ -282,7 +380,7 @@ void testParameterChanges()
              params.retinex.enabled = false;
              params.retinex.str += 5;
          },
-         {WorkItem::rawBaseRebuild, WorkItem::analysisRun}},
+         {WorkItem::rawBaseRebuild, WorkItem::analysisRun}, {}, RETINEX},
     };
 
     for (const ParamCase& testCase : cases) {
@@ -293,14 +391,108 @@ void testParameterChanges()
         const Derivation preview(StagePath::Preview, previous, current,
                                  RenderStateKey{}, RenderStateKey{},
                                  RequestKind::ParamsOnly);
-        expectOrder(preview.preview(), testCase.previewExpected,
+        const WorkOrder previewOrder = preview.preview();
+        expectOrder(previewOrder, testCase.previewExpected,
                     std::string("parameter ") + testCase.name);
+        if (testCase.useOracle) {
+            expectNoTypedOnly(
+                previewOrder, legacyPreviewRawOrder(current, testCase.mask),
+                std::string("parameter ") + testCase.name);
+        }
 
         const Derivation crop(StagePath::Crop, previous, current,
                               RenderStateKey{}, RenderStateKey{},
                               RequestKind::ParamsOnly);
         expectOrder(crop.crop(), testCase.cropExpected,
                     std::string("parameter ") + testCase.name + " on crop");
+    }
+}
+
+/*
+ * The request kind the coordinator derives from the refreshmap action. The
+ * shadow comparison runs on the same folding, so an edit family must not name
+ * raw work beyond the action it sends.
+ */
+RequestKind kindForAction(int mask)
+{
+    if ((mask & M_HIGHQUAL) != 0) {
+        return RequestKind::HighQuality;
+    }
+    if ((mask & (M_INIT | M_LINDENOISE | M_HDR)) != 0) {
+        return RequestKind::FullPreview;
+    }
+    return RequestKind::ParamsOnly;
+}
+
+/*
+ * Each edit family with the request kind its editor action produces. This is
+ * the end-to-end predicate check: the typed order may be smaller than the
+ * legacy raw set where the mask over-approximates, but it must never name an
+ * item the mask does not run.
+ */
+void testEditFamiliesAgainstLegacyOracle()
+{
+    using Mutate = void (*)(procparams::ProcParams&);
+    struct Edit {
+        const char* name;
+        Mutate mutate;
+        int mask;
+        /* Whether the typed raw set is expected to equal the legacy one. */
+        bool exact;
+    };
+
+    const Edit edits[] = {
+        {"white balance", [](procparams::ProcParams& params) {
+             params.wb.temperature += 500;
+         }, WB, true},
+        {"demosaic method", [](procparams::ProcParams& params) {
+             params.raw.bayersensor.method = "RCD";
+         }, DEMOSAIC, true},
+        {"denoise", [](procparams::ProcParams& params) {
+             params.dirpyrDenoise.luma += 5;
+         }, ALLNORAW, true},
+        {"coarse rotate", [](procparams::ProcParams& params) {
+             params.coarse.rotate = 90;
+         }, ALLNORAW, true},
+        {"fine rotate", [](procparams::ProcParams& params) {
+             params.rotate.degree = 1.5;
+         }, HDR, true},
+        {"capture sharpening", [](procparams::ProcParams& params) {
+             params.pdsharpening.enabled = true;
+             params.pdsharpening.contrast += 0.1;
+         }, CAPTURESHARPEN, true},
+        {"lens profile", [](procparams::ProcParams& params) {
+             params.lensProf.lcMode =
+                 procparams::LensProfParams::LcMode::LENSFUNMANUAL;
+         }, DARKFRAME, true},
+        {"retinex", [](procparams::ProcParams& params) {
+             params.retinex.enabled = true;
+         }, DEMOSAIC, false},
+        {"colour management", [](procparams::ProcParams& params) {
+             params.icm.workingProfile = "ProPhoto";
+         }, DEMOSAIC, false}
+    };
+
+    for (const Edit& edit : edits) {
+        const procparams::ProcParams previous;
+        procparams::ProcParams current = previous;
+        edit.mutate(current);
+
+        const Derivation preview(StagePath::Preview, previous, current,
+                                 RenderStateKey{}, RenderStateKey{},
+                                 kindForAction(edit.mask));
+        const WorkOrder typed = preview.preview();
+        const WorkOrder legacy = legacyPreviewRawOrder(current, edit.mask);
+
+        expectNoTypedOnly(typed, legacy,
+                          std::string("action ") + edit.name);
+        if (edit.exact) {
+            check(typed == legacy,
+                  std::string("action ") + edit.name +
+                      ": typed order equals the legacy raw set: expected " +
+                      workOrderName(legacy) + ", derived " +
+                      workOrderName(typed));
+        }
     }
 }
 
@@ -321,12 +513,15 @@ void testSourceReload()
                  WorkItem::analysisRun},
                 "source reload on preview");
 
+    /*
+     * The crop gates are mask-only. A source generation bump reaches the crop
+     * through M_INIT (RequestKind::FullCrop), not through a parameter delta,
+     * so the work order is empty when the request does not carry it. The
+     * dirty-block derivation still models the Source aspect separately.
+     */
     const Derivation crop(StagePath::Crop, params, params, previousState,
                           currentState, RequestKind::ParamsOnly);
-    expectOrder(crop.crop(),
-                {WorkItem::sourceSelect, WorkItem::rawBaseRebuild,
-                 WorkItem::analysisRun},
-                "source reload on crop");
+    expectOrder(crop.crop(), {}, "source reload without a crop reload request");
 
     /* A bare RGB modification is not a reload: only the demosaic reads it. */
     RenderStateKey modified;
@@ -398,13 +593,16 @@ void testHighDetailTransitions()
     expectOrder(gained.preview(), rawCore,
                 "high detail gained: the raw core runs");
 
+    /*
+     * The crop gates are mask-only: the high-detail transition reaches a crop
+     * as a mask request, not as a parameter delta, so a ParamsOnly update
+     * names no crop item even though the render-state aspect moved.
+     */
     const Derivation cropGained(StagePath::Crop, params, params,
                                 previousState, needed,
                                 RequestKind::ParamsOnly);
-    expectOrder(cropGained.crop(),
-                {WorkItem::sourceSelect, WorkItem::rawBaseRebuild,
-                 WorkItem::analysisRun},
-                "high detail gained: the crop reloads its ROI");
+    expectOrder(cropGained.crop(), {},
+                "high detail gained without a crop reload request");
 
     /*
      * The other direction has both flags already computed, so no work is
@@ -466,7 +664,7 @@ void testSpotTransitions()
                 "live spot buffer restores without rebuilding the base");
 
     /*
-     * The crop restores by swapping baseCrop at dcrop.cc:1511, so the live
+     * The crop restores by swapping baseCrop at dcrop.cc:1600, so the live
      * buffer names the restore and not the destructive body.
      */
     const Derivation cropLive(StagePath::Crop, liveParams, liveParams,
@@ -520,17 +718,22 @@ void testRequestKinds()
                               RequestKind::FullCrop);
     expectOrder(fullCrop.crop(), cropRebuild, "FullCrop: the crop reload set");
 
+    /*
+     * M_HIGHQUAL asks for the accurate chain but is not part of the legacy
+     * raw reload gate (M_INIT | M_LINDENOISE | M_HDR). A HighQuality-only
+     * request therefore names no destructive raw body on either path.
+     */
     const Derivation highQualityPreview(StagePath::Preview, params, params,
                                         RenderStateKey{}, RenderStateKey{},
                                         RequestKind::HighQuality);
-    expectOrder(highQualityPreview.preview(), previewRebuild,
-                "HighQuality on preview: the destructive raw set");
+    expectOrder(highQualityPreview.preview(), {},
+                "HighQuality-only on preview: no raw rebuild");
 
     const Derivation highQualityCrop(StagePath::Crop, params, params,
                                      RenderStateKey{}, RenderStateKey{},
                                      RequestKind::HighQuality);
-    expectOrder(highQualityCrop.crop(), cropRebuild,
-                "HighQuality on crop: the crop reload set");
+    expectOrder(highQualityCrop.crop(), {},
+                "HighQuality-only on crop: no raw reload");
 
     /* A full preview request also forces the raw set on the other path. */
     const Derivation previewOnCropPath(StagePath::Crop, params, params,
@@ -604,6 +807,58 @@ void testNoHistory()
                 {WorkItem::sourceSelect, WorkItem::rawBaseRebuild,
                  WorkItem::analysisRun},
                 "first crop pass: every crop raw item");
+}
+
+/*
+ * A missing previous parameter set is allowed: the family comparisons answer
+ * "changed". The pdsharpening split must not mistake that for a
+ * pdsharpening-only edit and hide a sensor demosaic delta.
+ */
+void testMissingPreviousParams()
+{
+    const procparams::ProcParams previous;
+    procparams::ProcParams current = previous;
+    current.raw.bayersensor.method = "RCD";
+
+    Derivation preview(StagePath::Preview, previous, current, RenderStateKey{},
+                       RenderStateKey{}, RequestKind::ParamsOnly);
+    preview.inputs.previousParams = nullptr;
+    expectOrder(preview.preview(),
+                {WorkItem::rawDemosaic, WorkItem::rawBaseRebuild,
+                 WorkItem::analysisRun},
+                "missing previous params: demosaic delta stays named");
+}
+
+/*
+ * A null parameter set is a violated precondition. Debug builds assert (the
+ * contract in stage_work.h); release builds must still fail closed to the
+ * whole path-applicable set instead of deriving an empty order. This test
+ * exercises the release contract.
+ */
+void testNullParamsFailClosed()
+{
+#ifdef NDEBUG
+    const procparams::ProcParams params;
+
+    Derivation preview(StagePath::Preview, params, params, RenderStateKey{},
+                       RenderStateKey{}, RequestKind::ParamsOnly);
+    preview.inputs.params = nullptr;
+    expectOrder(preview.preview(),
+                {WorkItem::sourceSelect, WorkItem::rawPreprocess,
+                 WorkItem::rawDemosaic, WorkItem::rawBaseRebuild,
+                 WorkItem::retinexPrepare, WorkItem::spotApply,
+                 WorkItem::spotRestore, WorkItem::analysisRun},
+                "null params preview: every path-applicable item");
+
+    Derivation crop(StagePath::Crop, params, params, RenderStateKey{},
+                    RenderStateKey{}, RequestKind::ParamsOnly);
+    crop.inputs.params = nullptr;
+    expectOrder(crop.crop(),
+                {WorkItem::sourceSelect, WorkItem::rawBaseRebuild,
+                 WorkItem::spotApply, WorkItem::spotRestore,
+                 WorkItem::analysisRun, WorkItem::denoiseRun},
+                "null params crop: every path-applicable item");
+#endif
 }
 
 /*
@@ -703,12 +958,15 @@ int main()
     testBitset();
     testNoChange();
     testParameterChanges();
+    testEditFamiliesAgainstLegacyOracle();
     testSourceReload();
     testHighDetailTransitions();
     testSpotTransitions();
     testRequestKinds();
     testCropDenoise();
     testNoHistory();
+    testMissingPreviousParams();
+    testNullParamsFailClosed();
     testUnreadFacts();
     testCoverage();
 

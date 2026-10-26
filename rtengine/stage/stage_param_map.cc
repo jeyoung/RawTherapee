@@ -30,10 +30,12 @@
  * hashes the same members everywhere. The export table keeps twenty entries,
  * preview selects fourteen and crop fifteen.
  *
- * Whole ProcParams sub-structs are hashed field by field. The field lists below
- * were generated once from the declarations in procparams.h, the params
- * headers and coord.h, reviewed, and committed as ordinary code: when a member
- * is added to one of those sub-structs it must be added here too.
+ * Whole ProcParams sub-structs are hashed field by field. `raw` and `lensProf`
+ * are the exceptions: their parts feed different raw bodies, so the three raw
+ * consumer hashers add only the sub-fields the matching body reads. The field
+ * lists below were generated once from the declarations in procparams.h, the
+ * params headers and coord.h, reviewed, and committed as ordinary code: when a
+ * member is added to one of those sub-structs it must be added here too.
  * Missing a field would let a stale cache entry survive a parameter change, so
  * the ordering and completeness of each list matter.
  */
@@ -2054,29 +2056,164 @@ void addField(ParamHasher& hasher, const procparams::MetaDataParams& value)
  * Order inside a descriptor is fixed: the fingerprint format depends on it.
  */
 
-/* Select the frame and its raw decoder state; no image math runs here. */
-void hashSourceSelect(ParamHasher& hasher, const ProcParams& params)
+/*
+ * The three raw consumer groups.
+ *
+ * `RAWParams` is one ProcParams member but three blocks read disjoint parts of
+ * it. Hashing the whole member into each of them made every raw edit dirty
+ * every raw block, which is a superset of the legacy M_PREPROC/M_RAW gates: a
+ * demosaic-method edit named the preprocess body that the mask did not run.
+ * The helpers below hash only the sub-fields the matching body reads, so the
+ * block fingerprints follow the same parameter families as the gates.
+ *
+ * A member that genuinely feeds two bodies is listed in both groups and the
+ * overlap is documented at the field. The groups do not have to partition the
+ * struct: a field read only by getImage() stays in `raw.base`, which hashes the
+ * whole `raw` member.
+ */
+
+/* The raw frame the source selects; no image math runs here. */
+void addRawSourceSelectFields(ParamHasher& hasher,
+                              const procparams::RAWParams& raw)
 {
-    addField(hasher, params.raw);
+    /* setCurrentFrame(params->raw.bayersensor.imageNum) is the whole body. */
+    addField(hasher, raw.bayersensor.imageNum);
 }
 
 /*
- * imgsrc->preprocess() takes raw, lensProf, coarse and the denoise enable flag
- * (simpleprocess.cc:393). The whole dirpyrDenoise member is hashed because the
- * flag is read from it.
+ * The fields read by RawImageSource::preprocess() and its helpers
+ * (rawimagesource.cc: preprocess, copyOriginalPixels, scaleColors,
+ * processFlatField, CA_correct_RT).
+ *
+ * `raw.bayersensor.method` and `raw.xtranssensor.method` are deliberately
+ * absent: preprocess only compares the Bayer method with VNG4 to decide the
+ * global green-equilibration step, while the legacy M_PREPROC family does not
+ * carry `M_RAW`. A method edit is a demosaic edit; re-preprocessing on it would
+ * be a typed-only run. `coarse` is absent for the same reason: the preprocess
+ * call reads it for the lens vignetting map, but a coarse transform event is
+ * ALLNORAW and does not set M_PREPROC. `dirpyrDenoise` is absent because the
+ * preview passes `prepareDenoise = true`; the export path passes the enable
+ * flag but its fingerprints are not used for incremental scheduling.
+ */
+void addRawPreprocessFields(ParamHasher& hasher,
+                            const procparams::RAWParams& raw)
+{
+    addField(hasher, raw.bayersensor.black0);
+    addField(hasher, raw.bayersensor.black1);
+    addField(hasher, raw.bayersensor.black2);
+    addField(hasher, raw.bayersensor.black3);
+    addField(hasher, raw.bayersensor.twogreen);
+    addField(hasher, raw.bayersensor.Dehablack);
+    addField(hasher, raw.bayersensor.greenthresh);
+    addField(hasher, raw.bayersensor.linenoise);
+    addField(hasher, raw.bayersensor.linenoiseDirection);
+    addField(hasher, raw.bayersensor.pdafLinesFilter);
+    /* Shared with demosaic: CA correction and setBorder both read the border. */
+    addField(hasher, raw.bayersensor.border);
+
+    addField(hasher, raw.xtranssensor.blackred);
+    addField(hasher, raw.xtranssensor.blackgreen);
+    addField(hasher, raw.xtranssensor.blackblue);
+    addField(hasher, raw.xtranssensor.Dehablackx);
+
+    addField(hasher, raw.dark_frame);
+    addField(hasher, raw.df_autoselect);
+
+    addField(hasher, raw.ff_file);
+    addField(hasher, raw.ff_AutoSelect);
+    addField(hasher, raw.ff_FromMetaData);
+    addField(hasher, raw.ff_BlurRadius);
+    addField(hasher, raw.ff_BlurType);
+    addField(hasher, raw.ff_AutoClipControl);
+    addField(hasher, raw.ff_clipControl);
+
+    addField(hasher, raw.ca_autocorrect);
+    addField(hasher, raw.ca_avoidcolourshift);
+    addField(hasher, raw.caautoiterations);
+    addField(hasher, raw.cared);
+    addField(hasher, raw.cablue);
+
+    addField(hasher, raw.expos);
+    addField(hasher, raw.preprocessWB);
+    addField(hasher, raw.hotPixelFilter);
+    addField(hasher, raw.deadPixelFilter);
+    addField(hasher, raw.hotdeadpix_thresh);
+}
+
+/* Lens-profile fields preprocess reads for the vignetting correction. */
+void addLensProfPreprocessFields(ParamHasher& hasher,
+                                 const procparams::LensProfParams& lensProf)
+{
+    addField(hasher, lensProf.lcMode);
+    addField(hasher, lensProf.lcpFile);
+    addField(hasher, lensProf.useVign);
+    addField(hasher, lensProf.lfCameraMake);
+    addField(hasher, lensProf.lfCameraModel);
+    addField(hasher, lensProf.lfLens);
+}
+
+/*
+ * The fields read by RawImageSource::demosaic() plus capture sharpening.
+ *
+ * `raw.bayersensor.border` and `raw.expos` are shared with preprocess above;
+ * the demosaic body uses the border through setBorder() and the exposure for
+ * pixel-shift. `pdsharpening` is the whole member because the capture-sharpening
+ * body reads it as a unit.
+ */
+void addRawDemosaicFields(ParamHasher& hasher,
+                          const procparams::RAWParams& raw)
+{
+    addField(hasher, raw.bayersensor.method);
+    addField(hasher, raw.bayersensor.border);
+    addField(hasher, raw.bayersensor.dcb_iterations);
+    addField(hasher, raw.bayersensor.dcb_enhance);
+    addField(hasher, raw.bayersensor.lmmse_iterations);
+    addField(hasher, raw.bayersensor.dualDemosaicAutoContrast);
+    addField(hasher, raw.bayersensor.dualDemosaicContrast);
+    addField(hasher, raw.bayersensor.pixelShiftMotionCorrectionMethod);
+    addField(hasher, raw.bayersensor.pixelShiftEperIso);
+    addField(hasher, raw.bayersensor.pixelShiftSigma);
+    addField(hasher, raw.bayersensor.pixelShiftShowMotion);
+    addField(hasher, raw.bayersensor.pixelShiftShowMotionMaskOnly);
+    addField(hasher, raw.bayersensor.pixelShiftHoleFill);
+    addField(hasher, raw.bayersensor.pixelShiftMedian);
+    addField(hasher, raw.bayersensor.pixelShiftAverage);
+    addField(hasher, raw.bayersensor.pixelShiftGreen);
+    addField(hasher, raw.bayersensor.pixelShiftBlur);
+    addField(hasher, raw.bayersensor.pixelShiftSmoothFactor);
+    addField(hasher, raw.bayersensor.pixelShiftEqualBright);
+    addField(hasher, raw.bayersensor.pixelShiftEqualBrightChannel);
+    addField(hasher, raw.bayersensor.pixelShiftNonGreenCross);
+    addField(hasher, raw.bayersensor.pixelShiftDemosaicMethod);
+
+    addField(hasher, raw.xtranssensor.method);
+    addField(hasher, raw.xtranssensor.border);
+    addField(hasher, raw.xtranssensor.dualDemosaicAutoContrast);
+    addField(hasher, raw.xtranssensor.dualDemosaicContrast);
+
+    addField(hasher, raw.expos);
+}
+
+/* Select the frame; no image math runs here. */
+void hashSourceSelect(ParamHasher& hasher, const ProcParams& params)
+{
+    addRawSourceSelectFields(hasher, params.raw);
+}
+
+/*
+ * imgsrc->preprocess() reads the preprocess-only raw fields and the
+ * lens-profile vignetting fields (rawimagesource.cc:1466).
  */
 void hashRawPreprocess(ParamHasher& hasher, const ProcParams& params)
 {
-    addField(hasher, params.raw);
-    addField(hasher, params.lensProf);
-    addField(hasher, params.coarse);
-    addField(hasher, params.dirpyrDenoise);
+    addRawPreprocessFields(hasher, params.raw);
+    addLensProfPreprocessFields(hasher, params.lensProf);
 }
 
-/* Demosaic plus post-demosaic capture sharpening (simpleprocess.cc:399-405). */
+/* Demosaic plus post-demosaic capture sharpening (rawimagesource.cc:1827). */
 void hashRawDemosaic(ParamHasher& hasher, const ProcParams& params)
 {
-    addField(hasher, params.raw);
+    addRawDemosaicFields(hasher, params.raw);
     addField(hasher, params.pdsharpening);
 }
 
@@ -2339,11 +2476,53 @@ const std::vector<DescriptorDefinition>& definitions()
 {
     static const std::vector<DescriptorDefinition> catalogue = {
         // Export pipeline order.
-        {"source.select", {"raw"}, hashSourceSelect},
+        {"source.select", {"raw.bayersensor.imageNum"}, hashSourceSelect},
         {"raw.preprocess",
-         {"raw", "lensProf", "coarse", "dirpyrDenoise"},
+         {"raw.bayersensor.black0", "raw.bayersensor.black1",
+          "raw.bayersensor.black2", "raw.bayersensor.black3",
+          "raw.bayersensor.twogreen", "raw.bayersensor.Dehablack",
+          "raw.bayersensor.greenthresh", "raw.bayersensor.linenoise",
+          "raw.bayersensor.linenoiseDirection",
+          "raw.bayersensor.pdafLinesFilter", "raw.bayersensor.border",
+          "raw.xtranssensor.blackred", "raw.xtranssensor.blackgreen",
+          "raw.xtranssensor.blackblue", "raw.xtranssensor.Dehablackx",
+          "raw.dark_frame", "raw.df_autoselect", "raw.ff_file",
+          "raw.ff_AutoSelect", "raw.ff_FromMetaData",
+          "raw.ff_BlurRadius", "raw.ff_BlurType",
+          "raw.ff_AutoClipControl", "raw.ff_clipControl",
+          "raw.ca_autocorrect", "raw.ca_avoidcolourshift",
+          "raw.caautoiterations", "raw.cared", "raw.cablue", "raw.expos",
+          "raw.preprocessWB", "raw.hotPixelFilter", "raw.deadPixelFilter",
+          "raw.hotdeadpix_thresh", "lensProf.lcMode", "lensProf.lcpFile",
+          "lensProf.useVign", "lensProf.lfCameraMake",
+          "lensProf.lfCameraModel", "lensProf.lfLens"},
          hashRawPreprocess},
-        {"raw.demosaic", {"raw", "pdsharpening"}, hashRawDemosaic},
+        {"raw.demosaic",
+         {"raw.bayersensor.method", "raw.bayersensor.border",
+          "raw.bayersensor.dcb_iterations", "raw.bayersensor.dcb_enhance",
+          "raw.bayersensor.lmmse_iterations",
+          "raw.bayersensor.dualDemosaicAutoContrast",
+          "raw.bayersensor.dualDemosaicContrast",
+          "raw.bayersensor.pixelShiftMotionCorrectionMethod",
+          "raw.bayersensor.pixelShiftEperIso",
+          "raw.bayersensor.pixelShiftSigma",
+          "raw.bayersensor.pixelShiftShowMotion",
+          "raw.bayersensor.pixelShiftShowMotionMaskOnly",
+          "raw.bayersensor.pixelShiftHoleFill",
+          "raw.bayersensor.pixelShiftMedian",
+          "raw.bayersensor.pixelShiftAverage",
+          "raw.bayersensor.pixelShiftGreen",
+          "raw.bayersensor.pixelShiftBlur",
+          "raw.bayersensor.pixelShiftSmoothFactor",
+          "raw.bayersensor.pixelShiftEqualBright",
+          "raw.bayersensor.pixelShiftEqualBrightChannel",
+          "raw.bayersensor.pixelShiftNonGreenCross",
+          "raw.bayersensor.pixelShiftDemosaicMethod",
+          "raw.xtranssensor.method", "raw.xtranssensor.border",
+          "raw.xtranssensor.dualDemosaicAutoContrast",
+          "raw.xtranssensor.dualDemosaicContrast", "raw.expos",
+          "pdsharpening"},
+         hashRawDemosaic},
         {"raw.base",
          {"raw", "wb", "toneCurve", "spot", "dirpyrDenoise", "filmNegative",
           "retinex", "dehaze", "fattal", "cg", "icm"},
