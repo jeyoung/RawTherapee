@@ -547,6 +547,43 @@ WorkOrder derive_preview_work(const WorkInputs& inputs)
     const bool preprocess = preprocessBlockChanged || source || hdPrePending;
 
     /*
+     * The raw.base families that are also read by the demosaic body and the
+     * retinex preparation. Computed once: `wbChanged` feeds both the base and
+     * the Color/Coloropp augmentation, `icmChanged` feeds the base and the
+     * retinex preparation (the working profile is a real input there).
+     */
+    const bool wbChanged = paramFamilyChanged(inputs, &ProcParams::wb);
+    const bool icmChanged = baseIcmChanged(inputs);
+
+    /*
+     * The caller's Color/Coloropp white-balance augmentation is a mask fact:
+     * `M_WB` plus the recovery method, folded by the caller before the pass
+     * (improccoordinator.cc:4610-4618). getImage() applies the opposed
+     * recovery with the current white-balance multipliers and marks the planes
+     * recovered, so that request needs fresh demosaic planes. The `wb` family
+     * delta alone is not enough: the same delta can arrive in a pass whose mask
+     * does not carry M_WB (a caller re-sending a value the previous pass
+     * normalised), and naming the body then would be a typed-only run.
+     */
+    const bool hlrWbDemosaic = inputs.colorHlrWbRequest
+        && params.toneCurve.hrenabled
+        && params.toneCurve.method == "Coloropp";
+
+    /*
+     * A recovery method, blend or threshold delta can only take effect on
+     * fresh planes once getImage() has marked the current planes recovered
+     * (`rgbSourceModified`). When the planes carry no recovery output yet,
+     * getImage() applies the new setting to them and a fresh demosaic would
+     * change nothing, so that case stays legacy-only redundant work.
+     */
+    const bool hlrConfigChanged = history && inputs.previousParams != nullptr
+        && current.rgbSourceModified && params.toneCurve.hrenabled
+        && isColourHlrMethod(params)
+        && (inputs.previousParams->toneCurve.method != params.toneCurve.method
+            || inputs.previousParams->toneCurve.hlbl != params.toneCurve.hlbl
+            || inputs.previousParams->toneCurve.hlth != params.toneCurve.hlth);
+
+    /*
      * rawSourceWorkRuns(): the sensor demosaic fields, capture sharpening, a
      * pending high-detail demosaic, the colour highlight-recovery condition of
      * a modified RGB source, and the forward edges from a selected frame or a
@@ -556,13 +593,10 @@ WorkOrder derive_preview_work(const WorkInputs& inputs)
      * Capture sharpening is ANDed with the enable flag by the legacy gate, so
      * a disabled-tool parameter edit does not name the body. `pdSharpeningChanged`
      * separates that family from the sensor fields: when only it moved and the
-     * tool is off, rawSourceWorkRuns() is false.
-     */
-    /*
-     * Only claim a pdsharpening-only delta when the previous parameter set is
-     * actually available. Without it the family comparison is conservatively
-     * true, which would otherwise hide a sensor demosaic delta carried by the
-     * same block fingerprint.
+     * tool is off, rawSourceWorkRuns() is false. Only claim a pdsharpening-only
+     * delta when the previous parameter set is actually available: without it
+     * the family comparison is conservatively true, which would otherwise hide
+     * a sensor demosaic delta carried by the same block fingerprint.
      */
     const bool pdSharpeningChanged = history && inputs.previousParams != nullptr
         && paramFamilyChanged(inputs, &ProcParams::pdsharpening);
@@ -571,7 +605,8 @@ WorkOrder derive_preview_work(const WorkInputs& inputs)
     const bool captureSharpening =
         pdSharpeningChanged && params.pdsharpening.enabled;
     const bool demosaic = sensorDemosaicChanged || captureSharpening || source
-        || preprocessBlockChanged || hdRawPending || hlr;
+        || preprocessBlockChanged || hdRawPending || hlr || hlrWbDemosaic
+        || hlrConfigChanged;
 
     /*
      * baseRebuildRuns(): the raw.base families that actually rebuild, plus the
@@ -583,14 +618,13 @@ WorkOrder derive_preview_work(const WorkInputs& inputs)
      * legacy base gate includes M_LINDENOISE. A HighQuality-only request is not
      * a rebuild: `rawReload` excludes it.
      */
-    const bool base = preprocess || demosaic
-        || paramFamilyChanged(inputs, &ProcParams::wb)
+    const bool base = preprocess || demosaic || wbChanged
         || paramFamilyChanged(inputs, &ProcParams::toneCurve)
         || paramFamilyChanged(inputs, &ProcParams::dirpyrDenoise)
         || paramFamilyChanged(inputs, &ProcParams::filmNegative)
         || paramFamilyChanged(inputs, &ProcParams::retinex)
         || paramFamilyChanged(inputs, &ProcParams::cg)
-        || baseIcmChanged(inputs)
+        || icmChanged
         || rawReload;
 
     /*
@@ -621,13 +655,16 @@ WorkOrder derive_preview_work(const WorkInputs& inputs)
 
     /*
      * Retinex rewrites the shared raw planes before getImage(). It is named
-     * when its own parameters move or when a step that regenerates those
-     * planes runs. A white-balance-only M_INIT does not regenerate the planes,
-     * so the legacy gate over-approximates there.
+     * when its own parameters move, when a step that regenerates those planes
+     * runs, or when the working profile moves: the preparation converts the
+     * planes with the working-space matrix and back, so a working-profile delta
+     * is a real input even with unchanged planes. A white-balance-only M_INIT
+     * regenerates neither and is not read by the preparation, so it stays
+     * legacy-only redundant work.
      */
     if (retinexEnabled
         && (paramFamilyChanged(inputs, &ProcParams::retinex) || preprocess
-            || demosaic)) {
+            || demosaic || icmChanged)) {
         order.set(WorkItem::retinexPrepare);
     }
 

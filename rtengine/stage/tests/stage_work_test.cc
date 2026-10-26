@@ -100,6 +100,17 @@ WorkOrder legacyPreviewRawOrder(const procparams::ProcParams& params, int mask)
 {
     WorkOrder order;
 
+    /*
+     * The caller folds a white-balance edit on the Color/Coloropp path into
+     * DEMOSAIC before the pass runs (improccoordinator.cc:4610-4618). The
+     * oracle must model that augmentation, or the demosaic the typed order
+     * names for the opposed recovery would look like a typed-only run.
+     */
+    if ((mask & M_WB) != 0 && params.toneCurve.hrenabled
+        && params.toneCurve.method == "Coloropp") {
+        mask |= DEMOSAIC;
+    }
+
     const bool preprocess = (mask & M_PREPROC) != 0;
     const bool demosaic = (mask & M_RAW) != 0
         || ((mask & M_CSHARP) != 0 && params.pdsharpening.enabled);
@@ -253,6 +264,32 @@ void testBitset()
     check(static_cast<int>(WorkItem::sourceSelect) == 0
               && static_cast<int>(WorkItem::Count) == 9,
           "bitset: the item order is part of the log contract");
+}
+
+/*
+ * The conversion switch. With the order disabled the legacy gate is
+ * authoritative and a typed item cannot start a body the legacy gate skips;
+ * with it enabled the typed item is authoritative, including suppressing a
+ * body the legacy gate would run. The default is off (workOrderEnabled() is
+ * false unless RT_WORK_ORDER is set).
+ */
+void testWorkOrderSwitch()
+{
+    WorkOrder order;
+    order.set(WorkItem::rawDemosaic);
+
+    check(workItemRuns(false, order, WorkItem::rawDemosaic, true),
+          "switch off: the legacy run still runs");
+    check(!workItemRuns(false, WorkOrder{}, WorkItem::rawDemosaic, false),
+          "switch off: a legacy skip still skips");
+    check(workItemRuns(true, order, WorkItem::rawDemosaic, false),
+          "switch on: a typed item runs a body the legacy gate skips");
+    check(!workItemRuns(true, order, WorkItem::rawBaseRebuild, true),
+          "switch on: an unset typed item suppresses the legacy answer");
+
+    const bool envEnabled = std::getenv("RT_WORK_ORDER") != nullptr;
+    check(workOrderEnabled() == envEnabled,
+          "switch: RT_WORK_ORDER set enables, unset disables");
 }
 
 void testNoChange()
@@ -550,9 +587,10 @@ void testSourceReload()
 
     /*
      * A white-balance change on the Coloropp path demosaics in the legacy
-     * sequence through the caller's DEMOSAIC augmentation. That augmentation
-     * is a mask fact, not a parameter delta, so the typed order does not copy
-     * it; the shadow reports it as a legacy-only run instead.
+     * sequence through the caller's DEMOSAIC augmentation. The typed order
+     * names the same body: getImage() applies the opposed recovery with the
+     * current white-balance multipliers, so only fresh demosaic planes let the
+     * new multipliers take effect. This is pixel-affecting, not a saving.
      */
     procparams::ProcParams coloropp;
     coloropp.toneCurve.hrenabled = true;
@@ -560,12 +598,152 @@ void testSourceReload()
     procparams::ProcParams coloroppWb = coloropp;
     coloroppWb.wb.temperature += 500;
 
-    const Derivation wbHlr(StagePath::Preview, coloropp, coloroppWb,
-                           previousState, previousState,
-                           RequestKind::ParamsOnly);
+    Derivation wbHlr(StagePath::Preview, coloropp, coloroppWb,
+                     previousState, previousState,
+                     RequestKind::ParamsOnly);
+    wbHlr.inputs.colorHlrWbRequest = true;
     expectOrder(wbHlr.preview(),
+                {WorkItem::rawDemosaic, WorkItem::rawBaseRebuild,
+                 WorkItem::analysisRun},
+                "white balance on the Coloropp path demosaics for the recovery");
+}
+
+/*
+ * The two predicates the conversion added, and the legacy-only remainders they
+ * leave. A white-balance edit on the Coloropp recovery path and a recovery
+ * configuration edit on recovered planes are pixel-affecting and named. A
+ * working-profile edit is an input of the retinex preparation and named there,
+ * but not of the demosaic body; a white-balance-only M_INIT is not an input of
+ * the preparation. Those two stay legacy-only redundant work.
+ */
+void testRecoveryAndWorkingProfile()
+{
+    using procparams::ProcParams;
+
+    /* Coloropp recovery plus a white-balance request needs fresh planes. */
+    ProcParams coloropp;
+    coloropp.toneCurve.hrenabled = true;
+    coloropp.toneCurve.method = "Coloropp";
+    ProcParams coloroppWb = coloropp;
+    coloroppWb.wb.temperature += 500;
+
+    Derivation wb(StagePath::Preview, coloropp, coloroppWb,
+                  RenderStateKey{}, RenderStateKey{},
+                  RequestKind::ParamsOnly);
+    wb.inputs.colorHlrWbRequest = true;
+    expectOrder(wb.preview(),
+                {WorkItem::rawDemosaic, WorkItem::rawBaseRebuild,
+                 WorkItem::analysisRun},
+                "Coloropp white balance demosaics for the opposed recovery");
+    expectNoTypedOnly(wb.preview(), legacyPreviewRawOrder(coloroppWb, WB),
+                      "Coloropp white balance against the augmented legacy mask");
+
+    /*
+     * The same parameter delta in a pass whose mask does not carry the
+     * request bit does not demosaic: the legacy augmentation does not run
+     * either, and getImage() would apply the recovery to the current planes.
+     */
+    const Derivation bareWb(StagePath::Preview, coloropp, coloroppWb,
+                            RenderStateKey{}, RenderStateKey{},
+                            RequestKind::ParamsOnly);
+    expectOrder(bareWb.preview(),
                 {WorkItem::rawBaseRebuild, WorkItem::analysisRun},
-                "white balance on the Coloropp path rebuilds the base only");
+                "a bare white-balance delta does not demosaic");
+    expectNoTypedOnly(bareWb.preview(),
+                      legacyPreviewRawOrder(coloroppWb, ALLNORAW),
+                      "a bare white-balance delta against the legacy mask");
+
+    /* The same edit with recovery disabled does not touch the planes. */
+    ProcParams plainWb;
+    plainWb.wb.temperature += 500;
+    const Derivation plain(StagePath::Preview, ProcParams{}, plainWb,
+                           RenderStateKey{}, RenderStateKey{},
+                           RequestKind::ParamsOnly);
+    expectOrder(plain.preview(),
+                {WorkItem::rawBaseRebuild, WorkItem::analysisRun},
+                "white balance without recovery rebuilds the base only");
+
+    /*
+     * A recovery configuration change is only able to take effect on fresh
+     * planes once the current planes carry recovery output.
+     */
+    RenderStateKey recovered;
+    recovered.rgbSourceModified = true;
+    ProcParams color;
+    color.toneCurve.hrenabled = true;
+    color.toneCurve.method = "Color";
+    ProcParams coloroppMethod = color;
+    coloroppMethod.toneCurve.method = "Coloropp";
+
+    const Derivation config(StagePath::Preview, color, coloroppMethod,
+                            recovered, recovered, RequestKind::ParamsOnly);
+    expectOrder(config.preview(),
+                {WorkItem::rawDemosaic, WorkItem::rawBaseRebuild,
+                 WorkItem::analysisRun},
+                "recovery method change on recovered planes demosaics");
+    expectNoTypedOnly(config.preview(),
+                      legacyPreviewRawOrder(coloroppMethod, DEMOSAIC),
+                      "recovery method change against the legacy mask");
+
+    /*
+     * Without recovery output the demosaic body is redundant: getImage()
+     * applies the new setting to the current planes.
+     */
+    const Derivation idle(StagePath::Preview, color, coloroppMethod,
+                          RenderStateKey{}, RenderStateKey{},
+                          RequestKind::ParamsOnly);
+    expectOrder(idle.preview(),
+                {WorkItem::rawBaseRebuild, WorkItem::analysisRun},
+                "recovery method change on plain planes rebuilds the base only");
+    expectNoTypedOnly(idle.preview(),
+                      legacyPreviewRawOrder(coloroppMethod, DEMOSAIC),
+                      "plain-plane recovery change against the legacy mask");
+
+    /*
+     * The working profile is an input of the retinex preparation, which
+     * converts the planes with the working-space matrix and back.
+     */
+    ProcParams retinex;
+    retinex.retinex.enabled = true;
+    ProcParams retinexProfile = retinex;
+    retinexProfile.icm.workingProfile = "ProPhoto";
+
+    const Derivation profile(StagePath::Preview, retinex, retinexProfile,
+                             RenderStateKey{}, RenderStateKey{},
+                             RequestKind::ParamsOnly);
+    expectOrder(profile.preview(),
+                {WorkItem::rawBaseRebuild, WorkItem::retinexPrepare,
+                 WorkItem::analysisRun},
+                "working profile reprepares the retinex buffers");
+    expectNoTypedOnly(profile.preview(),
+                      legacyPreviewRawOrder(retinexProfile, DEMOSAIC),
+                      "working profile against the legacy mask");
+
+    /* Without retinex the working profile names no preparation. */
+    ProcParams plainProfile;
+    plainProfile.icm.workingProfile = "ProPhoto";
+    const Derivation noRetinex(StagePath::Preview, ProcParams{}, plainProfile,
+                               RenderStateKey{}, RenderStateKey{},
+                               RequestKind::ParamsOnly);
+    expectOrder(noRetinex.preview(),
+                {WorkItem::rawBaseRebuild, WorkItem::analysisRun},
+                "working profile without retinex rebuilds the base only");
+
+    /*
+     * A white-balance-only M_INIT does not move the planes or read the white
+     * balance in the preparation, so the legacy-only preparation is redundant.
+     */
+    ProcParams retinexWb = retinex;
+    retinexWb.wb.temperature += 500;
+    const Derivation wbRetinex(StagePath::Preview, retinex, retinexWb,
+                               RenderStateKey{}, RenderStateKey{},
+                               RequestKind::ParamsOnly);
+    expectOrder(wbRetinex.preview(),
+                {WorkItem::rawBaseRebuild, WorkItem::analysisRun},
+                "white balance does not reprepare the retinex buffers");
+    expectNoTypedOnly(wbRetinex.preview(),
+                      legacyPreviewRawOrder(retinexWb, WB),
+                      "white balance with retinex against the legacy mask");
 }
 
 void testHighDetailTransitions()
@@ -956,10 +1134,12 @@ void testCoverage()
 int main()
 {
     testBitset();
+    testWorkOrderSwitch();
     testNoChange();
     testParameterChanges();
     testEditFamiliesAgainstLegacyOracle();
     testSourceReload();
+    testRecoveryAndWorkingProfile();
     testHighDetailTransitions();
     testSpotTransitions();
     testRequestKinds();

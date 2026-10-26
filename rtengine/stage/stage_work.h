@@ -38,10 +38,11 @@ namespace rtengine::stage
 /*
  * Typed work order for the destructive raw and core jobs.
  *
- * The preview and the crop still decide which body jobs run from the legacy
- * `M_*` mask. Before those gates can be retired, each destructive job needs a
- * name and an exact membership predicate that is derived from the same inputs
- * the gate uses, not from the mask. This unit is that order.
+ * The preview raw-chain gates can run from this order behind RT_WORK_ORDER; the
+ * crop still decides which body jobs run from the legacy `M_*` mask. Before
+ * those gates can be retired, each destructive job needs a name and an exact
+ * membership predicate that is derived from the same inputs the gate uses, not
+ * from the mask. This unit is that order.
  *
  * The scope is deliberately the destructive raw/core jobs only: the jobs that
  * regenerate pixels, rebuild the raw base or write the spot buffer. The
@@ -49,14 +50,15 @@ namespace rtengine::stage
  * of stage_dirty_blocks.h in this step; adding them here would mix a
  * pixel-invalidation order with an execution-set order.
  *
- * The derivation reads exactly eight inputs (WorkInputs): the previous and
+ * The derivation reads exactly nine inputs (WorkInputs): the previous and
  * current RenderStateKey, the previous and current BlockFingerprints, the
- * previous and current ProcParams, the RequestKind and the StagePath. It never
- * reads the mask, a coordinator, a crop or a pipeline object. The mask still
- * reaches the prediction indirectly because the caller folds its request bits
- * into RequestKind and into the request facts of the key before it derives;
- * that folding happens at the call boundary and is documented for each item
- * below.
+ * previous and current ProcParams, the RequestKind, the StagePath and the
+ * Color/Coloropp white-balance request fact. It never reads the mask, a
+ * coordinator, a crop or a pipeline object. The mask still reaches the
+ * prediction indirectly because the caller folds its request bits into
+ * RequestKind, into the request facts of the key and into the white-balance
+ * request fact before it derives; that folding happens at the call boundary
+ * and is documented for each item below.
  *
  * Exactness contract:
  *
@@ -82,9 +84,10 @@ namespace rtengine::stage
  *   therefore omits it and the demosaic consumer owns it. That is a bounded
  *   subset of the body's ideal inputs, chosen to match the gate the order
  *   describes, not a typed-only superset.
- * - The order is not executed anywhere in this step. It is a specification
- *   that a later step consumes, so an error here must be visible in the
- *   predicate table rather than in an image.
+ * - The order drives the preview raw-chain gates only when RT_WORK_ORDER is
+ *   set; see workOrderEnabled(). The crop gates and every downstream preview
+ *   node keep their legacy gates, so an error here is visible in the
+ *   predicate table and in the shadow comparison rather than in an image.
  *
  * The order is a subset of the legacy gates, never a superset: a fact that
  * the legacy gate does not consult must not name an item, or the shadow
@@ -195,6 +198,46 @@ inline bool workShadowEnabled()
 }
 
 /*
+ * Whether the typed order drives the preview raw-chain gates.
+ *
+ * `RT_WORK_ORDER` is read once per process with the same rule as
+ * RT_WORK_SHADOW: any value enables it, and unset disables it. The default is
+ * off, so the legacy `M_*` gates stay authoritative and the added cost is one
+ * branch per gate site.
+ *
+ * When set, each converted site runs its body from the typed item instead of
+ * the legacy gate. The plan, the crop, the dirty-block derivation and every
+ * downstream node gate are unchanged, and the shadow comparison stays active,
+ * so the two answers can still be compared pass by pass.
+ *
+ * This switch is the kill switch for the conversion, not a preference: there
+ * is no user-facing setting because the typed order is still validated against
+ * the legacy gates and every legacy-only remainder is either named by the
+ * order or documented as redundant work at its item. Do not flip the default
+ * before a full preview-parity run with the switch on has confirmed those
+ * remainders.
+ */
+inline bool workOrderEnabled()
+{
+    static const bool enabled = std::getenv("RT_WORK_ORDER") != nullptr;
+    return enabled;
+}
+
+/*
+ * Answer of one gate site.
+ *
+ * When the switch is off the legacy gate is authoritative, exactly as before
+ * the conversion. When it is on the typed item is authoritative. The caller
+ * still computes and probes the legacy answer in both modes; this function
+ * only picks which answer enters the body.
+ */
+inline bool workItemRuns(bool orderEnabled, const WorkOrder& order,
+                         WorkItem item, bool legacyRuns)
+{
+    return orderEnabled ? order.has(item) : legacyRuns;
+}
+
+/*
  * Accumulator for one pass.
  *
  * A gate site reports the legacy answer for one item; repeated sites for the
@@ -289,6 +332,15 @@ struct WorkInputs {
     StagePath path = StagePath::Preview;
     /* Current parameters; required, borrowed. */
     const procparams::ProcParams* params = nullptr;
+    /*
+     * The pass mask carries the `M_WB` request bit. This is a request fact of
+     * the same kind as RequestKind: the caller folds it at the boundary
+     * because the mask is never an input. It exists for the caller's
+     * Color/Coloropp white-balance augmentation, which sets `DEMOSAIC` before
+     * the pass; a `wb` parameter delta alone cannot express it, because the
+     * same delta can arrive without the request bit.
+     */
+    bool colorHlrWbRequest = false;
 };
 
 /*
@@ -313,19 +365,40 @@ struct WorkInputs {
  *   the `raw.preprocess` and `source.select` blocks (the `M_PREPROC` row of
  *   stage_mask_map.cc:87) and by the Source and HighDetail aspects. A rebuild
  *   request is deliberately not a disjunct: `M_INIT` and `M_LINDENOISE`
- *   rebuild the base without selecting or preprocessing the source.
+ *   rebuild the base without selecting or preprocessing the source. Legacy-only
+ *   remainder: a mask event that carries `M_PREPROC` but moves neither the
+ *   frame number nor a source fact (for example the DARKFRAME-tagged Clamp OOG
+ *   toggle, rtgui/tools/tonecurve.cc:44) calls `setCurrentFrame()` with the
+ *   frame already loaded; that method marks the source only when the frame
+ *   actually changes (rawimagesource.h), so the call is redundant work.
  * - rawPreprocess: `preprocessChanged || source || hdPre`. Replaces the
- *   `rawWorkRuns()` call at :1546. Same blocks and aspects.
+ *   `rawWorkRuns()` call at :1546. Same blocks and aspects. The same
+ *   over-approximating event re-runs preprocess with identical raw and
+ *   lens-profile inputs, so the planes it produces are unchanged; that
+ *   remainder is redundant work, and the base rebuild the edit needs is named
+ *   separately.
  * - rawDemosaic: `sensorDemosaicChanged || captureSharpening || source ||
- *   preprocessChanged || hdRaw || hlr`. Replaces `rawSourceWorkRuns()` at
- *   improccoordinator.cc:1363, called at :1599. Fed by the `raw.demosaic`
- *   block (`M_RAW` and `M_CSHARP` rows, stage_mask_map.cc:89-92), the forward
- *   edges from the selected frame and the preprocessed planes (every
- *   DARKFRAME/FLATFIELD event also sets M_RAW), the HighDetail aspect, and the
- *   parameter/`rgbSourceModified` pair of the colour highlight-recovery
- *   condition. Capture sharpening is inside the same body and is ANDed with
- *   `pdsharpening.enabled`, exactly as the gate is. A rebuild request is not a
- *   disjunct for the same reason as sourceSelect.
+ *   preprocessChanged || hdRaw || hlr || hlrWbDemosaic || hlrConfigChanged`.
+ *   Replaces `rawSourceWorkRuns()` at improccoordinator.cc:1363, called at
+ *   :1599. Fed by the `raw.demosaic` block (`M_RAW` and `M_CSHARP` rows,
+ *   stage_mask_map.cc:89-92), the forward edges from the selected frame and the
+ *   preprocessed planes (every DARKFRAME/FLATFIELD event also sets M_RAW), the
+ *   HighDetail aspect, and the parameter/`rgbSourceModified` pair of the colour
+ *   highlight-recovery condition. Capture sharpening is inside the same body
+ *   and is ANDed with `pdsharpening.enabled`, exactly as the gate is. A rebuild
+ *   request is not a disjunct for the same reason as sourceSelect.
+ *   `hlrWbDemosaic` mirrors the caller's Color/Coloropp white-balance
+ *   augmentation (the `M_WB` request fact, recovery enabled and method
+ *   `Coloropp`): getImage() applies the opposed recovery with the current
+ *   white-balance multipliers and marks the planes recovered, so only fresh
+ *   demosaic planes let the new multipliers take effect. It is pixel-affecting
+ *   and therefore named; the request fact is carried by WorkInputs because a
+ *   bare `wb` delta cannot tell the request from a re-sent value.
+ *   `hlrConfigChanged` names a recovery method, blend or threshold
+ *   delta while the planes already carry recovery output
+ *   (`rgbSourceModified`), because the new setting can only be applied to
+ *   fresh planes. An event that moves none of the body's inputs leaves the
+ *   demosaic legacy-only redundant work; see the remaining cases below.
  * - rawBaseRebuild: `preprocess || demosaic || family(wb) ||
  *   family(toneCurve) || family(dirpyrDenoise) || family(filmNegative) ||
  *   family(retinex) || family(cg) || family(icm-without-output) ||
@@ -342,11 +415,17 @@ struct WorkInputs {
  *   theoretical one. `spotBufferLive` is not a disjunct either: a live buffer
  *   forces the restore, not the destructive body.
  * - retinexPrepare: `params.retinex.enabled && (family(retinex) ||
- *   preprocess || demosaic)`. Replaces the gate at improccoordinator.cc:1719
- *   (`M_RETINEX | M_INIT` plus the enabled check). Retinex rewrites the shared
- *   raw planes, so it is named when its own parameters move or when a step
- *   that regenerates those planes runs. A white-balance-only `M_INIT` does not
- *   regenerate the planes and is left to the legacy-only class.
+ *   preprocess || demosaic || icm-without-output)`. Replaces the gate at
+ *   improccoordinator.cc:1719 (`M_RETINEX | M_INIT` plus the enabled check).
+ *   Retinex rewrites the shared raw planes, so it is named when its own
+ *   parameters move or when a step that regenerates those planes runs. The
+ *   working profile is a real input of the preparation: the buffers are
+ *   converted with `workingSpaceMatrix(cmp.workingProfile)` and back with its
+ *   inverse (rawimagesource.cc: retinexPrepareBuffers/retinex), so
+ *   `icm-without-output` names it even when the planes did not move.
+ *   A white-balance-only `M_INIT` does not regenerate the planes and the
+ *   preparation does not read the white balance (getImage() applies the
+ *   multipliers afterwards), so that remainder is redundant work.
  * - spotApply: `spotPending || (spotsConfigured && family(spot))`. Replaces
  *   the gates at improccoordinator.cc:2088 and :2188/:2191. `spotPending` is
  *   the request fact carried by the key; the family delta is the parameter
@@ -369,12 +448,33 @@ struct WorkInputs {
  *   schedule, so this is exact, not a disabled approximation.
  *
  * Remaining typed supersets: none for the edit families the tests and GUI
- * evidence drive. The deliberate legacy-only cases are a white-balance
- * `M_INIT` for retinex preparation (it does not regenerate the raw planes), a
- * working-profile `DEMOSAIC` event for the demosaic body (the base needs the
- * rebuild, the demosaic body does not), and the caller's Color/Coloropp
- * `DEMOSAIC` augmentation for a white-balance edit (a mask fact the typed
- * order cannot see). They are measured as legacyOnly, never as typedOnly.
+ * evidence drive. The deliberate legacy-only cases are:
+ * - A white-balance `M_INIT` for retinex preparation. The preparation reads
+ *   the raw planes, the retinex parameters and the working profile, none of
+ *   which a white-balance edit moves; getImage() applies the multipliers
+ *   later. The job is redundant, not skipped (see retinexPrepare above).
+ * - A working-profile `DEMOSAIC` event for the demosaic body. The demosaic
+ *   reads `RAWParams` and `pdsharpening`, not `icm`, so the fresh planes are
+ *   identical; the base rebuild the edit needs is named separately by
+ *   rawBaseRebuild, and the pass-level `M_RAW` reason has already invalidated
+ *   the base cache before any body runs.
+ * - A recovery method, blend or threshold event while the planes carry no
+ *   recovery output (`rgbSourceModified` false): getImage() applies the new
+ *   setting to the current planes, so a fresh demosaic changes nothing.
+ * - A `DEMOSAIC` or DARKFRAME mask event that moves none of the source,
+ *   preprocess or demosaic inputs (for example a profile save that re-sends an
+ *   already-enabled capture-sharpening flag, or the DARKFRAME-tagged Clamp OOG
+ *   toggle): `setCurrentFrame()` sees the frame already loaded, preprocess
+ *   reproduces the same planes, and demosaic and capture sharpening are
+ *   idempotent under the same white balance. The base rebuild and analysis the
+ *   event asks for are named separately. The per-item argument is in the
+ *   sourceSelect, rawPreprocess and rawDemosaic bullets above.
+ *
+ * Each is measured as legacyOnly, never as typedOnly, and each is redundant
+ * work rather than a pixel-affecting job. The caller's Color/Coloropp
+ * `DEMOSAIC` augmentation for a white-balance edit was in this class before
+ * the conversion; it is pixel-affecting, so `hlrWbDemosaic` now names it
+ * instead.
  *
  * Facts that no preview item reads, and why:
  *
