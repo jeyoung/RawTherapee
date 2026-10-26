@@ -168,13 +168,17 @@ protected:
     bool previewDirtyStateValid = false;
 
     /*
-     * Parameters of the last completed full-frame pass, for the read-only
-     * work-order shadow comparison. The copy is taken after the pass, because
-     * the stage bodies normalise white balance and write automatic denoise
-     * strengths back into the live parameters; those corrections are consumed
-     * by the pass and must not read as a new delta. Only maintained while
-     * RT_WORK_SHADOW is set.
+     * History of the last completed full-frame pass for the read-only
+     * work-order shadow comparison. Both halves are snapshotted after the
+     * crop render, because the crop analysis writes automatic denoise
+     * strengths back into the live parameters (and the preview bodies write
+     * white balance, while the GUI listeners write automatic black, contrast
+     * and radius). Those corrections are consumed by the pass and must not
+     * read as a new delta. Taking the fingerprint before the pass and the
+     * parameters after it mixed two vintages and produced a false typed-only
+     * run. Only maintained while RT_WORK_SHADOW is set.
      */
+    stage::ParamSnapshot previewWorkFingerprints;
     procparams::ProcParams previewDirtyParams;
     bool previewDirtyParamsValid = false;
 
@@ -395,6 +399,7 @@ protected:
     }
 
     void recordPreviewDirtyState(const PreviewPassState& pass);
+    void recordPreviewWorkHistory();
     void invalidatePreviewDirtyState();
 
     MyMutex mProcessing;

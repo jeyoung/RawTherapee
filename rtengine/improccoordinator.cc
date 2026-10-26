@@ -1495,9 +1495,11 @@ struct ImProcCoordinator::PreviewPassState {
     /*
      * Dirty-block derivation for this pass. `fingerprints` is the parameter
      * snapshot taken before any node runs, because the pass normalises the
-     * live ProcParams; it becomes the snapshot of the next pass once the pass
-     * completes. `renderState` is the state the pass is about to run with and
-     * is rebuilt after the pass to record the work it completed.
+     * live ProcParams and the graph must compare this input with the previous
+     * completed pass. `renderState` is the state the pass is about to run
+     * with and is rebuilt after the pass to record the work it completed. The
+     * work-order shadow keeps its own post-crop history; see
+     * recordPreviewWorkHistory().
      */
     stage::ParamSnapshot fingerprints;
     stage::RenderStateKey renderState;
@@ -4249,10 +4251,12 @@ stage::DirtyBlocks ImProcCoordinator::previewDirtyBlocks(
 /*
  * Record the input of the pass that just completed.
  *
- * The parameter snapshot is the one taken before the nodes ran; the render
- * state is rebuilt now so the high-detail fields describe the work the pass
- * finished. A pass that did not take the full-frame path must not call this:
- * its buffers still belong to the previous snapshot.
+ * The graph's dirty history keeps the pre-pass fingerprint, because the pass
+ * normalises the live ProcParams and the comparison for the next pass must be
+ * against the parameters the graph consumed. The render state is rebuilt now
+ * so the high-detail fields describe the work the pass finished. A pass that
+ * did not take the full-frame path must not call this: its buffers still
+ * belong to the previous snapshot.
  */
 void ImProcCoordinator::recordPreviewDirtyState(const PreviewPassState& pass)
 {
@@ -4260,23 +4264,36 @@ void ImProcCoordinator::recordPreviewDirtyState(const PreviewPassState& pass)
     previewDirtyState = previewRenderState(pass);
     previewDirtyFingerprintsValid = true;
     previewDirtyStateValid = true;
+}
 
-    if (stage::workShadowEnabled()) {
-        /*
-         * The stage bodies normalise white balance and write automatic denoise
-         * strengths back into the live parameters. Those corrections are
-         * consumed by this pass, so the stored family snapshot is the post-pass
-         * state; comparing them again would name a delta the mask never saw.
-         */
-        previewDirtyParams = *params;
-        previewDirtyParamsValid = true;
+/*
+ * Record the previous state for the read-only work-order shadow.
+ *
+ * Called after the crop render, because the crop analysis writes automatic
+ * denoise strengths back into the live parameters and the preview bodies and
+ * GUI listeners write their own corrections. The fingerprints and the
+ * parameter copy are taken together from that post-pass state, so the next
+ * derivation compares two halves of the same vintage. Taking one before the
+ * previous pass and one after it made a write-back look like a new event and
+ * produced a false typed-only run.
+ */
+void ImProcCoordinator::recordPreviewWorkHistory()
+{
+    if (!stage::workShadowEnabled()) {
+        return;
     }
+
+    previewWorkFingerprints =
+        stage::snapshotParams(*params, stage::StagePath::Preview);
+    previewDirtyParams = *params;
+    previewDirtyParamsValid = true;
 }
 
 /* The buffers the snapshot describes are gone; the next pass is all-dirty. */
 void ImProcCoordinator::invalidatePreviewDirtyState()
 {
     previewDirtyFingerprints.clear();
+    previewWorkFingerprints.clear();
     previewDirtyFingerprintsValid = false;
     previewDirtyStateValid = false;
     previewDirtyParamsValid = false;
@@ -4723,7 +4740,7 @@ void ImProcCoordinator::updatePreviewImage(int todo, bool panningRelatedChange,
                 const stage::BlockFingerprints currentWork =
                     workFingerprints(pass.fingerprints);
                 const stage::BlockFingerprints previousWork =
-                    workFingerprints(previewDirtyFingerprints);
+                    workFingerprints(previewWorkFingerprints);
 
                 stage::WorkInputs inputs;
                 inputs.previousState = &previewDirtyState;
@@ -4785,6 +4802,16 @@ void ImProcCoordinator::updatePreviewImage(int todo, bool panningRelatedChange,
         renderCrops(todo, panningRelatedChange
                         || (highDetailNeeded && prevdemo != PD_Sidecar));
     }
+
+    /*
+     * The crop analysis writes automatic denoise strengths back into the live
+     * parameters after the preview history was recorded, and a crop-only
+     * update can do so between two full-frame passes. Snapshot the shadow
+     * history after every crop render, so its fingerprints and its parameter
+     * copy describe the same post-pass state; the validity flag still comes
+     * from the last full-frame pass.
+     */
+    recordPreviewWorkHistory();
 
     // monitor.output is the last node of the plan; the pass records
     // whether the plan scheduled it.
