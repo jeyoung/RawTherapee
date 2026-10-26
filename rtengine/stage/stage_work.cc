@@ -37,9 +37,11 @@
 
 #include "procparams.h"
 
+#include <atomic>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <initializer_list>
 #include <string>
 #include <tuple>
@@ -295,6 +297,112 @@ std::string workOrderName(const WorkOrder& order)
     }
     text += ']';
     return text;
+}
+
+void WorkShadow::probe(WorkItem item, bool legacyRuns)
+{
+    if (forced_) {
+        return;
+    }
+
+    const size_t index = static_cast<size_t>(item);
+    assert(index < workItemCount && "WorkShadow probe out of range");
+    if (index >= workItemCount) {
+        return;
+    }
+
+    probed_[index] = true;
+    legacy_[index] = legacy_[index] || legacyRuns;
+}
+
+void WorkShadow::probeRawBaseNode(bool legacyRuns)
+{
+    if (forced_) {
+        return;
+    }
+
+    nodeProbed_ = true;
+    nodeLegacy_ = nodeLegacy_ || legacyRuns;
+}
+
+void WorkShadow::skipForcedPass()
+{
+    forced_ = true;
+}
+
+void WorkShadow::report(const char* path, const WorkOrder& order) const
+{
+    static std::atomic<uint64_t> nextPass{1};
+    const uint64_t pass = nextPass.fetch_add(1, std::memory_order_relaxed);
+
+    if (forced_) {
+        std::fprintf(stderr,
+                     "work-shadow %s pass=%llu typedOnly=0 legacyOnly=0 "
+                     "agree=0 items=forced-no-history\n",
+                     path, static_cast<unsigned long long>(pass));
+        return;
+    }
+
+    std::string typedOnly;
+    std::string legacyOnly;
+    size_t typedCount = 0;
+    size_t legacyCount = 0;
+    size_t agree = 0;
+
+    const auto classify = [&](const char* name, bool typed, bool legacy) {
+        if (typed && !legacy) {
+            if (!typedOnly.empty()) {
+                typedOnly += ' ';
+            }
+            typedOnly += name;
+            ++typedCount;
+        } else if (!typed && legacy) {
+            if (!legacyOnly.empty()) {
+                legacyOnly += ' ';
+            }
+            legacyOnly += name;
+            ++legacyCount;
+        } else {
+            ++agree;
+        }
+    };
+
+    for (size_t i = 0; i < workItemCount; ++i) {
+        if (!probed_[i]) {
+            continue;
+        }
+        const WorkItem item = static_cast<WorkItem>(i);
+        classify(workItemName(item), order.has(item), legacy_[i]);
+    }
+
+    if (nodeProbed_) {
+        const bool nodeTyped = order.has(WorkItem::rawBaseRebuild)
+            || order.has(WorkItem::retinexPrepare)
+            || order.has(WorkItem::spotApply)
+            || order.has(WorkItem::spotRestore)
+            || order.has(WorkItem::analysisRun);
+        classify("rawBaseNode", nodeTyped, nodeLegacy_);
+    }
+
+    std::string items;
+    if (!typedOnly.empty()) {
+        items += "typedOnly[" + typedOnly + "]";
+    }
+    if (!legacyOnly.empty()) {
+        if (!items.empty()) {
+            items += ' ';
+        }
+        items += "legacyOnly[" + legacyOnly + "]";
+    }
+    if (items.empty()) {
+        items = "none";
+    }
+
+    std::fprintf(stderr,
+                 "work-shadow %s pass=%llu typedOnly=%zu legacyOnly=%zu "
+                 "agree=%zu items=%s\n",
+                 path, static_cast<unsigned long long>(pass), typedCount,
+                 legacyCount, agree, items.c_str());
 }
 
 WorkOrder derive_preview_work(const WorkInputs& inputs)

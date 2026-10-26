@@ -167,6 +167,17 @@ protected:
     bool previewDirtyFingerprintsValid = false;
     bool previewDirtyStateValid = false;
 
+    /*
+     * Parameters of the last completed full-frame pass, for the read-only
+     * work-order shadow comparison. The copy is taken after the pass, because
+     * the stage bodies normalise white balance and write automatic denoise
+     * strengths back into the live parameters; those corrections are consumed
+     * by the pass and must not read as a new delta. Only maintained while
+     * RT_WORK_SHADOW is set.
+     */
+    procparams::ProcParams previewDirtyParams;
+    bool previewDirtyParamsValid = false;
+
     // True while the initial rough preview is being rendered. Rough previews
     // must not populate the preview base cache.
     bool initialRoughPreview = false;

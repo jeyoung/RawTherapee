@@ -24,6 +24,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <string>
 
 namespace rtengine::procparams
@@ -155,6 +156,60 @@ private:
  * compared textually.
  */
 std::string workOrderName(const WorkOrder& order);
+
+/*
+ * Whether the read-only shadow comparison is enabled.
+ *
+ * `RT_WORK_SHADOW` is read once per process. The caller gates every shadow
+ * computation and every probe on this function; when it is unset, the added
+ * cost is one branch and no allocation. No log line is emitted when disabled.
+ *
+ * Contract of the comparison:
+ *
+ * - `typedOnly` means the typed order names an item that the legacy gate does
+ *   not run. It is a missing input or a derivation error and must be zero.
+ * - `legacyOnly` means the legacy gate runs an item that the typed order does
+ *   not name. It is the legacy over-approximation that the typed order intends
+ *   to save: it is measured, not treated as a defect.
+ */
+inline bool workShadowEnabled()
+{
+    static const bool enabled = std::getenv("RT_WORK_SHADOW") != nullptr;
+    return enabled;
+}
+
+/*
+ * Accumulator for one pass.
+ *
+ * A gate site reports the legacy answer for one item; repeated sites for the
+ * same item are ORed, so the pass compares "did any legacy site run this item"
+ * with the typed order. Probing is a no-op until a site has been added.
+ *
+ * The accumulator is a value with fixed storage, safe to keep in a caller's
+ * per-pass state. It allocates only in report(), which is called only when the
+ * shadow is enabled.
+ */
+struct WorkShadow {
+    void probe(WorkItem item, bool legacyRuns);
+    /* The raw.base node-entry gate (baseWorkMayRun), which is an aggregate. */
+    void probeRawBaseNode(bool legacyRuns);
+    /*
+     * Mark a pass whose typed order is the forced full destructive set because
+     * the caller has no usable history. The legacy mask is not required to
+     * carry every bit on such a pass, so the pass is reported separately and
+     * does not contribute to typedOnly.
+     */
+    void skipForcedPass();
+    /* Emit the one-line pass report to stderr. */
+    void report(const char* path, const WorkOrder& order) const;
+
+private:
+    std::array<bool, workItemCount> probed_{};
+    std::array<bool, workItemCount> legacy_{};
+    bool nodeProbed_ = false;
+    bool nodeLegacy_ = false;
+    bool forced_ = false;
+};
 
 /*
  * Inputs of one derivation.
