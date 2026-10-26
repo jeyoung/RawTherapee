@@ -133,6 +133,7 @@ set(RTENGINESOURCEFILES
     stage/stage_render_state.cc
     stage/stage_runtime.cc
     stage/stage_store.cc
+    stage/stage_work.cc
     svgrender.cc
     tmo_fattal02.cc
     utils.cc
@@ -344,6 +345,25 @@ target_include_directories(stage-dirty-blocks-test PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/stage"
 )
 rt_setup_target(stage-dirty-blocks-test)
+
+# Exact raw/core work orders derived from fingerprints and request facts.
+add_executable(stage-work-test EXCLUDE_FROM_ALL
+    "${CMAKE_CURRENT_SOURCE_DIR}/stage/tests/stage_work_test.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/editcallbacks.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/multilangmgr.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/options.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/paramsedited.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/pathutils.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/threadutils.cc"
+)
+target_include_directories(stage-work-test BEFORE PRIVATE
+    "${CMAKE_BINARY_DIR}/rtgui"
+)
+target_link_libraries(stage-work-test PRIVATE rtengine)
+target_include_directories(stage-work-test PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/stage"
+)
+rt_setup_target(stage-work-test)
 
 add_executable(stage-parity-test EXCLUDE_FROM_ALL
     "${CMAKE_CURRENT_SOURCE_DIR}/stage/tests/stage_parity_test.cc"
