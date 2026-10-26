@@ -1534,7 +1534,8 @@ void ImProcCoordinator::stageSourceSelect(PreviewPassState& pass)
     if (stage::workShadowEnabled()) {
         pass.shadow.probe(stage::WorkItem::sourceSelect, legacyRuns);
     }
-    if (!legacyRuns) {
+    if (!stage::workItemRuns(stage::workOrderEnabled(), pass.work,
+                             stage::WorkItem::sourceSelect, legacyRuns)) {
         return;
     }
 
@@ -1549,7 +1550,8 @@ void ImProcCoordinator::stageRawPreprocess(PreviewPassState& pass)
     if (stage::workShadowEnabled()) {
         pass.shadow.probe(stage::WorkItem::rawPreprocess, legacyRuns);
     }
-    if (!legacyRuns) {
+    if (!stage::workItemRuns(stage::workOrderEnabled(), pass.work,
+                             stage::WorkItem::rawPreprocess, legacyRuns)) {
         return;
     }
 
@@ -1603,7 +1605,8 @@ void ImProcCoordinator::stageRawDemosaic(PreviewPassState& pass)
     if (stage::workShadowEnabled()) {
         pass.shadow.probe(stage::WorkItem::rawDemosaic, legacyRuns);
     }
-    if (!legacyRuns) {
+    if (!stage::workItemRuns(stage::workOrderEnabled(), pass.work,
+                             stage::WorkItem::rawDemosaic, legacyRuns)) {
         return;
     }
 
@@ -1709,7 +1712,15 @@ void ImProcCoordinator::stageRawBase(PreviewPassState& pass)
         pass.shadow.probe(stage::WorkItem::analysisRun, legacyRebuild);
     }
 
-    if (legacyRebuild) {
+    /*
+     * The node keeps its entry gate above: the typed order changes which
+     * bodies inside raw.base run, not whether the plan enters the node.
+     */
+    const bool rebuildRuns = stage::workItemRuns(
+        stage::workOrderEnabled(), pass.work, stage::WorkItem::rawBaseRebuild,
+        legacyRebuild);
+
+    if (rebuildRuns) {
         if (params->wb.method == "autitcgreen") {
             imgsrc->getrgbloc(0, 0, fh, fw, 0, 0, fh, fw, params->wb);
         }
@@ -1721,7 +1732,10 @@ void ImProcCoordinator::stageRawBase(PreviewPassState& pass)
         pass.shadow.probe(stage::WorkItem::retinexPrepare, legacyRetinex);
     }
 
-    if (legacyRetinex) {
+    const bool retinexRuns = stage::workItemRuns(
+        stage::workOrderEnabled(), pass.work, stage::WorkItem::retinexPrepare,
+        legacyRetinex);
+    if (retinexRuns) {
         bool dehacontlutili = false;
         bool mapcontlutili = false;
         bool useHsl = false;
@@ -1739,7 +1753,7 @@ void ImProcCoordinator::stageRawBase(PreviewPassState& pass)
     if (settings->verbose) {
         printf("automethod=%s \n", params->wb.method.c_str());
     }
-    if (legacyRebuild) {
+    if (rebuildRuns) {
         MyMutex::MyLock initLock(minit);  // Also used in crop window
         //imgsrc->HLRecovery_Global(params->toneCurve);   // this handles Color HLRecovery
 
@@ -2089,7 +2103,10 @@ void ImProcCoordinator::stageRawBase(PreviewPassState& pass)
         if (stage::workShadowEnabled()) {
             pass.shadow.probe(stage::WorkItem::spotApply, legacySpot);
         }
-        if (legacySpot) {
+        const bool spotRuns = stage::workItemRuns(
+            stage::workOrderEnabled(), pass.work, stage::WorkItem::spotApply,
+            legacySpot);
+        if (spotRuns) {
             spotsDone = true;
             PreviewProps pp(0, 0, fw, fh, scale);
             ipf.removeSpots(orig_prev, imgsrc, params->spot.entries, pp, currWB, nullptr, tr);
@@ -2189,7 +2206,19 @@ void ImProcCoordinator::stageRawBase(PreviewPassState& pass)
     if (stage::workShadowEnabled()) {
         pass.shadow.probe(stage::WorkItem::spotApply, legacySpotApply);
     }
-    if (legacySpotBuffer) {
+
+    /*
+     * The typed order names the buffer path when the request or a spot delta
+     * asks for it. The legacy buffer gate stays in the condition on purpose:
+     * its disabled/empty branch is the buffer clear, not a spot application,
+     * and the typed order has no item for that state transition, so skipping
+     * it would leave a stale buffer live.
+     */
+    const bool orderEnabled = stage::workOrderEnabled();
+    const bool spotBufferPath = legacySpotBuffer
+        || (orderEnabled && pass.work.has(stage::WorkItem::spotApply)
+            && !spotsDone);
+    if (spotBufferPath) {
         if (params->spot.enabled && !params->spot.entries.empty()) {
             allocCache(spotprev);
             orig_prev->copyData(spotprev);
@@ -2207,7 +2236,10 @@ void ImProcCoordinator::stageRawBase(PreviewPassState& pass)
     if (stage::workShadowEnabled()) {
         pass.shadow.probe(stage::WorkItem::spotRestore, legacySpotRestore);
     }
-    if (legacySpotRestore) {
+    const bool restoreRuns = stage::workItemRuns(
+        orderEnabled, pass.work, stage::WorkItem::spotRestore,
+        legacySpotRestore);
+    if (restoreRuns && spotprev != nullptr) {
         spotprev->copyData(orig_prev);
     }
 }
@@ -4279,7 +4311,7 @@ void ImProcCoordinator::recordPreviewDirtyState(const PreviewPassState& pass)
  */
 void ImProcCoordinator::recordPreviewWorkHistory()
 {
-    if (!stage::workShadowEnabled()) {
+    if (!stage::workShadowEnabled() && !stage::workOrderEnabled()) {
         return;
     }
 
@@ -4611,8 +4643,11 @@ void ImProcCoordinator::updatePreviewImage(int todo, bool panningRelatedChange,
         // forces the demosaic and, with it, every block in the DEMOSAIC mask.
         // The hand-written pass applied this just before the demosaic node; it
         // is a pure function of the mask and the parameters, so it runs here
-        // and the plan sees the mask the pass will actually use.
-        if ((pass.todo & M_WB) && params->toneCurve.hrenabled
+        // and the plan sees the mask the pass will actually use. The request
+        // bit is kept for the typed order, which cannot derive it from a
+        // parameter delta.
+        const bool colorHlrWbRequest = (pass.todo & M_WB) != 0;
+        if (colorHlrWbRequest && params->toneCurve.hrenabled
                 && params->toneCurve.method == "Coloropp") {
             pass.todo |= DEMOSAIC;
         }
@@ -4719,16 +4754,46 @@ void ImProcCoordinator::updatePreviewImage(int todo, bool panningRelatedChange,
         pass.renderState = previewRenderState(pass);
 
         /*
-         * Read-only work-order shadow. The order is derived once per pass from
-         * the same previous snapshot, keys and parameters the dirty-block
-         * derivation uses. The mask never reaches the derivation; the legacy
-         * answers are probed at each gate site instead.
+         * Work order of the pass. Derived once per pass from the same previous
+         * snapshot, keys and parameters the dirty-block derivation uses, and
+         * read by each converted raw-chain gate below. The mask never reaches
+         * the derivation; the legacy answers are still probed at each site.
+         *
+         * With RT_WORK_ORDER unset this block runs only for the shadow, and
+         * only when a usable history exists, exactly as before the conversion.
+         * With the switch set the order always exists: a pass without history
+         * derives the destructive set, because every delta counts then.
          */
-        if (stage::workShadowEnabled()) {
+        const bool wantWorkOrder = stage::workOrderEnabled();
+        const bool wantWorkShadow = stage::workShadowEnabled();
+
+        if (wantWorkOrder || wantWorkShadow) {
             const bool history = previewDirtyFingerprintsValid
                 && previewDirtyStateValid && previewDirtyParamsValid;
 
-            if (!history) {
+            if (history || wantWorkOrder) {
+                stage::WorkInputs inputs;
+                stage::BlockFingerprints currentWork;
+                stage::BlockFingerprints previousWork;
+
+                if (history) {
+                    currentWork = workFingerprints(pass.fingerprints);
+                    previousWork = workFingerprints(previewWorkFingerprints);
+                    inputs.previousState = &previewDirtyState;
+                    inputs.previousFingerprints = &previousWork;
+                    inputs.previousParams = &previewDirtyParams;
+                }
+
+                inputs.currentState = &pass.renderState;
+                inputs.currentFingerprints = &currentWork;
+                inputs.requestKind = pass.requestKind;
+                inputs.path = stage::StagePath::Preview;
+                inputs.params = params.get();
+                inputs.colorHlrWbRequest = colorHlrWbRequest;
+                pass.work = stage::derive_preview_work(inputs);
+            }
+
+            if (wantWorkShadow && !history) {
                 /*
                  * No usable history: the typed order is the forced full
                  * destructive set and the legacy mask is not required to carry
@@ -4736,22 +4801,6 @@ void ImProcCoordinator::updatePreviewImage(int todo, bool panningRelatedChange,
                  * typed-only run.
                  */
                 pass.shadow.skipForcedPass();
-            } else {
-                const stage::BlockFingerprints currentWork =
-                    workFingerprints(pass.fingerprints);
-                const stage::BlockFingerprints previousWork =
-                    workFingerprints(previewWorkFingerprints);
-
-                stage::WorkInputs inputs;
-                inputs.previousState = &previewDirtyState;
-                inputs.currentState = &pass.renderState;
-                inputs.previousFingerprints = &previousWork;
-                inputs.currentFingerprints = &currentWork;
-                inputs.previousParams = &previewDirtyParams;
-                inputs.requestKind = pass.requestKind;
-                inputs.path = stage::StagePath::Preview;
-                inputs.params = params.get();
-                pass.work = stage::derive_preview_work(inputs);
             }
         }
 
