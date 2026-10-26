@@ -92,6 +92,7 @@ void expectOrder(const WorkOrder& actual,
  * them; a caller that let them die before the derivation would dangle.
  */
 struct Derivation {
+    procparams::ProcParams previousParams;
     procparams::ProcParams currentParams;
     BlockFingerprints previousFingerprints;
     BlockFingerprints currentFingerprints;
@@ -100,12 +101,13 @@ struct Derivation {
     WorkInputs inputs;
 
     Derivation(StagePath path,
-               const procparams::ProcParams& previousParams,
+               const procparams::ProcParams& previousParamsIn,
                procparams::ProcParams currentParamsIn,
                RenderStateKey previousStateIn,
                RenderStateKey currentStateIn,
                RequestKind kind)
-        : currentParams(std::move(currentParamsIn)),
+        : previousParams(previousParamsIn),
+          currentParams(std::move(currentParamsIn)),
           previousFingerprints(stage_fingerprints(path, previousParams)),
           currentFingerprints(stage_fingerprints(path, currentParams)),
           previousState(std::move(previousStateIn)),
@@ -117,6 +119,7 @@ struct Derivation {
         inputs.currentState = &currentState;
         inputs.previousFingerprints = &previousFingerprints;
         inputs.currentFingerprints = &currentFingerprints;
+        inputs.previousParams = &this->previousParams;
         inputs.requestKind = kind;
         inputs.path = path;
         inputs.params = &this->currentParams;
@@ -210,6 +213,8 @@ void testParameterChanges()
         const char* name;
         Mutate mutate;
         std::initializer_list<WorkItem> previewExpected;
+        /* The crop stage bodies still read the spot families without a reload. */
+        std::initializer_list<WorkItem> cropExpected = {};
     };
 
     const ParamCase cases[] = {
@@ -255,6 +260,29 @@ void testParameterChanges()
          },
          {WorkItem::sourceSelect, WorkItem::rawPreprocess,
           WorkItem::rawBaseRebuild, WorkItem::analysisRun}},
+        {"spot entry (spot buffer, no base rebuild)",
+         [](procparams::ProcParams& params) {
+             params.spot.enabled = true;
+             params.spot.entries.emplace_back();
+         },
+         {WorkItem::spotApply, WorkItem::spotRestore},
+         {WorkItem::spotApply, WorkItem::spotRestore}},
+        {"dehaze (transform, not raw.base)",
+         [](procparams::ProcParams& params) {
+             params.dehaze.enabled = true;
+         },
+         {}},
+        {"output profile (monitor sink, not raw.base)",
+         [](procparams::ProcParams& params) {
+             params.icm.outputProfile = "sRGB";
+         },
+         {}},
+        {"retinex disabled (no preparation)",
+         [](procparams::ProcParams& params) {
+             params.retinex.enabled = false;
+             params.retinex.str += 5;
+         },
+         {WorkItem::rawBaseRebuild, WorkItem::analysisRun}},
     };
 
     for (const ParamCase& testCase : cases) {
@@ -271,7 +299,7 @@ void testParameterChanges()
         const Derivation crop(StagePath::Crop, previous, current,
                               RenderStateKey{}, RenderStateKey{},
                               RequestKind::ParamsOnly);
-        expectOrder(crop.crop(), {},
+        expectOrder(crop.crop(), testCase.cropExpected,
                     std::string("parameter ") + testCase.name + " on crop");
     }
 }
@@ -324,6 +352,25 @@ void testSourceReload()
                 {WorkItem::rawDemosaic, WorkItem::rawBaseRebuild,
                  WorkItem::analysisRun},
                 "RGB modification with a mismatching HLR method demosaics");
+
+    /*
+     * A white-balance change on the Coloropp path demosaics in the legacy
+     * sequence through the caller's DEMOSAIC augmentation. That augmentation
+     * is a mask fact, not a parameter delta, so the typed order does not copy
+     * it; the shadow reports it as a legacy-only run instead.
+     */
+    procparams::ProcParams coloropp;
+    coloropp.toneCurve.hrenabled = true;
+    coloropp.toneCurve.method = "Coloropp";
+    procparams::ProcParams coloroppWb = coloropp;
+    coloroppWb.wb.temperature += 500;
+
+    const Derivation wbHlr(StagePath::Preview, coloropp, coloroppWb,
+                           previousState, previousState,
+                           RequestKind::ParamsOnly);
+    expectOrder(wbHlr.preview(),
+                {WorkItem::rawBaseRebuild, WorkItem::analysisRun},
+                "white balance on the Coloropp path rebuilds the base only");
 }
 
 void testHighDetailTransitions()
@@ -360,8 +407,10 @@ void testHighDetailTransitions()
                 "high detail gained: the crop reloads its ROI");
 
     /*
-     * The other direction has both flags already computed, so only the
-     * decision moved; the raw core still has to rerun at the new scale.
+     * The other direction has both flags already computed, so no work is
+     * pending. The legacy zoom request carries the absolute mask; the typed
+     * order names only work whose inputs it can express, so the dropped
+     * transition stays empty rather than inventing a rule the mask lacks.
      */
     RenderStateKey dropped;
     dropped.highDetailNeeded = false;
@@ -370,8 +419,8 @@ void testHighDetailTransitions()
     dropped.highDetailStateKnown = true;
     const Derivation lost(StagePath::Preview, params, params, needed, dropped,
                           RequestKind::ParamsOnly);
-    expectOrder(lost.preview(), rawCore,
-                "high detail dropped: the raw core runs");
+    expectOrder(lost.preview(), {},
+                "high detail dropped with computed work: no pending raw work");
 }
 
 void testSpotTransitions()
@@ -379,10 +428,9 @@ void testSpotTransitions()
     const procparams::ProcParams params;
 
     /*
-     * A pending request alone has no base delta, so the apply body (which
-     * lives inside the base rebuild branch) does not run; the restore copy
-     * still does. The realistic transition carries the spot parameter delta
-     * and is covered by the parameter table.
+     * A pending request alone has no base delta, so the spots are applied to
+     * the buffer path and copied back. The realistic base transition carries
+     * the request fact and applies them in the rebuild branch instead.
      */
     RenderStateKey previousState;
     RenderStateKey pendingState;
@@ -390,47 +438,52 @@ void testSpotTransitions()
 
     const Derivation pending(StagePath::Preview, params, params, previousState,
                              pendingState, RequestKind::ParamsOnly);
-    expectOrder(pending.preview(), {WorkItem::spotRestore},
-                "spot pending without a delta: restore only");
+    expectOrder(pending.preview(),
+                {WorkItem::spotApply, WorkItem::spotRestore},
+                "spot pending without a delta: buffer apply and restore");
 
     const Derivation cropPending(StagePath::Crop, params, params,
                                  previousState, pendingState,
                                  RequestKind::ParamsOnly);
-    expectOrder(cropPending.crop(), {WorkItem::spotRestore},
-                "spot pending on crop without a reload: restore only");
+    expectOrder(cropPending.crop(),
+                {WorkItem::spotApply, WorkItem::spotRestore},
+                "spot pending on crop without a reload: buffer apply and swap");
 
     /*
-     * The standing rule: a live buffer changes the next base pass on the
-     * preview, so the base and the analysis run even with no delta.
+     * The standing rule: a live buffer is copied back even with no delta. The
+     * tool must still be configured, because a disabled or empty tool deletes
+     * the buffer instead of restoring it.
      */
+    procparams::ProcParams liveParams = params;
+    liveParams.spot.enabled = true;
+    liveParams.spot.entries.emplace_back();
     RenderStateKey liveState;
     liveState.spotBufferLive = true;
 
-    const Derivation live(StagePath::Preview, params, params, previousState,
-                          liveState, RequestKind::ParamsOnly);
-    expectOrder(live.preview(),
-                {WorkItem::rawBaseRebuild, WorkItem::spotRestore,
-                 WorkItem::analysisRun},
-                "live spot buffer forces the base rebuild and the restore");
+    const Derivation live(StagePath::Preview, liveParams, liveParams,
+                          previousState, liveState, RequestKind::ParamsOnly);
+    expectOrder(live.preview(), {WorkItem::spotRestore},
+                "live spot buffer restores without rebuilding the base");
 
     /*
      * The crop restores by swapping baseCrop at dcrop.cc:1511, so the live
      * buffer names the restore and not the destructive body.
      */
-    const Derivation cropLive(StagePath::Crop, params, params, previousState,
-                              liveState, RequestKind::ParamsOnly);
+    const Derivation cropLive(StagePath::Crop, liveParams, liveParams,
+                              previousState, liveState,
+                              RequestKind::ParamsOnly);
     expectOrder(cropLive.crop(), {WorkItem::spotRestore},
                 "live spot buffer on crop: pointer-swap restore only");
 
     /* A carried spot delta plus the pending fact applies the spots. */
     procparams::ProcParams spotted = params;
     spotted.spot.enabled = true;
+    spotted.spot.entries.emplace_back();
     const Derivation applied(StagePath::Preview, params, spotted,
                              previousState, pendingState,
                              RequestKind::ParamsOnly);
     expectOrder(applied.preview(),
-                {WorkItem::rawBaseRebuild, WorkItem::spotApply,
-                 WorkItem::spotRestore, WorkItem::analysisRun},
+                {WorkItem::spotApply, WorkItem::spotRestore},
                 "spot delta with a pending request applies and restores");
 
     /* A cleared buffer and a cleared request need no spot work. */
@@ -445,10 +498,13 @@ void testSpotTransitions()
 void testRequestKinds()
 {
     const procparams::ProcParams params;
+    /*
+     * A rebuild request names the destructive base body. It does not select,
+     * preprocess or demosaic the source: RequestKind folds M_INIT,
+     * M_LINDENOISE and M_HDR together and only those bits reach the base.
+     */
     const std::initializer_list<WorkItem> previewRebuild = {
-        WorkItem::sourceSelect, WorkItem::rawPreprocess,
-        WorkItem::rawDemosaic, WorkItem::rawBaseRebuild,
-        WorkItem::analysisRun};
+        WorkItem::rawBaseRebuild, WorkItem::analysisRun};
     const std::initializer_list<WorkItem> cropRebuild = {
         WorkItem::sourceSelect, WorkItem::rawBaseRebuild,
         WorkItem::analysisRun};
@@ -592,9 +648,11 @@ void testCoverage()
     const procparams::ProcParams params;
 
     procparams::ProcParams busy = params;
+    busy.raw.bayersensor.black0 += 1.0;
     busy.retinex.enabled = true;
     busy.dirpyrDenoise.enabled = true;
     busy.spot.enabled = true;
+    busy.spot.entries.emplace_back();
     RenderStateKey live;
     live.spotPending = true;
     live.spotBufferLive = true;

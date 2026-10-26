@@ -116,6 +116,50 @@ bool sourceReloaded(const RenderStateKey& previous,
                        current.sourceFullHeight, current.sourceFrameCount);
 }
 
+/*
+ * Delta of one ProcParams member.
+ *
+ * `BlockFingerprints` keeps the raw.base families merged in one hash, so a
+ * retinex or spot delta cannot be told apart from a white-balance delta. The
+ * previous parameter set is carried for exactly this question. A missing
+ * history or previous set answers "changed", which is the conservative
+ * reading and matches the legacy first pass.
+ */
+template <typename Member>
+bool paramFamilyChanged(const WorkInputs& inputs,
+                        Member procparams::ProcParams::*member)
+{
+    if (!usableHistory(inputs) || inputs.previousParams == nullptr
+        || inputs.params == nullptr) {
+        return true;
+    }
+
+    return (inputs.previousParams->*member) != (inputs.params->*member);
+}
+
+/*
+ * Whether colour management changed in a way that rebuilds the base.
+ *
+ * The output profile, intent and black-point compensation are monitor-sink
+ * inputs (`EvOProfile` maps to M_MONITOR), while the working space is read by
+ * getImage(). Comparing the whole `icm` member would name the base for an
+ * output-profile edit that the legacy gate does not rebuild.
+ */
+bool baseIcmChanged(const WorkInputs& inputs)
+{
+    if (!usableHistory(inputs) || inputs.previousParams == nullptr
+        || inputs.params == nullptr) {
+        return true;
+    }
+
+    procparams::ColorManagementParams previous = inputs.previousParams->icm;
+    const procparams::ColorManagementParams& current = inputs.params->icm;
+    previous.outputProfile = current.outputProfile;
+    previous.outputIntent = current.outputIntent;
+    previous.outputBPC = current.outputBPC;
+    return previous != current;
+}
+
 bool isColourHlrMethod(const ProcParams& params)
 {
     return params.toneCurve.method == "Color"
@@ -291,13 +335,13 @@ WorkOrder derive_preview_work(const WorkInputs& inputs)
     const bool hlr = params != nullptr && hlrDemandsDemosaic(*params, current);
 
     /*
-     * A change of the high-detail decision changes the demosaic scale, so both
-     * directions schedule the raw core. The legacy mask carried the same fact
-     * as M_PREPROC/M_RAW from the zoom request; the decision itself is already
-     * part of the key, so no mask bit is needed.
+     * A change of the high-detail decision only schedules the raw core when
+     * the work for the new decision is still pending; that fact is carried by
+     * the high-detail fields and read by `hdPre`/`hdRaw` below. A bare
+     * decision change is a mask-level request (the caller sends ALL on a zoom
+     * transition), not a parameter delta, so naming it here would create a
+     * typed-only run against a mask that did not carry it.
      */
-    const bool highDetailMoved = history
-        && previous.highDetailNeeded != current.highDetailNeeded;
 
     const bool sourceReload = history && sourceReloaded(previous, current);
 
@@ -312,29 +356,53 @@ WorkOrder derive_preview_work(const WorkInputs& inputs)
     /*
      * rawWorkRuns(): M_PREPROC or a high-detail preprocess that is still
      * pending. The source facts join because a reload re-selects the frame
-     * before it preprocesses, and a rebuild request forces the step.
+     * before it preprocesses. A rebuild request is deliberately absent:
+     * RequestKind folds M_INIT/M_LINDENOISE/M_HDR into FullPreview, and those
+     * bits rebuild the base without selecting or preprocessing the source.
      */
     const bool preprocess = blockChanged(inputs, "raw.preprocess")
         || (current.highDetailNeeded && !current.highDetailPreprocessComputed)
-        || highDetailMoved || sourceReload || rebuild;
+        || sourceReload;
 
     /*
      * rawSourceWorkRuns(): M_RAW/M_CSHARP, a pending high-detail demosaic, the
-     * colour highlight-recovery condition, a reload and a rebuild request.
+     * colour highlight-recovery condition of a modified RGB source, and a
+     * reload. A rebuild request is absent for the same reason as in
+     * `preprocess`. The caller's extra DEMOSAIC augmentation for a white
+     * balance on the Coloropp path is a mask fact and is deliberately not
+     * copied: it appears as a legacy-only run in the shadow.
      */
     const bool demosaic = blockChanged(inputs, "raw.demosaic")
         || (current.highDetailNeeded && !current.highDetailRawComputed)
-        || highDetailMoved || hlr || sourceReload || rebuild;
+        || hlr || sourceReload;
 
     /*
-     * baseRebuildRuns(): the base families, the request, and the two standing
-     * rules. A preprocess or a demosaic regenerates the planes the base
-     * consumes, so it invalidates the base (the forward-edge rule of
-     * stage_dirty_blocks.h, close_dirty_blocks). A live spot buffer changes the
-     * next base pass.
+     * baseRebuildRuns(): the raw.base families that actually rebuild, plus the
+     * forward edges that regenerate the planes the base reads. The raw.base
+     * block fingerprint is not used: it merges spot and retinex with the
+     * rebuilding families. A preprocess or a demosaic regenerates the planes
+     * the base consumes (the forward-edge rule of stage_dirty_blocks.h,
+     * close_dirty_blocks).
      */
-    const bool base = blockChanged(inputs, "raw.base") || preprocess
-        || demosaic || rebuild || current.spotBufferLive;
+    const bool base = preprocess || demosaic
+        || paramFamilyChanged(inputs, &ProcParams::wb)
+        || paramFamilyChanged(inputs, &ProcParams::toneCurve)
+        || paramFamilyChanged(inputs, &ProcParams::filmNegative)
+        || paramFamilyChanged(inputs, &ProcParams::retinex)
+        || paramFamilyChanged(inputs, &ProcParams::cg)
+        || baseIcmChanged(inputs)
+        || rebuild;
+
+    /*
+     * A spot delta does not rebuild the base: the legacy M_SPOT bit only
+     * enters the spot gates inside raw.base and the buffer restore. The
+     * request fact `spotPending` already carries the enabled/entries test.
+     */
+    const bool spotsConfigured = inputs.params != nullptr
+        && inputs.params->spot.enabled && !inputs.params->spot.entries.empty();
+    const bool spotChanged = spotsConfigured
+        && paramFamilyChanged(inputs, &ProcParams::spot);
+    const bool spotApply = current.spotPending || spotChanged;
 
     if (preprocess) {
         order.set(WorkItem::sourceSelect);
@@ -351,15 +419,34 @@ WorkOrder derive_preview_work(const WorkInputs& inputs)
         order.set(WorkItem::analysisRun);
     }
 
-    if (base && retinexEnabled) {
+    /*
+     * Retinex rewrites the shared raw planes before getImage(). It is named
+     * when its own parameters move or when a step that regenerates those
+     * planes runs. A white-balance-only M_INIT does not regenerate the planes,
+     * so the legacy gate over-approximates there.
+     */
+    if (retinexEnabled
+        && (paramFamilyChanged(inputs, &ProcParams::retinex) || preprocess
+            || demosaic)) {
         order.set(WorkItem::retinexPrepare);
     }
 
-    if (base && current.spotPending) {
+    /*
+     * A base rebuild removes the spots from the freshly rebuilt image even
+     * when their parameters did not move; the request fact covers that case.
+     * The buffer path applies them when there is no base rebuild.
+     */
+    if (spotApply) {
         order.set(WorkItem::spotApply);
     }
 
-    if (current.spotPending || current.spotBufferLive) {
+    /*
+     * The direct base path applies the spots itself, so the copy-back is only
+     * needed when the buffer path ran or a buffer is still live. A disabled or
+     * empty spot tool deletes the buffer, hence the `spotsConfigured` guard.
+     */
+    if ((current.spotBufferLive && spotsConfigured)
+        || (spotApply && !base)) {
         order.set(WorkItem::spotRestore);
     }
 
@@ -400,6 +487,10 @@ WorkOrder derive_crop_work(const WorkInputs& inputs)
 
     const ProcParams* params = inputs.params;
     const bool denoiseEnabled = params == nullptr || params->dirpyrDenoise.enabled;
+    const bool spotsConfigured = params != nullptr
+        && params->spot.enabled && !params->spot.entries.empty();
+    const bool spotChanged = spotsConfigured
+        && paramFamilyChanged(inputs, &ProcParams::spot);
 
     /*
      * The crop folds its reload bits (M_INIT | M_LINDENOISE | M_HDR) into
@@ -424,11 +515,19 @@ WorkOrder derive_crop_work(const WorkInputs& inputs)
         order.set(WorkItem::denoiseRun);
     }
 
-    if (reload && current.spotPending) {
+    /*
+     * The direct base path applies the spots itself (M_SPOT inside the reload
+     * branch); without a reload the spot buffer path runs and is then swapped
+     * into place.
+     */
+    const bool spotApply = current.spotPending || spotChanged;
+
+    if (spotApply) {
         order.set(WorkItem::spotApply);
     }
 
-    if (current.spotPending || current.spotBufferLive) {
+    if ((current.spotBufferLive && spotsConfigured)
+        || (spotApply && !reload)) {
         order.set(WorkItem::spotRestore);
     }
 

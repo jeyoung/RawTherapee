@@ -48,33 +48,33 @@ namespace rtengine::stage
  * of stage_dirty_blocks.h in this step; adding them here would mix a
  * pixel-invalidation order with an execution-set order.
  *
- * The derivation reads exactly seven inputs (WorkInputs): the previous and
+ * The derivation reads exactly eight inputs (WorkInputs): the previous and
  * current RenderStateKey, the previous and current BlockFingerprints, the
- * RequestKind, the StagePath and the current ProcParams. It never reads the
- * mask, a coordinator, a crop or a pipeline object. The mask still reaches the
- * prediction indirectly because the caller folds its request bits into
- * RequestKind and into the request facts of the key before it derives; that
- * folding happens at the call boundary and is documented for each item below.
+ * previous and current ProcParams, the RequestKind and the StagePath. It never
+ * reads the mask, a coordinator, a crop or a pipeline object. The mask still
+ * reaches the prediction indirectly because the caller folds its request bits
+ * into RequestKind and into the request facts of the key before it derives;
+ * that folding happens at the call boundary and is documented for each item
+ * below.
  *
  * Exactness contract:
  *
- * - Every item is expressed as a predicate over those seven inputs.
- * - A predicate that the inputs cannot express is marked UNRESOLVED in the
- *   comment for that item, and the missing fact is named. An unresolved item
- *   answers with the conservative (superset) predicate instead of silently
- *   dropping the gate.
+ * - Every item is expressed as a predicate over those eight inputs.
+ * - The raw.base block fingerprint merges several parameter families that the
+ *   legacy gates treat differently. The previous parameter set is therefore
+ *   carried as well, and the raw.base items compare the individual families
+ *   (raw, wb, toneCurve, spot, dirpyrDenoise, filmNegative, retinex, cg, icm)
+ *   instead of that one fingerprint. A family comparison is exact at the
+ *   ProcParams member boundary; it is still coarse within a member.
  * - The order is not executed anywhere in this step. It is a specification
  *   that a later step consumes, so an error here must be visible in the
  *   predicate table rather than in an image.
  *
- * A block fingerprint is the finest parameter fact the unit carries. Where a
- * legacy bit named a narrower parameter family than the block's field list,
- * the predicate is the block-level answer: the item is named when any field of
- * the owning block moved, and the body keeps its own internal gates for the
- * sub-steps. That is a superset only where the field list merges families, it
- * is never a subset, and the merge is recorded here rather than left implicit.
- * The one merge that changes which outer body runs (raw.base) is called out as
- * UNRESOLVED under that item.
+ * The order is a subset of the legacy gates, never a superset: a fact that
+ * the legacy gate does not consult must not name an item, or the shadow
+ * comparison would report a typed-only run. Where a legacy bit is coarser
+ * than the inputs (an HDR event rebuilding raw.base, for example), the item
+ * is deliberately not named and the difference is measured as legacy-only.
  */
 
 /*
@@ -159,13 +159,17 @@ std::string workOrderName(const WorkOrder& order);
 /*
  * Inputs of one derivation.
  *
- * The pointers are borrowed and are not stored. The previous state and the
- * previous fingerprints may be null on the first update of a caller; a null
- * history is read as "every parameter changed" and yields the destructive set,
- * which is what the legacy first pass does (a new coordinator or crop runs
- * `ALL`). A null current state, current fingerprint table or parameter set
- * violates the precondition: the derivation asserts and answers with the whole
- * path-applicable set.
+ * The pointers are borrowed and are not stored. The previous state, previous
+ * fingerprints and previous parameters may be null on the first update of a
+ * caller; a null history is read as "every parameter changed" and yields the
+ * destructive set, which is what the legacy first pass does (a new coordinator
+ * or crop runs `ALL`). A null current state, current fingerprint table or
+ * parameter set violates the precondition: the derivation asserts and answers
+ * with the whole path-applicable set.
+ *
+ * `previousParams` is what makes the raw.base split exact. A caller that
+ * supplies usable fingerprints but no previous parameters makes every family
+ * comparison true, so the answer is conservative rather than silently empty.
  *
  * `requestKind` is the request this pass serves. It must equal
  * `currentState->requestKind` when a current state is supplied; the duplicate
@@ -182,6 +186,8 @@ struct WorkInputs {
     const BlockFingerprints* previousFingerprints = nullptr;
     /* Fingerprints of this pass; required. */
     const BlockFingerprints* currentFingerprints = nullptr;
+    /* Parameters of the previous pass, or null when unavailable. */
+    const procparams::ProcParams* previousParams = nullptr;
     /* Request under service; must agree with currentState->requestKind. */
     RequestKind requestKind = RequestKind::ParamsOnly;
     /* Path the order is derived for. */
@@ -195,54 +201,63 @@ struct WorkInputs {
  *
  * Predicates, with the gate each replaces. `changed(id)` is the fingerprint
  * delta of that canonical block, true when no usable history exists.
+ * `family(member)` is the previous/current ProcParams delta of one raw.base
+ * parameter family, true when either parameter set is unavailable.
  * `reload` is a source reload, `hdPre`/`hdRaw` are the high-detail work still
- * pending, `hdMoved` is a change of the high-detail decision, and `rebuild` is
- * `request_rebuilds_path(requestKind)`.
+ * pending, and `rebuild` is `request_rebuilds_path(requestKind)`. A bare
+ * change of the high-detail decision is not a disjunct: it is a mask-level
+ * zoom request, not a parameter delta.
  *
- * - sourceSelect: `changed("raw.preprocess") || hdPre || hdMoved || reload ||
- *   rebuild`. Replaces `rawWorkRuns()` at improccoordinator.cc:1345, called
- *   from stageSourceSelect at :1503. Fed by the `raw.preprocess` block (the
+ * - sourceSelect: `changed("raw.preprocess") || hdPre || reload`.
+ *   Replaces `rawWorkRuns()` at improccoordinator.cc:1345, called from
+ *   stageSourceSelect at :1503. Fed by the `raw.preprocess` block (the
  *   `M_PREPROC` row of stage_mask_map.cc:87) and by the Source and HighDetail
- *   aspects. The source facts are part of the predicate because selecting the
- *   frame is the per-pass half of a reload; a rebuild request forces the step
- *   because the request bits are absolute.
+ *   aspects. A rebuild request is deliberately not a disjunct: `M_INIT` and
+ *   `M_LINDENOISE` rebuild the base without selecting or preprocessing the
+ *   source, and `RequestKind` cannot distinguish those bits from `M_PREPROC`.
  * - rawPreprocess: the same predicate. Replaces the `rawWorkRuns()` call at
  *   :1514. Same block and aspects.
- * - rawDemosaic: `changed("raw.demosaic") || hdRaw || hdMoved ||
- *   colourHlr || reload || rebuild`. Replaces `rawSourceWorkRuns()` at
+ * - rawDemosaic: `changed("raw.demosaic") || hdRaw ||
+ *   colourHlr || reload`. Replaces `rawSourceWorkRuns()` at
  *   improccoordinator.cc:1362, called at :1563. Fed by the `raw.demosaic`
  *   block (`M_RAW` and `M_CSHARP` rows, stage_mask_map.cc:89-92), the Source
  *   and HighDetail aspects, and the parameter/`rgbSourceModified` pair of the
  *   colour highlight-recovery condition. Capture sharpening is inside the
- *   same body and is covered by the same fingerprint.
- * - rawBaseRebuild: `changed("raw.base") || rawPreprocess ||
- *   rawDemosaic || rebuild || spotBufferLive`.
- *   Replaces `baseRebuildRuns()` (improccoordinator.cc:1378) as used by
- *   `baseWorkMayRun()` at :1384 and the rebuild branch at :1660/:1684. Fed by
- *   the `raw.base` block (`M_WB`, `M_INIT`, `M_SPOT`, `M_LINDENOISE`,
- *   `M_RETINEX` rows), the Source, HighDetail and Derived aspects, and the
- *   Request aspect. UNRESOLVED: the legacy split inside raw.base between
- *   `M_INIT`/`M_LINDENOISE`/`M_HDR`, which rebuild, and `M_RETINEX`/`M_SPOT`,
- *   which only prepare, is not representable here because raw.base has one
- *   fingerprint and no previous ProcParams is carried. The missing fact is a
- *   per-family fingerprint (or the previous ProcParams) for raw.base. The
- *   predicate is the block-level answer and is therefore a superset: a
- *   retinex-only or spot-only delta also names the rebuild body, whose own
- *   internal gates then decide. It is not a skipped job.
- * - retinexPrepare: `rawBaseRebuild && params->retinex.enabled`. Replaces the
- *   gate at improccoordinator.cc:1666 (`M_RETINEX | M_INIT` plus the enabled
- *   check). Fed by the `raw.base` block through the `M_RETINEX` row and by the
- *   Request aspect. The `M_RETINEX` half has the same UNRESOLVED split as
- *   rawBaseRebuild; the enabled test is exact.
- * - spotApply: `rawBaseRebuild && spotPending`. Replaces the gate at
- *   improccoordinator.cc:2029. Fed by the `raw.base` block through `M_SPOT`,
- *   by `spotPending` (a request fact deliberately exempt from the aspect map)
- *   and by the standing live-buffer rule.
- * - spotRestore: `spotPending || spotBufferLive`. Replaces the restore at
- *   improccoordinator.cc:2123 and the copy-back at :2137. Fed by `spotPending`
- *   and by the `spotBufferLive` half of the Derived aspect. The live-buffer
- *   disjunct is the standing rule: a live buffer changes the next base pass
- *   and must be kept in step even when nothing else moves.
+ *   same body and is covered by the same fingerprint. A rebuild request is not
+ *   a disjunct for the same reason as sourceSelect.
+ * - rawBaseRebuild: `rawPreprocess || rawDemosaic || family(wb) ||
+ *   family(toneCurve) || family(filmNegative) || family(retinex) ||
+ *   family(cg) || family(icm-without-output) || rebuild`. Replaces
+ *   `baseRebuildRuns()` (improccoordinator.cc:1378) and the reuse gate at
+ *   :1660/:1684. The raw and denoise families reach it through the
+ *   preprocess/demosaic forward edges. `family(spot)` is excluded: a spot
+ *   delta does not rebuild the base. `family(icm)` ignores the three output
+ *   profile fields, because `EvOProfile` only dirties the monitor sink.
+ *   Dehaze, Fattal and the transform families are excluded as well: the
+ *   legacy `HDR` event over-approximates and rebuilds the base for them, and
+ *   that difference is measured rather than copied. `spotBufferLive` is not a
+ *   disjunct either: a live buffer forces the restore, not the destructive
+ *   body.
+ * - retinexPrepare: `params->retinex.enabled && (family(retinex) ||
+ *   rawPreprocess || rawDemosaic)`. Replaces the gate at
+ *   improccoordinator.cc:1666 (`M_RETINEX | M_INIT` plus the enabled check).
+ *   Retinex rewrites the shared raw planes, so it is named when its own
+ *   parameters move or when a step that regenerates those planes runs. A
+ *   white-balance-only `M_INIT` does not regenerate the planes and is left to
+ *   the legacy-only class.
+ * - spotApply: `spotPending || (spotConfigured && (family(spot) ||
+ *   rawBaseRebuild))`. Replaces the gates at improccoordinator.cc:2029 and
+ *   :2123. `spotPending` is the request fact carried by the key; the family
+ *   delta is the parameter half. The base rebuild is a disjunct because the
+ *   spots are removed from the freshly rebuilt base even when their
+ *   parameters did not move. Fed by the `spot` family and by the Derived
+ *   aspect.
+ * - spotRestore: `spotPending || spotBufferLive || family(spot)`. Replaces the
+ *   restore at improccoordinator.cc:2123 and the copy-back at :2137. The
+ *   live-buffer disjunct is the standing rule: a live buffer changes the next
+ *   base pass and must be kept in step even when nothing else moves. A spot
+ *   parameter delta allocates a new buffer in the same pass, so it names the
+ *   restore as well.
  * - analysisRun: the same predicate as rawBaseRebuild. The preview folds
  *   analysis into raw.base (`isFoldedPreviewNode("analysis")`), so the body
  *   at improccoordinator.cc:2121 runs exactly with the rebuild branch. Fed by
@@ -268,8 +283,7 @@ struct WorkInputs {
  *   which is restore-versus-recompute, not whether the body runs.
  *
  * The mask is never an input. Every predicate above is a function of the
- * seven WorkInputs; a gate that could only be expressed with a mask bit would
- * be reported as unresolved rather than added.
+ * eight WorkInputs; no gate is expressed with a mask bit.
  */
 WorkOrder derive_preview_work(const WorkInputs& inputs);
 
@@ -293,7 +307,10 @@ WorkOrder derive_preview_work(const WorkInputs& inputs);
  *   coordinator and has no retinex buffer preparation call.
  * - rawPreprocess, rawDemosaic: never derived. The crop never preprocesses or
  *   demosaics; it reads the coordinator's source through `getImage()`.
- * - spotApply: `reload && spotPending`. Replaces the gate at dcrop.cc:1402.
+ * - spotApply: `spotPending`. Replaces the gates at dcrop.cc:1402 and
+ *   :1494. `spotPending` is `(todo & M_SPOT)` plus the enabled/entries test
+ *   carried by the key; the crop has no base rebuild of its own that would
+ *   re-apply the spots.
  * - spotRestore: `spotPending || spotBufferLive`. Replaces the restore at
  *   dcrop.cc:1494 and the pointer swap at :1511. The live-buffer disjunct is
  *   the standing rule; on the crop the restore is a pointer swap, so it does
