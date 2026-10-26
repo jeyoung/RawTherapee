@@ -763,6 +763,45 @@ void testStateMutation()
           "state spot preview: the analysis runs with the base");
 }
 
+/*
+ * Enabling automatic denoise must dirty the analysis block on its own account.
+ *
+ * The analysis measures the noise the denoise base consumes, and the legacy
+ * M_LINDENOISE gate schedules it for this change. The analysis fingerprint has
+ * to name the denoise parameters so the derivation reaches the same conclusion
+ * without the mask, and so a node-level work flag can see the analysis as
+ * directly dirty rather than only as a downstream consumer.
+ */
+void testDenoiseAnalysis()
+{
+    procparams::ProcParams params;
+
+    procparams::ProcParams denoised = params;
+    denoised.dirpyrDenoise.enabled = true;
+
+    /*
+     * The automatic analysis is invalid at both ends, so the render-state
+     * delta is empty: only the fingerprint can schedule the analysis.
+     */
+    RenderStateKey state;
+    state.denoiseAnalysisValid = false;
+    state.dirPyrDenoiseExpComp = 0.5;
+    state.requestKind = RequestKind::ParamsOnly;
+
+    const DirtyBlocks derived = deriveCrop(
+        stage_fingerprints(StagePath::Crop, params),
+        stage_fingerprints(StagePath::Crop, denoised), state, state);
+
+    check(!derived.forced, "denoise: the update is a derivation");
+    check(derived.fromState.empty(),
+          "denoise: an invalid analysis adds no render-state delta");
+    check(contains(derived.fromParams, "analysis"),
+          "denoise: enabling it dirties the analysis directly: "
+              + format_block_ids(derived.fromParams));
+    check(contains(derived.blocks, "analysis"),
+          "denoise: the analysis block is scheduled");
+}
+
 void testShadow()
 {
     const DirtyShadow clean = compare_dirty_shadow(
@@ -1094,6 +1133,7 @@ int main()
     testRequestFacts();
     testAspectBlocks();
     testStateMutation();
+    testDenoiseAnalysis();
     testShadow();
     testResidents();
     testCoupledGroups();

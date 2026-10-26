@@ -2104,12 +2104,17 @@ void hashRawBase(ParamHasher& hasher, const ProcParams& params)
 /*
  * firstAnalysis() reads icm.workingProfile to build the luminance weights
  * (improcfun.cc:515-521). toneCurve is kept from the inventory because the
- * histogram feeds the auto-exposure parameters consumed by raw.base.
+ * histogram feeds the auto-exposure parameters consumed by raw.base. The
+ * automatic denoise measurement reads the denoise configuration (the automatic
+ * methods it selects, and the curve or slider mode), so the whole member is
+ * hashed: an analysis measured for one denoise configuration must not be
+ * reused for another.
  */
 void hashAnalysis(ParamHasher& hasher, const ProcParams& params)
 {
     addField(hasher, params.icm);
     addField(hasher, params.toneCurve);
+    addField(hasher, params.dirpyrDenoise);
 }
 
 /*
@@ -2343,7 +2348,7 @@ const std::vector<DescriptorDefinition>& definitions()
          {"raw", "wb", "toneCurve", "spot", "dirpyrDenoise", "filmNegative",
           "retinex", "dehaze", "fattal", "cg", "icm"},
          hashRawBase},
-        {"analysis", {"icm", "toneCurve"}, hashAnalysis},
+        {"analysis", {"icm", "toneCurve", "dirpyrDenoise"}, hashAnalysis},
         {"transform",
          {"coarse", "commonTrans", "rotate", "distortion", "perspective",
           "cacorrection", "vignetting", "gradient", "pcvignette", "lensProf",

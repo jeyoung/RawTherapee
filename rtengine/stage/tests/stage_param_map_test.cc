@@ -295,6 +295,9 @@ void checkNeutralStability()
  * uninitialised, so their old values depended on stack contents and were not
  * reproducible. Their new values are pinned below, and
  * checkSharpeningExclusions() proves the dead members stay out of the hash.
+ * The analysis value changed when the denoise parameters joined its field
+ * list: the automatic denoise measurement reads them, so the deliberate
+ * format change is recorded here rather than reverted.
  */
 const std::map<std::string, std::string>& neutralExportFingerprints()
 {
@@ -303,7 +306,7 @@ const std::map<std::string, std::string>& neutralExportFingerprints()
         {"raw.preprocess", "6e1c2ab900680311b61ad035af35abdb"},
         {"raw.demosaic", "c45c97915e008007116693df91ceefb5"},
         {"raw.base", "8786a9e2404ada652d318a74b1005f4e"},
-        {"analysis", "3b9a821d71116e555419b613ec7f6604"},
+        {"analysis", "653441262d4cd6d9713a0afe66ae9d3f"},
         {"transform", "a6a394fbf372e1052ebe4fb397d7ef00"},
         {"local.adjustments", "69a6d4f54577a0f76ee897f84b8df245"},
         {"rgb.proc", "3c401612bc6c48edeb1ab96aa95e9c30"},
@@ -473,6 +476,14 @@ const std::vector<Mutation>& mutations()
         /* Analysis */
         {"analysis", "toneCurve.autoexp",
          [](procparams::ProcParams& p) { p.toneCurve.autoexp = true; }, false},
+        /*
+         * The automatic denoise measurement reads the denoise parameters, so
+         * an analysis measured for another denoise configuration must not be
+         * reused.
+         */
+        {"analysis", "dirpyrDenoise.enabled",
+         [](procparams::ProcParams& p) { p.dirpyrDenoise.enabled = true; },
+         false},
         /* Source select */
         {"source.select", "raw.bayersensor.imageNum",
          [](procparams::ProcParams& p) { p.raw.bayersensor.imageNum = 1; },
