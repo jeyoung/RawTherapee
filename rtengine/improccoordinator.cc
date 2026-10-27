@@ -4775,7 +4775,8 @@ void ImProcCoordinator::updatePreviewImage(EditorRequest request,
      * opt-in itself stays with the environment; see stage_runtime.h.
      */
     stage::set_opencl_stage_allowed(
-        App::get().options().rtSettings.useOpenCL);
+        App::get().options().rtSettings.useOpenCL
+        && App::get().options().rtSettings.openCLMode == 1);
 
     // Below 100% the Preview Demosaic Method preference is authoritative.
     // At 100% and above the per-tab FAST toggle decides. Detail windows use

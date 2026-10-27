@@ -45,6 +45,7 @@
 #include "stage/stage_graph.h"
 #include "stage/stage_pipeline.h"
 #include "stage/stage_profile.h"
+#include "stage/stage_runtime.h"
 #include "utils.h"
 
 #include <cassert>
@@ -521,6 +522,14 @@ private:
         ImProcFunctions &ipf = * (ipf_p.get());
         ipf.setOpenCLAllowed(App::get().options().rtSettings.useOpenCL);
         opencl::setStageAllowed(App::get().options().rtSettings.useOpenCL);
+        /*
+         * The graph device path follows the same user setting as the classic
+         * export path. Export runs in both OpenCL modes ("export only" is mode
+         * 0), so the batch policy is governed by useOpenCL alone; the preview
+         * coordinator additionally requires mode 1.
+         */
+        stage::set_opencl_stage_allowed(
+            App::get().options().rtSettings.useOpenCL);
 
         imgsrc->setCurrentFrame(params.raw.bayersensor.imageNum);
         return true;
