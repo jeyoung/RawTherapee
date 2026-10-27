@@ -366,6 +366,15 @@ rt_setup_target(stage-param-hash-test)
 # Explicit render state that is not represented in ProcParams.
 add_executable(stage-render-state-test EXCLUDE_FROM_ALL
     "${CMAKE_CURRENT_SOURCE_DIR}/stage/tests/stage_render_state_test.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/editcallbacks.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/multilangmgr.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/options.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/paramsedited.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/pathutils.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/threadutils.cc"
+)
+target_include_directories(stage-render-state-test BEFORE PRIVATE
+    "${CMAKE_BINARY_DIR}/rtgui"
 )
 target_link_libraries(stage-render-state-test PRIVATE rtengine)
 target_include_directories(stage-render-state-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/stage")

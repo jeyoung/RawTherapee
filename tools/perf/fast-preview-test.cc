@@ -77,27 +77,55 @@ bool testDeferredMask()
 {
     using namespace rtengine;
 
-    constexpr int forced =
-        M_MONITOR | M_RGBCURVE | M_LUMACURVE | M_LUMINANCE | M_COLOR;
+    // The forced stages are typed: monitor.output, rgb.proc and the Lab chain.
+    const stage::DirtyBlocks forced = deferredForcedBlocks();
+    CHECK(forced.ids.count("monitor.output") == 1);
+    CHECK(forced.ids.count("rgb.proc") == 1);
+    CHECK(forced.ids.count("lab.tools") == 1);
+    CHECK(forced.ids.count("lab.wavelet") == 1);
+    CHECK(forced.ids.count("working.trc") == 1);
+    CHECK(forced.ids.count("ciecam") == 1);
+    CHECK(forced.ids.count("gamut") == 1);
 
-    // An empty request still rebuilds the analysis.
-    CHECK(viewportDeferredMask(0) == forced);
+    // No source or raw block can reach the deferred schedule.
+    CHECK(forced.ids.count("source.select") == 0);
+    CHECK(forced.ids.count("raw.preprocess") == 0);
+    CHECK(forced.ids.count("raw.demosaic") == 0);
+    CHECK(forced.ids.count("raw.base") == 0);
+    CHECK(forced.ids.count("analysis") == 0);
 
-    // Downstream stages are preserved.
-    CHECK((viewportDeferredMask(M_COLOR) & M_COLOR) != 0);
+    const uint32_t bits = deferredStageBits(forced);
+    CHECK(bits == deferredForcedStageBits);
+    CHECK((bits & static_cast<uint32_t>(DeferredStage::LocalAdjustments)) == 0);
 
-    // Base bits never reach the deferred pass.
-    CHECK((viewportDeferredMask(M_RAW | M_WB | M_INIT | M_COLOR)
-           & (M_RAW | M_WB | M_INIT)) == 0);
-    CHECK((viewportDeferredMask(M_PREPROC | M_RGBCURVE) & M_PREPROC) == 0);
-    CHECK((viewportDeferredMask(M_TRANSFORM | M_COLOR) & M_TRANSFORM) == 0);
+    // The opaque block-body payload covers the same downstream stages.
+    const int payload = deferredExecutionPayload(bits);
+    CHECK((payload & M_MONITOR) != 0);
+    CHECK((payload & M_RGBCURVE) != 0);
+    CHECK((payload & (M_LUMACURVE | M_LUMINANCE | M_COLOR))
+          == (M_LUMACURVE | M_LUMINANCE | M_COLOR));
+    CHECK((payload & (M_PREPROC | M_RAW | M_WB | M_INIT | M_HDR)) == 0);
 
-    // Accumulating two hits keeps both stages and the forced bits.
-    const int merged = viewportDeferredMask(M_RGBCURVE)
-        | viewportDeferredMask(M_LUMACURVE);
-    CHECK((merged & M_RGBCURVE) != 0);
-    CHECK((merged & M_LUMACURVE) != 0);
-    CHECK((merged & forced) == forced);
+    // A request-stage addition stays typed and adds only its own payload bit.
+    stage::DirtyBlocks withLocal = forced;
+    withLocal.ids.insert("local.adjustments");
+    const uint32_t withLocalBits = deferredStageBits(withLocal);
+    CHECK((withLocalBits
+           & static_cast<uint32_t>(DeferredStage::LocalAdjustments)) != 0);
+    CHECK((deferredExecutionPayload(withLocalBits) & M_AUTOEXP) != 0);
+
+    // The atomic snapshot is a plain value derived from the record.
+    DeferredRecord record;
+    record.blocks = forced;
+    record.forcedAnalysis = true;
+    record.hits = 2;
+    record.firstHitUs = 1000;
+    record.deadlineUs = 1500;
+    const DeferredAnalysisSnapshot snapshot = deferredSnapshot(record);
+    CHECK(snapshot.pending());
+    CHECK(snapshot.stageBits() == bits);
+    CHECK(snapshot.forcedAnalysis());
+    CHECK(snapshot.hits() == 2);
 
     return true;
 }

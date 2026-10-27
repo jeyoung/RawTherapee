@@ -155,7 +155,7 @@ RenderStateKey changedKey()
     key.previousDemoBase = 2;
     /*
      * The request facts. Every field is set to a value the default key does
-     * not have, including the four that are deliberately unmapped: the
+     * not have, including the three that are deliberately unmapped: the
      * "reports every aspect" test then proves that the unmapped facts add no
      * group, rather than passing because they were left at their defaults.
      */
@@ -168,7 +168,6 @@ RenderStateKey changedKey()
     key.denoiseAnalysisValid = true;
     key.spotPending = true;
     key.spotBufferLive = true;
-    key.deferredAnalysisMask = 0x00084000;
     key.cropGuideFingerprint = UINT64_C(0x0123456789abcdef);
     key.viewportMoved = true;
     return key;
@@ -597,8 +596,6 @@ void testRequestFacts()
     const std::vector<Fact> unmappedFacts = {
         {"spotPending",
          [](RenderStateKey& key) { key.spotPending = true; }},
-        {"deferredAnalysisMask",
-         [](RenderStateKey& key) { key.deferredAnalysisMask = 0x00084000; }},
         {"cropGuideFingerprint",
          [](RenderStateKey& key) {
              key.cropGuideFingerprint = UINT64_C(0x0123456789abcdef);

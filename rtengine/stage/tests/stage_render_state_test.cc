@@ -28,12 +28,17 @@
 
 #include "stage_render_state.h"
 
+#include "rtengine/editorrequest.h"
+#include "rtengine/refreshmap.h"
+#include "rtengine/viewportdefer.h"
+
 #include <cstdio>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <string>
 #include <type_traits>
+#include <vector>
 
 namespace
 {
@@ -106,7 +111,6 @@ RenderStateKey sample()
     key.denoiseAnalysisValid = true;
     key.spotPending = true;
     key.spotBufferLive = true;
-    key.deferredAnalysisMask = 0x00084000;
     key.cropGuideFingerprint = UINT64_C(0x0123456789abcdef);
     key.viewportMoved = true;
     return key;
@@ -171,7 +175,6 @@ ParamFingerprint canonicalFingerprint(const RenderStateKey& key)
     hasher.add(key.spotPending);
     hasher.add(key.spotBufferLive);
 
-    hasher.add(key.deferredAnalysisMask);
     hasher.add(key.cropGuideFingerprint);
     hasher.add(key.viewportMoved);
 
@@ -246,10 +249,191 @@ static_assert(noPointers<
                   decltype(RenderStateKey::denoiseAnalysisValid),
                   decltype(RenderStateKey::spotPending),
                   decltype(RenderStateKey::spotBufferLive),
-                  decltype(RenderStateKey::deferredAnalysisMask),
                   decltype(RenderStateKey::cropGuideFingerprint),
                   decltype(RenderStateKey::viewportMoved)>(),
               "RenderStateKey must not contain pointers");
+
+/*
+ * The retired mask-to-reason table, kept as the replay oracle.
+ */
+const char* oldBaseCacheReason(int mask)
+{
+    if (mask & M_PREPROC) {
+        return "preprocess";
+    }
+    if (mask & M_RAW) {
+        return "raw";
+    }
+    if (mask & M_WB) {
+        return "white-balance";
+    }
+    if (mask & M_HIGHQUAL) {
+        return "high-detail-request";
+    }
+    return nullptr;
+}
+
+/*
+ * Typed base-cache input set for one compatibility mask.
+ *
+ * This is the mapping the coordinator's parameter derivation reproduces in
+ * production: one block per family, never the pass execution set.
+ */
+rtengine::stage::DirtyBlocks baseCacheBlocksForMask(int mask)
+{
+    rtengine::stage::DirtyBlocks blocks;
+    blocks.valid = true;
+    if ((mask & M_PREPROC) != 0) {
+        blocks.ids.insert("raw.preprocess");
+    }
+    if ((mask & M_RAW) != 0) {
+        blocks.ids.insert("raw.demosaic");
+    }
+    if ((mask & M_WB) != 0) {
+        blocks.ids.insert("raw.base");
+    }
+    return blocks;
+}
+
+void checkBaseCacheReplay()
+{
+    const auto compare = [](int mask, const char* label) {
+        const char* expected = oldBaseCacheReason(mask);
+        const char* actual = rtengine::stage::baseCacheInvalidationReason(
+            rtengine::stage::baseCacheInvalidationFor(
+                baseCacheBlocksForMask(mask), (mask & M_HIGHQUAL) != 0));
+        const bool equal = (expected == nullptr && actual == nullptr)
+            || (expected != nullptr && actual != nullptr
+                && std::string(expected) == actual);
+        if (!equal) {
+            std::fprintf(stderr,
+                         "FAIL: base-cache replay %s mask=0x%x: old=%s "
+                         "typed=%s\n",
+                         label, mask,
+                         expected != nullptr ? expected : "(none)",
+                         actual != nullptr ? actual : "(none)");
+            ++failures;
+        }
+    };
+
+    // Every producer intent, then every pair of coalesced intents.
+    const rtengine::RequestIntent intents[] = {
+        rtengine::RequestIntent::AllNoRaw,
+        rtengine::RequestIntent::Demosaic,
+        rtengine::RequestIntent::Hdr,
+        rtengine::RequestIntent::SpotAdjust,
+        rtengine::RequestIntent::Transform,
+        rtengine::RequestIntent::WhiteBalance,
+        rtengine::RequestIntent::RepaintOnly,
+        rtengine::RequestIntent::ControlOnly,
+        rtengine::RequestIntent::Compr,
+        rtengine::RequestIntent::CaptureSharpen,
+        rtengine::RequestIntent::DarkFrame,
+        rtengine::RequestIntent::First,
+        rtengine::RequestIntent::AutoExposure,
+        rtengine::RequestIntent::LuminanceCurve,
+        rtengine::RequestIntent::DirPyrEqualizer,
+        rtengine::RequestIntent::RgbCurve,
+        rtengine::RequestIntent::Sharpening
+    };
+
+    long long comparisons = 0;
+    for (rtengine::RequestIntent intent : intents) {
+        compare(rtengine::compatibility_mask(intent), "intent");
+        ++comparisons;
+    }
+    for (rtengine::RequestIntent left : intents) {
+        for (rtengine::RequestIntent right : intents) {
+            compare(rtengine::compatibility_mask(left)
+                        | rtengine::compatibility_mask(right),
+                    "intent pair");
+            ++comparisons;
+        }
+    }
+
+    /*
+     * Exhaustive over the four bits that decide the reason, with a
+     * representative set of unrelated bits present so the typed mapper cannot
+     * depend on anything else.
+     */
+    constexpr int unrelated =
+        M_INIT | M_SPOT | M_LINDENOISE | M_HDR | M_TRANSFORM | M_BLURMAP
+        | M_AUTOEXP | M_RGBCURVE | M_LUMACURVE | M_LUMINANCE | M_COLOR
+        | M_MONITOR | M_CSHARP | M_RETINEX | M_CROP | M_VOID | M_MINUPDATE;
+    const int relevant[] = {M_PREPROC, M_RAW, M_WB, M_HIGHQUAL};
+    for (int subset = 0; subset < 16; ++subset) {
+        int mask = unrelated;
+        for (int bit = 0; bit < 4; ++bit) {
+            if ((subset & (1 << bit)) != 0) {
+                mask |= relevant[bit];
+            }
+        }
+        compare(mask, "relevant subset");
+        ++comparisons;
+    }
+
+    // The narrow typed set maps the base finish to white balance only.
+    {
+        rtengine::stage::DirtyBlocks broad;
+        broad.valid = true;
+        broad.ids.insert("raw.base");
+        broad.ids.insert("analysis");
+        broad.ids.insert("local.adjustments");
+        check(rtengine::stage::baseCacheInvalidationFor(broad, false)
+                  == rtengine::stage::BaseCacheInvalidation::WhiteBalance,
+              "raw.base maps to white-balance");
+    }
+
+    std::printf("stage-render-state-test: base-cache replay: %lld decisions\n",
+                comparisons);
+}
+
+/*
+ * The deferred record is typed and can never schedule the base.
+ */
+void checkDeferredReplay()
+{
+    using namespace rtengine;
+
+    const stage::DirtyBlocks forced = deferredForcedBlocks();
+    check(forced.ids.count("monitor.output") == 1,
+          "deferred forced set names monitor.output");
+    check(forced.ids.count("rgb.proc") == 1,
+          "deferred forced set names rgb.proc");
+    check(forced.ids.count("lab.tools") == 1,
+          "deferred forced set names lab.tools");
+    for (const char* base : {"source.select", "raw.preprocess", "raw.demosaic",
+                             "raw.base", "analysis"}) {
+        check(forced.ids.count(base) == 0,
+              "deferred forced set never names a source or raw block");
+    }
+
+    const uint32_t bits = deferredStageBits(forced);
+    check(bits == deferredForcedStageBits,
+          "deferred stage bits are the canonical forced set");
+    const int payload = deferredExecutionPayload(bits);
+    check((payload & (M_PREPROC | M_RAW | M_WB | M_INIT | M_HDR)) == 0,
+          "deferred execution payload never carries a base bit");
+
+    DeferredRecord record;
+    record.blocks = forced;
+    record.forcedAnalysis = true;
+    record.hits = 3;
+    record.firstHitUs = 100;
+    record.deadlineUs = 600;
+    const DeferredAnalysisSnapshot snapshot = deferredSnapshot(record);
+    check(snapshot.pending(), "deferred snapshot reports pending work");
+    check(snapshot.forcedAnalysis(),
+          "deferred snapshot carries the forced flag");
+    check(snapshot.stageBits() == bits,
+          "deferred snapshot carries the typed bits");
+    check(snapshot.hits() == 3, "deferred snapshot carries the hit count");
+
+    DeferredRecord empty;
+    check(!empty.pending(), "an empty deferred record is not pending");
+    check(!deferredSnapshot(empty).pending(),
+          "an empty deferred snapshot is not pending");
+}
 
 } // namespace
 
@@ -276,7 +460,7 @@ int main()
      */
     {
         const ParamFingerprint golden = sample().fingerprint();
-        const std::string expected = "7ad04e9ccb3fb3abd888a235cc2f2b25";
+        const std::string expected = "e607b13944b921db473300421f0da1b7";
         if (golden.hexString() != expected) {
             std::fprintf(stderr, "golden fingerprint is %s\n",
                          golden.hexString().c_str());
@@ -372,8 +556,6 @@ int main()
                  [](RenderStateKey& key) { key.spotPending = false; });
     expectChange("spotBufferLive",
                  [](RenderStateKey& key) { key.spotBufferLive = false; });
-    expectChange("deferredAnalysisMask",
-                 [](RenderStateKey& key) { key.deferredAnalysisMask = 0; });
     expectChange("cropGuideFingerprint",
                  [](RenderStateKey& key) { key.cropGuideFingerprint = 0; });
     expectChange("viewportMoved",
@@ -445,6 +627,9 @@ int main()
         check(changed.fingerprint() == canonicalFingerprint(changed),
               "a changed state still uses the canonical stream");
     }
+
+    checkBaseCacheReplay();
+    checkDeferredReplay();
 
     if (failures == 0) {
         std::puts("stage-render-state-test: PASS");

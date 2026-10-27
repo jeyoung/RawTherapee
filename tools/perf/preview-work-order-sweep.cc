@@ -872,7 +872,16 @@ int main(int argc, char** argv)
     }
     g_setenv("RT_SETTINGS", settingsDir.c_str(), TRUE);
     g_setenv("RT_CACHE", cacheDir.c_str(), TRUE);
-    g_setenv("RT_PREVIEW_BASE_CACHE", "0", TRUE);
+    /*
+     * The sweep disables the base cache by default so a state dump cannot be
+     * served from an earlier state's snapshot. RT_SWEEP_BASE_CACHE=1 keeps it
+     * on for the dedicated evidence run that proves a deferred flush neither
+     * invalidates nor rebuilds the base.
+     */
+    const char* keepBaseCache = g_getenv("RT_SWEEP_BASE_CACHE");
+    if (keepBaseCache == nullptr || g_strcmp0(keepBaseCache, "1") != 0) {
+        g_setenv("RT_PREVIEW_BASE_CACHE", "0", TRUE);
+    }
     /*
      * The full-state sweep must make every state a settled full-frame pass, so
      * the viewport fast path is switched off: it deliberately repaints a crop

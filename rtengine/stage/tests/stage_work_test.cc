@@ -1119,7 +1119,6 @@ void testUnreadFacts()
     current.gamutCheck = true;
     current.viewportMoved = true;
     current.cropGuideFingerprint = 0x1234567890abcdefULL;
-    current.deferredAnalysisMask = 0x400;
     current.previousDemoBase =
         static_cast<int32_t>(PreviousDemoBase::Sidecar);
     current.fastPreviewEnabled = true;
