@@ -314,156 +314,6 @@ std::string workOrderName(const WorkOrder& order)
     return text;
 }
 
-void WorkShadow::probe(WorkItem item, bool legacyRuns)
-{
-    if (forced_) {
-        return;
-    }
-
-    const size_t index = static_cast<size_t>(item);
-    assert(index < workItemCount && "WorkShadow probe out of range");
-    if (index >= workItemCount) {
-        return;
-    }
-
-    probed_[index] = true;
-    legacy_[index] = legacy_[index] || legacyRuns;
-}
-
-void WorkShadow::probeRawBaseNode(bool legacyRuns)
-{
-    if (forced_) {
-        return;
-    }
-
-    nodeProbed_ = true;
-    nodeLegacy_ = nodeLegacy_ || legacyRuns;
-}
-
-void WorkShadow::skipForcedPass()
-{
-    forced_ = true;
-}
-
-void WorkShadow::report(const char* path, const WorkOrder& order) const
-{
-    static std::atomic<uint64_t> nextPass{1};
-    const uint64_t pass = nextPass.fetch_add(1, std::memory_order_relaxed);
-
-    if (forced_) {
-        std::fprintf(stderr,
-                     "work-shadow %s pass=%llu typedOnly=0 legacyOnly=0 "
-                     "unprobed=0 agree=0 items=forced-no-history\n",
-                     path, static_cast<unsigned long long>(pass));
-        return;
-    }
-
-    const bool preview = std::strcmp(path, "preview") == 0;
-    const bool crop = std::strcmp(path, "crop") == 0;
-
-    const auto applicable = [preview, crop](WorkItem item) {
-        if (!preview && !crop) {
-            return true;
-        }
-        if (item == WorkItem::denoiseRun) {
-            return crop;
-        }
-        if (item == WorkItem::rawPreprocess || item == WorkItem::rawDemosaic
-            || item == WorkItem::retinexPrepare) {
-            return preview;
-        }
-        return true;
-    };
-
-    /* The bodies that live inside the preview raw.base node. */
-    const auto insideRawBaseNode = [](WorkItem item) {
-        return item == WorkItem::rawBaseRebuild
-            || item == WorkItem::retinexPrepare
-            || item == WorkItem::spotApply || item == WorkItem::spotRestore
-            || item == WorkItem::analysisRun;
-    };
-
-    std::string typedOnly;
-    std::string legacyOnly;
-    std::string unprobed;
-    size_t typedCount = 0;
-    size_t legacyCount = 0;
-    size_t unprobedCount = 0;
-    size_t agree = 0;
-
-    const auto append = [](std::string& list, const char* name) {
-        if (!list.empty()) {
-            list += ' ';
-        }
-        list += name;
-    };
-
-    const auto classify = [&](const char* name, bool typed, bool legacy) {
-        if (typed && !legacy) {
-            append(typedOnly, name);
-            ++typedCount;
-        } else if (!typed && legacy) {
-            append(legacyOnly, name);
-            ++legacyCount;
-        } else {
-            ++agree;
-        }
-    };
-
-    for (size_t i = 0; i < workItemCount; ++i) {
-        const WorkItem item = static_cast<WorkItem>(i);
-        if (!applicable(item)) {
-            continue;
-        }
-
-        bool known = probed_[i];
-        bool legacy = legacy_[i];
-        /*
-         * The raw.base node was not entered, so none of the bodies inside it
-         * ran. That is a definite legacy answer, not a missing probe.
-         */
-        if (!known && insideRawBaseNode(item) && nodeProbed_
-            && !nodeLegacy_) {
-            known = true;
-            legacy = false;
-        }
-
-        if (!known) {
-            append(unprobed, workItemName(item));
-            ++unprobedCount;
-            continue;
-        }
-
-        classify(workItemName(item), order.has(item), legacy);
-    }
-
-    std::string items;
-    if (!typedOnly.empty()) {
-        items += "typedOnly[" + typedOnly + "]";
-    }
-    if (!legacyOnly.empty()) {
-        if (!items.empty()) {
-            items += ' ';
-        }
-        items += "legacyOnly[" + legacyOnly + "]";
-    }
-    if (!unprobed.empty()) {
-        if (!items.empty()) {
-            items += ' ';
-        }
-        items += "unprobed[" + unprobed + "]";
-    }
-    if (items.empty()) {
-        items = "none";
-    }
-
-    std::fprintf(stderr,
-                 "work-shadow %s pass=%llu typedOnly=%zu legacyOnly=%zu "
-                 "unprobed=%zu agree=%zu items=%s\n",
-                 path, static_cast<unsigned long long>(pass), typedCount,
-                 legacyCount, unprobedCount, agree, items.c_str());
-}
-
 WorkOrder derive_preview_work(const WorkInputs& inputs)
 {
     assert(inputs.path == StagePath::Preview
@@ -721,11 +571,12 @@ WorkOrder derive_preview_work(const WorkInputs& inputs)
 
     /*
      * The direct base path applies the spots itself, so the copy-back is only
-     * needed when the buffer path ran or a buffer is still live. A disabled or
-     * empty spot tool deletes the buffer, hence the `spotsConfigured` guard.
+     * needed when the buffer path ran or a buffer is still live. A live buffer
+     * is also named when the tool is now disabled: the buffer-maintenance site
+     * clears it, and the copy-back then finds no buffer. Naming that state is
+     * what lets the site stop reading M_SPOT.
      */
-    if ((current.spotBufferLive && spotsConfigured)
-        || (spotApply && !base)) {
+    if (current.spotBufferLive || (spotApply && !base)) {
         order.set(WorkItem::spotRestore);
     }
 
@@ -774,15 +625,15 @@ WorkOrder derive_crop_work(const WorkInputs& inputs)
         && paramFamilyChanged(inputs, &ProcParams::spot);
 
     /*
-     * The crop gates are mask-only: every destructive body tests
-     * `M_INIT | M_LINDENOISE | M_HDR` directly (dcrop.cc: stageSourceSelect,
-     * stageAnalysis, stageRawBase). The crop folds those bits into
-     * RequestKind::FullCrop before it builds the key. A source reload or a
-     * high-detail transition reaches the crop through the same bits, so it is
-     * not an independent disjunct here; the dirty-block derivation models
-     * those render-state aspects separately. HighQuality maps M_HIGHQUAL,
-     * which no crop gate consults, and is therefore not a reload. No history
-     * means the first update, which the legacy path runs with ALL.
+     * The destructive bodies share the reload request. The crop folds
+     * `M_INIT | M_LINDENOISE | M_HDR` into RequestKind::FullCrop before it
+     * builds the key; that fold is the only mask-derived fact the derivation
+     * reads. A source reload or a high-detail transition reaches the crop
+     * through the same bits, so it is not an independent disjunct here; the
+     * dirty-block derivation models those render-state aspects separately.
+     * HighQuality maps M_HIGHQUAL, which the reload request does not carry,
+     * and is therefore not a reload. No history means the first update, which
+     * runs the full destructive set.
      */
     const bool reload = !history || requestReloadsRaw(inputs.requestKind);
 
@@ -807,8 +658,7 @@ WorkOrder derive_crop_work(const WorkInputs& inputs)
         order.set(WorkItem::spotApply);
     }
 
-    if ((current.spotBufferLive && spotsConfigured)
-        || (spotApply && !reload)) {
+    if (current.spotBufferLive || (spotApply && !reload)) {
         order.set(WorkItem::spotRestore);
     }
 

@@ -267,25 +267,21 @@ void testBitset()
 }
 
 /*
- * The conversion switch. With the order disabled the legacy gate is
- * authoritative and a typed item cannot start a body the legacy gate skips;
- * with it enabled the typed item is authoritative, including suppressing a
- * body the legacy gate would run. The default is on; the environment variable
- * is the kill switch.
+ * The conversion switch. The exact order names only the derived items; the
+ * conservative order (kill switch off) names every parameter-applicable item.
+ * The default is on; the environment variable is the kill switch.
  */
 void testWorkOrderSwitch()
 {
     WorkOrder order;
     order.set(WorkItem::rawDemosaic);
 
-    check(workItemRuns(false, order, WorkItem::rawDemosaic, true),
-          "switch off: the legacy run still runs");
-    check(!workItemRuns(false, WorkOrder{}, WorkItem::rawDemosaic, false),
-          "switch off: a legacy skip still skips");
-    check(workItemRuns(true, order, WorkItem::rawDemosaic, false),
-          "switch on: a typed item runs a body the legacy gate skips");
-    check(!workItemRuns(true, order, WorkItem::rawBaseRebuild, true),
-          "switch on: an unset typed item suppresses the legacy answer");
+    check(workItemRuns(order, WorkItem::rawDemosaic),
+          "switch: a typed item runs its body");
+    check(!workItemRuns(order, WorkItem::rawBaseRebuild),
+          "switch: an unset typed item skips its body");
+    check(!workItemRuns(WorkOrder{}, WorkItem::rawDemosaic),
+          "switch: an empty order runs nothing");
 
     /* Unset is the default and enables the typed order. */
     check(workOrderValueEnables(nullptr),
@@ -300,6 +296,59 @@ void testWorkOrderSwitch()
     check(!workOrderValueEnables("0"), "switch: 0 disables");
     check(!workOrderValueEnables("off"), "switch: off disables");
     check(!workOrderValueEnables("OFF"), "switch: OFF disables");
+}
+
+/*
+ * The kill switch derives with no usable history, so every
+ * parameter-applicable raw/core item is named. This is the conservative
+ * fallback that replaces the legacy mask: safe and slower, never empty.
+ */
+void testConservativeFallback()
+{
+    procparams::ProcParams params;
+    params.retinex.enabled = true;
+    params.dirpyrDenoise.enabled = true;
+    params.spot.enabled = true;
+    params.spot.entries.emplace_back();
+
+    RenderStateKey state;
+    state.cropSkip = 1;
+    state.spotBufferLive = true;
+
+    Derivation preview(StagePath::Preview, params, params, state, state,
+                       RequestKind::HighQuality);
+    preview.inputs.previousState = nullptr;
+    preview.inputs.previousFingerprints = nullptr;
+    preview.inputs.previousParams = nullptr;
+    expectOrder(preview.preview(),
+                {WorkItem::sourceSelect, WorkItem::rawPreprocess,
+                 WorkItem::rawDemosaic, WorkItem::rawBaseRebuild,
+                 WorkItem::retinexPrepare, WorkItem::spotApply,
+                 WorkItem::spotRestore, WorkItem::analysisRun},
+                "conservative preview: every raw-core item");
+
+    Derivation crop(StagePath::Crop, params, params, state, state,
+                    RequestKind::HighQuality);
+    crop.inputs.previousState = nullptr;
+    crop.inputs.previousFingerprints = nullptr;
+    crop.inputs.previousParams = nullptr;
+    expectOrder(crop.crop(),
+                {WorkItem::sourceSelect, WorkItem::rawBaseRebuild,
+                 WorkItem::spotApply, WorkItem::spotRestore,
+                 WorkItem::analysisRun, WorkItem::denoiseRun},
+                "conservative crop: every crop raw item");
+
+    /*
+     * The buffer clear is covered by spotRestore: a live buffer with the tool
+     * disabled is still named, so the site can clear it without the mask.
+     */
+    procparams::ProcParams disabled;
+    RenderStateKey live;
+    live.spotBufferLive = true;
+    Derivation clear(StagePath::Crop, disabled, disabled, live, live,
+                     RequestKind::ParamsOnly);
+    expectOrder(clear.crop(), {WorkItem::spotRestore},
+                "conservative crop: a live buffer is named for the clear");
 }
 
 void testNoChange()
@@ -1223,6 +1272,7 @@ int main()
 {
     testBitset();
     testWorkOrderSwitch();
+    testConservativeFallback();
     testNoChange();
     testParameterChanges();
     testEditFamiliesAgainstLegacyOracle();

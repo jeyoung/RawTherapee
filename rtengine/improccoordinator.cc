@@ -1285,12 +1285,13 @@ void dump_crop(const Image8* crop, const char* tag, int visibleX,
  * them are one private method each, called in the order the graph plan
  * schedules, so the inventory and the executor cannot drift apart.
  *
- * A node method keeps the event-mask gate the block always used, because
- * a preview node decides *how much* of its output the current mask allows, not
- * only whether it runs at all. raw.base is the clearest example: it rebuilds
- * the base image for one class of bits, re-prepares retinex for another and
- * re-applies spots for a third. The plan decides whether the node is executed;
- * the node decides what the mask permits inside it.
+ * The downstream node methods keep the event-mask gate the block always used,
+ * because such a node decides *how much* of its output the current mask allows,
+ * not only whether it runs at all. The raw/core bodies are different: each is
+ * gated by the typed work order at this revision, and the plan decides whether
+ * the containing node is executed. The order names the base rebuild, the
+ * retinex preparation, the spot apply/restore and the analysis separately, so
+ * the node enters exactly when one of them is named.
  *
  * analysis is folded into raw.base. firstAnalysis() is the final statement of
  * the base-rebuild guard and the spot pass that closes raw.base mutates
@@ -1341,52 +1342,9 @@ bool isPreviewNode(const std::string& id)
  * Node gates. Each is the condition the hand-written pass used for the same
  * block, or a documented superset of it. A superset only means the node is
  * executed and its own gate decides; a subset would skip work the legacy pass
- * runs, which the plan validation refuses.
+ * runs, which the plan validation refuses. The raw/core bodies are not gated
+ * here any more: the typed work order decides them.
  */
-bool rawWorkRuns(int todo, bool highDetailNeeded,
-                 bool highDetailPreprocessComputed)
-{
-    return (todo & M_PREPROC) != 0
-        || (!highDetailPreprocessComputed && highDetailNeeded);
-}
-
-/*
- * raw.demosaic owns the demosaic, the capture sharpening and the retinex
- * buffer preparation. The predicate is the union of the three guards inside
- * the node. The graph plan decides whether the node is entered; the predicate
- * decides how much of the node's body the event mask permits.
- *
- * A white-balance change can force a demosaic through the Color/Coloropp
- * highlight-recovery path, and a modified RGB source re-demosaics only when
- * the recovery method matches the current one.
- */
-bool rawSourceWorkRuns(int todo, bool highDetailNeeded,
-                       bool highDetailRawComputed, bool rgbSourceModified,
-                       const ProcParams& params)
-{
-    const bool isColor = params.toneCurve.method == "Color"
-        || params.toneCurve.method == "Coloropp";
-    const bool demosaic = (todo & M_RAW) != 0
-        || (!highDetailRawComputed && highDetailNeeded)
-        || (params.toneCurve.hrenabled && !isColor && rgbSourceModified)
-        || (!params.toneCurve.hrenabled && isColor && rgbSourceModified);
-    const bool captureSharpening = (todo & (M_RAW | M_CSHARP)) != 0
-        && params.pdsharpening.enabled;
-
-    return demosaic || captureSharpening;
-}
-
-bool baseRebuildRuns(int todo)
-{
-    return (todo & (M_INIT | M_LINDENOISE | M_HDR)) != 0;
-}
-
-/* raw.base has three gated blocks plus the spot copy that closes the image. */
-bool baseWorkMayRun(int todo, bool spotPending)
-{
-    return baseRebuildRuns(todo) || (todo & (M_RETINEX | M_SPOT)) != 0
-        || spotPending;
-}
 
 /*
  * The base rebuild can change fw/fh through setScale(), so a size-dependent
@@ -1462,9 +1420,9 @@ void logPreviewGraphActive(size_t nodes)
 }
 
 /*
- * Rebuild the vector form of a saved parameter snapshot for the work-order
- * shadow. The map and the vector both follow the canonical preview order, so
- * the ids line up. Only called while RT_WORK_SHADOW is set.
+ * Rebuild the vector form of a saved parameter snapshot for the work order.
+ * The map and the vector both follow the canonical preview order, so the ids
+ * line up.
  */
 stage::BlockFingerprints workFingerprints(
     const stage::ParamSnapshot& snapshot)
@@ -1507,12 +1465,10 @@ struct ImProcCoordinator::PreviewPassState {
     stage::DirtyBlocks dirty;
 
     /*
-     * Read-only work-order shadow comparison, active only while
-     * RT_WORK_SHADOW is set. `work` is the typed order derived once per pass;
-     * `shadow` accumulates the legacy answers at the gate sites.
+     * The typed work order derived once per pass; it is the execution-set
+     * authority for the destructive raw/core bodies.
      */
     stage::WorkOrder work;
-    stage::WorkShadow shadow;
 };
 
 /* The resolved node sequence for one pass. */
@@ -1529,13 +1485,7 @@ struct ImProcCoordinator::PreviewPassPlan {
  */
 void ImProcCoordinator::stageSourceSelect(PreviewPassState& pass)
 {
-    const bool legacyRuns = rawWorkRuns(pass.todo, pass.highDetailNeeded,
-                                        highDetailPreprocessComputed);
-    if (stage::workShadowEnabled()) {
-        pass.shadow.probe(stage::WorkItem::sourceSelect, legacyRuns);
-    }
-    if (!stage::workItemRuns(stage::workOrderEnabled(), pass.work,
-                             stage::WorkItem::sourceSelect, legacyRuns)) {
+    if (!stage::workItemRuns(pass.work, stage::WorkItem::sourceSelect)) {
         return;
     }
 
@@ -1545,13 +1495,7 @@ void ImProcCoordinator::stageSourceSelect(PreviewPassState& pass)
 /* raw.preprocess: black/white levels, flat field, pre-interpolation. */
 void ImProcCoordinator::stageRawPreprocess(PreviewPassState& pass)
 {
-    const bool legacyRuns = rawWorkRuns(pass.todo, pass.highDetailNeeded,
-                                        highDetailPreprocessComputed);
-    if (stage::workShadowEnabled()) {
-        pass.shadow.probe(stage::WorkItem::rawPreprocess, legacyRuns);
-    }
-    if (!stage::workItemRuns(stage::workOrderEnabled(), pass.work,
-                             stage::WorkItem::rawPreprocess, legacyRuns)) {
+    if (!stage::workItemRuns(pass.work, stage::WorkItem::rawPreprocess)) {
         return;
     }
 
@@ -1599,14 +1543,7 @@ void ImProcCoordinator::stageRawPreprocess(PreviewPassState& pass)
  */
 void ImProcCoordinator::stageRawDemosaic(PreviewPassState& pass)
 {
-    const bool legacyRuns = rawSourceWorkRuns(
-        pass.todo, pass.highDetailNeeded, highDetailRawComputed,
-        imgsrc->isRGBSourceModified(), *params);
-    if (stage::workShadowEnabled()) {
-        pass.shadow.probe(stage::WorkItem::rawDemosaic, legacyRuns);
-    }
-    if (!stage::workItemRuns(stage::workOrderEnabled(), pass.work,
-                             stage::WorkItem::rawDemosaic, legacyRuns)) {
+    if (!stage::workItemRuns(pass.work, stage::WorkItem::rawDemosaic)) {
         return;
     }
 
@@ -1695,30 +1632,25 @@ void ImProcCoordinator::stageRawDemosaic(PreviewPassState& pass)
  */
 void ImProcCoordinator::stageRawBase(PreviewPassState& pass)
 {
-    const bool legacyMayRun = baseWorkMayRun(pass.todo, spotprev != nullptr);
-    if (stage::workShadowEnabled()) {
-        pass.shadow.probeRawBaseNode(legacyMayRun);
-    }
-    if (!legacyMayRun) {
+    /*
+     * The node is entered exactly when one of its bodies is named. There is no
+     * independent node gate: the typed order is the execution set, and the
+     * bodies inside the node are gated by their own items below.
+     */
+    const bool nodeRuns =
+        pass.work.has(stage::WorkItem::rawBaseRebuild)
+        || pass.work.has(stage::WorkItem::retinexPrepare)
+        || pass.work.has(stage::WorkItem::spotApply)
+        || pass.work.has(stage::WorkItem::spotRestore)
+        || pass.work.has(stage::WorkItem::analysisRun);
+    if (!nodeRuns) {
         return;
     }
 
     bool spotsDone = false;
 
-    const bool legacyRebuild = baseRebuildRuns(pass.todo);
-    if (stage::workShadowEnabled()) {
-        pass.shadow.probe(stage::WorkItem::rawBaseRebuild, legacyRebuild);
-        /* analysis is folded into the rebuild branch, but has its own item. */
-        pass.shadow.probe(stage::WorkItem::analysisRun, legacyRebuild);
-    }
-
-    /*
-     * The node keeps its entry gate above: the typed order changes which
-     * bodies inside raw.base run, not whether the plan enters the node.
-     */
-    const bool rebuildRuns = stage::workItemRuns(
-        stage::workOrderEnabled(), pass.work, stage::WorkItem::rawBaseRebuild,
-        legacyRebuild);
+    const bool rebuildRuns =
+        stage::workItemRuns(pass.work, stage::WorkItem::rawBaseRebuild);
 
     if (rebuildRuns) {
         if (params->wb.method == "autitcgreen") {
@@ -1726,15 +1658,8 @@ void ImProcCoordinator::stageRawBase(PreviewPassState& pass)
         }
     }
 
-    const bool legacyRetinex = (pass.todo & (M_RETINEX | M_INIT)) != 0
-        && params->retinex.enabled;
-    if (stage::workShadowEnabled()) {
-        pass.shadow.probe(stage::WorkItem::retinexPrepare, legacyRetinex);
-    }
-
-    const bool retinexRuns = stage::workItemRuns(
-        stage::workOrderEnabled(), pass.work, stage::WorkItem::retinexPrepare,
-        legacyRetinex);
+    const bool retinexRuns =
+        stage::workItemRuns(pass.work, stage::WorkItem::retinexPrepare);
     if (retinexRuns) {
         bool dehacontlutili = false;
         bool mapcontlutili = false;
@@ -2098,14 +2023,8 @@ void ImProcCoordinator::stageRawBase(PreviewPassState& pass)
 
         pass.timer->cacheHit = baseCacheHit;
 
-        const bool legacySpot = (pass.todo & M_SPOT) != 0
-            && params->spot.enabled && !params->spot.entries.empty();
-        if (stage::workShadowEnabled()) {
-            pass.shadow.probe(stage::WorkItem::spotApply, legacySpot);
-        }
-        const bool spotRuns = stage::workItemRuns(
-            stage::workOrderEnabled(), pass.work, stage::WorkItem::spotApply,
-            legacySpot);
+        const bool spotRuns =
+            stage::workItemRuns(pass.work, stage::WorkItem::spotApply);
         if (spotRuns) {
             spotsDone = true;
             PreviewProps pp(0, 0, fw, fh, scale);
@@ -2200,45 +2119,34 @@ void ImProcCoordinator::stageRawBase(PreviewPassState& pass)
         // analysis of the finished base image.
         ipf.firstAnalysis(orig_prev, *params, vhist16);
     }
-    const bool legacySpotBuffer = (pass.todo & M_SPOT) != 0 && !spotsDone;
-    const bool legacySpotApply = legacySpotBuffer && params->spot.enabled
-        && !params->spot.entries.empty();
-    if (stage::workShadowEnabled()) {
-        pass.shadow.probe(stage::WorkItem::spotApply, legacySpotApply);
-    }
-
     /*
-     * The typed order names the buffer path when the request or a spot delta
-     * asks for it. The legacy buffer gate stays in the condition on purpose:
-     * its disabled/empty branch is the buffer clear, not a spot application,
-     * and the typed order has no item for that state transition, so skipping
-     * it would leave a stale buffer live.
+     * Spot buffer maintenance. `spotApply` names the buffer apply when the
+     * direct base path did not apply the spots itself; `spotRestore` names a
+     * live buffer, which is restored or, when the tool is no longer
+     * configured, cleared. Neither decision reads the mask: the pending
+     * request and the spot family delta are folded into spotApply by the
+     * derivation.
      */
-    const bool orderEnabled = stage::workOrderEnabled();
-    const bool spotBufferPath = legacySpotBuffer
-        || (orderEnabled && pass.work.has(stage::WorkItem::spotApply)
-            && !spotsDone);
-    if (spotBufferPath) {
-        if (params->spot.enabled && !params->spot.entries.empty()) {
+    const bool spotsConfigured =
+        params->spot.enabled && !params->spot.entries.empty();
+    const bool spotApplyRuns =
+        stage::workItemRuns(pass.work, stage::WorkItem::spotApply);
+    const bool restoreRuns =
+        stage::workItemRuns(pass.work, stage::WorkItem::spotRestore);
+    const bool directSpot = rebuildRuns && spotsDone;
+
+    if (restoreRuns) {
+        if (spotsConfigured && spotApplyRuns && !directSpot) {
             allocCache(spotprev);
             orig_prev->copyData(spotprev);
             PreviewProps pp(0, 0, fw, fh, scale);
             ipf.removeSpots(spotprev, imgsrc, params->spot.entries, pp, currWB, &params->icm, tr);
-        } else {
-            if (spotprev) {
-                delete spotprev;
-                spotprev = nullptr;
-            }
+        } else if (!spotsConfigured && spotprev) {
+            delete spotprev;
+            spotprev = nullptr;
         }
     }
 
-    const bool legacySpotRestore = spotprev != nullptr;
-    if (stage::workShadowEnabled()) {
-        pass.shadow.probe(stage::WorkItem::spotRestore, legacySpotRestore);
-    }
-    const bool restoreRuns = stage::workItemRuns(
-        orderEnabled, pass.work, stage::WorkItem::spotRestore,
-        legacySpotRestore);
     if (restoreRuns && spotprev != nullptr) {
         spotprev->copyData(orig_prev);
     }
@@ -4299,7 +4207,7 @@ void ImProcCoordinator::recordPreviewDirtyState(const PreviewPassState& pass)
 }
 
 /*
- * Record the previous state for the read-only work-order shadow.
+ * Record the previous state for the work order.
  *
  * Called after the crop render, because the crop analysis writes automatic
  * denoise strengths back into the live parameters and the preview bodies and
@@ -4307,11 +4215,11 @@ void ImProcCoordinator::recordPreviewDirtyState(const PreviewPassState& pass)
  * parameter copy are taken together from that post-pass state, so the next
  * derivation compares two halves of the same vintage. Taking one before the
  * previous pass and one after it made a write-back look like a new event and
- * produced a false typed-only run.
+ * produced a false extra run.
  */
 void ImProcCoordinator::recordPreviewWorkHistory()
 {
-    if (!stage::workShadowEnabled() && !stage::workOrderEnabled()) {
+    if (!stage::workOrderEnabled()) {
         return;
     }
 
@@ -4756,53 +4664,42 @@ void ImProcCoordinator::updatePreviewImage(int todo, bool panningRelatedChange,
         /*
          * Work order of the pass. Derived once per pass from the same previous
          * snapshot, keys and parameters the dirty-block derivation uses, and
-         * read by each converted raw-chain gate below. The mask never reaches
-         * the derivation; the legacy answers are still probed at each site.
+         * read by each converted raw/core site below. The mask never reaches
+         * the derivation.
          *
-         * The typed order is on by default. When RT_WORK_ORDER=0 or =off kills
-         * it, this block runs only for the shadow, and only when a usable
-         * history exists, exactly as before the conversion. With the typed
-         * order enabled it always exists: a pass without history derives the
-         * destructive set, because every delta counts then.
+         * With RT_WORK_ORDER enabled (the default) and a usable history the
+         * order is exact. A pass without history derives the destructive set,
+         * because every delta counts then. When the kill switch is off the
+         * derivation deliberately sees no history, so it names every
+         * parameter-applicable raw/core item: a safe, slower superset instead
+         * of the legacy mask.
          */
         const bool wantWorkOrder = stage::workOrderEnabled();
-        const bool wantWorkShadow = stage::workShadowEnabled();
+        const bool history = previewDirtyFingerprintsValid
+            && previewDirtyStateValid && previewDirtyParamsValid;
+        const bool exactHistory = wantWorkOrder && history;
 
-        if (wantWorkOrder || wantWorkShadow) {
-            const bool history = previewDirtyFingerprintsValid
-                && previewDirtyStateValid && previewDirtyParamsValid;
+        {
+            stage::WorkInputs inputs;
+            stage::BlockFingerprints currentWork;
+            stage::BlockFingerprints previousWork;
 
-            if (history || wantWorkOrder) {
-                stage::WorkInputs inputs;
-                stage::BlockFingerprints currentWork;
-                stage::BlockFingerprints previousWork;
+            currentWork = workFingerprints(pass.fingerprints);
 
-                if (history) {
-                    currentWork = workFingerprints(pass.fingerprints);
-                    previousWork = workFingerprints(previewWorkFingerprints);
-                    inputs.previousState = &previewDirtyState;
-                    inputs.previousFingerprints = &previousWork;
-                    inputs.previousParams = &previewDirtyParams;
-                }
-
-                inputs.currentState = &pass.renderState;
-                inputs.currentFingerprints = &currentWork;
-                inputs.requestKind = pass.requestKind;
-                inputs.path = stage::StagePath::Preview;
-                inputs.params = params.get();
-                inputs.colorHlrWbRequest = colorHlrWbRequest;
-                pass.work = stage::derive_preview_work(inputs);
+            if (exactHistory) {
+                previousWork = workFingerprints(previewWorkFingerprints);
+                inputs.previousState = &previewDirtyState;
+                inputs.previousFingerprints = &previousWork;
+                inputs.previousParams = &previewDirtyParams;
             }
 
-            if (wantWorkShadow && !history) {
-                /*
-                 * No usable history: the typed order is the forced full
-                 * destructive set and the legacy mask is not required to carry
-                 * every bit. Report the pass as forced instead of counting a
-                 * typed-only run.
-                 */
-                pass.shadow.skipForcedPass();
-            }
+            inputs.currentState = &pass.renderState;
+            inputs.currentFingerprints = &currentWork;
+            inputs.requestKind = pass.requestKind;
+            inputs.path = stage::StagePath::Preview;
+            inputs.params = params.get();
+            inputs.colorHlrWbRequest = colorHlrWbRequest;
+            pass.work = stage::derive_preview_work(inputs);
         }
 
         pass.dirty = previewDirtyBlocks(pass);
@@ -4841,10 +4738,6 @@ void ImProcCoordinator::updatePreviewImage(int todo, bool panningRelatedChange,
         // The full-frame buffers now match this pass input. Record it after
         // the nodes ran, so the high-detail fields describe the work done.
         recordPreviewDirtyState(pass);
-
-        if (stage::workShadowEnabled()) {
-            pass.shadow.report("preview", pass.work);
-        }
     }
 
 // process crop, if needed

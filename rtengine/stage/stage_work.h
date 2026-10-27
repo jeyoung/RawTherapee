@@ -38,12 +38,11 @@ namespace rtengine::stage
 /*
  * Typed work order for the destructive raw and core jobs.
  *
- * The preview raw-chain gates run from this order by default; RT_WORK_ORDER=0
- * or =off is the kill switch. The crop still decides which body jobs run from
- * the legacy `M_*` mask. Before
- * those gates can be retired, each destructive job needs a name and an exact
- * membership predicate that is derived from the same inputs the gate uses, not
- * from the mask. This unit is that order.
+ * Both paths run their raw/core gates from this order by default. RT_WORK_ORDER=0
+ * or =off is the kill switch: it derives a conservative order that names every
+ * parameter-applicable raw/core item for the pass, so no body is skipped at the
+ * cost of redundant work. The kill switch never falls back to the legacy `M_*`
+ * mask.
  *
  * The scope is deliberately the destructive raw/core jobs only: the jobs that
  * regenerate pixels, rebuild the raw base or write the spot buffer. The
@@ -85,18 +84,17 @@ namespace rtengine::stage
  *   therefore omits it and the demosaic consumer owns it. That is a bounded
  *   subset of the body's ideal inputs, chosen to match the gate the order
  *   describes, not a typed-only superset.
- * - The order drives the preview raw-chain gates by default; RT_WORK_ORDER=0
- *   or RT_WORK_ORDER=off is the kill switch (see workOrderEnabled()). The crop
- *   gates and every downstream preview node keep their legacy gates, so an
- *   error here is visible in the predicate table and in the shadow comparison
- *   rather than in an image.
+ * - The order is the execution-set authority at every converted site. The
+ *   downstream preview and crop nodes keep their own gates; this unit only
+ *   decides which raw/core bodies run.
+ * - When the switch is off the caller derives with no usable history, so every
+ *   parameter-applicable item is named. That is the conservative fallback: a
+ *   superset of the exact set, safe and slower, never the mask.
  *
- * The order is a subset of the legacy gates, never a superset: a fact that
- * the legacy gate does not consult must not name an item, or the shadow
- * comparison would report a typed-only run. Where the legacy gate is coarser
- * than the body's inputs, the typed order names the item only when a request
- * or a parameter delta actually carries it; the remaining over-approximation
- * is measured as legacy-only.
+ * The order names an item only when a request, a parameter delta or a live
+ * buffer state carries it. Where the legacy gate is coarser than the body's
+ * inputs, that keeps the item out; the legacy over-approximation is documented
+ * as redundant work below.
  */
 
 /*
@@ -179,19 +177,10 @@ private:
 std::string workOrderName(const WorkOrder& order);
 
 /*
- * Whether the read-only shadow comparison is enabled.
- *
- * `RT_WORK_SHADOW` is read once per process. The caller gates every shadow
- * computation and every probe on this function; when it is unset, the added
- * cost is one branch and no allocation. No log line is emitted when disabled.
- *
- * Contract of the comparison:
- *
- * - `typedOnly` means the typed order names an item that the legacy gate does
- *   not run. It is a missing input or a derivation error and must be zero.
- * - `legacyOnly` means the legacy gate runs an item that the typed order does
- *   not name. It is the legacy over-approximation that the typed order intends
- *   to save: it is measured, not treated as a defect.
+ * The raw/core sites no longer probe a legacy answer; the typed order is the
+ * execution-set authority at every converted site. The switch is retained for
+ * the diagnostic sweep harness, which reports the environment state before a
+ * run; it has no effect on the engine.
  */
 inline bool workShadowEnabled()
 {
@@ -223,24 +212,21 @@ inline bool workOrderValueEnables(const char* value)
 }
 
 /*
- * Whether the typed order drives the preview raw-chain gates.
+ * Whether the exact typed order drives the raw/core gates.
  *
  * `RT_WORK_ORDER` is read once per process. The default is on: the typed order
- * is authoritative at every converted gate and the legacy answer is still
- * probed when RT_WORK_SHADOW is set.
+ * is the sole scheduling authority at every converted gate.
  *
  * The variable is the kill switch for the conversion, not a preference: any
- * value keeps the typed order enabled, while "0" and "off" make the legacy
- * `M_*` gates authoritative again, exactly as before the conversion. There is
- * no user-facing setting; the switch exists so a regression can be isolated
- * without rebuilding.
+ * value keeps the exact typed order enabled, while "0" and "off" select the
+ * conservative fallback. There is no user-facing setting; the switch exists
+ * so a regression can be isolated without rebuilding.
  *
- * When the typed order is enabled, each converted site runs its body from the
- * typed item instead of the legacy gate. The plan, the crop, the dirty-block
- * derivation and every downstream node gate are unchanged, and the shadow
- * comparison stays available, so the two answers can still be compared pass by
- * pass. The sweep that validated every raw-chain family is recorded in
- * devnotes/perf/STAGE_PIPELINE.md.
+ * The kill switch does not restore the legacy `M_*` gates. The caller derives
+ * the order with no usable history, which names every parameter-applicable
+ * raw/core item for the pass, so a converted site runs a safe superset of the
+ * exact set instead of skipping a body. The plan, the dirty-block derivation
+ * and every downstream node gate are unchanged by the switch.
  */
 inline bool workOrderEnabled()
 {
@@ -250,75 +236,18 @@ inline bool workOrderEnabled()
 }
 
 /*
- * Answer of one gate site.
+ * Answer of one converted gate site.
  *
- * When the switch is off the legacy gate is authoritative, exactly as before
- * the conversion. When it is on the typed item is authoritative. The caller
- * still computes and probes the legacy answer in both modes; this function
- * only picks which answer enters the body.
+ * The caller supplies the order it derived. The exact order names a body only
+ * when its predicate holds; the conservative order (kill switch off) names
+ * every parameter-applicable body. The site never consults the mask, so a
+ * missing item skips the body only on the exact order.
  */
-inline bool workItemRuns(bool orderEnabled, const WorkOrder& order,
-                         WorkItem item, bool legacyRuns)
+inline bool workItemRuns(const WorkOrder& order, WorkItem item)
 {
-    return orderEnabled ? order.has(item) : legacyRuns;
+    return order.has(item);
 }
 
-/*
- * Accumulator for one pass.
- *
- * A gate site reports the legacy answer for one item; repeated sites for the
- * same item are ORed, so the pass compares "did any legacy site run this item"
- * with the typed order. Probing is a no-op until a site has been added.
- *
- * Accounting rules:
- *
- * - Every applicable item that no site probed is counted and named as
- *   `unprobed`; it is never dropped and never folded into `agree`.
- * - A disagreement is counted once per item. The raw.base node-entry gate is
- *   not a separate item: when the node was not entered, it supplies a
- *   definite "did not run" answer for the bodies inside it, so an inner item
- *   that was not probed is still classified exactly once instead of being
- *   lost or double-counted.
- * - Forced/no-history passes are excluded from all counts and reported as
- *   `forced-no-history`.
- *
- * Path coverage differs because the bodies differ. The preview probes eight
- * items: sourceSelect, rawPreprocess, rawDemosaic, rawBaseRebuild,
- * retinexPrepare, spotApply, spotRestore and analysisRun; denoiseRun has no
- * preview body. The crop probes six: sourceSelect, rawBaseRebuild, spotApply,
- * spotRestore, analysisRun and denoiseRun; rawPreprocess, rawDemosaic and
- * retinexPrepare have no crop body. Items outside the path are neither probed
- * nor counted as unprobed.
- *
- * The accumulator is a value with fixed storage, safe to keep in a caller's
- * per-pass state. It allocates only in report(), which is called only when the
- * shadow is enabled.
- */
-struct WorkShadow {
-    void probe(WorkItem item, bool legacyRuns);
-    /*
-     * The raw.base node-entry gate (baseWorkMayRun). It is not an item: it
-     * answers "did not run" for the bodies inside the node when they were not
-     * reached, so an unentered node does not turn its items into unprobed.
-     */
-    void probeRawBaseNode(bool legacyRuns);
-    /*
-     * Mark a pass whose typed order is the forced full destructive set because
-     * the caller has no usable history. The legacy mask is not required to
-     * carry every bit on such a pass, so the pass is reported separately and
-     * does not contribute to typedOnly, legacyOnly or unprobed.
-     */
-    void skipForcedPass();
-    /* Emit the one-line pass report to stderr. */
-    void report(const char* path, const WorkOrder& order) const;
-
-private:
-    std::array<bool, workItemCount> probed_{};
-    std::array<bool, workItemCount> legacy_{};
-    bool nodeProbed_ = false;
-    bool nodeLegacy_ = false;
-    bool forced_ = false;
-};
 
 /*
  * Inputs of one derivation.
@@ -471,12 +400,15 @@ struct WorkInputs {
  *   rebuilt image even if their parameters did not move, but that case is
  *   already carried by `spotPending` for an M_SPOT request. Fed by the `spot`
  *   family and by the Derived aspect.
- * - spotRestore: `(spotBufferLive && spotsConfigured) ||
- *   (spotApply && !base)`. Replaces the copy-back gate at
- *   improccoordinator.cc:2207. The live-buffer disjunct is the standing rule:
- *   a live buffer changes the next base pass and must be kept in step even
- *   when nothing else moves. A spot parameter delta allocates a new buffer in
- *   the same pass, so it names the restore as well when the base did not run.
+ * - spotRestore: `spotBufferLive || (spotApply && !base)`. Replaces the
+ *   copy-back gate at improccoordinator.cc:2207. The live-buffer disjunct is
+ *   the standing rule: a live buffer changes the next base pass and must be
+ *   kept in step even when nothing else moves. A spot parameter delta
+ *   allocates a new buffer in the same pass, so it names the restore as well
+ *   when the base did not run. A live buffer whose tool is now disabled is
+ *   named by the same disjunct: the buffer-maintenance site clears it, and
+ *   the copy-back that follows finds no buffer. Naming the clear is what lets
+ *   the site stop reading `M_SPOT`.
  * - analysisRun: the same predicate as rawBaseRebuild. The preview folds
  *   analysis into raw.base (`isFoldedPreviewNode("analysis")`), so the body
  *   at improccoordinator.cc:2185 runs exactly with the rebuild branch.
@@ -515,8 +447,9 @@ struct WorkInputs {
  *   order in this direction because the fit pass switches the demosaic mode
  *   to FAST, and rawBaseRebuild is named separately by the reload request.
  *
- * Each is measured as legacyOnly, never as typedOnly, and each is redundant
- * work rather than a pixel-affecting job. The caller's Color/Coloropp
+ * Each is redundant work rather than a pixel-affecting job. The `typedOnly=0`
+ * shadow measurement that established this before the retirement is recorded
+ * in devnotes/perf/STAGE_PIPELINE.md. The caller's Color/Coloropp
  * `DEMOSAIC` augmentation for a white-balance edit was in this class before
  * the conversion; it is pixel-affecting, so `hlrWbDemosaic` now names it
  * instead.
@@ -544,49 +477,45 @@ WorkOrder derive_preview_work(const WorkInputs& inputs);
 /*
  * Work order of one crop pass.
  *
- * Predicates, with the gate each replaces. `reload` is
- * `!history || rawReload`, where `rawReload` is
- * `requestKind == FullCrop || FullPreview`. Every crop gate is mask-only:
- * stageSourceSelect, stageAnalysis and stageRawBase all test
- * `M_INIT | M_LINDENOISE | M_HDR` directly. The crop folds those bits into
- * `RequestKind::FullCrop` at dcrop.cc:697 before it builds the key. A source
- * reload or a high-detail transition does not add an independent disjunct:
- * it reaches the crop through the same bits, while the dirty-block derivation
- * models the Source and HighDetail render-state aspects separately.
- * `HighQuality` is not a reload: it maps `M_HIGHQUAL`, which no crop gate
- * consults.
+ * Predicates, with the body each decides. `reload` is `!history || rawReload`,
+ * where `rawReload` is `requestKind == FullCrop || FullPreview`. The crop folds
+ * the reload bits (`M_INIT | M_LINDENOISE | M_HDR`) into
+ * `RequestKind::FullCrop` at dcrop.cc before it builds the key; that request
+ * fact is the only way the mask reaches this function. A source reload or a
+ * high-detail transition does not add an independent disjunct: it reaches the
+ * crop through the same bits, while the dirty-block derivation models the
+ * Source and HighDetail render-state aspects separately. `HighQuality` is not a
+ * reload: it maps `M_HIGHQUAL`, which no crop gate consults.
  *
- * - sourceSelect: `reload`. Replaces the gate at dcrop.cc:981. Fed by the
- *   Request aspect (the crop's only mask-derived fact), the Source aspect and
- *   the HighDetail aspect.
- * - rawBaseRebuild: `reload`. Replaces the branch at dcrop.cc:1455 and the
- *   denoise branch at :1514. The crop always runs the base tail
- *   (`createBuffer()` at dcrop.cc:1567) as a resident step; only this
- *   destructive body is gated, which is why the predicate is the reload alone
- *   and not the base-block fingerprint.
+ * - sourceSelect: `reload`. Fed by the Request aspect (the crop's only
+ *   mask-derived fact), the Source aspect and the HighDetail aspect.
+ * - rawBaseRebuild: `reload`. The crop always runs the base tail
+ *   (`createBuffer()`) as a resident step; only this destructive body is gated,
+ *   which is why the predicate is the reload alone and not the base-block
+ *   fingerprint.
  * - retinexPrepare: never derived. The crop receives the base image from the
  *   coordinator and has no retinex buffer preparation call.
  * - rawPreprocess, rawDemosaic: never derived. The crop never preprocesses or
  *   demosaics; it reads the coordinator's source through `getImage()`.
- * - spotApply: `spotPending || (spotsConfigured && family(spot))`. Replaces
- *   the gates at dcrop.cc:1467 and :1571. `spotPending` is `(todo & M_SPOT)`
- *   plus the enabled/entries test carried by the key; the crop has no base
- *   rebuild of its own that would re-apply the spots.
- * - spotRestore: `(spotBufferLive && spotsConfigured) ||
- *   (spotApply && !reload)`. Replaces the restore at dcrop.cc:1594 and the
- *   pointer swap at :1600. The live-buffer disjunct is the standing rule; on
- *   the crop the restore is a pointer swap, so it does not force the
- *   destructive body and rawBaseRebuild stays reload-only.
- * - analysisRun: `reload`. Replaces the gate at dcrop.cc:1064. The item covers
- *   the automatic-denoise analysis and the PRE/MAN ROI reload inside the same
- *   body; the `leveldnautsimpl` and method branches are internal and do not
- *   change whether the body is entered.
+ * - spotApply: `spotPending || (spotsConfigured && family(spot))`.
+ *   `spotPending` is `(todo & M_SPOT)` plus the enabled/entries test carried by
+ *   the key; that folding is the request fact. The crop has no base rebuild of
+ *   its own that would re-apply the spots.
+ * - spotRestore: `spotBufferLive || (spotApply && !reload)`. The live-buffer
+ *   disjunct is the standing rule; on the crop the restore is a pointer swap,
+ *   so it does not force the destructive body and rawBaseRebuild stays
+ *   reload-only. A live buffer whose tool is now disabled is named by the same
+ *   disjunct so the buffer-maintenance site clears it; the copy-back that
+ *   follows then finds no buffer.
+ * - analysisRun: `reload`. The item covers the automatic-denoise analysis and
+ *   the PRE/MAN ROI reload inside the same body; the `leveldnautsimpl` and
+ *   method branches are internal and do not change whether the body is entered.
  * - denoiseRun: `reload && params.dirpyrDenoise.enabled && cropSkip == 1`.
- *   Replaces the gate at dcrop.cc:1514. The skip test is exact: the crop
- *   denoises only at skip 1, and `cropSkip` is a field of the key.
+ *   The skip test is exact: the crop denoises only at skip 1, and `cropSkip`
+ *   is a field of the key.
  *
- * Remaining typed supersets: none. The crop predicates are the legacy mask
- * gates plus the two spot facts the key carries explicitly.
+ * Remaining typed supersets: none. The spot buffer clear is named by the
+ * spotRestore disjunct, so no crop site reads the mask.
  *
  * Facts that no crop item reads, and why:
  *
@@ -597,8 +526,9 @@ WorkOrder derive_preview_work(const WorkInputs& inputs);
  *   repaint schedules no destructive job.
  * - `deferredAnalysisMask`, `cropGuideFingerprint`: as on the preview.
  *
- * The mask is never an input. The crop's reload bits reach this function only
- * through `RequestKind`, at the boundary that builds the key.
+ * The mask is never an input. The crop's reload and spot request bits reach
+ * this function only through `RequestKind` and `spotPending`, at the boundary
+ * that builds the key.
  */
 WorkOrder derive_crop_work(const WorkInputs& inputs);
 

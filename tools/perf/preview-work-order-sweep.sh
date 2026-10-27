@@ -9,11 +9,11 @@
 #   RT_BUILD_DIR   configured build directory (default build/cpu)
 #
 # The driver runs the same image and state sequence twice: once with the
-# legacy gates authoritative (RT_WORK_ORDER=off) and once with the typed order
-# at its default (RT_WORK_ORDER unset). It then compares every settled state's
-# preview.tif and work.tif with ImageMagick and requires pixel-exact equality,
-# checks that every shadow pass reports typedOnly=0, and probes the kill
-# switch. Raw files and dumps stay under build/test-scratch.
+# conservative fallback (RT_WORK_ORDER=off) and once with the exact typed
+# order at its default (RT_WORK_ORDER unset). It then compares every settled
+# state's preview.tif and work.tif with ImageMagick and requires pixel-exact
+# equality, checks that no legacy raw/core compare site remains, and probes
+# the kill switch. Raw files and dumps stay under build/test-scratch.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -70,26 +70,30 @@ check_switch 0 env RT_WORK_ORDER=OFF
 rm -rf "$out/off" "$out/on"
 mkdir -p "$out/off" "$out/on"
 
-echo "== sweep: legacy gates (RT_WORK_ORDER=off) =="
-OMP_NUM_THREADS=1 RT_WORK_ORDER=off RT_WORK_SHADOW=1 \
+echo "== sweep: conservative fallback (RT_WORK_ORDER=off) =="
+OMP_NUM_THREADS=1 RT_WORK_ORDER=off \
     stdbuf -oL -eL "$bin" "$raw" "$out/off" >"$out/off.log" 2>&1
-echo "== sweep: typed order (default on) =="
-OMP_NUM_THREADS=1 env -u RT_WORK_ORDER RT_WORK_SHADOW=1 \
+echo "== sweep: exact typed order (default on) =="
+OMP_NUM_THREADS=1 env -u RT_WORK_ORDER \
     stdbuf -oL -eL "$bin" "$raw" "$out/on" >"$out/on.log" 2>&1
 
-grep -q "SWITCH work-order=0 shadow=1" "$out/off.log" \
-    || { echo "off run did not report the legacy switch" >&2; exit 1; }
-grep -q "SWITCH work-order=1 shadow=1" "$out/on.log" \
-    || { echo "on run did not report the default switch" >&2; exit 1; }
+grep -q "SWITCH work-order=0 shadow=0" "$out/off.log" \
+    || { echo "off run did not report the conservative switch" >&2; exit 1; }
+grep -q "SWITCH work-order=1 shadow=0" "$out/on.log" \
+    || { echo "on run did not report the exact switch" >&2; exit 1; }
 
-shadow_lines=$(grep -c "work-shadow preview" "$out/off.log" || true)
-typed_ok=$(grep -c "work-shadow preview .*typedOnly=0 " "$out/off.log" || true)
-if [ "$shadow_lines" -eq 0 ] || [ "$typed_ok" -ne "$shadow_lines" ]; then
-    echo "typedOnly FAIL: $typed_ok of $shadow_lines passes reported zero" >&2
-    grep "work-shadow preview" "$out/off.log" >&2
+# The raw/core legacy gates are retired: no site emits a comparison line.
+if grep -q "work-shadow" "$out/off.log" "$out/on.log"; then
+    echo "retirement FAIL: a work-shadow comparison is still emitted" >&2
     exit 1
 fi
-echo "shadow: $typed_ok of $shadow_lines passes typedOnly=0 (off run)"
+
+states=$(grep -c "^STATE " "$out/off.log" || true)
+if [ "$states" -eq 0 ]; then
+    echo "sweep FAIL: no states reported" >&2
+    exit 1
+fi
+echo "retirement: no legacy raw/core compare site remains ($states states)"
 
 echo "== per-state parity =="
 failures=0
@@ -119,37 +123,4 @@ if [ "$failures" -ne 0 ]; then
     exit 1
 fi
 
-echo "== shadow detail (off run) =="
-awk '
-    /^STATE / {
-        pass = ""
-        for (i = 1; i <= NF; ++i) {
-            if ($i ~ /^pass=/) {
-                pass = substr($i, 6)
-            }
-        }
-        if (pass != "") {
-            name[pass] = $3
-        }
-        next
-    }
-    /work-shadow preview/ {
-        pass = ""
-        for (i = 1; i <= NF; ++i) {
-            if ($i ~ /^pass=/) {
-                pass = substr($i, 6)
-            }
-        }
-        line[pass] = $0
-        order[++count] = pass
-        next
-    }
-    END {
-        for (i = 1; i <= count; ++i) {
-            pass = order[i]
-            printf "%-28s %s\n", name[pass], line[pass]
-        }
-    }
-' "$out/off.log"
-
-echo "preview work-order sweep: PASS ($shadow_lines passes)"
+echo "preview work-order sweep: PASS ($states states)"
