@@ -35,8 +35,8 @@ Resize::Resize () : FoldableToolPanel(this, TOOL_NAME, M("TP_RESIZE_LABEL"), fal
 {
     auto m = ProcEventMapper::getInstance();
     EvResizeAllowUpscaling = m->newEvent(rtengine::RequestIntent::ControlOnly, "HISTORY_MSG_RESIZE_ALLOWUPSCALING");
-    EvResizeLongedge = m->newEvent (RESIZE, "HISTORY_MSG_RESIZE_LONGEDGE");
-    EvResizeShortedge = m->newEvent (RESIZE, "HISTORY_MSG_RESIZE_SHORTEDGE");   
+    EvResizeLongedge = m->newEvent (rtengine::RequestIntent::ControlOnly, "HISTORY_MSG_RESIZE_LONGEDGE");
+    EvResizeShortedge = m->newEvent (rtengine::RequestIntent::ControlOnly, "HISTORY_MSG_RESIZE_SHORTEDGE");
 
     cropw = 0;
     croph = 0;
