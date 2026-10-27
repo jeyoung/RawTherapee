@@ -119,6 +119,7 @@ set(RTENGINESOURCEFILES
     stage/stage_buffer_state.cc
     stage/stage_builtins.cc
     stage/stage_cache.cc
+    stage/stage_cache_integration.cc
     stage/stage_device.cc
     stage/stage_dirty_blocks.cc
     stage/stage_graph.cc
@@ -276,6 +277,26 @@ add_executable(stage-cache-test EXCLUDE_FROM_ALL
 target_link_libraries(stage-cache-test PRIVATE rtengine)
 target_include_directories(stage-cache-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/stage")
 rt_setup_target(stage-cache-test)
+
+# Node-output cache of the preview raw.base tier: key, decision, budget,
+# eviction, counters, disabled path and repeated-pass parity.
+add_executable(stage-node-cache-test EXCLUDE_FROM_ALL
+    "${CMAKE_CURRENT_SOURCE_DIR}/stage/tests/stage_node_cache_test.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/editcallbacks.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/multilangmgr.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/options.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/paramsedited.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/pathutils.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/threadutils.cc"
+)
+target_include_directories(stage-node-cache-test BEFORE PRIVATE
+    "${CMAKE_BINARY_DIR}/rtgui"
+)
+target_link_libraries(stage-node-cache-test PRIVATE rtengine)
+target_include_directories(stage-node-cache-test PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/stage"
+)
+rt_setup_target(stage-node-cache-test)
 
 add_executable(stage-device-test EXCLUDE_FROM_ALL
     "${CMAKE_CURRENT_SOURCE_DIR}/stage/tests/stage_device_test.cc"
