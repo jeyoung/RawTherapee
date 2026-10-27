@@ -59,6 +59,13 @@ public:
     /* Whether the event has a registered dynamic request. */
     bool hasRegisteredRequest(ProcEvent event) const;
 
+    /*
+     * Recorded classification of a static ProcEventCode. This is the table
+     * lookup the registry uses for static identities; a code outside the
+     * static range is a contract violation and fails fast.
+     */
+    static RequestIntent staticEventIntent(int code);
+
 private:
     EditorRequestRegistry();
 

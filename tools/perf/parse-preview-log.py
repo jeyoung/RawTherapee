@@ -8,13 +8,14 @@ import re
 import sys
 
 LINE = re.compile(
-    r"preview update:\s+(?P<ms>\d+)\s+ms\s+todo=0x(?P<todo>[0-9a-fA-F]+)"
+    r"preview update:\s+(?P<ms>\d+)\s+ms\s+kind=(?P<kind>\d+)"
+    r"\s+request=(?P<request>[0-9a-fA-F]{1,16})"
     r"(?:\s+cache=(?P<cache>\d+))?"
     r"(?:\s+viewport=(?P<viewport>[A-Za-z-]+))?"
     r"(?:\s+crop_ms=(?P<crop_ms>\d+))?"
-    r"(?:\s+deferred_todo=0x(?P<deferred_todo>[0-9a-fA-F]+))?"
+    r"(?:\s+deferred_stages=0x(?P<deferred_stages>[0-9a-fA-F]+))?"
     r"(?:\s+deferred_hits=(?P<deferred_hits>\d+))?"
-    r"(?:\s+reason=(?P<reason>[A-Za-z-]+))?"
+    r"(?:\s+reason=(?P<reason>[A-Za-z0-9_-]+))?"
 )
 
 
@@ -42,23 +43,34 @@ def main():
             continue
         row = match.groupdict()
         row["ms"] = int(row["ms"])
-        row["todo"] = int(row["todo"], 16)
+        row["kind"] = int(row["kind"])
+        row["request"] = int(row["request"], 16)
         if row["cache"] is not None:
             row["cache"] = int(row["cache"])
         if row["crop_ms"] is not None:
             row["crop_ms"] = int(row["crop_ms"])
-        if row["deferred_todo"] is not None:
-            row["deferred_todo"] = int(row["deferred_todo"], 16)
+        if row["deferred_stages"] is not None:
+            row["deferred_stages"] = int(row["deferred_stages"], 16)
         if row["deferred_hits"] is not None:
             row["deferred_hits"] = int(row["deferred_hits"])
         rows.append(row)
 
+    matched = len(rows)
     if args.drop_first and rows:
         rows = rows[1:]
 
+    if not rows:
+        if matched == 0:
+            message = "no 'preview update:' samples found"
+        else:
+            message = "every 'preview update:' sample was dropped"
+        print(f"parse-preview-log: {message} in {args.path}",
+              file=sys.stderr)
+        return 1
+
     if args.csv:
-        fields = ["ms", "todo", "cache", "viewport", "crop_ms",
-                  "deferred_todo", "deferred_hits", "reason"]
+        fields = ["ms", "kind", "request", "cache", "viewport", "crop_ms",
+                  "deferred_stages", "deferred_hits", "reason"]
         with open(args.csv, "w", encoding="utf-8") as handle:
             handle.write(",".join(fields) + "\n")
             for row in rows:

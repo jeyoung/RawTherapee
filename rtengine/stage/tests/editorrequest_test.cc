@@ -401,6 +401,28 @@ void checkRegistry()
           "an obsolete event resolves to no request");
 }
 
+/* Every static code in the registry range resolves to its recorded row. */
+void checkStaticRegistryRange()
+{
+    EditorRequestRegistry* registry = EditorRequestRegistry::getInstance();
+    std::size_t rows = 0;
+
+    for (int code = 0; code < rtengine::NUMOFEVENTS; ++code) {
+        const RequestIntent intent =
+            EditorRequestRegistry::staticEventIntent(code);
+        const EditorRequest expected = make_request(intent);
+        const EditorRequest actual = registry->requestFor(ProcEvent(code));
+        check(actual.identity() == expected.identity(),
+              "static event " + std::to_string(code)
+                  + " resolves to its recorded intent");
+        ++rows;
+    }
+
+    check(rows == static_cast<std::size_t>(rtengine::NUMOFEVENTS),
+          "the static registry covers the whole event range");
+    std::printf("editorrequest-test: static registry: %zu rows\n", rows);
+}
+
 /* Producer event keys separate requests that differ in any typed fact. */
 void checkProducerEventKey()
 {
@@ -639,9 +661,6 @@ void checkNoLegacyProducerCalls()
 
         const std::string relative =
             fs::relative(it->path(), root).generic_string();
-        if (relative == "eventmapper.cc" || relative == "eventmapper.h") {
-            continue;
-        }
 
         std::ifstream stream(it->path());
         if (!stream) {
@@ -728,10 +747,7 @@ void checkMaskRetirementGuard()
 
             const std::string relative =
                 fs::relative(it->path(), sourceRoot).generic_string();
-            if (relative == "rtgui/eventmapper.cc"
-                    || relative == "rtgui/eventmapper.h"
-                    || relative
-                        == "rtengine/stage/tests/editorrequest_test.cc") {
+            if (relative == "rtengine/stage/tests/editorrequest_test.cc") {
                 continue;
             }
 
@@ -818,6 +834,7 @@ int main()
     checkCoalesce();
     checkAugmentations();
     checkRegistry();
+    checkStaticRegistryRange();
     checkProducerEventKey();
     checkCropReallocationWorkOrder();
     checkConvertedProducerIntents();

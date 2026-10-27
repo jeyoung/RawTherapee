@@ -247,6 +247,11 @@ EditorRequestRegistry *EditorRequestRegistry::getInstance()
     return &instance;
 }
 
+RequestIntent EditorRequestRegistry::staticEventIntent(int code)
+{
+    return staticIntentFor(code);
+}
+
 ProcEvent EditorRequestRegistry::newEvent()
 {
     return ProcEvent(++nextEvent_);
