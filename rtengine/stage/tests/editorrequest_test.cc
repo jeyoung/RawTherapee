@@ -243,6 +243,127 @@ void checkCombinedBits()
 }
 
 /*
+ * The viewport fast-path facts. Each is a pure bit test the admission and LUT
+ * selection read, so the adapter must set it for every single bit, and a
+ * coalesced request must recompute it from the union.
+ */
+void checkViewportFacts()
+{
+    constexpr int baseChain =
+        M_PREPROC | M_RAW | M_WB | M_INIT | M_LINDENOISE | M_MONITOR
+        | M_TRANSFORM | M_CSHARP | M_RETINEX | M_BLURMAP;
+
+    for (const BitExpectation& row : expectations()) {
+        const EditorRequest request = from_legacy_mask(row.bit);
+        const std::string label = std::string("facts ") + row.name;
+
+        check(request.baseChainIntent == ((row.bit & baseChain) != 0),
+              label + ": baseChainIntent");
+        check(request.cropIntent == (row.bit == M_CROP),
+              label + ": cropIntent");
+        check(request.repaintRequest == (row.bit == M_MINUPDATE),
+              label + ": repaintRequest");
+        check(request.controlBitRequest == (row.bit == M_VOID),
+              label + ": controlBitRequest");
+        check(request.lumaCurveIntent == (row.bit == M_LUMACURVE),
+              label + ": lumaCurveIntent");
+        check(request.labPixelIntent
+                  == (row.bit == M_LUMINANCE || row.bit == M_COLOR),
+              label + ": labPixelIntent");
+        check(request.luminanceIntent == (row.bit == M_LUMINANCE),
+              label + ": luminanceIntent");
+        check(request.colorIntent == (row.bit == M_COLOR),
+              label + ": colorIntent");
+        check(request.transformRequest == (row.bit == M_TRANSFORM),
+              label + ": transformRequest");
+    }
+
+    const EditorRequest merged = coalesce(from_legacy_mask(M_LUMACURVE),
+                                          from_legacy_mask(M_CROP));
+    check(merged.lumaCurveIntent && merged.cropIntent,
+          "coalescing unions the viewport facts");
+    check(merged.baseChainIntent == false,
+          "a Lab and crop union stays outside the base chain");
+    check(planningAgreesWithLegacyMask(merged),
+          "the coalesced viewport facts agree with the union mask");
+}
+
+/*
+ * Viewport admission and LUT selection for the documented request shapes.
+ * The exhaustive decision table lives in viewport_admission_test.cc; this
+ * pins the reason strings and the selections the coordinator consumes.
+ */
+void checkViewportAdmission()
+{
+    using rtengine::ViewportAdmissionInputs;
+    using rtengine::ViewportAdmissionState;
+    using rtengine::ViewportEligibility;
+    using rtengine::viewportCropSelection;
+    using rtengine::viewportCropTodo;
+    using rtengine::viewportEligibility;
+    using rtengine::viewportFastPathFallback;
+    using rtengine::viewportLutSelection;
+
+    check(viewportEligibility(from_legacy_mask(M_CROP))
+              == ViewportEligibility::Admit,
+          "a crop request is admissible");
+    check(viewportEligibility(from_legacy_mask(M_HIGHQUAL))
+              == ViewportEligibility::Base,
+          "a high-detail request is a base request");
+    check(viewportEligibility(from_legacy_mask(M_VOID))
+              == ViewportEligibility::Unsupported,
+          "a control-only request is unsupported");
+
+    {
+        rtengine::ViewportLutSelection selection =
+            viewportLutSelection(from_legacy_mask(M_CROP));
+        check(selection.toneCurves && selection.lumaCurveFromCrop
+                  && !selection.labCurves && !selection.wavelet,
+              "a crop request rebuilds the tone LUTs and lumacurve only");
+
+        const EditorRequest luma = from_legacy_mask(M_LUMACURVE);
+        selection = viewportLutSelection(luma);
+        check(selection.labCurves && selection.rebuildsLumaCurve()
+                  && !selection.wavelet,
+              "a luminance-curve request rebuilds the whole Lab family");
+
+        const EditorRequest autoExp = from_legacy_mask(M_AUTOEXP);
+        selection = viewportLutSelection(autoExp);
+        check(selection.wavelet && !selection.lumaCurveFromCrop,
+              "auto exposure rebuilds the wavelet LUT");
+    }
+
+    {
+        const EditorRequest crop = from_legacy_mask(M_CROP);
+        const rtengine::ViewportCropSelection selection =
+            viewportCropSelection(crop);
+        check(viewportCropTodo(selection) == M_CROP,
+              "a crop request renders only the crop subset");
+
+        const EditorRequest widened =
+            from_legacy_mask(M_LUMACURVE | M_LUMINANCE | M_COLOR);
+        rtengine::ViewportCropSelection dependent =
+            viewportCropSelection(widened);
+        rtengine::resolveCropDependencies(dependent);
+        check(viewportCropTodo(dependent)
+                  == (M_LUMACURVE | M_LUMINANCE | M_COLOR),
+              "the Lab pixel dependency keeps the exact bits");
+    }
+
+    {
+        rtengine::procparams::ProcParams params;
+        params.toneCurve.autoexp = true;
+        ViewportAdmissionInputs inputs{params, params, params, {}};
+        inputs.state.fastPathEnabled = true;
+        inputs.state.fullStateComplete = true;
+        check(std::string(viewportFastPathFallback(
+                  from_legacy_mask(M_CROP), inputs))
+                  == "auto-exposure",
+              "auto exposure keeps its fallback reason");
+    }
+}
+
+/*
  * Every pair of bits that can legally be coalesced must produce exactly the
  * request a single mask of the union produces: same kind, same facts, same
  * gate mask and same identity. Pairs whose union contains a combined
@@ -296,6 +417,24 @@ void checkEveryPair()
             check(merged.localAdjustmentsIntent
                       == single.localAdjustmentsIntent,
                   label + ": localAdjustmentsIntent");
+            check(merged.baseChainIntent == single.baseChainIntent,
+                  label + ": baseChainIntent");
+            check(merged.cropIntent == single.cropIntent,
+                  label + ": cropIntent");
+            check(merged.repaintRequest == single.repaintRequest,
+                  label + ": repaintRequest");
+            check(merged.controlBitRequest == single.controlBitRequest,
+                  label + ": controlBitRequest");
+            check(merged.lumaCurveIntent == single.lumaCurveIntent,
+                  label + ": lumaCurveIntent");
+            check(merged.labPixelIntent == single.labPixelIntent,
+                  label + ": labPixelIntent");
+            check(merged.luminanceIntent == single.luminanceIntent,
+                  label + ": luminanceIntent");
+            check(merged.colorIntent == single.colorIntent,
+                  label + ": colorIntent");
+            check(merged.transformRequest == single.transformRequest,
+                  label + ": transformRequest");
             check(merged.legacyGateMask == unionMask,
                   label + ": gate mask");
             check(merged.identity() == single.identity(),
@@ -608,25 +747,39 @@ void checkRefreshMapper()
 
 /*
  * Producer actions with the same planning identity must still be distinct
- * events: EvSpotEnabled (ALLNORAW) and EvSpotEnabledOPA (SPOTADJUST) share a
- * history message today and plan identically, but their compatibility masks
- * differ. The event key therefore includes the mask.
+ * events when their compatibility masks differ. The event key therefore
+ * includes the identity *and* the mask: a mask difference that carries no
+ * planning fact today (M_LUMINANCE and M_COLOR are both the Lab pixel family)
+ * must not collapse two producer actions into one registry entry.
  */
 void checkProducerEventKey()
 {
-    const EditorRequest allNoRaw = make_request(RequestIntent::AllNoRaw);
-    const EditorRequest spotAdjust = make_request(RequestIntent::SpotAdjust);
+    const EditorRequest lab = from_legacy_mask(M_LUMINANCE);
+    const EditorRequest colour = from_legacy_mask(M_COLOR);
 
-    check(allNoRaw.identity() == spotAdjust.identity(),
-          "ALLNORAW and SPOTADJUST share a planning identity");
-    check(allNoRaw.legacyGateMask != spotAdjust.legacyGateMask,
-          "ALLNORAW and SPOTADJUST differ in their compatibility mask");
-    check(producerEventKey(allNoRaw, "HISTORY_MSG_SPOT")
-              != producerEventKey(spotAdjust, "HISTORY_MSG_SPOT"),
+    check(lab.identity() == colour.identity(),
+          "M_LUMINANCE and M_COLOR share a planning identity");
+    check(lab.legacyGateMask != colour.legacyGateMask,
+          "M_LUMINANCE and M_COLOR differ in their compatibility mask");
+    check(producerEventKey(lab, "HISTORY_MSG_LAB")
+              != producerEventKey(colour, "HISTORY_MSG_LAB"),
           "same identity and message with different masks get distinct keys");
-    check(producerEventKey(allNoRaw, "HISTORY_MSG_SPOT")
-              == producerEventKey(allNoRaw, "HISTORY_MSG_SPOT"),
+    check(producerEventKey(lab, "HISTORY_MSG_LAB")
+              == producerEventKey(lab, "HISTORY_MSG_LAB"),
           "the same producer action keeps its key");
+
+    /*
+     * The base-chain fact is a planning field: ALLNORAW asks for the
+     * full-frame base and RGBCURVE does not, so the two cannot share an
+     * identity even though their other facts overlap.
+     */
+    const EditorRequest allNoRaw = make_request(RequestIntent::AllNoRaw);
+    const EditorRequest rgbCurve = make_request(RequestIntent::RgbCurve);
+
+    check(allNoRaw.baseChainIntent && !rgbCurve.baseChainIntent,
+          "ALLNORAW is a base-chain request and RGBCURVE is not");
+    check(allNoRaw.identity() != rgbCurve.identity(),
+          "ALLNORAW and RGBCURVE differ in their planning identity");
 
     for (const IntentExpectation& left : intentExpectations()) {
         for (const IntentExpectation& right : intentExpectations()) {
@@ -1087,6 +1240,8 @@ void checkContractViolations()
 int main()
 {
     checkEveryBit();
+    checkViewportFacts();
+    checkViewportAdmission();
     checkControlAndImperative();
     checkCombinedBits();
     checkEveryPair();

@@ -25,6 +25,7 @@
  * usable history; the incremental path is the one under test.
  *
  *   preview-work-order-sweep <raw> <out-dir> [--timing=N [--clamp]]
+ *   preview-work-order-sweep <raw> <out-dir> --fast-path [--timing=N]
  *   preview-work-order-sweep --print-switch
  *
  * Parity mode writes a private RT_PREVIEW_DUMP directory, waits for each pass
@@ -32,6 +33,12 @@
  * <out-dir>/<NN>-<state>/. Run the driver twice, once with the typed order
  * disabled (RT_WORK_ORDER=off) and once with it enabled (the default), then
  * compare the copies pixel-exactly.
+ *
+ * `--fast-path` runs the eligible sequence instead: every state is an edit the
+ * viewport fast path can serve, and the harness leaves RT_VIEWPORT_FAST at its
+ * default instead of forcing the full render. It prints `VIEWPORT enabled=...`
+ * so the driver can prove the mode, and the driver compares each state against
+ * the same state rendered with the fast path off.
  *
  * Timing mode does not dump. It loads the same image with the same profile
  * and preview scale, performs the same initial pass and then times `N` plain
@@ -46,6 +53,7 @@
  */
 
 #include <algorithm>
+#include <cassert>
 #include <chrono>
 #include <clocale>
 #include <cmath>
@@ -151,6 +159,59 @@ std::string joinPath(const std::string& a, const std::string& b)
     return (std::filesystem::path(a) / b).string();
 }
 
+/*
+ * Minimal visible crop.
+ *
+ * The viewport fast path only renders crops that have a listener, so a
+ * headless fast-path check must own one. The image itself is not consumed
+ * here: Crop::update writes its viewport output through the preview dump
+ * hook (`crop-main.tif`), which is the artefact the driver compares.
+ */
+class CropCapture final : public rtengine::DetailedCropListener
+{
+public:
+    void setDetailedCrop(rtengine::IImage8*, rtengine::IImage8*,
+                         const rtengine::procparams::ColorManagementParams&,
+                         const rtengine::procparams::CropParams&,
+                         const rtengine::procparams::CropGuideParams&,
+                         int, int, int, int, int) override
+    {
+    }
+
+    void getWindow(int& cx, int& cy, int& cw, int& ch, int& skip) override
+    {
+        cx = x_;
+        cy = y_;
+        cw = width_;
+        ch = height_;
+        skip = skip_;
+    }
+
+    void setWindow(int x, int y, int width, int height, int skip)
+    {
+        x_ = x;
+        y_ = y;
+        width_ = width;
+        height_ = height;
+        skip_ = skip;
+    }
+
+private:
+    int x_ = 64;
+    int y_ = 64;
+    int width_ = 384;
+    int height_ = 256;
+    int skip_ = 4;
+};
+
+/*
+ * The fit-zoom viewport: the whole image at the preview skip. The crop window
+ * is in full-image coordinates with its own skip (Crop::setCropSizes), so the
+ * immediate crop cost is what a user waits for at fit zoom.
+ */
+constexpr int CROP_X = 0;
+constexpr int CROP_Y = 0;
+
 bool copyDump(const std::string& dumpDir, const std::string& outDir,
               const std::string& name, unsigned pass)
 {
@@ -193,6 +254,23 @@ bool copyDump(const std::string& dumpDir, const std::string& outDir,
         }
     }
 
+    /*
+     * The visible crop is dumped only when the pass rendered one, which the
+     * fast-path check requires. The descriptor has no pass counter, so the
+     * file is whatever the last crop render of the settled state produced.
+     */
+    const std::string cropSource = joinPath(dumpDir, "crop-main.tif");
+    if (std::filesystem::exists(cropSource)) {
+        std::filesystem::copy_file(
+            cropSource, joinPath(target, "crop-main.tif"),
+            std::filesystem::copy_options::overwrite_existing, error);
+        if (error) {
+            std::fprintf(stderr, "sweep: cannot copy crop-main.tif: %s\n",
+                         error.message().c_str());
+            return false;
+        }
+    }
+
     return true;
 }
 
@@ -203,6 +281,10 @@ public:
 
     ~Session()
     {
+        if (crop_ != nullptr) {
+            crop_->destroy();
+            crop_ = nullptr;
+        }
         if (processor_ != nullptr) {
             /*
              * The coordinator owns the image-source reference and releases it
@@ -222,7 +304,8 @@ public:
     Session& operator=(const Session&) = delete;
 
     bool open(const std::string& file,
-              const rtengine::procparams::ProcParams& params)
+              const rtengine::procparams::ProcParams& params,
+              bool withCrop)
     {
         int errorCode = 0;
         image_ = rtengine::InitialImage::load(Glib::ustring(file), true,
@@ -263,6 +346,28 @@ public:
             std::fprintf(stderr, "sweep: the initial preview did not settle\n");
             return false;
         }
+
+        if (withCrop) {
+            /*
+             * A visible crop is what the viewport fast path exists for. It
+             * must exist before the eligible edits, so every hit has a
+             * listener to repaint and the dump has a crop to compare.
+             */
+            crop_ = processor_->createCrop(nullptr, false);
+            if (crop_ == nullptr) {
+                std::fprintf(stderr, "sweep: cannot create the crop window\n");
+                return false;
+            }
+            const int fullWidth = processor_->getFullWidth();
+            const int fullHeight = processor_->getFullHeight();
+            assert(fullWidth > 0 && fullHeight > 0);
+            cropCapture_.setWindow(CROP_X, CROP_Y, fullWidth, fullHeight,
+                                   PREVIEW_SCALE);
+            crop_->setListener(&cropCapture_);
+            crop_->setWindow(CROP_X, CROP_Y, fullWidth, fullHeight,
+                             PREVIEW_SCALE);
+            crop_->fullUpdate();
+        }
         return true;
     }
 
@@ -272,7 +377,8 @@ public:
      * return the elapsed wall time.
      */
     bool apply(const rtengine::procparams::ProcParams& params, int todo,
-               rtengine::procparams::ProcParams& normalised, double& elapsedMs)
+               rtengine::procparams::ProcParams& normalised, double& elapsedMs,
+               bool readBack = true)
     {
         const unsigned target = preview_.ready() + 1;
         const auto start = std::chrono::steady_clock::now();
@@ -295,7 +401,17 @@ public:
         elapsedMs = std::chrono::duration<double, std::milli>(
                         std::chrono::steady_clock::now() - start)
                         .count();
-        processor_->getParams(&normalised, false);
+        if (readBack) {
+            processor_->getParams(&normalised, false);
+        } else {
+            /*
+             * Keep the caller's parameter set, as the editor does. The engine
+             * normalises deterministic values (notably wb.green) in its own
+             * copy, and a request built from that copy would differ from the
+             * pre-pass base snapshot and fall back with `white-balance`.
+             */
+            normalised = params;
+        }
         return true;
     }
 
@@ -329,9 +445,17 @@ public:
         return preview_.ready();
     }
 
+    /* The engine's live parameters, after the pass normalised them. */
+    void params(rtengine::procparams::ProcParams& out) const
+    {
+        processor_->getParams(&out, false);
+    }
+
 private:
     rtengine::InitialImage* image_ = nullptr;
     rtengine::StagedImageProcessor* processor_ = nullptr;
+    rtengine::DetailedCrop* crop_ = nullptr;
+    CropCapture cropCapture_;
     PreviewWait preview_;
 };
 
@@ -459,6 +583,14 @@ struct ZoomState
     bool fullResolution;
 };
 
+const State exposureState()
+{
+    return {"exposure", AUTOEXP,
+            [](rtengine::procparams::ProcParams& params) {
+                params.toneCurve.expcomp += EXPOSURE_STEP;
+            }};
+}
+
 const State* sweepStates(size_t& count)
 {
     static const State states[] = {
@@ -473,24 +605,58 @@ const State* sweepStates(size_t& count)
     return states;
 }
 
+/*
+ * Edits the viewport fast path can serve.
+ *
+ * Each mask is the one the GUI sends for the tool and each mutation changes a
+ * parent LUT or an auto-exposure input, so the full-frame preview output
+ * depends on the edit: a fast-path bug that rebuilt the wrong LUT or skipped a
+ * stage changes the dump, and the driver catches it as a non-zero difference
+ * against the same state rendered with RT_VIEWPORT_FAST=0.
+ */
+const State* fastPathStates(size_t& count)
+{
+    static const State states[] = {
+        exposureState(),
+        {"tone-curve", AUTOEXP,
+         [](rtengine::procparams::ProcParams& params) {
+             params.toneCurve.contrast += 5;
+         }},
+        {"lab-curve", LUMINANCECURVE,
+         [](rtengine::procparams::ProcParams& params) {
+             params.labCurve.brightness += 5;
+         }},
+        {"wavelet-curve", DIRPYREQUALIZER,
+         [](rtengine::procparams::ProcParams& params) {
+             params.wavelet.enabled = true;
+             params.wavelet.wavclCurve = {0.0, 0.0, 0.5, 0.6, 1.0, 1.0};
+         }},
+        exposureState(),
+    };
+    count = sizeof(states) / sizeof(states[0]);
+    return states;
+}
+
 const ZoomState zoomStates[] = {
     {"zoom-100", true},
     {"zoom-fit", false},
 };
-
-const State exposureState()
-{
-    return {"exposure", AUTOEXP,
-            [](rtengine::procparams::ProcParams& params) {
-                params.toneCurve.expcomp += EXPOSURE_STEP;
-            }};
-}
 
 void printSwitch()
 {
     std::printf("SWITCH work-order=%d shadow=%d\n",
                 rtengine::stage::workOrderEnabled() ? 1 : 0,
                 rtengine::stage::workShadowEnabled() ? 1 : 0);
+
+    /*
+     * Mirror the coordinator's kill-switch reading so the driver can prove
+     * which mode the process actually ran. The coordinator reads the variable
+     * once per process; this probe runs before the first pass.
+     */
+    const char* value = g_getenv("RT_VIEWPORT_FAST");
+    const bool viewportEnabled = value == nullptr || value[0] == '\0'
+        || g_strcmp0(value, "0") != 0;
+    std::printf("VIEWPORT enabled=%d\n", viewportEnabled ? 1 : 0);
 }
 
 bool printState(unsigned index, const std::string& name, unsigned pass,
@@ -501,7 +667,8 @@ bool printState(unsigned index, const std::string& name, unsigned pass,
     return true;
 }
 
-int runParity(const std::string& file, const std::string& outDir)
+int runParity(const std::string& file, const std::string& outDir,
+              bool fastPath)
 {
     const std::string dumpDir = joinPath(outDir, "dump");
     std::error_code error;
@@ -515,7 +682,7 @@ int runParity(const std::string& file, const std::string& outDir)
 
     rtengine::procparams::ProcParams params;
     Session session;
-    if (!session.open(file, params)) {
+    if (!session.open(file, params, fastPath)) {
         return 2;
     }
 
@@ -527,7 +694,8 @@ int runParity(const std::string& file, const std::string& outDir)
     printState(0, "initial", pass, 0.0);
 
     size_t stateCount = 0;
-    const State* states = sweepStates(stateCount);
+    const State* states = fastPath ? fastPathStates(stateCount)
+                                   : sweepStates(stateCount);
     unsigned index = 1;
 
     for (size_t i = 0; i < stateCount; ++i) {
@@ -536,7 +704,8 @@ int runParity(const std::string& file, const std::string& outDir)
 
         rtengine::procparams::ProcParams normalised;
         double elapsed = 0.0;
-        if (!session.apply(next, states[i].todo, normalised, elapsed)) {
+        if (!session.apply(next, states[i].todo, normalised, elapsed,
+                           !fastPath)) {
             return 2;
         }
         params = normalised;
@@ -552,23 +721,30 @@ int runParity(const std::string& file, const std::string& outDir)
         ++index;
     }
 
-    for (const ZoomState& zoom : zoomStates) {
-        double elapsed = 0.0;
-        if (!session.zoom(zoom.fullResolution, elapsed)) {
-            return 2;
-        }
-        ++pass;
+    /*
+     * The zoom crossings and the trailing exposure belong to the full-state
+     * sweep. The fast-path sequence is exactly the eligible edits: a zoom
+     * crossing is a high-detail transition and would fall back by design.
+     */
+    if (!fastPath) {
+        for (const ZoomState& zoom : zoomStates) {
+            double elapsed = 0.0;
+            if (!session.zoom(zoom.fullResolution, elapsed)) {
+                return 2;
+            }
+            ++pass;
 
-        char name[64];
-        std::snprintf(name, sizeof(name), "%02u-%s", index, zoom.name);
-        if (!copyDump(dumpDir, outDir, name, pass)) {
-            return 2;
+            char name[64];
+            std::snprintf(name, sizeof(name), "%02u-%s", index, zoom.name);
+            if (!copyDump(dumpDir, outDir, name, pass)) {
+                return 2;
+            }
+            printState(index, zoom.name, pass, elapsed);
+            ++index;
         }
-        printState(index, zoom.name, pass, elapsed);
-        ++index;
     }
 
-    {
+    if (!fastPath) {
         rtengine::procparams::ProcParams next = params;
         exposureState().mutate(next);
 
@@ -596,7 +772,12 @@ int runTiming(const std::string& file, const std::string& outDir, int samples,
 {
     rtengine::procparams::ProcParams params;
     Session session;
-    if (!session.open(file, params)) {
+    /*
+     * Timing always owns a visible crop: the fast path's saving is the crop
+     * repaint it serves, and without one the harness would measure only the
+     * deferred full pass.
+     */
+    if (!session.open(file, params, true)) {
         return 2;
     }
 
@@ -640,7 +821,8 @@ int main(int argc, char** argv)
 
     if (argc < 3) {
         std::fprintf(stderr,
-                     "usage: %s <raw> <out-dir> [--timing=N]\n"
+                     "usage: %s <raw> <out-dir> [--timing=N] [--clamp]"
+                     " [--fast-path]\n"
                      "       %s --print-switch\n",
                      argv[0], argv[0]);
         return 2;
@@ -658,6 +840,7 @@ int main(int argc, char** argv)
     }
     int timingSamples = 0;
     bool timingClamp = false;
+    bool fastPath = false;
 
     for (int i = 3; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -665,6 +848,8 @@ int main(int argc, char** argv)
             timingSamples = std::atoi(arg.c_str() + std::strlen("--timing="));
         } else if (arg == "--clamp") {
             timingClamp = true;
+        } else if (arg == "--fast-path") {
+            fastPath = true;
         } else {
             std::fprintf(stderr, "sweep: unknown argument %s\n", arg.c_str());
             return 2;
@@ -689,12 +874,21 @@ int main(int argc, char** argv)
     g_setenv("RT_CACHE", cacheDir.c_str(), TRUE);
     g_setenv("RT_PREVIEW_BASE_CACHE", "0", TRUE);
     /*
-     * Every state must be a settled full-frame pass, so the raw chain runs and
-     * the shadow compares it. The viewport fast path deliberately repaints a
-     * crop and defers the full pass, which would make a state's dump and its
-     * shadow record belong to different passes.
+     * The full-state sweep must make every state a settled full-frame pass, so
+     * the viewport fast path is switched off: it deliberately repaints a crop
+     * and defers the full pass, which would make a state's dump and its shadow
+     * record belong to different passes. The fast-path sequence keeps the
+     * ambient value, so the driver can run the same states with it on and off.
      */
-    g_setenv("RT_VIEWPORT_FAST", "0", TRUE);
+    if (fastPath) {
+        /*
+         * Leave RT_VIEWPORT_FAST exactly as the driver set it, so the same
+         * binary can run the forced-full side and the fast side.
+         */
+        g_setenv("RT_PREVIEW_PROFILE", "1", TRUE);
+    } else {
+        g_setenv("RT_VIEWPORT_FAST", "0", TRUE);
+    }
 
     try {
         App::get().setArgv0(DATA_SEARCH_PATH);
@@ -716,5 +910,5 @@ int main(int argc, char** argv)
 
     return timingSamples > 0
                ? runTiming(file, outDir, timingSamples, timingClamp)
-               : runParity(file, outDir);
+               : runParity(file, outDir, fastPath);
 }

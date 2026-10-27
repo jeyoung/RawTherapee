@@ -493,6 +493,23 @@ target_compile_definitions(editorrequest-test PRIVATE
     RT_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
 rt_setup_target(editorrequest-test)
 
+# Decision-table replay for the typed viewport fast-path admission and LUT
+# selection, against the retired mask-based gate kept as a local oracle.
+add_executable(viewport-admission-test EXCLUDE_FROM_ALL
+    "${CMAKE_CURRENT_SOURCE_DIR}/stage/tests/viewport_admission_test.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/editcallbacks.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/multilangmgr.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/options.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/paramsedited.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/pathutils.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/threadutils.cc"
+)
+target_include_directories(viewport-admission-test BEFORE PRIVATE
+    "${CMAKE_BINARY_DIR}/rtgui"
+)
+target_link_libraries(viewport-admission-test PRIVATE rtengine)
+rt_setup_target(viewport-admission-test)
+
 target_include_directories(rtengine
     PUBLIC
         # Other libraries should use #include "rtengine/header.h"
