@@ -1437,6 +1437,22 @@ stage::BlockFingerprints workFingerprints(
     return fingerprints;
 }
 
+/* Read view over one Imagefloat for the copy in and out of the node cache. */
+RtStageBuffer imageTierView(const Imagefloat* image)
+{
+    RtStageBuffer view{};
+    view.size = sizeof(RtStageBuffer);
+    view.data = image->r(0);
+    view.width = image->getWidth();
+    view.height = image->getHeight();
+    view.row_pitch = image->getRowStride();
+    view.plane_pitch = image->getPlaneStride();
+    view.planes = 3;
+    view.format = RT_STAGE_F32;
+    view.flags = RT_STAGE_BUFFER_READ;
+    return view;
+}
+
 } // namespace
 
 /* State owned by one full-frame preview pass. */
@@ -1627,6 +1643,132 @@ void ImProcCoordinator::stageRawDemosaic(PreviewPassState& pass)
 }
 
 /*
+ * Build the node-cache key of the preview raw.base tier for one pass.
+ *
+ * The pass snapshot, the render state and the work order are the inputs the
+ * pass derived its order from, and the output geometry is the allocated
+ * preview size. See stage_cache_integration.h for the component rationale.
+ */
+stage::NodeCacheKey ImProcCoordinator::nodeCacheRawBaseKey(
+    const PreviewPassState& pass) const
+{
+    stage::NodeCacheKey key;
+    key.node = "preview.raw.base";
+    key.render = pass.renderState.fingerprint();
+    key.block_ids.reserve(pass.fingerprints.size());
+    key.block_values.reserve(pass.fingerprints.size());
+    for (const auto& entry : pass.fingerprints) {
+        key.block_ids.push_back(entry.first);
+        key.block_values.push_back(entry.second);
+    }
+    key.work = stage::nodeCacheWorkBits(pass.work)
+               & stage::nodeCacheTierMask();
+    key.width = pW;
+    key.height = pH;
+    key.planes = 3;
+    key.format = RT_STAGE_F32;
+    return key;
+}
+
+/*
+ * Substitute a cache hit for the preview raw.base rebuild body.
+ *
+ * Called only when the typed order permits reuse and the plan schedules the
+ * base rebuild, so every downstream node reruns from the restored tier. The
+ * entry carries the pixels and the auxiliary state the same node derives, so
+ * the whole destructive branch (white balance, spot removal, film negative,
+ * colour-space conversion, gamut compression and the closing analysis) is
+ * skipped. Returns false, leaving the caller to recompute, when the entry
+ * cannot be delivered into the live buffer or its auxiliary state is invalid.
+ */
+bool ImProcCoordinator::nodeCacheRestoreRawBase(
+    const PreviewPassState& pass, const stage::NodeCacheKey& key)
+{
+    if (orig_prev == nullptr) {
+        return false;
+    }
+
+    RtStageBuffer view = imageTierView(orig_prev);
+    std::vector<unsigned char> aux;
+    if (!nodeCache.restore(key, view, &aux)) {
+        return false;
+    }
+
+    stage::RawBaseTierState state;
+    if (!stage::decodeRawBaseTierState(aux.data(), aux.size(), state)) {
+        return false;
+    }
+
+    currWB = ColorTemp(state.wb_temp, state.wb_green, state.wb_equal,
+                       state.wb_method,
+                       static_cast<StandardObserver>(state.wb_observer));
+
+    /*
+     * The rebuild branch normalises the live white balance from the source
+     * multipliers. A hit must reproduce that write-back, or the next pass
+     * would see un-normalised parameters and fingerprint a different state.
+     */
+    if (params->wb.enabled) {
+        params->wb.temperature = static_cast<int>(currWB.getTemp());
+        params->wb.green = currWB.getGreen();
+    }
+    if (!state.histogram.empty()
+            && state.histogram.size() != vhist16.getSize()) {
+        vhist16(static_cast<int>(state.histogram.size()));
+    }
+    const size_t count =
+        std::min(state.histogram.size(),
+                 static_cast<size_t>(vhist16.getSize()));
+    for (size_t i = 0; i < count; ++i) {
+        vhist16[static_cast<int>(i)] = state.histogram[i];
+    }
+    denoiseInfoStore.valid = state.denoise_valid;
+
+    // The branch sets this after a rebuild or a base-cache restore; a node
+    // cache hit is the same kind of completed base for the crop guard.
+    lastPassPrevdemoBase.store(
+        pass.prevdemoFull ? PrevdemoBase::SIDECAR : PrevdemoBase::FAST,
+        std::memory_order_release);
+    return true;
+}
+
+/*
+ * Store the preview raw.base tier after the node produced it.
+ *
+ * Only an executed node has final pixels, white balance and histogram, so the
+ * store lives at the end of stageRawBase. The auxiliary state shares the entry
+ * and the budget; a refused store leaves the previous entry untouched. A tier
+ * whose pass named a raw source producer is not stored: the order would refuse
+ * it on every later pass, so the copy would be spent on an entry that can
+ * never be read.
+ */
+void ImProcCoordinator::nodeCacheStoreRawBase(const PreviewPassState& pass)
+{
+    if (!nodeCache.enabled() || orig_prev == nullptr
+            || !stage::nodeCacheReuseAllowed(pass.work)) {
+        return;
+    }
+
+    stage::RawBaseTierState state;
+    state.wb_temp = currWB.getTemp();
+    state.wb_green = currWB.getGreen();
+    state.wb_equal = currWB.getEqual();
+    state.wb_observer = static_cast<int32_t>(currWB.getObserver());
+    state.wb_method = currWB.getMethod();
+    state.denoise_valid = denoiseInfoStore.valid;
+    state.histogram.resize(vhist16.getSize());
+    for (unsigned int i = 0; i < state.histogram.size(); ++i) {
+        state.histogram[i] = vhist16[static_cast<int>(i)];
+    }
+    const std::vector<unsigned char> aux =
+        stage::encodeRawBaseTierState(state);
+
+    const stage::NodeCacheKey key = nodeCacheRawBaseKey(pass);
+    const RtStageBuffer view = imageTierView(orig_prev);
+    nodeCache.store(key, view, aux.data(), aux.size());
+}
+
+/*
  * raw.base: white balance, the base image itself, spot removal, film negative,
  * the source gamut compression and the first analysis that closes the base.
  */
@@ -1652,7 +1794,28 @@ void ImProcCoordinator::stageRawBase(PreviewPassState& pass)
     const bool rebuildRuns =
         stage::workItemRuns(pass.work, stage::WorkItem::rawBaseRebuild);
 
-    if (rebuildRuns) {
+    /*
+     * Node-output cache probe. A hit substitutes the stored tier for the whole
+     * destructive body below. It is taken only when the typed order names no
+     * raw source producer and schedules the base rebuild, so the downstream
+     * chain reruns from the restored tier; the exact key then guarantees the
+     * bytes. The switch is off by default, and everything here is a no-op
+     * then.
+     */
+    bool tierRestored = false;
+    if (rebuildRuns && nodeCache.enabled()) {
+        if (stage::nodeCacheReuseAllowed(pass.work)
+                && stage::nodeCacheSubstitutionAllowed(pass.work)) {
+            const stage::NodeCacheKey key = nodeCacheRawBaseKey(pass);
+            if (nodeCache.probe(key)) {
+                tierRestored = nodeCacheRestoreRawBase(pass, key);
+            }
+        } else {
+            nodeCache.note_refused();
+        }
+    }
+
+    if (rebuildRuns && !tierRestored) {
         if (params->wb.method == "autitcgreen") {
             imgsrc->getrgbloc(0, 0, fh, fw, 0, 0, fh, fw, params->wb);
         }
@@ -1660,7 +1823,7 @@ void ImProcCoordinator::stageRawBase(PreviewPassState& pass)
 
     const bool retinexRuns =
         stage::workItemRuns(pass.work, stage::WorkItem::retinexPrepare);
-    if (retinexRuns) {
+    if (retinexRuns && !tierRestored) {
         bool dehacontlutili = false;
         bool mapcontlutili = false;
         bool useHsl = false;
@@ -1678,7 +1841,7 @@ void ImProcCoordinator::stageRawBase(PreviewPassState& pass)
     if (settings->verbose) {
         printf("automethod=%s \n", params->wb.method.c_str());
     }
-    if (rebuildRuns) {
+    if (rebuildRuns && !tierRestored) {
         MyMutex::MyLock initLock(minit);  // Also used in crop window
         //imgsrc->HLRecovery_Global(params->toneCurve);   // this handles Color HLRecovery
 
@@ -2135,7 +2298,7 @@ void ImProcCoordinator::stageRawBase(PreviewPassState& pass)
         stage::workItemRuns(pass.work, stage::WorkItem::spotRestore);
     const bool directSpot = rebuildRuns && spotsDone;
 
-    if (restoreRuns) {
+    if (restoreRuns && !tierRestored) {
         if (spotsConfigured && spotApplyRuns && !directSpot) {
             allocCache(spotprev);
             orig_prev->copyData(spotprev);
@@ -2147,8 +2310,20 @@ void ImProcCoordinator::stageRawBase(PreviewPassState& pass)
         }
     }
 
-    if (restoreRuns && spotprev != nullptr) {
+    if (restoreRuns && !tierRestored && spotprev != nullptr) {
         spotprev->copyData(orig_prev);
+    }
+
+    /*
+     * The node's pixels, white balance and histogram are final now, so record
+     * the tier under this pass's key. Only a pass that ran the rebuild body
+     * has the base tier in `orig_prev`: a pass that entered the node for spot
+     * maintenance alone holds the downstream intermediate in that buffer, so
+     * storing it would poison the cache. A no-op when the switch is off, and a
+     * wasted copy after a hit, so the store is skipped then.
+     */
+    if (rebuildRuns && !tierRestored) {
+        nodeCacheStoreRawBase(pass);
     }
 }
 
