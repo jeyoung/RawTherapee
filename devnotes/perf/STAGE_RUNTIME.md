@@ -762,6 +762,23 @@ decision reads the mask.
 it is a parameter/metadata predicate, not a mask test. The raw/core bodies keep
 their block-1 work-order authority and their internal compatibility reads.
 
+Every execution-payload augmentation in `updatePreviewImage()` refreshes the
+typed request before any consumer runs. The post-crop-vignetting augmentation
+adds `TRANSFORM` (which carries `M_HDR` and `M_SPOT` through the composite) and
+therefore calls `refreshFromLegacyMask()`, which recomputes the kind,
+`fullFrameIntent`, `spotPending` and the mask-shaped facts. The viewport fast
+path also widens the crop request mask when it adds `M_LUMINANCE | M_COLOR` for
+a `M_LUMACURVE`/`M_AUTOEXP` crop, so the crop bodies read the same intents the
+legacy mask implied. Debug builds assert `planningAgreesWithLegacyMask()` at
+the PC-vignette augmentation, the panning requeue, the deferred absorb, the
+fast-path crop and the crop render.
+
+A crop reallocation forces `origCrop` to be refilled even when the editor
+request is a plain parameter update. `crop_request_kind()` maps the render
+state to `FullCrop` for that update, so `derive_crop_work()` names
+`rawBaseRebuild` and `analysisRun`. The GUI normally pairs the reallocation
+with a `FullCrop` request, but the force no longer depends on that.
+
 ### Typed producer API
 
 `rtengine/editorrequest.h` adds `RequestIntent`, `make_request()` and
@@ -782,21 +799,27 @@ mask for the callers that still need one. `ImProcCoordinator::endUpdateParams
 `from_legacy_mask()` only when the event was registered with `mapEvent()`.
 
 Converted producers (54 calls in the first group, 34 in the raw/whole-preview
-group and 43 control-only calls): film negative, dirpyrdnoise, spot,
+group and 45 control-only calls, the two `RESIZE` events included): film
+negative, dirpyrdnoise, spot,
 bayerprocess, xtransprocess, tonecurve, retinex, dehaze, Fattal tone mapping,
 the locallab CIE params, white balance, distortion, perspective, lens
 geometry, crop guides, gamut compression, capture sharpening, dark-frame and
 flat-field preprocessing, raw CA correction, raw exposure, preprocess white
-balance and every former `M_VOID`/`GAMMA`/`RESIZE` control event.
+balance and every former `M_VOID`/`GAMMA`/`RESIZE`/`EXIF`/`IPTC` control event
+(45 in total).
 
 The compatibility path is the integer `newEvent(action, message)` overload
-(323 call sites in 30 tool files). It is documented in `editorrequest.h` and
-covered by `editorrequest-test`: a mask event has no typed request,
-`getRequest()` returns false, `getAction()` returns the mask, and the
-coordinator classifies it once through `from_legacy_mask()`. The profile
-refresh with unchanged raw parameters is the one place that deliberately
-drops a typed request and re-enters through `getAction(event) & ALLNORAW`,
-because its absolute kind would rebuild the raw core.
+(323 call sites in 15 tool files; with the mapper definition in
+`rtgui/eventmapper.cc` that is 16 GUI files). It is documented in
+`editorrequest.h` and covered by `editorrequest-test`: a mask event has no
+typed request, `getRequest()` returns false, `getAction()` returns the mask,
+and the coordinator classifies it once through `from_legacy_mask()`. The
+profile refresh with unchanged raw parameters is the one place that
+deliberately drops a typed request and re-enters through
+`getAction(event) & ALLNORAW`, because its absolute kind would rebuild the raw
+core. The typed event key includes both the planning identity and the
+compatibility mask, so actions that plan identically but carry different
+payloads (`EvSpotEnabled` and `EvSpotEnabledOPA`) stay distinct.
 
 `refreshmap.*` is **not removed**. The exact remaining entries are:
 
@@ -845,8 +868,11 @@ No node-entry gate and no planning decision reads the mask.
 - Both configurations build: `tools/build-rt.sh cpu -j 6` and
   `tools/build-rt.sh opencl -j 6`.
 - `editorrequest-test` covers every intent, the compatibility mask, the
-  producer-provided execution set, coalescing and the typed/mask mapper
-  lookup; it passes in both build directories.
+  producer-provided execution set, coalescing, the typed/mask mapper lookup,
+  the producer event-key uniqueness (`checkProducerEventKey`), the fast-path
+  fact refresh (`checkFastPathAugmentation`), the crop reallocation work order
+  (`checkCropReallocationWorkOrder`) and the tool-to-intent wiring
+  (`checkConvertedProducerIntents`); it passes in both build directories.
 - Preview sweep: `preview-work-order-sweep` reports 16 states and `AE=0` for
   both `preview.tif` and `work.tif` in every state.
 - Crop: `crop-stage-test --sequences` reports `33 plans executed, 0 plan

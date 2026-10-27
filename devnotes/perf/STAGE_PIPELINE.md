@@ -196,6 +196,15 @@ retinex for another and re-applies spots for a third. `monitor.output`
 executes at its legacy site, after the crop render, so the monitor profile
 cache refresh it follows still feeds the crop viewport.
 
+The producer side is typed too. Tools name a `RequestIntent`; `make_request()`
+builds the kind, facts and compatibility mask, and `RefreshMapper` stores the
+request beside the mask. The event registry key is the planning identity *and*
+the compatibility mask, so two actions that plan identically but carry
+different payloads stay distinct. The integer `newEvent(action, message)`
+overload remains the documented compatibility path for the 323 parameter-only
+calls in 15 tool files (16 GUI files including `rtgui/eventmapper.cc`); it is
+classified once by `from_legacy_mask()`.
+
 Three statements that were unconditional in the hand-written pass stay in the
 caller, never in a node: the `oprevi = orig_prev` working-pointer reset, the
 local-adjustment damping floor, and the frame-count and image-type notices.
