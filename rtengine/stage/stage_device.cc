@@ -1,8 +1,7 @@
 #include "stage_device.h"
 
 #include "stage_buffer.h"
-
-#include "opencl/openclengine.h"
+#include "stage_opencl_device.h"
 
 #include <cassert>
 #include <chrono>
@@ -59,49 +58,71 @@ public:
                                              : StageEventStatus::Failed;
         event.result = status;
         event.elapsed_ns = local.elapsed_ns;
+        event.device = StageDeviceType::CPU;
+        event.asynchronous = false;
         if (profiling != nullptr) {
             *profiling = local;
         }
         return event;
     }
 
-    RtStageStatus wait(const StageEvent& event) const override
-    {
-        return event.result;
-    }
-};
-
-class OpenCLStageQueue final : public StageQueue
-{
-public:
-    StageDeviceType type() const override
-    {
-        return StageDeviceType::OPENCL;
-    }
-
-    StageEvent submit(const StageProgram& program,
-                      const std::vector<RtStageArg>& args,
-                      RtStageProfiling* profiling) override
-    {
-        (void)program;
-        (void)args;
-        if (profiling != nullptr) {
-            *profiling = RtStageProfiling{};
-        }
-
-        StageEvent event;
-        event.status = StageEventStatus::Failed;
-        event.result = RT_STAGE_FALLBACK;
-        return event;
-    }
-
-    RtStageStatus wait(const StageEvent& event) const override
+    RtStageStatus wait(StageEvent& event) const override
     {
         return event.result;
     }
 };
 
 } // namespace
+
+bool stage_buffer_layout(const StageBufferShape& shape, std::size_t& row_pitch,
+                         std::size_t& plane_pitch, std::size_t& bytes,
+                         std::string* error)
+{
+    const auto fail = [error](const char* message) {
+        if (error != nullptr) {
+            *error = message;
+        }
+        return false;
+    };
+
+    if (shape.width <= 0 || shape.height <= 0 || shape.planes == 0 ||
+        shape.planes > 3) {
+        return fail("invalid buffer shape");
+    }
+
+    const std::size_t sample_bytes = bytes_per_sample(shape.format);
+    if (sample_bytes == 0) {
+        return fail("unsupported buffer format");
+    }
+
+    const std::size_t limit = std::numeric_limits<std::size_t>::max();
+    const std::size_t width = static_cast<std::size_t>(shape.width);
+    const std::size_t height = static_cast<std::size_t>(shape.height);
+    const std::size_t planes = static_cast<std::size_t>(shape.planes);
+
+    if (width > limit / sample_bytes) {
+        return fail("buffer row overflows");
+    }
+    std::size_t row_bytes = width * sample_bytes;
+    if (shape.format == RT_STAGE_U8 && shape.planes == 1) {
+        /* Single-plane U8 is packed RGB, matching stage::row_bytes(). */
+        if (row_bytes > limit / 3) {
+            return fail("buffer row overflows");
+        }
+        row_bytes *= 3;
+    }
+
+    row_pitch = round_up(row_bytes, STAGE_BUFFER_ALIGNMENT);
+    if (height > 0 && row_pitch > limit / height) {
+        return fail("buffer plane overflows");
+    }
+    plane_pitch = row_pitch * height;
+    if (plane_pitch > limit / planes) {
+        return fail("buffer allocation overflows");
+    }
+    bytes = round_up(plane_pitch * planes, STAGE_BUFFER_ALIGNMENT);
+    return true;
+}
 
 const char* to_string(StageDeviceType type)
 {
@@ -131,6 +152,41 @@ const char* to_string(StageEventStatus status)
     return "unknown";
 }
 
+StageEvent StageQueue::submit(const StageRequest& request,
+                              RtStageProfiling* profiling)
+{
+    std::string error;
+    auto program = StageCompiler::instance().compile(request, &error);
+    if (!program) {
+        StageEvent event;
+        event.status = StageEventStatus::Failed;
+        event.result = RT_STAGE_FALLBACK;
+        event.device = StageDeviceType::CPU;
+        event.note = error;
+        return event;
+    }
+
+    /*
+     * The host guarantee every queue keeps: a node without a device
+     * implementation runs here, inline, on the host. It is deliberately not
+     * submitted to `this`, because a device queue cannot execute a host
+     * function pointer.
+     */
+    CPUStageQueue host;
+    StageEvent event = host.submit(*program, request.args, profiling);
+    event.device = StageDeviceType::CPU;
+    return event;
+}
+
+StageEventStatus StageQueue::poll(StageEvent& event) const
+{
+    if (event.submission) {
+        event.status = event.submission->poll();
+        event.elapsed_ns = event.submission->elapsed_ns();
+    }
+    return event.status;
+}
+
 StageBufferAllocator::StageBufferAllocator(StageDeviceType type) : type_(type)
 {
 }
@@ -155,44 +211,17 @@ RtStageBuffer StageBufferAllocator::allocate(const StageBufferShape& shape,
     };
 
     if (type_ != StageDeviceType::CPU) {
-        return fail("device buffer allocation is not implemented");
-    }
-    if (shape.width <= 0 || shape.height <= 0 || shape.planes == 0 ||
-        shape.planes > 3) {
-        return fail("invalid buffer shape");
+        return fail("device-local buffers are allocated by the device residency");
     }
 
-    const std::size_t sample_bytes = bytes_per_sample(shape.format);
-    if (sample_bytes == 0) {
-        return fail("unsupported buffer format");
+    std::size_t row_pitch = 0;
+    std::size_t plane_pitch = 0;
+    std::size_t total = 0;
+    std::string layout_error;
+    if (!stage_buffer_layout(shape, row_pitch, plane_pitch, total,
+                             &layout_error)) {
+        return fail(layout_error.c_str());
     }
-
-    const std::size_t limit = std::numeric_limits<std::size_t>::max();
-    const std::size_t width = static_cast<std::size_t>(shape.width);
-    const std::size_t height = static_cast<std::size_t>(shape.height);
-    const std::size_t planes = static_cast<std::size_t>(shape.planes);
-
-    if (width > limit / sample_bytes) {
-        return fail("buffer row overflows");
-    }
-    std::size_t row_bytes = width * sample_bytes;
-    if (shape.format == RT_STAGE_U8 && shape.planes == 1) {
-        /* Single-plane U8 is packed RGB, matching stage::row_bytes(). */
-        if (row_bytes > limit / 3) {
-            return fail("buffer row overflows");
-        }
-        row_bytes *= 3;
-    }
-
-    const std::size_t row_pitch = round_up(row_bytes, STAGE_BUFFER_ALIGNMENT);
-    if (height > 0 && row_pitch > limit / height) {
-        return fail("buffer plane overflows");
-    }
-    const std::size_t plane_pitch = row_pitch * height;
-    if (plane_pitch > limit / planes) {
-        return fail("buffer allocation overflows");
-    }
-    const std::size_t total = round_up(plane_pitch * planes, STAGE_BUFFER_ALIGNMENT);
 
     void* data = std::aligned_alloc(STAGE_BUFFER_ALIGNMENT, total);
     if (data == nullptr) {
@@ -298,14 +327,50 @@ std::shared_ptr<StageProgram> StageContext::compile(const StageRequest& request,
 RtStageStatus StageContext::execute(const StageRequest& request,
                                     RtStageProfiling* profiling)
 {
+    if (device_type() == StageDeviceType::OPENCL) {
+        /*
+         * Every node is selected independently: an unimplemented node, a
+         * disabled device or an exhausted budget runs on the host program in
+         * this same context, so a device problem never fails a render.
+         */
+        const StageNodeSelection selection =
+            select_node_device(request.name.c_str());
+        if (selection.device == StageNodeDevice::OpenCL) {
+            StageQueue& context_queue = queue();
+            StageEvent event = context_queue.submit(request, nullptr);
+            const RtStageStatus status = context_queue.wait(event);
+            if (status == RT_STAGE_OK) {
+                if (profiling != nullptr) {
+                    *profiling = RtStageProfiling{};
+                    profiling->elapsed_ns = event.elapsed_ns;
+                }
+                return status;
+            }
+        }
+    }
+
     auto program = compile(request, nullptr);
     if (!program) {
         return RT_STAGE_FALLBACK;
     }
 
-    StageQueue& context_queue = queue();
-    const StageEvent event = context_queue.submit(*program, request.args, profiling);
+    /*
+     * A device queue only runs device kernels. The host program therefore runs
+     * on a host queue, never on the device queue that refused it.
+     */
+    StageQueue& context_queue =
+        device_type() == StageDeviceType::OPENCL ? host_queue() : queue();
+    StageEvent event = context_queue.submit(*program, request.args, profiling);
     return context_queue.wait(event);
+}
+
+StageQueue& StageContext::host_queue()
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!host_queue_) {
+        host_queue_ = cpu_device()->create_queue();
+    }
+    return *host_queue_;
 }
 
 StageQueue& StageContext::queue()
@@ -321,6 +386,14 @@ StageQueue& StageContext::queue()
 StageBufferAllocator& StageContext::allocator()
 {
     return allocator_;
+}
+
+StageDeviceResidency* StageContext::residency()
+{
+    if (device_type() != StageDeviceType::OPENCL) {
+        return nullptr;
+    }
+    return queue().residency();
 }
 
 void StageContext::clear_program_cache()
@@ -368,38 +441,6 @@ std::unique_ptr<StageQueue> CPUStageDevice::create_queue() const
     return std::make_unique<CPUStageQueue>();
 }
 
-StageDeviceType OpenCLStageDevice::type() const
-{
-    return StageDeviceType::OPENCL;
-}
-
-const char* OpenCLStageDevice::name() const
-{
-    return "opencl";
-}
-
-bool OpenCLStageDevice::available() const
-{
-    /* Existing backend state only; this skeleton adds no OpenCL calls. */
-    return rtengine::opencl::enabled();
-}
-
-StageCapabilities OpenCLStageDevice::capabilities() const
-{
-    /* No execution path is wired yet, so no guarantee can be advertised. */
-    return StageCapabilities{};
-}
-
-std::shared_ptr<StageContext> OpenCLStageDevice::create_context() const
-{
-    return std::make_shared<StageContext>(std::make_shared<OpenCLStageDevice>());
-}
-
-std::unique_ptr<StageQueue> OpenCLStageDevice::create_queue() const
-{
-    return std::make_unique<OpenCLStageQueue>();
-}
-
 std::shared_ptr<StageDevice> cpu_device()
 {
     static const std::shared_ptr<StageDevice> device =
@@ -410,7 +451,7 @@ std::shared_ptr<StageDevice> cpu_device()
 std::shared_ptr<StageDevice> opencl_device()
 {
     static const std::shared_ptr<StageDevice> device =
-        std::make_shared<OpenCLStageDevice>();
+        make_opencl_stage_device();
     return device;
 }
 

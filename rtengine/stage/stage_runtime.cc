@@ -1,10 +1,14 @@
 #include "stage_runtime.h"
 
+#include "stage_device.h"
+#include "stage_opencl_device.h"
 #include "stage_profile.h"
 
+#include <glib.h>
 #include <glibmm/module.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cctype>
 #include <cstdlib>
@@ -78,7 +82,197 @@ bool file_stamp(const std::string& path, int64_t& mtime, int64_t& size)
     return true;
 }
 
+/*
+ * Device selection. CPU is the default; RT_STAGE_OPENCL=1 opts in and the
+ * kill switches force CPU. The user preference is wired in through
+ * set_opencl_stage_allowed(), so a disabled backend never runs a node on the
+ * device even when the environment asks for it.
+ */
+std::atomic<bool> opencl_allowed{true};
+std::mutex selection_mutex;
+std::map<std::string, StageNodeDevice> node_overrides;
+
+bool env_flag(const char* name, bool& is_set)
+{
+    const char* value = std::getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        is_set = false;
+        return false;
+    }
+    is_set = true;
+    return g_ascii_strcasecmp(value, "0") != 0 &&
+           g_ascii_strcasecmp(value, "off") != 0 &&
+           g_ascii_strcasecmp(value, "false") != 0 &&
+           g_ascii_strcasecmp(value, "no") != 0;
+}
+
+bool has_override(const std::string& node, StageNodeDevice& device)
+{
+    std::lock_guard<std::mutex> lock(selection_mutex);
+    const auto found = node_overrides.find(node);
+    if (found == node_overrides.end()) {
+        return false;
+    }
+    device = found->second;
+    return true;
+}
+
+StageNodeSelection select_impl(const char* node, StageNodeDevice requested)
+{
+    const std::string name = node != nullptr ? node : "";
+    StageNodeSelection selection;
+    selection.implemented = node_has_device_implementation(node);
+
+    if (requested == StageNodeDevice::CPU) {
+        selection.device = StageNodeDevice::CPU;
+        selection.reason = selection.implemented
+                               ? "CPU selected"
+                               : "no OpenCL implementation for node '" + name + "'";
+        return selection;
+    }
+
+    /* Kill switches win over every request. */
+    if (!opencl_allowed.load(std::memory_order_acquire)) {
+        selection.device = StageNodeDevice::CPU;
+        selection.reason = "OpenCL stage execution is disabled by the user preference";
+        return selection;
+    }
+    bool set = false;
+    const bool opt_in = env_flag("RT_STAGE_OPENCL", set);
+    if (set && !opt_in) {
+        /* An explicit RT_STAGE_OPENCL=0 is a kill switch. */
+        selection.device = StageNodeDevice::CPU;
+        selection.reason = "RT_STAGE_OPENCL is off";
+        return selection;
+    }
+    if (env_flag("RT_STAGE_OPENCL_DISABLE", set) && set) {
+        selection.device = StageNodeDevice::CPU;
+        selection.reason = "RT_STAGE_OPENCL_DISABLE is set";
+        return selection;
+    }
+
+    if (!selection.implemented) {
+        selection.device = StageNodeDevice::CPU;
+        selection.reason = "no OpenCL implementation for node '" + name + "'";
+        return selection;
+    }
+
+    std::string device_reason;
+    if (!opencl_stage_available(&device_reason)) {
+        selection.device = StageNodeDevice::CPU;
+        selection.reason = device_reason;
+        return selection;
+    }
+
+    selection.device = StageNodeDevice::OpenCL;
+    selection.reason.clear();
+    return selection;
+}
+
+/* Lazily created device context shared by stage::run(). */
+std::shared_ptr<StageContext> opencl_context()
+{
+    static std::mutex mutex;
+    static std::shared_ptr<StageContext> context;
+    static bool tried = false;
+
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!tried) {
+        tried = true;
+        if (opencl_stage_available(nullptr)) {
+            auto device = opencl_device();
+            if (device != nullptr) {
+                context = device->create_context();
+            }
+        }
+    }
+    return context;
+}
+
+/* Profile record shared by the host and device executions. */
+void record_stage(const char* name, const char* impl, const char* source,
+                  const std::vector<RtStageArg>& args,
+                  const RtStageProfiling& local)
+{
+    if (!profiling_enabled()) {
+        return;
+    }
+    StageRecord record;
+    record.stage = name != nullptr ? name : "";
+    record.impl = impl;
+    record.source = source;
+    record.consumer = "interactive";
+    record.elapsed_ns = local.elapsed_ns;
+    record.width = !args.empty() && args[0].kind == RT_STAGE_ARG_BUFFER
+                       ? args[0].u.buffer.width
+                       : 0;
+    record.height = !args.empty() && args[0].kind == RT_STAGE_ARG_BUFFER
+                        ? args[0].u.buffer.height
+                        : 0;
+    record.cache_hit = local.cache_hit;
+    if (!args.empty() && args[0].kind == RT_STAGE_ARG_BUFFER) {
+        record.input_hash = hash_buffer(args[0].u.buffer);
+    }
+    if (args.size() > 1 && args[1].kind == RT_STAGE_ARG_BUFFER) {
+        record.output_hash = hash_buffer(args[1].u.buffer);
+    }
+    profile(record);
+}
+
 } // namespace
+
+bool node_has_device_implementation(const char* node)
+{
+    return node != nullptr && has_opencl_stage_node(node);
+}
+
+StageNodeSelection select_node_device(const char* node,
+                                      StageNodeDevice requested)
+{
+    return select_impl(node, requested);
+}
+
+StageNodeSelection select_node_device(const char* node)
+{
+    const std::string name = node != nullptr ? node : "";
+    StageNodeDevice requested = StageNodeDevice::CPU;
+
+    StageNodeDevice overridden;
+    if (has_override(name, overridden)) {
+        requested = overridden;
+    } else {
+        bool set = false;
+        if (env_flag("RT_STAGE_OPENCL", set) && set) {
+            requested = StageNodeDevice::OpenCL;
+        }
+    }
+    return select_impl(node, requested);
+}
+
+void set_opencl_stage_allowed(bool allowed)
+{
+    opencl_allowed.store(allowed, std::memory_order_release);
+}
+
+bool opencl_stage_allowed()
+{
+    return opencl_allowed.load(std::memory_order_acquire);
+}
+
+void set_node_device_override(const char* node, StageNodeDevice device)
+{
+    if (node == nullptr) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(selection_mutex);
+    node_overrides[node] = device;
+}
+
+void clear_node_device_overrides()
+{
+    std::lock_guard<std::mutex> lock(selection_mutex);
+    node_overrides.clear();
+}
 
 struct StageModule {
     std::string path;
@@ -277,6 +471,31 @@ RtStageStatus run(const char* name, const std::vector<RtStageArg>& args,
     request.name = name != nullptr ? name : "";
     request.args = args;
     request.impl = impl != nullptr ? impl : "";
+
+    /*
+     * The device path is opt-in and is only entered when the node has an
+     * implementation and the device is usable. With the switch unset the
+     * function takes exactly the host path below, so the default behaviour,
+     * timing and memory are unchanged.
+     */
+    if (request.impl.empty()) {
+        const StageNodeSelection selection = select_node_device(name);
+        if (selection.device == StageNodeDevice::OpenCL) {
+            auto context = opencl_context();
+            if (context != nullptr) {
+                RtStageProfiling local{};
+                const RtStageStatus status = context->execute(request, &local);
+                if (status == RT_STAGE_OK) {
+                    if (profiling != nullptr) {
+                        *profiling = local;
+                    }
+                    record_stage(name, "opencl", "opencl", args, local);
+                    return status;
+                }
+            }
+        }
+    }
+
     std::string error;
     auto program = StageCompiler::instance().compile(request, &error);
     if (!program) {
@@ -292,28 +511,8 @@ RtStageStatus run(const char* name, const std::vector<RtStageArg>& args,
         *profiling = local;
     }
 
-    if (profiling_enabled()) {
-        StageRecord record;
-        record.stage = name != nullptr ? name : "";
-        record.impl = program->is_module() ? "module" : "builtin";
-        record.source = program->source();
-        record.consumer = "interactive";
-        record.elapsed_ns = local.elapsed_ns;
-        record.width = !args.empty() && args[0].kind == RT_STAGE_ARG_BUFFER
-                           ? args[0].u.buffer.width
-                           : 0;
-        record.height = !args.empty() && args[0].kind == RT_STAGE_ARG_BUFFER
-                            ? args[0].u.buffer.height
-                            : 0;
-        record.cache_hit = local.cache_hit;
-        if (!args.empty() && args[0].kind == RT_STAGE_ARG_BUFFER) {
-            record.input_hash = hash_buffer(args[0].u.buffer);
-        }
-        if (args.size() > 1 && args[1].kind == RT_STAGE_ARG_BUFFER) {
-            record.output_hash = hash_buffer(args[1].u.buffer);
-        }
-        profile(record);
-    }
+    record_stage(name, program->is_module() ? "module" : "builtin",
+                 program->source(), args, local);
 
     return status;
 }

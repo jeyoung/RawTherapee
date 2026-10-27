@@ -41,14 +41,45 @@ enum class StageEventStatus {
 const char* to_string(StageEventStatus status);
 
 /*
- * Result of one queue submission. There is no asynchronous dependency yet:
- * every queue in this phase completes or fails before submit() returns, so the
- * event only carries status and timing.
+ * Completion handle for a submission that may still be running.
+ *
+ * The handle is created by the queue that accepted the work. Its status only
+ * changes through poll() and wait(), so an observed Pending or Running state
+ * always means the work has not finished and the output must not be consumed.
+ */
+class StageSubmission
+{
+public:
+    virtual ~StageSubmission() = default;
+
+    /* Block until the submission finishes; returns its result. */
+    virtual RtStageStatus wait() = 0;
+
+    /* Refresh the status without blocking. */
+    virtual StageEventStatus poll() = 0;
+
+    /* Time from submission to the last observed completion. */
+    virtual std::uint64_t elapsed_ns() const = 0;
+};
+
+/*
+ * Result of one queue submission.
+ *
+ * `device` is the device that actually executed the node, which can differ
+ * from the queue type when a node has no device implementation or the device
+ * allocation budget is exhausted. `asynchronous` is true only when submit()
+ * returned before the work finished; a submission that completes inline sets
+ * it false and carries a final status.
  */
 struct StageEvent {
     StageEventStatus status = StageEventStatus::Pending;
     RtStageStatus result = RT_STAGE_OK;
     std::uint64_t elapsed_ns = 0;
+    StageDeviceType device = StageDeviceType::CPU;
+    bool asynchronous = false;
+    /* Why a device path was declined; empty for a normal execution. */
+    std::string note;
+    std::shared_ptr<StageSubmission> submission;
 
     bool done() const
     {
@@ -65,8 +96,9 @@ struct StageEvent {
 /*
  * A queue executes compiled programs on one device.
  *
- * The CPU queue executes inline before submit() returns. The OpenCL skeleton
- * has no execution path in this phase and reports RT_STAGE_FALLBACK.
+ * The CPU queue executes inline before submit() returns. A device queue
+ * accepts a node request, may run it asynchronously, and falls back to the
+ * compiled host program when the node has no device implementation.
  */
 class StageQueue
 {
@@ -79,8 +111,25 @@ public:
                               const std::vector<RtStageArg>& args,
                               RtStageProfiling* profiling = nullptr) = 0;
 
-    /* Synchronous queues have already finished by the time submit() returns. */
-    virtual RtStageStatus wait(const StageEvent& event) const = 0;
+    /*
+     * Execute a node request. The default implementation compiles the request
+     * and submits the host program, which is the CPU guarantee every queue
+     * keeps. A device queue overrides it to dispatch accepted nodes.
+     */
+    virtual StageEvent submit(const StageRequest& request,
+                              RtStageProfiling* profiling = nullptr);
+
+    /* Refresh an event from its submission; returns the current status. */
+    virtual StageEventStatus poll(StageEvent& event) const;
+
+    /* Blocking completion; finalises the event and returns its result. */
+    virtual RtStageStatus wait(StageEvent& event) const = 0;
+
+    /* Device residency owned by this queue, or null for a host queue. */
+    virtual class StageDeviceResidency* residency()
+    {
+        return nullptr;
+    }
 };
 
 /*
@@ -118,12 +167,95 @@ struct StageBufferShape {
  */
 inline constexpr std::size_t STAGE_BUFFER_ALIGNMENT = 64;
 
+/* Device accounting for one residency. Bytes are those reserved on the
+ * device, not the driver's own bookkeeping. */
+struct StageResidencyStats {
+    std::size_t budget_bytes = 0;
+    std::size_t used_bytes = 0;
+    std::size_t peak_bytes = 0;
+    std::uint64_t allocations = 0;
+    std::uint64_t reused = 0;
+    std::uint64_t evictions = 0;
+    std::uint64_t refusals = 0;
+};
+
+/* A device-local allocation; formats and pitches match RtStageBuffer. */
+class StageDeviceBuffer
+{
+public:
+    virtual ~StageDeviceBuffer() = default;
+
+    virtual StageDeviceType type() const = 0;
+    virtual StageBufferShape shape() const = 0;
+    virtual std::size_t bytes() const = 0;
+    virtual std::size_t row_pitch() const = 0;   // bytes
+    virtual std::size_t plane_pitch() const = 0; // bytes
+    virtual bool valid() const = 0;
+};
+
+using StageDeviceBufferPtr = std::shared_ptr<StageDeviceBuffer>;
+
+/*
+ * Padded layout of a buffer shape: 64-byte aligned rows, packed planes and a
+ * 64-byte aligned block. Single-plane U8 is packed RGB, matching
+ * stage::row_bytes(). Returns false for an invalid shape and sets error.
+ */
+bool stage_buffer_layout(const StageBufferShape& shape, std::size_t& row_pitch,
+                         std::size_t& plane_pitch, std::size_t& bytes,
+                         std::string* error = nullptr);
+
+/*
+ * Device-resident buffers.
+ *
+ * A residency binds a device allocation to a host buffer address: the node
+ * output the buffer belongs to. An entry is reused while the address and the
+ * shape are unchanged, and it is released when the caller drops the binding,
+ * when the byte budget forces an eviction, or when the residency dies. A
+ * request that cannot be met reports a null buffer and a reason, so the
+ * caller can run the node on the host instead.
+ */
+class StageDeviceResidency
+{
+public:
+    virtual ~StageDeviceResidency() = default;
+
+    virtual StageDeviceType type() const = 0;
+    virtual StageResidencyStats stats() const = 0;
+
+    /*
+     * Set the byte budget. Idle entries are evicted until the residency fits;
+     * returns false when in-use entries still exceed the budget.
+     */
+    virtual bool set_budget(std::size_t bytes) = 0;
+
+    /* Find or create the allocation bound to key. */
+    virtual StageDeviceBufferPtr acquire(const void* key,
+                                         const StageBufferShape& shape,
+                                         std::string* error = nullptr) = 0;
+
+    /* Copy the host contents into the whole device buffer. */
+    virtual RtStageStatus upload(const StageDeviceBufferPtr& buffer,
+                                 const RtStageBuffer& host) = 0;
+
+    /* Copy the whole device buffer back into the host buffer. */
+    virtual RtStageStatus readback(const StageDeviceBufferPtr& buffer,
+                                   const RtStageBuffer& host) = 0;
+
+    virtual StageDeviceBufferPtr find(const void* key) const = 0;
+
+    /* Drop the binding for key and free its allocation. */
+    virtual bool release(const void* key) = 0;
+
+    virtual void clear() = 0;
+};
+
 /*
  * Buffer allocator owned by a StageContext.
  *
  * The CPU allocator owns aligned, zeroed host memory and releases it in
- * release(). The OpenCL allocator is a skeleton: it refuses allocation until
- * a device allocator is wired, so no OpenCL call is made from here.
+ * release(). It is host memory only: a device allocation goes through the
+ * StageDeviceResidency of the device queue instead, because a device block
+ * has no host address to hand out.
  *
  * All blocks are freed when the allocator is destroyed; descriptors still held
  * at that point are invalid. The context owns the allocator, so a buffer must
@@ -139,8 +271,9 @@ public:
     StageBufferAllocator& operator=(const StageBufferAllocator&) = delete;
 
     /*
-     * Allocate a zeroed buffer. Returns a descriptor with a null data pointer
-     * and sets error when the shape is invalid or the device has no allocator.
+     * Allocate a zeroed host buffer. Returns a descriptor with a null data
+     * pointer and sets error when the shape is invalid or the allocator is
+     * device-local.
      */
     RtStageBuffer allocate(const StageBufferShape& shape,
                            std::string* error = nullptr);
@@ -188,12 +321,22 @@ public:
     std::shared_ptr<StageProgram> compile(const StageRequest& request,
                                           std::string* error = nullptr);
 
-    /* Compile (or reuse) and execute synchronously on the context queue. */
+    /*
+     * Compile (or reuse) and execute a node. On a device context the node is
+     * dispatched to the device when selection and the device allow it, and
+     * run on the host program otherwise.
+     */
     RtStageStatus execute(const StageRequest& request,
                           RtStageProfiling* profiling = nullptr);
 
     StageQueue& queue();
     StageBufferAllocator& allocator();
+
+    /* Host queue used for the per-node CPU fallback of a device context. */
+    StageQueue& host_queue();
+
+    /* Device residency of an OpenCL context; null on the CPU device. */
+    StageDeviceResidency* residency();
 
     void clear_program_cache();
     std::size_t program_cache_size() const;
@@ -203,6 +346,7 @@ private:
     StageBufferAllocator allocator_;
     mutable std::mutex mutex_;
     std::unique_ptr<StageQueue> queue_;
+    std::unique_ptr<StageQueue> host_queue_;
     std::map<std::string, std::shared_ptr<StageProgram>> programs_;
 };
 
@@ -223,10 +367,10 @@ public:
 };
 
 /*
- * OpenCL skeleton. Availability maps to the existing backend's enabled state;
- * it adds no OpenCL calls of its own. The device advertises no execution
- * capability until the backend is wired, so its queue reports
- * RT_STAGE_FALLBACK.
+ * OpenCL device. Availability follows the backend that is compiled in and a
+ * usable device; a CPU device is used only when RT_OPENCL_ALLOW_CPU=1. The
+ * implementation lives in stage_opencl_device.cc so this header stays free of
+ * OpenCL types.
  */
 class OpenCLStageDevice final : public StageDevice
 {

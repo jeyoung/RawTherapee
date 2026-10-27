@@ -1,0 +1,710 @@
+/*
+ * Device residency, event and selection tests for the stage runtime.
+ *
+ * The OpenCL cases run whenever a usable device is present. POCL exposes a CPU
+ * device only with RT_OPENCL_ALLOW_CPU=1; the device type is reported so a
+ * CPU-device run is never presented as GPU evidence.
+ */
+
+#include "stage_buffer.h"
+#include "stage_device.h"
+#include "stage_opencl_device.h"
+#include "stage_runtime.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+#include <vector>
+
+namespace
+{
+
+using namespace rtengine::stage;
+
+int failures = 0;
+int skipped = 0;
+
+void check(bool condition, const char* message)
+{
+    if (!condition) {
+        std::fprintf(stderr, "FAIL: %s\n", message);
+        ++failures;
+    }
+}
+
+void skip(const char* message)
+{
+    std::fprintf(stderr, "SKIP: %s\n", message);
+    ++skipped;
+}
+
+bool close_enough(float value)
+{
+    return std::isfinite(value);
+}
+
+RtStageArg buffer_arg(const RtStageBuffer& buffer)
+{
+    RtStageArg arg{};
+    arg.kind = RT_STAGE_ARG_BUFFER;
+    arg.u.buffer = buffer;
+    return arg;
+}
+
+RtStageArg double_arg(double value)
+{
+    RtStageArg arg{};
+    arg.kind = RT_STAGE_ARG_DOUBLE;
+    arg.u.f = value;
+    return arg;
+}
+
+RtStageArg int_arg(std::int64_t value)
+{
+    RtStageArg arg{};
+    arg.kind = RT_STAGE_ARG_INT;
+    arg.u.i = value;
+    return arg;
+}
+
+void fill(RtStageBuffer& buffer, unsigned seed)
+{
+    for (std::uint32_t plane = 0; plane < buffer.planes; ++plane) {
+        unsigned char* plane_data = static_cast<unsigned char*>(buffer.data) +
+                                    static_cast<std::size_t>(plane) *
+                                        buffer.plane_pitch;
+        for (int y = 0; y < buffer.height; ++y) {
+            float* row = reinterpret_cast<float*>(
+                plane_data + static_cast<std::size_t>(y) * buffer.row_pitch);
+            for (int x = 0; x < buffer.width; ++x) {
+                const unsigned value =
+                    (seed + static_cast<unsigned>(x) * 17u +
+                     static_cast<unsigned>(y) * 31u + plane * 101u) %
+                    65536u;
+                row[x] = static_cast<float>(value);
+            }
+        }
+    }
+}
+
+struct Diff {
+    double max_abs = 0.0;
+    std::size_t differing = 0;
+    std::size_t samples = 0;
+    bool finite = true;
+};
+
+/* Peak absolute error in 16-bit LSB units: one sample unit is one LSB. */
+Diff compare(const RtStageBuffer& a, const RtStageBuffer& b)
+{
+    Diff diff;
+    if (a.format != RT_STAGE_F32 || b.format != RT_STAGE_F32 ||
+        a.width != b.width || a.height != b.height || a.planes != b.planes) {
+        diff.finite = false;
+        return diff;
+    }
+    for (std::uint32_t plane = 0; plane < a.planes; ++plane) {
+        const unsigned char* pa = static_cast<const unsigned char*>(a.data) +
+                                  static_cast<std::size_t>(plane) * a.plane_pitch;
+        const unsigned char* pb = static_cast<const unsigned char*>(b.data) +
+                                  static_cast<std::size_t>(plane) * b.plane_pitch;
+        for (int y = 0; y < a.height; ++y) {
+            const float* ra = reinterpret_cast<const float*>(
+                pa + static_cast<std::size_t>(y) * a.row_pitch);
+            const float* rb = reinterpret_cast<const float*>(
+                pb + static_cast<std::size_t>(y) * b.row_pitch);
+            for (int x = 0; x < a.width; ++x) {
+                ++diff.samples;
+                if (!close_enough(ra[x]) || !close_enough(rb[x])) {
+                    diff.finite = false;
+                }
+                const double delta = std::fabs(static_cast<double>(ra[x]) -
+                                               static_cast<double>(rb[x]));
+                if (delta > 0.0) {
+                    ++diff.differing;
+                }
+                diff.max_abs = std::max(diff.max_abs, delta);
+            }
+        }
+    }
+    return diff;
+}
+
+struct NodeFixture {
+    RtStageBuffer source;
+    RtStageBuffer cpu_output;
+    RtStageBuffer device_output;
+
+    bool allocate(StageBufferAllocator& allocator, int src_w, int src_h,
+                  int dst_w, int dst_h)
+    {
+        std::string error;
+        source = allocator.allocate({RT_STAGE_F32, src_w, src_h, 3}, &error);
+        cpu_output = allocator.allocate({RT_STAGE_F32, dst_w, dst_h, 3}, &error);
+        device_output = allocator.allocate({RT_STAGE_F32, dst_w, dst_h, 3}, &error);
+        if (!valid(source) || !valid(cpu_output) || !valid(device_output)) {
+            std::fprintf(stderr, "allocation failed: %s\n", error.c_str());
+            return false;
+        }
+        fill(source, 7u);
+        fill(device_output, 0u);
+        return true;
+    }
+
+    std::vector<RtStageArg> args(RtStageBuffer& dst, double scale) const
+    {
+        return {buffer_arg(source), buffer_arg(dst), double_arg(scale), int_arg(0)};
+    }
+};
+
+std::string read_file(const std::string& path)
+{
+    std::string contents;
+    if (FILE* file = std::fopen(path.c_str(), "rb")) {
+        char buffer[4096];
+        std::size_t read = 0;
+        while ((read = std::fread(buffer, 1, sizeof(buffer), file)) > 0) {
+            contents.append(buffer, read);
+        }
+        std::fclose(file);
+    }
+    return contents;
+}
+
+/* ------------------------------------------------------------ residency */
+
+void test_residency()
+{
+    using namespace rtengine::stage;
+
+    std::string reason;
+    if (!opencl_stage_available(&reason)) {
+        skip(("residency: " + reason).c_str());
+        return;
+    }
+
+    StageOpenCLDeviceInfo info;
+    check(opencl_stage_device_info(&info), "device info is available");
+    std::printf("stage-residency: device=%s platform=%s driver=%s type=%s\n",
+                info.device.c_str(), info.platform.c_str(), info.driver.c_str(),
+                info.cpu ? "CPU (POCL CPU run)" : "GPU");
+
+    auto context = opencl_device()->create_context();
+    check(context != nullptr, "OpenCL device creates a context");
+    if (context == nullptr) {
+        return;
+    }
+    StageDeviceResidency* residency = context->residency();
+    check(residency != nullptr, "OpenCL context exposes a residency");
+    if (residency == nullptr) {
+        return;
+    }
+
+    StageBufferAllocator host(StageDeviceType::CPU);
+    std::string error;
+    RtStageBuffer host_buffer =
+        host.allocate({RT_STAGE_F32, 40, 24, 3}, &error);
+    check(valid(host_buffer), "host fixture allocates");
+    fill(host_buffer, 3u);
+
+    const void* key = host_buffer.data;
+    StageDeviceBufferPtr device =
+        residency->acquire(key, {RT_STAGE_F32, 40, 24, 3}, &error);
+    check(device != nullptr, "residency acquires a device buffer");
+    if (device == nullptr) {
+        std::fprintf(stderr, "acquire error: %s\n", error.c_str());
+        return;
+    }
+    check(device->valid(), "device buffer is valid");
+    check(device->bytes() > 0, "device buffer accounts its bytes");
+
+    std::size_t row_pitch = 0;
+    std::size_t plane_pitch = 0;
+    std::size_t bytes = 0;
+    check(stage_buffer_layout({RT_STAGE_F32, 40, 24, 3}, row_pitch, plane_pitch,
+                              bytes),
+          "layout helper resolves the shape");
+    check(device->row_pitch() == row_pitch, "device row pitch matches layout");
+    check(device->plane_pitch() == plane_pitch,
+          "device plane pitch matches layout");
+    check(device->bytes() == bytes, "device size matches layout");
+
+    StageResidencyStats stats = residency->stats();
+    check(stats.allocations == 1, "one device allocation is counted");
+    check(stats.used_bytes == bytes, "used bytes account the allocation");
+    check(stats.peak_bytes >= bytes, "peak bytes record the high-water mark");
+
+    const RtStageStatus upload_status = residency->upload(device, host_buffer);
+    if (upload_status != RT_STAGE_OK) {
+        std::fprintf(stderr, "upload status: %d\n", static_cast<int>(upload_status));
+    }
+    check(upload_status == RT_STAGE_OK, "upload copies the host buffer");
+
+    RtStageBuffer readback = host.allocate({RT_STAGE_F32, 40, 24, 3}, &error);
+    check(valid(readback), "readback target allocates");
+    std::memset(readback.data, 0, readback.plane_pitch * readback.planes);
+    const RtStageStatus readback_status = residency->readback(device, readback);
+    if (readback_status != RT_STAGE_OK) {
+        std::fprintf(stderr, "readback status: %d\n",
+                     static_cast<int>(readback_status));
+    }
+    check(readback_status == RT_STAGE_OK,
+          "readback copies the device buffer back");
+    const Diff roundtrip = compare(host_buffer, readback);
+    check(roundtrip.finite, "upload/readback stays finite");
+    check(roundtrip.max_abs == 0.0, "upload/readback is exact");
+    check(roundtrip.differing == 0, "upload/readback changes no sample");
+
+    /* Reuse keeps the allocation when the address and shape are unchanged. */
+    StageDeviceBufferPtr again =
+        residency->acquire(key, {RT_STAGE_F32, 40, 24, 3}, &error);
+    check(again == device, "a repeated acquire returns the same allocation");
+    stats = residency->stats();
+    check(stats.allocations == 1, "reuse does not allocate again");
+    check(stats.reused == 1, "reuse is counted");
+
+    /* Drop the caller handles before the budget can evict the entries. */
+    device.reset();
+    again.reset();
+
+    /* A shape change at the same address replaces the allocation. */
+    RtStageBuffer wider = host.allocate({RT_STAGE_F32, 64, 24, 3}, &error);
+    StageDeviceBufferPtr resized =
+        residency->acquire(wider.data, {RT_STAGE_F32, 64, 24, 3}, &error);
+    check(resized != nullptr, "a different shape allocates");
+    check(resized != nullptr, "a different shape replaces the allocation");
+
+    /* Budget: keep only the newest allocation. */
+    const std::size_t one_buffer = resized != nullptr ? resized->bytes() : 0;
+    check(residency->set_budget(one_buffer), "a one-buffer budget is accepted");
+    stats = residency->stats();
+    check(stats.evictions >= 1, "shrinking the budget evicts idle entries");
+    check(stats.used_bytes <= stats.budget_bytes, "the residency fits its budget");
+    check(residency->find(key) == nullptr, "the evicted binding is gone");
+
+    /* Over budget: a single allocation larger than the whole budget. */
+    const std::uint64_t refusals = residency->stats().refusals;
+    RtStageBuffer huge = host.allocate({RT_STAGE_F32, 2048, 2048, 3}, &error);
+    error.clear();
+    StageDeviceBufferPtr refused =
+        residency->acquire(huge.data, {RT_STAGE_F32, 2048, 2048, 3}, &error);
+    check(refused == nullptr, "an over-budget allocation is refused");
+    check(!error.empty(), "a refusal reports a reason");
+    check(residency->stats().refusals == refusals + 1,
+          "a refusal is counted");
+
+    /* Release returns the bytes and drops the binding. */
+    residency->release(wider.data);
+    stats = residency->stats();
+    check(stats.used_bytes == 0, "release returns all bytes");
+    check(residency->find(wider.data) == nullptr, "release drops the binding");
+
+    check(residency->set_budget(bytes * 4), "the budget can grow again");
+    check(residency->acquire(key, {RT_STAGE_F32, 40, 24, 3}, &error) != nullptr,
+          "allocation resumes after a refusal");
+    residency->clear();
+    check(residency->stats().used_bytes == 0, "clear frees every binding");
+}
+
+/* --------------------------------------------------------------- events */
+
+void test_cpu_events()
+{
+    using namespace rtengine::stage;
+
+    auto context = cpu_device()->create_context();
+    StageBufferAllocator& allocator = context->allocator();
+    std::string error;
+    RtStageBuffer source = allocator.allocate({RT_STAGE_F32, 32, 16, 3}, &error);
+    RtStageBuffer output = allocator.allocate({RT_STAGE_F32, 16, 8, 3}, &error);
+    fill(source, 11u);
+
+    StageRequest request;
+    request.name = "lanczos3";
+    request.impl = "builtin";
+    request.args = {buffer_arg(source), buffer_arg(output), double_arg(0.5),
+                    int_arg(0)};
+
+    auto program = context->compile(request, &error);
+    check(program != nullptr, "CPU program compiles");
+
+    auto queue = cpu_device()->create_queue();
+    StageEvent event = queue->submit(*program, request.args, nullptr);
+    check(event.status == StageEventStatus::Complete,
+          "the CPU queue completes before submit returns");
+    check(!event.asynchronous, "the CPU event reports a synchronous result");
+    check(event.device == StageDeviceType::CPU, "the CPU event names the CPU");
+    check(event.done() && event.succeeded(), "the CPU event succeeded");
+    check(event.note.empty(), "a CPU execution has no fallback note");
+    check(queue->wait(event) == RT_STAGE_OK, "the CPU wait reports OK");
+}
+
+void test_device_events(bool available)
+{
+    using namespace rtengine::stage;
+
+    if (!available) {
+        skip("device events: no OpenCL device");
+        return;
+    }
+
+    auto queue = opencl_device()->create_queue();
+    StageBufferAllocator host(StageDeviceType::CPU);
+    std::string error;
+    RtStageBuffer source = host.allocate({RT_STAGE_F32, 48, 32, 3}, &error);
+    RtStageBuffer output = host.allocate({RT_STAGE_F32, 24, 16, 3}, &error);
+    fill(source, 5u);
+
+    StageRequest request;
+    request.name = "lanczos3";
+    request.args = {buffer_arg(source), buffer_arg(output), double_arg(0.5),
+                    int_arg(0)};
+
+    StageEvent event = queue->submit(request, nullptr);
+    if (!event.asynchronous) {
+        std::fprintf(stderr, "device submit note: %s\n", event.note.c_str());
+    }
+    check(event.asynchronous, "the device submission returns before completion");
+    check(event.status == StageEventStatus::Running,
+          "the device event reports running");
+    check(event.device == StageDeviceType::OPENCL,
+          "the device event names the device");
+    check(!event.done(), "a running event is not done");
+    check(event.submission != nullptr, "a running event carries a submission");
+    check(queue->poll(event) == StageEventStatus::Running,
+          "poll keeps a running event running");
+    check(queue->wait(event) == RT_STAGE_OK, "the device wait reports OK");
+    check(event.status == StageEventStatus::Complete,
+          "wait completes the event");
+    check(event.succeeded(), "the completed event succeeded");
+    check(event.elapsed_ns > 0, "the completed event carries timing");
+
+    /* A node that refuses device execution must fall back to the host and say
+     * why, without pretending to be asynchronous. */
+    RtStageBuffer bad_source = host.allocate({RT_STAGE_F32, 16, 16, 3}, &error);
+    RtStageBuffer bad_output = host.allocate({RT_STAGE_F32, 8, 8, 1}, &error);
+    StageRequest bad;
+    bad.name = "lanczos3";
+    bad.args = {buffer_arg(bad_source), buffer_arg(bad_output), double_arg(0.5),
+                int_arg(0)};
+    StageEvent failed = queue->submit(bad, nullptr);
+    check(!failed.asynchronous, "a refused device node is synchronous");
+    check(failed.device == StageDeviceType::CPU,
+          "a refused device node reports the CPU");
+    check(failed.status == StageEventStatus::Failed,
+          "an invalid node fails on the host");
+    check(!failed.note.empty(), "a refused device node reports a reason");
+
+    /* An unknown node has no device implementation and runs on the host. */
+    StageRequest unknown;
+    unknown.name = "no_such_stage";
+    StageEvent missing = queue->submit(unknown, nullptr);
+    check(!missing.asynchronous, "an unknown node is synchronous");
+    check(missing.device == StageDeviceType::CPU, "an unknown node runs on the CPU");
+    check(missing.status == StageEventStatus::Failed, "an unknown node fails");
+    check(missing.note.find("no OpenCL implementation") != std::string::npos,
+          "an unimplemented node explains the fallback");
+}
+
+/* ------------------------------------------------------------ selection */
+
+void test_selection(bool available)
+{
+    using namespace rtengine::stage;
+
+    clear_node_device_overrides();
+    unsetenv("RT_STAGE_OPENCL");
+    unsetenv("RT_STAGE_OPENCL_DISABLE");
+    set_opencl_stage_allowed(true);
+
+    StageNodeSelection default_choice = select_node_device("lanczos3");
+    check(default_choice.device == StageNodeDevice::CPU,
+          "the default selection is CPU");
+    if (available) {
+        check(default_choice.implemented,
+              "lanczos3 has a device implementation");
+    }
+
+    StageNodeSelection unknown = select_node_device("no_such_stage");
+    check(unknown.device == StageNodeDevice::CPU,
+          "an unimplemented node selects CPU");
+    check(!unknown.implemented, "an unimplemented node is reported as such");
+    check(unknown.reason.find("no OpenCL implementation") != std::string::npos,
+          "an unimplemented node explains the CPU selection");
+
+    /* The explicit API asks for a device. */
+    StageNodeSelection explicit_cpu =
+        select_node_device("lanczos3", StageNodeDevice::CPU);
+    check(explicit_cpu.device == StageNodeDevice::CPU,
+          "an explicit CPU request returns the CPU");
+
+    StageNodeSelection explicit_device =
+        select_node_device("lanczos3", StageNodeDevice::OpenCL);
+    if (available) {
+        check(explicit_device.device == StageNodeDevice::OpenCL,
+              "an explicit device request returns the device");
+    } else {
+        check(explicit_device.device == StageNodeDevice::CPU,
+              "an unavailable device request falls back to CPU");
+        check(!explicit_device.reason.empty(),
+              "an unavailable device explains the fallback");
+    }
+
+    /* The kill switch wins over the request and the environment. */
+    set_opencl_stage_allowed(false);
+    StageNodeSelection killed =
+        select_node_device("lanczos3", StageNodeDevice::OpenCL);
+    check(killed.device == StageNodeDevice::CPU,
+          "the user kill switch forces CPU");
+    check(killed.reason.find("disabled") != std::string::npos,
+          "the kill switch explains itself");
+    set_opencl_stage_allowed(true);
+
+    setenv("RT_STAGE_OPENCL_DISABLE", "1", 1);
+    StageNodeSelection env_killed =
+        select_node_device("lanczos3", StageNodeDevice::OpenCL);
+    check(env_killed.device == StageNodeDevice::CPU,
+          "RT_STAGE_OPENCL_DISABLE forces CPU");
+    unsetenv("RT_STAGE_OPENCL_DISABLE");
+
+    setenv("RT_STAGE_OPENCL", "0", 1);
+    StageNodeSelection env_off =
+        select_node_device("lanczos3", StageNodeDevice::OpenCL);
+    check(env_off.device == StageNodeDevice::CPU,
+          "RT_STAGE_OPENCL=0 kills an explicit device request");
+    unsetenv("RT_STAGE_OPENCL");
+
+    /* The environment opt-in. */
+    setenv("RT_STAGE_OPENCL", "1", 1);
+    StageNodeSelection opted_in = select_node_device("lanczos3");
+    if (available) {
+        check(opted_in.device == StageNodeDevice::OpenCL,
+              "RT_STAGE_OPENCL=1 opts the implemented node in");
+    } else {
+        check(opted_in.device == StageNodeDevice::CPU,
+              "RT_STAGE_OPENCL=1 falls back without a device");
+    }
+    unsetenv("RT_STAGE_OPENCL");
+
+    /* An explicit per-node override replaces the environment default. */
+    set_node_device_override("lanczos3", StageNodeDevice::OpenCL);
+    StageNodeSelection overridden = select_node_device("lanczos3");
+    if (available) {
+        check(overridden.device == StageNodeDevice::OpenCL,
+              "a per-node override selects the device");
+    } else {
+        check(overridden.device == StageNodeDevice::CPU,
+              "a per-node override falls back without a device");
+    }
+    clear_node_device_overrides();
+}
+
+/* -------------------------------------------------------- first device node */
+
+void test_node_parity(bool available)
+{
+    using namespace rtengine::stage;
+
+    constexpr double TOLERANCE_LSB = 1.0;
+
+    auto cpu = cpu_device()->create_context();
+    StageBufferAllocator host(StageDeviceType::CPU);
+
+    for (const double scale : {0.5, 1.5}) {
+        const int dst_w = static_cast<int>(128 * scale);
+        const int dst_h = static_cast<int>(96 * scale);
+        NodeFixture fixture;
+        if (!fixture.allocate(host, 128, 96, dst_w, dst_h)) {
+            check(false, "node fixture allocates");
+            continue;
+        }
+
+        StageRequest request;
+        request.name = "lanczos3";
+        request.args = fixture.args(fixture.cpu_output, scale);
+        check(cpu->execute(request, nullptr) == RT_STAGE_OK,
+              "the CPU executes the resize node");
+
+        if (!available) {
+            skip("node parity: no OpenCL device");
+            continue;
+        }
+
+        auto device_context = opencl_device()->create_context();
+        set_node_device_override("lanczos3", StageNodeDevice::OpenCL);
+        request.args = fixture.args(fixture.device_output, scale);
+        const RtStageStatus status = device_context->execute(request, nullptr);
+        clear_node_device_overrides();
+        if (status != RT_STAGE_OK) {
+            std::fprintf(stderr, "device execute status: %d\n",
+                         static_cast<int>(status));
+        }
+        check(status == RT_STAGE_OK, "the device executes the resize node");
+
+        StageDeviceResidency* residency = device_context->residency();
+        check(residency != nullptr, "the device context has a residency");
+        if (residency != nullptr && residency->stats().allocations == 0) {
+            check(false, "the device path allocated device buffers");
+        }
+
+        const Diff diff = compare(fixture.cpu_output, fixture.device_output);
+        std::printf("stage-residency: lanczos3 scale %.1f: PAE %.6f LSB16, "
+                    "%zu of %zu samples differ, tolerance %.1f LSB16\n",
+                    scale, diff.max_abs, diff.differing, diff.samples,
+                    TOLERANCE_LSB);
+        check(diff.finite, "device output is finite");
+        check(diff.max_abs <= TOLERANCE_LSB,
+              "device output is within one 16-bit LSB of the CPU");
+
+        check(host.release(fixture.cpu_output), "the CPU output is released");
+    }
+
+    /* Over-budget fallback: a residency that cannot hold the node runs the
+     * host program and still succeeds. */
+    if (available) {
+        auto context = opencl_device()->create_context();
+        context->residency()->set_budget(1024);
+        NodeFixture fixture;
+        if (fixture.allocate(host, 128, 96, 64, 48)) {
+            StageRequest request;
+            request.name = "lanczos3";
+            request.args = fixture.args(fixture.device_output, 0.5);
+            set_node_device_override("lanczos3", StageNodeDevice::OpenCL);
+            const RtStageStatus status = context->execute(request, nullptr);
+            clear_node_device_overrides();
+            check(status == RT_STAGE_OK,
+                  "an over-budget node falls back to the host and succeeds");
+            check(context->residency()->stats().refusals > 0,
+                  "the over-budget fallback is counted as a refusal");
+
+            RtStageBuffer reference = host.allocate({RT_STAGE_F32, 64, 48, 3});
+            StageRequest cpu_request;
+            cpu_request.name = "lanczos3";
+            cpu_request.args = fixture.args(reference, 0.5);
+            check(cpu->execute(cpu_request, nullptr) == RT_STAGE_OK,
+                  "the CPU reference executes after a device refusal");
+            const Diff diff = compare(reference, fixture.device_output);
+            check(diff.finite && diff.max_abs == 0.0,
+                  "the over-budget fallback is exact");
+            host.release(reference);
+        }
+    }
+}
+
+/* --------------------------------------------------------- run() wiring */
+
+void test_run_wiring(bool available)
+{
+    using namespace rtengine::stage;
+
+    StageBufferAllocator host(StageDeviceType::CPU);
+    NodeFixture fixture;
+    if (!fixture.allocate(host, 96, 64, 48, 32)) {
+        check(false, "run fixture allocates");
+        return;
+    }
+
+    RtStageBuffer cpu_output = fixture.cpu_output;
+    RtStageBuffer device_output = fixture.device_output;
+
+    const std::string profile_path =
+        std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR")
+                                          : "/tmp") +
+        "/stage-residency-profile.jsonl";
+    std::remove(profile_path.c_str());
+    setenv("RT_STAGE_PROFILE", profile_path.c_str(), 1);
+
+    /* The switch off: the host path must be the one that runs. */
+    unsetenv("RT_STAGE_OPENCL");
+    clear_node_device_overrides();
+    set_opencl_stage_allowed(true);
+    const auto cpu_args = fixture.args(cpu_output, 0.5);
+    check(run("lanczos3", cpu_args) == RT_STAGE_OK,
+          "run() executes with the switch off");
+    const std::string host_profile = read_file(profile_path);
+    check(host_profile.find("\"impl\":\"opencl\"") == std::string::npos,
+          "the switch-off run() does not use the device");
+    check(host_profile.find("\"impl\":\"builtin\"") != std::string::npos ||
+              host_profile.find("\"impl\":\"module\"") != std::string::npos,
+          "the switch-off run() reports a host implementation");
+
+    if (!available) {
+        skip("run wiring: no OpenCL device");
+        unsetenv("RT_STAGE_PROFILE");
+        return;
+    }
+
+    /* The switch on: the same call must dispatch to the device. */
+    std::remove(profile_path.c_str());
+    set_node_device_override("lanczos3", StageNodeDevice::OpenCL);
+    const auto device_args = fixture.args(device_output, 0.5);
+    check(run("lanczos3", device_args) == RT_STAGE_OK,
+          "run() executes with the device selected");
+    const std::string device_profile = read_file(profile_path);
+    check(device_profile.find("\"impl\":\"opencl\"") != std::string::npos,
+          "the device run() reports the OpenCL implementation");
+    clear_node_device_overrides();
+
+    const Diff diff = compare(cpu_output, device_output);
+    std::printf("stage-residency: run() parity: PAE %.6f LSB16, "
+                "%zu of %zu samples differ\n",
+                diff.max_abs, diff.differing, diff.samples);
+    check(diff.finite, "the run() device output is finite");
+    check(diff.max_abs <= 1.0, "the run() device output is within one LSB");
+
+    /* The same dispatch is reachable through the environment opt-in alone. */
+    std::remove(profile_path.c_str());
+    setenv("RT_STAGE_OPENCL", "1", 1);
+    std::string env_error;
+    RtStageBuffer env_output =
+        host.allocate({RT_STAGE_F32, 48, 32, 3}, &env_error);
+    const auto env_args = fixture.args(env_output, 0.5);
+    check(run("lanczos3", env_args) == RT_STAGE_OK,
+          "run() executes with RT_STAGE_OPENCL=1");
+    unsetenv("RT_STAGE_OPENCL");
+    const std::string env_profile = read_file(profile_path);
+    unsetenv("RT_STAGE_PROFILE");
+    check(env_profile.find("\"impl\":\"opencl\"") != std::string::npos,
+          "RT_STAGE_OPENCL=1 alone dispatches the node to the device");
+}
+
+} // namespace
+
+int main()
+{
+    using namespace rtengine::stage;
+
+    /* The switch is global; start from a known state. */
+    unsetenv("RT_STAGE_OPENCL");
+    unsetenv("RT_STAGE_OPENCL_DISABLE");
+    clear_node_device_overrides();
+    set_opencl_stage_allowed(true);
+
+    std::string reason;
+    const bool available = opencl_stage_available(&reason);
+    if (!available) {
+        std::printf("stage-residency: OpenCL unavailable (%s)\n", reason.c_str());
+    }
+    if (available) {
+        const auto nodes = opencl_stage_nodes();
+        check(!nodes.empty(), "at least one node has a device implementation");
+        check(has_opencl_stage_node("lanczos3"),
+              "the resize node has a device implementation");
+    }
+
+    test_cpu_events();
+    test_device_events(available);
+    test_selection(available);
+    test_residency();
+    test_node_parity(available);
+    test_run_wiring(available);
+
+    if (failures == 0) {
+        std::printf("stage-residency-test: PASS (%d skipped)\n", skipped);
+    }
+    return failures == 0 ? 0 : 1;
+}
