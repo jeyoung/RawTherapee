@@ -745,7 +745,9 @@ derived.
 The derived set is the execution-set authority. There is no
 `RT_CROP_DIRTY` mode and no runtime mask baseline. `crop-stage-test --sequences`
 applies the real `refreshmap.h` composite mask to the stage bodies, then
-compares the incremental crop with a fresh render of the final state.
+compares the incremental crop with a fresh render of the final state. For the
+destructive raw/core bodies the typed work order is the execution-set
+authority; the dirty-block set still schedules the downstream nodes.
 
 The `todo` coalescing and the plan validation in `planCropGraph()` are
 unchanged. A rejected plan aborts instead of running a full legacy loop, and
@@ -781,6 +783,93 @@ execution set. It compares display and output-space images byte for byte and
 requires one executed plan per state, one dirty derivation per update, and no
 plan rejection. Result on CPU and OpenCL builds: `AE=0` for every state and
 profile.
+
+#### Raw/core gate retirement
+
+The crop destructive bodies were converted to the typed work order at
+`500ee68c1` and the legacy raw/core gates were retired at `56157e8b8`. At
+`56157e8b8` every crop and preview raw/core body runs from the derived order;
+no site reads the mask for whether that body runs. The delta-block derivation
+and the downstream Lab/transform/monitor gates are unchanged.
+
+Removed crop predicates (all tested directly in `stageSourceSelect`,
+`stageAnalysis` and `stageRawBase`):
+
+```cpp
+(todo & (M_INIT | M_LINDENOISE | M_HDR)) != 0
+(todo & M_SPOT) != 0
+spotCrop != nullptr
+```
+
+Removed preview predicates (the batch gate functions in
+`improccoordinator.cc`):
+
+```cpp
+(todo & M_PREPROC) != 0 || (!highDetailPreprocessComputed && highDetailNeeded)
+(todo & M_RAW) != 0 || (!highDetailRawComputed && highDetailNeeded)
+    || (toneCurve.hrenabled && !isColor && rgbSourceModified)
+    || (!toneCurve.hrenabled && isColor && rgbSourceModified)
+(todo & (M_RAW | M_CSHARP)) != 0 && pdsharpening.enabled
+(todo & (M_INIT | M_LINDENOISE | M_HDR)) != 0
+(todo & (M_RETINEX | M_SPOT)) != 0
+(todo & (M_RETINEX | M_INIT)) != 0 && retinex.enabled
+(todo & M_SPOT) != 0 && spot.enabled && !spot.entries.empty()
+spotprev != nullptr
+```
+
+The request facts that remain are deliberate boundary folds, not gates:
+`RequestKind` from `M_INIT | M_LINDENOISE | M_HDR` (and `M_HIGHQUAL`), and
+`spotPending` from `M_SPOT`. The HDR/Fattal block (`todo & M_HDR`) and the
+demosaic body's internal sub-gates still read the mask: they decide how much
+of a node runs, not whether the raw/core body is entered. The transform,
+Lab and monitor gates are untouched.
+
+The spot buffer clear is now covered by `spotRestore`: a live buffer is named
+whether the tool is still configured (restore) or not (clear). That is why the
+site no longer reads `M_SPOT`.
+
+`RT_WORK_ORDER=0`/`off` no longer restores the mask. The caller derives with no
+usable history, so every parameter-applicable raw/core item is named: a
+conservative superset, safe and slower. The unit test pins the derivation and
+the preview sweep runs the conservative order against the exact one.
+
+#### Retirement evidence
+
+The conversion commit kept the read-only comparison active. On the crop
+harness it reported `typedOnly=0` on every pass of every state, `legacyOnly=0`,
+and `unprobed` only on the crop-only state where the plan omits the source and
+denoise stages that the order did not name. The preview sweep reported
+`typedOnly=0` on all 14 states; its `legacyOnly` entries were the documented
+redundant cases (working-profile demosaic and the high-detail fit
+transition).
+
+At `56157e8b8`, image 10.2 MP PEF `colorspace_flowers.pef`, 100% viewport
+960x640, `OMP_NUM_THREADS=1`:
+
+| Run | Plans | Fallbacks | Derivations | AE |
+| --- | --- | --- | --- | --- |
+| `crop-stage-test --sequences` | 33 | 0 | 33 | 0, all states |
+| `crop-stage-test --stages` | 6 | 0 | 6 | 0, all states |
+| `--sequences --extra-states` (spot, denoise, fattal) | 42 | 0 | 42 | 0, all states |
+| `--sequences --extra-states` with `RT_WORK_ORDER=off` | 42 | 0 | 42 | 0, all states |
+
+The PPM outputs of the conversion run and the retirement run are byte-identical
+for all 31 files, including the spot, denoise, fattal and geometry sequences.
+`preview-work-order-sweep.sh`: 14 states, `AE=0` for `preview.tif` and
+`work.tif`, kill switch 4 enabling and 3 disabling values, and no comparison
+line remains. Single-threaded 16-bit TIFF export with `RT_WORK_ORDER` on and off
+is `AE=0`; `thumbnail-stage-test` passes.
+
+Timing on the Intel Core i7-3770 host, 40 samples each, same image and control
+edit, `OMP_NUM_THREADS=1`:
+
+| Harness | Before (p50 / p95) | After (p50 / p95) |
+| --- | --- | --- |
+| crop exposure edit | 251.7 / 264.2 ms | 244.7 / 260.0 ms |
+| preview exposure edit | 321.4 / 329.0 ms | 320.1 / 328.3 ms |
+
+Both changes are within run-to-run noise. The CPU and OpenCL configurations
+compile, and the 14 stage unit tests pass in both trees.
 
 #### Request-fact change evidence
 
