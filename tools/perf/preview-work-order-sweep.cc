@@ -372,6 +372,28 @@ State retinexOn()
             }};
 }
 
+/*
+ * A retinex buffer input edited while retinex is already enabled. The
+ * preparation inside the demosaic body chooses the buffer layout from the
+ * colour space and writes its forward gamma into the planes, so the body must
+ * re-run; toggling only `enabled` does not exercise that path.
+ */
+State retinexColorspace()
+{
+    return {"retinex-colorspace", DEMOSAIC,
+            [](rtengine::procparams::ProcParams& params) {
+                params.retinex.retinexcolorspace = "HSLLOG";
+            }};
+}
+
+State retinexGamma()
+{
+    return {"retinex-gamma", DEMOSAIC,
+            [](rtengine::procparams::ProcParams& params) {
+                params.retinex.gammaretinex = "low";
+            }};
+}
+
 State workProfileRetinexOn()
 {
     return {"workprofile-retinex-on", DEMOSAIC,
@@ -441,7 +463,8 @@ const State* sweepStates(size_t& count)
 {
     static const State states[] = {
         spotAdd(), spotRemove(),
-        retinexOn(), workProfileRetinexOn(), retinexOff(),
+        retinexOn(), retinexColorspace(), retinexGamma(),
+        workProfileRetinexOn(), retinexOff(),
         workProfileRetinexOff(),
         filmNegativeOn(), filmNegativeOff(),
         captureSharpeningOn(), captureSharpeningOff(),
