@@ -36,7 +36,6 @@
 
 #include "stage_dirty_blocks.h"
 
-#include "stage_mask_map.h"
 #include "stage_pipeline.h"
 
 #include "rtengine/procparams.h"
@@ -764,7 +763,7 @@ void testStateMutation()
  * Enabling automatic denoise must dirty the analysis block on its own account.
  *
  * The analysis measures the noise the denoise base consumes, and the legacy
- * M_LINDENOISE gate schedules it for this change. The analysis fingerprint has
+ * the line-denoise family gate schedules it for this change. The analysis fingerprint has
  * to name the denoise parameters so the derivation reaches the same conclusion
  * without the mask, and so a node-level work flag can see the analysis as
  * directly dirty rather than only as a downstream consumer.
@@ -1089,15 +1088,11 @@ void testPreviewWrappers()
 
 void testVocabulary()
 {
-    std::set<std::string> maskIds;
-    for (const StageMaskMapEntry& row : stageMaskMap()) {
-        for (const std::string& id : row.cropBlocks) {
-            maskIds.insert(id);
-        }
-    }
-    for (const StageInputEntry& entry : nonMaskInputs(StagePath::Crop)) {
-        maskIds.insert(entry.block);
-    }
+    /*
+     * The derived crop ids are recorded by the pipeline specification. A new
+     * block must be added there before it can reach the derivation.
+     */
+    const std::vector<std::string> known = pipelineIds(StagePath::Crop);
 
     procparams::ProcParams params;
     params.wb.temperature += 500;
@@ -1112,8 +1107,8 @@ void testVocabulary()
         RenderStateKey(), changedKey());
 
     for (const std::string& id : derived.blocks) {
-        check(maskIds.find(id) != maskIds.end(),
-              "vocabulary: derived block is known to the mask map: " + id);
+        check(contains(known, id),
+              "vocabulary: derived block is in the pipeline spec: " + id);
     }
 }
 

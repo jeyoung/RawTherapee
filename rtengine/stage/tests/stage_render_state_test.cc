@@ -29,7 +29,6 @@
 #include "stage_render_state.h"
 
 #include "rtengine/editorrequest.h"
-#include "rtengine/refreshmap.h"
 #include "rtengine/viewportdefer.h"
 
 #include <cstdio>
@@ -254,121 +253,72 @@ static_assert(noPointers<
               "RenderStateKey must not contain pointers");
 
 /*
- * The retired mask-to-reason table, kept as the replay oracle.
- */
-const char* oldBaseCacheReason(int mask)
-{
-    if (mask & M_PREPROC) {
-        return "preprocess";
-    }
-    if (mask & M_RAW) {
-        return "raw";
-    }
-    if (mask & M_WB) {
-        return "white-balance";
-    }
-    if (mask & M_HIGHQUAL) {
-        return "high-detail-request";
-    }
-    return nullptr;
-}
-
-/*
- * Typed base-cache input set for one compatibility mask.
+ * Recorded base-cache decisions.
  *
- * This is the mapping the coordinator's parameter derivation reproduces in
- * production: one block per family, never the pass execution set.
+ * Each row is the exact input set and reason the coordinator must derive for
+ * one producer intent. The table is the oracle; no live request family is
+ * interpreted here.
  */
-rtengine::stage::DirtyBlocks baseCacheBlocksForMask(int mask)
-{
-    rtengine::stage::DirtyBlocks blocks;
-    blocks.valid = true;
-    if ((mask & M_PREPROC) != 0) {
-        blocks.ids.insert("raw.preprocess");
-    }
-    if ((mask & M_RAW) != 0) {
-        blocks.ids.insert("raw.demosaic");
-    }
-    if ((mask & M_WB) != 0) {
-        blocks.ids.insert("raw.base");
-    }
-    return blocks;
-}
+struct BaseCacheDecision {
+    const char* name;
+    std::initializer_list<const char*> blocks;
+    bool highDetail;
+    const char* reason;
+};
 
 void checkBaseCacheReplay()
 {
-    const auto compare = [](int mask, const char* label) {
-        const char* expected = oldBaseCacheReason(mask);
-        const char* actual = rtengine::stage::baseCacheInvalidationReason(
-            rtengine::stage::baseCacheInvalidationFor(
-                baseCacheBlocksForMask(mask), (mask & M_HIGHQUAL) != 0));
-        const bool equal = (expected == nullptr && actual == nullptr)
-            || (expected != nullptr && actual != nullptr
-                && std::string(expected) == actual);
-        if (!equal) {
-            std::fprintf(stderr,
-                         "FAIL: base-cache replay %s mask=0x%x: old=%s "
-                         "typed=%s\n",
-                         label, mask,
-                         expected != nullptr ? expected : "(none)",
-                         actual != nullptr ? actual : "(none)");
-            ++failures;
-        }
-    };
-
-    // Every producer intent, then every pair of coalesced intents.
-    const rtengine::RequestIntent intents[] = {
-        rtengine::RequestIntent::AllNoRaw,
-        rtengine::RequestIntent::Demosaic,
-        rtengine::RequestIntent::Hdr,
-        rtengine::RequestIntent::SpotAdjust,
-        rtengine::RequestIntent::Transform,
-        rtengine::RequestIntent::WhiteBalance,
-        rtengine::RequestIntent::RepaintOnly,
-        rtengine::RequestIntent::ControlOnly,
-        rtengine::RequestIntent::Compr,
-        rtengine::RequestIntent::CaptureSharpen,
-        rtengine::RequestIntent::DarkFrame,
-        rtengine::RequestIntent::First,
-        rtengine::RequestIntent::AutoExposure,
-        rtengine::RequestIntent::LuminanceCurve,
-        rtengine::RequestIntent::DirPyrEqualizer,
-        rtengine::RequestIntent::RgbCurve,
-        rtengine::RequestIntent::Sharpening
+    const BaseCacheDecision rows[] = {
+        {"AllNoRaw", {}, false, nullptr},
+        {"Demosaic", {"raw.demosaic"}, false, "raw"},
+        {"Hdr", {}, false, nullptr},
+        {"SpotAdjust", {}, false, nullptr},
+        {"Transform", {}, false, nullptr},
+        {"WhiteBalance", {"raw.base"}, false, "white-balance"},
+        {"RepaintOnly", {}, false, nullptr},
+        {"ControlOnly", {}, false, nullptr},
+        {"Compr", {}, false, nullptr},
+        {"CaptureSharpen", {}, false, nullptr},
+        {"DarkFrame", {"raw.preprocess", "raw.demosaic"}, false,
+         "preprocess"},
+        {"First", {"raw.preprocess", "raw.demosaic"}, false, "preprocess"},
+        {"AutoExposure", {}, false, nullptr},
+        {"LuminanceCurve", {}, false, nullptr},
+        {"DirPyrEqualizer", {}, false, nullptr},
+        {"RgbCurve", {}, false, nullptr},
+        {"Sharpening", {}, false, nullptr},
+        {"Retinex", {}, false, nullptr},
+        {"Crop", {}, false, nullptr},
+        {"Monitor", {}, false, nullptr},
+        {"HighQuality", {}, true, "high-detail-request"},
+        {"Demosaic+WhiteBalance", {"raw.demosaic", "raw.base"}, false, "raw"},
+        {"DarkFrame+HighQuality",
+         {"raw.preprocess", "raw.demosaic"}, true, "preprocess"},
+        {"WhiteBalance+HighQuality", {"raw.base"}, true, "white-balance"},
     };
 
     long long comparisons = 0;
-    for (rtengine::RequestIntent intent : intents) {
-        compare(rtengine::compatibility_mask(intent), "intent");
-        ++comparisons;
-    }
-    for (rtengine::RequestIntent left : intents) {
-        for (rtengine::RequestIntent right : intents) {
-            compare(rtengine::compatibility_mask(left)
-                        | rtengine::compatibility_mask(right),
-                    "intent pair");
-            ++comparisons;
+    for (const BaseCacheDecision& row : rows) {
+        rtengine::stage::DirtyBlocks blocks;
+        blocks.valid = true;
+        for (const char* id : row.blocks) {
+            blocks.ids.insert(id);
         }
-    }
 
-    /*
-     * Exhaustive over the four bits that decide the reason, with a
-     * representative set of unrelated bits present so the typed mapper cannot
-     * depend on anything else.
-     */
-    constexpr int unrelated =
-        M_INIT | M_SPOT | M_LINDENOISE | M_HDR | M_TRANSFORM | M_BLURMAP
-        | M_AUTOEXP | M_RGBCURVE | M_LUMACURVE | M_LUMINANCE | M_COLOR
-        | M_MONITOR | M_CSHARP | M_RETINEX | M_CROP | M_VOID | M_MINUPDATE;
-    const int relevant[] = {M_PREPROC, M_RAW, M_WB, M_HIGHQUAL};
-    for (int subset = 0; subset < 16; ++subset) {
-        int mask = unrelated;
-        for (int bit = 0; bit < 4; ++bit) {
-            if ((subset & (1 << bit)) != 0) {
-                mask |= relevant[bit];
-            }
+        const char* actual = rtengine::stage::baseCacheInvalidationReason(
+            rtengine::stage::baseCacheInvalidationFor(blocks,
+                                                      row.highDetail));
+        const bool equal = (row.reason == nullptr && actual == nullptr)
+            || (row.reason != nullptr && actual != nullptr
+                && std::string(row.reason) == actual);
+        if (!equal) {
+            std::fprintf(stderr,
+                         "FAIL: base-cache replay %s: expected=%s typed=%s\n",
+                         row.name,
+                         row.reason != nullptr ? row.reason : "(none)",
+                         actual != nullptr ? actual : "(none)");
+            ++failures;
         }
-        compare(mask, "relevant subset");
         ++comparisons;
     }
 
@@ -411,9 +361,17 @@ void checkDeferredReplay()
     const uint32_t bits = deferredStageBits(forced);
     check(bits == deferredForcedStageBits,
           "deferred stage bits are the canonical forced set");
-    const int payload = deferredExecutionPayload(bits);
-    check((payload & (M_PREPROC | M_RAW | M_WB | M_INIT | M_HDR)) == 0,
-          "deferred execution payload never carries a base bit");
+    rtengine::EditorRequest request;
+    request.present = true;
+    request.controlOnly = false;
+    request.kind = RequestKind::ParamsOnly;
+    request.absorbDeferredExecution(forced);
+    check(!request.rawIntent && !request.captureSharpenIntent
+              && !request.colorHlrWbRequest && !request.fullFrameIntent,
+          "the deferred request never carries a base family");
+    check(request.monitorIntent && request.rgbProcIntent
+              && request.lumaCurveIntent,
+          "the deferred request names its typed downstream families");
 
     DeferredRecord record;
     record.blocks = forced;

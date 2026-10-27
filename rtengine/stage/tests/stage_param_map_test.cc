@@ -666,7 +666,7 @@ void checkRawConsumerSplit()
         return fingerprints(exportParamMap(), export_fingerprint, changed);
     };
 
-    /* A demosaic-method edit is M_RAW, not M_PREPROC or a frame selection. */
+    /* A demosaic-method edit is the raw family, not the preprocess family or a frame selection. */
     {
         const FingerprintMap changed = after([](procparams::ProcParams& p) {
             p.raw.bayersensor.method = "RCD";
@@ -679,7 +679,7 @@ void checkRawConsumerSplit()
               "demosaic method leaves source.select unchanged");
     }
 
-    /* The denoise family is M_LINDENOISE, not a raw preprocessing family. */
+    /* The denoise family is the line-denoise family, not a raw preprocessing family. */
     {
         const FingerprintMap changed = after([](procparams::ProcParams& p) {
             p.dirpyrDenoise.luma += 5;
@@ -696,7 +696,7 @@ void checkRawConsumerSplit()
               "denoise leaves source.select unchanged");
     }
 
-    /* A coarse rotate is applied after the raw stage: M_TRANSFORM only. */
+    /* A coarse rotate is applied after the raw stage: the transform family only. */
     {
         const FingerprintMap changed = after([](procparams::ProcParams& p) {
             p.coarse.rotate = 90;

@@ -40,7 +40,6 @@
 #include "stage_work.h"
 
 #include "rtengine/procparams.h"
-#include "rtengine/refreshmap.h"
 
 #include <cstdio>
 #include <initializer_list>
@@ -85,83 +84,6 @@ void expectOrder(const WorkOrder& actual,
     check(false, message + ": expected " + workOrderName(wanted)
                      + ", derived " + workOrderName(actual));
 }
-
-/*
- * The legacy gate answers for the raw/core items of one edit, read from the
- * refreshmap action the GUI sends. This is the oracle the typed order must
- * never exceed: `typedOnly` is exactly the set of items the typed order names
- * that this function does not set.
- *
- * Only the raw/core items are modelled. Spot state is carried in the render
- * key rather than in the action, so spot cases keep their explicit checks in
- * testSpotTransitions().
- */
-WorkOrder legacyPreviewRawOrder(const procparams::ProcParams& params, int mask)
-{
-    WorkOrder order;
-
-    /*
-     * The caller folds a white-balance edit on the Color/Coloropp path into
-     * DEMOSAIC before the pass runs (improccoordinator.cc:4610-4618). The
-     * oracle must model that augmentation, or the demosaic the typed order
-     * names for the opposed recovery would look like a typed-only run.
-     */
-    if ((mask & M_WB) != 0 && params.toneCurve.hrenabled
-        && params.toneCurve.method == "Coloropp") {
-        mask |= DEMOSAIC;
-    }
-
-    const bool preprocess = (mask & M_PREPROC) != 0;
-    const bool demosaic = (mask & M_RAW) != 0
-        || ((mask & M_CSHARP) != 0 && params.pdsharpening.enabled);
-    const bool base = (mask & (M_INIT | M_LINDENOISE | M_HDR)) != 0;
-    const bool spotConfigured =
-        params.spot.enabled && !params.spot.entries.empty();
-    const bool spotApply = (mask & M_SPOT) != 0 && spotConfigured;
-    const bool retinex = ((mask & (M_RETINEX | M_INIT)) != 0)
-        && params.retinex.enabled;
-
-    if (preprocess) {
-        order.set(WorkItem::sourceSelect);
-        order.set(WorkItem::rawPreprocess);
-    }
-    if (demosaic) {
-        order.set(WorkItem::rawDemosaic);
-    }
-    if (base) {
-        order.set(WorkItem::rawBaseRebuild);
-        order.set(WorkItem::analysisRun);
-    }
-    if (spotApply) {
-        order.set(WorkItem::spotApply);
-        /* Without a base rebuild the spots are applied to the buffer and
-         * copied back; a base rebuild applies them directly. */
-        if (!base) {
-            order.set(WorkItem::spotRestore);
-        }
-    }
-    if (retinex) {
-        order.set(WorkItem::retinexPrepare);
-    }
-
-    return order;
-}
-
-void expectNoTypedOnly(const WorkOrder& typed, const WorkOrder& legacy,
-                       const std::string& message)
-{
-    WorkOrder extra;
-    for (size_t i = 0; i < workItemCount; ++i) {
-        const WorkItem item = static_cast<WorkItem>(i);
-        if (typed.has(item) && !legacy.has(item)) {
-            extra.set(item);
-        }
-    }
-    check(extra.empty(), message + ": typedOnly " + workOrderName(extra)
-                             + " against legacy " + workOrderName(legacy)
-                             + ", derived " + workOrderName(typed));
-}
-
 
 /*
  * One derivation under test.
@@ -378,10 +300,6 @@ void testParameterChanges()
         std::initializer_list<WorkItem> previewExpected;
         /* The crop stage bodies still read the spot families without a reload. */
         std::initializer_list<WorkItem> cropExpected = {};
-        /* The refreshmap action the editor sends for this edit. */
-        int mask = 0;
-        /* False for facts the raw/core oracle does not model (spot state). */
-        bool useOracle = true;
     };
 
     const ParamCase cases[] = {
@@ -389,32 +307,32 @@ void testParameterChanges()
          [](procparams::ProcParams& params) {
              params.wb.temperature += 500;
          },
-         {WorkItem::rawBaseRebuild, WorkItem::analysisRun}, {}, WB},
+         {WorkItem::rawBaseRebuild, WorkItem::analysisRun}},
         {"raw sensor level (raw.preprocess, raw.demosaic, raw.base)",
          [](procparams::ProcParams& params) {
              params.raw.bayersensor.black0 += 1.0;
          },
          {WorkItem::sourceSelect, WorkItem::rawPreprocess,
           WorkItem::rawDemosaic, WorkItem::rawBaseRebuild,
-          WorkItem::analysisRun}, {}, DARKFRAME},
+          WorkItem::analysisRun}},
         {"capture sharpening enabled (raw.demosaic)",
          [](procparams::ProcParams& params) {
              params.pdsharpening.enabled = true;
              params.pdsharpening.contrast += 0.1;
          },
          {WorkItem::rawDemosaic, WorkItem::rawBaseRebuild,
-          WorkItem::analysisRun}, {}, CAPTURESHARPEN},
+          WorkItem::analysisRun}},
         {"capture sharpening disabled (no demosaic body)",
          [](procparams::ProcParams& params) {
              params.pdsharpening.contrast += 0.1;
          },
-         {}, {}, CAPTURESHARPEN},
+         {}},
         {"retinex (raw.demosaic buffers, raw.base, enabled)",
          [](procparams::ProcParams& params) {
              params.retinex.enabled = true;
          },
          {WorkItem::rawDemosaic, WorkItem::rawBaseRebuild,
-          WorkItem::retinexPrepare, WorkItem::analysisRun}, {}, DEMOSAIC},
+          WorkItem::retinexPrepare, WorkItem::analysisRun}},
         {"lens profile (raw.preprocess, forward edge to demosaic)",
          [](procparams::ProcParams& params) {
              params.lensProf.lcMode =
@@ -422,45 +340,45 @@ void testParameterChanges()
          },
          {WorkItem::sourceSelect, WorkItem::rawPreprocess,
           WorkItem::rawDemosaic, WorkItem::rawBaseRebuild,
-          WorkItem::analysisRun}, {}, DARKFRAME},
+          WorkItem::analysisRun}},
         {"lens CA flag (transform, not preprocess)",
          [](procparams::ProcParams& params) {
              params.lensProf.useCA = true;
          },
-         {}, {}, HDR},
+         {}},
         {"colour management (raw.base, analysis)",
          [](procparams::ProcParams& params) {
              params.icm.workingProfile = "ProPhoto";
          },
-         {WorkItem::rawBaseRebuild, WorkItem::analysisRun}, {}, DEMOSAIC},
+         {WorkItem::rawBaseRebuild, WorkItem::analysisRun}},
         {"denoise strength (raw.base, analysis)",
          [](procparams::ProcParams& params) {
              params.dirpyrDenoise.luma += 5;
          },
-         {WorkItem::rawBaseRebuild, WorkItem::analysisRun}, {}, ALLNORAW},
+         {WorkItem::rawBaseRebuild, WorkItem::analysisRun}},
         {"demosaic method (raw.demosaic, raw.base)",
          [](procparams::ProcParams& params) {
              params.raw.bayersensor.method = "RCD";
          },
          {WorkItem::rawDemosaic, WorkItem::rawBaseRebuild,
-          WorkItem::analysisRun}, {}, DEMOSAIC},
+          WorkItem::analysisRun}},
         {"coarse rotate (transform, not preprocess)",
          [](procparams::ProcParams& params) {
              params.coarse.rotate = 90;
          },
-         {}, {}, ALLNORAW},
+         {}},
         {"fine rotate (transform, not preprocess)",
          [](procparams::ProcParams& params) {
              params.rotate.degree = 1.5;
          },
-         {}, {}, HDR},
+         {}},
         {"spot entry (spot buffer, no base rebuild)",
          [](procparams::ProcParams& params) {
              params.spot.enabled = true;
              params.spot.entries.emplace_back();
          },
          {WorkItem::spotApply, WorkItem::spotRestore},
-         {WorkItem::spotApply, WorkItem::spotRestore}, SPOTADJUST, false},
+         {WorkItem::spotApply, WorkItem::spotRestore}},
         {"dehaze (transform, not raw.base)",
          [](procparams::ProcParams& params) {
              params.dehaze.enabled = true;
@@ -476,7 +394,7 @@ void testParameterChanges()
              params.retinex.enabled = false;
              params.retinex.str += 5;
          },
-         {WorkItem::rawBaseRebuild, WorkItem::analysisRun}, {}, RETINEX},
+         {WorkItem::rawBaseRebuild, WorkItem::analysisRun}},
     };
 
     for (const ParamCase& testCase : cases) {
@@ -487,108 +405,14 @@ void testParameterChanges()
         const Derivation preview(StagePath::Preview, previous, current,
                                  RenderStateKey{}, RenderStateKey{},
                                  RequestKind::ParamsOnly);
-        const WorkOrder previewOrder = preview.preview();
-        expectOrder(previewOrder, testCase.previewExpected,
+        expectOrder(preview.preview(), testCase.previewExpected,
                     std::string("parameter ") + testCase.name);
-        if (testCase.useOracle) {
-            expectNoTypedOnly(
-                previewOrder, legacyPreviewRawOrder(current, testCase.mask),
-                std::string("parameter ") + testCase.name);
-        }
 
         const Derivation crop(StagePath::Crop, previous, current,
                               RenderStateKey{}, RenderStateKey{},
                               RequestKind::ParamsOnly);
         expectOrder(crop.crop(), testCase.cropExpected,
                     std::string("parameter ") + testCase.name + " on crop");
-    }
-}
-
-/*
- * The request kind the coordinator derives from the refreshmap action. The
- * shadow comparison runs on the same folding, so an edit family must not name
- * raw work beyond the action it sends.
- */
-RequestKind kindForAction(int mask)
-{
-    if ((mask & M_HIGHQUAL) != 0) {
-        return RequestKind::HighQuality;
-    }
-    if ((mask & (M_INIT | M_LINDENOISE | M_HDR)) != 0) {
-        return RequestKind::FullPreview;
-    }
-    return RequestKind::ParamsOnly;
-}
-
-/*
- * Each edit family with the request kind its editor action produces. This is
- * the end-to-end predicate check: the typed order may be smaller than the
- * legacy raw set where the mask over-approximates, but it must never name an
- * item the mask does not run.
- */
-void testEditFamiliesAgainstLegacyOracle()
-{
-    using Mutate = void (*)(procparams::ProcParams&);
-    struct Edit {
-        const char* name;
-        Mutate mutate;
-        int mask;
-        /* Whether the typed raw set is expected to equal the legacy one. */
-        bool exact;
-    };
-
-    const Edit edits[] = {
-        {"white balance", [](procparams::ProcParams& params) {
-             params.wb.temperature += 500;
-         }, WB, true},
-        {"demosaic method", [](procparams::ProcParams& params) {
-             params.raw.bayersensor.method = "RCD";
-         }, DEMOSAIC, true},
-        {"denoise", [](procparams::ProcParams& params) {
-             params.dirpyrDenoise.luma += 5;
-         }, ALLNORAW, true},
-        {"coarse rotate", [](procparams::ProcParams& params) {
-             params.coarse.rotate = 90;
-         }, ALLNORAW, true},
-        {"fine rotate", [](procparams::ProcParams& params) {
-             params.rotate.degree = 1.5;
-         }, HDR, true},
-        {"capture sharpening", [](procparams::ProcParams& params) {
-             params.pdsharpening.enabled = true;
-             params.pdsharpening.contrast += 0.1;
-         }, CAPTURESHARPEN, true},
-        {"lens profile", [](procparams::ProcParams& params) {
-             params.lensProf.lcMode =
-                 procparams::LensProfParams::LcMode::LENSFUNMANUAL;
-         }, DARKFRAME, true},
-        {"retinex", [](procparams::ProcParams& params) {
-             params.retinex.enabled = true;
-         }, DEMOSAIC, true},
-        {"colour management", [](procparams::ProcParams& params) {
-             params.icm.workingProfile = "ProPhoto";
-         }, DEMOSAIC, false}
-    };
-
-    for (const Edit& edit : edits) {
-        const procparams::ProcParams previous;
-        procparams::ProcParams current = previous;
-        edit.mutate(current);
-
-        const Derivation preview(StagePath::Preview, previous, current,
-                                 RenderStateKey{}, RenderStateKey{},
-                                 kindForAction(edit.mask));
-        const WorkOrder typed = preview.preview();
-        const WorkOrder legacy = legacyPreviewRawOrder(current, edit.mask);
-
-        expectNoTypedOnly(typed, legacy,
-                          std::string("action ") + edit.name);
-        if (edit.exact) {
-            check(typed == legacy,
-                  std::string("action ") + edit.name +
-                      ": typed order equals the legacy raw set: expected " +
-                      workOrderName(legacy) + ", derived " +
-                      workOrderName(typed));
-        }
     }
 }
 
@@ -611,7 +435,7 @@ void testSourceReload()
 
     /*
      * The crop gates are mask-only. A source generation bump reaches the crop
-     * through M_INIT (RequestKind::FullCrop), not through a parameter delta,
+     * through the init family (RequestKind::FullCrop), not through a parameter delta,
      * so the work order is empty when the request does not carry it. The
      * dirty-block derivation still models the Source aspect separately.
      */
@@ -674,7 +498,7 @@ void testSourceReload()
  * working-profile edit while retinex is enabled is an input of both the
  * retinex preparation and the buffer preparation inside the demosaic body, so
  * both are named. While retinex is disabled the demosaic body remains
- * legacy-only redundant work; a white-balance-only M_INIT is not an input of
+ * legacy-only redundant work; a white-balance-only the init family is not an input of
  * the preparation either.
  */
 void testRecoveryAndWorkingProfile()
@@ -696,8 +520,6 @@ void testRecoveryAndWorkingProfile()
                 {WorkItem::rawDemosaic, WorkItem::rawBaseRebuild,
                  WorkItem::analysisRun},
                 "Coloropp white balance demosaics for the opposed recovery");
-    expectNoTypedOnly(wb.preview(), legacyPreviewRawOrder(coloroppWb, WB),
-                      "Coloropp white balance against the augmented legacy mask");
 
     /*
      * The same parameter delta in a pass whose mask does not carry the
@@ -710,9 +532,6 @@ void testRecoveryAndWorkingProfile()
     expectOrder(bareWb.preview(),
                 {WorkItem::rawBaseRebuild, WorkItem::analysisRun},
                 "a bare white-balance delta does not demosaic");
-    expectNoTypedOnly(bareWb.preview(),
-                      legacyPreviewRawOrder(coloroppWb, ALLNORAW),
-                      "a bare white-balance delta against the legacy mask");
 
     /* The same edit with recovery disabled does not touch the planes. */
     ProcParams plainWb;
@@ -742,9 +561,6 @@ void testRecoveryAndWorkingProfile()
                 {WorkItem::rawDemosaic, WorkItem::rawBaseRebuild,
                  WorkItem::analysisRun},
                 "recovery method change on recovered planes demosaics");
-    expectNoTypedOnly(config.preview(),
-                      legacyPreviewRawOrder(coloroppMethod, DEMOSAIC),
-                      "recovery method change against the legacy mask");
 
     /*
      * Without recovery output the demosaic body is redundant: getImage()
@@ -756,9 +572,6 @@ void testRecoveryAndWorkingProfile()
     expectOrder(idle.preview(),
                 {WorkItem::rawBaseRebuild, WorkItem::analysisRun},
                 "recovery method change on plain planes rebuilds the base only");
-    expectNoTypedOnly(idle.preview(),
-                      legacyPreviewRawOrder(coloroppMethod, DEMOSAIC),
-                      "plain-plane recovery change against the legacy mask");
 
     /*
      * The working profile is an input of the retinex preparation, which
@@ -776,9 +589,6 @@ void testRecoveryAndWorkingProfile()
                 {WorkItem::rawDemosaic, WorkItem::rawBaseRebuild,
                  WorkItem::retinexPrepare, WorkItem::analysisRun},
                 "working profile reprepares the retinex buffers");
-    expectNoTypedOnly(profile.preview(),
-                      legacyPreviewRawOrder(retinexProfile, DEMOSAIC),
-                      "working profile against the legacy mask");
 
     /* Without retinex the working profile names no preparation. */
     ProcParams plainProfile;
@@ -791,7 +601,7 @@ void testRecoveryAndWorkingProfile()
                 "working profile without retinex rebuilds the base only");
 
     /*
-     * A white-balance-only M_INIT does not move the planes or read the white
+     * A white-balance-only the init family does not move the planes or read the white
      * balance in the preparation, so the legacy-only preparation is redundant.
      */
     ProcParams retinexWb = retinex;
@@ -802,9 +612,6 @@ void testRecoveryAndWorkingProfile()
     expectOrder(wbRetinex.preview(),
                 {WorkItem::rawBaseRebuild, WorkItem::analysisRun},
                 "white balance does not reprepare the retinex buffers");
-    expectNoTypedOnly(wbRetinex.preview(),
-                      legacyPreviewRawOrder(retinexWb, WB),
-                      "white balance with retinex against the legacy mask");
 }
 
 void testHighDetailTransitions()
@@ -940,8 +747,8 @@ void testRequestKinds()
     const procparams::ProcParams params;
     /*
      * A rebuild request names the destructive base body. It does not select,
-     * preprocess or demosaic the source: RequestKind folds M_INIT,
-     * M_LINDENOISE and M_HDR together and only those bits reach the base.
+     * preprocess or demosaic the source: RequestKind folds the init family,
+     * the line-denoise family and the HDR family together and only those bits reach the base.
      */
     const std::initializer_list<WorkItem> previewRebuild = {
         WorkItem::rawBaseRebuild, WorkItem::analysisRun};
@@ -961,8 +768,8 @@ void testRequestKinds()
     expectOrder(fullCrop.crop(), cropRebuild, "FullCrop: the crop reload set");
 
     /*
-     * M_HIGHQUAL asks for the accurate chain but is not part of the legacy
-     * raw reload gate (M_INIT | M_LINDENOISE | M_HDR). A HighQuality-only
+     * the high-quality request asks for the accurate chain but is not part of the legacy
+     * raw reload gate (the init family | the line-denoise family | the HDR family). A HighQuality-only
      * request therefore names no destructive raw body on either path.
      */
     const Derivation highQualityPreview(StagePath::Preview, params, params,
@@ -1144,7 +951,7 @@ void testUnreadFacts()
  * raw planes. Enabling either is covered by the parameter cases; disabling
  * them is the direction that needs a fresh demosaic, because the previous
  * pass's output is still in the planes. The legacy DEMOSAIC action carries
- * M_RAW in both directions.
+ * the raw family in both directions.
  */
 void testInPlaceBodyTransitions()
 {
@@ -1164,9 +971,6 @@ void testInPlaceBodyTransitions()
                 {WorkItem::rawDemosaic, WorkItem::rawBaseRebuild,
                  WorkItem::analysisRun},
                 "capture sharpening disabled: the demosaic body removes it");
-    expectNoTypedOnly(sharpeningDisable.preview(),
-                      legacyPreviewRawOrder(sharpeningOff, DEMOSAIC),
-                      "capture sharpening disabled against the legacy mask");
 
     /* A disabled-tool parameter edit leaves the planes untouched. */
     ProcParams sharpeningIdle = sharpeningOff;
@@ -1177,9 +981,6 @@ void testInPlaceBodyTransitions()
     expectOrder(idle.preview(),
                 {WorkItem::rawBaseRebuild, WorkItem::analysisRun},
                 "capture sharpening idle edit: no demosaic body");
-    expectNoTypedOnly(idle.preview(),
-                      legacyPreviewRawOrder(sharpeningIdle, DEMOSAIC),
-                      "capture sharpening idle edit against the legacy mask");
 
     ProcParams retinex;
     retinex.retinex.enabled = true;
@@ -1191,11 +992,8 @@ void testInPlaceBodyTransitions()
                 {WorkItem::rawDemosaic, WorkItem::rawBaseRebuild,
                  WorkItem::analysisRun},
                 "retinex disabled: the demosaic body discards its planes");
-    expectNoTypedOnly(retinexDisable.preview(),
-                      legacyPreviewRawOrder(retinexOff, DEMOSAIC),
-                      "retinex disabled against the legacy mask");
 
-    /* A strength edit carries M_RETINEX and reuses the prepared buffers. */
+    /* A strength edit carries the retinex family and reuses the prepared buffers. */
     ProcParams retinexStrength = retinex;
     retinexStrength.retinex.str += 5;
     const Derivation strength(StagePath::Preview, retinex, retinexStrength,
@@ -1205,9 +1003,6 @@ void testInPlaceBodyTransitions()
                 {WorkItem::rawBaseRebuild, WorkItem::retinexPrepare,
                  WorkItem::analysisRun},
                 "retinex strength reuses the prepared buffers");
-    expectNoTypedOnly(strength.preview(),
-                      legacyPreviewRawOrder(retinexStrength, RETINEX),
-                      "retinex strength against the legacy mask");
 }
 
 /*
@@ -1260,10 +1055,6 @@ void testRetinexBufferInputs()
                     {WorkItem::rawDemosaic, WorkItem::rawBaseRebuild,
                      WorkItem::retinexPrepare, WorkItem::analysisRun},
                     std::string("retinex ") + edit.name + " buffer edit");
-        expectNoTypedOnly(enabled.preview(),
-                          legacyPreviewRawOrder(current, DEMOSAIC),
-                          std::string("retinex ") + edit.name +
-                              " against the legacy mask");
 
         /* While disabled no buffer describes a known colour space or gamma. */
         ProcParams currentOff;
@@ -1274,10 +1065,6 @@ void testRetinexBufferInputs()
         expectOrder(disabled.preview(),
                     {WorkItem::rawBaseRebuild, WorkItem::analysisRun},
                     std::string("retinex ") + edit.name + " with retinex off");
-        expectNoTypedOnly(disabled.preview(),
-                          legacyPreviewRawOrder(currentOff, DEMOSAIC),
-                          std::string("retinex ") + edit.name +
-                              " with retinex off against the legacy mask");
     }
 
     /*
@@ -1292,13 +1079,10 @@ void testRetinexBufferInputs()
     const Derivation unusedGamma(StagePath::Preview, fixedTable, fixedGamma,
                                  RenderStateKey{}, RenderStateKey{},
                                  RequestKind::ParamsOnly);
-    expectNoTypedOnly(unusedGamma.preview(),
-                      legacyPreviewRawOrder(fixedGamma, DEMOSAIC),
-                      "gam edit under a fixed gamma table against the mask");
 
     /*
      * `retinex()` reads `toneCurve.hrenabled` for the Lab-mode gamut control.
-     * The editor's ALLNORAW action carries M_INIT, so the legacy preparation
+     * The editor's ALLNORAW action carries the init family, so the legacy preparation
      * re-runs and the typed order must name it.
      */
     ProcParams hl = retinex;
@@ -1310,8 +1094,6 @@ void testRetinexBufferInputs()
                 {WorkItem::rawBaseRebuild, WorkItem::retinexPrepare,
                  WorkItem::analysisRun},
                 "highlight recovery toggle reprepares the retinex output");
-    expectNoTypedOnly(highlight.preview(), legacyPreviewRawOrder(hl, ALLNORAW),
-                      "highlight recovery toggle against the legacy mask");
 
     ProcParams hlOff;
     hlOff.toneCurve.hrenabled = true;
@@ -1323,7 +1105,7 @@ void testRetinexBufferInputs()
                 "highlight recovery toggle with retinex off rebuilds the base");
 
     /*
-     * A strength edit carries M_RETINEX and does not re-demosaic: the
+     * A strength edit carries the retinex family and does not re-demosaic: the
      * preparation's gamma guard and `retinex()` repeat the same `str != 0`
      * test, so the buffers stay valid.
      */
@@ -1336,9 +1118,6 @@ void testRetinexBufferInputs()
                 {WorkItem::rawBaseRebuild, WorkItem::retinexPrepare,
                  WorkItem::analysisRun},
                 "retinex strength does not re-demosaic");
-    expectNoTypedOnly(strengthEdit.preview(),
-                      legacyPreviewRawOrder(strength, RETINEX),
-                      "retinex strength against the legacy mask");
 }
 
 /* Every item is reachable from at least one documented case. */
@@ -1405,7 +1184,6 @@ int main()
     testConservativeFallback();
     testNoChange();
     testParameterChanges();
-    testEditFamiliesAgainstLegacyOracle();
     testSourceReload();
     testRecoveryAndWorkingProfile();
     testRetinexBufferInputs();
