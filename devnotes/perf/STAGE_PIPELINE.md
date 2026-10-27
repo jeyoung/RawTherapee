@@ -885,9 +885,9 @@ the CPU build unless stated:
 
 - `stage-abi-test`, `stage-cache-test`, `stage-device-test`,
   `stage-dirty-blocks-test`, `stage-graph-test`, `stage-indexer-test`,
-  `stage-mask-map-test`, `stage-param-hash-test`, `stage-param-map-test`,
-  `stage-parity-test`, `stage-pipeline-test`, `stage-render-state-test` and
-  `stage-store-test`: 13 PASS.
+  `stage-param-hash-test`, `stage-param-map-test`, `stage-parity-test`,
+  `stage-pipeline-test`, `stage-render-state-test`, `stage-store-test` and
+  `viewport-admission-test`: 13 PASS.
 - `crop-stage-test --sequences`: PASS, `33 plans executed, 0 plan fallbacks,
   33 dirty derivations`, `AE=0` in the static fit/100%/zoomed states and in
   every sequence state.
@@ -1174,14 +1174,15 @@ The Clamp-OOG p50 falls from 510.3 ms to 315.3 ms (-38.2%); p95 falls from
 ### Builds and tests
 
 `tools/build-rt.sh cpu -j 6` and `tools/build-rt.sh opencl -j 6` complete.
-All 16 stage test executables plus `editorrequest-test` pass in both build
-trees:
+All 15 `stage-*` test executables plus `editorrequest-test` and
+`viewport-admission-test` pass in both build trees:
 `stage-abi-test`, `stage-cache-test`, `stage-node-cache-test`,
 `stage-device-test`, `stage-residency-test`, `stage-graph-test`,
 `stage-indexer-test`, `stage-param-hash-test`, `stage-render-state-test`,
 `stage-param-map-test`, `stage-dirty-blocks-test`, `stage-work-test`,
-`stage-pipeline-test`, `stage-mask-map-test`, `stage-store-test` and
-`stage-parity-test`. `stage-work-test` pins the switch parser (`nullptr`, empty,
+`stage-pipeline-test`, `stage-store-test`, `stage-parity-test`,
+`editorrequest-test` and `viewport-admission-test`. `stage-work-test` pins the
+switch parser (`nullptr`, empty,
 `1`, `yes` enable; `0`, `off`, `OFF` disable) and the corrected predicates
 (retinex planes and buffer inputs, capture-sharpening disable, high-detail
 drop).

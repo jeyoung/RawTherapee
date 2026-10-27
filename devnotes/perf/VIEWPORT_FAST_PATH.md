@@ -49,8 +49,10 @@ and the two snapshots, and calls `viewportFastPathFallback()` in
   admitted. A producer-provided dirty set must also stay inside the delta
   chain: a base block (`source.select`, `raw.preprocess`, `raw.demosaic`,
   `raw.base`, `analysis`, `transform`) makes it a base request and an unknown
-  block makes it unsupported. An absent accumulator is unsupported, and an HDR
-  request alone stays admissible because GUI events over-approximate with it;
+  block makes it unsupported. An absent accumulator is unsupported. An HDR
+  request alone is a base request because `familiesFor(Hdr)` names
+  `lineDenoise`; the `Hdr` row of `viewport_admission_test.cc` records
+  `ViewportEligibility::Base`;
 - the parameter vetoes are unchanged and keep their order and reason strings:
   auto exposure, histogram matching, auto B&W, auto colour-toning, CIE,
   Local Lab, non-zero Lab contrast, active Fattal/dehaze/spot removal, every

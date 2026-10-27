@@ -70,8 +70,12 @@ narrow typed input set (`raw.preprocess`, `raw.demosaic`, `raw.base` for the
 white-balance fact) and the high-detail flag to the same strings the old mask
 mapper published. The typed set is not the pass execution set: a spot,
 film-negative, Retinex or tone-curve change does not invalidate the snapshot,
-matching the old mask behaviour. `stage-render-state-test` replays every
-producer intent and every intent pair against the retired mask oracle.
+matching the old mask behaviour. `stage-render-state-test` pins the decision
+table with hand-written block sets and reason strings: 21 of the 22 intents
+(all but `NoRequest`) and three representative pairs
+(`Demosaic+WhiteBalance`, `DarkFrame+HighQuality`,
+`WhiteBalance+HighQuality`). It does not replay requests against the retired
+mask oracle.
 
 Crop-only and output/monitor-only changes do not invalidate. A transform-only
 change is not an invalidation either because it normally changes only the

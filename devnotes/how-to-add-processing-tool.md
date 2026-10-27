@@ -137,11 +137,13 @@ localization file and use `M()` to load them.
 ### Trigering Preview/History Updates
 
 In order for your tool to trigger image preview updates and be displayed in
-the edit history, you need to connect changes to the event system. Example
-code to do so is below.
-
-Events are categorized such that they trigger only part of the image processing
-pipeline when emitted. See `rtengine/refreshmap.h` for more details.
+the edit history, you need to register a typed producer event. A tool names a
+`rtengine::RequestIntent`; the intent selects the pipeline families the request
+asks for and the coordinator derives the request facts from it. There is no
+integer event mask to choose and no stage constant to combine. See
+`rtengine/editorrequest.h` for the intent set and
+`rtengine/editorrequest_registry.cc` for the recorded classification of the
+static `ProcEventCode` events.
 
 ```cpp
 // rtgui/tools/faketool.h
@@ -163,18 +165,39 @@ private:
 void FakeTool::setupEvents()
 {
     auto m = ProcEventMapper::getInstance();
-    // ALL is one possible stage when regenerating image preview.
-    // See refreshmap.h for more options.
-    //
     // HISTORY_MSG_FAKE_TOOL_ENABLED is a localization string key.
-    EvFakeToolEnabled = m->newEvent(ALL, "HISTORY_MSG_FAKE_TOOL_ENABLED");
+    EvFakeToolEnabled = m->newEvent(
+        rtengine::RequestIntent::LuminanceCurve,
+        "HISTORY_MSG_FAKE_TOOL_ENABLED");
 }
 ```
+
+Choose the narrowest intent whose families cover everything the tool dirties.
+The family intents most new tools need are:
+
+- `LuminanceCurve` for a Lab curve or Lab pixel tool;
+- `RgbCurve` for an RGB curve or colour tool;
+- `DirPyrEqualizer` for a wavelet or directional-pyramid tool;
+- `WhiteBalance` for a white-balance change;
+- `Demosaic` for a demosaic change and `CaptureSharpen` for capture
+  sharpening;
+- `DarkFrame` for dark-frame and flat-field changes;
+- `Transform` for geometry, `Compr` for gamut compression, `Hdr` for the
+  HDR/dehaze family and `Retinex` for Retinex;
+- `ControlOnly` for a parameter update that renders nothing.
+
+If the tool already knows the exact preview blocks it dirties, the
+`EditorRequest` overload of `newEvent()` accepts a producer-provided set; the
+intent overload is the usual choice.
 
 When registering a new event, the localization key is for the general action
 that is displayed in the history. Later, when emitting the event, you can
 include additional details in the `listener->panelChanged()` call. The string
 should be added to `rtdata/languages/default`.
+
+The `editorrequest-test` guard rejects a regression to the retired mask:
+`newEvent(<integer>)`, `M_*` mask constants and the deleted mask names fail
+the suite, so a new tool must keep its event typed.
 
 ## Maintaining Feature Compatibility
 

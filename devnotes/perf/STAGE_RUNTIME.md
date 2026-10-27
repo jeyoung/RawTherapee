@@ -687,8 +687,8 @@ the rectangle; the closure adds every downstream consumer; the snapshot form
 equals the ProcParams form; every adapter returns the same execution set as
 `derive_dirty_blocks()`, including the resident sink; and every id returned is
 a canonical node of the path. The other stage tests (`stage-pipeline-test`,
-`stage-mask-map-test`, `stage-render-state-test`, `stage-param-map-test`) still
-pass.
+`stage-render-state-test`, `stage-param-map-test`,
+`viewport-admission-test`) still pass.
 
 The latency and screenshot evidence of the first preview draft was measured
 against the standalone unit and is not carried over: the shared derivation is

@@ -4,7 +4,7 @@ Preview timings are emitted when `RT_PREVIEW_PROFILE=1` is set. Each completed
 render prints:
 
 ```text
-preview update: <wall-ms> ms todo=0x<mask>
+preview update: <wall-ms> ms kind=<request-kind> request=<request-identity> cache=<0|1> [viewport=<shape> ...]
 ```
 
 The timer starts after a stale queued request has been rejected, so dropped
