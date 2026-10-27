@@ -188,13 +188,13 @@ afterwards; a separate boundary would reorder the pass. The plan still
 carries the node and tracks its dirty state, but no executor exists for it, so
 the preview executes 13 of its 14 canonical nodes.
 
-The nodes keep their own event-mask gates because a preview block decides how
-much of its output a mask allows, not only whether it runs: `raw.base`
-rebuilds the base for one class of bits, re-prepares retinex for another and
-re-applies spots for a third. The plan decides whether a node is executed; the
-node decides what the mask permits inside it. `monitor.output` executes at its
-legacy site, after the crop render, so the monitor profile cache refresh it
-follows still feeds the crop viewport.
+The node entry is the plan: a preview node executes only when the dirty set
+names it. A node body still decides *how much* of its output the request
+allows, and it reads the typed `EditorRequest` facts for that rather than the
+mask: `raw.base` rebuilds the base for one class of requests, re-prepares
+retinex for another and re-applies spots for a third. `monitor.output`
+executes at its legacy site, after the crop render, so the monitor profile
+cache refresh it follows still feeds the crop viewport.
 
 Three statements that were unconditional in the hand-written pass stay in the
 caller, never in a node: the `oprevi = orig_prev` working-pointer reset, the
