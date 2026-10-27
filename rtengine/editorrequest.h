@@ -24,6 +24,12 @@
 #include <initializer_list>
 #include <string>
 
+namespace rtengine::procparams
+{
+struct ToneCurveParams;
+class ProcParams;
+} // namespace rtengine::procparams
+
 namespace rtengine
 {
 
@@ -178,6 +184,60 @@ struct EditorRequest {
     bool localAdjustmentsIntent = false;
 
     /*
+     * The request carries a bit of the base chain: `M_PREPROC`, `M_RAW`,
+     * `M_WB`, `M_INIT`, `M_LINDENOISE`, `M_MONITOR`, `M_TRANSFORM`,
+     * `M_CSHARP`, `M_RETINEX` or `M_BLURMAP`. These are the bits that ask for
+     * the full-frame base or a display sink and therefore cannot be served by
+     * the viewport fast path. `M_HDR` is deliberately not included: it is one
+     * of the over-approximated bits a GUI event may carry even when the HDR
+     * inputs did not change. Recompute it with setLegacyGateMask().
+     */
+    bool baseChainIntent = false;
+
+    /* The request repaints the visible crop (`M_CROP`). */
+    bool cropIntent = false;
+
+    /*
+     * The request carries the control bit `M_VOID`, with or without other
+     * work. The fast path has nothing to render for a request that asks to
+     * update parameters without a repaint.
+     */
+    bool controlBitRequest = false;
+
+    /*
+     * The request carries `M_MINUPDATE`. It is the imperative repaint only
+     * when it is the whole mask (see imperativeRepaint), but a coalesced
+     * request can carry it beside other work, and the crop subset follows the
+     * bit rather than the imperative.
+     */
+    bool repaintRequest = false;
+
+    /* The request rebuilds the Lab tone curve (`M_LUMACURVE`). */
+    bool lumaCurveIntent = false;
+
+    /* The request applies the Lab pixel tools (`M_LUMINANCE` or `M_COLOR`). */
+    bool labPixelIntent = false;
+
+    /*
+     * The exact Lab pixel bits. The crop bodies read M_LUMINANCE and M_COLOR
+     * separately, so the crop payload preserves which one the request named.
+     * They are payload-shaping facts like the mask itself and are therefore
+     * excluded from identity(); every planning decision uses their union,
+     * labPixelIntent.
+     */
+    bool luminanceIntent = false;
+    bool colorIntent = false;
+
+    /*
+     * The request asks for the geometry transform (`M_TRANSFORM`) without the
+     * other transform-family bits. The viewport crop subset carries it when
+     * post-crop vignetting derives a transform, and it is a dependency of the
+     * crop render rather than a request kind. Recompute it with
+     * setLegacyGateMask().
+     */
+    bool transformRequest = false;
+
+    /*
      * The request carries no bit outside the control bit `M_VOID`, so it
      * updates parameters without rendering. A request with an empty legacy
      * mask is treated the same way.
@@ -197,10 +257,10 @@ struct EditorRequest {
      *
      * This is the mask the adapter received, ORed across coalesced requests
      * and widened whenever the coordinator adds an execution bit. It is
-     * consumed only by the legacy block gates, by cache invalidation and by
-     * the documented viewport fast-path admission site. It is not read by any
-     * planning decision, and it is excluded from identity(); the planning
-     * facts derived from it are included.
+     * consumed only by the unconverted block bodies, by cache invalidation and
+     * by the deferred-analysis queue. It is not read by any planning
+     * decision, and it is excluded from identity(); the planning facts derived
+     * from it are included.
      */
     int legacyGateMask = 0;
 
@@ -238,17 +298,237 @@ struct EditorRequest {
     void refreshFromLegacyMask();
 
     /*
-     * The legacy mask for the documented viewport fast-path admission test.
-     *
-     * This is the single accessor the coordinator uses to obtain the opaque
-     * execution payload; see ImProcCoordinator::updatePreviewImage() for the
-     * documented admission site and the list of non-planning consumers.
+     * The opaque execution payload, for the block bodies, cache invalidation
+     * and the deferred-analysis queue. Viewport admission does not read it.
      */
-    int viewportAdmissionMask() const
+    int executionPayload() const
     {
         return legacyGateMask;
     }
 };
+
+/*
+ * What the viewport fast path can do with a request, from the typed request
+ * alone.
+ *
+ * The classification is the request-family half of admission; the parameter
+ * vetoes are applied separately by viewportFastPathFallback(). The values keep
+ * the legacy fallback reasons so a profile log stays comparable across the
+ * retirement.
+ */
+enum class ViewportEligibility : int32_t {
+    /* The request touches only inputs the fast path rebuilds. */
+    Admit = 0,
+    /* The request needs the full-frame base chain or the display sink. */
+    Base = 1,
+    /* The request names no rendering family the fast path supports. */
+    Unsupported = 2
+};
+
+/* Classify a request for viewport admission. See ViewportEligibility. */
+ViewportEligibility viewportEligibility(const EditorRequest& request);
+
+/*
+ * Fallback reason for a non-admitted classification, or nullptr for Admit.
+ * The strings are the ones the mask-based gate reported.
+ */
+const char* viewportEligibilityReason(ViewportEligibility eligibility);
+
+/*
+ * Coordinator state that takes part in admission but is not request data.
+ *
+ * The high-detail fields are the decision and what has been computed for it;
+ * they decide whether the cached full-frame analysis can serve the request.
+ */
+struct ViewportAdmissionState {
+    /* The RT_VIEWPORT_FAST kill switch is on. */
+    bool fastPathEnabled = true;
+    /* A complete full-frame pass has published its snapshot. */
+    bool fullStateComplete = false;
+    /* The request needs the high-detail chain. */
+    bool highDetailNeeded = false;
+    /* The high-detail decision of the last completed full-frame pass. */
+    bool highDetailComplete = false;
+    /* The high-detail preprocess and demosaic buffers are current. */
+    bool highDetailPreprocessComputed = false;
+    bool highDetailRawComputed = false;
+};
+
+/*
+ * The parameter sets admission compares.
+ *
+ * `current` is the request's parameters, `lastFullPass` the inputs of the last
+ * completed full-frame pass (`viewportFullParams`) and `lastLutPass` the
+ * parameters whose parent LUTs were last rebuilt (`viewportLutParams`).
+ */
+struct ViewportAdmissionInputs {
+    const procparams::ProcParams& current;
+    const procparams::ProcParams& lastFullPass;
+    const procparams::ProcParams& lastLutPass;
+    ViewportAdmissionState state;
+};
+
+/*
+ * Viewport fast-path admission: nullptr when the request may be served by the
+ * fast path, otherwise the stable fallback reason.
+ *
+ * The request family is classified from `request` (see viewportEligibility());
+ * the parameter vetoes below reproduce the hand-written gate exactly. They
+ * stay because each names an input the cached full-frame analysis cannot
+ * serve: auto exposure and histogram matching change the tone LUT's histogram,
+ * auto black-and-white and auto colour toning recompute their own LUTs from
+ * the image, CIE and Local Lab are full-frame chains, non-zero Lab contrast
+ * needs the cached Lab histogram, the full-frame filters would be re-applied
+ * differently, and a base input that differs from the snapshot invalidates the
+ * cached analysis. A LUT input that changed without a request for its family
+ * would leave a stale parent LUT, so that is vetoed too.
+ */
+const char* viewportFastPathFallback(const EditorRequest& request,
+                                     const ViewportAdmissionInputs& inputs);
+
+/*
+ * Whether the highlight-recovery subset of the tone curve is equal.
+ *
+ * Only these fields feed the highlight reconstruction that the fast path
+ * reproduces from the cached base; the rest of the tone curve is a parent LUT.
+ */
+bool sameHighlightRecovery(const procparams::ToneCurveParams& a,
+                           const procparams::ToneCurveParams& b);
+
+/*
+ * The parent LUTs a viewport request rebuilds.
+ *
+ * The full path rebuilds a parent LUT when its parameter family is requested.
+ * The fast path must reproduce exactly that, and one family needs two levels:
+ * a crop repaint rebuilds the tone LUTs and lumacurve -- the crop's zero
+ * histogram makes lumacurve independent of the cached full-frame histogram --
+ * but not clcurve or the signed Lab curves, which need the real analysis. A
+ * luminance-curve request rebuilds all three Lab LUTs. `labCurves` therefore
+ * means the whole Lab family and `lumaCurveFromCrop` means lumacurve alone.
+ *
+ * The names are the dependencies, not the bits: `toneCurves` is the
+ * complexCurve/RGBCurve/toning/B&W group and `wavelet` is wavclCurve. The two
+ * named constructors serve the full-path sites, which rebuild one family for
+ * their own block and only need the snapshot updated.
+ */
+struct ViewportLutSelection {
+    /* complexCurve, the RGB curves, colour toning and the B&W curves. */
+    bool toneCurves = false;
+    /* Lumacurve, clcurve and the signed Lab curves. */
+    bool labCurves = false;
+    /* Lumacurve only, from the zero histogram. */
+    bool lumaCurveFromCrop = false;
+    /* wavclCurve. */
+    bool wavelet = false;
+
+    /* Whether complexLCurve must run. */
+    bool rebuildsLumaCurve() const
+    {
+        return labCurves || lumaCurveFromCrop;
+    }
+
+    /* Whether any parent LUT must be rebuilt. */
+    bool any() const
+    {
+        return toneCurves || rebuildsLumaCurve() || wavelet;
+    }
+
+    /* The tone/RGB/toning/B&W family alone. */
+    static ViewportLutSelection toneOnly()
+    {
+        ViewportLutSelection selection;
+        selection.toneCurves = true;
+        return selection;
+    }
+
+    /* The whole Lab curve family alone. */
+    static ViewportLutSelection labOnly()
+    {
+        ViewportLutSelection selection;
+        selection.labCurves = true;
+        return selection;
+    }
+
+    /* The wavelet curve alone. */
+    static ViewportLutSelection waveletOnly()
+    {
+        ViewportLutSelection selection;
+        selection.wavelet = true;
+        return selection;
+    }
+};
+
+/*
+ * The parent LUTs one request needs rebuilt, from its typed request data.
+ *
+ * `toneCurves` covers the tone/RGB/toning/B&W group, `labCurves` the whole Lab
+ * family, `lumaCurveFromCrop` lumacurve from a crop repaint, and `wavelet`
+ * wavclCurve. A crop repaint is a dependency of the tone and luma LUTs because
+ * the crop consumes them; it is not a second request.
+ */
+ViewportLutSelection viewportLutSelection(const EditorRequest& request);
+
+/*
+ * The work one viewport fast-path hit renders on the visible crops.
+ *
+ * The crop bodies still read an execution mask; this struct is the typed
+ * decision behind it. `labPixelsImplied()` is the dependency the legacy site
+ * expressed as a mask OR: a luminance-curve or auto-exposure edit reaches the
+ * crop's Lab pixel tools only through `M_LUMINANCE|M_COLOR`, so the crop
+ * render needs them whenever either family is in the selection.
+ */
+struct ViewportCropSelection {
+    /* M_CROP: the crop rectangle changed. */
+    bool crop = false;
+    /* M_MINUPDATE: repaint without new image work. */
+    bool repaint = false;
+    /* M_AUTOEXP. */
+    bool autoExposure = false;
+    /* M_TRANSFORM: a derived or requested geometry transform. */
+    bool transform = false;
+    /* M_RGBCURVE. */
+    bool rgbProc = false;
+    /* M_LUMACURVE. */
+    bool lumaCurve = false;
+    /* M_LUMINANCE and M_COLOR, kept apart because the crop carries the exact
+     * bits the request named. */
+    bool luminance = false;
+    bool color = false;
+
+    /* Whether the request names either Lab pixel tool. */
+    bool labPixels() const
+    {
+        return luminance || color;
+    }
+
+    /* A luminance-curve or auto-exposure edit needs the Lab pixel tools. */
+    bool labPixelsImplied() const
+    {
+        return labPixels() || lumaCurve || autoExposure;
+    }
+};
+
+/*
+ * The crop-render selection of one request, from its typed request data.
+ *
+ * `request` must carry the execution facts of the pass, so a caller that
+ * augmented the payload refreshes the request first. resolveCropDependencies()
+ * is separate so the dependency is visible at the call site and can be
+ * replayed.
+ */
+ViewportCropSelection viewportCropSelection(const EditorRequest& request);
+
+/* Close the selection over the crop's Lab pixel dependency, in place. */
+void resolveCropDependencies(ViewportCropSelection& selection);
+
+/*
+ * The `todo` argument Crop::update() reads for a selection, and the execution
+ * mask it reads from the request. Both are payload materialisations for the
+ * unconverted crop bodies, not planning decisions.
+ */
+int viewportCropTodo(const ViewportCropSelection& selection);
+int viewportCropPayload(int requestMask,
+                        const ViewportCropSelection& selection);
 
 /*
  * Facts that reach a request without passing through an `M_*` bit.
@@ -306,9 +586,9 @@ EditorRequest from_legacy_mask(int mask, const LegacyMaskContext& context = {});
  * operations the tools currently express; `make_request()` turns one into an
  * `EditorRequest` whose kind, facts and dirty-block source are the planning
  * inputs. `legacyGateMask` is filled with the identical compatibility mask, so
- * the viewport fast path, the deferred queue, cache invalidation and the block
- * bodies keep the payload they had. The compatibility mask is derived here,
- * next to the adapter, and never at the tool.
+ * the deferred queue, cache invalidation and the block bodies keep the payload
+ * they had. The compatibility mask is derived here, next to the adapter, and
+ * never at the tool.
  *
  * A tool that knows the exact blocks it dirties passes them to the second
  * form. They replace the parameter-fingerprint comparison for that request;

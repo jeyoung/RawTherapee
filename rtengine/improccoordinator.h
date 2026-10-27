@@ -341,7 +341,8 @@ protected:
     void setScale(int prevscale, bool allowSmall = false);
     void updatePreviewImage (EditorRequest request, bool panningRelatedChange,
                              unsigned requestId);
-    bool canUseViewportFastPath(int todo, bool highDetailNeeded,
+    bool canUseViewportFastPath(const EditorRequest& request,
+                                bool highDetailNeeded,
                                 const char*& reason) const;
     void prepareViewportLuts(int todo);
     void updateViewportLutSnapshot(int todo);

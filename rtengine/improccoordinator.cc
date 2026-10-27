@@ -508,16 +508,6 @@ void ImProcCoordinator::restoreParams()
 namespace
 {
 
-bool sameHighlightRecovery(const procparams::ToneCurveParams& a,
-                           const procparams::ToneCurveParams& b)
-{
-    return a.hrenabled == b.hrenabled
-        && a.method == b.method
-        && a.hlbl == b.hlbl
-        && a.hlth == b.hlth
-        && a.clampOOG == b.clampOOG;
-}
-
 bool sameBaseInputs(const procparams::ProcParams& a,
                     const procparams::ProcParams& b)
 {
@@ -598,14 +588,6 @@ int viewportDeferredMaxWaitMs()
     return value;
 }
 
-constexpr int VIEWPORT_FAST_ALLOWED_TODO =
-    M_AUTOEXP | M_RGBCURVE | M_LUMACURVE | M_LUMINANCE | M_COLOR
-    | M_CROP | M_MINUPDATE | M_HDR | M_SPOT;
-
-constexpr int VIEWPORT_FAST_REJECTED_TODO =
-    M_PREPROC | M_RAW | M_WB | M_INIT | M_LINDENOISE | M_MONITOR
-    | M_TRANSFORM | M_CSHARP | M_RETINEX | M_HIGHQUAL | M_BLURMAP;
-
 // Bits that are safe for Crop::update once the parent LUTs have been rebuilt.
 // Base/init and over-approximated HDR/spot bits are deliberately dropped.
 constexpr int VIEWPORT_CROP_TODO =
@@ -659,217 +641,30 @@ void assertPlanningAgrees(const EditorRequest&, const char*)
 
 } // namespace
 
-bool ImProcCoordinator::canUseViewportFastPath(int todo,
+bool ImProcCoordinator::canUseViewportFastPath(const EditorRequest& request,
                                                bool highDetailNeeded,
                                                const char*& reason) const
 {
-    reason = nullptr;
+    /*
+     * Admission is the typed policy in editorrequest.cc; this wrapper only
+     * collects the coordinator state that takes part in it. The current
+     * parameters and the two snapshots are the inputs the hand-written gate
+     * read, so the policy sees exactly the same data.
+     */
+    ViewportAdmissionInputs inputs{*params, viewportFullParams,
+                                   viewportLutParams, {}};
+    inputs.state.fastPathEnabled = viewportFastEnabled();
+    inputs.state.fullStateComplete =
+        viewportStateValid.load(std::memory_order_relaxed);
+    inputs.state.highDetailNeeded = highDetailNeeded;
+    inputs.state.highDetailComplete =
+        viewportHighDetail.load(std::memory_order_relaxed);
+    inputs.state.highDetailPreprocessComputed = highDetailPreprocessComputed;
+    inputs.state.highDetailRawComputed = highDetailRawComputed;
 
-    if (!viewportFastEnabled()) {
-        reason = "switch-off";
-        return false;
-    }
-    if (!viewportStateValid.load(std::memory_order_relaxed)) {
-        reason = "no-complete-full-state";
-        return false;
-    }
-    if (highDetailNeeded
-            != viewportHighDetail.load(std::memory_order_relaxed)) {
-        reason = "high-detail-transition";
-        return false;
-    }
-    if (highDetailNeeded
-            && (!highDetailPreprocessComputed || !highDetailRawComputed)) {
-        reason = "high-detail-pending";
-        return false;
-    }
-    if (todo & VIEWPORT_FAST_REJECTED_TODO) {
-        reason = "base-request";
-        return false;
-    }
-    if (todo & ~VIEWPORT_FAST_ALLOWED_TODO) {
-        reason = "unsupported-request";
-        return false;
-    }
+    reason = viewportFastPathFallback(request, inputs);
 
-    if (params->toneCurve.autoexp
-            || viewportFullParams.toneCurve.autoexp) {
-        reason = "auto-exposure";
-        return false;
-    }
-    if (params->toneCurve.histmatching
-            || viewportFullParams.toneCurve.histmatching
-            || params->toneCurve.fromHistMatching
-            || viewportFullParams.toneCurve.fromHistMatching) {
-        reason = "histogram-matching";
-        return false;
-    }
-    if ((params->blackwhite.enabled && params->blackwhite.autoc)
-            || (viewportFullParams.blackwhite.enabled
-                && viewportFullParams.blackwhite.autoc)) {
-        reason = "auto-black-white";
-        return false;
-    }
-    if ((params->colorToning.enabled && params->colorToning.autosat)
-            || (viewportFullParams.colorToning.enabled
-                && viewportFullParams.colorToning.autosat)) {
-        reason = "auto-colour-toning";
-        return false;
-    }
-    if (params->colorappearance.enabled) {
-        reason = "cie";
-        return false;
-    }
-    if (params->locallab.enabled) {
-        reason = "local-lab";
-        return false;
-    }
-    if (params->labCurve.contrast != 0) {
-        reason = "lab-contrast";
-        return false;
-    }
-
-    // Active full-frame filters would either be skipped here or re-applied
-    // differently from the normal path, so leave them to the full pipeline.
-    if (params->fattal.enabled || params->dehaze.enabled) {
-        reason = "hdr-processing";
-        return false;
-    }
-    if (params->spot.enabled && !params->spot.entries.empty()) {
-        reason = "spot-removal";
-        return false;
-    }
-
-    const ProcParams& last = viewportFullParams;
-
-    if (params->raw != last.raw) {
-        reason = "raw";
-        return false;
-    }
-    if (params->wb != last.wb) {
-        reason = "white-balance";
-        return false;
-    }
-    if (params->icm != last.icm) {
-        reason = "color-management";
-        return false;
-    }
-    if (params->coarse != last.coarse) {
-        reason = "coarse-transform";
-        return false;
-    }
-    // The transform-stage parameters stay rejected until the ROI parity of
-    // Crop::update() with a live transform change is validated on the GUI.
-    if (params->commonTrans != last.commonTrans) {
-        reason = "common-transform";
-        return false;
-    }
-    if (params->rotate != last.rotate) {
-        reason = "rotate";
-        return false;
-    }
-    if (params->distortion != last.distortion) {
-        reason = "distortion";
-        return false;
-    }
-    if (params->lensProf != last.lensProf) {
-        reason = "lens-profile";
-        return false;
-    }
-    if (params->perspective != last.perspective) {
-        reason = "perspective";
-        return false;
-    }
-    if (params->gradient != last.gradient) {
-        reason = "gradient";
-        return false;
-    }
-    if (params->pcvignette != last.pcvignette) {
-        reason = "post-crop-vignette";
-        return false;
-    }
-    if (params->cacorrection != last.cacorrection) {
-        reason = "ca-correction";
-        return false;
-    }
-    if (params->vignetting != last.vignetting) {
-        reason = "vignetting";
-        return false;
-    }
-    if (params->spot != last.spot) {
-        reason = "spot";
-        return false;
-    }
-    if (params->filmNegative != last.filmNegative) {
-        reason = "film-negative";
-        return false;
-    }
-    if (params->dehaze != last.dehaze) {
-        reason = "dehaze";
-        return false;
-    }
-    if (params->fattal != last.fattal) {
-        reason = "fattal";
-        return false;
-    }
-    if (params->retinex != last.retinex) {
-        reason = "retinex";
-        return false;
-    }
-    if (params->pdsharpening != last.pdsharpening) {
-        reason = "capture-sharpening";
-        return false;
-    }
-    if (params->dirpyrDenoise != last.dirpyrDenoise) {
-        reason = "denoise";
-        return false;
-    }
-    if (params->cg != last.cg) {
-        reason = "gamut-compression";
-        return false;
-    }
-    if (params->locallab != last.locallab) {
-        reason = "local-lab-params";
-        return false;
-    }
-    if (!sameHighlightRecovery(params->toneCurve, last.toneCurve)) {
-        reason = "highlight-recovery";
-        return false;
-    }
-    if (params->toneCurve.autoexp != last.toneCurve.autoexp
-            || params->toneCurve.histmatching
-                != last.toneCurve.histmatching
-            || params->blackwhite.autoc != last.blackwhite.autoc
-            || params->colorToning.autosat != last.colorToning.autosat) {
-        reason = "auto-flags";
-        return false;
-    }
-
-    // The fast path rebuilds LUTs based on the request mask. If a LUT input
-    // changed without its corresponding mask bit, fall back instead of
-    // rendering with stale curves.
-    const ProcParams& lastLut = viewportLutParams;
-
-    if ((params->toneCurve != lastLut.toneCurve
-            || params->rgbCurves != lastLut.rgbCurves
-            || params->colorToning != lastLut.colorToning
-            || params->blackwhite != lastLut.blackwhite)
-            && !(todo & M_RGBCURVE)) {
-        reason = "tone-curve-mask";
-        return false;
-    }
-    if (params->labCurve != lastLut.labCurve
-            && !(todo & M_LUMACURVE)) {
-        reason = "lab-curve-mask";
-        return false;
-    }
-    if (params->wavelet != lastLut.wavelet
-            && !(todo & (M_LUMINANCE | M_COLOR))) {
-        reason = "wavelet-mask";
-        return false;
-    }
-
-    return true;
+    return reason == nullptr;
 }
 
 void ImProcCoordinator::prepareViewportLuts(int todo)
@@ -4784,20 +4579,22 @@ void ImProcCoordinator::updatePreviewImage(EditorRequest request,
     }
 
     /*
-     * The documented viewport-admission read. `todo` is the legacy execution
-     * payload: it feeds the block gates, cache invalidation and the fast-path
-     * admission test below. Every planning decision reads the request facts,
-     * not `todo`; each widening below refreshes those facts through
-     * setLegacyGateMask().
+     * The opaque execution payload. `todo` feeds the block bodies, cache
+     * invalidation and the deferred-analysis queue; admission reads the typed
+     * request, not `todo`. Each widening below refreshes the request facts
+     * through setLegacyGateMask().
      */
-    int todo = request.viewportAdmissionMask();
+    int todo = request.executionPayload();
 
     // Keep the requested event mask for cache invalidation. The augmentation
     // below turns a crop-only change into a transform request, but the base
-    // image itself does not change. Eligibility is evaluated on this
-    // un-augmented mask so a derived transform does not force a full render.
+    // image itself does not change. Eligibility is evaluated on the
+    // un-augmented request so a derived transform does not force a full
+    // render; the typed facts of that request are the ones the adapter
+    // derived from the un-augmented payload.
     const int baseCacheTodo = todo;
     const int eligibilityTodo = todo;
+    const EditorRequest eligibilityRequest = request;
 
     // This augmentation must happen before a stale request is requeued, since
     // the next request may only carry M_CROP and M_MONITOR.
@@ -4901,7 +4698,7 @@ void ImProcCoordinator::updatePreviewImage(EditorRequest request,
         forceFullPreview.load(std::memory_order_relaxed);
 
     const char* viewportFallback = nullptr;
-    if (canUseViewportFastPath(eligibilityTodo, highDetailNeeded,
+    if (canUseViewportFastPath(eligibilityRequest, highDetailNeeded,
                                viewportFallback)) {
         int cropTodo = todo & VIEWPORT_CROP_TODO;
         EditorRequest cropRequest = request;

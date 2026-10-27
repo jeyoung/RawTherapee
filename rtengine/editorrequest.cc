@@ -26,6 +26,7 @@
 
 #include "editorrequest.h"
 
+#include "procparams.h"
 #include "refreshmap.h"
 
 #include <cassert>
@@ -33,6 +34,7 @@
 #include <cstdlib>
 #include <algorithm>
 #include <functional>
+#include <set>
 #include <string>
 
 namespace rtengine
@@ -55,6 +57,40 @@ constexpr int REQUEST_BITS = M_VOID | M_MINUPDATE | M_HIGHQUAL;
 
 /* Every bit the coordinator consumes. */
 constexpr int MAPPED_BITS = PARAMETER_AND_OUTPUT_BITS | REQUEST_BITS;
+
+/*
+ * The base-chain bits: a request carrying one of them asks for the full-frame
+ * base or a display sink. M_HDR is excluded on purpose because GUI events
+ * over-approximate with it; its parameter veto is separate.
+ */
+constexpr int BASE_CHAIN_BITS =
+    M_PREPROC | M_RAW | M_WB | M_INIT | M_LINDENOISE | M_MONITOR | M_TRANSFORM
+    | M_CSHARP | M_RETINEX | M_BLURMAP;
+
+/*
+ * Preview-path blocks the viewport fast path can serve, and the base blocks it
+ * cannot. A producer that reports its own dirty set is held to the same
+ * envelope the request families describe; the ids are the canonical preview
+ * descriptors (stage_pipeline.cc). `monitor.output` is a resident of the path
+ * and belongs to the deferred pass, but naming it is not a base request.
+ */
+bool viewportDeltaBlock(const std::string& id)
+{
+    static const std::set<std::string> delta = {
+        "local.adjustments", "rgb.proc", "lab.tools", "lab.wavelet",
+        "working.trc", "ciecam", "gamut", "monitor.output"
+    };
+    return delta.count(id) != 0;
+}
+
+bool viewportBaseBlock(const std::string& id)
+{
+    static const std::set<std::string> base = {
+        "source.select", "raw.preprocess", "raw.demosaic", "raw.base",
+        "analysis", "transform"
+    };
+    return base.count(id) != 0;
+}
 
 /* The absolute reload bits, which ask for the whole path. */
 constexpr int FULL_FRAME_BITS = M_INIT | M_LINDENOISE | M_HDR;
@@ -114,6 +150,13 @@ uint64_t identityOf(const EditorRequest& request)
     hash = hashCombine(hash, request.labChainIntent ? 1 : 0);
     hash = hashCombine(hash, request.autoExposureIntent ? 1 : 0);
     hash = hashCombine(hash, request.localAdjustmentsIntent ? 1 : 0);
+    hash = hashCombine(hash, request.baseChainIntent ? 1 : 0);
+    hash = hashCombine(hash, request.cropIntent ? 1 : 0);
+    hash = hashCombine(hash, request.controlBitRequest ? 1 : 0);
+    hash = hashCombine(hash, request.repaintRequest ? 1 : 0);
+    hash = hashCombine(hash, request.lumaCurveIntent ? 1 : 0);
+    hash = hashCombine(hash, request.labPixelIntent ? 1 : 0);
+    hash = hashCombine(hash, request.transformRequest ? 1 : 0);
     hash = hashCombine(hash, request.dirty.valid ? 1 : 0);
     hash = hashCombine(hash, request.dirty.forced ? 1 : 0);
 
@@ -191,6 +234,15 @@ void EditorRequest::setLegacyGateMask(int mask)
     autoExposureIntent = (mask & M_AUTOEXP) != 0;
     localAdjustmentsIntent =
         (mask & (M_AUTOEXP | M_RGBCURVE | M_CROP)) != 0;
+    baseChainIntent = (mask & BASE_CHAIN_BITS) != 0;
+    cropIntent = (mask & M_CROP) != 0;
+    controlBitRequest = (mask & M_VOID) != 0;
+    repaintRequest = (mask & M_MINUPDATE) != 0;
+    lumaCurveIntent = (mask & M_LUMACURVE) != 0;
+    labPixelIntent = (mask & (M_LUMINANCE | M_COLOR)) != 0;
+    luminanceIntent = (mask & M_LUMINANCE) != 0;
+    colorIntent = (mask & M_COLOR) != 0;
+    transformRequest = (mask & M_TRANSFORM) != 0;
 }
 
 uint64_t EditorRequest::identity() const
@@ -244,7 +296,25 @@ bool planningAgreesWithLegacyMask(const EditorRequest& request)
         && request.localAdjustmentsIntent
             == ((request.legacyGateMask
                  & (M_AUTOEXP | M_RGBCURVE | M_CROP))
-                != 0);
+                != 0)
+        && request.baseChainIntent
+            == ((request.legacyGateMask & BASE_CHAIN_BITS) != 0)
+        && request.cropIntent
+            == ((request.legacyGateMask & M_CROP) != 0)
+        && request.repaintRequest
+            == ((request.legacyGateMask & M_MINUPDATE) != 0)
+        && request.controlBitRequest
+            == ((request.legacyGateMask & M_VOID) != 0)
+        && request.lumaCurveIntent
+            == ((request.legacyGateMask & M_LUMACURVE) != 0)
+        && request.labPixelIntent
+            == ((request.legacyGateMask & (M_LUMINANCE | M_COLOR)) != 0)
+        && request.luminanceIntent
+            == ((request.legacyGateMask & M_LUMINANCE) != 0)
+        && request.colorIntent
+            == ((request.legacyGateMask & M_COLOR) != 0)
+        && request.transformRequest
+            == ((request.legacyGateMask & M_TRANSFORM) != 0);
 }
 
 EditorRequest from_legacy_mask(int mask, const LegacyMaskContext& context)
@@ -467,6 +537,351 @@ stage::RequestKind crop_request_kind(EditorRequest::RequestKind previewKind,
     }
 
     return previewKind;
+}
+
+bool sameHighlightRecovery(const procparams::ToneCurveParams& a,
+                           const procparams::ToneCurveParams& b)
+{
+    return a.hrenabled == b.hrenabled
+        && a.method == b.method
+        && a.hlbl == b.hlbl
+        && a.hlth == b.hlth
+        && a.clampOOG == b.clampOOG;
+}
+
+ViewportEligibility viewportEligibility(const EditorRequest& request)
+{
+    /*
+     * An absent request never reaches admission: the coordinator's loop stops
+     * when the accumulator is empty. Classify it as unsupported rather than
+     * admitting a request that names no work.
+     */
+    if (!request.present) {
+        return ViewportEligibility::Unsupported;
+    }
+
+    /*
+     * The base chain and the accurate path need the full-frame rebuild, and
+     * they take precedence over the unsupported classification so the reason
+     * stays the one the mask-based gate reported.
+     */
+    if (request.baseChainIntent || request.highDetailIntent) {
+        return ViewportEligibility::Base;
+    }
+
+    /*
+     * A producer that reports its own dirty blocks is held to the same
+     * envelope the request families describe. The set is an execution set:
+     * residents and forward closure are included, so a delta seed also names
+     * its downstream nodes.
+     */
+    if (!request.derivesFromParameters()) {
+        if (!request.dirty.valid) {
+            return ViewportEligibility::Unsupported;
+        }
+        for (const std::string& id : request.dirty.ids) {
+            if (viewportDeltaBlock(id)) {
+                continue;
+            }
+            return viewportBaseBlock(id) ? ViewportEligibility::Base
+                                         : ViewportEligibility::Unsupported;
+        }
+    }
+
+    /*
+     * A control-only request (`M_VOID`) updates parameters without rendering;
+     * the fast path has nothing to render for it.
+     */
+    if (request.controlBitRequest) {
+        return ViewportEligibility::Unsupported;
+    }
+
+    return ViewportEligibility::Admit;
+}
+
+const char* viewportEligibilityReason(ViewportEligibility eligibility)
+{
+    switch (eligibility) {
+    case ViewportEligibility::Admit:
+        return nullptr;
+    case ViewportEligibility::Base:
+        return "base-request";
+    case ViewportEligibility::Unsupported:
+        return "unsupported-request";
+    }
+    assert(false && "unknown viewport eligibility");
+    return "unsupported-request";
+}
+
+namespace
+{
+
+/*
+ * The parameter vetoes of viewport admission, in the order the hand-written
+ * gate applied them so a profile log keeps its reason.
+ */
+const char* viewportParamFallback(const ViewportAdmissionInputs& inputs,
+                                  const EditorRequest& request)
+{
+    const procparams::ProcParams& current = inputs.current;
+    const procparams::ProcParams& last = inputs.lastFullPass;
+
+    if (current.toneCurve.autoexp || last.toneCurve.autoexp) {
+        return "auto-exposure";
+    }
+    if (current.toneCurve.histmatching || last.toneCurve.histmatching
+            || current.toneCurve.fromHistMatching
+            || last.toneCurve.fromHistMatching) {
+        return "histogram-matching";
+    }
+    if ((current.blackwhite.enabled && current.blackwhite.autoc)
+            || (last.blackwhite.enabled && last.blackwhite.autoc)) {
+        return "auto-black-white";
+    }
+    if ((current.colorToning.enabled && current.colorToning.autosat)
+            || (last.colorToning.enabled && last.colorToning.autosat)) {
+        return "auto-colour-toning";
+    }
+    if (current.colorappearance.enabled) {
+        return "cie";
+    }
+    if (current.locallab.enabled) {
+        return "local-lab";
+    }
+    if (current.labCurve.contrast != 0) {
+        return "lab-contrast";
+    }
+
+    // Active full-frame filters would either be skipped here or re-applied
+    // differently from the normal path, so leave them to the full pipeline.
+    if (current.fattal.enabled || current.dehaze.enabled) {
+        return "hdr-processing";
+    }
+    if (current.spot.enabled && !current.spot.entries.empty()) {
+        return "spot-removal";
+    }
+
+    if (current.raw != last.raw) {
+        return "raw";
+    }
+    if (current.wb != last.wb) {
+        return "white-balance";
+    }
+    if (current.icm != last.icm) {
+        return "color-management";
+    }
+    if (current.coarse != last.coarse) {
+        return "coarse-transform";
+    }
+    // The transform-stage parameters stay rejected until the ROI parity of
+    // Crop::update() with a live transform change is validated on the GUI.
+    if (current.commonTrans != last.commonTrans) {
+        return "common-transform";
+    }
+    if (current.rotate != last.rotate) {
+        return "rotate";
+    }
+    if (current.distortion != last.distortion) {
+        return "distortion";
+    }
+    if (current.lensProf != last.lensProf) {
+        return "lens-profile";
+    }
+    if (current.perspective != last.perspective) {
+        return "perspective";
+    }
+    if (current.gradient != last.gradient) {
+        return "gradient";
+    }
+    if (current.pcvignette != last.pcvignette) {
+        return "post-crop-vignette";
+    }
+    if (current.cacorrection != last.cacorrection) {
+        return "ca-correction";
+    }
+    if (current.vignetting != last.vignetting) {
+        return "vignetting";
+    }
+    if (current.spot != last.spot) {
+        return "spot";
+    }
+    if (current.filmNegative != last.filmNegative) {
+        return "film-negative";
+    }
+    if (current.dehaze != last.dehaze) {
+        return "dehaze";
+    }
+    if (current.fattal != last.fattal) {
+        return "fattal";
+    }
+    if (current.retinex != last.retinex) {
+        return "retinex";
+    }
+    if (current.pdsharpening != last.pdsharpening) {
+        return "capture-sharpening";
+    }
+    if (current.dirpyrDenoise != last.dirpyrDenoise) {
+        return "denoise";
+    }
+    if (current.cg != last.cg) {
+        return "gamut-compression";
+    }
+    if (current.locallab != last.locallab) {
+        return "local-lab-params";
+    }
+    if (!sameHighlightRecovery(current.toneCurve, last.toneCurve)) {
+        return "highlight-recovery";
+    }
+    if (current.toneCurve.autoexp != last.toneCurve.autoexp
+            || current.toneCurve.histmatching
+                != last.toneCurve.histmatching
+            || current.blackwhite.autoc != last.blackwhite.autoc
+            || current.colorToning.autosat != last.colorToning.autosat) {
+        return "auto-flags";
+    }
+
+    // The fast path rebuilds only the parent LUTs the request asks for. If a
+    // LUT input changed without its family, fall back instead of rendering
+    // with stale curves.
+    const procparams::ProcParams& lastLut = inputs.lastLutPass;
+
+    if ((current.toneCurve != lastLut.toneCurve
+            || current.rgbCurves != lastLut.rgbCurves
+            || current.colorToning != lastLut.colorToning
+            || current.blackwhite != lastLut.blackwhite)
+            && !request.rgbProcIntent) {
+        return "tone-curve-mask";
+    }
+    if (current.labCurve != lastLut.labCurve && !request.lumaCurveIntent) {
+        return "lab-curve-mask";
+    }
+    if (current.wavelet != lastLut.wavelet && !request.labPixelIntent) {
+        return "wavelet-mask";
+    }
+
+    return nullptr;
+}
+
+} // namespace
+
+const char* viewportFastPathFallback(const EditorRequest& request,
+                                     const ViewportAdmissionInputs& inputs)
+{
+    if (!inputs.state.fastPathEnabled) {
+        return "switch-off";
+    }
+    if (!inputs.state.fullStateComplete) {
+        return "no-complete-full-state";
+    }
+    if (inputs.state.highDetailNeeded != inputs.state.highDetailComplete) {
+        return "high-detail-transition";
+    }
+    if (inputs.state.highDetailNeeded
+            && (!inputs.state.highDetailPreprocessComputed
+                || !inputs.state.highDetailRawComputed)) {
+        return "high-detail-pending";
+    }
+
+    const ViewportEligibility eligibility = viewportEligibility(request);
+    if (eligibility != ViewportEligibility::Admit) {
+        return viewportEligibilityReason(eligibility);
+    }
+
+    return viewportParamFallback(inputs, request);
+}
+
+ViewportLutSelection viewportLutSelection(const EditorRequest& request)
+{
+    ViewportLutSelection selection;
+
+    /*
+     * A crop repaint rebuilds the tone LUTs and lumacurve from the zero
+     * histogram, because Crop::update() consumes both.
+     */
+    selection.toneCurves = request.rgbProcIntent || request.cropIntent;
+    selection.labCurves = request.lumaCurveIntent;
+    selection.lumaCurveFromCrop = request.cropIntent;
+
+    /* The wavelet LUT is shared by the Lab pixel family and auto exposure. */
+    selection.wavelet = request.labPixelIntent || request.autoExposureIntent;
+
+    return selection;
+}
+
+ViewportCropSelection viewportCropSelection(const EditorRequest& request)
+{
+    ViewportCropSelection selection;
+
+    selection.crop = request.cropIntent;
+    selection.repaint = request.repaintRequest;
+    selection.autoExposure = request.autoExposureIntent;
+    selection.transform = request.transformRequest;
+    selection.rgbProc = request.rgbProcIntent;
+    selection.lumaCurve = request.lumaCurveIntent;
+    selection.luminance = request.luminanceIntent;
+    selection.color = request.colorIntent;
+
+    return selection;
+}
+
+void resolveCropDependencies(ViewportCropSelection& selection)
+{
+    if (selection.lumaCurve || selection.autoExposure) {
+        selection.luminance = true;
+        selection.color = true;
+    }
+}
+
+int viewportCropTodo(const ViewportCropSelection& selection)
+{
+    int todo = 0;
+
+    if (selection.crop) {
+        todo |= M_CROP;
+    }
+    if (selection.repaint) {
+        todo |= M_MINUPDATE;
+    }
+    if (selection.autoExposure) {
+        todo |= M_AUTOEXP;
+    }
+    if (selection.transform) {
+        todo |= M_TRANSFORM;
+    }
+    if (selection.rgbProc) {
+        todo |= M_RGBCURVE;
+    }
+    if (selection.lumaCurve) {
+        todo |= M_LUMACURVE;
+    }
+    if (selection.luminance) {
+        todo |= M_LUMINANCE;
+    }
+    if (selection.color) {
+        todo |= M_COLOR;
+    }
+
+    return todo;
+}
+
+int viewportCropPayload(int requestMask,
+                        const ViewportCropSelection& selection)
+{
+    /*
+     * The crop bodies read the execution payload, not the request. The only
+     * addition the fast path makes is the Lab pixel pair its dependency
+     * resolution implied; every other bit is the request's own payload.
+     */
+    int payload = requestMask;
+
+    if (selection.luminance) {
+        payload |= M_LUMINANCE;
+    }
+    if (selection.color) {
+        payload |= M_COLOR;
+    }
+
+    return payload;
 }
 
 } // namespace rtengine
