@@ -776,30 +776,41 @@ void Crop::update(int todo)
     }
 
     /*
-     * Read-only work-order shadow. The order is derived once per update from
-     * the previous snapshot, the keys and the parameters, exactly like the
-     * dirty-block derivation. The mask is not passed in; the legacy gates are
-     * probed at their sites instead.
+     * Work order of the update. Derived once per update from the previous
+     * snapshot, the keys and the parameters, exactly like the dirty-block
+     * derivation. The mask is never an input: the legacy gates are probed at
+     * their sites while the shadow is enabled.
+     *
+     * The typed order is on by default, so it is derived even when the shadow
+     * is off. A pass without usable history derives the forced full crop
+     * reload set, which is what the first update needs.
      */
-    if (rtengine::stage::workShadowEnabled()) {
-        if (!dirtyState->valid || !dirtyState->paramsValid) {
+    const bool wantWorkOrder = rtengine::stage::workOrderEnabled();
+    const bool wantWorkShadow = rtengine::stage::workShadowEnabled();
+    if (wantWorkOrder || wantWorkShadow) {
+        const bool history = dirtyState->valid && dirtyState->paramsValid;
+        rtengine::stage::WorkInputs workInputs;
+
+        if (history) {
+            workInputs.previousState = &dirtyState->renderState;
+            workInputs.previousFingerprints = &dirtyState->fingerprints;
+            workInputs.previousParams = &dirtyState->previousParams;
+        }
+
+        workInputs.currentState = &state;
+        workInputs.currentFingerprints = &current;
+        workInputs.requestKind = state.requestKind;
+        workInputs.path = rtengine::stage::StagePath::Crop;
+        workInputs.params = &params;
+        ctx.work = rtengine::stage::derive_crop_work(workInputs);
+
+        if (wantWorkShadow && !history) {
             /*
              * No usable history: the typed order is the forced full crop
              * reload set and the legacy mask need not carry every bit. Report
              * the pass as forced instead of counting a typed-only run.
              */
             ctx.shadow.skipForcedPass();
-        } else {
-            rtengine::stage::WorkInputs workInputs;
-            workInputs.previousState = &dirtyState->renderState;
-            workInputs.currentState = &state;
-            workInputs.previousFingerprints = &dirtyState->fingerprints;
-            workInputs.currentFingerprints = &current;
-            workInputs.previousParams = &dirtyState->previousParams;
-            workInputs.requestKind = state.requestKind;
-            workInputs.path = rtengine::stage::StagePath::Crop;
-            workInputs.params = &params;
-            ctx.work = rtengine::stage::derive_crop_work(workInputs);
         }
     }
 
@@ -945,10 +956,13 @@ void Crop::update(int todo)
     dirtyState->renderState = cropRenderState();
     dirtyState->valid = true;
 
-    if (rtengine::stage::workShadowEnabled()) {
+    if (rtengine::stage::workShadowEnabled()
+        || rtengine::stage::workOrderEnabled()) {
         dirtyState->previousParams = params;
         dirtyState->paramsValid = true;
-        ctx.shadow.report("crop", ctx.work);
+        if (rtengine::stage::workShadowEnabled()) {
+            ctx.shadow.report("crop", ctx.work);
+        }
     }
 }
 
@@ -982,7 +996,10 @@ void Crop::stageSourceSelect(CropStageContext& ctx)
     if (rtengine::stage::workShadowEnabled()) {
         ctx.shadow.probe(rtengine::stage::WorkItem::sourceSelect, legacyReload);
     }
-    if (!legacyReload) {
+    if (!rtengine::stage::workItemRuns(rtengine::stage::workOrderEnabled(),
+                                       ctx.work,
+                                       rtengine::stage::WorkItem::sourceSelect,
+                                       legacyReload)) {
         return;
     }
     tr = getCoarseBitMask(params.coarse);
@@ -1065,7 +1082,10 @@ void Crop::stageAnalysis(CropStageContext& ctx)
     if (rtengine::stage::workShadowEnabled()) {
         ctx.shadow.probe(rtengine::stage::WorkItem::analysisRun, legacyReload);
     }
-    if (!legacyReload) {
+    if (!rtengine::stage::workItemRuns(rtengine::stage::workOrderEnabled(),
+                                       ctx.work,
+                                       rtengine::stage::WorkItem::analysisRun,
+                                       legacyReload)) {
         return;
     }
     if ((settings->leveldnautsimpl == 1 && params.dirpyrDenoise.Cmethod == "PRE") || (settings->leveldnautsimpl == 0 && params.dirpyrDenoise.C2method == "PREV")) {
@@ -1457,7 +1477,10 @@ void Crop::stageRawBase(CropStageContext& ctx)
         ctx.shadow.probe(rtengine::stage::WorkItem::rawBaseRebuild,
                          legacyRebuild);
     }
-    if (legacyRebuild) {
+    const bool rebuildRuns = rtengine::stage::workItemRuns(
+        rtengine::stage::workOrderEnabled(), ctx.work,
+        rtengine::stage::WorkItem::rawBaseRebuild, legacyRebuild);
+    if (rebuildRuns) {
         //  if (params.dirpyrDenoise.Cmethod=="AUT" || params.dirpyrDenoise.Cmethod=="PON") {//reinit origCrop after Auto
         if ((settings->leveldnautsimpl == 1 && params.dirpyrDenoise.Cmethod == "AUT")  || (settings->leveldnautsimpl == 0 && params.dirpyrDenoise.C2method == "AUTO")) { //reinit origCrop after Auto
             PreviewProps pp(trafx, trafy, trafw * skip, trafh * skip, skip);
@@ -1469,7 +1492,10 @@ void Crop::stageRawBase(CropStageContext& ctx)
         if (rtengine::stage::workShadowEnabled()) {
             ctx.shadow.probe(rtengine::stage::WorkItem::spotApply, legacySpot);
         }
-        if (legacySpot) {
+        if (rtengine::stage::workItemRuns(rtengine::stage::workOrderEnabled(),
+                                          ctx.work,
+                                          rtengine::stage::WorkItem::spotApply,
+                                          legacySpot)) {
             spotsDone = true;
             PreviewProps pp(trafx, trafy, trafw * skip, trafh * skip, skip);
             //parent->imgsrc->getImage(parent->currWB, tr, origCrop, pp, params.toneCurve, params.raw);
@@ -1509,34 +1535,34 @@ void Crop::stageRawBase(CropStageContext& ctx)
                 parent->adnListener->noiseChanged(0.f, 0.f);
             }
 
-        if (legacyRebuild) {
+        const bool legacyDenoise = skip == 1 && denoiseParams.enabled;
+        if (rtengine::stage::workShadowEnabled()) {
+            ctx.shadow.probe(rtengine::stage::WorkItem::denoiseRun,
+                             legacyDenoise);
+        }
 
-            const bool legacyDenoise = skip == 1 && denoiseParams.enabled;
-            if (rtengine::stage::workShadowEnabled()) {
-                ctx.shadow.probe(rtengine::stage::WorkItem::denoiseRun,
-                                 legacyDenoise);
+        if (rtengine::stage::workItemRuns(rtengine::stage::workOrderEnabled(),
+                                          ctx.work,
+                                          rtengine::stage::WorkItem::denoiseRun,
+                                          legacyDenoise)) {
+
+            float nresi, highresi;
+            parent->ipf.RGB_denoise(0, origCrop, origCrop, calclum, parent->denoiseInfoStore.ch_M, parent->denoiseInfoStore.max_r, parent->denoiseInfoStore.max_b, parent->imgsrc->isRAW(), /*Roffset,*/ denoiseParams, parent->imgsrc->getDirPyrDenoiseExpComp(), noiseLCurve, noiseCCurve, nresi, highresi);
+
+            if (parent->adnListener) {
+                parent->adnListener->noiseChanged(nresi, highresi);
             }
 
-            if (legacyDenoise) {
-
-                float nresi, highresi;
-                parent->ipf.RGB_denoise(0, origCrop, origCrop, calclum, parent->denoiseInfoStore.ch_M, parent->denoiseInfoStore.max_r, parent->denoiseInfoStore.max_b, parent->imgsrc->isRAW(), /*Roffset,*/ denoiseParams, parent->imgsrc->getDirPyrDenoiseExpComp(), noiseLCurve, noiseCCurve, nresi, highresi);
-
-                if (parent->adnListener) {
-                    parent->adnListener->noiseChanged(nresi, highresi);
+            if (settings->leveldnautsimpl == 1) {
+                if ((denoiseParams.Cmethod == "AUT" || denoiseParams.Cmethod == "PRE") && (parent->adnListener)) { // force display value of sliders
+                    parent->adnListener->chromaChanged(denoiseParams.chroma, denoiseParams.redchro, denoiseParams.bluechro);
                 }
-
-                if (settings->leveldnautsimpl == 1) {
-                    if ((denoiseParams.Cmethod == "AUT" || denoiseParams.Cmethod == "PRE") && (parent->adnListener)) { // force display value of sliders
-                        parent->adnListener->chromaChanged(denoiseParams.chroma, denoiseParams.redchro, denoiseParams.bluechro);
-                    }
-                } else {
-                    if ((denoiseParams.C2method == "AUTO" || denoiseParams.C2method == "PREV") && (parent->adnListener)) { // force display value of sliders
-                        parent->adnListener->chromaChanged(denoiseParams.chroma, denoiseParams.redchro, denoiseParams.bluechro);
-                    }
+            } else {
+                if ((denoiseParams.C2method == "AUTO" || denoiseParams.C2method == "PREV") && (parent->adnListener)) { // force display value of sliders
+                    parent->adnListener->chromaChanged(denoiseParams.chroma, denoiseParams.redchro, denoiseParams.bluechro);
                 }
-
             }
+
         }
 
         if (params.filmNegative.enabled && params.filmNegative.colorSpace == FilmNegativeParams::ColorSpace::INPUT) {
@@ -1574,7 +1600,18 @@ void Crop::stageRawBase(CropStageContext& ctx)
         ctx.shadow.probe(rtengine::stage::WorkItem::spotApply,
                          legacySpotApply);
     }
-    if (legacySpotBuffer) {
+    /*
+     * The typed order names the buffer path when the request or a spot delta
+     * asks for it. The legacy buffer gate stays in the condition on purpose:
+     * its disabled/empty branch is the buffer clear, not a spot application,
+     * and the typed order has no item for that state transition, so skipping
+     * it would leave a stale buffer live.
+     */
+    const bool orderEnabled = rtengine::stage::workOrderEnabled();
+    const bool spotBufferPath = legacySpotBuffer
+        || (orderEnabled && ctx.work.has(rtengine::stage::WorkItem::spotApply)
+            && !spotsDone);
+    if (spotBufferPath) {
         if (params.spot.enabled && !params.spot.entries.empty()) {
             if(!spotCrop) {
                 spotCrop = new Imagefloat (cropw, croph);
@@ -1596,7 +1633,10 @@ void Crop::stageRawBase(CropStageContext& ctx)
         ctx.shadow.probe(rtengine::stage::WorkItem::spotRestore,
                          legacySpotRestore);
     }
-    if (legacySpotRestore) {
+    if (rtengine::stage::workItemRuns(orderEnabled, ctx.work,
+                                      rtengine::stage::WorkItem::spotRestore,
+                                      legacySpotRestore)
+        && spotCrop) {
         baseCrop = spotCrop;
     }
 

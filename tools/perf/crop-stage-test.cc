@@ -653,13 +653,19 @@ bool compareState(CropState state, const Result& baseline,
 struct EditScenario {
     const char* name;
     int todo;
+    /*
+     * Extra scenarios are not part of the default sequence: they exist to
+     * exercise the spot, denoise and HDR bodies on demand. `--only=<name>`
+     * selects one explicitly, `--extra-states` adds all of them.
+     */
+    bool extra;
     void (*mutate)(rtengine::procparams::ProcParams&);
 };
 
 const std::vector<EditScenario>& editScenarios()
 {
     static const std::vector<EditScenario> scenarios = {
-        {"wb", WB,
+        {"wb", WB, false,
          [](rtengine::procparams::ProcParams& p) {
              /*
               * A manual white balance: with the automatic method the engine
@@ -670,13 +676,13 @@ const std::vector<EditScenario>& editScenarios()
              p.wb.method = "Custom";
              p.wb.temperature += 800;
          }},
-        {"demosaic", DEMOSAIC,
+        {"demosaic", DEMOSAIC, false,
          [](rtengine::procparams::ProcParams& p) {
              p.pdsharpening.enabled = true;
          }},
-        {"transform", TRANSFORM,
+        {"transform", TRANSFORM, false,
          [](rtengine::procparams::ProcParams& p) { p.rotate.degree = 1.5; }},
-        {"local", AUTOEXP,
+        {"local", AUTOEXP, false,
          [](rtengine::procparams::ProcParams& p) {
              p.locallab.enabled = true;
              if (p.locallab.spots.empty()) {
@@ -684,25 +690,50 @@ const std::vector<EditScenario>& editScenarios()
              }
              p.locallab.spots.back().struc += 10.0;
          }},
-        {"sharpening", SHARPENING,
+        {"sharpening", SHARPENING, false,
          [](rtengine::procparams::ProcParams& p) {
              p.sharpening.enabled = true;
              p.sharpening.amount += 100;
          }},
-        {"ciecam", AUTOEXP,
+        {"ciecam", AUTOEXP, false,
          [](rtengine::procparams::ProcParams& p) {
              p.colorappearance.enabled = true;
              p.colorappearance.modelmethod = "02";
          }},
-        {"ciecam-off", AUTOEXP,
+        {"ciecam-off", AUTOEXP, false,
          [](rtengine::procparams::ProcParams& p) {
              p.colorappearance.enabled = false;
          }},
-        {"crop", CROP,
+        {"crop", CROP, false,
          [](rtengine::procparams::ProcParams& p) {
              p.crop.enabled = true;
              p.crop.fixratio = true;
              p.crop.ratio = "3:2";
+         }},
+        {"spot", SPOTADJUST, true,
+         [](rtengine::procparams::ProcParams& p) {
+             /*
+              * An in-image coordinate for the representative sample. The spot
+              * body allocates the buffer and copies it back even when the
+              * removal lies outside the 100% viewport, so the state exercises
+              * spotApply and spotRestore on both sides of the base path.
+              */
+             p.spot.enabled = true;
+             p.spot.entries.clear();
+             rtengine::procparams::SpotEntry entry;
+             entry.sourcePos = rtengine::Coord(200, 200);
+             entry.targetPos = rtengine::Coord(200, 200);
+             p.spot.entries.push_back(entry);
+         }},
+        {"denoise", ALLNORAW, true,
+         [](rtengine::procparams::ProcParams& p) {
+             p.dirpyrDenoise.enabled = true;
+             p.dirpyrDenoise.luma += 5;
+         }},
+        {"fattal", HDR, true,
+         [](rtengine::procparams::ProcParams& p) {
+             p.fattal.enabled = true;
+             p.fattal.amount += 10;
          }}
     };
     return scenarios;
@@ -846,8 +877,10 @@ bool runBenchmark(const std::string& file,
         }
         const auto end = std::chrono::steady_clock::now();
         if (i >= WARMUP) {
-            timings.push_back(
-                std::chrono::duration<double, std::milli>(end - start).count());
+            const double elapsed =
+                std::chrono::duration<double, std::milli>(end - start).count();
+            timings.push_back(elapsed);
+            std::printf("TIMING %d %.3f\n", i - WARMUP, elapsed);
         }
     }
 
@@ -856,10 +889,11 @@ bool runBenchmark(const std::string& file,
         std::accumulate(timings.begin(), timings.end(), 0.0);
     const double mean = total / static_cast<double>(timings.size());
     const double median = timings[timings.size() / 2];
+    const double p95 = timings[(timings.size() * 95) / 100];
 
     std::printf("bench edit=%s: %d updates, mean %.1f ms, median %.1f ms, "
-                "min %.1f ms, max %.1f ms\n",
-                edit.c_str(), count, mean, median,
+                "p95 %.1f ms, min %.1f ms, max %.1f ms\n",
+                edit.c_str(), count, mean, median, p95,
                 timings.front(), timings.back());
     return true;
 }
@@ -871,6 +905,7 @@ int main(int argc, char** argv)
     if (argc < 2) {
         std::fprintf(stderr,
                      "usage: %s <raw> [pp3] [out-dir] [--stages] [--sequences] "
+                     "[--extra-states] "
                      "[--only=<scenario>] [--bench=<n>] [--bench-edit=crop] "
                      "[--out=<dir>] [--cbdl=aft] [--no-ciecam]\n",
                      argv[0]);
@@ -882,6 +917,7 @@ int main(int argc, char** argv)
     std::string outDir = ".";
     bool stageCoverage = false;
     bool sequences = false;
+    bool extraStates = false;
     bool afterRgb = false;
     bool ciecam = true;
     std::string onlyScenario;
@@ -894,6 +930,8 @@ int main(int argc, char** argv)
             stageCoverage = true;
         } else if (argument == "--sequences") {
             sequences = true;
+        } else if (argument == "--extra-states") {
+            extraStates = true;
         } else if (argument == "--cbdl=aft") {
             afterRgb = true;
         } else if (argument == "--no-ciecam") {
@@ -1005,6 +1043,9 @@ int main(int argc, char** argv)
         }
         for (const EditScenario& scenario : editScenarios()) {
             if (!onlyScenario.empty() && onlyScenario != scenario.name) {
+                continue;
+            }
+            if (onlyScenario.empty() && scenario.extra && !extraStates) {
                 continue;
             }
             ok = runSequence(file, params, scenario, outDir) && ok;
