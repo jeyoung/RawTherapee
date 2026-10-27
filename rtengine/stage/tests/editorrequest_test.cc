@@ -45,6 +45,7 @@ using rtengine::EditorRequest;
 using rtengine::LegacyMaskContext;
 using rtengine::coalesce;
 using rtengine::from_legacy_mask;
+using rtengine::planningAgreesWithLegacyMask;
 
 int failures = 0;
 
@@ -73,6 +74,21 @@ void checkBit(int mask, const char* name, EditorRequest::RequestKind kind,
     check(request.derivesFromParameters(),
           label + ": derives from parameters");
     check(request.dirty.blocks.empty(), label + ": no producer dirty set");
+
+    /*
+     * The mask-shaped facts. For a single bit, only M_MONITOR admits the
+     * full-frame path, only M_WB requests the Color/Coloropp DEMOSAIC, only a
+     * bare M_CROP or M_MINUPDATE suppresses monitor.output, and only
+     * M_MINUPDATE is an imperative repaint.
+     */
+    check(request.fullFrameAdmission == (mask == M_MONITOR),
+          label + ": fullFrameAdmission");
+    check(request.colorHlrWbRequest == (mask == M_WB),
+          label + ": colorHlrWbRequest");
+    check(request.monitorOutputRequest == (mask != M_CROP && mask != M_MINUPDATE),
+          label + ": monitorOutputRequest");
+    check(request.imperativeRepaint == (mask == M_MINUPDATE),
+          label + ": imperativeRepaint");
 }
 
 struct BitExpectation {
@@ -214,6 +230,189 @@ void checkCombinedBits()
           "coalescing unions the gate mask");
 }
 
+/*
+ * Every pair of bits that can legally be coalesced must produce exactly the
+ * request a single mask of the union produces: same kind, same facts, same
+ * gate mask and same identity. Pairs whose union contains a combined
+ * M_MINUPDATE are contract violations and are checked separately.
+ */
+void checkEveryPair()
+{
+    for (const BitExpectation& left : expectations()) {
+        for (const BitExpectation& right : expectations()) {
+            const int unionMask = left.bit | right.bit;
+
+            if ((unionMask & M_MINUPDATE) != 0
+                    && unionMask != M_MINUPDATE) {
+                continue;
+            }
+
+            const EditorRequest merged =
+                coalesce(from_legacy_mask(left.bit),
+                         from_legacy_mask(right.bit));
+            const EditorRequest single = from_legacy_mask(unionMask);
+            const std::string label =
+                std::string("pair ") + left.name + "+" + right.name;
+
+            check(merged.present, label + ": present");
+            check(merged.kind == single.kind, label + ": kind");
+            check(merged.controlOnly == single.controlOnly,
+                  label + ": controlOnly");
+            check(merged.spotPending == single.spotPending,
+                  label + ": spotPending");
+            check(merged.highDetailIntent == single.highDetailIntent,
+                  label + ": highDetailIntent");
+            check(merged.fullFrameIntent == single.fullFrameIntent,
+                  label + ": fullFrameIntent");
+            check(merged.fullFrameAdmission == single.fullFrameAdmission,
+                  label + ": fullFrameAdmission");
+            check(merged.colorHlrWbRequest == single.colorHlrWbRequest,
+                  label + ": colorHlrWbRequest");
+            check(merged.monitorOutputRequest == single.monitorOutputRequest,
+                  label + ": monitorOutputRequest");
+            check(merged.imperativeRepaint == single.imperativeRepaint,
+                  label + ": imperativeRepaint");
+            check(merged.legacyGateMask == unionMask,
+                  label + ": gate mask");
+            check(merged.identity() == single.identity(),
+                  label + ": identity");
+        }
+    }
+}
+
+/*
+ * Facts that are monotone in the mask are unioned; facts that interpret the
+ * mask as a whole are recomputed from the union.
+ */
+void checkFactUnion()
+{
+    LegacyMaskContext moved;
+    moved.viewportMoved = true;
+
+    const EditorRequest spotAndReload =
+        coalesce(from_legacy_mask(M_SPOT), from_legacy_mask(M_INIT));
+    check(spotAndReload.spotPending && spotAndReload.fullFrameIntent,
+          "coalescing unions spot and full-frame intent");
+
+    const EditorRequest movedAndHigh =
+        coalesce(from_legacy_mask(M_CROP, moved),
+                 from_legacy_mask(M_HIGHQUAL));
+    check(movedAndHigh.viewportMoved && movedAndHigh.highDetailIntent,
+          "coalescing unions viewportMoved and high-detail intent");
+    check(movedAndHigh.kind == EditorRequest::RequestKind::HighQuality,
+          "high detail keeps its precedence over a viewport move");
+
+    const EditorRequest controlAndCrop =
+        coalesce(from_legacy_mask(M_VOID), from_legacy_mask(M_CROP));
+    check(!controlAndCrop.controlOnly,
+          "coalescing ANDs controlOnly over a rendering request");
+
+    /*
+     * Both inputs suppress monitor.output, but the union carries M_MONITOR, so
+     * the merged request must render it. This proves the fact is recomputed
+     * from the union rather than ORed.
+     */
+    const EditorRequest cropAndRepaint =
+        coalesce(from_legacy_mask(M_CROP), from_legacy_mask(M_MINUPDATE));
+    check(!from_legacy_mask(M_CROP).monitorOutputRequest,
+          "a bare crop suppresses monitor.output");
+    check(!from_legacy_mask(M_MINUPDATE).monitorOutputRequest,
+          "a bare repaint suppresses monitor.output");
+    check(cropAndRepaint.monitorOutputRequest,
+          "the union of two monitor-suppressing masks renders monitor.output");
+
+    /*
+     * Neither input sets every ALL bit, but their union does, so the merged
+     * request admits the full-frame path. Admission is not a monotone union.
+     */
+    const int left = M_PREPROC | M_RAW;
+    const int right = ALL & ~left;
+    check(!from_legacy_mask(left).fullFrameAdmission,
+          "half of ALL does not admit the full frame");
+    check(!from_legacy_mask(right).fullFrameAdmission,
+          "the other half of ALL does not admit the full frame");
+    check(coalesce(from_legacy_mask(left), from_legacy_mask(right))
+              .fullFrameAdmission,
+          "the union of two halves of ALL admits the full frame");
+}
+
+void checkEmptyAccumulator()
+{
+    const EditorRequest empty;
+    check(!empty.present, "an empty accumulator is not present");
+    check(empty.controlOnly, "an empty accumulator is control-only");
+
+    const EditorRequest request = from_legacy_mask(M_HIGHQUAL | M_CROP);
+
+    const EditorRequest withEmptyFirst = coalesce(empty, request);
+    check(withEmptyFirst.identity() == request.identity(),
+          "an empty first accumulator returns the second request");
+    check(withEmptyFirst.legacyGateMask == request.legacyGateMask,
+          "an empty first accumulator keeps the second mask");
+
+    const EditorRequest withEmptySecond = coalesce(request, empty);
+    check(withEmptySecond.identity() == request.identity(),
+          "an empty second accumulator returns the first request");
+    check(withEmptySecond.legacyGateMask == request.legacyGateMask,
+          "an empty second accumulator keeps the first mask");
+
+    check(!coalesce(empty, empty).present,
+          "coalescing two empty accumulators stays empty");
+}
+
+/*
+ * The coordinator patches the typed kind and facts after it widens a legacy
+ * mask at four sites. These are the exact shapes it produces; the debug
+ * cross-check in the coordinator asserts the same relation.
+ */
+void checkCoordinatorPatches()
+{
+    {
+        EditorRequest requeued = from_legacy_mask(M_MINUPDATE);
+        check(requeued.imperativeRepaint,
+              "a bare repaint is imperative before the requeue");
+        requeued.setLegacyGateMask(M_MINUPDATE | M_MONITOR);
+        requeued.viewportMoved = true;
+        requeued.kind = EditorRequest::RequestKind::ParamsOnly;
+        check(!requeued.imperativeRepaint,
+              "widening the requeue clears the imperative repaint");
+        check(planningAgreesWithLegacyMask(requeued),
+              "the panning requeue patch agrees with its widened mask");
+    }
+    {
+        EditorRequest refreshed = from_legacy_mask(M_CROP);
+        refreshed.setLegacyGateMask(M_CROP | M_INIT | M_HDR | M_MONITOR);
+        refreshed.fullFrameIntent = true;
+        refreshed.kind = EditorRequest::RequestKind::FullPreview;
+        check(planningAgreesWithLegacyMask(refreshed),
+              "the base-refresh patch agrees with its widened mask");
+    }
+    {
+        EditorRequest absorbed = from_legacy_mask(M_MINUPDATE);
+        absorbed.setLegacyGateMask(
+            M_MINUPDATE | M_MONITOR | M_RGBCURVE | M_LUMACURVE
+            | M_LUMINANCE | M_COLOR);
+        absorbed.kind = EditorRequest::RequestKind::ParamsOnly;
+        check(planningAgreesWithLegacyMask(absorbed),
+              "the deferred-absorb patch agrees with its widened mask");
+    }
+    {
+        EditorRequest color = from_legacy_mask(M_WB);
+        color.setLegacyGateMask(M_WB | DEMOSAIC);
+        color.fullFrameIntent = true;
+        color.spotPending = true;
+        color.kind = EditorRequest::RequestKind::FullPreview;
+        check(planningAgreesWithLegacyMask(color),
+              "the Color/Coloropp patch agrees with its widened mask");
+    }
+
+    /* The cross-check is not vacuous: a wrong kind must be rejected. */
+    EditorRequest wrong = from_legacy_mask(M_WB);
+    wrong.kind = EditorRequest::RequestKind::FullPreview;
+    check(!planningAgreesWithLegacyMask(wrong),
+          "the cross-check rejects a kind the mask does not imply");
+}
+
 void checkViewportMovedContext()
 {
     LegacyMaskContext context;
@@ -229,13 +428,13 @@ void checkIdentity()
 {
     /*
      * The identity is a planning identity: two different masks that carry no
-     * planning information must have the same identity. The legacy gate mask
-     * is deliberately excluded.
+     * planning information must have the same identity. The raw legacy mask
+     * is deliberately excluded; every mask-shaped planning fact is included.
      */
     const EditorRequest autoexp = from_legacy_mask(M_AUTOEXP);
     const EditorRequest color = from_legacy_mask(M_COLOR);
     check(autoexp.identity() == color.identity(),
-          "identity ignores the legacy mask");
+          "identity ignores the raw legacy mask");
     check(autoexp.identity()
               == coalesce(autoexp, color).identity(),
           "coalescing planning-equivalent requests keeps the identity");
@@ -248,6 +447,33 @@ void checkIdentity()
           "high-detail intent changes the identity");
     check(autoexp.identity() != from_legacy_mask(M_MINUPDATE).identity(),
           "kind changes the identity");
+
+    LegacyMaskContext moved;
+    moved.viewportMoved = true;
+    check(autoexp.identity() != from_legacy_mask(M_AUTOEXP, moved).identity(),
+          "viewportMoved changes the identity");
+
+    /*
+     * Mask-shaped facts. M_WB and M_AUTOEXP plan differently (the Color/Coloropp
+     * DEMOSAIC path), and M_MONITOR and M_COLOR plan differently (full-frame
+     * admission), so neither pair may share an identity.
+     */
+    check(from_legacy_mask(M_WB).identity()
+              != from_legacy_mask(M_AUTOEXP).identity(),
+          "colorHlrWbRequest changes the identity");
+    check(from_legacy_mask(M_MONITOR).identity()
+              != from_legacy_mask(M_COLOR).identity(),
+          "fullFrameAdmission changes the identity");
+    check(from_legacy_mask(M_COLOR).identity()
+              != from_legacy_mask(M_CROP).identity(),
+          "monitorOutputRequest changes the identity");
+
+    /* The imperative-repaint fact is a planning field of its own. */
+    EditorRequest imperative = from_legacy_mask(M_MINUPDATE);
+    EditorRequest notImperative = imperative;
+    notImperative.imperativeRepaint = false;
+    check(imperative.identity() != notImperative.identity(),
+          "imperativeRepaint changes the identity");
 }
 
 /*
@@ -283,6 +509,7 @@ void checkContractViolations()
     expectAbort(1 << 21, "unknown bit");
     expectAbort(M_MINUPDATE | M_CROP, "combined M_MINUPDATE");
     expectAbort(M_MINUPDATE | M_VOID, "M_MINUPDATE with M_VOID");
+    expectAbort(M_MINUPDATE | M_HIGHQUAL, "M_MINUPDATE with M_HIGHQUAL");
 }
 
 } // namespace
@@ -292,6 +519,10 @@ int main()
     checkEveryBit();
     checkControlAndImperative();
     checkCombinedBits();
+    checkEveryPair();
+    checkFactUnion();
+    checkEmptyAccumulator();
+    checkCoordinatorPatches();
     checkViewportMovedContext();
     checkIdentity();
     checkContractViolations();

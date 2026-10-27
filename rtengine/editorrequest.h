@@ -32,9 +32,10 @@ namespace rtengine
  * mask as the thing that decides *what kind of work* a preview request asks
  * for. The mask itself is still carried, as an opaque execution gate for the
  * block bodies that have not been converted yet; no planning decision reads
- * it.
+ * the raw mask. The adapter derives the mask-shaped planning facts below, so
+ * every consumer reads a named fact instead.
  *
- * The type has four parts:
+ * The type has these parts:
  *
  * - `kind`: the request kind the preview plan consumes. It has the same
  *   precedence the coordinator used to derive from the mask: HighQuality,
@@ -43,12 +44,14 @@ namespace rtengine
  *   block set, or an explicit "derive from the parameters" state. The legacy
  *   adapter always asks for the derivation, because the GUI has no typed
  *   block information yet.
- * - request facts: the four boolean inputs the render state and the work
- *   order need and that are not fields of `ProcParams`.
- * - `identity()`: a content hash of the fields above, used to decide whether
- *   two coalesced requests are planning-equivalent. It deliberately excludes
- *   the legacy mask, so it does not change when a producer switches from a
- *   mask to typed information.
+ * - request facts: the boolean inputs the render state, the work order and
+ *   the plan need and that are not fields of `ProcParams`. Facts that depend
+ *   on the legacy mask are named and derived in one place; the coordinator
+ *   never re-reads the mask for them.
+ * - `identity()`: a content hash of every planning field above, used to
+ *   decide whether two coalesced requests are planning-equivalent. The raw
+ *   legacy mask is excluded, but every planning fact derived from it is
+ *   included, so two masks that plan differently never share an identity.
  *
  * The struct is a plain value and is safe to copy and compare.
  */
@@ -114,6 +117,35 @@ struct EditorRequest {
     bool fullFrameIntent = false;
 
     /*
+     * The mask alone admits the full-frame path: either every `ALL` bit is
+     * set or `M_MONITOR` is present. The coordinator ORs this with its
+     * panning and high-detail inputs; it is one of the mask-shaped planning
+     * facts and is recomputed by setLegacyGateMask().
+     */
+    bool fullFrameAdmission = false;
+
+    /*
+     * The pass carries a white-balance request (`M_WB`). The Color/Coloropp
+     * highlight-recovery path forces DEMOSAIC for it; the work order consumes
+     * this fact directly. Recompute it with setLegacyGateMask().
+     */
+    bool colorHlrWbRequest = false;
+
+    /*
+     * The pass renders `monitor.output`. The legacy predicate is "the mask is
+     * neither exactly `M_CROP` nor exactly `M_MINUPDATE`, or it carries
+     * `M_MONITOR`". Recompute it with setLegacyGateMask().
+     */
+    bool monitorOutputRequest = false;
+
+    /*
+     * The mask is exactly `M_MINUPDATE`, the only form in which a repaint is
+     * imperative. A widened mask turns a RepaintOnly request into ParamsOnly.
+     * Recompute it with setLegacyGateMask().
+     */
+    bool imperativeRepaint = false;
+
+    /*
      * The request carries no bit outside the control bit `M_VOID`, so it
      * updates parameters without rendering. A request with an empty legacy
      * mask is treated the same way.
@@ -131,19 +163,31 @@ struct EditorRequest {
     /*
      * Opaque legacy execution payload.
      *
-     * This is the mask the adapter received, ORed across coalesced requests.
-     * It is consumed only by the legacy block gates, by cache invalidation
-     * and by the documented viewport fast-path admission site. It is not a
-     * planning input and is excluded from identity().
+     * This is the mask the adapter received, ORed across coalesced requests
+     * and widened whenever the coordinator adds an execution bit. It is
+     * consumed only by the legacy block gates, by cache invalidation and by
+     * the documented viewport fast-path admission site. It is not read by any
+     * planning decision, and it is excluded from identity(); the planning
+     * facts derived from it are included.
      */
     int legacyGateMask = 0;
 
     /*
-     * Stable content identity of the planning fields, excluding the legacy
-     * mask. Equal values mean the two requests are indistinguishable to the
-     * planner and may be coalesced without losing planning information.
+     * Stable content identity of the planning fields, excluding the raw
+     * legacy mask. Equal values mean the two requests are indistinguishable to
+     * the planner and may be coalesced without losing planning information.
      */
     uint64_t identity() const;
+
+    /*
+     * Set the legacy execution payload and recompute every mask-shaped
+     * planning fact from it.
+     *
+     * This is the only place the coordinator may change `legacyGateMask`: an
+     * augmentation such as a base refresh adds execution bits, and the named
+     * facts must follow. The raw mask interpretation stays in this unit.
+     */
+    void setLegacyGateMask(int mask);
 
     /* Whether the dirty set comes from the producer rather than parameters. */
     bool derivesFromParameters() const
@@ -152,10 +196,11 @@ struct EditorRequest {
     }
 
     /*
-     * The legacy mask for the viewport fast-path admission test.
+     * The legacy mask for the documented viewport fast-path admission test.
      *
-     * This is the single accessor the fast path uses; see
-     * ImProcCoordinator::updatePreviewImage() for the documented limitation.
+     * This is the single accessor the coordinator uses to obtain the opaque
+     * execution payload; see ImProcCoordinator::updatePreviewImage() for the
+     * documented admission site and the list of non-planning consumers.
      */
     int viewportAdmissionMask() const
     {
@@ -188,15 +233,18 @@ struct LegacyMaskContext {
  * | M_INIT, M_LINDENOISE,   | FullPreview | fullFrameIntent              |
  * |   M_HDR                 |             |                              |
  * | M_SPOT                  | ParamsOnly  | spotPending                  |
+ * | M_WB                    | ParamsOnly  | colorHlrWbRequest            |
  * | every other execution   | ParamsOnly  | none                         |
  * |   or output bit         |             |                              |
  *
- * `M_VOID` is pure control: a mask made only of it suppresses the render but
- * may still publish parameters. `M_MINUPDATE` is imperative: it means
- * "repaint without new image work" and is only valid on its own, as declared
- * in refreshmap.h. A combined `M_MINUPDATE` is a contract violation and
- * fails fast rather than silently degrading to ParamsOnly. An unknown bit is
- * a mapping gap and also fails fast.
+ * Independently of the kind, every mask also yields `fullFrameAdmission` and
+ * `monitorOutputRequest`; both are documented on the fields. `M_VOID` is pure
+ * control: a mask made only of it suppresses the render but may still publish
+ * parameters. `M_MINUPDATE` is imperative: it means "repaint without new image
+ * work" and is only valid on its own, as declared in refreshmap.h. A combined
+ * `M_MINUPDATE` is a contract violation and fails fast rather than silently
+ * degrading to ParamsOnly. An unknown bit is a mapping gap and also fails
+ * fast.
  *
  * `legacyGateMask` always receives the input mask unchanged, so the caller's
  * legacy block gates see exactly what they saw before.
@@ -204,14 +252,31 @@ struct LegacyMaskContext {
 EditorRequest from_legacy_mask(int mask, const LegacyMaskContext& context = {});
 
 /*
+ * Debug cross-check: whether a request still agrees with the planning a bare
+ * interpretation of its legacy mask would give.
+ *
+ * The coordinator patches the typed kind and facts after it widens a legacy
+ * mask. The base-refresh and Color/Coloropp patches must reproduce the old
+ * derivation over the widened mask, and a debug build asserts that here. The
+ * requeue and deferred-absorb patches only ever narrow a repaint, so they
+ * assert the narrower `imperativeRepaint` relation instead. A unit test can
+ * call this directly. It is never used by planning.
+ */
+bool planningAgreesWithLegacyMask(const EditorRequest& request);
+
+/*
  * Coalesce two requests into one.
  *
  * The result keeps the legacy-mask union (so block gates are unchanged), the
- * union of every fact, and the strongest kind. Kind precedence reproduces the
- * old derivation over the ORed mask: HighQuality, then FullPreview, then
- * RepaintOnly only when every contributing request was a bare repaint, then
- * ParamsOnly. A control-only request therefore turns a bare repaint into a
- * parameter update, exactly as forming `M_MINUPDATE | M_VOID` did.
+ * union of every input fact, and the strongest kind. The mask-shaped facts
+ * (`fullFrameAdmission`, `colorHlrWbRequest`, `monitorOutputRequest`,
+ * `imperativeRepaint`) are recomputed from the union, because they are not
+ * monotone in the mask and the old code interpreted the ORed mask as a whole.
+ * Kind precedence reproduces the old derivation over the ORed mask:
+ * HighQuality, then FullPreview, then RepaintOnly only when every contributing
+ * request was a bare repaint, then ParamsOnly. A control-only request therefore
+ * turns a bare repaint into a parameter update, exactly as forming
+ * `M_MINUPDATE | M_VOID` did.
  *
  * Producer-provided dirty sets are unioned; otherwise both inputs derive from
  * the parameters.

@@ -16,6 +16,7 @@
  *  You should have received a copy of the GNU General Public License
  *  along with RawTherapee.  If not, see <https://www.gnu.org/licenses/>.
  */
+#include <cassert>
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
@@ -610,9 +611,32 @@ EditorRequest deferredAnalysisRequest(int mask)
     request.present = mask != 0;
     request.controlOnly = false;
     request.kind = stage::RequestKind::ParamsOnly;
-    request.legacyGateMask = mask;
+    request.setLegacyGateMask(mask);
     return request;
 }
+
+#ifndef NDEBUG
+/*
+ * The base-refresh and Color/Coloropp patches of the typed request must
+ * reproduce the old derivation over the widened mask. Fail loudly in a debug
+ * build if one drifts. The requeue and deferred-absorb patches only narrow a
+ * repaint and carry their own narrower assertion at the site.
+ */
+void assertPlanningAgrees(const EditorRequest& request, const char* site)
+{
+    if (!planningAgreesWithLegacyMask(request)) {
+        std::fprintf(
+            stderr,
+            "editor request diverges from its legacy mask at %s\n",
+            site);
+        assert(false && "typed request diverged from its legacy mask");
+    }
+}
+#else
+void assertPlanningAgrees(const EditorRequest&, const char*)
+{
+}
+#endif
 
 } // namespace
 
@@ -4451,7 +4475,15 @@ void ImProcCoordinator::executePreviewNode(const std::string& id,
     }
 }
 
-// todo: bitmask containing desired actions, taken from changesSinceLast
+/*
+ * Preview request entry point.
+ *
+ * `request` is the typed planning input: its kind and facts decide what the
+ * pass plans. `legacyGateMask` remains the opaque execution payload for the
+ * block bodies that have not been converted. Whenever this method widens the
+ * mask it calls setLegacyGateMask(), so the named facts stay in step and no
+ * planning decision below reads the mask.
+ */
 void ImProcCoordinator::updatePreviewImage(EditorRequest request,
                                            bool panningRelatedChange,
                                            unsigned requestId)
@@ -4467,11 +4499,11 @@ void ImProcCoordinator::updatePreviewImage(EditorRequest request,
     }
 
     /*
-     * The legacy execution payload. This is the single read of the adapter's
-     * mask in this method. It feeds the legacy block gates, cache
-     * invalidation and the documented viewport admission below; it is never
-     * used to derive the request kind or the request facts, which come from
-     * `request`.
+     * The documented viewport-admission read. `todo` is the legacy execution
+     * payload: it feeds the block gates, cache invalidation and the fast-path
+     * admission test below. Every planning decision reads the request facts,
+     * not `todo`; each widening below refreshes those facts through
+     * setLegacyGateMask().
      */
     int todo = request.viewportAdmissionMask();
 
@@ -4494,14 +4526,14 @@ void ImProcCoordinator::updatePreviewImage(EditorRequest request,
         /*
          * Requeue the typed request, not a mask re-interpretation: the
          * augmentation above may have added an execution bit, but the request
-         * kind and facts are already typed. Adding M_MONITOR for a panning
-         * change turns a bare repaint into a parameter update, matching the
-         * old derivation over the ORed mask.
+         * kind and facts stay typed. Adding M_MONITOR for a panning change
+         * turns a bare repaint into a parameter update, matching the old
+         * derivation over the ORed mask.
          */
-        request.legacyGateMask = todo;
+        request.setLegacyGateMask(todo);
         request.present = true;
         if (panningRelatedChange) {
-            request.legacyGateMask |= M_MONITOR;
+            request.setLegacyGateMask(request.legacyGateMask | M_MONITOR);
             request.viewportMoved = true;
         }
         /*
@@ -4510,9 +4542,16 @@ void ImProcCoordinator::updatePreviewImage(EditorRequest request,
          * derivation produce ParamsOnly.
          */
         if (request.kind == stage::RequestKind::RepaintOnly
-                && request.legacyGateMask != M_MINUPDATE) {
+                && !request.imperativeRepaint) {
             request.kind = stage::RequestKind::ParamsOnly;
         }
+        /*
+         * Debug cross-check for the repaint patch: a RepaintOnly request
+         * survives the requeue only while its mask is still the bare
+         * M_MINUPDATE, which is exactly what imperativeRepaint records.
+         */
+        assert(request.kind != stage::RequestKind::RepaintOnly
+               || request.imperativeRepaint);
 
         pendingRequest = coalesce(pendingRequest, request);
         paramsUpdateMutex.unlock();
@@ -4602,6 +4641,7 @@ void ImProcCoordinator::updatePreviewImage(EditorRequest request,
         // event did not carry an init/HDR bit. The added bits make sure the
         // base image and analysis are rebuilt from the current parameters.
         todo |= M_INIT | M_HDR | M_MONITOR;
+        request.setLegacyGateMask(todo);
         /*
          * Widening the mask to a base refresh widens the typed request too.
          * HighQuality keeps its precedence, exactly as the old derivation
@@ -4613,8 +4653,10 @@ void ImProcCoordinator::updatePreviewImage(EditorRequest request,
         }
         if (params->spot != viewportFullParams.spot) {
             todo |= M_SPOT;
+            request.setLegacyGateMask(todo);
             request.spotPending = true;
         }
+        assertPlanningAgrees(request, "base refresh");
         if (previewBaseCache->enabled()) {
             previewBaseCache->markDirty("viewport-base-refresh");
         }
@@ -4623,7 +4665,9 @@ void ImProcCoordinator::updatePreviewImage(EditorRequest request,
     // A request that takes the normal path satisfies any deferred analysis
     // work: it rebuilds the whole-frame pipeline, so the accumulated stages
     // must be part of its mask rather than left for a later pass.
-    if (absorbPendingDeferred(todo)
+    const bool absorbedDeferred = absorbPendingDeferred(todo);
+    request.setLegacyGateMask(todo);
+    if (absorbedDeferred
             && request.kind == stage::RequestKind::RepaintOnly) {
         /*
          * The deferred mask always adds execution bits, so the ORed mask can
@@ -4631,6 +4675,15 @@ void ImProcCoordinator::updatePreviewImage(EditorRequest request,
          * produced ParamsOnly for this combination.
          */
         request.kind = stage::RequestKind::ParamsOnly;
+    }
+    if (absorbedDeferred) {
+        /*
+         * Debug cross-check for the absorb patch: the accumulated deferred
+         * mask always widens the request past the bare repaint, so neither the
+         * mask-shaped fact nor the kind may still say "repaint".
+         */
+        assert(!request.imperativeRepaint);
+        assert(request.kind != stage::RequestKind::RepaintOnly);
     }
 
     bool suppressDeferredCropRender = false;
@@ -4647,7 +4700,7 @@ void ImProcCoordinator::updatePreviewImage(EditorRequest request,
     PreviewPassState pass;
     bool monitorOutputPlanned = false;
 
-    if (((todo & ALL) == ALL) || (todo & M_MONITOR) || panningRelatedChange || (highDetailNeeded && prevdemo != PD_Sidecar)) {
+    if (request.fullFrameAdmission || panningRelatedChange || (highDetailNeeded && prevdemo != PD_Sidecar)) {
         fullPipelineRan = true;
         pass.todo = todo;
         pass.request = request;
@@ -4659,7 +4712,7 @@ void ImProcCoordinator::updatePreviewImage(EditorRequest request,
         // and the plan sees the mask the pass will actually use. The request
         // bit is kept for the typed order, which cannot derive it from a
         // parameter delta.
-        const bool colorHlrWbRequest = (pass.todo & M_WB) != 0;
+        const bool colorHlrWbRequest = request.colorHlrWbRequest;
         if (colorHlrWbRequest && params->toneCurve.hrenabled
                 && params->toneCurve.method == "Coloropp") {
             pass.todo |= DEMOSAIC;
@@ -4668,11 +4721,13 @@ void ImProcCoordinator::updatePreviewImage(EditorRequest request,
              * old derivation saw a whole-path rebuild with spot work. Keep the
              * typed request in step; M_HIGHQUAL still wins.
              */
+            pass.request.setLegacyGateMask(pass.todo);
             pass.request.fullFrameIntent = true;
             pass.request.spotPending = true;
             if (!pass.request.highDetailIntent) {
                 pass.request.kind = stage::RequestKind::FullPreview;
             }
+            assertPlanningAgrees(pass.request, "color/coloropp demosaic");
         }
 
         pass.highDetailNeeded = highDetailNeeded;
@@ -4826,6 +4881,13 @@ void ImProcCoordinator::updatePreviewImage(EditorRequest request,
         }
 
         todo = pass.todo;
+        /*
+         * Nodes may widen the execution payload themselves (raw.demosaic adds
+         * M_INIT|M_CSHARP after a rebuild). Refresh the mask-shaped facts so
+         * the monitor render gate below sees the same planning the old
+         * derivation read from the final mask.
+         */
+        pass.request.setLegacyGateMask(todo);
 
         if ((pass.todo & M_MONITOR) || (lastOutputProfile != params->icm.outputProfile) || lastOutputIntent != params->icm.outputIntent || lastOutputBPC != params->icm.outputBPC) {
             lastOutputProfile = params->icm.outputProfile;
@@ -4858,7 +4920,7 @@ void ImProcCoordinator::updatePreviewImage(EditorRequest request,
     // monitor.output is the last node of the plan; the pass records
     // whether the plan scheduled it.
     if (monitorOutputPlanned) {
-        if ((todo != CROP && todo != MINUPDATE) || (todo & M_MONITOR)) {
+        if (pass.request.monitorOutputRequest) {
             MyMutex::MyLock prevImgLock(previmg->getMutex());
 
             try {

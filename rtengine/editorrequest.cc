@@ -78,7 +78,8 @@ uint64_t hashCombine(uint64_t hash, uint64_t value)
     /*
      * FNV-1a. The identity stays inside one process, so portability across
      * builds is not required, but a fixed function keeps the tests and the
-     * coordinator agreeing on equality.
+     * coordinator agreeing on equality. The offset basis is the 64-bit
+     * FNV-1a constant 14695981039346656037.
      */
     hash ^= value;
     hash *= 1099511628211ULL;
@@ -87,7 +88,7 @@ uint64_t hashCombine(uint64_t hash, uint64_t value)
 
 uint64_t identityOf(const EditorRequest& request)
 {
-    uint64_t hash = 1469598103934665603ULL;
+    uint64_t hash = 14695981039346656037ULL;
 
     hash = hashCombine(hash, static_cast<uint64_t>(request.kind));
     hash = hashCombine(
@@ -97,6 +98,15 @@ uint64_t identityOf(const EditorRequest& request)
     hash = hashCombine(hash, request.viewportMoved ? 1 : 0);
     hash = hashCombine(hash, request.highDetailIntent ? 1 : 0);
     hash = hashCombine(hash, request.fullFrameIntent ? 1 : 0);
+    /*
+     * The mask-shaped facts are planning inputs, so they belong to the
+     * identity even though the raw mask does not. Two masks that plan
+     * differently must never share an identity.
+     */
+    hash = hashCombine(hash, request.fullFrameAdmission ? 1 : 0);
+    hash = hashCombine(hash, request.colorHlrWbRequest ? 1 : 0);
+    hash = hashCombine(hash, request.monitorOutputRequest ? 1 : 0);
+    hash = hashCombine(hash, request.imperativeRepaint ? 1 : 0);
     hash = hashCombine(hash, request.dirty.valid ? 1 : 0);
     hash = hashCombine(hash, request.dirty.forced ? 1 : 0);
 
@@ -111,11 +121,86 @@ uint64_t identityOf(const EditorRequest& request)
     return hash;
 }
 
+/* The mask alone admits the full-frame path. */
+bool fullFrameAdmissionFor(int mask)
+{
+    return (mask & ALL) == ALL || (mask & M_MONITOR) != 0;
+}
+
+/* The pass carries a white-balance request. */
+bool colorHlrWbRequestFor(int mask)
+{
+    return (mask & M_WB) != 0;
+}
+
+/*
+ * The legacy monitor render gate: every request except a bare crop or a bare
+ * repaint renders monitor.output, and M_MONITOR always does.
+ */
+bool monitorOutputRequestFor(int mask)
+{
+    return (mask != CROP && mask != MINUPDATE) || (mask & M_MONITOR) != 0;
+}
+
+/* The mask exactly in its imperative-repaint form. */
+bool imperativeRepaintFor(int mask)
+{
+    return mask == M_MINUPDATE;
+}
+
+/*
+ * Kind the request bits imply, in the precedence the coordinator used before
+ * the typed request. Deliberately total and non-aborting: the coordinator's
+ * debug cross-check evaluates widened masks that the adapter would reject.
+ */
+EditorRequest::RequestKind kindForLegacyMask(int mask)
+{
+    if (mask == M_MINUPDATE) {
+        return EditorRequest::RequestKind::RepaintOnly;
+    }
+    if ((mask & M_HIGHQUAL) != 0) {
+        return EditorRequest::RequestKind::HighQuality;
+    }
+    if ((mask & FULL_FRAME_BITS) != 0) {
+        return EditorRequest::RequestKind::FullPreview;
+    }
+    return EditorRequest::RequestKind::ParamsOnly;
+}
+
 } // namespace
+
+void EditorRequest::setLegacyGateMask(int mask)
+{
+    legacyGateMask = mask;
+    fullFrameAdmission = fullFrameAdmissionFor(mask);
+    colorHlrWbRequest = colorHlrWbRequestFor(mask);
+    monitorOutputRequest = monitorOutputRequestFor(mask);
+    imperativeRepaint = imperativeRepaintFor(mask);
+}
 
 uint64_t EditorRequest::identity() const
 {
     return identityOf(*this);
+}
+
+bool planningAgreesWithLegacyMask(const EditorRequest& request)
+{
+    return request.kind == kindForLegacyMask(request.legacyGateMask)
+        && request.controlOnly == ((request.legacyGateMask & ~M_VOID) == 0)
+        && request.spotPending
+            == ((request.legacyGateMask & M_SPOT) != 0)
+        && request.highDetailIntent
+            == ((request.legacyGateMask & M_HIGHQUAL) != 0)
+        && request.fullFrameIntent
+            == ((request.legacyGateMask & FULL_FRAME_BITS) != 0)
+        && request.fullFrameAdmission
+            == fullFrameAdmissionFor(request.legacyGateMask)
+        && request.colorHlrWbRequest
+            == colorHlrWbRequestFor(request.legacyGateMask)
+        && request.monitorOutputRequest
+            == monitorOutputRequestFor(request.legacyGateMask)
+        && request.imperativeRepaint
+            == imperativeRepaintFor(request.legacyGateMask);
 }
 
 EditorRequest from_legacy_mask(int mask, const LegacyMaskContext& context)
@@ -143,7 +228,7 @@ EditorRequest from_legacy_mask(int mask, const LegacyMaskContext& context)
     EditorRequest request;
 
     request.present = mask != 0;
-    request.legacyGateMask = mask;
+    request.setLegacyGateMask(mask);
     request.controlOnly = (mask & ~M_VOID) == 0;
     request.viewportMoved = context.viewportMoved;
     request.spotPending = (mask & M_SPOT) != 0;
@@ -156,15 +241,7 @@ EditorRequest from_legacy_mask(int mask, const LegacyMaskContext& context)
      * coalesced mask, kept here so the mask is interpreted in exactly one
      * place.
      */
-    if (repaint) {
-        request.kind = EditorRequest::RequestKind::RepaintOnly;
-    } else if (request.highDetailIntent) {
-        request.kind = EditorRequest::RequestKind::HighQuality;
-    } else if (request.fullFrameIntent) {
-        request.kind = EditorRequest::RequestKind::FullPreview;
-    } else {
-        request.kind = EditorRequest::RequestKind::ParamsOnly;
-    }
+    request.kind = kindForLegacyMask(mask);
 
     return request;
 }
@@ -181,7 +258,8 @@ EditorRequest coalesce(const EditorRequest& first, const EditorRequest& second)
     EditorRequest merged;
 
     merged.present = true;
-    merged.legacyGateMask = first.legacyGateMask | second.legacyGateMask;
+    merged.setLegacyGateMask(
+        first.legacyGateMask | second.legacyGateMask);
     merged.controlOnly = first.controlOnly && second.controlOnly;
     merged.spotPending = first.spotPending || second.spotPending;
     merged.viewportMoved = first.viewportMoved || second.viewportMoved;
