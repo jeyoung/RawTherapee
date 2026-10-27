@@ -37,8 +37,8 @@ namespace rtengine::stage
  * Graph dirty-block derivation.
  *
  * The legacy `M_*` bitset names a parameter family, not the blocks that read
- * it, and its coarse gates over-approximate: `M_LUMINANCE` dirties both the
- * Lab tools and the sharpening block, and `M_CROP` re-runs four blocks that a
+ * it, and its coarse gates over-approximate: the luminance family dirties both the
+ * Lab tools and the sharpening block, and the crop family re-runs four blocks that a
  * crop change does not touch. The preview and crop paths need a block set that
  * follows the actual inputs of a block so the graph can decide execution
  * without the bitset.
@@ -121,7 +121,7 @@ std::vector<RenderStateAspect> changed_render_state_aspects(
  * pass rebuilds the path", not "these inputs changed". A caller that carries
  * such a request has to treat the whole path as dirty, because the request may
  * stand for work whose inputs are not represented in ProcParams or in the
- * render state (the crop reloads its destructive raw stage for M_INIT, for
+ * render state (the crop reloads its destructive raw stage for a reload request, for
  * example). ParamsOnly and RepaintOnly are deltas and rebuild nothing.
  */
 bool request_rebuilds_path(RequestKind kind);

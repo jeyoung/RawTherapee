@@ -33,7 +33,7 @@ implementation:
 | Preview   | `rtengine/improccoordinator.cc` | `processImage()` / `worker()` |
 | Crop      | `rtengine/dcrop.cc`       | `Crop::cropImage()` |
 | Thumbnail | `rtengine/rtthumbnail.cc` | `loadQuickFromRaw()`, `quickProcessImage()`, `processImage()` |
-| Invalidation | `rtengine/refreshmap.h`, `refreshmap.cc` | `M_*` block mask |
+| Invalidation | `rtengine/editorrequest.h`, `stage/stage_dirty_blocks.*` | typed request facts and blocked ids |
 
 ## Canonical block catalogue
 
@@ -196,20 +196,17 @@ retinex for another and re-applies spots for a third. `monitor.output`
 executes at its legacy site, after the crop render, so the monitor profile
 cache refresh it follows still feeds the crop viewport.
 
-The producer side is typed too. Tools name a `RequestIntent`; `make_request()`
-builds the kind, facts and compatibility mask, and `RefreshMapper` stores the
-request beside the mask. The event registry key is the planning identity *and*
-the compatibility mask, so two actions that plan identically but carry
-different payloads stay distinct. The integer `newEvent(action, message)`
-overload remains the documented compatibility path for the 323 parameter-only
-calls in 15 tool files (16 GUI files including `rtgui/eventmapper.cc`); it is
-classified once by `from_legacy_mask()`.
+The producer side is typed too. Tools name a `RequestIntent`;
+`make_request()` builds the typed kind and facts, and the event registry stores
+the request. The event key is the request identity and the history message, so
+two actions that plan identically but carry different payload facts stay
+distinct. The integer `newEvent(action, message)` overload is deleted.
 
 Three statements that were unconditional in the hand-written pass stay in the
 caller, never in a node: the `oprevi = orig_prev` working-pointer reset, the
 local-adjustment damping floor, and the frame-count and image-type notices.
-The Color/Coloropp `todo |= DEMOSAIC` augmentation also runs there so the plan
-sees the mask the pass will use.
+The Color/Coloropp `markColorHlrDemosaic()` augmentation also runs there so the
+plan sees the typed request the pass will use.
 
 ### Crop: 15 nodes, 14 edges
 
@@ -745,17 +742,17 @@ the pass, because several stage bodies write corrected values back into the
 parameters (automatic white balance, automatic denoise) and those corrections
 belong to the state the buffers hold, not to the next update's inputs.
 
-The one thing the crop still takes from the mask is the raw-reload request:
-`M_INIT`, `M_LINDENOISE` and `M_HDR` ask for the destructive raw stage to be
-reloaded, which no parameter fingerprint can express. The mask is carried into
-the render state as `RequestKind::FullCrop`, so the derivation treats the pass
-as a rebuild instead of silently skipping the reload. Every other input is
-derived.
+The one thing the crop still takes from the request is the raw-reload
+decision: the init, line-denoise and HDR families ask for the destructive raw
+stage to be reloaded, which no parameter fingerprint can express. The request
+kind is carried into the render state as `RequestKind::FullCrop`, so the
+derivation treats the pass as a rebuild instead of silently skipping the
+reload. Every other input is derived.
 
 The derived set is the execution-set authority. There is no
 `RT_CROP_DIRTY` mode and no runtime mask baseline. `crop-stage-test --sequences`
-applies the real `refreshmap.h` composite mask to the stage bodies, then
-compares the incremental crop with a fresh render of the final state. For the
+applies the typed request of each edit to the stage bodies, then compares the
+incremental crop with a fresh render of the final state. For the
 destructive raw/core bodies the typed work order is the execution-set
 authority; the dirty-block set still schedules the downstream nodes.
 
@@ -766,9 +763,9 @@ the graph's dirty flags come from the derived set.
 ### Dirty-block evidence
 
 `crop-stage-test --sequences` drives one parameter or viewport change inside a
-live session for each scenario, applies the real `refreshmap.h` composite mask
-to the stage bodies, and compares the incremental crop with a fresh render of
-the final state.
+live session for each scenario, applies the typed request of the edit to the
+stage bodies, and compares the incremental crop with a fresh render of the
+final state.
 
 Image: the public 10.2 MP PEF sample `colorspace_flowers.pef` (listed in
 `devnotes/opencl/testdata.manifest`), 100% viewport 960x640,
@@ -828,17 +825,17 @@ spotprev != nullptr
 ```
 
 The request facts that remain are deliberate boundary folds, not gates:
-`RequestKind` from `M_INIT | M_LINDENOISE | M_HDR` (and `M_HIGHQUAL`), and
-`spotPending` from `M_SPOT`. The HDR/Fattal block (`todo & M_HDR`) and the
-demosaic body's internal sub-gates still read the mask: they decide how much
-of a node runs, not whether the raw/core body is entered. The transform,
-Lab and monitor gates are untouched.
+`RequestKind` from the init, line-denoise, HDR and high-quality families, and
+`spotPending` from the spot family. The HDR/Fattal block (`hdrIntent`) and the
+demosaic body's internal sub-gates read typed facts: they decide how much of a
+node runs, not whether the raw/core body is entered. The transform, Lab and
+monitor gates are untouched.
 
 The spot buffer clear is now covered by `spotRestore`: a live buffer is named
 whether the tool is still configured (restore) or not (clear). That is why the
 site no longer reads `M_SPOT`.
 
-`RT_WORK_ORDER=0`/`off` no longer restores the mask. The caller derives with no
+`RT_WORK_ORDER=0`/`off` no longer restores a mask. The caller derives with no
 usable history, so every parameter-applicable raw/core item is named: a
 conservative superset, safe and slower. The unit test pins the derivation and
 the preview sweep runs the conservative order against the exact one.
@@ -905,234 +902,30 @@ The preview bench is not usable evidence for this change. The harness captured
 only two samples because its hard-coded slider coordinates miss on this
 layout, so no timing claim is made.
 
-## Mask-to-block equivalence map (Phase F)
+## Retired mask maps
 
-The legacy `M_*` bitset in `rtengine/refreshmap.h` and the Phase F audit that
-precedes its removal mix four different things: execution gates, cache
-invalidation, request kinds (`M_VOID`, `M_MINUPDATE`, `M_HIGHQUAL`) and
-diagnostics. `rtengine/stage/stage_mask_map.h/.cc` records what each bit means
-in canonical stage terms so the bitset can be validated against the graph
-before it is deleted, and so the bits it cannot express are written down
-instead of living in folklore.
+The legacy request mask and its equivalence data are deleted. There is no
+`refreshmap.*`, no `stage_mask_map.*`, no `M_*` constant and no compatibility
+mask on a request. The intents in `rtengine/editorrequest.h` name the request
+families; `make_request()` builds the typed facts; the stage bodies read the
+facts.
 
-This map is parallel to `refreshmap.*`: the legacy table, the coordinator and
-the crop viewport are unchanged and still drive the running pipelines. The map
-is data only, reads no pixels and executes nothing. It covers `Export`,
-`Preview` and `Crop`; `Thumbnail` has its own quick path and no bitset
-equivalence yet.
+The static `ProcEventCode` identities keep their meaning as event identities.
+`rtengine/editorrequest_registry.cc` records the intent of each static event as
+a compact range table, and a producer event created by
+`ProcEventMapper::newEvent()` stores its typed request directly. History and
+deduplication are unchanged.
 
-### API
-
-| Function | Meaning |
-|----------|---------|
-| `blocks_for_mask(mask, path)` | Blocks directly dirtied by the bits set in `mask`, in canonical pipeline order |
-| `mask_for_blocks(blocks)` | Best-effort inverse for diagnostics; request kinds are never inferred |
-| `stageMaskMap()` | The 21-row table: bit, name, kind and per-path block ids |
-| `isKnownMaskBit(bit)` | Whether the row exists |
-| `maskBitIsPathSpecific(bit)` | True for `M_CROP` and `M_MONITOR` only |
-| `nonMaskInputs(path)` | Inputs that reach a block without an `M_*` bit |
-
-A returned set is direct dirtiness, not a transitive closure. A consumer that
-needs the complete recompute set closes it over
-`buildPipelineSpec(path)` edges. Composite constants from `refreshmap.h`
-(`ALL`, `COMPR`, `DEMOSAIC`, `RGBCURVE`, `SHARPENING`, ...) work unchanged
-because they are ordinary bit unions. Aliases that resolve to a request kind
-(`GAMMA`, `RESIZE`, `EXIF`, `IPTC` are all `M_VOID`) return an empty set.
-
-An unknown bit trips an assertion in debug builds and is ignored otherwise, so
-a release build degrades to under-invalidation rather than undefined
-behaviour. Passing `StagePath::Thumbnail` is out of scope and asserts.
-
-### Bit table
-
-Kind `execution` dirties a parameter family, `output-request` names geometry or
-a display/output transform, and `request-kind` controls how much work is done
-without naming a block. Every id is a canonical descriptor of that path; the
-preview column is empty for a block the preview path does not carry.
-
-| Bit | Kind | Export | Preview | Crop | Evidence |
-|-----|------|--------|---------|------|----------|
-| `M_PREPROC` | execution | `raw.preprocess` | `raw.preprocess` | `raw.preprocess` | `improccoordinator.cc:1656` preprocess gate |
-| `M_RAW` | execution | `raw.demosaic` | `raw.demosaic` | `raw.demosaic` | `:1705` demosaic trigger |
-| `M_CSHARP` | execution | `raw.demosaic` | `raw.demosaic` | `raw.demosaic` | `:1746` capture sharpening, bundled in `raw.demosaic` |
-| `M_WB` | execution | `raw.base` | `raw.base` | `raw.base` | white balance inside `getImage()` |
-| `M_INIT` | execution | `raw.base` | `raw.base` | `raw.base` | `:1810` base gate |
-| `M_SPOT` | execution | `raw.base` | `raw.base` | `raw.base` | `:2173`, `dcrop.cc:625` spot removal |
-| `M_LINDENOISE` | execution | `raw.base` | `raw.base` | `raw.base` | `:1782`, `dcrop.cc:189` denoise |
-| `M_RETINEX` | execution | `raw.base` | `raw.base` | `raw.base` | `:1788` Retinex |
-| `M_HDR` | execution | `transform` | `transform` | `transform` | `:2286`, `dcrop.cc:749` Fattal and dehaze |
-| `M_TRANSFORM` | execution | `transform` | `transform` | `transform` | transform block |
-| `M_BLURMAP` | execution | `lab.sharpening` | - | `lab.sharpening` | sharpening halo blur map; preview carries no sharpening |
-| `M_AUTOEXP` | execution | `analysis`, `local.adjustments` | same | same | `:2337` analysis; all local-lab events map to `AUTOEXP` |
-| `M_RGBCURVE` | execution | `local.adjustments`, `rgb.proc`, `lab.wavelet` | same | same | `:2583`, `:3234`, `:2328` before/after equaliser gate |
-| `M_LUMACURVE` | execution | `lab.tools`, `ciecam` | same | same | `:3324` Lab curve LUT; CIE CAM events map to `LUMINANCECURVE` |
-| `M_LUMINANCE` | execution | `lab.tools`, `lab.sharpening`, `lab.wavelet` | `lab.tools`, `lab.wavelet` | `lab.tools`, `lab.sharpening`, `lab.wavelet` | `:3366`, `dcrop.cc:1399` Lab pass |
-| `M_COLOR` | execution | `lab.tools`, `lab.sharpening`, `lab.wavelet`, `working.trc`, `ciecam`, `gamut` | `lab.tools`, `lab.wavelet`, `working.trc`, `ciecam`, `gamut` | as export | same Lab pass; no finer bit exists |
-| `M_CROP` | output-request | `crop` | `analysis`, `local.adjustments`, `rgb.proc`, `lab.tools` | as preview | crop geometry; hidden histogram/LUT dependency |
-| `M_MONITOR` | output-request | `output.convert`, `output.icc` | `monitor.output` | `viewport.output` | display transform, output profile, intent and BPC |
-| `M_VOID` | request-kind | - | - | - | parameters changed, no preview work |
-| `M_MINUPDATE` | request-kind | - | - | - | repaint without new image work |
-| `M_HIGHQUAL` | request-kind | - | - | - | force the accurate path |
-
-`M_CROP` is the only bit with a hidden dependency. On preview and crop it does
-not run a block, but the fast path rebuilds the tone-curve and Lab-curve LUTs
-from the cached working histogram (`prepareViewportLuts()`), so it depends on
-the histogram owned by `analysis` and on the LUT consumers `rgb.proc` and
-`lab.tools`, and it re-runs local adjustments. `analysis` is listed even though
-a crop change leaves the histogram unchanged; recomputing it is the
-conservative choice and is recorded below.
-
-`M_MONITOR` has two meanings that share one bit: `EvMonitorTransform` (display)
-and `EvOProfile`/`EvOIntent`/`EvOBPCompens` (output). Each path maps it to the
-sinks it owns.
-
-### Representative masks
-
-The test pins the block sets for the masks used by the audit. Rows are in
-canonical pipeline order; `-` means the path has no such block and not that the
-bit is irrelevant.
-
-| Mask | Export | Preview | Crop |
-|------|--------|---------|------|
-| `ALL` | raw core + analysis, transform, local, rgb, Lab family, gamut | without `lab.sharpening` | as export |
-| `COMPR` | `ALLNORAW` + `output.convert`, `output.icc` | `ALLNORAW` + `monitor.output` | `ALLNORAW` + `viewport.output` |
-| `ALLNORAW` | `raw.base` + analysis, transform, local, rgb, Lab family, gamut | without `lab.sharpening` | as export |
-| `DEMOSAIC` | `ALLNORAW` + `raw.demosaic` | without `lab.sharpening` | as export |
-| `WB` | same block set as `ALLNORAW` | same as `ALLNORAW` | same as `ALLNORAW` |
-| `RGBCURVE` | local, rgb, Lab family, `working.trc`, `ciecam`, `gamut` | without `lab.sharpening` | as export |
-| `LUMINANCECURVE` | Lab family, `working.trc`, `ciecam`, `gamut` | without `lab.sharpening` | as export |
-| `SHARPENING` | same as `LUMINANCECURVE` | same as `LUMINANCECURVE` | same |
-| `DIRPYRDENOISE` | same as `SHARPENING` | same | same |
-| `DIRPYREQUALIZER` | same as `SHARPENING` | same | same |
-| `TRANSFORM` | `raw.base`, analysis, transform, local, rgb, Lab family, `working.trc`, `ciecam`, `gamut` | without `lab.sharpening` | as export |
-| `CROP` | `crop` | analysis, local, rgb, `lab.tools` | analysis, local, rgb, `lab.tools` |
-| `RESIZE` | - | - | - |
-| `MONITORTRANSFORM` | `output.convert`, `output.icc` | `monitor.output` | `viewport.output` |
-| `OUTPUTPROFILE` | same as `MONITORTRANSFORM` | same | same |
-
-"Lab family" is `lab.tools`, `lab.sharpening` (where carried), `lab.wavelet`,
-`working.trc`, `ciecam`, `gamut`. The exact vectors are in
-`rtengine/stage/tests/stage_mask_map_test.cc`; the table above is a reading
-aid.
-
-### Inputs without a mask bit
-
-Some blocks are driven by something the bitset does not represent. They are
-listed per path in `nonMaskInputs()` and prove that no block is silently
-unmapped.
-
-| Path | Block | Kind | Reason |
-|------|-------|------|--------|
-| all three | `source.select` | source | image load and source generation |
-| export | `resize` | parameters | resize events map to `M_VOID` |
-| export | `output.sharpen` | parameters | post-resize sharpening events map to `M_VOID` |
-| export | `framing` | parameters | no dedicated mask bit |
-| export | `output.icc` | parameters | metadata events map to `M_VOID` |
-| preview | `monitor.output` | render-state | monitor profile, intent, soft proof, gamut check |
-| crop | `viewport.output` | render-state | monitor configuration and crop/ROI geometry |
-
-`M_VOID` is why the export-only tail is invisible to the bitset: a resize,
-post-resize sharpening or metadata edit asks for "parameters changed, do not
-repaint", and the export path recomputes those blocks from the parameter
-fingerprints instead.
-
-### Known over-approximations
-
-The map records the parameter family a bit represents, not every gate the
-legacy code happens to test. Where the legacy gate is broader, the difference
-is an over-approximation in the legacy path that the stage runtime does not
-need to reproduce. The following are deliberate and reviewed:
-
-1. `M_WB`, `M_INIT`, `M_SPOT`, `M_LINDENOISE` and `M_RETINEX` all dirty
-   `raw.base`. `WB` and `ALLNORAW` therefore produce the same block set: the
-   bitset's distinction between white balance and "everything after raw" is not
-   observable at block granularity, because white balance is inside `raw.base`.
-2. `M_CSHARP` dirties `raw.demosaic`, although it only rebuilds capture
-   sharpening. The catalogue bundles demosaic and capture sharpening in one
-   block, so a capture-sharpening change may recompute the demosaic.
-3. `M_HDR` dirties `transform`, although the legacy base gate
-   (`M_INIT | M_LINDENOISE | M_HDR`) also forces `raw.base`. The `HDR`
-   composite still carries `M_SPOT` and `M_LINDENOISE`, so events that use the
-   composite keep the legacy breadth.
-4. `M_AUTOEXP` dirties `analysis` and `local.adjustments`, but the legacy Lab
-   pass also runs when `M_AUTOEXP` is set (`:3366`). Downstream closure from
-   `local.adjustments` covers that pass, so the map does not list it.
-5. `M_RGBCURVE` lists `lab.wavelet` for the directional-pyramid "bef" gate at
-   `:2328`. That block is downstream of `rgb.proc`, so closure would reach it
-   anyway; the direct entry records the legacy gate.
-6. The bitset has no per-tool bits below luminance and colour. `M_LUMINANCE`
-   and `M_COLOR` therefore dirty the whole Lab family, and `SHARPENING`,
-   `IMPULSEDENOISE`, `DEFRINGE`, `DIRPYRDENOISE`, `DIRPYREQUALIZER` and
-   `LUMINANCECURVE` all produce the same block set. This is the largest
-   over-approximation in the map and the main reason the stage runtime should
-   use per-stage fingerprints rather than the bitset.
-7. `M_CROP` dirties `analysis` on preview and crop. The histogram does not
-   change with the crop rectangle; it is listed because the LUT rebuild reads
-   the cached histogram and a stale analysis output would silently produce
-   wrong curves. A real executor should treat it as a validity precondition
-   rather than unconditional dirt.
-8. `M_MONITOR` dirties `output.convert` and `output.icc` on export, although
-   the display transform is irrelevant there. The same bit carries the output
-   profile, intent and BPC events, which do affect those blocks.
-9. `M_BLURMAP` has no preview block because preview carries no
-   `lab.sharpening`. The sharpening blur map is rebuilt by the crop viewport,
-   which is `StagePath::Crop`.
-
-### Bits that could not be mapped
-
-None of the 21 catalogued bits is missing a row. Five bits do not name a
-processing block and are mapped by kind rather than by family:
-
-- `M_VOID`, `M_MINUPDATE`, `M_HIGHQUAL` are request kinds and dirty nothing.
-  `M_VOID` carries the only loss of information in the map: events that use it
-  for metadata, resize, post-resize sharpening and framing have no block
-  equivalent and must be recovered from the parameter fingerprints.
-- `M_CROP` and `M_MONITOR` are output or view requests. They are mapped to the
-  sinks each path owns, plus `M_CROP`'s histogram and LUT dependency.
-
-No bit is diagnostic-only. The closest case is `M_VOID`, which the metadata
-panel uses to record a parameter change with no repaint.
-
-### Verification
-
-```bash
-cd build/worktrees/phaseF-event-map
-tools/build-rt.sh cpu -j 6 --ccache --stage-modules
-cmake --build build/cpu-phaseF-event-map --target stage-mask-map-test -j 6
-build/cpu-phaseF-event-map/rtengine/stage-mask-map-test
-```
-
-Result:
-
-```text
-stage-mask-map-test: PASS
-```
-
-The test checks:
-
-1. one row for each of the 21 catalogued bits, with the right kind, a single
-   set bit and no duplicate;
-2. every id is canonical for the path, unique within the row and in pipeline
-   order;
-3. every execution bit has an export and a crop block, and a preview block
-   except the documented `M_BLURMAP` case;
-4. every block of every path is reachable from a bit or a non-mask input;
-5. rows agree on blocks shared by two paths, except `M_CROP` and `M_MONITOR`;
-6. the three request kinds are classified as such, dirty nothing, and are
-   never inferred by the inverse;
-7. the representative masks produce the exact vectors recorded above;
-8. the inverse contains every bit that produced a non-empty set.
-
-The OpenCL configuration compiles as well. The map is data only, so no parity
-run applies.
+`editorrequest-test` runs the reintroduction guard over the engine, GUI and
+tool sources. It fails on a retired unit, helper or mask constant, and on an
+integer `newEvent` action.
 
 ## Preview typed work order
 
 The preview raw-chain gates run from the typed order by default. The order is
 derived once per pass by `rtengine/stage/stage_work.cc`. The legacy `M_*` gates
-are retired, so there is no runtime shadow probe: `typedOnly` is pinned by the
-unit oracle in `rtengine/stage/tests/stage_work_test.cc`, which compares every
-case against the action the editor sends. `RT_WORK_ORDER` is the kill switch:
+are retired, so there is no runtime shadow probe: the exact expected order of
+every parameter case is recorded in `rtengine/stage/tests/stage_work_test.cc`. `RT_WORK_ORDER` is the kill switch:
 any value leaves the typed order enabled, while `0` and `off`
 (case-insensitive) derive the order with no usable history, so it names every
 parameter-applicable item. Unset is the default and enables the exact order.
@@ -1324,16 +1117,14 @@ work the request allows. The gates, their class and their replacement are:
 | demosaic rebuild widening | `stageRawDemosaic()` | payload | `pass.todo \|= M_INIT\|M_CSHARP` | `demosaicRebuilt`, applied after the node loop by `markDemosaicRebuilt()` |
 | output-profile refresh | post-node | body | `pass.todo & M_MONITOR` | `monitorIntent` |
 | crop force | `Crop::update()` | scheduling | `if (forcedFull) todo = ALL` | removed; `forcedFull` and the request facts already admit the same work |
-| timer / dump / trace | diagnostics | diagnostic | `int todo` | `request.executionPayload()` |
+| timer / dump / trace | diagnostics | diagnostic | `int todo` | request kind and identity |
 
-`monitorIntent` is the exact `M_MONITOR` bit, not `monitorOutputRequest`: a
+`monitorIntent` is the exact monitor family, not `monitorOutputRequest`: a
 spot or white-balance request renders `monitor.output` but does not name the
-monitor transform, and the crop gate and profile refresh followed the bit.
+monitor transform, and the crop gate and profile refresh follow the family.
 `rawIntent` and `captureSharpenIntent` are payload-shaping facts like
-`luminanceIntent`; they are excluded from `identity()`. The deferred payload
-and the `from_legacy_mask(ALL | M_MONITOR)` producers remain for step 5, as do
-`viewportCropTodo()`/`viewportCropPayload()` as test oracles; the coordinator
-no longer calls them.
+`luminanceIntent`, and all of them participate in `identity()`. No deferred
+payload, mask adapter or crop-todo oracle remains.
 
 Only one gate changed shape, and only in how it is expressed:
 `captureSharpening` names the local `demosaicRebuilt` fact explicitly instead

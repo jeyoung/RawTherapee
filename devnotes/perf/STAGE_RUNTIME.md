@@ -742,7 +742,7 @@ no latency change is claimed rather than assumed.
 
 Builds: `tools/build-rt.sh cpu -j 6 --ccache` and `tools/build-rt.sh opencl
 -j 6 --ccache` both complete with no warning in the changed translation units.
-`stage-dirty-blocks-test`, `stage-pipeline-test`, `stage-mask-map-test`,
+`stage-dirty-blocks-test`, `stage-pipeline-test`,
 `stage-render-state-test` and `stage-param-map-test` pass in both build
 directories.
 
@@ -756,16 +756,16 @@ is the same unit the preview coordinator uses through the adapters above; the
 rules and tables are in `devnotes/perf/STAGE_PIPELINE.md`.
 
 The crop plan has one authority: the derived dirty set. There is no
-`RT_CROP_DIRTY` mode and no mask comparison. The mask keeps its two remaining
-jobs: GUI notification and coalescing, and the raw-reload request. `M_INIT`,
-`M_LINDENOISE` and `M_HDR` ask for the destructive raw stage to be reloaded;
-the crop carries that as `RequestKind::FullCrop`, so the derivation rebuilds
-the path instead of skipping a reload no fingerprint describes.
+`RT_CROP_DIRTY` mode and no mask comparison. The typed request keeps the raw
+reload decision: the init, line-denoise and HDR families ask for the
+destructive raw stage to be reloaded; the crop carries that as
+`RequestKind::FullCrop`, so the derivation rebuilds the path instead of
+skipping a reload no fingerprint describes.
 
 `crop_graph` exposes `runs()`, `fallbacks()` and `dirtyDerivations()` as
 process-wide counters. `RT_CROP_DIRTY_TRACE=1` prints one line per derivation
-with the mask, the forced flag, the key parameter values and the directly dirty
-blocks.
+with the request kind and identity, the forced flag, the key parameter values
+and the directly dirty blocks.
 
 `crop-stage-test --sequences [--only=<scenario>]` drives one edit per scenario
 inside a live session and compares the incremental crop with a fresh render of
@@ -781,8 +781,7 @@ full preview/crop/thumbnail gate also passes with the mask switches removed.
 ## Typed editor requests and downstream gates
 
 This phase finishes the request migration for the full-frame preview and the
-crop viewport. `EditorRequest` is the planning input; the mask is a
-compatibility payload.
+crop viewport. `EditorRequest` is the only planning and execution input.
 
 ### Downstream node entry
 
@@ -793,8 +792,8 @@ names it. The five mask helpers (`transformMayRun()`,
 typed intent facts (`transformFamilyIntent`, `hdrIntent`, `rgbProcIntent`,
 `labChainIntent`, `autoExposureIntent`, `localAdjustmentsIntent`) and closes
 the set once, after every coordinator-side insertion. The plan therefore
-covers the legacy envelope: a node cannot be skipped because the mask happened
-to be narrower than the request.
+covers the full envelope: a node cannot be skipped because a request family
+happened to be narrower than the parameter delta.
 
 The body still needs to know *how much* of a scheduled block the request
 allows. Those decisions read the typed facts, never the mask:
@@ -816,7 +815,7 @@ membership alone cannot tell a real downstream change from a resident-only
 pass. `Crop::update()` also takes the typed request: its render state now maps
 `request.kind` to the crop kind, `request.imperativeRepaint` to
 `viewportMoved`, and `request.spotPending` to the spot fact. No crop planning
-decision reads the mask.
+decision reads a mask.
 
 #### Forced crop passes
 
@@ -856,17 +855,13 @@ it is a parameter/metadata predicate, not a mask test. The raw/core bodies keep
 their block-1 work-order authority and their internal compatibility reads.
 
 Every execution-payload augmentation in `updatePreviewImage()` is a named
-intent method on `EditorRequest`, and they keep the typed facts in step before
-any consumer runs. The post-crop-vignetting augmentation adds `TRANSFORM`
-(which carries `M_HDR` and `M_SPOT` through the composite) through
-`markCropTransform()`, which recomputes the kind, `fullFrameIntent`,
-`spotPending` and the mask-shaped facts. The viewport fast path adds
-`M_LUMINANCE | M_COLOR` for a `M_LUMACURVE`/`M_AUTOEXP` crop through
-`markLabPixels()`, so the crop bodies read the same intents the legacy mask
-implied. Debug builds assert `planningAgreesWithLegacyMask()` at the
-PC-vignette augmentation, the panning requeue, the base refresh, the
-Color/Coloropp augmentation, the deferred absorb, the fast-path crop and the
-crop render.
+intent method on `EditorRequest`, and each sets the typed facts before any
+consumer runs. The post-crop-vignetting augmentation applies the transform
+family through `markCropTransform()`, which recomputes the kind,
+`fullFrameIntent`, `spotPending` and the remaining facts. The viewport fast
+path adds the luminance and colour families for a luminance-curve or
+auto-exposure crop through `markLabPixels()`, so the crop bodies read the same
+intents the request implies.
 
 A forced crop pass forces `origCrop` to be refilled even when the editor
 request is a plain parameter update. `crop_request_kind()` maps the render
@@ -893,193 +888,99 @@ the viewport fast path still rejects histogram matching.
 
 ### Typed producer API
 
-`rtengine/editorrequest.h` adds `RequestIntent`, `make_request()` and
-`compatibility_mask()`. A tool names the operation it asks for
-(`Transform`, `WhiteBalance`, `Hdr`, `AllNoRaw`, `Demosaic`, `SpotAdjust`,
-`Compr`, `CaptureSharpen`, `DarkFrame`, `First`, `RepaintOnly`,
-`ControlOnly`, `AutoExposure`, `LuminanceCurve`, `DirPyrEqualizer`,
-`RgbCurve`, `Sharpening`); `make_request()` builds the typed kind, facts and
-compatibility mask in one place. A producer that knows its blocks passes them
-as a seed list; `make_request()` closes over the pipeline edges and adds the
-path residents, so the result is an execution set. An empty list keeps the
+`rtengine/editorrequest.h` defines `RequestIntent`, `make_request()` and the
+typed `EditorRequest`. A tool names the operation it asks for (`Transform`,
+`WhiteBalance`, `Hdr`, `AllNoRaw`, `Demosaic`, `SpotAdjust`, `Compr`,
+`CaptureSharpen`, `DarkFrame`, `First`, `RepaintOnly`, `ControlOnly`,
+`AutoExposure`, `LuminanceCurve`, `DirPyrEqualizer`, `RgbCurve`,
+`Sharpening`); `make_request()` builds the typed kind and facts in one place.
+A producer that knows its blocks passes them as a seed list;
+`make_request()` closes over the pipeline edges and adds the path residents,
+so the result is an execution set. An empty list keeps the
 parameter-fingerprint derivation.
 
-The five parameter-family intents carry the exact legacy composites:
+`ProcEventMapper::newEvent(RequestIntent, message)` builds the request and
+registers it with `rtengine::EditorRequestRegistry`. The integer
+`newEvent(action, message)` overload is deleted. `ImProcCoordinator::
+endUpdateParams(ProcEvent)` resolves the registered typed request; a static
+`ProcEventCode` resolves through the registry's recorded intent ranges.
+`endUpdateParams(int)` has no request meaning and fails fast.
 
-| Intent | Compatibility mask |
-| --- | --- |
-| `AutoExposure` | `AUTOEXP` |
-| `LuminanceCurve` | `LUMINANCECURVE` |
-| `DirPyrEqualizer` | `DIRPYREQUALIZER` |
-| `RgbCurve` | `RGBCURVE` |
-| `Sharpening` | `SHARPENING` |
+The profile filter is the only boundary that replaces the parameter set
+without a raw reload. It registers an `AllNoRaw` request and passes its event
+identity, so the dirty set comes from the parameter fingerprints and the raw
+families only run when a fingerprint moved.
 
-`DirPyrEqualizer` and `Sharpening` have the same composite and the same
-planning identity, so their actions stay distinct through the history message
-in the producer event key. The test pins both the mask and that relation.
+### The event registry
 
-`ProcEventMapper::newEvent(RequestIntent, message)` registers the typed
-request with `RefreshMapper`. `RefreshMapper::mapRequest()` records both the
-typed request and the compatibility mask; `getAction()` keeps returning the
-mask for the callers that still need one. `ImProcCoordinator::endUpdateParams
-(ProcEvent)` looks the typed request up first and falls back to
-`from_legacy_mask()` only when the event was registered with `mapEvent()`.
+`rtengine/editorrequest_registry.h/.cc` owns `ProcEvent` identity,
+deduplication and history. It allocates a fresh identity for a typed producer
+event and stores the typed request. Static `ProcEventCode` identities resolve
+through a compact range table of recorded intents; the table is data about the
+events the GUI already emits, not a request mask. `ProcEventCode` and the
+`ProcEvent` values are unchanged.
 
-Converted producers (54 calls in the first group, 34 in the raw/whole-preview
-group and 45 control-only calls, the two `RESIZE` events included): film
-negative, dirpyrdnoise, spot,
-bayerprocess, xtransprocess, tonecurve, retinex, dehaze, Fattal tone mapping,
-the locallab CIE params, white balance, distortion, perspective, lens
-geometry, crop guides, gamut compression, capture sharpening, dark-frame and
-flat-field preprocessing, raw CA correction, raw exposure, preprocess white
-balance and every former `M_VOID`/`GAMMA`/`RESIZE`/`EXIF`/`IPTC` control event
-(45 in total).
+### Retired mask surface
 
-The remaining parameter-only producers are converted too: 323 registrations
-using the five family aliases — 185 `AUTOEXP`, 78 `LUMINANCECURVE`, 51
-`DIRPYREQUALIZER`, 6 `RGBCURVE` and 3 `SHARPENING` — now call
-`newEvent(RequestIntent, message)`. Eight of those lines are commented-out
-registrations (two `DirPyrEqualizer` in `wavelet.cc`, six `RgbCurve` in
-`localcontrast.cc` and `colortoning.cc`); they are converted for consistency
-and remain commented out. The six `RGBCURVE` registrations are the calls the
-plan singled out: five block-commented in `localcontrast.cc` and one
-line-commented in `colortoning.cc`. They are parameter-only RGB-curve
-registrations with no distinct action, so they use `RgbCurve`, whose mask is
-the exact `RGBCURVE` composite. The plan expected six further residual calls
-outside the five families; the tree at `a6643be36` has none, because the
-earlier conversion commit `c98501f51` had already converted every such
-registration.
+The legacy request mask is gone: no `refreshmap.*`, no `stage_mask_map.*`, no
+`M_*` mask constant, no `legacyGateMask`, no `from_legacy_mask()`, no
+`executionPayload()` and no `viewportCropTodo()`/`viewportCropPayload()`.
+Every execution-payload widening is a named method on `EditorRequest`
+(`markBaseRefresh()`, `markViewportMoved()`, `markCropTransform()`,
+`markColorHlrDemosaic()`, `markDemosaicRebuilt()`, `markLabPixels()`,
+`absorbDeferredExecution()`), and each sets the typed facts directly.
 
-`rtgui/` therefore has no integer `newEvent(action, message)` call left:
-`editorrequest-test` scans all 358 GUI sources and requires every one of the
-442 live `newEvent` calls to name the typed API. The compatibility path stays
-as the adapter only, documented in `editorrequest.h` and still covered by the
-test: a mask event has no typed request, `getRequest()` returns false,
-`getAction()` returns the mask, and the coordinator classifies it once
-through `from_legacy_mask()`. The profile refresh with unchanged raw
-parameters is the one place that deliberately drops a typed request and
-re-enters through `getAction(event) & ALLNORAW`, because its absolute kind
-would rebuild the raw core. The typed event key includes both the planning
-identity and the compatibility mask, so actions that plan identically but
-carry different payloads (`EvSpotEnabled` and `EvSpotEnabledOPA`) stay
-distinct.
+Diagnostics print typed data: the preview timer prints the request kind and
+identity, the preview dump records the kind and identity, and the crop dirty
+trace prints the kind and identity. No diagnostic reconstructs a mask.
 
-`refreshmap.*` is **not removed**. The exact remaining entries are:
-
-- `ProcEventMapper::newEvent(int action, ...)`: zero producer call sites. It
-  stays as the compatibility entry point for the later retirement step, and
-  `ProcEventMapper::newEvent(RequestIntent, ...)` forwards through
-  `make_request()`.
-- `RefreshMapper::getAction()`: four call sites — the profile filter in
-  `rtgui/toolpanelcoord.cc`, the compatibility branch of
-  `ImProcCoordinator::endUpdateParams(ProcEvent)`, and two assertions in
-  `editorrequest-test`.
-- `refreshmap[]`: the `NUMOFEVENTS`-entry static table that seeds
-  `RefreshMapper`. It is still the action source for events created before a
-  tool registers its own event, and the mask source for the profile filter.
-
-The reason the adapter stays is that the compatibility masks are still read
-by the preview-base-cache invalidation, the deferred-analysis queue and the
-unconverted block bodies. The intents reproduce those composites exactly, so
-those consumers keep the payload they had while no producer constructs a
-mask. They are the next retirement target, after those consumers have typed
-inputs.
-
-### Remaining mask reads
-
-Every remaining mask read is classified as one of:
-
-1. **Viewport admission and LUT selection do not read the mask.** Admission
-   classifies the typed `EditorRequest` (`viewportEligibility()`) and applies
-   the parameter vetoes in `viewportFastPathFallback()`; `prepareViewportLuts()`
-   and `updateViewportLutSnapshot()` take a `ViewportLutSelection`, and the crop
-   subset comes from `viewportCropSelection()`. `viewportCropTodo()` and
-   `viewportCropPayload()` remain only as the pre-retirement oracles in the
-   tests; the coordinator no longer calls them.
-2. **Deferred scheduling.** `absorbPendingDeferred()`, the deferred watcher and
-   the deferred flush use a typed `DeferredRecord` (a `DirtyBlocks` set plus a
-   forced-analysis flag, hit count and deadline). The forced stages are
-   `monitor.output`, `rgb.proc` and the Lab chain; no source or raw block is
-   ever named. The request absorbs the materialised payload through
-   `EditorRequest::absorbDeferredExecution()`, inside the adapter. The
-   crop-render trigger reads `monitorIntent`, `rgbProcIntent` and
-   `lumaCurveIntent`; `dcrop.cc` has no scheduling read, and its
-   `fullUpdate()` compatibility request is built through `from_legacy_mask()`.
-3. **Diagnostics.** `preview_dump`, the preview timer and the crop dirty trace
-   print `request.executionPayload()` as data; the timer and dump take the
-   typed request and derive the number.
-4. **Compatibility.** The base-refresh, panning, PC-vignette, Color/Coloropp,
-   demosaic-rebuild and Lab-dependency widenings are named intent methods on
-   `EditorRequest` (`markBaseRefresh()`, `markViewportMoved()`,
-   `markCropTransform()`, `markColorHlrDemosaic()`,
-   `markDemosaicRebuilt()`, `markLabPixels()`). They keep the payload and every
-   derived fact in step, and no execution site reads or writes a mask bit.
-   The raw body gates read `rawIntent` and `captureSharpenIntent`; the
-   output-profile refresh reads `monitorIntent`. The preview-base-cache
-   invalidation is typed as before.
-
-No body gate, node-entry gate or planning decision reads a mask, and no
-`todo` parameter or `pass.todo` read remains in the preview or crop execution
-path. The only mask-shaped values left are the compatibility payload, the
-`from_legacy_mask()` producers, and the diagnostics.
+`editorrequest-test` scans every engine, GUI and tool source file, ignoring
+comments, and fails if `refreshmap`, `stage_mask_map`, a mask constant (apart
+from the standard maths macros), a retired helper or an integer `newEvent`
+action reappears.
 
 ### Evidence
 
 - Both configurations build: `tools/build-rt.sh cpu -j 6` and
   `tools/build-rt.sh opencl -j 6`.
-- `editorrequest-test` covers every intent, the compatibility mask, the
-  producer-provided execution set, coalescing, the typed/mask mapper lookup,
-  the producer event-key uniqueness (`checkProducerEventKey`), the fast-path
-  fact refresh (`checkFastPathAugmentation`), the viewport facts and the
-  admission/LUT selections (`checkViewportFacts`, `checkViewportAdmission`),
-  the crop reallocation work order (`checkCropReallocationWorkOrder`), the
-  tool-to-intent wiring (`checkConvertedProducerIntents`) and the producer
-  source scan (`checkNoLegacyProducerCalls`, 358 files and 442 live typed
-  calls).
-- Viewport admission: `viewport-admission-test` replays the retired mask gate
-  against the typed policy over 1 048 576 masks, 1 336 request shapes,
-  42 parameter-veto states and 32 admission states (1 795 584 fallback
-  comparisons and 1 050 201 selection comparisons) with zero divergence; a
-  deliberately introduced policy drift produced 33 025 failures.
-- All 18 stage test executables (the 17 existing plus
-  `viewport-admission-test`) pass in both build directories.
-- Preview sweep: `preview-work-order-sweep` reports 16 states and `AE=0` for
-  both `preview.tif` and `work.tif` in every state.
+- `editorrequest-test` covers the recorded decision table for every intent,
+  the producer-provided execution set, coalescing, the registry lookup for
+  dynamic and static events, the producer event-key uniqueness, the
+  augmentations, the crop reallocation work order, the tool-to-intent wiring
+  and the producer source scan (358 files, 443 typed calls). It also runs the
+  mask-reintroduction guard over 663 engine, GUI and tool sources: no retired
+  unit, constant, helper or integer `newEvent` action is present.
+- Viewport admission: `viewport-admission-test` checks the recorded eligibility,
+  LUT and crop decision for every intent, the producer block envelope, the
+  coalescing rule and the parameter-veto matrix (42 parameter states x 32
+  admission states = 1 344 comparisons).
+- All 16 stage test executables pass in the CPU build; the OpenCL build
+  compiles the engine, CLI and GUI.
+- Preview sweep: `preview-work-order-sweep` runs its state sequence with
+  `AE=0` for `preview.tif` and `work.tif`.
 - Fast path on: `preview-work-order-sweep --fast-path` reports 5 fast hits and
-  5 deferred analyses for the 5 eligible states, one initial fallback, and
-  `AE=0` for `preview.tif`, `work.tif` and the visible `crop-main.tif` in every
-  state. At fit zoom the immediate crop cost is p50 52.0 ms / p95 56.0 ms
-  over 19 hits against a p50 373.2 ms / p95 386.3 ms forced full render over
-  20 samples
-  (10.2 MP PEF, `OMP_NUM_THREADS=1`). The GUI check is recorded as not run in
-  `VIEWPORT_FAST_PATH.md`.
+  5 deferred analyses, one initial fallback, and `AE=0` for `preview.tif`,
+  `work.tif` and the visible `crop-main.tif` in all 6 states.
 - Crop: `crop-stage-test --sequences --extra-states` reports `48 plans
-  executed, 0 plan fallbacks, 48 dirty derivations`, and every static and
-  incremental state is `AE=0` with `OMP_NUM_THREADS=1`, including
-  `highqual-refill` and `highqual-dehaze`. Both high-quality states also stay
-  `AE=0` with default threads across three runs. The only states that move
-  there are the known thread-noise cases: `seq fattal` (`AE=1`, 133-1332
-  differing bytes over three runs) and intermittently `fit` (1-3 bytes, max
-  delta 1). Both compare two renders of identical parameters, and `seq fattal`
-  reproduces without the derived-curve change. `--stages` passes with `AE=0`.
-- Export: the graph export is `AE=0` against the neutral export of the same
-  binary and reports the 20-node inventory; the thread matrix is `AE=0` at 2
-  and 4 threads. The cross-branch `baseline-dev` comparison and 8-thread
-  determinism are environment-limited on this host: the graph build's data
-  directory (`/usr/local/share/rawtherapee-graph`) is not installed, so the
-  binary logs `The bundled profile ... could not be found! ... Default
-  internal values will be used instead` while the baseline binary resolves the
-  installed `rawtherapee` data. The baseline difference (30369998 samples) and
-  the 8-thread delta (19 samples, max delta 5) both reproduce byte-identically
-  without this change.
+  executed, 0 plan fallbacks, 48 dirty derivations`, and every state is
+  `AE=0` with `OMP_NUM_THREADS=1`. `--stages` reports `6 plans executed, 0
+  plan fallbacks, 6 dirty derivations` with `AE=0`.
+- Export: the neutral and sidecar exports are `AE=0` against the pre-change
+  binary built from the same commit, and the graph export is `AE=0` against
+  the neutral export. The `baseline-dev` comparison and the 8-thread result
+  are not parity evidence here: `baseline-dev` is 158 commits older, and the
+  8-thread delta is the known host float-order variation.
 - Thumbnail: `thumbnail-stage-test` reports `PASS` for the embedded and raw
   paths.
-- Node cache: `stage-node-cache-test` passes unchanged in both builds.
+- Node cache: `stage-node-cache-test` passes in both builds. Base cache:
+  `preview-base-cache-test` passes.
 - Control edit timing on the 10.2 MP PEF with its sidecar,
-  `OMP_NUM_THREADS=1`, 40 samples per side, parent source and this change
-  built in the same build tree: parent p50 243.5 ms and 247.7 ms in two runs,
-  this change p50 244.7 ms and 244.0 ms. The parent's own run-to-run spread is
-  about 1.7%, so the difference is inside noise.
+  `OMP_NUM_THREADS=1`, 10 samples per side: the exact typed order p50
+  374.4 ms (min 369.3, max 379.4) against the conservative fallback p50
+  475.4 ms (min 469.3, max 487.0).
+- The cross-branch `baseline-dev` export differs because it is an older
+  commit (5.13-158-g15390b0f), not because of this migration; the pre-change
+  binary from this commit is byte-identical.
 
 
 

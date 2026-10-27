@@ -144,7 +144,7 @@ bool paramFamilyChanged(const WorkInputs& inputs,
  * Whether colour management changed in a way that rebuilds the base.
  *
  * The output profile, intent and black-point compensation are monitor-sink
- * inputs (`EvOProfile` maps to M_MONITOR), while the working space is read by
+ * inputs (`EvOProfile` maps to the monitor family), while the working space is read by
  * getImage(). Comparing the whole `icm` member would name the base for an
  * output-profile edit that the legacy gate does not rebuild.
  */
@@ -180,7 +180,7 @@ bool baseIcmChanged(const WorkInputs& inputs)
  * `str` is read only as a guard (`str != 0` selects whether the gamma stage
  * runs), and `retinex()` repeats the same guard. A strength edit therefore
  * changes nothing the buffers hold unless it crosses zero, and the editor
- * sends `RETINEX` for it, which carries no `M_RAW`: naming the demosaic body
+ * sends `RETINEX` for it, which carries no `the raw family`: naming the demosaic body
  * there would be a typed-only run that re-demosaics planes the legacy pass
  * keeps. It stays out, like the pre-existing legacy gap it is.
  */
@@ -203,7 +203,7 @@ bool retinexBufferInputsChanged(const WorkInputs& inputs)
  *
  * The body reads `Tc.hrenabled` for the Lab-mode gamut control
  * (rawimagesource.cc:2458), so a highlight-recovery toggle changes the retinex
- * output. The editor sends ALLNORAW for it, which carries `M_INIT` and makes
+ * output. The editor sends ALLNORAW for it, which carries `the init family` and makes
  * the legacy preparation re-run, so naming it is not a typed-only run.
  */
 bool retinexHighlightChanged(const WorkInputs& inputs)
@@ -250,10 +250,10 @@ void setAll(WorkOrder& order, std::initializer_list<WorkItem> items)
 /*
  * Whether a request carries the destructive raw reload bits.
  *
- * FullPreview and FullCrop stand for `M_INIT | M_LINDENOISE | M_HDR`, the
- * legacy reload gate. HighQuality stands for `M_HIGHQUAL`, which asks for the
+ * FullPreview and FullCrop stand for `the init family | the line-denoise family | the HDR family`, the
+ * legacy reload gate. HighQuality stands for `the high-quality request`, which asks for the
  * accurate chain but is not part of that gate: the preview maps a bare
- * M_HIGHQUAL request to it (imagearea.cc:809) and the crop does the same, so a
+ * the high-quality request request to it (imagearea.cc:809) and the crop does the same, so a
  * HighQuality-only pass must not be treated as a raw reload.
  */
 bool requestReloadsRaw(RequestKind kind)
@@ -413,8 +413,8 @@ WorkOrder derive_preview_work(const WorkInputs& inputs)
 
     /*
      * A reload request is absolute, not a delta. The legacy request bits are
-     * M_INIT, M_LINDENOISE and M_HDR, which the caller folds into FullPreview
-     * or FullCrop. M_HIGHQUAL is a separate request: it asks for the accurate
+     * the init family, the line-denoise family and the HDR family, which the caller folds into FullPreview
+     * or FullCrop. the high-quality request is a separate request: it asks for the accurate
      * chain, and the legacy base gate does not consult it, so HighQuality is
      * deliberately not a raw reload here.
      */
@@ -433,7 +433,7 @@ WorkOrder derive_preview_work(const WorkInputs& inputs)
      * caller substitutes the FAST method in the pass's RAWParams, while at
      * 100% the configured method runs. Dropping the decision therefore needs
      * a fresh demosaic even though no ProcParams field moved, and every
-     * crossing queues a full request that carries M_RAW. The pending-work
+     * crossing queues a full request that carries the raw family. The pending-work
      * fields above only cover the direction that gains high detail.
      */
     const bool highDetailModeChanged =
@@ -442,9 +442,9 @@ WorkOrder derive_preview_work(const WorkInputs& inputs)
     /*
      * source.select and raw.preprocess move together: rawWorkRuns() feeds
      * both. A selected-frame change (`raw.bayersensor.imageNum`) is a
-     * DARKFRAME event, which also sets M_PREPROC and M_RAW, so it regenerates
+     * DARKFRAME event, which also sets the preprocess family and the raw family, so it regenerates
      * the source selection and the preprocessed planes. A rebuild request is
-     * not a disjunct: RequestKind folds M_INIT/M_LINDENOISE/M_HDR into
+     * not a disjunct: RequestKind folds the init family/the line-denoise family/the HDR family into
      * FullPreview/FullCrop, and those bits rebuild the base without selecting
      * or preprocessing the source.
      */
@@ -462,12 +462,12 @@ WorkOrder derive_preview_work(const WorkInputs& inputs)
 
     /*
      * The caller's Color/Coloropp white-balance augmentation is a mask fact:
-     * `M_WB` plus the recovery method, folded by the caller before the pass
+     * `the white-balance family` plus the recovery method, folded by the caller before the pass
      * (improccoordinator.cc:4610-4618). getImage() applies the opposed
      * recovery with the current white-balance multipliers and marks the planes
      * recovered, so that request needs fresh demosaic planes. The `wb` family
      * delta alone is not enough: the same delta can arrive in a pass whose mask
-     * does not carry M_WB (a caller re-sending a value the previous pass
+     * does not carry the white-balance family (a caller re-sending a value the previous pass
      * normalised), and naming the body then would be a typed-only run.
      */
     const bool hlrWbDemosaic = inputs.colorHlrWbRequest
@@ -493,13 +493,13 @@ WorkOrder derive_preview_work(const WorkInputs& inputs)
      * pending high-detail demosaic, the colour highlight-recovery condition of
      * a modified RGB source, the retinex plane work, and the forward edges from
      * a selected frame or a preprocessed source. Every DARKFRAME/FLATFIELD
-     * event sets M_RAW as well as M_PREPROC, so a preprocess change also runs
+     * event sets the raw family as well as the preprocess family, so a preprocess change also runs
      * the demosaic gate.
      *
      * Capture sharpening modifies the demosaiced planes in place, so the body
      * must run not only when the tool becomes enabled but also when it becomes
      * disabled: only a fresh demosaic removes the sharpening the previous pass
-     * left in the planes. The legacy DEMOSAIC event carries M_RAW in both
+     * left in the planes. The legacy DEMOSAIC event carries the raw family in both
      * directions. A pdsharpening-only delta while the tool was and is disabled
      * still leaves the body un-named, because the planes are unchanged; that
      * legacy-only remainder is redundant work.
@@ -531,7 +531,7 @@ WorkOrder derive_preview_work(const WorkInputs& inputs)
      * buffers are converted with the working-space matrix), and when a retinex
      * member the preparation reads moves (the buffer layout, the forward gamma
      * table and its `gam`/`slope` inputs). The legacy DEMOSAIC event carries
-     * M_RAW in each of those cases. A retinex strength edit carries M_RETINEX
+     * the raw family in each of those cases. A retinex strength edit carries the retinex family
      * instead and reuses the existing buffers, so it must not name the
      * demosaic body.
      */
@@ -554,7 +554,7 @@ WorkOrder derive_preview_work(const WorkInputs& inputs)
      * rebuilding families. A preprocess or a demosaic regenerates the planes
      * the base consumes (the forward-edge rule of stage_dirty_blocks.h,
      * close_dirty_blocks). `dirpyrDenoise` is one of the families because the
-     * legacy base gate includes M_LINDENOISE. A HighQuality-only request is not
+     * legacy base gate includes the line-denoise family. A HighQuality-only request is not
      * a rebuild: `rawReload` excludes it.
      */
     const bool base = preprocess || demosaic || wbChanged
@@ -567,7 +567,7 @@ WorkOrder derive_preview_work(const WorkInputs& inputs)
         || rawReload;
 
     /*
-     * A spot delta does not rebuild the base: the legacy M_SPOT bit only
+     * A spot delta does not rebuild the base: the legacy the spot family bit only
      * enters the spot gates inside raw.base and the buffer restore. The
      * request fact `spotPending` already carries the enabled/entries test.
      */
@@ -599,7 +599,7 @@ WorkOrder derive_preview_work(const WorkInputs& inputs)
      * planes with the working-space matrix and back, and `retinex()` converts
      * them back with its inverse), or when the highlight-recovery flag moves
      * (`retinex()` reads it for the Lab-mode gamut control). A white-balance
-     * M_INIT regenerates none of those and is not read by the preparation, so
+     * the init family regenerates none of those and is not read by the preparation, so
      * it stays legacy-only redundant work.
      */
     if (retinexEnabled
@@ -622,7 +622,7 @@ WorkOrder derive_preview_work(const WorkInputs& inputs)
      * needed when the buffer path ran or a buffer is still live. A live buffer
      * is also named when the tool is now disabled: the buffer-maintenance site
      * clears it, and the copy-back then finds no buffer. Naming that state is
-     * what lets the site stop reading M_SPOT.
+     * what lets the site stop reading the spot family.
      */
     if (current.spotBufferLive || (spotApply && !base)) {
         order.set(WorkItem::spotRestore);
@@ -674,12 +674,12 @@ WorkOrder derive_crop_work(const WorkInputs& inputs)
 
     /*
      * The destructive bodies share the reload request. The crop folds
-     * `M_INIT | M_LINDENOISE | M_HDR` into RequestKind::FullCrop before it
+     * `the init family | the line-denoise family | the HDR family` into RequestKind::FullCrop before it
      * builds the key; that fold is the only mask-derived fact the derivation
      * reads. A source reload or a high-detail transition reaches the crop
      * through the same bits, so it is not an independent disjunct here; the
      * dirty-block derivation models those render-state aspects separately.
-     * HighQuality maps M_HIGHQUAL, which the reload request does not carry,
+     * HighQuality maps the high-quality request, which the reload request does not carry,
      * and is therefore not a reload. No history means the first update, which
      * runs the full destructive set.
      */
@@ -696,7 +696,7 @@ WorkOrder derive_crop_work(const WorkInputs& inputs)
     }
 
     /*
-     * The direct base path applies the spots itself (M_SPOT inside the reload
+     * The direct base path applies the spots itself (the spot family inside the reload
      * branch); without a reload the spot buffer path runs and is then swapped
      * into place.
      */

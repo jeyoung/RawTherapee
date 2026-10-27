@@ -18,14 +18,14 @@ preview.
 This implementation covers requests that cannot change the base image or the
 full-frame analysis inputs:
 
-- `M_AUTOEXP`, `M_RGBCURVE`, `M_LUMACURVE`, `M_LUMINANCE`, `M_COLOR`,
-  `M_CROP` and `M_MINUPDATE`;
-- `M_HDR` and `M_SPOT` may appear because several GUI events over-approximate
-  with them, but only when the corresponding parameters are unchanged. Active
-  Fattal, dehaze or spot removal is rejected, because the normal path would
-  re-apply those filters.
+- the auto-exposure, RGB-curve, luminance-curve, Lab-pixel, crop and
+  repaint families;
+- the HDR and spot families may appear because several GUI events
+  over-approximate with them, but only when the corresponding parameters are
+  unchanged. Active Fattal, dehaze or spot removal is rejected, because the
+  normal path would re-apply those filters.
 
-The transform-stage family (`M_TRANSFORM`) is not promoted. `Crop::update()`
+The transform family is not promoted. `Crop::update()`
 does render ROI transforms, but the full validation could not be completed
 with the available headless GUI tooling, so the gate stays closed and the
 follow-up is recorded below.
@@ -42,17 +42,15 @@ and the two snapshots, and calls `viewportFastPathFallback()` in
 `editorrequest.cc`. That function is the whole policy:
 
 - the request family is classified by `viewportEligibility()`: a request
-  carrying a base-chain fact (`M_PREPROC`, `M_RAW`, `M_WB`, `M_INIT`,
-  `M_LINDENOISE`, `M_MONITOR`, `M_TRANSFORM`, `M_CSHARP`, `M_RETINEX`,
-  `M_BLURMAP`) or the high-detail fact is a **base request**
-  (`base-request`); a request carrying the control bit (`M_VOID`) is
-  **unsupported** (`unsupported-request`); everything else is admitted. A
-  producer-provided dirty set must also stay inside the delta chain: a base
-  block (`source.select`, `raw.preprocess`, `raw.demosaic`, `raw.base`,
-  `analysis`, `transform`) makes it a base request and an unknown block makes
-  it unsupported. A request kind is used the same way the mask was: an absent
-  accumulator is unsupported, and `M_HDR` alone stays admissible because GUI
-  events over-approximate with it;
+  carrying a base-chain fact (preprocess, raw, white balance, init, line
+  denoise, monitor, transform, capture sharpening, retinex or blur map) or the
+  high-detail fact is a **base request** (`base-request`); a control-only
+  request is **unsupported** (`unsupported-request`); everything else is
+  admitted. A producer-provided dirty set must also stay inside the delta
+  chain: a base block (`source.select`, `raw.preprocess`, `raw.demosaic`,
+  `raw.base`, `analysis`, `transform`) makes it a base request and an unknown
+  block makes it unsupported. An absent accumulator is unsupported, and an HDR
+  request alone stays admissible because GUI events over-approximate with it;
 - the parameter vetoes are unchanged and keep their order and reason strings:
   auto exposure, histogram matching, auto B&W, auto colour-toning, CIE,
   Local Lab, non-zero Lab contrast, active Fattal/dehaze/spot removal, every
@@ -60,9 +58,9 @@ and the two snapshots, and calls `viewportFastPathFallback()` in
   and the auto flags, and a tone/Lab/wavelet LUT input that changed without its
   request family.
 
-The fallback reasons are the ones the mask-based gate reported, so a profile
-log stays comparable. The pre-retirement gate is kept as a test-local oracle in
-`viewport_admission_test.cc`; it is not part of the engine.
+The fallback reasons keep their historical strings, so a profile log stays
+comparable. `viewport_admission_test.cc` checks recorded decisions per intent
+and the parameter matrix; it has no mask oracle.
 
 White balance is compared against the pre-pass copy on purpose. The normal
 full pass normalises `wb.green` into the rendering parameters; the GUI keeps
@@ -77,10 +75,10 @@ because white balance is a deterministic function of it.
 
 | Selection | Request family | Rebuilds |
 |---|---|---|
-| `toneCurves` | `M_RGBCURVE` or `M_CROP` | `complexCurve`, `RGBCurve`, colour-toning LUTs, B&W curves, custom curves |
-| `labCurves` | `M_LUMACURVE` | lumacurve, `clcurve`, `complexsgnCurve` |
-| `lumaCurveFromCrop` | `M_CROP` | lumacurve only, from the zero histogram |
-| `wavelet` | `M_LUMINANCE`, `M_COLOR` or `M_AUTOEXP` | `wavclCurve` |
+| `toneCurves` | RGB curve or crop | `complexCurve`, `RGBCurve`, colour-toning LUTs, B&W curves, custom curves |
+| `labCurves` | luminance curve | lumacurve, `clcurve`, `complexsgnCurve` |
+| `lumaCurveFromCrop` | crop | lumacurve only, from the zero histogram |
+| `wavelet` | Lab pixel or auto exposure | `wavclCurve` |
 
 `rebuildsLumaCurve()` is "`labCurves` or `lumaCurveFromCrop`". The snapshot
 update takes the same selection, so a crop repaint rebuilds lumacurve but does
@@ -96,10 +94,8 @@ in `stageRgbProc()` and `stageLabTools()` use `toneOnly()`, `labOnly()` and
 3. The crop selection (`viewportCropSelection()`) is taken from the augmented
    request. `resolveCropDependencies()` expresses the one dependency the old
    code wrote as a mask OR: a luminance-curve or auto-exposure edit reaches
-   the crop's Lab pixel tools only through `M_LUMINANCE|M_COLOR`, so both bits
-   are implied. `viewportCropTodo()` is the `todo` argument Crop::update()
-   reads and `viewportCropPayload()` is its execution mask; no mask arithmetic
-   is left at the call site.
+   the crop's Lab pixel tools, so both families are implied. `Crop::update()`
+   reads the typed request directly; there is no todo or execution mask.
 4. Crops with a listener are updated immediately. This is the only work the
    interaction pays for.
 5. The analysis stages the hit skipped are accumulated as a typed
@@ -142,11 +138,10 @@ while the pass was running.
 - `viewportCropRenderReusable()` allows the deferred pass to skip the crop
   render only while the burst contains a single hit.
 
-The old `viewportDeferredMask()` and the `deferredAnalysisMask` render-state
-field are deleted. A deferred flush still carries an opaque execution payload
-(`deferredExecutionPayload()`) because unconverted block bodies read it, but
-the payload is derived once from the typed stage bits and never decides the
-schedule. The deferral therefore cannot add a source or raw block.
+The old `viewportDeferredMask()` and the deferred analysis mask are deleted.
+A deferred flush carries the typed stage facts through
+`EditorRequest::absorbDeferredExecution()`, so the schedule and the bodies read
+the same facts. The deferral cannot add a source or raw block.
 
 | Setting | Default | Unit | Range | Purpose |
 |---|---:|---|---|---|
@@ -182,9 +177,9 @@ The fast path has two snapshots:
 State is invalidated on image switch (`assign()`), `freeAll()`, destruction,
 `stopProcessing()`, and `setScale()` dimension or scale changes. It also
 becomes invalid whenever a request bypasses the fast path with a missing or
-mismatched base snapshot. In that case the request is augmented with
-`M_INIT | M_HDR | M_MONITOR` (and `M_SPOT` when spot parameters differ),
-forcing a real base/analysis rebuild rather than marking stale state valid.
+mismatched base snapshot. In that case `markBaseRefresh()` adds the init, HDR
+and monitor families (and spot when the spot parameters differ), forcing a
+real base/analysis rebuild rather than marking stale state valid.
 
 `viewportStateValid`, `viewportHighDetail`, `forceFullPreview`,
 `viewportDeferredRequest` and `deferredCropRendered` are atomic. The state is
@@ -199,9 +194,9 @@ source planes remain valid.
 With `RT_PREVIEW_PROFILE=1` each completed request reports one of:
 
 ```text
-preview update: 40 ms todo=0x1009f cache=0 viewport=fast crop_ms=39 deferred_stages=0xff deferred_hits=3
-preview update: 92 ms todo=0x1005f cache=0 viewport=deferred-analysis
-preview update: 113 ms todo=0x1009f cache=0 viewport=fallback reason=switch-off
+preview update: 40 ms kind=2 request=6f1c... cache=0 viewport=fast crop_ms=39 deferred_stages=0x7f deferred_hits=3
+preview update: 92 ms kind=2 request=2a04... cache=0 viewport=deferred-analysis
+preview update: 113 ms kind=2 request=8b77... cache=0 viewport=fallback reason=switch-off
 ```
 
 `deferred_stages` is the `DeferredStage` bit set the hit queued (`0xff` is the
@@ -217,23 +212,14 @@ crops again. Fallback reasons include `no-complete-full-state`, `base-request`,
 ### Typed admission and LUT selection
 
 The decision-table replay is `viewport-admission-test`
-(`rtengine/stage/tests/viewport_admission_test.cc`). It keeps the
-pre-retirement mask gate as a local oracle and requires an identical decision,
-an identical fallback reason and an identical LUT/crop selection on every
-case. A deliberately introduced drift in the typed policy produced 33 025
-failures, so the replay is not vacuous.
+(`rtengine/stage/tests/viewport_admission_test.cc`). It records the
+eligibility, fallback reason and LUT/crop selection every intent must produce,
+plus the producer block envelope and the coalescing rule. Its parameter matrix
+crosses 42 parameter-veto states with 32 admission states.
 
-| Matrix | Cases |
-|---|---:|
-| Every mask the adapter accepts (21 bits, contract violations excluded) | 1 048 576 |
-| Request shapes: 17 intents, every intent pair (289), every reachable kind × family subset, the deferred flush and the coordinator augmentations | 1 336 |
-| Selection comparisons (exhaustive masks plus shapes) | 1 050 201 |
-| Parameter-veto states × admission states × shapes (42 × 32 × 1 336) | 1 795 584 |
-
-All 18 stage test executables pass in both build directories (the 17 existing
-ones plus `viewport-admission-test`). Both configurations compile:
-`build/cpu-perf-graph-retire` and `build/opencl-perf-graph-retire`
-(`WITH_OPENCL=ON`).
+All 16 stage test executables pass in the CPU build. Both configurations
+compile: `build/cpu-perf-graph-retire` and
+`build/opencl-perf-graph-retire` (`WITH_OPENCL=ON`).
 
 ### Fast-path-on harness
 
@@ -322,7 +308,7 @@ and a fresh settings directory:
 ### Deferred analysis (issue #23)
 
 Unit test: `tools/perf/test-fast-preview.sh build/cpu-issue-23-viewport-defer`
-PASS, covering the deferred mask, the deadline cap, and the single-hit crop
+PASS, covering the deferred record, the deadline cap, and the single-hit crop
 reuse rule. The OpenCL build passed `tools/opencl/verify.sh --quick` on the
 AMD Radeon RX 550: `pef/neutral max_pae=1.5259e-05` and the monitor self-test
 (1 byte, 14 of 196608 samples).
@@ -404,20 +390,20 @@ with `verify.sh --quick` as above.
 
 ## Known limitations and follow-ups
 
-- Promote `M_TRANSFORM` once ROI-transform parity is validated on the GUI.
-  The crop path already accepts the bit, but the headless checks could not
+- Promote the transform family once ROI-transform parity is validated on the
+  GUI. The crop path already accepts it, but the headless checks could not
   drive the Lens/Geometry sliders reliably, so the gate remains closed rather
   than accepted unmeasured.
 - Add a cached `lhist16` so non-zero Lab contrast can use the fast path. The
   histogram is built from `oprevl` after `rgbProc()`, so it includes the tone
   curve; a cached copy is only exact for Lab-only edits and needs a
-  `rgbProc()` refresh when the request also carries `M_RGBCURVE`.
+  `rgbProc()` refresh when the request also carries the RGB curve family.
 - Handle active Fattal/dehaze/spot correctly rather than falling back.
 - Validate crop ROI moves, panning/zooming cache reuse and detail windows on a
   wider image set, including OpenCL.
 - Validate the spot-reset and base-refresh path and add an automated
   fast-on/off regression for it.
-- Evaluate whether the deferred pass can skip `M_AUTOEXP` entirely when the
+- Evaluate whether the deferred pass can skip the auto-exposure family when the
   corresponding auto flags are off.
 - Progressive crop resolution during a drag is not implemented. It would
   multiply `CropHandler::getWindow()`'s skip while a gesture is active and
@@ -428,6 +414,6 @@ with `verify.sh --quick` as above.
 
 The per-tab FAST preview toggle and a 100% zoom crossing change the effective
 `highDetailNeeded`. The coordinator invalidates the viewport state and queues
-`ALL | M_MONITOR` when the effective full/fast result changes, so a cache entry
+the first/whole-preview request when the effective full/fast result changes, so a cache entry
 from the other mode is never reused. A no-op transition does not queue a
 render. See `devnotes/perf/FAST_PREVIEW_TOGGLE.md`.

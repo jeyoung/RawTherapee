@@ -79,8 +79,8 @@ namespace rtengine::stage
  * - A member that genuinely feeds two bodies is listed in both consumer
  *   groups. The shared members are `raw.bayersensor.border` and `raw.expos`
  *   (preprocess and demosaic). `raw.bayersensor.method` also reaches the
- *   preprocess green-equilibration guard, but the legacy M_PREPROC family does
- *   not carry M_RAW and does not re-preprocess on a method edit; preprocess
+ *   preprocess green-equilibration guard, but the legacy the preprocess family family does
+ *   not carry the raw family and does not re-preprocess on a method edit; preprocess
  *   therefore omits it and the demosaic consumer owns it. That is a bounded
  *   subset of the body's ideal inputs, chosen to match the gate the order
  *   describes, not a typed-only superset.
@@ -288,7 +288,7 @@ struct WorkInputs {
     /* Current parameters; required, borrowed. */
     const procparams::ProcParams* params = nullptr;
     /*
-     * The pass mask carries the `M_WB` request bit. This is a request fact of
+     * The pass mask carries the `the white-balance family` request bit. This is a request fact of
      * the same kind as RequestKind: the caller folds it at the boundary
      * because the mask is never an input. It exists for the caller's
      * Color/Coloropp white-balance augmentation, which sets `DEMOSAIC` before
@@ -314,15 +314,15 @@ struct WorkInputs {
  * `requestKind == FullPreview || FullCrop`. A high-detail decision change also
  * changes the demosaic mode (the caller substitutes the FAST method below
  * 100%), so both directions name rawDemosaic; the mask-level zoom request
- * carries `M_RAW` for exactly that reason.
+ * carries `the raw family` for exactly that reason.
  *
  * - sourceSelect: `preprocess`, below. Replaces `rawWorkRuns()` at
  *   improccoordinator.cc:1346, called from stageSourceSelect at :1531. Fed by
- *   the `raw.preprocess` and `source.select` blocks (the `M_PREPROC` row of
- *   stage_mask_map.cc:87) and by the Source and HighDetail aspects. A rebuild
- *   request is deliberately not a disjunct: `M_INIT` and `M_LINDENOISE`
+ *   the `raw.preprocess` and `source.select` blocks (the `the preprocess family` row of
+ *   the retired mask map:87) and by the Source and HighDetail aspects. A rebuild
+ *   request is deliberately not a disjunct: `the init family` and `the line-denoise family`
  *   rebuild the base without selecting or preprocessing the source. Legacy-only
- *   remainder: a mask event that carries `M_PREPROC` but moves neither the
+ *   remainder: a mask event that carries `the preprocess family` but moves neither the
  *   frame number nor a source fact (for example the DARKFRAME-tagged Clamp OOG
  *   toggle, rtgui/tools/tonecurve.cc:44) calls `setCurrentFrame()` with the
  *   frame already loaded; that method marks the source only when the frame
@@ -339,16 +339,16 @@ struct WorkInputs {
  *   Replaces `rawSourceWorkRuns()`, now
  *   `ImProcCoordinator::stageRawDemosaic()` at improccoordinator.cc:1544,
  *   called from the pass plan at :4372. Fed by the `raw.demosaic` block
- *   (`M_RAW` and `M_CSHARP` rows, stage_mask_map.cc:89-92), the forward edges
+ *   (`the raw family` and `the capture-sharpening family` rows, the retired mask map:89-92), the forward edges
  *   from the selected frame and the preprocessed planes (every
- *   DARKFRAME/FLATFIELD event also sets M_RAW), the HighDetail aspect, and the
+ *   DARKFRAME/FLATFIELD event also sets the raw family), the HighDetail aspect, and the
  *   parameter/`rgbSourceModified` pair of the colour highlight-recovery
  *   condition. Capture sharpening is inside the same body:
  *   it modifies the demosaiced planes in place, so `captureSharpening` is a
  *   `pdsharpening` delta while the tool is enabled *or* was enabled in the
  *   previous pass. Disabling it must re-run the demosaic to remove the
  *   sharpening the planes still carry, and the legacy DEMOSAIC event carries
- *   `M_RAW` in that direction too. `retinexPlanes` names the body for the
+ *   `the raw family` in that direction too. `retinexPlanes` names the body for the
  *   retinex buffer preparation that lives at the end of it: the buffers must
  *   be built when retinex is newly enabled, removed when it is disabled (only
  *   a fresh demosaic discards the retinex output written into the planes),
@@ -358,11 +358,11 @@ struct WorkInputs {
  *   chooses the buffer layout from the colour space and writes the forward
  *   gamma into the planes, so the existing buffers would otherwise describe
  *   the previous colour space or gamma while `retinex()` consumes them with
- *   the new parameters. A bare retinex strength edit carries `M_RETINEX` and
+ *   the new parameters. A bare retinex strength edit carries `the retinex family` and
  *   reuses the buffers, so it is not a disjunct. A rebuild request is not a
  *   disjunct for the same reason as sourceSelect.
  *   `hlrWbDemosaic` mirrors the caller's Color/Coloropp white-balance
- *   augmentation (the `M_WB` request fact, recovery enabled and method
+ *   augmentation (the `the white-balance family` request fact, recovery enabled and method
  *   `Coloropp`): getImage() applies the opposed recovery with the current
  *   white-balance multipliers and marks the planes recovered, so only fresh
  *   demosaic planes let the new multipliers take effect. It is pixel-affecting
@@ -379,18 +379,18 @@ struct WorkInputs {
  *   rawReload`. Replaces `baseRebuildRuns()` (improccoordinator.cc:1379), the
  *   `stageRawBase` branch at :1694, the `getImage()` call at :2064 and the
  *   first analysis at :2185. `family(dirpyrDenoise)` is included because the
- *   legacy base gate carries `M_LINDENOISE`; the raw families reach the base
+ *   legacy base gate carries `the line-denoise family`; the raw families reach the base
  *   through the preprocess/demosaic forward edges and are not compared twice.
  *   `family(spot)` is excluded: a spot delta does not rebuild the base.
  *   `family(icm)` ignores the three output-profile fields, because
  *   `EvOProfile` only dirties the monitor sink. `rawReload` excludes
- *   `HighQuality`: `M_HIGHQUAL` is not part of the legacy base gate, and a
- *   bare M_HIGHQUAL request is a real pass (imagearea.cc:809), not a
+ *   `HighQuality`: `the high-quality request` is not part of the legacy base gate, and a
+ *   bare the high-quality request request is a real pass (imagearea.cc:809), not a
  *   theoretical one. `spotBufferLive` is not a disjunct either: a live buffer
  *   forces the restore, not the destructive body.
  * - retinexPrepare: `params.retinex.enabled && (family(retinex) ||
  *   preprocess || demosaic || icm-without-output || retinexHighlight)`.
- *   Replaces the gate at improccoordinator.cc:1719 (`M_RETINEX | M_INIT` plus
+ *   Replaces the gate at improccoordinator.cc:1719 (`the retinex family | the init family` plus
  *   the enabled check).
  *   Retinex rewrites the shared raw planes, so it is named when its own
  *   parameters move or when a step that regenerates those planes runs. The
@@ -400,8 +400,8 @@ struct WorkInputs {
  *   `icm-without-output` names it even when the planes did not move.
  *   `retinexHighlight` is a `toneCurve.hrenabled` delta: `retinex()` reads the
  *   flag for the Lab-mode gamut control, and the editor's ALLNORAW action
- *   carries `M_INIT`, so the legacy gate re-runs the preparation too.
- *   A white-balance-only `M_INIT` does not regenerate the planes and the
+ *   carries `the init family`, so the legacy gate re-runs the preparation too.
+ *   A white-balance-only `the init family` does not regenerate the planes and the
  *   preparation does not read the white balance (getImage() applies the
  *   multipliers afterwards), so that remainder is redundant work.
  * - spotApply: `spotPending || (spotsConfigured && family(spot))`. Replaces
@@ -409,7 +409,7 @@ struct WorkInputs {
  *   the request fact carried by the key; the family delta is the parameter
  *   half. When a base rebuild runs, the spots are removed from the freshly
  *   rebuilt image even if their parameters did not move, but that case is
- *   already carried by `spotPending` for an M_SPOT request. Fed by the `spot`
+ *   already carried by `spotPending` for an the spot family request. Fed by the `spot`
  *   family and by the Derived aspect.
  * - spotRestore: `spotBufferLive || (spotApply && !base)`. Replaces the
  *   copy-back gate at improccoordinator.cc:2207. The live-buffer disjunct is
@@ -419,18 +419,18 @@ struct WorkInputs {
  *   when the base did not run. A live buffer whose tool is now disabled is
  *   named by the same disjunct: the buffer-maintenance site clears it, and
  *   the copy-back that follows finds no buffer. Naming the clear is what lets
- *   the site stop reading `M_SPOT`.
+ *   the site stop reading `the spot family`.
  * - analysisRun: the same predicate as rawBaseRebuild. The preview folds
  *   analysis into raw.base (`isFoldedPreviewNode("analysis")`), so the body
  *   at improccoordinator.cc:2185 runs exactly with the rebuild branch.
  * - denoiseRun: never derived. The preview's directional-pyramid denoise call
- *   is commented out (improccoordinator.cc:2102-2141); `M_LINDENOISE` only
+ *   is commented out (improccoordinator.cc:2102-2141); `the line-denoise family` only
  *   participates through `baseRebuildRuns()`. There is no preview body to
  *   schedule, so this is exact, not a disabled approximation.
  *
  * Remaining typed supersets: none for the edit families the tests and GUI
  * evidence drive. The deliberate legacy-only cases are:
- * - A white-balance `M_INIT` for retinex preparation. The preparation reads
+ * - A white-balance `the init family` for retinex preparation. The preparation reads
  *   the raw planes, the retinex parameters and the working profile, none of
  *   which a white-balance edit moves; getImage() applies the multipliers
  *   later. The job is redundant, not skipped (see retinexPrepare above).
@@ -449,7 +449,7 @@ struct WorkInputs {
  * - A retinex strength edit from zero to non-zero, or back. `str` only selects
  *   whether the preparation applies its forward gamma, and `retinex()` repeats
  *   the same guard, so both paths keep the buffer the last preparation built.
- *   The editor sends `RETINEX`, which does not carry `M_RAW`, so the legacy
+ *   The editor sends `RETINEX`, which does not carry `the raw family`, so the legacy
  *   pass does not re-demosaic either: this is a pre-existing gap shared with
  *   the legacy path, not a divergence, and naming the body would be a
  *   typed-only run.
@@ -464,7 +464,7 @@ struct WorkInputs {
  *   idempotent under the same white balance. The base rebuild and analysis the
  *   event asks for are named separately. The per-item argument is in the
  *   sourceSelect, rawPreprocess and rawDemosaic bullets above.
- * - A high-detail fit transition (`ALL | M_MONITOR` with `highDetailNeeded`
+ * - A high-detail fit transition (`ALL | the monitor family` with `highDetailNeeded`
  *   false after the 100% pass) for sourceSelect and rawPreprocess. Nothing
  *   moved in the source or the preprocessed planes, so the legacy
  *   re-selection and re-preprocess are redundant. rawDemosaic is named by the
@@ -484,7 +484,7 @@ struct WorkInputs {
  * - `viewportMoved`: the preview reports the panning heuristic under this
  *   name, but no raw gate consults it; a repaint keeps the raw buffers.
  * - `cropGuideFingerprint`: guides are an overlay and no stage consumes them.
- * - `deferredAnalysisMask`: the deferred mask carries only monitor and
+ * - `deferredAnalysisRequest`: the deferred request carries only monitor and
  *   curve/Lab bits by construction (improccoordinator.cc:1019-1027), never a
  *   base bit, so it cannot schedule a raw item.
  * - `fastPreviewEnabled`, `mainPreviewFullResolution`, `initialRoughPreview`
@@ -504,13 +504,13 @@ WorkOrder derive_preview_work(const WorkInputs& inputs);
  *
  * Predicates, with the body each decides. `reload` is `!history || rawReload`,
  * where `rawReload` is `requestKind == FullCrop || FullPreview`. The crop folds
- * the reload bits (`M_INIT | M_LINDENOISE | M_HDR`) into
+ * the reload bits (`the init family | the line-denoise family | the HDR family`) into
  * `RequestKind::FullCrop` at dcrop.cc before it builds the key; that request
  * fact is the only way the mask reaches this function. A source reload or a
  * high-detail transition does not add an independent disjunct: it reaches the
  * crop through the same bits, while the dirty-block derivation models the
  * Source and HighDetail render-state aspects separately. `HighQuality` is not a
- * reload: it maps `M_HIGHQUAL`, which no crop gate consults.
+ * reload: it maps `the high-quality request`, which no crop gate consults.
  *
  * - sourceSelect: `reload`. Fed by the Request aspect (the crop's only
  *   mask-derived fact), the Source aspect and the HighDetail aspect.
@@ -523,7 +523,7 @@ WorkOrder derive_preview_work(const WorkInputs& inputs);
  * - rawPreprocess, rawDemosaic: never derived. The crop never preprocesses or
  *   demosaics; it reads the coordinator's source through `getImage()`.
  * - spotApply: `spotPending || (spotsConfigured && family(spot))`.
- *   `spotPending` is `(todo & M_SPOT)` plus the enabled/entries test carried by
+ *   `spotPending` is `(todo & the spot family)` plus the enabled/entries test carried by
  *   the key; that folding is the request fact. The crop has no base rebuild of
  *   its own that would re-apply the spots.
  * - spotRestore: `spotBufferLive || (spotApply && !reload)`. The live-buffer
@@ -549,7 +549,7 @@ WorkOrder derive_preview_work(const WorkInputs& inputs);
  *   crop rebuilds both when the reload bit is present.
  * - `viewportMoved`: `RequestKind::RepaintOnly` already represents it, and a
  *   repaint schedules no destructive job.
- * - `deferredAnalysisMask`, `cropGuideFingerprint`: as on the preview.
+ * - the deferred analysis request, `cropGuideFingerprint`: as on the preview.
  *
  * The mask is never an input. The crop's reload and spot request bits reach
  * this function only through `RequestKind` and `spotPending`, at the boundary

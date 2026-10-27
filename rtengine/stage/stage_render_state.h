@@ -206,7 +206,7 @@ struct RenderStateKey {
      * parameters still name spots; `spotBufferLive` is true when a spot buffer
      * exists, because restoring it changes the next base pass.
      *
-     * `deferredAnalysisMask` was removed from this struct: deferred analysis is
+     * The deferred analysis mask was removed from this struct: deferred analysis is
      * scheduler state that the coordinator now carries as a typed dirty-block
      * record before it builds the key, so it is not a render-state field and
      * does not reach this struct at all.
@@ -219,7 +219,7 @@ struct RenderStateKey {
      * viewport moved and the existing buffers may be reused, not when a repaint
      * must happen now. The preview reports the `panningRelatedChange`
      * heuristic, a ProcParams diff that has no mask bit, and the crop reports
-     * the `M_MINUPDATE` mask bit, which is an imperative repaint request; both
+     * a bare repaint request, which is imperative; both
      * are reported under this one name and the repaint imperative itself stays
      * out of scope.
      *

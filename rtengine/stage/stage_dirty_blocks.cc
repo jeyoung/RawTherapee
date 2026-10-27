@@ -173,7 +173,7 @@ bool isSourceBlock(const std::string& id)
  * - `spotPending` is only turned on by the spot parameter delta, which is
  *   already mapped; the opposite transition carries no parameter delta and is
  *   harmless because no block reads the cleared flag;
- * - `deferredAnalysisMask` is a scheduling fact that the coordinator absorbs
+ * - `deferredAnalysisRequest` is a scheduling fact that the coordinator absorbs
  *   before it builds the key, and it is published from an advisory atomic
  *   snapshot, so it cannot order a dirty set;
  * - `cropGuideFingerprint` names an editor overlay that no stage consumes;
@@ -634,7 +634,7 @@ DirtyBlocks derive_dirty_blocks(const DirtyBlockInputs& inputs)
     /*
      * A rebuild request is absolute, not a delta: this pass has to rebuild the
      * path even when no fingerprint moved. The crop reaches this with the raw
-     * reload bits of the legacy mask (M_INIT, M_LINDENOISE, M_HDR), which no
+     * reload families (init, line denoise and HDR), which no
      * parameter fingerprint can express because the raw stage is reloaded
      * instead of updated in place.
      */
