@@ -1026,3 +1026,135 @@ The test checks:
 
 The OpenCL configuration compiles as well. The map is data only, so no parity
 run applies.
+
+## Preview typed work order
+
+The preview raw-chain gates run from the typed order by default. The order is
+derived once per pass by `rtengine/stage/stage_work.cc` and the shadow
+comparison (`RT_WORK_SHADOW=1`) reports `typedOnly` and `legacyOnly` per pass.
+`RT_WORK_ORDER` is the kill switch: any value leaves the typed order enabled,
+while `0` and `off` (case-insensitive) make the legacy `M_*` gates
+authoritative. Unset is the default and enables the order.
+
+### Sweep
+
+`tools/perf/preview-work-order-sweep.cc` drives the real
+`StagedImageProcessor`/`ImProcCoordinator` through one initial pass and then
+one edit per state, waiting for each full-frame pass to settle. It copies the
+`RT_PREVIEW_DUMP` files (`preview.tif`, `work.tif`, `preview.json`) after every
+state. The viewport fast path is disabled inside the harness
+(`RT_VIEWPORT_FAST=0`) so every state is a full-frame pass and its dump and
+shadow record belong to the same pass. The preview scale is 4, the profile is
+the default, and the fit state uses the FAST preview demosaic so the 100%
+crossing is a real high-detail transition.
+
+```bash
+export RT_BUILD_DIR="$PWD/build/cpu-perf-graph-workflags"
+tools/perf/preview-work-order-sweep.sh \
+    build/rt-testdata/colorspace_flowers.pef \
+    build/test-scratch/work-order-sweep
+```
+
+The driver builds the target, probes the kill switch, runs the sequence with
+`RT_WORK_ORDER=off` and with the default, compares every state with
+`magick compare -metric AE`, and requires `typedOnly=0` on every shadow pass.
+It writes the two run logs and the state dumps under the output directory.
+
+### States and parity
+
+The matrix covers the required families, with the working-profile change
+driven twice (once with retinex enabled and once without) so the retinex buffer
+dependency is exercised in both directions. Fourteen settled passes ran: the
+initial pass plus thirteen states.
+
+| # | State | Action | Preview AE | Work AE |
+|---|-------|--------|-----------:|--------:|
+| 0 | initial | load | 0 | 0 |
+| 1 | spot-add | enable one spot entry, `SPOTADJUST` | 0 | 0 |
+| 2 | spot-remove | clear and disable the spot tool, `SPOTADJUST` | 0 | 0 |
+| 3 | retinex-on | `retinex.enabled = true`, `DEMOSAIC` | 0 | 0 |
+| 4 | workprofile-retinex-on | `Rec2020` -> `ProPhoto`, `DEMOSAIC` | 0 | 0 |
+| 5 | retinex-off | `retinex.enabled = false`, `DEMOSAIC` | 0 | 0 |
+| 6 | workprofile-retinex-off | `ProPhoto` -> `Rec2020`, `DEMOSAIC` | 0 | 0 |
+| 7 | filmneg-on | `filmNegative.enabled = true`, `ALLNORAW` | 0 | 0 |
+| 8 | filmneg-off | `filmNegative.enabled = false`, `ALLNORAW` | 0 | 0 |
+| 9 | capsharp-on | enable capture sharpening, `DEMOSAIC` | 0 | 0 |
+| 10 | capsharp-off | disable capture sharpening, `DEMOSAIC` | 0 | 0 |
+| 11 | zoom-100 | `setMainPreviewFullResolution(true)` | 0 | 0 |
+| 12 | zoom-fit | `setMainPreviewFullResolution(false)` | 0 | 0 |
+| 13 | exposure | `expcomp += 0.7`, `AUTOEXP` | 0 | 0 |
+
+Comparison: ImageMagick 7.1.1-43 Q16, `magick compare -metric AE` on the
+16-bit dumps. `AE=0` for both `preview.tif` and `work.tif` in all fourteen
+states.
+
+The shadow reported `typedOnly=0` on all fourteen passes in both runs. The
+initial pass is reported as `forced-no-history` and is excluded from the
+counts. `legacyOnly` was zero on every pass except two:
+
+| Pass | State | legacyOnly | Resolution |
+|------|-------|------------|------------|
+| 7 | workprofile-retinex-off | `rawDemosaic` | Retinex is already disabled and no demosaic input moved; the legacy `DEMOSAIC` event re-demosaics identical planes. The typed order skips the body. Pixels are identical (AE=0); redundant work. |
+| 13 | zoom-fit | `sourceSelect rawPreprocess` | The fit request re-selects the already-loaded frame and re-preprocesses identical raw and lens-profile inputs. The demosaic **is** named in this direction because the fit pass switches the demosaic mode to FAST. Pixels are identical (AE=0); redundant work. |
+
+### Derivation corrections found by the sweep
+
+Three typed predicates were wrong. The first clean run failed on the retinex
+state with a crash and on the high-detail drop with non-zero AE; the capture
+sharpening disable was corrected in the same change because it is the same
+in-place-body case. The fixes are in `derive_preview_work()`.
+
+1. **Retinex plane preparation.** `retinexPrepareBuffers()` lives at the end
+   of the `raw.demosaic` body, and `retinex()` in `raw.base` consumes the
+   buffers. The typed `rawDemosaic` predicate had no retinex input, so
+   enabling retinex skipped the preparation and crashed in
+   `RawImageSource::retinex()` on an unallocated `conversionBuffer[2]`.
+   Disabling retinex also left its in-place output in the planes. The new
+   `retinexPlanes` term names `rawDemosaic` when retinex is newly enabled,
+   when it is disabled (only a fresh demosaic removes the output), and when
+   the working profile moves while it is enabled (the buffers are converted
+   with the working-space matrix). A bare retinex strength edit carries
+   `M_RETINEX`, reuses the buffers and still does not name the body.
+2. **Capture sharpening disable.** Capture sharpening writes the demosaiced
+   planes in place. The typed predicate named the body only while the tool was
+   currently enabled, so disabling it kept the sharpened planes. It now names
+   the body when either the previous or the current tool state is enabled,
+   matching the legacy `DEMOSAIC` action; the fixed run is `AE=0` for the
+   disable state and every later state.
+3. **High-detail drop.** Below 100% the caller substitutes the FAST demosaic
+   method; at 100% the configured method runs. The typed predicate only named
+   pending high-detail work, which covers the gaining direction. Dropping the
+   decision changed the pixels without naming the body. The `highDetailMode`
+   term names `rawDemosaic` in both directions; the crossing request carries
+   `M_RAW` for exactly that reason.
+
+### Timing
+
+Ten samples per side on the same image, default profile, preview scale 4, fit
+state, `OMP_NUM_THREADS=1`, host CPU build. The host is an Intel Core
+i7-3770 (4C/8T). The control exposure edit rebuilds the base in both modes, so
+no speed-up is expected; the Clamp-OOG toggle is the case where the typed
+order skips the legacy preprocess and demosaic.
+
+| Case | Mode | p50 (ms) | p95 (ms) |
+|------|------|---------:|---------:|
+| exposure `expcomp += 0.7` | off | 318.6 | 319.6 |
+| exposure `expcomp += 0.7` | on | 317.8 | 318.9 |
+| Clamp-OOG toggle | off | 510.3 | 513.2 |
+| Clamp-OOG toggle | on | 315.3 | 317.9 |
+
+The Clamp-OOG p50 falls from 510.3 ms to 315.3 ms (-38.2%); p95 falls from
+513.2 ms to 317.9 ms (-38.1%). The exposure control is unchanged within noise
+(-0.3% p50), which is the expected result because both modes rebuild the base.
+
+### Builds and tests
+
+`tools/build-rt.sh cpu -j 6` and `tools/build-rt.sh opencl -j 6` complete.
+All stage test executables pass in both build trees:
+`stage-abi-test`, `stage-cache-test`, `stage-device-test`, `stage-graph-test`,
+`stage-indexer-test`, `stage-param-hash-test`, `stage-render-state-test`,
+`stage-param-map-test`, `stage-dirty-blocks-test`, `stage-work-test`,
+`stage-pipeline-test`, `stage-mask-map-test`, `stage-store-test` and
+`stage-parity-test`. `stage-work-test` pins the switch parser (`nullptr`, empty,
+`1`, `yes` enable; `0`, `off`, `OFF` disable) and the three corrected
+predicates.
