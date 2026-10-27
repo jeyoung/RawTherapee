@@ -16,6 +16,7 @@ namespace rtengine::stage
 
 class StageContext;
 class StageDevice;
+class StageDeviceResidency;
 
 enum class StageDeviceType {
     CPU,
@@ -126,7 +127,7 @@ public:
     virtual RtStageStatus wait(StageEvent& event) const = 0;
 
     /* Device residency owned by this queue, or null for a host queue. */
-    virtual class StageDeviceResidency* residency()
+    virtual StageDeviceResidency* residency()
     {
         return nullptr;
     }
