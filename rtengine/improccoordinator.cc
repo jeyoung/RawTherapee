@@ -942,7 +942,7 @@ uint32_t ImProcCoordinator::queueViewportDeferredAnalysis(
      * oprevi. The typed set names the monitor conversion, rgb.proc and the Lab
      * chain the old bits selected; it never names a source or raw block, so a
      * deferred flush cannot dirty the base. The request's own downstream
-     * stages are added from its typed facts, not from the legacy payload.
+     * stages are added from its typed facts.
      */
     const stage::DirtyBlocks deferred = deferredBlocksForRequest(request);
     const uint32_t stageBits = deferredStageBits(deferred);
@@ -1378,7 +1378,7 @@ struct ImProcCoordinator::PreviewPassState {
     stage::RenderStateKey renderState;
     /*
      * The typed request this pass runs. It is the only execution input; the
-     * legacy payload it still carries is materialised inside the adapter.
+     * producer registered its facts, and no site reads a mask.
      */
     EditorRequest request;
     stage::DirtyBlocks dirty;
@@ -4366,10 +4366,10 @@ stage::DirtyBlocks ImProcCoordinator::previewDirtyBlocks(
     }
 
     /*
-     * The typed intent facts are the same request-level information the
-     * hand-written sequence read from the mask. Seeding their nodes here makes
-     * the plan cover the legacy envelope exactly; the bodies still use the
-     * facts to decide how much of a scheduled block the request allows.
+     * The typed intent facts carry the request-level information the retired
+     * mask used to express. Seeding their nodes here makes the plan cover the
+     * same envelope; the bodies still use the facts to decide how much of a
+     * scheduled block the request allows.
      */
     if (pass.request.hdrIntent) {
         result.ids.insert("transform");
@@ -4668,16 +4668,15 @@ void ImProcCoordinator::updatePreviewImage(EditorRequest request,
     }
 
     /*
-     * The typed request is the only execution input. It still carries the
-     * legacy payload for the unconverted bodies, but every widening below is
-     * named as an intent method, so no site reads or writes a mask bit.
+     * The typed request is the only execution input. Every widening below is
+     * named as a typed intent method, so no site reads or writes a mask bit.
      */
 
     // Keep the request shape for eligibility. The augmentation below turns a
     // crop-only change into a transform request, but the base image itself
     // does not change. Eligibility is evaluated on the un-augmented request
     // so a derived transform does not force a full render; the typed facts of
-    // that request are the ones the adapter derived from the payload.
+    // that request are the ones the producer registered.
     const EditorRequest eligibilityRequest = request;
 
     // This augmentation must happen before a stale request is requeued, since
@@ -4698,7 +4697,7 @@ void ImProcCoordinator::updatePreviewImage(EditorRequest request,
 
         /*
          * Requeue the typed request, not a mask re-interpretation: the
-         * augmentation above may have added an execution bit, but the request
+         * augmentation above may have added a typed fact, but the request
          * kind and facts stay typed. Naming the monitor family for a panning
          * change turns a bare repaint into a parameter update.
          */
@@ -4707,8 +4706,9 @@ void ImProcCoordinator::updatePreviewImage(EditorRequest request,
             request.markViewportMoved();
         }
         /*
-         * A bare repaint survives the requeue only while its mask is still
-         * bare repaint. Any augmentation above makes the request ParamsOnly.
+         * A bare repaint survives the requeue only while the request still
+         * carries the imperative repaint fact. Any augmentation above makes
+         * the request ParamsOnly.
          */
         if (request.kind == stage::RequestKind::RepaintOnly
                 && !request.imperativeRepaint) {
@@ -4716,8 +4716,8 @@ void ImProcCoordinator::updatePreviewImage(EditorRequest request,
         }
         /*
          * Debug cross-check for the repaint patch: a RepaintOnly request
-         * survives the requeue only while its mask is still the bare
-         * a bare repaint, which is exactly what imperativeRepaint records.
+         * survives the requeue only while it remains a bare repaint, which is
+         * exactly what imperativeRepaint records.
          */
         assert(request.kind != stage::RequestKind::RepaintOnly
                || request.imperativeRepaint);
@@ -4853,22 +4853,23 @@ void ImProcCoordinator::updatePreviewImage(EditorRequest request,
     }
 
     // A request that takes the normal path satisfies any deferred analysis
-    // work: it rebuilds the whole-frame pipeline, so the accumulated stages
-    // must be part of its payload rather than left for a later pass.
+    // work: it rebuilds the whole-frame pipeline, so the families the
+    // accumulated stages name must be part of its request rather than left
+    // for a later pass.
     const bool absorbedDeferred = absorbPendingDeferred(request);
     if (absorbedDeferred
             && request.kind == stage::RequestKind::RepaintOnly) {
         /*
-         * The deferred mask always adds execution bits, so the ORed mask can
-         * no longer a bare repaint, so the combination is ParamsOnly.
+         * The deferred families always widen the request, so it is no longer
+         * a bare repaint and the combination is ParamsOnly.
          */
         request.kind = stage::RequestKind::ParamsOnly;
     }
     if (absorbedDeferred) {
         /*
          * Debug cross-check for the absorb patch: the accumulated deferred
-         * mask always widens the request past the bare repaint, so neither the
-         * mask-shaped fact nor the kind may still say "repaint".
+         * families always widen the request past the bare repaint, so neither
+         * the imperative fact nor the kind may still say "repaint".
          */
         assert(!request.imperativeRepaint);
         assert(request.kind != stage::RequestKind::RepaintOnly);
@@ -5061,10 +5062,10 @@ void ImProcCoordinator::updatePreviewImage(EditorRequest request,
         }
 
         /*
-         * Nodes may widen the execution payload themselves (raw.demosaic
-         * records that it re-ran). Apply that widening at the position the
+         * Nodes may widen the request facts themselves (raw.demosaic records
+         * that it re-ran). Apply that widening at the position the
          * hand-written pass did, so the monitor gate and the crop request see
-         * the same facts the old final mask produced.
+         * the same facts the retired mask produced.
          */
         if (pass.demosaicRebuilt) {
             pass.request.markDemosaicRebuilt();

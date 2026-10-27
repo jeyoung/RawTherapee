@@ -180,9 +180,9 @@ bool baseIcmChanged(const WorkInputs& inputs)
  * `str` is read only as a guard (`str != 0` selects whether the gamma stage
  * runs), and `retinex()` repeats the same guard. A strength edit therefore
  * changes nothing the buffers hold unless it crosses zero, and the editor
- * sends `RETINEX` for it, which carries no `the raw family`: naming the demosaic body
- * there would be a typed-only run that re-demosaics planes the legacy pass
- * keeps. It stays out, like the pre-existing legacy gap it is.
+ * sends `RETINEX` for it, which does not name the raw family: naming the
+ * demosaic body there would be a typed-only run that re-demosaics planes the
+ * legacy pass keeps. It stays out, like the pre-existing legacy gap it is.
  */
 bool retinexBufferInputsChanged(const WorkInputs& inputs)
 {
@@ -203,8 +203,8 @@ bool retinexBufferInputsChanged(const WorkInputs& inputs)
  *
  * The body reads `Tc.hrenabled` for the Lab-mode gamut control
  * (rawimagesource.cc:2458), so a highlight-recovery toggle changes the retinex
- * output. The editor sends ALLNORAW for it, which carries `the init family` and makes
- * the legacy preparation re-run, so naming it is not a typed-only run.
+ * output. The editor sends ALLNORAW for it, which names the init family and
+ * makes the legacy preparation re-run, so naming it is not a typed-only run.
  */
 bool retinexHighlightChanged(const WorkInputs& inputs)
 {
@@ -224,9 +224,9 @@ bool isColourHlrMethod(const ProcParams& params)
 }
 
 /*
- * The colour highlight-recovery condition of rawSourceWorkRuns()
- * (improccoordinator.cc:1362): a modified RGB source is re-demosaiced when the
- * recovery method and the source colour space disagree, in either direction.
+ * The colour highlight-recovery condition of rawSourceWorkRuns(): a modified
+ * RGB source is re-demosaiced when the recovery method and the source colour
+ * space disagree, in either direction.
  */
 bool hlrDemandsDemosaic(const ProcParams& params,
                         const RenderStateKey& state)
@@ -248,13 +248,13 @@ void setAll(WorkOrder& order, std::initializer_list<WorkItem> items)
 }
 
 /*
- * Whether a request carries the destructive raw reload bits.
+ * Whether a request carries the destructive raw reload families.
  *
- * FullPreview and FullCrop stand for `the init family | the line-denoise family | the HDR family`, the
- * legacy reload gate. HighQuality stands for `the high-quality request`, which asks for the
- * accurate chain but is not part of that gate: the preview maps a bare
- * the high-quality request request to it (imagearea.cc:809) and the crop does the same, so a
- * HighQuality-only pass must not be treated as a raw reload.
+ * FullPreview and FullCrop stand for the init, line-denoise and HDR families,
+ * the legacy reload gate. HighQuality stands for the high-quality request,
+ * which asks for the accurate chain but is not part of that gate: the preview
+ * maps a bare high-quality request to it (imagearea.cc:809) and the crop does
+ * the same, so a HighQuality-only pass must not be treated as a raw reload.
  */
 bool requestReloadsRaw(RequestKind kind)
 {
@@ -412,11 +412,11 @@ WorkOrder derive_preview_work(const WorkInputs& inputs)
     const bool sourceReload = history && sourceReloaded(previous, current);
 
     /*
-     * A reload request is absolute, not a delta. The legacy request bits are
-     * the init family, the line-denoise family and the HDR family, which the caller folds into FullPreview
-     * or FullCrop. the high-quality request is a separate request: it asks for the accurate
-     * chain, and the legacy base gate does not consult it, so HighQuality is
-     * deliberately not a raw reload here.
+     * A reload request is absolute, not a delta. The legacy request families
+     * are the init, line-denoise and HDR families, which the caller folds into
+     * FullPreview or FullCrop. The high-quality request is separate: it asks
+     * for the accurate chain, and the legacy base gate does not consult it, so
+     * HighQuality is deliberately not a raw reload here.
      */
     const bool rawReload = requestReloadsRaw(inputs.requestKind);
 
@@ -433,8 +433,9 @@ WorkOrder derive_preview_work(const WorkInputs& inputs)
      * caller substitutes the FAST method in the pass's RAWParams, while at
      * 100% the configured method runs. Dropping the decision therefore needs
      * a fresh demosaic even though no ProcParams field moved, and every
-     * crossing queues a full request that carries the raw family. The pending-work
-     * fields above only cover the direction that gains high detail.
+     * crossing queues a full request that carries the raw family. The
+     * pending-work fields above only cover the direction that gains high
+     * detail.
      */
     const bool highDetailModeChanged =
         history && previous.highDetailNeeded != current.highDetailNeeded;
@@ -442,11 +443,11 @@ WorkOrder derive_preview_work(const WorkInputs& inputs)
     /*
      * source.select and raw.preprocess move together: rawWorkRuns() feeds
      * both. A selected-frame change (`raw.bayersensor.imageNum`) is a
-     * DARKFRAME event, which also sets the preprocess family and the raw family, so it regenerates
-     * the source selection and the preprocessed planes. A rebuild request is
-     * not a disjunct: RequestKind folds the init family/the line-denoise family/the HDR family into
-     * FullPreview/FullCrop, and those bits rebuild the base without selecting
-     * or preprocessing the source.
+     * DARKFRAME event, which also names the preprocess and raw families, so it
+     * regenerates the source selection and the preprocessed planes. A rebuild
+     * request is not a disjunct: RequestKind folds the init, line-denoise and
+     * HDR families into FullPreview/FullCrop, and those families rebuild the
+     * base without selecting or preprocessing the source.
      */
     const bool source = selectChanged || sourceReload;
     const bool preprocess = preprocessBlockChanged || source || hdPrePending;
@@ -461,13 +462,13 @@ WorkOrder derive_preview_work(const WorkInputs& inputs)
     const bool icmChanged = baseIcmChanged(inputs);
 
     /*
-     * The caller's Color/Coloropp white-balance augmentation is a mask fact:
-     * `the white-balance family` plus the recovery method, folded by the caller before the pass
-     * (improccoordinator.cc:4610-4618). getImage() applies the opposed
-     * recovery with the current white-balance multipliers and marks the planes
-     * recovered, so that request needs fresh demosaic planes. The `wb` family
-     * delta alone is not enough: the same delta can arrive in a pass whose mask
-     * does not carry the white-balance family (a caller re-sending a value the previous pass
+     * The caller's Color/Coloropp white-balance augmentation is a request
+     * fact: the white-balance family plus the recovery method, folded by the
+     * caller before the pass. getImage() applies the opposed recovery with the
+     * current white-balance multipliers and marks the planes recovered, so
+     * that request needs fresh demosaic planes. The `wb` family delta alone is
+     * not enough: the same delta can arrive in a pass that does not carry the
+     * white-balance family (a caller re-sending a value the previous pass
      * normalised), and naming the body then would be a typed-only run.
      */
     const bool hlrWbDemosaic = inputs.colorHlrWbRequest
@@ -567,9 +568,9 @@ WorkOrder derive_preview_work(const WorkInputs& inputs)
         || rawReload;
 
     /*
-     * A spot delta does not rebuild the base: the legacy the spot family bit only
-     * enters the spot gates inside raw.base and the buffer restore. The
-     * request fact `spotPending` already carries the enabled/entries test.
+     * A spot delta does not rebuild the base: the spot family only enters the
+     * spot gates inside raw.base and the buffer restore. The request fact
+     * `spotPending` already carries the enabled/entries test.
      */
     const bool spotsConfigured =
         params.spot.enabled && !params.spot.entries.empty();
@@ -673,15 +674,15 @@ WorkOrder derive_crop_work(const WorkInputs& inputs)
         && paramFamilyChanged(inputs, &ProcParams::spot);
 
     /*
-     * The destructive bodies share the reload request. The crop folds
-     * `the init family | the line-denoise family | the HDR family` into RequestKind::FullCrop before it
-     * builds the key; that fold is the only mask-derived fact the derivation
-     * reads. A source reload or a high-detail transition reaches the crop
-     * through the same bits, so it is not an independent disjunct here; the
-     * dirty-block derivation models those render-state aspects separately.
-     * HighQuality maps the high-quality request, which the reload request does not carry,
-     * and is therefore not a reload. No history means the first update, which
-     * runs the full destructive set.
+     * The destructive bodies share the reload request. The crop folds the
+     * init, line-denoise and HDR families into RequestKind::FullCrop before it
+     * builds the key; that fold is the only request-derived fact the
+     * derivation reads. A source reload or a high-detail transition reaches
+     * the crop through the same families, so it is not an independent
+     * disjunct here; the dirty-block derivation models those render-state
+     * aspects separately. HighQuality maps to the high-quality request, which
+     * the reload request does not carry, and is therefore not a reload. No
+     * history means the first update, which runs the full destructive set.
      */
     const bool reload = !history || requestReloadsRaw(inputs.requestKind);
 

@@ -657,6 +657,14 @@ public:
     ProcParams* beginUpdateParams () override;
     void        endUpdateParams (ProcEvent change) override;  // must be called after beginUpdateParams, triggers update
     /*
+     * Static event identity. This overload is required on the derived type:
+     * without it a ProcEventCode would bind to the aborting int form below.
+     */
+    void        endUpdateParams (ProcEventCode change)
+    {
+        endUpdateParams(ProcEvent(change));
+    }
+    /*
      * The integer form carried a retired request mask. It has no request
      * meaning any more and fails fast.
      */
