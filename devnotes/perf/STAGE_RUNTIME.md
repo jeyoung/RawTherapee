@@ -1229,11 +1229,11 @@ cannot produce a complete topological order logs one diagnostic and aborts
 `crop-graph: fatal: plan rejected: ...`, `thumbnail-graph: <entry>: fatal:
 plan rejected: ...`). A partly processed image is never produced.
 
-`refreshmap.*` and the `todo` event mask stay for GUI notification, request
-coalescing, the compatibility payload and the diagnostics. They no longer
-decide the preview or crop execution set, and no body gate, crop-render
-trigger or node-entry gate reads them: `RT_PREVIEW_DIRTY` and `RT_CROP_DIRTY`
-are gone.
+The request mask, `refreshmap.*` and the `todo` payload are deleted. GUI
+notification and request coalescing use the typed request facts, and the
+diagnostics print the request kind and identity. No body gate, crop-render
+trigger or node-entry gate reads a mask: `RT_PREVIEW_DIRTY` and
+`RT_CROP_DIRTY` are gone.
 
 The gate is unchanged in shape. `run-suite.sh --graph` now requires the export
 log to report the 20-node inventory and the export to be byte-identical to the
@@ -1366,11 +1366,10 @@ follow-up should give the harness a completion signal that does not depend on
   a thread that never sets it defaults to allowed and still needs the
   environment opt-in.
 - Parameter fingerprints now drive the preview and crop dirty-block sets, and
-  the graph paths are default. `refreshmap.*` and the `todo` mask remain only
-  for GUI notification, coalescing, the compatibility payload and diagnostics;
-  every producer is typed, including the five parameter families, and no body
-  gate or crop-render trigger reads the mask. The compatibility entries are
-  listed under "Typed editor requests and downstream gates".
+  the graph paths are default. GUI notification, coalescing and diagnostics
+  use the typed request facts; every producer is typed, including the five
+  parameter families, and no body gate or crop-render trigger reads a mask.
+  The event registry keeps the ProcEvent identity and history only.
 - Tile ordering is connected to denoise and wavelet behind `RT_TILE_ORDER=1`,
   but it is opt-in and has no reduced-work mode. The deterministic merge is
   always on.
