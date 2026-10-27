@@ -79,6 +79,14 @@ public:
     size_t used() const;
 
     /*
+     * Number of pixel or auxiliary buffers the cache has allocated. It is a
+     * test seam for the disabled path: a caller that never reaches put() must
+     * leave it at zero. It is not an entry count and is never reset by
+     * reset_stats().
+     */
+    uint64_t allocationCount() const;
+
+    /*
      * Store a copy of `source`. `aux` is an optional opaque payload that shares
      * the entry and the budget; it is stored verbatim and handed back by get().
      * An entry is refused when the buffer is malformed or when the payload and
@@ -86,13 +94,20 @@ public:
      */
     bool put(const StageKey& key, const RtStageBuffer& source,
              const void* aux = nullptr, size_t aux_bytes = 0);
+    /*
+     * Restore an entry. get() records a probe and refreshes the entry's
+     * recency; fetch() is the uncounted copy that follows a probe and
+     * refreshes recency without changing the counters. contains() is a
+     * non-touching introspection and is deliberately not an access for the
+     * least-recently-used order.
+     */
     bool get(const StageKey& key, RtStageBuffer& destination,
              std::vector<unsigned char>* aux = nullptr) const;
     /* Copy an entry that a preceding peek() already accounted for. */
     bool fetch(const StageKey& key, RtStageBuffer& destination,
                std::vector<unsigned char>* aux = nullptr) const;
     bool contains(const StageKey& key) const;
-    /* Membership probe that records a hit or a miss without copying. */
+    /* Membership probe that records a hit or a miss and refreshes recency. */
     bool peek(const StageKey& key) const;
     /* Record a probe the caller declined for policy reasons. */
     void note_refused();
@@ -114,6 +129,9 @@ private:
     void erase_locked(
         std::unordered_map<StageKey, Entry, StageKeyHash>::iterator it,
         bool evicted);
+    /* Move one entry to the front of the least-recently-used list. */
+    void touch_locked(
+        std::unordered_map<StageKey, Entry, StageKeyHash>::iterator it) const;
 
     bool peek_locked(const StageKey& key) const;
     bool copy_locked(const Entry& entry, RtStageBuffer& destination,
@@ -122,9 +140,10 @@ private:
     mutable std::mutex mutex_;
     size_t budget_ = 0;
     size_t used_ = 0;
-    std::list<StageKey> lru_;
-    std::unordered_map<StageKey, Entry, StageKeyHash> entries_;
+    mutable std::list<StageKey> lru_;
+    mutable std::unordered_map<StageKey, Entry, StageKeyHash> entries_;
     mutable StageCacheStats stats_;
+    mutable uint64_t allocations_ = 0;
 };
 
 } // namespace rtengine::stage

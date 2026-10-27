@@ -1421,8 +1421,8 @@ void logPreviewGraphActive(size_t nodes)
 
 /*
  * Rebuild the vector form of a saved parameter snapshot for the work order.
- * The map and the vector both follow the canonical preview order, so the ids
- * line up.
+ * `ParamSnapshot` is a map keyed by block id, so both forms are in
+ * lexicographic id order; they agree because they iterate the same map once.
  */
 stage::BlockFingerprints workFingerprints(
     const stage::ParamSnapshot& snapshot)
@@ -1645,9 +1645,18 @@ void ImProcCoordinator::stageRawDemosaic(PreviewPassState& pass)
 /*
  * Build the node-cache key of the preview raw.base tier for one pass.
  *
- * The pass snapshot, the render state and the work order are the inputs the
- * pass derived its order from, and the output geometry is the allocated
- * preview size. See stage_cache_integration.h for the component rationale.
+ * The key is built before any body runs, from the pass snapshot, the render
+ * state and the work order the pass derived its order from, plus the output
+ * geometry and the active backend. See stage_cache_integration.h for the
+ * component rationale.
+ *
+ * Consequence of the pre-body snapshot: a body that writes parameters back
+ * (the white-balance normalisation, the automatic methods) leaves the live
+ * parameters different from the key the tier is stored under. The entry is
+ * correct for the inputs it names, but a later pass carries the written-back
+ * parameters, so it fingerprints a different key and the entry is
+ * unreachable. The write-back is still required for correctness; it is a
+ * utilisation limit, not a parity risk.
  */
 stage::NodeCacheKey ImProcCoordinator::nodeCacheRawBaseKey(
     const PreviewPassState& pass) const
@@ -1663,6 +1672,7 @@ stage::NodeCacheKey ImProcCoordinator::nodeCacheRawBaseKey(
     }
     key.work = stage::nodeCacheWorkBits(pass.work)
                & stage::nodeCacheTierMask();
+    key.backend = stage::nodeCacheBackendFingerprint();
     key.width = pW;
     key.height = pH;
     key.planes = 3;
@@ -1680,6 +1690,10 @@ stage::NodeCacheKey ImProcCoordinator::nodeCacheRawBaseKey(
  * colour-space conversion, gamut compression and the closing analysis) is
  * skipped. Returns false, leaving the caller to recompute, when the entry
  * cannot be delivered into the live buffer or its auxiliary state is invalid.
+ *
+ * A hit is only possible while the spot state is stable, because
+ * nodeCacheReuseAllowed() refuses the tier otherwise; the live spot buffer is
+ * therefore null here and the node-cache path never has to restore it.
  */
 bool ImProcCoordinator::nodeCacheRestoreRawBase(
     const PreviewPassState& pass, const stage::NodeCacheKey& key)
@@ -1699,9 +1713,11 @@ bool ImProcCoordinator::nodeCacheRestoreRawBase(
         return false;
     }
 
-    currWB = ColorTemp(state.wb_temp, state.wb_green, state.wb_equal,
-                       state.wb_method,
-                       static_cast<StandardObserver>(state.wb_observer));
+    ColorTemp restored_wb;
+    if (!stage::rawBaseTierWhiteBalance(state, restored_wb)) {
+        return false;
+    }
+    currWB = restored_wb;
 
     /*
      * The rebuild branch normalises the live white balance from the source
@@ -1740,12 +1756,13 @@ bool ImProcCoordinator::nodeCacheRestoreRawBase(
  * and the budget; a refused store leaves the previous entry untouched. A tier
  * whose pass named a raw source producer is not stored: the order would refuse
  * it on every later pass, so the copy would be spent on an entry that can
- * never be read.
+ * never be read. The same applies while the spot state is unstable, because a
+ * live spot buffer contributes pixels that the key does not carry.
  */
 void ImProcCoordinator::nodeCacheStoreRawBase(const PreviewPassState& pass)
 {
     if (!nodeCache.enabled() || orig_prev == nullptr
-            || !stage::nodeCacheReuseAllowed(pass.work)) {
+            || !stage::nodeCacheReuseAllowed(pass.work, pass.renderState)) {
         return;
     }
 
@@ -1755,6 +1772,9 @@ void ImProcCoordinator::nodeCacheStoreRawBase(const PreviewPassState& pass)
     state.wb_equal = currWB.getEqual();
     state.wb_observer = static_cast<int32_t>(currWB.getObserver());
     state.wb_method = currWB.getMethod();
+    // The body assigns the default sentinel when white balance is disabled;
+    // a negative temperature cannot survive the clipping constructor.
+    state.wb_no_balance = currWB.getTemp() < 0.0;
     state.denoise_valid = denoiseInfoStore.valid;
     state.histogram.resize(vhist16.getSize());
     for (unsigned int i = 0; i < state.histogram.size(); ++i) {
@@ -1804,13 +1824,18 @@ void ImProcCoordinator::stageRawBase(PreviewPassState& pass)
      */
     bool tierRestored = false;
     if (rebuildRuns && nodeCache.enabled()) {
-        if (stage::nodeCacheReuseAllowed(pass.work)
+        if (stage::nodeCacheReuseAllowed(pass.work, pass.renderState)
                 && stage::nodeCacheSubstitutionAllowed(pass.work)) {
             const stage::NodeCacheKey key = nodeCacheRawBaseKey(pass);
             if (nodeCache.probe(key)) {
                 tierRestored = nodeCacheRestoreRawBase(pass, key);
             }
         } else {
+            /*
+             * The work order named a raw source producer, the pass schedules
+             * no substitution, or the spot state is unstable. Count the
+             * declined probe; the body below recomputes exactly.
+             */
             nodeCache.note_refused();
         }
     }

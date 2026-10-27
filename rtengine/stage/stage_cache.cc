@@ -77,6 +77,23 @@ size_t StageCache::used() const
     return used_;
 }
 
+uint64_t StageCache::allocationCount() const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    return allocations_;
+}
+
+void StageCache::touch_locked(
+    std::unordered_map<StageKey, Entry, StageKeyHash>::iterator it) const
+{
+    if (it->second.lru == lru_.begin()) {
+        return;
+    }
+    lru_.erase(it->second.lru);
+    lru_.push_front(it->first);
+    it->second.lru = lru_.begin();
+}
+
 void StageCache::erase_locked(
     std::unordered_map<StageKey, Entry, StageKeyHash>::iterator it,
     bool evicted)
@@ -131,6 +148,7 @@ bool StageCache::put(const StageKey& key, const RtStageBuffer& source,
 
     OwnedStageBuffer owned;
     owned.storage.resize(pixels);
+    ++allocations_;
     owned.view.size = sizeof(RtStageBuffer);
     owned.view.data = owned.storage.data();
     owned.view.width = source.width;
@@ -159,6 +177,7 @@ bool StageCache::put(const StageKey& key, const RtStageBuffer& source,
         const unsigned char* bytes_in =
             static_cast<const unsigned char*>(aux);
         entry.aux.assign(bytes_in, bytes_in + aux_bytes);
+        ++allocations_;
     }
     entry.bytes = bytes;
     lru_.push_front(key);
@@ -172,13 +191,14 @@ bool StageCache::put(const StageKey& key, const RtStageBuffer& source,
 
 bool StageCache::peek_locked(const StageKey& key) const
 {
-    const bool found = entries_.find(key) != entries_.end();
-    if (found) {
-        ++stats_.hits;
-    } else {
+    auto found = entries_.find(key);
+    if (found == entries_.end()) {
         ++stats_.misses;
+        return false;
     }
-    return found;
+    ++stats_.hits;
+    touch_locked(found);
+    return true;
 }
 
 bool StageCache::get(const StageKey& key, RtStageBuffer& destination,
@@ -191,7 +211,11 @@ bool StageCache::get(const StageKey& key, RtStageBuffer& destination,
         return false;
     }
     ++stats_.hits;
-    return copy_locked(found->second, destination, aux);
+    if (!copy_locked(found->second, destination, aux)) {
+        return false;
+    }
+    touch_locked(found);
+    return true;
 }
 
 bool StageCache::fetch(const StageKey& key, RtStageBuffer& destination,
@@ -202,7 +226,11 @@ bool StageCache::fetch(const StageKey& key, RtStageBuffer& destination,
     if (found == entries_.end()) {
         return false;
     }
-    return copy_locked(found->second, destination, aux);
+    if (!copy_locked(found->second, destination, aux)) {
+        return false;
+    }
+    touch_locked(found);
+    return true;
 }
 
 bool StageCache::copy_locked(const Entry& entry, RtStageBuffer& destination,
@@ -239,6 +267,7 @@ bool StageCache::copy_locked(const Entry& entry, RtStageBuffer& destination,
 
 bool StageCache::contains(const StageKey& key) const
 {
+    // Introspection only: it neither counts a probe nor refreshes recency.
     std::lock_guard<std::mutex> lock(mutex_);
     return entries_.find(key) != entries_.end();
 }

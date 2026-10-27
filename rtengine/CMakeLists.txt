@@ -294,6 +294,7 @@ target_include_directories(stage-node-cache-test BEFORE PRIVATE
 )
 target_link_libraries(stage-node-cache-test PRIVATE rtengine)
 target_include_directories(stage-node-cache-test PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}"
     "${CMAKE_CURRENT_SOURCE_DIR}/stage"
 )
 rt_setup_target(stage-node-cache-test)

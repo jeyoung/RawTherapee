@@ -146,6 +146,61 @@ int main()
         check(evicting.used() <= evicting.budget(), "used stays within budget");
     }
 
+    // True LRU: a lookup refreshes recency, so the untouched entry goes.
+    // Under a FIFO order this fails because the first insert is evicted.
+    {
+        StageCache lru(5000);
+        StageKey a;
+        a.stage = "a";
+        StageKey b;
+        b.stage = "b";
+        StageKey c;
+        c.stage = "c";
+
+        check(lru.put(a, source), "LRU: a fits");
+        check(lru.put(b, source), "LRU: b fits");
+        check(lru.peek(a), "LRU: a is probed");
+        check(lru.put(c, source), "LRU: c evicts the least recently used");
+        check(lru.contains(a), "LRU: the probed entry survives");
+        check(!lru.contains(b), "LRU: the untouched entry is evicted");
+        check(lru.contains(c), "LRU: the new entry is kept");
+        check(!lru.peek(b), "LRU: the evicted entry misses");
+
+        // fetch() after a probe also refreshes recency.
+        StageCache fetched(5000);
+        check(fetched.put(a, source), "LRU: fetch case a fits");
+        check(fetched.put(b, source), "LRU: fetch case b fits");
+        check(fetched.get(a, destination), "LRU: fetch case a is read");
+        check(fetched.put(c, source), "LRU: fetch case c evicts b");
+        check(fetched.contains(a), "LRU: the read entry survives");
+        check(!fetched.contains(b), "LRU: the unread entry is evicted");
+
+        // contains() is introspection and must not refresh recency.
+        StageCache observed(5000);
+        check(observed.put(a, source), "LRU: contains case a fits");
+        check(observed.put(b, source), "LRU: contains case b fits");
+        check(observed.contains(a), "LRU: contains case observes a");
+        check(observed.put(c, source), "LRU: contains case c evicts a");
+        check(!observed.contains(a),
+              "LRU: contains does not refresh recency");
+        check(observed.contains(b), "LRU: the newer entry survives");
+    }
+
+    // Allocation accounting: a store allocates the tier and the payload.
+    {
+        StageCache counted(4096);
+        check(counted.allocationCount() == 0,
+              "a fresh cache has no allocations");
+        check(counted.put(key, source, "aux", 3),
+              "an entry with a payload stores");
+        check(counted.allocationCount() == 2,
+              "the tier and the payload each allocate once");
+        check(!counted.put(key, source, nullptr, 3),
+              "a malformed payload is refused");
+        check(counted.allocationCount() == 2,
+              "a refused store allocates nothing");
+    }
+
     // Replacing the same key is not an eviction.
     {
         StageCache replacing(4096);

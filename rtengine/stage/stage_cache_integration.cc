@@ -1,5 +1,8 @@
 #include "stage_cache_integration.h"
 
+#include "colortemp.h"
+#include "opencl/openclengine.h"
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -175,7 +178,8 @@ double bitsDouble(uint64_t bits)
 }
 
 constexpr unsigned char AUX_MAGIC[3] = {'N', 'C', 'A'};
-constexpr unsigned char AUX_VERSION = 1;
+/* Version 2 adds the no-balance flag; older blobs are rejected. */
+constexpr unsigned char AUX_VERSION = 2;
 
 } // namespace
 
@@ -184,6 +188,7 @@ bool NodeCacheKey::operator==(const NodeCacheKey& other) const
     return node == other.node && render == other.render &&
            block_ids == other.block_ids &&
            block_values == other.block_values && work == other.work &&
+           backend == other.backend &&
            width == other.width && height == other.height &&
            planes == other.planes && format == other.format;
 }
@@ -204,6 +209,9 @@ StageKey nodeCacheStageKey(const NodeCacheKey& key)
     }
     appendHex(encoded, key.work);
     encoded.push_back('\x1f');
+    appendHex(encoded, key.backend.words[0]);
+    appendHex(encoded, key.backend.words[1]);
+    encoded.push_back('\x1f');
     appendDecimal(encoded, key.width);
     encoded.push_back('\x1f');
     appendDecimal(encoded, key.height);
@@ -219,14 +227,34 @@ StageKey nodeCacheStageKey(const NodeCacheKey& key)
     stage.inputs[0] = key.render.words[0];
     stage.inputs[1] = key.render.words[1];
     stage.inputs[2] = key.work;
+    stage.inputs[3] = key.backend.hash();
     stage.level = static_cast<uint32_t>(key.width);
     stage.consumer = key.format;
     return stage;
 }
 
-uint64_t nodeCacheKeyDigest(const NodeCacheKey& key)
+ParamFingerprint nodeCacheBackendFingerprint()
 {
-    return nodeCacheStageKey(key).params;
+    ParamHasher hasher;
+    hasher.addSectionLabel("backend");
+    if (!opencl::enabled()) {
+        hasher.addString("cpu");
+        return hasher.finish();
+    }
+
+    hasher.addString("opencl");
+    const int index = opencl::selectedDevice();
+    hasher.add(static_cast<int32_t>(index));
+    const std::vector<opencl::DeviceInfo> devices = opencl::devices();
+    if (index >= 0 && static_cast<size_t>(index) < devices.size()) {
+        const opencl::DeviceInfo& device =
+            devices[static_cast<size_t>(index)];
+        hasher.addString(device.name);
+        hasher.addString(device.vendor);
+        hasher.addString(device.version);
+        hasher.addString(device.driver);
+    }
+    return hasher.finish();
 }
 
 uint64_t nodeCacheWorkBits(const WorkOrder& work)
@@ -255,6 +283,7 @@ std::vector<unsigned char> encodeRawBaseTierState(const RawBaseTierState& state)
                      static_cast<uint32_t>(state.wb_observer)));
     writeU64(out, static_cast<uint64_t>(state.wb_method.size()));
     out.insert(out.end(), state.wb_method.begin(), state.wb_method.end());
+    out.push_back(state.wb_no_balance ? 1u : 0u);
     out.push_back(state.denoise_valid ? 1u : 0u);
     writeU64(out, static_cast<uint64_t>(state.histogram.size()));
     for (uint32_t value : state.histogram) {
@@ -282,7 +311,7 @@ bool decodeRawBaseTierState(const unsigned char* data, size_t size,
         !readU64(data, size, offset, equal) ||
         !readU64(data, size, offset, observer) ||
         !readU64(data, size, offset, methodSize) ||
-        methodSize > size || offset + methodSize + 1 > size) {
+        methodSize > size || offset + methodSize + 2 > size) {
         return false;
     }
     RawBaseTierState decoded;
@@ -295,6 +324,7 @@ bool decodeRawBaseTierState(const unsigned char* data, size_t size,
         reinterpret_cast<const char*>(data + offset),
         static_cast<size_t>(methodSize));
     offset += static_cast<size_t>(methodSize);
+    decoded.wb_no_balance = data[offset++] != 0;
     decoded.denoise_valid = data[offset++] != 0;
     uint64_t count = 0;
     if (!readU64(data, size, offset, count) ||
@@ -313,6 +343,45 @@ bool decodeRawBaseTierState(const unsigned char* data, size_t size,
         return false;
     }
     state = std::move(decoded);
+    return true;
+}
+
+bool rawBaseTierWhiteBalance(const RawBaseTierState& state, ColorTemp& wb)
+{
+    if (state.wb_no_balance) {
+        /*
+         * The body assigns the default-constructed sentinel, not a clipped
+         * temperature. Rebuilding it the same way keeps -1/-1 intact; the
+         * five-argument constructor would clamp it to 1500 K / 0.02 and the
+         * no-WB pass would then convert colour differently.
+         */
+        const ColorTemp sentinel;
+        if (state.wb_temp != sentinel.getTemp()
+                || state.wb_green != sentinel.getGreen()
+                || state.wb_equal != sentinel.getEqual()
+                || state.wb_method != sentinel.getMethod()
+                || state.wb_observer
+                       != static_cast<int32_t>(sentinel.getObserver())) {
+            return false;
+        }
+        wb = sentinel;
+        return true;
+    }
+
+    const ColorTemp restored(
+        state.wb_temp, state.wb_green, state.wb_equal, state.wb_method,
+        static_cast<StandardObserver>(state.wb_observer));
+    if (restored.getTemp() != state.wb_temp
+            || restored.getGreen() != state.wb_green
+            || restored.getEqual() != state.wb_equal
+            || restored.getMethod() != state.wb_method
+            || static_cast<int32_t>(restored.getObserver())
+                   != state.wb_observer) {
+        // A clipped field means the stored state cannot be reproduced
+        // exactly; the caller must rebuild instead of approximating.
+        return false;
+    }
+    wb = restored;
     return true;
 }
 
@@ -358,8 +427,12 @@ size_t nodeCacheBudgetBytes()
     return nodeCacheBudgetMiB() * 1024u * 1024u;
 }
 
-bool nodeCacheReuseAllowed(const WorkOrder& work)
+bool nodeCacheReuseAllowed(const WorkOrder& work,
+                           const RenderStateKey& render)
 {
+    if (render.spotPending || render.spotBufferLive) {
+        return false;
+    }
     return !work.has(WorkItem::sourceSelect)
         && !work.has(WorkItem::rawPreprocess)
         && !work.has(WorkItem::rawDemosaic)
@@ -441,6 +514,13 @@ size_t NodeCache::used() const
 size_t NodeCache::budget() const
 {
     return enabled_ ? cache_.budget() : 0;
+}
+
+uint64_t NodeCache::allocationCount() const
+{
+    // Deliberately independent of enabled_: the test proves that the disabled
+    // path never reaches an allocation.
+    return cache_.allocationCount();
 }
 
 StageCacheStats NodeCache::stats() const
