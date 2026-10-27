@@ -147,6 +147,33 @@ struct EditorRequest {
     bool monitorOutputRequest = false;
 
     /*
+     * The request carries the display/transform bit `M_MONITOR` itself. This
+     * is narrower than monitorOutputRequest: a spot or white-balance request
+     * renders monitor.output but does not name the monitor transform, and the
+     * crop render gate and the output-profile refresh follow the bit. It is a
+     * payload-shaping fact like the mask itself and is excluded from
+     * identity(). Recompute it with setLegacyGateMask().
+     */
+    bool monitorIntent = false;
+
+    /*
+     * The request names the sensor demosaic sub-step (`M_RAW`). The raw body
+     * runs as one node for demosaic, capture sharpening and retinex buffer
+     * preparation; this fact decides whether the demosaic itself is re-run,
+     * independently of whether the node was entered. It is payload-shaping and
+     * excluded from identity(). Recompute it with setLegacyGateMask().
+     */
+    bool rawIntent = false;
+
+    /*
+     * The request names the capture-sharpening sub-step (`M_CSHARP`). Capture
+     * sharpening rewrites the demosaiced planes in place, so the raw body
+     * consults this beside rawIntent. Payload-shaping and excluded from
+     * identity(). Recompute it with setLegacyGateMask().
+     */
+    bool captureSharpenIntent = false;
+
+    /*
      * The mask is exactly `M_MINUPDATE`, the only form in which a repaint is
      * imperative. A widened mask turns a RepaintOnly request into ParamsOnly.
      * Recompute it with setLegacyGateMask().
@@ -296,6 +323,51 @@ struct EditorRequest {
      * narrow a repaint patch the kind themselves and must not call this.
      */
     void refreshFromLegacyMask();
+
+    /*
+     * Execution-payload augmentations of one preview pass.
+     *
+     * Each method reproduces a widening the hand-written coordinator applied
+     * to its `todo` integer, and keeps every derived fact in step. They exist
+     * so no execution site reads or writes a mask bit itself; the mask
+     * interpretation stays in this unit until the retirement step removes the
+     * payload. The names are the intent, not the bits.
+     */
+
+    /* A post-crop-vignetting change needs the transform family. */
+    void markCropTransform();
+
+    /* The viewport moved; the pass may reuse buffers (`M_MONITOR`). */
+    void markViewportMoved();
+
+    /*
+     * Refresh the whole-frame base after a viewport-state mismatch. Adds
+     * M_INIT|M_HDR|M_MONITOR and, when the spot parameters moved, M_SPOT.
+     */
+    void markBaseRefresh(bool spotChanged);
+
+    /*
+     * A Color/Coloropp white-balance request needs fresh demosaic planes;
+     * adds the DEMOSAIC composite.
+     */
+    void markColorHlrDemosaic();
+
+    /*
+     * The demosaic body re-ran during this pass, so the base must be fetched
+     * again and capture sharpening re-applied; adds M_INIT|M_CSHARP. Called
+     * after the node loop, at the position the hand-written pass widened its
+     * payload.
+     */
+    void markDemosaicRebuilt();
+
+    /* A viewport crop dependency needs the Lab pixel tools. */
+    void markLabPixels(bool luminance, bool color);
+
+    /*
+     * Merge the typed deferred-analysis stages into this request. The payload
+     * materialisation stays here; no execution site reads it.
+     */
+    void absorbDeferredExecution(const stage::DirtyBlocks& blocks);
 
     /*
      * The opaque execution payload, for the block bodies, cache invalidation
@@ -522,9 +594,11 @@ ViewportCropSelection viewportCropSelection(const EditorRequest& request);
 void resolveCropDependencies(ViewportCropSelection& selection);
 
 /*
- * The `todo` argument Crop::update() reads for a selection, and the execution
- * mask it reads from the request. Both are payload materialisations for the
- * unconverted crop bodies, not planning decisions.
+ * The execution payload a selection would have materialised, and the payload
+ * for the crop request. Both are pre-retirement oracles for the tests: the
+ * coordinator now passes the typed request directly, because the crop bodies
+ * read the facts rather than the mask. They are not planning decisions and are
+ * removed with the payload in the retirement step.
  */
 int viewportCropTodo(const ViewportCropSelection& selection);
 int viewportCropPayload(int requestMask,

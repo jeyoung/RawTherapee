@@ -28,6 +28,7 @@
 
 #include "procparams.h"
 #include "refreshmap.h"
+#include "viewportdefer.h"
 
 #include <cassert>
 #include <cstdint>
@@ -225,6 +226,9 @@ void EditorRequest::setLegacyGateMask(int mask)
     fullFrameAdmission = fullFrameAdmissionFor(mask);
     colorHlrWbRequest = colorHlrWbRequestFor(mask);
     monitorOutputRequest = monitorOutputRequestFor(mask);
+    monitorIntent = (mask & M_MONITOR) != 0;
+    rawIntent = (mask & M_RAW) != 0;
+    captureSharpenIntent = (mask & M_CSHARP) != 0;
     imperativeRepaint = imperativeRepaintFor(mask);
     transformFamilyIntent =
         (mask & (M_HDR | M_TRANSFORM | M_RGBCURVE | M_INIT | M_LINDENOISE)) != 0;
@@ -261,6 +265,62 @@ void EditorRequest::refreshFromLegacyMask()
     kind = kindForLegacyMask(legacyGateMask);
 }
 
+void EditorRequest::markCropTransform()
+{
+    setLegacyGateMask(legacyGateMask | TRANSFORM);
+    refreshFromLegacyMask();
+}
+
+void EditorRequest::markViewportMoved()
+{
+    /*
+     * The panning requeue widened the payload without refreshing the kind:
+     * the caller patches RepaintOnly to ParamsOnly itself. Keep that shape.
+     */
+    setLegacyGateMask(legacyGateMask | M_MONITOR);
+    viewportMoved = true;
+}
+
+void EditorRequest::markBaseRefresh(bool spotChanged)
+{
+    setLegacyGateMask(legacyGateMask | M_INIT | M_HDR | M_MONITOR
+                      | (spotChanged ? M_SPOT : 0));
+    refreshFromLegacyMask();
+}
+
+void EditorRequest::markColorHlrDemosaic()
+{
+    setLegacyGateMask(legacyGateMask | DEMOSAIC);
+    refreshFromLegacyMask();
+}
+
+void EditorRequest::markDemosaicRebuilt()
+{
+    setLegacyGateMask(legacyGateMask | M_INIT | M_CSHARP);
+    refreshFromLegacyMask();
+}
+
+void EditorRequest::markLabPixels(bool luminance, bool color)
+{
+    /*
+     * Only the Lab pixel facts change, and the caller asserts that the
+     * planning fields still agree; do not re-derive the kind, because a bare
+     * repaint keeps its RepaintOnly classification on the fast path.
+     */
+    setLegacyGateMask(legacyGateMask | (luminance ? M_LUMINANCE : 0)
+                      | (color ? M_COLOR : 0));
+}
+
+void EditorRequest::absorbDeferredExecution(const stage::DirtyBlocks& blocks)
+{
+    /*
+     * The deferred record carries typed stage ids; materialise the payload
+     * once, here, exactly as the deferred flush did before the retirement.
+     */
+    setLegacyGateMask(
+        legacyGateMask | deferredExecutionPayload(deferredStageBits(blocks)));
+}
+
 bool planningAgreesWithLegacyMask(const EditorRequest& request)
 {
     return request.kind == kindForLegacyMask(request.legacyGateMask)
@@ -277,6 +337,12 @@ bool planningAgreesWithLegacyMask(const EditorRequest& request)
             == colorHlrWbRequestFor(request.legacyGateMask)
         && request.monitorOutputRequest
             == monitorOutputRequestFor(request.legacyGateMask)
+        && request.monitorIntent
+            == ((request.legacyGateMask & M_MONITOR) != 0)
+        && request.rawIntent
+            == ((request.legacyGateMask & M_RAW) != 0)
+        && request.captureSharpenIntent
+            == ((request.legacyGateMask & M_CSHARP) != 0)
         && request.imperativeRepaint
             == imperativeRepaintFor(request.legacyGateMask)
         && request.transformFamilyIntent
@@ -834,34 +900,34 @@ void resolveCropDependencies(ViewportCropSelection& selection)
 
 int viewportCropTodo(const ViewportCropSelection& selection)
 {
-    int todo = 0;
+    int payload = 0;
 
     if (selection.crop) {
-        todo |= M_CROP;
+        payload |= M_CROP;
     }
     if (selection.repaint) {
-        todo |= M_MINUPDATE;
+        payload |= M_MINUPDATE;
     }
     if (selection.autoExposure) {
-        todo |= M_AUTOEXP;
+        payload |= M_AUTOEXP;
     }
     if (selection.transform) {
-        todo |= M_TRANSFORM;
+        payload |= M_TRANSFORM;
     }
     if (selection.rgbProc) {
-        todo |= M_RGBCURVE;
+        payload |= M_RGBCURVE;
     }
     if (selection.lumaCurve) {
-        todo |= M_LUMACURVE;
+        payload |= M_LUMACURVE;
     }
     if (selection.luminance) {
-        todo |= M_LUMINANCE;
+        payload |= M_LUMINANCE;
     }
     if (selection.color) {
-        todo |= M_COLOR;
+        payload |= M_COLOR;
     }
 
-    return todo;
+    return payload;
 }
 
 int viewportCropPayload(int requestMask,

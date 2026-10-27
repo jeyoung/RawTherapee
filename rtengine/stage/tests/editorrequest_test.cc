@@ -276,6 +276,12 @@ void checkViewportFacts()
               label + ": colorIntent");
         check(request.transformRequest == (row.bit == M_TRANSFORM),
               label + ": transformRequest");
+        check(request.monitorIntent == (row.bit == M_MONITOR),
+              label + ": monitorIntent");
+        check(request.rawIntent == (row.bit == M_RAW),
+              label + ": rawIntent");
+        check(request.captureSharpenIntent == (row.bit == M_CSHARP),
+              label + ": captureSharpenIntent");
     }
 
     const EditorRequest merged = coalesce(from_legacy_mask(M_LUMACURVE),
@@ -403,6 +409,13 @@ void checkEveryPair()
                   label + ": colorHlrWbRequest");
             check(merged.monitorOutputRequest == single.monitorOutputRequest,
                   label + ": monitorOutputRequest");
+            check(merged.monitorIntent == single.monitorIntent,
+                  label + ": monitorIntent");
+            check(merged.rawIntent == single.rawIntent,
+                  label + ": rawIntent");
+            check(merged.captureSharpenIntent
+                      == single.captureSharpenIntent,
+                  label + ": captureSharpenIntent");
             check(merged.imperativeRepaint == single.imperativeRepaint,
                   label + ": imperativeRepaint");
             check(merged.transformFamilyIntent == single.transformFamilyIntent,
@@ -834,8 +847,7 @@ void checkFastPathAugmentation()
     EditorRequest crop = from_legacy_mask(M_CROP);
     check(!crop.transformFamilyIntent,
           "a bare crop does not claim transform-family work");
-    crop.setLegacyGateMask(crop.legacyGateMask | TRANSFORM);
-    crop.refreshFromLegacyMask();
+    crop.markCropTransform();
     check(crop.transformFamilyIntent,
           "the PC-vignette augmentation refreshes transformFamilyIntent");
     check(crop.kind == EditorRequest::RequestKind::FullPreview,
@@ -846,12 +858,61 @@ void checkFastPathAugmentation()
     EditorRequest lumacurve = from_legacy_mask(M_LUMACURVE);
     check(!lumacurve.labChainIntent,
           "a bare luminance curve does not claim the Lab chain");
-    lumacurve.setLegacyGateMask(
-        lumacurve.legacyGateMask | M_LUMINANCE | M_COLOR);
+    lumacurve.markLabPixels(true, true);
     check(lumacurve.labChainIntent,
           "the fast-path Lab augmentation refreshes labChainIntent");
+    check(lumacurve.luminanceIntent && lumacurve.colorIntent,
+          "the fast-path Lab augmentation names both pixel tools");
     check(planningAgreesWithLegacyMask(lumacurve),
           "the fast-path Lab augmentation agrees with its widened mask");
+
+    EditorRequest single = from_legacy_mask(M_RGBCURVE);
+    single.markLabPixels(true, false);
+    check(single.luminanceIntent && !single.colorIntent,
+          "the Lab augmentation keeps the exact bit it was given");
+}
+
+/*
+ * Every execution-payload widening of the preview pass is named as an intent
+ * method. These pin the payload each one produces, so the body gates can read
+ * the named fact instead of the mask.
+ */
+void checkExecutionAugmentations()
+{
+    EditorRequest moved = from_legacy_mask(M_MINUPDATE);
+    moved.markViewportMoved();
+    check(moved.viewportMoved, "the panning requeue records the move");
+    check(moved.monitorIntent, "the panning requeue names M_MONITOR");
+    check(moved.legacyGateMask == (M_MINUPDATE | M_MONITOR),
+          "the panning requeue widens the payload like the old code");
+
+    EditorRequest base = from_legacy_mask(M_CROP);
+    base.markBaseRefresh(true);
+    check(base.fullFrameIntent && base.spotPending,
+          "a base refresh claims the reload and spot work");
+    check(base.monitorIntent, "a base refresh names M_MONITOR");
+    check(base.kind == EditorRequest::RequestKind::FullPreview,
+          "a base refresh widens the kind like the old mask");
+    check(planningAgreesWithLegacyMask(base),
+          "a base refresh agrees with its widened mask");
+
+    EditorRequest hlr = from_legacy_mask(M_WB);
+    hlr.markColorHlrDemosaic();
+    check(hlr.legacyGateMask == (M_WB | DEMOSAIC),
+          "the Color/Coloropp augmentation adds the DEMOSAIC composite");
+    check(hlr.rawIntent && hlr.spotPending,
+          "the Color/Coloropp augmentation names demosaic and spot work");
+    check(planningAgreesWithLegacyMask(hlr),
+          "the Color/Coloropp augmentation agrees with its widened mask");
+
+    EditorRequest rebuilt = from_legacy_mask(M_LUMINANCE);
+    rebuilt.markDemosaicRebuilt();
+    check(rebuilt.legacyGateMask == (M_LUMINANCE | M_INIT | M_CSHARP),
+          "the demosaic rebuild adds M_INIT|M_CSHARP");
+    check(rebuilt.fullFrameIntent && rebuilt.captureSharpenIntent,
+          "the demosaic rebuild claims the reload and capture sharpening");
+    check(planningAgreesWithLegacyMask(rebuilt),
+          "the demosaic rebuild agrees with its widened mask");
 }
 
 /*
@@ -1254,6 +1315,7 @@ int main()
     checkRefreshMapper();
     checkProducerEventKey();
     checkFastPathAugmentation();
+    checkExecutionAugmentations();
     checkCropReallocationWorkOrder();
     checkConvertedProducerIntents();
     checkNoLegacyProducerCalls();
