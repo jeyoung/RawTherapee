@@ -44,6 +44,10 @@ struct StageOpenCLDeviceInfo {
     std::string version;
     bool cpu = false;
     unsigned long long global_memory = 0;
+    /* Platforms the ICD health probe skipped, empty when every platform
+     * answered. An ICD that crashes the query is not fatal: its platforms are
+     * skipped with this diagnostic and the node falls back to the host. */
+    std::string note;
 };
 
 /* True when a usable device is present. A CPU device requires

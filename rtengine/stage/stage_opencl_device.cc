@@ -24,8 +24,10 @@
 #include <algorithm>
 #include <atomic>
 #include <cassert>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
+#include <csignal>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -46,6 +48,20 @@
 
 #include "rt_math.h"
 #include "sleef.h"
+
+/*
+ * The ICD health probe asks a platform's questions in a throwaway process, so
+ * a vendor that kills that process can be skipped; that needs fork().
+ */
+#if defined(__unix__) || defined(__APPLE__)
+#include <sys/resource.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#define RT_STAGE_ICD_PROBE_FORK 1
+#else
+#define RT_STAGE_ICD_PROBE_FORK 0
+#endif
 
 #endif // RT_HAVE_OPENCL
 
@@ -235,20 +251,215 @@ std::string device_string(const Api& api, cl_device_id device, cl_device_info pa
     return value;
 }
 
-bool find_device(const Api& api, cl_device_type type, bool cpu,
-                 SelectedDevice& result)
+bool enumerate_platforms(const Api& api, std::vector<cl_platform_id>& platforms)
 {
     cl_uint platform_count = 0;
     if (api.GetPlatformIDs(0, nullptr, &platform_count) != CL_SUCCESS ||
         platform_count == 0) {
         return false;
     }
-    std::vector<cl_platform_id> platforms(platform_count);
+    platforms.resize(platform_count);
     if (api.GetPlatformIDs(platform_count, platforms.data(), nullptr) != CL_SUCCESS) {
+        platforms.clear();
         return false;
     }
+    return true;
+}
 
+/* ------------------------------------------------------ ICD health probe */
+
+/*
+ * A broken ICD can take the whole process down inside the ICD loader. With the
+ * distribution vendor set (pocl.icd next to rusticl.icd) the Mesa rusticl
+ * platform publishes an uninitialised ICD dispatch chain, and the loader tail
+ * jumps through a null entry while answering the first platform query (Debian
+ * bug #1117930; `clinfo` crashes the same way). That happens before a CL error
+ * code exists, so the platform cannot be validated in this address space.
+ *
+ * The probe therefore asks every platform the questions the selector will ask,
+ * one child process per platform, so that a platform which kills or hangs its
+ * child can be observed and skipped without hiding the platforms behind it.
+ * The parent dispatches only to platforms that answered.
+ */
+
+enum class PlatformHealth {
+    USABLE,    // answered every probe question
+    CRASHED,   // the probe child died before answering
+    TIMED_OUT, // the probe child hung and was killed by the alarm
+    UNPROBED   // the probe itself could not run
+};
+
+/* Upper bound for one probe child, in seconds. A vendor that hangs the query
+ * must not hang RawTherapee; the child is killed and its platform skipped. */
+constexpr unsigned PROBE_TIMEOUT_SECONDS = 30;
+
+struct PlatformProbe {
+    std::vector<PlatformHealth> health;
+    /* Set when the probe could not run at all. */
+    std::string failure;
+};
+
+/*
+ * The same calls find_device() makes for a platform. The CL status codes are
+ * irrelevant: what is being established is that the call returned at all.
+ */
+void probe_platform(const Api& api, cl_platform_id platform)
+{
+    std::size_t size = 0;
+    (void)api.GetPlatformInfo(platform, CL_PLATFORM_NAME, 0, nullptr, &size);
+
+    cl_uint device_count = 0;
+    if (api.GetDeviceIDs(platform, CL_DEVICE_TYPE_ALL, 0, nullptr, &device_count) !=
+            CL_SUCCESS ||
+        device_count == 0) {
+        return;
+    }
+    cl_device_id device = nullptr;
+    if (api.GetDeviceIDs(platform, CL_DEVICE_TYPE_ALL, 1, &device, nullptr) !=
+            CL_SUCCESS ||
+        device == nullptr) {
+        return;
+    }
+    cl_device_type type = 0;
+    (void)api.GetDeviceInfo(device, CL_DEVICE_NAME, 0, nullptr, &size);
+    (void)api.GetDeviceInfo(device, CL_DEVICE_TYPE, sizeof(type), &type, nullptr);
+    cl_ulong memory = 0;
+    (void)api.GetDeviceInfo(device, CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(memory),
+                            &memory, nullptr);
+}
+
+/*
+ * One child per platform, so a platform that kills its child cannot hide the
+ * platforms behind it. The child answers with one byte and is reaped; its exit
+ * status and the missing byte tell the parent what happened.
+ */
+PlatformHealth probe_platform_isolated(const Api& api, cl_platform_id platform)
+{
+#if RT_STAGE_ICD_PROBE_FORK
+    int pipe_fds[2] = {-1, -1};
+    if (pipe(pipe_fds) != 0) {
+        return PlatformHealth::UNPROBED;
+    }
+    const pid_t child = fork();
+    if (child < 0) {
+        (void)close(pipe_fds[0]);
+        (void)close(pipe_fds[1]);
+        return PlatformHealth::UNPROBED;
+    }
+    if (child == 0) {
+        /* Probe child: no stdio, no atexit handlers, no core file, and an
+         * alarm so a hung vendor cannot outlive the probe. */
+        (void)close(pipe_fds[0]);
+        const struct rlimit no_core = {0, 0};
+        (void)setrlimit(RLIMIT_CORE, &no_core);
+        (void)alarm(PROBE_TIMEOUT_SECONDS);
+        probe_platform(api, platform);
+        const unsigned char answered = 1;
+        (void)write(pipe_fds[1], &answered, sizeof(answered));
+        _exit(0);
+    }
+
+    (void)close(pipe_fds[1]);
+    unsigned char answered = 0;
+    ssize_t got = 0;
+    do {
+        got = read(pipe_fds[0], &answered, sizeof(answered));
+    } while (got < 0 && errno == EINTR);
+    (void)close(pipe_fds[0]);
+
+    int status = 0;
+    while (waitpid(child, &status, 0) < 0 && errno == EINTR) {
+    }
+
+    if (got == static_cast<ssize_t>(sizeof(answered))) {
+        return PlatformHealth::USABLE;
+    }
+    if (WIFSIGNALED(status) && WTERMSIG(status) == SIGALRM) {
+        return PlatformHealth::TIMED_OUT;
+    }
+    return PlatformHealth::CRASHED;
+#else
+    /* Without fork() a vendor that kills the process cannot be observed, so
+     * query the platform directly. The defect this guards against is in the
+     * ocl-icd loader, which these platforms do not use. */
+    (void)api;
+    (void)platform;
+    return PlatformHealth::USABLE;
+#endif
+}
+
+PlatformProbe probe_platforms(const Api& api,
+                              const std::vector<cl_platform_id>& platforms)
+{
+    PlatformProbe probe;
+    probe.health.reserve(platforms.size());
     for (cl_platform_id platform : platforms) {
+        const PlatformHealth health = probe_platform_isolated(api, platform);
+        if (health == PlatformHealth::UNPROBED && probe.failure.empty()) {
+            probe.failure = "the ICD health probe could not start";
+        }
+        probe.health.push_back(health);
+    }
+    return probe;
+}
+
+std::string describe_skipped_platforms(const PlatformProbe& probe,
+                                       std::size_t platform_count)
+{
+    if (!probe.failure.empty()) {
+        return probe.failure + "; the OpenCL device path is disabled";
+    }
+    std::size_t skipped = 0;
+    std::string detail;
+    for (std::size_t index = 0; index < probe.health.size(); ++index) {
+        std::string reason;
+        switch (probe.health[index]) {
+        case PlatformHealth::USABLE:
+            continue;
+        case PlatformHealth::CRASHED:
+            reason = "crashed the ICD query";
+            break;
+        case PlatformHealth::TIMED_OUT:
+            reason = "did not answer within " +
+                     std::to_string(PROBE_TIMEOUT_SECONDS) + " s";
+            break;
+        case PlatformHealth::UNPROBED:
+            reason = "was not probed";
+            break;
+        }
+        ++skipped;
+        if (!detail.empty()) {
+            detail += "; ";
+        }
+        detail += "platform " + std::to_string(index) + " " + reason;
+    }
+    if (skipped == 0) {
+        return {};
+    }
+    return std::to_string(skipped) + " of " + std::to_string(platform_count) +
+           " OpenCL platform(s) skipped: " + detail +
+           "; check the installed ICDs (/etc/OpenCL/vendors, or OCL_ICD_VENDORS)";
+}
+
+/* Diagnostic about skipped platforms, set once beside the device choice. */
+std::string& icd_note()
+{
+    static std::string note;
+    return note;
+}
+
+bool find_device(const Api& api, const std::vector<cl_platform_id>& platforms,
+                 const std::vector<PlatformHealth>& health, cl_device_type type,
+                 bool cpu, SelectedDevice& result)
+{
+    assert(health.size() == platforms.size());
+
+    for (std::size_t index = 0; index < platforms.size(); ++index) {
+        /* A platform the probe could not validate is never dispatched to. */
+        if (health[index] != PlatformHealth::USABLE) {
+            continue;
+        }
+        const cl_platform_id platform = platforms[index];
         cl_uint device_count = 0;
         if (api.GetDeviceIDs(platform, type, 0, nullptr, &device_count) != CL_SUCCESS ||
             device_count == 0) {
@@ -299,11 +510,21 @@ const SelectedDevice* selected_device(std::string* reason)
             failure = "OpenCL loader unavailable: " + backend.error;
             return;
         }
+        std::vector<cl_platform_id> platforms;
+        if (!enumerate_platforms(backend.api, platforms)) {
+            failure = "no OpenCL platform";
+            return;
+        }
+        const PlatformProbe probe = probe_platforms(backend.api, platforms);
+        icd_note() = describe_skipped_platforms(probe, platforms.size());
+
         /* A GPU or accelerator is used unconditionally. A CPU device is the
          * last resort and needs the explicit opt-in the classic backend also
          * requires, because it is not an accelerated path. */
-        if (find_device(backend.api, CL_DEVICE_TYPE_GPU, false, choice) ||
-            find_device(backend.api, CL_DEVICE_TYPE_ACCELERATOR, false, choice)) {
+        if (find_device(backend.api, platforms, probe.health, CL_DEVICE_TYPE_GPU,
+                        false, choice) ||
+            find_device(backend.api, platforms, probe.health,
+                        CL_DEVICE_TYPE_ACCELERATOR, false, choice)) {
             available = true;
             return;
         }
@@ -312,7 +533,8 @@ const SelectedDevice* selected_device(std::string* reason)
                       "CPU device";
             return;
         }
-        if (find_device(backend.api, CL_DEVICE_TYPE_CPU, true, choice)) {
+        if (find_device(backend.api, platforms, probe.health, CL_DEVICE_TYPE_CPU,
+                        true, choice)) {
             available = true;
             return;
         }
@@ -322,6 +544,9 @@ const SelectedDevice* selected_device(std::string* reason)
     if (!available) {
         if (reason != nullptr) {
             *reason = failure;
+            if (!icd_note().empty()) {
+                *reason += "; " + icd_note();
+            }
         }
         return nullptr;
     }
@@ -1338,6 +1563,7 @@ bool opencl_stage_device_info(StageOpenCLDeviceInfo* info)
         info->version = selected->version;
         info->cpu = selected->cpu;
         info->global_memory = selected->global_memory;
+        info->note = icd_note();
     }
     return true;
 }

@@ -624,6 +624,73 @@ void test_selection(bool available)
     clear_node_device_overrides();
 }
 
+/* ------------------------------------------------ ambient ICD robustness */
+
+/*
+ * Regression cover for a broken ICD. With the distribution vendor set
+ * (pocl.icd next to rusticl.icd) the rusticl platform publishes an
+ * uninitialised ICD dispatch chain, so the first query against it jumps
+ * through a null entry inside the loader and kills the process before any CL
+ * error exists (Debian bug #1117930; `clinfo` crashes the same way).
+ *
+ * The device path must skip such a platform and still produce a result: either
+ * it selects a usable device or it runs the node on the host. Both outcomes
+ * pass; a crash, or a selection that claims a device the queue cannot use,
+ * does not.
+ */
+void test_icd_robustness(bool available, const std::string& reason)
+{
+    using namespace rtengine::stage;
+
+    StageOpenCLDeviceInfo info;
+    const bool have_info = opencl_stage_device_info(&info);
+    check(have_info == available, "device info and availability agree");
+    if (available) {
+        check(!info.platform.empty(), "the selected platform has a name");
+        check(!info.device.empty(), "the selected device has a name");
+        std::printf("stage-residency: icd: device=%s platform=%s executor=%s\n",
+                    info.device.c_str(), info.platform.c_str(),
+                    info.cpu ? "CPU" : "GPU");
+    } else {
+        check(!reason.empty(), "an unavailable device explains why");
+        std::printf("stage-residency: icd: host fallback (%s)\n", reason.c_str());
+    }
+    if (!info.note.empty()) {
+        std::printf("stage-residency: icd: %s\n", info.note.c_str());
+    }
+
+    /* Whichever branch was taken, the resize node still runs. */
+    StageBufferAllocator host(StageDeviceType::CPU);
+    NodeFixture fixture;
+    if (!fixture.allocate(host, 64, 48, 32, 24)) {
+        check(false, "the ICD robustness fixture allocates");
+        return;
+    }
+
+    std::string select_reason;
+    const auto device = select_device(StageDeviceType::OPENCL, &select_reason);
+    check(device != nullptr, "node selection returns a device");
+    const bool selected_device = device->type() == StageDeviceType::OPENCL;
+    check(selected_device == available,
+          "the selected device agrees with the availability check");
+
+    const auto context = device->create_context();
+    StageRequest request;
+    request.name = "lanczos3";
+    request.args = fixture.args(fixture.device_output, 0.5);
+    set_node_device_override("lanczos3", StageNodeDevice::OpenCL);
+    StageExecution execution;
+    const RtStageStatus status = context->execute(request, nullptr, &execution);
+    clear_node_device_overrides();
+
+    check(status == RT_STAGE_OK,
+          "the resize node runs with the ambient ICD set");
+    check(execution.device == (available ? StageDeviceType::OPENCL
+                                         : StageDeviceType::CPU),
+          "the node runs on the selected device or the host");
+    check(host.release(fixture.device_output), "the robustness output is released");
+}
+
 /* -------------------------------------------------------- first device node */
 
 void test_node_parity(bool available)
@@ -841,6 +908,7 @@ int main()
 
     test_cpu_events();
     test_failed_event();
+    test_icd_robustness(available, reason);
     test_device_events(available);
     test_selection(available);
     test_residency();

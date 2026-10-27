@@ -1,6 +1,7 @@
 #include "stage_buffer.h"
 #include "stage_buffer_state.h"
 #include "stage_device.h"
+#include "stage_opencl_device.h"
 #include "stage_parity.h"
 #include "stage_runtime.h"
 
@@ -206,11 +207,19 @@ int main()
               "OpenCL wait reports fallback");
     }
 
-    /* Device selection falls back to CPU when OpenCL is unavailable. */
+    /* Device selection falls back to CPU when OpenCL is unavailable. The
+     * status line carries the ICD diagnostic when a platform was skipped. */
     std::string ocl_reason;
     const auto ocl_selection = select_device(StageDeviceType::OPENCL, &ocl_reason);
-    std::printf("opencl-stage-device: %s\n",
-                ocl->available() ? "available" : "unavailable (CPU fallback)");
+    std::string ocl_status;
+    StageOpenCLDeviceInfo ocl_info;
+    if (opencl_stage_available(&ocl_status) && opencl_stage_device_info(&ocl_info)) {
+        std::printf("opencl-stage-device: available%s%s\n",
+                    ocl_info.note.empty() ? "" : "; ", ocl_info.note.c_str());
+    } else {
+        std::printf("opencl-stage-device: unavailable (CPU fallback); %s\n",
+                    ocl_status.c_str());
+    }
     if (ocl->available()) {
         check(ocl_selection->type() == StageDeviceType::OPENCL,
               "available OpenCL is selected");
