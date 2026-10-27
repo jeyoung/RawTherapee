@@ -93,6 +93,15 @@ struct CropStageContext {
      */
     const rtengine::EditorRequest& request;
 
+    /*
+     * The pass was widened to the legacy "everything" request because the
+     * buffers were replaced or the editor asked for the high-quality chain.
+     * The typed request describes only what the editor asked for, so a body
+     * gate whose legacy predicate used a bit that `todo = ALL` carries must
+     * consult this fact as well. See Crop::update().
+     */
+    bool forcedFull = false;
+
     // Raw load and auto-denoise scratch.
     bool needsInitUpdate = false;
     int tr = 0;
@@ -616,9 +625,18 @@ void Crop::update(int todo, const EditorRequest& request)
         needsinitupdate = setCropSizes(wx, wy, ww, wh, ws, true);     // this set skip=ws
     }
 
-    // it something has been reallocated, all processing steps have to be performed
-    if (needsinitupdate
-            || request.kind == rtengine::stage::RequestKind::HighQuality) {
+    /*
+     * It something has been reallocated, or the editor asked for the
+     * high-quality chain, all processing steps have to be performed, exactly
+     * as the legacy `todo = ALL` assignment did. Keep that force as its own
+     * fact: the typed request below still describes only what the editor
+     * asked for, so the converted body gates must see both. A fullUpdate()
+     * already carries `ALL` in its request and needs no extra fact.
+     */
+    const bool forcedFull = needsinitupdate
+        || request.kind == rtengine::stage::RequestKind::HighQuality;
+
+    if (forcedFull) {
         todo = ALL;
     }
 
@@ -636,6 +654,7 @@ void Crop::update(int todo, const EditorRequest& request)
      * same order, so the plan cannot change an arithmetic step or an ordering.
      */
     CropStageContext ctx(*parent->params, todo, baseCrop, request);
+    ctx.forcedFull = forcedFull;
     ctx.needsInitUpdate = needsinitupdate;
     ctx.widIm = widIm;
     ctx.heiIm = heiIm;
@@ -653,7 +672,7 @@ void Crop::update(int todo, const EditorRequest& request)
      * high-detail flags while they run.
      */
     const auto cropRenderState = [this, &request, &params,
-                                  viewportMovedRequest, needsinitupdate]() {
+                                  viewportMovedRequest, forcedFull]() {
         rtengine::stage::RenderStateKey state;
         state.previewScale = skip;
         state.previewWidth = cropw;
@@ -692,16 +711,18 @@ void Crop::update(int todo, const EditorRequest& request)
          * The fast-preview and main-preview switches are preview request
          * state; the crop viewport does not consult them.
          *
-         * The request kind comes from the typed request, except for a
-         * reallocation: the buffers were just replaced, so the base must be
-         * refilled whatever the editor asked for. That force is carried in the
-         * render-state kind as FullCrop, which makes derive_crop_work() name
-         * the raw base rebuild even when the request is ParamsOnly or
-         * RepaintOnly. HighQuality keeps its own priority for the work order;
-         * the dirty derivation carries the reallocation through forceFull.
+         * The request kind comes from the typed request, except for a forced
+         * pass: the buffers were just replaced or the editor asked for the
+         * high-quality chain, so the base must be refilled whatever the
+         * request says. That force is carried in the render-state kind as
+         * FullCrop, which makes derive_crop_work() name the raw base rebuild
+         * even when the request is ParamsOnly or RepaintOnly. This mirrors the
+         * legacy `todo = ALL`: its M_INIT/M_LINDENOISE/M_HDR bits always
+         * reloaded the base, and the HDR and local-adjustment bodies overwrite
+         * origCrop, so a forced pass must start from fresh pixels.
          */
         state.requestKind = rtengine::crop_request_kind(
-            request.kind, needsinitupdate);
+            request.kind, forcedFull);
 
         /*
          * Request facts. The source is read at its current frame. The
@@ -724,8 +745,16 @@ void Crop::update(int todo, const EditorRequest& request)
                 parent->imgsrc->getDirPyrDenoiseExpComp();
         }
         state.denoiseAnalysisValid = parent->denoiseInfoStore.valid;
-        state.spotPending = request.spotPending && params.spot.enabled
-            && !params.spot.entries.empty();
+        /*
+         * A forced pass carries M_SPOT in the legacy `ALL`: the base is
+         * refilled, so the configured spots must be applied to it again. The
+         * request's own spot fact is not enough, because a high-quality pass
+         * asks for the accurate chain, not for spot work.
+         */
+        const bool spotsConfigured =
+            params.spot.enabled && !params.spot.entries.empty();
+        state.spotPending =
+            spotsConfigured && (request.spotPending || forcedFull);
         state.spotBufferLive = spotCrop != nullptr;
 
         /*
@@ -1582,7 +1611,7 @@ void Crop::stageRawBase(CropStageContext& ctx)
 
     std::unique_ptr<Imagefloat> fattalCrop;
 
-    if (ctx.request.hdrIntent
+    if ((ctx.request.hdrIntent || ctx.forcedFull)
             && (params.fattal.enabled || params.dehaze.enabled)) {
         Imagefloat *f = origCrop;
         int fw = skips(parent->fw, skip);
@@ -1675,7 +1704,8 @@ void Crop::stageTransform(CropStageContext& ctx)
 
     // transform
    // if (needstransform || ((todo & (M_TRANSFORM | M_RGBCURVE)) && params.dirpyrequalizer.cbdlMethod == "bef" && params.dirpyrequalizer.enabled && !params.colorappearance.enabled)) {
-    const bool transformIntent = ctx.request.transformFamilyIntent;
+    const bool transformIntent =
+        ctx.request.transformFamilyIntent || ctx.forcedFull;
     if (needstransform || (transformIntent && params.dirpyrequalizer.cbdlMethod == "bef" && params.dirpyrequalizer.enabled && !cam02)) {
         if (!transCrop) {
             transCrop = new Imagefloat(cropw, croph);
@@ -1715,7 +1745,8 @@ void Crop::stageLocalAdjustments(CropStageContext& ctx)
     ProcParams& params = ctx.params;
     Imagefloat*& baseCrop = ctx.baseCrop;
 
-    if (ctx.request.localAdjustmentsIntent && params.locallab.enabled && !params.locallab.spots.empty()) {
+    if ((ctx.request.localAdjustmentsIntent || ctx.forcedFull)
+            && params.locallab.enabled && !params.locallab.spots.empty()) {
 
         //I made a little change here. Rather than have luminanceCurve (and others) use in/out lab images, we can do more if we copy right here.
         parent->ipf.rgb2lab(*baseCrop, *laboCrop, params.icm.workingProfile);
@@ -2239,7 +2270,7 @@ void Crop::stageRgbProc(CropStageContext& ctx)
     ProcParams& params = ctx.params;
     Imagefloat*& baseCrop = ctx.baseCrop;
 
-    if (ctx.request.rgbProcIntent) {
+    if (ctx.request.rgbProcIntent || ctx.forcedFull) {
         double rrm, ggm, bbm;
         DCPProfileApplyState as;
         DCPProfile *dcpProf = parent->imgsrc->getDCP(params.icm, as);
@@ -2258,7 +2289,7 @@ void Crop::stageLabTools(CropStageContext& ctx)
     const bool cam02 = ctx.cam02;
     LUTu& dummy = ctx.dummy;
 
-    if (!ctx.request.labChainIntent) {
+    if (!ctx.request.labChainIntent && !ctx.forcedFull) {
         return;
     }
     labnCrop->CopyFrom(laboCrop);
@@ -2295,7 +2326,7 @@ void Crop::stageLabSharpening(CropStageContext& ctx)
     ProcParams& params = ctx.params;
     const bool cam02 = ctx.cam02;
 
-    if (!ctx.request.labChainIntent) {
+    if (!ctx.request.labChainIntent && !ctx.forcedFull) {
         return;
     }
     //parent->ipf.EPDToneMap(labnCrop, 5, 1);    //Go with much fewer than normal iterates for fast redisplay.
@@ -2322,7 +2353,7 @@ void Crop::stageLabWavelet(CropStageContext& ctx)
     ProcParams& params = ctx.params;
     const bool cam02 = ctx.cam02;
 
-    if (!ctx.request.labChainIntent) {
+    if (!ctx.request.labChainIntent && !ctx.forcedFull) {
         return;
     }
     //   if (skip==1) {
@@ -2587,7 +2618,7 @@ void Crop::stageLabWavelet(CropStageContext& ctx)
 void Crop::stageWorkingTrc(CropStageContext& ctx)
 {
     ProcParams& params = ctx.params;
-    if (!ctx.request.labChainIntent) {
+    if (!ctx.request.labChainIntent && !ctx.forcedFull) {
         return;
     }
     parent->ipf.softLight(labnCrop, params.softlight);
@@ -2716,7 +2747,7 @@ void Crop::stageCieCam(CropStageContext& ctx)
     ProcParams& params = ctx.params;
     LUTu& dummy = ctx.dummy;
 
-    if (!ctx.request.labChainIntent) {
+    if (!ctx.request.labChainIntent && !ctx.forcedFull) {
         return;
     }
     if (params.colorappearance.enabled) {
@@ -2763,7 +2794,7 @@ void Crop::stageCieCam(CropStageContext& ctx)
 void Crop::stageGamut(CropStageContext& ctx)
 {
     ProcParams& params = ctx.params;
-    if (!ctx.request.labChainIntent) {
+    if (!ctx.request.labChainIntent && !ctx.forcedFull) {
         return;
     }
     bool exec = params.icm.wgamut != ColorManagementParams::Wwgamut::NONE  || params.icm.wgamgain != 0.f;

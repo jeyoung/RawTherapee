@@ -734,7 +734,19 @@ const std::vector<EditScenario>& editScenarios()
          [](rtengine::procparams::ProcParams& p) {
              p.fattal.enabled = true;
              p.fattal.amount += 10;
-         }}
+         }},
+        /*
+         * Regression: a bare high-quality request (opening a detail window,
+         * imagearea.cc:809) does not carry M_HDR, but the crop widens it to
+         * the legacy "everything" request. It must therefore still rebuild
+         * the dehazed base. The reference is a fresh full render of the same
+         * parameters, so a skipped HDR body shows up as a byte difference.
+         */
+        {"highqual-dehaze", M_HIGHQUAL, false,
+         [](rtengine::procparams::ProcParams& p) {
+             p.dehaze.enabled = true;
+             p.dehaze.strength = 60;
+         }},
     };
     return scenarios;
 }
@@ -835,6 +847,49 @@ bool runGeometrySequence(const std::string& file,
 
     return reportSequence("geometry", 0, incrementalDerived, reference,
                           outDir);
+}
+
+/*
+ * A forced high-quality pass over a base that local adjustments and a visible
+ * spot have already written into. The change is an exposure edit, so the
+ * request reaches the preview while the spot family stays unchanged; the
+ * pass must refill origCrop and reapply the spots, exactly as the legacy
+ * `todo = ALL` did. A forced pass that reruns the bodies on the old buffers
+ * double-applies the local adjustments, and one that refills without the
+ * spot work loses the removal; both show up against the fresh render.
+ */
+bool runForcedRefillSequence(const std::string& file,
+                             const rtengine::procparams::ProcParams& params,
+                             const std::string& outDir)
+{
+    rtengine::procparams::ProcParams configured = params;
+    configured.locallab.enabled = true;
+    configured.locallab.spots.emplace_back();
+    configured.spot.enabled = true;
+    rtengine::procparams::SpotEntry entry;
+    entry.sourcePos = rtengine::Coord(1500, 1000);
+    entry.targetPos = rtengine::Coord(1600, 1100);
+    configured.spot.entries.push_back(entry);
+
+    rtengine::procparams::ProcParams changed = configured;
+    changed.toneCurve.expcomp = 0.5;
+
+    Session candidate(file, configured, CropState::Full);
+    if (!candidate.ready() || !candidate.apply(changed, M_HIGHQUAL)) {
+        std::fprintf(stderr,
+                     "FAIL seq highqual-refill: the candidate session failed\n");
+        return false;
+    }
+
+    Result reference;
+    if (!runCrop(file, changed, CropState::Full, reference)) {
+        std::fprintf(stderr,
+                     "FAIL seq highqual-refill: the reference session failed\n");
+        return false;
+    }
+
+    return reportSequence("highqual-refill", M_HIGHQUAL, candidate.result(),
+                          reference, outDir);
 }
 
 /*
@@ -1040,6 +1095,9 @@ int main(int argc, char** argv)
     if (sequences) {
         if (onlyScenario.empty() || onlyScenario == "geometry") {
             ok = runGeometrySequence(file, params, outDir) && ok;
+        }
+        if (onlyScenario.empty() || onlyScenario == "highqual-refill") {
+            ok = runForcedRefillSequence(file, params, outDir) && ok;
         }
         for (const EditScenario& scenario : editScenarios()) {
             if (!onlyScenario.empty() && onlyScenario != scenario.name) {
