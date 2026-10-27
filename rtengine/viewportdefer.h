@@ -19,10 +19,14 @@
 #pragma once
 
 #include <algorithm>
+#include <cassert>
+#include <cstdint>
+#include <type_traits>
 
 #include <glib.h>
 
 #include "refreshmap.h"
+#include "stage/stage_dirty_blocks.h"
 
 namespace rtengine
 {
@@ -68,23 +72,234 @@ constexpr int VIEWPORT_DEFERRED_POLL_MS = 10;
  */
 constexpr int VIEWPORT_DEFERRED_IDLE_POLL_MS = 100;
 
-/**
- * @brief Build the full-frame analysis mask that a viewport fast-path hit
- * skipped.
+/*
+ * Graph nodes a deferred analysis pass may have to run.
  *
- * The forced bits make the deferred pass rebuild the full-frame analysis even
- * when the original request only carried one downstream stage. Base bits are
- * stripped: the fast path never changes the base, and a request that does
- * takes the normal path instead.
+ * The retired mask kept the same set implicitly: M_MONITOR selected
+ * monitor.output, M_RGBCURVE selected rgb.proc, and the Lab bits selected the
+ * Lab chain. Spelling the nodes out here makes the mapping a typed fact that
+ * the coordinator applies once; no M_* bit decides the deferred schedule.
  */
-constexpr int viewportDeferredMask(int todo)
+enum class DeferredStage : uint32_t {
+    MonitorOutput = 1u << 0,
+    RgbProc = 1u << 1,
+    LabTools = 1u << 2,
+    LabWavelet = 1u << 3,
+    WorkingTrc = 1u << 4,
+    CieCam = 1u << 5,
+    Gamut = 1u << 6,
+    LocalAdjustments = 1u << 7
+};
+
+/* The stages a deferred pass always runs: the full-frame analysis chain. */
+constexpr uint32_t deferredForcedStageBits =
+    static_cast<uint32_t>(DeferredStage::MonitorOutput)
+    | static_cast<uint32_t>(DeferredStage::RgbProc)
+    | static_cast<uint32_t>(DeferredStage::LabTools)
+    | static_cast<uint32_t>(DeferredStage::LabWavelet)
+    | static_cast<uint32_t>(DeferredStage::WorkingTrc)
+    | static_cast<uint32_t>(DeferredStage::CieCam)
+    | static_cast<uint32_t>(DeferredStage::Gamut);
+
+/* Stable lower-case node id of one deferred stage. */
+inline const char* deferredStageId(DeferredStage stage)
 {
-    constexpr int forced =
-        M_MONITOR | M_RGBCURVE | M_LUMACURVE | M_LUMINANCE | M_COLOR;
-    constexpr int base =
-        M_HDR | M_SPOT | M_PREPROC | M_RAW | M_WB | M_INIT | M_LINDENOISE
-        | M_CSHARP | M_RETINEX | M_TRANSFORM | M_HIGHQUAL | M_BLURMAP;
-    return (todo | forced) & ~base;
+    switch (stage) {
+    case DeferredStage::MonitorOutput:
+        return "monitor.output";
+    case DeferredStage::RgbProc:
+        return "rgb.proc";
+    case DeferredStage::LabTools:
+        return "lab.tools";
+    case DeferredStage::LabWavelet:
+        return "lab.wavelet";
+    case DeferredStage::WorkingTrc:
+        return "working.trc";
+    case DeferredStage::CieCam:
+        return "ciecam";
+    case DeferredStage::Gamut:
+        return "gamut";
+    case DeferredStage::LocalAdjustments:
+        return "local.adjustments";
+    }
+
+    assert(false && "unknown deferred stage");
+    return "";
+}
+
+/* Stage bit named by a block id; unknown ids contribute none. */
+inline uint32_t deferredStageBitForId(const std::string& id)
+{
+    if (id == "monitor.output") {
+        return static_cast<uint32_t>(DeferredStage::MonitorOutput);
+    }
+    if (id == "rgb.proc") {
+        return static_cast<uint32_t>(DeferredStage::RgbProc);
+    }
+    if (id == "lab.tools") {
+        return static_cast<uint32_t>(DeferredStage::LabTools);
+    }
+    if (id == "lab.wavelet") {
+        return static_cast<uint32_t>(DeferredStage::LabWavelet);
+    }
+    if (id == "working.trc") {
+        return static_cast<uint32_t>(DeferredStage::WorkingTrc);
+    }
+    if (id == "ciecam") {
+        return static_cast<uint32_t>(DeferredStage::CieCam);
+    }
+    if (id == "gamut") {
+        return static_cast<uint32_t>(DeferredStage::Gamut);
+    }
+    if (id == "local.adjustments") {
+        return static_cast<uint32_t>(DeferredStage::LocalAdjustments);
+    }
+    return 0;
+}
+
+/* Typed stage bits named by a dirty-block set; unknown ids contribute none. */
+inline uint32_t deferredStageBits(const stage::DirtyBlocks& blocks)
+{
+    uint32_t bits = 0;
+    for (const std::string& id : blocks.ids) {
+        bits |= deferredStageBitForId(id);
+    }
+    return bits;
+}
+
+/* Dirty-block set for the stages a deferred pass always runs. */
+inline stage::DirtyBlocks deferredForcedBlocks()
+{
+    stage::DirtyBlocks blocks;
+    blocks.valid = true;
+    const DeferredStage stages[] = {
+        DeferredStage::MonitorOutput,
+        DeferredStage::RgbProc,
+        DeferredStage::LabTools,
+        DeferredStage::LabWavelet,
+        DeferredStage::WorkingTrc,
+        DeferredStage::CieCam,
+        DeferredStage::Gamut
+    };
+    for (DeferredStage stage : stages) {
+        blocks.ids.insert(deferredStageId(stage));
+    }
+    blocks.blocks.assign(blocks.ids.begin(), blocks.ids.end());
+    return blocks;
+}
+
+/*
+ * Opaque execution payload for the block bodies of the deferred pass.
+ *
+ * This is derived from the typed stage bits once and then carried on the
+ * request exactly as the old mask was: it is the payload the unconverted
+ * bodies still read, not the deferred schedule. It deliberately names only
+ * downstream stages; no source or raw block is ever added.
+ */
+inline int deferredExecutionPayload(uint32_t stageBits)
+{
+    int payload = 0;
+    if ((stageBits & static_cast<uint32_t>(DeferredStage::MonitorOutput))
+            != 0) {
+        payload |= M_MONITOR;
+    }
+    if ((stageBits & static_cast<uint32_t>(DeferredStage::RgbProc)) != 0) {
+        payload |= M_RGBCURVE;
+    }
+    if ((stageBits & (static_cast<uint32_t>(DeferredStage::LabTools)
+                      | static_cast<uint32_t>(DeferredStage::LabWavelet)
+                      | static_cast<uint32_t>(DeferredStage::WorkingTrc)
+                      | static_cast<uint32_t>(DeferredStage::CieCam)
+                      | static_cast<uint32_t>(DeferredStage::Gamut)))
+            != 0) {
+        payload |= M_LUMACURVE | M_LUMINANCE | M_COLOR;
+    }
+    if ((stageBits & static_cast<uint32_t>(DeferredStage::LocalAdjustments))
+            != 0) {
+        payload |= M_AUTOEXP;
+    }
+    return payload;
+}
+
+/**
+ * @brief Lock-free snapshot of the deferred record.
+ *
+ * The value is a single 64-bit word so it is always lock-free: the render path
+ * loads it with one atomic read and never takes `paramsUpdateMutex`. The typed
+ * DeferredStage bit set, the explicit forced-analysis flag and the hit count
+ * are packed; the settle window timestamps stay in the authoritative record
+ * because only the watcher, which already holds the mutex, reads them.
+ */
+struct DeferredAnalysisSnapshot {
+    static constexpr uint64_t stageMask = 0xFFu;
+    static constexpr uint64_t forcedBit = 1ull << 8;
+    static constexpr int hitsShift = 32;
+
+    uint64_t packed = 0;
+
+    static DeferredAnalysisSnapshot make(uint32_t stageBits, bool forced,
+                                         int32_t hits)
+    {
+        DeferredAnalysisSnapshot snapshot;
+        snapshot.packed =
+            (static_cast<uint64_t>(stageBits) & stageMask)
+            | (forced ? forcedBit : 0)
+            | (static_cast<uint64_t>(
+                   static_cast<uint32_t>(hits)) << hitsShift);
+        return snapshot;
+    }
+
+    uint32_t stageBits() const
+    {
+        return static_cast<uint32_t>(packed & stageMask);
+    }
+
+    bool forcedAnalysis() const
+    {
+        return (packed & forcedBit) != 0;
+    }
+
+    int32_t hits() const
+    {
+        return static_cast<int32_t>(packed >> hitsShift);
+    }
+
+    bool pending() const
+    {
+        return forcedAnalysis() || stageBits() != 0;
+    }
+};
+
+static_assert(std::is_trivially_copyable_v<DeferredAnalysisSnapshot>
+                  && sizeof(DeferredAnalysisSnapshot) == sizeof(uint64_t),
+              "the deferred snapshot must be a lock-free 64-bit value");
+
+/**
+ * @brief Authoritative deferred record, guarded by `paramsUpdateMutex`.
+ *
+ * The block set is the typed record the coordinator accumulates and absorbs.
+ * The hit count and the two timestamps are the existing settle-window
+ * bookkeeping; the snapshot below is derived from this record after every
+ * mutation and published atomically for lock-free readers.
+ */
+struct DeferredRecord {
+    stage::DirtyBlocks blocks;
+    bool forcedAnalysis = false;
+    int32_t hits = 0;
+    gint64 firstHitUs = 0;
+    gint64 deadlineUs = 0;
+
+    bool pending() const
+    {
+        return forcedAnalysis || !blocks.ids.empty();
+    }
+};
+
+/* Derive the lock-free snapshot from the authoritative record. */
+inline DeferredAnalysisSnapshot deferredSnapshot(const DeferredRecord& record)
+{
+    return DeferredAnalysisSnapshot::make(
+        deferredStageBits(record.blocks), record.forcedAnalysis, record.hits);
 }
 
 /**

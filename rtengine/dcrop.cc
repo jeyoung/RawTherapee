@@ -758,13 +758,6 @@ void Crop::update(int todo, const EditorRequest& request)
         state.spotBufferLive = spotCrop != nullptr;
 
         /*
-         * The crop has no deferred analysis of its own, so this stays at the
-         * default. The mask is coordinator request state, which the preview
-         * key carries.
-         */
-        state.deferredAnalysisMask = 0;
-
-        /*
          * Crop guides are an overlay that no stage consumes, so cropGuide is
          * deliberately absent from the parameter fingerprint. It is carried
          * here as a pure state value instead. The previous key kept in

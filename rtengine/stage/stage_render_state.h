@@ -31,6 +31,42 @@ struct CropGuideParams;
 namespace rtengine::stage
 {
 
+struct DirtyBlocks;
+
+/*
+ * Reason the preview base cache is invalidated for one request.
+ *
+ * The values keep the strings the mask-based coordinator published, so a
+ * profile log stays comparable across the retirement. The precedence is the
+ * old one: a source preprocess wins over a demosaic, which wins over a base
+ * finish, which wins over the high-detail request. `None` means the request
+ * leaves the cached base reusable.
+ */
+enum class BaseCacheInvalidation : int32_t {
+    None = 0,
+    Preprocess = 1,
+    Raw = 2,
+    WhiteBalance = 3,
+    HighDetailRequest = 4
+};
+
+/* Stable reason string, or null for None. */
+const char* baseCacheInvalidationReason(BaseCacheInvalidation invalidation);
+
+/*
+ * Map a typed dirty-block set and the high-detail request fact to the base
+ * cache invalidation.
+ *
+ * The set is the narrow "base cache inputs" set, not the pass execution set:
+ * `raw.preprocess` is a source preprocess change, `raw.demosaic` a demosaiced
+ * plane change, and `raw.base` the base finish where white balance is applied.
+ * A caller must not pass the full execution set, because the base block also
+ * covers spot, film-negative, retinex and tone-curve inputs that the cache
+ * key or its bypass rules handle without invalidating the stored snapshot.
+ */
+BaseCacheInvalidation baseCacheInvalidationFor(const DirtyBlocks& blocks,
+                                               bool highDetailIntent);
+
 /*
  * Kind of work one preview or crop request asks for.
  *
@@ -142,17 +178,15 @@ struct RenderStateKey {
      * Request facts.
      *
      * These are the inputs the exact preview and crop work flags need and that
-     * neither ProcParams nor an earlier field carries. Eight of the twelve
+     * neither ProcParams nor an earlier field carries. Eight of the eleven
      * are mapped to a RenderStateAspect by stage_dirty_blocks.cc: the five
      * source facts join Source, and `dirPyrDenoiseExpComp`,
      * `denoiseAnalysisValid` and `spotBufferLive` form Derived.
      *
-     * The other four are deliberately exempt, each for its own reason:
+     * The other three are deliberately exempt, each for its own reason:
      * `spotPending`, whose false->true transition is carried by the spot
-     * parameter delta; `deferredAnalysisMask`, a scheduling fact the
-     * coordinator absorbs before it builds the key, published from an
-     * advisory atomic snapshot; `cropGuideFingerprint`, an overlay value
-     * whose later job is to suppress a repaint; and `viewportMoved`, which
+     * parameter delta; `cropGuideFingerprint`, an overlay value whose later
+     * job is to suppress a repaint; and `viewportMoved`, which
      * RequestKind::RepaintOnly already represents on the crop.
      *
      * `sourceRotateDegree` is the source rotation in degrees, `sourceFullWidth`
@@ -172,12 +206,11 @@ struct RenderStateKey {
      * parameters still name spots; `spotBufferLive` is true when a spot buffer
      * exists, because restoring it changes the next base pass.
      *
-     * `deferredAnalysisMask` is the full-frame analysis mask the coordinator
-     * had queued for its deferred viewport pass when the key was built; zero
-     * means nothing was queued. The coordinator publishes it from an atomic
-     * member without the coordinator mutex, so it is an advisory snapshot that
-     * can change immediately after it is read; that mutex also guards the
-     * viewport fast-path state, and reading this fact never requires it.
+     * `deferredAnalysisMask` was removed from this struct: deferred analysis is
+     * scheduler state that the coordinator now carries as a typed dirty-block
+     * record before it builds the key, so it is not a render-state field and
+     * does not reach this struct at all.
+     *
      * `cropGuideFingerprint` is a 64-bit fingerprint of CropGuideParams.
      * Guides are an editor overlay and no stage consumes them, so they stay
      * out of the parameter fingerprint; the value is carried here so a later
@@ -202,7 +235,6 @@ struct RenderStateKey {
     bool denoiseAnalysisValid = false;
     bool spotPending = false;
     bool spotBufferLive = false;
-    int32_t deferredAnalysisMask = 0;
     uint64_t cropGuideFingerprint = 0;
     bool viewportMoved = false;
 
@@ -267,7 +299,6 @@ private:
         denoiseAnalysisValid,
         spotPending,
         spotBufferLive,
-        deferredAnalysisMask,
         cropGuideFingerprint,
         viewportMoved))
     {
@@ -310,7 +341,6 @@ private:
             denoiseAnalysisValid,
             spotPending,
             spotBufferLive,
-            deferredAnalysisMask,
             cropGuideFingerprint,
             viewportMoved);
     }

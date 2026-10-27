@@ -79,23 +79,57 @@ namespace
 
 constexpr int VECTORSCOPE_SIZE = 128;
 
-const char* baseCacheTodoReason(int todo)
+/*
+ * Typed base-cache input set for one pass.
+ *
+ * The cache snapshot covers the source preprocess, the demosaiced planes and
+ * the base finish where white balance is applied. Only those three families
+ * invalidate it; the rest of the base block either changes the cache key or is
+ * bypassed, exactly as before. The set is therefore narrow on purpose and must
+ * not be confused with the pass execution set.
+ *
+ * With no usable history every family counts as changed, which is the
+ * conservative answer for the first pass after an image switch.
+ */
+rtengine::stage::DirtyBlocks baseCacheDirtyBlocks(
+    const rtengine::stage::ParamSnapshot* previous,
+    const rtengine::stage::ParamSnapshot& current,
+    bool whiteBalanceRequest)
 {
-    if (todo & M_PREPROC) {
-        return "preprocess";
+    rtengine::stage::DirtyBlocks blocks;
+    blocks.valid = true;
+
+    const bool noHistory = previous == nullptr;
+
+    const auto changed = [&](const char* id) {
+        if (noHistory) {
+            return true;
+        }
+        const auto currentIt = current.find(id);
+        const auto previousIt = previous->find(id);
+        if (currentIt == current.end() || previousIt == previous->end()) {
+            return true;
+        }
+        return currentIt->second != previousIt->second;
+    };
+
+    if (changed("raw.preprocess")) {
+        blocks.ids.insert("raw.preprocess");
     }
-    if (todo & M_RAW) {
-        return "raw";
+    if (changed("raw.demosaic")) {
+        blocks.ids.insert("raw.demosaic");
     }
-    if (todo & M_WB) {
-        return "white-balance";
+    /*
+     * White balance is the one base-finish family that invalidated the cache.
+     * The request fact is the typed form of the old M_WB bit; comparing the
+     * live WB structure would also see the engine's own normalisation and
+     * invalidate on unrelated edits.
+     */
+    if (whiteBalanceRequest) {
+        blocks.ids.insert("raw.base");
     }
-    if (todo & M_HIGHQUAL) {
-        return "high-detail-request";
-    }
-    // M_TRANSFORM is part of ALLNORAW and usually only changes the post-base
-    // transform. The base transform bit mask is part of the cache key instead.
-    return nullptr;
+
+    return blocks;
 }
 
 /*
@@ -151,7 +185,7 @@ struct PreviewTimer {
                      static_cast<long long>(ms), todo, cacheHit ? 1 : 0);
         if (viewportFast) {
             std::fprintf(stderr,
-                         " viewport=fast crop_ms=%lld deferred_todo=0x%x"
+                         " viewport=fast crop_ms=%lld deferred_stages=0x%x"
                          " deferred_hits=%d\n",
                          viewportCropMs, viewportDeferredTodo,
                          viewportDeferredHits);
@@ -308,10 +342,10 @@ ImProcCoordinator::ImProcCoordinator() :
     updaterRunning(false),
     nextParams(new procparams::ProcParams),
     destroying(false),
-    pendingDeferredMask(0),
-    pendingDeferredHits(0),
-    pendingDeferredFirstUs(0),
-    pendingDeferredDeadlineUs(0),
+    pendingDeferred(),
+    pendingDeferredSnapshot(DeferredAnalysisSnapshot{}),
+    absorbedDeferredBlocks(),
+    absorbedDeferredActive(false),
     deferredWatcherStarted(false),
     deferredWatcherPaused(false),
     deferredWatcherStop(false),
@@ -407,10 +441,11 @@ ImProcCoordinator::~ImProcCoordinator()
         deferredWatcher = nullptr;
         deferredWatcherStarted = false;
         deferredWatcherPaused = true;
-        pendingDeferredMask = 0;
-        pendingDeferredHits = 0;
-        pendingDeferredFirstUs = 0;
-        pendingDeferredDeadlineUs = 0;
+        pendingDeferred = DeferredRecord{};
+        pendingDeferredSnapshot.store(DeferredAnalysisSnapshot{},
+                                      std::memory_order_relaxed);
+        absorbedDeferredBlocks = stage::DirtyBlocks{};
+        absorbedDeferredActive = false;
     }
 
     if (watcher) {
@@ -591,23 +626,53 @@ int viewportDeferredMaxWaitMs()
 /*
  * Typed request for a deferred-analysis flush.
  *
- * `pendingDeferredMask` is scheduler state, not an editor request: it is the
- * set of analysis stages a viewport fast-path hit skipped and the full-frame
- * pass must catch up. It never carries a request kind (a deferred mask always
- * includes the forced monitor and curve bits, so it can never be a bare
- * repaint), and it is therefore carried as a ParamsOnly request with the
- * mask as its legacy execution payload.
+ * `pendingDeferred` is scheduler state, not an editor request: it is the set
+ * of analysis nodes a viewport fast-path hit skipped and the full-frame pass
+ * must catch up. It never carries a request kind (a deferred record always
+ * forces the analysis), and it is therefore carried as a ParamsOnly request.
+ * The execution payload is derived from the typed stage bits once, for the
+ * unconverted block bodies only.
  */
-EditorRequest deferredAnalysisRequest(int mask)
+EditorRequest deferredAnalysisRequest(uint32_t stageBits)
 {
-    assert(mask != 0);
+    assert(stageBits != 0);
 
     EditorRequest request;
-    request.present = mask != 0;
+    request.present = stageBits != 0;
     request.controlOnly = false;
     request.kind = stage::RequestKind::ParamsOnly;
-    request.setLegacyGateMask(mask);
+    request.setLegacyGateMask(deferredExecutionPayload(stageBits));
     return request;
+}
+
+/*
+ * Deferred stage set for one fast-path hit.
+ *
+ * The forced analysis stages are joined by the downstream stages the request
+ * itself named, derived from its typed facts. Nothing here can name a source
+ * or raw block, so absorbing the record never schedules the base.
+ */
+stage::DirtyBlocks deferredBlocksForRequest(const EditorRequest& request)
+{
+    stage::DirtyBlocks blocks = deferredForcedBlocks();
+
+    if (request.rgbProcIntent) {
+        blocks.ids.insert("rgb.proc");
+    }
+    if (request.labChainIntent || request.lumaCurveIntent
+            || request.labPixelIntent) {
+        blocks.ids.insert("lab.tools");
+        blocks.ids.insert("lab.wavelet");
+        blocks.ids.insert("working.trc");
+        blocks.ids.insert("ciecam");
+        blocks.ids.insert("gamut");
+    }
+    if (request.autoExposureIntent) {
+        blocks.ids.insert("local.adjustments");
+    }
+
+    blocks.blocks.assign(blocks.ids.begin(), blocks.ids.end());
+    return blocks;
 }
 
 #ifndef NDEBUG
@@ -793,6 +858,14 @@ void ImProcCoordinator::ensureDeferredWatcher()
     paramsUpdateMutex.unlock();
 }
 
+void ImProcCoordinator::publishDeferredSnapshotLocked()
+{
+    // Called with paramsUpdateMutex held. Release pairs with the relaxed
+    // reader, which only needs the whole value to be visible, not ordering.
+    pendingDeferredSnapshot.store(deferredSnapshot(pendingDeferred),
+                                  std::memory_order_release);
+}
+
 void ImProcCoordinator::deferredWatcherLoop()
 {
     int sleepMs = VIEWPORT_DEFERRED_IDLE_POLL_MS;
@@ -807,9 +880,9 @@ void ImProcCoordinator::deferredWatcherLoop()
         bool due = false;
         {
             MyMutex::MyLock lock(paramsUpdateMutex);
-            due = pendingDeferredMask != 0 && !deferredWatcherPaused
-                && g_get_monotonic_time() >= pendingDeferredDeadlineUs;
-            sleepMs = pendingDeferredMask != 0
+            due = pendingDeferred.pending() && !deferredWatcherPaused
+                && g_get_monotonic_time() >= pendingDeferred.deadlineUs;
+            sleepMs = pendingDeferred.pending()
                 ? VIEWPORT_DEFERRED_POLL_MS : VIEWPORT_DEFERRED_IDLE_POLL_MS;
         }
 
@@ -821,23 +894,27 @@ void ImProcCoordinator::deferredWatcherLoop()
 
 void ImProcCoordinator::flushDeferredAnalysis()
 {
-    int mask = 0;
+    uint32_t stageBits = 0;
 
     paramsUpdateMutex.lock();
 
-    if (pendingDeferredMask == 0 || deferredWatcherPaused
+    if (!pendingDeferred.pending() || deferredWatcherPaused
             || deferredWatcherStop.load(std::memory_order_acquire)) {
         paramsUpdateMutex.unlock();
         return;
     }
 
-    mask = pendingDeferredMask;
-    pendingDeferredMask = 0;
-    pendingDeferredHits = 0;
-    pendingDeferredFirstUs = 0;
-    pendingDeferredDeadlineUs = 0;
+    stageBits = deferredStageBits(pendingDeferred.blocks);
+    if (stageBits == 0) {
+        // A forced-analysis record with an empty set still names the full
+        // forced chain; the queue never produces it, but fail safe.
+        stageBits = deferredForcedStageBits;
+    }
+    pendingDeferred = DeferredRecord{};
+    publishDeferredSnapshotLocked();
     forceFullPreview.store(true, std::memory_order_relaxed);
-    pendingRequest = coalesce(pendingRequest, deferredAnalysisRequest(mask));
+    pendingRequest = coalesce(pendingRequest,
+                              deferredAnalysisRequest(stageBits));
 
     paramsUpdateMutex.unlock();
 
@@ -847,10 +924,8 @@ void ImProcCoordinator::flushDeferredAnalysis()
 void ImProcCoordinator::dropPendingDeferred()
 {
     paramsUpdateMutex.lock();
-    pendingDeferredMask = 0;
-    pendingDeferredHits = 0;
-    pendingDeferredFirstUs = 0;
-    pendingDeferredDeadlineUs = 0;
+    pendingDeferred = DeferredRecord{};
+    publishDeferredSnapshotLocked();
     deferredCropReusable.store(false, std::memory_order_relaxed);
     paramsUpdateMutex.unlock();
 }
@@ -861,54 +936,72 @@ bool ImProcCoordinator::absorbPendingDeferred(int& todo)
 
     bool absorbed = false;
 
-    if (pendingDeferredMask != 0) {
-        // The request that is about to run will rebuild the whole-frame
-        // analysis, so it must also cover the stages the fast path skipped.
-        todo |= pendingDeferredMask;
+    if (pendingDeferred.pending()) {
+        /*
+         * The request about to run rebuilds the whole-frame analysis, so it
+         * must also cover the typed stages the fast path skipped. The block
+         * set is merged by the dirty derivation; the derived execution payload
+         * keeps the unconverted block bodies and their typed facts in step.
+         * Neither path names a source or raw block.
+         */
+        absorbedDeferredBlocks = pendingDeferred.blocks;
+        absorbedDeferredActive = true;
+        todo |= deferredExecutionPayload(
+            deferredStageBits(pendingDeferred.blocks));
         absorbed = true;
-        pendingDeferredMask = 0;
-        pendingDeferredHits = 0;
-        pendingDeferredFirstUs = 0;
-        pendingDeferredDeadlineUs = 0;
+        pendingDeferred = DeferredRecord{};
+        publishDeferredSnapshotLocked();
     }
 
     paramsUpdateMutex.unlock();
     return absorbed;
 }
 
-int ImProcCoordinator::queueViewportDeferredAnalysis(int todo,
-                                                     unsigned request)
+uint32_t ImProcCoordinator::queueViewportDeferredAnalysis(
+    const EditorRequest& request, unsigned requestId)
 {
-    // Rebuild the full-frame analysis from the base image already held in
-    // oprevi. Base bits such as M_HDR/M_SPOT are over-approximated by several
-    // event masks and their parameters are known to be unchanged here, so the
-    // deferred pass only forces the monitor conversion and the curve/Lab
-    // pipeline.
-    const int deferred = viewportDeferredMask(todo);
+    /*
+     * Rebuild the full-frame analysis from the base image already held in
+     * oprevi. The typed set names the monitor conversion, rgb.proc and the Lab
+     * chain the old bits selected; it never names a source or raw block, so a
+     * deferred flush cannot dirty the base. The request's own downstream
+     * stages are added from its typed facts, not from the legacy payload.
+     */
+    const stage::DirtyBlocks deferred = deferredBlocksForRequest(request);
+    const uint32_t stageBits = deferredStageBits(deferred);
     const gint64 now = g_get_monotonic_time();
 
     paramsUpdateMutex.lock();
 
-    if (pendingDeferredMask == 0) {
-        pendingDeferredFirstUs = now;
+    if (!pendingDeferred.pending()) {
+        pendingDeferred.firstHitUs = now;
     }
 
-    pendingDeferredMask |= deferred;
-    ++pendingDeferredHits;
+    for (const std::string& id : deferred.ids) {
+        pendingDeferred.blocks.ids.insert(id);
+    }
+    pendingDeferred.blocks.valid = true;
+    pendingDeferred.blocks.forced = true;
+    pendingDeferred.blocks.blocks.assign(pendingDeferred.blocks.ids.begin(),
+                                         pendingDeferred.blocks.ids.end());
+    pendingDeferred.forcedAnalysis = true;
+    ++pendingDeferred.hits;
 
     // The crop rendered by this hit is reusable only while it is the only hit
     // of the burst; with accumulated hits the last render may not cover the
     // earlier stages, so the deferred pass renders the crops again.
-    deferredCropReusable.store(viewportCropRenderReusable(pendingDeferredHits),
-                               std::memory_order_relaxed);
+    deferredCropReusable.store(
+        viewportCropRenderReusable(pendingDeferred.hits),
+        std::memory_order_relaxed);
 
-    pendingDeferredDeadlineUs = viewportDeferredDeadline(
-        pendingDeferredFirstUs, now, viewportDeferredSettleMs(),
+    pendingDeferred.deadlineUs = viewportDeferredDeadline(
+        pendingDeferred.firstHitUs, now, viewportDeferredSettleMs(),
         viewportDeferredMaxWaitMs());
 
     viewportDeferredParams = *params;
-    viewportDeferredRequest.store(request, std::memory_order_relaxed);
+    viewportDeferredRequest.store(requestId, std::memory_order_relaxed);
     deferredCropRendered.store(true, std::memory_order_relaxed);
+    publishDeferredSnapshotLocked();
 
     const bool flushNow = viewportDeferredSettleMs() == 0;
 
@@ -920,7 +1013,7 @@ int ImProcCoordinator::queueViewportDeferredAnalysis(int todo,
         ensureDeferredWatcher();
     }
 
-    return deferred;
+    return stageBits;
 }
 
 void ImProcCoordinator::markViewportStateValid(bool highDetailNeeded)
@@ -939,7 +1032,7 @@ void ImProcCoordinator::markViewportStateValid(bool highDetailNeeded)
     // running. Only clear the per-hit bookkeeping when nothing is pending,
     // otherwise the newer burst would lose its suppression and request data.
     MyMutex::MyLock lock(paramsUpdateMutex);
-    if (pendingDeferredMask == 0) {
+    if (!pendingDeferred.pending()) {
         viewportDeferredRequest.store(0, std::memory_order_relaxed);
         deferredCropRendered.store(false, std::memory_order_relaxed);
         deferredCropReusable.store(false, std::memory_order_relaxed);
@@ -4195,14 +4288,6 @@ stage::RenderStateKey ImProcCoordinator::previewRenderState(
     key.spotBufferLive = spotprev != nullptr;
 
     /*
-     * The deferred analysis the coordinator had queued at this point, read
-     * without the coordinator mutex. The mask is data only in this revision,
-     * and the full-frame path has already absorbed any pending burst into the
-     * request mask, so it is normally zero here.
-     */
-    key.deferredAnalysisMask = deferredAnalysisMask();
-
-    /*
      * The crop-guide fingerprint is formed by the crop request, which reads
      * CropGuideParams; a full-frame preview does not carry it.
      */
@@ -4266,6 +4351,17 @@ stage::DirtyBlocks ImProcCoordinator::previewDirtyBlocks(
 
     stage::DirtyBlocks result =
         stage::mergeDirtyBlocks(fromParams, fromState);
+
+    /*
+     * A deferred burst absorbed by this pass contributes its typed stages.
+     * The set never contains a source or raw block, so the merge cannot dirty
+     * the base; it just makes the skipped analysis nodes part of the plan.
+     */
+    if (absorbedDeferredActive) {
+        for (const std::string& id : absorbedDeferredBlocks.ids) {
+            result.ids.insert(id);
+        }
+    }
 
     /*
      * The transform node also applies the pre-RGB directional-pyramid
@@ -4359,6 +4455,10 @@ void ImProcCoordinator::recordPreviewDirtyState(const PreviewPassState& pass)
     previewDirtyState = previewRenderState(pass);
     previewDirtyFingerprintsValid = true;
     previewDirtyStateValid = true;
+    // The pass consumed the absorbed deferred stages; a later pass must not
+    // schedule them again.
+    absorbedDeferredBlocks = stage::DirtyBlocks{};
+    absorbedDeferredActive = false;
 }
 
 /*
@@ -4392,6 +4492,8 @@ void ImProcCoordinator::invalidatePreviewDirtyState()
     previewDirtyFingerprintsValid = false;
     previewDirtyStateValid = false;
     previewDirtyParamsValid = false;
+    absorbedDeferredBlocks = stage::DirtyBlocks{};
+    absorbedDeferredActive = false;
 }
 
 /*
@@ -4582,14 +4684,11 @@ void ImProcCoordinator::updatePreviewImage(EditorRequest request,
      */
     int todo = request.executionPayload();
 
-    // Keep the requested event mask for cache invalidation. The augmentation
-    // below turns a crop-only change into a transform request, but the base
-    // image itself does not change. Eligibility is evaluated on the
-    // un-augmented request so a derived transform does not force a full
-    // render; the typed facts of that request are the ones the adapter
-    // derived from the un-augmented payload.
-    const int baseCacheTodo = todo;
-    const int eligibilityTodo = todo;
+    // Keep the request shape for eligibility. The augmentation below turns a
+    // crop-only change into a transform request, but the base image itself
+    // does not change. Eligibility is evaluated on the un-augmented request
+    // so a derived transform does not force a full render; the typed facts of
+    // that request are the ones the adapter derived from the payload.
     const EditorRequest eligibilityRequest = request;
 
     // This augmentation must happen before a stale request is requeued, since
@@ -4678,14 +4777,10 @@ void ImProcCoordinator::updatePreviewImage(EditorRequest request,
         prevdemoFull, fastPreview, mainFull);
     //    printf("metwb=%s \n", params->wb.method.c_str());
 
-    if (previewBaseCache->enabled()) {
-        if (const char* reason = baseCacheTodoReason(baseCacheTodo)) {
-            previewBaseCache->markDirty(reason);
-        }
-        if (highDetailStateKnown
-                && highDetailNeeded != lastHighDetailNeeded) {
-            previewBaseCache->markDirty("high-detail-transition");
-        }
+    if (previewBaseCache->enabled()
+            && highDetailStateKnown
+            && highDetailNeeded != lastHighDetailNeeded) {
+        previewBaseCache->markDirty("high-detail-transition");
     }
     lastHighDetailNeeded = highDetailNeeded;
     highDetailStateKnown = true;
@@ -4727,15 +4822,35 @@ void ImProcCoordinator::updatePreviewImage(EditorRequest request,
             std::chrono::duration_cast<std::chrono::milliseconds>(
                 cropEnd - cropStart).count();
         previewTimer.viewportDeferredTodo =
-            queueViewportDeferredAnalysis(eligibilityTodo, requestId);
-        {
-            MyMutex::MyLock lock(paramsUpdateMutex);
-            previewTimer.viewportDeferredHits = pendingDeferredHits;
-        }
+            static_cast<int>(queueViewportDeferredAnalysis(
+                eligibilityRequest, requestId));
+        previewTimer.viewportDeferredHits =
+            deferredAnalysisSnapshot().hits();
         return;
     }
 
     previewTimer.viewportFallback = viewportFallback;
+
+    /*
+     * Typed base-cache invalidation for the normal path. The narrow input set
+     * is derived from the block fingerprints and the white-balance family; a
+     * fast-path hit returns above and never carries a base input, exactly as
+     * the old mask rule did.
+     */
+    if (previewBaseCache->enabled()) {
+        const stage::ParamSnapshot currentFingerprints =
+            stage::snapshotParams(*params, stage::StagePath::Preview);
+        const stage::DirtyBlocks cacheBlocks = baseCacheDirtyBlocks(
+            previewDirtyFingerprintsValid ? &previewDirtyFingerprints
+                                          : nullptr,
+            currentFingerprints,
+            request.colorHlrWbRequest);
+        if (const char* reason = stage::baseCacheInvalidationReason(
+                stage::baseCacheInvalidationFor(
+                    cacheBlocks, request.highDetailIntent))) {
+            previewBaseCache->markDirty(reason);
+        }
+    }
 
     // A request that bypasses the fast path must not leave a previous fast
     // state looking valid when its base inputs changed. If the base snapshot
@@ -5806,10 +5921,11 @@ void ImProcCoordinator::stopProcessing()
     paramsUpdateMutex.lock();
     deferredWatcherPaused = true;
     pendingRequest = EditorRequest{};
-    pendingDeferredMask = 0;
-    pendingDeferredHits = 0;
-    pendingDeferredFirstUs = 0;
-    pendingDeferredDeadlineUs = 0;
+    pendingDeferred = DeferredRecord{};
+    pendingDeferredSnapshot.store(DeferredAnalysisSnapshot{},
+                                  std::memory_order_relaxed);
+    absorbedDeferredBlocks = stage::DirtyBlocks{};
+    absorbedDeferredActive = false;
     paramsUpdateMutex.unlock();
 
     if (updaterRunning && thread) {

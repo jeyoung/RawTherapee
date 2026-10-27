@@ -34,6 +34,7 @@
 #include "stage/stage_cache_integration.h"
 #include "stage/stage_dirty_blocks.h"
 #include "stage/stage_render_state.h"
+#include "viewportdefer.h"
 
 #include "rtgui/threadutils.h"
 
@@ -347,7 +348,8 @@ protected:
     void prepareViewportLuts(const ViewportLutSelection& selection);
     void updateViewportLutSnapshot(const ViewportLutSelection& selection);
     void renderCrops(int todo, bool force, const EditorRequest& request);
-    int queueViewportDeferredAnalysis(int todo, unsigned request);
+    uint32_t queueViewportDeferredAnalysis(const EditorRequest& request,
+                                           unsigned requestId);
     void markViewportStateValid(bool highDetailNeeded);
     void invalidateViewportState();
     void ensureDeferredWatcher();
@@ -355,6 +357,7 @@ protected:
     void flushDeferredAnalysis();
     void dropPendingDeferred();
     bool absorbPendingDeferred(int& todo);
+    void publishDeferredSnapshotLocked();
 
     /*
      * Canonical full-frame preview nodes (devnotes/perf/STAGE_PIPELINE.md).
@@ -413,22 +416,25 @@ protected:
     stage::DirtyBlocks previewDirtyBlocks(const PreviewPassState& pass) const;
 
     /*
-     * Deferred analysis mask queued for the viewport fast path.
+     * Lock-free snapshot of the deferred analysis record.
      *
-     * Lock-free and safe to call on the render path: it does not take
-     * paramsUpdateMutex, so building a RenderStateKey never blocks a request
-     * update. That mutex also guards the viewport fast-path state, so this
-     * accessor must read nothing but the atomic below. Every mutation of the
-     * mask still happens under the mutex, so the burst bookkeeping stays
-     * coherent. The load is relaxed because the mask carries no other data: the
-     * returned value is an advisory snapshot that a concurrent fast-path hit
-     * may change immediately after it is read, and nothing may treat it as a
-     * claim about a later pass.
+     * Safe to call on the render path: it does not take paramsUpdateMutex, so
+     * reading it never blocks a request update. That mutex guards the
+     * authoritative DeferredRecord; every mutation publishes a new snapshot
+     * atomically. The load is relaxed because the snapshot is advisory: a
+     * concurrent fast-path hit may change the record immediately after it is
+     * read, and nothing may treat it as a claim about a later pass.
+     *
+     * Threading contract:
+     * - the writer holds paramsUpdateMutex, mutates pendingDeferred, then
+     *   stores deferredSnapshot(pendingDeferred) with release ordering;
+     * - the reader loads the snapshot with relaxed ordering and only copies
+     *   the plain value out, so it never observes a torn struct;
+     * - the authoritative block set is never read on the render path.
      */
-    int32_t deferredAnalysisMask() const
+    DeferredAnalysisSnapshot deferredAnalysisSnapshot() const
     {
-        return static_cast<int32_t>(
-            pendingDeferredMask.load(std::memory_order_relaxed));
+        return pendingDeferredSnapshot.load(std::memory_order_relaxed);
     }
 
     void recordPreviewDirtyState(const PreviewPassState& pass);
@@ -465,17 +471,21 @@ protected:
     // Deferred full-frame analysis, see rtengine/viewportdefer.h.
     //
     // A viewport fast-path hit serves the crop immediately and accumulates the
-    // analysis stages it skipped. The mask is run once the interaction settles,
-    // so a drag costs one analysis pass instead of one per update. The fields
-    // below are guarded by paramsUpdateMutex unless they are atomic.
+    // analysis stages it skipped. The record is run once the interaction
+    // settles, so a drag costs one analysis pass instead of one per update.
     //
-    // The mask itself is atomic so the render path can read it without taking
-    // paramsUpdateMutex (see deferredAnalysisMask()); every mutation still
-    // happens under that mutex, so there is still one source of truth.
-    std::atomic<int> pendingDeferredMask;
-    int pendingDeferredHits;
-    gint64 pendingDeferredFirstUs;
-    gint64 pendingDeferredDeadlineUs;
+    // The authoritative DeferredRecord is guarded by paramsUpdateMutex. The
+    // atomic snapshot beside it is the render path's lock-free view; every
+    // mutation of the record is followed by publishDeferredSnapshotLocked(),
+    // so there is still one source of truth and a reader never takes the
+    // mutex.
+    DeferredRecord pendingDeferred;
+    std::atomic<DeferredAnalysisSnapshot> pendingDeferredSnapshot;
+    // Blocks the pass about to run absorbed from a pending burst. They are
+    // merged into the pass dirty set, never into a source or raw block, and
+    // cleared when the full-frame pass records its state.
+    stage::DirtyBlocks absorbedDeferredBlocks;
+    bool absorbedDeferredActive;
     bool deferredWatcherStarted;
     bool deferredWatcherPaused;
     std::atomic<bool> deferredWatcherStop;

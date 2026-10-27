@@ -17,7 +17,11 @@
 
 #include "stage_render_state.h"
 
+#include "stage_dirty_blocks.h"
+
 #include "procparams.h"
+
+#include <cassert>
 
 namespace rtengine::stage
 {
@@ -83,11 +87,52 @@ ParamFingerprint RenderStateKey::fingerprint() const
     hasher.add(spotPending);
     hasher.add(spotBufferLive);
 
-    hasher.add(deferredAnalysisMask);
     hasher.add(cropGuideFingerprint);
     hasher.add(viewportMoved);
 
     return hasher.finish();
+}
+
+const char* baseCacheInvalidationReason(BaseCacheInvalidation invalidation)
+{
+    switch (invalidation) {
+    case BaseCacheInvalidation::None:
+        return nullptr;
+    case BaseCacheInvalidation::Preprocess:
+        return "preprocess";
+    case BaseCacheInvalidation::Raw:
+        return "raw";
+    case BaseCacheInvalidation::WhiteBalance:
+        return "white-balance";
+    case BaseCacheInvalidation::HighDetailRequest:
+        return "high-detail-request";
+    }
+
+    assert(false && "unknown base-cache invalidation");
+    return nullptr;
+}
+
+BaseCacheInvalidation baseCacheInvalidationFor(const DirtyBlocks& blocks,
+                                               bool highDetailIntent)
+{
+    /*
+     * Precedence of the retired mask mapper: M_PREPROC, then M_RAW, then
+     * M_WB, then M_HIGHQUAL. The narrow base-cache input set uses one block
+     * per family, so the order is explicit rather than incidental.
+     */
+    if (blocks.ids.count("raw.preprocess") != 0) {
+        return BaseCacheInvalidation::Preprocess;
+    }
+    if (blocks.ids.count("raw.demosaic") != 0) {
+        return BaseCacheInvalidation::Raw;
+    }
+    if (blocks.ids.count("raw.base") != 0) {
+        return BaseCacheInvalidation::WhiteBalance;
+    }
+    if (highDetailIntent) {
+        return BaseCacheInvalidation::HighDetailRequest;
+    }
+    return BaseCacheInvalidation::None;
 }
 
 /*
