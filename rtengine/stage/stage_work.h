@@ -336,12 +336,14 @@ struct WorkInputs {
  * - rawDemosaic: `sensorDemosaicChanged || captureSharpening || source ||
  *   preprocessChanged || hdRaw || highDetailModeChanged || hlr ||
  *   hlrWbDemosaic || hlrConfigChanged || retinexPlanes`.
- *   Replaces `rawSourceWorkRuns()` at improccoordinator.cc:1363, called at
- *   :1599. Fed by the `raw.demosaic` block (`M_RAW` and `M_CSHARP` rows,
- *   stage_mask_map.cc:89-92), the forward edges from the selected frame and the
- *   preprocessed planes (every DARKFRAME/FLATFIELD event also sets M_RAW), the
- *   HighDetail aspect, and the parameter/`rgbSourceModified` pair of the colour
- *   highlight-recovery condition. Capture sharpening is inside the same body:
+ *   Replaces `rawSourceWorkRuns()`, now
+ *   `ImProcCoordinator::stageRawDemosaic()` at improccoordinator.cc:1544,
+ *   called from the pass plan at :4372. Fed by the `raw.demosaic` block
+ *   (`M_RAW` and `M_CSHARP` rows, stage_mask_map.cc:89-92), the forward edges
+ *   from the selected frame and the preprocessed planes (every
+ *   DARKFRAME/FLATFIELD event also sets M_RAW), the HighDetail aspect, and the
+ *   parameter/`rgbSourceModified` pair of the colour highlight-recovery
+ *   condition. Capture sharpening is inside the same body:
  *   it modifies the demosaiced planes in place, so `captureSharpening` is a
  *   `pdsharpening` delta while the tool is enabled *or* was enabled in the
  *   previous pass. Disabling it must re-run the demosaic to remove the
@@ -349,11 +351,16 @@ struct WorkInputs {
  *   `M_RAW` in that direction too. `retinexPlanes` names the body for the
  *   retinex buffer preparation that lives at the end of it: the buffers must
  *   be built when retinex is newly enabled, removed when it is disabled (only
- *   a fresh demosaic discards the retinex output written into the planes), and
- *   rebuilt when the working profile moves while it is enabled. A bare
- *   retinex strength edit carries `M_RETINEX` and reuses the buffers, so it is
- *   not a disjunct. A rebuild request is not a disjunct for the same reason as
- *   sourceSelect.
+ *   a fresh demosaic discards the retinex output written into the planes),
+ *   rebuilt when the working profile moves while it is enabled, and rebuilt
+ *   when a retinex member the preparation reads moves
+ *   (`retinexcolorspace`, `gammaretinex`, `gam`, `slope`): the preparation
+ *   chooses the buffer layout from the colour space and writes the forward
+ *   gamma into the planes, so the existing buffers would otherwise describe
+ *   the previous colour space or gamma while `retinex()` consumes them with
+ *   the new parameters. A bare retinex strength edit carries `M_RETINEX` and
+ *   reuses the buffers, so it is not a disjunct. A rebuild request is not a
+ *   disjunct for the same reason as sourceSelect.
  *   `hlrWbDemosaic` mirrors the caller's Color/Coloropp white-balance
  *   augmentation (the `M_WB` request fact, recovery enabled and method
  *   `Coloropp`): getImage() applies the opposed recovery with the current
@@ -382,14 +389,18 @@ struct WorkInputs {
  *   theoretical one. `spotBufferLive` is not a disjunct either: a live buffer
  *   forces the restore, not the destructive body.
  * - retinexPrepare: `params.retinex.enabled && (family(retinex) ||
- *   preprocess || demosaic || icm-without-output)`. Replaces the gate at
- *   improccoordinator.cc:1719 (`M_RETINEX | M_INIT` plus the enabled check).
+ *   preprocess || demosaic || icm-without-output || retinexHighlight)`.
+ *   Replaces the gate at improccoordinator.cc:1719 (`M_RETINEX | M_INIT` plus
+ *   the enabled check).
  *   Retinex rewrites the shared raw planes, so it is named when its own
  *   parameters move or when a step that regenerates those planes runs. The
  *   working profile is a real input of the preparation: the buffers are
  *   converted with `workingSpaceMatrix(cmp.workingProfile)` and back with its
  *   inverse (rawimagesource.cc: retinexPrepareBuffers/retinex), so
  *   `icm-without-output` names it even when the planes did not move.
+ *   `retinexHighlight` is a `toneCurve.hrenabled` delta: `retinex()` reads the
+ *   flag for the Lab-mode gamut control, and the editor's ALLNORAW action
+ *   carries `M_INIT`, so the legacy gate re-runs the preparation too.
  *   A white-balance-only `M_INIT` does not regenerate the planes and the
  *   preparation does not read the white balance (getImage() applies the
  *   multipliers afterwards), so that remainder is redundant work.
@@ -429,6 +440,19 @@ struct WorkInputs {
  *   separately by rawBaseRebuild. While retinex is enabled the body is named
  *   through `retinexPlanes`, because the buffers are converted with the
  *   working-space matrix.
+ * - A retinex buffer-input `DEMOSAIC` event (`retinexcolorspace`,
+ *   `gammaretinex`, `gam`, `slope`) while retinex is disabled. The preparation
+ *   does not run at all when the tool is off (`params->retinex.enabled` guards
+ *   the call), so no buffer describes a stale colour space or gamma; the base
+ *   rebuild the edit needs is named separately. While retinex is enabled the
+ *   body is named through `retinexPlanes`.
+ * - A retinex strength edit from zero to non-zero, or back. `str` only selects
+ *   whether the preparation applies its forward gamma, and `retinex()` repeats
+ *   the same guard, so both paths keep the buffer the last preparation built.
+ *   The editor sends `RETINEX`, which does not carry `M_RAW`, so the legacy
+ *   pass does not re-demosaic either: this is a pre-existing gap shared with
+ *   the legacy path, not a divergence, and naming the body would be a
+ *   typed-only run.
  * - A recovery method, blend or threshold event while the planes carry no
  *   recovery output (`rgbSourceModified` false): getImage() applies the new
  *   setting to the current planes, so a fresh demosaic changes nothing.
@@ -447,9 +471,10 @@ struct WorkInputs {
  *   order in this direction because the fit pass switches the demosaic mode
  *   to FAST, and rawBaseRebuild is named separately by the reload request.
  *
- * Each is redundant work rather than a pixel-affecting job. The `typedOnly=0`
- * shadow measurement that established this before the retirement is recorded
- * in devnotes/perf/STAGE_PIPELINE.md. The caller's Color/Coloropp
+ * Except for the `str` case, which is a gap shared with the legacy path rather
+ * than a saving, each is redundant work rather than a pixel-affecting job. The
+ * `typedOnly=0` shadow measurement that established this before the retirement
+ * is recorded in devnotes/perf/STAGE_PIPELINE.md. The caller's Color/Coloropp
  * `DEMOSAIC` augmentation for a white-balance edit was in this class before
  * the conversion; it is pixel-affecting, so `hlrWbDemosaic` now names it
  * instead.

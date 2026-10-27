@@ -1211,6 +1211,137 @@ void testInPlaceBodyTransitions()
                       "retinex strength against the legacy mask");
 }
 
+/*
+ * The retinex members `retinexPrepareBuffers()` reads.
+ *
+ * The preparation chooses the buffer layout from `retinexcolorspace` and
+ * writes the forward gamma into the raw planes in place, so a change of the
+ * colour space, of the gamma table or of the free-gamma `gam`/`slope` value
+ * leaves the existing buffers describing the previous colour space or gamma
+ * while `retinex()` consumes them with the new parameters. Enabling retinex
+ * alone is covered by testParameterChanges; these cases cover an edit made
+ * while it is already enabled, and the sweep now mirrors both directions.
+ */
+void testRetinexBufferInputs()
+{
+    using procparams::ProcParams;
+
+    ProcParams retinex;
+    retinex.retinex.enabled = true;
+
+    using Mutate = void (*)(ProcParams&);
+    struct BufferEdit {
+        const char* name;
+        Mutate mutate;
+    };
+
+    const BufferEdit edits[] = {
+        {"colour space", [](ProcParams& params) {
+             params.retinex.retinexcolorspace = "HSLLOG";
+         }},
+        {"gamma table", [](ProcParams& params) {
+             params.retinex.gammaretinex = "low";
+         }},
+        {"free gamma", [](ProcParams& params) {
+             params.retinex.gam = 1.8;
+         }},
+        {"gamma slope", [](ProcParams& params) {
+             params.retinex.slope = 2.0;
+         }},
+    };
+
+    for (const BufferEdit& edit : edits) {
+        ProcParams current = retinex;
+        edit.mutate(current);
+
+        const Derivation enabled(StagePath::Preview, retinex, current,
+                                 RenderStateKey{}, RenderStateKey{},
+                                 RequestKind::ParamsOnly);
+        expectOrder(enabled.preview(),
+                    {WorkItem::rawDemosaic, WorkItem::rawBaseRebuild,
+                     WorkItem::retinexPrepare, WorkItem::analysisRun},
+                    std::string("retinex ") + edit.name + " buffer edit");
+        expectNoTypedOnly(enabled.preview(),
+                          legacyPreviewRawOrder(current, DEMOSAIC),
+                          std::string("retinex ") + edit.name +
+                              " against the legacy mask");
+
+        /* While disabled no buffer describes a known colour space or gamma. */
+        ProcParams currentOff;
+        edit.mutate(currentOff);
+        const Derivation disabled(StagePath::Preview, ProcParams{}, currentOff,
+                                  RenderStateKey{}, RenderStateKey{},
+                                  RequestKind::ParamsOnly);
+        expectOrder(disabled.preview(),
+                    {WorkItem::rawBaseRebuild, WorkItem::analysisRun},
+                    std::string("retinex ") + edit.name + " with retinex off");
+        expectNoTypedOnly(disabled.preview(),
+                          legacyPreviewRawOrder(currentOff, DEMOSAIC),
+                          std::string("retinex ") + edit.name +
+                              " with retinex off against the legacy mask");
+    }
+
+    /*
+     * The gamma members are only read when `gammaretinex == "fre"`, so a
+     * `gam` delta under another table is redundant work on both paths: the
+     * legacy DEMOSAIC action re-demosaics regardless.
+     */
+    ProcParams fixedTable = retinex;
+    fixedTable.retinex.gammaretinex = "mid";
+    ProcParams fixedGamma = fixedTable;
+    fixedGamma.retinex.gam = 1.8;
+    const Derivation unusedGamma(StagePath::Preview, fixedTable, fixedGamma,
+                                 RenderStateKey{}, RenderStateKey{},
+                                 RequestKind::ParamsOnly);
+    expectNoTypedOnly(unusedGamma.preview(),
+                      legacyPreviewRawOrder(fixedGamma, DEMOSAIC),
+                      "gam edit under a fixed gamma table against the mask");
+
+    /*
+     * `retinex()` reads `toneCurve.hrenabled` for the Lab-mode gamut control.
+     * The editor's ALLNORAW action carries M_INIT, so the legacy preparation
+     * re-runs and the typed order must name it.
+     */
+    ProcParams hl = retinex;
+    hl.toneCurve.hrenabled = true;
+    const Derivation highlight(StagePath::Preview, retinex, hl,
+                               RenderStateKey{}, RenderStateKey{},
+                               RequestKind::ParamsOnly);
+    expectOrder(highlight.preview(),
+                {WorkItem::rawBaseRebuild, WorkItem::retinexPrepare,
+                 WorkItem::analysisRun},
+                "highlight recovery toggle reprepares the retinex output");
+    expectNoTypedOnly(highlight.preview(), legacyPreviewRawOrder(hl, ALLNORAW),
+                      "highlight recovery toggle against the legacy mask");
+
+    ProcParams hlOff;
+    hlOff.toneCurve.hrenabled = true;
+    const Derivation highlightOff(StagePath::Preview, ProcParams{}, hlOff,
+                                  RenderStateKey{}, RenderStateKey{},
+                                  RequestKind::ParamsOnly);
+    expectOrder(highlightOff.preview(),
+                {WorkItem::rawBaseRebuild, WorkItem::analysisRun},
+                "highlight recovery toggle with retinex off rebuilds the base");
+
+    /*
+     * A strength edit carries M_RETINEX and does not re-demosaic: the
+     * preparation's gamma guard and `retinex()` repeat the same `str != 0`
+     * test, so the buffers stay valid.
+     */
+    ProcParams strength = retinex;
+    strength.retinex.str = 60;
+    const Derivation strengthEdit(StagePath::Preview, retinex, strength,
+                                  RenderStateKey{}, RenderStateKey{},
+                                  RequestKind::ParamsOnly);
+    expectOrder(strengthEdit.preview(),
+                {WorkItem::rawBaseRebuild, WorkItem::retinexPrepare,
+                 WorkItem::analysisRun},
+                "retinex strength does not re-demosaic");
+    expectNoTypedOnly(strengthEdit.preview(),
+                      legacyPreviewRawOrder(strength, RETINEX),
+                      "retinex strength against the legacy mask");
+}
+
 /* Every item is reachable from at least one documented case. */
 void testCoverage()
 {
@@ -1278,6 +1409,7 @@ int main()
     testEditFamiliesAgainstLegacyOracle();
     testSourceReload();
     testRecoveryAndWorkingProfile();
+    testRetinexBufferInputs();
     testInPlaceBodyTransitions();
     testHighDetailTransitions();
     testSpotTransitions();

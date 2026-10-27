@@ -163,6 +163,60 @@ bool baseIcmChanged(const WorkInputs& inputs)
     return previous != current;
 }
 
+/*
+ * Whether a retinex member that `retinexPrepareBuffers()` reads moved.
+ *
+ * The preparation body (rawimagesource.cc) reads `retinexcolorspace` for the
+ * buffer layout (`useHsl`), `gammaretinex` to choose the forward gamma table,
+ * and `gam` and `slope` to build the "fre" table. It also writes that forward
+ * gamma into the raw planes in place, so a delta here makes the existing
+ * buffers describe the old colour space or the old gamma. The remaining
+ * members of the family are read by `retinex()` in raw.base, which the
+ * `retinexPrepare` item covers on its own. The working profile is named by
+ * `icmChanged` and the border comes from the same body (`setBorder()`), so a
+ * border edit is already a demosaic-block delta; those two are not repeated
+ * here.
+ *
+ * `str` is read only as a guard (`str != 0` selects whether the gamma stage
+ * runs), and `retinex()` repeats the same guard. A strength edit therefore
+ * changes nothing the buffers hold unless it crosses zero, and the editor
+ * sends `RETINEX` for it, which carries no `M_RAW`: naming the demosaic body
+ * there would be a typed-only run that re-demosaics planes the legacy pass
+ * keeps. It stays out, like the pre-existing legacy gap it is.
+ */
+bool retinexBufferInputsChanged(const WorkInputs& inputs)
+{
+    if (!usableHistory(inputs) || inputs.previousParams == nullptr
+        || inputs.params == nullptr) {
+        return true;
+    }
+
+    const procparams::RetinexParams& previous = inputs.previousParams->retinex;
+    const procparams::RetinexParams& current = inputs.params->retinex;
+    return previous.retinexcolorspace != current.retinexcolorspace
+        || previous.gammaretinex != current.gammaretinex
+        || previous.gam != current.gam || previous.slope != current.slope;
+}
+
+/*
+ * Delta of the one tone-curve member `retinex()` reads.
+ *
+ * The body reads `Tc.hrenabled` for the Lab-mode gamut control
+ * (rawimagesource.cc:2458), so a highlight-recovery toggle changes the retinex
+ * output. The editor sends ALLNORAW for it, which carries `M_INIT` and makes
+ * the legacy preparation re-run, so naming it is not a typed-only run.
+ */
+bool retinexHighlightChanged(const WorkInputs& inputs)
+{
+    if (!usableHistory(inputs) || inputs.previousParams == nullptr
+        || inputs.params == nullptr) {
+        return true;
+    }
+
+    return inputs.previousParams->toneCurve.hrenabled
+        != inputs.params->toneCurve.hrenabled;
+}
+
 bool isColourHlrMethod(const ProcParams& params)
 {
     return params.toneCurve.method == "Color"
@@ -355,15 +409,6 @@ WorkOrder derive_preview_work(const WorkInputs& inputs)
     const bool retinexEnabled = params.retinex.enabled;
     const bool hlr = hlrDemandsDemosaic(params, current);
 
-    /*
-     * A change of the high-detail decision only schedules the raw core when
-     * the work for the new decision is still pending; that fact is carried by
-     * the high-detail fields and read by `hdPre`/`hdRaw` below. A bare
-     * decision change is a mask-level request (the caller sends ALL on a zoom
-     * transition), not a parameter delta, so naming it here would create a
-     * typed-only run against a mask that did not carry it.
-     */
-
     const bool sourceReload = history && sourceReloaded(previous, current);
 
     /*
@@ -482,18 +527,20 @@ WorkOrder derive_preview_work(const WorkInputs& inputs)
      * consumes those buffers. The body must therefore run when retinex is
      * newly enabled (there are no buffers yet), when it is disabled (the
      * current planes still carry the retinex output and only a fresh demosaic
-     * removes it), and when the working profile moves while it is enabled
-     * (the buffers are converted with the working-space matrix). The legacy
-     * DEMOSAIC event carries M_RAW in each of those cases. A retinex strength
-     * edit carries M_RETINEX instead and reuses the existing buffers, so it
-     * must not name the demosaic body.
+     * removes it), when the working profile moves while it is enabled (the
+     * buffers are converted with the working-space matrix), and when a retinex
+     * member the preparation reads moves (the buffer layout, the forward gamma
+     * table and its `gam`/`slope` inputs). The legacy DEMOSAIC event carries
+     * M_RAW in each of those cases. A retinex strength edit carries M_RETINEX
+     * instead and reuses the existing buffers, so it must not name the
+     * demosaic body.
      */
     const bool previousRetinexEnabled =
         history && inputs.previousParams != nullptr
         && inputs.previousParams->retinex.enabled;
     const bool retinexPlanes = retinexEnabled
         ? (inputs.previousParams == nullptr || !previousRetinexEnabled
-           || icmChanged)
+           || icmChanged || retinexBufferInputsChanged(inputs))
         : (inputs.previousParams != nullptr && previousRetinexEnabled);
 
     const bool demosaic = sensorDemosaicChanged || captureSharpening || source
@@ -548,15 +595,16 @@ WorkOrder derive_preview_work(const WorkInputs& inputs)
     /*
      * Retinex rewrites the shared raw planes before getImage(). It is named
      * when its own parameters move, when a step that regenerates those planes
-     * runs, or when the working profile moves: the preparation converts the
-     * planes with the working-space matrix and back, so a working-profile delta
-     * is a real input even with unchanged planes. A white-balance-only M_INIT
-     * regenerates neither and is not read by the preparation, so it stays
-     * legacy-only redundant work.
+     * runs, when the working profile moves (the preparation converts the
+     * planes with the working-space matrix and back, and `retinex()` converts
+     * them back with its inverse), or when the highlight-recovery flag moves
+     * (`retinex()` reads it for the Lab-mode gamut control). A white-balance
+     * M_INIT regenerates none of those and is not read by the preparation, so
+     * it stays legacy-only redundant work.
      */
     if (retinexEnabled
         && (paramFamilyChanged(inputs, &ProcParams::retinex) || preprocess
-            || demosaic || icmChanged)) {
+            || demosaic || icmChanged || retinexHighlightChanged(inputs))) {
         order.set(WorkItem::retinexPrepare);
     }
 
