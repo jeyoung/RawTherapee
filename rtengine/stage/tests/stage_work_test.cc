@@ -270,8 +270,8 @@ void testBitset()
  * The conversion switch. With the order disabled the legacy gate is
  * authoritative and a typed item cannot start a body the legacy gate skips;
  * with it enabled the typed item is authoritative, including suppressing a
- * body the legacy gate would run. The default is off (workOrderEnabled() is
- * false unless RT_WORK_ORDER is set).
+ * body the legacy gate would run. The default is on; the environment variable
+ * is the kill switch.
  */
 void testWorkOrderSwitch()
 {
@@ -287,9 +287,19 @@ void testWorkOrderSwitch()
     check(!workItemRuns(true, order, WorkItem::rawBaseRebuild, true),
           "switch on: an unset typed item suppresses the legacy answer");
 
-    const bool envEnabled = std::getenv("RT_WORK_ORDER") != nullptr;
-    check(workOrderEnabled() == envEnabled,
-          "switch: RT_WORK_ORDER set enables, unset disables");
+    /* Unset is the default and enables the typed order. */
+    check(workOrderValueEnables(nullptr),
+          "switch: unset RT_WORK_ORDER keeps the typed order enabled");
+    /* Any other value enables it, including an explicitly empty value. */
+    check(workOrderValueEnables("1"), "switch: 1 enables");
+    check(workOrderValueEnables("yes"), "switch: yes enables");
+    check(workOrderValueEnables(""), "switch: an empty value enables");
+    check(workOrderValueEnables("offf"),
+          "switch: only the literal off disables");
+    /* The two documented kill values disable it, case-insensitively. */
+    check(!workOrderValueEnables("0"), "switch: 0 disables");
+    check(!workOrderValueEnables("off"), "switch: off disables");
+    check(!workOrderValueEnables("OFF"), "switch: OFF disables");
 }
 
 void testNoChange()
@@ -350,12 +360,12 @@ void testParameterChanges()
              params.pdsharpening.contrast += 0.1;
          },
          {}, {}, CAPTURESHARPEN},
-        {"retinex (raw.base, enabled)",
+        {"retinex (raw.demosaic buffers, raw.base, enabled)",
          [](procparams::ProcParams& params) {
              params.retinex.enabled = true;
          },
-         {WorkItem::rawBaseRebuild, WorkItem::retinexPrepare,
-          WorkItem::analysisRun}, {}, DEMOSAIC},
+         {WorkItem::rawDemosaic, WorkItem::rawBaseRebuild,
+          WorkItem::retinexPrepare, WorkItem::analysisRun}, {}, DEMOSAIC},
         {"lens profile (raw.preprocess, forward edge to demosaic)",
          [](procparams::ProcParams& params) {
              params.lensProf.lcMode =
@@ -504,7 +514,7 @@ void testEditFamiliesAgainstLegacyOracle()
          }, DARKFRAME, true},
         {"retinex", [](procparams::ProcParams& params) {
              params.retinex.enabled = true;
-         }, DEMOSAIC, false},
+         }, DEMOSAIC, true},
         {"colour management", [](procparams::ProcParams& params) {
              params.icm.workingProfile = "ProPhoto";
          }, DEMOSAIC, false}
@@ -609,12 +619,14 @@ void testSourceReload()
 }
 
 /*
- * The two predicates the conversion added, and the legacy-only remainders they
+ * The predicates the conversion added, and the legacy-only remainders they
  * leave. A white-balance edit on the Coloropp recovery path and a recovery
  * configuration edit on recovered planes are pixel-affecting and named. A
- * working-profile edit is an input of the retinex preparation and named there,
- * but not of the demosaic body; a white-balance-only M_INIT is not an input of
- * the preparation. Those two stay legacy-only redundant work.
+ * working-profile edit while retinex is enabled is an input of both the
+ * retinex preparation and the buffer preparation inside the demosaic body, so
+ * both are named. While retinex is disabled the demosaic body remains
+ * legacy-only redundant work; a white-balance-only M_INIT is not an input of
+ * the preparation either.
  */
 void testRecoveryAndWorkingProfile()
 {
@@ -712,8 +724,8 @@ void testRecoveryAndWorkingProfile()
                              RenderStateKey{}, RenderStateKey{},
                              RequestKind::ParamsOnly);
     expectOrder(profile.preview(),
-                {WorkItem::rawBaseRebuild, WorkItem::retinexPrepare,
-                 WorkItem::analysisRun},
+                {WorkItem::rawDemosaic, WorkItem::rawBaseRebuild,
+                 WorkItem::retinexPrepare, WorkItem::analysisRun},
                 "working profile reprepares the retinex buffers");
     expectNoTypedOnly(profile.preview(),
                       legacyPreviewRawOrder(retinexProfile, DEMOSAIC),
@@ -783,10 +795,11 @@ void testHighDetailTransitions()
                 "high detail gained without a crop reload request");
 
     /*
-     * The other direction has both flags already computed, so no work is
-     * pending. The legacy zoom request carries the absolute mask; the typed
-     * order names only work whose inputs it can express, so the dropped
-     * transition stays empty rather than inventing a rule the mask lacks.
+     * The other direction has both flags already computed, so no pending
+     * high-detail work remains. The decision still changes the demosaic mode:
+     * the fit pass substitutes the FAST method, so the body must re-demosaic
+     * even though no parameter moved. Source selection and preprocessing are
+     * unchanged and stay legacy-only redundant work.
      */
     RenderStateKey dropped;
     dropped.highDetailNeeded = false;
@@ -795,8 +808,10 @@ void testHighDetailTransitions()
     dropped.highDetailStateKnown = true;
     const Derivation lost(StagePath::Preview, params, params, needed, dropped,
                           RequestKind::ParamsOnly);
-    expectOrder(lost.preview(), {},
-                "high detail dropped with computed work: no pending raw work");
+    expectOrder(lost.preview(),
+                {WorkItem::rawDemosaic, WorkItem::rawBaseRebuild,
+                 WorkItem::analysisRun},
+                "high detail dropped: the demosaic mode changes to FAST");
 }
 
 void testSpotTransitions()
@@ -1074,6 +1089,79 @@ void testUnreadFacts()
                 "display, viewport, guide and editor facts move no crop job");
 }
 
+/*
+ * The two bodies that write pixels in place rather than only deciding output.
+ *
+ * Capture sharpening modifies the demosaiced planes, and retinex() writes the
+ * raw planes. Enabling either is covered by the parameter cases; disabling
+ * them is the direction that needs a fresh demosaic, because the previous
+ * pass's output is still in the planes. The legacy DEMOSAIC action carries
+ * M_RAW in both directions.
+ */
+void testInPlaceBodyTransitions()
+{
+    using procparams::ProcParams;
+
+    ProcParams sharpening;
+    sharpening.pdsharpening.enabled = true;
+    sharpening.pdsharpening.contrast += 0.1;
+    ProcParams sharpeningOff = sharpening;
+    sharpeningOff.pdsharpening.enabled = false;
+
+    const Derivation sharpeningDisable(StagePath::Preview, sharpening,
+                                       sharpeningOff, RenderStateKey{},
+                                       RenderStateKey{},
+                                       RequestKind::FullPreview);
+    expectOrder(sharpeningDisable.preview(),
+                {WorkItem::rawDemosaic, WorkItem::rawBaseRebuild,
+                 WorkItem::analysisRun},
+                "capture sharpening disabled: the demosaic body removes it");
+    expectNoTypedOnly(sharpeningDisable.preview(),
+                      legacyPreviewRawOrder(sharpeningOff, DEMOSAIC),
+                      "capture sharpening disabled against the legacy mask");
+
+    /* A disabled-tool parameter edit leaves the planes untouched. */
+    ProcParams sharpeningIdle = sharpeningOff;
+    sharpeningIdle.pdsharpening.contrast += 0.1;
+    const Derivation idle(StagePath::Preview, sharpeningOff, sharpeningIdle,
+                          RenderStateKey{}, RenderStateKey{},
+                          RequestKind::FullPreview);
+    expectOrder(idle.preview(),
+                {WorkItem::rawBaseRebuild, WorkItem::analysisRun},
+                "capture sharpening idle edit: no demosaic body");
+    expectNoTypedOnly(idle.preview(),
+                      legacyPreviewRawOrder(sharpeningIdle, DEMOSAIC),
+                      "capture sharpening idle edit against the legacy mask");
+
+    ProcParams retinex;
+    retinex.retinex.enabled = true;
+    const ProcParams retinexOff;
+    const Derivation retinexDisable(StagePath::Preview, retinex, retinexOff,
+                                    RenderStateKey{}, RenderStateKey{},
+                                    RequestKind::FullPreview);
+    expectOrder(retinexDisable.preview(),
+                {WorkItem::rawDemosaic, WorkItem::rawBaseRebuild,
+                 WorkItem::analysisRun},
+                "retinex disabled: the demosaic body discards its planes");
+    expectNoTypedOnly(retinexDisable.preview(),
+                      legacyPreviewRawOrder(retinexOff, DEMOSAIC),
+                      "retinex disabled against the legacy mask");
+
+    /* A strength edit carries M_RETINEX and reuses the prepared buffers. */
+    ProcParams retinexStrength = retinex;
+    retinexStrength.retinex.str += 5;
+    const Derivation strength(StagePath::Preview, retinex, retinexStrength,
+                              RenderStateKey{}, RenderStateKey{},
+                              RequestKind::FullPreview);
+    expectOrder(strength.preview(),
+                {WorkItem::rawBaseRebuild, WorkItem::retinexPrepare,
+                 WorkItem::analysisRun},
+                "retinex strength reuses the prepared buffers");
+    expectNoTypedOnly(strength.preview(),
+                      legacyPreviewRawOrder(retinexStrength, RETINEX),
+                      "retinex strength against the legacy mask");
+}
+
 /* Every item is reachable from at least one documented case. */
 void testCoverage()
 {
@@ -1140,6 +1228,7 @@ int main()
     testEditFamiliesAgainstLegacyOracle();
     testSourceReload();
     testRecoveryAndWorkingProfile();
+    testInPlaceBodyTransitions();
     testHighDetailTransitions();
     testSpotTransitions();
     testRequestKinds();

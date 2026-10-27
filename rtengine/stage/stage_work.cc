@@ -533,6 +533,16 @@ WorkOrder derive_preview_work(const WorkInputs& inputs)
         && !current.highDetailPreprocessComputed;
     const bool hdRawPending = current.highDetailNeeded
         && !current.highDetailRawComputed;
+    /*
+     * The high-detail decision also chooses the demosaic mode: below 100% the
+     * caller substitutes the FAST method in the pass's RAWParams, while at
+     * 100% the configured method runs. Dropping the decision therefore needs
+     * a fresh demosaic even though no ProcParams field moved, and every
+     * crossing queues a full request that carries M_RAW. The pending-work
+     * fields above only cover the direction that gains high detail.
+     */
+    const bool highDetailModeChanged =
+        history && previous.highDetailNeeded != current.highDetailNeeded;
 
     /*
      * source.select and raw.preprocess move together: rawWorkRuns() feeds
@@ -586,27 +596,59 @@ WorkOrder derive_preview_work(const WorkInputs& inputs)
     /*
      * rawSourceWorkRuns(): the sensor demosaic fields, capture sharpening, a
      * pending high-detail demosaic, the colour highlight-recovery condition of
-     * a modified RGB source, and the forward edges from a selected frame or a
-     * preprocessed source. Every DARKFRAME/FLATFIELD event sets M_RAW as well
-     * as M_PREPROC, so a preprocess change also runs the demosaic gate.
+     * a modified RGB source, the retinex plane work, and the forward edges from
+     * a selected frame or a preprocessed source. Every DARKFRAME/FLATFIELD
+     * event sets M_RAW as well as M_PREPROC, so a preprocess change also runs
+     * the demosaic gate.
      *
-     * Capture sharpening is ANDed with the enable flag by the legacy gate, so
-     * a disabled-tool parameter edit does not name the body. `pdSharpeningChanged`
-     * separates that family from the sensor fields: when only it moved and the
-     * tool is off, rawSourceWorkRuns() is false. Only claim a pdsharpening-only
-     * delta when the previous parameter set is actually available: without it
-     * the family comparison is conservatively true, which would otherwise hide
-     * a sensor demosaic delta carried by the same block fingerprint.
+     * Capture sharpening modifies the demosaiced planes in place, so the body
+     * must run not only when the tool becomes enabled but also when it becomes
+     * disabled: only a fresh demosaic removes the sharpening the previous pass
+     * left in the planes. The legacy DEMOSAIC event carries M_RAW in both
+     * directions. A pdsharpening-only delta while the tool was and is disabled
+     * still leaves the body un-named, because the planes are unchanged; that
+     * legacy-only remainder is redundant work.
+     *
+     * `pdSharpeningChanged` separates the capture-sharpening family from the
+     * sensor fields. Only claim a pdsharpening-only delta when the previous
+     * parameter set is actually available: without it the family comparison is
+     * conservatively true, which would otherwise hide a sensor demosaic delta
+     * carried by the same block fingerprint.
      */
     const bool pdSharpeningChanged = history && inputs.previousParams != nullptr
         && paramFamilyChanged(inputs, &ProcParams::pdsharpening);
+    const bool previousCaptureSharpening =
+        history && inputs.previousParams != nullptr
+        && inputs.previousParams->pdsharpening.enabled;
+    const bool captureSharpening = pdSharpeningChanged
+        && (params.pdsharpening.enabled || previousCaptureSharpening);
     const bool sensorDemosaicChanged =
         demosaicBlockChanged && !pdSharpeningChanged;
-    const bool captureSharpening =
-        pdSharpeningChanged && params.pdsharpening.enabled;
+
+    /*
+     * Retinex buffer preparation lives inside the raw.demosaic body, not in
+     * the retinex preparation item: `retinexPrepareBuffers()` runs before
+     * getImage() when the planes are regenerated, and `retinex()` in raw.base
+     * consumes those buffers. The body must therefore run when retinex is
+     * newly enabled (there are no buffers yet), when it is disabled (the
+     * current planes still carry the retinex output and only a fresh demosaic
+     * removes it), and when the working profile moves while it is enabled
+     * (the buffers are converted with the working-space matrix). The legacy
+     * DEMOSAIC event carries M_RAW in each of those cases. A retinex strength
+     * edit carries M_RETINEX instead and reuses the existing buffers, so it
+     * must not name the demosaic body.
+     */
+    const bool previousRetinexEnabled =
+        history && inputs.previousParams != nullptr
+        && inputs.previousParams->retinex.enabled;
+    const bool retinexPlanes = retinexEnabled
+        ? (inputs.previousParams == nullptr || !previousRetinexEnabled
+           || icmChanged)
+        : (inputs.previousParams != nullptr && previousRetinexEnabled);
+
     const bool demosaic = sensorDemosaicChanged || captureSharpening || source
-        || preprocessBlockChanged || hdRawPending || hlr || hlrWbDemosaic
-        || hlrConfigChanged;
+        || preprocessBlockChanged || hdRawPending || highDetailModeChanged
+        || hlr || hlrWbDemosaic || hlrConfigChanged || retinexPlanes;
 
     /*
      * baseRebuildRuns(): the raw.base families that actually rebuild, plus the

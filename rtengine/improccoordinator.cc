@@ -4759,10 +4759,11 @@ void ImProcCoordinator::updatePreviewImage(int todo, bool panningRelatedChange,
          * read by each converted raw-chain gate below. The mask never reaches
          * the derivation; the legacy answers are still probed at each site.
          *
-         * With RT_WORK_ORDER unset this block runs only for the shadow, and
-         * only when a usable history exists, exactly as before the conversion.
-         * With the switch set the order always exists: a pass without history
-         * derives the destructive set, because every delta counts then.
+         * The typed order is on by default. When RT_WORK_ORDER=0 or =off kills
+         * it, this block runs only for the shadow, and only when a usable
+         * history exists, exactly as before the conversion. With the typed
+         * order enabled it always exists: a pass without history derives the
+         * destructive set, because every delta counts then.
          */
         const bool wantWorkOrder = stage::workOrderEnabled();
         const bool wantWorkShadow = stage::workShadowEnabled();

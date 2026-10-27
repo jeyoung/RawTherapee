@@ -38,8 +38,9 @@ namespace rtengine::stage
 /*
  * Typed work order for the destructive raw and core jobs.
  *
- * The preview raw-chain gates can run from this order behind RT_WORK_ORDER; the
- * crop still decides which body jobs run from the legacy `M_*` mask. Before
+ * The preview raw-chain gates run from this order by default; RT_WORK_ORDER=0
+ * or =off is the kill switch. The crop still decides which body jobs run from
+ * the legacy `M_*` mask. Before
  * those gates can be retired, each destructive job needs a name and an exact
  * membership predicate that is derived from the same inputs the gate uses, not
  * from the mask. This unit is that order.
@@ -84,10 +85,11 @@ namespace rtengine::stage
  *   therefore omits it and the demosaic consumer owns it. That is a bounded
  *   subset of the body's ideal inputs, chosen to match the gate the order
  *   describes, not a typed-only superset.
- * - The order drives the preview raw-chain gates only when RT_WORK_ORDER is
- *   set; see workOrderEnabled(). The crop gates and every downstream preview
- *   node keep their legacy gates, so an error here is visible in the
- *   predicate table and in the shadow comparison rather than in an image.
+ * - The order drives the preview raw-chain gates by default; RT_WORK_ORDER=0
+ *   or RT_WORK_ORDER=off is the kill switch (see workOrderEnabled()). The crop
+ *   gates and every downstream preview node keep their legacy gates, so an
+ *   error here is visible in the predicate table and in the shadow comparison
+ *   rather than in an image.
  *
  * The order is a subset of the legacy gates, never a superset: a fact that
  * the legacy gate does not consult must not name an item, or the shadow
@@ -198,28 +200,52 @@ inline bool workShadowEnabled()
 }
 
 /*
+ * Whether one `RT_WORK_ORDER` value leaves the typed order enabled.
+ *
+ * Unset (`nullptr`) is the default and enables it. The literals "0" and
+ * "off" (case-insensitive) disable it. Every other value, including an empty
+ * string, enables it. The parser is exposed so a unit test can pin the rule
+ * without a child process; `workOrderEnabled()` reads the environment once.
+ */
+inline bool workOrderValueEnables(const char* value)
+{
+    if (value == nullptr) {
+        return true;
+    }
+    if (value[0] == '0' && value[1] == '\0') {
+        return false;
+    }
+    const auto lower = [](char c) {
+        return c >= 'A' && c <= 'Z' ? static_cast<char>(c - 'A' + 'a') : c;
+    };
+    return !(lower(value[0]) == 'o' && lower(value[1]) == 'f'
+             && lower(value[2]) == 'f' && value[3] == '\0');
+}
+
+/*
  * Whether the typed order drives the preview raw-chain gates.
  *
- * `RT_WORK_ORDER` is read once per process with the same rule as
- * RT_WORK_SHADOW: any value enables it, and unset disables it. The default is
- * off, so the legacy `M_*` gates stay authoritative and the added cost is one
- * branch per gate site.
+ * `RT_WORK_ORDER` is read once per process. The default is on: the typed order
+ * is authoritative at every converted gate and the legacy answer is still
+ * probed when RT_WORK_SHADOW is set.
  *
- * When set, each converted site runs its body from the typed item instead of
- * the legacy gate. The plan, the crop, the dirty-block derivation and every
- * downstream node gate are unchanged, and the shadow comparison stays active,
- * so the two answers can still be compared pass by pass.
+ * The variable is the kill switch for the conversion, not a preference: any
+ * value keeps the typed order enabled, while "0" and "off" make the legacy
+ * `M_*` gates authoritative again, exactly as before the conversion. There is
+ * no user-facing setting; the switch exists so a regression can be isolated
+ * without rebuilding.
  *
- * This switch is the kill switch for the conversion, not a preference: there
- * is no user-facing setting because the typed order is still validated against
- * the legacy gates and every legacy-only remainder is either named by the
- * order or documented as redundant work at its item. Do not flip the default
- * before a full preview-parity run with the switch on has confirmed those
- * remainders.
+ * When the typed order is enabled, each converted site runs its body from the
+ * typed item instead of the legacy gate. The plan, the crop, the dirty-block
+ * derivation and every downstream node gate are unchanged, and the shadow
+ * comparison stays available, so the two answers can still be compared pass by
+ * pass. The sweep that validated every raw-chain family is recorded in
+ * devnotes/perf/STAGE_PIPELINE.md.
  */
 inline bool workOrderEnabled()
 {
-    static const bool enabled = std::getenv("RT_WORK_ORDER") != nullptr;
+    static const bool enabled =
+        workOrderValueEnables(std::getenv("RT_WORK_ORDER"));
     return enabled;
 }
 
@@ -356,9 +382,10 @@ struct WorkInputs {
  * parameter family, true when either parameter set is unavailable.
  * `hdPre`/`hdRaw` are the high-detail work still pending, `hlr` is the colour
  * highlight-recovery condition, and `rawReload` is
- * `requestKind == FullPreview || FullCrop`. A bare change of the high-detail
- * decision is not a disjunct: it is a mask-level zoom request, not a
- * parameter delta.
+ * `requestKind == FullPreview || FullCrop`. A high-detail decision change also
+ * changes the demosaic mode (the caller substitutes the FAST method below
+ * 100%), so both directions name rawDemosaic; the mask-level zoom request
+ * carries `M_RAW` for exactly that reason.
  *
  * - sourceSelect: `preprocess`, below. Replaces `rawWorkRuns()` at
  *   improccoordinator.cc:1346, called from stageSourceSelect at :1531. Fed by
@@ -378,15 +405,26 @@ struct WorkInputs {
  *   remainder is redundant work, and the base rebuild the edit needs is named
  *   separately.
  * - rawDemosaic: `sensorDemosaicChanged || captureSharpening || source ||
- *   preprocessChanged || hdRaw || hlr || hlrWbDemosaic || hlrConfigChanged`.
+ *   preprocessChanged || hdRaw || highDetailModeChanged || hlr ||
+ *   hlrWbDemosaic || hlrConfigChanged || retinexPlanes`.
  *   Replaces `rawSourceWorkRuns()` at improccoordinator.cc:1363, called at
  *   :1599. Fed by the `raw.demosaic` block (`M_RAW` and `M_CSHARP` rows,
  *   stage_mask_map.cc:89-92), the forward edges from the selected frame and the
  *   preprocessed planes (every DARKFRAME/FLATFIELD event also sets M_RAW), the
  *   HighDetail aspect, and the parameter/`rgbSourceModified` pair of the colour
- *   highlight-recovery condition. Capture sharpening is inside the same body
- *   and is ANDed with `pdsharpening.enabled`, exactly as the gate is. A rebuild
- *   request is not a disjunct for the same reason as sourceSelect.
+ *   highlight-recovery condition. Capture sharpening is inside the same body:
+ *   it modifies the demosaiced planes in place, so `captureSharpening` is a
+ *   `pdsharpening` delta while the tool is enabled *or* was enabled in the
+ *   previous pass. Disabling it must re-run the demosaic to remove the
+ *   sharpening the planes still carry, and the legacy DEMOSAIC event carries
+ *   `M_RAW` in that direction too. `retinexPlanes` names the body for the
+ *   retinex buffer preparation that lives at the end of it: the buffers must
+ *   be built when retinex is newly enabled, removed when it is disabled (only
+ *   a fresh demosaic discards the retinex output written into the planes), and
+ *   rebuilt when the working profile moves while it is enabled. A bare
+ *   retinex strength edit carries `M_RETINEX` and reuses the buffers, so it is
+ *   not a disjunct. A rebuild request is not a disjunct for the same reason as
+ *   sourceSelect.
  *   `hlrWbDemosaic` mirrors the caller's Color/Coloropp white-balance
  *   augmentation (the `M_WB` request fact, recovery enabled and method
  *   `Coloropp`): getImage() applies the opposed recovery with the current
@@ -453,11 +491,12 @@ struct WorkInputs {
  *   the raw planes, the retinex parameters and the working profile, none of
  *   which a white-balance edit moves; getImage() applies the multipliers
  *   later. The job is redundant, not skipped (see retinexPrepare above).
- * - A working-profile `DEMOSAIC` event for the demosaic body. The demosaic
- *   reads `RAWParams` and `pdsharpening`, not `icm`, so the fresh planes are
- *   identical; the base rebuild the edit needs is named separately by
- *   rawBaseRebuild, and the pass-level `M_RAW` reason has already invalidated
- *   the base cache before any body runs.
+ * - A working-profile `DEMOSAIC` event for the demosaic body while retinex is
+ *   disabled. The demosaic reads `RAWParams` and `pdsharpening`, not `icm`, so
+ *   the fresh planes are identical; the base rebuild the edit needs is named
+ *   separately by rawBaseRebuild. While retinex is enabled the body is named
+ *   through `retinexPlanes`, because the buffers are converted with the
+ *   working-space matrix.
  * - A recovery method, blend or threshold event while the planes carry no
  *   recovery output (`rgbSourceModified` false): getImage() applies the new
  *   setting to the current planes, so a fresh demosaic changes nothing.
@@ -469,6 +508,12 @@ struct WorkInputs {
  *   idempotent under the same white balance. The base rebuild and analysis the
  *   event asks for are named separately. The per-item argument is in the
  *   sourceSelect, rawPreprocess and rawDemosaic bullets above.
+ * - A high-detail fit transition (`ALL | M_MONITOR` with `highDetailNeeded`
+ *   false after the 100% pass) for sourceSelect and rawPreprocess. Nothing
+ *   moved in the source or the preprocessed planes, so the legacy
+ *   re-selection and re-preprocess are redundant. rawDemosaic is named by the
+ *   order in this direction because the fit pass switches the demosaic mode
+ *   to FAST, and rawBaseRebuild is named separately by the reload request.
  *
  * Each is measured as legacyOnly, never as typedOnly, and each is redundant
  * work rather than a pixel-affecting job. The caller's Color/Coloropp
