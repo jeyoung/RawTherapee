@@ -35,11 +35,11 @@ const Glib::ustring Distortion::TOOL_NAME = "distortion";
 Distortion::Distortion (): FoldableToolPanel(this, TOOL_NAME, M("TP_DISTORTION_LABEL"))
 {
     auto mapper = ProcEventMapper::getInstance();
-    EvDistortionDefish = mapper->newEvent(TRANSFORM, "HISTORY_MSG_DISTORTION_DEFISH");
-    EvDistortionDefishVoid = mapper->newEvent(M_VOID, "HISTORY_MSG_DISTORTION_DEFISH");
+    EvDistortionDefish = mapper->newEvent(rtengine::RequestIntent::Transform, "HISTORY_MSG_DISTORTION_DEFISH");
+    EvDistortionDefishVoid = mapper->newEvent(rtengine::RequestIntent::ControlOnly, "HISTORY_MSG_DISTORTION_DEFISH");
 
-    EvDistortionDefishFocalLength = mapper->newEvent(TRANSFORM, "HISTORY_MSG_DISTORTION_DEFISH_FOCAL");
-    EvDistortionDefishFocalLengthVoid = mapper->newEvent(M_VOID, "HISTORY_MSG_DISTORTION_DEFISH_FOCAL");
+    EvDistortionDefishFocalLength = mapper->newEvent(rtengine::RequestIntent::Transform, "HISTORY_MSG_DISTORTION_DEFISH_FOCAL");
+    EvDistortionDefishFocalLengthVoid = mapper->newEvent(rtengine::RequestIntent::ControlOnly, "HISTORY_MSG_DISTORTION_DEFISH_FOCAL");
 
     setCamBasedEventsActive();
 

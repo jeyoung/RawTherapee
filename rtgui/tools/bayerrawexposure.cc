@@ -32,8 +32,8 @@ BayerRAWExposure::BayerRAWExposure () : FoldableToolPanel(this, TOOL_NAME, M("TP
 {
     const auto& options = App::get().options();
     auto m = ProcEventMapper::getInstance();
-    EvDehablack = m->newEvent(DARKFRAME, "HISTORY_MSG_DEHABLACK");
-    EvDehablackVoid = m->newEvent(M_VOID, "HISTORY_MSG_DEHABLACK");
+    EvDehablack = m->newEvent(rtengine::RequestIntent::DarkFrame, "HISTORY_MSG_DEHABLACK");
+    EvDehablackVoid = m->newEvent(rtengine::RequestIntent::ControlOnly, "HISTORY_MSG_DEHABLACK");
 
     PexBlack1 = Gtk::manage(new Adjuster (M("TP_RAWEXPOS_BLACK_1"), -2048, 2048, 1.0, 0)); //black level
     PexBlack1->setAdjusterListener (this);

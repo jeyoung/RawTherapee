@@ -27,12 +27,16 @@
 
 #include "rtengine/editorrequest.h"
 
+#include "rtengine/procparams.h"
 #include "rtengine/refreshmap.h"
+#include "rtengine/stage/stage_work.h"
 
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <sstream>
 #include <string>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -43,9 +47,14 @@ namespace
 
 using rtengine::EditorRequest;
 using rtengine::LegacyMaskContext;
+using rtengine::RequestIntent;
 using rtengine::coalesce;
+using rtengine::compatibility_mask;
+using rtengine::crop_request_kind;
 using rtengine::from_legacy_mask;
+using rtengine::make_request;
 using rtengine::planningAgreesWithLegacyMask;
+using rtengine::producerEventKey;
 
 int failures = 0;
 
@@ -272,6 +281,18 @@ void checkEveryPair()
                   label + ": monitorOutputRequest");
             check(merged.imperativeRepaint == single.imperativeRepaint,
                   label + ": imperativeRepaint");
+            check(merged.transformFamilyIntent == single.transformFamilyIntent,
+                  label + ": transformFamilyIntent");
+            check(merged.hdrIntent == single.hdrIntent, label + ": hdrIntent");
+            check(merged.rgbProcIntent == single.rgbProcIntent,
+                  label + ": rgbProcIntent");
+            check(merged.labChainIntent == single.labChainIntent,
+                  label + ": labChainIntent");
+            check(merged.autoExposureIntent == single.autoExposureIntent,
+                  label + ": autoExposureIntent");
+            check(merged.localAdjustmentsIntent
+                      == single.localAdjustmentsIntent,
+                  label + ": localAdjustmentsIntent");
             check(merged.legacyGateMask == unionMask,
                   label + ": gate mask");
             check(merged.identity() == single.identity(),
@@ -425,6 +446,352 @@ void checkViewportMovedContext()
           "viewportMoved defaults to false");
 }
 
+/*
+ * The typed producer API. Each intent must produce the request its legacy
+ * composite produced, so converting a tool cannot change planning; the
+ * compatibility mask must be the composite the rest of the coordinator still
+ * consumes.
+ */
+struct IntentExpectation {
+    RequestIntent intent;
+    const char* name;
+    int mask;
+};
+
+const std::vector<IntentExpectation>& intentExpectations()
+{
+    static const std::vector<IntentExpectation> rows = {
+        {RequestIntent::AllNoRaw, "AllNoRaw", ALLNORAW},
+        {RequestIntent::Demosaic, "Demosaic", DEMOSAIC},
+        {RequestIntent::Hdr, "Hdr", HDR},
+        {RequestIntent::SpotAdjust, "SpotAdjust", SPOTADJUST},
+        {RequestIntent::Transform, "Transform", TRANSFORM},
+        {RequestIntent::WhiteBalance, "WhiteBalance", WB},
+        {RequestIntent::RepaintOnly, "RepaintOnly", M_MINUPDATE},
+        {RequestIntent::ControlOnly, "ControlOnly", M_VOID},
+        {RequestIntent::Compr, "Compr", COMPR},
+        {RequestIntent::CaptureSharpen, "CaptureSharpen", CAPTURESHARPEN},
+        {RequestIntent::DarkFrame, "DarkFrame", DARKFRAME},
+        {RequestIntent::First, "First", FIRST}
+    };
+    return rows;
+}
+
+void checkProducerIntents()
+{
+    for (const IntentExpectation& row : intentExpectations()) {
+        const std::string label = std::string("intent ") + row.name;
+        const EditorRequest typed = make_request(row.intent);
+        const EditorRequest legacy = from_legacy_mask(row.mask);
+
+        check(compatibility_mask(row.intent) == row.mask,
+              label + ": compatibility mask");
+        check(typed.legacyGateMask == row.mask, label + ": gate mask");
+        check(typed.kind == legacy.kind, label + ": kind");
+        check(typed.controlOnly == legacy.controlOnly,
+              label + ": controlOnly");
+        check(typed.present, label + ": present");
+        check(typed.spotPending == legacy.spotPending, label + ": spot");
+        check(typed.fullFrameIntent == legacy.fullFrameIntent,
+              label + ": full frame");
+        check(typed.colorHlrWbRequest == legacy.colorHlrWbRequest,
+              label + ": colour HLR WB");
+        check(typed.transformFamilyIntent == legacy.transformFamilyIntent,
+              label + ": transform family");
+        check(typed.hdrIntent == legacy.hdrIntent, label + ": HDR");
+        check(typed.rgbProcIntent == legacy.rgbProcIntent, label + ": rgb.proc");
+        check(typed.labChainIntent == legacy.labChainIntent, label + ": Lab");
+        check(typed.autoExposureIntent == legacy.autoExposureIntent,
+              label + ": auto exposure");
+        check(typed.localAdjustmentsIntent == legacy.localAdjustmentsIntent,
+              label + ": local adjustments");
+        check(typed.derivesFromParameters(),
+              label + ": no producer dirty set");
+        check(planningAgreesWithLegacyMask(typed),
+              label + ": agrees with its compatibility mask");
+        check(typed.identity() == legacy.identity(),
+              label + ": identical planning identity");
+    }
+
+    check(make_request(RequestIntent::RepaintOnly).kind
+              == EditorRequest::RequestKind::RepaintOnly,
+          "the repaint intent stays RepaintOnly");
+    check(make_request(RequestIntent::WhiteBalance).colorHlrWbRequest,
+          "the white-balance intent carries the Color/Coloropp fact");
+}
+
+/*
+ * A producer that names its dirty blocks gets an execution set: the seeds,
+ * the forward closure and the path residents. The set replaces the parameter
+ * comparison, but the request identity records it.
+ */
+void checkProducerDirtyBlocks()
+{
+    const EditorRequest seeded = make_request(
+        RequestIntent::Transform, {"transform"}, rtengine::stage::StagePath::Preview);
+
+    check(seeded.dirtySource == EditorRequest::DirtySource::ProducerProvided,
+          "producer blocks set ProducerProvided");
+    check(seeded.dirty.valid, "producer dirty set is valid");
+    check(seeded.dirty.ids.count("transform") != 0,
+          "producer dirty set contains the seed");
+    check(seeded.dirty.ids.count("local.adjustments") != 0,
+          "producer dirty set closes over the first consumer");
+    check(seeded.dirty.ids.count("monitor.output") != 0,
+          "producer dirty set contains the path resident");
+    check(seeded.dirty.forced == false, "producer dirty set is not forced");
+    check(!seeded.derivesFromParameters(),
+          "producer dirty set does not derive from parameters");
+    check(seeded.identity() != make_request(RequestIntent::Transform).identity(),
+          "producer dirty blocks change the identity");
+
+    const EditorRequest second = make_request(
+        RequestIntent::Transform, {"rgb.proc"}, rtengine::stage::StagePath::Preview);
+    const EditorRequest merged = coalesce(seeded, second);
+    check(merged.dirtySource
+              == EditorRequest::DirtySource::ProducerProvided,
+          "coalescing two producer sets keeps ProducerProvided");
+    check(merged.dirty.ids.count("transform") != 0,
+          "coalescing unions the producer sets");
+    check(merged.dirty.ids.count("rgb.proc") != 0,
+          "coalescing keeps both seeds");
+
+    const EditorRequest derived = make_request(RequestIntent::Transform);
+    const EditorRequest mixed = coalesce(derived, second);
+    check(mixed.dirtySource
+              == EditorRequest::DirtySource::ProducerProvided,
+          "a derived request does not erase a producer set");
+}
+
+/*
+ * The RefreshMapper carries the typed request for a converted event and the
+ * compatibility mask for every consumer that still asks for one. An event
+ * registered with a mask stays on the compatibility path.
+ */
+void checkRefreshMapper()
+{
+    auto* mapper = rtengine::RefreshMapper::getInstance();
+
+    const rtengine::ProcEvent typedEvent = mapper->newEvent();
+    const EditorRequest typed = make_request(RequestIntent::WhiteBalance);
+    mapper->mapRequest(typedEvent, typed);
+
+    EditorRequest found;
+    check(mapper->getRequest(typedEvent, found),
+          "a typed event returns its request");
+    check(found.identity() == typed.identity(),
+          "the typed request survives the mapper");
+    check(mapper->getAction(typedEvent) == WB,
+          "a typed event still reports its compatibility mask");
+
+    const rtengine::ProcEvent maskedEvent = mapper->newEvent();
+    mapper->mapEvent(maskedEvent, AUTOEXP);
+    check(!mapper->getRequest(maskedEvent, found),
+          "a mask event has no typed request");
+    check(mapper->getAction(maskedEvent) == AUTOEXP,
+          "a mask event keeps its action");
+
+    const rtengine::ProcEvent reused = mapper->newEvent();
+    mapper->mapRequest(reused, typed);
+    mapper->mapEvent(reused, M_CROP);
+    check(!mapper->getRequest(reused, found),
+          "re-registering with a mask clears the typed request");
+}
+
+/*
+ * Producer actions with the same planning identity must still be distinct
+ * events: EvSpotEnabled (ALLNORAW) and EvSpotEnabledOPA (SPOTADJUST) share a
+ * history message today and plan identically, but their compatibility masks
+ * differ. The event key therefore includes the mask.
+ */
+void checkProducerEventKey()
+{
+    const EditorRequest allNoRaw = make_request(RequestIntent::AllNoRaw);
+    const EditorRequest spotAdjust = make_request(RequestIntent::SpotAdjust);
+
+    check(allNoRaw.identity() == spotAdjust.identity(),
+          "ALLNORAW and SPOTADJUST share a planning identity");
+    check(allNoRaw.legacyGateMask != spotAdjust.legacyGateMask,
+          "ALLNORAW and SPOTADJUST differ in their compatibility mask");
+    check(producerEventKey(allNoRaw, "HISTORY_MSG_SPOT")
+              != producerEventKey(spotAdjust, "HISTORY_MSG_SPOT"),
+          "same identity and message with different masks get distinct keys");
+    check(producerEventKey(allNoRaw, "HISTORY_MSG_SPOT")
+              == producerEventKey(allNoRaw, "HISTORY_MSG_SPOT"),
+          "the same producer action keeps its key");
+
+    for (const IntentExpectation& left : intentExpectations()) {
+        for (const IntentExpectation& right : intentExpectations()) {
+            if (left.intent == right.intent) {
+                continue;
+            }
+
+            const std::string label =
+                std::string("key uniqueness ") + left.name + "/" + right.name;
+            check(producerEventKey(make_request(left.intent), "msg")
+                      != producerEventKey(make_request(right.intent), "msg"),
+                  label);
+        }
+    }
+}
+
+/*
+ * The fast path augments the execution payload after the request was built.
+ * Every augmentation must refresh the typed facts before the crop consumes
+ * them. These are the two augmentation shapes used in updatePreviewImage().
+ */
+void checkFastPathAugmentation()
+{
+    EditorRequest crop = from_legacy_mask(M_CROP);
+    check(!crop.transformFamilyIntent,
+          "a bare crop does not claim transform-family work");
+    crop.setLegacyGateMask(crop.legacyGateMask | TRANSFORM);
+    crop.refreshFromLegacyMask();
+    check(crop.transformFamilyIntent,
+          "the PC-vignette augmentation refreshes transformFamilyIntent");
+    check(crop.kind == EditorRequest::RequestKind::FullPreview,
+          "the PC-vignette augmentation widens the kind like the old mask");
+    check(planningAgreesWithLegacyMask(crop),
+          "the PC-vignette augmentation agrees with its widened mask");
+
+    EditorRequest lumacurve = from_legacy_mask(M_LUMACURVE);
+    check(!lumacurve.labChainIntent,
+          "a bare luminance curve does not claim the Lab chain");
+    lumacurve.setLegacyGateMask(
+        lumacurve.legacyGateMask | M_LUMINANCE | M_COLOR);
+    check(lumacurve.labChainIntent,
+          "the fast-path Lab augmentation refreshes labChainIntent");
+    check(planningAgreesWithLegacyMask(lumacurve),
+          "the fast-path Lab augmentation agrees with its widened mask");
+}
+
+/*
+ * A crop reallocation must refill the base even when the editor request is a
+ * plain parameter update. The force is carried in the render-state request
+ * kind, which derive_crop_work() reads.
+ */
+void checkCropReallocationWorkOrder()
+{
+    rtengine::procparams::ProcParams params;
+
+    const rtengine::stage::BlockFingerprints fingerprints =
+        rtengine::stage::stage_fingerprints(
+            rtengine::stage::StagePath::Crop, params);
+
+    rtengine::stage::RenderStateKey state;
+    state.cropSkip = 1;
+    state.requestKind = crop_request_kind(
+        EditorRequest::RequestKind::ParamsOnly, false);
+
+    rtengine::stage::WorkInputs inputs;
+    inputs.path = rtengine::stage::StagePath::Crop;
+    inputs.previousState = &state;
+    inputs.previousFingerprints = &fingerprints;
+    inputs.previousParams = &params;
+    inputs.currentState = &state;
+    inputs.currentFingerprints = &fingerprints;
+    inputs.requestKind = state.requestKind;
+    inputs.params = &params;
+
+    const rtengine::stage::WorkOrder steady =
+        rtengine::stage::derive_crop_work(inputs);
+    check(!rtengine::stage::workItemRuns(
+              steady, rtengine::stage::WorkItem::rawBaseRebuild),
+          "a steady parameter update does not rebuild the crop base");
+
+    state.requestKind = crop_request_kind(
+        EditorRequest::RequestKind::ParamsOnly, true);
+    inputs.requestKind = state.requestKind;
+
+    const rtengine::stage::WorkOrder reallocated =
+        rtengine::stage::derive_crop_work(inputs);
+    check(rtengine::stage::workItemRuns(
+              reallocated, rtengine::stage::WorkItem::rawBaseRebuild),
+          "a reallocation forces the crop base rebuild");
+    check(rtengine::stage::workItemRuns(
+              reallocated, rtengine::stage::WorkItem::analysisRun),
+          "a reallocation forces the crop analysis");
+
+    check(crop_request_kind(EditorRequest::RequestKind::HighQuality, true)
+              == rtengine::stage::RequestKind::FullCrop,
+          "a reallocation wins over a high-quality crop request");
+    check(crop_request_kind(EditorRequest::RequestKind::FullPreview, false)
+              == rtengine::stage::RequestKind::FullCrop,
+          "a full preview maps to a full crop");
+}
+
+/*
+ * Tool -> intent wiring. Read the converted producer sources and check that
+ * each documented action registers the intent the migration table names. This
+ * is deliberately a source check: the tools are GUI widgets, and constructing
+ * them in this engine test would pull in the whole toolkit.
+ */
+void checkProducerSource(
+    const char* file, const char* historyMsg, const char* intent,
+    const char* label)
+{
+    const std::string path = std::string(RT_SOURCE_DIR) + "/" + file;
+    std::ifstream stream(path);
+
+    if (!stream) {
+        check(false, std::string(label) + ": cannot read " + path);
+        return;
+    }
+
+    std::string line;
+    bool foundMessage = false;
+    bool foundIntent = false;
+
+    while (std::getline(stream, line)) {
+        if (line.find(historyMsg) == std::string::npos) {
+            continue;
+        }
+        foundMessage = true;
+        if (line.find(std::string("RequestIntent::") + intent)
+                != std::string::npos) {
+            foundIntent = true;
+        }
+    }
+
+    check(foundMessage, std::string(label) + ": message not found");
+    check(foundIntent, std::string(label) + ": wrong intent");
+}
+
+void checkConvertedProducerIntents()
+{
+    checkProducerSource("rtgui/tools/filmnegative.cc",
+                        "HISTORY_MSG_FILMNEGATIVE_VALUES", "AllNoRaw",
+                        "film negative");
+    checkProducerSource("rtgui/tools/spot.cc", "HISTORY_MSG_SPOT_ENTRY",
+                        "SpotAdjust", "spot entry");
+    checkProducerSource("rtgui/tools/whitebalance.cc",
+                        "HISTORY_MSG_WBALANCE_OBSERVER10", "WhiteBalance",
+                        "white balance");
+    checkProducerSource("rtgui/tools/dehaze.cc", "HISTORY_MSG_DEHAZE_ENABLED",
+                        "Hdr", "dehaze");
+    checkProducerSource("rtgui/tools/perspective.cc",
+                        "HISTORY_MSG_PERSP_METHOD", "Transform",
+                        "perspective");
+    checkProducerSource("rtgui/tools/compressgamut.cc",
+                        "HISTORY_MSG_CG_COLORSPACE", "Compr",
+                        "gamut compression");
+    checkProducerSource("rtgui/tools/pdsharpening.cc",
+                        "HISTORY_MSG_PDSHARPEN_CONTRAST", "CaptureSharpen",
+                        "capture sharpening");
+    checkProducerSource("rtgui/tools/bayerpreprocess.cc",
+                        "HISTORY_MSG_PREPROCESS_PDAFLINESFILTER", "DarkFrame",
+                        "dark frame");
+    checkProducerSource("rtgui/tools/cropguide.cc",
+                        "HISTORY_MSG_CROP_GUIDE_ENABLED", "RepaintOnly",
+                        "crop guide");
+    checkProducerSource("rtgui/tools/preprocesswb.cc",
+                        "HISTORY_MSG_PREPROCWB_MODE", "First",
+                        "preprocess white balance");
+    checkProducerSource("rtgui/tools/resize.cc",
+                        "HISTORY_MSG_RESIZE_LONGEDGE", "ControlOnly",
+                        "resize");
+}
+
 void checkIdentity()
 {
     /*
@@ -432,27 +799,47 @@ void checkIdentity()
      * planning information must have the same identity. The raw legacy mask
      * is deliberately excluded; every mask-shaped planning fact is included.
      */
-    const EditorRequest autoexp = from_legacy_mask(M_AUTOEXP);
+    const EditorRequest plain = from_legacy_mask(M_LUMINANCE);
     const EditorRequest color = from_legacy_mask(M_COLOR);
-    check(autoexp.identity() == color.identity(),
+    check(plain.identity() == color.identity(),
           "identity ignores the raw legacy mask");
-    check(autoexp.identity()
-              == coalesce(autoexp, color).identity(),
+    check(plain.identity()
+              == coalesce(plain, color).identity(),
           "coalescing planning-equivalent requests keeps the identity");
 
-    check(autoexp.identity() != from_legacy_mask(M_SPOT).identity(),
+    check(plain.identity() != from_legacy_mask(M_SPOT).identity(),
           "spot intent changes the identity");
-    check(autoexp.identity() != from_legacy_mask(M_INIT).identity(),
+    check(plain.identity() != from_legacy_mask(M_INIT).identity(),
           "full-frame intent changes the identity");
-    check(autoexp.identity() != from_legacy_mask(M_HIGHQUAL).identity(),
+    check(plain.identity() != from_legacy_mask(M_HIGHQUAL).identity(),
           "high-detail intent changes the identity");
-    check(autoexp.identity() != from_legacy_mask(M_MINUPDATE).identity(),
+    check(plain.identity() != from_legacy_mask(M_MINUPDATE).identity(),
           "kind changes the identity");
 
     LegacyMaskContext moved;
     moved.viewportMoved = true;
-    check(autoexp.identity() != from_legacy_mask(M_AUTOEXP, moved).identity(),
+    check(plain.identity() != from_legacy_mask(M_LUMINANCE, moved).identity(),
           "viewportMoved changes the identity");
+
+    /*
+     * The new request facts are planning fields. An auto-exposure request
+     * recomputes different work from a plain Lab request, and a transform or
+     * HDR request differs from both.
+     */
+    check(plain.identity() != from_legacy_mask(M_AUTOEXP).identity(),
+          "autoExposureIntent changes the identity");
+    check(from_legacy_mask(M_TRANSFORM).identity()
+              != from_legacy_mask(M_LUMINANCE).identity(),
+          "transformFamilyIntent changes the identity");
+    check(from_legacy_mask(M_HDR).identity()
+              != from_legacy_mask(M_INIT).identity(),
+          "hdrIntent changes the identity");
+    check(from_legacy_mask(M_RGBCURVE).identity()
+              != from_legacy_mask(M_LUMINANCE).identity(),
+          "rgbProcIntent changes the identity");
+    check(from_legacy_mask(M_CROP).identity()
+              != from_legacy_mask(M_LUMINANCE).identity(),
+          "localAdjustmentsIntent changes the identity");
 
     /*
      * Mask-shaped facts. M_WB and M_AUTOEXP plan differently (the Color/Coloropp
@@ -525,6 +912,13 @@ int main()
     checkEmptyAccumulator();
     checkCoordinatorPatches();
     checkViewportMovedContext();
+    checkProducerIntents();
+    checkProducerDirtyBlocks();
+    checkRefreshMapper();
+    checkProducerEventKey();
+    checkFastPathAugmentation();
+    checkCropReallocationWorkOrder();
+    checkConvertedProducerIntents();
     checkIdentity();
     checkContractViolations();
 

@@ -34,10 +34,10 @@ const Glib::ustring LensGeometry::TOOL_NAME = "lensgeom";
 LensGeometry::LensGeometry () : FoldableToolPanel(this, TOOL_NAME, M("TP_LENSGEOM_LABEL")), rlistener(nullptr), lastFill(false)
 {
     auto m = ProcEventMapper::getInstance();
-    EvTransScale  = m->newEvent(TRANSFORM, "HISTORY_MSG_TRANS_SCALE");
-    EvTransScaleHorizontally  = m->newEvent(TRANSFORM, "HISTORY_MSG_TRANS_SCALE_HORIZONTALLY");
-    EvTransScaleVertically  = m->newEvent(TRANSFORM, "HISTORY_MSG_TRANS_SCALE_VERTICALLY");
-    EvTransMethod = m->newEvent(TRANSFORM, "HISTORY_MSG_TRANS_METHOD");
+    EvTransScale  = m->newEvent(rtengine::RequestIntent::Transform, "HISTORY_MSG_TRANS_SCALE");
+    EvTransScaleHorizontally  = m->newEvent(rtengine::RequestIntent::Transform, "HISTORY_MSG_TRANS_SCALE_HORIZONTALLY");
+    EvTransScaleVertically  = m->newEvent(rtengine::RequestIntent::Transform, "HISTORY_MSG_TRANS_SCALE_VERTICALLY");
+    EvTransMethod = m->newEvent(rtengine::RequestIntent::Transform, "HISTORY_MSG_TRANS_METHOD");
 
     Gtk::Box* hb1 = Gtk::manage (new Gtk::Box ());
     hb1->pack_start (*Gtk::manage (new Gtk::Label ( M("TP_RAW_DMETHOD") + ": ")), Gtk::PACK_SHRINK, 4);

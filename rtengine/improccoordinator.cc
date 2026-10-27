@@ -19,6 +19,7 @@
 #include <cassert>
 #include <cerrno>
 #include <chrono>
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -955,14 +956,15 @@ void ImProcCoordinator::updateViewportLutSnapshot(int todo)
     }
 }
 
-void ImProcCoordinator::renderCrops(int todo, bool force)
+void ImProcCoordinator::renderCrops(int todo, bool force,
+                                    const EditorRequest& request)
 {
     for (size_t i = 0; i < crops.size(); i++) {
         if (crops[i]->hasListener()
                 && (force
                     || (todo & (M_MONITOR | M_RGBCURVE | M_LUMACURVE))
                     || crops[i]->get_skip() == 1)) {
-            crops[i]->update(todo);     // may call ourselves
+            crops[i]->update(todo, request);     // may call ourselves
         }
     }
 }
@@ -1388,50 +1390,12 @@ bool isPreviewNode(const std::string& id)
 }
 
 /*
- * Node gates. Each is the condition the hand-written pass used for the same
- * block, or a documented superset of it. A superset only means the node is
- * executed and its own gate decides; a subset would skip work the legacy pass
- * runs, which the plan validation refuses. The raw/core bodies are not gated
- * here any more: the typed work order decides them.
+ * Node entry is decided by the pass plan: a node is executed only when the
+ * dirty-block set names it. The three helpers that used to translate the
+ * event mask into an entry decision are gone with that change. A body still
+ * asks the typed request facts when it has to decide *how much* of its block
+ * the request allows; it never reads the mask.
  */
-
-/*
- * The base rebuild can change fw/fh through setScale(), so a size-dependent
- * transform check taken before the pass is only usable together with the
- * rebuild bits.
- */
-bool transformMayRun(int todo, bool transformNeeded)
-{
-    return transformNeeded
-        || (todo & (M_HDR | M_TRANSFORM | M_RGBCURVE | M_INIT | M_LINDENOISE))
-               != 0;
-}
-
-bool localAdjustmentsMayRun(int todo, const ProcParams& params)
-{
-    return (todo & M_AUTOEXP) != 0
-        || ((todo & (M_AUTOEXP | M_RGBCURVE | M_CROP)) != 0
-            && params.locallab.enabled && !params.locallab.spots.empty());
-}
-
-bool rgbProcRuns(int todo)
-{
-    return (todo & (M_RGBCURVE | M_CROP)) != 0;
-}
-
-/*
- * The Lab tool chain. The hand-written pass wrote the mask as
- * (M_LUMINANCE + M_COLOR); it is a sum of two bits, so it is kept verbatim.
- */
-bool labPipelineRuns(int todo)
-{
-    return (todo & (M_LUMINANCE + M_COLOR)) != 0 || (todo & M_AUTOEXP) != 0;
-}
-
-bool labToolsRun(int todo)
-{
-    return (todo & (M_LUMACURVE | M_CROP)) != 0 || labPipelineRuns(todo);
-}
 
 /*
  * Report a plan the executor cannot run, and stop.
@@ -2408,11 +2372,18 @@ void ImProcCoordinator::stageRawBase(PreviewPassState& pass)
 /* transform: dehaze, Fattal tone mapping and the geometry transform. */
 void ImProcCoordinator::stageTransform(PreviewPassState& pass)
 {
-    if (!transformMayRun(pass.todo, pass.transformNeeded)) {
+    /*
+     * The plan only schedules this node when the dirty set names transform.
+     * transformNeeded is retained as a check on the plan: a source or
+     * parameter dependency the derivation missed must not silently skip the
+     * geometry.
+     */
+    if (pass.dirty.ids.count("transform") == 0 && !pass.transformNeeded) {
         return;
     }
 
-    if ((pass.todo & M_HDR) && (params->fattal.enabled || params->dehaze.enabled)) {
+    if (pass.request.hdrIntent
+            && (params->fattal.enabled || params->dehaze.enabled)) {
         if (fattal_11_dcrop_cache) {
             delete fattal_11_dcrop_cache;
             fattal_11_dcrop_cache = nullptr;
@@ -2430,7 +2401,7 @@ void ImProcCoordinator::stageTransform(PreviewPassState& pass)
     bool needstransform = ipf.needsTransform(fw, fh, imgsrc->getRotateDegree(), imgsrc->getMetaData());
 
     //  if ((needstransform || ((pass.todo & (M_TRANSFORM | M_RGBCURVE))  && params->dirpyrequalizer.cbdlMethod == "bef" && params->dirpyrequalizer.enabled && !params->colorappearance.enabled))) {
-    if ((needstransform || ((pass.todo & (M_TRANSFORM | M_RGBCURVE))  && params->dirpyrequalizer.cbdlMethod == "bef" && params->dirpyrequalizer.enabled && !pass.cam02))) {
+    if ((needstransform || (pass.request.transformFamilyIntent  && params->dirpyrequalizer.cbdlMethod == "bef" && params->dirpyrequalizer.enabled && !pass.cam02))) {
         // Forking the image
         assert(oprevi);
         Imagefloat *op = oprevi;
@@ -2443,7 +2414,7 @@ void ImProcCoordinator::stageTransform(PreviewPassState& pass)
             op->copyData(oprevi);
         }
     }
-    if ((pass.todo & (M_TRANSFORM | M_RGBCURVE))  && params->dirpyrequalizer.cbdlMethod == "bef" && params->dirpyrequalizer.enabled && !pass.cam02) {
+    if (pass.request.transformFamilyIntent  && params->dirpyrequalizer.cbdlMethod == "bef" && params->dirpyrequalizer.enabled && !pass.cam02) {
         const int W = oprevi->getWidth();
         const int H = oprevi->getHeight();
         LabImage labcbdl(W, H);
@@ -2459,11 +2430,19 @@ void ImProcCoordinator::stageTransform(PreviewPassState& pass)
  */
 void ImProcCoordinator::stageLocalAdjustments(PreviewPassState& pass)
 {
-    if (!localAdjustmentsMayRun(pass.todo, *params)) {
+    const bool autoExposure = pass.request.autoExposureIntent;
+    const bool scheduled = pass.dirty.ids.count("local.adjustments") != 0;
+
+    /*
+     * The plan schedules this node from the dirty set. Auto exposure is a
+     * request-level bit rather than a parameter family, so an auto-exposure
+     * request keeps the node entered even when no fingerprint moved.
+     */
+    if (!scheduled && !autoExposure) {
         return;
     }
 
-    if (pass.todo & M_AUTOEXP) {
+    if (autoExposure) {
         if (params->toneCurve.autoexp) {
             LUTu aehist;
             int aehistcompr;
@@ -2707,7 +2686,7 @@ void ImProcCoordinator::stageLocalAdjustments(PreviewPassState& pass)
             delete [] caprad;
         }
     }
-    if ((pass.todo & (M_AUTOEXP | M_RGBCURVE | M_CROP)) && params->locallab.enabled && !params->locallab.spots.empty()) {
+    if (pass.request.localAdjustmentsIntent && params->locallab.enabled && !params->locallab.spots.empty()) {
 
         ipf.rgb2lab(*oprevi, *oprevl, params->icm.workingProfile);
 
@@ -3363,7 +3342,7 @@ void ImProcCoordinator::stageLocalAdjustments(PreviewPassState& pass)
 /* rgb.proc: the tone curve, RGB curves and colour toning. */
 void ImProcCoordinator::stageRgbProc(PreviewPassState& pass)
 {
-    if (!rgbProcRuns(pass.todo)) {
+    if (pass.dirty.ids.count("rgb.proc") == 0) {
         return;
     }
 
@@ -3421,7 +3400,7 @@ void ImProcCoordinator::stageRgbProc(PreviewPassState& pass)
     }
 
     // if it's just crop we just need the histogram, no image updates
-    if (pass.todo & M_RGBCURVE) {
+    if (pass.request.rgbProcIntent) {
         //initialize rrm bbm ggm different from zero to avoid black screen in some cases
         double rrm = 33.;
         double ggm = 33.;
@@ -3458,7 +3437,7 @@ void ImProcCoordinator::stageRgbProc(PreviewPassState& pass)
 /* lab.tools: the Lab curve preparation and the Lab tool chain. */
 void ImProcCoordinator::stageLabTools(PreviewPassState& pass)
 {
-    if (!labToolsRun(pass.todo)) {
+    if (pass.dirty.ids.count("lab.tools") == 0) {
         return;
     }
 
@@ -3497,7 +3476,7 @@ void ImProcCoordinator::stageLabTools(PreviewPassState& pass)
                                   params->labCurve.lccurve, chroma_acurve, chroma_bcurve, satcurve, lhskcurve, scale == 1 ? 1 : 16);
     updateViewportLutSnapshot(M_LUMACURVE);
 
-    if (labPipelineRuns(pass.todo)) {
+    if (pass.request.labChainIntent) {
     nprevl->CopyFrom(oprevl);
     histCCurve.clear();
     histLCurve.clear();
@@ -3537,7 +3516,8 @@ void ImProcCoordinator::stageLabTools(PreviewPassState& pass)
 /* lab.wavelet: the wavelet tool. */
 void ImProcCoordinator::stageLabWavelet(PreviewPassState& pass)
 {
-    if (!labPipelineRuns(pass.todo)) {
+    if (pass.dirty.ids.count("lab.wavelet") == 0
+            || !pass.request.labChainIntent) {
         return;
     }
 
@@ -3756,7 +3736,8 @@ void ImProcCoordinator::stageLabWavelet(PreviewPassState& pass)
 /* working.trc: soft light, the working TRC and the preservation pass. */
 void ImProcCoordinator::stageWorkingTrc(PreviewPassState& pass)
 {
-    if (!labPipelineRuns(pass.todo)) {
+    if (pass.dirty.ids.count("working.trc") == 0
+            || !pass.request.labChainIntent) {
         return;
     }
 
@@ -4004,7 +3985,8 @@ void ImProcCoordinator::stageWorkingTrc(PreviewPassState& pass)
 /* ciecam: colour appearance and adaptation. */
 void ImProcCoordinator::stageCieCam(PreviewPassState& pass)
 {
-    if (!labPipelineRuns(pass.todo)) {
+    if (pass.dirty.ids.count("ciecam") == 0
+            || !pass.request.labChainIntent) {
         return;
     }
 
@@ -4164,7 +4146,8 @@ void ImProcCoordinator::stageCieCam(PreviewPassState& pass)
 /* gamut: working-space gamut compression and gain. */
 void ImProcCoordinator::stageGamut(PreviewPassState& pass)
 {
-    if (!labPipelineRuns(pass.todo)) {
+    if (pass.dirty.ids.count("gamut") == 0
+            || !pass.request.labChainIntent) {
         return;
     }
 
@@ -4444,6 +4427,41 @@ stage::DirtyBlocks ImProcCoordinator::previewDirtyBlocks(
         stage::mergeDirtyBlocks(fromParams, fromState);
 
     /*
+     * The transform node also applies the pre-RGB directional-pyramid
+     * equaliser for the transform family. That is an absolute request bit, not
+     * a parameter that the transform fingerprint carries, so the typed fact
+     * seeds the node here. The closure below then names its consumers, exactly
+     * as a transform parameter change would.
+     */
+    if (pass.request.transformFamilyIntent) {
+        result.ids.insert("transform");
+    }
+
+    /*
+     * The typed intent facts are the same request-level information the
+     * hand-written sequence read from the mask. Seeding their nodes here makes
+     * the plan cover the legacy envelope exactly; the bodies still use the
+     * facts to decide how much of a scheduled block the request allows.
+     */
+    if (pass.request.hdrIntent) {
+        result.ids.insert("transform");
+    }
+    if (pass.request.rgbProcIntent) {
+        result.ids.insert("rgb.proc");
+    }
+    if (pass.request.labChainIntent) {
+        result.ids.insert("lab.tools");
+        result.ids.insert("lab.wavelet");
+        result.ids.insert("working.trc");
+        result.ids.insert("ciecam");
+        result.ids.insert("gamut");
+    }
+    if (pass.request.localAdjustmentsIntent
+            || pass.request.autoExposureIntent) {
+        result.ids.insert("local.adjustments");
+    }
+
+    /*
      * `analysis` is folded into raw.base: firstAnalysis() is the last statement
      * of the base rebuild, so a dirty analysis must enter raw.base as well or
      * the histogram would never be recomputed. The same applies to the base
@@ -4462,6 +4480,22 @@ stage::DirtyBlocks ImProcCoordinator::previewDirtyBlocks(
      */
     if (spotprev != nullptr) {
         result.ids.insert("raw.base");
+    }
+
+    /*
+     * Close the set once, after every coordinator-side insertion. For the
+     * parameter-derived path this is idempotent; for a producer-provided set it
+     * is the guarantee that the plan never schedules a block without its
+     * consumers. Residents are part of the execution set on every path.
+     */
+    result = stage::closeOverGraph(result, stage::StagePath::Preview);
+    for (const std::string& id :
+         stage::resident_blocks(stage::StagePath::Preview)) {
+        result.ids.insert(id);
+        if (std::find(result.blocks.begin(), result.blocks.end(), id)
+                == result.blocks.end()) {
+            result.blocks.push_back(id);
+        }
     }
 
     return result;
@@ -4720,6 +4754,16 @@ void ImProcCoordinator::updatePreviewImage(EditorRequest request,
         todo |= TRANSFORM;
     }
 
+    /*
+     * Every execution-payload augmentation refreshes the typed facts before
+     * anything can consume them. The fast path below uses `request` directly,
+     * so leaving the facts at their pre-augmentation values would make the
+     * crop bodies read a stale transform/rgb/Lab intent.
+     */
+    request.setLegacyGateMask(todo);
+    request.refreshFromLegacyMask();
+    assertPlanningAgrees(request, "pc-vignette augmentation");
+
     if (previewRequest.load(std::memory_order_relaxed) != requestId) {
         paramsUpdateMutex.lock();
 
@@ -4752,6 +4796,7 @@ void ImProcCoordinator::updatePreviewImage(EditorRequest request,
          */
         assert(request.kind != stage::RequestKind::RepaintOnly
                || request.imperativeRepaint);
+        assertPlanningAgrees(request, "panning requeue");
 
         pendingRequest = coalesce(pendingRequest, request);
         paramsUpdateMutex.unlock();
@@ -4800,17 +4845,22 @@ void ImProcCoordinator::updatePreviewImage(EditorRequest request,
     if (canUseViewportFastPath(eligibilityTodo, highDetailNeeded,
                                viewportFallback)) {
         int cropTodo = todo & VIEWPORT_CROP_TODO;
+        EditorRequest cropRequest = request;
         if (cropTodo & (M_LUMACURVE | M_AUTOEXP)) {
             // Crop::update applies luminance/colour work for these bits only
-            // through M_LUMINANCE/M_COLOR; keep the mask consistent.
+            // through M_LUMINANCE/M_COLOR; keep the mask and the typed facts
+            // consistent, because the crop bodies read the facts.
             cropTodo |= M_LUMINANCE | M_COLOR;
+            cropRequest.setLegacyGateMask(
+                request.legacyGateMask | M_LUMINANCE | M_COLOR);
         }
+        assertPlanningAgrees(cropRequest, "viewport fast-path crop");
 
         prepareViewportLuts(eligibilityTodo);
         ipf.setScale(scale);
 
         const auto cropStart = std::chrono::steady_clock::now();
-        renderCrops(cropTodo, true);
+        renderCrops(cropTodo, true, cropRequest);
         const auto cropEnd = std::chrono::steady_clock::now();
         previewTimer.viewportFast = true;
         previewTimer.viewportCropMs =
@@ -4884,6 +4934,7 @@ void ImProcCoordinator::updatePreviewImage(EditorRequest request,
          */
         assert(!request.imperativeRepaint);
         assert(request.kind != stage::RequestKind::RepaintOnly);
+        assertPlanningAgrees(request, "deferred absorb");
     }
 
     bool suppressDeferredCropRender = false;
@@ -5088,6 +5139,8 @@ void ImProcCoordinator::updatePreviewImage(EditorRequest request,
          * derivation read from the final mask.
          */
         pass.request.setLegacyGateMask(todo);
+        pass.request.refreshFromLegacyMask();
+
 
         if ((pass.todo & M_MONITOR) || (lastOutputProfile != params->icm.outputProfile) || lastOutputIntent != params->icm.outputIntent || lastOutputBPC != params->icm.outputBPC) {
             lastOutputProfile = params->icm.outputProfile;
@@ -5103,8 +5156,12 @@ void ImProcCoordinator::updatePreviewImage(EditorRequest request,
 
 // process crop, if needed
     if (!suppressDeferredCropRender) {
+        const EditorRequest& cropRequest =
+            pass.request.present ? pass.request : request;
+        assertPlanningAgrees(cropRequest, "preview crop render");
         renderCrops(todo, panningRelatedChange
-                        || (highDetailNeeded && prevdemo != PD_Sidecar));
+                        || (highDetailNeeded && prevdemo != PD_Sidecar),
+                    cropRequest);
     }
 
     /*
@@ -6038,8 +6095,33 @@ ProcParams* ImProcCoordinator::beginUpdateParams()
 
 void ImProcCoordinator::endUpdateParams(ProcEvent change)
 {
-    int action = RefreshMapper::getInstance()->getAction(change);
-    endUpdateParams(action);
+    EditorRequest request;
+
+    if (!RefreshMapper::getInstance()->getRequest(change, request)) {
+        /*
+         * Compatibility path: the producer registered a mask. This is the one
+         * place the GUI boundary still hands planning information over in mask
+         * form, and from_legacy_mask() is the single classifier.
+         */
+        request = from_legacy_mask(
+            RefreshMapper::getInstance()->getAction(change),
+            LegacyMaskContext{});
+    }
+
+    endUpdateParams(request);
+}
+
+void ImProcCoordinator::endUpdateParams(const EditorRequest& request)
+{
+    pendingRequest = coalesce(pendingRequest, request);
+    paramsReady.store(true, std::memory_order_release);
+
+    if (!request.controlOnly) {
+        previewRequest.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    paramsUpdateMutex.unlock();
+    startProcessing();
 }
 
 void ImProcCoordinator::endUpdateParams(int changeFlags)

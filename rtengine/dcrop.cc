@@ -38,6 +38,7 @@
 #include "curves.h"
 #include "dcp.h"
 #include "dcrop.h"
+#include "editorrequest.h"
 #include "guidedfilter.h"
 #include "image8.h"
 #include "imagefloat.h"
@@ -85,6 +86,12 @@ struct CropStageContext {
     procparams::ProcParams& params;
     const int todo;
     Imagefloat* baseCrop;
+    /*
+     * Typed request of this update. The crop plan decides which stages are
+     * entered; the stage bodies that must decide *how much* of their block the
+     * request allows read these facts instead of the mask.
+     */
+    const rtengine::EditorRequest& request;
 
     // Raw load and auto-denoise scratch.
     bool needsInitUpdate = false;
@@ -124,8 +131,8 @@ struct CropStageContext {
     rtengine::stage::WorkOrder work;
 
     CropStageContext(procparams::ProcParams& parameters, int actions,
-                     Imagefloat* base)
-        : params(parameters), todo(actions), baseCrop(base)
+                     Imagefloat* base, const rtengine::EditorRequest& typed)
+        : params(parameters), todo(actions), baseCrop(base), request(typed)
     {
     }
 
@@ -575,7 +582,7 @@ unsigned dirtyDerivations()
 
 } // namespace crop_graph
 
-void Crop::update(int todo)
+void Crop::update(int todo, const EditorRequest& request)
 {
     MyMutex::MyLock cropLock(cropMutex);
 
@@ -583,11 +590,11 @@ void Crop::update(int todo)
 //       CropGUIListener* cropgl;
 
     /*
-     * The incoming mask names a repaint-only viewport move. Read it before the
-     * ALL augmentation below replaces the request mask; the fact describes the
-     * request, not the work the augmentation adds.
+     * The incoming request names a repaint-only viewport move. Read the typed
+     * fact before the ALL augmentation below replaces the mask; the fact
+     * describes the request, not the work the augmentation adds.
      */
-    const bool viewportMovedRequest = (todo & M_MINUPDATE) != 0;
+    const bool viewportMovedRequest = request.imperativeRepaint;
 
     // No need to update todo here, since it has already been changed in ImprocCoordinator::updatePreviewImage,
     // and Crop::update ask to do ALL anyway
@@ -610,7 +617,8 @@ void Crop::update(int todo)
     }
 
     // it something has been reallocated, all processing steps have to be performed
-    if (needsinitupdate || (todo & M_HIGHQUAL)) {
+    if (needsinitupdate
+            || request.kind == rtengine::stage::RequestKind::HighQuality) {
         todo = ALL;
     }
 
@@ -627,7 +635,7 @@ void Crop::update(int todo)
      * blocks this invocation executes; all blocks call the same methods in the
      * same order, so the plan cannot change an arithmetic step or an ordering.
      */
-    CropStageContext ctx(*parent->params, todo, baseCrop);
+    CropStageContext ctx(*parent->params, todo, baseCrop, request);
     ctx.needsInitUpdate = needsinitupdate;
     ctx.widIm = widIm;
     ctx.heiIm = heiIm;
@@ -644,8 +652,8 @@ void Crop::update(int todo)
      * pass, because the stage bodies can update the source generation and the
      * high-detail flags while they run.
      */
-    const auto cropRenderState = [this, &todo, &params,
-                                  viewportMovedRequest]() {
+    const auto cropRenderState = [this, &request, &params,
+                                  viewportMovedRequest, needsinitupdate]() {
         rtengine::stage::RenderStateKey state;
         state.previewScale = skip;
         state.previewWidth = cropw;
@@ -684,21 +692,16 @@ void Crop::update(int todo)
          * The fast-preview and main-preview switches are preview request
          * state; the crop viewport does not consult them.
          *
-         * The request kind is the one thing the crop takes from the legacy
-         * mask rather than from ProcParams: M_INIT, M_LINDENOISE and M_HDR ask
-         * for the destructive raw stage to be reloaded, which is a request,
-         * not a parameter delta. It is carried as FullCrop so the derivation
-         * treats the path as a rebuild instead of silently skipping the
-         * reload.
+         * The request kind comes from the typed request, except for a
+         * reallocation: the buffers were just replaced, so the base must be
+         * refilled whatever the editor asked for. That force is carried in the
+         * render-state kind as FullCrop, which makes derive_crop_work() name
+         * the raw base rebuild even when the request is ParamsOnly or
+         * RepaintOnly. HighQuality keeps its own priority for the work order;
+         * the dirty derivation carries the reallocation through forceFull.
          */
-        const bool reloadRequested = (todo & (M_INIT | M_LINDENOISE | M_HDR)) != 0;
-        state.requestKind = (todo & M_HIGHQUAL) != 0
-                                ? rtengine::stage::RequestKind::HighQuality
-                                : reloadRequested
-                                      ? rtengine::stage::RequestKind::FullCrop
-                                      : todo == M_MINUPDATE
-                                            ? rtengine::stage::RequestKind::RepaintOnly
-                                            : rtengine::stage::RequestKind::ParamsOnly;
+        state.requestKind = rtengine::crop_request_kind(
+            request.kind, needsinitupdate);
 
         /*
          * Request facts. The source is read at its current frame. The
@@ -721,7 +724,7 @@ void Crop::update(int todo)
                 parent->imgsrc->getDirPyrDenoiseExpComp();
         }
         state.denoiseAnalysisValid = parent->denoiseInfoStore.valid;
-        state.spotPending = (todo & M_SPOT) != 0 && params.spot.enabled
+        state.spotPending = request.spotPending && params.spot.enabled
             && !params.spot.entries.empty();
         state.spotBufferLive = spotCrop != nullptr;
 
@@ -813,7 +816,8 @@ void Crop::update(int todo)
     inputs.previousState = dirtyState->valid ? &dirtyState->renderState
                                              : nullptr;
     inputs.currentState = &state;
-    inputs.forceFull = needsinitupdate || (todo & M_HIGHQUAL) != 0;
+    inputs.forceFull = needsinitupdate
+        || request.kind == rtengine::stage::RequestKind::HighQuality;
 
     const rtengine::stage::DirtyBlocks derived =
         rtengine::stage::derive_dirty_blocks(inputs);
@@ -1437,7 +1441,6 @@ void Crop::stageAnalysis(CropStageContext& ctx)
 void Crop::stageRawBase(CropStageContext& ctx)
 {
     ProcParams& params = ctx.params;
-    const int todo = ctx.todo;
     int& tr = ctx.tr;
     NoiseCurve& noiseLCurve = ctx.noiseLCurve;
     NoiseCurve& noiseCCurve = ctx.noiseCCurve;
@@ -1579,7 +1582,8 @@ void Crop::stageRawBase(CropStageContext& ctx)
 
     std::unique_ptr<Imagefloat> fattalCrop;
 
-    if ((todo & M_HDR) && (params.fattal.enabled || params.dehaze.enabled)) {
+    if (ctx.request.hdrIntent
+            && (params.fattal.enabled || params.dehaze.enabled)) {
         Imagefloat *f = origCrop;
         int fw = skips(parent->fw, skip);
         int fh = skips(parent->fh, skip);
@@ -1663,7 +1667,6 @@ void Crop::stageRawBase(CropStageContext& ctx)
 void Crop::stageTransform(CropStageContext& ctx)
 {
     ProcParams& params = ctx.params;
-    const int todo = ctx.todo;
     Imagefloat*& baseCrop = ctx.baseCrop;
 
     const bool needstransform  = parent->ipf.needsTransform(skips(parent->fw, skip), skips(parent->fh, skip), parent->imgsrc->getRotateDegree(), parent->imgsrc->getMetaData());
@@ -1672,7 +1675,8 @@ void Crop::stageTransform(CropStageContext& ctx)
 
     // transform
    // if (needstransform || ((todo & (M_TRANSFORM | M_RGBCURVE)) && params.dirpyrequalizer.cbdlMethod == "bef" && params.dirpyrequalizer.enabled && !params.colorappearance.enabled)) {
-    if (needstransform || ((todo & (M_TRANSFORM | M_RGBCURVE)) && params.dirpyrequalizer.cbdlMethod == "bef" && params.dirpyrequalizer.enabled && !cam02)) {
+    const bool transformIntent = ctx.request.transformFamilyIntent;
+    if (needstransform || (transformIntent && params.dirpyrequalizer.cbdlMethod == "bef" && params.dirpyrequalizer.enabled && !cam02)) {
         if (!transCrop) {
             transCrop = new Imagefloat(cropw, croph);
         }
@@ -1694,7 +1698,7 @@ void Crop::stageTransform(CropStageContext& ctx)
     }
 
    // if ((todo & (M_TRANSFORM | M_RGBCURVE))  && params.dirpyrequalizer.cbdlMethod == "bef" && params.dirpyrequalizer.enabled && !params.colorappearance.enabled) {
-    if ((todo & (M_TRANSFORM | M_RGBCURVE))  && params.dirpyrequalizer.cbdlMethod == "bef" && params.dirpyrequalizer.enabled && !cam02) {
+    if (transformIntent  && params.dirpyrequalizer.cbdlMethod == "bef" && params.dirpyrequalizer.enabled && !cam02) {
 
         const int W = baseCrop->getWidth();
         const int H = baseCrop->getHeight();
@@ -1709,10 +1713,9 @@ void Crop::stageTransform(CropStageContext& ctx)
 void Crop::stageLocalAdjustments(CropStageContext& ctx)
 {
     ProcParams& params = ctx.params;
-    const int todo = ctx.todo;
     Imagefloat*& baseCrop = ctx.baseCrop;
 
-    if ((todo & (M_AUTOEXP | M_RGBCURVE)) && params.locallab.enabled && !params.locallab.spots.empty()) {
+    if (ctx.request.localAdjustmentsIntent && params.locallab.enabled && !params.locallab.spots.empty()) {
 
         //I made a little change here. Rather than have luminanceCurve (and others) use in/out lab images, we can do more if we copy right here.
         parent->ipf.rgb2lab(*baseCrop, *laboCrop, params.icm.workingProfile);
@@ -2234,10 +2237,9 @@ void Crop::stageLocalAdjustments(CropStageContext& ctx)
 void Crop::stageRgbProc(CropStageContext& ctx)
 {
     ProcParams& params = ctx.params;
-    const int todo = ctx.todo;
     Imagefloat*& baseCrop = ctx.baseCrop;
 
-    if (todo & M_RGBCURVE) {
+    if (ctx.request.rgbProcIntent) {
         double rrm, ggm, bbm;
         DCPProfileApplyState as;
         DCPProfile *dcpProf = parent->imgsrc->getDCP(params.icm, as);
@@ -2253,11 +2255,10 @@ void Crop::stageRgbProc(CropStageContext& ctx)
 void Crop::stageLabTools(CropStageContext& ctx)
 {
     ProcParams& params = ctx.params;
-    const int todo = ctx.todo;
     const bool cam02 = ctx.cam02;
     LUTu& dummy = ctx.dummy;
 
-    if ((todo & (M_LUMINANCE + M_COLOR)) == 0) {
+    if (!ctx.request.labChainIntent) {
         return;
     }
     labnCrop->CopyFrom(laboCrop);
@@ -2292,10 +2293,9 @@ void Crop::stageLabTools(CropStageContext& ctx)
 void Crop::stageLabSharpening(CropStageContext& ctx)
 {
     ProcParams& params = ctx.params;
-    const int todo = ctx.todo;
     const bool cam02 = ctx.cam02;
 
-    if ((todo & (M_LUMINANCE + M_COLOR)) == 0) {
+    if (!ctx.request.labChainIntent) {
         return;
     }
     //parent->ipf.EPDToneMap(labnCrop, 5, 1);    //Go with much fewer than normal iterates for fast redisplay.
@@ -2320,10 +2320,9 @@ void Crop::stageLabSharpening(CropStageContext& ctx)
 void Crop::stageLabWavelet(CropStageContext& ctx)
 {
     ProcParams& params = ctx.params;
-    const int todo = ctx.todo;
     const bool cam02 = ctx.cam02;
 
-    if ((todo & (M_LUMINANCE + M_COLOR)) == 0) {
+    if (!ctx.request.labChainIntent) {
         return;
     }
     //   if (skip==1) {
@@ -2588,8 +2587,7 @@ void Crop::stageLabWavelet(CropStageContext& ctx)
 void Crop::stageWorkingTrc(CropStageContext& ctx)
 {
     ProcParams& params = ctx.params;
-    const int todo = ctx.todo;
-    if ((todo & (M_LUMINANCE + M_COLOR)) == 0) {
+    if (!ctx.request.labChainIntent) {
         return;
     }
     parent->ipf.softLight(labnCrop, params.softlight);
@@ -2716,10 +2714,9 @@ void Crop::stageWorkingTrc(CropStageContext& ctx)
 void Crop::stageCieCam(CropStageContext& ctx)
 {
     ProcParams& params = ctx.params;
-    const int todo = ctx.todo;
     LUTu& dummy = ctx.dummy;
 
-    if ((todo & (M_LUMINANCE + M_COLOR)) == 0) {
+    if (!ctx.request.labChainIntent) {
         return;
     }
     if (params.colorappearance.enabled) {
@@ -2766,8 +2763,7 @@ void Crop::stageCieCam(CropStageContext& ctx)
 void Crop::stageGamut(CropStageContext& ctx)
 {
     ProcParams& params = ctx.params;
-    const int todo = ctx.todo;
-    if ((todo & (M_LUMINANCE + M_COLOR)) == 0) {
+    if (!ctx.request.labChainIntent) {
         return;
     }
     bool exec = params.icm.wgamut != ColorManagementParams::Wwgamut::NONE  || params.icm.wgamgain != 0.f;
@@ -3177,9 +3173,17 @@ void Crop::fullUpdate()
     // If there are more update request, the following WHILE will collect it
     newUpdatePending = true;
 
+    /*
+     * A forced detail-window refresh is the legacy "everything" request. It
+     * is built through the adapter once, so the typed facts and the mask stay
+     * in step.
+     */
+    const EditorRequest forced =
+        from_legacy_mask(ALL | M_MONITOR, LegacyMaskContext{});
+
     while (newUpdatePending) {
         newUpdatePending = false;
-        update(ALL);
+        update(ALL, forced);
     }
 
     updating = false;  // end of crop update

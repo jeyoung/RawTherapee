@@ -30,7 +30,7 @@ Retinex::Retinex () : FoldableToolPanel (this, TOOL_NAME, M ("TP_RETINEX_LABEL")
     nextminT = 0.;
     nextmaxT = 0.;
     auto m = ProcEventMapper::getInstance();
-    EvReticomplex = m->newEvent(DEMOSAIC, "HISTORY_MSG_COMPLEXRETI");
+    EvReticomplex = m->newEvent(rtengine::RequestIntent::Demosaic, "HISTORY_MSG_COMPLEXRETI");
 
 
     const RetinexParams default_params;

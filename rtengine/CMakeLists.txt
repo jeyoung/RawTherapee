@@ -456,8 +456,19 @@ rt_setup_target(stage-store-test)
 # Typed editor request and its single legacy-mask adapter.
 add_executable(editorrequest-test EXCLUDE_FROM_ALL
     "${CMAKE_CURRENT_SOURCE_DIR}/stage/tests/editorrequest_test.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/editcallbacks.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/multilangmgr.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/options.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/paramsedited.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/pathutils.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/threadutils.cc"
+)
+target_include_directories(editorrequest-test BEFORE PRIVATE
+    "${CMAKE_BINARY_DIR}/rtgui"
 )
 target_link_libraries(editorrequest-test PRIVATE rtengine)
+target_compile_definitions(editorrequest-test PRIVATE
+    RT_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
 rt_setup_target(editorrequest-test)
 
 target_include_directories(rtengine

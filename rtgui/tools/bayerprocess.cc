@@ -37,11 +37,11 @@ BayerProcess::BayerProcess () :
     const auto& options = App::get().options();
 
     auto m = ProcEventMapper::getInstance();
-    EvDemosaicBorder = m->newEvent(DARKFRAME, "HISTORY_MSG_RAW_BORDER");
-    EvDemosaicContrast = m->newEvent(DEMOSAIC, "HISTORY_MSG_DUALDEMOSAIC_CONTRAST");
-    EvDemosaicAutoContrast = m->newEvent(DEMOSAIC, "HISTORY_MSG_DUALDEMOSAIC_AUTO_CONTRAST");
-    EvDemosaicPixelshiftDemosaicMethod = m->newEvent(DEMOSAIC, "HISTORY_MSG_PIXELSHIFT_DEMOSAIC");
-    EvPixelshiftAverage = m->newEvent(DEMOSAIC, "HISTORY_MSG_PIXELSHIFT_AVERAGE");
+    EvDemosaicBorder = m->newEvent(rtengine::RequestIntent::DarkFrame, "HISTORY_MSG_RAW_BORDER");
+    EvDemosaicContrast = m->newEvent(rtengine::RequestIntent::Demosaic, "HISTORY_MSG_DUALDEMOSAIC_CONTRAST");
+    EvDemosaicAutoContrast = m->newEvent(rtengine::RequestIntent::Demosaic, "HISTORY_MSG_DUALDEMOSAIC_AUTO_CONTRAST");
+    EvDemosaicPixelshiftDemosaicMethod = m->newEvent(rtengine::RequestIntent::Demosaic, "HISTORY_MSG_PIXELSHIFT_DEMOSAIC");
+    EvPixelshiftAverage = m->newEvent(rtengine::RequestIntent::Demosaic, "HISTORY_MSG_PIXELSHIFT_AVERAGE");
 
     Gtk::Box* hb1 = Gtk::manage (new Gtk::Box ());
     hb1->pack_start (*Gtk::manage (new Gtk::Label ( M("TP_RAW_DMETHOD") + ": ")), Gtk::PACK_SHRINK, 4);

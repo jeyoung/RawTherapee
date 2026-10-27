@@ -31,6 +31,7 @@
 #include <cassert>
 #include <cstdint>
 #include <cstdlib>
+#include <algorithm>
 #include <functional>
 #include <string>
 
@@ -107,6 +108,12 @@ uint64_t identityOf(const EditorRequest& request)
     hash = hashCombine(hash, request.colorHlrWbRequest ? 1 : 0);
     hash = hashCombine(hash, request.monitorOutputRequest ? 1 : 0);
     hash = hashCombine(hash, request.imperativeRepaint ? 1 : 0);
+    hash = hashCombine(hash, request.transformFamilyIntent ? 1 : 0);
+    hash = hashCombine(hash, request.hdrIntent ? 1 : 0);
+    hash = hashCombine(hash, request.rgbProcIntent ? 1 : 0);
+    hash = hashCombine(hash, request.labChainIntent ? 1 : 0);
+    hash = hashCombine(hash, request.autoExposureIntent ? 1 : 0);
+    hash = hashCombine(hash, request.localAdjustmentsIntent ? 1 : 0);
     hash = hashCombine(hash, request.dirty.valid ? 1 : 0);
     hash = hashCombine(hash, request.dirty.forced ? 1 : 0);
 
@@ -176,11 +183,30 @@ void EditorRequest::setLegacyGateMask(int mask)
     colorHlrWbRequest = colorHlrWbRequestFor(mask);
     monitorOutputRequest = monitorOutputRequestFor(mask);
     imperativeRepaint = imperativeRepaintFor(mask);
+    transformFamilyIntent =
+        (mask & (M_HDR | M_TRANSFORM | M_RGBCURVE | M_INIT | M_LINDENOISE)) != 0;
+    hdrIntent = (mask & M_HDR) != 0;
+    rgbProcIntent = (mask & M_RGBCURVE) != 0;
+    labChainIntent = (mask & (M_LUMINANCE | M_COLOR | M_AUTOEXP)) != 0;
+    autoExposureIntent = (mask & M_AUTOEXP) != 0;
+    localAdjustmentsIntent =
+        (mask & (M_AUTOEXP | M_RGBCURVE | M_CROP)) != 0;
 }
 
 uint64_t EditorRequest::identity() const
 {
     return identityOf(*this);
+}
+
+void EditorRequest::refreshFromLegacyMask()
+{
+    present = legacyGateMask != 0;
+    controlOnly = (legacyGateMask & ~M_VOID) == 0;
+    spotPending = (legacyGateMask & M_SPOT) != 0;
+    highDetailIntent = (legacyGateMask & M_HIGHQUAL) != 0;
+    fullFrameIntent = (legacyGateMask & FULL_FRAME_BITS) != 0;
+    setLegacyGateMask(legacyGateMask);
+    kind = kindForLegacyMask(legacyGateMask);
 }
 
 bool planningAgreesWithLegacyMask(const EditorRequest& request)
@@ -200,7 +226,25 @@ bool planningAgreesWithLegacyMask(const EditorRequest& request)
         && request.monitorOutputRequest
             == monitorOutputRequestFor(request.legacyGateMask)
         && request.imperativeRepaint
-            == imperativeRepaintFor(request.legacyGateMask);
+            == imperativeRepaintFor(request.legacyGateMask)
+        && request.transformFamilyIntent
+            == ((request.legacyGateMask
+                 & (M_HDR | M_TRANSFORM | M_RGBCURVE | M_INIT
+                    | M_LINDENOISE))
+                != 0)
+        && request.hdrIntent
+            == ((request.legacyGateMask & M_HDR) != 0)
+        && request.rgbProcIntent
+            == ((request.legacyGateMask & M_RGBCURVE) != 0)
+        && request.labChainIntent
+            == ((request.legacyGateMask & (M_LUMINANCE | M_COLOR | M_AUTOEXP))
+                != 0)
+        && request.autoExposureIntent
+            == ((request.legacyGateMask & M_AUTOEXP) != 0)
+        && request.localAdjustmentsIntent
+            == ((request.legacyGateMask
+                 & (M_AUTOEXP | M_RGBCURVE | M_CROP))
+                != 0);
 }
 
 EditorRequest from_legacy_mask(int mask, const LegacyMaskContext& context)
@@ -266,6 +310,15 @@ EditorRequest coalesce(const EditorRequest& first, const EditorRequest& second)
     merged.highDetailIntent =
         first.highDetailIntent || second.highDetailIntent;
     merged.fullFrameIntent = first.fullFrameIntent || second.fullFrameIntent;
+    merged.transformFamilyIntent =
+        first.transformFamilyIntent || second.transformFamilyIntent;
+    merged.hdrIntent = first.hdrIntent || second.hdrIntent;
+    merged.rgbProcIntent = first.rgbProcIntent || second.rgbProcIntent;
+    merged.labChainIntent = first.labChainIntent || second.labChainIntent;
+    merged.autoExposureIntent =
+        first.autoExposureIntent || second.autoExposureIntent;
+    merged.localAdjustmentsIntent =
+        first.localAdjustmentsIntent || second.localAdjustmentsIntent;
 
     /*
      * Reproduce the old derivation over the ORed mask. A bare repaint stays a
@@ -302,6 +355,108 @@ EditorRequest coalesce(const EditorRequest& first, const EditorRequest& second)
     }
 
     return merged;
+}
+
+int compatibility_mask(RequestIntent intent)
+{
+    switch (intent) {
+    case RequestIntent::AllNoRaw:
+        return ALLNORAW;
+    case RequestIntent::Demosaic:
+        return DEMOSAIC;
+    case RequestIntent::Hdr:
+        return HDR;
+    case RequestIntent::SpotAdjust:
+        return SPOTADJUST;
+    case RequestIntent::Transform:
+        return TRANSFORM;
+    case RequestIntent::WhiteBalance:
+        return WB;
+    case RequestIntent::RepaintOnly:
+        return M_MINUPDATE;
+    case RequestIntent::ControlOnly:
+        return M_VOID;
+    case RequestIntent::Compr:
+        return COMPR;
+    case RequestIntent::CaptureSharpen:
+        return CAPTURESHARPEN;
+    case RequestIntent::DarkFrame:
+        return DARKFRAME;
+    case RequestIntent::First:
+        return FIRST;
+    }
+
+    assert(false && "unknown request intent");
+    std::abort();
+}
+
+EditorRequest make_request(RequestIntent intent,
+                           std::initializer_list<const char*> blocks,
+                           stage::StagePath path)
+{
+    EditorRequest request = from_legacy_mask(compatibility_mask(intent));
+
+    if (blocks.size() == 0) {
+        return request;
+    }
+
+    /*
+     * A producer that names its blocks knows the seeds, not the execution
+     * set. Close over the pipeline edges and add the path residents, exactly
+     * as derive_dirty_blocks() does for the parameter form, so the coordinator
+     * can use the set as an execution set.
+     */
+    stage::DirtyBlocks seed;
+    seed.valid = true;
+    for (const char* id : blocks) {
+        seed.ids.insert(id);
+        seed.blocks.push_back(id);
+    }
+
+    stage::DirtyBlocks closed = stage::closeOverGraph(seed, path);
+
+    for (const std::string& id : stage::resident_blocks(path)) {
+        closed.ids.insert(id);
+        if (std::find(closed.blocks.begin(), closed.blocks.end(), id)
+                == closed.blocks.end()) {
+            closed.blocks.push_back(id);
+        }
+    }
+
+    closed.reason.clear();
+    closed.forced = false;
+    request.dirty = closed;
+    request.dirtySource = EditorRequest::DirtySource::ProducerProvided;
+    return request;
+}
+
+EditorRequest make_request(RequestIntent intent)
+{
+    return make_request(intent, {}, stage::StagePath::Preview);
+}
+
+std::string producerEventKey(const EditorRequest& request,
+                             const std::string& historyMsg)
+{
+    return "typed-" + std::to_string(request.identity()) + "-"
+        + std::to_string(request.legacyGateMask) + historyMsg;
+}
+
+stage::RequestKind crop_request_kind(EditorRequest::RequestKind previewKind,
+                                     bool reallocation)
+{
+    if (reallocation) {
+        return stage::RequestKind::FullCrop;
+    }
+
+    if (previewKind == stage::RequestKind::HighQuality) {
+        return stage::RequestKind::HighQuality;
+    }
+    if (previewKind == stage::RequestKind::FullPreview) {
+        return stage::RequestKind::FullCrop;
+    }
+
+    return previewKind;
 }
 
 } // namespace rtengine

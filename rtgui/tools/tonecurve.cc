@@ -40,10 +40,10 @@ ToneCurve::ToneCurve() : FoldableToolPanel(this, TOOL_NAME, M("TP_EXPOSURE_LABEL
 {
     auto m = ProcEventMapper::getInstance();
     EvHistMatching = m->newEvent(AUTOEXP, "HISTORY_MSG_HISTMATCHING");
-    EvHistMatchingBatch = m->newEvent(M_VOID, "HISTORY_MSG_HISTMATCHING");
-    EvClampOOG = m->newEvent(DARKFRAME, "HISTORY_MSG_CLAMPOOG");
-    EvHLbl = m->newEvent(DEMOSAIC, "HISTORY_MSG_HLBL");
-    EvHLth = m->newEvent(DEMOSAIC, "HISTORY_MSG_HLTH");
+    EvHistMatchingBatch = m->newEvent(rtengine::RequestIntent::ControlOnly, "HISTORY_MSG_HISTMATCHING");
+    EvClampOOG = m->newEvent(rtengine::RequestIntent::DarkFrame, "HISTORY_MSG_CLAMPOOG");
+    EvHLbl = m->newEvent(rtengine::RequestIntent::Demosaic, "HISTORY_MSG_HLBL");
+    EvHLth = m->newEvent(rtengine::RequestIntent::Demosaic, "HISTORY_MSG_HLTH");
 
     CurveListener::setMulti(true);
 

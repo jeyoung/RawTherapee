@@ -8748,11 +8748,11 @@ Locallabcie::Locallabcie():
     Evlocallabshadmaskcie = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIEMASK_SHAD");
     EvlocallabLLmaskcieshapewav = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIEMASK_WLC");
     EvlocallabcsThresholdcie = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIEMASK_WLEV");
-    Evlocallabcomprcie = m->newEvent(HDR, "HISTORY_MSG_LOCAL_CIE_BRICOMP");
-    Evlocallabstrcielog = m->newEvent(HDR, "HISTORY_MSG_LOCAL_CIE_STRLOG");
-    Evlocallabsatcie = m->newEvent(HDR, "HISTORY_MSG_LOCAL_CIE_SATCIE");
-    Evlocallablogcieq = m->newEvent(HDR, "HISTORY_MSG_LOCAL_CIE_LOGCIEQ");
-    Evlocallabcomprcieth = m->newEvent(HDR, "HISTORY_MSG_LOCAL_CIE_BRICOMPTH");
+    Evlocallabcomprcie = m->newEvent(rtengine::RequestIntent::Hdr, "HISTORY_MSG_LOCAL_CIE_BRICOMP");
+    Evlocallabstrcielog = m->newEvent(rtengine::RequestIntent::Hdr, "HISTORY_MSG_LOCAL_CIE_STRLOG");
+    Evlocallabsatcie = m->newEvent(rtengine::RequestIntent::Hdr, "HISTORY_MSG_LOCAL_CIE_SATCIE");
+    Evlocallablogcieq = m->newEvent(rtengine::RequestIntent::Hdr, "HISTORY_MSG_LOCAL_CIE_LOGCIEQ");
+    Evlocallabcomprcieth = m->newEvent(rtengine::RequestIntent::Hdr, "HISTORY_MSG_LOCAL_CIE_BRICOMPTH");
     EvlocallabHHhmaskcieshape = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIEMASK_CHH");
     EvlocallabbwevMethod12 = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIE_SIGMET");
     Evlocallabgamjcie = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIE_GAM");

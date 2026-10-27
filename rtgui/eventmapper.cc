@@ -58,6 +58,42 @@ rtengine::ProcEvent ProcEventMapper::newEvent(int action, const std::string &his
 }
 
 
+rtengine::ProcEvent ProcEventMapper::newEvent(
+    rtengine::RequestIntent intent, const std::string &history_msg)
+{
+    return newEvent(rtengine::make_request(intent), history_msg);
+}
+
+
+rtengine::ProcEvent ProcEventMapper::newEvent(
+    rtengine::EditorRequest request, const std::string &history_msg)
+{
+    /*
+     * The key carries the planning identity and the compatibility mask. The
+     * mask is required because two producer actions can plan identically yet
+     * carry different execution payloads (EvSpotEnabled and
+     * EvSpotEnabledOPA share a history message today).
+     */
+    const std::string eventkey =
+        rtengine::producerEventKey(request, history_msg);
+    const auto ret = events_.find(eventkey);
+    if (ret == events_.end()) {
+        rtengine::ProcEvent event = rtengine::RefreshMapper::getInstance()->newEvent();
+        rtengine::RefreshMapper::getInstance()->mapRequest(event, request);
+        events_.emplace(std::move(eventkey), event);
+        if (history_msg.empty()) {
+            history_msgs_[event] = M("HISTORY_MSG_" + std::to_string(event + 1));
+        } else {
+            history_msgs_[event] = M(history_msg);
+        }
+
+        return event;
+    } else {
+        return ret->second;
+    }
+}
+
+
 const std::string &ProcEventMapper::getHistoryMsg(rtengine::ProcEvent event) const
 {
     static std::string empty;

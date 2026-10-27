@@ -32,9 +32,9 @@ const Glib::ustring XTransProcess::TOOL_NAME = "xtransprocess";
 XTransProcess::XTransProcess () : FoldableToolPanel(this, TOOL_NAME, M("TP_RAW_LABEL"), App::get().options().prevdemo != PD_Sidecar)
 {
     auto m = ProcEventMapper::getInstance();
-    EvDemosaicBorder = m->newEvent(DEMOSAIC, "HISTORY_MSG_RAW_BORDER");
-    EvDemosaicContrast = m->newEvent(DEMOSAIC, "HISTORY_MSG_DUALDEMOSAIC_CONTRAST");
-    EvDemosaicAutoContrast = m->newEvent(DEMOSAIC, "HISTORY_MSG_DUALDEMOSAIC_AUTO_CONTRAST");
+    EvDemosaicBorder = m->newEvent(rtengine::RequestIntent::Demosaic, "HISTORY_MSG_RAW_BORDER");
+    EvDemosaicContrast = m->newEvent(rtengine::RequestIntent::Demosaic, "HISTORY_MSG_DUALDEMOSAIC_CONTRAST");
+    EvDemosaicAutoContrast = m->newEvent(rtengine::RequestIntent::Demosaic, "HISTORY_MSG_DUALDEMOSAIC_AUTO_CONTRAST");
 
     Gtk::Box* hb1 = Gtk::manage (new Gtk::Box ());
     hb1->pack_start (*Gtk::manage (new Gtk::Label ( M("TP_RAW_DMETHOD") + ": ")), Gtk::PACK_SHRINK, 4);

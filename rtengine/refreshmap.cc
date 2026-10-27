@@ -17,6 +17,7 @@
  *  along with RawTherapee.  If not, see <https://www.gnu.org/licenses/>.
  */
 #include "refreshmap.h"
+#include "editorrequest.h"
 #include "procevents.h"
 
 
@@ -1210,6 +1211,27 @@ ProcEvent RefreshMapper::newEvent()
 void RefreshMapper::mapEvent(ProcEvent event, int action)
 {
     actions_[event] = action;
+    requests_.erase(event);
+}
+
+
+void RefreshMapper::mapRequest(ProcEvent event, const EditorRequest& request)
+{
+    actions_[event] = request.legacyGateMask;
+    requests_[event] = std::make_shared<const EditorRequest>(request);
+}
+
+
+bool RefreshMapper::getRequest(ProcEvent event, EditorRequest& request) const
+{
+    auto it = requests_.find(event);
+
+    if (it == requests_.end()) {
+        return false;
+    }
+
+    request = *it->second;
+    return true;
 }
 
 

@@ -36,7 +36,7 @@ const Glib::ustring FlatField::TOOL_NAME = "flatfield";
 FlatField::FlatField () : FoldableToolPanel(this, TOOL_NAME, M("TP_FLATFIELD_LABEL"))
 {
     auto m = ProcEventMapper::getInstance();
-    EvFlatFieldFromMetaData = m->newEvent(DARKFRAME, "HISTORY_MSG_FF_FROMMETADATA");
+    EvFlatFieldFromMetaData = m->newEvent(rtengine::RequestIntent::DarkFrame, "HISTORY_MSG_FF_FROMMETADATA");
 
     auto& options = App::get().mut_options();
 

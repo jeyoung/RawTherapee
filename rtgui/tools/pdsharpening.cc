@@ -39,17 +39,17 @@ PdSharpening::PdSharpening() :
     lastAutoRadius(true)
 {
     auto m = ProcEventMapper::getInstance();
-    EvPdShrContrast = m->newEvent(CAPTURESHARPEN, "HISTORY_MSG_PDSHARPEN_CONTRAST");
-    EvPdShrCheckIter = m->newEvent(CAPTURESHARPEN, "HISTORY_MSG_PDSHARPEN_CHECKITER");
-    EvPdShrDRadius = m->newEvent(CAPTURESHARPEN, "HISTORY_MSG_PDSHARPEN_RADIUS");
-    EvPdShrDRadiusOffset = m->newEvent(CAPTURESHARPEN, "HISTORY_MSG_PDSHARPEN_RADIUS_BOOST");
-    EvPdShrDIterations = m->newEvent(CAPTURESHARPEN, "HISTORY_MSG_PDSHARPEN_ITERATIONS");
-    EvPdShrAutoContrast = m->newEvent(CAPTURESHARPEN, "HISTORY_MSG_PDSHARPEN_AUTO_CONTRAST");
-    EvPdShrAutoRadius = m->newEvent(CAPTURESHARPEN, "HISTORY_MSG_PDSHARPEN_AUTO_RADIUS");
-    EvPdShrshowcap = m->newEvent(CAPTURESHARPEN, "HISTORY_MSG_PDSHARPEN_SHOWCAP");
-    EvPdShrnoisecaptype = m->newEvent(CAPTURESHARPEN, "HISTORY_MSG_PDSHARPEN_NOISECAPTYPE");
-    EvPdShrnoisecap = m->newEvent(CAPTURESHARPEN, "HISTORY_MSG_PDSHARPEN_NOISECAP");
-    EvPdShrnoisecapafter = m->newEvent(CAPTURESHARPEN, "HISTORY_MSG_PDSHARPEN_NOISECAPAFTER");
+    EvPdShrContrast = m->newEvent(rtengine::RequestIntent::CaptureSharpen, "HISTORY_MSG_PDSHARPEN_CONTRAST");
+    EvPdShrCheckIter = m->newEvent(rtengine::RequestIntent::CaptureSharpen, "HISTORY_MSG_PDSHARPEN_CHECKITER");
+    EvPdShrDRadius = m->newEvent(rtengine::RequestIntent::CaptureSharpen, "HISTORY_MSG_PDSHARPEN_RADIUS");
+    EvPdShrDRadiusOffset = m->newEvent(rtengine::RequestIntent::CaptureSharpen, "HISTORY_MSG_PDSHARPEN_RADIUS_BOOST");
+    EvPdShrDIterations = m->newEvent(rtengine::RequestIntent::CaptureSharpen, "HISTORY_MSG_PDSHARPEN_ITERATIONS");
+    EvPdShrAutoContrast = m->newEvent(rtengine::RequestIntent::CaptureSharpen, "HISTORY_MSG_PDSHARPEN_AUTO_CONTRAST");
+    EvPdShrAutoRadius = m->newEvent(rtengine::RequestIntent::CaptureSharpen, "HISTORY_MSG_PDSHARPEN_AUTO_RADIUS");
+    EvPdShrshowcap = m->newEvent(rtengine::RequestIntent::CaptureSharpen, "HISTORY_MSG_PDSHARPEN_SHOWCAP");
+    EvPdShrnoisecaptype = m->newEvent(rtengine::RequestIntent::CaptureSharpen, "HISTORY_MSG_PDSHARPEN_NOISECAPTYPE");
+    EvPdShrnoisecap = m->newEvent(rtengine::RequestIntent::CaptureSharpen, "HISTORY_MSG_PDSHARPEN_NOISECAP");
+    EvPdShrnoisecapafter = m->newEvent(rtengine::RequestIntent::CaptureSharpen, "HISTORY_MSG_PDSHARPEN_NOISECAPAFTER");
     Gtk::Box* hb = Gtk::manage(new Gtk::Box());
     hb->show();
     contrast = Gtk::manage(new Adjuster(M("TP_SHARPENING_CONTRAST"), 0, 200, 1, 10));

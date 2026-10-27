@@ -1141,8 +1141,13 @@ void ToolPanelCoordinator::panelChanged(const rtengine::ProcEvent& event, const 
         return;
     }
 
-    int changeFlags = rtengine::RefreshMapper::getInstance()->getAction(event);
-
+    /*
+     * The event identifies the producer request. A converted producer stored
+     * a typed EditorRequest in the RefreshMapper; an unconverted one carries
+     * the mask and is classified once by from_legacy_mask() in the
+     * coordinator. The profile filter below is the only caller that needs the
+     * raw mask.
+     */
     ProcParams* params = ipc->beginUpdateParams();
 
     for (auto toolPanel : toolPanels) {
@@ -1153,7 +1158,6 @@ void ToolPanelCoordinator::panelChanged(const rtengine::ProcEvent& event, const 
     if (event == rtengine::EvCTHFlip || event == rtengine::EvCTVFlip) {
         if (fabs(params->rotate.degree) > 0.001) {
             params->rotate.degree *= -1;
-            changeFlags |= rtengine::RefreshMapper::getInstance()->getAction(rtengine::EvROTDegree);
             rotate->read(params);
         }
     }
@@ -1221,7 +1225,7 @@ void ToolPanelCoordinator::panelChanged(const rtengine::ProcEvent& event, const 
         ipc->setLocallabMaskVisibility(false, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
     }
 
-    ipc->endUpdateParams(changeFlags);    // starts the IPC processing
+    ipc->endUpdateParams(event);    // starts the IPC processing
 
     hasChanged = true;
 
@@ -1332,6 +1336,12 @@ void ToolPanelCoordinator::profileChange(
 
     // start the IPC processing
     if (filterRawRefresh) {
+        /*
+         * Compatibility path, documented in editorrequest.h: a profile edit
+         * with unchanged raw parameters is filtered with the mask form so the
+         * raw core is not rebuilt. The typed request is deliberately dropped
+         * here because its absolute kind would rebuild the path.
+         */
         ipc->endUpdateParams(rtengine::RefreshMapper::getInstance()->getAction(event) & ALLNORAW);
     } else {
         ipc->endUpdateParams(event);

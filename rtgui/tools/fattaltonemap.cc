@@ -36,7 +36,7 @@ const Glib::ustring FattalToneMapping::TOOL_NAME = "fattal";
 FattalToneMapping::FattalToneMapping(): FoldableToolPanel(this, TOOL_NAME, M("TP_TM_FATTAL_LABEL"), true, true)
 {
     auto m = ProcEventMapper::getInstance();
-    EvTMFattalAnchor = m->newEvent(HDR, "HISTORY_MSG_TM_FATTAL_ANCHOR");
+    EvTMFattalAnchor = m->newEvent(rtengine::RequestIntent::Hdr, "HISTORY_MSG_TM_FATTAL_ANCHOR");
 
     amount = Gtk::manage(new Adjuster (M("TP_TM_FATTAL_AMOUNT"), 1., 100., 1., 30.));
     threshold = Gtk::manage(new Adjuster (M("TP_TM_FATTAL_THRESHOLD"), -100., 300., 1., 0.0));

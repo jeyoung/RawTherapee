@@ -345,7 +345,7 @@ protected:
                                 const char*& reason) const;
     void prepareViewportLuts(int todo);
     void updateViewportLutSnapshot(int todo);
-    void renderCrops(int todo, bool force);
+    void renderCrops(int todo, bool force, const EditorRequest& request);
     int queueViewportDeferredAnalysis(int todo, unsigned request);
     void markViewportStateValid(bool highDetailNeeded);
     void invalidateViewportState();
@@ -640,6 +640,12 @@ public:
     ProcParams* beginUpdateParams () override;
     void        endUpdateParams (ProcEvent change) override;  // must be called after beginUpdateParams, triggers update
     void        endUpdateParams (int changeFlags) override;
+    /*
+     * Typed dispatch for a converted producer event. Not part of the engine
+     * interface: the GUI boundary calls it with the EditorRequest the event
+     * registered, so planning never reconstructs the request from the mask.
+     */
+    void        endUpdateParams (const EditorRequest& request);
     void        stopProcessing () override;
 
     std::string *retistrsav;

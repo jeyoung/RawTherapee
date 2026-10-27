@@ -26,7 +26,7 @@ using namespace rtengine;
 using namespace rtengine::procparams;
 
 
-MetaDataPanel::MetaDataPanel() : EvMetaDataMode(ProcEventMapper::getInstance()->newEvent(M_VOID, "HISTORY_MSG_METADATA_MODE"))
+MetaDataPanel::MetaDataPanel() : EvMetaDataMode(ProcEventMapper::getInstance()->newEvent(rtengine::RequestIntent::ControlOnly, "HISTORY_MSG_METADATA_MODE"))
 {
     set_orientation(Gtk::ORIENTATION_VERTICAL);
 
