@@ -88,7 +88,9 @@ The graph device path runs the `lanczos3` resize node. Device runs use
 `RT_OPENCL_ALLOW_CPU=1` and an ICD directory that contains only `pocl.icd`
 (`OCL_ICD_VENDORS`), so the selected device is POCL's CPU device
 (`cpu-ivybridge-Intel(R) Core(TM) i7-3770 CPU @ 3.40GHz`). These are
-CPU-device results and must not be read as GPU parity.
+CPU-device results and must not be read as GPU parity. Restricting the ICD set
+pins the device identity; it is no longer needed to avoid the rusticl crash
+described under "Broken and unsupported ICDs", because a broken ICD is skipped.
 
 The parity gate is 1 LSB at 16-bit (1/65535 = 1.53e-5 normalised). The measured
 peak absolute error is zero:
@@ -123,3 +125,76 @@ the parent commit `9e8df3493`, 331.48 (328.69) with the switch off and 328.99
 samples ranged from 319 to 363 ms. No performance claim is made for the device
 node on a CPU OpenCL device: it is slower than the host and exists for parity
 and correctness.
+
+## Broken and unsupported ICDs
+
+Device selection must survive whatever the ICD set contains. The stage device
+enumerates the platforms the ICD loader reports and validates each one before it
+dispatches to it.
+
+Failure found on 2026-10-27 at `3339afc62`: with the distribution vendor set
+(`mesa.icd`, `pocl.icd`, `rusticl.icd` in `/etc/OpenCL/vendors`)
+`stage-device-test` and `stage-residency-test` died with SIGSEGV inside the ICD
+loader, while an `OCL_ICD_VENDORS` directory holding only `pocl.icd` worked. The
+fault is the rusticl platform's ICD dispatch chain: ocl-icd 2.3.3 tail-jumps
+through a null entry while answering the first platform query. A 20-line C
+program calling `clGetPlatformInfo` on the second platform, and `clinfo`,
+crash identically, so this is an ICD defect and not a RawTherapee or merge
+defect. It is Debian bug #1117930 (`mesa-opencl-icd`, rusticl dispatch table not
+initialised). `clGetPlatformIDs` still reports both platforms without an error
+and the crash happens before a CL error code exists, so a platform cannot be
+validated in-process.
+
+The trigger is order dependent: rusticl second, after pocl, is broken, while
+rusticl first is fine for the same pair (`mesa.icd` before `rusticl.icd` is also
+fine). The distribution file order (`pocl.icd`, then `rusticl.icd`) is the
+broken one, which is why the ambient set reproduced it.
+
+Fix: `probe_platforms()` in `stage_opencl_device.cc` asks every platform the
+questions the selector will ask (platform name, device ids, first device name,
+type and global memory) in a forked child, one child per platform, with
+`RLIMIT_CORE=0` and a 30 s alarm. The parent dispatches only to platforms whose
+child answered; a platform whose child dies or times out is skipped, with a
+diagnostic such as:
+
+    no GPU OpenCL device; set RT_OPENCL_ALLOW_CPU=1 to use a CPU device;
+    1 of 2 OpenCL platform(s) skipped: platform 1 crashed the ICD query;
+    check the installed ICDs (/etc/OpenCL/vendors, or OCL_ICD_VENDORS)
+
+and the node falls back to the host. `StageOpenCLDeviceInfo::note` carries the
+same text when a device was still selected, so a run that loses a vendor is
+visible without failing. One child per platform is deliberate: a broken
+platform does not hide the platforms behind it. The probe is a one-off cost of
+about 30 to 40 ms per process on this host, measured on the two device tests.
+
+Limitations:
+
+- rusticl is unsupported on this host: its platform kills the query when it is
+  loaded after pocl, so its devices are unusable here even though the ICD is
+  installed. Only POCL is selected. The probe cannot say which vendor is at
+  fault beyond reporting that the platform at that index crashed.
+- The probe covers enumeration only. A vendor that fails or crashes later, in
+  context, queue, kernel or a transfer, is still reported through the existing
+  fallback paths; the crash path is not additionally protected.
+- The probe needs `fork()`, so it runs on POSIX systems only. Elsewhere the
+  platforms are queried directly as before, because the defect is specific to
+  the ocl-icd loader. If `fork()` or `pipe()` fails the affected platforms are
+  skipped and the device path stays on the host rather than querying an
+  unvalidated platform. Forking a process that other threads are using can
+  inherit a loader or allocator lock; that only delays the child, which the
+  alarm then kills, so the platform is skipped instead of hanging RawTherapee.
+
+Evidence, 2026-10-27, `build/opencl-perf-graph-final`, GCC, ambient ICD set
+unless stated. "Ambient" is the `/etc/OpenCL/vendors` set, `OCL_ICD_VENDORS`
+unset.
+
+| Check | Result |
+|---|---|
+| `stage-device-test`, ambient ICD set | PASS, exit 0; host fallback with the diagnostic above, no crash |
+| `stage-residency-test`, ambient ICD set | PASS, exit 0, 5 skipped; no crash |
+| `stage-residency-test`, ambient ICD set, `RT_OPENCL_ALLOW_CPU=1` | PASS, 0 skipped; POCL CPU device, platform 1 skipped; PAE 0.000000 LSB16 at scales 0.5 and 1.5 (0 of 9216 and 0 of 82944 samples) and 0 of 4608 through `run()`; `StageExecution` reports `device=OPENCL`, `asynchronous=true` |
+| `stage-residency-test`, `OCL_ICD_VENDORS` = `pocl.icd` only, `RT_OPENCL_ALLOW_CPU=1 RT_REQUIRE_GPU=1`, `OMP_NUM_THREADS=1` | PASS, 0 skipped, no platform skipped; PAE 0.000000 LSB16 with the same sample counts. This is the device-parity row |
+| `stage-residency-test`, `OCL_ICD_VENDORS` with `rusticl.icd` before `pocl.icd` | PASS, 0 skipped; no platform skipped and POCL selected, so the order dependence is covered from both sides |
+| `OCL_ICD_VENDORS` = empty directory, `RT_REQUIRE_GPU=1` | FAIL, exit 1, "no OpenCL platform" and the host fallback; a missing device still cannot pass as a skip |
+| CPU build (`WITH_OPENCL=OFF`) and OpenCL build, 16 stage test executables plus `editorrequest-test` | both compile without warnings, 17 of 17 executables PASS in both trees (34 runs) |
+| kill switch, `--gpu=off` with `RT_STAGE_OPENCL=1`, resize profile | the stage profile records one `lanczos3` node with `impl=module`; no `impl=opencl` record |
