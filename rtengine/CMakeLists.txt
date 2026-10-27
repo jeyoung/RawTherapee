@@ -127,6 +127,7 @@ set(RTENGINESOURCEFILES
     stage/stage_indexer.cc
     stage/stage_lanczos.cc
     stage/stage_mask_map.cc
+    stage/stage_opencl_device.cc
     stage/stage_param_hash.cc
     stage/stage_param_map.cc
     stage/stage_parity.cc
@@ -318,6 +319,27 @@ target_compile_definitions(stage-device-test PRIVATE
     RT_STAGE_BUILD_DIR="${CMAKE_BINARY_DIR}/stages"
 )
 rt_setup_target(stage-device-test)
+
+# Device residency: allocation, upload, readback, budget, eviction, event
+# states, per-node selection and the first device node's parity.
+add_executable(stage-residency-test EXCLUDE_FROM_ALL
+    "${CMAKE_CURRENT_SOURCE_DIR}/stage/tests/stage_residency_test.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/editcallbacks.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/multilangmgr.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/options.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/paramsedited.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/pathutils.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/threadutils.cc"
+)
+target_include_directories(stage-residency-test BEFORE PRIVATE
+    "${CMAKE_BINARY_DIR}/rtgui"
+)
+target_link_libraries(stage-residency-test PRIVATE rtengine)
+target_include_directories(stage-residency-test PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/stage"
+)
+rt_setup_target(stage-residency-test)
 
 add_executable(stage-graph-test EXCLUDE_FROM_ALL
     "${CMAKE_CURRENT_SOURCE_DIR}/stage/tests/stage_graph_test.cc"

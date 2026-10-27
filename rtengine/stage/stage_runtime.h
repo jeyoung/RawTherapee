@@ -84,4 +84,56 @@ RtStageStatus run(const char* name, const std::vector<RtStageArg>& args,
                   RtStageProfiling* profiling = nullptr,
                   const char* impl = nullptr);
 
+/* Device a node is allowed to run on. CPU is the default. */
+enum class StageNodeDevice {
+    CPU,
+    OpenCL
+};
+
+struct StageNodeSelection {
+    StageNodeDevice device = StageNodeDevice::CPU;
+    /* Whether the node has a device implementation at all. */
+    bool implemented = false;
+    /* Why the selection is CPU, or why the requested device was refused. */
+    std::string reason;
+};
+
+/* True when the node has an OpenCL implementation in this build. */
+bool node_has_device_implementation(const char* node);
+
+/*
+ * Device for one node without building the selection reason. The execution
+ * path uses this so the common CPU case costs two environment reads and no
+ * string allocation or override-map lock.
+ */
+StageNodeDevice node_device(const char* node);
+
+/*
+ * Explicit selection for one node: the caller asks for a device and gets the
+ * resolved choice. A node without a device implementation, a disabled device
+ * or an active kill switch resolves to CPU with a reason.
+ */
+StageNodeSelection select_node_device(const char* node,
+                                      StageNodeDevice requested);
+
+/*
+ * Environment selection. The default is CPU; RT_STAGE_OPENCL=1 opts in and
+ * RT_STAGE_OPENCL_DISABLE=1 (or RT_STAGE_OPENCL=0) is the kill switch.
+ */
+StageNodeSelection select_node_device(const char* node);
+
+/*
+ * Kill switch, wired from the user's OpenCL preference. It is per-thread, like
+ * opencl::setStageAllowed(), so a preview pass and a batch export in one
+ * process cannot overwrite each other's policy. A false value forces every
+ * node on that thread to CPU whatever the environment requests; the default is
+ * true so an embedding without a preference still honours the opt-in switch.
+ */
+void set_opencl_stage_allowed(bool allowed);
+bool opencl_stage_allowed();
+
+/* Explicit per-node override, for tests and embedding. The kill switch wins. */
+void set_node_device_override(const char* node, StageNodeDevice device);
+void clear_node_device_overrides();
+
 } // namespace rtengine::stage

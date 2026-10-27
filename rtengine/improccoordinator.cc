@@ -59,6 +59,7 @@
 #include "stage/stage_graph.h"
 #include "stage/stage_pipeline.h"
 #include "stage/stage_profile.h"
+#include "stage/stage_runtime.h"
 #include "stage/stage_work.h"
 #include "tweakoperator.h"
 #include "refreshmap.h"
@@ -4813,6 +4814,14 @@ void ImProcCoordinator::updatePreviewImage(EditorRequest request,
                          && App::get().options().rtSettings.openCLMode == 1);
     opencl::setStageAllowed(App::get().options().rtSettings.useOpenCL
                             && App::get().options().rtSettings.openCLMode == 1);
+    /*
+     * Kill switch for the graph device path: a user who disabled OpenCL must
+     * not have a node run on a device, whatever RT_STAGE_OPENCL requests. The
+     * opt-in itself stays with the environment; see stage_runtime.h.
+     */
+    stage::set_opencl_stage_allowed(
+        App::get().options().rtSettings.useOpenCL
+        && App::get().options().rtSettings.openCLMode == 1);
 
     // Below 100% the Preview Demosaic Method preference is authoritative.
     // At 100% and above the per-tab FAST toggle decides. Detail windows use

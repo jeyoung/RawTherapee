@@ -169,17 +169,24 @@ int main()
     if (cpu_queue != nullptr) {
         check(cpu_queue->type() == StageDeviceType::CPU,
               "CPU queue reports its type");
-        const StageEvent event =
+        StageEvent event =
             cpu_queue->submit(*program, request.args, nullptr);
         check(event.status == StageEventStatus::Complete,
               "CPU queue completes inline");
         check(event.succeeded(), "CPU queue event succeeded");
         check(event.done(), "CPU queue event is done");
         check(event.elapsed_ns > 0, "CPU queue event carries timing");
+        check(event.device == StageDeviceType::CPU,
+              "CPU queue event names the CPU");
+        check(!event.asynchronous, "CPU queue event is synchronous");
         check(cpu_queue->wait(event) == RT_STAGE_OK, "CPU queue wait reports OK");
     }
 
-    /* The OpenCL skeleton has no execution path: it always falls back. */
+    /*
+     * The OpenCL device owns real buffers and queues. A compiled host program
+     * cannot run on it, so that entry point reports a failure; node requests
+     * are the device dispatch path and are covered by stage-residency-test.
+     */
     const auto ocl = opencl_device();
     check(ocl->type() == StageDeviceType::OPENCL,
           "OpenCL device reports its type");
@@ -188,12 +195,13 @@ int main()
     if (ocl_queue != nullptr) {
         check(ocl_queue->type() == StageDeviceType::OPENCL,
               "OpenCL queue reports its type");
-        const StageEvent event =
-            ocl_queue->submit(*program, request.args, nullptr);
+        StageEvent event = ocl_queue->submit(*program, request.args, nullptr);
         check(event.status == StageEventStatus::Failed,
-              "OpenCL queue reports a failed event");
+              "OpenCL queue refuses a compiled host program");
         check(event.result == RT_STAGE_FALLBACK,
-              "OpenCL queue reports fallback");
+              "OpenCL queue reports fallback for a host program");
+        check(event.device == StageDeviceType::NONE,
+              "a refused host program reports that nothing executed");
         check(ocl_queue->wait(event) == RT_STAGE_FALLBACK,
               "OpenCL wait reports fallback");
     }
@@ -202,17 +210,23 @@ int main()
     std::string ocl_reason;
     const auto ocl_selection = select_device(StageDeviceType::OPENCL, &ocl_reason);
     std::printf("opencl-stage-device: %s\n",
-                ocl->available() ? "available (execution not wired)"
-                                 : "unavailable (CPU fallback)");
+                ocl->available() ? "available" : "unavailable (CPU fallback)");
     if (ocl->available()) {
         check(ocl_selection->type() == StageDeviceType::OPENCL,
               "available OpenCL is selected");
         check(ocl_reason.empty(), "available OpenCL has no fallback reason");
+        const StageCapabilities ocl_capabilities = ocl->capabilities();
+        check(ocl_capabilities.device_buffers,
+              "OpenCL device advertises device buffers");
+        check(ocl_capabilities.async, "OpenCL device advertises asynchrony");
         const auto ocl_context = ocl_selection->create_context();
         check(ocl_context != nullptr, "OpenCL device creates a context");
         if (ocl_context != nullptr) {
-            check(ocl_context->execute(request, nullptr) == RT_STAGE_FALLBACK,
-                  "OpenCL context execution reports fallback");
+            check(ocl_context->residency() != nullptr,
+                  "OpenCL context exposes its residency");
+            /* The switch is unset, so the context runs the host program. */
+            check(ocl_context->execute(request, nullptr) == RT_STAGE_OK,
+                  "an OpenCL context runs the host program by default");
         }
     } else {
         check(ocl_selection->type() == StageDeviceType::CPU,
@@ -275,6 +289,8 @@ int main()
           "device types have stable names");
     check(std::string(to_string(StageEventStatus::Failed)) == "failed",
           "event statuses have stable names");
+    check(std::string(to_string(StageDeviceType::NONE)) == "none",
+          "a non-execution has a stable name");
 
     /* Allocator guards. */
     error.clear();
@@ -287,8 +303,9 @@ int main()
     error.clear();
     const RtStageBuffer refused =
         ocl_allocator.allocate({RT_STAGE_F32, 4, 4, 1}, &error);
-    check(refused.data == nullptr, "the OpenCL allocator refuses allocation");
-    check(!error.empty(), "the OpenCL allocator reports why");
+    check(refused.data == nullptr,
+          "the host allocator refuses device-local allocation");
+    check(!error.empty(), "the device refusal reports why");
     check(!ocl_allocator.owns(refused), "a refused buffer is not owned");
 
     check(allocator.release(source), "allocator releases the source");

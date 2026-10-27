@@ -49,26 +49,41 @@ relinking the GUI or CLI.
 
 ## Device and buffer state
 
-`rtengine/stage/stage_device.h` adds the device abstraction the graph plan
-needs, without changing any production path. The object model is the OpenCL
-one: a device creates contexts and queues, a queue executes a compiled
-program, and an event carries status and timing.
+`rtengine/stage/stage_device.h` defines the device abstraction the graph uses.
+The object model is the OpenCL one: a device creates contexts and queues, a
+queue executes a compiled program or a node request, and an event carries
+status, the executing device and timing.
 
 | Type | Role |
 | --- | --- |
 | `StageDevice` | type, name, availability, capabilities, context and queue factory |
-| `CPUStageDevice` | always available, resolves built-ins and modules through `StageCompiler`, executes synchronously, deterministic and full precision |
-| `OpenCLStageDevice` | skeleton; availability maps to `opencl::enabled()` and it adds no OpenCL call |
-| `StageContext` | owns a device, a per-context program cache and a buffer allocator |
-| `StageQueue` | CPU executes inline; the OpenCL queue returns `RT_STAGE_FALLBACK` |
-| `StageEvent` | status and elapsed time; no asynchronous dependency yet |
+| `CPUStageDevice` | always available, resolves built-ins and modules through `StageCompiler`, executes inline, deterministic and full precision |
+| `OpenCLStageDevice` | owns its ICD loader state, device selection, context and in-order queue; a CPU device is used only with `RT_OPENCL_ALLOW_CPU=1` |
+| `StageContext` | owns a device, a per-context program cache, the host allocator and the device residency of its queue |
+| `StageQueue` | CPU executes inline; the OpenCL queue submits a node kernel asynchronously, refuses a compiled host program, and runs a node without a device implementation on the host |
+| `StageEvent` | status, executing device (`NONE` when nothing ran), asynchronous flag, elapsed time, fallback note and completion handle |
+| `StageSubmission` | `wait()`, `poll()` and `elapsed_ns()` for an asynchronous submission |
+| `StageDeviceResidency` | device allocations keyed by host buffer address, byte budget, LRU eviction, refusals and accounting |
 
 `StageContext::compile()` calls the existing `StageCompiler`, so the
 resolution order and the built-in/module fallback are unchanged. The context
 caches the resulting program by stage name and explicit implementation;
 `clear_program_cache()` forces the next compile to resolve again. The default
-context selects CPU, and `select_device(StageDeviceType::OPENCL)` falls back
-to CPU with a reason when the existing OpenCL backend is not enabled.
+context selects CPU. `StageContext::execute()` fills a `StageExecution` with
+the device that actually executed and whether the submission was asynchronous,
+so a caller never infers device execution from the selection: the device queue
+can refuse an over-budget allocation or a launch and run the host program
+instead.
+
+`StageBufferAllocator` is host memory only: zeroed memory with 64-byte aligned
+rows and planes, `F32`/`U16` with one to three planes, and `U8` only as a
+single packed-RGB plane (multi-plane U8 is refused because `stage::row_bytes()`
+triples every U8 row). Device memory goes through `StageDeviceResidency`, which
+binds an allocation to the host buffer address that is the node output, reuses
+it while address and shape are unchanged, evicts the least recently used idle
+entries under the byte budget, and refuses a buffer that does not fit so the
+node can run on the host. The budget defaults to 1024 MiB; `RT_STAGE_DEVICE_BUDGET_MB` overrides it, out-of-range values clamp to 16-65536 MiB, and a
+non-numeric value keeps the default.
 
 `rtengine/stage/stage_buffer_state.h` associates an `RtStageBuffer` with a
 location, a device generation and an intrusive reference count. The header
@@ -83,23 +98,44 @@ contains no OpenCL types:
 
 The CPU `ensure_host()` performs no copy: it reports `RT_STAGE_OK` for a
 host-valid or shared buffer, `RT_STAGE_FALLBACK` for a stale device copy and
-`RT_STAGE_INVALID` for dirty contents. `ensure_device()` reports
-`RT_STAGE_FALLBACK` because the CPU has no device memory and the OpenCL
-upload is not wired. `mark_host_write()`, `mark_device_write()`,
+`RT_STAGE_INVALID` for dirty contents. `ensure_device()` still reports
+`RT_STAGE_FALLBACK`: the runtime moves data through `StageDeviceResidency`
+rather than through this wrapper, so the wrapper remains a state machine for a
+later scheduler. `mark_host_write()`, `mark_device_write()`,
 `mark_both_valid()` and `mark_dirty()` record the transitions, and the device
 generation lets a later implementation invalidate copies from an earlier
 device session. The wrapper does not own memory; the descriptor stays a
 non-owning view over an engine image or an allocator block.
 
-`StageBufferAllocator` is owned by the context. The CPU allocator returns
-zeroed host memory with 64-byte aligned rows and planes and supports `F32`,
-`U16` and `U8` with one to three planes; single-plane `U8` is packed RGB,
-matching `stage::row_bytes()`. The OpenCL allocator refuses allocation until a
-device allocator exists.
+### Device selection and events
 
-Nothing creates a non-CPU context and no call site changed: `ImProcFunctions`,
-the export graph and the preview layer still use `StageCompiler` and `run()`
-exactly as before. The new types are infrastructure for the next phase.
+CPU is the default. `node_device()` is the execution-path resolver: it reads
+`RT_STAGE_OPENCL` (opt-in), consults a per-node override only when one exists,
+and returns CPU without building a reason string. `select_node_device()` is the
+diagnostic API and adds the reason and the implementation flag.
+
+| Control | Effect |
+| --- | --- |
+| `RT_STAGE_OPENCL=1` | opt in; nodes with a device implementation are dispatched to the device |
+| `RT_STAGE_OPENCL=0`, `RT_STAGE_OPENCL_DISABLE=1` | kill switches; even an explicit device request resolves to CPU |
+| `set_opencl_stage_allowed()` | per-thread user policy, set by the preview coordinator (`useOpenCL && openCLMode == 1`) and by the batch export path (`useOpenCL`) |
+| `select_node_device(node, device)` | explicit per-node request with the resolved device and reason |
+| `set_node_device_override()` | per-node override for tests and embedding; the kill switches still win |
+
+Events are honest about what happened. The CPU queue completes before
+`submit()` returns (`asynchronous=false`, `device=CPU`). A device submit
+returns `Running` with a completion handle (`device=OPENCL`,
+`asynchronous=true`); `poll()` queries the driver and can report `Failed`
+early, and `wait()` blocks, reads the output back and only then reports
+`Complete`. An event that executed nothing, such as a compiled host program
+offered to the device queue or a resolution failure, reports `device=NONE`
+rather than naming a device that did not run.
+
+The classic backend still owns the accelerated resize: when the user enables
+OpenCL, `ImProcFunctions::Lanczos` calls `opencl::resizeLanczos` before the
+stage runtime, so the wired `lanczos3` device node is reached only when that
+path declines. The device node and its parity are exercised through the same
+`stage::run()` entry point by `stage-residency-test`.
 
 ## Pilot stage
 
@@ -292,10 +328,10 @@ optional gate.
 
 The OpenCL configuration compiles with `--stage-modules` and gives the same
 result: all ten legacy/graph pairs are `AE=0`, the graph logs 20 executed
-nodes, `stage-device-test` reports `opencl-stage-device: available (execution
-not wired)`, and `stage-pipeline-test`, `stage-graph-test` and
-`stage-device-test` pass. The parity runs use `--gpu=off`; the graph path does
-not use the GPU backend in this phase.
+nodes, and `stage-pipeline-test`, `stage-graph-test` and `stage-device-test`
+pass. The parity runs use `--gpu=off`. A POCL CPU run of the device tests is
+recorded in `PARITY.md`; the device path is opt-in and does not affect these
+export results.
 
 `buildTilePlan()` produces a cheap block score from a luminance plane and
 splits blocks into full and cheap work. It is the hook for selective
@@ -1016,13 +1052,20 @@ parity.
   checks that the CPU device is available, deterministic and full precision;
   that Lanczos compiles, caches, executes through the context and the inline
   CPU queue; that the default context and explicit selection pick CPU; that
-  the OpenCL queue reports `RT_STAGE_FALLBACK`; that selection falls back to
-  CPU with a reason when OpenCL is unavailable; that the buffer state machine,
-  generation and reference count behave as documented; and that the context
-  output is pixel-identical to a direct `StageCompiler` execution (`AE=0`,
-  0 differing of 2304 samples). The OpenCL build on this host reports
-  `opencl-stage-device: available (execution not wired)` and still passes;
-  the CPU-only build exercises the unavailable/fallback branch.
+  the OpenCL queue refuses a compiled host program and reports `device=NONE`
+  for it; that selection falls back to CPU with a reason when OpenCL is
+  unavailable; that the buffer state machine, generation and reference count
+  behave as documented; and that the context output is pixel-identical to a
+  direct `StageCompiler` execution (`AE=0`, 0 differing of 2304 samples). The
+  OpenCL build reports `opencl-stage-device: available` when a device is
+  present; the CPU-only build exercises the unavailable branch.
+- `stage-residency-test` covers device allocation, upload and readback, reuse,
+  true LRU eviction order, budget clamping and refusals, the event state
+  machine including a driver failure (`poll()` to `Failed`), selection and
+  kill switches, and the `lanczos3` device node's parity with an explicit
+  executing-device assertion. `RT_REQUIRE_GPU=1` turns a missing device into a
+  failure instead of a skip. The suite runner builds it with the other stage
+  tests.
 - `stage-param-hash-test` exercises the fingerprint contract in 41 checks:
   identical descriptors agree, a published golden value pins the format, every
   field type and order changes the fingerprint, shared string prefixes and
@@ -1243,17 +1286,28 @@ follow-up should give the harness a completion signal that does not depend on
   preview requests and reopen after a base has been stored.
 - Only Lanczos is exposed as a loadable stage. Denoise, wavelet, local
   adjustments and the output conversion still use the existing code paths.
-- The OpenCL device is a skeleton: it mirrors the existing backend's enabled
-  state, advertises no execution capability, and its queue always reports
-  `RT_STAGE_FALLBACK`. Its allocator refuses allocation. No OpenCL execution
-  or device-side buffer is implemented in this phase.
+- The OpenCL device executes one node, `lanczos3` (resize). Every other node
+  has no device implementation and resolves to the host program with a reason.
+  The device path is opt-in (`RT_STAGE_OPENCL=1`) and nothing in the default
+  configuration runs on a device.
+- The classic backend pre-empts the wired node when acceleration is enabled:
+  `ImProcFunctions::Lanczos` tries `opencl::resizeLanczos` first, so the stage
+  device node is reached only when the classic path declines. The batch policy
+  follows `useOpenCL`, so `--gpu=off` disables the graph device as well; with
+  acceleration enabled the classic resize handles the node. The device node is
+  therefore exercised end to end through `stage::run()` by
+  `stage-residency-test`, not by a CLI export.
 - The context program cache is keyed by stage name and explicit
   implementation, so it reads `RT_STAGE_*` and `RT_STAGE_PATH` on the first
   compile of a key. Call `clear_program_cache()` to re-resolve after changing
   the environment or rebuilding a module.
 - `StageBufferState` is non-owning and has no readback path: `ensure_host()`
   reports `RT_STAGE_FALLBACK` while the device copy is authoritative, and
-  `ensure_device()` reports `RT_STAGE_FALLBACK` on CPU.
+  `ensure_device()` reports `RT_STAGE_FALLBACK` on CPU. The runtime uses
+  `StageDeviceResidency` for device transfers, not this wrapper.
+- The kill-switch policy is per-thread, matching `opencl::setStageAllowed()`;
+  a thread that never sets it defaults to allowed and still needs the
+  environment opt-in.
 - Parameter fingerprints now drive the preview and crop dirty-block sets, and
   the graph paths are default. `refreshmap.*` and the `todo` mask remain for
   GUI notification, viewport admission, deferred scheduling and the 323
