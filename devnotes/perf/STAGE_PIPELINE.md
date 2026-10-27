@@ -1338,3 +1338,138 @@ Host CPU build, image 10.2 MP PEF `colorspace_flowers.pef`,
 | Single-threaded 16-bit TIFF export, `RT_WORK_ORDER` on vs off | `AE=0` |
 | `thumbnail-stage-test` | PASS embedded and raw |
 | Both configurations | `tools/build-rt.sh cpu -j 6` and `tools/build-rt.sh opencl -j 6` compile; 14 stage test executables PASS in both trees |
+
+## Node-output cache of the preview raw.base tier
+
+Status: opt-in (`RT_NODE_CACHE`), default off. The work-order conversion is
+unchanged; the cache is a second consumer of the typed order and of the pass
+fingerprints.
+
+### Problem
+
+The preview destroys and rebuilds `orig_prev` in place. A pass that names
+`rawBaseRebuild` pays `getImage()`, white balance, spot removal, film negative,
+the colour-space conversion, gamut compression and `firstAnalysis()` again,
+even when the pass input is byte-identical to an earlier pass (a repeated
+request, a toggle returned to its previous value, a redundant redraw). The
+node-output tier makes that repeat explicit and measurable.
+
+### Key
+
+`stage::NodeCacheKey` is an exact value, not a 64-bit digest:
+
+| Component | Covers |
+|-----------|--------|
+| `node` | The canonical node id of the tier (`preview.raw.base`), so two nodes with equal inputs cannot share an entry. |
+| `render` | The 128-bit `RenderStateKey::fingerprint()`: preview scale and allocated size, crop/ROI rectangle, skip and borders, the high-detail decision and the work done for it, source generation and source facts, a modified RGB source, monitor and soft-proof configuration, editor switches, request kind, the base the preceding pass used, the denoise/spot facts, the deferred analysis mask, the crop-guide fingerprint and the viewport-moved fact. The whole fingerprint is used; a subset could go stale when a field is added. |
+| `blocks` | Every canonical block fingerprint of the preview pass, in pipeline order, from the same `ParamSnapshot` the work order was derived from. Covers every `ProcParams` member a block reads, including the raw families that reach the base through preprocess/demosaic. |
+| `work` | The producing work items restricted to the tier (`rawBaseRebuild`, `retinexPrepare`, `spotApply`, `spotRestore`, `analysisRun`). Two passes that ran different bodies are different producers even with equal parameters. |
+| `width`, `height`, `planes`, `format` | Output geometry and layout, so a scale or layout change can never match. |
+
+The key is encoded field by field into `StageKey::stage` (fixed-width
+hexadecimal fingerprints, unit-separated ids), so `StageCache` equality is
+exact string equality; the digest is only the hash and the resident stamp.
+
+Deliberately excluded, and why it is safe:
+
+- **Process pointers, `Imagefloat` allocation addresses.** They change on
+  every reallocation without changing pixels.
+- **`currWB`, `vhist16`, `denoiseInfoStore.valid`, the spot buffer.** They are
+  outputs of the same node, derived from parameters and source already in the
+  key. They are stored in the entry's auxiliary payload instead of being
+  hashed.
+- **Wall clock, thread count, OpenCL device.** The tier is process-local in
+  this step. A cross-process store must add these before it shares entries.
+
+### Reuse decision
+
+`nodeCacheReuseAllowed()` refuses the tier when the typed order names any raw
+source producer (`sourceSelect`, `rawPreprocess`, `rawDemosaic`,
+`retinexPrepare`): the plan would regenerate the planes the base is built
+from. This is the "the node's inputs would not rebuild" reading of the
+acceptance rule; the tier's own body may still be scheduled, and the exact key
+then decides whether that rebuild would reproduce the same bytes.
+
+`nodeCacheSubstitutionAllowed()` requires `rawBaseRebuild` in the order. A
+substitution replaces the end-of-node tier, so every downstream node must rerun
+from it. The dirty-block derivation seeds the whole path for a rebuild request
+and closes forward over the consumers for a base delta, so a scheduled base
+rebuild always reruns the chain. A pass that enters `raw.base` for spot
+maintenance alone keeps the downstream intermediate in the shared buffer, and a
+substitution there would corrupt the in-place chain; it is refused.
+
+On a hit the whole destructive branch is skipped, including the first analysis
+and the listeners it drives. The listener values are unchanged by definition of
+the key; the GUI already holds them. `params->wb.temperature`/`green` are
+written back from the restored `currWB`, because the rebuild branch normalises
+them in place and the next pass would otherwise fingerprint a different state.
+
+### Budget, eviction, counters, switch
+
+- `RT_NODE_CACHE` is the switch. Unset is the default and disables the cache.
+  `0` and `off` (case-insensitive) disable it; every other value, including the
+  empty string, enables it. With it off, `NodeCache` allocates nothing and
+  every call is a no-op: behaviour and memory are identical to the base commit.
+- `RT_NODE_CACHE_MB` is the budget in MiB. Default **256**, valid range
+  **1..8192**; a missing, malformed or out-of-range value falls back to the
+  default. The budget is per coordinator instance (one per editor tab); an
+  entry is about 7.9 MiB for the 10.2 MP preview at scale 4. Entries are
+  LRU-evicted on insert when the incoming entry would exceed the budget. The
+  auxiliary state shares the entry and the budget.
+- `RT_NODE_CACHE_STATS` (any value) prints one summary at process exit:
+  `node-cache: budget= used= hits= misses= refused= inserts= rejects=
+  evictions= bytes-in= bytes-evict=`.
+  `hits`/`misses` are probes, `refused` are probes the work-order rule
+  declined, `inserts`/`rejects` store attempts, `evictions` budget removals.
+- An entry larger than the whole budget is rejected, not admitted.
+
+### Tests
+
+- `stage-cache-test`: auxiliary payload round-trip, counters, reset, eviction
+  and byte accounting, oversized rejection, replacement is not an eviction,
+  budget shrink eviction, refusal accounting.
+- `stage-node-cache-test`: switch parser; key equality and collision resistance
+  for a different source generation, preview width, crop rectangle, preview
+  scale, block fingerprint, block id, producing work order, node id, output
+  width and format; the reuse and substitution decisions; repeated-pass
+  restore with `AE=0`; budget and eviction; disabled path no-op; auxiliary
+  corruption rejection.
+
+### Evidence
+
+Host CPU build (`build/cpu-perf-graph-cache`), GCC, generic target,
+`OMP_NUM_THREADS=1`, image 10.2 MP PEF `colorspace_flowers.pef`, preview
+scale 4.
+
+| Check | Result |
+|-------|--------|
+| `stage-node-cache-test` repeated pass | `hits=1 misses=1 AE=0` |
+| `preview-work-order-sweep.sh`, 16 states, `RT_NODE_CACHE` off vs on | PASS, all 16 states `AE=0` for `preview.tif` and `work.tif` |
+| Repeated-state harness (four Clamp-OOG toggles) | `hits=1 misses=4 refused=3 inserts=4`; all 8 dumped states `AE=0` between cache off and on |
+| `crop-stage-test --sequences` | PASS, 33 plans, `AE=0`; the crop path does not use the preview tier |
+| 16-bit TIFF export, `RT_NODE_CACHE` off vs on | `AE=0` |
+| `thumbnail-stage-test` (embedded and raw) | PASS in both runs; raw PPM `AE=0` |
+| `tools/build-rt.sh cpu` / `opencl` | both compile; all 15 stage test executables PASS in both trees |
+
+### Timing
+
+Ten Clamp-OOG toggle samples per side, same image and profile, after the
+initial pass; the sequence returns to each of two states, so later samples hit.
+`p50` is over all ten samples; steady state is samples 3..9.
+
+| Case | p50 (ms) | steady mean (ms) | samples |
+|------|---------:|-----------------:|--------:|
+| cache off | 319.5 | 319.5 | 10 |
+| cache on | 297.9 | 297.0 | 10 |
+
+The steady-state pass falls by 7.0%. The first miss pays the entry allocation
+and copy: the largest single insert sample was 332.4 ms against 320.4 ms off,
+and the first sample was within noise (324.5 vs 326.2 ms). The hit path skips
+the whole base body, not a per-pixel approximation, and the parity runs above
+are `AE=0`.
+
+Known limits: the tier is process-local; the preview canvas keeps one live
+buffer, so only a scheduled rebuild can be substituted; a spot-only pass never
+substitutes; and listeners are not re-fired on a hit. The next step is to give
+nodes private buffers, which removes the canvas constraint and lets the store
+serve without the rebuild-closure guard.
