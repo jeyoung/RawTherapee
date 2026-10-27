@@ -981,8 +981,6 @@ private:
     RtStageStatus result_ = RT_STAGE_OK;
 };
 
-class OpenCLStageQueue;
-
 /*
  * Upload the inputs, compute the weights, enqueue the kernel and read the
  * result back in wait(). Returns null with a reason when the node cannot run
@@ -1269,11 +1267,50 @@ private:
     std::shared_ptr<OpenCLResidency> residency_;
 };
 
+/* Keeps a context usable when the device disappears between the availability
+ * check and queue creation: every submission reports a fallback instead of
+ * dereferencing a missing environment. */
+class UnavailableStageQueue final : public StageQueue
+{
+public:
+    StageDeviceType type() const override
+    {
+        return StageDeviceType::OPENCL;
+    }
+
+    StageEvent submit(const StageProgram&, const std::vector<RtStageArg>&,
+                      RtStageProfiling*) override
+    {
+        return failed_event();
+    }
+
+    StageEvent submit(const StageRequest&, RtStageProfiling*) override
+    {
+        return failed_event();
+    }
+
+    RtStageStatus wait(StageEvent& event) const override
+    {
+        return event.result;
+    }
+
+private:
+    static StageEvent failed_event()
+    {
+        StageEvent event;
+        event.status = StageEventStatus::Failed;
+        event.result = RT_STAGE_FALLBACK;
+        event.device = StageDeviceType::OPENCL;
+        event.note = "OpenCL device is unavailable";
+        return event;
+    }
+};
+
 std::unique_ptr<StageQueue> make_opencl_queue()
 {
     auto env = make_env();
     if (!env) {
-        return nullptr;
+        return std::make_unique<UnavailableStageQueue>();
     }
     return std::make_unique<OpenCLStageQueue>(std::move(env));
 }
