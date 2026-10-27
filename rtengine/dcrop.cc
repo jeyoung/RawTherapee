@@ -653,7 +653,7 @@ void Crop::update(int todo, const EditorRequest& request)
      * high-detail flags while they run.
      */
     const auto cropRenderState = [this, &request, &params,
-                                  viewportMovedRequest]() {
+                                  viewportMovedRequest, needsinitupdate]() {
         rtengine::stage::RenderStateKey state;
         state.previewScale = skip;
         state.previewWidth = cropw;
@@ -692,19 +692,16 @@ void Crop::update(int todo, const EditorRequest& request)
          * The fast-preview and main-preview switches are preview request
          * state; the crop viewport does not consult them.
          *
-         * The request kind comes from the typed request. The crop used to
-         * classify its reload bits here; the preview request now carries the
-         * kind, so the crop only maps the preview vocabulary to the crop one.
-         * A forced reallocation is carried separately by inputs.forceFull.
+         * The request kind comes from the typed request, except for a
+         * reallocation: the buffers were just replaced, so the base must be
+         * refilled whatever the editor asked for. That force is carried in the
+         * render-state kind as FullCrop, which makes derive_crop_work() name
+         * the raw base rebuild even when the request is ParamsOnly or
+         * RepaintOnly. HighQuality keeps its own priority for the work order;
+         * the dirty derivation carries the reallocation through forceFull.
          */
-        state.requestKind =
-            request.kind == rtengine::stage::RequestKind::HighQuality
-                ? rtengine::stage::RequestKind::HighQuality
-                : request.kind == rtengine::stage::RequestKind::FullPreview
-                      ? rtengine::stage::RequestKind::FullCrop
-                      : request.kind == rtengine::stage::RequestKind::RepaintOnly
-                            ? rtengine::stage::RequestKind::RepaintOnly
-                            : rtengine::stage::RequestKind::ParamsOnly;
+        state.requestKind = rtengine::crop_request_kind(
+            request.kind, needsinitupdate);
 
         /*
          * Request facts. The source is read at its current frame. The

@@ -27,12 +27,16 @@
 
 #include "rtengine/editorrequest.h"
 
+#include "rtengine/procparams.h"
 #include "rtengine/refreshmap.h"
+#include "rtengine/stage/stage_work.h"
 
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <sstream>
 #include <string>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -46,9 +50,11 @@ using rtengine::LegacyMaskContext;
 using rtengine::RequestIntent;
 using rtengine::coalesce;
 using rtengine::compatibility_mask;
+using rtengine::crop_request_kind;
 using rtengine::from_legacy_mask;
 using rtengine::make_request;
 using rtengine::planningAgreesWithLegacyMask;
+using rtengine::producerEventKey;
 
 int failures = 0;
 
@@ -592,6 +598,200 @@ void checkRefreshMapper()
           "re-registering with a mask clears the typed request");
 }
 
+/*
+ * Producer actions with the same planning identity must still be distinct
+ * events: EvSpotEnabled (ALLNORAW) and EvSpotEnabledOPA (SPOTADJUST) share a
+ * history message today and plan identically, but their compatibility masks
+ * differ. The event key therefore includes the mask.
+ */
+void checkProducerEventKey()
+{
+    const EditorRequest allNoRaw = make_request(RequestIntent::AllNoRaw);
+    const EditorRequest spotAdjust = make_request(RequestIntent::SpotAdjust);
+
+    check(allNoRaw.identity() == spotAdjust.identity(),
+          "ALLNORAW and SPOTADJUST share a planning identity");
+    check(allNoRaw.legacyGateMask != spotAdjust.legacyGateMask,
+          "ALLNORAW and SPOTADJUST differ in their compatibility mask");
+    check(producerEventKey(allNoRaw, "HISTORY_MSG_SPOT")
+              != producerEventKey(spotAdjust, "HISTORY_MSG_SPOT"),
+          "same identity and message with different masks get distinct keys");
+    check(producerEventKey(allNoRaw, "HISTORY_MSG_SPOT")
+              == producerEventKey(allNoRaw, "HISTORY_MSG_SPOT"),
+          "the same producer action keeps its key");
+
+    for (const IntentExpectation& left : intentExpectations()) {
+        for (const IntentExpectation& right : intentExpectations()) {
+            if (left.intent == right.intent) {
+                continue;
+            }
+
+            const std::string label =
+                std::string("key uniqueness ") + left.name + "/" + right.name;
+            check(producerEventKey(make_request(left.intent), "msg")
+                      != producerEventKey(make_request(right.intent), "msg"),
+                  label);
+        }
+    }
+}
+
+/*
+ * The fast path augments the execution payload after the request was built.
+ * Every augmentation must refresh the typed facts before the crop consumes
+ * them. These are the two augmentation shapes used in updatePreviewImage().
+ */
+void checkFastPathAugmentation()
+{
+    EditorRequest crop = from_legacy_mask(M_CROP);
+    check(!crop.transformFamilyIntent,
+          "a bare crop does not claim transform-family work");
+    crop.setLegacyGateMask(crop.legacyGateMask | TRANSFORM);
+    crop.refreshFromLegacyMask();
+    check(crop.transformFamilyIntent,
+          "the PC-vignette augmentation refreshes transformFamilyIntent");
+    check(crop.kind == EditorRequest::RequestKind::FullPreview,
+          "the PC-vignette augmentation widens the kind like the old mask");
+    check(planningAgreesWithLegacyMask(crop),
+          "the PC-vignette augmentation agrees with its widened mask");
+
+    EditorRequest lumacurve = from_legacy_mask(M_LUMACURVE);
+    check(!lumacurve.labChainIntent,
+          "a bare luminance curve does not claim the Lab chain");
+    lumacurve.setLegacyGateMask(
+        lumacurve.legacyGateMask | M_LUMINANCE | M_COLOR);
+    check(lumacurve.labChainIntent,
+          "the fast-path Lab augmentation refreshes labChainIntent");
+    check(planningAgreesWithLegacyMask(lumacurve),
+          "the fast-path Lab augmentation agrees with its widened mask");
+}
+
+/*
+ * A crop reallocation must refill the base even when the editor request is a
+ * plain parameter update. The force is carried in the render-state request
+ * kind, which derive_crop_work() reads.
+ */
+void checkCropReallocationWorkOrder()
+{
+    rtengine::procparams::ProcParams params;
+
+    const rtengine::stage::BlockFingerprints fingerprints =
+        rtengine::stage::stage_fingerprints(
+            rtengine::stage::StagePath::Crop, params);
+
+    rtengine::stage::RenderStateKey state;
+    state.cropSkip = 1;
+    state.requestKind = crop_request_kind(
+        EditorRequest::RequestKind::ParamsOnly, false);
+
+    rtengine::stage::WorkInputs inputs;
+    inputs.path = rtengine::stage::StagePath::Crop;
+    inputs.previousState = &state;
+    inputs.previousFingerprints = &fingerprints;
+    inputs.previousParams = &params;
+    inputs.currentState = &state;
+    inputs.currentFingerprints = &fingerprints;
+    inputs.requestKind = state.requestKind;
+    inputs.params = &params;
+
+    const rtengine::stage::WorkOrder steady =
+        rtengine::stage::derive_crop_work(inputs);
+    check(!rtengine::stage::workItemRuns(
+              steady, rtengine::stage::WorkItem::rawBaseRebuild),
+          "a steady parameter update does not rebuild the crop base");
+
+    state.requestKind = crop_request_kind(
+        EditorRequest::RequestKind::ParamsOnly, true);
+    inputs.requestKind = state.requestKind;
+
+    const rtengine::stage::WorkOrder reallocated =
+        rtengine::stage::derive_crop_work(inputs);
+    check(rtengine::stage::workItemRuns(
+              reallocated, rtengine::stage::WorkItem::rawBaseRebuild),
+          "a reallocation forces the crop base rebuild");
+    check(rtengine::stage::workItemRuns(
+              reallocated, rtengine::stage::WorkItem::analysisRun),
+          "a reallocation forces the crop analysis");
+
+    check(crop_request_kind(EditorRequest::RequestKind::HighQuality, true)
+              == rtengine::stage::RequestKind::FullCrop,
+          "a reallocation wins over a high-quality crop request");
+    check(crop_request_kind(EditorRequest::RequestKind::FullPreview, false)
+              == rtengine::stage::RequestKind::FullCrop,
+          "a full preview maps to a full crop");
+}
+
+/*
+ * Tool -> intent wiring. Read the converted producer sources and check that
+ * each documented action registers the intent the migration table names. This
+ * is deliberately a source check: the tools are GUI widgets, and constructing
+ * them in this engine test would pull in the whole toolkit.
+ */
+void checkProducerSource(
+    const char* file, const char* historyMsg, const char* intent,
+    const char* label)
+{
+    const std::string path = std::string(RT_SOURCE_DIR) + "/" + file;
+    std::ifstream stream(path);
+
+    if (!stream) {
+        check(false, std::string(label) + ": cannot read " + path);
+        return;
+    }
+
+    std::string line;
+    bool foundMessage = false;
+    bool foundIntent = false;
+
+    while (std::getline(stream, line)) {
+        if (line.find(historyMsg) == std::string::npos) {
+            continue;
+        }
+        foundMessage = true;
+        if (line.find(std::string("RequestIntent::") + intent)
+                != std::string::npos) {
+            foundIntent = true;
+        }
+    }
+
+    check(foundMessage, std::string(label) + ": message not found");
+    check(foundIntent, std::string(label) + ": wrong intent");
+}
+
+void checkConvertedProducerIntents()
+{
+    checkProducerSource("rtgui/tools/filmnegative.cc",
+                        "HISTORY_MSG_FILMNEGATIVE_VALUES", "AllNoRaw",
+                        "film negative");
+    checkProducerSource("rtgui/tools/spot.cc", "HISTORY_MSG_SPOT_ENTRY",
+                        "SpotAdjust", "spot entry");
+    checkProducerSource("rtgui/tools/whitebalance.cc",
+                        "HISTORY_MSG_WBALANCE_OBSERVER10", "WhiteBalance",
+                        "white balance");
+    checkProducerSource("rtgui/tools/dehaze.cc", "HISTORY_MSG_DEHAZE_ENABLED",
+                        "Hdr", "dehaze");
+    checkProducerSource("rtgui/tools/perspective.cc",
+                        "HISTORY_MSG_PERSP_METHOD", "Transform",
+                        "perspective");
+    checkProducerSource("rtgui/tools/compressgamut.cc",
+                        "HISTORY_MSG_CG_COLORSPACE", "Compr",
+                        "gamut compression");
+    checkProducerSource("rtgui/tools/pdsharpening.cc",
+                        "HISTORY_MSG_PDSHARPEN_CONTRAST", "CaptureSharpen",
+                        "capture sharpening");
+    checkProducerSource("rtgui/tools/bayerpreprocess.cc",
+                        "HISTORY_MSG_PREPROCESS_PDAFLINESFILTER", "DarkFrame",
+                        "dark frame");
+    checkProducerSource("rtgui/tools/cropguide.cc",
+                        "HISTORY_MSG_CROP_GUIDE_ENABLED", "RepaintOnly",
+                        "crop guide");
+    checkProducerSource("rtgui/tools/preprocesswb.cc",
+                        "HISTORY_MSG_PREPROCWB_MODE", "First",
+                        "preprocess white balance");
+    checkProducerSource("rtgui/tools/resize.cc",
+                        "HISTORY_MSG_RESIZE_LONGEDGE", "ControlOnly",
+                        "resize");
+}
+
 void checkIdentity()
 {
     /*
@@ -715,6 +915,10 @@ int main()
     checkProducerIntents();
     checkProducerDirtyBlocks();
     checkRefreshMapper();
+    checkProducerEventKey();
+    checkFastPathAugmentation();
+    checkCropReallocationWorkOrder();
+    checkConvertedProducerIntents();
     checkIdentity();
     checkContractViolations();
 

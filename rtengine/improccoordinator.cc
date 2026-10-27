@@ -4754,6 +4754,16 @@ void ImProcCoordinator::updatePreviewImage(EditorRequest request,
         todo |= TRANSFORM;
     }
 
+    /*
+     * Every execution-payload augmentation refreshes the typed facts before
+     * anything can consume them. The fast path below uses `request` directly,
+     * so leaving the facts at their pre-augmentation values would make the
+     * crop bodies read a stale transform/rgb/Lab intent.
+     */
+    request.setLegacyGateMask(todo);
+    request.refreshFromLegacyMask();
+    assertPlanningAgrees(request, "pc-vignette augmentation");
+
     if (previewRequest.load(std::memory_order_relaxed) != requestId) {
         paramsUpdateMutex.lock();
 
@@ -4786,6 +4796,7 @@ void ImProcCoordinator::updatePreviewImage(EditorRequest request,
          */
         assert(request.kind != stage::RequestKind::RepaintOnly
                || request.imperativeRepaint);
+        assertPlanningAgrees(request, "panning requeue");
 
         pendingRequest = coalesce(pendingRequest, request);
         paramsUpdateMutex.unlock();
@@ -4834,17 +4845,22 @@ void ImProcCoordinator::updatePreviewImage(EditorRequest request,
     if (canUseViewportFastPath(eligibilityTodo, highDetailNeeded,
                                viewportFallback)) {
         int cropTodo = todo & VIEWPORT_CROP_TODO;
+        EditorRequest cropRequest = request;
         if (cropTodo & (M_LUMACURVE | M_AUTOEXP)) {
             // Crop::update applies luminance/colour work for these bits only
-            // through M_LUMINANCE/M_COLOR; keep the mask consistent.
+            // through M_LUMINANCE/M_COLOR; keep the mask and the typed facts
+            // consistent, because the crop bodies read the facts.
             cropTodo |= M_LUMINANCE | M_COLOR;
+            cropRequest.setLegacyGateMask(
+                request.legacyGateMask | M_LUMINANCE | M_COLOR);
         }
+        assertPlanningAgrees(cropRequest, "viewport fast-path crop");
 
         prepareViewportLuts(eligibilityTodo);
         ipf.setScale(scale);
 
         const auto cropStart = std::chrono::steady_clock::now();
-        renderCrops(cropTodo, true, request);
+        renderCrops(cropTodo, true, cropRequest);
         const auto cropEnd = std::chrono::steady_clock::now();
         previewTimer.viewportFast = true;
         previewTimer.viewportCropMs =
@@ -4918,6 +4934,7 @@ void ImProcCoordinator::updatePreviewImage(EditorRequest request,
          */
         assert(!request.imperativeRepaint);
         assert(request.kind != stage::RequestKind::RepaintOnly);
+        assertPlanningAgrees(request, "deferred absorb");
     }
 
     bool suppressDeferredCropRender = false;
@@ -5122,6 +5139,8 @@ void ImProcCoordinator::updatePreviewImage(EditorRequest request,
          * derivation read from the final mask.
          */
         pass.request.setLegacyGateMask(todo);
+        pass.request.refreshFromLegacyMask();
+
 
         if ((pass.todo & M_MONITOR) || (lastOutputProfile != params->icm.outputProfile) || lastOutputIntent != params->icm.outputIntent || lastOutputBPC != params->icm.outputBPC) {
             lastOutputProfile = params->icm.outputProfile;
@@ -5137,9 +5156,12 @@ void ImProcCoordinator::updatePreviewImage(EditorRequest request,
 
 // process crop, if needed
     if (!suppressDeferredCropRender) {
+        const EditorRequest& cropRequest =
+            pass.request.present ? pass.request : request;
+        assertPlanningAgrees(cropRequest, "preview crop render");
         renderCrops(todo, panningRelatedChange
                         || (highDetailNeeded && prevdemo != PD_Sidecar),
-                    pass.request.present ? pass.request : request);
+                    cropRequest);
     }
 
     /*
