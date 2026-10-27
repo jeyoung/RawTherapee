@@ -25,7 +25,6 @@
 
 #include <glib.h>
 
-#include "refreshmap.h"
 #include "stage/stage_dirty_blocks.h"
 
 namespace rtengine
@@ -75,10 +74,11 @@ constexpr int VIEWPORT_DEFERRED_IDLE_POLL_MS = 100;
 /*
  * Graph nodes a deferred analysis pass may have to run.
  *
- * The retired mask kept the same set implicitly: M_MONITOR selected
- * monitor.output, M_RGBCURVE selected rgb.proc, and the Lab bits selected the
- * Lab chain. Spelling the nodes out here makes the mapping a typed fact that
- * the coordinator applies once; no M_* bit decides the deferred schedule.
+ * The retired request mask kept the same set implicitly: the monitor family
+ * selected monitor.output, the RGB curve family selected rgb.proc, and the Lab
+ * families selected the Lab chain. Spelling the nodes out here makes the
+ * mapping a typed fact that
+ * the coordinator applies once; no request family decides the schedule.
  */
 enum class DeferredStage : uint32_t {
     MonitorOutput = 1u << 0,
@@ -186,39 +186,6 @@ inline stage::DirtyBlocks deferredForcedBlocks()
     }
     blocks.blocks.assign(blocks.ids.begin(), blocks.ids.end());
     return blocks;
-}
-
-/*
- * Opaque execution payload for the block bodies of the deferred pass.
- *
- * This is derived from the typed stage bits once and then carried on the
- * request exactly as the old mask was: it is the payload the unconverted
- * bodies still read, not the deferred schedule. It deliberately names only
- * downstream stages; no source or raw block is ever added.
- */
-inline int deferredExecutionPayload(uint32_t stageBits)
-{
-    int payload = 0;
-    if ((stageBits & static_cast<uint32_t>(DeferredStage::MonitorOutput))
-            != 0) {
-        payload |= M_MONITOR;
-    }
-    if ((stageBits & static_cast<uint32_t>(DeferredStage::RgbProc)) != 0) {
-        payload |= M_RGBCURVE;
-    }
-    if ((stageBits & (static_cast<uint32_t>(DeferredStage::LabTools)
-                      | static_cast<uint32_t>(DeferredStage::LabWavelet)
-                      | static_cast<uint32_t>(DeferredStage::WorkingTrc)
-                      | static_cast<uint32_t>(DeferredStage::CieCam)
-                      | static_cast<uint32_t>(DeferredStage::Gamut)))
-            != 0) {
-        payload |= M_LUMACURVE | M_LUMINANCE | M_COLOR;
-    }
-    if ((stageBits & static_cast<uint32_t>(DeferredStage::LocalAdjustments))
-            != 0) {
-        payload |= M_AUTOEXP;
-    }
-    return payload;
 }
 
 /**

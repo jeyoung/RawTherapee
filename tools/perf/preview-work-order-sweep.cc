@@ -59,6 +59,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstdio>
+#include <map>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -79,12 +80,35 @@
 
 #include "rtengine/image8.h"
 #include "rtengine/procparams.h"
-#include "rtengine/refreshmap.h"
+#include "rtengine/editorrequest.h"
+#include "rtengine/editorrequest_registry.h"
 #include "rtengine/rtengine.h"
 #include "rtengine/stage/stage_work.h"
 
 namespace
 {
+
+/*
+ * Typed event for one harness request. The registry owns the request; the
+ * harness only needs the identity token the engine interface accepts.
+ */
+rtengine::ProcEvent eventFor(rtengine::RequestIntent intent)
+{
+    static std::map<int, rtengine::ProcEvent> events;
+
+    auto it = events.find(static_cast<int>(intent));
+    if (it != events.end()) {
+        return it->second;
+    }
+
+    rtengine::ProcEvent event =
+        rtengine::EditorRequestRegistry::getInstance()->newEvent();
+    rtengine::EditorRequestRegistry::getInstance()->registerRequest(
+        event, rtengine::make_request(intent));
+    events.emplace(static_cast<int>(intent), event);
+    return event;
+}
+
 
 /* Longest preview edge is chosen by the coordinator; this is its skip. */
 constexpr int PREVIEW_SCALE = 4;
@@ -336,7 +360,7 @@ public:
         rtengine::procparams::ProcParams* editing =
             processor_->beginUpdateParams();
         *editing = params;
-        processor_->endUpdateParams(FIRST);
+        processor_->endUpdateParams(eventFor(rtengine::RequestIntent::First));
 
         if (!preview_.waitFor(1, PASS_TIMEOUT_MS)) {
             std::fprintf(stderr, "sweep: the initial preview timed out\n");
@@ -376,7 +400,8 @@ public:
      * incremental pass to land, read the normalised parameters back and
      * return the elapsed wall time.
      */
-    bool apply(const rtengine::procparams::ProcParams& params, int todo,
+    bool apply(const rtengine::procparams::ProcParams& params,
+               rtengine::RequestIntent intent,
                rtengine::procparams::ProcParams& normalised, double& elapsedMs,
                bool readBack = true)
     {
@@ -386,7 +411,7 @@ public:
         rtengine::procparams::ProcParams* editing =
             processor_->beginUpdateParams();
         *editing = params;
-        processor_->endUpdateParams(todo);
+        processor_->endUpdateParams(eventFor(intent));
 
         if (!preview_.waitFor(target, PASS_TIMEOUT_MS)) {
             std::fprintf(stderr, "sweep: the incremental preview timed out\n");
@@ -462,13 +487,13 @@ private:
 struct State
 {
     std::string name;
-    int todo;
+    rtengine::RequestIntent intent;
     void (*mutate)(rtengine::procparams::ProcParams&);
 };
 
 State spotAdd()
 {
-    return {"spot-add", SPOTADJUST,
+    return {"spot-add", rtengine::RequestIntent::SpotAdjust,
             [](rtengine::procparams::ProcParams& params) {
                 params.spot.enabled = true;
                 params.spot.entries.clear();
@@ -481,7 +506,7 @@ State spotAdd()
 
 State spotRemove()
 {
-    return {"spot-remove", SPOTADJUST,
+    return {"spot-remove", rtengine::RequestIntent::SpotAdjust,
             [](rtengine::procparams::ProcParams& params) {
                 params.spot.enabled = false;
                 params.spot.entries.clear();
@@ -490,7 +515,7 @@ State spotRemove()
 
 State retinexOn()
 {
-    return {"retinex-on", DEMOSAIC,
+    return {"retinex-on", rtengine::RequestIntent::Demosaic,
             [](rtengine::procparams::ProcParams& params) {
                 params.retinex.enabled = true;
             }};
@@ -504,7 +529,7 @@ State retinexOn()
  */
 State retinexColorspace()
 {
-    return {"retinex-colorspace", DEMOSAIC,
+    return {"retinex-colorspace", rtengine::RequestIntent::Demosaic,
             [](rtengine::procparams::ProcParams& params) {
                 params.retinex.retinexcolorspace = "HSLLOG";
             }};
@@ -512,7 +537,7 @@ State retinexColorspace()
 
 State retinexGamma()
 {
-    return {"retinex-gamma", DEMOSAIC,
+    return {"retinex-gamma", rtengine::RequestIntent::Demosaic,
             [](rtengine::procparams::ProcParams& params) {
                 params.retinex.gammaretinex = "low";
             }};
@@ -520,7 +545,7 @@ State retinexGamma()
 
 State workProfileRetinexOn()
 {
-    return {"workprofile-retinex-on", DEMOSAIC,
+    return {"workprofile-retinex-on", rtengine::RequestIntent::Demosaic,
             [](rtengine::procparams::ProcParams& params) {
                 params.icm.workingProfile = "ProPhoto";
             }};
@@ -528,7 +553,7 @@ State workProfileRetinexOn()
 
 State retinexOff()
 {
-    return {"retinex-off", DEMOSAIC,
+    return {"retinex-off", rtengine::RequestIntent::Demosaic,
             [](rtengine::procparams::ProcParams& params) {
                 params.retinex.enabled = false;
             }};
@@ -536,7 +561,7 @@ State retinexOff()
 
 State workProfileRetinexOff()
 {
-    return {"workprofile-retinex-off", DEMOSAIC,
+    return {"workprofile-retinex-off", rtengine::RequestIntent::Demosaic,
             [](rtengine::procparams::ProcParams& params) {
                 params.icm.workingProfile = "Rec2020";
             }};
@@ -544,7 +569,7 @@ State workProfileRetinexOff()
 
 State filmNegativeOn()
 {
-    return {"filmneg-on", ALLNORAW,
+    return {"filmneg-on", rtengine::RequestIntent::AllNoRaw,
             [](rtengine::procparams::ProcParams& params) {
                 params.filmNegative.enabled = true;
             }};
@@ -552,7 +577,7 @@ State filmNegativeOn()
 
 State filmNegativeOff()
 {
-    return {"filmneg-off", ALLNORAW,
+    return {"filmneg-off", rtengine::RequestIntent::AllNoRaw,
             [](rtengine::procparams::ProcParams& params) {
                 params.filmNegative.enabled = false;
             }};
@@ -560,7 +585,7 @@ State filmNegativeOff()
 
 State captureSharpeningOn()
 {
-    return {"capsharp-on", DEMOSAIC,
+    return {"capsharp-on", rtengine::RequestIntent::Demosaic,
             [](rtengine::procparams::ProcParams& params) {
                 params.pdsharpening.enabled = true;
                 params.pdsharpening.contrast += 0.1;
@@ -569,7 +594,7 @@ State captureSharpeningOn()
 
 State captureSharpeningOff()
 {
-    return {"capsharp-off", DEMOSAIC,
+    return {"capsharp-off", rtengine::RequestIntent::Demosaic,
             [](rtengine::procparams::ProcParams& params) {
                 params.pdsharpening.enabled = false;
                 params.pdsharpening.contrast -= 0.1;
@@ -585,7 +610,7 @@ struct ZoomState
 
 const State exposureState()
 {
-    return {"exposure", AUTOEXP,
+    return {"exposure", rtengine::RequestIntent::AutoExposure,
             [](rtengine::procparams::ProcParams& params) {
                 params.toneCurve.expcomp += EXPOSURE_STEP;
             }};
@@ -618,15 +643,15 @@ const State* fastPathStates(size_t& count)
 {
     static const State states[] = {
         exposureState(),
-        {"tone-curve", AUTOEXP,
+        {"tone-curve", rtengine::RequestIntent::AutoExposure,
          [](rtengine::procparams::ProcParams& params) {
              params.toneCurve.contrast += 5;
          }},
-        {"lab-curve", LUMINANCECURVE,
+        {"lab-curve", rtengine::RequestIntent::LuminanceCurve,
          [](rtengine::procparams::ProcParams& params) {
              params.labCurve.brightness += 5;
          }},
-        {"wavelet-curve", DIRPYREQUALIZER,
+        {"wavelet-curve", rtengine::RequestIntent::DirPyrEqualizer,
          [](rtengine::procparams::ProcParams& params) {
              params.wavelet.enabled = true;
              params.wavelet.wavclCurve = {0.0, 0.0, 0.5, 0.6, 1.0, 1.0};
@@ -704,7 +729,7 @@ int runParity(const std::string& file, const std::string& outDir,
 
         rtengine::procparams::ProcParams normalised;
         double elapsed = 0.0;
-        if (!session.apply(next, states[i].todo, normalised, elapsed,
+        if (!session.apply(next, states[i].intent, normalised, elapsed,
                            !fastPath)) {
             return 2;
         }
@@ -750,7 +775,7 @@ int runParity(const std::string& file, const std::string& outDir,
 
         rtengine::procparams::ProcParams normalised;
         double elapsed = 0.0;
-        if (!session.apply(next, exposureState().todo, normalised, elapsed)) {
+        if (!session.apply(next, exposureState().intent, normalised, elapsed)) {
             return 2;
         }
         params = normalised;
@@ -786,7 +811,9 @@ int runTiming(const std::string& file, const std::string& outDir, int samples,
     bool high = true;
     for (int sample = 0; sample < samples; ++sample) {
         rtengine::procparams::ProcParams next = params;
-        const int todo = clamp ? DARKFRAME : AUTOEXP;
+        const rtengine::RequestIntent intent = clamp
+            ? rtengine::RequestIntent::DarkFrame
+            : rtengine::RequestIntent::AutoExposure;
         if (clamp) {
             next.toneCurve.clampOOG = high;
         } else {
@@ -796,7 +823,7 @@ int runTiming(const std::string& file, const std::string& outDir, int samples,
 
         rtengine::procparams::ProcParams normalised;
         double elapsed = 0.0;
-        if (!session.apply(next, todo, normalised, elapsed)) {
+        if (!session.apply(next, intent, normalised, elapsed)) {
             return 2;
         }
         params = normalised;

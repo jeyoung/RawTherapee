@@ -86,7 +86,7 @@ skip() { printf 'SKIP\t%s\n' "$*"; }
 # ---------------------------------------------------------------- stage tests
 info "stage tests"
 if [ "$skip_stage_tests" -eq 0 ]; then
-    for target in stage-abi-test stage-parity-test stage-cache-test stage-graph-test stage-indexer-test stage-store-test stage-node-cache-test stage-device-test stage-residency-test stage-param-hash-test stage-pipeline-test stage-param-map-test stage-render-state-test stage-mask-map-test stage-dirty-blocks-test stage-work-test editorrequest-test; do
+    for target in stage-abi-test stage-parity-test stage-cache-test stage-graph-test stage-indexer-test stage-store-test stage-node-cache-test stage-device-test stage-residency-test stage-param-hash-test stage-pipeline-test stage-param-map-test stage-render-state-test stage-dirty-blocks-test stage-work-test editorrequest-test; do
         if cmake --build "$build_dir" --target "$target" -j 6 >"$report/$target.build.log" 2>&1 \
             && "$build_dir/rtengine/$target" >"$report/$target.log" 2>&1; then
             pass "$target"

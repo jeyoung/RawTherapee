@@ -22,7 +22,7 @@
 #include <cmath>
 #include <ctime>
 
-#include "rtengine/refreshmap.h"
+#include "rtengine/editorrequest.h"
 #include "rtengine/procparams.h"
 #include "rtengine/profiling.h"
 #include "rtengine/rt_math.h"
@@ -806,7 +806,8 @@ void ImageArea::addCropWindow ()
 
     // Detail windows need a crop refresh. This no longer forces the demosaic
     // method; that is decided by the main preview zoom and the FAST toggle.
-    ipc->startProcessing(M_HIGHQUAL);
+    ipc->startProcessing(
+        static_cast<int>(rtengine::RequestIntent::HighQuality));
     ipc->setHighQualComputed();
 }
 

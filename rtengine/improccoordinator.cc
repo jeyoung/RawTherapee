@@ -62,7 +62,7 @@
 #include "stage/stage_runtime.h"
 #include "stage/stage_work.h"
 #include "tweakoperator.h"
-#include "refreshmap.h"
+#include "editorrequest_registry.h"
 #include "utils.h"
 #include "rt_algo.h"
 #include "viewportdefer.h"
@@ -121,7 +121,7 @@ rtengine::stage::DirtyBlocks baseCacheDirtyBlocks(
     }
     /*
      * White balance is the one base-finish family that invalidated the cache.
-     * The request fact is the typed form of the old M_WB bit; comparing the
+     * The request fact is the typed form of the white-balance family; comparing the
      * live WB structure would also see the engine's own normalisation and
      * invalidate on unrelated edits.
      */
@@ -182,9 +182,12 @@ struct PreviewTimer {
         const auto end = std::chrono::steady_clock::now();
         const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             end - start).count();
-        std::fprintf(stderr, "preview update: %lld ms todo=0x%x cache=%d",
+        std::fprintf(stderr,
+                     "preview update: %lld ms kind=%d request=%016llx cache=%d",
                      static_cast<long long>(ms),
-                     request.executionPayload(), cacheHit ? 1 : 0);
+                     static_cast<int>(request.kind),
+                     static_cast<unsigned long long>(request.identity()),
+                     cacheHit ? 1 : 0);
         if (viewportFast) {
             std::fprintf(stderr,
                          " viewport=fast crop_ms=%lld deferred_stages=0x%x"
@@ -631,19 +634,18 @@ int viewportDeferredMaxWaitMs()
  * `pendingDeferred` is scheduler state, not an editor request: it is the set
  * of analysis nodes a viewport fast-path hit skipped and the full-frame pass
  * must catch up. It never carries a request kind (a deferred record always
- * forces the analysis), and it is therefore carried as a ParamsOnly request.
- * The execution payload is derived from the typed stage bits once, for the
- * unconverted block bodies only.
+ * forces the analysis), and it is therefore carried as a ParamsOnly request
+ * whose facts are derived from the typed stage ids.
  */
-EditorRequest deferredAnalysisRequest(uint32_t stageBits)
+EditorRequest deferredAnalysisRequest(const stage::DirtyBlocks& blocks)
 {
-    assert(stageBits != 0);
+    assert(!blocks.ids.empty());
 
     EditorRequest request;
-    request.present = stageBits != 0;
+    request.present = true;
     request.controlOnly = false;
     request.kind = stage::RequestKind::ParamsOnly;
-    request.setLegacyGateMask(deferredExecutionPayload(stageBits));
+    request.absorbDeferredExecution(blocks);
     return request;
 }
 
@@ -676,29 +678,6 @@ stage::DirtyBlocks deferredBlocksForRequest(const EditorRequest& request)
     blocks.blocks.assign(blocks.ids.begin(), blocks.ids.end());
     return blocks;
 }
-
-#ifndef NDEBUG
-/*
- * The base-refresh and Color/Coloropp patches of the typed request must
- * reproduce the old derivation over the widened mask. Fail loudly in a debug
- * build if one drifts. The requeue and deferred-absorb patches only narrow a
- * repaint and carry their own narrower assertion at the site.
- */
-void assertPlanningAgrees(const EditorRequest& request, const char* site)
-{
-    if (!planningAgreesWithLegacyMask(request)) {
-        std::fprintf(
-            stderr,
-            "editor request diverges from its legacy mask at %s\n",
-            site);
-        assert(false && "typed request diverged from its legacy mask");
-    }
-}
-#else
-void assertPlanningAgrees(const EditorRequest&, const char*)
-{
-}
-#endif
 
 } // namespace
 
@@ -895,8 +874,6 @@ void ImProcCoordinator::deferredWatcherLoop()
 
 void ImProcCoordinator::flushDeferredAnalysis()
 {
-    uint32_t stageBits = 0;
-
     paramsUpdateMutex.lock();
 
     if (!pendingDeferred.pending() || deferredWatcherPaused
@@ -905,17 +882,17 @@ void ImProcCoordinator::flushDeferredAnalysis()
         return;
     }
 
-    stageBits = deferredStageBits(pendingDeferred.blocks);
-    if (stageBits == 0) {
+    stage::DirtyBlocks deferredBlocks = pendingDeferred.blocks;
+    if (deferredBlocks.ids.empty()) {
         // A forced-analysis record with an empty set still names the full
         // forced chain; the queue never produces it, but fail safe.
-        stageBits = deferredForcedStageBits;
+        deferredBlocks = deferredForcedBlocks();
     }
     pendingDeferred = DeferredRecord{};
     publishDeferredSnapshotLocked();
     forceFullPreview.store(true, std::memory_order_relaxed);
     pendingRequest = coalesce(pendingRequest,
-                              deferredAnalysisRequest(stageBits));
+                              deferredAnalysisRequest(deferredBlocks));
 
     paramsUpdateMutex.unlock();
 
@@ -1173,7 +1150,8 @@ void dump_full_frame(const Image8* preview, const Image8* work,
          << "  \"schema\": \"rt-preview-dump/1\",\n"
          << "  \"pass\": " << pass << ",\n"
          << "  \"scale\": " << scale << ",\n"
-         << "  \"todo\": " << request.executionPayload() << ",\n"
+         << "  \"kind\": " << static_cast<int>(request.kind) << ",\n"
+         << "  \"request\": \"" << request.identity() << "\",\n"
          << "  \"format\": \"uint16-tiff\",\n"
          << "  \"preview\": {\"file\": \"preview.tif\", \"width\": "
          << preview->getWidth() << ", \"height\": " << preview->getHeight()
@@ -1374,7 +1352,7 @@ RtStageBuffer imageTierView(const Imagefloat* image)
 struct ImProcCoordinator::PreviewPassState {
     /*
      * The demosaic body ran in this pass. The hand-written pass widened its
-     * payload with M_INIT|M_CSHARP at that point but only refreshed the typed
+     * request with the reload and capture-sharpening facts at that point but only refreshed the typed
      * request after the node loop, so the widening must stay deferred to the
      * same position.
      */
@@ -1525,13 +1503,13 @@ void ImProcCoordinator::stageRawDemosaic(PreviewPassState& pass)
             xtransAutoContrastListener->autoContrastChanged(contrastThreshold);
         }
 
-        // if a demosaic happened we should also call getimage later, so we need to set the M_INIT flag
+        // if a demosaic happened we should also call getimage later, so we need the reload fact
         pass.demosaicRebuilt = true;
 
     }
 
     /*
-     * The hand-written pass widened the payload with M_INIT|M_CSHARP when the
+     * The hand-written pass widened the payload with the reload and capture-sharpening facts when the
      * demosaic ran, which made capture sharpening run even when the request
      * named neither bit. `demosaicRebuilt` is that sub-step fact.
      */
@@ -2155,7 +2133,7 @@ void ImProcCoordinator::stageRawBase(PreviewPassState& pass)
         //ColorTemp::CAT02 (orig_prev, &params) ;
         //   printf("orig_prevW=%d\n  scale=%d",orig_prev->width, scale);
         /* Issue 2785, disabled some 1:1 tools
-                if (false) { // retired M_LINDENOISE gate
+                if (false) { // retired denoise gate
                     DirPyrDenoiseParams denoiseParams = params->dirpyrDenoise;
                     if (denoiseParams.enabled && (scale==1)) {
                         Imagefloat *calclum = NULL ;
@@ -4670,10 +4648,10 @@ void ImProcCoordinator::executePreviewNode(const std::string& id,
  * Preview request entry point.
  *
  * `request` is the typed planning input: its kind and facts decide what the
- * pass plans. `legacyGateMask` remains the opaque execution payload for the
- * block bodies that have not been converted. Whenever this method widens the
- * mask it calls setLegacyGateMask(), so the named facts stay in step and no
- * planning decision below reads the mask.
+ * pass plans. Every execution input is a typed request fact; there is no
+ * integer payload. Whenever this method widens a request it uses the named
+ * augmentation, so the facts stay in step and no planning decision reads a
+ * mask.
  */
 void ImProcCoordinator::updatePreviewImage(EditorRequest request,
                                            bool panningRelatedChange,
@@ -4703,7 +4681,7 @@ void ImProcCoordinator::updatePreviewImage(EditorRequest request,
     const EditorRequest eligibilityRequest = request;
 
     // This augmentation must happen before a stale request is requeued, since
-    // the next request may only carry M_CROP and M_MONITOR.
+    // the next request may name only the crop and monitor families.
     if (request.cropIntent && ipf.needsPCVignetting()) {
         request.markCropTransform();
     }
@@ -4714,7 +4692,6 @@ void ImProcCoordinator::updatePreviewImage(EditorRequest request,
      * so leaving the facts at their pre-augmentation values would make the
      * crop bodies read a stale transform/rgb/Lab intent.
      */
-    assertPlanningAgrees(request, "pc-vignette augmentation");
 
     if (previewRequest.load(std::memory_order_relaxed) != requestId) {
         paramsUpdateMutex.lock();
@@ -4722,9 +4699,8 @@ void ImProcCoordinator::updatePreviewImage(EditorRequest request,
         /*
          * Requeue the typed request, not a mask re-interpretation: the
          * augmentation above may have added an execution bit, but the request
-         * kind and facts stay typed. Adding M_MONITOR for a panning change
-         * turns a bare repaint into a parameter update, matching the old
-         * derivation over the ORed mask.
+         * kind and facts stay typed. Naming the monitor family for a panning
+         * change turns a bare repaint into a parameter update.
          */
         request.present = true;
         if (panningRelatedChange) {
@@ -4732,8 +4708,7 @@ void ImProcCoordinator::updatePreviewImage(EditorRequest request,
         }
         /*
          * A bare repaint survives the requeue only while its mask is still
-         * exactly M_MINUPDATE. Any augmentation above makes the old
-         * derivation produce ParamsOnly.
+         * bare repaint. Any augmentation above makes the request ParamsOnly.
          */
         if (request.kind == stage::RequestKind::RepaintOnly
                 && !request.imperativeRepaint) {
@@ -4742,11 +4717,10 @@ void ImProcCoordinator::updatePreviewImage(EditorRequest request,
         /*
          * Debug cross-check for the repaint patch: a RepaintOnly request
          * survives the requeue only while its mask is still the bare
-         * M_MINUPDATE, which is exactly what imperativeRepaint records.
+         * a bare repaint, which is exactly what imperativeRepaint records.
          */
         assert(request.kind != stage::RequestKind::RepaintOnly
                || request.imperativeRepaint);
-        assertPlanningAgrees(request, "panning requeue");
 
         pendingRequest = coalesce(pendingRequest, request);
         paramsUpdateMutex.unlock();
@@ -4810,13 +4784,12 @@ void ImProcCoordinator::updatePreviewImage(EditorRequest request,
 
         EditorRequest cropRequest = request;
         if (cropSelection.labPixels()) {
-            // Crop::update applies luminance/colour work for the implied bits
-            // only through M_LUMINANCE/M_COLOR; keep the payload and the typed
-            // facts consistent, because the crop bodies read the facts.
+            // Crop::update applies luminance/colour work for the implied
+            // families; keep the typed facts consistent, because the crop
+            // bodies read them.
             cropRequest.markLabPixels(cropSelection.luminance,
                                        cropSelection.color);
         }
-        assertPlanningAgrees(cropRequest, "viewport fast-path crop");
 
         prepareViewportLuts(viewportLutSelection(eligibilityRequest));
         ipf.setScale(scale);
@@ -4869,11 +4842,11 @@ void ImProcCoordinator::updatePreviewImage(EditorRequest request,
     if (viewportFastEnabled()
             && (!stateWasValid || !sameBaseInputs(*params, viewportFullParams))) {
         viewportStateValid.store(false, std::memory_order_relaxed);
-        // M_MONITOR also forces the full-frame block even when the original
-        // event did not carry an init/HDR bit. The added bits make sure the
-        // base image and analysis are rebuilt from the current parameters.
+        // The monitor family also forces the full-frame block even when the
+        // original request did not name an init/HDR family. The added facts
+        // make sure the base image and analysis are rebuilt from the current
+        // parameters.
         request.markBaseRefresh(params->spot != viewportFullParams.spot);
-        assertPlanningAgrees(request, "base refresh");
         if (previewBaseCache->enabled()) {
             previewBaseCache->markDirty("viewport-base-refresh");
         }
@@ -4887,8 +4860,7 @@ void ImProcCoordinator::updatePreviewImage(EditorRequest request,
             && request.kind == stage::RequestKind::RepaintOnly) {
         /*
          * The deferred mask always adds execution bits, so the ORed mask can
-         * no longer be the bare M_MINUPDATE. The old derivation therefore
-         * produced ParamsOnly for this combination.
+         * no longer a bare repaint, so the combination is ParamsOnly.
          */
         request.kind = stage::RequestKind::ParamsOnly;
     }
@@ -4900,7 +4872,6 @@ void ImProcCoordinator::updatePreviewImage(EditorRequest request,
          */
         assert(!request.imperativeRepaint);
         assert(request.kind != stage::RequestKind::RepaintOnly);
-        assertPlanningAgrees(request, "deferred absorb");
     }
 
     bool suppressDeferredCropRender = false;
@@ -4932,12 +4903,11 @@ void ImProcCoordinator::updatePreviewImage(EditorRequest request,
         if (colorHlrWbRequest && params->toneCurve.hrenabled
                 && params->toneCurve.method == "Coloropp") {
             /*
-             * DEMOSAIC contains the absolute reload bits and M_SPOT, so the
-             * old derivation saw a whole-path rebuild with spot work. Keep the
-             * typed request in step; M_HIGHQUAL still wins.
+             * The demosaic intent names the reload and spot families, so the
+             * request becomes a whole-path rebuild with spot work. Keep the
+             * typed request in step; a high-quality request still wins.
              */
             pass.request.markColorHlrDemosaic();
-            assertPlanningAgrees(pass.request, "color/coloropp demosaic");
         }
 
         pass.highDetailNeeded = highDetailNeeded;
@@ -5119,7 +5089,6 @@ void ImProcCoordinator::updatePreviewImage(EditorRequest request,
     if (!suppressDeferredCropRender) {
         const EditorRequest& cropRequest =
             pass.request.present ? pass.request : request;
-        assertPlanningAgrees(cropRequest, "preview crop render");
         renderCrops(panningRelatedChange
                         || (highDetailNeeded && prevdemo != PD_Sidecar),
                     cropRequest);
@@ -5945,12 +5914,23 @@ void ImProcCoordinator::startProcessing()
     updaterThreadStart.unlock();
 }
 
-void ImProcCoordinator::startProcessing(int changeCode)
+void ImProcCoordinator::startProcessing(int intentCode)
 {
+    /*
+     * The engine interface is frozen at an integer argument, so the GUI
+     * passes the RequestIntent value of the typed change instead of a mask.
+     */
+    if (intentCode < 0
+            || intentCode > static_cast<int>(RequestIntent::HighQuality)) {
+        assert(false && "startProcessing needs a RequestIntent value");
+        std::abort();
+    }
+
+    const EditorRequest request =
+        make_request(static_cast<RequestIntent>(intentCode));
+
     paramsUpdateMutex.lock();
     deferredWatcherPaused = false;
-    const EditorRequest request =
-        from_legacy_mask(changeCode, LegacyMaskContext{});
     pendingRequest = coalesce(pendingRequest, request);
 
     if (!request.controlOnly) {
@@ -6030,7 +6010,7 @@ void ImProcCoordinator::process()
 
         paramsUpdateMutex.unlock();
 
-        // A control-only request (M_VOID) publishes the parameters without
+        // A control-only request publishes the parameters without
         // rendering, exactly as the integer mask did.
         if (!change.controlOnly) {
             change.viewportMoved =
@@ -6058,20 +6038,13 @@ ProcParams* ImProcCoordinator::beginUpdateParams()
 
 void ImProcCoordinator::endUpdateParams(ProcEvent change)
 {
-    EditorRequest request;
-
-    if (!RefreshMapper::getInstance()->getRequest(change, request)) {
-        /*
-         * Compatibility path: the producer registered a mask. This is the one
-         * place the GUI boundary still hands planning information over in mask
-         * form, and from_legacy_mask() is the single classifier.
-         */
-        request = from_legacy_mask(
-            RefreshMapper::getInstance()->getAction(change),
-            LegacyMaskContext{});
-    }
-
-    endUpdateParams(request);
+    /*
+     * The event is the identity token; the registry holds the typed request
+     * the producer registered, or the recorded classification of a static
+     * event identity.
+     */
+    endUpdateParams(
+        EditorRequestRegistry::getInstance()->requestFor(change));
 }
 
 void ImProcCoordinator::endUpdateParams(const EditorRequest& request)
@@ -6089,17 +6062,14 @@ void ImProcCoordinator::endUpdateParams(const EditorRequest& request)
 
 void ImProcCoordinator::endUpdateParams(int changeFlags)
 {
-    const EditorRequest request =
-        from_legacy_mask(changeFlags, LegacyMaskContext{});
-    pendingRequest = coalesce(pendingRequest, request);
-    paramsReady.store(true, std::memory_order_release);
-
-    if (!request.controlOnly) {
-        previewRequest.fetch_add(1, std::memory_order_relaxed);
-    }
-
-    paramsUpdateMutex.unlock();
-    startProcessing();
+    /*
+     * The integer form carried a request mask. Every producer now emits a
+     * typed request, so an integer here is a contract violation rather than a
+     * silently interpreted payload.
+     */
+    (void)changeFlags;
+    assert(false && "endUpdateParams(int) has no request meaning");
+    std::abort();
 }
 
 bool ImProcCoordinator::getHighQualComputed()
@@ -6181,7 +6151,7 @@ void ImProcCoordinator::queueFullPreviewRefresh()
 
     paramsUpdateMutex.lock();
     pendingRequest = coalesce(
-        pendingRequest, from_legacy_mask(ALL | M_MONITOR, LegacyMaskContext{}));
+        pendingRequest, make_request(RequestIntent::First));
     previewRequest.fetch_add(1, std::memory_order_relaxed);
     paramsUpdateMutex.unlock();
 

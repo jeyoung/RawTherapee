@@ -30,7 +30,6 @@
 
 #include "rtengine/color.h"
 #include "rtengine/procparams.h"
-#include "rtengine/refreshmap.h"
 
 using namespace rtengine;
 using namespace rtengine::procparams;

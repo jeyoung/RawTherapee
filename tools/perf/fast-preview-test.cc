@@ -8,6 +8,7 @@
  */
 #include <iostream>
 
+#include "rtengine/editorrequest.h"
 #include "rtengine/previewquality.h"
 #include "rtengine/viewportdefer.h"
 
@@ -98,21 +99,31 @@ bool testDeferredMask()
     CHECK(bits == deferredForcedStageBits);
     CHECK((bits & static_cast<uint32_t>(DeferredStage::LocalAdjustments)) == 0);
 
-    // The opaque block-body payload covers the same downstream stages.
-    const int payload = deferredExecutionPayload(bits);
-    CHECK((payload & M_MONITOR) != 0);
-    CHECK((payload & M_RGBCURVE) != 0);
-    CHECK((payload & (M_LUMACURVE | M_LUMINANCE | M_COLOR))
-          == (M_LUMACURVE | M_LUMINANCE | M_COLOR));
-    CHECK((payload & (M_PREPROC | M_RAW | M_WB | M_INIT | M_HDR)) == 0);
+    // The request carries the same downstream stages as typed facts.
+    rtengine::EditorRequest request;
+    request.present = true;
+    request.controlOnly = false;
+    request.kind = stage::RequestKind::ParamsOnly;
+    request.absorbDeferredExecution(forced);
+    CHECK(request.monitorIntent);
+    CHECK(request.rgbProcIntent);
+    CHECK(request.lumaCurveIntent && request.luminanceIntent
+          && request.colorIntent);
+    CHECK(!request.rawIntent && !request.captureSharpenIntent
+          && !request.colorHlrWbRequest && !request.fullFrameIntent);
 
-    // A request-stage addition stays typed and adds only its own payload bit.
+    // A request-stage addition stays typed and adds only its own fact.
     stage::DirtyBlocks withLocal = forced;
     withLocal.ids.insert("local.adjustments");
     const uint32_t withLocalBits = deferredStageBits(withLocal);
     CHECK((withLocalBits
            & static_cast<uint32_t>(DeferredStage::LocalAdjustments)) != 0);
-    CHECK((deferredExecutionPayload(withLocalBits) & M_AUTOEXP) != 0);
+    rtengine::EditorRequest localRequest;
+    localRequest.present = true;
+    localRequest.controlOnly = false;
+    localRequest.kind = stage::RequestKind::ParamsOnly;
+    localRequest.absorbDeferredExecution(withLocal);
+    CHECK(localRequest.autoExposureIntent);
 
     // The atomic snapshot is a plain value derived from the record.
     DeferredRecord record;

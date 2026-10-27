@@ -16,24 +16,21 @@
  */
 
 /*
- * Typed editor request and the single legacy-mask adapter.
+ * Typed editor request construction and coalescing.
  *
- * The mask layout lives in refreshmap.h. This unit maps every bit the
- * coordinator consumes and refuses an unmapped bit, so a future mask addition
- * cannot silently lose its request meaning. The mapping and the coalescing
- * rules are documented in editorrequest.h.
+ * A producer names a RequestIntent. This unit maps the intent to the named
+ * pipeline families it covers and derives the request facts once, so no
+ * integer mask reaches the coordinator, the plan or a stage body.
  */
 
 #include "editorrequest.h"
 
 #include "procparams.h"
-#include "refreshmap.h"
-#include "viewportdefer.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cstdint>
 #include <cstdlib>
-#include <algorithm>
 #include <functional>
 #include <set>
 #include <string>
@@ -45,35 +42,10 @@ namespace
 {
 
 /*
- * Bits that name a parameter family or an output request. They all degrade to
- * ParamsOnly: they dirty work, but they are not a request kind.
- */
-constexpr int PARAMETER_AND_OUTPUT_BITS =
-    M_PREPROC | M_RAW | M_WB | M_SPOT | M_CSHARP | M_MONITOR | M_RETINEX
-    | M_CROP | M_INIT | M_LINDENOISE | M_HDR | M_TRANSFORM | M_BLURMAP
-    | M_AUTOEXP | M_RGBCURVE | M_LUMACURVE | M_LUMINANCE | M_COLOR;
-
-/* Control and request-kind bits, none of which names a parameter family. */
-constexpr int REQUEST_BITS = M_VOID | M_MINUPDATE | M_HIGHQUAL;
-
-/* Every bit the coordinator consumes. */
-constexpr int MAPPED_BITS = PARAMETER_AND_OUTPUT_BITS | REQUEST_BITS;
-
-/*
- * The base-chain bits: a request carrying one of them asks for the full-frame
- * base or a display sink. M_HDR is excluded on purpose because GUI events
- * over-approximate with it; its parameter veto is separate.
- */
-constexpr int BASE_CHAIN_BITS =
-    M_PREPROC | M_RAW | M_WB | M_INIT | M_LINDENOISE | M_MONITOR | M_TRANSFORM
-    | M_CSHARP | M_RETINEX | M_BLURMAP;
-
-/*
  * Preview-path blocks the viewport fast path can serve, and the base blocks it
  * cannot. A producer that reports its own dirty set is held to the same
  * envelope the request families describe; the ids are the canonical preview
- * descriptors (stage_pipeline.cc). `monitor.output` is a resident of the path
- * and belongs to the deferred pass, but naming it is not a base request.
+ * descriptors (stage_pipeline.cc).
  */
 bool viewportDeltaBlock(const std::string& id)
 {
@@ -93,24 +65,6 @@ bool viewportBaseBlock(const std::string& id)
     return base.count(id) != 0;
 }
 
-/* The absolute reload bits, which ask for the whole path. */
-constexpr int FULL_FRAME_BITS = M_INIT | M_LINDENOISE | M_HDR;
-
-/*
- * Fail fast on a contract violation.
- *
- * The assert documents the invariant in debug builds; the abort makes the
- * contract hold in release builds too, where NDEBUG removes the assert. An
- * unmapped bit is a mapping gap and a combined M_MINUPDATE is a producer bug;
- * both would otherwise degrade silently to ParamsOnly.
- */
-[[noreturn]] void failContract(const char* message)
-{
-    assert(false && message);
-    (void)message;
-    std::abort();
-}
-
 uint64_t hashCombine(uint64_t hash, uint64_t value)
 {
     /*
@@ -124,309 +78,317 @@ uint64_t hashCombine(uint64_t hash, uint64_t value)
     return hash;
 }
 
-uint64_t identityOf(const EditorRequest& request)
-{
-    uint64_t hash = 14695981039346656037ULL;
-
-    hash = hashCombine(hash, static_cast<uint64_t>(request.kind));
-    hash = hashCombine(
-        hash, static_cast<uint64_t>(request.dirtySource));
-    hash = hashCombine(hash, request.controlOnly ? 1 : 0);
-    hash = hashCombine(hash, request.spotPending ? 1 : 0);
-    hash = hashCombine(hash, request.viewportMoved ? 1 : 0);
-    hash = hashCombine(hash, request.highDetailIntent ? 1 : 0);
-    hash = hashCombine(hash, request.fullFrameIntent ? 1 : 0);
-    /*
-     * The mask-shaped facts are planning inputs, so they belong to the
-     * identity even though the raw mask does not. Two masks that plan
-     * differently must never share an identity.
-     */
-    hash = hashCombine(hash, request.fullFrameAdmission ? 1 : 0);
-    hash = hashCombine(hash, request.colorHlrWbRequest ? 1 : 0);
-    hash = hashCombine(hash, request.monitorOutputRequest ? 1 : 0);
-    hash = hashCombine(hash, request.imperativeRepaint ? 1 : 0);
-    hash = hashCombine(hash, request.transformFamilyIntent ? 1 : 0);
-    hash = hashCombine(hash, request.hdrIntent ? 1 : 0);
-    hash = hashCombine(hash, request.rgbProcIntent ? 1 : 0);
-    hash = hashCombine(hash, request.labChainIntent ? 1 : 0);
-    hash = hashCombine(hash, request.autoExposureIntent ? 1 : 0);
-    hash = hashCombine(hash, request.localAdjustmentsIntent ? 1 : 0);
-    hash = hashCombine(hash, request.baseChainIntent ? 1 : 0);
-    hash = hashCombine(hash, request.cropIntent ? 1 : 0);
-    hash = hashCombine(hash, request.controlBitRequest ? 1 : 0);
-    hash = hashCombine(hash, request.repaintRequest ? 1 : 0);
-    hash = hashCombine(hash, request.lumaCurveIntent ? 1 : 0);
-    hash = hashCombine(hash, request.labPixelIntent ? 1 : 0);
-    hash = hashCombine(hash, request.transformRequest ? 1 : 0);
-    hash = hashCombine(hash, request.dirty.valid ? 1 : 0);
-    hash = hashCombine(hash, request.dirty.forced ? 1 : 0);
-
-    /*
-     * `ids` is a std::set, so the iteration order is stable and the identity
-     * does not depend on the order the producer named the blocks.
-     */
-    for (const std::string& id : request.dirty.ids) {
-        hash = hashCombine(hash, std::hash<std::string>{}(id));
-    }
-
-    return hash;
-}
-
-/* The mask alone admits the full-frame path. */
-bool fullFrameAdmissionFor(int mask)
-{
-    return (mask & ALL) == ALL || (mask & M_MONITOR) != 0;
-}
-
-/* The pass carries a white-balance request. */
-bool colorHlrWbRequestFor(int mask)
-{
-    return (mask & M_WB) != 0;
-}
+/*
+ * The pipeline families one intent names.
+ *
+ * These are the named families of the retired request mask, kept as plain
+ * booleans because they are the vocabulary of the intent table. They are not
+ * a bitfield: nothing packs, masks or compares them, and the request the
+ * caller receives carries the derived facts, never this struct.
+ */
+struct RequestFamilies {
+    bool control = false;
+    bool repaintOnly = false;
+    bool highQuality = false;
+    bool whiteBalance = false;
+    bool spot = false;
+    bool captureSharpen = false;
+    bool monitor = false;
+    bool retinex = false;
+    bool crop = false;
+    bool preprocess = false;
+    bool raw = false;
+    bool init = false;
+    bool lineDenoise = false;
+    bool hdr = false;
+    bool transform = false;
+    bool blurmap = false;
+    bool autoExposure = false;
+    bool rgbCurve = false;
+    bool lumaCurve = false;
+    bool luminance = false;
+    bool color = false;
+};
 
 /*
- * The legacy monitor render gate: every request except a bare crop or a bare
- * repaint renders monitor.output, and M_MONITOR always does.
+ * The family set of one intent. The rows are the intent definitions, not a
+ * mask table: each row names the operations the tool or static event asks
+ * for.
  */
-bool monitorOutputRequestFor(int mask)
+RequestFamilies familiesFor(RequestIntent intent)
 {
-    return (mask != CROP && mask != MINUPDATE) || (mask & M_MONITOR) != 0;
-}
+    RequestFamilies f;
 
-/* The mask exactly in its imperative-repaint form. */
-bool imperativeRepaintFor(int mask)
-{
-    return mask == M_MINUPDATE;
-}
-
-/*
- * Kind the request bits imply, in the precedence the coordinator used before
- * the typed request. Deliberately total and non-aborting: the coordinator's
- * debug cross-check evaluates widened masks that the adapter would reject.
- */
-EditorRequest::RequestKind kindForLegacyMask(int mask)
-{
-    if (mask == M_MINUPDATE) {
-        return EditorRequest::RequestKind::RepaintOnly;
-    }
-    if ((mask & M_HIGHQUAL) != 0) {
-        return EditorRequest::RequestKind::HighQuality;
-    }
-    if ((mask & FULL_FRAME_BITS) != 0) {
-        return EditorRequest::RequestKind::FullPreview;
-    }
-    return EditorRequest::RequestKind::ParamsOnly;
-}
-
-} // namespace
-
-void EditorRequest::setLegacyGateMask(int mask)
-{
-    legacyGateMask = mask;
-    fullFrameAdmission = fullFrameAdmissionFor(mask);
-    colorHlrWbRequest = colorHlrWbRequestFor(mask);
-    monitorOutputRequest = monitorOutputRequestFor(mask);
-    monitorIntent = (mask & M_MONITOR) != 0;
-    rawIntent = (mask & M_RAW) != 0;
-    captureSharpenIntent = (mask & M_CSHARP) != 0;
-    imperativeRepaint = imperativeRepaintFor(mask);
-    transformFamilyIntent =
-        (mask & (M_HDR | M_TRANSFORM | M_RGBCURVE | M_INIT | M_LINDENOISE)) != 0;
-    hdrIntent = (mask & M_HDR) != 0;
-    rgbProcIntent = (mask & M_RGBCURVE) != 0;
-    labChainIntent = (mask & (M_LUMINANCE | M_COLOR | M_AUTOEXP)) != 0;
-    autoExposureIntent = (mask & M_AUTOEXP) != 0;
-    localAdjustmentsIntent =
-        (mask & (M_AUTOEXP | M_RGBCURVE | M_CROP)) != 0;
-    baseChainIntent = (mask & BASE_CHAIN_BITS) != 0;
-    cropIntent = (mask & M_CROP) != 0;
-    controlBitRequest = (mask & M_VOID) != 0;
-    repaintRequest = (mask & M_MINUPDATE) != 0;
-    lumaCurveIntent = (mask & M_LUMACURVE) != 0;
-    labPixelIntent = (mask & (M_LUMINANCE | M_COLOR)) != 0;
-    luminanceIntent = (mask & M_LUMINANCE) != 0;
-    colorIntent = (mask & M_COLOR) != 0;
-    transformRequest = (mask & M_TRANSFORM) != 0;
-}
-
-uint64_t EditorRequest::identity() const
-{
-    return identityOf(*this);
-}
-
-void EditorRequest::refreshFromLegacyMask()
-{
-    present = legacyGateMask != 0;
-    controlOnly = (legacyGateMask & ~M_VOID) == 0;
-    spotPending = (legacyGateMask & M_SPOT) != 0;
-    highDetailIntent = (legacyGateMask & M_HIGHQUAL) != 0;
-    fullFrameIntent = (legacyGateMask & FULL_FRAME_BITS) != 0;
-    setLegacyGateMask(legacyGateMask);
-    kind = kindForLegacyMask(legacyGateMask);
-}
-
-void EditorRequest::markCropTransform()
-{
-    setLegacyGateMask(legacyGateMask | TRANSFORM);
-    refreshFromLegacyMask();
-}
-
-void EditorRequest::markViewportMoved()
-{
-    /*
-     * The panning requeue widened the payload without refreshing the kind:
-     * the caller patches RepaintOnly to ParamsOnly itself. Keep that shape.
-     */
-    setLegacyGateMask(legacyGateMask | M_MONITOR);
-    viewportMoved = true;
-}
-
-void EditorRequest::markBaseRefresh(bool spotChanged)
-{
-    setLegacyGateMask(legacyGateMask | M_INIT | M_HDR | M_MONITOR
-                      | (spotChanged ? M_SPOT : 0));
-    refreshFromLegacyMask();
-}
-
-void EditorRequest::markColorHlrDemosaic()
-{
-    setLegacyGateMask(legacyGateMask | DEMOSAIC);
-    refreshFromLegacyMask();
-}
-
-void EditorRequest::markDemosaicRebuilt()
-{
-    setLegacyGateMask(legacyGateMask | M_INIT | M_CSHARP);
-    refreshFromLegacyMask();
-}
-
-void EditorRequest::markLabPixels(bool luminance, bool color)
-{
-    /*
-     * Only the Lab pixel facts change, and the caller asserts that the
-     * planning fields still agree; do not re-derive the kind, because a bare
-     * repaint keeps its RepaintOnly classification on the fast path.
-     */
-    setLegacyGateMask(legacyGateMask | (luminance ? M_LUMINANCE : 0)
-                      | (color ? M_COLOR : 0));
-}
-
-void EditorRequest::absorbDeferredExecution(const stage::DirtyBlocks& blocks)
-{
-    /*
-     * The deferred record carries typed stage ids; materialise the payload
-     * once, here, exactly as the deferred flush did before the retirement.
-     */
-    setLegacyGateMask(
-        legacyGateMask | deferredExecutionPayload(deferredStageBits(blocks)));
-}
-
-bool planningAgreesWithLegacyMask(const EditorRequest& request)
-{
-    return request.kind == kindForLegacyMask(request.legacyGateMask)
-        && request.controlOnly == ((request.legacyGateMask & ~M_VOID) == 0)
-        && request.spotPending
-            == ((request.legacyGateMask & M_SPOT) != 0)
-        && request.highDetailIntent
-            == ((request.legacyGateMask & M_HIGHQUAL) != 0)
-        && request.fullFrameIntent
-            == ((request.legacyGateMask & FULL_FRAME_BITS) != 0)
-        && request.fullFrameAdmission
-            == fullFrameAdmissionFor(request.legacyGateMask)
-        && request.colorHlrWbRequest
-            == colorHlrWbRequestFor(request.legacyGateMask)
-        && request.monitorOutputRequest
-            == monitorOutputRequestFor(request.legacyGateMask)
-        && request.monitorIntent
-            == ((request.legacyGateMask & M_MONITOR) != 0)
-        && request.rawIntent
-            == ((request.legacyGateMask & M_RAW) != 0)
-        && request.captureSharpenIntent
-            == ((request.legacyGateMask & M_CSHARP) != 0)
-        && request.imperativeRepaint
-            == imperativeRepaintFor(request.legacyGateMask)
-        && request.transformFamilyIntent
-            == ((request.legacyGateMask
-                 & (M_HDR | M_TRANSFORM | M_RGBCURVE | M_INIT
-                    | M_LINDENOISE))
-                != 0)
-        && request.hdrIntent
-            == ((request.legacyGateMask & M_HDR) != 0)
-        && request.rgbProcIntent
-            == ((request.legacyGateMask & M_RGBCURVE) != 0)
-        && request.labChainIntent
-            == ((request.legacyGateMask & (M_LUMINANCE | M_COLOR | M_AUTOEXP))
-                != 0)
-        && request.autoExposureIntent
-            == ((request.legacyGateMask & M_AUTOEXP) != 0)
-        && request.localAdjustmentsIntent
-            == ((request.legacyGateMask
-                 & (M_AUTOEXP | M_RGBCURVE | M_CROP))
-                != 0)
-        && request.baseChainIntent
-            == ((request.legacyGateMask & BASE_CHAIN_BITS) != 0)
-        && request.cropIntent
-            == ((request.legacyGateMask & M_CROP) != 0)
-        && request.repaintRequest
-            == ((request.legacyGateMask & M_MINUPDATE) != 0)
-        && request.controlBitRequest
-            == ((request.legacyGateMask & M_VOID) != 0)
-        && request.lumaCurveIntent
-            == ((request.legacyGateMask & M_LUMACURVE) != 0)
-        && request.labPixelIntent
-            == ((request.legacyGateMask & (M_LUMINANCE | M_COLOR)) != 0)
-        && request.luminanceIntent
-            == ((request.legacyGateMask & M_LUMINANCE) != 0)
-        && request.colorIntent
-            == ((request.legacyGateMask & M_COLOR) != 0)
-        && request.transformRequest
-            == ((request.legacyGateMask & M_TRANSFORM) != 0);
-}
-
-EditorRequest from_legacy_mask(int mask, const LegacyMaskContext& context)
-{
-    assert(mask >= 0);
-
-    const int unknown = mask & ~MAPPED_BITS;
-
-    if (unknown != 0) {
-        failContract("unknown bit in a legacy editor mask");
+    switch (intent) {
+    case RequestIntent::AllNoRaw:
+        f.spot = true;
+        f.init = true;
+        f.lineDenoise = true;
+        f.hdr = true;
+        f.transform = true;
+        f.blurmap = true;
+        f.autoExposure = true;
+        f.rgbCurve = true;
+        f.lumaCurve = true;
+        f.luminance = true;
+        f.color = true;
+        break;
+    case RequestIntent::Demosaic:
+        f.spot = true;
+        f.raw = true;
+        f.init = true;
+        f.lineDenoise = true;
+        f.hdr = true;
+        f.transform = true;
+        f.blurmap = true;
+        f.autoExposure = true;
+        f.rgbCurve = true;
+        f.lumaCurve = true;
+        f.luminance = true;
+        f.color = true;
+        break;
+    case RequestIntent::Hdr:
+        f.spot = true;
+        f.lineDenoise = true;
+        f.hdr = true;
+        f.transform = true;
+        f.blurmap = true;
+        f.autoExposure = true;
+        f.rgbCurve = true;
+        f.lumaCurve = true;
+        f.luminance = true;
+        f.color = true;
+        break;
+    case RequestIntent::SpotAdjust:
+        f.spot = true;
+        f.hdr = true;
+        f.blurmap = true;
+        f.autoExposure = true;
+        f.rgbCurve = true;
+        f.lumaCurve = true;
+        f.luminance = true;
+        f.color = true;
+        break;
+    case RequestIntent::Transform:
+        f.spot = true;
+        f.hdr = true;
+        f.transform = true;
+        f.blurmap = true;
+        f.autoExposure = true;
+        f.rgbCurve = true;
+        f.lumaCurve = true;
+        f.luminance = true;
+        f.color = true;
+        break;
+    case RequestIntent::WhiteBalance:
+        f.whiteBalance = true;
+        f.spot = true;
+        f.init = true;
+        f.lineDenoise = true;
+        f.hdr = true;
+        f.transform = true;
+        f.blurmap = true;
+        f.autoExposure = true;
+        f.rgbCurve = true;
+        f.lumaCurve = true;
+        f.luminance = true;
+        f.color = true;
+        break;
+    case RequestIntent::RepaintOnly:
+        f.repaintOnly = true;
+        break;
+    case RequestIntent::ControlOnly:
+        f.control = true;
+        break;
+    case RequestIntent::Compr:
+        f.spot = true;
+        f.init = true;
+        f.lineDenoise = true;
+        f.hdr = true;
+        f.transform = true;
+        f.blurmap = true;
+        f.autoExposure = true;
+        f.rgbCurve = true;
+        f.lumaCurve = true;
+        f.luminance = true;
+        f.color = true;
+        f.monitor = true;
+        break;
+    case RequestIntent::CaptureSharpen:
+        f.spot = true;
+        f.captureSharpen = true;
+        f.init = true;
+        f.lineDenoise = true;
+        f.hdr = true;
+        f.transform = true;
+        f.blurmap = true;
+        f.autoExposure = true;
+        f.rgbCurve = true;
+        f.lumaCurve = true;
+        f.luminance = true;
+        f.color = true;
+        break;
+    case RequestIntent::DarkFrame:
+    case RequestIntent::First:
+        f.spot = true;
+        f.preprocess = true;
+        f.raw = true;
+        f.init = true;
+        f.lineDenoise = true;
+        f.hdr = true;
+        f.transform = true;
+        f.blurmap = true;
+        f.autoExposure = true;
+        f.rgbCurve = true;
+        f.lumaCurve = true;
+        f.luminance = true;
+        f.color = true;
+        f.monitor = intent == RequestIntent::First;
+        break;
+    case RequestIntent::AutoExposure:
+        f.spot = true;
+        f.hdr = true;
+        f.autoExposure = true;
+        f.rgbCurve = true;
+        f.lumaCurve = true;
+        f.luminance = true;
+        f.color = true;
+        break;
+    case RequestIntent::LuminanceCurve:
+        f.lumaCurve = true;
+        f.luminance = true;
+        f.color = true;
+        break;
+    case RequestIntent::DirPyrEqualizer:
+    case RequestIntent::Sharpening:
+        f.luminance = true;
+        f.color = true;
+        break;
+    case RequestIntent::RgbCurve:
+        f.rgbCurve = true;
+        f.lumaCurve = true;
+        f.luminance = true;
+        f.color = true;
+        break;
+    case RequestIntent::Retinex:
+        f.spot = true;
+        f.retinex = true;
+        f.init = true;
+        f.lineDenoise = true;
+        f.hdr = true;
+        f.transform = true;
+        f.blurmap = true;
+        f.autoExposure = true;
+        f.rgbCurve = true;
+        f.lumaCurve = true;
+        f.luminance = true;
+        f.color = true;
+        break;
+    case RequestIntent::Crop:
+        f.crop = true;
+        break;
+    case RequestIntent::Monitor:
+        f.monitor = true;
+        break;
+    case RequestIntent::NoRequest:
+        break;
+    case RequestIntent::HighQuality:
+        f.highQuality = true;
+        break;
     }
 
-    const bool repaint = (mask & M_MINUPDATE) != 0;
+    return f;
+}
 
-    /*
-     * refreshmap.h declares that M_MINUPDATE must not be combined with any
-     * other event. The old code only recognised it when the whole mask was
-     * exactly M_MINUPDATE; treat any other combination as a contract
-     * violation instead of silently planning a parameter update.
-     */
-    if (repaint && mask != M_MINUPDATE) {
-        failContract("M_MINUPDATE must be used alone");
-    }
+/* Whether the family set names every base family. */
+bool namesEveryFamily(const RequestFamilies& f)
+{
+    return f.preprocess && f.raw && f.init && f.spot && f.lineDenoise
+        && f.hdr && f.transform && f.blurmap && f.autoExposure
+        && f.rgbCurve && f.lumaCurve && f.luminance && f.color;
+}
 
+/* Whether the family set names anything outside the control operation. */
+bool namesRenderWork(const RequestFamilies& f)
+{
+    return f.repaintOnly || f.highQuality || f.whiteBalance || f.spot
+        || f.captureSharpen || f.monitor || f.retinex || f.crop
+        || f.preprocess || f.raw || f.init || f.lineDenoise || f.hdr
+        || f.transform || f.blurmap || f.autoExposure || f.rgbCurve
+        || f.lumaCurve || f.luminance || f.color;
+}
+
+/* Build the typed request of one family set. */
+EditorRequest requestFromFamilies(const RequestFamilies& f)
+{
     EditorRequest request;
 
-    request.present = mask != 0;
-    request.setLegacyGateMask(mask);
-    request.controlOnly = (mask & ~M_VOID) == 0;
-    request.viewportMoved = context.viewportMoved;
-    request.spotPending = (mask & M_SPOT) != 0;
-    request.highDetailIntent = (mask & M_HIGHQUAL) != 0;
-    request.fullFrameIntent = (mask & FULL_FRAME_BITS) != 0;
-    request.dirtySource = EditorRequest::DirtySource::DeriveFromParameters;
+    request.present = f.control || namesRenderWork(f);
+    request.controlOnly = !namesRenderWork(f);
+    request.controlBitRequest = f.control;
+    request.repaintRequest = f.repaintOnly;
+    request.spotPending = f.spot;
+    request.highDetailIntent = f.highQuality;
+    request.fullFrameIntent = f.init || f.lineDenoise || f.hdr;
+    request.fullFrameAdmission = namesEveryFamily(f) || f.monitor;
+    request.colorHlrWbRequest = f.whiteBalance;
+    request.monitorIntent = f.monitor;
+    request.rawIntent = f.raw;
+    request.captureSharpenIntent = f.captureSharpen;
+    request.transformFamilyIntent =
+        f.hdr || f.transform || f.rgbCurve || f.init || f.lineDenoise;
+    request.hdrIntent = f.hdr;
+    request.rgbProcIntent = f.rgbCurve;
+    request.labChainIntent = f.luminance || f.color || f.autoExposure;
+    request.autoExposureIntent = f.autoExposure;
+    request.localAdjustmentsIntent =
+        f.autoExposure || f.rgbCurve || f.crop;
+    request.baseChainIntent = f.preprocess || f.raw || f.whiteBalance
+        || f.init || f.lineDenoise || f.monitor || f.transform
+        || f.captureSharpen || f.retinex || f.blurmap;
+    request.cropIntent = f.crop;
+    request.lumaCurveIntent = f.lumaCurve;
+    request.labPixelIntent = f.luminance || f.color;
+    request.luminanceIntent = f.luminance;
+    request.colorIntent = f.color;
+    request.transformRequest = f.transform;
 
     /*
-     * Kind precedence is the one the coordinator used to derive from the
-     * coalesced mask, kept here so the mask is interpreted in exactly one
-     * place.
+     * The intent table only ever sets repaintOnly for a bare repaint, so the
+     * imperative flag follows it directly.
      */
-    request.kind = kindForLegacyMask(mask);
+    request.imperativeRepaint = f.repaintOnly;
+
+    if (request.imperativeRepaint) {
+        request.kind = EditorRequest::RequestKind::RepaintOnly;
+    } else if (request.highDetailIntent) {
+        request.kind = EditorRequest::RequestKind::HighQuality;
+    } else if (request.fullFrameIntent) {
+        request.kind = EditorRequest::RequestKind::FullPreview;
+    } else {
+        request.kind = EditorRequest::RequestKind::ParamsOnly;
+    }
+
+    request.monitorOutputRequest = !request.suppressesMonitorOutput();
 
     return request;
 }
 
-EditorRequest coalesce(const EditorRequest& first, const EditorRequest& second)
+/*
+ * Merge two typed requests.
+ *
+ * The union keeps every input fact. The derived facts that are not monotone
+ * are recomputed from the union, exactly as the retired derivation recomputed
+ * them from the union of two masks:
+ *
+ * - a bare repaint survives only when both inputs were bare repaints;
+ * - a crop-only or repaint-only shape suppresses monitor.output, so two
+ *   suppressing inputs produce a rendering union;
+ * - the kind follows HighQuality, then the full-frame intent, then a surviving
+ *   bare repaint.
+ */
+EditorRequest mergeRequests(const EditorRequest& first,
+                            const EditorRequest& second)
 {
     if (!first.present) {
         return second;
@@ -438,14 +400,23 @@ EditorRequest coalesce(const EditorRequest& first, const EditorRequest& second)
     EditorRequest merged;
 
     merged.present = true;
-    merged.setLegacyGateMask(
-        first.legacyGateMask | second.legacyGateMask);
     merged.controlOnly = first.controlOnly && second.controlOnly;
+    merged.controlBitRequest =
+        first.controlBitRequest || second.controlBitRequest;
+    merged.repaintRequest = first.repaintRequest || second.repaintRequest;
     merged.spotPending = first.spotPending || second.spotPending;
     merged.viewportMoved = first.viewportMoved || second.viewportMoved;
     merged.highDetailIntent =
         first.highDetailIntent || second.highDetailIntent;
     merged.fullFrameIntent = first.fullFrameIntent || second.fullFrameIntent;
+    merged.fullFrameAdmission =
+        first.fullFrameAdmission || second.fullFrameAdmission;
+    merged.colorHlrWbRequest =
+        first.colorHlrWbRequest || second.colorHlrWbRequest;
+    merged.monitorIntent = first.monitorIntent || second.monitorIntent;
+    merged.rawIntent = first.rawIntent || second.rawIntent;
+    merged.captureSharpenIntent =
+        first.captureSharpenIntent || second.captureSharpenIntent;
     merged.transformFamilyIntent =
         first.transformFamilyIntent || second.transformFamilyIntent;
     merged.hdrIntent = first.hdrIntent || second.hdrIntent;
@@ -455,24 +426,28 @@ EditorRequest coalesce(const EditorRequest& first, const EditorRequest& second)
         first.autoExposureIntent || second.autoExposureIntent;
     merged.localAdjustmentsIntent =
         first.localAdjustmentsIntent || second.localAdjustmentsIntent;
+    merged.baseChainIntent = first.baseChainIntent || second.baseChainIntent;
+    merged.cropIntent = first.cropIntent || second.cropIntent;
+    merged.lumaCurveIntent = first.lumaCurveIntent || second.lumaCurveIntent;
+    merged.labPixelIntent = first.labPixelIntent || second.labPixelIntent;
+    merged.luminanceIntent = first.luminanceIntent || second.luminanceIntent;
+    merged.colorIntent = first.colorIntent || second.colorIntent;
+    merged.transformRequest = first.transformRequest || second.transformRequest;
 
-    /*
-     * Reproduce the old derivation over the ORed mask. A bare repaint stays a
-     * repaint only when every contributing request is a bare repaint; any
-     * other request (including a control-only M_VOID) makes the combination a
-     * parameter update.
-     */
-    if (merged.highDetailIntent) {
+    merged.imperativeRepaint =
+        first.imperativeRepaint && second.imperativeRepaint;
+
+    if (merged.imperativeRepaint) {
+        merged.kind = EditorRequest::RequestKind::RepaintOnly;
+    } else if (merged.highDetailIntent) {
         merged.kind = EditorRequest::RequestKind::HighQuality;
     } else if (merged.fullFrameIntent) {
         merged.kind = EditorRequest::RequestKind::FullPreview;
-    } else if (!merged.controlOnly
-               && first.kind == EditorRequest::RequestKind::RepaintOnly
-               && second.kind == EditorRequest::RequestKind::RepaintOnly) {
-        merged.kind = EditorRequest::RequestKind::RepaintOnly;
     } else {
         merged.kind = EditorRequest::RequestKind::ParamsOnly;
     }
+
+    merged.monitorOutputRequest = !merged.suppressesMonitorOutput();
 
     const bool firstProvided =
         first.dirtySource == EditorRequest::DirtySource::ProducerProvided;
@@ -493,54 +468,203 @@ EditorRequest coalesce(const EditorRequest& first, const EditorRequest& second)
     return merged;
 }
 
-int compatibility_mask(RequestIntent intent)
+uint64_t identityOf(const EditorRequest& request)
 {
-    switch (intent) {
-    case RequestIntent::AllNoRaw:
-        return ALLNORAW;
-    case RequestIntent::Demosaic:
-        return DEMOSAIC;
-    case RequestIntent::Hdr:
-        return HDR;
-    case RequestIntent::SpotAdjust:
-        return SPOTADJUST;
-    case RequestIntent::Transform:
-        return TRANSFORM;
-    case RequestIntent::WhiteBalance:
-        return WB;
-    case RequestIntent::RepaintOnly:
-        return M_MINUPDATE;
-    case RequestIntent::ControlOnly:
-        return M_VOID;
-    case RequestIntent::Compr:
-        return COMPR;
-    case RequestIntent::CaptureSharpen:
-        return CAPTURESHARPEN;
-    case RequestIntent::DarkFrame:
-        return DARKFRAME;
-    case RequestIntent::First:
-        return FIRST;
-    case RequestIntent::AutoExposure:
-        return AUTOEXP;
-    case RequestIntent::LuminanceCurve:
-        return LUMINANCECURVE;
-    case RequestIntent::DirPyrEqualizer:
-        return DIRPYREQUALIZER;
-    case RequestIntent::RgbCurve:
-        return RGBCURVE;
-    case RequestIntent::Sharpening:
-        return SHARPENING;
+    uint64_t hash = 14695981039346656037ULL;
+
+    hash = hashCombine(hash, static_cast<uint64_t>(request.kind));
+    hash = hashCombine(hash, static_cast<uint64_t>(request.dirtySource));
+    hash = hashCombine(hash, request.present ? 1 : 0);
+    hash = hashCombine(hash, request.controlOnly ? 1 : 0);
+    hash = hashCombine(hash, request.spotPending ? 1 : 0);
+    hash = hashCombine(hash, request.viewportMoved ? 1 : 0);
+    hash = hashCombine(hash, request.highDetailIntent ? 1 : 0);
+    hash = hashCombine(hash, request.fullFrameIntent ? 1 : 0);
+    hash = hashCombine(hash, request.fullFrameAdmission ? 1 : 0);
+    hash = hashCombine(hash, request.colorHlrWbRequest ? 1 : 0);
+    hash = hashCombine(hash, request.monitorOutputRequest ? 1 : 0);
+    hash = hashCombine(hash, request.monitorIntent ? 1 : 0);
+    hash = hashCombine(hash, request.rawIntent ? 1 : 0);
+    hash = hashCombine(hash, request.captureSharpenIntent ? 1 : 0);
+    hash = hashCombine(hash, request.imperativeRepaint ? 1 : 0);
+    hash = hashCombine(hash, request.transformFamilyIntent ? 1 : 0);
+    hash = hashCombine(hash, request.hdrIntent ? 1 : 0);
+    hash = hashCombine(hash, request.rgbProcIntent ? 1 : 0);
+    hash = hashCombine(hash, request.labChainIntent ? 1 : 0);
+    hash = hashCombine(hash, request.autoExposureIntent ? 1 : 0);
+    hash = hashCombine(hash, request.localAdjustmentsIntent ? 1 : 0);
+    hash = hashCombine(hash, request.baseChainIntent ? 1 : 0);
+    hash = hashCombine(hash, request.cropIntent ? 1 : 0);
+    hash = hashCombine(hash, request.controlBitRequest ? 1 : 0);
+    hash = hashCombine(hash, request.repaintRequest ? 1 : 0);
+    hash = hashCombine(hash, request.lumaCurveIntent ? 1 : 0);
+    hash = hashCombine(hash, request.labPixelIntent ? 1 : 0);
+    hash = hashCombine(hash, request.luminanceIntent ? 1 : 0);
+    hash = hashCombine(hash, request.colorIntent ? 1 : 0);
+    hash = hashCombine(hash, request.transformRequest ? 1 : 0);
+    hash = hashCombine(hash, request.dirty.valid ? 1 : 0);
+    hash = hashCombine(hash, request.dirty.forced ? 1 : 0);
+
+    /*
+     * `ids` is a std::set, so the iteration order is stable and the identity
+     * does not depend on the order the producer named the blocks.
+     */
+    for (const std::string& id : request.dirty.ids) {
+        hash = hashCombine(hash, std::hash<std::string>{}(id));
     }
 
-    assert(false && "unknown request intent");
-    std::abort();
+    return hash;
+}
+
+} // namespace
+
+uint64_t EditorRequest::identity() const
+{
+    return identityOf(*this);
+}
+
+bool EditorRequest::suppressesMonitorOutput() const
+{
+    /*
+     * A request suppresses monitor.output only when it is exactly a crop
+     * repaint or exactly a bare repaint. `localAdjustmentsIntent` is true for
+     * a crop request, so it is not part of the "work outside the shape" test.
+     */
+    const bool otherWork = spotPending || highDetailIntent || fullFrameIntent
+        || colorHlrWbRequest || monitorIntent || rawIntent
+        || captureSharpenIntent || transformFamilyIntent || hdrIntent
+        || rgbProcIntent || labChainIntent || autoExposureIntent
+        || baseChainIntent || controlBitRequest || lumaCurveIntent
+        || labPixelIntent || transformRequest || viewportMoved
+        || fullFrameAdmission;
+
+    if (cropIntent && !repaintRequest && !otherWork) {
+        return true;
+    }
+    if (repaintRequest && !cropIntent && !otherWork) {
+        return true;
+    }
+
+    return false;
+}
+
+void EditorRequest::markCropTransform()
+{
+    *this = mergeRequests(*this, make_request(RequestIntent::Transform));
+}
+
+void EditorRequest::markViewportMoved()
+{
+    /*
+     * The panning requeue widened the payload without refreshing the kind:
+     * the caller patches RepaintOnly to ParamsOnly itself. Keep that shape:
+     * only the display facts and the imperative flag change.
+     */
+    monitorIntent = true;
+    monitorOutputRequest = true;
+    fullFrameAdmission = true;
+    baseChainIntent = true;
+    imperativeRepaint = false;
+    viewportMoved = true;
+}
+
+void EditorRequest::markBaseRefresh(bool spotChanged)
+{
+    RequestFamilies f;
+    f.init = true;
+    f.hdr = true;
+    f.monitor = true;
+    f.spot = spotChanged;
+
+    *this = mergeRequests(*this, requestFromFamilies(f));
+}
+
+void EditorRequest::markColorHlrDemosaic()
+{
+    *this = mergeRequests(*this, make_request(RequestIntent::Demosaic));
+}
+
+void EditorRequest::markDemosaicRebuilt()
+{
+    RequestFamilies f;
+    f.init = true;
+    f.captureSharpen = true;
+
+    *this = mergeRequests(*this, requestFromFamilies(f));
+}
+
+void EditorRequest::markLabPixels(bool luminance, bool color)
+{
+    /*
+     * Only the Lab pixel facts change, and the caller asserts that the
+     * planning fields still agree; do not re-derive the kind, because a bare
+     * repaint keeps its RepaintOnly classification on the fast path.
+     */
+    luminanceIntent = luminanceIntent || luminance;
+    colorIntent = colorIntent || color;
+    labPixelIntent = luminanceIntent || colorIntent;
+}
+
+void EditorRequest::absorbDeferredExecution(const stage::DirtyBlocks& blocks)
+{
+    /*
+     * The deferred record carries typed stage ids. Apply the same facts the
+     * old execution payload implied, without re-deriving the kind: the caller
+     * patches a repaint to ParamsOnly and asserts that it is no longer
+     * imperative.
+     */
+    bool monitorStage = false;
+    bool rgbStage = false;
+    bool labStage = false;
+    bool localStage = false;
+
+    for (const std::string& id : blocks.ids) {
+        if (id == "monitor.output") {
+            monitorStage = true;
+        } else if (id == "rgb.proc") {
+            rgbStage = true;
+        } else if (id == "lab.tools" || id == "lab.wavelet"
+                   || id == "working.trc" || id == "ciecam"
+                   || id == "gamut") {
+            labStage = true;
+        } else if (id == "local.adjustments") {
+            localStage = true;
+        }
+    }
+
+    if (monitorStage) {
+        monitorIntent = true;
+        monitorOutputRequest = true;
+        fullFrameAdmission = true;
+        baseChainIntent = true;
+    }
+    if (rgbStage) {
+        rgbProcIntent = true;
+        transformFamilyIntent = true;
+        localAdjustmentsIntent = true;
+    }
+    if (labStage) {
+        lumaCurveIntent = true;
+        labChainIntent = true;
+        labPixelIntent = true;
+        luminanceIntent = true;
+        colorIntent = true;
+    }
+    if (localStage) {
+        autoExposureIntent = true;
+        labChainIntent = true;
+        localAdjustmentsIntent = true;
+    }
+
+    imperativeRepaint = false;
+    monitorOutputRequest = !suppressesMonitorOutput();
 }
 
 EditorRequest make_request(RequestIntent intent,
                            std::initializer_list<const char*> blocks,
                            stage::StagePath path)
 {
-    EditorRequest request = from_legacy_mask(compatibility_mask(intent));
+    EditorRequest request = requestFromFamilies(familiesFor(intent));
 
     if (blocks.size() == 0) {
         return request;
@@ -584,8 +708,7 @@ EditorRequest make_request(RequestIntent intent)
 std::string producerEventKey(const EditorRequest& request,
                              const std::string& historyMsg)
 {
-    return "typed-" + std::to_string(request.identity()) + "-"
-        + std::to_string(request.legacyGateMask) + historyMsg;
+    return "typed-" + std::to_string(request.identity()) + "-" + historyMsg;
 }
 
 stage::RequestKind crop_request_kind(EditorRequest::RequestKind previewKind,
@@ -629,7 +752,7 @@ ViewportEligibility viewportEligibility(const EditorRequest& request)
     /*
      * The base chain and the accurate path need the full-frame rebuild, and
      * they take precedence over the unsupported classification so the reason
-     * stays the one the mask-based gate reported.
+     * stays stable.
      */
     if (request.baseChainIntent || request.highDetailIntent) {
         return ViewportEligibility::Base;
@@ -654,10 +777,7 @@ ViewportEligibility viewportEligibility(const EditorRequest& request)
         }
     }
 
-    /*
-     * A control-only request (`M_VOID`) updates parameters without rendering;
-     * the fast path has nothing to render for it.
-     */
+    /* A control-only request updates parameters without rendering. */
     if (request.controlBitRequest) {
         return ViewportEligibility::Unsupported;
     }
@@ -898,56 +1018,9 @@ void resolveCropDependencies(ViewportCropSelection& selection)
     }
 }
 
-int viewportCropTodo(const ViewportCropSelection& selection)
+EditorRequest coalesce(const EditorRequest& first, const EditorRequest& second)
 {
-    int payload = 0;
-
-    if (selection.crop) {
-        payload |= M_CROP;
-    }
-    if (selection.repaint) {
-        payload |= M_MINUPDATE;
-    }
-    if (selection.autoExposure) {
-        payload |= M_AUTOEXP;
-    }
-    if (selection.transform) {
-        payload |= M_TRANSFORM;
-    }
-    if (selection.rgbProc) {
-        payload |= M_RGBCURVE;
-    }
-    if (selection.lumaCurve) {
-        payload |= M_LUMACURVE;
-    }
-    if (selection.luminance) {
-        payload |= M_LUMINANCE;
-    }
-    if (selection.color) {
-        payload |= M_COLOR;
-    }
-
-    return payload;
-}
-
-int viewportCropPayload(int requestMask,
-                        const ViewportCropSelection& selection)
-{
-    /*
-     * The crop bodies read the execution payload, not the request. The only
-     * addition the fast path makes is the Lab pixel pair its dependency
-     * resolution implied; every other bit is the request's own payload.
-     */
-    int payload = requestMask;
-
-    if (selection.luminance) {
-        payload |= M_LUMINANCE;
-    }
-    if (selection.color) {
-        payload |= M_COLOR;
-    }
-
-    return payload;
+    return mergeRequests(first, second);
 }
 
 } // namespace rtengine

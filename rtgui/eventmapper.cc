@@ -37,27 +37,6 @@ ProcEventMapper *ProcEventMapper::getInstance()
 }
 
 
-rtengine::ProcEvent ProcEventMapper::newEvent(int action, const std::string &history_msg)
-{
-    std::string eventkey = std::to_string(action) + history_msg;
-    const auto ret = events_.find(eventkey);
-    if (ret == events_.end()) {
-        rtengine::ProcEvent event = rtengine::RefreshMapper::getInstance()->newEvent();
-        rtengine::RefreshMapper::getInstance()->mapEvent(event, action);
-        events_.emplace(std::move(eventkey), event);
-        if (history_msg.empty()) {
-            history_msgs_[event] = M("HISTORY_MSG_" + std::to_string(event + 1));
-        } else {
-            history_msgs_[event] = M(history_msg);
-        }
-
-        return event;
-    } else {
-        return ret->second;
-    }
-}
-
-
 rtengine::ProcEvent ProcEventMapper::newEvent(
     rtengine::RequestIntent intent, const std::string &history_msg)
 {
@@ -69,17 +48,17 @@ rtengine::ProcEvent ProcEventMapper::newEvent(
     rtengine::EditorRequest request, const std::string &history_msg)
 {
     /*
-     * The key carries the planning identity and the compatibility mask. The
-     * mask is required because two producer actions can plan identically yet
-     * carry different execution payloads (EvSpotEnabled and
-     * EvSpotEnabledOPA share a history message today).
+     * The key carries the request identity and the history message. Two
+     * producer actions stay distinct when any typed fact differs.
      */
     const std::string eventkey =
         rtengine::producerEventKey(request, history_msg);
     const auto ret = events_.find(eventkey);
     if (ret == events_.end()) {
-        rtengine::ProcEvent event = rtengine::RefreshMapper::getInstance()->newEvent();
-        rtengine::RefreshMapper::getInstance()->mapRequest(event, request);
+        rtengine::ProcEvent event =
+            rtengine::EditorRequestRegistry::getInstance()->newEvent();
+        rtengine::EditorRequestRegistry::getInstance()->registerRequest(
+            event, request);
         events_.emplace(std::move(eventkey), event);
         if (history_msg.empty()) {
             history_msgs_[event] = M("HISTORY_MSG_" + std::to_string(event + 1));

@@ -20,6 +20,7 @@
 
 #include "multilangmgr.h"
 #include "toolpanelcoord.h"
+#include "eventmapper.h"
 #include "metadatapanel.h"
 #include "options.h"
 #include "rtimage.h"
@@ -30,7 +31,7 @@
 #include "rtengine/improcfun.h"
 #include "rtengine/perspectivecorrection.h"
 #include "rtengine/procevents.h"
-#include "rtengine/refreshmap.h"
+#include "rtengine/editorrequest.h"
 
 using namespace rtengine::procparams;
 
@@ -1142,11 +1143,10 @@ void ToolPanelCoordinator::panelChanged(const rtengine::ProcEvent& event, const 
     }
 
     /*
-     * The event identifies the producer request. A converted producer stored
-     * a typed EditorRequest in the RefreshMapper; an unconverted one carries
-     * the mask and is classified once by from_legacy_mask() in the
-     * coordinator. The profile filter below is the only caller that needs the
-     * raw mask.
+     * The event identifies the producer request. The registry resolves it to
+     * the typed request the producer registered, or to the recorded
+     * classification of a static event identity. The profile filter below
+     * emits its own typed request.
      */
     ProcParams* params = ipc->beginUpdateParams();
 
@@ -1337,12 +1337,15 @@ void ToolPanelCoordinator::profileChange(
     // start the IPC processing
     if (filterRawRefresh) {
         /*
-         * Compatibility path, documented in editorrequest.h: a profile edit
-         * with unchanged raw parameters is filtered with the mask form so the
-         * raw core is not rebuilt. The typed request is deliberately dropped
-         * here because its absolute kind would rebuild the path.
+         * A profile edit with unchanged raw parameters replaces the parameter
+         * set without reloading the raw core. The typed request derives its
+         * dirty set from the parameter fingerprints and names no raw family,
+         * so the raw blocks only run when a fingerprint actually moved.
          */
-        ipc->endUpdateParams(rtengine::RefreshMapper::getInstance()->getAction(event) & ALLNORAW);
+        static const rtengine::ProcEvent profileParameterRequest =
+            ProcEventMapper::getInstance()->newEvent(
+                rtengine::RequestIntent::AllNoRaw);
+        ipc->endUpdateParams(profileParameterRequest);
     } else {
         ipc->endUpdateParams(event);
     }

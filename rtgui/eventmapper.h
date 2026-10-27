@@ -23,7 +23,7 @@
 #include <map>
 #include <unordered_map>
 #include "rtengine/editorrequest.h"
-#include "rtengine/refreshmap.h"
+#include "rtengine/editorrequest_registry.h"
 
 
 class ProcEventMapper {
@@ -31,19 +31,13 @@ public:
     static ProcEventMapper *getInstance();
     /*
      * Typed producer entry point. The tool names what it asks for; the
-     * request kind, facts and compatibility mask are built in
-     * editorrequest.cc. This is the form converted tools use.
+     * request kind and facts are built in editorrequest.cc. This is the form
+     * converted tools use.
      */
     rtengine::ProcEvent newEvent(rtengine::RequestIntent intent,
                                  const std::string &history_msg="");
     rtengine::ProcEvent newEvent(rtengine::EditorRequest request,
                                  const std::string &history_msg="");
-    /*
-     * Compatibility entry point for parameter-only tools that carry no
-     * planning information. The coordinator classifies the mask once through
-     * from_legacy_mask().
-     */
-    rtengine::ProcEvent newEvent(int action, const std::string &history_msg="");
     const std::string &getHistoryMsg(rtengine::ProcEvent event) const;
 
 private:

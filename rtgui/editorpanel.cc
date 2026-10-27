@@ -23,7 +23,7 @@
 
 #include "rtengine/array2D.h"
 #include "rtengine/imagesource.h"
-#include "rtengine/refreshmap.h"
+#include "rtengine/editorrequest.h"
 #include "rtengine/iccstore.h"
 #include "rtengine/previewquality.h"
 #include "batchqueue.h"
@@ -61,18 +61,11 @@ constexpr int INITIAL_ROUGH_SCALE_MULTIPLIER = 2;
 
 // The rough pass has already decoded and preprocessed the raw source, but the
 // final preview scale change reallocates the Lab buffers. Rebuild the
-// post-base pipeline for the final frame; COMPR deliberately omits M_PREPROC
-// and M_RAW.
-constexpr int INITIAL_FINAL_PIPELINE = COMPR;
-
-static_assert(
-    (INITIAL_FINAL_PIPELINE
-        & (M_RGBCURVE | M_LUMACURVE | M_LUMINANCE | M_COLOR | M_MONITOR))
-        == (M_RGBCURVE | M_LUMACURVE | M_LUMINANCE | M_COLOR | M_MONITOR),
-    "The final rough-load pass must rebuild every post-base preview stage");
-static_assert(
-    (INITIAL_FINAL_PIPELINE & (M_PREPROC | M_RAW)) == 0,
-    "The final rough-load pass must not repeat raw preprocessing");
+// post-base pipeline for the final frame. The compression intent names the
+// monitor and Lab families and deliberately omits the raw preprocessing and
+// demosaic families, so the final pass does not repeat them.
+constexpr rtengine::RequestIntent INITIAL_FINAL_PIPELINE =
+    rtengine::RequestIntent::Compr;
 
 void setprogressStrUI(double val, const Glib::ustring str, MyProgressBar* pProgress)
 {
@@ -1442,7 +1435,7 @@ void EditorPanel::onPreviewReady()
         ipc->setPreviewScale(loadingFinalScale);
         loadingFinalScale = ipc->getPreviewScale();
         loadingStage = LoadingStage::FinalPreview;
-        ipc->startProcessing(INITIAL_FINAL_PIPELINE);
+        ipc->startProcessing(static_cast<int>(INITIAL_FINAL_PIPELINE));
         return;
     }
 

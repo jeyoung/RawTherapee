@@ -46,7 +46,6 @@
 #include "labimage.h"
 #include "mytime.h"
 #include "procparams.h"
-#include "refreshmap.h"
 #include "stage/stage_dirty_blocks.h"
 #include "stage/stage_graph.h"
 #include "stage/stage_pipeline.h"
@@ -712,8 +711,8 @@ void Crop::update(const EditorRequest& request)
          * request says. That force is carried in the render-state kind as
          * FullCrop, which makes derive_crop_work() name the raw base rebuild
          * even when the request is ParamsOnly or RepaintOnly. This mirrors the
-         * legacy `todo = ALL`: its M_INIT/M_LINDENOISE/M_HDR bits always
-         * reloaded the base, and the HDR and local-adjustment bodies overwrite
+         * legacy forced pass: its reload families always refilled the base,
+         * and the HDR and local-adjustment bodies overwrite
          * origCrop, so a forced pass must start from fresh pixels.
          */
         state.requestKind = rtengine::crop_request_kind(
@@ -741,8 +740,8 @@ void Crop::update(const EditorRequest& request)
         }
         state.denoiseAnalysisValid = parent->denoiseInfoStore.valid;
         /*
-         * A forced pass carries M_SPOT in the legacy `ALL`: the base is
-         * refilled, so the configured spots must be applied to it again. The
+         * A forced pass carries the spot family: the base is refilled, so the
+         * configured spots must be applied to it again. The
          * request's own spot fact is not enough, because a high-quality pass
          * asks for the accurate chain, not for spot work.
          */
@@ -764,7 +763,7 @@ void Crop::update(const EditorRequest& request)
             rtengine::stage::cropGuideFingerprint(params.cropGuide);
 
         /*
-         * The crop's viewport-moved fact. M_MINUPDATE is an imperative
+         * The crop's viewport-moved fact. a bare repaint is an imperative
          * "refresh without changing the image" request, so the existing buffers
          * may be reused. What the pass does with it is unchanged, and the
          * imperative itself is not modelled by this field.
@@ -842,10 +841,12 @@ void Crop::update(const EditorRequest& request)
 
     if (g_getenv("RT_CROP_DIRTY_TRACE") != nullptr) {
         std::fprintf(stderr,
-                     "crop-dirty-trace: payload=0x%x init=%d forced=%d "
+                     "crop-dirty-trace: kind=%d request=%016llx init=%d "
+                     "forced=%d "
                      "wb=%d sharp=%d cie=%d spots=%zu crop=%d "
                      "params=%s\n",
-                     request.executionPayload(),
+                     static_cast<int>(request.kind),
+                     static_cast<unsigned long long>(request.identity()),
                      needsinitupdate ? 1 : 0, derived.forced ? 1 : 0,
                      params.wb.temperature, params.sharpening.amount,
                      params.colorappearance.enabled ? 1 : 0,
@@ -3194,12 +3195,10 @@ void Crop::fullUpdate()
     newUpdatePending = true;
 
     /*
-     * A forced detail-window refresh is the legacy "everything" request. It
-     * is built through the adapter once, so the typed facts and the mask stay
-     * in step.
+     * A forced detail-window refresh is the "everything" request, built as
+     * the whole-preview intent.
      */
-    const EditorRequest forced =
-        from_legacy_mask(ALL | M_MONITOR, LegacyMaskContext{});
+    const EditorRequest forced = make_request(RequestIntent::First);
 
     while (newUpdatePending) {
         newUpdatePending = false;

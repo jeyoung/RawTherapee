@@ -24,7 +24,6 @@
 #include "rtengine/rt_math.h"
 #include "guiutils.h"
 #include "eventmapper.h"
-#include "rtengine/refreshmap.h"
 
 using namespace rtengine;
 using namespace rtengine::procparams;

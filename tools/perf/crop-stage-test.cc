@@ -40,6 +40,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstdio>
+#include <map>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -62,11 +63,34 @@
 #include "rtengine/dcrop.h"
 #include "rtengine/image8.h"
 #include "rtengine/procparams.h"
-#include "rtengine/refreshmap.h"
+#include "rtengine/editorrequest.h"
+#include "rtengine/editorrequest_registry.h"
 #include "rtengine/rtengine.h"
 
 namespace
 {
+
+/*
+ * Typed event for one harness request. The registry owns the request; the
+ * harness only needs the identity token the engine interface accepts.
+ */
+rtengine::ProcEvent eventFor(rtengine::RequestIntent intent)
+{
+    static std::map<int, rtengine::ProcEvent> events;
+
+    auto it = events.find(static_cast<int>(intent));
+    if (it != events.end()) {
+        return it->second;
+    }
+
+    rtengine::ProcEvent event =
+        rtengine::EditorRequestRegistry::getInstance()->newEvent();
+    rtengine::EditorRequestRegistry::getInstance()->registerRequest(
+        event, rtengine::make_request(intent));
+    events.emplace(static_cast<int>(intent), event);
+    return event;
+}
+
 
 /* 8-bit RGB samples, the data a DetailedCropListener receives. */
 struct Pixels {
@@ -455,7 +479,7 @@ public:
         rtengine::procparams::ProcParams* editing =
             processor_->beginUpdateParams();
         *editing = params;
-        processor_->endUpdateParams(FIRST);
+        processor_->endUpdateParams(eventFor(rtengine::RequestIntent::First));
 
         if (!preview_.waitFor(1, PREVIEW_TIMEOUT_MS)) {
             std::fprintf(stderr,
@@ -506,7 +530,8 @@ public:
      * coordinator renders the crop for every non-void mask, which is the path
      * this harness measures.
      */
-    bool apply(const rtengine::procparams::ProcParams& params, int todo)
+    bool apply(const rtengine::procparams::ProcParams& params,
+               rtengine::RequestIntent intent)
     {
         const unsigned previewTarget = preview_.ready() + 1;
         const unsigned cropTarget = capture_->generation() + 1;
@@ -514,7 +539,7 @@ public:
         rtengine::procparams::ProcParams* editing =
             processor_->beginUpdateParams();
         *editing = params;
-        processor_->endUpdateParams(todo);
+        processor_->endUpdateParams(eventFor(intent));
 
         if (!preview_.waitFor(previewTarget, UPDATE_TIMEOUT_MS)) {
             std::fprintf(stderr,
@@ -645,14 +670,14 @@ bool compareState(CropState state, const Result& baseline,
  * One incremental edit: the mask the GUI sends for that edit and the parameter
  * change behind it.
  *
- * The masks are the real composites from refreshmap.h, not single bits: a
- * white-balance or demosaic edit carries M_INIT because the source has to be
+ * The masks are the real composites from the retired request table, not single bits: a
+ * white-balance or demosaic edit carries the init family because the source has to be
  * reloaded, and a sharpening edit carries the whole Lab chain. They exercise
  * the per-block work inside the nodes; the graph plan no longer reads them.
  */
 struct EditScenario {
     const char* name;
-    int todo;
+    rtengine::RequestIntent intent;
     /*
      * Extra scenarios are not part of the default sequence: they exist to
      * exercise the spot, denoise and HDR bodies on demand. `--only=<name>`
@@ -665,7 +690,7 @@ struct EditScenario {
 const std::vector<EditScenario>& editScenarios()
 {
     static const std::vector<EditScenario> scenarios = {
-        {"wb", WB, false,
+        {"wb", rtengine::RequestIntent::WhiteBalance, false,
          [](rtengine::procparams::ProcParams& p) {
              /*
               * A manual white balance: with the automatic method the engine
@@ -676,13 +701,13 @@ const std::vector<EditScenario>& editScenarios()
              p.wb.method = "Custom";
              p.wb.temperature += 800;
          }},
-        {"demosaic", DEMOSAIC, false,
+        {"demosaic", rtengine::RequestIntent::Demosaic, false,
          [](rtengine::procparams::ProcParams& p) {
              p.pdsharpening.enabled = true;
          }},
-        {"transform", TRANSFORM, false,
+        {"transform", rtengine::RequestIntent::Transform, false,
          [](rtengine::procparams::ProcParams& p) { p.rotate.degree = 1.5; }},
-        {"local", AUTOEXP, false,
+        {"local", rtengine::RequestIntent::AutoExposure, false,
          [](rtengine::procparams::ProcParams& p) {
              p.locallab.enabled = true;
              if (p.locallab.spots.empty()) {
@@ -690,27 +715,27 @@ const std::vector<EditScenario>& editScenarios()
              }
              p.locallab.spots.back().struc += 10.0;
          }},
-        {"sharpening", SHARPENING, false,
+        {"sharpening", rtengine::RequestIntent::DirPyrEqualizer, false,
          [](rtengine::procparams::ProcParams& p) {
              p.sharpening.enabled = true;
              p.sharpening.amount += 100;
          }},
-        {"ciecam", AUTOEXP, false,
+        {"ciecam", rtengine::RequestIntent::AutoExposure, false,
          [](rtengine::procparams::ProcParams& p) {
              p.colorappearance.enabled = true;
              p.colorappearance.modelmethod = "02";
          }},
-        {"ciecam-off", AUTOEXP, false,
+        {"ciecam-off", rtengine::RequestIntent::AutoExposure, false,
          [](rtengine::procparams::ProcParams& p) {
              p.colorappearance.enabled = false;
          }},
-        {"crop", CROP, false,
+        {"crop", rtengine::RequestIntent::Crop, false,
          [](rtengine::procparams::ProcParams& p) {
              p.crop.enabled = true;
              p.crop.fixratio = true;
              p.crop.ratio = "3:2";
          }},
-        {"spot", SPOTADJUST, true,
+        {"spot", rtengine::RequestIntent::SpotAdjust, true,
          [](rtengine::procparams::ProcParams& p) {
              /*
               * An in-image coordinate for the representative sample. The spot
@@ -725,19 +750,19 @@ const std::vector<EditScenario>& editScenarios()
              entry.targetPos = rtengine::Coord(200, 200);
              p.spot.entries.push_back(entry);
          }},
-        {"denoise", ALLNORAW, true,
+        {"denoise", rtengine::RequestIntent::AllNoRaw, true,
          [](rtengine::procparams::ProcParams& p) {
              p.dirpyrDenoise.enabled = true;
              p.dirpyrDenoise.luma += 5;
          }},
-        {"fattal", HDR, true,
+        {"fattal", rtengine::RequestIntent::Hdr, true,
          [](rtengine::procparams::ProcParams& p) {
              p.fattal.enabled = true;
              p.fattal.amount += 10;
          }},
         /*
          * Regression: a bare high-quality request (opening a detail window,
-         * imagearea.cc:809) does not carry M_HDR, but the crop widens it to
+         * imagearea.cc:809) does not carry the HDR family, but the crop widens it to
          * the legacy "everything" request. It must therefore still rebuild
          * the dehazed base. The reference is a fresh full render of the same
          * parameters, so a skipped HDR body shows up as a byte difference.
@@ -750,7 +775,7 @@ const std::vector<EditScenario>& editScenarios()
          * derivation renders a whole-image tone difference against the fresh
          * render, not a small residual.
          */
-        {"highqual-dehaze", M_HIGHQUAL, false,
+        {"highqual-dehaze", rtengine::RequestIntent::HighQuality, false,
          [](rtengine::procparams::ProcParams& p) {
              p.dehaze.enabled = true;
              p.dehaze.strength = 60;
@@ -782,7 +807,8 @@ Difference difference(const Result& a, const Result& b)
  * of the final state. The two must match exactly; there is no legacy execution
  * path to compare against.
  */
-bool reportSequence(const std::string& label, int todo,
+bool reportSequence(const std::string& label,
+                    rtengine::RequestIntent intent,
                     const Result& candidate, const Result& reference,
                     const std::string& outDir)
 {
@@ -797,8 +823,9 @@ bool reportSequence(const std::string& label, int todo,
     const bool ok = fresh.differingBytes == 0 && fresh.maxDelta == 0
                     && !geometryDiffers;
 
-    std::printf("%s seq %s: todo=0x%x fresh AE=%d (%zu bytes)\n",
-                ok ? "PASS" : "FAIL", label.c_str(), todo,
+    std::printf("%s seq %s: intent=%d fresh AE=%d (%zu bytes)\n",
+                ok ? "PASS" : "FAIL", label.c_str(),
+                static_cast<int>(intent),
                 fresh.maxDelta, fresh.differingBytes);
 
     writePpm(outDir + "/seq-" + label + "-candidate.ppm", candidate.display);
@@ -815,7 +842,7 @@ bool runSequence(const std::string& file,
     scenario.mutate(changed);
 
     Session candidate(file, params, CropState::Full);
-    if (!candidate.ready() || !candidate.apply(changed, scenario.todo)) {
+    if (!candidate.ready() || !candidate.apply(changed, scenario.intent)) {
         std::fprintf(stderr, "FAIL seq %s: the candidate session failed\n",
                      scenario.name);
         return false;
@@ -829,7 +856,7 @@ bool runSequence(const std::string& file,
         return false;
     }
 
-    return reportSequence(scenario.name, scenario.todo, incrementalDerived,
+    return reportSequence(scenario.name, scenario.intent, incrementalDerived,
                           reference, outDir);
 }
 
@@ -858,7 +885,7 @@ bool runGeometrySequence(const std::string& file,
         return false;
     }
 
-    return reportSequence("geometry", 0, incrementalDerived, reference,
+    return reportSequence("geometry", rtengine::RequestIntent::Crop, incrementalDerived, reference,
                           outDir);
 }
 
@@ -888,7 +915,7 @@ bool runForcedRefillSequence(const std::string& file,
     changed.toneCurve.expcomp = 0.5;
 
     Session candidate(file, configured, CropState::Full);
-    if (!candidate.ready() || !candidate.apply(changed, M_HIGHQUAL)) {
+    if (!candidate.ready() || !candidate.apply(changed, rtengine::RequestIntent::HighQuality)) {
         std::fprintf(stderr,
                      "FAIL seq highqual-refill: the candidate session failed\n");
         return false;
@@ -901,7 +928,7 @@ bool runForcedRefillSequence(const std::string& file,
         return false;
     }
 
-    return reportSequence("highqual-refill", M_HIGHQUAL, candidate.result(),
+    return reportSequence("highqual-refill", rtengine::RequestIntent::HighQuality, candidate.result(),
                           reference, outDir);
 }
 
@@ -930,16 +957,16 @@ bool runBenchmark(const std::string& file,
 
     for (int i = 0; i < count + WARMUP; ++i) {
         rtengine::procparams::ProcParams changed = params;
-        int todo = M_RGBCURVE;
+        rtengine::RequestIntent intent = rtengine::RequestIntent::RgbCurve;
         if (edit == "crop") {
             changed.crop.enabled = (i % 2 == 0);
-            todo = M_CROP;
+            intent = rtengine::RequestIntent::Crop;
         } else {
             changed.toneCurve.expcomp = (i % 2 == 0) ? 0.05 : -0.05;
         }
 
         const auto start = std::chrono::steady_clock::now();
-        if (!session.apply(changed, todo)) {
+        if (!session.apply(changed, intent)) {
             std::fprintf(stderr, "FAIL bench: update %d failed\n", i);
             return false;
         }

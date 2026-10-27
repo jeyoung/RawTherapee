@@ -41,6 +41,7 @@ set(RTENGINESOURCEFILES
     dual_demosaic_RT.cc
     dynamicprofile.cc
     editorrequest.cc
+    editorrequest_registry.cc
     eahd_demosaic.cc
     EdgePreservingDecomposition.cc
     fast_demo.cc
@@ -107,7 +108,6 @@ set(RTENGINESOURCEFILES
     rawimage.cc
     rawimagesource.cc
     rcd_demosaic.cc
-    refreshmap.cc
     rt_algo.cc
     rtapp.cc
     rtlensfun.cc
@@ -126,7 +126,6 @@ set(RTENGINESOURCEFILES
     stage/stage_graph.cc
     stage/stage_indexer.cc
     stage/stage_lanczos.cc
-    stage/stage_mask_map.cc
     stage/stage_opencl_device.cc
     stage/stage_param_hash.cc
     stage/stage_param_map.cc
@@ -210,6 +209,15 @@ rt_setup_target(preview-base-cache-test)
 # Standalone regression test for the 100% FAST preview decision.
 add_executable(fast-preview-test EXCLUDE_FROM_ALL
     "${PROJECT_SOURCE_DIR}/tools/perf/fast-preview-test.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/editcallbacks.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/multilangmgr.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/options.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/paramsedited.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/pathutils.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/threadutils.cc"
+)
+target_include_directories(fast-preview-test BEFORE PRIVATE
+    "${CMAKE_BINARY_DIR}/rtgui"
 )
 target_link_libraries(fast-preview-test PRIVATE rtengine)
 rt_setup_target(fast-preview-test)
@@ -462,20 +470,6 @@ add_executable(stage-pipeline-test EXCLUDE_FROM_ALL
 )
 target_include_directories(stage-pipeline-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/stage")
 rt_setup_target(stage-pipeline-test)
-
-# The mask map is data only as well. Compile it with the pipeline
-# specification so the test does not link the engine, and add the rtengine
-# include directory for refreshmap.h.
-add_executable(stage-mask-map-test EXCLUDE_FROM_ALL
-    "${CMAKE_CURRENT_SOURCE_DIR}/stage/tests/stage_mask_map_test.cc"
-    "${CMAKE_CURRENT_SOURCE_DIR}/stage/stage_mask_map.cc"
-    "${CMAKE_CURRENT_SOURCE_DIR}/stage/stage_pipeline.cc"
-)
-target_include_directories(stage-mask-map-test PRIVATE
-    "${CMAKE_CURRENT_SOURCE_DIR}/stage"
-    "${CMAKE_CURRENT_SOURCE_DIR}"
-)
-rt_setup_target(stage-mask-map-test)
 
 add_executable(stage-store-test EXCLUDE_FROM_ALL
     "${CMAKE_CURRENT_SOURCE_DIR}/stage/tests/stage_store_test.cc"

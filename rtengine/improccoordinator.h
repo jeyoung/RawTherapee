@@ -648,14 +648,22 @@ public:
 
     void        getParams (procparams::ProcParams* dst, bool tweaked=false) override;
 
-    void        startProcessing (int changeCode) override;
+    /*
+     * The engine interface takes an integer here. The GUI passes the
+     * RequestIntent value of the typed change; the coordinator builds the
+     * request from it and never interprets an integer mask.
+     */
+    void        startProcessing (int intentCode) override;
     ProcParams* beginUpdateParams () override;
     void        endUpdateParams (ProcEvent change) override;  // must be called after beginUpdateParams, triggers update
+    /*
+     * The integer form carried a retired request mask. It has no request
+     * meaning any more and fails fast.
+     */
     void        endUpdateParams (int changeFlags) override;
     /*
-     * Typed dispatch for a converted producer event. Not part of the engine
-     * interface: the GUI boundary calls it with the EditorRequest the event
-     * registered, so planning never reconstructs the request from the mask.
+     * Typed dispatch for a producer event. The GUI boundary calls it with the
+     * EditorRequest the event registered.
      */
     void        endUpdateParams (const EditorRequest& request);
     void        stopProcessing () override;
