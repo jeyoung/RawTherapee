@@ -31,6 +31,7 @@
 #include "improcfun.h"
 #include "LUT.h"
 #include "rtengine.h"
+#include "stage/stage_cache_integration.h"
 #include "stage/stage_dirty_blocks.h"
 #include "stage/stage_render_state.h"
 
@@ -152,6 +153,19 @@ protected:
     // Experimental, default-off cache of the preview base image returned by
     // ImageSource::getImage(). One snapshot only; deep copies in and out.
     std::unique_ptr<PreviewBaseCache> previewBaseCache;
+
+    /*
+     * Opt-in node-output cache for the preview raw.base tier (RT_NODE_CACHE).
+     *
+     * The tier is the `orig_prev` pixel buffer plus the small state the same
+     * node derives from it (white balance, histogram, denoise validity). The
+     * key is the exact `NodeCacheKey` of the pass. A hit substitutes for the
+     * rebuild body only when the typed work order names no raw source producer
+     * and the base rebuild itself is scheduled, so every downstream node
+     * reruns from the restored tier. The byte budget and the switch are fixed
+     * from the environment at construction.
+     */
+    stage::NodeCache nodeCache;
 
     /*
      * Input of the last completed full-frame preview pass, used to derive the
@@ -367,6 +381,21 @@ protected:
 
     PreviewPassPlan planPreviewPass(PreviewPassState& pass);
     void executePreviewNode(const std::string& id, PreviewPassState& pass);
+
+    /*
+     * Node-output cache of the preview raw.base tier (RT_NODE_CACHE).
+     *
+     * nodeCacheRawBaseKey() names the tier from the pass state.
+     * nodeCacheRestoreRawBase() substitutes a hit for the rebuild body and
+     * returns false when the entry cannot be delivered. nodeCacheStoreRawBase()
+     * records the tier at the end of stageRawBase, because only then are the
+     * pixels, the white balance and the histogram of this pass final. Both are
+     * no-ops when the switch is off.
+     */
+    stage::NodeCacheKey nodeCacheRawBaseKey(const PreviewPassState& pass) const;
+    bool nodeCacheRestoreRawBase(const PreviewPassState& pass,
+                                 const stage::NodeCacheKey& key);
+    void nodeCacheStoreRawBase(const PreviewPassState& pass);
 
     /*
      * Dirty-block derivation for the graph scheduler.

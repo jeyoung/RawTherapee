@@ -60,7 +60,7 @@ void StageCache::set_budget(size_t bytes)
         if (found == entries_.end()) {
             lru_.pop_back();
         } else {
-            erase_locked(found);
+            erase_locked(found, true);
         }
     }
 }
@@ -77,44 +77,78 @@ size_t StageCache::used() const
     return used_;
 }
 
-void StageCache::erase_locked(
-    std::unordered_map<StageKey, Entry, StageKeyHash>::iterator it)
+uint64_t StageCache::allocationCount() const
 {
-    used_ -= it->second.bytes;
-    lru_.erase(it->second.lru);
-    entries_.erase(it);
+    std::lock_guard<std::mutex> lock(mutex_);
+    return allocations_;
 }
 
-bool StageCache::put(const StageKey& key, const RtStageBuffer& source)
+void StageCache::touch_locked(
+    std::unordered_map<StageKey, Entry, StageKeyHash>::iterator it) const
 {
+    if (it->second.lru == lru_.begin()) {
+        return;
+    }
+    lru_.erase(it->second.lru);
+    lru_.push_front(it->first);
+    it->second.lru = lru_.begin();
+}
+
+void StageCache::erase_locked(
+    std::unordered_map<StageKey, Entry, StageKeyHash>::iterator it,
+    bool evicted)
+{
+    const size_t bytes = it->second.bytes;
+    used_ -= bytes;
+    lru_.erase(it->second.lru);
+    entries_.erase(it);
+    if (evicted) {
+        ++stats_.evictions;
+        stats_.bytes_evicted += bytes;
+    }
+}
+
+bool StageCache::put(const StageKey& key, const RtStageBuffer& source,
+                     const void* aux, size_t aux_bytes)
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (aux == nullptr && aux_bytes != 0) {
+        ++stats_.rejects;
+        return false;
+    }
     if (source.data == nullptr || source.width <= 0 || source.height <= 0 ||
         source.planes == 0) {
+        ++stats_.rejects;
         return false;
     }
 
     const size_t row = active_row_bytes(source);
-    const size_t bytes = row * static_cast<size_t>(source.height) *
-                         static_cast<size_t>(source.planes);
-    if (bytes == 0 || bytes > budget_) {
+    const size_t pixels = row * static_cast<size_t>(source.height) *
+                          static_cast<size_t>(source.planes);
+    const size_t bytes = pixels + aux_bytes;
+    if (pixels == 0 || bytes > budget_) {
+        ++stats_.rejects;
         return false;
     }
 
-    std::lock_guard<std::mutex> lock(mutex_);
+    // A re-insert of the same key replaces the old entry instead of evicting
+    // it; the replacement is not a capacity event.
     auto existing = entries_.find(key);
     if (existing != entries_.end()) {
-        erase_locked(existing);
+        erase_locked(existing, false);
     }
     while (used_ + bytes > budget_ && !lru_.empty()) {
         auto victim = entries_.find(lru_.back());
         if (victim == entries_.end()) {
             lru_.pop_back();
         } else {
-            erase_locked(victim);
+            erase_locked(victim, true);
         }
     }
 
     OwnedStageBuffer owned;
-    owned.storage.resize(bytes);
+    owned.storage.resize(pixels);
+    ++allocations_;
     owned.view.size = sizeof(RtStageBuffer);
     owned.view.data = owned.storage.data();
     owned.view.width = source.width;
@@ -136,25 +170,81 @@ bool StageCache::put(const StageKey& key, const RtStageBuffer& source)
         }
     }
 
+    Entry entry;
+    entry.key = key;
+    entry.buffer = std::move(owned);
+    if (aux_bytes != 0) {
+        const unsigned char* bytes_in =
+            static_cast<const unsigned char*>(aux);
+        entry.aux.assign(bytes_in, bytes_in + aux_bytes);
+        ++allocations_;
+    }
+    entry.bytes = bytes;
     lru_.push_front(key);
-    entries_.emplace(key, Entry{key, std::move(owned), bytes, lru_.begin()});
+    entry.lru = lru_.begin();
+    entries_.emplace(key, std::move(entry));
     used_ += bytes;
+    ++stats_.inserts;
+    stats_.bytes_inserted += bytes;
     return true;
 }
 
-bool StageCache::get(const StageKey& key, RtStageBuffer& destination) const
+bool StageCache::peek_locked(const StageKey& key) const
+{
+    auto found = entries_.find(key);
+    if (found == entries_.end()) {
+        ++stats_.misses;
+        return false;
+    }
+    ++stats_.hits;
+    touch_locked(found);
+    return true;
+}
+
+bool StageCache::get(const StageKey& key, RtStageBuffer& destination,
+                     std::vector<unsigned char>* aux) const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto found = entries_.find(key);
+    if (found == entries_.end()) {
+        ++stats_.misses;
+        return false;
+    }
+    ++stats_.hits;
+    if (!copy_locked(found->second, destination, aux)) {
+        return false;
+    }
+    touch_locked(found);
+    return true;
+}
+
+bool StageCache::fetch(const StageKey& key, RtStageBuffer& destination,
+                       std::vector<unsigned char>* aux) const
 {
     std::lock_guard<std::mutex> lock(mutex_);
     auto found = entries_.find(key);
     if (found == entries_.end()) {
         return false;
     }
-    const OwnedStageBuffer& owned = found->second.buffer;
+    if (!copy_locked(found->second, destination, aux)) {
+        return false;
+    }
+    touch_locked(found);
+    return true;
+}
+
+bool StageCache::copy_locked(const Entry& entry, RtStageBuffer& destination,
+                             std::vector<unsigned char>* aux) const
+{
+    const OwnedStageBuffer& owned = entry.buffer;
     if (destination.data == nullptr || destination.width != owned.view.width ||
         destination.height != owned.view.height ||
         destination.planes != owned.view.planes ||
         destination.format != owned.view.format ||
         destination.row_pitch < owned.view.row_pitch) {
+        // The entry is present but cannot be delivered into this view. Count
+        // the probe as a hit, because lookup succeeded, and leave the caller
+        // to treat the failed restore as unusable.
         return false;
     }
 
@@ -169,13 +259,29 @@ bool StageCache::get(const StageKey& key, RtStageBuffer& destination) const
                         src + static_cast<size_t>(y) * row, row);
         }
     }
+    if (aux != nullptr) {
+        *aux = entry.aux;
+    }
     return true;
 }
 
 bool StageCache::contains(const StageKey& key) const
 {
+    // Introspection only: it neither counts a probe nor refreshes recency.
     std::lock_guard<std::mutex> lock(mutex_);
     return entries_.find(key) != entries_.end();
+}
+
+bool StageCache::peek(const StageKey& key) const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    return peek_locked(key);
+}
+
+void StageCache::note_refused()
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    ++stats_.refused;
 }
 
 void StageCache::clear()
@@ -184,6 +290,21 @@ void StageCache::clear()
     entries_.clear();
     lru_.clear();
     used_ = 0;
+}
+
+StageCacheStats StageCache::stats() const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    StageCacheStats snapshot = stats_;
+    snapshot.bytes_used = used_;
+    snapshot.bytes_budget = budget_;
+    return snapshot;
+}
+
+void StageCache::reset_stats()
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    stats_ = StageCacheStats{};
 }
 
 } // namespace rtengine::stage
