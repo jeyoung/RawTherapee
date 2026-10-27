@@ -22,6 +22,7 @@
 
 #include <cstdint>
 #include <initializer_list>
+#include <string>
 
 namespace rtengine
 {
@@ -227,6 +228,16 @@ struct EditorRequest {
     }
 
     /*
+     * Recompute every mask-derived planning field from the current legacy
+     * gate mask, exactly as from_legacy_mask() would. Used after an
+     * execution-payload augmentation: the post-crop-vignetting transform
+     * augmentation adds M_HDR and M_SPOT through TRANSFORM, so kind,
+     * fullFrameIntent and spotPending change too. Sites that deliberately
+     * narrow a repaint patch the kind themselves and must not call this.
+     */
+    void refreshFromLegacyMask();
+
+    /*
      * The legacy mask for the documented viewport fast-path admission test.
      *
      * This is the single accessor the coordinator uses to obtain the opaque
@@ -355,6 +366,31 @@ EditorRequest make_request(RequestIntent intent,
 
 /* The compatibility mask an intent carries, exposed for tests and diagnostics. */
 int compatibility_mask(RequestIntent intent);
+
+/*
+ * Dedup key of a typed producer event.
+ *
+ * Two producer actions must stay distinct even when their planning identity is
+ * equal: `EvSpotEnabled` (ALLNORAW) and `EvSpotEnabledOPA` (SPOTADJUST) plan
+ * the same today but carry different compatibility masks, and collapsing them
+ * would lose the mask the rest of the coordinator consumes. The key therefore
+ * includes the identity *and* the compatibility mask. The identity remains the
+ * planning identity; this function is only the event registry key.
+ */
+std::string producerEventKey(const EditorRequest& request,
+                             const std::string& historyMsg);
+
+/*
+ * Request kind of one crop update.
+ *
+ * A crop reallocation has to refill `origCrop`, but the preview request that
+ * triggered it may be a plain parameter update. The render-state request kind
+ * is therefore widened to FullCrop for that update, so the crop work order
+ * names the base rebuild even when the editor request did not. HighQuality
+ * keeps its own priority; the other kinds map one to one.
+ */
+stage::RequestKind crop_request_kind(EditorRequest::RequestKind previewKind,
+                                     bool reallocation);
 
 /*
  * Debug cross-check: whether a request still agrees with the planning a bare

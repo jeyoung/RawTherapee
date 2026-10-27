@@ -198,6 +198,17 @@ uint64_t EditorRequest::identity() const
     return identityOf(*this);
 }
 
+void EditorRequest::refreshFromLegacyMask()
+{
+    present = legacyGateMask != 0;
+    controlOnly = (legacyGateMask & ~M_VOID) == 0;
+    spotPending = (legacyGateMask & M_SPOT) != 0;
+    highDetailIntent = (legacyGateMask & M_HIGHQUAL) != 0;
+    fullFrameIntent = (legacyGateMask & FULL_FRAME_BITS) != 0;
+    setLegacyGateMask(legacyGateMask);
+    kind = kindForLegacyMask(legacyGateMask);
+}
+
 bool planningAgreesWithLegacyMask(const EditorRequest& request)
 {
     return request.kind == kindForLegacyMask(request.legacyGateMask)
@@ -422,6 +433,30 @@ EditorRequest make_request(RequestIntent intent,
 EditorRequest make_request(RequestIntent intent)
 {
     return make_request(intent, {}, stage::StagePath::Preview);
+}
+
+std::string producerEventKey(const EditorRequest& request,
+                             const std::string& historyMsg)
+{
+    return "typed-" + std::to_string(request.identity()) + "-"
+        + std::to_string(request.legacyGateMask) + historyMsg;
+}
+
+stage::RequestKind crop_request_kind(EditorRequest::RequestKind previewKind,
+                                     bool reallocation)
+{
+    if (reallocation) {
+        return stage::RequestKind::FullCrop;
+    }
+
+    if (previewKind == stage::RequestKind::HighQuality) {
+        return stage::RequestKind::HighQuality;
+    }
+    if (previewKind == stage::RequestKind::FullPreview) {
+        return stage::RequestKind::FullCrop;
+    }
+
+    return previewKind;
 }
 
 } // namespace rtengine
