@@ -87,8 +87,18 @@ bool file_stamp(const std::string& path, int64_t& mtime, int64_t& size)
  * kill switches force CPU. The user preference is wired in through
  * set_opencl_stage_allowed(), so a disabled backend never runs a node on the
  * device even when the environment asks for it.
+ *
+ * The execution path calls node_device(), which resolves the same policy
+ * without building a reason string or touching the override map unless an
+ * override exists. The selection API adds the diagnostics for callers and
+ * tests.
  */
-std::atomic<bool> opencl_allowed{true};
+/*
+ * Per-thread, like opencl::setStageAllowed(): a preview pass and a batch
+ * export in one process can hold different policies without racing.
+ */
+thread_local bool opencl_allowed = true;
+std::atomic<bool> overrides_present{false};
 std::mutex selection_mutex;
 std::map<std::string, StageNodeDevice> node_overrides;
 
@@ -108,6 +118,9 @@ bool env_flag(const char* name, bool& is_set)
 
 bool has_override(const std::string& node, StageNodeDevice& device)
 {
+    if (!overrides_present.load(std::memory_order_acquire)) {
+        return false;
+    }
     std::lock_guard<std::mutex> lock(selection_mutex);
     const auto found = node_overrides.find(node);
     if (found == node_overrides.end()) {
@@ -117,56 +130,89 @@ bool has_override(const std::string& node, StageNodeDevice& device)
     return true;
 }
 
-StageNodeSelection select_impl(const char* node, StageNodeDevice requested)
+StageNodeDevice requested_device(const char* node)
 {
-    const std::string name = node != nullptr ? node : "";
-    StageNodeSelection selection;
-    selection.implemented = node_has_device_implementation(node);
+    StageNodeDevice overridden;
+    if (node != nullptr && has_override(node, overridden)) {
+        return overridden;
+    }
+    bool set = false;
+    if (env_flag("RT_STAGE_OPENCL", set) && set) {
+        return StageNodeDevice::OpenCL;
+    }
+    return StageNodeDevice::CPU;
+}
+
+/*
+ * Resolve one request. `reason` and `implemented` are optional so the
+ * execution path does not pay for diagnostics it discards.
+ */
+StageNodeDevice resolve_device(const char* node, StageNodeDevice requested,
+                               bool* implemented, std::string* reason)
+{
+    const bool need_implementation =
+        requested == StageNodeDevice::OpenCL || implemented != nullptr ||
+        reason != nullptr;
+    const bool has_implementation =
+        need_implementation && node_has_device_implementation(node);
+    if (implemented != nullptr) {
+        *implemented = has_implementation;
+    }
 
     if (requested == StageNodeDevice::CPU) {
-        selection.device = StageNodeDevice::CPU;
-        selection.reason = selection.implemented
-                               ? "CPU selected"
-                               : "no OpenCL implementation for node '" + name + "'";
-        return selection;
+        if (reason != nullptr) {
+            *reason = has_implementation
+                          ? "CPU selected"
+                          : "no OpenCL implementation for node '" +
+                                std::string(node != nullptr ? node : "") + "'";
+        }
+        return StageNodeDevice::CPU;
     }
 
     /* Kill switches win over every request. */
-    if (!opencl_allowed.load(std::memory_order_acquire)) {
-        selection.device = StageNodeDevice::CPU;
-        selection.reason = "OpenCL stage execution is disabled by the user preference";
-        return selection;
+    if (!opencl_allowed) {
+        if (reason != nullptr) {
+            *reason =
+                "OpenCL stage execution is disabled by the user preference";
+        }
+        return StageNodeDevice::CPU;
     }
     bool set = false;
     const bool opt_in = env_flag("RT_STAGE_OPENCL", set);
     if (set && !opt_in) {
         /* An explicit RT_STAGE_OPENCL=0 is a kill switch. */
-        selection.device = StageNodeDevice::CPU;
-        selection.reason = "RT_STAGE_OPENCL is off";
-        return selection;
+        if (reason != nullptr) {
+            *reason = "RT_STAGE_OPENCL is off";
+        }
+        return StageNodeDevice::CPU;
     }
     if (env_flag("RT_STAGE_OPENCL_DISABLE", set) && set) {
-        selection.device = StageNodeDevice::CPU;
-        selection.reason = "RT_STAGE_OPENCL_DISABLE is set";
-        return selection;
+        if (reason != nullptr) {
+            *reason = "RT_STAGE_OPENCL_DISABLE is set";
+        }
+        return StageNodeDevice::CPU;
     }
 
-    if (!selection.implemented) {
-        selection.device = StageNodeDevice::CPU;
-        selection.reason = "no OpenCL implementation for node '" + name + "'";
-        return selection;
+    if (!has_implementation) {
+        if (reason != nullptr) {
+            *reason = "no OpenCL implementation for node '" +
+                      std::string(node != nullptr ? node : "") + "'";
+        }
+        return StageNodeDevice::CPU;
     }
 
     std::string device_reason;
-    if (!opencl_stage_available(&device_reason)) {
-        selection.device = StageNodeDevice::CPU;
-        selection.reason = device_reason;
-        return selection;
+    if (!opencl_stage_available(reason != nullptr ? &device_reason : nullptr)) {
+        if (reason != nullptr) {
+            *reason = device_reason;
+        }
+        return StageNodeDevice::CPU;
     }
 
-    selection.device = StageNodeDevice::OpenCL;
-    selection.reason.clear();
-    return selection;
+    if (reason != nullptr) {
+        reason->clear();
+    }
+    return StageNodeDevice::OpenCL;
 }
 
 /* Lazily created device context shared by stage::run(). */
@@ -226,37 +272,37 @@ bool node_has_device_implementation(const char* node)
     return node != nullptr && has_opencl_stage_node(node);
 }
 
+StageNodeDevice node_device(const char* node)
+{
+    return resolve_device(node, requested_device(node), nullptr, nullptr);
+}
+
 StageNodeSelection select_node_device(const char* node,
                                       StageNodeDevice requested)
 {
-    return select_impl(node, requested);
+    StageNodeSelection selection;
+    selection.device =
+        resolve_device(node, requested, &selection.implemented, &selection.reason);
+    return selection;
 }
 
 StageNodeSelection select_node_device(const char* node)
 {
-    const std::string name = node != nullptr ? node : "";
-    StageNodeDevice requested = StageNodeDevice::CPU;
-
-    StageNodeDevice overridden;
-    if (has_override(name, overridden)) {
-        requested = overridden;
-    } else {
-        bool set = false;
-        if (env_flag("RT_STAGE_OPENCL", set) && set) {
-            requested = StageNodeDevice::OpenCL;
-        }
-    }
-    return select_impl(node, requested);
+    StageNodeSelection selection;
+    selection.device = resolve_device(node, requested_device(node),
+                                      &selection.implemented,
+                                      &selection.reason);
+    return selection;
 }
 
 void set_opencl_stage_allowed(bool allowed)
 {
-    opencl_allowed.store(allowed, std::memory_order_release);
+    opencl_allowed = allowed;
 }
 
 bool opencl_stage_allowed()
 {
-    return opencl_allowed.load(std::memory_order_acquire);
+    return opencl_allowed;
 }
 
 void set_node_device_override(const char* node, StageNodeDevice device)
@@ -266,12 +312,14 @@ void set_node_device_override(const char* node, StageNodeDevice device)
     }
     std::lock_guard<std::mutex> lock(selection_mutex);
     node_overrides[node] = device;
+    overrides_present.store(true, std::memory_order_release);
 }
 
 void clear_node_device_overrides()
 {
     std::lock_guard<std::mutex> lock(selection_mutex);
     node_overrides.clear();
+    overrides_present.store(false, std::memory_order_release);
 }
 
 struct StageModule {
@@ -478,20 +526,29 @@ RtStageStatus run(const char* name, const std::vector<RtStageArg>& args,
      * function takes exactly the host path below, so the default behaviour,
      * timing and memory are unchanged.
      */
-    if (request.impl.empty()) {
-        const StageNodeSelection selection = select_node_device(name);
-        if (selection.device == StageNodeDevice::OpenCL) {
-            auto context = opencl_context();
-            if (context != nullptr) {
-                RtStageProfiling local{};
-                const RtStageStatus status = context->execute(request, &local);
-                if (status == RT_STAGE_OK) {
-                    if (profiling != nullptr) {
-                        *profiling = local;
-                    }
-                    record_stage(name, "opencl", "opencl", args, local);
-                    return status;
+    if (request.impl.empty() && node_device(name) == StageNodeDevice::OpenCL) {
+        auto context = opencl_context();
+        if (context != nullptr) {
+            RtStageProfiling local{};
+            StageExecution execution;
+            const RtStageStatus status =
+                context->execute(request, &local, &execution);
+            if (status == RT_STAGE_OK) {
+                /*
+                 * Record what actually ran, not what was requested. The device
+                 * queue can fall back to the host when its allocation budget
+                 * or a launch refuses the node, and that must not be labelled
+                 * as device execution.
+                 */
+                const bool on_device =
+                    execution.device == StageDeviceType::OPENCL;
+                if (profiling != nullptr) {
+                    *profiling = local;
                 }
+                record_stage(name, on_device ? "opencl" : "host",
+                             on_device ? "opencl" : "device-fallback", args,
+                             local);
+                return status;
             }
         }
     }

@@ -60,8 +60,9 @@ namespace
 /*
  * Budget for device-resident buffers. The default fits a pair of
  * full-resolution 45 MP three-plane F32 buffers with room for a resize
- * destination. RT_STAGE_DEVICE_BUDGET_MB overrides it; the range is clamped so
- * a typo cannot exhaust host memory through POCL or a large GPU.
+ * destination. RT_STAGE_DEVICE_BUDGET_MB overrides it; out-of-range values are
+ * clamped to the range and a non-numeric value keeps the default, so a typo
+ * can neither exhaust host memory nor silently disable the device path.
  */
 constexpr std::size_t DEFAULT_DEVICE_BUDGET_MIB = 1024;
 constexpr std::size_t MIN_DEVICE_BUDGET_MIB = 16;
@@ -83,8 +84,10 @@ std::size_t device_budget_bytes()
     if (const char* value = std::getenv("RT_STAGE_DEVICE_BUDGET_MB")) {
         char* end = nullptr;
         const unsigned long parsed = std::strtoul(value, &end, 10);
-        if (end != value && parsed >= MIN_DEVICE_BUDGET_MIB) {
-            mib = std::min<std::size_t>(parsed, MAX_DEVICE_BUDGET_MIB);
+        if (end != value) {
+            mib = std::min<std::size_t>(
+                std::max<std::size_t>(parsed, MIN_DEVICE_BUDGET_MIB),
+                MAX_DEVICE_BUDGET_MIB);
         }
     }
     return mib * MIB;
@@ -1210,7 +1213,7 @@ public:
         StageEvent event;
         event.status = StageEventStatus::Failed;
         event.result = RT_STAGE_FALLBACK;
-        event.device = StageDeviceType::OPENCL;
+        event.device = StageDeviceType::NONE;
         event.asynchronous = false;
         event.note = "a compiled host program cannot run on the OpenCL queue";
         return event;
@@ -1300,7 +1303,7 @@ private:
         StageEvent event;
         event.status = StageEventStatus::Failed;
         event.result = RT_STAGE_FALLBACK;
-        event.device = StageDeviceType::OPENCL;
+        event.device = StageDeviceType::NONE;
         event.note = "OpenCL device is unavailable";
         return event;
     }
@@ -1412,7 +1415,7 @@ public:
         StageEvent event;
         event.status = StageEventStatus::Failed;
         event.result = RT_STAGE_FALLBACK;
-        event.device = StageDeviceType::OPENCL;
+        event.device = StageDeviceType::NONE;
         event.note = "built without OpenCL";
         return event;
     }

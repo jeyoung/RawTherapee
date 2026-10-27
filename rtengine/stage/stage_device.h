@@ -20,7 +20,10 @@ class StageDeviceResidency;
 
 enum class StageDeviceType {
     CPU,
-    OPENCL
+    OPENCL,
+    /* No execution happened: a refusal, a resolution failure or an event that
+     * never left Pending. Devices and queues are always CPU or OPENCL. */
+    NONE
 };
 
 const char* to_string(StageDeviceType type);
@@ -68,15 +71,15 @@ public:
  *
  * `device` is the device that actually executed the node, which can differ
  * from the queue type when a node has no device implementation or the device
- * allocation budget is exhausted. `asynchronous` is true only when submit()
- * returned before the work finished; a submission that completes inline sets
- * it false and carries a final status.
+ * allocation budget is exhausted, and is NONE when nothing executed.
+ * `asynchronous` is true only when submit() returned before the work finished;
+ * a submission that completes inline sets it false and carries a final status.
  */
 struct StageEvent {
     StageEventStatus status = StageEventStatus::Pending;
     RtStageStatus result = RT_STAGE_OK;
     std::uint64_t elapsed_ns = 0;
-    StageDeviceType device = StageDeviceType::CPU;
+    StageDeviceType device = StageDeviceType::NONE;
     bool asynchronous = false;
     /* Why a device path was declined; empty for a normal execution. */
     std::string note;
@@ -198,8 +201,10 @@ using StageDeviceBufferPtr = std::shared_ptr<StageDeviceBuffer>;
 
 /*
  * Padded layout of a buffer shape: 64-byte aligned rows, packed planes and a
- * 64-byte aligned block. Single-plane U8 is packed RGB, matching
- * stage::row_bytes(). Returns false for an invalid shape and sets error.
+ * 64-byte aligned block. U8 is packed RGB and must be a single plane, which is
+ * the only U8 shape the engine views produce; stage::row_bytes() also triples
+ * the row for U8, so refusing multi-plane U8 keeps the two helpers in step.
+ * Returns false for an invalid shape and sets error.
  */
 bool stage_buffer_layout(const StageBufferShape& shape, std::size_t& row_pitch,
                          std::size_t& plane_pitch, std::size_t& bytes,
@@ -305,6 +310,13 @@ private:
  * reads the environment on the first compile of a key; clear_program_cache()
  * forces the next compile to resolve the request again.
  */
+/* What one StageContext::execute() call actually did. */
+struct StageExecution {
+    StageDeviceType device = StageDeviceType::NONE;
+    /* True when the kernel was submitted and completed asynchronously. */
+    bool asynchronous = false;
+};
+
 class StageContext
 {
 public:
@@ -325,10 +337,13 @@ public:
     /*
      * Compile (or reuse) and execute a node. On a device context the node is
      * dispatched to the device when selection and the device allow it, and
-     * run on the host program otherwise.
+     * run on the host program otherwise. `execution`, when given, reports the
+     * device that actually executed and whether the submission was
+     * asynchronous, so a caller never has to infer it from the selection.
      */
     RtStageStatus execute(const StageRequest& request,
-                          RtStageProfiling* profiling = nullptr);
+                          RtStageProfiling* profiling = nullptr,
+                          StageExecution* execution = nullptr);
 
     StageQueue& queue();
     StageBufferAllocator& allocator();

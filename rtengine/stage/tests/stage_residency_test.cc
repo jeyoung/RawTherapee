@@ -308,6 +308,75 @@ void test_residency()
           "allocation resumes after a refusal");
     residency->clear();
     check(residency->stats().used_bytes == 0, "clear frees every binding");
+
+    /* True LRU order: with three idle candidates the least recently used one
+     * is evicted, not just any entry. */
+    auto lru_context = opencl_device()->create_context();
+    StageDeviceResidency* lru = lru_context->residency();
+    check(lru != nullptr, "the LRU context exposes a residency");
+    if (lru != nullptr) {
+        RtStageBuffer oldest = host.allocate({RT_STAGE_F32, 32, 16, 3}, &error);
+        RtStageBuffer middle = host.allocate({RT_STAGE_F32, 32, 16, 3}, &error);
+        RtStageBuffer newest = host.allocate({RT_STAGE_F32, 32, 16, 3}, &error);
+        const StageBufferShape shape{RT_STAGE_F32, 32, 16, 3};
+        StageDeviceBufferPtr first = lru->acquire(oldest.data, shape, &error);
+        StageDeviceBufferPtr second = lru->acquire(middle.data, shape, &error);
+        StageDeviceBufferPtr third = lru->acquire(newest.data, shape, &error);
+        check(first && second && third, "three LRU entries allocate");
+        if (first && second && third) {
+            const std::size_t one = first->bytes();
+            check(!lru->set_budget(one * 2),
+                  "in-use entries cannot be evicted by a smaller budget");
+            first.reset();
+            second.reset();
+            third.reset();
+            /* Touch the oldest so the middle entry becomes the LRU victim. */
+            check(lru->acquire(oldest.data, shape, &error) != nullptr,
+                  "the oldest entry can be touched");
+            check(lru->set_budget(one * 2), "the budget trims to two buffers");
+            check(lru->find(middle.data) == nullptr,
+                  "the least recently used idle entry is evicted");
+            check(lru->find(oldest.data) != nullptr,
+                  "a recently touched entry survives");
+            check(lru->find(newest.data) != nullptr,
+                  "the newest entry survives");
+            check(lru->stats().evictions == 1, "exactly one entry was evicted");
+        }
+        lru->clear();
+    }
+
+    /* Budget parsing: out-of-range values clamp, garbage keeps the default. */
+    constexpr std::size_t MIB = 1024 * 1024;
+    setenv("RT_STAGE_DEVICE_BUDGET_MB", "1", 1);
+    auto low_queue = opencl_device()->create_queue();
+    check(low_queue->residency()->stats().budget_bytes == 16 * MIB,
+          "a low budget clamps to 16 MiB");
+    setenv("RT_STAGE_DEVICE_BUDGET_MB", "999999", 1);
+    auto high_queue = opencl_device()->create_queue();
+    check(high_queue->residency()->stats().budget_bytes == 65536 * MIB,
+          "a high budget clamps to 65536 MiB");
+    setenv("RT_STAGE_DEVICE_BUDGET_MB", "not-a-number", 1);
+    auto default_queue = opencl_device()->create_queue();
+    check(default_queue->residency()->stats().budget_bytes == 1024 * MIB,
+          "a non-numeric budget keeps the 1024 MiB default");
+    unsetenv("RT_STAGE_DEVICE_BUDGET_MB");
+
+    /* Multi-plane U8 has no defined layout; both helpers must agree by
+     * refusing it. */
+    std::size_t u8_row = 0;
+    std::size_t u8_plane = 0;
+    std::size_t u8_bytes = 0;
+    std::string u8_error;
+    check(!stage_buffer_layout({RT_STAGE_U8, 8, 8, 3}, u8_row, u8_plane,
+                               u8_bytes, &u8_error),
+          "multi-plane U8 is refused by the layout helper");
+    check(u8_error.find("single-plane") != std::string::npos,
+          "multi-plane U8 explains the refusal");
+    u8_error.clear();
+    check(host.allocate({RT_STAGE_U8, 8, 8, 3}, &u8_error).data == nullptr,
+          "multi-plane U8 is refused by the host allocator");
+    check(u8_error.find("single-plane") != std::string::npos,
+          "the host allocator explains the refusal");
 }
 
 /* --------------------------------------------------------------- events */
@@ -341,6 +410,57 @@ void test_cpu_events()
     check(event.done() && event.succeeded(), "the CPU event succeeded");
     check(event.note.empty(), "a CPU execution has no fallback note");
     check(queue->wait(event) == RT_STAGE_OK, "the CPU wait reports OK");
+}
+
+/*
+ * Driver double: reports Running once, then Failed. Used to exercise the event
+ * state machine through the real StageQueue::poll() without depending on a
+ * device error that hardware may not reproduce on demand.
+ */
+class FailingSubmission final : public StageSubmission
+{
+public:
+    RtStageStatus wait() override
+    {
+        status_ = StageEventStatus::Failed;
+        return RT_STAGE_ERROR;
+    }
+
+    StageEventStatus poll() override
+    {
+        if (polls_++ > 0) {
+            status_ = StageEventStatus::Failed;
+        }
+        return status_;
+    }
+
+    std::uint64_t elapsed_ns() const override
+    {
+        return 42;
+    }
+
+private:
+    int polls_ = 0;
+    StageEventStatus status_ = StageEventStatus::Running;
+};
+
+void test_failed_event()
+{
+    auto queue = cpu_device()->create_queue();
+    StageEvent event;
+    event.status = StageEventStatus::Running;
+    event.asynchronous = true;
+    event.submission = std::make_shared<FailingSubmission>();
+
+    check(queue->poll(event) == StageEventStatus::Running,
+          "a poll keeps a running submission running");
+    check(queue->poll(event) == StageEventStatus::Failed,
+          "a driver failure moves the event to Failed");
+    check(event.status == StageEventStatus::Failed,
+          "the failed status is stored on the event");
+    check(!event.succeeded(), "a failed event did not succeed");
+    check(event.elapsed_ns == 42,
+          "a failed event keeps the measured completion time");
 }
 
 void test_device_events(bool available)
@@ -404,7 +524,8 @@ void test_device_events(bool available)
     unknown.name = "no_such_stage";
     StageEvent missing = queue->submit(unknown, nullptr);
     check(!missing.asynchronous, "an unknown node is synchronous");
-    check(missing.device == StageDeviceType::CPU, "an unknown node runs on the CPU");
+    check(missing.device == StageDeviceType::NONE,
+          "an unknown node reports that nothing executed");
     check(missing.status == StageEventStatus::Failed, "an unknown node fails");
     check(missing.note.find("no OpenCL implementation") != std::string::npos,
           "an unimplemented node explains the fallback");
@@ -537,13 +658,19 @@ void test_node_parity(bool available)
         auto device_context = opencl_device()->create_context();
         set_node_device_override("lanczos3", StageNodeDevice::OpenCL);
         request.args = fixture.args(fixture.device_output, scale);
-        const RtStageStatus status = device_context->execute(request, nullptr);
+        StageExecution execution;
+        const RtStageStatus status =
+            device_context->execute(request, nullptr, &execution);
         clear_node_device_overrides();
         if (status != RT_STAGE_OK) {
             std::fprintf(stderr, "device execute status: %d\n",
                          static_cast<int>(status));
         }
         check(status == RT_STAGE_OK, "the device executes the resize node");
+        check(execution.device == StageDeviceType::OPENCL,
+              "the execute result names the device as the executor");
+        check(execution.asynchronous,
+              "the device execution was submitted asynchronously");
 
         StageDeviceResidency* residency = device_context->residency();
         check(residency != nullptr, "the device context has a residency");
@@ -574,10 +701,16 @@ void test_node_parity(bool available)
             request.name = "lanczos3";
             request.args = fixture.args(fixture.device_output, 0.5);
             set_node_device_override("lanczos3", StageNodeDevice::OpenCL);
-            const RtStageStatus status = context->execute(request, nullptr);
+            StageExecution over_budget;
+            const RtStageStatus status =
+                context->execute(request, nullptr, &over_budget);
             clear_node_device_overrides();
             check(status == RT_STAGE_OK,
                   "an over-budget node falls back to the host and succeeds");
+            check(over_budget.device == StageDeviceType::CPU,
+                  "an over-budget node reports the host as the executor");
+            check(!over_budget.asynchronous,
+                  "an over-budget node reports a synchronous execution");
             check(context->residency()->stats().refusals > 0,
                   "the over-budget fallback is counted as a refusal");
 
@@ -689,6 +822,16 @@ int main()
     if (!available) {
         std::printf("stage-residency: OpenCL unavailable (%s)\n", reason.c_str());
     }
+    const char* require = std::getenv("RT_REQUIRE_GPU");
+    const bool require_device = require != nullptr && require[0] != '\0' &&
+                                std::strcmp(require, "0") != 0;
+    if (!available && require_device) {
+        std::fprintf(stderr,
+                     "FAIL: RT_REQUIRE_GPU is set but no OpenCL device is "
+                     "available\n");
+        return 1;
+    }
+
     if (available) {
         const auto nodes = opencl_stage_nodes();
         check(!nodes.empty(), "at least one node has a device implementation");
@@ -697,6 +840,7 @@ int main()
     }
 
     test_cpu_events();
+    test_failed_event();
     test_device_events(available);
     test_selection(available);
     test_residency();

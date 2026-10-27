@@ -102,6 +102,13 @@ struct StageNodeSelection {
 bool node_has_device_implementation(const char* node);
 
 /*
+ * Device for one node without building the selection reason. The execution
+ * path uses this so the common CPU case costs two environment reads and no
+ * string allocation or override-map lock.
+ */
+StageNodeDevice node_device(const char* node);
+
+/*
  * Explicit selection for one node: the caller asks for a device and gets the
  * resolved choice. A node without a device implementation, a disabled device
  * or an active kill switch resolves to CPU with a reason.
@@ -116,10 +123,11 @@ StageNodeSelection select_node_device(const char* node,
 StageNodeSelection select_node_device(const char* node);
 
 /*
- * Process-wide kill switch, wired from the user's OpenCL preference. A false
- * value forces every node to CPU whatever the environment requests; the
- * default is true so an embedding without a preference still honours the
- * opt-in switch.
+ * Kill switch, wired from the user's OpenCL preference. It is per-thread, like
+ * opencl::setStageAllowed(), so a preview pass and a batch export in one
+ * process cannot overwrite each other's policy. A false value forces every
+ * node on that thread to CPU whatever the environment requests; the default is
+ * true so an embedding without a preference still honours the opt-in switch.
  */
 void set_opencl_stage_allowed(bool allowed);
 bool opencl_stage_allowed();

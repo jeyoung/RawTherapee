@@ -100,6 +100,10 @@ bool stage_buffer_layout(const StageBufferShape& shape, std::size_t& row_pitch,
     const std::size_t height = static_cast<std::size_t>(shape.height);
     const std::size_t planes = static_cast<std::size_t>(shape.planes);
 
+    if (shape.format == RT_STAGE_U8 && shape.planes != 1) {
+        return fail("packed U8 is a single-plane format");
+    }
+
     if (width > limit / sample_bytes) {
         return fail("buffer row overflows");
     }
@@ -131,6 +135,8 @@ const char* to_string(StageDeviceType type)
         return "cpu";
     case StageDeviceType::OPENCL:
         return "opencl";
+    case StageDeviceType::NONE:
+        return "none";
     }
     assert(false);
     return "unknown";
@@ -161,7 +167,7 @@ StageEvent StageQueue::submit(const StageRequest& request,
         StageEvent event;
         event.status = StageEventStatus::Failed;
         event.result = RT_STAGE_FALLBACK;
-        event.device = StageDeviceType::CPU;
+        event.device = StageDeviceType::NONE;
         event.note = error;
         return event;
     }
@@ -325,27 +331,34 @@ std::shared_ptr<StageProgram> StageContext::compile(const StageRequest& request,
 }
 
 RtStageStatus StageContext::execute(const StageRequest& request,
-                                    RtStageProfiling* profiling)
+                                    RtStageProfiling* profiling,
+                                    StageExecution* execution)
 {
-    if (device_type() == StageDeviceType::OPENCL) {
+    if (execution != nullptr) {
+        *execution = StageExecution{};
+    }
+
+    if (device_type() == StageDeviceType::OPENCL &&
+        node_device(request.name.c_str()) == StageNodeDevice::OpenCL) {
         /*
-         * Every node is selected independently: an unimplemented node, a
-         * disabled device or an exhausted budget runs on the host program in
-         * this same context, so a device problem never fails a render.
+         * The node was selected for the device. The queue reports the device
+         * that actually ran, so a budget or launch refusal inside the queue is
+         * visible to the caller instead of being papered over by the
+         * selection.
          */
-        const StageNodeSelection selection =
-            select_node_device(request.name.c_str());
-        if (selection.device == StageNodeDevice::OpenCL) {
-            StageQueue& context_queue = queue();
-            StageEvent event = context_queue.submit(request, nullptr);
-            const RtStageStatus status = context_queue.wait(event);
-            if (status == RT_STAGE_OK) {
-                if (profiling != nullptr) {
-                    *profiling = RtStageProfiling{};
-                    profiling->elapsed_ns = event.elapsed_ns;
-                }
-                return status;
+        StageQueue& context_queue = queue();
+        StageEvent event = context_queue.submit(request, nullptr);
+        const RtStageStatus status = context_queue.wait(event);
+        if (status == RT_STAGE_OK) {
+            if (profiling != nullptr) {
+                *profiling = RtStageProfiling{};
+                profiling->elapsed_ns = event.elapsed_ns;
             }
+            if (execution != nullptr) {
+                execution->device = event.device;
+                execution->asynchronous = event.asynchronous;
+            }
+            return status;
         }
     }
 
@@ -361,7 +374,12 @@ RtStageStatus StageContext::execute(const StageRequest& request,
     StageQueue& context_queue =
         device_type() == StageDeviceType::OPENCL ? host_queue() : queue();
     StageEvent event = context_queue.submit(*program, request.args, profiling);
-    return context_queue.wait(event);
+    const RtStageStatus status = context_queue.wait(event);
+    if (execution != nullptr) {
+        execution->device = event.device;
+        execution->asynchronous = event.asynchronous;
+    }
+    return status;
 }
 
 StageQueue& StageContext::host_queue()

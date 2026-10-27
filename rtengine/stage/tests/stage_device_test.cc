@@ -200,6 +200,8 @@ int main()
               "OpenCL queue refuses a compiled host program");
         check(event.result == RT_STAGE_FALLBACK,
               "OpenCL queue reports fallback for a host program");
+        check(event.device == StageDeviceType::NONE,
+              "a refused host program reports that nothing executed");
         check(ocl_queue->wait(event) == RT_STAGE_FALLBACK,
               "OpenCL wait reports fallback");
     }
@@ -287,6 +289,8 @@ int main()
           "device types have stable names");
     check(std::string(to_string(StageEventStatus::Failed)) == "failed",
           "event statuses have stable names");
+    check(std::string(to_string(StageDeviceType::NONE)) == "none",
+          "a non-execution has a stable name");
 
     /* Allocator guards. */
     error.clear();
