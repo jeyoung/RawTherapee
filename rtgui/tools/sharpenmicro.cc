@@ -35,7 +35,7 @@ SharpenMicro::SharpenMicro () : FoldableToolPanel(this, TOOL_NAME, M("TP_SHARPEN
 {
 
     auto m = ProcEventMapper::getInstance();
-    EvSharpenMicroContrast = m->newEvent(SHARPENING, "HISTORY_MSG_MICROCONTRAST_CONTRAST");
+    EvSharpenMicroContrast = m->newEvent(rtengine::RequestIntent::Sharpening, "HISTORY_MSG_MICROCONTRAST_CONTRAST");
 
     contrast = Gtk::manage(new Adjuster (M("TP_SHARPENMICRO_CONTRAST"), 0, 200, 1, 20));
     contrast->setAdjusterListener (this);

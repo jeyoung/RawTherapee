@@ -38,7 +38,7 @@ const Glib::ustring LCurve::TOOL_NAME = "labcurves";
 LCurve::LCurve() : FoldableToolPanel(this, TOOL_NAME, M("TP_LABCURVE_LABEL"), false, true)
 {
     auto m = ProcEventMapper::getInstance();
-    Evgamutmunsell = m->newEvent(LUMINANCECURVE, "HISTORY_MSG_GAMUTMUNSEL");
+    Evgamutmunsell = m->newEvent(rtengine::RequestIntent::LuminanceCurve, "HISTORY_MSG_GAMUTMUNSEL");
     CurveListener::setMulti(true);
     brightness = Gtk::manage(new Adjuster(M("TP_LABCURVE_BRIGHTNESS"), -100., 100., 1., 0.));
     contrast   = Gtk::manage(new Adjuster(M("TP_LABCURVE_CONTRAST"), -100., 100., 1., 0.));

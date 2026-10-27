@@ -116,8 +116,8 @@ ControlSpotPanel::ControlSpotPanel():
     maskPrevActive(false)
 {
     auto m = ProcEventMapper::getInstance();
-    EvLocallabavoidgamutMethod = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_GAMUTMUNSEL");
-    EvLocallabavoidnegative =  m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_AVOIDNEGATIVE");
+    EvLocallabavoidgamutMethod = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_GAMUTMUNSEL");
+    EvLocallabavoidnegative =  m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_AVOIDNEGATIVE");
     const bool showtooltip = App::get().options().showtooltip;
 
 //    pack_start(*hishow_);

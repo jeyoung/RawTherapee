@@ -34,8 +34,8 @@ const Glib::ustring SoftLight::TOOL_NAME = "softlight";
 SoftLight::SoftLight(): FoldableToolPanel(this, TOOL_NAME, M("TP_SOFTLIGHT_LABEL"), false, true)
 {
     auto m = ProcEventMapper::getInstance();
-    EvSoftLightEnabled = m->newEvent(LUMINANCECURVE, "HISTORY_MSG_SOFTLIGHT_ENABLED");
-    EvSoftLightStrength = m->newEvent(LUMINANCECURVE, "HISTORY_MSG_SOFTLIGHT_STRENGTH");
+    EvSoftLightEnabled = m->newEvent(rtengine::RequestIntent::LuminanceCurve, "HISTORY_MSG_SOFTLIGHT_ENABLED");
+    EvSoftLightStrength = m->newEvent(rtengine::RequestIntent::LuminanceCurve, "HISTORY_MSG_SOFTLIGHT_STRENGTH");
     
     strength = Gtk::manage(new Adjuster(M("TP_SOFTLIGHT_STRENGTH"), 0., 100., 1., 30.));
     strength->setAdjusterListener(this);

@@ -142,21 +142,21 @@ ColorAppearance::ColorAppearance () : FoldableToolPanel (this, TOOL_NAME, M ("TP
     milestones.push_back ( GradientMilestone (1., 1., 1., 1.) );
 
     auto m = ProcEventMapper::getInstance();
-    EvCATAutotempout = m->newEvent(LUMINANCECURVE, "HISTORY_MSG_TEMPOUT");
-    EvCATillum = m->newEvent(LUMINANCECURVE, "HISTORY_MSG_ILLUM");
-    EvCATcomplex = m->newEvent(LUMINANCECURVE, "HISTORY_MSG_CATCOMPLEX");
-    EvCATmodel = m->newEvent(LUMINANCECURVE, "HISTORY_MSG_CATMODEL");
-    EvCATcat = m->newEvent(LUMINANCECURVE, "HISTORY_MSG_CATCAT");
-    EvCATcolorhred = m->newEvent(LUMINANCECURVE, "HISTORY_MSG_CATHUERED");
-    EvCATschromared = m->newEvent(LUMINANCECURVE, "HISTORY_MSG_CATSCHROMARED");
-    EvCATcolorhgreen = m->newEvent(LUMINANCECURVE, "HISTORY_MSG_CATHUEGREEN");
-    EvCATschromagreen = m->newEvent(LUMINANCECURVE, "HISTORY_MSG_CATSCHROMAGREEN");
-    EvCATcolorhblue = m->newEvent(LUMINANCECURVE, "HISTORY_MSG_CATHUEBLUE");
-    EvCATschromablue = m->newEvent(LUMINANCECURVE, "HISTORY_MSG_CATSCHROMABLUE");
-    EvCATCurvered = m->newEvent(LUMINANCECURVE, "HISTORY_MSG_CATCURVERED");
-    EvCATCurvegreen = m->newEvent(LUMINANCECURVE, "HISTORY_MSG_CATCURVEGREEN");
-    EvCATCurveblue = m->newEvent(LUMINANCECURVE, "HISTORY_MSG_CATCURVEBLUE");
-    EvCATbrighthres = m->newEvent(LUMINANCECURVE, "HISTORY_MSG_CATBRIGHTRES");
+    EvCATAutotempout = m->newEvent(rtengine::RequestIntent::LuminanceCurve, "HISTORY_MSG_TEMPOUT");
+    EvCATillum = m->newEvent(rtengine::RequestIntent::LuminanceCurve, "HISTORY_MSG_ILLUM");
+    EvCATcomplex = m->newEvent(rtengine::RequestIntent::LuminanceCurve, "HISTORY_MSG_CATCOMPLEX");
+    EvCATmodel = m->newEvent(rtengine::RequestIntent::LuminanceCurve, "HISTORY_MSG_CATMODEL");
+    EvCATcat = m->newEvent(rtengine::RequestIntent::LuminanceCurve, "HISTORY_MSG_CATCAT");
+    EvCATcolorhred = m->newEvent(rtengine::RequestIntent::LuminanceCurve, "HISTORY_MSG_CATHUERED");
+    EvCATschromared = m->newEvent(rtengine::RequestIntent::LuminanceCurve, "HISTORY_MSG_CATSCHROMARED");
+    EvCATcolorhgreen = m->newEvent(rtengine::RequestIntent::LuminanceCurve, "HISTORY_MSG_CATHUEGREEN");
+    EvCATschromagreen = m->newEvent(rtengine::RequestIntent::LuminanceCurve, "HISTORY_MSG_CATSCHROMAGREEN");
+    EvCATcolorhblue = m->newEvent(rtengine::RequestIntent::LuminanceCurve, "HISTORY_MSG_CATHUEBLUE");
+    EvCATschromablue = m->newEvent(rtengine::RequestIntent::LuminanceCurve, "HISTORY_MSG_CATSCHROMABLUE");
+    EvCATCurvered = m->newEvent(rtengine::RequestIntent::LuminanceCurve, "HISTORY_MSG_CATCURVERED");
+    EvCATCurvegreen = m->newEvent(rtengine::RequestIntent::LuminanceCurve, "HISTORY_MSG_CATCURVEGREEN");
+    EvCATCurveblue = m->newEvent(rtengine::RequestIntent::LuminanceCurve, "HISTORY_MSG_CATCURVEBLUE");
+    EvCATbrighthres = m->newEvent(rtengine::RequestIntent::LuminanceCurve, "HISTORY_MSG_CATBRIGHTRES");
 
     //preset button cat02/16
     Gtk::Frame *genFrame;

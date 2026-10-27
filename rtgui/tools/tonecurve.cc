@@ -39,7 +39,7 @@ const Glib::ustring ToneCurve::TOOL_NAME = "tonecurve";
 ToneCurve::ToneCurve() : FoldableToolPanel(this, TOOL_NAME, M("TP_EXPOSURE_LABEL"))
 {
     auto m = ProcEventMapper::getInstance();
-    EvHistMatching = m->newEvent(AUTOEXP, "HISTORY_MSG_HISTMATCHING");
+    EvHistMatching = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_HISTMATCHING");
     EvHistMatchingBatch = m->newEvent(rtengine::RequestIntent::ControlOnly, "HISTORY_MSG_HISTMATCHING");
     EvClampOOG = m->newEvent(rtengine::RequestIntent::DarkFrame, "HISTORY_MSG_CLAMPOOG");
     EvHLbl = m->newEvent(rtengine::RequestIntent::Demosaic, "HISTORY_MSG_HLBL");

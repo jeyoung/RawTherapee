@@ -31,11 +31,14 @@
 #include "rtengine/refreshmap.h"
 #include "rtengine/stage/stage_work.h"
 
+#include <algorithm>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
+#include <regex>
 #include <sstream>
 #include <string>
 #include <sys/wait.h>
@@ -472,7 +475,12 @@ const std::vector<IntentExpectation>& intentExpectations()
         {RequestIntent::Compr, "Compr", COMPR},
         {RequestIntent::CaptureSharpen, "CaptureSharpen", CAPTURESHARPEN},
         {RequestIntent::DarkFrame, "DarkFrame", DARKFRAME},
-        {RequestIntent::First, "First", FIRST}
+        {RequestIntent::First, "First", FIRST},
+        {RequestIntent::AutoExposure, "AutoExposure", AUTOEXP},
+        {RequestIntent::LuminanceCurve, "LuminanceCurve", LUMINANCECURVE},
+        {RequestIntent::DirPyrEqualizer, "DirPyrEqualizer", DIRPYREQUALIZER},
+        {RequestIntent::RgbCurve, "RgbCurve", RGBCURVE},
+        {RequestIntent::Sharpening, "Sharpening", SHARPENING}
     };
     return rows;
 }
@@ -626,13 +634,41 @@ void checkProducerEventKey()
                 continue;
             }
 
+            const EditorRequest leftRequest = make_request(left.intent);
+            const EditorRequest rightRequest = make_request(right.intent);
+
+            /*
+             * The key carries the planning identity and the compatibility
+             * mask. Two intents that differ in either must therefore stay
+             * distinct even when they share a history message.
+             */
+            if (leftRequest.identity() == rightRequest.identity()
+                    && leftRequest.legacyGateMask
+                        == rightRequest.legacyGateMask) {
+                continue;
+            }
+
             const std::string label =
                 std::string("key uniqueness ") + left.name + "/" + right.name;
-            check(producerEventKey(make_request(left.intent), "msg")
-                      != producerEventKey(make_request(right.intent), "msg"),
+            check(producerEventKey(leftRequest, "msg")
+                      != producerEventKey(rightRequest, "msg"),
                   label);
         }
     }
+
+    /*
+     * DIRPYREQUALIZER and SHARPENING have the same legacy composite and the
+     * same planning identity, so the history message is the only discriminator
+     * between two such actions. Real producers always pass distinct messages.
+     */
+    const EditorRequest dirPyr = make_request(RequestIntent::DirPyrEqualizer);
+    const EditorRequest sharpening = make_request(RequestIntent::Sharpening);
+    check(dirPyr.identity() == sharpening.identity()
+              && dirPyr.legacyGateMask == sharpening.legacyGateMask,
+          "DirPyrEqualizer and Sharpening share their planning payload");
+    check(producerEventKey(dirPyr, "HISTORY_MSG_DIRPYREQUALIZER")
+              != producerEventKey(sharpening, "HISTORY_MSG_SHARPENING"),
+          "the history message keeps same-payload actions distinct");
 }
 
 /*
@@ -792,6 +828,152 @@ void checkConvertedProducerIntents()
                         "resize");
 }
 
+/*
+ * Remove comments from a source file so a commented-out producer cannot make
+ * the scan pass or fail for the wrong reason. String and character literals
+ * are respected, because a history message may contain `//`.
+ */
+std::string stripComments(const std::string& text)
+{
+    std::string result;
+    result.reserve(text.size());
+
+    bool lineComment = false;
+    bool blockComment = false;
+    bool inString = false;
+    bool inChar = false;
+
+    for (std::size_t index = 0; index < text.size(); ++index) {
+        const char current = text[index];
+        const char next =
+            index + 1 < text.size() ? text[index + 1] : '\0';
+
+        if (lineComment) {
+            if (current == '\n') {
+                lineComment = false;
+                result += current;
+            }
+            continue;
+        }
+        if (blockComment) {
+            if (current == '*' && next == '/') {
+                blockComment = false;
+                ++index;
+            } else if (current == '\n') {
+                result += current;
+            }
+            continue;
+        }
+        if (inString || inChar) {
+            result += current;
+            if (current == '\\' && next != '\0') {
+                result += next;
+                ++index;
+            } else if ((inString && current == '"')
+                       || (inChar && current == '\'')) {
+                inString = false;
+                inChar = false;
+            }
+            continue;
+        }
+        if (current == '/' && next == '/') {
+            lineComment = true;
+            ++index;
+            continue;
+        }
+        if (current == '/' && next == '*') {
+            blockComment = true;
+            ++index;
+            continue;
+        }
+        if (current == '"') {
+            inString = true;
+        } else if (current == '\'') {
+            inChar = true;
+        }
+        result += current;
+    }
+
+    return result;
+}
+
+/*
+ * The typed producer API is the only producer entry point. Every `newEvent`
+ * call in `rtgui/` must name a typed request; the compatibility overload is
+ * retained only in `eventmapper.cc`/`.h`, which define the adapter and are
+ * therefore skipped. This is a source check because the tools are GUI
+ * widgets and constructing them here would pull in the whole toolkit.
+ */
+void checkNoLegacyProducerCalls()
+{
+    namespace fs = std::filesystem;
+
+    const fs::path root = fs::path(RT_SOURCE_DIR) / "rtgui";
+    const std::regex callPattern(
+        R"(newEvent\s*\(\s*([A-Za-z_][A-Za-z0-9_:]*))");
+
+    std::size_t files = 0;
+    std::size_t calls = 0;
+    std::vector<std::string> violations;
+
+    std::error_code error;
+    for (fs::recursive_directory_iterator it(root, error), end;
+         it != end && !error; it.increment(error)) {
+        if (!it->is_regular_file()) {
+            continue;
+        }
+
+        const std::string suffix = it->path().extension().string();
+        if (suffix != ".cc" && suffix != ".h" && suffix != ".hpp") {
+            continue;
+        }
+
+        const std::string relative =
+            fs::relative(it->path(), root).generic_string();
+        if (relative == "eventmapper.cc" || relative == "eventmapper.h") {
+            continue;
+        }
+
+        std::ifstream stream(it->path());
+        if (!stream) {
+            check(false, "producer scan cannot read " + it->path().string());
+            continue;
+        }
+
+        std::ostringstream buffer;
+        buffer << stream.rdbuf();
+        const std::string content = stripComments(buffer.str());
+
+        ++files;
+        for (std::sregex_iterator match(
+                 content.begin(), content.end(), callPattern),
+             last;
+             match != last; ++match) {
+            ++calls;
+            const std::string argument = (*match)[1].str();
+            if (argument.rfind("rtengine::", 0) != 0) {
+                const std::size_t offset =
+                    static_cast<std::size_t>(match->position());
+                const std::size_t line = static_cast<std::size_t>(
+                    std::count(content.begin(), content.begin() + offset,
+                               '\n')) + 1;
+                violations.push_back(relative + ":" + std::to_string(line)
+                                     + ": " + argument);
+            }
+        }
+    }
+
+    check(!error, "producer scan completed: " + error.message());
+    check(files > 0, "producer scan found GUI sources");
+    check(calls > 0, "producer scan found typed producer calls");
+    for (const std::string& violation : violations) {
+        check(false, "legacy newEvent producer call: " + violation);
+    }
+
+    std::printf("editorrequest-test: producer scan: %zu files, %zu calls\n",
+                files, calls);
+}
+
 void checkIdentity()
 {
     /*
@@ -919,6 +1101,7 @@ int main()
     checkFastPathAugmentation();
     checkCropReallocationWorkOrder();
     checkConvertedProducerIntents();
+    checkNoLegacyProducerCalls();
     checkIdentity();
     checkContractViolations();
 

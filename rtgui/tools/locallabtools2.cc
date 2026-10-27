@@ -160,7 +160,7 @@ LocallabTone::LocallabTone():
     Lmasktmshape(static_cast<DiagonalCurveEditor*>(mask2tmCurveEditorG->addCurve(CT_Diagonal, "L(L)")))
 {
     auto m = ProcEventMapper::getInstance();
-    Evlocallabpreviewtm = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_PREVIEWTM");
+    Evlocallabpreviewtm = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_PREVIEWTM");
     
     set_orientation(Gtk::ORIENTATION_VERTICAL);
 
@@ -935,7 +935,7 @@ LocallabRetinex::LocallabRetinex():
 {
 
     auto m = ProcEventMapper::getInstance();
-    Evlocallabdehazeblack = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_DEHAZE_BLACK");
+    Evlocallabdehazeblack = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_DEHAZE_BLACK");
 
     set_orientation(Gtk::ORIENTATION_VERTICAL);
 
@@ -2142,19 +2142,19 @@ LocallabSharp::LocallabSharp():
     
     auto m = ProcEventMapper::getInstance();
     //rtengine::ProcEvent EvlocallabenacieMaskall;
-    Evlocallabmethodcap = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_METHODCAP");
-    Evlocallabcapradius = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CAPRADIUS");
-    Evlocallabautoradiuson = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_AUTOCAPRADIUS");
-    Evlocallabautoradiusoff = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_AUTOCAPRADIUS");
-    Evlocallabsharcontraston = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_AUTOSHAR");
-    Evlocallabsharcontrastoff = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_AUTOSHAR");
-    Evlocallababdconvboost = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CONVBOOST");
-    Evlocallababdcoprot = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CONVPROT");
-    Evlocallababdconvlat = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CONVLAT");
-    Evlocallabsharrepar = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_SHARREPAR");
-    Evlocallababsharshow = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_SHARSHOW");   
-    Evlocallababitercheck = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_SHARITERCHECK");   
-    Evlocallababdconvgam = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CONVGAM");
+    Evlocallabmethodcap = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_METHODCAP");
+    Evlocallabcapradius = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CAPRADIUS");
+    Evlocallabautoradiuson = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_AUTOCAPRADIUS");
+    Evlocallabautoradiusoff = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_AUTOCAPRADIUS");
+    Evlocallabsharcontraston = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_AUTOSHAR");
+    Evlocallabsharcontrastoff = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_AUTOSHAR");
+    Evlocallababdconvboost = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CONVBOOST");
+    Evlocallababdcoprot = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CONVPROT");
+    Evlocallababdconvlat = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CONVLAT");
+    Evlocallabsharrepar = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_SHARREPAR");
+    Evlocallababsharshow = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_SHARSHOW");
+    Evlocallababitercheck = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_SHARITERCHECK");
+    Evlocallababdconvgam = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CONVGAM");
     set_orientation(Gtk::ORIENTATION_VERTICAL);
     capradius->addAutoButton(M("TP_SHARPENING_EDRADIUS_TOOLTIP"));
     sharcontrast->addAutoButton(M("TP_SHARPENING_CONTRASTAUTO_TOOLTIP"));
@@ -2998,13 +2998,13 @@ LocallabContrast::LocallabContrast():
     Lmasklcshape(static_cast<DiagonalCurveEditor*>(mask2lcCurveEditorG->addCurve(CT_Diagonal, "L(L)")))
 {
     auto m = ProcEventMapper::getInstance();
-    Evlocallabpreviewlc = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_PREVIEWLC");
-    Evlocallabfeatherwav = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_FEATHERWAV");
-    Evlocallaboffslc = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_OFFSETWAV");
+    Evlocallabpreviewlc = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_PREVIEWLC");
+    Evlocallabfeatherwav = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_FEATHERWAV");
+    Evlocallaboffslc = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_OFFSETWAV");
 
-    Evlocallabprocesswav = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_PROCESSWAV");
-    Evlocallablimitwav = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_LIMITWAV");
-    Evlocallabgradlc = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_GRADWAV");
+    Evlocallabprocesswav = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_PROCESSWAV");
+    Evlocallablimitwav = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_LIMITWAV");
+    Evlocallabgradlc = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_GRADWAV");
     
     set_orientation(Gtk::ORIENTATION_VERTICAL);
 
@@ -6041,13 +6041,13 @@ LocallabLog::LocallabLog():
 
 {
     auto m = ProcEventMapper::getInstance();
-    Evlocallabpreviewlog = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_PREVIEWLOG");
-    Evlocallabwhiteslog = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_LOG_WHITES");
-    Evlocallabblackslog = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_LOG_BLACKS");
-    Evlocallabcomprlog = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_LOG_COMPR");
-    Evlocallabstrelog = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_LOG_STRE");
-    Evlocallabsatlog = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_LOG_SAT");
-    Evlocallabfeatherlog = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_FEATHERLOG");
+    Evlocallabpreviewlog = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_PREVIEWLOG");
+    Evlocallabwhiteslog = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_LOG_WHITES");
+    Evlocallabblackslog = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_LOG_BLACKS");
+    Evlocallabcomprlog = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_LOG_COMPR");
+    Evlocallabstrelog = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_LOG_STRE");
+    Evlocallabsatlog = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_LOG_SAT");
+    Evlocallabfeatherlog = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_FEATHERLOG");
 
     set_orientation(Gtk::ORIENTATION_VERTICAL);
 
@@ -7541,8 +7541,8 @@ LocallabMask::LocallabMask():
 {
 
     auto m = ProcEventMapper::getInstance();
-    Evlocallabpreviewmas = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_PREVIEWMAS");
-    Evlocallabfeather_mask = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_FEATHERMAS");
+    Evlocallabpreviewmas = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_PREVIEWMAS");
+    Evlocallabfeather_mask = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_FEATHERMAS");
     
     set_orientation(Gtk::ORIENTATION_VERTICAL);
 
@@ -8736,108 +8736,108 @@ Locallabcie::Locallabcie():
 
 {
     auto m = ProcEventMapper::getInstance();
-    Evlocallabpreviewcie = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_PREVIEWCIE");
-    Evlocallabnormcie12 = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIE_NORM");
-    Evlocallabnormcie = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIE_NORM11");
-    Evlocallabstrumaskcie = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIEMASK_STRU");
-    EvLocallabtoolcie = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIEMASK_STRU_TOOL");
-    EvLocallabfftcieMask = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIEMASK_BLURFFT");
-    Evlocallabcontcie = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIEMASK_BLURCONT");
-    Evlocallabblurcie = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIEMASK_BLURRAD");
-    Evlocallabhighmaskcie = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIEMASK_HIGH");
-    Evlocallabshadmaskcie = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIEMASK_SHAD");
-    EvlocallabLLmaskcieshapewav = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIEMASK_WLC");
-    EvlocallabcsThresholdcie = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIEMASK_WLEV");
+    Evlocallabpreviewcie = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_PREVIEWCIE");
+    Evlocallabnormcie12 = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIE_NORM");
+    Evlocallabnormcie = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIE_NORM11");
+    Evlocallabstrumaskcie = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIEMASK_STRU");
+    EvLocallabtoolcie = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIEMASK_STRU_TOOL");
+    EvLocallabfftcieMask = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIEMASK_BLURFFT");
+    Evlocallabcontcie = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIEMASK_BLURCONT");
+    Evlocallabblurcie = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIEMASK_BLURRAD");
+    Evlocallabhighmaskcie = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIEMASK_HIGH");
+    Evlocallabshadmaskcie = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIEMASK_SHAD");
+    EvlocallabLLmaskcieshapewav = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIEMASK_WLC");
+    EvlocallabcsThresholdcie = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIEMASK_WLEV");
     Evlocallabcomprcie = m->newEvent(rtengine::RequestIntent::Hdr, "HISTORY_MSG_LOCAL_CIE_BRICOMP");
     Evlocallabstrcielog = m->newEvent(rtengine::RequestIntent::Hdr, "HISTORY_MSG_LOCAL_CIE_STRLOG");
     Evlocallabsatcie = m->newEvent(rtengine::RequestIntent::Hdr, "HISTORY_MSG_LOCAL_CIE_SATCIE");
     Evlocallablogcieq = m->newEvent(rtengine::RequestIntent::Hdr, "HISTORY_MSG_LOCAL_CIE_LOGCIEQ");
     Evlocallabcomprcieth = m->newEvent(rtengine::RequestIntent::Hdr, "HISTORY_MSG_LOCAL_CIE_BRICOMPTH");
-    EvlocallabHHhmaskcieshape = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIEMASK_CHH");
-    EvlocallabbwevMethod12 = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIE_SIGMET");
-    Evlocallabgamjcie = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIE_GAM");
-    Evlocallabslopjcie = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIE_SLOP");
-    Evlocallabsatjcie = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIE_SAT");
-    Evlocallabsmoothjcie = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIE_SMOOTHJCIE");
+    EvlocallabHHhmaskcieshape = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIEMASK_CHH");
+    EvlocallabbwevMethod12 = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIE_SIGMET");
+    Evlocallabgamjcie = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIE_GAM");
+    Evlocallabslopjcie = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIE_SLOP");
+    Evlocallabsatjcie = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIE_SAT");
+    Evlocallabsmoothjcie = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIE_SMOOTHJCIE");
 
-    Evlocallabmidtciemet = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIE_MIDTMET");
-    Evlocallabmidtcie = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIE_MIDT");
-    Evlocallabcontsig = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIE_CONTSIG");
-    Evlocallabskewsig = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIE_SKEWSIG");
-    Evlocallabwhitsig = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIE_WHITSIG");
-    Evlocallabslopesmo = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIE_SLOPESMO");
-    Evlocallabslopesmoq = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIE_SLOPESMOQ");
-    Evlocallabslopesmor = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIE_SLOPESMOR");
-    Evlocallabslopesmog = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIE_SLOPESMOG");
-    Evlocallabslopesmob = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIE_SLOPESMOB");
-    Evlocallabkslopesmor = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIE_KSLOPESMOR");
-    Evlocallabkslopesmog = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIE_KSLOPESMOG");
-    Evlocallabkslopesmob = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIE_KSLOPESMOB");
-    Evlocallabsmoothcie = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIE_SMOOTH");
-    Evlocallabsmoothcielnk = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIE_SMOOTHLNK");
-    Evlocallabsmoothcieinv = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIE_SMOOTHINV");
-    Evlocallabsmoothcietrc = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIE_SMOOTHTRC");
-    Evlocallabsmoothcietrcrel = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIE_SMOOTHTRCREL");
-    Evlocallabsmoothcieyb = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIE_SMOOTHYB");
-    Evlocallabsmoothcieth = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIE_SMOOTHTH");
-    Evlocallabsmoothciethtrc = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIE_SMOOTHTHTRC");
-    Evlocallabsmoothcielum = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIE_SMOOTH_LUM");
-    Evlocallabsmoothciehigh = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIE_SMOOTH_HIGH");
-    Evlocallabsigcie = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIE_SIG");
-    Evlocallabillcie = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIE_ILL");
-    Evlocallabprimcie = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIE_PRIM");
-    Evlocallabcatcie = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIE_CAT");
-    Evlocallabwhitescie = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIE_WHITES");
-    Evlocallabblackscie = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIE_BLACKS");
-    Evlocallabredxl = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIE_REDXL");
-    Evlocallabredyl = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIE_REDYL");
-    Evlocallabgrexl = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIE_GREXL");
-    Evlocallabgreyl = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIE_GREYL");
-    Evlocallabbluxl = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIE_BLUXL");
-    Evlocallabbluyl = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIE_BLUYL");
-    EvlocallabGridciexy = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIE_LABGRIDCIE");
-    Evlocallabgamutcie = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIE_GAMUTCIE");
-    Evlocallabbwcie = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIE_BWCIE");
-    Evlocallabexpprecam = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIE_EXPPRECAM");
-    Evlocallablightsigqcie12 = m->newEvent(AUTOEXP, "");
-    Evlocallabcontsigqcie = m->newEvent(AUTOEXP, "");
-    Evlocallabrefi = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIE_REFI");
-    Evlocallabshiftxl = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIE_SHIFTXL");
-    Evlocallabshiftyl = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIE_SHIFTYL");
-    Evlocallabanggradcie = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIE_ANGGRAD");
-    Evlocallabstrgradcie = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIE_STRGRAD");
-    Evlocallabdetailciejz = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIE_DETAILJZ");
-    EvlocallabenacieMaskall = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIE_ENAMASKALL");
-    Evlocallabsmoothciemet = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIE_SMOOTHMET");
-    Evlocallabfeathercie = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_FEATHERCIE");
-    EvlocallabmodeQJ = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_QJMETHOD");
-    EvlocallabbwevMethod = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIE_WEVMETHOD11");
-    Evlocallabsigmoidldacie = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_SIGDACIE");
-    Evlocallabsigmoidthcie = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_SIGTHCIE");
-    Evlocallabsigmoidblcie = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_SIGBLCIE");
-    Evlocallabsigq = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_SIGQ11");
-    Evlocallabsigq_12 = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_SIGQ12");
-    Evlocallabsigjz = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_SIGJZ11");
-    Evlocallabforcebw = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_SIGFORCEBW");
-    Evlocallabsigmoidldajzcie = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_SIGJZ11CONT");
-    Evlocallabsigmoidthjzcie = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_SIGJZ11GRAY");
-    Evlocallabsigmoidbljzcie = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_SIGJZ11BL");
-    Evlocallabsigmoidsenscie = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_SIGSENSICIE");
-    Evlocallabblurciede = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_BLURCIEDE");
-    Evlocallablogcie_12 = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_LOGCIE12");
-    Evlocallabcolorhred = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIE_RGB_COLORHRED");
-    Evlocallabschromared = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIE_RGB_SCHROMARED");
-    Evlocallabshapered = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIE_RGB_SHAPERED");
-    Evlocallabcolorhgreen = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIE_RGB_COLORHGREEN");
-    Evlocallabschromagreen = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIE_RGB_SCHROMAGREEN");
-    Evlocallabshapegreen = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIE_RGB_SHAPEGREEN");
-    Evlocallabcolorhblue = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIE_RGB_COLORHBLUE");
-    Evlocallabschromablue = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIE_RGB_SCHROMABLUE");
-    Evlocallabshapeblue = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIE_RGB_SHAPEBLUE");
-    Evlocallabgamgain = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIE_GAMGAIN");
-    Evlocallabgampower = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIE_GAMPOWER");
-    Evlocallabgamutw = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIE_GAMLIST");
-    Evlocallabbrighthres = m->newEvent(AUTOEXP, "HISTORY_MSG_LOCAL_CIE_RGB_BRIGHTHRES");
+    Evlocallabmidtciemet = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIE_MIDTMET");
+    Evlocallabmidtcie = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIE_MIDT");
+    Evlocallabcontsig = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIE_CONTSIG");
+    Evlocallabskewsig = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIE_SKEWSIG");
+    Evlocallabwhitsig = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIE_WHITSIG");
+    Evlocallabslopesmo = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIE_SLOPESMO");
+    Evlocallabslopesmoq = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIE_SLOPESMOQ");
+    Evlocallabslopesmor = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIE_SLOPESMOR");
+    Evlocallabslopesmog = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIE_SLOPESMOG");
+    Evlocallabslopesmob = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIE_SLOPESMOB");
+    Evlocallabkslopesmor = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIE_KSLOPESMOR");
+    Evlocallabkslopesmog = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIE_KSLOPESMOG");
+    Evlocallabkslopesmob = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIE_KSLOPESMOB");
+    Evlocallabsmoothcie = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIE_SMOOTH");
+    Evlocallabsmoothcielnk = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIE_SMOOTHLNK");
+    Evlocallabsmoothcieinv = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIE_SMOOTHINV");
+    Evlocallabsmoothcietrc = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIE_SMOOTHTRC");
+    Evlocallabsmoothcietrcrel = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIE_SMOOTHTRCREL");
+    Evlocallabsmoothcieyb = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIE_SMOOTHYB");
+    Evlocallabsmoothcieth = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIE_SMOOTHTH");
+    Evlocallabsmoothciethtrc = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIE_SMOOTHTHTRC");
+    Evlocallabsmoothcielum = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIE_SMOOTH_LUM");
+    Evlocallabsmoothciehigh = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIE_SMOOTH_HIGH");
+    Evlocallabsigcie = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIE_SIG");
+    Evlocallabillcie = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIE_ILL");
+    Evlocallabprimcie = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIE_PRIM");
+    Evlocallabcatcie = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIE_CAT");
+    Evlocallabwhitescie = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIE_WHITES");
+    Evlocallabblackscie = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIE_BLACKS");
+    Evlocallabredxl = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIE_REDXL");
+    Evlocallabredyl = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIE_REDYL");
+    Evlocallabgrexl = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIE_GREXL");
+    Evlocallabgreyl = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIE_GREYL");
+    Evlocallabbluxl = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIE_BLUXL");
+    Evlocallabbluyl = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIE_BLUYL");
+    EvlocallabGridciexy = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIE_LABGRIDCIE");
+    Evlocallabgamutcie = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIE_GAMUTCIE");
+    Evlocallabbwcie = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIE_BWCIE");
+    Evlocallabexpprecam = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIE_EXPPRECAM");
+    Evlocallablightsigqcie12 = m->newEvent(rtengine::RequestIntent::AutoExposure, "");
+    Evlocallabcontsigqcie = m->newEvent(rtengine::RequestIntent::AutoExposure, "");
+    Evlocallabrefi = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIE_REFI");
+    Evlocallabshiftxl = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIE_SHIFTXL");
+    Evlocallabshiftyl = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIE_SHIFTYL");
+    Evlocallabanggradcie = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIE_ANGGRAD");
+    Evlocallabstrgradcie = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIE_STRGRAD");
+    Evlocallabdetailciejz = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIE_DETAILJZ");
+    EvlocallabenacieMaskall = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIE_ENAMASKALL");
+    Evlocallabsmoothciemet = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIE_SMOOTHMET");
+    Evlocallabfeathercie = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_FEATHERCIE");
+    EvlocallabmodeQJ = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_QJMETHOD");
+    EvlocallabbwevMethod = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIE_WEVMETHOD11");
+    Evlocallabsigmoidldacie = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_SIGDACIE");
+    Evlocallabsigmoidthcie = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_SIGTHCIE");
+    Evlocallabsigmoidblcie = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_SIGBLCIE");
+    Evlocallabsigq = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_SIGQ11");
+    Evlocallabsigq_12 = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_SIGQ12");
+    Evlocallabsigjz = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_SIGJZ11");
+    Evlocallabforcebw = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_SIGFORCEBW");
+    Evlocallabsigmoidldajzcie = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_SIGJZ11CONT");
+    Evlocallabsigmoidthjzcie = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_SIGJZ11GRAY");
+    Evlocallabsigmoidbljzcie = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_SIGJZ11BL");
+    Evlocallabsigmoidsenscie = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_SIGSENSICIE");
+    Evlocallabblurciede = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_BLURCIEDE");
+    Evlocallablogcie_12 = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_LOGCIE12");
+    Evlocallabcolorhred = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIE_RGB_COLORHRED");
+    Evlocallabschromared = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIE_RGB_SCHROMARED");
+    Evlocallabshapered = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIE_RGB_SHAPERED");
+    Evlocallabcolorhgreen = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIE_RGB_COLORHGREEN");
+    Evlocallabschromagreen = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIE_RGB_SCHROMAGREEN");
+    Evlocallabshapegreen = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIE_RGB_SHAPEGREEN");
+    Evlocallabcolorhblue = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIE_RGB_COLORHBLUE");
+    Evlocallabschromablue = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIE_RGB_SCHROMABLUE");
+    Evlocallabshapeblue = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIE_RGB_SHAPEBLUE");
+    Evlocallabgamgain = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIE_GAMGAIN");
+    Evlocallabgampower = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIE_GAMPOWER");
+    Evlocallabgamutw = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIE_GAMLIST");
+    Evlocallabbrighthres = m->newEvent(rtengine::RequestIntent::AutoExposure, "HISTORY_MSG_LOCAL_CIE_RGB_BRIGHTHRES");
 
     set_orientation(Gtk::ORIENTATION_VERTICAL);
 

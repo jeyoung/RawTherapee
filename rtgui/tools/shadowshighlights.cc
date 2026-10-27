@@ -30,7 +30,7 @@ const Glib::ustring ShadowsHighlights::TOOL_NAME = "shadowshighlights";
 ShadowsHighlights::ShadowsHighlights () : FoldableToolPanel(this, TOOL_NAME, M("TP_SHADOWSHLIGHTS_LABEL"), false, true)
 {
     auto m = ProcEventMapper::getInstance();
-    EvSHColorspace = m->newEvent(LUMINANCECURVE, "HISTORY_MSG_SH_COLORSPACE");
+    EvSHColorspace = m->newEvent(rtengine::RequestIntent::LuminanceCurve, "HISTORY_MSG_SH_COLORSPACE");
 
     Gtk::Box* hb = Gtk::manage (new Gtk::Box ());
     hb->pack_start(*Gtk::manage(new Gtk::Label(M("TP_DIRPYRDENOISE_MAIN_COLORSPACE") + ": ")), Gtk::PACK_SHRINK);

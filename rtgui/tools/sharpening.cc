@@ -28,8 +28,8 @@ const Glib::ustring Sharpening::TOOL_NAME = "sharpening";
 Sharpening::Sharpening () : FoldableToolPanel(this, TOOL_NAME, M("TP_SHARPENING_LABEL"), true, true)
 {
     auto m = ProcEventMapper::getInstance();
-    EvSharpenContrast = m->newEvent(SHARPENING, "HISTORY_MSG_SHARPENING_CONTRAST");
-    EvSharpenBlur = m->newEvent(SHARPENING, "HISTORY_MSG_SHARPENING_BLUR");
+    EvSharpenContrast = m->newEvent(rtengine::RequestIntent::Sharpening, "HISTORY_MSG_SHARPENING_CONTRAST");
+    EvSharpenBlur = m->newEvent(rtengine::RequestIntent::Sharpening, "HISTORY_MSG_SHARPENING_BLUR");
 
     Gtk::Box* hb = Gtk::manage (new Gtk::Box ());
     hb->show ();

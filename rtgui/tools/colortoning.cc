@@ -351,8 +351,8 @@ ColorToning::ColorToning () : FoldableToolPanel(this, TOOL_NAME, M("TP_COLORTONI
     //------------------------------------------------------------------------
     // LAB grid
     auto m = ProcEventMapper::getInstance();
-//    EvColorToningLabGridValue = m->newEvent(RGBCURVE, "HISTORY_MSG_COLORTONING_LABGRID_VALUE");
-    EvColorToningLabGridValue = m->newEvent(LUMINANCECURVE, "HISTORY_MSG_COLORTONING_LABGRID_VALUE");
+//    EvColorToningLabGridValue = m->newEvent(rtengine::RequestIntent::RgbCurve, "HISTORY_MSG_COLORTONING_LABGRID_VALUE");
+    EvColorToningLabGridValue = m->newEvent(rtengine::RequestIntent::LuminanceCurve, "HISTORY_MSG_COLORTONING_LABGRID_VALUE");
     labgrid = Gtk::manage(new LabGrid(EvColorToningLabGridValue, M("TP_COLORTONING_LABGRID_VALUES")));
     pack_start(*labgrid, Gtk::PACK_EXPAND_WIDGET, 4);
     //------------------------------------------------------------------------
@@ -371,19 +371,19 @@ ColorToning::ColorToning () : FoldableToolPanel(this, TOOL_NAME, M("TP_COLORTONI
             box->pack_start(*btn, false, false);
         };
 
-    EvLabRegionList = m->newEvent(LUMINANCECURVE, "HISTORY_MSG_COLORTONING_LABREGION_LIST");
-    EvLabRegionAB = m->newEvent(LUMINANCECURVE, "HISTORY_MSG_COLORTONING_LABREGION_AB");
-    EvLabRegionSaturation = m->newEvent(LUMINANCECURVE, "HISTORY_MSG_COLORTONING_LABREGION_SATURATION");
-    EvLabRegionLightness = m->newEvent(LUMINANCECURVE, "HISTORY_MSG_COLORTONING_LABREGION_LIGHTNESS");
-    EvLabRegionSlope = m->newEvent(LUMINANCECURVE, "HISTORY_MSG_COLORTONING_LABREGION_SLOPE");
-    EvLabRegionOffset = m->newEvent(LUMINANCECURVE, "HISTORY_MSG_COLORTONING_LABREGION_OFFSET");
-    EvLabRegionPower = m->newEvent(LUMINANCECURVE, "HISTORY_MSG_COLORTONING_LABREGION_POWER");
-    EvLabRegionHueMask = m->newEvent(LUMINANCECURVE, "HISTORY_MSG_COLORTONING_LABREGION_HUEMASK");
-    EvLabRegionChromaticityMask = m->newEvent(LUMINANCECURVE, "HISTORY_MSG_COLORTONING_LABREGION_CHROMATICITYMASK");
-    EvLabRegionLightnessMask = m->newEvent(LUMINANCECURVE, "HISTORY_MSG_COLORTONING_LABREGION_LIGHTNESSMASK");
-    EvLabRegionMaskBlur = m->newEvent(LUMINANCECURVE, "HISTORY_MSG_COLORTONING_LABREGION_MASKBLUR");
-    EvLabRegionShowMask = m->newEvent(LUMINANCECURVE, "HISTORY_MSG_COLORTONING_LABREGION_SHOWMASK");
-    EvLabRegionChannel = m->newEvent(LUMINANCECURVE, "HISTORY_MSG_COLORTONING_LABREGION_CHANNEL");
+    EvLabRegionList = m->newEvent(rtengine::RequestIntent::LuminanceCurve, "HISTORY_MSG_COLORTONING_LABREGION_LIST");
+    EvLabRegionAB = m->newEvent(rtengine::RequestIntent::LuminanceCurve, "HISTORY_MSG_COLORTONING_LABREGION_AB");
+    EvLabRegionSaturation = m->newEvent(rtengine::RequestIntent::LuminanceCurve, "HISTORY_MSG_COLORTONING_LABREGION_SATURATION");
+    EvLabRegionLightness = m->newEvent(rtengine::RequestIntent::LuminanceCurve, "HISTORY_MSG_COLORTONING_LABREGION_LIGHTNESS");
+    EvLabRegionSlope = m->newEvent(rtengine::RequestIntent::LuminanceCurve, "HISTORY_MSG_COLORTONING_LABREGION_SLOPE");
+    EvLabRegionOffset = m->newEvent(rtengine::RequestIntent::LuminanceCurve, "HISTORY_MSG_COLORTONING_LABREGION_OFFSET");
+    EvLabRegionPower = m->newEvent(rtengine::RequestIntent::LuminanceCurve, "HISTORY_MSG_COLORTONING_LABREGION_POWER");
+    EvLabRegionHueMask = m->newEvent(rtengine::RequestIntent::LuminanceCurve, "HISTORY_MSG_COLORTONING_LABREGION_HUEMASK");
+    EvLabRegionChromaticityMask = m->newEvent(rtengine::RequestIntent::LuminanceCurve, "HISTORY_MSG_COLORTONING_LABREGION_CHROMATICITYMASK");
+    EvLabRegionLightnessMask = m->newEvent(rtengine::RequestIntent::LuminanceCurve, "HISTORY_MSG_COLORTONING_LABREGION_LIGHTNESSMASK");
+    EvLabRegionMaskBlur = m->newEvent(rtengine::RequestIntent::LuminanceCurve, "HISTORY_MSG_COLORTONING_LABREGION_MASKBLUR");
+    EvLabRegionShowMask = m->newEvent(rtengine::RequestIntent::LuminanceCurve, "HISTORY_MSG_COLORTONING_LABREGION_SHOWMASK");
+    EvLabRegionChannel = m->newEvent(rtengine::RequestIntent::LuminanceCurve, "HISTORY_MSG_COLORTONING_LABREGION_CHANNEL");
     labRegionBox = Gtk::manage(new Gtk::Box(Gtk::ORIENTATION_VERTICAL));
 
     labRegionList = Gtk::manage(new Gtk::ListViewText(3));
