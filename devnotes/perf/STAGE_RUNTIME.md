@@ -859,11 +859,26 @@ longer depends on that.
 `compatibility_mask()`. A tool names the operation it asks for
 (`Transform`, `WhiteBalance`, `Hdr`, `AllNoRaw`, `Demosaic`, `SpotAdjust`,
 `Compr`, `CaptureSharpen`, `DarkFrame`, `First`, `RepaintOnly`,
-`ControlOnly`); `make_request()` builds the typed kind, facts and
+`ControlOnly`, `AutoExposure`, `LuminanceCurve`, `DirPyrEqualizer`,
+`RgbCurve`, `Sharpening`); `make_request()` builds the typed kind, facts and
 compatibility mask in one place. A producer that knows its blocks passes them
 as a seed list; `make_request()` closes over the pipeline edges and adds the
 path residents, so the result is an execution set. An empty list keeps the
 parameter-fingerprint derivation.
+
+The five parameter-family intents carry the exact legacy composites:
+
+| Intent | Compatibility mask |
+| --- | --- |
+| `AutoExposure` | `AUTOEXP` |
+| `LuminanceCurve` | `LUMINANCECURVE` |
+| `DirPyrEqualizer` | `DIRPYREQUALIZER` |
+| `RgbCurve` | `RGBCURVE` |
+| `Sharpening` | `SHARPENING` |
+
+`DirPyrEqualizer` and `Sharpening` have the same composite and the same
+planning identity, so their actions stay distinct through the history message
+in the producer event key. The test pins both the mask and that relation.
 
 `ProcEventMapper::newEvent(RequestIntent, message)` registers the typed
 request with `RefreshMapper`. `RefreshMapper::mapRequest()` records both the
@@ -882,24 +897,41 @@ flat-field preprocessing, raw CA correction, raw exposure, preprocess white
 balance and every former `M_VOID`/`GAMMA`/`RESIZE`/`EXIF`/`IPTC` control event
 (45 in total).
 
-The compatibility path is the integer `newEvent(action, message)` overload
-(323 call sites in 15 tool files; with the mapper definition in
-`rtgui/eventmapper.cc` that is 16 GUI files). It is documented in
-`editorrequest.h` and covered by `editorrequest-test`: a mask event has no
-typed request, `getRequest()` returns false, `getAction()` returns the mask,
-and the coordinator classifies it once through `from_legacy_mask()`. The
-profile refresh with unchanged raw parameters is the one place that
-deliberately drops a typed request and re-enters through
-`getAction(event) & ALLNORAW`, because its absolute kind would rebuild the raw
-core. The typed event key includes both the planning identity and the
-compatibility mask, so actions that plan identically but carry different
-payloads (`EvSpotEnabled` and `EvSpotEnabledOPA`) stay distinct.
+The remaining parameter-only producers are converted too: 323 registrations
+using the five family aliases — 185 `AUTOEXP`, 78 `LUMINANCECURVE`, 51
+`DIRPYREQUALIZER`, 6 `RGBCURVE` and 3 `SHARPENING` — now call
+`newEvent(RequestIntent, message)`. Eight of those lines are commented-out
+registrations (two `DirPyrEqualizer` in `wavelet.cc`, six `RgbCurve` in
+`localcontrast.cc` and `colortoning.cc`); they are converted for consistency
+and remain commented out. The six `RGBCURVE` registrations are the calls the
+plan singled out: five block-commented in `localcontrast.cc` and one
+line-commented in `colortoning.cc`. They are parameter-only RGB-curve
+registrations with no distinct action, so they use `RgbCurve`, whose mask is
+the exact `RGBCURVE` composite. The plan expected six further residual calls
+outside the five families; the tree at `a6643be36` has none, because the
+earlier conversion commit `c98501f51` had already converted every such
+registration.
+
+`rtgui/` therefore has no integer `newEvent(action, message)` call left:
+`editorrequest-test` scans all 358 GUI sources and requires every one of the
+442 live `newEvent` calls to name the typed API. The compatibility path stays
+as the adapter only, documented in `editorrequest.h` and still covered by the
+test: a mask event has no typed request, `getRequest()` returns false,
+`getAction()` returns the mask, and the coordinator classifies it once
+through `from_legacy_mask()`. The profile refresh with unchanged raw
+parameters is the one place that deliberately drops a typed request and
+re-enters through `getAction(event) & ALLNORAW`, because its absolute kind
+would rebuild the raw core. The typed event key includes both the planning
+identity and the compatibility mask, so actions that plan identically but
+carry different payloads (`EvSpotEnabled` and `EvSpotEnabledOPA`) stay
+distinct.
 
 `refreshmap.*` is **not removed**. The exact remaining entries are:
 
-- `ProcEventMapper::newEvent(int action, ...)`: 323 producer call sites.
-  By action family: 185 `AUTOEXP`, 78 `LUMINANCECURVE`, 51
-  `DIRPYREQUALIZER`, 6 `RGBCURVE` and 3 `SHARPENING`.
+- `ProcEventMapper::newEvent(int action, ...)`: zero producer call sites. It
+  stays as the compatibility entry point for the later retirement step, and
+  `ProcEventMapper::newEvent(RequestIntent, ...)` forwards through
+  `make_request()`.
 - `RefreshMapper::getAction()`: four call sites — the profile filter in
   `rtgui/toolpanelcoord.cc`, the compatibility branch of
   `ImProcCoordinator::endUpdateParams(ProcEvent)`, and two assertions in
@@ -908,11 +940,11 @@ payloads (`EvSpotEnabled` and `EvSpotEnabledOPA`) stay distinct.
   `RefreshMapper`. It is still the action source for events created before a
   tool registers its own event, and the mask source for the profile filter.
 
-The reason is that those parameter-only tools need their exact composite mask
-for the viewport LUT snapshot, the preview-base-cache invalidation and the
-deferred-analysis queue. A generic parameter-only typed request would lose the
-`M_RGBCURVE`/`M_LUMACURVE`/`M_LUMINANCE`/`M_COLOR` distinction those caches
-read. They are the next migration target, after those consumers have typed
+The reason the adapter stays is that the compatibility masks are still read
+by the viewport LUT snapshot, the preview-base-cache invalidation and the
+deferred-analysis queue. The intents reproduce those composites exactly, so
+those consumers keep the payload they had while no producer constructs a
+mask. They are the next retirement target, after those consumers have typed
 inputs.
 
 ### Remaining mask reads
@@ -945,23 +977,31 @@ No node-entry gate and no planning decision reads the mask.
   producer-provided execution set, coalescing, the typed/mask mapper lookup,
   the producer event-key uniqueness (`checkProducerEventKey`), the fast-path
   fact refresh (`checkFastPathAugmentation`), the crop reallocation work order
-  (`checkCropReallocationWorkOrder`) and the tool-to-intent wiring
-  (`checkConvertedProducerIntents`); it passes in both build directories.
+  (`checkCropReallocationWorkOrder`), the tool-to-intent wiring
+  (`checkConvertedProducerIntents`) and the producer source scan
+  (`checkNoLegacyProducerCalls`, 358 files and 442 live typed calls); all 17
+  stage test executables pass in both build directories.
 - Preview sweep: `preview-work-order-sweep` reports 16 states and `AE=0` for
   both `preview.tif` and `work.tif` in every state.
-- Crop: `crop-stage-test --sequences` reports `33 plans executed, 0 plan
-  fallbacks, 33 dirty derivations` and `AE=0` for every static and incremental
-  scenario; `--stages` passes with `AE=0`.
-- Export: single-thread PEF export is `AE=0` against a parent-commit build.
+- Crop: `crop-stage-test --sequences` reports `39 plans executed, 0 plan
+  fallbacks, 39 dirty derivations`. Static states and the geometry, WB,
+  demosaic, transform, local, sharpening, CIE CAM, CIE CAM-off and crop
+  scenarios are `AE=0`. Two incremental states fail on the sidecar corpus:
+  `highqual-refill` `AE=45` and `highqual-dehaze` `AE=44`. The same two
+  states fail byte-identically when the parent commit is built in the same
+  build tree (`3626802` and `3627644` differing bytes), so the failure
+  pre-dates this change and no producer-intent path is on the test's call
+  graph. `--stages` passes with `AE=0`.
+- Export: single-thread PEF export of the neutral image and of the sidecar is
+  `AE=0` against a parent-commit build on the same tree.
 - Thumbnail: `thumbnail-stage-test` reports `PASS` for the embedded and raw
   paths.
-- Node cache: `stage-node-cache-test` reports `hits=1 misses=1 AE=0` and the
-  LRU eviction, unchanged; `preview-base-cache-test` passes.
-- Control edit timing on the 10.2 MP PEF, `OMP_NUM_THREADS=1`, five samples
-  per side, parent source and this change built in the same build tree:
-  parent p50 489 ms, this change p50 493 ms (about 0.8%, inside run-to-run
-  noise). The exact plan versus `RT_WORK_ORDER=off` is 493 ms versus 597 ms
-  p50 over ten samples.
+- Node cache: `stage-node-cache-test` passes unchanged in both builds.
+- Control edit timing on the 10.2 MP PEF with its sidecar,
+  `OMP_NUM_THREADS=1`, 40 samples per side, parent source and this change
+  built in the same build tree: parent p50 243.5 ms and 247.7 ms in two runs,
+  this change p50 244.7 ms and 244.0 ms. The parent's own run-to-run spread is
+  about 1.7%, so the difference is inside noise.
 
 
 
@@ -1348,10 +1388,10 @@ follow-up should give the harness a completion signal that does not depend on
   environment opt-in.
 - Parameter fingerprints now drive the preview and crop dirty-block sets, and
   the graph paths are default. `refreshmap.*` and the `todo` mask remain for
-  GUI notification, viewport admission, deferred scheduling and the 323
-  parameter-only producer call sites; the downstream node-entry gates and the
-  planning producers are typed. The remaining compatibility entries are
-  listed under "Typed editor requests and downstream gates".
+  GUI notification, viewport admission, deferred scheduling and the
+  compatibility adapter; every producer is typed, including the five
+  parameter families. The remaining compatibility entries are listed under
+  "Typed editor requests and downstream gates".
 - Tile ordering is connected to denoise and wavelet behind `RT_TILE_ORDER=1`,
   but it is opt-in and has no reduced-work mode. The deterministic merge is
   always on.
