@@ -794,6 +794,40 @@ pass. `Crop::update()` also takes the typed request: its render state now maps
 `viewportMoved`, and `request.spotPending` to the spot fact. No crop planning
 decision reads the mask.
 
+#### Forced crop passes
+
+The crop still widens a pass to the legacy `todo = ALL` when the buffers were
+reallocated or the request is high quality, because every step has to be
+performed over the new or accurate base. The typed request describes only what
+the editor asked for, so every body gate whose legacy predicate was
+`todo & M_*` must also consult the force; otherwise a reallocating pass or a
+bare `M_HIGHQUAL` request (opening a detail window, `imagearea.cc:809`) skips
+work that `ALL` used to admit. `CropStageContext::forcedFull` carries that
+force, and the gates are:
+
+| Body | Legacy predicate | Gate |
+| --- | --- | --- |
+| dehaze/Fattal | `todo & M_HDR` | `hdrIntent \|\| forcedFull` |
+| transform pre-RGB equaliser | `todo & (M_TRANSFORM \| M_RGBCURVE)` | `transformFamilyIntent \|\| forcedFull` |
+| local adjustments | `todo & (M_AUTOEXP \| M_RGBCURVE)` | `localAdjustmentsIntent \|\| forcedFull` |
+| rgb.proc | `todo & M_RGBCURVE` | `rgbProcIntent \|\| forcedFull` |
+| Lab tools, sharpening, wavelet, working TRC, CIE CAM, gamut | `todo & (M_LUMINANCE + M_COLOR)` | `labChainIntent \|\| forcedFull` |
+
+`viewportMoved` is read before the force and stays request-only, because
+`M_MINUPDATE` is not part of `ALL`. `Crop::fullUpdate()` already builds its
+request from `ALL | M_MONITOR`, so it needs no extra fact. The same force is
+folded into `crop_request_kind()`, so the work order names `rawBaseRebuild`,
+`analysisRun` and, at 100%, `denoiseRun`, and the bodies start from fresh
+source pixels, as the `ALL` reload bits did. `M_SPOT` belongs to the same
+class even though spot apply is work-order driven: `ALL` carries it, and a
+refilled base loses the removal unless the spot work runs again, so
+`spotPending` is true for a forced pass when spots are configured. The
+regression is covered by two `crop-stage-test --sequences` states: a bare
+`M_HIGHQUAL` update that enables dehaze (`highqual-dehaze`) and an
+`M_HIGHQUAL` exposure edit over a base with local adjustments and a visible
+spot (`highqual-refill`), both compared with a fresh full render and required
+to be byte-identical.
+
 `stageTransform()` keeps `pass.transformNeeded` as a cross-check on the plan;
 it is a parameter/metadata predicate, not a mask test. The raw/core bodies keep
 their block-1 work-order authority and their internal compatibility reads.
@@ -809,11 +843,15 @@ legacy mask implied. Debug builds assert `planningAgreesWithLegacyMask()` at
 the PC-vignette augmentation, the panning requeue, the deferred absorb, the
 fast-path crop and the crop render.
 
-A crop reallocation forces `origCrop` to be refilled even when the editor
+A forced crop pass forces `origCrop` to be refilled even when the editor
 request is a plain parameter update. `crop_request_kind()` maps the render
-state to `FullCrop` for that update, so `derive_crop_work()` names
-`rawBaseRebuild` and `analysisRun`. The GUI normally pairs the reallocation
-with a `FullCrop` request, but the force no longer depends on that.
+state to `FullCrop` for that pass, so `derive_crop_work()` names
+`rawBaseRebuild` and `analysisRun`. The force is the same
+`needsinitupdate || HighQuality` that widens `todo` to `ALL`; like the legacy
+`M_INIT | M_LINDENOISE | M_HDR` bits that `ALL` carried, it must refill the
+base because the HDR and local-adjustment bodies overwrite `origCrop`. The GUI
+normally pairs a reallocation with a `FullCrop` request, but the force no
+longer depends on that.
 
 ### Typed producer API
 
