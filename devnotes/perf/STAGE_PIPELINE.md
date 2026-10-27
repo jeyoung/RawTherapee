@@ -1324,8 +1324,10 @@ The Clamp-OOG p50 falls from 510.3 ms to 315.3 ms (-38.2%); p95 falls from
 ### Builds and tests
 
 `tools/build-rt.sh cpu -j 6` and `tools/build-rt.sh opencl -j 6` complete.
-All stage test executables pass in both build trees:
-`stage-abi-test`, `stage-cache-test`, `stage-device-test`, `stage-graph-test`,
+All 16 stage test executables plus `editorrequest-test` pass in both build
+trees:
+`stage-abi-test`, `stage-cache-test`, `stage-node-cache-test`,
+`stage-device-test`, `stage-residency-test`, `stage-graph-test`,
 `stage-indexer-test`, `stage-param-hash-test`, `stage-render-state-test`,
 `stage-param-map-test`, `stage-dirty-blocks-test`, `stage-work-test`,
 `stage-pipeline-test`, `stage-mask-map-test`, `stage-store-test` and
@@ -1347,7 +1349,7 @@ Host CPU build, image 10.2 MP PEF `colorspace_flowers.pef`,
 | `crop-stage-test --stages` | PASS, 6 plans executed, 0 plan fallbacks, 6 dirty derivations, `AE=0` |
 | Single-threaded 16-bit TIFF export, `RT_WORK_ORDER` on vs off | `AE=0` |
 | `thumbnail-stage-test` | PASS embedded and raw |
-| Both configurations | `tools/build-rt.sh cpu -j 6` and `tools/build-rt.sh opencl -j 6` compile; 14 stage test executables PASS in both trees |
+| Both configurations | `tools/build-rt.sh cpu -j 6` and `tools/build-rt.sh opencl -j 6` compile; 16 stage test executables plus `editorrequest-test` PASS in both trees |
 
 ## Node-output cache of the preview raw.base tier
 
@@ -1511,7 +1513,7 @@ sentinel-aware white-balance restore, true LRU and the OpenCL-in-key change.
 | `crop-stage-test --stages` | 6 plans, 0 fallbacks, 6 derivations, `AE=0` |
 | 16-bit TIFF export, `RT_NODE_CACHE` off vs on | `AE=0` (regression check only: the export path never constructs a `NodeCache` and prints no node-cache summary) |
 | `thumbnail-stage-test` | PASS embedded and raw (the thumbnail path does not use the tier) |
-| `tools/build-rt.sh cpu` / `opencl` (`--ccache`) | both trees compile; all stage test executables of this phase pass in both |
+| `tools/build-rt.sh cpu` / `opencl` (`--ccache`) | both trees compile; 16 stage test executables plus `editorrequest-test` PASS in both |
 
 The preview sweep produced no hits at all: every state either missed a fresh
 key or was refused by the work-order or spot guard, so all 16 `AE=0` results
@@ -1656,3 +1658,41 @@ Everything except `resize`: `source.select`, `source.embedded`,
 `framing`, `output.icc`, `monitor.output`, `viewport.output` and the five
 `thumbnail.*` nodes. They have no device implementation yet, so they resolve
 to CPU and keep the host code path.
+
+## Final integration of the request and device branches
+
+The typed-request branch (`perf-graph-request2`, head `81e73b9be`) and the
+device-residency branch (`perf-graph-opencl`, head `c42ea4ca4`) were merged in
+that order onto `9e8df3493`. The three shared files were combined by hand:
+
+- `rtengine/improccoordinator.cc` keeps the typed planning, the
+  `refreshFromLegacyMask()` calls and every `assertPlanningAgrees()` site from
+  the request branch, and adds `stage::set_opencl_stage_allowed(useOpenCL &&
+  openCLMode == 1)` beside `opencl::setStageAllowed()`; `simpleprocess.cc` sets
+  the batch policy from `useOpenCL` alone.
+- `rtengine/CMakeLists.txt` keeps the request test sources and
+  `RT_SOURCE_DIR`, and adds `stage/stage_opencl_device.cc` and
+  `stage-residency-test`.
+- This record keeps the request sections and the device section; the earlier
+  per-phase test counts are replaced by the integrated counts.
+
+Verification of the merged tree (`build/cpu-perf-graph-final` and
+`build/opencl-perf-graph-final`), host CPU build unless stated, image 10.2 MP
+PEF `colorspace_flowers.pef`, `OMP_NUM_THREADS=1`:
+
+| Check | Result |
+|-------|--------|
+| `tools/build-rt.sh cpu -j 6` / `opencl -j 6` | both compile; 16 stage test executables plus `editorrequest-test` PASS in both trees (the two device tests use the pocl-only ICD directory) |
+| preview sweep, 16 states, `RT_NODE_CACHE` off | PASS, 32 images (`preview.tif`, `work.tif`) `AE=0` |
+| preview sweep, 16 states, `RT_NODE_CACHE=1` | PASS, 32 images `AE=0`; `hits=0 misses=5 refused=11 inserts=5`; cross-cache comparison of the 16 states is `AE=0` |
+| repeated exposure, 10 samples, `RT_NODE_CACHE=1` | `hits=7 misses=3 refused=1 inserts=3`; the final dump is `AE=0` for `preview.tif` and `work.tif` against the cache-off run; `stage-node-cache-test` reports `repeated-pass: hits=1 misses=1 AE=0` |
+| `crop-stage-test --sequences` | PASS, 33 plans, 0 fallbacks, 33 derivations, `AE=0` |
+| `crop-stage-test --stages` | PASS, 6 plans, 0 fallbacks, 6 derivations, `AE=0` |
+| `thumbnail-stage-test` | PASS embedded and raw; both PPM pairs byte-identical |
+| 16-bit TIFF export vs a `9e8df3493` binary, neutral and sidecar | `AE=0`, 0 of 30419712 samples differ in both |
+| `stage-residency-test`, ICD restricted to `pocl.icd`, `RT_OPENCL_ALLOW_CPU=1 RT_REQUIRE_GPU=1` | PASS, 0 skipped; POCL CPU device `cpu-ivybridge-...`; PAE 0.000000 LSB16, 0 of 9216 and 0 of 82944 node samples, 0 of 4608 through `run()`; tolerance 1 LSB16. These are POCL CPU results, not GPU parity |
+| same test without a device and `RT_REQUIRE_GPU=1` | FAIL, exit 1, as designed |
+| kill switch, `--gpu=off` with `RT_STAGE_OPENCL=1`, resize profile | the stage profile records one `lanczos3` node with `impl=module`; no `impl=opencl` record |
+| 16-bit export with the resize profile, switch off (`--gpu=off`) vs on (`--gpu=auto`) | `AE=0`, 0 of 1630800 samples differ; the on run emits no stage `lanczos3` record because the classic path handles it |
+| exposure edit timing, node cache off vs on, 10 samples per side | off 333.9 ms mean / 330.4 ms p50 and 318.4 / 317.3 on a repeat; on 309.1 / 302.5 with 7 hits. The off-side spread (16 ms) is the same order as the difference, so no timing claim is made |
+| exposure edit timing, device switch off vs on, 10 samples per side | off 319.9 ms mean / 318.7 ms p50, repeat 321.8 / 317.0; on 318.4 / 317.5. Within the host noise range; the preview graph runs no stage-ABI node |
