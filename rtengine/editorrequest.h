@@ -318,10 +318,13 @@ EditorRequest from_legacy_mask(int mask, const LegacyMaskContext& context = {});
  * which is the safe default for a tool that only knows "this parameter
  * changed".
  *
- * Parameter-only tools that have no planning information to carry stay on the
- * integer `ProcEventMapper::newEvent(action, message)` compatibility path; no
- * `M_*` bit reaches a planning decision through it because the coordinator
- * adapter classifies it once.
+ * Every GUI producer now names an intent, so the typed API is the only
+ * producer entry point. The integer
+ * `ProcEventMapper::newEvent(action, message)` overload and the legacy
+ * adapter remain in place for the later retirement step, but no producer
+ * constructs a mask with them. No `M_*` bit reaches a planning decision
+ * through either path because the coordinator adapter classifies each mask
+ * once.
  */
 enum class RequestIntent {
     /* A destructive raw reload, the legacy `ALLNORAW` composite. */
@@ -347,7 +350,17 @@ enum class RequestIntent {
     /* Dark-frame/flat-field family, the legacy `DARKFRAME` composite. */
     DarkFrame = 10,
     /* Whole preview including the monitor sink, the legacy `FIRST`. */
-    First = 11
+    First = 11,
+    /* Auto-exposure family, the legacy `AUTOEXP` composite. */
+    AutoExposure = 12,
+    /* Luminance-curve family, the legacy `LUMINANCECURVE` composite. */
+    LuminanceCurve = 13,
+    /* Directional-pyramid equaliser family, the legacy `DIRPYREQUALIZER`. */
+    DirPyrEqualizer = 14,
+    /* RGB-curve family, the legacy `RGBCURVE` composite. */
+    RgbCurve = 15,
+    /* Sharpening family, the legacy `SHARPENING` composite. */
+    Sharpening = 16
 };
 
 /* Intent to typed request, with no producer-provided dirty blocks. */

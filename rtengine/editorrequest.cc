@@ -384,6 +384,16 @@ int compatibility_mask(RequestIntent intent)
         return DARKFRAME;
     case RequestIntent::First:
         return FIRST;
+    case RequestIntent::AutoExposure:
+        return AUTOEXP;
+    case RequestIntent::LuminanceCurve:
+        return LUMINANCECURVE;
+    case RequestIntent::DirPyrEqualizer:
+        return DIRPYREQUALIZER;
+    case RequestIntent::RgbCurve:
+        return RGBCURVE;
+    case RequestIntent::Sharpening:
+        return SHARPENING;
     }
 
     assert(false && "unknown request intent");
