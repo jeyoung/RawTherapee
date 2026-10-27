@@ -102,11 +102,12 @@ in `stageRgbProc()` and `stageLabTools()` use `toneOnly()`, `labOnly()` and
    is left at the call site.
 4. Crops with a listener are updated immediately. This is the only work the
    interaction pays for.
-5. The analysis stages the hit skipped are accumulated in
-   `pendingDeferredMask` under `paramsUpdateMutex`, with a deadline. The hit
-   does not queue a full-frame pass and does not block further fast hits.
-6. When the deadline expires, `flushDeferredAnalysis()` coalesces the
-   accumulated mask into `pendingRequest` as a deferred-analysis request
+5. The analysis stages the hit skipped are accumulated as a typed
+   `DeferredRecord` (a `DirtyBlocks` set plus an explicit forced-analysis flag,
+   hit count and deadline) under `paramsUpdateMutex`. The hit does not queue a
+   full-frame pass and does not block further fast hits.
+6. When the deadline expires, `flushDeferredAnalysis()` coalesces the typed
+   record into `pendingRequest` as a deferred-analysis request
    (`deferredAnalysisRequest()`), sets `forceFullPreview` and starts the normal
    `process()` loop. It updates `previmg`, `workimg`, histograms/scopes and
    listeners, re-renders the crops, and only then marks the viewport state
@@ -114,7 +115,7 @@ in `stageRgbProc()` and `stageLabTools()` use `toneOnly()`, `labOnly()` and
 
 `forceFullPreview` is set when the analysis is queued, not when the hit is
 served, and it no longer blocks eligibility. `absorbPendingDeferred()` folds a
-pending mask into any request that takes the normal path, so a base-changing
+pending record into any request that takes the normal path, so a base-changing
 edit cannot skip the stages a fast hit already applied to the crop.
 `markViewportStateValid()` publishes the snapshot only after the full-frame
 block ran, and it keeps the per-hit bookkeeping when a newer burst was queued
@@ -122,14 +123,30 @@ while the pass was running.
 
 ## Deferred analysis
 
-`rtengine/viewportdefer.h` holds the pure decision logic:
+`rtengine/viewportdefer.h` holds the typed decision logic:
 
-- `viewportDeferredMask()` forces `M_MONITOR|M_RGBCURVE|M_LUMACURVE
-  |M_LUMINANCE|M_COLOR` and strips every base bit;
+- `DeferredStage` names the graph nodes a deferred pass may run:
+  `monitor.output`, `rgb.proc`, `lab.tools`, `lab.wavelet`, `working.trc`,
+  `ciecam`, `gamut` and `local.adjustments`;
+- `deferredForcedBlocks()` is the monitor/RGB/Lab chain every deferred pass
+  runs. It contains no `source.select`, `raw.preprocess`, `raw.demosaic`,
+  `raw.base` or `analysis` id, so absorbing it can never dirty the base;
+- `DeferredRecord` is the authoritative record (typed blocks, forced flag,
+  hits, first-hit and deadline timestamps) guarded by `paramsUpdateMutex`;
+- `DeferredAnalysisSnapshot` is a packed 64-bit lock-free value derived from
+  the record. The render path reads it with one relaxed atomic load and never
+  takes the mutex; every mutation publishes a new snapshot with release
+  ordering, so a reader sees either the old or the new whole record;
 - `viewportDeferredDeadline()` re-arms the settle window on each hit and caps
   the wait from the first hit of the burst;
 - `viewportCropRenderReusable()` allows the deferred pass to skip the crop
   render only while the burst contains a single hit.
+
+The old `viewportDeferredMask()` and the `deferredAnalysisMask` render-state
+field are deleted. A deferred flush still carries an opaque execution payload
+(`deferredExecutionPayload()`) because unconverted block bodies read it, but
+the payload is derived once from the typed stage bits and never decides the
+schedule. The deferral therefore cannot add a source or raw block.
 
 | Setting | Default | Unit | Range | Purpose |
 |---|---:|---|---|---|
@@ -147,11 +164,11 @@ queues the analysis immediately and reproduces the pre-deferral behaviour.
 
 The watcher is one low-priority `Glib::Thread` per coordinator, created on the
 first deferred hit and joined in the destructor. `stopProcessing()` sets a
-pause flag and drops the pending mask before joining the render thread, so an
+pause flag and drops the pending record before joining the render thread, so an
 image switch or the rough/final loading handoff cannot resurrect work against
 buffers that are about to be rebuilt. `startProcessing(int)` clears the pause.
 `invalidateViewportState()`, `assign()`, `freeAll()`, `setScale()` and
-`setTweakOperator()` drop the pending mask as well.
+`setTweakOperator()` drop the pending record as well.
 
 ## State validity and invalidation
 
@@ -182,12 +199,14 @@ source planes remain valid.
 With `RT_PREVIEW_PROFILE=1` each completed request reports one of:
 
 ```text
-preview update: 40 ms todo=0x1009f cache=0 viewport=fast crop_ms=39 deferred_todo=0x1005f deferred_hits=3
+preview update: 40 ms todo=0x1009f cache=0 viewport=fast crop_ms=39 deferred_stages=0xff deferred_hits=3
 preview update: 92 ms todo=0x1005f cache=0 viewport=deferred-analysis
 preview update: 113 ms todo=0x1009f cache=0 viewport=fallback reason=switch-off
 ```
 
-`deferred_hits` is the size of the burst the hit belongs to; `1` means the
+`deferred_stages` is the `DeferredStage` bit set the hit queued (`0xff` is the
+whole forced chain plus `local.adjustments`); `deferred_hits` is the size of the
+burst the hit belongs to; `1` means the
 deferred pass may reuse the crop render, greater values mean it renders the
 crops again. Fallback reasons include `no-complete-full-state`, `base-request`,
 `auto-exposure`, `lab-contrast`, `highlight-recovery`, `cie`, `local-lab`,

@@ -53,7 +53,10 @@ The snapshot is dropped or marked dirty for:
 
 - image switch (`assign()`), `freeAll()`, destruction;
 - `setScale()` when the scale or preview dimensions change;
-- `M_PREPROC`, `M_RAW`, `M_WB` and `M_HIGHQUAL` request bits;
+- a `raw.preprocess` block fingerprint change (`preprocess`);
+- a `raw.demosaic` block fingerprint change (`raw`);
+- a request carrying the typed white-balance fact (`white-balance`);
+- the high-detail request fact (`high-detail-request`);
 - a `highDetailNeeded` transition;
 - a `preprocess()`, `demosaic()`, `retinex()` or `captureSharpening()` call;
 - colour highlight recovery modifying the shared raw planes;
@@ -62,10 +65,17 @@ The snapshot is dropped or marked dirty for:
   `ImageSource` at full resolution;
 - `flush()` and `load()`.
 
-Crop-only (`M_CROP`) and output/monitor-only (`M_MONITOR`) changes do not
-invalidate. `M_TRANSFORM` is not used as an invalidation bit by itself because
-it is part of `ALLNORAW` and normally changes only the post-base transform; the
-coarse transform (`tr`) is part of the key instead.
+The request reasons come from `stage::baseCacheInvalidationFor()`, which maps a
+narrow typed input set (`raw.preprocess`, `raw.demosaic`, `raw.base` for the
+white-balance fact) and the high-detail flag to the same strings the old mask
+mapper published. The typed set is not the pass execution set: a spot,
+film-negative, Retinex or tone-curve change does not invalidate the snapshot,
+matching the old mask behaviour. `stage-render-state-test` replays every
+producer intent and every intent pair against the retired mask oracle.
+
+Crop-only and output/monitor-only changes do not invalidate. A transform-only
+change is not an invalidation either because it normally changes only the
+post-base transform; the coarse transform (`tr`) is part of the key instead.
 
 ## Profiling
 

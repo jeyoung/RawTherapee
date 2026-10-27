@@ -640,8 +640,29 @@ pass is `ParamsOnly`. The plan never reads the mask.
 The snapshots are dropped on `assign()`, `freeAll()`, `stopProcessing()` and the
 input-ICC reference path, so the next pass is all-dirty whenever the buffers
 they describe are gone. A pass that does not take the full-frame path (the
-viewport fast path, a deferred analysis flush, an aborted request) does not
-update them.
+viewport fast path or an aborted request) does not update them.
+
+### Base-cache and deferred scheduling typing
+
+`baseCacheInvalidationFor()` replaces the mask mapper with a typed table:
+`raw.preprocess` maps to `preprocess`, `raw.demosaic` to `raw`, `raw.base` (the
+white-balance request fact) to `white-balance`, and the high-detail request
+fact to `high-detail-request`, in that precedence. The coordinator derives a
+narrow base-cache input set and never passes the pass execution set, so a spot,
+film-negative, Retinex or tone-curve change still leaves the snapshot reusable.
+
+The deferred burst is a `DeferredRecord`: a `DirtyBlocks` set, an explicit
+`forcedAnalysis` flag, the hit count and the first-hit/deadline timestamps.
+Absorbing it merges only the typed downstream stages into the pass dirty set.
+The render path reads a packed 64-bit `DeferredAnalysisSnapshot` with one
+relaxed atomic load; writers update the authoritative record under
+`paramsUpdateMutex` and then publish the snapshot with release ordering.
+
+`RenderStateKey::deferredAnalysisMask` was removed, so the persisted
+render-state fingerprint format changed. The published golden value in
+`stage-render-state-test` moved from `7ad04e9ccb3fb3abd888a235cc2f2b25` to
+`e607b13944b921db473300421f0da1b7`; stored render states and node-cache keys
+written by an older build must be discarded, not compared.
 
 The plan is refused, and the process aborts, when the derivation is invalid,
 names a block outside the preview inventory, or the graph would skip a dirty
@@ -974,15 +995,22 @@ Every remaining mask read is classified as one of:
    deleted. The pre-retirement gate survives only as the local oracle in
    `viewport_admission_test.cc`.
 2. **Deferred scheduling.** `absorbPendingDeferred()`, the deferred watcher and
-   the crop-render trigger `(M_MONITOR | M_RGBCURVE | M_LUMACURVE)`.
-   `dcrop.cc` has no scheduling read left except the forced detail-window
-   request `from_legacy_mask(ALL | M_MONITOR)` in `fullUpdate()`.
+   the deferred flush use a typed `DeferredRecord` (a `DirtyBlocks` set plus a
+   forced-analysis flag, hit count and deadline). The forced stages are
+   `monitor.output`, `rgb.proc` and the Lab chain; no source or raw block is
+   ever named. A packed 64-bit `DeferredAnalysisSnapshot` is published
+   atomically for lock-free readers. The crop-render trigger still reads
+   `(M_MONITOR | M_RGBCURVE | M_LUMACURVE)`. `dcrop.cc` has no scheduling read
+   left except the forced detail-window request
+   `from_legacy_mask(ALL | M_MONITOR)` in `fullUpdate()`.
 3. **Diagnostics.** `preview_dump`, the preview timer and the
    `preview-graph`/`crop-graph` log lines print the mask as data.
-4. **Compatibility.** `baseCacheTodoReason()`, the base-refresh and
-   panning/Coloropp request widenings, the raw.demosaic body gates and the
-   `M_MONITOR` output-profile refresh. These are payload/execution details,
-   not planning decisions.
+4. **Compatibility.** The base-refresh and panning/Coloropp request widenings,
+   the raw.demosaic body gates and the `M_MONITOR` output-profile refresh.
+   These are payload/execution details, not planning decisions. The
+   preview-base-cache invalidation no longer reads a mask: it maps the typed
+   `raw.preprocess`/`raw.demosaic` block deltas, the white-balance request fact
+   and the high-detail flag through `baseCacheInvalidationFor()`.
 
 No node-entry gate and no planning decision reads the mask.
 
