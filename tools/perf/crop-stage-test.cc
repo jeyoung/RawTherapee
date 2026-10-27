@@ -741,11 +741,24 @@ const std::vector<EditScenario>& editScenarios()
          * the legacy "everything" request. It must therefore still rebuild
          * the dehazed base. The reference is a fresh full render of the same
          * parameters, so a skipped HDR body shows up as a byte difference.
+         *
+         * The tone curve carries a second regression: the engine derives a
+         * matched curve from the raw histogram when the parameters ask for
+         * matching without carrying one, and every render consumes the result.
+         * The state above those parameters explicitly instead of relying on
+         * the sidecar: with an unmatched curve, a pass that skips the
+         * derivation renders a whole-image tone difference against the fresh
+         * render, not a small residual.
          */
         {"highqual-dehaze", M_HIGHQUAL, false,
          [](rtengine::procparams::ProcParams& p) {
              p.dehaze.enabled = true;
              p.dehaze.strength = 60;
+             p.toneCurve.histmatching = true;
+             p.toneCurve.fromHistMatching = false;
+             p.toneCurve.curveMode = rtengine::procparams::ToneCurveMode::STD;
+             p.toneCurve.curve.assign(1, 0.0);
+             p.toneCurve.curve2.assign(1, 0.0);
          }},
     };
     return scenarios;

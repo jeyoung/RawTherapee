@@ -98,6 +98,23 @@ const char* baseCacheTodoReason(int todo)
     return nullptr;
 }
 
+/*
+ * Whether the parameters ask for a histogram-matched tone curve but do not
+ * carry one yet.
+ *
+ * The matched curve is a derived parameter, like the automatic white balance:
+ * the editor enables histogram matching and the engine completes the curve
+ * from the raw histogram. Every render consumes the curve, so a pass that
+ * renders must build it before use, whatever the request asked for. Skipping
+ * the match leaves the parameters in a state no full pass would render from,
+ * and a forced crop pass then differs from a fresh full render over the whole
+ * image.
+ */
+bool toneCurveNeedsMatching(const rtengine::procparams::ProcParams& params)
+{
+    return params.toneCurve.histmatching && !params.toneCurve.fromHistMatching;
+}
+
 }
 
 namespace
@@ -2426,21 +2443,79 @@ void ImProcCoordinator::stageTransform(PreviewPassState& pass)
 }
 
 /*
+ * Complete the histogram-matched tone curve.
+ *
+ * Called by the auto-exposure request path, and by any render pass whose
+ * parameters ask for matching without carrying a matched curve. The curve is a
+ * derived parameter, so the completion is idempotent: once the curve is
+ * present `fromHistMatching` is set and later passes leave it alone.
+ */
+void ImProcCoordinator::matchToneCurve()
+{
+    if (!params->toneCurve.histmatching) {
+        return;
+    }
+
+    const bool exectrcexp = params->icm.trcExp; // store if Abstract profile enabled
+
+    if (!params->toneCurve.fromHistMatching) {
+        if (params->icm.trcExp) {
+            params->icm.trcExp = false; // disabled Abstract profile, if hismatching
+        }
+
+        imgsrc->getAutoMatchedToneCurve(params->icm, params->raw,
+                                        params->wb.observer,
+                                        params->toneCurve.curve);
+        params->icm.trcExp = exectrcexp; // restore Abstract profile
+    }
+
+    if (params->toneCurve.autoexp) {
+        params->toneCurve.expcomp = 0.0;
+    }
+
+    params->toneCurve.autoexp = false;
+    params->toneCurve.curveMode = ToneCurveMode::FILMLIKE;
+    params->toneCurve.curve2 = { 0 };
+    params->toneCurve.brightness = 0;
+    params->toneCurve.contrast = 0;
+    params->toneCurve.black = 0;
+    params->toneCurve.fromHistMatching = true;
+
+    if (aeListener) {
+        aeListener->autoMatchedToneCurveChanged(params->toneCurve.curveMode,
+                                                params->toneCurve.curve);
+    }
+}
+
+/*
  * local.adjustments: the encoding/log analysis for the local spots and the
  * local adjustment region itself.
  */
 void ImProcCoordinator::stageLocalAdjustments(PreviewPassState& pass)
 {
     const bool autoExposure = pass.request.autoExposureIntent;
+    const bool needsMatchedToneCurve = toneCurveNeedsMatching(*params);
     const bool scheduled = pass.dirty.ids.count("local.adjustments") != 0;
 
     /*
      * The plan schedules this node from the dirty set. Auto exposure is a
      * request-level bit rather than a parameter family, so an auto-exposure
-     * request keeps the node entered even when no fingerprint moved.
+     * request keeps the node entered even when no fingerprint moved. The
+     * matched tone curve is a derived parameter every render consumes, so
+     * parameters that ask for it without carrying it enter the node too.
      */
-    if (!scheduled && !autoExposure) {
+    if (!scheduled && !autoExposure && !needsMatchedToneCurve) {
         return;
+    }
+
+    /*
+     * Complete the derived curve for a pass that is not an auto-exposure
+     * request. Without this, an incremental pass renders from the unmatched
+     * curve while a fresh full pass matches it first, and a forced crop pass
+     * disagrees with a fresh render of the same parameters.
+     */
+    if (!autoExposure && needsMatchedToneCurve) {
+        matchToneCurve();
     }
 
     if (autoExposure) {
@@ -2456,33 +2531,7 @@ void ImProcCoordinator::stageLocalAdjustments(PreviewPassState& pass)
                                            params->toneCurve.black, params->toneCurve.hlcompr, params->toneCurve.hlcomprthresh, params->toneCurve.hrenabled);
         }
 
-        if (params->toneCurve.histmatching ) {
-            bool exectrcexp = false;//store if Abstract profile enabled
-            exectrcexp = params->icm.trcExp;
-            if (!params->toneCurve.fromHistMatching) {
-                if(params->icm.trcExp) {
-                    params->icm.trcExp = false;//disabled Abstract profile, if hismatching
-                }
-                imgsrc->getAutoMatchedToneCurve(params->icm, params->raw, params->wb.observer, params->toneCurve.curve);
-                params->icm.trcExp = exectrcexp;//restore Abstract profile
-            }
-
-            if (params->toneCurve.autoexp) {
-                params->toneCurve.expcomp = 0.0;
-            }
-
-            params->toneCurve.autoexp = false;
-            params->toneCurve.curveMode = ToneCurveMode::FILMLIKE;
-            params->toneCurve.curve2 = { 0 };
-            params->toneCurve.brightness = 0;
-            params->toneCurve.contrast = 0;
-            params->toneCurve.black = 0;
-            params->toneCurve.fromHistMatching = true;
-
-            if (aeListener) {
-                aeListener->autoMatchedToneCurveChanged(params->toneCurve.curveMode, params->toneCurve.curve);
-            }
-        }
+        matchToneCurve();
 
         // Encoding log with locallab and SE capture sharpening
         if (params->locallab.enabled && !params->locallab.spots.empty()) {
@@ -4458,7 +4507,8 @@ stage::DirtyBlocks ImProcCoordinator::previewDirtyBlocks(
         result.ids.insert("gamut");
     }
     if (pass.request.localAdjustmentsIntent
-            || pass.request.autoExposureIntent) {
+            || pass.request.autoExposureIntent
+            || toneCurveNeedsMatching(*params)) {
         result.ids.insert("local.adjustments");
     }
 

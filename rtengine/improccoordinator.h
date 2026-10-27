@@ -371,6 +371,7 @@ protected:
     void stageRawBase(PreviewPassState& pass);
     void stageTransform(PreviewPassState& pass);
     void stageLocalAdjustments(PreviewPassState& pass);
+    void matchToneCurve();
     void stageRgbProc(PreviewPassState& pass);
     void stageLabTools(PreviewPassState& pass);
     void stageLabWavelet(PreviewPassState& pass);
