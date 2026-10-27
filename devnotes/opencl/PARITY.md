@@ -40,10 +40,10 @@ difference between two identical runs). The gate is the peak absolute error
 | 2026-10-24 | 47c50ee77 | AMD RX 550 | colorspace_flowers.pef / bayer14 (`--formats`) | off vs auto | 1 LSB | PASS |
 | 2026-10-24 | 47c50ee77 | AMD RX 550 | 45.7 MP NEF / resize 0.5x | off vs auto | 1 LSB | PASS |
 | 2026-10-24 | 47c50ee77 | AMD RX 550 | 45.7 MP NEF / sidecar (crop + resize) | off vs auto | 1 LSB | PASS |
-| 2026-10-27 | 3a9d73c5f | POCL (CPU) | colorspace_flowers.pef / resize.pp3, `lanczos3` node | stage switch off vs on | 0 | PASS |
-| 2026-10-27 | 3a9d73c5f | POCL (CPU) | colorspace_flowers.pef / resize.pp3, 16-bit TIFF | stage switch off vs on | AE=0 | PASS |
-| 2026-10-27 | 3a9d73c5f | POCL (CPU) | colorspace_flowers.pef / preview sweep, 16 states | stage switch off vs on | 0 (32 images AE=0) | PASS |
-| 2026-10-27 | 3a9d73c5f | POCL (CPU) | colorspace_flowers.pef / crop harness, 3 states + sequences | stage switch off vs on | AE=0 (30 PPMs) | PASS |
+| 2026-10-27 | 8141ddf8d | POCL (CPU) | colorspace_flowers.pef / `lanczos3` node via `stage::run` | device vs host, `StageExecution` | 0 | PASS |
+| 2026-10-27 | 8141ddf8d | POCL (CPU) | colorspace_flowers.pef / resize.pp3, 16-bit TIFF, `--gpu=off` | switch off vs on (host policy) | AE=0 | PASS |
+| 2026-10-27 | 8141ddf8d | POCL (CPU) | colorspace_flowers.pef / preview sweep, 16 states | switch off vs on | 0 (32 images AE=0) | PASS |
+| 2026-10-27 | 8141ddf8d | POCL (CPU) | colorspace_flowers.pef / crop harness, 3 states + sequences | switch off vs on | AE=0 (30 PPMs) | PASS |
 
 `47c50ee77` changes only CPU export buffer handling; the OpenCL rows above
 re-run the existing GPU stages against the new CPU neighbour.
@@ -84,29 +84,42 @@ Notes:
 
 ## Stage device residency
 
-`3a9d73c5f` adds the graph device path and wires the `lanczos3` resize node
-through it. Device runs use `RT_OPENCL_ALLOW_CPU=1` and an ICD directory that
-contains only `pocl.icd` (`OCL_ICD_VENDORS`), so the selected device is POCL's
-CPU device (`cpu-ivybridge-Intel(R) Core(TM) i7-3770 CPU @ 3.40GHz`). These are
+The graph device path runs the `lanczos3` resize node. Device runs use
+`RT_OPENCL_ALLOW_CPU=1` and an ICD directory that contains only `pocl.icd`
+(`OCL_ICD_VENDORS`), so the selected device is POCL's CPU device
+(`cpu-ivybridge-Intel(R) Core(TM) i7-3770 CPU @ 3.40GHz`). These are
 CPU-device results and must not be read as GPU parity.
 
-The parity gate remains 1 LSB at 16-bit (1/65535 = 1.53e-5 normalised). The
-measured peak absolute error is zero in every case:
+The parity gate is 1 LSB at 16-bit (1/65535 = 1.53e-5 normalised). The measured
+peak absolute error is zero:
 
-- The node itself, on a synthetic 128x96 three-plane F32 image at scales 0.5
-  and 1.5, differs from the host implementation in 0 of 9216 and 0 of 82944
-  samples.
-- A 16-bit TIFF export with the resize profile is identical (`AE=0`, PAE 0 of
-  7604928 samples, same stage output hash) and the profile record shows the
-  node ran with `impl=opencl` when the switch is on and `impl=module` when it
-  is off.
-- The preview sweep and the crop harness produce identical images with the
-  switch on and off, but neither graph runs a stage-ABI node, so those runs
-  are CPU-path regression checks with zero device calls, not device parity.
+- The node itself, through the same `stage::run()` entry point that
+  `ImProcFunctions::Lanczos` uses, on a synthetic 128x96 three-plane F32 image
+  at scales 0.5 and 1.5, differs from the host implementation in 0 of 9216 and
+  0 of 82944 samples. `StageContext::execute()` reports `StageExecution`
+  `device=OPENCL`, `asynchronous=true`, so the parity is attributed to an
+  executed device kernel rather than to the selection. If the queue had fallen
+  back to the host it would report `device=CPU` and the test would fail.
+- An over-budget node runs on the host: `StageExecution` reports `device=CPU`,
+  `asynchronous=false`, and its output is exact against the CPU reference.
+- A 16-bit TIFF export with the resize profile is identical with the graph
+  switch off and on (`AE=0`, PAE 0 of 7604928 samples, same stage output hash).
+  With `--gpu=off` the batch policy now disables the graph device, so both runs
+  record the host implementation; that run is CPU-path regression evidence, not
+  device evidence. With `--gpu=auto` the classic `opencl::resizeLanczos` handles
+  the node and no stage `lanczos3` record is emitted, also `AE=0`.
+- The preview sweep (16 states, 32 images) and the crop harness (30 PPM files)
+  are identical with the switch off and on, but neither graph runs a stage-ABI
+  node; they are CPU-path regression checks with zero device calls.
 
-Timing on POCL CPU, `OMP_NUM_THREADS=1`, same image and profile: the resize
-node takes 161.6 ms on the device against 84.2 ms on the host. A CPU OpenCL
-device is not an acceleration target; the figure records that the device path
-works and is not a performance claim. The preview sweep is unaffected by the
-switch: 318.89 ms mean with the switch off and 318.70 ms with it on (18
-samples per side), against 318.72 ms at the parent commit `9e8df3493`.
+Kill switch: `--gpu=off` with `RT_STAGE_OPENCL=1` records `impl=module` (the
+host) and not `impl=opencl`. Before the batch-path wiring it recorded
+`impl=opencl`, which was the defect this record corrects.
+
+Timing on POCL CPU, `OMP_NUM_THREADS=1`, same image and profile, interleaved
+18 samples per side: the preview sweep is 327.67 ms mean (326.99 median) at
+the parent commit `9e8df3493`, 331.48 (328.69) with the switch off and 328.99
+(324.72) with it on. The spread is run-to-run noise on this host, whose
+samples ranged from 319 to 363 ms. No performance claim is made for the device
+node on a CPU OpenCL device: it is slower than the host and exists for parity
+and correctness.

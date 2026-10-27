@@ -1502,7 +1502,7 @@ sentinel-aware white-balance restore, true LRU and the OpenCL-in-key change.
 | `crop-stage-test --stages` | 6 plans, 0 fallbacks, 6 derivations, `AE=0` |
 | 16-bit TIFF export, `RT_NODE_CACHE` off vs on | `AE=0` (regression check only: the export path never constructs a `NodeCache` and prints no node-cache summary) |
 | `thumbnail-stage-test` | PASS embedded and raw (the thumbnail path does not use the tier) |
-| `tools/build-rt.sh cpu` / `opencl` (`--ccache`) | both trees compile; all 15 stage test executables PASS in both |
+| `tools/build-rt.sh cpu` / `opencl` (`--ccache`) | both trees compile; all stage test executables of this phase pass in both |
 
 The preview sweep produced no hits at all: every state either missed a fresh
 key or was refused by the work-order or spot guard, so all 16 `AE=0` results
@@ -1541,10 +1541,14 @@ the rebuild-closure guard.
 
 ## Node device residency (POCL CPU)
 
-The graph now has a device path: a node can run on an OpenCL device with its
-inputs uploaded to device buffers, and its output read back into the host
+The graph has a device path: a node can run on an OpenCL device with its
+inputs uploaded to device buffers and its output read back into the host
 buffer the graph already owns. The path is opt-in; the default is the host
-program and the default code path is unchanged.
+program. The host execution statements are unchanged, but the default path is
+not free: `stage::run` now resolves the node's policy first. `node_device()`
+reads two environment variables, checks a cached override flag and returns CPU
+without building a reason string or taking the override-map lock in the common
+case. `select_node_device()` adds the diagnostics for callers and tests.
 
 ### First device node
 
@@ -1556,20 +1560,27 @@ host implementation and the OpenCL kernel precompute the same weights with the
 same code and perform the separable dot products in the same order, so the
 results agree to rounding; the measured difference is zero.
 
+The classic backend still owns the accelerated resize: when the user enables
+OpenCL, `ImProcFunctions::Lanczos` calls `opencl::resizeLanczos` before the
+stage runtime, so the device node is reached only when that path declines.
+
 ### Selection and switches
 
 | Control | Effect |
 |---------|--------|
-| default | CPU; `stage::run` takes the original host path statement for statement |
+| default | CPU; the host program runs |
 | `RT_STAGE_OPENCL=1` | opt in; nodes with a device implementation are dispatched to the device queue |
 | `RT_STAGE_OPENCL=0` | kill switch; even an explicit device request resolves to CPU |
 | `RT_STAGE_OPENCL_DISABLE=1` | kill switch, independent of the opt-in value |
-| user preference | `ImProcCoordinator` passes `rtSettings.useOpenCL` to `set_opencl_stage_allowed()`; a disabled backend never runs a node on a device |
+| user preference, preview | the coordinator sets `useOpenCL && openCLMode == 1`; mode 0 is export-only and does not allow the device in a preview pass |
+| user preference, batch | `simpleprocess` sets `useOpenCL`; export is accelerated in both OpenCL modes, and `--gpu=off` sets `useOpenCL=false`, which now also disables the graph device |
 | `stage::select_node_device(node, device)` | explicit per-node request; returns the resolved device, whether an implementation exists and the reason for a refusal |
 | `stage::set_node_device_override()` | per-node override for tests and embedding; the kill switches still win |
 
-A node without a device implementation reports `implemented=false` and runs on
-the host program. A node whose device allocation is refused (budget) or whose
+The policy is per-thread, like `opencl::setStageAllowed()`, so a preview pass
+and a batch export in one process cannot overwrite each other's setting. A node
+without a device implementation reports `implemented=false` and runs on the
+host program. A node whose device allocation is refused (budget) or whose
 launch fails also runs on the host, so a device problem never fails a render.
 
 ### Buffers, budget and events
@@ -1578,17 +1589,27 @@ launch fails also runs on the host, so a device problem never fails a render.
   the node output it belongs to. A repeated node with the same address and
   shape reuses the allocation; a shape change replaces it; `release(key)`
   drops it; the context destroys the rest.
-- The budget defaults to 1 GiB and is set by `RT_STAGE_DEVICE_BUDGET_MB`
-  (clamped to 16-65536 MiB). `StageResidencyStats` reports budget, used,
-  peak, allocations, reuses, evictions and refusals.
+- The budget defaults to 1 GiB and is set by `RT_STAGE_DEVICE_BUDGET_MB`.
+  Out-of-range values clamp to 16-65536 MiB and a non-numeric value keeps the
+  default. `StageResidencyStats` reports budget, used, peak, allocations,
+  reuses, evictions and refusals.
 - Over budget: idle entries (no other reference) are evicted least-recently-
   used first. If a single buffer still does not fit, the request is refused
   with a reason, counted as a refusal, and the node runs on the host.
+- U8 is packed RGB and must be a single plane. The layout helper refuses
+  multi-plane U8, which is the only shape where it would disagree with
+  `stage::row_bytes()`; the engine views only produce single-plane U8.
 - Events carry the device that actually executed. The CPU fallback completes
-  before `submit()` returns (`asynchronous=false`). A device submission
-  returns `Running` with a completion handle; `poll()` queries the driver and
-  can report `Failed` early, and `wait()` blocks, reads the output back and
-  completes the event. Completion is never claimed before the readback.
+  before `submit()` returns (`asynchronous=false`, `device=CPU`). A device
+  submission returns `Running` with a completion handle (`device=OPENCL`,
+  `asynchronous=true`); `poll()` queries the driver and can report `Failed`
+  early, and `wait()` blocks, reads the output back and only then reports
+  `Complete`. An event that executed nothing, such as a compiled host program
+  offered to the device queue, reports `device=NONE`.
+- `StageContext::execute()` fills a `StageExecution { device, asynchronous }`
+  from the completed event. Callers and the profile record use it instead of
+  the selection, so a queue that falls back to the host is never labelled as a
+  device execution.
 
 ### Evidence
 
@@ -1601,15 +1622,21 @@ these are CPU-device measurements, never GPU parity.
 
 | Check | Result |
 |-------|--------|
-| `stage-residency-test` (POCL CPU) | PASS, 0 skipped: buffers, upload/readback, reuse, eviction, over-budget refusal and fallback, running/complete/failed events, selection and kill switches, node parity |
-| `stage-device-test` (POCL CPU) | PASS |
-| all 15 stage test executables, CPU and OpenCL trees | PASS |
-| `lanczos3` node parity, synthetic 128x96, scales 0.5 and 1.5 | PAE 0.000000 LSB16, 0 of 9216 and 0 of 82944 samples differ (tolerance 1 LSB16) |
-| 16-bit TIFF export, resize profile, switch off vs on | `AE=0`, PAE 0 of 7604928 samples, same output hash; device record `impl=opencl` |
-| preview sweep, 16 states, switch off vs on | 32 images `AE=0`, PAE 0 (regression check: the preview graph runs no stage-ABI node, so no device call) |
+| `stage-residency-test` (POCL CPU, `RT_REQUIRE_GPU=1`) | PASS, 0 skipped: buffers, upload/readback, reuse, true LRU order, budget clamping, over-budget refusal and host fallback, running/complete/failed events including a driver failure, selection and kill switches, node parity with an explicit executing-device assertion |
+| `stage-residency-test` without a device and `RT_REQUIRE_GPU=1` | FAIL, exit 1 (a missing device cannot pass as a skip) |
+| `stage-device-test` (POCL CPU) | PASS; a refused compiled host program reports `device=NONE` |
+| all 16 stage test executables, CPU and OpenCL trees | PASS; `tools/perf/run-suite.sh` builds 14 of them, including `stage-residency-test` |
+| `lanczos3` node parity, synthetic 128x96, scales 0.5 and 1.5 | PAE 0.000000 LSB16, 0 of 9216 and 0 of 82944 samples differ (tolerance 1 LSB16); `StageExecution` reports `device=OPENCL`, `asynchronous=true` |
+| over-budget node | runs on the host, `StageExecution` reports `device=CPU`, `asynchronous=false`, exact against the CPU reference |
+| 16-bit TIFF export, resize profile, `--gpu=off`, switch off vs on | `AE=0`, PAE 0 of 7604928 samples, same output hash; both runs record the host implementation |
+| kill-switch check, `--gpu=off` with `RT_STAGE_OPENCL=1` | the profile records `impl=module` (host), not `impl=opencl`; before the wiring fix it recorded `opencl` |
+| `--gpu=auto` with `RT_STAGE_OPENCL=1` | no stage `lanczos3` record: the classic `opencl::resizeLanczos` handles the node, and the export is `AE=0` against `--gpu=off` |
+| preview sweep, 16 states, switch off vs on | 32 images `AE=0`, PAE 0 (regression check: the preview graph runs no stage-ABI node and mode 0 disallows the device) |
 | crop harness, 3 states plus sequences, switch off vs on | 30 PPM files byte-identical; both runs PASS, 42 plans, 0 fallbacks (no stage-ABI node in the crop graph) |
-| preview timing, 18 samples per side | off 318.89 ms mean (316.43-323.65), on 318.70 ms (316.55-322.55); baseline at `9e8df3493` 318.72 ms |
-| resize node timing, 3888x2608 | host 84.2 ms, POCL CPU device 161.6 ms: the device path is slower on a CPU device, which is expected and not a performance claim |
+| preview timing, interleaved 18 samples per side | baseline `9e8df3493` 327.67 ms mean (326.99 median); switch off 331.48 (328.69); switch on 328.99 (324.72); the spread is run-to-run noise |
+
+No performance claim is made for the device node on a CPU OpenCL device; the
+device run is slower than the host and exists for parity and correctness.
 
 ### Nodes still CPU-only
 
@@ -1619,4 +1646,4 @@ Everything except `resize`: `source.select`, `source.embedded`,
 `working.trc`, `ciecam`, `gamut`, `output.convert`, `crop`, `output.sharpen`,
 `framing`, `output.icc`, `monitor.output`, `viewport.output` and the five
 `thumbnail.*` nodes. They have no device implementation yet, so they resolve
-to CPU with a reason and keep the host code path.
+to CPU and keep the host code path.
