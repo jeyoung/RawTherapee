@@ -69,12 +69,13 @@ rtengine::ProcEvent ProcEventMapper::newEvent(
     rtengine::EditorRequest request, const std::string &history_msg)
 {
     /*
-     * The dedup key is the planning identity, not the compatibility mask: two
-     * intents that plan the same may share an event, while two that plan
-     * differently never do.
+     * The key carries the planning identity and the compatibility mask. The
+     * mask is required because two producer actions can plan identically yet
+     * carry different execution payloads (EvSpotEnabled and
+     * EvSpotEnabledOPA share a history message today).
      */
-    std::string eventkey = "typed-" + std::to_string(request.identity())
-        + history_msg;
+    const std::string eventkey =
+        rtengine::producerEventKey(request, history_msg);
     const auto ret = events_.find(eventkey);
     if (ret == events_.end()) {
         rtengine::ProcEvent event = rtengine::RefreshMapper::getInstance()->newEvent();
