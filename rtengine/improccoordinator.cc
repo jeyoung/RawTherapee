@@ -588,12 +588,6 @@ int viewportDeferredMaxWaitMs()
     return value;
 }
 
-// Bits that are safe for Crop::update once the parent LUTs have been rebuilt.
-// Base/init and over-approximated HDR/spot bits are deliberately dropped.
-constexpr int VIEWPORT_CROP_TODO =
-    M_CROP | M_MINUPDATE | M_AUTOEXP | M_TRANSFORM | M_RGBCURVE
-    | M_LUMACURVE | M_LUMINANCE | M_COLOR;
-
 /*
  * Typed request for a deferred-analysis flush.
  *
@@ -667,9 +661,10 @@ bool ImProcCoordinator::canUseViewportFastPath(const EditorRequest& request,
     return reason == nullptr;
 }
 
-void ImProcCoordinator::prepareViewportLuts(int todo)
+void ImProcCoordinator::prepareViewportLuts(
+    const ViewportLutSelection& selection)
 {
-    if (todo & (M_RGBCURVE | M_CROP)) {
+    if (selection.toneCurves) {
         // vhist16 is cached from the last completed full-frame pass and is a
         // function of the base image and working profile only.
         CurveFactory::complexCurve(
@@ -717,7 +712,7 @@ void ImProcCoordinator::prepareViewportLuts(int todo)
             1.f - (float(params->colorToning.saturatedOpacity) / 100.f);
     }
 
-    if (todo & (M_LUMACURVE | M_CROP)) {
+    if (selection.rebuildsLumaCurve()) {
         // Lab contrast is restricted to zero by the eligibility check, so the
         // histogram cannot influence lumacurve. histLCurve is refreshed by the
         // deferred full pass. Guard the shared helper as well: a non-zero
@@ -732,7 +727,7 @@ void ImProcCoordinator::prepareViewportLuts(int todo)
             scale == 1 ? 1 : 16, utili);
     }
 
-    if (todo & M_LUMACURVE) {
+    if (selection.labCurves) {
         clcutili = CurveFactory::diagonalCurve2Lut(
             params->labCurve.clcurve, clcurve, scale == 1 ? 1 : 16);
 
@@ -743,28 +738,29 @@ void ImProcCoordinator::prepareViewportLuts(int todo)
             lhskcurve, scale == 1 ? 1 : 16);
     }
 
-    if (todo & (M_LUMINANCE | M_COLOR | M_AUTOEXP)) {
+    if (selection.wavelet) {
         wavcontlutili = CurveFactory::diagonalCurve2Lut(
             params->wavelet.wavclCurve, wavclCurve, scale == 1 ? 1 : 16);
     }
 
-    updateViewportLutSnapshot(todo);
+    updateViewportLutSnapshot(selection);
 }
 
-void ImProcCoordinator::updateViewportLutSnapshot(int todo)
+void ImProcCoordinator::updateViewportLutSnapshot(
+    const ViewportLutSelection& selection)
 {
-    if (todo & (M_RGBCURVE | M_CROP)) {
+    if (selection.toneCurves) {
         viewportLutParams.toneCurve = params->toneCurve;
         viewportLutParams.rgbCurves = params->rgbCurves;
         viewportLutParams.colorToning = params->colorToning;
         viewportLutParams.blackwhite = params->blackwhite;
     }
-    if (todo & M_LUMACURVE) {
-        // M_CROP rebuilds lumacurve but not clcurve/sgn curves, so it cannot
-        // prove the whole Lab family current.
+    if (selection.labCurves) {
+        // A crop repaint rebuilds lumacurve but not clcurve/sgn curves, so it
+        // cannot prove the whole Lab family current.
         viewportLutParams.labCurve = params->labCurve;
     }
-    if (todo & (M_LUMINANCE | M_COLOR | M_AUTOEXP)) {
+    if (selection.wavelet) {
         viewportLutParams.wavelet = params->wavelet;
     }
 }
@@ -3193,7 +3189,7 @@ void ImProcCoordinator::stageRgbProc(PreviewPassState& pass)
 
     // complexCurve also calculates the pre-curves histogram depending
     // on crop; the tone/LUT part is shared with the viewport fast path.
-    prepareViewportLuts(M_RGBCURVE);
+    prepareViewportLuts(ViewportLutSelection::toneOnly());
 
     int satTH = 80;
     int satPR = 30;
@@ -3319,7 +3315,7 @@ void ImProcCoordinator::stageLabTools(PreviewPassState& pass)
 
     CurveFactory::complexsgnCurve(autili, butili, ccutili, cclutili, params->labCurve.acurve, params->labCurve.bcurve, params->labCurve.cccurve,
                                   params->labCurve.lccurve, chroma_acurve, chroma_bcurve, satcurve, lhskcurve, scale == 1 ? 1 : 16);
-    updateViewportLutSnapshot(M_LUMACURVE);
+    updateViewportLutSnapshot(ViewportLutSelection::labOnly());
 
     if (pass.request.labChainIntent) {
     nprevl->CopyFrom(oprevl);
@@ -3354,7 +3350,7 @@ void ImProcCoordinator::stageLabTools(PreviewPassState& pass)
     }
 
     wavcontlutili = CurveFactory::diagonalCurve2Lut(params->wavelet.wavclCurve, wavclCurve, scale == 1 ? 1 : 16);
-    updateViewportLutSnapshot(M_LUMINANCE | M_COLOR);
+    updateViewportLutSnapshot(ViewportLutSelection::waveletOnly());
     }
 }
 
@@ -4700,23 +4696,31 @@ void ImProcCoordinator::updatePreviewImage(EditorRequest request,
     const char* viewportFallback = nullptr;
     if (canUseViewportFastPath(eligibilityRequest, highDetailNeeded,
                                viewportFallback)) {
-        int cropTodo = todo & VIEWPORT_CROP_TODO;
+        /*
+         * The crop render reads the augmented request: a post-crop-vignetting
+         * change derives a transform, and a luminance-curve or auto-exposure
+         * edit implies the Lab pixel tools. The payload the crop bodies read
+         * is materialised from that selection; no mask arithmetic happens
+         * here.
+         */
+        ViewportCropSelection cropSelection = viewportCropSelection(request);
+        resolveCropDependencies(cropSelection);
+
         EditorRequest cropRequest = request;
-        if (cropTodo & (M_LUMACURVE | M_AUTOEXP)) {
-            // Crop::update applies luminance/colour work for these bits only
-            // through M_LUMINANCE/M_COLOR; keep the mask and the typed facts
-            // consistent, because the crop bodies read the facts.
-            cropTodo |= M_LUMINANCE | M_COLOR;
+        if (cropSelection.labPixels()) {
+            // Crop::update applies luminance/colour work for the implied bits
+            // only through M_LUMINANCE/M_COLOR; keep the payload and the typed
+            // facts consistent, because the crop bodies read the facts.
             cropRequest.setLegacyGateMask(
-                request.legacyGateMask | M_LUMINANCE | M_COLOR);
+                viewportCropPayload(request.legacyGateMask, cropSelection));
         }
         assertPlanningAgrees(cropRequest, "viewport fast-path crop");
 
-        prepareViewportLuts(eligibilityTodo);
+        prepareViewportLuts(viewportLutSelection(eligibilityRequest));
         ipf.setScale(scale);
 
         const auto cropStart = std::chrono::steady_clock::now();
-        renderCrops(cropTodo, true, cropRequest);
+        renderCrops(viewportCropTodo(cropSelection), true, cropRequest);
         const auto cropEnd = std::chrono::steady_clock::now();
         previewTimer.viewportFast = true;
         previewTimer.viewportCropMs =

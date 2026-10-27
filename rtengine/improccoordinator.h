@@ -344,8 +344,8 @@ protected:
     bool canUseViewportFastPath(const EditorRequest& request,
                                 bool highDetailNeeded,
                                 const char*& reason) const;
-    void prepareViewportLuts(int todo);
-    void updateViewportLutSnapshot(int todo);
+    void prepareViewportLuts(const ViewportLutSelection& selection);
+    void updateViewportLutSnapshot(const ViewportLutSelection& selection);
     void renderCrops(int todo, bool force, const EditorRequest& request);
     int queueViewportDeferredAnalysis(int todo, unsigned request);
     void markViewportStateValid(bool highDetailNeeded);
