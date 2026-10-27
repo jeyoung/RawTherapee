@@ -18,7 +18,7 @@ if(1):
                         grp1 = subprocess.Popen(('grep', '-ro', '--exclude=procevents.h', '--exclude-dir=.git', pec.displayname), stdout=subprocess.PIPE)
                         wcr1 = subprocess.check_output(('wc', '-l'), stdin=grp1.stdout)
                         grp1.wait()
-                        grp2 = subprocess.Popen(('grep', '-ro', '--exclude=procevents.h', '--exclude=refreshmap.cc', '--exclude-dir=.git', pec.displayname), stdout=subprocess.PIPE)
+                        grp2 = subprocess.Popen(('grep', '-ro', '--exclude=procevents.h', '--exclude-dir=.git', pec.displayname), stdout=subprocess.PIPE)
                         wcr2 = subprocess.check_output(('wc', '-l'), stdin=grp2.stdout)
                         grp2.wait()
                         print(pec.enum_value, pec.displayname,int(wcr1), int(wcr2))
