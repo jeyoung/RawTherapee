@@ -43,8 +43,11 @@ namespace
 
 using rtengine::EditorRequest;
 using rtengine::LegacyMaskContext;
+using rtengine::RequestIntent;
 using rtengine::coalesce;
+using rtengine::compatibility_mask;
 using rtengine::from_legacy_mask;
+using rtengine::make_request;
 using rtengine::planningAgreesWithLegacyMask;
 
 int failures = 0;
@@ -272,6 +275,18 @@ void checkEveryPair()
                   label + ": monitorOutputRequest");
             check(merged.imperativeRepaint == single.imperativeRepaint,
                   label + ": imperativeRepaint");
+            check(merged.transformFamilyIntent == single.transformFamilyIntent,
+                  label + ": transformFamilyIntent");
+            check(merged.hdrIntent == single.hdrIntent, label + ": hdrIntent");
+            check(merged.rgbProcIntent == single.rgbProcIntent,
+                  label + ": rgbProcIntent");
+            check(merged.labChainIntent == single.labChainIntent,
+                  label + ": labChainIntent");
+            check(merged.autoExposureIntent == single.autoExposureIntent,
+                  label + ": autoExposureIntent");
+            check(merged.localAdjustmentsIntent
+                      == single.localAdjustmentsIntent,
+                  label + ": localAdjustmentsIntent");
             check(merged.legacyGateMask == unionMask,
                   label + ": gate mask");
             check(merged.identity() == single.identity(),
@@ -425,6 +440,158 @@ void checkViewportMovedContext()
           "viewportMoved defaults to false");
 }
 
+/*
+ * The typed producer API. Each intent must produce the request its legacy
+ * composite produced, so converting a tool cannot change planning; the
+ * compatibility mask must be the composite the rest of the coordinator still
+ * consumes.
+ */
+struct IntentExpectation {
+    RequestIntent intent;
+    const char* name;
+    int mask;
+};
+
+const std::vector<IntentExpectation>& intentExpectations()
+{
+    static const std::vector<IntentExpectation> rows = {
+        {RequestIntent::AllNoRaw, "AllNoRaw", ALLNORAW},
+        {RequestIntent::Demosaic, "Demosaic", DEMOSAIC},
+        {RequestIntent::Hdr, "Hdr", HDR},
+        {RequestIntent::SpotAdjust, "SpotAdjust", SPOTADJUST},
+        {RequestIntent::Transform, "Transform", TRANSFORM},
+        {RequestIntent::WhiteBalance, "WhiteBalance", WB},
+        {RequestIntent::RepaintOnly, "RepaintOnly", M_MINUPDATE},
+        {RequestIntent::ControlOnly, "ControlOnly", M_VOID},
+        {RequestIntent::Compr, "Compr", COMPR},
+        {RequestIntent::CaptureSharpen, "CaptureSharpen", CAPTURESHARPEN},
+        {RequestIntent::DarkFrame, "DarkFrame", DARKFRAME},
+        {RequestIntent::First, "First", FIRST}
+    };
+    return rows;
+}
+
+void checkProducerIntents()
+{
+    for (const IntentExpectation& row : intentExpectations()) {
+        const std::string label = std::string("intent ") + row.name;
+        const EditorRequest typed = make_request(row.intent);
+        const EditorRequest legacy = from_legacy_mask(row.mask);
+
+        check(compatibility_mask(row.intent) == row.mask,
+              label + ": compatibility mask");
+        check(typed.legacyGateMask == row.mask, label + ": gate mask");
+        check(typed.kind == legacy.kind, label + ": kind");
+        check(typed.controlOnly == legacy.controlOnly,
+              label + ": controlOnly");
+        check(typed.present, label + ": present");
+        check(typed.spotPending == legacy.spotPending, label + ": spot");
+        check(typed.fullFrameIntent == legacy.fullFrameIntent,
+              label + ": full frame");
+        check(typed.colorHlrWbRequest == legacy.colorHlrWbRequest,
+              label + ": colour HLR WB");
+        check(typed.transformFamilyIntent == legacy.transformFamilyIntent,
+              label + ": transform family");
+        check(typed.hdrIntent == legacy.hdrIntent, label + ": HDR");
+        check(typed.rgbProcIntent == legacy.rgbProcIntent, label + ": rgb.proc");
+        check(typed.labChainIntent == legacy.labChainIntent, label + ": Lab");
+        check(typed.autoExposureIntent == legacy.autoExposureIntent,
+              label + ": auto exposure");
+        check(typed.localAdjustmentsIntent == legacy.localAdjustmentsIntent,
+              label + ": local adjustments");
+        check(typed.derivesFromParameters(),
+              label + ": no producer dirty set");
+        check(planningAgreesWithLegacyMask(typed),
+              label + ": agrees with its compatibility mask");
+        check(typed.identity() == legacy.identity(),
+              label + ": identical planning identity");
+    }
+
+    check(make_request(RequestIntent::RepaintOnly).kind
+              == EditorRequest::RequestKind::RepaintOnly,
+          "the repaint intent stays RepaintOnly");
+    check(make_request(RequestIntent::WhiteBalance).colorHlrWbRequest,
+          "the white-balance intent carries the Color/Coloropp fact");
+}
+
+/*
+ * A producer that names its dirty blocks gets an execution set: the seeds,
+ * the forward closure and the path residents. The set replaces the parameter
+ * comparison, but the request identity records it.
+ */
+void checkProducerDirtyBlocks()
+{
+    const EditorRequest seeded = make_request(
+        RequestIntent::Transform, {"transform"}, rtengine::stage::StagePath::Preview);
+
+    check(seeded.dirtySource == EditorRequest::DirtySource::ProducerProvided,
+          "producer blocks set ProducerProvided");
+    check(seeded.dirty.valid, "producer dirty set is valid");
+    check(seeded.dirty.ids.count("transform") != 0,
+          "producer dirty set contains the seed");
+    check(seeded.dirty.ids.count("local.adjustments") != 0,
+          "producer dirty set closes over the first consumer");
+    check(seeded.dirty.ids.count("monitor.output") != 0,
+          "producer dirty set contains the path resident");
+    check(seeded.dirty.forced == false, "producer dirty set is not forced");
+    check(!seeded.derivesFromParameters(),
+          "producer dirty set does not derive from parameters");
+    check(seeded.identity() != make_request(RequestIntent::Transform).identity(),
+          "producer dirty blocks change the identity");
+
+    const EditorRequest second = make_request(
+        RequestIntent::Transform, {"rgb.proc"}, rtengine::stage::StagePath::Preview);
+    const EditorRequest merged = coalesce(seeded, second);
+    check(merged.dirtySource
+              == EditorRequest::DirtySource::ProducerProvided,
+          "coalescing two producer sets keeps ProducerProvided");
+    check(merged.dirty.ids.count("transform") != 0,
+          "coalescing unions the producer sets");
+    check(merged.dirty.ids.count("rgb.proc") != 0,
+          "coalescing keeps both seeds");
+
+    const EditorRequest derived = make_request(RequestIntent::Transform);
+    const EditorRequest mixed = coalesce(derived, second);
+    check(mixed.dirtySource
+              == EditorRequest::DirtySource::ProducerProvided,
+          "a derived request does not erase a producer set");
+}
+
+/*
+ * The RefreshMapper carries the typed request for a converted event and the
+ * compatibility mask for every consumer that still asks for one. An event
+ * registered with a mask stays on the compatibility path.
+ */
+void checkRefreshMapper()
+{
+    auto* mapper = rtengine::RefreshMapper::getInstance();
+
+    const rtengine::ProcEvent typedEvent = mapper->newEvent();
+    const EditorRequest typed = make_request(RequestIntent::WhiteBalance);
+    mapper->mapRequest(typedEvent, typed);
+
+    EditorRequest found;
+    check(mapper->getRequest(typedEvent, found),
+          "a typed event returns its request");
+    check(found.identity() == typed.identity(),
+          "the typed request survives the mapper");
+    check(mapper->getAction(typedEvent) == WB,
+          "a typed event still reports its compatibility mask");
+
+    const rtengine::ProcEvent maskedEvent = mapper->newEvent();
+    mapper->mapEvent(maskedEvent, AUTOEXP);
+    check(!mapper->getRequest(maskedEvent, found),
+          "a mask event has no typed request");
+    check(mapper->getAction(maskedEvent) == AUTOEXP,
+          "a mask event keeps its action");
+
+    const rtengine::ProcEvent reused = mapper->newEvent();
+    mapper->mapRequest(reused, typed);
+    mapper->mapEvent(reused, M_CROP);
+    check(!mapper->getRequest(reused, found),
+          "re-registering with a mask clears the typed request");
+}
+
 void checkIdentity()
 {
     /*
@@ -432,27 +599,47 @@ void checkIdentity()
      * planning information must have the same identity. The raw legacy mask
      * is deliberately excluded; every mask-shaped planning fact is included.
      */
-    const EditorRequest autoexp = from_legacy_mask(M_AUTOEXP);
+    const EditorRequest plain = from_legacy_mask(M_LUMINANCE);
     const EditorRequest color = from_legacy_mask(M_COLOR);
-    check(autoexp.identity() == color.identity(),
+    check(plain.identity() == color.identity(),
           "identity ignores the raw legacy mask");
-    check(autoexp.identity()
-              == coalesce(autoexp, color).identity(),
+    check(plain.identity()
+              == coalesce(plain, color).identity(),
           "coalescing planning-equivalent requests keeps the identity");
 
-    check(autoexp.identity() != from_legacy_mask(M_SPOT).identity(),
+    check(plain.identity() != from_legacy_mask(M_SPOT).identity(),
           "spot intent changes the identity");
-    check(autoexp.identity() != from_legacy_mask(M_INIT).identity(),
+    check(plain.identity() != from_legacy_mask(M_INIT).identity(),
           "full-frame intent changes the identity");
-    check(autoexp.identity() != from_legacy_mask(M_HIGHQUAL).identity(),
+    check(plain.identity() != from_legacy_mask(M_HIGHQUAL).identity(),
           "high-detail intent changes the identity");
-    check(autoexp.identity() != from_legacy_mask(M_MINUPDATE).identity(),
+    check(plain.identity() != from_legacy_mask(M_MINUPDATE).identity(),
           "kind changes the identity");
 
     LegacyMaskContext moved;
     moved.viewportMoved = true;
-    check(autoexp.identity() != from_legacy_mask(M_AUTOEXP, moved).identity(),
+    check(plain.identity() != from_legacy_mask(M_LUMINANCE, moved).identity(),
           "viewportMoved changes the identity");
+
+    /*
+     * The new request facts are planning fields. An auto-exposure request
+     * recomputes different work from a plain Lab request, and a transform or
+     * HDR request differs from both.
+     */
+    check(plain.identity() != from_legacy_mask(M_AUTOEXP).identity(),
+          "autoExposureIntent changes the identity");
+    check(from_legacy_mask(M_TRANSFORM).identity()
+              != from_legacy_mask(M_LUMINANCE).identity(),
+          "transformFamilyIntent changes the identity");
+    check(from_legacy_mask(M_HDR).identity()
+              != from_legacy_mask(M_INIT).identity(),
+          "hdrIntent changes the identity");
+    check(from_legacy_mask(M_RGBCURVE).identity()
+              != from_legacy_mask(M_LUMINANCE).identity(),
+          "rgbProcIntent changes the identity");
+    check(from_legacy_mask(M_CROP).identity()
+              != from_legacy_mask(M_LUMINANCE).identity(),
+          "localAdjustmentsIntent changes the identity");
 
     /*
      * Mask-shaped facts. M_WB and M_AUTOEXP plan differently (the Color/Coloropp
@@ -525,6 +712,9 @@ int main()
     checkEmptyAccumulator();
     checkCoordinatorPatches();
     checkViewportMovedContext();
+    checkProducerIntents();
+    checkProducerDirtyBlocks();
+    checkRefreshMapper();
     checkIdentity();
     checkContractViolations();
 

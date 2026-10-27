@@ -33,6 +33,8 @@ class CieImage;
 /* Per-update snapshot of the crop dirty-block derivation. Defined in dcrop.cc. */
 struct CropDirtyState;
 
+struct EditorRequest;
+
 using namespace procparams;
 
 class ImProcCoordinator;
@@ -108,7 +110,7 @@ public:
 //   MyMutex* locMutex;
     void setEditSubscriber(EditSubscriber* newSubscriber);
     bool hasListener();
-    void update(int todo);
+    void update(int todo, const EditorRequest& request);
     void setWindow   (int cropX, int cropY, int cropW, int cropH, int skip) override
     {
         setCropSizes(cropX, cropY, cropW, cropH, skip, false);

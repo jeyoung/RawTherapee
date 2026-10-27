@@ -21,6 +21,7 @@
 #include "stage/stage_render_state.h"
 
 #include <cstdint>
+#include <initializer_list>
 
 namespace rtengine
 {
@@ -146,6 +147,36 @@ struct EditorRequest {
     bool imperativeRepaint = false;
 
     /*
+     * The request carries the transform family (`M_HDR`, `M_TRANSFORM`,
+     * `M_RGBCURVE`, `M_INIT` or `M_LINDENOISE`). The transform node applies
+     * the pre-RGB directional-pyramid equaliser for this family only, exactly
+     * as the hand-written pass did. Recompute it with setLegacyGateMask().
+     */
+    bool transformFamilyIntent = false;
+
+    /* The request asks for the HDR/dehaze sub-path (`M_HDR`). */
+    bool hdrIntent = false;
+
+    /* The request applies the RGB processing chain (`M_RGBCURVE`). */
+    bool rgbProcIntent = false;
+
+    /*
+     * The request applies the Lab chain (`M_LUMINANCE`, `M_COLOR` or
+     * `M_AUTOEXP`). The Lab node bodies decide whether to touch pixels with
+     * this fact; the graph plan decides whether the node is entered.
+     */
+    bool labChainIntent = false;
+
+    /* The request recomputes auto exposure (`M_AUTOEXP`). */
+    bool autoExposureIntent = false;
+
+    /*
+     * The request may recompute the local-adjustment regions (`M_AUTOEXP`,
+     * `M_RGBCURVE` or `M_CROP`).
+     */
+    bool localAdjustmentsIntent = false;
+
+    /*
      * The request carries no bit outside the control bit `M_VOID`, so it
      * updates parameters without rendering. A request with an empty legacy
      * mask is treated the same way.
@@ -238,7 +269,12 @@ struct LegacyMaskContext {
  * |   or output bit         |             |                              |
  *
  * Independently of the kind, every mask also yields `fullFrameAdmission` and
- * `monitorOutputRequest`; both are documented on the fields. `M_VOID` is pure
+ * `monitorOutputRequest`; both are documented on the fields. The body facts
+ * `transformFamilyIntent`, `hdrIntent`, `rgbProcIntent`, `labChainIntent`,
+ * `autoExposureIntent` and `localAdjustmentsIntent` are derived here too.
+ * They tell a scheduled node how much of its block the request allows; they
+ * are not entry decisions, which come from the plan's dirty-block set.
+ * `M_VOID` is pure
  * control: a mask made only of it suppresses the render but may still publish
  * parameters. `M_MINUPDATE` is imperative: it means "repaint without new image
  * work" and is only valid on its own, as declared in refreshmap.h. A combined
@@ -250,6 +286,75 @@ struct LegacyMaskContext {
  * legacy block gates see exactly what they saw before.
  */
 EditorRequest from_legacy_mask(int mask, const LegacyMaskContext& context = {});
+
+/*
+ * Typed producer API.
+ *
+ * A GUI tool that carries planning information names the operation it asks
+ * for instead of building an `M_*` mask. `RequestIntent` is the closed set of
+ * operations the tools currently express; `make_request()` turns one into an
+ * `EditorRequest` whose kind, facts and dirty-block source are the planning
+ * inputs. `legacyGateMask` is filled with the identical compatibility mask, so
+ * the viewport fast path, the deferred queue, cache invalidation and the block
+ * bodies keep the payload they had. The compatibility mask is derived here,
+ * next to the adapter, and never at the tool.
+ *
+ * A tool that knows the exact blocks it dirties passes them to the second
+ * form. They replace the parameter-fingerprint comparison for that request;
+ * the set is closed over the pipeline and joined with the path residents
+ * before it is stored, so it is an execution set and not only a seed list.
+ * Omitting the blocks leaves the derivation to the parameter fingerprints,
+ * which is the safe default for a tool that only knows "this parameter
+ * changed".
+ *
+ * Parameter-only tools that have no planning information to carry stay on the
+ * integer `ProcEventMapper::newEvent(action, message)` compatibility path; no
+ * `M_*` bit reaches a planning decision through it because the coordinator
+ * adapter classifies it once.
+ */
+enum class RequestIntent {
+    /* A destructive raw reload, the legacy `ALLNORAW` composite. */
+    AllNoRaw = 0,
+    /* A demosaic family change, the legacy `DEMOSAIC` composite. */
+    Demosaic = 1,
+    /* The HDR/dehaze family, the legacy `HDR` composite. */
+    Hdr = 2,
+    /* Spot add/remove inside the base pass, the legacy `SPOTADJUST`. */
+    SpotAdjust = 3,
+    /* The geometry family, the legacy `TRANSFORM` composite. */
+    Transform = 4,
+    /* A white-balance change, the legacy `WB` composite. */
+    WhiteBalance = 5,
+    /* Repaint the current image without new work, the legacy `MINUPDATE`. */
+    RepaintOnly = 6,
+    /* Update parameters without rendering, the legacy `M_VOID`. */
+    ControlOnly = 7,
+    /* Gamut compression family, the legacy `COMPR` composite. */
+    Compr = 8,
+    /* Capture sharpening family, the legacy `CAPTURESHARPEN` composite. */
+    CaptureSharpen = 9,
+    /* Dark-frame/flat-field family, the legacy `DARKFRAME` composite. */
+    DarkFrame = 10,
+    /* Whole preview including the monitor sink, the legacy `FIRST`. */
+    First = 11
+};
+
+/* Intent to typed request, with no producer-provided dirty blocks. */
+EditorRequest make_request(RequestIntent intent);
+
+/*
+ * Intent to typed request with a producer-provided dirty-block seed.
+ *
+ * `blocks` are canonical ids of `path`; the result closes over the pipeline
+ * edges and includes the path residents. An empty list is equivalent to the
+ * one-argument form.
+ */
+EditorRequest make_request(RequestIntent intent,
+                           std::initializer_list<const char*> blocks,
+                           stage::StagePath path = stage::StagePath::Preview);
+
+/* The compatibility mask an intent carries, exposed for tests and diagnostics. */
+int compatibility_mask(RequestIntent intent);
 
 /*
  * Debug cross-check: whether a request still agrees with the planning a bare
