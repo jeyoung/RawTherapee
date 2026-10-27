@@ -40,6 +40,7 @@ set(RTENGINESOURCEFILES
     dirpyr_equalizer.cc
     dual_demosaic_RT.cc
     dynamicprofile.cc
+    editorrequest.cc
     eahd_demosaic.cc
     EdgePreservingDecomposition.cc
     fast_demo.cc
@@ -429,6 +430,13 @@ add_executable(stage-store-test EXCLUDE_FROM_ALL
 target_link_libraries(stage-store-test PRIVATE rtengine)
 target_include_directories(stage-store-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/stage")
 rt_setup_target(stage-store-test)
+
+# Typed editor request and its single legacy-mask adapter.
+add_executable(editorrequest-test EXCLUDE_FROM_ALL
+    "${CMAKE_CURRENT_SOURCE_DIR}/stage/tests/editorrequest_test.cc"
+)
+target_link_libraries(editorrequest-test PRIVATE rtengine)
+rt_setup_target(editorrequest-test)
 
 target_include_directories(rtengine
     PUBLIC
