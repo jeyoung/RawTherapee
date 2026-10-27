@@ -1302,6 +1302,65 @@ divergence: `str` crossing zero, which only toggles the preparation's forward
 gamma (the `RETINEX` action carries no `M_RAW` on either path), and the crop's
 `coarse`-derived bit mask. Both are `shared gap` rows above.
 
+### Execution-gate retirement (step 4)
+
+The body gates no longer read the execution mask. `updatePreviewImage()` keeps
+no `int todo`; `renderCrops()`, `Crop::update()`, `CropStageContext`, the
+preview timer and the dump take the typed request. Every conversion keeps the
+sub-step semantics: a node is entered by the plan and decides inside it which
+work the request allows. The gates, their class and their replacement are:
+
+| Gate | Site | Class | Old condition | New condition |
+|------|------|-------|---------------|---------------|
+| crop render | `renderCrops()` | body | `todo & (M_MONITOR\|M_RGBCURVE\|M_LUMACURVE)` | `monitorIntent \|\| rgbProcIntent \|\| lumaCurveIntent` |
+| PC-vignette transform | `updatePreviewImage()` | scheduling | `todo & M_CROP`, then `\|= TRANSFORM` | `cropIntent`, then `markCropTransform()` |
+| panning requeue | `updatePreviewImage()` | scheduling | `todo \|= M_MONITOR` | `markViewportMoved()` |
+| base refresh | `updatePreviewImage()` | scheduling | `todo \|= M_INIT\|M_HDR\|M_MONITOR` (+`M_SPOT`) | `markBaseRefresh(spotChanged)` |
+| deferred absorb | `absorbPendingDeferred()` | payload | `todo \|= deferredExecutionPayload(...)` | `absorbDeferredExecution(blocks)` |
+| Color/Coloropp demosaic | pass setup | payload | `pass.todo \|= DEMOSAIC` + manual facts | `markColorHlrDemosaic()` |
+| demosaic sub-step | `stageRawDemosaic()` | body | `pass.todo & M_RAW` | `rawIntent` |
+| capture sharpening | `stageRawDemosaic()` | body | `pass.todo & (M_RAW\|M_CSHARP)` | `rawIntent \|\| captureSharpenIntent \|\| demosaicRebuilt` |
+| retinex preparation | `stageRawDemosaic()` | body | `pass.todo & M_RAW` | `rawIntent` |
+| demosaic rebuild widening | `stageRawDemosaic()` | payload | `pass.todo \|= M_INIT\|M_CSHARP` | `demosaicRebuilt`, applied after the node loop by `markDemosaicRebuilt()` |
+| output-profile refresh | post-node | body | `pass.todo & M_MONITOR` | `monitorIntent` |
+| crop force | `Crop::update()` | scheduling | `if (forcedFull) todo = ALL` | removed; `forcedFull` and the request facts already admit the same work |
+| timer / dump / trace | diagnostics | diagnostic | `int todo` | `request.executionPayload()` |
+
+`monitorIntent` is the exact `M_MONITOR` bit, not `monitorOutputRequest`: a
+spot or white-balance request renders `monitor.output` but does not name the
+monitor transform, and the crop gate and profile refresh followed the bit.
+`rawIntent` and `captureSharpenIntent` are payload-shaping facts like
+`luminanceIntent`; they are excluded from `identity()`. The deferred payload
+and the `from_legacy_mask(ALL | M_MONITOR)` producers remain for step 5, as do
+`viewportCropTodo()`/`viewportCropPayload()` as test oracles; the coordinator
+no longer calls them.
+
+Only one gate changed shape, and only in how it is expressed:
+`captureSharpening` names the local `demosaicRebuilt` fact explicitly instead
+of relying on the widened `pass.todo`. Every other gate is a one-to-one
+substitution, and the post-node widening stays at its original position so it
+cannot leak into the transform node of the same pass. The dead
+`M_LINDENOISE` block in `stageRawBase()` is inside a comment and is marked
+retired; no compiled read remains.
+
+#### Step-4 evidence
+
+Host CPU build, `OMP_NUM_THREADS=1`, image 10.2 MP PEF
+`colorspace_flowers.pef`:
+
+| Check | Result |
+| --- | --- |
+| preview sweep, 16 states | PASS, `AE=0` for `preview.tif` and `work.tif` in every state |
+| `crop-stage-test --sequences --extra-states` | PASS, 48 plans, 0 fallbacks, 48 dirty derivations, `AE=0` |
+| `crop-stage-test --stages` | PASS, 6 plans, 0 fallbacks, 6 dirty derivations, `AE=0` |
+| viewport fast path | PASS, 5 hits, 5 deferred analyses, 1 initial fallback, 18 images `AE=0` |
+| node cache, on vs off | PASS, 16 states `AE=0`; on `hits=0 misses=5 refused=11 inserts=5` |
+| 16-bit TIFF export, work order on vs off | `AE=0` |
+| `thumbnail-stage-test` | PASS embedded and raw |
+| both builds | `cpu-perf-graph-retire` and `opencl-perf-graph-retire` compile; 16 stage tests plus `editorrequest-test` PASS in both |
+| control exposure, 10 samples | before p50 383.7 ms / p95 390.9 ms, after p50 373.5 ms / p95 377.0 ms |
+| viewport fast path, 10 samples | before crop p50 58.0 ms (n=9), after 55.0 ms (n=9); settled p50 636.1 vs 635.6 ms |
+
 ### Timing
 
 Ten samples per side on the same image, default profile, preview scale 4, fit

@@ -430,8 +430,8 @@ methods, so the inventory and the executor cannot drift apart.
 |------|--------|-----------------|
 | `source.select` | `stageSourceSelect()` | preprocess bits or high detail newly needed |
 | `raw.preprocess` | `stageRawPreprocess()` | same |
-| `raw.demosaic` | `stageRawDemosaic()` | `M_RAW`, `M_CSHARP`, `M_WB`, modified RGB source, high detail |
-| `raw.base` | `stageRawBase()` | `M_INIT`, `M_LINDENOISE`, `M_HDR`, `M_RETINEX`, `M_SPOT`, pending spot copy |
+| `raw.demosaic` | `stageRawDemosaic()` | `rawIntent`, `captureSharpenIntent`, `colorHlrWbRequest`, modified RGB source, high detail |
+| `raw.base` | `stageRawBase()` | work-order items `rawBaseRebuild`, `retinexPrepare`, `spotApply`, `spotRestore`, `analysisRun` |
 | `analysis` | folded into `raw.base` | the base rebuild |
 | `transform` | `stageTransform()` | `M_HDR`, `M_TRANSFORM`, `M_RGBCURVE`, base rebuild, `needsTransform()` |
 | `local.adjustments` | `stageLocalAdjustments()` | `M_AUTOEXP`, or `M_RGBCURVE`/`M_CROP` with local spots |
@@ -443,17 +443,20 @@ methods, so the inventory and the executor cannot drift apart.
 | `gamut` | `stageGamut()` | the Lab chain |
 | `monitor.output` | `stageMonitorOutput()` | monitor conversion or a panning-related change |
 
-The Lab chain is the hand-written mask `(todo & (M_LUMINANCE + M_COLOR)) ||
-(todo & M_AUTOEXP)`.
+The Lab chain is the typed fact `labChainIntent`, derived once in the adapter
+from `M_LUMINANCE`, `M_COLOR` and `M_AUTOEXP`.
 
-A node keeps the event-mask gate the hand-written block used, because a
-preview block decides how much of its output a mask allows, not only whether
-it runs: `raw.base` rebuilds the base for one class of bits, re-prepares
-retinex for another and re-applies spots for a third. The plan decides whether
-the node is executed; the node decides what the mask permits inside it. The
-gates used for dirty marking are the same predicates the nodes use, and are
-documented supersets of the block's internal guards, so a plan can only skip a
-node that would have done nothing.
+A node keeps the sub-step gate the hand-written block used, because a preview
+block decides how much of its output a request allows, not only whether it
+runs: `raw.base` rebuilds the base for one work item, re-prepares retinex for
+another and re-applies spots for a third. The plan decides whether the node is
+executed; the node decides what the request permits inside it. The raw body is
+now typed: `stageRawDemosaic()` reads `rawIntent`, `captureSharpenIntent` and
+the local `demosaicRebuilt` fact, and `stageRawBase()` reads only its work
+items. The remaining nodes keep their legacy predicate until step 5; none of
+them decides node entry. The gates used for dirty marking are the same
+predicates the nodes use, and are documented supersets of the block's internal
+guards, so a plan can only skip a node that would have done nothing.
 
 `analysis` is folded into `raw.base`. `firstAnalysis()` is the final statement
 of the base-rebuild guard, and the spot pass that closes `raw.base` mutates
@@ -470,9 +473,9 @@ caller rather than in a node, because a node can be skipped:
 - the local-adjustment damping floor for selective-editing capture sharpening;
 - the frame-count and image-type notices.
 
-The Color/Coloropp white-balance augmentation (`todo |= DEMOSAIC`) also runs in
-the caller: it is a pure function of the mask, and the plan must see the mask
-the pass will actually use.
+The Color/Coloropp white-balance augmentation (`markColorHlrDemosaic()`) also
+runs in the caller: it is a pure function of the request facts, and the plan
+must see the request the pass will actually use.
 
 ### Plan and validation
 
@@ -817,14 +820,13 @@ decision reads the mask.
 
 #### Forced crop passes
 
-The crop still widens a pass to the legacy `todo = ALL` when the buffers were
-reallocated or the request is high quality, because every step has to be
-performed over the new or accurate base. The typed request describes only what
-the editor asked for, so every body gate whose legacy predicate was
-`todo & M_*` must also consult the force; otherwise a reallocating pass or a
-bare `M_HIGHQUAL` request (opening a detail window, `imagearea.cc:809`) skips
-work that `ALL` used to admit. `CropStageContext::forcedFull` carries that
-force, and the gates are:
+The crop performs every step when the buffers were reallocated or the request
+is high quality, because the new or accurate base needs a full refill. The
+typed request describes only what the editor asked for, so every body gate
+whose legacy predicate was `todo & M_*` also consults the force; otherwise a
+reallocating pass or a bare `M_HIGHQUAL` request (opening a detail window,
+`imagearea.cc:809`) skips work that `ALL` used to admit.
+`CropStageContext::forcedFull` carries that force, and the gates are:
 
 | Body | Legacy predicate | Gate |
 | --- | --- | --- |
@@ -853,23 +855,25 @@ to be byte-identical.
 it is a parameter/metadata predicate, not a mask test. The raw/core bodies keep
 their block-1 work-order authority and their internal compatibility reads.
 
-Every execution-payload augmentation in `updatePreviewImage()` refreshes the
-typed request before any consumer runs. The post-crop-vignetting augmentation
-adds `TRANSFORM` (which carries `M_HDR` and `M_SPOT` through the composite) and
-therefore calls `refreshFromLegacyMask()`, which recomputes the kind,
-`fullFrameIntent`, `spotPending` and the mask-shaped facts. The viewport fast
-path also widens the crop request mask when it adds `M_LUMINANCE | M_COLOR` for
-a `M_LUMACURVE`/`M_AUTOEXP` crop, so the crop bodies read the same intents the
-legacy mask implied. Debug builds assert `planningAgreesWithLegacyMask()` at
-the PC-vignette augmentation, the panning requeue, the deferred absorb, the
-fast-path crop and the crop render.
+Every execution-payload augmentation in `updatePreviewImage()` is a named
+intent method on `EditorRequest`, and they keep the typed facts in step before
+any consumer runs. The post-crop-vignetting augmentation adds `TRANSFORM`
+(which carries `M_HDR` and `M_SPOT` through the composite) through
+`markCropTransform()`, which recomputes the kind, `fullFrameIntent`,
+`spotPending` and the mask-shaped facts. The viewport fast path adds
+`M_LUMINANCE | M_COLOR` for a `M_LUMACURVE`/`M_AUTOEXP` crop through
+`markLabPixels()`, so the crop bodies read the same intents the legacy mask
+implied. Debug builds assert `planningAgreesWithLegacyMask()` at the
+PC-vignette augmentation, the panning requeue, the base refresh, the
+Color/Coloropp augmentation, the deferred absorb, the fast-path crop and the
+crop render.
 
 A forced crop pass forces `origCrop` to be refilled even when the editor
 request is a plain parameter update. `crop_request_kind()` maps the render
 state to `FullCrop` for that pass, so `derive_crop_work()` names
 `rawBaseRebuild` and `analysisRun`. The force is the same
-`needsinitupdate || HighQuality` that widens `todo` to `ALL`; like the legacy
-`M_INIT | M_LINDENOISE | M_HDR` bits that `ALL` carried, it must refill the
+`needsinitupdate || HighQuality` that drove the legacy `ALL` widening; like the
+legacy `M_INIT | M_LINDENOISE | M_HDR` bits that `ALL` carried, it must refill the
 base because the HDR and local-adjustment bodies overwrite `origCrop`. The GUI
 normally pairs a reallocation with a `FullCrop` request, but the force no
 longer depends on that.
@@ -989,30 +993,35 @@ Every remaining mask read is classified as one of:
    classifies the typed `EditorRequest` (`viewportEligibility()`) and applies
    the parameter vetoes in `viewportFastPathFallback()`; `prepareViewportLuts()`
    and `updateViewportLutSnapshot()` take a `ViewportLutSelection`, and the crop
-   subset and its Lab widening come from `viewportCropSelection()`,
-   `resolveCropDependencies()`, `viewportCropTodo()` and
-   `viewportCropPayload()`. The mask constants that expressed the old gate are
-   deleted. The pre-retirement gate survives only as the local oracle in
-   `viewport_admission_test.cc`.
+   subset comes from `viewportCropSelection()`. `viewportCropTodo()` and
+   `viewportCropPayload()` remain only as the pre-retirement oracles in the
+   tests; the coordinator no longer calls them.
 2. **Deferred scheduling.** `absorbPendingDeferred()`, the deferred watcher and
    the deferred flush use a typed `DeferredRecord` (a `DirtyBlocks` set plus a
    forced-analysis flag, hit count and deadline). The forced stages are
    `monitor.output`, `rgb.proc` and the Lab chain; no source or raw block is
-   ever named. A packed 64-bit `DeferredAnalysisSnapshot` is published
-   atomically for lock-free readers. The crop-render trigger still reads
-   `(M_MONITOR | M_RGBCURVE | M_LUMACURVE)`. `dcrop.cc` has no scheduling read
-   left except the forced detail-window request
-   `from_legacy_mask(ALL | M_MONITOR)` in `fullUpdate()`.
-3. **Diagnostics.** `preview_dump`, the preview timer and the
-   `preview-graph`/`crop-graph` log lines print the mask as data.
-4. **Compatibility.** The base-refresh and panning/Coloropp request widenings,
-   the raw.demosaic body gates and the `M_MONITOR` output-profile refresh.
-   These are payload/execution details, not planning decisions. The
-   preview-base-cache invalidation no longer reads a mask: it maps the typed
-   `raw.preprocess`/`raw.demosaic` block deltas, the white-balance request fact
-   and the high-detail flag through `baseCacheInvalidationFor()`.
+   ever named. The request absorbs the materialised payload through
+   `EditorRequest::absorbDeferredExecution()`, inside the adapter. The
+   crop-render trigger reads `monitorIntent`, `rgbProcIntent` and
+   `lumaCurveIntent`; `dcrop.cc` has no scheduling read, and its
+   `fullUpdate()` compatibility request is built through `from_legacy_mask()`.
+3. **Diagnostics.** `preview_dump`, the preview timer and the crop dirty trace
+   print `request.executionPayload()` as data; the timer and dump take the
+   typed request and derive the number.
+4. **Compatibility.** The base-refresh, panning, PC-vignette, Color/Coloropp,
+   demosaic-rebuild and Lab-dependency widenings are named intent methods on
+   `EditorRequest` (`markBaseRefresh()`, `markViewportMoved()`,
+   `markCropTransform()`, `markColorHlrDemosaic()`,
+   `markDemosaicRebuilt()`, `markLabPixels()`). They keep the payload and every
+   derived fact in step, and no execution site reads or writes a mask bit.
+   The raw body gates read `rawIntent` and `captureSharpenIntent`; the
+   output-profile refresh reads `monitorIntent`. The preview-base-cache
+   invalidation is typed as before.
 
-No node-entry gate and no planning decision reads the mask.
+No body gate, node-entry gate or planning decision reads a mask, and no
+`todo` parameter or `pass.todo` read remains in the preview or crop execution
+path. The only mask-shaped values left are the compatibility payload, the
+`from_legacy_mask()` producers, and the diagnostics.
 
 ### Evidence
 
@@ -1320,10 +1329,10 @@ cannot produce a complete topological order logs one diagnostic and aborts
 plan rejected: ...`). A partly processed image is never produced.
 
 `refreshmap.*` and the `todo` event mask stay for GUI notification, request
-coalescing, the viewport fast path, the deferred analysis queue, the
-crop-render trigger and the compatibility payload. They no longer decide the
-preview or crop execution set, and no downstream node-entry gate reads them:
-`RT_PREVIEW_DIRTY` and `RT_CROP_DIRTY` are gone.
+coalescing, the compatibility payload and the diagnostics. They no longer
+decide the preview or crop execution set, and no body gate, crop-render
+trigger or node-entry gate reads them: `RT_PREVIEW_DIRTY` and `RT_CROP_DIRTY`
+are gone.
 
 The gate is unchanged in shape. `run-suite.sh --graph` now requires the export
 log to report the 20-node inventory and the export to be byte-identical to the
@@ -1456,11 +1465,11 @@ follow-up should give the harness a completion signal that does not depend on
   a thread that never sets it defaults to allowed and still needs the
   environment opt-in.
 - Parameter fingerprints now drive the preview and crop dirty-block sets, and
-  the graph paths are default. `refreshmap.*` and the `todo` mask remain for
-  GUI notification, viewport admission, deferred scheduling and the
-  compatibility adapter; every producer is typed, including the five
-  parameter families. The remaining compatibility entries are listed under
-  "Typed editor requests and downstream gates".
+  the graph paths are default. `refreshmap.*` and the `todo` mask remain only
+  for GUI notification, coalescing, the compatibility payload and diagnostics;
+  every producer is typed, including the five parameter families, and no body
+  gate or crop-render trigger reads the mask. The compatibility entries are
+  listed under "Typed editor requests and downstream gates".
 - Tile ordering is connected to denoise and wavelet behind `RT_TILE_ORDER=1`,
   but it is opt-in and has no reduced-work mode. The deterministic merge is
   always on.
