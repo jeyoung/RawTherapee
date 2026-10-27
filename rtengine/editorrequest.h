@@ -268,15 +268,25 @@ bool planningAgreesWithLegacyMask(const EditorRequest& request);
  * Coalesce two requests into one.
  *
  * The result keeps the legacy-mask union (so block gates are unchanged), the
- * union of every input fact, and the strongest kind. The mask-shaped facts
- * (`fullFrameAdmission`, `colorHlrWbRequest`, `monitorOutputRequest`,
- * `imperativeRepaint`) are recomputed from the union, because they are not
- * monotone in the mask and the old code interpreted the ORed mask as a whole.
- * Kind precedence reproduces the old derivation over the ORed mask:
- * HighQuality, then FullPreview, then RepaintOnly only when every contributing
- * request was a bare repaint, then ParamsOnly. A control-only request therefore
- * turns a bare repaint into a parameter update, exactly as forming
- * `M_MINUPDATE | M_VOID` did.
+ * union of every input fact, and the strongest kind. The mask-shaped facts are
+ * recomputed from the union so they describe the payload as a whole, exactly
+ * as the old code interpreted the ORed mask. That is required because some of
+ * them are not monotone in the mask:
+ *
+ * - `fullFrameAdmission` becomes true only when the union accumulates every
+ *   `ALL` bit, even though neither input had them all;
+ * - `monitorOutputRequest` is false for exactly `M_CROP` and `M_MINUPDATE`, so
+ *   two suppressing inputs can produce a rendering union;
+ * - `imperativeRepaint` is true only for exactly `M_MINUPDATE`, so any
+ *   widening clears it.
+ *
+ * `colorHlrWbRequest` is monotone in `M_WB`, but it is recomputed with the
+ * others so every fact is derived once from the same payload and cannot drift
+ * from the rest. Kind precedence reproduces the old derivation over the ORed
+ * mask: HighQuality, then FullPreview, then RepaintOnly only when every
+ * contributing request was a bare repaint, then ParamsOnly. A control-only
+ * request therefore turns a bare repaint into a parameter update, exactly as
+ * forming `M_MINUPDATE | M_VOID` did.
  *
  * Producer-provided dirty sets are unioned; otherwise both inputs derive from
  * the parameters.

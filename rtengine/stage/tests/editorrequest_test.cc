@@ -308,9 +308,10 @@ void checkFactUnion()
           "coalescing ANDs controlOnly over a rendering request");
 
     /*
-     * Both inputs suppress monitor.output, but the union carries M_MONITOR, so
-     * the merged request must render it. This proves the fact is recomputed
-     * from the union rather than ORed.
+     * Both inputs suppress monitor.output. Their union,
+     * `M_CROP | M_MINUPDATE`, is neither exactly `M_CROP` nor exactly
+     * `M_MINUPDATE`, so the legacy predicate renders it. This proves the
+     * fact is recomputed from the union rather than ORed.
      */
     const EditorRequest cropAndRepaint =
         coalesce(from_legacy_mask(M_CROP), from_legacy_mask(M_MINUPDATE));
