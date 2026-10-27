@@ -597,9 +597,10 @@ explicitly for diagnostics and tests.
 node and records one residual input that `RenderStateKey` cannot carry yet: a
 pending spot buffer that the next `raw.base` restores. The request kind is the
 second such input: `M_HIGHQUAL`, `M_INIT`, `M_LINDENOISE` and `M_HDR` are
-request-level bits the render state has no field for, so the coordinator maps
-them to `HighQuality` and `FullPreview` and the state adapter treats an
-absolute request as a whole-path rebuild. An ordinary pass is `ParamsOnly`.
+request-level bits the render state has no field for, so the adapter maps them
+once to `HighQuality` and `FullPreview` in the typed `EditorRequest` and the
+state adapter treats an absolute request as a whole-path rebuild. An ordinary
+pass is `ParamsOnly`. The plan never reads the mask.
 The snapshots are dropped on `assign()`, `freeAll()`, `stopProcessing()` and the
 input-ICC reference path, so the next pass is all-dirty whenever the buffers
 they describe are gone. A pass that does not take the full-frame path (the
