@@ -97,8 +97,9 @@ the same code.
 5. The analysis stages the hit skipped are accumulated in
    `pendingDeferredMask` under `paramsUpdateMutex`, with a deadline. The hit
    does not queue a full-frame pass and does not block further fast hits.
-6. When the deadline expires, `flushDeferredAnalysis()` merges the accumulated
-   mask into `changeSinceLast`, sets `forceFullPreview` and starts the normal
+6. When the deadline expires, `flushDeferredAnalysis()` coalesces the
+   accumulated mask into `pendingRequest` as a deferred-analysis request
+   (`deferredAnalysisRequest()`), sets `forceFullPreview` and starts the normal
    `process()` loop. It updates `previmg`, `workimg`, histograms/scopes and
    listeners, re-renders the crops, and only then marks the viewport state
    valid again.

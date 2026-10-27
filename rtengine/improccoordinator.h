@@ -26,6 +26,7 @@
 #include "colortemp.h"
 #include "curves.h"
 #include "dcrop.h"
+#include "editorrequest.h"
 #include "imagesource.h"
 #include "improcfun.h"
 #include "LUT.h"
@@ -324,7 +325,8 @@ protected:
     /// Updates all waveforms. Returns true unless not updated.
     bool updateWaveforms();
     void setScale(int prevscale, bool allowSmall = false);
-    void updatePreviewImage (int todo, bool panningRelatedChange, unsigned request);
+    void updatePreviewImage (EditorRequest request, bool panningRelatedChange,
+                             unsigned requestId);
     bool canUseViewportFastPath(int todo, bool highDetailNeeded,
                                 const char*& reason) const;
     void prepareViewportLuts(int todo);
@@ -337,7 +339,7 @@ protected:
     void deferredWatcherLoop();
     void flushDeferredAnalysis();
     void dropPendingDeferred();
-    void absorbPendingDeferred(int& todo);
+    bool absorbPendingDeferred(int& todo);
 
     /*
      * Canonical full-frame preview nodes (devnotes/perf/STAGE_PIPELINE.md).
@@ -418,7 +420,12 @@ protected:
     Glib::Thread* thread;
     MyMutex updaterThreadStart;
     MyMutex paramsUpdateMutex;
-    int  changeSinceLast;
+    /*
+     * Coalesced typed request for the next preview pass. Guarded by
+     * paramsUpdateMutex. The legacy mask is the opaque execution payload on
+     * the request, not a planning input; see editorrequest.h.
+     */
+    EditorRequest pendingRequest;
     std::atomic<unsigned> previewRequest{0};
     bool updaterRunning;
     const std::unique_ptr<ProcParams> nextParams;

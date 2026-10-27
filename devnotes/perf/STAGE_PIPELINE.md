@@ -648,10 +648,11 @@ crop path, 14 for the preview) rather than twice.
 3. **Rebuild request.** A `FullCrop`, `FullPreview` or `HighQuality` request
    dirties the whole path. A request is absolute, not a delta: it says "this
    pass rebuilds the path", so it cannot be expressed as an input change. The
-   preview coordinator derives the kind from the request-level mask bits,
-   because those bits stand for work no parameter or render-state field
-   describes: `M_HIGHQUAL` is `HighQuality`, `M_INIT`, `M_LINDENOISE` and
-   `M_HDR` are `FullPreview`, and an ordinary pass is `ParamsOnly`.
+   preview coordinator takes the kind from the typed `EditorRequest`, whose
+   adapter maps the request-level mask bits once, because those bits stand for
+   work no parameter or render-state field describes: `M_HIGHQUAL` is
+   `HighQuality`, `M_INIT`, `M_LINDENOISE` and `M_HDR` are `FullPreview`, and
+   an ordinary pass is `ParamsOnly`. The plan never reads the mask.
 4. **Coupled group.** The Lab chain shares one `laboCrop -> labnCrop` seed and
    one gate. Seeding any member seeds the whole group: crop
    `lab.tools`, `lab.sharpening`, `lab.wavelet`, `working.trc`, `ciecam`,
