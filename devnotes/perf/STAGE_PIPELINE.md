@@ -1119,11 +1119,13 @@ run applies.
 ## Preview typed work order
 
 The preview raw-chain gates run from the typed order by default. The order is
-derived once per pass by `rtengine/stage/stage_work.cc` and the shadow
-comparison (`RT_WORK_SHADOW=1`) reports `typedOnly` and `legacyOnly` per pass.
-`RT_WORK_ORDER` is the kill switch: any value leaves the typed order enabled,
-while `0` and `off` (case-insensitive) make the legacy `M_*` gates
-authoritative. Unset is the default and enables the order.
+derived once per pass by `rtengine/stage/stage_work.cc`. The legacy `M_*` gates
+are retired, so there is no runtime shadow probe: `typedOnly` is pinned by the
+unit oracle in `rtengine/stage/tests/stage_work_test.cc`, which compares every
+case against the action the editor sends. `RT_WORK_ORDER` is the kill switch:
+any value leaves the typed order enabled, while `0` and `off`
+(case-insensitive) derive the order with no usable history, so it names every
+parameter-applicable item. Unset is the default and enables the exact order.
 
 ### Sweep
 
@@ -1132,10 +1134,13 @@ authoritative. Unset is the default and enables the order.
 one edit per state, waiting for each full-frame pass to settle. It copies the
 `RT_PREVIEW_DUMP` files (`preview.tif`, `work.tif`, `preview.json`) after every
 state. The viewport fast path is disabled inside the harness
-(`RT_VIEWPORT_FAST=0`) so every state is a full-frame pass and its dump and
-shadow record belong to the same pass. The preview scale is 4, the profile is
-the default, and the fit state uses the FAST preview demosaic so the 100%
-crossing is a real high-detail transition.
+(`RT_VIEWPORT_FAST=0`) so every state is a full-frame pass. The preview scale is
+4, the profile is the default, and the fit state uses the FAST preview demosaic
+so the 100% crossing is a real high-detail transition.
+
+The dumps are 8-bit image data in 16-bit containers: the preview path produces
+8-bit RGB, and `preview.tif` and `work.tif` widen it without adding precision.
+`AE` is therefore a byte comparison, not a 16-bit-precision comparison.
 
 ```bash
 export RT_BUILD_DIR="$PWD/build/cpu-perf-graph-workflags"
@@ -1144,17 +1149,42 @@ tools/perf/preview-work-order-sweep.sh \
     build/test-scratch/work-order-sweep
 ```
 
-The driver builds the target, probes the kill switch, runs the sequence with
-`RT_WORK_ORDER=off` and with the default, compares every state with
-`magick compare -metric AE`, and requires `typedOnly=0` on every shadow pass.
-It writes the two run logs and the state dumps under the output directory.
+The driver builds the target, probes the kill switch (with `RT_WORK_SHADOW`
+unset, so an ambient value cannot fail the probe), runs the sequence with
+`RT_WORK_ORDER=off` and with the default, and compares every state with
+`magick compare -metric AE`. The state list comes from the run log and a state
+directory missing on either side fails the run; the driver never passes on the
+strength of the directories that happen to exist. It writes the two run logs
+and the state dumps under the output directory.
+
+Timing samples use the same harness. The script documents the flag and runs
+the exact commands itself:
+
+```bash
+export RT_BUILD_DIR="$PWD/build/cpu-perf-graph-workflags"
+tools/perf/preview-work-order-sweep.sh \
+    build/rt-testdata/colorspace_flowers.pef \
+    build/test-scratch/work-order-timing --timing=10
+
+# Equivalent, if the harness is invoked directly:
+OMP_NUM_THREADS=1 env -u RT_WORK_SHADOW RT_WORK_ORDER=off \
+    "$RT_BUILD_DIR/rtengine/preview-work-order-sweep" \
+    build/rt-testdata/colorspace_flowers.pef \
+    build/test-scratch/work-order-timing/off --timing=10
+OMP_NUM_THREADS=1 env -u RT_WORK_ORDER -u RT_WORK_SHADOW \
+    "$RT_BUILD_DIR/rtengine/preview-work-order-sweep" \
+    build/rt-testdata/colorspace_flowers.pef \
+    build/test-scratch/work-order-timing/on --timing=10
+```
 
 ### States and parity
 
 The matrix covers the required families, with the working-profile change
 driven twice (once with retinex enabled and once without) so the retinex buffer
-dependency is exercised in both directions. Fourteen settled passes ran: the
-initial pass plus thirteen states.
+dependency is exercised in both directions, and with two retinex buffer inputs
+edited while the tool is already enabled. Sixteen settled passes ran: the
+initial pass plus fifteen states. The initial pass is a counted state, not an
+excluded warm-up: it is dumped, compared and listed like every other state.
 
 | # | State | Action | Preview AE | Work AE |
 |---|-------|--------|-----------:|--------:|
@@ -1162,36 +1192,53 @@ initial pass plus thirteen states.
 | 1 | spot-add | enable one spot entry, `SPOTADJUST` | 0 | 0 |
 | 2 | spot-remove | clear and disable the spot tool, `SPOTADJUST` | 0 | 0 |
 | 3 | retinex-on | `retinex.enabled = true`, `DEMOSAIC` | 0 | 0 |
-| 4 | workprofile-retinex-on | `Rec2020` -> `ProPhoto`, `DEMOSAIC` | 0 | 0 |
-| 5 | retinex-off | `retinex.enabled = false`, `DEMOSAIC` | 0 | 0 |
-| 6 | workprofile-retinex-off | `ProPhoto` -> `Rec2020`, `DEMOSAIC` | 0 | 0 |
-| 7 | filmneg-on | `filmNegative.enabled = true`, `ALLNORAW` | 0 | 0 |
-| 8 | filmneg-off | `filmNegative.enabled = false`, `ALLNORAW` | 0 | 0 |
-| 9 | capsharp-on | enable capture sharpening, `DEMOSAIC` | 0 | 0 |
-| 10 | capsharp-off | disable capture sharpening, `DEMOSAIC` | 0 | 0 |
-| 11 | zoom-100 | `setMainPreviewFullResolution(true)` | 0 | 0 |
-| 12 | zoom-fit | `setMainPreviewFullResolution(false)` | 0 | 0 |
-| 13 | exposure | `expcomp += 0.7`, `AUTOEXP` | 0 | 0 |
+| 4 | retinex-colorspace | `Lab` -> `HSLLOG` with retinex on, `DEMOSAIC` | 0 | 0 |
+| 5 | retinex-gamma | `gammaretinex` `none` -> `low` with retinex on, `DEMOSAIC` | 0 | 0 |
+| 6 | workprofile-retinex-on | `Rec2020` -> `ProPhoto`, `DEMOSAIC` | 0 | 0 |
+| 7 | retinex-off | `retinex.enabled = false`, `DEMOSAIC` | 0 | 0 |
+| 8 | workprofile-retinex-off | `ProPhoto` -> `Rec2020`, `DEMOSAIC` | 0 | 0 |
+| 9 | filmneg-on | `filmNegative.enabled = true`, `ALLNORAW` | 0 | 0 |
+| 10 | filmneg-off | `filmNegative.enabled = false`, `ALLNORAW` | 0 | 0 |
+| 11 | capsharp-on | enable capture sharpening, `DEMOSAIC` | 0 | 0 |
+| 12 | capsharp-off | disable capture sharpening, `DEMOSAIC` | 0 | 0 |
+| 13 | zoom-100 | `setMainPreviewFullResolution(true)` | 0 | 0 |
+| 14 | zoom-fit | `setMainPreviewFullResolution(false)` | 0 | 0 |
+| 15 | exposure | `expcomp += 0.7`, `AUTOEXP` | 0 | 0 |
 
 Comparison: ImageMagick 7.1.1-43 Q16, `magick compare -metric AE` on the
-16-bit dumps. `AE=0` for both `preview.tif` and `work.tif` in all fourteen
-states.
+8-bit dumps carried in 16-bit containers. `AE=0` for both `preview.tif` and
+`work.tif` in all sixteen states.
 
-The shadow reported `typedOnly=0` on all fourteen passes in both runs. The
-initial pass is reported as `forced-no-history` and is excluded from the
-counts. `legacyOnly` was zero on every pass except two:
+States 4 and 5 are the regression guard for the retinex buffer inputs. With
+the pre-fix predicate they were the only two states that differed: `AE=633744`
+for both `preview.tif` and `work.tif`, in both cases because the exact order
+skipped the demosaic body and left the buffers describing the previous colour
+space or gamma while `retinex()` consumed them with the new parameters. With
+the fix they are `AE=0`.
 
-| Pass | State | legacyOnly | Resolution |
-|------|-------|------------|------------|
-| 7 | workprofile-retinex-off | `rawDemosaic` | Retinex is already disabled and no demosaic input moved; the legacy `DEMOSAIC` event re-demosaics identical planes. The typed order skips the body. Pixels are identical (AE=0); redundant work. |
-| 13 | zoom-fit | `sourceSelect rawPreprocess` | The fit request re-selects the already-loaded frame and re-preprocesses identical raw and lens-profile inputs. The demosaic **is** named in this direction because the fit pass switches the demosaic mode to FAST. Pixels are identical (AE=0); redundant work. |
+The AE comparison proves that the exact order does not skip a pixel-affecting
+body: the conservative run names every parameter-applicable item, so any body
+the exact order dropped would show up as a difference. It cannot by itself
+prove `typedOnly=0`, because an extra body can reproduce identical pixels.
+That check is the unit oracle (`stage-work-test`): every case is compared with
+the action its editor sends, and an item the typed order names but the action
+does not set fails the test. The retired shadow's last `legacyOnly` record is
+kept below because the arguments have not changed; the initial pass was
+counted there too:
+
+| State | legacyOnly | Resolution |
+|-------|------------|------------|
+| workprofile-retinex-off | `rawDemosaic` | Retinex is already disabled and no demosaic input moved; the legacy `DEMOSAIC` event re-demosaics identical planes. The typed order skips the body. Pixels are identical (AE=0); redundant work. |
+| zoom-fit | `sourceSelect rawPreprocess` | The fit request re-selects the already-loaded frame and re-preprocesses identical raw and lens-profile inputs. The demosaic **is** named in this direction because the fit pass switches the demosaic mode to FAST. Pixels are identical (AE=0); redundant work. |
 
 ### Derivation corrections found by the sweep
 
-Three typed predicates were wrong. The first clean run failed on the retinex
-state with a crash and on the high-detail drop with non-zero AE; the capture
-sharpening disable was corrected in the same change because it is the same
-in-place-body case. The fixes are in `derive_preview_work()`.
+The first clean run failed on the retinex state with a crash and on the
+high-detail drop with non-zero AE; the capture sharpening disable was corrected
+in the same change because it is the same in-place-body case. The fixes are in
+`derive_preview_work()`. The list is not exhaustive: the body-input audit below
+found two further gaps that the sweep could not see, because it only toggled
+tool enable flags.
 
 1. **Retinex plane preparation.** `retinexPrepareBuffers()` lives at the end
    of the `raw.demosaic` body, and `retinex()` in `raw.base` consumes the
@@ -1216,6 +1263,34 @@ in-place-body case. The fixes are in `derive_preview_work()`.
    decision changed the pixels without naming the body. The `highDetailMode`
    term names `rawDemosaic` in both directions; the crossing request carries
    `M_RAW` for exactly that reason.
+
+### Body-input audit
+
+The sweep compares runs, so it only catches a predicate that is wrong for a
+state the sweep drives. This audit instead enumerates what each executed body
+reads and checks that the item's predicate, or an item it implies, names every
+input. `named` means the predicate covers it; `gap, fixed` is a defect found by
+this audit and repaired here; `shared gap` is an input that neither the typed
+order nor the legacy gate names, where naming it would be a typed-only run and
+therefore a divergence from the legacy path.
+
+| Item | Inputs read by the executed body | Named by | Verdict |
+|------|----------------------------------|----------|---------|
+| `sourceSelect` (preview) | `raw.bayersensor.imageNum` | `changed("source.select")` | named |
+| `sourceSelect` (crop) | `params.coarse` (`getCoarseBitMask`), `params.dirpyrDenoise` (noise curves), crop geometry | `reload` | shared gap: the legacy gate was the same `M_INIT \| M_LINDENOISE \| M_HDR` reload, so a `coarse`-only `ALLNORAW` edit left the bit mask stale on both paths |
+| `rawPreprocess` | preprocess raw fields, `lensProf` vignetting fields, `coarse`, high-detail need | `changed("raw.preprocess")`, `source`, `hdPre` | shared gap: `coarse` feeds the vignetting map, but the legacy `M_PREPROC` family excludes `M_RAW` and no `coarse` action carries `M_PREPROC` |
+| `rawDemosaic` | demosaic raw fields, `raw.*.border`, `pdsharpening`, `retinexcolorspace`, `gammaretinex`, `gam`, `slope`, `icm.workingProfile`, high-detail decision, `rgbSourceModified`, `toneCurve` recovery fields | the demosaic block, `captureSharpening`, `source`, `preprocess`, `hdRaw`, `highDetailModeChanged`, `hlr*`, `retinexPlanes` | **gap, fixed:** the four retinex buffer inputs were not named, so a colour-space or gamma edit reused buffers built for the previous one (states 4 and 5, `AE=633744` before the fix) |
+| `rawBaseRebuild` | `wb`, `toneCurve`, `dirpyrDenoise`, `filmNegative` and `params.raw`, `cg`, `icm` (working space), `spot.entries`, `currWB`, request reload | the eight families, `icm-without-output`, `preprocess`/`demosaic` forward edges, `rawReload` | named; `retinex` is in the family list because `retinex()` rewrites the planes before the base |
+| `retinexPrepare` | every `retinex` member, `icm.workingProfile`, `toneCurve.hrenabled`, the raw planes and the buffers | `family(retinex)`, `icm-without-output`, `preprocess`, `demosaic`, `retinexHighlight` | **gap, fixed:** `retinex()` reads `Tc.hrenabled` for the Lab-mode gamut control and the editor sends `ALLNORAW` (which carries `M_INIT`), so the legacy gate re-ran it and the typed order did not |
+| `spotApply` | `spot.entries`, `currWB`, `icm`, request bit | `spotPending`, `spotsConfigured && family(spot)` | named; a white-balance edit carries `M_SPOT`, so the request fact covers the `currWB` dependency |
+| `spotRestore` | live buffer, configured spots, base-rebuild outcome | `spotBufferLive`, `spotApply && !base` | named |
+| `analysisRun` | `icm`, `toneCurve`, `dirpyrDenoise` via `firstAnalysis()` | the rawBaseRebuild predicate (analysis is folded into raw.base) | named |
+| `denoiseRun` (crop) | `dirpyrDenoise`, `cropSkip` | `reload`, `dirpyrDenoise.enabled`, `cropSkip == 1` | named; the preview has no denoise body at all |
+
+Two inputs stay out on purpose, both pre-existing legacy behaviour rather than
+divergence: `str` crossing zero, which only toggles the preparation's forward
+gamma (the `RETINEX` action carries no `M_RAW` on either path), and the crop's
+`coarse`-derived bit mask. Both are `shared gap` rows above.
 
 ### Timing
 
@@ -1245,5 +1320,21 @@ All stage test executables pass in both build trees:
 `stage-param-map-test`, `stage-dirty-blocks-test`, `stage-work-test`,
 `stage-pipeline-test`, `stage-mask-map-test`, `stage-store-test` and
 `stage-parity-test`. `stage-work-test` pins the switch parser (`nullptr`, empty,
-`1`, `yes` enable; `0`, `off`, `OFF` disable) and the three corrected
-predicates.
+`1`, `yes` enable; `0`, `off`, `OFF` disable) and the corrected predicates
+(retinex planes and buffer inputs, capture-sharpening disable, high-detail
+drop).
+
+#### Re-verification after the retinex buffer-input fix
+
+Host CPU build, image 10.2 MP PEF `colorspace_flowers.pef`,
+`OMP_NUM_THREADS=1`:
+
+| Check | Result |
+| --- | --- |
+| `stage-work-test` | PASS, including the four retinex buffer-input cases, the retinex-off direction and the highlight-recovery toggle |
+| `preview-work-order-sweep.sh` | PASS, 16 states, `AE=0` for `preview.tif` and `work.tif` in every state; the pre-fix predicate fails states 4 and 5 with `AE=633744` |
+| `crop-stage-test --sequences` | PASS, 33 plans executed, 0 plan fallbacks, 33 dirty derivations, `AE=0` in every state |
+| `crop-stage-test --stages` | PASS, 6 plans executed, 0 plan fallbacks, 6 dirty derivations, `AE=0` |
+| Single-threaded 16-bit TIFF export, `RT_WORK_ORDER` on vs off | `AE=0` |
+| `thumbnail-stage-test` | PASS embedded and raw |
+| Both configurations | `tools/build-rt.sh cpu -j 6` and `tools/build-rt.sh opencl -j 6` compile; 14 stage test executables PASS in both trees |
