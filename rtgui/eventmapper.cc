@@ -58,6 +58,41 @@ rtengine::ProcEvent ProcEventMapper::newEvent(int action, const std::string &his
 }
 
 
+rtengine::ProcEvent ProcEventMapper::newEvent(
+    rtengine::RequestIntent intent, const std::string &history_msg)
+{
+    return newEvent(rtengine::make_request(intent), history_msg);
+}
+
+
+rtengine::ProcEvent ProcEventMapper::newEvent(
+    rtengine::EditorRequest request, const std::string &history_msg)
+{
+    /*
+     * The dedup key is the planning identity, not the compatibility mask: two
+     * intents that plan the same may share an event, while two that plan
+     * differently never do.
+     */
+    std::string eventkey = "typed-" + std::to_string(request.identity())
+        + history_msg;
+    const auto ret = events_.find(eventkey);
+    if (ret == events_.end()) {
+        rtengine::ProcEvent event = rtengine::RefreshMapper::getInstance()->newEvent();
+        rtengine::RefreshMapper::getInstance()->mapRequest(event, request);
+        events_.emplace(std::move(eventkey), event);
+        if (history_msg.empty()) {
+            history_msgs_[event] = M("HISTORY_MSG_" + std::to_string(event + 1));
+        } else {
+            history_msgs_[event] = M(history_msg);
+        }
+
+        return event;
+    } else {
+        return ret->second;
+    }
+}
+
+
 const std::string &ProcEventMapper::getHistoryMsg(rtengine::ProcEvent event) const
 {
     static std::string empty;

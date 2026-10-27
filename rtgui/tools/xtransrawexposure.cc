@@ -32,8 +32,8 @@ const Glib::ustring XTransRAWExposure::TOOL_NAME = "xtransrawexposure";
 XTransRAWExposure::XTransRAWExposure () : FoldableToolPanel(this, TOOL_NAME, M("TP_EXPOS_BLACKPOINT_LABEL"))
 {
     auto m = ProcEventMapper::getInstance();
-    EvDehablackx = m->newEvent(DARKFRAME, "HISTORY_MSG_DEHABLACKX");
-    EvDehablackxVoid = m->newEvent(M_VOID, "HISTORY_MSG_DEHABLACKX"); 
+    EvDehablackx = m->newEvent(rtengine::RequestIntent::DarkFrame, "HISTORY_MSG_DEHABLACKX");
+    EvDehablackxVoid = m->newEvent(rtengine::RequestIntent::ControlOnly, "HISTORY_MSG_DEHABLACKX");
  
     PexBlackRed = Gtk::manage(new Adjuster (M("TP_RAWEXPOS_BLACK_RED"), -2048, 2048, 1.0, 0)); //black level
     PexBlackRed->setAdjusterListener (this);

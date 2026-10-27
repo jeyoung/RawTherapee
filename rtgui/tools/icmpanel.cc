@@ -48,15 +48,15 @@ ICMPanel::ICMPanel() : FoldableToolPanel(this, TOOL_NAME, M("TP_ICM_LABEL")), iu
 {    
     CurveListener::setMulti(true);
     auto m = ProcEventMapper::getInstance();
-    EvICMprimariMethod = m->newEvent(GAMMA, "HISTORY_MSG_ICM_OUTPUT_PRIMARIES");
-    EvICMprofileMethod = m->newEvent(GAMMA, "HISTORY_MSG_ICM_OUTPUT_TYPE");
-    EvICMtempMethod = m->newEvent(GAMMA, "HISTORY_MSG_ICM_OUTPUT_TEMP");
-    //EvICMpredx = m->newEvent(GAMMA, "HISTORY_MSG_ICMPREDX");
-    //EvICMpredy = m->newEvent(GAMMA, "HISTORY_MSG_ICMPREDY");
-    //EvICMpgrex = m->newEvent(GAMMA, "HISTORY_MSG_ICMPGREX");
-    //EvICMpgrey = m->newEvent(GAMMA, "HISTORY_MSG_ICMPGREY");
-    //EvICMpblux = m->newEvent(GAMMA, "HISTORY_MSG_ICMPBLUX");
-    //EvICMpbluy = m->newEvent(GAMMA, "HISTORY_MSG_ICMPBLUY");
+    EvICMprimariMethod = m->newEvent(rtengine::RequestIntent::ControlOnly, "HISTORY_MSG_ICM_OUTPUT_PRIMARIES");
+    EvICMprofileMethod = m->newEvent(rtengine::RequestIntent::ControlOnly, "HISTORY_MSG_ICM_OUTPUT_TYPE");
+    EvICMtempMethod = m->newEvent(rtengine::RequestIntent::ControlOnly, "HISTORY_MSG_ICM_OUTPUT_TEMP");
+    //EvICMpredx = m->newEvent(rtengine::RequestIntent::ControlOnly, "HISTORY_MSG_ICMPREDX");
+    //EvICMpredy = m->newEvent(rtengine::RequestIntent::ControlOnly, "HISTORY_MSG_ICMPREDY");
+    //EvICMpgrex = m->newEvent(rtengine::RequestIntent::ControlOnly, "HISTORY_MSG_ICMPGREX");
+    //EvICMpgrey = m->newEvent(rtengine::RequestIntent::ControlOnly, "HISTORY_MSG_ICMPGREY");
+    //EvICMpblux = m->newEvent(rtengine::RequestIntent::ControlOnly, "HISTORY_MSG_ICMPBLUX");
+    //EvICMpbluy = m->newEvent(rtengine::RequestIntent::ControlOnly, "HISTORY_MSG_ICMPBLUY");
     EvICMgamm = m->newEvent(LUMINANCECURVE, "HISTORY_MSG_ICM_WORKING_GAMMA");
     EvICMslop = m->newEvent(LUMINANCECURVE, "HISTORY_MSG_ICM_WORKING_SLOPE");
     EvICMtrcinMethod = m->newEvent(LUMINANCECURVE, "HISTORY_MSG_ICM_WORKING_TRC_METHOD");

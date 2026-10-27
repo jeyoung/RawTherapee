@@ -18,6 +18,7 @@
  */
 #pragma once
 
+#include <memory>
 #include <unordered_map>
 
 #include "procevents.h"
@@ -92,11 +93,25 @@ extern int refreshmap[];
 namespace rtengine
 {
 
+struct EditorRequest;
+
 class RefreshMapper {
 public:
     static RefreshMapper *getInstance();
     ProcEvent newEvent();
     void mapEvent(ProcEvent event, int action);
+    /*
+     * Register a converted producer's typed request. The compatibility mask
+     * the request carries becomes the action of the event, so the callers that
+     * still ask for a mask keep seeing the payload they had.
+     */
+    void mapRequest(ProcEvent event, const EditorRequest& request);
+    /*
+     * Typed lookup for a converted event. False means the event was registered
+     * with mapEvent() and the caller must use the documented mask
+     * compatibility path.
+     */
+    bool getRequest(ProcEvent event, EditorRequest& request) const;
     int getAction(ProcEvent event) const;
     
 private:
@@ -104,6 +119,7 @@ private:
 
     int next_event_;
     std::unordered_map<int, int> actions_;
+    std::unordered_map<int, std::shared_ptr<const EditorRequest>> requests_;
 };
 
 } // namespace rtengine

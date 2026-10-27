@@ -119,10 +119,10 @@ Spot::Spot() :
     link.setActive (false);
 
     auto m = ProcEventMapper::getInstance();
-    EvSpotEnabled = m->newEvent(ALLNORAW, "HISTORY_MSG_SPOT");
-    EvSpotEnabledOPA = m->newEvent(SPOTADJUST, "HISTORY_MSG_SPOT");
-    EvSpotEntry = m->newEvent(SPOTADJUST, "HISTORY_MSG_SPOT_ENTRY");
-    EvSpotEntryOPA = m->newEvent(SPOTADJUST, "HISTORY_MSG_SPOT_ENTRY");
+    EvSpotEnabled = m->newEvent(rtengine::RequestIntent::AllNoRaw, "HISTORY_MSG_SPOT");
+    EvSpotEnabledOPA = m->newEvent(rtengine::RequestIntent::SpotAdjust, "HISTORY_MSG_SPOT");
+    EvSpotEntry = m->newEvent(rtengine::RequestIntent::SpotAdjust, "HISTORY_MSG_SPOT_ENTRY");
+    EvSpotEntryOPA = m->newEvent(rtengine::RequestIntent::SpotAdjust, "HISTORY_MSG_SPOT_ENTRY");
 
     show_all();
 }

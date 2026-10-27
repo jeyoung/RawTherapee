@@ -62,19 +62,19 @@ const Glib::ustring Compressgamut::TOOL_NAME = "compressgamut";
 Compressgamut::Compressgamut () : FoldableToolPanel(this, TOOL_NAME, M("TP_COMPRESSGAMUT_LABEL"), true, true)
 {
     auto m = ProcEventMapper::getInstance();
-    EvcgColorspace = m->newEvent(COMPR, "HISTORY_MSG_CG_COLORSPACE");//FIRST to reinit histogram
-    Evcgthc = m->newEvent(COMPR, "HISTORY_MSG_CG_CYANTH");
-    Evcgthm = m->newEvent(COMPR, "HISTORY_MSG_CG_MAGENTATH");
-    Evcgthy = m->newEvent(COMPR, "HISTORY_MSG_CG_YELLOWTH");
-    Evcgdc = m->newEvent(COMPR, "HISTORY_MSG_CG_CYANLIM");
-    Evcgdm = m->newEvent(COMPR, "HISTORY_MSG_CG_MAGENTALIM");
-    Evcgdy = m->newEvent(COMPR, "HISTORY_MSG_CG_YELLOWLIM");
-    Evcgroll = m->newEvent(COMPR, "HISTORY_MSG_CG_ROLLOFF");
-    Evcgpwr = m->newEvent(COMPR, "HISTORY_MSG_CG_VALUE");
-    Evcgenabled = m->newEvent(COMPR, "HISTORY_MSG_CG_ENABLED");
-    Evcgdcautoon = m->newEvent(COMPR, "HISTORY_MSG_CG_CYANDC_AUTO");
-    Evcgdmautoon = m->newEvent(COMPR, "HISTORY_MSG_CG_CYANDM_AUTO");
-    Evcgdyautoon = m->newEvent(COMPR, "HISTORY_MSG_CG_CYANDY_AUTO");
+    EvcgColorspace = m->newEvent(rtengine::RequestIntent::Compr, "HISTORY_MSG_CG_COLORSPACE");//FIRST to reinit histogram
+    Evcgthc = m->newEvent(rtengine::RequestIntent::Compr, "HISTORY_MSG_CG_CYANTH");
+    Evcgthm = m->newEvent(rtengine::RequestIntent::Compr, "HISTORY_MSG_CG_MAGENTATH");
+    Evcgthy = m->newEvent(rtengine::RequestIntent::Compr, "HISTORY_MSG_CG_YELLOWTH");
+    Evcgdc = m->newEvent(rtengine::RequestIntent::Compr, "HISTORY_MSG_CG_CYANLIM");
+    Evcgdm = m->newEvent(rtengine::RequestIntent::Compr, "HISTORY_MSG_CG_MAGENTALIM");
+    Evcgdy = m->newEvent(rtengine::RequestIntent::Compr, "HISTORY_MSG_CG_YELLOWLIM");
+    Evcgroll = m->newEvent(rtengine::RequestIntent::Compr, "HISTORY_MSG_CG_ROLLOFF");
+    Evcgpwr = m->newEvent(rtengine::RequestIntent::Compr, "HISTORY_MSG_CG_VALUE");
+    Evcgenabled = m->newEvent(rtengine::RequestIntent::Compr, "HISTORY_MSG_CG_ENABLED");
+    Evcgdcautoon = m->newEvent(rtengine::RequestIntent::Compr, "HISTORY_MSG_CG_CYANDC_AUTO");
+    Evcgdmautoon = m->newEvent(rtengine::RequestIntent::Compr, "HISTORY_MSG_CG_CYANDM_AUTO");
+    Evcgdyautoon = m->newEvent(rtengine::RequestIntent::Compr, "HISTORY_MSG_CG_CYANDY_AUTO");
     Gtk::Frame *iFrame = Gtk::manage(new Gtk::Frame(M("TP_COMPRESSGAMUT_MAIN_COLORSPACE")));
 
     iFrame->set_label_align(0.025f, 0.5);

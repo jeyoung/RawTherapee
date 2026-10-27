@@ -33,9 +33,9 @@ const Glib::ustring RAWCACorr::TOOL_NAME = "rawcacorrection";
 RAWCACorr::RAWCACorr () : FoldableToolPanel(this, TOOL_NAME, M("TP_RAWCACORR_LABEL"))
 {
     auto m = ProcEventMapper::getInstance();
-    EvPreProcessCAAutoiterations = m->newEvent(DARKFRAME, "HISTORY_MSG_RAWCACORR_AUTOIT");
-    EvPreProcessCAColourshift = m->newEvent(DARKFRAME, "HISTORY_MSG_RAWCACORR_COLORSHIFT");
-    EvPreProcessCAColourshiftHistory = m->newEvent(M_VOID, "HISTORY_MSG_RAWCACORR_COLORSHIFT");
+    EvPreProcessCAAutoiterations = m->newEvent(rtengine::RequestIntent::DarkFrame, "HISTORY_MSG_RAWCACORR_AUTOIT");
+    EvPreProcessCAColourshift = m->newEvent(rtengine::RequestIntent::DarkFrame, "HISTORY_MSG_RAWCACORR_COLORSHIFT");
+    EvPreProcessCAColourshiftHistory = m->newEvent(rtengine::RequestIntent::ControlOnly, "HISTORY_MSG_RAWCACORR_COLORSHIFT");
 
     Gtk::Image* const icaredL =   Gtk::manage (new RTImage ("circle-red-cyan-small"));
     Gtk::Image* const icaredR =   Gtk::manage (new RTImage ("circle-cyan-red-small"));

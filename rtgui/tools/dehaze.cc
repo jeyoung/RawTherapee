@@ -34,11 +34,11 @@ const Glib::ustring Dehaze::TOOL_NAME = "dehaze";
 Dehaze::Dehaze(): FoldableToolPanel(this, TOOL_NAME, M("TP_DEHAZE_LABEL"), false, true)
 {
     auto m = ProcEventMapper::getInstance();
-    EvDehazeEnabled = m->newEvent(HDR, "HISTORY_MSG_DEHAZE_ENABLED");
-    EvDehazeStrength = m->newEvent(HDR, "HISTORY_MSG_DEHAZE_STRENGTH");
-    EvDehazeShowDepthMap = m->newEvent(HDR, "HISTORY_MSG_DEHAZE_SHOW_DEPTH_MAP");
-    EvDehazeDepth = m->newEvent(HDR, "HISTORY_MSG_DEHAZE_DEPTH");
-    EvDehazeSaturation = m->newEvent(HDR, "HISTORY_MSG_DEHAZE_SATURATION");
+    EvDehazeEnabled = m->newEvent(rtengine::RequestIntent::Hdr, "HISTORY_MSG_DEHAZE_ENABLED");
+    EvDehazeStrength = m->newEvent(rtengine::RequestIntent::Hdr, "HISTORY_MSG_DEHAZE_STRENGTH");
+    EvDehazeShowDepthMap = m->newEvent(rtengine::RequestIntent::Hdr, "HISTORY_MSG_DEHAZE_SHOW_DEPTH_MAP");
+    EvDehazeDepth = m->newEvent(rtengine::RequestIntent::Hdr, "HISTORY_MSG_DEHAZE_DEPTH");
+    EvDehazeSaturation = m->newEvent(rtengine::RequestIntent::Hdr, "HISTORY_MSG_DEHAZE_SATURATION");
     
     strength = Gtk::manage(new Adjuster(M("TP_DEHAZE_STRENGTH"), 0., 100., 1., 50.));
     strength->setAdjusterListener(this);

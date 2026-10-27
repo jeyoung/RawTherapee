@@ -163,15 +163,15 @@ void CropGuide::setupEvents()
 {
     auto m = ProcEventMapper::getInstance();
 
-    EvCropGuideEnabled = m->newEvent(MINUPDATE, "HISTORY_MSG_CROP_GUIDE_ENABLED");
+    EvCropGuideEnabled = m->newEvent(rtengine::RequestIntent::RepaintOnly, "HISTORY_MSG_CROP_GUIDE_ENABLED");
     EvCropGuidePresetChanged =
-        m->newEvent(MINUPDATE, "HISTORY_MSG_CROP_GUIDE_PRESET_CHANGED");
+        m->newEvent(rtengine::RequestIntent::RepaintOnly, "HISTORY_MSG_CROP_GUIDE_PRESET_CHANGED");
     EvCropGuideAspectRatioPresetChanged =
-        m->newEvent(MINUPDATE, "HISTORY_MSG_CROP_GUIDE_ASPECT_RATIO_PRESET_CHANGED");
+        m->newEvent(rtengine::RequestIntent::RepaintOnly, "HISTORY_MSG_CROP_GUIDE_ASPECT_RATIO_PRESET_CHANGED");
     EvCropGuideBleedChanged =
-        m->newEvent(MINUPDATE, "HISTORY_MSG_CROP_GUIDE_BLEED_CHANGED");
+        m->newEvent(rtengine::RequestIntent::RepaintOnly, "HISTORY_MSG_CROP_GUIDE_BLEED_CHANGED");
     EvCropGuideBasisChanged =
-        m->newEvent(MINUPDATE, "HISTORY_MSG_CROP_GUIDE_BLEED_BASIS_CHANGED");
+        m->newEvent(rtengine::RequestIntent::RepaintOnly, "HISTORY_MSG_CROP_GUIDE_BLEED_BASIS_CHANGED");
 }
 
 void CropGuide::setupPresets()

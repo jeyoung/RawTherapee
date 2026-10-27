@@ -91,23 +91,23 @@ PerspCorrection::PerspCorrection () : FoldableToolPanel(this, TOOL_NAME, M("TP_P
 
     auto mapper = ProcEventMapper::getInstance();
     // Normal events.
-    EvPerspCamAngle = mapper->newEvent(TRANSFORM, "HISTORY_MSG_PERSP_CAM_ANGLE");
-    EvPerspCamFocalLength = mapper->newEvent(TRANSFORM, "HISTORY_MSG_PERSP_CAM_FL");
-    EvPerspCamShift = mapper->newEvent(TRANSFORM, "HISTORY_MSG_PERSP_CAM_SHIFT");
-    EvPerspMethod = mapper->newEvent(TRANSFORM, "HISTORY_MSG_PERSP_METHOD");
-    EvPerspProjAngle = mapper->newEvent(TRANSFORM, "HISTORY_MSG_PERSP_PROJ_ANGLE");
-    EvPerspProjRotate = mapper->newEvent(TRANSFORM, "HISTORY_MSG_PERSP_PROJ_ROTATE");
-    EvPerspProjShift = mapper->newEvent(TRANSFORM, "HISTORY_MSG_PERSP_PROJ_SHIFT");
-    EvPerspRender = mapper->newEvent(TRANSFORM, "GENERAL_NA");
+    EvPerspCamAngle = mapper->newEvent(rtengine::RequestIntent::Transform, "HISTORY_MSG_PERSP_CAM_ANGLE");
+    EvPerspCamFocalLength = mapper->newEvent(rtengine::RequestIntent::Transform, "HISTORY_MSG_PERSP_CAM_FL");
+    EvPerspCamShift = mapper->newEvent(rtengine::RequestIntent::Transform, "HISTORY_MSG_PERSP_CAM_SHIFT");
+    EvPerspMethod = mapper->newEvent(rtengine::RequestIntent::Transform, "HISTORY_MSG_PERSP_METHOD");
+    EvPerspProjAngle = mapper->newEvent(rtengine::RequestIntent::Transform, "HISTORY_MSG_PERSP_PROJ_ANGLE");
+    EvPerspProjRotate = mapper->newEvent(rtengine::RequestIntent::Transform, "HISTORY_MSG_PERSP_PROJ_ROTATE");
+    EvPerspProjShift = mapper->newEvent(rtengine::RequestIntent::Transform, "HISTORY_MSG_PERSP_PROJ_SHIFT");
+    EvPerspRender = mapper->newEvent(rtengine::RequestIntent::Transform, "GENERAL_NA");
     // Void events.
-    EvPerspCamAngleVoid = mapper->newEvent(M_VOID, "HISTORY_MSG_PERSP_CAM_ANGLE");
-    EvPerspCamFocalLengthVoid = mapper->newEvent(M_VOID, "HISTORY_MSG_PERSP_CAM_FL");
-    EvPerspCamShiftVoid = mapper->newEvent(M_VOID, "HISTORY_MSG_PERSP_CAM_SHIFT");
-    EvPerspProjAngleVoid = mapper->newEvent(M_VOID, "HISTORY_MSG_PERSP_PROJ_ANGLE");
-    EvPerspProjRotateVoid = mapper->newEvent(M_VOID, "HISTORY_MSG_PERSP_PROJ_ROTATE");
-    EvPerspProjShiftVoid = mapper->newEvent(M_VOID, "HISTORY_MSG_PERSP_PROJ_SHIFT");
+    EvPerspCamAngleVoid = mapper->newEvent(rtengine::RequestIntent::ControlOnly, "HISTORY_MSG_PERSP_CAM_ANGLE");
+    EvPerspCamFocalLengthVoid = mapper->newEvent(rtengine::RequestIntent::ControlOnly, "HISTORY_MSG_PERSP_CAM_FL");
+    EvPerspCamShiftVoid = mapper->newEvent(rtengine::RequestIntent::ControlOnly, "HISTORY_MSG_PERSP_CAM_SHIFT");
+    EvPerspProjAngleVoid = mapper->newEvent(rtengine::RequestIntent::ControlOnly, "HISTORY_MSG_PERSP_PROJ_ANGLE");
+    EvPerspProjRotateVoid = mapper->newEvent(rtengine::RequestIntent::ControlOnly, "HISTORY_MSG_PERSP_PROJ_ROTATE");
+    EvPerspProjShiftVoid = mapper->newEvent(rtengine::RequestIntent::ControlOnly, "HISTORY_MSG_PERSP_PROJ_SHIFT");
     setCamBasedEventsActive();
-    EvPerspControlLines = mapper->newEvent(M_VOID, "HISTORY_MSG_PERSP_CTRL_LINE");
+    EvPerspControlLines = mapper->newEvent(rtengine::RequestIntent::ControlOnly, "HISTORY_MSG_PERSP_CTRL_LINE");
 
     lens_geom_listener = nullptr;
     panel_listener = nullptr;

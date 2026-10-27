@@ -34,8 +34,8 @@ BayerPreProcess::BayerPreProcess() : FoldableToolPanel(this, TOOL_NAME, M("TP_PR
 {
     const auto& options = App::get().options();
     auto m = ProcEventMapper::getInstance();
-    EvLineDenoiseDirection = m->newEvent(DARKFRAME, "HISTORY_MSG_PREPROCESS_LINEDENOISE_DIRECTION");
-    EvPDAFLinesFilter = m->newEvent(DARKFRAME, "HISTORY_MSG_PREPROCESS_PDAFLINESFILTER");
+    EvLineDenoiseDirection = m->newEvent(rtengine::RequestIntent::DarkFrame, "HISTORY_MSG_PREPROCESS_LINEDENOISE_DIRECTION");
+    EvPDAFLinesFilter = m->newEvent(rtengine::RequestIntent::DarkFrame, "HISTORY_MSG_PREPROCESS_PDAFLINESFILTER");
 
     lineDenoise = Gtk::manage(new Adjuster(M("TP_PREPROCESS_LINEDENOISE"), 0, 1000, 1, 0));
     lineDenoise->setAdjusterListener(this);

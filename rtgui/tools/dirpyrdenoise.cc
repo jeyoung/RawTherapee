@@ -40,7 +40,7 @@ const Glib::ustring DirPyrDenoise::TOOL_NAME = "dirpyrdenoise";
 DirPyrDenoise::DirPyrDenoise () : FoldableToolPanel(this, TOOL_NAME, M("TP_DIRPYRDENOISE_LABEL"), true, true), lastmedian(false)
 {
     const auto procEventMapper = ProcEventMapper::getInstance();
-    EvDPDNGain = procEventMapper->newEvent(ALLNORAW, "HISTORY_MSG_DIRPYRDENOISE_GAIN");
+    EvDPDNGain = procEventMapper->newEvent(rtengine::RequestIntent::AllNoRaw, "HISTORY_MSG_DIRPYRDENOISE_GAIN");
 
     std::vector<GradientMilestone> milestones;
     CurveListener::setMulti(true);

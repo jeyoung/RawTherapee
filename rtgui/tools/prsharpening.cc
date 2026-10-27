@@ -29,7 +29,7 @@ PrSharpening::PrSharpening () : FoldableToolPanel(this, TOOL_NAME, M("TP_PRSHARP
 {
 
     auto m = ProcEventMapper::getInstance();
-    EvPrShrContrast = m->newEvent(RESIZE, "HISTORY_MSG_PRSHARPEN_CONTRAST");
+    EvPrShrContrast = m->newEvent(rtengine::RequestIntent::ControlOnly, "HISTORY_MSG_PRSHARPEN_CONTRAST");
 
     std::vector<GradientMilestone> milestones;
     milestones.push_back( GradientMilestone(0.0, 0.0, 0.0, 0.0) );
