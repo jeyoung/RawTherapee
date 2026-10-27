@@ -35,31 +35,34 @@ locallab, CIE, Fattal/dehaze, spot removal or film-negative processing.
 
 ## Eligibility
 
-`canUseViewportFastPath()` is conservative and compares the current
-`ProcParams` with `viewportFullParams`, a copy of the request inputs of the
-last completed full-frame pass. It rejects the request if any of the following
-holds:
+`canUseViewportFastPath()` takes the typed `EditorRequest`, not a mask. It
+collects the coordinator state (kill switch, published full-frame state,
+high-detail decision and what has been computed) plus the current parameters
+and the two snapshots, and calls `viewportFastPathFallback()` in
+`editorrequest.cc`. That function is the whole policy:
 
-- the kill switch is set to `0`, no full pass completed, or the high-detail
-  state changed or is still being computed;
-- the request contains `M_PREPROC`, `M_RAW`, `M_WB`, `M_INIT`,
+- the request family is classified by `viewportEligibility()`: a request
+  carrying a base-chain fact (`M_PREPROC`, `M_RAW`, `M_WB`, `M_INIT`,
   `M_LINDENOISE`, `M_MONITOR`, `M_TRANSFORM`, `M_CSHARP`, `M_RETINEX`,
-  `M_HIGHQUAL` or `M_BLURMAP`, or any bit outside the allowed set above;
-- auto exposure, histogram matching, auto B&W or auto colour-toning saturation
-  is active;
-- CIE colour appearance or Local Lab is enabled;
-- the Lab curve contrast is non-zero (no cached `lhist16` yet);
-- Fattal, dehaze or spot removal is active;
-- `raw`, `wb`, `icm`, `coarse`, `commonTrans`, `rotate`, `distortion`,
-  `lensProf`, `perspective`, `gradient`, `pcvignette`, `cacorrection`,
-  `vignetting`, `spot`, `filmNegative`, `dehaze`, `fattal`, `retinex`,
-  `pdsharpening`, `dirpyrDenoise`, `cg` or `locallab` differ from the
-  snapshot;
-- the highlight-reconstruction subset of `toneCurve` changes
-  (`hrenabled`, `method`, `hlbl`, `hlth`, `clampOOG`);
-- an auto flag changes;
-- a tone/Lab/wavelet input changed without its corresponding request bit
-  (the fast path would otherwise keep stale parent LUTs).
+  `M_BLURMAP`) or the high-detail fact is a **base request**
+  (`base-request`); a request carrying the control bit (`M_VOID`) is
+  **unsupported** (`unsupported-request`); everything else is admitted. A
+  producer-provided dirty set must also stay inside the delta chain: a base
+  block (`source.select`, `raw.preprocess`, `raw.demosaic`, `raw.base`,
+  `analysis`, `transform`) makes it a base request and an unknown block makes
+  it unsupported. A request kind is used the same way the mask was: an absent
+  accumulator is unsupported, and `M_HDR` alone stays admissible because GUI
+  events over-approximate with it;
+- the parameter vetoes are unchanged and keep their order and reason strings:
+  auto exposure, histogram matching, auto B&W, auto colour-toning, CIE,
+  Local Lab, non-zero Lab contrast, active Fattal/dehaze/spot removal, every
+  base input compared with `viewportFullParams`, the highlight-recovery subset
+  and the auto flags, and a tone/Lab/wavelet LUT input that changed without its
+  request family.
+
+The fallback reasons are the ones the mask-based gate reported, so a profile
+log stays comparable. The pre-retirement gate is kept as a test-local oracle in
+`viewport_admission_test.cc`; it is not part of the engine.
 
 White balance is compared against the pre-pass copy on purpose. The normal
 full pass normalises `wb.green` into the rendering parameters; the GUI keeps
@@ -69,29 +72,34 @@ because white balance is a deterministic function of it.
 
 ## Parent LUT preparation
 
-`prepareViewportLuts()` mirrors the parent LUT work of the full path with the
-same `scale`/skip arguments:
+`prepareViewportLuts()` takes a `ViewportLutSelection`, which
+`viewportLutSelection(request)` derives from the request facts:
 
-- `CurveFactory::complexCurve` with the cached `vhist16`, plus `RGBCurve`,
-  colour-toning LUTs and opacities, B&W curves, custom tone curves and
-  `opautili`;
-- `CurveFactory::complexLCurve` with a permanently zero histogram. Lab
-  contrast is restricted to zero, so the histogram cannot affect
-  `lumacurve`; `histLCurve` is refreshed by the deferred pass;
-- `clcurve` and `complexsgnCurve` when `M_LUMACURVE` is requested;
-- `wavclCurve` when `M_LUMINANCE`, `M_COLOR` or `M_AUTOEXP` is requested.
+| Selection | Request family | Rebuilds |
+|---|---|---|
+| `toneCurves` | `M_RGBCURVE` or `M_CROP` | `complexCurve`, `RGBCurve`, colour-toning LUTs, B&W curves, custom curves |
+| `labCurves` | `M_LUMACURVE` | lumacurve, `clcurve`, `complexsgnCurve` |
+| `lumaCurveFromCrop` | `M_CROP` | lumacurve only, from the zero histogram |
+| `wavelet` | `M_LUMINANCE`, `M_COLOR` or `M_AUTOEXP` | `wavclCurve` |
 
-The tone/LUT block was factored into the shared helper and the full path calls
-the same code.
+`rebuildsLumaCurve()` is "`labCurves` or `lumaCurveFromCrop`". The snapshot
+update takes the same selection, so a crop repaint rebuilds lumacurve but does
+not claim the whole Lab family current, exactly as before. The full-path sites
+in `stageRgbProc()` and `stageLabTools()` use `toneOnly()`, `labOnly()` and
+`waveletOnly()`, which rebuild one family and update its snapshot.
 
 ## Flow
 
 1. A request is accepted if the generation counter is current.
-2. Eligibility is checked on the un-augmented request mask, so a transform
+2. Admission is evaluated on the **un-augmented** request, so a transform
    derived from a crop-only change does not force a full render.
-3. The crop todo is sanitised to
-   `M_CROP|M_MINUPDATE|M_AUTOEXP|M_TRANSFORM|M_RGBCURVE|M_LUMACURVE|M_LUMINANCE|M_COLOR`;
-   over-approximated `M_HDR`/`M_SPOT` and all base bits are removed.
+3. The crop selection (`viewportCropSelection()`) is taken from the augmented
+   request. `resolveCropDependencies()` expresses the one dependency the old
+   code wrote as a mask OR: a luminance-curve or auto-exposure edit reaches
+   the crop's Lab pixel tools only through `M_LUMINANCE|M_COLOR`, so both bits
+   are implied. `viewportCropTodo()` is the `todo` argument Crop::update()
+   reads and `viewportCropPayload()` is its execution mask; no mask arithmetic
+   is left at the call site.
 4. Crops with a listener are updated immediately. This is the only work the
    interaction pays for.
 5. The analysis stages the hit skipped are accumulated in
@@ -186,6 +194,79 @@ crops again. Fallback reasons include `no-complete-full-state`, `base-request`,
 `hdr-processing`, `spot-removal` and the individual base-parameter names.
 
 ## Validation
+
+### Typed admission and LUT selection
+
+The decision-table replay is `viewport-admission-test`
+(`rtengine/stage/tests/viewport_admission_test.cc`). It keeps the
+pre-retirement mask gate as a local oracle and requires an identical decision,
+an identical fallback reason and an identical LUT/crop selection on every
+case. A deliberately introduced drift in the typed policy produced 33 025
+failures, so the replay is not vacuous.
+
+| Matrix | Cases |
+|---|---:|
+| Every mask the adapter accepts (21 bits, contract violations excluded) | 1 048 576 |
+| Request shapes: 17 intents, every intent pair (289), every reachable kind × family subset, the deferred flush and the coordinator augmentations | 1 336 |
+| Selection comparisons (exhaustive masks plus shapes) | 1 050 201 |
+| Parameter-veto states × admission states × shapes (42 × 32 × 1 336) | 1 795 584 |
+
+All 18 stage test executables pass in both build directories (the 17 existing
+ones plus `viewport-admission-test`). Both configurations compile:
+`build/cpu-perf-graph-retire` and `build/opencl-perf-graph-retire`
+(`WITH_OPENCL=ON`).
+
+### Fast-path-on harness
+
+`tools/perf/preview-work-order-sweep.sh <raw> --fast-path` runs one eligible
+state sequence twice with only `RT_VIEWPORT_FAST` differing, requires the fast
+side to report `viewport=fast` and `viewport=deferred-analysis` once per
+eligible state and one initial fallback, and compares `preview.tif`,
+`work.tif` and the visible `crop-main.tif` against the forced full render.
+The harness owns a crop window covering the fit viewport, because the fast path
+only renders crops that have a listener.
+
+Result with the 10.2 MP PEF (`colorspace_flowers.pef`, sidecar) and
+`OMP_NUM_THREADS=1`, 6 states (initial + 5 eligible edits: exposure, tone
+curve contrast, Lab brightness, wavelet curve, exposure):
+
+```text
+fast path taken: 5 hit(s), 5 deferred analysis pass(es), 1 initial fallback
+00-initial..05-exposure   preview AE=0   work AE=0   crop-main AE=0
+preview viewport fast path: PASS (6 states)
+```
+
+Timing, same image, fit-zoom viewport (972x652 preview), 20 samples, one run
+per side:
+
+| Configuration | n | p50 | p95 |
+|---|---:|---:|---:|
+| forced full render (`RT_VIEWPORT_FAST=0`), edit to settled pass | 20 | 373.2 ms | 386.3 ms |
+| fast path, immediate visible-crop cost (`crop_ms`) | 19 hits | 52.0 ms | 56.0 ms |
+| fast path, edit to settled full-frame pass (hit + deferred analysis) | 20 | 625.6 ms | 636.4 ms |
+
+The immediate crop cost is the interactive latency. The settled figure is
+larger than the forced render because the harness waits for the deferred
+analysis as well as the hit; that is the design (the analysis runs after the
+interaction), not a regression of the hit.
+
+### GUI
+
+Not run as a deterministic gate. Under Xvfb 1600x1000 the runtime data
+directory (`/usr/local/share/rawtherapee-graph`) is not installed, so the GUI
+shows two modal profile notices, has no theme/CSS, and reports a
+`OPTIONS_*_MISSING` layout that only settles after the window is resized
+manually; there is no window manager to maximise it, and the tool-panel scroll
+moves sliders, so the same coordinates do not hit the same widget between runs.
+An attempt that drove fit, a tone-curve edit, 100 % zoom, a second curve edit
+and a pan produced five screenshots with `AE=0` between fast-on and fast-off
+and one genuine `viewport=fast` line, but the edit that produced the hit could
+not be attributed reproducibly, and the 100 % edit fell back with
+`reason=raw` (the high-detail pass stores a different raw method than the
+editor's request). That is context only; the harness mode above is the
+admission evidence.
+
+### Earlier validation
 
 Built both trees:
 

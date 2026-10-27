@@ -954,8 +954,8 @@ distinct.
   tool registers its own event, and the mask source for the profile filter.
 
 The reason the adapter stays is that the compatibility masks are still read
-by the viewport LUT snapshot, the preview-base-cache invalidation and the
-deferred-analysis queue. The intents reproduce those composites exactly, so
+by the preview-base-cache invalidation, the deferred-analysis queue and the
+unconverted block bodies. The intents reproduce those composites exactly, so
 those consumers keep the payload they had while no producer constructs a
 mask. They are the next retirement target, after those consumers have typed
 inputs.
@@ -964,11 +964,15 @@ inputs.
 
 Every remaining mask read is classified as one of:
 
-1. **Viewport admission.** `canUseViewportFastPath()`,
-   `VIEWPORT_FAST_REJECTED_TODO`, `VIEWPORT_CROP_TODO`,
-   `prepareViewportLuts()` and `updateViewportLutSnapshot()` in
-   `improccoordinator.cc` (lines 583-595, 839-954, 3351, 3477, 3512, 4753,
-   4837-4840).
+1. **Viewport admission and LUT selection do not read the mask.** Admission
+   classifies the typed `EditorRequest` (`viewportEligibility()`) and applies
+   the parameter vetoes in `viewportFastPathFallback()`; `prepareViewportLuts()`
+   and `updateViewportLutSnapshot()` take a `ViewportLutSelection`, and the crop
+   subset and its Lab widening come from `viewportCropSelection()`,
+   `resolveCropDependencies()`, `viewportCropTodo()` and
+   `viewportCropPayload()`. The mask constants that expressed the old gate are
+   deleted. The pre-retirement gate survives only as the local oracle in
+   `viewport_admission_test.cc`.
 2. **Deferred scheduling.** `absorbPendingDeferred()`, the deferred watcher and
    the crop-render trigger `(M_MONITOR | M_RGBCURVE | M_LUMACURVE)`.
    `dcrop.cc` has no scheduling read left except the forced detail-window
@@ -989,13 +993,29 @@ No node-entry gate and no planning decision reads the mask.
 - `editorrequest-test` covers every intent, the compatibility mask, the
   producer-provided execution set, coalescing, the typed/mask mapper lookup,
   the producer event-key uniqueness (`checkProducerEventKey`), the fast-path
-  fact refresh (`checkFastPathAugmentation`), the crop reallocation work order
-  (`checkCropReallocationWorkOrder`), the tool-to-intent wiring
-  (`checkConvertedProducerIntents`) and the producer source scan
-  (`checkNoLegacyProducerCalls`, 358 files and 442 live typed calls); all 17
-  stage test executables pass in both build directories.
+  fact refresh (`checkFastPathAugmentation`), the viewport facts and the
+  admission/LUT selections (`checkViewportFacts`, `checkViewportAdmission`),
+  the crop reallocation work order (`checkCropReallocationWorkOrder`), the
+  tool-to-intent wiring (`checkConvertedProducerIntents`) and the producer
+  source scan (`checkNoLegacyProducerCalls`, 358 files and 442 live typed
+  calls).
+- Viewport admission: `viewport-admission-test` replays the retired mask gate
+  against the typed policy over 1 048 576 masks, 1 336 request shapes,
+  42 parameter-veto states and 32 admission states (1 795 584 fallback
+  comparisons and 1 050 201 selection comparisons) with zero divergence; a
+  deliberately introduced policy drift produced 33 025 failures.
+- All 18 stage test executables (the 17 existing plus
+  `viewport-admission-test`) pass in both build directories.
 - Preview sweep: `preview-work-order-sweep` reports 16 states and `AE=0` for
   both `preview.tif` and `work.tif` in every state.
+- Fast path on: `preview-work-order-sweep --fast-path` reports 5 fast hits and
+  5 deferred analyses for the 5 eligible states, one initial fallback, and
+  `AE=0` for `preview.tif`, `work.tif` and the visible `crop-main.tif` in every
+  state. At fit zoom the immediate crop cost is p50 52.0 ms / p95 56.0 ms
+  over 19 hits against a p50 373.2 ms / p95 386.3 ms forced full render over
+  20 samples
+  (10.2 MP PEF, `OMP_NUM_THREADS=1`). The GUI check is recorded as not run in
+  `VIEWPORT_FAST_PATH.md`.
 - Crop: `crop-stage-test --sequences --extra-states` reports `48 plans
   executed, 0 plan fallbacks, 48 dirty derivations`, and every static and
   incremental state is `AE=0` with `OMP_NUM_THREADS=1`, including
