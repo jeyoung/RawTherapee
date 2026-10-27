@@ -853,6 +853,19 @@ base because the HDR and local-adjustment bodies overwrite `origCrop`. The GUI
 normally pairs a reallocation with a `FullCrop` request, but the force no
 longer depends on that.
 
+A forced pass reruns every body, but the parameters it renders from are
+prepared by the coordinator. The histogram-matched tone curve is a derived
+parameter: `toneCurve.histmatching` without `toneCurve.fromHistMatching` asks
+the engine to complete the curve from the raw histogram, and every render
+consumes it. Completion was reached only through the auto-exposure request,
+so a narrow incremental pass rendered from the identity curve while a fresh
+pass matched it first. `ImProcCoordinator::matchToneCurve()` owns the
+completion; `stageLocalAdjustments()` calls it for any pass whose parameters
+need it and `previewDirtyBlocks()` schedules the node for that reason, so the
+preview and the crop that follows consume the same parameters whichever
+request triggered the pass. The auto-exposure path is otherwise unchanged, and
+the viewport fast path still rejects histogram matching.
+
 ### Typed producer API
 
 `rtengine/editorrequest.h` adds `RequestIntent`, `make_request()` and
@@ -983,17 +996,25 @@ No node-entry gate and no planning decision reads the mask.
   stage test executables pass in both build directories.
 - Preview sweep: `preview-work-order-sweep` reports 16 states and `AE=0` for
   both `preview.tif` and `work.tif` in every state.
-- Crop: `crop-stage-test --sequences` reports `39 plans executed, 0 plan
-  fallbacks, 39 dirty derivations`. Static states and the geometry, WB,
-  demosaic, transform, local, sharpening, CIE CAM, CIE CAM-off and crop
-  scenarios are `AE=0`. Two incremental states fail on the sidecar corpus:
-  `highqual-refill` `AE=45` and `highqual-dehaze` `AE=44`. The same two
-  states fail byte-identically when the parent commit is built in the same
-  build tree (`3626802` and `3627644` differing bytes), so the failure
-  pre-dates this change and no producer-intent path is on the test's call
-  graph. `--stages` passes with `AE=0`.
-- Export: single-thread PEF export of the neutral image and of the sidecar is
-  `AE=0` against a parent-commit build on the same tree.
+- Crop: `crop-stage-test --sequences --extra-states` reports `48 plans
+  executed, 0 plan fallbacks, 48 dirty derivations`, and every static and
+  incremental state is `AE=0` with `OMP_NUM_THREADS=1`, including
+  `highqual-refill` and `highqual-dehaze`. Both high-quality states also stay
+  `AE=0` with default threads across three runs. The only states that move
+  there are the known thread-noise cases: `seq fattal` (`AE=1`, 133-1332
+  differing bytes over three runs) and intermittently `fit` (1-3 bytes, max
+  delta 1). Both compare two renders of identical parameters, and `seq fattal`
+  reproduces without the derived-curve change. `--stages` passes with `AE=0`.
+- Export: the graph export is `AE=0` against the neutral export of the same
+  binary and reports the 20-node inventory; the thread matrix is `AE=0` at 2
+  and 4 threads. The cross-branch `baseline-dev` comparison and 8-thread
+  determinism are environment-limited on this host: the graph build's data
+  directory (`/usr/local/share/rawtherapee-graph`) is not installed, so the
+  binary logs `The bundled profile ... could not be found! ... Default
+  internal values will be used instead` while the baseline binary resolves the
+  installed `rawtherapee` data. The baseline difference (30369998 samples) and
+  the 8-thread delta (19 samples, max delta 5) both reproduce byte-identically
+  without this change.
 - Thumbnail: `thumbnail-stage-test` reports `PASS` for the embedded and raw
   paths.
 - Node cache: `stage-node-cache-test` passes unchanged in both builds.
