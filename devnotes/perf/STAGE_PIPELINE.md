@@ -1538,3 +1538,85 @@ refused; parameters written back by the body make the entry unreachable; and
 listeners are not re-fired on a hit. The next step is to give nodes private
 buffers, which removes the canvas constraint and lets the store serve without
 the rebuild-closure guard.
+
+## Node device residency (POCL CPU)
+
+The graph now has a device path: a node can run on an OpenCL device with its
+inputs uploaded to device buffers, and its output read back into the host
+buffer the graph already owns. The path is opt-in; the default is the host
+program and the default code path is unchanged.
+
+### First device node
+
+`resize` is wired through the `lanczos3` stage ABI node (`ImProcFunctions::
+Lanczos` -> `stage::run`). It is the only node that already had a stage-ABI
+implementation and an existing kernel with a documented parity history
+(resize 0.5x/1.5x at 0-1 LSB), so it is the smallest honest device node. The
+host implementation and the OpenCL kernel precompute the same weights with the
+same code and perform the separable dot products in the same order, so the
+results agree to rounding; the measured difference is zero.
+
+### Selection and switches
+
+| Control | Effect |
+|---------|--------|
+| default | CPU; `stage::run` takes the original host path statement for statement |
+| `RT_STAGE_OPENCL=1` | opt in; nodes with a device implementation are dispatched to the device queue |
+| `RT_STAGE_OPENCL=0` | kill switch; even an explicit device request resolves to CPU |
+| `RT_STAGE_OPENCL_DISABLE=1` | kill switch, independent of the opt-in value |
+| user preference | `ImProcCoordinator` passes `rtSettings.useOpenCL` to `set_opencl_stage_allowed()`; a disabled backend never runs a node on a device |
+| `stage::select_node_device(node, device)` | explicit per-node request; returns the resolved device, whether an implementation exists and the reason for a refusal |
+| `stage::set_node_device_override()` | per-node override for tests and embedding; the kill switches still win |
+
+A node without a device implementation reports `implemented=false` and runs on
+the host program. A node whose device allocation is refused (budget) or whose
+launch fails also runs on the host, so a device problem never fails a render.
+
+### Buffers, budget and events
+
+- The residency keys a device allocation by the host buffer address, which is
+  the node output it belongs to. A repeated node with the same address and
+  shape reuses the allocation; a shape change replaces it; `release(key)`
+  drops it; the context destroys the rest.
+- The budget defaults to 1 GiB and is set by `RT_STAGE_DEVICE_BUDGET_MB`
+  (clamped to 16-65536 MiB). `StageResidencyStats` reports budget, used,
+  peak, allocations, reuses, evictions and refusals.
+- Over budget: idle entries (no other reference) are evicted least-recently-
+  used first. If a single buffer still does not fit, the request is refused
+  with a reason, counted as a refusal, and the node runs on the host.
+- Events carry the device that actually executed. The CPU fallback completes
+  before `submit()` returns (`asynchronous=false`). A device submission
+  returns `Running` with a completion handle; `poll()` queries the driver and
+  can report `Failed` early, and `wait()` blocks, reads the output back and
+  completes the event. Completion is never claimed before the readback.
+
+### Evidence
+
+Builds: `build/cpu-perf-graph-opencl` and `build/opencl-perf-graph-opencl`,
+GCC, generic target, `--ccache`. Device runs restrict the ICD to `pocl.icd`
+(`OCL_ICD_VENDORS`), set `RT_OPENCL_ALLOW_CPU=1` and use
+`OMP_NUM_THREADS=1`; the selected device reports `cpu-ivybridge-Intel(R)
+Core(TM) i7-3770 CPU @ 3.40GHz` on platform `Portable Computing Language`, so
+these are CPU-device measurements, never GPU parity.
+
+| Check | Result |
+|-------|--------|
+| `stage-residency-test` (POCL CPU) | PASS, 0 skipped: buffers, upload/readback, reuse, eviction, over-budget refusal and fallback, running/complete/failed events, selection and kill switches, node parity |
+| `stage-device-test` (POCL CPU) | PASS |
+| all 15 stage test executables, CPU and OpenCL trees | PASS |
+| `lanczos3` node parity, synthetic 128x96, scales 0.5 and 1.5 | PAE 0.000000 LSB16, 0 of 9216 and 0 of 82944 samples differ (tolerance 1 LSB16) |
+| 16-bit TIFF export, resize profile, switch off vs on | `AE=0`, PAE 0 of 7604928 samples, same output hash; device record `impl=opencl` |
+| preview sweep, 16 states, switch off vs on | 32 images `AE=0`, PAE 0 (regression check: the preview graph runs no stage-ABI node, so no device call) |
+| crop harness, 3 states plus sequences, switch off vs on | 30 PPM files byte-identical; both runs PASS, 42 plans, 0 fallbacks (no stage-ABI node in the crop graph) |
+| preview timing, 18 samples per side | off 318.89 ms mean (316.43-323.65), on 318.70 ms (316.55-322.55); baseline at `9e8df3493` 318.72 ms |
+| resize node timing, 3888x2608 | host 84.2 ms, POCL CPU device 161.6 ms: the device path is slower on a CPU device, which is expected and not a performance claim |
+
+### Nodes still CPU-only
+
+Everything except `resize`: `source.select`, `source.embedded`,
+`raw.preprocess`, `raw.demosaic`, `raw.base`, `analysis`, `transform`,
+`local.adjustments`, `rgb.proc`, `lab.tools`, `lab.sharpening`, `lab.wavelet`,
+`working.trc`, `ciecam`, `gamut`, `output.convert`, `crop`, `output.sharpen`,
+`framing`, `output.icc`, `monitor.output`, `viewport.output` and the five
+`thumbnail.*` nodes. They have no device implementation yet, so they resolve
+to CPU with a reason and keep the host code path.

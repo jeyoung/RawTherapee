@@ -40,6 +40,10 @@ difference between two identical runs). The gate is the peak absolute error
 | 2026-10-24 | 47c50ee77 | AMD RX 550 | colorspace_flowers.pef / bayer14 (`--formats`) | off vs auto | 1 LSB | PASS |
 | 2026-10-24 | 47c50ee77 | AMD RX 550 | 45.7 MP NEF / resize 0.5x | off vs auto | 1 LSB | PASS |
 | 2026-10-24 | 47c50ee77 | AMD RX 550 | 45.7 MP NEF / sidecar (crop + resize) | off vs auto | 1 LSB | PASS |
+| 2026-10-27 | 3a9d73c5f | POCL (CPU) | colorspace_flowers.pef / resize.pp3, `lanczos3` node | stage switch off vs on | 0 | PASS |
+| 2026-10-27 | 3a9d73c5f | POCL (CPU) | colorspace_flowers.pef / resize.pp3, 16-bit TIFF | stage switch off vs on | AE=0 | PASS |
+| 2026-10-27 | 3a9d73c5f | POCL (CPU) | colorspace_flowers.pef / preview sweep, 16 states | stage switch off vs on | 0 (32 images AE=0) | PASS |
+| 2026-10-27 | 3a9d73c5f | POCL (CPU) | colorspace_flowers.pef / crop harness, 3 states + sequences | stage switch off vs on | AE=0 (30 PPMs) | PASS |
 
 `47c50ee77` changes only CPU export buffer handling; the OpenCL rows above
 re-run the existing GPU stages against the new CPU neighbour.
@@ -77,3 +81,32 @@ Notes:
 - `verify.sh --rgbproc` sets `RT_OPENCL_RGBPROC=1`, asserts that
   `opencl rgbproc:` ran, and compares neutral and exposure profiles. The
   stage is batch-only because preview supplies a tone-curve histogram.
+
+## Stage device residency
+
+`3a9d73c5f` adds the graph device path and wires the `lanczos3` resize node
+through it. Device runs use `RT_OPENCL_ALLOW_CPU=1` and an ICD directory that
+contains only `pocl.icd` (`OCL_ICD_VENDORS`), so the selected device is POCL's
+CPU device (`cpu-ivybridge-Intel(R) Core(TM) i7-3770 CPU @ 3.40GHz`). These are
+CPU-device results and must not be read as GPU parity.
+
+The parity gate remains 1 LSB at 16-bit (1/65535 = 1.53e-5 normalised). The
+measured peak absolute error is zero in every case:
+
+- The node itself, on a synthetic 128x96 three-plane F32 image at scales 0.5
+  and 1.5, differs from the host implementation in 0 of 9216 and 0 of 82944
+  samples.
+- A 16-bit TIFF export with the resize profile is identical (`AE=0`, PAE 0 of
+  7604928 samples, same stage output hash) and the profile record shows the
+  node ran with `impl=opencl` when the switch is on and `impl=module` when it
+  is off.
+- The preview sweep and the crop harness produce identical images with the
+  switch on and off, but neither graph runs a stage-ABI node, so those runs
+  are CPU-path regression checks with zero device calls, not device parity.
+
+Timing on POCL CPU, `OMP_NUM_THREADS=1`, same image and profile: the resize
+node takes 161.6 ms on the device against 84.2 ms on the host. A CPU OpenCL
+device is not an acceleration target; the figure records that the device path
+works and is not a performance claim. The preview sweep is unaffected by the
+switch: 318.89 ms mean with the switch off and 318.70 ms with it on (18
+samples per side), against 318.72 ms at the parent commit `9e8df3493`.
