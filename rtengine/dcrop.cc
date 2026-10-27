@@ -84,7 +84,6 @@ using rtengine::TMatrix;
  */
 struct CropStageContext {
     procparams::ProcParams& params;
-    const int todo;
     Imagefloat* baseCrop;
     /*
      * Typed request of this update. The crop plan decides which stages are
@@ -139,9 +138,9 @@ struct CropStageContext {
      */
     rtengine::stage::WorkOrder work;
 
-    CropStageContext(procparams::ProcParams& parameters, int actions,
+    CropStageContext(procparams::ProcParams& parameters,
                      Imagefloat* base, const rtengine::EditorRequest& typed)
-        : params(parameters), todo(actions), baseCrop(base), request(typed)
+        : params(parameters), baseCrop(base), request(typed)
     {
     }
 
@@ -591,7 +590,7 @@ unsigned dirtyDerivations()
 
 } // namespace crop_graph
 
-void Crop::update(int todo, const EditorRequest& request)
+void Crop::update(const EditorRequest& request)
 {
     MyMutex::MyLock cropLock(cropMutex);
 
@@ -605,8 +604,8 @@ void Crop::update(int todo, const EditorRequest& request)
      */
     const bool viewportMovedRequest = request.imperativeRepaint;
 
-    // No need to update todo here, since it has already been changed in ImprocCoordinator::updatePreviewImage,
-    // and Crop::update ask to do ALL anyway
+    // The request already carries the coordinator augmentations; the crop graph
+    // and the body facts decide what this update renders.
 
     // give possibility to the listener to modify crop window (as the full image dimensions are already known at this point)
     int wx, wy, ww, wh, ws;
@@ -629,16 +628,12 @@ void Crop::update(int todo, const EditorRequest& request)
      * It something has been reallocated, or the editor asked for the
      * high-quality chain, all processing steps have to be performed, exactly
      * as the legacy `todo = ALL` assignment did. Keep that force as its own
-     * fact: the typed request below still describes only what the editor
-     * asked for, so the converted body gates must see both. A fullUpdate()
-     * already carries `ALL` in its request and needs no extra fact.
+     * fact: the typed request still describes only what the editor asked for,
+     * so the converted body gates must see both. A fullUpdate() already
+     * carries every fact its request names.
      */
     const bool forcedFull = needsinitupdate
         || request.kind == rtengine::stage::RequestKind::HighQuality;
-
-    if (forcedFull) {
-        todo = ALL;
-    }
 
     // Tells to the ImProcFunctions' tool what is the preview scale, which may lead to some simplifications
     parent->ipf.setScale(skip);
@@ -653,7 +648,7 @@ void Crop::update(int todo, const EditorRequest& request)
      * blocks this invocation executes; all blocks call the same methods in the
      * same order, so the plan cannot change an arithmetic step or an ordering.
      */
-    CropStageContext ctx(*parent->params, todo, baseCrop, request);
+    CropStageContext ctx(*parent->params, baseCrop, request);
     ctx.forcedFull = forcedFull;
     ctx.needsInitUpdate = needsinitupdate;
     ctx.widIm = widIm;
@@ -847,10 +842,11 @@ void Crop::update(int todo, const EditorRequest& request)
 
     if (g_getenv("RT_CROP_DIRTY_TRACE") != nullptr) {
         std::fprintf(stderr,
-                     "crop-dirty-trace: todo=0x%x init=%d forced=%d "
+                     "crop-dirty-trace: payload=0x%x init=%d forced=%d "
                      "wb=%d sharp=%d cie=%d spots=%zu crop=%d "
                      "params=%s\n",
-                     todo, needsinitupdate ? 1 : 0, derived.forced ? 1 : 0,
+                     request.executionPayload(),
+                     needsinitupdate ? 1 : 0, derived.forced ? 1 : 0,
                      params.wb.temperature, params.sharpening.amount,
                      params.colorappearance.enabled ? 1 : 0,
                      params.locallab.spots.size(),
@@ -1696,7 +1692,7 @@ void Crop::stageTransform(CropStageContext& ctx)
     ctx.cam02 = cam02;
 
     // transform
-   // if (needstransform || ((todo & (M_TRANSFORM | M_RGBCURVE)) && params.dirpyrequalizer.cbdlMethod == "bef" && params.dirpyrequalizer.enabled && !params.colorappearance.enabled)) {
+   // retired mask predicate: if (needstransform || ((transformFamilyIntent) && params.dirpyrequalizer.cbdlMethod == "bef" && params.dirpyrequalizer.enabled && !params.colorappearance.enabled)) {
     const bool transformIntent =
         ctx.request.transformFamilyIntent || ctx.forcedFull;
     if (needstransform || (transformIntent && params.dirpyrequalizer.cbdlMethod == "bef" && params.dirpyrequalizer.enabled && !cam02)) {
@@ -1720,7 +1716,7 @@ void Crop::stageTransform(CropStageContext& ctx)
         transCrop = nullptr;
     }
 
-   // if ((todo & (M_TRANSFORM | M_RGBCURVE))  && params.dirpyrequalizer.cbdlMethod == "bef" && params.dirpyrequalizer.enabled && !params.colorappearance.enabled) {
+   // retired mask predicate: if ((transformFamilyIntent)  && params.dirpyrequalizer.cbdlMethod == "bef" && params.dirpyrequalizer.enabled && !params.colorappearance.enabled) {
     if (transformIntent  && params.dirpyrequalizer.cbdlMethod == "bef" && params.dirpyrequalizer.enabled && !cam02) {
 
         const int W = baseCrop->getWidth();
@@ -3207,7 +3203,7 @@ void Crop::fullUpdate()
 
     while (newUpdatePending) {
         newUpdatePending = false;
-        update(ALL, forced);
+        update(forced);
     }
 
     updating = false;  // end of crop update

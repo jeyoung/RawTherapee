@@ -163,12 +163,13 @@ struct PreviewTimer {
     long long viewportCropMs = -1;
     int viewportDeferredTodo = 0;
     int viewportDeferredHits = 0;
-    int todo = 0;
+    /* The request this pass started with, for the diagnostic payload. */
+    rtengine::EditorRequest request;
     std::chrono::steady_clock::time_point start =
         std::chrono::steady_clock::now();
 
-    PreviewTimer(int changeMask, bool isEnabled)
-        : enabled(isEnabled), todo(changeMask)
+    PreviewTimer(const rtengine::EditorRequest& change, bool isEnabled)
+        : enabled(isEnabled), request(change)
     {
     }
 
@@ -182,7 +183,8 @@ struct PreviewTimer {
         const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             end - start).count();
         std::fprintf(stderr, "preview update: %lld ms todo=0x%x cache=%d",
-                     static_cast<long long>(ms), todo, cacheHit ? 1 : 0);
+                     static_cast<long long>(ms),
+                     request.executionPayload(), cacheHit ? 1 : 0);
         if (viewportFast) {
             std::fprintf(stderr,
                          " viewport=fast crop_ms=%lld deferred_stages=0x%x"
@@ -830,15 +832,14 @@ void ImProcCoordinator::updateViewportLutSnapshot(
     }
 }
 
-void ImProcCoordinator::renderCrops(int todo, bool force,
-                                    const EditorRequest& request)
+void ImProcCoordinator::renderCrops(bool force, const EditorRequest& request)
 {
     for (size_t i = 0; i < crops.size(); i++) {
         if (crops[i]->hasListener()
-                && (force
-                    || (todo & (M_MONITOR | M_RGBCURVE | M_LUMACURVE))
+                && (force || request.monitorIntent
+                    || request.rgbProcIntent || request.lumaCurveIntent
                     || crops[i]->get_skip() == 1)) {
-            crops[i]->update(todo, request);     // may call ourselves
+            crops[i]->update(request);     // may call ourselves
         }
     }
 }
@@ -930,7 +931,7 @@ void ImProcCoordinator::dropPendingDeferred()
     paramsUpdateMutex.unlock();
 }
 
-bool ImProcCoordinator::absorbPendingDeferred(int& todo)
+bool ImProcCoordinator::absorbPendingDeferred(EditorRequest& request)
 {
     paramsUpdateMutex.lock();
 
@@ -940,14 +941,13 @@ bool ImProcCoordinator::absorbPendingDeferred(int& todo)
         /*
          * The request about to run rebuilds the whole-frame analysis, so it
          * must also cover the typed stages the fast path skipped. The block
-         * set is merged by the dirty derivation; the derived execution payload
-         * keeps the unconverted block bodies and their typed facts in step.
-         * Neither path names a source or raw block.
+         * set is merged by the dirty derivation; the request absorbs the
+         * materialised payload for the unconverted block bodies and their
+         * typed facts. Neither path names a source or raw block.
          */
         absorbedDeferredBlocks = pendingDeferred.blocks;
         absorbedDeferredActive = true;
-        todo |= deferredExecutionPayload(
-            deferredStageBits(pendingDeferred.blocks));
+        request.absorbDeferredExecution(pendingDeferred.blocks);
         absorbed = true;
         pendingDeferred = DeferredRecord{};
         publishDeferredSnapshotLocked();
@@ -1146,8 +1146,8 @@ bool enabled()
     return state().enabled;
 }
 
-void dump_full_frame(const Image8* preview, const Image8* work, int scale,
-                     int todo)
+void dump_full_frame(const Image8* preview, const Image8* work,
+                     int scale, const EditorRequest& request)
 {
     DumpState& dump = state();
     if (!dump.enabled) {
@@ -1173,7 +1173,7 @@ void dump_full_frame(const Image8* preview, const Image8* work, int scale,
          << "  \"schema\": \"rt-preview-dump/1\",\n"
          << "  \"pass\": " << pass << ",\n"
          << "  \"scale\": " << scale << ",\n"
-         << "  \"todo\": " << todo << ",\n"
+         << "  \"todo\": " << request.executionPayload() << ",\n"
          << "  \"format\": \"uint16-tiff\",\n"
          << "  \"preview\": {\"file\": \"preview.tif\", \"width\": "
          << preview->getWidth() << ", \"height\": " << preview->getHeight()
@@ -1372,7 +1372,13 @@ RtStageBuffer imageTierView(const Imagefloat* image)
 
 /* State owned by one full-frame preview pass. */
 struct ImProcCoordinator::PreviewPassState {
-    int todo = 0;
+    /*
+     * The demosaic body ran in this pass. The hand-written pass widened its
+     * payload with M_INIT|M_CSHARP at that point but only refreshed the typed
+     * request after the node loop, so the widening must stay deferred to the
+     * same position.
+     */
+    bool demosaicRebuilt = false;
     RAWParams rp;
     bool highDetailNeeded = false;
     bool prevdemoFull = false;
@@ -1393,8 +1399,8 @@ struct ImProcCoordinator::PreviewPassState {
     stage::ParamSnapshot fingerprints;
     stage::RenderStateKey renderState;
     /*
-     * The typed request this pass runs. `todo` remains the opaque legacy
-     * execution payload for the block gates; `request` is the planning input.
+     * The typed request this pass runs. It is the only execution input; the
+     * legacy payload it still carries is materialised inside the adapter.
      */
     EditorRequest request;
     stage::DirtyBlocks dirty;
@@ -1483,7 +1489,7 @@ void ImProcCoordinator::stageRawDemosaic(PreviewPassState& pass)
     }
 
     bool iscolor = (params->toneCurve.method == "Color" || params->toneCurve.method == "Coloropp");
-    if ((pass.todo & M_RAW)
+    if (pass.request.rawIntent
             || (!highDetailRawComputed && pass.highDetailNeeded)
             // || (params->toneCurve.hrenabled && params->toneCurve.method != "Color" && imgsrc->isRGBSourceModified())
             // || (!params->toneCurve.hrenabled && params->toneCurve.method == "Color" && imgsrc->isRGBSourceModified())) {
@@ -1520,11 +1526,18 @@ void ImProcCoordinator::stageRawDemosaic(PreviewPassState& pass)
         }
 
         // if a demosaic happened we should also call getimage later, so we need to set the M_INIT flag
-        pass.todo |= (M_INIT | M_CSHARP);
+        pass.demosaicRebuilt = true;
 
     }
 
-    if ((pass.todo & (M_RAW | M_CSHARP)) && params->pdsharpening.enabled) {
+    /*
+     * The hand-written pass widened the payload with M_INIT|M_CSHARP when the
+     * demosaic ran, which made capture sharpening run even when the request
+     * named neither bit. `demosaicRebuilt` is that sub-step fact.
+     */
+    if ((pass.request.rawIntent || pass.request.captureSharpenIntent
+            || pass.demosaicRebuilt)
+            && params->pdsharpening.enabled) {
         double pdSharpencontrastThreshold = params->pdsharpening.contrast;
         double pdSharpenRadius = params->pdsharpening.deconvradius;
         previewBaseCache->markDirty("capture-sharpening");
@@ -1540,7 +1553,7 @@ void ImProcCoordinator::stageRawDemosaic(PreviewPassState& pass)
     }
 
 
-    if ((pass.todo & M_RAW)
+    if (pass.request.rawIntent
             || (!highDetailRawComputed && pass.highDetailNeeded)
             //  || (params->toneCurve.hrenabled && params->toneCurve.method != "Color" && imgsrc->isRGBSourceModified())
             //  || (!params->toneCurve.hrenabled && params->toneCurve.method == "Color" && imgsrc->isRGBSourceModified())) {
@@ -2142,7 +2155,7 @@ void ImProcCoordinator::stageRawBase(PreviewPassState& pass)
         //ColorTemp::CAT02 (orig_prev, &params) ;
         //   printf("orig_prevW=%d\n  scale=%d",orig_prev->width, scale);
         /* Issue 2785, disabled some 1:1 tools
-                if (pass.todo & M_LINDENOISE) {
+                if (false) { // retired M_LINDENOISE gate
                     DirPyrDenoiseParams denoiseParams = params->dirpyrDenoise;
                     if (denoiseParams.enabled && (scale==1)) {
                         Imagefloat *calclum = NULL ;
@@ -2302,7 +2315,7 @@ void ImProcCoordinator::stageTransform(PreviewPassState& pass)
     // Remove transformation if unneeded
     bool needstransform = ipf.needsTransform(fw, fh, imgsrc->getRotateDegree(), imgsrc->getMetaData());
 
-    //  if ((needstransform || ((pass.todo & (M_TRANSFORM | M_RGBCURVE))  && params->dirpyrequalizer.cbdlMethod == "bef" && params->dirpyrequalizer.enabled && !params->colorappearance.enabled))) {
+    //  retired mask predicate: if ((needstransform || ((transformFamilyIntent)  && params->dirpyrequalizer.cbdlMethod == "bef" && params->dirpyrequalizer.enabled && !params->colorappearance.enabled))) {
     if ((needstransform || (pass.request.transformFamilyIntent  && params->dirpyrequalizer.cbdlMethod == "bef" && params->dirpyrequalizer.enabled && !pass.cam02))) {
         // Forking the image
         assert(oprevi);
@@ -4677,12 +4690,10 @@ void ImProcCoordinator::updatePreviewImage(EditorRequest request,
     }
 
     /*
-     * The opaque execution payload. `todo` feeds the block bodies, cache
-     * invalidation and the deferred-analysis queue; admission reads the typed
-     * request, not `todo`. Each widening below refreshes the request facts
-     * through setLegacyGateMask().
+     * The typed request is the only execution input. It still carries the
+     * legacy payload for the unconverted bodies, but every widening below is
+     * named as an intent method, so no site reads or writes a mask bit.
      */
-    int todo = request.executionPayload();
 
     // Keep the request shape for eligibility. The augmentation below turns a
     // crop-only change into a transform request, but the base image itself
@@ -4693,8 +4704,8 @@ void ImProcCoordinator::updatePreviewImage(EditorRequest request,
 
     // This augmentation must happen before a stale request is requeued, since
     // the next request may only carry M_CROP and M_MONITOR.
-    if ((todo & M_CROP) && ipf.needsPCVignetting()) {
-        todo |= TRANSFORM;
+    if (request.cropIntent && ipf.needsPCVignetting()) {
+        request.markCropTransform();
     }
 
     /*
@@ -4703,8 +4714,6 @@ void ImProcCoordinator::updatePreviewImage(EditorRequest request,
      * so leaving the facts at their pre-augmentation values would make the
      * crop bodies read a stale transform/rgb/Lab intent.
      */
-    request.setLegacyGateMask(todo);
-    request.refreshFromLegacyMask();
     assertPlanningAgrees(request, "pc-vignette augmentation");
 
     if (previewRequest.load(std::memory_order_relaxed) != requestId) {
@@ -4717,11 +4726,9 @@ void ImProcCoordinator::updatePreviewImage(EditorRequest request,
          * turns a bare repaint into a parameter update, matching the old
          * derivation over the ORed mask.
          */
-        request.setLegacyGateMask(todo);
         request.present = true;
         if (panningRelatedChange) {
-            request.setLegacyGateMask(request.legacyGateMask | M_MONITOR);
-            request.viewportMoved = true;
+            request.markViewportMoved();
         }
         /*
          * A bare repaint survives the requeue only while its mask is still
@@ -4746,7 +4753,7 @@ void ImProcCoordinator::updatePreviewImage(EditorRequest request,
         return;
     }
 
-    PreviewTimer previewTimer(todo,
+    PreviewTimer previewTimer(request,
                               g_getenv("RT_PREVIEW_PROFILE") != nullptr);
     LoadProfile::Timer pipelineTimer(
         "preview pipeline", &LoadProfile::state().pipelineSeen);
@@ -4794,9 +4801,9 @@ void ImProcCoordinator::updatePreviewImage(EditorRequest request,
         /*
          * The crop render reads the augmented request: a post-crop-vignetting
          * change derives a transform, and a luminance-curve or auto-exposure
-         * edit implies the Lab pixel tools. The payload the crop bodies read
-         * is materialised from that selection; no mask arithmetic happens
-         * here.
+         * edit implies the Lab pixel tools. The Lab dependency is applied as
+         * the same named intent the payload used to carry; no mask arithmetic
+         * happens here.
          */
         ViewportCropSelection cropSelection = viewportCropSelection(request);
         resolveCropDependencies(cropSelection);
@@ -4806,8 +4813,8 @@ void ImProcCoordinator::updatePreviewImage(EditorRequest request,
             // Crop::update applies luminance/colour work for the implied bits
             // only through M_LUMINANCE/M_COLOR; keep the payload and the typed
             // facts consistent, because the crop bodies read the facts.
-            cropRequest.setLegacyGateMask(
-                viewportCropPayload(request.legacyGateMask, cropSelection));
+            cropRequest.markLabPixels(cropSelection.luminance,
+                                       cropSelection.color);
         }
         assertPlanningAgrees(cropRequest, "viewport fast-path crop");
 
@@ -4815,7 +4822,7 @@ void ImProcCoordinator::updatePreviewImage(EditorRequest request,
         ipf.setScale(scale);
 
         const auto cropStart = std::chrono::steady_clock::now();
-        renderCrops(viewportCropTodo(cropSelection), true, cropRequest);
+        renderCrops(true, cropRequest);
         const auto cropEnd = std::chrono::steady_clock::now();
         previewTimer.viewportFast = true;
         previewTimer.viewportCropMs =
@@ -4865,22 +4872,7 @@ void ImProcCoordinator::updatePreviewImage(EditorRequest request,
         // M_MONITOR also forces the full-frame block even when the original
         // event did not carry an init/HDR bit. The added bits make sure the
         // base image and analysis are rebuilt from the current parameters.
-        todo |= M_INIT | M_HDR | M_MONITOR;
-        request.setLegacyGateMask(todo);
-        /*
-         * Widening the mask to a base refresh widens the typed request too.
-         * HighQuality keeps its precedence, exactly as the old derivation
-         * checked M_HIGHQUAL before the reload bits.
-         */
-        request.fullFrameIntent = true;
-        if (!request.highDetailIntent) {
-            request.kind = stage::RequestKind::FullPreview;
-        }
-        if (params->spot != viewportFullParams.spot) {
-            todo |= M_SPOT;
-            request.setLegacyGateMask(todo);
-            request.spotPending = true;
-        }
+        request.markBaseRefresh(params->spot != viewportFullParams.spot);
         assertPlanningAgrees(request, "base refresh");
         if (previewBaseCache->enabled()) {
             previewBaseCache->markDirty("viewport-base-refresh");
@@ -4889,9 +4881,8 @@ void ImProcCoordinator::updatePreviewImage(EditorRequest request,
 
     // A request that takes the normal path satisfies any deferred analysis
     // work: it rebuilds the whole-frame pipeline, so the accumulated stages
-    // must be part of its mask rather than left for a later pass.
-    const bool absorbedDeferred = absorbPendingDeferred(todo);
-    request.setLegacyGateMask(todo);
+    // must be part of its payload rather than left for a later pass.
+    const bool absorbedDeferred = absorbPendingDeferred(request);
     if (absorbedDeferred
             && request.kind == stage::RequestKind::RepaintOnly) {
         /*
@@ -4928,31 +4919,24 @@ void ImProcCoordinator::updatePreviewImage(EditorRequest request,
 
     if (request.fullFrameAdmission || panningRelatedChange || (highDetailNeeded && prevdemo != PD_Sidecar)) {
         fullPipelineRan = true;
-        pass.todo = todo;
         pass.request = request;
 
         // A white-balance change on the Color/Coloropp highlight-recovery path
         // forces the demosaic and, with it, every block in the DEMOSAIC mask.
         // The hand-written pass applied this just before the demosaic node; it
-        // is a pure function of the mask and the parameters, so it runs here
-        // and the plan sees the mask the pass will actually use. The request
-        // bit is kept for the typed order, which cannot derive it from a
-        // parameter delta.
+        // is a pure function of the request facts and the parameters, so it
+        // runs here and the plan sees the request the pass will actually use.
+        // The request bit is kept for the typed order, which cannot derive it
+        // from a parameter delta.
         const bool colorHlrWbRequest = request.colorHlrWbRequest;
         if (colorHlrWbRequest && params->toneCurve.hrenabled
                 && params->toneCurve.method == "Coloropp") {
-            pass.todo |= DEMOSAIC;
             /*
              * DEMOSAIC contains the absolute reload bits and M_SPOT, so the
              * old derivation saw a whole-path rebuild with spot work. Keep the
              * typed request in step; M_HIGHQUAL still wins.
              */
-            pass.request.setLegacyGateMask(pass.todo);
-            pass.request.fullFrameIntent = true;
-            pass.request.spotPending = true;
-            if (!pass.request.highDetailIntent) {
-                pass.request.kind = stage::RequestKind::FullPreview;
-            }
+            pass.request.markColorHlrDemosaic();
             assertPlanningAgrees(pass.request, "color/coloropp demosaic");
         }
 
@@ -5106,18 +5090,20 @@ void ImProcCoordinator::updatePreviewImage(EditorRequest request,
             executePreviewNode(id, pass);
         }
 
-        todo = pass.todo;
         /*
-         * Nodes may widen the execution payload themselves (raw.demosaic adds
-         * M_INIT|M_CSHARP after a rebuild). Refresh the mask-shaped facts so
-         * the monitor render gate below sees the same planning the old
-         * derivation read from the final mask.
+         * Nodes may widen the execution payload themselves (raw.demosaic
+         * records that it re-ran). Apply that widening at the position the
+         * hand-written pass did, so the monitor gate and the crop request see
+         * the same facts the old final mask produced.
          */
-        pass.request.setLegacyGateMask(todo);
-        pass.request.refreshFromLegacyMask();
+        if (pass.demosaicRebuilt) {
+            pass.request.markDemosaicRebuilt();
+        }
 
-
-        if ((pass.todo & M_MONITOR) || (lastOutputProfile != params->icm.outputProfile) || lastOutputIntent != params->icm.outputIntent || lastOutputBPC != params->icm.outputBPC) {
+        if (pass.request.monitorIntent
+                || (lastOutputProfile != params->icm.outputProfile)
+                || lastOutputIntent != params->icm.outputIntent
+                || lastOutputBPC != params->icm.outputBPC) {
             lastOutputProfile = params->icm.outputProfile;
             lastOutputIntent = params->icm.outputIntent;
             lastOutputBPC = params->icm.outputBPC;
@@ -5134,7 +5120,7 @@ void ImProcCoordinator::updatePreviewImage(EditorRequest request,
         const EditorRequest& cropRequest =
             pass.request.present ? pass.request : request;
         assertPlanningAgrees(cropRequest, "preview crop render");
-        renderCrops(todo, panningRelatedChange
+        renderCrops(panningRelatedChange
                         || (highDetailNeeded && prevdemo != PD_Sidecar),
                     cropRequest);
     }
@@ -5162,7 +5148,8 @@ void ImProcCoordinator::updatePreviewImage(EditorRequest request,
             }
 
             if (preview_dump::enabled()) {
-                preview_dump::dump_full_frame(previmg, workimg, scale, todo);
+                preview_dump::dump_full_frame(previmg, workimg, scale,
+                                              pass.request);
             }
         }
 

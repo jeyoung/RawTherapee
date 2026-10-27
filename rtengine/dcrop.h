@@ -110,7 +110,7 @@ public:
 //   MyMutex* locMutex;
     void setEditSubscriber(EditSubscriber* newSubscriber);
     bool hasListener();
-    void update(int todo, const EditorRequest& request);
+    void update(const EditorRequest& request);
     void setWindow   (int cropX, int cropY, int cropW, int cropH, int skip) override
     {
         setCropSizes(cropX, cropY, cropW, cropH, skip, false);

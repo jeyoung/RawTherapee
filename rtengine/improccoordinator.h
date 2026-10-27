@@ -66,7 +66,7 @@ namespace preview_dump
 
 bool enabled();
 void dump_full_frame(const Image8* preview, const Image8* work, int scale,
-                     int todo);
+                     const EditorRequest& request);
 void dump_crop(const Image8* crop, const char* tag, int visibleX,
                int visibleY, int visibleWidth, int visibleHeight, int skip);
 
@@ -347,7 +347,7 @@ protected:
                                 const char*& reason) const;
     void prepareViewportLuts(const ViewportLutSelection& selection);
     void updateViewportLutSnapshot(const ViewportLutSelection& selection);
-    void renderCrops(int todo, bool force, const EditorRequest& request);
+    void renderCrops(bool force, const EditorRequest& request);
     uint32_t queueViewportDeferredAnalysis(const EditorRequest& request,
                                            unsigned requestId);
     void markViewportStateValid(bool highDetailNeeded);
@@ -356,7 +356,7 @@ protected:
     void deferredWatcherLoop();
     void flushDeferredAnalysis();
     void dropPendingDeferred();
-    bool absorbPendingDeferred(int& todo);
+    bool absorbPendingDeferred(EditorRequest& request);
     void publishDeferredSnapshotLocked();
 
     /*
