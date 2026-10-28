@@ -458,86 +458,99 @@ input:
 
 ```text
 {"stage":"transform","impl":"opencl","source":"opencl","consumer":"interactive",
- "ns":918149,"width":238,"height":160,"threads":0,"cache_hit":0,
+ "ns":828188,"width":238,"height":160,"threads":0,"cache_hit":0,
  "input_hash":"a677044a3725d807","output_hash":"142265ab331fb8d6"}
 {"stage":"rgb.proc","impl":"opencl","source":"opencl","consumer":"interactive",
  "ns":0,"width":238,"height":160,"threads":0,"cache_hit":0,
- "input_hash":"142265ab331fb8d6","output_hash":"9704335b08c4d157"}
+ "input_hash":"142265ab331fb8d6","output_hash":"b5564018d6e26f03"}
 ```
 
 (The records above are re-wrapped for width; the file is one JSON object per
-line. The `rgb.proc` `output_hash` is not stable between passes; see below.)
+line. The `rgb.proc` `output_hash` is stable across passes after the row-pitch
+fix.)
 
 PPM results against the pure CPU host:
 
 | Run | `raw-graph.ppm` sha256 | Samples differing from the host |
 |-----|------------------------|---------------------------------|
-| device, both nodes, 238x160 | `42f3f55a919c753288536ebba92faa550998e6fc8e4f9cb0211042b6082b564c` | 944 of 114 240: 943 in rows 158-159 (max 205), 1 at row 29 (1 LSB8) |
-| device `transform`, host `rgb.proc`, 238x160 | `27a9c5f4fd5ae6cf5d05444faf7f0980af37336e95693750defbb45845696f42` | 1 of 114 240, 1 LSB8 (row 29) |
-| device, both nodes, 240x161 | `bed2f0bcfe2149d14cc0b18d2acdcc79a5785d9fa025d07e376aa3b2f15eef90` | 2 of 115 920, 1 LSB8 |
+| device, both nodes, 238x160 | `27a9c5f4fd5ae6cf5d05444faf7f0980af37336e95693750defbb45845696f42` | 1 of 114 240, 1 LSB8 (row 29) |
+| device, both nodes, 179x120 | `c621bad329efc65b4c6cc10f9e6d744769cbf7235797f4cb8a3ff3729b299ffc` | 1 of 64 440, 1 LSB8 |
+| device, both nodes, 267x179 | `4dfbc3dc487337f7583343b9948dcd81e4365a5f94fb10409787dd18a885f418` | 4 of 143 379, 1 LSB8 |
+| classic rgbProc, 238x160 | `27a9c5f4fd5ae6cf5d05444faf7f0980af37336e95693750defbb45845696f42` | byte-identical to the device |
 | pure host, 238x160 | `c712e74faf30ff5bd826112d52804e46a3857c1ef2d7214317d662abfb6ccf84` | reference |
-| pure host, 240x161 | `b5aca018d1f5aeda467688722c77fb0dcbb9ac6e3ffc6ee4fc38d0e00baad944` | reference |
+| pure host, 179x120 | `a2572fc61344b57313861764174b562fca957963f59031e0de658f12ee49fbf5` | reference |
+| pure host, 267x179 | `36b1a4e5f708777e2049fa205ff172db70673c5bdf02672f1b228e8f6259ed6a` | reference |
 
-The both-node device hash at 238x160 is not stable: an earlier run of the same
-command gave `1afeaf31e436d28394948cae9ff024e56b36120454638aefd77eb18243765370`
-with 948 samples differing. The extra differing samples are always in the same
-two rows, 158 (232-234 bytes) and 159 (708-711 bytes), 316 pixels in total.
+The device and classic runs are stable across repeats: two device runs at each
+height give the same hash, and the `rgb.proc` `output_hash` is
+`b5564018d6e26f03` in both passes of a run.
 
-No pair is byte-identical. Two effects are separable:
-
-- the device kernels differ from the CPU arithmetic by 1 LSB8 on 1-2 samples
-  (one row-29 sample with `transform` on and `rgb.proc` off; two samples at
-  240x161 with both on), the 8-bit face of the documented 1 LSB16 kernel
-  tolerance;
-- at 238 px the `rgb.proc` tail defect below adds 943 samples with differences
-  up to 245.
-
-The embedded-JPEG branch is byte-identical in every run, 239x160, sha256
+The device path still differs from the CPU host by 1-4 samples at 1 LSB8, the
+8-bit face of the documented 1 LSB16 kernel tolerance, so byte identity is not
+the applicable gate for this composite. The embedded-JPEG branch is
+byte-identical in every run, 239x160, sha256
 `d961f0b52aaa8db2c7acd3c0a5924ad3ef22942156617bdf8fc204d52bd65514`.
 
-### `rgb.proc` device defect at padded row widths
+### `rgb.proc` row pitch
 
-The shared kernel `rt_rgb_proc` indexes compactly, `index = y * width + x`
-(`rtengine/stage/algorithms/rgb_proc_cl.h`), and takes no row-pitch arguments.
-The stage device allocates each plane with `row_pitch` rounded up to
-`STAGE_BUFFER_ALIGNMENT` = 64 bytes (`stage_device.cc:119`,
-`stage_device.h:172`). Upload and readback use the same pitched rectangle, so
-the compact indexing cancels and every sample the kernel writes reads back
-correctly. The write range, however, ends at `width * height` samples while the
-allocation holds `row_pitch / 4 * height`; the tail of
-`(row_pitch / 4 - width) * height` samples is never written and readback
-returns whatever the allocation held.
+`rt_rgb_proc` used to index source and destination as `y * width + x`, which is
+only correct for a compact plane. The stage device pads every plane row to
+`STAGE_BUFFER_ALIGNMENT` = 64 bytes (`stage_device.cc`, `stage_buffer_layout`;
+`stage_device.h:172`), so on any width whose row is not already 64-byte
+aligned the kernel addressed the wrong sample: rows sheared, the tail of the
+allocation was never written, and at width 179 the thumbnail run segfaulted.
+The classic backend allocates compact planes (`planeBytes` per plane, zero
+buffer row pitch), which is why the defect was latent there.
 
-At width 238 a row is 952 bytes, padded to 960, so 2 samples per row over 160
-rows stay unwritten: 320 samples, the last 1.34 rows. The measured difference
-is 943 samples of 114 240 in the recorded run and 948 in the previous one,
-always in rows 158 (232-234 bytes) and 159 (708-711 bytes), maximum 245. The
-node's `output_hash` changes between two identical passes for the same reason,
-and the recorded runs failed the harness's own two-pass comparison
-(`raw-legacy` `1afeaf31e436d28394948cae9ff024e56b36120454638aefd77eb18243765370`
-against `raw-graph` `42f3f55a…`; the first repeat failed with
-`28f82f58db690f314ed1d699c32fd7c83882cd247a2600f448e326341570ce61` against
-`1afeaf31…`) before one repeat passed.
+The kernel now takes `srcPitch` and `dstPitch` in float elements and indexes
+`y * srcPitch + x` and `y * dstPitch + x`; the arithmetic is unchanged. The
+stage ABI is unchanged: `run_rgb_proc` inserts the device row pitches after
+`height`, rejects a set of planes whose row pitches disagree, and falls back to
+the host if a pitch does not cover the width. The classic launcher passes
+`width` for both pitches, because its planes are compact.
 
-Two controls confirm the mechanism:
+Before and after, 238x160 thumbnail:
 
-- height 161 gives width 240, a 960-byte row, already a multiple of 64. The
-  `rgb.proc` `output_hash` is then stable (`8cf60f53eed0965f` in both passes)
-  and only 2 of 115 920 samples differ from the host, at 1 LSB8. There is no
-  tail garbage and no unstable hash.
-- height 120 gives width 179, a 716-byte row padded to 768 (192 samples), so
-  the tail is 13 samples per row, 1 560 samples. The device run segfaults
-  (exit 139) after the `thumbnail.rgb` node.
+| | before | after |
+|---|---|---|
+| samples differing from the pure host | 943-948, rows 158-159, max 245 | 1 of 114 240, row 29, max 1 LSB8 |
+| `rgb.proc` `output_hash` | unstable between passes | `b5564018d6e26f03` twice |
+| `raw-graph.ppm` | `42f3f55a…` or `1afeaf31…`, not stable | `27a9c5f4…`, stable |
+| height 120 (width 179) | segfault, exit 139 | PASS, 1 of 64 440 at 1 LSB8 |
 
-This is a defect in the `rgb.proc` node, not host-only work: the fix is to give
-the kernel row pitches or to allocate it compactly, and it is outside this
-coverage change. `thumbnail.rgb` stays `partial` and its parity is recorded as
-failed, not passed. Any width whose `width * 4` is not a multiple of 64 is
-affected, which is most thumbnail widths.
+The regression case is in `stage_residency_test.cc`: the node runs at width 238
+and 179 against a compact-pitch reference at width 240 and 192 with the same
+fixture, and the shared columns must agree bit for bit, the last row must be
+finite, and a repeat must be identical. Against the pre-fix indexing (the
+mutation restores `y * width + x` while keeping the pitch arguments) it fails
+with 128 of 17 136 and 785 of 12 888 shared samples differing, plus non-finite
+tail rows; after the fix both cases report `PAE 0.000000 LSB16, 0 differing`.
 
-Even with the defect fixed, the device path differs from the CPU host by 1-2
-samples at 1 LSB8, so byte identity is not the applicable gate for this
-composite; the 1 LSB16 tolerance of `devnotes/opencl/PARITY.md` is.
+The classic export control is a fast export resized to 238 px, `--gpu=auto`
+with `RT_OPENCL_RGBPROC=1` against the same command on the pre-fix build:
+`AE=0`, `PAE=0` on 238x160. `tools/opencl/verify.sh --stage-device` also passes
+the rgbproc pair at the 1 LSB16 limit.
+
+### Kernel row-pitch audit
+
+Every stage-device kernel in `stage_opencl_device.cc` was checked for the
+compact-index assumption. `rt_rgb_proc` was the only one; the rest already take
+and use pitches, and each is reachable at a padded width on a normal path:
+
+| Kernel | Row addressing | Padded-width test |
+|--------|----------------|-------------------|
+| `lanczos3` | `src_pitch`, `src_plane_pitch`, `dst_pitch`, `dst_plane_pitch` | node parity 238x160 → 119x80 and → 357x240 against the CPU |
+| `rt_transform` | `srcPitch`, `srcPlanePitch`, `dstPitch`, `dstPlanePitch` | identity geometry at 238x160, exact; 90° rotation within 1 LSB16 |
+| `rt_lab_to_float` | `srcPitch`, `srcPlanePitch`, `dstPitch`, `dstPlanePitch` | `output.convert` parity at 238x160 |
+| `rt_lab_to_u8` | `srcPitch`, `srcPlanePitch`, `dstRowBytes` | `thumbnail.output` at 238 (covered by the thumbnail harness) |
+| `rt_thumbnail_wb` | `srcPitch`, `srcPlanePitch`, `dstPitch`, `dstPlanePitch` | existing test at width 24, which is already padded; add 238 |
+| `rt_thumbnail_permute` | `srcPitch`, `srcPlanePitch`, `dstPitch`, `dstPlanePitch` | existing test at width 20, already padded |
+| `rt_thumbnail_permute_u8` | `srcPitch`, `dstPitch` (bytes) | same test, packed U8 |
+| `rt_thumbnail_scale_f32` | `src_pitch`, `src_plane_pitch`, `dst_pitch`, `dst_plane_pitch` | existing padded Image16 case (41x23); add a 238-wide F32 case |
+| `rt_thumbnail_scale_u8` | `src_pitch`, `dst_pitch` (bytes) | same test, packed U8 |
+
+No other kernel needs the pitch fix. The proposed rows are additional coverage,
+not known defects, and are not part of this change.
 
 ### Host-side residual
 
