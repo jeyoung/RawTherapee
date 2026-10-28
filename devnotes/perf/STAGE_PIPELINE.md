@@ -53,6 +53,7 @@ spec: `buildPipelineSpec()` returns the rooted subgraph, not the union.
 | `yes` | the block has its own stage-ABI device node |
 | `partial` | a composite block whose dominant pixel passes are device nodes; the host-side residual is named with the block record in `STAGE_RUNTIME.md` |
 | `no` | host-only: the block has no device node |
+| `n/a` | no pixel kernel to port: I/O, metadata, a histogram, or a row copy that a device round trip would make slower |
 
 A block's runtime node name can differ from its id; the name is given where it
 does. `partial` never means verified: it records device execution of the named
@@ -79,12 +80,12 @@ main sharpen node may still run on the device.
 
 | Id | Domain (export/preview/crop/thumbnail) | Consumer | Reuse | Role | Device |
 |----|----------------------------------------|----------|-------|------|--------|
-| `source.select` | Full/Full/Full/Full | path | recompute | select the frame to process | no |
-| `source.embedded` | -/-/-/Reduced | interactive | recompute | select the embedded JPEG | no |
+| `source.select` | Full/Full/Full/Full | path | recompute | select the frame to process | n/a |
+| `source.embedded` | -/-/-/Reduced | interactive | recompute | select the embedded JPEG | n/a |
 | `raw.preprocess` | Full/Full/Full/Full | path | reuse-output | raw black/white, hot/dead pixel, CA, flat field | no |
 | `raw.demosaic` | Full/Full/Full/Full | path | reuse-output | demosaic and capture sharpening | no |
 | `raw.base` | Full/Full/Roi/Reduced | path | reuse-output | `getImage()`, spot removal, denoise, film negative, Retinex, source-side gamut | no |
-| `analysis` | Full/Full/Roi/- | path | reuse-output | histogram and auto-exposure analysis | no |
+| `analysis` | Full/Full/Roi/- | path | reuse-output | histogram and auto-exposure analysis | n/a |
 | `transform` | Full/Full/Roi/- | path | reuse-input | rotation, distortion, perspective, CA, vignetting, gradient, post-crop vignette, dehaze, Fattal | yes |
 | `local.adjustments` | Full/Full/Roi/Reduced | path | reuse-input | local lab / selective editing | no |
 | `rgb.proc` | Full/Full/Roi/Reduced | path | reuse-input | RGB curves, tone curve, colour toning, B&W, channel mixer, HSV, film simulation | yes |
@@ -95,14 +96,14 @@ main sharpen node may still run on the device.
 | `ciecam` | Full/Full/Roi/- | path | reuse-input | CIE CAM 02 | no |
 | `gamut` | Full/Full/Roi/Reduced | path | reuse-input | working-space gamut compression | yes |
 | `output.convert` | Full/-/-/- | exact | reuse-output | Lab to output RGB and output profile conversion | yes |
-| `crop` | Full/-/-/- | exact | reuse-output | crop | no |
+| `crop` | Full/-/-/- | exact | reuse-output | crop | n/a |
 | `resize` | Full/-/-/- | exact | reuse-output | resize (`lanczos3`) | yes |
 | `output.sharpen` | Full/-/-/- | exact | reuse-input | post-resize sharpening (`output.sharpen`); USM without residual switches | partial |
 | `framing` | Full/-/-/- | exact | reuse-output | framing and frame drawing | yes |
-| `output.icc` | Full/-/-/- | exact | recompute | attach output ICC and metadata | no |
+| `output.icc` | Full/-/-/- | exact | recompute | attach output ICC and metadata | n/a |
 | `monitor.output` | -/Full/-/- | interactive | recompute | Lab to monitor RGB | yes |
 | `viewport.output` | -/-/Roi/- | interactive | recompute | Lab to monitor RGB for the viewport | yes |
-| `thumbnail.decode` | -/-/-/Reduced | interactive | reuse-output | decode the embedded JPEG | no |
+| `thumbnail.decode` | -/-/-/Reduced | interactive | reuse-output | decode the embedded JPEG | n/a |
 | `thumbnail.scale` | -/-/-/Reduced | interactive | reuse-output | scale to thumbnail height | yes |
 | `thumbnail.transform` | -/-/-/Reduced | interactive | reuse-input | coarse rotate and flip | yes |
 | `thumbnail.whitebalance` | -/-/-/Reduced | interactive | reuse-input | apply white balance to the thumbnail | yes |
@@ -1545,30 +1546,35 @@ device run is slower than the host and exists for parity and correctness.
 The `Device` column of the canonical block catalogue above is the single source
 of truth; this section records the remaining work and the naming exceptions.
 
-Device nodes today: `transform`, `rgb.proc`, `gamut`, `framing`, `lanczos3` (block
-`resize`), `output.convert`, `monitor.output`, `viewport.output`,
+Device nodes today: `transform`, `rgb.proc`, `gamut`, `framing`, `lanczos3`
+(block `resize`), `output.convert`, `monitor.output`, `viewport.output`,
+`output.sharpen` (for the supported USM and undamped RLD sets),
 `thumbnail.output`, `thumbnail.whitebalance`, `thumbnail.scale` and
-`thumbnail.transform` (the last
-two plus their runtime-only packed siblings `thumbnail.scale.u8` and
-`thumbnail.transform.u8`).
+`thumbnail.transform`, plus the runtime-only packed siblings
+`thumbnail.scale.u8` and `thumbnail.transform.u8`.
 
 Partial: `thumbnail.rgb` is a composite. Its two dominant pixel passes are the
 `transform` and `rgb.proc` device nodes, so the block is `partial`; the
 colour-space conversion, film negative, first analysis, dehaze, Fattal tone
-mapping and local adjustments around them stay on the host. The sub-node
-records, the commands and the parity result are in `STAGE_RUNTIME.md`.
+mapping and local adjustments around them stay on the host. `lab.sharpening`
+is partial through the shared `output.sharpen` node; its impulse denoise,
+defringe, ML sharpen edges and ML microcontrast stay on the host.
+`output.sharpen` itself is partial: damped RLD, radii at or above 1.15,
+edges-only, halo control, show-mask and `blurradius >= 0.25` run the host
+builtin. The sub-node records, commands and parity results are in
+`STAGE_RUNTIME.md`.
 
-Still CPU-only: `source.select`, `source.embedded`, `raw.preprocess`,
-`raw.demosaic`, `raw.base`, `analysis`, `local.adjustments`, `lab.tools`,
-`lab.sharpening`, `lab.wavelet`, `working.trc`, `ciecam`, `crop`,
-`output.sharpen`, `output.icc`, `thumbnail.decode` and `thumbnail.lab`.
+Still CPU-only: `raw.preprocess`, `raw.demosaic`, `raw.base`,
+`local.adjustments`, `lab.tools`, `lab.wavelet`, `working.trc`, `ciecam` and
+`thumbnail.lab`.
 
-Three of these are not standalone pixel kernels and need a recorded exception
-rather than a device node: `source.select` and `source.embedded` are I/O, and
-`analysis` produces only histograms. `analysis` is also folded into `raw.base`
-in the preview path, and the crop path folds `raw.preprocess` and
-`raw.demosaic` into `source.select`; those executions have no buffer boundary
-to submit.
+Recorded `n/a` exceptions: `source.select` and `source.embedded` are I/O,
+`analysis` produces only histograms, `output.icc` attaches metadata,
+`thumbnail.decode` is a decode, and `crop` is a row `memcpy` whose device round
+trip is more expensive than the copy until residency lands. `analysis` is also
+folded into `raw.base` in the preview path, and the crop path folds
+`raw.preprocess` and `raw.demosaic` into `source.select`; those executions
+have no buffer boundary to submit.
 
 ## Final integration of the request and device branches
 
