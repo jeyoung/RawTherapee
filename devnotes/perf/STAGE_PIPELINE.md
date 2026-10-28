@@ -46,38 +46,43 @@ implementation:
 Ids are stable. A block that a path does not run is absent from that path's
 spec: `buildPipelineSpec()` returns the rooted subgraph, not the union.
 
-| Id | Domain (export/preview/crop/thumbnail) | Consumer | Reuse | Role |
-|----|----------------------------------------|----------|-------|------|
-| `source.select` | Full/Full/Full/Full | path | recompute | select the frame to process |
-| `source.embedded` | -/-/-/Reduced | interactive | recompute | select the embedded JPEG |
-| `raw.preprocess` | Full/Full/Full/Full | path | reuse-output | raw black/white, hot/dead pixel, CA, flat field |
-| `raw.demosaic` | Full/Full/Full/Full | path | reuse-output | demosaic and capture sharpening |
-| `raw.base` | Full/Full/Roi/Reduced | path | reuse-output | `getImage()`, spot removal, denoise, film negative, Retinex, source-side gamut |
-| `analysis` | Full/Full/Roi/- | path | reuse-output | histogram and auto-exposure analysis |
-| `transform` | Full/Full/Roi/- | path | reuse-input | rotation, distortion, perspective, CA, vignetting, gradient, post-crop vignette, dehaze, Fattal |
-| `local.adjustments` | Full/Full/Roi/Reduced | path | reuse-input | local lab / selective editing |
-| `rgb.proc` | Full/Full/Roi/Reduced | path | reuse-input | RGB curves, tone curve, colour toning, B&W, channel mixer, HSV, film simulation |
-| `lab.tools` | Full/Full/Roi/Reduced | path | reuse-input | shadows/highlights, Lab curves, local contrast, vibrance, EPD, Lab-grid colour toning |
-| `lab.sharpening` | Full/-/Roi/- | path | reuse-input | impulse denoise, defringe, microcontrast, sharpening |
-| `lab.wavelet` | Full/Full/Roi/Reduced | path | reuse-input | directional pyramid equaliser and wavelet |
-| `working.trc` | Full/Full/Roi/- | path | reuse-input | soft light, tone equaliser and working-TRC conversion |
-| `ciecam` | Full/Full/Roi/- | path | reuse-input | CIE CAM 02 |
-| `gamut` | Full/Full/Roi/Reduced | path | reuse-input | working-space gamut compression |
-| `output.convert` | Full/-/-/- | exact | reuse-output | Lab to output RGB and output profile conversion |
-| `crop` | Full/-/-/- | exact | reuse-output | crop |
-| `resize` | Full/-/-/- | exact | reuse-output | resize |
-| `output.sharpen` | Full/-/-/- | exact | reuse-input | post-resize sharpening |
-| `framing` | Full/-/-/- | exact | reuse-output | framing and frame drawing |
-| `output.icc` | Full/-/-/- | exact | recompute | attach output ICC and metadata |
-| `monitor.output` | -/Full/-/- | interactive | recompute | Lab to monitor RGB |
-| `viewport.output` | -/-/Roi/- | interactive | recompute | Lab to monitor RGB for the viewport |
-| `thumbnail.decode` | -/-/-/Reduced | interactive | reuse-output | decode the embedded JPEG |
-| `thumbnail.scale` | -/-/-/Reduced | interactive | reuse-output | scale to thumbnail height |
-| `thumbnail.transform` | -/-/-/Reduced | interactive | reuse-input | coarse rotate and flip |
-| `thumbnail.whitebalance` | -/-/-/Reduced | interactive | reuse-input | apply white balance to the thumbnail |
-| `thumbnail.rgb` | -/-/-/Reduced | interactive | reuse-input | thumbnail RGB processing |
-| `thumbnail.lab` | -/-/-/Reduced | interactive | reuse-input | thumbnail Lab tools, working TRC, CIE CAM and gamut in one pass |
-| `thumbnail.output` | -/-/-/Reduced | interactive | recompute | Lab to 8-bit thumbnail with gamma |
+`Device` states whether the block has a stage-ABI device node today. A block's
+runtime node name can differ from its id; the name is given where it does.
+Device coverage of a composite block covers its dominant pixel pass only, and
+host-side sub-tools are listed with the node record in `STAGE_RUNTIME.md`.
+
+| Id | Domain (export/preview/crop/thumbnail) | Consumer | Reuse | Role | Device |
+|----|----------------------------------------|----------|-------|------|--------|
+| `source.select` | Full/Full/Full/Full | path | recompute | select the frame to process | no |
+| `source.embedded` | -/-/-/Reduced | interactive | recompute | select the embedded JPEG | no |
+| `raw.preprocess` | Full/Full/Full/Full | path | reuse-output | raw black/white, hot/dead pixel, CA, flat field | no |
+| `raw.demosaic` | Full/Full/Full/Full | path | reuse-output | demosaic and capture sharpening | no |
+| `raw.base` | Full/Full/Roi/Reduced | path | reuse-output | `getImage()`, spot removal, denoise, film negative, Retinex, source-side gamut | no |
+| `analysis` | Full/Full/Roi/- | path | reuse-output | histogram and auto-exposure analysis | no |
+| `transform` | Full/Full/Roi/- | path | reuse-input | rotation, distortion, perspective, CA, vignetting, gradient, post-crop vignette, dehaze, Fattal | yes |
+| `local.adjustments` | Full/Full/Roi/Reduced | path | reuse-input | local lab / selective editing | no |
+| `rgb.proc` | Full/Full/Roi/Reduced | path | reuse-input | RGB curves, tone curve, colour toning, B&W, channel mixer, HSV, film simulation | yes |
+| `lab.tools` | Full/Full/Roi/Reduced | path | reuse-input | shadows/highlights, Lab curves, local contrast, vibrance, EPD, Lab-grid colour toning | no |
+| `lab.sharpening` | Full/-/Roi/- | path | reuse-input | impulse denoise, defringe, microcontrast, sharpening | no |
+| `lab.wavelet` | Full/Full/Roi/Reduced | path | reuse-input | directional pyramid equaliser and wavelet | no |
+| `working.trc` | Full/Full/Roi/- | path | reuse-input | soft light, tone equaliser and working-TRC conversion | no |
+| `ciecam` | Full/Full/Roi/- | path | reuse-input | CIE CAM 02 | no |
+| `gamut` | Full/Full/Roi/Reduced | path | reuse-input | working-space gamut compression | no |
+| `output.convert` | Full/-/-/- | exact | reuse-output | Lab to output RGB and output profile conversion | yes |
+| `crop` | Full/-/-/- | exact | reuse-output | crop | no |
+| `resize` | Full/-/-/- | exact | reuse-output | resize (`lanczos3`) | yes |
+| `output.sharpen` | Full/-/-/- | exact | reuse-input | post-resize sharpening | no |
+| `framing` | Full/-/-/- | exact | reuse-output | framing and frame drawing | no |
+| `output.icc` | Full/-/-/- | exact | recompute | attach output ICC and metadata | no |
+| `monitor.output` | -/Full/-/- | interactive | recompute | Lab to monitor RGB | yes |
+| `viewport.output` | -/-/Roi/- | interactive | recompute | Lab to monitor RGB for the viewport | yes |
+| `thumbnail.decode` | -/-/-/Reduced | interactive | reuse-output | decode the embedded JPEG | no |
+| `thumbnail.scale` | -/-/-/Reduced | interactive | reuse-output | scale to thumbnail height | no |
+| `thumbnail.transform` | -/-/-/Reduced | interactive | reuse-input | coarse rotate and flip | yes |
+| `thumbnail.whitebalance` | -/-/-/Reduced | interactive | reuse-input | apply white balance to the thumbnail | yes |
+| `thumbnail.rgb` | -/-/-/Reduced | interactive | reuse-input | thumbnail RGB processing | no |
+| `thumbnail.lab` | -/-/-/Reduced | interactive | reuse-input | thumbnail Lab tools, working TRC, CIE CAM and gamut in one pass | no |
+| `thumbnail.output` | -/-/-/Reduced | interactive | recompute | Lab to 8-bit thumbnail with gamma | yes |
 
 ## Path specifications
 
@@ -1509,15 +1514,28 @@ these are CPU-device measurements, never GPU parity.
 No performance claim is made for the device node on a CPU OpenCL device; the
 device run is slower than the host and exists for parity and correctness.
 
-### Nodes still CPU-only
+### Node device coverage
 
-Everything except `resize`: `source.select`, `source.embedded`,
-`raw.preprocess`, `raw.demosaic`, `raw.base`, `analysis`, `transform`,
-`local.adjustments`, `rgb.proc`, `lab.tools`, `lab.sharpening`, `lab.wavelet`,
-`working.trc`, `ciecam`, `gamut`, `output.convert`, `crop`, `output.sharpen`,
-`framing`, `output.icc`, `monitor.output`, `viewport.output` and the five
-`thumbnail.*` nodes. They have no device implementation yet, so they resolve
-to CPU and keep the host code path.
+The `Device` column of the canonical block catalogue above is the single source
+of truth; this section records the remaining work and the naming exceptions.
+
+Device nodes today: `transform`, `rgb.proc`, `lanczos3` (block `resize`),
+`output.convert`, `monitor.output`, `viewport.output`, `thumbnail.output`,
+`thumbnail.whitebalance` and `thumbnail.transform` (plus its runtime-only
+packed sibling `thumbnail.transform.u8`).
+
+Still CPU-only: `source.select`, `source.embedded`, `raw.preprocess`,
+`raw.demosaic`, `raw.base`, `analysis`, `local.adjustments`, `lab.tools`,
+`lab.sharpening`, `lab.wavelet`, `working.trc`, `ciecam`, `gamut`, `crop`,
+`output.sharpen`, `framing`, `output.icc`, `thumbnail.decode`,
+`thumbnail.scale`, `thumbnail.rgb` and `thumbnail.lab`.
+
+Three of these are not standalone pixel kernels and need a recorded exception
+rather than a device node: `source.select` and `source.embedded` are I/O, and
+`analysis` produces only histograms. `analysis` is also folded into `raw.base`
+in the preview path, and the crop path folds `raw.preprocess` and
+`raw.demosaic` into `source.select`; those executions have no buffer boundary
+to submit.
 
 ## Final integration of the request and device branches
 
