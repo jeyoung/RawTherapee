@@ -653,7 +653,7 @@ enum class BlurType {
     void workingtrc(int sp, Imagefloat* src, Imagefloat* dst, int cw, int ch , int mul, Glib::ustring &profile, double gampos, double slpos, int cat, int &illum, int prim, int locprim, 
         float &rdx, float &rdy, float &grx, float &gry, float &blx, float &bly, float &meanx, float &meany, float &meanxe, float &meanye, float &maxdat, double *p,
         cmsHTRANSFORM &transform, bool normalizeIn = true, bool normalizeOut = true, bool keepTransForm = false, bool gamutcontrol = false,
-        float* probeMeanX = nullptr, float* probeMeanY = nullptr, cmsHPROFILE* outProfile = nullptr, bool setupOnly = false) const;
+        float* probeMeanX = nullptr, float* probeMeanY = nullptr, cmsHPROFILE* outProfile = nullptr, bool setupOnly = false, double* outPrimMatrix = nullptr) const;
     void preserv(LabImage *nprevl, LabImage *provis, int cw, int ch);
 
     bool transCoord(int W, int H, int x, int y, int w, int h, int& xv, int& yv, int& wv, int& hv, double ascaleDef = -1, const LensCorrection *pLCPMap = nullptr) const;

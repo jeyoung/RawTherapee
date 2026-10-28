@@ -1086,7 +1086,7 @@ void rotate_and_scale_primary(float primaries[3][2], float scaling, float rotati
 void ImProcFunctions::workingtrc(int sp, Imagefloat* src, Imagefloat* dst, int cw, int ch, int mul, Glib::ustring &profile, double gampos, double slpos, int cat, int &illum, int prim, int locprim,
                                  float &rdx, float &rdy, float &grx, float &gry, float &blx, float &bly, float &meanx, float &meany, float &meanxe, float &meanye, float &maxdat, double *p,
                                  cmsHTRANSFORM &transform, bool normalizeIn, bool normalizeOut, bool keepTransForm, bool gamutcontrol,
-                                 float* probeMeanX, float* probeMeanY, cmsHPROFILE* outProfile, bool setupOnly) const
+                                 float* probeMeanX, float* probeMeanY, cmsHPROFILE* outProfile, bool setupOnly, double* outPrimMatrix) const
 {
     const TMatrix wprof = ICCStore::getInstance()->workingSpaceMatrix(params->icm.workingProfile);
 
@@ -2145,6 +2145,18 @@ void ImProcFunctions::workingtrc(int sp, Imagefloat* src, Imagefloat* dst, int c
             for (int j = 0; j < 3; ++j) {
                 wprofprim[i][j] = (double) wprofpri[j * 3 + i];
                 //xyz in TMatrix format
+            }
+        }
+
+        // The device gamut control consumes the same RGB -> XYZ matrix the
+        // probe uses. Row-major, nine entries, in double as gamutmap() reads
+        // it, so the caller can upload a single-precision copy without
+        // re-deriving the primaries.
+        if (outPrimMatrix) {
+            for (int i = 0; i < 3; ++i) {
+                for (int j = 0; j < 3; ++j) {
+                    outPrimMatrix[i * 3 + j] = wprofprim[i][j];
+                }
             }
         }
         //White point xy

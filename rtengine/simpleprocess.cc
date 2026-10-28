@@ -48,6 +48,7 @@
 #include "stage/stage_pipeline.h"
 #include "stage/stage_profile.h"
 #include "stage/stage_runtime.h"
+#include "stage/working_trc_context.h"
 #include "utils.h"
 
 #include <cassert>
@@ -2298,133 +2299,57 @@ private:
         procparams::ProcParams& params = job->pparams;
         ImProcFunctions &ipf = * (ipf_p.get());
 
-        ipf.softLight(labView, params.softlight);
+        /*
+         * The device node is opt-in. Its host prefix runs here, before the
+         * submission: lab2rgb() and the fixed sRGB inverse are the block's own
+         * code, so the probe, the profile and the second-pass input are
+         * byte-identical to the CPU block whatever the device compiler does.
+         * With RT_STAGE_OPENCL unset the block below is the pre-node path.
+         */
+        if (stage::node_device("working.trc") == stage::StageNodeDevice::OpenCL) {
+            const bool supported = stage::workingTrcSupported(params);
+            stage::WorkingTrcContext context(params, ipf);
+            RtWorkingTrcContext descriptor = context.descriptor(supported);
 
+            RtStageArg args[6] = {};
+            args[0].kind = RT_STAGE_ARG_BUFFER;
+            args[0].u.buffer = stage::view(*labView);
+            args[1].kind = RT_STAGE_ARG_PTR;
+            args[1].u.ptr = &descriptor;
+            args[2].kind = RT_STAGE_ARG_INT;
+            args[2].u.i = supported ? 1 : 0;
+            args[3].kind = RT_STAGE_ARG_DOUBLE;
+            args[3].u.f = params.icm.wapsat;
 
-        if (params.icm.workingTRC != ColorManagementParams::WorkingTrc::NONE  && params.icm.trcExp) {
-            const int GW = labView->W;
-            const int GH = labView->H;
-            std::unique_ptr<LabImage> provis;
-            const float pres = 0.01f * params.icm.preser;
-            if(params.icm.trcExp) {//local contrast
-                int level_hr = 7;
-                int maxlevpo = 9;
-                bool wavcurvecont = false;
-                WaveletParams WaveParams = params.wavelet;
-                ColorManagementParams Colparams = params.icm;
-                WavOpacityCurveWL icmOpacityCurveWL;
-                Colparams.getCurves(icmOpacityCurveWL);
-                ipf.complete_local_contrast(labView, labView, WaveParams, Colparams, icmOpacityCurveWL, 1, level_hr, maxlevpo, wavcurvecont);
-
-            }
-
-            if (pres > 0.f && params.icm.wprim != ColorManagementParams::Primaries::DEFAULT) {
-                provis.reset(new LabImage(GW, GH));
-                provis->CopyFrom(labView);
-            }
-
-            const std::unique_ptr<Imagefloat> tmpImage1(new Imagefloat(GW, GH));
-
-            ipf.lab2rgb(*labView, *tmpImage1, params.icm.workingProfile);
-
-            const float satu = params.icm.wapsat;
-            // apsatur() needs the pre-TRC image as a reference; keep the copy
-            // only when that pass will actually run.
-            std::unique_ptr<Imagefloat> tmpImage2;
-
-            if (satu > 0.f) {
-                tmpImage2.reset(new Imagefloat(GW, GH));
-                tmpImage1.get()->copyData(tmpImage2.get());
-            }
-
-            const float gamtone = params.icm.wGamma;
-            const float slotone = params.icm.wSlope;
-
-            int illum = toUnderlying(params.icm.will);
-            const int prim = toUnderlying(params.icm.wprim);
-
-            Glib::ustring prof = params.icm.workingProfile;
-
-            cmsHTRANSFORM dummy = nullptr;
-            int ill = 0;
-            bool gamutcontrol = params.icm.gamut;
-            int catc = toUnderlying(params.icm.wcat);
-            int locprim = 0;
-            const int midton = params.icm.wmidtcie;
-            if(midton != 0) {
-                ToneEqualizerParams params;
-                params.enabled = true;
-                params.regularization = 0.f;
-                params.pivot = 0.f;
-                params.bands[0] = 0;
-                params.bands[2] = midton;
-                params.bands[4] = 0;
-                params.bands[5] = 0;
-                int mid = abs(midton);
-                int threshmid = 50;
-                if(mid > threshmid) {
-                    params.bands[1] = sign(midton) * (mid - threshmid);
-                    params.bands[3] = sign(midton) * (mid - threshmid);     
+            bool deviceReady = false;
+            if (supported) {
+                RtWorkingTrcResult setup{};
+                deviceReady = context.prepare(*labView) &&
+                              context.build(setup) == 0;
+                if (deviceReady) {
+                    args[4].kind = RT_STAGE_ARG_BUFFER;
+                    args[4].u.buffer = stage::view(context.xyz());
+                    args[5].kind = RT_STAGE_ARG_BUFFER;
+                    args[5].u.buffer = stage::view(context.linearReference());
                 }
-                ipf.toneEqualizer(tmpImage1.get(), params, prof, 1, false);
             }
-            
-            
-            float rdx, rdy, grx, gry, blx, bly = 0.f;
-            float meanx, meany, meanxe, meanye, maxdat = 0.f;
-            double p[6] = {0., 0., 0., 0., 0., 0.};
+            /*
+             * A residual configuration, or a supported one whose setup the
+             * host had to refuse, is still submitted with the support flag
+             * clear: the launcher refuses it and the builtin runs the host
+             * block, which records impl=host.
+             */
+            descriptor.supported = deviceReady ? 1u : 0u;
 
-            ipf.workingtrc(0, tmpImage1.get(), tmpImage1.get(), GW, GH, -5, prof, 2.4, 12.92310, 0, ill, 0, 0, rdx, rdy, grx, gry, blx, bly, meanx, meany, meanxe, meanye, maxdat, p, dummy, true, false, false, false);
-            ipf.workingtrc(0, tmpImage1.get(), tmpImage1.get(), GW, GH, 5, prof, gamtone, slotone, catc, illum, prim, locprim, rdx, rdy, grx, gry, blx, bly, meanx, meany, meanxe, meanye, maxdat,  p, dummy, false, true, true, gamutcontrol);
-
-            if(satu > 0.f) {
-                assert(tmpImage2);
-                ipf.apsatur(0, tmpImage1.get(), tmpImage2.get(), GW, GH, satu) ;
-            }
-
-            const float smoothisli = params.icm.wsmoothciesli;
-
-            if(smoothisli > 0.f) {
-                ToneEqualizerParams params;
-                params.enabled = true;
-                params.regularization = 0.f;
-                params.pivot = 0.f;
-                params.bands[0] = 0;
-                params.bands[1] = 0;
-                params.bands[2] = 0;
-                params.bands[3] = 0;
-                params.bands[4] = -40;//arbitrary value to adapt with WhiteEvjz - here White Ev # 10
-                params.bands[5] = -80;//8 Ev and above
-                bool Evsix = true;
-                if(Evsix) {//EV = 6 majority of images
-                    params.bands[4] = -30 * smoothisli;
-                    float smmothsli5 = std::min(smoothisli, 1.f);
-                    params.bands[5] = -80 * smmothsli5;                    
-                }
-                
-                ipf.toneEqualizer(tmpImage1.get(), params, prof, 1, false);
-            }
-
-            ipf.rgb2lab(*tmpImage1, *labView, params.icm.workingProfile);
-
-            // labView and provis
-            if (provis) {
-                ipf.preserv(labView, provis.get(), GW, GH);
-            }
-
-            if (params.icm.fbw) {
-#ifdef _OPENMP
-                #pragma omp parallel for
-#endif
-
-                for (int x = 0; x < GH; x++)
-                    for (int y = 0; y < GW; y++) {
-                        labView->a[x][y] = 0.f;
-                        labView->b[x][y] = 0.f;
-                    }
+            RtStageProfiling profiling{};
+            if (stage::run("working.trc",
+                           std::vector<RtStageArg>(args, args + 6),
+                           &profiling) == RT_STAGE_OK) {
+                return;
             }
         }
 
+        stage::workingTrcHostBlock(ipf, params, *labView);
     }
 
     /*

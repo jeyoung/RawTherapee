@@ -136,6 +136,7 @@ set(RTENGINESOURCEFILES
     stage/stage_runtime.cc
     stage/stage_store.cc
     stage/stage_work.cc
+    stage/working_trc_context.cc
     svgrender.cc
     tmo_fattal02.cc
     utils.cc

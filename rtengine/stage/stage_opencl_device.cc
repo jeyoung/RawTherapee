@@ -47,6 +47,7 @@
 #include <glibmm/error.h>
 #include <glibmm/module.h>
 
+#include "color.h"
 #include "rt_math.h"
 #include "sleef.h"
 #include "stage/algorithms/gamut_cl.h"
@@ -54,6 +55,8 @@
 #include "stage/algorithms/rgb_proc_cl.h"
 #include "stage/algorithms/sharpen_cl.h"
 #include "stage/algorithms/transform_cl.h"
+#include "stage/algorithms/working_trc_cl.h"
+#include "stage/working_trc_context.h"
 #include "transformmap.h"
 
 /*
@@ -739,6 +742,21 @@ __kernel void rt_lab_to_float(__global const float* src,
     return source;
 }
 
+/*
+ * The working.trc program: four entries sharing one source because the second
+ * pass consumes the first pass's device buffer and the probe runs on the host
+ * between them. RT_LAB_TO_RGB_CL supplies rt_lab_to_linear() and
+ * rt_gamma_lookup(); the node-specific arithmetic is in working_trc_cl.h.
+ */
+const std::string& working_trc_source()
+{
+    static const std::string source =
+        std::string("#pragma OPENCL FP_CONTRACT OFF\n"
+                    "#pragma STDC FP_CONTRACT OFF\n") +
+        RT_LAB_TO_RGB_CL + RT_WORKING_TRC_CL;
+    return source;
+}
+
 const std::string& lab_to_u8_source()
 {
     static const std::string source =
@@ -1171,6 +1189,7 @@ const std::vector<KernelDef>& kernels()
         {"thumbnail.output", lab_to_u8_source().c_str(), "rt_lab_to_u8"},
         {"rgb.proc", rgb_proc_source().c_str(), "rt_rgb_proc"},
         {"gamut", RT_GAMUT_CL, "rt_gamut"},
+        {"working.trc", working_trc_source().c_str(), "rt_working_trc_second"},
         {"output.sharpen", RT_SHARPEN_CL, "rt_sharpen_mask"},
         {"framing", framing_source().c_str(), "rt_framing"},
         {"thumbnail.whitebalance", thumbnail_wb_source().c_str(), "rt_thumbnail_wb"},
@@ -1788,8 +1807,16 @@ cl_kernel compiled_kernel_entry(const std::shared_ptr<OpenCLEnv>& env,
         return nullptr;
     }
 
-    build_error = env->api->BuildProgram(program, 1, &env->device, nullptr,
-                                         nullptr, nullptr);
+    /* The first pass divides every Lab sample by 327.68 and the host uses
+     * correctly rounded IEEE division. Without this option OpenCL may lower
+     * float division to a reciprocal approximation, which shifts the probe
+     * means and the whole profile. */
+    const char* build_options =
+        std::strcmp(def->name, "working.trc") == 0
+            ? "-cl-fp32-correctly-rounded-divide-sqrt"
+            : nullptr;
+    build_error = env->api->BuildProgram(program, 1, &env->device,
+                                         build_options, nullptr, nullptr);
     if (build_error != CL_SUCCESS) {
         std::size_t log_size = 0;
         env->api->GetProgramBuildInfo(program, env->device, CL_PROGRAM_BUILD_LOG,
@@ -2794,6 +2821,421 @@ RtStageStatus run_gamut(const std::shared_ptr<OpenCLEnv>& env,
     if (residency->readback(image, lab) != RT_STAGE_OK) {
         error = "gamut readback failed";
         return RT_STAGE_ERROR;
+    }
+
+    return RT_STAGE_OK;
+}
+
+
+/*
+ * The working.trc node. Argument order:
+ *   [0] Lab three-plane F32 buffer, read and written in place,
+ *   [1] PTR host context (RtWorkingTrcContext), host-only,
+ *   [2] int supported (1 when the call site admits the configuration),
+ *   [3] double saturation (icm.wapsat),
+ *   [4] int gamut control (1 when icm.gamut is set).
+ *
+ * The node runs the default configuration only: pass 1 writes the first-pass
+ * RGB to a device scratch, the host reads it back once to run the colour probe
+ * and build the matrix-shaper preset, then pass 2 consumes the same device
+ * buffer. The Lab buffer is read back only after every pass succeeded, so a
+ * refusal leaves the host image untouched for the builtin.
+ *
+ * A zero `supported` value refuses before the upload: that is the residual
+ * path, and it makes the CPU builtin - the original host block - execute and
+ * record impl=host. The per-pixel arguments are checked here; the context is
+ * not consulted for them.
+ */
+RtStageStatus run_working_trc(const std::shared_ptr<OpenCLEnv>& env,
+                              const std::shared_ptr<OpenCLResidency>& residency,
+                              const std::vector<RtStageArg>& args,
+                              std::string& error)
+{
+    constexpr std::size_t ARG_COUNT = 6;
+    if (args.size() != ARG_COUNT) {
+        error = "working.trc expects three buffers, a context and a scalar";
+        return RT_STAGE_INVALID;
+    }
+    if (args[0].kind != RT_STAGE_ARG_BUFFER ||
+        args[1].kind != RT_STAGE_ARG_PTR ||
+        args[2].kind != RT_STAGE_ARG_INT ||
+        args[3].kind != RT_STAGE_ARG_DOUBLE) {
+        error = "working.trc has an argument of the wrong kind";
+        return RT_STAGE_INVALID;
+    }
+
+    const RtStageBuffer& lab = args[0].u.buffer;
+    if (!valid(lab) || lab.format != RT_STAGE_F32 || lab.planes != 3) {
+        error = "working.trc needs a three-plane F32 Lab buffer";
+        return RT_STAGE_INVALID;
+    }
+
+    const auto* context =
+        static_cast<const RtWorkingTrcContext*>(args[1].u.ptr);
+    if (context == nullptr || context->size != sizeof(RtWorkingTrcContext) ||
+        context->version != RT_WORKING_TRC_CONTEXT_VERSION ||
+        context->magic != RT_WORKING_TRC_CONTEXT_MAGIC ||
+        context->build == nullptr) {
+        error = "working.trc has an invalid host context";
+        return RT_STAGE_INVALID;
+    }
+
+    const std::int64_t supported = args[2].u.i;
+    if (supported != 0 && supported != 1) {
+        error = "working.trc support flag must be 0 or 1";
+        return RT_STAGE_INVALID;
+    }
+    if (supported == 0) {
+        error = "working.trc residual configuration";
+        return RT_STAGE_FALLBACK;
+    }
+
+    const double saturation_double = args[3].u.f;
+    if (!std::isfinite(saturation_double) || saturation_double < 0.0 ||
+        saturation_double > 1.0) {
+        error = "working.trc saturation is outside 0..1";
+        return RT_STAGE_INVALID;
+    }
+    if (args[4].kind != RT_STAGE_ARG_BUFFER ||
+        args[5].kind != RT_STAGE_ARG_BUFFER) {
+        error = "working.trc has a pass-2 argument of the wrong kind";
+        return RT_STAGE_INVALID;
+    }
+    const RtStageBuffer& xyz = args[4].u.buffer;
+    const RtStageBuffer& linear = args[5].u.buffer;
+    const StageBufferShape image_shape{RT_STAGE_F32, lab.width, lab.height, 3};
+    for (const RtStageBuffer* buffer : {&xyz, &linear}) {
+        if (!valid(*buffer) || buffer->format != RT_STAGE_F32 ||
+            buffer->planes != 3 || buffer->width != lab.width ||
+            buffer->height != lab.height) {
+            error = "working.trc needs second-pass and linear RGB buffers";
+            return RT_STAGE_INVALID;
+        }
+    }
+
+    const KernelDef* def = find_kernel("working.trc");
+    assert(def != nullptr);
+    cl_kernel second_kernel =
+        compiled_kernel_entry(env, def, "rt_working_trc_second", error);
+    cl_kernel apsatur_kernel =
+        compiled_kernel_entry(env, def, "rt_working_trc_apsatur", error);
+    cl_kernel lab_kernel =
+        compiled_kernel_entry(env, def, "rt_working_trc_lab", error);
+    if (second_kernel == nullptr || apsatur_kernel == nullptr ||
+        lab_kernel == nullptr) {
+        return RT_STAGE_FALLBACK;
+    }
+
+    const int width = lab.width;
+    const int height = lab.height;
+
+    StageDeviceBufferPtr lab_device =
+        residency->acquire(lab.data, image_shape, &error);
+    StageDeviceBufferPtr xyz_device =
+        residency->acquire(xyz.data, image_shape, &error);
+    StageDeviceBufferPtr linear_device =
+        residency->acquire(linear.data, image_shape, &error);
+    char post_key = 0;
+    StageDeviceBufferPtr post =
+        residency->acquire(&post_key, image_shape, &error);
+    if (!lab_device || !xyz_device || !linear_device || !post) {
+        return RT_STAGE_FALLBACK;
+    }
+
+    if (residency->upload(lab_device, lab) != RT_STAGE_OK ||
+        residency->upload(xyz_device, xyz) != RT_STAGE_OK ||
+        residency->upload(linear_device, linear) != RT_STAGE_OK) {
+        error = "working.trc input upload failed";
+        return RT_STAGE_FALLBACK;
+    }
+
+    auto memory_of = [](const StageDeviceBufferPtr& buffer) {
+        auto device = std::dynamic_pointer_cast<OpenCLDeviceBuffer>(buffer);
+        return device != nullptr ? device->memory() : nullptr;
+    };
+    const auto pitch_of = [](const StageDeviceBufferPtr& buffer) {
+        return buffer->row_pitch() / sizeof(float);
+    };
+    const auto plane_pitch_of = [](const StageDeviceBufferPtr& buffer) {
+        return buffer->plane_pitch() / sizeof(float);
+    };
+
+    const StageDeviceBufferPtr buffers[] = {lab_device, xyz_device,
+                                           linear_device, post};
+    for (const StageDeviceBufferPtr& buffer : buffers) {
+        if (buffer->row_pitch() % sizeof(float) != 0 ||
+            buffer->plane_pitch() % sizeof(float) != 0 ||
+            pitch_of(buffer) < static_cast<std::size_t>(width) ||
+            plane_pitch_of(buffer) < static_cast<std::size_t>(height) *
+                                           pitch_of(buffer)) {
+            error = "working.trc row or plane pitch does not cover the image";
+            return RT_STAGE_FALLBACK;
+        }
+    }
+    /* The two RGB inputs and the post scratch have one layout. */
+    if (pitch_of(linear_device) != pitch_of(post) ||
+        plane_pitch_of(linear_device) != plane_pitch_of(post)) {
+        error = "working.trc RGB buffers have different pitches";
+        return RT_STAGE_FALLBACK;
+    }
+
+    const std::int64_t lab_pitch =
+        static_cast<std::int64_t>(pitch_of(lab_device));
+    const std::int64_t lab_plane_pitch =
+        static_cast<std::int64_t>(plane_pitch_of(lab_device));
+    const std::int64_t xyz_pitch =
+        static_cast<std::int64_t>(pitch_of(xyz_device));
+    const std::int64_t xyz_plane_pitch =
+        static_cast<std::int64_t>(plane_pitch_of(xyz_device));
+    const std::int64_t rgb_pitch =
+        static_cast<std::int64_t>(pitch_of(post));
+    const std::int64_t rgb_plane_pitch =
+        static_cast<std::int64_t>(plane_pitch_of(post));
+    if (lab_pitch > std::numeric_limits<cl_int>::max() / 3 ||
+        lab_plane_pitch > std::numeric_limits<cl_int>::max() / 3 ||
+        xyz_pitch > std::numeric_limits<cl_int>::max() / 3 ||
+        xyz_plane_pitch > std::numeric_limits<cl_int>::max() / 3 ||
+        rgb_pitch > std::numeric_limits<cl_int>::max() / 3 ||
+        rgb_plane_pitch > std::numeric_limits<cl_int>::max() / 3) {
+        error = "working.trc plane pitch does not fit the kernel's int";
+        return RT_STAGE_FALLBACK;
+    }
+
+    RtWorkingTrcResult setup{};
+    if (context->build(context->self, &setup) != 0 ||
+        setup.toxyz == nullptr || setup.matrix == nullptr ||
+        setup.gamma == nullptr || setup.curve == nullptr) {
+        error = "working.trc setup did not build the output profile";
+        return RT_STAGE_FALLBACK;
+    }
+
+    for (const float* table : {setup.toxyz, setup.matrix}) {
+        for (int entry = 0; entry < 9; ++entry) {
+            if (!std::isfinite(table[entry])) {
+                error = "working.trc setup produced a non-finite matrix";
+                return RT_STAGE_FALLBACK;
+            }
+        }
+    }
+    if (!std::isfinite(setup.gamma[0]) ||
+        !std::isfinite(setup.gamma[RT_WORKING_TRC_GAMMA_ENTRIES - 1])) {
+        error = "working.trc setup produced a non-finite gamma table";
+        return RT_STAGE_FALLBACK;
+    }
+
+    RtStageBuffer toxyz_host{};
+    toxyz_host.size = sizeof(RtStageBuffer);
+    toxyz_host.data = const_cast<float*>(setup.toxyz);
+    toxyz_host.width = 9;
+    toxyz_host.height = 1;
+    toxyz_host.row_pitch = 9 * sizeof(float);
+    toxyz_host.plane_pitch = toxyz_host.row_pitch;
+    toxyz_host.planes = 1;
+    toxyz_host.format = RT_STAGE_F32;
+    toxyz_host.flags = RT_STAGE_BUFFER_READ;
+
+    RtStageBuffer matrix_host = toxyz_host;
+    matrix_host.data = const_cast<float*>(setup.matrix);
+
+    RtStageBuffer gamma_host{};
+    gamma_host.size = sizeof(RtStageBuffer);
+    gamma_host.data = const_cast<float*>(setup.gamma);
+    gamma_host.width = RT_WORKING_TRC_GAMMA_ENTRIES;
+    gamma_host.height = 1;
+    gamma_host.row_pitch = RT_WORKING_TRC_GAMMA_ENTRIES * sizeof(float);
+    gamma_host.plane_pitch = gamma_host.row_pitch;
+    gamma_host.planes = 1;
+    gamma_host.format = RT_STAGE_F32;
+    gamma_host.flags = RT_STAGE_BUFFER_READ;
+
+    RtStageBuffer curve_host{};
+    curve_host.size = sizeof(RtStageBuffer);
+    curve_host.data = const_cast<float*>(setup.curve);
+    curve_host.width = 8;
+    curve_host.height = 1;
+    curve_host.row_pitch = 8 * sizeof(float);
+    curve_host.plane_pitch = curve_host.row_pitch;
+    curve_host.planes = 1;
+    curve_host.format = RT_STAGE_F32;
+    curve_host.flags = RT_STAGE_BUFFER_READ;
+
+    /* The host's Lab caches: the same 65536 samples Color::XYZ2Lab reads. */
+    std::vector<float> cachef_lut(RT_WORKING_TRC_GAMMA_ENTRIES);
+    std::vector<float> cachefy_lut(RT_WORKING_TRC_GAMMA_ENTRIES);
+    for (std::size_t i = 0; i < cachef_lut.size(); ++i) {
+        cachef_lut[i] = Color::cachef[static_cast<int>(i)];
+        cachefy_lut[i] = Color::cachefy[static_cast<int>(i)];
+    }
+    RtStageBuffer cachef_host = gamma_host;
+    cachef_host.data = cachef_lut.data();
+    RtStageBuffer cachefy_host = gamma_host;
+    cachefy_host.data = cachefy_lut.data();
+
+    const StageBufferShape matrix_shape{RT_STAGE_F32, 9, 1, 1};
+    const StageBufferShape curve_shape{RT_STAGE_F32, 8, 1, 1};
+    const StageBufferShape gamma_shape{
+        RT_STAGE_F32, static_cast<std::int32_t>(RT_WORKING_TRC_GAMMA_ENTRIES),
+        1, 1};
+    char toxyz_key = 0;
+    char matrix_key = 0;
+    char gamma_key = 0;
+    char curve_key = 0;
+    char cachef_key = 0;
+    char cachefy_key = 0;
+    StageDeviceBufferPtr toxyz_device =
+        residency->acquire(&toxyz_key, matrix_shape, &error);
+    StageDeviceBufferPtr matrix_device =
+        residency->acquire(&matrix_key, matrix_shape, &error);
+    StageDeviceBufferPtr gamma_device =
+        residency->acquire(&gamma_key, gamma_shape, &error);
+    StageDeviceBufferPtr curve_device =
+        residency->acquire(&curve_key, curve_shape, &error);
+    StageDeviceBufferPtr cachef_device =
+        residency->acquire(&cachef_key, gamma_shape, &error);
+    StageDeviceBufferPtr cachefy_device =
+        residency->acquire(&cachefy_key, gamma_shape, &error);
+    if (!toxyz_device || !matrix_device || !gamma_device ||
+        !curve_device || !cachef_device || !cachefy_device ||
+        residency->upload(toxyz_device, toxyz_host) != RT_STAGE_OK ||
+        residency->upload(matrix_device, matrix_host) != RT_STAGE_OK ||
+        residency->upload(gamma_device, gamma_host) != RT_STAGE_OK ||
+        residency->upload(curve_device, curve_host) != RT_STAGE_OK ||
+        residency->upload(cachef_device, cachef_host) != RT_STAGE_OK ||
+        residency->upload(cachefy_device, cachefy_host) != RT_STAGE_OK) {
+        error = "working.trc setup table upload failed";
+        return RT_STAGE_FALLBACK;
+    }
+
+    const auto set_arg = [&](cl_kernel kernel, cl_uint index, std::size_t bytes,
+                             const void* value) {
+        return env->api->SetKernelArg(kernel, index, bytes, value) == CL_SUCCESS;
+    };
+    const auto launch = [&](cl_kernel kernel, const char* label) {
+        const std::size_t global[2] = {static_cast<std::size_t>(width),
+                                       static_cast<std::size_t>(height)};
+        cl_event done = nullptr;
+        if (env->api->EnqueueNDRangeKernel(env->queue, kernel, 2, nullptr,
+                                           global, nullptr, 0, nullptr,
+                                           &done) != CL_SUCCESS ||
+            done == nullptr) {
+            error = std::string(label) + " launch failed";
+            return false;
+        }
+        const cl_int wait_status = env->api->WaitForEvents(1, &done);
+        env->api->ReleaseEvent(done);
+        if (wait_status != CL_SUCCESS) {
+            error = std::string(label) + " did not complete";
+            return false;
+        }
+        return true;
+    };
+
+    const cl_float saturation = static_cast<cl_float>(saturation_double);
+
+    {
+        std::lock_guard<std::recursive_mutex> lock(env->queue_mutex);
+
+        cl_mem xyz_memory = memory_of(xyz_device);
+        cl_mem linear_memory = memory_of(linear_device);
+        cl_mem post_memory = memory_of(post);
+        cl_mem toxyz_memory = memory_of(toxyz_device);
+        cl_mem matrix_memory = memory_of(matrix_device);
+        cl_mem gamma_memory = memory_of(gamma_device);
+        cl_mem curve_memory = memory_of(curve_device);
+        cl_mem cachef_memory = memory_of(cachef_device);
+        cl_mem cachefy_memory = memory_of(cachefy_device);
+        cl_mem lab_memory = memory_of(lab_device);
+        if (xyz_memory == nullptr || linear_memory == nullptr ||
+            post_memory == nullptr || toxyz_memory == nullptr ||
+            matrix_memory == nullptr ||
+            gamma_memory == nullptr || curve_memory == nullptr ||
+            cachef_memory == nullptr || cachefy_memory == nullptr ||
+            lab_memory == nullptr) {
+            error = "working.trc could not address its device buffers";
+            return RT_STAGE_FALLBACK;
+        }
+
+        const cl_int cl_width = width;
+        const cl_int cl_height = height;
+        const cl_int cl_lab_pitch = static_cast<cl_int>(lab_pitch);
+        const cl_int cl_lab_plane = static_cast<cl_int>(lab_plane_pitch);
+        const cl_int cl_xyz_pitch = static_cast<cl_int>(xyz_pitch);
+        const cl_int cl_xyz_plane = static_cast<cl_int>(xyz_plane_pitch);
+        const cl_int cl_rgb_pitch = static_cast<cl_int>(rgb_pitch);
+        const cl_int cl_rgb_plane = static_cast<cl_int>(rgb_plane_pitch);
+
+        cl_uint arg = 0;
+        bool ok = true;
+        ok = ok && set_arg(second_kernel, arg++, sizeof(cl_mem), &xyz_memory);
+        ok = ok && set_arg(second_kernel, arg++, sizeof(cl_mem), &post_memory);
+        ok = ok && set_arg(second_kernel, arg++, sizeof(cl_mem), &matrix_memory);
+        ok = ok && set_arg(second_kernel, arg++, sizeof(cl_mem), &gamma_memory);
+        ok = ok && set_arg(second_kernel, arg++, sizeof(cl_mem), &curve_memory);
+        ok = ok && set_arg(second_kernel, arg++, sizeof(cl_int), &cl_width);
+        ok = ok && set_arg(second_kernel, arg++, sizeof(cl_int), &cl_height);
+        ok = ok && set_arg(second_kernel, arg++, sizeof(cl_int), &cl_xyz_pitch);
+        ok = ok && set_arg(second_kernel, arg++, sizeof(cl_int), &cl_xyz_plane);
+        ok = ok && set_arg(second_kernel, arg++, sizeof(cl_int), &cl_rgb_pitch);
+        ok = ok &&
+             set_arg(second_kernel, arg++, sizeof(cl_int), &cl_rgb_plane);
+        if (!ok) {
+            error = "working.trc second-pass clSetKernelArg failed";
+            return RT_STAGE_FALLBACK;
+        }
+        if (!launch(second_kernel, "working.trc second pass")) {
+            return RT_STAGE_FALLBACK;
+        }
+
+        if (saturation_double > 0.0) {
+            arg = 0;
+            ok = true;
+            ok = ok &&
+                 set_arg(apsatur_kernel, arg++, sizeof(cl_mem), &linear_memory);
+            ok = ok &&
+                 set_arg(apsatur_kernel, arg++, sizeof(cl_mem), &post_memory);
+            ok = ok && set_arg(apsatur_kernel, arg++, sizeof(cl_mem), &toxyz_memory);
+            ok = ok &&
+                 set_arg(apsatur_kernel, arg++, sizeof(cl_float), &saturation);
+            ok = ok && set_arg(apsatur_kernel, arg++, sizeof(cl_int), &cl_width);
+            ok = ok && set_arg(apsatur_kernel, arg++, sizeof(cl_int), &cl_height);
+            ok = ok &&
+                 set_arg(apsatur_kernel, arg++, sizeof(cl_int), &cl_rgb_pitch);
+            ok = ok &&
+                 set_arg(apsatur_kernel, arg++, sizeof(cl_int), &cl_rgb_plane);
+            if (!ok) {
+                error = "working.trc saturation clSetKernelArg failed";
+                return RT_STAGE_FALLBACK;
+            }
+            if (!launch(apsatur_kernel, "working.trc saturation")) {
+                return RT_STAGE_FALLBACK;
+            }
+        }
+
+        arg = 0;
+        ok = true;
+        ok = ok && set_arg(lab_kernel, arg++, sizeof(cl_mem), &post_memory);
+        ok = ok && set_arg(lab_kernel, arg++, sizeof(cl_mem), &lab_memory);
+        ok = ok && set_arg(lab_kernel, arg++, sizeof(cl_mem), &toxyz_memory);
+        ok = ok && set_arg(lab_kernel, arg++, sizeof(cl_mem), &cachef_memory);
+        ok = ok && set_arg(lab_kernel, arg++, sizeof(cl_mem), &cachefy_memory);
+        ok = ok && set_arg(lab_kernel, arg++, sizeof(cl_int), &cl_width);
+        ok = ok && set_arg(lab_kernel, arg++, sizeof(cl_int), &cl_height);
+        ok = ok && set_arg(lab_kernel, arg++, sizeof(cl_int), &cl_rgb_pitch);
+        ok = ok && set_arg(lab_kernel, arg++, sizeof(cl_int), &cl_rgb_plane);
+        ok = ok && set_arg(lab_kernel, arg++, sizeof(cl_int), &cl_lab_pitch);
+        ok = ok && set_arg(lab_kernel, arg++, sizeof(cl_int), &cl_lab_plane);
+        if (!ok) {
+            error = "working.trc Lab clSetKernelArg failed";
+            return RT_STAGE_FALLBACK;
+        }
+        if (!launch(lab_kernel, "working.trc Lab pass")) {
+            return RT_STAGE_FALLBACK;
+        }
+    }
+
+    if (residency->readback(lab_device, lab) != RT_STAGE_OK) {
+        error = "working.trc Lab readback failed";
+        return RT_STAGE_FALLBACK;
     }
 
     return RT_STAGE_OK;
@@ -4316,6 +4758,20 @@ public:
         } else if (request.name == "gamut") {
             const RtStageStatus status =
                 run_gamut(env_, residency_, request.args, error);
+            if (status == RT_STAGE_OK) {
+                StageEvent done;
+                done.status = StageEventStatus::Complete;
+                done.result = RT_STAGE_OK;
+                done.device = StageDeviceType::OPENCL;
+                done.asynchronous = false;
+                return done;
+            }
+            StageEvent fallback = StageQueue::submit(request, profiling);
+            fallback.note = error;
+            return fallback;
+        } else if (request.name == "working.trc") {
+            const RtStageStatus status =
+                run_working_trc(env_, residency_, request.args, error);
             if (status == RT_STAGE_OK) {
                 StageEvent done;
                 done.status = StageEventStatus::Complete;
