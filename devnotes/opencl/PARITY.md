@@ -86,8 +86,9 @@ Notes:
 
 ## Stage device residency
 
-The graph device path runs the `lanczos3` resize node and the `transform`
-rotation/scale node. Device runs use
+The graph device path runs `lanczos3` (resize), `transform` (rotation/scale)
+and the Lab-to-RGB family (`output.convert` on export; `monitor.output`,
+`viewport.output` and `thumbnail.output` on the interactive paths). Device runs use
 `RT_OPENCL_ALLOW_CPU=1` and an ICD directory that contains only `pocl.icd`
 (`OCL_ICD_VENDORS`), so the selected device is POCL's CPU device
 (`cpu-ivybridge-Intel(R) Core(TM) i7-3770 CPU @ 3.40GHz`). These are
@@ -125,14 +126,20 @@ peak absolute error is zero for the synthetic node tests:
   error of 1 LSB16 on 384 601 of 10 139 424 pixels (3.8%), the same order as
   the classic GPU path. The interpolation helpers and the map builder are
   shared with the classic backend, so only the addressing differs.
+- `output.convert` through the device, against the `--gpu=off` reference, has a
+  peak error of 1 LSB16 on 385 525 of 10 139 424 pixels (3.8%). The packed
+  8-bit nodes are not reachable from the CLI; `stage-residency-test` compares
+  the kernel byte for byte with an independent reference on a synthetic Lab
+  image, and scaling the device matrix by 1.001 makes it fail.
 - `tools/opencl/verify.sh --stage-device`, which `--quick` also runs, asserts
-  both records and their parity in one step:
+  each record and its parity in one step:
 
   ```bash
   RT_BUILD_DIR=... RT_OPENCL_ALLOW_CPU=1 OCL_ICD_VENDORS=<pocl-only> \
       tools/opencl/verify.sh --stage-device
   # PASS  pef/stage-device-resize     max_pae=1.5259e-05
   # PASS  pef/stage-device-transform  max_pae=1.5259e-05
+  # PASS  pef/stage-device-output     max_pae=1.5259e-05
   ```
 - The preview sweep (16 states, 32 images) and the crop harness (30 PPM files)
   are identical with the switch off and on, but neither graph runs a stage-ABI

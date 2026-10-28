@@ -134,7 +134,9 @@ node ran on the device rather than only comparing pixels.
 | Resize, POCL CPU, `RT_STAGE_OPENCL=1`, preference on | PASS, `max_pae=1.5259e-05` (1 LSB at 16-bit) |
 | Transform (rotate 5 degrees) | PASS, `max_pae=1.5259e-05` |
 | Transform identity, device | exact, and fails when `sint` is mutated to 0.05 |
-| Device records | `"stage":"lanczos3"` and `"stage":"transform"`, both `impl":"opencl"`, `source":"opencl"`; the classic log has no `opencl resize` or `opencl transform` line |
+| Output conversion (neutral) | PASS, `max_pae=1.5259e-05` |
+| Packed 8-bit Lab to RGB | byte-exact against an independent reference, and fails when the device matrix is scaled by 1.001 |
+| Device records | `"stage":"lanczos3"`, `"stage":"transform"` and `"stage":"output.convert"`, all `impl":"opencl"`, `source":"opencl"`; the classic log has no `opencl resize`, `opencl transform` or `opencl lab2srgb` line |
 | Forced refusal (`RT_STAGE_DEVICE_BUDGET_MB=16`, `RT_REQUIRE_GPU=1`) | FAIL with `impl":"host","source":"device-fallback"` |
 | No device selected (no `RT_OPENCL_ALLOW_CPU`) | SKIP |
 | `RT_STAGE_OPENCL` unset | classic backend logs `opencl resize`, no stage record; default path unchanged |
@@ -164,8 +166,10 @@ identity transform, whose assertion was mutation-checked.
 - The stage device runs before the classic backend when `RT_STAGE_OPENCL`
   selects the node; the default order is unchanged.
 - The transform node and the classic path share one map builder and one set of
-  sampling helpers. The classic resize and rotate exports are byte-identical to
-  the pre-change package (0 LSB), so the refactor changed no pixels.
+  sampling helpers; the Lab-to-RGB family shares one arithmetic fragment with
+  the classic kernel. The classic resize, rotate and neutral exports are
+  byte-identical to the pre-change package (0 LSB), so the refactors changed no
+  pixels.
 - The shared kernel fragment is a namespace-scope constant, not a macro: GCC 12,
   the portable baseline, rejects a multi-line raw string inside a `#define` while
   the host compiler accepts it. The portable build found this; the host build

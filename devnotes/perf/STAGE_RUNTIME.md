@@ -173,6 +173,28 @@ Evidence: the identity geometry is pixel-exact on the device
 and a rotation export matches the CPU reference within 1 LSB at 16-bit on 3.8%
 of pixels; both are in `devnotes/opencl/PARITY.md`.
 
+## Lab-to-RGB family
+
+`output.convert` (float output), `monitor.output` (preview), `viewport.output`
+(crop) and `thumbnail.output` share one wrapper. The arguments are the Lab
+source buffer, the destination buffer, the 16-bit gamma LUT (65 536 F32
+samples) and the nine-entry matrix. The source may be a sub-rectangle view of
+the parent Lab image: the pitches stay the parent's, so the kernel reads the
+ROI without a host copy.
+
+The arithmetic is shared with the classic kernel through
+`rtengine/stage/algorithms/lab_to_rgb_cl.h`. The matrix and the LUT come from
+the ICC profile the classic backend already builds, so the node runs inside the
+same gated block and takes precedence there; if the classic backend is disabled
+the profile is not built and the nodes fall back with it, which is the same
+limitation as the other device nodes.
+
+`lab2monitorRgb()` takes the node name, so the preview, crop and thumbnail
+paths request `monitor.output`, `viewport.output` and `thumbnail.output`
+respectively. Only the export node is reachable from the CLI; the packed 8-bit
+output is covered by a reference test in `stage-residency-test`, which shares
+no code with the kernel.
+
 ## Pilot stage
 
 `lanczos3` is the pilot. The arithmetic lives in
