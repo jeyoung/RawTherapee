@@ -30,6 +30,7 @@
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <string>
@@ -48,6 +49,7 @@
 
 #include "rt_math.h"
 #include "sleef.h"
+#include "stage/algorithms/gamut_cl.h"
 #include "stage/algorithms/lab_to_rgb_cl.h"
 #include "stage/algorithms/rgb_proc_cl.h"
 #include "stage/algorithms/transform_cl.h"
@@ -1167,6 +1169,7 @@ const std::vector<KernelDef>& kernels()
         {"viewport.output", lab_to_u8_source().c_str(), "rt_lab_to_u8"},
         {"thumbnail.output", lab_to_u8_source().c_str(), "rt_lab_to_u8"},
         {"rgb.proc", rgb_proc_source().c_str(), "rt_rgb_proc"},
+        {"gamut", RT_GAMUT_CL, "rt_gamut"},
         {"framing", framing_source().c_str(), "rt_framing"},
         {"thumbnail.whitebalance", thumbnail_wb_source().c_str(), "rt_thumbnail_wb"},
         {"thumbnail.transform", thumbnail_permute_source().c_str(), "rt_thumbnail_permute"},
@@ -2568,6 +2571,221 @@ RtStageStatus run_rgb_proc(const std::shared_ptr<OpenCLEnv>& env,
 }
 
 /*
+ * End-of-process gamut. Argument order:
+ *   [0] Lab three-plane F32 buffer, read and written in place,
+ *   [1] wip, [2] wp, [3] to_out, [4] from_out: four 9-entry F32 matrices,
+ *   [5] double gain (2^EV), [6] double power, [7] int compress.
+ *
+ * The matrices are derived on the host in double from the same helpers and in
+ * the same order as ImProcFunctions::gamutcompr() for beginend == 1; see
+ * gamut_cl.h. The image argument is both source and destination on purpose:
+ * every pixel is read and written exactly once, so the in-place pass is the
+ * same as the host's separate provcomp buffer. The single Lab allocation is
+ * addressed through its row and plane pitches, and the three planes are read
+ * back after a wait, so the node reports a completed device event.
+ *
+ * Everything the kernel consumes is checked here: the buffer shape and format,
+ * four 9-entry tables, a positive finite gain and power, and a compress flag
+ * that is exactly 0 or 1. A suspicious value is refused, never guessed.
+ */
+RtStageStatus run_gamut(const std::shared_ptr<OpenCLEnv>& env,
+                        const std::shared_ptr<OpenCLResidency>& residency,
+                        const std::vector<RtStageArg>& args,
+                        std::string& error)
+{
+    constexpr std::size_t BUFFER_ARGS = 5;
+    constexpr std::size_t DOUBLE_ARGS = 2;
+    constexpr std::size_t INT_ARGS = 1;
+    constexpr std::size_t ARG_COUNT = BUFFER_ARGS + DOUBLE_ARGS + INT_ARGS;
+    constexpr std::size_t FIRST_DOUBLE = BUFFER_ARGS;
+    constexpr std::size_t FIRST_INT = BUFFER_ARGS + DOUBLE_ARGS;
+    constexpr int MATRIX_ENTRIES = 9;
+    constexpr int TABLE_ARGS = 4;
+
+    if (args.size() != ARG_COUNT) {
+        error = "gamut expects five buffers, two doubles and one int";
+        return RT_STAGE_INVALID;
+    }
+    for (std::size_t i = 0; i < BUFFER_ARGS; ++i) {
+        if (args[i].kind != RT_STAGE_ARG_BUFFER) {
+            error = "gamut expects five buffers";
+            return RT_STAGE_INVALID;
+        }
+    }
+    for (std::size_t i = FIRST_DOUBLE; i < FIRST_INT; ++i) {
+        if (args[i].kind != RT_STAGE_ARG_DOUBLE) {
+            error = "gamut has a non-double scalar";
+            return RT_STAGE_INVALID;
+        }
+    }
+    if (args[FIRST_INT].kind != RT_STAGE_ARG_INT) {
+        error = "gamut has a non-int compress flag";
+        return RT_STAGE_INVALID;
+    }
+
+    const RtStageBuffer& lab = args[0].u.buffer;
+    if (!valid(lab) || lab.format != RT_STAGE_F32 || lab.planes != 3) {
+        error = "gamut needs a three-plane F32 Lab buffer";
+        return RT_STAGE_INVALID;
+    }
+
+    for (std::size_t i = 1; i < BUFFER_ARGS; ++i) {
+        const RtStageBuffer& table = args[i].u.buffer;
+        if (!valid(table) || table.format != RT_STAGE_F32 ||
+            table.planes != 1 ||
+            table.width * table.height != MATRIX_ENTRIES) {
+            error = "gamut needs four 9-entry F32 matrices";
+            return RT_STAGE_INVALID;
+        }
+        const float* entries = static_cast<const float*>(table.data);
+        for (int entry = 0; entry < MATRIX_ENTRIES; ++entry) {
+            if (!std::isfinite(entries[entry])) {
+                error = "gamut matrix has a non-finite entry";
+                return RT_STAGE_INVALID;
+            }
+        }
+    }
+
+    const double gainev = args[FIRST_DOUBLE].u.f;
+    const double pwr = args[FIRST_DOUBLE + 1].u.f;
+    if (!std::isfinite(gainev) || gainev <= 0.0) {
+        error = "gamut gain is not a positive finite number";
+        return RT_STAGE_INVALID;
+    }
+    if (!std::isfinite(pwr) || pwr <= 0.0) {
+        error = "gamut power is not a positive finite number";
+        return RT_STAGE_INVALID;
+    }
+    if (!std::isfinite(static_cast<float>(gainev)) ||
+        static_cast<float>(gainev) <= 0.0f) {
+        error = "gamut gain does not fit the kernel's float multiplier";
+        return RT_STAGE_INVALID;
+    }
+
+    const std::int64_t compress = args[FIRST_INT].u.i;
+    if (compress != 0 && compress != 1) {
+        error = "gamut compress flag must be 0 or 1";
+        return RT_STAGE_INVALID;
+    }
+
+    const KernelDef* def = find_kernel("gamut");
+    assert(def != nullptr);
+    cl_kernel kernel = compiled_kernel(env, def, error);
+    if (kernel == nullptr) {
+        return RT_STAGE_FALLBACK;
+    }
+
+    const StageBufferShape image_shape{RT_STAGE_F32, lab.width, lab.height, 3};
+    StageDeviceBufferPtr image =
+        residency->acquire(lab.data, image_shape, &error);
+    if (!image) {
+        return RT_STAGE_FALLBACK;
+    }
+    if (residency->upload(image, lab) != RT_STAGE_OK) {
+        error = "gamut image upload failed";
+        return RT_STAGE_FALLBACK;
+    }
+
+    StageDeviceBufferPtr tables[TABLE_ARGS];
+    for (std::size_t i = 0; i < TABLE_ARGS; ++i) {
+        const RtStageBuffer& table = args[i + 1].u.buffer;
+        const StageBufferShape shape{RT_STAGE_F32, table.width, table.height,
+                                     1};
+        tables[i] = residency->acquire(table.data, shape, &error);
+        if (!tables[i] ||
+            residency->upload(tables[i], table) != RT_STAGE_OK) {
+            error = "gamut matrix upload failed";
+            return RT_STAGE_FALLBACK;
+        }
+    }
+
+    auto memory_of = [](const StageDeviceBufferPtr& buffer) {
+        auto device = std::dynamic_pointer_cast<OpenCLDeviceBuffer>(buffer);
+        return device != nullptr ? device->memory() : nullptr;
+    };
+
+    const std::size_t row_pitch_bytes = image->row_pitch();
+    const std::size_t plane_pitch_bytes = image->plane_pitch();
+    if (row_pitch_bytes % sizeof(float) != 0 ||
+        plane_pitch_bytes % sizeof(float) != 0 ||
+        row_pitch_bytes / sizeof(float) < static_cast<std::size_t>(lab.width) ||
+        plane_pitch_bytes / sizeof(float) <
+            static_cast<std::size_t>(lab.height) *
+                (row_pitch_bytes / sizeof(float))) {
+        error = "gamut row or plane pitch does not cover the image";
+        return RT_STAGE_FALLBACK;
+    }
+    const std::int64_t plane_pitch = static_cast<std::int64_t>(
+        plane_pitch_bytes / sizeof(float));
+    /* The kernel addresses the third plane as 2 * plane_pitch + offset. */
+    if (plane_pitch > std::numeric_limits<cl_int>::max() / 3) {
+        error = "gamut plane pitch does not fit the kernel's int arithmetic";
+        return RT_STAGE_FALLBACK;
+    }
+
+    std::lock_guard<std::recursive_mutex> lock(env->queue_mutex);
+
+    const cl_float gain = static_cast<cl_float>(gainev);
+    const cl_float power = static_cast<cl_float>(pwr);
+    const cl_int comp = static_cast<cl_int>(compress);
+    const cl_int width = lab.width;
+    const cl_int height = lab.height;
+    const cl_int pitch = static_cast<cl_int>(row_pitch_bytes / sizeof(float));
+    const cl_int plane = static_cast<cl_int>(plane_pitch);
+
+    const auto set_arg = [&](cl_uint index, std::size_t bytes,
+                             const void* value) {
+        return env->api->SetKernelArg(kernel, index, bytes, value) == CL_SUCCESS;
+    };
+
+    cl_uint arg = 0;
+    bool ok = true;
+    cl_mem image_memory = memory_of(image);
+    ok = set_arg(arg++, sizeof(cl_mem), &image_memory);
+    for (std::size_t i = 0; i < TABLE_ARGS && ok; ++i) {
+        cl_mem memory = memory_of(tables[i]);
+        ok = set_arg(arg++, sizeof(cl_mem), &memory);
+    }
+    ok = ok &&
+         set_arg(arg++, sizeof(cl_float), &gain) &&
+         set_arg(arg++, sizeof(cl_float), &power) &&
+         set_arg(arg++, sizeof(cl_int), &comp) &&
+         set_arg(arg++, sizeof(cl_int), &width) &&
+         set_arg(arg++, sizeof(cl_int), &height) &&
+         set_arg(arg++, sizeof(cl_int), &pitch) &&
+         set_arg(arg++, sizeof(cl_int), &plane);
+    if (!ok) {
+        error = "clSetKernelArg failed";
+        return RT_STAGE_FALLBACK;
+    }
+
+    const std::size_t global[2] = {static_cast<std::size_t>(width),
+                                   static_cast<std::size_t>(height)};
+    cl_event done = nullptr;
+    if (env->api->EnqueueNDRangeKernel(env->queue, kernel, 2, nullptr, global,
+                                       nullptr, 0, nullptr,
+                                       &done) != CL_SUCCESS ||
+        done == nullptr) {
+        error = "gamut launch failed";
+        return RT_STAGE_ERROR;
+    }
+
+    const cl_int wait_status = env->api->WaitForEvents(1, &done);
+    env->api->ReleaseEvent(done);
+    if (wait_status != CL_SUCCESS) {
+        error = "gamut did not complete";
+        return RT_STAGE_ERROR;
+    }
+
+    if (residency->readback(image, lab) != RT_STAGE_OK) {
+        error = "gamut readback failed";
+        return RT_STAGE_ERROR;
+    }
+
+    return RT_STAGE_OK;
+}
+
+/*
  * Frame drawing. Argument order:
  *   [0] source RGB buffer, [1] destination RGB buffer,
  *   [2..4] doubles border red, green and blue,
@@ -3540,6 +3758,20 @@ public:
         } else if (request.name == "rgb.proc") {
             const RtStageStatus status =
                 run_rgb_proc(env_, residency_, request.args, error);
+            if (status == RT_STAGE_OK) {
+                StageEvent done;
+                done.status = StageEventStatus::Complete;
+                done.result = RT_STAGE_OK;
+                done.device = StageDeviceType::OPENCL;
+                done.asynchronous = false;
+                return done;
+            }
+            StageEvent fallback = StageQueue::submit(request, profiling);
+            fallback.note = error;
+            return fallback;
+        } else if (request.name == "gamut") {
+            const RtStageStatus status =
+                run_gamut(env_, residency_, request.args, error);
             if (status == RT_STAGE_OK) {
                 StageEvent done;
                 done.status = StageEventStatus::Complete;

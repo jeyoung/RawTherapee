@@ -42,6 +42,8 @@
 #include "profiling.h"
 #include "rawimagesource.h"
 #include "rtengine.h"
+#include "stage/algorithms/gamut_cl.h"
+#include "stage/stage_buffer.h"
 #include "stage/stage_graph.h"
 #include "stage/stage_pipeline.h"
 #include "stage/stage_profile.h"
@@ -203,6 +205,32 @@ void logStageGraphActive(size_t nodes)
                  "stage-graph: active, %zu nodes executed from the canonical "
                  "export inventory\n",
                  nodes);
+}
+
+/*
+ * Run the end-of-process gamut node. The argument order is the one `run_gamut`
+ * documents in the device backend: the Lab buffer in place, the four matrices,
+ * the gain, the power and the compression flag.
+ *
+ * The matrices are derived by the shared helper, in double, exactly as
+ * ImProcFunctions::gamutcompr() does for the end of the process, so the device
+ * and the host block in stage_gamut() cannot disagree about the gamut mapping.
+ */
+bool run_gamut_stage(const procparams::ColorManagementParams& icm,
+                     LabImage& lab)
+{
+    stage::GamutNodeParams params;
+    std::string error;
+    if (!stage::gamut_node_params(icm, params, error)) {
+        return false;
+    }
+
+    stage::GamutNodeArgs node;
+    stage::gamut_node_args(lab, params, node);
+
+    RtStageProfiling profiling{};
+    return stage::run("gamut", std::vector<RtStageArg>(node.args, node.args + 8),
+                      &profiling) == RT_STAGE_OK;
 }
 
 class ImageProcessor
@@ -2483,6 +2511,18 @@ private:
         bool exec = params.icm.wgamut != ColorManagementParams::Wwgamut::NONE  || params.icm.wgamgain != 0.f;
 
         if (params.icm.workingTRC != ColorManagementParams::WorkingTrc::NONE && params.icm.trcExp  && exec) {
+
+            /*
+             * The device runs the whole block in place. A refusal or a failed
+             * launch falls through to the host block below unchanged, so the
+             * host never starts from a partially written Lab buffer: the
+             * launcher uploads, runs and reads the whole image back, and on
+             * any failure it returns before the readback.
+             */
+            if (stage::node_device("gamut") == stage::StageNodeDevice::OpenCL
+                    && run_gamut_stage(params.icm, *labView)) {
+                return;
+            }
 
             //compression gamut and gain at the end of process
             const int GW = labView->W;
