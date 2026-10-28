@@ -26,7 +26,6 @@
 
 #include "sharpen_core.h"
 
-
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -2877,7 +2876,6 @@ void test_output_sharpen(bool available)
     }
 
     unsigned seed = 1u;
-
     for (const SharpenCase& item : cases) {
         LabImage source(item.width, item.height);
         if (item.smooth) {
