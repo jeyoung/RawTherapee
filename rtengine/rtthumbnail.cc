@@ -58,6 +58,7 @@
 #include "settings.h"
 #include "stage/stage_graph.h"
 #include "stage/stage_pipeline.h"
+#include "stage/stage_buffer.h"
 #include "stage/stage_runtime.h"
 #include "stdimagesource.h"
 #include "StopWatch.h"
@@ -1754,6 +1755,41 @@ void Thumbnail::stageTransform(StageState& state)
  * thumbnail.whitebalance: resolve the white-balance multipliers and apply
  * them, including the highlight-recovery magenta guard.
  */
+namespace
+{
+
+/* White balance on the stage device: the multipliers are already resolved. */
+bool run_thumbnail_wb_stage(Imagefloat& image, double rmi, double gmi,
+                            double bmi, bool hrenabled)
+{
+    constexpr int DOUBLE_ARGS = 3;
+    constexpr int INT_ARGS = 3;
+    constexpr int ARG_COUNT = 1 + DOUBLE_ARGS + INT_ARGS;
+
+    RtStageArg args[ARG_COUNT]{};
+    args[0].kind = RT_STAGE_ARG_BUFFER;
+    args[0].u.buffer = stage::view(image);
+
+    const double doubles[DOUBLE_ARGS] = {rmi, gmi, bmi};
+    for (int i = 0; i < DOUBLE_ARGS; ++i) {
+        args[1 + i].kind = RT_STAGE_ARG_DOUBLE;
+        args[1 + i].u.f = doubles[i];
+    }
+    const int ints[INT_ARGS] = {hrenabled ? 1 : 0, image.getWidth(),
+                                image.getHeight()};
+    for (int i = 0; i < INT_ARGS; ++i) {
+        args[1 + DOUBLE_ARGS + i].kind = RT_STAGE_ARG_INT;
+        args[1 + DOUBLE_ARGS + i].u.i = ints[i];
+    }
+
+    RtStageProfiling profiling{};
+    return stage::run("thumbnail.whitebalance",
+                      std::vector<RtStageArg>(args, args + ARG_COUNT),
+                      &profiling) == RT_STAGE_OK;
+}
+
+} // namespace
+
 void Thumbnail::stageWhiteBalance(StageState& state)
 {
     const procparams::ProcParams& params = *state.params;
@@ -1829,6 +1865,14 @@ void Thumbnail::stageWhiteBalance(StageState& state)
         rmi *= params.raw.expos;
         gmi *= params.raw.expos;
         bmi *= params.raw.expos;
+    }
+
+    if (stage::node_device("thumbnail.whitebalance") ==
+        stage::StageNodeDevice::OpenCL) {
+        if (run_thumbnail_wb_stage(*baseImg, rmi, gmi, bmi,
+                                   params.toneCurve.hrenabled)) {
+            return;
+        }
     }
 
     // apply white balance and raw white point (simulated)

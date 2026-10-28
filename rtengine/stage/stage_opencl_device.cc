@@ -775,6 +775,52 @@ const std::string& rgb_proc_source()
     return source;
 }
 
+/*
+ * Thumbnail white balance: a per-pixel multiply with the highlight-average
+ * branch. The multipliers and the highlight flag are resolved on the host, so
+ * this kernel only reproduces the loop. 65535 is rt_math.h's MAXVALF.
+ */
+const std::string& thumbnail_wb_source()
+{
+    static const std::string source = R"CLC(
+#pragma OPENCL FP_CONTRACT OFF
+
+__kernel void rt_thumbnail_wb(__global const float* src, __global float* dst,
+                              const float rmi, const float gmi,
+                              const float bmi, const int hrenabled,
+                              const int width, const int height,
+                              const int srcPitch, const int srcPlanePitch,
+                              const int dstPitch, const int dstPlanePitch)
+{
+    const float MAX_VALUE = 65535.0f;
+    const int gid = get_global_id(0);
+    const int y = gid / width;
+    if (y >= height) {
+        return;
+    }
+    const int x = gid - y * width;
+    const int in = y * srcPitch + x;
+    const int out = y * dstPitch + x;
+
+    const float red = src[in] * rmi;
+    const float green = src[srcPlanePitch + in] * gmi;
+    const float blue = src[2 * srcPlanePitch + in] * bmi;
+
+    if (hrenabled && red > MAX_VALUE && blue > MAX_VALUE) {
+        const float value = clamp((red + green + blue) / 3.0f, 0.0f, MAX_VALUE);
+        dst[out] = value;
+        dst[dstPlanePitch + out] = value;
+        dst[2 * dstPlanePitch + out] = value;
+    } else {
+        dst[out] = clamp(red, 0.0f, MAX_VALUE);
+        dst[dstPlanePitch + out] = clamp(green, 0.0f, MAX_VALUE);
+        dst[2 * dstPlanePitch + out] = clamp(blue, 0.0f, MAX_VALUE);
+    }
+}
+)CLC";
+    return source;
+}
+
 const std::vector<KernelDef>& kernels()
 {
     static const std::vector<KernelDef> table = {
@@ -784,7 +830,8 @@ const std::vector<KernelDef>& kernels()
         {"monitor.output", lab_to_u8_source().c_str(), "rt_lab_to_u8"},
         {"viewport.output", lab_to_u8_source().c_str(), "rt_lab_to_u8"},
         {"thumbnail.output", lab_to_u8_source().c_str(), "rt_lab_to_u8"},
-        {"rgb.proc", rgb_proc_source().c_str(), "rt_rgb_proc"}
+        {"rgb.proc", rgb_proc_source().c_str(), "rt_rgb_proc"},
+        {"thumbnail.whitebalance", thumbnail_wb_source().c_str(), "rt_thumbnail_wb"}
     };
     return table;
 }
@@ -2146,6 +2193,143 @@ RtStageStatus run_rgb_proc(const std::shared_ptr<OpenCLEnv>& env,
     return RT_STAGE_OK;
 }
 
+
+/*
+ * Thumbnail white balance. Arguments:
+ *   [0] image buffer, [1] doubles rmi, gmi, bmi, [2] ints hrenabled, width,
+ *   height. The image may be in place: source and destination share a key.
+ * The three planes are read back after a wait, so the node reports a
+ * completed device event.
+ */
+RtStageStatus run_thumbnail_wb(const std::shared_ptr<OpenCLEnv>& env,
+                               const std::shared_ptr<OpenCLResidency>& residency,
+                               const std::vector<RtStageArg>& args,
+                               std::string& error)
+{
+    constexpr std::size_t BUFFER_ARGS = 1;
+    constexpr std::size_t DOUBLE_ARGS = 3;
+    constexpr std::size_t INT_ARGS = 3;
+    constexpr std::size_t ARG_COUNT = BUFFER_ARGS + DOUBLE_ARGS + INT_ARGS;
+
+    if (args.size() != ARG_COUNT || args[0].kind != RT_STAGE_ARG_BUFFER) {
+        error = "thumbnail.whitebalance expects a buffer, three doubles and "
+                "three ints";
+        return RT_STAGE_INVALID;
+    }
+    for (std::size_t i = 1; i <= DOUBLE_ARGS; ++i) {
+        if (args[i].kind != RT_STAGE_ARG_DOUBLE) {
+            error = "thumbnail.whitebalance has a non-double multiplier";
+            return RT_STAGE_INVALID;
+        }
+    }
+    for (std::size_t i = 1 + DOUBLE_ARGS; i < ARG_COUNT; ++i) {
+        if (args[i].kind != RT_STAGE_ARG_INT) {
+            error = "thumbnail.whitebalance has a non-int scalar";
+            return RT_STAGE_INVALID;
+        }
+    }
+
+    const RtStageBuffer& image = args[0].u.buffer;
+    if (!valid(image) || image.format != RT_STAGE_F32 || image.planes != 3) {
+        error = "thumbnail.whitebalance needs a three-plane F32 buffer";
+        return RT_STAGE_INVALID;
+    }
+
+    const KernelDef* def = find_kernel("thumbnail.whitebalance");
+    assert(def != nullptr);
+    cl_kernel kernel = compiled_kernel(env, def, error);
+    if (kernel == nullptr) {
+        return RT_STAGE_FALLBACK;
+    }
+
+    const StageBufferShape shape{RT_STAGE_F32, image.width, image.height, 1};
+    StageDeviceBufferPtr planes[3];
+    for (int plane = 0; plane < 3; ++plane) {
+        const RtStageBuffer view = plane_view(image, plane);
+        planes[plane] = residency->acquire(view.data, shape, &error);
+        if (!planes[plane]) {
+            return RT_STAGE_FALLBACK;
+        }
+        if (residency->upload(planes[plane], view) != RT_STAGE_OK) {
+            error = "thumbnail.whitebalance upload failed";
+            return RT_STAGE_FALLBACK;
+        }
+    }
+
+    auto memory_of = [](const StageDeviceBufferPtr& buffer) {
+        auto device = std::dynamic_pointer_cast<OpenCLDeviceBuffer>(buffer);
+        return device != nullptr ? device->memory() : nullptr;
+    };
+
+    std::lock_guard<std::recursive_mutex> lock(env->queue_mutex);
+
+    auto device = std::dynamic_pointer_cast<OpenCLDeviceBuffer>(planes[0]);
+    if (!device) {
+        error = "thumbnail.whitebalance device buffer mismatch";
+        return RT_STAGE_FALLBACK;
+    }
+    const cl_int width = image.width;
+    const cl_int height = image.height;
+    const cl_int pitch = static_cast<cl_int>(device->row_pitch() / sizeof(float));
+    const cl_int plane_pitch =
+        static_cast<cl_int>(device->plane_pitch() / sizeof(float));
+    const cl_float rmi = static_cast<cl_float>(args[1].u.f);
+    const cl_float gmi = static_cast<cl_float>(args[2].u.f);
+    const cl_float bmi = static_cast<cl_float>(args[3].u.f);
+    const cl_int hrenabled = static_cast<cl_int>(args[4].u.i);
+
+    const auto set_arg = [&](cl_uint index, std::size_t bytes,
+                             const void* value) {
+        return env->api->SetKernelArg(kernel, index, bytes, value) == CL_SUCCESS;
+    };
+
+    cl_mem memory = memory_of(planes[0]);
+    const bool args_ok =
+        set_arg(0, sizeof(cl_mem), &memory) &&
+        set_arg(1, sizeof(cl_mem), &memory) &&
+        set_arg(2, sizeof(cl_float), &rmi) &&
+        set_arg(3, sizeof(cl_float), &gmi) &&
+        set_arg(4, sizeof(cl_float), &bmi) &&
+        set_arg(5, sizeof(cl_int), &hrenabled) &&
+        set_arg(6, sizeof(cl_int), &width) &&
+        set_arg(7, sizeof(cl_int), &height) &&
+        set_arg(8, sizeof(cl_int), &pitch) &&
+        set_arg(9, sizeof(cl_int), &plane_pitch) &&
+        set_arg(10, sizeof(cl_int), &pitch) &&
+        set_arg(11, sizeof(cl_int), &plane_pitch);
+    if (!args_ok) {
+        error = "clSetKernelArg failed";
+        return RT_STAGE_FALLBACK;
+    }
+
+    const std::size_t global =
+        static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
+    cl_event done = nullptr;
+    if (env->api->EnqueueNDRangeKernel(env->queue, kernel, 1, nullptr, &global,
+                                       nullptr, 0, nullptr,
+                                       &done) != CL_SUCCESS ||
+        done == nullptr) {
+        error = "thumbnail.whitebalance launch failed";
+        return RT_STAGE_ERROR;
+    }
+    const cl_int wait_status = env->api->WaitForEvents(1, &done);
+    env->api->ReleaseEvent(done);
+    if (wait_status != CL_SUCCESS) {
+        error = "thumbnail.whitebalance did not complete";
+        return RT_STAGE_ERROR;
+    }
+
+    for (int plane = 0; plane < 3; ++plane) {
+        if (residency->readback(planes[plane], plane_view(image, plane)) !=
+            RT_STAGE_OK) {
+            error = "thumbnail.whitebalance readback failed";
+            return RT_STAGE_ERROR;
+        }
+    }
+
+    return RT_STAGE_OK;
+}
+
 class OpenCLStageQueue final : public StageQueue
 {
 public:
@@ -2202,6 +2386,20 @@ public:
         } else if (request.name == "output.convert") {
             submission = launch_lab_to_rgb(env_, residency_, request.args,
                                            request.name.c_str(), false, error);
+        } else if (request.name == "thumbnail.whitebalance") {
+            const RtStageStatus status =
+                run_thumbnail_wb(env_, residency_, request.args, error);
+            if (status == RT_STAGE_OK) {
+                StageEvent done;
+                done.status = StageEventStatus::Complete;
+                done.result = RT_STAGE_OK;
+                done.device = StageDeviceType::OPENCL;
+                done.asynchronous = false;
+                return done;
+            }
+            StageEvent fallback = StageQueue::submit(request, profiling);
+            fallback.note = error;
+            return fallback;
         } else if (request.name == "rgb.proc") {
             const RtStageStatus status =
                 run_rgb_proc(env_, residency_, request.args, error);
