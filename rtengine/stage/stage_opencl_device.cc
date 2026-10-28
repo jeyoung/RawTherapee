@@ -776,6 +776,55 @@ const std::string& rgb_proc_source()
 }
 
 /*
+ * Frame drawing. Every destination pixel is written exactly once: inside the
+ * source rectangle the source sample is copied, and elsewhere the constant
+ * border colour is written. That is the same result as filling the frame and
+ * then copying the source over it, in one pass. Row pitches stay explicit
+ * because the stage device pads rows to the stage alignment.
+ */
+const std::string& framing_source()
+{
+    static const std::string source = R"CLC(
+#pragma OPENCL FP_CONTRACT OFF
+
+__kernel void rt_framing(__global const float* srcR,
+                         __global const float* srcG,
+                         __global const float* srcB,
+                         __global float* dstR,
+                         __global float* dstG,
+                         __global float* dstB,
+                         const float borderR, const float borderG,
+                         const float borderB,
+                         const int srcWidth, const int srcHeight,
+                         const int dstWidth, const int dstHeight,
+                         const int srcPitch, const int dstPitch,
+                         const int rowOffset, const int colOffset)
+{
+    const int x = get_global_id(0);
+    const int y = get_global_id(1);
+    if (x >= dstWidth || y >= dstHeight) {
+        return;
+    }
+
+    const int sx = x - colOffset;
+    const int sy = y - rowOffset;
+    const int out = y * dstPitch + x;
+    if (sx >= 0 && sx < srcWidth && sy >= 0 && sy < srcHeight) {
+        const int in = sy * srcPitch + sx;
+        dstR[out] = srcR[in];
+        dstG[out] = srcG[in];
+        dstB[out] = srcB[in];
+    } else {
+        dstR[out] = borderR;
+        dstG[out] = borderG;
+        dstB[out] = borderB;
+    }
+}
+)CLC";
+    return source;
+}
+
+/*
  * Thumbnail white balance: a per-pixel multiply with the highlight-average
  * branch. The multipliers and the highlight flag are resolved on the host, so
  * this kernel only reproduces the loop. 65535 is rt_math.h's MAXVALF.
@@ -1118,6 +1167,7 @@ const std::vector<KernelDef>& kernels()
         {"viewport.output", lab_to_u8_source().c_str(), "rt_lab_to_u8"},
         {"thumbnail.output", lab_to_u8_source().c_str(), "rt_lab_to_u8"},
         {"rgb.proc", rgb_proc_source().c_str(), "rt_rgb_proc"},
+        {"framing", framing_source().c_str(), "rt_framing"},
         {"thumbnail.whitebalance", thumbnail_wb_source().c_str(), "rt_thumbnail_wb"},
         {"thumbnail.transform", thumbnail_permute_source().c_str(), "rt_thumbnail_permute"},
         {"thumbnail.transform.u8", thumbnail_permute_source().c_str(), "rt_thumbnail_permute_u8"},
@@ -2517,6 +2567,214 @@ RtStageStatus run_rgb_proc(const std::shared_ptr<OpenCLEnv>& env,
     return RT_STAGE_OK;
 }
 
+/*
+ * Frame drawing. Argument order:
+ *   [0] source RGB buffer, [1] destination RGB buffer,
+ *   [2..4] doubles border red, green and blue,
+ *   [5..6] ints row and column offset of the source inside the frame.
+ *
+ * The framed dimensions come from the destination buffer; the source and
+ * destination pitches are inserted by the launcher when it sets the kernel
+ * arguments. The node is only valid when the source is strictly smaller than
+ * the frame in at least one dimension and fits at the given offset, which is
+ * exactly the region where drawFrame() inserts a border. The three
+ * destination planes are read back after a wait, so the node reports a
+ * completed device event.
+ */
+RtStageStatus run_framing(const std::shared_ptr<OpenCLEnv>& env,
+                          const std::shared_ptr<OpenCLResidency>& residency,
+                          const std::vector<RtStageArg>& args,
+                          std::string& error)
+{
+    constexpr std::size_t BUFFER_ARGS = 2;
+    constexpr std::size_t DOUBLE_ARGS = 3;
+    constexpr std::size_t INT_ARGS = 2;
+    constexpr std::size_t ARG_COUNT = BUFFER_ARGS + DOUBLE_ARGS + INT_ARGS;
+    constexpr std::size_t FIRST_INT = BUFFER_ARGS + DOUBLE_ARGS;
+
+    if (args.size() != ARG_COUNT) {
+        error = "framing expects two buffers, three doubles and two ints";
+        return RT_STAGE_INVALID;
+    }
+    for (std::size_t i = 0; i < BUFFER_ARGS; ++i) {
+        if (args[i].kind != RT_STAGE_ARG_BUFFER) {
+            error = "framing expects two buffers";
+            return RT_STAGE_INVALID;
+        }
+    }
+    for (std::size_t i = BUFFER_ARGS; i < FIRST_INT; ++i) {
+        if (args[i].kind != RT_STAGE_ARG_DOUBLE) {
+            error = "framing has a non-double border colour";
+            return RT_STAGE_INVALID;
+        }
+    }
+    for (std::size_t i = FIRST_INT; i < ARG_COUNT; ++i) {
+        if (args[i].kind != RT_STAGE_ARG_INT) {
+            error = "framing has a non-int offset";
+            return RT_STAGE_INVALID;
+        }
+    }
+
+    const RtStageBuffer& src = args[0].u.buffer;
+    const RtStageBuffer& dst = args[1].u.buffer;
+    if (!valid(src) || !valid(dst) || src.format != RT_STAGE_F32 ||
+        dst.format != RT_STAGE_F32 || src.planes != 3 || dst.planes != 3) {
+        error = "framing needs two three-plane F32 buffers";
+        return RT_STAGE_INVALID;
+    }
+    if (src.data == dst.data) {
+        error = "framing source and destination are the same buffer";
+        return RT_STAGE_INVALID;
+    }
+
+    /*
+     * drawFrame() returns the source unchanged when it is larger than the
+     * frame or exactly the frame size, so the node must never see either
+     * shape. Every dimension and offset is signed and checked before it
+     * reaches the kernel.
+     */
+    if (dst.width < src.width || dst.height < src.height) {
+        error = "framing destination is smaller than the source";
+        return RT_STAGE_INVALID;
+    }
+    if (dst.width == src.width && dst.height == src.height) {
+        error = "framing source already fills the frame";
+        return RT_STAGE_INVALID;
+    }
+
+    const std::int64_t row_offset = args[FIRST_INT].u.i;
+    const std::int64_t col_offset = args[FIRST_INT + 1].u.i;
+    if (row_offset < 0 || col_offset < 0 ||
+        row_offset + src.height > dst.height ||
+        col_offset + src.width > dst.width) {
+        error = "framing source does not fit at the given offset";
+        return RT_STAGE_INVALID;
+    }
+
+    const KernelDef* def = find_kernel("framing");
+    assert(def != nullptr);
+    cl_kernel kernel = compiled_kernel(env, def, error);
+    if (kernel == nullptr) {
+        return RT_STAGE_FALLBACK;
+    }
+
+    StageDeviceBufferPtr src_devices[3];
+    StageDeviceBufferPtr dst_devices[3];
+    const StageBufferShape src_shape{RT_STAGE_F32, src.width, src.height, 1};
+    const StageBufferShape dst_shape{RT_STAGE_F32, dst.width, dst.height, 1};
+    for (int plane = 0; plane < 3; ++plane) {
+        const RtStageBuffer src_plane = plane_view(src, plane);
+        const RtStageBuffer dst_plane = plane_view(dst, plane);
+        src_devices[plane] = residency->acquire(src_plane.data, src_shape, &error);
+        dst_devices[plane] = residency->acquire(dst_plane.data, dst_shape, &error);
+        if (!src_devices[plane] || !dst_devices[plane]) {
+            return RT_STAGE_FALLBACK;
+        }
+        if (residency->upload(src_devices[plane], src_plane) != RT_STAGE_OK) {
+            error = "framing source upload failed";
+            return RT_STAGE_FALLBACK;
+        }
+    }
+
+    auto memory_of = [](const StageDeviceBufferPtr& buffer) {
+        auto device = std::dynamic_pointer_cast<OpenCLDeviceBuffer>(buffer);
+        return device != nullptr ? device->memory() : nullptr;
+    };
+
+    const std::size_t src_pitch_bytes = src_devices[0]->row_pitch();
+    const std::size_t dst_pitch_bytes = dst_devices[0]->row_pitch();
+    for (int plane = 1; plane < 3; ++plane) {
+        if (src_devices[plane]->row_pitch() != src_pitch_bytes ||
+            dst_devices[plane]->row_pitch() != dst_pitch_bytes) {
+            error = "framing planes disagree on the row pitch";
+            return RT_STAGE_FALLBACK;
+        }
+    }
+    if (src_pitch_bytes % sizeof(float) != 0 ||
+        dst_pitch_bytes % sizeof(float) != 0 ||
+        src_pitch_bytes / sizeof(float) < static_cast<std::size_t>(src.width) ||
+        dst_pitch_bytes / sizeof(float) < static_cast<std::size_t>(dst.width)) {
+        error = "framing row pitch does not cover the image width";
+        return RT_STAGE_FALLBACK;
+    }
+
+    std::lock_guard<std::recursive_mutex> lock(env->queue_mutex);
+
+    const cl_float border_r = static_cast<cl_float>(args[2].u.f);
+    const cl_float border_g = static_cast<cl_float>(args[3].u.f);
+    const cl_float border_b = static_cast<cl_float>(args[4].u.f);
+    const cl_int src_width = src.width;
+    const cl_int src_height = src.height;
+    const cl_int dst_width = dst.width;
+    const cl_int dst_height = dst.height;
+    const cl_int src_pitch =
+        static_cast<cl_int>(src_pitch_bytes / sizeof(float));
+    const cl_int dst_pitch =
+        static_cast<cl_int>(dst_pitch_bytes / sizeof(float));
+    const cl_int row = static_cast<cl_int>(row_offset);
+    const cl_int col = static_cast<cl_int>(col_offset);
+
+    const auto set_arg = [&](cl_uint index, std::size_t bytes,
+                             const void* value) {
+        return env->api->SetKernelArg(kernel, index, bytes, value) == CL_SUCCESS;
+    };
+
+    cl_uint arg = 0;
+    bool ok = true;
+    for (int plane = 0; plane < 3 && ok; ++plane) {
+        cl_mem memory = memory_of(src_devices[plane]);
+        ok = set_arg(arg++, sizeof(cl_mem), &memory);
+    }
+    for (int plane = 0; plane < 3 && ok; ++plane) {
+        cl_mem memory = memory_of(dst_devices[plane]);
+        ok = set_arg(arg++, sizeof(cl_mem), &memory);
+    }
+    ok = ok &&
+         set_arg(arg++, sizeof(cl_float), &border_r) &&
+         set_arg(arg++, sizeof(cl_float), &border_g) &&
+         set_arg(arg++, sizeof(cl_float), &border_b) &&
+         set_arg(arg++, sizeof(cl_int), &src_width) &&
+         set_arg(arg++, sizeof(cl_int), &src_height) &&
+         set_arg(arg++, sizeof(cl_int), &dst_width) &&
+         set_arg(arg++, sizeof(cl_int), &dst_height) &&
+         set_arg(arg++, sizeof(cl_int), &src_pitch) &&
+         set_arg(arg++, sizeof(cl_int), &dst_pitch) &&
+         set_arg(arg++, sizeof(cl_int), &row) &&
+         set_arg(arg++, sizeof(cl_int), &col);
+    if (!ok) {
+        error = "clSetKernelArg failed";
+        return RT_STAGE_FALLBACK;
+    }
+
+    const std::size_t global[2] = {static_cast<std::size_t>(dst_width),
+                                   static_cast<std::size_t>(dst_height)};
+    cl_event done = nullptr;
+    if (env->api->EnqueueNDRangeKernel(env->queue, kernel, 2, nullptr, global,
+                                       nullptr, 0, nullptr,
+                                       &done) != CL_SUCCESS ||
+        done == nullptr) {
+        error = "framing launch failed";
+        return RT_STAGE_ERROR;
+    }
+
+    const cl_int wait_status = env->api->WaitForEvents(1, &done);
+    env->api->ReleaseEvent(done);
+    if (wait_status != CL_SUCCESS) {
+        error = "framing did not complete";
+        return RT_STAGE_ERROR;
+    }
+
+    for (int plane = 0; plane < 3; ++plane) {
+        if (residency->readback(dst_devices[plane], plane_view(dst, plane)) !=
+            RT_STAGE_OK) {
+            error = "framing readback failed";
+            return RT_STAGE_ERROR;
+        }
+    }
+
+    return RT_STAGE_OK;
+}
+
 
 /*
  * Thumbnail white balance. Arguments:
@@ -3282,6 +3540,20 @@ public:
         } else if (request.name == "rgb.proc") {
             const RtStageStatus status =
                 run_rgb_proc(env_, residency_, request.args, error);
+            if (status == RT_STAGE_OK) {
+                StageEvent done;
+                done.status = StageEventStatus::Complete;
+                done.result = RT_STAGE_OK;
+                done.device = StageDeviceType::OPENCL;
+                done.asynchronous = false;
+                return done;
+            }
+            StageEvent fallback = StageQueue::submit(request, profiling);
+            fallback.note = error;
+            return fallback;
+        } else if (request.name == "framing") {
+            const RtStageStatus status =
+                run_framing(env_, residency_, request.args, error);
             if (status == RT_STAGE_OK) {
                 StageEvent done;
                 done.status = StageEventStatus::Complete;

@@ -728,6 +728,38 @@ bool run_lanczos_stage(const RtStageBuffer& src, const RtStageBuffer& dst, float
 }
 
 /*
+ * Run the frame-drawing node. Argument order is the one `run_framing`
+ * documents in the device backend: source, destination, the border colour and
+ * the source offset inside the frame.
+ */
+bool run_framing_stage(const rtengine::Imagefloat& src,
+                       rtengine::Imagefloat& dst, double border_red,
+                       double border_green, double border_blue, int row_offset,
+                       int col_offset)
+{
+    RtStageArg args[7]{};
+    args[0].kind = RT_STAGE_ARG_BUFFER;
+    args[0].u.buffer = rtengine::stage::view(src);
+    args[1].kind = RT_STAGE_ARG_BUFFER;
+    args[1].u.buffer = rtengine::stage::view(dst);
+    args[2].kind = RT_STAGE_ARG_DOUBLE;
+    args[2].u.f = border_red;
+    args[3].kind = RT_STAGE_ARG_DOUBLE;
+    args[3].u.f = border_green;
+    args[4].kind = RT_STAGE_ARG_DOUBLE;
+    args[4].u.f = border_blue;
+    args[5].kind = RT_STAGE_ARG_INT;
+    args[5].u.i = row_offset;
+    args[6].kind = RT_STAGE_ARG_INT;
+    args[6].u.i = col_offset;
+
+    RtStageProfiling profiling{};
+    return rtengine::stage::run("framing", {args[0], args[1], args[2], args[3],
+                                            args[4], args[5], args[6]},
+                                &profiling) == RT_STAGE_OK;
+}
+
+/*
  * True when the stage device owns this node and must therefore run before the
  * classic OpenCL backend. Both paths cover the node, and the classic one is
  * checked first today, so without this the device implementation would never
@@ -1244,6 +1276,29 @@ Imagefloat* ImProcFunctions::drawFrame(Imagefloat* rgb, const FramingParams& par
     float g = Color::gamma2curve[clip(params.borderGreen)];
     float b = Color::gamma2curve[clip(params.borderBlue)];
 
+    auto offset = [](int inner, int outer) {
+        double u = inner;
+        double v = outer;
+        return static_cast<int>(std::round((v - u) / 2.0));
+    };
+    int rowOffset = offset(rgb->getHeight(), framed->getHeight());
+    int colOffset = offset(rgb->getWidth(), framed->getWidth());
+
+    if (stage::node_device("framing") == stage::StageNodeDevice::OpenCL) {
+        if (run_framing_stage(*rgb, *framed, r, g, b, rowOffset, colOffset)) {
+            delete rgb;
+            return framed;
+        }
+
+        /*
+         * The device may have written part of the destination before it
+         * declined. Reallocate so the host path never starts from, or
+         * returns, a partially written image.
+         */
+        delete framed;
+        framed = new Imagefloat(dims.framedWidth, dims.framedHeight);
+    }
+
 #ifdef _OPENMP
     #pragma omp parallel for if (multiThread)
 #endif
@@ -1254,14 +1309,6 @@ Imagefloat* ImProcFunctions::drawFrame(Imagefloat* rgb, const FramingParams& par
             framed->b(i, j) = b;
         }
     }
-
-    auto offset = [](int inner, int outer) {
-        double u = inner;
-        double v = outer;
-        return static_cast<int>(std::round((v - u) / 2.0));
-    };
-    int rowOffset = offset(rgb->getHeight(), framed->getHeight());
-    int colOffset = offset(rgb->getWidth(), framed->getWidth());
 
 #ifdef _OPENMP
     #pragma omp parallel for if (multiThread)
