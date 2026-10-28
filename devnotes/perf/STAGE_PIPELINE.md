@@ -74,7 +74,7 @@ sub-nodes and the residual beside it, not parity of the composite.
 | `lab.wavelet` | Full/Full/Roi/Reduced | path | reuse-input | directional pyramid equaliser and wavelet | no |
 | `working.trc` | Full/Full/Roi/- | path | reuse-input | soft light, tone equaliser and working-TRC conversion | no |
 | `ciecam` | Full/Full/Roi/- | path | reuse-input | CIE CAM 02 | no |
-| `gamut` | Full/Full/Roi/Reduced | path | reuse-input | working-space gamut compression | no |
+| `gamut` | Full/Full/Roi/Reduced | path | reuse-input | working-space gamut compression | yes |
 | `output.convert` | Full/-/-/- | exact | reuse-output | Lab to output RGB and output profile conversion | yes |
 | `crop` | Full/-/-/- | exact | reuse-output | crop | no |
 | `resize` | Full/-/-/- | exact | reuse-output | resize (`lanczos3`) | yes |
@@ -1526,7 +1526,7 @@ device run is slower than the host and exists for parity and correctness.
 The `Device` column of the canonical block catalogue above is the single source
 of truth; this section records the remaining work and the naming exceptions.
 
-Device nodes today: `transform`, `rgb.proc`, `framing`, `lanczos3` (block
+Device nodes today: `transform`, `rgb.proc`, `gamut`, `framing`, `lanczos3` (block
 `resize`), `output.convert`, `monitor.output`, `viewport.output`,
 `thumbnail.output`, `thumbnail.whitebalance`, `thumbnail.scale` and
 `thumbnail.transform` (the last
@@ -1541,7 +1541,7 @@ records, the commands and the parity result are in `STAGE_RUNTIME.md`.
 
 Still CPU-only: `source.select`, `source.embedded`, `raw.preprocess`,
 `raw.demosaic`, `raw.base`, `analysis`, `local.adjustments`, `lab.tools`,
-`lab.sharpening`, `lab.wavelet`, `working.trc`, `ciecam`, `gamut`, `crop`,
+`lab.sharpening`, `lab.wavelet`, `working.trc`, `ciecam`, `crop`,
 `output.sharpen`, `output.icc`, `thumbnail.decode` and `thumbnail.lab`.
 
 Three of these are not standalone pixel kernels and need a recorded exception

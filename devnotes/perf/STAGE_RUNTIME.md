@@ -282,6 +282,73 @@ There is no residual for the block: it is a pure pixel copy and a constant
 fill, with no arithmetic. The frame geometry stays in `stage_crop()`, as
 before.
 
+## Gamut
+
+`gamut` runs the end-of-process gamut block of `stage_gamut()` in
+`rtengine/simpleprocess.cc` as one in-place device pass: Lab, the linear
+working RGB, an optional gain, the ACES reference gamut compression and back
+to Lab. The block keeps its original guard (`workingTRC != NONE`, `trcExp` and
+`wgamut != NONE` or `wgamgain != 0`). When the node is selected the call site
+tries it first and returns without allocating `provcomp`; a refusal or a
+failed launch falls through to the unchanged host block, so the host never
+starts from a partly written Lab buffer. The preview, crop and thumbnail paths
+keep their own copies of this block.
+
+The ABI is `[0]` the three-plane F32 Lab buffer, read and written in place,
+`[1]` `wip`, `[2]` `wp`, `[3]` `to_out` and `[4]` `from_out` (four 9-entry F32
+matrices), `[5]` the double gain `pow_F(2, wgamgain)`, `[6]` the double
+compression power `wgampower` and `[7]` the int `compress` flag, 1 when a
+gamut is selected and 0 for the gain-only case. The single Lab allocation is
+addressed through the device row and plane pitches, so padded rows are
+correct.
+
+Matrix provenance, in double, is the one `ImProcFunctions::gamutcompr()`
+derives for `beginend == 1`: `wpro = workingSpaceMatrix(workingProfile)`,
+`inv_out = inverse(out)` for the selected output gamut, `Rprov = inv_out *
+wpro`, `to_out = transpose(Rprov)` and `from_out = inverse(to_out)`, while
+`wip` is `workingSpaceInverseMatrix(workingProfile)` and `wp` is
+`workingSpaceMatrix(workingProfile)`, exactly as the host block uses them. The
+four output-gamut matrices are local constants in `gamutcompr()`; they are
+repeated, with their source named, in `stage/algorithms/gamut_cl.h`, which the
+call site, the launcher and the test share so they cannot drift apart. Only the
+upload is single precision.
+
+The kernel reproduces the host arithmetic in the host's order: `Lab2XYZ` with
+the same `aa = a / 327.68f` form and CIE constants, `xyz2rgb` and `rgbxyz`,
+the gain, `aces_reference_gamut_compression` and `XYZ2Lab`. The compression is
+the rolloff branch only, because `gamutcompr()` sets `roll = true` for
+`beginend == 1`; the fixed thresholds 0.8/0.75/0.85 and distance limits
+1.15/1.25/1.5 are named constants in the kernel because they are the contract,
+not settings. `computeXYZ2Lab` and `computeXYZ2LabY` evaluate the same CIE
+curve analytically; the host answers the 0..65535 range from its interpolated
+`cachef`/`cachefy` tables, and the measured difference between the two is far
+below one 16-bit LSB. `#pragma OPENCL FP_CONTRACT OFF` keeps the multiply-add
+order.
+
+The launcher rejects a buffer that is not three-plane F32, a table that is not
+a 9-entry single-plane F32 matrix, a gain or power that is not positive and
+finite, a gain that does not fit the kernel's float multiplier, and a compress
+flag that is not 0 or 1. A working gamut value outside the enum is refused by
+the host parameter builder rather than mapped to a guessed matrix. Source and
+destination are the same buffer on purpose: every pixel is read and written
+exactly once, which is the host's `provcomp` result with one allocation. The
+three planes are read back after a wait, so the event is complete with
+`asynchronous=false`.
+
+Evidence:
+
+| Case | Result |
+|---|---|
+| device test, 238 and 179 wide (device row pitch 240 and 192), REC2020/ADOBE/SRGB/DCIP3 and the gain-only case, power 1.0 and 1.2, gain +0.5, -0.5 and 0 EV | PAE 0.031250 LSB16 (REC2020, SRGB, DCIP3), 0.045898 (ADOBE), 0.061035 (gain-only); 9976 of 17136 samples differ at 238x24, 5309 of 9129 at 179x17 |
+| device test, invalid compress flag and non-positive power | both refused, `RT_STAGE_OK` not returned, and the Lab buffer untouched |
+| `verify.sh --stage-device`, POCL CPU, `RT_REQUIRE_GPU=1`, `OMP_NUM_THREADS=1`, `gamut.pp3` | PASS, `max_pae=1.5259e-05`, record `"stage":"gamut","impl":"opencl","source":"opencl"` on a 3888x2608 frame |
+| `RT_STAGE_OPENCL` unset, gamut profile, `--gpu=off`, two concurrent runs | byte-identical to the pre-change binary at `3ee70b76f` (`sha256 10cdce4964b714ae93cd4eb843080d96580790d7170ea1130a0598899f678314`, 60 844 902 bytes); a sequential run differs only in the wall-clock Exif date-time string, and `--gpu=auto` is pixel-identical (`PAE 0`) |
+| forced refusal (`RT_STAGE_DEVICE_BUDGET_MB=16`) | the gamut record is absent, so the gate predicate fails while the export still succeeds through the host block |
+
+The device test's synthetic Lab content is L in [0, 32768] and a, b in
+[-16384, 16384], which saturates the compression. There is no residual for the
+block: the whole end-of-process gamut pass is the node.
+
 ## Thumbnail white balance
 
 `thumbnail.whitebalance` applies the white-balance multipliers that the host

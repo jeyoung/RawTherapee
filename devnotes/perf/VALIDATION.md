@@ -119,6 +119,7 @@ POCL ICD:
 stage-residency: device=cpu-ivybridge ... platform=Portable Computing Language type=CPU (POCL CPU run)
 stage-residency: lanczos3 scale 0.5: PAE 0.000000 LSB16, 0 of 9216 samples differ, tolerance 1.0 LSB16
 stage-residency: lanczos3 scale 1.5: PAE 0.000000 LSB16, 0 of 82944 samples differ, tolerance 1.0 LSB16
+stage-residency: gamut rec2020 238x24 (pitch 240): PAE 0.031250 LSB16, 9976 of 17136 samples differ
 stage-residency: run() parity: PAE 0.000000 LSB16, 0 of 4608 samples differ
 stage-residency-test: PASS (0 skipped)
 ```
@@ -138,17 +139,21 @@ node ran on the device rather than only comparing pixels.
 | Output conversion (neutral) | PASS, `max_pae=1.5259e-05` |
 | RGB tone stage (`rgbproc-exposure`) | PASS, `max_pae=1.5259e-05` |
 | Framing (`framing.pp3`, 1080x725 frame) | PASS, `max_pae=1.5259e-05`; the record is `"stage":"framing".*"impl":"opencl"` |
+| Gamut (`gamut.pp3`, gain 0.25 EV, Rec2020 compression) | PASS, `max_pae=1.5259e-05`; the record is `"stage":"gamut","impl":"opencl","source":"opencl"` |
 | Packed 8-bit Lab to RGB | byte-exact against an independent reference, and fails when the device matrix is scaled by 1.001 |
 | `monitor.output`, `viewport.output` in the GUI | device records with `impl=opencl`, `source=opencl`; preview image area identical to a CPU-only run (0 LSB8) |
 | `thumbnail.output` via the file browser | 12 device records; thumbnail cache byte-identical to a CPU-only run |
 | `thumbnail.transform` (float and U8) | sixteen rotation/flip combinations match the reference in both formats; not reached through the GUI harness |
 | `thumbnail.whitebalance` via the file browser | device record present; the 45.7 MP NEF cache is byte-identical to a CPU-only run; the device test matches its reference exactly |
-| Device records | `"stage":"lanczos3"`, `"stage":"transform"`, `"stage":"output.convert"` and `"stage":"framing"`, all `impl":"opencl"`, `source":"opencl"`; the classic log has no `opencl resize`, `opencl transform` or `opencl lab2srgb` line |
+| Device records | `"stage":"lanczos3"`, `"stage":"transform"`, `"stage":"output.convert"`, `"stage":"gamut"` and `"stage":"framing"`, all `impl":"opencl"`, `source":"opencl"`; the classic log has no `opencl resize`, `opencl transform` or `opencl lab2srgb` line |
 | Forced refusal (`RT_STAGE_DEVICE_BUDGET_MB=16`, `RT_REQUIRE_GPU=1`) | FAIL, exit 1, with `"impl":"host","source":"device-fallback"` on the first refused node |
 | No device selected (no `RT_OPENCL_ALLOW_CPU`) | SKIP |
-| `RT_STAGE_OPENCL` unset | classic backend logs `opencl resize`, no stage record; default path unchanged |
+| `RT_STAGE_OPENCL` unset | classic backend logs `opencl resize`, no stage record; default path unchanged, and at the gamut profile the export is byte-identical to the pre-change binary |
 
 The forced refusal proves the gate can fail, so the PASS is not vacuous. A
+targeted gamut refusal (`RT_STAGE_DEVICE_BUDGET_MB=16`) leaves the gamut
+record absent, so the gate predicate fails, while the export still succeeds
+through the host block and is pixel-identical to the CPU-only export. A
 targeted framing refusal with a 4900x4604 fixed frame and a 150 MB device
 budget leaves the resize and output nodes on the device while the framing
 record is absent; `drawFrame()` completes on the host and the framing gate
