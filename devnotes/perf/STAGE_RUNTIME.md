@@ -241,6 +241,47 @@ same tool exclusions (black and white, HSV equalizer, film simulation, colour
 toning and the rest). Parity is 1 LSB at 16-bit on 4% of pixels, and the
 classic path stays byte-identical to the package before the kernel moved.
 
+## Framing
+
+`framing` draws the frame in `ImProcFunctions::drawFrame()`. The block has no
+host stage built-in, so only that call site can select it; the classic engine
+path is the fill-and-copy loop it already ran.
+
+The ABI is `[0]` source, `[1]` destination, `[2..4]` doubles border red, green
+and blue, `[5..6]` ints row and column offset. Both buffers are three-plane F32
+`Imagefloat` views; the framed dimensions come from the destination buffer and
+the launcher inserts the source and destination row pitches. The border values
+are the `Color::gamma2curve` entries the host computes from the clipped 8-bit
+slider values, so the kernel receives the finished colour and does no gamma
+work. The offsets are the host's
+`int(round((outer - inner) / 2.0))`, which rounds an odd delta .5 away from
+zero.
+
+The node rejects a shape that is not three-plane F32, equal source and
+destination buffers, a destination smaller than the source, the equal-size
+shape that `drawFrame()` returns unchanged, and offsets that do not fit the
+source inside the frame. It writes every destination pixel exactly once: the
+source sample inside the source rectangle, the constant border colour
+elsewhere. That is the host's fill-then-copy result in one pass, and the
+explicit pitches keep padded rows correct. The three destination planes are
+read back after a wait, so the event is complete with `asynchronous=false`.
+
+Evidence:
+
+| Case | Result |
+|---|---|
+| device test, four shapes including odd and even deltas and one equal dimension | device execution, `device=OPENCL`, PAE 0.000000 LSB16, 0 of 3840, 3840, 2673 and 2856 samples differ from `ImProcFunctions::drawFrame()` |
+| equal-size and source-larger early returns | both return the source pointer unchanged with the node selected, so the node is never entered |
+| production call site with the node selected | 0 of the same samples differ from the CPU `drawFrame()` output |
+| `verify.sh --stage-device` with `framing.pp3` | PASS, `"stage":"framing".*"impl":"opencl"`, `max_pae=1.5259e-05` on a 1080x725 frame |
+| `RT_STAGE_OPENCL` unset, framing profile, `--gpu=off` | byte-identical to the pre-change binary in three concurrent runs; `--gpu=auto` also matched once, and the second run differed only in the wall-clock Exif `DateTime` tag |
+| forced refusal (`RT_STAGE_DEVICE_BUDGET_MB=16`, `RT_REQUIRE_GPU=1`) | `verify.sh --stage-device` FAIL, exit 1 |
+| targeted framing refusal (large fixed border, budget 150 MB) | the resize and output nodes still run on the device; the framing record is absent and `drawFrame()` completes on the host, so the framing gate predicate fails |
+
+There is no residual for the block: it is a pure pixel copy and a constant
+fill, with no arithmetic. The frame geometry stays in `stage_crop()`, as
+before.
+
 ## Thumbnail white balance
 
 `thumbnail.whitebalance` applies the white-balance multipliers that the host

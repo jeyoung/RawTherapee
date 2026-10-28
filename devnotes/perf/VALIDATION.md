@@ -137,20 +137,24 @@ node ran on the device rather than only comparing pixels.
 | Transform identity, device | exact, and fails when `sint` is mutated to 0.05 |
 | Output conversion (neutral) | PASS, `max_pae=1.5259e-05` |
 | RGB tone stage (`rgbproc-exposure`) | PASS, `max_pae=1.5259e-05` |
+| Framing (`framing.pp3`, 1080x725 frame) | PASS, `max_pae=1.5259e-05`; the record is `"stage":"framing".*"impl":"opencl"` |
 | Packed 8-bit Lab to RGB | byte-exact against an independent reference, and fails when the device matrix is scaled by 1.001 |
 | `monitor.output`, `viewport.output` in the GUI | device records with `impl=opencl`, `source=opencl`; preview image area identical to a CPU-only run (0 LSB8) |
 | `thumbnail.output` via the file browser | 12 device records; thumbnail cache byte-identical to a CPU-only run |
 | `thumbnail.transform` (float and U8) | sixteen rotation/flip combinations match the reference in both formats; not reached through the GUI harness |
 | `thumbnail.whitebalance` via the file browser | device record present; the 45.7 MP NEF cache is byte-identical to a CPU-only run; the device test matches its reference exactly |
-| Device records | `"stage":"lanczos3"`, `"stage":"transform"` and `"stage":"output.convert"`, all `impl":"opencl"`, `source":"opencl"`; the classic log has no `opencl resize`, `opencl transform` or `opencl lab2srgb` line |
-| Forced refusal (`RT_STAGE_DEVICE_BUDGET_MB=16`, `RT_REQUIRE_GPU=1`) | FAIL with `impl":"host","source":"device-fallback"` |
+| Device records | `"stage":"lanczos3"`, `"stage":"transform"`, `"stage":"output.convert"` and `"stage":"framing"`, all `impl":"opencl"`, `source":"opencl"`; the classic log has no `opencl resize`, `opencl transform` or `opencl lab2srgb` line |
+| Forced refusal (`RT_STAGE_DEVICE_BUDGET_MB=16`, `RT_REQUIRE_GPU=1`) | FAIL, exit 1, with `"impl":"host","source":"device-fallback"` on the first refused node |
 | No device selected (no `RT_OPENCL_ALLOW_CPU`) | SKIP |
 | `RT_STAGE_OPENCL` unset | classic backend logs `opencl resize`, no stage record; default path unchanged |
 
-The forced refusal proves the gate can fail, so the PASS is not vacuous. The
-device-versus-CPU difference is 1 LSB on 96 426 of 2 534 980 pixels (3.8%) for
-resize and on 384 601 of 10 139 424 pixels (3.8%) for transform, both inside
-the limit. The residency test's synthetic images are exact, including the
+The forced refusal proves the gate can fail, so the PASS is not vacuous. A
+targeted framing refusal with a 4900x4604 fixed frame and a 150 MB device
+budget leaves the resize and output nodes on the device while the framing
+record is absent; `drawFrame()` completes on the host and the framing gate
+predicate fails. The device-versus-CPU difference is 1 LSB on 96 426 of
+2 534 980 pixels (3.8%) for resize and on 384 601 of 10 139 424 pixels (3.8%)
+for transform, both inside the limit. The residency test's synthetic images are exact, including the
 identity transform, whose assertion was mutation-checked.
 
 ## Interactive nodes on the host

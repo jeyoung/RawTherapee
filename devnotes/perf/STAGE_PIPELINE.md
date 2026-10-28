@@ -79,7 +79,7 @@ sub-nodes and the residual beside it, not parity of the composite.
 | `crop` | Full/-/-/- | exact | reuse-output | crop | no |
 | `resize` | Full/-/-/- | exact | reuse-output | resize (`lanczos3`) | yes |
 | `output.sharpen` | Full/-/-/- | exact | reuse-input | post-resize sharpening | no |
-| `framing` | Full/-/-/- | exact | reuse-output | framing and frame drawing | no |
+| `framing` | Full/-/-/- | exact | reuse-output | framing and frame drawing | yes |
 | `output.icc` | Full/-/-/- | exact | recompute | attach output ICC and metadata | no |
 | `monitor.output` | -/Full/-/- | interactive | recompute | Lab to monitor RGB | yes |
 | `viewport.output` | -/-/Roi/- | interactive | recompute | Lab to monitor RGB for the viewport | yes |
@@ -1526,9 +1526,10 @@ device run is slower than the host and exists for parity and correctness.
 The `Device` column of the canonical block catalogue above is the single source
 of truth; this section records the remaining work and the naming exceptions.
 
-Device nodes today: `transform`, `rgb.proc`, `lanczos3` (block `resize`),
-`output.convert`, `monitor.output`, `viewport.output`, `thumbnail.output`,
-`thumbnail.whitebalance`, `thumbnail.scale` and `thumbnail.transform` (the last
+Device nodes today: `transform`, `rgb.proc`, `framing`, `lanczos3` (block
+`resize`), `output.convert`, `monitor.output`, `viewport.output`,
+`thumbnail.output`, `thumbnail.whitebalance`, `thumbnail.scale` and
+`thumbnail.transform` (the last
 two plus their runtime-only packed siblings `thumbnail.scale.u8` and
 `thumbnail.transform.u8`).
 
@@ -1541,8 +1542,7 @@ records, the commands and the parity result are in `STAGE_RUNTIME.md`.
 Still CPU-only: `source.select`, `source.embedded`, `raw.preprocess`,
 `raw.demosaic`, `raw.base`, `analysis`, `local.adjustments`, `lab.tools`,
 `lab.sharpening`, `lab.wavelet`, `working.trc`, `ciecam`, `gamut`, `crop`,
-`output.sharpen`, `framing`, `output.icc`, `thumbnail.decode` and
-`thumbnail.lab`.
+`output.sharpen`, `output.icc`, `thumbnail.decode` and `thumbnail.lab`.
 
 Three of these are not standalone pixel kernels and need a recorded exception
 rather than a device node: `source.select` and `source.embedded` are I/O, and
