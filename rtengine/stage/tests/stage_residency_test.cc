@@ -1458,6 +1458,60 @@ void run_scale_f32_cases(StageQueue& queue, StageBufferAllocator& host)
     host.release(source_buffer);
 }
 
+/*
+ * Image16 pads every row to 128 bits, so a width that is not a multiple of
+ * eight separates the allocated stride from the packed row. The source here is
+ * a real Image16 handed to the node through stage::view(), exactly as the
+ * production call site does it, rather than an allocator buffer with packed
+ * strides: a descriptor that reported the packed width would upload rows at
+ * the wrong offsets and the comparison below would fail.
+ */
+void run_scale_padded_view_case(StageQueue& queue, StageBufferAllocator& host)
+{
+    /* 41 * 2 bytes: 82 packed, 96 with the 128-bit row padding. */
+    constexpr int PADDED_WIDTH = 41;
+    constexpr int PADDED_HEIGHT = 23;
+    constexpr int PADDED_DST_WIDTH = 19;
+    constexpr int PADDED_DST_HEIGHT = 11;
+    const ScaleTarget target{PADDED_DST_WIDTH, PADDED_DST_HEIGHT,
+                             "padded 41x23 to 19x11"};
+
+    Image16 source(PADDED_WIDTH, PADDED_HEIGHT);
+    if (source.getWidth() != PADDED_WIDTH ||
+        source.getHeight() != PADDED_HEIGHT) {
+        check(false, "padded Image16 fixture allocates");
+        return;
+    }
+    fill_scale_source(source);
+
+    const RtStageBuffer source_view = view(source);
+    check(source_view.row_pitch == source.getRowStride(),
+          "the Image16 view reports the allocated row stride");
+    check(source_view.row_pitch >=
+              static_cast<std::size_t>(PADDED_WIDTH) *
+                  sizeof(unsigned short),
+          "the Image16 row stride covers the packed row");
+    /* Padding is present, so the case cannot pass on a packed descriptor. */
+    check(source_view.row_pitch >
+              static_cast<std::size_t>(PADDED_WIDTH) *
+                  sizeof(unsigned short),
+          "the 41-column Image16 row is padded beyond the packed row");
+    check(source_view.plane_pitch == source.getPlaneStride(),
+          "the Image16 view reports the allocated plane stride");
+
+    for (TypeInterpolation interp : {TI_Nearest, TI_Bilinear}) {
+        Imagefloat reference(PADDED_DST_WIDTH, PADDED_DST_HEIGHT);
+        source.resizeImgTo(PADDED_DST_WIDTH, PADDED_DST_HEIGHT, interp,
+                           &reference);
+        RtStageBuffer device = host.allocate(
+            {RT_STAGE_F32, PADDED_DST_WIDTH, PADDED_DST_HEIGHT, 3});
+        submit_scale(queue, "thumbnail.scale", source_view, device, interp);
+        report_scale("thumbnail.scale (padded Image16)", target, interp,
+                     compare_scale(device, reference), true);
+        host.release(device);
+    }
+}
+
 void test_thumbnail_scale(bool available)
 {
     using namespace rtengine::stage;
@@ -1482,6 +1536,7 @@ void test_thumbnail_scale(bool available)
     run_scale_u8_cases(*queue, host);
     run_scale_u16_cases(*queue, host);
     run_scale_f32_cases(*queue, host);
+    run_scale_padded_view_case(*queue, host);
 }
 
 /* ------------------------------------------------------------ selection */
