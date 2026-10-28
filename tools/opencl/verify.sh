@@ -9,6 +9,7 @@
 #    tools/opencl/verify.sh --formats
 #    tools/opencl/verify.sh --monitor
 #    tools/opencl/verify.sh --rgbproc
+#    tools/opencl/verify.sh --stage-device
 #    tools/opencl/verify.sh --list-coverage
 #
 #  Environment:
@@ -216,6 +217,7 @@ quick() {
     expect_stage=0
     expect_stage_name=""
     run_monitor
+    run_stage_device "pef/stage-device"
 }
 
 stage() {
@@ -321,6 +323,84 @@ monitor() {
     run_monitor
 }
 
+# The stage device is opt-in and separate from the classic backend: the device
+# path needs both the user preference (`--gpu=auto`) and RT_STAGE_OPENCL=1, and
+# it reports through the stage profile record rather than the classic log. The
+# node must appear with impl="opencl"; impl="host" means the device declined
+# and the built-in or module ran instead, which is a SKIP unless a GPU is
+# required.
+run_stage_device() {
+    local label="$1"
+    local sample="${sample_override:-$TESTDATA/colorspace_flowers.pef}"
+    local profile="$ROOT/devnotes/opencl/pp3/resize.pp3"
+
+    [ -f "$sample" ] || die "missing $sample (run tools/opencl/fetch-testdata.sh)"
+    [ -f "$profile" ] || die "missing profile $profile"
+
+    if [ "$has_device" -eq 0 ]; then
+        if [ "${RT_REQUIRE_GPU:-0}" = "1" ]; then
+            printf 'FAIL\t%s\tno OpenCL device for the stage path\n' "$label"
+            return 1
+        fi
+        printf 'SKIP\t%s\tno OpenCL device (set RT_OPENCL_ALLOW_CPU=1 for a CPU device)\n' "$label"
+        return 0
+    fi
+
+    local outdir
+    outdir="$(mktemp -d "${TMPDIR:-/tmp}/rtstagedev.XXXXXX")"
+    local record="$outdir/stages.json"
+    local host="$outdir/host.tif"
+    local device="$outdir/device.tif"
+
+    if ! env OMP_NUM_THREADS="$THREADS" "$cli" --gpu=off -p "$profile" \
+            -o "$host" -t -b16 -Y -c "$sample" >"$outdir/host.log" 2>&1; then
+        printf 'FAIL\t%s\tload or export failed (gpu=off)\n' "$label"
+        rm -rf "$outdir"
+        return 1
+    fi
+
+    if ! env OMP_NUM_THREADS="$THREADS" RT_STAGE_OPENCL=1 \
+            RT_STAGE_PROFILE="$record" "$cli" --gpu=auto -p "$profile" \
+            -o "$device" -t -b16 -Y -c "$sample" >"$outdir/device.log" 2>&1; then
+        printf 'FAIL\t%s\tload or export failed (stage device)\n' "$label"
+        rm -rf "$outdir"
+        return 1
+    fi
+
+    if [ ! -s "$record" ] || ! grep -q '"stage":"lanczos3"' "$record"; then
+        printf 'FAIL\t%s\tno stage record for lanczos3\n' "$label"
+        rm -rf "$outdir"
+        return 1
+    fi
+
+    if ! grep -Eq '"stage":"lanczos3".*"impl":"opencl"' "$record"; then
+        local why
+        why="$(grep '"stage":"lanczos3"' "$record" | head -1)"
+        rm -rf "$outdir"
+        if [ "${RT_REQUIRE_GPU:-0}" = "1" ]; then
+            printf 'FAIL\t%s\tstage device did not execute: %s\n' "$label" "$why"
+            return 1
+        fi
+        printf 'SKIP\t%s\tstage device declined: %s\n' "$label" "$why"
+        return 0
+    fi
+
+    local result="PASS"
+    if ! compare_images "$host" "$device"; then
+        result="FAIL"
+    fi
+    printf '%s\t%s\tmax_pae=%s\n' "$result" "$label" "${LAST_PAE:-unknown}"
+    rm -rf "$outdir"
+    [ "$result" = "PASS" ]
+}
+
+stage_device() {
+    printf 'binary\t%s\n' "$cli"
+    "$cli" --gpu-info | tail -n +2 | sed 's/^/gpu\t/'
+    detect_device
+    run_stage_device "pef/stage-device"
+}
+
 rgbproc() {
     local sample="${sample_override:-$TESTDATA/colorspace_flowers.pef}"
     local profile="$ROOT/devnotes/opencl/pp3/rgbproc-exposure.pp3"
@@ -402,6 +482,7 @@ while [ "$#" -gt 0 ]; do
         --formats) mode="formats" ;;
         --monitor) mode="monitor" ;;
         --rgbproc) mode="rgbproc" ;;
+        --stage-device) mode="stage_device" ;;
         --stage)
             [ "$#" -ge 2 ] || die "--stage needs a name"
             mode="stage"
@@ -429,6 +510,7 @@ case "$mode" in
     formats) formats ;;
     monitor) monitor ;;
     rgbproc) rgbproc ;;
+    stage_device) stage_device ;;
     stage) stage "$stage_name" ;;
     coverage) list_coverage ;;
 esac
