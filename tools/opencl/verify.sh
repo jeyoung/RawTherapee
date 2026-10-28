@@ -226,6 +226,8 @@ quick() {
         "$ROOT/devnotes/opencl/pp3/rgbproc-exposure.pp3" rgb.proc
     run_stage_device "pef/stage-device-framing" \
         "$ROOT/devnotes/opencl/pp3/framing.pp3" framing
+    run_stage_device "pef/stage-device-gamut" \
+        "$ROOT/devnotes/opencl/pp3/gamut.pp3" gamut
 }
 
 stage() {
@@ -426,6 +428,8 @@ stage_device() {
         "$ROOT/devnotes/opencl/pp3/rgbproc-exposure.pp3" rgb.proc
     run_stage_device "pef/stage-device-framing" \
         "$ROOT/devnotes/opencl/pp3/framing.pp3" framing
+    run_stage_device "pef/stage-device-gamut" \
+        "$ROOT/devnotes/opencl/pp3/gamut.pp3" gamut
 }
 
 rgbproc() {

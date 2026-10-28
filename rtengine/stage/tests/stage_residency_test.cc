@@ -14,10 +14,14 @@
 #include "image8.h"
 #include "image16.h"
 #include "imagefloat.h"
+#include "labimage.h"
 
 #include "color.h"
+#include "iccstore.h"
 #include "improcfun.h"
 #include "procparams.h"
+#include "settings.h"
+#include "stage/algorithms/gamut_cl.h"
 
 #include <algorithm>
 #include <cmath>
@@ -38,6 +42,8 @@ using namespace rtengine::stage;
 using rtengine::Image8;
 using rtengine::Image16;
 using rtengine::Imagefloat;
+using rtengine::LabImage;
+using rtengine::TMatrix;
 using rtengine::TI_Bilinear;
 using rtengine::TI_Nearest;
 using rtengine::TypeInterpolation;
@@ -2259,6 +2265,315 @@ void test_framing(bool available)
     }
 }
 
+/* ------------------------------------------------------------- gamut node */
+
+/*
+ * Color::XYZ2Lab() reads Color::cachef and Color::cachefy, which
+ * Color::init() fills together with the denoise tables and the Settings
+ * singleton. The two Lab tables are therefore filled here with the same
+ * formulas and the same double intermediate, as init_gamma2curve() does for
+ * the framing node.
+ */
+void init_lab_caches()
+{
+    constexpr int ENTRIES = 65536;
+    constexpr double MAX_VALUE = 65535.0;
+    constexpr double KAPPA = 24389.0 / 27.0;
+    const double eps_max = MAX_VALUE * (216.0 / 24389.0);
+
+    rtengine::Color::cachef(ENTRIES, LUT_CLIP_BELOW);
+    rtengine::Color::cachefy(ENTRIES, LUT_CLIP_BELOW);
+
+    int i = 0;
+    for (; i <= static_cast<int>(eps_max); ++i) {
+        const double index = i;
+        rtengine::Color::cachef[i] =
+            327.68 * ((KAPPA * index / MAX_VALUE + 16.0) / 116.0);
+        rtengine::Color::cachefy[i] = 327.68 * (KAPPA * index / MAX_VALUE);
+    }
+    for (; i < ENTRIES; ++i) {
+        const double index = i;
+        rtengine::Color::cachef[i] = 327.68 * std::cbrt(index / MAX_VALUE);
+        rtengine::Color::cachefy[i] =
+            327.68 * (116.0 * std::cbrt(index / MAX_VALUE) - 16.0);
+    }
+}
+
+/*
+ * Deterministic Lab content with real gamut excursions: L in [0, 32768] and
+ * a, b in [-16384, 16384]. That covers saturated colours, which the
+ * compression must treat, without pushing the pipeline far outside the range
+ * a photograph can produce.
+ */
+void fill_lab(LabImage& lab, unsigned seed)
+{
+    constexpr unsigned MAX_L = 32768u;
+    constexpr int MAX_AB = 16384;
+    constexpr unsigned AB_RANGE = 2u * MAX_AB + 1u;
+
+    std::uint32_t state = seed * 2654435761u + 1u;
+    const auto next = [&state]() {
+        state = state * 1664525u + 1013904223u;
+        return state >> 8;
+    };
+
+    for (int y = 0; y < lab.H; ++y) {
+        for (int x = 0; x < lab.W; ++x) {
+            lab.L[y][x] = static_cast<float>(next() % (MAX_L + 1u));
+            lab.a[y][x] = static_cast<float>(
+                static_cast<int>(next() % AB_RANGE) - MAX_AB);
+            lab.b[y][x] = static_cast<float>(
+                static_cast<int>(next() % AB_RANGE) - MAX_AB);
+        }
+    }
+}
+
+/*
+ * The host block of stage_gamut(), assembled from the production functions:
+ * Color::Lab2XYZ, Color::xyz2rgb, ImProcFunctions::gamutcompr, Color::rgbxyz
+ * and Color::XYZ2Lab, in the same order.
+ */
+void gamut_cpu_reference(rtengine::ImProcFunctions& ipf,
+                         const rtengine::procparams::ProcParams& params,
+                         const LabImage& source, LabImage& destination)
+{
+    const int GW = source.W;
+    const int GH = source.H;
+
+    const TMatrix wprof = rtengine::ICCStore::getInstance()->workingSpaceMatrix(
+        params.icm.workingProfile);
+    const double wp[3][3] = {
+        {wprof[0][0], wprof[0][1], wprof[0][2]},
+        {wprof[1][0], wprof[1][1], wprof[1][2]},
+        {wprof[2][0], wprof[2][1], wprof[2][2]}};
+    const TMatrix wiprof =
+        rtengine::ICCStore::getInstance()->workingSpaceInverseMatrix(
+            params.icm.workingProfile);
+    const double wip[3][3] = {
+        {wiprof[0][0], wiprof[0][1], wiprof[0][2]},
+        {wiprof[1][0], wiprof[1][1], wiprof[1][2]},
+        {wiprof[2][0], wiprof[2][1], wiprof[2][2]}};
+
+    Imagefloat provcomp(GW, GH);
+
+    for (int i = 0; i < GH; ++i) {
+        for (int j = 0; j < GW; ++j) {
+            float X = 0.0f;
+            float Y = 0.0f;
+            float Z = 0.0f;
+            rtengine::Color::Lab2XYZ(source.L[i][j], source.a[i][j],
+                                     source.b[i][j], X, Y, Z);
+            rtengine::Color::xyz2rgb(X, Y, Z, provcomp.r(i, j),
+                                     provcomp.g(i, j), provcomp.b(i, j), wip);
+        }
+    }
+
+    const float gainev =
+        pow_F(2.0f, static_cast<float>(params.icm.wgamgain));
+    if (params.icm.wgamgain != 0.0f) {
+        for (int i = 0; i < GH; ++i) {
+            for (int j = 0; j < GW; ++j) {
+                provcomp.r(i, j) *= gainev;
+                provcomp.g(i, j) *= gainev;
+                provcomp.b(i, j) *= gainev;
+            }
+        }
+    }
+
+    if (params.icm.wgamut !=
+        rtengine::procparams::ColorManagementParams::Wwgamut::NONE) {
+        float mac = 0.0f;
+        float mac0 = 0.0f;
+        float mac1 = 0.0f;
+        float mac2 = 0.0f;
+        ipf.gamutcompr(&provcomp, &provcomp, 1, 1.0f, 0, mac, mac0, mac1,
+                       mac2);
+    }
+
+    for (int i = 0; i < GH; ++i) {
+        for (int j = 0; j < GW; ++j) {
+            float x = 0.0f;
+            float y = 0.0f;
+            float z = 0.0f;
+            rtengine::Color::rgbxyz(provcomp.r(i, j), provcomp.g(i, j),
+                                    provcomp.b(i, j), x, y, z, wp);
+            rtengine::Color::XYZ2Lab(x, y, z, destination.L[i][j],
+                                     destination.a[i][j],
+                                     destination.b[i][j]);
+        }
+    }
+}
+
+struct GamutCase {
+    const char* name;
+    int width;
+    int height;
+    rtengine::procparams::ColorManagementParams::Wwgamut gamut;
+    double gain;
+    double power;
+};
+
+/*
+ * Compare the node with the production host block for every end-of-process
+ * gamut, for the gain-only case, and at widths whose device rows are padded
+ * by the stage alignment (238 and 179 do not tile the alignment).
+ */
+void test_gamut(bool available)
+{
+    using namespace rtengine::stage;
+    using Wwgamut = rtengine::procparams::ColorManagementParams::Wwgamut;
+
+    init_lab_caches();
+
+    /*
+     * gamutcompr() reads settings->verbose. The engine normally installs the
+     * Settings singleton; a value-initialised one keeps this test standalone.
+     */
+    static rtengine::Settings test_settings{};
+    rtengine::settings = &test_settings;
+
+    {
+        rtengine::procparams::ColorManagementParams icm;
+        icm.workingProfile = "Rec2020";
+        icm.wgamut = static_cast<Wwgamut>(99);
+        GamutNodeParams rejected;
+        std::string error;
+        check(!gamut_node_params(icm, rejected, error),
+              "gamut rejects a working gamut value outside the enum");
+    }
+
+    if (available) {
+        check(node_has_device_implementation("gamut"),
+              "the gamut node has a device implementation");
+    }
+
+    const GamutCase cases[] = {
+        {"rec2020", 238, 24, Wwgamut::REC2020, 0.0, 1.0},
+        {"adobe", 238, 24, Wwgamut::ADOBE, 0.0, 1.0},
+        {"srgb", 238, 24, Wwgamut::SRGB, 0.0, 1.0},
+        {"dcip3", 238, 24, Wwgamut::DCIP3, 0.0, 1.0},
+        {"gain only", 238, 24, Wwgamut::NONE, 0.5, 1.0},
+        {"rec2020 narrow", 179, 17, Wwgamut::REC2020, 0.0, 1.2},
+        {"adobe narrow", 179, 17, Wwgamut::ADOBE, 0.0, 1.2},
+        {"srgb narrow", 179, 17, Wwgamut::SRGB, 0.0, 1.2},
+        {"dcip3 narrow", 179, 17, Wwgamut::DCIP3, 0.0, 1.2},
+        {"gain only narrow", 179, 17, Wwgamut::NONE, -0.5, 1.0},
+    };
+
+    if (!available) {
+        skip("gamut: no OpenCL device");
+        return;
+    }
+
+    const auto context = opencl_device()->create_context();
+    check(context != nullptr, "gamut: the device creates a context");
+    if (context == nullptr) {
+        return;
+    }
+
+    for (const GamutCase& item : cases) {
+        rtengine::procparams::ProcParams params;
+        params.icm.workingProfile = "Rec2020";
+        params.icm.workingTRC =
+            rtengine::procparams::ColorManagementParams::WorkingTrc::GAMMA_2_2;
+        params.icm.trcExp = true;
+        params.icm.wgamut = item.gamut;
+        params.icm.wgamgain = item.gain;
+        params.icm.wgampower = item.power;
+
+        rtengine::ImProcFunctions ipf(&params, false);
+
+        LabImage source(item.width, item.height);
+        fill_lab(source, 5u);
+        LabImage cpu(item.width, item.height);
+        gamut_cpu_reference(ipf, params, source, cpu);
+
+        LabImage device(item.width, item.height);
+        fill_lab(device, 5u);
+
+        GamutNodeParams node_params;
+        std::string error;
+        if (!gamut_node_params(params.icm, node_params, error)) {
+            check(false, "gamut: the host parameters are built");
+            continue;
+        }
+        GamutNodeArgs node;
+        gamut_node_args(device, node_params, node);
+
+        set_node_device_override("gamut", StageNodeDevice::OpenCL);
+        StageRequest request;
+        request.name = "gamut";
+        request.args.assign(node.args, node.args + 8);
+        StageExecution execution;
+        const RtStageStatus status =
+            context->execute(request, nullptr, &execution);
+        clear_node_device_overrides();
+
+        check(status == RT_STAGE_OK, "the device executes the gamut node");
+        check(execution.device == StageDeviceType::OPENCL,
+              "the gamut execution names the device");
+        check(!execution.asynchronous,
+              "gamut reads its planes back, so the execution is complete");
+
+        std::size_t row_pitch = 0;
+        std::size_t plane_pitch = 0;
+        std::size_t bytes = 0;
+        std::string layout_error;
+        check(stage_buffer_layout({RT_STAGE_F32, item.width, item.height, 3},
+                                  row_pitch, plane_pitch, bytes,
+                                  &layout_error),
+              "gamut: the device layout is valid");
+        check(row_pitch / sizeof(float) >
+                  static_cast<std::size_t>(item.width),
+              "gamut: the narrow case really has padded rows");
+
+        const Diff diff = compare(view(device), view(cpu));
+        std::printf("stage-residency: gamut %s %dx%d (pitch %zu): "
+                    "PAE %.6f LSB16, %zu of %zu samples differ\n",
+                    item.name, item.width, item.height,
+                    row_pitch / sizeof(float), diff.max_abs,
+                    diff.differing, diff.samples);
+        check(diff.finite, "the gamut device output is finite");
+        check(diff.max_abs <= 1.0,
+              "the gamut device output is within one LSB16");
+
+        /*
+         * The node validates its inputs. A refusal must leave the buffer
+         * untouched, because the call site then runs the host block on it.
+         */
+        if (item.gamut == Wwgamut::REC2020 && item.width == 238) {
+            LabImage guarded(item.width, item.height);
+            fill_lab(guarded, 5u);
+            GamutNodeArgs bad;
+            gamut_node_args(guarded, node_params, bad);
+            bad.args[7].u.i = 2;
+            set_node_device_override("gamut", StageNodeDevice::OpenCL);
+            StageRequest refuse;
+            refuse.name = "gamut";
+            refuse.args.assign(bad.args, bad.args + 8);
+            StageExecution refused;
+            const RtStageStatus refuse_status =
+                context->execute(refuse, nullptr, &refused);
+            clear_node_device_overrides();
+            check(refuse_status != RT_STAGE_OK,
+                  "gamut refuses a compress flag that is not 0 or 1");
+            const Diff untouched = compare(view(guarded), view(source));
+            check(untouched.differing == 0 && untouched.max_abs == 0.0,
+                  "a refused gamut leaves the Lab buffer untouched");
+
+            bad.args[7].u.i = 1;
+            bad.args[6].u.f = 0.0;
+            set_node_device_override("gamut", StageNodeDevice::OpenCL);
+            refuse.args.assign(bad.args, bad.args + 8);
+            const RtStageStatus power_status =
+                context->execute(refuse, nullptr, &refused);
+            clear_node_device_overrides();
+            check(power_status != RT_STAGE_OK,
+                  "gamut refuses a non-positive compression power");
+        }
+    }
+}
+
 /* --------------------------------------------------------- run() wiring */
 
 void test_run_wiring(bool available)
@@ -2385,6 +2700,7 @@ int main()
     test_node_parity(available);
     test_rgb_proc_pitch(available);
     test_framing(available);
+    test_gamut(available);
     test_run_wiring(available);
 
     if (failures == 0) {

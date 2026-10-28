@@ -1,0 +1,7 @@
+[Color Management]
+WorkingProfile=Rec2020
+WorkingTRC=22
+TrcExp=true
+Wwgamut=rec2020
+Wgampower=1.2
+Wgamgain=0.25
