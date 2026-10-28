@@ -87,6 +87,37 @@ fallback; the served hit cost 37-40 ms at fit and 57-61 ms at 100 %. See
 navigator/histogram MAE note.
 
 
+## Known defect: second image stuck at the rough stage
+
+Single-tab, load an image, open a second from the file browser, then
+double-click the image area to zoom. The second image stays at the first
+progressive stage: a small pixelated block with the grid overlay and a `0%`
+zoom indicator.
+
+Attribution: **pre-existing upstream behaviour**, not from the typed-request
+work. `build/baseline-dev/rtgui/rawtherapee` (dev, 2026-10-24, before this
+branch) reproduces the same state from the same steps.
+
+Trace from the branch build, with `RT_STAGE_PROFILE` counting real passes:
+
+| Step | Device records | Trace |
+| --- | --- | --- |
+| first image loaded and zoomed | 20 | `setZoom old=200 new=200 enabled=1`, crop `0,0 8280x5512` |
+| second image loaded | 21 | one `monitor.output` at `552x828`; no transform, no final pass |
+| double-click on the second image | 21 | `setZoom old=200 new=500 enabled=0`, crop `0,0 5512x8280`, no `update()` |
+
+Two findings to start from when it is fixed:
+
+- the crop handler is `enabled=0` after the image switch, so
+  `CropHandler::setZoom()` never calls `update()` and no render is requested;
+- the fit zoom for the portrait image resolves to `500` (factor 0.02) where a
+  fit in a 1200x680 window needs about `200`, which is why the image appears as
+  a small block.
+
+Do not patch from the symptom alone: the disabled flag and the wrong fit value
+may share one stale input. Instrument `CropHandler::setEnabled`,
+`CropWindow::zoomFit()`/`getFitZoom()` and the editor load path first.
+
 ## Initial-load reveal
 
 Single-editor mode replaces the previous image immediately when a new raw
