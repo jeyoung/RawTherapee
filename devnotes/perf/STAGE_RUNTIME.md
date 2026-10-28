@@ -246,9 +246,11 @@ classic path stays byte-identical to the package before the kernel moved.
 `thumbnail.whitebalance` applies the white-balance multipliers that the host
 resolves from the colour temperature, with the highlight-average branch for
 `toneCurve.hrenabled`. The kernel is small and in place: one three-plane F32
-buffer, three multipliers and the flag. It is the first thumbnail node on the
-device beyond `thumbnail.output`, and the cache it feeds is byte-identical to a
-CPU-only run.
+buffer, three multipliers and the flag. The whole image is one device
+allocation addressed through its plane pitch; uploading each plane into its
+own compact buffer put the plane 1 and 2 writes past the first allocation,
+which the device test caught. A 45.7 MP NEF thumbnail cache is byte-identical
+to a CPU-only run.
 
 ## Pilot stage
 

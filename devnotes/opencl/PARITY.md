@@ -127,8 +127,9 @@ peak absolute error is zero for the synthetic node tests:
   error of 1 LSB16 on 384 601 of 10 139 424 pixels (3.8%), the same order as
   the classic GPU path. The interpolation helpers and the map builder are
   shared with the classic backend, so only the addressing differs.
-- `thumbnail.whitebalance` runs on the device for the file-browser thumbnails
-  and the thumbnail cache is byte-identical to a CPU-only run.
+- `thumbnail.whitebalance` runs on the device for the file-browser thumbnails;
+  a 45.7 MP NEF thumbnail cache is byte-identical to a CPU-only run, and the
+  device test matches an independent reference exactly.
 - `rgb.proc` through the device, against the `--gpu=off` reference, has a peak
   error of 1 LSB16 on 401 708 of 10 139 424 pixels (4.0%). The classic path is
   byte-identical to the package built before the kernel moved.
