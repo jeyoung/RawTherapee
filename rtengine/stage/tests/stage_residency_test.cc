@@ -2116,7 +2116,8 @@ void test_framing(bool available)
         {"even delta, white", 32, 24, 40, 32, 255, 255, 255},
         {"odd delta, black", 31, 23, 40, 32, 0, 0, 0},
         {"both sides smaller, grey", 20, 16, 33, 27, 128, 128, 128},
-        {"one side equal, per-channel", 25, 19, 34, 28, 255, 128, 0},
+        {"per-channel border", 25, 19, 34, 28, 255, 128, 0},
+        {"one axis equal, zero row offset", 25, 19, 34, 19, 255, 128, 0},
     };
 
     /* Both early returns are host rules and must not reach the node. */
