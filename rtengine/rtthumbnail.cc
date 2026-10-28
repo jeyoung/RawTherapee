@@ -1584,6 +1584,75 @@ struct Thumbnail::QuickStageState {
     Image8* img = nullptr;
 };
 
+namespace
+{
+
+/* The ABI interpolation selector mirrors the engine's TypeInterpolation. */
+static_assert(static_cast<int>(TI_Nearest) == 0 &&
+                  static_cast<int>(TI_Bilinear) == 1,
+              "the ABI interpolation selector mirrors TypeInterpolation");
+
+/*
+ * thumbnail.scale.u8 on the device: a packed 8-bit source into a packed 8-bit
+ * destination, reproducing `ChunkyRGBData::resizeImgTo`. The caller keeps the
+ * host path when this returns false.
+ */
+bool run_thumbnail_scale_u8_stage(Image8& source, Image8& dst,
+                                  TypeInterpolation interp)
+{
+    constexpr int ARG_COUNT = 3;
+
+    RtStageArg args[ARG_COUNT]{};
+    args[0].kind = RT_STAGE_ARG_BUFFER;
+    args[0].u.buffer = stage::view(source);
+    args[1].kind = RT_STAGE_ARG_BUFFER;
+    args[1].u.buffer = stage::view(dst);
+    args[2].kind = RT_STAGE_ARG_INT;
+    args[2].u.i = static_cast<int64_t>(interp);
+
+    RtStageProfiling profiling{};
+    return stage::run("thumbnail.scale.u8",
+                      std::vector<RtStageArg>(args, args + ARG_COUNT),
+                      &profiling) == RT_STAGE_OK;
+}
+
+/*
+ * thumbnail.scale on the device: the cached thumbnail may be packed 8-bit or
+ * planar 16-bit or float, and the destination is three-plane float. Reaching
+ * `resizeImgTo` through the same type switch keeps the source layout honest.
+ */
+bool run_thumbnail_scale_stage(ImageIO* source, Imagefloat& dst,
+                               TypeInterpolation interp)
+{
+    RtStageBuffer source_view{};
+    if (source->getType() == sImage8) {
+        source_view = stage::view(*static_cast<Image8*>(source));
+    } else if (source->getType() == sImage16) {
+        source_view = stage::view(*static_cast<Image16*>(source));
+    } else if (source->getType() == sImagefloat) {
+        source_view = stage::view(*static_cast<Imagefloat*>(source));
+    } else {
+        return false;
+    }
+
+    constexpr int ARG_COUNT = 3;
+
+    RtStageArg args[ARG_COUNT]{};
+    args[0].kind = RT_STAGE_ARG_BUFFER;
+    args[0].u.buffer = source_view;
+    args[1].kind = RT_STAGE_ARG_BUFFER;
+    args[1].u.buffer = stage::view(dst);
+    args[2].kind = RT_STAGE_ARG_INT;
+    args[2].u.i = static_cast<int64_t>(interp);
+
+    RtStageProfiling profiling{};
+    return stage::run("thumbnail.scale",
+                      std::vector<RtStageArg>(args, args + ARG_COUNT),
+                      &profiling) == RT_STAGE_OK;
+}
+
+} // namespace
+
 /*
  * thumbnail.scale for the embedded JPEG branch. The embedded image continues
  * in 8-bit, so this block rescales to the requested height with the same
@@ -1604,7 +1673,25 @@ void Thumbnail::stageQuickScale(QuickStageState& state)
         rwidth = thumbImg->getWidth() * rheight / thumbImg->getHeight();
     }
 
-    baseImg = resizeTo<Image8> (rwidth, rheight, state.interp, thumbImg);
+    Image8* scaled = nullptr;
+    /*
+     * The quick path leaves a collapsed destination to `resizeTo`, so the
+     * device node is only offered a usable one. The embedded image is 8-bit;
+     * any other type falls through to the host unchanged.
+     */
+    if (rwidth >= 1 && rheight >= 1 && thumbImg->getType() == sImage8 &&
+        stage::node_device("thumbnail.scale.u8") ==
+            stage::StageNodeDevice::OpenCL) {
+        std::unique_ptr<Image8> dst(new Image8(rwidth, rheight));
+        if (run_thumbnail_scale_u8_stage(*static_cast<Image8*>(thumbImg), *dst,
+                                         state.interp)) {
+            scaled = dst.release();
+        }
+    }
+
+    baseImg = scaled != nullptr
+                  ? scaled
+                  : resizeTo<Image8> (rwidth, rheight, state.interp, thumbImg);
 }
 
 /*
@@ -1770,8 +1857,19 @@ void Thumbnail::stageScale(StageState& state)
 
     if (rwidth < 1) rwidth = 1;
     if (rheight < 1) rheight = 1;
+    assert(rwidth >= 1 && rheight >= 1);
 
-    baseImg = resizeTo<Imagefloat> (rwidth, rheight, state.interp, thumbImg);
+    Imagefloat* scaled = nullptr;
+    if (stage::node_device("thumbnail.scale") == stage::StageNodeDevice::OpenCL) {
+        std::unique_ptr<Imagefloat> dst(new Imagefloat(rwidth, rheight));
+        if (run_thumbnail_scale_stage(thumbImg, *dst, state.interp)) {
+            scaled = dst.release();
+        }
+    }
+
+    baseImg = scaled != nullptr
+                  ? scaled
+                  : resizeTo<Imagefloat> (rwidth, rheight, state.interp, thumbImg);
 
     // Film negative legacy mode, for backwards compatibility RT v5.8
     if (params.filmNegative.enabled) {

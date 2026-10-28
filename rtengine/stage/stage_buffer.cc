@@ -1,6 +1,7 @@
 #include "stage_buffer.h"
 
 #include "image8.h"
+#include "image16.h"
 #include "imagefloat.h"
 #include "labimage.h"
 
@@ -68,6 +69,19 @@ RtStageBuffer view(Image8& image)
     const size_t plane_pitch = row_pitch * static_cast<size_t>(image.getHeight());
     return make(image.data, image.getWidth(), image.getHeight(), row_pitch,
                 plane_pitch, 1, RT_STAGE_U8,
+                RT_STAGE_BUFFER_READ | RT_STAGE_BUFFER_WRITE);
+}
+
+/*
+ * Image16 keeps three planes of `unsigned short` with the 128-bit row padding
+ * that PlanarRGBData allocates, so the descriptor reports the image's own
+ * strides rather than the packed width. The device residency copies row by
+ * row, which keeps the padded host layout valid.
+ */
+RtStageBuffer view(Image16& image)
+{
+    return make(image.r(0), image.getWidth(), image.getHeight(),
+                image.getRowStride(), image.getPlaneStride(), 3, RT_STAGE_U16,
                 RT_STAGE_BUFFER_READ | RT_STAGE_BUFFER_WRITE);
 }
 

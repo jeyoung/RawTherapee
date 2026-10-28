@@ -7,6 +7,7 @@ namespace rtengine
 class Imagefloat;
 class LabImage;
 class Image8;
+class Image16;
 }
 
 namespace rtengine::stage
@@ -18,6 +19,7 @@ RtStageBuffer view(const Imagefloat& image);
 RtStageBuffer view(LabImage& image);
 RtStageBuffer view(const LabImage& image);
 RtStageBuffer view(Image8& image);
+RtStageBuffer view(Image16& image);
 
 bool valid(const RtStageBuffer& buffer);
 size_t bytes_per_pixel(RtStageFormat format);

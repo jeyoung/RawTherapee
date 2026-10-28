@@ -912,6 +912,202 @@ __kernel void rt_thumbnail_permute_u8(__global const uchar* src,
     return source;
 }
 
+/*
+ * Thumbnail scale: the resampling loop of `IImage::resizeImgTo`.
+ *
+ * The source coordinate map is built on the host with the CPU's own float
+ * arithmetic, because the two reference variants differ in how they derive it:
+ * PlanarRGBData (Imagefloat and Image16) accumulates a float position row by
+ * row, while ChunkyRGBData (Image8) multiplies and divides per row and column.
+ * Recomputing either inside the kernel would round differently.
+ *
+ * The packed 8-bit variant is not a float resize: the reference stores the
+ * bilinear blend in the source type before converting, so the value is
+ * truncated toward zero, and an 8-bit source is converted to float by *257.
+ *
+ * One work item owns one destination row, so the per-row map is loaded once
+ * and the row stays cache friendly. The extra work items a runtime may append
+ * to reach a work-group multiple return before indexing anything.
+ */
+const std::string& thumbnail_scale_source()
+{
+    static const std::string source = R"CLC(
+#pragma OPENCL FP_CONTRACT OFF
+
+/* Mirrors the host selectors; the ABI passes TI_Nearest and TI_Bilinear. */
+#define RT_SCALE_NEAREST 0
+#define RT_SCALE_BILINEAR 1
+#define RT_SCALE_COPY 2
+
+#define RT_SCALE_SRC_F32 0
+#define RT_SCALE_SRC_U16 1
+#define RT_SCALE_SRC_U8 2
+
+/* ImageDatas::convertTo(unsigned char, float&) multiplies by 257. */
+#define RT_SCALE_U8_TO_F32 257.0f
+
+/* One destination axis entry, built on the host. `next` equals `index` on the
+ * last source row or column, as the reference clamps it. */
+typedef struct {
+    int index;
+    int next;
+    float fraction;
+} RtScaleAxis;
+
+/* ImageDatas::convertTo(float, float&): a NaN becomes zero. */
+inline float rt_scale_finish(float value)
+{
+    return isnan(value) ? 0.0f : value;
+}
+
+/* The term order is the reference's: four products, summed left to right. */
+inline float rt_scale_planar_f32(__global const float* src, const int pitch,
+                                 const int plane_pitch, const int plane,
+                                 const RtScaleAxis row, const RtScaleAxis col,
+                                 const int mode)
+{
+    const int base = plane * plane_pitch;
+    if (mode == RT_SCALE_NEAREST || mode == RT_SCALE_COPY) {
+        return src[base + row.index * pitch + col.index];
+    }
+    const float dx = col.fraction;
+    const float dy = row.fraction;
+    const int sy = row.index * pitch;
+    const int ny = row.next * pitch;
+    return src[base + sy + col.index] * (1.0f - dx) * (1.0f - dy) +
+           src[base + sy + col.next] * dx * (1.0f - dy) +
+           src[base + ny + col.index] * (1.0f - dx) * dy +
+           src[base + ny + col.next] * dx * dy;
+}
+
+inline float rt_scale_planar_u16(__global const ushort* src, const int pitch,
+                                 const int plane_pitch, const int plane,
+                                 const RtScaleAxis row, const RtScaleAxis col,
+                                 const int mode)
+{
+    const int base = plane * plane_pitch;
+    if (mode == RT_SCALE_NEAREST || mode == RT_SCALE_COPY) {
+        return (float)src[base + row.index * pitch + col.index];
+    }
+    const float dx = col.fraction;
+    const float dy = row.fraction;
+    const int sy = row.index * pitch;
+    const int ny = row.next * pitch;
+    const float a = (float)src[base + sy + col.index];
+    const float b = (float)src[base + sy + col.next];
+    const float c = (float)src[base + ny + col.index];
+    const float d = (float)src[base + ny + col.next];
+    return a * (1.0f - dx) * (1.0f - dy) +
+           b * dx * (1.0f - dy) +
+           c * (1.0f - dx) * dy +
+           d * dx * dy;
+}
+
+/*
+ * Packed 8-bit source: the reference assigns the float blend to an unsigned
+ * char before converting it, so the truncation toward zero is part of the
+ * result. Read as one plane of packed RGB.
+ */
+inline uchar rt_scale_packed_u8(__global const uchar* src, const int pitch,
+                                const int plane, const RtScaleAxis row,
+                                const RtScaleAxis col, const int mode)
+{
+    const int sy = row.index * pitch;
+    if (mode == RT_SCALE_NEAREST || mode == RT_SCALE_COPY) {
+        return src[sy + col.index * 3 + plane];
+    }
+    const int ny = row.next * pitch;
+    const int sx = col.index * 3 + plane;
+    const int nx = col.next * 3 + plane;
+    const float dx = col.fraction;
+    const float dy = row.fraction;
+    return (uchar)(src[sy + sx] * (1.0f - dx) * (1.0f - dy) +
+                   src[sy + nx] * dx * (1.0f - dy) +
+                   src[ny + sx] * (1.0f - dx) * dy +
+                   src[ny + nx] * dx * dy);
+}
+
+/*
+ * The source pointer is typed as bytes because the three source formats have
+ * different element types; each cast keeps the global address space, and the
+ * device allocation starts on a 64-byte boundary. Pitches are in elements of
+ * the format that reads them.
+ */
+__kernel void rt_thumbnail_scale_f32(__global const uchar* src,
+                                     __global float* dst,
+                                     __global const RtScaleAxis* rows,
+                                     __global const RtScaleAxis* cols,
+                                     const int src_format, const int mode,
+                                     const int dst_width,
+                                     const int dst_height,
+                                     const int src_pitch,
+                                     const int src_plane_pitch,
+                                     const int dst_pitch,
+                                     const int dst_plane_pitch)
+{
+    const int y = get_global_id(0);
+    if (y >= dst_height) {
+        return;
+    }
+    const RtScaleAxis row = rows[y];
+    __global const float* plane_src = (__global const float*)src;
+    __global const ushort* plane_u16 = (__global const ushort*)src;
+
+    for (int x = 0; x < dst_width; ++x) {
+        const RtScaleAxis col = cols[x];
+        const int out = y * dst_pitch + x;
+        for (int plane = 0; plane < 3; ++plane) {
+            float value;
+            if (src_format == RT_SCALE_SRC_U8) {
+                value = (float)rt_scale_packed_u8(src, src_pitch, plane, row,
+                                                  col, mode) *
+                        RT_SCALE_U8_TO_F32;
+            } else if (src_format == RT_SCALE_SRC_U16) {
+                value = rt_scale_planar_u16(plane_u16, src_pitch,
+                                            src_plane_pitch, plane, row, col,
+                                            mode);
+            } else {
+                /* RT_SCALE_SRC_F32 */
+                value = rt_scale_planar_f32(plane_src, src_pitch,
+                                            src_plane_pitch, plane, row, col,
+                                            mode);
+            }
+            dst[plane * dst_plane_pitch + out] = rt_scale_finish(value);
+        }
+    }
+}
+
+/* The packed 8-bit destination: an unsigned char source converts to an
+ * unsigned char destination unchanged. */
+__kernel void rt_thumbnail_scale_u8(__global const uchar* src,
+                                    __global uchar* dst,
+                                    __global const RtScaleAxis* rows,
+                                    __global const RtScaleAxis* cols,
+                                    const int mode,
+                                    const int dst_width,
+                                    const int dst_height,
+                                    const int src_pitch,
+                                    const int dst_pitch)
+{
+    const int y = get_global_id(0);
+    if (y >= dst_height) {
+        return;
+    }
+    const RtScaleAxis row = rows[y];
+
+    for (int x = 0; x < dst_width; ++x) {
+        const RtScaleAxis col = cols[x];
+        const int out = y * dst_pitch + x * 3;
+        for (int plane = 0; plane < 3; ++plane) {
+            dst[out + plane] = rt_scale_packed_u8(src, src_pitch, plane, row,
+                                                  col, mode);
+        }
+    }
+}
+)CLC";
+    return source;
+}
+
 const std::vector<KernelDef>& kernels()
 {
     static const std::vector<KernelDef> table = {
@@ -924,7 +1120,9 @@ const std::vector<KernelDef>& kernels()
         {"rgb.proc", rgb_proc_source().c_str(), "rt_rgb_proc"},
         {"thumbnail.whitebalance", thumbnail_wb_source().c_str(), "rt_thumbnail_wb"},
         {"thumbnail.transform", thumbnail_permute_source().c_str(), "rt_thumbnail_permute"},
-        {"thumbnail.transform.u8", thumbnail_permute_source().c_str(), "rt_thumbnail_permute_u8"}
+        {"thumbnail.transform.u8", thumbnail_permute_source().c_str(), "rt_thumbnail_permute_u8"},
+        {"thumbnail.scale", thumbnail_scale_source().c_str(), "rt_thumbnail_scale_f32"},
+        {"thumbnail.scale.u8", thumbnail_scale_source().c_str(), "rt_thumbnail_scale_u8"}
     };
     return table;
 }
@@ -2585,6 +2783,339 @@ RtStageStatus run_thumbnail_permute(
     return RT_STAGE_OK;
 }
 
+/*
+ * Thumbnail scale. Arguments: [0] source, [1] destination, [2] interpolation
+ * (0 nearest, 1 bilinear). The source may be packed 8-bit, planar 16-bit or
+ * planar float; the destination is three-plane float, or packed 8-bit for the
+ * `thumbnail.scale.u8` node.
+ */
+
+/* ABI interpolation values: TI_Nearest and TI_Bilinear. */
+constexpr std::int64_t SCALE_INTERP_NEAREST = 0;
+constexpr std::int64_t SCALE_INTERP_BILINEAR = 1;
+
+/* Kernel interpolation modes; copy is the reference's same-size short cut. */
+constexpr int SCALE_MODE_NEAREST = 0;
+constexpr int SCALE_MODE_BILINEAR = 1;
+constexpr int SCALE_MODE_COPY = 2;
+
+/* Kernel source-format selectors. */
+constexpr int SCALE_SRC_F32 = 0;
+constexpr int SCALE_SRC_U16 = 1;
+constexpr int SCALE_SRC_U8 = 2;
+
+struct ScaleAxis {
+    std::int32_t index = 0;
+    std::int32_t next = 0;
+    float fraction = 0.0f;
+};
+
+/* The OpenCL struct is three 32-bit words, packed without padding. */
+static_assert(sizeof(ScaleAxis) == 3 * sizeof(std::uint32_t),
+              "ScaleAxis must match the kernel struct");
+
+/*
+ * PlanarRGBData::resizeImgTo() advances the source coordinate with a float
+ * accumulator, so the host repeats the same additions; recomputing
+ * `i * step` drifts by an ulp and changes the interpolated sample.
+ */
+bool build_planar_axis(int src_length, int dst_length, std::vector<ScaleAxis>& axis)
+{
+    assert(src_length > 0 && dst_length > 0);
+    const float step = static_cast<float>(src_length) /
+                       static_cast<float>(dst_length);
+    float position = 0.0f;
+    axis.resize(static_cast<std::size_t>(dst_length));
+    for (int i = 0; i < dst_length; ++i, position += step) {
+        const int index = static_cast<int>(position);
+        if (index < 0 || index >= src_length) {
+            return false;
+        }
+        const int next = index < src_length - 1 ? index + 1 : index;
+        axis[static_cast<std::size_t>(i)] = ScaleAxis{
+            index, next, position - static_cast<float>(index)};
+    }
+    return true;
+}
+
+/*
+ * ChunkyRGBData::resizeImgTo() derives the source index with integer
+ * multiplication and the fraction from that index. The thumbnail range keeps
+ * `i * length` inside 64 bits; the reference's int expression cannot overflow
+ * there either.
+ */
+bool build_chunky_axis(int src_length, int dst_length, std::vector<ScaleAxis>& axis)
+{
+    assert(src_length > 0 && dst_length > 0);
+    axis.resize(static_cast<std::size_t>(dst_length));
+    for (int i = 0; i < dst_length; ++i) {
+        const std::int64_t product =
+            static_cast<std::int64_t>(i) * static_cast<std::int64_t>(src_length);
+        const int index = static_cast<int>(product / dst_length);
+        if (index < 0 || index >= src_length) {
+            return false;
+        }
+        const float position = static_cast<float>(i) *
+                               static_cast<float>(src_length) /
+                               static_cast<float>(dst_length);
+        const int next = index + 1 < src_length ? index + 1 : index;
+        axis[static_cast<std::size_t>(i)] = ScaleAxis{
+            index, next, position - static_cast<float>(index)};
+    }
+    return true;
+}
+
+/* Nearest and the same-size copy take one source sample per axis. */
+void build_nearest_axis(int src_length, int dst_length, std::vector<ScaleAxis>& axis)
+{
+    assert(src_length > 0 && dst_length > 0);
+    axis.resize(static_cast<std::size_t>(dst_length));
+    for (int i = 0; i < dst_length; ++i) {
+        const std::int64_t product =
+            static_cast<std::int64_t>(i) * static_cast<std::int64_t>(src_length);
+        const int index = static_cast<int>(product / dst_length);
+        assert(index >= 0 && index < src_length);
+        axis[static_cast<std::size_t>(i)] = ScaleAxis{index, index, 0.0f};
+    }
+}
+
+bool build_scale_axis(int source_format, int mode, int src_length, int dst_length,
+                      std::vector<ScaleAxis>& axis)
+{
+    if (mode == SCALE_MODE_COPY || mode == SCALE_MODE_NEAREST) {
+        build_nearest_axis(src_length, dst_length, axis);
+        return true;
+    }
+    if (source_format == SCALE_SRC_U8) {
+        return build_chunky_axis(src_length, dst_length, axis);
+    }
+    return build_planar_axis(src_length, dst_length, axis);
+}
+
+RtStageStatus run_thumbnail_scale(
+    const std::shared_ptr<OpenCLEnv>& env,
+    const std::shared_ptr<OpenCLResidency>& residency,
+    const std::vector<RtStageArg>& args, const char* node, bool eight_bit,
+    std::string& error)
+{
+    constexpr std::size_t BUFFER_ARGS = 2;
+    constexpr std::size_t INT_ARGS = 1;
+    constexpr std::size_t ARG_COUNT = BUFFER_ARGS + INT_ARGS;
+
+    if (args.size() != ARG_COUNT ||
+        args[0].kind != RT_STAGE_ARG_BUFFER ||
+        args[1].kind != RT_STAGE_ARG_BUFFER ||
+        args[2].kind != RT_STAGE_ARG_INT) {
+        error = "thumbnail scale expects two buffers and an int";
+        return RT_STAGE_INVALID;
+    }
+
+    const RtStageBuffer& src = args[0].u.buffer;
+    const RtStageBuffer& dst = args[1].u.buffer;
+    if (!valid(src) || !valid(dst)) {
+        error = "thumbnail scale has an invalid buffer";
+        return RT_STAGE_INVALID;
+    }
+    if (src.data == dst.data) {
+        error = "thumbnail scale needs distinct buffers";
+        return RT_STAGE_INVALID;
+    }
+
+    const std::int64_t interp = args[2].u.i;
+    if (interp != SCALE_INTERP_NEAREST && interp != SCALE_INTERP_BILINEAR) {
+        error = "thumbnail scale has an unknown interpolation value " +
+                std::to_string(interp);
+        return RT_STAGE_INVALID;
+    }
+
+    int source_format = SCALE_SRC_F32;
+    if (eight_bit) {
+        if (src.format != RT_STAGE_U8 || src.planes != 1 ||
+            dst.format != RT_STAGE_U8 || dst.planes != 1) {
+            error = "thumbnail scale (8-bit) needs two packed U8 buffers";
+            return RT_STAGE_INVALID;
+        }
+        source_format = SCALE_SRC_U8;
+    } else {
+        if (dst.format != RT_STAGE_F32 || dst.planes != 3) {
+            error = "thumbnail scale needs a three-plane F32 destination";
+            return RT_STAGE_INVALID;
+        }
+        if (src.format == RT_STAGE_F32 || src.format == RT_STAGE_U16) {
+            if (src.planes != 3) {
+                error = "thumbnail scale needs a three-plane planar source";
+                return RT_STAGE_INVALID;
+            }
+            source_format =
+                src.format == RT_STAGE_F32 ? SCALE_SRC_F32 : SCALE_SRC_U16;
+        } else if (src.format == RT_STAGE_U8) {
+            if (src.planes != 1) {
+                error = "thumbnail scale needs a packed U8 source";
+                return RT_STAGE_INVALID;
+            }
+            source_format = SCALE_SRC_U8;
+        } else {
+            error = "thumbnail scale has an unsupported source format";
+            return RT_STAGE_INVALID;
+        }
+    }
+
+    /*
+     * The reference converts the same-size case without resampling, before it
+     * looks at the interpolation, so the mode encodes that priority.
+     */
+    const bool same_size = src.width == dst.width && src.height == dst.height;
+    const int mode = same_size
+        ? SCALE_MODE_COPY
+        : (interp == SCALE_INTERP_NEAREST ? SCALE_MODE_NEAREST
+                                          : SCALE_MODE_BILINEAR);
+
+    std::vector<ScaleAxis> rows;
+    std::vector<ScaleAxis> cols;
+    if (!build_scale_axis(source_format, mode, src.height, dst.height, rows) ||
+        !build_scale_axis(source_format, mode, src.width, dst.width, cols)) {
+        error = "thumbnail scale cannot map the source onto the destination";
+        return RT_STAGE_INVALID;
+    }
+
+    const KernelDef* def = find_kernel(node);
+    assert(def != nullptr);
+    cl_kernel kernel = compiled_kernel(env, def, error);
+    if (kernel == nullptr) {
+        return RT_STAGE_FALLBACK;
+    }
+
+    const StageBufferShape src_shape{src.format, src.width, src.height,
+                                     src.planes};
+    const StageBufferShape dst_shape{dst.format, dst.width, dst.height,
+                                     dst.planes};
+    StageDeviceBufferPtr src_device = residency->acquire(src.data, src_shape, &error);
+    StageDeviceBufferPtr dst_device = residency->acquire(dst.data, dst_shape, &error);
+    if (!src_device || !dst_device) {
+        return RT_STAGE_FALLBACK;
+    }
+    if (residency->upload(src_device, src) != RT_STAGE_OK) {
+        error = "thumbnail scale upload failed";
+        return RT_STAGE_FALLBACK;
+    }
+
+    auto device_src = std::dynamic_pointer_cast<OpenCLDeviceBuffer>(src_device);
+    auto device_dst = std::dynamic_pointer_cast<OpenCLDeviceBuffer>(dst_device);
+    if (!device_src || !device_dst) {
+        error = "thumbnail scale device buffer mismatch";
+        return RT_STAGE_FALLBACK;
+    }
+
+    /* The two axes travel as scratch buffers and die with the submission. */
+    const auto create_scratch = [&](std::size_t bytes, const void* data,
+                                    cl_mem& out) -> bool {
+        cl_int scratch_error = CL_SUCCESS;
+        out = env->api->CreateBuffer(env->context,
+                                     CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                     bytes, const_cast<void*>(data),
+                                     &scratch_error);
+        return out != nullptr;
+    };
+    constexpr std::size_t AXIS_BUFFERS = 2;
+    std::vector<cl_mem> scratch(AXIS_BUFFERS, nullptr);
+    if (!create_scratch(rows.size() * sizeof(ScaleAxis), rows.data(),
+                        scratch[0]) ||
+        !create_scratch(cols.size() * sizeof(ScaleAxis), cols.data(),
+                        scratch[1])) {
+        for (cl_mem memory : scratch) {
+            if (memory != nullptr) {
+                env->api->ReleaseMemObject(memory);
+            }
+        }
+        error = "thumbnail scale scratch allocation failed";
+        return RT_STAGE_FALLBACK;
+    }
+
+    std::lock_guard<std::recursive_mutex> lock(env->queue_mutex);
+
+    const cl_mem src_memory = device_src->memory();
+    const cl_mem dst_memory = device_dst->memory();
+    const cl_int src_format = source_format;
+    const cl_int scale_mode = mode;
+    const cl_int dst_width = dst.width;
+    const cl_int dst_height = dst.height;
+    /* Pitch units follow the element type each kernel indexes with. */
+    const cl_int src_element_bytes = static_cast<cl_int>(bytes_per_pixel(src.format));
+    const cl_int src_pitch =
+        static_cast<cl_int>(device_src->row_pitch()) / src_element_bytes;
+    const cl_int src_plane_pitch =
+        static_cast<cl_int>(device_src->plane_pitch()) / src_element_bytes;
+    const cl_int dst_element_bytes = static_cast<cl_int>(bytes_per_pixel(dst.format));
+    const cl_int dst_pitch =
+        static_cast<cl_int>(device_dst->row_pitch()) / dst_element_bytes;
+    const cl_int dst_plane_pitch =
+        static_cast<cl_int>(device_dst->plane_pitch()) / dst_element_bytes;
+
+    const auto set_arg = [&](cl_uint index, std::size_t bytes,
+                             const void* value) {
+        return env->api->SetKernelArg(kernel, index, bytes, value) == CL_SUCCESS;
+    };
+
+    bool args_ok =
+        set_arg(0, sizeof(cl_mem), &src_memory) &&
+        set_arg(1, sizeof(cl_mem), &dst_memory) &&
+        set_arg(2, sizeof(cl_mem), &scratch[0]) &&
+        set_arg(3, sizeof(cl_mem), &scratch[1]);
+    if (eight_bit) {
+        args_ok = args_ok &&
+                  set_arg(4, sizeof(cl_int), &scale_mode) &&
+                  set_arg(5, sizeof(cl_int), &dst_width) &&
+                  set_arg(6, sizeof(cl_int), &dst_height) &&
+                  set_arg(7, sizeof(cl_int), &src_pitch) &&
+                  set_arg(8, sizeof(cl_int), &dst_pitch);
+    } else {
+        args_ok = args_ok &&
+                  set_arg(4, sizeof(cl_int), &src_format) &&
+                  set_arg(5, sizeof(cl_int), &scale_mode) &&
+                  set_arg(6, sizeof(cl_int), &dst_width) &&
+                  set_arg(7, sizeof(cl_int), &dst_height) &&
+                  set_arg(8, sizeof(cl_int), &src_pitch) &&
+                  set_arg(9, sizeof(cl_int), &src_plane_pitch) &&
+                  set_arg(10, sizeof(cl_int), &dst_pitch) &&
+                  set_arg(11, sizeof(cl_int), &dst_plane_pitch);
+    }
+    if (!args_ok) {
+        for (cl_mem memory : scratch) {
+            env->api->ReleaseMemObject(memory);
+        }
+        error = "clSetKernelArg failed";
+        return RT_STAGE_FALLBACK;
+    }
+
+    const std::size_t global = static_cast<std::size_t>(dst.height);
+    cl_event done = nullptr;
+    if (env->api->EnqueueNDRangeKernel(env->queue, kernel, 1, nullptr, &global,
+                                       nullptr, 0, nullptr,
+                                       &done) != CL_SUCCESS ||
+        done == nullptr) {
+        for (cl_mem memory : scratch) {
+            env->api->ReleaseMemObject(memory);
+        }
+        error = "thumbnail scale launch failed";
+        return RT_STAGE_ERROR;
+    }
+    const cl_int wait_status = env->api->WaitForEvents(1, &done);
+    env->api->ReleaseEvent(done);
+    for (cl_mem memory : scratch) {
+        env->api->ReleaseMemObject(memory);
+    }
+    if (wait_status != CL_SUCCESS) {
+        error = "thumbnail scale did not complete";
+        return RT_STAGE_ERROR;
+    }
+    if (residency->readback(dst_device, dst) != RT_STAGE_OK) {
+        error = "thumbnail scale readback failed";
+        return RT_STAGE_ERROR;
+    }
+
+    return RT_STAGE_OK;
+}
+
 class OpenCLStageQueue final : public StageQueue
 {
 public:
@@ -2674,6 +3205,36 @@ public:
         } else if (request.name == "thumbnail.whitebalance") {
             const RtStageStatus status =
                 run_thumbnail_wb(env_, residency_, request.args, error);
+            if (status == RT_STAGE_OK) {
+                StageEvent done;
+                done.status = StageEventStatus::Complete;
+                done.result = RT_STAGE_OK;
+                done.device = StageDeviceType::OPENCL;
+                done.asynchronous = false;
+                return done;
+            }
+            StageEvent fallback = StageQueue::submit(request, profiling);
+            fallback.note = error;
+            return fallback;
+        } else if (request.name == "thumbnail.scale") {
+            const RtStageStatus status =
+                run_thumbnail_scale(env_, residency_, request.args,
+                                    request.name.c_str(), false, error);
+            if (status == RT_STAGE_OK) {
+                StageEvent done;
+                done.status = StageEventStatus::Complete;
+                done.result = RT_STAGE_OK;
+                done.device = StageDeviceType::OPENCL;
+                done.asynchronous = false;
+                return done;
+            }
+            StageEvent fallback = StageQueue::submit(request, profiling);
+            fallback.note = error;
+            return fallback;
+        } else if (request.name == "thumbnail.scale.u8") {
+            const RtStageStatus status =
+                run_thumbnail_scale(env_, residency_, request.args,
+                                    request.name.c_str(), true, error);
             if (status == RT_STAGE_OK) {
                 StageEvent done;
                 done.status = StageEventStatus::Complete;
