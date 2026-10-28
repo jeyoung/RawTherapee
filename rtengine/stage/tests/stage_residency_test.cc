@@ -851,6 +851,206 @@ void test_thumbnail_wb(bool available)
     check(differing == 0, "thumbnail white balance matches the reference");
 }
 
+/*
+ * thumbnail.transform is a permutation of the coarse rotate/flip
+ * composition. Sixteen combinations of rotation and flips are compared with
+ * an independent mapping of the same operations.
+ */
+void test_thumbnail_permute(bool available)
+{
+    using namespace rtengine::stage;
+
+    if (!available) {
+        skip("thumbnail transform: no OpenCL device");
+        return;
+    }
+
+    constexpr int WIDTH = 20;
+    constexpr int HEIGHT = 12;
+    const int rotations[4] = {0, 90, 180, 270};
+
+    auto queue = opencl_device()->create_queue();
+    StageBufferAllocator host(StageDeviceType::CPU);
+    std::string error;
+    RtStageBuffer src =
+        host.allocate({RT_STAGE_F32, WIDTH, HEIGHT, 3}, &error);
+    if (src.data == nullptr) {
+        check(false, "thumbnail transform fixture allocates");
+        return;
+    }
+    for (int plane = 0; plane < 3; ++plane) {
+        unsigned char* base = static_cast<unsigned char*>(src.data) +
+                              static_cast<std::size_t>(plane) * src.plane_pitch;
+        for (int y = 0; y < HEIGHT; ++y) {
+            float* row = reinterpret_cast<float*>(
+                base + static_cast<std::size_t>(y) * src.row_pitch);
+            for (int x = 0; x < WIDTH; ++x) {
+                row[x] = static_cast<float>(plane * 100000 + y * 100 + x);
+            }
+        }
+    }
+
+    int differing = 0;
+    for (int rotation : rotations) {
+        for (int flips = 0; flips < 4; ++flips) {
+            const bool hflip = (flips & 1) != 0;
+            const bool vflip = (flips & 2) != 0;
+            const bool swaps = rotation == 90 || rotation == 270;
+            const int dw = swaps ? HEIGHT : WIDTH;
+            const int dh = swaps ? WIDTH : HEIGHT;
+
+            RtStageBuffer dst =
+                host.allocate({RT_STAGE_F32, dw, dh, 3}, &error);
+            StageRequest request;
+            request.name = "thumbnail.transform";
+            request.args = {buffer_arg(src), buffer_arg(dst),
+                            int_arg(rotation), int_arg(hflip ? 1 : 0),
+                            int_arg(vflip ? 1 : 0)};
+            StageEvent event = queue->submit(request, nullptr);
+            if (!event.succeeded() || queue->wait(event) != RT_STAGE_OK) {
+                ++differing;
+                continue;
+            }
+
+            for (int y = 0; y < dh; ++y) {
+                for (int x = 0; x < dw; ++x) {
+                    const int ux = hflip ? dw - 1 - x : x;
+                    const int uy = vflip ? dh - 1 - y : y;
+                    int sx = ux;
+                    int sy = uy;
+                    if (rotation == 90) {
+                        sx = uy;
+                        sy = HEIGHT - 1 - ux;
+                    } else if (rotation == 180) {
+                        sx = WIDTH - 1 - ux;
+                        sy = HEIGHT - 1 - uy;
+                    } else if (rotation == 270) {
+                        sx = WIDTH - 1 - uy;
+                        sy = ux;
+                    }
+                    for (int plane = 0; plane < 3; ++plane) {
+                        const float* src_row = reinterpret_cast<const float*>(
+                            static_cast<const unsigned char*>(src.data) +
+                            static_cast<std::size_t>(plane) * src.plane_pitch +
+                            static_cast<std::size_t>(sy) * src.row_pitch);
+                        const float* dst_row = reinterpret_cast<const float*>(
+                            static_cast<const unsigned char*>(dst.data) +
+                            static_cast<std::size_t>(plane) * dst.plane_pitch +
+                            static_cast<std::size_t>(y) * dst.row_pitch);
+                        if (dst_row[x] != src_row[sx]) {
+                            ++differing;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (differing != 0) {
+        std::fprintf(stderr, "thumbnail transform: %d samples differ\n",
+                     differing);
+    }
+    check(differing == 0,
+          "thumbnail transform matches the rotate/flip reference");
+}
+
+/*
+ * The packed 8-bit variant used by the embedded-JPEG thumbnail path.
+ */
+void test_thumbnail_permute_u8(bool available)
+{
+    using namespace rtengine::stage;
+
+    if (!available) {
+        skip("thumbnail transform (8-bit): no OpenCL device");
+        return;
+    }
+
+    constexpr int WIDTH = 18;
+    constexpr int HEIGHT = 10;
+    const int rotations[4] = {0, 90, 180, 270};
+
+    auto queue = opencl_device()->create_queue();
+    StageBufferAllocator host(StageDeviceType::CPU);
+    std::string error;
+    RtStageBuffer src = host.allocate({RT_STAGE_U8, WIDTH, HEIGHT, 1}, &error);
+    if (src.data == nullptr) {
+        check(false, "thumbnail transform 8-bit fixture allocates");
+        return;
+    }
+    unsigned char* src_data = static_cast<unsigned char*>(src.data);
+    for (int y = 0; y < HEIGHT; ++y) {
+        unsigned char* row = src_data + static_cast<std::size_t>(y) * src.row_pitch;
+        for (int x = 0; x < WIDTH; ++x) {
+            row[x * 3] = static_cast<unsigned char>(x * 7 + y * 3);
+            row[x * 3 + 1] = static_cast<unsigned char>(x + y * 11);
+            row[x * 3 + 2] = static_cast<unsigned char>(x * 3 + y);
+        }
+    }
+
+    int differing = 0;
+    for (int rotation : rotations) {
+        for (int flips = 0; flips < 4; ++flips) {
+            const bool hflip = (flips & 1) != 0;
+            const bool vflip = (flips & 2) != 0;
+            const bool swaps = rotation == 90 || rotation == 270;
+            const int dw = swaps ? HEIGHT : WIDTH;
+            const int dh = swaps ? WIDTH : HEIGHT;
+
+            RtStageBuffer dst =
+                host.allocate({RT_STAGE_U8, dw, dh, 1}, &error);
+            StageRequest request;
+            request.name = "thumbnail.transform.u8";
+            request.args = {buffer_arg(src), buffer_arg(dst),
+                            int_arg(rotation), int_arg(hflip ? 1 : 0),
+                            int_arg(vflip ? 1 : 0)};
+            StageEvent event = queue->submit(request, nullptr);
+            if (!event.succeeded() || queue->wait(event) != RT_STAGE_OK) {
+                ++differing;
+                continue;
+            }
+
+            const unsigned char* dst_data =
+                static_cast<const unsigned char*>(dst.data);
+            for (int y = 0; y < dh; ++y) {
+                const unsigned char* dst_row =
+                    dst_data + static_cast<std::size_t>(y) * dst.row_pitch;
+                const int uy = vflip ? dh - 1 - y : y;
+                for (int x = 0; x < dw; ++x) {
+                    const int ux = hflip ? dw - 1 - x : x;
+                    int sx = ux;
+                    int sy = uy;
+                    if (rotation == 90) {
+                        sx = uy;
+                        sy = HEIGHT - 1 - ux;
+                    } else if (rotation == 180) {
+                        sx = WIDTH - 1 - ux;
+                        sy = HEIGHT - 1 - uy;
+                    } else if (rotation == 270) {
+                        sx = WIDTH - 1 - uy;
+                        sy = ux;
+                    }
+                    const unsigned char* src_row =
+                        src_data + static_cast<std::size_t>(sy) * src.row_pitch;
+                    for (int channel = 0; channel < 3; ++channel) {
+                        if (dst_row[x * 3 + channel] !=
+                            src_row[sx * 3 + channel]) {
+                            ++differing;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (differing != 0) {
+        std::fprintf(stderr, "thumbnail transform 8-bit: %d samples differ\n",
+                     differing);
+    }
+    check(differing == 0,
+          "thumbnail transform (8-bit) matches the rotate/flip reference");
+}
+
 /* ------------------------------------------------------------ selection */
 
 void test_selection(bool available)
@@ -1233,6 +1433,8 @@ int main()
     test_transform_identity(available);
     test_lab_to_u8(available);
     test_thumbnail_wb(available);
+    test_thumbnail_permute(available);
+    test_thumbnail_permute_u8(available);
     test_selection(available);
     test_residency();
     test_node_parity(available);
