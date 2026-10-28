@@ -2570,6 +2570,30 @@ void test_gamut(bool available)
             clear_node_device_overrides();
             check(power_status != RT_STAGE_OK,
                   "gamut refuses a non-positive compression power");
+
+            /*
+             * The ABI contract is a 9x1 table. A 3x3 table has the same entry
+             * count but a device row pitch that the kernel's flat read would
+             * cross into, so the launcher must reject the shape.
+             */
+            bad.args[6].u.f = node_params.pwr;
+            RtStageBuffer square = bad.args[1].u.buffer;
+            square.width = 3;
+            square.height = 3;
+            square.row_pitch = 3 * sizeof(float);
+            square.plane_pitch = 9 * sizeof(float);
+            bad.args[1].u.buffer = square;
+            set_node_device_override("gamut", StageNodeDevice::OpenCL);
+            refuse.args.assign(bad.args, bad.args + 8);
+            const RtStageStatus shape_status =
+                context->execute(refuse, nullptr, &refused);
+            clear_node_device_overrides();
+            check(shape_status != RT_STAGE_OK,
+                  "gamut refuses a 3x3 table in place of the 9x1 contract");
+            const Diff square_untouched = compare(view(guarded), view(source));
+            check(square_untouched.differing == 0 &&
+                      square_untouched.max_abs == 0.0,
+                  "a refused 3x3 table leaves the Lab buffer untouched");
         }
     }
 }
