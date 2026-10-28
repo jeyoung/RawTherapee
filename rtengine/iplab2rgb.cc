@@ -18,6 +18,7 @@
  */
 #include <glibmm/ustring.h>
 
+#include <cassert>
 #include <map>
 #include <mutex>
 #include <string>
@@ -1084,12 +1085,23 @@ void rotate_and_scale_primary(float primaries[3][2], float scaling, float rotati
 
 void ImProcFunctions::workingtrc(int sp, Imagefloat* src, Imagefloat* dst, int cw, int ch, int mul, Glib::ustring &profile, double gampos, double slpos, int cat, int &illum, int prim, int locprim,
                                  float &rdx, float &rdy, float &grx, float &gry, float &blx, float &bly, float &meanx, float &meany, float &meanxe, float &meanye, float &maxdat, double *p,
-                                 cmsHTRANSFORM &transform, bool normalizeIn, bool normalizeOut, bool keepTransForm, bool gamutcontrol) const
+                                 cmsHTRANSFORM &transform, bool normalizeIn, bool normalizeOut, bool keepTransForm, bool gamutcontrol,
+                                 float* probeMeanX, float* probeMeanY, cmsHPROFILE* outProfile, bool setupOnly) const
 {
     const TMatrix wprof = ICCStore::getInstance()->workingSpaceMatrix(params->icm.workingProfile);
 
     double wb2[3][3];
     constexpr float epsilon =  0.00001f;//To avoid negative values and / or set a minimum RGB float value to avoid incorrect calculations. We can change epsilon if need.
+
+    // setupOnly exposes a setup that this call builds itself: a reused
+    // transform has nothing to expose, and without an output handle the
+    // profile would have no owner.
+    const bool canBuildSetup = transform == nullptr && outProfile != nullptr;
+    assert(!setupOnly || canBuildSetup);
+
+    if (setupOnly && !canBuildSetup) {
+        return;
+    }
 
 #ifdef _OPENMP
         #pragma omp parallel for
@@ -1170,6 +1182,13 @@ void ImProcFunctions::workingtrc(int sp, Imagefloat* src, Imagefloat* dst, int c
         meany /= (bfh * bfw);
         meanx += 0.005f;
         meany += 0.005f; //empirical mean delta with value end in process
+
+        if (probeMeanX) {
+            *probeMeanX = meanx;
+        }
+        if (probeMeanY) {
+            *probeMeanY = meany;
+        }
 
         if (settings->verbose) {
             printf("Estimation dominant color : x=%f y=%f\n", (double) meanx, (double) meany);
@@ -2165,6 +2184,20 @@ void ImProcFunctions::workingtrc(int sp, Imagefloat* src, Imagefloat* dst, int c
         }
 
         cmsFreeToneCurve(GammaTRC[0]);
+
+        // Hand the profile over instead of closing it: lcms profiles are
+        // reference counted and the caller owns the handle when outProfile is
+        // non-null. Without outProfile the existing lifetime is unchanged (the
+        // handle is leaked; that unrelated fix is out of scope here).
+        if (outProfile) {
+            *outProfile = oprofdef;
+        }
+
+        if (setupOnly) {
+            // The caller asked for the probe means and the profile only: no
+            // transform is created and no pixel is converted.
+            return;
+        }
 
         if (oprofdef) {
             constexpr cmsUInt32Number flags = cmsFLAGS_NOOPTIMIZE | cmsFLAGS_NOCACHE | cmsFLAGS_BLACKPOINTCOMPENSATION | cmsFLAGS_GAMUTCHECK;

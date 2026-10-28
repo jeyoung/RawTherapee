@@ -1985,6 +1985,34 @@ follow-up should give the harness a completion signal that does not depend on
 `monitor.output`, or make the preview pass notify once it has executed an
 (empty) plan.
 
+## Working TRC
+
+`ImProcFunctions::workingtrc()` keeps the primaries, illuminant, CAT and TRC
+setup for the working-TRC conversion. Its trailing parameters expose that setup
+instead of duplicating it in a second implementation:
+
+- `probeMeanX`/`probeMeanY` receive the dominant-colour probe means on the
+  `mul == 5` pass; every other pass leaves them untouched.
+- `outProfile` receives the RGB profile the call builds, with ownership
+  transferred to the caller (`cmsCloseProfile`). The handle must outlive any
+  transform made from it. When it is null the previous lifetime is unchanged:
+  the handle is leaked once per call, a pre-existing defect that this stage
+  does not address.
+- `setupOnly` stops once the profile and its TRC tags exist. No transform is
+  created and no pixel is transformed; only the unconditional epsilon clamp at
+  the start of the function runs. It needs `outProfile` and a call that builds
+  its own profile, so passing an existing `transform` makes it a no-op.
+
+All four parameters default to null/false, so the existing call sites are
+source-compatible and produce the same pixels. A full call still creates and
+applies the lcms transform exactly as before.
+
+Device coverage is not claimed here: no GPU kernel consumes the exposed profile
+yet. `tools/perf/working-trc-setup-test.cc` covers the contract (means, profile,
+no transform, destination untouched, `buildGpuProfile()` succeeds) and guards
+the converted pixels with a digest recorded from the pre-change CPU
+implementation.
+
 ## Limitations
 
 - Preview, crop, thumbnail and export run only the graph. No

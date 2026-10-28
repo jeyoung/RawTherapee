@@ -638,9 +638,22 @@ enum class BlurType {
     void gamutcompr( rtengine::Imagefloat *src, rtengine::Imagefloat *dst, int beginend, float powe, int nbsegam, float &mac, float &mac0, float &mac1, float &mac2) const;
     void apsatur(int sp, Imagefloat* src, Imagefloat* dst, int bfw, int bfh, float satu);
 
+    // Working-TRC conversion. The trailing parameters let the colour setup be
+    // reused instead of duplicating the primaries, illuminant and CAT logic.
+    //
+    // `probeMeanX` and `probeMeanY`, when non-null, receive the dominant-colour
+    // probe means computed on the `mul == 5` pass; every other pass leaves them
+    // untouched. `outProfile`, when non-null, receives the RGB profile built by
+    // this call and ownership is transferred to the caller (`cmsCloseProfile`);
+    // the handle must outlive any transform created from it. With `setupOnly`
+    // the call stops once the profile and its TRC tags exist: no transform is
+    // created and no pixel is transformed, although the unconditional epsilon
+    // clamp at the start still runs. `setupOnly` needs `outProfile` and a call
+    // that builds its own profile, so an existing `transform` makes it a no-op.
     void workingtrc(int sp, Imagefloat* src, Imagefloat* dst, int cw, int ch , int mul, Glib::ustring &profile, double gampos, double slpos, int cat, int &illum, int prim, int locprim, 
         float &rdx, float &rdy, float &grx, float &gry, float &blx, float &bly, float &meanx, float &meany, float &meanxe, float &meanye, float &maxdat, double *p,
-        cmsHTRANSFORM &transform, bool normalizeIn = true, bool normalizeOut = true, bool keepTransForm = false, bool gamutcontrol = false) const;
+        cmsHTRANSFORM &transform, bool normalizeIn = true, bool normalizeOut = true, bool keepTransForm = false, bool gamutcontrol = false,
+        float* probeMeanX = nullptr, float* probeMeanY = nullptr, cmsHPROFILE* outProfile = nullptr, bool setupOnly = false) const;
     void preserv(LabImage *nprevl, LabImage *provis, int cw, int ch);
 
     bool transCoord(int W, int H, int x, int y, int w, int h, int& xv, int& yv, int& wv, int& hv, double ascaleDef = -1, const LensCorrection *pLCPMap = nullptr) const;
