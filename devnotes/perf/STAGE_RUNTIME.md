@@ -361,17 +361,22 @@ the host builtin and the device comparison use one algorithm. The call site in
 returns when the node reports `RT_STAGE_OK`; otherwise it runs the extracted
 core directly. `simpleprocess.cc` keeps its L clamp before the call.
 
-The ABI is `[0]` a one-plane F32 L buffer, read and written in place, then the
-scalars `[1]` method (0 USM, 1 RLD), `[2]` amount, `[3]` contrast, `[4]` radius,
-`[5]` blur radius, `[6..9]` the four threshold values, `[10]` the four-value
-threshold form, `[11]` threshold start-at-one, `[12]` edges-only, `[13]` edge
-radius, `[14]` edge tolerance, `[15]` halo control, `[16]` halo amount,
-`[17]` deconvolution amount, `[18]` deconvolution radius, `[19]`
-deconvolution iterations, `[20]` deconvolution damping, `[21]` automatic
-deconvolution radius, `[22]` corner boost, `[23]` corner latitude, `[24]`
-scale and `[25]` show-mask. The host parameter builder rejects a method outside
-the enum; the decoder validates the argument kinds, the one-plane F32 buffer
-and every 0/1 flag.
+The ABI is `[0]` a tightly packed one-plane F32 L buffer, read and written in
+place, then the scalars `[1]` method (0 USM, 1 RLD), `[2]` amount, `[3]`
+contrast, `[4]` radius, `[5]` blur radius, `[6..9]` the four threshold values,
+`[10]` the four-value threshold form, `[11]` threshold start-at-one, `[12]`
+edges-only, `[13]` edge radius, `[14]` edge tolerance, `[15]` halo control,
+`[16]` halo amount, `[17]` deconvolution amount, `[18]` deconvolution radius,
+`[19]` deconvolution iterations, `[20]` deconvolution damping, `[21]`
+automatic deconvolution radius, `[22]` corner boost, `[23]` corner latitude,
+`[24]` scale and `[25]` show-mask. The L buffer must satisfy
+`row_pitch == width * sizeof(float)` and
+`plane_pitch == width * height * sizeof(float)`: the extracted CPU core is
+W-strided and the host builtin passes its raw pointer, so neither can honour a
+padded descriptor. A padded row or plane is refused as `RT_STAGE_INVALID`
+instead of being misread on the host, and the node leaves the plane untouched.
+The host parameter builder rejects a method outside the enum; the decoder
+validates the argument kinds, the packed F32 buffer and every 0/1 flag.
 
 The host builtin reconstructs the whole `SharpeningParams` set, including the
 residual fields, and calls `sharpen_luminance()`. It therefore covers RLD,
@@ -419,6 +424,8 @@ Evidence:
 | device test, 25 cases: defaults, radius 0.3/0.5/0.59/0.6/1.15/3.0, contrast 0/20/100, amounts 1/100/200/1000, threshold breakpoints and the two-value form, widths 8/63/64/65 and padded 238, sigma 0.25 and a skip case | worst PAE 0.824219 LSB16 (threshold two-value), next 0.664062 (amount 1000); width 8..238 at or below 0.136719; 1953 to 5712 samples per case |
 | identity and flat-mask cases (contrast 0, threshold zeros, sigma below `GAUSS_SKIP`) | bit-exact, 0 differing samples |
 | residual request through `stage::run()` with `halocontrol=true`, RLD and `blurradius=0.3` | `impl=host`, `source=device-fallback`; output bit-identical to both the production CPU path and the extracted core |
+| packed-plane contract through `stage::run()` with a padded row or a padded plane, on both the device and the builtin path | `RT_STAGE_INVALID`, 1953 samples untouched in every case |
+| `edgesonly=true` and `showMask=true` through `stage::run()` | both are valid host residuals: `impl=host`, no device record; edges-only is bit-identical to the CPU reference, show-mask is bit-identical to the CPU mask and writes all 1953 samples |
 | supported request through `stage::run()` | record `impl=opencl`, `source=opencl`; within 1 LSB16 of the CPU path |
 | `verify.sh --stage-device`, POCL CPU, `RT_REQUIRE_GPU=1`, `OMP_NUM_THREADS=1`, `sharpen-usm.pp3` | PASS, `max_pae=1.5259e-05` on a 1944x1304 frame; record `"stage":"output.sharpen","impl":"opencl","source":"opencl"` |
 | the same gate with `sharpen-rld.pp3` | `impl=host`, `source=device-fallback`; printed as a host residual and not counted as device parity |

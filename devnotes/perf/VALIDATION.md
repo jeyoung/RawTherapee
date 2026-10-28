@@ -147,7 +147,8 @@ node ran on the device rather than only comparing pixels.
 | Output sharpening USM (`sharpen-usm.pp3`, 0.5 scale, radius 0.5) | PASS, `max_pae=1.5259e-05`; the record is `"stage":"output.sharpen","impl":"opencl","source":"opencl"` |
 | Output sharpening RLD (`sharpen-rld.pp3`) | PASS as a host residual: `"stage":"output.sharpen","impl":"host","source":"device-fallback"`, not counted as device parity |
 | Output sharpening device test | 25 USM cases at widths 8 to 238 (including a padded 238 row), radius 0.3 to 3.0, contrast 0/20/100, amounts 1/100/200/1000 and threshold breakpoints; worst PAE 0.824219 LSB16, all finite; the flat-mask and skip cases are bit-exact |
-| Output sharpening residuals | `halocontrol=true`, RLD and `blurradius=0.3` return `impl=host` through `stage::run()` and are bit-identical to the CPU reference and the extracted core |
+| Output sharpening residuals | `halocontrol=true`, RLD, `blurradius=0.3`, `edgesonly=true` and `showMask=true` return `impl=host` through `stage::run()`; the first four are bit-identical to the CPU reference and the extracted core, and show-mask is bit-identical to the CPU mask and writes all samples |
+| Output sharpening packed-plane contract | padded row and padded plane descriptors are refused with `RT_STAGE_INVALID` on both the device and builtin paths, leaving all samples untouched |
 | Output sharpening CPU refactor | USM and RLD exports with `--gpu=off`, `OMP_NUM_THREADS=1`: normalized 16-bit pixel hashes identical before and after |
 | Device records | `"stage":"lanczos3"`, `"stage":"transform"`, `"stage":"output.convert"`, `"stage":"gamut"`, `"stage":"framing"` and `"stage":"output.sharpen"`, all `impl":"opencl"`, `source":"opencl"`; the classic log has no `opencl resize`, `opencl transform` or `opencl lab2srgb` line |
 | `monitor.output`, `viewport.output` in the GUI | device records with `impl=opencl`, `source=opencl`; preview image area identical to a CPU-only run (0 LSB8) |
