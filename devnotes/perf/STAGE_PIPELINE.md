@@ -5,6 +5,12 @@ the four engine pipelines: export, preview, crop and thumbnail. It is the
 Phase A artefact for the stage runtime: the graph and its block boundaries are
 specified and tested here, before any production pipeline is rewired.
 
+Vocabulary: the typed `EditorRequest` (facts and dirty blocks) is the only
+request type. `M_*` names appear below only in historical migration mappings,
+in quoted code that was removed, and in the retirement guard; none is a current
+rule. The mask-era sentences are kept because they explain why the derivation
+looks the way it does.
+
 The specification is data only. `rtengine/stage/stage_pipeline.cc` builds it and
 `rtengine/stage/tests/stage_pipeline_test.cc` proves its shape. All four engine
 paths execute this graph through `StageGraph::plan()`; the hand-ordered
@@ -655,10 +661,11 @@ crop path, 14 for the preview) rather than twice.
    dirties the whole path. A request is absolute, not a delta: it says "this
    pass rebuilds the path", so it cannot be expressed as an input change. The
    preview coordinator takes the kind from the typed `EditorRequest`, whose
-   adapter maps the request-level mask bits once, because those bits stand for
-   work no parameter or render-state field describes: `M_HIGHQUAL` is
-   `HighQuality`, `M_INIT`, `M_LINDENOISE` and `M_HDR` are `FullPreview`, and
-   an ordinary pass is `ParamsOnly`. The plan never reads the mask.
+   adapter maps the request family once, because that family stands for work
+   no parameter or render-state field describes: the high-quality family is
+   `HighQuality`, the initialisation, line-denoise and HDR families are
+   `FullPreview`, and an ordinary pass is `ParamsOnly`. No retired mask bit is
+   read at runtime.
 4. **Coupled group.** The Lab chain shares one `laboCrop -> labnCrop` seed and
    one gate. Seeding any member seeds the whole group: crop
    `lab.tools`, `lab.sharpening`, `lab.wavelet`, `working.trc`, `ciecam`,
@@ -725,8 +732,8 @@ call and never skips a block.
 
 The geometry row covers the crop rectangle as well as the preview scale, so a
 preview crop change re-renders the whole preview. That is the conservative
-answer: the crop viewport's row is the tighter `M_CROP` set because the crop
-path has no full-frame source reload in its geometry change.
+answer: the crop viewport's row is the tighter crop set because the crop path
+has no full-frame source reload in its geometry change.
 
 `StagePath::Export` and `StagePath::Thumbnail` do not carry a
 `RenderStateKey`; the state adapter returns the whole path and marks the result
@@ -955,10 +962,12 @@ tools/perf/preview-work-order-sweep.sh \
 The driver builds the target, probes the kill switch (with `RT_WORK_SHADOW`
 unset, so an ambient value cannot fail the probe), runs the sequence with
 `RT_WORK_ORDER=off` and with the default, and compares every state with
-`magick compare -metric AE`. The state list comes from the run log and a state
-directory missing on either side fails the run; the driver never passes on the
-strength of the directories that happen to exist. It writes the two run logs
-and the state dumps under the output directory.
+`magick compare -metric AE`. `RT_WORK_SHADOW` is a diagnostic marker only: it
+changes no engine behaviour and is kept so a recorded run can state which mode
+it used. The state list comes from the run log and a state directory missing on
+either side fails the run; the driver never passes on the strength of the
+directories that happen to exist. It writes the two run logs and the state
+dumps under the output directory.
 
 Timing samples use the same harness. The script documents the flag and runs
 the exact commands itself:
@@ -1052,8 +1061,8 @@ tool enable flags.
    `retinexPlanes` term names `rawDemosaic` when retinex is newly enabled,
    when it is disabled (only a fresh demosaic removes the output), and when
    the working profile moves while it is enabled (the buffers are converted
-   with the working-space matrix). A bare retinex strength edit carries
-   `M_RETINEX`, reuses the buffers and still does not name the body.
+   with the working-space matrix). A bare retinex strength edit dirties the
+   retinex family, reuses the buffers and still does not name the body.
 2. **Capture sharpening disable.** Capture sharpening writes the demosaiced
    planes in place. The typed predicate named the body only while the tool was
    currently enabled, so disabling it kept the sharpened planes. It now names
@@ -1064,8 +1073,8 @@ tool enable flags.
    method; at 100% the configured method runs. The typed predicate only named
    pending high-detail work, which covers the gaining direction. Dropping the
    decision changed the pixels without naming the body. The `highDetailMode`
-   term names `rawDemosaic` in both directions; the crossing request carries
-   `M_RAW` for exactly that reason.
+   term names `rawDemosaic` in both directions; the crossing request names the
+   raw source for exactly that reason.
 
 ### Body-input audit
 

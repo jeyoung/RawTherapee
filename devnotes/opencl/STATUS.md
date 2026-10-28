@@ -136,7 +136,8 @@ An RCD full-image pass prototype was implemented and reverted before commit.
 - Preview changes carry a generation counter, incremented in both
   `startProcessing(int)` and `endUpdateParams(int)`.
 - Before a render starts, `updatePreviewImage` discards a stale request and
-  requeues its complete mask; panning requests also requeue `M_MONITOR`.
+  requeues its complete typed request; panning requests also dirty the
+  monitor-output block.
 - The crop/post-crop-vignetting transform augmentation is applied before the
   discarding check.
 - `WITH_OPENCL=ON` and `WITH_OPENCL=OFF` builds PASS.

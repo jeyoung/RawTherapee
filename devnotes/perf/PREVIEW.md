@@ -110,15 +110,15 @@ crossfade and no intermediate three-stage blur-up, matching the existing rough
 preview -> detailed-crop handoff. Editing remains disabled during decoding and
 the rough preview, and is enabled only when the final image arrives.
 
-The final pass must request the complete post-base preview pipeline
-(`M_RGBCURVE`, `M_LUMACURVE`, `M_LUMINANCE`, `M_COLOR` and `M_MONITOR`, plus
-the optional HDR/spot/denoise stages), not just `M_INIT | M_MONITOR`. The
-preview scale change reallocates the Lab buffers, so reducing the request to
-the base and monitor stages leaves `oprevl` and `nprevl` empty. The navigator
-and the 100% panning fallback both use the resulting preview image and would
-show a black frame until an unrelated edit rebuilds the pipeline. The final
-request uses the canonical `COMPR` mask and deliberately omits `M_PREPROC` and
-`M_RAW`; the rough pass has already decoded and preprocessed the source. The
+The final pass must request the complete post-base preview pipeline (RGB
+curves, Lab curves, luminance, colour and monitor output, plus the optional
+HDR/spot/denoise stages), not just the base and monitor blocks. The preview
+scale change reallocates the Lab buffers, so reducing the request to the base
+and monitor stages leaves `oprevl` and `nprevl` empty. The navigator and the
+100% panning fallback both use the resulting preview image and would show a
+black frame until an unrelated edit rebuilds the pipeline. The final request is
+the canonical full preview request and deliberately omits raw preprocessing and
+the raw source; the rough pass has already decoded and preprocessed the source. The
 handoff adopts the coordinator's actual scale after `setPreviewScale()`, so a
 profile-induced scale normalisation is not compared with a stale request.
 

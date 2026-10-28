@@ -32,7 +32,8 @@ stored session state.
   `CropHandler::newImage()` rather than inferred from `Crop::skip`.
 - `paramsReady` prevents a toggle from queuing work before the first real
   parameter update.
-- A 100% crossing queues `ALL | M_MONITOR` only when it changes the effective
+- A 100% crossing queues a complete preview request including monitor output
+  only when it changes the effective
   demosaic decision returned by `needFullDemosaic()`, invalidating the viewport
   state and dirtying the preview base cache. The comparison uses the
   main-preview resolution flag on both sides of the crossing and the current
@@ -46,8 +47,8 @@ stored session state.
   screen after a crossing. A preference change on its own still does not
   refresh the below-100% preview.
 - Toggling FAST while the main preview is below 100% does not queue a render.
-- `M_HIGHQUAL` remains a detail-window crop refresh. It no longer selects the
-  demosaic method.
+- A high-quality (100%) crossing remains a detail-window crop refresh. It no
+  longer selects the demosaic method.
 
 ## Verification
 

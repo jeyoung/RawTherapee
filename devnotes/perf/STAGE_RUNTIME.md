@@ -5,6 +5,10 @@ This record describes the experimental stage runtime added on
 keeps the existing image pipeline, while the new layer provides a stable
 interface for later cache, tile and OpenCL work.
 
+Vocabulary: the typed `EditorRequest` (facts and dirty blocks) replaced the
+invalidation bitmask. `M_*` names below appear only in historical evidence and
+in quoted code that was removed; none is a current rule.
+
 ## Purpose
 
 The engine has four hand-ordered pipelines (`ImProcCoordinator`, `Crop`,
@@ -672,7 +676,7 @@ names a block outside the preview inventory, or the graph would skip a dirty
 node.
 
 The preview plan has one authority: the parameter fingerprints and the render
-state. There is no mask-authority switch and no shadow plan. The event mask
+state. There is no mask-authority switch and no shadow plan. The typed request
 still drives the viewport fast path, the crop render, GUI notification and the
 per-node work inside a scheduled node, but it no longer decides which
 full-frame nodes are scheduled.
@@ -717,8 +721,10 @@ proves the edit exercised a real pass. The two profile rows also show the
 expected separation: an output profile reaches only `work.tif`, a monitor
 profile only `preview.tif`.
 
-Historical evidence from the shadow tranche: across the four graph runs the
-shadow log reported zero mismatches and two over-approximations. On the exposure pass (`mask=0x401f`) the derivation adds
+Historical evidence from the retired shadow tranche (the mask vocabulary in
+this paragraph is the vocabulary of that era): across the four graph runs the
+shadow log reported zero mismatches and two over-approximations. On the
+exposure pass (`mask=0x401f`) the derivation adds
 `raw.base`: the event mask leaves the base to the retinex sub-path, the block
 runs and its own gate declines the work. On the output-profile pass
 (`mask=0x4280`, which carries the injected `M_INIT | M_HDR` rebuild bits) it
