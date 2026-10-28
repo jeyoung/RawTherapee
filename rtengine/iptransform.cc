@@ -21,6 +21,8 @@
 #include "imagefloat.h"
 #include "improcfun.h"
 #include "opencl/openclengine.h"
+#include "stage/stage_buffer.h"
+#include "stage/stage_runtime.h"
 
 #include "homogeneouscoordinates.h"
 #include "procparams.h"
@@ -1068,6 +1070,51 @@ void ImProcFunctions::transformLuminanceOnly (Imagefloat* original, Imagefloat* 
 }
 
 
+namespace
+{
+
+/*
+ * Run the rotation/scale node on the stage device. The argument order is the
+ * one `launch_transform` documents: two buffers, eight ints, four doubles. The
+ * classic backend covers the same node, so the call site tries this first when
+ * the device owns the node.
+ */
+bool run_transform_stage(Imagefloat& original, Imagefloat& transformed, int cx,
+                         int cy, int sx, int sy, int oW, int oH,
+                         double hscale, double vscale, double cost, double sint,
+                         bool highQuality, bool useLog)
+{
+    constexpr int INT_ARGS = 8;
+    constexpr int DOUBLE_ARGS = 4;
+    constexpr int ARG_COUNT = 2 + INT_ARGS + DOUBLE_ARGS;
+
+    RtStageArg args[ARG_COUNT]{};
+    args[0].kind = RT_STAGE_ARG_BUFFER;
+    args[0].u.buffer = stage::view(original);
+    args[1].kind = RT_STAGE_ARG_BUFFER;
+    args[1].u.buffer = stage::view(transformed);
+
+    const int ints[INT_ARGS] = {
+        cx, cy, sx, sy, oW, oH, highQuality ? 1 : 0, useLog ? 1 : 0
+    };
+    for (int i = 0; i < INT_ARGS; ++i) {
+        args[2 + i].kind = RT_STAGE_ARG_INT;
+        args[2 + i].u.i = ints[i];
+    }
+
+    const double doubles[DOUBLE_ARGS] = {hscale, vscale, cost, sint};
+    for (int i = 0; i < DOUBLE_ARGS; ++i) {
+        args[2 + INT_ARGS + i].kind = RT_STAGE_ARG_DOUBLE;
+        args[2 + INT_ARGS + i].u.f = doubles[i];
+    }
+
+    RtStageProfiling profiling{};
+    return stage::run("transform", std::vector<RtStageArg>(args, args + ARG_COUNT),
+                      &profiling) == RT_STAGE_OK;
+}
+
+} // namespace
+
 void ImProcFunctions::transformGeneral(bool highQuality, Imagefloat *original, Imagefloat *transformed, int cx, int cy, int sx, int sy, int oW, int oH, int fW, int fH, const LensCorrection *pLCPMap, bool useOriginalBuffer)
 {
 
@@ -1189,9 +1236,16 @@ void ImProcFunctions::transformGeneral(bool highQuality, Imagefloat *original, I
             gpuOriginal = gpuLog.get();
         }
 
-        if (opencl::transformRotateScale(gpuOriginal, transformed, cx, cy, sx,
-                                         sy, oW, oH, hscale, vscale, cost, sint,
-                                         highQuality, useLog)) {
+        if (stage::node_device("transform") == stage::StageNodeDevice::OpenCL) {
+            if (run_transform_stage(*gpuOriginal, *transformed, cx, cy, sx, sy,
+                                    oW, oH, hscale, vscale, cost, sint,
+                                    highQuality, useLog)) {
+                return;
+            }
+        } else if (opencl::transformRotateScale(gpuOriginal, transformed, cx,
+                                                cy, sx, sy, oW, oH, hscale,
+                                                vscale, cost, sint, highQuality,
+                                                useLog)) {
             return;
         }
     }

@@ -48,6 +48,8 @@
 
 #include "rt_math.h"
 #include "sleef.h"
+#include "stage/algorithms/transform_cl.h"
+#include "transformmap.h"
 
 /*
  * The ICD health probe asks a platform's questions in a throwaway process, so
@@ -625,10 +627,73 @@ __kernel void lanczos3(__global const float* src,
 }
 )CLC";
 
+const char* const TRANSFORM_SOURCE = R"CLC(
+#pragma OPENCL FP_CONTRACT OFF
+)CLC" RT_TRANSFORM_SAMPLING_CL R"CLC(
+/*
+ * Three-plane rotation/scale with a host-built map: four floats per
+ * destination pixel hold the source cell and the fractional offsets. The
+ * sampling helpers are shared with the classic backend kernel, so both
+ * interpolate identically; only the addressing differs.
+ */
+__kernel void rt_transform(__global const float* src,
+                           __global float* dst,
+                           __global const float* map,
+                           const int srcWidth, const int srcHeight,
+                           const int dstWidth, const int dstHeight,
+                           const int srcPitch, const int srcPlanePitch,
+                           const int dstPitch, const int dstPlanePitch,
+                           const int highQuality, const int useLog)
+{
+    /* One work item per destination pixel, as the launch uses a 1-D range.
+     * The runtime may pad the range to a work-group multiple, so the extra
+     * items must return before they index the buffers. */
+    const int gid = get_global_id(0);
+    const int y = gid / dstWidth;
+    if (y >= dstHeight) {
+        return;
+    }
+    const int x = gid - y * dstWidth;
+
+    const int index = y * dstPitch + x;
+    const int mapIndex = (y * dstWidth + x) * 4;
+    const int xc = (int)map[mapIndex];
+    const int yc = (int)map[mapIndex + 1];
+    const float dx = map[mapIndex + 2];
+    const float dy = map[mapIndex + 3];
+
+    __global const float* input[3] = {
+        src, src + srcPlanePitch, src + 2 * srcPlanePitch
+    };
+    __global float* output[3] = {
+        dst, dst + dstPlanePitch, dst + 2 * dstPlanePitch
+    };
+
+    if (yc < 0 || yc >= srcHeight || xc < 0 || xc >= srcWidth) {
+        output[0][index] = 0.0f;
+        output[1][index] = 0.0f;
+        output[2][index] = 0.0f;
+        return;
+    }
+
+    const int interior = yc > 0 && yc < srcHeight - 2
+        && xc > 0 && xc < srcWidth - 2;
+
+    for (int plane = 0; plane < 3; ++plane) {
+        const float value = (interior && highQuality)
+            ? rt_transform_cubic(input[plane], srcPitch, xc - 1, yc - 1, dx, dy)
+            : rt_transform_bilinear(input[plane], srcPitch, srcWidth,
+                                    srcHeight, xc, yc, dx, dy);
+        output[plane][index] = rt_transform_finish(value, useLog);
+    }
+}
+)CLC";
+
 const std::vector<KernelDef>& kernels()
 {
     static const std::vector<KernelDef> table = {
-        {"lanczos3", LANCZOS_SOURCE, "lanczos3"}
+        {"lanczos3", LANCZOS_SOURCE, "lanczos3"},
+        {"transform", TRANSFORM_SOURCE, "rt_transform"}
     };
     return table;
 }
@@ -1214,6 +1279,57 @@ private:
  * result back in wait(). Returns null with a reason when the node cannot run
  * on the device, so the caller can fall back to the host program.
  */
+/*
+ * Compile a kernel once per queue and keep it for the context lifetime. The
+ * program cache is per environment, so a rebuild of the same entry point does
+ * not pay the build again.
+ */
+cl_kernel compiled_kernel(const std::shared_ptr<OpenCLEnv>& env,
+                          const KernelDef* def, std::string& error)
+{
+    std::lock_guard<std::mutex> lock(env->program_mutex);
+    const auto found = env->kernels.find(def->name);
+    if (found != env->kernels.end()) {
+        return found->second;
+    }
+
+    cl_int build_error = CL_SUCCESS;
+    const char* source = def->source;
+    cl_program program = env->api->CreateProgramWithSource(
+        env->context, 1, &source, nullptr, &build_error);
+    if (program == nullptr) {
+        error = "clCreateProgramWithSource failed";
+        return nullptr;
+    }
+
+    build_error = env->api->BuildProgram(program, 1, &env->device, nullptr,
+                                         nullptr, nullptr);
+    if (build_error != CL_SUCCESS) {
+        std::size_t log_size = 0;
+        env->api->GetProgramBuildInfo(program, env->device, CL_PROGRAM_BUILD_LOG,
+                                      0, nullptr, &log_size);
+        std::string log(log_size, '\0');
+        if (log_size > 0) {
+            env->api->GetProgramBuildInfo(program, env->device,
+                                          CL_PROGRAM_BUILD_LOG, log_size,
+                                          &log[0], nullptr);
+        }
+        env->api->ReleaseProgram(program);
+        error = "OpenCL kernel build failed: " + log;
+        return nullptr;
+    }
+
+    cl_kernel kernel = env->api->CreateKernel(program, def->entry, &build_error);
+    env->api->ReleaseProgram(program);
+    if (kernel == nullptr) {
+        error = "clCreateKernel failed";
+        return nullptr;
+    }
+
+    env->kernels[def->name] = kernel;
+    return kernel;
+}
+
 std::shared_ptr<OpenCLSubmission> launch_lanczos(
     const std::shared_ptr<OpenCLEnv>& env,
     const std::shared_ptr<OpenCLResidency>& residency,
@@ -1272,47 +1388,9 @@ std::shared_ptr<OpenCLSubmission> launch_lanczos(
         return nullptr;
     }
 
-    /* Compile once per queue and keep the kernel for the context lifetime. */
-    cl_kernel kernel = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(env->program_mutex);
-        const auto found = env->kernels.find(def->name);
-        if (found != env->kernels.end()) {
-            kernel = found->second;
-        } else {
-            cl_int build_error = CL_SUCCESS;
-            const char* source = def->source;
-            cl_program program = env->api->CreateProgramWithSource(
-                env->context, 1, &source, nullptr, &build_error);
-            if (program == nullptr) {
-                error = "clCreateProgramWithSource failed";
-                return nullptr;
-            }
-            build_error = env->api->BuildProgram(program, 1, &env->device,
-                                                 nullptr, nullptr, nullptr);
-            if (build_error != CL_SUCCESS) {
-                std::size_t log_size = 0;
-                env->api->GetProgramBuildInfo(program, env->device,
-                                              CL_PROGRAM_BUILD_LOG, 0, nullptr,
-                                              &log_size);
-                std::string log(log_size, '\0');
-                if (log_size > 0) {
-                    env->api->GetProgramBuildInfo(program, env->device,
-                                                  CL_PROGRAM_BUILD_LOG, log_size,
-                                                  &log[0], nullptr);
-                }
-                env->api->ReleaseProgram(program);
-                error = "OpenCL kernel build failed: " + log;
-                return nullptr;
-            }
-            kernel = env->api->CreateKernel(program, def->entry, &build_error);
-            env->api->ReleaseProgram(program);
-            if (kernel == nullptr) {
-                error = "clCreateKernel failed";
-                return nullptr;
-            }
-            env->kernels[def->name] = kernel;
-        }
+    cl_kernel kernel = compiled_kernel(env, def, error);
+    if (kernel == nullptr) {
+        return nullptr;
     }
 
     /* Scratch buffers hold the weights and tap bounds for this submission. */
@@ -1412,6 +1490,185 @@ std::shared_ptr<OpenCLSubmission> launch_lanczos(
                                               residency, dst_device, dst);
 }
 
+
+/*
+ * Rotation and scale. Argument order:
+ *   [0] source buffer, [1] destination buffer,
+ *   [2..9] ints cx, cy, sx, sy, oW, oH, highQuality, useLog,
+ *   [10..13] doubles hscale, vscale, cost, sint.
+ *
+ * The map is built on the host in double precision with the same builder the
+ * classic backend uses, and travels as a scratch buffer for this submission.
+ */
+std::shared_ptr<OpenCLSubmission> launch_transform(
+    const std::shared_ptr<OpenCLEnv>& env,
+    const std::shared_ptr<OpenCLResidency>& residency,
+    const std::vector<RtStageArg>& args, std::string& error)
+{
+    constexpr std::size_t BUFFER_ARGS = 2;
+    constexpr std::size_t INT_ARGS = 8;
+    constexpr std::size_t DOUBLE_ARGS = 4;
+    constexpr std::size_t ARG_COUNT = BUFFER_ARGS + INT_ARGS + DOUBLE_ARGS;
+
+    if (args.size() != ARG_COUNT || args[0].kind != RT_STAGE_ARG_BUFFER ||
+        args[1].kind != RT_STAGE_ARG_BUFFER) {
+        error = "transform expects two buffers, eight ints and four doubles";
+        return nullptr;
+    }
+    for (std::size_t i = BUFFER_ARGS; i < BUFFER_ARGS + INT_ARGS; ++i) {
+        if (args[i].kind != RT_STAGE_ARG_INT) {
+            error = "transform argument " + std::to_string(i) + " is not an int";
+            return nullptr;
+        }
+    }
+    for (std::size_t i = BUFFER_ARGS + INT_ARGS; i < ARG_COUNT; ++i) {
+        if (args[i].kind != RT_STAGE_ARG_DOUBLE) {
+            error = "transform argument " + std::to_string(i) +
+                    " is not a double";
+            return nullptr;
+        }
+    }
+
+    const RtStageBuffer& src = args[0].u.buffer;
+    const RtStageBuffer& dst = args[1].u.buffer;
+    if (!valid(src) || !valid(dst) || src.format != RT_STAGE_F32 ||
+        dst.format != RT_STAGE_F32 || src.planes != 3 || dst.planes != 3) {
+        error = "transform needs two three-plane F32 buffers";
+        return nullptr;
+    }
+    if (src.data == dst.data) {
+        error = "transform needs distinct source and destination buffers";
+        return nullptr;
+    }
+
+    TransformGeometry geometry;
+    geometry.cx = args[2].u.i;
+    geometry.cy = args[3].u.i;
+    geometry.sx = args[4].u.i;
+    geometry.sy = args[5].u.i;
+    geometry.oW = args[6].u.i;
+    geometry.oH = args[7].u.i;
+    geometry.hscale = args[10].u.f;
+    geometry.vscale = args[11].u.f;
+    geometry.cost = args[12].u.f;
+    geometry.sint = args[13].u.f;
+    const bool high_quality = args[8].u.i != 0;
+    const bool use_log = args[9].u.i != 0;
+
+    std::vector<float> map;
+    buildTransformMap(geometry, dst.width, dst.height, map);
+
+    const KernelDef* def = find_kernel("transform");
+    assert(def != nullptr);
+
+    const StageBufferShape src_shape{RT_STAGE_F32, src.width, src.height, 3};
+    const StageBufferShape dst_shape{RT_STAGE_F32, dst.width, dst.height, 3};
+
+    StageDeviceBufferPtr src_device =
+        residency->acquire(src.data, src_shape, &error);
+    if (!src_device) {
+        return nullptr;
+    }
+    StageDeviceBufferPtr dst_device =
+        residency->acquire(dst.data, dst_shape, &error);
+    if (!dst_device) {
+        return nullptr;
+    }
+    if (residency->upload(src_device, src) != RT_STAGE_OK) {
+        error = "device upload failed";
+        return nullptr;
+    }
+
+    auto device_src = std::dynamic_pointer_cast<OpenCLDeviceBuffer>(src_device);
+    auto device_dst = std::dynamic_pointer_cast<OpenCLDeviceBuffer>(dst_device);
+    if (!device_src || !device_dst) {
+        error = "device buffer type mismatch";
+        return nullptr;
+    }
+
+    cl_kernel kernel = compiled_kernel(env, def, error);
+    if (kernel == nullptr) {
+        return nullptr;
+    }
+
+    cl_int map_error = CL_SUCCESS;
+    cl_mem map_memory = env->api->CreateBuffer(
+        env->context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+        map.size() * sizeof(float), map.data(), &map_error);
+    if (map_memory == nullptr || map_error != CL_SUCCESS) {
+        if (map_memory != nullptr) {
+            env->api->ReleaseMemObject(map_memory);
+        }
+        error = "device map allocation failed";
+        return nullptr;
+    }
+
+    std::vector<cl_mem> scratch{map_memory};
+
+    const cl_int src_width = src.width;
+    const cl_int src_height = src.height;
+    const cl_int dst_width = dst.width;
+    const cl_int dst_height = dst.height;
+    const cl_int src_pitch =
+        static_cast<cl_int>(device_src->row_pitch() / sizeof(float));
+    const cl_int src_plane_pitch =
+        static_cast<cl_int>(device_src->plane_pitch() / sizeof(float));
+    const cl_int dst_pitch =
+        static_cast<cl_int>(device_dst->row_pitch() / sizeof(float));
+    const cl_int dst_plane_pitch =
+        static_cast<cl_int>(device_dst->plane_pitch() / sizeof(float));
+    const cl_int high_quality_arg = high_quality ? 1 : 0;
+    const cl_int use_log_arg = use_log ? 1 : 0;
+
+    const auto set_arg = [&](cl_uint index, std::size_t bytes,
+                             const void* value) {
+        return env->api->SetKernelArg(kernel, index, bytes, value) == CL_SUCCESS;
+    };
+
+    std::lock_guard<std::recursive_mutex> lock(env->queue_mutex);
+
+    cl_mem src_memory = device_src->memory();
+    cl_mem dst_memory = device_dst->memory();
+    const bool args_ok =
+        set_arg(0, sizeof(cl_mem), &src_memory) &&
+        set_arg(1, sizeof(cl_mem), &dst_memory) &&
+        set_arg(2, sizeof(cl_mem), &map_memory) &&
+        set_arg(3, sizeof(cl_int), &src_width) &&
+        set_arg(4, sizeof(cl_int), &src_height) &&
+        set_arg(5, sizeof(cl_int), &dst_width) &&
+        set_arg(6, sizeof(cl_int), &dst_height) &&
+        set_arg(7, sizeof(cl_int), &src_pitch) &&
+        set_arg(8, sizeof(cl_int), &src_plane_pitch) &&
+        set_arg(9, sizeof(cl_int), &dst_pitch) &&
+        set_arg(10, sizeof(cl_int), &dst_plane_pitch) &&
+        set_arg(11, sizeof(cl_int), &high_quality_arg) &&
+        set_arg(12, sizeof(cl_int), &use_log_arg);
+    if (!args_ok) {
+        for (cl_mem memory : scratch) {
+            env->api->ReleaseMemObject(memory);
+        }
+        error = "clSetKernelArg failed";
+        return nullptr;
+    }
+
+    const std::size_t global =
+        static_cast<std::size_t>(dst.width) * static_cast<std::size_t>(dst.height);
+    cl_event done = nullptr;
+    const cl_int enqueue_error = env->api->EnqueueNDRangeKernel(
+        env->queue, kernel, 1, nullptr, &global, nullptr, 0, nullptr, &done);
+    if (enqueue_error != CL_SUCCESS || done == nullptr) {
+        for (cl_mem memory : scratch) {
+            env->api->ReleaseMemObject(memory);
+        }
+        error = "clEnqueueNDRangeKernel failed with error " +
+                std::to_string(enqueue_error);
+        return nullptr;
+    }
+
+    return std::make_shared<OpenCLSubmission>(env, done, std::move(scratch),
+                                              residency, dst_device, dst);
+}
+
 class OpenCLStageQueue final : public StageQueue
 {
 public:
@@ -1460,8 +1717,14 @@ public:
         event.device = StageDeviceType::OPENCL;
 
         std::string error;
-        auto submission =
-            launch_lanczos(env_, residency_, request.args, error);
+        std::shared_ptr<OpenCLSubmission> submission;
+        if (request.name == "lanczos3") {
+            submission = launch_lanczos(env_, residency_, request.args, error);
+        } else if (request.name == "transform") {
+            submission = launch_transform(env_, residency_, request.args, error);
+        } else {
+            error = "no OpenCL launcher for stage '" + request.name + "'";
+        }
         if (!submission) {
             StageEvent fallback = StageQueue::submit(request, profiling);
             fallback.note = error;

@@ -23,6 +23,8 @@
 #include "rtengine/image8.h"
 #include "rtengine/imagefloat.h"
 #include "rtengine/labimage.h"
+#include "rtengine/stage/algorithms/transform_cl.h"
+#include "rtengine/transformmap.h"
 #include "boxblur.h"
 #include "color.h"
 #include "improcfun.h"
@@ -352,60 +354,9 @@ float lanczosWeight(float x, float a)
     return a * xsinf(x) * xsinf(x / a) / (x * x);
 }
 
-const char* transformKernelSource = R"(
+const char* transformKernelSource = R"CLC(
 #pragma OPENCL FP_CONTRACT OFF
-
-inline float rt_finish(const float value, const int useLog)
-{
-    return useLog ? exp(value) : value;
-}
-
-inline float rt_cubic1(__global const float* src, const int srcWidth,
-                       const int xs, const int ys,
-                       const float dx, const float dy)
-{
-    const float A = -0.85f;
-    const float t1v = A * (dy - dy * dy);
-    const float t2v = (3.0f - 2.0f * dy) * dy * dy;
-    const float w0v = t1v - (t1v * dy);
-    const float w1v = 1.0f - (t1v * dy) - t2v;
-    const float w2v = t1v * dy - t1v + t2v;
-    const float w3v = t1v * dy;
-    float values[4];
-
-    for (int i = 0; i < 4; ++i) {
-        values[i] = (w0v * src[ys * srcWidth + xs + i]
-            + w1v * src[(ys + 1) * srcWidth + xs + i])
-            + (w2v * src[(ys + 2) * srcWidth + xs + i]
-            + w3v * src[(ys + 3) * srcWidth + xs + i]);
-    }
-
-    const float t1h = A * (dx - dx * dx);
-    const float t2h = (3.0f - 2.0f * dx) * dx * dx;
-    const float w0h = t1h - (t1h * dx);
-    const float w1h = 1.0f - (t1h * dx) - t2h;
-    const float w2h = t1h * dx - t1h + t2h;
-    const float w3h = t1h * dx;
-
-    return (values[0] * w0h + values[2] * w2h)
-        + (values[1] * w1h + values[3] * w3h);
-}
-
-inline float rt_bilinear1(__global const float* src, const int srcWidth,
-                          const int srcHeight, const int xc, const int yc,
-                          const float dx, const float dy)
-{
-    const int x1 = clamp(xc, 0, srcWidth - 1);
-    const int x2 = clamp(xc + 1, 0, srcWidth - 1);
-    const int y1 = clamp(yc, 0, srcHeight - 1);
-    const int y2 = clamp(yc + 1, 0, srcHeight - 1);
-
-    return src[y1 * srcWidth + x1] * (1.0f - dx) * (1.0f - dy)
-        + src[y1 * srcWidth + x2] * dx * (1.0f - dy)
-        + src[y2 * srcWidth + x1] * (1.0f - dx) * dy
-        + src[y2 * srcWidth + x2] * dx * dy;
-}
-
+)CLC" RT_TRANSFORM_SAMPLING_CL R"CLC(
 __kernel void rt_transform(__global const float* srcR,
                            __global const float* srcG,
                            __global const float* srcB,
@@ -435,21 +386,21 @@ __kernel void rt_transform(__global const float* srcR,
 
     if (yc > 0 && yc < srcHeight - 2 && xc > 0 && xc < srcWidth - 2) {
         if (highQuality) {
-            dstR[index] = rt_finish(rt_cubic1(srcR, srcWidth, xc - 1, yc - 1, dx, dy), useLog);
-            dstG[index] = rt_finish(rt_cubic1(srcG, srcWidth, xc - 1, yc - 1, dx, dy), useLog);
-            dstB[index] = rt_finish(rt_cubic1(srcB, srcWidth, xc - 1, yc - 1, dx, dy), useLog);
+            dstR[index] = rt_transform_finish(rt_transform_cubic(srcR, srcWidth, xc - 1, yc - 1, dx, dy), useLog);
+            dstG[index] = rt_transform_finish(rt_transform_cubic(srcG, srcWidth, xc - 1, yc - 1, dx, dy), useLog);
+            dstB[index] = rt_transform_finish(rt_transform_cubic(srcB, srcWidth, xc - 1, yc - 1, dx, dy), useLog);
         } else {
-            dstR[index] = rt_finish(rt_bilinear1(srcR, srcWidth, srcHeight, xc, yc, dx, dy), useLog);
-            dstG[index] = rt_finish(rt_bilinear1(srcG, srcWidth, srcHeight, xc, yc, dx, dy), useLog);
-            dstB[index] = rt_finish(rt_bilinear1(srcB, srcWidth, srcHeight, xc, yc, dx, dy), useLog);
+            dstR[index] = rt_transform_finish(rt_transform_bilinear(srcR, srcWidth, srcWidth, srcHeight, xc, yc, dx, dy), useLog);
+            dstG[index] = rt_transform_finish(rt_transform_bilinear(srcG, srcWidth, srcWidth, srcHeight, xc, yc, dx, dy), useLog);
+            dstB[index] = rt_transform_finish(rt_transform_bilinear(srcB, srcWidth, srcWidth, srcHeight, xc, yc, dx, dy), useLog);
         }
     } else {
-        dstR[index] = rt_finish(rt_bilinear1(srcR, srcWidth, srcHeight, xc, yc, dx, dy), useLog);
-        dstG[index] = rt_finish(rt_bilinear1(srcG, srcWidth, srcHeight, xc, yc, dx, dy), useLog);
-        dstB[index] = rt_finish(rt_bilinear1(srcB, srcWidth, srcHeight, xc, yc, dx, dy), useLog);
+        dstR[index] = rt_transform_finish(rt_transform_bilinear(srcR, srcWidth, srcWidth, srcHeight, xc, yc, dx, dy), useLog);
+        dstG[index] = rt_transform_finish(rt_transform_bilinear(srcG, srcWidth, srcWidth, srcHeight, xc, yc, dx, dy), useLog);
+        dstB[index] = rt_transform_finish(rt_transform_bilinear(srcB, srcWidth, srcWidth, srcHeight, xc, yc, dx, dy), useLog);
     }
 }
-)";
+)CLC";
 
 const char* labToRgbKernelSource = R"(
 #pragma OPENCL FP_CONTRACT OFF
@@ -2167,33 +2118,20 @@ bool transformRotateScale(const Imagefloat* src, Imagefloat* dst,
         return false;
     }
 
-    const double w2 = static_cast<double>(oW) / 2.0 - 0.5;
-    const double h2 = static_cast<double>(oH) / 2.0 - 0.5;
-    const double centerX = cx - w2;
-    const double centerY = cy - h2;
-    std::vector<float> map(static_cast<size_t>(dstWidth) * dstHeight * 4);
+    TransformGeometry geometry;
+    geometry.cx = cx;
+    geometry.cy = cy;
+    geometry.sx = sx;
+    geometry.sy = sy;
+    geometry.oW = oW;
+    geometry.oH = oH;
+    geometry.hscale = hscale;
+    geometry.vscale = vscale;
+    geometry.cost = cost;
+    geometry.sint = sint;
 
-    for (int y = 0; y < dstHeight; ++y) {
-        for (int x = 0; x < dstWidth; ++x) {
-            const size_t index = (static_cast<size_t>(y) * dstWidth + x) * 4;
-            const double xd = hscale * (static_cast<double>(x) + centerX);
-            const double yd = vscale * (static_cast<double>(y) + centerY);
-            const double dxr = xd * cost - yd * sint;
-            const double dyr = xd * sint + yd * cost;
-            double dx = dxr + w2;
-            double dy = dyr + h2;
-            int xc = static_cast<int>(dx);
-            dx -= xc;
-            xc -= sx;
-            int yc = static_cast<int>(dy);
-            dy -= yc;
-            yc -= sy;
-            map[index] = static_cast<float>(xc);
-            map[index + 1] = static_cast<float>(yc);
-            map[index + 2] = static_cast<float>(dx);
-            map[index + 3] = static_cast<float>(dy);
-        }
-    }
+    std::vector<float> map;
+    buildTransformMap(geometry, dstWidth, dstHeight, map);
 
     BufferSet buffers;
     buffers.owner = &state;
