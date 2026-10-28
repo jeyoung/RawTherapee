@@ -138,6 +138,7 @@ node ran on the device rather than only comparing pixels.
 | Output conversion (neutral) | PASS, `max_pae=1.5259e-05` |
 | Packed 8-bit Lab to RGB | byte-exact against an independent reference, and fails when the device matrix is scaled by 1.001 |
 | `monitor.output`, `viewport.output` in the GUI | device records with `impl=opencl`, `source=opencl`; preview image area identical to a CPU-only run (0 LSB8) |
+| `thumbnail.output` via the file browser | 12 device records; thumbnail cache byte-identical to a CPU-only run |
 | Device records | `"stage":"lanczos3"`, `"stage":"transform"` and `"stage":"output.convert"`, all `impl":"opencl"`, `source":"opencl"`; the classic log has no `opencl resize`, `opencl transform` or `opencl lab2srgb` line |
 | Forced refusal (`RT_STAGE_DEVICE_BUDGET_MB=16`, `RT_REQUIRE_GPU=1`) | FAIL with `impl":"host","source":"device-fallback"` |
 | No device selected (no `RT_OPENCL_ALLOW_CPU`) | SKIP |
@@ -167,11 +168,9 @@ of them the GUI silently uses the CPU path.
 - Container POCL parity: the package does not ship the test binaries and the
   stage device path is packaging-independent. The host POCL run covers the
   kernel; the container runs cover installation and export.
-- `thumbnail.output`: not reached. The thumbnail path never enables the device
-  (it sets neither the per-thread policy nor a usable monitor profile), and the
-  classic monitor path does not run there either, so a browser thumbnail falls
-  back to `lab2rgb`. Recorded as uncovered; this is wiring in `rtthumbnail`,
-  not a kernel gap.
+- None outstanding for the Lab-to-RGB family: `thumbnail.output` is now reached
+  as well. The file browser generates its thumbnails on the device and the
+  cache is byte-identical to a CPU-only run.
 - `--gpu-test` and `--gpu-test-monitor`: no GPU is available on this host.
 - Multi-threaded export parity: export is non-deterministic without
   `OMP_NUM_THREADS=1`, so parity runs are single-threaded by design.

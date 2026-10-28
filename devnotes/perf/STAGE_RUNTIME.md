@@ -207,10 +207,14 @@ an hour to discover:
 - point `OCL_ICD_VENDORS` at the POCL-only directory by absolute path, or the
   loader finds no platform.
 
-`thumbnail.output` is still uncovered. The thumbnail path never enables the
-device: it does not set the per-thread policy and the classic monitor path does
-not run there either, so a browser thumbnail falls back to `lab2rgb`. That is a
-wiring gap in `rtthumbnail`, not a kernel gap.
+`thumbnail.output` needed a wiring fix: `rtthumbnail` never set
+`ipf.setOpenCLAllowed()`, `opencl::setStageAllowed()` or
+`stage::set_opencl_stage_allowed()` before building the monitor profile, so the
+monitor conversion never reached a backend and a browser thumbnail fell back to
+`lab2rgb`. With the policy set from the same preference the editor and the batch
+export use, the file browser generates its thumbnails on the device (12 records
+for the visible corpus) and the thumbnail cache is byte-identical to a CPU-only
+run.
 
 ## Pilot stage
 
