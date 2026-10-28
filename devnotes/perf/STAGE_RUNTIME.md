@@ -195,12 +195,22 @@ respectively. Only the export node is reachable from the CLI; the packed 8-bit
 output is covered by a reference test in `stage-residency-test`, which shares
 no code with the kernel.
 
-The interactive nodes were **not exercised on a device** in this environment.
-The GUI here does not initialise OpenCL from a seeded options file — the
-classic backend does not run either — so a preview cannot reach the device
-path. The wiring is compiled and reviewed and the kernel is covered by the
-reference test, but a device run of `monitor.output`, `viewport.output` or
-`thumbnail.output` is recorded as uncovered until a GPU host can run it.
+`monitor.output` and `viewport.output` have since been exercised on the host
+with a 45.7 MP NEF: the GUI records both nodes with `impl=opencl`,
+`source=opencl`, and the preview image area is pixel-identical (0 LSB8) to a
+CPU-only run of the same state. Three things are required, and two of them cost
+an hour to discover:
+
+- run the OpenCL build of the GUI, not the CPU build, whose backend is a stub;
+- set an explicit monitor profile (`[Color Management] MonitorProfile`),
+  because without one the monitor conversion never reaches a backend at all;
+- point `OCL_ICD_VENDORS` at the POCL-only directory by absolute path, or the
+  loader finds no platform.
+
+`thumbnail.output` is still uncovered. The thumbnail path never enables the
+device: it does not set the per-thread policy and the classic monitor path does
+not run there either, so a browser thumbnail falls back to `lab2rgb`. That is a
+wiring gap in `rtthumbnail`, not a kernel gap.
 
 ## Pilot stage
 
