@@ -734,6 +734,123 @@ void test_lab_to_u8(bool available)
     check(differing == 0, "the Lab to RGB 8-bit output matches the reference");
 }
 
+/*
+ * thumbnail.whitebalance is reachable only from the thumbnail path, so the
+ * export harness cannot cover it. Run the device kernel on a synthetic image
+ * and compare every sample with an independent reference of the same loop.
+ */
+void test_thumbnail_wb(bool available)
+{
+    using namespace rtengine::stage;
+
+    if (!available) {
+        skip("thumbnail white balance: no OpenCL device");
+        return;
+    }
+
+    constexpr int WIDTH = 24;
+    constexpr int HEIGHT = 16;
+    constexpr double RMI = 2.0;
+    constexpr double GMI = 1.0;
+    constexpr double BMI = 0.5;
+    constexpr float MAX_VALUE = 65535.0f;
+    constexpr bool HR = true;
+
+    auto queue = opencl_device()->create_queue();
+    StageBufferAllocator host(StageDeviceType::CPU);
+    std::string error;
+    RtStageBuffer image =
+        host.allocate({RT_STAGE_F32, WIDTH, HEIGHT, 3}, &error);
+    if (image.data == nullptr) {
+        check(false, "thumbnail white balance fixture allocates");
+        return;
+    }
+
+    /* A ramp whose products straddle the highlight threshold. */
+    for (int plane = 0; plane < 3; ++plane) {
+        unsigned char* base = static_cast<unsigned char*>(image.data) +
+                              static_cast<std::size_t>(plane) * image.plane_pitch;
+        for (int y = 0; y < HEIGHT; ++y) {
+            float* row = reinterpret_cast<float*>(
+                base + static_cast<std::size_t>(y) * image.row_pitch);
+            for (int x = 0; x < WIDTH; ++x) {
+                row[x] = static_cast<float>(1000 + plane * 20000 + x * 1300 +
+                                            y * 700);
+            }
+        }
+    }
+
+    /* Keep a copy because the node works in place. */
+    std::vector<float> original(
+        static_cast<std::size_t>(WIDTH) * HEIGHT * 3);
+    for (int plane = 0; plane < 3; ++plane) {
+        const float* row = reinterpret_cast<const float*>(
+            static_cast<const unsigned char*>(image.data) +
+            static_cast<std::size_t>(plane) * image.plane_pitch);
+        for (int y = 0; y < HEIGHT; ++y) {
+            const float* src = reinterpret_cast<const float*>(
+                reinterpret_cast<const unsigned char*>(row) +
+                static_cast<std::size_t>(y) * image.row_pitch);
+            for (int x = 0; x < WIDTH; ++x) {
+                original[(static_cast<std::size_t>(plane) * HEIGHT + y) *
+                             WIDTH + x] = src[x];
+            }
+        }
+    }
+
+    StageRequest request;
+    request.name = "thumbnail.whitebalance";
+    request.args = {buffer_arg(image), double_arg(RMI), double_arg(GMI),
+                    double_arg(BMI), int_arg(HR ? 1 : 0), int_arg(WIDTH),
+                    int_arg(HEIGHT)};
+
+    StageEvent event = queue->submit(request, nullptr);
+    check(event.succeeded(), "the thumbnail white balance node completed");
+    check(queue->wait(event) == RT_STAGE_OK,
+          "the thumbnail white balance wait is OK");
+
+    int differing = 0;
+    for (int y = 0; y < HEIGHT; ++y) {
+        const float* planes[3] = {};
+        for (int plane = 0; plane < 3; ++plane) {
+            planes[plane] = reinterpret_cast<const float*>(
+                static_cast<const unsigned char*>(image.data) +
+                static_cast<std::size_t>(plane) * image.plane_pitch +
+                static_cast<std::size_t>(y) * image.row_pitch);
+        }
+        for (int x = 0; x < WIDTH; ++x) {
+            const float sample[3] = {
+                original[(static_cast<std::size_t>(0) * HEIGHT + y) * WIDTH + x],
+                original[(static_cast<std::size_t>(1) * HEIGHT + y) * WIDTH + x],
+                original[(static_cast<std::size_t>(2) * HEIGHT + y) * WIDTH + x]};
+            float red = sample[0] * static_cast<float>(RMI);
+            float green = sample[1] * static_cast<float>(GMI);
+            float blue = sample[2] * static_cast<float>(BMI);
+            float expected[3];
+            if (HR && red > MAX_VALUE && blue > MAX_VALUE) {
+                const float value = std::min(std::max((red + green + blue) / 3.0f,
+                                                      0.0f), MAX_VALUE);
+                expected[0] = expected[1] = expected[2] = value;
+            } else {
+                expected[0] = std::min(std::max(red, 0.0f), MAX_VALUE);
+                expected[1] = std::min(std::max(green, 0.0f), MAX_VALUE);
+                expected[2] = std::min(std::max(blue, 0.0f), MAX_VALUE);
+            }
+            for (int plane = 0; plane < 3; ++plane) {
+                if (planes[plane][x] != expected[plane]) {
+                    ++differing;
+                }
+            }
+        }
+    }
+
+    if (differing != 0) {
+        std::fprintf(stderr,
+                     "thumbnail white balance: %d samples differ\n", differing);
+    }
+    check(differing == 0, "thumbnail white balance matches the reference");
+}
+
 /* ------------------------------------------------------------ selection */
 
 void test_selection(bool available)
@@ -1115,6 +1232,7 @@ int main()
     test_device_events(available);
     test_transform_identity(available);
     test_lab_to_u8(available);
+    test_thumbnail_wb(available);
     test_selection(available);
     test_residency();
     test_node_parity(available);
