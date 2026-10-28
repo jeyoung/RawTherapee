@@ -295,7 +295,7 @@ starts from a partly written Lab buffer. The preview, crop and thumbnail paths
 keep their own copies of this block.
 
 The ABI is `[0]` the three-plane F32 Lab buffer, read and written in place,
-`[1]` `wip`, `[2]` `wp`, `[3]` `to_out` and `[4]` `from_out` (four 9-entry F32
+`[1]` `wip`, `[2]` `wp`, `[3]` `to_out` and `[4]` `from_out` (four 9x1 F32
 matrices), `[5]` the double gain `pow_F(2, wgamgain)`, `[6]` the double
 compression power `wgampower` and `[7]` the int `compress` flag, 1 when a
 gamut is selected and 0 for the gain-only case. The single Lab allocation is
@@ -326,7 +326,9 @@ below one 16-bit LSB. `#pragma OPENCL FP_CONTRACT OFF` keeps the multiply-add
 order.
 
 The launcher rejects a buffer that is not three-plane F32, a table that is not
-a 9-entry single-plane F32 matrix, a gain or power that is not positive and
+a 9x1 single-plane F32 matrix (nine flat entries, one row; a 3x3 table with the
+same entry count would be read across the device's padded row pitch), a gain
+or power that is not positive and
 finite, a gain that does not fit the kernel's float multiplier, and a compress
 flag that is not 0 or 1. A working gamut value outside the enum is refused by
 the host parameter builder rather than mapped to a guessed matrix. Source and
