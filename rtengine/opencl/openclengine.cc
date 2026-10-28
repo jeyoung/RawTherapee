@@ -23,6 +23,7 @@
 #include "rtengine/image8.h"
 #include "rtengine/imagefloat.h"
 #include "rtengine/labimage.h"
+#include "rtengine/stage/algorithms/lab_to_rgb_cl.h"
 #include "rtengine/stage/algorithms/transform_cl.h"
 #include "rtengine/transformmap.h"
 #include "boxblur.h"
@@ -407,57 +408,12 @@ __kernel void rt_transform(__global const float* srcR,
     return source;
 }
 
-const char* labToRgbKernelSource = R"(
-#pragma OPENCL FP_CONTRACT OFF
-
-inline float rt_f2xyz(const float f)
+const std::string& labToRgbKernelSource()
 {
-    return f > 0.20689655172413793f
-        ? f * f * f
-        : (116.0f * f - 16.0f) * (27.0f / 24389.0f);
-}
-
-inline float rt_gamma_lookup(__global const float* lut, const float value)
-{
-    const float clamped = clamp(value, 0.0f, 65535.0f);
-    const int index = (int)clamped;
-    const int upper = min(index + 1, 65535);
-    const float fraction = clamped - (float)index;
-    return lut[index] + (lut[upper] - lut[index]) * fraction;
-}
-
-inline unsigned char rt_to_u8(const float value)
-{
-    const unsigned int v = (unsigned int)clamp(value, 0.0f, 65535.0f);
-    return (unsigned char)(((v + 128u) - ((v + 128u) >> 8)) >> 8);
-}
-
-inline float3 rt_lab_to_linear(__global const float* labL,
-                               __global const float* labA,
-                               __global const float* labB,
-                               __global const float* matrix,
-                               const int index)
-{
-    const float L = labL[index];
-    const float a = labA[index];
-    const float b = labB[index];
-    const float LL = L / 327.68f;
-    const float fy = (0.008620689655172414f * L) / 327.68f
-        + 0.13793103448275862f;
-    const float fx = (0.002f * a) / 327.68f + fy;
-    const float fz = fy - (0.005f * b) / 327.68f;
-    const float xyzX = 65535.0f * rt_f2xyz(fx) * 0.9642f;
-    const float xyzZ = 65535.0f * rt_f2xyz(fz) * 0.8249f;
-    const float xyzY = LL > 8.0f
-        ? 65535.0f * fy * fy * fy
-        : 65535.0f * LL / 903.2962962962963f;
-
-    return (float3)(
-        matrix[0] * xyzX + matrix[1] * xyzY + matrix[2] * xyzZ,
-        matrix[3] * xyzX + matrix[4] * xyzY + matrix[5] * xyzZ,
-        matrix[6] * xyzX + matrix[7] * xyzY + matrix[8] * xyzZ);
-}
-
+    static const std::string source =
+        std::string("#pragma OPENCL FP_CONTRACT OFF\n") +
+        RT_LAB_TO_RGB_CL +
+        R"CLC(
 __kernel void rt_lab_to_srgb(__global const float* labL,
                              __global const float* labA,
                              __global const float* labB,
@@ -506,7 +462,9 @@ __kernel void rt_lab_to_srgb8(__global const float* labL,
     dst[out + 1] = rt_to_u8(rt_gamma_lookup(gammaLut, rgb.y));
     dst[out + 2] = rt_to_u8(rt_gamma_lookup(gammaLut, rgb.z));
 }
-)";
+)CLC";
+    return source;
+}
 
 const char* rgbProcKernelSource = R"(
 #pragma OPENCL FP_CONTRACT OFF
@@ -2440,7 +2398,7 @@ bool labToRgb(const LabImage* src, int cx, int cy, int cw, int ch,
     }
 
     std::string error;
-    cl_program program = programFor(state, labToRgbKernelSource,
+    cl_program program = programFor(state, labToRgbKernelSource(),
                                     standardOption(info), error);
 
     if (program == nullptr) {

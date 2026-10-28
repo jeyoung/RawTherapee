@@ -48,6 +48,7 @@
 
 #include "rt_math.h"
 #include "sleef.h"
+#include "stage/algorithms/lab_to_rgb_cl.h"
 #include "stage/algorithms/transform_cl.h"
 #include "transformmap.h"
 
@@ -694,11 +695,88 @@ __kernel void rt_transform(__global const float* src,
     return source;
 }
 
+/*
+ * Lab to RGB. The matrix and the 16-bit gamma LUT come from the caller, which
+ * builds them from the same ICC profile the classic backend uses; the
+ * arithmetic is shared with the classic kernel. The float entry serves
+ * output.convert, the packed 8-bit entry serves monitor.output,
+ * viewport.output and thumbnail.output.
+ */
+const std::string& lab_to_float_source()
+{
+    static const std::string source =
+        std::string("#pragma OPENCL FP_CONTRACT OFF\n") +
+        RT_LAB_TO_RGB_CL +
+        R"CLC(
+__kernel void rt_lab_to_float(__global const float* src,
+                              __global float* dst,
+                              __global const float* lut,
+                              __global const float* matrix,
+                              const int width, const int height,
+                              const int srcPitch, const int srcPlanePitch,
+                              const int dstPitch, const int dstPlanePitch)
+{
+    const int gid = get_global_id(0);
+    const int y = gid / width;
+    if (y >= height) {
+        return;
+    }
+    const int x = gid - y * width;
+    const int offset = y * srcPitch + x;
+    const float3 rgb = rt_lab_to_linear(src, src + srcPlanePitch,
+                                        src + 2 * srcPlanePitch, matrix,
+                                        offset);
+    const int out = y * dstPitch + x;
+    dst[out] = rt_gamma_lookup(lut, rgb.x);
+    dst[out + dstPlanePitch] = rt_gamma_lookup(lut, rgb.y);
+    dst[out + 2 * dstPlanePitch] = rt_gamma_lookup(lut, rgb.z);
+}
+)CLC";
+    return source;
+}
+
+const std::string& lab_to_u8_source()
+{
+    static const std::string source =
+        std::string("#pragma OPENCL FP_CONTRACT OFF\n") +
+        RT_LAB_TO_RGB_CL +
+        R"CLC(
+__kernel void rt_lab_to_u8(__global const float* src,
+                           __global unsigned char* dst,
+                           __global const float* lut,
+                           __global const float* matrix,
+                           const int width, const int height,
+                           const int srcPitch, const int srcPlanePitch,
+                           const int dstRowBytes)
+{
+    const int gid = get_global_id(0);
+    const int y = gid / width;
+    if (y >= height) {
+        return;
+    }
+    const int x = gid - y * width;
+    const int offset = y * srcPitch + x;
+    const float3 rgb = rt_lab_to_linear(src, src + srcPlanePitch,
+                                        src + 2 * srcPlanePitch, matrix,
+                                        offset);
+    const int out = y * dstRowBytes + x * 3;
+    dst[out] = rt_to_u8(rt_gamma_lookup(lut, rgb.x));
+    dst[out + 1] = rt_to_u8(rt_gamma_lookup(lut, rgb.y));
+    dst[out + 2] = rt_to_u8(rt_gamma_lookup(lut, rgb.z));
+}
+)CLC";
+    return source;
+}
+
 const std::vector<KernelDef>& kernels()
 {
     static const std::vector<KernelDef> table = {
         {"lanczos3", LANCZOS_SOURCE, "lanczos3"},
-        {"transform", transform_source().c_str(), "rt_transform"}
+        {"transform", transform_source().c_str(), "rt_transform"},
+        {"output.convert", lab_to_float_source().c_str(), "rt_lab_to_float"},
+        {"monitor.output", lab_to_u8_source().c_str(), "rt_lab_to_u8"},
+        {"viewport.output", lab_to_u8_source().c_str(), "rt_lab_to_u8"},
+        {"thumbnail.output", lab_to_u8_source().c_str(), "rt_lab_to_u8"}
     };
     return table;
 }
@@ -1674,6 +1752,179 @@ std::shared_ptr<OpenCLSubmission> launch_transform(
                                               residency, dst_device, dst);
 }
 
+
+/*
+ * Lab to RGB for one node. Argument order:
+ *   [0] source Lab buffer, [1] destination buffer,
+ *   [2] gamma LUT buffer (65536 F32 samples),
+ *   [3] matrix buffer (9 F32 entries).
+ *
+ * output.convert takes a three-plane F32 destination; the monitor, viewport
+ * and thumbnail nodes take a packed U8 destination. The source may be a
+ * sub-rectangle view of a larger Lab image: its pitches describe the parent,
+ * so the kernel addresses it exactly as the caller laid it out.
+ */
+std::shared_ptr<OpenCLSubmission> launch_lab_to_rgb(
+    const std::shared_ptr<OpenCLEnv>& env,
+    const std::shared_ptr<OpenCLResidency>& residency,
+    const std::vector<RtStageArg>& args, const char* node, bool eight_bit,
+    std::string& error)
+{
+    constexpr std::size_t ARG_COUNT = 4;
+    constexpr int GAMMA_LUT_ENTRIES = 65536;
+    constexpr int MATRIX_ENTRIES = 9;
+
+    if (args.size() != ARG_COUNT) {
+        error = "Lab to RGB expects four buffers";
+        return nullptr;
+    }
+    for (std::size_t i = 0; i < ARG_COUNT; ++i) {
+        if (args[i].kind != RT_STAGE_ARG_BUFFER) {
+            error = "Lab to RGB expects four buffers";
+            return nullptr;
+        }
+    }
+
+    const RtStageBuffer& src = args[0].u.buffer;
+    const RtStageBuffer& dst = args[1].u.buffer;
+    const RtStageBuffer& lut = args[2].u.buffer;
+    const RtStageBuffer& matrix = args[3].u.buffer;
+
+    if (!valid(src) || !valid(dst) || !valid(lut) || !valid(matrix) ||
+        src.format != RT_STAGE_F32 || src.planes != 3 ||
+        lut.format != RT_STAGE_F32 || lut.planes != 1 ||
+        matrix.format != RT_STAGE_F32 || matrix.planes != 1) {
+        error = "Lab to RGB needs a three-plane F32 source and F32 tables";
+        return nullptr;
+    }
+    if (lut.width * lut.height != GAMMA_LUT_ENTRIES ||
+        matrix.width * matrix.height != MATRIX_ENTRIES) {
+        error = "Lab to RGB table sizes are wrong";
+        return nullptr;
+    }
+    if (eight_bit) {
+        if (dst.format != RT_STAGE_U8 || dst.planes != 1) {
+            error = "the 8-bit output node needs a packed U8 destination";
+            return nullptr;
+        }
+    } else if (dst.format != RT_STAGE_F32 || dst.planes != 3) {
+        error = "output.convert needs a three-plane F32 destination";
+        return nullptr;
+    }
+    if (src.data == dst.data) {
+        error = "Lab to RGB needs distinct source and destination buffers";
+        return nullptr;
+    }
+    if (dst.width != src.width || dst.height != src.height) {
+        error = "Lab to RGB source and destination sizes differ";
+        return nullptr;
+    }
+
+    const KernelDef* def = find_kernel(node);
+    assert(def != nullptr);
+
+    const StageBufferShape src_shape{RT_STAGE_F32, src.width, src.height, 3};
+    const StageBufferShape dst_shape = eight_bit
+        ? StageBufferShape{RT_STAGE_U8, dst.width, dst.height, 1}
+        : StageBufferShape{RT_STAGE_F32, dst.width, dst.height, 3};
+    const StageBufferShape lut_shape{RT_STAGE_F32, lut.width, lut.height, 1};
+    const StageBufferShape matrix_shape{RT_STAGE_F32, matrix.width,
+                                        matrix.height, 1};
+
+    StageDeviceBufferPtr src_device =
+        residency->acquire(src.data, src_shape, &error);
+    StageDeviceBufferPtr dst_device =
+        residency->acquire(dst.data, dst_shape, &error);
+    StageDeviceBufferPtr lut_device =
+        residency->acquire(lut.data, lut_shape, &error);
+    StageDeviceBufferPtr matrix_device =
+        residency->acquire(matrix.data, matrix_shape, &error);
+    if (!src_device || !dst_device || !lut_device || !matrix_device) {
+        return nullptr;
+    }
+    if (residency->upload(src_device, src) != RT_STAGE_OK ||
+        residency->upload(lut_device, lut) != RT_STAGE_OK ||
+        residency->upload(matrix_device, matrix) != RT_STAGE_OK) {
+        error = "device upload failed";
+        return nullptr;
+    }
+
+    auto device_src = std::dynamic_pointer_cast<OpenCLDeviceBuffer>(src_device);
+    auto device_dst = std::dynamic_pointer_cast<OpenCLDeviceBuffer>(dst_device);
+    auto device_lut = std::dynamic_pointer_cast<OpenCLDeviceBuffer>(lut_device);
+    auto device_matrix =
+        std::dynamic_pointer_cast<OpenCLDeviceBuffer>(matrix_device);
+    if (!device_src || !device_dst || !device_lut || !device_matrix) {
+        error = "device buffer type mismatch";
+        return nullptr;
+    }
+
+    cl_kernel kernel = compiled_kernel(env, def, error);
+    if (kernel == nullptr) {
+        return nullptr;
+    }
+
+    const cl_int width = src.width;
+    const cl_int height = src.height;
+    const cl_int src_pitch =
+        static_cast<cl_int>(device_src->row_pitch() / sizeof(float));
+    const cl_int src_plane_pitch =
+        static_cast<cl_int>(device_src->plane_pitch() / sizeof(float));
+    const cl_int dst_pitch =
+        static_cast<cl_int>(device_dst->row_pitch() / sizeof(float));
+    const cl_int dst_plane_pitch =
+        static_cast<cl_int>(device_dst->plane_pitch() / sizeof(float));
+    const cl_int dst_row_bytes = static_cast<cl_int>(device_dst->row_pitch());
+
+    const auto set_arg = [&](cl_uint index, std::size_t bytes,
+                             const void* value) {
+        return env->api->SetKernelArg(kernel, index, bytes, value) == CL_SUCCESS;
+    };
+
+    std::lock_guard<std::recursive_mutex> lock(env->queue_mutex);
+
+    cl_mem src_memory = device_src->memory();
+    cl_mem dst_memory = device_dst->memory();
+    cl_mem lut_memory = device_lut->memory();
+    cl_mem matrix_memory = device_matrix->memory();
+
+    bool args_ok =
+        set_arg(0, sizeof(cl_mem), &src_memory) &&
+        set_arg(1, sizeof(cl_mem), &dst_memory) &&
+        set_arg(2, sizeof(cl_mem), &lut_memory) &&
+        set_arg(3, sizeof(cl_mem), &matrix_memory) &&
+        set_arg(4, sizeof(cl_int), &width) &&
+        set_arg(5, sizeof(cl_int), &height) &&
+        set_arg(6, sizeof(cl_int), &src_pitch) &&
+        set_arg(7, sizeof(cl_int), &src_plane_pitch);
+    if (args_ok) {
+        if (eight_bit) {
+            args_ok = set_arg(8, sizeof(cl_int), &dst_row_bytes);
+        } else {
+            args_ok = set_arg(8, sizeof(cl_int), &dst_pitch) &&
+                      set_arg(9, sizeof(cl_int), &dst_plane_pitch);
+        }
+    }
+    if (!args_ok) {
+        error = "clSetKernelArg failed";
+        return nullptr;
+    }
+
+    const std::size_t global =
+        static_cast<std::size_t>(src.width) * static_cast<std::size_t>(src.height);
+    cl_event done = nullptr;
+    const cl_int enqueue_error = env->api->EnqueueNDRangeKernel(
+        env->queue, kernel, 1, nullptr, &global, nullptr, 0, nullptr, &done);
+    if (enqueue_error != CL_SUCCESS || done == nullptr) {
+        error = "clEnqueueNDRangeKernel failed with error " +
+                std::to_string(enqueue_error);
+        return nullptr;
+    }
+
+    return std::make_shared<OpenCLSubmission>(env, done, std::vector<cl_mem>{},
+                                              residency, dst_device, dst);
+}
+
 class OpenCLStageQueue final : public StageQueue
 {
 public:
@@ -1727,6 +1978,14 @@ public:
             submission = launch_lanczos(env_, residency_, request.args, error);
         } else if (request.name == "transform") {
             submission = launch_transform(env_, residency_, request.args, error);
+        } else if (request.name == "output.convert") {
+            submission = launch_lab_to_rgb(env_, residency_, request.args,
+                                           request.name.c_str(), false, error);
+        } else if (request.name == "monitor.output" ||
+                   request.name == "viewport.output" ||
+                   request.name == "thumbnail.output") {
+            submission = launch_lab_to_rgb(env_, residency_, request.args,
+                                           request.name.c_str(), true, error);
         } else {
             error = "no OpenCL launcher for stage '" + request.name + "'";
         }

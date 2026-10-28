@@ -2871,7 +2871,7 @@ void Crop::stageViewportOutput(CropStageContext& ctx)
 
 
     // Computing the preview image, i.e. converting from lab->Monitor color space (soft-proofing disabled) or lab->Output profile->Monitor color space (soft-proofing enabled)
-    parent->ipf.lab2monitorRgb(labnCrop, cropImg);
+    parent->ipf.lab2monitorRgb(labnCrop, cropImg, "viewport.output");
 
     // Opt-in parity hook: the dump carries the whole crop buffer including
     // the processing border, plus the clamped visible rectangle in its

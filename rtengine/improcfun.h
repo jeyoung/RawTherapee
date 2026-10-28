@@ -282,7 +282,8 @@ enum class BlurType {
 
     void sharpeningcam(CieImage* ncie, float** buffer, bool showMask = false);
     void transform(Imagefloat* original, Imagefloat* transformed, int cx, int cy, int sx, int sy, int oW, int oH, int fW, int fH, const FramesMetaData *metadata, int rawRotationDeg, bool fullImage, bool useOriginalBuffer = false);
-    void lab2monitorRgb(LabImage* lab, Image8* image);
+    void lab2monitorRgb(LabImage* lab, Image8* image,
+                        const char* stageNode = "monitor.output");
 
     double resizeScale(const procparams::ProcParams* params, int fw, int fh, int &imw, int &imh);
     void resize(Imagefloat* src, Imagefloat* dst, float dScale);

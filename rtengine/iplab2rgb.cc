@@ -32,6 +32,8 @@
 #include "labimage.h"
 #include "opencl/openclengine.h"
 #include "procparams.h"
+#include "stage/stage_buffer.h"
+#include "stage/stage_runtime.h"
 #include "rtengine.h"
 #include "settings.h"
 #include "utils.h"
@@ -224,6 +226,80 @@ inline void copyAndClamp(const LabImage *src, unsigned char *dst, const double r
     }
 }
 
+
+/*
+ * Stage-device Lab to RGB. The node takes a sub-rectangle view of the Lab
+ * image plus the same matrix and 16-bit LUT the classic backend uses, so the
+ * two paths differ only in who converts.
+ */
+RtStageBuffer table_view(const float* data, int entries)
+{
+    RtStageBuffer buffer{};
+    buffer.size = sizeof(RtStageBuffer);
+    buffer.data = const_cast<float*>(data);
+    buffer.width = entries;
+    buffer.height = 1;
+    buffer.row_pitch = static_cast<std::size_t>(entries) * sizeof(float);
+    buffer.plane_pitch = buffer.row_pitch;
+    buffer.planes = 1;
+    buffer.format = RT_STAGE_F32;
+    buffer.flags = RT_STAGE_BUFFER_READ;
+    return buffer;
+}
+
+/* A view of the ROI inside the parent image: the pitches stay the parent's. */
+RtStageBuffer lab_roi_view(const LabImage& lab, int cx, int cy, int cw, int ch)
+{
+    RtStageBuffer buffer = stage::view(lab);
+    buffer.data = static_cast<unsigned char*>(buffer.data) +
+                  static_cast<std::size_t>(cy) * buffer.row_pitch +
+                  static_cast<std::size_t>(cx) * sizeof(float);
+    buffer.width = cw;
+    buffer.height = ch;
+    return buffer;
+}
+
+bool run_lab_to_float_stage(const char* node, const LabImage& lab, int cx,
+                            int cy, int cw, int ch, const float matrix[9],
+                            const std::vector<float>& gamma, Imagefloat& dst)
+{
+    constexpr int MATRIX_ENTRIES = 9;
+
+    RtStageArg args[4]{};
+    args[0].kind = RT_STAGE_ARG_BUFFER;
+    args[0].u.buffer = lab_roi_view(lab, cx, cy, cw, ch);
+    args[1].kind = RT_STAGE_ARG_BUFFER;
+    args[1].u.buffer = stage::view(dst);
+    args[2].kind = RT_STAGE_ARG_BUFFER;
+    args[2].u.buffer = table_view(gamma.data(), static_cast<int>(gamma.size()));
+    args[3].kind = RT_STAGE_ARG_BUFFER;
+    args[3].u.buffer = table_view(matrix, MATRIX_ENTRIES);
+
+    RtStageProfiling profiling{};
+    return stage::run(node, {args[0], args[1], args[2], args[3]}, &profiling) ==
+           RT_STAGE_OK;
+}
+
+bool run_lab_to_rgb8_stage(const char* node, const LabImage& lab, Image8& dst,
+                           const float matrix[9],
+                           const std::vector<float>& gamma)
+{
+    constexpr int MATRIX_ENTRIES = 9;
+
+    RtStageArg args[4]{};
+    args[0].kind = RT_STAGE_ARG_BUFFER;
+    args[0].u.buffer = lab_roi_view(lab, 0, 0, lab.W, lab.H);
+    args[1].kind = RT_STAGE_ARG_BUFFER;
+    args[1].u.buffer = stage::view(dst);
+    args[2].kind = RT_STAGE_ARG_BUFFER;
+    args[2].u.buffer = table_view(gamma.data(), static_cast<int>(gamma.size()));
+    args[3].kind = RT_STAGE_ARG_BUFFER;
+    args[3].u.buffer = table_view(matrix, MATRIX_ENTRIES);
+
+    RtStageProfiling profiling{};
+    return stage::run(node, {args[0], args[1], args[2], args[3]}, &profiling) ==
+           RT_STAGE_OK;
+}
 } // namespace
 
 
@@ -245,12 +321,19 @@ vfloat gammalog(vfloat x, vfloat p, vfloat s, vfloat g3, vfloat g4)
 //
 // If monitorTransform, divide by 327.68 then apply monitorTransform (which can integrate soft-proofing)
 // otherwise divide by 327.68, convert to xyz and apply the sRGB transform, before converting with gamma2curve
-void ImProcFunctions::lab2monitorRgb(LabImage* lab, Image8* image)
+void ImProcFunctions::lab2monitorRgb(LabImage* lab, Image8* image,
+                                     const char* stageNode)
 {
     if (monitorGpuReady && !gamutWarning && openCLAllowed
-            && opencl::enabled() && opencl::stageAllowed()
-            && opencl::labToRgb8(lab, image, monitorMatrix, monitorGamma)) {
-        return;
+            && opencl::enabled() && opencl::stageAllowed()) {
+        if (stage::node_device(stageNode) == stage::StageNodeDevice::OpenCL) {
+            if (run_lab_to_rgb8_stage(stageNode, *lab, *image, monitorMatrix,
+                                      monitorGamma)) {
+                return;
+            }
+        } else if (opencl::labToRgb8(lab, image, monitorMatrix, monitorGamma)) {
+            return;
+        }
     }
 
     if (monitorTransform) {
@@ -468,11 +551,18 @@ Imagefloat* ImProcFunctions::lab2rgbOut(LabImage* lab, int cx, int cy, int cw, i
                 && blackPoint.Y <= zeroBlackPointTolerance;
         }
 
-        if (safeForGpu
-                && opencl::labToSrgbOut(
-                    lab, image, cx, cy, cw, ch,
-                    outputGpuMatrix, outputGpuGamma)) {
-            return image;
+        if (safeForGpu) {
+            if (stage::node_device("output.convert") ==
+                stage::StageNodeDevice::OpenCL) {
+                if (run_lab_to_float_stage("output.convert", *lab, cx, cy, cw,
+                                           ch, outputGpuMatrix, outputGpuGamma,
+                                           *image)) {
+                    return image;
+                }
+            } else if (opencl::labToSrgbOut(lab, image, cx, cy, cw, ch,
+                                            outputGpuMatrix, outputGpuGamma)) {
+                return image;
+            }
         }
     }
 

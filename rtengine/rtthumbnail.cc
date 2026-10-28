@@ -2749,7 +2749,7 @@ Image8* Thumbnail::stageOutput(StageState& state)
     Image8* readyImg = nullptr;
     if (forMonitor) {
         readyImg = new Image8 (fw, fh);
-        ipf.lab2monitorRgb (labView, readyImg);
+        ipf.lab2monitorRgb (labView, readyImg, "thumbnail.output");
     } else {
         readyImg = ipf.lab2rgb(labView, 0, 0, fw, fh, params.icm, false);
     }
