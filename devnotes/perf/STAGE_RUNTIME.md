@@ -439,8 +439,15 @@ float normalization, so the device uses the same values as the CPU. The
 Gaussian support windows follow `GAUSS_SKIP` (0.25), 0.6, 0.84 and 1.15:
 below 0.25 the RLD loop is the CPU's identity copy, and at or above 1.15 the
 node is a host residual. The mask, the blur, the RLD estimate and the RLD
-intermediate are device scratch; only the L plane is uploaded and read back,
-and all iterations run in one submission.
+intermediate are device scratch; only the L plane is uploaded and read back.
+Each RLD iteration is two blocking kernel submissions (divide, then multiply)
+on the in-order device queue. The node is one stage submission with no
+intermediate host transfer, not one enqueue.
+
+`#pragma OPENCL FP_CONTRACT OFF` is at the top of the whole kernel source, so
+it applies to the mask, apply and USM kernels as well as the RLD kernels. It
+keeps the CPU multiply-add order; the USM figures below were re-measured with
+the pragma in place.
 
 Evidence:
 
