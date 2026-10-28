@@ -2,7 +2,7 @@
 
 Evidence for the install, export, GUI and device-parity runs of the integrated
 graph workstream. The export matrix and the device gate were measured at
-commit `b2e028e66`. The full GUI table was measured at `b4943e8f9`; the later
+commit `906926442`. The full GUI table was measured at `b4943e8f9`; the later
 engine changes add two opt-in device nodes (`resize`, `transform`), which are
 inactive unless `RT_STAGE_OPENCL` selects a node, and the classic paths were
 confirmed byte-identical to the pre-change package. A startup smoke at the tip
@@ -11,11 +11,11 @@ is recorded below.
 ## Artefact
 
 ```
-rawtherapee-graph-5.13-352-gb2e028e66_5.13+git13373.b2e028e66-1_amd64.deb
-sha256 259af7e5dbb4d4fbff403a0f65d3378002616486e243b3a09a5f29d1c3796ce6
+rawtherapee-graph-5.13-358-g906926442_5.13+git13379.906926442-1_amd64.deb
+sha256 21eded5fab02835966d281f1188bcbb8f3476a6527dd86a8a4b1fe7dc7df73a1
 ```
 
-Built in the Debian 12 container from clean `b2e028e66`; the commit after it is
+Built in the Debian 12 container from clean `906926442`; the commit after it is
 documentation only. Earlier packages in
 `build/portable` are retained for comparison and are not part of this record.
 
