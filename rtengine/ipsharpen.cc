@@ -32,6 +32,9 @@
 #include "rtengine.h"
 #include "color.h"
 #include "boxblur.h"
+#include "sharpen_core.h"
+#include "stage/algorithms/sharpen_cl.h"
+#include "stage/stage_runtime.h"
 
 //#define BENCHMARK
 #include "StopWatch.h"
@@ -167,6 +170,12 @@ namespace rtengine
 {
 
 void ImProcFunctions::deconvsharpening (float** luminance, float** tmp, const float * const * blend, int W, int H, const procparams::SharpeningParams &sharpenParam, double Scale)
+{
+    deconv_sharpening_luminance(luminance, tmp, blend, W, H, sharpenParam,
+                                Scale);
+}
+
+void deconv_sharpening_luminance (float** luminance, float** tmp, const float * const * blend, int W, int H, const procparams::SharpeningParams &sharpenParam, double Scale)
 {
     if (sharpenParam.deconvamount == 0 && sharpenParam.blurradius < 0.25) {
         return;
@@ -923,12 +932,49 @@ void ImProcFunctions::sharpening (LabImage* lab, const procparams::SharpeningPar
         return;
     }
 
-    int W = lab->W, H = lab->H;
+    const int W = lab->W;
+    const int H = lab->H;
+
+    /*
+     * The node carries the whole parameter set, including the method, so a
+     * residual request still runs through the host builtin and is recorded as
+     * a host execution rather than being silently mixed with a device pass.
+     */
+    stage::SharpenNodeParams nodeParams;
+    std::string error;
+    if (stage::sharpen_node_params(sharpenParam, scale, showMask, nodeParams, error)) {
+        stage::SharpenNodeArgs node;
+        stage::sharpen_node_args(lab->L[0], W, H, nodeParams, node);
+        if (stage::run("output.sharpen",
+                       std::vector<RtStageArg>(node.args,
+                                               node.args + stage::SHARPEN_NODE_ARGS)) ==
+            RT_STAGE_OK) {
+            return;
+        }
+    }
+
+    sharpen_luminance(lab->L[0], W, H, sharpenParam, scale, multiThread,
+                      showMask);
+}
+
+void sharpen_luminance (float* L, int W, int H, const procparams::SharpeningParams &sharpenParam, double scale, bool multiThread, bool showMask)
+{
+    /*
+     * Every helper below takes a row-pointer table. LabImage::L[0] is one
+     * contiguous plane, so this table is a view and not a copy: the CPU
+     * result is the one the frame-based implementation produced.
+     */
+    std::vector<float*> luminance(static_cast<std::size_t>(H));
+    std::vector<const float*> constLuminance(static_cast<std::size_t>(H));
+    for (int i = 0; i < H; ++i) {
+        luminance[i] = L + static_cast<std::size_t>(i) * W;
+        constLuminance[i] = luminance[i];
+    }
 
     // calculate contrast based blend factors to reduce sharpening in regions with low contrast
     JaggedArray<float> blend(W, H);
     float contrast = sharpenParam.contrast / 100.0;
-    buildBlendMask(lab->L, blend, W, H, contrast);
+    buildBlendMask(constLuminance.data(), blend, W, H, contrast);
 
     if(showMask) {
 #ifdef _OPENMP
@@ -937,7 +983,7 @@ void ImProcFunctions::sharpening (LabImage* lab, const procparams::SharpeningPar
 
         for (int i = 0; i < H; ++i) {
             for (int j = 0; j < W; ++j) {
-                lab->L[i][j] = blend[i][j] * 32768.f;
+                luminance[i][j] = blend[i][j] * 32768.f;
             }
         }
         return;
@@ -946,7 +992,7 @@ void ImProcFunctions::sharpening (LabImage* lab, const procparams::SharpeningPar
     JaggedArray<float> b2(W, H);
 
     if (sharpenParam.method == "rld") {
-        deconvsharpening (lab->L, b2, blend, lab->W, lab->H, sharpenParam, scale);
+        deconv_sharpening_luminance (luminance.data(), b2, blend, W, H, sharpenParam, scale);
         return;
     }
 BENCHFUN
@@ -969,13 +1015,13 @@ BENCHFUN
         #pragma omp parallel
 #endif
         {
-            gaussianBlur(lab->L, blur, W, H, sharpenParam.blurradius);
+            gaussianBlur(luminance.data(), blur, W, H, sharpenParam.blurradius);
 #ifdef _OPENMP
             #pragma omp for
 #endif
             for (int i = 0; i < H; ++i) {
                 for (int j = 0; j < W; ++j) {
-                    blur[i][j] = intp(blend[i][j], lab->L[i][j], std::max(blur[i][j], 0.0f));
+                    blur[i][j] = intp(blend[i][j], luminance[i][j], std::max(blur[i][j], 0.0f));
                 }
             }
         }
@@ -988,13 +1034,13 @@ BENCHFUN
     {
 
         if (!sharpenParam.edgesonly) {
-            gaussianBlur (lab->L, b2, W, H, sharpenParam.radius / scale);
+            gaussianBlur (luminance.data(), b2, W, H, sharpenParam.radius / scale);
         } else {
-            bilateral<float, float> (lab->L, (float**)b3, b2, W, H, sharpenParam.edges_radius / scale, sharpenParam.edges_tolerance, multiThread);
+            bilateral<float, float> (luminance.data(), (float**)b3, b2, W, H, sharpenParam.edges_radius / scale, sharpenParam.edges_tolerance, multiThread);
             gaussianBlur (b3, b2, W, H, sharpenParam.radius / scale);
         }
     }
-    float** base = lab->L;
+    float** base = luminance.data();
 
     if (sharpenParam.edgesonly) {
         base = b3;
@@ -1013,11 +1059,11 @@ BENCHFUN
                                   min(fabsf(diff), upperBound),                   // X axis value = absolute value of the difference, truncated to the max value of this field
                                   sharpenParam.amount * diff * 0.01f        // Y axis max value
                               );
-                lab->L[i][j] = intp(blend[i][j], lab->L[i][j] + delta, lab->L[i][j]);
+                luminance[i][j] = intp(blend[i][j], luminance[i][j] + delta, luminance[i][j]);
             }
     } else {
         if (!sharpenParam.edgesonly) {
-            // make a deep copy of lab->L
+            // make a deep copy of the plane
             JaggedArray<float> labCopy(W, H);
 
 #ifdef _OPENMP
@@ -1026,12 +1072,12 @@ BENCHFUN
 
             for( int i = 0; i < H; i++ )
                 for( int j = 0; j < W; j++ ) {
-                    labCopy[i][j] = lab->L[i][j];
+                    labCopy[i][j] = luminance[i][j];
                 }
 
-            sharpenHaloCtrl (lab->L, b2, labCopy, blend, W, H, sharpenParam);
+            sharpenHaloCtrl (luminance.data(), b2, labCopy, blend, W, H, sharpenParam);
         } else {
-            sharpenHaloCtrl (lab->L, b2, base, blend, W, H, sharpenParam);
+            sharpenHaloCtrl (luminance.data(), b2, base, blend, W, H, sharpenParam);
         }
 
     }
@@ -1050,7 +1096,7 @@ BENCHFUN
 #endif
         for (int i = 0; i < H; ++i) {
             for (int j = 0; j < W; ++j) {
-                lab->L[i][j] = intp(blend[i][j], lab->L[i][j], max(blur[i][j], 0.0f));
+                luminance[i][j] = intp(blend[i][j], luminance[i][j], max(blur[i][j], 0.0f));
             }
         }
     }

@@ -52,6 +52,7 @@
 #include "stage/algorithms/gamut_cl.h"
 #include "stage/algorithms/lab_to_rgb_cl.h"
 #include "stage/algorithms/rgb_proc_cl.h"
+#include "stage/algorithms/sharpen_cl.h"
 #include "stage/algorithms/transform_cl.h"
 #include "transformmap.h"
 
@@ -1170,6 +1171,7 @@ const std::vector<KernelDef>& kernels()
         {"thumbnail.output", lab_to_u8_source().c_str(), "rt_lab_to_u8"},
         {"rgb.proc", rgb_proc_source().c_str(), "rt_rgb_proc"},
         {"gamut", RT_GAMUT_CL, "rt_gamut"},
+        {"output.sharpen", RT_SHARPEN_CL, "rt_sharpen_mask"},
         {"framing", framing_source().c_str(), "rt_framing"},
         {"thumbnail.whitebalance", thumbnail_wb_source().c_str(), "rt_thumbnail_wb"},
         {"thumbnail.transform", thumbnail_permute_source().c_str(), "rt_thumbnail_permute"},
@@ -1766,11 +1768,13 @@ private:
  * program cache is per environment, so a rebuild of the same entry point does
  * not pay the build again.
  */
-cl_kernel compiled_kernel(const std::shared_ptr<OpenCLEnv>& env,
-                          const KernelDef* def, std::string& error)
+cl_kernel compiled_kernel_entry(const std::shared_ptr<OpenCLEnv>& env,
+                                const KernelDef* def, const char* entry,
+                                std::string& error)
 {
     std::lock_guard<std::mutex> lock(env->program_mutex);
-    const auto found = env->kernels.find(def->name);
+    const std::string key = std::string(def->name) + ':' + entry;
+    const auto found = env->kernels.find(key);
     if (found != env->kernels.end()) {
         return found->second;
     }
@@ -1801,15 +1805,21 @@ cl_kernel compiled_kernel(const std::shared_ptr<OpenCLEnv>& env,
         return nullptr;
     }
 
-    cl_kernel kernel = env->api->CreateKernel(program, def->entry, &build_error);
+    cl_kernel kernel = env->api->CreateKernel(program, entry, &build_error);
     env->api->ReleaseProgram(program);
     if (kernel == nullptr) {
         error = "clCreateKernel failed";
         return nullptr;
     }
 
-    env->kernels[def->name] = kernel;
+    env->kernels[key] = kernel;
     return kernel;
+}
+
+cl_kernel compiled_kernel(const std::shared_ptr<OpenCLEnv>& env,
+                          const KernelDef* def, std::string& error)
+{
+    return compiled_kernel_entry(env, def, def->entry, error);
 }
 
 std::shared_ptr<OpenCLSubmission> launch_lanczos(
@@ -3629,6 +3639,299 @@ RtStageStatus run_thumbnail_scale(
     return RT_STAGE_OK;
 }
 
+/*
+ * Output sharpening, USM only. Arguments are documented in
+ * stage/algorithms/sharpen_cl.h. The L plane is the only transfer: the mask,
+ * the blur and the IIR intermediate live in device scratch.
+ */
+RtStageStatus run_sharpen(const std::shared_ptr<OpenCLEnv>& env,
+                          const std::shared_ptr<OpenCLResidency>& residency,
+                          const std::vector<RtStageArg>& args,
+                          std::string& error)
+{
+    SharpenNodeParams p;
+    RtStageBuffer image{};
+    if (!sharpen_node_decode(args.data(),
+                             static_cast<std::uint32_t>(args.size()), p, image,
+                             error)) {
+        return RT_STAGE_INVALID;
+    }
+    if (image.width < 8 || image.height < 8) {
+        error = "output.sharpen needs at least 8x8 pixels";
+        return RT_STAGE_INVALID;
+    }
+    if (!sharpen_device_supported(p, error)) {
+        return RT_STAGE_FALLBACK;
+    }
+
+    const int width = image.width;
+    const int height = image.height;
+    const double sigma = p.radius / p.scale;
+
+    const KernelDef* def = find_kernel("output.sharpen");
+    assert(def != nullptr);
+    cl_kernel mask_kernel =
+        compiled_kernel_entry(env, def, "rt_sharpen_mask", error);
+    cl_kernel iir_kernel =
+        compiled_kernel_entry(env, def, "rt_sharpen_iir_line", error);
+    cl_kernel fir_kernel =
+        compiled_kernel_entry(env, def, "rt_sharpen_fir3", error);
+    cl_kernel apply_kernel =
+        compiled_kernel_entry(env, def, "rt_sharpen_apply", error);
+    if (mask_kernel == nullptr || iir_kernel == nullptr ||
+        fir_kernel == nullptr || apply_kernel == nullptr) {
+        return RT_STAGE_FALLBACK;
+    }
+
+    StageDeviceBufferPtr image_device =
+        residency->acquire(image.data, {RT_STAGE_F32, width, height, 1}, &error);
+    if (!image_device) {
+        return RT_STAGE_FALLBACK;
+    }
+    if (residency->upload(image_device, image) != RT_STAGE_OK) {
+        error = "output.sharpen upload failed";
+        return RT_STAGE_FALLBACK;
+    }
+
+    auto device = std::dynamic_pointer_cast<OpenCLDeviceBuffer>(image_device);
+    if (!device) {
+        error = "output.sharpen device buffer type mismatch";
+        return RT_STAGE_FALLBACK;
+    }
+    if (device->row_pitch() % sizeof(float) != 0) {
+        error = "output.sharpen row pitch is not sample aligned";
+        return RT_STAGE_FALLBACK;
+    }
+    const int pitch = static_cast<int>(device->row_pitch() / sizeof(float));
+    if (pitch < width) {
+        error = "output.sharpen row pitch does not cover the width";
+        return RT_STAGE_FALLBACK;
+    }
+    cl_mem image_memory = device->memory();
+
+    std::vector<cl_mem> scratch;
+    const std::size_t scratch_bytes = device->row_pitch() *
+                                      static_cast<std::size_t>(height);
+    const auto release_scratch = [&]() {
+        for (cl_mem memory : scratch) {
+            env->api->ReleaseMemObject(memory);
+        }
+        scratch.clear();
+    };
+    const auto create_scratch = [&]() -> bool {
+        for (int i = 0; i < 3; ++i) {
+            cl_int scratch_error = CL_SUCCESS;
+            cl_mem memory =
+                env->api->CreateBuffer(env->context, CL_MEM_READ_WRITE,
+                                       scratch_bytes, nullptr, &scratch_error);
+            if (memory == nullptr) {
+                return false;
+            }
+            scratch.push_back(memory);
+        }
+        return true;
+    };
+    if (!create_scratch()) {
+        release_scratch();
+        error = "output.sharpen device scratch allocation failed";
+        return RT_STAGE_FALLBACK;
+    }
+    cl_mem mask_memory = scratch[0];
+    cl_mem temp_memory = scratch[1];
+    cl_mem blur_memory = scratch[2];
+
+    std::lock_guard<std::recursive_mutex> lock(env->queue_mutex);
+
+    const auto set_arg = [&](cl_kernel kernel, cl_uint index,
+                             std::size_t bytes, const void* value) {
+        return env->api->SetKernelArg(kernel, index, bytes, value) == CL_SUCCESS;
+    };
+    const auto run_2d = [&](cl_kernel kernel, int global_width,
+                            int global_height) -> bool {
+        const std::size_t global[2] = {
+            static_cast<std::size_t>(global_width),
+            static_cast<std::size_t>(global_height)};
+        cl_event done = nullptr;
+        if (env->api->EnqueueNDRangeKernel(env->queue, kernel, 2, nullptr,
+                                           global, nullptr, 0, nullptr,
+                                           &done) != CL_SUCCESS ||
+            done == nullptr) {
+            return false;
+        }
+        const cl_int wait_status = env->api->WaitForEvents(1, &done);
+        env->api->ReleaseEvent(done);
+        return wait_status == CL_SUCCESS;
+    };
+    const auto run_1d = [&](cl_kernel kernel, int lines) -> bool {
+        const std::size_t global = static_cast<std::size_t>(lines);
+        cl_event done = nullptr;
+        if (env->api->EnqueueNDRangeKernel(env->queue, kernel, 1, nullptr,
+                                           &global, nullptr, 0, nullptr,
+                                           &done) != CL_SUCCESS ||
+            done == nullptr) {
+            return false;
+        }
+        const cl_int wait_status = env->api->WaitForEvents(1, &done);
+        env->api->ReleaseEvent(done);
+        return wait_status == CL_SUCCESS;
+    };
+
+    const cl_int cl_width = width;
+    const cl_int cl_height = height;
+    const cl_int cl_pitch = pitch;
+
+    /* Contrast mask, then its sigma-2 blur (skipped when the mask is flat). */
+    const cl_float contrast_threshold =
+        static_cast<cl_float>(p.contrast / 100.0);
+    const cl_float contrast_scale =
+        static_cast<cl_float>(SHARPEN_MASK_GRADIENT_SCALE);
+    const bool mask_ok =
+        set_arg(mask_kernel, 0, sizeof(cl_mem), &image_memory) &&
+        set_arg(mask_kernel, 1, sizeof(cl_mem), &mask_memory) &&
+        set_arg(mask_kernel, 2, sizeof(cl_int), &cl_width) &&
+        set_arg(mask_kernel, 3, sizeof(cl_int), &cl_height) &&
+        set_arg(mask_kernel, 4, sizeof(cl_int), &cl_pitch) &&
+        set_arg(mask_kernel, 5, sizeof(cl_float), &contrast_threshold) &&
+        set_arg(mask_kernel, 6, sizeof(cl_float), &contrast_scale) &&
+        run_2d(mask_kernel, width, height);
+    if (!mask_ok) {
+        release_scratch();
+        error = "output.sharpen mask failed";
+        return RT_STAGE_ERROR;
+    }
+
+    const auto run_iir = [&](cl_mem source, cl_mem target, int length,
+                             int src_base_step, int dst_base_step,
+                             int src_stride, int dst_stride, int lines,
+                             const SharpenIirFactors& factors) -> bool {
+        const cl_int cl_length = length;
+        const cl_int cl_src_base_step = src_base_step;
+        const cl_int cl_dst_base_step = dst_base_step;
+        const cl_int cl_src_stride = src_stride;
+        const cl_int cl_dst_stride = dst_stride;
+        cl_float m[9];
+        for (int i = 0; i < 3; ++i) {
+            for (int j = 0; j < 3; ++j) {
+                m[i * 3 + j] = factors.m[i][j];
+            }
+        }
+        const bool ok =
+            set_arg(iir_kernel, 0, sizeof(cl_mem), &source) &&
+            set_arg(iir_kernel, 1, sizeof(cl_mem), &target) &&
+            set_arg(iir_kernel, 2, sizeof(cl_int), &cl_length) &&
+            set_arg(iir_kernel, 3, sizeof(cl_int), &cl_src_base_step) &&
+            set_arg(iir_kernel, 4, sizeof(cl_int), &cl_dst_base_step) &&
+            set_arg(iir_kernel, 5, sizeof(cl_int), &cl_src_stride) &&
+            set_arg(iir_kernel, 6, sizeof(cl_int), &cl_dst_stride) &&
+            set_arg(iir_kernel, 7, sizeof(cl_float), &factors.B) &&
+            set_arg(iir_kernel, 8, sizeof(cl_float), &factors.b1) &&
+            set_arg(iir_kernel, 9, sizeof(cl_float), &factors.b2) &&
+            set_arg(iir_kernel, 10, sizeof(cl_float), &factors.b3);
+        if (!ok) {
+            return false;
+        }
+        for (int i = 0; i < 9; ++i) {
+            if (!set_arg(iir_kernel, static_cast<cl_uint>(11 + i),
+                         sizeof(cl_float), &m[i])) {
+                return false;
+            }
+        }
+        return run_1d(iir_kernel, lines);
+    };
+
+    if (contrast_threshold != 0.0f) {
+        SharpenIirFactors mask_factors;
+        sharpen_iir_factors(SHARPEN_MASK_SIGMA, mask_factors);
+        if (!run_iir(mask_memory, temp_memory, width, pitch, pitch, 1, 1,
+                     height, mask_factors) ||
+            !run_iir(temp_memory, mask_memory, height, 1, 1, pitch, pitch,
+                     width, mask_factors)) {
+            release_scratch();
+            error = "output.sharpen mask blur failed";
+            return RT_STAGE_ERROR;
+        }
+    }
+
+    /* Main USM blur. */
+    int use_blur = 1;
+    if (sigma < SHARPEN_GAUSS_SKIP) {
+        use_blur = 0;
+    } else if (sigma < SHARPEN_FIR_LIMIT) {
+        SharpenFirFactors factors;
+        sharpen_fir_factors(sigma, factors);
+        const cl_int src_pitch = pitch;
+        const cl_int dst_pitch = pitch;
+        const bool ok =
+            set_arg(fir_kernel, 0, sizeof(cl_mem), &image_memory) &&
+            set_arg(fir_kernel, 1, sizeof(cl_mem), &blur_memory) &&
+            set_arg(fir_kernel, 2, sizeof(cl_int), &cl_width) &&
+            set_arg(fir_kernel, 3, sizeof(cl_int), &cl_height) &&
+            set_arg(fir_kernel, 4, sizeof(cl_int), &src_pitch) &&
+            set_arg(fir_kernel, 5, sizeof(cl_int), &dst_pitch) &&
+            set_arg(fir_kernel, 6, sizeof(cl_float), &factors.c0) &&
+            set_arg(fir_kernel, 7, sizeof(cl_float), &factors.c1) &&
+            set_arg(fir_kernel, 8, sizeof(cl_float), &factors.c2) &&
+            set_arg(fir_kernel, 9, sizeof(cl_float), &factors.b0) &&
+            set_arg(fir_kernel, 10, sizeof(cl_float), &factors.b1) &&
+            run_2d(fir_kernel, width, height);
+        if (!ok) {
+            release_scratch();
+            error = "output.sharpen FIR blur failed";
+            return RT_STAGE_ERROR;
+        }
+    } else {
+        SharpenIirFactors factors;
+        sharpen_iir_factors(sigma, factors);
+        if (!run_iir(image_memory, temp_memory, width, pitch, pitch, 1, 1,
+                     height, factors) ||
+            !run_iir(temp_memory, blur_memory, height, 1, 1, pitch, pitch,
+                     width, factors)) {
+            release_scratch();
+            error = "output.sharpen IIR blur failed";
+            return RT_STAGE_ERROR;
+        }
+    }
+
+    const cl_int use_blur_flag = use_blur;
+    const cl_int cl_amount = p.amount;
+    const cl_int cl_bl = p.threshold_bottom_left;
+    const cl_int cl_tl = p.threshold_top_left;
+    const cl_int cl_br = p.threshold_bottom_right;
+    const cl_int cl_tr = p.threshold_top_right;
+    const cl_int cl_is_double = p.threshold_is_double ? 1 : 0;
+    const cl_int cl_start_at_one = p.threshold_start_at_one ? 1 : 0;
+    const bool apply_ok =
+        set_arg(apply_kernel, 0, sizeof(cl_mem), &image_memory) &&
+        set_arg(apply_kernel, 1, sizeof(cl_mem), &blur_memory) &&
+        set_arg(apply_kernel, 2, sizeof(cl_mem), &mask_memory) &&
+        set_arg(apply_kernel, 3, sizeof(cl_int), &cl_width) &&
+        set_arg(apply_kernel, 4, sizeof(cl_int), &cl_height) &&
+        set_arg(apply_kernel, 5, sizeof(cl_int), &cl_pitch) &&
+        set_arg(apply_kernel, 6, sizeof(cl_int), &use_blur_flag) &&
+        set_arg(apply_kernel, 7, sizeof(cl_int), &cl_amount) &&
+        set_arg(apply_kernel, 8, sizeof(cl_int), &cl_bl) &&
+        set_arg(apply_kernel, 9, sizeof(cl_int), &cl_tl) &&
+        set_arg(apply_kernel, 10, sizeof(cl_int), &cl_br) &&
+        set_arg(apply_kernel, 11, sizeof(cl_int), &cl_tr) &&
+        set_arg(apply_kernel, 12, sizeof(cl_int), &cl_is_double) &&
+        set_arg(apply_kernel, 13, sizeof(cl_int), &cl_start_at_one) &&
+        run_2d(apply_kernel, width, height);
+    if (!apply_ok) {
+        release_scratch();
+        error = "output.sharpen apply failed";
+        return RT_STAGE_ERROR;
+    }
+
+    const RtStageStatus readback = residency->readback(image_device, image);
+    release_scratch();
+    if (readback != RT_STAGE_OK) {
+        error = "output.sharpen readback failed";
+        return RT_STAGE_ERROR;
+    }
+
+    return RT_STAGE_OK;
+}
+
 class OpenCLStageQueue final : public StageQueue
 {
 public:
@@ -3776,6 +4079,20 @@ public:
         } else if (request.name == "gamut") {
             const RtStageStatus status =
                 run_gamut(env_, residency_, request.args, error);
+            if (status == RT_STAGE_OK) {
+                StageEvent done;
+                done.status = StageEventStatus::Complete;
+                done.result = RT_STAGE_OK;
+                done.device = StageDeviceType::OPENCL;
+                done.asynchronous = false;
+                return done;
+            }
+            StageEvent fallback = StageQueue::submit(request, profiling);
+            fallback.note = error;
+            return fallback;
+        } else if (request.name == "output.sharpen") {
+            const RtStageStatus status =
+                run_sharpen(env_, residency_, request.args, error);
             if (status == RT_STAGE_OK) {
                 StageEvent done;
                 done.status = StageEventStatus::Complete;
