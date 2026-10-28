@@ -60,10 +60,14 @@ sub-nodes and the residual beside it, not parity of the composite.
 
 `output.sharpen` is partial: the device runs the unsupported-mask path with
 `method=usm`, no edges-only, no halo control, no show-mask, `blurradius < 0.25`
-and `radius / scale < 25`. RLD, edges-only, halo control, show-mask,
-`blurradius >= 0.25` and `radius / scale >= 25` are host residuals; they run
-the `output.sharpen` host builtin and are recorded as `impl=host`, never as a
-device pass.
+and `radius / scale < 25`, and the undamped Richardson-Lucy path with
+`method=rld`, `deconvdamping == 0`, `deconviter <= 1000`,
+`deconvradius / scale < 1.15` and `blurradius < 0.25`. The default post-resize
+profile (`rld`, radius 0.45, 100 iterations, no damping) is therefore on the
+device. Damped RLD, `deconvradius / scale >= 1.15`, `deconviter > 1000`,
+edges-only, halo control, show-mask, `blurradius >= 0.25` and the USM sigma
+limit are host residuals; they run the `output.sharpen` host builtin and are
+recorded as `impl=host`, never as a device pass.
 
 | Id | Domain (export/preview/crop/thumbnail) | Consumer | Reuse | Role | Device |
 |----|----------------------------------------|----------|-------|------|--------|
