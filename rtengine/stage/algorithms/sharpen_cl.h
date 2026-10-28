@@ -24,6 +24,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <string>
 
 /*
@@ -707,13 +708,30 @@ inline bool sharpen_node_decode(const RtStageArg* args, std::uint32_t nargs,
     buffer = args[SHARPEN_ARG_BUFFER].u.buffer;
     if (buffer.size != sizeof(RtStageBuffer) || buffer.data == nullptr ||
         buffer.format != RT_STAGE_F32 || buffer.planes != 1 ||
-        buffer.width <= 0 || buffer.height <= 0 ||
-        buffer.row_pitch <
-            static_cast<std::size_t>(buffer.width) * sizeof(float) ||
-        buffer.plane_pitch <
-            static_cast<std::size_t>(buffer.width) * buffer.height *
-                sizeof(float)) {
-        error = "sharpen needs a one-plane F32 L buffer";
+        buffer.width <= 0 || buffer.height <= 0) {
+        error = "sharpen needs a tightly packed one-plane F32 L buffer";
+        return false;
+    }
+    /*
+     * The extracted CPU core addresses the plane with a W-sample stride and
+     * the host builtin passes its raw pointer, so the host cannot honour a
+     * padded row or plane. The in-tree producer hands over a tight LabImage
+     * plane. Requiring exact pitches keeps the host and device interpretations
+     * identical; a padded descriptor is rejected rather than silently misread
+     * on the host.
+     */
+    const std::size_t tight_row =
+        static_cast<std::size_t>(buffer.width) * sizeof(float);
+    if (tight_row >
+        std::numeric_limits<std::size_t>::max() /
+            static_cast<std::size_t>(buffer.height)) {
+        error = "sharpen plane size overflows";
+        return false;
+    }
+    const std::size_t tight_plane =
+        tight_row * static_cast<std::size_t>(buffer.height);
+    if (buffer.row_pitch != tight_row || buffer.plane_pitch != tight_plane) {
+        error = "sharpen needs a tightly packed one-plane F32 L buffer";
         return false;
     }
 
