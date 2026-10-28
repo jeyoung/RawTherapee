@@ -2242,32 +2242,31 @@ RtStageStatus run_thumbnail_wb(const std::shared_ptr<OpenCLEnv>& env,
         return RT_STAGE_FALLBACK;
     }
 
-    const StageBufferShape shape{RT_STAGE_F32, image.width, image.height, 1};
-    StageDeviceBufferPtr planes[3];
-    for (int plane = 0; plane < 3; ++plane) {
-        const RtStageBuffer view = plane_view(image, plane);
-        planes[plane] = residency->acquire(view.data, shape, &error);
-        if (!planes[plane]) {
-            return RT_STAGE_FALLBACK;
-        }
-        if (residency->upload(planes[plane], view) != RT_STAGE_OK) {
-            error = "thumbnail.whitebalance upload failed";
-            return RT_STAGE_FALLBACK;
-        }
+    /*
+     * The kernel addresses all three planes through one buffer, so the whole
+     * image is one allocation. Uploading each plane into its own compact
+     * buffer would put the plane writes past the first allocation.
+     */
+    const StageBufferShape shape{RT_STAGE_F32, image.width, image.height, 3};
+    StageDeviceBufferPtr device_image =
+        residency->acquire(image.data, shape, &error);
+    if (!device_image) {
+        return RT_STAGE_FALLBACK;
+    }
+    if (residency->upload(device_image, image) != RT_STAGE_OK) {
+        error = "thumbnail.whitebalance upload failed";
+        return RT_STAGE_FALLBACK;
     }
 
-    auto memory_of = [](const StageDeviceBufferPtr& buffer) {
-        auto device = std::dynamic_pointer_cast<OpenCLDeviceBuffer>(buffer);
-        return device != nullptr ? device->memory() : nullptr;
-    };
-
-    std::lock_guard<std::recursive_mutex> lock(env->queue_mutex);
-
-    auto device = std::dynamic_pointer_cast<OpenCLDeviceBuffer>(planes[0]);
+    auto device = std::dynamic_pointer_cast<OpenCLDeviceBuffer>(device_image);
     if (!device) {
         error = "thumbnail.whitebalance device buffer mismatch";
         return RT_STAGE_FALLBACK;
     }
+
+    std::lock_guard<std::recursive_mutex> lock(env->queue_mutex);
+
+    cl_mem memory = device->memory();
     const cl_int width = image.width;
     const cl_int height = image.height;
     const cl_int pitch = static_cast<cl_int>(device->row_pitch() / sizeof(float));
@@ -2283,7 +2282,6 @@ RtStageStatus run_thumbnail_wb(const std::shared_ptr<OpenCLEnv>& env,
         return env->api->SetKernelArg(kernel, index, bytes, value) == CL_SUCCESS;
     };
 
-    cl_mem memory = memory_of(planes[0]);
     const bool args_ok =
         set_arg(0, sizeof(cl_mem), &memory) &&
         set_arg(1, sizeof(cl_mem), &memory) &&
@@ -2319,12 +2317,9 @@ RtStageStatus run_thumbnail_wb(const std::shared_ptr<OpenCLEnv>& env,
         return RT_STAGE_ERROR;
     }
 
-    for (int plane = 0; plane < 3; ++plane) {
-        if (residency->readback(planes[plane], plane_view(image, plane)) !=
-            RT_STAGE_OK) {
-            error = "thumbnail.whitebalance readback failed";
-            return RT_STAGE_ERROR;
-        }
+    if (residency->readback(device_image, image) != RT_STAGE_OK) {
+        error = "thumbnail.whitebalance readback failed";
+        return RT_STAGE_ERROR;
     }
 
     return RT_STAGE_OK;
