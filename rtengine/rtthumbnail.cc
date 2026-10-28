@@ -1610,10 +1610,67 @@ void Thumbnail::stageQuickScale(QuickStageState& state)
 /*
  * thumbnail.transform for the embedded JPEG branch.
  */
+namespace
+{
+
+/* Coarse transform on the device for the packed 8-bit embedded thumbnail. */
+bool run_thumbnail_permute_u8_stage(Image8*& image, int deg, bool hflip,
+                                    bool vflip)
+{
+    constexpr int ARG_COUNT = 5;
+    if (image == nullptr) {
+        return false;
+    }
+
+    const int width = image->getWidth();
+    const int height = image->getHeight();
+    const bool swaps = deg == 90 || deg == 270;
+    std::unique_ptr<Image8> dst(
+        new Image8(swaps ? height : width, swaps ? width : height));
+
+    RtStageArg args[ARG_COUNT]{};
+    args[0].kind = RT_STAGE_ARG_BUFFER;
+    args[0].u.buffer = stage::view(*image);
+    args[1].kind = RT_STAGE_ARG_BUFFER;
+    args[1].u.buffer = stage::view(*dst);
+    args[2].kind = RT_STAGE_ARG_INT;
+    args[2].u.i = deg;
+    args[3].kind = RT_STAGE_ARG_INT;
+    args[3].u.i = hflip ? 1 : 0;
+    args[4].kind = RT_STAGE_ARG_INT;
+    args[4].u.i = vflip ? 1 : 0;
+
+    RtStageProfiling profiling{};
+    if (stage::run("thumbnail.transform.u8",
+                   std::vector<RtStageArg>(args, args + ARG_COUNT),
+                   &profiling) != RT_STAGE_OK) {
+        return false;
+    }
+
+    delete image;
+    image = dst.release();
+    return true;
+}
+
+} // namespace
+
 void Thumbnail::stageQuickTransform(QuickStageState& state)
 {
     const procparams::ProcParams& params = *state.params;
     Image8*& baseImg = state.img;
+
+    const bool rotates = params.coarse.rotate == 90 ||
+                         params.coarse.rotate == 180 ||
+                         params.coarse.rotate == 270;
+    if ((rotates || params.coarse.hflip || params.coarse.vflip) &&
+        stage::node_device("thumbnail.transform.u8") ==
+            stage::StageNodeDevice::OpenCL) {
+        if (run_thumbnail_permute_u8_stage(
+                baseImg, rotates ? params.coarse.rotate : 0,
+                params.coarse.hflip, params.coarse.vflip)) {
+            return;
+        }
+    }
 
     if (params.coarse.rotate) {
         baseImg->rotate (params.coarse.rotate);
@@ -1729,12 +1786,72 @@ void Thumbnail::stageScale(StageState& state)
 /*
  * thumbnail.transform: coarse rotate and flip of the reduced image.
  */
+namespace
+{
+
+/* Coarse transform on the stage device: rotate, then horizontal, then
+ * vertical flip, matching `IImage::rotate`, `hflip` and `vflip`. */
+bool run_thumbnail_permute_stage(Imagefloat*& image, int deg, bool hflip,
+                                 bool vflip)
+{
+    constexpr int ARG_COUNT = 5;
+    if (image == nullptr) {
+        return false;
+    }
+
+    const int width = image->getWidth();
+    const int height = image->getHeight();
+    const bool swaps = deg == 90 || deg == 270;
+    std::unique_ptr<Imagefloat> dst(
+        new Imagefloat(swaps ? height : width, swaps ? width : height));
+
+    RtStageArg args[ARG_COUNT]{};
+    args[0].kind = RT_STAGE_ARG_BUFFER;
+    args[0].u.buffer = stage::view(*image);
+    args[1].kind = RT_STAGE_ARG_BUFFER;
+    args[1].u.buffer = stage::view(*dst);
+    args[2].kind = RT_STAGE_ARG_INT;
+    args[2].u.i = deg;
+    args[3].kind = RT_STAGE_ARG_INT;
+    args[3].u.i = hflip ? 1 : 0;
+    args[4].kind = RT_STAGE_ARG_INT;
+    args[4].u.i = vflip ? 1 : 0;
+
+    RtStageProfiling profiling{};
+    if (stage::run("thumbnail.transform",
+                   std::vector<RtStageArg>(args, args + ARG_COUNT),
+                   &profiling) != RT_STAGE_OK) {
+        return false;
+    }
+
+    delete image;
+    image = dst.release();
+    return true;
+}
+
+} // namespace
+
 void Thumbnail::stageTransform(StageState& state)
 {
     const procparams::ProcParams& params = *state.params;
     Imagefloat*& baseImg = state.baseImg;
     int& rwidth = state.rwidth;
     int& rheight = state.rheight;
+
+    const bool rotates = params.coarse.rotate == 90 ||
+                         params.coarse.rotate == 180 ||
+                         params.coarse.rotate == 270;
+    if ((rotates || params.coarse.hflip || params.coarse.vflip) &&
+        stage::node_device("thumbnail.transform") ==
+            stage::StageNodeDevice::OpenCL) {
+        if (run_thumbnail_permute_stage(baseImg, rotates ? params.coarse.rotate : 0,
+                                        params.coarse.hflip,
+                                        params.coarse.vflip)) {
+            rwidth = baseImg->getWidth();
+            rheight = baseImg->getHeight();
+            return;
+        }
+    }
 
     if (params.coarse.rotate) {
         baseImg->rotate (params.coarse.rotate);

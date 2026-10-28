@@ -821,6 +821,97 @@ __kernel void rt_thumbnail_wb(__global const float* src, __global float* dst,
     return source;
 }
 
+/*
+ * Thumbnail coarse transform: the rotate-then-flip composition of
+ * `IImage::rotate`, `hflip` and `vflip`, expressed as one destination-to-source
+ * mapping. The rotation is applied first, then the flips, so the inverse walks
+ * back through them.
+ */
+const std::string& thumbnail_permute_source()
+{
+    static const std::string source = R"CLC(
+#pragma OPENCL FP_CONTRACT OFF
+
+__kernel void rt_thumbnail_permute(__global const float* src,
+                                   __global float* dst,
+                                   const int srcW, const int srcH,
+                                   const int dstW, const int dstH,
+                                   const int deg, const int hflip,
+                                   const int vflip,
+                                   const int srcPitch, const int srcPlanePitch,
+                                   const int dstPitch, const int dstPlanePitch)
+{
+    const int gid = get_global_id(0);
+    const int y = gid / dstW;
+    if (y >= dstH) {
+        return;
+    }
+    const int x = gid - y * dstW;
+
+    const int x1 = hflip ? dstW - 1 - x : x;
+    const int y1 = vflip ? dstH - 1 - y : y;
+
+    int sx = x1;
+    int sy = y1;
+    if (deg == 90) {
+        sx = y1;
+        sy = srcH - 1 - x1;
+    } else if (deg == 180) {
+        sx = srcW - 1 - x1;
+        sy = srcH - 1 - y1;
+    } else if (deg == 270) {
+        sx = srcW - 1 - y1;
+        sy = x1;
+    }
+
+    const int in = sy * srcPitch + sx;
+    const int out = y * dstPitch + x;
+    dst[out] = src[in];
+    dst[dstPlanePitch + out] = src[srcPlanePitch + in];
+    dst[2 * dstPlanePitch + out] = src[2 * srcPlanePitch + in];
+}
+
+__kernel void rt_thumbnail_permute_u8(__global const uchar* src,
+                                      __global uchar* dst,
+                                      const int srcW, const int srcH,
+                                      const int dstW, const int dstH,
+                                      const int deg, const int hflip,
+                                      const int vflip,
+                                      const int srcPitch, const int dstPitch)
+{
+    const int gid = get_global_id(0);
+    const int y = gid / dstW;
+    if (y >= dstH) {
+        return;
+    }
+    const int x = gid - y * dstW;
+
+    const int x1 = hflip ? dstW - 1 - x : x;
+    const int y1 = vflip ? dstH - 1 - y : y;
+
+    int sx = x1;
+    int sy = y1;
+    if (deg == 90) {
+        sx = y1;
+        sy = srcH - 1 - x1;
+    } else if (deg == 180) {
+        sx = srcW - 1 - x1;
+        sy = srcH - 1 - y1;
+    } else if (deg == 270) {
+        sx = srcW - 1 - y1;
+        sy = x1;
+    }
+
+    const int in = sy * srcPitch + sx * 3;
+    const int out = y * dstPitch + x * 3;
+    dst[out] = src[in];
+    dst[out + 1] = src[in + 1];
+    dst[out + 2] = src[in + 2];
+}
+)CLC";
+    return source;
+}
+
 const std::vector<KernelDef>& kernels()
 {
     static const std::vector<KernelDef> table = {
@@ -831,7 +922,9 @@ const std::vector<KernelDef>& kernels()
         {"viewport.output", lab_to_u8_source().c_str(), "rt_lab_to_u8"},
         {"thumbnail.output", lab_to_u8_source().c_str(), "rt_lab_to_u8"},
         {"rgb.proc", rgb_proc_source().c_str(), "rt_rgb_proc"},
-        {"thumbnail.whitebalance", thumbnail_wb_source().c_str(), "rt_thumbnail_wb"}
+        {"thumbnail.whitebalance", thumbnail_wb_source().c_str(), "rt_thumbnail_wb"},
+        {"thumbnail.transform", thumbnail_permute_source().c_str(), "rt_thumbnail_permute"},
+        {"thumbnail.transform.u8", thumbnail_permute_source().c_str(), "rt_thumbnail_permute_u8"}
     };
     return table;
 }
@@ -2325,6 +2418,173 @@ RtStageStatus run_thumbnail_wb(const std::shared_ptr<OpenCLEnv>& env,
     return RT_STAGE_OK;
 }
 
+
+/*
+ * Thumbnail coarse transform. Arguments: [0] source, [1] destination,
+ * [2..4] ints deg, hflip, vflip. The destination has the rotated dimensions;
+ * the kernel maps each destination pixel back to its source.
+ */
+RtStageStatus run_thumbnail_permute(
+    const std::shared_ptr<OpenCLEnv>& env,
+    const std::shared_ptr<OpenCLResidency>& residency,
+    const std::vector<RtStageArg>& args, const char* node, bool eight_bit,
+    std::string& error)
+{
+    constexpr std::size_t BUFFER_ARGS = 2;
+    constexpr std::size_t INT_ARGS = 3;
+    constexpr std::size_t ARG_COUNT = BUFFER_ARGS + INT_ARGS;
+
+    if (args.size() != ARG_COUNT ||
+        args[0].kind != RT_STAGE_ARG_BUFFER ||
+        args[1].kind != RT_STAGE_ARG_BUFFER) {
+        error = "thumbnail transform expects two buffers and three ints";
+        return RT_STAGE_INVALID;
+    }
+    for (std::size_t i = BUFFER_ARGS; i < ARG_COUNT; ++i) {
+        if (args[i].kind != RT_STAGE_ARG_INT) {
+            error = "thumbnail transform has a non-int scalar";
+            return RT_STAGE_INVALID;
+        }
+    }
+
+    const RtStageBuffer& src = args[0].u.buffer;
+    const RtStageBuffer& dst = args[1].u.buffer;
+    if (eight_bit) {
+        if (!valid(src) || !valid(dst) || src.format != RT_STAGE_U8 ||
+            dst.format != RT_STAGE_U8 || src.planes != 1 || dst.planes != 1) {
+            error = "thumbnail transform needs two packed U8 buffers";
+            return RT_STAGE_INVALID;
+        }
+    } else if (!valid(src) || !valid(dst) || src.format != RT_STAGE_F32 ||
+               dst.format != RT_STAGE_F32 || src.planes != 3 ||
+               dst.planes != 3) {
+        error = "thumbnail transform needs two three-plane F32 buffers";
+        return RT_STAGE_INVALID;
+    }
+    if (src.data == dst.data) {
+        error = "thumbnail transform needs distinct buffers";
+        return RT_STAGE_INVALID;
+    }
+
+    const int deg = static_cast<int>(args[2].u.i);
+    if (deg != 0 && deg != 90 && deg != 180 && deg != 270) {
+        error = "thumbnail transform needs a rotation of 0, 90, 180 or 270";
+        return RT_STAGE_INVALID;
+    }
+    const int rotated_w = deg == 90 || deg == 270 ? src.height : src.width;
+    const int rotated_h = deg == 90 || deg == 270 ? src.width : src.height;
+    if (dst.width != rotated_w || dst.height != rotated_h) {
+        error = "thumbnail transform destination has the wrong dimensions";
+        return RT_STAGE_INVALID;
+    }
+
+    const KernelDef* def = find_kernel(node);
+    assert(def != nullptr);
+    cl_kernel kernel = compiled_kernel(env, def, error);
+    if (kernel == nullptr) {
+        return RT_STAGE_FALLBACK;
+    }
+
+    const StageBufferShape src_shape = eight_bit
+        ? StageBufferShape{RT_STAGE_U8, src.width, src.height, 1}
+        : StageBufferShape{RT_STAGE_F32, src.width, src.height, 3};
+    const StageBufferShape dst_shape = eight_bit
+        ? StageBufferShape{RT_STAGE_U8, dst.width, dst.height, 1}
+        : StageBufferShape{RT_STAGE_F32, dst.width, dst.height, 3};
+    StageDeviceBufferPtr src_device =
+        residency->acquire(src.data, src_shape, &error);
+    StageDeviceBufferPtr dst_device =
+        residency->acquire(dst.data, dst_shape, &error);
+    if (!src_device || !dst_device) {
+        return RT_STAGE_FALLBACK;
+    }
+    if (residency->upload(src_device, src) != RT_STAGE_OK) {
+        error = "thumbnail transform upload failed";
+        return RT_STAGE_FALLBACK;
+    }
+
+    auto device_src = std::dynamic_pointer_cast<OpenCLDeviceBuffer>(src_device);
+    auto device_dst = std::dynamic_pointer_cast<OpenCLDeviceBuffer>(dst_device);
+    if (!device_src || !device_dst) {
+        error = "thumbnail transform device buffer mismatch";
+        return RT_STAGE_FALLBACK;
+    }
+
+    std::lock_guard<std::recursive_mutex> lock(env->queue_mutex);
+
+    const cl_int src_w = src.width;
+    const cl_int src_h = src.height;
+    const cl_int dst_w = dst.width;
+    const cl_int dst_h = dst.height;
+    const cl_int rotation = deg;
+    const cl_int hflip = static_cast<cl_int>(args[3].u.i != 0);
+    const cl_int vflip = static_cast<cl_int>(args[4].u.i != 0);
+
+    const auto set_arg = [&](cl_uint index, std::size_t bytes,
+                             const void* value) {
+        return env->api->SetKernelArg(kernel, index, bytes, value) == CL_SUCCESS;
+    };
+
+    cl_mem src_memory = device_src->memory();
+    cl_mem dst_memory = device_dst->memory();
+    bool args_ok =
+        set_arg(0, sizeof(cl_mem), &src_memory) &&
+        set_arg(1, sizeof(cl_mem), &dst_memory) &&
+        set_arg(2, sizeof(cl_int), &src_w) &&
+        set_arg(3, sizeof(cl_int), &src_h) &&
+        set_arg(4, sizeof(cl_int), &dst_w) &&
+        set_arg(5, sizeof(cl_int), &dst_h) &&
+        set_arg(6, sizeof(cl_int), &rotation) &&
+        set_arg(7, sizeof(cl_int), &hflip) &&
+        set_arg(8, sizeof(cl_int), &vflip);
+    if (eight_bit) {
+        const cl_int src_pitch = static_cast<cl_int>(device_src->row_pitch());
+        const cl_int dst_pitch = static_cast<cl_int>(device_dst->row_pitch());
+        args_ok = args_ok && set_arg(9, sizeof(cl_int), &src_pitch) &&
+                  set_arg(10, sizeof(cl_int), &dst_pitch);
+    } else {
+        const cl_int src_pitch =
+            static_cast<cl_int>(device_src->row_pitch() / sizeof(float));
+        const cl_int src_plane_pitch =
+            static_cast<cl_int>(device_src->plane_pitch() / sizeof(float));
+        const cl_int dst_pitch =
+            static_cast<cl_int>(device_dst->row_pitch() / sizeof(float));
+        const cl_int dst_plane_pitch =
+            static_cast<cl_int>(device_dst->plane_pitch() / sizeof(float));
+        args_ok = args_ok && set_arg(9, sizeof(cl_int), &src_pitch) &&
+                  set_arg(10, sizeof(cl_int), &src_plane_pitch) &&
+                  set_arg(11, sizeof(cl_int), &dst_pitch) &&
+                  set_arg(12, sizeof(cl_int), &dst_plane_pitch);
+    }
+    if (!args_ok) {
+        error = "clSetKernelArg failed";
+        return RT_STAGE_FALLBACK;
+    }
+
+    const std::size_t global =
+        static_cast<std::size_t>(dst_w) * static_cast<std::size_t>(dst_h);
+    cl_event done = nullptr;
+    if (env->api->EnqueueNDRangeKernel(env->queue, kernel, 1, nullptr, &global,
+                                       nullptr, 0, nullptr,
+                                       &done) != CL_SUCCESS ||
+        done == nullptr) {
+        error = "thumbnail transform launch failed";
+        return RT_STAGE_ERROR;
+    }
+    const cl_int wait_status = env->api->WaitForEvents(1, &done);
+    env->api->ReleaseEvent(done);
+    if (wait_status != CL_SUCCESS) {
+        error = "thumbnail transform did not complete";
+        return RT_STAGE_ERROR;
+    }
+    if (residency->readback(dst_device, dst) != RT_STAGE_OK) {
+        error = "thumbnail transform readback failed";
+        return RT_STAGE_ERROR;
+    }
+
+    return RT_STAGE_OK;
+}
+
 class OpenCLStageQueue final : public StageQueue
 {
 public:
@@ -2381,6 +2641,36 @@ public:
         } else if (request.name == "output.convert") {
             submission = launch_lab_to_rgb(env_, residency_, request.args,
                                            request.name.c_str(), false, error);
+        } else if (request.name == "thumbnail.transform") {
+            const RtStageStatus status =
+                run_thumbnail_permute(env_, residency_, request.args,
+                                      request.name.c_str(), false, error);
+            if (status == RT_STAGE_OK) {
+                StageEvent done;
+                done.status = StageEventStatus::Complete;
+                done.result = RT_STAGE_OK;
+                done.device = StageDeviceType::OPENCL;
+                done.asynchronous = false;
+                return done;
+            }
+            StageEvent fallback = StageQueue::submit(request, profiling);
+            fallback.note = error;
+            return fallback;
+        } else if (request.name == "thumbnail.transform.u8") {
+            const RtStageStatus status =
+                run_thumbnail_permute(env_, residency_, request.args,
+                                      request.name.c_str(), true, error);
+            if (status == RT_STAGE_OK) {
+                StageEvent done;
+                done.status = StageEventStatus::Complete;
+                done.result = RT_STAGE_OK;
+                done.device = StageDeviceType::OPENCL;
+                done.asynchronous = false;
+                return done;
+            }
+            StageEvent fallback = StageQueue::submit(request, profiling);
+            fallback.note = error;
+            return fallback;
         } else if (request.name == "thumbnail.whitebalance") {
             const RtStageStatus status =
                 run_thumbnail_wb(env_, residency_, request.args, error);
