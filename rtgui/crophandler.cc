@@ -18,6 +18,7 @@
  */
 #include "crophandler.h"
 
+#include <cassert>
 #include <cstring>
 #include "guiutils.h"
 #include "cropwindow.h"
@@ -110,8 +111,14 @@ void CropHandler::newImage (StagedImageProcessor* ipc_, bool isDetailWindow)
     }
 
     crop = ipc->createCrop (editDataProvider, isDetailWindow);
+    assert (crop != nullptr);
     ipc->setSizeListener (this);
-    crop->setListener (enabled ? this : nullptr);
+    // close() disables the handler when the previous image's coordinator is
+    // torn down. A new image always wants rendering, so re-enable the handler
+    // before binding it; otherwise setDetailedCrop() returns early, no initial
+    // crop arrives and a zoom requests nothing.
+    enabled = true;
+    crop->setListener (this);
     initial = true;
 }
 
