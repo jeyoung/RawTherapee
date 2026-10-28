@@ -2,19 +2,20 @@
 
 Evidence for the install, export, GUI and device-parity runs of the integrated
 graph workstream. The export matrix and the device gate were measured at
-commit `3a1a55559`. The GUI checks were measured at `b4943e8f9`; the only later
-engine change is the opt-in stage-device precedence, which is inactive unless
-`RT_STAGE_OPENCL` selects a node, so those rows still describe the default
-path.
+commit `639081af1`. The full GUI table was measured at `b4943e8f9`; the later
+engine changes add two opt-in device nodes (`resize`, `transform`), which are
+inactive unless `RT_STAGE_OPENCL` selects a node, and the classic paths were
+confirmed byte-identical to the pre-change package. A startup smoke at the tip
+is recorded below.
 
 ## Artefact
 
 ```
-rawtherapee-graph-5.13-331-g3a1a55559_5.13+git13352.3a1a55559-1_amd64.deb
-sha256 fd53e9d9239ed9c078d62a86f2093dcbd067506ab486c9fd3bc91c52a8362ffe
+rawtherapee-graph-5.13-337-g639081af1_5.13+git13358.639081af1-1_amd64.deb
+sha256 526fc08a3ca8da8e183c8dc69576deb6ec8e3a9801aa8e58cc51b03b55844352
 ```
 
-Built in the Debian 12 container from clean `3a1a55559`. Earlier packages in
+Built in the Debian 12 container from clean `639081af1`. Earlier packages in
 `build/portable` are retained for comparison and are not part of this record.
 
 ## Environment
@@ -94,6 +95,10 @@ own `RT_SETTINGS` and `RT_CACHE` under `build/test-scratch/`.
 | tif16 | 1200x680, present | graph active, 13 of 14 nodes | graph active, 13 nodes, 2 folded | not graph-logged | PASS | PASS | PASS |
 | jpg8 | 1200x680, present | graph active, 13 of 14 nodes | graph active, 13 nodes, 2 folded | not graph-logged | PASS | PASS | PASS |
 
+At the validation commit a NEF was also opened with the tip build: the window
+appeared at 1200x680, the preview and crop graphs ran, and the process stayed
+alive under the same interactions.
+
 Every step produced a distinct screenshot and the process was alive after the
 interactions; no `error`, `failed`, `critical`, assertion or abort line
 appeared. Keys were delivered through XTEST with the pointer over the image
@@ -128,6 +133,7 @@ node ran on the device rather than only comparing pixels.
 |---|---|
 | Resize, POCL CPU, `RT_STAGE_OPENCL=1`, preference on | PASS, `max_pae=1.5259e-05` (1 LSB at 16-bit) |
 | Transform (rotate 5 degrees) | PASS, `max_pae=1.5259e-05` |
+| Transform identity, device | exact, and fails when `sint` is mutated to 0.05 |
 | Device records | `"stage":"lanczos3"` and `"stage":"transform"`, both `impl":"opencl"`, `source":"opencl"`; the classic log has no `opencl resize` or `opencl transform` line |
 | Forced refusal (`RT_STAGE_DEVICE_BUDGET_MB=16`, `RT_REQUIRE_GPU=1`) | FAIL with `impl":"host","source":"device-fallback"` |
 | No device selected (no `RT_OPENCL_ALLOW_CPU`) | SKIP |
@@ -157,6 +163,13 @@ identity transform, whose assertion was mutation-checked.
   removed code and the retirement guard still name `M_*` deliberately.
 - The stage device runs before the classic backend when `RT_STAGE_OPENCL`
   selects the node; the default order is unchanged.
+- The transform node and the classic path share one map builder and one set of
+  sampling helpers. The classic resize and rotate exports are byte-identical to
+  the pre-change package (0 LSB), so the refactor changed no pixels.
+- The shared kernel fragment is a namespace-scope constant, not a macro: GCC 12,
+  the portable baseline, rejects a multi-line raw string inside a `#define` while
+  the host compiler accepts it. The portable build found this; the host build
+  did not.
 
 ## Publication scan
 
