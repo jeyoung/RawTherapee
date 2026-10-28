@@ -36,6 +36,7 @@
  * otherwise. The latter still only affects the final rounding of one sample.
  */
 inline constexpr const char* RT_SHARPEN_CL = R"CLC(
+#pragma OPENCL FP_CONTRACT OFF
 #ifdef cl_khr_fp64
 #pragma OPENCL EXTENSION cl_khr_fp64 : enable
 typedef double rt_sharpen_real;
@@ -45,6 +46,8 @@ typedef float rt_sharpen_real;
 
 /* The CPU truncates the difference at this magnitude. */
 #define RT_SHARPEN_THRESHOLD_UPPER_BOUND 2000.0f
+/* The 5x5/7x7 division kernels clamp the denominator to this floor. */
+#define RT_SHARPEN_DIV_FLOOR 0.00001f
 
 /* buildBlendMask() with autoContrast off, including its border replication. */
 __kernel void rt_sharpen_mask(__global const float* src,
@@ -292,6 +295,292 @@ __kernel void rt_sharpen_apply(__global float* luminance,
     const float updated = base + delta;
     luminance[index] = mask[index] * (updated - base) + base;
 }
+
+/* Richardson-Lucy initialisation: clamp L and seed the running estimate. */
+__kernel void rt_sharpen_rld_init(__global float* luminance,
+                                  __global float* estimate,
+                                  const int width,
+                                  const int height,
+                                  const int pitch)
+{
+    const int x = (int)get_global_id(0);
+    const int y = (int)get_global_id(1);
+    if (x >= width || y >= height) {
+        return;
+    }
+    const int index = y * pitch + x;
+    const float value = luminance[index] < 0.0f ? 0.0f : luminance[index];
+    luminance[index] = value;
+    estimate[index] = value;
+}
+
+/* gauss3x3()'s denominator, including its first/last row and column rules. */
+float rt_sharpen_blur3(__global const float* src,
+                       const int index,
+                       const int pitch,
+                       const int x,
+                       const int y,
+                       const int width,
+                       const int height,
+                       const float c0,
+                       const float c1,
+                       const float c2,
+                       const float b0,
+                       const float b1)
+{
+    if (y == 0 || y == height - 1) {
+        if (x == 0 || x == width - 1) {
+            return src[index];
+        }
+        return b1 * (src[index - 1] + src[index + 1]) + b0 * src[index];
+    }
+    if (x == 0 || x == width - 1) {
+        return b1 * (src[index - pitch] + src[index + pitch]) +
+               b0 * src[index];
+    }
+    return c2 * (src[index - pitch - 1] + src[index - pitch + 1] +
+                 src[index + pitch - 1] + src[index + pitch + 1]) +
+           c1 * (src[index - pitch] + src[index - 1] + src[index + 1] +
+                 src[index + pitch]) +
+           c0 * src[index];
+}
+
+__kernel void rt_sharpen_div3(__global const float* estimate,
+                              __global float* tmp,
+                              __global const float* luminance,
+                              const int width,
+                              const int height,
+                              const int pitch,
+                              const float c0,
+                              const float c1,
+                              const float c2,
+                              const float b0,
+                              const float b1)
+{
+    const int x = (int)get_global_id(0);
+    const int y = (int)get_global_id(1);
+    if (x >= width || y >= height) {
+        return;
+    }
+    const int index = y * pitch + x;
+    const float denom = rt_sharpen_blur3(estimate, index, pitch, x, y, width,
+                                         height, c0, c1, c2, b0, b1);
+    const float divisor = denom > 0.0f ? denom : 1.0f;
+    const float value = luminance[index] / divisor;
+    tmp[index] = value < 0.0f ? 0.0f : value;
+}
+
+__kernel void rt_sharpen_mult3(__global const float* tmp,
+                               __global float* estimate,
+                               const int width,
+                               const int height,
+                               const int pitch,
+                               const float c0,
+                               const float c1,
+                               const float c2,
+                               const float b0,
+                               const float b1)
+{
+    const int x = (int)get_global_id(0);
+    const int y = (int)get_global_id(1);
+    if (x >= width || y >= height) {
+        return;
+    }
+    const int index = y * pitch + x;
+    estimate[index] *= rt_sharpen_blur3(tmp, index, pitch, x, y, width,
+                                        height, c0, c1, c2, b0, b1);
+}
+
+/* gauss7x7div()'s weighted sum, including the c21 double-use quirk. */
+float rt_sharpen_blur7(__global const float* src,
+                       const int index,
+                       const int pitch,
+                       const float c00,
+                       const float c10,
+                       const float c11,
+                       const float c20,
+                       const float c21,
+                       const float c22,
+                       const float c30,
+                       const float c31)
+{
+    const int p = pitch;
+    return c31 * (src[index - 3 * p - 1] + src[index - 3 * p + 1] +
+                  src[index - p - 3] + src[index - p + 3] +
+                  src[index + p - 3] + src[index + p + 3] +
+                  src[index + 3 * p - 1] + src[index + 3 * p + 1]) +
+           c30 * (src[index - 3 * p] + src[index - 3] +
+                  src[index + 3] + src[index + 3 * p]) +
+           c22 * (src[index - 2 * p - 2] + src[index - 2 * p + 2] +
+                  src[index + 2 * p - 2] + src[index + 2 * p + 2]) +
+           c21 * (src[index - 2 * p - 1] +
+                  src[index - 2 * p + 1] * c21 +
+                  src[index - p - 2] + src[index - p + 2] +
+                  src[index + p - 2] + src[index + p + 2] +
+                  src[index + 2 * p - 1] + src[index + 2 * p + 1]) +
+           c20 * (src[index - 2 * p] + src[index - 2] +
+                  src[index + 2] + src[index + 2 * p]) +
+           c11 * (src[index - p - 1] + src[index - p + 1] +
+                  src[index + p - 1] + src[index + p + 1]) +
+           c10 * (src[index - p] + src[index - 1] + src[index + 1] +
+                  src[index + p]) +
+           c00 * src[index];
+}
+
+/* gauss5x5div()'s weighted sum. */
+float rt_sharpen_blur5(__global const float* src,
+                       const int index,
+                       const int pitch,
+                       const float c00,
+                       const float c10,
+                       const float c11,
+                       const float c20,
+                       const float c21)
+{
+    const int p = pitch;
+    return c21 * (src[index - 2 * p - 1] + src[index - 2 * p + 1] +
+                  src[index - p - 2] + src[index - p + 2] +
+                  src[index + p - 2] + src[index + p + 2] +
+                  src[index + 2 * p - 1] + src[index + 2 * p + 1]) +
+           c20 * (src[index - 2 * p] + src[index - 2] +
+                  src[index + 2] + src[index + 2 * p]) +
+           c11 * (src[index - p - 1] + src[index - p + 1] +
+                  src[index + p - 1] + src[index + p + 1]) +
+           c10 * (src[index - p] + src[index - 1] + src[index + 1] +
+                  src[index + p]) +
+           c00 * src[index];
+}
+
+__kernel void rt_sharpen_div5(__global const float* estimate,
+                              __global float* tmp,
+                              __global const float* luminance,
+                              const int width,
+                              const int height,
+                              const int pitch,
+                              const float c00,
+                              const float c10,
+                              const float c11,
+                              const float c20,
+                              const float c21)
+{
+    const int x = (int)get_global_id(0);
+    const int y = (int)get_global_id(1);
+    if (x >= width || y >= height) {
+        return;
+    }
+    const int index = y * pitch + x;
+    if (x < 2 || x >= width - 2 || y < 2 || y >= height - 2) {
+        tmp[index] = 1.0f;
+        return;
+    }
+    const float denom = rt_sharpen_blur5(estimate, index, pitch, c00, c10,
+                                         c11, c20, c21);
+    tmp[index] = luminance[index] /
+                 (denom < RT_SHARPEN_DIV_FLOOR ? RT_SHARPEN_DIV_FLOOR : denom);
+}
+
+__kernel void rt_sharpen_mult5(__global const float* tmp,
+                               __global float* estimate,
+                               const int width,
+                               const int height,
+                               const int pitch,
+                               const float c00,
+                               const float c10,
+                               const float c11,
+                               const float c20,
+                               const float c21)
+{
+    const int x = (int)get_global_id(0);
+    const int y = (int)get_global_id(1);
+    if (x >= width || y >= height) {
+        return;
+    }
+    if (x < 2 || x >= width - 2 || y < 2 || y >= height - 2) {
+        return;
+    }
+    const int index = y * pitch + x;
+    estimate[index] *= rt_sharpen_blur5(tmp, index, pitch, c00, c10, c11, c20,
+                                        c21);
+}
+
+__kernel void rt_sharpen_div7(__global const float* estimate,
+                              __global float* tmp,
+                              __global const float* luminance,
+                              const int width,
+                              const int height,
+                              const int pitch,
+                              const float c00,
+                              const float c10,
+                              const float c11,
+                              const float c20,
+                              const float c21,
+                              const float c22,
+                              const float c30,
+                              const float c31)
+{
+    const int x = (int)get_global_id(0);
+    const int y = (int)get_global_id(1);
+    if (x >= width || y >= height) {
+        return;
+    }
+    const int index = y * pitch + x;
+    if (x < 3 || x >= width - 3 || y < 3 || y >= height - 3) {
+        tmp[index] = 1.0f;
+        return;
+    }
+    const float denom = rt_sharpen_blur7(estimate, index, pitch, c00, c10,
+                                         c11, c20, c21, c22, c30, c31);
+    tmp[index] = luminance[index] /
+                 (denom < RT_SHARPEN_DIV_FLOOR ? RT_SHARPEN_DIV_FLOOR : denom);
+}
+
+__kernel void rt_sharpen_mult7(__global const float* tmp,
+                               __global float* estimate,
+                               const int width,
+                               const int height,
+                               const int pitch,
+                               const float c00,
+                               const float c10,
+                               const float c11,
+                               const float c20,
+                               const float c21,
+                               const float c22,
+                               const float c30,
+                               const float c31)
+{
+    const int x = (int)get_global_id(0);
+    const int y = (int)get_global_id(1);
+    if (x >= width || y >= height) {
+        return;
+    }
+    if (x < 3 || x >= width - 3 || y < 3 || y >= height - 3) {
+        return;
+    }
+    const int index = y * pitch + x;
+    estimate[index] *= rt_sharpen_blur7(tmp, index, pitch, c00, c10, c11, c20,
+                                        c21, c22, c30, c31);
+}
+
+/* Final intp(blend * amount, max(estimate, 0), L), in place. */
+__kernel void rt_sharpen_rld_final(__global float* luminance,
+                                   __global const float* estimate,
+                                   __global const float* mask,
+                                   const int width,
+                                   const int height,
+                                   const int pitch,
+                                   const float amount)
+{
+    const int x = (int)get_global_id(0);
+    const int y = (int)get_global_id(1);
+    if (x >= width || y >= height) {
+        return;
+    }
+    const int index = y * pitch + x;
+    const float current = luminance[index];
+    const float positive = estimate[index] < 0.0f ? 0.0f : estimate[index];
+    const float blend = mask[index] * amount;
+    luminance[index] = blend * (positive - current) + current;
+}
 )CLC";
 
 /*
@@ -404,6 +693,10 @@ constexpr double SHARPEN_FIR_LIMIT = 0.6;
 constexpr double SHARPEN_SIGMA_LIMIT = 25.0;
 constexpr double SHARPEN_MASK_SIGMA = 2.0;
 constexpr double SHARPEN_MASK_GRADIENT_SCALE = 0.0625 / 327.68;
+/* Mirrors the gaussianBlur() support-window breakpoints. */
+constexpr double SHARPEN_5X5_LIMIT = 0.84;
+constexpr double SHARPEN_7X7_LIMIT = 1.15;
+constexpr int SHARPEN_DECONV_ITERATION_LIMIT = 1000;
 
 /*
  * Coefficients of the 1-D Young-van Vliet recurrence, computed in double on
@@ -494,18 +787,100 @@ inline void sharpen_fir_factors(double sigma, SharpenFirFactors& out)
     out.b0 = static_cast<float>(1.0 / edge_sum);
 }
 
+/* The five named entries of compute5x5kernel(), in its float arithmetic. */
+struct SharpenKernel5 {
+    float c00 = 0.0f;
+    float c10 = 0.0f;
+    float c11 = 0.0f;
+    float c20 = 0.0f;
+    float c21 = 0.0f;
+};
+
+inline void sharpen_kernel5(double sigma_value, SharpenKernel5& out)
+{
+    const float sigma = static_cast<float>(sigma_value);
+    const double temp = static_cast<double>(-2.0f * (sigma * sigma));
+    const double radius2 = (3.0 * SHARPEN_5X5_LIMIT) *
+                           (3.0 * SHARPEN_5X5_LIMIT);
+    float kernel[5][5];
+    float sum = 0.0f;
+    for (int i = -2; i <= 2; ++i) {
+        for (int j = -2; j <= 2; ++j) {
+            if (i * i + j * j <= radius2) {
+                kernel[i + 2][j + 2] =
+                    static_cast<float>(std::exp((i * i + j * j) / temp));
+                sum += kernel[i + 2][j + 2];
+            } else {
+                kernel[i + 2][j + 2] = 0.0f;
+            }
+        }
+    }
+    for (int i = 0; i < 5; ++i) {
+        for (int j = 0; j < 5; ++j) {
+            kernel[i][j] /= sum;
+        }
+    }
+    out.c21 = kernel[0][1];
+    out.c20 = kernel[0][2];
+    out.c11 = kernel[1][1];
+    out.c10 = kernel[1][2];
+    out.c00 = kernel[2][2];
+}
+
+/* The eight named entries of compute7x7kernel(), in its float arithmetic. */
+struct SharpenKernel7 {
+    float c00 = 0.0f;
+    float c10 = 0.0f;
+    float c11 = 0.0f;
+    float c20 = 0.0f;
+    float c21 = 0.0f;
+    float c22 = 0.0f;
+    float c30 = 0.0f;
+    float c31 = 0.0f;
+};
+
+inline void sharpen_kernel7(double sigma_value, SharpenKernel7& out)
+{
+    const float sigma = static_cast<float>(sigma_value);
+    const double temp = static_cast<double>(-2.0f * (sigma * sigma));
+    const double radius2 = (3.0 * SHARPEN_7X7_LIMIT) *
+                           (3.0 * SHARPEN_7X7_LIMIT);
+    float kernel[7][7];
+    float sum = 0.0f;
+    for (int i = -3; i <= 3; ++i) {
+        for (int j = -3; j <= 3; ++j) {
+            if (i * i + j * j <= radius2) {
+                kernel[i + 3][j + 3] =
+                    static_cast<float>(std::exp((i * i + j * j) / temp));
+                sum += kernel[i + 3][j + 3];
+            } else {
+                kernel[i + 3][j + 3] = 0.0f;
+            }
+        }
+    }
+    for (int i = 0; i < 7; ++i) {
+        for (int j = 0; j < 7; ++j) {
+            kernel[i][j] /= sum;
+        }
+    }
+    out.c31 = kernel[0][2];
+    out.c30 = kernel[0][3];
+    out.c22 = kernel[1][1];
+    out.c21 = kernel[1][2];
+    out.c20 = kernel[1][3];
+    out.c11 = kernel[2][2];
+    out.c10 = kernel[2][3];
+    out.c00 = kernel[3][3];
+}
+
 /*
- * The device accepts only the USM path with no residual switch and with the
- * blur radii whose kernels the launcher implements. Everything else returns
- * false with a reason, so the host builtin runs and the record says host.
+ * The device accepts the USM path and the undamped RLD path with the kernels
+ * this launcher implements. Everything else returns false with a reason, so
+ * the host builtin runs and the record says host.
  */
 inline bool sharpen_device_supported(const SharpenNodeParams& p,
                                      std::string& error)
 {
-    if (p.method != SHARPEN_METHOD_USM) {
-        error = "output.sharpen: the RLD method is a host residual";
-        return false;
-    }
     if (p.edgesonly) {
         error = "output.sharpen: edges only is a host residual";
         return false;
@@ -522,17 +897,50 @@ inline bool sharpen_device_supported(const SharpenNodeParams& p,
         error = "output.sharpen: the blur radius is a host residual";
         return false;
     }
-    if (!(p.scale > 0.0) || !std::isfinite(p.scale) ||
-        !std::isfinite(p.radius) || p.radius < 0.0) {
-        error = "output.sharpen: invalid radius or scale";
+    if (!(p.scale > 0.0) || !std::isfinite(p.scale)) {
+        error = "output.sharpen: invalid scale";
         return false;
     }
-    const double sigma = p.radius / p.scale;
-    if (!(sigma < SHARPEN_SIGMA_LIMIT)) {
-        error = "output.sharpen: sigma is outside the device range";
-        return false;
+
+    if (p.method == SHARPEN_METHOD_USM) {
+        if (!std::isfinite(p.radius) || p.radius < 0.0) {
+            error = "output.sharpen: invalid radius";
+            return false;
+        }
+        const double sigma = p.radius / p.scale;
+        if (!(sigma < SHARPEN_SIGMA_LIMIT)) {
+            error = "output.sharpen: sigma is outside the device range";
+            return false;
+        }
+        return true;
     }
-    return true;
+
+    if (p.method == SHARPEN_METHOD_RLD) {
+        if (p.deconvdamping != 0) {
+            error = "output.sharpen: deconvolution damping is a host residual";
+            return false;
+        }
+        if (p.deconviter < 0 ||
+            p.deconviter > SHARPEN_DECONV_ITERATION_LIMIT) {
+            error = "output.sharpen: deconvolution iteration count is outside "
+                    "the device range";
+            return false;
+        }
+        if (!std::isfinite(p.deconvradius) || p.deconvradius < 0.0) {
+            error = "output.sharpen: invalid deconvolution radius";
+            return false;
+        }
+        const double sigma = p.deconvradius / p.scale;
+        if (!(sigma < SHARPEN_7X7_LIMIT)) {
+            error = "output.sharpen: separable deconvolution is a host "
+                    "residual";
+            return false;
+        }
+        return true;
+    }
+
+    error = "output.sharpen: unknown method";
+    return false;
 }
 
 /* The node parameters a profile selects. Rejects a method outside the enum. */

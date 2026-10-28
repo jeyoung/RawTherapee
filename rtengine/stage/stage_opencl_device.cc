@@ -3666,7 +3666,15 @@ RtStageStatus run_sharpen(const std::shared_ptr<OpenCLEnv>& env,
 
     const int width = image.width;
     const int height = image.height;
-    const double sigma = p.radius / p.scale;
+
+    /*
+     * The CPU deconvolution returns before it clamps L when the amount is zero
+     * and there is no blur-radius pre-pass, so the plane is unchanged. Report
+     * OK without touching it; this is the same no-op on the host.
+     */
+    if (p.method == SHARPEN_METHOD_RLD && p.deconvamount == 0) {
+        return RT_STAGE_OK;
+    }
 
     const KernelDef* def = find_kernel("output.sharpen");
     assert(def != nullptr);
@@ -3674,12 +3682,7 @@ RtStageStatus run_sharpen(const std::shared_ptr<OpenCLEnv>& env,
         compiled_kernel_entry(env, def, "rt_sharpen_mask", error);
     cl_kernel iir_kernel =
         compiled_kernel_entry(env, def, "rt_sharpen_iir_line", error);
-    cl_kernel fir_kernel =
-        compiled_kernel_entry(env, def, "rt_sharpen_fir3", error);
-    cl_kernel apply_kernel =
-        compiled_kernel_entry(env, def, "rt_sharpen_apply", error);
-    if (mask_kernel == nullptr || iir_kernel == nullptr ||
-        fir_kernel == nullptr || apply_kernel == nullptr) {
+    if (mask_kernel == nullptr || iir_kernel == nullptr) {
         return RT_STAGE_FALLBACK;
     }
 
@@ -3850,6 +3853,240 @@ RtStageStatus run_sharpen(const std::shared_ptr<OpenCLEnv>& env,
             error = "output.sharpen mask blur failed";
             return RT_STAGE_ERROR;
         }
+    }
+
+    if (p.method == SHARPEN_METHOD_RLD) {
+        const double rld_sigma = p.deconvradius / p.scale;
+
+        cl_kernel init_kernel =
+            compiled_kernel_entry(env, def, "rt_sharpen_rld_init", error);
+        cl_kernel final_kernel =
+            compiled_kernel_entry(env, def, "rt_sharpen_rld_final", error);
+        if (init_kernel == nullptr || final_kernel == nullptr) {
+            release_scratch();
+            return RT_STAGE_FALLBACK;
+        }
+
+        /*
+         * gaussianBlur() skips below GAUSS_SKIP, uses 3x3 below 0.6, 5x5 up
+         * to 0.84 and 7x7 up to 1.15. The support check has already excluded
+         * the separable IIR range.
+         */
+        enum class RldClass { Skip, Fir3, Kernel5, Kernel7 };
+        RldClass rld_class = RldClass::Skip;
+        if (rld_sigma >= SHARPEN_GAUSS_SKIP) {
+            if (rld_sigma < SHARPEN_FIR_LIMIT) {
+                rld_class = RldClass::Fir3;
+            } else if (rld_sigma <= SHARPEN_5X5_LIMIT) {
+                rld_class = RldClass::Kernel5;
+            } else {
+                rld_class = RldClass::Kernel7;
+            }
+        }
+
+        cl_kernel div_kernel = nullptr;
+        cl_kernel mult_kernel = nullptr;
+        SharpenFirFactors fir_factors;
+        SharpenKernel5 kernel5;
+        SharpenKernel7 kernel7;
+        switch (rld_class) {
+        case RldClass::Skip:
+            break;
+        case RldClass::Fir3:
+            sharpen_fir_factors(rld_sigma, fir_factors);
+            div_kernel =
+                compiled_kernel_entry(env, def, "rt_sharpen_div3", error);
+            mult_kernel =
+                compiled_kernel_entry(env, def, "rt_sharpen_mult3", error);
+            break;
+        case RldClass::Kernel5:
+            sharpen_kernel5(rld_sigma, kernel5);
+            div_kernel =
+                compiled_kernel_entry(env, def, "rt_sharpen_div5", error);
+            mult_kernel =
+                compiled_kernel_entry(env, def, "rt_sharpen_mult5", error);
+            break;
+        case RldClass::Kernel7:
+            sharpen_kernel7(rld_sigma, kernel7);
+            div_kernel =
+                compiled_kernel_entry(env, def, "rt_sharpen_div7", error);
+            mult_kernel =
+                compiled_kernel_entry(env, def, "rt_sharpen_mult7", error);
+            break;
+        }
+        if (rld_class != RldClass::Skip &&
+            (div_kernel == nullptr || mult_kernel == nullptr)) {
+            release_scratch();
+            return RT_STAGE_FALLBACK;
+        }
+
+        cl_mem estimate_memory = temp_memory;
+        cl_mem tmp_memory = blur_memory;
+        const bool init_ok =
+            set_arg(init_kernel, 0, sizeof(cl_mem), &image_memory) &&
+            set_arg(init_kernel, 1, sizeof(cl_mem), &estimate_memory) &&
+            set_arg(init_kernel, 2, sizeof(cl_int), &cl_width) &&
+            set_arg(init_kernel, 3, sizeof(cl_int), &cl_height) &&
+            set_arg(init_kernel, 4, sizeof(cl_int), &cl_pitch) &&
+            run_2d(init_kernel, width, height);
+        if (!init_ok) {
+            release_scratch();
+            error = "output.sharpen RLD initialisation failed";
+            return RT_STAGE_ERROR;
+        }
+
+        if (rld_class != RldClass::Skip) {
+            const auto run_div = [&]() -> bool {
+                bool ok =
+                    set_arg(div_kernel, 0, sizeof(cl_mem), &estimate_memory) &&
+                    set_arg(div_kernel, 1, sizeof(cl_mem), &tmp_memory) &&
+                    set_arg(div_kernel, 2, sizeof(cl_mem), &image_memory) &&
+                    set_arg(div_kernel, 3, sizeof(cl_int), &cl_width) &&
+                    set_arg(div_kernel, 4, sizeof(cl_int), &cl_height) &&
+                    set_arg(div_kernel, 5, sizeof(cl_int), &cl_pitch);
+                cl_uint arg = 6;
+                if (rld_class == RldClass::Fir3) {
+                    ok = ok &&
+                         set_arg(div_kernel, arg++, sizeof(cl_float),
+                                 &fir_factors.c0) &&
+                         set_arg(div_kernel, arg++, sizeof(cl_float),
+                                 &fir_factors.c1) &&
+                         set_arg(div_kernel, arg++, sizeof(cl_float),
+                                 &fir_factors.c2) &&
+                         set_arg(div_kernel, arg++, sizeof(cl_float),
+                                 &fir_factors.b0) &&
+                         set_arg(div_kernel, arg++, sizeof(cl_float),
+                                 &fir_factors.b1);
+                } else if (rld_class == RldClass::Kernel5) {
+                    ok = ok &&
+                         set_arg(div_kernel, arg++, sizeof(cl_float),
+                                 &kernel5.c00) &&
+                         set_arg(div_kernel, arg++, sizeof(cl_float),
+                                 &kernel5.c10) &&
+                         set_arg(div_kernel, arg++, sizeof(cl_float),
+                                 &kernel5.c11) &&
+                         set_arg(div_kernel, arg++, sizeof(cl_float),
+                                 &kernel5.c20) &&
+                         set_arg(div_kernel, arg++, sizeof(cl_float),
+                                 &kernel5.c21);
+                } else {
+                    ok = ok &&
+                         set_arg(div_kernel, arg++, sizeof(cl_float),
+                                 &kernel7.c00) &&
+                         set_arg(div_kernel, arg++, sizeof(cl_float),
+                                 &kernel7.c10) &&
+                         set_arg(div_kernel, arg++, sizeof(cl_float),
+                                 &kernel7.c11) &&
+                         set_arg(div_kernel, arg++, sizeof(cl_float),
+                                 &kernel7.c20) &&
+                         set_arg(div_kernel, arg++, sizeof(cl_float),
+                                 &kernel7.c21) &&
+                         set_arg(div_kernel, arg++, sizeof(cl_float),
+                                 &kernel7.c22) &&
+                         set_arg(div_kernel, arg++, sizeof(cl_float),
+                                 &kernel7.c30) &&
+                         set_arg(div_kernel, arg++, sizeof(cl_float),
+                                 &kernel7.c31);
+                }
+                return ok && run_2d(div_kernel, width, height);
+            };
+            const auto run_mult = [&]() -> bool {
+                bool ok =
+                    set_arg(mult_kernel, 0, sizeof(cl_mem), &tmp_memory) &&
+                    set_arg(mult_kernel, 1, sizeof(cl_mem), &estimate_memory) &&
+                    set_arg(mult_kernel, 2, sizeof(cl_int), &cl_width) &&
+                    set_arg(mult_kernel, 3, sizeof(cl_int), &cl_height) &&
+                    set_arg(mult_kernel, 4, sizeof(cl_int), &cl_pitch);
+                cl_uint arg = 5;
+                if (rld_class == RldClass::Fir3) {
+                    ok = ok &&
+                         set_arg(mult_kernel, arg++, sizeof(cl_float),
+                                 &fir_factors.c0) &&
+                         set_arg(mult_kernel, arg++, sizeof(cl_float),
+                                 &fir_factors.c1) &&
+                         set_arg(mult_kernel, arg++, sizeof(cl_float),
+                                 &fir_factors.c2) &&
+                         set_arg(mult_kernel, arg++, sizeof(cl_float),
+                                 &fir_factors.b0) &&
+                         set_arg(mult_kernel, arg++, sizeof(cl_float),
+                                 &fir_factors.b1);
+                } else if (rld_class == RldClass::Kernel5) {
+                    ok = ok &&
+                         set_arg(mult_kernel, arg++, sizeof(cl_float),
+                                 &kernel5.c00) &&
+                         set_arg(mult_kernel, arg++, sizeof(cl_float),
+                                 &kernel5.c10) &&
+                         set_arg(mult_kernel, arg++, sizeof(cl_float),
+                                 &kernel5.c11) &&
+                         set_arg(mult_kernel, arg++, sizeof(cl_float),
+                                 &kernel5.c20) &&
+                         set_arg(mult_kernel, arg++, sizeof(cl_float),
+                                 &kernel5.c21);
+                } else {
+                    ok = ok &&
+                         set_arg(mult_kernel, arg++, sizeof(cl_float),
+                                 &kernel7.c00) &&
+                         set_arg(mult_kernel, arg++, sizeof(cl_float),
+                                 &kernel7.c10) &&
+                         set_arg(mult_kernel, arg++, sizeof(cl_float),
+                                 &kernel7.c11) &&
+                         set_arg(mult_kernel, arg++, sizeof(cl_float),
+                                 &kernel7.c20) &&
+                         set_arg(mult_kernel, arg++, sizeof(cl_float),
+                                 &kernel7.c21) &&
+                         set_arg(mult_kernel, arg++, sizeof(cl_float),
+                                 &kernel7.c22) &&
+                         set_arg(mult_kernel, arg++, sizeof(cl_float),
+                                 &kernel7.c30) &&
+                         set_arg(mult_kernel, arg++, sizeof(cl_float),
+                                 &kernel7.c31);
+                }
+                return ok && run_2d(mult_kernel, width, height);
+            };
+
+            for (int iteration = 0; iteration < p.deconviter; ++iteration) {
+                if (!run_div() || !run_mult()) {
+                    release_scratch();
+                    error = "output.sharpen RLD iteration failed";
+                    return RT_STAGE_ERROR;
+                }
+            }
+        }
+
+        const cl_float rld_amount =
+            static_cast<cl_float>(p.deconvamount) / 100.0f;
+        const bool final_ok =
+            set_arg(final_kernel, 0, sizeof(cl_mem), &image_memory) &&
+            set_arg(final_kernel, 1, sizeof(cl_mem), &estimate_memory) &&
+            set_arg(final_kernel, 2, sizeof(cl_mem), &mask_memory) &&
+            set_arg(final_kernel, 3, sizeof(cl_int), &cl_width) &&
+            set_arg(final_kernel, 4, sizeof(cl_int), &cl_height) &&
+            set_arg(final_kernel, 5, sizeof(cl_int), &cl_pitch) &&
+            set_arg(final_kernel, 6, sizeof(cl_float), &rld_amount) &&
+            run_2d(final_kernel, width, height);
+        if (!final_ok) {
+            release_scratch();
+            error = "output.sharpen RLD final blend failed";
+            return RT_STAGE_ERROR;
+        }
+
+        const RtStageStatus readback = residency->readback(image_device, image);
+        release_scratch();
+        if (readback != RT_STAGE_OK) {
+            error = "output.sharpen RLD readback failed";
+            return RT_STAGE_ERROR;
+        }
+        return RT_STAGE_OK;
+    }
+
+    const double sigma = p.radius / p.scale;
+    cl_kernel fir_kernel =
+        compiled_kernel_entry(env, def, "rt_sharpen_fir3", error);
+    cl_kernel apply_kernel =
+        compiled_kernel_entry(env, def, "rt_sharpen_apply", error);
+    if (fir_kernel == nullptr || apply_kernel == nullptr) {
+        release_scratch();
+        return RT_STAGE_FALLBACK;
     }
 
     /* Main USM blur. */
