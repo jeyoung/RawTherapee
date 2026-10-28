@@ -252,6 +252,25 @@ own compact buffer put the plane 1 and 2 writes past the first allocation,
 which the device test caught. A 45.7 MP NEF thumbnail cache is byte-identical
 to a CPU-only run.
 
+## Remaining thumbnail nodes: measured cost
+
+The plan assumed these were cheaper than step 5's kernels. Inspection says
+otherwise, so the next session does not start from that assumption:
+
+- `thumbnail.scale` calls `resizeTo` with the caller's `TypeInterpolation`
+  (`TI_Bilinear` for the normal path, `TI_Nearest` for the quick one), not the
+  Lanczos stage. A device node needs a bilinear resize kernel and a reference
+  match to `resizeTo`, which is new work rather than a rewire.
+- `thumbnail.transform` rotates and flips in place through the `IImage`
+  templates in `iimage.h`, which reallocate the planes. A device node must
+  allocate a new image, permute into it and swap, so the call site needs
+  restructuring; the permutation itself is simple but the semantics of
+  `rotate(90|180|270)` must be matched exactly.
+- `thumbnail.rgb` and `thumbnail.lab` are composites: colour-space conversion,
+  analysis, geometry, local adjustments and RGB or Lab processing folded into
+  one block.
+- `thumbnail.decode` is a JPEG decode, not a kernel.
+
 ## Pilot stage
 
 `lanczos3` is the pilot. The arithmetic lives in
