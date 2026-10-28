@@ -110,7 +110,15 @@ void CropHandler::newImage (StagedImageProcessor* ipc_, bool isDetailWindow)
 
     crop = ipc->createCrop (editDataProvider, isDetailWindow);
     ipc->setSizeListener (this);
-    crop->setListener (enabled ? this : nullptr);
+    /*
+     * close() disables the handler when the previous image's coordinator is
+     * torn down. Binding a live crop window to a new coordinator must
+     * re-enable it: otherwise setDetailedCrop() returns early, the new crop
+     * never renders and a zoom requests nothing, which is the second-image
+     * stuck-rough defect.
+     */
+    enabled = true;
+    crop->setListener (this);
     initial = true;
 }
 
