@@ -2573,7 +2573,7 @@ RtStageStatus run_rgb_proc(const std::shared_ptr<OpenCLEnv>& env,
 /*
  * End-of-process gamut. Argument order:
  *   [0] Lab three-plane F32 buffer, read and written in place,
- *   [1] wip, [2] wp, [3] to_out, [4] from_out: four 9-entry F32 matrices,
+ *   [1] wip, [2] wp, [3] to_out, [4] from_out: four 9x1 F32 matrices,
  *   [5] double gain (2^EV), [6] double power, [7] int compress.
  *
  * The matrices are derived on the host in double from the same helpers and in
@@ -2585,7 +2585,7 @@ RtStageStatus run_rgb_proc(const std::shared_ptr<OpenCLEnv>& env,
  * back after a wait, so the node reports a completed device event.
  *
  * Everything the kernel consumes is checked here: the buffer shape and format,
- * four 9-entry tables, a positive finite gain and power, and a compress flag
+ * four 9x1 tables, a positive finite gain and power, and a compress flag
  * that is exactly 0 or 1. A suspicious value is refused, never guessed.
  */
 RtStageStatus run_gamut(const std::shared_ptr<OpenCLEnv>& env,
@@ -2599,7 +2599,11 @@ RtStageStatus run_gamut(const std::shared_ptr<OpenCLEnv>& env,
     constexpr std::size_t ARG_COUNT = BUFFER_ARGS + DOUBLE_ARGS + INT_ARGS;
     constexpr std::size_t FIRST_DOUBLE = BUFFER_ARGS;
     constexpr std::size_t FIRST_INT = BUFFER_ARGS + DOUBLE_ARGS;
-    constexpr int MATRIX_ENTRIES = 9;
+    /* The ABI contract is a 9x1 table. The kernel reads nine flat entries, so
+     * a taller table would be read across the device's padded row pitch. */
+    constexpr int MATRIX_ROWS = 1;
+    constexpr int MATRIX_COLUMNS = 9;
+    constexpr int MATRIX_ENTRIES = MATRIX_ROWS * MATRIX_COLUMNS;
     constexpr int TABLE_ARGS = 4;
 
     if (args.size() != ARG_COUNT) {
@@ -2632,9 +2636,9 @@ RtStageStatus run_gamut(const std::shared_ptr<OpenCLEnv>& env,
     for (std::size_t i = 1; i < BUFFER_ARGS; ++i) {
         const RtStageBuffer& table = args[i].u.buffer;
         if (!valid(table) || table.format != RT_STAGE_F32 ||
-            table.planes != 1 ||
-            table.width * table.height != MATRIX_ENTRIES) {
-            error = "gamut needs four 9-entry F32 matrices";
+            table.planes != 1 || table.width != MATRIX_COLUMNS ||
+            table.height != MATRIX_ROWS) {
+            error = "gamut needs four 9x1 F32 matrices";
             return RT_STAGE_INVALID;
         }
         const float* entries = static_cast<const float*>(table.data);

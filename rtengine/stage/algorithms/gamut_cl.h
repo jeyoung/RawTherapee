@@ -68,7 +68,7 @@ inline constexpr const char* RT_GAMUT_CL = R"CLC(
 #define RT_GAMUT_C1_BY_116 0.008620689655172414f
 #define RT_GAMUT_C16_BY_116 0.13793103448275862f
 #define RT_GAMUT_EPSILON_N 0.20689655172413793f
-#define RT_GAMUT_KAPPA_INV 27.0f / 24389.0f
+#define RT_GAMUT_KAPPA_INV (27.0f / 24389.0f)
 #define RT_GAMUT_KAPPA 903.2962962962963f
 /* MAXVALF * eps, eps = 216/24389: the end of the CIE linear segment, the
  * same split Color::init() uses for cachef/cachefy. */
