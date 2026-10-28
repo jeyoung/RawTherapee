@@ -206,6 +206,22 @@ target_include_directories(preview-base-cache-test BEFORE PRIVATE
 target_link_libraries(preview-base-cache-test PRIVATE rtengine)
 rt_setup_target(preview-base-cache-test)
 
+# Standalone regression test for the working-TRC setup-only contract.
+add_executable(working-trc-setup-test EXCLUDE_FROM_ALL
+    "${PROJECT_SOURCE_DIR}/tools/perf/working-trc-setup-test.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/editcallbacks.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/multilangmgr.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/options.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/paramsedited.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/pathutils.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/threadutils.cc"
+)
+target_include_directories(working-trc-setup-test BEFORE PRIVATE
+    "${CMAKE_BINARY_DIR}/rtgui"
+)
+target_link_libraries(working-trc-setup-test PRIVATE rtengine)
+rt_setup_target(working-trc-setup-test)
+
 # Standalone regression test for the 100% FAST preview decision.
 add_executable(fast-preview-test EXCLUDE_FROM_ALL
     "${PROJECT_SOURCE_DIR}/tools/perf/fast-preview-test.cc"
