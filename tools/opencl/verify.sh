@@ -222,6 +222,8 @@ quick() {
     run_stage_device "pef/stage-device-transform" \
         "$ROOT/devnotes/opencl/pp3/rotate.pp3" transform
     run_stage_device "pef/stage-device-output" "" output.convert
+    run_stage_device "pef/stage-device-rgbproc" \
+        "$ROOT/devnotes/opencl/pp3/rgbproc-exposure.pp3" rgb.proc
 }
 
 stage() {
@@ -371,8 +373,11 @@ run_stage_device() {
         return 1
     fi
 
+    # RT_OPENCL_RGBPROC opts the RGB tone stage in; it affects only rgb.proc,
+    # so every device run may set it.
     if ! env OMP_NUM_THREADS="$THREADS" RT_STAGE_OPENCL=1 \
-            RT_STAGE_PROFILE="$record" "$cli" --gpu=auto "${profileArg[@]}" \
+            RT_OPENCL_RGBPROC=1 RT_STAGE_PROFILE="$record" \
+            "$cli" --gpu=auto "${profileArg[@]}" \
             -o "$device" -t -b16 -Y -c "$sample" >"$outdir/device.log" 2>&1; then
         printf 'FAIL\t%s\tload or export failed (stage device)\n' "$label"
         rm -rf "$outdir"
@@ -415,6 +420,8 @@ stage_device() {
     run_stage_device "pef/stage-device-transform" \
         "$ROOT/devnotes/opencl/pp3/rotate.pp3" transform
     run_stage_device "pef/stage-device-output" "" output.convert
+    run_stage_device "pef/stage-device-rgbproc" \
+        "$ROOT/devnotes/opencl/pp3/rgbproc-exposure.pp3" rgb.proc
 }
 
 rgbproc() {
