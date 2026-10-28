@@ -87,7 +87,7 @@ fallback; the served hit cost 37-40 ms at fit and 57-61 ms at 100 %. See
 navigator/histogram MAE note.
 
 
-## Known defect: second image stuck at the rough stage
+## Fixed defect: second image stuck at the rough stage
 
 Single-tab, load an image, open a second from the file browser, then
 double-click the image area to zoom. The second image stays at the first
@@ -98,7 +98,16 @@ Attribution: **pre-existing upstream behaviour**, not from the typed-request
 work. `build/baseline-dev/rtgui/rawtherapee` (dev, 2026-10-24, before this
 branch) reproduces the same state from the same steps.
 
-Trace from the branch build, with `RT_STAGE_PROFILE` counting real passes:
+The cause was in the GUI, not the engine: `CropHandler::close()` disables the
+handler when the previous image's coordinator is torn down, and `newImage()`
+bound the next coordinator without re-enabling it. `setDetailedCrop()` then
+returned early, so the new crop never rendered and a zoom requested nothing.
+`newImage()` now re-enables the handler when it binds. After the fix, the same
+steps add one `viewport.output` and one `monitor.output` record and the image
+renders sharp.
+
+Trace from the branch build before the fix, with `RT_STAGE_PROFILE` counting
+real passes:
 
 | Step | Device records | Trace |
 | --- | --- | --- |
