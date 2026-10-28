@@ -15,6 +15,10 @@
 #include "image16.h"
 #include "imagefloat.h"
 
+#include "color.h"
+#include "improcfun.h"
+#include "procparams.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -22,6 +26,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -2049,6 +2054,210 @@ void test_rgb_proc_pitch(bool available)
     }
 }
 
+/*
+ * drawFrame() reads rtengine::Color::gamma2curve, which rtengine::Color::init()
+ * fills from the sRGB table. The test initialises the same table subset so the
+ * production CPU path can be called without the engine-wide initialisation,
+ * which needs the Settings singleton and the ICC stores.
+ */
+void init_gamma2curve()
+{
+    constexpr int ENTRIES = 65536;
+    constexpr double MAX_VALUE = 65535.0;
+    constexpr float MAX_VALUE_F = 65535.0f;
+
+    rtengine::Color::gammatab_srgb(ENTRIES, 0);
+    for (int i = 0; i < ENTRIES; ++i) {
+        rtengine::Color::gammatab_srgb[i] =
+            rtengine::Color::gamma2(i / MAX_VALUE);
+    }
+    rtengine::Color::gammatab_srgb *= MAX_VALUE_F;
+    rtengine::Color::gamma2curve.share(rtengine::Color::gammatab_srgb,
+                                       LUT_CLIP_BELOW | LUT_CLIP_ABOVE);
+}
+
+/* The border clip drawFrame() applies to the 8-bit GUI value. */
+float frame_border(int value)
+{
+    constexpr int MAX_8BIT = 255;
+    constexpr double MAX_16BIT = 65535.0;
+    const int sanitized = std::max(0, std::min(value, MAX_8BIT));
+    const double normalized = static_cast<double>(sanitized) / MAX_8BIT;
+    const int index = static_cast<int>(normalized * MAX_16BIT);
+    return rtengine::Color::gamma2curve[index];
+}
+
+std::unique_ptr<Imagefloat> make_image(int width, int height, unsigned seed)
+{
+    auto image = std::make_unique<Imagefloat>(width, height);
+    RtStageBuffer buffer = view(*image);
+    fill(buffer, seed);
+    return image;
+}
+
+struct FramingCase {
+    const char* name;
+    int src_width;
+    int src_height;
+    int dst_width;
+    int dst_height;
+    int red;
+    int green;
+    int blue;
+};
+
+void test_framing(bool available)
+{
+    using namespace rtengine::stage;
+
+    init_gamma2curve();
+
+    const FramingCase cases[] = {
+        {"even delta, white", 32, 24, 40, 32, 255, 255, 255},
+        {"odd delta, black", 31, 23, 40, 32, 0, 0, 0},
+        {"both sides smaller, grey", 20, 16, 33, 27, 128, 128, 128},
+        {"one side equal, per-channel", 25, 19, 34, 28, 255, 128, 0},
+    };
+
+    /* Both early returns are host rules and must not reach the node. */
+    rtengine::procparams::ProcParams early_params;
+    early_params.framing.enabled = true;
+    rtengine::ImProcFunctions early_ipf(&early_params, false);
+
+    set_node_device_override("framing", StageNodeDevice::OpenCL);
+    {
+        auto same = make_image(24, 18, 7u);
+        Imagefloat* same_pointer = same.get();
+        rtengine::ImProcFunctions::FramingData dims;
+        dims.enabled = true;
+        dims.imgWidth = 24;
+        dims.imgHeight = 18;
+        dims.framedWidth = 24;
+        dims.framedHeight = 18;
+        Imagefloat* returned =
+            early_ipf.drawFrame(same_pointer, early_params.framing, dims);
+        check(returned == same_pointer,
+              "framing returns the source pointer when it equals the frame");
+        same.release();
+        delete returned;
+    }
+    {
+        auto larger = make_image(30, 24, 11u);
+        Imagefloat* larger_pointer = larger.get();
+        rtengine::ImProcFunctions::FramingData dims;
+        dims.enabled = true;
+        dims.imgWidth = 30;
+        dims.imgHeight = 24;
+        dims.framedWidth = 28;
+        dims.framedHeight = 22;
+        Imagefloat* returned =
+            early_ipf.drawFrame(larger_pointer, early_params.framing, dims);
+        check(returned == larger_pointer,
+              "framing returns the source pointer when it is larger");
+        larger.release();
+        delete returned;
+    }
+    clear_node_device_overrides();
+
+    if (!available) {
+        skip("framing: no OpenCL device");
+        return;
+    }
+
+    const auto context = opencl_device()->create_context();
+    check(context != nullptr, "framing: the device creates a context");
+    if (context == nullptr) {
+        return;
+    }
+
+    for (const FramingCase& item : cases) {
+        rtengine::procparams::ProcParams params;
+        params.framing.enabled = true;
+        params.framing.borderRed = item.red;
+        params.framing.borderGreen = item.green;
+        params.framing.borderBlue = item.blue;
+        rtengine::ImProcFunctions ipf(&params, false);
+
+        rtengine::ImProcFunctions::FramingData dims;
+        dims.enabled = true;
+        dims.imgWidth = item.src_width;
+        dims.imgHeight = item.src_height;
+        dims.framedWidth = item.dst_width;
+        dims.framedHeight = item.dst_height;
+
+        const int row_offset = static_cast<int>(std::round(
+            (static_cast<double>(item.dst_height) - item.src_height) / 2.0));
+        const int col_offset = static_cast<int>(std::round(
+            (static_cast<double>(item.dst_width) - item.src_width) / 2.0));
+
+        auto seed = make_image(item.src_width, item.src_height, 3u);
+
+        unsetenv("RT_STAGE_OPENCL");
+        clear_node_device_overrides();
+        auto cpu_source = make_image(item.src_width, item.src_height, 3u);
+        std::unique_ptr<Imagefloat> cpu(
+            ipf.drawFrame(cpu_source.release(), params.framing, dims));
+        if (!cpu) {
+            check(false, "framing: the CPU path returns an image");
+            continue;
+        }
+
+        Imagefloat device(item.dst_width, item.dst_height);
+        RtStageArg args[7]{};
+        args[0] = buffer_arg(view(*seed));
+        args[1] = buffer_arg(view(device));
+        args[2] = double_arg(frame_border(item.red));
+        args[3] = double_arg(frame_border(item.green));
+        args[4] = double_arg(frame_border(item.blue));
+        args[5] = int_arg(row_offset);
+        args[6] = int_arg(col_offset);
+
+        set_node_device_override("framing", StageNodeDevice::OpenCL);
+        StageRequest request;
+        request.name = "framing";
+        request.args.assign(args, args + 7);
+        StageExecution execution;
+        const RtStageStatus status =
+            context->execute(request, nullptr, &execution);
+        clear_node_device_overrides();
+
+        check(status == RT_STAGE_OK,
+              "the device executes the framing node");
+        check(execution.device == StageDeviceType::OPENCL,
+              "the framing execution names the device");
+        check(!execution.asynchronous,
+              "framing reads its planes back, so the execution is complete");
+
+        const Diff diff = compare(view(device), view(*cpu));
+        std::printf("stage-residency: framing %s %dx%d -> %dx%d "
+                    "(offset %d,%d): PAE %.6f LSB16, %zu of %zu samples "
+                    "differ\n",
+                    item.name, item.src_width, item.src_height,
+                    item.dst_width, item.dst_height, row_offset, col_offset,
+                    diff.max_abs, diff.differing, diff.samples);
+        check(diff.finite, "the framing device output is finite");
+        check(diff.differing == 0 && diff.max_abs == 0.0,
+              "the framing device output is bit-exact against drawFrame");
+
+        /*
+         * The production call site must take the same decision and return the
+         * same pixels when the node is selected.
+         */
+        auto call_source = make_image(item.src_width, item.src_height, 3u);
+        set_node_device_override("framing", StageNodeDevice::OpenCL);
+        std::unique_ptr<Imagefloat> call_result(
+            ipf.drawFrame(call_source.release(), params.framing, dims));
+        clear_node_device_overrides();
+        if (!call_result) {
+            check(false, "framing: the call site returns an image");
+            continue;
+        }
+        const Diff call_diff = compare(view(*call_result), view(*cpu));
+        check(call_diff.differing == 0 && call_diff.max_abs == 0.0,
+              "the framing call site output is bit-exact against drawFrame");
+    }
+}
+
 /* --------------------------------------------------------- run() wiring */
 
 void test_run_wiring(bool available)
@@ -2174,6 +2383,7 @@ int main()
     test_residency();
     test_node_parity(available);
     test_rgb_proc_pitch(available);
+    test_framing(available);
     test_run_wiring(available);
 
     if (failures == 0) {
