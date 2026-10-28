@@ -1,9 +1,11 @@
 # Parity results
 
 All comparisons use 16-bit TIFF output and `OMP_NUM_THREADS=1`, because the
-multi-threaded CPU path is itself not bit-reproducible (observed up to 5 LSB
-difference between two identical runs). The gate is the peak absolute error
-(PAE) in normalised units; 1 LSB at 16-bit is 1/65535 = 1.53e-5.
+multi-threaded CPU path is itself not bit-reproducible. Two identical Debian 12
+runs of a 10.2 MP PEF differed by 40 LSB on one pixel without it, and a host
+versus container pair differed by 754 LSB on 2 608 pixels; with it, the same
+pairs are exact. The gate is the peak absolute error (PAE) in normalised units;
+1 LSB at 16-bit is 1/65535 = 1.53e-5.
 
 | Date | Commit | Device | Image/profile | Mode | PAE | Result |
 |---|---|---|---|---|---|---|
