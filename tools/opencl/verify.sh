@@ -221,6 +221,7 @@ quick() {
         "$ROOT/devnotes/opencl/pp3/resize.pp3" lanczos3
     run_stage_device "pef/stage-device-transform" \
         "$ROOT/devnotes/opencl/pp3/rotate.pp3" transform
+    run_stage_device "pef/stage-device-output" "" output.convert
 }
 
 stage() {
@@ -341,7 +342,12 @@ run_stage_device() {
     local sample="${sample_override:-$TESTDATA/colorspace_flowers.pef}"
 
     [ -f "$sample" ] || die "missing $sample (run tools/opencl/fetch-testdata.sh)"
-    [ -f "$profile" ] || die "missing profile $profile"
+    # An empty profile selects the neutral defaults, which is what the output
+    # conversion needs: no sidecar, no resize.
+    [ -z "$profile" ] || [ -f "$profile" ] || die "missing profile $profile"
+
+    local -a profileArg=()
+    [ -n "$profile" ] && profileArg=(-p "$profile")
 
     if [ "$has_device" -eq 0 ]; then
         if [ "${RT_REQUIRE_GPU:-0}" = "1" ]; then
@@ -358,7 +364,7 @@ run_stage_device() {
     local host="$outdir/host.tif"
     local device="$outdir/device.tif"
 
-    if ! env OMP_NUM_THREADS="$THREADS" "$cli" --gpu=off -p "$profile" \
+    if ! env OMP_NUM_THREADS="$THREADS" "$cli" --gpu=off "${profileArg[@]}" \
             -o "$host" -t -b16 -Y -c "$sample" >"$outdir/host.log" 2>&1; then
         printf 'FAIL\t%s\tload or export failed (gpu=off)\n' "$label"
         rm -rf "$outdir"
@@ -366,7 +372,7 @@ run_stage_device() {
     fi
 
     if ! env OMP_NUM_THREADS="$THREADS" RT_STAGE_OPENCL=1 \
-            RT_STAGE_PROFILE="$record" "$cli" --gpu=auto -p "$profile" \
+            RT_STAGE_PROFILE="$record" "$cli" --gpu=auto "${profileArg[@]}" \
             -o "$device" -t -b16 -Y -c "$sample" >"$outdir/device.log" 2>&1; then
         printf 'FAIL\t%s\tload or export failed (stage device)\n' "$label"
         rm -rf "$outdir"
@@ -408,6 +414,7 @@ stage_device() {
         "$ROOT/devnotes/opencl/pp3/resize.pp3" lanczos3
     run_stage_device "pef/stage-device-transform" \
         "$ROOT/devnotes/opencl/pp3/rotate.pp3" transform
+    run_stage_device "pef/stage-device-output" "" output.convert
 }
 
 rgbproc() {
