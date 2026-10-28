@@ -126,16 +126,18 @@ node ran on the device rather than only comparing pixels.
 
 | Case | Result |
 |---|---|
-| POCL CPU selected, `RT_STAGE_OPENCL=1`, preference on | PASS, `max_pae=1.5259e-05` (1 LSB at 16-bit) |
-| Device record | `"stage":"lanczos3","impl":"opencl","source":"opencl"`, and the classic log has no `opencl resize` line |
+| Resize, POCL CPU, `RT_STAGE_OPENCL=1`, preference on | PASS, `max_pae=1.5259e-05` (1 LSB at 16-bit) |
+| Transform (rotate 5 degrees) | PASS, `max_pae=1.5259e-05` |
+| Device records | `"stage":"lanczos3"` and `"stage":"transform"`, both `impl":"opencl"`, `source":"opencl"`; the classic log has no `opencl resize` or `opencl transform` line |
 | Forced refusal (`RT_STAGE_DEVICE_BUDGET_MB=16`, `RT_REQUIRE_GPU=1`) | FAIL with `impl":"host","source":"device-fallback"` |
 | No device selected (no `RT_OPENCL_ALLOW_CPU`) | SKIP |
 | `RT_STAGE_OPENCL` unset | classic backend logs `opencl resize`, no stage record; default path unchanged |
 
 The forced refusal proves the gate can fail, so the PASS is not vacuous. The
-device-versus-CPU difference on the export is 1 LSB on 96 426 of 2 534 980
-pixels (3.8%), inside the limit; the residency test's synthetic images are
-exact.
+device-versus-CPU difference is 1 LSB on 96 426 of 2 534 980 pixels (3.8%) for
+resize and on 384 601 of 10 139 424 pixels (3.8%) for transform, both inside
+the limit. The residency test's synthetic images are exact, including the
+identity transform, whose assertion was mutation-checked.
 
 ## Not run, and why
 

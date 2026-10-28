@@ -146,6 +146,31 @@ declines without probing the ICD, so the default path is unchanged. The parity
 and the end-to-end assertion are in `tools/opencl/verify.sh --stage-device`,
 which `--quick` also runs.
 
+## Transform node
+
+`transform` is the second device node. Its argument order is two buffers
+(three-plane F32 source and destination), eight ints (`cx`, `cy`, `sx`, `sy`,
+`oW`, `oH`, `highQuality`, `useLog`) and four doubles (`hscale`, `vscale`,
+`cost`, `sint`); `launch_transform` documents the same order.
+
+The destination-to-source map is built on the host in double precision by
+`rtengine/transformmap.h`, which the classic backend now uses as well, so the
+two paths cannot disagree about the geometry. The interpolation arithmetic
+lives once in `rtengine/stage/algorithms/transform_cl.h` and is concatenated
+into both kernel sources; only the addressing differs, because the classic
+kernel takes one buffer per plane while the device kernel takes one three-plane
+buffer with row and plane pitches.
+
+The device kernel runs a one-dimensional range, one work item per destination
+pixel, and derives `y` from the flat id. A two-dimensional `get_global_id(1)`
+against a 1-D launch silently writes only the first row, which is worth
+remembering when adding nodes: the launch and the kernel must agree.
+
+Evidence: the identity geometry is pixel-exact on the device
+(`stage-residency-test`, with a mutation check proving the assertion can fail),
+and a rotation export matches the CPU reference within 1 LSB at 16-bit on 3.8%
+of pixels; both are in `devnotes/opencl/PARITY.md`.
+
 ## Pilot stage
 
 `lanczos3` is the pilot. The arithmetic lives in
@@ -1354,12 +1379,13 @@ follow-up should give the harness a completion signal that does not depend on
   preview requests and reopen after a base has been stored.
 - Only Lanczos is exposed as a loadable stage. Denoise, wavelet, local
   adjustments and the output conversion still use the existing code paths.
-- The OpenCL device executes one node, `lanczos3` (resize). Every other node
-  has no device implementation and resolves to the host program with a reason.
-  The device path is opt-in (`RT_STAGE_OPENCL=1`) and nothing in the default
-  configuration runs on a device.
-- The classic backend and the device node cover the same resize. With
-  `RT_STAGE_OPENCL=1` and a device available the stage device runs first, so
+- The OpenCL device executes two nodes, `lanczos3` (resize) and `transform`
+  (rotation/scale). Every other node has no device implementation and resolves
+  to the host program with a reason. The device path is opt-in
+  (`RT_STAGE_OPENCL=1`) and nothing in the default configuration runs on a
+  device.
+- The classic backend and the device node cover the same resize and transform.
+  With `RT_STAGE_OPENCL=1` and a device available the stage device runs first, so
   `--gpu=auto` exports reach it; with the switch unset the classic backend
   handles the node and no stage record is emitted. The batch policy still
   follows `useOpenCL`, so `--gpu=off` disables the graph device as well.

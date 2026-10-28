@@ -86,7 +86,8 @@ Notes:
 
 ## Stage device residency
 
-The graph device path runs the `lanczos3` resize node. Device runs use
+The graph device path runs the `lanczos3` resize node and the `transform`
+rotation/scale node. Device runs use
 `RT_OPENCL_ALLOW_CPU=1` and an ICD directory that contains only `pocl.icd`
 (`OCL_ICD_VENDORS`), so the selected device is POCL's CPU device
 (`cpu-ivybridge-Intel(R) Core(TM) i7-3770 CPU @ 3.40GHz`). These are
@@ -95,7 +96,7 @@ pins the device identity; it is no longer needed to avoid the rusticl crash
 described under "Broken and unsupported ICDs", because a broken ICD is skipped.
 
 The parity gate is 1 LSB at 16-bit (1/65535 = 1.53e-5 normalised). The measured
-peak absolute error is zero:
+peak absolute error is zero for the synthetic node tests:
 
 - The node itself, through the same `stage::run()` entry point that
   `ImProcFunctions::Lanczos` uses, on a synthetic 128x96 three-plane F32 image
@@ -117,13 +118,21 @@ peak absolute error is zero:
   Forcing a refusal (`RT_STAGE_DEVICE_BUDGET_MB=16`) records `impl=host`,
   `source=device-fallback`; the gate then reports FAIL when `RT_REQUIRE_GPU=1`
   and SKIP otherwise, so the assertion is not vacuous.
+- The device `transform` node is pixel-exact for identity geometry on a
+  synthetic three-plane image, which `stage-residency-test` asserts; rotating
+  it by 0.05 radians makes that test fail, so the assertion is not vacuous. A
+  16-bit TIFF export with the rotate profile, against `--gpu=off`, has a peak
+  error of 1 LSB16 on 384 601 of 10 139 424 pixels (3.8%), the same order as
+  the classic GPU path. The interpolation helpers and the map builder are
+  shared with the classic backend, so only the addressing differs.
 - `tools/opencl/verify.sh --stage-device`, which `--quick` also runs, asserts
-  the record and the parity in one step:
+  both records and their parity in one step:
 
   ```bash
   RT_BUILD_DIR=... RT_OPENCL_ALLOW_CPU=1 OCL_ICD_VENDORS=<pocl-only> \
       tools/opencl/verify.sh --stage-device
-  # PASS  pef/stage-device  max_pae=1.5259e-05
+  # PASS  pef/stage-device-resize     max_pae=1.5259e-05
+  # PASS  pef/stage-device-transform  max_pae=1.5259e-05
   ```
 - The preview sweep (16 states, 32 images) and the crop harness (30 PPM files)
   are identical with the switch off and on, but neither graph runs a stage-ABI
