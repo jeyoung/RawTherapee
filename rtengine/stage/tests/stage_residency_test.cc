@@ -11,12 +11,17 @@
 #include "stage_opencl_device.h"
 #include "stage_runtime.h"
 
+#include "image8.h"
+#include "image16.h"
+#include "imagefloat.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -24,6 +29,13 @@ namespace
 {
 
 using namespace rtengine::stage;
+
+using rtengine::Image8;
+using rtengine::Image16;
+using rtengine::Imagefloat;
+using rtengine::TI_Bilinear;
+using rtengine::TI_Nearest;
+using rtengine::TypeInterpolation;
 
 int failures = 0;
 int skipped = 0;
@@ -1051,6 +1063,427 @@ void test_thumbnail_permute_u8(bool available)
           "thumbnail transform (8-bit) matches the rotate/flip reference");
 }
 
+/* --------------------------------------------------------- thumbnail scale */
+
+/*
+ * thumbnail.scale and thumbnail.scale.u8 reproduce `IImage::resizeImgTo`, so
+ * the device output is compared with that production template rather than with
+ * a reimplementation of the loop. The fixture covers both ends of the range,
+ * the midpoint and, for a float source, a NaN, which the float destination
+ * conversion turns into zero.
+ */
+
+constexpr int SCALE_SRC_WIDTH = 40;
+constexpr int SCALE_SRC_HEIGHT = 24;
+constexpr int SCALE_DOWN_WIDTH = 23;
+constexpr int SCALE_DOWN_HEIGHT = 14;
+constexpr int SCALE_UP_WIDTH = 61;
+constexpr int SCALE_UP_HEIGHT = 37;
+constexpr int SCALE_NAN_X = 5;
+constexpr int SCALE_NAN_Y = 3;
+/* One LSB of the 16-bit scale, the recorded tolerance for planar bilinear. */
+constexpr double SCALE_TOLERANCE_LSB16 = 1.0;
+
+struct ScaleTarget {
+    int width;
+    int height;
+    const char* label;
+};
+
+const ScaleTarget SCALE_TARGETS[] = {
+    {SCALE_DOWN_WIDTH, SCALE_DOWN_HEIGHT, "downscale"},
+    {SCALE_UP_WIDTH, SCALE_UP_HEIGHT, "upscale"},
+    {SCALE_SRC_WIDTH, SCALE_SRC_HEIGHT, "same size"}};
+
+struct ScaleMismatch {
+    std::size_t samples = 0;
+    std::size_t differing = 0;
+    std::size_t non_finite = 0;
+    double max_abs = 0.0;
+
+    bool exact() const
+    {
+        return differing == 0 && non_finite == 0;
+    }
+};
+
+/* Deterministic spread over the whole range, so no value depends on luck. */
+unsigned scale_value(int x, int y, int plane, unsigned max_value)
+{
+    const std::uint32_t hash =
+        static_cast<std::uint32_t>(x) * 2654435761u ^
+        static_cast<std::uint32_t>(y) * 40503u ^
+        static_cast<std::uint32_t>(plane + 1) * 2246822519u;
+    return hash % (max_value + 1u);
+}
+
+unsigned char* scale_pixel(Image8& image, int plane, int y, int x)
+{
+    return &image.data[(static_cast<std::size_t>(y) * image.getWidth() + x) * 3 +
+                       plane];
+}
+
+const unsigned char* scale_pixel(const Image8& image, int plane, int y, int x)
+{
+    return &image.data[(static_cast<std::size_t>(y) * image.getWidth() + x) * 3 +
+                       plane];
+}
+
+unsigned short* scale_row(Image16& image, int plane, int y)
+{
+    return plane == 0 ? image.r(y) : plane == 1 ? image.g(y) : image.b(y);
+}
+
+const unsigned short* scale_row(const Image16& image, int plane, int y)
+{
+    return plane == 0 ? image.r(y) : plane == 1 ? image.g(y) : image.b(y);
+}
+
+float* scale_row(Imagefloat& image, int plane, int y)
+{
+    return plane == 0 ? image.r(y) : plane == 1 ? image.g(y) : image.b(y);
+}
+
+const float* scale_row(const Imagefloat& image, int plane, int y)
+{
+    return plane == 0 ? image.r(y) : plane == 1 ? image.g(y) : image.b(y);
+}
+
+void fill_scale_source(Image8& image)
+{
+    for (int plane = 0; plane < 3; ++plane) {
+        for (int y = 0; y < image.getHeight(); ++y) {
+            for (int x = 0; x < image.getWidth(); ++x) {
+                *scale_pixel(image, plane, y, x) = static_cast<unsigned char>(
+                    scale_value(x, y, plane, 255u));
+            }
+        }
+    }
+    /* Both ends, the midpoint and its neighbour, which is where rounding and
+     * truncation show up first. */
+    *scale_pixel(image, 0, 0, 0) = 0;
+    *scale_pixel(image, 0, 0, 1) = 255;
+    *scale_pixel(image, 0, 0, 2) = 128;
+    *scale_pixel(image, 0, 1, 0) = 129;
+    *scale_pixel(image, 1, 1, 1) = 1;
+    *scale_pixel(image, 2, 1, 2) = 254;
+}
+
+void fill_scale_source(Image16& image)
+{
+    for (int plane = 0; plane < 3; ++plane) {
+        for (int y = 0; y < image.getHeight(); ++y) {
+            unsigned short* row = scale_row(image, plane, y);
+            for (int x = 0; x < image.getWidth(); ++x) {
+                row[x] = static_cast<unsigned short>(
+                    scale_value(x, y, plane, 65535u));
+            }
+        }
+    }
+    *scale_row(image, 0, 0) = 0;
+    scale_row(image, 0, 0)[1] = 65535;
+    scale_row(image, 0, 0)[2] = 32768;
+    scale_row(image, 0, 1)[0] = 32769;
+    scale_row(image, 1, 1)[1] = 1;
+    scale_row(image, 2, 1)[2] = 65534;
+}
+
+void fill_scale_source(Imagefloat& image)
+{
+    for (int plane = 0; plane < 3; ++plane) {
+        for (int y = 0; y < image.getHeight(); ++y) {
+            float* row = scale_row(image, plane, y);
+            for (int x = 0; x < image.getWidth(); ++x) {
+                row[x] = static_cast<float>(
+                    scale_value(x, y, plane, 65535u));
+            }
+        }
+    }
+    *scale_row(image, 0, 0) = 0.0f;
+    scale_row(image, 0, 0)[1] = 65535.0f;
+    scale_row(image, 0, 0)[2] = 32768.0f;
+    scale_row(image, 0, 1)[0] = 32769.0f;
+    scale_row(image, 1, 1)[1] = 1.0f;
+    scale_row(image, 1, SCALE_NAN_Y)[SCALE_NAN_X] =
+        std::numeric_limits<float>::quiet_NaN();
+    /*
+     * An infinity separates the same-size conversion from the resampling
+     * branches: the reference converts it unchanged, while a blend would
+     * multiply it by a zero weight and produce a NaN.
+     */
+    scale_row(image, 2, 0)[3] = std::numeric_limits<float>::infinity();
+}
+
+/* Copy a fixture through the image's own strides, so a wrong view pitch in
+ * production shows up as a mismatch rather than being mirrored here. */
+void copy_scale_source(const Image8& image, const RtStageBuffer& buffer)
+{
+    const std::size_t row_bytes = static_cast<std::size_t>(image.getWidth()) * 3;
+    for (int y = 0; y < image.getHeight(); ++y) {
+        std::memcpy(static_cast<unsigned char*>(buffer.data) +
+                        static_cast<std::size_t>(y) * buffer.row_pitch,
+                    image.data + static_cast<std::size_t>(y) * row_bytes,
+                    row_bytes);
+    }
+}
+
+void copy_scale_source(const Image16& image, const RtStageBuffer& buffer)
+{
+    const std::size_t row_bytes =
+        static_cast<std::size_t>(image.getWidth()) * sizeof(unsigned short);
+    for (int plane = 0; plane < 3; ++plane) {
+        for (int y = 0; y < image.getHeight(); ++y) {
+            std::memcpy(static_cast<unsigned char*>(buffer.data) +
+                            static_cast<std::size_t>(plane) * buffer.plane_pitch +
+                            static_cast<std::size_t>(y) * buffer.row_pitch,
+                        scale_row(image, plane, y), row_bytes);
+        }
+    }
+}
+
+void copy_scale_source(const Imagefloat& image, const RtStageBuffer& buffer)
+{
+    const std::size_t row_bytes =
+        static_cast<std::size_t>(image.getWidth()) * sizeof(float);
+    for (int plane = 0; plane < 3; ++plane) {
+        for (int y = 0; y < image.getHeight(); ++y) {
+            std::memcpy(static_cast<unsigned char*>(buffer.data) +
+                            static_cast<std::size_t>(plane) * buffer.plane_pitch +
+                            static_cast<std::size_t>(y) * buffer.row_pitch,
+                        scale_row(image, plane, y), row_bytes);
+        }
+    }
+}
+
+ScaleMismatch compare_scale(const RtStageBuffer& device, const Image8& reference)
+{
+    ScaleMismatch mismatch;
+    for (int plane = 0; plane < 3; ++plane) {
+        for (int y = 0; y < reference.getHeight(); ++y) {
+            for (int x = 0; x < reference.getWidth(); ++x) {
+                const unsigned char expected = *scale_pixel(reference, plane, y, x);
+                const unsigned char actual =
+                    *(static_cast<const unsigned char*>(device.data) +
+                      static_cast<std::size_t>(y) * device.row_pitch +
+                      static_cast<std::size_t>(x) * 3 + plane);
+                ++mismatch.samples;
+                if (actual != expected) {
+                    ++mismatch.differing;
+                    mismatch.max_abs = std::max(
+                        mismatch.max_abs,
+                        std::fabs(static_cast<double>(actual) -
+                                  static_cast<double>(expected)));
+                }
+            }
+        }
+    }
+    return mismatch;
+}
+
+ScaleMismatch compare_scale(const RtStageBuffer& device,
+                            const Imagefloat& reference)
+{
+    ScaleMismatch mismatch;
+    for (int plane = 0; plane < 3; ++plane) {
+        for (int y = 0; y < reference.getHeight(); ++y) {
+            const float* expected_row = scale_row(reference, plane, y);
+            const float* actual_row = reinterpret_cast<const float*>(
+                static_cast<const unsigned char*>(device.data) +
+                static_cast<std::size_t>(plane) * device.plane_pitch +
+                static_cast<std::size_t>(y) * device.row_pitch);
+            for (int x = 0; x < reference.getWidth(); ++x) {
+                ++mismatch.samples;
+                const float actual = actual_row[x];
+                const float expected = expected_row[x];
+                /* Identical samples, including a shared infinity, are exact. */
+                if (actual == expected) {
+                    continue;
+                }
+                const double delta =
+                    std::fabs(static_cast<double>(actual) -
+                              static_cast<double>(expected));
+                if (!std::isfinite(delta)) {
+                    ++mismatch.non_finite;
+                    continue;
+                }
+                if (delta > 0.0) {
+                    ++mismatch.differing;
+                }
+                mismatch.max_abs = std::max(mismatch.max_abs, delta);
+            }
+        }
+    }
+    return mismatch;
+}
+
+/* Submit one scale node and require that the device executed it. */
+void submit_scale(StageQueue& queue, const char* node, const RtStageBuffer& source,
+                  const RtStageBuffer& dst, TypeInterpolation interp)
+{
+    StageRequest request;
+    request.name = node;
+    request.args = {buffer_arg(source), buffer_arg(dst),
+                    int_arg(static_cast<std::int64_t>(interp))};
+
+    StageEvent event = queue.submit(request, nullptr);
+    const std::string label = std::string(node) + " executes on the device";
+    check(event.device == StageDeviceType::OPENCL, label.c_str());
+    check(event.succeeded(), (std::string(node) + " completed").c_str());
+    check(!event.asynchronous,
+          (std::string(node) + " waits inside the launcher").c_str());
+    check(queue.wait(event) == RT_STAGE_OK,
+          (std::string(node) + " reports OK").c_str());
+}
+
+void report_scale(const char* node, const ScaleTarget& target,
+                  TypeInterpolation interp, const ScaleMismatch& mismatch,
+                  bool exact_required)
+{
+    const char* interp_label = interp == TI_Nearest ? "nearest" : "bilinear";
+    std::printf("stage-residency: %s %s %s: PAE %.6f LSB16, "
+                "%zu of %zu samples differ, %zu non-finite\n",
+                node, target.label, interp_label, mismatch.max_abs,
+                mismatch.differing, mismatch.samples, mismatch.non_finite);
+
+    const std::string label =
+        std::string(node) + " " + target.label + " " + interp_label;
+    if (exact_required) {
+        check(mismatch.exact(), (label + " is bit-exact").c_str());
+    } else {
+        check(mismatch.non_finite == 0 &&
+                  mismatch.max_abs <= SCALE_TOLERANCE_LSB16,
+              (label + " stays within one LSB16").c_str());
+    }
+}
+
+/*
+ * A packed 8-bit source is the lossy reference: the blend is stored in the
+ * source type, so both destinations must reproduce it exactly.
+ */
+void run_scale_u8_cases(StageQueue& queue, StageBufferAllocator& host)
+{
+    Image8 source(SCALE_SRC_WIDTH, SCALE_SRC_HEIGHT);
+    fill_scale_source(source);
+    RtStageBuffer source_buffer =
+        host.allocate({RT_STAGE_U8, SCALE_SRC_WIDTH, SCALE_SRC_HEIGHT, 1});
+    if (source_buffer.data == nullptr) {
+        check(false, "thumbnail scale 8-bit source fixture allocates");
+        return;
+    }
+    copy_scale_source(source, source_buffer);
+
+    for (const ScaleTarget& target : SCALE_TARGETS) {
+        for (TypeInterpolation interp : {TI_Nearest, TI_Bilinear}) {
+            Image8 reference8(target.width, target.height);
+            source.resizeImgTo(target.width, target.height, interp, &reference8);
+            RtStageBuffer device8 =
+                host.allocate({RT_STAGE_U8, target.width, target.height, 1});
+            submit_scale(queue, "thumbnail.scale.u8", source_buffer, device8,
+                         interp);
+            report_scale("thumbnail.scale.u8", target, interp,
+                         compare_scale(device8, reference8), true);
+            host.release(device8);
+
+            Imagefloat referencef(target.width, target.height);
+            source.resizeImgTo(target.width, target.height, interp, &referencef);
+            RtStageBuffer devicef =
+                host.allocate({RT_STAGE_F32, target.width, target.height, 3});
+            submit_scale(queue, "thumbnail.scale", source_buffer, devicef,
+                         interp);
+            report_scale("thumbnail.scale (8-bit source)", target, interp,
+                         compare_scale(devicef, referencef), true);
+            host.release(devicef);
+        }
+    }
+    host.release(source_buffer);
+}
+
+void run_scale_u16_cases(StageQueue& queue, StageBufferAllocator& host)
+{
+    Image16 source(SCALE_SRC_WIDTH, SCALE_SRC_HEIGHT);
+    fill_scale_source(source);
+    RtStageBuffer source_buffer =
+        host.allocate({RT_STAGE_U16, SCALE_SRC_WIDTH, SCALE_SRC_HEIGHT, 3});
+    if (source_buffer.data == nullptr) {
+        check(false, "thumbnail scale 16-bit source fixture allocates");
+        return;
+    }
+    copy_scale_source(source, source_buffer);
+
+    for (const ScaleTarget& target : SCALE_TARGETS) {
+        const bool same_size = target.width == SCALE_SRC_WIDTH &&
+                               target.height == SCALE_SRC_HEIGHT;
+        for (TypeInterpolation interp : {TI_Nearest, TI_Bilinear}) {
+            Imagefloat reference(target.width, target.height);
+            source.resizeImgTo(target.width, target.height, interp, &reference);
+            RtStageBuffer device =
+                host.allocate({RT_STAGE_F32, target.width, target.height, 3});
+            submit_scale(queue, "thumbnail.scale", source_buffer, device, interp);
+            report_scale("thumbnail.scale (16-bit source)", target, interp,
+                         compare_scale(device, reference),
+                         interp == TI_Nearest || same_size);
+            host.release(device);
+        }
+    }
+    host.release(source_buffer);
+}
+
+void run_scale_f32_cases(StageQueue& queue, StageBufferAllocator& host)
+{
+    Imagefloat source(SCALE_SRC_WIDTH, SCALE_SRC_HEIGHT);
+    fill_scale_source(source);
+    RtStageBuffer source_buffer =
+        host.allocate({RT_STAGE_F32, SCALE_SRC_WIDTH, SCALE_SRC_HEIGHT, 3});
+    if (source_buffer.data == nullptr) {
+        check(false, "thumbnail scale float source fixture allocates");
+        return;
+    }
+    copy_scale_source(source, source_buffer);
+
+    for (const ScaleTarget& target : SCALE_TARGETS) {
+        const bool same_size = target.width == SCALE_SRC_WIDTH &&
+                               target.height == SCALE_SRC_HEIGHT;
+        for (TypeInterpolation interp : {TI_Nearest, TI_Bilinear}) {
+            Imagefloat reference(target.width, target.height);
+            source.resizeImgTo(target.width, target.height, interp, &reference);
+            RtStageBuffer device =
+                host.allocate({RT_STAGE_F32, target.width, target.height, 3});
+            submit_scale(queue, "thumbnail.scale", source_buffer, device, interp);
+            report_scale("thumbnail.scale (float source)", target, interp,
+                         compare_scale(device, reference),
+                         interp == TI_Nearest || same_size);
+            host.release(device);
+        }
+    }
+    host.release(source_buffer);
+}
+
+void test_thumbnail_scale(bool available)
+{
+    using namespace rtengine::stage;
+
+    if (!available) {
+        skip("thumbnail scale: no OpenCL device");
+        return;
+    }
+
+    const std::vector<std::string> nodes = opencl_stage_nodes();
+    check(std::find(nodes.begin(), nodes.end(), "thumbnail.scale") != nodes.end(),
+          "thumbnail.scale is registered as a device node");
+    check(std::find(nodes.begin(), nodes.end(), "thumbnail.scale.u8") !=
+              nodes.end(),
+          "thumbnail.scale.u8 is registered as a device node");
+
+    auto queue = opencl_device()->create_queue();
+    check(queue->type() == StageDeviceType::OPENCL,
+          "the thumbnail scale cases run on the OpenCL queue");
+
+    StageBufferAllocator host(StageDeviceType::CPU);
+    run_scale_u8_cases(*queue, host);
+    run_scale_u16_cases(*queue, host);
+    run_scale_f32_cases(*queue, host);
+}
+
 /* ------------------------------------------------------------ selection */
 
 void test_selection(bool available)
@@ -1435,6 +1868,7 @@ int main()
     test_thumbnail_wb(available);
     test_thumbnail_permute(available);
     test_thumbnail_permute_u8(available);
+    test_thumbnail_scale(available);
     test_selection(available);
     test_residency();
     test_node_parity(available);
