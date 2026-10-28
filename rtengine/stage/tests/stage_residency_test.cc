@@ -531,6 +531,51 @@ void test_device_events(bool available)
           "an unimplemented node explains the fallback");
 }
 
+/*
+ * Identity geometry must reproduce the source exactly: at a zero fractional
+ * offset the cubic weights pick the sample itself, so any difference is an
+ * addressing or pitch bug rather than interpolation error.
+ */
+void test_transform_identity(bool available)
+{
+    using namespace rtengine::stage;
+
+    if (!available) {
+        skip("transform identity: no OpenCL device");
+        return;
+    }
+
+    auto queue = opencl_device()->create_queue();
+    StageBufferAllocator host(StageDeviceType::CPU);
+    std::string error;
+    constexpr int WIDTH = 40;
+    constexpr int HEIGHT = 24;
+    RtStageBuffer source =
+        host.allocate({RT_STAGE_F32, WIDTH, HEIGHT, 3}, &error);
+    RtStageBuffer output =
+        host.allocate({RT_STAGE_F32, WIDTH, HEIGHT, 3}, &error);
+    fill(source, 23u);
+
+    StageRequest request;
+    request.name = "transform";
+    request.args = {
+        buffer_arg(source), buffer_arg(output),
+        /* cx, cy, sx, sy, oW, oH, highQuality, useLog */
+        int_arg(0), int_arg(0), int_arg(0), int_arg(0),
+        int_arg(WIDTH), int_arg(HEIGHT), int_arg(1), int_arg(0),
+        /* hscale, vscale, cost, sint */
+        double_arg(1.0), double_arg(1.0), double_arg(1.0), double_arg(0.0)
+    };
+
+    StageEvent event = queue->submit(request, nullptr);
+    check(event.asynchronous, "the transform submission is asynchronous");
+    check(queue->wait(event) == RT_STAGE_OK, "the transform wait reports OK");
+
+    const Diff diff = compare(source, output);
+    check(diff.max_abs == 0.0, "identity transform is exact");
+    check(diff.differing == 0, "identity transform changes no sample");
+}
+
 /* ------------------------------------------------------------ selection */
 
 void test_selection(bool available)
@@ -910,6 +955,7 @@ int main()
     test_failed_event();
     test_icd_robustness(available, reason);
     test_device_events(available);
+    test_transform_identity(available);
     test_selection(available);
     test_residency();
     test_node_parity(available);
