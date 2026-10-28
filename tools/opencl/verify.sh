@@ -217,7 +217,10 @@ quick() {
     expect_stage=0
     expect_stage_name=""
     run_monitor
-    run_stage_device "pef/stage-device"
+    run_stage_device "pef/stage-device-resize" \
+        "$ROOT/devnotes/opencl/pp3/resize.pp3" lanczos3
+    run_stage_device "pef/stage-device-transform" \
+        "$ROOT/devnotes/opencl/pp3/rotate.pp3" transform
 }
 
 stage() {
@@ -329,10 +332,13 @@ monitor() {
 # node must appear with impl="opencl"; impl="host" means the device declined
 # and the built-in or module ran instead, which is a SKIP unless a GPU is
 # required.
+#
+# Usage: run_stage_device <label> <profile> <node>
 run_stage_device() {
     local label="$1"
+    local profile="$2"
+    local node="$3"
     local sample="${sample_override:-$TESTDATA/colorspace_flowers.pef}"
-    local profile="$ROOT/devnotes/opencl/pp3/resize.pp3"
 
     [ -f "$sample" ] || die "missing $sample (run tools/opencl/fetch-testdata.sh)"
     [ -f "$profile" ] || die "missing profile $profile"
@@ -367,15 +373,15 @@ run_stage_device() {
         return 1
     fi
 
-    if [ ! -s "$record" ] || ! grep -q '"stage":"lanczos3"' "$record"; then
-        printf 'FAIL\t%s\tno stage record for lanczos3\n' "$label"
+    if [ ! -s "$record" ] || ! grep -q "\"stage\":\"${node}\"" "$record"; then
+        printf 'FAIL\t%s\tno stage record for %s\n' "$label" "$node"
         rm -rf "$outdir"
         return 1
     fi
 
-    if ! grep -Eq '"stage":"lanczos3".*"impl":"opencl"' "$record"; then
+    if ! grep -Eq "\"stage\":\"${node}\".*\"impl\":\"opencl\"" "$record"; then
         local why
-        why="$(grep '"stage":"lanczos3"' "$record" | head -1)"
+        why="$(grep "\"stage\":\"${node}\"" "$record" | head -1)"
         rm -rf "$outdir"
         if [ "${RT_REQUIRE_GPU:-0}" = "1" ]; then
             printf 'FAIL\t%s\tstage device did not execute: %s\n' "$label" "$why"
@@ -398,7 +404,10 @@ stage_device() {
     printf 'binary\t%s\n' "$cli"
     "$cli" --gpu-info | tail -n +2 | sed 's/^/gpu\t/'
     detect_device
-    run_stage_device "pef/stage-device"
+    run_stage_device "pef/stage-device-resize" \
+        "$ROOT/devnotes/opencl/pp3/resize.pp3" lanczos3
+    run_stage_device "pef/stage-device-transform" \
+        "$ROOT/devnotes/opencl/pp3/rotate.pp3" transform
 }
 
 rgbproc() {
