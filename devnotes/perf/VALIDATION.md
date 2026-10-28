@@ -133,8 +133,33 @@ This is POCL CPU parity only and is labelled as such. It is not GPU evidence.
 - Multi-threaded export parity: export is non-deterministic in the baseline, so
   parity runs are single-threaded by design.
 
-## Decisions recorded with this validation
+## Publication scan
 
+Scope: the complete `origin/perf-graph..HEAD` range (83 commits at the time of
+the scan), the working tree, every commit message, every author and committer
+identity, the tracked test-data manifest and the provider-side content on
+`origin` (24 issues, no pull requests, no releases).
+
+| Check | Result |
+|---|---|
+| Private keys, cloud and forge tokens | none |
+| Absolute home paths (`/home/`, `/Users/`, drive paths) | none |
+| Private corpus names and hashes | none |
+| IPv4 addresses | none |
+| Email addresses in added lines | none |
+| Authors and committers | `Eddy Young <jeyoung@users.noreply.github.com>` only |
+| Commit messages | clean |
+| Provider-side issues, PRs, releases | clean |
+| `devnotes/opencl/testdata.manifest` | public rows only |
+
+The private rows that were published earlier remain in the history before
+`origin/perf-graph` (`cf40fbc36` added them, `dd031f371` removed them). That is
+a recorded incident, not a new finding; per the publication policy the pushed
+history is not rewritten and the current content is clean.
+
+No push was performed in this session.
+
+## Decisions recorded with this validation
 - `RT_WORK_SHADOW` is kept as a diagnostic marker with no engine effect. It
   exists so the sweep harness can report the mode of a recorded run; the
   comments that implied it turned on a second authority were corrected.
