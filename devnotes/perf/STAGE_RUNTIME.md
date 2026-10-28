@@ -270,7 +270,7 @@ Evidence:
 
 | Case | Result |
 |---|---|
-| device test, four shapes including odd and even deltas and one equal dimension | device execution, `device=OPENCL`, PAE 0.000000 LSB16, 0 of 3840, 3840, 2673 and 2856 samples differ from `ImProcFunctions::drawFrame()` |
+| device test, five shapes: odd and even deltas, both dimensions smaller, a per-channel border and one shape with a zero offset on one axis | device execution, `device=OPENCL`, PAE 0.000000 LSB16, 0 of 3840, 3840, 2673, 2856 and 1938 samples differ from `ImProcFunctions::drawFrame()` |
 | equal-size and source-larger early returns | both return the source pointer unchanged with the node selected, so the node is never entered |
 | production call site with the node selected | 0 of the same samples differ from the CPU `drawFrame()` output |
 | `verify.sh --stage-device` with `framing.pp3` | PASS, `"stage":"framing".*"impl":"opencl"`, `max_pae=1.5259e-05` on a 1080x725 frame |
