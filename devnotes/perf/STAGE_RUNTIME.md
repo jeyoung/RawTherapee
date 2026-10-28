@@ -271,6 +271,24 @@ otherwise, so the next session does not start from that assumption:
   one block.
 - `thumbnail.decode` is a JPEG decode, not a kernel.
 
+## Thumbnail coarse transform
+
+`thumbnail.transform` covers the full thumbnail path (three-plane F32) and
+`thumbnail.transform.u8` the embedded-JPEG quick path (packed U8). Both express
+the rotate-then-flip composition of `IImage::rotate`, `hflip` and `vflip` as one
+destination-to-source mapping, so the whole coarse transform is a single pass.
+The call sites allocate the destination (the dimensions swap for 90 and 270),
+run the node and swap the image pointer.
+
+The kernels are device-tested for all sixteen rotation/flip combinations in
+both formats against an independent mapping; disabling the 90-degree branch
+makes the float test fail on 2 880 samples. The browser path could not be made
+to produce a device record in the harness: a sidecar with `[Coarse] Rotate=90`
+changed the thumbnail cache key but no `thumbnail.transform` record appeared,
+so the harness did not reach those call sites. The node is therefore verified by
+the device test and by compilation, and the GUI path is recorded as uncovered
+rather than passed.
+
 ## Pilot stage
 
 `lanczos3` is the pilot. The arithmetic lives in
