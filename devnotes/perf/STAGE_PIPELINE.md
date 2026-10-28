@@ -58,6 +58,13 @@ A block's runtime node name can differ from its id; the name is given where it
 does. `partial` never means verified: it records device execution of the named
 sub-nodes and the residual beside it, not parity of the composite.
 
+`output.sharpen` is partial: the device runs the unsupported-mask path with
+`method=usm`, no edges-only, no halo control, no show-mask, `blurradius < 0.25`
+and `radius / scale < 25`. RLD, edges-only, halo control, show-mask,
+`blurradius >= 0.25` and `radius / scale >= 25` are host residuals; they run
+the `output.sharpen` host builtin and are recorded as `impl=host`, never as a
+device pass.
+
 | Id | Domain (export/preview/crop/thumbnail) | Consumer | Reuse | Role | Device |
 |----|----------------------------------------|----------|-------|------|--------|
 | `source.select` | Full/Full/Full/Full | path | recompute | select the frame to process | no |
@@ -78,7 +85,7 @@ sub-nodes and the residual beside it, not parity of the composite.
 | `output.convert` | Full/-/-/- | exact | reuse-output | Lab to output RGB and output profile conversion | yes |
 | `crop` | Full/-/-/- | exact | reuse-output | crop | no |
 | `resize` | Full/-/-/- | exact | reuse-output | resize (`lanczos3`) | yes |
-| `output.sharpen` | Full/-/-/- | exact | reuse-input | post-resize sharpening | no |
+| `output.sharpen` | Full/-/-/- | exact | reuse-input | post-resize sharpening (`output.sharpen`); USM without residual switches | partial |
 | `framing` | Full/-/-/- | exact | reuse-output | framing and frame drawing | yes |
 | `output.icc` | Full/-/-/- | exact | recompute | attach output ICC and metadata | no |
 | `monitor.output` | -/Full/-/- | interactive | recompute | Lab to monitor RGB | yes |

@@ -351,6 +351,84 @@ The device test's synthetic Lab content is L in [0, 32768] and a, b in
 [-16384, 16384], which saturates the compression. There is no residual for the
 block: the whole end-of-process gamut pass is the node.
 
+## Output sharpening
+
+`output.sharpen` runs the unsupported-mask path of
+`ImProcFunctions::sharpening()`. The CPU body was extracted unchanged into
+`rtengine::sharpen_luminance()` in `rtengine/sharpen_core.h`, so the call site,
+the host builtin and the device comparison use one algorithm. The call site in
+`ipsharpen.cc` builds the node arguments after the existing early returns and
+returns when the node reports `RT_STAGE_OK`; otherwise it runs the extracted
+core directly. `simpleprocess.cc` keeps its L clamp before the call.
+
+The ABI is `[0]` a one-plane F32 L buffer, read and written in place, then the
+scalars `[1]` method (0 USM, 1 RLD), `[2]` amount, `[3]` contrast, `[4]` radius,
+`[5]` blur radius, `[6..9]` the four threshold values, `[10]` the four-value
+threshold form, `[11]` threshold start-at-one, `[12]` edges-only, `[13]` edge
+radius, `[14]` edge tolerance, `[15]` halo control, `[16]` halo amount,
+`[17]` deconvolution amount, `[18]` deconvolution radius, `[19]`
+deconvolution iterations, `[20]` deconvolution damping, `[21]` automatic
+deconvolution radius, `[22]` corner boost, `[23]` corner latitude, `[24]`
+scale and `[25]` show-mask. The host parameter builder rejects a method outside
+the enum; the decoder validates the argument kinds, the one-plane F32 buffer
+and every 0/1 flag.
+
+The host builtin reconstructs the whole `SharpeningParams` set, including the
+residual fields, and calls `sharpen_luminance()`. It therefore covers RLD,
+edges-only, halo control and show-mask with the CPU arithmetic. When the device
+declines any of those, the device queue runs this builtin on the host queue and
+`stage::run()` records `impl=host`, `source=device-fallback`; a device pass is
+never mixed with a host pass in one node call.
+
+The device supports `method=usm`, no edges-only, no halo control, no show-mask,
+`blurradius < 0.25` and `radius / scale < 25`; `radius / scale >= 25` follows
+the CPU `GAUSS_DOUBLE` limit. RLD, edges-only, halo control, show-mask,
+`blurradius >= 0.25` and the sigma limit are named residuals in
+`stage/algorithms/sharpen_cl.h`.
+
+Kernels, in one program:
+
+- `rt_sharpen_mask` reproduces `buildBlendMask()` with `autoContrast` off: the
+  four-direction gradient, the float scale `0.0625 / 327.68`, the sigmoid
+  blend factor and the CPU border replication. A zero contrast threshold
+  writes a flat mask and skips its blur.
+- `rt_sharpen_iir_line` is the separable Young-van Vliet recurrence for both
+  axes. A line advances by one sample horizontally and by the row pitch
+  vertically, so padded rows are handled explicitly.
+- `rt_sharpen_fir3` reproduces `gauss3x3()` for distinct source and
+  destination, including the horizontal first and last rows, the vertical
+  first and last columns and the copied corners.
+- `rt_sharpen_apply` evaluates `min(fabs(diff), 2000)`, the threshold mapping
+  and `intp(a, b, c) = a * (b - c) + c` in the CPU order, in place.
+
+The mask blur is always sigma 2. The IIR coefficients are computed on the host
+in double from the same formulae as `calculateYvVFactors()` in `gauss.cc`, and
+uploaded as floats. The `M` scaling matches the SSE implementation that ships
+on x86-64, because that is the production path the device is compared against;
+starting the recurrence, the forward pass, the boundary correction and the
+backward pass keep the host order. The 3x3 kernel coefficients are the
+normalized `gauss3x3()` constants. `GAUSS_SKIP` (0.25) becomes an identity
+copy, which the apply kernel implements by leaving `diff` at zero. The mask,
+the blur and the IIR intermediate are device scratch; only the L plane is
+uploaded and read back.
+
+Evidence:
+
+| Case | Result |
+|---|---|
+| device test, 25 cases: defaults, radius 0.3/0.5/0.59/0.6/1.15/3.0, contrast 0/20/100, amounts 1/100/200/1000, threshold breakpoints and the two-value form, widths 8/63/64/65 and padded 238, sigma 0.25 and a skip case | worst PAE 0.824219 LSB16 (threshold two-value), next 0.664062 (amount 1000); width 8..238 at or below 0.136719; 1953 to 5712 samples per case |
+| identity and flat-mask cases (contrast 0, threshold zeros, sigma below `GAUSS_SKIP`) | bit-exact, 0 differing samples |
+| residual request through `stage::run()` with `halocontrol=true`, RLD and `blurradius=0.3` | `impl=host`, `source=device-fallback`; output bit-identical to both the production CPU path and the extracted core |
+| supported request through `stage::run()` | record `impl=opencl`, `source=opencl`; within 1 LSB16 of the CPU path |
+| `verify.sh --stage-device`, POCL CPU, `RT_REQUIRE_GPU=1`, `OMP_NUM_THREADS=1`, `sharpen-usm.pp3` | PASS, `max_pae=1.5259e-05` on a 1944x1304 frame; record `"stage":"output.sharpen","impl":"opencl","source":"opencl"` |
+| the same gate with `sharpen-rld.pp3` | `impl=host`, `source=device-fallback`; printed as a host residual and not counted as device parity |
+| pure CPU refactor, USM and RLD profiles, `--gpu=off`, `OMP_NUM_THREADS=1` | normalized 16-bit pixel hashes identical before and after: USM `24ffef79d50c678b4dea72d5e3f047ae32a4a34c0fd4b11c248ba1c500cb093f`, RLD `d0e6555e96fe7ab393cedea13bd4b1d6b45e80faac86af456d8e67b962816b30` |
+
+The threshold mapping uses double when the device advertises `cl_khr_fp64`,
+which POCL does, and float otherwise; the fallback only affects the final
+rounding of a sample. A device that cannot build the program falls back to the
+host builtin, so the node still produces the CPU result.
+
 ## Thumbnail white balance
 
 `thumbnail.whitebalance` applies the white-balance multipliers that the host

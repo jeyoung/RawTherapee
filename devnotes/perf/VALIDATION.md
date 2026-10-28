@@ -120,6 +120,10 @@ stage-residency: device=cpu-ivybridge ... platform=Portable Computing Language t
 stage-residency: lanczos3 scale 0.5: PAE 0.000000 LSB16, 0 of 9216 samples differ, tolerance 1.0 LSB16
 stage-residency: lanczos3 scale 1.5: PAE 0.000000 LSB16, 0 of 82944 samples differ, tolerance 1.0 LSB16
 stage-residency: gamut rec2020 238x24 (pitch 240): PAE 0.031250 LSB16, 9976 of 17136 samples differ
+stage-residency: output.sharpen defaults 63x31: PAE 0.089844 LSB16, 542 of 1953 samples differ
+stage-residency: output.sharpen threshold two values 63x31: PAE 0.824219 LSB16, 1841 of 1953 samples differ
+stage-residency: output.sharpen padded width 238 238x24: PAE 0.097656 LSB16, 1633 of 5712 samples differ
+stage-residency: output.sharpen skip sigma 63x31: PAE 0.000000 LSB16, 0 of 1953 samples differ
 stage-residency: run() parity: PAE 0.000000 LSB16, 0 of 4608 samples differ
 stage-residency-test: PASS (0 skipped)
 ```
@@ -140,12 +144,17 @@ node ran on the device rather than only comparing pixels.
 | RGB tone stage (`rgbproc-exposure`) | PASS, `max_pae=1.5259e-05` |
 | Framing (`framing.pp3`, 1080x725 frame) | PASS, `max_pae=1.5259e-05`; the record is `"stage":"framing".*"impl":"opencl"` |
 | Gamut (`gamut.pp3`, gain 0.25 EV, Rec2020 compression) | PASS, `max_pae=1.5259e-05`; the record is `"stage":"gamut","impl":"opencl","source":"opencl"` |
-| Packed 8-bit Lab to RGB | byte-exact against an independent reference, and fails when the device matrix is scaled by 1.001 |
+| Output sharpening USM (`sharpen-usm.pp3`, 0.5 scale, radius 0.5) | PASS, `max_pae=1.5259e-05`; the record is `"stage":"output.sharpen","impl":"opencl","source":"opencl"` |
+| Output sharpening RLD (`sharpen-rld.pp3`) | PASS as a host residual: `"stage":"output.sharpen","impl":"host","source":"device-fallback"`, not counted as device parity |
+| Output sharpening device test | 25 USM cases at widths 8 to 238 (including a padded 238 row), radius 0.3 to 3.0, contrast 0/20/100, amounts 1/100/200/1000 and threshold breakpoints; worst PAE 0.824219 LSB16, all finite; the flat-mask and skip cases are bit-exact |
+| Output sharpening residuals | `halocontrol=true`, RLD and `blurradius=0.3` return `impl=host` through `stage::run()` and are bit-identical to the CPU reference and the extracted core |
+| Output sharpening CPU refactor | USM and RLD exports with `--gpu=off`, `OMP_NUM_THREADS=1`: normalized 16-bit pixel hashes identical before and after |
+| Device records | `"stage":"lanczos3"`, `"stage":"transform"`, `"stage":"output.convert"`, `"stage":"gamut"`, `"stage":"framing"` and `"stage":"output.sharpen"`, all `impl":"opencl"`, `source":"opencl"`; the classic log has no `opencl resize`, `opencl transform` or `opencl lab2srgb` line |
 | `monitor.output`, `viewport.output` in the GUI | device records with `impl=opencl`, `source=opencl`; preview image area identical to a CPU-only run (0 LSB8) |
 | `thumbnail.output` via the file browser | 12 device records; thumbnail cache byte-identical to a CPU-only run |
 | `thumbnail.transform` (float and U8) | sixteen rotation/flip combinations match the reference in both formats; not reached through the GUI harness |
 | `thumbnail.whitebalance` via the file browser | device record present; the 45.7 MP NEF cache is byte-identical to a CPU-only run; the device test matches its reference exactly |
-| Device records | `"stage":"lanczos3"`, `"stage":"transform"`, `"stage":"output.convert"`, `"stage":"gamut"` and `"stage":"framing"`, all `impl":"opencl"`, `source":"opencl"`; the classic log has no `opencl resize`, `opencl transform` or `opencl lab2srgb` line |
+| Packed 8-bit Lab to RGB | byte-exact against an independent reference, and fails when the device matrix is scaled by 1.001 |
 | Forced refusal (`RT_STAGE_DEVICE_BUDGET_MB=16`, `RT_REQUIRE_GPU=1`) | FAIL, exit 1, with `"impl":"host","source":"device-fallback"` on the first refused node |
 | No device selected (no `RT_OPENCL_ALLOW_CPU`) | SKIP |
 | `RT_STAGE_OPENCL` unset | classic backend logs `opencl resize`, no stage record; default path unchanged, and at the gamut profile the export is byte-identical to the pre-change binary |
