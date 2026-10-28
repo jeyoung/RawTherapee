@@ -727,18 +727,41 @@ bool run_lanczos_stage(const RtStageBuffer& src, const RtStageBuffer& dst, float
                                 &profiling) == RT_STAGE_OK;
 }
 
+/*
+ * True when the stage device owns this node and must therefore run before the
+ * classic OpenCL backend. Both paths cover the node, and the classic one is
+ * checked first today, so without this the device implementation would never
+ * be reached. With RT_STAGE_OPENCL unset this is false and the order below is
+ * unchanged; `resolve_device()` also declines without probing the ICD when the
+ * node is not requested, so the default path pays nothing. When the switch is
+ * set and the stage cannot run at all, the call falls through to the host loop
+ * rather than to the classic backend: the request was for the stage path.
+ */
+bool stage_device_first()
+{
+    return rtengine::stage::node_device("lanczos3") ==
+           rtengine::stage::StageNodeDevice::OpenCL;
+}
+
 } // namespace
 
 void ImProcFunctions::Lanczos (const Imagefloat* src, Imagefloat* dst, float scale)
 {
 
-    if (openCLAllowed && opencl::resizeLanczos(src, dst, scale)) {
-        return;
-    }
+    if (stage_device_first()) {
+        if (run_lanczos_stage(rtengine::stage::view(*src),
+                              rtengine::stage::view(*dst), scale)) {
+            return;
+        }
+    } else {
+        if (openCLAllowed && opencl::resizeLanczos(src, dst, scale)) {
+            return;
+        }
 
-    if (run_lanczos_stage(rtengine::stage::view(*src),
-                          rtengine::stage::view(*dst), scale)) {
-        return;
+        if (run_lanczos_stage(rtengine::stage::view(*src),
+                              rtengine::stage::view(*dst), scale)) {
+            return;
+        }
     }
 
     const float delta = 1.0f / scale;
@@ -876,13 +899,20 @@ void ImProcFunctions::Lanczos (const Imagefloat* src, Imagefloat* dst, float sca
 
 void ImProcFunctions::Lanczos (const LabImage* src, LabImage* dst, float scale)
 {
-    if (openCLAllowed && opencl::resizeLanczos(src, dst, scale)) {
-        return;
-    }
+    if (stage_device_first()) {
+        if (run_lanczos_stage(rtengine::stage::view(*src),
+                              rtengine::stage::view(*dst), scale)) {
+            return;
+        }
+    } else {
+        if (openCLAllowed && opencl::resizeLanczos(src, dst, scale)) {
+            return;
+        }
 
-    if (run_lanczos_stage(rtengine::stage::view(*src),
-                          rtengine::stage::view(*dst), scale)) {
-        return;
+        if (run_lanczos_stage(rtengine::stage::view(*src),
+                              rtengine::stage::view(*dst), scale)) {
+            return;
+        }
     }
 
     const float delta = 1.0f / scale;
