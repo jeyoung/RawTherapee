@@ -2889,6 +2889,10 @@ void test_output_sharpen(bool available)
         copy_sharpen_l(source, cpu);
         run_cpu_sharpen(p, scale, cpu);
         const Diff diff = compare_sharpen_l(target, cpu);
+        std::printf("stage-residency: output.sharpen %s: %s, %zu of %zu "
+                    "samples differ\n",
+                    label, expect_device ? "device" : "host", diff.differing,
+                    diff.samples);
         check(diff.finite,
               (std::string(label) + " stays finite").c_str());
         if (expect_device) {
@@ -2903,7 +2907,7 @@ void test_output_sharpen(bool available)
             LabImage direct(63, 31);
             copy_sharpen_l(source, direct);
             rtengine::sharpen_luminance(direct.L[0], direct.W, direct.H, p,
-                                        scale, false, false);
+                                        scale, true, false);
             const Diff core_diff = compare_sharpen_l(target, direct);
             check(core_diff.differing == 0 && core_diff.max_abs == 0.0,
                   (std::string(label) + " matches the extracted core").c_str());
@@ -2929,6 +2933,123 @@ void test_output_sharpen(bool available)
         auto p = base;
         p.blurradius = 0.3;
         run_and_read(p, 1.0, false, "blur radius residual");
+    }
+    {
+        auto p = base;
+        p.edgesonly = true;
+        run_and_read(p, 1.0, false, "edges only residual");
+    }
+
+    /*
+     * The node contract is a tightly packed L plane. The extracted core and
+     * the host builtin address it with a W-sample stride, so both padded
+     * descriptors must be refused by the device launcher and by the builtin,
+     * leaving the plane untouched.
+     */
+    const auto expect_refusal = [&](const char* label, bool padded_row,
+                                    bool padded_plane,
+                                    StageNodeDevice selection) {
+        LabImage source(63, 31);
+        fill_sharpen_l(source, 23u);
+        LabImage target(63, 31);
+        copy_sharpen_l(source, target);
+
+        SharpenNodeParams node_params;
+        std::string error;
+        check(sharpen_node_params(base, 1.0, false, node_params, error),
+              (std::string(label) + " builds its parameters").c_str());
+        SharpenNodeArgs node;
+        sharpen_node_args(target.L[0], target.W, target.H, node_params, node);
+        RtStageBuffer descriptor =
+            sharpen_l_buffer(target.L[0], target.W, target.H);
+        if (padded_row) {
+            descriptor.row_pitch += 4 * sizeof(float);
+        }
+        if (padded_plane) {
+            descriptor.plane_pitch += 64;
+        }
+        node.args[SHARPEN_ARG_BUFFER].u.buffer = descriptor;
+        std::vector<RtStageArg> args(node.args, node.args + SHARPEN_NODE_ARGS);
+
+        set_node_device_override("output.sharpen", selection);
+        const RtStageStatus status = run("output.sharpen", args);
+        clear_node_device_overrides();
+
+        check(status != RT_STAGE_OK,
+              (std::string(label) + " is refused").c_str());
+        const Diff untouched = compare_sharpen_l(target, source);
+        check(untouched.differing == 0 && untouched.max_abs == 0.0,
+              (std::string(label) + " leaves the plane untouched").c_str());
+        std::printf("stage-residency: output.sharpen %s: refused (status %d), "
+                    "%zu samples untouched\n",
+                    label, static_cast<int>(status), untouched.samples);
+    };
+
+    for (StageNodeDevice selection :
+         {StageNodeDevice::OpenCL, StageNodeDevice::CPU}) {
+        const bool device = selection == StageNodeDevice::OpenCL;
+        expect_refusal(device ? "padded row on the device"
+                              : "padded row in the builtin",
+                       true, false, selection);
+        expect_refusal(device ? "padded plane on the device"
+                              : "padded plane in the builtin",
+                       false, true, selection);
+    }
+
+    /*
+     * Show-mask is a valid residual, not an invalid descriptor: the device
+     * refuses it, the host builtin runs, and the host writes the mask. The
+     * contract for this case is therefore RT_STAGE_OK with impl=host.
+     */
+    {
+        LabImage source(63, 31);
+        fill_sharpen_l(source, 29u);
+        LabImage target(63, 31);
+        copy_sharpen_l(source, target);
+
+        SharpenNodeParams node_params;
+        std::string error;
+        check(sharpen_node_params(base, 1.0, true, node_params, error),
+              "show-mask residual builds its parameters");
+        SharpenNodeArgs node;
+        sharpen_node_args(target.L[0], target.W, target.H, node_params, node);
+        std::vector<RtStageArg> args(node.args, node.args + SHARPEN_NODE_ARGS);
+
+        std::remove(profile_path.c_str());
+        setenv("RT_STAGE_PROFILE", profile_path.c_str(), 1);
+        set_node_device_override("output.sharpen", StageNodeDevice::OpenCL);
+        const RtStageStatus status = run("output.sharpen", args);
+        clear_node_device_overrides();
+        const std::string profile = read_file(profile_path);
+        unsetenv("RT_STAGE_PROFILE");
+
+        check(status == RT_STAGE_OK, "show-mask residual completes");
+        check(profile.find("\"stage\":\"output.sharpen\"") != std::string::npos,
+              "show-mask residual records the node");
+        check(profile.find("\"impl\":\"host\"") != std::string::npos,
+              "show-mask residual records a host execution");
+        check(profile.find("\"impl\":\"opencl\"") == std::string::npos,
+              "show-mask residual never records a device pass");
+
+        LabImage cpu(63, 31);
+        copy_sharpen_l(source, cpu);
+        rtengine::procparams::ProcParams params;
+        params.prsharpening = base;
+        rtengine::ImProcFunctions ipf(&params, false);
+        ipf.setScale(1.0);
+        set_node_device_override("output.sharpen", StageNodeDevice::CPU);
+        ipf.sharpening(&cpu, base, true);
+        clear_node_device_overrides();
+
+        const Diff diff = compare_sharpen_l(target, cpu);
+        check(diff.differing == 0 && diff.max_abs == 0.0,
+              "show-mask output matches the CPU mask");
+        const Diff written = compare_sharpen_l(target, source);
+        check(written.differing > 0,
+              "show-mask writes the mask into the plane");
+        std::printf("stage-residency: output.sharpen show-mask residual: "
+                    "impl=host, %zu of %zu samples carry the mask\n",
+                    written.differing, written.samples);
     }
 }
 
