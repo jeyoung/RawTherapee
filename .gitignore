@@ -20,6 +20,7 @@ cmake_install.cmake
 install_manifest.txt
 
 build*
+.worktrees/
 cmake-build*
 Build*
 !tools/build-rt.sh
