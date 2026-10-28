@@ -1,0 +1,16 @@
+[Resize]
+Enabled=true
+Scale=0.5
+AppliesTo=Full image
+Method=Lanczos
+DataSpecified=0
+AllowUpscaling=true
+
+[PostResizeSharpening]
+Enabled=true
+Method=rld
+Contrast=15
+DeconvRadius=0.45
+DeconvAmount=50
+DeconvIterations=10
+DeconvDamping=0

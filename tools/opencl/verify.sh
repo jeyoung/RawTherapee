@@ -228,6 +228,10 @@ quick() {
         "$ROOT/devnotes/opencl/pp3/framing.pp3" framing
     run_stage_device "pef/stage-device-gamut" \
         "$ROOT/devnotes/opencl/pp3/gamut.pp3" gamut
+    run_stage_device "pef/stage-device-sharpen" \
+        "$ROOT/devnotes/opencl/pp3/sharpen-usm.pp3" output.sharpen
+    run_stage_host "pef/stage-host-sharpen-rld" \
+        "$ROOT/devnotes/opencl/pp3/sharpen-rld.pp3" output.sharpen
 }
 
 stage() {
@@ -415,6 +419,75 @@ run_stage_device() {
     [ "$result" = "PASS" ]
 }
 
+#
+# A residual request must be recorded as a host execution, never counted as
+# device parity. The TIFF comparison is informational: the device may still
+# have run other nodes in the same export.
+#
+# Usage: run_stage_host <label> <profile> <node>
+#
+run_stage_host() {
+    local label="$1"
+    local profile="$2"
+    local node="$3"
+    local sample="${sample_override:-$TESTDATA/colorspace_flowers.pef}"
+
+    [ -f "$sample" ] || die "missing $sample (run tools/opencl/fetch-testdata.sh)"
+    [ -z "$profile" ] || [ -f "$profile" ] || die "missing profile $profile"
+
+    if [ "$has_device" -eq 0 ]; then
+        if [ "${RT_REQUIRE_GPU:-0}" = "1" ]; then
+            printf 'FAIL\t%s\tno OpenCL device for the host residual\n' "$label"
+            return 1
+        fi
+        printf 'SKIP\t%s\tno OpenCL device (set RT_OPENCL_ALLOW_CPU=1 for a CPU device)\n' "$label"
+        return 0
+    fi
+
+    local outdir
+    outdir="$(mktemp -d "${TMPDIR:-/tmp}/rtstagehost.XXXXXX")"
+    local record="$outdir/stages.json"
+    local host="$outdir/host.tif"
+    local device="$outdir/device.tif"
+
+    if ! env OMP_NUM_THREADS="$THREADS" "$cli" --gpu=off -p "$profile" \
+            -o "$host" -t -b16 -Y -c "$sample" >"$outdir/host.log" 2>&1; then
+        printf 'FAIL\t%s\tload or export failed (gpu=off)\n' "$label"
+        rm -rf "$outdir"
+        return 1
+    fi
+    if ! env OMP_NUM_THREADS="$THREADS" RT_STAGE_OPENCL=1 \
+            RT_OPENCL_RGBPROC=1 RT_STAGE_PROFILE="$record" \
+            "$cli" --gpu=auto -p "$profile" \
+            -o "$device" -t -b16 -Y -c "$sample" >"$outdir/device.log" 2>&1; then
+        printf 'FAIL\t%s\tload or export failed (stage host)\n' "$label"
+        rm -rf "$outdir"
+        return 1
+    fi
+
+    if [ ! -s "$record" ] || ! grep -q "\"stage\":\"${node}\"" "$record"; then
+        printf 'FAIL\t%s\tno stage record for %s\n' "$label" "$node"
+        rm -rf "$outdir"
+        return 1
+    fi
+    if ! grep -Eq "\"stage\":\"${node}\".*\"impl\":\"host\"" "$record" ||
+            grep -Eq "\"stage\":\"${node}\".*\"impl\":\"opencl\"" "$record"; then
+        local why
+        why="$(grep "\"stage\":\"${node}\"" "$record" | head -1)"
+        printf 'FAIL\t%s\tresidual did not run on the host: %s\n' "$label" "$why"
+        rm -rf "$outdir"
+        return 1
+    fi
+
+    local pae="not counted"
+    if compare_images "$host" "$device"; then
+        pae="${LAST_PAE} (informational)"
+    fi
+    printf 'PASS\t%s\timpl=host, %s\n' "$label" "$pae"
+    rm -rf "$outdir"
+    return 0
+}
+
 stage_device() {
     printf 'binary\t%s\n' "$cli"
     "$cli" --gpu-info | tail -n +2 | sed 's/^/gpu\t/'
@@ -430,6 +503,10 @@ stage_device() {
         "$ROOT/devnotes/opencl/pp3/framing.pp3" framing
     run_stage_device "pef/stage-device-gamut" \
         "$ROOT/devnotes/opencl/pp3/gamut.pp3" gamut
+    run_stage_device "pef/stage-device-sharpen" \
+        "$ROOT/devnotes/opencl/pp3/sharpen-usm.pp3" output.sharpen
+    run_stage_host "pef/stage-host-sharpen-rld" \
+        "$ROOT/devnotes/opencl/pp3/sharpen-rld.pp3" output.sharpen
 }
 
 rgbproc() {

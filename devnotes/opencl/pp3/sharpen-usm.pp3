@@ -1,0 +1,15 @@
+[Resize]
+Enabled=true
+Scale=0.5
+AppliesTo=Full image
+Method=Lanczos
+DataSpecified=0
+AllowUpscaling=true
+
+[PostResizeSharpening]
+Enabled=true
+Method=usm
+Contrast=15
+Radius=0.5
+Amount=200
+Threshold=20;80;1200;2000

@@ -22,6 +22,9 @@
 #include "procparams.h"
 #include "settings.h"
 #include "stage/algorithms/gamut_cl.h"
+#include "stage/algorithms/sharpen_cl.h"
+
+#include "sharpen_core.h"
 
 #include <algorithm>
 #include <cmath>
@@ -2598,6 +2601,337 @@ void test_gamut(bool available)
     }
 }
 
+/* --------------------------------------------------- output sharpening */
+
+float sharpen_fixture_value(int x, int y, unsigned seed)
+{
+    std::uint32_t state = seed * 2654435761u + 1u;
+    for (int index = 0; index < y * 4096 + x; ++index) {
+        state = state * 1664525u + 1013904223u;
+    }
+    state ^= static_cast<std::uint32_t>(x) * 2246822519u;
+    state ^= static_cast<std::uint32_t>(y) * 3266489917u;
+    /* Spread over negative and positive L, including a dark left band. */
+    int value = static_cast<int>((state >> 8) % 34001u) - 1000;
+    if (x < 3) {
+        value -= 2000;
+    }
+    return static_cast<float>(value);
+}
+
+void fill_sharpen_l(LabImage& lab, unsigned seed)
+{
+    for (int y = 0; y < lab.H; ++y) {
+        for (int x = 0; x < lab.W; ++x) {
+            lab.L[y][x] = sharpen_fixture_value(x, y, seed);
+            lab.a[y][x] = 0.0f;
+            lab.b[y][x] = 0.0f;
+        }
+    }
+}
+
+void copy_sharpen_l(const LabImage& source, LabImage& destination)
+{
+    for (int y = 0; y < source.H; ++y) {
+        std::memcpy(destination.L[y], source.L[y],
+                    static_cast<std::size_t>(source.W) * sizeof(float));
+        std::memcpy(destination.a[y], source.a[y],
+                    static_cast<std::size_t>(source.W) * sizeof(float));
+        std::memcpy(destination.b[y], source.b[y],
+                    static_cast<std::size_t>(source.W) * sizeof(float));
+    }
+}
+
+Diff compare_sharpen_l(const LabImage& a, const LabImage& b)
+{
+    Diff diff;
+    if (a.W != b.W || a.H != b.H) {
+        diff.finite = false;
+        return diff;
+    }
+    for (int y = 0; y < a.H; ++y) {
+        for (int x = 0; x < a.W; ++x) {
+            ++diff.samples;
+            const float actual = a.L[y][x];
+            const float expected = b.L[y][x];
+            if (!close_enough(actual) || !close_enough(expected)) {
+                diff.finite = false;
+            }
+            const double delta = std::fabs(static_cast<double>(actual) -
+                                           static_cast<double>(expected));
+            if (delta > 0.0) {
+                ++diff.differing;
+            }
+            diff.max_abs = std::max(diff.max_abs, delta);
+        }
+    }
+    return diff;
+}
+
+/* The production CPU path, with the node pinned to the host. */
+void run_cpu_sharpen(const rtengine::procparams::SharpeningParams& sharpening,
+                     double scale, LabImage& lab)
+{
+    rtengine::procparams::ProcParams params;
+    params.prsharpening = sharpening;
+    rtengine::ImProcFunctions ipf(&params, false);
+    ipf.setScale(scale);
+    set_node_device_override("output.sharpen", StageNodeDevice::CPU);
+    ipf.sharpening(&lab, sharpening);
+    clear_node_device_overrides();
+}
+
+RtStageStatus run_device_sharpen(const std::shared_ptr<StageContext>& context,
+                                 const rtengine::procparams::SharpeningParams& sharpening,
+                                 double scale, LabImage& lab,
+                                 StageExecution& execution, std::string& error)
+{
+    SharpenNodeParams node_params;
+    if (!sharpen_node_params(sharpening, scale, false, node_params, error)) {
+        return RT_STAGE_INVALID;
+    }
+    SharpenNodeArgs node;
+    sharpen_node_args(lab.L[0], lab.W, lab.H, node_params, node);
+    set_node_device_override("output.sharpen", StageNodeDevice::OpenCL);
+    StageRequest request;
+    request.name = "output.sharpen";
+    request.args.assign(node.args, node.args + SHARPEN_NODE_ARGS);
+    const RtStageStatus status = context->execute(request, nullptr, &execution);
+    clear_node_device_overrides();
+    return status;
+}
+
+struct SharpenCase {
+    std::string label;
+    int width;
+    int height;
+    double scale;
+    rtengine::procparams::SharpeningParams params;
+    bool exact;
+};
+
+void test_output_sharpen(bool available)
+{
+    using namespace rtengine::stage;
+
+    {
+        rtengine::procparams::SharpeningParams bad;
+        SharpenNodeParams node;
+        std::string error;
+        bad.method = "not-a-method";
+        check(!sharpen_node_params(bad, 1.0, false, node, error),
+              "output.sharpen rejects a method outside the enum");
+    }
+
+    rtengine::procparams::SharpeningParams base;
+    base.enabled = true;
+    base.method = "usm";
+    base.amount = 200;
+    base.contrast = 20.0;
+    base.radius = 0.5;
+    base.blurradius = 0.2;
+
+    std::vector<SharpenCase> cases;
+    const auto add = [&cases](const std::string& label, int width, int height,
+                              double scale,
+                              const rtengine::procparams::SharpeningParams& p,
+                              bool exact) {
+        cases.push_back(SharpenCase{label, width, height, scale, p, exact});
+    };
+
+    add("defaults", 63, 31, 1.0, base, false);
+
+    for (double radius : {0.3, 0.5, 0.59, 0.6, 1.15, 3.0}) {
+        auto p = base;
+        p.radius = radius;
+        add("radius " + std::to_string(radius), 63, 31, 1.0, p, false);
+    }
+    for (double contrast : {0.0, 20.0, 100.0}) {
+        auto p = base;
+        p.contrast = contrast;
+        add("contrast " + std::to_string(contrast), 63, 31, 1.0, p, false);
+    }
+    for (int amount : {1, 100, 200, 1000}) {
+        auto p = base;
+        p.amount = amount;
+        add("amount " + std::to_string(amount), 63, 31, 1.0, p, false);
+    }
+
+    {
+        auto p = base;
+        p.threshold.setValues(0, 0, 0, 0);
+        add("threshold zeros", 63, 31, 1.0, p, false);
+    }
+    {
+        auto p = base;
+        p.threshold.setValues(20, 80, 1200, 1200);
+        add("threshold equal right values", 63, 31, 1.0, p, false);
+    }
+    {
+        auto p = base;
+        p.threshold = rtengine::procparams::Threshold<int>(20, 200, false);
+        add("threshold two values", 63, 31, 1.0, p, false);
+    }
+    {
+        auto p = base;
+        p.threshold.setValues(80, 2000, 2000, 2000);
+        add("threshold breakpoints", 63, 31, 1.0, p, false);
+    }
+
+    for (int width : {8, 63, 64, 65}) {
+        add("width " + std::to_string(width), width, 17, 1.0, base, false);
+    }
+    add("padded width 238", 238, 24, 1.0, base, false);
+
+    /* Sigma below GAUSS_SKIP copies the plane, so the node is the identity. */
+    add("skip sigma", 63, 31, 4.0, base, true);
+    /* Sigma at the FIR limit. */
+    add("sigma 0.25", 63, 31, 2.0, base, false);
+
+    if (!available) {
+        skip("output sharpening: no OpenCL device");
+        return;
+    }
+
+    const auto context = opencl_device()->create_context();
+    check(context != nullptr, "output sharpening: the device creates a context");
+    if (context == nullptr) {
+        return;
+    }
+
+    unsigned seed = 1u;
+    for (const SharpenCase& item : cases) {
+        LabImage source(item.width, item.height);
+        fill_sharpen_l(source, seed++);
+
+        LabImage cpu(item.width, item.height);
+        copy_sharpen_l(source, cpu);
+        run_cpu_sharpen(item.params, item.scale, cpu);
+
+        LabImage device(item.width, item.height);
+        copy_sharpen_l(source, device);
+        StageExecution execution;
+        std::string error;
+        const RtStageStatus status =
+            run_device_sharpen(context, item.params, item.scale, device,
+                               execution, error);
+        const std::string prefix = "output.sharpen " + item.label;
+        check(status == RT_STAGE_OK, (prefix + " completes").c_str());
+        check(execution.device == StageDeviceType::OPENCL,
+              (prefix + " runs on the device").c_str());
+        check(!execution.asynchronous,
+              (prefix + " reads the plane back synchronously").c_str());
+
+        const Diff diff = compare_sharpen_l(device, cpu);
+        std::printf("stage-residency: %s %dx%d: PAE %.6f LSB16, "
+                    "%zu of %zu samples differ\n",
+                    prefix.c_str(), item.width, item.height, diff.max_abs,
+                    diff.differing, diff.samples);
+        check(diff.finite, (prefix + " is finite").c_str());
+        if (item.exact) {
+            check(diff.differing == 0 && diff.max_abs == 0.0,
+                  (prefix + " is bit-exact").c_str());
+        } else {
+            check(diff.max_abs <= 1.0,
+                  (prefix + " is within one LSB16").c_str());
+        }
+    }
+
+    /*
+     * A supported request must be recorded as device execution through
+     * run(), while a residual switch must execute the host builtin and report
+     * impl=host. The host result is compared with the production CPU path and
+     * with the extracted core, so the record cannot hide a mixed pass.
+     */
+    const std::string profile_path =
+        std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp") +
+        "/stage-residency-sharpen.jsonl";
+
+    const auto run_and_read = [&](const rtengine::procparams::SharpeningParams& p,
+                                  double scale, bool expect_device,
+                                  const char* label) {
+        LabImage source(63, 31);
+        fill_sharpen_l(source, 11u);
+        LabImage target(63, 31);
+        copy_sharpen_l(source, target);
+
+        SharpenNodeParams node_params;
+        std::string error;
+        check(sharpen_node_params(p, scale, false, node_params, error),
+              (std::string(label) + " builds its parameters").c_str());
+        SharpenNodeArgs node;
+        sharpen_node_args(target.L[0], target.W, target.H, node_params, node);
+        std::vector<RtStageArg> args(node.args, node.args + SHARPEN_NODE_ARGS);
+
+        std::remove(profile_path.c_str());
+        setenv("RT_STAGE_PROFILE", profile_path.c_str(), 1);
+        set_node_device_override("output.sharpen", StageNodeDevice::OpenCL);
+        const RtStageStatus status = run("output.sharpen", args);
+        clear_node_device_overrides();
+        const std::string profile = read_file(profile_path);
+        unsetenv("RT_STAGE_PROFILE");
+
+        check(status == RT_STAGE_OK,
+              (std::string(label) + " completes through run()").c_str());
+        check(profile.find("\"stage\":\"output.sharpen\"") != std::string::npos,
+              (std::string(label) + " records the node").c_str());
+        if (expect_device) {
+            check(profile.find("\"impl\":\"opencl\"") != std::string::npos,
+                  (std::string(label) + " records a device execution").c_str());
+        } else {
+            check(profile.find("\"impl\":\"host\"") != std::string::npos,
+                  (std::string(label) + " records a host execution").c_str());
+            check(profile.find("\"impl\":\"opencl\"") == std::string::npos,
+                  (std::string(label) + " never mixes a device pass").c_str());
+        }
+
+        LabImage cpu(63, 31);
+        copy_sharpen_l(source, cpu);
+        run_cpu_sharpen(p, scale, cpu);
+        const Diff diff = compare_sharpen_l(target, cpu);
+        check(diff.finite,
+              (std::string(label) + " stays finite").c_str());
+        if (expect_device) {
+            check(diff.max_abs <= 1.0,
+                  (std::string(label) + " is within one LSB16").c_str());
+        } else {
+            check(diff.differing == 0 && diff.max_abs == 0.0,
+                  (std::string(label) + " matches the CPU reference").c_str());
+        }
+
+        if (!expect_device) {
+            LabImage direct(63, 31);
+            copy_sharpen_l(source, direct);
+            rtengine::sharpen_luminance(direct.L[0], direct.W, direct.H, p,
+                                        scale, false, false);
+            const Diff core_diff = compare_sharpen_l(target, direct);
+            check(core_diff.differing == 0 && core_diff.max_abs == 0.0,
+                  (std::string(label) + " matches the extracted core").c_str());
+        }
+    };
+
+    run_and_read(base, 1.0, true, "supported run");
+
+    {
+        auto p = base;
+        p.halocontrol = true;
+        run_and_read(p, 1.0, false, "halo control residual");
+    }
+    {
+        auto p = base;
+        p.method = "rld";
+        p.deconvamount = 20;
+        p.deconvradius = 0.5;
+        p.deconviter = 2;
+        run_and_read(p, 1.0, false, "RLD residual");
+    }
+    {
+        auto p = base;
+        p.blurradius = 0.3;
+        run_and_read(p, 1.0, false, "blur radius residual");
+    }
+}
+
 /* --------------------------------------------------------- run() wiring */
 
 void test_run_wiring(bool available)
@@ -2725,6 +3059,7 @@ int main()
     test_rgb_proc_pitch(available);
     test_framing(available);
     test_gamut(available);
+    test_output_sharpen(available);
     test_run_wiring(available);
 
     if (failures == 0) {
