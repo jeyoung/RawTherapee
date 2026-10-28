@@ -178,9 +178,10 @@ std::string workOrderName(const WorkOrder& order);
 
 /*
  * The raw/core sites no longer probe a legacy answer; the typed order is the
- * execution-set authority at every converted site. The switch is retained for
- * the diagnostic sweep harness, which reports the environment state before a
- * run; it has no effect on the engine.
+ * execution-set authority at every converted site. RT_WORK_SHADOW is retained
+ * deliberately as a diagnostic marker: it changes no engine behaviour and
+ * exists so the sweep harness can report which mode a recorded run used. Do
+ * not grow it into a second authority.
  */
 inline bool workShadowEnabled()
 {
