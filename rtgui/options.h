@@ -338,6 +338,7 @@ public:
     int spotmet;
 
     bool inspectorWindow; // open inspector in separate window
+    bool inspectorFitWindow; // embedded inspector fits the image to the tab
     bool zoomOnScroll;    // translate scroll events to zoom
 
     std::vector<double> thumbnailZoomRatios;

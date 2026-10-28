@@ -437,8 +437,14 @@ bool Inspector::on_draw(const ::Cairo::RefPtr< Cairo::Context> &cr)
         availableSize.y = win->get_height() * deviceScale;
         int imW = rtengine::max<int>(currImage->imgBuffer.getWidth(), 1);
         int imH = rtengine::max<int>(currImage->imgBuffer.getHeight(), 1);
+        // The embedded Inspect tab is a 100% loupe by default. Its persistent
+        // Fit to window toggle uses the same no-upscale fit as the separate
+        // Inspector window, but without that window's zoom and pan.
+        const bool embeddedFit = !window && App::get().options().inspectorFitWindow;
         scale = rtengine::min(1., rtengine::min<double>(availableSize.x / imW, availableSize.y / imH));
-        if (scaled) {
+        if (embeddedFit) {
+            zoomScale = 1.0;
+        } else if (scaled) {
             // reduce size of image to fit into window, no further zoom down
             zoomScale = rtengine::max<double>(zoomScale, 1.0);
             scale *= zoomScale;
@@ -451,7 +457,13 @@ bool Inspector::on_draw(const ::Cairo::RefPtr< Cairo::Context> &cr)
         availableSize.x /= scale;
         availableSize.y /= scale;
 
-        if (imW < availableSize.x) {
+        if (embeddedFit) {
+            // Fit the whole image and ignore the loupe centre. The image can
+            // only be smaller than the available area, so it is always centred.
+            topLeft.set(0, 0);
+            dest.x = rtengine::max<double>(0., (availableSize.x - imW) / 2.);
+            dest.y = rtengine::max<double>(0., (availableSize.y - imH) / 2.);
+        } else if (imW < availableSize.x) {
             // center the image in the available space along X
             topLeft.x = 0;
             dest.x = (availableSize.x - imW) / 2.;
@@ -464,17 +476,19 @@ bool Inspector::on_draw(const ::Cairo::RefPtr< Cairo::Context> &cr)
             topLeft.x = rtengine::max<double>(topLeft.x, 0);
         }
 
-        if (imH < availableSize.y) {
-            // center the image in the available space along Y
-            topLeft.y = 0;
-            dest.y = (availableSize.y - imH) / 2.;
-        } else {
-            // partial image display
-            // double clamp
-            topLeft.y = center.y + availableSize.y / 2.;
-            topLeft.y = rtengine::min<double>(topLeft.y, imH);
-            topLeft.y -= availableSize.y;
-            topLeft.y = rtengine::max<double>(topLeft.y, 0);
+        if (!embeddedFit) {
+            if (imH < availableSize.y) {
+                // center the image in the available space along Y
+                topLeft.y = 0;
+                dest.y = (availableSize.y - imH) / 2.;
+            } else {
+                // partial image display
+                // double clamp
+                topLeft.y = center.y + availableSize.y / 2.;
+                topLeft.y = rtengine::min<double>(topLeft.y, imH);
+                topLeft.y -= availableSize.y;
+                topLeft.y = rtengine::max<double>(topLeft.y, 0);
+            }
         }
         //printf("center: %d, %d   (img: %d, %d)  (availableSize: %d, %d)  (topLeft: %d, %d)\n", center.x, center.y, imW, imH, availableSize.x, availableSize.y, topLeft.x, topLeft.y);
 
@@ -500,7 +514,7 @@ bool Inspector::on_draw(const ::Cairo::RefPtr< Cairo::Context> &cr)
         }
 
         bool scaledImage = scale != 1.0;
-        if (!window || (deviceScale == 1 && !scaledImage)) {
+        if ((!window && !embeddedFit) || (deviceScale == 1 && !scaledImage)) {
             // standard drawing
             currImage->imgBuffer.copySurface(win);
         }

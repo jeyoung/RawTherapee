@@ -519,6 +519,7 @@ void Options::setDefaults()
     spotmet = 0;
 
     inspectorWindow = false;
+    inspectorFitWindow = false;
     zoomOnScroll = true;
     prevdemo = PD_Sidecar;
 
@@ -1842,6 +1843,10 @@ void Options::readFromFile(Glib::ustring fname)
                     inspectorWindow = keyFile.get_boolean("GUI", "InspectorWindow");
                 }
 
+                if (keyFile.has_key("GUI", "InspectorFitWindow")) {
+                    inspectorFitWindow = keyFile.get_boolean("GUI", "InspectorFitWindow");
+                }
+
                 if (keyFile.has_key("GUI", "ZoomOnScroll")) {
                     zoomOnScroll = keyFile.get_boolean("GUI", "ZoomOnScroll");
                 }
@@ -2736,6 +2741,7 @@ void Options::saveToFile(Glib::ustring fname)
         keyFile.set_integer("GUI", "Complexity", complexity);
         keyFile.set_integer("GUI", "Spotmet", spotmet);
         keyFile.set_boolean("GUI", "InspectorWindow", inspectorWindow);
+        keyFile.set_boolean("GUI", "InspectorFitWindow", inspectorFitWindow);
         keyFile.set_boolean("GUI", "ZoomOnScroll", zoomOnScroll);
         keyFile.set_integer("GUI", "MaxZoom", static_cast<int>(maxZoomLimit));
 

@@ -99,6 +99,29 @@ FilePanel::FilePanel () : parent(nullptr), error(0)
     inspectorPanel = new Inspector();
     fileCatalog->setInspector(inspectorPanel);
 
+    if (!options.inspectorWindow) {
+        // The embedded Inspect tab is a 100% loupe. This persistent toggle
+        // switches it to a whole-image fit without touching the separate
+        // Inspector window, which already has the f shortcut.
+        inspectorTab = Gtk::manage (new Gtk::Box (Gtk::ORIENTATION_VERTICAL));
+        inspectorFitWindow = Gtk::manage (new Gtk::CheckButton (M("INSPECTOR_FIT_WINDOW")));
+        inspectorFitWindow->set_active (options.inspectorFitWindow);
+        inspectorFitWindow->set_tooltip_markup (M("INSPECTOR_FIT_WINDOW_TOOLTIP"));
+        inspectorFitWindow->set_margin_start (6);
+        inspectorFitWindow->set_margin_end (6);
+        inspectorFitWindow->set_margin_top (6);
+        inspectorFitWindow->set_margin_bottom (4);
+        inspectorFitWindow->signal_toggled().connect(
+            [this]() -> void
+            {
+                App::get().mut_options().inspectorFitWindow = inspectorFitWindow->get_active();
+                inspectorPanel->queue_draw();
+            }
+        );
+        inspectorTab->pack_start (*inspectorFitWindow, Gtk::PACK_SHRINK);
+        inspectorTab->pack_start (*inspectorPanel, Gtk::PACK_EXPAND_WIDGET);
+    }
+
     Gtk::ScrolledWindow* sExportPanel = Gtk::manage ( new Gtk::ScrolledWindow() );
     exportPanel = Gtk::manage ( new ExportPanel () );
     sExportPanel->add (*exportPanel);
@@ -137,7 +160,7 @@ FilePanel::FilePanel () : parent(nullptr), error(0)
 
     rightNotebook->append_page (*sFilterPanel, *filtLab);
     if (!options.inspectorWindow)
-        rightNotebook->append_page (*inspectorPanel, *inspectLab);
+        rightNotebook->append_page (*inspectorTab, *inspectLab);
     rightNotebook->append_page (*tpcPaned, *devLab);
     //rightNotebook->append_page (*taggingBox, *tagLab); commented out: currently the tab is empty ...
     rightNotebook->append_page (*sExportPanel, *exportLab);
@@ -168,6 +191,12 @@ FilePanel::~FilePanel ()
     idle_register.destroy();
 
     rightNotebookSwitchConn.disconnect();
+
+    // inspectorTab is owned by the notebook; remove the non-managed
+    // Inspector before deleting it so the box never holds a dead child.
+    if (inspectorTab && inspectorPanel) {
+        inspectorTab->remove (*inspectorPanel);
+    }
 
     if (inspectorPanel) {
         delete inspectorPanel;

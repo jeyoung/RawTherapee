@@ -93,6 +93,8 @@ private:
     RecentBrowser* recentBrowser;
 
     Inspector* inspectorPanel;
+    Gtk::Box* inspectorTab = nullptr;
+    Gtk::CheckButton* inspectorFitWindow = nullptr;
     Gtk::Paned* tpcPaned;
     BatchToolPanelCoordinator* tpc;
     History* history;
