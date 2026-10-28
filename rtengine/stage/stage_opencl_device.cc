@@ -3640,9 +3640,9 @@ RtStageStatus run_thumbnail_scale(
 }
 
 /*
- * Output sharpening, USM only. Arguments are documented in
+ * Output sharpening, USM and undamped RLD. Arguments are documented in
  * stage/algorithms/sharpen_cl.h. The L plane is the only transfer: the mask,
- * the blur and the IIR intermediate live in device scratch.
+ * the blur, the RLD estimate and the RLD intermediate live in device scratch.
  */
 RtStageStatus run_sharpen(const std::shared_ptr<OpenCLEnv>& env,
                           const std::shared_ptr<OpenCLResidency>& residency,

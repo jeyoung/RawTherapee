@@ -774,8 +774,9 @@ struct SharpenFirFactors {
 
 inline void sharpen_fir_factors(double sigma, SharpenFirFactors& out)
 {
-    const double c = std::exp(-0.5 * (1.0 / (sigma * sigma)));
-    const double c2 = std::exp(-(1.0 / (sigma * sigma)));
+    const double inv_sigma = 1.0 / sigma;
+    const double c = std::exp(-0.5 * (inv_sigma * inv_sigma));
+    const double c2 = std::exp(-(inv_sigma * inv_sigma));
     const double sum = 1.0 + 4.0 * (c + c2);
     out.c0 = static_cast<float>(1.0 / sum);
     out.c1 = static_cast<float>(c / sum);
