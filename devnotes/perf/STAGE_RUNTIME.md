@@ -257,15 +257,6 @@ to a CPU-only run.
 The plan assumed these were cheaper than step 5's kernels. Inspection says
 otherwise, so the next session does not start from that assumption:
 
-- `thumbnail.scale` calls `resizeTo` with the caller's `TypeInterpolation`
-  (`TI_Bilinear` for the normal path, `TI_Nearest` for the quick one), not the
-  Lanczos stage. A device node needs a bilinear resize kernel and a reference
-  match to `resizeTo`, which is new work rather than a rewire.
-- `thumbnail.transform` rotates and flips in place through the `IImage`
-  templates in `iimage.h`, which reallocate the planes. A device node must
-  allocate a new image, permute into it and swap, so the call site needs
-  restructuring; the permutation itself is simple but the semantics of
-  `rotate(90|180|270)` must be matched exactly.
 - `thumbnail.rgb` and `thumbnail.lab` are composites: colour-space conversion,
   analysis, geometry, local adjustments and RGB or Lab processing folded into
   one block.
@@ -288,6 +279,85 @@ changed the thumbnail cache key but no `thumbnail.transform` record appeared,
 so the harness did not reach those call sites. The node is therefore verified by
 the device test and by compilation, and the GUI path is recorded as uncovered
 rather than passed.
+
+## Thumbnail scale
+
+`thumbnail.scale` covers the full thumbnail path (three-plane F32 destination)
+and `thumbnail.scale.u8` the embedded-JPEG quick path (packed U8 destination).
+The pipeline block id stays `thumbnail.scale`; the second node name exists
+because the destination format differs, as with `thumbnail.transform`, and
+because the 8-bit reference path is not a float resize at all. The ABI is
+`[0]` source, `[1]` destination, `[2]` interpolation (`0` nearest, `1`
+bilinear); the source and destination formats come from `RtStageBuffer.format`.
+
+The node reproduces `IImage::resizeImgTo`, which carries three arithmetic
+variants:
+
+| Source | Mapping | Conversion |
+|---|---|---|
+| `Imagefloat` (planar F32) | position accumulated in float (`syf += heightByNh`), `sy = int(syf)`, `dy = syf - float(sy)` | `convertTo(float, float&)`: a NaN becomes 0 |
+| `Image16` (planar U16) | the same accumulation, samples promoted to float | the same float conversion |
+| `Image8` (packed U8) | `sy = i * height / nh`, `dy = float(i) * float(height) / float(nh) - float(sy)`, not accumulated | the blend is stored in `unsigned char` first, so it is truncated toward zero; a float destination then multiplies by 257 |
+
+A same-size request is a pure type conversion in the reference and takes
+priority over the interpolation, so the kernel has a third mode that copies
+rather than blends. Without it an infinity would be multiplied by a zero
+weight and become a NaN.
+
+The coordinate map is built on the host, not in the kernel. The planar variants
+accumulate and the packed variant multiplies and divides, and either one
+differs by an ulp if recomputed differently; the host repeats the reference
+expressions verbatim and uploads one `{index, next, fraction}` entry per
+destination row and column as scratch buffers. The kernel then only indexes and
+blends, under `FP_CONTRACT OFF`, so the four products are summed in the
+reference's order. One work item owns one destination row: the map is loaded
+once per row and the row stays cache friendly, at the cost of a serial inner
+loop.
+
+`stage::view(Image16&)` reports the image's own padded row and plane strides,
+not the packed `width * sizeof(uint16_t)`: `PlanarRGBData` pads every row to
+128 bits, and the residency copies row by row, so the padded host layout stays
+valid for widths that are not a multiple of eight.
+
+Both call sites ask `node_device()` first and keep the existing `resizeTo`
+line as the fallback. `stageScale` does not return early, because the
+film-negative step that follows stays on the host; it selects the device image
+and then runs the unchanged inversion. `stageQuickScale` offers the node only a
+destination of at least one pixel in each direction, since that path leaves a
+collapsed destination to `resizeTo`.
+
+Evidence (POCL CPU device, `RT_OPENCL_ALLOW_CPU=1 RT_REQUIRE_GPU=1`,
+`OMP_NUM_THREADS=1`):
+
+- `stage-residency-test` compares the device output with the production
+  `resizeImgTo` template for all four reachable format pairs (U8→U8, U8→F32,
+  U16→F32, F32→F32), nearest and bilinear, at 40x24 → 23x14 (downscale),
+  40x24 → 61x37 (upscale) and 40x24 → 40x24: 24 cases, all bit-exact
+  (`PAE 0.000000 LSB16`; 966 samples on the downscale, 6 771 on the upscale
+  and 2 880 at the same size, none differing). The fixture covers 0, the top
+  of the range, the midpoint and its neighbour, one NaN for a float source and
+  one infinity, which separates the same-size conversion from the resampling
+  modes.
+- The test has teeth: storing the U8 blend rounded instead of truncated fails
+  the U8 bilinear cases (459 of 966 samples on the downscale, 3 395 of 6 771
+  on the upscale), and dropping the same-size copy fails the float same-size
+  case on the infinity sample.
+- `thumbnail-stage-test` on the public 10.2 MP PEF with its sidecar at 160 px
+  produced `thumbnail.scale` and `thumbnail.scale.u8` records with
+  `impl=opencl`, twice each because the harness renders legacy and graph in one
+  process. The PPM files are byte-identical to the same binary with
+  `RT_STAGE_OPENCL` unset and to a binary built from the pre-change commit:
+  embedded `239x160`, sha256
+  `d961f0b52aaa8db2c7acd3c0a5924ad3ef22942156617bdf8fc204d52bd65514`; raw
+  `238x160`, sha256
+  `254e4451dfd4dede1ab0199f46d8eecad1d0c1574e704c96979a6d5fc9173824`. With the
+  switch unset no stage record is written at all, because the call sites never
+  enter the runtime.
+- The node is harness-covered, not CLI-covered: thumbnail generation is not on
+  the export path, so `VALIDATION.md` gains no row for it, and the GUI
+  thumbnail run recorded for `thumbnail.output` was not repeated with the
+  scale node on the device. That interactive path is uncovered rather than
+  passed.
 
 ## Pilot stage
 

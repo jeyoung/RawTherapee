@@ -77,7 +77,7 @@ host-side sub-tools are listed with the node record in `STAGE_RUNTIME.md`.
 | `monitor.output` | -/Full/-/- | interactive | recompute | Lab to monitor RGB | yes |
 | `viewport.output` | -/-/Roi/- | interactive | recompute | Lab to monitor RGB for the viewport | yes |
 | `thumbnail.decode` | -/-/-/Reduced | interactive | reuse-output | decode the embedded JPEG | no |
-| `thumbnail.scale` | -/-/-/Reduced | interactive | reuse-output | scale to thumbnail height | no |
+| `thumbnail.scale` | -/-/-/Reduced | interactive | reuse-output | scale to thumbnail height | yes |
 | `thumbnail.transform` | -/-/-/Reduced | interactive | reuse-input | coarse rotate and flip | yes |
 | `thumbnail.whitebalance` | -/-/-/Reduced | interactive | reuse-input | apply white balance to the thumbnail | yes |
 | `thumbnail.rgb` | -/-/-/Reduced | interactive | reuse-input | thumbnail RGB processing | no |
