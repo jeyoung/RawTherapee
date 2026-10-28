@@ -135,11 +135,16 @@ early, and `wait()` blocks, reads the output back and only then reports
 offered to the device queue or a resolution failure, reports `device=NONE`
 rather than naming a device that did not run.
 
-The classic backend still owns the accelerated resize: when the user enables
-OpenCL, `ImProcFunctions::Lanczos` calls `opencl::resizeLanczos` before the
-stage runtime, so the wired `lanczos3` device node is reached only when that
-path declines. The device node and its parity are exercised through the same
-`stage::run()` entry point by `stage-residency-test`.
+The classic backend and the device node cover the same resize. When
+`RT_STAGE_OPENCL=1` selects `lanczos3` and a device is available,
+`ImProcFunctions::Lanczos` (both the `Imagefloat` and the `LabImage` overload)
+runs the stage device first; otherwise it keeps the original order and tries
+`opencl::resizeLanczos` before the stage runtime. Without the precedence check
+the classic path intercepted the node whenever acceleration was enabled and
+the device implementation was unreachable. With the switch unset the resolver
+declines without probing the ICD, so the default path is unchanged. The parity
+and the end-to-end assertion are in `tools/opencl/verify.sh --stage-device`,
+which `--quick` also runs.
 
 ## Pilot stage
 
@@ -1353,13 +1358,15 @@ follow-up should give the harness a completion signal that does not depend on
   has no device implementation and resolves to the host program with a reason.
   The device path is opt-in (`RT_STAGE_OPENCL=1`) and nothing in the default
   configuration runs on a device.
-- The classic backend pre-empts the wired node when acceleration is enabled:
-  `ImProcFunctions::Lanczos` tries `opencl::resizeLanczos` first, so the stage
-  device node is reached only when the classic path declines. The batch policy
-  follows `useOpenCL`, so `--gpu=off` disables the graph device as well; with
-  acceleration enabled the classic resize handles the node. The device node is
-  therefore exercised end to end through `stage::run()` by
-  `stage-residency-test`, not by a CLI export.
+- The classic backend and the device node cover the same resize. With
+  `RT_STAGE_OPENCL=1` and a device available the stage device runs first, so
+  `--gpu=auto` exports reach it; with the switch unset the classic backend
+  handles the node and no stage record is emitted. The batch policy still
+  follows `useOpenCL`, so `--gpu=off` disables the graph device as well.
+  `verify.sh --stage-device` (also in `--quick`) asserts the `impl=opencl`
+  record and the 1 LSB parity against the CPU reference. A forced refusal
+  (`RT_STAGE_DEVICE_BUDGET_MB=16`, `RT_REQUIRE_GPU=1`) makes it FAIL, so the
+  assertion is not vacuous.
 - The context program cache is keyed by stage name and explicit
   implementation, so it reads `RT_STAGE_*` and `RT_STAGE_PATH` on the first
   compile of a key. Call `clear_program_cache()` to re-resolve after changing

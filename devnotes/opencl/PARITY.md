@@ -104,12 +104,25 @@ peak absolute error is zero:
   back to the host it would report `device=CPU` and the test would fail.
 - An over-budget node runs on the host: `StageExecution` reports `device=CPU`,
   `asynchronous=false`, and its output is exact against the CPU reference.
-- A 16-bit TIFF export with the resize profile is identical with the graph
-  switch off and on (`AE=0`, PAE 0 of 7604928 samples, same stage output hash).
-  With `--gpu=off` the batch policy now disables the graph device, so both runs
-  record the host implementation; that run is CPU-path regression evidence, not
-  device evidence. With `--gpu=auto` the classic `opencl::resizeLanczos` handles
-  the node and no stage `lanczos3` record is emitted, also `AE=0`.
+- A 16-bit TIFF export with the resize profile through the device, against the
+  `--gpu=off` CPU reference, has a peak error of 1 LSB16 on 96 426 of 2 534 980
+  pixels (3.8%), inside the 1 LSB gate. The same export with `RT_STAGE_OPENCL`
+  unset is handled by the classic backend and emits no stage record, so the
+  default path is unchanged.
+- The device record carries the attribution: with the switch on and
+  `--gpu=auto` the classic log no longer has an `opencl resize` line, and the
+  stage record says `"stage":"lanczos3","impl":"opencl","source":"opencl"`.
+  Forcing a refusal (`RT_STAGE_DEVICE_BUDGET_MB=16`) records `impl=host`,
+  `source=device-fallback`; the gate then reports FAIL when `RT_REQUIRE_GPU=1`
+  and SKIP otherwise, so the assertion is not vacuous.
+- `tools/opencl/verify.sh --stage-device`, which `--quick` also runs, asserts
+  the record and the parity in one step:
+
+  ```bash
+  RT_BUILD_DIR=... RT_OPENCL_ALLOW_CPU=1 OCL_ICD_VENDORS=<pocl-only> \
+      tools/opencl/verify.sh --stage-device
+  # PASS  pef/stage-device  max_pae=1.5259e-05
+  ```
 - The preview sweep (16 states, 32 images) and the crop harness (30 PPM files)
   are identical with the switch off and on, but neither graph runs a stage-ABI
   node; they are CPU-path regression checks with zero device calls.
