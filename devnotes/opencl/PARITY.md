@@ -88,7 +88,8 @@ Notes:
 
 The graph device path runs `lanczos3` (resize), `transform` (rotation/scale)
 and the Lab-to-RGB family (`output.convert` on export; `monitor.output`,
-`viewport.output` and `thumbnail.output` on the interactive paths). Device runs use
+`viewport.output` and `thumbnail.output` on the interactive paths), plus
+`rgb.proc` when `RT_OPENCL_RGBPROC=1`. Device runs use
 `RT_OPENCL_ALLOW_CPU=1` and an ICD directory that contains only `pocl.icd`
 (`OCL_ICD_VENDORS`), so the selected device is POCL's CPU device
 (`cpu-ivybridge-Intel(R) Core(TM) i7-3770 CPU @ 3.40GHz`). These are
@@ -126,6 +127,9 @@ peak absolute error is zero for the synthetic node tests:
   error of 1 LSB16 on 384 601 of 10 139 424 pixels (3.8%), the same order as
   the classic GPU path. The interpolation helpers and the map builder are
   shared with the classic backend, so only the addressing differs.
+- `rgb.proc` through the device, against the `--gpu=off` reference, has a peak
+  error of 1 LSB16 on 401 708 of 10 139 424 pixels (4.0%). The classic path is
+  byte-identical to the package built before the kernel moved.
 - `output.convert` through the device, against the `--gpu=off` reference, has a
   peak error of 1 LSB16 on 385 525 of 10 139 424 pixels (3.8%). The packed
   8-bit nodes are not reachable from the CLI; `stage-residency-test` compares
@@ -140,6 +144,7 @@ peak absolute error is zero for the synthetic node tests:
   # PASS  pef/stage-device-resize     max_pae=1.5259e-05
   # PASS  pef/stage-device-transform  max_pae=1.5259e-05
   # PASS  pef/stage-device-output     max_pae=1.5259e-05
+  # PASS  pef/stage-device-rgbproc    max_pae=1.5259e-05
   ```
 - The preview sweep (16 states, 32 images) and the crop harness (30 PPM files)
   are identical with the switch off and on, but neither graph runs a stage-ABI

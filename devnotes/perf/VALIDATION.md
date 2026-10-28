@@ -136,6 +136,7 @@ node ran on the device rather than only comparing pixels.
 | Transform (rotate 5 degrees) | PASS, `max_pae=1.5259e-05` |
 | Transform identity, device | exact, and fails when `sint` is mutated to 0.05 |
 | Output conversion (neutral) | PASS, `max_pae=1.5259e-05` |
+| RGB tone stage (`rgbproc-exposure`) | PASS, `max_pae=1.5259e-05` |
 | Packed 8-bit Lab to RGB | byte-exact against an independent reference, and fails when the device matrix is scaled by 1.001 |
 | `monitor.output`, `viewport.output` in the GUI | device records with `impl=opencl`, `source=opencl`; preview image area identical to a CPU-only run (0 LSB8) |
 | `thumbnail.output` via the file browser | 12 device records; thumbnail cache byte-identical to a CPU-only run |

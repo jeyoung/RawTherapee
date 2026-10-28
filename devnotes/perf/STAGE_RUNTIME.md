@@ -216,6 +216,31 @@ export use, the file browser generates its thumbnails on the device (12 records
 for the visible corpus) and the thumbnail cache is byte-identical to a CPU-only
 run.
 
+## RGB tone stage
+
+`rgb.proc` runs the RGB tone and Lab conversion on the device. The kernel is
+shared with the classic backend through
+`rtengine/stage/algorithms/rgb_proc_cl.h`, and it keeps the classic signature:
+three source planes, three Lab planes, ten tables (highlight, shadow and tone
+LUTs, three optional RGB curves, the two Lab caches, the channel mixer and the
+XYZ matrix), then the dimensions and seven scalars. The argument order the
+stage node uses is documented at `run_rgb_proc`.
+
+Two details are worth keeping:
+
+- The kernel indexes with `get_global_id(0)`/`get_global_id(1)`, so the launch
+  is two-dimensional. A one-dimensional range writes only the first row, which
+  is the second time this class of mistake has appeared; the other device
+  kernels derive x and y from a flat id and must be launched one-dimensionally.
+- The three destination planes are read back after a wait, so the node reports
+  `asynchronous=false` while still naming the device. That keeps the event
+  honest without inventing a multi-plane submission type.
+
+The stage node runs inside the classic opt-in: `RT_OPENCL_RGBPROC=1` plus the
+same tool exclusions (black and white, HSV equalizer, film simulation, colour
+toning and the rest). Parity is 1 LSB at 16-bit on 4% of pixels, and the
+classic path stays byte-identical to the package before the kernel moved.
+
 ## Pilot stage
 
 `lanczos3` is the pilot. The arithmetic lives in
