@@ -94,6 +94,51 @@ dynamic session period: the engine measures the current image's full refresh
 125 ms fallback until a measurement exists. The period follows the active tab.
 There is no preference. See `devnotes/perf/PREVIEW_REFRESH.md`.
 
+### Fixed defect: second image stuck at the rough stage
+
+Single-tab mode reuses the editor, the image area and the crop window when
+another image is opened. The previous image's teardown calls
+`CropHandler::close()`, which disables the handler; `newImage()` then bound the
+next coordinator without re-enabling it. `setDetailedCrop()` returned early, so
+the second image never received a crop, `ImageArea::initialImageArrived()`
+never re-fitted the view and a zoom requested nothing. The viewport stayed on
+the stale rough block.
+
+`CropHandler::newImage()` now re-enables the handler before binding the
+listener. `close()` remains the only disabling path, and a new image always
+wants rendering. Multi-tab mode creates a fresh crop window and was unaffected;
+the first image and detail windows keep their previous behaviour.
+
+Evidence: host CPU build under Xvfb 1600x1000, fresh `RT_SETTINGS` and
+`RT_CACHE`, default 1200x680 window, 10.2 MP PEF then 25.9 MP X-Trans RAF
+opened from the file-browser filmstrip. The reference is the same RAF opened
+first in a fresh session and zoomed the same way; the viewport region excludes
+the side panels and tooltips.
+
+| Check | Before | After |
+|---|---|---|
+| Second image at 100 %, viewport AE against the reference | 180401 | 0 |
+| Second image at fit, inner viewport AE against the reference | 84981 | 6 |
+| Second image request | no crop render; pixelated block | sharp image |
+| Multi-tab, same sequence | — | sharp, no crash |
+
+The fit figure is 6 pixels of 154440, consistent with render rounding rather
+than a stale pass. `tools/perf/test-fast-preview.sh` and
+`tools/perf/test-preview-base-cache.sh` passed on the CPU build, and both the
+CPU and OpenCL configurations compiled.
+
+Package: `rawtherapee-5.13-166-g0379bb37e_5.13+git13187.0379bb37e-1_amd64.deb`
+(27 MB), SHA-256
+`3967bf4e4bbf1de29a0c7d38456fa2353d8d7090e6091bf060197148a39677d0`.
+
+Debian 12 and Debian 13 containers each installed the package, listed `jxl`,
+exported the public PEF as 16-bit TIFF with `OMP_NUM_THREADS=1` (AE = 0 against
+the host export) and opened the image in the GUI under Xvfb. The extracted
+package binary passed the same single-tab two-image sequence with AE = 0 at
+100 % against the reference. Host GPU diagnostics on the package binary
+passed: `--gpu-test` on the AMD Radeon RX 550 and `--gpu-test-monitor`
+(max 1 byte, 14 of 196608 samples).
+
 
 ## Initial-load reveal
 
