@@ -69,6 +69,14 @@ edges-only, halo control, show-mask, `blurradius >= 0.25` and the USM sigma
 limit are host residuals; they run the `output.sharpen` host builtin and are
 recorded as `impl=host`, never as a device pass.
 
+`lab.sharpening` is partial through the same `output.sharpen` node:
+`ImProcFunctions::sharpening()` is the entry point for both the Lab block and
+the post-resize block, so a Lab-only profile records `output.sharpen`. The
+rest of the Lab block is host-only: impulse denoise, defringe, ML sharpen
+edges and ML microcontrast. Those tools are off by default; when one is
+enabled the block is not atomic, because that pass stays on the host while the
+main sharpen node may still run on the device.
+
 | Id | Domain (export/preview/crop/thumbnail) | Consumer | Reuse | Role | Device |
 |----|----------------------------------------|----------|-------|------|--------|
 | `source.select` | Full/Full/Full/Full | path | recompute | select the frame to process | no |
@@ -81,7 +89,7 @@ recorded as `impl=host`, never as a device pass.
 | `local.adjustments` | Full/Full/Roi/Reduced | path | reuse-input | local lab / selective editing | no |
 | `rgb.proc` | Full/Full/Roi/Reduced | path | reuse-input | RGB curves, tone curve, colour toning, B&W, channel mixer, HSV, film simulation | yes |
 | `lab.tools` | Full/Full/Roi/Reduced | path | reuse-input | shadows/highlights, Lab curves, local contrast, vibrance, EPD, Lab-grid colour toning | no |
-| `lab.sharpening` | Full/-/Roi/- | path | reuse-input | impulse denoise, defringe, microcontrast, sharpening | no |
+| `lab.sharpening` | Full/-/Roi/- | path | reuse-input | impulse denoise, defringe, ML sharpen edges, ML microcontrast and the main sharpen pass (shared `output.sharpen` node) | partial |
 | `lab.wavelet` | Full/Full/Roi/Reduced | path | reuse-input | directional pyramid equaliser and wavelet | no |
 | `working.trc` | Full/Full/Roi/- | path | reuse-input | soft light, tone equaliser and working-TRC conversion | no |
 | `ciecam` | Full/Full/Roi/- | path | reuse-input | CIE CAM 02 | no |

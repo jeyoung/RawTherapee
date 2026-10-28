@@ -471,6 +471,33 @@ which POCL does, and float otherwise; the fallback only affects the final
 rounding of a sample. A device that cannot build the program falls back to the
 host builtin, so the node still produces the CPU result.
 
+### Lab sharpening shares the node
+
+`ImProcFunctions::sharpening()` is the entry point for both blocks. The
+post-resize call is `stage_output_sharpen()` and the Lab call is
+`stage_lab_sharpening()` in `rtengine/simpleprocess.cc`; the latter runs before
+resize and is not gated on `labResize`. The node therefore keeps the name
+`output.sharpen` in both places. A Lab-only profile with `[Resize]
+Enabled=false` reaches the node from `lab.sharpening` and records
+`"stage":"output.sharpen","impl":"opencl","source":"opencl"` at the full frame
+size, not at a resized size.
+
+The rest of `lab.sharpening` is host-only: impulse denoise, defringe, ML
+sharpen edges and ML microcontrast run before or beside the main sharpen call.
+They are off by default. When one is enabled the block is only partially
+device-covered: the extra pass stays on the host while the shared sharpen node
+may still run on the device. This is the atomicity caveat for the block — it
+is not one device pass and there is no block-level device record.
+
+Evidence, POCL CPU, `RT_OPENCL_ALLOW_CPU=1 RT_OPENCL_RGBPROC=1
+RT_STAGE_OPENCL=1 RT_STAGE_PROFILE=... OMP_NUM_THREADS=1`, export with
+`rawtherapee-graph-cli --gpu=auto` against a `--gpu=off` export:
+
+| Case | Result |
+|---|---|
+| `[Resize] Enabled=false`, `[Sharpening] Enabled=true Method=usm`, default values | record `"stage":"output.sharpen","impl":"opencl","source":"opencl"`, width 3888, height 2608; TIFF PAE `1.5259e-05` (1 LSB16), 392 345 of 30 419 712 samples differ |
+| the same profile plus `[SharpenEdge] Enabled=true` | the ML edge pass is host-side, the shared node still records `impl=opencl`; TIFF PAE `1.5259e-05`, 392 387 of 30 419 712 samples differ |
+
 ## Thumbnail white balance
 
 `thumbnail.whitebalance` applies the white-balance multipliers that the host
