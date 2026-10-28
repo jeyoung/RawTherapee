@@ -1,0 +1,8 @@
+[Color Management]
+WorkingProfile=Rec2020
+WorkingTRC=22
+TrcExp=true
+
+[SoftLight]
+Enabled=true
+Strength=50

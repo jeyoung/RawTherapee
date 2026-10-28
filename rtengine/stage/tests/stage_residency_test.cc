@@ -21,8 +21,10 @@
 #include "improcfun.h"
 #include "procparams.h"
 #include "settings.h"
+#include "utils.h"
 #include "stage/algorithms/gamut_cl.h"
 #include "stage/algorithms/sharpen_cl.h"
+#include "stage/working_trc_context.h"
 
 #include "sharpen_core.h"
 
@@ -2332,6 +2334,34 @@ void fill_lab(LabImage& lab, unsigned seed)
 }
 
 /*
+ * A source image inside the working gamut: smooth linear RGB converted to Lab
+ * with the same helpers the engine uses. The device node admits this range;
+ * the random fill above deliberately leaves it and is a residual case.
+ */
+void fill_lab_in_gamut(LabImage& lab, const Glib::ustring& workingProfile)
+{
+    const TMatrix wp =
+        rtengine::ICCStore::getInstance()->workingSpaceMatrix(workingProfile);
+    for (int y = 0; y < lab.H; ++y) {
+        for (int x = 0; x < lab.W; ++x) {
+            const float u = static_cast<float>(x) /
+                            static_cast<float>(std::max(lab.W - 1, 1));
+            const float v = static_cast<float>(y) /
+                            static_cast<float>(std::max(lab.H - 1, 1));
+            const float r = 2000.f + 60000.f * (0.6f * u + 0.2f * v);
+            const float g = 1500.f + 50000.f * (0.5f * v + 0.3f * (1.f - u));
+            const float b = 2500.f + 55000.f * (0.4f * u + 0.5f * v);
+            float X = 0.f;
+            float Y = 0.f;
+            float Z = 0.f;
+            rtengine::Color::rgbxyz(r, g, b, X, Y, Z, wp);
+            rtengine::Color::XYZ2Lab(X, Y, Z, lab.L[y][x], lab.a[y][x],
+                                     lab.b[y][x]);
+        }
+    }
+}
+
+/*
  * The host block of stage_gamut(), assembled from the production functions:
  * Color::Lab2XYZ, Color::xyz2rgb, ImProcFunctions::gamutcompr, Color::rgbxyz
  * and Color::XYZ2Lab, in the same order.
@@ -2738,6 +2768,320 @@ struct SharpenCase {
     bool exact;
     bool smooth;
 };
+
+
+
+/* Color::init()'s sRGB inverse table, the only LUT workingtrc() uses in its
+ * fixed first pass. The rest of the initialisation needs the engine-wide
+ * Settings and ICC stores. */
+void init_srgb_inverse()
+{
+    constexpr int ENTRIES = 65536;
+    constexpr float MAX_VALUE = 65535.0f;
+
+    rtengine::Color::igammatab_srgb(ENTRIES, 0);
+    for (int i = 0; i < ENTRIES; ++i) {
+        rtengine::Color::igammatab_srgb[i] =
+            rtengine::Color::igamma2(i / 65535.0);
+    }
+    rtengine::Color::igammatab_srgb *= MAX_VALUE;
+}
+
+struct WorkingTrcCase {
+    const char* label;
+    int width;
+    int height;
+    rtengine::procparams::ColorManagementParams::WorkingTrc trc;
+    double gamma;
+    double slope;
+    bool gamut;
+    double saturation;
+    /* The configuration belongs to the device set. */
+    bool configSupported;
+    /* The source stays inside the working gamut. */
+    bool inGamut;
+};
+
+/*
+ * The production host block, the device node and the call-site contract.
+ *
+ * The supported cases run in-gamut source data; a configuration that leaves
+ * the working gamut is inside the configuration set but the setup refuses it,
+ * so it must fall back. The final Lab is compared within one LSB16. A residual
+ * - a switch the node does not implement, or the out-of-gamut case - must be
+ * refused by the launcher and executed by the host builtin, byte for byte.
+ */
+void test_working_trc(bool available)
+{
+    using namespace rtengine::stage;
+    using WorkingTrc =
+        rtengine::procparams::ColorManagementParams::WorkingTrc;
+
+    init_lab_caches();
+    init_srgb_inverse();
+
+    static rtengine::Settings test_settings{};
+    rtengine::settings = &test_settings;
+
+    /* The engine creates the lcms mutex in rtengine::init(); a standalone
+     * test provides one so the profile transform path is safe. */
+    static MyMutex test_lcms_mutex;
+    if (rtengine::lcmsMutex == nullptr) {
+        rtengine::lcmsMutex = &test_lcms_mutex;
+    }
+
+    {
+        rtengine::procparams::ProcParams defaults;
+        check(!workingTrcSupported(defaults),
+              "working.trc refuses WorkingTRC=none");
+    }
+
+    const WorkingTrcCase cases[] = {
+        {"gamma 2.2", 238, 24, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, true, 0.5, true, true},
+        {"bt709", 238, 24, WorkingTrc::BT709, 2.2, 4.5, true, 0.5, true, true},
+        {"srgb", 238, 24, WorkingTrc::SRGB, 2.4, 12.92310, true, 0.5, true, true},
+        {"gamma 1.8", 238, 24, WorkingTrc::GAMMA_1_8, 1.8, 4.5, true, 0.5, true, true},
+        {"linear", 238, 24, WorkingTrc::LINEAR, 1.0, 1.0, true, 0.5, true, true},
+        {"no gamut", 238, 24, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, false, 0.5, true, true},
+        {"no saturation", 179, 17, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, true, 0.0, true, true},
+        {"full saturation", 238, 24, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, true, 1.0, true, true},
+        {"odd width", 179, 17, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, true, 0.5, true, true},
+        {"out of gamut", 238, 24, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, true, 0.5, true, false},
+        {"midtone equaliser", 238, 24, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, true, 0.5, false, false},
+        {"soft light", 179, 17, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, true, 0.5, false, false},
+    };
+
+    if (!available) {
+        skip("working.trc: no OpenCL device");
+    } else {
+        check(node_has_device_implementation("working.trc"),
+              "the working.trc node has a device implementation");
+    }
+
+    const std::string profile_path =
+        std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp") +
+        "/stage-residency-working-trc.jsonl";
+
+    for (const WorkingTrcCase& item : cases) {
+        rtengine::procparams::ProcParams params;
+        params.icm.workingProfile = "Rec2020";
+        params.icm.workingTRC = item.trc;
+        params.icm.trcExp = true;
+        params.icm.wGamma = item.gamma;
+        params.icm.wSlope = item.slope;
+        params.icm.gamut = item.gamut;
+        params.icm.wapsat = item.saturation;
+        if (std::strcmp(item.label, "soft light") == 0) {
+            params.softlight.enabled = true;
+            params.softlight.strength = 50;
+        } else if (std::strcmp(item.label, "midtone equaliser") == 0) {
+            params.icm.wmidtcie = 25.0;
+        }
+        check(workingTrcSupported(params) == item.configSupported,
+              (std::string("working.trc ") + item.label +
+               " resolves to the expected configuration set").c_str());
+
+        rtengine::ImProcFunctions ipf(&params, false);
+
+        LabImage source(item.width, item.height);
+        if (item.inGamut) {
+            fill_lab_in_gamut(source, params.icm.workingProfile);
+        } else {
+            fill_lab(source, 7u);
+        }
+
+        LabImage cpu(item.width, item.height);
+        cpu.CopyFrom(&source);
+        workingTrcHostBlock(ipf, params, cpu);
+
+        LabImage device(item.width, item.height);
+        device.CopyFrom(&source);
+
+        WorkingTrcContext context(params, ipf);
+        const bool expectDevice = available && item.configSupported &&
+                                  item.inGamut;
+        RtWorkingTrcContext descriptor =
+            context.descriptor(item.configSupported);
+
+        RtStageArg args[6] = {};
+        args[0].kind = RT_STAGE_ARG_BUFFER;
+        args[0].u.buffer = view(device);
+        args[1].kind = RT_STAGE_ARG_PTR;
+        args[1].u.ptr = &descriptor;
+        args[2].kind = RT_STAGE_ARG_INT;
+        args[2].u.i = item.configSupported ? 1 : 0;
+        args[3].kind = RT_STAGE_ARG_DOUBLE;
+        args[3].u.f = item.saturation;
+        bool deviceReady = false;
+        if (item.configSupported) {
+            RtWorkingTrcResult setup{};
+            check(context.prepare(source), "working.trc host prefix runs");
+            deviceReady = context.build(setup) == 0;
+            check(deviceReady == item.inGamut,
+                  (std::string("working.trc ") + item.label +
+                   " setup acceptance matches the gamut").c_str());
+            if (deviceReady) {
+                args[4].kind = RT_STAGE_ARG_BUFFER;
+                args[4].u.buffer = view(context.xyz());
+                args[5].kind = RT_STAGE_ARG_BUFFER;
+                args[5].u.buffer = view(context.linearReference());
+            }
+        }
+        descriptor.supported = deviceReady ? 1u : 0u;
+
+        std::remove(profile_path.c_str());
+        setenv("RT_STAGE_PROFILE", profile_path.c_str(), 1);
+        set_node_device_override("working.trc", StageNodeDevice::OpenCL);
+        const RtStageStatus status = run(
+            "working.trc", std::vector<RtStageArg>(args, args + 6));
+        clear_node_device_overrides();
+        const std::string profile = read_file(profile_path);
+        unsetenv("RT_STAGE_PROFILE");
+
+        check(status == RT_STAGE_OK,
+              (std::string("working.trc ") + item.label +
+               " completes through run()").c_str());
+        check(profile.find("\"stage\":\"working.trc\"") != std::string::npos,
+              (std::string("working.trc ") + item.label +
+               " records the node").c_str());
+
+        const Diff diff = compare(view(device), view(cpu));
+        std::printf("stage-residency: working.trc %s %dx%d %s: PAE %.6f "
+                    "LSB16, %zu of %zu samples differ\n",
+                    item.label, item.width, item.height,
+                    expectDevice ? "device" : "host", diff.max_abs,
+                    diff.differing, diff.samples);
+        check(diff.finite,
+              (std::string("working.trc ") + item.label +
+               " stays finite").c_str());
+
+        if (expectDevice) {
+            check(profile.find("\"impl\":\"opencl\"") != std::string::npos,
+                  (std::string("working.trc ") + item.label +
+                   " records a device execution").c_str());
+            check(diff.max_abs <= 1.0,
+                  (std::string("working.trc ") + item.label +
+                   " is within one LSB16").c_str());
+        } else {
+            check(profile.find("\"impl\":\"host\"") != std::string::npos,
+                  (std::string("working.trc ") + item.label +
+                   " records a host execution").c_str());
+            check(profile.find("\"impl\":\"opencl\"") == std::string::npos,
+                  (std::string("working.trc ") + item.label +
+                   " never mixes a device pass").c_str());
+            check(diff.differing == 0 && diff.max_abs == 0.0,
+                  (std::string("working.trc ") + item.label +
+                   " matches the CPU block").c_str());
+        }
+    }
+
+    if (!available) {
+        return;
+    }
+
+    /*
+     * Probe parity. The setup runs on the one device readback; the reference
+     * runs the same production setup on a host first pass. The two first
+     * passes are the same image up to the host's SSE/scalar rounding, so the
+     * means are expected to agree to a few float ulps.
+     */
+    {
+        rtengine::procparams::ProcParams params;
+        params.icm.workingProfile = "Rec2020";
+        params.icm.workingTRC = WorkingTrc::GAMMA_2_2;
+        params.icm.trcExp = true;
+        params.icm.gamut = true;
+        params.icm.wapsat = 0.5;
+        rtengine::ImProcFunctions ipf(&params, false);
+
+        LabImage source(238, 24);
+        fill_lab_in_gamut(source, params.icm.workingProfile);
+
+        LabImage reference_source(238, 24);
+        reference_source.CopyFrom(&source);
+        rtengine::Imagefloat first(238, 24);
+        ipf.lab2rgb(reference_source, first, params.icm.workingProfile);
+
+        float rdx = 0.f, rdy = 0.f, grx = 0.f, gry = 0.f, blx = 0.f,
+              bly = 0.f;
+        float meanx = 0.f, meany = 0.f, meanxe = 0.f, meanye = 0.f,
+              maxdat = 0.f;
+        double p[6] = {0., 0., 0., 0., 0., 0.};
+        cmsHTRANSFORM dummy = nullptr;
+        int ill = 0;
+        Glib::ustring prof = params.icm.workingProfile;
+        ipf.workingtrc(0, &first, &first, first.getWidth(), first.getHeight(),
+                       -5, prof, WORKING_TRC_FIRST_GAMMA,
+                       WORKING_TRC_FIRST_SLOPE, 0, ill, 0, 0, rdx, rdy, grx,
+                       gry, blx, bly, meanx, meany, meanxe, meanye, maxdat, p,
+                       dummy, true, false, false, false);
+
+        Imagefloat probe(238, 24);
+        first.copyData(&probe);
+        float refMeanX = 0.f;
+        float refMeanY = 0.f;
+        cmsHPROFILE refProfile = nullptr;
+        double refPrim[9] = {};
+        ipf.workingtrc(0, &probe, &probe, probe.getWidth(), probe.getHeight(),
+                       5, prof, params.icm.wGamma, params.icm.wSlope,
+                       rtengine::toUnderlying(params.icm.wcat), ill, 0, 0,
+                       rdx, rdy, grx, gry, blx, bly, meanx, meany, meanxe,
+                       meanye, maxdat, p, dummy, false, true, true,
+                       params.icm.gamut, &refMeanX, &refMeanY, &refProfile,
+                       true, refPrim);
+        check(refProfile != nullptr,
+              "working.trc probe reference builds a profile");
+        if (refProfile != nullptr) {
+            cmsCloseProfile(refProfile);
+        }
+
+        LabImage device(238, 24);
+        device.CopyFrom(&source);
+        WorkingTrcContext context(params, ipf);
+        RtWorkingTrcContext descriptor = context.descriptor(true);
+        check(context.prepare(source), "working.trc probe prefix runs");
+        RtWorkingTrcResult probeSetup{};
+        check(context.build(probeSetup) == 0,
+              "working.trc probe setup builds");
+        descriptor.supported = 1u;
+        RtStageArg args[6] = {};
+        args[0].kind = RT_STAGE_ARG_BUFFER;
+        args[0].u.buffer = view(device);
+        args[1].kind = RT_STAGE_ARG_PTR;
+        args[1].u.ptr = &descriptor;
+        args[2].kind = RT_STAGE_ARG_INT;
+        args[2].u.i = 1;
+        args[3].kind = RT_STAGE_ARG_DOUBLE;
+        args[3].u.f = params.icm.wapsat;
+        args[4].kind = RT_STAGE_ARG_BUFFER;
+        args[4].u.buffer = view(context.xyz());
+        args[5].kind = RT_STAGE_ARG_BUFFER;
+        args[5].u.buffer = view(context.linearReference());
+
+        set_node_device_override("working.trc", StageNodeDevice::OpenCL);
+        const RtStageStatus status =
+            run("working.trc", std::vector<RtStageArg>(args, args + 6));
+        clear_node_device_overrides();
+
+        const double deltaX =
+            std::fabs(context.meanx() - static_cast<double>(refMeanX));
+        const double deltaY =
+            std::fabs(context.meany() - static_cast<double>(refMeanY));
+        std::printf("stage-residency: working.trc probe: device "
+                    "%.9g/%.9g host %.9g/%.9g delta %.3g/%.3g\n",
+                    context.meanx(), context.meany(),
+                    static_cast<double>(refMeanX),
+                    static_cast<double>(refMeanY), deltaX, deltaY);
+        check(status == RT_STAGE_OK, "the probe parity run completes");
+        check(context.built(), "the probe parity run built its setup");
+        /*
+         * The probe now runs on the host prefix, so its means are the host
+         * block's means bit for bit on every device.
+         */
+        check(deltaX == 0.0 && deltaY == 0.0,
+              "the probe means are the host means bit for bit");
+    }
+}
 
 void test_output_sharpen(bool available)
 {
@@ -3269,6 +3613,7 @@ int main()
     test_rgb_proc_pitch(available);
     test_framing(available);
     test_gamut(available);
+    test_working_trc(available);
     test_output_sharpen(available);
     test_run_wiring(available);
 
