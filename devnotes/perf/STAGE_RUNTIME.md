@@ -257,10 +257,12 @@ to a CPU-only run.
 The plan assumed these were cheaper than step 5's kernels. Inspection says
 otherwise, so the next session does not start from that assumption:
 
-- `thumbnail.rgb` and `thumbnail.lab` are composites: colour-space conversion,
-  analysis, geometry, local adjustments and RGB or Lab processing folded into
-  one block.
+- `thumbnail.lab` is a composite: Lab tools, local contrast, working-TRC
+  conversion, CIE CAM and gamut compression folded into one block.
 - `thumbnail.decode` is a JPEG decode, not a kernel.
+
+`thumbnail.rgb` is also a composite, but its dominant pixel passes are the
+existing `transform` and `rgb.proc` device nodes; see *Thumbnail RGB* below.
 
 ## Thumbnail coarse transform
 
@@ -358,6 +360,209 @@ Evidence (POCL CPU device, `RT_OPENCL_ALLOW_CPU=1 RT_REQUIRE_GPU=1`,
   thumbnail run recorded for `thumbnail.output` was not repeated with the
   scale node on the device. That interactive path is uncovered rather than
   passed.
+
+## Thumbnail RGB
+
+`thumbnail.rgb` is the composite `Thumbnail::stageRgb()`
+(`rtengine/rtthumbnail.cc:2121`). It owns no kernel: its two dominant pixel
+passes are sub-nodes that already have device implementations, and the rest of
+the block is host-side residual. The catalogue therefore marks it `partial`.
+
+### Passes and coverage
+
+In execution order, with the call site in `stageRgb()`:
+
+| Pass | Site | Coverage |
+|------|------|----------|
+| film negative, input colour space | `rtthumbnail.cc:2158` | host |
+| colour-space conversion, raw | `rtthumbnail.cc:2165` | host |
+| colour-space conversion, non-raw | `rtthumbnail.cc:2167` | host |
+| film negative, working space | `rtthumbnail.cc:2172` | host |
+| first analysis | `rtthumbnail.cc:2179` | host |
+| dehaze | `rtthumbnail.cc:2181` | host |
+| Fattal tone mapping | `rtthumbnail.cc:2182` | host |
+| geometry transform | `rtthumbnail.cc:2191` | device node `transform` |
+| `rgb2lab` for local adjustments | `rtthumbnail.cc:2224` | host |
+| `calc_ref` | `rtthumbnail.cc:2459` and `:2461` | host |
+| `Lab_Local` | `rtthumbnail.cc:2505` | host |
+| `lab2rgb` after local adjustments | `rtthumbnail.cc:2577` | host |
+| `moyeqt` colour-toning scan | `rtthumbnail.cc:2639` | host |
+| RGB tone and Lab conversion | `rtthumbnail.cc:2672` | device node `rgb.proc` |
+
+The auto-exposure derivation at `:2213` reads the analysis histogram and
+produces parameters; it is not a pixel pass. The two local-adjustment passes
+and the colour-toning scan only run when their tools are enabled. The LUT
+construction around the block (`CurveFactory::complexCurve` `:2596`, `RGBCurve`
+`:2605-2607`, `colorToning.getCurves` `:2618`, `curveBW` `:2628`) is host-side
+table work whose output `rgb.proc` consumes.
+
+Both device nodes also have a classic OpenCL backend:
+`opencl::transformRotateScale` (`iptransform.cc:1245`) and `opencl::rgbProc`
+(`improcfun.cc:2600`). They are tried only when the stage resolver declines the
+node. No other pass in this block has one: the remaining passes have no
+`opencl::` call site in their implementations.
+
+The device nodes are reached through their existing gates, not through a
+thumbnail-specific one. `transform` needs acceleration allowed, an enabled
+device and no lens, CA, distortion, vignette, gradient or post-crop-vignette
+work (`iptransform.cc:1225-1244`). `rgb.proc` sits inside the classic
+`RT_OPENCL_RGBPROC=1` opt-in and its tool exclusions (`improcfun.cc:2528-2543`),
+so the `rgb.proc` record needs that variable in addition to
+`RT_STAGE_OPENCL=1`. That is the documented classic gate, not a thumbnail
+wiring gap: with the variable unset the node is not offered to the runtime and
+no record is written.
+
+### Evidence
+
+Sidecar: `devnotes/opencl/pp3/rgbproc-exposure.pp3` plus
+`[Rotation] Degree=90`, so `needsTransform()` is true and both sub-nodes run.
+It is kept untracked at `build/test-scratch/thumb-rgb/thumb-rgb.pp3`.
+
+```bash
+PEF=${RT_TESTDATA:-$PWD/build/rt-testdata}/colorspace_flowers.pef
+SCRATCH=$PWD/build/test-scratch/thumb-rgb
+OCL_ICD_VENDORS=$PWD/build/test-scratch/pocl-icd RT_OPENCL_ALLOW_CPU=1 \
+OMP_NUM_THREADS=1 RT_SETTINGS=$SCRATCH/rt-settings RT_CACHE=$SCRATCH/rt-cache \
+RT_STAGE_OPENCL=1 RT_STAGE_PROFILE=$SCRATCH/device.jsonl \
+RT_OPENCL_RGBPROC=1 \
+build/opencl-perf-graph/rtengine/thumbnail-stage-test "$PEF" \
+    $SCRATCH/thumb-rgb.pp3 160 $SCRATCH/device
+```
+
+The host twin runs the same binary and arguments with `RT_STAGE_OPENCL`,
+`RT_STAGE_PROFILE` and `RT_OPENCL_RGBPROC` unset and with `OCL_ICD_VENDORS`
+pointing at an empty directory. The empty directory is required: with
+`RT_STAGE_OPENCL` unset alone, an ambient ICD (`rusticl.icd`, `mesa.icd`) is
+still found, `opencl::enabled()` is true because the user preference is on, and
+the classic backend handles `transform` and the Lab-to-RGB sinks. The "host"
+run is then a classic-backend run and agrees with the device by construction.
+With no ICD the backend is off and the reference is the CPU code; a run of the
+CPU build reproduces that hash exactly.
+
+```bash
+mkdir -p $SCRATCH/empty-icd
+OCL_ICD_VENDORS=$SCRATCH/empty-icd OMP_NUM_THREADS=1 \
+RT_SETTINGS=$SCRATCH/rt-settings RT_CACHE=$SCRATCH/rt-cache \
+build/opencl-perf-graph/rtengine/thumbnail-stage-test "$PEF" \
+    $SCRATCH/thumb-rgb.pp3 160 $SCRATCH/host
+```
+
+A third run keeps `RT_STAGE_OPENCL=1` but leaves `RT_OPENCL_RGBPROC` unset, so
+`transform` and the other thumbnail nodes run on the device while `rgb.proc`
+stays on the host. POCL's CPU device is selected, so these are CPU-device runs,
+never GPU parity.
+
+Both sub-node records appear, chained by their hashes: `transform` reads
+`a677044a3725d807` and writes `142265ab331fb8d6`, which is exactly `rgb.proc`'s
+input:
+
+```text
+{"stage":"transform","impl":"opencl","source":"opencl","consumer":"interactive",
+ "ns":918149,"width":238,"height":160,"threads":0,"cache_hit":0,
+ "input_hash":"a677044a3725d807","output_hash":"142265ab331fb8d6"}
+{"stage":"rgb.proc","impl":"opencl","source":"opencl","consumer":"interactive",
+ "ns":0,"width":238,"height":160,"threads":0,"cache_hit":0,
+ "input_hash":"142265ab331fb8d6","output_hash":"9704335b08c4d157"}
+```
+
+(The records above are re-wrapped for width; the file is one JSON object per
+line. The `rgb.proc` `output_hash` is not stable between passes; see below.)
+
+PPM results against the pure CPU host:
+
+| Run | `raw-graph.ppm` sha256 | Samples differing from the host |
+|-----|------------------------|---------------------------------|
+| device, both nodes, 238x160 | `42f3f55a919c753288536ebba92faa550998e6fc8e4f9cb0211042b6082b564c` | 944 of 114 240: 943 in rows 158-159 (max 205), 1 at row 29 (1 LSB8) |
+| device `transform`, host `rgb.proc`, 238x160 | `27a9c5f4fd5ae6cf5d05444faf7f0980af37336e95693750defbb45845696f42` | 1 of 114 240, 1 LSB8 (row 29) |
+| device, both nodes, 240x161 | `bed2f0bcfe2149d14cc0b18d2acdcc79a5785d9fa025d07e376aa3b2f15eef90` | 2 of 115 920, 1 LSB8 |
+| pure host, 238x160 | `c712e74faf30ff5bd826112d52804e46a3857c1ef2d7214317d662abfb6ccf84` | reference |
+| pure host, 240x161 | `b5aca018d1f5aeda467688722c77fb0dcbb9ac6e3ffc6ee4fc38d0e00baad944` | reference |
+
+The both-node device hash at 238x160 is not stable: an earlier run of the same
+command gave `1afeaf31e436d28394948cae9ff024e56b36120454638aefd77eb18243765370`
+with 948 samples differing. The extra differing samples are always in the same
+two rows, 158 (232-234 bytes) and 159 (708-711 bytes), 316 pixels in total.
+
+No pair is byte-identical. Two effects are separable:
+
+- the device kernels differ from the CPU arithmetic by 1 LSB8 on 1-2 samples
+  (one row-29 sample with `transform` on and `rgb.proc` off; two samples at
+  240x161 with both on), the 8-bit face of the documented 1 LSB16 kernel
+  tolerance;
+- at 238 px the `rgb.proc` tail defect below adds 943 samples with differences
+  up to 245.
+
+The embedded-JPEG branch is byte-identical in every run, 239x160, sha256
+`d961f0b52aaa8db2c7acd3c0a5924ad3ef22942156617bdf8fc204d52bd65514`.
+
+### `rgb.proc` device defect at padded row widths
+
+The shared kernel `rt_rgb_proc` indexes compactly, `index = y * width + x`
+(`rtengine/stage/algorithms/rgb_proc_cl.h`), and takes no row-pitch arguments.
+The stage device allocates each plane with `row_pitch` rounded up to
+`STAGE_BUFFER_ALIGNMENT` = 64 bytes (`stage_device.cc:119`,
+`stage_device.h:172`). Upload and readback use the same pitched rectangle, so
+the compact indexing cancels and every sample the kernel writes reads back
+correctly. The write range, however, ends at `width * height` samples while the
+allocation holds `row_pitch / 4 * height`; the tail of
+`(row_pitch / 4 - width) * height` samples is never written and readback
+returns whatever the allocation held.
+
+At width 238 a row is 952 bytes, padded to 960, so 2 samples per row over 160
+rows stay unwritten: 320 samples, the last 1.34 rows. The measured difference
+is 943 samples of 114 240 in the recorded run and 948 in the previous one,
+always in rows 158 (232-234 bytes) and 159 (708-711 bytes), maximum 245. The
+node's `output_hash` changes between two identical passes for the same reason,
+and the recorded runs failed the harness's own two-pass comparison
+(`raw-legacy` `1afeaf31e436d28394948cae9ff024e56b36120454638aefd77eb18243765370`
+against `raw-graph` `42f3f55a…`; the first repeat failed with
+`28f82f58db690f314ed1d699c32fd7c83882cd247a2600f448e326341570ce61` against
+`1afeaf31…`) before one repeat passed.
+
+Two controls confirm the mechanism:
+
+- height 161 gives width 240, a 960-byte row, already a multiple of 64. The
+  `rgb.proc` `output_hash` is then stable (`8cf60f53eed0965f` in both passes)
+  and only 2 of 115 920 samples differ from the host, at 1 LSB8. There is no
+  tail garbage and no unstable hash.
+- height 120 gives width 179, a 716-byte row padded to 768 (192 samples), so
+  the tail is 13 samples per row, 1 560 samples. The device run segfaults
+  (exit 139) after the `thumbnail.rgb` node.
+
+This is a defect in the `rgb.proc` node, not host-only work: the fix is to give
+the kernel row pitches or to allocate it compactly, and it is outside this
+coverage change. `thumbnail.rgb` stays `partial` and its parity is recorded as
+failed, not passed. Any width whose `width * 4` is not a multiple of 64 is
+affected, which is most thumbnail widths.
+
+Even with the defect fixed, the device path differs from the CPU host by 1-2
+samples at 1 LSB8, so byte identity is not the applicable gate for this
+composite; the 1 LSB16 tolerance of `devnotes/opencl/PARITY.md` is.
+
+### Host-side residual
+
+Confirmed against the code, not copied from the block description:
+
+- colour-space conversion, raw and non-raw: `RawImageSource::colorSpaceConversion`
+  (`rawimagesource.cc:1139`) and `StdImageSource::colorSpaceConversion`
+  (`stdimagesource.cc:227`). The raw form is an lcms transform,
+  `cmsDoTransform` at `rawimagesource.cc:3568`, with a DCP branch.
+- film negative, before and after the conversion:
+  `ImProcFunctions::filmNegativeProcess` (`filmnegativeproc.cc:387`), called at
+  `rtthumbnail.cc:2158` and `:2172`.
+- first analysis: `improcfun.cc:602`, produces the histogram that feeds the
+  auto-exposure parameters, the tone curve and `rgbProc`.
+- dehaze: `ipdehaze.cc:308`.
+- Fattal tone mapping: `tmo_fattal02.cc:1067`.
+- local adjustments: `rgb2lab` (`improcfun.cc:6047`), `calc_ref`, `Lab_Local`
+  and `lab2rgb` (`improcfun.cc:6206`); enabled only with `locallab` spots.
+- colour-toning automatic saturation: `moyeqt` (`improcfun.cc:2149`), a
+  whole-image scan enabled only by `colorToning.autosat`.
+
+The dehaze and Fattal calls sit in this block rather than in `transform` on the
+thumbnail path, although the export and preview catalogues fold them into
+`transform`; the thumbnail block boundary is as implemented, and both are
+host-only.
 
 ## Pilot stage
 

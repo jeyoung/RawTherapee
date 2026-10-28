@@ -46,10 +46,17 @@ implementation:
 Ids are stable. A block that a path does not run is absent from that path's
 spec: `buildPipelineSpec()` returns the rooted subgraph, not the union.
 
-`Device` states whether the block has a stage-ABI device node today. A block's
-runtime node name can differ from its id; the name is given where it does.
-Device coverage of a composite block covers its dominant pixel pass only, and
-host-side sub-tools are listed with the node record in `STAGE_RUNTIME.md`.
+`Device` records how far a block has moved onto the stage-ABI device path:
+
+| Value | Meaning |
+|-------|---------|
+| `yes` | the block has its own stage-ABI device node |
+| `partial` | a composite block whose dominant pixel passes are device nodes; the host-side residual is named with the block record in `STAGE_RUNTIME.md` |
+| `no` | host-only: the block has no device node |
+
+A block's runtime node name can differ from its id; the name is given where it
+does. `partial` never means verified: it records device execution of the named
+sub-nodes and the residual beside it, not parity of the composite.
 
 | Id | Domain (export/preview/crop/thumbnail) | Consumer | Reuse | Role | Device |
 |----|----------------------------------------|----------|-------|------|--------|
@@ -80,7 +87,7 @@ host-side sub-tools are listed with the node record in `STAGE_RUNTIME.md`.
 | `thumbnail.scale` | -/-/-/Reduced | interactive | reuse-output | scale to thumbnail height | yes |
 | `thumbnail.transform` | -/-/-/Reduced | interactive | reuse-input | coarse rotate and flip | yes |
 | `thumbnail.whitebalance` | -/-/-/Reduced | interactive | reuse-input | apply white balance to the thumbnail | yes |
-| `thumbnail.rgb` | -/-/-/Reduced | interactive | reuse-input | thumbnail RGB processing | no |
+| `thumbnail.rgb` | -/-/-/Reduced | interactive | reuse-input | thumbnail RGB processing | partial |
 | `thumbnail.lab` | -/-/-/Reduced | interactive | reuse-input | thumbnail Lab tools, working TRC, CIE CAM and gamut in one pass | no |
 | `thumbnail.output` | -/-/-/Reduced | interactive | recompute | Lab to 8-bit thumbnail with gamma | yes |
 
@@ -1521,14 +1528,21 @@ of truth; this section records the remaining work and the naming exceptions.
 
 Device nodes today: `transform`, `rgb.proc`, `lanczos3` (block `resize`),
 `output.convert`, `monitor.output`, `viewport.output`, `thumbnail.output`,
-`thumbnail.whitebalance` and `thumbnail.transform` (plus its runtime-only
-packed sibling `thumbnail.transform.u8`).
+`thumbnail.whitebalance`, `thumbnail.scale` and `thumbnail.transform` (the last
+two plus their runtime-only packed siblings `thumbnail.scale.u8` and
+`thumbnail.transform.u8`).
+
+Partial: `thumbnail.rgb` is a composite. Its two dominant pixel passes are the
+`transform` and `rgb.proc` device nodes, so the block is `partial`; the
+colour-space conversion, film negative, first analysis, dehaze, Fattal tone
+mapping and local adjustments around them stay on the host. The sub-node
+records, the commands and the parity result are in `STAGE_RUNTIME.md`.
 
 Still CPU-only: `source.select`, `source.embedded`, `raw.preprocess`,
 `raw.demosaic`, `raw.base`, `analysis`, `local.adjustments`, `lab.tools`,
 `lab.sharpening`, `lab.wavelet`, `working.trc`, `ciecam`, `gamut`, `crop`,
-`output.sharpen`, `framing`, `output.icc`, `thumbnail.decode`,
-`thumbnail.scale`, `thumbnail.rgb` and `thumbnail.lab`.
+`output.sharpen`, `framing`, `output.icc`, `thumbnail.decode` and
+`thumbnail.lab`.
 
 Three of these are not standalone pixel kernels and need a recorded exception
 rather than a device node: `source.select` and `source.embedded` are I/O, and
