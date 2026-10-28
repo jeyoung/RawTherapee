@@ -5,7 +5,6 @@ Debian 12 container. No AppImage and no build dependencies on the target
 machine.
 
 ## Build
-
 ```bash
 tools/build-rt.sh portable
 ```
@@ -31,6 +30,11 @@ GUI under Xvfb. The test containers have no OpenCL ICD, so `--gpu-test` and
 `--gpu-test-monitor` were recorded as not run rather than passed. Interactive
 toggle checks used host Xvfb; the package test is a functional install and
 startup smoke test.
+
+The graph package has its own matrix: install on Debian 12 and 13 with
+`apt-get install ./pkg.deb`, four inputs by two outputs compared against the
+host build, Xephyr GUI checks and POCL device parity. It lives in
+`devnotes/perf/VALIDATION.md` with the artefact hash and the image digests.
 
 ## Layout
 
