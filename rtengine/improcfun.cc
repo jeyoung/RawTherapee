@@ -42,6 +42,8 @@
 #include "improcfun.h"
 #include "labimage.h"
 #include "opencl/openclengine.h"
+#include "stage/stage_buffer.h"
+#include "stage/stage_runtime.h"
 #include "pipettebuffer.h"
 #include "procparams.h"
 #include "rt_math.h"
@@ -79,6 +81,91 @@ bool buildMonitorGpuProfile(cmsHPROFILE monitor, float matrix[9],
     return buildGpuProfile(monitor, matrix, gamma);
 }
 
+
+namespace
+{
+
+/* A one-sample stand-in for a curve the mask says is unused. */
+RtStageBuffer rgbTable(const float* data, int entries)
+{
+    RtStageBuffer buffer{};
+    buffer.size = sizeof(RtStageBuffer);
+    buffer.data = const_cast<float*>(data);
+    buffer.width = entries;
+    buffer.height = 1;
+    buffer.row_pitch = static_cast<std::size_t>(entries) * sizeof(float);
+    buffer.plane_pitch = buffer.row_pitch;
+    buffer.planes = 1;
+    buffer.format = RT_STAGE_F32;
+    buffer.flags = RT_STAGE_BUFFER_READ;
+    return buffer;
+}
+
+/*
+ * Run the RGB tone and Lab conversion on the stage device. The argument order
+ * is the one `run_rgb_proc` documents in the device backend.
+ */
+bool run_rgb_proc_stage(Imagefloat& working, LabImage& lab,
+                        const opencl::RgbProcData& data)
+{
+    constexpr int INT_ARGS = 6;
+    constexpr int DOUBLE_ARGS = 3;
+    constexpr int BUFFER_ARGS = 12;
+    constexpr int ARG_COUNT = BUFFER_ARGS + INT_ARGS + DOUBLE_ARGS;
+    constexpr int LUT_ENTRIES = 65536;
+    constexpr int MATRIX_ENTRIES = 9;
+
+    static const float dummy = 0.0f;
+    const auto curve = [](const float* lut) {
+        return lut != nullptr ? lut : &dummy;
+    };
+    const auto curveSize = [](const float* lut) {
+        return lut != nullptr ? LUT_ENTRIES : 1;
+    };
+
+    RtStageArg args[ARG_COUNT]{};
+    args[0].kind = RT_STAGE_ARG_BUFFER;
+    args[0].u.buffer = stage::view(working);
+    args[1].kind = RT_STAGE_ARG_BUFFER;
+    args[1].u.buffer = stage::view(lab);
+
+    const float* tables[BUFFER_ARGS - 2] = {
+        data.hlToneCurve, data.shToneCurve, data.toneCurve,
+        curve(data.rCurve), curve(data.gCurve), curve(data.bCurve),
+        data.cachef, data.cachefy, data.channelMixer, data.toxyz};
+    const int tableSizes[BUFFER_ARGS - 2] = {
+        LUT_ENTRIES, LUT_ENTRIES, LUT_ENTRIES,
+        curveSize(data.rCurve), curveSize(data.gCurve), curveSize(data.bCurve),
+        LUT_ENTRIES, LUT_ENTRIES, MATRIX_ENTRIES, MATRIX_ENTRIES};
+
+    for (int i = 0; i < BUFFER_ARGS - 2; ++i) {
+        if (tables[i] == nullptr) {
+            return false;
+        }
+        args[2 + i].kind = RT_STAGE_ARG_BUFFER;
+        args[2 + i].u.buffer = rgbTable(tables[i], tableSizes[i]);
+    }
+
+    const int ints[INT_ARGS] = {
+        working.getWidth(), working.getHeight(), data.toneCurveBlack,
+        data.clampOog ? 1 : 0, data.mixChannels ? 1 : 0, data.rgbCurveMask};
+    for (int i = 0; i < INT_ARGS; ++i) {
+        args[BUFFER_ARGS + i].kind = RT_STAGE_ARG_INT;
+        args[BUFFER_ARGS + i].u.i = ints[i];
+    }
+    const double doubles[DOUBLE_ARGS] = {data.expScale, data.comp,
+                                         data.hlRange};
+    for (int i = 0; i < DOUBLE_ARGS; ++i) {
+        args[BUFFER_ARGS + INT_ARGS + i].kind = RT_STAGE_ARG_DOUBLE;
+        args[BUFFER_ARGS + INT_ARGS + i].u.f = doubles[i];
+    }
+
+    RtStageProfiling profiling{};
+    return stage::run("rgb.proc", std::vector<RtStageArg>(args, args + ARG_COUNT),
+                      &profiling) == RT_STAGE_OK;
+}
+
+} // namespace
 
 // begin of helper function for rgbProc()
 void shadowToneCurve(const LUTf &shtonecurve, float *rtemp, float *gtemp, float *btemp, int istart, int tH, int jstart, int tW, int tileSize)
@@ -2505,7 +2592,12 @@ void ImProcFunctions::rgbProc(Imagefloat* working, LabImage* lab, PipetteBuffer 
         gpuData.mixChannels = mixchannels;
         gpuData.rgbCurveMask = rgbCurveMask;
 
-        if (opencl::rgbProc(working, lab, gpuData)) {
+        if (stage::node_device("rgb.proc") ==
+            stage::StageNodeDevice::OpenCL) {
+            if (run_rgb_proc_stage(*working, *lab, gpuData)) {
+                return;
+            }
+        } else if (opencl::rgbProc(working, lab, gpuData)) {
             return;
         }
     }

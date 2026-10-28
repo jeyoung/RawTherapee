@@ -49,6 +49,7 @@
 #include "rt_math.h"
 #include "sleef.h"
 #include "stage/algorithms/lab_to_rgb_cl.h"
+#include "stage/algorithms/rgb_proc_cl.h"
 #include "stage/algorithms/transform_cl.h"
 #include "transformmap.h"
 
@@ -768,6 +769,12 @@ __kernel void rt_lab_to_u8(__global const float* src,
     return source;
 }
 
+const std::string& rgb_proc_source()
+{
+    static const std::string source = RT_RGB_PROC_CL;
+    return source;
+}
+
 const std::vector<KernelDef>& kernels()
 {
     static const std::vector<KernelDef> table = {
@@ -776,7 +783,8 @@ const std::vector<KernelDef>& kernels()
         {"output.convert", lab_to_float_source().c_str(), "rt_lab_to_float"},
         {"monitor.output", lab_to_u8_source().c_str(), "rt_lab_to_u8"},
         {"viewport.output", lab_to_u8_source().c_str(), "rt_lab_to_u8"},
-        {"thumbnail.output", lab_to_u8_source().c_str(), "rt_lab_to_u8"}
+        {"thumbnail.output", lab_to_u8_source().c_str(), "rt_lab_to_u8"},
+        {"rgb.proc", rgb_proc_source().c_str(), "rt_rgb_proc"}
     };
     return table;
 }
@@ -1925,6 +1933,219 @@ std::shared_ptr<OpenCLSubmission> launch_lab_to_rgb(
                                               residency, dst_device, dst);
 }
 
+
+/* A single-plane view of one plane inside a pitched image buffer. */
+RtStageBuffer plane_view(const RtStageBuffer& image, std::uint32_t plane)
+{
+    RtStageBuffer view = image;
+    view.data = static_cast<unsigned char*>(image.data) +
+                static_cast<std::size_t>(plane) * image.plane_pitch;
+    view.planes = 1;
+    return view;
+}
+
+/*
+ * RGB tone and Lab conversion. Argument order:
+ *   [0] source RGB buffer, [1] destination Lab buffer,
+ *   [2] highlight LUT, [3] shadow LUT, [4] tone LUT,
+ *   [5] red curve, [6] green curve, [7] blue curve,
+ *   [8] cachef, [9] cachefy, [10] channel mixer matrix, [11] XYZ matrix,
+ *   [12..20] ints width, height, toneCurveBlack, clampOog, mixChannels,
+ *            rgbCurveMask and doubles expScale, comp, hlRange.
+ *
+ * A LUT is 65536 samples; an absent RGB curve may be a one-sample dummy
+ * because rgbCurveMask stops the kernel reading it. The matrix tables hold
+ * nine floats. The kernel indexes compact planes, so each plane is uploaded
+ * into its own device allocation and the three destinations are read back
+ * here; the submission is therefore complete when it is returned.
+ */
+RtStageStatus run_rgb_proc(const std::shared_ptr<OpenCLEnv>& env,
+                           const std::shared_ptr<OpenCLResidency>& residency,
+                           const std::vector<RtStageArg>& args,
+                           std::string& error)
+{
+    constexpr std::size_t BUFFER_ARGS = 12;
+    constexpr std::size_t INT_ARGS = 6;
+    constexpr std::size_t DOUBLE_ARGS = 3;
+    constexpr std::size_t ARG_COUNT = BUFFER_ARGS + INT_ARGS + DOUBLE_ARGS;
+    constexpr int LUT_ENTRIES = 65536;
+    constexpr int MATRIX_ENTRIES = 9;
+
+    if (args.size() != ARG_COUNT) {
+        error = "rgb.proc expects twelve buffers, six ints and three doubles";
+        return RT_STAGE_INVALID;
+    }
+    for (std::size_t i = 0; i < BUFFER_ARGS; ++i) {
+        if (args[i].kind != RT_STAGE_ARG_BUFFER) {
+            error = "rgb.proc expects twelve buffers";
+            return RT_STAGE_INVALID;
+        }
+    }
+    for (std::size_t i = BUFFER_ARGS; i < BUFFER_ARGS + INT_ARGS; ++i) {
+        if (args[i].kind != RT_STAGE_ARG_INT) {
+            error = "rgb.proc has a non-int scalar";
+            return RT_STAGE_INVALID;
+        }
+    }
+    for (std::size_t i = BUFFER_ARGS + INT_ARGS; i < ARG_COUNT; ++i) {
+        if (args[i].kind != RT_STAGE_ARG_DOUBLE) {
+            error = "rgb.proc has a non-double scalar";
+            return RT_STAGE_INVALID;
+        }
+    }
+
+    const RtStageBuffer& src = args[0].u.buffer;
+    const RtStageBuffer& dst = args[1].u.buffer;
+    if (!valid(src) || !valid(dst) || src.format != RT_STAGE_F32 ||
+        dst.format != RT_STAGE_F32 || src.planes != 3 || dst.planes != 3) {
+        error = "rgb.proc needs two three-plane F32 buffers";
+        return RT_STAGE_INVALID;
+    }
+    if (src.data == dst.data || src.width != dst.width ||
+        src.height != dst.height) {
+        error = "rgb.proc source and destination do not match";
+        return RT_STAGE_INVALID;
+    }
+
+    for (std::size_t i = 2; i < BUFFER_ARGS; ++i) {
+        const RtStageBuffer& table = args[i].u.buffer;
+        if (!valid(table) || table.format != RT_STAGE_F32 ||
+            table.planes != 1) {
+            error = "rgb.proc needs F32 table buffers";
+            return RT_STAGE_INVALID;
+        }
+        const int entries = table.width * table.height;
+        const bool lut = i <= 9;
+        if (lut && entries != LUT_ENTRIES && entries != 1) {
+            error = "rgb.proc LUT sizes are wrong";
+            return RT_STAGE_INVALID;
+        }
+        if (!lut && entries != MATRIX_ENTRIES) {
+            error = "rgb.proc matrix sizes are wrong";
+            return RT_STAGE_INVALID;
+        }
+    }
+
+    const KernelDef* def = find_kernel("rgb.proc");
+    assert(def != nullptr);
+    cl_kernel kernel = compiled_kernel(env, def, error);
+    if (kernel == nullptr) {
+        return RT_STAGE_FALLBACK;
+    }
+
+    const StageBufferShape plane_shape{RT_STAGE_F32, src.width, src.height, 1};
+    StageDeviceBufferPtr src_devices[3];
+    StageDeviceBufferPtr dst_devices[3];
+    for (int plane = 0; plane < 3; ++plane) {
+        const RtStageBuffer src_plane = plane_view(src, plane);
+        const RtStageBuffer dst_plane = plane_view(dst, plane);
+        src_devices[plane] =
+            residency->acquire(src_plane.data, plane_shape, &error);
+        dst_devices[plane] =
+            residency->acquire(dst_plane.data, plane_shape, &error);
+        if (!src_devices[plane] || !dst_devices[plane]) {
+            return RT_STAGE_FALLBACK;
+        }
+        if (residency->upload(src_devices[plane], src_plane) != RT_STAGE_OK) {
+            error = "rgb.proc source upload failed";
+            return RT_STAGE_FALLBACK;
+        }
+    }
+
+    StageDeviceBufferPtr tables[BUFFER_ARGS - 2];
+    for (std::size_t i = 2; i < BUFFER_ARGS; ++i) {
+        const RtStageBuffer& table = args[i].u.buffer;
+        const StageBufferShape shape{RT_STAGE_F32, table.width, table.height,
+                                     1};
+        tables[i - 2] = residency->acquire(table.data, shape, &error);
+        if (!tables[i - 2] ||
+            residency->upload(tables[i - 2], table) != RT_STAGE_OK) {
+            error = "rgb.proc table upload failed";
+            return RT_STAGE_FALLBACK;
+        }
+    }
+
+    auto memory_of = [](const StageDeviceBufferPtr& buffer) {
+        auto device = std::dynamic_pointer_cast<OpenCLDeviceBuffer>(buffer);
+        return device != nullptr ? device->memory() : nullptr;
+    };
+
+    std::lock_guard<std::recursive_mutex> lock(env->queue_mutex);
+
+    const cl_int width = src.width;
+    const cl_int height = src.height;
+    const cl_int tone_curve_black = static_cast<cl_int>(args[14].u.i);
+    const cl_int clamp_oog = static_cast<cl_int>(args[15].u.i);
+    const cl_int mix_channels = static_cast<cl_int>(args[16].u.i);
+    const cl_int rgb_curve_mask = static_cast<cl_int>(args[17].u.i);
+    const cl_float exp_scale = static_cast<cl_float>(args[18].u.f);
+    const cl_float comp = static_cast<cl_float>(args[19].u.f);
+    const cl_float hl_range = static_cast<cl_float>(args[20].u.f);
+
+    const auto set_arg = [&](cl_uint index, std::size_t bytes,
+                             const void* value) {
+        return env->api->SetKernelArg(kernel, index, bytes, value) == CL_SUCCESS;
+    };
+
+    cl_uint arg = 0;
+    bool ok = true;
+    for (int plane = 0; plane < 3 && ok; ++plane) {
+        cl_mem memory = memory_of(src_devices[plane]);
+        ok = set_arg(arg++, sizeof(cl_mem), &memory);
+    }
+    for (int plane = 0; plane < 3 && ok; ++plane) {
+        cl_mem memory = memory_of(dst_devices[plane]);
+        ok = set_arg(arg++, sizeof(cl_mem), &memory);
+    }
+    for (std::size_t i = 0; i < BUFFER_ARGS - 2 && ok; ++i) {
+        cl_mem memory = memory_of(tables[i]);
+        ok = set_arg(arg++, sizeof(cl_mem), &memory);
+    }
+    ok = ok &&
+         set_arg(arg++, sizeof(cl_int), &width) &&
+         set_arg(arg++, sizeof(cl_int), &height) &&
+         set_arg(arg++, sizeof(cl_float), &exp_scale) &&
+         set_arg(arg++, sizeof(cl_float), &comp) &&
+         set_arg(arg++, sizeof(cl_float), &hl_range) &&
+         set_arg(arg++, sizeof(cl_int), &tone_curve_black) &&
+         set_arg(arg++, sizeof(cl_int), &clamp_oog) &&
+         set_arg(arg++, sizeof(cl_int), &mix_channels) &&
+         set_arg(arg++, sizeof(cl_int), &rgb_curve_mask);
+    if (!ok) {
+        error = "clSetKernelArg failed";
+        return RT_STAGE_FALLBACK;
+    }
+
+    /* The shared kernel derives x and y from a two-dimensional range. */
+    const std::size_t global[2] = {static_cast<std::size_t>(width),
+                                   static_cast<std::size_t>(height)};
+    cl_event done = nullptr;
+    if (env->api->EnqueueNDRangeKernel(env->queue, kernel, 2, nullptr, global,
+                                       nullptr, 0, nullptr,
+                                       &done) != CL_SUCCESS ||
+        done == nullptr) {
+        error = "rgb.proc launch failed";
+        return RT_STAGE_ERROR;
+    }
+
+    const cl_int wait_status = env->api->WaitForEvents(1, &done);
+    env->api->ReleaseEvent(done);
+    if (wait_status != CL_SUCCESS) {
+        error = "rgb.proc did not complete";
+        return RT_STAGE_ERROR;
+    }
+
+    for (int plane = 0; plane < 3; ++plane) {
+        if (residency->readback(dst_devices[plane], plane_view(dst, plane)) !=
+            RT_STAGE_OK) {
+            error = "rgb.proc readback failed";
+            return RT_STAGE_ERROR;
+        }
+    }
+
+    return RT_STAGE_OK;
+}
+
 class OpenCLStageQueue final : public StageQueue
 {
 public:
@@ -1981,6 +2202,20 @@ public:
         } else if (request.name == "output.convert") {
             submission = launch_lab_to_rgb(env_, residency_, request.args,
                                            request.name.c_str(), false, error);
+        } else if (request.name == "rgb.proc") {
+            const RtStageStatus status =
+                run_rgb_proc(env_, residency_, request.args, error);
+            if (status == RT_STAGE_OK) {
+                StageEvent done;
+                done.status = StageEventStatus::Complete;
+                done.result = RT_STAGE_OK;
+                done.device = StageDeviceType::OPENCL;
+                done.asynchronous = false;
+                return done;
+            }
+            StageEvent fallback = StageQueue::submit(request, profiling);
+            fallback.note = error;
+            return fallback;
         } else if (request.name == "monitor.output" ||
                    request.name == "viewport.output" ||
                    request.name == "thumbnail.output") {
