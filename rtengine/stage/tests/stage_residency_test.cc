@@ -1803,6 +1803,252 @@ void test_node_parity(bool available)
     }
 }
 
+/* ------------------------------------------------- rgb.proc row pitches */
+
+/*
+ * `rgb.proc` used to index its source and destination as `y * width + x`.
+ * The stage device pads every row to the stage alignment, so on a width whose
+ * row is not already aligned the kernel addressed the wrong sample and left
+ * the tail of the allocation unwritten. The kernel now takes a source and a
+ * destination pitch, and these cases fail without them.
+ *
+ * The check needs no CPU reference. The same fixture is run at a padded width
+ * and at a width whose row pitch equals its width, where the shared columns
+ * must agree bit for bit; the padded run is repeated to prove the last row is
+ * finite and stable.
+ */
+
+struct RgbProcFixture {
+    RtStageBuffer source;
+    RtStageBuffer output;
+    std::vector<float> luts;
+    float mixer[9] = {1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f};
+    float toxyz[9] = {1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f};
+
+    bool allocate(StageBufferAllocator& allocator, int width, int height)
+    {
+        std::string error;
+        source = allocator.allocate({RT_STAGE_F32, width, height, 3}, &error);
+        output = allocator.allocate({RT_STAGE_F32, width, height, 3}, &error);
+        if (!valid(source) || !valid(output)) {
+            std::fprintf(stderr, "rgb.proc fixture allocation failed: %s\n",
+                         error.c_str());
+            return false;
+        }
+        fill(source, 7u);
+        fill(output, 0u);
+
+        luts.resize(65536);
+        for (std::size_t i = 0; i < luts.size(); ++i) {
+            luts[i] = static_cast<float>(i);
+        }
+        return true;
+    }
+
+    static RtStageArg table(const float* data, int entries)
+    {
+        RtStageBuffer buffer{};
+        buffer.size = sizeof(RtStageBuffer);
+        buffer.data = const_cast<float*>(data);
+        buffer.width = entries;
+        buffer.height = 1;
+        buffer.row_pitch = static_cast<std::size_t>(entries) * sizeof(float);
+        buffer.plane_pitch = buffer.row_pitch;
+        buffer.planes = 1;
+        buffer.format = RT_STAGE_F32;
+        buffer.flags = RT_STAGE_BUFFER_READ;
+        return buffer_arg(buffer);
+    }
+
+    std::vector<RtStageArg> args(RtStageBuffer& dst) const
+    {
+        std::vector<RtStageArg> result;
+        result.push_back(buffer_arg(source));
+        result.push_back(buffer_arg(dst));
+        for (int i = 0; i < 6; ++i) {
+            result.push_back(table(luts.data(), 65536));
+        }
+        result.push_back(table(luts.data(), 65536));
+        result.push_back(table(luts.data(), 65536));
+        result.push_back(table(mixer, 9));
+        result.push_back(table(toxyz, 9));
+        result.push_back(int_arg(source.width));
+        result.push_back(int_arg(source.height));
+        result.push_back(int_arg(0));          /* toneCurveBlack */
+        result.push_back(int_arg(1));          /* clampOog */
+        result.push_back(int_arg(0));          /* mixChannels */
+        result.push_back(int_arg(0));          /* rgbCurveMask */
+        result.push_back(double_arg(1.0));     /* expScale */
+        result.push_back(double_arg(0.0));     /* comp */
+        result.push_back(double_arg(65535.0)); /* hlRange */
+        return result;
+    }
+};
+
+/* Compare the first `columns` columns of two equal-height, equal-plane images. */
+Diff compare_columns(const RtStageBuffer& a, const RtStageBuffer& b, int columns)
+{
+    Diff diff;
+    if (a.format != RT_STAGE_F32 || b.format != RT_STAGE_F32 ||
+        a.height != b.height || a.planes != b.planes || columns > a.width ||
+        columns > b.width) {
+        diff.finite = false;
+        return diff;
+    }
+    for (std::uint32_t plane = 0; plane < a.planes; ++plane) {
+        const unsigned char* pa = static_cast<const unsigned char*>(a.data) +
+                                  static_cast<std::size_t>(plane) * a.plane_pitch;
+        const unsigned char* pb = static_cast<const unsigned char*>(b.data) +
+                                  static_cast<std::size_t>(plane) * b.plane_pitch;
+        for (int y = 0; y < a.height; ++y) {
+            const float* ra = reinterpret_cast<const float*>(
+                pa + static_cast<std::size_t>(y) * a.row_pitch);
+            const float* rb = reinterpret_cast<const float*>(
+                pb + static_cast<std::size_t>(y) * b.row_pitch);
+            for (int x = 0; x < columns; ++x) {
+                ++diff.samples;
+                if (!close_enough(ra[x]) || !close_enough(rb[x])) {
+                    diff.finite = false;
+                }
+                const double delta = std::fabs(static_cast<double>(ra[x]) -
+                                               static_cast<double>(rb[x]));
+                if (delta > 0.0) {
+                    ++diff.differing;
+                }
+                diff.max_abs = std::max(diff.max_abs, delta);
+            }
+        }
+    }
+    return diff;
+}
+
+bool last_row_finite(const RtStageBuffer& buffer)
+{
+    for (std::uint32_t plane = 0; plane < buffer.planes; ++plane) {
+        const unsigned char* base = static_cast<const unsigned char*>(buffer.data) +
+                                    static_cast<std::size_t>(plane) *
+                                        buffer.plane_pitch +
+                                    static_cast<std::size_t>(buffer.height - 1) *
+                                        buffer.row_pitch;
+        const float* row = reinterpret_cast<const float*>(base);
+        for (int x = 0; x < buffer.width; ++x) {
+            if (!std::isfinite(row[x])) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+void test_rgb_proc_pitch(bool available)
+{
+    using namespace rtengine::stage;
+
+    if (!available) {
+        skip("rgb.proc pitch: no OpenCL device");
+        return;
+    }
+
+    constexpr int HEIGHT = 24;
+    const struct {
+        int padded;
+        int compact;
+    } cases[] = {{238, 240}, {179, 192}};
+
+    StageBufferAllocator host(StageDeviceType::CPU);
+    const auto context = opencl_device()->create_context();
+    check(context != nullptr, "rgb.proc pitch: the device creates a context");
+    if (context == nullptr) {
+        return;
+    }
+
+    for (const auto& item : cases) {
+        std::size_t row_pitch = 0;
+        std::size_t plane_pitch = 0;
+        std::size_t bytes = 0;
+        std::string layout_error;
+        check(stage_buffer_layout({RT_STAGE_F32, item.padded, HEIGHT, 1},
+                                  row_pitch, plane_pitch, bytes, &layout_error),
+              "rgb.proc pitch: the padded layout is valid");
+        check(row_pitch / sizeof(float) > static_cast<std::size_t>(item.padded),
+              "rgb.proc pitch: the padded case really has padded rows");
+        const int padded_pitch = static_cast<int>(row_pitch / sizeof(float));
+        check(stage_buffer_layout({RT_STAGE_F32, item.compact, HEIGHT, 1},
+                                  row_pitch, plane_pitch, bytes, &layout_error),
+              "rgb.proc pitch: the compact layout is valid");
+        check(row_pitch / sizeof(float) == static_cast<std::size_t>(item.compact),
+              "rgb.proc pitch: the compact case shares its pitch and width");
+
+        RgbProcFixture padded;
+        RgbProcFixture reference;
+        if (!padded.allocate(host, item.padded, HEIGHT) ||
+            !reference.allocate(host, item.compact, HEIGHT)) {
+            check(false, "rgb.proc pitch: the fixtures allocate");
+            continue;
+        }
+
+        std::string error;
+        RtStageBuffer repeat =
+            host.allocate({RT_STAGE_F32, item.padded, HEIGHT, 3}, &error);
+        if (!valid(repeat)) {
+            check(false, "rgb.proc pitch: the repeat output allocates");
+            continue;
+        }
+        fill(repeat, 0u);
+
+        set_node_device_override("rgb.proc", StageNodeDevice::OpenCL);
+
+        StageRequest request;
+        request.name = "rgb.proc";
+        request.args = padded.args(padded.output);
+        StageExecution first;
+        RtStageStatus status = context->execute(request, nullptr, &first);
+        check(status == RT_STAGE_OK,
+              "the device executes rgb.proc on padded rows");
+        check(first.device == StageDeviceType::OPENCL,
+              "the padded-row execution names the device");
+        check(!first.asynchronous,
+              "rgb.proc reads its planes back, so the execution is complete");
+
+        request.args = padded.args(repeat);
+        StageExecution second;
+        status = context->execute(request, nullptr, &second);
+        check(status == RT_STAGE_OK,
+              "the device repeats rgb.proc on padded rows");
+
+        request.args = reference.args(reference.output);
+        StageExecution compact;
+        status = context->execute(request, nullptr, &compact);
+        check(status == RT_STAGE_OK,
+              "the device executes rgb.proc on a compact pitch");
+
+        clear_node_device_overrides();
+
+        const Diff shared =
+            compare_columns(padded.output, reference.output, item.padded);
+        std::printf("stage-residency: rgb.proc width %d (pitch %d): "
+                    "PAE %.6f LSB16, %zu of %zu shared samples differ\n",
+                    item.padded, padded_pitch,
+                    shared.max_abs, shared.differing, shared.samples);
+        check(shared.finite, "the padded-row output is finite");
+        check(shared.differing == 0 && shared.max_abs == 0.0,
+              "the padded and compact runs agree on the shared columns");
+
+        const Diff stable = compare(padded.output, repeat);
+        check(stable.finite, "the repeated padded-row output is finite");
+        check(stable.differing == 0 && stable.max_abs == 0.0,
+              "the padded-row output is stable across two runs");
+        check(last_row_finite(padded.output),
+              "the padded-row output writes its last row");
+
+        host.release(padded.output);
+        host.release(repeat);
+        host.release(reference.output);
+        host.release(padded.source);
+        host.release(reference.source);
+    }
+}
+
 /* --------------------------------------------------------- run() wiring */
 
 void test_run_wiring(bool available)
@@ -1927,6 +2173,7 @@ int main()
     test_selection(available);
     test_residency();
     test_node_parity(available);
+    test_rgb_proc_pitch(available);
     test_run_wiring(available);
 
     if (failures == 0) {
