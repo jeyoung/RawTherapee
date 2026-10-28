@@ -152,6 +152,11 @@ identity transform, whose assertion was mutation-checked.
 - Container POCL parity: the package does not ship the test binaries and the
   stage device path is packaging-independent. The host POCL run covers the
   kernel; the container runs cover installation and export.
+- Interactive device nodes (`monitor.output`, `viewport.output`,
+  `thumbnail.output`): not exercised on a device. The GUI in this environment
+  does not initialise OpenCL from a seeded options file, so the classic backend
+  does not run either. The kernel is covered by the reference test; the wiring
+  is compiled and reviewed. Recorded as uncovered, not as a pass.
 - `--gpu-test` and `--gpu-test-monitor`: no GPU is available on this host.
 - Multi-threaded export parity: export is non-deterministic without
   `OMP_NUM_THREADS=1`, so parity runs are single-threaded by design.

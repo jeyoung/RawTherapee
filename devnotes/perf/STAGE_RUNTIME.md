@@ -195,6 +195,13 @@ respectively. Only the export node is reachable from the CLI; the packed 8-bit
 output is covered by a reference test in `stage-residency-test`, which shares
 no code with the kernel.
 
+The interactive nodes were **not exercised on a device** in this environment.
+The GUI here does not initialise OpenCL from a seeded options file — the
+classic backend does not run either — so a preview cannot reach the device
+path. The wiring is compiled and reviewed and the kernel is covered by the
+reference test, but a device run of `monitor.output`, `viewport.output` or
+`thumbnail.output` is recorded as uncovered until a GPU host can run it.
+
 ## Pilot stage
 
 `lanczos3` is the pilot. The arithmetic lives in
