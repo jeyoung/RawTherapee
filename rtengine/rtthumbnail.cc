@@ -54,9 +54,11 @@
 #include "rawimagesource.h"
 #include "rtengine.h"
 #include "rtthumbnail.h"
+#include "opencl/openclengine.h"
 #include "settings.h"
 #include "stage/stage_graph.h"
 #include "stage/stage_pipeline.h"
+#include "stage/stage_runtime.h"
 #include "stdimagesource.h"
 #include "StopWatch.h"
 #include "utils.h"
@@ -1881,6 +1883,15 @@ void Thumbnail::stageRgb(StageState& state)
     //ColorTemp::CAT02 (baseImg, &params)   ;//perhaps not good!
 
     ipf.setScale (sqrt (double (fw * fw + fh * fh)) / sqrt (double (thumbImg->getWidth() * thumbImg->getWidth() + thumbImg->getHeight() * thumbImg->getHeight()))*scale);
+    /*
+     * The thumbnail path follows the same user preference as the editor and
+     * the batch export. Without this the monitor conversion never reaches a
+     * backend here, so neither the classic GPU path nor the stage device can
+     * take thumbnail.output, and a browser thumbnail falls back to lab2rgb.
+     */
+    ipf.setOpenCLAllowed (settings->useOpenCL);
+    opencl::setStageAllowed (settings->useOpenCL);
+    stage::set_opencl_stage_allowed (settings->useOpenCL);
     ipf.updateColorProfiles (ICCStore::getInstance()->getDefaultMonitorProfileName(), RenderingIntent(settings->monitorIntent), false, false);
 
     // Process film negative BEFORE colorspace conversion, if needed
