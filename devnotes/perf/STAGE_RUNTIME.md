@@ -1995,9 +1995,9 @@ instead of duplicating it in a second implementation:
   `mul == 5` pass; every other pass leaves them untouched.
 - `outProfile` receives the RGB profile the call builds, with ownership
   transferred to the caller (`cmsCloseProfile`). The handle must outlive any
-  transform made from it. When it is null the previous lifetime is unchanged:
-  the handle is leaked once per call, a pre-existing defect that this stage
-  does not address.
+  transform made from it.
+- `outPrimMatrix` receives the probe's RGB to XYZ primaries matrix in double,
+  row-major.
 - `setupOnly` stops once the profile and its TRC tags exist. No transform is
   created and no pixel is transformed; only the unconditional epsilon clamp at
   the start of the function runs. It needs `outProfile` and a call that builds
@@ -2007,11 +2007,74 @@ All four parameters default to null/false, so the existing call sites are
 source-compatible and produce the same pixels. A full call still creates and
 applies the lcms transform exactly as before.
 
-Device coverage is not claimed here: no GPU kernel consumes the exposed profile
-yet. `tools/perf/working-trc-setup-test.cc` covers the contract (means, profile,
-no transform, destination untouched, `buildGpuProfile()` succeeds) and guards
-the converted pixels with a digest recorded from the pre-change CPU
-implementation.
+### Node
+
+`working.trc` runs the default configuration as a **host prefix plus one
+device second pass**. The prefix is part of the node, not a device kernel:
+
+1. `lab2rgb()` into the linear working RGB image, with a copy of that image as
+   the `apsatur()` reference;
+2. the fixed first pass, `workingtrc(mul = -5, gampos = 2.4,
+   slpos = 12.92310)`, including its epsilon clamp and the
+   `Color::igammatab_srgb` inverse;
+3. the setup-only probe on that host first pass, then `buildGpuProfile()` for
+   the XYZ to linear matrix and the linear to encoded table;
+4. `toxyz` followed, when `icm.gamut` is set, by `Color::gamutmap()` with the
+   probe's double primaries matrix. The result is the second-pass input.
+
+The device work starts at the second pass: the matrix times the host XYZ, the
+inverse profile TRC, `apsatur()` and RGB to Lab. The prefix exists to make the
+probe, the profile and the second-pass input byte-identical to the CPU block on
+every OpenCL compiler. The device first pass was removed: a one-ulp difference
+in `lab2rgb()` and the sRGB inverse shifted the probe means and the profile,
+and no OpenCL compiler reproduced the host's SSE/scalar split exactly. The
+first pass is therefore not claimed as device work.
+
+The ABI is `[0]` the three-plane F32 Lab buffer, read and written in place,
+`[1]` the host-only `RtWorkingTrcContext` pointer (`RT_STAGE_ARG_PTR`), `[2]`
+the int support flag, 1 only when the call site admits the configuration and
+the host setup succeeded, `[3]` the double `icm.wapsat`, `[4]` the three-plane
+F32 second-pass XYZ image from the host prefix and `[5]` the three-plane F32
+linear pre-TRC reference for `apsatur()`. The context is host-only: its
+`build` callback runs the setup-only probe, `buildGpuProfile()`, `toxyz` and
+`Color::gamutmap()` and returns the matrices, the gamma table and the
+parametric TRC. Nothing in the context is passed to a kernel.
+
+The profile provenance is the block's own: the whitelist name selects the
+primaries and illuminant, `setupOnly` returns the profile, and
+`buildGpuProfile()` turns its colorants into the float XYZ to linear matrix and
+its red TRC into the 65536-entry linear to encoded table. The kernel uses the
+table for `0 <= linear <= 1`, the exact `linear / c` inverse below the TRC
+breakpoint (where the table cannot resolve the first encoded codes) and the
+analytic inverse of lcms type 5 or -5 outside the table. `Color::cachef` and
+`Color::cachefy` are uploaded so RGB to Lab matches `Color::XYZ2Lab()` rather
+than re-evaluating the cube root. `#pragma OPENCL FP_CONTRACT OFF`,
+`#pragma STDC FP_CONTRACT OFF` and
+`-cl-fp32-correctly-rounded-divide-sqrt` keep the float division and
+multiply-add order. The host prefix applies the epsilon clamp before the probe,
+exactly as the block does, and the second-pass kernel clamps its input once
+more.
+
+Residuals run the `working.trc` host builtin and record `impl=host`: a
+`WorkingTRC` of `NONE`, `trcExp` off, a profile outside the twelve-name list,
+a non-relative intent, non-default primaries or illuminant, soft light on,
+local contrast on, either tone equaliser on (`wmidtcie` or
+`wsmoothciesli`), black-and-white output (`fbw`), a first-pass sample above
+`WORKING_TRC_FIRST_PASS_MAX` (1.001, so a working-gamut overflow stays on the
+host), a profile that is not a matrix shaper, a TRC that is not lcms type 5 or
+-5, or a `buildGpuProfile()` failure. The builtin disables device recursion
+and runs the original host block on the Lab buffer.
+
+Evidence, with `OMP_NUM_THREADS=1` and a 3888x2608 PEF:
+
+| Case | Result |
+|---|---|
+| `stage-residency-test` on POCL, twelve cases at 238x24 and 179x17, gamut on/off, `wapsat` 0/0.5/1, five TRC values | supported PAE 0.015625 to 0.376953 LSB16 (linear worst), all finite; probe means `device == host` bit for bit (`delta 0/0`); out-of-gamut, midtone-equaliser and soft-light residuals `impl=host`, PAE 0, 0 differing samples |
+| `verify.sh --stage-device`, POCL CPU, `working-trc.pp3` | PASS, `max_pae=1.5259e-05`, record `"stage":"working.trc","impl":"opencl","source":"opencl"` |
+| `verify.sh --stage-device`, AMD RX 550 (rusticl), `working-trc.pp3` | PASS, `max_pae=1.5259e-05`, record `"stage":"working.trc","impl":"opencl","source":"opencl"` |
+| AMD RX 550, `Gamut=false` | PASS, `max_pae=1.5259e-05` |
+| `working-trc-residual.pp3` (soft light on) | PASS as a host residual: `"stage":"working.trc","impl":"host"`, `max_pae=1.5259e-05` informational |
+| `--gpu=off` CPU path, two runs | identical (`PAE 0`) |
 
 ## Limitations
 

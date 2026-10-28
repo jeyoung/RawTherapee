@@ -70,6 +70,20 @@ edges-only, halo control, show-mask, `blurradius >= 0.25` and the USM sigma
 limit are host residuals; they run the `output.sharpen` host builtin and are
 recorded as `impl=host`, never as a device pass.
 
+`working.trc` is partial: the default configuration runs one device second
+pass between a host prefix and the unchanged host fallback. The host prefix is
+`lab2rgb()`, the fixed sRGB inverse, the setup-only probe and the profile, and
+then `toxyz` with the optional `Color::gamutmap()`; it runs on the host so the
+probe means, the profile and the second-pass input are byte-identical to the
+CPU block on every OpenCL compiler. The device work starts at the second pass:
+the matrix-shaper transform, `apsatur()` and RGB to Lab. A configuration with
+`workingTRC == NONE`, `trcExp == false`, a profile outside the twelve-name
+list, a non-relative intent, non-default primaries or illuminant, soft light
+on, local contrast on, either tone equaliser on, black-and-white output on, a
+first pass above the working-gamut tolerance, a non-matrix-shaper profile or a
+`buildGpuProfile()` failure is a residual: it runs the `working.trc` host
+builtin and records `impl=host`, never a device pass.
+
 `lab.sharpening` is partial through the same `output.sharpen` node:
 `ImProcFunctions::sharpening()` is the entry point for both the Lab block and
 the post-resize block, so a Lab-only profile records `output.sharpen`. The
@@ -92,7 +106,7 @@ main sharpen node may still run on the device.
 | `lab.tools` | Full/Full/Roi/Reduced | path | reuse-input | shadows/highlights, Lab curves, local contrast, vibrance, EPD, Lab-grid colour toning | no |
 | `lab.sharpening` | Full/-/Roi/- | path | reuse-input | impulse denoise, defringe, ML sharpen edges, ML microcontrast and the main sharpen pass (shared `output.sharpen` node) | partial |
 | `lab.wavelet` | Full/Full/Roi/Reduced | path | reuse-input | directional pyramid equaliser and wavelet | no |
-| `working.trc` | Full/Full/Roi/- | path | reuse-input | soft light, tone equaliser and working-TRC conversion | no |
+| `working.trc` | Full/Full/Roi/- | path | reuse-input | soft light, tone equaliser and working-TRC conversion | partial |
 | `ciecam` | Full/Full/Roi/- | path | reuse-input | CIE CAM 02 | no |
 | `gamut` | Full/Full/Roi/Reduced | path | reuse-input | working-space gamut compression | yes |
 | `output.convert` | Full/-/-/- | exact | reuse-output | Lab to output RGB and output profile conversion | yes |

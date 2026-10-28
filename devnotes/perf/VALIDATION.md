@@ -155,6 +155,12 @@ node ran on the device rather than only comparing pixels.
 | Lab sharpening with `[SharpenEdge] Enabled=true` | PASS, `max_pae=1.5259e-05` (392 387 of 30 419 712 samples differ); ML sharpen edges stays host-side while the shared `output.sharpen` record is still `impl=opencl`, so the block is partial |
 | Output sharpening packed-plane contract | padded row and padded plane descriptors are refused with `RT_STAGE_INVALID` on both the device and builtin paths, leaving all samples untouched |
 | Output sharpening CPU refactor | USM and RLD exports with `--gpu=off`, `OMP_NUM_THREADS=1`: normalized 16-bit pixel hashes identical before and after |
+| Working TRC default (`working-trc.pp3`, WorkingTRC=22, TrcExp), POCL CPU, `RT_STAGE_OPENCL=1` | PASS, `max_pae=1.5259e-05`; the record is `"stage":"working.trc","impl":"opencl","source":"opencl"` at 3888×2608 |
+| Working TRC default, AMD RX 550 (rusticl) | PASS, `max_pae=1.5259e-05`; `"impl":"opencl"` |
+| Working TRC `Gamut=false`, AMD RX 550 and POCL CPU | PASS, `max_pae=1.5259e-05`; `"impl":"opencl"` |
+| Working TRC residual (`working-trc-residual.pp3`, soft light on) | PASS as a host residual: `"stage":"working.trc","impl":"host"`, `max_pae=1.5259e-05` informational |
+| Working TRC device test | twelve cases at 238×24 and 179×17, gamut on/off, `wapsat` 0/0.5/1 and five TRC values; worst PAE 0.376953 LSB16, all finite; probe means bit-identical (`delta 0/0`); out-of-gamut, midtone-equaliser and soft-light residuals bit-identical to the CPU block with `impl=host` |
+| Working TRC CPU path (`--gpu=off`, two runs) | identical, `PAE 0` |
 | Device records | `"stage":"lanczos3"`, `"stage":"transform"`, `"stage":"output.convert"`, `"stage":"gamut"`, `"stage":"framing"` and `"stage":"output.sharpen"`, all `impl":"opencl"`, `source":"opencl"`; the classic log has no `opencl resize`, `opencl transform` or `opencl lab2srgb` line |
 | `monitor.output`, `viewport.output` in the GUI | device records with `impl=opencl`, `source=opencl`; preview image area identical to a CPU-only run (0 LSB8) |
 | `thumbnail.output` via the file browser | 12 device records; thumbnail cache byte-identical to a CPU-only run |
