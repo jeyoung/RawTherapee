@@ -140,6 +140,7 @@ node ran on the device rather than only comparing pixels.
 | Packed 8-bit Lab to RGB | byte-exact against an independent reference, and fails when the device matrix is scaled by 1.001 |
 | `monitor.output`, `viewport.output` in the GUI | device records with `impl=opencl`, `source=opencl`; preview image area identical to a CPU-only run (0 LSB8) |
 | `thumbnail.output` via the file browser | 12 device records; thumbnail cache byte-identical to a CPU-only run |
+| `thumbnail.whitebalance` via the file browser | device record present; cache byte-identical to a CPU-only run |
 | Device records | `"stage":"lanczos3"`, `"stage":"transform"` and `"stage":"output.convert"`, all `impl":"opencl"`, `source":"opencl"`; the classic log has no `opencl resize`, `opencl transform` or `opencl lab2srgb` line |
 | Forced refusal (`RT_STAGE_DEVICE_BUDGET_MB=16`, `RT_REQUIRE_GPU=1`) | FAIL with `impl":"host","source":"device-fallback"` |
 | No device selected (no `RT_OPENCL_ALLOW_CPU`) | SKIP |

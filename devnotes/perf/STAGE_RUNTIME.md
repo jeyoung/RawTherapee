@@ -241,6 +241,15 @@ same tool exclusions (black and white, HSV equalizer, film simulation, colour
 toning and the rest). Parity is 1 LSB at 16-bit on 4% of pixels, and the
 classic path stays byte-identical to the package before the kernel moved.
 
+## Thumbnail white balance
+
+`thumbnail.whitebalance` applies the white-balance multipliers that the host
+resolves from the colour temperature, with the highlight-average branch for
+`toneCurve.hrenabled`. The kernel is small and in place: one three-plane F32
+buffer, three multipliers and the flag. It is the first thumbnail node on the
+device beyond `thumbnail.output`, and the cache it feeds is byte-identical to a
+CPU-only run.
+
 ## Pilot stage
 
 `lanczos3` is the pilot. The arithmetic lives in
