@@ -230,8 +230,10 @@ quick() {
         "$ROOT/devnotes/opencl/pp3/gamut.pp3" gamut
     run_stage_device "pef/stage-device-sharpen" \
         "$ROOT/devnotes/opencl/pp3/sharpen-usm.pp3" output.sharpen
-    run_stage_host "pef/stage-host-sharpen-rld" \
+    run_stage_device "pef/stage-device-sharpen-rld" \
         "$ROOT/devnotes/opencl/pp3/sharpen-rld.pp3" output.sharpen
+    run_stage_host "pef/stage-host-sharpen-rld-damped" \
+        "$ROOT/devnotes/opencl/pp3/sharpen-rld-damped.pp3" output.sharpen
 }
 
 stage() {
@@ -505,8 +507,10 @@ stage_device() {
         "$ROOT/devnotes/opencl/pp3/gamut.pp3" gamut
     run_stage_device "pef/stage-device-sharpen" \
         "$ROOT/devnotes/opencl/pp3/sharpen-usm.pp3" output.sharpen
-    run_stage_host "pef/stage-host-sharpen-rld" \
+    run_stage_device "pef/stage-device-sharpen-rld" \
         "$ROOT/devnotes/opencl/pp3/sharpen-rld.pp3" output.sharpen
+    run_stage_host "pef/stage-host-sharpen-rld-damped" \
+        "$ROOT/devnotes/opencl/pp3/sharpen-rld-damped.pp3" output.sharpen
 }
 
 rgbproc() {

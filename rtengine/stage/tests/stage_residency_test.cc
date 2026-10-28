@@ -26,6 +26,7 @@
 
 #include "sharpen_core.h"
 
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -2630,6 +2631,34 @@ void fill_sharpen_l(LabImage& lab, unsigned seed)
     }
 }
 
+/*
+ * Richardson-Lucy divides by the blurred estimate, so white noise drives the
+ * iteration into an unrealistic dynamic range. This fixture keeps smooth
+ * gradients, a few hard edges and a negative band, which is the content the
+ * deconvolution is meant for.
+ */
+void fill_rld_l(LabImage& lab, unsigned seed)
+{
+    const float phase = static_cast<float>(seed) * 0.37f;
+    for (int y = 0; y < lab.H; ++y) {
+        for (int x = 0; x < lab.W; ++x) {
+            float value = 16000.0f +
+                          7000.0f * std::sin(0.15f * x + phase) *
+                              std::cos(0.11f * y - phase) +
+                          3000.0f * std::sin(0.31f * (x + y));
+            if (((x / 8) + (y / 8)) % 2 == 0) {
+                value += 4000.0f;
+            }
+            if (x < 3) {
+                value -= 18000.0f;
+            }
+            lab.L[y][x] = value;
+            lab.a[y][x] = 0.0f;
+            lab.b[y][x] = 0.0f;
+        }
+    }
+}
+
 void copy_sharpen_l(const LabImage& source, LabImage& destination)
 {
     for (int y = 0; y < source.H; ++y) {
@@ -2708,6 +2737,7 @@ struct SharpenCase {
     double scale;
     rtengine::procparams::SharpeningParams params;
     bool exact;
+    bool smooth;
 };
 
 void test_output_sharpen(bool available)
@@ -2735,8 +2765,9 @@ void test_output_sharpen(bool available)
     const auto add = [&cases](const std::string& label, int width, int height,
                               double scale,
                               const rtengine::procparams::SharpeningParams& p,
-                              bool exact) {
-        cases.push_back(SharpenCase{label, width, height, scale, p, exact});
+                              bool exact, bool smooth = false) {
+        cases.push_back(
+            SharpenCase{label, width, height, scale, p, exact, smooth});
     };
 
     add("defaults", 63, 31, 1.0, base, false);
@@ -2788,6 +2819,52 @@ void test_output_sharpen(bool available)
     /* Sigma at the FIR limit. */
     add("sigma 0.25", 63, 31, 2.0, base, false);
 
+    rtengine::procparams::SharpeningParams rld = base;
+    rld.method = "rld";
+    rld.deconvamount = 100;
+    rld.deconvradius = 0.45;
+    rld.deconviter = 100;
+    rld.deconvdamping = 0;
+
+    for (double radius : {0.3, 0.45, 0.75, 1.0}) {
+        auto p = rld;
+        p.deconvradius = radius;
+        p.deconviter = 30;
+        add("RLD radius " + std::to_string(radius), 63, 31, 1.0, p, false,
+            true);
+    }
+    for (int iterations : {1, 5, 30, 100}) {
+        auto p = rld;
+        p.deconviter = iterations;
+        add("RLD iterations " + std::to_string(iterations), 63, 31, 1.0, p,
+            false, true);
+    }
+    for (int amount : {1, 50, 100, 1000}) {
+        auto p = rld;
+        p.deconvamount = amount;
+        p.deconviter = 10;
+        add("RLD amount " + std::to_string(amount), 63, 31, 1.0, p, false,
+            true);
+    }
+    {
+        auto p = rld;
+        p.deconvamount = 1000;
+        p.deconviter = 10;
+        p.contrast = 0.0;
+        add("RLD amount 1000 flat mask", 63, 31, 1.0, p, false,
+            true);
+    }
+    {
+        auto p = rld;
+        p.deconviter = 30;
+        add("RLD padded width 238", 238, 24, 1.0, p, false, true);
+    }
+    {
+        auto p = rld;
+        p.deconvamount = 0;
+        add("RLD no-op", 63, 31, 1.0, p, true, true);
+    }
+
     if (!available) {
         skip("output sharpening: no OpenCL device");
         return;
@@ -2800,9 +2877,14 @@ void test_output_sharpen(bool available)
     }
 
     unsigned seed = 1u;
+
     for (const SharpenCase& item : cases) {
         LabImage source(item.width, item.height);
-        fill_sharpen_l(source, seed++);
+        if (item.smooth) {
+            fill_rld_l(source, seed++);
+        } else {
+            fill_sharpen_l(source, seed++);
+        }
 
         LabImage cpu(item.width, item.height);
         copy_sharpen_l(source, cpu);
@@ -2927,7 +3009,16 @@ void test_output_sharpen(bool available)
         p.deconvamount = 20;
         p.deconvradius = 0.5;
         p.deconviter = 2;
-        run_and_read(p, 1.0, false, "RLD residual");
+        p.deconvdamping = 50;
+        run_and_read(p, 1.0, false, "RLD damping residual");
+    }
+    {
+        auto p = base;
+        p.method = "rld";
+        p.deconvamount = 20;
+        p.deconvradius = 1.5;
+        p.deconviter = 5;
+        run_and_read(p, 1.0, false, "RLD IIR radius residual");
     }
     {
         auto p = base;
