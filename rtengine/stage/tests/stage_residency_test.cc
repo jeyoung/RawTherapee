@@ -576,6 +576,164 @@ void test_transform_identity(bool available)
     check(diff.differing == 0, "identity transform changes no sample");
 }
 
+/*
+ * The packed 8-bit Lab-to-RGB path is only reachable from the preview, crop
+ * and thumbnail paths, so the export harness cannot cover it. This test runs
+ * the device kernel on a synthetic Lab image and compares every byte with an
+ * independent reference of the same formula.
+ */
+namespace reference
+{
+
+float f2xyz(float f)
+{
+    return f > 0.20689655172413793f
+        ? f * f * f
+        : (116.0f * f - 16.0f) * (27.0f / 24389.0f);
+}
+
+float gamma_lookup(const float* lut, float value)
+{
+    const float clamped = std::min(std::max(value, 0.0f), 65535.0f);
+    const int index = static_cast<int>(clamped);
+    const int upper = std::min(index + 1, 65535);
+    const float fraction = clamped - static_cast<float>(index);
+    return lut[index] + (lut[upper] - lut[index]) * fraction;
+}
+
+unsigned char to_u8(float value)
+{
+    const unsigned int v = static_cast<unsigned int>(
+        std::min(std::max(value, 0.0f), 65535.0f));
+    return static_cast<unsigned char>(((v + 128u) - ((v + 128u) >> 8)) >> 8);
+}
+
+struct Rgb {
+    float r;
+    float g;
+    float b;
+};
+
+Rgb lab_to_linear(float L, float a, float b, const float matrix[9])
+{
+    const float LL = L / 327.68f;
+    const float fy =
+        (0.008620689655172414f * L) / 327.68f + 0.13793103448275862f;
+    const float fx = (0.002f * a) / 327.68f + fy;
+    const float fz = fy - (0.005f * b) / 327.68f;
+    const float xyzX = 65535.0f * f2xyz(fx) * 0.9642f;
+    const float xyzZ = 65535.0f * f2xyz(fz) * 0.8249f;
+    const float xyzY = LL > 8.0f ? 65535.0f * fy * fy * fy
+                                 : 65535.0f * LL / 903.2962962962963f;
+    return Rgb{
+        matrix[0] * xyzX + matrix[1] * xyzY + matrix[2] * xyzZ,
+        matrix[3] * xyzX + matrix[4] * xyzY + matrix[5] * xyzZ,
+        matrix[6] * xyzX + matrix[7] * xyzY + matrix[8] * xyzZ};
+}
+
+} // namespace reference
+
+void test_lab_to_u8(bool available)
+{
+    using namespace rtengine::stage;
+
+    if (!available) {
+        skip("Lab to RGB 8-bit: no OpenCL device");
+        return;
+    }
+
+    constexpr int WIDTH = 24;
+    constexpr int HEIGHT = 16;
+    constexpr int LUT_ENTRIES = 65536;
+    constexpr int MATRIX_ENTRIES = 9;
+
+    auto queue = opencl_device()->create_queue();
+    StageBufferAllocator host(StageDeviceType::CPU);
+    std::string error;
+
+    RtStageBuffer lab = host.allocate({RT_STAGE_F32, WIDTH, HEIGHT, 3}, &error);
+    RtStageBuffer dst = host.allocate({RT_STAGE_U8, WIDTH, HEIGHT, 1}, &error);
+    RtStageBuffer lut =
+        host.allocate({RT_STAGE_F32, LUT_ENTRIES, 1, 1}, &error);
+    RtStageBuffer matrix =
+        host.allocate({RT_STAGE_F32, MATRIX_ENTRIES, 1, 1}, &error);
+    if (lab.data == nullptr || dst.data == nullptr || lut.data == nullptr ||
+        matrix.data == nullptr) {
+        check(false, "Lab to RGB fixture allocates");
+        return;
+    }
+
+    /* A ramp per plane: a row/column swap or a plane mix-up changes bytes. */
+    for (int plane = 0; plane < 3; ++plane) {
+        unsigned char* base = static_cast<unsigned char*>(lab.data) +
+                              static_cast<std::size_t>(plane) * lab.plane_pitch;
+        for (int y = 0; y < HEIGHT; ++y) {
+            float* row = reinterpret_cast<float*>(
+                base + static_cast<std::size_t>(y) * lab.row_pitch);
+            for (int x = 0; x < WIDTH; ++x) {
+                row[x] = static_cast<float>(2000 + plane * 900 + x * 37 +
+                                            y * 11);
+            }
+        }
+    }
+
+    float* lut_data = reinterpret_cast<float*>(lut.data);
+    for (int i = 0; i < LUT_ENTRIES; ++i) {
+        lut_data[i] = static_cast<float>(i);
+    }
+
+    /* D65 XYZ to linear sRGB, as an output profile supplies it. */
+    const float matrix_values[MATRIX_ENTRIES] = {
+        3.2404542f, -1.5371385f, -0.4985314f,
+        -0.9692660f, 1.8760108f, 0.0415560f,
+        0.0556434f, -0.2040259f, 1.0572252f};
+    float* matrix_data = reinterpret_cast<float*>(matrix.data);
+    for (int i = 0; i < MATRIX_ENTRIES; ++i) {
+        matrix_data[i] = matrix_values[i];
+    }
+
+    StageRequest request;
+    request.name = "monitor.output";
+    request.args = {buffer_arg(lab), buffer_arg(dst), buffer_arg(lut),
+                    buffer_arg(matrix)};
+
+    StageEvent event = queue->submit(request, nullptr);
+    check(event.asynchronous, "the Lab to RGB 8-bit submission is asynchronous");
+    check(queue->wait(event) == RT_STAGE_OK, "the Lab to RGB 8-bit wait is OK");
+
+    int differing = 0;
+    for (int y = 0; y < HEIGHT; ++y) {
+        const float* planes[3] = {};
+        for (int plane = 0; plane < 3; ++plane) {
+            planes[plane] = reinterpret_cast<const float*>(
+                static_cast<const unsigned char*>(lab.data) +
+                static_cast<std::size_t>(plane) * lab.plane_pitch +
+                static_cast<std::size_t>(y) * lab.row_pitch);
+        }
+        const unsigned char* row =
+            static_cast<const unsigned char*>(dst.data) +
+            static_cast<std::size_t>(y) * dst.row_pitch;
+        for (int x = 0; x < WIDTH; ++x) {
+            const reference::Rgb rgb = reference::lab_to_linear(
+                planes[0][x], planes[1][x], planes[2][x], matrix_values);
+            const unsigned char expected[3] = {
+                reference::to_u8(reference::gamma_lookup(lut_data, rgb.r)),
+                reference::to_u8(reference::gamma_lookup(lut_data, rgb.g)),
+                reference::to_u8(reference::gamma_lookup(lut_data, rgb.b))};
+            if (row[x * 3] != expected[0] || row[x * 3 + 1] != expected[1] ||
+                row[x * 3 + 2] != expected[2]) {
+                ++differing;
+            }
+        }
+    }
+
+    if (differing != 0) {
+        std::fprintf(stderr, "Lab to RGB 8-bit: %d of %d pixels differ\n",
+                     differing, WIDTH * HEIGHT);
+    }
+    check(differing == 0, "the Lab to RGB 8-bit output matches the reference");
+}
+
 /* ------------------------------------------------------------ selection */
 
 void test_selection(bool available)
@@ -956,6 +1114,7 @@ int main()
     test_icd_robustness(available, reason);
     test_device_events(available);
     test_transform_identity(available);
+    test_lab_to_u8(available);
     test_selection(available);
     test_residency();
     test_node_parity(available);
