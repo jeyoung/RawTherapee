@@ -2291,11 +2291,16 @@ RtStageBuffer plane_view(const RtStageBuffer& image, std::uint32_t plane)
  *   [12..20] ints width, height, toneCurveBlack, clampOog, mixChannels,
  *            rgbCurveMask and doubles expScale, comp, hlRange.
  *
+ * The stage ABI does not carry the row pitch: the launcher inserts the two
+ * device pitches after height when it sets the kernel arguments, so the node
+ * argument order above is unchanged.
+ *
  * A LUT is 65536 samples; an absent RGB curve may be a one-sample dummy
  * because rgbCurveMask stops the kernel reading it. The matrix tables hold
- * nine floats. The kernel indexes compact planes, so each plane is uploaded
- * into its own device allocation and the three destinations are read back
- * here; the submission is therefore complete when it is returned.
+ * nine floats. Each plane is uploaded into its own device allocation, the
+ * kernel addresses it by the allocation's row pitch, and the three
+ * destinations are read back here; the submission is therefore complete when
+ * it is returned.
  */
 RtStageStatus run_rgb_proc(const std::shared_ptr<OpenCLEnv>& env,
                            const std::shared_ptr<OpenCLResidency>& residency,
@@ -2408,10 +2413,36 @@ RtStageStatus run_rgb_proc(const std::shared_ptr<OpenCLEnv>& env,
         return device != nullptr ? device->memory() : nullptr;
     };
 
+    /*
+     * The kernel addresses rows by pitch, and the residency pads rows to the
+     * stage alignment. Every plane of one side must therefore agree, and the
+     * pitch must be at least the image width.
+     */
+    const std::size_t src_pitch_bytes = src_devices[0]->row_pitch();
+    const std::size_t dst_pitch_bytes = dst_devices[0]->row_pitch();
+    for (int plane = 1; plane < 3; ++plane) {
+        if (src_devices[plane]->row_pitch() != src_pitch_bytes ||
+            dst_devices[plane]->row_pitch() != dst_pitch_bytes) {
+            error = "rgb.proc planes disagree on the row pitch";
+            return RT_STAGE_FALLBACK;
+        }
+    }
+    if (src_pitch_bytes % sizeof(float) != 0 ||
+        dst_pitch_bytes % sizeof(float) != 0 ||
+        src_pitch_bytes / sizeof(float) < static_cast<std::size_t>(src.width) ||
+        dst_pitch_bytes / sizeof(float) < static_cast<std::size_t>(dst.width)) {
+        error = "rgb.proc row pitch does not cover the image width";
+        return RT_STAGE_FALLBACK;
+    }
+
     std::lock_guard<std::recursive_mutex> lock(env->queue_mutex);
 
     const cl_int width = src.width;
     const cl_int height = src.height;
+    const cl_int src_pitch =
+        static_cast<cl_int>(src_pitch_bytes / sizeof(float));
+    const cl_int dst_pitch =
+        static_cast<cl_int>(dst_pitch_bytes / sizeof(float));
     const cl_int tone_curve_black = static_cast<cl_int>(args[14].u.i);
     const cl_int clamp_oog = static_cast<cl_int>(args[15].u.i);
     const cl_int mix_channels = static_cast<cl_int>(args[16].u.i);
@@ -2442,6 +2473,8 @@ RtStageStatus run_rgb_proc(const std::shared_ptr<OpenCLEnv>& env,
     ok = ok &&
          set_arg(arg++, sizeof(cl_int), &width) &&
          set_arg(arg++, sizeof(cl_int), &height) &&
+         set_arg(arg++, sizeof(cl_int), &src_pitch) &&
+         set_arg(arg++, sizeof(cl_int), &dst_pitch) &&
          set_arg(arg++, sizeof(cl_float), &exp_scale) &&
          set_arg(arg++, sizeof(cl_float), &comp) &&
          set_arg(arg++, sizeof(cl_float), &hl_range) &&

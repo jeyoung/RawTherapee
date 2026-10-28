@@ -20,9 +20,11 @@
 
 /*
  * The RGB tone and Lab conversion kernel, shared by the classic OpenCL
- * backend and the stage device. The kernel indexes compact single-plane
- * buffers, so both backends upload one device buffer per plane and reuse the
- * same text; only the upload and readback differ.
+ * backend and the stage device. The kernel indexes single-plane buffers by
+ * explicit row pitch, because the stage device allocates rows padded to the
+ * stage alignment while the classic backend is compact. The two backends
+ * upload one device buffer per plane and reuse the same text; only the upload,
+ * the pitch and the readback differ.
  *
  * A namespace-scope constant rather than a macro: GCC 12, the portable
  * package baseline, rejects a multi-line raw string inside a #define.
@@ -141,6 +143,8 @@ __kernel void rt_rgb_proc(__global const float* srcR,
                           __global const float* toxyz,
                           const int width,
                           const int height,
+                          const int srcPitch,
+                          const int dstPitch,
                           const float expScale,
                           const float comp,
                           const float hlRange,
@@ -156,10 +160,11 @@ __kernel void rt_rgb_proc(__global const float* srcR,
         return;
     }
 
-    const int index = y * width + x;
-    float r = srcR[index];
-    float g = srcG[index];
-    float b = srcB[index];
+    const int srcIndex = y * srcPitch + x;
+    const int dstIndex = y * dstPitch + x;
+    float r = srcR[srcIndex];
+    float g = srcG[srcIndex];
+    float b = srcB[srcIndex];
 
     if (mixChannels) {
         const float rmix = (r * channelMixer[0] + g * channelMixer[1]
@@ -237,8 +242,8 @@ __kernel void rt_rgb_proc(__global const float* srcR,
     const float fy = rt_compute_f(cachef, Y);
     const float fz = rt_compute_f(cachef, Z);
 
-    dstL[index] = rt_compute_fy(cachefy, Y);
-    dstA[index] = 500.0f * (fx - fy);
-    dstB[index] = 200.0f * (fy - fz);
+    dstL[dstIndex] = rt_compute_fy(cachefy, Y);
+    dstA[dstIndex] = 500.0f * (fx - fy);
+    dstB[dstIndex] = 200.0f * (fy - fz);
 }
 )CLC";

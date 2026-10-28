@@ -2492,6 +2492,13 @@ bool rgbProc(const Imagefloat* src, LabImage* dst, const RgbProcData& data)
 
     const cl_int widthArg = width;
     const cl_int heightArg = height;
+    /*
+     * The classic backend allocates every plane with exactly `planeBytes` and
+     * copies with a zero buffer row pitch, so its planes are compact and the
+     * kernel pitch is the width in float elements.
+     */
+    const cl_int srcPitchArg = width;
+    const cl_int dstPitchArg = width;
     const cl_int toneCurveBlackArg = data.toneCurveBlack;
     const cl_int clampOogArg = data.clampOog ? 1 : 0;
     const cl_int mixChannelsArg = data.mixChannels ? 1 : 0;
@@ -2515,13 +2522,15 @@ bool rgbProc(const Imagefloat* src, LabImage* dst, const RgbProcData& data)
     status |= state.api.SetKernelArg(kernel, 15, sizeof(cl_mem), &toxyzBuffer);
     status |= state.api.SetKernelArg(kernel, 16, sizeof(cl_int), &widthArg);
     status |= state.api.SetKernelArg(kernel, 17, sizeof(cl_int), &heightArg);
-    status |= state.api.SetKernelArg(kernel, 18, sizeof(cl_float), &data.expScale);
-    status |= state.api.SetKernelArg(kernel, 19, sizeof(cl_float), &data.comp);
-    status |= state.api.SetKernelArg(kernel, 20, sizeof(cl_float), &data.hlRange);
-    status |= state.api.SetKernelArg(kernel, 21, sizeof(cl_int), &toneCurveBlackArg);
-    status |= state.api.SetKernelArg(kernel, 22, sizeof(cl_int), &clampOogArg);
-    status |= state.api.SetKernelArg(kernel, 23, sizeof(cl_int), &mixChannelsArg);
-    status |= state.api.SetKernelArg(kernel, 24, sizeof(cl_int), &rgbCurveMaskArg);
+    status |= state.api.SetKernelArg(kernel, 18, sizeof(cl_int), &srcPitchArg);
+    status |= state.api.SetKernelArg(kernel, 19, sizeof(cl_int), &dstPitchArg);
+    status |= state.api.SetKernelArg(kernel, 20, sizeof(cl_float), &data.expScale);
+    status |= state.api.SetKernelArg(kernel, 21, sizeof(cl_float), &data.comp);
+    status |= state.api.SetKernelArg(kernel, 22, sizeof(cl_float), &data.hlRange);
+    status |= state.api.SetKernelArg(kernel, 23, sizeof(cl_int), &toneCurveBlackArg);
+    status |= state.api.SetKernelArg(kernel, 24, sizeof(cl_int), &clampOogArg);
+    status |= state.api.SetKernelArg(kernel, 25, sizeof(cl_int), &mixChannelsArg);
+    status |= state.api.SetKernelArg(kernel, 26, sizeof(cl_int), &rgbCurveMaskArg);
 
     if (status != CL_SUCCESS) {
         rgbProcUnavailable = true;
