@@ -627,9 +627,12 @@ __kernel void lanczos3(__global const float* src,
 }
 )CLC";
 
-const char* const TRANSFORM_SOURCE = R"CLC(
-#pragma OPENCL FP_CONTRACT OFF
-)CLC" RT_TRANSFORM_SAMPLING_CL R"CLC(
+const std::string& transform_source()
+{
+    static const std::string source =
+        std::string("#pragma OPENCL FP_CONTRACT OFF\n") +
+        RT_TRANSFORM_SAMPLING_CL +
+        R"CLC(
 /*
  * Three-plane rotation/scale with a host-built map: four floats per
  * destination pixel hold the source cell and the fractional offsets. The
@@ -688,12 +691,14 @@ __kernel void rt_transform(__global const float* src,
     }
 }
 )CLC";
+    return source;
+}
 
 const std::vector<KernelDef>& kernels()
 {
     static const std::vector<KernelDef> table = {
         {"lanczos3", LANCZOS_SOURCE, "lanczos3"},
-        {"transform", TRANSFORM_SOURCE, "rt_transform"}
+        {"transform", transform_source().c_str(), "rt_transform"}
     };
     return table;
 }

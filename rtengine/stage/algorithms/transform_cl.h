@@ -30,10 +30,11 @@
  * `stride` is the row stride in floats, and `width`/`height` are the image
  * bounds used for clamping.
  *
- * This is a macro rather than a constant so each kernel source can concatenate
- * it with its own entry point at compile time.
+ * This is a namespace-scope constant rather than a macro: GCC 12 rejects a
+ * multi-line raw string inside a #define, and the portable package targets
+ * Debian 12. Each kernel source concatenates it at run time instead.
  */
-#define RT_TRANSFORM_SAMPLING_CL R"CLC(
+inline constexpr const char* RT_TRANSFORM_SAMPLING_CL = R"CLC(
 inline float rt_transform_finish(const float value, const int useLog)
 {
     return useLog ? exp(value) : value;
@@ -85,4 +86,4 @@ inline float rt_transform_bilinear(__global const float* src, const int stride,
         + src[y2 * stride + x1] * (1.0f - dx) * dy
         + src[y2 * stride + x2] * dx * dy;
 }
-)CLC"
+)CLC";

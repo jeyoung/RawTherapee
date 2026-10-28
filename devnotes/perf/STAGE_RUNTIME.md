@@ -157,9 +157,11 @@ The destination-to-source map is built on the host in double precision by
 `rtengine/transformmap.h`, which the classic backend now uses as well, so the
 two paths cannot disagree about the geometry. The interpolation arithmetic
 lives once in `rtengine/stage/algorithms/transform_cl.h` and is concatenated
-into both kernel sources; only the addressing differs, because the classic
-kernel takes one buffer per plane while the device kernel takes one three-plane
-buffer with row and plane pitches.
+into both kernel sources at run time; only the addressing differs, because the
+classic kernel takes one buffer per plane while the device kernel takes one
+three-plane buffer with row and plane pitches. The fragment is a
+namespace-scope constant, not a macro: GCC 12, the portable baseline, rejects a
+multi-line raw string inside a `#define`, which the host compiler accepts.
 
 The device kernel runs a one-dimensional range, one work item per destination
 pixel, and derives `y` from the flat id. A two-dimensional `get_global_id(1)`

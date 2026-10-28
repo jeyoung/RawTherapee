@@ -354,9 +354,12 @@ float lanczosWeight(float x, float a)
     return a * xsinf(x) * xsinf(x / a) / (x * x);
 }
 
-const char* transformKernelSource = R"CLC(
-#pragma OPENCL FP_CONTRACT OFF
-)CLC" RT_TRANSFORM_SAMPLING_CL R"CLC(
+const std::string& transformKernelSource()
+{
+    static const std::string source =
+        std::string("#pragma OPENCL FP_CONTRACT OFF\n") +
+        RT_TRANSFORM_SAMPLING_CL +
+        R"CLC(
 __kernel void rt_transform(__global const float* srcR,
                            __global const float* srcG,
                            __global const float* srcB,
@@ -401,6 +404,8 @@ __kernel void rt_transform(__global const float* srcR,
     }
 }
 )CLC";
+    return source;
+}
 
 const char* labToRgbKernelSource = R"(
 #pragma OPENCL FP_CONTRACT OFF
@@ -2196,7 +2201,7 @@ bool transformRotateScale(const Imagefloat* src, Imagefloat* dst,
     }
 
     std::string error;
-    cl_program program = programFor(state, transformKernelSource,
+    cl_program program = programFor(state, transformKernelSource(),
                                     standardOption(info), error);
 
     if (program == nullptr) {
