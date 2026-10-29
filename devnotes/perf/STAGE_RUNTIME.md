@@ -2742,113 +2742,103 @@ submission.
 
 ## Local adjustments
 
-`local.adjustments` is the export block at `simpleprocess.cc:1468`. The block
-applies the spot parameter fixups, the optional pre-CBDL directional pyramid
-equaliser, `rgb2lab()` into `labView`, one `ImProcFunctions::Lab_Local()` call
-per spot and the final `lab2rgb()` back into `baseImg`. `Lab_Local()` takes
-270 parameters and the colour-only path is a small island inside it: the spot
-loop, the colour sliders and curves, the deltaE blend and the two full-image
-round trips.
+`local.adjustments` is the export block at `simpleprocess.cc:1468`. The first
+device increment covers exactly one active colour spot: `spotMethod == "norm"`,
+`shape == "ELI"`, `expcolor == true`, every other `exp*` false,
+`qualitycurveMethod == "none"`, `avoidgamutMethod == "NONE"`, `avoidrad == 0`,
+`hrenabled == false`, no recursion, inversion, explicit mask, soft radius,
+merge, LabGrid, RGB curve or exposure curve, and chroma/lightness/contrast
+inside `-100..100`. Curves, Munsell, multi-spot and inactive spots are the next
+increments and stay on the host.
 
-### Host block
+### ABI and host setup
 
-The body of `stage_local_adjustments()` moved unchanged into
-`rtengine::stage::localAdjustmentsHostBlock()` in
-`rtengine/stage/local_adjustments_context.cc`. The call site, the host builtin
-and the tests now share one CPU implementation. The block still owns the
-pre-CBDL pass and the final `lab2rgb()`; the caller creates `labView` and
-passes it in, so the extracted function no longer allocates it. The `nocrash`
-prefilter at the start of every `Lab_Local()` call is the per-spot negative
-value round trip (`lab2rgb`, every channel `max(epsi0)`, `rgb2lab`); the tail
-clamp is the same round trip with `epsi` (`1e-5`) and, when the Laplacian arm
-is selected, `clipR()`. The tone curve mode selects `notzero` in every profile,
-so a supported spot always takes the tail arm; the record carries the arm
-rather than assuming it.
+The node takes a three-plane `F32` Lab buffer, a pointer to
+`RtLocalAdjustmentsContext` (version 1, magic `0x4C414A43`, size checked) and
+the block support flag. `run_local_adjustments()` calls the context's
+`build(self, 0, &lab, &setup)` before the upload. `build` runs
+`ImProcFunctions::localAdjustmentsSpotParams()` (the block's own
+`calcLocalParams()`), `calc_ref()`, `complexCurvelocal()` and the two
+chroma-slider curve builders, and exports one 66-float record, the curve
+tables, the working and inverse matrices, `Color::cachef[]`/`cachefy[]` and the
+`gaussianBlur()` coefficients for `origblur`. `calc_ref()` and `avge` stay
+host-side.
 
-### ABI and context
+The call site prefills `labView` with `rgb2lab(baseImg)`, submits the node and
+converts the returned Lab back with `lab2rgb()`; `baseImg` is not passed to the
+kernel. A refusal or a failed launch returns before `readback()`, so the host
+Lab is written only on success. The builtin runs the extracted
+`localAdjustmentsHostBlock()` with device recursion disabled and records
+`impl=host`.
 
-The node takes three arguments: a three-plane `F32` Lab buffer, a pointer to
-`RtLocalAdjustmentsContext` and the block support flag. The context is
-host-only and versioned (`RT_LOCAL_ADJUSTMENTS_CONTEXT_VERSION 1`,
-`RT_LOCAL_ADJUSTMENTS_CONTEXT_MAGIC 0x4C414A43`, size checked). It holds a
-`build` callback and a `run_host` callback. The call site passes only
-`RT_STAGE_ARG_BUFFER`, `RT_STAGE_ARG_PTR` and `RT_STAGE_ARG_INT`, so a stale
-descriptor is rejected before any callback runs.
+### Kernels and order
 
-`build(spot, lab, out)` prepares one spot at a time. It calls
-`ImProcFunctions::localAdjustmentsSpotParams()`, the new narrow interface to
-the block's own `calcLocalParams()`, so geometry, transition, deltaE weights
-and the activity flags are the values `Lab_Local()` will use rather than a
-second derivation. It then calls `calc_ref()` on the image *as it stands
-before that spot* (each spot's references depend on the previous result),
-`complexCurvelocal()` for the lightness/contrast table and the curve factories
-for the four diagonal and three hue curves. The flat record has
-`RT_LOCAL_ADJUSTMENTS_SPOT_STRIDE` (66) floats: geometry, transition and
-deltaE weights, the slider values, the references and area average, the
-activity and method flags, the clamp arm, the curve offsets and the
-working-profile chroma scale. Curve offsets index one float table
-(`RT_LOCAL_ADJUSTMENTS_MAX_LUT_ENTRIES`, 2^22 floats); `-1` means absent. The
-setup also exports the nine working-space matrix floats, `Color::cachef[]` and
-`cachefy[]`, and the 197x140 Munsell set.
+The program is the lab.tools helpers, the Munsell fragment (unused by this
+increment but required by the vibrance source), the local-contrast IIR line
+kernel, the Sleef `xatan2f`/`xsincosf` port and the lab.regions
+`xlogf`/`xexpf`/`pow_F` port, followed by four kernels:
 
-The reference build is deliberately per spot. A single `build` for the whole
-block cannot be faithful: `calc_ref()` for spot N reads the Lab result of spot
-N-1, and a future launcher must read the device buffer back between spots
-before calling `build` again. The per-spot record shape and callback make that
-ordering explicit; the current launcher does not use it.
+- `rt_local_adjustments_clamp`: `lab2rgb`, `max(channel, epsi)`, optional
+  `clipR`, `rgb2lab`, using the host float matrices and `cachef`/`cachefy`.
+  The prefilter runs it with `epsi0 = 1e-6` when `avoidneg` is set; the tail
+  runs it with `epsi = 1e-5` and the recorded `CLAMP_NOTZERO` arm.
+- `rt_local_adjustments_roi`: copies the spot ROI out of the Lab image into
+  one plane per channel.
+- `rt_lab_tools_lc_line`: the existing host-matched IIR Gaussian, sigma
+  `(2 + 0.2 * blurcolde) / sk` with `sk = 1`, horizontal and vertical, one
+  plane at a time. Only the SSE path is admitted (`double_path == 0`).
+- `rt_local_adjustments_apply`: the colour core, `calcTransition()` for ELI,
+  the deltaE scope against the blurred original, `calcreducdE()` and
+  `calcLocalFactor()` with the Sleef ports, then
+  `orig + factor * reducdE * (corrected - orig)` with the host's `clipC()`.
 
-### Predicate and refusal
+The order is the block's: the optional prefilter, the ROI original blur, the
+colour apply, then the tail clamp. `avoidgamutMethod == "NONE"` still performs
+the tail clamp. The launch refuses a GPU device and a double-path blur before
+the upload.
 
-`localAdjustmentsSupported()` is block-level. It admits a normal elliptical or
-rectangular spot with no recursion, inversion, merge, explicit mask, soft
-radius, gradient, LabGrid, RGB curve, exposure curve or tool other than
-Colour & Light, `avoidgamutMethod` NONE or MUNS, `avoidrad == 0` and
-`gamc == 1`; an inactive spot is admitted as the clamp-only case. It refuses
-the pre-CBDL and dehaze passes, the exposure/soft-light/dirpyrequalizer
-Laplacian arm, every other tool, LAB/XYZ/XYZREL gamut methods and any value
-outside the record's ranges. One refused spot makes the whole block a
-residual, so device and host are never mixed per spot.
+### Exactness
 
-The OpenCL queue registers the node, validates the three arguments, buffer
-format and pitch, the context magic/version/size and the support flag, then
-refuses with `local.adjustments colour-only kernel is not implemented` (or
-`local.adjustments residual` for a zero flag). The refusal happens before the
-upload, the host queue runs the builtin, and the record is
-`"impl":"host","source":"device-fallback"`. The builtin runs
-`localAdjustmentsHostBlock()` with device recursion disabled.
+The clamp is the same round trip as the lab.tools RGB-mode blend and uses the
+host's own matrices, caches and cube-root path. The transition uses the
+vibrance fragment's Sleef `xsincosf()` for `xcosf()` and the lab.regions
+`pow_F()` for `transweak`; `calcLocalFactor()` and `calcreducdE()` call OpenCL
+`pow()` where the host calls `std::pow(float,float)`. The two
+`color_satur`/`color_saturmoins` curves are host-sampled at 65536 points and
+read with linear interpolation; the measured worst case over the parity matrix
+is 0.060547 LSB16, so the sampled table stays inside the 1 LSB16 bound.
+`hueref`/`chromaref`/`lumaref` are the `calc_ref()` outputs; `sobelref` is not
+used because the structure slider is a residual.
 
-### Measured blocker
+### Residuals
 
-The colour kernel itself is not in this change. A faithful port needs, per
-spot, the ROI Gaussian for `origblur` (radius `(2 + 0.2 * blurcolde) / sk`),
-the colour core (the chroma NURBS pair, C=f(C), C=f(L), L=f(C), H=f(H),
-L=f(H), C=f(H), the lightness/contrast `calclight()` table and the LabGrid
-residual gate), `transit_shapedetect2()`'s transition/deltaE blend, the
-per-spot `nocrash` and tail round trips, and `avoidcolshi()`'s Munsell pass.
-`calc_ref()` and `localAdjustmentsSpotParams()` stay host-side, which forces
-one submission per spot with a read-back between them; the block's
-`reservedView` is fixed and the `lastorigView`/`shbuffer` state is only needed
-by merge and inverse sharpening, both residuals. The host also uses Sleef
-`xatan2f`/`xcosf`/`xsincosf`/`pow_F` in the transition and Munsell products;
-the 1 LSB16 target has to be measured against those, not against OpenCL's
-libm. The host block, predicate, record builder, matrices, caches, Munsell
-export and refusal are therefore landed first; no subset that skips the clamp
-or the Munsell pass is shipped.
+Every configuration outside the one-spot set is a residual: curves,
+Munsell, a second spot, an inactive spot, a rectangular spot, exposure,
+shadows/highlights, vibrance, local contrast, blur/denoise, sharpening, tone
+mapping, Retinex, CBDL, log, soft light, the common mask, CIE CAM, dehaze,
+`exc`/`full`/`main`, merge, explicit masks, soft radius, LAB/XYZ/XYZREL gamut
+methods, the RGB curve, LabGrid, `avoidrad != 0`, `transit == 100`, a blur
+radius above 100, a missing clamp arm, a rate outside the record ranges, and a
+host setup failure. A GPU device is refused before the upload. The whole block
+runs the host builtin with `impl=host`; there is no per-spot mixing.
 
 ### Evidence
 
-`stage-residency-test` on the CPU and POCL builds:
+`stage-residency-test`, POCL CPU, `OMP_NUM_THREADS=1`:
 
 | Case | Result |
 |---|---|
-| Host extraction, four profiles at 179x48, 179x49 and 238x64 | one inactive spot, two overlapping spots, three overlapping spots and the three reversed: `impl=host` on the POCL run, no `impl=opencl`, PAE 0.000000 LSB16, 0 differing samples, finite (25,776 / 26,313 / 45,696 / 45,696 samples) |
-| Predicate | the default profile is refused; a default inactive spot is admitted; 25 residual mutations (exposure, SH, vibrance, local contrast, blur, tone map, soft light, sharpening, log, mask, explicit mask, soft radius, recursion, inversion, merge, `exc`, LAB, XYZ, `avoidrad`, RGB curve, LabGrid, structure, gamma, pre-CBDL, dehaze) are refused |
-| Record builder | one spot record, finite slots, L curve active and L=f(H) inactive for a non-identity L curve and an identity hue curve, MUNS recorded, the negative-value prefilter recorded, `CLAMP_NOTZERO` recorded, absent tables marked `-1` |
-| CLI refusal record | `localadjustments.pp3`, 3888x2608 PEF, POCL CPU, `--gpu=auto`, `RT_STAGE_OPENCL=1`: the node records `"stage":"local.adjustments","impl":"host","source":"device-fallback"` before the classic backend's pre-existing `opencl::initLocked()` P2 crashes the process. The block itself completes in 3.3-3.5 s. No CLI TIFF parity is claimed from this run |
-| Host block parity | the four residency cases above are the TIFF-equivalent Lab comparison: `impl=host`, PAE 0, 0 differing samples, finite |
-| Default path | with `RT_STAGE_OPENCL` unset the call site runs the host block directly; the four residency cases are unchanged and the CPU-only test passes |
-| Builds | `build/cpu-perf-graph` and `build/opencl-perf-graph` compile `rth-cli` and `stage-residency-test`; CPU-only test reports `PASS (24 skipped)` |
-| Gate | `verify.sh --stage-device` rows added for both profiles; with the current refusal they print `SKIP ... stage device declined`, and `RT_REQUIRE_GPU=1` turns that into a failure. The device row is not marked PASS. |
+| Supported matrix, 17 cases at 179x48, 179x49, 238x64 and 8192x64 | clamp only, chroma -50/50, lightness -50/50, contrast -50/50, all -50/50, deltaE off, transit 0/99, prefilter off and the three sizes: 2,219,001 samples, `impl=opencl` on every case, finite, worst 0.060547 LSB16 (8192x64), none over 1 LSB16 |
+| Non-vacuity | the all-50 colour case changes 29,698 of 45,696 reference samples against the clamp-only case, PAE 36,726.416992 LSB16 |
+| Residuals, 7 cases | multi-spot, MUNS, quality curves, explicit mask, soft radius, exposure tool and highlight reconstruction are refused, record `impl=host` with no `impl=opencl`, and are byte-identical to the block (7 x 45,696 samples, PAE 0) |
+| Predicate matrix, 35 entries | one otherwise supported profile per residual setting is refused; the supported profile is admitted |
+| `verify.sh --stage-device`, POCL CPU, `localadjustments.pp3` | PASS, `max_pae=1.5259e-05` (1 LSB16), record `"stage":"local.adjustments","impl":"opencl","source":"opencl"` at 3888x2608; `compare_tiff.py` max 1 LSB16, 414,889 of 30,419,712 samples differ |
+| `localadjustments-multispot.pp3` | SKIP as a residual: the record is `"impl":"host","source":"device-fallback"` |
+| Full `--stage-device` run | the current suite stops at the pre-existing `working.trc` row (`max_pae=4.57771e-05`) before reaching local.adjustments; the two local rows were run from a trimmed copy of the same script, so the single-spot PASS is direct evidence and the full-suite result is not claimed |
+| Forced refusal | `RT_STAGE_DEVICE_BUDGET_MB=16` records `impl=host`; with `RT_REQUIRE_GPU=1` the stage-device row FAILs |
+| Default path | with `RT_STAGE_OPENCL` unset the call site runs the host block directly; the CPU-only test reports `stage-residency-test: PASS (25 skipped)` and the host output is unchanged |
+| Builds | `build/cpu-perf-graph` and `build/opencl-perf-graph` compile `rth-cli` and `stage-residency-test` with GCC and the generic target |
+| GPU | not run; the launcher checks `StageOpenCLDeviceInfo::cpu` and refuses before the upload, so a GPU submission records `impl=host`. The device test runs the GPU branch only when a non-CPU device is selected |
 
 ## Limitations
 

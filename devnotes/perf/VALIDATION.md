@@ -225,33 +225,18 @@ node ran on the device rather than only comparing pixels.
 
 | Case | Result |
 |---|---|
-| CLI refusal record, `localadjustments.pp3`, 3888x2608 PEF, POCL CPU, `--gpu=auto`, `RT_STAGE_OPENCL=1` | the node records `"stage":"local.adjustments","impl":"host","source":"device-fallback"`; the process then hits the pre-existing classic `opencl::initLocked()` P2 and exits before the TIFF is finished, so no CLI TIFF comparison is claimed. `--gpu=off` exports of both profiles complete and are identical to the unmodified CPU path, but that option also disables the stage kill switch, so it is not device evidence |
-| Device parity for a colour spot | not run: the launcher refuses before the upload, so `impl=opencl` is never recorded. The gate rows are present and print `SKIP ... stage device declined`; `RT_REQUIRE_GPU=1` turns them into FAIL. This is the measured blocker recorded in `STAGE_RUNTIME.md`, not a PASS |
-| Device predicate and record builder | `stage-residency-test`: default profile refused, default inactive clamp-only spot admitted, 25 residual mutations refused, one finite 66-slot record with active L and inactive L=f(H) tables, MUNS, the negative-value prefilter and `CLAMP_NOTZERO` recorded |
-| POCL run | `stage-residency-test: PASS (1 skipped)`; the four local-adjustments cases report `impl=host`, no `impl=opencl`, PAE 0.000000 LSB16 and 0 differing samples |
-| CPU-only run | `stage-residency-test: PASS (24 skipped)` with `OpenCL unavailable (built without OpenCL)` |
-| Forced refusal | `RT_REQUIRE_GPU=1` with the local-adjustments rows fails the stage-device gate, so the refusal path is non-vacuous |
-
-The forced refusal proves the gate can fail, so the PASS is not vacuous. A
-targeted gamut refusal (`RT_STAGE_DEVICE_BUDGET_MB=16`) leaves the gamut
-record absent, so the gate predicate fails, while the export still succeeds
-through the host block and is pixel-identical to the CPU-only export. A
-targeted framing refusal with a 4900x4604 fixed frame and a 150 MB device
-budget leaves the resize and output nodes on the device while the framing
-record is absent; `drawFrame()` completes on the host and the framing gate
-predicate fails. The device-versus-CPU difference is 1 LSB on 96 426 of
-2 534 980 pixels (3.8%) for resize and on 384 601 of 10 139 424 pixels (3.8%)
-for transform, both inside the limit. The residency test's synthetic images are exact, including the
-identity transform, whose assertion was mutation-checked.
-
-The lab.tools rows above were produced with `tools/opencl/verify.sh`, which
-sets `RT_OPENCL_RGBPROC=1`. Without it, a bare
-`rawtherapee-graph-cli --gpu=auto` export with `RT_STAGE_OPENCL=1` segfaults in
-`opencl::initLocked()` through `ImProcFunctions::lab2rgbOut()` - a null call in
-the classic backend's lazy OpenCL initialisation - for every profile, the
-neutral default included. It reproduces at `03c94581c`, before the lab.tools
-node existed, so it is a pre-existing classic-backend defect, not a lab.tools
-defect; it is recorded as a P2 residual in `STAGE_RUNTIME.md`.
+| Device parity, 17 supported cases | POCL CPU, `stage-residency-test`: clamp only, chroma/lightness/contrast -50/0/50, all -50/50, deltaE off, transit 0/99, prefilter off, 179x48, 179x49, 238x64 and 8192x64; 2,219,001 samples, `impl=opencl` on every case, finite, worst 0.060547 LSB16, none over 1 LSB16 |
+| Clamp evidence | the clamp-only case differs from the block by 0.038574 LSB16 (12,301 of 45,696 samples), so the per-spot round trip is measured, not skipped |
+| Non-vacuity | the all-50 colour case changes 29,698 of 45,696 reference samples against clamp-only, PAE 36,726.416992 LSB16 |
+| Residual matrix, 35 entries | inactive spot, two spots, MUNS, quality curves, hue curves, RECT, exposure, SH, vibrance, local contrast, blur, tone map, soft light, sharpening, log, mask, explicit mask, soft radius, recursion, inversion, merge, `exc`, LAB, XYZ, `avoidrad`, RGB curve, LabGrid, structure, gamma, pre-CBDL, dehaze, highlight reconstruction, blur radius 101, transit 100 and chroma 101 are all refused |
+| Residual parity, 7 cases | multi-spot, MUNS, quality curve, explicit mask, soft radius, exposure tool and highlight reconstruction record `impl=host` with no `impl=opencl` and are byte-identical to the block (7 x 45,696 samples, PAE 0) |
+| `verify.sh --stage-device`, POCL CPU, `localadjustments.pp3` | PASS, `max_pae=1.5259e-05` (1 LSB16); record `"stage":"local.adjustments","impl":"opencl","source":"opencl"` at 3888x2608; manual `compare_tiff.py` max 1 LSB16, 414,889 of 30,419,712 samples differ |
+| `localadjustments-multispot.pp3` | SKIP as a residual: `"impl":"host","source":"device-fallback"` |
+| Full `--stage-device` run | stops at the pre-existing `pef/stage-device-working-trc` row (`max_pae=4.57771e-05`) before the local-adjustments rows; those two rows were run from a trimmed copy of the same script and the single-spot row passes, so the local result is not inferred from a full-suite pass |
+| Forced refusal | `RT_STAGE_DEVICE_BUDGET_MB=16` with the single-spot profile records `impl=host`; under `RT_REQUIRE_GPU=1` the stage-device row FAILs, so the gate is non-vacuous |
+| CPU-only build | `stage-residency-test: PASS (25 skipped)` with `OpenCL unavailable (built without OpenCL)`; the host output is unchanged |
+| Builds | `build/cpu-perf-graph` and `build/opencl-perf-graph` compile `rth-cli` and `stage-residency-test` with GCC, generic target |
+| GPU | not run; the launcher refuses a non-CPU device before the upload. The device test has a GPU branch that asserts `impl=host` when a GPU is selected |
 
 ## Interactive nodes on the host
 

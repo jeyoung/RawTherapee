@@ -212,7 +212,7 @@ main sharpen node may still run on the device.
 | `raw.base` | Full/Full/Roi/Reduced | path | reuse-output | `getImage()`, spot removal, denoise, film negative, Retinex, source-side gamut | no |
 | `analysis` | Full/Full/Roi/- | path | reuse-output | histogram and auto-exposure analysis | n/a |
 | `transform` | Full/Full/Roi/- | path | reuse-input | rotation, distortion, perspective, CA, vignetting, gradient, post-crop vignette, dehaze, Fattal | yes |
-| `local.adjustments` | Full/Full/Roi/Reduced | path | reuse-input | local lab / selective editing | no |
+| `local.adjustments` | Full/Full/Roi/Reduced | path | reuse-input | local lab / selective editing | partial |
 | `rgb.proc` | Full/Full/Roi/Reduced | path | reuse-input | RGB curves, tone curve, colour toning, B&W, channel mixer, HSV, film simulation | yes |
 | `lab.tools` | Full/Full/Roi/Reduced | path | reuse-input | shadows/highlights, vibrance, Lab curves, local contrast, EPD, Lab-grid colour toning and Lab colour-correction regions | partial |
 | `lab.sharpening` | Full/-/Roi/- | path | reuse-input | impulse denoise, defringe, ML sharpen edges, ML microcontrast and the main sharpen pass (shared `output.sharpen` node) | partial |
@@ -1691,26 +1691,27 @@ edges-only, halo control, show-mask and `blurradius >= 0.25` run the host
 builtin. The sub-node records, commands and parity results are in
 `STAGE_RUNTIME.md`.
 
-Still CPU-only: `raw.preprocess`, `raw.demosaic`, `raw.base`,
-`local.adjustments`, `lab.tools`, `lab.wavelet`, `working.trc`, `ciecam` and
-`thumbnail.lab`.
+Still CPU-only: `raw.preprocess`, `raw.demosaic`, `raw.base`, `lab.tools`,
+`lab.wavelet`, `working.trc`, `ciecam` and `thumbnail.lab`.
 
-`local.adjustments` has its host block, its block-level predicate, its flat
-per-spot ABI and its refusal path in place, but no device pass yet. The
-launcher validates the submission and then refuses before touching the Lab
-buffer, so every profile records `impl=host` and runs the extracted block. The
-admitted set is the colour-only spot: `spotMethod == "norm"`, `shape` ELI or
-RECT, no recursion, inversion, explicit mask, soft radius, merge, gradient,
-LabGrid, RGB curve, exposure curve or tool other than Colour & Light, with
-`avoidgamutMethod` NONE or MUNS and `avoidrad == 0`. The per-spot negative
-value prefilter, the tail clamp and the final Munsell pass are all part of the
-unit; an inactive spot is the clamp-only case and is admitted. Everything else
-is a residual: exposure (FFT PDE), shadows/highlights, vibrance, local
-contrast, blur/denoise, sharpening, tone mapping, Retinex, CBDL, log, soft
-light, the common mask, CIE CAM, dehaze, `exc`/`full`/`main`, merge, explicit
-masks, soft radius, LAB/XYZ/XYZREL gamut methods, the RGB curve, LabGrid,
-`avoidrad != 0` and an active pre-CBDL pass. The measured blocker is recorded
-in `STAGE_RUNTIME.md`.
+`local.adjustments` is partial through the one-spot colour path. The admitted
+set is exactly one active spot with `spotMethod == "norm"`,
+`shape == "ELI"`, `expcolor == true`, every other `exp*` false,
+`qualitycurveMethod == "none"`, `avoidgamutMethod == "NONE"`, `avoidrad == 0`,
+`hrenabled == false`, no recursion, inversion, explicit mask, soft radius,
+merge, LabGrid, RGB curve or exposure curve, and chroma/lightness/contrast
+inside `-100..100`. The node runs the per-spot negative-value prefilter, the
+ROI original Gaussian, the elliptical transition/deltaE colour apply and the
+full-image tail clamp; `baseImg` stays host and the final `lab2rgb()` is the
+call site's. The two chroma-slider curves are host-sampled into 65536-entry
+tables. Everything else is a residual: curves (L/C/H and quality), Munsell,
+multi-spot, inactive spots, rectangular spots, exposure (FFT PDE),
+shadows/highlights, vibrance, local contrast, blur/denoise, sharpening, tone
+mapping, Retinex, CBDL, log, soft light, the common mask, CIE CAM, dehaze,
+`exc`/`full`/`main`, merge, explicit masks, soft radius, LAB/XYZ/XYZREL gamut
+methods, the RGB curve, LabGrid, `avoidrad != 0`, `transit == 100`, a blur
+radius above 100 and an active pre-CBDL pass. A GPU device is refused before
+the upload.
 
 Recorded `n/a` exceptions: `source.select` and `source.embedded` are I/O,
 `analysis` produces only histograms, `output.icc` attaches metadata,
