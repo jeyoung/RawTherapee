@@ -2010,10 +2010,12 @@ private:
                                  &curve1, &curve2, &satcurve, &lhskcurve};
 
         /*
-         * The device node is opt-in and covers the LabGrid pass and
-         * shadows/highlights only. Everything else in the block is a residual:
-         * the node is not submitted as supported, the launcher refuses it and
-         * the builtin below runs the host block, recording impl=host.
+         * The device node is opt-in and covers the LabGrid pass,
+         * shadows/highlights and vibrance. Everything else in the block is a
+         * residual: the node is not submitted as supported, the launcher
+         * refuses it and the builtin below runs the host block, recording
+         * impl=host. The launcher also refuses vibrance on a GPU device,
+         * whose division rounding can move a Munsell-limit pixel.
          */
         if (stage::node_device("lab.tools") == stage::StageNodeDevice::OpenCL) {
             const bool supported = stage::labToolsSupported(params);

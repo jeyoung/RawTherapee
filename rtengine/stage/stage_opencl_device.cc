@@ -1835,9 +1835,7 @@ cl_kernel compiled_kernel_entry(const std::shared_ptr<OpenCLEnv>& env,
     const char* build_options =
         std::strcmp(def->name, "working.trc") == 0 ||
                 std::strcmp(def->name, "lab.tools") == 0
-            ? (std::strcmp(def->name, "lab.tools") == 0
-                   ? "-cl-fp32-correctly-rounded-divide-sqrt -cl-opt-disable"
-                   : "-cl-fp32-correctly-rounded-divide-sqrt")
+            ? "-cl-fp32-correctly-rounded-divide-sqrt"
             : nullptr;
     build_error = env->api->BuildProgram(program, 1, &env->device,
                                          build_options, nullptr, nullptr);
@@ -3456,6 +3454,26 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
     if (!labgrid && !sh_active && !vibrance) {
         error = "lab.tools has no enabled tool";
         return RT_STAGE_FALLBACK;
+    }
+
+    /*
+     * Vibrance needs the host's correctly rounded divide and sqrt at every
+     * branch decision. A GPU OpenCL implementation may round one of them
+     * differently, which moves a pixel whose hue sits on a Munsell zone limit
+     * to the other side of the gate; the Radeon RX 550 was measured moving
+     * two pixels by up to 2,329 LSB16 on the PEF chart. The node therefore
+     * runs vibrance only on a CPU OpenCL device (POCL), the deterministic
+     * device the project uses for parity, and records impl=host elsewhere.
+     */
+    if (vibrance) {
+        cl_device_type device_type = 0;
+        if (env->api->GetDeviceInfo(env->device, CL_DEVICE_TYPE,
+                                    sizeof(device_type), &device_type,
+                                    nullptr) != CL_SUCCESS ||
+            device_type != CL_DEVICE_TYPE_CPU) {
+            error = "lab.tools vibrance needs a deterministic CPU device";
+            return RT_STAGE_FALLBACK;
+        }
     }
 
     const RtStageBuffer& lut_highlight = args[16].u.buffer;
