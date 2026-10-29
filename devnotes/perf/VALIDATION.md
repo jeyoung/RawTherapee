@@ -221,6 +221,17 @@ node ran on the device rather than only comparing pixels.
 | No device selected (no `RT_OPENCL_ALLOW_CPU`) | SKIP |
 | `RT_STAGE_OPENCL` unset | classic backend logs `opencl resize`, no stage record; default path unchanged, and at the gamut profile the export is byte-identical to the pre-change binary |
 
+### Local adjustments
+
+| Case | Result |
+|---|---|
+| CLI refusal record, `localadjustments.pp3`, 3888x2608 PEF, POCL CPU, `--gpu=auto`, `RT_STAGE_OPENCL=1` | the node records `"stage":"local.adjustments","impl":"host","source":"device-fallback"`; the process then hits the pre-existing classic `opencl::initLocked()` P2 and exits before the TIFF is finished, so no CLI TIFF comparison is claimed. `--gpu=off` exports of both profiles complete and are identical to the unmodified CPU path, but that option also disables the stage kill switch, so it is not device evidence |
+| Device parity for a colour spot | not run: the launcher refuses before the upload, so `impl=opencl` is never recorded. The gate rows are present and print `SKIP ... stage device declined`; `RT_REQUIRE_GPU=1` turns them into FAIL. This is the measured blocker recorded in `STAGE_RUNTIME.md`, not a PASS |
+| Device predicate and record builder | `stage-residency-test`: default profile refused, default inactive clamp-only spot admitted, 25 residual mutations refused, one finite 66-slot record with active L and inactive L=f(H) tables, MUNS, the negative-value prefilter and `CLAMP_NOTZERO` recorded |
+| POCL run | `stage-residency-test: PASS (1 skipped)`; the four local-adjustments cases report `impl=host`, no `impl=opencl`, PAE 0.000000 LSB16 and 0 differing samples |
+| CPU-only run | `stage-residency-test: PASS (24 skipped)` with `OpenCL unavailable (built without OpenCL)` |
+| Forced refusal | `RT_REQUIRE_GPU=1` with the local-adjustments rows fails the stage-device gate, so the refusal path is non-vacuous |
+
 The forced refusal proves the gate can fail, so the PASS is not vacuous. A
 targeted gamut refusal (`RT_STAGE_DEVICE_BUDGET_MB=16`) leaves the gamut
 record absent, so the gate predicate fails, while the export still succeeds

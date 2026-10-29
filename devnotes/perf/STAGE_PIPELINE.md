@@ -1695,6 +1695,23 @@ Still CPU-only: `raw.preprocess`, `raw.demosaic`, `raw.base`,
 `local.adjustments`, `lab.tools`, `lab.wavelet`, `working.trc`, `ciecam` and
 `thumbnail.lab`.
 
+`local.adjustments` has its host block, its block-level predicate, its flat
+per-spot ABI and its refusal path in place, but no device pass yet. The
+launcher validates the submission and then refuses before touching the Lab
+buffer, so every profile records `impl=host` and runs the extracted block. The
+admitted set is the colour-only spot: `spotMethod == "norm"`, `shape` ELI or
+RECT, no recursion, inversion, explicit mask, soft radius, merge, gradient,
+LabGrid, RGB curve, exposure curve or tool other than Colour & Light, with
+`avoidgamutMethod` NONE or MUNS and `avoidrad == 0`. The per-spot negative
+value prefilter, the tail clamp and the final Munsell pass are all part of the
+unit; an inactive spot is the clamp-only case and is admitted. Everything else
+is a residual: exposure (FFT PDE), shadows/highlights, vibrance, local
+contrast, blur/denoise, sharpening, tone mapping, Retinex, CBDL, log, soft
+light, the common mask, CIE CAM, dehaze, `exc`/`full`/`main`, merge, explicit
+masks, soft radius, LAB/XYZ/XYZREL gamut methods, the RGB curve, LabGrid,
+`avoidrad != 0` and an active pre-CBDL pass. The measured blocker is recorded
+in `STAGE_RUNTIME.md`.
+
 Recorded `n/a` exceptions: `source.select` and `source.embedded` are I/O,
 `analysis` produces only histograms, `output.icc` attaches metadata,
 `thumbnail.decode` is a decode, and `crop` is a row `memcpy` whose device round
