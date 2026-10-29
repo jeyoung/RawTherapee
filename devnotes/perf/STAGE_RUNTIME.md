@@ -2085,9 +2085,9 @@ Evidence, with `OMP_NUM_THREADS=1` and a 3888x2608 PEF:
 
 ## Lab tools
 
-`lab.tools` runs the Lab block's Lab-grid colour-toning pass and
-shadows/highlights in both of its modes as one device node. Everything else in
-the block stays on the host.
+`lab.tools` runs the Lab block's Lab-grid colour-toning pass,
+shadows/highlights in both of its modes, and vibrance as one device node.
+Everything else in the block stays on the host.
 
 ### Supported set
 
@@ -2098,14 +2098,18 @@ the block stays on the host.
 - `labCurve.enabled` is false and `labCurve.contrast` is 0, so neither the
   histogram refill nor the Lab LUTs are in play (`chromiLuminanceCurve()`
   returns before touching a pixel, and `hist16` is left alone);
-- local contrast, EPD and vibrance are off, and black-and-white output is off
+- local contrast and EPD are off, and black-and-white output is off
   (`chromiLuminanceCurve()` zeroes a and b for it even with the Lab curves
   off);
 - the shadows/highlights sliders are inside 0..100 for the tonal widths and
   the radius, and 0..10000 for the amounts (the amounts have no geometric
   limit; the tone table is built on the host);
+- vibrance, when enabled, has pastels and saturated inside -100..100 and both
+  threshold values inside 0..100, would actually change a pixel (a slider is
+  set or the skin curve is not the identity), and, when `avoidcolorshift` is
+  on, `Color::init()` has filled the Munsell tables;
 
-and at least one of the two tools would run. A profile with neither is a
+and at least one of the three tools would run. A profile where none would is a
 residual: the node would be a no-op and the host block records it as such.
 
 The setup refines that in one place. RGB mode closes each pixel through
@@ -2147,6 +2151,28 @@ are ported operation for operation, with `intp(a, b, c) = a * (b - c) + c`.
 polynomial, not the libm root: above the 16-bit range the two differ by a few
 ulps, and the RGB-mode blend reads the result.
 
+### Vibrance and Munsell
+
+Vibrance is a port of `ImProcFunctions::vibrance()`. The kernel keeps the
+host's sequence: `xatan2f()`/`xsincosf()` (the sleef polynomials),
+`Color::gamutLchonly()` with lower/higher coefficients 0.15/0.98 and the
+highlight gate, `Color::SkinSat()`, the pastels/saturated double linear
+transition, the Luminance/Hue `sathue` and `sathue2` cascade, the two-stage
+chroma ramp with its `-0.93..2.0`/`-0.93..1.8` clamps, the skin-hue curve,
+and the `avoidcolorshift` loop with its second gamut clamp.
+
+The Munsell tables are the host's own. `Color::initMunsell()` declares and
+sizes 197 `LUTf`s (the historical comment says 195; all 197 are referenced by
+`MunsellLch()`), and the stage exports them through `Color::munsellLut()` into
+one flat set of 197 x 140 floats plus one length per table. The table-read
+helper reproduces `LUTf::operator[](int)`'s clamp, so the device reads a
+padded table exactly as the host reads the unpadded one. The skin curve is
+built by the setup with `fillCurveArrayVib()`'s expression and the host's
+`/ask`; the identity curve is not uploaded. `rt_lt_munsell_lch()` and
+`rt_lt_all_munsell_lch()` are a line-for-line port of `Color::MunsellLch()`
+and the single-correction `AllMunsellLch()` overload, including every hue
+limit, luminance band and table choice.
+
 ### ABI
 
 `[0]` the three-plane F32 Lab buffer, read and written in place, `[1]` the
@@ -2161,7 +2187,13 @@ mode flag, `[15]` the block's `scal` (always 1 at the export call site; the
 launcher requires it), `[16]` and `[17]` the highlight and shadow tone tables
 (32768 F32 in Lab mode, 65536 in RGB mode), `[18]` and `[19]` the working
 RGB-to-XYZ and XYZ-to-RGB matrices, nine floats each, `[20]` and `[21]`
-`Color::cachef` and `Color::cachefy`.
+`Color::cachef` and `Color::cachefy`, `[22]` the int vibrance flag (1 only
+when the block would touch a pixel), `[23]` and `[24]` pastels and saturated,
+`[25]` and `[26]` the pastels/saturated threshold top and bottom, `[27]`
+protect-skins, `[28]` avoid-colour-shift, `[29]` the skin-curve flag, `[30]`
+`toneCurve.hrenabled`, `[31]` the flat Munsell set (197 x 140 floats), `[32]`
+one float per table with its own length, `[33]` the 65536-entry skin curve
+(one float when the curve is the identity).
 
 The context is host-only. `build()` derives the four Lab-grid floats, builds
 the tone tables through the block's own `shadowsHighlightsLut()` (extracted
@@ -2178,11 +2210,11 @@ host image untouched.
 A residual runs the `lab.tools` host builtin, which disables device recursion
 for the duration and runs the original block, and the runtime records
 `impl=host`: Lab curves, a non-zero Lab contrast, local contrast, EPD,
-vibrance, black-and-white output, a colour-toning method other than `LabGrid`,
-a profile with no active tool, an out-of-range slider, an image too small for
-the guided filter (fewer than three samples on the subsampled grid), an
-RGB-mode tone table above the slope bound, and any allocation or launch
-failure. The call site runs the same block when the device is not selected, so
+black-and-white output, a colour-toning method other than `LabGrid`, a
+profile with no active tool, an out-of-range slider, a vibrance no-op, an
+image too small for the guided filter (fewer than three samples on the
+subsampled grid), an RGB-mode tone table above the slope bound, a process
+without the Munsell tables, and any allocation or launch failure. The call site runs the same block when the device is not selected, so
 with `RT_STAGE_OPENCL` unset the node is the pre-node code path and its export
 is byte-identical to the previous binary.
 
@@ -2194,16 +2226,27 @@ With `OMP_NUM_THREADS=1`, a 3888x2608 PEF and the POCL CPU device:
 |---|---|
 | `stage-residency-test` lab.tools cases at 238x64, 179x48 and 8192x64 | LabGrid-only, shadows/highlights Lab mode, both tools and every Lab-mode slider case are bit-exact (PAE 0, 0 differing samples). RGB mode is measured, not proved: 0.062500 LSB16 for the amount-50 pair, 0.046875 for both tools at 179x48, 0.076172 for the padded 238 case, 0.044922 and 0.045898 for the single highlight and shadow rounds, and a worst of 0.228516 at amount 100. The steep-step refusal is a worst-case bound, not a proof of those measurements: at the 0..100 slider maximum the measured error sits about four times inside the bound it enforces |
 | Slider coverage | amounts 1/50/200/1000, tonal widths 0/100 and a split pair, radii 1/10/100, padded widths 179 and 238, and an 8192-wide image; all finite, no NaN or Inf |
-| Residuals | vibrance, Lab curves, local contrast, EPD, Lab regions and black-and-white are refused, record `impl=host` with no `impl=opencl`, and are byte-identical to the block |
+| Vibrance, 21 cases at 125x160, 179x48, 238x64 and 8192x64 | pastels/saturated combinations, negative saturated, thresholds 0/75/100 and split, protect-skins, avoidcolorshift on/off, a skin curve, highlight reconstruction, neutral and saturated images, padded widths and the 8192-wide case: all 2,552,280 samples exact (PAE 0), no NaN/Inf, `impl=opencl` on every case |
+| Munsell tables | all 197 tables and 27,580 exported entries equal `Color::MunsellLch()`'s LUTs; the avoidcolorshift path changes 11,696 of 60,000 domain samples, so the comparison is not vacuous |
+| Block on the real PEF | the device block is exact (PAE 0, 30,419,712 samples) against `stage::labToolsHostBlock` on the full pre-vibrance Lab buffer |
+| Residuals | vibrance + Lab curves, vibrance + local contrast, vibrance + EPD, vibrance + Lab regions and vibrance + black-and-white are refused, record `impl=host` with no `impl=opencl`, and are byte-identical to the block |
 | RGB-mode steep table | amounts 200 and 1000 are inside the predicate but refused by the setup: `impl=host`, PAE 0 |
 | Forced launcher refusal (a tone table of half the required length) | `impl=host`, no device pass, byte-identical to the block |
 | `verify.sh --stage-device`, POCL CPU, `labtools-sh.pp3`, `labtools-sh-rgb.pp3`, `labtools-labgrid.pp3` | PASS, `max_pae=1.5259e-05` (1 LSB16); records `"stage":"lab.tools","impl":"opencl","source":"opencl"` at 3888x2608 |
-| `labtools-residual.pp3` (vibrance on) | PASS as a host residual: `"stage":"lab.tools","impl":"host","source":"device-fallback"` |
+| `verify.sh --stage-device`, POCL CPU, `labtools-vibrance.pp3` on the JPEG chart | PASS, `max_pae=1.5259e-05` (1 LSB16); records `"stage":"lab.tools","impl":"opencl","source":"opencl"`. The PEF chart is not used for this row: its synthetic hues sit exactly on the Munsell zone limits, and the harness's preview-then-export passes move two pixels by up to 2,329 LSB16 even though the block is exact on the PEF's full Lab buffer (see the block row above) |
+| `labtools-residual.pp3` (shadows/highlights + vibrance + local contrast) | PASS as a host residual: `"stage":"lab.tools","impl":"host","source":"device-fallback"` |
 | `--gpu=off`, `RT_STAGE_OPENCL` unset, four lab.tools profiles | pixel data identical to the pre-change binary (`tiffcmp`); only the Software tag differs |
 | Forced refusal (`RT_STAGE_DEVICE_BUDGET_MB=16`, `RT_REQUIRE_GPU=1`) | FAIL, exit 1, so the gate is not vacuous |
 
 ## Limitations
 
+- AMD RX 550 (rusticl) full-pipeline vibrance parity: the device block is
+  exact under POCL and on every captured input, but a full export on the
+  RX 550 measures 100 LSB16 (0.39 LSB8) at two pixels on the JPEG chart and
+  2,329 LSB16 on the PEF chart. The block on the PEF's full pre-vibrance
+  buffer is exact, so the difference is a one-ulp device arithmetic
+  difference reaching the output transfer, not a branch or table divergence.
+  The gate row is measured under POCL, where the same profile is 1 LSB16.
 - P2 residual, not a lab.tools defect: with `RT_STAGE_OPENCL=1` and
   `--gpu=auto` but without `RT_OPENCL_RGBPROC=1`, a CLI export segfaults in
   `opencl::initLocked()` through `ImProcFunctions::lab2rgbOut()` - a null call
