@@ -7643,6 +7643,44 @@ void test_local_adjustments(bool available)
               "the quality curves are off");
     }
 
+    /* An inactive block must not round-trip the base image. This is the
+     * regression that showed up as the working.trc gate row moving by
+     * ~2 LSB when the stage node was selected. */
+    {
+        const auto no_round_trip = [](rtengine::procparams::ProcParams& params,
+                                      const char* label) {
+            Imagefloat base(179, 48);
+            Imagefloat expected(179, 48);
+            fill_local_adjustments_rgb(base, 91u);
+            fill_local_adjustments_rgb(expected, 91u);
+            std::unique_ptr<LabImage> lab(new LabImage(179, 48));
+            rtengine::ImProcFunctions ipf(&params, false);
+            localAdjustmentsHostBlock(ipf, params, &base, lab.get(), 179, 48);
+            const Diff diff = compare(view(base), view(expected));
+            std::printf("stage-residency: local.adjustments %s: base PAE "
+                        "%.6f LSB16, %zu samples differ\n",
+                        label, diff.max_abs, diff.differing);
+            check(diff.finite && diff.max_abs == 0.0 &&
+                      diff.differing == 0,
+                  "an inactive local.adjustments block leaves baseImg "
+                  "untouched");
+        };
+
+        rtengine::procparams::ProcParams disabled;
+        disabled.locallab.enabled = false;
+        disabled.locallab.spots.push_back(
+            localAdjustmentsSpot("disabled", 0, 0, 800, true, 35, 10, -5));
+        check(!localAdjustmentsSupported(disabled),
+              "a disabled local.adjustments block is outside the predicate");
+        no_round_trip(disabled, "disabled block");
+
+        rtengine::procparams::ProcParams empty;
+        empty.locallab.enabled = true;
+        check(!localAdjustmentsSupported(empty),
+              "an empty local.adjustments block is outside the predicate");
+        no_round_trip(empty, "empty block");
+    }
+
     std::remove(profile_path.c_str());
 }
 
