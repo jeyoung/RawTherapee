@@ -35,6 +35,7 @@ cli=""
 sample_override=""
 compare_cmd=()
 has_device=0
+device_is_cpu=0
 expect_stage=0
 expect_stage_name=""
 expect_stage_absent=""
@@ -108,11 +109,18 @@ compare_images() {
 }
 
 detect_device() {
-    if "$cli" --gpu-info 2>/dev/null | grep -q '\* \['; then
+    local selected
+    selected="$("$cli" --gpu-info 2>/dev/null | grep '\* \[' | head -1 || true)"
+    if [ -n "$selected" ]; then
         has_device=1
+        case "$selected" in
+            *"[CPU]"*) device_is_cpu=1 ;;
+            *) device_is_cpu=0 ;;
+        esac
     else
         has_device=0
-expect_stage=0
+        device_is_cpu=0
+        expect_stage=0
     fi
 }
 
@@ -245,7 +253,7 @@ quick() {
     run_stage_device "pef/stage-device-lab-tools-labgrid" \
         "$ROOT/devnotes/opencl/pp3/labtools-labgrid.pp3" lab.tools
     run_stage_device "pef/stage-device-lab-tools-vibrance" \
-        "$ROOT/devnotes/opencl/pp3/labtools-vibrance.pp3" lab.tools
+        "$ROOT/devnotes/opencl/pp3/labtools-vibrance.pp3" lab.tools cpu
     run_stage_host "pef/stage-host-lab-tools-residual" \
         "$ROOT/devnotes/opencl/pp3/labtools-residual.pp3" lab.tools
 }
@@ -360,11 +368,16 @@ monitor() {
 # and the built-in or module ran instead, which is a SKIP unless a GPU is
 # required.
 #
-# Usage: run_stage_device <label> <profile> <node>
+# Usage: run_stage_device <label> <profile> <node> [device-class]
+#
+# device-class "cpu" marks a row whose node runs only on a CPU OpenCL device
+# (the vibrance row). On a GPU the row is SKIP with the specific reason, or
+# FAIL under RT_REQUIRE_GPU=1, rather than the generic "stage device declined".
 run_stage_device() {
     local label="$1"
     local profile="$2"
     local node="$3"
+    local device_class="${4:-any}"
     local sample="${sample_override:-$TESTDATA/colorspace_flowers.pef}"
 
     [ -f "$sample" ] || die "missing $sample (run tools/opencl/fetch-testdata.sh)"
@@ -381,6 +394,15 @@ run_stage_device() {
             return 1
         fi
         printf 'SKIP\t%s\tno OpenCL device (set RT_OPENCL_ALLOW_CPU=1 for a CPU device)\n' "$label"
+        return 0
+    fi
+
+    if [ "$device_class" = "cpu" ] && [ "$device_is_cpu" -ne 1 ]; then
+        if [ "${RT_REQUIRE_GPU:-0}" = "1" ]; then
+            printf 'FAIL\t%s\tvibrance is CPU-device-only; the selected device is not a CPU OpenCL device\n' "$label"
+            return 1
+        fi
+        printf 'SKIP\t%s\tvibrance is CPU-device-only; the selected device is not a CPU OpenCL device\n' "$label"
         return 0
     fi
 
@@ -536,7 +558,7 @@ stage_device() {
     run_stage_device "pef/stage-device-lab-tools-labgrid" \
         "$ROOT/devnotes/opencl/pp3/labtools-labgrid.pp3" lab.tools
     run_stage_device "pef/stage-device-lab-tools-vibrance" \
-        "$ROOT/devnotes/opencl/pp3/labtools-vibrance.pp3" lab.tools
+        "$ROOT/devnotes/opencl/pp3/labtools-vibrance.pp3" lab.tools cpu
     run_stage_host "pef/stage-host-lab-tools-residual" \
         "$ROOT/devnotes/opencl/pp3/labtools-residual.pp3" lab.tools
 }
