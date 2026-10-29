@@ -20,6 +20,7 @@
 #pragma once
 
 #include "stage_abi.h"
+#include "stage/lab_tools_context.h"
 
 #include <cstdint>
 #include <vector>
@@ -87,6 +88,12 @@ struct ProcParams;
 #define RT_LOCAL_ADJUSTMENTS_CLAMP_NONE 0u
 #define RT_LOCAL_ADJUSTMENTS_CLAMP_NOTZERO 1u
 #define RT_LOCAL_ADJUSTMENTS_CLAMP_LAPLACIAN 2u
+/* Lab_Local()'s two negative-value guards and the deltaE scope constants. */
+#define RT_LOCAL_ADJUSTMENTS_EPSI0 0.000001f
+#define RT_LOCAL_ADJUSTMENTS_EPSI 0.00001f
+#define RT_LOCAL_ADJUSTMENTS_LIMSCOPE 80
+#define RT_LOCAL_ADJUSTMENTS_MAXSCOPE 1.25f
+#define RT_LOCAL_ADJUSTMENTS_MINSCOPE 0.025f
 
 /* Per-spot record slots. */
 #define RT_LOCAL_ADJUSTMENTS_SLOT_XC 0u
@@ -187,6 +194,10 @@ typedef struct RtLocalAdjustmentsResult {
     uint32_t munsell_tables;
     /* RT_LOCAL_ADJUSTMENTS_CLAMP_* for every spot. */
     uint32_t clamp_mode;
+    /* The host-built Gaussian coefficients for origblur, sigma
+     * (2 + 0.2 * blurcolde) / sk with sk = 1. Only the SSE path is admitted;
+     * the launcher refuses double_path. */
+    const RtLabToolsIir* iir;
 } RtLocalAdjustmentsResult;
 
 typedef struct RtLocalAdjustmentsContext {
@@ -309,6 +320,7 @@ private:
     std::vector<float> cachefy_;
     std::vector<float> munsell_;
     std::vector<float> munsell_sizes_;
+    RtLabToolsIir iir_ = {};
     uint32_t clamp_mode_ = RT_LOCAL_ADJUSTMENTS_CLAMP_NONE;
 };
 

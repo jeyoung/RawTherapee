@@ -189,84 +189,103 @@ bool copyToBuffer(const LabImage& image, RtStageBuffer& lab)
 
 bool localAdjustmentsSupported(const procparams::ProcParams& params)
 {
-    if (!params.locallab.enabled || params.locallab.spots.empty()) {
-        return false;
-    }
-    if (params.locallab.spots.size() > RT_LOCAL_ADJUSTMENTS_MAX_SPOTS) {
-        return false;
-    }
     /*
-     * The pre-CBDL pass, the dehaze prefilter and the global negative-value
-     * guard run before the spot loop and would put a full-image round trip
-     * outside the node. They are residuals.
+     * This increment admits exactly one active colour spot. The wider
+     * colour-only set (curves, Munsell, rectangular spots, multiple spots and
+     * inactive clamp-only spots) stays a residual until the next increments.
      */
-    if (params.dirpyrequalizer.enabled || params.dehaze.enabled) {
+    if (!params.locallab.enabled || params.locallab.spots.size() != 1) {
+        return false;
+    }
+    if (params.dirpyrequalizer.enabled || params.dehaze.enabled ||
+        params.toneCurve.hrenabled) {
         return false;
     }
 
-    for (const auto& spot : params.locallab.spots) {
-        if (spot.spotMethod != "norm") {
-            return false;
-        }
-        if (spot.shape != "ELI" && spot.shape != "RECT") {
-            return false;
-        }
-        if (spot.recurs || spot.invers || spot.inversex || spot.inverssh ||
-            spot.inverssha || spot.inversret) {
-            return false;
-        }
-        if (!isNoMerge(spot.merMethod)) {
-            return false;
-        }
-        if (!isQualityCurve(spot.qualitycurveMethod)) {
-            return false;
-        }
-        if (!isAvoidMethod(spot.avoidgamutMethod)) {
-            return false;
-        }
-        if (spot.softradiuscol != 0.0 || spot.avoidrad != 0.0) {
-            return false;
-        }
-        /* The colour path's own switches: gamma, the merge recovery and the
-         * three gradients around the spot. */
-        if (spot.gamc != 1.0 || spot.strcol != 0.0 ||
-            spot.strcolab != 0.0 || spot.strcolh != 0.0 ||
-            spot.structcol != 0) {
-            return false;
-        }
-        /* Display-only and residual switches. */
-        if (spot.special || spot.toolcol || spot.blwh) {
-            return false;
-        }
-        if (diagonalCurveActive(spot.rgbcurve) ||
-            diagonalCurveActive(spot.excurve)) {
-            return false;
-        }
-        if (!labGridIdle(spot) || !explicitMaskIdle(spot)) {
-            return false;
-        }
-        /* The pre-CBDL fixups read these even for an inactive spot. */
-        if (spot.expsharp || spot.expprecam) {
-            return false;
-        }
-        /* An inactive spot does no colour work; it is the clamp-only case.
-         * An active one may only carry Colour & Light. */
-        if (spot.activ && otherToolEnabled(spot)) {
-            return false;
-        }
-        if (spot.loc.size() != 4) {
-            return false;
-        }
-        if (!finiteValue(spot.transit) || !finiteValue(spot.transitweak) ||
-            !finiteValue(spot.transitgrad) || !finiteValue(spot.iter) ||
-            !finiteValue(spot.balan) || !finiteValue(spot.balanh) ||
-            !finiteValue(spot.avoidrad) || !finiteValue(spot.gamc) ||
-            !finiteValue(spot.strcol) ||
-            !finiteValue(spot.strcolab) || !finiteValue(spot.strcolh) ||
-            !finiteValue(spot.blurcolde) || !finiteValue(spot.circrad) ||
-            !finiteValue(spot.structcol) || !finiteValue(spot.colorde)) {
-            return false;
-        }
+    const auto& spot = params.locallab.spots[0];
+    if (spot.spotMethod != "norm" || !spot.activ || spot.shape != "ELI" ||
+        !spot.expcolor) {
+        return false;
+    }
+    if (otherToolEnabled(spot)) {
+        return false;
+    }
+    if (spot.recurs || spot.invers || spot.inversex || spot.inverssh ||
+        spot.inverssha || spot.inversret) {
+        return false;
+    }
+    if (spot.softradiuscol != 0.0 || spot.avoidrad != 0.0) {
+        return false;
+    }
+    if (!isNoMerge(spot.merMethod)) {
+        return false;
+    }
+    if (!(spot.qualitycurveMethod.empty() ||
+          spot.qualitycurveMethod == "none")) {
+        return false;
+    }
+    if (!(spot.avoidgamutMethod.empty() ||
+          spot.avoidgamutMethod == "NONE")) {
+        return false;
+    }
+    if (spot.gamc != 1.0 || spot.strcol != 0.0 ||
+        spot.strcolab != 0.0 || spot.strcolh != 0.0 ||
+        spot.structcol != 0) {
+        return false;
+    }
+    if (spot.special || spot.toolcol || spot.blwh) {
+        return false;
+    }
+    if (diagonalCurveActive(spot.rgbcurve) ||
+        diagonalCurveActive(spot.excurve) ||
+        diagonalCurveActive(spot.llcurve) ||
+        diagonalCurveActive(spot.lccurve) ||
+        diagonalCurveActive(spot.cccurve) ||
+        diagonalCurveActive(spot.clcurve)) {
+        return false;
+    }
+    LocLHCurve lhCurve;
+    LocHHCurve hhCurve;
+    LocCHCurve chCurve;
+    lhCurve.Set(spot.LHcurve);
+    hhCurve.Set(spot.HHcurve);
+    chCurve.Set(spot.CHcurve);
+    if (locCurveActive(lhCurve) || locCurveActive(hhCurve) ||
+        locCurveActive(chCurve)) {
+        return false;
+    }
+    if (!labGridIdle(spot) || !explicitMaskIdle(spot)) {
+        return false;
+    }
+    if (spot.loc.size() != 4) {
+        return false;
+    }
+    if (spot.chroma < -100 || spot.chroma > 100 ||
+        spot.lightness < -100 || spot.lightness > 100 ||
+        spot.contrast < -100 || spot.contrast > 100) {
+        return false;
+    }
+    if (spot.blurcolde < 0 || spot.blurcolde > 100) {
+        return false;
+    }
+    /* transit == 100 makes the host's 1 - ach zero in calcLocalFactor(); it
+     * is outside the finite domain this node promises. */
+    if (!(spot.transit >= 0.0 && spot.transit < 100.0)) {
+        return false;
+    }
+    if (!finiteValue(spot.transit) || !finiteValue(spot.transitweak) ||
+        !finiteValue(spot.transitgrad) || !finiteValue(spot.iter) ||
+        !finiteValue(spot.balan) || !finiteValue(spot.balanh) ||
+        !finiteValue(spot.sensi) || !finiteValue(spot.thresh) ||
+        !finiteValue(spot.colorde) || !finiteValue(spot.circrad) ||
+        !finiteValue(spot.centerX) || !finiteValue(spot.centerY) ||
+        !finiteValue(spot.loc[0]) || !finiteValue(spot.loc[1]) ||
+        !finiteValue(spot.loc[2]) || !finiteValue(spot.loc[3])) {
+        return false;
+    }
+    if (spot.transitweak < 0.0 || spot.transitweak > 10.0 ||
+        spot.transitgrad < -10.0 || spot.transitgrad > 10.0) {
+        return false;
     }
     return true;
 }
@@ -1123,6 +1142,61 @@ int LocalAdjustmentsContext::build(int spot, const RtStageBuffer* lab,
              lightActive ? appendTable(lightCurve)
                          : RT_LOCAL_ADJUSTMENTS_NO_LUT);
 
+    /*
+     * trans-shapedetect2()'s origblur: gaussianBlur() with radius
+     * (2 + 0.2 * lp.blurcol) / sk and sk = 1. The host builds the
+     * coefficients; only the SSE path is admitted, so double_path is 0 for
+     * every supported blurcolde.
+     */
+    {
+        const double sigma = static_cast<double>(
+            2.0f + 0.2f * lp.blurcol);
+        const GaussianIirCoefficients coefficients =
+            gaussianIirCoefficients(sigma);
+        const auto fill = [&coefficients](RtLabToolsIirDirection& direction) {
+            direction.lane[0] = static_cast<float>(coefficients.B);
+            direction.lane[1] = static_cast<float>(coefficients.b1);
+            direction.lane[2] = static_cast<float>(coefficients.b2);
+            direction.lane[3] = static_cast<float>(coefficients.b3);
+            for (int row = 0; row < 3; ++row) {
+                for (int column = 0; column < 3; ++column) {
+                    const std::size_t index =
+                        4u + static_cast<std::size_t>(row) * 3u +
+                        static_cast<std::size_t>(column);
+                    direction.lane[index] =
+                        static_cast<float>(coefficients.sse_M[row][column]);
+                    direction.border[index] = coefficients.sse_M[row][column];
+                    direction.wide[index] = coefficients.M[row][column];
+                }
+            }
+            direction.border[0] = coefficients.B;
+            direction.border[1] = coefficients.b1;
+            direction.border[2] = coefficients.b2;
+            direction.border[3] = coefficients.b3;
+            direction.wide[0] = coefficients.B;
+            direction.wide[1] = coefficients.b1;
+            direction.wide[2] = coefficients.b2;
+            direction.wide[3] = coefficients.b3;
+        };
+        iir_ = RtLabToolsIir{};
+        iir_.size = sizeof(RtLabToolsIir);
+        iir_.version = RT_LAB_TOOLS_IIR_VERSION;
+        iir_.double_path = sigma >= GAUSS_DOUBLE_LIMIT ? 1u : 0u;
+        fill(iir_.horizontal);
+        fill(iir_.vertical);
+        for (const RtLabToolsIirDirection* direction :
+             {&iir_.horizontal, &iir_.vertical}) {
+            for (std::size_t index = 0; index < RT_LAB_TOOLS_IIR_TERMS;
+                 ++index) {
+                if (!std::isfinite(direction->lane[index]) ||
+                    !std::isfinite(direction->border[index]) ||
+                    !std::isfinite(direction->wide[index])) {
+                    return 1;
+                }
+            }
+        }
+    }
+
     out.spots = spots_.data();
     out.spot_count = 1;
     out.spot_stride = RT_LOCAL_ADJUSTMENTS_SPOT_STRIDE;
@@ -1136,6 +1210,7 @@ int LocalAdjustmentsContext::build(int spot, const RtStageBuffer* lab,
     out.munsell_sizes = munsell_sizes_.data();
     out.munsell_tables = RT_LAB_TOOLS_MUNSELL_TABLES;
     out.clamp_mode = clamp_mode_;
+    out.iir = &iir_;
     built_ = true;
     return 0;
 }

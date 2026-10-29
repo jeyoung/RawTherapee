@@ -60,6 +60,7 @@
 #include "stage/algorithms/lab_curve_cl.h"
 #include "stage/algorithms/lab_regions_cl.h"
 #include "stage/algorithms/lab_wavelet_cl.h"
+#include "stage/algorithms/local_adjustments_cl.h"
 #include "stage/algorithms/munsell_lch_cl.h"
 #include "stage/algorithms/vibrance_cl.h"
 #include "stage/algorithms/working_trc_cl.h"
@@ -793,6 +794,16 @@ const std::string& lab_tools_source()
  * reconstruction equaliser. The range tables and hue/chroma masks arrive as
  * host-built buffers; lab_wavelet_cl.h carries the block's arithmetic.
  */
+const std::string& local_adjustments_source()
+{
+    static const std::string source =
+        std::string("#pragma OPENCL FP_CONTRACT OFF\n"
+                    "#pragma STDC FP_CONTRACT OFF\n"
+                    "#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n") +
+        local_adjustments_program();
+    return source;
+}
+
 const std::string& lab_wavelet_source()
 {
     static const std::string source =
@@ -1293,6 +1304,7 @@ const std::vector<KernelDef>& kernels()
         {"lab.tools.localcontrast", local_contrast_source().c_str(), "rt_lab_tools_lc_line"},
         {"lab.tools.regions", lab_regions_source().c_str(), "rt_lab_tools_region_mask"},
         {"lab.wavelet", lab_wavelet_source().c_str(), "rt_lab_wavelet_decompose"},
+        {"local.adjustments", local_adjustments_source().c_str(), "rt_local_adjustments_apply"},
         {"output.sharpen", RT_SHARPEN_CL, "rt_sharpen_mask"},
         {"framing", framing_source().c_str(), "rt_framing"},
         {"thumbnail.whitebalance", thumbnail_wb_source().c_str(), "rt_thumbnail_wb"},
@@ -1918,6 +1930,7 @@ cl_kernel compiled_kernel_entry(const std::shared_ptr<OpenCLEnv>& env,
                 std::strcmp(def->name, "lab.tools") == 0 ||
                 std::strcmp(def->name, "lab.tools.labcurve") == 0 ||
                 std::strcmp(def->name, "lab.tools.localcontrast") == 0 ||
+                std::strcmp(def->name, "local.adjustments") == 0 ||
                 std::strcmp(def->name, "lab.wavelet") == 0
             ? "-cl-fp32-correctly-rounded-divide-sqrt"
             : nullptr;
@@ -7927,18 +7940,28 @@ RtStageStatus run_sharpen(const std::shared_ptr<OpenCLEnv>& env,
 }
 
 /*
- * The local.adjustments node is registered so the refusal is visible in the
- * runtime record rather than silently bypassing it: the launcher validates the
- * ABI, then refuses before it touches the Lab buffer, and the compiled builtin
- * runs the extracted host block with impl=host.
+ * The local.adjustments node, one-spot colour increment.
  *
- * The colour-only kernel set is not part of this change. calc_ref() for spot N
- * needs the Lab result of spot N-1, so a faithful device block must read the
- * buffer back between spots; the clamp and Munsell passes are also still to
- * port. Until they land both the supported and the residual request refuse.
+ *   [0] Lab three-plane F32 buffer, read and written in place,
+ *   [1] PTR host context (RtLocalAdjustmentsContext), host-only,
+ *   [2] int support flag, mirrored from the context descriptor.
+ *
+ * The context build runs once, before the upload, on the Lab image the call
+ * site produced with rgb2lab(baseImg). It exports the per-spot record, the
+ * host-built light and chroma-slider tables, the working matrices, the Lab
+ * caches and the Gaussian coefficients for origblur. calc_ref() and
+ * complexCurvelocal() stay host-side.
+ *
+ * Pass order matches Lab_Local(): the optional negative-value prefilter, the
+ * ROI original blur, the colour/transition/deltaE apply, then the tail clamp.
+ * Every pass writes the device image; the host Lab is read back only after all
+ * passes succeeded, so a refusal or a failed launch leaves it untouched for
+ * the builtin.
  */
-RtStageStatus validate_local_adjustments(const std::vector<RtStageArg>& args,
-                                         std::string& error)
+RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
+                                    const std::shared_ptr<OpenCLResidency>& residency,
+                                    const std::vector<RtStageArg>& args,
+                                    std::string& error)
 {
     constexpr std::size_t ARG_COUNT = 3;
 
@@ -7953,12 +7976,13 @@ RtStageStatus validate_local_adjustments(const std::vector<RtStageArg>& args,
         error = "local.adjustments has an argument of the wrong kind";
         return RT_STAGE_INVALID;
     }
+
     const RtStageBuffer& lab = args[0].u.buffer;
     if (!valid(lab) || lab.format != RT_STAGE_F32 || lab.planes != 3) {
         error = "local.adjustments needs a three-plane F32 Lab buffer";
         return RT_STAGE_INVALID;
     }
-    const RtLocalAdjustmentsContext* context =
+    const auto* context =
         static_cast<const RtLocalAdjustmentsContext*>(args[1].u.ptr);
     if (context == nullptr ||
         context->size != sizeof(RtLocalAdjustmentsContext) ||
@@ -7972,10 +7996,543 @@ RtStageStatus validate_local_adjustments(const std::vector<RtStageArg>& args,
         error = "local.adjustments support flag must be 0 or 1";
         return RT_STAGE_INVALID;
     }
+    if (args[2].u.i != 1 || context->supported != 1) {
+        error = "local.adjustments support flag is not set";
+        return RT_STAGE_FALLBACK;
+    }
     if (lab.row_pitch % sizeof(float) != 0 ||
-        lab.plane_pitch < lab.row_pitch * static_cast<std::size_t>(lab.height)) {
+        lab.plane_pitch <
+            lab.row_pitch * static_cast<std::size_t>(lab.height)) {
         error = "local.adjustments Lab buffer pitch does not cover the image";
         return RT_STAGE_INVALID;
+    }
+
+    /*
+     * The device path is CPU-only: the colour core uses pow()/cos()/sin()
+     * where the host uses its own SLEEF helpers, and the deltaE scope
+     * amplifies small differences. A GPU is refused before the upload.
+     */
+    StageOpenCLDeviceInfo device;
+    if (!opencl_stage_device_info(&device) || !device.cpu) {
+        error = "local.adjustments requires a CPU OpenCL device";
+        return RT_STAGE_FALLBACK;
+    }
+    {
+        cl_device_fp_config fp_config = 0;
+        if (env->api->GetDeviceInfo(env->device, CL_DEVICE_DOUBLE_FP_CONFIG,
+                                    sizeof(fp_config), &fp_config,
+                                    nullptr) != CL_SUCCESS ||
+            fp_config == 0) {
+            error = "local.adjustments needs device fp64";
+            return RT_STAGE_FALLBACK;
+        }
+    }
+
+    RtLocalAdjustmentsResult setup{};
+    if (context->build(context->self, 0, &lab, &setup) != 0) {
+        error = "local.adjustments host setup failed";
+        return RT_STAGE_FALLBACK;
+    }
+    if (setup.spots == nullptr || setup.spot_count != 1 ||
+        setup.spot_stride != RT_LOCAL_ADJUSTMENTS_SPOT_STRIDE ||
+        setup.ws == nullptr || setup.iws == nullptr ||
+        setup.cachef == nullptr || setup.cachefy == nullptr ||
+        setup.iir == nullptr) {
+        error = "local.adjustments setup is incomplete";
+        return RT_STAGE_FALLBACK;
+    }
+
+    const float* rec = setup.spots;
+    const auto finite = [](float value) { return std::isfinite(value); };
+    for (std::size_t slot = 0; slot < setup.spot_stride; ++slot) {
+        if (!finite(rec[slot])) {
+            error = "local.adjustments record has a non-finite value";
+            return RT_STAGE_FALLBACK;
+        }
+    }
+    if (rec[RT_LOCAL_ADJUSTMENTS_SLOT_SHAPE] !=
+            RT_LOCAL_ADJUSTMENTS_SHAPE_ELI ||
+        rec[RT_LOCAL_ADJUSTMENTS_SLOT_ACTIV] != 1.0f ||
+        rec[RT_LOCAL_ADJUSTMENTS_SLOT_ISLOCAL] != 1.0f ||
+        rec[RT_LOCAL_ADJUSTMENTS_SLOT_COLORENA] != 1.0f ||
+        rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXPCOLOR] != 1.0f ||
+        rec[RT_LOCAL_ADJUSTMENTS_SLOT_QCURVE] != 0.0f ||
+        rec[RT_LOCAL_ADJUSTMENTS_SLOT_MERGE] != 0.0f ||
+        rec[RT_LOCAL_ADJUSTMENTS_SLOT_AVOIDGAMUT] !=
+            RT_LOCAL_ADJUSTMENTS_AVOID_NONE ||
+        rec[RT_LOCAL_ADJUSTMENTS_SLOT_HRENABLED] != 0.0f ||
+        (rec[RT_LOCAL_ADJUSTMENTS_SLOT_AVOIDNEG] != 0.0f &&
+         rec[RT_LOCAL_ADJUSTMENTS_SLOT_AVOIDNEG] != 1.0f) ||
+        (rec[RT_LOCAL_ADJUSTMENTS_SLOT_DELTAE] != 0.0f &&
+         rec[RT_LOCAL_ADJUSTMENTS_SLOT_DELTAE] != 1.0f)) {
+        error = "local.adjustments record is outside the one-spot set";
+        return RT_STAGE_FALLBACK;
+    }
+    const uint32_t clamp_mode =
+        static_cast<uint32_t>(rec[RT_LOCAL_ADJUSTMENTS_SLOT_CLAMPMODE]);
+    if (clamp_mode != RT_LOCAL_ADJUSTMENTS_CLAMP_NOTZERO &&
+        clamp_mode != RT_LOCAL_ADJUSTMENTS_CLAMP_LAPLACIAN) {
+        error = "local.adjustments has no clamp arm";
+        return RT_STAGE_FALLBACK;
+    }
+    if (rec[RT_LOCAL_ADJUSTMENTS_SLOT_CHRO] < -100.0f ||
+        rec[RT_LOCAL_ADJUSTMENTS_SLOT_CHRO] > 100.0f ||
+        rec[RT_LOCAL_ADJUSTMENTS_SLOT_LIGH] < -100.0f ||
+        rec[RT_LOCAL_ADJUSTMENTS_SLOT_LIGH] > 100.0f ||
+        rec[RT_LOCAL_ADJUSTMENTS_SLOT_CONT] < -100.0f ||
+        rec[RT_LOCAL_ADJUSTMENTS_SLOT_CONT] > 100.0f ||
+        rec[RT_LOCAL_ADJUSTMENTS_SLOT_BLURCOL] < 0.0f ||
+        rec[RT_LOCAL_ADJUSTMENTS_SLOT_BLURCOL] > 100.0f) {
+        error = "local.adjustments slider is outside its range";
+        return RT_STAGE_FALLBACK;
+    }
+    if (setup.iir->size != sizeof(RtLabToolsIir) ||
+        setup.iir->version != RT_LAB_TOOLS_IIR_VERSION ||
+        setup.iir->double_path != 0) {
+        error = "local.adjustments blur needs the SSE coefficient path";
+        return RT_STAGE_FALLBACK;
+    }
+
+    const int width = lab.width;
+    const int height = lab.height;
+    const int xstart = std::max(
+        static_cast<int>(rec[RT_LOCAL_ADJUSTMENTS_SLOT_XC] -
+                         rec[RT_LOCAL_ADJUSTMENTS_SLOT_LXL]),
+        0);
+    const int ystart = std::max(
+        static_cast<int>(rec[RT_LOCAL_ADJUSTMENTS_SLOT_YC] -
+                         rec[RT_LOCAL_ADJUSTMENTS_SLOT_LYT]),
+        0);
+    const int xend = std::min(
+        static_cast<int>(rec[RT_LOCAL_ADJUSTMENTS_SLOT_XC] +
+                         rec[RT_LOCAL_ADJUSTMENTS_SLOT_LX]),
+        width);
+    const int yend = std::min(
+        static_cast<int>(rec[RT_LOCAL_ADJUSTMENTS_SLOT_YC] +
+                         rec[RT_LOCAL_ADJUSTMENTS_SLOT_LY]),
+        height);
+    const int bfw = xend - xstart;
+    const int bfh = yend - ystart;
+    if (bfw < 4 || bfh < 4 || bfw > width || bfh > height) {
+        error = "local.adjustments spot ROI is too small";
+        return RT_STAGE_FALLBACK;
+    }
+
+    const KernelDef* def = find_kernel("local.adjustments");
+    assert(def != nullptr);
+    cl_kernel apply_kernel =
+        compiled_kernel_entry(env, def, "rt_local_adjustments_apply", error);
+    cl_kernel clamp_kernel =
+        compiled_kernel_entry(env, def, "rt_local_adjustments_clamp", error);
+    cl_kernel roi_kernel =
+        compiled_kernel_entry(env, def, "rt_local_adjustments_roi", error);
+    cl_kernel line_kernel =
+        compiled_kernel_entry(env, def, "rt_lab_tools_lc_line", error);
+    if (apply_kernel == nullptr || clamp_kernel == nullptr ||
+        roi_kernel == nullptr || line_kernel == nullptr) {
+        return RT_STAGE_FALLBACK;
+    }
+
+    const auto memory_of = [](const StageDeviceBufferPtr& buffer) {
+        auto device_buffer =
+            std::dynamic_pointer_cast<OpenCLDeviceBuffer>(buffer);
+        return device_buffer != nullptr ? device_buffer->memory() : nullptr;
+    };
+    const auto pitch_of = [](const StageDeviceBufferPtr& buffer) -> std::size_t {
+        return buffer != nullptr ? buffer->row_pitch() / sizeof(float) : 0;
+    };
+    const auto plane_pitch_of =
+        [](const StageDeviceBufferPtr& buffer) -> std::size_t {
+        return buffer != nullptr ? buffer->plane_pitch() / sizeof(float) : 0;
+    };
+
+    StageDeviceBufferPtr image =
+        residency->acquire(lab.data,
+                           StageBufferShape{RT_STAGE_F32, width, height, 3},
+                           &error);
+    if (!image || residency->upload(image, lab) != RT_STAGE_OK) {
+        error = "local.adjustments Lab upload failed";
+        return RT_STAGE_FALLBACK;
+    }
+
+    /* Host-built tables. A table that no slider reads gets a one-float
+     * placeholder so every kernel argument is a valid buffer. */
+    std::vector<float> placeholder(1, 0.f);
+    char placeholder_key = 0;
+    StageDeviceBufferPtr placeholder_device = residency->acquire(
+        &placeholder_key, StageBufferShape{RT_STAGE_F32, 1, 1, 1}, &error);
+    if (!placeholder_device ||
+        residency->upload(placeholder_device,
+                          RtStageBuffer{sizeof(RtStageBuffer),
+                                        placeholder.data(), 1, 1,
+                                        sizeof(float), sizeof(float), 1,
+                                        RT_STAGE_F32,
+                                        RT_STAGE_BUFFER_READ}) != RT_STAGE_OK) {
+        error = "local.adjustments placeholder upload failed";
+        return RT_STAGE_FALLBACK;
+    }
+
+    const auto upload_table = [&](const float* data, int count, char* key,
+                                  const char* label)
+        -> StageDeviceBufferPtr {
+        StageDeviceBufferPtr device_buffer = residency->acquire(
+            key, StageBufferShape{RT_STAGE_F32, count, 1, 1}, &error);
+        if (!device_buffer) {
+            error = std::string("local.adjustments ") + label +
+                    " allocation failed";
+            return nullptr;
+        }
+        RtStageBuffer host{};
+        host.size = sizeof(RtStageBuffer);
+        host.data = const_cast<float*>(data);
+        host.width = count;
+        host.height = 1;
+        host.row_pitch = static_cast<std::size_t>(count) * sizeof(float);
+        host.plane_pitch = host.row_pitch;
+        host.planes = 1;
+        host.format = RT_STAGE_F32;
+        host.flags = RT_STAGE_BUFFER_READ;
+        if (residency->upload(device_buffer, host) != RT_STAGE_OK) {
+            error = std::string("local.adjustments ") + label +
+                    " upload failed";
+            return nullptr;
+        }
+        return device_buffer;
+    };
+
+    char record_key = 0;
+    char ws_key = 0;
+    char iws_key = 0;
+    char cachef_key = 0;
+    char cachefy_key = 0;
+    char light_key = 0;
+    char satur_key = 0;
+    char saturmoins_key = 0;
+
+    StageDeviceBufferPtr record_device =
+        upload_table(rec, RT_LOCAL_ADJUSTMENTS_SPOT_STRIDE, &record_key,
+                     "record");
+    StageDeviceBufferPtr ws_device =
+        upload_table(setup.ws, 9, &ws_key, "working matrix");
+    StageDeviceBufferPtr iws_device =
+        upload_table(setup.iws, 9, &iws_key, "inverse matrix");
+    StageDeviceBufferPtr cachef_device = upload_table(
+        setup.cachef, RT_LAB_TOOLS_CACHE_ENTRIES, &cachef_key, "cachef");
+    StageDeviceBufferPtr cachefy_device = upload_table(
+        setup.cachefy, RT_LAB_TOOLS_CACHE_ENTRIES, &cachefy_key, "cachefy");
+    if (!record_device || !ws_device || !iws_device || !cachef_device ||
+        !cachefy_device) {
+        return RT_STAGE_FALLBACK;
+    }
+
+    const auto table_slice = [&](int offset_slot, int active_slot, int entries,
+                                 const char* label, char* key)
+        -> StageDeviceBufferPtr {
+        const float offset = rec[offset_slot];
+        const bool active = rec[active_slot] == 1.0f;
+        if (!active) {
+            return placeholder_device;
+        }
+        if (offset < 0.0f ||
+            static_cast<std::size_t>(offset) + static_cast<std::size_t>(entries) >
+                setup.lut_count) {
+            error = std::string("local.adjustments ") + label +
+                    " table is out of range";
+            return nullptr;
+        }
+        return upload_table(setup.luts + static_cast<std::size_t>(offset),
+                            entries, key, label);
+    };
+
+    StageDeviceBufferPtr light_device =
+        table_slice(RT_LOCAL_ADJUSTMENTS_SLOT_LIGHT_OFFSET,
+                    RT_LOCAL_ADJUSTMENTS_SLOT_LIGHT_ACTIVE,
+                    RT_LOCAL_ADJUSTMENTS_LIGHT_LUT_ENTRIES, "light",
+                    &light_key);
+    StageDeviceBufferPtr satur_device =
+        table_slice(RT_LOCAL_ADJUSTMENTS_SLOT_SATUR_OFFSET,
+                    RT_LOCAL_ADJUSTMENTS_SLOT_SATUR_ACTIVE,
+                    RT_LOCAL_ADJUSTMENTS_LUT_ENTRIES, "satur", &satur_key);
+    StageDeviceBufferPtr saturmoins_device =
+        table_slice(RT_LOCAL_ADJUSTMENTS_SLOT_SATURMOINS_OFFSET,
+                    RT_LOCAL_ADJUSTMENTS_SLOT_SATURMOINS_ACTIVE,
+                    RT_LOCAL_ADJUSTMENTS_LUT_ENTRIES, "saturmoins",
+                    &saturmoins_key);
+    if (!light_device || !satur_device || !saturmoins_device) {
+        return RT_STAGE_FALLBACK;
+    }
+
+    char roi_keys[3] = {0, 0, 0};
+    char scratch_key = 0;
+    char blur_keys[3] = {0, 0, 0};
+    StageDeviceBufferPtr roi_device[3];
+    StageDeviceBufferPtr blur_device[3];
+    for (int plane = 0; plane < 3; ++plane) {
+        roi_device[plane] = residency->acquire(
+            &roi_keys[plane],
+            StageBufferShape{RT_STAGE_F32, bfw, bfh, 1}, &error);
+        blur_device[plane] = residency->acquire(
+            &blur_keys[plane],
+            StageBufferShape{RT_STAGE_F32, bfw, bfh, 1}, &error);
+        if (!roi_device[plane] || !blur_device[plane]) {
+            error = "local.adjustments ROI allocation failed";
+            return RT_STAGE_FALLBACK;
+        }
+    }
+    StageDeviceBufferPtr scratch_device = residency->acquire(
+        &scratch_key, StageBufferShape{RT_STAGE_F32, bfw, bfh, 1}, &error);
+    if (!scratch_device) {
+        error = "local.adjustments blur scratch allocation failed";
+        return RT_STAGE_FALLBACK;
+    }
+
+    const int lab_pitch = static_cast<int>(pitch_of(image));
+    const int lab_plane = static_cast<int>(plane_pitch_of(image));
+    const int roi_pitch = static_cast<int>(pitch_of(roi_device[0]));
+    const int blur_pitch = static_cast<int>(pitch_of(blur_device[0]));
+    const int scratch_pitch = static_cast<int>(pitch_of(scratch_device));
+    if (pitch_of(image) > static_cast<std::size_t>(
+                               std::numeric_limits<cl_int>::max()) ||
+        plane_pitch_of(image) >
+            static_cast<std::size_t>(std::numeric_limits<cl_int>::max()) / 3 ||
+        pitch_of(roi_device[0]) >
+            static_cast<std::size_t>(std::numeric_limits<cl_int>::max()) ||
+        pitch_of(blur_device[0]) >
+            static_cast<std::size_t>(std::numeric_limits<cl_int>::max()) ||
+        pitch_of(scratch_device) >
+            static_cast<std::size_t>(std::numeric_limits<cl_int>::max())) {
+        error = "local.adjustments pitch does not fit the kernel's int";
+        return RT_STAGE_FALLBACK;
+    }
+
+    std::lock_guard<std::recursive_mutex> lock(env->queue_mutex);
+
+    const auto set = [&](cl_kernel kernel, cl_uint index, std::size_t bytes,
+                         const void* value) {
+        return env->api->SetKernelArg(kernel, index, bytes, value) ==
+               CL_SUCCESS;
+    };
+    const auto launch2d = [&](cl_kernel kernel, std::size_t gx,
+                              std::size_t gy, const char* label) {
+        const std::size_t global[2] = {gx, gy};
+        cl_event done = nullptr;
+        if (env->api->EnqueueNDRangeKernel(env->queue, kernel, 2, nullptr,
+                                           global, nullptr, 0, nullptr,
+                                           &done) != CL_SUCCESS ||
+            done == nullptr) {
+            error = std::string("local.adjustments ") + label +
+                    " launch failed";
+            return false;
+        }
+        const cl_int wait = env->api->WaitForEvents(1, &done);
+        env->api->ReleaseEvent(done);
+        if (wait != CL_SUCCESS) {
+            error = std::string("local.adjustments ") + label +
+                    " did not complete";
+            return false;
+        }
+        return true;
+    };
+    const auto launch1d = [&](cl_kernel kernel, std::size_t gx,
+                              const char* label) {
+        const std::size_t global[1] = {gx};
+        cl_event done = nullptr;
+        if (env->api->EnqueueNDRangeKernel(env->queue, kernel, 1, nullptr,
+                                           global, nullptr, 0, nullptr,
+                                           &done) != CL_SUCCESS ||
+            done == nullptr) {
+            error = std::string("local.adjustments ") + label +
+                    " launch failed";
+            return false;
+        }
+        const cl_int wait = env->api->WaitForEvents(1, &done);
+        env->api->ReleaseEvent(done);
+        if (wait != CL_SUCCESS) {
+            error = std::string("local.adjustments ") + label +
+                    " did not complete";
+            return false;
+        }
+        return true;
+    };
+
+    const auto run_clamp = [&](float epsi, int mode, const char* label) {
+        cl_uint arg = 0;
+        cl_mem lab_memory = memory_of(image);
+        cl_mem ws_memory = memory_of(ws_device);
+        cl_mem iws_memory = memory_of(iws_device);
+        cl_mem cachef_memory = memory_of(cachef_device);
+        cl_mem cachefy_memory = memory_of(cachefy_device);
+        cl_int mode_value = mode;
+        cl_float epsi_value = epsi;
+        bool ok = true;
+        ok = ok && set(clamp_kernel, arg++, sizeof(cl_mem), &lab_memory);
+        ok = ok && set(clamp_kernel, arg++, sizeof(cl_mem), &ws_memory);
+        ok = ok && set(clamp_kernel, arg++, sizeof(cl_mem), &iws_memory);
+        ok = ok && set(clamp_kernel, arg++, sizeof(cl_mem), &cachef_memory);
+        ok = ok && set(clamp_kernel, arg++, sizeof(cl_mem), &cachefy_memory);
+        ok = ok && set(clamp_kernel, arg++, sizeof(cl_int), &width);
+        ok = ok && set(clamp_kernel, arg++, sizeof(cl_int), &height);
+        ok = ok && set(clamp_kernel, arg++, sizeof(cl_int), &lab_pitch);
+        ok = ok && set(clamp_kernel, arg++, sizeof(cl_int), &lab_plane);
+        ok = ok && set(clamp_kernel, arg++, sizeof(cl_int), &mode_value);
+        ok = ok && set(clamp_kernel, arg++, sizeof(cl_float), &epsi_value);
+        if (!ok) {
+            error = std::string("local.adjustments ") + label +
+                    " arguments failed";
+            return false;
+        }
+        return launch2d(clamp_kernel, static_cast<std::size_t>(width),
+                        static_cast<std::size_t>(height), label);
+    };
+
+    if (rec[RT_LOCAL_ADJUSTMENTS_SLOT_AVOIDNEG] != 0.0f &&
+        !run_clamp(RT_LOCAL_ADJUSTMENTS_EPSI0,
+                   RT_LOCAL_ADJUSTMENTS_CLAMP_NOTZERO, "prefilter")) {
+        return RT_STAGE_FALLBACK;
+    }
+
+    /* ROI copy, then the Gaussian for each plane. */
+    {
+        cl_uint arg = 0;
+        cl_mem lab_memory = memory_of(image);
+        cl_mem roi_l = memory_of(roi_device[0]);
+        cl_mem roi_a = memory_of(roi_device[1]);
+        cl_mem roi_b = memory_of(roi_device[2]);
+        cl_int x0 = xstart;
+        cl_int y0 = ystart;
+        cl_int rw = bfw;
+        cl_int rh = bfh;
+        cl_int lp = lab_pitch;
+        cl_int lpl = lab_plane;
+        cl_int rp = roi_pitch;
+        bool ok = true;
+        ok = ok && set(roi_kernel, arg++, sizeof(cl_mem), &lab_memory);
+        ok = ok && set(roi_kernel, arg++, sizeof(cl_mem), &roi_l);
+        ok = ok && set(roi_kernel, arg++, sizeof(cl_mem), &roi_a);
+        ok = ok && set(roi_kernel, arg++, sizeof(cl_mem), &roi_b);
+        ok = ok && set(roi_kernel, arg++, sizeof(cl_int), &x0);
+        ok = ok && set(roi_kernel, arg++, sizeof(cl_int), &y0);
+        ok = ok && set(roi_kernel, arg++, sizeof(cl_int), &rw);
+        ok = ok && set(roi_kernel, arg++, sizeof(cl_int), &rh);
+        ok = ok && set(roi_kernel, arg++, sizeof(cl_int), &lp);
+        ok = ok && set(roi_kernel, arg++, sizeof(cl_int), &lpl);
+        ok = ok && set(roi_kernel, arg++, sizeof(cl_int), &rp);
+        if (!ok || !launch2d(roi_kernel, static_cast<std::size_t>(bfw),
+                             static_cast<std::size_t>(bfh), "ROI copy")) {
+            error = "local.adjustments ROI copy failed";
+            return RT_STAGE_FALLBACK;
+        }
+    }
+
+    const auto run_line =
+        [&](cl_kernel kernel, cl_mem src, cl_mem dst, cl_mem state,
+            cl_int length, cl_int lines, cl_int src_base_step,
+            cl_int dst_base_step, cl_int src_stride, cl_int dst_stride,
+            cl_int vector_lines, const RtLabToolsIirDirection& direction,
+            const char* label) {
+        cl_uint arg = 0;
+        cl_int mode = 0;
+        bool ok = true;
+        ok = ok && set(kernel, arg++, sizeof(cl_mem), &src);
+        ok = ok && set(kernel, arg++, sizeof(cl_mem), &dst);
+        ok = ok && set(kernel, arg++, sizeof(cl_mem), &state);
+        ok = ok && set(kernel, arg++, sizeof(cl_int), &length);
+        ok = ok && set(kernel, arg++, sizeof(cl_int), &lines);
+        ok = ok && set(kernel, arg++, sizeof(cl_int), &src_base_step);
+        ok = ok && set(kernel, arg++, sizeof(cl_int), &dst_base_step);
+        ok = ok && set(kernel, arg++, sizeof(cl_int), &src_stride);
+        ok = ok && set(kernel, arg++, sizeof(cl_int), &dst_stride);
+        ok = ok && set(kernel, arg++, sizeof(cl_int), &mode);
+        ok = ok && set(kernel, arg++, sizeof(cl_int), &vector_lines);
+        for (std::size_t index = 0;
+             index < RT_LAB_TOOLS_IIR_TERMS && ok; ++index) {
+            ok = ok && set(kernel, arg++, sizeof(cl_float),
+                           &direction.lane[index]);
+        }
+        for (std::size_t index = 0;
+             index < RT_LAB_TOOLS_IIR_TERMS && ok; ++index) {
+            ok = ok && set(kernel, arg++, sizeof(cl_double),
+                           &direction.border[index]);
+        }
+        for (std::size_t index = 0;
+             index < RT_LAB_TOOLS_IIR_TERMS && ok; ++index) {
+            ok = ok && set(kernel, arg++, sizeof(cl_double),
+                           &direction.wide[index]);
+        }
+        if (!ok) {
+            error = std::string("local.adjustments ") + label +
+                    " arguments failed";
+            return false;
+        }
+        return launch1d(kernel, static_cast<std::size_t>(lines), label);
+    };
+
+    const cl_int horizontal_vector_lines = bfh - (bfh % 4);
+    const cl_int vertical_vector_lines = bfw - (bfw % 8);
+    for (int plane = 0; plane < 3; ++plane) {
+        cl_mem src = memory_of(roi_device[plane]);
+        cl_mem scratch = memory_of(scratch_device);
+        cl_mem dst = memory_of(blur_device[plane]);
+        if (!run_line(line_kernel, src, scratch, scratch, bfw, bfh,
+                      roi_pitch, scratch_pitch, 1, 1,
+                      horizontal_vector_lines, setup.iir->horizontal,
+                      "horizontal blur") ||
+            !run_line(line_kernel, scratch, dst, scratch, bfh, bfw, 1, 1,
+                      scratch_pitch, blur_pitch, vertical_vector_lines,
+                      setup.iir->vertical, "vertical blur")) {
+            return RT_STAGE_FALLBACK;
+        }
+    }
+
+    {
+        cl_uint arg = 0;
+        cl_mem lab_memory = memory_of(image);
+        cl_mem blur_l = memory_of(blur_device[0]);
+        cl_mem blur_a = memory_of(blur_device[1]);
+        cl_mem blur_b = memory_of(blur_device[2]);
+        cl_mem record_memory = memory_of(record_device);
+        cl_mem light_memory = memory_of(light_device);
+        cl_mem satur_memory = memory_of(satur_device);
+        cl_mem saturmoins_memory = memory_of(saturmoins_device);
+        cl_int x0 = xstart;
+        cl_int y0 = ystart;
+        cl_int rw = bfw;
+        cl_int rh = bfh;
+        cl_int lp = lab_pitch;
+        cl_int lpl = lab_plane;
+        cl_int bp = blur_pitch;
+        bool ok = true;
+        ok = ok && set(apply_kernel, arg++, sizeof(cl_mem), &lab_memory);
+        ok = ok && set(apply_kernel, arg++, sizeof(cl_mem), &blur_l);
+        ok = ok && set(apply_kernel, arg++, sizeof(cl_mem), &blur_a);
+        ok = ok && set(apply_kernel, arg++, sizeof(cl_mem), &blur_b);
+        ok = ok && set(apply_kernel, arg++, sizeof(cl_mem), &record_memory);
+        ok = ok && set(apply_kernel, arg++, sizeof(cl_mem), &light_memory);
+        ok = ok && set(apply_kernel, arg++, sizeof(cl_mem), &satur_memory);
+        ok = ok && set(apply_kernel, arg++, sizeof(cl_mem),
+                       &saturmoins_memory);
+        ok = ok && set(apply_kernel, arg++, sizeof(cl_int), &lp);
+        ok = ok && set(apply_kernel, arg++, sizeof(cl_int), &lpl);
+        ok = ok && set(apply_kernel, arg++, sizeof(cl_int), &rw);
+        ok = ok && set(apply_kernel, arg++, sizeof(cl_int), &rh);
+        ok = ok && set(apply_kernel, arg++, sizeof(cl_int), &x0);
+        ok = ok && set(apply_kernel, arg++, sizeof(cl_int), &y0);
+        ok = ok && set(apply_kernel, arg++, sizeof(cl_int), &bp);
+        if (!ok || !launch2d(apply_kernel, static_cast<std::size_t>(bfw),
+                             static_cast<std::size_t>(bfh), "colour apply")) {
+            error = "local.adjustments colour apply failed";
+            return RT_STAGE_FALLBACK;
+        }
+    }
+
+    if (!run_clamp(RT_LOCAL_ADJUSTMENTS_EPSI, static_cast<int>(clamp_mode),
+                   "tail clamp")) {
+        return RT_STAGE_FALLBACK;
+    }
+
+    if (residency->readback(image, lab) != RT_STAGE_OK) {
+        error = "local.adjustments readback failed";
+        return RT_STAGE_ERROR;
     }
     return RT_STAGE_OK;
 }
@@ -8019,31 +8576,6 @@ public:
             StageEvent event = StageQueue::submit(request, profiling);
             event.note = "an explicit implementation is a host program";
             return event;
-        }
-
-        if (request.name == "local.adjustments") {
-            std::string error;
-            const RtStageStatus status =
-                validate_local_adjustments(request.args, error);
-            if (status != RT_STAGE_OK) {
-                StageEvent failed;
-                failed.status = StageEventStatus::Failed;
-                failed.result = status;
-                failed.device = StageDeviceType::NONE;
-                failed.note = error;
-                return failed;
-            }
-            /*
-             * No colour-only kernel is registered yet. The host queue runs
-             * the builtin, so the record says impl=host rather than claiming
-             * a device pass that never ran.
-             */
-            StageEvent fallback = StageQueue::submit(request, profiling);
-            fallback.note =
-                request.args[2].u.i != 0
-                    ? "local.adjustments colour-only kernel is not implemented"
-                    : "local.adjustments residual";
-            return fallback;
         }
 
         if (find_kernel(request.name) == nullptr) {
@@ -8184,6 +8716,20 @@ public:
         } else if (request.name == "lab.tools") {
             const RtStageStatus status =
                 run_lab_tools(env_, residency_, request.args, error);
+            if (status == RT_STAGE_OK) {
+                StageEvent done;
+                done.status = StageEventStatus::Complete;
+                done.result = RT_STAGE_OK;
+                done.device = StageDeviceType::OPENCL;
+                done.asynchronous = false;
+                return done;
+            }
+            StageEvent fallback = StageQueue::submit(request, profiling);
+            fallback.note = error;
+            return fallback;
+        } else if (request.name == "local.adjustments") {
+            const RtStageStatus status =
+                run_local_adjustments(env_, residency_, request.args, error);
             if (status == RT_STAGE_OK) {
                 StageEvent done;
                 done.status = StageEventStatus::Complete;
@@ -8357,16 +8903,12 @@ std::vector<std::string> opencl_stage_nodes()
     for (const KernelDef& def : kernels()) {
         names.emplace_back(def.name);
     }
-    /* The local.adjustments node validates and then refuses until its kernel
-     * set lands; it is still a device node because the refusal is part of the
-     * runtime's record, not a silent host bypass. */
-    names.emplace_back("local.adjustments");
     return names;
 }
 
 bool has_opencl_stage_node(const std::string& name)
 {
-    return name == "local.adjustments" || find_kernel(name) != nullptr;
+    return find_kernel(name) != nullptr;
 }
 
 StageDeviceType OpenCLStageDevice::type() const

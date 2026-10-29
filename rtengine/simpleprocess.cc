@@ -1486,10 +1486,13 @@ private:
                 labView = new LabImage(fw, fh);
             }
 
+            ipf.rgb2lab(*baseImg, *labView, params.icm.workingProfile);
+
             stage::LocalAdjustmentsContext context(params, ipf, baseImg,
                                                    labView, fw, fh);
             const bool supported = stage::localAdjustmentsSupported(params);
-            RtLocalAdjustmentsContext descriptor = context.descriptor(false);
+            RtLocalAdjustmentsContext descriptor =
+                context.descriptor(supported);
 
             RtStageArg args[3] = {};
             args[0].kind = RT_STAGE_ARG_BUFFER;
@@ -1503,6 +1506,8 @@ private:
             if (stage::run("local.adjustments",
                            std::vector<RtStageArg>(args, args + 3),
                            &profiling) == RT_STAGE_OK) {
+                /* The node returns Lab; baseImg stays the host's. */
+                ipf.lab2rgb(*labView, *baseImg, params.icm.workingProfile);
                 return;
             }
         }
