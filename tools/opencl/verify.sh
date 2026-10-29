@@ -254,6 +254,8 @@ quick() {
         "$ROOT/devnotes/opencl/pp3/labtools-labgrid.pp3" lab.tools
     run_stage_device "pef/stage-device-lab-tools-vibrance" \
         "$ROOT/devnotes/opencl/pp3/labtools-vibrance.pp3" lab.tools cpu
+    run_stage_device "pef/stage-device-lab-tools-labcurve" \
+        "$ROOT/devnotes/opencl/pp3/labtools-labcurve.pp3" lab.tools cpu
     run_stage_host "pef/stage-host-lab-tools-residual" \
         "$ROOT/devnotes/opencl/pp3/labtools-residual.pp3" lab.tools
 }
@@ -399,10 +401,10 @@ run_stage_device() {
 
     if [ "$device_class" = "cpu" ] && [ "$device_is_cpu" -ne 1 ]; then
         if [ "${RT_REQUIRE_GPU:-0}" = "1" ]; then
-            printf 'FAIL\t%s\tvibrance is CPU-device-only; the selected device is not a CPU OpenCL device\n' "$label"
+            printf 'FAIL\t%s\tthe row is CPU-device-only; the selected device is not a CPU OpenCL device\n' "$label"
             return 1
         fi
-        printf 'SKIP\t%s\tvibrance is CPU-device-only; the selected device is not a CPU OpenCL device\n' "$label"
+        printf 'SKIP\t%s\tthe row is CPU-device-only; the selected device is not a CPU OpenCL device\n' "$label"
         return 0
     fi
 
@@ -559,6 +561,8 @@ stage_device() {
         "$ROOT/devnotes/opencl/pp3/labtools-labgrid.pp3" lab.tools
     run_stage_device "pef/stage-device-lab-tools-vibrance" \
         "$ROOT/devnotes/opencl/pp3/labtools-vibrance.pp3" lab.tools cpu
+    run_stage_device "pef/stage-device-lab-tools-labcurve" \
+        "$ROOT/devnotes/opencl/pp3/labtools-labcurve.pp3" lab.tools cpu
     run_stage_host "pef/stage-host-lab-tools-residual" \
         "$ROOT/devnotes/opencl/pp3/labtools-residual.pp3" lab.tools
 }

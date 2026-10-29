@@ -3602,6 +3602,7 @@ struct LabToolsHostState {
 
     LabToolsHostState()
     {
+        hist16(65536);
         lumacurve(32770, 0);
         curve1(65536);
         curve2(65536);
@@ -3692,7 +3693,7 @@ LabToolsRun run_lab_tools_node(LabImage& image,
     result.deviceReady = deviceReady;
     RtLabToolsContext descriptor = context.descriptor(deviceReady);
 
-    RtStageArg args[34] = {};
+    RtStageArg args[56] = {};
     args[0].kind = RT_STAGE_ARG_BUFFER;
     args[0].u.buffer = view(image);
     args[1].kind = RT_STAGE_ARG_PTR;
@@ -3745,6 +3746,42 @@ LabToolsRun run_lab_tools_node(LabImage& image,
     args[30].kind = RT_STAGE_ARG_INT;
     args[30].u.i = params.toneCurve.hrenabled ? 1 : 0;
 
+    args[34].kind = RT_STAGE_ARG_INT;
+    args[34].u.i = deviceReady ? setup.lab_curve_active : 0;
+    args[35].kind = RT_STAGE_ARG_INT;
+    args[35].u.i = deviceReady ? setup.lab_curve_l_active : 0;
+    args[36].kind = RT_STAGE_ARG_INT;
+    args[36].u.i = deviceReady ? setup.lab_curve_a_active : 0;
+    args[37].kind = RT_STAGE_ARG_INT;
+    args[37].u.i = deviceReady ? setup.lab_curve_b_active : 0;
+    args[38].kind = RT_STAGE_ARG_INT;
+    args[38].u.i = deviceReady ? setup.lab_curve_cc_active : 0;
+    args[39].kind = RT_STAGE_ARG_INT;
+    args[39].u.i = deviceReady ? setup.lab_curve_lc_active : 0;
+    args[40].kind = RT_STAGE_ARG_INT;
+    args[40].u.i = deviceReady ? setup.lab_curve_cl_active : 0;
+    args[41].kind = RT_STAGE_ARG_INT;
+    args[41].u.i = deviceReady ? setup.lab_curve_munsell : 0;
+    args[42].kind = RT_STAGE_ARG_INT;
+    args[42].u.i = deviceReady ? setup.lab_curve_lcredsk : 0;
+    const double lab_curve_doubles[5] = {
+        deviceReady ? setup.lab_curve_rst_protection : 0.0,
+        deviceReady ? setup.lab_curve_protect_red : 0.0,
+        deviceReady ? setup.lab_curve_protect_red_h : 0.0,
+        deviceReady ? setup.lab_curve_amount_chroma : 0.0,
+        deviceReady ? setup.lab_curve_adjust : 1.0};
+    for (int index = 0; index < 5; ++index) {
+        args[43 + index].kind = RT_STAGE_ARG_DOUBLE;
+        args[43 + index].u.f = lab_curve_doubles[index];
+    }
+    for (int index = 48; index < 54; ++index) {
+        args[index].kind = RT_STAGE_ARG_BUFFER;
+    }
+    args[54].kind = RT_STAGE_ARG_INT;
+    args[54].u.i = deviceReady ? setup.lab_curve_l_entries : 0;
+    args[55].kind = RT_STAGE_ARG_INT;
+    args[55].u.i = deviceReady ? setup.lab_curve_entries : 0;
+
     for (int index = 16; index < 22; ++index) {
         args[index].kind = RT_STAGE_ARG_BUFFER;
     }
@@ -3787,6 +3824,27 @@ LabToolsRun run_lab_tools_node(LabImage& image,
                 setup.skin_curve_set != 0
                     ? static_cast<int>(RT_LAB_TOOLS_SKIN_CURVE_ENTRIES)
                     : 1);
+        } else if (setup.lab_curve_munsell != 0) {
+            args[31].u.buffer = host_buffer(
+                setup.munsell, static_cast<int>(RT_LAB_TOOLS_MUNSELL_TABLES *
+                                                RT_LAB_TOOLS_MUNSELL_STRIDE));
+            args[32].u.buffer = host_buffer(
+                setup.munsell_sizes,
+                static_cast<int>(RT_LAB_TOOLS_MUNSELL_TABLES));
+        }
+        if (setup.lab_curve_active != 0) {
+            args[48].u.buffer = host_buffer(
+                setup.lab_curve_l, static_cast<int>(setup.lab_curve_l_entries));
+            args[49].u.buffer = host_buffer(
+                setup.lab_curve_a, static_cast<int>(setup.lab_curve_entries));
+            args[50].u.buffer = host_buffer(
+                setup.lab_curve_b, static_cast<int>(setup.lab_curve_entries));
+            args[51].u.buffer = host_buffer(
+                setup.lab_curve_cc, static_cast<int>(setup.lab_curve_entries));
+            args[52].u.buffer = host_buffer(
+                setup.lab_curve_lc, static_cast<int>(setup.lab_curve_entries));
+            args[53].u.buffer = host_buffer(
+                setup.lab_curve_cl, static_cast<int>(setup.lab_curve_entries));
         }
     }
 
@@ -3794,7 +3852,7 @@ LabToolsRun run_lab_tools_node(LabImage& image,
     setenv("RT_STAGE_PROFILE", profile_path.c_str(), 1);
     set_node_device_override("lab.tools", StageNodeDevice::OpenCL);
     result.status =
-        run("lab.tools", std::vector<RtStageArg>(args, args + 34));
+        run("lab.tools", std::vector<RtStageArg>(args, args + 56));
     clear_node_device_overrides();
     unsetenv("RT_STAGE_PROFILE");
     return result;
@@ -3941,7 +3999,7 @@ void test_lab_tools(bool available)
      * block, and the result must be the block's own output.
      */
     const char* residual_labels[] = {
-        "vibrance + Lab curves", "vibrance + local contrast", "vibrance + EPD",
+        "vibrance + Lab contrast", "vibrance + local contrast", "vibrance + EPD",
         "vibrance + Lab regions", "vibrance + black and white",
         "vibrance no-op", "vibrance pastels out of range"};
     for (const char* label : residual_labels) {
@@ -3957,13 +4015,14 @@ void test_lab_tools(bool available)
         params.vibrance.pastels = 50;
         params.vibrance.saturated = 30;
 
-        if (std::strcmp(label, "vibrance + Lab curves") == 0) {
+        if (std::strcmp(label, "vibrance + Lab contrast") == 0) {
             params.labCurve.enabled = true;
+            params.labCurve.contrast = 10;
             params.labCurve.lcurve = {
-                static_cast<double>(FCT_MinMaxCPoints),
-                0.0, 0.0, 0.0, 0.0,
-                0.5, 0.6, 0.0, 0.0,
-                1.0, 1.0, 0.0, 0.0};
+                static_cast<double>(DCT_Spline),
+                0.0, 0.0,
+                0.5, 0.6,
+                1.0, 1.0};
         } else if (std::strcmp(label, "vibrance + local contrast") == 0) {
             params.localContrast.enabled = true;
             params.localContrast.radius = 20;
@@ -4150,7 +4209,7 @@ void test_lab_tools(bool available)
         check(context.build(setup) == 0, "forced fallback setup builds");
         RtLabToolsContext descriptor = context.descriptor(true);
 
-        RtStageArg args[34] = {};
+        RtStageArg args[56] = {};
         args[0].kind = RT_STAGE_ARG_BUFFER;
         args[0].u.buffer = view(device);
         args[1].kind = RT_STAGE_ARG_PTR;
@@ -4202,6 +4261,19 @@ void test_lab_tools(bool available)
         for (int index = 31; index < 34; ++index) {
             args[index].kind = RT_STAGE_ARG_BUFFER;
         }
+        for (int index = 34; index <= 42; ++index) {
+            args[index].kind = RT_STAGE_ARG_INT;
+            args[index].u.i = 0;
+        }
+        for (int index = 43; index <= 47; ++index) {
+            args[index].kind = RT_STAGE_ARG_DOUBLE;
+            args[index].u.f = 0.0;
+        }
+        for (int index = 48; index < 54; ++index) {
+            args[index].kind = RT_STAGE_ARG_BUFFER;
+        }
+        args[54].kind = RT_STAGE_ARG_INT;
+        args[55].kind = RT_STAGE_ARG_INT;
         /* Half the required length: the launcher refuses the submission. */
         args[16].u.buffer = host_buffer(setup.lut_highlight,
                                         static_cast<int>(setup.lut_entries) / 2);
@@ -4218,7 +4290,7 @@ void test_lab_tools(bool available)
         setenv("RT_STAGE_PROFILE", profile_path.c_str(), 1);
         set_node_device_override("lab.tools", StageNodeDevice::OpenCL);
         const RtStageStatus status =
-            run("lab.tools", std::vector<RtStageArg>(args, args + 34));
+            run("lab.tools", std::vector<RtStageArg>(args, args + 56));
         clear_node_device_overrides();
         const std::string profile = read_file(profile_path);
         unsetenv("RT_STAGE_PROFILE");
@@ -4654,6 +4726,421 @@ void test_lab_tools_vibrance(bool available)
 }
 
 
+/* --------------------------------------------------- lab.tools Lab curves */
+
+/*
+ * The Lab-curve fixtures. `neutral` has no chroma, so the block's CC == 0
+ * branch, the a/b tables and the Munsell chroma gate are all exercised from
+ * the other side. `saturated` spans the hue circle and chroma up to the
+ * Munsell LUT limit.
+ */
+void fill_lab_curve_neutral(LabImage& lab)
+{
+    for (int y = 0; y < lab.H; ++y) {
+        for (int x = 0; x < lab.W; ++x) {
+            lab.L[y][x] = 32768.f * static_cast<float>(x) /
+                          static_cast<float>(lab.W > 1 ? lab.W - 1 : 1);
+            lab.a[y][x] = 0.f;
+            lab.b[y][x] = 0.f;
+        }
+    }
+}
+
+void fill_lab_curve_saturated(LabImage& lab)
+{
+    for (int y = 0; y < lab.H; ++y) {
+        const float l = 4.f + 96.f * static_cast<float>(y) /
+                                   static_cast<float>(lab.H > 1 ? lab.H - 1 : 1);
+        for (int x = 0; x < lab.W; ++x) {
+            const float hue =
+                -3.05f + 6.10f * static_cast<float>(x % 61) / 60.f;
+            const float c = 55.f + 30.f * static_cast<float>((x / 61) % 4);
+            lab.L[y][x] = l * 327.68f;
+            lab.a[y][x] = c * cosf(hue) * 327.68f;
+            lab.b[y][x] = c * sinf(hue) * 327.68f;
+        }
+    }
+}
+
+/* The block's diagonal curve point list: 0 -> 0, 0.5 -> mid, 1 -> 1. */
+std::vector<double> lab_curve_points(double mid)
+{
+    return {static_cast<double>(DCT_Spline),
+            0.0, 0.0,
+            0.5, mid,
+            1.0, 1.0};
+}
+
+struct LabCurveCase {
+    const char* label;
+    int width;
+    int height;
+    int image; /* 0 random, 1 neutral, 2 saturated */
+    int brightness;
+    double mid;
+    bool lcurve;
+    bool acurve;
+    bool bcurve;
+    bool cccurve;
+    bool lccurve;
+    bool clcurve;
+    int chromaticity;
+    const char* munsell;
+    double rstprotection;
+    bool lcredsk;
+    int protectred;
+    double protectredh;
+};
+
+void test_lab_tools_lab_curve(bool available)
+{
+    using namespace rtengine::stage;
+
+    static MyMutex lab_curve_lcms_mutex;
+    if (rtengine::lcmsMutex == nullptr) {
+        rtengine::lcmsMutex = &lab_curve_lcms_mutex;
+    }
+    static rtengine::Settings lab_curve_settings{};
+    rtengine::settings = &lab_curve_settings;
+    rtengine::Color::init();
+
+    const std::string profile_path =
+        std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp") +
+        "/stage-residency-lab-tools-labcurve.jsonl";
+
+    if (!available) {
+        skip("lab.tools Lab curves: no OpenCL device");
+        return;
+    }
+    check(node_has_device_implementation("lab.tools"),
+          "the lab.tools node has a device implementation for Lab curves");
+
+    const LabCurveCase cases[] = {
+        /* label, w, h, image, brightness, mid, l, a, b, cc, lc, cl,
+         * chromaticity, munsell, rstprotection, lcredsk, protectred,
+         * protectredh */
+        {"L curve only", 238, 64, 0, 0, 0.58, true, false, false, false,
+         false, false, 0, "MUN", 0.0, true, 60, 0.3},
+        {"identity tables", 179, 48, 0, 0, 0.5, false, false, false, false,
+         false, false, 0, "MUN", 0.0, true, 60, 0.3},
+        {"L curve brightness", 238, 64, 0, 20, 0.58, true, false, false,
+         false, false, false, 0, "MUN", 0.0, true, 60, 0.3},
+        {"a curve only", 179, 48, 0, 0, 0.60, false, true, false, false, false,
+         false, 0, "MUN", 0.0, true, 60, 0.3},
+        {"a/b curves", 238, 64, 0, 0, 0.60, false, true, true, false, false,
+         false, 0, "MUN", 0.0, true, 60, 0.3},
+        {"C=f(C)", 238, 64, 2, 0, 1.35, false, false, false, true, false,
+         false, 0, "MUN", 0.0, true, 60, 0.3},
+        {"L=f(C)", 238, 64, 2, 0, 1.10, false, false, false, false, true,
+         false, 0, "MUN", 0.0, true, 60, 0.3},
+        {"C=f(L)", 238, 64, 0, 0, 0.70, false, false, false, false, false,
+         true, 0, "MUN", 0.0, true, 60, 0.3},
+        {"combined curves", 238, 64, 0, 0, 0.62, true, true, true, true, true,
+         true, 0, "MUN", 0.0, true, 60, 0.3},
+        {"combined NONE", 238, 64, 0, 0, 0.62, true, true, true, true, true,
+         true, 0, "NONE", 0.0, true, 60, 0.3},
+        {"combined MUN", 238, 64, 0, 0, 0.62, true, true, true, true, true,
+         true, 0, "MUN", 0.0, true, 60, 0.3},
+        {"red/skin protection", 238, 64, 2, 0, 1.20, false, false, false, true,
+         true, false, 0, "MUN", 30.0, true, 60, 0.3},
+        {"protection low red", 179, 48, 2, 0, 1.20, false, false, false, true,
+         true, false, 0, "MUN", 60.0, true, 25, 0.12},
+        {"protection high red", 238, 64, 2, 0, 1.20, false, false, false, true,
+         true, false, 0, "MUN", 10.0, true, 160, 0.9},
+        {"lcredsk off", 179, 48, 2, 0, 1.10, false, false, false, false, true,
+         false, 0, "MUN", 30.0, false, 60, 0.3},
+        {"neutral L curve", 238, 64, 1, 0, 0.58, true, false, false, false,
+         false, false, 0, "MUN", 0.0, true, 60, 0.3},
+        {"neutral combined MUN", 179, 48, 1, 0, 0.62, true, true, true, true,
+         true, true, 0, "MUN", 0.0, true, 60, 0.3},
+        {"saturated combined", 179, 48, 2, 0, 0.62, true, true, true, true,
+         true, true, 0, "MUN", 0.0, true, 60, 0.3},
+        {"padded width 179", 179, 48, 0, 0, 0.62, true, true, true, true, true,
+         true, 0, "MUN", 0.0, true, 60, 0.3},
+        {"padded width 238", 238, 64, 0, 0, 0.62, true, true, true, true, true,
+         true, 0, "MUN", 0.0, true, 60, 0.3},
+        {"large width 8192", 8192, 64, 0, 0, 0.62, true, true, true, true, true,
+         true, 0, "MUN", 0.0, true, 60, 0.3},
+    };
+
+    unsigned seed = 0x51ed270bu;
+    for (const LabCurveCase& item : cases) {
+        rtengine::procparams::ProcParams params;
+        params.labCurve.enabled = true;
+        params.labCurve.brightness = item.brightness;
+        params.labCurve.contrast = 0;
+        params.labCurve.chromaticity = item.chromaticity;
+        params.labCurve.gamutmunselmethod = item.munsell;
+        params.labCurve.rstprotection = item.rstprotection;
+        params.labCurve.lcredsk = item.lcredsk;
+        if (item.lcurve) {
+            params.labCurve.lcurve = lab_curve_points(item.mid);
+        }
+        if (item.acurve) {
+            params.labCurve.acurve = lab_curve_points(item.mid);
+        }
+        if (item.bcurve) {
+            params.labCurve.bcurve = lab_curve_points(item.mid);
+        }
+        if (item.cccurve) {
+            params.labCurve.cccurve = lab_curve_points(item.mid);
+        }
+        if (item.lccurve) {
+            params.labCurve.lccurve = lab_curve_points(item.mid);
+        }
+        if (item.clcurve) {
+            params.labCurve.clcurve = lab_curve_points(item.mid);
+        }
+
+        lab_curve_settings.protectred = item.protectred;
+        lab_curve_settings.protectredh = item.protectredh;
+        lab_curve_settings.amchroma = 40;
+
+        check(labToolsSupported(params),
+              (std::string("lab.tools Lab curve ") + item.label +
+               " is the supported set").c_str());
+        check(labToolsLabCurveActive(params),
+              (std::string("lab.tools Lab curve ") + item.label +
+               " runs the Lab-curve pass").c_str());
+
+        LabImage source(item.width, item.height);
+        switch (item.image) {
+        case 1:
+            fill_lab_curve_neutral(source);
+            break;
+        case 2:
+            fill_lab_curve_saturated(source);
+            break;
+        default:
+            fill_lab_tools(source, seed++);
+            break;
+        }
+
+        rtengine::ImProcFunctions cpu_ipf(&params, false);
+        LabToolsHostState cpu_host;
+        LabImage cpu(item.width, item.height);
+        cpu.CopyFrom(&source);
+        LabToolsLuts cpu_luts = cpu_host.luts();
+        labToolsHostBlock(cpu_ipf, params, cpu, cpu_luts, cpu_host.autili,
+                          cpu_host.butili);
+
+        rtengine::ImProcFunctions device_ipf(&params, false);
+        LabToolsHostState device_host;
+        LabImage device(item.width, item.height);
+        device.CopyFrom(&source);
+        const LabToolsRun result =
+            run_lab_tools_node(device, params, device_host, device_ipf,
+                               profile_path);
+        const std::string profile = read_file(profile_path);
+
+        check(result.supported,
+              (std::string("lab.tools Lab curve ") + item.label +
+               " resolves to the supported set").c_str());
+        check(result.deviceReady,
+              (std::string("lab.tools Lab curve ") + item.label +
+               " builds its host setup").c_str());
+        check(result.status == RT_STAGE_OK,
+              (std::string("lab.tools Lab curve ") + item.label +
+               " completes through run()").c_str());
+        check(profile.find("\"stage\":\"lab.tools\"") != std::string::npos,
+              (std::string("lab.tools Lab curve ") + item.label +
+               " records the node").c_str());
+        check(profile.find("\"impl\":\"opencl\"") != std::string::npos,
+              (std::string("lab.tools Lab curve ") + item.label +
+               " records a device execution").c_str());
+
+        const Distribution d = distribution(view(device), view(cpu));
+        std::printf("stage-residency: lab.tools Lab curve %s %dx%d: PAE "
+                    "%.6f LSB16; exact %zu, <=0.25 %zu, <=0.5 %zu, <=1 %zu, "
+                    ">1 %zu of %zu\n",
+                    item.label, item.width, item.height, d.max_abs, d.exact,
+                    d.quarter, d.half, d.one, d.over, d.samples);
+        check(d.finite,
+              (std::string("lab.tools Lab curve ") + item.label +
+               " stays finite").c_str());
+        check(d.over == 0,
+              (std::string("lab.tools Lab curve ") + item.label +
+               " is within one LSB16").c_str());
+        if (d.over > 0) {
+            double worst = -1.0;
+            int wx = -1;
+            int wy = -1;
+            for (int y = 0; y < item.height; ++y) {
+                for (int x = 0; x < item.width; ++x) {
+                    for (int plane = 0; plane < 3; ++plane) {
+                        const float hv = plane == 0 ? cpu.L[y][x]
+                                        : plane == 1 ? cpu.a[y][x]
+                                                     : cpu.b[y][x];
+                        const float dv = plane == 0 ? device.L[y][x]
+                                        : plane == 1 ? device.a[y][x]
+                                                     : device.b[y][x];
+                        const double delta =
+                            std::fabs(static_cast<double>(hv) - dv);
+                        if (delta > worst) {
+                            worst = delta;
+                            wx = x;
+                            wy = y;
+                        }
+                    }
+                }
+            }
+            std::printf("stage-residency: worst Lab-curve pixel %d,%d: host "
+                        "L=%.4f a=%.4f b=%.4f device L=%.4f a=%.4f b=%.4f\n",
+                        wx, wy, cpu.L[wy][wx], cpu.a[wy][wx],
+                        cpu.b[wy][wx], device.L[wy][wx], device.a[wy][wx],
+                        device.b[wy][wx]);
+        }
+    }
+
+    /*
+     * Residuals: every other Lab-curve family or setting must be refused and
+     * must run the block on the host byte for byte.
+     */
+    const char* residual_labels[] = {
+        "contrast", "chromaticity slider", "C=f(H) curve", "L=f(H) curve",
+        "H=f(H) curve", "XYZ Munsell", "black and white"};
+    for (const char* label : residual_labels) {
+        rtengine::procparams::ProcParams params;
+        params.labCurve.enabled = true;
+        params.labCurve.lcurve = lab_curve_points(0.60);
+        params.labCurve.acurve = lab_curve_points(0.60);
+        params.labCurve.cccurve = lab_curve_points(0.70);
+        params.labCurve.gamutmunselmethod = "MUN";
+        lab_curve_settings.protectred = 60;
+        lab_curve_settings.protectredh = 0.3;
+        lab_curve_settings.amchroma = 40;
+
+        if (std::strcmp(label, "contrast") == 0) {
+            params.labCurve.contrast = 15;
+        } else if (std::strcmp(label, "chromaticity slider") == 0) {
+            params.labCurve.chromaticity = 25;
+        } else if (std::strcmp(label, "C=f(H) curve") == 0) {
+            params.labCurve.chcurve = {
+                static_cast<double>(FCT_MinMaxCPoints),
+                0.0, 0.5, 0.0, 0.0, 0.5, 0.6, 0.0, 0.0,
+                1.0, 0.5, 0.0, 0.0};
+        } else if (std::strcmp(label, "L=f(H) curve") == 0) {
+            params.labCurve.lhcurve = {
+                static_cast<double>(FCT_MinMaxCPoints),
+                0.0, 0.5, 0.0, 0.0, 0.5, 0.6, 0.0, 0.0,
+                1.0, 0.5, 0.0, 0.0};
+        } else if (std::strcmp(label, "H=f(H) curve") == 0) {
+            params.labCurve.hhcurve = {
+                static_cast<double>(FCT_MinMaxCPoints),
+                0.0, 0.5, 0.0, 0.0, 0.5, 0.6, 0.0, 0.0,
+                1.0, 0.5, 0.0, 0.0};
+        } else if (std::strcmp(label, "XYZ Munsell") == 0) {
+            params.labCurve.gamutmunselmethod = "XYZ";
+        } else {
+            params.blackwhite.enabled = true;
+        }
+
+        check(!labToolsSupported(params),
+              (std::string("lab.tools Lab curve residual ") + label +
+               " is a residual").c_str());
+
+        LabImage source(179, 48);
+        fill_lab_curve_saturated(source);
+
+        rtengine::ImProcFunctions cpu_ipf(&params, false);
+        LabToolsHostState cpu_host;
+        LabImage cpu(179, 48);
+        cpu.CopyFrom(&source);
+        LabToolsLuts cpu_luts = cpu_host.luts();
+        labToolsHostBlock(cpu_ipf, params, cpu, cpu_luts, cpu_host.autili,
+                          cpu_host.butili);
+
+        rtengine::ImProcFunctions device_ipf(&params, false);
+        LabToolsHostState device_host;
+        LabImage device(179, 48);
+        device.CopyFrom(&source);
+        const LabToolsRun result =
+            run_lab_tools_node(device, params, device_host, device_ipf,
+                               profile_path);
+        const std::string profile = read_file(profile_path);
+
+        check(!result.supported,
+              (std::string("lab.tools Lab curve residual ") + label +
+               " is refused as a device configuration").c_str());
+        check(!result.deviceReady,
+              (std::string("lab.tools Lab curve residual ") + label +
+               " does not build a device setup").c_str());
+        check(result.status == RT_STAGE_OK,
+              (std::string("lab.tools Lab curve residual ") + label +
+               " completes through run()").c_str());
+        check(profile.find("\"impl\":\"host\"") != std::string::npos,
+              (std::string("lab.tools Lab curve residual ") + label +
+               " records a host execution").c_str());
+        check(profile.find("\"impl\":\"opencl\"") == std::string::npos,
+              (std::string("lab.tools Lab curve residual ") + label +
+               " never mixes a device pass").c_str());
+
+        const Diff diff = compare(view(device), view(cpu));
+        std::printf("stage-residency: lab.tools Lab curve residual %s: host, "
+                    "PAE %.6f LSB16, %zu of %zu samples differ\n",
+                    label, diff.max_abs, diff.differing, diff.samples);
+        check(diff.finite,
+              (std::string("lab.tools Lab curve residual ") + label +
+               " stays finite").c_str());
+        check(diff.differing == 0 && diff.max_abs == 0.0,
+              (std::string("lab.tools Lab curve residual ") + label +
+               " matches the CPU block").c_str());
+    }
+
+    /*
+     * Non-vacuity: on the saturated fixture the Munsell correction and the
+     * red/skin protection must change the host block's own output.
+     */
+    {
+        rtengine::procparams::ProcParams params;
+        params.labCurve.enabled = true;
+        params.labCurve.acurve = lab_curve_points(0.62);
+        params.labCurve.gamutmunselmethod = "MUN";
+        rtengine::procparams::ProcParams none = params;
+        none.labCurve.gamutmunselmethod = "NONE";
+
+        LabImage source(179, 48);
+        fill_lab_curve_saturated(source);
+        const auto host_block = [&](const rtengine::procparams::ProcParams& p) {
+            LabImage image(179, 48);
+            image.CopyFrom(&source);
+            rtengine::ImProcFunctions ipf(&p, false);
+            LabToolsHostState state;
+            LabToolsLuts luts = state.luts();
+            labToolsHostBlock(ipf, p, image, luts, state.autili, state.butili);
+            return image;
+        };
+        const LabImage mun = host_block(params);
+        const LabImage blended = host_block(none);
+        const Diff correction = compare(view(mun), view(blended));
+        std::printf("stage-residency: Lab-curve Munsell correction changes %zu "
+                    "of %zu saturated samples, PAE %.6f LSB16\n",
+                    correction.differing, correction.samples,
+                    correction.max_abs);
+        check(correction.differing > 0,
+              "the Lab-curve Munsell correction changes the image");
+
+        rtengine::procparams::ProcParams protected_on = params;
+        protected_on.labCurve.cccurve = lab_curve_points(1.20);
+        protected_on.labCurve.rstprotection = 30.0;
+        rtengine::procparams::ProcParams protected_off = protected_on;
+        lab_curve_settings.protectred = 0;
+        lab_curve_settings.protectredh = 0;
+        const LabImage without = host_block(protected_off);
+        lab_curve_settings.protectred = 60;
+        lab_curve_settings.protectredh = 0.3;
+        const LabImage with = host_block(protected_on);
+        const Diff protection = compare(view(with), view(without));
+        std::printf("stage-residency: Lab-curve red/skin protection changes %zu "
+                    "of %zu saturated samples, PAE %.6f LSB16\n",
+                    protection.differing, protection.samples,
+                    protection.max_abs);
+        check(protection.differing > 0,
+              "the Lab-curve red/skin protection changes the image");
+    }
+}
+
+
 /* --------------------------------------------------------- run() wiring */
 
 void test_run_wiring(bool available)
@@ -4784,6 +5271,7 @@ int main()
     test_working_trc(available);
     test_lab_tools(available);
     test_lab_tools_vibrance(available);
+    test_lab_tools_lab_curve(available);
     test_output_sharpen(available);
     test_run_wiring(available);
 

@@ -1,0 +1,17 @@
+[Luminance Curve]
+Enabled=true
+Brightness=0
+Contrast=0
+Chromaticity=0
+Gamutmunse=MUN
+RedAndSkinTonesProtection=30
+LCredsk=true
+LCurve=1;0;0;0.5;0.58;1;1;
+aCurve=1;0;0;0.5;0.55;1;1;
+bCurve=1;0;0;0.5;0.55;1;1;
+ccCurve=1;0;0;0.5;1.2;1;1;
+chCurve=0;
+lhCurve=0;
+hhCurve=0;
+LcCurve=1;0;0;0.5;0.6;1;1;
+ClCurve=1;0;0;0.5;0.45;1;1;
