@@ -53,7 +53,7 @@ struct ProcParams;
  * object that owns the ProcParams and ImProcFunctions references, so the
  * pointer must not outlive them.
  */
-#define RT_LAB_TOOLS_CONTEXT_VERSION 3u
+#define RT_LAB_TOOLS_CONTEXT_VERSION 4u
 /* "LTOC": rejects a stale or unrelated pointer before any callback runs. */
 #define RT_LAB_TOOLS_CONTEXT_MAGIC 0x4C544F43u
 /* The Lab-mode tone table: one entry per 16-bit L value (0..32767). */
@@ -89,6 +89,61 @@ struct ProcParams;
  */
 #define RT_LAB_TOOLS_IIR_TERMS 13u
 #define RT_LAB_TOOLS_IIR_VERSION 1u
+/*
+ * Lab colour-correction regions (ImProcFunctions::labColorCorrectionRegions).
+ * The device set admits one to four regions. Each region's hue, chromaticity
+ * and lightness masks are host-sampled FlatCurves: the host evaluates
+ * FlatCurve::getVal() on a uniform grid and the kernel interpolates it, so the
+ * host never exports a curve the kernel would have to re-derive. The
+ * chroma argument is xlin2log(c * 327.68/48000, 10); the host samples to four,
+ * past the point where FlatCurve's final interval begins (its synthetic 3.0
+ * endpoint), and the kernel extrapolates beyond that with the same slope the
+ * host uses. The lightness argument is raw L/32768, so it is sampled to the
+ * same point and a negative value wraps once, as FlatCurve::getVal() does.
+ */
+#define RT_LAB_TOOLS_MAX_REGIONS 4u
+#define RT_LAB_TOOLS_REGION_CURVES 3u
+/*
+ * A sampled mask curve is a piecewise-linear table: a float node count, then
+ * that many x nodes and that many y nodes. The host refines the table where
+ * the chord deviates from FlatCurve::getVal(), so a smooth curve needs a few
+ * hundred nodes and a control-point kink costs a short run of nodes on each
+ * side. A curve that needs more than the maximum is refused.
+ */
+#define RT_LAB_TOOLS_REGION_LUT_NODES 32768u
+#define RT_LAB_TOOLS_REGION_LUT_STRIDE (1u + 2u * RT_LAB_TOOLS_REGION_LUT_NODES)
+/* Per-region floats, indexed by the RT_LAB_TOOLS_REGION_* constants below. */
+#define RT_LAB_TOOLS_REGION_PARAM_STRIDE 14u
+#define RT_LAB_TOOLS_REGION_CHROMA_DOMAIN 4.0f
+#define RT_LAB_TOOLS_REGION_LIGHT_DOMAIN 4.0f
+/* The region sliders' ABI ranges. A value outside them is a residual. The
+ * a/b correction is the LabGrid widget's normalised value, which is bounded
+ * by the GUI at +-1; the range admits the larger values a hand-edited profile
+ * can carry without letting abcoord() overflow the device's float. */
+#define RT_LAB_TOOLS_REGION_MAX_AB 20.0
+#define RT_LAB_TOOLS_REGION_MAX_SATURATION 100.0
+#define RT_LAB_TOOLS_REGION_MIN_SLOPE 0.1
+#define RT_LAB_TOOLS_REGION_MAX_SLOPE 4.0
+#define RT_LAB_TOOLS_REGION_MAX_OFFSET 0.1
+#define RT_LAB_TOOLS_REGION_MIN_POWER 0.1
+#define RT_LAB_TOOLS_REGION_MAX_POWER 4.0
+#define RT_LAB_TOOLS_REGION_MIN_BLUR -10.0
+#define RT_LAB_TOOLS_REGION_MAX_BLUR 100.0
+/* Region parameter slots. */
+#define RT_LAB_TOOLS_REGION_ABCA 0u
+#define RT_LAB_TOOLS_REGION_ABCB 1u
+#define RT_LAB_TOOLS_REGION_RS 2u
+#define RT_LAB_TOOLS_REGION_SLOPE 3u
+#define RT_LAB_TOOLS_REGION_OFFSET 4u
+#define RT_LAB_TOOLS_REGION_POWER 5u
+#define RT_LAB_TOOLS_REGION_CHANNEL 6u
+#define RT_LAB_TOOLS_REGION_MASK_BLUR 7u
+#define RT_LAB_TOOLS_REGION_RADIUS_AB 8u
+#define RT_LAB_TOOLS_REGION_RADIUS_L 9u
+#define RT_LAB_TOOLS_REGION_HUE_ACTIVE 10u
+#define RT_LAB_TOOLS_REGION_CHROMA_ACTIVE 11u
+#define RT_LAB_TOOLS_REGION_LIGHT_ACTIVE 12u
+#define RT_LAB_TOOLS_REGION_RESERVED 13u
 
 typedef struct RtLabToolsIirDirection {
     /* The SSE float lane: B, b1, b2, b3 and sse_M narrowed to float, which is
@@ -190,6 +245,26 @@ typedef struct RtLabToolsResult {
     float local_contrast_darkness;
     float local_contrast_lightness;
     const RtLabToolsIir* local_contrast_iir;
+    /*
+     * The Lab-region set. `region_count` is 0 when no region pass runs.
+     * `region_luts` holds region_count * 3 * region_lut_entries floats,
+     * region-major and hue/chroma/lightness in that order; an inactive curve's
+     * slice is zero and is never read. `region_params` is region_count
+     * RT_LAB_TOOLS_REGION_PARAM_STRIDE floats, indexed by the
+     * RT_LAB_TOOLS_REGION_* slots.
+     */
+    const float* region_luts;
+    const float* region_params;
+    /*
+     * The working matrices at the host's full double precision. The region
+     * CDL and channel-copy round trips are host double matrix products; the
+     * float matrices above are one ulp away and can move a gamut-edge sample
+     * by two LSB16, so the region program reads these instead.
+     */
+    const double* ws_double;
+    const double* iws_double;
+    uint32_t region_count;
+    uint32_t region_lut_stride;
 } RtLabToolsResult;
 
 
@@ -292,6 +367,21 @@ bool labToolsLocalContrastActive(const procparams::ProcParams& params);
  * are separate: a pass whose tables are all the identity still rewrites L, a
  * and b through the block's divides, so it is not a no-op. */
 bool labToolsLabCurveActive(const procparams::ProcParams& params);
+/*
+ * True when the colour-toning method is LabRegions and the bounded set holds:
+ * no mask display, one to four regions, every mask curve empty, FCT_Linear or
+ * a FlatCurve the host can sample faithfully, and every slider inside the ABI
+ * range. The predicate and the setup apply the same checks, so a refused
+ * profile never reaches the launcher as a device configuration.
+ */
+bool labToolsRegionsActive(const procparams::ProcParams& params);
+/* guidedfilter.cc's file-local calculate_subsampling(): the guided-filter
+ * subsampling the region pass gets when it passes no explicit value. */
+int labToolsRegionSubsampling(int width, int height, int radius);
+/* The block's r1/r2 derivation from a region's maskBlur and the call site's
+ * scale. */
+void labToolsRegionRadii(double mask_blur, int scale, int* radius_ab,
+                         int* radius_l);
 
 
 /*
@@ -354,6 +444,8 @@ private:
     std::vector<float> lut_shadow_;
     float ws_[9] = {};
     float iws_[9] = {};
+    double ws_double_[9] = {};
+    double iws_double_[9] = {};
     std::vector<float> cachef_;
     std::vector<float> cachefy_;
     std::vector<float> munsell_;
@@ -388,6 +480,9 @@ private:
     float local_contrast_darkness_ = 1.f;
     float local_contrast_lightness_ = 1.f;
     RtLabToolsIir local_contrast_iir_ = {};
+    bool regions_active_ = false;
+    std::vector<float> region_luts_;
+    std::vector<float> region_params_;
 };
 
 } // namespace rtengine::stage

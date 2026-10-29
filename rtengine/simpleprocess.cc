@@ -2011,13 +2011,14 @@ private:
 
         /*
          * The device node is opt-in and covers the LabGrid pass,
-         * shadows/highlights, the Lab curves and vibrance. Everything else in
-         * the block is a residual: the node is not submitted as supported, the
-         * launcher refuses it and the builtin below runs the host block,
-         * recording impl=host. The launcher also refuses vibrance and the
-         * Lab-curve pass on a GPU device, whose arithmetic rounding can move a
-         * Munsell-limit pixel, and the Lab-curve pass on a device without
-         * fp64, whose tables index a double-rounded chroma.
+         * shadows/highlights, the Lab curves, vibrance, local contrast and the
+         * bounded Lab-region set. Everything else in the block is a residual:
+         * the node is not submitted as supported, the launcher refuses it and
+         * the builtin below runs the host block, recording impl=host. The
+         * launcher also refuses vibrance, the Lab-curve pass, local contrast
+         * and regions on a GPU device, whose arithmetic rounding can move a
+         * Munsell-limit pixel or the region mask, and the Lab-curve,
+         * local-contrast and region passes on a device without fp64.
          */
         if (stage::node_device("lab.tools") == stage::StageNodeDevice::OpenCL) {
             const bool supported = stage::labToolsSupported(params);
@@ -2026,7 +2027,7 @@ private:
             const bool deviceReady = supported && context.build(setup) == 0;
             RtLabToolsContext descriptor = context.descriptor(deviceReady);
 
-            RtStageArg args[63] = {};
+            RtStageArg args[69] = {};
             args[0].kind = RT_STAGE_ARG_BUFFER;
             args[0].u.buffer = stage::view(*labView);
             args[1].kind = RT_STAGE_ARG_PTR;
@@ -2164,6 +2165,24 @@ private:
             args[62].u.ptr =
                 deviceReady ? setup.local_contrast_iir : nullptr;
 
+            /*
+             * Lab regions. The count is the context's region set; the mask
+             * tables and per-region floats are uploaded from the host build.
+             */
+            args[63].kind = RT_STAGE_ARG_INT;
+            args[63].u.i = deviceReady ? setup.region_count : 0;
+            args[64].kind = RT_STAGE_ARG_BUFFER;
+            args[65].kind = RT_STAGE_ARG_INT;
+            args[65].u.i = deviceReady
+                               ? static_cast<std::int64_t>(
+                                     setup.region_lut_stride)
+                               : 0;
+            args[66].kind = RT_STAGE_ARG_BUFFER;
+            args[67].kind = RT_STAGE_ARG_PTR;
+            args[67].u.ptr = deviceReady ? setup.ws_double : nullptr;
+            args[68].kind = RT_STAGE_ARG_PTR;
+            args[68].u.ptr = deviceReady ? setup.iws_double : nullptr;
+
             for (int index = 16; index < 22; ++index) {
                 args[index].kind = RT_STAGE_ARG_BUFFER;
             }
@@ -2218,6 +2237,19 @@ private:
                         setup.munsell_sizes,
                         static_cast<int>(RT_LAB_TOOLS_MUNSELL_TABLES));
                 }
+                if (setup.region_count != 0) {
+                    args[64].u.buffer = host_buffer(
+                        setup.region_luts,
+                        static_cast<int>(
+                            setup.region_count *
+                            RT_LAB_TOOLS_REGION_CURVES *
+                            setup.region_lut_stride));
+                    args[66].u.buffer = host_buffer(
+                        setup.region_params,
+                        static_cast<int>(
+                            setup.region_count *
+                            RT_LAB_TOOLS_REGION_PARAM_STRIDE));
+                }
                 if (setup.lab_curve_active != 0) {
                     args[48].u.buffer = host_buffer(
                         setup.lab_curve_l,
@@ -2242,7 +2274,7 @@ private:
 
             RtStageProfiling profiling{};
             if (stage::run("lab.tools",
-                           std::vector<RtStageArg>(args, args + 63),
+                           std::vector<RtStageArg>(args, args + 69),
                            &profiling) == RT_STAGE_OK) {
                 return;
             }

@@ -489,12 +489,17 @@ inline float rt_lt_cbrt(float d)
 /* LUTf::operator[](float) with LUT_CLIP_BELOW: Color::cachef[]'s access. */
 inline float rt_lt_cache_lookup(__global const float* table, const float value)
 {
-    int index = (int)value;
+    /* LUTf::operator[] with LUT_CLIP_BELOW | LUT_CLIP_ABOVE: maxs is size-2,
+     * so values above it return the last entry rather than interpolating from
+     * the second-to-last one. */
+    const int last = (int)RT_LT_MAXVAL - 1;
     if (value < 0.0f) {
-        index = 0;
-    } else if (value > RT_LT_MAXVAL - 2.0f) {
-        index = 65534;
+        return table[0];
     }
+    if (value > (float)last) {
+        return table[last + 1];
+    }
+    const int index = (int)value;
     const float fraction = value - (float)index;
     const float low = table[index];
     return low + (table[index + 1] - low) * fraction;
@@ -504,8 +509,10 @@ inline float rt_lt_cache_lookup(__global const float* table, const float value)
 inline float rt_lt_compute_f(const float value, __global const float* cache)
 {
     if (value < 0.0f) {
-        return 327.68f * ((RT_LT_KAPPA * value / RT_LT_MAXVAL + 16.0f) /
-                          116.0f);
+        /* Color::computeXYZ2Lab()'s negative branch is a double expression:
+         * kappa, the scale and the offsets are double literals there. */
+        return (float)(327.68 * ((903.2962962962963 * (double)value /
+                                  65535.0 + 16.0) / 116.0));
     }
     if (value > RT_LT_MAXVAL) {
         return 327.68f * rt_lt_cbrt(value / RT_LT_MAXVAL);
@@ -517,7 +524,8 @@ inline float rt_lt_compute_f(const float value, __global const float* cache)
 inline float rt_lt_compute_fy(const float value, __global const float* cache)
 {
     if (value < 0.0f) {
-        return 327.68f * (RT_LT_KAPPA * value / RT_LT_MAXVAL);
+        return (float)(327.68 * (903.2962962962963 * (double)value /
+                                 65535.0));
     }
     if (value > RT_LT_MAXVAL) {
         return 327.68f * (116.0f * rt_lt_cbrt(value / RT_LT_MAXVAL) - 16.0f);

@@ -58,6 +58,7 @@
 #include "stage/algorithms/lab_tools_cl.h"
 #include "stage/algorithms/local_contrast_cl.h"
 #include "stage/algorithms/lab_curve_cl.h"
+#include "stage/algorithms/lab_regions_cl.h"
 #include "stage/algorithms/munsell_lch_cl.h"
 #include "stage/algorithms/vibrance_cl.h"
 #include "stage/algorithms/working_trc_cl.h"
@@ -802,6 +803,23 @@ const std::string& lab_curve_source()
 }
 
 /*
+ * The Lab-region program. The mask product, the hue mapping, the working
+ * matrix products and the rgbLuminance() overload the block calls are double
+ * expressions, so the program needs fp64 and is built only on a device that
+ * advertises it. It reuses lab_tools_cl.h's Lab helpers but none of its
+ * kernels.
+ */
+const std::string& lab_regions_source()
+{
+    static const std::string source =
+        std::string("#pragma OPENCL FP_CONTRACT OFF\n"
+                    "#pragma STDC FP_CONTRACT OFF\n"
+                    "#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n") +
+        RT_LAB_TOOLS_CL + RT_LAB_REGIONS_CL;
+    return source;
+}
+
+/*
  * The local-contrast program. gaussianBlur() above sigma 25 recurs in double
  * and the SSE path's tail lines evaluate in double too, so the program needs
  * fp64 and is built only on a device that advertises it. The launcher refuses
@@ -1253,6 +1271,7 @@ const std::vector<KernelDef>& kernels()
         {"lab.tools", lab_tools_source().c_str(), "rt_lab_tools_mask"},
         {"lab.tools.labcurve", lab_curve_source().c_str(), "rt_lab_tools_lab_curve"},
         {"lab.tools.localcontrast", local_contrast_source().c_str(), "rt_lab_tools_lc_line"},
+        {"lab.tools.regions", lab_regions_source().c_str(), "rt_lab_tools_region_mask"},
         {"output.sharpen", RT_SHARPEN_CL, "rt_sharpen_mask"},
         {"framing", framing_source().c_str(), "rt_framing"},
         {"thumbnail.whitebalance", thumbnail_wb_source().c_str(), "rt_thumbnail_wb"},
@@ -3353,12 +3372,16 @@ RtStageStatus run_working_trc(const std::shared_ptr<OpenCLEnv>& env,
  *        would run),
  *   [57] int radius, [58] double amount, [59] double darkness,
  *   [60] double lightness, [61] int the block's scale,
- *   [62] PTR host-built RtLabToolsIir coefficients (host-only, never uploaded).
+ *   [62] PTR host-built RtLabToolsIir coefficients (host-only, never uploaded),
+ *   [63] int region count (0 or 1..4), [64] BUFFER the region mask tables,
+ *   [65] int their stride, [66] BUFFER the per-region parameters,
+ *   [67] and [68] PTR the working and inverse matrices as nine doubles each
+ *        (host-only, copied to a device buffer).
  *
  * The pass order is the block's own: LabGrid, then the highlight round, then
  * the shadow round, then local contrast, then the Lab-curve pass, then
- * vibrance. Each tool writes the full image, so the work is sequential in that
- * order and no pass can run out of order.
+ * vibrance, then the regions in region order. Each tool writes the full image,
+ * so the work is sequential in that order and no pass can run out of order.
  *
  * A clear support flag refuses before the upload: that is the residual path,
  * and it makes the CPU builtin - the extracted host block - execute and record
@@ -3370,7 +3393,7 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
                             const std::vector<RtStageArg>& args,
                             std::string& error)
 {
-    constexpr std::size_t ARG_COUNT = 63;
+    constexpr std::size_t ARG_COUNT = 69;
     constexpr int SUBSAMPLING = 4;
     /* guidedfilter.h's epsilon, passed to f_mean() by shadowsHighlights(). */
     constexpr float LAB_TOOLS_EPSILON = 0.075f;
@@ -3426,6 +3449,12 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
     }
     kinds = kinds && args[61].kind == RT_STAGE_ARG_INT &&
             args[62].kind == RT_STAGE_ARG_PTR;
+    kinds = kinds && args[63].kind == RT_STAGE_ARG_INT &&
+            args[64].kind == RT_STAGE_ARG_BUFFER &&
+            args[65].kind == RT_STAGE_ARG_INT &&
+            args[66].kind == RT_STAGE_ARG_BUFFER &&
+            args[67].kind == RT_STAGE_ARG_PTR &&
+            args[68].kind == RT_STAGE_ARG_PTR;
     if (!kinds) {
         error = "lab.tools has an argument of the wrong kind";
         return RT_STAGE_INVALID;
@@ -3711,8 +3740,130 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
         }
     }
 
+    /*
+     * Lab regions. A nonzero count is the call site's
+     * labToolsRegionsActive(): the LabRegions method inside the bounded set.
+     * The host ships the mask tables and the per-region floats; the launcher
+     * revalidates every value so a direct submission cannot feed the kernel
+     * something the predicate would refuse.
+     */
+    const std::int64_t region_count_arg = args[63].u.i;
+    if (region_count_arg < 0 ||
+        region_count_arg >
+            static_cast<std::int64_t>(RT_LAB_TOOLS_MAX_REGIONS)) {
+        error = "lab.tools region count is outside its range";
+        return RT_STAGE_INVALID;
+    }
+    const int region_count = static_cast<int>(region_count_arg);
+    const bool regions = region_count > 0;
+    int region_lut_stride = 0;
+    if (regions) {
+        const std::int64_t stride = args[65].u.i;
+        if (stride !=
+            static_cast<std::int64_t>(RT_LAB_TOOLS_REGION_LUT_STRIDE)) {
+            error = "lab.tools region table length is outside its range";
+            return RT_STAGE_INVALID;
+        }
+        region_lut_stride = static_cast<int>(stride);
+
+        const RtStageBuffer& luts = args[64].u.buffer;
+        const std::int64_t expected_luts =
+            static_cast<std::int64_t>(region_count) *
+            static_cast<std::int64_t>(RT_LAB_TOOLS_REGION_CURVES) *
+            static_cast<std::int64_t>(region_lut_stride);
+        if (!valid(luts) || luts.format != RT_STAGE_F32 ||
+            luts.planes != 1 || luts.height != 1 ||
+            luts.width != expected_luts) {
+            error = "lab.tools needs the region mask tables";
+            return RT_STAGE_INVALID;
+        }
+        const RtStageBuffer& table = args[66].u.buffer;
+        const std::int64_t expected_params =
+            static_cast<std::int64_t>(region_count) *
+            static_cast<std::int64_t>(RT_LAB_TOOLS_REGION_PARAM_STRIDE);
+        if (!valid(table) || table.format != RT_STAGE_F32 ||
+            table.planes != 1 || table.height != 1 ||
+            table.width != expected_params) {
+            error = "lab.tools needs the region parameter table";
+            return RT_STAGE_INVALID;
+        }
+        if (args[67].u.ptr == nullptr || args[68].u.ptr == nullptr) {
+            error = "lab.tools needs the region working matrices";
+            return RT_STAGE_INVALID;
+        }
+        const float* values = static_cast<const float*>(table.data);
+        for (int region = 0; region < region_count; ++region) {
+            const float* p =
+                values + region * RT_LAB_TOOLS_REGION_PARAM_STRIDE;
+            for (std::size_t slot = 0;
+                 slot < RT_LAB_TOOLS_REGION_PARAM_STRIDE; ++slot) {
+                if (!std::isfinite(p[slot])) {
+                    error = "lab.tools has a non-finite region parameter";
+                    return RT_STAGE_INVALID;
+                }
+            }
+            const int channel = static_cast<int>(p[RT_LAB_TOOLS_REGION_CHANNEL]);
+            const float radius_ab = p[RT_LAB_TOOLS_REGION_RADIUS_AB];
+            const float radius_l = p[RT_LAB_TOOLS_REGION_RADIUS_L];
+            if (channel < -1 || channel > 2 ||
+                p[RT_LAB_TOOLS_REGION_RS] < 0.0f ||
+                p[RT_LAB_TOOLS_REGION_RS] > 3.0f ||
+                p[RT_LAB_TOOLS_REGION_SLOPE] <= 0.0f ||
+                p[RT_LAB_TOOLS_REGION_POWER] <= 0.0f ||
+                radius_ab < 1.0f || radius_l < 1.0f ||
+                radius_ab != std::floor(radius_ab) ||
+                radius_l != std::floor(radius_l)) {
+                error = "lab.tools has a region parameter outside its range";
+                return RT_STAGE_INVALID;
+            }
+            const std::size_t active_slots[] = {
+                static_cast<std::size_t>(RT_LAB_TOOLS_REGION_HUE_ACTIVE),
+                static_cast<std::size_t>(RT_LAB_TOOLS_REGION_CHROMA_ACTIVE),
+                static_cast<std::size_t>(RT_LAB_TOOLS_REGION_LIGHT_ACTIVE)};
+            for (std::size_t slot : active_slots) {
+                if (p[slot] != 0.0f && p[slot] != 1.0f) {
+                    error = "lab.tools has a region mask flag outside its "
+                            "range";
+                    return RT_STAGE_INVALID;
+                }
+            }
+
+            const float* tables =
+                static_cast<const float*>(luts.data);
+            for (int curve = 0;
+                 curve < static_cast<int>(RT_LAB_TOOLS_REGION_CURVES);
+                 ++curve) {
+                if (p[active_slots[curve]] == 0.0f) {
+                    continue;
+                }
+                const float* table =
+                    tables +
+                    (region * RT_LAB_TOOLS_REGION_CURVES + curve) *
+                        region_lut_stride;
+                const int nodes = static_cast<int>(table[0]);
+                if (nodes < 2 ||
+                    nodes >
+                        static_cast<int>(RT_LAB_TOOLS_REGION_LUT_NODES)) {
+                    error = "lab.tools has a region table with a bad node "
+                            "count";
+                    return RT_STAGE_INVALID;
+                }
+                const float* xs = table + 1;
+                const float* ys = table + 1 + nodes;
+                for (int node = 0; node < nodes; ++node) {
+                    if (!std::isfinite(xs[node]) ||
+                        !std::isfinite(ys[node]) ||
+                        (node > 0 && xs[node] <= xs[node - 1])) {
+                        error = "lab.tools has a malformed region table";
+                        return RT_STAGE_INVALID;
+                    }
+                }
+            }
+        }
+    }
+
     if (!labgrid && !sh_active && !vibrance && !lab_curve &&
-        !local_contrast) {
+        !local_contrast && !regions) {
         error = "lab.tools has no enabled tool";
         return RT_STAGE_FALLBACK;
     }
@@ -3728,7 +3879,7 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
      * three only on a CPU OpenCL device (POCL), the deterministic device the
      * project uses for parity, and records impl=host elsewhere.
      */
-    if (vibrance || lab_curve || local_contrast) {
+    if (vibrance || lab_curve || local_contrast || regions) {
         cl_device_type device_type = 0;
         if (env->api->GetDeviceInfo(env->device, CL_DEVICE_TYPE,
                                     sizeof(device_type), &device_type,
@@ -3745,7 +3896,7 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
      * recurrence, so both need an fp64 device. A device without fp64 cannot
      * build either program; the pass stays on the host.
      */
-    if (lab_curve || local_contrast) {
+    if (lab_curve || local_contrast || regions) {
         cl_device_fp_config fp_config = 0;
         if (env->api->GetDeviceInfo(env->device, CL_DEVICE_DOUBLE_FP_CONFIG,
                                     sizeof(fp_config), &fp_config,
@@ -3886,8 +4037,42 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
         error = "lab.tools Lab buffer pitch does not cover the image";
         return RT_STAGE_INVALID;
     }
-    const int sw = width / SUBSAMPLING;
-    const int sh = height / SUBSAMPLING;
+    /*
+     * The region pass picks guidedFilter()'s default subsampling from the
+     * image size and each radius. The buffers are sized for the smallest
+     * subsampling any pass needs, so the shadows/highlights explicit
+     * subsampling of four and every region radius share one set of scratch
+     * planes.
+     */
+    std::vector<int> region_radius_ab;
+    std::vector<int> region_radius_l;
+    std::vector<int> region_subsampling_ab;
+    std::vector<int> region_subsampling_l;
+    int sub_subsampling = SUBSAMPLING;
+    if (regions) {
+        const float* values =
+            static_cast<const float*>(args[66].u.buffer.data);
+        for (int region = 0; region < region_count; ++region) {
+            const float* p =
+                values + region * RT_LAB_TOOLS_REGION_PARAM_STRIDE;
+            const int radius_ab =
+                static_cast<int>(p[RT_LAB_TOOLS_REGION_RADIUS_AB]);
+            const int radius_l =
+                static_cast<int>(p[RT_LAB_TOOLS_REGION_RADIUS_L]);
+            const int subsampling_ab =
+                labToolsRegionSubsampling(width, height, radius_ab);
+            const int subsampling_l =
+                labToolsRegionSubsampling(width, height, radius_l);
+            region_radius_ab.push_back(radius_ab);
+            region_radius_l.push_back(radius_l);
+            region_subsampling_ab.push_back(subsampling_ab);
+            region_subsampling_l.push_back(subsampling_l);
+            sub_subsampling = std::min(
+                sub_subsampling, std::min(subsampling_ab, subsampling_l));
+        }
+    }
+    const int sw = width / sub_subsampling;
+    const int sh = height / sub_subsampling;
     if (sw < 3 || sh < 3) {
         error = "lab.tools image is too small for the guided filter";
         return RT_STAGE_FALLBACK;
@@ -3937,13 +4122,31 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
         local_contrast ? compiled_kernel_entry(env, lc_def,
                                                "rt_lab_tools_lc_blend", error)
                        : nullptr;
+    const KernelDef* region_def = find_kernel("lab.tools.regions");
+    assert(region_def != nullptr);
+    cl_kernel region_mask_kernel =
+        regions ? compiled_kernel_entry(env, region_def,
+                                        "rt_lab_tools_region_mask", error)
+                : nullptr;
+    cl_kernel region_upsample_kernel =
+        regions ? compiled_kernel_entry(env, region_def,
+                                        "rt_lab_tools_region_upsample",
+                                        error)
+                : nullptr;
+    cl_kernel region_apply_kernel =
+        regions ? compiled_kernel_entry(env, region_def,
+                                        "rt_lab_tools_region_apply", error)
+                : nullptr;
     if (mask_kernel == nullptr || subsample_kernel == nullptr ||
         box_h_kernel == nullptr || box_v_kernel == nullptr ||
         combine_kernel == nullptr || upsample_kernel == nullptr ||
         apply_kernel == nullptr || labgrid_kernel == nullptr ||
         vibrance_kernel == nullptr || (lab_curve && lab_curve_kernel == nullptr) ||
         (local_contrast && (lc_line_kernel == nullptr ||
-                            lc_blend_kernel == nullptr))) {
+                            lc_blend_kernel == nullptr)) ||
+        (regions && (region_mask_kernel == nullptr ||
+                     region_upsample_kernel == nullptr ||
+                     region_apply_kernel == nullptr))) {
         return RT_STAGE_FALLBACK;
     }
 
@@ -4073,6 +4276,40 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
         lc_h_device = residency->acquire(&lc_h_key, lc_shape, &error);
         lc_v_device = residency->acquire(&lc_v_key, lc_shape, &error);
     }
+
+    /*
+     * The region pass keeps the original Lab snapshot for every region's mask
+     * (the block builds every mask before it applies any region), the two
+     * filtered masks, and the host-built tables.
+     */
+    char snapshot_key = 0;
+    char region_masks_key = 0;
+    char region_luts_key = 0;
+    char region_params_key = 0;
+    const StageBufferShape region_masks_shape{RT_STAGE_F32, width, height, 2};
+    const StageBufferShape region_luts_shape{
+        RT_STAGE_F32,
+        region_count * static_cast<int>(RT_LAB_TOOLS_REGION_CURVES) *
+            region_lut_stride,
+        1, 1};
+    const StageBufferShape region_params_shape{
+        RT_STAGE_F32,
+        region_count *
+            static_cast<int>(RT_LAB_TOOLS_REGION_PARAM_STRIDE),
+        1, 1};
+    StageDeviceBufferPtr snapshot_device;
+    StageDeviceBufferPtr region_masks_device;
+    StageDeviceBufferPtr region_luts_device;
+    StageDeviceBufferPtr region_params_device;
+    if (regions) {
+        snapshot_device = residency->acquire(&snapshot_key, lab_shape, &error);
+        region_masks_device =
+            residency->acquire(&region_masks_key, region_masks_shape, &error);
+        region_luts_device =
+            residency->acquire(&region_luts_key, region_luts_shape, &error);
+        region_params_device = residency->acquire(
+            &region_params_key, region_params_shape, &error);
+    }
     if (!lab_device || !full || !sub_i1 || !sub_p1 || !sub_meani ||
         !sub_meanp || !sub_temp || !lut_highlight_device ||
         !lut_shadow_device || !ws_device || !iws_device || !cachef_device ||
@@ -4083,7 +4320,9 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
         (lab_curve &&
          (!lcurve_device || !acurve_device || !bcurve_device ||
           !satcurve_device || !lhskcurve_device || !clcurve_device)) ||
-        (local_contrast && (!lc_h_device || !lc_v_device))) {
+        (local_contrast && (!lc_h_device || !lc_v_device)) ||
+        (regions && (!snapshot_device || !region_masks_device ||
+                     !region_luts_device || !region_params_device))) {
         return RT_STAGE_FALLBACK;
     }
 
@@ -4111,7 +4350,12 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
           !upload(bcurve_device, bcurve, "bcurve") ||
           !upload(satcurve_device, satcurve, "satcurve") ||
           !upload(lhskcurve_device, lhskcurve, "lhskcurve") ||
-          !upload(clcurve_device, clcurve, "clcurve")))) {
+          !upload(clcurve_device, clcurve, "clcurve"))) ||
+        (regions &&
+         (!upload(snapshot_device, lab, "region snapshot") ||
+          !upload(region_luts_device, args[64].u.buffer, "region tables") ||
+          !upload(region_params_device, args[66].u.buffer,
+                  "region parameters")))) {
         return RT_STAGE_FALLBACK;
     }
 
@@ -4130,6 +4374,24 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
         lab_device, full, sub_i1, sub_p1, sub_meani, sub_meanp, sub_temp,
         lut_highlight_device, lut_shadow_device, ws_device, iws_device,
         cachef_device, cachefy_device};
+    const StageDeviceBufferPtr region_buffers[] = {
+        snapshot_device, region_masks_device, region_luts_device,
+        region_params_device};
+    for (const StageDeviceBufferPtr& buffer : region_buffers) {
+        if (buffer == nullptr) {
+            continue;
+        }
+        if (buffer->row_pitch() % sizeof(float) != 0 ||
+            buffer->plane_pitch() % sizeof(float) != 0 ||
+            pitch_of(buffer) <
+                static_cast<std::size_t>(buffer->shape().width) ||
+            plane_pitch_of(buffer) <
+                static_cast<std::size_t>(buffer->shape().height) *
+                    pitch_of(buffer)) {
+            error = "lab.tools region buffer pitch does not cover its table";
+            return RT_STAGE_FALLBACK;
+        }
+    }
     for (const StageDeviceBufferPtr& buffer : buffers) {
         if (buffer->row_pitch() % sizeof(float) != 0 ||
             buffer->plane_pitch() % sizeof(float) != 0 ||
@@ -4200,6 +4462,13 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
     cl_mem clcurve_memory = lab_curve ? memory_of(clcurve_device) : nullptr;
     cl_mem lc_h_memory = local_contrast ? memory_of(lc_h_device) : nullptr;
     cl_mem lc_v_memory = local_contrast ? memory_of(lc_v_device) : nullptr;
+    cl_mem snapshot_memory = regions ? memory_of(snapshot_device) : nullptr;
+    cl_mem region_masks_memory =
+        regions ? memory_of(region_masks_device) : nullptr;
+    cl_mem region_luts_memory =
+        regions ? memory_of(region_luts_device) : nullptr;
+    cl_mem region_params_memory =
+        regions ? memory_of(region_params_device) : nullptr;
     if (lab_memory == nullptr || full_memory == nullptr ||
         i1_memory == nullptr || p1_memory == nullptr ||
         meani_memory == nullptr || meanp_memory == nullptr ||
@@ -4214,19 +4483,28 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
          (lcurve_memory == nullptr || acurve_memory == nullptr ||
           bcurve_memory == nullptr || satcurve_memory == nullptr ||
           lhskcurve_memory == nullptr || clcurve_memory == nullptr)) ||
-        (local_contrast && (lc_h_memory == nullptr || lc_v_memory == nullptr))) {
+        (local_contrast && (lc_h_memory == nullptr || lc_v_memory == nullptr)) ||
+        (regions && (snapshot_memory == nullptr ||
+                     region_masks_memory == nullptr ||
+                     region_luts_memory == nullptr ||
+                     region_params_memory == nullptr))) {
         error = "lab.tools could not address its device buffers";
         return RT_STAGE_FALLBACK;
     }
 
     const cl_int cl_width = width;
     const cl_int cl_height = height;
-    const cl_int cl_sw = sw;
-    const cl_int cl_sh = sh;
+    /* shadows/highlights passes an explicit subsampling of four. */
+    const cl_int cl_sw_sh = width / SUBSAMPLING;
+    const cl_int cl_sh_sh = height / SUBSAMPLING;
     const cl_int lab_pitch = static_cast<cl_int>(pitch_of(lab_device));
     const cl_int lab_plane = static_cast<cl_int>(plane_pitch_of(lab_device));
     const cl_int full_pitch = static_cast<cl_int>(pitch_of(full));
     const cl_int full_plane = static_cast<cl_int>(plane_pitch_of(full));
+    const cl_int region_mask_pitch =
+        regions ? static_cast<cl_int>(pitch_of(region_masks_device)) : 0;
+    const cl_int region_mask_plane =
+        regions ? static_cast<cl_int>(plane_pitch_of(region_masks_device)) : 0;
     const cl_int sub_pitch = static_cast<cl_int>(pitch_of(sub_i1));
     /* The five subsampled buffers are allocated from the same shape, so the
      * layout helper gives them one pitch; refuse rather than mix layouts. */
@@ -4242,6 +4520,8 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
         lab_plane > std::numeric_limits<cl_int>::max() / 3 ||
         full_pitch > std::numeric_limits<cl_int>::max() / 3 ||
         full_plane > std::numeric_limits<cl_int>::max() / 3 ||
+        region_mask_pitch > std::numeric_limits<cl_int>::max() / 2 ||
+        region_mask_plane > std::numeric_limits<cl_int>::max() / 2 ||
         sub_pitch > std::numeric_limits<cl_int>::max() / 2 ||
         sw > std::numeric_limits<cl_int>::max() / 2 ||
         sh > std::numeric_limits<cl_int>::max() / 2) {
@@ -4332,35 +4612,28 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
 
     const std::size_t image_global[2] = {static_cast<std::size_t>(width),
                                          static_cast<std::size_t>(height)};
-    const std::size_t sub_global[2] = {static_cast<std::size_t>(sw),
-                                       static_cast<std::size_t>(sh)};
-    const std::size_t row_global[2] = {1, static_cast<std::size_t>(sh)};
-    const std::size_t column_global[2] = {static_cast<std::size_t>(sw), 1};
-
-    const float sub_col_scale =
-        static_cast<float>(width) / static_cast<float>(sw);
-    const float sub_row_scale =
-        static_cast<float>(height) / static_cast<float>(sh);
-    const float up_col_scale =
-        static_cast<float>(sw) / static_cast<float>(width);
-    const float up_row_scale =
-        static_cast<float>(sh) / static_cast<float>(height);
-
-    const auto box_blur = [&](cl_mem src, cl_mem dst, cl_int box_radius) {
+    const auto box_blur = [&](cl_mem src, cl_mem dst, cl_int box_radius,
+                              cl_int grid_width, cl_int grid_height) {
         cl_mem temp = temp_memory;
+        const std::size_t row[2] = {1,
+                                    static_cast<std::size_t>(grid_height)};
+        const std::size_t column[2] = {
+            static_cast<std::size_t>(grid_width), 1};
         cl_uint arg = 0;
         bool ok = true;
         ok = ok && set_arg(box_h_kernel, arg++, sizeof(cl_mem), &src);
         ok = ok && set_arg(box_h_kernel, arg++, sizeof(cl_mem), &temp);
         ok = ok && set_arg(box_h_kernel, arg++, sizeof(cl_int), &box_radius);
-        ok = ok && set_arg(box_h_kernel, arg++, sizeof(cl_int), &cl_sw);
-        ok = ok && set_arg(box_h_kernel, arg++, sizeof(cl_int), &cl_sh);
+        ok = ok && set_arg(box_h_kernel, arg++, sizeof(cl_int),
+                           &grid_width);
+        ok = ok && set_arg(box_h_kernel, arg++, sizeof(cl_int),
+                           &grid_height);
         ok = ok && set_arg(box_h_kernel, arg++, sizeof(cl_int), &sub_pitch);
         if (!ok) {
             error = "lab.tools box blur arguments failed";
             return false;
         }
-        if (!launch(box_h_kernel, row_global, "lab.tools horizontal box blur")) {
+        if (!launch(box_h_kernel, row, "lab.tools horizontal box blur")) {
             return false;
         }
 
@@ -4371,14 +4644,16 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
         ok = ok && set_arg(box_v_kernel, arg++, sizeof(cl_mem), &temp);
         ok = ok && set_arg(box_v_kernel, arg++, sizeof(cl_mem), &dst);
         ok = ok && set_arg(box_v_kernel, arg++, sizeof(cl_int), &box_radius);
-        ok = ok && set_arg(box_v_kernel, arg++, sizeof(cl_int), &cl_sw);
-        ok = ok && set_arg(box_v_kernel, arg++, sizeof(cl_int), &cl_sh);
+        ok = ok && set_arg(box_v_kernel, arg++, sizeof(cl_int),
+                           &grid_width);
+        ok = ok && set_arg(box_v_kernel, arg++, sizeof(cl_int),
+                           &grid_height);
         ok = ok && set_arg(box_v_kernel, arg++, sizeof(cl_int), &sub_pitch);
         if (!ok) {
             error = "lab.tools box blur arguments failed";
             return false;
         }
-        return launch(box_v_kernel, column_global,
+        return launch(box_v_kernel, column,
                       "lab.tools vertical box blur");
     };
 
@@ -4388,7 +4663,8 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
      * `c` is ignored by 0 and 2; the caller passes dst for those.
      */
     const auto combine = [&](cl_mem dst, cl_mem a, cl_mem b, cl_mem c,
-                             cl_int op, cl_float epsilon) {
+                             cl_int op, cl_float epsilon, cl_int grid_width,
+                             cl_int grid_height) {
         cl_uint arg = 0;
         bool ok = true;
         ok = ok && set_arg(combine_kernel, arg++, sizeof(cl_mem), &dst);
@@ -4398,13 +4674,18 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
         ok = ok && set_arg(combine_kernel, arg++, sizeof(cl_int), &op);
         ok = ok && set_arg(combine_kernel, arg++, sizeof(cl_float), &epsilon);
         ok = ok && set_arg(combine_kernel, arg++, sizeof(cl_int), &sub_pitch);
-        ok = ok && set_arg(combine_kernel, arg++, sizeof(cl_int), &cl_sw);
-        ok = ok && set_arg(combine_kernel, arg++, sizeof(cl_int), &cl_sh);
+        ok = ok && set_arg(combine_kernel, arg++, sizeof(cl_int),
+                           &grid_width);
+        ok = ok && set_arg(combine_kernel, arg++, sizeof(cl_int),
+                           &grid_height);
         if (!ok) {
             error = "lab.tools guided filter arguments failed";
             return false;
         }
-        return launch(combine_kernel, sub_global, "lab.tools guided filter");
+        const std::size_t global[2] = {
+            static_cast<std::size_t>(grid_width),
+            static_cast<std::size_t>(grid_height)};
+        return launch(combine_kernel, global, "lab.tools guided filter");
     };
 
     /*
@@ -4415,6 +4696,19 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
         const cl_int hl_flag = hl ? 1 : 0;
         const float thresh = shadowsHighlightsThreshold(tonalwidth);
         const float scale_value = shadowsHighlightsScale(thresh, hl);
+        const cl_int sh_sw = cl_sw_sh;
+        const cl_int sh_sh = cl_sh_sh;
+        const std::size_t sh_sub_global[2] = {
+            static_cast<std::size_t>(sh_sw),
+            static_cast<std::size_t>(sh_sh)};
+        const float sh_sub_col_scale =
+            static_cast<float>(width) / static_cast<float>(sh_sw);
+        const float sh_sub_row_scale =
+            static_cast<float>(height) / static_cast<float>(sh_sh);
+        const float sh_up_col_scale =
+            static_cast<float>(sh_sw) / static_cast<float>(width);
+        const float sh_up_row_scale =
+            static_cast<float>(sh_sh) / static_cast<float>(height);
 
         cl_uint arg = 0;
         bool ok = true;
@@ -4445,8 +4739,8 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
                            &i1_memory);
         ok = ok && set_arg(subsample_kernel, arg++, sizeof(cl_mem),
                            &p1_memory);
-        ok = ok && set_arg(subsample_kernel, arg++, sizeof(cl_int), &cl_sw);
-        ok = ok && set_arg(subsample_kernel, arg++, sizeof(cl_int), &cl_sh);
+        ok = ok && set_arg(subsample_kernel, arg++, sizeof(cl_int), &sh_sw);
+        ok = ok && set_arg(subsample_kernel, arg++, sizeof(cl_int), &sh_sh);
         ok = ok && set_arg(subsample_kernel, arg++, sizeof(cl_int), &cl_width);
         ok = ok && set_arg(subsample_kernel, arg++, sizeof(cl_int), &cl_height);
         ok = ok && set_arg(subsample_kernel, arg++, sizeof(cl_int),
@@ -4455,55 +4749,59 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
                            &full_plane);
         ok = ok && set_arg(subsample_kernel, arg++, sizeof(cl_int), &sub_pitch);
         ok = ok && set_arg(subsample_kernel, arg++, sizeof(cl_float),
-                           &sub_col_scale);
+                           &sh_sub_col_scale);
         ok = ok && set_arg(subsample_kernel, arg++, sizeof(cl_float),
-                           &sub_row_scale);
+                           &sh_sub_row_scale);
         if (!ok) {
             error = "lab.tools subsample arguments failed";
             return false;
         }
-        if (!launch(subsample_kernel, sub_global, "lab.tools subsample")) {
+        if (!launch(subsample_kernel, sh_sub_global,
+                    "lab.tools subsample")) {
             return false;
         }
 
         const cl_int rad = guidedFilterBoxRadius(
-            shadowsHighlightsRadius(radius, scale), SUBSAMPLING, sw, sh);
+            shadowsHighlightsRadius(radius, scale), SUBSAMPLING, sh_sw,
+            sh_sh);
         const cl_float epsilon = LAB_TOOLS_EPSILON;
 
         /* meanI and meanp from I1 and p1, which stay intact. */
-        if (!box_blur(i1_memory, meani_memory, rad) ||
-            !box_blur(p1_memory, meanp_memory, rad)) {
+        if (!box_blur(i1_memory, meani_memory, rad, sh_sw, sh_sh) ||
+            !box_blur(p1_memory, meanp_memory, rad, sh_sw, sh_sh)) {
             return false;
         }
         /* corrIp = I1 * p1, then its box mean, in place. */
-        if (!combine(p1_memory, i1_memory, p1_memory, p1_memory, 0, epsilon) ||
-            !box_blur(p1_memory, p1_memory, rad)) {
+        if (!combine(p1_memory, i1_memory, p1_memory, p1_memory, 0, epsilon,
+                     sh_sw, sh_sh) ||
+            !box_blur(p1_memory, p1_memory, rad, sh_sw, sh_sh)) {
             return false;
         }
         /* corrI = I1 * I1, then its box mean, in place. */
         if (!combine(i1_memory, i1_memory, i1_memory, i1_memory, 0,
-                     epsilon) ||
-            !box_blur(i1_memory, i1_memory, rad)) {
+                     epsilon, sh_sw, sh_sh) ||
+            !box_blur(i1_memory, i1_memory, rad, sh_sw, sh_sh)) {
             return false;
         }
         /* varI = corrI - meanI^2, covIp = corrIp - meanI * meanp. */
         if (!combine(i1_memory, meani_memory, meani_memory, i1_memory, 1,
-                     epsilon) ||
+                     epsilon, sh_sw, sh_sh) ||
             !combine(p1_memory, meani_memory, meanp_memory, p1_memory, 1,
-                     epsilon)) {
+                     epsilon, sh_sw, sh_sh)) {
             return false;
         }
         /* a = covIp / (varI + eps), b = meanp - a * meanI. The block's
          * SUBMUL reads its fourth array, so b overwrites covIp while meanp
          * stays intact. */
-        if (!combine(i1_memory, p1_memory, i1_memory, i1_memory, 2, epsilon) ||
+        if (!combine(i1_memory, p1_memory, i1_memory, i1_memory, 2, epsilon,
+                     sh_sw, sh_sh) ||
             !combine(p1_memory, i1_memory, meani_memory, meanp_memory, 1,
-                     epsilon)) {
+                     epsilon, sh_sw, sh_sh)) {
             return false;
         }
         /* meana and meanb, in place. */
-        if (!box_blur(i1_memory, i1_memory, rad) ||
-            !box_blur(p1_memory, p1_memory, rad)) {
+        if (!box_blur(i1_memory, i1_memory, rad, sh_sw, sh_sh) ||
+            !box_blur(p1_memory, p1_memory, rad, sh_sw, sh_sh)) {
             return false;
         }
 
@@ -4515,8 +4813,8 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
                            &p1_memory);
         ok = ok && set_arg(upsample_kernel, arg++, sizeof(cl_mem),
                            &full_memory);
-        ok = ok && set_arg(upsample_kernel, arg++, sizeof(cl_int), &cl_sw);
-        ok = ok && set_arg(upsample_kernel, arg++, sizeof(cl_int), &cl_sh);
+        ok = ok && set_arg(upsample_kernel, arg++, sizeof(cl_int), &sh_sw);
+        ok = ok && set_arg(upsample_kernel, arg++, sizeof(cl_int), &sh_sh);
         ok = ok && set_arg(upsample_kernel, arg++, sizeof(cl_int), &cl_width);
         ok = ok && set_arg(upsample_kernel, arg++, sizeof(cl_int), &cl_height);
         ok = ok && set_arg(upsample_kernel, arg++, sizeof(cl_int), &sub_pitch);
@@ -4525,9 +4823,9 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
         ok = ok && set_arg(upsample_kernel, arg++, sizeof(cl_int),
                            &full_plane);
         ok = ok && set_arg(upsample_kernel, arg++, sizeof(cl_float),
-                           &up_col_scale);
+                           &sh_up_col_scale);
         ok = ok && set_arg(upsample_kernel, arg++, sizeof(cl_float),
-                           &up_row_scale);
+                           &sh_up_row_scale);
         if (!ok) {
             error = "lab.tools upsample arguments failed";
             return false;
@@ -4566,6 +4864,185 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
         }
         return launch(apply_kernel, image_global, "lab.tools blend");
     };
+
+    /*
+     * One region's guidedFilter() with the block's implicit subsampling. The
+     * initial mask and the guide stay in `full` (plane 0 and plane 1), so the
+     * same mask can feed the second radius; the filtered result is written to
+     * one plane of the region-mask buffer.
+     */
+    const auto region_guided_filter = [&](cl_int radius_value,
+                                          cl_float epsilon,
+                                          cl_int subsampling,
+                                          cl_int dst_plane) {
+        const cl_int grid_width = width / subsampling;
+        const cl_int grid_height = height / subsampling;
+        if (grid_width < 3 || grid_height < 3) {
+            error = "lab.tools region grid is too small";
+            return false;
+        }
+        const std::size_t grid_global[2] = {
+            static_cast<std::size_t>(grid_width),
+            static_cast<std::size_t>(grid_height)};
+        const float sub_col =
+            static_cast<float>(width) / static_cast<float>(grid_width);
+        const float sub_row =
+            static_cast<float>(height) / static_cast<float>(grid_height);
+        const float up_col =
+            static_cast<float>(grid_width) / static_cast<float>(width);
+        const float up_row =
+            static_cast<float>(grid_height) / static_cast<float>(height);
+
+        cl_uint arg = 0;
+        bool ok = true;
+        ok = ok && set_arg(subsample_kernel, arg++, sizeof(cl_mem),
+                           &full_memory);
+        ok = ok && set_arg(subsample_kernel, arg++, sizeof(cl_mem),
+                           &i1_memory);
+        ok = ok && set_arg(subsample_kernel, arg++, sizeof(cl_mem),
+                           &p1_memory);
+        ok = ok && set_arg(subsample_kernel, arg++, sizeof(cl_int),
+                           &grid_width);
+        ok = ok && set_arg(subsample_kernel, arg++, sizeof(cl_int),
+                           &grid_height);
+        ok = ok && set_arg(subsample_kernel, arg++, sizeof(cl_int),
+                           &cl_width);
+        ok = ok && set_arg(subsample_kernel, arg++, sizeof(cl_int),
+                           &cl_height);
+        ok = ok && set_arg(subsample_kernel, arg++, sizeof(cl_int),
+                           &full_pitch);
+        ok = ok && set_arg(subsample_kernel, arg++, sizeof(cl_int),
+                           &full_plane);
+        ok = ok && set_arg(subsample_kernel, arg++, sizeof(cl_int),
+                           &sub_pitch);
+        ok = ok && set_arg(subsample_kernel, arg++, sizeof(cl_float),
+                           &sub_col);
+        ok = ok && set_arg(subsample_kernel, arg++, sizeof(cl_float),
+                           &sub_row);
+        if (!ok) {
+            error = "lab.tools region subsample arguments failed";
+            return false;
+        }
+        if (!launch(subsample_kernel, grid_global,
+                    "lab.tools region subsample")) {
+            return false;
+        }
+
+        const cl_int rad = guidedFilterBoxRadius(
+            radius_value, subsampling, grid_width, grid_height);
+
+        if (!box_blur(i1_memory, meani_memory, rad, grid_width,
+                      grid_height) ||
+            !box_blur(p1_memory, meanp_memory, rad, grid_width,
+                      grid_height)) {
+            return false;
+        }
+        if (!combine(p1_memory, i1_memory, p1_memory, p1_memory, 0, epsilon,
+                     grid_width, grid_height) ||
+            !box_blur(p1_memory, p1_memory, rad, grid_width,
+                      grid_height)) {
+            return false;
+        }
+        if (!combine(i1_memory, i1_memory, i1_memory, i1_memory, 0,
+                     epsilon, grid_width, grid_height) ||
+            !box_blur(i1_memory, i1_memory, rad, grid_width,
+                      grid_height)) {
+            return false;
+        }
+        if (!combine(i1_memory, meani_memory, meani_memory, i1_memory, 1,
+                     epsilon, grid_width, grid_height) ||
+            !combine(p1_memory, meani_memory, meanp_memory, p1_memory, 1,
+                     epsilon, grid_width, grid_height)) {
+            return false;
+        }
+        if (!combine(i1_memory, p1_memory, i1_memory, i1_memory, 2,
+                     epsilon, grid_width, grid_height) ||
+            !combine(p1_memory, i1_memory, meani_memory, meanp_memory, 1,
+                     epsilon, grid_width, grid_height)) {
+            return false;
+        }
+        if (!box_blur(i1_memory, i1_memory, rad, grid_width,
+                      grid_height) ||
+            !box_blur(p1_memory, p1_memory, rad, grid_width,
+                      grid_height)) {
+            return false;
+        }
+
+        arg = 0;
+        ok = true;
+        ok = ok && set_arg(region_upsample_kernel, arg++, sizeof(cl_mem),
+                           &i1_memory);
+        ok = ok && set_arg(region_upsample_kernel, arg++, sizeof(cl_mem),
+                           &p1_memory);
+        ok = ok && set_arg(region_upsample_kernel, arg++, sizeof(cl_mem),
+                           &full_memory);
+        ok = ok && set_arg(region_upsample_kernel, arg++, sizeof(cl_mem),
+                           &region_masks_memory);
+        ok = ok && set_arg(region_upsample_kernel, arg++, sizeof(cl_int),
+                           &grid_width);
+        ok = ok && set_arg(region_upsample_kernel, arg++, sizeof(cl_int),
+                           &grid_height);
+        ok = ok && set_arg(region_upsample_kernel, arg++, sizeof(cl_int),
+                           &cl_width);
+        ok = ok && set_arg(region_upsample_kernel, arg++, sizeof(cl_int),
+                           &cl_height);
+        ok = ok && set_arg(region_upsample_kernel, arg++, sizeof(cl_int),
+                           &sub_pitch);
+        ok = ok && set_arg(region_upsample_kernel, arg++, sizeof(cl_int),
+                           &full_pitch);
+        ok = ok && set_arg(region_upsample_kernel, arg++, sizeof(cl_int),
+                           &full_plane);
+        ok = ok && set_arg(region_upsample_kernel, arg++, sizeof(cl_int),
+                           &region_mask_pitch);
+        ok = ok && set_arg(region_upsample_kernel, arg++, sizeof(cl_int),
+                           &dst_plane);
+        ok = ok && set_arg(region_upsample_kernel, arg++, sizeof(cl_float),
+                           &up_col);
+        ok = ok && set_arg(region_upsample_kernel, arg++, sizeof(cl_float),
+                           &up_row);
+        if (!ok) {
+            error = "lab.tools region upsample arguments failed";
+            return false;
+        }
+        return launch(region_upsample_kernel, image_global,
+                      "lab.tools region upsample");
+    };
+
+    /*
+     * The region CDL and channel copy repeat the host's double matrix
+     * products. The float ws/iws buffers are the other kernels' inputs, so the
+     * region program gets its own copies at the host's precision.
+     */
+    cl_mem region_ws_memory = nullptr;
+    cl_mem region_iws_memory = nullptr;
+    std::shared_ptr<void> region_ws_owner;
+    std::shared_ptr<void> region_iws_owner;
+    if (regions) {
+        for (int matrix = 0; matrix < 2; ++matrix) {
+            const double* host = static_cast<const double*>(
+                matrix == 0 ? args[67].u.ptr : args[68].u.ptr);
+            cl_int matrix_error = CL_SUCCESS;
+            cl_mem memory = env->api->CreateBuffer(
+                env->context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                9 * sizeof(cl_double), const_cast<double*>(host),
+                &matrix_error);
+            if (memory == nullptr) {
+                error = "lab.tools region matrix upload failed";
+                return RT_STAGE_FALLBACK;
+            }
+            std::shared_ptr<void> owner(
+                static_cast<void*>(memory), [api = env->api](void* pointer) {
+                    api->ReleaseMemObject(static_cast<cl_mem>(pointer));
+                });
+            if (matrix == 0) {
+                region_ws_memory = memory;
+                region_ws_owner = owner;
+            } else {
+                region_iws_memory = memory;
+                region_iws_owner = owner;
+            }
+        }
+    }
 
     {
         std::lock_guard<std::recursive_mutex> lock(env->queue_mutex);
@@ -4878,6 +5355,115 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
             }
             if (!launch(vibrance_kernel, image_global, "lab.tools vibrance")) {
                 return RT_STAGE_FALLBACK;
+            }
+        }
+
+        /*
+         * ImProcFunctions::labColorCorrectionRegions(), after vibrance, as
+         * the host block orders it. Every region mask is built from the
+         * original Lab snapshot; the region applications then run in region
+         * order on the previous result.
+         */
+        if (regions) {
+            const cl_float region_c_factor = 327.68f / 48000.f;
+            for (int region = 0; region < region_count; ++region) {
+                const cl_int cl_region = region;
+                if (region_subsampling_ab[region] < 1 ||
+                    region_subsampling_l[region] < 1) {
+                    error = "lab.tools region subsampling is invalid";
+                    return RT_STAGE_FALLBACK;
+                }
+
+                cl_uint arg = 0;
+                bool ok = true;
+                ok = ok && set_arg(region_mask_kernel, arg++, sizeof(cl_mem),
+                                   &snapshot_memory);
+                ok = ok && set_arg(region_mask_kernel, arg++, sizeof(cl_mem),
+                                   &full_memory);
+                ok = ok && set_arg(region_mask_kernel, arg++, sizeof(cl_mem),
+                                   &region_luts_memory);
+                ok = ok && set_arg(region_mask_kernel, arg++, sizeof(cl_mem),
+                                   &region_params_memory);
+                ok = ok && set_arg(region_mask_kernel, arg++, sizeof(cl_int),
+                                   &cl_region);
+                ok = ok && set_arg(region_mask_kernel, arg++, sizeof(cl_int),
+                                   &region_lut_stride);
+                ok = ok && set_arg(region_mask_kernel, arg++,
+                                   sizeof(cl_float), &region_c_factor);
+                ok = ok && set_arg(region_mask_kernel, arg++, sizeof(cl_int),
+                                   &cl_width);
+                ok = ok && set_arg(region_mask_kernel, arg++, sizeof(cl_int),
+                                   &cl_height);
+                ok = ok && set_arg(region_mask_kernel, arg++, sizeof(cl_int),
+                                   &lab_pitch);
+                ok = ok && set_arg(region_mask_kernel, arg++, sizeof(cl_int),
+                                   &lab_plane);
+                ok = ok && set_arg(region_mask_kernel, arg++, sizeof(cl_int),
+                                   &full_pitch);
+                ok = ok && set_arg(region_mask_kernel, arg++, sizeof(cl_int),
+                                   &full_plane);
+                if (!ok) {
+                    error = "lab.tools region mask arguments failed";
+                    return RT_STAGE_FALLBACK;
+                }
+                if (!launch(region_mask_kernel, image_global,
+                            "lab.tools region mask")) {
+                    return RT_STAGE_FALLBACK;
+                }
+
+                const cl_int cl_radius_ab =
+                    region_radius_ab[region];
+                const cl_int cl_radius_l = region_radius_l[region];
+                const cl_float epsilon_ab = 0.001f;
+                const cl_float epsilon_l = 0.0001f;
+                if (!region_guided_filter(
+                        cl_radius_ab, epsilon_ab,
+                        region_subsampling_ab[region], 0) ||
+                    !region_guided_filter(
+                        cl_radius_l, epsilon_l,
+                        region_subsampling_l[region],
+                        region_mask_plane)) {
+                    return RT_STAGE_FALLBACK;
+                }
+
+                arg = 0;
+                ok = true;
+                ok = ok && set_arg(region_apply_kernel, arg++,
+                                   sizeof(cl_mem), &lab_memory);
+                ok = ok && set_arg(region_apply_kernel, arg++,
+                                   sizeof(cl_mem), &region_masks_memory);
+                ok = ok && set_arg(region_apply_kernel, arg++,
+                                   sizeof(cl_mem), &region_params_memory);
+                ok = ok && set_arg(region_apply_kernel, arg++,
+                                   sizeof(cl_mem), &region_ws_memory);
+                ok = ok && set_arg(region_apply_kernel, arg++,
+                                   sizeof(cl_mem), &region_iws_memory);
+                ok = ok && set_arg(region_apply_kernel, arg++,
+                                   sizeof(cl_mem), &cachef_memory);
+                ok = ok && set_arg(region_apply_kernel, arg++,
+                                   sizeof(cl_mem), &cachefy_memory);
+                ok = ok && set_arg(region_apply_kernel, arg++,
+                                   sizeof(cl_int), &cl_region);
+                ok = ok && set_arg(region_apply_kernel, arg++,
+                                   sizeof(cl_int), &cl_width);
+                ok = ok && set_arg(region_apply_kernel, arg++,
+                                   sizeof(cl_int), &cl_height);
+                ok = ok && set_arg(region_apply_kernel, arg++,
+                                   sizeof(cl_int), &lab_pitch);
+                ok = ok && set_arg(region_apply_kernel, arg++,
+                                   sizeof(cl_int), &lab_plane);
+                ok = ok && set_arg(region_apply_kernel, arg++,
+                                   sizeof(cl_int), &region_mask_pitch);
+                ok = ok && set_arg(region_apply_kernel, arg++,
+                                   sizeof(cl_int), &region_mask_plane);
+                if (!ok) {
+                    error = "lab.tools region apply arguments failed";
+                    return RT_STAGE_FALLBACK;
+                }
+                if (!launch(region_apply_kernel, image_global,
+                            "lab.tools region apply")) {
+                    return RT_STAGE_FALLBACK;
+                }
             }
         }
     }

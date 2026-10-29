@@ -8,6 +8,7 @@
 #include "ipshadowshighlights.h"
 #include "labimage.h"
 #include "procparams.h"
+#include "sleef.h"
 #include "stage/stage_buffer.h"
 
 #include <cassert>
@@ -46,7 +47,270 @@ bool munsellTablesAvailable()
            first != nullptr && first->getSize() != 0;
 }
 
+/*
+ * The region mask curves. FlatCurve::getVal() is piecewise linear, so a
+ * piecewise-linear table can reproduce it exactly away from the knots.
+ * Refine only where the chord misses the curve; a smooth region needs a few
+ * hundred nodes and a control-point kink costs a short run on each side.
+ */
+constexpr double REGION_LUT_EPSILON = 2.0e-7;
+constexpr double REGION_LUT_ACCEPT = 5.0e-7;
+constexpr int REGION_LUT_MAX_DEPTH = 22;
+constexpr int REGION_LUT_MIN_PROBES = 4096;
+
+struct RegionCurveNode {
+    double x;
+    double y;
+};
+
+void regionCurveRefine(const FlatCurve& curve, const RegionCurveNode& left,
+                       const RegionCurveNode& right, int depth,
+                       std::vector<RegionCurveNode>& nodes, bool& ok)
+{
+    if (!ok) {
+        return;
+    }
+    if (nodes.size() + 2 > RT_LAB_TOOLS_REGION_LUT_NODES) {
+        ok = false;
+        return;
+    }
+
+    const double span = right.x - left.x;
+    const auto chord = [&](double x) {
+        return left.y + (right.y - left.y) * (x - left.x) / span;
+    };
+    const double quarter = left.x + 0.25 * span;
+    const double half = left.x + 0.5 * span;
+    const double three_quarters = left.x + 0.75 * span;
+    const double f_quarter = curve.getVal(quarter);
+    const double f_half = curve.getVal(half);
+    const double f_three_quarters = curve.getVal(three_quarters);
+    const bool split =
+        std::abs(f_quarter - chord(quarter)) > REGION_LUT_EPSILON ||
+        std::abs(f_half - chord(half)) > REGION_LUT_EPSILON ||
+        std::abs(f_three_quarters - chord(three_quarters)) >
+            REGION_LUT_EPSILON;
+    if (!split || depth >= REGION_LUT_MAX_DEPTH) {
+        return;
+    }
+
+    const RegionCurveNode middle{half, f_half};
+    regionCurveRefine(curve, left, middle, depth + 1, nodes, ok);
+    nodes.push_back(middle);
+    regionCurveRefine(curve, middle, right, depth + 1, nodes, ok);
+}
+
+/* The kernel's table lookup, on the host, over the float table as stored. */
+double regionLutValue(const float* slot, double t)
+{
+    const int count = static_cast<int>(slot[0]);
+    if (count < 2) {
+        return 0.0;
+    }
+    const float* xs = slot + 1;
+    const float* ys = slot + 1 + count;
+    if (t <= static_cast<double>(xs[0])) {
+        const double slope =
+            (static_cast<double>(ys[1]) - ys[0]) /
+            (static_cast<double>(xs[1]) - xs[0]);
+        return ys[0] + (t - xs[0]) * slope;
+    }
+    if (t >= static_cast<double>(xs[count - 1])) {
+        const double slope =
+            (static_cast<double>(ys[count - 1]) - ys[count - 2]) /
+            (static_cast<double>(xs[count - 1]) - xs[count - 2]);
+        return ys[count - 1] + (t - xs[count - 1]) * slope;
+    }
+    int low = 0;
+    int high = count - 1;
+    while (high - low > 1) {
+        const int middle = (low + high) / 2;
+        if (static_cast<double>(xs[middle]) <= t) {
+            low = middle;
+        } else {
+            high = middle;
+        }
+    }
+    const double fraction =
+        (t - xs[low]) /
+        (static_cast<double>(xs[high]) - static_cast<double>(xs[low]));
+    return ys[low] + (static_cast<double>(ys[high]) - ys[low]) * fraction;
+}
+
+/* Sample one FlatCurve into `slot`. `low`/`high` is the query domain; the
+ * kernel extrapolates both sides with the first and last segment slopes, so
+ * the table is validated a little outside its domain as well. Returns false
+ * when the curve cannot be represented within the error bound. */
+bool sampleRegionCurve(const std::vector<double>& points, bool periodic,
+                       double low, double high, bool wrap_below,
+                       bool check_above, float* slot)
+{
+    if (points.empty() || points[0] == FCT_Linear) {
+        return true;
+    }
+    if (points[0] != FCT_MinMaxCPoints && points[0] != FCT_Empty) {
+        return false;
+    }
+
+    FlatCurve curve(points, periodic);
+    std::vector<RegionCurveNode> nodes;
+    nodes.reserve(64);
+    const RegionCurveNode first_node{low, curve.getVal(low)};
+    const RegionCurveNode last_node{high, curve.getVal(high)};
+    nodes.push_back(first_node);
+    bool ok = true;
+    regionCurveRefine(curve, first_node, last_node, 0, nodes, ok);
+    nodes.push_back(last_node);
+    if (!ok || nodes.size() > RT_LAB_TOOLS_REGION_LUT_NODES) {
+        return false;
+    }
+
+    slot[0] = static_cast<float>(nodes.size());
+    for (std::size_t index = 0; index < nodes.size(); ++index) {
+        slot[1 + index] = static_cast<float>(nodes[index].x);
+        slot[1 + nodes.size() + index] =
+            static_cast<float>(nodes[index].y);
+    }
+
+    /*
+     * Validate the stored float table against getVal(), including the linear
+     * extrapolation the kernel uses outside the domain. The lightness argument
+     * is raw L/32768 and can leave [0,1], and the chroma argument is a log
+     * scale; both are extrapolated on the far side only.
+     */
+    const int probes = std::max<int>(
+        REGION_LUT_MIN_PROBES, static_cast<int>(nodes.size()) * 4);
+    double worst = 0.0;
+    for (int index = 0; index <= probes; ++index) {
+        const double t = low + (high - low) * index / probes;
+        const double error =
+            std::abs(regionLutValue(slot, t) - curve.getVal(t));
+        worst = std::max(worst, error);
+    }
+    const double margin = high - low;
+    if (check_above) {
+        for (int index = 1; index <= 8; ++index) {
+            const double t = high + margin * index / 4.0;
+            worst = std::max(
+                worst, std::abs(regionLutValue(slot, t) - curve.getVal(t)));
+        }
+    }
+    if (wrap_below) {
+        /*
+         * FlatCurve::getVal() adds 1.0 when t is below the first polyline
+         * node. A negative L/32768 therefore wraps into the table once, and
+         * the kernel repeats that rule; the host value is getVal() at the
+         * original argument. The table covers one unit below zero, which is
+         * L >= -32768.
+         */
+        for (int index = 1; index <= 8; ++index) {
+            const double t = -static_cast<double>(index) / 8.0;
+            const double wrapped = t + 1.0;
+            worst = std::max(
+                worst, std::abs(regionLutValue(slot, wrapped) -
+                                curve.getVal(t)));
+        }
+    }
+    return worst <= REGION_LUT_ACCEPT;
+}
+
+bool regionCurveSupported(const std::vector<double>& points)
+{
+    if (points.empty() || points[0] == FCT_Linear) {
+        return true;
+    }
+    return points[0] == FCT_MinMaxCPoints || points[0] == FCT_Empty;
+}
+
+bool regionFinite(double value)
+{
+    return std::isfinite(value);
+}
+
+bool regionConfigurationSupported(const procparams::ProcParams& params)
+{
+    if (params.colorToning.labregionsShowMask >= 0) {
+        return false;
+    }
+    const auto& regions = params.colorToning.labregions;
+    if (regions.empty() ||
+        regions.size() > static_cast<std::size_t>(RT_LAB_TOOLS_MAX_REGIONS)) {
+        return false;
+    }
+    for (const auto& region : regions) {
+        if (!regionFinite(region.a) || !regionFinite(region.b) ||
+            !regionFinite(region.saturation) || !regionFinite(region.slope) ||
+            !regionFinite(region.offset) || !regionFinite(region.power) ||
+            !regionFinite(region.maskBlur)) {
+            return false;
+        }
+        if (std::abs(region.a) > RT_LAB_TOOLS_REGION_MAX_AB ||
+            std::abs(region.b) > RT_LAB_TOOLS_REGION_MAX_AB ||
+            std::abs(region.saturation) >
+                RT_LAB_TOOLS_REGION_MAX_SATURATION ||
+            region.slope < RT_LAB_TOOLS_REGION_MIN_SLOPE ||
+            region.slope > RT_LAB_TOOLS_REGION_MAX_SLOPE ||
+            std::abs(region.offset) > RT_LAB_TOOLS_REGION_MAX_OFFSET ||
+            region.power < RT_LAB_TOOLS_REGION_MIN_POWER ||
+            region.power > RT_LAB_TOOLS_REGION_MAX_POWER ||
+            region.maskBlur < RT_LAB_TOOLS_REGION_MIN_BLUR ||
+            region.maskBlur > RT_LAB_TOOLS_REGION_MAX_BLUR ||
+            region.channel <
+                procparams::ColorToningParams::LabCorrectionRegion::CHAN_ALL ||
+            region.channel >
+                procparams::ColorToningParams::LabCorrectionRegion::CHAN_B) {
+            return false;
+        }
+        if (!regionCurveSupported(region.hueMask) ||
+            !regionCurveSupported(region.chromaticityMask) ||
+            !regionCurveSupported(region.lightnessMask)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 } // namespace
+
+bool labToolsRegionsActive(const procparams::ProcParams& params)
+{
+    return params.colorToning.enabled &&
+           params.colorToning.method == "LabRegions" &&
+           regionConfigurationSupported(params);
+}
+
+int labToolsRegionSubsampling(int width, int height, int radius)
+{
+    /* guidedfilter.cc's file-local calculate_subsampling(), branch for
+     * branch. */
+    if (radius == 1) {
+        return 1;
+    }
+    if (std::max(width, height) <= 600) {
+        return 1;
+    }
+    for (int subsampling = 5; subsampling > 0; --subsampling) {
+        if (radius % subsampling == 0) {
+            return subsampling;
+        }
+    }
+    return 1;
+}
+
+void labToolsRegionRadii(double mask_blur, int scale, int* radius_ab,
+                         int* radius_l)
+{
+    /* ImProcFunctions::labColorCorrectionRegions()'s own derivation. */
+    const double blur = mask_blur < 0.0 ? -1.0 / mask_blur : 1.0 + mask_blur;
+    *radius_ab = std::max(
+        static_cast<int>(
+            static_cast<double>(4 / scale) * blur + 0.5),
+        1);
+    *radius_l = std::max(
+        static_cast<int>(
+            static_cast<double>(25 / scale) * blur + 0.5),
+        1);
+}
 
 bool labToolsShadowsHighlightsActive(const procparams::ProcParams& params)
 {
@@ -91,11 +355,13 @@ bool labToolsLabCurveActive(const procparams::ProcParams& params)
 bool labToolsSupported(const procparams::ProcParams& params)
 {
     /*
-     * The LabGrid pass is the only colour toning this node implements, and
-     * every other colour toning method is a residual. LabRegions is covered by
-     * the method test: labColorCorrectionRegions() only runs for it.
+     * The two colour-toning methods this node implements are LabGrid and the
+     * bounded LabRegions set. Every other method, and a LabRegions profile
+     * outside the set, is a residual.
      */
-    if (params.colorToning.enabled && params.colorToning.method != "LabGrid") {
+    const bool lab_regions = labToolsRegionsActive(params);
+    if (params.colorToning.enabled &&
+        params.colorToning.method != "LabGrid" && !lab_regions) {
         return false;
     }
 
@@ -212,7 +478,7 @@ bool labToolsSupported(const procparams::ProcParams& params)
     }
 
     return (params.colorToning.enabled &&
-            params.colorToning.method == "LabGrid") ||
+            (params.colorToning.method == "LabGrid" || lab_regions)) ||
            labToolsShadowsHighlightsActive(params) ||
            labToolsLocalContrastActive(params) || vibrance ||
            labToolsLabCurveActive(params);
@@ -367,6 +633,8 @@ int LabToolsContext::build(RtLabToolsResult& out)
         for (int col = 0; col < 3; ++col) {
             ws_[row * 3 + col] = static_cast<float>(ws[row][col]);
             iws_[row * 3 + col] = static_cast<float>(iws[row][col]);
+            ws_double_[row * 3 + col] = ws[row][col];
+            iws_double_[row * 3 + col] = iws[row][col];
         }
     }
 
@@ -743,6 +1011,99 @@ int LabToolsContext::build(RtLabToolsResult& out)
         }
     }
 
+    /*
+     * Lab regions. The block derives abca/abcb, rs, the CDL parameters and
+     * the two guided-filter radii from the same region list. The mask curves
+     * are sampled here so the kernel reads a host-built table rather than
+     * re-deriving FlatCurve's polyline.
+     */
+    regions_active_ = labToolsRegionsActive(params_);
+    region_luts_.clear();
+    region_params_.clear();
+    if (regions_active_) {
+        const auto& regions = params_.colorToning.labregions;
+        const std::size_t lut_stride = RT_LAB_TOOLS_REGION_LUT_STRIDE;
+        const std::size_t region_stride = RT_LAB_TOOLS_REGION_PARAM_STRIDE;
+        region_luts_.assign(
+            regions.size() * RT_LAB_TOOLS_REGION_CURVES * lut_stride, 0.f);
+        region_params_.assign(regions.size() * region_stride, 0.f);
+
+        /* ImProcFunctions::labColorCorrectionRegions()'s abcoord(). */
+        const auto abcoord = [](float x) {
+            return SGN(x) * xlog2lin(std::abs(x), 4.f);
+        };
+        const auto active = [](const std::vector<double>& points) {
+            return !points.empty() && points[0] != FCT_Linear;
+        };
+
+        for (std::size_t index = 0; index < regions.size(); ++index) {
+            const auto& region = regions[index];
+            float* values = &region_params_[index * region_stride];
+            values[RT_LAB_TOOLS_REGION_ABCA] =
+                abcoord(static_cast<float>(region.a));
+            values[RT_LAB_TOOLS_REGION_ABCB] =
+                abcoord(static_cast<float>(region.b));
+            const double saturation = region.saturation;
+            values[RT_LAB_TOOLS_REGION_RS] = static_cast<float>(
+                1.0 + saturation /
+                          (SGN(saturation) > 0 ? 50.0 : 100.0));
+            values[RT_LAB_TOOLS_REGION_SLOPE] =
+                static_cast<float>(region.slope);
+            values[RT_LAB_TOOLS_REGION_OFFSET] =
+                static_cast<float>(region.offset);
+            values[RT_LAB_TOOLS_REGION_POWER] =
+                static_cast<float>(region.power);
+            values[RT_LAB_TOOLS_REGION_CHANNEL] =
+                static_cast<float>(region.channel);
+            values[RT_LAB_TOOLS_REGION_MASK_BLUR] =
+                static_cast<float>(region.maskBlur);
+
+            int radius_ab = 0;
+            int radius_l = 0;
+            labToolsRegionRadii(region.maskBlur, LAB_TOOLS_EXPORT_SCALE,
+                                &radius_ab, &radius_l);
+            values[RT_LAB_TOOLS_REGION_RADIUS_AB] =
+                static_cast<float>(radius_ab);
+            values[RT_LAB_TOOLS_REGION_RADIUS_L] =
+                static_cast<float>(radius_l);
+
+            float* luts = &region_luts_[
+                index * RT_LAB_TOOLS_REGION_CURVES * lut_stride];
+            /*
+             * The hue argument stays in [0,1]. The chroma and lightness
+             * tables run to the point where FlatCurve's final interval begins
+             * (the polyline's synthetic 3.0 endpoint), so a chroma above the
+             * domain or an L above 32768 follows the same final segment the
+             * host does. A negative L wraps once, as getVal() does.
+             */
+            if (!sampleRegionCurve(region.hueMask, true, 0.0, 1.0, false,
+                                   false, luts + 0 * lut_stride) ||
+                !sampleRegionCurve(
+                    region.chromaticityMask, false, 0.0,
+                    static_cast<double>(
+                        RT_LAB_TOOLS_REGION_CHROMA_DOMAIN),
+                    false, true, luts + 1 * lut_stride) ||
+                !sampleRegionCurve(region.lightnessMask, false, 0.0,
+                                   static_cast<double>(
+                                       RT_LAB_TOOLS_REGION_LIGHT_DOMAIN),
+                                   true, true, luts + 2 * lut_stride)) {
+                return 1;
+            }
+            values[RT_LAB_TOOLS_REGION_HUE_ACTIVE] =
+                active(region.hueMask) ? 1.f : 0.f;
+            values[RT_LAB_TOOLS_REGION_CHROMA_ACTIVE] =
+                active(region.chromaticityMask) ? 1.f : 0.f;
+            values[RT_LAB_TOOLS_REGION_LIGHT_ACTIVE] =
+                active(region.lightnessMask) ? 1.f : 0.f;
+
+            for (std::size_t slot = 0; slot < region_stride; ++slot) {
+                if (!std::isfinite(values[slot])) {
+                    return 1;
+                }
+            }
+        }
+    }
+
     out.labgrid = labgrid_;
     out.lut_highlight = lut_highlight_.data();
     out.lut_shadow = lut_shadow_.data();
@@ -794,6 +1155,18 @@ int LabToolsContext::build(RtLabToolsResult& out)
     out.local_contrast_lightness = local_contrast_lightness_;
     out.local_contrast_iir =
         local_contrast_active_ ? &local_contrast_iir_ : nullptr;
+    out.region_luts = regions_active_ ? region_luts_.data() : nullptr;
+    out.region_params = regions_active_ ? region_params_.data() : nullptr;
+    out.ws_double = regions_active_ ? ws_double_ : nullptr;
+    out.iws_double = regions_active_ ? iws_double_ : nullptr;
+    out.region_count =
+        regions_active_
+            ? static_cast<uint32_t>(params_.colorToning.labregions.size())
+            : 0u;
+    out.region_lut_stride =
+        regions_active_ ? static_cast<uint32_t>(
+                              RT_LAB_TOOLS_REGION_LUT_STRIDE)
+                        : 0u;
     built_ = true;
     return 0;
 }
