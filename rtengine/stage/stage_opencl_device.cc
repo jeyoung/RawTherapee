@@ -59,10 +59,12 @@
 #include "stage/algorithms/local_contrast_cl.h"
 #include "stage/algorithms/lab_curve_cl.h"
 #include "stage/algorithms/lab_regions_cl.h"
+#include "stage/algorithms/lab_wavelet_cl.h"
 #include "stage/algorithms/munsell_lch_cl.h"
 #include "stage/algorithms/vibrance_cl.h"
 #include "stage/algorithms/working_trc_cl.h"
 #include "stage/lab_tools_context.h"
+#include "stage/lab_wavelet_context.h"
 #include "stage/working_trc_context.h"
 
 #include "ipshadowshighlights.h"
@@ -784,6 +786,20 @@ const std::string& lab_tools_source()
 }
 
 /*
+ * The lab.wavelet program: the directional pyramid decomposition and the
+ * reconstruction equaliser. The range tables and hue/chroma masks arrive as
+ * host-built buffers; lab_wavelet_cl.h carries the block's arithmetic.
+ */
+const std::string& lab_wavelet_source()
+{
+    static const std::string source =
+        std::string("#pragma OPENCL FP_CONTRACT OFF\n"
+                    "#pragma STDC FP_CONTRACT OFF\n") +
+        RT_LAB_WAVELET_CL;
+    return source;
+}
+
+/*
  * The Lab-curve program. It repeats chromiLuminanceCurve()'s double-precision
  * square root and divide, which `sqrt(float) / 327.68f` performs on the host,
  * so the Munsell chroma index and the block's chroma values round exactly as
@@ -1272,6 +1288,7 @@ const std::vector<KernelDef>& kernels()
         {"lab.tools.labcurve", lab_curve_source().c_str(), "rt_lab_tools_lab_curve"},
         {"lab.tools.localcontrast", local_contrast_source().c_str(), "rt_lab_tools_lc_line"},
         {"lab.tools.regions", lab_regions_source().c_str(), "rt_lab_tools_region_mask"},
+        {"lab.wavelet", lab_wavelet_source().c_str(), "rt_lab_wavelet_decompose"},
         {"output.sharpen", RT_SHARPEN_CL, "rt_sharpen_mask"},
         {"framing", framing_source().c_str(), "rt_framing"},
         {"thumbnail.whitebalance", thumbnail_wb_source().c_str(), "rt_thumbnail_wb"},
@@ -1896,7 +1913,8 @@ cl_kernel compiled_kernel_entry(const std::shared_ptr<OpenCLEnv>& env,
         std::strcmp(def->name, "working.trc") == 0 ||
                 std::strcmp(def->name, "lab.tools") == 0 ||
                 std::strcmp(def->name, "lab.tools.labcurve") == 0 ||
-                std::strcmp(def->name, "lab.tools.localcontrast") == 0
+                std::strcmp(def->name, "lab.tools.localcontrast") == 0 ||
+                std::strcmp(def->name, "lab.wavelet") == 0
             ? "-cl-fp32-correctly-rounded-divide-sqrt"
             : nullptr;
     build_error = env->api->BuildProgram(program, 1, &env->device,
@@ -5519,6 +5537,456 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
 }
 
 /*
+ * The lab.wavelet node. Argument order:
+ *   [0] Lab three-plane F32 buffer, read and written in place (only L changes
+ *       unless the gamutlab pre-pass also repairs a and b),
+ *   [1] PTR host context (RtLabWaveletContext), host-only,
+ *   [2] int support flag, mirrored from the context descriptor,
+ *   [3..8] doubles mult[0..5] (level 0 is the finest),
+ *   [9] double threshold, [10] double skinprotect,
+ *   [11..13] doubles b_l, t_l and t_r (the block's hueskin points / 100),
+ *   [14] int gamutlab, [15] int the block's scale,
+ *   [16] int active levels (1..6),
+ *   [17] BUFFER the host-built range tables, levels * 0x20000 floats,
+ *   [18] BUFFER the host-built hue mask, [19] BUFFER the chroma mask.
+ *
+ * The pass order is the block's own: the host prepares the gamutlab
+ * BadpixelsLab() pre-pass and the hue/chroma masks on a private copy, then
+ * the device decomposes levels 0..levels-1 and reconstructs from the coarsest
+ * level down to 0. The last reconstruction level writes the source L plane,
+ * which is the block's final copy.
+ *
+ * A clear support flag refuses before the upload: that is the residual path,
+ * and it makes the CPU builtin - the extracted host block - execute and record
+ * impl=host. Every refusal leaves the caller's Lab buffer untouched.
+ */
+RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
+                              const std::shared_ptr<OpenCLResidency>& residency,
+                              const std::vector<RtStageArg>& args,
+                              std::string& error)
+{
+    constexpr std::size_t ARG_COUNT = 20;
+
+    if (args.size() != ARG_COUNT) {
+        error = "lab.wavelet expects a Lab buffer, a context and its "
+                "parameters";
+        return RT_STAGE_INVALID;
+    }
+
+    bool kinds = args[0].kind == RT_STAGE_ARG_BUFFER &&
+                 args[1].kind == RT_STAGE_ARG_PTR &&
+                 args[2].kind == RT_STAGE_ARG_INT;
+    for (std::size_t index = 3; index <= 13; ++index) {
+        kinds = kinds && args[index].kind == RT_STAGE_ARG_DOUBLE;
+    }
+    kinds = kinds && args[14].kind == RT_STAGE_ARG_INT &&
+            args[15].kind == RT_STAGE_ARG_INT &&
+            args[16].kind == RT_STAGE_ARG_INT &&
+            args[17].kind == RT_STAGE_ARG_BUFFER &&
+            args[18].kind == RT_STAGE_ARG_BUFFER &&
+            args[19].kind == RT_STAGE_ARG_BUFFER;
+    if (!kinds) {
+        error = "lab.wavelet has an argument of the wrong kind";
+        return RT_STAGE_INVALID;
+    }
+
+    const RtStageBuffer& lab = args[0].u.buffer;
+    if (!valid(lab) || lab.format != RT_STAGE_F32 || lab.planes != 3) {
+        error = "lab.wavelet needs a three-plane F32 Lab buffer";
+        return RT_STAGE_INVALID;
+    }
+
+    const auto* context = static_cast<const RtLabWaveletContext*>(
+        args[1].u.ptr);
+    if (context == nullptr || context->size != sizeof(RtLabWaveletContext) ||
+        context->version != RT_LAB_WAVELET_CONTEXT_VERSION ||
+        context->magic != RT_LAB_WAVELET_CONTEXT_MAGIC ||
+        context->build == nullptr || context->prepare == nullptr ||
+        context->run_host == nullptr) {
+        error = "lab.wavelet has an invalid host context";
+        return RT_STAGE_INVALID;
+    }
+
+    const std::int64_t supported = args[2].u.i;
+    if (supported != 0 && supported != 1) {
+        error = "lab.wavelet support flag must be 0 or 1";
+        return RT_STAGE_INVALID;
+    }
+    if (supported != 1 || context->supported != 1) {
+        error = "lab.wavelet support flag is not set";
+        return RT_STAGE_FALLBACK;
+    }
+
+    double mult[RT_LAB_WAVELET_MAX_LEVELS] = {};
+    for (int level = 0; level < static_cast<int>(RT_LAB_WAVELET_MAX_LEVELS);
+         ++level) {
+        const double value = args[3 + level].u.f;
+        if (!std::isfinite(value) || value < LAB_WAVELET_MIN_MULT ||
+            value > LAB_WAVELET_MAX_MULT) {
+            error = "lab.wavelet has a multiplier outside its range";
+            return RT_STAGE_INVALID;
+        }
+        mult[level] = value;
+    }
+    const double threshold = args[9].u.f;
+    const double skinprotect = args[10].u.f;
+    const double b_l = args[11].u.f;
+    const double t_l = args[12].u.f;
+    const double t_r = args[13].u.f;
+    if (!std::isfinite(threshold) ||
+        threshold < LAB_WAVELET_MIN_THRESHOLD ||
+        threshold > LAB_WAVELET_MAX_THRESHOLD ||
+        !std::isfinite(skinprotect) ||
+        skinprotect < LAB_WAVELET_MIN_SKIN ||
+        skinprotect > LAB_WAVELET_MAX_SKIN) {
+        error = "lab.wavelet has a threshold or skin setting outside its "
+                "range";
+        return RT_STAGE_INVALID;
+    }
+    if (!std::isfinite(b_l) || !std::isfinite(t_l) || !std::isfinite(t_r) ||
+        b_l < LAB_WAVELET_MIN_HUE || b_l > LAB_WAVELET_MAX_HUE ||
+        t_l < LAB_WAVELET_MIN_HUE || t_l > LAB_WAVELET_MAX_HUE ||
+        t_r < LAB_WAVELET_MIN_HUE || t_r > LAB_WAVELET_MAX_HUE) {
+        error = "lab.wavelet has a hue point outside its range";
+        return RT_STAGE_INVALID;
+    }
+    const std::int64_t gamutlab_flag = args[14].u.i;
+    const std::int64_t scale = args[15].u.i;
+    const std::int64_t levels_value = args[16].u.i;
+    if ((gamutlab_flag != 0 && gamutlab_flag != 1) ||
+        scale != RT_LAB_WAVELET_EXPORT_SCALE || levels_value < 1 ||
+        levels_value > static_cast<std::int64_t>(
+                           RT_LAB_WAVELET_MAX_LEVELS)) {
+        error = "lab.wavelet has a flag or level count outside its range";
+        return RT_STAGE_INVALID;
+    }
+    const int levels = static_cast<int>(levels_value);
+
+    const int expected_levels = labWaveletLastLevel(mult);
+    if (expected_levels != levels) {
+        error = "lab.wavelet level count disagrees with its multipliers";
+        return RT_STAGE_INVALID;
+    }
+
+    /*
+     * dirpyr_channel()'s first and last column blocks read up to
+     * 2 * scalewin without a lower clamp; the block is only defined when the
+     * image is at least that wide. Fail closed rather than reproduce an
+     * out-of-bounds read.
+     */
+    int widest = 1;
+    for (int level = 0; level < levels; ++level) {
+        const int step = 1 << level;
+        const int window = level > 1 ? 2 * step : step;
+        widest = std::max(widest, window);
+    }
+    const int width = lab.width;
+    const int height = lab.height;
+    if (width < 8 || height < 8 || width < 2 * widest) {
+        error = "lab.wavelet image is too small for its pyramid";
+        return RT_STAGE_FALLBACK;
+    }
+    if (lab.row_pitch % sizeof(float) != 0 ||
+        lab.plane_pitch < lab.row_pitch * static_cast<std::size_t>(height)) {
+        error = "lab.wavelet Lab buffer pitch does not cover the image";
+        return RT_STAGE_INVALID;
+    }
+
+    const RtStageBuffer& luts = args[17].u.buffer;
+    if (!valid(luts) || luts.format != RT_STAGE_F32 || luts.planes != 1 ||
+        luts.height != 1 ||
+        static_cast<std::uint32_t>(luts.width) !=
+            static_cast<std::uint32_t>(levels) *
+                RT_LAB_WAVELET_LUT_ENTRIES) {
+        error = "lab.wavelet needs one range table per level";
+        return RT_STAGE_INVALID;
+    }
+
+    const bool skin = skinprotect != 0.0;
+    const RtStageBuffer& hue = args[18].u.buffer;
+    const RtStageBuffer& chrom = args[19].u.buffer;
+    if (skin) {
+        for (const RtStageBuffer* mask : {&hue, &chrom}) {
+            if (!valid(*mask) || mask->format != RT_STAGE_F32 ||
+                mask->planes != 1 || mask->height != height ||
+                mask->width != width) {
+                error = "lab.wavelet needs two hue/chroma masks";
+                return RT_STAGE_INVALID;
+            }
+        }
+    }
+
+    /*
+     * The equaliser's weights and its LUT lookup use float division and
+     * square root. A GPU OpenCL implementation may round either differently,
+     * so the node runs only on a deterministic CPU device (POCL), the device
+     * the project uses for parity, and records impl=host elsewhere.
+     */
+    cl_device_type device_type = 0;
+    if (env->api->GetDeviceInfo(env->device, CL_DEVICE_TYPE,
+                                sizeof(device_type), &device_type,
+                                nullptr) != CL_SUCCESS ||
+        device_type != CL_DEVICE_TYPE_CPU) {
+        error = "lab.wavelet needs a deterministic CPU device";
+        return RT_STAGE_FALLBACK;
+    }
+
+    /*
+     * The gamutlab protection is a host pre-pass. Run it, and the mask
+     * precompute, on a private copy so a later refusal leaves the caller's
+     * image untouched for the host builtin.
+     */
+    std::vector<float> scratch;
+    RtStageBuffer prepared = lab;
+    if (context->needs_scratch != 0) {
+        const std::size_t pixels =
+            static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
+        scratch.resize(pixels * 3);
+        prepared.data = scratch.data();
+        prepared.row_pitch = static_cast<std::size_t>(width) * sizeof(float);
+        prepared.plane_pitch = prepared.row_pitch * height;
+        prepared.planes = 3;
+        const auto* source = static_cast<const unsigned char*>(lab.data);
+        auto* target = static_cast<unsigned char*>(prepared.data);
+        for (std::uint32_t plane = 0; plane < 3; ++plane) {
+            for (int y = 0; y < height; ++y) {
+                std::memcpy(target + plane * prepared.plane_pitch +
+                                static_cast<std::size_t>(y) *
+                                    prepared.row_pitch,
+                            source + plane * lab.plane_pitch +
+                                static_cast<std::size_t>(y) * lab.row_pitch,
+                            static_cast<std::size_t>(width) * sizeof(float));
+            }
+        }
+    }
+    if (context->prepare(context->self, &prepared) != 0) {
+        error = "lab.wavelet host preparation failed";
+        return RT_STAGE_FALLBACK;
+    }
+
+    /* The L plane is the only input the equaliser reads. */
+    char l_key = 0;
+    char pyramid_keys[RT_LAB_WAVELET_MAX_LEVELS] = {};
+    char lut_key = 0;
+    char hue_key = 0;
+    char chrom_key = 0;
+    const StageBufferShape plane_shape{RT_STAGE_F32, width, height, 1};
+    const StageBufferShape lut_shape{
+        RT_STAGE_F32,
+        static_cast<std::int32_t>(levels) *
+            static_cast<std::int32_t>(RT_LAB_WAVELET_LUT_ENTRIES),
+        1, 1};
+    StageDeviceBufferPtr l_device = residency->acquire(&l_key, plane_shape,
+                                                       &error);
+    StageDeviceBufferPtr pyramid[RT_LAB_WAVELET_MAX_LEVELS];
+    for (int level = 0; level < levels; ++level) {
+        pyramid[level] = residency->acquire(&pyramid_keys[level], plane_shape,
+                                            &error);
+    }
+    StageDeviceBufferPtr lut_device = residency->acquire(&lut_key, lut_shape,
+                                                         &error);
+    StageDeviceBufferPtr hue_device;
+    StageDeviceBufferPtr chrom_device;
+    if (skin) {
+        hue_device = residency->acquire(&hue_key, plane_shape, &error);
+        chrom_device = residency->acquire(&chrom_key, plane_shape, &error);
+    }
+    bool acquired = l_device && lut_device;
+    for (int level = 0; level < levels; ++level) {
+        acquired = acquired && pyramid[level];
+    }
+    if (skin) {
+        acquired = acquired && hue_device && chrom_device;
+    }
+    if (!acquired) {
+        return RT_STAGE_FALLBACK;
+    }
+
+    if (residency->upload(l_device, plane_view(prepared, 0)) != RT_STAGE_OK ||
+        residency->upload(lut_device, luts) != RT_STAGE_OK ||
+        (skin &&
+         (residency->upload(hue_device, hue) != RT_STAGE_OK ||
+          residency->upload(chrom_device, chrom) != RT_STAGE_OK))) {
+        error = "lab.wavelet setup upload failed";
+        return RT_STAGE_FALLBACK;
+    }
+
+    const KernelDef* def = find_kernel("lab.wavelet");
+    if (def == nullptr) {
+        error = "lab.wavelet kernel is not registered";
+        return RT_STAGE_INVALID;
+    }
+    cl_kernel decompose_kernel = compiled_kernel_entry(
+        env, def, "rt_lab_wavelet_decompose", error);
+    cl_kernel equalize_kernel = compiled_kernel_entry(
+        env, def, "rt_lab_wavelet_equalize", error);
+    if (decompose_kernel == nullptr || equalize_kernel == nullptr) {
+        return RT_STAGE_FALLBACK;
+    }
+
+    auto memory_of = [](const StageDeviceBufferPtr& buffer) {
+        auto device = std::dynamic_pointer_cast<OpenCLDeviceBuffer>(buffer);
+        return device != nullptr ? device->memory() : nullptr;
+    };
+    const auto pitch_of = [](const StageDeviceBufferPtr& buffer) {
+        return static_cast<cl_int>(buffer->row_pitch() / sizeof(float));
+    };
+    const auto set_arg = [&](cl_kernel kernel, cl_uint index, std::size_t bytes,
+                             const void* value) {
+        return env->api->SetKernelArg(kernel, index, bytes, value) == CL_SUCCESS;
+    };
+    const auto launch = [&](cl_kernel kernel, const std::size_t* global,
+                            const char* label) {
+        cl_event done = nullptr;
+        if (env->api->EnqueueNDRangeKernel(env->queue, kernel, 2, nullptr,
+                                           global, nullptr, 0, nullptr,
+                                           &done) != CL_SUCCESS ||
+            done == nullptr) {
+            error = std::string(label) + " launch failed";
+            return false;
+        }
+        const cl_int wait_status = env->api->WaitForEvents(1, &done);
+        env->api->ReleaseEvent(done);
+        if (wait_status != CL_SUCCESS) {
+            error = std::string(label) + " did not complete";
+            return false;
+        }
+        return true;
+    };
+
+    const cl_int cl_width = width;
+    const cl_int cl_height = height;
+#if defined(__SSE2__) || defined(RT_SIMDE)
+    const cl_int cl_vectorised = 1;
+#else
+    const cl_int cl_vectorised = 0;
+#endif
+    const std::size_t image_global[2] = {
+        static_cast<std::size_t>(width), static_cast<std::size_t>(height)};
+    const cl_mem l_memory = memory_of(l_device);
+    const cl_int l_pitch = pitch_of(l_device);
+    std::vector<cl_mem> pyramid_memory(levels);
+    std::vector<cl_int> pyramid_pitch(levels);
+    for (int level = 0; level < levels; ++level) {
+        pyramid_memory[level] = memory_of(pyramid[level]);
+        pyramid_pitch[level] = pitch_of(pyramid[level]);
+    }
+    const cl_mem lut_memory = memory_of(lut_device);
+    const cl_mem hue_memory = skin ? memory_of(hue_device) : l_memory;
+    const cl_mem chrom_memory = skin ? memory_of(chrom_device) : l_memory;
+    const cl_int mask_pitch = skin ? pitch_of(hue_device) : 0;
+
+    /* dirpyr_channel(), finest level first. */
+    for (int level = 0; level < levels; ++level) {
+        const cl_mem fine_memory =
+            level == 0 ? l_memory : pyramid_memory[level - 1];
+        const cl_int fine_pitch =
+            level == 0 ? l_pitch : pyramid_pitch[level - 1];
+        const cl_int cl_level = level;
+        const cl_int cl_scale = 1 << level;
+        bool ok = true;
+        ok = ok && set_arg(decompose_kernel, 0, sizeof(cl_mem), &fine_memory);
+        ok = ok && set_arg(decompose_kernel, 1, sizeof(cl_int), &fine_pitch);
+        ok = ok && set_arg(decompose_kernel, 2, sizeof(cl_mem),
+                           &pyramid_memory[level]);
+        ok = ok && set_arg(decompose_kernel, 3, sizeof(cl_int),
+                           &pyramid_pitch[level]);
+        ok = ok && set_arg(decompose_kernel, 4, sizeof(cl_int), &cl_width);
+        ok = ok && set_arg(decompose_kernel, 5, sizeof(cl_int), &cl_height);
+        ok = ok && set_arg(decompose_kernel, 6, sizeof(cl_int), &cl_level);
+        ok = ok && set_arg(decompose_kernel, 7, sizeof(cl_int), &cl_scale);
+        ok = ok && set_arg(decompose_kernel, 8, sizeof(cl_int),
+                           &cl_vectorised);
+        if (!ok || !launch(decompose_kernel, image_global,
+                           "lab.wavelet decompose")) {
+            error = "lab.wavelet decompose arguments failed";
+            return RT_STAGE_FALLBACK;
+        }
+    }
+
+    /*
+     * idirpyr_eq_channel(), coarsest level first. The last pyramid level is
+     * the reconstruction buffer, exactly as the block reuses it; level 0
+     * writes the source plane directly.
+     */
+    const int buffer_level = levels - 1;
+    const double skinprotect_value = skinprotect;
+    const cl_int cl_skin = skin ? 1 : 0;
+    const cl_float cl_skinprotect = static_cast<cl_float>(skinprotect_value);
+    const cl_float cl_b_l = static_cast<cl_float>(b_l);
+    const cl_float cl_t_l = static_cast<cl_float>(t_l);
+    const cl_float cl_t_r = static_cast<cl_float>(t_r);
+    for (int level = buffer_level; level >= 0; --level) {
+        const cl_mem fine_memory =
+            level == 0 ? l_memory : pyramid_memory[level - 1];
+        const cl_int fine_pitch =
+            level == 0 ? l_pitch : pyramid_pitch[level - 1];
+        const cl_int cl_level = level;
+        const cl_int to_dst = level == 0 ? 1 : 0;
+        bool ok = true;
+        ok = ok && set_arg(equalize_kernel, 0, sizeof(cl_mem), &fine_memory);
+        ok = ok && set_arg(equalize_kernel, 1, sizeof(cl_int), &fine_pitch);
+        ok = ok && set_arg(equalize_kernel, 2, sizeof(cl_mem),
+                           &pyramid_memory[level]);
+        ok = ok && set_arg(equalize_kernel, 3, sizeof(cl_int),
+                           &pyramid_pitch[level]);
+        ok = ok && set_arg(equalize_kernel, 4, sizeof(cl_mem),
+                           &pyramid_memory[buffer_level]);
+        ok = ok && set_arg(equalize_kernel, 5, sizeof(cl_int),
+                           &pyramid_pitch[buffer_level]);
+        ok = ok && set_arg(equalize_kernel, 6, sizeof(cl_mem), &l_memory);
+        ok = ok && set_arg(equalize_kernel, 7, sizeof(cl_int), &l_pitch);
+        ok = ok && set_arg(equalize_kernel, 8, sizeof(cl_mem), &lut_memory);
+        ok = ok && set_arg(equalize_kernel, 9, sizeof(cl_int), &cl_level);
+        ok = ok && set_arg(equalize_kernel, 10, sizeof(cl_mem), &hue_memory);
+        ok = ok && set_arg(equalize_kernel, 11, sizeof(cl_int), &mask_pitch);
+        ok = ok && set_arg(equalize_kernel, 12, sizeof(cl_mem),
+                           &chrom_memory);
+        ok = ok && set_arg(equalize_kernel, 13, sizeof(cl_int), &mask_pitch);
+        ok = ok && set_arg(equalize_kernel, 14, sizeof(cl_int), &cl_width);
+        ok = ok && set_arg(equalize_kernel, 15, sizeof(cl_int), &cl_height);
+        ok = ok && set_arg(equalize_kernel, 16, sizeof(cl_int), &cl_skin);
+        ok = ok && set_arg(equalize_kernel, 17, sizeof(cl_float),
+                           &cl_skinprotect);
+        ok = ok && set_arg(equalize_kernel, 18, sizeof(cl_float), &cl_b_l);
+        ok = ok && set_arg(equalize_kernel, 19, sizeof(cl_float), &cl_t_l);
+        ok = ok && set_arg(equalize_kernel, 20, sizeof(cl_float), &cl_t_r);
+        ok = ok && set_arg(equalize_kernel, 21, sizeof(cl_int), &to_dst);
+        if (!ok || !launch(equalize_kernel, image_global,
+                           "lab.wavelet equalize")) {
+            error = "lab.wavelet equalize arguments failed";
+            return RT_STAGE_FALLBACK;
+        }
+    }
+
+    if (residency->readback(l_device, plane_view(lab, 0)) != RT_STAGE_OK) {
+        error = "lab.wavelet L readback failed";
+        return RT_STAGE_FALLBACK;
+    }
+
+    /*
+     * BadpixelsLab() also repairs a and b. The prepared copy owns those
+     * repaired planes; the device only wrote L.
+     */
+    if (context->needs_scratch != 0) {
+        auto* target = static_cast<unsigned char*>(lab.data);
+        const auto* source = static_cast<const unsigned char*>(prepared.data);
+        for (std::uint32_t plane = 1; plane < 3; ++plane) {
+            for (int y = 0; y < height; ++y) {
+                std::memcpy(target + plane * lab.plane_pitch +
+                                static_cast<std::size_t>(y) * lab.row_pitch,
+                            source + plane * prepared.plane_pitch +
+                                static_cast<std::size_t>(y) *
+                                    prepared.row_pitch,
+                            static_cast<std::size_t>(width) * sizeof(float));
+            }
+        }
+    }
+
+    return RT_STAGE_OK;
+}
+
+/*
  * Frame drawing. Argument order:
  *   [0] source RGB buffer, [1] destination RGB buffer,
  *   [2..4] doubles border red, green and blue,
@@ -7063,6 +7531,20 @@ public:
         } else if (request.name == "lab.tools") {
             const RtStageStatus status =
                 run_lab_tools(env_, residency_, request.args, error);
+            if (status == RT_STAGE_OK) {
+                StageEvent done;
+                done.status = StageEventStatus::Complete;
+                done.result = RT_STAGE_OK;
+                done.device = StageDeviceType::OPENCL;
+                done.asynchronous = false;
+                return done;
+            }
+            StageEvent fallback = StageQueue::submit(request, profiling);
+            fallback.note = error;
+            return fallback;
+        } else if (request.name == "lab.wavelet") {
+            const RtStageStatus status =
+                run_lab_wavelet(env_, residency_, request.args, error);
             if (status == RT_STAGE_OK) {
                 StageEvent done;
                 done.status = StageEventStatus::Complete;

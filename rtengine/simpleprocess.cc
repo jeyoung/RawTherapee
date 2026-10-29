@@ -48,6 +48,7 @@
 #include "stage/stage_pipeline.h"
 #include "stage/stage_profile.h"
 #include "stage/lab_tools_context.h"
+#include "stage/lab_wavelet_context.h"
 #include "stage/stage_runtime.h"
 #include "stage/working_trc_context.h"
 #include "utils.h"
@@ -2325,7 +2326,8 @@ private:
 
     /*
      * lab.wavelet: the after-CBDL directional pyramid equaliser and the
-     * wavelet tool. Extracted from stage_finish() unchanged.
+     * wavelet tool. The equaliser runs in the node; the wavelet tool remains
+     * in the extracted host block until its own increment.
      */
     void stage_lab_wavelet()
     {
@@ -2333,170 +2335,102 @@ private:
 
         procparams::ProcParams& params = job->pparams;
         ImProcFunctions &ipf = * (ipf_p.get());
-        const bool cam02 = usesCieCam02();
 
-        // directional pyramid wavelet
-        if (params.dirpyrequalizer.cbdlMethod == "aft") {
-         //   if ((params.colorappearance.enabled && !settings->autocielab)  || !params.colorappearance.enabled) {
-            if ((params.colorappearance.enabled && !settings->autocielab)  || !cam02) {
-                ipf.dirpyrequalizer(labView, 1);     //TODO: this is the luminance tonecurve, not the RGB one
+        /*
+         * The device node is opt-in and covers the directional pyramid
+         * equaliser in after-CBDL position with the wavelet tool off.
+         * Everything else is a residual: the node is not submitted as
+         * supported, the launcher refuses it and the builtin runs the host
+         * block, recording impl=host. The launcher also refuses a GPU device,
+         * whose rounding can move a hipass across a range-table entry.
+         */
+        if (stage::node_device("lab.wavelet") == stage::StageNodeDevice::OpenCL) {
+            const bool supported = stage::labWaveletSupported(params);
+            stage::LabWaveletContext context(params, ipf, labView->W, labView->H);
+            RtLabWaveletResult setup{};
+            const bool deviceReady = supported && context.build(setup) == 0;
+            RtLabWaveletContext descriptor = context.descriptor(deviceReady);
+
+            RtStageArg args[20] = {};
+            args[0].kind = RT_STAGE_ARG_BUFFER;
+            args[0].u.buffer = stage::view(*labView);
+            args[1].kind = RT_STAGE_ARG_PTR;
+            args[1].u.ptr = &descriptor;
+            args[2].kind = RT_STAGE_ARG_INT;
+            args[2].u.i = deviceReady ? 1 : 0;
+            for (int level = 0; level < 6; ++level) {
+                args[3 + level].kind = RT_STAGE_ARG_DOUBLE;
+                args[3 + level].u.f = params.dirpyrequalizer.mult[level];
+            }
+            args[9].kind = RT_STAGE_ARG_DOUBLE;
+            args[9].u.f = params.dirpyrequalizer.threshold;
+            args[10].kind = RT_STAGE_ARG_DOUBLE;
+            args[10].u.f = params.dirpyrequalizer.skinprotect;
+            args[11].kind = RT_STAGE_ARG_DOUBLE;
+            args[11].u.f = static_cast<double>(params.dirpyrequalizer.hueskin.getBottomLeft()) / 100.0;
+            args[12].kind = RT_STAGE_ARG_DOUBLE;
+            args[12].u.f = static_cast<double>(params.dirpyrequalizer.hueskin.getTopLeft()) / 100.0;
+            args[13].kind = RT_STAGE_ARG_DOUBLE;
+            args[13].u.f = static_cast<double>(params.dirpyrequalizer.hueskin.getTopRight()) / 100.0;
+            args[14].kind = RT_STAGE_ARG_INT;
+            args[14].u.i = params.dirpyrequalizer.gamutlab ? 1 : 0;
+            args[15].kind = RT_STAGE_ARG_INT;
+            args[15].u.i = stage::LAB_WAVELET_EXPORT_SCALE;
+            args[16].kind = RT_STAGE_ARG_INT;
+            args[16].u.i = deviceReady ? setup.levels : 0;
+            for (int index = 17; index < 20; ++index) {
+                args[index].kind = RT_STAGE_ARG_BUFFER;
+            }
+            if (deviceReady) {
+                const auto host_buffer = [](const float* data, int width) {
+                    RtStageBuffer buffer{};
+                    buffer.size = sizeof(RtStageBuffer);
+                    buffer.data = const_cast<float*>(data);
+                    buffer.width = width;
+                    buffer.height = 1;
+                    buffer.row_pitch = static_cast<std::size_t>(width) * sizeof(float);
+                    buffer.plane_pitch = buffer.row_pitch;
+                    buffer.planes = 1;
+                    buffer.format = RT_STAGE_F32;
+                    buffer.flags = RT_STAGE_BUFFER_READ;
+                    return buffer;
+                };
+                args[17].u.buffer = host_buffer(
+                    setup.luts,
+                    static_cast<int>(setup.levels * RT_LAB_WAVELET_LUT_ENTRIES));
+                if (setup.skinprotect != 0) {
+                    const auto mask_buffer = [](const float* data, int width,
+                                                int height) {
+                        RtStageBuffer buffer{};
+                        buffer.size = sizeof(RtStageBuffer);
+                        buffer.data = const_cast<float*>(data);
+                        buffer.width = width;
+                        buffer.height = height;
+                        buffer.row_pitch =
+                            static_cast<std::size_t>(width) * sizeof(float);
+                        buffer.plane_pitch =
+                            buffer.row_pitch * static_cast<std::size_t>(height);
+                        buffer.planes = 1;
+                        buffer.format = RT_STAGE_F32;
+                        buffer.flags = RT_STAGE_BUFFER_READ;
+                        return buffer;
+                    };
+                    args[18].u.buffer = mask_buffer(
+                        setup.hue, labView->W, labView->H);
+                    args[19].u.buffer = mask_buffer(
+                        setup.chrom, labView->W, labView->H);
+                }
+            }
+
+            RtStageProfiling profiling{};
+            if (stage::run("lab.wavelet",
+                           std::vector<RtStageArg>(args, args + 20),
+                           &profiling) == RT_STAGE_OK) {
+                return;
             }
         }
 
-        if ((params.wavelet.enabled)){
-            stage::ScopedProfile profile("finish.wavelet");
-            LabImage *unshar = nullptr;
-            WaveletParams WaveParams = params.wavelet;
-            WavCurve wavCLVCurve;
-            WavCurve wavdenoise;
-            WavCurve wavdenoiseh;
-            Wavblcurve wavblcurve;
-            WavOpacityCurveRG waOpacityCurveRG;
-            WavOpacityCurveSH waOpacityCurveSH;
-            WavOpacityCurveBY waOpacityCurveBY;
-            WavOpacityCurveW waOpacityCurveW;
-            WavOpacityCurveWL waOpacityCurveWL;
-            LabImage *provradius = nullptr;
-            bool procont = WaveParams.expcontrast;
-            bool prochro = WaveParams.expchroma;
-            bool proedge = WaveParams.expedge;
-            bool profin = WaveParams.expfinal;
-            bool proton = WaveParams.exptoning;
-            bool pronois = WaveParams.expnoise;
-
-            if (WaveParams.softrad > 0.f) {
-                provradius = new LabImage(*labView, true);
-            }
-
-            params.wavelet.getCurves(wavCLVCurve, wavdenoise, wavdenoiseh, wavblcurve, waOpacityCurveRG, waOpacityCurveSH, waOpacityCurveBY, waOpacityCurveW, waOpacityCurveWL);
-
-            CurveFactory::diagonalCurve2Lut(params.wavelet.wavclCurve, wavclCurve, 1);
-
-            if ((WaveParams.ushamethod == "sharp" || WaveParams.ushamethod == "clari") && WaveParams.expclari && WaveParams.CLmethod != "all") {
-                const Glib::ustring provis = params.wavelet.CLmethod;
-                params.wavelet.CLmethod = "all";
-                ipf.ip_wavelet(labView, labView, 2, WaveParams, wavCLVCurve, wavdenoise, wavdenoiseh, wavblcurve, waOpacityCurveRG, waOpacityCurveSH, waOpacityCurveBY, waOpacityCurveW,  waOpacityCurveWL, wavclCurve, 1);
-                unshar = new LabImage(*labView, true);
-                params.wavelet.CLmethod = provis;
-
-                WaveParams.expcontrast = false;
-                WaveParams.expchroma = false;
-                WaveParams.expedge = false;
-                WaveParams.expfinal = false;
-                WaveParams.exptoning = false;
-                WaveParams.expnoise = false;
-            }
-
-            ipf.ip_wavelet(labView, labView, 2, WaveParams, wavCLVCurve, wavdenoise, wavdenoiseh, wavblcurve, waOpacityCurveRG, waOpacityCurveSH, waOpacityCurveBY, waOpacityCurveW,  waOpacityCurveWL, wavclCurve, 1);
-
-            if ((WaveParams.ushamethod == "sharp" || WaveParams.ushamethod == "clari") && WaveParams.expclari && WaveParams.CLmethod != "all") {
-                WaveParams.expcontrast = procont;
-                WaveParams.expchroma = prochro;
-                WaveParams.expedge = proedge;
-                WaveParams.expfinal = profin;
-                WaveParams.exptoning = proton;
-                WaveParams.expnoise = pronois;
-
-                if (WaveParams.softrad > 0.f) {
-                    array2D<float> ble(fw, fh);
-                    array2D<float> guid(fw, fh);
-                    Imagefloat *tmpImage = nullptr;
-                    tmpImage = new Imagefloat(fw, fh);
-#ifdef _OPENMP
-                    #pragma omp parallel for
-#endif
-
-                    for (int ir = 0; ir < fh; ir++)
-                        for (int jr = 0; jr < fw; jr++) {
-                            float X, Y, Z;
-                            float L = provradius->L[ir][jr];
-                            float a = provradius->a[ir][jr];
-                            float b = provradius->b[ir][jr];
-                            Color::Lab2XYZ(L, a, b, X, Y, Z);
-
-                            guid[ir][jr] = Y / 32768.f;
-                            float La = labView->L[ir][jr];
-                            float aa = labView->a[ir][jr];
-                            float ba = labView->b[ir][jr];
-                            Color::Lab2XYZ(La, aa, ba, X, Y, Z);
-                            tmpImage->r(ir, jr) = X;
-                            tmpImage->g(ir, jr) = Y;
-                            tmpImage->b(ir, jr) = Z;
-                            ble[ir][jr] = Y / 32768.f;
-                        }
-
-                    double epsilmax = 0.0001;
-                    double epsilmin = 0.00001;
-                    double aepsil = (epsilmax - epsilmin) / 100.f;
-                    double bepsil = epsilmin; //epsilmax - 100.f * aepsil;
-                    double epsil = aepsil * WaveParams.softrad + bepsil;
-
-                    float blur = 10.f / 1 * (0.5f + 0.8f * WaveParams.softrad);
-                    // rtengine::guidedFilter(guid, ble, ble, blur, 0.001, multiTh);
-                    rtengine::guidedFilter(guid, ble, ble, blur, epsil, false);
-
-
-
-#ifdef _OPENMP
-                    #pragma omp parallel for
-#endif
-
-                    for (int ir = 0; ir < fh; ir++)
-                        for (int jr = 0; jr < fw; jr++) {
-                            float X = tmpImage->r(ir, jr);
-                            float Y = 32768.f * ble[ir][jr];
-                            float Z = tmpImage->b(ir, jr);
-                            float L, a, b;
-                            Color::XYZ2Lab(X, Y, Z, L, a, b);
-                            labView->L[ir][jr] = L;
-                        }
-
-                    delete tmpImage;
-                }
-
-            }
-
-            if ((WaveParams.ushamethod == "sharp" || WaveParams.ushamethod == "clari") && WaveParams.expclari && WaveParams.CLmethod != "all") {
-                float mL = (float)(WaveParams.mergeL / 100.f);
-                float mC = (float)(WaveParams.mergeC / 100.f);
-                float mL0;
-                float mC0;
-
-                if ((WaveParams.CLmethod == "one" || WaveParams.CLmethod == "inf")  && WaveParams.Backmethod == "black") {
-                    mL0 = mC0 = 0.f;
-                    mL = -1.5f * mL;
-                    mC = -mC;
-                } else if (WaveParams.CLmethod == "sup" && WaveParams.Backmethod == "resid") {
-                    mL0 = mL;
-                    mC0 = mC;
-                } else {
-                    mL0 = mL = mC0 = mC = 0.f;
-                }
-
-
-#ifdef _OPENMP
-                #pragma omp parallel for
-#endif
-
-                for (int x = 0; x < fh; x++)
-                    for (int y = 0; y < fw; y++) {
-                        labView->L[x][y] = LIM((1.f + mL0) * (unshar->L[x][y]) - mL * labView->L[x][y], 0.f, 32768.f);
-                        labView->a[x][y] = (1.f + mC0) * (unshar->a[x][y]) - mC * labView->a[x][y];
-                        labView->b[x][y] = (1.f + mC0) * (unshar->b[x][y]) - mC * labView->b[x][y];
-                    }
-
-                delete unshar;
-                unshar    = NULL;
-
-                if (WaveParams.softrad > 0.f) {
-                    delete provradius;
-                    provradius    = NULL;
-                }
-
-            }
-
-            wavCLVCurve.Reset();
-        }
+        stage::labWaveletHostBlock(ipf, params, *labView);
     }
 
     /*

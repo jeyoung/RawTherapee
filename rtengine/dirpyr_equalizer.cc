@@ -26,6 +26,7 @@
 #include "cieimage.h"
 #include "color.h"
 #include "curves.h"
+#include "dirpyr_equalizer.h"
 #include "improcfun.h"
 #include "LUT.h"
 #include "opthelper.h"
@@ -370,6 +371,53 @@ void idirpyr_eq_channelcam(const float * const * data_coarse, const float * cons
 namespace rtengine
 {
 
+/*
+ * The range table, shared with the lab.wavelet device node's host setup. The
+ * anonymous-namespace fillLut() above stays the one implementation.
+ */
+void dirpyrFillLut(LUTf& irangefn, int level, double dirpyrThreshold,
+                   float mult, float skinprot)
+{
+    fillLut(irangefn, level, dirpyrThreshold, mult, skinprot);
+}
+
+/*
+ * The block's hue/chroma precompute. Keeping the SSE2 precompute here means
+ * the device node receives the same masks the block itself computes on this
+ * build.
+ */
+void dirpyrHueChroma(const float* const* l_a, const float* const* l_b,
+                     float** hue, float** chrom, int width, int height)
+{
+#ifdef _OPENMP
+    #pragma omp parallel
+#endif
+    {
+#if defined(__SSE2__) || defined(RT_SIMDE)
+        const vfloat div = F2V(327.68f);
+#endif
+#ifdef _OPENMP
+        #pragma omp for
+#endif
+
+        for (int i = 0; i < height; i++) {
+            int j = 0;
+#if defined(__SSE2__) || defined(RT_SIMDE)
+            for (; j < width - 3; j += 4) {
+                const vfloat lav = LVFU(l_a[i][j]);
+                const vfloat lbv = LVFU(l_b[i][j]);
+                STVFU(hue[i][j], xatan2f(lbv, lav));
+                STVFU(chrom[i][j], vsqrtf(SQRV(lbv) + SQRV(lav)) / div);
+            }
+#endif
+            for (; j < width; j++) {
+                hue[i][j] = xatan2f(l_b[i][j], l_a[i][j]);
+                chrom[i][j] = sqrtf(SQR((l_b[i][j])) + SQR((l_a[i][j]))) / 327.68f;
+            }
+        }
+    }
+}
+
 void ImProcFunctions::dirpyr_equalizer(const float * const * src, float ** dst, int srcwidth, int srcheight, const float * const * l_a, const float * const * l_b, const double * mult, const double dirpyrThreshold, const double skinprot, float b_l, float t_l, float t_r, int scaleprev)
 {
     //sequence of scales
@@ -414,34 +462,7 @@ void ImProcFunctions::dirpyr_equalizer(const float * const * src, float ** dst, 
         // but we need two additional buffers for this preprocessing
         tmpHue(srcwidth, srcheight);
         tmpChr(srcwidth, srcheight);
-
-#ifdef _OPENMP
-        #pragma omp parallel
-#endif
-        {
-#if defined(__SSE2__) || defined(RT_SIMDE)
-            const vfloat div = F2V(327.68f);
-#endif
-#ifdef _OPENMP
-            #pragma omp for
-#endif
-
-            for (int i = 0; i < srcheight; i++) {
-                int j = 0;
-#if defined(__SSE2__) || defined(RT_SIMDE)
-                for (; j < srcwidth - 3; j += 4) {
-                    const vfloat lav = LVFU(l_a[i][j]);
-                    const vfloat lbv = LVFU(l_b[i][j]);
-                    STVFU(tmpHue[i][j], xatan2f(lbv, lav));
-                    STVFU(tmpChr[i][j], vsqrtf(SQRV(lbv) + SQRV(lav)) / div);
-                }
-#endif
-                for (; j < srcwidth; j++) {
-                    tmpHue[i][j] = xatan2f(l_b[i][j], l_a[i][j]);
-                    tmpChr[i][j] = sqrtf(SQR((l_b[i][j])) + SQR((l_a[i][j]))) / 327.68f;
-                }
-            }
-        }
+        dirpyrHueChroma(l_a, l_b, tmpHue, tmpChr, srcwidth, srcheight);
     }
 
     // with the current implementation of idirpyr_eq_channel we can safely use the buffer from last level as buffer, saves some memory
