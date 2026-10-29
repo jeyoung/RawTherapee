@@ -5879,7 +5879,7 @@ void test_lab_wavelet(bool available)
      * refused and must run the block on the host byte for byte.
      */
     const char* residual_labels[] = {
-        "wavelet enabled", "cbdlMethod bef", "mult out of range",
+        "wavelet enabled without contrast", "cbdlMethod bef", "mult out of range",
         "threshold out of range", "skin out of range",
         "all multipliers neutral", "CIE-CAM gate closed"};
     for (const char* label : residual_labels) {
@@ -5890,7 +5890,7 @@ void test_lab_wavelet(bool available)
         params.dirpyrequalizer.threshold = 0.2;
         params.dirpyrequalizer.skinprotect = 0.0;
 
-        if (std::strcmp(label, "wavelet enabled") == 0) {
+        if (std::strcmp(label, "wavelet enabled without contrast") == 0) {
             params.wavelet.enabled = true;
         } else if (std::strcmp(label, "cbdlMethod bef") == 0) {
             params.dirpyrequalizer.cbdlMethod = "bef";
@@ -6046,6 +6046,389 @@ void test_lab_wavelet(bool available)
                     artifact.differing, artifact.samples, artifact.max_abs);
         check(artifact.differing > 0,
               "lab.wavelet gamutlab pre-pass changes the image");
+    }
+}
+
+/* --------------------------------------------- lab.wavelet contrast pass */
+
+/*
+ * The contrast-only wavelet configuration. The equaliser is off unless the
+ * case asks for both passes; every other panel is off, which is the set the
+ * device admits.
+ */
+void wavelet_contrast_params(rtengine::procparams::ProcParams& params,
+                             int levels, bool highlight_shadow,
+                             const int* contrast, double sigma, double offset,
+                             int strength)
+{
+    params.dirpyrequalizer.enabled = false;
+    params.wavelet.enabled = true;
+    params.wavelet.expcontrast = true;
+    params.wavelet.expchroma = false;
+    params.wavelet.expedge = false;
+    params.wavelet.expbl = false;
+    params.wavelet.expresid = false;
+    params.wavelet.expfinal = false;
+    params.wavelet.exptoning = false;
+    params.wavelet.expnoise = false;
+    params.wavelet.expclari = false;
+    params.wavelet.CLmethod = "all";
+    params.wavelet.Tilesmethod = "full";
+    params.wavelet.HSmethod = highlight_shadow ? "with" : "without";
+    params.wavelet.daubcoeffmethod = "6_";
+    params.wavelet.thres = levels;
+    params.wavelet.threshold = 4;
+    params.wavelet.threshold2 = 5;
+    params.wavelet.sigma = sigma;
+    params.wavelet.offset = offset;
+    params.wavelet.lowthr = 40.0;
+    params.wavelet.strength = strength;
+    params.wavelet.softrad = 0.0;
+    params.wavelet.softradend = 0.0;
+    params.wavelet.skinprotect = 0.0;
+    params.wavelet.avoid = false;
+    params.wavelet.median = false;
+    params.wavelet.medianlev = false;
+    params.wavelet.sup = 0;
+    for (int level = 0; level < 9; ++level) {
+        params.wavelet.c[level] = contrast[level];
+    }
+}
+
+void test_lab_wavelet_contrast(bool available)
+{
+    using namespace rtengine::stage;
+
+    static MyMutex contrast_lcms_mutex;
+    if (rtengine::lcmsMutex == nullptr) {
+        rtengine::lcmsMutex = &contrast_lcms_mutex;
+    }
+    static rtengine::Settings contrast_settings{};
+    rtengine::settings = &contrast_settings;
+    rtengine::Color::init();
+
+    const std::string profile_path =
+        std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp") +
+        "/stage-residency-lab-wavelet-contrast.jsonl";
+
+    if (!available) {
+        skip("lab.wavelet contrast: no OpenCL device");
+        return;
+    }
+
+    struct WaveletCase {
+        const char* label;
+        int width;
+        int height;
+        int levels;
+        bool highlight_shadow;
+        int contrast[9];
+        double sigma;
+        double offset;
+        int strength;
+        bool transform_only;
+        bool equalizer;
+        int image; /* 0 random, 1 gradient */
+    };
+
+    const WaveletCase cases[] = {
+        /* Transform only: contrast multipliers are zero and the residual
+         * contrast slider keeps the decomposition alive, so the device runs
+         * the forward and inverse transform through the same path the host
+         * block uses. Production refuses c[0] == 0; the forced submission
+         * proves the transform itself is bit-exact. */
+        {"transform only", 179, 48, 5, false, {0, 0, 0, 0, 0, 0, 0, 0, 0},
+         1.0, 1.0, 100, true, false, 1},
+        {"contrast without HS", 179, 48, 5, false,
+         {24, 18, 12, 6, 3, 0, 0, 0, 0}, 1.0, 1.0, 100, false, false, 1},
+        {"contrast negative c", 179, 48, 5, false,
+         {-30, -20, -10, 5, 5, 0, 0, 0, 0}, 1.0, 1.0, 100, false, false, 0},
+        {"contrast sigma offset", 238, 64, 6, false,
+         {35, 25, 15, 8, 4, 2, 0, 0, 0}, 0.5, 1.4, 100, false, false, 1},
+        {"contrast strength 60", 238, 64, 6, false,
+         {35, 25, 15, 8, 4, 2, 0, 0, 0}, 1.0, 1.0, 60, false, false, 1},
+        {"contrast with HS", 238, 64, 6, true,
+         {30, 22, 14, 8, 4, 2, 0, 0, 0}, 1.0, 1.0, 100, false, false, 1},
+        {"contrast HS padded 179", 179, 49, 5, true,
+         {30, 22, 14, 8, 4, 0, 0, 0, 0}, 1.0, 1.0, 100, false, false, 0},
+        {"levels 1", 179, 48, 1, false, {40, 0, 0, 0, 0, 0, 0, 0, 0}, 1.0,
+         1.0, 100, false, false, 1},
+        {"levels 2", 179, 48, 2, false, {40, 20, 0, 0, 0, 0, 0, 0, 0}, 1.0,
+         1.0, 100, false, false, 1},
+        {"levels 3", 179, 48, 3, false, {40, 20, 10, 0, 0, 0, 0, 0, 0},
+         1.0, 1.0, 100, false, false, 1},
+        {"levels 7", 179, 160, 7, true,
+         {40, 30, 20, 10, 5, 3, 2, 0, 0}, 1.0, 1.0, 100, false, false, 1},
+        {"wide 8192", 8192, 64, 6, true,
+         {30, 22, 14, 8, 4, 2, 0, 0, 0}, 1.0, 1.0, 100, false, false, 0},
+        {"equalizer and wavelet", 238, 64, 6, true,
+         {30, 22, 14, 8, 4, 2, 0, 0, 0}, 1.0, 1.0, 100, false, true, 1},
+    };
+
+    unsigned seed = 0x1b56c4e9u;
+    for (const WaveletCase& item : cases) {
+        rtengine::procparams::ProcParams params;
+        wavelet_contrast_params(params, item.levels, item.highlight_shadow,
+                                item.contrast, item.sigma, item.offset,
+                                item.strength);
+        if (item.transform_only) {
+            /* Keep the decomposition alive with a non-zero residual contrast
+             * slider; the residual curve itself needs Expresid, which is off,
+             * so the host block only runs the transform. */
+            params.wavelet.contrast = 1;
+        }
+        if (item.equalizer) {
+            params.dirpyrequalizer.enabled = true;
+            params.dirpyrequalizer.cbdlMethod = "aft";
+            params.dirpyrequalizer.mult[0] = 1.4;
+            params.dirpyrequalizer.threshold = 0.2;
+        }
+
+        LabImage source(item.width, item.height);
+        if (item.image == 1) {
+            fill_lab_wavelet_skin(source);
+        } else {
+            fill_lab_tools(source, seed++);
+        }
+
+        if (item.transform_only) {
+            check(!labWaveletSupported(params, item.width, item.height),
+                  "lab.wavelet transform-only set is a production residual");
+        } else {
+            check(labWaveletSupported(params, item.width, item.height),
+                  (std::string("lab.wavelet contrast ") + item.label +
+                   " is the supported set").c_str());
+        }
+
+        rtengine::ImProcFunctions cpu_ipf(&params, false);
+        LabImage cpu(item.width, item.height);
+        cpu.CopyFrom(&source);
+        labWaveletHostBlock(cpu_ipf, params, cpu);
+
+        rtengine::ImProcFunctions device_ipf(&params, false);
+        LabImage device(item.width, item.height);
+        device.CopyFrom(&source);
+        const LabWaveletRun result = run_lab_wavelet_node(
+            device, params, device_ipf, profile_path, true,
+            item.transform_only);
+        const std::string profile = read_file(profile_path);
+
+        check(result.deviceReady,
+              (std::string("lab.wavelet contrast ") + item.label +
+               " builds its host setup").c_str());
+        check(result.status == RT_STAGE_OK,
+              (std::string("lab.wavelet contrast ") + item.label +
+               " completes through run()").c_str());
+        check(profile.find("\"stage\":\"lab.wavelet\"") != std::string::npos,
+              (std::string("lab.wavelet contrast ") + item.label +
+               " records the node").c_str());
+        check(profile.find("\"impl\":\"opencl\"") != std::string::npos,
+              (std::string("lab.wavelet contrast ") + item.label +
+               " records a device execution").c_str());
+
+        const Distribution d = distribution(view(device), view(cpu));
+        std::printf("stage-residency: lab.wavelet contrast %s %dx%d L%d: "
+                    "PAE %.6f LSB16; exact %zu, <=0.25 %zu, <=0.5 %zu, "
+                    "<=1 %zu, >1 %zu of %zu\n",
+                    item.label, item.width, item.height, item.levels,
+                    d.max_abs, d.exact, d.quarter, d.half, d.one, d.over,
+                    d.samples);
+        check(d.finite,
+              (std::string("lab.wavelet contrast ") + item.label +
+               " stays finite").c_str());
+        check(d.one == 0 && d.over == 0,
+              (std::string("lab.wavelet contrast ") + item.label +
+               " is within one LSB16").c_str());
+    }
+
+    /*
+     * Residuals: every parameter outside the contrast-only set must run the
+     * block on the host, byte for byte.
+     */
+    const char* residual_labels[] = {
+        "expcontrast off", "expchroma on", "expedge on", "expbl on",
+        "expresid on", "expfinal on", "exptoning on", "expnoise on",
+        "expclari on", "CLmethod one", "Tilesmethod big", "softrad",
+        "skinprotect", "avoid", "median", "sup", "daubcoeffmethod 4_",
+        "HSmethod other", "Chcurve", "sigma range", "offset range",
+        "lowthr range", "threshold range", "threshold2 range",
+        "strength range", "c range", "c0 zero", "levels zero",
+        "nothing enabled"};
+    for (const char* label : residual_labels) {
+        rtengine::procparams::ProcParams params;
+        const int contrast[9] = {30, 22, 14, 8, 4, 2, 0, 0, 0};
+        wavelet_contrast_params(params, 6, true, contrast, 1.0, 1.0, 100);
+
+        if (std::strcmp(label, "expcontrast off") == 0) {
+            params.wavelet.expcontrast = false;
+        } else if (std::strcmp(label, "expchroma on") == 0) {
+            params.wavelet.expchroma = true;
+        } else if (std::strcmp(label, "expedge on") == 0) {
+            params.wavelet.expedge = true;
+        } else if (std::strcmp(label, "expbl on") == 0) {
+            params.wavelet.expbl = true;
+        } else if (std::strcmp(label, "expresid on") == 0) {
+            params.wavelet.expresid = true;
+        } else if (std::strcmp(label, "expfinal on") == 0) {
+            params.wavelet.expfinal = true;
+        } else if (std::strcmp(label, "exptoning on") == 0) {
+            params.wavelet.exptoning = true;
+        } else if (std::strcmp(label, "expnoise on") == 0) {
+            params.wavelet.expnoise = true;
+        } else if (std::strcmp(label, "expclari on") == 0) {
+            params.wavelet.expclari = true;
+        } else if (std::strcmp(label, "CLmethod one") == 0) {
+            params.wavelet.CLmethod = "one";
+        } else if (std::strcmp(label, "Tilesmethod big") == 0) {
+            params.wavelet.Tilesmethod = "big";
+        } else if (std::strcmp(label, "softrad") == 0) {
+            params.wavelet.softrad = 5.0;
+        } else if (std::strcmp(label, "skinprotect") == 0) {
+            params.wavelet.skinprotect = 30.0;
+        } else if (std::strcmp(label, "avoid") == 0) {
+            params.wavelet.avoid = true;
+        } else if (std::strcmp(label, "median") == 0) {
+            params.wavelet.median = true;
+        } else if (std::strcmp(label, "sup") == 0) {
+            params.wavelet.sup = 10;
+        } else if (std::strcmp(label, "daubcoeffmethod 4_") == 0) {
+            params.wavelet.daubcoeffmethod = "4_";
+        } else if (std::strcmp(label, "HSmethod other") == 0) {
+            params.wavelet.HSmethod = "other";
+        } else if (std::strcmp(label, "Chcurve") == 0) {
+            params.wavelet.Chcurve = {1.0, 0.0, 0.5, 0.35, 0.35, 0.5, 0.2, 0.35, 0.35, 1.0, 0.5, 0.35, 0.35};
+        } else if (std::strcmp(label, "sigma range") == 0) {
+            params.wavelet.sigma = 3.0;
+        } else if (std::strcmp(label, "offset range") == 0) {
+            params.wavelet.offset = 2.0;
+        } else if (std::strcmp(label, "lowthr range") == 0) {
+            params.wavelet.lowthr = 10.0;
+        } else if (std::strcmp(label, "threshold range") == 0) {
+            params.wavelet.threshold = 0;
+        } else if (std::strcmp(label, "threshold2 range") == 0) {
+            params.wavelet.threshold2 = 2;
+        } else if (std::strcmp(label, "strength range") == 0) {
+            params.wavelet.strength = 101;
+        } else if (std::strcmp(label, "c range") == 0) {
+            params.wavelet.c[0] = 400;
+        } else if (std::strcmp(label, "c0 zero") == 0) {
+            params.wavelet.c[0] = 0;
+        } else if (std::strcmp(label, "levels zero") == 0) {
+            params.wavelet.thres = 0;
+        } else if (std::strcmp(label, "nothing enabled") == 0) {
+            params.wavelet.enabled = false;
+            params.dirpyrequalizer.enabled = false;
+        }
+
+        check(!labWaveletSupported(params, 238, 64),
+              (std::string("lab.wavelet contrast residual ") + label +
+               " is a residual").c_str());
+
+        LabImage source(238, 64);
+        fill_lab_wavelet_skin(source);
+
+        rtengine::ImProcFunctions cpu_ipf(&params, false);
+        LabImage cpu(238, 64);
+        cpu.CopyFrom(&source);
+        labWaveletHostBlock(cpu_ipf, params, cpu);
+
+        rtengine::ImProcFunctions device_ipf(&params, false);
+        LabImage device(238, 64);
+        device.CopyFrom(&source);
+        const LabWaveletRun result =
+            run_lab_wavelet_node(device, params, device_ipf, profile_path);
+        const std::string profile = read_file(profile_path);
+
+        check(!result.supported,
+              (std::string("lab.wavelet contrast residual ") + label +
+               " is refused as a device configuration").c_str());
+        check(!result.deviceReady,
+              (std::string("lab.wavelet contrast residual ") + label +
+               " does not build a device setup").c_str());
+        check(result.status == RT_STAGE_OK,
+              (std::string("lab.wavelet contrast residual ") + label +
+               " completes through run()").c_str());
+        check(profile.find("\"impl\":\"host\"") != std::string::npos,
+              (std::string("lab.wavelet contrast residual ") + label +
+               " records a host execution").c_str());
+        check(profile.find("\"impl\":\"opencl\"") == std::string::npos,
+              (std::string("lab.wavelet contrast residual ") + label +
+               " never mixes a device pass").c_str());
+
+        const Diff diff = compare(view(device), view(cpu));
+        std::printf("stage-residency: lab.wavelet contrast residual %s: "
+                    "host, PAE %.6f LSB16, %zu of %zu samples differ\n",
+                    label, diff.max_abs, diff.differing, diff.samples);
+        check(diff.finite,
+              (std::string("lab.wavelet contrast residual ") + label +
+               " stays finite").c_str());
+        check(diff.differing == 0 && diff.max_abs == 0.0,
+              (std::string("lab.wavelet contrast residual ") + label +
+               " matches the CPU block").c_str());
+    }
+
+    /*
+     * The default path: with RT_STAGE_OPENCL unset and no override, run()
+     * resolves to the built-in, which executes the same extracted host block.
+     * It must match the direct block byte for byte, with the equaliser off
+     * and only the wavelet tool enabled.
+     */
+    {
+        rtengine::procparams::ProcParams params;
+        const int contrast[9] = {30, 22, 14, 8, 4, 2, 0, 0, 0};
+        wavelet_contrast_params(params, 6, true, contrast, 1.0, 1.0, 100);
+
+        LabImage source(238, 64);
+        fill_lab_wavelet_skin(source);
+
+        rtengine::ImProcFunctions host_ipf(&params, false);
+        LabImage host(238, 64);
+        host.CopyFrom(&source);
+        labWaveletHostBlock(host_ipf, params, host);
+
+        rtengine::ImProcFunctions builtin_ipf(&params, false);
+        LabImage builtin(238, 64);
+        builtin.CopyFrom(&source);
+        const LabWaveletRun result = run_lab_wavelet_node(
+            builtin, params, builtin_ipf, profile_path, false);
+        const std::string profile = read_file(profile_path);
+        check(result.status == RT_STAGE_OK,
+              "lab.wavelet contrast default path completes through run()");
+        check(profile.find("\"impl\":\"builtin\"") != std::string::npos,
+              "lab.wavelet contrast default path records the built-in "
+              "implementation");
+        check(profile.find("\"impl\":\"opencl\"") == std::string::npos,
+              "lab.wavelet contrast default path never runs a device pass");
+        const Diff diff = compare(view(builtin), view(host));
+        check(diff.differing == 0 && diff.max_abs == 0.0,
+              "lab.wavelet contrast default path matches the host block");
+    }
+
+    /*
+     * Non-vacuity: the contrast path must change thousands of samples and
+     * move at least one by more than one LSB16 against the identity.
+     */
+    {
+        rtengine::procparams::ProcParams params;
+        const int contrast[9] = {40, 30, 20, 10, 5, 3, 0, 0, 0};
+        wavelet_contrast_params(params, 6, true, contrast, 1.0, 1.0, 100);
+
+        LabImage source(238, 64);
+        fill_lab_wavelet_skin(source);
+
+        rtengine::ImProcFunctions ipf(&params, false);
+        LabImage changed(238, 64);
+        changed.CopyFrom(&source);
+        labWaveletHostBlock(ipf, params, changed);
+
+        const Diff diff = compare(view(changed), view(source));
+        std::printf("stage-residency: lab.wavelet contrast changes %zu of "
+                    "%zu samples against the identity, PAE %.6f LSB16\n",
+                    diff.differing, diff.samples, diff.max_abs);
+        check(diff.differing > 1000,
+              "lab.wavelet contrast changes thousands of samples");
+        check(diff.max_abs > 1.0,
+              "lab.wavelet contrast moves more than one LSB16");
     }
 }
 
@@ -6787,6 +7170,7 @@ int main()
     test_lab_tools_local_contrast(available);
     test_lab_tools_regions(available);
     test_lab_wavelet(available);
+    test_lab_wavelet_contrast(available);
     test_lab_wavelet_gpu(available);
     test_output_sharpen(available);
     test_run_wiring(available);
