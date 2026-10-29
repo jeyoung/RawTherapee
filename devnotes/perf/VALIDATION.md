@@ -229,10 +229,11 @@ of them the GUI silently uses the CPU path.
 
 ## Publication scan
 
-Scope: the complete `origin/perf-graph..HEAD` range (83 commits at the time of
-the scan), the working tree, every commit message, every author and committer
+Scope: the complete `origin/perf-graph..HEAD` range at `8fdcb2fb3` (166
+commits), the working tree, every commit message, every author and committer
 identity, the tracked test-data manifest and the provider-side content on
-`origin` (24 issues, no pull requests, no releases).
+`origin` (24 issues, no pull requests, no releases). The scan was run again on
+the commit that records this result before the push.
 
 | Check | Result |
 |---|---|
@@ -240,16 +241,17 @@ identity, the tracked test-data manifest and the provider-side content on
 | Absolute home paths (`/home/`, `/Users/`, drive paths) | none |
 | Private corpus names and hashes | none |
 | IPv4 addresses | none |
-| Email addresses in added lines | none |
-| Authors and committers | `Eddy Young <jeyoung@users.noreply.github.com>` only |
+| Email addresses in added lines | only the noreply identity recorded in this table |
+| Authors and committers | `Eddy Young <jeyoung@users.noreply.github.com>` only, all 166 commits |
 | Commit messages | clean |
-| Provider-side issues, PRs, releases | clean |
-| `devnotes/opencl/testdata.manifest` | public rows only |
+| Tags and releases created by this range | none |
+| Provider-side issues, PRs, releases | unchanged by this range |
+| `devnotes/opencl/testdata.manifest` and `TESTDATA.md` | public rows only; private samples are gitignored and unlisted |
+| Windows drive paths, machine identifiers, serials, phone numbers | none |
 
 The private rows published before `origin/perf-graph` (`cf40fbc36` added them,
 `dd031f371` removed them) remain a recorded incident. Per policy the pushed
 history is not rewritten and the current content is clean.
 
-Commits made after the scan (the precedence fix, the verifier mode and the
-record updates) are not yet scanned; scan the then-current range again before
-any push. No push was performed.
+The branch is fast-forward from `origin/perf-graph`; the push publishes this
+range only. Push is now authorised for each stable, scanned range.
