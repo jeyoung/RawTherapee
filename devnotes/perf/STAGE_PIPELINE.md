@@ -168,6 +168,24 @@ channel difference into more than one LSB16. A
 residual runs the `lab.tools` host builtin and records `impl=host`, never a
 device pass.
 
+`lab.wavelet` is partial: the directional pyramid equaliser runs on the
+device when it is enabled in after-CBDL position (`cbdlMethod == "aft"`), the
+wavelet tool is off and the CIE-CAM gate admits the pass. The host builds the
+per-level range tables through the equaliser's own `fillLut()` and the
+hue/chroma masks through its own SSE-aware precompute, and exports the
+`badpixels` protection as a host pre-pass when `gamutlab` and `skinprotect`
+are both set. The kernel is a port of `dirpyr_channel()` and
+`idirpyr_eq_channel()`/`Color::SkinSatCbdl()`: it reproduces the scalar and
+SSE weight forms, the 5x5 domain kernel at levels 2 and above, the host's
+four-column SSE groups and their shifted lane loads, the interpolated
+`LUTf::operator[](float)` lookup, the skin scale and the in-place
+reconstruction. It is admitted only on a CPU OpenCL device. An enabled
+wavelet tool, `cbdlMethod == "bef"`, an out-of-range multiplier, threshold,
+skin or hue point, an all-neutral pyramid, a closed CIE-CAM gate, an image
+too narrow for its pyramid and a GPU device are residuals: each runs the
+`lab.wavelet` host builtin and records `impl=host`, never a device pass. The
+wavelet tool remains host-side until its own increment.
+
 `lab.sharpening` is partial through the same `output.sharpen` node:
 `ImProcFunctions::sharpening()` is the entry point for both the Lab block and
 the post-resize block, so a Lab-only profile records `output.sharpen`. The
@@ -189,7 +207,7 @@ main sharpen node may still run on the device.
 | `rgb.proc` | Full/Full/Roi/Reduced | path | reuse-input | RGB curves, tone curve, colour toning, B&W, channel mixer, HSV, film simulation | yes |
 | `lab.tools` | Full/Full/Roi/Reduced | path | reuse-input | shadows/highlights, vibrance, Lab curves, local contrast, EPD, Lab-grid colour toning and Lab colour-correction regions | partial |
 | `lab.sharpening` | Full/-/Roi/- | path | reuse-input | impulse denoise, defringe, ML sharpen edges, ML microcontrast and the main sharpen pass (shared `output.sharpen` node) | partial |
-| `lab.wavelet` | Full/Full/Roi/Reduced | path | reuse-input | directional pyramid equaliser and wavelet | no |
+| `lab.wavelet` | Full/Full/Roi/Reduced | path | reuse-input | directional pyramid equaliser and wavelet | partial |
 | `working.trc` | Full/Full/Roi/- | path | reuse-input | soft light, tone equaliser and working-TRC conversion | partial |
 | `ciecam` | Full/Full/Roi/- | path | reuse-input | CIE CAM 02 | no |
 | `gamut` | Full/Full/Roi/Reduced | path | reuse-input | working-space gamut compression | yes |

@@ -2529,6 +2529,114 @@ With `OMP_NUM_THREADS=1`, a 3888x2608 PEF and the POCL CPU device:
 | OpenCL-disabled build (`build/cpu-perf-graph`, no OpenCL backend) | `rtengine` and `stage-residency-test` compile; the test prints `OpenCL unavailable (built without OpenCL)` and passes with 21 skipped. The `lab.tools` rows are host-only, so the CPU tree stays buildable and green |
 | Forced refusal (`RT_STAGE_DEVICE_BUDGET_MB=16`, `RT_REQUIRE_GPU=1`) | FAIL, exit 1, so the gate is not vacuous |
 
+## Lab wavelet
+
+`lab.wavelet` runs the directional pyramid equaliser as one device node. The
+wavelet tool in the same block is not ported yet: an enabled `wavelet` section
+is a residual and keeps the whole block on the host, so this node only ever
+runs the equaliser and the residual list below.
+
+### Supported set
+
+`labWaveletSupported()` admits a profile where
+
+- `dirpyrequalizer.enabled` is true and `cbdlMethod == "aft"`;
+- `wavelet.enabled` is false;
+- the call site's CIE-CAM gate is open
+  (`(colorappearance.enabled && !settings->autocielab) || !cam02`);
+- every multiplier is finite and in 0..4, the threshold in 0..1, skin
+  protection in -100..100 and each hue point in -10..10;
+- at least one multiplier is more than 0.001 away from 1, so the block would
+  touch the image.
+
+The launcher additionally requires a CPU OpenCL device (POCL), at least an
+8x8 image, and a width of at least twice the largest half-window the active
+levels read (`4 * 2^(levels-1)` for six levels, 128 columns). A GPU device, an
+image that narrow, or an enabled wavelet tool reaches the builtin and records
+`impl=host`.
+
+### ABI
+
+The ABI is `[0]` the three-plane F32 Lab buffer, read and written in place;
+`[1]` the host-only `RtLabWaveletContext` pointer (`RT_STAGE_ARG_PTR`); `[2]`
+the int support flag, mirrored from the context descriptor; `[3..8]` the six
+double multipliers, level 0 finest; `[9]` the double threshold; `[10]` the
+double skin protection; `[11..13]` the doubles `b_l`, `t_l` and `t_r` (the
+block's `hueskin` points divided by 100); `[14]` int `gamutlab`; `[15]` int
+the block's scale, which the launcher requires to be 1; `[16]` int the number
+of active levels; `[17]` the host-built range tables, `levels * 0x20000`
+floats; `[18]` the host-built hue mask and `[19]` the chroma mask, each
+`width * height` floats and present only when skin protection is non-zero.
+Nothing in the context is uploaded: the pointers are host memory the launcher
+reads.
+
+### Arithmetic and provenance
+
+The block's own code supplies both host inputs, through two helpers extracted
+from `dirpyr_equalizer.cc` so the block and the setup cannot drift:
+
+- `dirpyrFillLut()` is the block's `fillLut()`, run once per active level. The
+  kernel never evaluates the threshold band, the `exp(level * log(3))` scale
+  or the 0.65/0.45 multiplier taper.
+- `dirpyrHueChroma()` is the block's precompute, including its SSE
+  `xatan2f()`/`sqrt` path and its scalar tail. The kernel reads the resulting
+  masks, so it never re-derives an angle.
+
+The kernel is a port of `dirpyr_channel()`,
+`idirpyr_eq_channel()` and `Color::SkinSatCbdl()`:
+
+- levels 0 and 1 use the kernel-free neighbour set; levels 2 to 5 use the
+  5x5 domain kernel (`1000/2000`) at `scale = 2^level`;
+- every level reads the same neighbour order, boundary clamps and
+  `rangeFn()` floor of 1000 as the host;
+- the host's SSE loop processes four output columns at a time and loads four
+  consecutive samples per neighbour, so for `scale > 1` lanes 1..3 are not the
+  scalar neighbour set. The device reconstructs the group start and lane and
+  reproduces that load; without it the multi-level cases diverged by up to
+  4.16 LSB16 on the test fixtures;
+- the range lookup reproduces `LUTf::operator[](float)` with
+  `LUT_CLIP_BELOW | LUT_CLIP_ABOVE`: truncation, the `size-2` upper clip and
+  linear interpolation between the two neighbouring entries;
+- the reconstruction starts from the coarsest pyramid level, accumulates the
+  weighted high-pass into that level exactly as the block reuses it, and level
+  0 writes the source L plane, which is the block's final copy;
+- `Color::SkinSatCbdl()` is ported verbatim, with the same float constants,
+  comparison order, `scale == 1` hard/soft branch and the `skinprot > 85`
+  hair/beard extension.
+
+`#pragma OPENCL FP_CONTRACT OFF`, `#pragma STDC FP_CONTRACT OFF` and
+`-cl-fp32-correctly-rounded-divide-sqrt` keep the float operations in the
+block's order. The program is fp32 only.
+
+`gamutlab` with non-zero skin protection is not a kernel: `BadpixelsLab()`
+runs on the host, on a private copy of the image, before the masks are
+computed. Its separable Gaussian analysis and its L/a/b repairs therefore
+match the block bit for bit, and a refusal after the pre-pass leaves the
+caller's Lab buffer untouched. The device launcher then uploads only L and
+copies the repaired a/b planes from the prepared copy after readback.
+
+### Residuals
+
+`wavelet.enabled`, `cbdlMethod == "bef"`, a multiplier, threshold, skin or hue
+point outside the ABI bounds, an all-neutral pyramid, a closed CIE-CAM gate, a
+GPU device, a too-narrow image, and a failed host setup are residuals. Each
+runs the `lab.wavelet` host builtin, which executes the extracted host block
+with device recursion disabled, and records `impl=host`, never a device pass.
+
+### Evidence
+
+`stage-residency-test`, POCL CPU, `OMP_NUM_THREADS=1`:
+
+| Case | Result |
+|---|---|
+| Device parity, 14 cases at 179x48, 238x64 and 8192x64 | six levels, finest only, three levels, threshold 0 and 1, skin protection +60 and -60, gamutlab with and without skin, padded 179/238, a saturated hue circle and an 8192-wide plain and skin case; 3,574,560 samples, `impl=opencl` on every case, no NaN/Inf, worst 0.115234 LSB16 and 0 samples over 1 LSB16 |
+| Non-vacuity | skin protection changes 574 of 45,696 samples (PAE 108.908203 LSB16); the gamutlab pre-pass changes 29,542 of 45,696 (PAE 20,453.597931), so both device paths are exercised |
+| Residuals, seven cases | wavelet enabled, `cbdlMethod bef`, multiplier 5, threshold 2, skin 200, an all-neutral pyramid and a closed CIE-CAM gate are refused, record `impl=host` with no `impl=opencl`, and are byte-identical to the block (PAE 0, 7 x 25,776 samples) |
+| Default path | with `RT_STAGE_OPENCL` unset and no override, `run()` resolves to the builtin, records `impl=builtin`, and is byte-identical to `labWaveletHostBlock` |
+| GPU | not run on a GPU in this change. The launcher's `CL_DEVICE_TYPE` check refuses before any upload, so a GPU submission records `impl=host`; the test's GPU residual is skipped on POCL and runs when a non-CPU device is selected |
+| `verify.sh --stage-device`, POCL CPU, `labwavelet.pp3` | PASS, `max_pae=1.5259e-05` (1 LSB16), record `"stage":"lab.wavelet","impl":"opencl","source":"opencl"` at 3888x2608 |
+| `--gpu=off`, `RT_STAGE_OPENCL` unset | the call site takes the extracted host block; the node is not submitted, and the output is the pre-node CPU result |
+
 ## Limitations
 
 - GPU vibrance and GPU Lab curves are refused by design. The RX 550
@@ -2544,6 +2652,12 @@ With `OMP_NUM_THREADS=1`, a 3888x2608 PEF and the POCL CPU device:
   device for this node, and its PEF gate rows measure 1 LSB16. A CPU device
   without fp64 runs the Lab-curve, local-contrast and region blocks on the host
   and records `impl=host`.
+- The directional pyramid equaliser is CPU-device only. Its per-level
+  arithmetic uses the host's float division and its SSE group load, and a GPU
+  compiler is free to contract the accumulation or round the skin-gate
+  comparisons differently, so the launcher refuses a GPU before any upload
+  and the block records `impl=host`. The wavelet tool in the same block is not
+  ported; an enabled `wavelet` section is a residual for now.
 - P2 residual, not a lab.tools defect: with `RT_STAGE_OPENCL=1` and
   `--gpu=auto` but without `RT_OPENCL_RGBPROC=1`, a CLI export segfaults in
   `opencl::initLocked()` through `ImProcFunctions::lab2rgbOut()` - a null call
