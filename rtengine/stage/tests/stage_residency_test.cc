@@ -2861,10 +2861,10 @@ void test_working_trc(bool available)
 
     if (!available) {
         skip("working.trc: no OpenCL device");
-    } else {
-        check(node_has_device_implementation("working.trc"),
-              "the working.trc node has a device implementation");
+        return;
     }
+    check(node_has_device_implementation("working.trc"),
+          "the working.trc node has a device implementation");
 
     const std::string profile_path =
         std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp") +
