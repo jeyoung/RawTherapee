@@ -165,7 +165,7 @@ node ran on the device rather than only comparing pixels.
 | Lab tools (`labtools-sh-rgb.pp3`, RGB mode) | PASS, `max_pae=1.5259e-05`; `"impl":"opencl"` |
 | Lab tools (`labtools-labgrid.pp3`, LabGrid only) | PASS, `max_pae=1.5259e-05`; `"impl":"opencl"` |
 | Lab tools residual (`labtools-residual.pp3`, vibrance on) | PASS as a host residual: `"stage":"lab.tools","impl":"host","source":"device-fallback"`, not counted as device parity |
-| Lab tools device test | 22 cases at 238x64, 179x48 and 8192x64: LabGrid only, shadows/highlights Lab and RGB modes, both tools, single rounds, amounts 1/50/200/1000, tonal widths 0/100/split, radii 1/10/100 and padded widths; Lab mode bit-exact (PAE 0), RGB mode worst 0.23 LSB16, all finite; six residuals and two steep-table refusals are `impl=host` and bit-identical to the block; a forced launcher refusal is `impl=host` and bit-identical |
+| Lab tools device test | 23 cases at 238x64, 179x48 and 8192x64: LabGrid only, shadows/highlights Lab and RGB modes, both tools, single rounds, amounts 1/50/200/1000, tonal widths 0/100/split, radii 1/10/100 and padded widths; Lab mode bit-exact (PAE 0), RGB mode worst 0.23 LSB16, all finite; six residuals and two steep-table refusals are `impl=host` and bit-identical to the block; a forced launcher refusal is `impl=host` and bit-identical |
 | Lab tools CPU refactor | LabGrid, Lab-mode and RGB-mode exports with `--gpu=off`, `RT_STAGE_OPENCL` unset: pixel data identical to the pre-change binary (`tiffcmp`), only the Software tag differs |
 | Device records | `"stage":"lanczos3"`, `"stage":"transform"`, `"stage":"output.convert"`, `"stage":"gamut"`, `"stage":"framing"` and `"stage":"output.sharpen"`, all `impl":"opencl"`, `source":"opencl"`; the classic log has no `opencl resize`, `opencl transform` or `opencl lab2srgb` line |
 | `monitor.output`, `viewport.output` in the GUI | device records with `impl=opencl`, `source=opencl`; preview image area identical to a CPU-only run (0 LSB8) |
@@ -188,6 +188,15 @@ predicate fails. The device-versus-CPU difference is 1 LSB on 96 426 of
 2 534 980 pixels (3.8%) for resize and on 384 601 of 10 139 424 pixels (3.8%)
 for transform, both inside the limit. The residency test's synthetic images are exact, including the
 identity transform, whose assertion was mutation-checked.
+
+The lab.tools rows above were produced with `tools/opencl/verify.sh`, which
+sets `RT_OPENCL_RGBPROC=1`. Without it, a bare
+`rawtherapee-graph-cli --gpu=auto` export with `RT_STAGE_OPENCL=1` segfaults in
+`opencl::initLocked()` through `ImProcFunctions::lab2rgbOut()` - a null call in
+the classic backend's lazy OpenCL initialisation - for every profile, the
+neutral default included. It reproduces at `03c94581c`, before the lab.tools
+node existed, so it is a pre-existing classic-backend defect, not a lab.tools
+defect; it is recorded as a P2 residual in `STAGE_RUNTIME.md`.
 
 ## Interactive nodes on the host
 

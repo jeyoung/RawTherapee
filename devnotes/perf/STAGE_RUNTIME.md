@@ -2137,9 +2137,11 @@ departing sample, and the shrinking tail, with division in the head and tail
 and the reciprocal multiply of the SSE and remaining-column paths in the
 interior. The departing samples that the host keeps in a ring buffer are read
 from the read-only source instead, which holds the same values because the
-two passes always write a different buffer; the launcher ping-pongs through one
-subsampled scratch plane. `rescaleBilinear()` and `getBilinearValue()` are
-ported operation for operation, with `intp(a, b, c) = a * (b - c) + c`.
+two passes always write a different buffer. The launcher keeps the subsampled
+grid as five separate single-plane buffers - `I1`, `p1`, `meanI`, `meanp` and
+one temp - and routes every box pass through the temp buffer, so a source that
+is also the destination is safe. `rescaleBilinear()` and `getBilinearValue()`
+are ported operation for operation, with `intp(a, b, c) = a * (b - c) + c`.
 
 `Color::computeXYZ2Lab()`'s cube root is the host's own `xcbrtf()`, the sleef
 polynomial, not the libm root: above the 16-bit range the two differ by a few
@@ -2190,7 +2192,7 @@ With `OMP_NUM_THREADS=1`, a 3888x2608 PEF and the POCL CPU device:
 
 | Case | Result |
 |---|---|
-| `stage-residency-test` lab.tools cases at 238x64, 179x48 and 8192x64 | LabGrid-only, shadows/highlights Lab mode, both tools and every Lab-mode slider case are bit-exact (PAE 0, 0 differing samples); RGB mode is within 0.08 LSB16 at amounts 50 and 100 and single-round cases at 0.002 to 0.006 |
+| `stage-residency-test` lab.tools cases at 238x64, 179x48 and 8192x64 | LabGrid-only, shadows/highlights Lab mode, both tools and every Lab-mode slider case are bit-exact (PAE 0, 0 differing samples). RGB mode is measured, not proved: 0.062500 LSB16 for the amount-50 pair, 0.046875 for both tools at 179x48, 0.076172 for the padded 238 case, 0.044922 and 0.045898 for the single highlight and shadow rounds, and a worst of 0.228516 at amount 100. The steep-step refusal is a worst-case bound, not a proof of those measurements: at the 0..100 slider maximum the measured error sits about four times inside the bound it enforces |
 | Slider coverage | amounts 1/50/200/1000, tonal widths 0/100 and a split pair, radii 1/10/100, padded widths 179 and 238, and an 8192-wide image; all finite, no NaN or Inf |
 | Residuals | vibrance, Lab curves, local contrast, EPD, Lab regions and black-and-white are refused, record `impl=host` with no `impl=opencl`, and are byte-identical to the block |
 | RGB-mode steep table | amounts 200 and 1000 are inside the predicate but refused by the setup: `impl=host`, PAE 0 |
@@ -2202,6 +2204,14 @@ With `OMP_NUM_THREADS=1`, a 3888x2608 PEF and the POCL CPU device:
 
 ## Limitations
 
+- P2 residual, not a lab.tools defect: with `RT_STAGE_OPENCL=1` and
+  `--gpu=auto` but without `RT_OPENCL_RGBPROC=1`, a CLI export segfaults in
+  `opencl::initLocked()` through `ImProcFunctions::lab2rgbOut()` - a null call
+  in the classic backend's lazy OpenCL initialisation - for every profile, the
+  neutral default included. It reproduces at `03c94581c`, before the lab.tools
+  node existed. `RT_OPENCL_RGBPROC=1` avoids it, and `tools/opencl/verify.sh`
+  sets it, so the lab.tools gate evidence was produced with that environment;
+  a bare CLI export of a lab.tools profile needs the same variable.
 - Preview, crop, thumbnail and export run only the graph. No
   graph path caches or reuses buffers yet. The preview executes 13 of its 14
   canonical nodes (`analysis` folded into `raw.base`), the crop 13 of 15
