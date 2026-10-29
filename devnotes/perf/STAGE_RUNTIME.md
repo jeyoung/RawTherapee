@@ -2127,8 +2127,13 @@ vibrance as one device node. Everything else in the block stays on the host.
   their programs repeat the host's double-precision `sqrt`/divide or IIR
   recurrence; without fp64 the launcher refuses them and the block stays on
   the host;
+- local contrast below sigma 25 also requires a host build with `__SSE2__` or
+  `RT_SIMDE`. The exported coefficients describe the SSE float path; a host
+  built without either runs `gaussianBlur()`'s double path for the same sigma,
+  so the launcher refuses that sigma and records `impl=host`. At sigma 25 and
+  above both sides use the double path and the pass stays available;
 
-and at least one of the four tools would run. A profile where none would is a
+and at least one of the five tools would run. A profile where none would is a
 residual: the node would be a no-op and the host block records it as such. An
 enabled Lab curve counts as a running tool even when all six tables are the
 identity: the pass still rewrites L, a and b through the block's divides.
@@ -2195,9 +2200,12 @@ device reproduces both:
 - below 25 the host runs `gaussHorizontalSse()`/`gaussVerticalSse()`. Rows in
   groups of four and columns in groups of eight recur in single precision with
   float coefficients; the remaining tail lines recur in double with the same
-  coefficients and narrow every store. The kernel uses one work item per line
-  and takes the float branch for the vector group and the double branch for
-  the tail lines, so both halves of the host path are reproduced.
+  coefficients and narrow every store. Their boundary correction keeps the
+  source and the forward state in `float`, so each deviation is a float
+  subtraction before the double matrix multiplies it; the kernel narrows the
+  deviation the same way. The kernel uses one work item per line and takes the
+  float branch for the vector group and the double branch for the tail lines,
+  so both halves of the host path are reproduced.
 - at 25 and above the host runs `gaussHorizontal<double>()` and
   `gaussVertical<double>()`. The forward state, the boundary correction and
   the backward recurrence stay double, and only the finished line narrows to
@@ -2398,7 +2406,8 @@ and XYZREL Munsell methods, a local contrast outside the ABI range or combined
 with any other residual tool, EPD, black-and-white output, a
 colour-toning method other than `LabGrid`, a profile with no active tool, an
 out-of-range slider or red/skin setting, a vibrance no-op, a device without
-fp64 for local contrast and the Lab curves, a GPU for vibrance, local contrast
+fp64 for local contrast and the Lab curves, a host built without SSE2 (or
+RT_SIMDE) for local contrast below sigma 25, a GPU for vibrance, local contrast
 and the Lab curves, an image too small for the guided filter (fewer than three
 samples on the subsampled grid) or for the IIR recurrence (fewer than four
 samples per line),
@@ -2422,8 +2431,9 @@ With `OMP_NUM_THREADS=1`, a 3888x2608 PEF and the POCL CPU device:
 | Lab curves, 21 cases at 238x64, 179x48 and 8192x64 | L only, brightness, an enabled pass with all six tables the identity, a only, a/b, C=f(C), L=f(C), C=f(L), all six combined, combined with MUN and with NONE, three red/skin protection settings, `lcredsk` off, neutral and saturated images, padded 179/238 and 8192 wide: 2,347,344 samples, `impl=opencl` on every case, no NaN/Inf, every sample bit-exact (PAE 0, 0 differing samples). The earlier 169 one-ulp samples came from the host's ≤3-column double-sqrt tail, which the kernel now reproduces |
 | Lab-curve non-vacuity | on a 179x48 saturated fixture the MUN correction changes 288 of 25,776 samples and the red/skin protection changes 2,610, so the device comparison exercises both paths |
 | Lab-curve residuals | contrast 15, chromaticity 25, a non-identity C=f(H), L=f(H) or H=f(H) curve, the XYZ Munsell method and black-and-white output are refused, record `impl=host` with no `impl=opencl`, and are byte-identical to the block (PAE 0) |
-| Local contrast, 19 cases at 238x64, 179x48, 179x50 and 8192x64 | radii 1/10/40/80/100 (both blur paths), amounts 0/0.1/1/2, darkness and lightness 0.5/1/2 and the two-way split, padded 179 and 238, an odd height of 50 (the horizontal tail rows), the 8192-wide case, and combinations with the Lab curves, shadows/highlights and vibrance: 2,336,706 samples, `impl=opencl` on every case, no NaN/Inf, every sample bit-exact (PAE 0, 0 differing samples) |
-| Local-contrast non-vacuity | on a 179x48 fixture radius 10, amount 1 changes 8,592 of 25,776 samples (PAE 11,416.818359 LSB16), so the device comparison is not a copy |
+| Local contrast, 23 cases at 238x64, 179x48, 179x50, 238x63 and 8192x64 | radii 1/10/40/80/100 (both blur paths), amounts 0/0.1/1/2, darkness and lightness 0.5/1/2 and the two-way split, padded 179 and 238, an odd height of 50 (the horizontal tail rows), the 8192-wide case, and combinations with the Lab curves, shadows/highlights and vibrance: 2,461,164 samples, `impl=opencl` on every case, no NaN/Inf, every sample bit-exact (PAE 0, 0 differing samples) |
+| Local-contrast tail, sigma 24 | the integer fixture and three wide non-integer fixtures (L alternates around 30000 and 0.4 so the float deviation subtraction rounds) cover the last `H mod 4` rows and `W mod 8` columns at 179x50 and 238x63. With the kernel's deviation kept in double - the pre-fix code - the amount-2 179x50 case moves 7 of 26,850 samples, worst 0.164062 LSB16 (26,843 exact); the fixed kernel is bit-exact on all four cases |
+| Local-contrast non-vacuity | on a 179x48 fixture radius 10, amount 1 changes 8,592 of 25,776 samples (PAE 11,071.999900 LSB16), so the device comparison is not a copy |
 | Local-contrast residuals, nine cases | radius 0 and 300, amount 3 and -0.1, darkness 4, lightness -0.5, a NaN amount, and the tool combined with EPD or a non-zero Lab contrast are refused, record `impl=host` with no `impl=opencl`, and are byte-identical to the block (PAE 0, 231,984 samples) |
 | Block on the real PEF, POCL | the device block matches `stage::labToolsHostBlock` bit for bit (30,419,712 samples, max float delta 0) on the full pre-vibrance Lab buffer |
 | Residuals | vibrance + Lab contrast, vibrance + local contrast with amount 30 (outside the ABI range), vibrance + EPD, vibrance + Lab regions, vibrance + black-and-white, a vibrance no-op (sliders at zero, identity curve) and pastels 200 (out of range) are refused, record `impl=host` with no `impl=opencl`, and are byte-identical to the block |

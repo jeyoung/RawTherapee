@@ -94,8 +94,9 @@ bit-exact and an RGB-mode round is within one LSB16. Local contrast is a port
 of `ImProcFunctions::localContrast()`: the host supplies the
 `gaussianBlur()` IIR coefficients for the block's sigma, and the kernel
 reproduces both of the host's blur paths - the SSE float path below sigma 25,
-including its non-vectorised tail lines, and the double path above it - so the
-pass is bit-exact for both. Vibrance is a port of
+including its non-vectorised tail lines and their float boundary deviation,
+and the double path above it - so the pass is bit-exact for both in the
+tested matrix, including the wide sigma-24 tail fixtures. Vibrance is a port of
 `ImProcFunctions::vibrance()` including `Color::gamutLchonly()`,
 `Color::SkinSat()`, the two-stage chroma ramp and the `avoidcolorshift` path
 through `Color::AllMunsellLch()`; the host builds the Munsell table set, the
@@ -117,7 +118,10 @@ therefore built separately from the fp32 `lab.tools` program with
 `cl_khr_fp64`; the launcher refuses the pass on a device without fp64. Local
 contrast's own fp64 program (`lab.tools.localcontrast`) carries the same
 restriction: the double recurrence and the SSE path's double tail lines need
-`double`, so a device without fp64 keeps the block on the host. Vibrance,
+`double`, so a device without fp64 keeps the block on the host. Below sigma 25
+it also needs a host built with SSE2 (or `RT_SIMDE`), because the device
+coefficients describe the SSE path; without it the host runs the double path
+and the launcher refuses that sigma. Vibrance,
 local contrast and the Lab curves are admitted only on a CPU OpenCL device: a
 GPU's `xatan2f()` division or `sqrt` rounds differently and moves pixels on a
 Munsell limit, and its compiler may lower the IIR recurrence differently, so a
@@ -126,7 +130,8 @@ the block is a residual: a non-zero Lab
 `contrast` (it owns the `hist16` refill a later node reads), the chromaticity
 slider and the C=f(H), L=f(H) and H=f(H) flat curves, the LAB, XYZ and XYZREL
 Munsell methods (they need `gamutLchonly()` and `gamutmap()`), a denoise
-chroma factor, a local contrast outside the ABI range, EPD, black-and-white
+chroma factor, a local contrast outside the ABI range, a local contrast below
+sigma 25 on a host built without SSE2, EPD, black-and-white
 output, any colour-toning
 method other than `LabGrid` (`LabRegions` included), a profile where no device
 tool would run, and an RGB-mode tone table whose steepest step can turn the
