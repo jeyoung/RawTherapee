@@ -212,6 +212,8 @@ inline constexpr int LAB_WAVELET_MIN_THRESHOLD2_LEVEL = 3;
 inline constexpr int LAB_WAVELET_MAX_THRESHOLD2_LEVEL = 9;
 inline constexpr int LAB_WAVELET_MIN_STRENGTH = 0;
 inline constexpr int LAB_WAVELET_MAX_STRENGTH = 100;
+inline constexpr double LAB_WAVELET_MIN_WAVELET_THREND = 0.0;
+inline constexpr double LAB_WAVELET_MAX_WAVELET_THREND = 100.0;
 
 /* The block's `scale` argument at every export call site. The equaliser's
  * BadpixelsLab() radius is 4 / scale, and the launcher requires this value. */

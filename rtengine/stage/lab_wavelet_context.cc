@@ -100,6 +100,11 @@ int labWaveletLastLevel(const double* mult)
     return last;
 }
 
+/*
+ * The node supports the equaliser alone, the wavelet contrast tool alone, and
+ * both in the block's order. Each half is validated only when it is enabled,
+ * so a wavelet-only profile does not need dirpyrequalizer.enabled.
+ */
 bool labWaveletSupported(const procparams::ProcParams& params, int width,
                          int height)
 {
@@ -234,8 +239,14 @@ int labWaveletTransformLevels(const procparams::ProcParams& params,
     }
     levwav = std::min(maxlev2, levwav);
 
-    /* The trailing-zero trim in ip_wavelet(): a level whose multiplier is
-     * exactly zero is dead when nothing else in the block needs it. */
+    /*
+     * The trailing-zero trim in ip_wavelet(): a level whose multiplier is
+     * exactly zero is dead when nothing else in the block needs it. Thrend is
+     * read unconditionally afterwards and, when positive, restores the
+     * untrimmed count so the residual tone mapping keeps its levels; delta and
+     * the highlight/shadow kH then use that larger maxlvl.
+     */
+    const int capped = levwav;
     const bool noiseena = wavelet.expnoise && minwin > 128;
     const bool ref0 =
         noiseena && (wavelet.level0noise.getBottom() > 0. ||
@@ -260,6 +271,10 @@ int labWaveletTransformLevels(const procparams::ProcParams& params,
         while (levwav > 0 && multiplier(levwav - 1) == 0) {
             --levwav;
         }
+    }
+    const float thrend = 0.01f * static_cast<float>(wavelet.thrend);
+    if (thrend > 0.f) {
+        levwav = capped;
     }
     return levwav > 0 ? levwav : 0;
 }
@@ -328,6 +343,11 @@ bool labWaveletWaveletSupported(const procparams::ProcParams& params,
     }
     if (wavelet.strength < LAB_WAVELET_MIN_STRENGTH ||
         wavelet.strength > LAB_WAVELET_MAX_STRENGTH) {
+        return false;
+    }
+    if (!std::isfinite(wavelet.thrend) ||
+        wavelet.thrend < LAB_WAVELET_MIN_WAVELET_THREND ||
+        wavelet.thrend > LAB_WAVELET_MAX_WAVELET_THREND) {
         return false;
     }
     for (int level = 0; level < 9; ++level) {
