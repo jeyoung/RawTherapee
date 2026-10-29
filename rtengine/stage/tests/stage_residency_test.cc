@@ -37,6 +37,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <string>
@@ -3693,7 +3694,7 @@ LabToolsRun run_lab_tools_node(LabImage& image,
     result.deviceReady = deviceReady;
     RtLabToolsContext descriptor = context.descriptor(deviceReady);
 
-    RtStageArg args[63] = {};
+    RtStageArg args[69] = {};
     args[0].kind = RT_STAGE_ARG_BUFFER;
     args[0].u.buffer = view(image);
     args[1].kind = RT_STAGE_ARG_PTR;
@@ -3798,6 +3799,17 @@ LabToolsRun run_lab_tools_node(LabImage& image,
     args[62].kind = RT_STAGE_ARG_PTR;
     args[62].u.ptr = deviceReady ? setup.local_contrast_iir : nullptr;
 
+    args[63].kind = RT_STAGE_ARG_INT;
+    args[63].u.i = deviceReady ? setup.region_count : 0;
+    args[64].kind = RT_STAGE_ARG_BUFFER;
+    args[65].kind = RT_STAGE_ARG_INT;
+    args[65].u.i = deviceReady ? setup.region_lut_stride : 0;
+    args[66].kind = RT_STAGE_ARG_BUFFER;
+    args[67].kind = RT_STAGE_ARG_PTR;
+    args[67].u.ptr = deviceReady ? setup.ws_double : nullptr;
+    args[68].kind = RT_STAGE_ARG_PTR;
+    args[68].u.ptr = deviceReady ? setup.iws_double : nullptr;
+
     for (int index = 16; index < 22; ++index) {
         args[index].kind = RT_STAGE_ARG_BUFFER;
     }
@@ -3848,6 +3860,17 @@ LabToolsRun run_lab_tools_node(LabImage& image,
                 setup.munsell_sizes,
                 static_cast<int>(RT_LAB_TOOLS_MUNSELL_TABLES));
         }
+        if (setup.region_count != 0) {
+            args[64].u.buffer = host_buffer(
+                setup.region_luts,
+                static_cast<int>(setup.region_count *
+                                 RT_LAB_TOOLS_REGION_CURVES *
+                                 setup.region_lut_stride));
+            args[66].u.buffer = host_buffer(
+                setup.region_params,
+                static_cast<int>(setup.region_count *
+                                 RT_LAB_TOOLS_REGION_PARAM_STRIDE));
+        }
         if (setup.lab_curve_active != 0) {
             args[48].u.buffer = host_buffer(
                 setup.lab_curve_l, static_cast<int>(setup.lab_curve_l_entries));
@@ -3868,7 +3891,7 @@ LabToolsRun run_lab_tools_node(LabImage& image,
     setenv("RT_STAGE_PROFILE", profile_path.c_str(), 1);
     set_node_device_override("lab.tools", StageNodeDevice::OpenCL);
     result.status =
-        run("lab.tools", std::vector<RtStageArg>(args, args + 63));
+        run("lab.tools", std::vector<RtStageArg>(args, args + 69));
     clear_node_device_overrides();
     unsetenv("RT_STAGE_PROFILE");
     return result;
@@ -4016,8 +4039,9 @@ void test_lab_tools(bool available)
      */
     const char* residual_labels[] = {
         "vibrance + Lab contrast", "vibrance + local contrast out of range",
-        "vibrance + EPD", "vibrance + Lab regions", "vibrance + black and white",
-        "vibrance no-op", "vibrance pastels out of range"};
+        "vibrance + EPD", "vibrance + Lab regions show mask",
+        "vibrance + black and white", "vibrance no-op",
+        "vibrance pastels out of range"};
     for (const char* label : residual_labels) {
         rtengine::procparams::ProcParams params;
         params.sh.enabled = true;
@@ -4055,9 +4079,11 @@ void test_lab_tools(bool available)
             params.vibrance.saturated = 0;
         } else if (std::strcmp(label, "vibrance pastels out of range") == 0) {
             params.vibrance.pastels = 200;
-        } else if (std::strcmp(label, "vibrance + Lab regions") == 0) {
+        } else if (std::strcmp(
+                       label, "vibrance + Lab regions show mask") == 0) {
             params.colorToning.enabled = true;
             params.colorToning.method = "LabRegions";
+            params.colorToning.labregionsShowMask = 0;
             rtengine::procparams::ColorToningParams::LabCorrectionRegion
                 region;
             region.a = 10.0;
@@ -4226,7 +4252,7 @@ void test_lab_tools(bool available)
         check(context.build(setup) == 0, "forced fallback setup builds");
         RtLabToolsContext descriptor = context.descriptor(true);
 
-        RtStageArg args[63] = {};
+        RtStageArg args[69] = {};
         args[0].kind = RT_STAGE_ARG_BUFFER;
         args[0].u.buffer = view(device);
         args[1].kind = RT_STAGE_ARG_PTR;
@@ -4298,6 +4324,14 @@ void test_lab_tools(bool available)
         args[60].kind = RT_STAGE_ARG_DOUBLE;
         args[61].kind = RT_STAGE_ARG_INT;
         args[62].kind = RT_STAGE_ARG_PTR;
+        args[63].kind = RT_STAGE_ARG_INT;
+        args[63].u.i = 0;
+        args[64].kind = RT_STAGE_ARG_BUFFER;
+        args[65].kind = RT_STAGE_ARG_INT;
+        args[65].u.i = 0;
+        args[66].kind = RT_STAGE_ARG_BUFFER;
+        args[67].kind = RT_STAGE_ARG_PTR;
+        args[68].kind = RT_STAGE_ARG_PTR;
         args[59].u.f = 1.0;
         args[60].u.f = 1.0;
         args[61].u.i = LAB_TOOLS_EXPORT_SCALE;
@@ -4317,7 +4351,7 @@ void test_lab_tools(bool available)
         setenv("RT_STAGE_PROFILE", profile_path.c_str(), 1);
         set_node_device_override("lab.tools", StageNodeDevice::OpenCL);
         const RtStageStatus status =
-            run("lab.tools", std::vector<RtStageArg>(args, args + 63));
+            run("lab.tools", std::vector<RtStageArg>(args, args + 69));
         clear_node_device_overrides();
         const std::string profile = read_file(profile_path);
         unsetenv("RT_STAGE_PROFILE");
@@ -5595,6 +5629,438 @@ void test_run_wiring(bool available)
           "RT_STAGE_OPENCL=1 alone dispatches the node to the device");
 }
 
+/* --------------------------------------------------- lab.tools Lab regions */
+
+/*
+ * A region mask the host can sample: a two-point FCT_MinMaxCPoints curve with
+ * the given tangents. Zero tangents make the segment linear; 0.35 exercises
+ * the curved path.
+ */
+std::vector<double> region_mask(double x0, double y0, double x1, double y1,
+                                double tangent)
+{
+    return {static_cast<double>(FCT_MinMaxCPoints),
+            x0, y0, tangent, tangent,
+            x1, y1, tangent, tangent};
+}
+
+std::vector<double> region_no_mask()
+{
+    return {static_cast<double>(FCT_Linear)};
+}
+
+struct RegionSpec {
+    double a;
+    double b;
+    double saturation;
+    double slope;
+    double offset;
+    double power;
+    double blur;
+    int channel;
+    /* 0 all default masks, 1 hue only, 2 chroma only, 3 lightness only,
+     * 4 all curved, 5 no masks. */
+    int masks;
+};
+
+struct RegionCase {
+    const char* label;
+    int width;
+    int height;
+    int count;
+    RegionSpec regions[4];
+};
+
+/* The mask set a case asks for. The default LabCorrectionRegion already has
+ * fully open hue, chroma and lightness curves. */
+void set_region_masks(
+    rtengine::procparams::ColorToningParams::LabCorrectionRegion& region,
+    int masks)
+{
+    switch (masks) {
+    case 1:
+        region.hueMask =
+            region_mask(0.05, 0.0, 0.95, 1.0, 0.35);
+        region.chromaticityMask = region_no_mask();
+        region.lightnessMask = region_no_mask();
+        break;
+    case 2:
+        region.hueMask = region_no_mask();
+        region.chromaticityMask =
+            region_mask(0.0, 1.0, 1.2, 0.0, 0.35);
+        region.lightnessMask = region_no_mask();
+        break;
+    case 3:
+        region.hueMask = region_no_mask();
+        region.chromaticityMask = region_no_mask();
+        region.lightnessMask = region_mask(0.0, 0.2, 1.0, 0.8, 0.0);
+        break;
+    case 4:
+        region.hueMask =
+            region_mask(0.05, 0.0, 0.95, 1.0, 0.35);
+        region.chromaticityMask =
+            region_mask(0.0, 1.0, 1.2, 0.0, 0.35);
+        region.lightnessMask =
+            region_mask(0.0, 0.2, 1.0, 0.8, 0.35);
+        break;
+    case 5:
+        region.hueMask.clear();
+        region.chromaticityMask.clear();
+        region.lightnessMask.clear();
+        break;
+    case 6:
+        region.hueMask = {
+            static_cast<double>(FCT_MinMaxCPoints),
+            0.05, 0.0, 0.35, 0.35,
+            0.50, 0.8, 0.20, 0.20,
+            0.95, 0.1, 0.35, 0.35};
+        region.chromaticityMask = {
+            static_cast<double>(FCT_MinMaxCPoints),
+            0.0, 1.0, 0.35, 0.35,
+            0.6, 0.2, 0.1, 0.4,
+            1.2, 0.9, 0.35, 0.35};
+        region.lightnessMask = {
+            static_cast<double>(FCT_MinMaxCPoints),
+            0.0, 0.1, 0.0, 0.4,
+            0.5, 0.9, 0.3, 0.1,
+            1.0, 0.3, 0.35, 0.35};
+        break;
+    default:
+        /* The LabCorrectionRegion defaults: three fully open masks. */
+        break;
+    }
+}
+
+void apply_region_case(const RegionCase& item,
+                       rtengine::procparams::ProcParams& params)
+{
+    params.colorToning.enabled = true;
+    params.colorToning.method = "LabRegions";
+    params.colorToning.labregions.clear();
+    for (int index = 0; index < item.count; ++index) {
+        rtengine::procparams::ColorToningParams::LabCorrectionRegion region;
+        const RegionSpec& spec = item.regions[index];
+        region.a = spec.a;
+        region.b = spec.b;
+        region.saturation = spec.saturation;
+        region.slope = spec.slope;
+        region.offset = spec.offset;
+        region.power = spec.power;
+        region.maskBlur = spec.blur;
+        region.channel = spec.channel;
+        set_region_masks(region, spec.masks);
+        params.colorToning.labregions.push_back(region);
+    }
+}
+
+void test_lab_tools_regions(bool available)
+{
+    using namespace rtengine::stage;
+
+    static MyMutex regions_lcms_mutex;
+    if (rtengine::lcmsMutex == nullptr) {
+        rtengine::lcmsMutex = &regions_lcms_mutex;
+    }
+    static rtengine::Settings regions_settings{};
+    rtengine::settings = &regions_settings;
+    rtengine::Color::init();
+
+    const std::string profile_path =
+        std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp") +
+        "/stage-residency-lab-tools-regions.jsonl";
+
+    /*
+     * The default region is the bounded set's simplest case. The setup must
+     * export one region and three mask tables, and every table must reproduce
+     * FlatCurve::getVal() inside the accepted error.
+     */
+    {
+        rtengine::procparams::ProcParams params;
+        params.colorToning.enabled = true;
+        params.colorToning.method = "LabRegions";
+
+        rtengine::ImProcFunctions ipf(&params, false);
+        LabToolsHostState host;
+        LabToolsLuts luts = host.luts();
+        LabToolsContext context(params, ipf, luts, host.autili, host.butili);
+        RtLabToolsResult setup{};
+        check(context.build(setup) == 0, "region setup builds");
+        check(setup.region_count == 1, "the setup exports one default region");
+        check(setup.region_lut_stride == RT_LAB_TOOLS_REGION_LUT_STRIDE,
+              "the region table has the declared stride");
+        check(setup.region_luts != nullptr && setup.region_params != nullptr,
+              "the region tables have buffers");
+        bool finite = true;
+        bool curves = true;
+        for (int region = 0; region < 1; ++region) {
+            for (int curve = 0; curve < 3; ++curve) {
+                const float* slot =
+                    setup.region_luts +
+                    (region * 3 + curve) * setup.region_lut_stride;
+                const int count = static_cast<int>(slot[0]);
+                curves = curves && count >= 2 &&
+                         count <= static_cast<int>(
+                                      RT_LAB_TOOLS_REGION_LUT_NODES);
+                for (int index = 0; index < 1 + 2 * count; ++index) {
+                    finite = finite && std::isfinite(slot[index]);
+                }
+            }
+        }
+        check(curves, "every region mask exports a piecewise-linear table");
+        check(finite, "the region tables are finite");
+    }
+
+    if (!available) {
+        skip("lab.tools Lab regions: no OpenCL device");
+        return;
+    }
+
+    const RegionCase cases[] = {
+        {"single region", 238, 64, 1,
+         {{0.4, -0.3, 30.0, 1.0, 0.0, 1.0, 0.4, -1, 0}}},
+        {"two regions", 238, 64, 2,
+         {{0.35, -0.2, 25.0, 1.0, 0.0, 1.0, 0.4, -1, 0},
+          {-0.4, 0.3, -20.0, 1.1, 0.01, 0.9, 1.5, -1, 4}}},
+        {"four regions", 238, 64, 4,
+         {{0.5, -0.2, 20.0, 1.0, 0.0, 1.0, 0.3, -1, 0},
+          {-0.3, 0.4, -30.0, 0.9, -0.02, 1.2, 2.0, -1, 1},
+          {0.2, 0.2, 10.0, 1.2, 0.0, 0.8, 0.0, -1, 2},
+          {-0.2, -0.4, 40.0, 1.0, 0.03, 1.0, 4.0, -1, 3}}},
+        {"hue mask only", 238, 64, 1,
+         {{0.3, -0.3, 20.0, 1.0, 0.0, 1.0, 0.5, -1, 1}}},
+        {"chroma mask only", 238, 64, 1,
+         {{0.3, -0.3, 20.0, 1.0, 0.0, 1.0, 0.5, -1, 2}}},
+        {"lightness mask only", 238, 64, 1,
+         {{0.3, -0.3, 20.0, 1.0, 0.0, 1.0, 0.5, -1, 3}}},
+        {"curved masks", 238, 64, 1,
+         {{0.4, -0.3, 35.0, 1.0, 0.0, 1.0, 0.7, -1, 4}}},
+        {"three-point masks", 238, 64, 1,
+         {{0.35, -0.25, 25.0, 1.1, 0.01, 0.95, 0.6, -1, 6}}},
+        {"no masks", 238, 64, 1,
+         {{0.4, -0.3, 35.0, 1.0, 0.0, 1.0, 0.7, -1, 5}}},
+        {"CDL slope", 238, 64, 1,
+         {{0.3, -0.2, 10.0, 1.35, 0.0, 1.0, 0.4, -1, 0}}},
+        {"CDL offset", 238, 64, 1,
+         {{0.3, -0.2, 10.0, 1.0, 0.06, 1.0, 0.4, -1, 0}}},
+        {"CDL power", 238, 64, 1,
+         {{0.3, -0.2, 10.0, 1.0, 0.0, 0.75, 0.4, -1, 0}}},
+        {"CDL all", 238, 64, 1,
+         {{0.3, -0.2, 25.0, 1.2, -0.04, 1.3, 0.4, -1, 4}}},
+        {"saturation up", 238, 64, 1,
+         {{0.2, -0.1, 80.0, 1.0, 0.0, 1.0, 0.4, -1, 0}}},
+        {"saturation down", 238, 64, 1,
+         {{0.2, -0.1, -60.0, 1.0, 0.0, 1.0, 0.4, -1, 0}}},
+        {"channel red", 238, 64, 1,
+         {{0.4, -0.3, 20.0, 1.0, 0.0, 1.0, 0.4, 0, 0}}},
+        {"channel green", 238, 64, 1,
+         {{0.4, -0.3, 20.0, 1.0, 0.0, 1.0, 0.4, 1, 0}}},
+        {"channel blue", 238, 64, 1,
+         {{0.4, -0.3, 20.0, 1.0, 0.0, 1.0, 0.4, 2, 0}}},
+        {"blur zero", 238, 64, 1,
+         {{0.4, -0.3, 20.0, 1.0, 0.0, 1.0, 0.0, -1, 0}}},
+        {"blur negative", 238, 64, 1,
+         {{0.4, -0.3, 20.0, 1.0, 0.0, 1.0, -2.0, -1, 0}}},
+        {"blur five", 238, 64, 1,
+         {{0.4, -0.3, 20.0, 1.0, 0.0, 1.0, 5.0, -1, 0}}},
+        {"padded width 179", 179, 48, 2,
+         {{0.4, -0.3, 30.0, 1.0, 0.0, 1.0, 0.4, -1, 0},
+          {-0.4, 0.2, -15.0, 1.1, 0.0, 0.9, 1.0, -1, 4}}},
+        {"padded width 238", 238, 64, 4,
+         {{0.3, -0.2, 20.0, 1.0, 0.0, 1.0, 0.2, -1, 0},
+          {-0.2, 0.3, -15.0, 1.0, 0.0, 1.0, 0.8, -1, 1},
+          {0.4, 0.1, 35.0, 1.2, 0.02, 0.9, 2.0, -1, 2},
+          {-0.3, -0.4, -35.0, 0.9, -0.02, 1.1, 3.0, -1, 3}}},
+        {"large width 8192", 8192, 64, 2,
+         {{0.4, -0.3, 30.0, 1.0, 0.0, 1.0, 0.4, -1, 0},
+          {-0.4, 0.2, -15.0, 1.1, 0.0, 0.9, 1.0, -1, 4}}},
+    };
+
+    unsigned seed = 0x51ed270bu;
+    std::size_t samples = 0;
+    std::size_t differing = 0;
+    std::size_t worst_over = 0;
+    double worst = 0.0;
+
+    for (const RegionCase& item : cases) {
+        rtengine::procparams::ProcParams params;
+        apply_region_case(item, params);
+
+        check(labToolsSupported(params),
+              (std::string("lab.tools regions ") + item.label +
+               " is the supported set").c_str());
+
+        LabImage source(item.width, item.height);
+        fill_lab_tools(source, seed++);
+
+        rtengine::ImProcFunctions cpu_ipf(&params, false);
+        LabToolsHostState cpu_host;
+        LabImage cpu(item.width, item.height);
+        cpu.CopyFrom(&source);
+        LabToolsLuts cpu_luts = cpu_host.luts();
+        labToolsHostBlock(cpu_ipf, params, cpu, cpu_luts, cpu_host.autili,
+                          cpu_host.butili);
+
+        rtengine::ImProcFunctions device_ipf(&params, false);
+        LabToolsHostState device_host;
+        LabImage device(item.width, item.height);
+        device.CopyFrom(&source);
+        const LabToolsRun result =
+            run_lab_tools_node(device, params, device_host, device_ipf,
+                               profile_path);
+        const std::string profile = read_file(profile_path);
+
+        check(result.supported,
+              (std::string("lab.tools regions ") + item.label +
+               " resolves to the supported set").c_str());
+        check(result.deviceReady,
+              (std::string("lab.tools regions ") + item.label +
+               " builds its host setup").c_str());
+        check(result.status == RT_STAGE_OK,
+              (std::string("lab.tools regions ") + item.label +
+               " completes through run()").c_str());
+        check(profile.find("\"stage\":\"lab.tools\"") != std::string::npos,
+              (std::string("lab.tools regions ") + item.label +
+               " records the node").c_str());
+        check(profile.find("\"impl\":\"opencl\"") != std::string::npos,
+              (std::string("lab.tools regions ") + item.label +
+               " records a device execution").c_str());
+
+        const Distribution d = distribution(view(device), view(cpu));
+        std::printf("stage-residency: lab.tools regions %s %dx%d: PAE %.6f "
+                    "LSB16; exact %zu, <=0.25 %zu, <=0.5 %zu, <=1 %zu, >1 "
+                    "%zu of %zu\n",
+                    item.label, item.width, item.height, d.max_abs, d.exact,
+                    d.quarter, d.half, d.one, d.over, d.samples);
+        check(d.finite,
+              (std::string("lab.tools regions ") + item.label +
+               " stays finite").c_str());
+        check(d.over == 0,
+              (std::string("lab.tools regions ") + item.label +
+               " is within one LSB16").c_str());
+
+        samples += d.samples;
+        differing += d.samples - d.exact;
+        worst_over += d.over;
+        worst = std::max(worst, d.max_abs);
+
+        /*
+         * Non-vacuous: the region pass must change the block's output for at
+         * least one case. Compare the CPU result with its input.
+         */
+        const Diff changed = compare(view(cpu), view(source));
+        if (std::strcmp(item.label, "single region") == 0) {
+            check(changed.differing > 0,
+                  "the region pass changes the image");
+        }
+    }
+
+    std::printf("stage-residency: lab.tools regions total: %zu samples, "
+                "%zu differing, worst PAE %.6f LSB16, %zu over one LSB16\n",
+                samples, differing, worst, worst_over);
+
+    /*
+     * Residuals. Each profile is the supported set plus one property the
+     * bounded set excludes; the predicate refuses it, the launcher runs the
+     * builtin and the result is the block's own.
+     */
+    const auto run_residual = [&](const char* label,
+                                  const std::function<void(
+                                      rtengine::procparams::ProcParams&)>&
+                                      mutate) {
+        rtengine::procparams::ProcParams params;
+        params.colorToning.enabled = true;
+        params.colorToning.method = "LabRegions";
+        params.colorToning.labregions[0].a = 0.4;
+        params.colorToning.labregions[0].b = -0.3;
+        params.colorToning.labregions[0].saturation = 20.0;
+        params.colorToning.labregions[0].maskBlur = 0.4;
+        mutate(params);
+
+        check(!labToolsSupported(params),
+              (std::string("lab.tools regions ") + label +
+               " is a residual").c_str());
+
+        LabImage source(179, 48);
+        fill_lab_tools(source, seed++);
+
+        rtengine::ImProcFunctions cpu_ipf(&params, false);
+        LabToolsHostState cpu_host;
+        LabImage cpu(179, 48);
+        cpu.CopyFrom(&source);
+        LabToolsLuts cpu_luts = cpu_host.luts();
+        labToolsHostBlock(cpu_ipf, params, cpu, cpu_luts, cpu_host.autili,
+                          cpu_host.butili);
+
+        rtengine::ImProcFunctions device_ipf(&params, false);
+        LabToolsHostState device_host;
+        LabImage device(179, 48);
+        device.CopyFrom(&source);
+        const LabToolsRun result =
+            run_lab_tools_node(device, params, device_host, device_ipf,
+                               profile_path);
+        const std::string profile = read_file(profile_path);
+
+        check(!result.supported,
+              (std::string("lab.tools regions ") + label +
+               " is refused as a device configuration").c_str());
+        check(!result.deviceReady,
+              (std::string("lab.tools regions ") + label +
+               " does not build a device setup").c_str());
+        check(result.status == RT_STAGE_OK,
+              (std::string("lab.tools regions ") + label +
+               " completes through run()").c_str());
+        check(profile.find("\"impl\":\"host\"") != std::string::npos,
+              (std::string("lab.tools regions ") + label +
+               " records a host execution").c_str());
+        check(profile.find("\"impl\":\"opencl\"") == std::string::npos,
+              (std::string("lab.tools regions ") + label +
+               " never mixes a device pass").c_str());
+        const Diff diff = compare(view(device), view(cpu));
+        std::printf("stage-residency: lab.tools regions residual %s: host, "
+                    "PAE %.6f LSB16, %zu of %zu samples differ\n",
+                    label, diff.max_abs, diff.differing, diff.samples);
+        check(diff.differing == 0 && diff.max_abs == 0.0,
+              (std::string("lab.tools regions ") + label +
+               " matches the CPU block").c_str());
+    };
+
+    run_residual("show mask",
+                 [](rtengine::procparams::ProcParams& p) {
+                     p.colorToning.labregionsShowMask = 0;
+                 });
+    run_residual("five regions",
+                 [](rtengine::procparams::ProcParams& p) {
+                     while (p.colorToning.labregions.size() < 5) {
+                         p.colorToning.labregions.push_back(
+                             rtengine::procparams::ColorToningParams::
+                                 LabCorrectionRegion());
+                     }
+                 });
+    run_residual("unsupported curve",
+                 [](rtengine::procparams::ProcParams& p) {
+                     p.colorToning.labregions[0].hueMask = {
+                         static_cast<double>(FCT_Unchanged),
+                         0.0, 0.0, 0.0, 0.0,
+                         1.0, 1.0, 0.0, 0.0};
+                 });
+    run_residual("slope out of range",
+                 [](rtengine::procparams::ProcParams& p) {
+                     p.colorToning.labregions[0].slope = 0.05;
+                 });
+    run_residual("channel out of range",
+                 [](rtengine::procparams::ProcParams& p) {
+                     p.colorToning.labregions[0].channel = 3;
+                 });
+    run_residual("saturation out of range",
+                 [](rtengine::procparams::ProcParams& p) {
+                     p.colorToning.labregions[0].saturation = 200.0;
+                 });
+    run_residual("blur out of range",
+                 [](rtengine::procparams::ProcParams& p) {
+                     p.colorToning.labregions[0].maskBlur = -20.0;
+                 });
+}
+
 } // namespace
 
 int main()
@@ -5650,6 +6116,7 @@ int main()
     test_lab_tools_vibrance(available);
     test_lab_tools_lab_curve(available);
     test_lab_tools_local_contrast(available);
+    test_lab_tools_regions(available);
     test_output_sharpen(available);
     test_run_wiring(available);
 
