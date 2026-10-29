@@ -123,12 +123,23 @@ product, the two `guidedFilter()` rounds with the block's implicit subsampling
 and its 0.001/0.0001 epsilons, the `abcoord` a/b correction, the CDL round trip
 with `pow_F()` and the saturation-about-luminance step, the channel copy from
 the original pixel and the two `intp()` blends. The masks are always built
-from a snapshot of the original Lab, and the region applications run in region
-order. The working matrices are uploaded again as doubles for this pass,
+from a snapshot of the Lab as it stands at the start of the regions pass, after
+LabGrid, shadows/highlights, local contrast, the Lab curves and vibrance, and
+the region applications then run in region order on the working Lab. The working matrices are uploaded again as doubles for this pass,
 because the host's CDL and channel products are double expressions and the
 float matrices can move a gamut-edge sample by 2 LSB16. The program is
 therefore built separately from the fp32 `lab.tools` program with
-`cl_khr_fp64`; the launcher refuses the pass on a device without fp64. Local
+`cl_khr_fp64`; the launcher refuses the pass on a device without fp64. The
+region port also corrected two shared Lab-cache helpers in
+`lab_tools_cl.h`: `rt_lt_cache_lookup()` now reproduces `LUTf`'s
+`LUT_CLIP_ABOVE` at the `size-2` bound instead of interpolating from the last
+entry, and `rt_lt_compute_f()/_fy()` use `Color::computeXYZ2Lab()`'s double
+negative branches. Both are read by the pre-existing RGB-mode
+shadows/highlights blend (`rt_lab_tools_apply_rgb`) and by the region apply
+kernel. Measured against the host block, the RGB SH cases keep their PAE and
+lose 200, 115, 158, 302, 132 and 105 differing samples; the amount-100 case
+drops from 0.228516 to 0.216797 LSB16, and the real-PEF RGB SH export is
+pixel-identical before and after. Local
 contrast's own fp64 program (`lab.tools.localcontrast`) carries the same
 restriction: the double recurrence and the SSE path's double tail lines need
 `double`, so a device without fp64 keeps the block on the host. Below sigma 25
