@@ -161,6 +161,12 @@ node ran on the device rather than only comparing pixels.
 | Working TRC residual (`working-trc-residual.pp3`, soft light on) | PASS as a host residual: `"stage":"working.trc","impl":"host"`, `max_pae=1.5259e-05` informational |
 | Working TRC device test | twelve cases at 238×24 and 179×17, gamut on/off, `wapsat` 0/0.5/1 and five TRC values; worst PAE 0.376953 LSB16, all finite; probe means bit-identical (`delta 0/0`); out-of-gamut, midtone-equaliser and soft-light residuals bit-identical to the CPU block with `impl=host` |
 | Working TRC CPU path (`--gpu=off`, two runs) | identical, `PAE 0` |
+| Lab tools (`labtools-sh.pp3`, shadows/highlights Lab mode), POCL CPU, `RT_STAGE_OPENCL=1` | PASS, `max_pae=1.5259e-05`; the record is `"stage":"lab.tools","impl":"opencl","source":"opencl"` at 3888x2608 |
+| Lab tools (`labtools-sh-rgb.pp3`, RGB mode) | PASS, `max_pae=1.5259e-05`; `"impl":"opencl"` |
+| Lab tools (`labtools-labgrid.pp3`, LabGrid only) | PASS, `max_pae=1.5259e-05`; `"impl":"opencl"` |
+| Lab tools residual (`labtools-residual.pp3`, vibrance on) | PASS as a host residual: `"stage":"lab.tools","impl":"host","source":"device-fallback"`, not counted as device parity |
+| Lab tools device test | 22 cases at 238x64, 179x48 and 8192x64: LabGrid only, shadows/highlights Lab and RGB modes, both tools, single rounds, amounts 1/50/200/1000, tonal widths 0/100/split, radii 1/10/100 and padded widths; Lab mode bit-exact (PAE 0), RGB mode worst 0.23 LSB16, all finite; six residuals and two steep-table refusals are `impl=host` and bit-identical to the block; a forced launcher refusal is `impl=host` and bit-identical |
+| Lab tools CPU refactor | LabGrid, Lab-mode and RGB-mode exports with `--gpu=off`, `RT_STAGE_OPENCL` unset: pixel data identical to the pre-change binary (`tiffcmp`), only the Software tag differs |
 | Device records | `"stage":"lanczos3"`, `"stage":"transform"`, `"stage":"output.convert"`, `"stage":"gamut"`, `"stage":"framing"` and `"stage":"output.sharpen"`, all `impl":"opencl"`, `source":"opencl"`; the classic log has no `opencl resize`, `opencl transform` or `opencl lab2srgb` line |
 | `monitor.output`, `viewport.output` in the GUI | device records with `impl=opencl`, `source=opencl`; preview image area identical to a CPU-only run (0 LSB8) |
 | `thumbnail.output` via the file browser | 12 device records; thumbnail cache byte-identical to a CPU-only run |
@@ -222,6 +228,15 @@ of them the GUI silently uses the CPU path.
   the classic kernel. The classic resize, rotate and neutral exports are
   byte-identical to the pre-change package (0 LSB), so the refactors changed no
   pixels.
+- The lab.tools guided filter is a port, not an approximation: the subsampling,
+  the box radius clamps, `boxblur()`'s running sums and the bilinear rescale and
+  readout follow `guidedfilter.cc` and `boxblur.cc` operation for operation, so
+  a Lab-mode round is bit-exact. RGB mode keeps single precision because the
+  POCL device used for the gate exposes no `cl_khr_fp64`; the host's `xcbrtf()`
+  is ported so the cube root matches, and the setup refuses a tone table whose
+  steepest step could turn the closing round trip's one-ulp channel difference
+  into more than one LSB16. That bound is crossed only above the 0..100 slider
+  range.
 - The shared kernel fragment is a namespace-scope constant, not a macro: GCC 12,
   the portable baseline, rejects a multi-line raw string inside a `#define` while
   the host compiler accepts it. The portable build found this; the host build

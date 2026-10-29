@@ -84,6 +84,21 @@ first pass above the working-gamut tolerance, a non-matrix-shaper profile or a
 `buildGpuProfile()` failure is a residual: it runs the `working.trc` host
 builtin and records `impl=host`, never a device pass.
 
+`lab.tools` is partial: the Lab-grid colour-toning pass and
+shadows/highlights in both its Lab and RGB modes run on the device. The
+guided filter is ported with the block's own fast-guided-filter subsampling of
+4, `boxblur()`'s running sums and bilinear rescale/readout, and the tone
+tables are built on the host from the block's `pow_F()` and `sh_contrast`
+code, so a supported Lab-mode round is bit-exact and an RGB-mode round is
+within one LSB16. Everything else in the block is a residual: Lab curves
+(which own the histogram refill and the Lab LUTs; a non-zero `contrast` is
+excluded with them), local contrast, EPD, vibrance, black-and-white output,
+any colour-toning method other than `LabGrid` (`LabRegions` included), a
+profile with neither tool active, and an RGB-mode tone table whose steepest
+step can turn the closing round trip's one-ulp channel difference into more
+than one LSB16. A residual runs the `lab.tools` host builtin and records
+`impl=host`, never a device pass.
+
 `lab.sharpening` is partial through the same `output.sharpen` node:
 `ImProcFunctions::sharpening()` is the entry point for both the Lab block and
 the post-resize block, so a Lab-only profile records `output.sharpen`. The
@@ -103,7 +118,7 @@ main sharpen node may still run on the device.
 | `transform` | Full/Full/Roi/- | path | reuse-input | rotation, distortion, perspective, CA, vignetting, gradient, post-crop vignette, dehaze, Fattal | yes |
 | `local.adjustments` | Full/Full/Roi/Reduced | path | reuse-input | local lab / selective editing | no |
 | `rgb.proc` | Full/Full/Roi/Reduced | path | reuse-input | RGB curves, tone curve, colour toning, B&W, channel mixer, HSV, film simulation | yes |
-| `lab.tools` | Full/Full/Roi/Reduced | path | reuse-input | shadows/highlights, Lab curves, local contrast, vibrance, EPD, Lab-grid colour toning | no |
+| `lab.tools` | Full/Full/Roi/Reduced | path | reuse-input | shadows/highlights, Lab curves, local contrast, vibrance, EPD, Lab-grid colour toning | partial |
 | `lab.sharpening` | Full/-/Roi/- | path | reuse-input | impulse denoise, defringe, ML sharpen edges, ML microcontrast and the main sharpen pass (shared `output.sharpen` node) | partial |
 | `lab.wavelet` | Full/Full/Roi/Reduced | path | reuse-input | directional pyramid equaliser and wavelet | no |
 | `working.trc` | Full/Full/Roi/- | path | reuse-input | soft light, tone equaliser and working-TRC conversion | partial |

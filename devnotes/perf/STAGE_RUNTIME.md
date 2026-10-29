@@ -2083,6 +2083,123 @@ Evidence, with `OMP_NUM_THREADS=1` and a 3888x2608 PEF:
 | CUSTOM `WorkingTRC`, gamma 0.4, slope 4.5 (type -5) | host residual: `impl=host`, no `impl=opencl`, PAE 0 against the CPU block; observed TRC type -5, `params 2.5, 0.868743, 0.131257, 0.222222, 0.100725` |
 | `--gpu=off` CPU path, two runs | identical (`PAE 0`) |
 
+## Lab tools
+
+`lab.tools` runs the Lab block's Lab-grid colour-toning pass and
+shadows/highlights in both of its modes as one device node. Everything else in
+the block stays on the host.
+
+### Supported set
+
+`labToolsSupported()` admits a profile where
+
+- colour toning is off, or on with `method == "LabGrid"`; any other method,
+  `LabRegions` included, is a residual;
+- `labCurve.enabled` is false and `labCurve.contrast` is 0, so neither the
+  histogram refill nor the Lab LUTs are in play (`chromiLuminanceCurve()`
+  returns before touching a pixel, and `hist16` is left alone);
+- local contrast, EPD and vibrance are off, and black-and-white output is off
+  (`chromiLuminanceCurve()` zeroes a and b for it even with the Lab curves
+  off);
+- the shadows/highlights sliders are inside 0..100 for the tonal widths and
+  the radius, and 0..10000 for the amounts (the amounts have no geometric
+  limit; the tone table is built on the host);
+
+and at least one of the two tools would run. A profile with neither is a
+residual: the node would be a no-op and the host block records it as such.
+
+The setup refines that in one place. RGB mode closes each pixel through
+`lab2rgb()` and `rgb2lab()`, and the host evaluates those two colour-matrix
+products in double. The device keeps single precision, so the channel that
+indexes the tone table can differ by an ulp of a 16-bit value; a table whose
+largest adjacent entry-to-entry step times that ulp can exceed one LSB16 is
+refused, and the builtin runs the block. With the block's own `sh_contrast`
+this bound is crossed only by a hand-edited amount above the 0..100 slider
+range. Lab mode applies the table to the exact L value and has no such bound.
+
+### Arithmetic
+
+The block's sequence is preserved exactly:
+
+1. the mask and guiding image from the L plane
+   (`pow4(l * scale)` / `pow4(scale / l)`, threshold `tonalwidth * 327.68`);
+2. `guidedFilter(L, mask, mask, radius, 0.075, multiThread, 4)`;
+3. the host-built tone table and `intp(blend, f[l], l)`, with the shadow
+   round's chromaticity scaling; or in RGB mode `lab2rgb()`, the per-channel
+   table where the channel is not out of gamut, and `rgb2lab()`.
+
+The guided filter is a port, not an approximation. The subsampled grid is
+`W/4` by `H/4`, `r1` is `float(r)/subsampling` truncated, and `f_mean()`
+clamps it the way `guidedfilter.cc` does. `boxblur()` is reproduced by one
+work item per row for the horizontal pass and one per column for the vertical
+pass, in `boxblur()`'s float order: the growing head, the running sum with the
+departing sample, and the shrinking tail, with division in the head and tail
+and the reciprocal multiply of the SSE and remaining-column paths in the
+interior. The departing samples that the host keeps in a ring buffer are read
+from the read-only source instead, which holds the same values because the
+two passes always write a different buffer; the launcher ping-pongs through one
+subsampled scratch plane. `rescaleBilinear()` and `getBilinearValue()` are
+ported operation for operation, with `intp(a, b, c) = a * (b - c) + c`.
+
+`Color::computeXYZ2Lab()`'s cube root is the host's own `xcbrtf()`, the sleef
+polynomial, not the libm root: above the 16-bit range the two differ by a few
+ulps, and the RGB-mode blend reads the result.
+
+### ABI
+
+`[0]` the three-plane F32 Lab buffer, read and written in place, `[1]` the
+host-only `RtLabToolsContext` pointer (`RT_STAGE_ARG_PTR`), `[2]` the int
+support flag, mirrored from the context descriptor; the launcher requires both
+to be 1, so a configuration or setup refusal reaches the builtin as
+`impl=host`, `[3]` the int LabGrid flag, `[4..7]` the doubles `a_scale`,
+`a_base`, `b_scale`, `b_base` exactly as `colorToningLabGrid()` derives them,
+`[8]` shadows/highlights enabled, `[9]` highlights, `[10]` shadows, `[11]`
+highlight tonal width, `[12]` shadow tonal width, `[13]` radius, `[14]` the Lab
+mode flag, `[15]` the block's `scal` (always 1 at the export call site; the
+launcher requires it), `[16]` and `[17]` the highlight and shadow tone tables
+(32768 F32 in Lab mode, 65536 in RGB mode), `[18]` and `[19]` the working
+RGB-to-XYZ and XYZ-to-RGB matrices, nine floats each, `[20]` and `[21]`
+`Color::cachef` and `Color::cachefy`.
+
+The context is host-only. `build()` derives the four Lab-grid floats, builds
+the tone tables through the block's own `shadowsHighlightsLut()` (extracted
+from `ImProcFunctions::shadowsHighlights()` so the host path and the setup
+cannot drift), copies the working matrices and the two Lab caches, and applies
+the RGB-mode table check. `runHost()` runs the extracted host block on the Lab
+buffer, honouring the buffer's pitches. The launcher validates every kind,
+every table length and the matrix and cache shapes before it uploads; the Lab
+buffer is read back only after every pass succeeded, so a refusal leaves the
+host image untouched.
+
+### Residuals and the builtin
+
+A residual runs the `lab.tools` host builtin, which disables device recursion
+for the duration and runs the original block, and the runtime records
+`impl=host`: Lab curves, a non-zero Lab contrast, local contrast, EPD,
+vibrance, black-and-white output, a colour-toning method other than `LabGrid`,
+a profile with no active tool, an out-of-range slider, an image too small for
+the guided filter (fewer than three samples on the subsampled grid), an
+RGB-mode tone table above the slope bound, and any allocation or launch
+failure. The call site runs the same block when the device is not selected, so
+with `RT_STAGE_OPENCL` unset the node is the pre-node code path and its export
+is byte-identical to the previous binary.
+
+### Evidence
+
+With `OMP_NUM_THREADS=1`, a 3888x2608 PEF and the POCL CPU device:
+
+| Case | Result |
+|---|---|
+| `stage-residency-test` lab.tools cases at 238x64, 179x48 and 8192x64 | LabGrid-only, shadows/highlights Lab mode, both tools and every Lab-mode slider case are bit-exact (PAE 0, 0 differing samples); RGB mode is within 0.08 LSB16 at amounts 50 and 100 and single-round cases at 0.002 to 0.006 |
+| Slider coverage | amounts 1/50/200/1000, tonal widths 0/100 and a split pair, radii 1/10/100, padded widths 179 and 238, and an 8192-wide image; all finite, no NaN or Inf |
+| Residuals | vibrance, Lab curves, local contrast, EPD, Lab regions and black-and-white are refused, record `impl=host` with no `impl=opencl`, and are byte-identical to the block |
+| RGB-mode steep table | amounts 200 and 1000 are inside the predicate but refused by the setup: `impl=host`, PAE 0 |
+| Forced launcher refusal (a tone table of half the required length) | `impl=host`, no device pass, byte-identical to the block |
+| `verify.sh --stage-device`, POCL CPU, `labtools-sh.pp3`, `labtools-sh-rgb.pp3`, `labtools-labgrid.pp3` | PASS, `max_pae=1.5259e-05` (1 LSB16); records `"stage":"lab.tools","impl":"opencl","source":"opencl"` at 3888x2608 |
+| `labtools-residual.pp3` (vibrance on) | PASS as a host residual: `"stage":"lab.tools","impl":"host","source":"device-fallback"` |
+| `--gpu=off`, `RT_STAGE_OPENCL` unset, four lab.tools profiles | pixel data identical to the pre-change binary (`tiffcmp`); only the Software tag differs |
+| Forced refusal (`RT_STAGE_DEVICE_BUDGET_MB=16`, `RT_REQUIRE_GPU=1`) | FAIL, exit 1, so the gate is not vacuous |
+
 ## Limitations
 
 - Preview, crop, thumbnail and export run only the graph. No
@@ -2140,11 +2257,11 @@ Evidence, with `OMP_NUM_THREADS=1` and a 3888x2608 PEF:
   preview requests and reopen after a base has been stored.
 - Only Lanczos is exposed as a loadable stage. Denoise, wavelet, local
   adjustments and the output conversion still use the existing code paths.
-- The OpenCL device executes two nodes, `lanczos3` (resize) and `transform`
-  (rotation/scale). Every other node has no device implementation and resolves
-  to the host program with a reason. The device path is opt-in
-  (`RT_STAGE_OPENCL=1`) and nothing in the default configuration runs on a
-  device.
+- The device nodes are the ones `opencl_stage_nodes()` lists; the catalogue in
+  `STAGE_PIPELINE.md` records which blocks are `yes`, `partial` or `no`. Every
+  other node resolves to the host program with a reason. The device path is
+  opt-in (`RT_STAGE_OPENCL=1`) and nothing in the default configuration runs on
+  a device.
 - The classic backend and the device node cover the same resize and transform.
   With `RT_STAGE_OPENCL=1` and a device available the stage device runs first, so
   `--gpu=auto` exports reach it; with the switch unset the classic backend
