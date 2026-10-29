@@ -2111,7 +2111,9 @@ Everything else in the block stays on the host.
 - vibrance additionally requires a CPU OpenCL device. A GPU may round the
   division inside `xatan2f()` differently, which moves a pixel whose hue sits
   on a Munsell limit across the gate; the launcher refuses vibrance on a GPU
-  and the builtin records `impl=host` (see "GPU isolation" below);
+  and the builtin records `impl=host`; the gate prints a specific
+  `SKIP ... vibrance is CPU-device-only` for that row (see "GPU isolation"
+  below);
 
 and at least one of the three tools would run. A profile where none would is a
 residual: the node would be a no-op and the host block records it as such.
@@ -2188,7 +2190,8 @@ The PEF export was run on the RX 550 twice, once with the host block and once
 with the device node, and the pre-vibrance Lab buffer was captured inside
 each block. The two inputs are bit-identical (30,419,712 samples, max delta
 0), so no upstream node is involved: `rgb.proc`, `transform`, `working.trc`
-and `gamut` are not implicated. The block outputs differ at two pixels:
+and `gamut` are not implicated. The two pixels that reach the full export,
+with their block values, are:
 
 | row, col | L | a | b | C | H | host (a, b) | device (a, b) | correction |
 |---|---|---|---|---|---|---|---|---|
@@ -2199,6 +2202,18 @@ The input delta is (0, 0, 0) at both coordinates. The L output delta is 0;
 the a/b deltas are (+469.455079, +799.851562) at 1392,1648 and
 (+781.111328, -482.537109) at 78,1456.
 
+Counts, with their scope:
+
+- the committed full export differs at **2 pixels** (max 9 LSB8, 2,329 LSB16);
+- the committed block, compared on the identical input, differs at **29
+  pixels** above 1 LSB16 (max 799.851562 LSB16). The other 27 are masked by
+  later stages in the full export;
+- an experimental FMA-residual correctly rounded division, applied at
+  **block level only**, fixed the two named pixels (both within 0.005 LSB16
+  of the host) and left **27 pixels** above 1 LSB16 (max 470.764656 LSB16,
+  down from 799.851562). The experiment was not kept: it did not make the
+  whole image exact and was not run through the full export.
+
 The first pixel sits on zone 1's upper limit (`huelimit[1] = -0.55`, the
 input hue is -0.550000072, one ulp inside): the host enters zone 1 and
 corrects the hue, while the device output keeps the input hue, so its
@@ -2207,15 +2222,10 @@ The second pixel is inside zone 1; the two implementations take a different
 table branch (corrections 0.03875 and 0.03500 rad). The isolation points at
 the quotient in `xatan2f()`: rusticl does not appear to honour
 `-cl-fp32-correctly-rounded-divide-sqrt`, while the host divides with IEEE
-rounding. As a diagnosis, replacing that quotient with an FMA-residual
-correctly rounded division moved both pixels to within 0.005 LSB16 of the
-host (the 27 remaining pixels fell from 799.85 to 470.76 LSB16); the
-correction is not kept because it did not make the whole image exact. The
-same block is bit-exact under POCL (the knife-edge regression case below),
-which is why the node supports vibrance only on a CPU OpenCL device. On the
-RX 550 the launcher refuses it, the builtin runs the host block, and the
-export records `impl=host`; the full PEF export then matches `--gpu=off` at
-1.5259e-05.
+rounding. The same block is bit-exact under POCL (the knife-edge regression
+case below), which is why the node supports vibrance only on a CPU OpenCL
+device. On the RX 550 the launcher refuses it and the builtin runs the host
+block; the export records `impl=host` and is not counted as device parity.
 
 ### ABI
 
@@ -2272,7 +2282,7 @@ With `OMP_NUM_THREADS=1`, a 3888x2608 PEF and the POCL CPU device:
 |---|---|
 | `stage-residency-test` lab.tools cases at 238x64, 179x48 and 8192x64 | LabGrid-only, shadows/highlights Lab mode, both tools and every Lab-mode slider case are bit-exact (PAE 0, 0 differing samples). RGB mode is measured, not proved: 0.062500 LSB16 for the amount-50 pair, 0.046875 for both tools at 179x48, 0.076172 for the padded 238 case, 0.044922 and 0.045898 for the single highlight and shadow rounds, and a worst of 0.228516 at amount 100. The steep-step refusal is a worst-case bound, not a proof of those measurements: at the 0..100 slider maximum the measured error sits about four times inside the bound it enforces |
 | Slider coverage | amounts 1/50/200/1000, tonal widths 0/100 and a split pair, radii 1/10/100, padded widths 179 and 238, and an 8192-wide image; all finite, no NaN or Inf |
-| Vibrance, 21 cases at 125x160, 179x48, 238x64 and 8192x64 | pastels/saturated combinations, negative saturated, thresholds 0/75/100 and split, protect-skins, avoidcolorshift on/off, a skin curve, highlight reconstruction, neutral and saturated images, padded widths, the 8192-wide case and the two-pixel knife-edge case: 2,570,352 samples, measured PAE 0 and asserted within 1 LSB16 (`over == 0`), no NaN/Inf, `impl=opencl` on every case (POCL CPU) |
+| Vibrance, 21 cases at 125x160, 179x48, 238x64, 8192x64 and 64x16 | pastels/saturated combinations, negative saturated, thresholds 0/75/100 and split, protect-skins, avoidcolorshift on/off, a skin curve, highlight reconstruction, neutral and saturated images, padded widths, the 8192-wide case and the two-pixel knife-edge case: 2,570,352 samples, measured PAE 0 and asserted within 1 LSB16 (`over == 0`), no NaN/Inf, `impl=opencl` on every case (POCL CPU) |
 | Munsell tables | all 197 tables and 27,580 exported entries equal `Color::MunsellLch()`'s LUTs; the avoidcolorshift path changes 11,696 of 60,000 domain samples, so the comparison is not vacuous |
 | Block on the real PEF, POCL | the device block matches `stage::labToolsHostBlock` bit for bit (30,419,712 samples, max float delta 0) on the full pre-vibrance Lab buffer |
 | Residuals | vibrance + Lab curves, vibrance + local contrast, vibrance + EPD, vibrance + Lab regions, vibrance + black-and-white, a vibrance no-op (sliders at zero, identity curve) and pastels 200 (out of range) are refused, record `impl=host` with no `impl=opencl`, and are byte-identical to the block |
@@ -2280,7 +2290,8 @@ With `OMP_NUM_THREADS=1`, a 3888x2608 PEF and the POCL CPU device:
 | Forced launcher refusal (a tone table of half the required length) | `impl=host`, no device pass, byte-identical to the block |
 | `verify.sh --stage-device`, POCL CPU, `labtools-sh.pp3`, `labtools-sh-rgb.pp3`, `labtools-labgrid.pp3` | PASS, `max_pae=1.5259e-05` (1 LSB16); records `"stage":"lab.tools","impl":"opencl","source":"opencl"` at 3888x2608 |
 | `verify.sh --stage-device`, POCL CPU, `labtools-vibrance.pp3` on the PEF chart | PASS, `max_pae=1.5259e-05` (1 LSB16); records `"stage":"lab.tools","impl":"opencl","source":"opencl"` |
-| `verify.sh --stage-device`, RX 550 (rusticl), `labtools-vibrance.pp3` | vibrance is refused on the GPU: `"stage":"lab.tools","impl":"host","source":"device-fallback"`, no `impl=opencl` for the vibrance row; the export matches `--gpu=off` at 1.5259e-05. This is the fail-closed path for the isolation above |
+| `verify.sh --stage-device`, RX 550 (rusticl), `labtools-vibrance.pp3` | prints `SKIP` for `pef/stage-device-lab-tools-vibrance` with `vibrance is CPU-device-only; the selected device is not a CPU OpenCL device`. The row stops before `compare_images` and prints no PAE. A manual `--gpu=auto` export records `"stage":"lab.tools","impl":"host","source":"device-fallback"`; it is not counted as device parity (the other GPU nodes move 372,307 samples by 1 LSB16). A manual `--gpu=off RT_STAGE_OPENCL=1` export is pixel-identical to `--gpu=off` (AE 0); only the Software tag differs |
+| `verify.sh --stage-device` with `RT_REQUIRE_GPU=1`, RX 550 | the vibrance row FAILs intentionally with `vibrance is CPU-device-only; the selected device is not a CPU OpenCL device`; the POCL run is the authoritative gate |
 | `labtools-residual.pp3` (shadows/highlights + vibrance + local contrast) | PASS as a host residual: `"stage":"lab.tools","impl":"host","source":"device-fallback"` |
 | `--gpu=off`, `RT_STAGE_OPENCL` unset, four lab.tools profiles | pixel data identical to the pre-change binary (`tiffcmp`); only the Software tag differs |
 | Forced refusal (`RT_STAGE_DEVICE_BUDGET_MB=16`, `RT_REQUIRE_GPU=1`) | FAIL, exit 1, so the gate is not vacuous |
