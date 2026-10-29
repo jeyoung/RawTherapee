@@ -40,9 +40,12 @@ struct ProcParams;
  *
  * The device launcher receives this structure through RT_STAGE_ARG_PTR. It is
  * host-only: the pointer and its callbacks live in host memory and nothing
- * here is passed to a kernel. The context builds the per-level range tables
- * through the equaliser's own fillLut(), runs the hue/chroma precompute
- * through the equaliser's own SSE-aware code, and can run the original host
+ * here is passed to a kernel. The context builds the equaliser's per-level
+ * range tables through its own fillLut(), runs the hue/chroma precompute
+ * through the equaliser's own SSE-aware code, and builds the wavelet tool's
+ * contrast-only parameter table: the level count, the scalars, the 8-tap
+ * filters and, after the device statistics read back, one mea block per level
+ * through the block's own calceffect(). It can also run the original host
  * block for a residual.
  *
  * Gamutlab protection is a host pre-pass: the block calls BadpixelsLab()
@@ -52,11 +55,51 @@ struct ProcParams;
  * than approximating it. The prepared copy is what the hue/chroma masks are
  * built from, in the same order as the block.
  */
-#define RT_LAB_WAVELET_CONTEXT_VERSION 1u
+#define RT_LAB_WAVELET_CONTEXT_VERSION 2u
 /* "LWCT": rejects a stale or unrelated pointer before any callback runs. */
 #define RT_LAB_WAVELET_CONTEXT_MAGIC 0x4C574354u
 /* The number of levels of the directional pyramid. */
 #define RT_LAB_WAVELET_MAX_LEVELS 6u
+/* The wavelet decomposition admits up to ten levels (wavelet_level's limit). */
+#define RT_LAB_WAVELET_MAX_TRANSFORM_LEVELS 10u
+/*
+ * The wavelet parameter table. The host builds one flat float block per
+ * submission: the scalars below, then the 8-tap analysis and synthesis
+ * filters, then one RT_LAB_WAVELET_MEA_ENTRIES-entry block per level filled by
+ * compute_mea() after the device statistics have been read back. The device
+ * never re-derives a filter, a threshold or a range.
+ */
+#define RT_LAB_WAVELET_WAVELET_PARAMS 64u
+#define RT_LAB_WAVELET_MEA_ENTRIES 10u
+/* One block of raw statistics per (level, direction) band. */
+#define RT_LAB_WAVELET_STATS_PER_BAND 6u
+
+/* Wavelet parameter table indices. C0..C9 occupy ten consecutive slots. */
+#define RT_LW_PARAM_LEVELS 0
+#define RT_LW_PARAM_HSMET 1
+#define RT_LW_PARAM_NUMLEVH 2
+#define RT_LW_PARAM_NUMLEVS 3
+#define RT_LW_PARAM_C 4
+#define RT_LW_PARAM_THRESHOLD 14
+#define RT_LW_PARAM_THRESHOLD2 15
+#define RT_LW_PARAM_SIGMA 16
+#define RT_LW_PARAM_OFFSET 17
+#define RT_LW_PARAM_LOWTHR 18
+#define RT_LW_PARAM_STRENGTH 19
+#define RT_LW_PARAM_B_LHL 20
+#define RT_LW_PARAM_T_LHL 21
+#define RT_LW_PARAM_B_RHL 22
+#define RT_LW_PARAM_T_RHL 23
+#define RT_LW_PARAM_B_LSL 24
+#define RT_LW_PARAM_T_LSL 25
+#define RT_LW_PARAM_B_RSL 26
+#define RT_LW_PARAM_T_RSL 27
+#define RT_LW_PARAM_TAPS 28
+/* Slots 32..63 hold Daubechies analysis lo/hi and synthesis lo/hi. */
+#define RT_LW_PARAM_FILTER_ANAL_LO 32
+#define RT_LW_PARAM_FILTER_ANAL_HI 40
+#define RT_LW_PARAM_FILTER_SYNTH_LO 48
+#define RT_LW_PARAM_FILTER_SYNTH_HI 56
 /*
  * One range table per level: 0x20000 entries covering hipass + 0x10000, the
  * LUT size dirpyr_equalizer.cc's fillLut() writes and idirpyr_eq_channel()
@@ -77,7 +120,34 @@ typedef struct RtLabWaveletResult {
     uint32_t lut_entries;
     uint32_t levels;
     uint32_t skinprotect;
+    /*
+     * The wavelet pass. `wavelet` is 1 when the device runs it. `params`
+     * carries wavelet_entries floats: the scalar/filter table followed by the
+     * per-level mea blocks that compute_mea() fills after the statistics
+     * readback.
+     */
+    uint32_t wavelet;
+    uint32_t wavelet_levels;
+    uint32_t wavelet_entries;
+    float* params;
 } RtLabWaveletResult;
+
+/*
+ * The wavelet sub-structure of the context. The launcher reads it to size the
+ * transform, the statistics pass and the contrast pass; the host owns every
+ * value. compute_mea() is called with the device statistics block
+ * (RT_LAB_WAVELET_STATS_PER_BAND floats per (level, direction), level-major,
+ * direction 1..3) and fills the mea tail of `params`.
+ */
+typedef struct RtLabWaveletWavelet {
+    /* 1 when the call site admits the wavelet contrast pass on the device. */
+    uint32_t active;
+    uint32_t levels;
+    uint32_t taps;
+    uint32_t entries;
+    float* params;
+    int (*compute_mea)(void* self, const float* stats, uint32_t levels);
+} RtLabWaveletWavelet;
 
 typedef struct RtLabWaveletContext {
     uint32_t size;
@@ -103,6 +173,8 @@ typedef struct RtLabWaveletContext {
     uint32_t needs_scratch;
     uint32_t levels;
     uint32_t skinprotect;
+    /* The wavelet contrast pass; zero-filled when it is off. */
+    RtLabWaveletWavelet wavelet;
 } RtLabWaveletContext;
 
 namespace rtengine::stage
@@ -123,6 +195,24 @@ inline constexpr double LAB_WAVELET_MAX_SKIN = 100.0;
 inline constexpr double LAB_WAVELET_MIN_HUE = -10.0;
 inline constexpr double LAB_WAVELET_MAX_HUE = 10.0;
 
+/* The wavelet tool's slider bounds. A value outside them is a residual. */
+inline constexpr double LAB_WAVELET_MIN_WAVELET_SIGMA = 0.05;
+inline constexpr double LAB_WAVELET_MAX_WAVELET_SIGMA = 2.5;
+inline constexpr double LAB_WAVELET_MIN_WAVELET_OFFSET = 0.33;
+inline constexpr double LAB_WAVELET_MAX_WAVELET_OFFSET = 1.66;
+inline constexpr double LAB_WAVELET_MIN_WAVELET_LOWTHR = 20.0;
+inline constexpr double LAB_WAVELET_MAX_WAVELET_LOWTHR = 100.0;
+inline constexpr int LAB_WAVELET_MIN_WAVELET_C = -100;
+inline constexpr int LAB_WAVELET_MAX_WAVELET_C = 350;
+inline constexpr int LAB_WAVELET_MIN_WAVELET_LEVELS = 1;
+inline constexpr int LAB_WAVELET_MAX_WAVELET_LEVELS = 9;
+inline constexpr int LAB_WAVELET_MIN_THRESHOLD_LEVEL = 1;
+inline constexpr int LAB_WAVELET_MAX_THRESHOLD_LEVEL = 9;
+inline constexpr int LAB_WAVELET_MIN_THRESHOLD2_LEVEL = 3;
+inline constexpr int LAB_WAVELET_MAX_THRESHOLD2_LEVEL = 9;
+inline constexpr int LAB_WAVELET_MIN_STRENGTH = 0;
+inline constexpr int LAB_WAVELET_MAX_STRENGTH = 100;
+
 /* The block's `scale` argument at every export call site. The equaliser's
  * BadpixelsLab() radius is 4 / scale, and the launcher requires this value. */
 inline constexpr int LAB_WAVELET_EXPORT_SCALE = RT_LAB_WAVELET_EXPORT_SCALE;
@@ -135,12 +225,35 @@ inline constexpr int LAB_WAVELET_EXPORT_SCALE = RT_LAB_WAVELET_EXPORT_SCALE;
 int labWaveletLastLevel(const double* mult);
 
 /*
- * Whether the block is the node's supported set: an enabled directional
- * pyramid equaliser in after-CBDL position, no wavelet pass, the CIE-CAM gate
- * open, and every parameter inside the ABI bounds. The image-size and CPU
- * device checks live in the launcher.
+ * The number of transform levels ip_wavelet() actually builds for this image:
+ * the MaxLev slider, trimmed by the image-size caps, the ContExtra level and
+ * the trailing zero contrast multipliers. Zero means the block returns before
+ * the decomposition. The device reproduces this derivation exactly.
  */
-bool labWaveletSupported(const procparams::ProcParams& params);
+int labWaveletTransformLevels(const procparams::ProcParams& params,
+                              int width, int height);
+
+/*
+ * Whether the wavelet contrast pass is the node's supported set: contrast
+ * only, no chroma, edge, residual, final, toning, noise, clarity or blur
+ * panel, the "all" level method, full-tile processing, no soft radius, skin
+ * protection, avoid-colour-shift or blue-sky median, no extra level, the
+ * default 8-tap Daubechies, a highlight/shadow method the block implements,
+ * an identity chroma-by-hue curve, every scalar in range and an image large
+ * enough for the undecimated Haar bands.
+ */
+bool labWaveletWaveletSupported(const procparams::ProcParams& params,
+                                int width, int height);
+
+/*
+ * Whether the block is the node's supported set: an enabled directional
+ * pyramid equaliser, an enabled wavelet tool, or both, each inside its own
+ * admitted set, with every parameter inside the ABI bounds. The image-size and
+ * CPU device checks live in the launcher; the wavelet half-size check lives in
+ * labWaveletWaveletSupported().
+ */
+bool labWaveletSupported(const procparams::ProcParams& params, int width,
+                         int height);
 
 /*
  * The block as it ran before the device node, moved here unchanged so the
@@ -171,12 +284,16 @@ public:
     /* Fill the host-only descriptor handed over as RT_STAGE_ARG_PTR. */
     RtLabWaveletContext descriptor(bool supported);
 
-    /* Build the range tables and allocate the masks. Returns 0 on success. */
+    /* Build the range tables, the masks and the wavelet parameter table.
+     * Returns 0 on success. */
     int build(RtLabWaveletResult& out);
 
     int prepare(RtStageBuffer& lab);
 
     int runHost(RtStageBuffer& lab);
+
+    /* Fill the per-level mea blocks from the device statistics block. */
+    int computeMea(const float* stats, uint32_t levels);
 
 private:
     procparams::ProcParams& params_;
@@ -195,6 +312,10 @@ private:
     std::vector<float> luts_;
     std::vector<float> hue_;
     std::vector<float> chrom_;
+
+    bool wavelet_active_ = false;
+    int wavelet_levels_ = 0;
+    std::vector<float> wavelet_params_;
 };
 
 } // namespace rtengine::stage

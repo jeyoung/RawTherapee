@@ -227,7 +227,7 @@ RtStageStatus lab_wavelet_execute(const RtStageArg* args, uint32_t nargs,
 {
     (void)profiling;
 
-    constexpr uint32_t ARG_COUNT = 20;
+    constexpr uint32_t ARG_COUNT = 22;
     if (nargs != ARG_COUNT || args[0].kind != RT_STAGE_ARG_BUFFER ||
         args[1].kind != RT_STAGE_ARG_PTR ||
         args[2].kind != RT_STAGE_ARG_INT) {
@@ -243,7 +243,9 @@ RtStageStatus lab_wavelet_execute(const RtStageArg* args, uint32_t nargs,
         args[16].kind != RT_STAGE_ARG_INT ||
         args[17].kind != RT_STAGE_ARG_BUFFER ||
         args[18].kind != RT_STAGE_ARG_BUFFER ||
-        args[19].kind != RT_STAGE_ARG_BUFFER) {
+        args[19].kind != RT_STAGE_ARG_BUFFER ||
+        args[20].kind != RT_STAGE_ARG_INT ||
+        args[21].kind != RT_STAGE_ARG_BUFFER) {
         return RT_STAGE_INVALID;
     }
 

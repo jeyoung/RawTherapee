@@ -7,6 +7,7 @@
 #include "imagefloat.h"
 #include "improcfun.h"
 #include "labimage.h"
+#include "cplx_wavelet_filter_coeffs.h"
 #include "procparams.h"
 #include "rt_math.h"
 #include "settings.h"
@@ -36,6 +37,11 @@ int prepare_thunk(void* self, RtStageBuffer* lab)
 int run_host_thunk(void* self, RtStageBuffer* lab)
 {
     return static_cast<LabWaveletContext*>(self)->runHost(*lab);
+}
+
+int compute_mea_thunk(void* self, const float* stats, uint32_t levels)
+{
+    return static_cast<LabWaveletContext*>(self)->computeMea(stats, levels);
 }
 
 /*
@@ -94,59 +100,267 @@ int labWaveletLastLevel(const double* mult)
     return last;
 }
 
-bool labWaveletSupported(const procparams::ProcParams& params)
+bool labWaveletSupported(const procparams::ProcParams& params, int width,
+                         int height)
 {
     const procparams::DirPyrEqualizerParams& equalizer =
         params.dirpyrequalizer;
 
-    if (!equalizer.enabled || equalizer.cbdlMethod != "aft") {
-        return false;
-    }
-    /* The wavelet pass is the next node increment; until it is ported an
-     * enabled wavelet tool keeps the whole block on the host. */
-    if (params.wavelet.enabled) {
-        return false;
-    }
-    if (settings == nullptr) {
+    const bool equalizerOn = equalizer.enabled;
+    const bool waveletOn = params.wavelet.enabled;
+    if (!equalizerOn && !waveletOn) {
         return false;
     }
 
-    /* stage_lab_wavelet()'s gate around the equaliser call. */
-    const bool cam02 = params.colorappearance.enabled &&
-                       params.colorappearance.modelmethod == "02";
-    if (!((params.colorappearance.enabled && !settings->autocielab) ||
-          !cam02)) {
-        return false;
-    }
+    if (equalizerOn) {
+        if (equalizer.cbdlMethod != "aft") {
+            return false;
+        }
+        if (settings == nullptr) {
+            return false;
+        }
 
-    for (int level = 0; level < static_cast<int>(RT_LAB_WAVELET_MAX_LEVELS);
-         ++level) {
-        const double value = equalizer.mult[level];
-        if (!std::isfinite(value) || value < LAB_WAVELET_MIN_MULT ||
-            value > LAB_WAVELET_MAX_MULT) {
+        /* stage_lab_wavelet()'s gate around the equaliser call. */
+        const bool cam02 = params.colorappearance.enabled &&
+                           params.colorappearance.modelmethod == "02";
+        if (!((params.colorappearance.enabled && !settings->autocielab) ||
+              !cam02)) {
+            return false;
+        }
+
+        for (int level = 0;
+             level < static_cast<int>(RT_LAB_WAVELET_MAX_LEVELS); ++level) {
+            const double value = equalizer.mult[level];
+            if (!std::isfinite(value) || value < LAB_WAVELET_MIN_MULT ||
+                value > LAB_WAVELET_MAX_MULT) {
+                return false;
+            }
+        }
+        if (!std::isfinite(equalizer.threshold) ||
+            equalizer.threshold < LAB_WAVELET_MIN_THRESHOLD ||
+            equalizer.threshold > LAB_WAVELET_MAX_THRESHOLD) {
+            return false;
+        }
+        if (!std::isfinite(equalizer.skinprotect) ||
+            equalizer.skinprotect < LAB_WAVELET_MIN_SKIN ||
+            equalizer.skinprotect > LAB_WAVELET_MAX_SKIN) {
+            return false;
+        }
+        if (!hueInRange(equalizer.hueskin.getBottomLeft()) ||
+            !hueInRange(equalizer.hueskin.getTopLeft()) ||
+            !hueInRange(equalizer.hueskin.getBottomRight()) ||
+            !hueInRange(equalizer.hueskin.getTopRight())) {
+            return false;
+        }
+
+        /* A block whose multipliers are all neutral does not touch the image;
+         * it is a residual so the host records it instead of an empty device
+         * pass. */
+        if (labWaveletLastLevel(equalizer.mult) <= 0) {
             return false;
         }
     }
-    if (!std::isfinite(equalizer.threshold) ||
-        equalizer.threshold < LAB_WAVELET_MIN_THRESHOLD ||
-        equalizer.threshold > LAB_WAVELET_MAX_THRESHOLD) {
+
+    return !waveletOn || labWaveletWaveletSupported(params, width, height);
+}
+
+int labWaveletTransformLevels(const procparams::ProcParams& params,
+                              int width, int height)
+{
+    const procparams::WaveletParams& wavelet = params.wavelet;
+    if (!wavelet.enabled || width <= 0 || height <= 0) {
+        return 0;
+    }
+
+    /* ip_wavelet(): the export call site passes skip = 1. */
+    constexpr int skip = 1;
+    const int minwin = std::min(width, height);
+    const bool extra = wavelet.sup != 0;
+
+    int maxlevelcrop = 9;
+    if (extra) {
+        maxlevelcrop = 10;
+    }
+    if (minwin * skip < 1024) {
+        maxlevelcrop = 9;
+    }
+    if (minwin * skip < 512) {
+        maxlevelcrop = 8;
+    }
+    if (minwin * skip < 256) {
+        maxlevelcrop = 7;
+    }
+    if (minwin * skip < 128) {
+        maxlevelcrop = 6;
+    }
+    if (minwin * skip < 64) {
+        maxlevelcrop = 5;
+    }
+    if (minwin * skip < 32) {
+        maxlevelcrop = 4;
+    }
+
+    int levwav = wavelet.thres;
+    if (wavelet.expnoise) {
+        levwav = 6;
+    }
+    if (levwav == 9 && extra) {
+        levwav = 10;
+    }
+    levwav = std::min(maxlevelcrop, levwav);
+    if (levwav < 1) {
+        return 0;
+    }
+
+    const int minsizetile = std::min(width, height);
+    int maxlev2 = 10;
+    if (minsizetile < 1024 && levwav == 10) {
+        maxlev2 = 9;
+    }
+    if (minsizetile < 512) {
+        maxlev2 = 8;
+    }
+    if (minsizetile < 256) {
+        maxlev2 = 7;
+    }
+    if (minsizetile < 128) {
+        maxlev2 = 6;
+    }
+    if (minsizetile < 64) {
+        maxlev2 = 5;
+    }
+    if (minsizetile < 32) {
+        maxlev2 = 4;
+    }
+    levwav = std::min(maxlev2, levwav);
+
+    /* The trailing-zero trim in ip_wavelet(): a level whose multiplier is
+     * exactly zero is dead when nothing else in the block needs it. */
+    const bool noiseena = wavelet.expnoise && minwin > 128;
+    const bool ref0 =
+        noiseena && (wavelet.level0noise.getBottom() > 0. ||
+                     wavelet.level1noise.getBottom() > 0. ||
+                     wavelet.level2noise.getBottom() > 0. ||
+                     wavelet.level3noise.getBottom() > 0.);
+    const bool dead = !wavelet.expbl && wavelet.contrast == 0 &&
+                      wavelet.resblur == 0 && !noiseena &&
+                      wavelet.tmrs == 0 && !wavelet.expresid &&
+                      !wavelet.expchroma && !wavelet.exptoning &&
+                      !wavelet.expfinal && !wavelet.expedge &&
+                      wavelet.rescon == 0 && wavelet.resconH == 0 &&
+                      wavelet.edgval == 0 && !ref0 &&
+                      wavelet.CLmethod == "all";
+    if (dead) {
+        const auto multiplier = [&](int index) -> int {
+            if (index < wavelet.thres && index < 9) {
+                return wavelet.c[index];
+            }
+            return index == 9 ? wavelet.sup : 0;
+        };
+        while (levwav > 0 && multiplier(levwav - 1) == 0) {
+            --levwav;
+        }
+    }
+    return levwav > 0 ? levwav : 0;
+}
+
+bool labWaveletWaveletSupported(const procparams::ProcParams& params,
+                                int width, int height)
+{
+    const procparams::WaveletParams& wavelet = params.wavelet;
+    if (!wavelet.enabled) {
+        return true;
+    }
+
+    /* Contrast only: every other export panel is a residual. */
+    if (!wavelet.expcontrast || wavelet.expchroma || wavelet.expedge ||
+        wavelet.expbl || wavelet.expresid || wavelet.expfinal ||
+        wavelet.exptoning || wavelet.expnoise || wavelet.expclari) {
         return false;
     }
-    if (!std::isfinite(equalizer.skinprotect) ||
-        equalizer.skinprotect < LAB_WAVELET_MIN_SKIN ||
-        equalizer.skinprotect > LAB_WAVELET_MAX_SKIN) {
+    if (wavelet.CLmethod != "all" || wavelet.Tilesmethod != "full") {
         return false;
     }
-    if (!hueInRange(equalizer.hueskin.getBottomLeft()) ||
-        !hueInRange(equalizer.hueskin.getTopLeft()) ||
-        !hueInRange(equalizer.hueskin.getBottomRight()) ||
-        !hueInRange(equalizer.hueskin.getTopRight())) {
+    if (wavelet.softrad != 0.0 || wavelet.softradend != 0.0) {
+        return false;
+    }
+    if (wavelet.skinprotect != 0.0) {
+        return false;
+    }
+    if (wavelet.avoid || wavelet.median) {
+        return false;
+    }
+    if (wavelet.sup != 0) {
+        return false;
+    }
+    /* Only the default 8-tap Daubechies analysis is ported. */
+    if (wavelet.daubcoeffmethod != "6_") {
+        return false;
+    }
+    if (wavelet.HSmethod != "with" && wavelet.HSmethod != "without") {
+        return false;
+    }
+    /* An active chroma-by-hue curve would scale the contrast per pixel. */
+    {
+        const FlatCurve chroma_curve(wavelet.Chcurve);
+        if (!chroma_curve.isIdentity()) {
+            return false;
+        }
+    }
+    if (!std::isfinite(wavelet.sigma) ||
+        wavelet.sigma < LAB_WAVELET_MIN_WAVELET_SIGMA ||
+        wavelet.sigma > LAB_WAVELET_MAX_WAVELET_SIGMA ||
+        !std::isfinite(wavelet.offset) ||
+        wavelet.offset < LAB_WAVELET_MIN_WAVELET_OFFSET ||
+        wavelet.offset > LAB_WAVELET_MAX_WAVELET_OFFSET ||
+        !std::isfinite(wavelet.lowthr) ||
+        wavelet.lowthr < LAB_WAVELET_MIN_WAVELET_LOWTHR ||
+        wavelet.lowthr > LAB_WAVELET_MAX_WAVELET_LOWTHR) {
+        return false;
+    }
+    if (wavelet.thres < LAB_WAVELET_MIN_WAVELET_LEVELS ||
+        wavelet.thres > LAB_WAVELET_MAX_WAVELET_LEVELS ||
+        wavelet.threshold < LAB_WAVELET_MIN_THRESHOLD_LEVEL ||
+        wavelet.threshold > LAB_WAVELET_MAX_THRESHOLD_LEVEL ||
+        wavelet.threshold2 < LAB_WAVELET_MIN_THRESHOLD2_LEVEL ||
+        wavelet.threshold2 > LAB_WAVELET_MAX_THRESHOLD2_LEVEL) {
+        return false;
+    }
+    if (wavelet.strength < LAB_WAVELET_MIN_STRENGTH ||
+        wavelet.strength > LAB_WAVELET_MAX_STRENGTH) {
+        return false;
+    }
+    for (int level = 0; level < 9; ++level) {
+        if (wavelet.c[level] < LAB_WAVELET_MIN_WAVELET_C ||
+            wavelet.c[level] > LAB_WAVELET_MAX_WAVELET_C) {
+            return false;
+        }
+    }
+    /* The scoped set leaves the finest level active; an all-zero pyramid
+     * would be a no-op dressed up as a device pass. */
+    if (wavelet.c[0] == 0) {
         return false;
     }
 
-    /* A block whose multipliers are all neutral does not touch the image; it
-     * is a residual so the host records it instead of an empty device pass. */
-    return labWaveletLastLevel(equalizer.mult) > 0;
+    const int levels = labWaveletTransformLevels(params, width, height);
+    if (levels < 1 ||
+        levels > static_cast<int>(RT_LAB_WAVELET_MAX_TRANSFORM_LEVELS)) {
+        return false;
+    }
+    if (width > 0 && height > 0) {
+        /* The undecimated Haar levels read skip pixels to the right and
+         * below; the block leaves the border band unwritten when the grid is
+         * too small, so refuse instead of reproducing an uninitialised read. */
+        const int half_w = (width + 1) / 2;
+        const int half_h = (height + 1) / 2;
+        if (levels >= 2) {
+            const int reach = 1 << (levels - 1);
+            if (half_w < reach || half_h < reach) {
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 /*
@@ -358,70 +572,213 @@ RtLabWaveletContext LabWaveletContext::descriptor(bool supported)
         gamutlab_ && skinprotect_ != 0.f ? 1u : 0u;
     context.levels = static_cast<uint32_t>(levels_);
     context.skinprotect = skinprotect_ != 0.f ? 1u : 0u;
+    context.wavelet.active = wavelet_active_ ? 1u : 0u;
+    context.wavelet.levels = static_cast<uint32_t>(wavelet_levels_);
+    context.wavelet.taps = 8u;
+    context.wavelet.entries = static_cast<uint32_t>(
+        wavelet_params_.size());
+    context.wavelet.params =
+        wavelet_params_.empty() ? nullptr : wavelet_params_.data();
+    context.wavelet.compute_mea = &compute_mea_thunk;
     return context;
 }
 
 int LabWaveletContext::build(RtLabWaveletResult& out)
 {
-    if (built_) {
-        out.luts = luts_.data();
+    const auto fill_result = [&out, this]() {
+        out.luts = luts_.empty() ? nullptr : luts_.data();
         out.hue = hue_.empty() ? nullptr : hue_.data();
         out.chrom = chrom_.empty() ? nullptr : chrom_.data();
         out.lut_entries = RT_LAB_WAVELET_LUT_ENTRIES;
         out.levels = static_cast<uint32_t>(levels_);
         out.skinprotect = skinprotect_ != 0.f ? 1u : 0u;
+        out.wavelet = wavelet_active_ ? 1u : 0u;
+        out.wavelet_levels = static_cast<uint32_t>(wavelet_levels_);
+        out.wavelet_entries =
+            static_cast<uint32_t>(wavelet_params_.size());
+        out.params =
+            wavelet_params_.empty() ? nullptr : wavelet_params_.data();
+    };
+
+    if (built_) {
+        fill_result();
         return 0;
     }
 
-    levels_ = labWaveletLastLevel(params_.dirpyrequalizer.mult);
-    if (levels_ <= 0 ||
-        levels_ > static_cast<int>(RT_LAB_WAVELET_MAX_LEVELS)) {
+    levels_ = params_.dirpyrequalizer.enabled
+                  ? labWaveletLastLevel(params_.dirpyrequalizer.mult)
+                  : 0;
+    if (levels_ > static_cast<int>(RT_LAB_WAVELET_MAX_LEVELS)) {
         return 1;
     }
-    if (width_ < 8 || height_ < 8) {
-        return 2;
-    }
 
-    for (int level = 0; level < static_cast<int>(RT_LAB_WAVELET_MAX_LEVELS);
-         ++level) {
-        multi_[level] =
-            static_cast<float>(params_.dirpyrequalizer.mult[level]);
-    }
+    if (levels_ > 0) {
+        if (width_ < 8 || height_ < 8) {
+            return 2;
+        }
 
-    /*
-     * One host-built range table per active level, through the block's own
-     * fillLut(). The device never re-derives the threshold arithmetic.
-     */
-    luts_.assign(static_cast<std::size_t>(levels_) *
-                     RT_LAB_WAVELET_LUT_ENTRIES,
-                 0.f);
-    for (int level = 0; level < levels_; ++level) {
-        LUTf table(static_cast<int>(RT_LAB_WAVELET_LUT_ENTRIES));
-        dirpyrFillLut(table, level, params_.dirpyrequalizer.threshold,
-                      multi_[level], skinprotect_);
-        float* target = luts_.data() +
-                        static_cast<std::size_t>(level) *
-                            RT_LAB_WAVELET_LUT_ENTRIES;
-        for (std::uint32_t index = 0; index < RT_LAB_WAVELET_LUT_ENTRIES;
-             ++index) {
-            target[index] = table[static_cast<int>(index)];
+        for (int level = 0;
+             level < static_cast<int>(RT_LAB_WAVELET_MAX_LEVELS); ++level) {
+            multi_[level] =
+                static_cast<float>(params_.dirpyrequalizer.mult[level]);
+        }
+
+        /*
+         * One host-built range table per active level, through the block's own
+         * fillLut(). The device never re-derives the threshold arithmetic.
+         */
+        luts_.assign(static_cast<std::size_t>(levels_) *
+                         RT_LAB_WAVELET_LUT_ENTRIES,
+                     0.f);
+        for (int level = 0; level < levels_; ++level) {
+            LUTf table(static_cast<int>(RT_LAB_WAVELET_LUT_ENTRIES));
+            dirpyrFillLut(table, level, params_.dirpyrequalizer.threshold,
+                          multi_[level], skinprotect_);
+            float* target = luts_.data() +
+                            static_cast<std::size_t>(level) *
+                                RT_LAB_WAVELET_LUT_ENTRIES;
+            for (std::uint32_t index = 0;
+                 index < RT_LAB_WAVELET_LUT_ENTRIES; ++index) {
+                target[index] = table[static_cast<int>(index)];
+            }
+        }
+
+        if (skinprotect_ != 0.f) {
+            const std::size_t pixels = static_cast<std::size_t>(width_) *
+                                       static_cast<std::size_t>(height_);
+            hue_.assign(pixels, 0.f);
+            chrom_.assign(pixels, 0.f);
         }
     }
 
-    if (skinprotect_ != 0.f) {
-        const std::size_t pixels =
-            static_cast<std::size_t>(width_) * static_cast<std::size_t>(height_);
-        hue_.assign(pixels, 0.f);
-        chrom_.assign(pixels, 0.f);
+    wavelet_levels_ =
+        labWaveletTransformLevels(params_, width_, height_);
+    wavelet_active_ = params_.wavelet.enabled && wavelet_levels_ >= 1;
+    if (params_.wavelet.enabled && !wavelet_active_) {
+        return 3;
+    }
+    if (wavelet_active_) {
+        if (width_ <= 0 || height_ <= 0 ||
+            wavelet_levels_ >
+                static_cast<int>(RT_LAB_WAVELET_MAX_TRANSFORM_LEVELS)) {
+            return 4;
+        }
+        const procparams::WaveletParams& wavelet = params_.wavelet;
+        constexpr std::size_t params_count =
+            RT_LAB_WAVELET_WAVELET_PARAMS;
+        constexpr std::size_t mea_count = RT_LAB_WAVELET_MEA_ENTRIES;
+        wavelet_params_.assign(
+            params_count +
+                static_cast<std::size_t>(wavelet_levels_) * mea_count,
+            0.f);
+
+        float* table = wavelet_params_.data();
+        const auto fold = [](double value) {
+            return static_cast<float>(value);
+        };
+        table[RT_LW_PARAM_LEVELS] =
+            static_cast<float>(wavelet_levels_);
+        table[RT_LW_PARAM_HSMET] =
+            wavelet.HSmethod == "with" ? 1.f : 0.f;
+        table[RT_LW_PARAM_NUMLEVH] =
+            static_cast<float>(wavelet.threshold - 1);
+        table[RT_LW_PARAM_NUMLEVS] =
+            static_cast<float>(wavelet.threshold2);
+        for (int level = 0; level < 10; ++level) {
+            float value = 0.f;
+            if (level < wavelet.thres && level < 9) {
+                value = static_cast<float>(wavelet.c[level]);
+            } else if (level == 9) {
+                value = static_cast<float>(wavelet.sup);
+            }
+            table[RT_LW_PARAM_C + level] = value;
+        }
+        table[RT_LW_PARAM_THRESHOLD] =
+            static_cast<float>(wavelet.threshold);
+        table[RT_LW_PARAM_THRESHOLD2] =
+            static_cast<float>(wavelet.threshold2);
+        table[RT_LW_PARAM_SIGMA] = fold(wavelet.sigma);
+        table[RT_LW_PARAM_OFFSET] = fold(wavelet.offset);
+        table[RT_LW_PARAM_LOWTHR] = fold(wavelet.lowthr);
+        table[RT_LW_PARAM_STRENGTH] = std::min(
+            1.f, std::max(0.f, static_cast<float>(wavelet.strength) / 100.f));
+        table[RT_LW_PARAM_B_LHL] =
+            static_cast<float>(wavelet.hllev.getBottomLeft());
+        table[RT_LW_PARAM_T_LHL] =
+            static_cast<float>(wavelet.hllev.getTopLeft());
+        table[RT_LW_PARAM_B_RHL] =
+            static_cast<float>(wavelet.hllev.getBottomRight());
+        table[RT_LW_PARAM_T_RHL] =
+            static_cast<float>(wavelet.hllev.getTopRight());
+        table[RT_LW_PARAM_B_LSL] =
+            static_cast<float>(wavelet.bllev.getBottomLeft());
+        table[RT_LW_PARAM_T_LSL] =
+            static_cast<float>(wavelet.bllev.getTopLeft());
+        table[RT_LW_PARAM_B_RSL] =
+            static_cast<float>(wavelet.bllev.getBottomRight());
+        table[RT_LW_PARAM_T_RSL] =
+            static_cast<float>(wavelet.bllev.getTopRight());
+        constexpr int taps = 8;
+        table[RT_LW_PARAM_TAPS] = static_cast<float>(taps);
+        for (int index = 0; index < taps; ++index) {
+            table[RT_LW_PARAM_FILTER_ANAL_LO + index] = Daub4_anal8[0][index];
+            table[RT_LW_PARAM_FILTER_ANAL_HI + index] = Daub4_anal8[1][index];
+            table[RT_LW_PARAM_FILTER_SYNTH_LO + index] =
+                Daub4_anal8[0][taps - 1 - index];
+            table[RT_LW_PARAM_FILTER_SYNTH_HI + index] =
+                Daub4_anal8[1][taps - 1 - index];
+        }
     }
 
     built_ = true;
-    out.luts = luts_.data();
-    out.hue = hue_.empty() ? nullptr : hue_.data();
-    out.chrom = chrom_.empty() ? nullptr : chrom_.data();
-    out.lut_entries = RT_LAB_WAVELET_LUT_ENTRIES;
-    out.levels = static_cast<uint32_t>(levels_);
-    out.skinprotect = skinprotect_ != 0.f ? 1u : 0u;
+    fill_result();
+    return 0;
+}
+
+int LabWaveletContext::computeMea(const float* stats, uint32_t levels)
+{
+    if (!wavelet_active_ || stats == nullptr ||
+        levels != static_cast<uint32_t>(wavelet_levels_) ||
+        levels < 1 ||
+        levels > RT_LAB_WAVELET_MAX_TRANSFORM_LEVELS) {
+        return 1;
+    }
+
+    float mean[RT_LAB_WAVELET_MAX_TRANSFORM_LEVELS] = {};
+    float sigma[RT_LAB_WAVELET_MAX_TRANSFORM_LEVELS] = {};
+    const float effect = static_cast<float>(params_.wavelet.sigma);
+    const float offs = static_cast<float>(params_.wavelet.offset);
+    float* mea = wavelet_params_.data() + RT_LAB_WAVELET_WAVELET_PARAMS;
+
+    for (uint32_t level = 0; level < levels; ++level) {
+        float averagePlus[4] = {};
+        float sigmaPlus[4] = {};
+        for (int dir = 1; dir < 4; ++dir) {
+            const std::size_t base =
+                (static_cast<std::size_t>(level) * 3 +
+                 static_cast<std::size_t>(dir - 1)) *
+                RT_LAB_WAVELET_STATS_PER_BAND;
+            averagePlus[dir] = stats[base + 0];
+            sigmaPlus[dir] = stats[base + 4];
+        }
+
+        /* Eval2()'s accumulation order and its / 3. */
+        float averageL = 0.f;
+        float sigL = 0.f;
+        for (int dir = 1; dir < 4; ++dir) {
+            averageL += averagePlus[dir];
+            sigL += sigmaPlus[dir];
+        }
+        averageL /= 3;
+        sigL /= 3;
+        mean[level] = averageL;
+        sigma[level] = sigL;
+
+        ipf_.calceffect(static_cast<int>(level), mean, sigma,
+                        mea + static_cast<std::size_t>(level) *
+                                  RT_LAB_WAVELET_MEA_ENTRIES,
+                        effect, offs);
+    }
     return 0;
 }
 

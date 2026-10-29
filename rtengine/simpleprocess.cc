@@ -2326,8 +2326,8 @@ private:
 
     /*
      * lab.wavelet: the after-CBDL directional pyramid equaliser and the
-     * wavelet tool. The equaliser runs in the node; the wavelet tool remains
-     * in the extracted host block until its own increment.
+     * wavelet tool's contrast-only path. Either pass may run in the node; the
+     * extracted host block runs both when the node is a residual.
      */
     void stage_lab_wavelet()
     {
@@ -2337,21 +2337,24 @@ private:
         ImProcFunctions &ipf = * (ipf_p.get());
 
         /*
-         * The device node is opt-in and covers the directional pyramid
-         * equaliser in after-CBDL position with the wavelet tool off.
-         * Everything else is a residual: the node is not submitted as
-         * supported, the launcher refuses it and the builtin runs the host
-         * block, recording impl=host. The launcher also refuses a GPU device,
-         * whose rounding can move a hipass across a range-table entry.
+         * The device node is opt-in. It covers the directional pyramid
+         * equaliser in after-CBDL position and the wavelet tool's contrast-only
+         * path, either alone or in the block's order. Everything else is a
+         * residual: the node is not submitted as supported, the launcher
+         * refuses it and the builtin runs the host block, recording
+         * impl=host. The launcher also refuses a GPU device, whose rounding
+         * can move a hipass across a range-table entry, and a wavelet pass
+         * without fp64.
          */
         if (stage::node_device("lab.wavelet") == stage::StageNodeDevice::OpenCL) {
-            const bool supported = stage::labWaveletSupported(params);
+            const bool supported =
+                stage::labWaveletSupported(params, labView->W, labView->H);
             stage::LabWaveletContext context(params, ipf, labView->W, labView->H);
             RtLabWaveletResult setup{};
             const bool deviceReady = supported && context.build(setup) == 0;
             RtLabWaveletContext descriptor = context.descriptor(deviceReady);
 
-            RtStageArg args[20] = {};
+            RtStageArg args[22] = {};
             args[0].kind = RT_STAGE_ARG_BUFFER;
             args[0].u.buffer = stage::view(*labView);
             args[1].kind = RT_STAGE_ARG_PTR;
@@ -2381,6 +2384,9 @@ private:
             for (int index = 17; index < 20; ++index) {
                 args[index].kind = RT_STAGE_ARG_BUFFER;
             }
+            args[20].kind = RT_STAGE_ARG_INT;
+            args[20].u.i = deviceReady && setup.wavelet != 0 ? 1 : 0;
+            args[21].kind = RT_STAGE_ARG_BUFFER;
             if (deviceReady) {
                 const auto host_buffer = [](const float* data, int width) {
                     RtStageBuffer buffer{};
@@ -2395,9 +2401,11 @@ private:
                     buffer.flags = RT_STAGE_BUFFER_READ;
                     return buffer;
                 };
-                args[17].u.buffer = host_buffer(
-                    setup.luts,
-                    static_cast<int>(setup.levels * RT_LAB_WAVELET_LUT_ENTRIES));
+                if (setup.levels > 0) {
+                    args[17].u.buffer = host_buffer(
+                        setup.luts,
+                        static_cast<int>(setup.levels * RT_LAB_WAVELET_LUT_ENTRIES));
+                }
                 if (setup.skinprotect != 0) {
                     const auto mask_buffer = [](const float* data, int width,
                                                 int height) {
@@ -2420,11 +2428,15 @@ private:
                     args[19].u.buffer = mask_buffer(
                         setup.chrom, labView->W, labView->H);
                 }
+                if (setup.wavelet != 0 && setup.params != nullptr) {
+                    args[21].u.buffer = host_buffer(
+                        setup.params, static_cast<int>(setup.wavelet_entries));
+                }
             }
 
             RtStageProfiling profiling{};
             if (stage::run("lab.wavelet",
-                           std::vector<RtStageArg>(args, args + 20),
+                           std::vector<RtStageArg>(args, args + 22),
                            &profiling) == RT_STAGE_OK) {
                 return;
             }

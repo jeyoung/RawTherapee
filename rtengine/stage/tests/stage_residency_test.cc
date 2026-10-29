@@ -5602,12 +5602,14 @@ LabWaveletRun run_lab_wavelet_node(LabImage& image,
                                    rtengine::procparams::ProcParams& params,
                                    rtengine::ImProcFunctions& ipf,
                                    const std::string& profile_path,
-                                   bool submit_device = true)
+                                   bool submit_device = true,
+                                   bool force = false)
 {
     using namespace rtengine::stage;
 
     LabWaveletRun result;
-    result.supported = labWaveletSupported(params);
+    result.supported = force ||
+                       labWaveletSupported(params, image.W, image.H);
 
     LabWaveletContext context(params, ipf, image.W, image.H);
     RtLabWaveletResult setup{};
@@ -5615,7 +5617,7 @@ LabWaveletRun run_lab_wavelet_node(LabImage& image,
     result.deviceReady = deviceReady;
     RtLabWaveletContext descriptor = context.descriptor(deviceReady);
 
-    RtStageArg args[20] = {};
+    RtStageArg args[22] = {};
     args[0].kind = RT_STAGE_ARG_BUFFER;
     args[0].u.buffer = view(image);
     args[1].kind = RT_STAGE_ARG_PTR;
@@ -5645,6 +5647,9 @@ LabWaveletRun run_lab_wavelet_node(LabImage& image,
     for (int index = 17; index < 20; ++index) {
         args[index].kind = RT_STAGE_ARG_BUFFER;
     }
+    args[20].kind = RT_STAGE_ARG_INT;
+    args[20].u.i = deviceReady && setup.wavelet != 0 ? 1 : 0;
+    args[21].kind = RT_STAGE_ARG_BUFFER;
     if (deviceReady) {
         const auto host_buffer = [](const float* data, int width) {
             RtStageBuffer buffer{};
@@ -5673,9 +5678,16 @@ LabWaveletRun run_lab_wavelet_node(LabImage& image,
             buffer.flags = RT_STAGE_BUFFER_READ;
             return buffer;
         };
-        args[17].u.buffer = host_buffer(
-            setup.luts,
-            static_cast<int>(setup.levels * RT_LAB_WAVELET_LUT_ENTRIES));
+        if (setup.levels > 0) {
+            args[17].u.buffer = host_buffer(
+                setup.luts,
+                static_cast<int>(setup.levels *
+                                 RT_LAB_WAVELET_LUT_ENTRIES));
+        }
+        if (setup.wavelet != 0 && setup.params != nullptr) {
+            args[21].u.buffer = host_buffer(
+                setup.params, static_cast<int>(setup.wavelet_entries));
+        }
         if (setup.skinprotect != 0) {
             args[18].u.buffer = mask_buffer(setup.hue, image.W, image.H);
             args[19].u.buffer = mask_buffer(setup.chrom, image.W, image.H);
@@ -5690,7 +5702,7 @@ LabWaveletRun run_lab_wavelet_node(LabImage& image,
     } else {
         clear_node_device_overrides();
     }
-    result.status = run("lab.wavelet", std::vector<RtStageArg>(args, args + 20));
+    result.status = run("lab.wavelet", std::vector<RtStageArg>(args, args + 22));
     clear_node_device_overrides();
     unsetenv("RT_STAGE_PROFILE");
     return result;
@@ -5794,7 +5806,7 @@ void test_lab_wavelet(bool available)
             params.dirpyrequalizer.mult[level] = item.mult[level];
         }
 
-        check(labWaveletSupported(params),
+        check(labWaveletSupported(params, item.width, item.height),
               (std::string("lab.wavelet ") + item.label +
                " is the supported set").c_str());
 
@@ -5898,7 +5910,7 @@ void test_lab_wavelet(bool available)
             wavelet_settings.autocielab = true;
         }
 
-        check(!labWaveletSupported(params),
+        check(!labWaveletSupported(params, 179, 48),
               (std::string("lab.wavelet residual ") + label +
                " is a residual").c_str());
 
