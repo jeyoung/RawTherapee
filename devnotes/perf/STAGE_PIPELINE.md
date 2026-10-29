@@ -85,12 +85,17 @@ first pass above the working-gamut tolerance, a non-matrix-shaper profile or a
 builtin and records `impl=host`, never a device pass.
 
 `lab.tools` is partial: the Lab-grid colour-toning pass,
-shadows/highlights in both its Lab and RGB modes, vibrance and the Lab curves
-run on the device. The guided filter is ported with the block's own
-fast-guided-filter subsampling of 4, `boxblur()`'s running sums and bilinear
-rescale/readout, and the tone tables are built on the host from the block's
-`pow_F()` and `sh_contrast` code, so a supported Lab-mode round is bit-exact
-and an RGB-mode round is within one LSB16. Vibrance is a port of
+shadows/highlights in both its Lab and RGB modes, local contrast, vibrance and
+the Lab curves run on the device. The guided filter is ported with the block's
+own fast-guided-filter subsampling of 4, `boxblur()`'s running sums and
+bilinear rescale/readout, and the tone tables are built on the host from the
+block's `pow_F()` and `sh_contrast` code, so a supported Lab-mode round is
+bit-exact and an RGB-mode round is within one LSB16. Local contrast is a port
+of `ImProcFunctions::localContrast()`: the host supplies the
+`gaussianBlur()` IIR coefficients for the block's sigma, and the kernel
+reproduces both of the host's blur paths - the SSE float path below sigma 25,
+including its non-vectorised tail lines, and the double path above it - so the
+pass is bit-exact for both. Vibrance is a port of
 `ImProcFunctions::vibrance()` including `Color::gamutLchonly()`,
 `Color::SkinSat()`, the two-stage chroma ramp and the `avoidcolorshift` path
 through `Color::AllMunsellLch()`; the host builds the Munsell table set, the
@@ -109,15 +114,20 @@ Munsell index use the host's double-precision `sqrt` divided by the promoted
 falls back to the double path for the last up to three columns, and the kernel
 reproduces that tail. The program is
 therefore built separately from the fp32 `lab.tools` program with
-`cl_khr_fp64`; the launcher refuses the pass on a device without fp64. Both
-vibrance and the Lab curves are admitted only on a CPU OpenCL device: a GPU's
-`xatan2f()` division or `sqrt` rounds differently and moves pixels on a
-Munsell limit, so a GPU submission runs the host block and records
-`impl=host`. Everything else in the block is a residual: a non-zero Lab
+`cl_khr_fp64`; the launcher refuses the pass on a device without fp64. Local
+contrast's own fp64 program (`lab.tools.localcontrast`) carries the same
+restriction: the double recurrence and the SSE path's double tail lines need
+`double`, so a device without fp64 keeps the block on the host. Vibrance,
+local contrast and the Lab curves are admitted only on a CPU OpenCL device: a
+GPU's `xatan2f()` division or `sqrt` rounds differently and moves pixels on a
+Munsell limit, and its compiler may lower the IIR recurrence differently, so a
+GPU submission runs the host block and records `impl=host`. Everything else in
+the block is a residual: a non-zero Lab
 `contrast` (it owns the `hist16` refill a later node reads), the chromaticity
 slider and the C=f(H), L=f(H) and H=f(H) flat curves, the LAB, XYZ and XYZREL
 Munsell methods (they need `gamutLchonly()` and `gamutmap()`), a denoise
-chroma factor, local contrast, EPD, black-and-white output, any colour-toning
+chroma factor, a local contrast outside the ABI range, EPD, black-and-white
+output, any colour-toning
 method other than `LabGrid` (`LabRegions` included), a profile where no device
 tool would run, and an RGB-mode tone table whose steepest step can turn the
 closing round trip's one-ulp channel difference into more than one LSB16. A

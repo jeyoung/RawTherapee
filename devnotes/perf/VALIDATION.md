@@ -130,11 +130,14 @@ stage-residency-test: PASS (0 skipped)
 
 This is POCL CPU parity only and is labelled as such. It is not GPU evidence.
 The same run also covers `lab.tools`: the LabGrid, shadows/highlights and
-vibrance rows keep their measured parity, and the Lab-curve rows add 21
+vibrance rows keep their measured parity, the Lab-curve rows add 21
 supported cases (2,347,344 samples, every sample bit-exact, PAE 0) plus seven
+residuals that run `impl=host` at PAE 0, and the local-contrast rows add 19
+supported cases (2,336,706 samples, every sample bit-exact, PAE 0) plus nine
 residuals that run `impl=host` at PAE 0. The Lab-curve detail, including the
-host-built LUT provenance, the precompute tail and the fp64 program, is in
-`STAGE_RUNTIME.md`.
+host-built LUT provenance, the precompute tail and the fp64 program, and the
+local-contrast detail, including the host-built IIR coefficients and both blur
+paths, are in `STAGE_RUNTIME.md`.
 
 ## Stage-device gate
 
@@ -172,15 +175,18 @@ node ran on the device rather than only comparing pixels.
 | Lab tools (`labtools-labgrid.pp3`, LabGrid only) | PASS, `max_pae=1.5259e-05`; `"impl":"opencl"` |
 | Lab tools (`labtools-vibrance.pp3`, vibrance only), POCL CPU, `RT_STAGE_OPENCL=1` | PASS, `max_pae=1.5259e-05` (1 LSB16); `"stage":"lab.tools","impl":"opencl","source":"opencl"` at 3888x2608 |
 | Lab tools (`labtools-labcurve.pp3`, L/a/b/C=f(C)/L=f(C)/C=f(L) with MUN), POCL CPU, `RT_STAGE_OPENCL=1` | PASS, `max_pae=1.5259e-05` (1 LSB16); `"stage":"lab.tools","impl":"opencl","source":"opencl"` at 3888x2608. The host builds all six tables with `CurveFactory`, and the pass runs in the fp64 `lab.tools.labcurve` program |
+| Lab tools (`labtools-localcontrast.pp3`, radius 60, amount 0.3, darkness 0.9, lightness 1.1), POCL CPU, `RT_STAGE_OPENCL=1` | PASS, `max_pae=1.5259e-05` (1 LSB16); `"stage":"lab.tools","impl":"opencl","source":"opencl"` at 3888x2608. Radius 60 is above the sigma-25 split, so the row runs the fp64 `lab.tools.localcontrast` double recurrence |
 | Lab tools vibrance on RX 550 (rusticl) | the gate prints `SKIP` for `pef/stage-device-lab-tools-vibrance` with `the row is CPU-device-only; the selected device is not a CPU OpenCL device`; the row stops before `compare_images` and prints no PAE. A manual `--gpu=auto` export records `"stage":"lab.tools","impl":"host","source":"device-fallback"` and is not counted as device parity. A manual `--gpu=off RT_STAGE_OPENCL=1` export is pixel-identical to `--gpu=off` (AE 0); only the Software tag differs |
 | Lab tools vibrance on RX 550 with `RT_REQUIRE_GPU=1` | the vibrance row FAILs intentionally with the same CPU-device-only reason; POCL is the authoritative gate |
 | Lab tools vibrance device test | 21 cases at 125x160, 179x48, 238x64, 8192x64 and 64x16: pastels/saturated combinations, negative saturated, thresholds 0/75/100 and split, protect-skins, avoidcolorshift on/off, a skin curve, highlight reconstruction, neutral and saturated images, padded widths, the 8192-wide case and the two-pixel Munsell-limit case; 2,570,352 samples, measured PAE 0 and asserted within 1 LSB16, finite, `impl=opencl` on POCL; all 197 Munsell tables (27,580 entries) equal the host LUTs and the correction changes 11,696 of 60,000 domain samples |
 | Lab tools residual (`labtools-residual.pp3`, shadows/highlights + vibrance + local contrast) | PASS as a host residual: `"stage":"lab.tools","impl":"host","source":"device-fallback"`, not counted as device parity |
-| Lab tools vibrance residual combinations (Lab contrast, local contrast, EPD, Lab regions, black-and-white), a vibrance no-op and pastels 200 (out of range) | refused, `impl=host` with no `impl=opencl`, PAE 0 against the block |
+| Lab tools vibrance residual combinations (Lab contrast, local contrast with an out-of-range amount, EPD, Lab regions, black-and-white), a vibrance no-op and pastels 200 (out of range) | refused, `impl=host` with no `impl=opencl`, PAE 0 against the block |
 | Lab tools Lab-curve device test | 21 cases at 238x64, 179x48 and 8192x64: L only, brightness, an all-identity pass, a only, a/b, C=f(C), L=f(C), C=f(L), all six combined, MUN and NONE, three red/skin protection settings, `lcredsk` off, neutral and saturated images and padded widths; 2,347,344 samples, all bit-exact (PAE 0, 0 differing samples), all finite and `impl=opencl` on POCL; the MUN correction and red/skin protection each change the fixture, so the comparison is not vacuous |
 | Lab tools Lab-curve residuals (contrast 15, chromaticity 25, a C=f(H)/L=f(H)/H=f(H) flat curve, the XYZ Munsell method, black-and-white output) | refused, `impl=host` with no `impl=opencl`, PAE 0 against the block |
+| Lab tools local-contrast device test | 19 cases at 238x64, 179x48, 179x50 and 8192x64: radii 1/10/40/80/100 (both blur paths), amounts 0/0.1/1/2, darkness and lightness 0.5/1/2 and the two-way split, padded 179/238, an odd height of 50 (the horizontal tail rows), the 8192-wide case, and combinations with the Lab curves, shadows/highlights and vibrance; 2,336,706 samples, all bit-exact (PAE 0, 0 differing samples), all finite and `impl=opencl` on POCL; radius 10, amount 1 changes 8,592 of 25,776 fixture samples, so the comparison is not vacuous |
+| Lab tools local-contrast residuals (radius 0/300, amount 3/-0.1, darkness 4, lightness -0.5, a NaN amount, EPD, a non-zero Lab contrast) | refused, `impl=host` with no `impl=opencl`, PAE 0 against the block (231,984 samples) |
 | Lab tools device test | 23 cases at 238x64, 179x48 and 8192x64: LabGrid only, shadows/highlights Lab and RGB modes, both tools, single rounds, amounts 1/50/200/1000, tonal widths 0/100/split, radii 1/10/100 and padded widths; Lab mode bit-exact (PAE 0), RGB mode worst 0.23 LSB16, all finite; six residuals and two steep-table refusals are `impl=host` and bit-identical to the block; a forced launcher refusal is `impl=host` and bit-identical |
-| Lab tools CPU refactor | LabGrid, Lab-mode and RGB-mode exports with `--gpu=off`, `RT_STAGE_OPENCL` unset: pixel data identical to the pre-change binary (`tiffcmp`), only the Software tag differs. The `labtools-labcurve.pp3` export was checked the same way in this change (ImageMagick AE 0) |
+| Lab tools CPU refactor | LabGrid, Lab-mode and RGB-mode exports with `--gpu=off`, `RT_STAGE_OPENCL` unset: pixel data identical to the pre-change binary (`tiffcmp`), only the Software tag differs. The `labtools-labcurve.pp3` export was checked the same way in this change (ImageMagick AE 0). The `labtools-localcontrast.pp3` and a Lab-curve + local-contrast profile are pixel-identical to the binary built at `e2e7011e5` (AE 0 and `tiffcmp` identical) |
 | Device records | `"stage":"lanczos3"`, `"stage":"transform"`, `"stage":"output.convert"`, `"stage":"gamut"`, `"stage":"framing"` and `"stage":"output.sharpen"`, all `impl":"opencl"`, `source":"opencl"`; the classic log has no `opencl resize`, `opencl transform` or `opencl lab2srgb` line |
 | `monitor.output`, `viewport.output` in the GUI | device records with `impl=opencl`, `source=opencl`; preview image area identical to a CPU-only run (0 LSB8) |
 | `thumbnail.output` via the file browser | 12 device records; thumbnail cache byte-identical to a CPU-only run |
