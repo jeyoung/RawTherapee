@@ -190,11 +190,15 @@ bool copyToBuffer(const LabImage& image, RtStageBuffer& lab)
 bool localAdjustmentsSupported(const procparams::ProcParams& params)
 {
     /*
-     * This increment admits exactly one active colour spot. The wider
-     * colour-only set (curves, Munsell, rectangular spots, multiple spots and
-     * inactive clamp-only spots) stays a residual until the next increments.
+     * The block is atomic: every spot must be in the set below. An inactive
+     * spot is the clamp-only case; an active spot is Colour & Light, with
+     * optional L/C/H curves and MUNS. Curves, Munsell, rectangular spots,
+     * inactive spots and multiple spots are supported; every other tool and
+     * the masks, merge, soft radius, gradients and LAB/XYZ gamut methods are
+     * residuals.
      */
-    if (!params.locallab.enabled || params.locallab.spots.size() != 1) {
+    if (!params.locallab.enabled || params.locallab.spots.empty() ||
+        params.locallab.spots.size() > RT_LOCAL_ADJUSTMENTS_MAX_SPOTS) {
         return false;
     }
     if (params.dirpyrequalizer.enabled || params.dehaze.enabled ||
@@ -202,90 +206,93 @@ bool localAdjustmentsSupported(const procparams::ProcParams& params)
         return false;
     }
 
-    const auto& spot = params.locallab.spots[0];
-    if (spot.spotMethod != "norm" || !spot.activ || spot.shape != "ELI" ||
-        !spot.expcolor) {
-        return false;
-    }
-    if (otherToolEnabled(spot)) {
-        return false;
-    }
-    if (spot.recurs || spot.invers || spot.inversex || spot.inverssh ||
-        spot.inverssha || spot.inversret) {
-        return false;
-    }
-    if (spot.softradiuscol != 0.0 || spot.avoidrad != 0.0) {
-        return false;
-    }
-    if (!isNoMerge(spot.merMethod)) {
-        return false;
-    }
-    if (!(spot.qualitycurveMethod.empty() ||
-          spot.qualitycurveMethod == "none")) {
-        return false;
-    }
-    if (!(spot.avoidgamutMethod.empty() ||
-          spot.avoidgamutMethod == "NONE")) {
-        return false;
-    }
-    if (spot.gamc != 1.0 || spot.reparcol != 100.0 ||
-        spot.strcol != 0.0 || spot.strcolab != 0.0 ||
-        spot.strcolh != 0.0 || spot.structcol != 0) {
-        return false;
-    }
-    if (spot.special || spot.toolcol || spot.blwh) {
-        return false;
-    }
-    if (diagonalCurveActive(spot.rgbcurve) ||
-        diagonalCurveActive(spot.excurve) ||
-        diagonalCurveActive(spot.llcurve) ||
-        diagonalCurveActive(spot.lccurve) ||
-        diagonalCurveActive(spot.cccurve) ||
-        diagonalCurveActive(spot.clcurve)) {
-        return false;
-    }
-    LocLHCurve lhCurve;
-    LocHHCurve hhCurve;
-    LocCHCurve chCurve;
-    lhCurve.Set(spot.LHcurve);
-    hhCurve.Set(spot.HHcurve);
-    chCurve.Set(spot.CHcurve);
-    if (locCurveActive(lhCurve) || locCurveActive(hhCurve) ||
-        locCurveActive(chCurve)) {
-        return false;
-    }
-    if (!labGridIdle(spot) || !explicitMaskIdle(spot)) {
-        return false;
-    }
-    if (spot.loc.size() != 4) {
-        return false;
-    }
-    if (spot.chroma < -100 || spot.chroma > 100 ||
-        spot.lightness < -100 || spot.lightness > 100 ||
-        spot.contrast < -100 || spot.contrast > 100) {
-        return false;
-    }
-    if (spot.blurcolde < 0 || spot.blurcolde > 100) {
-        return false;
-    }
-    /* transit == 100 makes the host's 1 - ach zero in calcLocalFactor(); it
-     * is outside the finite domain this node promises. */
-    if (!(spot.transit >= 0.0 && spot.transit < 100.0)) {
-        return false;
-    }
-    if (!finiteValue(spot.transit) || !finiteValue(spot.transitweak) ||
-        !finiteValue(spot.transitgrad) || !finiteValue(spot.iter) ||
-        !finiteValue(spot.balan) || !finiteValue(spot.balanh) ||
-        !finiteValue(spot.sensi) || !finiteValue(spot.thresh) ||
-        !finiteValue(spot.colorde) || !finiteValue(spot.circrad) ||
-        !finiteValue(spot.centerX) || !finiteValue(spot.centerY) ||
-        !finiteValue(spot.loc[0]) || !finiteValue(spot.loc[1]) ||
-        !finiteValue(spot.loc[2]) || !finiteValue(spot.loc[3])) {
-        return false;
-    }
-    if (spot.transitweak < 0.0 || spot.transitweak > 10.0 ||
-        spot.transitgrad < -10.0 || spot.transitgrad > 10.0) {
-        return false;
+    for (const auto& spot : params.locallab.spots) {
+        if (spot.spotMethod != "norm") {
+            return false;
+        }
+        if (spot.shape != "ELI" && spot.shape != "RECT") {
+            return false;
+        }
+        if (spot.recurs || spot.invers || spot.inversex || spot.inverssh ||
+            spot.inverssha || spot.inversret) {
+            return false;
+        }
+        /* expprecam can force the pre-CBDL pass even when the CBDL tool is
+         * off; expsharp on an inactive spot only touches shardamping, which
+         * no active tool reads. */
+        if (spot.expprecam) {
+            return false;
+        }
+        if (!isNoMerge(spot.merMethod)) {
+            return false;
+        }
+        if (!(spot.qualitycurveMethod.empty() ||
+              spot.qualitycurveMethod == "none" ||
+              spot.qualitycurveMethod == "std")) {
+            return false;
+        }
+        /* MUNS is a measured residual: on the real gate image the clamp's
+         * last-bit differences move Munsell's discontinuous zone thresholds
+         * by up to 136 LSB16. NONE only until the clamp is bit-exact. */
+        if (!(spot.avoidgamutMethod.empty() ||
+              spot.avoidgamutMethod == "NONE")) {
+            return false;
+        }
+        if (spot.softradiuscol != 0.0 || spot.avoidrad != 0.0) {
+            return false;
+        }
+        if (spot.gamc != 1.0 || spot.reparcol != 100.0 ||
+            spot.strcol != 0.0 || spot.strcolab != 0.0 ||
+            spot.strcolh != 0.0 || spot.structcol != 0) {
+            return false;
+        }
+        if (spot.special || spot.toolcol || spot.blwh) {
+            return false;
+        }
+        if (diagonalCurveActive(spot.rgbcurve) ||
+            diagonalCurveActive(spot.excurve)) {
+            return false;
+        }
+        if (!labGridIdle(spot) || !explicitMaskIdle(spot)) {
+            return false;
+        }
+        if (spot.loc.size() != 4) {
+            return false;
+        }
+        if (spot.chroma < -100 || spot.chroma > 100 ||
+            spot.lightness < -100 || spot.lightness > 100 ||
+            spot.contrast < -100 || spot.contrast > 100) {
+            return false;
+        }
+        if (spot.blurcolde < 0 || spot.blurcolde > 100) {
+            return false;
+        }
+        /* transit == 100 makes the host's 1 - ach zero in calcLocalFactor();
+         * it is outside the finite domain this node promises. */
+        if (!(spot.transit >= 0.0 && spot.transit < 100.0)) {
+            return false;
+        }
+        if (!finiteValue(spot.transit) || !finiteValue(spot.transitweak) ||
+            !finiteValue(spot.transitgrad) || !finiteValue(spot.iter) ||
+            !finiteValue(spot.balan) || !finiteValue(spot.balanh) ||
+            !finiteValue(spot.sensi) || !finiteValue(spot.thresh) ||
+            !finiteValue(spot.colorde) || !finiteValue(spot.circrad) ||
+            !finiteValue(spot.centerX) || !finiteValue(spot.centerY) ||
+            !finiteValue(spot.loc[0]) || !finiteValue(spot.loc[1]) ||
+            !finiteValue(spot.loc[2]) || !finiteValue(spot.loc[3])) {
+            return false;
+        }
+        if (spot.transitweak < 0.0 || spot.transitweak > 10.0 ||
+            spot.transitgrad < -10.0 || spot.transitgrad > 10.0) {
+            return false;
+        }
+        /* An active spot is Colour & Light only; an inactive spot does no
+         * colour work, so its other tool settings are inert and admitted. */
+        if (spot.activ) {
+            if (!spot.expcolor || otherToolEnabled(spot)) {
+                return false;
+            }
+        }
     }
     return true;
 }
@@ -798,6 +805,7 @@ RtLocalAdjustmentsContext LocalAdjustmentsContext::descriptor(bool supported)
     out.version = RT_LOCAL_ADJUSTMENTS_CONTEXT_VERSION;
     out.magic = RT_LOCAL_ADJUSTMENTS_CONTEXT_MAGIC;
     out.supported = supported ? 1u : 0u;
+    out.spot_count = static_cast<uint32_t>(params_.locallab.spots.size());
     out.self = this;
     out.build = [](void* self, int32_t spot, const RtStageBuffer* lab,
                    RtLocalAdjustmentsResult* result) {

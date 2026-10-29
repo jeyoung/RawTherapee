@@ -70,12 +70,32 @@ inline constexpr const char* RT_LOCAL_ADJUSTMENTS_CL = R"CLC(
 #define RT_LA_QCURVE 31
 #define RT_LA_MERGE 32
 #define RT_LA_AVOIDGAMUT 33
+#define RT_LA_AVOID_MUNS 4
 #define RT_LA_CLAMPMODE 34
 #define RT_LA_HRENABLED 35
 #define RT_LA_AVOIDNEG 65
-#define RT_LA_LIGHT_OFFSET 52
+#define RT_LA_LL_OFFSET 43
+#define RT_LA_CL_OFFSET 44
+#define RT_LA_LC_OFFSET 45
+#define RT_LA_CC_OFFSET 46
+#define RT_LA_LH_OFFSET 47
+#define RT_LA_HH_OFFSET 48
+#define RT_LA_CH_OFFSET 49
 #define RT_LA_SATUR_OFFSET 50
 #define RT_LA_SATURMOINS_OFFSET 51
+#define RT_LA_LIGHT_OFFSET 52
+#define RT_LA_LL_ACTIVE 53
+#define RT_LA_CL_ACTIVE 54
+#define RT_LA_LC_ACTIVE 55
+#define RT_LA_CC_ACTIVE 56
+#define RT_LA_LH_ACTIVE 57
+#define RT_LA_HH_ACTIVE 58
+#define RT_LA_CH_ACTIVE 59
+#define RT_LA_SATUR_ACTIVE 60
+#define RT_LA_SATURMOINS_ACTIVE 61
+#define RT_LA_LIGHT_ACTIVE 62
+#define RT_LA_ADJUSTR 63
+#define RT_LA_AMOUNTCHROM 64
 
 /* iplocallab.cc's constants. */
 #define RT_LA_MINSCOPE 0.025f
@@ -91,17 +111,25 @@ inline float rt_la_clipC(const float x)
 
 /* LUTf::operator[] with LUT_CLIP_OFF, as complexCurvelocal() leaves the
  * lightness table. maxs is size - 2 and maxsf is maxs. */
-inline float rt_la_light_lut(__global const float* table, const float index)
+/* LUTf::operator[] with LUT_CLIP_OFF. `maxs` is size - 2 (32768 for the
+ * 32770-entry light table, 65534 for a 65536-entry curve table). */
+inline float rt_la_lut_off(__global const float* table, const float maxs,
+                           const float index)
 {
     int idx = (int)index;
     if (index < 0.0f) {
         idx = 0;
-    } else if (index > 32768.0f) {
-        idx = 32768;
+    } else if (index > maxs) {
+        idx = (int)maxs;
     }
     const float diff = index - (float)idx;
     const float low = table[idx];
     return low + (table[idx + 1] - low) * diff;
+}
+
+inline float rt_la_light_lut(__global const float* table, const float index)
+{
+    return rt_la_lut_off(table, 32768.0f, index);
 }
 
 /* The host's color_satur/color_saturmoins DiagonalCurve, sampled by the context
@@ -172,11 +200,107 @@ inline float rt_la_calc_local_factor(const float lox, const float loy,
     return pow(0.5f * (1.0f + c), gradreal * gradreal);
 }
 
-/* iplocallab.cc calcTransition() for the elliptical shape. */
+/* iplocallab.cc calcLocalFactorrect(). */
+inline float rt_la_calc_local_factor_rect(const float lox, const float loy,
+                                          const float lcx, const float dx,
+                                          const float lcy, const float dy,
+                                          const float ach, const float gradient)
+{
+    const float eps = 0.0001f;
+    const float krap = fabs(dx / dy);
+    const float kx = lox - lcx;
+    const float ky = loy - lcy;
+    float ref = 0.0f;
+    if (fabs(kx / (ky + eps)) < krap) {
+        ref = sqrt(dy * dy * (1.0f + (kx / (ky + eps)) *
+                                         (kx / (ky + eps))));
+    } else {
+        ref = sqrt(dx * dx * (1.0f + (ky / (kx + eps)) *
+                                         (ky / (kx + eps))));
+    }
+    const float rad = fmax(eps, sqrt(kx * kx + ky * ky));
+    const float rapy = fabs((loy - lcy) / rad);
+    const float gradreal = gradient * rapy + 1.0f;
+    const float coef = rad / ref;
+    const float fact = (coef - 1.0f) / (ach - 1.0f);
+    return pow(fact, gradreal * gradreal);
+}
+
+/* iplocallab.cc calcTransitionrect(). */
+inline void rt_la_transition_rect(const float lox, const float loy,
+                                  const float ach, __global const float* rec,
+                                  int* zone, float* localFactor)
+{
+    const float xc = rec[RT_LA_XC];
+    const float yc = rec[RT_LA_YC];
+    const float lx = rec[RT_LA_LX];
+    const float ly = rec[RT_LA_LY];
+    const float lxL = rec[RT_LA_LXL];
+    const float lyT = rec[RT_LA_LYT];
+    const float transgrad = rec[RT_LA_TRANSGRAD];
+    const float transweak = rec[RT_LA_TRANSWEAK];
+
+    *zone = 0;
+
+    if (lox >= xc && lox < xc + lx) {
+        if (loy >= yc && loy < yc + ly) {
+            if (lox < xc + lx * ach && loy < yc + ly * ach) {
+                *zone = 2;
+            } else {
+                *zone = 1;
+                *localFactor = rt_lr_pow_F(
+                    rt_la_calc_local_factor_rect(lox, loy, xc, lx, yc, ly,
+                                                 ach, transgrad),
+                    transweak);
+            }
+        } else if (loy < yc && loy > yc - lyT) {
+            if (lox < xc + lx * ach && loy > yc - lyT * ach) {
+                *zone = 2;
+            } else {
+                *zone = 1;
+                *localFactor = rt_lr_pow_F(
+                    rt_la_calc_local_factor_rect(lox, loy, xc, lx, yc, lyT,
+                                                 ach, transgrad),
+                    transweak);
+            }
+        }
+    } else if (lox < xc && lox > xc - lxL) {
+        if (loy <= yc && loy > yc - lyT) {
+            if (lox > (xc - lxL * ach) && loy > (yc - lyT * ach)) {
+                *zone = 2;
+            } else {
+                *zone = 1;
+                *localFactor = rt_lr_pow_F(
+                    rt_la_calc_local_factor_rect(lox, loy, xc, lxL, yc, lyT,
+                                                 ach, transgrad),
+                    transweak);
+            }
+        } else if (loy > yc && loy < yc + ly) {
+            if (lox > (xc - lxL * ach) && loy < (yc + ly * ach)) {
+                *zone = 2;
+            } else {
+                *zone = 1;
+                *localFactor = rt_lr_pow_F(
+                    rt_la_calc_local_factor_rect(lox, loy, xc, lxL, yc, ly,
+                                                 ach, transgrad),
+                    transweak);
+            }
+        }
+    }
+}
+
+/*
+ * The transition for the spot's shape: ELI is calcTransition(), RECT is
+ * calcTransitionrect().
+ */
 inline void rt_la_transition(const float lox, const float loy,
                              const float ach, __global const float* rec,
                              int* zone, float* localFactor)
 {
+    if (rec[RT_LA_SHAPE] == 1.0f) {
+        rt_la_transition_rect(lox, loy, ach, rec, zone, localFactor);
+        return;
+    }
     const float xc = rec[RT_LA_XC];
     const float yc = rec[RT_LA_YC];
     const float lx = rec[RT_LA_LX];
@@ -268,6 +392,32 @@ inline void rt_la_transition(const float lox, const float loy,
 }
 
 /*
+ * LocLHCurve/LocHHCurve/LocCHCurve have a 501-entry LUTf: the host's
+ * LUTf::operator[](float) clips at index 499, so the last half-entry returns
+ * table[500] rather than interpolating. The context exports 65536 samples;
+ * only the first 501 are the curve.
+ */
+inline float rt_la_loc_lut(__global const float* table, const float index)
+{
+    int idx = (int)index;
+    if (index < 0.0f) {
+        return table[0];
+    }
+    if (index > 499.0f) {
+        return table[500];
+    }
+    const float low = table[idx];
+    return low + (table[idx + 1] - low) * (index - (float)idx);
+}
+
+/* iplocallab.cc's Color::huelab_to_huehsv2(), narrowed to float for the
+ * 500-entry L/C/H tables. */
+inline float rt_la_huehsv(const float HH)
+{
+    return (float)rt_lr_huelab_to_huehsv2(HH);
+}
+
+/*
  * Copy the spot ROI out of the full Lab image into one plane per channel.
  * This is the host's bufcolorig/origblur copy at the start of the colour
  * block.
@@ -305,6 +455,7 @@ __kernel void rt_local_adjustments_apply(__global float* lab,
                                          __global const float* blurA,
                                          __global const float* blurB,
                                          __global const float* rec,
+                                         __global const float* luts,
                                          __global const float* light_lut,
                                          __global const float* satur_lut,
                                          __global const float* saturmoins_lut,
@@ -353,8 +504,91 @@ __kernel void rt_local_adjustments_apply(__global float* lab,
         corrB = chroma * sincosval.x;
     }
 
+    const float qcurve = rec[RT_LA_QCURVE];
+    const float adjustr = rec[RT_LA_ADJUSTR];
+    const float amountchrom = rec[RT_LA_AMOUNTCHROM];
+
+    if (qcurve != 0.0f) {
+        if (rec[RT_LA_CC_ACTIVE] != 0.0f) { /* C=f(C) */
+            const float chromat = sqrt(corrA * corrA + corrB * corrB);
+            const float ch = rt_la_lut_off(
+                luts + (int)rec[RT_LA_CC_OFFSET], 65534.0f,
+                chromat * adjustr) / ((chromat + 0.00001f) * adjustr);
+            corrA *= ch;
+            corrB *= ch;
+        }
+        if (rec[RT_LA_CL_ACTIVE] != 0.0f) { /* C=f(L) */
+            const float factor = rt_la_lut_off(
+                luts + (int)rec[RT_LA_CL_OFFSET], 65534.0f,
+                corrL * 2.0f) / (corrL * 2.0f);
+            corrA *= factor;
+            corrB *= factor;
+        }
+        if (rec[RT_LA_LC_ACTIVE] != 0.0f) { /* L=f(C) */
+            const float chromat = sqrt(corrA * corrA + corrB * corrB);
+            float lc = rt_la_lut_off(
+                luts + (int)rec[RT_LA_LC_OFFSET], 65534.0f,
+                chromat * adjustr) / ((chromat + 0.00001f) * adjustr);
+            lc = lc > 1.0f ? (lc - 1.0f) * 0.1f + 1.0f
+                           : (lc - 1.0f) * 0.3f + 1.0f;
+            corrL *= lc;
+        }
+        if (rec[RT_LA_HH_ACTIVE] != 0.0f) { /* H=f(H) */
+            const float chromat = sqrt(corrA * corrA + corrB * corrB);
+            const float hh = rt_lt_xatan2f(corrB, corrA);
+            const float table = rt_la_loc_lut(
+                luts + (int)rec[RT_LA_HH_OFFSET],
+                500.0f * rt_la_huehsv(hh));
+            const float valparam = 2.0f * (table - 0.5f) + hh;
+            const float2 sincosval = rt_lt_xsincosf(valparam);
+            corrA = chromat * sincosval.y;
+            corrB = chromat * sincosval.x;
+        }
+    }
+
     if (ligh != 0.0f || cont != 0.0f) {
         corrL = rt_la_light_lut(light_lut, corrL);
+    }
+
+    if (qcurve != 0.0f) {
+        if (rec[RT_LA_LL_ACTIVE] != 0.0f) { /* L=f(L) */
+            corrL = 0.5f * rt_la_lut_off(
+                luts + (int)rec[RT_LA_LL_OFFSET], 65534.0f, corrL * 2.0f);
+        }
+        if (rec[RT_LA_LH_ACTIVE] != 0.0f) { /* L=f(H) */
+            const float rhue = rt_lt_xatan2f(corrB, corrA);
+            const float chromat =
+                sqrt(corrA * corrA + corrB * corrB) / 32768.0f;
+            float lr = rt_lt_lim01(corrL / 32768.0f);
+            const float table = rt_la_loc_lut(
+                luts + (int)rec[RT_LA_LH_OFFSET],
+                500.0f * rt_la_huehsv(rhue));
+            float valparam = table - 0.5f;
+            float valparamneg = valparam;
+            const float kc = amountchrom;
+            const double kccd = (double)chromat / (double)kc;
+            const float kcc = (float)(kccd * kccd);
+            valparam *= 2.0f * kcc;
+            valparamneg *= kcc;
+            if (valparam > 0.0f) {
+                const float one_minus = 1.0f - fmin(lr, 1.0f);
+                lr = (1.0f - valparam) * lr +
+                     valparam * (1.0f - one_minus * one_minus *
+                                           one_minus * one_minus);
+            } else {
+                lr *= (1.0f + 1.9f * valparamneg);
+            }
+            corrL = lr * 32768.0f;
+        }
+        if (rec[RT_LA_CH_ACTIVE] != 0.0f) { /* C=f(H) */
+            const float rhue = rt_lt_xatan2f(corrB, corrA);
+            const float table = rt_la_loc_lut(
+                luts + (int)rec[RT_LA_CH_OFFSET],
+                500.0f * rt_la_huehsv(rhue));
+            const float factor = 1.0f + (table - 0.5f);
+            corrA *= factor;
+            corrB *= factor;
+        }
     }
 
     int zone = 0;
@@ -416,6 +650,182 @@ __kernel void rt_local_adjustments_apply(__global float* lab,
 }
 
 /*
+ * Color::AllMunsellLch(true, Lprov1, Lprov2, HH, Chprov1, CC,
+ * correctionHue, correctlum). The fragment's rt_lt_munsell_lch() is the
+ * host MunsellLch() port; this wrapper is the lumaMuns branch.
+ */
+inline void rt_la_all_munsell_lch(const float Lprov1, const float Loldd,
+                                  const float HH, const float Chprov1_in,
+                                  const float CC, float* correctionHuechroma,
+                                  float* correctlum,
+                                  __global const float* tables,
+                                  __global const float* sizes)
+{
+    *correctionHuechroma = 0.0f;
+    *correctlum = 0.0f;
+    if (CC < 6.0f || CC >= 140.0f) {
+        return;
+    }
+    const float huelimit[8] = {-2.48f, -0.55f, 0.44f, 1.52f,
+                               1.87f, 3.09f, -0.27f, 0.44f};
+    const float chrom = fmin(fmax(Chprov1_in, 6.0f), 140.0f);
+    for (int zo = 1; zo <= 4; ++zo) {
+        if (HH > huelimit[2 * zo - 2] && HH < huelimit[2 * zo - 1]) {
+            int correctL = 0;
+            float correctionHue = 0.0f;
+            float correctionHueLum = 0.0f;
+            rt_lt_munsell_lch(Lprov1, HH, chrom, CC, &correctionHue, zo,
+                              &correctionHueLum, &correctL, tables, sizes);
+            *correctionHuechroma = correctionHue;
+
+            bool contin1 = false;
+            float correctlumprov = 0.0f;
+            if (correctL != 0) {
+                correctlumprov = correctionHueLum;
+                contin1 = true;
+                correctL = 0;
+            }
+            if (fabs(Lprov1 - Loldd) > 6.0f) {
+                correctionHueLum = 0.0f;
+                correctionHue = 0.0f;
+                rt_lt_munsell_lch(Loldd, HH, chrom, chrom, &correctionHue, zo,
+                                  &correctionHueLum, &correctL, tables, sizes);
+                if (correctL != 0 && contin1) {
+                    *correctlum = correctionHueLum - correctlumprov;
+                }
+            }
+            break;
+        }
+    }
+}
+
+/*
+ * ImProcFunctions::avoidcolshi()'s MUNS branch. `reserved` is the fixed
+ * start-of-block Lab image; `lab` is the current transformed image.
+ */
+__kernel void rt_local_adjustments_munsell(__global float* lab,
+                                           __global const float* reserved,
+                                           __global const float* rec,
+                                           __global const float* tables,
+                                           __global const float* sizes,
+                                           const int width, const int height,
+                                           const int lab_pitch,
+                                           const int lab_plane)
+{
+    const int x = (int)get_global_id(0);
+    const int y = (int)get_global_id(1);
+    if (x >= width || y >= height) {
+        return;
+    }
+    if (rec[RT_LA_ISLOCAL] == 0.0f ||
+        rec[RT_LA_AVOIDGAMUT] != (float)RT_LA_AVOID_MUNS) {
+        return;
+    }
+
+    const float yc = rec[RT_LA_YC];
+    const float ly = rec[RT_LA_LY];
+    const float lyT = rec[RT_LA_LYT];
+    const bool isZone0 = (float)y > yc + ly || (float)y < yc - lyT;
+    if (isZone0) {
+        return;
+    }
+
+    int zone = 0;
+    float localFactor = 1.0f;
+    const float achm = rec[RT_LA_TRANS] / 100.0f;
+    rt_la_transition((float)x, (float)y, achm, rec, &zone, &localFactor);
+    if (zone == 0) {
+        return;
+    }
+
+    const int offset = y * lab_pitch + x;
+    const float anew = lab[lab_plane + offset];
+    const float bnew = lab[2 * lab_plane + offset];
+    const float Lprov1 = lab[offset] / 327.68f;
+    const float Chprov = sqrt(anew * anew + bnew * bnew) / 327.68f;
+
+    float2 sincosval;
+    sincosval.y = Chprov == 0.0f ? 1.0f : anew / (Chprov * 327.68f);
+    sincosval.x = Chprov == 0.0f ? 0.0f : bnew / (Chprov * 327.68f);
+    float HH = rt_lt_xatan2f(bnew, anew);
+
+    const float Lprov2 = reserved[offset] / 327.68f;
+    const float rA = reserved[lab_plane + offset];
+    const float rB = reserved[2 * lab_plane + offset];
+    const float memChprov = sqrt(rA * rA + rB * rB) / 327.68f;
+
+    float correctionHue = 0.0f;
+    float correctlum = 0.0f;
+    rt_la_all_munsell_lch(Lprov1, Lprov2, HH, Chprov, memChprov,
+                          &correctionHue, &correctlum, tables, sizes);
+
+    if (correctionHue != 0.0f || correctlum != 0.0f) {
+        if (fabs(correctionHue) < 0.015f) {
+            HH += correctlum;
+        }
+        sincosval = rt_lt_xsincosf(HH + correctionHue);
+    }
+
+    lab[lab_plane + offset] = 327.68f * Chprov * sincosval.y;
+    lab[2 * lab_plane + offset] = 327.68f * Chprov * sincosval.x;
+}
+
+/* Color::cachef[]/cachefy[] are LUT_CLIP_BELOW only, so a value above the
+ * second-to-last entry extrapolates from data[65534], while the shared
+ * lab.tools helper clips above at the last entry. The clamp uses this
+ * local, host-faithful copy. */
+inline float rt_la_cache_lookup(__global const float* table, const float value)
+{
+    if (value < 0.0f) {
+        return table[0];
+    }
+    int idx = (int)value;
+    if (value > 65534.0f) {
+        idx = 65534;
+    }
+    const float diff = value - (float)idx;
+    const float low = table[idx];
+    return low + (table[idx + 1] - low) * diff;
+}
+
+inline float rt_la_compute_f(const float value, __global const float* cache)
+{
+    if (value < 0.0f) {
+        return (float)(327.68 * ((903.2962962962963 * (double)value /
+                                  65535.0 + 16.0) / 116.0));
+    }
+    if (value > RT_LT_MAXVAL) {
+        return 327.68f * rt_lt_cbrt(value / RT_LT_MAXVAL);
+    }
+    return rt_la_cache_lookup(cache, value);
+}
+
+inline float rt_la_compute_fy(const float value, __global const float* cache)
+{
+    if (value < 0.0f) {
+        return (float)(327.68 * (903.2962962962963 * (double)value /
+                                 65535.0));
+    }
+    if (value > RT_LT_MAXVAL) {
+        return 327.68f * (116.0f * rt_lt_cbrt(value / RT_LT_MAXVAL) - 16.0f);
+    }
+    return rt_la_cache_lookup(cache, value);
+}
+
+inline void rt_la_xyz2lab(const float X, const float Y, const float Z,
+                          __global const float* cachef,
+                          __global const float* cachefy,
+                          float* L, float* a, float* b)
+{
+    const float fx = rt_la_compute_f(X / RT_LT_D50X, cachef);
+    const float fy = rt_la_compute_f(Y, cachef);
+    const float fz = rt_la_compute_f(Z / RT_LT_D50Z, cachef);
+    *L = rt_la_compute_fy(Y, cachefy);
+    *a = 500.0f * (fx - fy);
+    *b = 200.0f * (fy - fz);
+}
+
+/*
  * Lab_Local()'s two full-image negative-value round trips: lab2rgb(), the
  * per-channel max with epsi (and clipR for the Laplacian arm), rgb2lab().
  * mode 0 is the tail's no-clamp arm and is not used by a supported single
@@ -461,7 +871,7 @@ __kernel void rt_local_adjustments_clamp(__global float* lab,
     float out_l = 0.0f;
     float out_a = 0.0f;
     float out_b = 0.0f;
-    rt_lt_xyz2lab(out_x, out_y, out_z, cachef, cachefy, &out_l, &out_a,
+    rt_la_xyz2lab(out_x, out_y, out_z, cachef, cachefy, &out_l, &out_a,
                   &out_b);
     lab[offset] = out_l;
     lab[lab_plane + offset] = out_a;

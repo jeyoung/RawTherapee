@@ -210,6 +210,8 @@ typedef struct RtLocalAdjustmentsContext {
      * is how a residual configuration is recorded as a host execution.
      */
     uint32_t supported;
+    /* Number of spots in the block; build() takes an index in 0..count-1. */
+    uint32_t spot_count;
     void* self;
     /*
      * Builds one spot's flat record and curve table. `spot` selects the spot
