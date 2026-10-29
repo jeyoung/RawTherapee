@@ -262,9 +262,20 @@ __kernel void rt_lab_tools_lab_curve(
         btmp = rt_lt_lut(bcurve, curve_size, btmp + 32768.0f) - 32768.0f;
     }
 
-    float CC = (a_active != 0 || b_active != 0)
-                   ? rt_lt_sqrt_div(atmp * atmp + btmp * btmp)
-                   : rt_lt_sqrt_div_f32(atmp * atmp + btmp * btmp);
+    /*
+     * chromiLuminanceCurve()'s SSE2 precompute covers the columns its
+     * `for (k = 0; k < W - 3; k += 4)` loop covers: 4 * (floor((W-4)/4) + 1)
+     * columns, or none when W < 4. Its tail loop, the last up to three
+     * columns, uses the scalar double sqrt instead, and so does the whole
+     * frame when the a or b table is active (the precompute does not run
+     * then). Reproduce both.
+     */
+    const int simd_columns = width >= 4 ? 4 * (((width - 4) / 4) + 1) : 0;
+    const bool host_precompute = a_active == 0 && b_active == 0;
+    float CC = rt_lt_sqrt_div(atmp * atmp + btmp * btmp);
+    if (host_precompute && x < simd_columns) {
+        CC = rt_lt_sqrt_div_f32(atmp * atmp + btmp * btmp);
+    }
     float HH = rt_lt_xatan2f(btmp, atmp);
     float2 sincosval;
     if (CC == 0.0f) {
