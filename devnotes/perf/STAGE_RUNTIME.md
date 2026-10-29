@@ -2562,14 +2562,18 @@ The wavelet part is admitted when `wavelet.enabled` is true and
 - `HSMethod` is `"with"` or `"without"`, and the chroma-by-hue curve is the
   identity;
 - sigma is in 0.05..2.5, offset in 0.33..1.66, lowthr in 20..100, the
-  highlight and shadow level gates are 1..9 and 3..9, strength is 0..100 and
-  every contrast multiplier is -100..350;
+  highlight and shadow level gates are 1..9 and 3..9, strength is 0..100,
+  Thrend is 0..100 and every contrast multiplier is -100..350;
 - the finest contrast multiplier is non-zero and the image is large enough
   for the decomposition the block would build.
 
 The transform level count is the block's own: the `MaxLev` slider, capped by
-the image-size limits, the extra level and then the trailing-zero trim that
-applies when `Contrast` is zero and nothing else needs a level. The launcher
+the image-size limits, the extra level, the trailing-zero trim that applies
+when `Contrast` is zero and nothing else needs a level, and the unconditional
+`Thrend` restore that follows it. A positive `Thrend` restores the untrimmed
+capped count, so the device and the block agree on `maxlvl` even when the
+last contrast multipliers are zero; `Thrend` is host-side only and is not in
+the parameter table. The launcher
 additionally requires a CPU OpenCL device (POCL), an 8x8 image for the
 equaliser, a width of at least twice the largest half-window for its active
 levels, fp64 for the wavelet statistics, and half-size dimensions of at least
@@ -2689,11 +2693,15 @@ block's order:
 level-0 blend, and the clamps are all reproduced. The transform and the
 contrast multiply are bit-exact against the block on POCL.
 
-Device memory is `(3 * levels + 7) * ceil(W/2) * ceil(H/2)` floats for the
-bands, the two low-pass buffers, the two full-width half-height scratch rows,
-the statistics and the parameter table. Every buffer is acquired before the
-equaliser runs, so an exhausted `RT_STAGE_DEVICE_BUDGET_MB` falls back with
-the caller's image untouched.
+Device memory is the bands (`3 * levels` half-size planes), the two
+half-size low-pass ping-pong planes, two full-width half-height scratch rows
+(`W * ceil(H/2)` floats each), and the fixed statistics and parameter tables
+(`levels * 18` and `64 + levels * 10` floats). That is
+`(3 * levels + 2) * ceil(W/2) * ceil(H/2) + 2 * W * ceil(H/2) + levels * 28 +
+64` floats; the commonly quoted `(3 * levels + 7) * ceil(W/2) * ceil(H/2)` is
+an upper bound that folds the scratch rows into half-size planes. Every
+buffer is acquired before the equaliser runs, so an exhausted
+`RT_STAGE_DEVICE_BUDGET_MB` falls back with the caller's image untouched.
 
 ### Residuals
 
@@ -2722,13 +2730,14 @@ submission.
 |---|---|
 | Equaliser parity, 14 cases at 179x48, 238x64 and 8192x64 | six levels, finest only, three levels, threshold 0 and 1, skin protection +60 and -60, gamutlab with and without skin, padded 179/238, a saturated hue circle and an 8192-wide plain and skin case; 3,574,560 samples, `impl=opencl` on every case, no NaN/Inf, worst 0.115234 LSB16 and 0 samples over 1 LSB16 |
 | Equaliser non-vacuity | skin protection changes 574 of 45,696 samples (PAE 108.908203 LSB16); the gamutlab pre-pass changes 29,542 of 45,696 (PAE 20,453.597931) |
-| Wavelet parity, 13 cases | transform only (all contrast multipliers zero), contrast with and without HS, negative multipliers, sigma 0.5 / offset 1.4, strength 60, padded 179x49, levels 1/2/3/7, 8192x64 and the equaliser plus wavelet in one submission: 2,022,537 samples, all bit-exact (PAE 0, 0 samples over 0.5 L = 1 LSB16), finite, `impl=opencl` on every case |
+| Wavelet parity, 14 cases | transform only (all contrast multipliers zero), contrast with and without HS, negative multipliers, sigma 0.5 / offset 1.4, strength 60, padded 179x49, levels 1/2/3/7, 8192x64, the equaliser plus wavelet in one submission, and two trailing zero multipliers with `Thrend=5`: 2,068,233 samples, measured PAE 0 and asserted bit-exact (0 differing samples), finite, `impl=opencl` on every case. Before `Thrend` was honoured the last case diverged by PAE 70.428223 LSB16 and 10,061 samples over 1 LSB16 |
 | Wavelet non-vacuity | the contrast path changes 14,651 of 45,696 fixture samples against the identity, PAE 3,933.345703 LSB16 |
-| Wavelet residuals, 29 cases | each unsupported flag, method, curve, range, zero multiplier, zero level count and the all-off profile are refused, record `impl=host` with no `impl=opencl`, and are byte-identical to the block (PAE 0, 29 x 45,696 samples) |
+| Wavelet residuals, 30 cases | each unsupported flag, method, curve, range (including `Thrend=101`), zero multiplier, zero level count and the all-off profile are refused, record `impl=host` with no `impl=opencl`, and are byte-identical to the block (PAE 0, 30 x 45,696 samples) |
 | Default path, equaliser and wavelet | with `RT_STAGE_OPENCL` unset and no override, `run()` resolves to the builtin, records `impl=builtin`, and is byte-identical to `labWaveletHostBlock` |
 | GPU | not run on a GPU in this change. The launcher's `CL_DEVICE_TYPE` check refuses before any upload, so a GPU submission records `impl=host`; the test's GPU residual is skipped on POCL and runs when a non-CPU device is selected |
 | `verify.sh --stage-device`, POCL CPU, `labwavelet.pp3` | PASS, `max_pae=1.5259e-05` (1 LSB16), record `"stage":"lab.wavelet","impl":"opencl","source":"opencl"` at 3888x2608 |
 | `verify.sh --stage-device`, POCL CPU, `labwavelet-contrast.pp3` | PASS, `max_pae=1.5259e-05` (1 LSB16), record `"stage":"lab.wavelet","impl":"opencl","source":"opencl"` at 3888x2608; the profile leaves the equaliser off |
+| Builds | `build/opencl-perf-graph` and `build/cpu-perf-graph` compile `rth-cli` and `stage-residency-test` from the final sources with GCC and the generic target, no warnings. The CPU-only test prints `OpenCL unavailable (built without OpenCL)` and reports `stage-residency-test: PASS (24 skipped)` |
 | `--gpu=off`, `RT_STAGE_OPENCL` unset | the call site takes the extracted host block; the node is not submitted, and the output is the pre-node CPU result |
 
 ## Limitations
@@ -2746,12 +2755,14 @@ submission.
   device for this node, and its PEF gate rows measure 1 LSB16. A CPU device
   without fp64 runs the Lab-curve, local-contrast and region blocks on the host
   and records `impl=host`.
-- The directional pyramid equaliser is CPU-device only. Its per-level
-  arithmetic uses the host's float division and its SSE group load, and a GPU
-  compiler is free to contract the accumulation or round the skin-gate
-  comparisons differently, so the launcher refuses a GPU before any upload
-  and the block records `impl=host`. The wavelet tool in the same block is not
-  ported; an enabled `wavelet` section is a residual for now.
+- The directional pyramid equaliser and the wavelet contrast path are
+  CPU-device only; the wavelet statistics also need fp64. The equaliser uses
+  the host's float division and its SSE group load, and the wavelet path
+  depends on the host's exact double scan and float multiply order, so the
+  launcher refuses a GPU (or a non-fp64 device for the wavelet) before any
+  upload and the block records `impl=host`. The equaliser alone, the wavelet
+  contrast tool alone and both in the block's order are supported; the other
+  wavelet panels are residuals.
 - P2 residual, not a lab.tools defect: with `RT_STAGE_OPENCL=1` and
   `--gpu=auto` but without `RT_OPENCL_RGBPROC=1`, a CLI export segfaults in
   `opencl::initLocked()` through `ImProcFunctions::lab2rgbOut()` - a null call

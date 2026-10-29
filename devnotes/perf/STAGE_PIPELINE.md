@@ -177,17 +177,19 @@ Either pass may run alone, so the node no longer requires
 equaliser's per-level range tables through its own `fillLut()` and the
 hue/chroma masks through its own SSE-aware precompute, and exports the
 `badpixels` protection as a host pre-pass when `gamutlab` and `skinprotect`
-are both set. The wavelet host builds the level count, the `c[]`/threshold/
-sigma/offset/strength/corner scalar table and the 8-tap analysis and synthesis
-filters, and fills each level's `mea` through the block's own `calceffect()`
-after the device statistics read back. The kernels port `dirpyr_channel()`,
+are both set. The wavelet host builds the level count (including the
+unconditional `Thrend` restore of the trailing-zero trim), the
+`c[]`/threshold/sigma/offset/strength/corner scalar table and the 8-tap
+analysis and synthesis filters, and fills each level's `mea` through the
+block's own `calceffect()` after the device statistics read back. The kernels port `dirpyr_channel()`,
 `idirpyr_eq_channel()`/`Color::SkinSatCbdl()`, the decimated 8-tap Daubechies
 and undecimated Haar transform, the single-thread ascending double statistics,
 `ContAllL()`'s `lbeta`/`alpha`/highlight-shadow ramp, the strength blend and
 the final clamp. It is admitted only on a CPU OpenCL device, and the wavelet
 pass also needs fp64. An enabled wavelet panel other than contrast,
 `cbdlMethod == "bef"`, an out-of-range multiplier, threshold, skin, hue,
-sigma, offset, lowthr, gate, strength or `c[]`, an all-neutral pyramid, a
+sigma, offset, lowthr, gate, strength, Thrend or `c[]`, an all-neutral
+pyramid, a
 closed CIE-CAM gate, an image too narrow or too small for its pyramid or Haar
 bands, a GPU or non-fp64 device and nothing enabled at all are residuals:
 each runs the `lab.wavelet` host builtin and records `impl=host`, never a
