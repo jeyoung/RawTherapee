@@ -243,33 +243,41 @@ __kernel void rt_lab_tools_lc_line(__global const float* src,
                     border_b3 * dst[db + (j - 3) * dst_stride]);
     }
 
-    const double bW = src[sb + last * src_stride];
-    const double g1 = dst[db + last * dst_stride];
-    const double g2 = dst[db + (last - 1) * dst_stride];
-    const double g3 = dst[db + (last - 2) * dst_stride];
-    const float n0 = (float)(bW + border_m00 * (g1 - bW) +
-                             border_m01 * (g2 - bW) +
-                             border_m02 * (g3 - bW));
-    const float n1 = (float)(bW + border_m10 * (g1 - bW) +
-                             border_m11 * (g2 - bW) +
-                             border_m12 * (g3 - bW));
-    const float n2 = (float)(bW + border_m20 * (g1 - bW) +
-                             border_m21 * (g2 - bW) +
-                             border_m22 * (g3 - bW));
+    /* The host's tail lines keep the source and the forward state in float, so
+     * each deviation is a float subtraction before the double boundary matrix
+     * multiplies it. Keeping this subtraction in double would move the tail. */
+    const float bW = src[sb + last * src_stride];
+    const float g1 = dst[db + last * dst_stride];
+    const float g2 = dst[db + (last - 1) * dst_stride];
+    const float g3 = dst[db + (last - 2) * dst_stride];
+    const float dev1 = g1 - bW;
+    const float dev2 = g2 - bW;
+    const float dev3 = g3 - bW;
+    const float n0 = (float)((double)bW + border_m00 * (double)dev1 +
+                             border_m01 * (double)dev2 +
+                             border_m02 * (double)dev3);
+    const float n1 = (float)((double)bW + border_m10 * (double)dev1 +
+                             border_m11 * (double)dev2 +
+                             border_m12 * (double)dev3);
+    const float n2 = (float)((double)bW + border_m20 * (double)dev1 +
+                             border_m21 * (double)dev2 +
+                             border_m22 * (double)dev3);
     dst[db + last * dst_stride] = n0;
     dst[db + (last - 1) * dst_stride] =
-        (float)(border_B * g2 + border_b1 * dst[db + last * dst_stride] +
-                border_b2 * n1 + border_b3 * n2);
+        (float)(border_B * (double)g2 +
+                border_b1 * (double)dst[db + last * dst_stride] +
+                border_b2 * (double)n1 + border_b3 * (double)n2);
     dst[db + (last - 2) * dst_stride] =
-        (float)(border_B * g3 +
-                border_b1 * dst[db + (last - 1) * dst_stride] +
-                border_b2 * dst[db + last * dst_stride] + border_b3 * n1);
+        (float)(border_B * (double)g3 +
+                border_b1 * (double)dst[db + (last - 1) * dst_stride] +
+                border_b2 * (double)dst[db + last * dst_stride] +
+                border_b3 * (double)n1);
     for (int j = last - 3; j >= 0; --j) {
         dst[db + j * dst_stride] =
-            (float)(border_B * dst[db + j * dst_stride] +
-                    border_b1 * dst[db + (j + 1) * dst_stride] +
-                    border_b2 * dst[db + (j + 2) * dst_stride] +
-                    border_b3 * dst[db + (j + 3) * dst_stride]);
+            (float)(border_B * (double)dst[db + j * dst_stride] +
+                    border_b1 * (double)dst[db + (j + 1) * dst_stride] +
+                    border_b2 * (double)dst[db + (j + 2) * dst_stride] +
+                    border_b3 * (double)dst[db + (j + 3) * dst_stride]);
     }
 }
 

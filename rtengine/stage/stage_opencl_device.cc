@@ -3768,6 +3768,17 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
         error = "lab.tools Lab curves need the host's SSE2 precompute";
         return RT_STAGE_FALLBACK;
     }
+    /*
+     * Local contrast below sigma 25 is the SSE float path, and the exported
+     * coefficients describe that path. A host built without SSE2 (and without
+     * RT_SIMDE) runs gaussianBlur()'s double path for the same sigma, so the
+     * device pass would diverge; keep the block on the host. At sigma 25 and
+     * above both sides use the double path and the pass stays available.
+     */
+    if (local_contrast && lc_iir->double_path == 0) {
+        error = "lab.tools local contrast needs the host's SSE2 blur path";
+        return RT_STAGE_FALLBACK;
+    }
 #endif
 
     const RtStageBuffer& lut_highlight = args[16].u.buffer;
