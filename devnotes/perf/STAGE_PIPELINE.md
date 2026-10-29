@@ -169,22 +169,29 @@ residual runs the `lab.tools` host builtin and records `impl=host`, never a
 device pass.
 
 `lab.wavelet` is partial: the directional pyramid equaliser runs on the
-device when it is enabled in after-CBDL position (`cbdlMethod == "aft"`), the
-wavelet tool is off and the CIE-CAM gate admits the pass. The host builds the
-per-level range tables through the equaliser's own `fillLut()` and the
+device when it is enabled in after-CBDL position (`cbdlMethod == "aft"`) and
+the CIE-CAM gate admits the pass, and the wavelet tool's contrast-only path
+runs on the device when `Expcontrast` is set with every other panel clear.
+Either pass may run alone, so the node no longer requires
+`dirpyrequalizer.enabled` when only the wavelet runs. The host builds the
+equaliser's per-level range tables through its own `fillLut()` and the
 hue/chroma masks through its own SSE-aware precompute, and exports the
 `badpixels` protection as a host pre-pass when `gamutlab` and `skinprotect`
-are both set. The kernel is a port of `dirpyr_channel()` and
-`idirpyr_eq_channel()`/`Color::SkinSatCbdl()`: it reproduces the scalar and
-SSE weight forms, the 5x5 domain kernel at levels 2 and above, the host's
-four-column SSE groups and their shifted lane loads, the interpolated
-`LUTf::operator[](float)` lookup, the skin scale and the in-place
-reconstruction. It is admitted only on a CPU OpenCL device. An enabled
-wavelet tool, `cbdlMethod == "bef"`, an out-of-range multiplier, threshold,
-skin or hue point, an all-neutral pyramid, a closed CIE-CAM gate, an image
-too narrow for its pyramid and a GPU device are residuals: each runs the
-`lab.wavelet` host builtin and records `impl=host`, never a device pass. The
-wavelet tool remains host-side until its own increment.
+are both set. The wavelet host builds the level count, the `c[]`/threshold/
+sigma/offset/strength/corner scalar table and the 8-tap analysis and synthesis
+filters, and fills each level's `mea` through the block's own `calceffect()`
+after the device statistics read back. The kernels port `dirpyr_channel()`,
+`idirpyr_eq_channel()`/`Color::SkinSatCbdl()`, the decimated 8-tap Daubechies
+and undecimated Haar transform, the single-thread ascending double statistics,
+`ContAllL()`'s `lbeta`/`alpha`/highlight-shadow ramp, the strength blend and
+the final clamp. It is admitted only on a CPU OpenCL device, and the wavelet
+pass also needs fp64. An enabled wavelet panel other than contrast,
+`cbdlMethod == "bef"`, an out-of-range multiplier, threshold, skin, hue,
+sigma, offset, lowthr, gate, strength or `c[]`, an all-neutral pyramid, a
+closed CIE-CAM gate, an image too narrow or too small for its pyramid or Haar
+bands, a GPU or non-fp64 device and nothing enabled at all are residuals:
+each runs the `lab.wavelet` host builtin and records `impl=host`, never a
+device pass.
 
 `lab.sharpening` is partial through the same `output.sharpen` node:
 `ImProcFunctions::sharpening()` is the entry point for both the Lab block and

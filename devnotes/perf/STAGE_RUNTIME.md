@@ -2531,17 +2531,18 @@ With `OMP_NUM_THREADS=1`, a 3888x2608 PEF and the POCL CPU device:
 
 ## Lab wavelet
 
-`lab.wavelet` runs the directional pyramid equaliser as one device node. The
-wavelet tool in the same block is not ported yet: an enabled `wavelet` section
-is a residual and keeps the whole block on the host, so this node only ever
-runs the equaliser and the residual list below.
+`lab.wavelet` runs the directional pyramid equaliser and, as a second
+increment, the wavelet tool's contrast-only path as one device node. Either
+pass may be the only one enabled: the node no longer requires
+`dirpyrequalizer.enabled` when only the wavelet runs. The wavelet
+decomposition, statistics, contrast multiply and reconstruction are device
+kernels; the other wavelet panels stay on the host and are residuals.
 
 ### Supported set
 
-`labWaveletSupported()` admits a profile where
+The equaliser part is admitted when
 
 - `dirpyrequalizer.enabled` is true and `cbdlMethod == "aft"`;
-- `wavelet.enabled` is false;
 - the call site's CIE-CAM gate is open
   (`(colorappearance.enabled && !settings->autocielab) || !cam02`);
 - every multiplier is finite and in 0..4, the threshold in 0..1, skin
@@ -2549,26 +2550,57 @@ runs the equaliser and the residual list below.
 - at least one multiplier is more than 0.001 away from 1, so the block would
   touch the image.
 
-The launcher additionally requires a CPU OpenCL device (POCL), at least an
-8x8 image, and a width of at least twice the largest half-window the active
-levels read (`4 * 2^(levels-1)` for six levels, 128 columns). A GPU device, an
-image that narrow, or an enabled wavelet tool reaches the builtin and records
-`impl=host`.
+The wavelet part is admitted when `wavelet.enabled` is true and
+
+- `Expcontrast` is set and every other export panel is clear: chroma, edge,
+  blur, residual, final, toning, noise and clarity;
+- `ChoiceLevMethod == "all"` and `TilesMethod == "full"`;
+- `Softrad` and `Softradend` are zero, skin protection is zero, and
+  `AvoidColorShift` and `Median` are off;
+- `ContExtra` is zero and `DaubMethod == "6_"` (the default 8-tap
+  Daubechies);
+- `HSMethod` is `"with"` or `"without"`, and the chroma-by-hue curve is the
+  identity;
+- sigma is in 0.05..2.5, offset in 0.33..1.66, lowthr in 20..100, the
+  highlight and shadow level gates are 1..9 and 3..9, strength is 0..100 and
+  every contrast multiplier is -100..350;
+- the finest contrast multiplier is non-zero and the image is large enough
+  for the decomposition the block would build.
+
+The transform level count is the block's own: the `MaxLev` slider, capped by
+the image-size limits, the extra level and then the trailing-zero trim that
+applies when `Contrast` is zero and nothing else needs a level. The launcher
+additionally requires a CPU OpenCL device (POCL), an 8x8 image for the
+equaliser, a width of at least twice the largest half-window for its active
+levels, fp64 for the wavelet statistics, and half-size dimensions of at least
+`2^(levels-1)` for the undecimated Haar bands. A GPU device or an image that
+narrow reaches the builtin and records `impl=host`.
 
 ### ABI
 
 The ABI is `[0]` the three-plane F32 Lab buffer, read and written in place;
-`[1]` the host-only `RtLabWaveletContext` pointer (`RT_STAGE_ARG_PTR`); `[2]`
-the int support flag, mirrored from the context descriptor; `[3..8]` the six
-double multipliers, level 0 finest; `[9]` the double threshold; `[10]` the
-double skin protection; `[11..13]` the doubles `b_l`, `t_l` and `t_r` (the
+`[1]` the host-only `RtLabWaveletContext` pointer (`RT_STAGE_ARG_PTR`), version
+2; `[2]` the int support flag, mirrored from the context descriptor; `[3..8]`
+the six double multipliers, level 0 finest; `[9]` the double threshold; `[10]`
+the double skin protection; `[11..13]` the doubles `b_l`, `t_l` and `t_r` (the
 block's `hueskin` points divided by 100); `[14]` int `gamutlab`; `[15]` int
 the block's scale, which the launcher requires to be 1; `[16]` int the number
-of active levels; `[17]` the host-built range tables, `levels * 0x20000`
-floats; `[18]` the host-built hue mask and `[19]` the chroma mask, each
-`width * height` floats and present only when skin protection is non-zero.
-Nothing in the context is uploaded: the pointers are host memory the launcher
-reads.
+of active equaliser levels; `[17]` the host-built range tables, `levels *
+0x20000` floats; `[18]` the host-built hue mask and `[19]` the chroma mask,
+each `width * height` floats and present only when skin protection is
+non-zero; `[20]` int the wavelet device flag; `[21]` the host-built wavelet
+parameter table, `64 + levels * 10` floats.
+
+The context carries a `RtLabWaveletWavelet` sub-structure with the wavelet
+support flag, level count, tap count, the parameter-table pointer and a
+`compute_mea()` callback. The table's first 64 floats are the scalars
+(levels, HS method, the two level gates, `c[0..9]`, thresholds, sigma, offset,
+lowthr, strength, the four highlight and four shadow corners, the tap count)
+and the 8-tap analysis/synthesis filter rows; the tail is one 10-entry `mea`
+block per level. `compute_mea()` is called with the device statistics and
+fills the tail on the host through the block's own `calceffect()`, so the
+device never re-derives a threshold band. Nothing in the context is uploaded:
+the pointers are host memory the launcher reads.
 
 ### Arithmetic and provenance
 
@@ -2615,13 +2647,72 @@ match the block bit for bit, and a refusal after the pre-pass leaves the
 caller's Lab buffer untouched. The device launcher then uploads only L and
 copies the repaired a/b planes from the prepared copy after readback.
 
+### Wavelet transform, statistics and contrast
+
+The wavelet pass is a direct port of `ip_wavelet()`'s contrast-only path. The
+launcher runs it after the equaliser (if any) on the same L plane, in the
+block's order:
+
+1. The level-0 analysis runs the decimated 8-tap Daubechies filter
+   (`Daub4_anal8`, offset 2) at half resolution: one vertical kernel writes
+   the two half-height rows with the host's clamped border and ascending tap
+   order, and one horizontal kernel writes the low pass and the three detail
+   bands, subsampling every other column.
+2. Levels 1..L-1 run the undecimated Haar analysis at stride `2^(level-1)` on
+   the same half-size grid. The border rule is the host's asymmetric one: the
+   band `[size - skip, skip)` is refused by the predicate rather than read
+   uninitialised.
+3. One work item per (level, direction) band scans the band in ascending
+   row-major order and reproduces `Aver()` and `Sigma()` back to back. Every
+   sum and variance accumulates in double, the threshold is `32.7f`, the
+   positive and negative counts are separate, and the mean, sigma, max and min
+   are converted to float exactly as the host does at `OMP_NUM_THREADS=1`.
+   A parallel tree reduction would flip near-threshold `lbeta` values; it is
+   not used.
+4. The statistics read back to the host, `RtLabWaveletContext::compute_mea()`
+   averages the three directions, calls the block's `calceffect()` for each
+   level and fills the `mea` tail of the parameter table. The table is
+   uploaded again before the contrast pass.
+5. One kernel per level applies `ContAllL()` to the three bands: the `lbeta`
+   piecewise factor, `alpha = (1024 + 15 * c[level] * scale * scale2 * lbeta *
+   diagacc) / 1024` with `scale = scale2 = diagacc = 1`, and, with
+   `HSMethod=with`, the per-pixel `kH` ramp, the four highlight and four
+   shadow corners and the two level gates. `cpMul == 0` skips the band, as the
+   block does. `LL100` is the original L at `(2y, 2x)` and `LL100res` is the
+   level-0 residual coefficient.
+6. The inverse runs the Haar levels from the coarsest down, using the two
+   half-size scratch rows, then the level-0 Daubechies synthesis with
+   `blend = strength / 100` and the `L <= 0 -> 1` clamp that is the block's
+   last operation on L.
+
+`wavelet.contrast`, the residual contrast curve, `strength` only through the
+level-0 blend, and the clamps are all reproduced. The transform and the
+contrast multiply are bit-exact against the block on POCL.
+
+Device memory is `(3 * levels + 7) * ceil(W/2) * ceil(H/2)` floats for the
+bands, the two low-pass buffers, the two full-width half-height scratch rows,
+the statistics and the parameter table. Every buffer is acquired before the
+equaliser runs, so an exhausted `RT_STAGE_DEVICE_BUDGET_MB` falls back with
+the caller's image untouched.
+
 ### Residuals
 
-`wavelet.enabled`, `cbdlMethod == "bef"`, a multiplier, threshold, skin or hue
+For the equaliser: `cbdlMethod == "bef"`, a multiplier, threshold, skin or hue
 point outside the ABI bounds, an all-neutral pyramid, a closed CIE-CAM gate, a
-GPU device, a too-narrow image, and a failed host setup are residuals. Each
-runs the `lab.wavelet` host builtin, which executes the extracted host block
-with device recursion disabled, and records `impl=host`, never a device pass.
+GPU device, a too-narrow image, and a failed host setup are residuals.
+
+For the wavelet: an enabled section without `Expcontrast`, any other export
+panel, another `ChoiceLevMethod` or `TilesMethod`, a non-zero soft radius,
+skin protection, avoid-colour-shift, the blue-sky median, `ContExtra`, a
+non-default Daubechies length, an unknown `HSMethod`, a non-identity
+chroma-by-hue curve, any scalar outside its bounds, a zero finest multiplier,
+a zero level count, a too-small image, and a GPU or non-fp64 device are
+residuals. Nothing enabled at all is also a residual.
+
+Each runs the `lab.wavelet` host builtin, which executes the extracted host
+block with device recursion disabled, and records `impl=host`, never a device
+pass. When both passes are supported they run in the block's order in one
+submission.
 
 ### Evidence
 
@@ -2629,12 +2720,15 @@ with device recursion disabled, and records `impl=host`, never a device pass.
 
 | Case | Result |
 |---|---|
-| Device parity, 14 cases at 179x48, 238x64 and 8192x64 | six levels, finest only, three levels, threshold 0 and 1, skin protection +60 and -60, gamutlab with and without skin, padded 179/238, a saturated hue circle and an 8192-wide plain and skin case; 3,574,560 samples, `impl=opencl` on every case, no NaN/Inf, worst 0.115234 LSB16 and 0 samples over 1 LSB16 |
-| Non-vacuity | skin protection changes 574 of 45,696 samples (PAE 108.908203 LSB16); the gamutlab pre-pass changes 29,542 of 45,696 (PAE 20,453.597931), so both device paths are exercised |
-| Residuals, seven cases | wavelet enabled, `cbdlMethod bef`, multiplier 5, threshold 2, skin 200, an all-neutral pyramid and a closed CIE-CAM gate are refused, record `impl=host` with no `impl=opencl`, and are byte-identical to the block (PAE 0, 7 x 25,776 samples) |
-| Default path | with `RT_STAGE_OPENCL` unset and no override, `run()` resolves to the builtin, records `impl=builtin`, and is byte-identical to `labWaveletHostBlock` |
+| Equaliser parity, 14 cases at 179x48, 238x64 and 8192x64 | six levels, finest only, three levels, threshold 0 and 1, skin protection +60 and -60, gamutlab with and without skin, padded 179/238, a saturated hue circle and an 8192-wide plain and skin case; 3,574,560 samples, `impl=opencl` on every case, no NaN/Inf, worst 0.115234 LSB16 and 0 samples over 1 LSB16 |
+| Equaliser non-vacuity | skin protection changes 574 of 45,696 samples (PAE 108.908203 LSB16); the gamutlab pre-pass changes 29,542 of 45,696 (PAE 20,453.597931) |
+| Wavelet parity, 13 cases | transform only (all contrast multipliers zero), contrast with and without HS, negative multipliers, sigma 0.5 / offset 1.4, strength 60, padded 179x49, levels 1/2/3/7, 8192x64 and the equaliser plus wavelet in one submission: 2,022,537 samples, all bit-exact (PAE 0, 0 samples over 0.5 L = 1 LSB16), finite, `impl=opencl` on every case |
+| Wavelet non-vacuity | the contrast path changes 14,651 of 45,696 fixture samples against the identity, PAE 3,933.345703 LSB16 |
+| Wavelet residuals, 29 cases | each unsupported flag, method, curve, range, zero multiplier, zero level count and the all-off profile are refused, record `impl=host` with no `impl=opencl`, and are byte-identical to the block (PAE 0, 29 x 45,696 samples) |
+| Default path, equaliser and wavelet | with `RT_STAGE_OPENCL` unset and no override, `run()` resolves to the builtin, records `impl=builtin`, and is byte-identical to `labWaveletHostBlock` |
 | GPU | not run on a GPU in this change. The launcher's `CL_DEVICE_TYPE` check refuses before any upload, so a GPU submission records `impl=host`; the test's GPU residual is skipped on POCL and runs when a non-CPU device is selected |
 | `verify.sh --stage-device`, POCL CPU, `labwavelet.pp3` | PASS, `max_pae=1.5259e-05` (1 LSB16), record `"stage":"lab.wavelet","impl":"opencl","source":"opencl"` at 3888x2608 |
+| `verify.sh --stage-device`, POCL CPU, `labwavelet-contrast.pp3` | PASS, `max_pae=1.5259e-05` (1 LSB16), record `"stage":"lab.wavelet","impl":"opencl","source":"opencl"` at 3888x2608; the profile leaves the equaliser off |
 | `--gpu=off`, `RT_STAGE_OPENCL` unset | the call site takes the extracted host block; the node is not submitted, and the output is the pre-node CPU result |
 
 ## Limitations
