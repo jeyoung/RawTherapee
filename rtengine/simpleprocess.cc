@@ -1474,23 +1474,30 @@ private:
         ImProcFunctions &ipf = * (ipf_p.get());
 
         /*
-         * The node is opt-in and its colour-only device path is not
-         * implemented yet: the context and its predicate are in place, but
-         * the launcher refuses before it touches the Lab buffer, so the
-         * builtin runs the extracted host block and records impl=host. The
-         * block is atomic: `supported` is the whole-block predicate, and no
-         * spot is ever split between the two implementations.
+         * An inactive block never reaches the node. For an active block the
+         * node is opt-in and atomic: `supported` is the whole-block predicate
+         * and no spot is split between the two implementations. Only a
+         * supported submission prefills labView; a residual submission still
+         * goes through the builtin so it records impl=host. A failed or
+         * refused submission leaves baseImg unmodified, so the host block
+         * below always starts from the same pixels as the CPU path.
          */
-        if (stage::node_device("local.adjustments") == stage::StageNodeDevice::OpenCL) {
+        const bool blockActive = params.locallab.enabled &&
+                                 !params.locallab.spots.empty();
+        if (blockActive &&
+            stage::node_device("local.adjustments") ==
+                stage::StageNodeDevice::OpenCL) {
             if (labView == nullptr) {
                 labView = new LabImage(fw, fh);
             }
 
-            ipf.rgb2lab(*baseImg, *labView, params.icm.workingProfile);
+            const bool supported = stage::localAdjustmentsSupported(params);
+            if (supported) {
+                ipf.rgb2lab(*baseImg, *labView, params.icm.workingProfile);
+            }
 
             stage::LocalAdjustmentsContext context(params, ipf, baseImg,
                                                    labView, fw, fh);
-            const bool supported = stage::localAdjustmentsSupported(params);
             RtLocalAdjustmentsContext descriptor =
                 context.descriptor(supported);
 
@@ -1506,8 +1513,15 @@ private:
             if (stage::run("local.adjustments",
                            std::vector<RtStageArg>(args, args + 3),
                            &profiling) == RT_STAGE_OK) {
-                /* The node returns Lab; baseImg stays the host's. */
-                ipf.lab2rgb(*labView, *baseImg, params.icm.workingProfile);
+                if (supported) {
+                    /*
+                     * The device returns Lab; baseImg is still the host's.
+                     * A refusal ran the builtin, which already converted it;
+                     * converting the same Lab again is idempotent.
+                     */
+                    ipf.lab2rgb(*labView, *baseImg,
+                                params.icm.workingProfile);
+                }
                 return;
             }
         }
