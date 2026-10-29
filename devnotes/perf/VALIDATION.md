@@ -232,7 +232,8 @@ node ran on the device rather than only comparing pixels.
 | Residual parity, 7 cases | multi-spot, MUNS, quality curve, explicit mask, soft radius, exposure tool and highlight reconstruction record `impl=host` with no `impl=opencl` and are byte-identical to the block (7 x 45,696 samples, PAE 0) |
 | `verify.sh --stage-device`, POCL CPU, `localadjustments.pp3` | PASS, `max_pae=1.5259e-05` (1 LSB16); record `"stage":"local.adjustments","impl":"opencl","source":"opencl"` at 3888x2608; manual `compare_tiff.py` max 1 LSB16, 414,889 of 30,419,712 samples differ |
 | `localadjustments-multispot.pp3` | SKIP as a residual: `"impl":"host","source":"device-fallback"` |
-| Full `--stage-device` run | stops at the pre-existing `pef/stage-device-working-trc` row (`max_pae=4.57771e-05`) before the local-adjustments rows; those two rows were run from a trimmed copy of the same script and the single-spot row passes, so the local result is not inferred from a full-suite pass |
+| Full `--stage-device` run | PASS, 22 rows on POCL. `working.trc` is back to 1 LSB16; before the call-site guard it was 3 LSB16 with 879,478 differing samples because an inactive local.adjustments block round-tripped the base image. The single-spot local row passes and the multi-spot row SKIPs as a residual |
+| Inactive blocks | a disabled block and an empty block leave `baseImg` byte-identical and take no Lab round trip |
 | Forced refusal | `RT_STAGE_DEVICE_BUDGET_MB=16` with the single-spot profile records `impl=host`; under `RT_REQUIRE_GPU=1` the stage-device row FAILs, so the gate is non-vacuous |
 | CPU-only build | `stage-residency-test: PASS (25 skipped)` with `OpenCL unavailable (built without OpenCL)`; the host output is unchanged |
 | Builds | `build/cpu-perf-graph` and `build/opencl-perf-graph` compile `rth-cli` and `stage-residency-test` with GCC, generic target |

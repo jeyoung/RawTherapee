@@ -1711,7 +1711,8 @@ mapping, Retinex, CBDL, log, soft light, the common mask, CIE CAM, dehaze,
 `exc`/`full`/`main`, merge, explicit masks, soft radius, LAB/XYZ/XYZREL gamut
 methods, the RGB curve, LabGrid, `avoidrad != 0`, `transit == 100`, a blur
 radius above 100 and an active pre-CBDL pass. A GPU device is refused before
-the upload.
+the upload. An inactive block (`locallab.enabled == false` or no spots) never
+enters the node and takes no Lab round trip.
 
 Recorded `n/a` exceptions: `source.select` and `source.embedded` are I/O,
 `analysis` produces only histograms, `output.icc` attaches metadata,

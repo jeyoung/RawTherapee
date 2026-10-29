@@ -2764,12 +2764,17 @@ tables, the working and inverse matrices, `Color::cachef[]`/`cachefy[]` and the
 `gaussianBlur()` coefficients for `origblur`. `calc_ref()` and `avge` stay
 host-side.
 
-The call site prefills `labView` with `rgb2lab(baseImg)`, submits the node and
-converts the returned Lab back with `lab2rgb()`; `baseImg` is not passed to the
-kernel. A refusal or a failed launch returns before `readback()`, so the host
-Lab is written only on success. The builtin runs the extracted
-`localAdjustmentsHostBlock()` with device recursion disabled and records
-`impl=host`.
+The call site prefills `labView` with `rgb2lab(baseImg)` only when the block is
+active and the whole-block predicate is true, submits the node and converts
+the returned Lab back with `lab2rgb()`; `baseImg` is not passed to the kernel.
+An inactive block (`locallab.enabled == false` or no spots) never enters the
+node, so it takes no round trip and leaves `baseImg` untouched. A residual
+submission is still sent with the support flag clear and runs the builtin. A
+refusal or a failed launch returns before `readback()`, so the host Lab is
+written only on success; if the submission fails after the prefill, only
+`labView` is scratch and the host block below rebuilds it from the unmodified
+`baseImg`. The builtin runs the extracted `localAdjustmentsHostBlock()` with
+device recursion disabled and records `impl=host`.
 
 ### Kernels and order
 
@@ -2831,10 +2836,11 @@ runs the host builtin with `impl=host`; there is no per-spot mixing.
 | Supported matrix, 17 cases at 179x48, 179x49, 238x64 and 8192x64 | clamp only, chroma -50/50, lightness -50/50, contrast -50/50, all -50/50, deltaE off, transit 0/99, prefilter off and the three sizes: 2,219,001 samples, `impl=opencl` on every case, finite, worst 0.060547 LSB16 (8192x64), none over 1 LSB16 |
 | Non-vacuity | the all-50 colour case changes 29,698 of 45,696 reference samples against the clamp-only case, PAE 36,726.416992 LSB16 |
 | Residuals, 7 cases | multi-spot, MUNS, quality curves, explicit mask, soft radius, exposure tool and highlight reconstruction are refused, record `impl=host` with no `impl=opencl`, and are byte-identical to the block (7 x 45,696 samples, PAE 0) |
+| Inactive blocks | a disabled block and an enabled block with no spots leave `baseImg` byte-identical (PAE 0, 0 differing samples); the call site does not prefill or convert for either |
 | Predicate matrix, 35 entries | one otherwise supported profile per residual setting is refused; the supported profile is admitted |
 | `verify.sh --stage-device`, POCL CPU, `localadjustments.pp3` | PASS, `max_pae=1.5259e-05` (1 LSB16), record `"stage":"local.adjustments","impl":"opencl","source":"opencl"` at 3888x2608; `compare_tiff.py` max 1 LSB16, 414,889 of 30,419,712 samples differ |
 | `localadjustments-multispot.pp3` | SKIP as a residual: the record is `"impl":"host","source":"device-fallback"` |
-| Full `--stage-device` run | the current suite stops at the pre-existing `working.trc` row (`max_pae=4.57771e-05`) before reaching local.adjustments; the two local rows were run from a trimmed copy of the same script, so the single-spot PASS is direct evidence and the full-suite result is not claimed |
+| Full `--stage-device` run | PASS, 22 rows: `working.trc` is back to 1 LSB16 (it was 3 LSB16, 879,478 differing, when an inactive local.adjustments block round-tripped the base image), the single-spot local row passes, and the multi-spot row SKIPs as a residual |
 | Forced refusal | `RT_STAGE_DEVICE_BUDGET_MB=16` records `impl=host`; with `RT_REQUIRE_GPU=1` the stage-device row FAILs |
 | Default path | with `RT_STAGE_OPENCL` unset the call site runs the host block directly; the CPU-only test reports `stage-residency-test: PASS (25 skipped)` and the host output is unchanged |
 | Builds | `build/cpu-perf-graph` and `build/opencl-perf-graph` compile `rth-cli` and `stage-residency-test` with GCC and the generic target |
