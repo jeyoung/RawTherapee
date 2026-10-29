@@ -3692,7 +3692,7 @@ LabToolsRun run_lab_tools_node(LabImage& image,
     result.deviceReady = deviceReady;
     RtLabToolsContext descriptor = context.descriptor(deviceReady);
 
-    RtStageArg args[22] = {};
+    RtStageArg args[34] = {};
     args[0].kind = RT_STAGE_ARG_BUFFER;
     args[0].u.buffer = view(image);
     args[1].kind = RT_STAGE_ARG_PTR;
@@ -3725,7 +3725,30 @@ LabToolsRun run_lab_tools_node(LabImage& image,
     args[15].kind = RT_STAGE_ARG_INT;
     args[15].u.i = LAB_TOOLS_EXPORT_SCALE;
 
+    const bool vibrance = labToolsVibranceActive(params);
+    args[22].kind = RT_STAGE_ARG_INT;
+    args[22].u.i = deviceReady && vibrance ? 1 : 0;
+    args[23].kind = RT_STAGE_ARG_INT;
+    args[23].u.i = params.vibrance.pastels;
+    args[24].kind = RT_STAGE_ARG_INT;
+    args[24].u.i = params.vibrance.saturated;
+    args[25].kind = RT_STAGE_ARG_INT;
+    args[25].u.i = params.vibrance.psthreshold.getTopLeft();
+    args[26].kind = RT_STAGE_ARG_INT;
+    args[26].u.i = params.vibrance.psthreshold.getBottomLeft();
+    args[27].kind = RT_STAGE_ARG_INT;
+    args[27].u.i = params.vibrance.protectskins ? 1 : 0;
+    args[28].kind = RT_STAGE_ARG_INT;
+    args[28].u.i = params.vibrance.avoidcolorshift ? 1 : 0;
+    args[29].kind = RT_STAGE_ARG_INT;
+    args[29].u.i = deviceReady && vibrance && setup.skin_curve_set != 0 ? 1 : 0;
+    args[30].kind = RT_STAGE_ARG_INT;
+    args[30].u.i = params.toneCurve.hrenabled ? 1 : 0;
+
     for (int index = 16; index < 22; ++index) {
+        args[index].kind = RT_STAGE_ARG_BUFFER;
+    }
+    for (int index = 31; index < 34; ++index) {
         args[index].kind = RT_STAGE_ARG_BUFFER;
     }
     if (deviceReady) {
@@ -3752,13 +3775,26 @@ LabToolsRun run_lab_tools_node(LabImage& image,
             setup.cachef, static_cast<int>(RT_LAB_TOOLS_CACHE_ENTRIES));
         args[21].u.buffer = host_buffer(
             setup.cachefy, static_cast<int>(RT_LAB_TOOLS_CACHE_ENTRIES));
+        if (vibrance) {
+            args[31].u.buffer = host_buffer(
+                setup.munsell, static_cast<int>(RT_LAB_TOOLS_MUNSELL_TABLES *
+                                                RT_LAB_TOOLS_MUNSELL_STRIDE));
+            args[32].u.buffer = host_buffer(
+                setup.munsell_sizes,
+                static_cast<int>(RT_LAB_TOOLS_MUNSELL_TABLES));
+            args[33].u.buffer = host_buffer(
+                setup.skin_curve,
+                setup.skin_curve_set != 0
+                    ? static_cast<int>(RT_LAB_TOOLS_SKIN_CURVE_ENTRIES)
+                    : 1);
+        }
     }
 
     std::remove(profile_path.c_str());
     setenv("RT_STAGE_PROFILE", profile_path.c_str(), 1);
     set_node_device_override("lab.tools", StageNodeDevice::OpenCL);
     result.status =
-        run("lab.tools", std::vector<RtStageArg>(args, args + 22));
+        run("lab.tools", std::vector<RtStageArg>(args, args + 34));
     clear_node_device_overrides();
     unsetenv("RT_STAGE_PROFILE");
     return result;
@@ -3905,8 +3941,8 @@ void test_lab_tools(bool available)
      * block, and the result must be the block's own output.
      */
     const char* residual_labels[] = {
-        "vibrance", "Lab curves", "local contrast", "EPD", "Lab regions",
-        "black and white"};
+        "vibrance + Lab curves", "vibrance + local contrast", "vibrance + EPD",
+        "vibrance + Lab regions", "vibrance + black and white"};
     for (const char* label : residual_labels) {
         rtengine::procparams::ProcParams params;
         params.sh.enabled = true;
@@ -3916,27 +3952,26 @@ void test_lab_tools(bool available)
         params.sh.htonalwidth = 40;
         params.sh.stonalwidth = 40;
         params.sh.radius = 10;
+        params.vibrance.enabled = true;
+        params.vibrance.pastels = 50;
+        params.vibrance.saturated = 30;
 
-        if (std::strcmp(label, "vibrance") == 0) {
-            params.vibrance.enabled = true;
-            params.vibrance.pastels = 50;
-            params.vibrance.saturated = 30;
-        } else if (std::strcmp(label, "Lab curves") == 0) {
+        if (std::strcmp(label, "vibrance + Lab curves") == 0) {
             params.labCurve.enabled = true;
             params.labCurve.lcurve = {
                 static_cast<double>(FCT_MinMaxCPoints),
                 0.0, 0.0, 0.0, 0.0,
                 0.5, 0.6, 0.0, 0.0,
                 1.0, 1.0, 0.0, 0.0};
-        } else if (std::strcmp(label, "local contrast") == 0) {
+        } else if (std::strcmp(label, "vibrance + local contrast") == 0) {
             params.localContrast.enabled = true;
             params.localContrast.radius = 20;
             params.localContrast.amount = 30;
-        } else if (std::strcmp(label, "EPD") == 0) {
+        } else if (std::strcmp(label, "vibrance + EPD") == 0) {
             params.epd.enabled = true;
             params.epd.strength = 0.5;
             params.epd.gamma = 1.0;
-        } else if (std::strcmp(label, "Lab regions") == 0) {
+        } else if (std::strcmp(label, "vibrance + Lab regions") == 0) {
             params.colorToning.enabled = true;
             params.colorToning.method = "LabRegions";
             rtengine::procparams::ColorToningParams::LabCorrectionRegion
@@ -4107,7 +4142,7 @@ void test_lab_tools(bool available)
         check(context.build(setup) == 0, "forced fallback setup builds");
         RtLabToolsContext descriptor = context.descriptor(true);
 
-        RtStageArg args[22] = {};
+        RtStageArg args[34] = {};
         args[0].kind = RT_STAGE_ARG_BUFFER;
         args[0].u.buffer = view(device);
         args[1].kind = RT_STAGE_ARG_PTR;
@@ -4136,6 +4171,10 @@ void test_lab_tools(bool available)
         args[14].u.i = 1;
         args[15].kind = RT_STAGE_ARG_INT;
         args[15].u.i = LAB_TOOLS_EXPORT_SCALE;
+        for (int index = 22; index < 31; ++index) {
+            args[index].kind = RT_STAGE_ARG_INT;
+            args[index].u.i = 0;
+        }
         const auto host_buffer = [](const float* data, int width) {
             RtStageBuffer buffer{};
             buffer.size = sizeof(RtStageBuffer);
@@ -4150,6 +4189,9 @@ void test_lab_tools(bool available)
             return buffer;
         };
         for (int index = 16; index < 22; ++index) {
+            args[index].kind = RT_STAGE_ARG_BUFFER;
+        }
+        for (int index = 31; index < 34; ++index) {
             args[index].kind = RT_STAGE_ARG_BUFFER;
         }
         /* Half the required length: the launcher refuses the submission. */
@@ -4168,7 +4210,7 @@ void test_lab_tools(bool available)
         setenv("RT_STAGE_PROFILE", profile_path.c_str(), 1);
         set_node_device_override("lab.tools", StageNodeDevice::OpenCL);
         const RtStageStatus status =
-            run("lab.tools", std::vector<RtStageArg>(args, args + 22));
+            run("lab.tools", std::vector<RtStageArg>(args, args + 34));
         clear_node_device_overrides();
         const std::string profile = read_file(profile_path);
         unsetenv("RT_STAGE_PROFILE");
@@ -4183,6 +4225,395 @@ void test_lab_tools(bool available)
               "the forced fallback matches the CPU block");
     }
 }
+
+/* --------------------------------------------------- lab.tools vibrance */
+
+/*
+ * The vibrance domain image: one pixel per (L, C, hue) sample. L covers every
+ * luminance band Color::MunsellLch() branches on, C runs from below the
+ * vibrance gate of 6 to the LUT clamp of 139, and the hue sweep covers all
+ * four Munsell zones and the skin region. The full grid is
+ * width x height = hue samples x (L samples * C samples).
+ */
+void fill_vibrance_domain(LabImage& lab)
+{
+    const float lightness[] = {6.f,  9.5f, 12.f, 17.f, 22.f, 27.f, 32.f, 37.f,
+                               42.f, 47.f, 52.f, 57.f, 62.f, 67.f, 72.f, 77.f,
+                               82.f, 87.f, 92.f, 97.f};
+    const float chroma[] = {6.5f, 8.f, 12.f, 20.f, 40.f, 80.f, 110.f, 139.f};
+    const int hue_count = 125;
+    const int lightness_count =
+        static_cast<int>(sizeof(lightness) / sizeof(lightness[0]));
+    const int chroma_count =
+        static_cast<int>(sizeof(chroma) / sizeof(chroma[0]));
+    const int rows = lightness_count * chroma_count;
+    const int height = lab.H < rows ? lab.H : rows;
+    const int width = lab.W < hue_count ? lab.W : hue_count;
+
+    for (int y = 0; y < height; ++y) {
+        const float l = lightness[y % lightness_count];
+        const float c = chroma[(y / lightness_count) % chroma_count];
+        for (int x = 0; x < width; ++x) {
+            const float hue = -3.10f + 0.05f * static_cast<float>(x);
+            lab.L[y][x] = l * 327.68f;
+            lab.a[y][x] = c * cosf(hue) * 327.68f;
+            lab.b[y][x] = c * sinf(hue) * 327.68f;
+        }
+    }
+}
+
+/* A neutral image: no chroma, so vibrance's CC == 0 branch runs. */
+void fill_vibrance_neutral(LabImage& lab)
+{
+    for (int y = 0; y < lab.H; ++y) {
+        for (int x = 0; x < lab.W; ++x) {
+            const float l = 32768.f * static_cast<float>(x) /
+                            static_cast<float>(lab.W > 1 ? lab.W - 1 : 1);
+            lab.L[y][x] = l;
+            lab.a[y][x] = 0.f;
+            lab.b[y][x] = 0.f;
+        }
+    }
+}
+
+/* A saturated image: chroma well above the LUT clamp at several hues. */
+void fill_vibrance_saturated(LabImage& lab)
+{
+    const float hues[] = {-2.8f, -1.2f, 0.2f, 1.0f, 2.6f};
+    for (int y = 0; y < lab.H; ++y) {
+        const float l = 10.f + 80.f * static_cast<float>(y) /
+                                   static_cast<float>(lab.H > 1 ? lab.H - 1 : 1);
+        for (int x = 0; x < lab.W; ++x) {
+            const float hue = hues[x % 5];
+            const float c = 100.f + 39.f * static_cast<float>((x / 5) % 2);
+            lab.L[y][x] = l * 327.68f;
+            lab.a[y][x] = c * cosf(hue) * 327.68f;
+            lab.b[y][x] = c * sinf(hue) * 327.68f;
+        }
+    }
+}
+
+struct VibranceCase {
+    const char* label;
+    int width;
+    int height;
+    int pastels;
+    int saturated;
+    int threshold_top;
+    int threshold_bottom;
+    bool protectskins;
+    bool avoidcolorshift;
+    bool skin_curve;
+    bool highlight;
+    int image; /* 0 domain, 1 neutral, 2 saturated, 3 random */
+};
+
+/* The distribution of the device-vs-host difference, in LSB16. */
+struct Distribution {
+    std::size_t samples = 0;
+    std::size_t exact = 0;
+    std::size_t quarter = 0;
+    std::size_t half = 0;
+    std::size_t one = 0;
+    std::size_t over = 0;
+    double max_abs = 0.0;
+    bool finite = true;
+};
+
+Distribution distribution(const RtStageBuffer& a, const RtStageBuffer& b)
+{
+    Distribution d;
+    if (a.format != RT_STAGE_F32 || b.format != RT_STAGE_F32 ||
+        a.width != b.width || a.height != b.height || a.planes != b.planes) {
+        d.finite = false;
+        return d;
+    }
+    for (std::uint32_t plane = 0; plane < a.planes; ++plane) {
+        for (int y = 0; y < a.height; ++y) {
+            const float* ra = reinterpret_cast<const float*>(
+                static_cast<const unsigned char*>(a.data) +
+                static_cast<std::size_t>(plane) * a.plane_pitch +
+                static_cast<std::size_t>(y) * a.row_pitch);
+            const float* rb = reinterpret_cast<const float*>(
+                static_cast<const unsigned char*>(b.data) +
+                static_cast<std::size_t>(plane) * b.plane_pitch +
+                static_cast<std::size_t>(y) * b.row_pitch);
+            for (int x = 0; x < a.width; ++x) {
+                ++d.samples;
+                if (!std::isfinite(ra[x]) || !std::isfinite(rb[x])) {
+                    d.finite = false;
+                    ++d.over;
+                    continue;
+                }
+                const double diff = std::fabs(static_cast<double>(ra[x]) -
+                                              static_cast<double>(rb[x]));
+                d.max_abs = std::max(d.max_abs, diff);
+                if (diff == 0.0) {
+                    ++d.exact;
+                } else if (diff <= 0.25) {
+                    ++d.quarter;
+                } else if (diff <= 0.5) {
+                    ++d.half;
+                } else if (diff <= 1.0) {
+                    ++d.one;
+                } else {
+                    ++d.over;
+                }
+            }
+        }
+    }
+    return d;
+}
+
+void test_lab_tools_vibrance(bool available)
+{
+    using namespace rtengine::stage;
+
+    static MyMutex vibrance_lcms_mutex;
+    if (rtengine::lcmsMutex == nullptr) {
+        rtengine::lcmsMutex = &vibrance_lcms_mutex;
+    }
+    static rtengine::Settings vibrance_settings{};
+    rtengine::settings = &vibrance_settings;
+    rtengine::Color::init();
+
+    const std::string profile_path =
+        std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp") +
+        "/stage-residency-lab-tools-vibrance.jsonl";
+
+    /*
+     * The full Munsell table set: every declared table is exported, its size
+     * is the host LUT's own size, every entry is the host entry, and the
+     * padding past that size is zero.
+     */
+    {
+        rtengine::procparams::ProcParams params;
+        params.vibrance.enabled = true;
+        params.vibrance.pastels = 50;
+        params.vibrance.saturated = 30;
+
+        rtengine::ImProcFunctions ipf(&params, false);
+        LabToolsHostState host;
+        LabToolsLuts luts = host.luts();
+        LabToolsContext context(params, ipf, luts, host.autili, host.butili);
+        RtLabToolsResult setup{};
+        check(context.build(setup) == 0, "vibrance setup builds");
+        check(setup.munsell_tables == RT_LAB_TOOLS_MUNSELL_TABLES,
+              "the setup exports every Munsell table");
+        check(setup.munsell != nullptr && setup.munsell_sizes != nullptr,
+              "the Munsell table set has a buffer");
+        check(rtengine::Color::munsellLutCount() ==
+                  static_cast<int>(RT_LAB_TOOLS_MUNSELL_TABLES),
+              "Color exposes every declared Munsell table");
+
+        std::size_t checked_entries = 0;
+        bool sizes_ok = true;
+        bool entries_ok = true;
+        bool finite = true;
+        for (std::uint32_t table = 0; table < RT_LAB_TOOLS_MUNSELL_TABLES;
+             ++table) {
+            const LUTf* lut = rtengine::Color::munsellLut(static_cast<int>(table));
+            const int size = lut != nullptr ? static_cast<int>(lut->getSize())
+                                            : 0;
+            sizes_ok = sizes_ok && size == static_cast<int>(
+                                             setup.munsell_sizes[table]);
+            sizes_ok = sizes_ok && (size == 50 || size == 90 || size == 140);
+            for (std::uint32_t index = 0; index < RT_LAB_TOOLS_MUNSELL_STRIDE;
+                 ++index) {
+                const float value =
+                    setup.munsell[table * RT_LAB_TOOLS_MUNSELL_STRIDE + index];
+                finite = finite && std::isfinite(value);
+                const float expected =
+                    index < static_cast<std::uint32_t>(size)
+                        ? (*lut)[static_cast<int>(index)]
+                        : 0.f;
+                entries_ok = entries_ok && value == expected;
+                ++checked_entries;
+            }
+        }
+        check(sizes_ok, "every Munsell table exports its own size");
+        check(entries_ok,
+              "every Munsell entry equals the host LUT and pads with zero");
+        check(finite, "the Munsell table set is finite");
+        std::printf("stage-residency: Munsell table set: %u tables, %zu "
+                    "entries checked against Color::MunsellLch's LUTs\n",
+                    RT_LAB_TOOLS_MUNSELL_TABLES, checked_entries);
+    }
+
+    if (!available) {
+        skip("lab.tools vibrance: no OpenCL device");
+        return;
+    }
+
+    const VibranceCase cases[] = {
+        /* label, w, h, pastels, saturated, top, bottom, protect, avoid,
+         * skin curve, highlight, image */
+        {"pastels only", 125, 160, 60, 0, 75, 0, false, true, false, false, 0},
+        {"saturated only", 125, 160, 0, 60, 75, 0, false, true, false, false,
+         0},
+        {"pastels and saturated", 125, 160, 60, 35, 75, 0, false, true, false,
+         false, 0},
+        {"equal sliders", 125, 160, 50, 50, 75, 0, false, true, false, false,
+         0},
+        {"negative saturated", 125, 160, 40, -40, 75, 0, false, true, false,
+         false, 0},
+        {"threshold 0", 125, 160, 60, 30, 0, 0, false, true, false, false, 0},
+        {"threshold 100", 125, 160, 60, 30, 100, 0, false, true, false, false,
+         0},
+        {"threshold split", 125, 160, 60, 30, 40, 80, false, true, false, false,
+         0},
+        {"protect skins", 125, 160, 60, 35, 75, 0, true, true, false, false, 0},
+        {"avoidcolorshift off", 125, 160, 60, 35, 75, 0, false, false, false,
+         false, 0},
+        {"skin curve", 125, 160, 60, 35, 75, 0, false, true, true, false, 0},
+        {"skin curve protect", 125, 160, 60, 35, 75, 0, true, true, true, false,
+         0},
+        {"highlight reconstruction", 125, 160, 60, 35, 75, 0, false, true,
+         false, true, 0},
+        {"neutral 179", 179, 48, 60, 35, 75, 0, false, true, false, false, 1},
+        {"neutral 238", 238, 64, 40, 20, 75, 0, true, true, false, false, 1},
+        {"saturated 179", 179, 48, 60, 35, 75, 0, false, true, false, false, 2},
+        {"saturated 238", 238, 64, 40, 20, 75, 0, true, true, false, false, 2},
+        {"padded 179", 179, 48, 60, 35, 75, 0, false, true, false, false, 3},
+        {"padded 238", 238, 64, 60, 35, 75, 0, false, true, false, false, 3},
+        {"large width 8192", 8192, 64, 60, 35, 75, 0, false, true, false, false,
+         3},
+    };
+
+    unsigned seed = 0x9e3779b9u;
+    for (const VibranceCase& item : cases) {
+        rtengine::procparams::ProcParams params;
+        params.vibrance.enabled = true;
+        params.vibrance.pastels = item.pastels;
+        params.vibrance.saturated = item.saturated;
+        params.vibrance.psthreshold = rtengine::procparams::Threshold<int>(
+            item.threshold_bottom, item.threshold_top, false);
+        params.vibrance.protectskins = item.protectskins;
+        params.vibrance.avoidcolorshift = item.avoidcolorshift;
+        params.toneCurve.hrenabled = item.highlight;
+        if (item.skin_curve) {
+            params.vibrance.skintonescurve = {
+                static_cast<double>(FCT_MinMaxCPoints),
+                0.0, 0.0, 0.0, 0.0,
+                0.5, 0.62, 0.0, 0.0,
+                1.0, 1.0, 0.0, 0.0};
+        }
+
+        check(labToolsSupported(params),
+              (std::string("lab.tools vibrance ") + item.label +
+               " is the supported set").c_str());
+
+        LabImage source(item.width, item.height);
+        switch (item.image) {
+        case 0:
+            fill_vibrance_domain(source);
+            break;
+        case 1:
+            fill_vibrance_neutral(source);
+            break;
+        case 2:
+            fill_vibrance_saturated(source);
+            break;
+        default:
+            fill_lab_tools(source, seed++);
+            break;
+        }
+
+        rtengine::ImProcFunctions cpu_ipf(&params, false);
+        LabToolsHostState cpu_host;
+        LabImage cpu(item.width, item.height);
+        cpu.CopyFrom(&source);
+        LabToolsLuts cpu_luts = cpu_host.luts();
+        labToolsHostBlock(cpu_ipf, params, cpu, cpu_luts, cpu_host.autili,
+                          cpu_host.butili);
+
+        rtengine::ImProcFunctions device_ipf(&params, false);
+        LabToolsHostState device_host;
+        LabImage device(item.width, item.height);
+        device.CopyFrom(&source);
+        const LabToolsRun result =
+            run_lab_tools_node(device, params, device_host, device_ipf,
+                               profile_path);
+        const std::string profile = read_file(profile_path);
+
+        check(result.supported,
+              (std::string("lab.tools vibrance ") + item.label +
+               " resolves to the supported set").c_str());
+        check(result.deviceReady,
+              (std::string("lab.tools vibrance ") + item.label +
+               " builds its host setup").c_str());
+        check(result.status == RT_STAGE_OK,
+              (std::string("lab.tools vibrance ") + item.label +
+               " completes through run()").c_str());
+        check(profile.find("\"stage\":\"lab.tools\"") != std::string::npos,
+              (std::string("lab.tools vibrance ") + item.label +
+               " records the node").c_str());
+        check(profile.find("\"impl\":\"opencl\"") != std::string::npos,
+              (std::string("lab.tools vibrance ") + item.label +
+               " records a device execution").c_str());
+
+        const Distribution d = distribution(view(device), view(cpu));
+        std::printf("stage-residency: lab.tools vibrance %s %dx%d: PAE %.6f "
+                    "LSB16; exact %zu, <=0.25 %zu, <=0.5 %zu, <=1 %zu, >1 "
+                    "%zu of %zu\n",
+                    item.label, item.width, item.height, d.max_abs, d.exact,
+                    d.quarter, d.half, d.one, d.over, d.samples);
+        check(d.finite,
+              (std::string("lab.tools vibrance ") + item.label +
+               " stays finite").c_str());
+        check(d.over == 0,
+              (std::string("lab.tools vibrance ") + item.label +
+               " is within one LSB16").c_str());
+    }
+
+    /*
+     * Diagnostic: the gate image has a pixel whose hue sits exactly on the
+     * Munsell zone limit -0.55. Run the production block and the device node
+     * on that single value.
+     */
+    /*
+     * The Munsell path is not vacuous: on the domain grid, switching
+     * avoidcolorshift off must change the host output, so the table
+     * comparisons above exercised AllMunsellLch().
+     */
+    {
+        rtengine::procparams::ProcParams on;
+        on.vibrance.enabled = true;
+        on.vibrance.pastels = 60;
+        on.vibrance.saturated = 35;
+        on.vibrance.avoidcolorshift = true;
+        rtengine::procparams::ProcParams off = on;
+        off.vibrance.avoidcolorshift = false;
+
+        LabImage source(125, 160);
+        fill_vibrance_domain(source);
+
+        rtengine::ImProcFunctions on_ipf(&on, false);
+        LabToolsHostState on_host;
+        LabImage on_image(125, 160);
+        on_image.CopyFrom(&source);
+        LabToolsLuts on_luts = on_host.luts();
+        labToolsHostBlock(on_ipf, on, on_image, on_luts, on_host.autili,
+                          on_host.butili);
+
+        rtengine::ImProcFunctions off_ipf(&off, false);
+        LabToolsHostState off_host;
+        LabImage off_image(125, 160);
+        off_image.CopyFrom(&source);
+        LabToolsLuts off_luts = off_host.luts();
+        labToolsHostBlock(off_ipf, off, off_image, off_luts, off_host.autili,
+                          off_host.butili);
+
+        const Diff correction = compare(view(on_image), view(off_image));
+        std::printf("stage-residency: Munsell correction changes %zu of %zu "
+                    "domain samples, PAE %.6f LSB16\n",
+                    correction.differing, correction.samples,
+                    correction.max_abs);
+        check(correction.differing > 0,
+              "the Munsell correction changes the domain image");
+    }
+}
+
 
 /* --------------------------------------------------------- run() wiring */
 
@@ -4313,6 +4744,7 @@ int main()
     test_gamut(available);
     test_working_trc(available);
     test_lab_tools(available);
+    test_lab_tools_vibrance(available);
     test_output_sharpen(available);
     test_run_wiring(available);
 

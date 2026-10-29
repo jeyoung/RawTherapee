@@ -244,6 +244,9 @@ quick() {
         "$ROOT/devnotes/opencl/pp3/labtools-sh-rgb.pp3" lab.tools
     run_stage_device "pef/stage-device-lab-tools-labgrid" \
         "$ROOT/devnotes/opencl/pp3/labtools-labgrid.pp3" lab.tools
+    run_stage_device "pef/stage-device-lab-tools-vibrance" \
+        "$ROOT/devnotes/opencl/pp3/labtools-vibrance.pp3" lab.tools \
+        "$TESTDATA/colorspace_flowers.jpg"
     run_stage_host "pef/stage-host-lab-tools-residual" \
         "$ROOT/devnotes/opencl/pp3/labtools-residual.pp3" lab.tools
 }
@@ -358,12 +361,15 @@ monitor() {
 # and the built-in or module ran instead, which is a SKIP unless a GPU is
 # required.
 #
-# Usage: run_stage_device <label> <profile> <node>
+# Usage: run_stage_device <label> <profile> <node> [sample]
 run_stage_device() {
     local label="$1"
     local profile="$2"
     local node="$3"
-    local sample="${sample_override:-$TESTDATA/colorspace_flowers.pef}"
+    # A row may name its own sample; the JPEG chart copy is used by the
+    # vibrance row, whose synthetic raw hues sit exactly on the Munsell zone
+    # limits that the harness's preview-then-export passes round differently.
+    local sample="${4:-${sample_override:-$TESTDATA/colorspace_flowers.pef}}"
 
     [ -f "$sample" ] || die "missing $sample (run tools/opencl/fetch-testdata.sh)"
     # An empty profile selects the neutral defaults, which is what the output
@@ -533,6 +539,9 @@ stage_device() {
         "$ROOT/devnotes/opencl/pp3/labtools-sh-rgb.pp3" lab.tools
     run_stage_device "pef/stage-device-lab-tools-labgrid" \
         "$ROOT/devnotes/opencl/pp3/labtools-labgrid.pp3" lab.tools
+    run_stage_device "pef/stage-device-lab-tools-vibrance" \
+        "$ROOT/devnotes/opencl/pp3/labtools-vibrance.pp3" lab.tools \
+        "$TESTDATA/colorspace_flowers.jpg"
     run_stage_host "pef/stage-host-lab-tools-residual" \
         "$ROOT/devnotes/opencl/pp3/labtools-residual.pp3" lab.tools
 }

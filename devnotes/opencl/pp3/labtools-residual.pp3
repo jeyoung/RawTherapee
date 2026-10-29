@@ -11,3 +11,10 @@ Lab=true
 Enabled=true
 Pastels=40
 Saturated=20
+
+[Local Contrast]
+Enabled=true
+Radius=20
+Amount=30
+Darkness=1
+Lightness=1
