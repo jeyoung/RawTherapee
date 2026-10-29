@@ -85,26 +85,41 @@ first pass above the working-gamut tolerance, a non-matrix-shaper profile or a
 builtin and records `impl=host`, never a device pass.
 
 `lab.tools` is partial: the Lab-grid colour-toning pass,
-shadows/highlights in both its Lab and RGB modes, and vibrance run on the
-device. The guided filter is ported with the block's own fast-guided-filter
-subsampling of 4, `boxblur()`'s running sums and bilinear rescale/readout, and
-the tone tables are built on the host from the block's `pow_F()` and
-`sh_contrast` code, so a supported Lab-mode round is bit-exact and an RGB-mode
-round is within one LSB16. Vibrance is a port of `ImProcFunctions::vibrance()`
-including `Color::gamutLchonly()`, `Color::SkinSat()`, the two-stage chroma
-ramp and the `avoidcolorshift` path through `Color::AllMunsellLch()`; the
-host builds the Munsell table set, the skin-hue curve and the two Lab caches,
-so the device reads exactly the host's tables. Vibrance is admitted only on a
-CPU OpenCL device: a GPU's `xatan2f()` division rounds differently and moves
-pixels on a Munsell limit, so a GPU submission runs the host block and records
-`impl=host`. Everything else in the block
-is a residual: Lab curves (which own the histogram refill and the Lab LUTs; a
-non-zero `contrast` is excluded with them), local contrast, EPD,
-black-and-white output, any colour-toning method other than `LabGrid`
-(`LabRegions` included), a profile where no device tool would run, and an
-RGB-mode tone table whose steepest step can turn the closing round trip's
-one-ulp channel difference into more than one LSB16. A residual runs the
-`lab.tools` host builtin and records `impl=host`, never a device pass.
+shadows/highlights in both its Lab and RGB modes, vibrance and the Lab curves
+run on the device. The guided filter is ported with the block's own
+fast-guided-filter subsampling of 4, `boxblur()`'s running sums and bilinear
+rescale/readout, and the tone tables are built on the host from the block's
+`pow_F()` and `sh_contrast` code, so a supported Lab-mode round is bit-exact
+and an RGB-mode round is within one LSB16. Vibrance is a port of
+`ImProcFunctions::vibrance()` including `Color::gamutLchonly()`,
+`Color::SkinSat()`, the two-stage chroma ramp and the `avoidcolorshift` path
+through `Color::AllMunsellLch()`; the host builds the Munsell table set, the
+skin-hue curve and the two Lab caches, so the device reads exactly the host's
+tables. The Lab-curve pass is a port of `ImProcFunctions::chromiLuminanceCurve()`
+for the L, a, b, C=f(C), L=f(C) and C=f(L) tables: the host runs the block's
+own `CurveFactory::complexLCurve()`, `complexsgnCurve()` and
+`diagonalCurve2Lut()` and exports the six tables, so the kernel never derives a
+curve. It also reads the exported Munsell set, `settings->protectred` and
+`protectredh`, `100 - rstprotection`, `amchroma`, `lcredsk` and the
+working-profile chroma scale. The kernel repeats the host's mixed precision:
+the SSE precompute gives the first chroma the single-precision `sqrt`/divide
+the host uses, while the closing chroma and the Munsell index use the host's
+double-precision `sqrt` divided by the promoted `327.68f`. The program is
+therefore built separately from the fp32 `lab.tools` program with
+`cl_khr_fp64`; the launcher refuses the pass on a device without fp64. Both
+vibrance and the Lab curves are admitted only on a CPU OpenCL device: a GPU's
+`xatan2f()` division or `sqrt` rounds differently and moves pixels on a
+Munsell limit, so a GPU submission runs the host block and records
+`impl=host`. Everything else in the block is a residual: a non-zero Lab
+`contrast` (it owns the `hist16` refill a later node reads), the chromaticity
+slider and the C=f(H), L=f(H) and H=f(H) flat curves, the LAB, XYZ and XYZREL
+Munsell methods (they need `gamutLchonly()` and `gamutmap()`), a denoise
+chroma factor, local contrast, EPD, black-and-white output, any colour-toning
+method other than `LabGrid` (`LabRegions` included), a profile where no device
+tool would run, and an RGB-mode tone table whose steepest step can turn the
+closing round trip's one-ulp channel difference into more than one LSB16. A
+residual runs the `lab.tools` host builtin and records `impl=host`, never a
+device pass.
 
 `lab.sharpening` is partial through the same `output.sharpen` node:
 `ImProcFunctions::sharpening()` is the entry point for both the Lab block and
@@ -473,7 +488,9 @@ export entry point and the tool implementations:
   that decide negative-value handling (`iplocallab.cc:2648`, `:2788-2789`,
   `:3510`, `:15684-15687`, `:16688`, `:23816-23826`).
 - `lab.tools` adds `icm` and `toneCurve` because `vibrance()` takes the
-  working profile and `toneCurve.hrenabled` (`simpleprocess.cc:1750`).
+  working profile and `toneCurve.hrenabled` (`simpleprocess.cc:1750`), and the
+  Lab-curve pass takes the working profile for its C=f(C)/C=f(L) chroma scale.
+  The curves themselves are already in `labCurve`.
 - `lab.sharpening` adds `icm`; `ipsharpen.cc` reads the working profile.
 - `lab.wavelet` adds `icm` and `toneCurve` (`ipwavelet.cc:223`, `:2017`).
 - `working.trc` adds `wavelet`: the TRC completion path copies `WaveParams`
