@@ -2011,11 +2011,13 @@ private:
 
         /*
          * The device node is opt-in and covers the LabGrid pass,
-         * shadows/highlights and vibrance. Everything else in the block is a
-         * residual: the node is not submitted as supported, the launcher
-         * refuses it and the builtin below runs the host block, recording
-         * impl=host. The launcher also refuses vibrance on a GPU device,
-         * whose division rounding can move a Munsell-limit pixel.
+         * shadows/highlights, the Lab curves and vibrance. Everything else in
+         * the block is a residual: the node is not submitted as supported, the
+         * launcher refuses it and the builtin below runs the host block,
+         * recording impl=host. The launcher also refuses vibrance and the
+         * Lab-curve pass on a GPU device, whose arithmetic rounding can move a
+         * Munsell-limit pixel, and the Lab-curve pass on a device without
+         * fp64, whose tables index a double-rounded chroma.
          */
         if (stage::node_device("lab.tools") == stage::StageNodeDevice::OpenCL) {
             const bool supported = stage::labToolsSupported(params);
@@ -2024,7 +2026,7 @@ private:
             const bool deviceReady = supported && context.build(setup) == 0;
             RtLabToolsContext descriptor = context.descriptor(deviceReady);
 
-            RtStageArg args[34] = {};
+            RtStageArg args[56] = {};
             args[0].kind = RT_STAGE_ARG_BUFFER;
             args[0].u.buffer = stage::view(*labView);
             args[1].kind = RT_STAGE_ARG_PTR;
@@ -2086,6 +2088,53 @@ private:
             args[30].kind = RT_STAGE_ARG_INT;
             args[30].u.i = params.toneCurve.hrenabled ? 1 : 0;
 
+            /*
+             * The Lab-curve pass. The six activity flags and the tables come
+             * from the host build; the method, the red/skin settings and the
+             * chroma scale are read from the same values the block reads.
+             */
+            args[34].kind = RT_STAGE_ARG_INT;
+            args[34].u.i = deviceReady ? setup.lab_curve_active : 0;
+            args[35].kind = RT_STAGE_ARG_INT;
+            args[35].u.i = deviceReady ? setup.lab_curve_l_active : 0;
+            args[36].kind = RT_STAGE_ARG_INT;
+            args[36].u.i = deviceReady ? setup.lab_curve_a_active : 0;
+            args[37].kind = RT_STAGE_ARG_INT;
+            args[37].u.i = deviceReady ? setup.lab_curve_b_active : 0;
+            args[38].kind = RT_STAGE_ARG_INT;
+            args[38].u.i = deviceReady ? setup.lab_curve_cc_active : 0;
+            args[39].kind = RT_STAGE_ARG_INT;
+            args[39].u.i = deviceReady ? setup.lab_curve_lc_active : 0;
+            args[40].kind = RT_STAGE_ARG_INT;
+            args[40].u.i = deviceReady ? setup.lab_curve_cl_active : 0;
+            args[41].kind = RT_STAGE_ARG_INT;
+            args[41].u.i = deviceReady ? setup.lab_curve_munsell : 0;
+            args[42].kind = RT_STAGE_ARG_INT;
+            args[42].u.i = deviceReady ? setup.lab_curve_lcredsk : 0;
+            const double lab_curve_doubles[5] = {
+                deviceReady ? setup.lab_curve_rst_protection : 0.0,
+                deviceReady ? setup.lab_curve_protect_red : 0.0,
+                deviceReady ? setup.lab_curve_protect_red_h : 0.0,
+                deviceReady ? setup.lab_curve_amount_chroma : 0.0,
+                deviceReady ? setup.lab_curve_adjust : 1.0};
+            for (int index = 0; index < 5; ++index) {
+                args[43 + index].kind = RT_STAGE_ARG_DOUBLE;
+                args[43 + index].u.f = lab_curve_doubles[index];
+            }
+            for (int index = 48; index < 54; ++index) {
+                args[index].kind = RT_STAGE_ARG_BUFFER;
+            }
+            args[54].kind = RT_STAGE_ARG_INT;
+            args[54].u.i = deviceReady
+                               ? static_cast<std::int64_t>(
+                                     setup.lab_curve_l_entries)
+                               : 0;
+            args[55].kind = RT_STAGE_ARG_INT;
+            args[55].u.i = deviceReady
+                               ? static_cast<std::int64_t>(
+                                     setup.lab_curve_entries)
+                               : 0;
+
             for (int index = 16; index < 22; ++index) {
                 args[index].kind = RT_STAGE_ARG_BUFFER;
             }
@@ -2131,12 +2180,40 @@ private:
                             ? static_cast<int>(
                                   RT_LAB_TOOLS_SKIN_CURVE_ENTRIES)
                             : 1);
+                } else if (setup.lab_curve_munsell != 0) {
+                    args[31].u.buffer = host_buffer(
+                        setup.munsell,
+                        static_cast<int>(RT_LAB_TOOLS_MUNSELL_TABLES *
+                                         RT_LAB_TOOLS_MUNSELL_STRIDE));
+                    args[32].u.buffer = host_buffer(
+                        setup.munsell_sizes,
+                        static_cast<int>(RT_LAB_TOOLS_MUNSELL_TABLES));
+                }
+                if (setup.lab_curve_active != 0) {
+                    args[48].u.buffer = host_buffer(
+                        setup.lab_curve_l,
+                        static_cast<int>(setup.lab_curve_l_entries));
+                    args[49].u.buffer = host_buffer(
+                        setup.lab_curve_a,
+                        static_cast<int>(setup.lab_curve_entries));
+                    args[50].u.buffer = host_buffer(
+                        setup.lab_curve_b,
+                        static_cast<int>(setup.lab_curve_entries));
+                    args[51].u.buffer = host_buffer(
+                        setup.lab_curve_cc,
+                        static_cast<int>(setup.lab_curve_entries));
+                    args[52].u.buffer = host_buffer(
+                        setup.lab_curve_lc,
+                        static_cast<int>(setup.lab_curve_entries));
+                    args[53].u.buffer = host_buffer(
+                        setup.lab_curve_cl,
+                        static_cast<int>(setup.lab_curve_entries));
                 }
             }
 
             RtStageProfiling profiling{};
             if (stage::run("lab.tools",
-                           std::vector<RtStageArg>(args, args + 34),
+                           std::vector<RtStageArg>(args, args + 56),
                            &profiling) == RT_STAGE_OK) {
                 return;
             }

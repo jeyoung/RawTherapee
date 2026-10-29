@@ -45,14 +45,15 @@ struct ProcParams;
  * host-only: the pointer, the callbacks and everything they return live in
  * host memory, and nothing here is passed to a kernel. The launcher validates
  * the per-pixel arguments from the ABI on its own; the context supplies the
- * tone tables that need pow_F(), the sh_contrast NURBS curve and the working
- * colour matrices, and it runs the original block for a residual.
+ * tone tables that need pow_F(), the sh_contrast NURBS curve, the working
+ * colour matrices, the six Lab-curve tables and the Munsell table set, and it
+ * runs the original block for a residual.
  *
  * The struct is C-compatible because the ABI is. `self` points at the C++
  * object that owns the ProcParams and ImProcFunctions references, so the
  * pointer must not outlive them.
  */
-#define RT_LAB_TOOLS_CONTEXT_VERSION 1u
+#define RT_LAB_TOOLS_CONTEXT_VERSION 2u
 /* "LTOC": rejects a stale or unrelated pointer before any callback runs. */
 #define RT_LAB_TOOLS_CONTEXT_MAGIC 0x4C544F43u
 /* The Lab-mode tone table: one entry per 16-bit L value (0..32767). */
@@ -68,6 +69,18 @@ struct ProcParams;
 #define RT_LAB_TOOLS_MUNSELL_STRIDE 140u
 /* Vibrance's host-built skin-tone hue curve. */
 #define RT_LAB_TOOLS_SKIN_CURVE_ENTRIES 65536u
+/*
+ * The six Lab-curve tables. The L table is CurveFactory::complexLCurve()'s
+ * output; the other five are the 65536-entry diagonal tables of
+ * CurveFactory::complexsgnCurve() and CurveFactory::diagonalCurve2Lut().
+ */
+#define RT_LAB_TOOLS_LUMA_LUT_ENTRIES 32770u
+#define RT_LAB_TOOLS_CURVE_LUT_ENTRIES 65536u
+/* params.labCurve.gamutmunselmethod, as chromiLuminanceCurve() maps it. NONE
+ * and MUN are the device methods; LAB, XYZ and XYZREL are residuals because
+ * they need gamutLchonly() and gamutmap(). */
+#define RT_LAB_TOOLS_MUNSELL_NONE 0u
+#define RT_LAB_TOOLS_MUNSELL_MUN 4u
 
 typedef struct RtLabToolsResult {
     /*
@@ -98,6 +111,43 @@ typedef struct RtLabToolsResult {
     uint32_t munsell_tables;
     /* 1 when Color::init()'s curve was non-identity and the table is built. */
     uint32_t skin_curve_set;
+    /*
+     * The six Lab-curve tables. `lab_curve_l` has lab_curve_l_entries entries
+     * (RT_LAB_TOOLS_LUMA_LUT_ENTRIES); the other five share
+     * lab_curve_entries (RT_LAB_TOOLS_CURVE_LUT_ENTRIES). They are null and
+     * the lengths are zero unless lab_curve_active is 1.
+     */
+    const float* lab_curve_l;
+    const float* lab_curve_a;
+    const float* lab_curve_b;
+    const float* lab_curve_cc;
+    const float* lab_curve_lc;
+    const float* lab_curve_cl;
+    uint32_t lab_curve_l_entries;
+    uint32_t lab_curve_entries;
+    /* 1 when the block would apply the Lab curves to the image. */
+    uint32_t lab_curve_active;
+    /* The six activity flags curve[] and the a/b/cc/lc/cl tables sit behind. */
+    uint32_t lab_curve_l_active;
+    uint32_t lab_curve_a_active;
+    uint32_t lab_curve_b_active;
+    uint32_t lab_curve_cc_active;
+    uint32_t lab_curve_lc_active;
+    uint32_t lab_curve_cl_active;
+    /* RT_LAB_TOOLS_MUNSELL_NONE or RT_LAB_TOOLS_MUNSELL_MUN. */
+    uint32_t lab_curve_munsell;
+    /*
+     * The red and skin protection inputs: settings->protectred and
+     * settings->protectredh as the block reads them, 100 - rstprotection,
+     * settings->amchroma and the C=f(C)/C=f(L) chroma scale (adjustr). The
+     * kernel derives the block's clamps from the raw values.
+     */
+    float lab_curve_rst_protection;
+    float lab_curve_protect_red;
+    float lab_curve_protect_red_h;
+    float lab_curve_amount_chroma;
+    float lab_curve_adjust;
+    uint32_t lab_curve_lcredsk;
 } RtLabToolsResult;
 
 
@@ -154,13 +204,16 @@ struct LabToolsLuts {
 
 /*
  * Whether the block is the lab.tools node's supported set: the LabGrid colour
- * toning pass, shadows/highlights and/or vibrance, with every other pixel tool
- * off.
+ * toning pass, shadows/highlights, vibrance and/or the Lab curves, with every
+ * other pixel tool off.
  *
- * Fail closed. Lab curves (which own the histogram refill and the Lab LUTs),
- * local contrast, EPD, black-and-white output and any colour-toning method
- * other than LabGrid are residuals. So is a profile where no tool would run:
- * the node would be a no-op and the host block records it.
+ * Fail closed. A Lab curve whose `contrast` is non-zero owns the hist16 refill
+ * a later node reads, so it is a residual. So are the chromaticity family
+ * (the chromaticity slider and the C=f(H), L=f(H) and H=f(H) flat curves), the
+ * LAB, XYZ and XYZREL Munsell methods, black-and-white output (which
+ * chromiLuminanceCurve() also touches), local contrast, EPD and any
+ * colour-toning method other than LabGrid. A profile where no tool would run
+ * is a residual too: the node would be a no-op and the host block records it.
  */
 bool labToolsSupported(const procparams::ProcParams& params);
 /* True when a shadows/highlights round would run for the given slider
@@ -170,6 +223,11 @@ bool labToolsShadowsHighlightsActive(const procparams::ProcParams& params);
  * non-identity or a slider is set. The predicate and the device launcher both
  * use it, so a vibrance block that is a no-op records impl=host. */
 bool labToolsVibranceActive(const procparams::ProcParams& params);
+/* True when chromiLuminanceCurve()'s Lab-curve pass runs on the device: the
+ * curves are enabled and `contrast` is zero. The six per-table activity flags
+ * are separate: a pass whose tables are all the identity still rewrites L, a
+ * and b through the block's divides, so it is not a no-op. */
+bool labToolsLabCurveActive(const procparams::ProcParams& params);
 
 
 /*
@@ -239,6 +297,26 @@ private:
     std::vector<float> skin_curve_;
     bool vibrance_active_ = false;
     bool skin_curve_set_ = false;
+    std::vector<float> lab_curve_l_;
+    std::vector<float> lab_curve_a_;
+    std::vector<float> lab_curve_b_;
+    std::vector<float> lab_curve_cc_;
+    std::vector<float> lab_curve_lc_;
+    std::vector<float> lab_curve_cl_;
+    bool lab_curve_active_ = false;
+    bool lab_curve_l_active_ = false;
+    bool lab_curve_a_active_ = false;
+    bool lab_curve_b_active_ = false;
+    bool lab_curve_cc_active_ = false;
+    bool lab_curve_lc_active_ = false;
+    bool lab_curve_cl_active_ = false;
+    uint32_t lab_curve_munsell_ = RT_LAB_TOOLS_MUNSELL_NONE;
+    float lab_curve_rst_protection_ = 0.f;
+    float lab_curve_protect_red_ = 0.f;
+    float lab_curve_protect_red_h_ = 0.f;
+    float lab_curve_amount_chroma_ = 0.f;
+    float lab_curve_adjust_ = 1.f;
+    bool lab_curve_lcredsk_ = true;
 };
 
 } // namespace rtengine::stage

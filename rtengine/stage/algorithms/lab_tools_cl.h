@@ -22,8 +22,9 @@
 /*
  * Device arithmetic for the lab.tools node.
  *
- * The node runs two of the Lab block's pixel tools: the LabGrid colour-toning
- * pass, and shadows/highlights in both its Lab and RGB modes. Everything the
+ * The node runs three of the Lab block's pixel tools: the LabGrid colour-toning
+ * pass, shadows/highlights in both its Lab and RGB modes, and vibrance. The
+ * Lab-curve pass is a separate fp64 program in lab_curve_cl.h. Everything the
  * block does with pow_F(), the sh_contrast NURBS curve, the diagonal curves or
  * lcms is either not part of this node or is built on the host.
  *

@@ -20,6 +20,28 @@ namespace rtengine::stage
 namespace
 {
 
+/* chromiLuminanceCurve()'s own construction: a flat curve that is non-identity
+ * only when its points move away from 0.5. The three flat-curve families are
+ * the chromaticity path, which the node does not port. */
+bool flatCurveActive(const std::vector<double>& points)
+{
+    if (points.empty() || points[0] == 0) {
+        return false;
+    }
+    FlatCurve curve(points);
+    return !curve.isIdentity();
+}
+
+/* Color::init() fills the Munsell tables MunsellLch() reads. A process
+ * without them cannot run the host block either, so the block is a residual. */
+bool munsellTablesAvailable()
+{
+    const LUTf* first = Color::munsellLut(0);
+    return Color::munsellLutCount() ==
+               static_cast<int>(RT_LAB_TOOLS_MUNSELL_TABLES) &&
+           first != nullptr && first->getSize() != 0;
+}
+
 } // namespace
 
 bool labToolsShadowsHighlightsActive(const procparams::ProcParams& params)
@@ -44,6 +66,19 @@ bool labToolsVibranceActive(const procparams::ProcParams& params)
     return !curve.isIdentity();
 }
 
+bool labToolsLabCurveActive(const procparams::ProcParams& params)
+{
+    /*
+     * chromiLuminanceCurve() owns the hist16 refill when `contrast` is
+     * non-zero; that refill is a side effect a later node reads, so the
+     * contrast path is never a device pass. With contrast at zero the pass
+     * always runs when the curves are enabled, even if every table is the
+     * identity: the pass still rewrites L, a and b through the block's own
+     * divides, which is why it is not a no-op.
+     */
+    return params.labCurve.enabled && params.labCurve.contrast == 0;
+}
+
 bool labToolsSupported(const procparams::ProcParams& params)
 {
     /*
@@ -56,13 +91,40 @@ bool labToolsSupported(const procparams::ProcParams& params)
     }
 
     /*
-     * Lab curves own the histogram refill and the Lab LUTs, and
-     * chromiLuminanceCurve() applies them. A contrast value with the curves
-     * switched off still refills hist16, which a later block reads, so it is a
-     * residual too.
+     * The Lab contrast value refills hist16, which a later block reads. The
+     * refill stays on the host, so a non-zero contrast is a residual.
      */
-    if (params.labCurve.enabled || params.labCurve.contrast != 0) {
+    if (params.labCurve.contrast != 0) {
         return false;
+    }
+
+    /*
+     * The Lab-curve pass is a device case only when everything it reads is
+     * ported. The chromaticity slider and the three flat curves (C=f(H),
+     * L=f(H) and H=f(H)) are a separate family; the LAB, XYZ and XYZREL
+     * Munsell methods need gamutLchonly() and gamutmap(); factnoise reads the
+     * denoise tool. Each is a residual.
+     */
+    if (params.labCurve.enabled) {
+        if (params.labCurve.chromaticity != 0 ||
+            flatCurveActive(params.labCurve.chcurve) ||
+            flatCurveActive(params.labCurve.lhcurve) ||
+            flatCurveActive(params.labCurve.hhcurve) ||
+            params.dirpyrDenoise.enabled) {
+            return false;
+        }
+        const bool munsell =
+            params.labCurve.gamutmunselmethod == "MUN";
+        if (!munsell && params.labCurve.gamutmunselmethod != "NONE") {
+            return false;
+        }
+        if (munsell && !munsellTablesAvailable()) {
+            return false;
+        }
+        if (!(params.labCurve.rstprotection >= 0.0 &&
+              params.labCurve.rstprotection <= 100.0)) {
+            return false;
+        }
     }
 
     if (params.localContrast.enabled || params.epd.enabled) {
@@ -97,17 +159,8 @@ bool labToolsSupported(const procparams::ProcParams& params)
         if (!vibrance) {
             return false;
         }
-        if (params.vibrance.avoidcolorshift) {
-            /*
-             * Color::init() fills the tables MunsellLch() reads. Without them
-             * neither path can run the correction, so the block is a residual.
-             */
-            const LUTf* first = Color::munsellLut(0);
-            if (Color::munsellLutCount() !=
-                    static_cast<int>(RT_LAB_TOOLS_MUNSELL_TABLES) ||
-                first == nullptr || first->getSize() == 0) {
-                return false;
-            }
+        if (params.vibrance.avoidcolorshift && !munsellTablesAvailable()) {
+            return false;
         }
     }
 
@@ -133,7 +186,8 @@ bool labToolsSupported(const procparams::ProcParams& params)
 
     return (params.colorToning.enabled &&
             params.colorToning.method == "LabGrid") ||
-           labToolsShadowsHighlightsActive(params) || vibrance;
+           labToolsShadowsHighlightsActive(params) || vibrance ||
+           labToolsLabCurveActive(params);
 }
 
 
@@ -371,17 +425,40 @@ int LabToolsContext::build(RtLabToolsResult& out)
     }
 
     /*
-     * Vibrance. The skin curve and the Munsell table set are built here, from
-     * the same host code the block uses, so the device path and the host path
-     * read one set of tables. A process without Color::init() cannot run the
-     * block either, so the setup refuses rather than reading empty tables.
+     * The two host-built table families: the Munsell set the vibrance
+     * avoidcolorshift path and the MUN Lab-curve method read, and vibrance's
+     * skin-hue curve.
      */
     static_assert(Color::MUNSELL_LUT_COUNT ==
                       static_cast<int>(RT_LAB_TOOLS_MUNSELL_TABLES),
                   "the stage ABI and Color must agree on the Munsell table count");
     vibrance_active_ = labToolsVibranceActive(params_);
     skin_curve_set_ = false;
-    if (vibrance_active_) {
+
+    /*
+     * The Lab-curve pass. `labToolsLabCurveActive()` is the block's
+     * `labCurve.enabled` with the residual contrast at zero; the six activity
+     * flags come from the host LUT build below. The method is mapped here so
+     * the Munsell export knows whether the pass needs the tables.
+     */
+    lab_curve_active_ = labToolsLabCurveActive(params_);
+    lab_curve_munsell_ = RT_LAB_TOOLS_MUNSELL_NONE;
+    if (lab_curve_active_) {
+        if (params_.labCurve.gamutmunselmethod == "NONE") {
+            lab_curve_munsell_ = RT_LAB_TOOLS_MUNSELL_NONE;
+        } else if (params_.labCurve.gamutmunselmethod == "MUN") {
+            lab_curve_munsell_ = RT_LAB_TOOLS_MUNSELL_MUN;
+        } else {
+            /* The predicate must have refused it; never guess a method. */
+            return 1;
+        }
+    }
+
+    const bool need_munsell =
+        vibrance_active_ ||
+        (lab_curve_active_ && lab_curve_munsell_ == RT_LAB_TOOLS_MUNSELL_MUN);
+
+    if (need_munsell) {
         const std::size_t table_count = RT_LAB_TOOLS_MUNSELL_TABLES;
         const std::size_t stride = RT_LAB_TOOLS_MUNSELL_STRIDE;
         if (Color::munsellLutCount() != static_cast<int>(table_count)) {
@@ -405,7 +482,9 @@ int LabToolsContext::build(RtLabToolsResult& out)
                         : 0.f;
             }
         }
+    }
 
+    if (vibrance_active_) {
         /*
          * ImProcFunctions::vibrance()'s own construction: a diagonal curve,
          * kept only when it is not the identity, filled by
@@ -437,6 +516,117 @@ int LabToolsContext::build(RtLabToolsResult& out)
         }
     }
 
+    /*
+     * The Lab-curve tables. The block's own CurveFactory calls build them, so
+     * the device reads exactly the host's LUTs and never re-derives a curve.
+     * `complexsgnCurve()` writes the a/b/cc/lc activity flags through to the
+     * caller's members, as the host block does.
+     */
+    lab_curve_l_active_ = false;
+    lab_curve_a_active_ = false;
+    lab_curve_b_active_ = false;
+    lab_curve_cc_active_ = false;
+    lab_curve_lc_active_ = false;
+    lab_curve_cl_active_ = false;
+    lab_curve_lcredsk_ = params_.labCurve.lcredsk;
+    lab_curve_adjust_ = 1.f;
+    if (lab_curve_active_) {
+        if (settings == nullptr) {
+            return 1;
+        }
+        if (luts_.lumacurve == nullptr ||
+            luts_.lumacurve->getSize() != RT_LAB_TOOLS_LUMA_LUT_ENTRIES ||
+            luts_.clcurve == nullptr ||
+            luts_.clcurve->getSize() != RT_LAB_TOOLS_CURVE_LUT_ENTRIES ||
+            luts_.curve1 == nullptr ||
+            luts_.curve1->getSize() != RT_LAB_TOOLS_CURVE_LUT_ENTRIES ||
+            luts_.curve2 == nullptr ||
+            luts_.curve2->getSize() != RT_LAB_TOOLS_CURVE_LUT_ENTRIES ||
+            luts_.satcurve == nullptr ||
+            luts_.satcurve->getSize() != RT_LAB_TOOLS_CURVE_LUT_ENTRIES ||
+            luts_.lhskcurve == nullptr ||
+            luts_.lhskcurve->getSize() != RT_LAB_TOOLS_CURVE_LUT_ENTRIES ||
+            luts_.hist16 == nullptr || luts_.dummy == nullptr) {
+            return 1;
+        }
+
+        bool utili = false;
+        CurveFactory::complexLCurve(
+            params_.labCurve.brightness, params_.labCurve.contrast,
+            params_.labCurve.lcurve, *luts_.hist16, *luts_.lumacurve,
+            *luts_.dummy, 1, utili);
+        const bool clcutili = CurveFactory::diagonalCurve2Lut(
+            params_.labCurve.clcurve, *luts_.clcurve, 1);
+        bool ccutili = false;
+        bool cclutili = false;
+        CurveFactory::complexsgnCurve(
+            *autili_, *butili_, ccutili, cclutili, params_.labCurve.acurve,
+            params_.labCurve.bcurve, params_.labCurve.cccurve,
+            params_.labCurve.lccurve, *luts_.curve1, *luts_.curve2,
+            *luts_.satcurve, *luts_.lhskcurve, 1);
+
+        const auto copy = [](const LUTf& lut, std::vector<float>& flat) {
+            const std::size_t size = lut.getSize();
+            if (flat.size() != size) {
+                flat.resize(size);
+            }
+            for (std::size_t index = 0; index < size; ++index) {
+                flat[index] = lut[static_cast<int>(index)];
+            }
+        };
+        copy(*luts_.lumacurve, lab_curve_l_);
+        copy(*luts_.curve1, lab_curve_a_);
+        copy(*luts_.curve2, lab_curve_b_);
+        copy(*luts_.satcurve, lab_curve_cc_);
+        copy(*luts_.lhskcurve, lab_curve_lc_);
+        copy(*luts_.clcurve, lab_curve_cl_);
+
+        lab_curve_l_active_ = utili;
+        lab_curve_a_active_ = *autili_;
+        lab_curve_b_active_ = *butili_;
+        lab_curve_cc_active_ = ccutili;
+        lab_curve_lc_active_ = cclutili;
+        lab_curve_cl_active_ = clcutili;
+
+        /*
+         * chromiLuminanceCurve()'s working-profile chroma scale, for the
+         * C=f(C) and C=f(L) table index.
+         */
+        const auto& profile = params_.icm.workingProfile;
+        if (profile == "ProPhoto") {
+            lab_curve_adjust_ = 1.2f;
+        } else if (profile == "Adobe RGB") {
+            lab_curve_adjust_ = 1.8f;
+        } else if (profile == "sRGB") {
+            lab_curve_adjust_ = 2.0f;
+        } else if (profile == "WideGamut") {
+            lab_curve_adjust_ = 1.2f;
+        } else if (profile == "Beta RGB") {
+            lab_curve_adjust_ = 1.4f;
+        } else if (profile == "BestRGB") {
+            lab_curve_adjust_ = 1.4f;
+        } else if (profile == "BruceRGB") {
+            lab_curve_adjust_ = 1.8f;
+        }
+
+        /*
+         * The red and skin protection inputs, read from the same globals the
+         * block reads. A non-finite value would make the kernel's comparisons
+         * meaningless, so the setup refuses.
+         */
+        lab_curve_rst_protection_ =
+            static_cast<float>(100.0 - params_.labCurve.rstprotection);
+        lab_curve_protect_red_ = static_cast<float>(settings->protectred);
+        lab_curve_protect_red_h_ = static_cast<float>(settings->protectredh);
+        lab_curve_amount_chroma_ = static_cast<float>(settings->amchroma);
+        if (!std::isfinite(lab_curve_rst_protection_) ||
+            !std::isfinite(lab_curve_protect_red_) ||
+            !std::isfinite(lab_curve_protect_red_h_) ||
+            !std::isfinite(lab_curve_amount_chroma_)) {
+            return 1;
+        }
+    }
+
     out.labgrid = labgrid_;
     out.lut_highlight = lut_highlight_.data();
     out.lut_shadow = lut_shadow_.data();
@@ -445,13 +635,41 @@ int LabToolsContext::build(RtLabToolsResult& out)
     out.iws = iws_;
     out.cachef = cachef_.data();
     out.cachefy = cachefy_.data();
-    out.munsell = vibrance_active_ ? munsell_.data() : nullptr;
-    out.munsell_sizes = vibrance_active_ ? munsell_sizes_.data() : nullptr;
+    out.munsell = need_munsell ? munsell_.data() : nullptr;
+    out.munsell_sizes = need_munsell ? munsell_sizes_.data() : nullptr;
     out.skin_curve = vibrance_active_ ? skin_curve_.data() : nullptr;
     out.munsell_tables =
-        vibrance_active_ ? static_cast<uint32_t>(RT_LAB_TOOLS_MUNSELL_TABLES)
-                         : 0u;
+        need_munsell ? static_cast<uint32_t>(RT_LAB_TOOLS_MUNSELL_TABLES)
+                     : 0u;
     out.skin_curve_set = skin_curve_set_ ? 1u : 0u;
+    out.lab_curve_l = lab_curve_active_ ? lab_curve_l_.data() : nullptr;
+    out.lab_curve_a = lab_curve_active_ ? lab_curve_a_.data() : nullptr;
+    out.lab_curve_b = lab_curve_active_ ? lab_curve_b_.data() : nullptr;
+    out.lab_curve_cc = lab_curve_active_ ? lab_curve_cc_.data() : nullptr;
+    out.lab_curve_lc = lab_curve_active_ ? lab_curve_lc_.data() : nullptr;
+    out.lab_curve_cl = lab_curve_active_ ? lab_curve_cl_.data() : nullptr;
+    out.lab_curve_l_entries =
+        lab_curve_active_
+            ? static_cast<uint32_t>(RT_LAB_TOOLS_LUMA_LUT_ENTRIES)
+            : 0u;
+    out.lab_curve_entries =
+        lab_curve_active_
+            ? static_cast<uint32_t>(RT_LAB_TOOLS_CURVE_LUT_ENTRIES)
+            : 0u;
+    out.lab_curve_active = lab_curve_active_ ? 1u : 0u;
+    out.lab_curve_l_active = lab_curve_l_active_ ? 1u : 0u;
+    out.lab_curve_a_active = lab_curve_a_active_ ? 1u : 0u;
+    out.lab_curve_b_active = lab_curve_b_active_ ? 1u : 0u;
+    out.lab_curve_cc_active = lab_curve_cc_active_ ? 1u : 0u;
+    out.lab_curve_lc_active = lab_curve_lc_active_ ? 1u : 0u;
+    out.lab_curve_cl_active = lab_curve_cl_active_ ? 1u : 0u;
+    out.lab_curve_munsell = lab_curve_munsell_;
+    out.lab_curve_rst_protection = lab_curve_rst_protection_;
+    out.lab_curve_protect_red = lab_curve_protect_red_;
+    out.lab_curve_protect_red_h = lab_curve_protect_red_h_;
+    out.lab_curve_amount_chroma = lab_curve_amount_chroma_;
+    out.lab_curve_adjust = lab_curve_adjust_;
+    out.lab_curve_lcredsk = lab_curve_lcredsk_ ? 1u : 0u;
     built_ = true;
     return 0;
 }

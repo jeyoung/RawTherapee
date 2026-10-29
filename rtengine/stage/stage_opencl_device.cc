@@ -56,6 +56,7 @@
 #include "stage/algorithms/sharpen_cl.h"
 #include "stage/algorithms/transform_cl.h"
 #include "stage/algorithms/lab_tools_cl.h"
+#include "stage/algorithms/lab_curve_cl.h"
 #include "stage/algorithms/munsell_lch_cl.h"
 #include "stage/algorithms/vibrance_cl.h"
 #include "stage/algorithms/working_trc_cl.h"
@@ -767,7 +768,9 @@ const std::string& working_trc_source()
  * The lab.tools program: the LabGrid pass, the shadows/highlights mask,
  * guided-filter and blend passes, and vibrance. lab_tools_cl.h carries the
  * block's own arithmetic and its Lab-cache lookups; the Munsell and vibrance
- * fragments are appended because vibrance calls the Munsell correction.
+ * fragments follow because vibrance calls the Munsell correction. The
+ * Lab-curve kernel is a separate program (lab_curve_source()) because it
+ * needs fp64.
  */
 const std::string& lab_tools_source()
 {
@@ -775,6 +778,25 @@ const std::string& lab_tools_source()
         std::string("#pragma OPENCL FP_CONTRACT OFF\n"
                     "#pragma STDC FP_CONTRACT OFF\n") +
         RT_LAB_TOOLS_CL + RT_MUNSELL_LCH_CL + RT_VIBRANCE_CL;
+    return source;
+}
+
+/*
+ * The Lab-curve program. It repeats chromiLuminanceCurve()'s double-precision
+ * square root and divide, which `sqrt(float) / 327.68f` performs on the host,
+ * so the Munsell chroma index and the block's chroma values round exactly as
+ * the host does. fp64 is required, so the program is only built when the
+ * device advertises CL_DEVICE_DOUBLE_FP_CONFIG; the launcher refuses the
+ * Lab-curve pass otherwise and the block stays on the host.
+ */
+const std::string& lab_curve_source()
+{
+    static const std::string source =
+        std::string("#pragma OPENCL FP_CONTRACT OFF\n"
+                    "#pragma STDC FP_CONTRACT OFF\n"
+                    "#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n") +
+        RT_LAB_TOOLS_CL + RT_MUNSELL_LCH_CL + RT_VIBRANCE_CL +
+        RT_LAB_CURVE_CL;
     return source;
 }
 
@@ -1212,6 +1234,7 @@ const std::vector<KernelDef>& kernels()
         {"gamut", RT_GAMUT_CL, "rt_gamut"},
         {"working.trc", working_trc_source().c_str(), "rt_working_trc_second"},
         {"lab.tools", lab_tools_source().c_str(), "rt_lab_tools_mask"},
+        {"lab.tools.labcurve", lab_curve_source().c_str(), "rt_lab_tools_lab_curve"},
         {"output.sharpen", RT_SHARPEN_CL, "rt_sharpen_mask"},
         {"framing", framing_source().c_str(), "rt_framing"},
         {"thumbnail.whitebalance", thumbnail_wb_source().c_str(), "rt_thumbnail_wb"},
@@ -1834,7 +1857,8 @@ cl_kernel compiled_kernel_entry(const std::shared_ptr<OpenCLEnv>& env,
      * division to a reciprocal approximation. */
     const char* build_options =
         std::strcmp(def->name, "working.trc") == 0 ||
-                std::strcmp(def->name, "lab.tools") == 0
+                std::strcmp(def->name, "lab.tools") == 0 ||
+                std::strcmp(def->name, "lab.tools.labcurve") == 0
             ? "-cl-fp32-correctly-rounded-divide-sqrt"
             : nullptr;
     build_error = env->api->BuildProgram(program, 1, &env->device,
@@ -3290,11 +3314,27 @@ RtStageStatus run_working_trc(const std::shared_ptr<OpenCLEnv>& env,
  *   [29] int skin curve set, [30] int highlight (toneCurve.hrenabled),
  *   [31] BUFFER the flat Munsell table set (197 x 140 floats),
  *   [32] BUFFER one float per Munsell table: that table's own length,
- *   [33] BUFFER the vibrance skin curve (65536 floats when [29] is 1).
+ *   [33] BUFFER the vibrance skin curve (65536 floats when [29] is 1),
+ *   [34] int Lab-curve flag (1 when chromiLuminanceCurve()'s pass runs for an
+ *        enabled Lab curve with contrast at zero),
+ *   [35] int L table active, [36] int a table active, [37] int b table active,
+ *   [38] int C=f(C) table active, [39] int L=f(C) table active,
+ *   [40] int C=f(L) table active,
+ *   [41] int Munsell method (RT_LAB_TOOLS_MUNSELL_NONE or _MUN),
+ *   [42] int lcredsk,
+ *   [43] double 100 - rstprotection, [44] double settings->protectred,
+ *   [45] double settings->protectredh, [46] double settings->amchroma,
+ *   [47] double the working-profile chroma scale,
+ *   [48] BUFFER the L table (32770 floats),
+ *   [49] BUFFER the a table, [50] BUFFER the b table,
+ *   [51] BUFFER the C=f(C) table, [52] BUFFER the L=f(C) table,
+ *   [53] BUFFER the C=f(L) table (65536 floats each),
+ *   [54] int L table length, [55] int the other five tables' length.
  *
  * The pass order is the block's own: LabGrid, then the highlight round, then
- * the shadow round, then vibrance. Each tool writes the full image, so the
- * work is sequential in that order and no pass can run out of order.
+ * the shadow round, then the Lab-curve pass, then vibrance. Each tool writes
+ * the full image, so the work is sequential in that order and no pass can run
+ * out of order.
  *
  * A clear support flag refuses before the upload: that is the residual path,
  * and it makes the CPU builtin - the extracted host block - execute and record
@@ -3306,7 +3346,7 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
                             const std::vector<RtStageArg>& args,
                             std::string& error)
 {
-    constexpr std::size_t ARG_COUNT = 34;
+    constexpr std::size_t ARG_COUNT = 56;
     constexpr int SUBSAMPLING = 4;
     /* guidedfilter.h's epsilon, passed to f_mean() by shadowsHighlights(). */
     constexpr float LAB_TOOLS_EPSILON = 0.075f;
@@ -3342,6 +3382,18 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
     }
     for (std::size_t index = 31; index <= 33; ++index) {
         kinds = kinds && args[index].kind == RT_STAGE_ARG_BUFFER;
+    }
+    for (std::size_t index = 34; index <= 42; ++index) {
+        kinds = kinds && args[index].kind == RT_STAGE_ARG_INT;
+    }
+    for (std::size_t index = 43; index <= 47; ++index) {
+        kinds = kinds && args[index].kind == RT_STAGE_ARG_DOUBLE;
+    }
+    for (std::size_t index = 48; index <= 53; ++index) {
+        kinds = kinds && args[index].kind == RT_STAGE_ARG_BUFFER;
+    }
+    for (std::size_t index = 54; index <= 55; ++index) {
+        kinds = kinds && args[index].kind == RT_STAGE_ARG_INT;
     }
     if (!kinds) {
         error = "lab.tools has an argument of the wrong kind";
@@ -3451,30 +3503,155 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
         }
     }
 
-    if (!labgrid && !sh_active && !vibrance) {
+    /*
+     * The Lab-curve pass. `lab_curve` is the call site's
+     * labToolsLabCurveActive(): the enabled curve with the residual contrast
+     * at zero. The six flags are the six host-built tables' activity, and the
+     * method is the block's gamutmunselmethod mapping (NONE or MUN only).
+     */
+    const std::int64_t lab_curve_flag = args[34].u.i;
+    if (lab_curve_flag != 0 && lab_curve_flag != 1) {
+        error = "lab.tools Lab-curve flag must be 0 or 1";
+        return RT_STAGE_INVALID;
+    }
+    const bool lab_curve = lab_curve_flag != 0;
+    int lab_curve_l = 0;
+    int lab_curve_a = 0;
+    int lab_curve_b = 0;
+    int lab_curve_cc = 0;
+    int lab_curve_lc = 0;
+    int lab_curve_cl = 0;
+    int lab_curve_method = 0;
+    int lcredsk = 0;
+    float rst_protection = 0.f;
+    float protect_red_raw = 0.f;
+    float protect_red_h_raw = 0.f;
+    float adjust = 1.f;
+    int lcurve_entries = 0;
+    int curve_entries = 0;
+    if (lab_curve) {
+        const auto in = [&](std::size_t index, int low, int high) {
+            const std::int64_t value = args[index].u.i;
+            return value >= low && value <= high ? static_cast<int>(value)
+                                                 : low - 1;
+        };
+        lab_curve_l = in(35, 0, 1);
+        lab_curve_a = in(36, 0, 1);
+        lab_curve_b = in(37, 0, 1);
+        lab_curve_cc = in(38, 0, 1);
+        lab_curve_lc = in(39, 0, 1);
+        lab_curve_cl = in(40, 0, 1);
+        lcredsk = in(42, 0, 1);
+        if (lab_curve_l < 0 || lab_curve_a < 0 || lab_curve_b < 0 ||
+            lab_curve_cc < 0 || lab_curve_lc < 0 || lab_curve_cl < 0 ||
+            lcredsk < 0) {
+            error = "lab.tools has a Lab-curve flag outside its range";
+            return RT_STAGE_INVALID;
+        }
+
+        const std::int64_t method = args[41].u.i;
+        if (method != static_cast<std::int64_t>(RT_LAB_TOOLS_MUNSELL_NONE) &&
+            method != static_cast<std::int64_t>(RT_LAB_TOOLS_MUNSELL_MUN)) {
+            error = "lab.tools has a Lab-curve Munsell method outside its range";
+            return RT_STAGE_INVALID;
+        }
+        lab_curve_method = static_cast<int>(method);
+
+        const auto double_arg = [&](std::size_t index) {
+            const double value = args[index].u.f;
+            if (!std::isfinite(value)) {
+                return std::numeric_limits<double>::quiet_NaN();
+            }
+            return value;
+        };
+        const double rst = double_arg(43);
+        const double protect_red = double_arg(44);
+        const double protect_red_h = double_arg(45);
+        const double amchroma = double_arg(46);
+        const double adjust_value = double_arg(47);
+        if (!std::isfinite(rst) || !std::isfinite(protect_red) ||
+            !std::isfinite(protect_red_h) || !std::isfinite(amchroma) ||
+            !std::isfinite(adjust_value) || rst < 0.0 || rst > 100.0 ||
+            protect_red < 0.0 || protect_red > 1000.0 ||
+            protect_red_h < 0.0 || protect_red_h > 10.0 ||
+            amchroma < 0.0 || amchroma > 10000.0 || adjust_value <= 0.0) {
+            error = "lab.tools has a Lab-curve red/skin setting outside its "
+                    "range";
+            return RT_STAGE_INVALID;
+        }
+        rst_protection = static_cast<float>(rst);
+        protect_red_raw = static_cast<float>(protect_red);
+        protect_red_h_raw = static_cast<float>(protect_red_h);
+        adjust = static_cast<float>(adjust_value);
+
+        const std::int64_t lcurve_length = args[54].u.i;
+        const std::int64_t curve_length = args[55].u.i;
+        if (lcurve_length !=
+                static_cast<std::int64_t>(RT_LAB_TOOLS_LUMA_LUT_ENTRIES) ||
+            curve_length !=
+                static_cast<std::int64_t>(RT_LAB_TOOLS_CURVE_LUT_ENTRIES)) {
+            error = "lab.tools has a Lab-curve table length outside its range";
+            return RT_STAGE_INVALID;
+        }
+        lcurve_entries = static_cast<int>(lcurve_length);
+        curve_entries = static_cast<int>(curve_length);
+    }
+
+    if (!labgrid && !sh_active && !vibrance && !lab_curve) {
         error = "lab.tools has no enabled tool";
         return RT_STAGE_FALLBACK;
     }
 
     /*
-     * Vibrance needs the host's correctly rounded divide and sqrt at every
-     * branch decision. A GPU OpenCL implementation may round one of them
-     * differently, which moves a pixel whose hue sits on a Munsell zone limit
-     * to the other side of the gate; the Radeon RX 550 was measured moving
-     * two pixels by up to 2,329 LSB16 on the PEF chart. The node therefore
-     * runs vibrance only on a CPU OpenCL device (POCL), the deterministic
-     * device the project uses for parity, and records impl=host elsewhere.
+     * Vibrance and the Lab curves need the host's correctly rounded divide and
+     * sqrt at every branch decision. A GPU OpenCL implementation may round one
+     * of them differently, which moves a pixel whose hue sits on a Munsell zone
+     * limit to the other side of the gate; the Radeon RX 550 was measured
+     * moving two vibrance pixels by up to 2,329 LSB16 on the PEF chart. The
+     * node therefore runs both only on a CPU OpenCL device (POCL), the
+     * deterministic device the project uses for parity, and records impl=host
+     * elsewhere.
      */
-    if (vibrance) {
+    if (vibrance || lab_curve) {
         cl_device_type device_type = 0;
         if (env->api->GetDeviceInfo(env->device, CL_DEVICE_TYPE,
                                     sizeof(device_type), &device_type,
                                     nullptr) != CL_SUCCESS ||
             device_type != CL_DEVICE_TYPE_CPU) {
-            error = "lab.tools vibrance needs a deterministic CPU device";
+            error = "lab.tools needs a deterministic CPU device";
             return RT_STAGE_FALLBACK;
         }
     }
+
+    /*
+     * The Lab-curve kernel repeats the host's double-precision square root and
+     * divide, so it needs an fp64 device. A device without fp64 cannot build
+     * its program; the pass stays on the host.
+     */
+    if (lab_curve) {
+        cl_device_fp_config fp_config = 0;
+        if (env->api->GetDeviceInfo(env->device, CL_DEVICE_DOUBLE_FP_CONFIG,
+                                    sizeof(fp_config), &fp_config,
+                                    nullptr) != CL_SUCCESS ||
+            fp_config == 0) {
+            error = "lab.tools Lab curves need device fp64";
+            return RT_STAGE_FALLBACK;
+        }
+    }
+
+    /*
+     * When the a and b tables are inactive the host feeds sincosval from the
+     * SSE2 precompute, which is single precision; the kernel's first chroma
+     * follows that path. A host built without SSE2 (and without RT_SIMDE)
+     * would compute the scalar double value instead, so the pass is refused
+     * rather than diverging from the block.
+     */
+#if !defined(__SSE2__) && !defined(RT_SIMDE)
+    if (lab_curve) {
+        error = "lab.tools Lab curves need the host's SSE2 precompute";
+        return RT_STAGE_FALLBACK;
+    }
+#endif
 
     const RtStageBuffer& lut_highlight = args[16].u.buffer;
     const RtStageBuffer& lut_shadow = args[17].u.buffer;
@@ -3515,22 +3692,24 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
     const RtStageBuffer& munsell = args[31].u.buffer;
     const RtStageBuffer& munsell_sizes = args[32].u.buffer;
     const RtStageBuffer& skin_curve = args[33].u.buffer;
-    if (vibrance) {
-        if (avoidcolorshift != 0) {
-            const std::uint32_t flats =
-                RT_LAB_TOOLS_MUNSELL_TABLES * RT_LAB_TOOLS_MUNSELL_STRIDE;
-            if (!valid(munsell) || munsell.format != RT_STAGE_F32 ||
-                munsell.planes != 1 || munsell.height != 1 ||
-                static_cast<std::uint32_t>(munsell.width) != flats ||
-                !valid(munsell_sizes) ||
-                munsell_sizes.format != RT_STAGE_F32 ||
-                munsell_sizes.planes != 1 || munsell_sizes.height != 1 ||
-                static_cast<std::uint32_t>(munsell_sizes.width) !=
-                    RT_LAB_TOOLS_MUNSELL_TABLES) {
-                error = "lab.tools needs the flat Munsell table set";
-                return RT_STAGE_INVALID;
-            }
+    const bool lab_curve_munsell =
+        lab_curve && lab_curve_method == static_cast<int>(RT_LAB_TOOLS_MUNSELL_MUN);
+    if ((vibrance && avoidcolorshift != 0) || lab_curve_munsell) {
+        const std::uint32_t flats =
+            RT_LAB_TOOLS_MUNSELL_TABLES * RT_LAB_TOOLS_MUNSELL_STRIDE;
+        if (!valid(munsell) || munsell.format != RT_STAGE_F32 ||
+            munsell.planes != 1 || munsell.height != 1 ||
+            static_cast<std::uint32_t>(munsell.width) != flats ||
+            !valid(munsell_sizes) ||
+            munsell_sizes.format != RT_STAGE_F32 ||
+            munsell_sizes.planes != 1 || munsell_sizes.height != 1 ||
+            static_cast<std::uint32_t>(munsell_sizes.width) !=
+                RT_LAB_TOOLS_MUNSELL_TABLES) {
+            error = "lab.tools needs the flat Munsell table set";
+            return RT_STAGE_INVALID;
         }
+    }
+    if (vibrance) {
         if (!valid(skin_curve) || skin_curve.format != RT_STAGE_F32 ||
             skin_curve.planes != 1 || skin_curve.height != 1 ||
             (skin_curve_set != 0 &&
@@ -3539,6 +3718,36 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
             (skin_curve_set == 0 && skin_curve.width < 1)) {
             error = "lab.tools needs the vibrance skin curve";
             return RT_STAGE_INVALID;
+        }
+    }
+
+    /*
+     * The six host-built Lab-curve tables. The L table is 32770 entries long
+     * (LUTf::operator[](float) reads index 32768 and its neighbour); the a, b,
+     * C=f(C), L=f(C) and C=f(L) tables are the block's 65536-entry diagonal
+     * tables.
+     */
+    const RtStageBuffer& lcurve = args[48].u.buffer;
+    const RtStageBuffer& acurve = args[49].u.buffer;
+    const RtStageBuffer& bcurve = args[50].u.buffer;
+    const RtStageBuffer& satcurve = args[51].u.buffer;
+    const RtStageBuffer& lhskcurve = args[52].u.buffer;
+    const RtStageBuffer& clcurve = args[53].u.buffer;
+    if (lab_curve) {
+        const RtStageBuffer* tables[] = {&lcurve, &acurve, &bcurve,
+                                         &satcurve, &lhskcurve, &clcurve};
+        for (std::size_t index = 0; index < 6; ++index) {
+            const std::uint32_t expected =
+                index == 0
+                    ? static_cast<std::uint32_t>(lcurve_entries)
+                    : static_cast<std::uint32_t>(curve_entries);
+            if (!valid(*tables[index]) ||
+                tables[index]->format != RT_STAGE_F32 ||
+                tables[index]->planes != 1 || tables[index]->height != 1 ||
+                static_cast<std::uint32_t>(tables[index]->width) != expected) {
+                error = "lab.tools needs the six Lab-curve tables";
+                return RT_STAGE_INVALID;
+            }
         }
     }
 
@@ -3578,11 +3787,17 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
         compiled_kernel_entry(env, def, "rt_lab_tools_labgrid", error);
     cl_kernel vibrance_kernel =
         compiled_kernel_entry(env, def, "rt_lab_tools_vibrance", error);
+    const KernelDef* curve_def = find_kernel("lab.tools.labcurve");
+    assert(curve_def != nullptr);
+    cl_kernel lab_curve_kernel =
+        lab_curve ? compiled_kernel_entry(env, curve_def,
+                                          "rt_lab_tools_lab_curve", error)
+                  : nullptr;
     if (mask_kernel == nullptr || subsample_kernel == nullptr ||
         box_h_kernel == nullptr || box_v_kernel == nullptr ||
         combine_kernel == nullptr || upsample_kernel == nullptr ||
         apply_kernel == nullptr || labgrid_kernel == nullptr ||
-        vibrance_kernel == nullptr) {
+        vibrance_kernel == nullptr || (lab_curve && lab_curve_kernel == nullptr)) {
         return RT_STAGE_FALLBACK;
     }
 
@@ -3660,19 +3875,53 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
     StageDeviceBufferPtr munsell_device;
     StageDeviceBufferPtr munsell_sizes_device;
     StageDeviceBufferPtr skin_curve_device;
-    if (vibrance) {
+    if (vibrance || lab_curve_munsell) {
         munsell_device = residency->acquire(&munsell_key, munsell_shape, &error);
         munsell_sizes_device =
             residency->acquire(&munsell_sizes_key, munsell_sizes_shape, &error);
+    }
+    if (vibrance) {
         skin_curve_device =
             residency->acquire(&skin_curve_key, skin_curve_shape, &error);
+    }
+
+    /* The six Lab-curve tables, acquired only when the pass runs. */
+    char lcurve_key = 0;
+    char acurve_key = 0;
+    char bcurve_key = 0;
+    char satcurve_key = 0;
+    char lhskcurve_key = 0;
+    char clcurve_key = 0;
+    const StageBufferShape lcurve_shape{
+        RT_STAGE_F32, static_cast<std::int32_t>(lcurve_entries), 1, 1};
+    const StageBufferShape curve_shape{
+        RT_STAGE_F32, static_cast<std::int32_t>(curve_entries), 1, 1};
+    StageDeviceBufferPtr lcurve_device;
+    StageDeviceBufferPtr acurve_device;
+    StageDeviceBufferPtr bcurve_device;
+    StageDeviceBufferPtr satcurve_device;
+    StageDeviceBufferPtr lhskcurve_device;
+    StageDeviceBufferPtr clcurve_device;
+    if (lab_curve) {
+        lcurve_device = residency->acquire(&lcurve_key, lcurve_shape, &error);
+        acurve_device = residency->acquire(&acurve_key, curve_shape, &error);
+        bcurve_device = residency->acquire(&bcurve_key, curve_shape, &error);
+        satcurve_device =
+            residency->acquire(&satcurve_key, curve_shape, &error);
+        lhskcurve_device =
+            residency->acquire(&lhskcurve_key, curve_shape, &error);
+        clcurve_device = residency->acquire(&clcurve_key, curve_shape, &error);
     }
     if (!lab_device || !full || !sub_i1 || !sub_p1 || !sub_meani ||
         !sub_meanp || !sub_temp || !lut_highlight_device ||
         !lut_shadow_device || !ws_device || !iws_device || !cachef_device ||
         !cachefy_device ||
-        (vibrance && (!munsell_device || !munsell_sizes_device ||
-                      !skin_curve_device))) {
+        ((vibrance || lab_curve_munsell) &&
+         (!munsell_device || !munsell_sizes_device)) ||
+        (vibrance && !skin_curve_device) ||
+        (lab_curve &&
+         (!lcurve_device || !acurve_device || !bcurve_device ||
+          !satcurve_device || !lhskcurve_device || !clcurve_device))) {
         return RT_STAGE_FALLBACK;
     }
 
@@ -3690,10 +3939,17 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
         !upload(ws_device, ws, "ws") || !upload(iws_device, iws, "iws") ||
         !upload(cachef_device, cachef, "cachef") ||
         !upload(cachefy_device, cachefy, "cachefy") ||
-        (vibrance &&
+        ((vibrance || lab_curve_munsell) &&
          (!upload(munsell_device, munsell, "munsell") ||
-          !upload(munsell_sizes_device, munsell_sizes, "munsell sizes") ||
-          !upload(skin_curve_device, skin_curve, "skin curve")))) {
+          !upload(munsell_sizes_device, munsell_sizes, "munsell sizes"))) ||
+        (vibrance && !upload(skin_curve_device, skin_curve, "skin curve")) ||
+        (lab_curve &&
+         (!upload(lcurve_device, lcurve, "lcurve") ||
+          !upload(acurve_device, acurve, "acurve") ||
+          !upload(bcurve_device, bcurve, "bcurve") ||
+          !upload(satcurve_device, satcurve, "satcurve") ||
+          !upload(lhskcurve_device, lhskcurve, "lhskcurve") ||
+          !upload(clcurve_device, clcurve, "clcurve")))) {
         return RT_STAGE_FALLBACK;
     }
 
@@ -3725,7 +3981,9 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
         }
     }
     for (const StageDeviceBufferPtr* buffer :
-         {&munsell_device, &munsell_sizes_device, &skin_curve_device}) {
+         {&munsell_device, &munsell_sizes_device, &skin_curve_device,
+          &lcurve_device, &acurve_device, &bcurve_device, &satcurve_device,
+          &lhskcurve_device, &clcurve_device}) {
         if (*buffer == nullptr) {
             continue;
         }
@@ -3751,11 +4009,19 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
     cl_mem cachef_memory = memory_of(cachef_device);
     cl_mem cachefy_memory = memory_of(cachefy_device);
     cl_mem munsell_memory =
-        vibrance ? memory_of(munsell_device) : nullptr;
+        (vibrance || lab_curve_munsell) ? memory_of(munsell_device) : nullptr;
     cl_mem munsell_sizes_memory =
-        vibrance ? memory_of(munsell_sizes_device) : nullptr;
+        (vibrance || lab_curve_munsell) ? memory_of(munsell_sizes_device)
+                                        : nullptr;
     cl_mem skin_curve_memory =
         vibrance ? memory_of(skin_curve_device) : nullptr;
+    cl_mem lcurve_memory = lab_curve ? memory_of(lcurve_device) : nullptr;
+    cl_mem acurve_memory = lab_curve ? memory_of(acurve_device) : nullptr;
+    cl_mem bcurve_memory = lab_curve ? memory_of(bcurve_device) : nullptr;
+    cl_mem satcurve_memory = lab_curve ? memory_of(satcurve_device) : nullptr;
+    cl_mem lhskcurve_memory =
+        lab_curve ? memory_of(lhskcurve_device) : nullptr;
+    cl_mem clcurve_memory = lab_curve ? memory_of(clcurve_device) : nullptr;
     if (lab_memory == nullptr || full_memory == nullptr ||
         i1_memory == nullptr || p1_memory == nullptr ||
         meani_memory == nullptr || meanp_memory == nullptr ||
@@ -3763,9 +4029,13 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
         sh_memory == nullptr || ws_memory == nullptr ||
         iws_memory == nullptr || cachef_memory == nullptr ||
         cachefy_memory == nullptr ||
-        (vibrance && (munsell_memory == nullptr ||
-                      munsell_sizes_memory == nullptr ||
-                      skin_curve_memory == nullptr))) {
+        ((vibrance || lab_curve_munsell) &&
+         (munsell_memory == nullptr || munsell_sizes_memory == nullptr)) ||
+        (vibrance && skin_curve_memory == nullptr) ||
+        (lab_curve &&
+         (lcurve_memory == nullptr || acurve_memory == nullptr ||
+          bcurve_memory == nullptr || satcurve_memory == nullptr ||
+          lhskcurve_memory == nullptr || clcurve_memory == nullptr))) {
         error = "lab.tools could not address its device buffers";
         return RT_STAGE_FALLBACK;
     }
@@ -4104,6 +4374,92 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
         if (sh_enabled != 0 && shadows > 0 &&
             !run_round(false, stonalwidth, sh_memory)) {
             return RT_STAGE_FALLBACK;
+        }
+
+        /*
+         * chromiLuminanceCurve(), between the shadows/highlights rounds and
+         * vibrance, as the host block orders it.
+         */
+        if (lab_curve) {
+            const cl_int cl_lcurve_entries = lcurve_entries;
+            const cl_int cl_curve_entries = curve_entries;
+            const cl_int cl_l_active = lab_curve_l;
+            const cl_int cl_a_active = lab_curve_a;
+            const cl_int cl_b_active = lab_curve_b;
+            const cl_int cl_cc_active = lab_curve_cc;
+            const cl_int cl_lc_active = lab_curve_lc;
+            const cl_int cl_cl_active = lab_curve_cl;
+            const cl_int cl_method = lab_curve_method;
+            const cl_float cl_rst = rst_protection;
+            const cl_float cl_protect_red = protect_red_raw;
+            const cl_float cl_protect_red_h = protect_red_h_raw;
+            const cl_float cl_adjust = adjust;
+            const cl_int cl_lcredsk = lcredsk;
+
+            cl_uint arg = 0;
+            bool ok = true;
+            ok = ok && set_arg(lab_curve_kernel, arg++, sizeof(cl_mem),
+                               &lab_memory);
+            ok = ok && set_arg(lab_curve_kernel, arg++, sizeof(cl_mem),
+                               &lcurve_memory);
+            ok = ok && set_arg(lab_curve_kernel, arg++, sizeof(cl_int),
+                               &cl_lcurve_entries);
+            ok = ok && set_arg(lab_curve_kernel, arg++, sizeof(cl_mem),
+                               &acurve_memory);
+            ok = ok && set_arg(lab_curve_kernel, arg++, sizeof(cl_mem),
+                               &bcurve_memory);
+            ok = ok && set_arg(lab_curve_kernel, arg++, sizeof(cl_mem),
+                               &satcurve_memory);
+            ok = ok && set_arg(lab_curve_kernel, arg++, sizeof(cl_mem),
+                               &lhskcurve_memory);
+            ok = ok && set_arg(lab_curve_kernel, arg++, sizeof(cl_mem),
+                               &clcurve_memory);
+            ok = ok && set_arg(lab_curve_kernel, arg++, sizeof(cl_int),
+                               &cl_curve_entries);
+            ok = ok && set_arg(lab_curve_kernel, arg++, sizeof(cl_int),
+                               &cl_l_active);
+            ok = ok && set_arg(lab_curve_kernel, arg++, sizeof(cl_int),
+                               &cl_a_active);
+            ok = ok && set_arg(lab_curve_kernel, arg++, sizeof(cl_int),
+                               &cl_b_active);
+            ok = ok && set_arg(lab_curve_kernel, arg++, sizeof(cl_int),
+                               &cl_cc_active);
+            ok = ok && set_arg(lab_curve_kernel, arg++, sizeof(cl_int),
+                               &cl_lc_active);
+            ok = ok && set_arg(lab_curve_kernel, arg++, sizeof(cl_int),
+                               &cl_cl_active);
+            ok = ok && set_arg(lab_curve_kernel, arg++, sizeof(cl_int),
+                               &cl_method);
+            ok = ok && set_arg(lab_curve_kernel, arg++, sizeof(cl_float),
+                               &cl_rst);
+            ok = ok && set_arg(lab_curve_kernel, arg++, sizeof(cl_float),
+                               &cl_protect_red);
+            ok = ok && set_arg(lab_curve_kernel, arg++, sizeof(cl_float),
+                               &cl_protect_red_h);
+            ok = ok && set_arg(lab_curve_kernel, arg++, sizeof(cl_float),
+                               &cl_adjust);
+            ok = ok && set_arg(lab_curve_kernel, arg++, sizeof(cl_int),
+                               &cl_lcredsk);
+            ok = ok && set_arg(lab_curve_kernel, arg++, sizeof(cl_mem),
+                               &munsell_memory);
+            ok = ok && set_arg(lab_curve_kernel, arg++, sizeof(cl_mem),
+                               &munsell_sizes_memory);
+            ok = ok && set_arg(lab_curve_kernel, arg++, sizeof(cl_int),
+                               &cl_width);
+            ok = ok && set_arg(lab_curve_kernel, arg++, sizeof(cl_int),
+                               &cl_height);
+            ok = ok && set_arg(lab_curve_kernel, arg++, sizeof(cl_int),
+                               &lab_pitch);
+            ok = ok && set_arg(lab_curve_kernel, arg++, sizeof(cl_int),
+                               &lab_plane);
+            if (!ok) {
+                error = "lab.tools Lab-curve arguments failed";
+                return RT_STAGE_FALLBACK;
+            }
+            if (!launch(lab_curve_kernel, image_global,
+                        "lab.tools Lab curves")) {
+                return RT_STAGE_FALLBACK;
+            }
         }
 
         if (vibrance) {

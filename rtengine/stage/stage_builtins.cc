@@ -112,7 +112,7 @@ RtStageStatus lab_tools_execute(const RtStageArg* args, uint32_t nargs,
 {
     (void)profiling;
 
-    constexpr uint32_t ARG_COUNT = 34;
+    constexpr uint32_t ARG_COUNT = 56;
     if (nargs != ARG_COUNT || args[0].kind != RT_STAGE_ARG_BUFFER ||
         args[1].kind != RT_STAGE_ARG_PTR ||
         args[2].kind != RT_STAGE_ARG_INT || args[3].kind != RT_STAGE_ARG_INT) {
@@ -140,6 +140,26 @@ RtStageStatus lab_tools_execute(const RtStageArg* args, uint32_t nargs,
     }
     for (uint32_t index = 31; index <= 33; ++index) {
         if (args[index].kind != RT_STAGE_ARG_BUFFER) {
+            return RT_STAGE_INVALID;
+        }
+    }
+    for (uint32_t index = 34; index <= 42; ++index) {
+        if (args[index].kind != RT_STAGE_ARG_INT) {
+            return RT_STAGE_INVALID;
+        }
+    }
+    for (uint32_t index = 43; index <= 47; ++index) {
+        if (args[index].kind != RT_STAGE_ARG_DOUBLE) {
+            return RT_STAGE_INVALID;
+        }
+    }
+    for (uint32_t index = 48; index <= 53; ++index) {
+        if (args[index].kind != RT_STAGE_ARG_BUFFER) {
+            return RT_STAGE_INVALID;
+        }
+    }
+    for (uint32_t index = 54; index <= 55; ++index) {
+        if (args[index].kind != RT_STAGE_ARG_INT) {
             return RT_STAGE_INVALID;
         }
     }
