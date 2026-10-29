@@ -3942,7 +3942,8 @@ void test_lab_tools(bool available)
      */
     const char* residual_labels[] = {
         "vibrance + Lab curves", "vibrance + local contrast", "vibrance + EPD",
-        "vibrance + Lab regions", "vibrance + black and white"};
+        "vibrance + Lab regions", "vibrance + black and white",
+        "vibrance no-op", "vibrance pastels out of range"};
     for (const char* label : residual_labels) {
         rtengine::procparams::ProcParams params;
         params.sh.enabled = true;
@@ -3971,6 +3972,13 @@ void test_lab_tools(bool available)
             params.epd.enabled = true;
             params.epd.strength = 0.5;
             params.epd.gamma = 1.0;
+        } else if (std::strcmp(label, "vibrance no-op") == 0) {
+            /* Enabled with both sliders at zero and an identity curve: the
+             * host vibrance would return without touching a pixel. */
+            params.vibrance.pastels = 0;
+            params.vibrance.saturated = 0;
+        } else if (std::strcmp(label, "vibrance pastels out of range") == 0) {
+            params.vibrance.pastels = 200;
         } else if (std::strcmp(label, "vibrance + Lab regions") == 0) {
             params.colorToning.enabled = true;
             params.colorToning.method = "LabRegions";
@@ -4276,6 +4284,32 @@ void fill_vibrance_neutral(LabImage& lab)
     }
 }
 
+/*
+ * The two pixels the RX 550 pipeline moved: their input hue sits within one
+ * ulp of a Munsell zone limit. The values are the full-precision pre-vibrance
+ * Lab samples captured from the PEF export.
+ */
+void fill_vibrance_knife_edge(LabImage& lab)
+{
+    struct Sample {
+        float l;
+        float a;
+        float b;
+    };
+    const Sample samples[] = {
+        {12361.283203f, 14259.261719f, -8742.428711f},
+        {18340.724609f, 13182.235352f, -11103.244141f},
+    };
+    for (int y = 0; y < lab.H; ++y) {
+        for (int x = 0; x < lab.W; ++x) {
+            const Sample& sample = samples[x % 2];
+            lab.L[y][x] = sample.l;
+            lab.a[y][x] = sample.a;
+            lab.b[y][x] = sample.b;
+        }
+    }
+}
+
 /* A saturated image: chroma well above the LUT clamp at several hues. */
 void fill_vibrance_saturated(LabImage& lab)
 {
@@ -4478,6 +4512,8 @@ void test_lab_tools_vibrance(bool available)
         {"padded 238", 238, 64, 60, 35, 75, 0, false, true, false, false, 3},
         {"large width 8192", 8192, 64, 60, 35, 75, 0, false, true, false, false,
          3},
+        {"Munsell zone knife edge", 64, 16, 60, 35, 75, 0, true, true, false,
+         false, 4},
     };
 
     unsigned seed = 0x9e3779b9u;
@@ -4513,6 +4549,9 @@ void test_lab_tools_vibrance(bool available)
             break;
         case 2:
             fill_vibrance_saturated(source);
+            break;
+        case 4:
+            fill_vibrance_knife_edge(source);
             break;
         default:
             fill_lab_tools(source, seed++);
