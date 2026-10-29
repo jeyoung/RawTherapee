@@ -6090,6 +6090,7 @@ void wavelet_contrast_params(rtengine::procparams::ProcParams& params,
     params.wavelet.median = false;
     params.wavelet.medianlev = false;
     params.wavelet.sup = 0;
+    params.wavelet.thrend = 0.0;
     for (int level = 0; level < 9; ++level) {
         params.wavelet.c[level] = contrast[level];
     }
@@ -6129,6 +6130,7 @@ void test_lab_wavelet_contrast(bool available)
         bool transform_only;
         bool equalizer;
         int image; /* 0 random, 1 gradient */
+        double thrend;
     };
 
     const WaveletCase cases[] = {
@@ -6162,7 +6164,13 @@ void test_lab_wavelet_contrast(bool available)
         {"wide 8192", 8192, 64, 6, true,
          {30, 22, 14, 8, 4, 2, 0, 0, 0}, 1.0, 1.0, 100, false, false, 0},
         {"equalizer and wavelet", 238, 64, 6, true,
-         {30, 22, 14, 8, 4, 2, 0, 0, 0}, 1.0, 1.0, 100, false, true, 1},
+         {30, 22, 14, 8, 4, 2, 0, 0, 0}, 1.0, 1.0, 100, false, true, 1, 0.0},
+        /* Thrend>0 undoes the trailing-zero trim: the host keeps six levels
+         * although the last two contrast multipliers are zero, so delta and
+         * the highlight/shadow kH use maxlvl 6. */
+        {"thrend keeps zero levels", 238, 64, 6, true,
+         {40, 30, 20, 10, 0, 0, 0, 0, 0}, 1.0, 1.0, 100, false, false, 1,
+         5.0},
     };
 
     unsigned seed = 0x1b56c4e9u;
@@ -6171,6 +6179,7 @@ void test_lab_wavelet_contrast(bool available)
         wavelet_contrast_params(params, item.levels, item.highlight_shadow,
                                 item.contrast, item.sigma, item.offset,
                                 item.strength);
+        params.wavelet.thrend = item.thrend;
         if (item.transform_only) {
             /* Keep the decomposition alive with a non-zero residual contrast
              * slider; the residual curve itself needs Expresid, which is off,
@@ -6236,9 +6245,9 @@ void test_lab_wavelet_contrast(bool available)
         check(d.finite,
               (std::string("lab.wavelet contrast ") + item.label +
                " stays finite").c_str());
-        check(d.one == 0 && d.over == 0,
+        check(d.exact == d.samples,
               (std::string("lab.wavelet contrast ") + item.label +
-               " is within one LSB16").c_str());
+               " is bit-exact").c_str());
     }
 
     /*
@@ -6253,7 +6262,7 @@ void test_lab_wavelet_contrast(bool available)
         "HSmethod other", "Chcurve", "sigma range", "offset range",
         "lowthr range", "threshold range", "threshold2 range",
         "strength range", "c range", "c0 zero", "levels zero",
-        "nothing enabled"};
+        "thrend range", "nothing enabled"};
     for (const char* label : residual_labels) {
         rtengine::procparams::ProcParams params;
         const int contrast[9] = {30, 22, 14, 8, 4, 2, 0, 0, 0};
@@ -6315,6 +6324,8 @@ void test_lab_wavelet_contrast(bool available)
             params.wavelet.c[0] = 0;
         } else if (std::strcmp(label, "levels zero") == 0) {
             params.wavelet.thres = 0;
+        } else if (std::strcmp(label, "thrend range") == 0) {
+            params.wavelet.thrend = 101.0;
         } else if (std::strcmp(label, "nothing enabled") == 0) {
             params.wavelet.enabled = false;
             params.dirpyrequalizer.enabled = false;
