@@ -99,12 +99,15 @@ tables. The Lab-curve pass is a port of `ImProcFunctions::chromiLuminanceCurve()
 for the L, a, b, C=f(C), L=f(C) and C=f(L) tables: the host runs the block's
 own `CurveFactory::complexLCurve()`, `complexsgnCurve()` and
 `diagonalCurve2Lut()` and exports the six tables, so the kernel never derives a
-curve. It also reads the exported Munsell set, `settings->protectred` and
-`protectredh`, `100 - rstprotection`, `amchroma`, `lcredsk` and the
-working-profile chroma scale. The kernel repeats the host's mixed precision:
-the SSE precompute gives the first chroma the single-precision `sqrt`/divide
-the host uses, while the closing chroma and the Munsell index use the host's
-double-precision `sqrt` divided by the promoted `327.68f`. The program is
+curve. It also reads the exported Munsell set, `settings->protectred`, `protectredh`, `100 - rstprotection`, `lcredsk` and the
+working-profile chroma scale; `settings->amchroma` is exported and validated
+but unused, because it only feeds the residual L=f(H) path. The kernel repeats
+the host's mixed precision: the SSE precompute gives the first chroma the
+single-precision `sqrt`/divide the host uses, while the closing chroma and the
+Munsell index use the host's double-precision `sqrt` divided by the promoted
+`327.68f`. The host's precompute covers only whole four-column blocks and
+falls back to the double path for the last up to three columns, and the kernel
+reproduces that tail. The program is
 therefore built separately from the fp32 `lab.tools` program with
 `cl_khr_fp64`; the launcher refuses the pass on a device without fp64. Both
 vibrance and the Lab curves are admitted only on a CPU OpenCL device: a GPU's

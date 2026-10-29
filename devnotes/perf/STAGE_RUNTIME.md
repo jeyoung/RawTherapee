@@ -2249,23 +2249,29 @@ block order: the L table, the signed a and b tables, the first red/skin gate,
 C=f(L), C=f(C), L=f(C), the closing chroma, and the Munsell correction with
 `Color::AllMunsellLch(lumaMuns = true)`'s luminance correction. It reads the
 exported Munsell set, `settings->protectred` and `protectredh`, `100 -
-rstprotection`, `amchroma`, `lcredsk` and the working-profile chroma scale
-(1.2 for ProPhoto and WideGamut, 1.8 for Adobe RGB and BruceRGB, 2.0 for sRGB,
-1.4 for Beta RGB and BestRGB, 1.0 otherwise). The residual families are the
-chromaticity slider, the C=f(H), L=f(H) and H=f(H) flat curves, the LAB, XYZ
-and XYZREL Munsell methods, a denoise chroma factor and black-and-white
-output.
+rstprotection`, `lcredsk` and the working-profile chroma scale (1.2 for
+ProPhoto and WideGamut, 1.8 for Adobe RGB and BruceRGB, 2.0 for sRGB, 1.4 for
+Beta RGB and BestRGB, 1.0 otherwise). `settings->amchroma` is exported and
+validated (ABI `[46]`) but not read: it only feeds the residual L=f(H) path.
+The residual families are the chromaticity slider, the C=f(H), L=f(H) and
+H=f(H) flat curves, the LAB, XYZ and XYZREL Munsell methods, a denoise chroma
+factor and black-and-white output.
 
 The chroma arithmetic is where a naive float port fails. On the host,
 `sqrt(float) / 327.68f` resolves to the libm double square root divided by the
 promoted float constant and rounded to float, while the SSE2 precompute that
 feeds `sincosval` when the a and b tables are inactive is single precision.
-`Color::MunsellLch()` truncates the chroma and the memory chroma to `int` table
-indices, so a one-ulp chroma difference can select the next table entry and
-rotate a pixel's hue by tens of LSB16. The kernel therefore reproduces both
-roundings: the inactive-a/b case takes the float precompute for the first
-chroma, and the closing chroma and the Munsell index take the
-double-precision `sqrt` divided by `(double)327.68f`. That requires fp64, so
+That precompute only covers whole four-column blocks:
+`for (k = 0; k < W - 3; k += 4)` covers `4 * (floor((W-4)/4) + 1)` columns,
+and the host's tail loop uses the scalar double `sqrt` for the last up to
+three columns (`improcfun.cc:4693-4708`). The kernel reproduces both: the
+precompute columns take the single-precision `vsqrtf`/divide, the tail
+columns and the active-a/b case take the double value, and the closing chroma
+and the Munsell index always take the double `sqrt` divided by
+`(double)327.68f`. `Color::MunsellLch()` truncates the chroma and the memory
+chroma to `int` table indices, so a one-ulp chroma difference can select the
+next table entry and rotate a pixel's hue by tens of LSB16; this is why the
+tail rounding matters. That requires fp64, so
 the kernel lives in its own program (`lab.tools.labcurve`) with
 `#pragma OPENCL EXTENSION cl_khr_fp64 : enable`; the fp32 `lab.tools` program
 and every GPU node are unaffected. The launcher refuses the pass when
@@ -2304,7 +2310,9 @@ one float per table with its own length, `[33]` the 65536-entry skin curve
 only when the enabled curve has `contrast == 0`), `[35..40]` the int L, a, b,
 C=f(C), L=f(C) and C=f(L) activity flags, `[41]` the Munsell method (0 or 4),
 `[42]` `lcredsk`, `[43]` `100 - rstprotection`, `[44]` and `[45]` the raw
-`settings->protectred` and `protectredh`, `[46]` `settings->amchroma`, `[47]`
+`settings->protectred` and `protectredh`, `[46]` `settings->amchroma`
+(validated but not read by the supported path; it only feeds the residual
+L=f(H) curve), `[47]`
 the working-profile chroma scale, `[48..53]` the six Lab-curve tables (the L
 table is 32770 floats, the other five 65536), `[54]` and `[55]` those two
 lengths. A submission with a wrong kind, length or non-finite value, or with a
@@ -2350,7 +2358,7 @@ With `OMP_NUM_THREADS=1`, a 3888x2608 PEF and the POCL CPU device:
 | Slider coverage | amounts 1/50/200/1000, tonal widths 0/100 and a split pair, radii 1/10/100, padded widths 179 and 238, and an 8192-wide image; all finite, no NaN or Inf |
 | Vibrance, 21 cases at 125x160, 179x48, 238x64, 8192x64 and 64x16 | pastels/saturated combinations, negative saturated, thresholds 0/75/100 and split, protect-skins, avoidcolorshift on/off, a skin curve, highlight reconstruction, neutral and saturated images, padded widths, the 8192-wide case and the two-pixel knife-edge case: 2,570,352 samples, measured PAE 0 and asserted within 1 LSB16 (`over == 0`), no NaN/Inf, `impl=opencl` on every case (POCL CPU) |
 | Munsell tables | all 197 tables and 27,580 exported entries equal `Color::MunsellLch()`'s LUTs; the avoidcolorshift path changes 11,696 of 60,000 domain samples, so the comparison is not vacuous |
-| Lab curves, 21 cases at 238x64, 179x48 and 8192x64 | L only, brightness, an enabled pass with all six tables the identity, a only, a/b, C=f(C), L=f(C), C=f(L), all six combined, combined with MUN and with NONE, three red/skin protection settings, `lcredsk` off, neutral and saturated images, padded 179/238 and 8192 wide: 2,347,344 samples, `impl=opencl` on every case, no NaN/Inf, worst PAE 0.013672 LSB16; 2,347,175 samples are bit-exact and 169 move by at most one 16-bit ulp (the L-only, brightness, identity and C=f(L) cases), none by more |
+| Lab curves, 21 cases at 238x64, 179x48 and 8192x64 | L only, brightness, an enabled pass with all six tables the identity, a only, a/b, C=f(C), L=f(C), C=f(L), all six combined, combined with MUN and with NONE, three red/skin protection settings, `lcredsk` off, neutral and saturated images, padded 179/238 and 8192 wide: 2,347,344 samples, `impl=opencl` on every case, no NaN/Inf, every sample bit-exact (PAE 0, 0 differing samples). The earlier 169 one-ulp samples came from the host's ≤3-column double-sqrt tail, which the kernel now reproduces |
 | Lab-curve non-vacuity | on a 179x48 saturated fixture the MUN correction changes 288 of 25,776 samples and the red/skin protection changes 2,610, so the device comparison exercises both paths |
 | Lab-curve residuals | contrast 15, chromaticity 25, a non-identity C=f(H), L=f(H) or H=f(H) curve, the XYZ Munsell method and black-and-white output are refused, record `impl=host` with no `impl=opencl`, and are byte-identical to the block (PAE 0) |
 | Block on the real PEF, POCL | the device block matches `stage::labToolsHostBlock` bit for bit (30,419,712 samples, max float delta 0) on the full pre-vibrance Lab buffer |
