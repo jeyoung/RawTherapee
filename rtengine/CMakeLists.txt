@@ -128,6 +128,7 @@ set(RTENGINESOURCEFILES
     stage/stage_lanczos.cc
     stage/lab_tools_context.cc
     stage/lab_wavelet_context.cc
+    stage/local_adjustments_context.cc
     stage/stage_opencl_device.cc
     stage/stage_param_hash.cc
     stage/stage_param_map.cc

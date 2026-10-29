@@ -2,6 +2,7 @@
 #include "stage_buffer.h"
 #include "lab_tools_context.h"
 #include "lab_wavelet_context.h"
+#include "local_adjustments_context.h"
 #include "stage_lanczos.h"
 #include "working_trc_context.h"
 #include "stage/algorithms/sharpen_cl.h"
@@ -276,6 +277,56 @@ RtStageStatus lab_wavelet_execute(const RtStageArg* args, uint32_t nargs,
     return status == 0 ? RT_STAGE_OK : RT_STAGE_ERROR;
 }
 
+/*
+ * Host implementation of the local.adjustments node.
+ *
+ * A refused or unsupported configuration arrives here because the device
+ * queue falls back to the compiled program. The builtin runs the extracted
+ * host block through the call-site context, so the result is the CPU result
+ * and the runtime records impl=host. Device recursion is disabled for the
+ * duration: the host block must not re-enter this node.
+ */
+RtStageStatus local_adjustments_execute(const RtStageArg* args,
+                                        uint32_t nargs,
+                                        RtStageProfiling* profiling)
+{
+    (void)profiling;
+
+    constexpr uint32_t ARG_COUNT = 3;
+    if (nargs != ARG_COUNT || args[0].kind != RT_STAGE_ARG_BUFFER ||
+        args[1].kind != RT_STAGE_ARG_PTR ||
+        args[2].kind != RT_STAGE_ARG_INT) {
+        return RT_STAGE_INVALID;
+    }
+
+    RtStageBuffer lab = args[0].u.buffer;
+    if (!valid(lab) || lab.format != RT_STAGE_F32 || lab.planes != 3) {
+        return RT_STAGE_INVALID;
+    }
+
+    const std::int64_t supported = args[2].u.i;
+    if (supported != 0 && supported != 1) {
+        return RT_STAGE_INVALID;
+    }
+
+    RtLocalAdjustmentsContext* context =
+        const_cast<RtLocalAdjustmentsContext*>(
+            static_cast<const RtLocalAdjustmentsContext*>(args[1].u.ptr));
+    if (context == nullptr ||
+        context->size != sizeof(RtLocalAdjustmentsContext) ||
+        context->version != RT_LOCAL_ADJUSTMENTS_CONTEXT_VERSION ||
+        context->magic != RT_LOCAL_ADJUSTMENTS_CONTEXT_MAGIC ||
+        context->run_host == nullptr) {
+        return RT_STAGE_INVALID;
+    }
+
+    const bool allowed = opencl_stage_allowed();
+    set_opencl_stage_allowed(false);
+    const int status = context->run_host(context->self, &lab);
+    set_opencl_stage_allowed(allowed);
+    return status == 0 ? RT_STAGE_OK : RT_STAGE_ERROR;
+}
+
 } // namespace
 
 void register_builtin_stages(StageCompiler& compiler)
@@ -285,6 +336,7 @@ void register_builtin_stages(StageCompiler& compiler)
     compiler.register_builtin("working.trc", &working_trc_execute);
     compiler.register_builtin("lab.tools", &lab_tools_execute);
     compiler.register_builtin("lab.wavelet", &lab_wavelet_execute);
+    compiler.register_builtin("local.adjustments", &local_adjustments_execute);
 }
 
 } // namespace rtengine::stage

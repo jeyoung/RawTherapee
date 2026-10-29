@@ -68,6 +68,7 @@ class NoiseCurve;
 class OpacityCurve;
 class PipetteBuffer;
 class ToneCurve;
+struct LocalAdjustmentsSpotParams;
 class WavCurve;
 class Wavblcurve;
 class WavOpacityCurveBY;
@@ -400,6 +401,14 @@ enum class BlurType {
     void mean_sig (const float* const * const savenormL, float &meanf, float &stdf, int xStart, int xEnd, int yStart, int yEnd) const;
 
     void calc_ref(int sp, LabImage* original, LabImage* transformed, int cx, int cy, int oW, int oH, int sk, double &huerefblur, double &chromarefblur, double &lumarefblur, double &hueref, double &chromaref, double &lumaref, double &sobelref, float &avg, const LocwavCurve & locwavCurveden, bool locwavdenutili);
+    /*
+     * The narrow per-spot interface the local.adjustments stage context reads.
+     * It calls the block's own calcLocalParams() with the export call site's
+     * arguments, so the geometry, transition and deltaE values are the ones
+     * Lab_Local() will use rather than a second derivation.
+     */
+    void localAdjustmentsSpotParams(int sp, int oW, int oH,
+                                    LocalAdjustmentsSpotParams& out) const;
     void copy_ref(LabImage* spotbuffer, LabImage* original, LabImage* transformed, int cx, int cy, int sk, const struct local_params & lp, double &huerefspot, double &chromarefspot, double &lumarefspot);
     void paste_ref(LabImage* spotbuffer, LabImage* transformed, int cx, int cy, int sk, const struct local_params & lp);
     void Lab_Local(int call, int sp, float** shbuffer, LabImage* original, LabImage* transformed, LabImage* reserved, LabImage * savenormtm, LabImage * savenormreti, LabImage* lastorig, int fw, int fh,  int cx, int cy, int oW, int oH, int tX, int tY, int tW, int tH, int sk, const LocretigainCurve& locRETgainCcurve, const LocretitransCurve &locRETtransCcurve,

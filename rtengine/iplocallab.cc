@@ -24,6 +24,7 @@
 #include <fftw3.h>
 
 #include "improcfun.h"
+#include "localadjustments.h"
 #include "colortemp.h"
 #include "curves.h"
 #include "gauss.h"
@@ -9117,6 +9118,52 @@ void ImProcFunctions::InverseColorLight_Local(bool tonequ, bool tonecurv, int sp
             }
         }
     }
+}
+
+void ImProcFunctions::localAdjustmentsSpotParams(
+    int sp, int oW, int oH, LocalAdjustmentsSpotParams& out) const
+{
+    /*
+     * The export call site passes no mask selector and no previous-deltaE
+     * flag to Lab_Local(), so the same arguments are used here. The wavelet
+     * denoise curve is only read by tools outside the supported set; an empty
+     * curve makes calcLocalParams() take the same branches as the export.
+     */
+    struct local_params lp;
+    LocwavCurve noDenoiseCurve;
+    calcLocalParams(sp, oW, oH, params->locallab, lp, false,
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    noDenoiseCurve, false);
+
+    out.xc = lp.xc;
+    out.yc = lp.yc;
+    out.lx = lp.lx;
+    out.ly = lp.ly;
+    out.lxL = lp.lxL;
+    out.lyT = lp.lyT;
+    out.trans = lp.trans;
+    out.transweak = lp.transweak;
+    out.transgrad = lp.transgrad;
+    out.rad = lp.rad;
+    out.cir = lp.cir;
+    out.chro = lp.chro;
+    out.cont = lp.cont;
+    out.ligh = lp.ligh;
+    out.struco = lp.struco;
+    out.sens = lp.sens;
+    out.thr = lp.thr;
+    out.iterat = lp.iterat;
+    out.balance = lp.balance;
+    out.balanceh = lp.balanceh;
+    out.blurcol = lp.blurcol;
+    out.shapmet = lp.shapmet;
+    out.qualcurvemet = lp.qualcurvemet;
+    out.mergemet = lp.mergemet;
+    out.activspot = lp.activspot;
+    out.colorena = lp.colorena;
+    out.islocal = lp.islocal;
+    out.deltaem = lp.deltaem;
+    out.blwh = lp.blwh;
 }
 
 void ImProcFunctions::calc_ref(int sp, LabImage * original, LabImage * transformed, int cx, int cy, int oW, int oH, int sk, double & huerefblur, double & chromarefblur, double & lumarefblur, double & hueref, double & chromaref, double & lumaref, double & sobelref, float & avg, const LocwavCurve & locwavCurveden, bool locwavdenutili)

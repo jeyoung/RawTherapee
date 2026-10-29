@@ -65,6 +65,7 @@
 #include "stage/algorithms/working_trc_cl.h"
 #include "stage/lab_tools_context.h"
 #include "stage/lab_wavelet_context.h"
+#include "stage/local_adjustments_context.h"
 #include "stage/working_trc_context.h"
 
 #include "cplx_wavelet_filter_coeffs.h"
@@ -7925,6 +7926,60 @@ RtStageStatus run_sharpen(const std::shared_ptr<OpenCLEnv>& env,
     return RT_STAGE_OK;
 }
 
+/*
+ * The local.adjustments node is registered so the refusal is visible in the
+ * runtime record rather than silently bypassing it: the launcher validates the
+ * ABI, then refuses before it touches the Lab buffer, and the compiled builtin
+ * runs the extracted host block with impl=host.
+ *
+ * The colour-only kernel set is not part of this change. calc_ref() for spot N
+ * needs the Lab result of spot N-1, so a faithful device block must read the
+ * buffer back between spots; the clamp and Munsell passes are also still to
+ * port. Until they land both the supported and the residual request refuse.
+ */
+RtStageStatus validate_local_adjustments(const std::vector<RtStageArg>& args,
+                                         std::string& error)
+{
+    constexpr std::size_t ARG_COUNT = 3;
+
+    if (args.size() != ARG_COUNT) {
+        error = "local.adjustments expects a Lab buffer, a context and a "
+                "support flag";
+        return RT_STAGE_INVALID;
+    }
+    if (args[0].kind != RT_STAGE_ARG_BUFFER ||
+        args[1].kind != RT_STAGE_ARG_PTR ||
+        args[2].kind != RT_STAGE_ARG_INT) {
+        error = "local.adjustments has an argument of the wrong kind";
+        return RT_STAGE_INVALID;
+    }
+    const RtStageBuffer& lab = args[0].u.buffer;
+    if (!valid(lab) || lab.format != RT_STAGE_F32 || lab.planes != 3) {
+        error = "local.adjustments needs a three-plane F32 Lab buffer";
+        return RT_STAGE_INVALID;
+    }
+    const RtLocalAdjustmentsContext* context =
+        static_cast<const RtLocalAdjustmentsContext*>(args[1].u.ptr);
+    if (context == nullptr ||
+        context->size != sizeof(RtLocalAdjustmentsContext) ||
+        context->version != RT_LOCAL_ADJUSTMENTS_CONTEXT_VERSION ||
+        context->magic != RT_LOCAL_ADJUSTMENTS_CONTEXT_MAGIC ||
+        context->build == nullptr || context->run_host == nullptr) {
+        error = "local.adjustments has an invalid host context";
+        return RT_STAGE_INVALID;
+    }
+    if (args[2].u.i != 0 && args[2].u.i != 1) {
+        error = "local.adjustments support flag must be 0 or 1";
+        return RT_STAGE_INVALID;
+    }
+    if (lab.row_pitch % sizeof(float) != 0 ||
+        lab.plane_pitch < lab.row_pitch * static_cast<std::size_t>(lab.height)) {
+        error = "local.adjustments Lab buffer pitch does not cover the image";
+        return RT_STAGE_INVALID;
+    }
+    return RT_STAGE_OK;
+}
+
 class OpenCLStageQueue final : public StageQueue
 {
 public:
@@ -7960,12 +8015,41 @@ public:
     StageEvent submit(const StageRequest& request,
                       RtStageProfiling* profiling) override
     {
-        if (find_kernel(request.name) == nullptr || !request.impl.empty()) {
+        if (!request.impl.empty()) {
             StageEvent event = StageQueue::submit(request, profiling);
-            event.note = request.impl.empty()
-                             ? "no OpenCL implementation for stage '" +
-                                   request.name + "'"
-                             : "an explicit implementation is a host program";
+            event.note = "an explicit implementation is a host program";
+            return event;
+        }
+
+        if (request.name == "local.adjustments") {
+            std::string error;
+            const RtStageStatus status =
+                validate_local_adjustments(request.args, error);
+            if (status != RT_STAGE_OK) {
+                StageEvent failed;
+                failed.status = StageEventStatus::Failed;
+                failed.result = status;
+                failed.device = StageDeviceType::NONE;
+                failed.note = error;
+                return failed;
+            }
+            /*
+             * No colour-only kernel is registered yet. The host queue runs
+             * the builtin, so the record says impl=host rather than claiming
+             * a device pass that never ran.
+             */
+            StageEvent fallback = StageQueue::submit(request, profiling);
+            fallback.note =
+                request.args[2].u.i != 0
+                    ? "local.adjustments colour-only kernel is not implemented"
+                    : "local.adjustments residual";
+            return fallback;
+        }
+
+        if (find_kernel(request.name) == nullptr) {
+            StageEvent event = StageQueue::submit(request, profiling);
+            event.note = "no OpenCL implementation for stage '" +
+                         request.name + "'";
             return event;
         }
 
@@ -8273,12 +8357,16 @@ std::vector<std::string> opencl_stage_nodes()
     for (const KernelDef& def : kernels()) {
         names.emplace_back(def.name);
     }
+    /* The local.adjustments node validates and then refuses until its kernel
+     * set lands; it is still a device node because the refusal is part of the
+     * runtime's record, not a silent host bypass. */
+    names.emplace_back("local.adjustments");
     return names;
 }
 
 bool has_opencl_stage_node(const std::string& name)
 {
-    return find_kernel(name) != nullptr;
+    return name == "local.adjustments" || find_kernel(name) != nullptr;
 }
 
 StageDeviceType OpenCLStageDevice::type() const
