@@ -238,6 +238,14 @@ quick() {
         "$ROOT/devnotes/opencl/pp3/working-trc.pp3" working.trc
     run_stage_host "pef/stage-host-working-trc-residual" \
         "$ROOT/devnotes/opencl/pp3/working-trc-residual.pp3" working.trc
+    run_stage_device "pef/stage-device-lab-tools-sh" \
+        "$ROOT/devnotes/opencl/pp3/labtools-sh.pp3" lab.tools
+    run_stage_device "pef/stage-device-lab-tools-sh-rgb" \
+        "$ROOT/devnotes/opencl/pp3/labtools-sh-rgb.pp3" lab.tools
+    run_stage_device "pef/stage-device-lab-tools-labgrid" \
+        "$ROOT/devnotes/opencl/pp3/labtools-labgrid.pp3" lab.tools
+    run_stage_host "pef/stage-host-lab-tools-residual" \
+        "$ROOT/devnotes/opencl/pp3/labtools-residual.pp3" lab.tools
 }
 
 stage() {
@@ -519,6 +527,14 @@ stage_device() {
         "$ROOT/devnotes/opencl/pp3/working-trc.pp3" working.trc
     run_stage_host "pef/stage-host-working-trc-residual" \
         "$ROOT/devnotes/opencl/pp3/working-trc-residual.pp3" working.trc
+    run_stage_device "pef/stage-device-lab-tools-sh" \
+        "$ROOT/devnotes/opencl/pp3/labtools-sh.pp3" lab.tools
+    run_stage_device "pef/stage-device-lab-tools-sh-rgb" \
+        "$ROOT/devnotes/opencl/pp3/labtools-sh-rgb.pp3" lab.tools
+    run_stage_device "pef/stage-device-lab-tools-labgrid" \
+        "$ROOT/devnotes/opencl/pp3/labtools-labgrid.pp3" lab.tools
+    run_stage_host "pef/stage-host-lab-tools-residual" \
+        "$ROOT/devnotes/opencl/pp3/labtools-residual.pp3" lab.tools
 }
 
 rgbproc() {

@@ -1,0 +1,8 @@
+[Shadows & Highlights]
+Enabled=true
+Highlights=50
+HighlightTonalWidth=50
+Shadows=50
+ShadowTonalWidth=50
+Radius=40
+Lab=true

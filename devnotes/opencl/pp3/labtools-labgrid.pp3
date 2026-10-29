@@ -1,0 +1,7 @@
+[ColorToning]
+Enabled=true
+Method=LabGrid
+LabGridALow=-30
+LabGridAHigh=25
+LabGridBLow=15
+LabGridBHigh=40

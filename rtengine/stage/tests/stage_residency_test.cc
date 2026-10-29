@@ -26,6 +26,7 @@
 #include "utils.h"
 #include "stage/algorithms/gamut_cl.h"
 #include "stage/algorithms/sharpen_cl.h"
+#include "stage/lab_tools_context.h"
 #include "stage/working_trc_context.h"
 
 #include "sharpen_core.h"
@@ -3581,6 +3582,608 @@ void test_output_sharpen(bool available)
     }
 }
 
+/* -------------------------------------------------------------- lab.tools */
+
+/*
+ * The LUT instances the export ImageProcessor holds. stage_rgb_proc() sizes
+ * them before lab.tools runs, so the test starts from the same sizes.
+ */
+struct LabToolsHostState {
+    LUTu hist16;
+    LUTf lumacurve;
+    LUTu dummy;
+    LUTf clcurve;
+    LUTf curve1;
+    LUTf curve2;
+    LUTf satcurve;
+    LUTf lhskcurve;
+    bool autili = false;
+    bool butili = false;
+
+    LabToolsHostState()
+    {
+        lumacurve(32770, 0);
+        curve1(65536);
+        curve2(65536);
+        satcurve(65536, 0);
+        lhskcurve(65536, 0);
+        clcurve(65536, 0);
+    }
+
+    LabToolsLuts luts()
+    {
+        return {&hist16,  &lumacurve, &dummy,    &clcurve,
+                &curve1,  &curve2,   &satcurve, &lhskcurve};
+    }
+};
+
+/*
+ * A Lab image that exercises the block: L covers 0..32767 with a smooth ramp
+ * plus a large-scale structure so the tonal-width threshold crosses, and a, b
+ * span the block's working range including values that force the Lab-to-RGB
+ * round trip out of gamut. A few samples sit outside 0..32767 to exercise the
+ * blend's range guard.
+ */
+void fill_lab_tools(LabImage& lab, unsigned seed)
+{
+    const int width = lab.W;
+    const int height = lab.H;
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            const unsigned hash =
+                (seed * 2654435761u + static_cast<unsigned>(x) * 2246822519u +
+                 static_cast<unsigned>(y) * 3266489917u) >>
+                8;
+            const unsigned cell = (hash ^ (hash >> 13)) % 4096u;
+            float l = 32768.f * static_cast<float>(cell) / 4096.f;
+            if ((hash % 97u) == 0u) {
+                l = 32768.f + 2000.f; /* above the blend's upper guard */
+            } else if ((hash % 89u) == 0u) {
+                l = -500.f; /* below the blend's lower guard */
+            }
+            lab.L[y][x] = l;
+            const int a = static_cast<int>(hash % 40000u) - 20000;
+            const int b = static_cast<int>((hash / 7u) % 40000u) - 20000;
+            lab.a[y][x] = static_cast<float>(a);
+            lab.b[y][x] = static_cast<float>(b);
+        }
+    }
+}
+
+struct LabToolsCase {
+    const char* label;
+    int width;
+    int height;
+    bool labgrid;
+    bool shadowsHighlights;
+    bool labMode;
+    int highlights;
+    int shadows;
+    int htonalwidth;
+    int stonalwidth;
+    int radius;
+};
+
+struct LabToolsRun {
+    bool supported = false;
+    bool deviceReady = false;
+    RtStageStatus status = RT_STAGE_INVALID;
+};
+
+/*
+ * The call site's submission, reproduced for one image: build the host setup,
+ * fill the ABI, and run the node with the device selected.
+ */
+LabToolsRun run_lab_tools_node(LabImage& image,
+                               const rtengine::procparams::ProcParams& params,
+                               LabToolsHostState& host,
+                               rtengine::ImProcFunctions& ipf,
+                               const std::string& profile_path)
+{
+    using namespace rtengine::stage;
+
+    LabToolsRun result;
+    result.supported = labToolsSupported(params);
+
+    LabToolsLuts luts = host.luts();
+    LabToolsContext context(params, ipf, luts, host.autili, host.butili);
+    RtLabToolsResult setup{};
+    const bool deviceReady = result.supported && context.build(setup) == 0;
+    result.deviceReady = deviceReady;
+    RtLabToolsContext descriptor = context.descriptor(deviceReady);
+
+    RtStageArg args[22] = {};
+    args[0].kind = RT_STAGE_ARG_BUFFER;
+    args[0].u.buffer = view(image);
+    args[1].kind = RT_STAGE_ARG_PTR;
+    args[1].u.ptr = &descriptor;
+    args[2].kind = RT_STAGE_ARG_INT;
+    args[2].u.i = deviceReady ? 1 : 0;
+    args[3].kind = RT_STAGE_ARG_INT;
+    args[3].u.i = (params.colorToning.enabled &&
+                   params.colorToning.method == "LabGrid")
+                      ? 1
+                      : 0;
+    for (int index = 0; index < 4; ++index) {
+        args[4 + index].kind = RT_STAGE_ARG_DOUBLE;
+        args[4 + index].u.f = deviceReady ? setup.labgrid[index] : 0.0;
+    }
+    args[8].kind = RT_STAGE_ARG_INT;
+    args[8].u.i = params.sh.enabled ? 1 : 0;
+    args[9].kind = RT_STAGE_ARG_INT;
+    args[9].u.i = params.sh.highlights;
+    args[10].kind = RT_STAGE_ARG_INT;
+    args[10].u.i = params.sh.shadows;
+    args[11].kind = RT_STAGE_ARG_INT;
+    args[11].u.i = params.sh.htonalwidth;
+    args[12].kind = RT_STAGE_ARG_INT;
+    args[12].u.i = params.sh.stonalwidth;
+    args[13].kind = RT_STAGE_ARG_INT;
+    args[13].u.i = params.sh.radius;
+    args[14].kind = RT_STAGE_ARG_INT;
+    args[14].u.i = params.sh.lab ? 1 : 0;
+    args[15].kind = RT_STAGE_ARG_INT;
+    args[15].u.i = LAB_TOOLS_EXPORT_SCALE;
+
+    for (int index = 16; index < 22; ++index) {
+        args[index].kind = RT_STAGE_ARG_BUFFER;
+    }
+    if (deviceReady) {
+        const auto host_buffer = [](const float* data, int width) {
+            RtStageBuffer buffer{};
+            buffer.size = sizeof(RtStageBuffer);
+            buffer.data = const_cast<float*>(data);
+            buffer.width = width;
+            buffer.height = 1;
+            buffer.row_pitch = static_cast<std::size_t>(width) * sizeof(float);
+            buffer.plane_pitch = buffer.row_pitch;
+            buffer.planes = 1;
+            buffer.format = RT_STAGE_F32;
+            buffer.flags = RT_STAGE_BUFFER_READ;
+            return buffer;
+        };
+        args[16].u.buffer = host_buffer(
+            setup.lut_highlight, static_cast<int>(setup.lut_entries));
+        args[17].u.buffer = host_buffer(
+            setup.lut_shadow, static_cast<int>(setup.lut_entries));
+        args[18].u.buffer = host_buffer(setup.ws, 9);
+        args[19].u.buffer = host_buffer(setup.iws, 9);
+        args[20].u.buffer = host_buffer(
+            setup.cachef, static_cast<int>(RT_LAB_TOOLS_CACHE_ENTRIES));
+        args[21].u.buffer = host_buffer(
+            setup.cachefy, static_cast<int>(RT_LAB_TOOLS_CACHE_ENTRIES));
+    }
+
+    std::remove(profile_path.c_str());
+    setenv("RT_STAGE_PROFILE", profile_path.c_str(), 1);
+    set_node_device_override("lab.tools", StageNodeDevice::OpenCL);
+    result.status =
+        run("lab.tools", std::vector<RtStageArg>(args, args + 22));
+    clear_node_device_overrides();
+    unsetenv("RT_STAGE_PROFILE");
+    return result;
+}
+
+/*
+ * The lab.tools node against the production block.
+ *
+ * The supported cases run the two device tools; the residual cases - each an
+ * otherwise supported profile with one more tool switched on - must be
+ * refused by the launcher, run the builtin and match the block bit for bit.
+ */
+void test_lab_tools(bool available)
+{
+    using namespace rtengine::stage;
+
+    /* Color::init() fills the Lab caches, the Munsell tables the vibrance
+     * residual reads and the gamma tables the block's curves use. */
+    static MyMutex lab_tools_lcms_mutex;
+    if (rtengine::lcmsMutex == nullptr) {
+        rtengine::lcmsMutex = &lab_tools_lcms_mutex;
+    }
+    static rtengine::Settings lab_tools_settings{};
+    rtengine::settings = &lab_tools_settings;
+    rtengine::Color::init();
+
+    {
+        rtengine::procparams::ProcParams defaults;
+        check(!labToolsSupported(defaults),
+              "lab.tools refuses the default profile (no tool enabled)");
+    }
+
+    const std::string profile_path =
+        std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp") +
+        "/stage-residency-lab-tools.jsonl";
+
+    if (!available) {
+        skip("lab.tools: no OpenCL device");
+        return;
+    }
+    check(node_has_device_implementation("lab.tools"),
+          "the lab.tools node has a device implementation");
+
+    const LabToolsCase cases[] = {
+        /* label, w, h, labgrid, sh, lab mode, hi, sh, htonal, stonal, radius */
+        {"LabGrid only", 238, 64, true, false, true, 0, 0, 50, 50, 10},
+        {"shadows/highlights Lab mode", 238, 64, false, true, true, 50, 50, 50, 50, 10},
+        {"shadows/highlights RGB mode", 238, 64, false, true, false, 50, 50, 50, 50, 10},
+        {"both tools Lab mode", 238, 64, true, true, true, 50, 50, 50, 50, 10},
+        {"both tools RGB mode", 179, 48, true, true, false, 50, 50, 50, 50, 10},
+        {"highlight only", 238, 64, false, true, true, 100, 0, 50, 50, 10},
+        {"shadow only", 238, 64, false, true, true, 0, 100, 50, 50, 10},
+        {"amount 1", 238, 64, false, true, true, 1, 1, 50, 50, 10},
+        {"amount 50", 238, 64, false, true, true, 50, 50, 50, 50, 10},
+        {"amount 200", 238, 64, false, true, true, 200, 200, 50, 50, 10},
+        {"amount 1000", 238, 64, false, true, true, 1000, 1000, 50, 50, 10},
+        {"tonalwidth 0", 238, 64, false, true, true, 100, 100, 0, 0, 10},
+        {"tonalwidth 100", 238, 64, false, true, true, 100, 100, 100, 100, 10},
+        {"tonalwidth split", 238, 64, false, true, true, 100, 100, 0, 100, 10},
+        {"radius 1", 238, 64, false, true, true, 100, 100, 50, 50, 1},
+        {"radius 10", 238, 64, false, true, true, 100, 100, 50, 50, 10},
+        {"radius 100", 238, 64, false, true, true, 100, 100, 50, 50, 100},
+        {"padded width 179", 179, 48, false, true, true, 100, 100, 50, 50, 10},
+        {"padded width 238 RGB", 238, 64, false, true, false, 100, 100, 50, 50, 100},
+        {"RGB highlight only", 238, 64, false, true, false, 50, 0, 50, 50, 10},
+        {"RGB shadow only", 238, 64, false, true, false, 0, 50, 50, 50, 10},
+        {"amount 100 RGB mode", 238, 64, false, true, false, 100, 100, 50, 50, 10},
+        {"large width 8192", 8192, 64, false, true, true, 100, 100, 50, 50, 40},
+    };
+
+    unsigned seed = 1u;
+    for (const LabToolsCase& item : cases) {
+        rtengine::procparams::ProcParams params;
+        params.colorToning.enabled = item.labgrid;
+        params.colorToning.method = "LabGrid";
+        params.colorToning.labgridALow = -40.0;
+        params.colorToning.labgridAHigh = 25.0;
+        params.colorToning.labgridBLow = 12.0;
+        params.colorToning.labgridBHigh = 55.0;
+        params.sh.enabled = item.shadowsHighlights;
+        params.sh.lab = item.labMode;
+        params.sh.highlights = item.highlights;
+        params.sh.shadows = item.shadows;
+        params.sh.htonalwidth = item.htonalwidth;
+        params.sh.stonalwidth = item.stonalwidth;
+        params.sh.radius = item.radius;
+
+        check(labToolsSupported(params),
+              (std::string("lab.tools ") + item.label +
+               " is the supported set").c_str());
+
+        LabImage source(item.width, item.height);
+        fill_lab_tools(source, seed++);
+
+        rtengine::ImProcFunctions cpu_ipf(&params, false);
+        LabToolsHostState cpu_host;
+        LabImage cpu(item.width, item.height);
+        cpu.CopyFrom(&source);
+        LabToolsLuts cpu_luts = cpu_host.luts();
+        labToolsHostBlock(cpu_ipf, params, cpu, cpu_luts, cpu_host.autili,
+                          cpu_host.butili);
+
+        rtengine::ImProcFunctions device_ipf(&params, false);
+        LabToolsHostState device_host;
+        LabImage device(item.width, item.height);
+        device.CopyFrom(&source);
+        const LabToolsRun result =
+            run_lab_tools_node(device, params, device_host, device_ipf,
+                               profile_path);
+        const std::string profile = read_file(profile_path);
+
+        check(result.supported,
+              (std::string("lab.tools ") + item.label +
+               " resolves to the supported set").c_str());
+        check(result.deviceReady,
+              (std::string("lab.tools ") + item.label +
+               " builds its host setup").c_str());
+        check(result.status == RT_STAGE_OK,
+              (std::string("lab.tools ") + item.label +
+               " completes through run()").c_str());
+        check(profile.find("\"stage\":\"lab.tools\"") != std::string::npos,
+              (std::string("lab.tools ") + item.label +
+               " records the node").c_str());
+        check(profile.find("\"impl\":\"opencl\"") != std::string::npos,
+              (std::string("lab.tools ") + item.label +
+               " records a device execution").c_str());
+
+        const Diff diff = compare(view(device), view(cpu));
+        std::printf("stage-residency: lab.tools %s %dx%d: PAE %.6f LSB16, "
+                    "%zu of %zu samples differ\n",
+                    item.label, item.width, item.height, diff.max_abs,
+                    diff.differing, diff.samples);
+        check(diff.finite,
+              (std::string("lab.tools ") + item.label +
+               " stays finite").c_str());
+        check(diff.max_abs <= 1.0,
+              (std::string("lab.tools ") + item.label +
+               " is within one LSB16").c_str());
+    }
+
+    /*
+     * Residuals: an otherwise supported profile plus one tool the node does
+     * not implement. The launcher must refuse it, the builtin must run the
+     * block, and the result must be the block's own output.
+     */
+    const char* residual_labels[] = {
+        "vibrance", "Lab curves", "local contrast", "EPD", "Lab regions",
+        "black and white"};
+    for (const char* label : residual_labels) {
+        rtengine::procparams::ProcParams params;
+        params.sh.enabled = true;
+        params.sh.lab = true;
+        params.sh.highlights = 60;
+        params.sh.shadows = 60;
+        params.sh.htonalwidth = 40;
+        params.sh.stonalwidth = 40;
+        params.sh.radius = 10;
+
+        if (std::strcmp(label, "vibrance") == 0) {
+            params.vibrance.enabled = true;
+            params.vibrance.pastels = 50;
+            params.vibrance.saturated = 30;
+        } else if (std::strcmp(label, "Lab curves") == 0) {
+            params.labCurve.enabled = true;
+            params.labCurve.lcurve = {
+                static_cast<double>(FCT_MinMaxCPoints),
+                0.0, 0.0, 0.0, 0.0,
+                0.5, 0.6, 0.0, 0.0,
+                1.0, 1.0, 0.0, 0.0};
+        } else if (std::strcmp(label, "local contrast") == 0) {
+            params.localContrast.enabled = true;
+            params.localContrast.radius = 20;
+            params.localContrast.amount = 30;
+        } else if (std::strcmp(label, "EPD") == 0) {
+            params.epd.enabled = true;
+            params.epd.strength = 0.5;
+            params.epd.gamma = 1.0;
+        } else if (std::strcmp(label, "Lab regions") == 0) {
+            params.colorToning.enabled = true;
+            params.colorToning.method = "LabRegions";
+            rtengine::procparams::ColorToningParams::LabCorrectionRegion
+                region;
+            region.a = 10.0;
+            region.b = -8.0;
+            region.saturation = 30.0;
+            region.slope = 1.0;
+            region.offset = 0.0;
+            region.power = 1.0;
+            region.maskBlur = 0.4;
+            region.channel = rtengine::procparams::ColorToningParams::
+                LabCorrectionRegion::CHAN_ALL;
+            params.colorToning.labregions.push_back(region);
+        } else {
+            params.blackwhite.enabled = true;
+        }
+
+        check(!labToolsSupported(params),
+              (std::string("lab.tools ") + label +
+               " is a residual").c_str());
+
+        LabImage source(179, 48);
+        fill_lab_tools(source, seed++);
+
+        rtengine::ImProcFunctions cpu_ipf(&params, false);
+        LabToolsHostState cpu_host;
+        LabImage cpu(179, 48);
+        cpu.CopyFrom(&source);
+        LabToolsLuts cpu_luts = cpu_host.luts();
+        labToolsHostBlock(cpu_ipf, params, cpu, cpu_luts, cpu_host.autili,
+                          cpu_host.butili);
+
+        rtengine::ImProcFunctions device_ipf(&params, false);
+        LabToolsHostState device_host;
+        LabImage device(179, 48);
+        device.CopyFrom(&source);
+        const LabToolsRun result =
+            run_lab_tools_node(device, params, device_host, device_ipf,
+                               profile_path);
+        const std::string profile = read_file(profile_path);
+
+        check(!result.supported,
+              (std::string("lab.tools ") + label +
+               " is refused as a device configuration").c_str());
+        check(!result.deviceReady,
+              (std::string("lab.tools ") + label +
+               " does not build a device setup").c_str());
+        check(result.status == RT_STAGE_OK,
+              (std::string("lab.tools ") + label +
+               " completes through run()").c_str());
+        check(profile.find("\"stage\":\"lab.tools\"") != std::string::npos,
+              (std::string("lab.tools ") + label +
+               " records the node").c_str());
+        check(profile.find("\"impl\":\"host\"") != std::string::npos,
+              (std::string("lab.tools ") + label +
+               " records a host execution").c_str());
+        check(profile.find("\"impl\":\"opencl\"") == std::string::npos,
+              (std::string("lab.tools ") + label +
+               " never mixes a device pass").c_str());
+
+        const Diff diff = compare(view(device), view(cpu));
+        std::printf("stage-residency: lab.tools residual %s: host, "
+                    "PAE %.6f LSB16, %zu of %zu samples differ\n",
+                    label, diff.max_abs, diff.differing, diff.samples);
+        check(diff.finite,
+              (std::string("lab.tools ") + label +
+               " stays finite").c_str());
+        check(diff.differing == 0 && diff.max_abs == 0.0,
+              (std::string("lab.tools ") + label +
+               " matches the CPU block").c_str());
+    }
+
+    /*
+     * RGB mode refuses a tone table whose steepest step, times one ulp of a
+     * 16-bit channel, can exceed one LSB16. Such a table needs a hand-edited
+     * amount above the 0..100 slider range; the setup refuses it and the
+     * builtin runs the block.
+     */
+    for (int amount : {200, 1000}) {
+        rtengine::procparams::ProcParams params;
+        params.sh.enabled = true;
+        params.sh.lab = false;
+        params.sh.highlights = amount;
+        params.sh.shadows = amount;
+        params.sh.htonalwidth = 50;
+        params.sh.stonalwidth = 50;
+        params.sh.radius = 10;
+
+        LabImage source(179, 48);
+        fill_lab_tools(source, seed++);
+
+        rtengine::ImProcFunctions cpu_ipf(&params, false);
+        LabToolsHostState cpu_host;
+        LabToolsLuts cpu_luts = cpu_host.luts();
+        LabImage cpu(179, 48);
+        cpu.CopyFrom(&source);
+        labToolsHostBlock(cpu_ipf, params, cpu, cpu_luts, cpu_host.autili,
+                          cpu_host.butili);
+
+        rtengine::ImProcFunctions device_ipf(&params, false);
+        LabToolsHostState device_host;
+        LabImage device(179, 48);
+        device.CopyFrom(&source);
+        const LabToolsRun result =
+            run_lab_tools_node(device, params, device_host, device_ipf,
+                               profile_path);
+        const std::string profile = read_file(profile_path);
+
+        check(result.supported,
+              (std::string("lab.tools RGB amount ") + std::to_string(amount) +
+               " is inside the predicate").c_str());
+        check(!result.deviceReady,
+              (std::string("lab.tools RGB amount ") + std::to_string(amount) +
+               " refuses the steep tone table").c_str());
+        check(result.status == RT_STAGE_OK,
+              (std::string("lab.tools RGB amount ") + std::to_string(amount) +
+               " completes through run()").c_str());
+        check(profile.find("\"impl\":\"host\"") != std::string::npos,
+              (std::string("lab.tools RGB amount ") + std::to_string(amount) +
+               " records a host execution").c_str());
+        check(profile.find("\"impl\":\"opencl\"") == std::string::npos,
+              (std::string("lab.tools RGB amount ") + std::to_string(amount) +
+               " never mixes a device pass").c_str());
+        const Diff diff = compare(view(device), view(cpu));
+        std::printf("stage-residency: lab.tools RGB amount %d: refused, "
+                    "PAE %.6f LSB16, %zu of %zu samples differ\n",
+                    amount, diff.max_abs, diff.differing, diff.samples);
+        check(diff.differing == 0 && diff.max_abs == 0.0,
+              (std::string("lab.tools RGB amount ") + std::to_string(amount) +
+               " matches the CPU block").c_str());
+    }
+
+    /*
+     * A supported configuration whose setup builds but whose submission the
+     * launcher refuses must still run the builtin and record impl=host. A tone
+     * table of the wrong length is that refusal.
+     */
+    {
+        rtengine::procparams::ProcParams params;
+        params.sh.enabled = true;
+        params.sh.lab = true;
+        params.sh.highlights = 80;
+        params.sh.shadows = 80;
+        params.sh.htonalwidth = 50;
+        params.sh.stonalwidth = 50;
+        params.sh.radius = 10;
+
+        LabImage source(238, 64);
+        fill_lab_tools(source, seed++);
+
+        rtengine::ImProcFunctions cpu_ipf(&params, false);
+        LabToolsHostState cpu_host;
+        LabImage cpu(238, 64);
+        cpu.CopyFrom(&source);
+        LabToolsLuts cpu_luts = cpu_host.luts();
+        labToolsHostBlock(cpu_ipf, params, cpu, cpu_luts, cpu_host.autili,
+                          cpu_host.butili);
+
+        rtengine::ImProcFunctions device_ipf(&params, false);
+        LabToolsHostState device_host;
+        LabImage device(238, 64);
+        device.CopyFrom(&source);
+        LabToolsLuts device_luts = device_host.luts();
+        LabToolsContext context(params, device_ipf, device_luts,
+                                device_host.autili, device_host.butili);
+        RtLabToolsResult setup{};
+        check(context.build(setup) == 0, "forced fallback setup builds");
+        RtLabToolsContext descriptor = context.descriptor(true);
+
+        RtStageArg args[22] = {};
+        args[0].kind = RT_STAGE_ARG_BUFFER;
+        args[0].u.buffer = view(device);
+        args[1].kind = RT_STAGE_ARG_PTR;
+        args[1].u.ptr = &descriptor;
+        args[2].kind = RT_STAGE_ARG_INT;
+        args[2].u.i = 1;
+        args[3].kind = RT_STAGE_ARG_INT;
+        args[3].u.i = 0;
+        for (int index = 0; index < 4; ++index) {
+            args[4 + index].kind = RT_STAGE_ARG_DOUBLE;
+            args[4 + index].u.f = setup.labgrid[index];
+        }
+        args[8].kind = RT_STAGE_ARG_INT;
+        args[8].u.i = 1;
+        args[9].kind = RT_STAGE_ARG_INT;
+        args[9].u.i = params.sh.highlights;
+        args[10].kind = RT_STAGE_ARG_INT;
+        args[10].u.i = params.sh.shadows;
+        args[11].kind = RT_STAGE_ARG_INT;
+        args[11].u.i = params.sh.htonalwidth;
+        args[12].kind = RT_STAGE_ARG_INT;
+        args[12].u.i = params.sh.stonalwidth;
+        args[13].kind = RT_STAGE_ARG_INT;
+        args[13].u.i = params.sh.radius;
+        args[14].kind = RT_STAGE_ARG_INT;
+        args[14].u.i = 1;
+        args[15].kind = RT_STAGE_ARG_INT;
+        args[15].u.i = LAB_TOOLS_EXPORT_SCALE;
+        const auto host_buffer = [](const float* data, int width) {
+            RtStageBuffer buffer{};
+            buffer.size = sizeof(RtStageBuffer);
+            buffer.data = const_cast<float*>(data);
+            buffer.width = width;
+            buffer.height = 1;
+            buffer.row_pitch = static_cast<std::size_t>(width) * sizeof(float);
+            buffer.plane_pitch = buffer.row_pitch;
+            buffer.planes = 1;
+            buffer.format = RT_STAGE_F32;
+            buffer.flags = RT_STAGE_BUFFER_READ;
+            return buffer;
+        };
+        for (int index = 16; index < 22; ++index) {
+            args[index].kind = RT_STAGE_ARG_BUFFER;
+        }
+        /* Half the required length: the launcher refuses the submission. */
+        args[16].u.buffer = host_buffer(setup.lut_highlight,
+                                        static_cast<int>(setup.lut_entries) / 2);
+        args[17].u.buffer = host_buffer(setup.lut_shadow,
+                                        static_cast<int>(setup.lut_entries));
+        args[18].u.buffer = host_buffer(setup.ws, 9);
+        args[19].u.buffer = host_buffer(setup.iws, 9);
+        args[20].u.buffer = host_buffer(
+            setup.cachef, static_cast<int>(RT_LAB_TOOLS_CACHE_ENTRIES));
+        args[21].u.buffer = host_buffer(
+            setup.cachefy, static_cast<int>(RT_LAB_TOOLS_CACHE_ENTRIES));
+
+        std::remove(profile_path.c_str());
+        setenv("RT_STAGE_PROFILE", profile_path.c_str(), 1);
+        set_node_device_override("lab.tools", StageNodeDevice::OpenCL);
+        const RtStageStatus status =
+            run("lab.tools", std::vector<RtStageArg>(args, args + 22));
+        clear_node_device_overrides();
+        const std::string profile = read_file(profile_path);
+        unsetenv("RT_STAGE_PROFILE");
+
+        check(status == RT_STAGE_OK, "the forced fallback completes");
+        check(profile.find("\"impl\":\"host\"") != std::string::npos,
+              "the forced fallback records a host execution");
+        check(profile.find("\"impl\":\"opencl\"") == std::string::npos,
+              "the forced fallback never mixes a device pass");
+        const Diff diff = compare(view(device), view(cpu));
+        check(diff.differing == 0 && diff.max_abs == 0.0,
+              "the forced fallback matches the CPU block");
+    }
+}
+
 /* --------------------------------------------------------- run() wiring */
 
 void test_run_wiring(bool available)
@@ -3709,6 +4312,7 @@ int main()
     test_framing(available);
     test_gamut(available);
     test_working_trc(available);
+    test_lab_tools(available);
     test_output_sharpen(available);
     test_run_wiring(available);
 
