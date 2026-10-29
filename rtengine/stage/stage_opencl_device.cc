@@ -743,9 +743,9 @@ __kernel void rt_lab_to_float(__global const float* src,
 }
 
 /*
- * The working.trc program: four entries sharing one source because the second
- * pass consumes the first pass's device buffer and the probe runs on the host
- * between them. RT_LAB_TO_RGB_CL supplies rt_lab_to_linear() and
+ * The working.trc program: the second-pass, apsatur and RGB-to-Lab entries
+ * share one source. The host prefix (lab2rgb and the fixed sRGB inverse) runs
+ * before the node, so no device first pass exists. RT_LAB_TO_RGB_CL supplies
  * rt_gamma_lookup(); the node-specific arithmetic is in working_trc_cl.h.
  */
 const std::string& working_trc_source()
@@ -1807,10 +1807,9 @@ cl_kernel compiled_kernel_entry(const std::shared_ptr<OpenCLEnv>& env,
         return nullptr;
     }
 
-    /* The first pass divides every Lab sample by 327.68 and the host uses
-     * correctly rounded IEEE division. Without this option OpenCL may lower
-     * float division to a reciprocal approximation, which shifts the probe
-     * means and the whole profile. */
+    /* apsatur and the analytic TRC divide, and the host uses correctly
+     * rounded IEEE division. Without this option OpenCL may lower float
+     * division to a reciprocal approximation. */
     const char* build_options =
         std::strcmp(def->name, "working.trc") == 0
             ? "-cl-fp32-correctly-rounded-divide-sqrt"
@@ -2835,16 +2834,16 @@ RtStageStatus run_gamut(const std::shared_ptr<OpenCLEnv>& env,
  *   [3] double saturation (icm.wapsat),
  *   [4] int gamut control (1 when icm.gamut is set).
  *
- * The node runs the default configuration only: pass 1 writes the first-pass
- * RGB to a device scratch, the host reads it back once to run the colour probe
- * and build the matrix-shaper preset, then pass 2 consumes the same device
- * buffer. The Lab buffer is read back only after every pass succeeded, so a
+ * The device work starts at the second pass: the host prefix has already run
+ * lab2rgb, the fixed sRGB inverse, the probe/profile, toxyz and the optional
+ * gamut map. The Lab buffer is read back only after every pass succeeded, so a
  * refusal leaves the host image untouched for the builtin.
  *
- * A zero `supported` value refuses before the upload: that is the residual
- * path, and it makes the CPU builtin - the original host block - execute and
- * record impl=host. The per-pixel arguments are checked here; the context is
- * not consulted for them.
+ * A clear support flag, in either the argument or the context descriptor,
+ * refuses before the upload: that is the residual path, and it makes the CPU
+ * builtin - the original host block - execute and record impl=host. The
+ * per-pixel arguments are checked here; the context is not consulted for
+ * them.
  */
 RtStageStatus run_working_trc(const std::shared_ptr<OpenCLEnv>& env,
                               const std::shared_ptr<OpenCLResidency>& residency,
@@ -2885,8 +2884,8 @@ RtStageStatus run_working_trc(const std::shared_ptr<OpenCLEnv>& env,
         error = "working.trc support flag must be 0 or 1";
         return RT_STAGE_INVALID;
     }
-    if (supported == 0) {
-        error = "working.trc residual configuration";
+    if (supported != 1 || context->supported != 1) {
+        error = "working.trc support flag is not set";
         return RT_STAGE_FALLBACK;
     }
 

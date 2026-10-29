@@ -88,10 +88,6 @@ RtStageStatus working_trc_execute(const RtStageArg* args, uint32_t nargs,
     if (!std::isfinite(saturation) || saturation < 0.0 || saturation > 1.0) {
         return RT_STAGE_INVALID;
     }
-    const std::int64_t gamut = args[4].u.i;
-    if (gamut != 0 && gamut != 1) {
-        return RT_STAGE_INVALID;
-    }
 
     const bool allowed = opencl_stage_allowed();
     set_opencl_stage_allowed(false);

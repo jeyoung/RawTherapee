@@ -185,34 +185,29 @@ inline float rt_wt_trc_inverse(__global const float* gamma,
                                __global const float* curve,
                                const float linear)
 {
-    const int type = (int)curve[0];
     const float g = curve[1];
     const float a = curve[2];
     const float b = curve[3];
     const float c = curve[4];
     const float d = curve[5];
 
+    /* The supported profile TRC is lcms type 5 only; the context refuses the
+     * inverse type -5 curve before the node runs. */
     /* The table's inverse is exact in the TRC's linear segment, but its
      * 65536 samples cannot resolve the first few encoded codes: lcms evaluates
      * the line directly there and the two differ by more than one LSB16 on
      * dark pixels. Below the breakpoint the inverse is exactly linear / c. */
-    if (type == 5 && linear >= 0.0f && linear < c * d) {
+    if (linear >= 0.0f && linear < c * d) {
         return (linear / c) * RT_WT_MAXVAL;
     }
     if (linear >= 0.0f && linear <= 1.0f) {
         return rt_gamma_lookup(gamma, linear * RT_WT_MAXVAL);
     }
 
-    if (type == 5) {
-        /* lcms type -5: X = (Y^(1/g) - b)/a above the breakpoint, Y/c below.
-         * The forward breakpoint value is c * d. */
-        const float threshold = c * d;
-        return (linear >= threshold ? (pow(linear, 1.0f / g) - b) / a
-                                    : linear / c)
-            * RT_WT_MAXVAL;
-    }
-    /* lcms type 5: Y = (aX + b)^g above d, cX below. */
-    return (linear >= d ? pow(a * linear + b, g) : c * linear)
+    /* lcms type -5: X = (Y^(1/g) - b)/a above the breakpoint, Y/c below. */
+    const float threshold = c * d;
+    return (linear >= threshold ? (pow(linear, 1.0f / g) - b) / a
+                                : linear / c)
         * RT_WT_MAXVAL;
 }
 

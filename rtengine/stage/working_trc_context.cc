@@ -58,8 +58,8 @@ constexpr int PRIMARIES_DEFAULT =
 constexpr int ILLUMINANT_DEFAULT =
     toUnderlying(procparams::ColorManagementParams::Illuminant::DEFAULT);
 
-/* Index of the last opacity-curve sample the local-contrast switch reads. */
-constexpr int OPACITY_CURVE_SAMPLES = 500;
+/* WavOpacityCurveWL::Set() fills 501 entries (0..500). */
+constexpr int OPACITY_CURVE_ENTRIES = 501;
 /* complete_local_contrast() treats an all-0.5 curve as inactive. */
 constexpr float OPACITY_CURVE_FLAT = 0.5f;
 
@@ -139,12 +139,14 @@ bool workingTrcSupported(const procparams::ProcParams& params)
     }
 
     /* Local contrast only runs when the expander is on and the working-TRC
-     * opacity curve is not flat. */
+     * opacity curve is not flat. Scan the whole 501-entry LUT: the host test
+     * stops at 499 and misses the last entry, so a curve that changes only
+     * there must stay on the host rather than be admitted as flat. */
     if (icm.wavExp) {
         Cm colparams = icm;
         WavOpacityCurveWL curve;
         colparams.getCurves(curve);
-        for (int i = 0; i < OPACITY_CURVE_SAMPLES; ++i) {
+        for (int i = 0; i < OPACITY_CURVE_ENTRIES; ++i) {
             if (curve[i] != OPACITY_CURVE_FLAT) {
                 return false;
             }
@@ -460,9 +462,11 @@ int WorkingTrcContext::build(RtWorkingTrcResult& out)
     }
 
     if (!ready || gamma_.size() != RT_WORKING_TRC_GAMMA_ENTRIES ||
-        (curveType != 5 && curveType != -5)) {
-        /* The block only builds a type-5 parametric TRC; anything else is
-         * refused so the host builtin runs rather than an approximation. */
+        curveType != 5) {
+        /* The device path is type 5 only. A CUSTOM WorkingTRC with gamma < 1
+         * builds the inverse type -5 curve, whose steep inverse amplifies the
+         * remaining float-versus-lcms post residual through the Lab a
+         * cancellation; it is a named host residual, never an approximation. */
         return 3;
     }
     curve_[0] = static_cast<float>(curveType);

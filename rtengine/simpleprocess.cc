@@ -2340,6 +2340,7 @@ private:
              * block, which records impl=host.
              */
             descriptor.supported = deviceReady ? 1u : 0u;
+            args[2].u.i = descriptor.supported;
 
             RtStageProfiling profiling{};
             if (stage::run("working.trc",
