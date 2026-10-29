@@ -2,6 +2,7 @@
 
 #include "color.h"
 #include "curves.h"
+#include "gauss.h"
 #include "iccstore.h"
 #include "improcfun.h"
 #include "ipshadowshighlights.h"
@@ -16,6 +17,9 @@
 
 namespace rtengine::stage
 {
+
+static_assert(LAB_TOOLS_LC_DOUBLE_SIGMA == GAUSS_DOUBLE_LIMIT,
+              "the stage ABI and gauss.cc must agree on the double IIR limit");
 
 namespace
 {
@@ -64,6 +68,11 @@ bool labToolsVibranceActive(const procparams::ProcParams& params)
      */
     DiagonalCurve curve(params.vibrance.skintonescurve, CURVES_MIN_POLY_POINTS);
     return !curve.isIdentity();
+}
+
+bool labToolsLocalContrastActive(const procparams::ProcParams& params)
+{
+    return params.localContrast.enabled;
 }
 
 bool labToolsLabCurveActive(const procparams::ProcParams& params)
@@ -127,7 +136,25 @@ bool labToolsSupported(const procparams::ProcParams& params)
         }
     }
 
-    if (params.localContrast.enabled || params.epd.enabled) {
+    /*
+     * Local contrast is a device case only when its sliders are inside the
+     * ABI range. The host block always writes the L plane when the tool is
+     * enabled, so it is an active tool even with amount 0.
+     */
+    if (params.localContrast.enabled) {
+        const auto& lc = params.localContrast;
+        if (!std::isfinite(lc.amount) || !std::isfinite(lc.darkness) ||
+            !std::isfinite(lc.lightness) ||
+            lc.radius < LAB_TOOLS_LC_MIN_RADIUS ||
+            lc.radius > LAB_TOOLS_LC_MAX_RADIUS || lc.amount < 0.0 ||
+            lc.amount > LAB_TOOLS_LC_MAX_AMOUNT || lc.darkness < 0.0 ||
+            lc.darkness > LAB_TOOLS_LC_MAX_DARKNESS || lc.lightness < 0.0 ||
+            lc.lightness > LAB_TOOLS_LC_MAX_LIGHTNESS) {
+            return false;
+        }
+    }
+
+    if (params.epd.enabled) {
         return false;
     }
 
@@ -186,7 +213,8 @@ bool labToolsSupported(const procparams::ProcParams& params)
 
     return (params.colorToning.enabled &&
             params.colorToning.method == "LabGrid") ||
-           labToolsShadowsHighlightsActive(params) || vibrance ||
+           labToolsShadowsHighlightsActive(params) ||
+           labToolsLocalContrastActive(params) || vibrance ||
            labToolsLabCurveActive(params);
 }
 
@@ -627,6 +655,94 @@ int LabToolsContext::build(RtLabToolsResult& out)
         }
     }
 
+    /*
+     * Local contrast. The block calls localContrast() with fftwlc=false and
+     * scale 1 after shadows/highlights, so sigma is the block's float radius
+     * over the scale, widened for gaussianBlur()'s double parameter. The
+     * coefficients are gauss.cc's own; both the SSE and double normalisations
+     * are exported because gaussianBlur() selects between those two paths at
+     * GAUSS_DOUBLE_LIMIT.
+     */
+    local_contrast_active_ = labToolsLocalContrastActive(params_);
+    local_contrast_radius_ = static_cast<uint32_t>(params_.localContrast.radius);
+    local_contrast_scale_ =
+        static_cast<uint32_t>(LAB_TOOLS_EXPORT_SCALE);
+    local_contrast_amount_ =
+        static_cast<float>(params_.localContrast.amount);
+    local_contrast_darkness_ =
+        static_cast<float>(params_.localContrast.darkness);
+    local_contrast_lightness_ =
+        static_cast<float>(params_.localContrast.lightness);
+    if (local_contrast_active_) {
+        const auto& lc = params_.localContrast;
+        if (lc.radius < LAB_TOOLS_LC_MIN_RADIUS ||
+            lc.radius > LAB_TOOLS_LC_MAX_RADIUS || !std::isfinite(lc.amount) ||
+            !std::isfinite(lc.darkness) || !std::isfinite(lc.lightness) ||
+            lc.amount < 0.0 || lc.amount > LAB_TOOLS_LC_MAX_AMOUNT ||
+            lc.darkness < 0.0 ||
+            lc.darkness > LAB_TOOLS_LC_MAX_DARKNESS || lc.lightness < 0.0 ||
+            lc.lightness > LAB_TOOLS_LC_MAX_LIGHTNESS) {
+            return 1;
+        }
+
+        /*
+         * iplocalcontrast.cc: `float sigma = radius / scale;`. The division is
+         * double and the result narrows to float before gaussianBlur() widens
+         * it again.
+         */
+        const double scale = static_cast<double>(LAB_TOOLS_EXPORT_SCALE);
+        const double sigma = static_cast<double>(
+            static_cast<float>(static_cast<double>(lc.radius) / scale));
+        const GaussianIirCoefficients coefficients =
+            gaussianIirCoefficients(sigma);
+
+        const auto fill = [&coefficients](RtLabToolsIirDirection& direction) {
+            direction.lane[0] = static_cast<float>(coefficients.B);
+            direction.lane[1] = static_cast<float>(coefficients.b1);
+            direction.lane[2] = static_cast<float>(coefficients.b2);
+            direction.lane[3] = static_cast<float>(coefficients.b3);
+            for (int row = 0; row < 3; ++row) {
+                for (int column = 0; column < 3; ++column) {
+                    const std::size_t index =
+                        4u + static_cast<std::size_t>(row) * 3u +
+                        static_cast<std::size_t>(column);
+                    direction.lane[index] =
+                        static_cast<float>(coefficients.sse_M[row][column]);
+                    direction.border[index] = coefficients.sse_M[row][column];
+                    direction.wide[index] = coefficients.M[row][column];
+                }
+            }
+            direction.border[0] = coefficients.B;
+            direction.border[1] = coefficients.b1;
+            direction.border[2] = coefficients.b2;
+            direction.border[3] = coefficients.b3;
+            direction.wide[0] = coefficients.B;
+            direction.wide[1] = coefficients.b1;
+            direction.wide[2] = coefficients.b2;
+            direction.wide[3] = coefficients.b3;
+        };
+        local_contrast_iir_ = RtLabToolsIir{};
+        local_contrast_iir_.size = sizeof(RtLabToolsIir);
+        local_contrast_iir_.version = RT_LAB_TOOLS_IIR_VERSION;
+        local_contrast_iir_.double_path =
+            sigma >= LAB_TOOLS_LC_DOUBLE_SIGMA ? 1u : 0u;
+        fill(local_contrast_iir_.horizontal);
+        fill(local_contrast_iir_.vertical);
+
+        for (const RtLabToolsIirDirection* direction :
+             {&local_contrast_iir_.horizontal,
+              &local_contrast_iir_.vertical}) {
+            for (std::size_t index = 0; index < RT_LAB_TOOLS_IIR_TERMS;
+                 ++index) {
+                if (!std::isfinite(direction->lane[index]) ||
+                    !std::isfinite(direction->border[index]) ||
+                    !std::isfinite(direction->wide[index])) {
+                    return 1;
+                }
+            }
+        }
+    }
+
     out.labgrid = labgrid_;
     out.lut_highlight = lut_highlight_.data();
     out.lut_shadow = lut_shadow_.data();
@@ -670,6 +786,14 @@ int LabToolsContext::build(RtLabToolsResult& out)
     out.lab_curve_amount_chroma = lab_curve_amount_chroma_;
     out.lab_curve_adjust = lab_curve_adjust_;
     out.lab_curve_lcredsk = lab_curve_lcredsk_ ? 1u : 0u;
+    out.local_contrast_enabled = local_contrast_active_ ? 1u : 0u;
+    out.local_contrast_radius = local_contrast_radius_;
+    out.local_contrast_scale = local_contrast_scale_;
+    out.local_contrast_amount = local_contrast_amount_;
+    out.local_contrast_darkness = local_contrast_darkness_;
+    out.local_contrast_lightness = local_contrast_lightness_;
+    out.local_contrast_iir =
+        local_contrast_active_ ? &local_contrast_iir_ : nullptr;
     built_ = true;
     return 0;
 }

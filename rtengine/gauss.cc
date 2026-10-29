@@ -1559,3 +1559,28 @@ void gaussianBlur(float** src, float** dst, const int W, const int H, const doub
     gaussianBlurImpl<float>(src, dst, W, H, sigma, useBoxBlur, gausstype, buffer2);
 }
 
+GaussianIirCoefficients gaussianIirCoefficients(const double sigma)
+{
+    GaussianIirCoefficients out;
+    double M[3][3];
+    calculateYvVFactors<double>(sigma, out.b1, out.b2, out.b3, out.B, M);
+
+    for (int i = 0; i < 3; ++i) {
+        for (int j = 0; j < 3; ++j) {
+            /* gaussHorizontal()/gaussVertical()'s normalisation, in its own
+             * operation order. */
+            out.M[i][j] = M[i][j] /
+                          ((1.0 + out.b1 - out.b2 + out.b3) *
+                           (1.0 + out.b2 + (out.b1 - out.b3) * out.b3));
+            /* gaussHorizontalSse()/gaussVerticalSse()'s normalisation: the
+             * multiply comes first, as those functions write it. */
+            double sse = M[i][j] * (1.0 + out.b2 + (out.b1 - out.b3) * out.b3);
+            sse /= (1.0 + out.b1 - out.b2 + out.b3) *
+                   (1.0 - out.b1 - out.b2 - out.b3);
+            out.sse_M[i][j] = sse;
+        }
+    }
+
+    return out;
+}
+

@@ -53,7 +53,7 @@ struct ProcParams;
  * object that owns the ProcParams and ImProcFunctions references, so the
  * pointer must not outlive them.
  */
-#define RT_LAB_TOOLS_CONTEXT_VERSION 2u
+#define RT_LAB_TOOLS_CONTEXT_VERSION 3u
 /* "LTOC": rejects a stale or unrelated pointer before any callback runs. */
 #define RT_LAB_TOOLS_CONTEXT_MAGIC 0x4C544F43u
 /* The Lab-mode tone table: one entry per 16-bit L value (0..32767). */
@@ -81,6 +81,35 @@ struct ProcParams;
  * they need gamutLchonly() and gamutmap(). */
 #define RT_LAB_TOOLS_MUNSELL_NONE 0u
 #define RT_LAB_TOOLS_MUNSELL_MUN 4u
+/*
+ * One direction's Young-van Vliet IIR coefficients, in the three forms the
+ * host's gaussianBlur() paths use. Each array is B, b1, b2, b3 and the nine
+ * boundary-matrix entries M[0][0] .. M[2][2], in that order. See
+ * gaussianIirCoefficients() in gauss.h for the provenance.
+ */
+#define RT_LAB_TOOLS_IIR_TERMS 13u
+#define RT_LAB_TOOLS_IIR_VERSION 1u
+
+typedef struct RtLabToolsIirDirection {
+    /* The SSE float lane: B, b1, b2, b3 and sse_M narrowed to float, which is
+     * what gaussHorizontalSse()/gaussVerticalSse() feed _mm_set1_ps(). */
+    float lane[RT_LAB_TOOLS_IIR_TERMS];
+    /* The same sse_M in double, for those functions' non-vectorised tail
+     * lines, which evaluate the recurrence in double and narrow each store. */
+    double border[RT_LAB_TOOLS_IIR_TERMS];
+    /* The double-precision path at and above sigma 25, with M. */
+    double wide[RT_LAB_TOOLS_IIR_TERMS];
+} RtLabToolsIirDirection;
+
+typedef struct RtLabToolsIir {
+    uint32_t size;
+    uint32_t version;
+    /* 1 when the host's gaussianBlur() takes the double path for this sigma. */
+    uint32_t double_path;
+    uint32_t reserved;
+    RtLabToolsIirDirection horizontal;
+    RtLabToolsIirDirection vertical;
+} RtLabToolsIir;
 
 typedef struct RtLabToolsResult {
     /*
@@ -148,6 +177,19 @@ typedef struct RtLabToolsResult {
     float lab_curve_amount_chroma;
     float lab_curve_adjust;
     uint32_t lab_curve_lcredsk;
+    /*
+     * Local contrast. The context exports the block's own float narrowing of
+     * the three sliders, the integer radius, the call site's scale and the
+     * host-built IIR coefficients. The coefficients are host memory read by
+     * the launcher; they are never uploaded.
+     */
+    uint32_t local_contrast_enabled;
+    uint32_t local_contrast_radius;
+    uint32_t local_contrast_scale;
+    float local_contrast_amount;
+    float local_contrast_darkness;
+    float local_contrast_lightness;
+    const RtLabToolsIir* local_contrast_iir;
 } RtLabToolsResult;
 
 
@@ -186,6 +228,23 @@ namespace rtengine::stage
 inline constexpr int LAB_TOOLS_EXPORT_SCALE = 1;
 
 /*
+ * Local contrast's ABI ranges. The radius admits values below the UI
+ * minimum of 20 because the parity matrix exercises sigma 1 and 10; the
+ * amount admits
+ * 2 rather than the UI maximum of 1 for the same reason. Darkness and
+ * lightness use the UI's 0..3. A value outside these bounds is a residual, not
+ * a device pass, so the host block's own arithmetic is the result.
+ */
+inline constexpr int LAB_TOOLS_LC_MIN_RADIUS = 1;
+inline constexpr int LAB_TOOLS_LC_MAX_RADIUS = 200;
+inline constexpr double LAB_TOOLS_LC_MAX_AMOUNT = 2.0;
+inline constexpr double LAB_TOOLS_LC_MAX_DARKNESS = 3.0;
+inline constexpr double LAB_TOOLS_LC_MAX_LIGHTNESS = 3.0;
+/* gaussianBlurImpl()'s GAUSS_DOUBLE in gauss.cc, which selects the
+ * double-precision IIR path. */
+inline constexpr double LAB_TOOLS_LC_DOUBLE_SIGMA = 25.0;
+
+/*
  * The LUT instances the host block reads and writes. They belong to the
  * caller: the export ImageProcessor owns one set for the whole pipeline and
  * the test builds its own. The block rebuilds every curve it uses, so the
@@ -204,16 +263,17 @@ struct LabToolsLuts {
 
 /*
  * Whether the block is the lab.tools node's supported set: the LabGrid colour
- * toning pass, shadows/highlights, vibrance and/or the Lab curves, with every
- * other pixel tool off.
+ * toning pass, shadows/highlights, local contrast, vibrance and/or the Lab
+ * curves, with every other pixel tool off.
  *
  * Fail closed. A Lab curve whose `contrast` is non-zero owns the hist16 refill
  * a later node reads, so it is a residual. So are the chromaticity family
  * (the chromaticity slider and the C=f(H), L=f(H) and H=f(H) flat curves), the
  * LAB, XYZ and XYZREL Munsell methods, black-and-white output (which
- * chromiLuminanceCurve() also touches), local contrast, EPD and any
- * colour-toning method other than LabGrid. A profile where no tool would run
- * is a residual too: the node would be a no-op and the host block records it.
+ * chromiLuminanceCurve() also touches), EPD and any colour-toning method other
+ * than LabGrid. A local contrast whose sliders are outside the ABI range is a
+ * residual as well. A profile where no tool would run is a residual too: the
+ * node would be a no-op and the host block records it.
  */
 bool labToolsSupported(const procparams::ProcParams& params);
 /* True when a shadows/highlights round would run for the given slider
@@ -223,6 +283,10 @@ bool labToolsShadowsHighlightsActive(const procparams::ProcParams& params);
  * non-identity or a slider is set. The predicate and the device launcher both
  * use it, so a vibrance block that is a no-op records impl=host. */
 bool labToolsVibranceActive(const procparams::ProcParams& params);
+/* True when ImProcFunctions::localContrast() would touch a pixel: the tool is
+ * enabled. It always writes the L plane, even with amount 0, because the
+ * block's LIM() can clamp an out-of-range sample. */
+bool labToolsLocalContrastActive(const procparams::ProcParams& params);
 /* True when chromiLuminanceCurve()'s Lab-curve pass runs on the device: the
  * curves are enabled and `contrast` is zero. The six per-table activity flags
  * are separate: a pass whose tables are all the identity still rewrites L, a
@@ -317,6 +381,13 @@ private:
     float lab_curve_amount_chroma_ = 0.f;
     float lab_curve_adjust_ = 1.f;
     bool lab_curve_lcredsk_ = true;
+    bool local_contrast_active_ = false;
+    uint32_t local_contrast_radius_ = 0;
+    uint32_t local_contrast_scale_ = 0;
+    float local_contrast_amount_ = 0.f;
+    float local_contrast_darkness_ = 1.f;
+    float local_contrast_lightness_ = 1.f;
+    RtLabToolsIir local_contrast_iir_ = {};
 };
 
 } // namespace rtengine::stage

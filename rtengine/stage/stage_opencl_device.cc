@@ -56,6 +56,7 @@
 #include "stage/algorithms/sharpen_cl.h"
 #include "stage/algorithms/transform_cl.h"
 #include "stage/algorithms/lab_tools_cl.h"
+#include "stage/algorithms/local_contrast_cl.h"
 #include "stage/algorithms/lab_curve_cl.h"
 #include "stage/algorithms/munsell_lch_cl.h"
 #include "stage/algorithms/vibrance_cl.h"
@@ -800,6 +801,22 @@ const std::string& lab_curve_source()
     return source;
 }
 
+/*
+ * The local-contrast program. gaussianBlur() above sigma 25 recurs in double
+ * and the SSE path's tail lines evaluate in double too, so the program needs
+ * fp64 and is built only on a device that advertises it. The launcher refuses
+ * the pass otherwise and the block stays on the host.
+ */
+const std::string& local_contrast_source()
+{
+    static const std::string source =
+        std::string("#pragma OPENCL FP_CONTRACT OFF\n"
+                    "#pragma STDC FP_CONTRACT OFF\n"
+                    "#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n") +
+        RT_LOCAL_CONTRAST_CL;
+    return source;
+}
+
 const std::string& lab_to_u8_source()
 {
     static const std::string source =
@@ -1235,6 +1252,7 @@ const std::vector<KernelDef>& kernels()
         {"working.trc", working_trc_source().c_str(), "rt_working_trc_second"},
         {"lab.tools", lab_tools_source().c_str(), "rt_lab_tools_mask"},
         {"lab.tools.labcurve", lab_curve_source().c_str(), "rt_lab_tools_lab_curve"},
+        {"lab.tools.localcontrast", local_contrast_source().c_str(), "rt_lab_tools_lc_line"},
         {"output.sharpen", RT_SHARPEN_CL, "rt_sharpen_mask"},
         {"framing", framing_source().c_str(), "rt_framing"},
         {"thumbnail.whitebalance", thumbnail_wb_source().c_str(), "rt_thumbnail_wb"},
@@ -1858,7 +1876,8 @@ cl_kernel compiled_kernel_entry(const std::shared_ptr<OpenCLEnv>& env,
     const char* build_options =
         std::strcmp(def->name, "working.trc") == 0 ||
                 std::strcmp(def->name, "lab.tools") == 0 ||
-                std::strcmp(def->name, "lab.tools.labcurve") == 0
+                std::strcmp(def->name, "lab.tools.labcurve") == 0 ||
+                std::strcmp(def->name, "lab.tools.localcontrast") == 0
             ? "-cl-fp32-correctly-rounded-divide-sqrt"
             : nullptr;
     build_error = env->api->BuildProgram(program, 1, &env->device,
@@ -3329,12 +3348,17 @@ RtStageStatus run_working_trc(const std::shared_ptr<OpenCLEnv>& env,
  *   [49] BUFFER the a table, [50] BUFFER the b table,
  *   [51] BUFFER the C=f(C) table, [52] BUFFER the L=f(C) table,
  *   [53] BUFFER the C=f(L) table (65536 floats each),
- *   [54] int L table length, [55] int the other five tables' length.
+ *   [54] int L table length, [55] int the other five tables' length,
+ *   [56] int local-contrast flag (1 when ImProcFunctions::localContrast()
+ *        would run),
+ *   [57] int radius, [58] double amount, [59] double darkness,
+ *   [60] double lightness, [61] int the block's scale,
+ *   [62] PTR host-built RtLabToolsIir coefficients (host-only, never uploaded).
  *
  * The pass order is the block's own: LabGrid, then the highlight round, then
- * the shadow round, then the Lab-curve pass, then vibrance. Each tool writes
- * the full image, so the work is sequential in that order and no pass can run
- * out of order.
+ * the shadow round, then local contrast, then the Lab-curve pass, then
+ * vibrance. Each tool writes the full image, so the work is sequential in that
+ * order and no pass can run out of order.
  *
  * A clear support flag refuses before the upload: that is the residual path,
  * and it makes the CPU builtin - the extracted host block - execute and record
@@ -3346,7 +3370,7 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
                             const std::vector<RtStageArg>& args,
                             std::string& error)
 {
-    constexpr std::size_t ARG_COUNT = 56;
+    constexpr std::size_t ARG_COUNT = 63;
     constexpr int SUBSAMPLING = 4;
     /* guidedfilter.h's epsilon, passed to f_mean() by shadowsHighlights(). */
     constexpr float LAB_TOOLS_EPSILON = 0.075f;
@@ -3395,6 +3419,13 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
     for (std::size_t index = 54; index <= 55; ++index) {
         kinds = kinds && args[index].kind == RT_STAGE_ARG_INT;
     }
+    kinds = kinds && args[56].kind == RT_STAGE_ARG_INT &&
+            args[57].kind == RT_STAGE_ARG_INT;
+    for (std::size_t index = 58; index <= 60; ++index) {
+        kinds = kinds && args[index].kind == RT_STAGE_ARG_DOUBLE;
+    }
+    kinds = kinds && args[61].kind == RT_STAGE_ARG_INT &&
+            args[62].kind == RT_STAGE_ARG_PTR;
     if (!kinds) {
         error = "lab.tools has an argument of the wrong kind";
         return RT_STAGE_INVALID;
@@ -3597,22 +3628,107 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
         curve_entries = static_cast<int>(curve_length);
     }
 
-    if (!labgrid && !sh_active && !vibrance && !lab_curve) {
+    /*
+     * Local contrast. The flag is the call site's
+     * labToolsLocalContrastActive(). The context exports the block's float
+     * narrowing of the three sliders and the IIR coefficients gauss.cc derives
+     * for the block's sigma; the launcher repeats the range checks so a direct
+     * submission cannot feed the kernel a value the predicate would refuse.
+     */
+    const std::int64_t local_contrast_flag = args[56].u.i;
+    if (local_contrast_flag != 0 && local_contrast_flag != 1) {
+        error = "lab.tools local contrast flag must be 0 or 1";
+        return RT_STAGE_INVALID;
+    }
+    const bool local_contrast = local_contrast_flag != 0;
+    int lc_radius = 0;
+    float lc_amount = 0.f;
+    float lc_darkness = 1.f;
+    float lc_lightness = 1.f;
+    const RtLabToolsIir* lc_iir = nullptr;
+    if (local_contrast) {
+        const std::int64_t radius = args[57].u.i;
+        if (radius < LAB_TOOLS_LC_MIN_RADIUS ||
+            radius > LAB_TOOLS_LC_MAX_RADIUS) {
+            error = "lab.tools local contrast radius is outside its range";
+            return RT_STAGE_INVALID;
+        }
+        lc_radius = static_cast<int>(radius);
+
+        const auto local_double = [&](std::size_t index, double high) {
+            const double value = args[index].u.f;
+            if (!std::isfinite(value) || value < 0.0 || value > high) {
+                return std::numeric_limits<double>::quiet_NaN();
+            }
+            return value;
+        };
+        const double amount = local_double(58, LAB_TOOLS_LC_MAX_AMOUNT);
+        const double darkness = local_double(59, LAB_TOOLS_LC_MAX_DARKNESS);
+        const double lightness =
+            local_double(60, LAB_TOOLS_LC_MAX_LIGHTNESS);
+        if (!std::isfinite(amount) || !std::isfinite(darkness) ||
+            !std::isfinite(lightness)) {
+            error = "lab.tools local contrast setting is outside its range";
+            return RT_STAGE_INVALID;
+        }
+        lc_amount = static_cast<float>(amount);
+        lc_darkness = static_cast<float>(darkness);
+        lc_lightness = static_cast<float>(lightness);
+
+        const std::int64_t scale = args[61].u.i;
+        if (scale != LAB_TOOLS_EXPORT_SCALE) {
+            error = "lab.tools local contrast scale is not the export scale";
+            return RT_STAGE_INVALID;
+        }
+
+        lc_iir = static_cast<const RtLabToolsIir*>(args[62].u.ptr);
+        if (lc_iir == nullptr || lc_iir->size != sizeof(RtLabToolsIir) ||
+            lc_iir->version != RT_LAB_TOOLS_IIR_VERSION) {
+            error = "lab.tools has an invalid local-contrast coefficient block";
+            return RT_STAGE_INVALID;
+        }
+        if (lc_iir->double_path > 1u ||
+            lc_iir->double_path !=
+                (static_cast<double>(lc_radius) >=
+                         LAB_TOOLS_LC_DOUBLE_SIGMA
+                     ? 1u
+                     : 0u)) {
+            error = "lab.tools local contrast coefficients use the wrong path";
+            return RT_STAGE_INVALID;
+        }
+        for (const RtLabToolsIirDirection* direction :
+             {&lc_iir->horizontal, &lc_iir->vertical}) {
+            for (std::size_t index = 0; index < RT_LAB_TOOLS_IIR_TERMS;
+                 ++index) {
+                if (!std::isfinite(direction->lane[index]) ||
+                    !std::isfinite(direction->border[index]) ||
+                    !std::isfinite(direction->wide[index])) {
+                    error = "lab.tools has a non-finite local-contrast "
+                            "coefficient";
+                    return RT_STAGE_INVALID;
+                }
+            }
+        }
+    }
+
+    if (!labgrid && !sh_active && !vibrance && !lab_curve &&
+        !local_contrast) {
         error = "lab.tools has no enabled tool";
         return RT_STAGE_FALLBACK;
     }
 
     /*
-     * Vibrance and the Lab curves need the host's correctly rounded divide and
-     * sqrt at every branch decision. A GPU OpenCL implementation may round one
-     * of them differently, which moves a pixel whose hue sits on a Munsell zone
-     * limit to the other side of the gate; the Radeon RX 550 was measured
-     * moving two vibrance pixels by up to 2,329 LSB16 on the PEF chart. The
-     * node therefore runs both only on a CPU OpenCL device (POCL), the
-     * deterministic device the project uses for parity, and records impl=host
-     * elsewhere.
+     * Vibrance, the Lab curves and local contrast need the host's correctly
+     * rounded divide and sqrt at every branch decision. A GPU OpenCL
+     * implementation may round one of them differently, which moves a pixel
+     * whose hue sits on a Munsell zone limit to the other side of the gate;
+     * the Radeon RX 550 was measured moving two vibrance pixels by up to
+     * 2,329 LSB16 on the PEF chart. Local contrast's IIR recurrence would
+     * likewise take a different boundary path. The node therefore runs all
+     * three only on a CPU OpenCL device (POCL), the deterministic device the
+     * project uses for parity, and records impl=host elsewhere.
      */
-    if (vibrance || lab_curve) {
+    if (vibrance || lab_curve || local_contrast) {
         cl_device_type device_type = 0;
         if (env->api->GetDeviceInfo(env->device, CL_DEVICE_TYPE,
                                     sizeof(device_type), &device_type,
@@ -3625,16 +3741,17 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
 
     /*
      * The Lab-curve kernel repeats the host's double-precision square root and
-     * divide, so it needs an fp64 device. A device without fp64 cannot build
-     * its program; the pass stays on the host.
+     * divide, and local contrast repeats gaussianBlur()'s double IIR
+     * recurrence, so both need an fp64 device. A device without fp64 cannot
+     * build either program; the pass stays on the host.
      */
-    if (lab_curve) {
+    if (lab_curve || local_contrast) {
         cl_device_fp_config fp_config = 0;
         if (env->api->GetDeviceInfo(env->device, CL_DEVICE_DOUBLE_FP_CONFIG,
                                     sizeof(fp_config), &fp_config,
                                     nullptr) != CL_SUCCESS ||
             fp_config == 0) {
-            error = "lab.tools Lab curves need device fp64";
+            error = "lab.tools needs device fp64";
             return RT_STAGE_FALLBACK;
         }
     }
@@ -3764,6 +3881,12 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
         error = "lab.tools image is too small for the guided filter";
         return RT_STAGE_FALLBACK;
     }
+    /* gaussianBlur()'s recurrence reads the last three samples and seeds from
+     * three states, so a line shorter than four would be out of bounds. */
+    if (local_contrast && (width < 4 || height < 4)) {
+        error = "lab.tools local contrast needs at least four rows and columns";
+        return RT_STAGE_FALLBACK;
+    }
 
     const KernelDef* def = find_kernel("lab.tools");
     assert(def != nullptr);
@@ -3793,11 +3916,23 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
         lab_curve ? compiled_kernel_entry(env, curve_def,
                                           "rt_lab_tools_lab_curve", error)
                   : nullptr;
+    const KernelDef* lc_def = find_kernel("lab.tools.localcontrast");
+    assert(lc_def != nullptr);
+    cl_kernel lc_line_kernel =
+        local_contrast
+            ? compiled_kernel_entry(env, lc_def, "rt_lab_tools_lc_line", error)
+            : nullptr;
+    cl_kernel lc_blend_kernel =
+        local_contrast ? compiled_kernel_entry(env, lc_def,
+                                               "rt_lab_tools_lc_blend", error)
+                       : nullptr;
     if (mask_kernel == nullptr || subsample_kernel == nullptr ||
         box_h_kernel == nullptr || box_v_kernel == nullptr ||
         combine_kernel == nullptr || upsample_kernel == nullptr ||
         apply_kernel == nullptr || labgrid_kernel == nullptr ||
-        vibrance_kernel == nullptr || (lab_curve && lab_curve_kernel == nullptr)) {
+        vibrance_kernel == nullptr || (lab_curve && lab_curve_kernel == nullptr) ||
+        (local_contrast && (lc_line_kernel == nullptr ||
+                            lc_blend_kernel == nullptr))) {
         return RT_STAGE_FALLBACK;
     }
 
@@ -3912,6 +4047,21 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
             residency->acquire(&lhskcurve_key, curve_shape, &error);
         clcurve_device = residency->acquire(&clcurve_key, curve_shape, &error);
     }
+
+    /*
+     * Local contrast's two image-sized planes: the horizontal pass writes the
+     * first and the vertical pass the second, which becomes the blur the blend
+     * reads. The residency refuses them over budget, which falls back cleanly.
+     */
+    char lc_h_key = 0;
+    char lc_v_key = 0;
+    const StageBufferShape lc_shape{RT_STAGE_F32, width, height, 1};
+    StageDeviceBufferPtr lc_h_device;
+    StageDeviceBufferPtr lc_v_device;
+    if (local_contrast) {
+        lc_h_device = residency->acquire(&lc_h_key, lc_shape, &error);
+        lc_v_device = residency->acquire(&lc_v_key, lc_shape, &error);
+    }
     if (!lab_device || !full || !sub_i1 || !sub_p1 || !sub_meani ||
         !sub_meanp || !sub_temp || !lut_highlight_device ||
         !lut_shadow_device || !ws_device || !iws_device || !cachef_device ||
@@ -3921,7 +4071,8 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
         (vibrance && !skin_curve_device) ||
         (lab_curve &&
          (!lcurve_device || !acurve_device || !bcurve_device ||
-          !satcurve_device || !lhskcurve_device || !clcurve_device))) {
+          !satcurve_device || !lhskcurve_device || !clcurve_device)) ||
+        (local_contrast && (!lc_h_device || !lc_v_device))) {
         return RT_STAGE_FALLBACK;
     }
 
@@ -3994,6 +4145,20 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
             return RT_STAGE_FALLBACK;
         }
     }
+    for (const StageDeviceBufferPtr* buffer : {&lc_h_device, &lc_v_device}) {
+        if (*buffer == nullptr) {
+            continue;
+        }
+        if ((*buffer)->row_pitch() % sizeof(float) != 0 ||
+            (*buffer)->plane_pitch() % sizeof(float) != 0 ||
+            pitch_of(*buffer) < static_cast<std::size_t>(width) ||
+            plane_pitch_of(*buffer) <
+                static_cast<std::size_t>(height) * pitch_of(*buffer)) {
+            error = "lab.tools local-contrast plane pitch does not cover the "
+                    "image";
+            return RT_STAGE_FALLBACK;
+        }
+    }
 
     cl_mem lab_memory = memory_of(lab_device);
     cl_mem full_memory = memory_of(full);
@@ -4022,6 +4187,8 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
     cl_mem lhskcurve_memory =
         lab_curve ? memory_of(lhskcurve_device) : nullptr;
     cl_mem clcurve_memory = lab_curve ? memory_of(clcurve_device) : nullptr;
+    cl_mem lc_h_memory = local_contrast ? memory_of(lc_h_device) : nullptr;
+    cl_mem lc_v_memory = local_contrast ? memory_of(lc_v_device) : nullptr;
     if (lab_memory == nullptr || full_memory == nullptr ||
         i1_memory == nullptr || p1_memory == nullptr ||
         meani_memory == nullptr || meanp_memory == nullptr ||
@@ -4035,7 +4202,8 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
         (lab_curve &&
          (lcurve_memory == nullptr || acurve_memory == nullptr ||
           bcurve_memory == nullptr || satcurve_memory == nullptr ||
-          lhskcurve_memory == nullptr || clcurve_memory == nullptr))) {
+          lhskcurve_memory == nullptr || clcurve_memory == nullptr)) ||
+        (local_contrast && (lc_h_memory == nullptr || lc_v_memory == nullptr))) {
         error = "lab.tools could not address its device buffers";
         return RT_STAGE_FALLBACK;
     }
@@ -4092,6 +4260,64 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
         }
         return true;
     };
+
+    const auto launch_1d = [&](cl_kernel kernel, std::size_t global,
+                               const char* label) {
+        cl_event done = nullptr;
+        if (env->api->EnqueueNDRangeKernel(env->queue, kernel, 1, nullptr,
+                                           &global, nullptr, 0, nullptr,
+                                           &done) != CL_SUCCESS ||
+            done == nullptr) {
+            error = std::string(label) + " launch failed";
+            return false;
+        }
+        const cl_int wait_status = env->api->WaitForEvents(1, &done);
+        env->api->ReleaseEvent(done);
+        if (wait_status != CL_SUCCESS) {
+            error = std::string(label) + " did not complete";
+            return false;
+        }
+        return true;
+    };
+
+    /*
+     * gaussianBlur()'s double path keeps a whole line of double forward states
+     * for the boundary correction and the backward recurrence. The stage
+     * formats are fp32 only, so this one buffer is created directly and checked
+     * against the residency's remaining budget; an over-budget image falls
+     * back before any pass runs.
+     */
+    cl_mem lc_state_memory = nullptr;
+    std::shared_ptr<void> lc_state_owner;
+    if (local_contrast && lc_iir->double_path != 0) {
+        const std::size_t samples =
+            static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
+        if (samples >
+            std::numeric_limits<std::size_t>::max() / sizeof(cl_double)) {
+            error = "lab.tools local-contrast state size overflows";
+            return RT_STAGE_FALLBACK;
+        }
+        const std::size_t state_bytes = samples * sizeof(cl_double);
+        const StageResidencyStats stats = residency->stats();
+        if (stats.used_bytes > stats.budget_bytes ||
+            state_bytes > stats.budget_bytes - stats.used_bytes) {
+            error = "lab.tools local-contrast state exceeds the device budget";
+            return RT_STAGE_FALLBACK;
+        }
+        cl_int state_error = CL_SUCCESS;
+        cl_mem memory = env->api->CreateBuffer(env->context, CL_MEM_READ_WRITE,
+                                               state_bytes, nullptr,
+                                               &state_error);
+        if (memory == nullptr) {
+            error = "lab.tools local-contrast state allocation failed";
+            return RT_STAGE_FALLBACK;
+        }
+        lc_state_owner = std::shared_ptr<void>(
+            static_cast<void*>(memory), [api = env->api](void* pointer) {
+                api->ReleaseMemObject(static_cast<cl_mem>(pointer));
+            });
+        lc_state_memory = memory;
+    }
 
     const std::size_t image_global[2] = {static_cast<std::size_t>(width),
                                          static_cast<std::size_t>(height)};
@@ -4377,8 +4603,136 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
         }
 
         /*
-         * chromiLuminanceCurve(), between the shadows/highlights rounds and
-         * vibrance, as the host block orders it.
+         * ImProcFunctions::localContrast(), between the shadows/highlights
+         * rounds and the Lab curves, as the host block orders it. The
+         * horizontal pass turns the L plane into the first scratch plane and
+         * the vertical pass turns that into the blur; the blend then rewrites
+         * L in place.
+         */
+        if (local_contrast) {
+            if (pitch_of(lc_h_device) >
+                    static_cast<std::size_t>(
+                        std::numeric_limits<cl_int>::max()) ||
+                pitch_of(lc_v_device) >
+                    static_cast<std::size_t>(
+                        std::numeric_limits<cl_int>::max())) {
+                error = "lab.tools local-contrast pitch does not fit the "
+                        "kernel's int";
+                return RT_STAGE_FALLBACK;
+            }
+            const cl_int lc_h_pitch =
+                static_cast<cl_int>(pitch_of(lc_h_device));
+            const cl_int lc_v_pitch =
+                static_cast<cl_int>(pitch_of(lc_v_device));
+            const cl_int lc_mode = static_cast<cl_int>(lc_iir->double_path);
+            const cl_int h_vector_lines =
+                lc_mode != 0 ? 0 : height - (height % 4);
+            const cl_int v_vector_lines =
+                lc_mode != 0 ? 0 : width - (width % 8);
+
+            const auto set_line_args =
+                [&](const RtLabToolsIirDirection& direction, cl_mem source,
+                    cl_mem target, cl_int length, cl_int lines,
+                    cl_int src_base_step, cl_int dst_base_step,
+                    cl_int src_stride, cl_int dst_stride,
+                    cl_int vector_lines) {
+                    cl_uint arg = 0;
+                    bool ok = true;
+                    ok = ok && set_arg(lc_line_kernel, arg++, sizeof(cl_mem),
+                                       &source);
+                    ok = ok && set_arg(lc_line_kernel, arg++, sizeof(cl_mem),
+                                       &target);
+                    ok = ok && set_arg(lc_line_kernel, arg++, sizeof(cl_mem),
+                                       &lc_state_memory);
+                    ok = ok && set_arg(lc_line_kernel, arg++, sizeof(cl_int),
+                                       &length);
+                    ok = ok && set_arg(lc_line_kernel, arg++, sizeof(cl_int),
+                                       &lines);
+                    ok = ok && set_arg(lc_line_kernel, arg++, sizeof(cl_int),
+                                       &src_base_step);
+                    ok = ok && set_arg(lc_line_kernel, arg++, sizeof(cl_int),
+                                       &dst_base_step);
+                    ok = ok && set_arg(lc_line_kernel, arg++, sizeof(cl_int),
+                                       &src_stride);
+                    ok = ok && set_arg(lc_line_kernel, arg++, sizeof(cl_int),
+                                       &dst_stride);
+                    ok = ok && set_arg(lc_line_kernel, arg++, sizeof(cl_int),
+                                       &lc_mode);
+                    ok = ok && set_arg(lc_line_kernel, arg++, sizeof(cl_int),
+                                       &vector_lines);
+                    for (std::size_t index = 0;
+                         index < RT_LAB_TOOLS_IIR_TERMS; ++index) {
+                        ok = ok &&
+                             set_arg(lc_line_kernel, arg++, sizeof(cl_float),
+                                     &direction.lane[index]);
+                    }
+                    for (std::size_t index = 0;
+                         index < RT_LAB_TOOLS_IIR_TERMS; ++index) {
+                        ok = ok &&
+                             set_arg(lc_line_kernel, arg++, sizeof(cl_double),
+                                     &direction.border[index]);
+                    }
+                    for (std::size_t index = 0;
+                         index < RT_LAB_TOOLS_IIR_TERMS; ++index) {
+                        ok = ok &&
+                             set_arg(lc_line_kernel, arg++, sizeof(cl_double),
+                                     &direction.wide[index]);
+                    }
+                    return ok;
+                };
+
+            if (!set_line_args(lc_iir->horizontal, lab_memory, lc_h_memory,
+                               width, height, lab_pitch, lc_h_pitch, 1, 1,
+                               h_vector_lines) ||
+                !launch_1d(lc_line_kernel, static_cast<std::size_t>(height),
+                           "lab.tools local-contrast horizontal")) {
+                error = "lab.tools local-contrast horizontal pass failed";
+                return RT_STAGE_FALLBACK;
+            }
+            if (!set_line_args(lc_iir->vertical, lc_h_memory, lc_v_memory,
+                               height, width, 1, 1, lc_h_pitch, lc_v_pitch,
+                               v_vector_lines) ||
+                !launch_1d(lc_line_kernel, static_cast<std::size_t>(width),
+                           "lab.tools local-contrast vertical")) {
+                error = "lab.tools local-contrast vertical pass failed";
+                return RT_STAGE_FALLBACK;
+            }
+
+            cl_uint arg = 0;
+            bool ok = true;
+            ok = ok && set_arg(lc_blend_kernel, arg++, sizeof(cl_mem),
+                               &lab_memory);
+            ok = ok && set_arg(lc_blend_kernel, arg++, sizeof(cl_mem),
+                               &lc_v_memory);
+            ok = ok && set_arg(lc_blend_kernel, arg++, sizeof(cl_int),
+                               &cl_width);
+            ok = ok && set_arg(lc_blend_kernel, arg++, sizeof(cl_int),
+                               &cl_height);
+            ok = ok && set_arg(lc_blend_kernel, arg++, sizeof(cl_int),
+                               &lab_pitch);
+            ok = ok && set_arg(lc_blend_kernel, arg++, sizeof(cl_int),
+                               &lab_plane);
+            ok = ok && set_arg(lc_blend_kernel, arg++, sizeof(cl_int),
+                               &lc_v_pitch);
+            ok = ok && set_arg(lc_blend_kernel, arg++, sizeof(cl_float),
+                               &lc_amount);
+            ok = ok && set_arg(lc_blend_kernel, arg++, sizeof(cl_float),
+                               &lc_darkness);
+            ok = ok && set_arg(lc_blend_kernel, arg++, sizeof(cl_float),
+                               &lc_lightness);
+            if (!ok) {
+                error = "lab.tools local-contrast blend arguments failed";
+                return RT_STAGE_FALLBACK;
+            }
+            if (!launch(lc_blend_kernel, image_global,
+                        "lab.tools local contrast")) {
+                return RT_STAGE_FALLBACK;
+            }
+        }
+
+        /*
+         * chromiLuminanceCurve(), between local contrast and vibrance, as the
+         * host block orders it.
          */
         if (lab_curve) {
             const cl_int cl_lcurve_entries = lcurve_entries;

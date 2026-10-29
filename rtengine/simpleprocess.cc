@@ -2026,7 +2026,7 @@ private:
             const bool deviceReady = supported && context.build(setup) == 0;
             RtLabToolsContext descriptor = context.descriptor(deviceReady);
 
-            RtStageArg args[56] = {};
+            RtStageArg args[63] = {};
             args[0].kind = RT_STAGE_ARG_BUFFER;
             args[0].u.buffer = stage::view(*labView);
             args[1].kind = RT_STAGE_ARG_PTR;
@@ -2135,6 +2135,35 @@ private:
                                      setup.lab_curve_entries)
                                : 0;
 
+            /*
+             * Local contrast. The flag is the context's active flag; the three
+             * sliders arrive as the block's own float narrowing and the
+             * coefficients as a host-only pointer.
+             */
+            args[56].kind = RT_STAGE_ARG_INT;
+            args[56].u.i = deviceReady ? setup.local_contrast_enabled : 0;
+            args[57].kind = RT_STAGE_ARG_INT;
+            args[57].u.i = deviceReady
+                               ? static_cast<std::int64_t>(
+                                     setup.local_contrast_radius)
+                               : 0;
+            args[58].kind = RT_STAGE_ARG_DOUBLE;
+            args[58].u.f = deviceReady ? setup.local_contrast_amount : 0.0;
+            args[59].kind = RT_STAGE_ARG_DOUBLE;
+            args[59].u.f =
+                deviceReady ? setup.local_contrast_darkness : 1.0;
+            args[60].kind = RT_STAGE_ARG_DOUBLE;
+            args[60].u.f =
+                deviceReady ? setup.local_contrast_lightness : 1.0;
+            args[61].kind = RT_STAGE_ARG_INT;
+            args[61].u.i = deviceReady
+                               ? static_cast<std::int64_t>(
+                                     setup.local_contrast_scale)
+                               : stage::LAB_TOOLS_EXPORT_SCALE;
+            args[62].kind = RT_STAGE_ARG_PTR;
+            args[62].u.ptr =
+                deviceReady ? setup.local_contrast_iir : nullptr;
+
             for (int index = 16; index < 22; ++index) {
                 args[index].kind = RT_STAGE_ARG_BUFFER;
             }
@@ -2213,7 +2242,7 @@ private:
 
             RtStageProfiling profiling{};
             if (stage::run("lab.tools",
-                           std::vector<RtStageArg>(args, args + 56),
+                           std::vector<RtStageArg>(args, args + 63),
                            &profiling) == RT_STAGE_OK) {
                 return;
             }
