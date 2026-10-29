@@ -22,11 +22,12 @@
  * Device arithmetic for the working.trc node.
  *
  * The kernels are the second pass of ImProcFunctions::workingtrc() and its
- * neighbours for the default configuration: the optional gamut control, the
- * matrix-shaper transform, apsatur() and the return to Lab. The host prefix
- * (lab2rgb() and the fixed sRGB inverse) is not a kernel: it runs on the host
- * so the probe, the profile and the pass-2 input are byte-identical to the
- * CPU block. Everything here is single precision except the values the host
+ * neighbours for the default configuration: the matrix-shaper transform,
+ * apsatur() and the return to Lab. The host prefix (lab2rgb(), the fixed sRGB
+ * inverse, the probe/profile and toxyz with the optional gamut map) is not a
+ * kernel: it runs on the host so the probe, the profile and the pass-2 input
+ * are byte-identical to the CPU block. Everything here is single precision
+ * except the values the host
  * exports as float: the working matrices, the profile matrices and the
  * 16-bit tables. The host still owns the probe, the lcms profile and the
  * gamma inverse.
@@ -38,9 +39,6 @@
 inline constexpr const char* RT_WORKING_TRC_CL = R"CLC(
 /* 16-bit sample scale of Imagefloat and LabImage (MAXVALF). */
 #define RT_WT_MAXVAL 65535.0f
-/* The block clamps the second-pass source to this epsilon. */
-#define RT_WT_EPSILON 0.00001f
-/* First-pass clamp: the epsilon workingtrc() applies before the sRGB inverse. */
 /* Color::D50x / Color::D50z, the white point Lab2XYZ and XYZ2Lab use. */
 #define RT_WT_D50X 0.9642f
 #define RT_WT_D50Z 0.8249f
@@ -176,10 +174,10 @@ inline void rt_wt_apply_satcie(float* r, float* g, float* b, const float f,
  * The profile's TRC tag maps encoded -> linear, so the transform's
  * linear -> encoded direction needs its inverse. buildGpuProfile() already
  * inverts the curve for the table; the analytic branch must use the same
- * direction. For a type-5 tag that inverse is lcms's type -5 evaluator; for a
- * type -5 tag (the block builds one when the requested gamma is below 1) it is
- * the forward type-5 evaluator. curve = {type, g, a, b, c, d, 0, 0} with the
- * tag's own parameter order.
+ * direction: above c*d, X = (Y^(1/g) - b)/a; below it, X = Y/c. curve =
+ * {type, g, a, b, c, d, 0, 0}. Only lcms type 5 reaches this helper; the setup
+ * refuses a type -5 profile (a CUSTOM WorkingTRC with gamma below 1) and runs
+ * the host builtin.
  */
 inline float rt_wt_trc_inverse(__global const float* gamma,
                                __global const float* curve,

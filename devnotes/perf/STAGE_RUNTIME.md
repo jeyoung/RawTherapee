@@ -2053,9 +2053,9 @@ is not admitted. `Color::cachef` and
 than re-evaluating the cube root. `#pragma OPENCL FP_CONTRACT OFF`,
 `#pragma STDC FP_CONTRACT OFF` and
 `-cl-fp32-correctly-rounded-divide-sqrt` keep the float division and
-multiply-add order. The host prefix applies the epsilon clamp before the probe,
-exactly as the block does, and the second-pass kernel clamps its input once
-more.
+multiply-add order. The host prefix applies the epsilon clamp before the probe
+and before toxyz, exactly as the block does; the device second pass consumes
+the already-clamped first-pass values and has no clamp of its own.
 
 Residuals run the `working.trc` host builtin and record `impl=host`: a
 `WorkingTRC` of `NONE`, `trcExp` off, a profile outside the twelve-name list,

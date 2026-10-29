@@ -2830,9 +2830,11 @@ RtStageStatus run_gamut(const std::shared_ptr<OpenCLEnv>& env,
  * The working.trc node. Argument order:
  *   [0] Lab three-plane F32 buffer, read and written in place,
  *   [1] PTR host context (RtWorkingTrcContext), host-only,
- *   [2] int supported (1 when the call site admits the configuration),
+ *   [2] int support flag, mirrored from the context descriptor (1 only when
+ *       the configuration is supported and the host setup admitted it),
  *   [3] double saturation (icm.wapsat),
- *   [4] int gamut control (1 when icm.gamut is set).
+ *   [4] three-plane F32 second-pass XYZ image from the host prefix,
+ *   [5] three-plane F32 linear pre-TRC reference for apsatur().
  *
  * The device work starts at the second pass: the host prefix has already run
  * lab2rgb, the fixed sRGB inverse, the probe/profile, toxyz and the optional
