@@ -47,6 +47,7 @@
 #include "stage/stage_graph.h"
 #include "stage/stage_pipeline.h"
 #include "stage/stage_profile.h"
+#include "stage/lab_tools_context.h"
 #include "stage/stage_runtime.h"
 #include "stage/working_trc_context.h"
 #include "utils.h"
@@ -2004,71 +2005,96 @@ private:
 
         procparams::ProcParams& params = job->pparams;
         ImProcFunctions &ipf = * (ipf_p.get());
-        const bool cam02 = usesCieCam02();
 
-        //%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-        //%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-        // start tile processing...???
+        stage::LabToolsLuts luts{&hist16, &lumacurve, &dummy, &clcurve,
+                                 &curve1, &curve2, &satcurve, &lhskcurve};
 
+        /*
+         * The device node is opt-in and covers the LabGrid pass and
+         * shadows/highlights only. Everything else in the block is a residual:
+         * the node is not submitted as supported, the launcher refuses it and
+         * the builtin below runs the host block, recording impl=host.
+         */
+        if (stage::node_device("lab.tools") == stage::StageNodeDevice::OpenCL) {
+            const bool supported = stage::labToolsSupported(params);
+            stage::LabToolsContext context(params, ipf, luts, autili, butili);
+            RtLabToolsResult setup{};
+            const bool deviceReady = supported && context.build(setup) == 0;
+            RtLabToolsContext descriptor = context.descriptor(deviceReady);
 
-        if (params.labCurve.contrast != 0) { //only use hist16 for contrast
-            hist16.clear();
+            RtStageArg args[22] = {};
+            args[0].kind = RT_STAGE_ARG_BUFFER;
+            args[0].u.buffer = stage::view(*labView);
+            args[1].kind = RT_STAGE_ARG_PTR;
+            args[1].u.ptr = &descriptor;
+            args[2].kind = RT_STAGE_ARG_INT;
+            args[2].u.i = deviceReady ? 1 : 0;
+            args[3].kind = RT_STAGE_ARG_INT;
+            args[3].u.i = (params.colorToning.enabled &&
+                           params.colorToning.method == "LabGrid")
+                              ? 1
+                              : 0;
+            for (int index = 0; index < 4; ++index) {
+                args[4 + index].kind = RT_STAGE_ARG_DOUBLE;
+                args[4 + index].u.f =
+                    deviceReady ? setup.labgrid[index] : 0.0;
+            }
+            args[8].kind = RT_STAGE_ARG_INT;
+            args[8].u.i = params.sh.enabled ? 1 : 0;
+            args[9].kind = RT_STAGE_ARG_INT;
+            args[9].u.i = params.sh.highlights;
+            args[10].kind = RT_STAGE_ARG_INT;
+            args[10].u.i = params.sh.shadows;
+            args[11].kind = RT_STAGE_ARG_INT;
+            args[11].u.i = params.sh.htonalwidth;
+            args[12].kind = RT_STAGE_ARG_INT;
+            args[12].u.i = params.sh.stonalwidth;
+            args[13].kind = RT_STAGE_ARG_INT;
+            args[13].u.i = params.sh.radius;
+            args[14].kind = RT_STAGE_ARG_INT;
+            args[14].u.i = params.sh.lab ? 1 : 0;
+            args[15].kind = RT_STAGE_ARG_INT;
+            args[15].u.i = stage::LAB_TOOLS_EXPORT_SCALE;
 
-#ifdef _OPENMP
-            #pragma omp parallel
-#endif
-            {
-                LUTu hist16thr(hist16.getSize());   // one temporary lookup table per thread
-                hist16thr.clear();
-#ifdef _OPENMP
-                #pragma omp for schedule(static) nowait
-#endif
+            for (int index = 16; index < 22; ++index) {
+                args[index].kind = RT_STAGE_ARG_BUFFER;
+            }
+            if (deviceReady) {
+                const auto host_buffer = [](const float* data, int width) {
+                    RtStageBuffer buffer{};
+                    buffer.size = sizeof(RtStageBuffer);
+                    buffer.data = const_cast<float*>(data);
+                    buffer.width = width;
+                    buffer.height = 1;
+                    buffer.row_pitch = static_cast<std::size_t>(width) *
+                                       sizeof(float);
+                    buffer.plane_pitch = buffer.row_pitch;
+                    buffer.planes = 1;
+                    buffer.format = RT_STAGE_F32;
+                    buffer.flags = RT_STAGE_BUFFER_READ;
+                    return buffer;
+                };
+                args[16].u.buffer = host_buffer(
+                    setup.lut_highlight, static_cast<int>(setup.lut_entries));
+                args[17].u.buffer = host_buffer(
+                    setup.lut_shadow, static_cast<int>(setup.lut_entries));
+                args[18].u.buffer = host_buffer(setup.ws, 9);
+                args[19].u.buffer = host_buffer(setup.iws, 9);
+                args[20].u.buffer = host_buffer(
+                    setup.cachef, static_cast<int>(RT_LAB_TOOLS_CACHE_ENTRIES));
+                args[21].u.buffer = host_buffer(
+                    setup.cachefy, static_cast<int>(RT_LAB_TOOLS_CACHE_ENTRIES));
+            }
 
-                for (int i = 0; i < fh; i++)
-                    for (int j = 0; j < fw; j++) {
-                        hist16thr[(int)((labView->L[i][j]))]++;
-                    }
-
-#ifdef _OPENMP
-                #pragma omp critical
-#endif
-                {
-                    hist16 += hist16thr;
-                }
+            RtStageProfiling profiling{};
+            if (stage::run("lab.tools",
+                           std::vector<RtStageArg>(args, args + 22),
+                           &profiling) == RT_STAGE_OK) {
+                return;
             }
         }
 
-        bool utili;
-        CurveFactory::complexLCurve(params.labCurve.brightness, params.labCurve.contrast, params.labCurve.lcurve, hist16, lumacurve, dummy, 1, utili);
-
-        const bool clcutili = CurveFactory::diagonalCurve2Lut(params.labCurve.clcurve, clcurve, 1);
-
-        bool ccutili, cclutili;
-        CurveFactory::complexsgnCurve(autili, butili, ccutili, cclutili, params.labCurve.acurve, params.labCurve.bcurve, params.labCurve.cccurve,
-                                      params.labCurve.lccurve, curve1, curve2, satcurve, lhskcurve, 1);
-
-
-        if (params.colorToning.enabled && params.colorToning.method == "LabGrid") {
-            ipf.colorToningLabGrid(labView, 0, labView->W, 0, labView->H, false);
-        }
-
-        ipf.shadowsHighlights(labView, params.sh.enabled, params.sh.lab, params.sh.highlights, params.sh.shadows, params.sh.radius, 1, params.sh.htonalwidth, params.sh.stonalwidth);
-
-        if (params.localContrast.enabled) {
-            // Alberto's local contrast
-            ipf.localContrast(labView, labView->L, params.localContrast, false, 1);//scale);
-        }
-
-        ipf.chromiLuminanceCurve(nullptr, 1, labView, labView, curve1, curve2, satcurve, lhskcurve, clcurve, lumacurve, utili, autili, butili, ccutili, cclutili, clcutili, dummy, dummy);
-
-    //    if ((params.colorappearance.enabled && !params.colorappearance.tonecie) || (!params.colorappearance.enabled)) {
-        if ((params.colorappearance.enabled && !params.colorappearance.tonecie) || (!cam02)) {
-            ipf.EPDToneMap(labView, 0, 1);
-        }
-
-
-        ipf.vibrance(labView, params.vibrance, params.toneCurve.hrenabled, params.icm.workingProfile);
-        ipf.labColorCorrectionRegions(labView);
+        stage::labToolsHostBlock(ipf, params, *labView, luts, autili, butili);
     }
 
     /*

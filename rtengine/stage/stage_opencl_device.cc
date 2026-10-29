@@ -55,8 +55,12 @@
 #include "stage/algorithms/rgb_proc_cl.h"
 #include "stage/algorithms/sharpen_cl.h"
 #include "stage/algorithms/transform_cl.h"
+#include "stage/algorithms/lab_tools_cl.h"
 #include "stage/algorithms/working_trc_cl.h"
+#include "stage/lab_tools_context.h"
 #include "stage/working_trc_context.h"
+
+#include "ipshadowshighlights.h"
 #include "transformmap.h"
 
 /*
@@ -757,6 +761,20 @@ const std::string& working_trc_source()
     return source;
 }
 
+/*
+ * The lab.tools program: the LabGrid pass, the shadows/highlights mask,
+ * guided-filter and blend passes. lab_tools_cl.h carries all of the node's
+ * arithmetic, including its own Lab-cache lookups.
+ */
+const std::string& lab_tools_source()
+{
+    static const std::string source =
+        std::string("#pragma OPENCL FP_CONTRACT OFF\n"
+                    "#pragma STDC FP_CONTRACT OFF\n") +
+        RT_LAB_TOOLS_CL;
+    return source;
+}
+
 const std::string& lab_to_u8_source()
 {
     static const std::string source =
@@ -1190,6 +1208,7 @@ const std::vector<KernelDef>& kernels()
         {"rgb.proc", rgb_proc_source().c_str(), "rt_rgb_proc"},
         {"gamut", RT_GAMUT_CL, "rt_gamut"},
         {"working.trc", working_trc_source().c_str(), "rt_working_trc_second"},
+        {"lab.tools", lab_tools_source().c_str(), "rt_lab_tools_mask"},
         {"output.sharpen", RT_SHARPEN_CL, "rt_sharpen_mask"},
         {"framing", framing_source().c_str(), "rt_framing"},
         {"thumbnail.whitebalance", thumbnail_wb_source().c_str(), "rt_thumbnail_wb"},
@@ -1811,7 +1830,8 @@ cl_kernel compiled_kernel_entry(const std::shared_ptr<OpenCLEnv>& env,
      * rounded IEEE division. Without this option OpenCL may lower float
      * division to a reciprocal approximation. */
     const char* build_options =
-        std::strcmp(def->name, "working.trc") == 0
+        std::strcmp(def->name, "working.trc") == 0 ||
+                std::strcmp(def->name, "lab.tools") == 0
             ? "-cl-fp32-correctly-rounded-divide-sqrt"
             : nullptr;
     build_error = env->api->BuildProgram(program, 1, &env->device,
@@ -3236,6 +3256,679 @@ RtStageStatus run_working_trc(const std::shared_ptr<OpenCLEnv>& env,
 
     if (residency->readback(lab_device, lab) != RT_STAGE_OK) {
         error = "working.trc Lab readback failed";
+        return RT_STAGE_FALLBACK;
+    }
+
+    return RT_STAGE_OK;
+}
+
+
+/*
+ * The lab.tools node. Argument order:
+ *   [0] Lab three-plane F32 buffer, read and written in place,
+ *   [1] PTR host context (RtLabToolsContext), host-only,
+ *   [2] int support flag, mirrored from the context descriptor (1 only when
+ *       the configuration is the node's supported set and the host setup
+ *       built its tables),
+ *   [3] int LabGrid flag,
+ *   [4..7] doubles a_scale, a_base, b_scale, b_base of the LabGrid pass,
+ *   [8] int shadows/highlights enabled,
+ *   [9] int highlights, [10] int shadows,
+ *   [11] int htonalwidth, [12] int stonalwidth,
+ *   [13] int radius, [14] int Lab mode, [15] int scale,
+ *   [16] BUFFER highlight tone table, [17] BUFFER shadow tone table,
+ *   [18] BUFFER working RGB -> XYZ, [19] BUFFER XYZ -> working RGB,
+ *   [20] BUFFER Color::cachef, [21] BUFFER Color::cachefy.
+ *
+ * The pass order is the block's own: LabGrid, then the highlight round, then
+ * the shadow round. Each round writes the full image, so the work is
+ * sequential in that order and no round can run out of order.
+ *
+ * A clear support flag refuses before the upload: that is the residual path,
+ * and it makes the CPU builtin - the extracted host block - execute and record
+ * impl=host. The Lab buffer is read back only after every pass succeeded, so a
+ * refused or failed launch leaves the host image untouched for the builtin.
+ */
+RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
+                            const std::shared_ptr<OpenCLResidency>& residency,
+                            const std::vector<RtStageArg>& args,
+                            std::string& error)
+{
+    constexpr std::size_t ARG_COUNT = 22;
+    constexpr int SUBSAMPLING = 4;
+    /* guidedfilter.h's epsilon, passed to f_mean() by shadowsHighlights(). */
+    constexpr float LAB_TOOLS_EPSILON = 0.075f;
+    /* The block's slider ranges; a value outside them is not a device case.
+     * The amounts have no geometric limit (their tone table is built on the
+     * host), but a negative or absurd value is refused rather than clamped. */
+    constexpr int MAX_SLIDER = 100;
+    constexpr int MAX_AMOUNT = 10000;
+
+    if (args.size() != ARG_COUNT) {
+        error = "lab.tools expects a Lab buffer, a context and its parameters";
+        return RT_STAGE_INVALID;
+    }
+
+    bool kinds = args[0].kind == RT_STAGE_ARG_BUFFER &&
+                 args[1].kind == RT_STAGE_ARG_PTR &&
+                 args[2].kind == RT_STAGE_ARG_INT &&
+                 args[3].kind == RT_STAGE_ARG_INT;
+    for (std::size_t index = 4; index <= 7; ++index) {
+        kinds = kinds && args[index].kind == RT_STAGE_ARG_DOUBLE;
+    }
+    for (std::size_t index = 8; index <= 15; ++index) {
+        kinds = kinds && args[index].kind == RT_STAGE_ARG_INT;
+    }
+    for (std::size_t index = 16; index <= 21; ++index) {
+        kinds = kinds && args[index].kind == RT_STAGE_ARG_BUFFER;
+    }
+    if (!kinds) {
+        error = "lab.tools has an argument of the wrong kind";
+        return RT_STAGE_INVALID;
+    }
+
+    const RtStageBuffer& lab = args[0].u.buffer;
+    if (!valid(lab) || lab.format != RT_STAGE_F32 || lab.planes != 3) {
+        error = "lab.tools needs a three-plane F32 Lab buffer";
+        return RT_STAGE_INVALID;
+    }
+
+    const auto* context = static_cast<const RtLabToolsContext*>(args[1].u.ptr);
+    if (context == nullptr || context->size != sizeof(RtLabToolsContext) ||
+        context->version != RT_LAB_TOOLS_CONTEXT_VERSION ||
+        context->magic != RT_LAB_TOOLS_CONTEXT_MAGIC ||
+        context->run_host == nullptr) {
+        error = "lab.tools has an invalid host context";
+        return RT_STAGE_INVALID;
+    }
+
+    const std::int64_t supported = args[2].u.i;
+    if (supported != 0 && supported != 1) {
+        error = "lab.tools support flag must be 0 or 1";
+        return RT_STAGE_INVALID;
+    }
+    if (supported != 1 || context->supported != 1) {
+        error = "lab.tools support flag is not set";
+        return RT_STAGE_FALLBACK;
+    }
+
+    const std::int64_t labgrid_flag = args[3].u.i;
+    if (labgrid_flag != 0 && labgrid_flag != 1) {
+        error = "lab.tools LabGrid flag must be 0 or 1";
+        return RT_STAGE_INVALID;
+    }
+    const bool labgrid = labgrid_flag != 0;
+    float labgrid_values[4] = {};
+    for (int index = 0; index < 4; ++index) {
+        const double value = args[4 + index].u.f;
+        if (!std::isfinite(value)) {
+            error = "lab.tools has a non-finite LabGrid parameter";
+            return RT_STAGE_INVALID;
+        }
+        labgrid_values[index] = static_cast<float>(value);
+    }
+
+    const auto int_arg = [&](std::size_t index, int low, int high) {
+        const std::int64_t value = args[index].u.i;
+        return value >= low && value <= high ? static_cast<int>(value) : -1;
+    };
+    const int sh_enabled = int_arg(8, 0, 1);
+    const int highlights = int_arg(9, 0, MAX_AMOUNT);
+    const int shadows = int_arg(10, 0, MAX_AMOUNT);
+    const int htonalwidth = int_arg(11, 0, MAX_SLIDER);
+    const int stonalwidth = int_arg(12, 0, MAX_SLIDER);
+    const int radius = int_arg(13, 0, MAX_SLIDER);
+    const int lab_mode = int_arg(14, 0, 1);
+    const int scale = int_arg(15, 1, 1);
+    if (sh_enabled < 0 || highlights < 0 || shadows < 0 ||
+        htonalwidth < 0 || stonalwidth < 0 || radius < 0 || lab_mode < 0 ||
+        scale != 1) {
+        error = "lab.tools has a shadows/highlights parameter outside its range";
+        return RT_STAGE_INVALID;
+    }
+    const bool sh_active = sh_enabled != 0 && (highlights > 0 || shadows > 0);
+    if (!labgrid && !sh_active) {
+        error = "lab.tools has no enabled tool";
+        return RT_STAGE_FALLBACK;
+    }
+
+    const RtStageBuffer& lut_highlight = args[16].u.buffer;
+    const RtStageBuffer& lut_shadow = args[17].u.buffer;
+    const RtStageBuffer& ws = args[18].u.buffer;
+    const RtStageBuffer& iws = args[19].u.buffer;
+    const RtStageBuffer& cachef = args[20].u.buffer;
+    const RtStageBuffer& cachefy = args[21].u.buffer;
+
+    const std::uint32_t lut_entries = lab_mode != 0
+                                          ? RT_LAB_TOOLS_LAB_LUT_ENTRIES
+                                          : RT_LAB_TOOLS_RGB_LUT_ENTRIES;
+    for (const RtStageBuffer* table : {&lut_highlight, &lut_shadow}) {
+        if (!valid(*table) || table->format != RT_STAGE_F32 ||
+            table->planes != 1 || table->height != 1 ||
+            static_cast<std::uint32_t>(table->width) != lut_entries) {
+            error = "lab.tools needs two tone tables of the mode's length";
+            return RT_STAGE_INVALID;
+        }
+    }
+    for (const RtStageBuffer* matrix : {&ws, &iws}) {
+        if (!valid(*matrix) || matrix->format != RT_STAGE_F32 ||
+            matrix->planes != 1 || matrix->width != 9 ||
+            matrix->height != 1) {
+            error = "lab.tools needs two working matrices of nine floats";
+            return RT_STAGE_INVALID;
+        }
+    }
+    for (const RtStageBuffer* cache : {&cachef, &cachefy}) {
+        if (!valid(*cache) || cache->format != RT_STAGE_F32 ||
+            cache->planes != 1 || cache->height != 1 ||
+            static_cast<std::uint32_t>(cache->width) !=
+                RT_LAB_TOOLS_CACHE_ENTRIES) {
+            error = "lab.tools needs the two Lab caches";
+            return RT_STAGE_INVALID;
+        }
+    }
+
+    const int width = lab.width;
+    const int height = lab.height;
+    if (lab.row_pitch % sizeof(float) != 0 ||
+        lab.plane_pitch < lab.row_pitch * static_cast<std::size_t>(height)) {
+        error = "lab.tools Lab buffer pitch does not cover the image";
+        return RT_STAGE_INVALID;
+    }
+    const int sw = width / SUBSAMPLING;
+    const int sh = height / SUBSAMPLING;
+    if (sw < 3 || sh < 3) {
+        error = "lab.tools image is too small for the guided filter";
+        return RT_STAGE_FALLBACK;
+    }
+
+    const KernelDef* def = find_kernel("lab.tools");
+    assert(def != nullptr);
+    cl_kernel mask_kernel =
+        compiled_kernel_entry(env, def, "rt_lab_tools_mask", error);
+    cl_kernel subsample_kernel =
+        compiled_kernel_entry(env, def, "rt_lab_tools_subsample", error);
+    cl_kernel box_h_kernel =
+        compiled_kernel_entry(env, def, "rt_lab_tools_box_h", error);
+    cl_kernel box_v_kernel =
+        compiled_kernel_entry(env, def, "rt_lab_tools_box_v", error);
+    cl_kernel combine_kernel =
+        compiled_kernel_entry(env, def, "rt_lab_tools_combine", error);
+    cl_kernel upsample_kernel =
+        compiled_kernel_entry(env, def, "rt_lab_tools_upsample", error);
+    cl_kernel apply_kernel = compiled_kernel_entry(
+        env, def,
+        lab_mode != 0 ? "rt_lab_tools_apply" : "rt_lab_tools_apply_rgb",
+        error);
+    cl_kernel labgrid_kernel =
+        compiled_kernel_entry(env, def, "rt_lab_tools_labgrid", error);
+    if (mask_kernel == nullptr || subsample_kernel == nullptr ||
+        box_h_kernel == nullptr || box_v_kernel == nullptr ||
+        combine_kernel == nullptr || upsample_kernel == nullptr ||
+        apply_kernel == nullptr || labgrid_kernel == nullptr) {
+        return RT_STAGE_FALLBACK;
+    }
+
+    const StageBufferShape lab_shape{RT_STAGE_F32, width, height, 3};
+    const StageBufferShape full_shape{RT_STAGE_F32, width, height, 2};
+    /* guidedFilter()'s five subsampled arrays. Each is its own buffer because
+     * the residency admits at most three planes, and separate buffers keep the
+     * kernel arguments explicit. */
+    const StageBufferShape sub_shape{RT_STAGE_F32, sw, sh, 1};
+    StageDeviceBufferPtr lab_device =
+        residency->acquire(lab.data, lab_shape, &error);
+    char full_key = 0;
+    char i1_key = 0;
+    char p1_key = 0;
+    char meani_key = 0;
+    char meanp_key = 0;
+    char temp_key = 0;
+    char hl_key = 0;
+    char sh_key = 0;
+    char ws_key = 0;
+    char iws_key = 0;
+    char cachef_key = 0;
+    char cachefy_key = 0;
+    StageDeviceBufferPtr full =
+        residency->acquire(&full_key, full_shape, &error);
+    StageDeviceBufferPtr sub_i1 =
+        residency->acquire(&i1_key, sub_shape, &error);
+    StageDeviceBufferPtr sub_p1 =
+        residency->acquire(&p1_key, sub_shape, &error);
+    StageDeviceBufferPtr sub_meani =
+        residency->acquire(&meani_key, sub_shape, &error);
+    StageDeviceBufferPtr sub_meanp =
+        residency->acquire(&meanp_key, sub_shape, &error);
+    StageDeviceBufferPtr sub_temp =
+        residency->acquire(&temp_key, sub_shape, &error);
+    const StageBufferShape lut_shape{
+        RT_STAGE_F32, static_cast<std::int32_t>(lut_entries), 1, 1};
+    const StageBufferShape matrix_shape{RT_STAGE_F32, 9, 1, 1};
+    const StageBufferShape cache_shape{
+        RT_STAGE_F32, static_cast<std::int32_t>(RT_LAB_TOOLS_CACHE_ENTRIES),
+        1, 1};
+    StageDeviceBufferPtr lut_highlight_device =
+        residency->acquire(&hl_key, lut_shape, &error);
+    StageDeviceBufferPtr lut_shadow_device =
+        residency->acquire(&sh_key, lut_shape, &error);
+    StageDeviceBufferPtr ws_device =
+        residency->acquire(&ws_key, matrix_shape, &error);
+    StageDeviceBufferPtr iws_device =
+        residency->acquire(&iws_key, matrix_shape, &error);
+    StageDeviceBufferPtr cachef_device =
+        residency->acquire(&cachef_key, cache_shape, &error);
+    StageDeviceBufferPtr cachefy_device =
+        residency->acquire(&cachefy_key, cache_shape, &error);
+    if (!lab_device || !full || !sub_i1 || !sub_p1 || !sub_meani ||
+        !sub_meanp || !sub_temp || !lut_highlight_device ||
+        !lut_shadow_device || !ws_device || !iws_device || !cachef_device ||
+        !cachefy_device) {
+        return RT_STAGE_FALLBACK;
+    }
+
+    if (residency->upload(lab_device, lab) != RT_STAGE_OK ||
+        residency->upload(lut_highlight_device, lut_highlight) !=
+            RT_STAGE_OK ||
+        residency->upload(lut_shadow_device, lut_shadow) != RT_STAGE_OK ||
+        residency->upload(ws_device, ws) != RT_STAGE_OK ||
+        residency->upload(iws_device, iws) != RT_STAGE_OK ||
+        residency->upload(cachef_device, cachef) != RT_STAGE_OK ||
+        residency->upload(cachefy_device, cachefy) != RT_STAGE_OK) {
+        error = "lab.tools setup upload failed";
+        return RT_STAGE_FALLBACK;
+    }
+
+    auto memory_of = [](const StageDeviceBufferPtr& buffer) {
+        auto device = std::dynamic_pointer_cast<OpenCLDeviceBuffer>(buffer);
+        return device != nullptr ? device->memory() : nullptr;
+    };
+    const auto pitch_of = [](const StageDeviceBufferPtr& buffer) {
+        return buffer->row_pitch() / sizeof(float);
+    };
+    const auto plane_pitch_of = [](const StageDeviceBufferPtr& buffer) {
+        return buffer->plane_pitch() / sizeof(float);
+    };
+
+    const StageDeviceBufferPtr buffers[] = {
+        lab_device, full, sub_i1, sub_p1, sub_meani, sub_meanp, sub_temp,
+        lut_highlight_device, lut_shadow_device, ws_device, iws_device,
+        cachef_device, cachefy_device};
+    for (const StageDeviceBufferPtr& buffer : buffers) {
+        if (buffer->row_pitch() % sizeof(float) != 0 ||
+            buffer->plane_pitch() % sizeof(float) != 0 ||
+            pitch_of(buffer) <
+                static_cast<std::size_t>(buffer->shape().width) ||
+            plane_pitch_of(buffer) <
+                static_cast<std::size_t>(buffer->shape().height) *
+                    pitch_of(buffer)) {
+            error = "lab.tools row or plane pitch does not cover the image";
+            return RT_STAGE_FALLBACK;
+        }
+    }
+
+    cl_mem lab_memory = memory_of(lab_device);
+    cl_mem full_memory = memory_of(full);
+    cl_mem i1_memory = memory_of(sub_i1);
+    cl_mem p1_memory = memory_of(sub_p1);
+    cl_mem meani_memory = memory_of(sub_meani);
+    cl_mem meanp_memory = memory_of(sub_meanp);
+    cl_mem temp_memory = memory_of(sub_temp);
+    cl_mem hl_memory = memory_of(lut_highlight_device);
+    cl_mem sh_memory = memory_of(lut_shadow_device);
+    cl_mem ws_memory = memory_of(ws_device);
+    cl_mem iws_memory = memory_of(iws_device);
+    cl_mem cachef_memory = memory_of(cachef_device);
+    cl_mem cachefy_memory = memory_of(cachefy_device);
+    if (lab_memory == nullptr || full_memory == nullptr ||
+        i1_memory == nullptr || p1_memory == nullptr ||
+        meani_memory == nullptr || meanp_memory == nullptr ||
+        temp_memory == nullptr || hl_memory == nullptr ||
+        sh_memory == nullptr || ws_memory == nullptr ||
+        iws_memory == nullptr || cachef_memory == nullptr ||
+        cachefy_memory == nullptr) {
+        error = "lab.tools could not address its device buffers";
+        return RT_STAGE_FALLBACK;
+    }
+
+    const cl_int cl_width = width;
+    const cl_int cl_height = height;
+    const cl_int cl_sw = sw;
+    const cl_int cl_sh = sh;
+    const cl_int lab_pitch = static_cast<cl_int>(pitch_of(lab_device));
+    const cl_int lab_plane = static_cast<cl_int>(plane_pitch_of(lab_device));
+    const cl_int full_pitch = static_cast<cl_int>(pitch_of(full));
+    const cl_int full_plane = static_cast<cl_int>(plane_pitch_of(full));
+    const cl_int sub_pitch = static_cast<cl_int>(pitch_of(sub_i1));
+    /* The five subsampled buffers are allocated from the same shape, so the
+     * layout helper gives them one pitch; refuse rather than mix layouts. */
+    if (pitch_of(sub_p1) != pitch_of(sub_i1) ||
+        pitch_of(sub_meani) != pitch_of(sub_i1) ||
+        pitch_of(sub_meanp) != pitch_of(sub_i1) ||
+        pitch_of(sub_temp) != pitch_of(sub_i1)) {
+        error = "lab.tools subsampled buffers have different pitches";
+        return RT_STAGE_FALLBACK;
+    }
+    const cl_int lut_size = static_cast<cl_int>(lut_entries);
+    if (lab_pitch > std::numeric_limits<cl_int>::max() / 3 ||
+        lab_plane > std::numeric_limits<cl_int>::max() / 3 ||
+        full_pitch > std::numeric_limits<cl_int>::max() / 3 ||
+        full_plane > std::numeric_limits<cl_int>::max() / 3 ||
+        sub_pitch > std::numeric_limits<cl_int>::max() / 2 ||
+        sw > std::numeric_limits<cl_int>::max() / 2 ||
+        sh > std::numeric_limits<cl_int>::max() / 2) {
+        error = "lab.tools pitch does not fit the kernel's int";
+        return RT_STAGE_FALLBACK;
+    }
+
+    const auto set_arg = [&](cl_kernel kernel, cl_uint index, std::size_t bytes,
+                             const void* value) {
+        return env->api->SetKernelArg(kernel, index, bytes, value) == CL_SUCCESS;
+    };
+    const auto launch = [&](cl_kernel kernel, const std::size_t* global,
+                            const char* label) {
+        cl_event done = nullptr;
+        if (env->api->EnqueueNDRangeKernel(env->queue, kernel, 2, nullptr,
+                                           global, nullptr, 0, nullptr,
+                                           &done) != CL_SUCCESS ||
+            done == nullptr) {
+            error = std::string(label) + " launch failed";
+            return false;
+        }
+        const cl_int wait_status = env->api->WaitForEvents(1, &done);
+        env->api->ReleaseEvent(done);
+        if (wait_status != CL_SUCCESS) {
+            error = std::string(label) + " did not complete";
+            return false;
+        }
+        return true;
+    };
+
+    const std::size_t image_global[2] = {static_cast<std::size_t>(width),
+                                         static_cast<std::size_t>(height)};
+    const std::size_t sub_global[2] = {static_cast<std::size_t>(sw),
+                                       static_cast<std::size_t>(sh)};
+    const std::size_t row_global[2] = {1, static_cast<std::size_t>(sh)};
+    const std::size_t column_global[2] = {static_cast<std::size_t>(sw), 1};
+
+    const float sub_col_scale =
+        static_cast<float>(width) / static_cast<float>(sw);
+    const float sub_row_scale =
+        static_cast<float>(height) / static_cast<float>(sh);
+    const float up_col_scale =
+        static_cast<float>(sw) / static_cast<float>(width);
+    const float up_row_scale =
+        static_cast<float>(sh) / static_cast<float>(height);
+
+    const auto box_blur = [&](cl_mem src, cl_mem dst, cl_int box_radius) {
+        cl_mem temp = temp_memory;
+        cl_uint arg = 0;
+        bool ok = true;
+        ok = ok && set_arg(box_h_kernel, arg++, sizeof(cl_mem), &src);
+        ok = ok && set_arg(box_h_kernel, arg++, sizeof(cl_mem), &temp);
+        ok = ok && set_arg(box_h_kernel, arg++, sizeof(cl_int), &box_radius);
+        ok = ok && set_arg(box_h_kernel, arg++, sizeof(cl_int), &cl_sw);
+        ok = ok && set_arg(box_h_kernel, arg++, sizeof(cl_int), &cl_sh);
+        ok = ok && set_arg(box_h_kernel, arg++, sizeof(cl_int), &sub_pitch);
+        if (!ok) {
+            error = "lab.tools box blur arguments failed";
+            return false;
+        }
+        if (!launch(box_h_kernel, row_global, "lab.tools horizontal box blur")) {
+            return false;
+        }
+
+        /* The vertical pass reads the horizontal result and writes the
+         * destination, so a source that is also the destination is safe. */
+        arg = 0;
+        ok = true;
+        ok = ok && set_arg(box_v_kernel, arg++, sizeof(cl_mem), &temp);
+        ok = ok && set_arg(box_v_kernel, arg++, sizeof(cl_mem), &dst);
+        ok = ok && set_arg(box_v_kernel, arg++, sizeof(cl_int), &box_radius);
+        ok = ok && set_arg(box_v_kernel, arg++, sizeof(cl_int), &cl_sw);
+        ok = ok && set_arg(box_v_kernel, arg++, sizeof(cl_int), &cl_sh);
+        ok = ok && set_arg(box_v_kernel, arg++, sizeof(cl_int), &sub_pitch);
+        if (!ok) {
+            error = "lab.tools box blur arguments failed";
+            return false;
+        }
+        return launch(box_v_kernel, column_global,
+                      "lab.tools vertical box blur");
+    };
+
+    /*
+     * guidedfilter.cc's element-wise operations:
+     *   0: dst = a * b, 1: dst = c - a * b, 2: dst = a / (b + epsilon).
+     * `c` is ignored by 0 and 2; the caller passes dst for those.
+     */
+    const auto combine = [&](cl_mem dst, cl_mem a, cl_mem b, cl_mem c,
+                             cl_int op, cl_float epsilon) {
+        cl_uint arg = 0;
+        bool ok = true;
+        ok = ok && set_arg(combine_kernel, arg++, sizeof(cl_mem), &dst);
+        ok = ok && set_arg(combine_kernel, arg++, sizeof(cl_mem), &a);
+        ok = ok && set_arg(combine_kernel, arg++, sizeof(cl_mem), &b);
+        ok = ok && set_arg(combine_kernel, arg++, sizeof(cl_mem), &c);
+        ok = ok && set_arg(combine_kernel, arg++, sizeof(cl_int), &op);
+        ok = ok && set_arg(combine_kernel, arg++, sizeof(cl_float), &epsilon);
+        ok = ok && set_arg(combine_kernel, arg++, sizeof(cl_int), &sub_pitch);
+        ok = ok && set_arg(combine_kernel, arg++, sizeof(cl_int), &cl_sw);
+        ok = ok && set_arg(combine_kernel, arg++, sizeof(cl_int), &cl_sh);
+        if (!ok) {
+            error = "lab.tools guided filter arguments failed";
+            return false;
+        }
+        return launch(combine_kernel, sub_global, "lab.tools guided filter");
+    };
+
+    /*
+     * One shadows/highlights round: the mask, guidedFilter(), then the blend.
+     * `lut_memory` is the host-built tone table of this round's amount.
+     */
+    const auto run_round = [&](bool hl, int tonalwidth, cl_mem lut_memory) {
+        const cl_int hl_flag = hl ? 1 : 0;
+        const float thresh = shadowsHighlightsThreshold(tonalwidth);
+        const float scale_value = shadowsHighlightsScale(thresh, hl);
+
+        cl_uint arg = 0;
+        bool ok = true;
+        ok = ok && set_arg(mask_kernel, arg++, sizeof(cl_mem), &lab_memory);
+        ok = ok && set_arg(mask_kernel, arg++, sizeof(cl_mem), &full_memory);
+        ok = ok && set_arg(mask_kernel, arg++, sizeof(cl_int), &cl_width);
+        ok = ok && set_arg(mask_kernel, arg++, sizeof(cl_int), &cl_height);
+        ok = ok && set_arg(mask_kernel, arg++, sizeof(cl_int), &lab_pitch);
+        ok = ok && set_arg(mask_kernel, arg++, sizeof(cl_int), &lab_plane);
+        ok = ok && set_arg(mask_kernel, arg++, sizeof(cl_int), &full_pitch);
+        ok = ok && set_arg(mask_kernel, arg++, sizeof(cl_int), &full_plane);
+        ok = ok && set_arg(mask_kernel, arg++, sizeof(cl_int), &hl_flag);
+        ok = ok && set_arg(mask_kernel, arg++, sizeof(cl_float), &thresh);
+        ok = ok && set_arg(mask_kernel, arg++, sizeof(cl_float), &scale_value);
+        if (!ok) {
+            error = "lab.tools mask arguments failed";
+            return false;
+        }
+        if (!launch(mask_kernel, image_global, "lab.tools mask")) {
+            return false;
+        }
+
+        arg = 0;
+        ok = true;
+        ok = ok && set_arg(subsample_kernel, arg++, sizeof(cl_mem),
+                           &full_memory);
+        ok = ok && set_arg(subsample_kernel, arg++, sizeof(cl_mem),
+                           &i1_memory);
+        ok = ok && set_arg(subsample_kernel, arg++, sizeof(cl_mem),
+                           &p1_memory);
+        ok = ok && set_arg(subsample_kernel, arg++, sizeof(cl_int), &cl_sw);
+        ok = ok && set_arg(subsample_kernel, arg++, sizeof(cl_int), &cl_sh);
+        ok = ok && set_arg(subsample_kernel, arg++, sizeof(cl_int), &cl_width);
+        ok = ok && set_arg(subsample_kernel, arg++, sizeof(cl_int), &cl_height);
+        ok = ok && set_arg(subsample_kernel, arg++, sizeof(cl_int),
+                           &full_pitch);
+        ok = ok && set_arg(subsample_kernel, arg++, sizeof(cl_int),
+                           &full_plane);
+        ok = ok && set_arg(subsample_kernel, arg++, sizeof(cl_int), &sub_pitch);
+        ok = ok && set_arg(subsample_kernel, arg++, sizeof(cl_float),
+                           &sub_col_scale);
+        ok = ok && set_arg(subsample_kernel, arg++, sizeof(cl_float),
+                           &sub_row_scale);
+        if (!ok) {
+            error = "lab.tools subsample arguments failed";
+            return false;
+        }
+        if (!launch(subsample_kernel, sub_global, "lab.tools subsample")) {
+            return false;
+        }
+
+        const cl_int rad = guidedFilterBoxRadius(
+            shadowsHighlightsRadius(radius, scale), SUBSAMPLING, sw, sh);
+        const cl_float epsilon = LAB_TOOLS_EPSILON;
+
+        /* meanI and meanp from I1 and p1, which stay intact. */
+        if (!box_blur(i1_memory, meani_memory, rad) ||
+            !box_blur(p1_memory, meanp_memory, rad)) {
+            return false;
+        }
+        /* corrIp = I1 * p1, then its box mean, in place. */
+        if (!combine(p1_memory, i1_memory, p1_memory, p1_memory, 0, epsilon) ||
+            !box_blur(p1_memory, p1_memory, rad)) {
+            return false;
+        }
+        /* corrI = I1 * I1, then its box mean, in place. */
+        if (!combine(i1_memory, i1_memory, i1_memory, i1_memory, 0,
+                     epsilon) ||
+            !box_blur(i1_memory, i1_memory, rad)) {
+            return false;
+        }
+        /* varI = corrI - meanI^2, covIp = corrIp - meanI * meanp. */
+        if (!combine(i1_memory, meani_memory, meani_memory, i1_memory, 1,
+                     epsilon) ||
+            !combine(p1_memory, meani_memory, meanp_memory, p1_memory, 1,
+                     epsilon)) {
+            return false;
+        }
+        /* a = covIp / (varI + eps), b = meanp - a * meanI. The block's
+         * SUBMUL reads its fourth array, so b overwrites covIp while meanp
+         * stays intact. */
+        if (!combine(i1_memory, p1_memory, i1_memory, i1_memory, 2, epsilon) ||
+            !combine(p1_memory, i1_memory, meani_memory, meanp_memory, 1,
+                     epsilon)) {
+            return false;
+        }
+        /* meana and meanb, in place. */
+        if (!box_blur(i1_memory, i1_memory, rad) ||
+            !box_blur(p1_memory, p1_memory, rad)) {
+            return false;
+        }
+
+        arg = 0;
+        ok = true;
+        ok = ok && set_arg(upsample_kernel, arg++, sizeof(cl_mem),
+                           &i1_memory);
+        ok = ok && set_arg(upsample_kernel, arg++, sizeof(cl_mem),
+                           &p1_memory);
+        ok = ok && set_arg(upsample_kernel, arg++, sizeof(cl_mem),
+                           &full_memory);
+        ok = ok && set_arg(upsample_kernel, arg++, sizeof(cl_int), &cl_sw);
+        ok = ok && set_arg(upsample_kernel, arg++, sizeof(cl_int), &cl_sh);
+        ok = ok && set_arg(upsample_kernel, arg++, sizeof(cl_int), &cl_width);
+        ok = ok && set_arg(upsample_kernel, arg++, sizeof(cl_int), &cl_height);
+        ok = ok && set_arg(upsample_kernel, arg++, sizeof(cl_int), &sub_pitch);
+        ok = ok && set_arg(upsample_kernel, arg++, sizeof(cl_int),
+                           &full_pitch);
+        ok = ok && set_arg(upsample_kernel, arg++, sizeof(cl_int),
+                           &full_plane);
+        ok = ok && set_arg(upsample_kernel, arg++, sizeof(cl_float),
+                           &up_col_scale);
+        ok = ok && set_arg(upsample_kernel, arg++, sizeof(cl_float),
+                           &up_row_scale);
+        if (!ok) {
+            error = "lab.tools upsample arguments failed";
+            return false;
+        }
+        if (!launch(upsample_kernel, image_global, "lab.tools upsample")) {
+            return false;
+        }
+
+        arg = 0;
+        ok = true;
+        ok = ok && set_arg(apply_kernel, arg++, sizeof(cl_mem), &lab_memory);
+        ok = ok && set_arg(apply_kernel, arg++, sizeof(cl_mem), &full_memory);
+        ok = ok && set_arg(apply_kernel, arg++, sizeof(cl_mem), &lut_memory);
+        ok = ok && set_arg(apply_kernel, arg++, sizeof(cl_int), &lut_size);
+        if (lab_mode == 0) {
+            ok = ok && set_arg(apply_kernel, arg++, sizeof(cl_mem),
+                               &ws_memory);
+            ok = ok && set_arg(apply_kernel, arg++, sizeof(cl_mem),
+                               &iws_memory);
+            ok = ok && set_arg(apply_kernel, arg++, sizeof(cl_mem),
+                               &cachef_memory);
+            ok = ok && set_arg(apply_kernel, arg++, sizeof(cl_mem),
+                               &cachefy_memory);
+        }
+        ok = ok && set_arg(apply_kernel, arg++, sizeof(cl_int), &cl_width);
+        ok = ok && set_arg(apply_kernel, arg++, sizeof(cl_int), &cl_height);
+        ok = ok && set_arg(apply_kernel, arg++, sizeof(cl_int), &lab_pitch);
+        ok = ok && set_arg(apply_kernel, arg++, sizeof(cl_int), &lab_plane);
+        ok = ok && set_arg(apply_kernel, arg++, sizeof(cl_int), &full_pitch);
+        if (lab_mode != 0) {
+            ok = ok && set_arg(apply_kernel, arg++, sizeof(cl_int), &hl_flag);
+        }
+        if (!ok) {
+            error = "lab.tools blend arguments failed";
+            return false;
+        }
+        return launch(apply_kernel, image_global, "lab.tools blend");
+    };
+
+    {
+        std::lock_guard<std::recursive_mutex> lock(env->queue_mutex);
+
+        if (labgrid) {
+            const cl_float a_scale = labgrid_values[0];
+            const cl_float a_base = labgrid_values[1];
+            const cl_float b_scale = labgrid_values[2];
+            const cl_float b_base = labgrid_values[3];
+            cl_uint arg = 0;
+            bool ok = true;
+            ok = ok && set_arg(labgrid_kernel, arg++, sizeof(cl_mem),
+                               &lab_memory);
+            ok = ok && set_arg(labgrid_kernel, arg++, sizeof(cl_int),
+                               &cl_width);
+            ok = ok && set_arg(labgrid_kernel, arg++, sizeof(cl_int),
+                               &cl_height);
+            ok = ok && set_arg(labgrid_kernel, arg++, sizeof(cl_int),
+                               &lab_pitch);
+            ok = ok && set_arg(labgrid_kernel, arg++, sizeof(cl_int),
+                               &lab_plane);
+            ok = ok && set_arg(labgrid_kernel, arg++, sizeof(cl_float),
+                               &a_scale);
+            ok = ok && set_arg(labgrid_kernel, arg++, sizeof(cl_float),
+                               &a_base);
+            ok = ok && set_arg(labgrid_kernel, arg++, sizeof(cl_float),
+                               &b_scale);
+            ok = ok && set_arg(labgrid_kernel, arg++, sizeof(cl_float),
+                               &b_base);
+            if (!ok) {
+                error = "lab.tools LabGrid arguments failed";
+                return RT_STAGE_FALLBACK;
+            }
+            if (!launch(labgrid_kernel, image_global, "lab.tools LabGrid")) {
+                return RT_STAGE_FALLBACK;
+            }
+        }
+
+        if (sh_enabled != 0 && highlights > 0 &&
+            !run_round(true, htonalwidth, hl_memory)) {
+            return RT_STAGE_FALLBACK;
+        }
+        if (sh_enabled != 0 && shadows > 0 &&
+            !run_round(false, stonalwidth, sh_memory)) {
+            return RT_STAGE_FALLBACK;
+        }
+    }
+
+    if (residency->readback(lab_device, lab) != RT_STAGE_OK) {
+        error = "lab.tools Lab readback failed";
         return RT_STAGE_FALLBACK;
     }
 
@@ -4773,6 +5466,20 @@ public:
         } else if (request.name == "working.trc") {
             const RtStageStatus status =
                 run_working_trc(env_, residency_, request.args, error);
+            if (status == RT_STAGE_OK) {
+                StageEvent done;
+                done.status = StageEventStatus::Complete;
+                done.result = RT_STAGE_OK;
+                done.device = StageDeviceType::OPENCL;
+                done.asynchronous = false;
+                return done;
+            }
+            StageEvent fallback = StageQueue::submit(request, profiling);
+            fallback.note = error;
+            return fallback;
+        } else if (request.name == "lab.tools") {
+            const RtStageStatus status =
+                run_lab_tools(env_, residency_, request.args, error);
             if (status == RT_STAGE_OK) {
                 StageEvent done;
                 done.status = StageEventStatus::Complete;

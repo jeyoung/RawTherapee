@@ -26,12 +26,107 @@
 #include "gauss.h"
 #include "guidedfilter.h"
 #include "iccstore.h"
+#include "ipshadowshighlights.h"
 #include "labimage.h"
 #include "opthelper.h"
 #include "procparams.h"
 #include "sleef.h"
 
 namespace rtengine {
+
+/*
+ * The block's tone table, extracted verbatim from apply() below so the device
+ * node's setup and the host path build the same table from the same code.
+ */
+void shadowsHighlightsLut(const double (*ws)[3], const double (*iws)[3],
+                          bool lab_mode, int amount, bool hl, bool multithread,
+                          LUTf& f)
+{
+    /* The block sizes the table once and reuses it for both rounds. */
+    assert(f.getSize() == (lab_mode ? 32768u : 65536u));
+
+    const auto rgb2lab =
+        [&](float R, float G, float B, float &l, float &a, float &b) -> void
+        {
+            float x, y, z;
+            Color::rgbxyz(R, G, B, x, y, z, ws);
+            Color::XYZ2Lab(x, y, z, l, a, b);
+        };
+
+    const auto lab2rgb =
+        [&](float l, float a, float b, float &R, float &G, float &B) -> void
+        {
+            float x, y, z;
+            Color::Lab2XYZ(l, a, b, x, y, z);
+            Color::xyz2rgb(x, y, z, R, G, B, iws);
+        };
+
+    const float base = std::pow(4.f, float(amount)/100.f);
+    const float gamma = hl ? base : 1.f / base;
+
+    const float contrast = std::pow(2.f, float(amount)/100.f);
+    DiagonalCurve sh_contrast({
+            DCT_NURBS,
+            0, 0,
+            0.125, std::pow(0.125 / 0.25, contrast) * 0.25,
+            0.25, 0.25,
+            0.375, std::pow(0.375 / 0.25, contrast) * 0.25,
+            1, 1
+        });
+
+    if(!hl) {
+        if (lab_mode) {
+#ifdef _OPENMP
+            #pragma omp parallel for if (multithread)
+#endif
+            for (int l = 0; l < 32768; ++l) {
+                auto val = pow_F(l / 32768.f, gamma);
+                // get a bit more contrast in the shadows
+                val = sh_contrast.getVal(val);
+                f[l] = val * 32768.f;
+            }
+        } else {
+#ifdef _OPENMP
+            #pragma omp parallel for if (multithread)
+#endif
+            for (int c = 0; c < 65536; ++c) {
+                float l, a, b;
+                float R = c, G = c, B = c;
+                rgb2lab(R, G, B, l, a, b);
+                auto val = pow_F(l / 32768.f, gamma);
+                // get a bit more contrast in the shadows
+                val = sh_contrast.getVal(val);
+                l = val * 32768.f;
+                lab2rgb(l, a, b, R, G, B);
+                f[c] = G;
+            }
+        }
+    } else {
+        if (lab_mode) {
+#ifdef _OPENMP
+            #pragma omp parallel for if (multithread)
+#endif
+            for (int l = 0; l < 32768; ++l) {
+                auto val = pow_F(l / 32768.f, gamma);
+                f[l] = val * 32768.f;
+            }
+        } else {
+#ifdef _OPENMP
+            #pragma omp parallel for if (multithread)
+#endif
+            for (int c = 0; c < 65536; ++c) {
+                float l, a, b;
+                float R = c, G = c, B = c;
+                rgb2lab(R, G, B, l, a, b);
+                auto val = pow_F(l / 32768.f, gamma);
+                l = val * 32768.f;
+                lab2rgb(l, a, b, R, G, B);
+                f[c] = G;
+            }
+        }
+    }
+}
+
 //modifications to pass parameters needs by locallab, to avoid 2 functions - no change in process - J.Desmis march 2019
 void ImProcFunctions::shadowsHighlights(LabImage *lab, bool ena, int labmode, int hightli, int shado, int rad, int scal, int hltonal, int shtonal)
 {
@@ -44,7 +139,7 @@ void ImProcFunctions::shadowsHighlights(LabImage *lab, bool ena, int labmode, in
 
     array2D<float> mask(width, height);
     array2D<float> L(width, height);
-    const float radius = float(rad) * 10 / scal;
+    const int radius = shadowsHighlightsRadius(rad, scal);
     LUTf f(lab_mode ? 32768 : 65536);
 
     TMatrix ws = ICCStore::getInstance()->workingSpaceMatrix(params->icm.workingProfile);
@@ -69,8 +164,8 @@ void ImProcFunctions::shadowsHighlights(LabImage *lab, bool ena, int labmode, in
     const auto apply =
         [&](int amount, int tonalwidth, bool hl) -> void
         {
-            const float thresh = tonalwidth * 327.68f;
-            const float scale = hl ? (thresh > 0.f ? 0.9f / thresh : 1.f) : thresh * 0.9f;
+            const float thresh = shadowsHighlightsThreshold(tonalwidth);
+            const float scale = shadowsHighlightsScale(thresh, hl);
 
 #ifdef _OPENMP
             #pragma omp parallel for if (multiThread)
@@ -91,70 +186,7 @@ void ImProcFunctions::shadowsHighlights(LabImage *lab, bool ena, int labmode, in
 
             guidedFilter(L, mask, mask, radius, 0.075, multiThread, 4);
 
-            const float base = std::pow(4.f, float(amount)/100.f);
-            const float gamma = hl ? base : 1.f / base;
-
-            const float contrast = std::pow(2.f, float(amount)/100.f);
-            DiagonalCurve sh_contrast({
-                    DCT_NURBS,
-                    0, 0,
-                    0.125, std::pow(0.125 / 0.25, contrast) * 0.25, 
-                    0.25, 0.25,
-                    0.375, std::pow(0.375 / 0.25, contrast) * 0.25,
-                    1, 1
-                });
-
-            if(!hl) {
-                if (lab_mode) {
-#ifdef _OPENMP
-                    #pragma omp parallel for if (multiThread)
-#endif
-                    for (int l = 0; l < 32768; ++l) {
-                        auto val = pow_F(l / 32768.f, gamma);
-                        // get a bit more contrast in the shadows
-                        val = sh_contrast.getVal(val);
-                        f[l] = val * 32768.f;
-                    }
-                } else {
-#ifdef _OPENMP
-                    #pragma omp parallel for if (multiThread)
-#endif
-                    for (int c = 0; c < 65536; ++c) {
-                        float l, a, b;
-                        float R = c, G = c, B = c;
-                        rgb2lab(R, G, B, l, a, b);
-                        auto val = pow_F(l / 32768.f, gamma);
-                        // get a bit more contrast in the shadows
-                        val = sh_contrast.getVal(val);
-                        l = val * 32768.f;
-                        lab2rgb(l, a, b, R, G, B);
-                        f[c] = G;
-                    }
-                }
-            } else {
-                if (lab_mode) {
-#ifdef _OPENMP
-                    #pragma omp parallel for if (multiThread)
-#endif
-                    for (int l = 0; l < 32768; ++l) {
-                        auto val = pow_F(l / 32768.f, gamma);
-                        f[l] = val * 32768.f;
-                    }
-                } else {
-#ifdef _OPENMP
-                    #pragma omp parallel for if (multiThread)
-#endif
-                    for (int c = 0; c < 65536; ++c) {
-                        float l, a, b;
-                        float R = c, G = c, B = c;
-                        rgb2lab(R, G, B, l, a, b);
-                        auto val = pow_F(l / 32768.f, gamma);
-                        l = val * 32768.f;
-                        lab2rgb(l, a, b, R, G, B);
-                        f[c] = G;
-                    }
-                }
-            }
+            shadowsHighlightsLut(ws, iws, lab_mode, amount, hl, multiThread, f);
 
 #ifdef _OPENMP
             #pragma omp parallel for schedule(dynamic,16) if (multiThread)
