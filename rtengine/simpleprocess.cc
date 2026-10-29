@@ -2022,7 +2022,7 @@ private:
             const bool deviceReady = supported && context.build(setup) == 0;
             RtLabToolsContext descriptor = context.descriptor(deviceReady);
 
-            RtStageArg args[22] = {};
+            RtStageArg args[34] = {};
             args[0].kind = RT_STAGE_ARG_BUFFER;
             args[0].u.buffer = stage::view(*labView);
             args[1].kind = RT_STAGE_ARG_PTR;
@@ -2056,7 +2056,38 @@ private:
             args[15].kind = RT_STAGE_ARG_INT;
             args[15].u.i = stage::LAB_TOOLS_EXPORT_SCALE;
 
+            /*
+             * Vibrance's own parameters. The flag is the same predicate the
+             * supported set uses, so a vibrance block that would not touch a
+             * pixel never reaches the launcher as a device tool.
+             */
+            const bool vibrance = stage::labToolsVibranceActive(params);
+            args[22].kind = RT_STAGE_ARG_INT;
+            args[22].u.i = deviceReady && vibrance ? 1 : 0;
+            args[23].kind = RT_STAGE_ARG_INT;
+            args[23].u.i = params.vibrance.pastels;
+            args[24].kind = RT_STAGE_ARG_INT;
+            args[24].u.i = params.vibrance.saturated;
+            args[25].kind = RT_STAGE_ARG_INT;
+            args[25].u.i = params.vibrance.psthreshold.getTopLeft();
+            args[26].kind = RT_STAGE_ARG_INT;
+            args[26].u.i = params.vibrance.psthreshold.getBottomLeft();
+            args[27].kind = RT_STAGE_ARG_INT;
+            args[27].u.i = params.vibrance.protectskins ? 1 : 0;
+            args[28].kind = RT_STAGE_ARG_INT;
+            args[28].u.i = params.vibrance.avoidcolorshift ? 1 : 0;
+            args[29].kind = RT_STAGE_ARG_INT;
+            args[29].u.i = deviceReady && vibrance &&
+                                  setup.skin_curve_set != 0
+                              ? 1
+                              : 0;
+            args[30].kind = RT_STAGE_ARG_INT;
+            args[30].u.i = params.toneCurve.hrenabled ? 1 : 0;
+
             for (int index = 16; index < 22; ++index) {
+                args[index].kind = RT_STAGE_ARG_BUFFER;
+            }
+            for (int index = 31; index < 34; ++index) {
                 args[index].kind = RT_STAGE_ARG_BUFFER;
             }
             if (deviceReady) {
@@ -2084,11 +2115,26 @@ private:
                     setup.cachef, static_cast<int>(RT_LAB_TOOLS_CACHE_ENTRIES));
                 args[21].u.buffer = host_buffer(
                     setup.cachefy, static_cast<int>(RT_LAB_TOOLS_CACHE_ENTRIES));
+                if (vibrance) {
+                    args[31].u.buffer = host_buffer(
+                        setup.munsell,
+                        static_cast<int>(RT_LAB_TOOLS_MUNSELL_TABLES *
+                                         RT_LAB_TOOLS_MUNSELL_STRIDE));
+                    args[32].u.buffer = host_buffer(
+                        setup.munsell_sizes,
+                        static_cast<int>(RT_LAB_TOOLS_MUNSELL_TABLES));
+                    args[33].u.buffer = host_buffer(
+                        setup.skin_curve,
+                        setup.skin_curve_set != 0
+                            ? static_cast<int>(
+                                  RT_LAB_TOOLS_SKIN_CURVE_ENTRIES)
+                            : 1);
+                }
             }
 
             RtStageProfiling profiling{};
             if (stage::run("lab.tools",
-                           std::vector<RtStageArg>(args, args + 22),
+                           std::vector<RtStageArg>(args, args + 34),
                            &profiling) == RT_STAGE_OK) {
                 return;
             }

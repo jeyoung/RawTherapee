@@ -61,6 +61,13 @@ struct ProcParams;
 #define RT_LAB_TOOLS_RGB_LUT_ENTRIES 65536u
 /* Color::cachef[] / cachefy[] entries, needed by the RGB-mode round trip. */
 #define RT_LAB_TOOLS_CACHE_ENTRIES 65536u
+/* The Munsell Lch tables the vibrance avoidcolorshift path reads. The flat
+ * set has RT_LAB_TOOLS_MUNSELL_TABLES entries of RT_LAB_TOOLS_MUNSELL_STRIDE
+ * floats each; the host pads every table to the longest one (140). */
+#define RT_LAB_TOOLS_MUNSELL_TABLES 197u
+#define RT_LAB_TOOLS_MUNSELL_STRIDE 140u
+/* Vibrance's host-built skin-tone hue curve. */
+#define RT_LAB_TOOLS_SKIN_CURVE_ENTRIES 65536u
 
 typedef struct RtLabToolsResult {
     /*
@@ -80,7 +87,19 @@ typedef struct RtLabToolsResult {
     /* Color::cachef[] and cachefy[], the 65536-sample Lab caches. */
     const float* cachef;
     const float* cachefy;
+    /*
+     * The flat Munsell table set and one entry per table with that table's
+     * own length. Both are read only when vibrance runs on the device.
+     */
+    const float* munsell;
+    const float* munsell_sizes;
+    /* The host-built vibrance skin curve, read only when skin_curve_set. */
+    const float* skin_curve;
+    uint32_t munsell_tables;
+    /* 1 when Color::init()'s curve was non-identity and the table is built. */
+    uint32_t skin_curve_set;
 } RtLabToolsResult;
+
 
 typedef struct RtLabToolsContext {
     uint32_t size;
@@ -135,17 +154,23 @@ struct LabToolsLuts {
 
 /*
  * Whether the block is the lab.tools node's supported set: the LabGrid colour
- * toning pass and/or shadows/highlights, with every other pixel tool off.
+ * toning pass, shadows/highlights and/or vibrance, with every other pixel tool
+ * off.
  *
  * Fail closed. Lab curves (which own the histogram refill and the Lab LUTs),
- * local contrast, EPD, vibrance, black-and-white output and any colour-toning
- * method other than LabGrid are residuals. So is a profile where neither tool
- * would run: the node would be a no-op and the host block records it.
+ * local contrast, EPD, black-and-white output and any colour-toning method
+ * other than LabGrid are residuals. So is a profile where no tool would run:
+ * the node would be a no-op and the host block records it.
  */
 bool labToolsSupported(const procparams::ProcParams& params);
 /* True when a shadows/highlights round would run for the given slider
  * values, as ImProcFunctions::shadowsHighlights() decides it. */
 bool labToolsShadowsHighlightsActive(const procparams::ProcParams& params);
+/* True when ImProcFunctions::vibrance() would touch a pixel: the skin curve is
+ * non-identity or a slider is set. The predicate and the device launcher both
+ * use it, so a vibrance block that is a no-op records impl=host. */
+bool labToolsVibranceActive(const procparams::ProcParams& params);
+
 
 /*
  * The block as it ran before the device node, moved here unchanged so the call
@@ -209,6 +234,11 @@ private:
     float iws_[9] = {};
     std::vector<float> cachef_;
     std::vector<float> cachefy_;
+    std::vector<float> munsell_;
+    std::vector<float> munsell_sizes_;
+    std::vector<float> skin_curve_;
+    bool vibrance_active_ = false;
+    bool skin_curve_set_ = false;
 };
 
 } // namespace rtengine::stage

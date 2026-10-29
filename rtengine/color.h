@@ -1456,6 +1456,29 @@ static inline void Lab2XYZ(vfloat L, vfloat a, vfloat b, vfloat &x, vfloat &y, v
     static void AllMunsellLch (bool lumaMuns, float Lprov1, float Loldd, float HH, float Chprov1, float CC, float &correctionHueChroma, float &correctlum);
     static void AllMunsellLch (float Lprov1, float HH, float Chprov1, float CC, float &correctionHueChroma);
 
+    /*
+     * The Munsell Lch LUTs, exposed for the lab.tools stage device.
+     *
+     * MunsellLch() reads a table indexed by the Munsell colour name and the
+     * luminance band. The stage copies the whole set into one flat, uploadable
+     * buffer, so the device evaluates the same corrections the host does
+     * instead of a second, hand-built table set.
+     *
+     * The count is the number of tables the source declares and sizes. The
+     * historical comment above initMunsell() says 195; the declarations,
+     * the initialisers and MunsellLch() itself all carry 197, so the stage
+     * exports 197. The ids are the declaration order.
+     *
+     * munsellLut() returns nullptr outside [0, count). A table is valid after
+     * Color::init(), which calls initMunsell().
+     */
+    static constexpr int MUNSELL_LUT_COUNT = 197;
+    static int munsellLutCount ()
+    {
+        return MUNSELL_LUT_COUNT;
+    }
+    static const LUTf* munsellLut (int index);
+
 
     /**
     * @brief Correct chromaticity and luminance so that the color stays in the working profile's gamut

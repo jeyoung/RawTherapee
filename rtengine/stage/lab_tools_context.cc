@@ -27,6 +27,23 @@ bool labToolsShadowsHighlightsActive(const procparams::ProcParams& params)
     return params.sh.enabled && (params.sh.highlights > 0 || params.sh.shadows > 0);
 }
 
+bool labToolsVibranceActive(const procparams::ProcParams& params)
+{
+    if (!params.vibrance.enabled) {
+        return false;
+    }
+    if (params.vibrance.pastels != 0 || params.vibrance.saturated != 0) {
+        return true;
+    }
+    /*
+     * ImProcFunctions::vibrance() keeps the hue curve only when it is not the
+     * identity, so an enabled but flat curve with both sliders at zero is a
+     * no-op there too.
+     */
+    DiagonalCurve curve(params.vibrance.skintonescurve, CURVES_MIN_POLY_POINTS);
+    return !curve.isIdentity();
+}
+
 bool labToolsSupported(const procparams::ProcParams& params)
 {
     /*
@@ -48,8 +65,7 @@ bool labToolsSupported(const procparams::ProcParams& params)
         return false;
     }
 
-    if (params.localContrast.enabled || params.epd.enabled ||
-        params.vibrance.enabled) {
+    if (params.localContrast.enabled || params.epd.enabled) {
         return false;
     }
 
@@ -59,6 +75,40 @@ bool labToolsSupported(const procparams::ProcParams& params)
      */
     if (params.blackwhite.enabled) {
         return false;
+    }
+
+    /*
+     * Vibrance runs on the device only when its parameters are inside the
+     * slider ranges the ABI validates and, for the avoidcolorshift path, the
+     * Munsell tables exist. A no-op vibrance is not a device case: the node
+     * would only be the other tools, or nothing.
+     */
+    const bool vibrance = labToolsVibranceActive(params);
+    if (params.vibrance.enabled) {
+        const auto in_range = [](int value, int low, int high) {
+            return value >= low && value <= high;
+        };
+        if (!in_range(params.vibrance.pastels, -100, 100) ||
+            !in_range(params.vibrance.saturated, -100, 100) ||
+            !in_range(params.vibrance.psthreshold.getTopLeft(), 0, 100) ||
+            !in_range(params.vibrance.psthreshold.getBottomLeft(), 0, 100)) {
+            return false;
+        }
+        if (!vibrance) {
+            return false;
+        }
+        if (params.vibrance.avoidcolorshift) {
+            /*
+             * Color::init() fills the tables MunsellLch() reads. Without them
+             * neither path can run the correction, so the block is a residual.
+             */
+            const LUTf* first = Color::munsellLut(0);
+            if (Color::munsellLutCount() !=
+                    static_cast<int>(RT_LAB_TOOLS_MUNSELL_TABLES) ||
+                first == nullptr || first->getSize() == 0) {
+                return false;
+            }
+        }
     }
 
     /*
@@ -83,8 +133,9 @@ bool labToolsSupported(const procparams::ProcParams& params)
 
     return (params.colorToning.enabled &&
             params.colorToning.method == "LabGrid") ||
-           labToolsShadowsHighlightsActive(params);
+           labToolsShadowsHighlightsActive(params) || vibrance;
 }
+
 
 void labToolsHostBlock(ImProcFunctions& ipf,
                        const procparams::ProcParams& params,
@@ -319,6 +370,73 @@ int LabToolsContext::build(RtLabToolsResult& out)
         cachefy_[index] = Color::cachefy[static_cast<int>(index)];
     }
 
+    /*
+     * Vibrance. The skin curve and the Munsell table set are built here, from
+     * the same host code the block uses, so the device path and the host path
+     * read one set of tables. A process without Color::init() cannot run the
+     * block either, so the setup refuses rather than reading empty tables.
+     */
+    static_assert(Color::MUNSELL_LUT_COUNT ==
+                      static_cast<int>(RT_LAB_TOOLS_MUNSELL_TABLES),
+                  "the stage ABI and Color must agree on the Munsell table count");
+    vibrance_active_ = labToolsVibranceActive(params_);
+    skin_curve_set_ = false;
+    if (vibrance_active_) {
+        const std::size_t table_count = RT_LAB_TOOLS_MUNSELL_TABLES;
+        const std::size_t stride = RT_LAB_TOOLS_MUNSELL_STRIDE;
+        if (Color::munsellLutCount() != static_cast<int>(table_count)) {
+            return 1;
+        }
+        if (munsell_.size() != table_count * stride) {
+            munsell_.assign(table_count * stride, 0.f);
+            munsell_sizes_.assign(table_count, 0.f);
+        }
+        for (std::size_t table = 0; table < table_count; ++table) {
+            const LUTf* lut = Color::munsellLut(static_cast<int>(table));
+            if (lut == nullptr || lut->getSize() == 0 ||
+                lut->getSize() > stride) {
+                return 1;
+            }
+            munsell_sizes_[table] = static_cast<float>(lut->getSize());
+            for (std::size_t index = 0; index < stride; ++index) {
+                munsell_[table * stride + index] =
+                    index < lut->getSize()
+                        ? (*lut)[static_cast<int>(index)]
+                        : 0.f;
+            }
+        }
+
+        /*
+         * ImProcFunctions::vibrance()'s own construction: a diagonal curve,
+         * kept only when it is not the identity, filled by
+         * fillCurveArrayVib() and then divided by `ask`. The one-liner is
+         * duplicated here because fillCurveArrayVib() is file-local in
+         * ipvibrance.cc; the arithmetic is the same expression in the same
+         * order.
+         */
+        DiagonalCurve curve(params_.vibrance.skintonescurve,
+                            CURVES_MIN_POLY_POINTS);
+        skin_curve_set_ = !curve.isIdentity();
+        if (skin_curve_.size() != RT_LAB_TOOLS_SKIN_CURVE_ENTRIES) {
+            skin_curve_.assign(RT_LAB_TOOLS_SKIN_CURVE_ENTRIES, 0.f);
+        }
+        if (skin_curve_set_) {
+            /* ipvibrance.cc's skbeg, skend and ask. */
+            constexpr float SKIN_HUE_BEGIN = -0.05f;
+            constexpr float SKIN_HUE_END = 1.60f;
+            const float ask = 65535.f / (SKIN_HUE_END - SKIN_HUE_BEGIN);
+            for (std::size_t index = 0;
+                 index < RT_LAB_TOOLS_SKIN_CURVE_ENTRIES; ++index) {
+                skin_curve_[index] = static_cast<float>(
+                    65535.0 * curve.getVal(static_cast<double>(index) /
+                                           65535.0)) /
+                    ask;
+            }
+        } else {
+            std::fill(skin_curve_.begin(), skin_curve_.end(), 0.f);
+        }
+    }
+
     out.labgrid = labgrid_;
     out.lut_highlight = lut_highlight_.data();
     out.lut_shadow = lut_shadow_.data();
@@ -327,6 +445,13 @@ int LabToolsContext::build(RtLabToolsResult& out)
     out.iws = iws_;
     out.cachef = cachef_.data();
     out.cachefy = cachefy_.data();
+    out.munsell = vibrance_active_ ? munsell_.data() : nullptr;
+    out.munsell_sizes = vibrance_active_ ? munsell_sizes_.data() : nullptr;
+    out.skin_curve = vibrance_active_ ? skin_curve_.data() : nullptr;
+    out.munsell_tables =
+        vibrance_active_ ? static_cast<uint32_t>(RT_LAB_TOOLS_MUNSELL_TABLES)
+                         : 0u;
+    out.skin_curve_set = skin_curve_set_ ? 1u : 0u;
     built_ = true;
     return 0;
 }

@@ -56,6 +56,8 @@
 #include "stage/algorithms/sharpen_cl.h"
 #include "stage/algorithms/transform_cl.h"
 #include "stage/algorithms/lab_tools_cl.h"
+#include "stage/algorithms/munsell_lch_cl.h"
+#include "stage/algorithms/vibrance_cl.h"
 #include "stage/algorithms/working_trc_cl.h"
 #include "stage/lab_tools_context.h"
 #include "stage/working_trc_context.h"
@@ -763,15 +765,16 @@ const std::string& working_trc_source()
 
 /*
  * The lab.tools program: the LabGrid pass, the shadows/highlights mask,
- * guided-filter and blend passes. lab_tools_cl.h carries all of the node's
- * arithmetic, including its own Lab-cache lookups.
+ * guided-filter and blend passes, and vibrance. lab_tools_cl.h carries the
+ * block's own arithmetic and its Lab-cache lookups; the Munsell and vibrance
+ * fragments are appended because vibrance calls the Munsell correction.
  */
 const std::string& lab_tools_source()
 {
     static const std::string source =
         std::string("#pragma OPENCL FP_CONTRACT OFF\n"
                     "#pragma STDC FP_CONTRACT OFF\n") +
-        RT_LAB_TOOLS_CL;
+        RT_LAB_TOOLS_CL + RT_MUNSELL_LCH_CL + RT_VIBRANCE_CL;
     return source;
 }
 
@@ -1832,7 +1835,9 @@ cl_kernel compiled_kernel_entry(const std::shared_ptr<OpenCLEnv>& env,
     const char* build_options =
         std::strcmp(def->name, "working.trc") == 0 ||
                 std::strcmp(def->name, "lab.tools") == 0
-            ? "-cl-fp32-correctly-rounded-divide-sqrt"
+            ? (std::strcmp(def->name, "lab.tools") == 0
+                   ? "-cl-fp32-correctly-rounded-divide-sqrt -cl-opt-disable"
+                   : "-cl-fp32-correctly-rounded-divide-sqrt")
             : nullptr;
     build_error = env->api->BuildProgram(program, 1, &env->device,
                                          build_options, nullptr, nullptr);
@@ -3278,11 +3283,20 @@ RtStageStatus run_working_trc(const std::shared_ptr<OpenCLEnv>& env,
  *   [13] int radius, [14] int Lab mode, [15] int scale,
  *   [16] BUFFER highlight tone table, [17] BUFFER shadow tone table,
  *   [18] BUFFER working RGB -> XYZ, [19] BUFFER XYZ -> working RGB,
- *   [20] BUFFER Color::cachef, [21] BUFFER Color::cachefy.
+ *   [20] BUFFER Color::cachef, [21] BUFFER Color::cachefy,
+ *   [22] int vibrance flag (1 only when ImProcFunctions::vibrance() would
+ *        run and the host setup built its tables),
+ *   [23] int pastels, [24] int saturated,
+ *   [25] int pastels/saturated threshold top, [26] int threshold bottom,
+ *   [27] int protectskins, [28] int avoidcolorshift,
+ *   [29] int skin curve set, [30] int highlight (toneCurve.hrenabled),
+ *   [31] BUFFER the flat Munsell table set (197 x 140 floats),
+ *   [32] BUFFER one float per Munsell table: that table's own length,
+ *   [33] BUFFER the vibrance skin curve (65536 floats when [29] is 1).
  *
  * The pass order is the block's own: LabGrid, then the highlight round, then
- * the shadow round. Each round writes the full image, so the work is
- * sequential in that order and no round can run out of order.
+ * the shadow round, then vibrance. Each tool writes the full image, so the
+ * work is sequential in that order and no pass can run out of order.
  *
  * A clear support flag refuses before the upload: that is the residual path,
  * and it makes the CPU builtin - the extracted host block - execute and record
@@ -3294,7 +3308,7 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
                             const std::vector<RtStageArg>& args,
                             std::string& error)
 {
-    constexpr std::size_t ARG_COUNT = 22;
+    constexpr std::size_t ARG_COUNT = 34;
     constexpr int SUBSAMPLING = 4;
     /* guidedfilter.h's epsilon, passed to f_mean() by shadowsHighlights(). */
     constexpr float LAB_TOOLS_EPSILON = 0.075f;
@@ -3303,6 +3317,9 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
      * host), but a negative or absurd value is refused rather than clamped. */
     constexpr int MAX_SLIDER = 100;
     constexpr int MAX_AMOUNT = 10000;
+    /* ipvibrance.cc's pastels/saturated range, and its threshold range. */
+    constexpr int MIN_VIBRANCE = -100;
+    constexpr int MAX_VIBRANCE = 100;
 
     if (args.size() != ARG_COUNT) {
         error = "lab.tools expects a Lab buffer, a context and its parameters";
@@ -3320,6 +3337,12 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
         kinds = kinds && args[index].kind == RT_STAGE_ARG_INT;
     }
     for (std::size_t index = 16; index <= 21; ++index) {
+        kinds = kinds && args[index].kind == RT_STAGE_ARG_BUFFER;
+    }
+    for (std::size_t index = 22; index <= 30; ++index) {
+        kinds = kinds && args[index].kind == RT_STAGE_ARG_INT;
+    }
+    for (std::size_t index = 31; index <= 33; ++index) {
         kinds = kinds && args[index].kind == RT_STAGE_ARG_BUFFER;
     }
     if (!kinds) {
@@ -3387,7 +3410,50 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
         return RT_STAGE_INVALID;
     }
     const bool sh_active = sh_enabled != 0 && (highlights > 0 || shadows > 0);
-    if (!labgrid && !sh_active) {
+
+    /*
+     * Vibrance. The flag is the call site's labToolsVibranceActive(): it is 1
+     * only when the block would touch a pixel, so a vibrance block with both
+     * sliders at zero and an identity skin curve stays on the host.
+     */
+    const std::int64_t vibrance_flag = args[22].u.i;
+    if (vibrance_flag != 0 && vibrance_flag != 1) {
+        error = "lab.tools vibrance flag must be 0 or 1";
+        return RT_STAGE_INVALID;
+    }
+    const bool vibrance = vibrance_flag != 0;
+    int pastels = 0;
+    int saturated = 0;
+    int threshold_top = 0;
+    int threshold_bottom = 0;
+    int protectskins = 0;
+    int avoidcolorshift = 0;
+    int skin_curve_set = 0;
+    int vibrance_highlight = 0;
+    if (vibrance) {
+        const auto in = [&](std::size_t index, int low, int high) {
+            const std::int64_t value = args[index].u.i;
+            return value >= low && value <= high ? static_cast<int>(value)
+                                                 : low - 1;
+        };
+        pastels = in(23, MIN_VIBRANCE, MAX_VIBRANCE);
+        saturated = in(24, MIN_VIBRANCE, MAX_VIBRANCE);
+        threshold_top = in(25, 0, MAX_SLIDER);
+        threshold_bottom = in(26, 0, MAX_SLIDER);
+        protectskins = in(27, 0, 1);
+        avoidcolorshift = in(28, 0, 1);
+        skin_curve_set = in(29, 0, 1);
+        vibrance_highlight = in(30, 0, 1);
+        if (pastels < MIN_VIBRANCE || saturated < MIN_VIBRANCE ||
+            threshold_top < 0 || threshold_bottom < 0 || protectskins < 0 ||
+            avoidcolorshift < 0 || skin_curve_set < 0 ||
+            vibrance_highlight < 0) {
+            error = "lab.tools has a vibrance parameter outside its range";
+            return RT_STAGE_INVALID;
+        }
+    }
+
+    if (!labgrid && !sh_active && !vibrance) {
         error = "lab.tools has no enabled tool";
         return RT_STAGE_FALLBACK;
     }
@@ -3428,6 +3494,36 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
         }
     }
 
+    const RtStageBuffer& munsell = args[31].u.buffer;
+    const RtStageBuffer& munsell_sizes = args[32].u.buffer;
+    const RtStageBuffer& skin_curve = args[33].u.buffer;
+    if (vibrance) {
+        if (avoidcolorshift != 0) {
+            const std::uint32_t flats =
+                RT_LAB_TOOLS_MUNSELL_TABLES * RT_LAB_TOOLS_MUNSELL_STRIDE;
+            if (!valid(munsell) || munsell.format != RT_STAGE_F32 ||
+                munsell.planes != 1 || munsell.height != 1 ||
+                static_cast<std::uint32_t>(munsell.width) != flats ||
+                !valid(munsell_sizes) ||
+                munsell_sizes.format != RT_STAGE_F32 ||
+                munsell_sizes.planes != 1 || munsell_sizes.height != 1 ||
+                static_cast<std::uint32_t>(munsell_sizes.width) !=
+                    RT_LAB_TOOLS_MUNSELL_TABLES) {
+                error = "lab.tools needs the flat Munsell table set";
+                return RT_STAGE_INVALID;
+            }
+        }
+        if (!valid(skin_curve) || skin_curve.format != RT_STAGE_F32 ||
+            skin_curve.planes != 1 || skin_curve.height != 1 ||
+            (skin_curve_set != 0 &&
+             static_cast<std::uint32_t>(skin_curve.width) !=
+                 RT_LAB_TOOLS_SKIN_CURVE_ENTRIES) ||
+            (skin_curve_set == 0 && skin_curve.width < 1)) {
+            error = "lab.tools needs the vibrance skin curve";
+            return RT_STAGE_INVALID;
+        }
+    }
+
     const int width = lab.width;
     const int height = lab.height;
     if (lab.row_pitch % sizeof(float) != 0 ||
@@ -3462,10 +3558,13 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
         error);
     cl_kernel labgrid_kernel =
         compiled_kernel_entry(env, def, "rt_lab_tools_labgrid", error);
+    cl_kernel vibrance_kernel =
+        compiled_kernel_entry(env, def, "rt_lab_tools_vibrance", error);
     if (mask_kernel == nullptr || subsample_kernel == nullptr ||
         box_h_kernel == nullptr || box_v_kernel == nullptr ||
         combine_kernel == nullptr || upsample_kernel == nullptr ||
-        apply_kernel == nullptr || labgrid_kernel == nullptr) {
+        apply_kernel == nullptr || labgrid_kernel == nullptr ||
+        vibrance_kernel == nullptr) {
         return RT_STAGE_FALLBACK;
     }
 
@@ -3489,6 +3588,9 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
     char iws_key = 0;
     char cachef_key = 0;
     char cachefy_key = 0;
+    char munsell_key = 0;
+    char munsell_sizes_key = 0;
+    char skin_curve_key = 0;
     StageDeviceBufferPtr full =
         residency->acquire(&full_key, full_shape, &error);
     StageDeviceBufferPtr sub_i1 =
@@ -3519,22 +3621,61 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
         residency->acquire(&cachef_key, cache_shape, &error);
     StageDeviceBufferPtr cachefy_device =
         residency->acquire(&cachefy_key, cache_shape, &error);
+
+    /* Vibrance's three host-built tables, acquired only when vibrance runs. */
+    const StageBufferShape munsell_shape{
+        RT_STAGE_F32,
+        static_cast<std::int32_t>(RT_LAB_TOOLS_MUNSELL_TABLES *
+                                  RT_LAB_TOOLS_MUNSELL_STRIDE),
+        1, 1};
+    const StageBufferShape munsell_sizes_shape{
+        RT_STAGE_F32,
+        static_cast<std::int32_t>(RT_LAB_TOOLS_MUNSELL_TABLES), 1, 1};
+    /* The host passes one float when the curve is the identity, which the
+     * kernel never reads; the buffer shape follows that width. */
+    const StageBufferShape skin_curve_shape{
+        RT_STAGE_F32,
+        skin_curve_set != 0
+            ? static_cast<std::int32_t>(RT_LAB_TOOLS_SKIN_CURVE_ENTRIES)
+            : 1,
+        1, 1};
+    StageDeviceBufferPtr munsell_device;
+    StageDeviceBufferPtr munsell_sizes_device;
+    StageDeviceBufferPtr skin_curve_device;
+    if (vibrance) {
+        munsell_device = residency->acquire(&munsell_key, munsell_shape, &error);
+        munsell_sizes_device =
+            residency->acquire(&munsell_sizes_key, munsell_sizes_shape, &error);
+        skin_curve_device =
+            residency->acquire(&skin_curve_key, skin_curve_shape, &error);
+    }
     if (!lab_device || !full || !sub_i1 || !sub_p1 || !sub_meani ||
         !sub_meanp || !sub_temp || !lut_highlight_device ||
         !lut_shadow_device || !ws_device || !iws_device || !cachef_device ||
-        !cachefy_device) {
+        !cachefy_device ||
+        (vibrance && (!munsell_device || !munsell_sizes_device ||
+                      !skin_curve_device))) {
         return RT_STAGE_FALLBACK;
     }
 
-    if (residency->upload(lab_device, lab) != RT_STAGE_OK ||
-        residency->upload(lut_highlight_device, lut_highlight) !=
-            RT_STAGE_OK ||
-        residency->upload(lut_shadow_device, lut_shadow) != RT_STAGE_OK ||
-        residency->upload(ws_device, ws) != RT_STAGE_OK ||
-        residency->upload(iws_device, iws) != RT_STAGE_OK ||
-        residency->upload(cachef_device, cachef) != RT_STAGE_OK ||
-        residency->upload(cachefy_device, cachefy) != RT_STAGE_OK) {
-        error = "lab.tools setup upload failed";
+    const auto upload = [&](const StageDeviceBufferPtr& buffer,
+                            const RtStageBuffer& host, const char* label) {
+        if (residency->upload(buffer, host) != RT_STAGE_OK) {
+            error = std::string("lab.tools setup upload failed: ") + label;
+            return false;
+        }
+        return true;
+    };
+    if (!upload(lab_device, lab, "lab") ||
+        !upload(lut_highlight_device, lut_highlight, "highlight") ||
+        !upload(lut_shadow_device, lut_shadow, "shadow") ||
+        !upload(ws_device, ws, "ws") || !upload(iws_device, iws, "iws") ||
+        !upload(cachef_device, cachef, "cachef") ||
+        !upload(cachefy_device, cachefy, "cachefy") ||
+        (vibrance &&
+         (!upload(munsell_device, munsell, "munsell") ||
+          !upload(munsell_sizes_device, munsell_sizes, "munsell sizes") ||
+          !upload(skin_curve_device, skin_curve, "skin curve")))) {
         return RT_STAGE_FALLBACK;
     }
 
@@ -3565,6 +3706,18 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
             return RT_STAGE_FALLBACK;
         }
     }
+    for (const StageDeviceBufferPtr* buffer :
+         {&munsell_device, &munsell_sizes_device, &skin_curve_device}) {
+        if (*buffer == nullptr) {
+            continue;
+        }
+        if ((*buffer)->row_pitch() % sizeof(float) != 0 ||
+            pitch_of(*buffer) <
+                static_cast<std::size_t>((*buffer)->shape().width)) {
+            error = "lab.tools table pitch does not cover the table";
+            return RT_STAGE_FALLBACK;
+        }
+    }
 
     cl_mem lab_memory = memory_of(lab_device);
     cl_mem full_memory = memory_of(full);
@@ -3579,13 +3732,22 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
     cl_mem iws_memory = memory_of(iws_device);
     cl_mem cachef_memory = memory_of(cachef_device);
     cl_mem cachefy_memory = memory_of(cachefy_device);
+    cl_mem munsell_memory =
+        vibrance ? memory_of(munsell_device) : nullptr;
+    cl_mem munsell_sizes_memory =
+        vibrance ? memory_of(munsell_sizes_device) : nullptr;
+    cl_mem skin_curve_memory =
+        vibrance ? memory_of(skin_curve_device) : nullptr;
     if (lab_memory == nullptr || full_memory == nullptr ||
         i1_memory == nullptr || p1_memory == nullptr ||
         meani_memory == nullptr || meanp_memory == nullptr ||
         temp_memory == nullptr || hl_memory == nullptr ||
         sh_memory == nullptr || ws_memory == nullptr ||
         iws_memory == nullptr || cachef_memory == nullptr ||
-        cachefy_memory == nullptr) {
+        cachefy_memory == nullptr ||
+        (vibrance && (munsell_memory == nullptr ||
+                      munsell_sizes_memory == nullptr ||
+                      skin_curve_memory == nullptr))) {
         error = "lab.tools could not address its device buffers";
         return RT_STAGE_FALLBACK;
     }
@@ -3924,6 +4086,60 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
         if (sh_enabled != 0 && shadows > 0 &&
             !run_round(false, stonalwidth, sh_memory)) {
             return RT_STAGE_FALLBACK;
+        }
+
+        if (vibrance) {
+            const cl_int cl_pastels = pastels;
+            const cl_int cl_saturated = saturated;
+            const cl_int cl_threshold_top = threshold_top;
+            const cl_int cl_threshold_bottom = threshold_bottom;
+            const cl_int cl_protectskins = protectskins;
+            const cl_int cl_avoidcolorshift = avoidcolorshift;
+            const cl_int cl_skin_curve_set = skin_curve_set;
+            const cl_int cl_vibrance_highlight = vibrance_highlight;
+            cl_uint arg = 0;
+            bool ok = true;
+            ok = ok && set_arg(vibrance_kernel, arg++, sizeof(cl_mem),
+                               &lab_memory);
+            ok = ok && set_arg(vibrance_kernel, arg++, sizeof(cl_int),
+                               &cl_width);
+            ok = ok && set_arg(vibrance_kernel, arg++, sizeof(cl_int),
+                               &cl_height);
+            ok = ok && set_arg(vibrance_kernel, arg++, sizeof(cl_int),
+                               &lab_pitch);
+            ok = ok && set_arg(vibrance_kernel, arg++, sizeof(cl_int),
+                               &lab_plane);
+            ok = ok && set_arg(vibrance_kernel, arg++, sizeof(cl_mem),
+                               &iws_memory);
+            ok = ok && set_arg(vibrance_kernel, arg++, sizeof(cl_mem),
+                               &skin_curve_memory);
+            ok = ok && set_arg(vibrance_kernel, arg++, sizeof(cl_int),
+                               &cl_skin_curve_set);
+            ok = ok && set_arg(vibrance_kernel, arg++, sizeof(cl_mem),
+                               &munsell_memory);
+            ok = ok && set_arg(vibrance_kernel, arg++, sizeof(cl_mem),
+                               &munsell_sizes_memory);
+            ok = ok && set_arg(vibrance_kernel, arg++, sizeof(cl_int),
+                               &cl_pastels);
+            ok = ok && set_arg(vibrance_kernel, arg++, sizeof(cl_int),
+                               &cl_saturated);
+            ok = ok && set_arg(vibrance_kernel, arg++, sizeof(cl_int),
+                               &cl_threshold_top);
+            ok = ok && set_arg(vibrance_kernel, arg++, sizeof(cl_int),
+                               &cl_threshold_bottom);
+            ok = ok && set_arg(vibrance_kernel, arg++, sizeof(cl_int),
+                               &cl_protectskins);
+            ok = ok && set_arg(vibrance_kernel, arg++, sizeof(cl_int),
+                               &cl_avoidcolorshift);
+            ok = ok && set_arg(vibrance_kernel, arg++, sizeof(cl_int),
+                               &cl_vibrance_highlight);
+            if (!ok) {
+                error = "lab.tools vibrance arguments failed";
+                return RT_STAGE_FALLBACK;
+            }
+            if (!launch(vibrance_kernel, image_global, "lab.tools vibrance")) {
+                return RT_STAGE_FALLBACK;
+            }
         }
     }
 
