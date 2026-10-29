@@ -94,7 +94,10 @@ round is within one LSB16. Vibrance is a port of `ImProcFunctions::vibrance()`
 including `Color::gamutLchonly()`, `Color::SkinSat()`, the two-stage chroma
 ramp and the `avoidcolorshift` path through `Color::AllMunsellLch()`; the
 host builds the Munsell table set, the skin-hue curve and the two Lab caches,
-so the device reads exactly the host's tables. Everything else in the block
+so the device reads exactly the host's tables. Vibrance is admitted only on a
+CPU OpenCL device: a GPU's `xatan2f()` division rounds differently and moves
+pixels on a Munsell limit, so a GPU submission runs the host block and records
+`impl=host`. Everything else in the block
 is a residual: Lab curves (which own the histogram refill and the Lab LUTs; a
 non-zero `contrast` is excluded with them), local contrast, EPD,
 black-and-white output, any colour-toning method other than `LabGrid`
