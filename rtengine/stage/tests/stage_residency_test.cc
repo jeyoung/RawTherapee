@@ -7254,6 +7254,9 @@ void test_local_adjustments(bool available)
         rtengine::lcmsMutex = &local_adjustments_lcms_mutex;
     }
     static rtengine::Settings local_adjustments_settings{};
+    /* options.cc's production default: low values make the L=f(H) curve
+     * extremely sensitive to the clamp's last-bit differences. */
+    local_adjustments_settings.amchroma = 40;
     rtengine::settings = &local_adjustments_settings;
     rtengine::Color::init();
 
@@ -7278,27 +7281,8 @@ void test_local_adjustments(bool available)
     /* The residual matrix: one otherwise supported profile per entry. */
     {
         const LocalAdjustmentsResidual residuals[] = {
-            {"inactive spot", [](auto& p) {
-                 p.locallab.spots[0].activ = false;
-             }},
-            {"two spots", [](auto& p) {
-                 p.locallab.spots.push_back(localAdjustmentsSpot(
-                     "second", 300, 200, 600, true, 20, 5, -5));
-             }},
             {"MUNS", [](auto& p) {
                  p.locallab.spots[0].avoidgamutMethod = "MUNS";
-             }},
-            {"quality curves", [](auto& p) {
-                 p.locallab.spots[0].qualitycurveMethod = "std";
-                 p.locallab.spots[0].llcurve = {
-                     3.0, 0.0, 0.0, 0.5, 0.7, 1.0, 1.0};
-             }},
-            {"hue curve", [](auto& p) {
-                 p.locallab.spots[0].LHcurve = {
-                     1.0, 0.0, 0.5, 0.35, 0.35, 0.5, 0.6, 0.35, 0.35};
-             }},
-            {"rectangular shape", [](auto& p) {
-                 p.locallab.spots[0].shape = "RECT";
              }},
             {"exposure", [](auto& p) {
                  p.locallab.spots[0].expexpose = true;
@@ -7378,6 +7362,31 @@ void test_local_adjustments(bool available)
              }},
             {"highlight reconstruction", [](auto& p) {
                  p.toneCurve.hrenabled = true;
+             }},
+            {"shadows/highlights", [](auto& p) {
+                 p.locallab.spots[0].expshadhigh = true;
+             }},
+            {"recursion", [](auto& p) {
+                 p.locallab.spots[0].recurs = true;
+             }},
+            {"exclude spot", [](auto& p) {
+                 p.locallab.spots[0].spotMethod = "exc";
+             }},
+            {"merge", [](auto& p) {
+                 p.locallab.spots[0].merMethod = "mtwo";
+             }},
+            {"LAB gamut", [](auto& p) {
+                 p.locallab.spots[0].avoidgamutMethod = "LAB";
+             }},
+            {"XYZ gamut", [](auto& p) {
+                 p.locallab.spots[0].avoidgamutMethod = "XYZ";
+             }},
+            {"avoid radius", [](auto& p) {
+                 p.locallab.spots[0].avoidrad = 5.0;
+             }},
+            {"RGB curve", [](auto& p) {
+                 p.locallab.spots[0].rgbcurve = {
+                     3.0, 0.0, 0.0, 0.5, 0.7, 1.0, 1.0};
              }},
             {"blur radius", [](auto& p) {
                  p.locallab.spots[0].blurcolde = 101;
@@ -7509,6 +7518,170 @@ void test_local_adjustments(bool available)
         skip("local.adjustments: no OpenCL device");
     }
 
+    /* Multi-spot state, RECT, inactive spots, curves and MUNS. Each case is
+     * built from scratch so the make lambda owns the spot list. */
+    {
+        const auto diagonal = [](double mid) {
+            return std::vector<double>{3.0, 0.0, 0.0, 0.5, mid, 1.0, 1.0};
+        };
+        const auto flat = [](double mid) {
+            return std::vector<double>{1.0, 0.0, 0.5, 0.35, 0.35,
+                                       0.5, mid, 0.35, 0.35};
+        };
+        const auto add_spot = [](rtengine::procparams::ProcParams& params,
+                                 int cx, int cy, int extent, bool active,
+                                 int chroma, int lightness, int contrast,
+                                 const char* shape,
+                                 const char* avoid) {
+            auto spot = localAdjustmentsSpot("spot", cx, cy, extent, active,
+                                             chroma, lightness, contrast);
+            spot.shape = shape;
+            spot.avoidgamutMethod = avoid;
+            params.locallab.spots.push_back(spot);
+        };
+
+        struct ComplexCase {
+            std::string label;
+            int width;
+            int height;
+            std::function<void(rtengine::procparams::ProcParams&)> make;
+        };
+        std::vector<ComplexCase> complex;
+        complex.push_back({"two ELI", 238, 64, [&](auto& p) {
+            add_spot(p, -300, -150, 700, true, 40, 8, 0, "ELI", "NONE");
+            add_spot(p, 300, 150, 700, true, -30, 0, 10, "ELI", "NONE");
+        }});
+        complex.push_back({"three ELI", 238, 64, [&](auto& p) {
+            add_spot(p, -300, -150, 700, true, 40, 8, 0, "ELI", "NONE");
+            add_spot(p, 300, 150, 700, true, -30, 0, 10, "ELI", "NONE");
+            add_spot(p, 0, 0, 500, true, 10, -5, 5, "ELI", "NONE");
+        }});
+        complex.push_back({"three ELI reversed", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 500, true, 10, -5, 5, "ELI", "NONE");
+            add_spot(p, 300, 150, 700, true, -30, 0, 10, "ELI", "NONE");
+            add_spot(p, -300, -150, 700, true, 40, 8, 0, "ELI", "NONE");
+        }});
+        complex.push_back({"RECT", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 35, 10, -5, "RECT", "NONE");
+        }});
+        complex.push_back({"RECT two", 179, 49, [&](auto& p) {
+            add_spot(p, -200, -100, 700, true, 35, 10, -5, "RECT", "NONE");
+            add_spot(p, 200, 100, 600, true, -20, -5, 8, "RECT", "NONE");
+        }});
+        complex.push_back({"inactive then active", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 700, false, 0, 0, 0, "ELI", "NONE");
+            add_spot(p, 100, 100, 600, true, 35, 10, -5, "ELI", "NONE");
+        }});
+        complex.push_back({"active then inactive", 238, 64, [&](auto& p) {
+            add_spot(p, 100, 100, 600, true, 35, 10, -5, "ELI", "NONE");
+            add_spot(p, 0, 0, 700, false, 0, 0, 0, "ELI", "NONE");
+        }});
+        const auto curve_case = [&](const char* label,
+                                    std::function<void(
+                                        rtengine::procparams::LocallabParams::
+                                            LocallabSpot&)> set) {
+            complex.push_back({label, 238, 64, [&, set](auto& p) {
+                add_spot(p, 0, 0, 800, true, 35, 10, -5, "ELI", "NONE");
+                p.locallab.spots[0].qualitycurveMethod = "std";
+                set(p.locallab.spots[0]);
+            }});
+        };
+        curve_case("L=f(L)", [&](auto& spot) { spot.llcurve = diagonal(0.7); });
+        curve_case("C=f(L)", [&](auto& spot) { spot.clcurve = diagonal(0.65); });
+        curve_case("L=f(C)", [&](auto& spot) { spot.lccurve = diagonal(1.3); });
+        curve_case("C=f(C)", [&](auto& spot) { spot.cccurve = diagonal(1.2); });
+        curve_case("H=f(H)", [&](auto& spot) { spot.HHcurve = flat(0.7); });
+        curve_case("L=f(H)", [&](auto& spot) { spot.LHcurve = flat(0.7); });
+        complex.push_back({"L=f(H) only", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            p.locallab.spots[0].qualitycurveMethod = "std";
+            p.locallab.spots[0].LHcurve = flat(0.7);
+        }});
+        curve_case("C=f(H)", [&](auto& spot) { spot.CHcurve = flat(0.7); });
+        complex.push_back({"all curves", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 35, 10, -5, "ELI", "NONE");
+            auto& spot = p.locallab.spots[0];
+            spot.qualitycurveMethod = "std";
+            spot.llcurve = diagonal(0.7);
+            spot.clcurve = diagonal(0.65);
+            spot.lccurve = diagonal(1.3);
+            spot.cccurve = diagonal(1.2);
+            spot.HHcurve = flat(0.7);
+            spot.LHcurve = flat(0.7);
+            spot.CHcurve = flat(0.7);
+        }});
+        complex.push_back({"gate multispot", 238, 64, [&](auto& p) {
+            add_spot(p, -400, -200, 700, true, 30, 10, 5, "ELI", "NONE");
+            p.locallab.spots[0].qualitycurveMethod = "std";
+            p.locallab.spots[0].llcurve = diagonal(0.7);
+            add_spot(p, 300, 200, 600, true, -20, -8, 10, "RECT", "NONE");
+            p.locallab.spots[1].qualitycurveMethod = "std";
+            p.locallab.spots[1].cccurve = diagonal(1.2);
+            add_spot(p, 0, 0, 500, false, 0, 0, 0, "ELI", "NONE");
+            p.locallab.spots[2].qualitycurveMethod = "none";
+        }});
+
+        std::unique_ptr<LabImage> forward_three;
+        for (const ComplexCase& c : complex) {
+            rtengine::procparams::ProcParams reference_params;
+            reference_params.locallab.enabled = true;
+            c.make(reference_params);
+            check(localAdjustmentsSupported(reference_params),
+                  "the complex local.adjustments case is inside the "
+                  "predicate");
+
+            Imagefloat reference_base(c.width, c.height);
+            fill_local_adjustments_rgb(reference_base, 211u);
+            std::unique_ptr<LabImage> reference_lab(
+                new LabImage(c.width, c.height));
+            rtengine::ImProcFunctions reference_ipf(&reference_params, false);
+            localAdjustmentsHostBlock(reference_ipf, reference_params,
+                                      &reference_base, reference_lab.get(),
+                                      c.width, c.height);
+
+            rtengine::procparams::ProcParams node_params = reference_params;
+            Imagefloat node_base(c.width, c.height);
+            fill_local_adjustments_rgb(node_base, 211u);
+            std::unique_ptr<LabImage> node_lab(
+                new LabImage(c.width, c.height));
+            rtengine::ImProcFunctions node_ipf(&node_params, false);
+            const RtStageStatus status = run_local_adjustments_node(
+                node_base, *node_lab, node_params, node_ipf, profile_path);
+            check(status == RT_STAGE_OK,
+                  "the complex local.adjustments case completes through run");
+            const std::string profile = read_file(profile_path);
+            if (cpu_device) {
+                check(profile.find("\"impl\":\"opencl\"") !=
+                          std::string::npos,
+                      "the complex case records a device pass");
+                check(profile.find("\"impl\":\"host\"") ==
+                          std::string::npos,
+                      "the complex case never falls back");
+            }
+            const Diff diff =
+                compare(view(*reference_lab), view(*node_lab));
+            std::printf("stage-residency: local.adjustments complex %s: "
+                        "PAE %.6f LSB16, %zu of %zu samples differ\n",
+                        c.label.c_str(), diff.max_abs, diff.differing,
+                        diff.samples);
+            check(diff.finite && diff.max_abs <= 1.0,
+                  "the complex local.adjustments case is within 1 LSB16");
+            if (c.label == "three ELI") {
+                forward_three.reset(new LabImage(*reference_lab, true));
+            }
+            if (c.label == "three ELI reversed" &&
+                forward_three != nullptr) {
+                const Diff order =
+                    compare(view(*forward_three), view(*reference_lab));
+                std::printf("stage-residency: local.adjustments order: "
+                            "%zu of %zu samples differ, PAE %.6f LSB16\n",
+                            order.differing, order.samples, order.max_abs);
+                check(order.differing > 0,
+                      "reversing the spot order changes the result");
+            }
+        }
+    }
+
     /* A 4-pixel ROI is below Lab_Local()'s mSP=5 colour floor. The block
      * still runs the prefilter and tail clamp but does no colour work, so the
      * launcher refuses and the host builtin must match it exactly. */
@@ -7561,17 +7734,8 @@ void test_local_adjustments(bool available)
      * and match the block byte for byte. */
     {
         const LocalAdjustmentsResidual residuals[] = {
-            {"multi-spot", [](auto& p) {
-                 p.locallab.spots.push_back(localAdjustmentsSpot(
-                     "second", 300, 200, 600, true, 20, 5, -5));
-             }},
             {"MUNS", [](auto& p) {
                  p.locallab.spots[0].avoidgamutMethod = "MUNS";
-             }},
-            {"quality curve", [](auto& p) {
-                 p.locallab.spots[0].qualitycurveMethod = "std";
-                 p.locallab.spots[0].llcurve = {
-                     3.0, 0.0, 0.0, 0.5, 0.7, 1.0, 1.0};
              }},
             {"explicit mask", [](auto& p) {
                  p.locallab.spots[0].enaColorMask = true;
