@@ -5171,6 +5171,42 @@ void test_lab_tools_lab_curve(bool available)
 /* ---------------------------------------------- lab.tools local contrast */
 
 /*
+ * A wide, non-integer Lab fixture for the IIR tail. The host's non-vectorised
+ * tail lines subtract a float source from a float forward state before the
+ * double boundary matrix multiplies the deviation. Random data over a wide
+ * range rarely makes that subtraction round; alternating a large value with a
+ * tiny one does, because the exact difference needs more mantissa bits than a
+ * float has. L therefore alternates between about 30000 and about 0.4, with
+ * fractional parts, and a,b carry fractional values as well.
+ */
+void fill_lab_tools_wide(LabImage& lab, unsigned seed)
+{
+    const int width = lab.W;
+    const int height = lab.H;
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            const unsigned hash =
+                (seed * 2654435761u + static_cast<unsigned>(x) * 2246822519u +
+                 static_cast<unsigned>(y) * 3266489917u) >>
+                7;
+            lab.L[y][x] = (hash & 1u) == 0u
+                              ? 30000.0f +
+                                    static_cast<float>(hash % 1024u) * 0.0123f
+                              : 0.37f +
+                                    static_cast<float>(hash % 997u) * 0.001f;
+            lab.a[y][x] =
+                static_cast<float>(static_cast<int>((hash / 3u) % 48000u) -
+                                   24000) +
+                0.25f;
+            lab.b[y][x] =
+                static_cast<float>(static_cast<int>((hash / 11u) % 48000u) -
+                                   24000) +
+                0.75f;
+        }
+    }
+}
+
+/*
  * Local contrast is a device pass of its own: the host blur is a separable
  * Young-van Vliet IIR filter, and gaussianBlur() switches between the SSE
  * float path and the double path at sigma 25. The matrix below covers both
@@ -5212,31 +5248,55 @@ void test_lab_tools_local_contrast(bool available)
         bool labCurve;
         bool shadows;
         bool vibrance;
+        bool wide;
     };
     const LocalContrastCase cases[] = {
-        /* label, w, h, radius, amount, dark, light, lab curve, sh, vibrance */
-        {"radius 1", 238, 64, 1, 1.0, 1.0, 1.0, false, false, false},
-        {"radius 10", 238, 64, 10, 1.0, 1.0, 1.0, false, false, false},
-        {"radius 40", 238, 64, 40, 1.0, 1.0, 1.0, false, false, false},
-        {"radius 80", 238, 64, 80, 1.0, 1.0, 1.0, false, false, false},
-        {"radius 100", 238, 64, 100, 1.0, 1.0, 1.0, false, false, false},
-        {"amount 0", 238, 64, 40, 0.0, 1.0, 1.0, false, false, false},
-        {"amount 0.1", 238, 64, 40, 0.1, 1.0, 1.0, false, false, false},
-        {"amount 2", 238, 64, 40, 2.0, 1.0, 1.0, false, false, false},
-        {"darkness 0.5", 238, 64, 40, 1.0, 0.5, 1.0, false, false, false},
-        {"lightness 2", 238, 64, 40, 1.0, 1.0, 2.0, false, false, false},
+        /* label, w, h, radius, amount, dark, light, lab curve, sh, vibrance,
+         * wide */
+        {"radius 1", 238, 64, 1, 1.0, 1.0, 1.0, false, false, false, false},
+        {"radius 10", 238, 64, 10, 1.0, 1.0, 1.0, false, false, false, false},
+        {"radius 40", 238, 64, 40, 1.0, 1.0, 1.0, false, false, false, false},
+        {"radius 80", 238, 64, 80, 1.0, 1.0, 1.0, false, false, false, false},
+        {"radius 100", 238, 64, 100, 1.0, 1.0, 1.0, false, false, false,
+         false},
+        {"amount 0", 238, 64, 40, 0.0, 1.0, 1.0, false, false, false, false},
+        {"amount 0.1", 238, 64, 40, 0.1, 1.0, 1.0, false, false, false,
+         false},
+        {"amount 2", 238, 64, 40, 2.0, 1.0, 1.0, false, false, false, false},
+        {"darkness 0.5", 238, 64, 40, 1.0, 0.5, 1.0, false, false, false,
+         false},
+        {"lightness 2", 238, 64, 40, 1.0, 1.0, 2.0, false, false, false,
+         false},
         {"darkness 2 lightness 0.5", 238, 64, 40, 1.0, 2.0, 0.5, false,
-         false, false},
+         false, false, false},
         {"darkness 0.5 lightness 2", 179, 48, 80, 1.0, 0.5, 2.0, false, false,
+         false, false},
+        {"padded width 179", 179, 48, 40, 1.0, 1.0, 1.0, false, false, false,
          false},
-        {"padded width 179", 179, 48, 40, 1.0, 1.0, 1.0, false, false, false},
-        {"padded width 238", 238, 64, 80, 1.0, 1.0, 1.0, false, false, false},
-        {"odd height 50", 179, 50, 10, 1.0, 1.0, 1.0, false, false, false},
-        {"large width 8192", 8192, 64, 100, 1.0, 0.5, 2.0, false, false, false},
-        {"with Lab curve", 238, 64, 40, 1.0, 1.0, 1.0, true, false, false},
+        {"padded width 238", 238, 64, 80, 1.0, 1.0, 1.0, false, false, false,
+         false},
+        {"odd height 50", 179, 50, 10, 1.0, 1.0, 1.0, false, false, false,
+         false},
+        {"large width 8192", 8192, 64, 100, 1.0, 0.5, 2.0, false, false, false,
+         false},
+        /* sigma 24 is just below the double-path split, so every odd row and
+         * column tail runs the SSE path's double tail. The wide cases carry
+         * non-integer values outside 0..32767 so the float deviation rounding
+         * is visible; the integer case keeps that rounding invisible. */
+        {"sigma 24 integer", 179, 48, 24, 1.0, 1.0, 1.0, false, false, false,
+         false},
+        {"sigma 24 wide 179x50", 179, 50, 24, 1.0, 1.0, 1.0, false, false,
+         false, true},
+        {"sigma 24 wide 238x63", 238, 63, 24, 2.0, 0.5, 2.0, false, false,
+         false, true},
+        {"sigma 24 wide amount 2", 179, 50, 24, 2.0, 0.5, 2.0, false, false,
+         false, true},
+        {"with Lab curve", 238, 64, 40, 1.0, 1.0, 1.0, true, false, false,
+         false},
         {"with shadows/highlights", 238, 64, 40, 1.0, 0.5, 2.0, false, true,
+         false, false},
+        {"with vibrance", 238, 64, 40, 1.0, 0.5, 2.0, false, false, true,
          false},
-        {"with vibrance", 238, 64, 40, 1.0, 0.5, 2.0, false, false, true},
     };
 
     unsigned seed = 0x9e3779b9u;
@@ -5277,7 +5337,11 @@ void test_lab_tools_local_contrast(bool available)
                " runs the local-contrast pass").c_str());
 
         LabImage source(item.width, item.height);
-        fill_lab_tools(source, seed++);
+        if (item.wide) {
+            fill_lab_tools_wide(source, seed++);
+        } else {
+            fill_lab_tools(source, seed++);
+        }
 
         rtengine::ImProcFunctions cpu_ipf(&params, false);
         LabToolsHostState cpu_host;
@@ -5321,6 +5385,9 @@ void test_lab_tools_local_contrast(bool available)
         check(d.finite,
               (std::string("lab.tools local contrast ") + item.label +
                " stays finite").c_str());
+        check(d.exact == d.samples,
+              (std::string("lab.tools local contrast ") + item.label +
+               " is bit-exact").c_str());
         check(d.over == 0,
               (std::string("lab.tools local contrast ") + item.label +
                " is within one LSB16").c_str());
