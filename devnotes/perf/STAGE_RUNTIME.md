@@ -2032,8 +2032,9 @@ first pass is therefore not claimed as device work.
 
 The ABI is `[0]` the three-plane F32 Lab buffer, read and written in place,
 `[1]` the host-only `RtWorkingTrcContext` pointer (`RT_STAGE_ARG_PTR`), `[2]`
-the int support flag, 1 only when the call site admits the configuration and
-the host setup succeeded, `[3]` the double `icm.wapsat`, `[4]` the three-plane
+the int support flag, mirrored from the context descriptor; the launcher
+requires both to be 1, so a configuration or setup refusal reaches the
+builtin as `impl=host`, `[3]` the double `icm.wapsat`, `[4]` the three-plane
 F32 second-pass XYZ image from the host prefix and `[5]` the three-plane F32
 linear pre-TRC reference for `apsatur()`. The context is host-only: its
 `build` callback runs the setup-only probe, `buildGpuProfile()`, `toxyz` and
@@ -2046,7 +2047,8 @@ primaries and illuminant, `setupOnly` returns the profile, and
 its red TRC into the 65536-entry linear to encoded table. The kernel uses the
 table for `0 <= linear <= 1`, the exact `linear / c` inverse below the TRC
 breakpoint (where the table cannot resolve the first encoded codes) and the
-analytic inverse of lcms type 5 or -5 outside the table. `Color::cachef` and
+analytic inverse of lcms type 5 outside the table. A profile TRC of type -5
+is not admitted. `Color::cachef` and
 `Color::cachefy` are uploaded so RGB to Lab matches `Color::XYZ2Lab()` rather
 than re-evaluating the cube root. `#pragma OPENCL FP_CONTRACT OFF`,
 `#pragma STDC FP_CONTRACT OFF` and
@@ -2061,9 +2063,13 @@ a non-relative intent, non-default primaries or illuminant, soft light on,
 local contrast on, either tone equaliser on (`wmidtcie` or
 `wsmoothciesli`), black-and-white output (`fbw`), a first-pass sample above
 `WORKING_TRC_FIRST_PASS_MAX` (1.001, so a working-gamut overflow stays on the
-host), a profile that is not a matrix shaper, a TRC that is not lcms type 5 or
--5, or a `buildGpuProfile()` failure. The builtin disables device recursion
-and runs the original host block on the Lab buffer.
+host), a profile that is not a matrix shaper, a TRC that is not lcms type 5, or
+a `buildGpuProfile()` failure. The inverse type -5 curve is the named case: a
+CUSTOM `WorkingTRC` with gamma below 1 builds it (`gampos` 2.5, TRC parameters
+`0.868743, 0.131257, 0.222222, 0.100725` at gamma 0.4, slope 4.5). Its steep
+inverse amplifies the remaining float-versus-lcms second-pass residual through
+the Lab a-channel cancellation, so it stays on the host. The builtin disables
+device recursion and runs the original host block on the Lab buffer.
 
 Evidence, with `OMP_NUM_THREADS=1` and a 3888x2608 PEF:
 
@@ -2074,6 +2080,7 @@ Evidence, with `OMP_NUM_THREADS=1` and a 3888x2608 PEF:
 | `verify.sh --stage-device`, AMD RX 550 (rusticl), `working-trc.pp3` | PASS, `max_pae=1.5259e-05`, record `"stage":"working.trc","impl":"opencl","source":"opencl"` |
 | AMD RX 550, `Gamut=false` | PASS, `max_pae=1.5259e-05` |
 | `working-trc-residual.pp3` (soft light on) | PASS as a host residual: `"stage":"working.trc","impl":"host"`, `max_pae=1.5259e-05` informational |
+| CUSTOM `WorkingTRC`, gamma 0.4, slope 4.5 (type -5) | host residual: `impl=host`, no `impl=opencl`, PAE 0 against the CPU block; observed TRC type -5, `params 2.5, 0.868743, 0.131257, 0.222222, 0.100725` |
 | `--gpu=off` CPU path, two runs | identical (`PAE 0`) |
 
 ## Limitations
