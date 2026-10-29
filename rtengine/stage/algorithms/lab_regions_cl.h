@@ -299,9 +299,32 @@ inline double rt_lr_lut(__global const float* slot, const double t)
 }
 
 /*
- * The region mask: the block's first loop. `src` is the original Lab
- * snapshot. The kernel writes the mask to scratch plane 0 and the guide to
- * plane 1, which guidedFilter() reads.
+ * The region mask reads the Lab as it stands at the start of
+ * labColorCorrectionRegions(), after every preceding tool in the block. The
+ * launcher copies the working Lab into this snapshot immediately before the
+ * region loop, so a later region never sees an earlier region's result.
+ */
+__kernel void rt_lab_tools_region_snapshot(
+    __global const float* src, __global float* dst,
+    const int width, const int height, const int src_pitch,
+    const int src_plane, const int dst_pitch, const int dst_plane)
+{
+    const int x = get_global_id(0);
+    const int y = get_global_id(1);
+    if (x >= width || y >= height) {
+        return;
+    }
+    const int offset = y * src_pitch + x;
+    const int out = y * dst_pitch + x;
+    for (int plane = 0; plane < 3; ++plane) {
+        dst[plane * dst_plane + out] = src[plane * src_plane + offset];
+    }
+}
+
+/*
+ * The region mask: the block's first loop. `src` is the Lab snapshot taken at
+ * the start of the regions pass. The kernel writes the mask to scratch plane
+ * 0 and the guide to plane 1, which guidedFilter() reads.
  */
 __kernel void rt_lab_tools_region_mask(
     __global const float* src, __global float* scratch,

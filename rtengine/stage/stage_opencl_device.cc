@@ -4124,6 +4124,11 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
                        : nullptr;
     const KernelDef* region_def = find_kernel("lab.tools.regions");
     assert(region_def != nullptr);
+    cl_kernel region_snapshot_kernel =
+        regions ? compiled_kernel_entry(env, region_def,
+                                        "rt_lab_tools_region_snapshot",
+                                        error)
+                : nullptr;
     cl_kernel region_mask_kernel =
         regions ? compiled_kernel_entry(env, region_def,
                                         "rt_lab_tools_region_mask", error)
@@ -4144,7 +4149,8 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
         vibrance_kernel == nullptr || (lab_curve && lab_curve_kernel == nullptr) ||
         (local_contrast && (lc_line_kernel == nullptr ||
                             lc_blend_kernel == nullptr)) ||
-        (regions && (region_mask_kernel == nullptr ||
+        (regions && (region_snapshot_kernel == nullptr ||
+                     region_mask_kernel == nullptr ||
                      region_upsample_kernel == nullptr ||
                      region_apply_kernel == nullptr))) {
         return RT_STAGE_FALLBACK;
@@ -4278,9 +4284,9 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
     }
 
     /*
-     * The region pass keeps the original Lab snapshot for every region's mask
-     * (the block builds every mask before it applies any region), the two
-     * filtered masks, and the host-built tables.
+     * The region pass keeps a snapshot of the Lab as it stands when the
+     * regions pass starts (after every preceding tool), for every region's
+     * mask, the two filtered masks, and the host-built tables.
      */
     char snapshot_key = 0;
     char region_masks_key = 0;
@@ -4352,8 +4358,7 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
           !upload(lhskcurve_device, lhskcurve, "lhskcurve") ||
           !upload(clcurve_device, clcurve, "clcurve"))) ||
         (regions &&
-         (!upload(snapshot_device, lab, "region snapshot") ||
-          !upload(region_luts_device, args[64].u.buffer, "region tables") ||
+         (!upload(region_luts_device, args[64].u.buffer, "region tables") ||
           !upload(region_params_device, args[66].u.buffer,
                   "region parameters")))) {
         return RT_STAGE_FALLBACK;
@@ -5360,11 +5365,48 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
 
         /*
          * ImProcFunctions::labColorCorrectionRegions(), after vibrance, as
-         * the host block orders it. Every region mask is built from the
-         * original Lab snapshot; the region applications then run in region
-         * order on the previous result.
+         * the host block orders it. Every region mask is built from the Lab
+         * snapshot taken at the start of this pass; the region applications
+         * then run in region order on the previous result.
          */
         if (regions) {
+            /*
+             * The block builds the masks from the Lab as it stands when
+             * labColorCorrectionRegions() is entered, after LabGrid, the two
+             * shadows/highlights rounds, local contrast, the Lab curves and
+             * vibrance. Copy the working Lab into the snapshot now; the
+             * region applications then run on the working Lab in region
+             * order.
+             */
+            {
+                cl_uint arg = 0;
+                bool ok = true;
+                ok = ok && set_arg(region_snapshot_kernel, arg++,
+                                   sizeof(cl_mem), &lab_memory);
+                ok = ok && set_arg(region_snapshot_kernel, arg++,
+                                   sizeof(cl_mem), &snapshot_memory);
+                ok = ok && set_arg(region_snapshot_kernel, arg++,
+                                   sizeof(cl_int), &cl_width);
+                ok = ok && set_arg(region_snapshot_kernel, arg++,
+                                   sizeof(cl_int), &cl_height);
+                ok = ok && set_arg(region_snapshot_kernel, arg++,
+                                   sizeof(cl_int), &lab_pitch);
+                ok = ok && set_arg(region_snapshot_kernel, arg++,
+                                   sizeof(cl_int), &lab_plane);
+                ok = ok && set_arg(region_snapshot_kernel, arg++,
+                                   sizeof(cl_int), &lab_pitch);
+                ok = ok && set_arg(region_snapshot_kernel, arg++,
+                                   sizeof(cl_int), &lab_plane);
+                if (!ok) {
+                    error = "lab.tools region snapshot arguments failed";
+                    return RT_STAGE_FALLBACK;
+                }
+                if (!launch(region_snapshot_kernel, image_global,
+                            "lab.tools region snapshot")) {
+                    return RT_STAGE_FALLBACK;
+                }
+            }
+
             const cl_float region_c_factor = 327.68f / 48000.f;
             for (int region = 0; region < region_count; ++region) {
                 const cl_int cl_region = region;
