@@ -1694,25 +1694,33 @@ builtin. The sub-node records, commands and parity results are in
 Still CPU-only: `raw.preprocess`, `raw.demosaic`, `raw.base`, `lab.tools`,
 `lab.wavelet`, `working.trc`, `ciecam` and `thumbnail.lab`.
 
-`local.adjustments` is partial through the one-spot colour path. The admitted
-set is exactly one active spot with `spotMethod == "norm"`,
-`shape == "ELI"`, `expcolor == true`, every other `exp*` false,
-`qualitycurveMethod == "none"`, `avoidgamutMethod == "NONE"`, `avoidrad == 0`,
-`hrenabled == false`, `reparcol == 100`, no recursion, inversion, explicit
-mask, soft radius, merge, LabGrid, RGB curve or exposure curve, and
-chroma/lightness/contrast inside `-100..100`; the ROI must be at least 5 px in
-each dimension. The node runs the per-spot negative-value prefilter, the
-ROI original Gaussian, the elliptical transition/deltaE colour apply and the
-full-image tail clamp; `baseImg` stays host and the final `lab2rgb()` is the
-call site's. The two chroma-slider curves are host-sampled into 65536-entry
-tables. Everything else is a residual: curves (L/C/H and quality), Munsell,
-multi-spot, inactive spots, rectangular spots, exposure (FFT PDE),
-shadows/highlights, vibrance, local contrast, blur/denoise, sharpening, tone
-mapping, Retinex, CBDL, log, soft light, the common mask, CIE CAM, dehaze,
-`exc`/`full`/`main`, merge, explicit masks, soft radius, LAB/XYZ/XYZREL gamut
-methods, the RGB curve, LabGrid, `avoidrad != 0`, `transit == 100`, a blur
-radius above 100, `reparcol != 100`, a ROI below 5 px and an active pre-CBDL
-pass. A GPU device is refused before the upload. An inactive block (`locallab.enabled == false` or no spots) never
+`local.adjustments` is partial through the multi-spot colour path. The
+admitted set is any number of `norm` spots in list order: an active spot is
+`expcolor == true` with every other `exp*` false, `reparcol == 100`, no
+recursion/inversion/mask/soft radius/merge/LabGrid/RGB or exposure curve,
+`qualitycurveMethod` none or std, `avoidgamutMethod == "NONE"`, and
+chroma/lightness/contrast inside `-100..100`; an inactive spot is the
+clamp-only case and may carry inert tool settings. Both `ELI` and `RECT`
+shapes are admitted, and an active ROI must be at least 5 px in each
+dimension. The node runs, per spot, the negative-value prefilter, the ROI
+original Gaussian, the transition/deltaE colour apply with the optional
+L/C/H curves, and the full-image tail clamp. `calc_ref` is recomputed on the
+read-back result of the previous spot, `reserved` is fixed at the start of the
+block, and `lastorig` is unused while merge is a residual. `baseImg` stays
+host and the final `lab2rgb()` is the call site's. The chroma-slider curves
+and the seven L/C/H curves are host-built into 65536-entry tables.
+
+Munsell (`avoidgamutMethod == "MUNS"`) is a measured residual, not an
+approximation: on the real gate image the clamp's last-bit differences move
+Munsell's discontinuous hue/zone thresholds by up to 136 LSB16, so MUNS stays
+on the host until the clamp is bit-exact. Everything else is a residual:
+exposure (FFT PDE), shadows/highlights, vibrance, local contrast,
+blur/denoise, sharpening, tone mapping, Retinex, CBDL, log, soft light, the
+common mask, CIE CAM, dehaze, `exc`/`full`/`main`, merge, explicit masks,
+soft radius, LAB/XYZ/XYZREL gamut methods, the RGB curve, LabGrid,
+`avoidrad != 0`, `transit == 100`, a blur radius above 100, `reparcol != 100`,
+a ROI below 5 px and an active pre-CBDL pass. A GPU device is refused before
+the upload. An inactive block (`locallab.enabled == false` or no spots) never
 enters the node and takes no Lab round trip.
 
 Recorded `n/a` exceptions: `source.select` and `source.embedded` are I/O,
