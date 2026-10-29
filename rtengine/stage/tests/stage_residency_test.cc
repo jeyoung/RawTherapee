@@ -2855,6 +2855,7 @@ void test_working_trc(bool available)
         {"soft light", 179, 17, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, true, 0.5, false, false, true},
         {"opacity curve", 238, 24, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, true, 0.5, false, true, true},
         {"custom gamma 0.4", 238, 24, WorkingTrc::CUSTOM, 0.4, 4.5, true, 0.5, true, true, false},
+        {"empty opacity", 238, 24, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, true, 0.5, true, true, true},
     };
 
     if (!available) {
@@ -2882,6 +2883,14 @@ void test_working_trc(bool available)
             params.softlight.strength = 50;
         } else if (std::strcmp(item.label, "midtone equaliser") == 0) {
             params.icm.wmidtcie = 25.0;
+        } else if (std::strcmp(item.label, "empty opacity") == 0) {
+            params.icm.wavExp = true;
+            params.icm.opacityCurveWLI = {
+                static_cast<double>(FCT_Linear)};
+            rtengine::procparams::ColorManagementParams colparams = params.icm;
+            rtengine::WavOpacityCurveWL curve;
+            colparams.getCurves(curve);
+            check(!curve, "the empty opacity curve has no LUT");
         } else if (std::strcmp(item.label, "opacity curve") == 0) {
             params.icm.wavExp = true;
             params.icm.opacityCurveWLI = {

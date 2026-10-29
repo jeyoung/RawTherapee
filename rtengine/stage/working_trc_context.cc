@@ -146,9 +146,13 @@ bool workingTrcSupported(const procparams::ProcParams& params)
         Cm colparams = icm;
         WavOpacityCurveWL curve;
         colparams.getCurves(curve);
-        for (int i = 0; i < OPACITY_CURVE_ENTRIES; ++i) {
-            if (curve[i] != OPACITY_CURVE_FLAT) {
-                return false;
+        /* An empty LUT means local contrast is inactive, exactly as
+         * complete_local_contrast() treats it. */
+        if (curve) {
+            for (int i = 0; i < OPACITY_CURVE_ENTRIES; ++i) {
+                if (curve[i] != OPACITY_CURVE_FLAT) {
+                    return false;
+                }
             }
         }
     }
