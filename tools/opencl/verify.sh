@@ -256,6 +256,8 @@ quick() {
         "$ROOT/devnotes/opencl/pp3/labtools-vibrance.pp3" lab.tools cpu
     run_stage_device "pef/stage-device-lab-tools-labcurve" \
         "$ROOT/devnotes/opencl/pp3/labtools-labcurve.pp3" lab.tools cpu
+    run_stage_device "pef/stage-device-lab-tools-localcontrast" \
+        "$ROOT/devnotes/opencl/pp3/labtools-localcontrast.pp3" lab.tools cpu
     run_stage_host "pef/stage-host-lab-tools-residual" \
         "$ROOT/devnotes/opencl/pp3/labtools-residual.pp3" lab.tools
 }
@@ -563,6 +565,8 @@ stage_device() {
         "$ROOT/devnotes/opencl/pp3/labtools-vibrance.pp3" lab.tools cpu
     run_stage_device "pef/stage-device-lab-tools-labcurve" \
         "$ROOT/devnotes/opencl/pp3/labtools-labcurve.pp3" lab.tools cpu
+    run_stage_device "pef/stage-device-lab-tools-localcontrast" \
+        "$ROOT/devnotes/opencl/pp3/labtools-localcontrast.pp3" lab.tools cpu
     run_stage_host "pef/stage-host-lab-tools-residual" \
         "$ROOT/devnotes/opencl/pp3/labtools-residual.pp3" lab.tools
 }

@@ -3693,7 +3693,7 @@ LabToolsRun run_lab_tools_node(LabImage& image,
     result.deviceReady = deviceReady;
     RtLabToolsContext descriptor = context.descriptor(deviceReady);
 
-    RtStageArg args[56] = {};
+    RtStageArg args[63] = {};
     args[0].kind = RT_STAGE_ARG_BUFFER;
     args[0].u.buffer = view(image);
     args[1].kind = RT_STAGE_ARG_PTR;
@@ -3782,6 +3782,22 @@ LabToolsRun run_lab_tools_node(LabImage& image,
     args[55].kind = RT_STAGE_ARG_INT;
     args[55].u.i = deviceReady ? setup.lab_curve_entries : 0;
 
+    args[56].kind = RT_STAGE_ARG_INT;
+    args[56].u.i = deviceReady ? setup.local_contrast_enabled : 0;
+    args[57].kind = RT_STAGE_ARG_INT;
+    args[57].u.i = deviceReady ? setup.local_contrast_radius : 0;
+    args[58].kind = RT_STAGE_ARG_DOUBLE;
+    args[58].u.f = deviceReady ? setup.local_contrast_amount : 0.0;
+    args[59].kind = RT_STAGE_ARG_DOUBLE;
+    args[59].u.f = deviceReady ? setup.local_contrast_darkness : 1.0;
+    args[60].kind = RT_STAGE_ARG_DOUBLE;
+    args[60].u.f = deviceReady ? setup.local_contrast_lightness : 1.0;
+    args[61].kind = RT_STAGE_ARG_INT;
+    args[61].u.i = deviceReady ? setup.local_contrast_scale
+                               : LAB_TOOLS_EXPORT_SCALE;
+    args[62].kind = RT_STAGE_ARG_PTR;
+    args[62].u.ptr = deviceReady ? setup.local_contrast_iir : nullptr;
+
     for (int index = 16; index < 22; ++index) {
         args[index].kind = RT_STAGE_ARG_BUFFER;
     }
@@ -3852,7 +3868,7 @@ LabToolsRun run_lab_tools_node(LabImage& image,
     setenv("RT_STAGE_PROFILE", profile_path.c_str(), 1);
     set_node_device_override("lab.tools", StageNodeDevice::OpenCL);
     result.status =
-        run("lab.tools", std::vector<RtStageArg>(args, args + 56));
+        run("lab.tools", std::vector<RtStageArg>(args, args + 63));
     clear_node_device_overrides();
     unsetenv("RT_STAGE_PROFILE");
     return result;
@@ -3999,8 +4015,8 @@ void test_lab_tools(bool available)
      * block, and the result must be the block's own output.
      */
     const char* residual_labels[] = {
-        "vibrance + Lab contrast", "vibrance + local contrast", "vibrance + EPD",
-        "vibrance + Lab regions", "vibrance + black and white",
+        "vibrance + Lab contrast", "vibrance + local contrast out of range",
+        "vibrance + EPD", "vibrance + Lab regions", "vibrance + black and white",
         "vibrance no-op", "vibrance pastels out of range"};
     for (const char* label : residual_labels) {
         rtengine::procparams::ProcParams params;
@@ -4023,7 +4039,8 @@ void test_lab_tools(bool available)
                 0.0, 0.0,
                 0.5, 0.6,
                 1.0, 1.0};
-        } else if (std::strcmp(label, "vibrance + local contrast") == 0) {
+        } else if (std::strcmp(label, "vibrance + local contrast out of range") ==
+                   0) {
             params.localContrast.enabled = true;
             params.localContrast.radius = 20;
             params.localContrast.amount = 30;
@@ -4209,7 +4226,7 @@ void test_lab_tools(bool available)
         check(context.build(setup) == 0, "forced fallback setup builds");
         RtLabToolsContext descriptor = context.descriptor(true);
 
-        RtStageArg args[56] = {};
+        RtStageArg args[63] = {};
         args[0].kind = RT_STAGE_ARG_BUFFER;
         args[0].u.buffer = view(device);
         args[1].kind = RT_STAGE_ARG_PTR;
@@ -4274,6 +4291,16 @@ void test_lab_tools(bool available)
         }
         args[54].kind = RT_STAGE_ARG_INT;
         args[55].kind = RT_STAGE_ARG_INT;
+        args[56].kind = RT_STAGE_ARG_INT;
+        args[57].kind = RT_STAGE_ARG_INT;
+        args[58].kind = RT_STAGE_ARG_DOUBLE;
+        args[59].kind = RT_STAGE_ARG_DOUBLE;
+        args[60].kind = RT_STAGE_ARG_DOUBLE;
+        args[61].kind = RT_STAGE_ARG_INT;
+        args[62].kind = RT_STAGE_ARG_PTR;
+        args[59].u.f = 1.0;
+        args[60].u.f = 1.0;
+        args[61].u.i = LAB_TOOLS_EXPORT_SCALE;
         /* Half the required length: the launcher refuses the submission. */
         args[16].u.buffer = host_buffer(setup.lut_highlight,
                                         static_cast<int>(setup.lut_entries) / 2);
@@ -4290,7 +4317,7 @@ void test_lab_tools(bool available)
         setenv("RT_STAGE_PROFILE", profile_path.c_str(), 1);
         set_node_device_override("lab.tools", StageNodeDevice::OpenCL);
         const RtStageStatus status =
-            run("lab.tools", std::vector<RtStageArg>(args, args + 56));
+            run("lab.tools", std::vector<RtStageArg>(args, args + 63));
         clear_node_device_overrides();
         const std::string profile = read_file(profile_path);
         unsetenv("RT_STAGE_PROFILE");
@@ -5141,6 +5168,289 @@ void test_lab_tools_lab_curve(bool available)
 }
 
 
+/* ---------------------------------------------- lab.tools local contrast */
+
+/*
+ * Local contrast is a device pass of its own: the host blur is a separable
+ * Young-van Vliet IIR filter, and gaussianBlur() switches between the SSE
+ * float path and the double path at sigma 25. The matrix below covers both
+ * (radii 1 and 10 against 40, 80 and 100), the three amounts and the three
+ * darkness/lightness settings named in the brief, padded widths, a large
+ * width and combinations with the other device tools.
+ */
+void test_lab_tools_local_contrast(bool available)
+{
+    using namespace rtengine::stage;
+
+    static MyMutex local_contrast_lcms_mutex;
+    if (rtengine::lcmsMutex == nullptr) {
+        rtengine::lcmsMutex = &local_contrast_lcms_mutex;
+    }
+    static rtengine::Settings local_contrast_settings{};
+    rtengine::settings = &local_contrast_settings;
+    rtengine::Color::init();
+
+    const std::string profile_path =
+        std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp") +
+        "/stage-residency-lab-tools-localcontrast.jsonl";
+
+    if (!available) {
+        skip("lab.tools local contrast: no OpenCL device");
+        return;
+    }
+    check(node_has_device_implementation("lab.tools"),
+          "the lab.tools node has a device implementation for local contrast");
+
+    struct LocalContrastCase {
+        const char* label;
+        int width;
+        int height;
+        int radius;
+        double amount;
+        double darkness;
+        double lightness;
+        bool labCurve;
+        bool shadows;
+        bool vibrance;
+    };
+    const LocalContrastCase cases[] = {
+        /* label, w, h, radius, amount, dark, light, lab curve, sh, vibrance */
+        {"radius 1", 238, 64, 1, 1.0, 1.0, 1.0, false, false, false},
+        {"radius 10", 238, 64, 10, 1.0, 1.0, 1.0, false, false, false},
+        {"radius 40", 238, 64, 40, 1.0, 1.0, 1.0, false, false, false},
+        {"radius 80", 238, 64, 80, 1.0, 1.0, 1.0, false, false, false},
+        {"radius 100", 238, 64, 100, 1.0, 1.0, 1.0, false, false, false},
+        {"amount 0", 238, 64, 40, 0.0, 1.0, 1.0, false, false, false},
+        {"amount 0.1", 238, 64, 40, 0.1, 1.0, 1.0, false, false, false},
+        {"amount 2", 238, 64, 40, 2.0, 1.0, 1.0, false, false, false},
+        {"darkness 0.5", 238, 64, 40, 1.0, 0.5, 1.0, false, false, false},
+        {"lightness 2", 238, 64, 40, 1.0, 1.0, 2.0, false, false, false},
+        {"darkness 2 lightness 0.5", 238, 64, 40, 1.0, 2.0, 0.5, false,
+         false, false},
+        {"darkness 0.5 lightness 2", 179, 48, 80, 1.0, 0.5, 2.0, false, false,
+         false},
+        {"padded width 179", 179, 48, 40, 1.0, 1.0, 1.0, false, false, false},
+        {"padded width 238", 238, 64, 80, 1.0, 1.0, 1.0, false, false, false},
+        {"odd height 50", 179, 50, 10, 1.0, 1.0, 1.0, false, false, false},
+        {"large width 8192", 8192, 64, 100, 1.0, 0.5, 2.0, false, false, false},
+        {"with Lab curve", 238, 64, 40, 1.0, 1.0, 1.0, true, false, false},
+        {"with shadows/highlights", 238, 64, 40, 1.0, 0.5, 2.0, false, true,
+         false},
+        {"with vibrance", 238, 64, 40, 1.0, 0.5, 2.0, false, false, true},
+    };
+
+    unsigned seed = 0x9e3779b9u;
+    for (const LocalContrastCase& item : cases) {
+        rtengine::procparams::ProcParams params;
+        params.localContrast.enabled = true;
+        params.localContrast.radius = item.radius;
+        params.localContrast.amount = item.amount;
+        params.localContrast.darkness = item.darkness;
+        params.localContrast.lightness = item.lightness;
+        if (item.labCurve) {
+            params.labCurve.enabled = true;
+            params.labCurve.lcurve = lab_curve_points(0.58);
+            params.labCurve.acurve = lab_curve_points(0.60);
+        }
+        if (item.shadows) {
+            params.sh.enabled = true;
+            params.sh.lab = true;
+            params.sh.highlights = 40;
+            params.sh.shadows = 40;
+            params.sh.htonalwidth = 50;
+            params.sh.stonalwidth = 50;
+            params.sh.radius = 20;
+        }
+        if (item.vibrance) {
+            params.vibrance.enabled = true;
+            params.vibrance.pastels = 30;
+            params.vibrance.saturated = 20;
+            params.vibrance.psthreshold = rtengine::procparams::Threshold<int>(
+                50, 50, false);
+        }
+
+        check(labToolsSupported(params),
+              (std::string("lab.tools local contrast ") + item.label +
+               " is the supported set").c_str());
+        check(labToolsLocalContrastActive(params),
+              (std::string("lab.tools local contrast ") + item.label +
+               " runs the local-contrast pass").c_str());
+
+        LabImage source(item.width, item.height);
+        fill_lab_tools(source, seed++);
+
+        rtengine::ImProcFunctions cpu_ipf(&params, false);
+        LabToolsHostState cpu_host;
+        LabImage cpu(item.width, item.height);
+        cpu.CopyFrom(&source);
+        LabToolsLuts cpu_luts = cpu_host.luts();
+        labToolsHostBlock(cpu_ipf, params, cpu, cpu_luts, cpu_host.autili,
+                          cpu_host.butili);
+
+        rtengine::ImProcFunctions device_ipf(&params, false);
+        LabToolsHostState device_host;
+        LabImage device(item.width, item.height);
+        device.CopyFrom(&source);
+        const LabToolsRun result =
+            run_lab_tools_node(device, params, device_host, device_ipf,
+                               profile_path);
+        const std::string profile = read_file(profile_path);
+
+        check(result.supported,
+              (std::string("lab.tools local contrast ") + item.label +
+               " resolves to the supported set").c_str());
+        check(result.deviceReady,
+              (std::string("lab.tools local contrast ") + item.label +
+               " builds its host setup").c_str());
+        check(result.status == RT_STAGE_OK,
+              (std::string("lab.tools local contrast ") + item.label +
+               " completes through run()").c_str());
+        check(profile.find("\"stage\":\"lab.tools\"") != std::string::npos,
+              (std::string("lab.tools local contrast ") + item.label +
+               " records the node").c_str());
+        check(profile.find("\"impl\":\"opencl\"") != std::string::npos,
+              (std::string("lab.tools local contrast ") + item.label +
+               " records a device execution").c_str());
+
+        const Distribution d = distribution(view(device), view(cpu));
+        std::printf("stage-residency: lab.tools local contrast %s %dx%d: PAE "
+                    "%.6f LSB16; exact %zu, <=0.25 %zu, <=0.5 %zu, <=1 %zu, "
+                    ">1 %zu of %zu\n",
+                    item.label, item.width, item.height, d.max_abs, d.exact,
+                    d.quarter, d.half, d.one, d.over, d.samples);
+        check(d.finite,
+              (std::string("lab.tools local contrast ") + item.label +
+               " stays finite").c_str());
+        check(d.over == 0,
+              (std::string("lab.tools local contrast ") + item.label +
+               " is within one LSB16").c_str());
+    }
+
+    /*
+     * Residuals: a local contrast outside the ABI range, and a local contrast
+     * combined with a tool the node does not implement, must be refused by
+     * the predicate and run the block on the host byte for byte.
+     */
+    struct LocalContrastResidual {
+        const char* label;
+        int radius;
+        double amount;
+        double darkness;
+        double lightness;
+        bool epd;
+        bool labContrast;
+    };
+    const LocalContrastResidual residuals[] = {
+        {"radius below the ABI range", 0, 1.0, 1.0, 1.0, false, false},
+        {"radius above the ABI range", 300, 1.0, 1.0, 1.0, false, false},
+        {"amount above the ABI range", 40, 3.0, 1.0, 1.0, false, false},
+        {"negative amount", 40, -0.1, 1.0, 1.0, false, false},
+        {"darkness above the ABI range", 40, 1.0, 4.0, 1.0, false, false},
+        {"negative lightness", 40, 1.0, 1.0, -0.5, false, false},
+        {"not a number amount", 40, std::nan(""), 1.0, 1.0, false, false},
+        {"with EPD", 40, 1.0, 1.0, 1.0, true, false},
+        {"with Lab contrast", 40, 1.0, 1.0, 1.0, false, true},
+    };
+    for (const LocalContrastResidual& item : residuals) {
+        rtengine::procparams::ProcParams params;
+        params.localContrast.enabled = true;
+        params.localContrast.radius = item.radius;
+        params.localContrast.amount = item.amount;
+        params.localContrast.darkness = item.darkness;
+        params.localContrast.lightness = item.lightness;
+        if (item.epd) {
+            params.epd.enabled = true;
+            params.epd.strength = 0.5;
+            params.epd.gamma = 1.0;
+        }
+        if (item.labContrast) {
+            params.labCurve.enabled = true;
+            params.labCurve.contrast = 10;
+        }
+
+        check(!labToolsSupported(params),
+              (std::string("lab.tools local contrast residual ") + item.label +
+               " is a residual").c_str());
+
+        LabImage source(179, 48);
+        fill_lab_tools(source, seed++);
+
+        rtengine::ImProcFunctions cpu_ipf(&params, false);
+        LabToolsHostState cpu_host;
+        LabImage cpu(179, 48);
+        cpu.CopyFrom(&source);
+        LabToolsLuts cpu_luts = cpu_host.luts();
+        labToolsHostBlock(cpu_ipf, params, cpu, cpu_luts, cpu_host.autili,
+                          cpu_host.butili);
+
+        rtengine::ImProcFunctions device_ipf(&params, false);
+        LabToolsHostState device_host;
+        LabImage device(179, 48);
+        device.CopyFrom(&source);
+        const LabToolsRun result =
+            run_lab_tools_node(device, params, device_host, device_ipf,
+                               profile_path);
+        const std::string profile = read_file(profile_path);
+
+        check(!result.supported,
+              (std::string("lab.tools local contrast residual ") + item.label +
+               " is refused as a device configuration").c_str());
+        check(!result.deviceReady,
+              (std::string("lab.tools local contrast residual ") + item.label +
+               " does not build a device setup").c_str());
+        check(result.status == RT_STAGE_OK,
+              (std::string("lab.tools local contrast residual ") + item.label +
+               " completes through run()").c_str());
+        check(profile.find("\"impl\":\"host\"") != std::string::npos,
+              (std::string("lab.tools local contrast residual ") + item.label +
+               " records a host execution").c_str());
+        check(profile.find("\"impl\":\"opencl\"") == std::string::npos,
+              (std::string("lab.tools local contrast residual ") + item.label +
+               " never mixes a device pass").c_str());
+
+        const Diff diff = compare(view(device), view(cpu));
+        std::printf("stage-residency: lab.tools local contrast residual %s: "
+                    "host, PAE %.6f LSB16, %zu of %zu samples differ\n",
+                    item.label, diff.max_abs, diff.differing, diff.samples);
+        check(diff.finite,
+              (std::string("lab.tools local contrast residual ") + item.label +
+               " stays finite").c_str());
+        check(diff.differing == 0 && diff.max_abs == 0.0,
+              (std::string("lab.tools local contrast residual ") + item.label +
+               " matches the CPU block").c_str());
+    }
+
+    /*
+     * Non-vacuity: the device pass must change pixels, otherwise a kernel that
+     * copied its input would pass every parity check above.
+     */
+    {
+        rtengine::procparams::ProcParams params;
+        params.localContrast.enabled = true;
+        params.localContrast.radius = 10;
+        params.localContrast.amount = 1.0;
+        params.localContrast.darkness = 1.0;
+        params.localContrast.lightness = 1.0;
+
+        LabImage source(179, 48);
+        fill_lab_tools(source, seed++);
+        LabImage image(179, 48);
+        image.CopyFrom(&source);
+        rtengine::ImProcFunctions ipf(&params, false);
+        LabToolsHostState state;
+        LabToolsLuts luts = state.luts();
+        labToolsHostBlock(ipf, params, image, luts, state.autili,
+                          state.butili);
+        const Diff change = compare(view(image), view(source));
+        std::printf("stage-residency: local contrast changes %zu of %zu "
+                    "samples, PAE %.6f LSB16\n",
+                    change.differing, change.samples, change.max_abs);
+        check(change.differing > 0,
+              "local contrast changes the host block's own output");
+    }
+}
+
+
 /* --------------------------------------------------------- run() wiring */
 
 void test_run_wiring(bool available)
@@ -5272,6 +5582,7 @@ int main()
     test_lab_tools(available);
     test_lab_tools_vibrance(available);
     test_lab_tools_lab_curve(available);
+    test_lab_tools_local_contrast(available);
     test_output_sharpen(available);
     test_run_wiring(available);
 
