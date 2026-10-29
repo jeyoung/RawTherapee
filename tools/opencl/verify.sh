@@ -262,6 +262,8 @@ quick() {
         "$ROOT/devnotes/opencl/pp3/labtools-regions.pp3" lab.tools cpu
     run_stage_host "pef/stage-host-lab-tools-residual" \
         "$ROOT/devnotes/opencl/pp3/labtools-residual.pp3" lab.tools
+    run_stage_device "pef/stage-device-lab-wavelet" \
+        "$ROOT/devnotes/opencl/pp3/labwavelet.pp3" lab.wavelet cpu
 }
 
 stage() {
@@ -573,6 +575,8 @@ stage_device() {
         "$ROOT/devnotes/opencl/pp3/labtools-regions.pp3" lab.tools cpu
     run_stage_host "pef/stage-host-lab-tools-residual" \
         "$ROOT/devnotes/opencl/pp3/labtools-residual.pp3" lab.tools
+    run_stage_device "pef/stage-device-lab-wavelet" \
+        "$ROOT/devnotes/opencl/pp3/labwavelet.pp3" lab.wavelet cpu
 }
 
 rgbproc() {

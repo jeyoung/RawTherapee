@@ -1,0 +1,13 @@
+[Directional Pyramid Equalizer]
+Enabled=true
+Gamutlab=false
+cbdlMethod=aft
+Mult0=2
+Mult1=1.5
+Mult2=1.2
+Mult3=1
+Mult4=1
+Mult5=1
+Threshold=0.2
+Skinprotect=0
+Hueskin=-5;25;170;120;

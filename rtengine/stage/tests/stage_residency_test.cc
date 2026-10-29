@@ -27,6 +27,7 @@
 #include "stage/algorithms/gamut_cl.h"
 #include "stage/algorithms/sharpen_cl.h"
 #include "stage/lab_tools_context.h"
+#include "stage/lab_wavelet_context.h"
 #include "stage/working_trc_context.h"
 
 #include "sharpen_core.h"
@@ -5552,6 +5553,542 @@ void test_lab_tools_local_contrast(bool available)
 }
 
 
+/* -------------------------------------------------------- lab.wavelet */
+
+/*
+ * A Lab fixture whose hues and chromas sweep the skin-protection bands at
+ * every lightness: hue -0.4..1.8, chroma 5..60, L 0..100.
+ */
+void fill_lab_wavelet_skin(LabImage& lab)
+{
+    for (int y = 0; y < lab.H; ++y) {
+        const float l = 32768.f * (static_cast<float>(y) + 0.5f) /
+                        static_cast<float>(lab.H);
+        for (int x = 0; x < lab.W; ++x) {
+            const float hue =
+                -0.4f + 2.2f * static_cast<float>(x % 64) / 63.f;
+            const float chroma =
+                5.f + 55.f * static_cast<float>((x / 64) % 4);
+            /* Pixel-scale structure so the high-pass is non-zero where the
+             * protection scale is read. */
+            const float flicker =
+                static_cast<float>((x * 37 + y * 101) % 17) * 180.f - 1440.f;
+            lab.L[y][x] = l + flicker;
+            lab.a[y][x] = chroma * 327.68f * cosf(hue);
+            lab.b[y][x] = chroma * 327.68f * sinf(hue);
+        }
+    }
+}
+
+struct LabWaveletCase {
+    const char* label;
+    int width;
+    int height;
+    int image; /* 0 random, 1 skin, 2 saturated hue circle */
+    double mult[6];
+    double threshold;
+    double skinprotect;
+    bool gamutlab;
+};
+
+struct LabWaveletRun {
+    bool supported = false;
+    bool deviceReady = false;
+    RtStageStatus status = RT_STAGE_INVALID;
+};
+
+/* The call site's submission, reproduced for one image. */
+LabWaveletRun run_lab_wavelet_node(LabImage& image,
+                                   rtengine::procparams::ProcParams& params,
+                                   rtengine::ImProcFunctions& ipf,
+                                   const std::string& profile_path,
+                                   bool submit_device = true)
+{
+    using namespace rtengine::stage;
+
+    LabWaveletRun result;
+    result.supported = labWaveletSupported(params);
+
+    LabWaveletContext context(params, ipf, image.W, image.H);
+    RtLabWaveletResult setup{};
+    const bool deviceReady = result.supported && context.build(setup) == 0;
+    result.deviceReady = deviceReady;
+    RtLabWaveletContext descriptor = context.descriptor(deviceReady);
+
+    RtStageArg args[20] = {};
+    args[0].kind = RT_STAGE_ARG_BUFFER;
+    args[0].u.buffer = view(image);
+    args[1].kind = RT_STAGE_ARG_PTR;
+    args[1].u.ptr = &descriptor;
+    args[2].kind = RT_STAGE_ARG_INT;
+    args[2].u.i = deviceReady ? 1 : 0;
+    for (int level = 0; level < 6; ++level) {
+        args[3 + level].kind = RT_STAGE_ARG_DOUBLE;
+        args[3 + level].u.f = params.dirpyrequalizer.mult[level];
+    }
+    args[9].kind = RT_STAGE_ARG_DOUBLE;
+    args[9].u.f = params.dirpyrequalizer.threshold;
+    args[10].kind = RT_STAGE_ARG_DOUBLE;
+    args[10].u.f = params.dirpyrequalizer.skinprotect;
+    args[11].kind = RT_STAGE_ARG_DOUBLE;
+    args[11].u.f = params.dirpyrequalizer.hueskin.getBottomLeft() / 100.0;
+    args[12].kind = RT_STAGE_ARG_DOUBLE;
+    args[12].u.f = params.dirpyrequalizer.hueskin.getTopLeft() / 100.0;
+    args[13].kind = RT_STAGE_ARG_DOUBLE;
+    args[13].u.f = params.dirpyrequalizer.hueskin.getTopRight() / 100.0;
+    args[14].kind = RT_STAGE_ARG_INT;
+    args[14].u.i = params.dirpyrequalizer.gamutlab ? 1 : 0;
+    args[15].kind = RT_STAGE_ARG_INT;
+    args[15].u.i = LAB_WAVELET_EXPORT_SCALE;
+    args[16].kind = RT_STAGE_ARG_INT;
+    args[16].u.i = deviceReady ? setup.levels : 0;
+    for (int index = 17; index < 20; ++index) {
+        args[index].kind = RT_STAGE_ARG_BUFFER;
+    }
+    if (deviceReady) {
+        const auto host_buffer = [](const float* data, int width) {
+            RtStageBuffer buffer{};
+            buffer.size = sizeof(RtStageBuffer);
+            buffer.data = const_cast<float*>(data);
+            buffer.width = width;
+            buffer.height = 1;
+            buffer.row_pitch = static_cast<std::size_t>(width) * sizeof(float);
+            buffer.plane_pitch = buffer.row_pitch;
+            buffer.planes = 1;
+            buffer.format = RT_STAGE_F32;
+            buffer.flags = RT_STAGE_BUFFER_READ;
+            return buffer;
+        };
+        const auto mask_buffer = [](const float* data, int width, int height) {
+            RtStageBuffer buffer{};
+            buffer.size = sizeof(RtStageBuffer);
+            buffer.data = const_cast<float*>(data);
+            buffer.width = width;
+            buffer.height = height;
+            buffer.row_pitch = static_cast<std::size_t>(width) * sizeof(float);
+            buffer.plane_pitch =
+                buffer.row_pitch * static_cast<std::size_t>(height);
+            buffer.planes = 1;
+            buffer.format = RT_STAGE_F32;
+            buffer.flags = RT_STAGE_BUFFER_READ;
+            return buffer;
+        };
+        args[17].u.buffer = host_buffer(
+            setup.luts,
+            static_cast<int>(setup.levels * RT_LAB_WAVELET_LUT_ENTRIES));
+        if (setup.skinprotect != 0) {
+            args[18].u.buffer = mask_buffer(setup.hue, image.W, image.H);
+            args[19].u.buffer = mask_buffer(setup.chrom, image.W, image.H);
+        }
+    }
+
+    std::remove(profile_path.c_str());
+    setenv("RT_STAGE_PROFILE", profile_path.c_str(), 1);
+    unsetenv("RT_STAGE_OPENCL");
+    if (submit_device) {
+        set_node_device_override("lab.wavelet", StageNodeDevice::OpenCL);
+    } else {
+        clear_node_device_overrides();
+    }
+    result.status = run("lab.wavelet", std::vector<RtStageArg>(args, args + 20));
+    clear_node_device_overrides();
+    unsetenv("RT_STAGE_PROFILE");
+    return result;
+}
+
+/*
+ * The lab.wavelet node against the production block. Supported cases run the
+ * equaliser on the device and must stay within one LSB16; residual cases must
+ * be refused, run the builtin and match the block byte for byte.
+ */
+void test_lab_wavelet(bool available)
+{
+    using namespace rtengine::stage;
+
+    static MyMutex wavelet_lcms_mutex;
+    if (rtengine::lcmsMutex == nullptr) {
+        rtengine::lcmsMutex = &wavelet_lcms_mutex;
+    }
+    static rtengine::Settings wavelet_settings{};
+    rtengine::settings = &wavelet_settings;
+    rtengine::Color::init();
+
+    const std::string profile_path =
+        std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp") +
+        "/stage-residency-lab-wavelet.jsonl";
+
+    if (!available) {
+        skip("lab.wavelet: no OpenCL device");
+        return;
+    }
+    check(node_has_device_implementation("lab.wavelet"),
+          "the lab.wavelet node has a device implementation");
+
+    /*
+     * The per-level range tables are the block's own fillLut() output and the
+     * launcher interpolates them exactly as LUTf::operator[](float) does.
+     */
+    {
+        rtengine::procparams::ProcParams params;
+        params.dirpyrequalizer.enabled = true;
+        params.dirpyrequalizer.cbdlMethod = "aft";
+        const double mult[6] = {1.6, 1.4, 1.2, 1.1, 1.05, 1.02};
+        for (int level = 0; level < 6; ++level) {
+            params.dirpyrequalizer.mult[level] = mult[level];
+        }
+        rtengine::ImProcFunctions ipf(&params, false);
+        LabWaveletContext context(params, ipf, 179, 48);
+        RtLabWaveletResult setup{};
+        check(context.build(setup) == 0, "lab.wavelet setup builds");
+        check(setup.levels == 6, "lab.wavelet exports every active level");
+        check(setup.lut_entries == RT_LAB_WAVELET_LUT_ENTRIES,
+              "lab.wavelet range tables have the block's size");
+        bool finite = true;
+        for (std::size_t index = 0;
+             index < static_cast<std::size_t>(setup.levels) *
+                         RT_LAB_WAVELET_LUT_ENTRIES;
+             ++index) {
+            finite = finite && std::isfinite(setup.luts[index]);
+        }
+        check(finite, "the lab.wavelet range tables are finite");
+    }
+
+    const LabWaveletCase cases[] = {
+        {"all levels", 179, 48, 0, {1.5, 1.5, 1.5, 1.5, 1.5, 1.5}, 0.2, 0.0,
+         false},
+        {"finest only", 179, 48, 0, {2.0, 1, 1, 1, 1, 1}, 0.2, 0.0, false},
+        {"three levels", 238, 64, 0, {2.0, 1.5, 1.2, 1, 1, 1}, 0.2, 0.0,
+         false},
+        {"threshold 0", 238, 64, 0, {1.4, 1.3, 1.2, 1.1, 1.05, 1.02}, 0.0,
+         0.0, false},
+        {"threshold 1", 179, 48, 0, {1, 1, 1, 1, 1, 1.8}, 1.0, 0.0, false},
+        {"skin protection", 238, 64, 1, {1.6, 1.4, 1.2, 1.1, 1.05, 1.02},
+         0.2, 60.0, false},
+        {"negative skin", 179, 48, 1, {1.6, 1.4, 1.2, 1.1, 1.05, 1.02},
+         0.2, -60.0, false},
+        {"gamutlab and skin", 238, 64, 0, {1.6, 1.4, 1.2, 1.1, 1.05, 1.02},
+         0.2, 60.0, true},
+        {"gamutlab no skin", 179, 48, 0, {1.6, 1.4, 1.2, 1.1, 1.05, 1.02},
+         0.2, 0.0, true},
+        {"padded 179 skin", 179, 48, 1, {1.4, 1.3, 1.2, 1.1, 1.05, 1.02},
+         0.2, 40.0, true},
+        {"padded 238 skin", 238, 64, 1, {1.4, 1.3, 1.2, 1.1, 1.05, 1.02},
+         0.2, 40.0, false},
+        {"saturated hue circle", 238, 64, 2,
+         {1.6, 1.4, 1.2, 1.1, 1.05, 1.02}, 0.2, 30.0, true},
+        {"large width 8192", 8192, 64, 0,
+         {1.4, 1.3, 1.2, 1.1, 1.05, 1.02}, 0.2, 0.0, false},
+        {"large width 8192 skin", 8192, 64, 1,
+         {1.4, 1.3, 1.2, 1.1, 1.05, 1.02}, 0.2, 50.0, true},
+    };
+
+    unsigned seed = 0x6d2b79f5u;
+    for (const LabWaveletCase& item : cases) {
+        rtengine::procparams::ProcParams params;
+        params.dirpyrequalizer.enabled = true;
+        params.dirpyrequalizer.cbdlMethod = "aft";
+        params.dirpyrequalizer.threshold = item.threshold;
+        params.dirpyrequalizer.skinprotect = item.skinprotect;
+        params.dirpyrequalizer.gamutlab = item.gamutlab;
+        for (int level = 0; level < 6; ++level) {
+            params.dirpyrequalizer.mult[level] = item.mult[level];
+        }
+
+        check(labWaveletSupported(params),
+              (std::string("lab.wavelet ") + item.label +
+               " is the supported set").c_str());
+
+        LabImage source(item.width, item.height);
+        switch (item.image) {
+        case 1:
+            fill_lab_wavelet_skin(source);
+            break;
+        case 2:
+            fill_lab_curve_saturated(source);
+            break;
+        default:
+            fill_lab_tools(source, seed++);
+            break;
+        }
+
+        rtengine::ImProcFunctions cpu_ipf(&params, false);
+        LabImage cpu(item.width, item.height);
+        cpu.CopyFrom(&source);
+        labWaveletHostBlock(cpu_ipf, params, cpu);
+
+        rtengine::ImProcFunctions device_ipf(&params, false);
+        LabImage device(item.width, item.height);
+        device.CopyFrom(&source);
+        const LabWaveletRun result =
+            run_lab_wavelet_node(device, params, device_ipf, profile_path);
+        const std::string profile = read_file(profile_path);
+        check(result.supported,
+              (std::string("lab.wavelet ") + item.label +
+               " resolves to the supported set").c_str());
+        check(result.deviceReady,
+              (std::string("lab.wavelet ") + item.label +
+               " builds its host setup").c_str());
+        check(result.status == RT_STAGE_OK,
+              (std::string("lab.wavelet ") + item.label +
+               " completes through run()").c_str());
+        check(profile.find("\"stage\":\"lab.wavelet\"") != std::string::npos,
+              (std::string("lab.wavelet ") + item.label +
+               " records the node").c_str());
+        check(profile.find("\"impl\":\"opencl\"") != std::string::npos,
+              (std::string("lab.wavelet ") + item.label +
+               " records a device execution").c_str());
+
+        const Distribution d = distribution(view(device), view(cpu));
+        std::printf("stage-residency: lab.wavelet %s %dx%d: PAE %.6f LSB16; "
+                    "exact %zu, <=0.25 %zu, <=0.5 %zu, <=1 %zu, >1 %zu of "
+                    "%zu\n",
+                    item.label, item.width, item.height, d.max_abs, d.exact,
+                    d.quarter, d.half, d.one, d.over, d.samples);
+        check(d.finite,
+              (std::string("lab.wavelet ") + item.label +
+               " stays finite").c_str());
+        check(d.over == 0,
+              (std::string("lab.wavelet ") + item.label +
+               " is within one LSB16").c_str());
+
+        /* The equaliser must actually change the image, so a device pass that
+         * silently returned its input cannot pass. */
+        if (item.image != 2) {
+            const Diff changed = compare(view(source), view(device));
+            check(changed.differing > 0,
+                  (std::string("lab.wavelet ") + item.label +
+                   " changes the image").c_str());
+        }
+    }
+
+    /*
+     * Residuals: the wavelet tool, the before-CBDL method, out-of-range
+     * parameters, a closed CIE-CAM gate and an all-neutral pyramid must be
+     * refused and must run the block on the host byte for byte.
+     */
+    const char* residual_labels[] = {
+        "wavelet enabled", "cbdlMethod bef", "mult out of range",
+        "threshold out of range", "skin out of range",
+        "all multipliers neutral", "CIE-CAM gate closed"};
+    for (const char* label : residual_labels) {
+        rtengine::procparams::ProcParams params;
+        params.dirpyrequalizer.enabled = true;
+        params.dirpyrequalizer.cbdlMethod = "aft";
+        params.dirpyrequalizer.mult[0] = 1.5;
+        params.dirpyrequalizer.threshold = 0.2;
+        params.dirpyrequalizer.skinprotect = 0.0;
+
+        if (std::strcmp(label, "wavelet enabled") == 0) {
+            params.wavelet.enabled = true;
+        } else if (std::strcmp(label, "cbdlMethod bef") == 0) {
+            params.dirpyrequalizer.cbdlMethod = "bef";
+        } else if (std::strcmp(label, "mult out of range") == 0) {
+            params.dirpyrequalizer.mult[0] = 5.0;
+        } else if (std::strcmp(label, "threshold out of range") == 0) {
+            params.dirpyrequalizer.threshold = 2.0;
+        } else if (std::strcmp(label, "skin out of range") == 0) {
+            params.dirpyrequalizer.skinprotect = 200.0;
+        } else if (std::strcmp(label, "all multipliers neutral") == 0) {
+            for (int level = 0; level < 6; ++level) {
+                params.dirpyrequalizer.mult[level] = 1.0;
+            }
+        } else {
+            params.colorappearance.enabled = true;
+            params.colorappearance.modelmethod = "02";
+            wavelet_settings.autocielab = true;
+        }
+
+        check(!labWaveletSupported(params),
+              (std::string("lab.wavelet residual ") + label +
+               " is a residual").c_str());
+
+        LabImage source(179, 48);
+        fill_lab_tools(source, seed++);
+
+        rtengine::ImProcFunctions cpu_ipf(&params, false);
+        LabImage cpu(179, 48);
+        cpu.CopyFrom(&source);
+        labWaveletHostBlock(cpu_ipf, params, cpu);
+
+        rtengine::ImProcFunctions device_ipf(&params, false);
+        LabImage device(179, 48);
+        device.CopyFrom(&source);
+        const LabWaveletRun result =
+            run_lab_wavelet_node(device, params, device_ipf, profile_path);
+        const std::string profile = read_file(profile_path);
+
+        check(!result.supported,
+              (std::string("lab.wavelet residual ") + label +
+               " is refused as a device configuration").c_str());
+        check(!result.deviceReady,
+              (std::string("lab.wavelet residual ") + label +
+               " does not build a device setup").c_str());
+        check(result.status == RT_STAGE_OK,
+              (std::string("lab.wavelet residual ") + label +
+               " completes through run()").c_str());
+        check(profile.find("\"impl\":\"host\"") != std::string::npos,
+              (std::string("lab.wavelet residual ") + label +
+               " records a host execution").c_str());
+        check(profile.find("\"impl\":\"opencl\"") == std::string::npos,
+              (std::string("lab.wavelet residual ") + label +
+               " never mixes a device pass").c_str());
+
+        const Diff diff = compare(view(device), view(cpu));
+        std::printf("stage-residency: lab.wavelet residual %s: host, PAE "
+                    "%.6f LSB16, %zu of %zu samples differ\n",
+                    label, diff.max_abs, diff.differing, diff.samples);
+        check(diff.finite,
+              (std::string("lab.wavelet residual ") + label +
+               " stays finite").c_str());
+        check(diff.differing == 0 && diff.max_abs == 0.0,
+              (std::string("lab.wavelet residual ") + label +
+               " matches the CPU block").c_str());
+        wavelet_settings.autocielab = false;
+    }
+
+    /*
+     * The default path: with RT_STAGE_OPENCL unset and no override, run()
+     * resolves to the built-in, which executes the same extracted host block
+     * the call site uses when the node is not selected. It must match the
+     * direct block byte for byte.
+     */
+    {
+        rtengine::procparams::ProcParams params;
+        params.dirpyrequalizer.enabled = true;
+        params.dirpyrequalizer.cbdlMethod = "aft";
+        params.dirpyrequalizer.mult[0] = 1.5;
+        params.dirpyrequalizer.threshold = 0.2;
+
+        LabImage source(179, 48);
+        fill_lab_tools(source, 0xa5a5a5a5u);
+
+        rtengine::ImProcFunctions host_ipf(&params, false);
+        LabImage host(179, 48);
+        host.CopyFrom(&source);
+        labWaveletHostBlock(host_ipf, params, host);
+
+        rtengine::ImProcFunctions builtin_ipf(&params, false);
+        LabImage builtin(179, 48);
+        builtin.CopyFrom(&source);
+        const LabWaveletRun result =
+            run_lab_wavelet_node(builtin, params, builtin_ipf, profile_path,
+                                 false);
+        const std::string profile = read_file(profile_path);
+        check(result.status == RT_STAGE_OK,
+              "lab.wavelet default path completes through run()");
+        check(profile.find("\"impl\":\"builtin\"") != std::string::npos,
+              "lab.wavelet default path records the built-in implementation");
+        check(profile.find("\"impl\":\"opencl\"") == std::string::npos,
+              "lab.wavelet default path never runs a device pass");
+        const Diff diff = compare(view(builtin), view(host));
+        check(diff.differing == 0 && diff.max_abs == 0.0,
+              "lab.wavelet default path matches the host block");
+    }
+
+    /*
+     * Non-vacuity: skin protection and the gamutlab pre-pass must change the
+     * host block's own output, so the supported cases exercised both.
+     */
+    {
+        const auto host_block = [&](rtengine::procparams::ProcParams& p,
+                                    const LabImage& source) {
+            LabImage image(source.W, source.H);
+            image.CopyFrom(&source);
+            rtengine::ImProcFunctions ipf(&p, false);
+            labWaveletHostBlock(ipf, p, image);
+            return image;
+        };
+
+        rtengine::procparams::ProcParams skin;
+        skin.dirpyrequalizer.enabled = true;
+        skin.dirpyrequalizer.cbdlMethod = "aft";
+        skin.dirpyrequalizer.mult[0] = 1.6;
+        skin.dirpyrequalizer.threshold = 0.2;
+        skin.dirpyrequalizer.skinprotect = 60.0;
+
+        LabImage skin_source(238, 64);
+        fill_lab_wavelet_skin(skin_source);
+        rtengine::procparams::ProcParams no_skin = skin;
+        no_skin.dirpyrequalizer.skinprotect = 0.0;
+        const Diff protection =
+            compare(view(host_block(skin, skin_source)),
+                    view(host_block(no_skin, skin_source)));
+        std::printf("stage-residency: lab.wavelet skin protection changes %zu "
+                    "of %zu samples, PAE %.6f LSB16\n",
+                    protection.differing, protection.samples,
+                    protection.max_abs);
+        check(protection.differing > 0,
+              "lab.wavelet skin protection changes the image");
+
+        rtengine::procparams::ProcParams gamut = skin;
+        gamut.dirpyrequalizer.gamutlab = true;
+        rtengine::procparams::ProcParams plain = skin;
+        plain.dirpyrequalizer.gamutlab = false;
+        LabImage gamut_source(238, 64);
+        fill_lab_tools(gamut_source, 0x51ed270bu);
+        const Diff artifact =
+            compare(view(host_block(gamut, gamut_source)),
+                    view(host_block(plain, gamut_source)));
+        std::printf("stage-residency: lab.wavelet gamutlab pre-pass changes %zu "
+                    "of %zu samples, PAE %.6f LSB16\n",
+                    artifact.differing, artifact.samples, artifact.max_abs);
+        check(artifact.differing > 0,
+              "lab.wavelet gamutlab pre-pass changes the image");
+    }
+}
+
+/* A GPU device must never run the equaliser; it records a host execution. */
+void test_lab_wavelet_gpu(bool available)
+{
+    using namespace rtengine::stage;
+
+    StageOpenCLDeviceInfo info;
+    if (!available || !opencl_stage_device_info(&info) || info.cpu) {
+        skip("lab.wavelet GPU residual: no GPU OpenCL device");
+        return;
+    }
+
+    static rtengine::Settings gpu_settings{};
+    rtengine::settings = &gpu_settings;
+    rtengine::Color::init();
+
+    const std::string profile_path =
+        std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp") +
+        "/stage-residency-lab-wavelet-gpu.jsonl";
+
+    rtengine::procparams::ProcParams params;
+    params.dirpyrequalizer.enabled = true;
+    params.dirpyrequalizer.cbdlMethod = "aft";
+    params.dirpyrequalizer.mult[0] = 1.5;
+
+    LabImage source(179, 48);
+    fill_lab_tools(source, 0x9e3779b9u);
+
+    rtengine::ImProcFunctions cpu_ipf(&params, false);
+    LabImage cpu(179, 48);
+    cpu.CopyFrom(&source);
+    labWaveletHostBlock(cpu_ipf, params, cpu);
+
+    rtengine::ImProcFunctions device_ipf(&params, false);
+    LabImage device(179, 48);
+    device.CopyFrom(&source);
+    const LabWaveletRun result =
+        run_lab_wavelet_node(device, params, device_ipf, profile_path);
+    const std::string profile = read_file(profile_path);
+
+    check(result.supported,
+          "lab.wavelet GPU residual is a supported configuration");
+    check(result.deviceReady,
+          "lab.wavelet GPU residual builds its host setup");
+    check(result.status == RT_STAGE_OK,
+          "lab.wavelet GPU residual completes through run()");
+    check(profile.find("\"impl\":\"host\"") != std::string::npos,
+          "lab.wavelet GPU residual records a host execution");
+    const Diff diff = compare(view(device), view(cpu));
+    check(diff.differing == 0 && diff.max_abs == 0.0,
+          "lab.wavelet GPU residual matches the CPU block");
+}
+
 /* --------------------------------------------------------- run() wiring */
 
 void test_run_wiring(bool available)
@@ -6237,6 +6774,8 @@ int main()
     test_lab_tools_lab_curve(available);
     test_lab_tools_local_contrast(available);
     test_lab_tools_regions(available);
+    test_lab_wavelet(available);
+    test_lab_wavelet_gpu(available);
     test_output_sharpen(available);
     test_run_wiring(available);
 
