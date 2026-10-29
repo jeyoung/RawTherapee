@@ -7388,6 +7388,12 @@ void test_local_adjustments(bool available)
             {"chroma range", [](auto& p) {
                  p.locallab.spots[0].chroma = 101;
              }},
+            {"reparcol 50", [](auto& p) {
+                 p.locallab.spots[0].reparcol = 50.0;
+             }},
+            {"reparcol 1", [](auto& p) {
+                 p.locallab.spots[0].reparcol = 1.0;
+             }},
         };
         for (const auto& residual : residuals) {
             rtengine::procparams::ProcParams params = supported;
@@ -7503,6 +7509,54 @@ void test_local_adjustments(bool available)
         skip("local.adjustments: no OpenCL device");
     }
 
+    /* A 4-pixel ROI is below Lab_Local()'s mSP=5 colour floor. The block
+     * still runs the prefilter and tail clamp but does no colour work, so the
+     * launcher refuses and the host builtin must match it exactly. */
+    {
+        rtengine::procparams::ProcParams params = supported;
+        params.locallab.spots[0].loc = {40, 40, 40, 40};
+        params.locallab.spots[0].centerX = 0;
+        params.locallab.spots[0].centerY = 0;
+        check(localAdjustmentsSupported(params),
+              "the 4-px spot is still inside the block predicate");
+
+        Imagefloat reference_base(100, 100);
+        fill_local_adjustments_rgb(reference_base, 131u);
+        std::unique_ptr<LabImage> reference_lab(
+            new LabImage(100, 100));
+        rtengine::ImProcFunctions reference_ipf(&params, false);
+        localAdjustmentsHostBlock(reference_ipf, params, &reference_base,
+                                  reference_lab.get(), 100, 100);
+
+        rtengine::procparams::ProcParams node_params = params;
+        Imagefloat node_base(100, 100);
+        fill_local_adjustments_rgb(node_base, 131u);
+        std::unique_ptr<LabImage> node_lab(new LabImage(100, 100));
+        rtengine::ImProcFunctions node_ipf(&node_params, false);
+        const RtStageStatus status =
+            run_local_adjustments_node(node_base, *node_lab, node_params,
+                                       node_ipf, profile_path);
+        check(status == RT_STAGE_OK,
+              "the 4-px local.adjustments case completes through run()");
+        const std::string profile = read_file(profile_path);
+        if (available) {
+            check(profile.find("\"impl\":\"host\"") !=
+                      std::string::npos,
+                  "the 4-px spot records a host execution");
+            check(profile.find("\"impl\":\"opencl\"") ==
+                      std::string::npos,
+                  "the 4-px spot never claims a device pass");
+        }
+        const Diff diff =
+            compare(view(*reference_lab), view(*node_lab));
+        std::printf("stage-residency: local.adjustments 4-px ROI: host, "
+                    "PAE %.6f LSB16, %zu samples differ\n",
+                    diff.max_abs, diff.differing);
+        check(diff.finite && diff.max_abs == 0.0 &&
+                  diff.differing == 0,
+              "the 4-px local.adjustments case matches the block");
+    }
+
     /* Residuals: every one must run the host builtin, never a device pass,
      * and match the block byte for byte. */
     {
@@ -7527,6 +7581,12 @@ void test_local_adjustments(bool available)
              }},
             {"exposure tool", [](auto& p) {
                  p.locallab.spots[0].expexpose = true;
+             }},
+            {"reparcol 50", [](auto& p) {
+                 p.locallab.spots[0].reparcol = 50.0;
+             }},
+            {"reparcol 1", [](auto& p) {
+                 p.locallab.spots[0].reparcol = 1.0;
              }},
             {"highlight reconstruction", [](auto& p) {
                  p.toneCurve.hrenabled = true;
@@ -7641,6 +7701,42 @@ void test_local_adjustments(bool available)
               "highlight reconstruction is off");
         check(record[RT_LOCAL_ADJUSTMENTS_SLOT_QCURVE] == 0.f,
               "the quality curves are off");
+    }
+
+    /* The call-site guard is a helper so the inactive/prefill decision is
+     * testable without constructing a full ImageProcessor job. */
+    {
+        rtengine::procparams::ProcParams disabled;
+        disabled.locallab.enabled = false;
+        disabled.locallab.spots.push_back(
+            localAdjustmentsSpot("disabled", 0, 0, 800, true, 35, 10, -5));
+        const LocalAdjustmentsDispatch disabled_route =
+            localAdjustmentsDispatch(disabled);
+        check(!disabled_route.submit && !disabled_route.prefill &&
+                  !disabled_route.supported,
+              "a disabled block does not submit or prefill");
+
+        rtengine::procparams::ProcParams empty;
+        empty.locallab.enabled = true;
+        const LocalAdjustmentsDispatch empty_route =
+            localAdjustmentsDispatch(empty);
+        check(!empty_route.submit && !empty_route.prefill &&
+                  !empty_route.supported,
+              "an empty block does not submit or prefill");
+
+        const LocalAdjustmentsDispatch active_route =
+            localAdjustmentsDispatch(supported);
+        check(active_route.submit && active_route.prefill &&
+                  active_route.supported,
+              "a supported active block submits and prefills");
+
+        rtengine::procparams::ProcParams residual = supported;
+        residual.locallab.spots[0].reparcol = 50.0;
+        const LocalAdjustmentsDispatch residual_route =
+            localAdjustmentsDispatch(residual);
+        check(residual_route.submit && !residual_route.prefill &&
+                  !residual_route.supported,
+              "an active residual submits without prefilling");
     }
 
     /* An inactive block must not round-trip the base image. This is the
