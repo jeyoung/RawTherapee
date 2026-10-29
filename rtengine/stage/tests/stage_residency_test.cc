@@ -28,6 +28,7 @@
 #include "stage/algorithms/sharpen_cl.h"
 #include "stage/lab_tools_context.h"
 #include "stage/lab_wavelet_context.h"
+#include "stage/local_adjustments_context.h"
 #include "stage/working_trc_context.h"
 
 #include "sharpen_core.h"
@@ -7124,6 +7125,363 @@ void test_lab_tools_regions(bool available)
     }
 }
 
+/* --------------------------------------------------- local adjustments */
+
+void fill_local_adjustments_rgb(Imagefloat& image, unsigned seed)
+{
+    for (int y = 0; y < image.getHeight(); ++y) {
+        for (int x = 0; x < image.getWidth(); ++x) {
+            const unsigned hash =
+                (seed * 2654435761u + static_cast<unsigned>(x) * 2246822519u +
+                 static_cast<unsigned>(y) * 3266489917u) >>
+                8;
+            /* A smooth ramp with structure so the transition, deltaE and clamp
+             * all see non-trivial values. A few samples sit outside the
+             * working range, which is what the per-spot clamp is for. */
+            float r = 12000.f + 12000.f * std::sin(0.031f * x) +
+                      6000.f * std::cos(0.017f * y);
+            float g = 18000.f + 9000.f * std::cos(0.023f * x + 0.4f);
+            float b = 9000.f + 15000.f * std::sin(0.019f * y + 0.7f);
+            if ((hash % 131u) == 0u) {
+                r = 70000.f;
+            } else if ((hash % 127u) == 0u) {
+                g = -3000.f;
+            }
+            image.r(y, x) = std::max(0.f, std::min(65535.f, r));
+            image.g(y, x) = std::max(0.f, std::min(65535.f, g));
+            image.b(y, x) = std::max(0.f, std::min(65535.f, b));
+        }
+    }
+}
+
+rtengine::procparams::LocallabParams::LocallabSpot localAdjustmentsSpot(
+    const char* name, int centre_x, int centre_y, int extent,
+    bool active, int chroma, int lightness, int contrast)
+{
+    rtengine::procparams::LocallabParams::LocallabSpot spot;
+    spot.name = name;
+    spot.shape = "ELI";
+    spot.spotMethod = "norm";
+    spot.centerX = centre_x;
+    spot.centerY = centre_y;
+    spot.loc = {extent, extent, extent, extent};
+    spot.circrad = 18.0;
+    spot.transit = 60.0;
+    spot.transitweak = 1.0;
+    spot.transitgrad = 0.0;
+    spot.activ = active;
+    spot.deltae = true;
+    spot.avoidrad = 0.0;
+    spot.avoidgamutMethod = "MUNS";
+    spot.merMethod = "mone";
+    spot.qualitycurveMethod = "none";
+    spot.gamc = 1.0;
+    spot.softradiuscol = 0.0;
+    spot.reparcol = 100.0; /* merge recovery; ignored without a merge */
+    spot.strengthgrid = 30; /* only scales an active LabGrid */
+    spot.avoidneg = true;    /* the per-spot negative-value prefilter */
+    spot.expcolor = true;
+    spot.chroma = chroma;
+    spot.lightness = lightness;
+    spot.contrast = contrast;
+    return spot;
+}
+
+/* The call-site submission: build the context, fill the three-argument ABI
+ * and run the node with the device selected. */
+RtStageStatus run_local_adjustments_node(
+    Imagefloat& base, LabImage& lab,
+    rtengine::procparams::ProcParams& params, rtengine::ImProcFunctions& ipf,
+    const std::string& profile_path)
+{
+    using namespace rtengine::stage;
+
+    LabImage* lab_pointer = &lab;
+    LocalAdjustmentsContext context(params, ipf, &base, lab_pointer, lab.W, lab.H);
+
+    RtStageArg args[3] = {};
+    args[0].kind = RT_STAGE_ARG_BUFFER;
+    args[0].u.buffer = view(lab);
+    args[1].kind = RT_STAGE_ARG_PTR;
+    args[1].u.ptr = &context; /* descriptor() is returned by value: see below */
+    args[2].kind = RT_STAGE_ARG_INT;
+    args[2].u.i = localAdjustmentsSupported(params) ? 1 : 0;
+
+    RtLocalAdjustmentsContext descriptor =
+        context.descriptor(args[2].u.i != 0);
+    args[1].u.ptr = &descriptor;
+
+    std::remove(profile_path.c_str());
+    setenv("RT_STAGE_PROFILE", profile_path.c_str(), 1);
+    set_node_device_override("local.adjustments", StageNodeDevice::OpenCL);
+    const RtStageStatus status =
+        run("local.adjustments", std::vector<RtStageArg>(args, args + 3));
+    clear_node_device_overrides();
+    unsetenv("RT_STAGE_PROFILE");
+    return status;
+}
+
+void test_local_adjustments(bool available)
+{
+    using namespace rtengine::stage;
+
+    static MyMutex local_adjustments_lcms_mutex;
+    if (rtengine::lcmsMutex == nullptr) {
+        rtengine::lcmsMutex = &local_adjustments_lcms_mutex;
+    }
+    static rtengine::Settings local_adjustments_settings{};
+    rtengine::settings = &local_adjustments_settings;
+    rtengine::Color::init();
+
+    {
+        rtengine::procparams::ProcParams defaults;
+        check(!localAdjustmentsSupported(defaults),
+              "local.adjustments refuses a profile with no spots");
+    }
+
+    /* An otherwise default spot is clamp-only and must be admitted: the
+     * block's prefilter and tail clamp still run for it. */
+    {
+        rtengine::procparams::ProcParams params;
+        params.locallab.enabled = true;
+        params.locallab.spots.push_back(
+            localAdjustmentsSpot("clamp", 0, 0, 800, false, 0, 0, 0));
+        check(localAdjustmentsSupported(params),
+              "local.adjustments admits an inactive clamp-only spot");
+    }
+
+    /* The residual matrix: one otherwise supported profile per entry, with
+     * exactly one setting moved outside the supported set. */
+    {
+        struct Residual {
+            const char* label;
+            void (*mutate)(rtengine::procparams::ProcParams&);
+        };
+        const Residual residuals[] = {
+            {"exposure", [](auto& p) {
+                 p.locallab.spots[0].expexpose = true;
+             }},
+            {"shadows/highlights", [](auto& p) {
+                 p.locallab.spots[0].expshadhigh = true;
+             }},
+            {"vibrance", [](auto& p) {
+                 p.locallab.spots[0].expvibrance = true;
+             }},
+            {"local contrast", [](auto& p) {
+                 p.locallab.spots[0].expcontrast = true;
+             }},
+            {"blur", [](auto& p) {
+                 p.locallab.spots[0].expblur = true;
+             }},
+            {"tone map", [](auto& p) {
+                 p.locallab.spots[0].exptonemap = true;
+             }},
+            {"soft light", [](auto& p) {
+                 p.locallab.spots[0].expsoft = true;
+             }},
+            {"sharpening", [](auto& p) {
+                 p.locallab.spots[0].expsharp = true;
+             }},
+            {"log", [](auto& p) {
+                 p.locallab.spots[0].explog = true;
+             }},
+            {"mask", [](auto& p) {
+                 p.locallab.spots[0].expmask = true;
+             }},
+            {"explicit mask", [](auto& p) {
+                 p.locallab.spots[0].enaColorMask = true;
+             }},
+            {"soft radius", [](auto& p) {
+                 p.locallab.spots[0].softradiuscol = 1.0;
+             }},
+            {"recursion", [](auto& p) {
+                 p.locallab.spots[0].recurs = true;
+             }},
+            {"inversion", [](auto& p) {
+                 p.locallab.spots[0].invers = true;
+             }},
+            {"merge", [](auto& p) {
+                 p.locallab.spots[0].merMethod = "mtwo";
+             }},
+            {"exclude spot", [](auto& p) {
+                 p.locallab.spots[0].spotMethod = "exc";
+             }},
+            {"LAB gamut", [](auto& p) {
+                 p.locallab.spots[0].avoidgamutMethod = "LAB";
+             }},
+            {"XYZ gamut", [](auto& p) {
+                 p.locallab.spots[0].avoidgamutMethod = "XYZ";
+             }},
+            {"soft radius gamut", [](auto& p) {
+                 p.locallab.spots[0].avoidrad = 5.0;
+             }},
+            {"RGB curve", [](auto& p) {
+                 p.locallab.spots[0].rgbcurve = {3.0, 0.0, 0.0, 0.5, 0.7, 1.0, 1.0};
+             }},
+            {"LabGrid", [](auto& p) {
+                 p.locallab.spots[0].labgridAHigh = 1.0;
+             }},
+            {"structure", [](auto& p) {
+                 p.locallab.spots[0].structcol = 10;
+             }},
+            {"gamma", [](auto& p) {
+                 p.locallab.spots[0].gamc = 2.0;
+             }},
+            {"pre-CBDL", [](auto& p) {
+                 p.dirpyrequalizer.enabled = true;
+             }},
+            {"dehaze", [](auto& p) {
+                 p.dehaze.enabled = true;
+             }},
+        };
+        for (const Residual& residual : residuals) {
+            rtengine::procparams::ProcParams params;
+            params.locallab.enabled = true;
+            params.locallab.spots.push_back(
+                localAdjustmentsSpot("residual", 0, 0, 800, true, 20, 5, 5));
+            residual.mutate(params);
+            if (localAdjustmentsSupported(params)) {
+                std::fprintf(stderr, "FAIL: local.adjustments admits %s\n",
+                             residual.label);
+                ++failures;
+            }
+        }
+    }
+
+    const std::string profile_path =
+        std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp") +
+        "/stage-residency-local-adjustments.jsonl";
+
+    struct Case {
+        const char* label;
+        int width;
+        int height;
+        int spots;
+        bool active;
+    };
+    const Case cases[] = {
+        {"one inactive spot, 179x48", 179, 48, 1, false},
+        {"two overlapping spots, 179x49", 179, 49, 2, true},
+        {"three overlapping spots, 238x64", 238, 64, 3, true},
+        {"reversed three spots, 238x64", 238, 64, 3, true},
+    };
+
+    for (std::size_t index = 0; index < sizeof(cases) / sizeof(cases[0]);
+         ++index) {
+        const Case& c = cases[index];
+        rtengine::procparams::ProcParams reference_params;
+        reference_params.locallab.enabled = true;
+        for (int spot = 0; spot < c.spots; ++spot) {
+            const int offset = spot * 140;
+            reference_params.locallab.spots.push_back(
+                localAdjustmentsSpot("spot", offset, offset, 800, c.active,
+                                     40 - 10 * spot, 8 * spot, -6 * spot));
+        }
+        if (std::strcmp(c.label, "reversed three spots, 238x64") == 0) {
+            std::reverse(reference_params.locallab.spots.begin(),
+                         reference_params.locallab.spots.end());
+        }
+        check(localAdjustmentsSupported(reference_params),
+              "the colour-only case is inside the predicate");
+
+        Imagefloat reference_base(c.width, c.height);
+        fill_local_adjustments_rgb(reference_base, 11u + index);
+        std::unique_ptr<LabImage> reference_lab(
+            new LabImage(c.width, c.height));
+        rtengine::ImProcFunctions reference_ipf(&reference_params, false);
+        localAdjustmentsHostBlock(reference_ipf, reference_params,
+                                  &reference_base, reference_lab.get(),
+                                  c.width, c.height);
+
+        rtengine::procparams::ProcParams node_params = reference_params;
+        Imagefloat node_base(c.width, c.height);
+        fill_local_adjustments_rgb(node_base, 11u + index);
+        std::unique_ptr<LabImage> node_lab(new LabImage(c.width, c.height));
+        rtengine::ImProcFunctions node_ipf(&node_params, false);
+        const RtStageStatus status =
+            run_local_adjustments_node(node_base, *node_lab, node_params,
+                                       node_ipf, profile_path);
+        check(status == RT_STAGE_OK,
+              "the local.adjustments node completes through run()");
+
+        const std::string profile = read_file(profile_path);
+        if (available) {
+            check(profile.find("\"impl\":\"host\"") != std::string::npos,
+                  "the local.adjustments node records a host execution");
+            check(profile.find("\"impl\":\"opencl\"") == std::string::npos,
+                  "the local.adjustments node never claims a device pass");
+        }
+
+        const Diff diff =
+            compare(view(*reference_lab), view(*node_lab));
+        std::printf("stage-residency: local.adjustments %s: PAE %.6f LSB16, "
+                    "%zu of %zu samples differ\n",
+                    c.label, diff.max_abs, diff.differing, diff.samples);
+        check(diff.finite && diff.max_abs == 0.0 && diff.differing == 0,
+              "the local.adjustments result matches the host block");
+    }
+
+    /* The per-spot record and its host-built tables. */
+    {
+        rtengine::procparams::ProcParams params;
+        params.locallab.enabled = true;
+        auto spot = localAdjustmentsSpot("build", 0, 0, 800, true, 35, 10, -5);
+        spot.qualitycurveMethod = "std";
+        spot.llcurve = {3.0, 0.0, 0.0, 0.5, 0.7, 1.0, 1.0};
+        spot.LHcurve = {0.0, 0.5, 1.0, 0.5};
+        params.locallab.spots.push_back(spot);
+
+        Imagefloat base(179, 48);
+        fill_local_adjustments_rgb(base, 41u);
+        std::unique_ptr<LabImage> lab(new LabImage(179, 48));
+        rtengine::ImProcFunctions ipf(&params, false);
+        rtengine::LabImage source(179, 48);
+        ipf.rgb2lab(base, source, params.icm.workingProfile);
+
+        LabImage* lab_pointer = lab.get();
+        LocalAdjustmentsContext context(params, ipf, &base, lab_pointer, 179, 48);
+        RtStageBuffer source_view = view(source);
+        RtLocalAdjustmentsResult setup{};
+        check(context.build(0, &source_view, setup) == 0,
+              "the local.adjustments setup builds one spot");
+        check(setup.spot_count == 1 &&
+                  setup.spot_stride ==
+                      RT_LOCAL_ADJUSTMENTS_SPOT_STRIDE,
+              "the local.adjustments record has one flat spot");
+        check(setup.lut_count != 0 && setup.luts != nullptr,
+              "the local.adjustments setup builds its curve tables");
+        check(setup.ws != nullptr && setup.iws != nullptr &&
+                  setup.cachef != nullptr && setup.cachefy != nullptr &&
+                  setup.munsell != nullptr,
+              "the local.adjustments setup exports the clamp tables");
+        const float* record = setup.spots;
+        bool finite = true;
+        for (std::size_t slot = 0;
+             slot < RT_LOCAL_ADJUSTMENTS_SPOT_STRIDE; ++slot) {
+            finite = finite && std::isfinite(record[slot]);
+        }
+        check(finite, "the local.adjustments record is finite");
+        check(record[RT_LOCAL_ADJUSTMENTS_SLOT_LL_ACTIVE] == 1.f,
+              "the L curve table is active");
+        check(record[RT_LOCAL_ADJUSTMENTS_SLOT_LH_ACTIVE] == 0.f,
+              "the identity L=f(H) curve is inactive");
+        check(record[RT_LOCAL_ADJUSTMENTS_SLOT_AVOIDGAMUT] ==
+                  RT_LOCAL_ADJUSTMENTS_AVOID_MUNS,
+              "the default gamut method is MUNS");
+        check(record[RT_LOCAL_ADJUSTMENTS_SLOT_AVOIDNEG] == 1.f,
+              "the default negative-value prefilter is recorded");
+        check(record[RT_LOCAL_ADJUSTMENTS_SLOT_CLAMPMODE] ==
+                  RT_LOCAL_ADJUSTMENTS_CLAMP_NOTZERO,
+              "the tail clamp arm is recorded");
+        const float lh_offset =
+            record[RT_LOCAL_ADJUSTMENTS_SLOT_LH_OFFSET];
+        check(lh_offset == RT_LOCAL_ADJUSTMENTS_NO_LUT,
+              "an inactive curve has no table");
+    }
+
+    std::remove(profile_path.c_str());
+}
+
 } // namespace
 
 int main()
@@ -7180,6 +7538,7 @@ int main()
     test_lab_tools_lab_curve(available);
     test_lab_tools_local_contrast(available);
     test_lab_tools_regions(available);
+    test_local_adjustments(available);
     test_lab_wavelet(available);
     test_lab_wavelet_contrast(available);
     test_lab_wavelet_gpu(available);
