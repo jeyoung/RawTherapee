@@ -113,7 +113,20 @@ single-precision `sqrt`/divide the host uses, while the closing chroma and the
 Munsell index use the host's double-precision `sqrt` divided by the promoted
 `327.68f`. The host's precompute covers only whole four-column blocks and
 falls back to the double path for the last up to three columns, and the kernel
-reproduces that tail. The program is
+reproduces that tail. Lab colour-correction regions are a port of
+`ImProcFunctions::labColorCorrectionRegions()` for one to four regions: the
+host samples each region's hue, chromaticity and lightness `FlatCurve` into a
+piecewise-linear table (refusing a curve the table cannot follow within the
+mask error budget), and the kernel reproduces the guide, the
+`Color::Lab2Lch()`/`huelab_to_huehsv2()`/`xlin2log()` transforms, the mask
+product, the two `guidedFilter()` rounds with the block's implicit subsampling
+and its 0.001/0.0001 epsilons, the `abcoord` a/b correction, the CDL round trip
+with `pow_F()` and the saturation-about-luminance step, the channel copy from
+the original pixel and the two `intp()` blends. The masks are always built
+from a snapshot of the original Lab, and the region applications run in region
+order. The working matrices are uploaded again as doubles for this pass,
+because the host's CDL and channel products are double expressions and the
+float matrices can move a gamut-edge sample by 2 LSB16. The program is
 therefore built separately from the fp32 `lab.tools` program with
 `cl_khr_fp64`; the launcher refuses the pass on a device without fp64. Local
 contrast's own fp64 program (`lab.tools.localcontrast`) carries the same
@@ -122,20 +135,25 @@ restriction: the double recurrence and the SSE path's double tail lines need
 it also needs a host built with SSE2 (or `RT_SIMDE`), because the device
 coefficients describe the SSE path; without it the host runs the double path
 and the launcher refuses that sigma. Vibrance,
-local contrast and the Lab curves are admitted only on a CPU OpenCL device: a
-GPU's `xatan2f()` division or `sqrt` rounds differently and moves pixels on a
-Munsell limit, and its compiler may lower the IIR recurrence differently, so a
-GPU submission runs the host block and records `impl=host`. Everything else in
-the block is a residual: a non-zero Lab
+local contrast, the Lab curves and Lab regions are admitted only on a CPU
+OpenCL device: a GPU's `xatan2f()` division or `sqrt` rounds differently and
+moves pixels on a Munsell limit, its compiler may lower the IIR recurrence
+differently, and its float contraction can move the region mask, so a GPU
+submission runs the host block and records `impl=host`. Lab regions also need
+an fp64 device (their mask product, hue mapping and working-matrix products
+are double expressions) and the bounded set: no mask display, one to four
+regions, mask curves that are empty, `FCT_Linear` or a `FCT_MinMaxCPoints`
+curve the host table can follow, and every slider inside the ABI range.
+Everything else in the block is a residual: a non-zero Lab
 `contrast` (it owns the `hist16` refill a later node reads), the chromaticity
 slider and the C=f(H), L=f(H) and H=f(H) flat curves, the LAB, XYZ and XYZREL
 Munsell methods (they need `gamutLchonly()` and `gamutmap()`), a denoise
 chroma factor, a local contrast outside the ABI range, a local contrast below
 sigma 25 on a host built without SSE2, EPD, black-and-white
-output, any colour-toning
-method other than `LabGrid` (`LabRegions` included), a profile where no device
-tool would run, and an RGB-mode tone table whose steepest step can turn the
-closing round trip's one-ulp channel difference into more than one LSB16. A
+output, a colour-toning method other than `LabGrid` and the bounded
+`LabRegions` set, a profile where no device tool would run, and an RGB-mode
+tone table whose steepest step can turn the closing round trip's one-ulp
+channel difference into more than one LSB16. A
 residual runs the `lab.tools` host builtin and records `impl=host`, never a
 device pass.
 
@@ -158,7 +176,7 @@ main sharpen node may still run on the device.
 | `transform` | Full/Full/Roi/- | path | reuse-input | rotation, distortion, perspective, CA, vignetting, gradient, post-crop vignette, dehaze, Fattal | yes |
 | `local.adjustments` | Full/Full/Roi/Reduced | path | reuse-input | local lab / selective editing | no |
 | `rgb.proc` | Full/Full/Roi/Reduced | path | reuse-input | RGB curves, tone curve, colour toning, B&W, channel mixer, HSV, film simulation | yes |
-| `lab.tools` | Full/Full/Roi/Reduced | path | reuse-input | shadows/highlights, vibrance, Lab curves, local contrast, EPD, Lab-grid colour toning | partial |
+| `lab.tools` | Full/Full/Roi/Reduced | path | reuse-input | shadows/highlights, vibrance, Lab curves, local contrast, EPD, Lab-grid colour toning and Lab colour-correction regions | partial |
 | `lab.sharpening` | Full/-/Roi/- | path | reuse-input | impulse denoise, defringe, ML sharpen edges, ML microcontrast and the main sharpen pass (shared `output.sharpen` node) | partial |
 | `lab.wavelet` | Full/Full/Roi/Reduced | path | reuse-input | directional pyramid equaliser and wavelet | no |
 | `working.trc` | Full/Full/Roi/- | path | reuse-input | soft light, tone equaliser and working-TRC conversion | partial |

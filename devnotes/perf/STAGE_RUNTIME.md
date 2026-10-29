@@ -2086,15 +2086,24 @@ Evidence, with `OMP_NUM_THREADS=1` and a 3888x2608 PEF:
 ## Lab tools
 
 `lab.tools` runs the Lab block's Lab-grid colour-toning pass,
-shadows/highlights in both of its modes, local contrast, the Lab curves and
-vibrance as one device node. Everything else in the block stays on the host.
+shadows/highlights in both of its modes, local contrast, the Lab curves,
+vibrance and the bounded Lab colour-correction region set as one device node.
+Everything else in the block stays on the host.
 
 ### Supported set
 
 `labToolsSupported()` admits a profile where
 
-- colour toning is off, or on with `method == "LabGrid"`; any other method,
-  `LabRegions` included, is a residual;
+- colour toning is off, or on with `method == "LabGrid"` or with a
+  `LabRegions` profile inside the region set below; any other method is a
+  residual;
+- a `LabRegions` profile has no mask display (`labregionsShowMask < 0`), one
+  to four regions, every mask curve empty, `FCT_Linear` or
+  `FCT_MinMaxCPoints`, and a/b inside +-20, saturation inside +-100, slope and
+  power inside 0.1..4, offset inside +-0.1, mask blur inside -10..100 and a
+  channel of -1, 0, 1 or 2. The host samples each mask curve to a
+  piecewise-linear table and refuses one the table cannot follow within the
+  error budget;
 - `labCurve.contrast` is 0, so the `hist16` refill a later node reads stays on
   the host. With the curves enabled the pass is admitted when the chromaticity
   slider is 0, the C=f(H), L=f(H) and H=f(H) flat curves are the identity, the
@@ -2116,17 +2125,18 @@ vibrance as one device node. Everything else in the block stays on the host.
   threshold values inside 0..100, would actually change a pixel (a slider is
   set or the skin curve is not the identity), and, when `avoidcolorshift` is
   on, `Color::init()` has filled the Munsell tables;
-- vibrance, local contrast and the Lab curves additionally require a CPU
-  OpenCL device. A GPU may round the division inside `xatan2f()` or the `sqrt`
-  differently, which moves a pixel whose hue or chroma sits on a Munsell limit
-  across the gate, and its compiler may lower the local-contrast IIR
-  recurrence differently; the launcher refuses all three on a GPU and the
-  builtin records `impl=host`; the gate prints a specific
-  `SKIP ... CPU-device-only` for those rows (see "GPU isolation" below);
-- local contrast and the Lab-curve pass also require an fp64 device, because
-  their programs repeat the host's double-precision `sqrt`/divide or IIR
-  recurrence; without fp64 the launcher refuses them and the block stays on
-  the host;
+- vibrance, local contrast, the Lab curves and Lab regions additionally
+  require a CPU OpenCL device. A GPU may round the division inside `xatan2f()`
+  or the `sqrt` differently, which moves a pixel whose hue or chroma sits on a
+  Munsell limit across the gate, and its compiler may lower the
+  local-contrast IIR recurrence or the region mask arithmetic differently; the
+  launcher refuses all four on a GPU and the builtin records `impl=host`; the
+  gate prints a specific `SKIP ... CPU-device-only` for those rows (see "GPU
+  isolation" below);
+- local contrast, the Lab-curve pass and Lab regions also require an fp64
+  device, because their programs repeat the host's double-precision
+  `sqrt`/divide, IIR recurrence or mask product and working-matrix products;
+  without fp64 the launcher refuses them and the block stays on the host;
 - local contrast below sigma 25 also requires a host build with `__SSE2__` or
   `RT_SIMDE`. The exported coefficients describe the SSE float path; a host
   built without either runs `gaussianBlur()`'s double path for the same sigma,
@@ -2224,7 +2234,54 @@ the double SSE tail and the double path. The launcher refuses a coefficient
 block whose `double_path` disagrees with the radius. The program is
 `lab.tools.localcontrast`, built with `cl_khr_fp64`; like the Lab-curve
 program it is refused on a GPU or a device without fp64. The pass order is
-LabGrid, shadows/highlights, local contrast, Lab curves, vibrance.
+LabGrid, shadows/highlights, local contrast, Lab curves, vibrance, regions.
+
+### Lab colour-correction regions
+
+The region pass is `ImProcFunctions::labColorCorrectionRegions()` for one to
+four regions, run after vibrance as the host block orders it.
+
+Each region's hue, chromaticity and lightness mask is a `FlatCurve`. Those
+curves are evaluated on the host into a piecewise-linear table: the host
+refines the table where its chord misses `FlatCurve::getVal()` and refuses a
+curve whose stored float table misses it by more than 5e-7 in mask units. The
+table is a node count followed by x and y nodes; the kernel interpolates it
+linearly and extrapolates at both ends with the first/last segment slope,
+which is what the host validates. A negative lightness (raw `L/32768`) wraps
+once, because `FlatCurve::getVal()` adds 1.0 below its first node; the
+lightness and chroma tables run to 4.0 so an L above 32768 or a large chroma
+follows the same final segment the host reads.
+
+The mask kernel reproduces the block's first loop: `guide = LIM01(L/32768)`,
+`Color::Lab2Lch()`'s scalar `sqrt(a*a+b*b)/327.68f`, the sleef `xatan2f()`,
+`fastlin2log()` with `327.68f/48000.f`, `Color::huelab_to_huehsv2()` in
+double, the `+1/6` wrap and `xlin2log(h, 3)`, then the product of the active
+tables clamped to 0..1. The product is a double expression narrowed to float,
+as in the block.
+
+Both masks are built from a snapshot of the original Lab, so a later region
+does not see an earlier region's result. Each is filtered by the existing
+guided-filter kernels with the block's implicit `calculate_subsampling()`
+choice and the two radii `max(int(4/scale*blur+0.5),1)` and
+`max(int(25/scale*blur+0.5),1)` with epsilons 0.001 and 0.0001. The host
+computes the radii and the initial mask stays in the scratch planes, so the
+second radius filters the same mask. The region applications then run in
+region order, one kernel launch each, against the previous region's result.
+
+The apply kernel repeats the block's per-region sequence: the
+`LIM(a + l*abca, -42000, 42000)` and b form, the CDL round trip
+(`Lab2XYZ`, `xyz2rgb`, per-channel `pow_F(max(rgb/65535*slope+offset,0),
+power)*65535`, the optional saturation about `rgbLuminance(r,g,b,ws)`, then
+`rgbxyz` and `XYZ2Lab`), `max(l_new,0)`, the optional channel copy from the
+original pixel, and the two `intp()` blends. `abca`/`abcb` are the host's
+`abcoord()` and `rs` is the host's saturation scale. The program is
+`lab.tools.regions`, built with `cl_khr_fp64`; it reads the working matrices
+as doubles because the host's CDL, channel and luminance products are double
+expressions, while `Lab2XYZ()` itself is float.
+
+The kernels use the host's `xcbrtf()` and `cachef`/`cachefy` lookups and the
+same double negative branches of `computeXYZ2Lab()`; that distinction is what
+keeps the CDL round trip inside one LSB16.
 
 ### Vibrance and Munsell
 
@@ -2374,11 +2431,17 @@ table is 32770 floats, the other five 65536), `[54]` and `[55]` those two
 lengths, `[56]` the int local-contrast flag (1 when the enabled tool would
 run), `[57]` the int radius, `[58]` to `[60]` the doubles `amount`,
 `darkness` and `lightness` after the block's float narrowing, `[61]` the int
-scale (always 1 at the export call site; the launcher requires it), and `[62]`
+scale (always 1 at the export call site; the launcher requires it), `[62]`
 the host-only `RtLabToolsIir` pointer with the three coefficient forms for
-each direction. A submission with a wrong kind, length or non-finite value,
+each direction, `[63]` the region count (0 or 1..4), `[64]` the region mask
+tables (count x 3 tables of 65537 floats, each a node count followed by x and
+y nodes), `[65]` that table stride, `[66]` the per-region parameter table
+(count x 14 floats: abca, abcb, rs, slope, offset, power, channel, maskBlur,
+the two radii, the three mask-active flags and a reserved slot), `[67]` and
+`[68]` the working and inverse matrices as nine doubles each. A submission
+with a wrong kind, length or non-finite value,
 a local-contrast setting outside the ABI range, a coefficient block of the
-wrong size or version, or with a
+wrong size or version, a region parameter outside the region ranges, or with a
 method other than 0 and 4 is refused.
 
 The context is host-only. `build()` derives the four Lab-grid floats, builds
@@ -2404,11 +2467,14 @@ for the duration and runs the original block, and the runtime records
 `impl=host`: a non-zero Lab contrast, the chromaticity family and the LAB, XYZ
 and XYZREL Munsell methods, a local contrast outside the ABI range or combined
 with any other residual tool, EPD, black-and-white output, a
-colour-toning method other than `LabGrid`, a profile with no active tool, an
+colour-toning method other than `LabGrid` and the bounded `LabRegions` set (a
+mask display, more than four regions, an unsupported mask curve, or a region
+slider outside its range), a profile with no active tool, an
 out-of-range slider or red/skin setting, a vibrance no-op, a device without
-fp64 for local contrast and the Lab curves, a host built without SSE2 (or
-RT_SIMDE) for local contrast below sigma 25, a GPU for vibrance, local contrast
-and the Lab curves, an image too small for the guided filter (fewer than three
+fp64 for local contrast, the Lab curves and regions, a host built without SSE2
+(or RT_SIMDE) for local contrast below sigma 25, a GPU for vibrance, local
+contrast, the Lab curves and regions, an image too small for the guided filter
+(fewer than three
 samples on the subsampled grid) or for the IIR recurrence (fewer than four
 samples per line),
 an RGB-mode tone table above the slope bound, a process without the Munsell
@@ -2435,20 +2501,25 @@ With `OMP_NUM_THREADS=1`, a 3888x2608 PEF and the POCL CPU device:
 | Local-contrast tail, sigma 24 | the integer fixture and three wide non-integer fixtures (L alternates around 30000 and 0.4 so the float deviation subtraction rounds) cover the last `H mod 4` rows and `W mod 8` columns at 179x50 and 238x63. With the kernel's deviation kept in double - the pre-fix code - the amount-2 179x50 case moves 7 of 26,850 samples, worst 0.164062 LSB16 (26,843 exact); the fixed kernel is bit-exact on all four cases |
 | Local-contrast non-vacuity | on a 179x48 fixture radius 10, amount 1 changes 8,592 of 25,776 samples (PAE 11,071.999900 LSB16), so the device comparison is not a copy |
 | Local-contrast residuals, nine cases | radius 0 and 300, amount 3 and -0.1, darkness 4, lightness -0.5, a NaN amount, and the tool combined with EPD or a non-zero Lab contrast are refused, record `impl=host` with no `impl=opencl`, and are byte-identical to the block (PAE 0, 231,984 samples) |
+| Lab regions, 24 cases at 238x64, 179x48 and 8192x64 | one/two/four regions; all masks open, no masks, hue-only, chroma-only, lightness-only, two- and three-point curved masks; CDL slope, offset, power and all combined; saturation +80 and -60; channels all/red/green/blue; mask blur 0, -2 and 5; padded 179/238 and 8192 wide. 2,603,952 samples, `impl=opencl` on every case, no NaN/Inf, worst 0.579102 LSB16 and 0 samples over 1 LSB16. The single-region and open-mask cases are bit-exact; the residue is the mask table's sub-ulp interpolation and the CDL round trip |
+| Lab-region non-vacuity | the single-region case changes the block's own output on the fixture, so the comparison is not a copy |
+| Lab-region residuals | a mask display, five regions, an `FCT_Unchanged` hue curve, slope 0.05, channel 3, saturation 200 and mask blur -20 are refused, record `impl=host` with no `impl=opencl`, and are byte-identical to the block (PAE 0, 7 x 25,776 samples) |
 | Block on the real PEF, POCL | the device block matches `stage::labToolsHostBlock` bit for bit (30,419,712 samples, max float delta 0) on the full pre-vibrance Lab buffer |
-| Residuals | vibrance + Lab contrast, vibrance + local contrast with amount 30 (outside the ABI range), vibrance + EPD, vibrance + Lab regions, vibrance + black-and-white, a vibrance no-op (sliders at zero, identity curve) and pastels 200 (out of range) are refused, record `impl=host` with no `impl=opencl`, and are byte-identical to the block |
+| Residuals | vibrance + Lab contrast, vibrance + local contrast with amount 30 (outside the ABI range), vibrance + EPD, vibrance + a Lab region mask display, vibrance + black-and-white, a vibrance no-op (sliders at zero, identity curve) and pastels 200 (out of range) are refused, record `impl=host` with no `impl=opencl`, and are byte-identical to the block |
 | RGB-mode steep table | amounts 200 and 1000 are inside the predicate but refused by the setup: `impl=host`, PAE 0 |
 | Forced launcher refusal (a tone table of half the required length) | `impl=host`, no device pass, byte-identical to the block |
 | `verify.sh --stage-device`, POCL CPU, `labtools-sh.pp3`, `labtools-sh-rgb.pp3`, `labtools-labgrid.pp3` | PASS, `max_pae=1.5259e-05` (1 LSB16); records `"stage":"lab.tools","impl":"opencl","source":"opencl"` at 3888x2608 |
 | `verify.sh --stage-device`, POCL CPU, `labtools-vibrance.pp3` on the PEF chart | PASS, `max_pae=1.5259e-05` (1 LSB16); records `"stage":"lab.tools","impl":"opencl","source":"opencl"` |
 | `verify.sh --stage-device`, POCL CPU, `labtools-labcurve.pp3` on the PEF chart | PASS, `max_pae=1.5259e-05` (1 LSB16); records `"stage":"lab.tools","impl":"opencl","source":"opencl"` at 3888x2608. The profile enables the L, a, b, C=f(C), L=f(C) and C=f(L) tables with `Gamutmunse=MUN`, so the gate row is the full supported set |
 | `verify.sh --stage-device`, POCL CPU, `labtools-localcontrast.pp3` on the PEF chart | PASS, `max_pae=1.5259e-05` (1 LSB16); records `"stage":"lab.tools","impl":"opencl","source":"opencl"` at 3888x2608. Radius 60 takes the double IIR path, so the gate exercises the double forward state buffer |
+| `verify.sh --stage-device`, POCL CPU, `labtools-regions.pp3` on the PEF chart | PASS, `max_pae=1.5259e-05` (1 LSB16); records `"stage":"lab.tools","impl":"opencl","source":"opencl"` at 3888x2608. Two regions: curved hue/chroma/lightness masks, CDL slope 1.1/offset 0.02/power 0.9, saturation 40, and a second region with a red channel copy, so the row exercises both mask radii and both CDL and channel paths |
 | GPU, `labtools-localcontrast.pp3` | not run on a GPU in this change. The gate row is declared `cpu`, so a non-CPU device takes the same `SKIP ... CPU-device-only` branch as the vibrance and Lab-curve rows, and the launcher's device-type check refuses the pass before any upload |
 | `verify.sh --stage-device`, RX 550 (rusticl), `labtools-vibrance.pp3` | prints `SKIP` for `pef/stage-device-lab-tools-vibrance` with `the row is CPU-device-only; the selected device is not a CPU OpenCL device`. The row stops before `compare_images` and prints no PAE. A manual `--gpu=auto` export records `"stage":"lab.tools","impl":"host","source":"device-fallback"`; it is not counted as device parity (the other GPU nodes move 372,307 samples by 1 LSB16). A manual `--gpu=off RT_STAGE_OPENCL=1` export is pixel-identical to `--gpu=off` (AE 0); only the Software tag differs |
 | `verify.sh --stage-device` with `RT_REQUIRE_GPU=1`, RX 550 | the vibrance row FAILs intentionally with `the row is CPU-device-only; the selected device is not a CPU OpenCL device`; the POCL run is the authoritative gate |
 | `labtools-residual.pp3` (shadows/highlights + vibrance + local contrast) | PASS as a host residual: `"stage":"lab.tools","impl":"host","source":"device-fallback"` |
 | `--gpu=off`, `RT_STAGE_OPENCL` unset, five lab.tools profiles (including `labtools-labcurve.pp3`) | pixel data identical to the pre-change binary (`tiffcmp`); only the Software tag differs |
 | `--gpu=off`, `RT_STAGE_OPENCL` unset, `labtools-localcontrast.pp3` and a Lab-curve + local-contrast profile | pixel data identical to the binary built at `e2e7011e5` (ImageMagick AE 0 and `tiffcmp` identical), so the CPU path is the pre-node code path |
+| `--gpu=off`, `RT_STAGE_OPENCL` unset, `labtools-regions.pp3`, `OMP_NUM_THREADS=1` | pixel data identical to the binary built at `e41b62b16` (ImageMagick AE 0 and PAE 0), so the region change does not touch the CPU path. Without `OMP_NUM_THREADS=1` the pre-existing parallel export varies by about 2,800 of 30.4M samples between two runs of either binary; the serialised comparison removes that noise |
 | Forced refusal (`RT_STAGE_DEVICE_BUDGET_MB=16`, `RT_REQUIRE_GPU=1`) | FAIL, exit 1, so the gate is not vacuous |
 
 ## Limitations
@@ -2458,10 +2529,14 @@ With `OMP_NUM_THREADS=1`, a 3888x2608 PEF and the POCL CPU device:
   differs at two Munsell-limit pixels because rusticl's `xatan2f()` division is
   not correctly rounded. The Lab-curve pass has the same Munsell-limit
   sensitivity, and its fp64 program has no reason to be admitted on a GPU
-  either. The launcher therefore requires a CPU OpenCL device for both; a GPU
+  either. The region pass has the same CPU-only requirement because its mask
+  product, hue mapping and double working-matrix products are contracted
+  differently by a GPU compiler. The launcher therefore requires a CPU OpenCL
+  device for vibrance, local contrast, the Lab curves and regions; a GPU
   export runs the host block and records `impl=host`. POCL is the deterministic
   device for this node, and its PEF gate rows measure 1 LSB16. A CPU device
-  without fp64 runs the Lab-curve block on the host and records `impl=host`.
+  without fp64 runs the Lab-curve, local-contrast and region blocks on the host
+  and records `impl=host`.
 - P2 residual, not a lab.tools defect: with `RT_STAGE_OPENCL=1` and
   `--gpu=auto` but without `RT_OPENCL_RGBPROC=1`, a CLI export segfaults in
   `opencl::initLocked()` through `ImProcFunctions::lab2rgbOut()` - a null call
