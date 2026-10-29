@@ -249,6 +249,25 @@ namespace rtengine::stage
  */
 bool localAdjustmentsSupported(const procparams::ProcParams& params);
 
+/*
+ * The call-site dispatch for one local.adjustments submission.
+ *
+ * `submit` is false for an inactive block: no spots or locallab disabled.
+ * Such a block must not enter the node and must not round-trip the base image
+ * through Lab. `prefill` is true only when the block is active and the
+ * whole-block predicate is true; only then does the call site convert
+ * baseImg into the Lab buffer before submitting. A residual active block
+ * still submits with the support flag clear so the builtin records impl=host.
+ */
+struct LocalAdjustmentsDispatch {
+    bool submit = false;
+    bool prefill = false;
+    bool supported = false;
+};
+
+LocalAdjustmentsDispatch localAdjustmentsDispatch(
+    const procparams::ProcParams& params);
+
 /* The clamp arm Lab_Local() takes after the spots. The tone curve mode makes
  * notzero true in every exported profile, so a supported block always has an
  * arm; notlaplacian depends on the exposure, soft-light and CBDL state. */

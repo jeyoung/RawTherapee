@@ -228,9 +228,9 @@ bool localAdjustmentsSupported(const procparams::ProcParams& params)
           spot.avoidgamutMethod == "NONE")) {
         return false;
     }
-    if (spot.gamc != 1.0 || spot.strcol != 0.0 ||
-        spot.strcolab != 0.0 || spot.strcolh != 0.0 ||
-        spot.structcol != 0) {
+    if (spot.gamc != 1.0 || spot.reparcol != 100.0 ||
+        spot.strcol != 0.0 || spot.strcolab != 0.0 ||
+        spot.strcolh != 0.0 || spot.structcol != 0) {
         return false;
     }
     if (spot.special || spot.toolcol || spot.blwh) {
@@ -288,6 +288,16 @@ bool localAdjustmentsSupported(const procparams::ProcParams& params)
         return false;
     }
     return true;
+}
+
+LocalAdjustmentsDispatch localAdjustmentsDispatch(
+    const procparams::ProcParams& params)
+{
+    LocalAdjustmentsDispatch out;
+    out.supported = localAdjustmentsSupported(params);
+    out.submit = params.locallab.enabled && !params.locallab.spots.empty();
+    out.prefill = out.submit && out.supported;
+    return out;
 }
 
 uint32_t localAdjustmentsClampMode(const procparams::ProcParams& params)

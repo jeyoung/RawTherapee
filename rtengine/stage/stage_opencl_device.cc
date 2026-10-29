@@ -8113,8 +8113,12 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
         height);
     const int bfw = xend - xstart;
     const int bfh = yend - ystart;
-    if (bfw < 4 || bfh < 4 || bfw > width || bfh > height) {
-        error = "local.adjustments spot ROI is too small";
+    /* iplocallab.cc's mSP is 5: Lab_Local() does no colour work below a
+     * 5-pixel ROI in either dimension. The prefilter and tail clamp still run,
+     * but the colour block is a no-op, so the device refuses and the host
+     * block executes instead. */
+    if (bfw < 5 || bfh < 5 || bfw > width || bfh > height) {
+        error = "local.adjustments spot ROI is below the colour floor";
         return RT_STAGE_FALLBACK;
     }
 

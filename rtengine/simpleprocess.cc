@@ -1482,24 +1482,23 @@ private:
          * refused submission leaves baseImg unmodified, so the host block
          * below always starts from the same pixels as the CPU path.
          */
-        const bool blockActive = params.locallab.enabled &&
-                                 !params.locallab.spots.empty();
-        if (blockActive &&
+        const stage::LocalAdjustmentsDispatch dispatch =
+            stage::localAdjustmentsDispatch(params);
+        if (dispatch.submit &&
             stage::node_device("local.adjustments") ==
                 stage::StageNodeDevice::OpenCL) {
             if (labView == nullptr) {
                 labView = new LabImage(fw, fh);
             }
 
-            const bool supported = stage::localAdjustmentsSupported(params);
-            if (supported) {
+            if (dispatch.prefill) {
                 ipf.rgb2lab(*baseImg, *labView, params.icm.workingProfile);
             }
 
             stage::LocalAdjustmentsContext context(params, ipf, baseImg,
                                                    labView, fw, fh);
             RtLocalAdjustmentsContext descriptor =
-                context.descriptor(supported);
+                context.descriptor(dispatch.supported);
 
             RtStageArg args[3] = {};
             args[0].kind = RT_STAGE_ARG_BUFFER;
@@ -1507,13 +1506,13 @@ private:
             args[1].kind = RT_STAGE_ARG_PTR;
             args[1].u.ptr = &descriptor;
             args[2].kind = RT_STAGE_ARG_INT;
-            args[2].u.i = supported ? 1 : 0;
+            args[2].u.i = dispatch.supported ? 1 : 0;
 
             RtStageProfiling profiling{};
             if (stage::run("local.adjustments",
                            std::vector<RtStageArg>(args, args + 3),
                            &profiling) == RT_STAGE_OK) {
-                if (supported) {
+                if (dispatch.supported) {
                     /*
                      * The device returns Lab; baseImg is still the host's.
                      * A refusal ran the builtin, which already converted it;
