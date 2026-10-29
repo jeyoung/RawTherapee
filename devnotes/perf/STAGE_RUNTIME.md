@@ -2746,10 +2746,13 @@ submission.
 device increment covers exactly one active colour spot: `spotMethod == "norm"`,
 `shape == "ELI"`, `expcolor == true`, every other `exp*` false,
 `qualitycurveMethod == "none"`, `avoidgamutMethod == "NONE"`, `avoidrad == 0`,
-`hrenabled == false`, no recursion, inversion, explicit mask, soft radius,
-merge, LabGrid, RGB curve or exposure curve, and chroma/lightness/contrast
-inside `-100..100`. Curves, Munsell, multi-spot and inactive spots are the next
-increments and stay on the host.
+`hrenabled == false`, `reparcol == 100`, no recursion, inversion, explicit
+mask, soft radius, merge, LabGrid, RGB curve or exposure curve, and
+chroma/lightness/contrast inside `-100..100`. The image ROI must be at least
+5 pixels in each dimension: `Lab_Local()`'s `mSP` floor makes the colour block
+a no-op below that, so the launcher refuses and the host block runs. Curves,
+Munsell, multi-spot and inactive spots are the next increments and stay on the
+host.
 
 ### ABI and host setup
 
@@ -2833,10 +2836,13 @@ runs the host builtin with `impl=host`; there is no per-spot mixing.
 
 | Case | Result |
 |---|---|
-| Supported matrix, 17 cases at 179x48, 179x49, 238x64 and 8192x64 | clamp only, chroma -50/50, lightness -50/50, contrast -50/50, all -50/50, deltaE off, transit 0/99, prefilter off and the three sizes: 2,219,001 samples, `impl=opencl` on every case, finite, worst 0.060547 LSB16 (8192x64), none over 1 LSB16 |
+| Supported matrix, 16 cases at 179x48, 179x49, 238x64 and 8192x64 | clamp only, chroma -50/50, lightness -50/50, contrast -50/50, all -50/50, deltaE off, transit 0/99, prefilter off and the three sizes: 2,219,001 samples, `impl=opencl` on every case, finite, worst 0.060547 LSB16 (8192x64), none over 1 LSB16 |
 | Non-vacuity | the all-50 colour case changes 29,698 of 45,696 reference samples against the clamp-only case, PAE 36,726.416992 LSB16 |
-| Residuals, 7 cases | multi-spot, MUNS, quality curves, explicit mask, soft radius, exposure tool and highlight reconstruction are refused, record `impl=host` with no `impl=opencl`, and are byte-identical to the block (7 x 45,696 samples, PAE 0) |
-| Inactive blocks | a disabled block and an enabled block with no spots leave `baseImg` byte-identical (PAE 0, 0 differing samples); the call site does not prefill or convert for either |
+| Residuals, 9 cases | multi-spot, MUNS, quality curves, explicit mask, soft radius, exposure tool, `reparcol` 50, `reparcol` 1 and highlight reconstruction are refused, record `impl=host` with no `impl=opencl`, and are byte-identical to the block (9 x 45,696 samples, PAE 0) |
+| `reparcol` | before the admission fix, `Reparcol_0=50` recorded `impl=opencl` and diverged by 3,903 LSB16 on 11,652,531 of 30,419,712 samples; the predicate now requires 100 and both 50 and 1 are host residuals at PAE 0 |
+| 4-px ROI | a 100x100 spot with a 4x4 ROI is still inside the block predicate, but the launcher refuses the colour floor and the builtin matches the block exactly (PAE 0, 0 differing samples) |
+| Inactive blocks | a disabled block and an enabled block with no spots leave `baseImg` byte-identical (PAE 0, 0 differing samples); `localAdjustmentsDispatch()` returns `submit=false, prefill=false` for both, and the call site uses that helper |
+| Active-gating helper | a supported active block returns `submit=true, prefill=true, supported=true`; an active residual (`reparcol=50`) returns `submit=true, prefill=false, supported=false` |
 | Predicate matrix, 35 entries | one otherwise supported profile per residual setting is refused; the supported profile is admitted |
 | `verify.sh --stage-device`, POCL CPU, `localadjustments.pp3` | PASS, `max_pae=1.5259e-05` (1 LSB16), record `"stage":"local.adjustments","impl":"opencl","source":"opencl"` at 3888x2608; `compare_tiff.py` max 1 LSB16, 414,889 of 30,419,712 samples differ |
 | `localadjustments-multispot.pp3` | SKIP as a residual: the record is `"impl":"host","source":"device-fallback"` |

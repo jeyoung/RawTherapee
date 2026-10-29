@@ -225,11 +225,14 @@ node ran on the device rather than only comparing pixels.
 
 | Case | Result |
 |---|---|
-| Device parity, 17 supported cases | POCL CPU, `stage-residency-test`: clamp only, chroma/lightness/contrast -50/0/50, all -50/50, deltaE off, transit 0/99, prefilter off, 179x48, 179x49, 238x64 and 8192x64; 2,219,001 samples, `impl=opencl` on every case, finite, worst 0.060547 LSB16, none over 1 LSB16 |
+| Device parity, 16 supported cases | POCL CPU, `stage-residency-test`: clamp only, chroma/lightness/contrast -50/0/50, all -50/50, deltaE off, transit 0/99, prefilter off, 179x48, 179x49, 238x64 and 8192x64; 2,219,001 samples, `impl=opencl` on every case, finite, worst 0.060547 LSB16, none over 1 LSB16 |
 | Clamp evidence | the clamp-only case differs from the block by 0.038574 LSB16 (12,301 of 45,696 samples), so the per-spot round trip is measured, not skipped |
 | Non-vacuity | the all-50 colour case changes 29,698 of 45,696 reference samples against clamp-only, PAE 36,726.416992 LSB16 |
 | Residual matrix, 35 entries | inactive spot, two spots, MUNS, quality curves, hue curves, RECT, exposure, SH, vibrance, local contrast, blur, tone map, soft light, sharpening, log, mask, explicit mask, soft radius, recursion, inversion, merge, `exc`, LAB, XYZ, `avoidrad`, RGB curve, LabGrid, structure, gamma, pre-CBDL, dehaze, highlight reconstruction, blur radius 101, transit 100 and chroma 101 are all refused |
-| Residual parity, 7 cases | multi-spot, MUNS, quality curve, explicit mask, soft radius, exposure tool and highlight reconstruction record `impl=host` with no `impl=opencl` and are byte-identical to the block (7 x 45,696 samples, PAE 0) |
+| Residual parity, 9 cases | multi-spot, MUNS, quality curve, explicit mask, soft radius, exposure tool, `reparcol` 50, `reparcol` 1 and highlight reconstruction record `impl=host` with no `impl=opencl` and are byte-identical to the block (9 x 45,696 samples, PAE 0) |
+| `reparcol` before/after | before the fix, `Reparcol_0=50` recorded `impl=opencl` and diverged by 3,903 LSB16 on 11,652,531 of 30,419,712 samples. The predicate now requires `reparcol == 100`; 50 and 1 are host residuals at PAE 0 |
+| 4-px ROI | a 4x4 ROI is inside the block predicate but below the `mSP=5` colour floor; the launcher refuses, records `impl=host` and matches the block at PAE 0 (0 differing samples) |
+| Active-gating helper | `localAdjustmentsDispatch()` returns no submit/prefill for a disabled or empty block, submit+prefill for a supported active block, and submit-without-prefill for an active residual |
 | `verify.sh --stage-device`, POCL CPU, `localadjustments.pp3` | PASS, `max_pae=1.5259e-05` (1 LSB16); record `"stage":"local.adjustments","impl":"opencl","source":"opencl"` at 3888x2608; manual `compare_tiff.py` max 1 LSB16, 414,889 of 30,419,712 samples differ |
 | `localadjustments-multispot.pp3` | SKIP as a residual: `"impl":"host","source":"device-fallback"` |
 | Full `--stage-device` run | PASS, 22 rows on POCL. `working.trc` is back to 1 LSB16; before the call-site guard it was 3 LSB16 with 879,478 differing samples because an inactive local.adjustments block round-tripped the base image. The single-spot local row passes and the multi-spot row SKIPs as a residual |

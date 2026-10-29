@@ -1698,9 +1698,10 @@ Still CPU-only: `raw.preprocess`, `raw.demosaic`, `raw.base`, `lab.tools`,
 set is exactly one active spot with `spotMethod == "norm"`,
 `shape == "ELI"`, `expcolor == true`, every other `exp*` false,
 `qualitycurveMethod == "none"`, `avoidgamutMethod == "NONE"`, `avoidrad == 0`,
-`hrenabled == false`, no recursion, inversion, explicit mask, soft radius,
-merge, LabGrid, RGB curve or exposure curve, and chroma/lightness/contrast
-inside `-100..100`. The node runs the per-spot negative-value prefilter, the
+`hrenabled == false`, `reparcol == 100`, no recursion, inversion, explicit
+mask, soft radius, merge, LabGrid, RGB curve or exposure curve, and
+chroma/lightness/contrast inside `-100..100`; the ROI must be at least 5 px in
+each dimension. The node runs the per-spot negative-value prefilter, the
 ROI original Gaussian, the elliptical transition/deltaE colour apply and the
 full-image tail clamp; `baseImg` stays host and the final `lab2rgb()` is the
 call site's. The two chroma-slider curves are host-sampled into 65536-entry
@@ -1710,8 +1711,8 @@ shadows/highlights, vibrance, local contrast, blur/denoise, sharpening, tone
 mapping, Retinex, CBDL, log, soft light, the common mask, CIE CAM, dehaze,
 `exc`/`full`/`main`, merge, explicit masks, soft radius, LAB/XYZ/XYZREL gamut
 methods, the RGB curve, LabGrid, `avoidrad != 0`, `transit == 100`, a blur
-radius above 100 and an active pre-CBDL pass. A GPU device is refused before
-the upload. An inactive block (`locallab.enabled == false` or no spots) never
+radius above 100, `reparcol != 100`, a ROI below 5 px and an active pre-CBDL
+pass. A GPU device is refused before the upload. An inactive block (`locallab.enabled == false` or no spots) never
 enters the node and takes no Lab round trip.
 
 Recorded `n/a` exceptions: `source.select` and `source.embedded` are I/O,
