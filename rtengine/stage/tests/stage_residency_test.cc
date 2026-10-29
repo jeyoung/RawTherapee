@@ -5669,6 +5669,9 @@ struct RegionCase {
     int height;
     int count;
     RegionSpec regions[4];
+    /* 0 regions alone, 1 after shadows/highlights, 2 after the Lab curves,
+     * 3 after vibrance. */
+    int combine;
 };
 
 /* The mask set a case asks for. The default LabCorrectionRegion already has
@@ -5751,6 +5754,36 @@ void apply_region_case(const RegionCase& item,
         set_region_masks(region, spec.masks);
         params.colorToning.labregions.push_back(region);
     }
+
+    if (item.combine == 1) {
+        params.sh.enabled = true;
+        params.sh.lab = true;
+        params.sh.highlights = 50;
+        params.sh.shadows = 50;
+        params.sh.htonalwidth = 50;
+        params.sh.stonalwidth = 50;
+        params.sh.radius = 10;
+    } else if (item.combine == 2) {
+        params.labCurve.enabled = true;
+        params.labCurve.contrast = 0;
+        params.labCurve.lcurve = {
+            static_cast<double>(DCT_Spline),
+            0.0, 0.0,
+            0.5, 0.62,
+            1.0, 1.0};
+        params.labCurve.acurve = {
+            static_cast<double>(DCT_Spline),
+            0.0, 0.0,
+            0.5, 0.55,
+            1.0, 1.0};
+        params.labCurve.gamutmunselmethod = "NONE";
+    } else if (item.combine == 3) {
+        params.vibrance.enabled = true;
+        params.vibrance.pastels = 60;
+        params.vibrance.saturated = 35;
+        params.vibrance.psthreshold =
+            rtengine::procparams::Threshold<int>(0, 75, false);
+    }
 }
 
 void test_lab_tools_regions(bool available)
@@ -5826,6 +5859,18 @@ void test_lab_tools_regions(bool available)
           {-0.3, 0.4, -30.0, 0.9, -0.02, 1.2, 2.0, -1, 1},
           {0.2, 0.2, 10.0, 1.2, 0.0, 0.8, 0.0, -1, 2},
           {-0.2, -0.4, 40.0, 1.0, 0.03, 1.0, 4.0, -1, 3}}},
+        {"shadows/highlights + regions", 238, 64, 2,
+         {{0.4, -0.3, 30.0, 1.0, 0.0, 1.0, 0.4, -1, 0},
+          {-0.3, 0.25, -20.0, 1.1, 0.0, 0.9, 1.2, -1, 4}},
+         1},
+        {"Lab curves + regions", 238, 64, 2,
+         {{0.4, -0.3, 30.0, 1.0, 0.0, 1.0, 0.4, -1, 0},
+          {-0.3, 0.25, -20.0, 1.1, 0.0, 0.9, 1.2, -1, 4}},
+         2},
+        {"vibrance + regions", 238, 64, 2,
+         {{0.4, -0.3, 30.0, 1.0, 0.0, 1.0, 0.4, -1, 0},
+          {-0.3, 0.25, -20.0, 1.1, 0.0, 0.9, 1.2, -1, 4}},
+         3},
         {"hue mask only", 238, 64, 1,
          {{0.3, -0.3, 20.0, 1.0, 0.0, 1.0, 0.5, -1, 1}}},
         {"chroma mask only", 238, 64, 1,
@@ -6059,6 +6104,81 @@ void test_lab_tools_regions(bool available)
                  [](rtengine::procparams::ProcParams& p) {
                      p.colorToning.labregions[0].maskBlur = -20.0;
                  });
+
+    /*
+     * A supported curve type whose polyline cannot be followed within the
+     * table's 5e-7 mask-error budget is refused by the setup, so the builtin
+     * runs the block. A near-vertical segment between two close control
+     * points is such a curve.
+     */
+    {
+        rtengine::procparams::ProcParams params;
+        params.colorToning.enabled = true;
+        params.colorToning.method = "LabRegions";
+        params.colorToning.labregions[0].a = 0.4;
+        params.colorToning.labregions[0].b = -0.3;
+        params.colorToning.labregions[0].saturation = 20.0;
+        params.colorToning.labregions[0].maskBlur = 0.4;
+        params.colorToning.labregions[0].hueMask = region_no_mask();
+        params.colorToning.labregions[0].lightnessMask = region_no_mask();
+        /* A dense zigzag: every segment is linear, but the slope changes by
+         * 2000 at every node, so the piecewise-linear table cannot follow it
+         * within 5e-7 even at its maximum depth and node budget. */
+        std::vector<double> hostile;
+        hostile.push_back(static_cast<double>(FCT_MinMaxCPoints));
+        constexpr int kZigzag = 2000;
+        for (int index = 0; index < kZigzag; ++index) {
+            hostile.push_back(static_cast<double>(index) /
+                              static_cast<double>(kZigzag));
+            hostile.push_back(index % 2 == 0 ? 0.0 : 1.0);
+            hostile.push_back(0.0);
+            hostile.push_back(0.0);
+        }
+        params.colorToning.labregions[0].chromaticityMask = hostile;
+
+        check(labToolsSupported(params),
+              "a supported curve type outside the table budget is inside the "
+              "predicate");
+        check(labToolsRegionsActive(params),
+              "the predicate does not sample the curve");
+
+        LabImage source(179, 48);
+        fill_lab_tools(source, seed++);
+
+        rtengine::ImProcFunctions cpu_ipf(&params, false);
+        LabToolsHostState cpu_host;
+        LabImage cpu(179, 48);
+        cpu.CopyFrom(&source);
+        LabToolsLuts cpu_luts = cpu_host.luts();
+        labToolsHostBlock(cpu_ipf, params, cpu, cpu_luts, cpu_host.autili,
+                          cpu_host.butili);
+
+        rtengine::ImProcFunctions device_ipf(&params, false);
+        LabToolsHostState device_host;
+        LabImage device(179, 48);
+        device.CopyFrom(&source);
+        const LabToolsRun result =
+            run_lab_tools_node(device, params, device_host, device_ipf,
+                               profile_path);
+        const std::string profile = read_file(profile_path);
+
+        check(result.supported,
+              "the unresolvable curve is still inside the predicate");
+        check(!result.deviceReady,
+              "the unresolvable curve refuses the device setup");
+        check(result.status == RT_STAGE_OK,
+              "the unresolvable curve completes through run()");
+        check(profile.find("\"impl\":\"host\"") != std::string::npos,
+              "the unresolvable curve records a host execution");
+        check(profile.find("\"impl\":\"opencl\"") == std::string::npos,
+              "the unresolvable curve never mixes a device pass");
+        const Diff diff = compare(view(device), view(cpu));
+        std::printf("stage-residency: lab.tools regions unresolvable curve: "
+                    "host, PAE %.6f LSB16, %zu of %zu samples differ\n",
+                    diff.max_abs, diff.differing, diff.samples);
+        check(diff.differing == 0 && diff.max_abs == 0.0,
+              "the unresolvable curve matches the CPU block");
+    }
 }
 
 } // namespace
