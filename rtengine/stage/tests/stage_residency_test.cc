@@ -17,6 +17,8 @@
 #include "labimage.h"
 
 #include "color.h"
+#include "curves.h"
+#include "flatcurvetypes.h"
 #include "iccstore.h"
 #include "improcfun.h"
 #include "procparams.h"
@@ -2800,6 +2802,8 @@ struct WorkingTrcCase {
     bool configSupported;
     /* The source stays inside the working gamut. */
     bool inGamut;
+    /* The host setup admits the configuration (type-5 TRC, range). */
+    bool setupAccepted;
 };
 
 /*
@@ -2837,18 +2841,20 @@ void test_working_trc(bool available)
     }
 
     const WorkingTrcCase cases[] = {
-        {"gamma 2.2", 238, 24, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, true, 0.5, true, true},
-        {"bt709", 238, 24, WorkingTrc::BT709, 2.2, 4.5, true, 0.5, true, true},
-        {"srgb", 238, 24, WorkingTrc::SRGB, 2.4, 12.92310, true, 0.5, true, true},
-        {"gamma 1.8", 238, 24, WorkingTrc::GAMMA_1_8, 1.8, 4.5, true, 0.5, true, true},
-        {"linear", 238, 24, WorkingTrc::LINEAR, 1.0, 1.0, true, 0.5, true, true},
-        {"no gamut", 238, 24, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, false, 0.5, true, true},
-        {"no saturation", 179, 17, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, true, 0.0, true, true},
-        {"full saturation", 238, 24, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, true, 1.0, true, true},
-        {"odd width", 179, 17, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, true, 0.5, true, true},
-        {"out of gamut", 238, 24, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, true, 0.5, true, false},
-        {"midtone equaliser", 238, 24, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, true, 0.5, false, false},
-        {"soft light", 179, 17, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, true, 0.5, false, false},
+        {"gamma 2.2", 238, 24, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, true, 0.5, true, true, true},
+        {"bt709", 238, 24, WorkingTrc::BT709, 2.2, 4.5, true, 0.5, true, true, true},
+        {"srgb", 238, 24, WorkingTrc::SRGB, 2.4, 12.92310, true, 0.5, true, true, true},
+        {"gamma 1.8", 238, 24, WorkingTrc::GAMMA_1_8, 1.8, 4.5, true, 0.5, true, true, true},
+        {"linear", 238, 24, WorkingTrc::LINEAR, 1.0, 1.0, true, 0.5, true, true, true},
+        {"no gamut", 238, 24, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, false, 0.5, true, true, true},
+        {"no saturation", 179, 17, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, true, 0.0, true, true, true},
+        {"full saturation", 238, 24, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, true, 1.0, true, true, true},
+        {"odd width", 179, 17, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, true, 0.5, true, true, true},
+        {"out of gamut", 238, 24, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, true, 0.5, true, false, false},
+        {"midtone equaliser", 238, 24, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, true, 0.5, false, false, true},
+        {"soft light", 179, 17, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, true, 0.5, false, false, true},
+        {"opacity curve", 238, 24, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, true, 0.5, false, true, true},
+        {"custom gamma 0.4", 238, 24, WorkingTrc::CUSTOM, 0.4, 4.5, true, 0.5, true, true, false},
     };
 
     if (!available) {
@@ -2876,6 +2882,23 @@ void test_working_trc(bool available)
             params.softlight.strength = 50;
         } else if (std::strcmp(item.label, "midtone equaliser") == 0) {
             params.icm.wmidtcie = 25.0;
+        } else if (std::strcmp(item.label, "opacity curve") == 0) {
+            params.icm.wavExp = true;
+            params.icm.opacityCurveWLI = {
+                static_cast<double>(FCT_MinMaxCPoints),
+                0.0, 0.5, 0.0, 0.0,
+                0.998, 0.5, 0.0, 0.0,
+                1.0, 0.9, 0.0, 0.0};
+            rtengine::procparams::ColorManagementParams colparams = params.icm;
+            rtengine::WavOpacityCurveWL curve;
+            colparams.getCurves(curve);
+            bool flatStart = true;
+            for (int i = 0; i < 500; ++i) {
+                flatStart = flatStart && curve[i] == 0.5f;
+            }
+            check(flatStart, "the opacity test curve is flat in 0..499");
+            check(curve[500] != 0.5f,
+                  "the opacity test curve changes at the last entry");
         }
         check(workingTrcSupported(params) == item.configSupported,
               (std::string("working.trc ") + item.label +
@@ -2899,7 +2922,7 @@ void test_working_trc(bool available)
 
         WorkingTrcContext context(params, ipf);
         const bool expectDevice = available && item.configSupported &&
-                                  item.inGamut;
+                                  item.setupAccepted;
         RtWorkingTrcContext descriptor =
             context.descriptor(item.configSupported);
 
@@ -2917,9 +2940,9 @@ void test_working_trc(bool available)
             RtWorkingTrcResult setup{};
             check(context.prepare(source), "working.trc host prefix runs");
             deviceReady = context.build(setup) == 0;
-            check(deviceReady == item.inGamut,
+            check(deviceReady == item.setupAccepted,
                   (std::string("working.trc ") + item.label +
-                   " setup acceptance matches the gamut").c_str());
+                   " setup acceptance matches the configuration").c_str());
             if (deviceReady) {
                 args[4].kind = RT_STAGE_ARG_BUFFER;
                 args[4].u.buffer = view(context.xyz());
@@ -2928,6 +2951,7 @@ void test_working_trc(bool available)
             }
         }
         descriptor.supported = deviceReady ? 1u : 0u;
+        args[2].u.i = descriptor.supported;
 
         std::remove(profile_path.c_str());
         setenv("RT_STAGE_PROFILE", profile_path.c_str(), 1);
@@ -2980,10 +3004,72 @@ void test_working_trc(bool available)
     }
 
     /*
-     * Probe parity. The setup runs on the one device readback; the reference
-     * runs the same production setup on a host first pass. The two first
-     * passes are the same image up to the host's SSE/scalar rounding, so the
-     * means are expected to agree to a few float ulps.
+     * A device refusal after a successful setup must still run the builtin
+     * and record impl=host. Corrupting the second-pass buffer shape makes the
+     * launcher refuse after the context has built.
+     */
+    {
+        rtengine::procparams::ProcParams params;
+        params.icm.workingProfile = "Rec2020";
+        params.icm.workingTRC = WorkingTrc::GAMMA_2_2;
+        params.icm.trcExp = true;
+        params.icm.gamut = true;
+        params.icm.wapsat = 0.5;
+        rtengine::ImProcFunctions ipf(&params, false);
+
+        LabImage source(238, 24);
+        fill_lab_in_gamut(source, params.icm.workingProfile);
+        LabImage cpu(238, 24);
+        cpu.CopyFrom(&source);
+        workingTrcHostBlock(ipf, params, cpu);
+        LabImage device(238, 24);
+        device.CopyFrom(&source);
+
+        WorkingTrcContext context(params, ipf);
+        RtWorkingTrcResult setup{};
+        check(context.prepare(source), "forced fallback prefix runs");
+        check(context.build(setup) == 0, "forced fallback setup builds");
+        RtWorkingTrcContext descriptor = context.descriptor(true);
+        RtStageArg args[6] = {};
+        args[0].kind = RT_STAGE_ARG_BUFFER;
+        args[0].u.buffer = view(device);
+        args[1].kind = RT_STAGE_ARG_PTR;
+        args[1].u.ptr = &descriptor;
+        args[2].kind = RT_STAGE_ARG_INT;
+        args[2].u.i = 1;
+        args[3].kind = RT_STAGE_ARG_DOUBLE;
+        args[3].u.f = params.icm.wapsat;
+        args[4].kind = RT_STAGE_ARG_BUFFER;
+        args[4].u.buffer = view(context.xyz());
+        args[4].u.buffer.planes = 1;
+        args[5].kind = RT_STAGE_ARG_BUFFER;
+        args[5].u.buffer = view(context.linearReference());
+
+        std::remove(profile_path.c_str());
+        setenv("RT_STAGE_PROFILE", profile_path.c_str(), 1);
+        set_node_device_override("working.trc", StageNodeDevice::OpenCL);
+        const RtStageStatus status =
+            run("working.trc", std::vector<RtStageArg>(args, args + 6));
+        clear_node_device_overrides();
+        const std::string profile = read_file(profile_path);
+        unsetenv("RT_STAGE_PROFILE");
+
+        check(status == RT_STAGE_OK, "the forced fallback completes");
+        check(profile.find("\"stage\":\"working.trc\"") != std::string::npos,
+              "the forced fallback records the node");
+        check(profile.find("\"impl\":\"host\"") != std::string::npos,
+              "the forced fallback records a host execution");
+        check(profile.find("\"impl\":\"opencl\"") == std::string::npos,
+              "the forced fallback never mixes a device pass");
+        const Diff diff = compare(view(device), view(cpu));
+        check(diff.differing == 0 && diff.max_abs == 0.0,
+              "the forced fallback matches the CPU block");
+    }
+
+    /*
+     * Probe parity. The setup runs on the host prefix; the reference runs the
+     * same production setup on a host first pass. The prefix is the block's
+     * own lab2rgb and sRGB inverse, so the means are exact.
      */
     {
         rtengine::procparams::ProcParams params;
