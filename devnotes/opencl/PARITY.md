@@ -53,6 +53,9 @@ pairs are exact. The gate is the peak absolute error (PAE) in normalised units;
 | 2026-10-30 | c79ea2579 | POCL (CPU) | colorspace_flowers.pef / `localadjustments-cbdl.pp3`, `local.adjustments` | off vs auto, 16-bit TIFF | 1 LSB | PASS |
 | 2026-10-30 | 4129076f6 | POCL (CPU) | 24-case CBDL matrix, `stage-residency-test` | device vs host block | 0.068 LSB (worst) | PASS |
 | 2026-10-30 | 4129076f6 | POCL (CPU) | CBDL chroma regressions (`chromacbdl=0.01`, `balan=2.5`), `stage-residency-test` | device vs host block | 0.029 LSB (worst) | PASS |
+| 2026-10-30 | uncommitted | POCL (CPU) | colorspace_flowers.pef / `localadjustments-dehaze.pp3`, `local.adjustments` | off vs auto, 16-bit TIFF | 1 LSB | PASS |
+| 2026-10-30 | uncommitted | POCL (CPU) | 16-case dehaze matrix (alone, colour, CBDL, vibrance, SH, soft light, local contrast, all tools, MUNS, multispot, inactive, ELI/RECT, 179x49, 238x64, 8192x64), `stage-residency-test` | device vs host block | 0.047 LSB (worst) | PASS |
+| 2026-10-30 | uncommitted | POCL (CPU) | 10-case dehaze residual matrix, `stage-residency-test` | device vs host block | 0 (host) | PASS |
 
 `47c50ee77` changes only CPU export buffer handling; the OpenCL rows above
 re-run the existing GPU stages against the new CPU neighbour.
@@ -148,6 +151,21 @@ peak absolute error is zero for the synthetic node tests:
   8-bit nodes are not reachable from the CLI; `stage-residency-test` compares
   the kernel byte for byte with an independent reference on a synthetic Lab
   image, and scaling the device matrix by 1.001 makes it fail.
+- Local dehaze, through `local.adjustments`, matches the host block in 17
+  configurations (alone, colour, CBDL, vibrance, shadows/highlights, soft
+  light, local contrast, all tools, MUNS, multispot, inactive, ELI/RECT and
+  the 179x49, 238x64 and 8192x64 widths) with a worst peak error of 0.047
+  LSB16. The pass is device-side except for one documented host reduction:
+  the ambient-light estimate (`get_dark_channel_downsized()` and the two exact
+  95th percentiles) runs in `dehazeAmbientPrefix()` on the read-back filtered
+  channels, because `std::nth_element` cannot be reproduced order-independently
+  on the device. The three colour guided filters, the dark channel, the
+  guided filter of the dark channel and the per-pixel recovery run on the
+  device with the lab.tools guided-filter port. A 16-bit TIFF export with
+  `localadjustments-dehaze.pp3` has a peak error of 1 LSB16, and ten residual
+  configurations (`dehazeblack`, show-depth, mask, soft radius, active
+  retinex, four out-of-range sliders and dehaze without the retinex enable)
+  run the host builtin byte for byte.
 - `tools/opencl/verify.sh --stage-device`, which `--quick` also runs, asserts
   each record and its parity in one step:
 

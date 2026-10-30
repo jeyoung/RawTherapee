@@ -1696,28 +1696,54 @@ Still CPU-only: `raw.preprocess`, `raw.demosaic`, `raw.base`, `lab.tools`,
 
 `local.adjustments` is partial through the multi-spot tool path. The
 admitted set is any number of `norm` spots in list order: an active spot runs
-any combination of local CBDL, Colour & Light, vibrance, shadows/highlights,
-soft light and Gaussian local contrast, and an inactive spot is the
-clamp-only case and may carry inert tool settings. Every active spot needs at
-least one of `expcbdl`, `expcolor`, `expvibrance`, `expshadhigh`, `expsoft`
-and `expcontrast`; every other `exp*` is a residual. The block-wide
-requirements are `reparcol == 100`, no
+any combination of local dehaze, local CBDL, Colour & Light, vibrance,
+shadows/highlights, soft light and Gaussian local contrast, and an inactive
+spot is the clamp-only case and may carry inert tool settings. Every active
+spot needs at least one of `expcbdl`, `expcolor`, `expvibrance`, `expshadhigh`,
+`expsoft`, `expcontrast` and the dehaze pair (`expreti` on with a non-zero
+`dehaz`); every other `exp*` is a residual. Local dehaze is exposed through
+the retinex enable: `expreti` must be on, the retinex strength must be zero
+(the retinex tool itself is a no-op), and `dehazeblack`, show-depth, an active
+retinex strength, a mask or a soft radius are residuals. `dehaz`,
+`depth`, `dehazeSaturation` and the blend sensitivity `sensih` are inside
+their GUI ranges. The block-wide requirements are `reparcol == 100`, no
 recursion/inversion/mask/soft radius/merge/LabGrid/RGB or exposure curve,
 `qualitycurveMethod` none or std, `avoidgamutMethod` `"NONE"` or `"MUNS"`,
 and chroma/lightness/contrast inside `-100..100`. Both `ELI` and `RECT`
 shapes are admitted, and an active ROI must be at least 5 px in each
-dimension. The tools run in `Lab_Local()`'s order: CBDL, vibrance,
-shadows/highlights, soft light, local contrast, then Colour & Light. Each
-tool takes a fresh ROI copy and its own deltaE reference blur
+dimension. The tools run in `Lab_Local()`'s order: local dehaze, CBDL,
+vibrance, shadows/highlights, soft light, local contrast, then Colour & Light.
+Each tool takes a fresh ROI copy and its own deltaE reference blur
 (`(2 + 0.2*blurcolde)` for colour, `(2 + 0.2*blurSHde)` for
-shadows/highlights, 3 for vibrance and soft light, and `lcradius` for local
-contrast's own Gaussian). `calc_ref` is
+shadows/highlights, 3 for vibrance, soft light and dehaze, and `lcradius` for
+local contrast's own Gaussian). The dehaze pass converts the ROI Lab to RGB,
+normalizes by `max(max * 2, 65535)`, runs three guided filters, derives the
+ambient light, builds and filters the dark channel and applies the per-pixel
+recovery; the ambient reduction is the one host prefix (see below).
+`calc_ref` is
 recomputed on the read-back result of the previous spot, `reserved` is fixed at
 the start of the block, and `lastorig` is unused while merge is a residual.
 `baseImg` stays host and the final `lab2rgb()` is the call site's. The
 chroma-slider curves, the seven L/C/H curves and the vibrance skin curve are
 host-built into 65536-entry tables; the local-contrast IIR coefficients are
 host-built for the region's sigma.
+
+Local dehaze runs `dehazeloc()` on the spot ROI. The device converts the ROI
+Lab to RGB, normalizes it, runs the three guided filters of the RGB channels,
+builds the dark channel with `max(max(W, H) / 600, 2)`, filters the dark
+channel against the normalized B and applies the per-pixel recovery. The
+guided filters reuse `lab.tools`' `guidedfilter.cc` port with the block's
+automatic subsampling and box radius. The one host prefix is the ambient
+reduction: `get_dark_channel_downsized()` and the two exact 95th percentiles
+of `estimate_ambient_light()` run in `dehazeAmbientPrefix()` on the read-back
+filtered channels (rescaled to the 200 px cap when the block does), because
+`std::nth_element` cannot be reproduced order-independently on the device.
+The device and the host block agree within 0.047 LSB16 over the 16-case
+matrix, and the `localadjustments-dehaze.pp3` export row is 1 LSB16.
+`dehazeblack`, show-depth, a mask, a soft radius, a non-zero retinex strength
+and an out-of-range strength/depth/saturation/sensitivity are residuals and
+run the host builtin; `dehazeAmbientPrefix()` refuses a prefix with no
+in-range dark sample, where the block itself reads an uninitialised ambient.
 
 Local CBDL admits `expcbdl` with the block's own multipliers (each in
 `0..4`), `chromacbdl` in `0..1.5`, `threshold` in `0..1`, `clarityml` in
@@ -1829,6 +1855,21 @@ non-vacuous: CBDL alone changes 34,170 of 68,544 fixture samples with PAE
 `localadjustments-cbdl.pp3` row is 1 LSB16 and differs from the neutral
 export by PAE 3,420 codes on 14,240,286 of 30,419,712 channel samples.
 
+The local dehaze matrix is within 0.047 LSB16 (worst 0.046875 on the 8192x64
+ROI, 0.038086 on a second spot) for dehaze alone, a negative strength,
+colour, CBDL, vibrance, shadows/highlights, soft light, local contrast, all
+seven tools, MUNS, a second spot, an inactive-then-active spot, ELI/RECT and
+the 179x49, 238x64 and 8192x64 widths; no sample is non-finite. It is
+non-vacuous: dehaze alone changes 22,752 of 45,696 fixture samples with PAE
+2,365.349609 LSB16 against the same spot with the retinex enable and dehaze
+off. The gate `localadjustments-dehaze.pp3` row is 1 LSB16. Ten residuals
+(`dehazeblack`, show-depth, an explicit mask, a soft radius, a non-zero
+retinex strength, four out-of-range sliders and a dehaze value without the
+retinex enable) run the host builtin and are byte-identical. The ambient
+light estimate is the pass's only host prefix; it runs the block's own
+percentile and double-precision average on the device's read-back filtered
+channels and is recorded in `dehaze_ambient.h`.
+
 The `chromacbdl = 0.01`, default-multiplier, default-clarity case is the
 chroma block's all-ones-multiplier arm: the CPU still enters the block and
 blends the luminance result. The pre-fix device skipped it and diverged by
@@ -1843,7 +1884,8 @@ gamma/slope, the SH recovery blend and gradient, vibrance
 gamma/gradients/warm, the local-contrast wavelet (`"wav"`) and FFT variants,
 CBDL's `contresid` and soft radius, blur/denoise, sharpening, tone mapping,
 Retinex, log, the
-common mask, CIE CAM, dehaze, `exc`/`full`/`main`, merge, explicit masks, soft
+common mask, CIE CAM, the global dehaze, `exc`/`full`/`main`, merge, explicit
+masks, soft
 radius, LAB/XYZ/XYZREL gamut methods, the RGB curve, LabGrid, `avoidrad != 0`,
 `transit == 100`, a blur radius above 100, `reparcol != 100`, a ROI below
 5 px (12 px with shadows/highlights active, where a 10-px ROI falls back to
