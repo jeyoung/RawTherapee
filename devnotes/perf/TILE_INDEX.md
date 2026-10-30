@@ -32,7 +32,7 @@ unchanged; the merge only adds what the existing code already computed.
 
 Merge unit:
 
-- denoise: `TILE_MERGE_BAND_ROWS = 2` tile rows. One row (10 tiles at the test
+- denoise: at most `TILE_MERGE_BAND_ROWS = 2` existing tile rows. One row (10 tiles at the test
   image's tiling) is narrower than eight threads and loses load balance; two
   rows (20 tiles) restore it while keeping the extra memory bounded. The extra
   buffers are 210 MB at 8280 x 5512.
@@ -72,6 +72,36 @@ forced tiled with `[Performance] RgbDenoiseThreadLimit=8`; wavelet with
 
 The new default output is also `AE=0` against the pre-merge 16-bit reference
 produced by the previous build at one thread, so the default path is unchanged.
+
+## F5: reserve only existing contribution rows (2026-10-30)
+
+Contribution capacity is `min(TILE_MERGE_BAND_ROWS, tile_rows) * tile_cols`.
+The allocation and its regression share the denoise-only
+`denoiseTileBufferCount()` helper. Band traversal, tile arithmetic, deterministic
+merge order and cleanup are unchanged. Verbose output reports the actual grid,
+buffer count and tile dimensions when the tiled allocation runs.
+
+The regression fails with the former two-row rule for a one-row panorama and
+a single tile, and passes with the fix. It also covers a one-column grid, two
+rows, an odd final band, invalid dimensions and multiplication without a signed
+`int` intermediate. The large-count case tests the helper, not giant-image support.
+
+Against upstream `33814c82c`, three deterministic noisy 16-bit RGB TIFF fixtures
+(4096x512, 512x2304 and 1024x1793) were denoised at one/four threads and with
+`RT_TILE_ORDER=0/1`. A positive `RgbDenoiseThreadLimit` forced tiling. All 12
+before/after comparisons were pixel-exact, as were six same-build repeats. All
+active outputs differed from their disabled-denoise controls. The fixed logs
+confirmed grids 1x5, 3x1 and 3x2 and capacities 5, 2 and 4 respectively.
+
+The panorama previously reserved ten contributions and now reserves five,
+avoiding 29,122,560 bytes of unpadded RGB float payload. Whole-process peak RSS
+did not show a clear reduction; unused allocations may remain physically
+uncommitted. Allocation arithmetic is not an RSS or speed claim.
+
+CPU and OpenCL-enabled full builds pass, as do `denoise-tile-buffers-test` and
+`stage-indexer-test` in both builds. No GPU execution or release-package test
+was performed. The reproducible fixture/profile runner accompanies the local
+handoff; the recorded parity evidence is CPU denoise on TIFF input.
 
 ## Performance
 
