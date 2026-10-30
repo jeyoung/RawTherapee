@@ -132,8 +132,19 @@ diagnostic. Its layout is validated when reported, but absent baseline
 markers leave its tiled execution unproven; exact comparisons and active
 controls still apply to both binaries.
 
-A successful run has 30 exports (two binaries, three fixtures, four active
-configurations plus one disabled control) and 12 base/candidate comparisons.
+Each active export is repeated once with the same binary, fixture, profile,
+denoise limit and tile order, using fresh isolated settings/cache/temp paths.
+The same environment policy applies, and the options-file hashes must match.
+Exact raster comparison of each pair is recorded separately under
+`determinism_comparisons` before any base/candidate comparison. A one-LSB
+repeat difference fails with a same-binary determinism error; it is not
+attributed to the candidate. The report retains both output paths and each
+export's `output_file_sha256` (a TIFF file hash, not a raster hash). TIFF
+metadata differences alone do not fail the raster gate. One repeat per case
+is bounded evidence, not proof of determinism across all future runs.
+
+A successful run has 54 exports (30 original exports and 24 active repeats),
+24 same-binary comparisons and 12 base/candidate comparisons.
 All outputs must retain the expected RGB16 geometry. Exact parity requires
 `max_abs=0`, normalized maximum zero and zero differing samples. The shared
 comparator permits a one-LSB difference at `--bits 16`, so its successful
@@ -173,3 +184,49 @@ source of run-to-run numerical variation; the cause has not been proven.
 Resolving it requires separate engine investigation rather than changing
 this tools-only contribution's exact comparison. Preserve failing reports
 and do not retry until green or relax the tolerance to claim acceptance.
+
+
+### Same-binary guard follow-up (#35)
+
+The guard belongs to draft PR #34 per the maintainer's explicit placement
+instruction. A real TIFF regression injects one sample at one LSB into a
+same-binary repeat for each role. Before the guard, both subcases incorrectly
+passed the complete harness; afterward each fails as determinism, with zero
+base/candidate comparisons and the failed metrics/output retained. A stable
+one-LSB difference between binaries still fails as parity. The original
+failed current-tip acceptance above remains the record; passing focused
+harness tests does not replace it.
+
+The maintainer requested rebasing onto `de5ca2825` before the final run.
+The published contribution history is preserved under the contributor's
+no-rewrite constraint. Final-tip integration and the final acceptance run
+remain pending; this follow-up does not claim a green engine gate or change
+FFTW plans, exact tolerance or the active profile.
+
+
+Read-only reinspection of the retained initial outputs establishes a
+same-binary run-to-run inconsistency, rather than evidence of a source delta:
+
+- Both executable SHA-256 values were
+  `58cbce3e6001d30800829a2d61c97aae6de1d6b0ef8b0f0ae7194f65d7644fab`.
+- Options files for the failing pair were byte-identical. The profile,
+  fixture and thread policy were shared by the initial same-binary run.
+- The common RGB16 raster SHA-256 was
+  `1ebe75ef65cd7f0300491b3784298623453283cfb0cf0472174999ccb79c411d`;
+  the outlier was
+  `4afb7f2bc5661080a9f6296cca47ddc56a9aa8d3dc646549196646572b03f0e8`.
+- 182 samples across 180 pixels differed: R 75, G 50, B 57, all at one
+  LSB. Zero-based examples (common -> outlier): `(340,48,B)`
+  `38745 -> 38746`; `(278,68,R)` `31162 -> 31161`; `(208,78,R)`
+  `24631 -> 24632`; `(6,82,B)` `15023 -> 15022`.
+- Re-reading the three retained diagnostic repeat outputs found the common
+  raster hash each time. These were not new exports or acceptance retries.
+
+The engine requests four `FFTW_MEASURE | FFTW_DESTROY_INPUT` plans. The
+retained run has no plan trace or wisdom state, and source inspection found
+no wisdom import/export hook; plan printing is commented out. Plan selection
+remains a hypothesis. No fixed-plan experiment was performed: obtaining that
+state or changing the planning mode needs separately agreed instrumentation
+or engine scope. The limitation is formally recorded here; it is not a
+proven root cause, a green acceptance result, or resolution of all #35
+criteria. PR #34 remains draft and #35 remains open.
