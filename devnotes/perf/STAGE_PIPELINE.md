@@ -1696,20 +1696,21 @@ Still CPU-only: `raw.preprocess`, `raw.demosaic`, `raw.base`, `lab.tools`,
 
 `local.adjustments` is partial through the multi-spot tool path. The
 admitted set is any number of `norm` spots in list order: an active spot runs
-any combination of Colour & Light, vibrance, shadows/highlights and Gaussian
-local contrast, and an inactive spot is the clamp-only case and may carry
-inert tool settings. Every active spot needs at least one of `expcolor`,
-`expvibrance`, `expshadhigh` and `expcontrast`; every other `exp*` is a
-residual. The block-wide requirements are `reparcol == 100`, no
-recursion/inversion/mask/soft radius/merge/LabGrid/RGB or exposure curve,
-`qualitycurveMethod` none or std, `avoidgamutMethod` `"NONE"` or `"MUNS"`,
-and chroma/lightness/contrast inside `-100..100`. Both `ELI` and `RECT` shapes
-are admitted, and an active ROI must be at least 5 px in each dimension. The
-tools run in `Lab_Local()`'s order: vibrance, shadows/highlights, local
-contrast, then Colour & Light. Each tool takes a fresh ROI copy and its own
-deltaE reference blur (`(2 + 0.2*blurcolde)` for colour,
-`(2 + 0.2*blurSHde)` for shadows/highlights, 3 for vibrance, and
-`lcradius` for local contrast's own Gaussian). `calc_ref` is
+any combination of Colour & Light, vibrance, shadows/highlights, soft light
+and Gaussian local contrast, and an inactive spot is the clamp-only case and
+may carry inert tool settings. Every active spot needs at least one of
+`expcolor`, `expvibrance`, `expshadhigh`, `expsoft` and `expcontrast`; every
+other `exp*` is a residual. The block-wide requirements are
+`reparcol == 100`, no recursion/inversion/mask/soft radius/merge/LabGrid/RGB
+or exposure curve, `qualitycurveMethod` none or std, `avoidgamutMethod`
+`"NONE"` or `"MUNS"`, and chroma/lightness/contrast inside `-100..100`. Both
+`ELI` and `RECT` shapes are admitted, and an active ROI must be at least 5 px
+in each dimension. The tools run in `Lab_Local()`'s order: vibrance,
+shadows/highlights, soft light, local contrast, then Colour & Light. Each
+tool takes a fresh ROI copy and its own deltaE reference blur
+(`(2 + 0.2*blurcolde)` for colour, `(2 + 0.2*blurSHde)` for
+shadows/highlights, 3 for vibrance and soft light, and `lcradius` for local
+contrast's own Gaussian). `calc_ref` is
 recomputed on the read-back result of the previous spot, `reserved` is fixed at
 the start of the block, and `lastorig` is unused while merge is a residual.
 `baseImg` stays host and the final `lab2rgb()` is the call site's. The
@@ -1750,6 +1751,18 @@ the RGB mode belongs to the global `lab.tools` node. A shadows/highlights ROI
 below `4 * 3` px is a host execution because the fast guided filter needs
 three subsampled samples per axis.
 
+Soft light admits only the per-pixel `softMethod == "soft"` curve;
+`"reti"` runs `retinex_pde()` and is a residual. It requires `streng` and
+`sensisf` in `1..100`, the GUI ranges. The host's block guard is
+`strng > 1`, so a strength of one is a recorded no-op rather than a pass.
+`ImProcFunctions::softLight()` is one per-pixel Lab -> XYZ -> working RGB
+round trip; the device kernel reuses the block's own working matrices, the
+`Color::gammatab_srgb`/`igammatab_srgb` pair and the exported Lab caches
+instead of re-deriving the curve. The deltaE blend uses `lp.senssf` and the
+default `3/sk` reference blur. A strength above two also selects the host's
+Laplacian clamp arm (`strng > 2 && sfena`), so the per-spot tail takes the
+`clipR()` arm rather than the notzero arm.
+
 Munsell (`avoidgamutMethod == "MUNS"`) is admitted after the clamps became
 bit-exact. The pre-fix clamp differed from the host only in the
 `Color::Lab2XYZ()` cubic order: `lab2rgb()`'s SIMD loop computes
@@ -1769,12 +1782,20 @@ sample is non-finite. It is non-vacuous: the tool changes 17,023 of 45,696
 fixture samples with PAE 362.355469 LSB16 against the same spot with the tool
 off. The gate `localadjustments-sh.pp3` row is 1 LSB16 and differs from the
 neutral export by PAE 28 codes on 3,073,092 of 10,139,904 pixels (8,144,216 of
-30,419,712 channel samples).
-Everything else is a residual: exposure (FFT PDE), the shadows/highlights
+30,419,712 channel samples). The soft-light matrix is within 0.054 LSB16
+(worst 0.053711 on a second spot, 0.030518 on an 8192x64 ROI) for soft light
+alone, colour+soft, shadows/highlights+soft, soft+local contrast, all five
+tools, MUNS, a second spot, an inactive spot carrying inert settings, ELI and
+RECT, and the 179x49/238x64/8192x64 widths; no sample is non-finite. It is
+non-vacuous: the tool changes 22,897 of 45,696 fixture samples with PAE
+3206.698242 LSB16 against the same spot with soft light off. The gate
+`localadjustments-soft.pp3` row is 1 LSB16.
+Everything else is a residual: exposure (FFT PDE), soft light's `"reti"`
+method, the shadows/highlights
 `"tone"`/`"ghs"`/`"micha"` methods, tone-eq multipliers, a non-default tone
 gamma/slope, the SH recovery blend and gradient, vibrance
 gamma/gradients/warm, the local-contrast wavelet (`"wav"`) and FFT variants,
-blur/denoise, sharpening, tone mapping, Retinex, CBDL, log, soft light, the
+blur/denoise, sharpening, tone mapping, Retinex, CBDL, log, the
 common mask, CIE CAM, dehaze, `exc`/`full`/`main`, merge, explicit masks, soft
 radius, LAB/XYZ/XYZREL gamut methods, the RGB curve, LabGrid, `avoidrad != 0`,
 `transit == 100`, a blur radius above 100, `reparcol != 100`, a ROI below
