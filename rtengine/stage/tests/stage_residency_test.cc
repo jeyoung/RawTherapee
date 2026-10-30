@@ -7409,8 +7409,76 @@ void test_local_adjustments(bool available)
             {"sharpening", [](auto& p) {
                  p.locallab.spots[0].expsharp = true;
              }},
-            {"log", [](auto& p) {
+            {"log detail", [](auto& p) {
+                 p.locallab.spots[0].expcolor = false;
                  p.locallab.spots[0].explog = true;
+                 p.locallab.spots[0].detail = 0.6;
+             }},
+            {"log autocompute", [](auto& p) {
+                 p.locallab.spots[0].expcolor = false;
+                 p.locallab.spots[0].explog = true;
+                 p.locallab.spots[0].detail = 0.0;
+                 p.locallab.spots[0].autocompute = true;
+             }},
+            {"log CIE CAM", [](auto& p) {
+                 p.locallab.spots[0].expcolor = false;
+                 p.locallab.spots[0].explog = true;
+                 p.locallab.spots[0].detail = 0.0;
+                 p.locallab.spots[0].expcie = true;
+             }},
+            {"log ciecam flag", [](auto& p) {
+                 p.locallab.spots[0].expcolor = false;
+                 p.locallab.spots[0].explog = true;
+                 p.locallab.spots[0].detail = 0.0;
+                 p.locallab.spots[0].ciecam = true;
+             }},
+            {"log gradient", [](auto& p) {
+                 p.locallab.spots[0].expcolor = false;
+                 p.locallab.spots[0].explog = true;
+                 p.locallab.spots[0].detail = 0.0;
+                 p.locallab.spots[0].strlog = 10.0;
+             }},
+            {"log source gray range", [](auto& p) {
+                 p.locallab.spots[0].expcolor = false;
+                 p.locallab.spots[0].explog = true;
+                 p.locallab.spots[0].detail = 0.0;
+                 p.locallab.spots[0].sourceGray = 0.0;
+             }},
+            {"log target gray range", [](auto& p) {
+                 p.locallab.spots[0].expcolor = false;
+                 p.locallab.spots[0].explog = true;
+                 p.locallab.spots[0].detail = 0.0;
+                 p.locallab.spots[0].targetGray = 200.0;
+             }},
+            {"log black EV range", [](auto& p) {
+                 p.locallab.spots[0].expcolor = false;
+                 p.locallab.spots[0].explog = true;
+                 p.locallab.spots[0].detail = 0.0;
+                 p.locallab.spots[0].blackEv = -20.0;
+             }},
+            {"log white EV range", [](auto& p) {
+                 p.locallab.spots[0].expcolor = false;
+                 p.locallab.spots[0].explog = true;
+                 p.locallab.spots[0].detail = 0.0;
+                 p.locallab.spots[0].whiteEv = 40.0;
+             }},
+            {"log compr range", [](auto& p) {
+                 p.locallab.spots[0].expcolor = false;
+                 p.locallab.spots[0].explog = true;
+                 p.locallab.spots[0].detail = 0.0;
+                 p.locallab.spots[0].comprlog = 2.0;
+             }},
+            {"log repar range", [](auto& p) {
+                 p.locallab.spots[0].expcolor = false;
+                 p.locallab.spots[0].explog = true;
+                 p.locallab.spots[0].detail = 0.0;
+                 p.locallab.spots[0].repar = 0.0;
+             }},
+            {"log sensitivity range", [](auto& p) {
+                 p.locallab.spots[0].expcolor = false;
+                 p.locallab.spots[0].explog = true;
+                 p.locallab.spots[0].detail = 0.0;
+                 p.locallab.spots[0].sensilog = 101;
              }},
             {"mask", [](auto& p) {
                  p.locallab.spots[0].expmask = true;
@@ -8116,6 +8184,232 @@ void test_local_adjustments(bool available)
             spot.dehazeblack = 0.0;
             spot.sensih = sensitivity;
         };
+        /* Local log encoding. detail is zero so the pass is the per-pixel
+         * arm; autocompute and CIE CAM stay off; repar is the log tool's own
+         * recovery weight. The sensilog values cover both senstype-11 arms
+         * (below 50 and 50..100, including the 100 early exit). */
+        const auto log_spot = [&](rtengine::procparams::ProcParams& p,
+                                  int sensitivity, bool satcontrol,
+                                  double detail, double comprlog,
+                                  double repar, double blackev,
+                                  double whiteev, double sourcegray,
+                                  double targetgray) {
+            auto& spot = p.locallab.spots[0];
+            spot.explog = true;
+            spot.autocompute = false;
+            spot.expcie = false;
+            spot.ciecam = false;
+            spot.detail = detail;
+            spot.strlog = 0.0;
+            spot.satlog = satcontrol;
+            spot.comprlog = comprlog;
+            spot.repar = repar;
+            spot.blackEv = blackev;
+            spot.whiteEv = whiteev;
+            spot.sourceGray = sourcegray;
+            spot.targetGray = targetgray;
+            spot.sensilog = sensitivity;
+        };
+        complex.push_back({"log only", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            p.locallab.spots[0].expcolor = false;
+            log_spot(p, 60, true, 0.0, 0.4, 100.0, -5.0, 10.0, 10.0,
+                     18.0);
+        }});
+        complex.push_back({"log only low sensitivity", 238, 64,
+                           [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            p.locallab.spots[0].expcolor = false;
+            log_spot(p, 30, false, 0.0, 0.2, 75.0, -8.0, 12.0, 12.0,
+                     20.0);
+        }});
+        complex.push_back({"log only raw sensitivity", 238, 64,
+                           [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            p.locallab.spots[0].expcolor = false;
+            log_spot(p, 100, true, 0.0, 0.9, 50.0, -10.0, 14.0, 8.0,
+                     22.0);
+        }});
+        complex.push_back({"log only no compression", 238, 64,
+                           [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            p.locallab.spots[0].expcolor = false;
+            log_spot(p, 30, false, 0.0, 0.0, 100.0, -5.0, 10.0, 10.0,
+                     18.0);
+        }});
+        complex.push_back({"log and colour", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 35, 10, -5, "ELI", "NONE");
+            log_spot(p, 60, true, 0.0, 0.4, 100.0, -5.0, 10.0, 10.0,
+                     18.0);
+        }});
+        complex.push_back({"log and dehaze", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            p.locallab.spots[0].expcolor = false;
+            log_spot(p, 60, true, 0.0, 0.4, 100.0, -5.0, 10.0, 10.0,
+                     18.0);
+            dehaze_spot(p, 50, 25, 50, 60);
+        }});
+        complex.push_back({"log and CBDL", 238, 96, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            p.locallab.spots[0].expcolor = false;
+            log_spot(p, 60, true, 0.0, 0.4, 100.0, -5.0, 10.0, 10.0,
+                     18.0);
+            cbdl_spot(p, 1.15, 1.1, 1.05, 1.0, 1.0, 1.0, 0.4, 1.0);
+        }});
+        complex.push_back({"log and vibrance", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            p.locallab.spots[0].expcolor = false;
+            log_spot(p, 60, true, 0.0, 0.4, 100.0, -5.0, 10.0, 10.0,
+                     18.0);
+            vibrance_spot(p, 40, 20);
+        }});
+        complex.push_back({"log and shadows/highlights", 238, 64,
+                           [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            p.locallab.spots[0].expcolor = false;
+            log_spot(p, 60, true, 0.0, 0.4, 100.0, -5.0, 10.0, 10.0,
+                     18.0);
+            sh_spot(p, 50, 50);
+        }});
+        complex.push_back({"log and soft light", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            p.locallab.spots[0].expcolor = false;
+            log_spot(p, 60, true, 0.0, 0.4, 100.0, -5.0, 10.0, 10.0,
+                     18.0);
+            soft_spot(p, 60);
+        }});
+        complex.push_back({"log and local contrast", 238, 64,
+                           [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            p.locallab.spots[0].expcolor = false;
+            log_spot(p, 60, true, 0.0, 0.4, 100.0, -5.0, 10.0, 10.0,
+                     18.0);
+            contrast_spot(p, 40, 0.4);
+        }});
+        complex.push_back({"log all tools", 238, 96, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 35, 10, -5, "ELI", "NONE");
+            auto& spot = p.locallab.spots[0];
+            log_spot(p, 30, true, 0.0, 0.4, 100.0, -5.0, 10.0, 10.0,
+                     18.0);
+            spot.expcbdl = true;
+            spot.mult[0] = 1.15;
+            spot.mult[1] = 1.1;
+            spot.mult[2] = 1.05;
+            spot.mult[3] = 1.0;
+            spot.mult[4] = 1.0;
+            spot.mult[5] = 1.0;
+            spot.chromacbdl = 0.4;
+            spot.threshold = 0.2;
+            spot.sensicb = 60;
+            spot.clarityml = 1.0;
+            spot.expvibrance = true;
+            spot.pastels = 40;
+            spot.saturated = 20;
+            spot.psthreshold.setValues(0, 75);
+            spot.sensiv = 30;
+            spot.expcontrast = true;
+            spot.localcontMethod = "loc";
+            spot.lcradius = 40;
+            spot.lcamount = 0.4;
+            spot.lcdarkness = 0.9;
+            spot.lclightness = 1.1;
+            spot.reparw = 100.0;
+            spot.sensilc = 60;
+            spot.expshadhigh = true;
+            spot.shMethod = "std";
+            spot.highlights = 50;
+            spot.shadows = 50;
+            spot.h_tonalwidth = 70;
+            spot.s_tonalwidth = 30;
+            spot.sh_radius = 40;
+            spot.sensihs = 30;
+            spot.blurSHde = 5;
+            spot.expsoft = true;
+            spot.softMethod = "soft";
+            spot.streng = 60;
+            spot.sensisf = 30;
+            dehaze_spot(p, 50, 25, 50, 60);
+        }});
+        complex.push_back({"log MUNS", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "MUNS");
+            p.locallab.spots[0].expcolor = false;
+            log_spot(p, 60, true, 0.0, 0.4, 100.0, -5.0, 10.0, 10.0,
+                     18.0);
+        }});
+        complex.push_back({"log RECT", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "RECT", "NONE");
+            p.locallab.spots[0].expcolor = false;
+            log_spot(p, 60, true, 0.0, 0.4, 100.0, -5.0, 10.0, 10.0,
+                     18.0);
+        }});
+        complex.push_back({"log 179x49", 179, 49, [&](auto& p) {
+            add_spot(p, 0, 0, 700, true, 0, 0, 0, "ELI", "NONE");
+            p.locallab.spots[0].expcolor = false;
+            log_spot(p, 60, true, 0.0, 0.4, 100.0, -5.0, 10.0, 10.0,
+                     18.0);
+        }});
+        complex.push_back({"log 238x64", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            p.locallab.spots[0].expcolor = false;
+            log_spot(p, 100, true, 0.0, 0.6, 100.0, -6.0, 11.0, 10.0,
+                     18.0);
+        }});
+        complex.push_back({"log 8192x64", 8192, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 8000, true, 0, 0, 0, "ELI", "NONE");
+            p.locallab.spots[0].expcolor = false;
+            log_spot(p, 60, true, 0.0, 0.4, 100.0, -5.0, 10.0, 10.0,
+                     18.0);
+        }});
+        complex.push_back({"log second spot", 238, 64, [&](auto& p) {
+            add_spot(p, -300, -150, 700, true, 30, 8, 0, "ELI", "NONE");
+            add_spot(p, 300, 150, 700, true, 0, 0, 0, "ELI", "NONE");
+            p.locallab.spots[1].expcolor = false;
+            auto& spot = p.locallab.spots[1];
+            spot.explog = true;
+            spot.autocompute = false;
+            spot.detail = 0.0;
+            spot.satlog = true;
+            spot.comprlog = 0.4;
+            spot.repar = 100.0;
+            spot.blackEv = -5.0;
+            spot.whiteEv = 10.0;
+            spot.sourceGray = 10.0;
+            spot.targetGray = 18.0;
+            spot.sensilog = 60;
+        }});
+        complex.push_back({"log first then colour", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            p.locallab.spots[0].expcolor = false;
+            log_spot(p, 60, true, 0.0, 0.4, 100.0, -5.0, 10.0, 10.0,
+                     18.0);
+            add_spot(p, 100, 100, 600, true, 35, 10, -5, "ELI", "NONE");
+        }});
+        complex.push_back({"log inactive then active", 238, 64,
+                           [&](auto& p) {
+            add_spot(p, 0, 0, 700, false, 0, 0, 0, "ELI", "NONE");
+            p.locallab.spots[0].expcolor = false;
+            log_spot(p, 60, true, 0.0, 0.4, 100.0, -5.0, 10.0, 10.0,
+                     18.0);
+            add_spot(p, 100, 100, 600, true, 35, 10, -5, "ELI", "NONE");
+        }});
+        complex.push_back({"inactive then log", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 700, false, 0, 0, 0, "ELI", "NONE");
+            add_spot(p, 100, 100, 600, true, 0, 0, 0, "ELI", "NONE");
+            p.locallab.spots[1].expcolor = false;
+            auto& spot = p.locallab.spots[1];
+            spot.explog = true;
+            spot.autocompute = false;
+            spot.detail = 0.0;
+            spot.satlog = true;
+            spot.comprlog = 0.4;
+            spot.repar = 100.0;
+            spot.blackEv = -5.0;
+            spot.whiteEv = 10.0;
+            spot.sourceGray = 10.0;
+            spot.targetGray = 18.0;
+            spot.sensilog = 60;
+        }});
+
         complex.push_back({"dehaze only", 238, 64, [&](auto& p) {
             add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
             p.locallab.spots[0].expcolor = false;
@@ -8758,6 +9052,30 @@ void test_local_adjustments(bool available)
                 check(changed.differing > 0,
                       "the CBDL tool changes the image");
             }
+            if (c.label == "log only") {
+                /* The same spot with log encoding off: the tool must change
+                 * the image, otherwise the parity above is vacuous. */
+                rtengine::procparams::ProcParams plain_params =
+                    reference_params;
+                plain_params.locallab.spots[0].explog = false;
+                Imagefloat plain_base(c.width, c.height);
+                fill_local_adjustments_rgb(plain_base, 211u);
+                std::unique_ptr<LabImage> plain_lab(
+                    new LabImage(c.width, c.height));
+                rtengine::ImProcFunctions plain_ipf(&plain_params, false);
+                localAdjustmentsHostBlock(plain_ipf, plain_params,
+                                          &plain_base, plain_lab.get(),
+                                          c.width, c.height);
+                const Diff changed =
+                    compare(view(*plain_lab), view(*reference_lab));
+                std::printf("stage-residency: local.adjustments log "
+                            "non-vacuity: %zu of %zu samples differ, "
+                            "PAE %.6f LSB16\n",
+                            changed.differing, changed.samples,
+                            changed.max_abs);
+                check(changed.differing > 0,
+                      "the log tool changes the image");
+            }
             if (c.label == "dehaze only") {
                 /* The same spot with the retinex enable and dehaze off: the
                  * dehaze tool must change the image, otherwise the parity
@@ -9316,6 +9634,82 @@ void test_local_adjustments(bool available)
                  spot.expcolor = false;
                  spot.expreti = false;
                  spot.dehaz = 50;
+             }},
+            {"log autocompute", [](auto& p) {
+                 auto& spot = p.locallab.spots[0];
+                 spot.expcolor = false;
+                 spot.explog = true;
+                 spot.detail = 0.0;
+                 spot.autocompute = true;
+             }},
+            {"log CIE CAM", [](auto& p) {
+                 auto& spot = p.locallab.spots[0];
+                 spot.expcolor = false;
+                 spot.explog = true;
+                 spot.detail = 0.0;
+                 spot.expcie = true;
+             }},
+            {"log ciecam flag", [](auto& p) {
+                 auto& spot = p.locallab.spots[0];
+                 spot.expcolor = false;
+                 spot.explog = true;
+                 spot.detail = 0.0;
+                 spot.ciecam = true;
+             }},
+            {"log detail", [](auto& p) {
+                 auto& spot = p.locallab.spots[0];
+                 spot.expcolor = false;
+                 spot.explog = true;
+                 spot.detail = 0.6;
+             }},
+            {"log gradient", [](auto& p) {
+                 auto& spot = p.locallab.spots[0];
+                 spot.expcolor = false;
+                 spot.explog = true;
+                 spot.detail = 0.0;
+                 spot.strlog = 10.0;
+             }},
+            {"log explicit mask", [](auto& p) {
+                 auto& spot = p.locallab.spots[0];
+                 spot.expcolor = false;
+                 spot.explog = true;
+                 spot.detail = 0.0;
+                 spot.enaLMask = true;
+             }},
+            {"log soft radius", [](auto& p) {
+                 auto& spot = p.locallab.spots[0];
+                 spot.expcolor = false;
+                 spot.explog = true;
+                 spot.detail = 0.0;
+                 spot.softradiuscol = 1.0;
+             }},
+            {"log source gray range", [](auto& p) {
+                 auto& spot = p.locallab.spots[0];
+                 spot.expcolor = false;
+                 spot.explog = true;
+                 spot.detail = 0.0;
+                 spot.sourceGray = 0.0;
+             }},
+            {"log compr range", [](auto& p) {
+                 auto& spot = p.locallab.spots[0];
+                 spot.expcolor = false;
+                 spot.explog = true;
+                 spot.detail = 0.0;
+                 spot.comprlog = 2.0;
+             }},
+            {"log repar range", [](auto& p) {
+                 auto& spot = p.locallab.spots[0];
+                 spot.expcolor = false;
+                 spot.explog = true;
+                 spot.detail = 0.0;
+                 spot.repar = 0.0;
+             }},
+            {"log sensitivity range", [](auto& p) {
+                 auto& spot = p.locallab.spots[0];
+                 spot.expcolor = false;
+                 spot.explog = true;
+                 spot.detail = 0.0;
+                 spot.sensilog = 101;
              }},
         };
         for (std::size_t index = 0;
