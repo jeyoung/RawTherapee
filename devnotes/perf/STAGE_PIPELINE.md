@@ -1696,18 +1696,20 @@ Still CPU-only: `raw.preprocess`, `raw.demosaic`, `raw.base`, `lab.tools`,
 
 `local.adjustments` is partial through the multi-spot tool path. The
 admitted set is any number of `norm` spots in list order: an active spot runs
-any combination of Colour & Light, vibrance and Gaussian local contrast, and an
-inactive spot is the clamp-only case and may carry inert tool settings. Every
-active spot needs at least one of `expcolor`, `expvibrance` and `expcontrast`;
-every other `exp*` is a residual. The block-wide requirements are
-`reparcol == 100`, no recursion/inversion/mask/soft radius/merge/LabGrid/RGB
-or exposure curve, `qualitycurveMethod` none or std, `avoidgamutMethod`
-`"NONE"` or `"MUNS"`, and chroma/lightness/contrast inside `-100..100`. Both
-`ELI` and `RECT` shapes are admitted, and an active ROI must be at least 5 px
-in each dimension. The tools run in `Lab_Local()`'s order: vibrance, local
+any combination of Colour & Light, vibrance, shadows/highlights and Gaussian
+local contrast, and an inactive spot is the clamp-only case and may carry
+inert tool settings. Every active spot needs at least one of `expcolor`,
+`expvibrance`, `expshadhigh` and `expcontrast`; every other `exp*` is a
+residual. The block-wide requirements are `reparcol == 100`, no
+recursion/inversion/mask/soft radius/merge/LabGrid/RGB or exposure curve,
+`qualitycurveMethod` none or std, `avoidgamutMethod` `"NONE"` or `"MUNS"`,
+and chroma/lightness/contrast inside `-100..100`. Both `ELI` and `RECT` shapes
+are admitted, and an active ROI must be at least 5 px in each dimension. The
+tools run in `Lab_Local()`'s order: vibrance, shadows/highlights, local
 contrast, then Colour & Light. Each tool takes a fresh ROI copy and its own
-deltaE reference blur (`(2 + 0.2*blurcolde)` for colour, 3 for the two other
-tools, and `lcradius` for local contrast's own Gaussian). `calc_ref` is
+deltaE reference blur (`(2 + 0.2*blurcolde)` for colour,
+`(2 + 0.2*blurSHde)` for shadows/highlights, 3 for vibrance, and
+`lcradius` for local contrast's own Gaussian). `calc_ref` is
 recomputed on the read-back result of the previous spot, `reserved` is fixed at
 the start of the block, and `lastorig` is unused while merge is a residual.
 `baseImg` stays host and the final `lab2rgb()` is the call site's. The
@@ -1730,6 +1732,23 @@ refuses non-zero wavelet settings. The block reads the Colour & Light
 the device reproduces that field. A ROI below `mSPwav = 32` skips the local
 contrast pass, as the host does.
 
+Shadows/highlights admits only the Lab-mode `"std"` method
+(`shMethod == "std"`); the `"tone"` (working TRC/tone-eq), `"ghs"` and
+`"micha"` methods are residuals. It requires `highlights` and `shadows` in
+`0..100`, both tonal widths in `10..100`, `sh_radius` in `0..100`, `sensihs`
+in `0..100`, `blurSHde` in `2..100`, `reparsh == 100` and `strSH == 0`, with
+the six `multsh` tone-eq multipliers zero and `gamSH`/`sloSH` at their
+`2.4`/`12.92` defaults. The block calls `shadowsHighlights()` twice, highlight
+first and then shadow, each with a host-built `shadowsHighlightsLut()` tone
+table and `guidedFilter()` at an explicit subsampling of four and epsilon
+`0.075`. The device reuses the lab.tools mask, box-blur, combine, upsample
+and apply kernels and the block's own `shadowsHighlightsRadius()`,
+`shadowsHighlightsThreshold()` and `shadowsHighlightsScale()` helpers. The
+local call site always passes `labmode = 1`, so only the Lab mode exists here;
+the RGB mode belongs to the global `lab.tools` node. A shadows/highlights ROI
+below `4 * 3` px is a host execution because the fast guided filter needs
+three subsampled samples per axis.
+
 Munsell (`avoidgamutMethod == "MUNS"`) is admitted after the clamps became
 bit-exact. The pre-fix clamp differed from the host only in the
 `Color::Lab2XYZ()` cubic order: `lab2rgb()`'s SIMD loop computes
@@ -1740,17 +1759,28 @@ device clamp now repeats both orders and all six clamp-only cases are
 bit-exact (0 of 1,751,721 samples); the gate MUNS row is 1 LSB16, the same as
 `NONE`. The vibrance and local-contrast rows are also 1 LSB16 on the gate
 image, and the residency matrix holds them at 0.06 LSB16 or below, alone and
-combined with Colour & Light, MUNS, multiple spots and the padded widths.
-Everything else is a residual: exposure (FFT PDE), shadows/highlights,
-vibrance gamma/gradients/warm, the local-contrast wavelet (`"wav"`) and FFT
-variants, blur/denoise, sharpening, tone mapping, Retinex, CBDL, log, soft
-light, the common mask, CIE CAM, dehaze, `exc`/`full`/`main`, merge, explicit
-masks, soft radius, LAB/XYZ/XYZREL gamut methods, the RGB curve, LabGrid,
-`avoidrad != 0`, `transit == 100`, a blur radius above 100, `reparcol != 100`,
-a ROI below 5 px, `ghs_D != 0 && ghs_BLP > 0` and an active pre-CBDL pass. A
-GPU device is refused before the upload. An inactive block
-(`locallab.enabled == false` or no spots) never enters the node and takes no
-Lab round trip.
+combined with Colour & Light, MUNS, multiple spots and the padded widths. The
+shadows/highlights matrix is within 0.054 LSB16 (worst 0.053711 on the second
+spot, 0.031250 with all four tools) for ELI and RECT, highlight-only,
+shadow-only, both rounds, colour, vibrance and local contrast combinations,
+all four tools, MUNS, a second spot, a padded 179x49 and an 8192x64 ROI; no
+sample is non-finite. It is non-vacuous: the tool changes 17,023 of 45,696
+fixture samples with PAE 362.355469 LSB16 against the same spot with the tool
+off. The gate `localadjustments-sh.pp3` row is 1 LSB16 and changes every pixel
+of the sample against the neutral export (PAE 7,138 codes, AE 4,222,180).
+Everything else is a residual: exposure (FFT PDE), the shadows/highlights
+`"tone"`/`"ghs"`/`"micha"` methods, tone-eq multipliers, a non-default tone
+gamma/slope, the SH recovery blend and gradient, vibrance
+gamma/gradients/warm, the local-contrast wavelet (`"wav"`) and FFT variants,
+blur/denoise, sharpening, tone mapping, Retinex, CBDL, log, soft light, the
+common mask, CIE CAM, dehaze, `exc`/`full`/`main`, merge, explicit masks, soft
+radius, LAB/XYZ/XYZREL gamut methods, the RGB curve, LabGrid, `avoidrad != 0`,
+`transit == 100`, a blur radius above 100, `reparcol != 100`, a ROI below
+5 px (12 px with shadows/highlights active, where a 10-px ROI falls back to
+the host at PAE 0), `ghs_D != 0 && ghs_BLP > 0` and
+an active pre-CBDL pass. A GPU device is refused before the upload. An
+inactive block (`locallab.enabled == false` or no spots) never enters the node
+and takes no Lab round trip.
 
 Recorded `n/a` exceptions: `source.select` and `source.embedded` are I/O,
 `analysis` produces only histograms, `output.icc` attaches metadata,
