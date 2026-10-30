@@ -1896,10 +1896,11 @@ spot, an inactive-then-active spot, ELI/RECT and the 179x49, 238x64 and
 22,817 of 45,696 fixture samples with PAE 9,332.763672 LSB16 against the same
 spot with the tool off. The gate `localadjustments-log.pp3` row is 1 LSB16
 and differs from the neutral export by PAE 20,952 codes on 5,254,380 of
-30,419,712 channel samples. The residual matrix (`autocompute`, `expcie`,
-`ciecam`, non-zero `detail`, `strlog`, an explicit mask, a soft radius,
-source/target gray, black/white EV, compression, `repar` and sensitivity out
-of range) runs the host builtin and is byte-identical.
+30,419,712 channel samples. The runtime residual matrix (`autocompute`,
+`expcie`, `ciecam`, non-zero `detail`, `strlog`, an explicit mask, a soft
+radius, source gray, compression, `repar` and sensitivity out of range) runs
+the host builtin and is byte-identical; the predicate matrix also covers
+target gray and black/white EV.
 
 The `chromacbdl = 0.01`, default-multiplier, default-clarity case is the
 chroma block's all-ones-multiplier arm: the CPU still enters the block and
