@@ -9789,9 +9789,10 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
              *   transit_shapedetect2() senstype 30.
              *
              * The guided filters are the lab.tools fragments with the block's
-             * automatic subsampling. The host reduction is the block's own
-             * percentile/ambient estimate over the device's filtered
-             * channels; it is the only part of the pass that runs on the host.
+             * automatic subsampling. The normalize maximum is read back and
+             * reduced on the host (an exact maximum), and the block's own
+             * percentile/ambient estimate runs over the read-back filtered
+             * channels; these are the pass's two host reductions.
              */
             if (dehazePass) {
                 if (!copy_roi() ||

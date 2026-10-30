@@ -1719,7 +1719,8 @@ shadows/highlights, 3 for vibrance, soft light and dehaze, and `lcradius` for
 local contrast's own Gaussian). The dehaze pass converts the ROI Lab to RGB,
 normalizes by `max(max * 2, 65535)`, runs three guided filters, derives the
 ambient light, builds and filters the dark channel and applies the per-pixel
-recovery; the ambient reduction is the one host prefix (see below).
+recovery; the normalize maximum and the ambient reduction are the two host
+reductions (see below).
 `calc_ref` is
 recomputed on the read-back result of the previous spot, `reserved` is fixed at
 the start of the block, and `lastorig` is unused while merge is a residual.
@@ -1733,13 +1734,15 @@ Lab to RGB, normalizes it, runs the three guided filters of the RGB channels,
 builds the dark channel with `max(max(W, H) / 600, 2)`, filters the dark
 channel against the normalized B and applies the per-pixel recovery. The
 guided filters reuse `lab.tools`' `guidedfilter.cc` port with the block's
-automatic subsampling and box radius. The one host prefix is the ambient
-reduction: `get_dark_channel_downsized()` and the two exact 95th percentiles
+automatic subsampling and box radius. The two host reductions are the
+normalize maximum, which is exact and order independent, and the ambient
+estimate: `get_dark_channel_downsized()` and the two exact 95th percentiles
 of `estimate_ambient_light()` run in `dehazeAmbientPrefix()` on the read-back
 filtered channels (rescaled to the 200 px cap when the block does), because
 `std::nth_element` cannot be reproduced order-independently on the device.
-The device and the host block agree within 0.047 LSB16 over the 16-case
-matrix, and the `localadjustments-dehaze.pp3` export row is 1 LSB16.
+The device and the host block agree within 0.053 LSB16 over the 17-case
+matrix, including a 1024x1793 ROI that triggers the nearest-neighbour
+rescale, and the `localadjustments-dehaze.pp3` export row is 1 LSB16.
 `dehazeblack`, show-depth, a mask, a soft radius, a non-zero retinex strength
 and an out-of-range strength/depth/saturation/sensitivity are residuals and
 run the host builtin; `dehazeAmbientPrefix()` refuses a prefix with no
@@ -1855,20 +1858,23 @@ non-vacuous: CBDL alone changes 34,170 of 68,544 fixture samples with PAE
 `localadjustments-cbdl.pp3` row is 1 LSB16 and differs from the neutral
 export by PAE 3,420 codes on 14,240,286 of 30,419,712 channel samples.
 
-The local dehaze matrix is within 0.047 LSB16 (worst 0.046875 on the 8192x64
+The local dehaze matrix is within 0.053 LSB16 (worst 0.052734 on the
+1024x1793 rescale ROI, 0.046875 on the 8192x64
 ROI, 0.038086 on a second spot) for dehaze alone, a negative strength,
 colour, CBDL, vibrance, shadows/highlights, soft light, local contrast, all
 seven tools, MUNS, a second spot, an inactive-then-active spot, ELI/RECT and
-the 179x49, 238x64 and 8192x64 widths; no sample is non-finite. It is
+the 179x49, 238x64 and 8192x64 widths and a 1024x1793 ROI that triggers the
+nearest-neighbour rescale; no sample is non-finite. It is
 non-vacuous: dehaze alone changes 22,752 of 45,696 fixture samples with PAE
 2,365.349609 LSB16 against the same spot with the retinex enable and dehaze
 off. The gate `localadjustments-dehaze.pp3` row is 1 LSB16. Ten residuals
 (`dehazeblack`, show-depth, an explicit mask, a soft radius, a non-zero
 retinex strength, four out-of-range sliders and a dehaze value without the
-retinex enable) run the host builtin and are byte-identical. The ambient
-light estimate is the pass's only host prefix; it runs the block's own
-percentile and double-precision average on the device's read-back filtered
-channels and is recorded in `dehaze_ambient.h`.
+retinex enable) run the host builtin and are byte-identical. The normalize
+maximum and the ambient light estimate are the pass's two host reductions;
+the latter runs the block's own percentile and double-precision average on
+the device's read-back filtered channels and is recorded in
+`dehaze_ambient.h`.
 
 The `chromacbdl = 0.01`, default-multiplier, default-clarity case is the
 chroma block's all-ones-multiplier arm: the CPU still enters the block and
