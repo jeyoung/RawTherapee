@@ -8746,6 +8746,10 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
             rec[RT_LOCAL_ADJUSTMENTS_SLOT_CBDL_LUMA_ACTIVE] == 1.0f;
         const bool cbdlChromaActive =
             rec[RT_LOCAL_ADJUSTMENTS_SLOT_CBDL_CHROMA_ACTIVE] == 1.0f;
+        /* The chroma block runs for every positive chromacbdl, even when its
+         * multipliers trim to all-ones and the table is absent. */
+        const bool cbdlChromaBlend =
+            cbdl && rec[RT_LOCAL_ADJUSTMENTS_SLOT_CBDL_CHROMA] > 0.0f;
         if ((rec[RT_LOCAL_ADJUSTMENTS_SLOT_CBDL_LUMA_ACTIVE] != 0.0f &&
              !cbdlLumaActive) ||
             (rec[RT_LOCAL_ADJUSTMENTS_SLOT_CBDL_CHROMA_ACTIVE] != 0.0f &&
@@ -9854,50 +9858,98 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
                 }
 
                 /* Chroma: the source is sqrt(a*a + b*b), and the block
-                 * normalises the result by 1 / (0.01 * max |value|). */
-                if (cbdlChromaActive) {
+                 * normalises the result by 1 / (0.01 * max |value|). The
+                 * block is entered for every positive chromacbdl, even when
+                 * cbdl_local_temp() returns without touching loctemp->L; in
+                 * that case the chroma blend uses the luminance result. */
+                if (cbdlChromaBlend) {
+                    /*
+                     * transit_shapedetect(7) receives the CPU's `original`,
+                     * which is the same LabImage as `transformed`: the
+                     * luminance blend has already written L, while a/b are
+                     * unchanged. A fresh copy here is therefore the CPU's
+                     * reference pair (post-luma L, pre-block a/b); a pre-luma
+                     * copy would diverge. The later vibrance and colour
+                     * passes each take their own pre-tool copy for the same
+                     * reason.
+                     */
                     if (!copy_roi() ||
                         !blur_roi(*setup.iir_vibrance, "CBDL chroma blur")) {
                         return RT_STAGE_FALLBACK;
                     }
-                    cl_mem src_memory = memory_of(cbdl_src_device);
-                    cl_mem cbdl_work_memory = memory_of(work_device);
-                    cl_int mode = 1;
-                    cl_uint arg = 0;
-                    bool ok = true;
-                    ok = ok && set(cbdl_fill_kernel, arg++, sizeof(cl_mem),
-                                   &cbdl_work_memory);
-                    ok = ok && set(cbdl_fill_kernel, arg++, sizeof(cl_int),
-                                   &work_pitch);
-                    ok = ok && set(cbdl_fill_kernel, arg++, sizeof(cl_int),
-                                   &work_plane);
-                    ok = ok && set(cbdl_fill_kernel, arg++, sizeof(cl_mem),
-                                   &src_memory);
-                    ok = ok && set(cbdl_fill_kernel, arg++, sizeof(cl_int),
-                                   &cbdl_src_pitch);
-                    ok = ok && set(cbdl_fill_kernel, arg++, sizeof(cl_int),
-                                   &bfw);
-                    ok = ok && set(cbdl_fill_kernel, arg++, sizeof(cl_int),
-                                   &bfh);
-                    ok = ok && set(cbdl_fill_kernel, arg++, sizeof(cl_int),
-                                   &mode);
-                    if (!ok ||
-                        !launch2d(cbdl_fill_kernel,
-                                  static_cast<std::size_t>(bfw),
-                                  static_cast<std::size_t>(bfh),
-                                  "CBDL chroma source")) {
-                        error = "local.adjustments CBDL chroma source failed";
-                        return RT_STAGE_FALLBACK;
-                    }
-                    if (!cbdl_run_pyramid(
-                            src_memory, cbdl_src_pitch,
-                            memory_of(cbdl_chroma_device),
-                            cbdlChromaLevels, clarC, "CBDL chroma")) {
-                        return RT_STAGE_FALLBACK;
+                    cl_mem out_memory = memory_of(cbdl_out_device);
+                    if (cbdlChromaActive) {
+                        cl_mem src_memory = memory_of(cbdl_src_device);
+                        cl_mem cbdl_work_memory = memory_of(work_device);
+                        cl_int mode = 1;
+                        cl_uint arg = 0;
+                        bool ok = true;
+                        ok = ok && set(cbdl_fill_kernel, arg++, sizeof(cl_mem),
+                                       &cbdl_work_memory);
+                        ok = ok && set(cbdl_fill_kernel, arg++, sizeof(cl_int),
+                                       &work_pitch);
+                        ok = ok && set(cbdl_fill_kernel, arg++, sizeof(cl_int),
+                                       &work_plane);
+                        ok = ok && set(cbdl_fill_kernel, arg++, sizeof(cl_mem),
+                                       &src_memory);
+                        ok = ok && set(cbdl_fill_kernel, arg++, sizeof(cl_int),
+                                       &cbdl_src_pitch);
+                        ok = ok && set(cbdl_fill_kernel, arg++, sizeof(cl_int),
+                                       &bfw);
+                        ok = ok && set(cbdl_fill_kernel, arg++, sizeof(cl_int),
+                                       &bfh);
+                        ok = ok && set(cbdl_fill_kernel, arg++, sizeof(cl_int),
+                                       &mode);
+                        if (!ok ||
+                            !launch2d(cbdl_fill_kernel,
+                                      static_cast<std::size_t>(bfw),
+                                      static_cast<std::size_t>(bfh),
+                                      "CBDL chroma source")) {
+                            error = "local.adjustments CBDL chroma source "
+                                    "failed";
+                            return RT_STAGE_FALLBACK;
+                        }
+                        if (!cbdl_run_pyramid(
+                                src_memory, cbdl_src_pitch,
+                                memory_of(cbdl_chroma_device),
+                                cbdlChromaLevels, clarC, "CBDL chroma")) {
+                            return RT_STAGE_FALLBACK;
+                        }
+                    } else if (!cbdlLumaActive) {
+                        /* The host's loctemp->L is the source copy when both
+                         * cbdl_local_temp() calls return early. */
+                        cl_mem cbdl_work_memory = memory_of(work_device);
+                        cl_int mode = 0;
+                        cl_uint arg = 0;
+                        bool ok = true;
+                        ok = ok && set(cbdl_fill_kernel, arg++, sizeof(cl_mem),
+                                       &cbdl_work_memory);
+                        ok = ok && set(cbdl_fill_kernel, arg++, sizeof(cl_int),
+                                       &work_pitch);
+                        ok = ok && set(cbdl_fill_kernel, arg++, sizeof(cl_int),
+                                       &work_plane);
+                        ok = ok && set(cbdl_fill_kernel, arg++, sizeof(cl_mem),
+                                       &out_memory);
+                        ok = ok && set(cbdl_fill_kernel, arg++, sizeof(cl_int),
+                                       &cbdl_out_pitch);
+                        ok = ok && set(cbdl_fill_kernel, arg++, sizeof(cl_int),
+                                       &bfw);
+                        ok = ok && set(cbdl_fill_kernel, arg++, sizeof(cl_int),
+                                       &bfh);
+                        ok = ok && set(cbdl_fill_kernel, arg++, sizeof(cl_int),
+                                       &mode);
+                        if (!ok ||
+                            !launch2d(cbdl_fill_kernel,
+                                      static_cast<std::size_t>(bfw),
+                                      static_cast<std::size_t>(bfh),
+                                      "CBDL chroma seed")) {
+                            error = "local.adjustments CBDL chroma seed "
+                                    "failed";
+                            return RT_STAGE_FALLBACK;
+                        }
                     }
 
                     cl_mem lab_memory = memory_of(image);
-                    cl_mem out_memory = memory_of(cbdl_out_device);
                     cl_mem rowmax_memory = memory_of(cbdl_rowmax_device);
                     cl_int cl_lab_pitch = lab_pitch;
                     cl_int cl_lab_plane = lab_plane;
@@ -9906,8 +9958,8 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
                     cl_int rh = bfh;
                     cl_int x0 = xstart;
                     cl_int y0 = ystart;
-                    arg = 0;
-                    ok = true;
+                    cl_uint arg = 0;
+                    bool ok = true;
                     ok = ok && set(cbdl_metric_kernel, arg++, sizeof(cl_mem),
                                    &out_memory);
                     ok = ok && set(cbdl_metric_kernel, arg++,

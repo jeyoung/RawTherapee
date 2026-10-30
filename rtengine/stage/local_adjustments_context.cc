@@ -1431,8 +1431,23 @@ int LocalAdjustmentsContext::build(int spot, const RtStageBuffer* lab,
         static_cast<int>(lp.xc + lp.lx), fw_);
     const int cbdlY1 = std::min(
         static_cast<int>(lp.yc + lp.ly), fh_);
+    /*
+     * The block's outer guard also requires a non-neutral multiplier, clarity
+     * or the residual contrast; clarity is at least 0.1 in the admitted set,
+     * so this is true whenever cbdlena is. The chroma block is then entered
+     * for every positive chromacbdl, even when its derived multipliers trim to
+     * all-ones and cbdl_local_temp() returns without touching loctemp->L.
+     */
+    bool cbdlNeutral = lp.clarityml == 0.f && lp.contresid == 0.f;
+    for (uint32_t level = 0; level < RT_LOCAL_ADJUSTMENTS_CBDL_LEVELS;
+         ++level) {
+        if (lp.mulloc[level] != 1.f) {
+            cbdlNeutral = false;
+        }
+    }
     const bool cbdlRoi =
-        lp.cbdlena && cbdlX1 - cbdlX0 >= RT_LOCAL_ADJUSTMENTS_CBDL_MIN_ROI &&
+        lp.cbdlena && !cbdlNeutral &&
+        cbdlX1 - cbdlX0 >= RT_LOCAL_ADJUSTMENTS_CBDL_MIN_ROI &&
         cbdlY1 - cbdlY0 >= RT_LOCAL_ADJUSTMENTS_CBDL_MIN_ROI;
     int cbdlLumaLevels = 0;
     int cbdlChromaLevels = 0;
@@ -1488,8 +1503,10 @@ int LocalAdjustmentsContext::build(int spot, const RtStageBuffer* lab,
         }
     }
     const bool cbdlLumaRun = cbdlRoi && cbdlLumaLevels > 0;
-    const bool cbdlChromaRun =
-        cbdlRoi && lp.chromacb > 0.f && cbdlChromaLevels > 0;
+    /* The chroma block always runs for a positive chromacbdl. The table is
+     * only present when its multipliers survive the trailing-identity trim. */
+    const bool cbdlChromaBlend = cbdlRoi && lp.chromacb > 0.f;
+    const bool cbdlChromaTable = cbdlChromaBlend && cbdlChromaLevels > 0;
     const auto buildCbdlTables = [&](const float* mult, int levels,
                                      std::vector<float>& tables) {
         tables.resize(static_cast<std::size_t>(levels) *
@@ -1520,7 +1537,7 @@ int LocalAdjustmentsContext::build(int spot, const RtStageBuffer* lab,
             return 1;
         }
     }
-    if (cbdlChromaRun) {
+    if (cbdlChromaTable) {
         buildCbdlTables(cbdlChromaMult, cbdlChromaLevels, cbdlChromaTables);
         cbdlChromaOffset = appendSamples(cbdlChromaTables);
         if (cbdlChromaOffset == RT_LOCAL_ADJUSTMENTS_NO_LUT) {
@@ -1651,7 +1668,7 @@ int LocalAdjustmentsContext::build(int spot, const RtStageBuffer* lab,
     record[RT_LOCAL_ADJUSTMENTS_SLOT_SENSSOFT] =
         static_cast<float>(lp.senssf);
     record[RT_LOCAL_ADJUSTMENTS_SLOT_EXPCBDL] =
-        (cbdlLumaRun || cbdlChromaRun) ? 1.f : 0.f;
+        (cbdlLumaRun || cbdlChromaBlend) ? 1.f : 0.f;
     record[RT_LOCAL_ADJUSTMENTS_SLOT_SENSCB] =
         static_cast<float>(lp.senscb);
     record[RT_LOCAL_ADJUSTMENTS_SLOT_CBDL_THRESHOLD] = lp.threshol;
@@ -1666,7 +1683,7 @@ int LocalAdjustmentsContext::build(int spot, const RtStageBuffer* lab,
     record[RT_LOCAL_ADJUSTMENTS_SLOT_CBDL_LUMA_LEVELS] =
         cbdlLumaRun ? static_cast<float>(cbdlLumaLevels) : 0.f;
     record[RT_LOCAL_ADJUSTMENTS_SLOT_CBDL_CHROMA_LEVELS] =
-        cbdlChromaRun ? static_cast<float>(cbdlChromaLevels) : 0.f;
+        cbdlChromaTable ? static_cast<float>(cbdlChromaLevels) : 0.f;
 
     const auto setTable = [record](int offsetSlot, int activeSlot,
                                    bool active, float offset) {
@@ -1732,7 +1749,7 @@ int LocalAdjustmentsContext::build(int spot, const RtStageBuffer* lab,
              RT_LOCAL_ADJUSTMENTS_SLOT_CBDL_LUMA_ACTIVE, cbdlLumaRun,
              cbdlLumaOffset);
     setTable(RT_LOCAL_ADJUSTMENTS_SLOT_CBDL_CHROMA_OFFSET,
-             RT_LOCAL_ADJUSTMENTS_SLOT_CBDL_CHROMA_ACTIVE, cbdlChromaRun,
+             RT_LOCAL_ADJUSTMENTS_SLOT_CBDL_CHROMA_ACTIVE, cbdlChromaTable,
              cbdlChromaOffset);
 
     /*
