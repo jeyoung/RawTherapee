@@ -7962,9 +7962,10 @@ RtStageStatus run_sharpen(const std::shared_ptr<OpenCLEnv>& env,
  * built from the spot's lcradius.
  *
  * Pass order matches Lab_Local(): the optional negative-value prefilter, then,
- * per active spot, local dehaze, local CBDL, vibrance, shadows/highlights, soft
- * light, local contrast and Colour & Light, each with its own ROI copy and
- * deltaE reference blur. The full-image tail clamp and the Munsell pass follow.
+ * per active spot, local log encoding, local dehaze, local CBDL, vibrance,
+ * shadows/highlights, soft light, local contrast and Colour & Light, each with
+ * its own ROI copy and deltaE reference blur. The full-image tail clamp and
+ * the Munsell pass follow.
  * Every pass writes the device image;
  * the host Lab is read back only after all passes succeeded, so a refusal or
  * a failed launch leaves it untouched for the builtin.
@@ -8060,6 +8061,10 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
         compiled_kernel_entry(env, def, "rt_lab_tools_lc_blend", error);
     cl_kernel blend_kernel =
         compiled_kernel_entry(env, def, "rt_local_adjustments_blend", error);
+    cl_kernel log_kernel =
+        compiled_kernel_entry(env, def, "rt_local_adjustments_log", error);
+    cl_kernel log_blend_kernel = compiled_kernel_entry(
+        env, def, "rt_local_adjustments_blend_log", error);
     cl_kernel softlight_kernel =
         compiled_kernel_entry(env, def, "rt_local_adjustments_softlight",
                               error);
@@ -8121,6 +8126,7 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
         roi_kernel == nullptr || munsell_kernel == nullptr ||
         line_kernel == nullptr || vibrance_kernel == nullptr ||
         lc_blend_kernel == nullptr || blend_kernel == nullptr ||
+        log_kernel == nullptr || log_blend_kernel == nullptr ||
         softlight_kernel == nullptr ||
         dehaze_lab2rgb_kernel == nullptr ||
         dehaze_rowmax_kernel == nullptr ||
@@ -8275,6 +8281,7 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
 
     char ws_key = 0;
     char iws_key = 0;
+    char ws_double_key = 0;
     char cachef_key = 0;
     char cachefy_key = 0;
     char gamma_srgb_key = 0;
@@ -8283,6 +8290,7 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
     char munsell_sizes_key = 0;
     StageDeviceBufferPtr ws_device;
     StageDeviceBufferPtr iws_device;
+    StageDeviceBufferPtr ws_double_device;
     StageDeviceBufferPtr cachef_device;
     StageDeviceBufferPtr cachefy_device;
     StageDeviceBufferPtr gamma_srgb_device;
@@ -8302,6 +8310,7 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
     char cbdl_chroma_key = 0;
     char work_key = 0;
     char scratch_key = 0;
+    char log_orig_key = 0;
     char blur_keys[3] = {0, 0, 0};
     char lc_h_key = 0;
     char lc_v_key = 0;
@@ -8492,6 +8501,8 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
             rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXPCBDL] == 1.0f;
         const bool dehazePass =
             rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXPDENAZE] == 1.0f;
+        const bool logPass =
+            rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXPLOG] == 1.0f;
         const uint32_t shape =
             static_cast<uint32_t>(rec[RT_LOCAL_ADJUSTMENTS_SLOT_SHAPE]);
         const uint32_t avoid = static_cast<uint32_t>(
@@ -8513,6 +8524,7 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
             (rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXPCBDL] != 0.0f && !cbdl) ||
             (rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXPDENAZE] != 0.0f &&
              !dehazePass) ||
+            (rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXPLOG] != 0.0f && !logPass) ||
             (rec[RT_LOCAL_ADJUSTMENTS_SLOT_MERGE] != 0.0f) ||
             (rec[RT_LOCAL_ADJUSTMENTS_SLOT_HRENABLED] != 0.0f) ||
             (rec[RT_LOCAL_ADJUSTMENTS_SLOT_REPARCOL] != 100.0f) ||
@@ -8528,7 +8540,7 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
              rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXPCOLOR] != 1.0f) ||
             (!active && (colour || vibrance || localContrast ||
                          shadowsHighlights || softLight || cbdl ||
-                         dehazePass || islocal))) {
+                         dehazePass || logPass || islocal))) {
             error = "local.adjustments record is outside the supported set";
             return RT_STAGE_FALLBACK;
         }
@@ -8620,6 +8632,28 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
              rec[RT_LOCAL_ADJUSTMENTS_SLOT_SENSH] < 0.0f ||
              rec[RT_LOCAL_ADJUSTMENTS_SLOT_SENSH] > 100.0f)) {
             error = "local.adjustments dehaze setting is outside its range";
+            return RT_STAGE_FALLBACK;
+        }
+        if (logPass &&
+            (rec[RT_LOCAL_ADJUSTMENTS_SLOT_LOG_SENS] < 0.0f ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_LOG_SENS] > 100.0f ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_LOG_GRAY] <= 0.0f ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_LOG_GRAY] > 1.0f ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_LOG_DYNAMIC_RANGE] < 0.5f ||
+             (rec[RT_LOCAL_ADJUSTMENTS_SLOT_LOG_COMPRLOG] != 0.0f &&
+              rec[RT_LOCAL_ADJUSTMENTS_SLOT_LOG_COMPRLOG] != 1.0f) ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_LOG_COMPRFACTOR] < 0.0f ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_LOG_COMPRFACTOR] > 1.0f ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_LOG_COMPRTHLOG] < 1.0f ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_LOG_COMPRTHLOG] > 4.0f ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_LOG_LINBASE] < 2.0f ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_LOG_NOISE] <= 0.0f ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_LOG_LOG2] <= 0.0f ||
+             (rec[RT_LOCAL_ADJUSTMENTS_SLOT_LOG_SATCONTROL] != 0.0f &&
+              rec[RT_LOCAL_ADJUSTMENTS_SLOT_LOG_SATCONTROL] != 1.0f) ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_LOG_REPART] < 0.0f ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_LOG_REPART] > 1.0f)) {
+            error = "local.adjustments log setting is outside its range";
             return RT_STAGE_FALLBACK;
         }
         const float cbdlLumaLevelsValue =
@@ -8911,6 +8945,36 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
             }
             ws_device = upload_table(setup.ws, 9, &ws_key, "working matrix");
             iws_device = upload_table(setup.iws, 9, &iws_key, "inverse matrix");
+            if (setup.ws_double == nullptr) {
+                error = "local.adjustments needs the double working matrix";
+                return RT_STAGE_FALLBACK;
+            }
+            {
+                StageDeviceBufferPtr matrix = residency->acquire(
+                    &ws_double_key, StageBufferShape{RT_STAGE_F32, 18, 1, 1},
+                    &error);
+                if (!matrix) {
+                    error = "local.adjustments double working matrix "
+                            "allocation failed";
+                    return RT_STAGE_FALLBACK;
+                }
+                RtStageBuffer host{};
+                host.size = sizeof(RtStageBuffer);
+                host.data = const_cast<double*>(setup.ws_double);
+                host.width = 18;
+                host.height = 1;
+                host.row_pitch = 18u * sizeof(float);
+                host.plane_pitch = host.row_pitch;
+                host.planes = 1;
+                host.format = RT_STAGE_F32;
+                host.flags = RT_STAGE_BUFFER_READ;
+                if (residency->upload(matrix, host) != RT_STAGE_OK) {
+                    error = "local.adjustments double working matrix "
+                            "upload failed";
+                    return RT_STAGE_FALLBACK;
+                }
+                ws_double_device = matrix;
+            }
             cachef_device = upload_table(setup.cachef,
                                          RT_LAB_TOOLS_CACHE_ENTRIES,
                                          &cachef_key, "cachef");
@@ -8932,8 +8996,8 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
             munsell_sizes_device = upload_table(
                 setup.munsell_sizes, RT_LAB_TOOLS_MUNSELL_TABLES,
                 &munsell_sizes_key, "Munsell sizes");
-            if (!ws_device || !iws_device || !cachef_device ||
-                !cachefy_device || !gamma_srgb_device ||
+            if (!ws_device || !iws_device || !ws_double_device ||
+                !cachef_device || !cachefy_device || !gamma_srgb_device ||
                 !igamma_srgb_device || !munsell_device ||
                 !munsell_sizes_device) {
                 return RT_STAGE_FALLBACK;
@@ -9035,6 +9099,12 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
             StageDeviceBufferPtr scratch_device = residency->acquire(
                 &scratch_key, StageBufferShape{RT_STAGE_F32, bfw, bfh, 1},
                 &error);
+            StageDeviceBufferPtr log_orig_device;
+            if (logPass) {
+                log_orig_device = residency->acquire(
+                    &log_orig_key, StageBufferShape{RT_STAGE_F32, bfw, bfh, 3},
+                    &error);
+            }
             /*
              * shadows/highlights' mask/guide pair and guidedFilter()'s five
              * subsampled arrays. They exist only when the tool runs.
@@ -9223,7 +9293,7 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
                  (!dehaze_rescale || dehaze_rescale_device));
             if (!work_device || !scratch_device || !blur_device[0] ||
                 !blur_device[1] || !blur_device[2] || !cbdl_acquired ||
-                !dehaze_acquired ||
+                !dehaze_acquired || (logPass && !log_orig_device) ||
                 (shadowsHighlights &&
                  (!sh_full_device || !sh_i1_device || !sh_p1_device ||
                   !sh_meani_device || !sh_meanp_device ||
@@ -9246,6 +9316,14 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
             const int work_pitch = int_pitch(pitch_of(work_device), "ROI");
             const int work_plane =
                 int_pitch(plane_pitch_of(work_device), "ROI plane");
+            int log_orig_pitch = 0;
+            int log_orig_plane = 0;
+            if (logPass) {
+                log_orig_pitch = int_pitch(pitch_of(log_orig_device),
+                                           "log original");
+                log_orig_plane = int_pitch(plane_pitch_of(log_orig_device),
+                                           "log original plane");
+            }
             const int blur_pitch = int_pitch(pitch_of(blur_device[0]), "blur");
             const int scratch_pitch =
                 int_pitch(pitch_of(scratch_device), "scratch");
@@ -9349,7 +9427,8 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
                 }
             }
             if (work_pitch < 0 || work_plane < 0 || blur_pitch < 0 ||
-                scratch_pitch < 0) {
+                scratch_pitch < 0 || (logPass && (log_orig_pitch < 0 ||
+                                                  log_orig_plane < 0))) {
                 return RT_STAGE_FALLBACK;
             }
             cl_mem work_memory = memory_of(work_device);
@@ -9772,6 +9851,225 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
                                 static_cast<std::size_t>(bfh),
                                 "shadows/highlights blend");
             };
+
+            /*
+             * Local log encoding runs first, before dehaze, CBDL and the
+             * colour tools. The block copies the ROI Lab to RGB, keeps the
+             * encoded RGB for the `repar` recovery blend, runs log_encode()'s
+             * per-pixel arm, blends, then converts back. The deltaE reference
+             * is the default 3/sk blur. find_gray() and the apply scalars are
+             * host-built.
+             */
+            if (logPass) {
+                if (!copy_roi() ||
+                    !blur_roi(*setup.iir_vibrance, "log encoding blur")) {
+                    return RT_STAGE_FALLBACK;
+                }
+
+                /* ROI Lab -> RGB, in place. */
+                {
+                    cl_uint arg = 0;
+                    cl_mem iws_memory = memory_of(iws_device);
+                    bool ok = true;
+                    ok = ok && set(dehaze_lab2rgb_kernel, arg++,
+                                   sizeof(cl_mem), &work_memory);
+                    ok = ok && set(dehaze_lab2rgb_kernel, arg++,
+                                   sizeof(cl_mem), &work_memory);
+                    ok = ok && set(dehaze_lab2rgb_kernel, arg++,
+                                   sizeof(cl_int), &bfw);
+                    ok = ok && set(dehaze_lab2rgb_kernel, arg++,
+                                   sizeof(cl_int), &bfh);
+                    ok = ok && set(dehaze_lab2rgb_kernel, arg++,
+                                   sizeof(cl_int), &work_pitch);
+                    ok = ok && set(dehaze_lab2rgb_kernel, arg++,
+                                   sizeof(cl_int), &work_plane);
+                    ok = ok && set(dehaze_lab2rgb_kernel, arg++,
+                                   sizeof(cl_int), &work_pitch);
+                    ok = ok && set(dehaze_lab2rgb_kernel, arg++,
+                                   sizeof(cl_int), &work_plane);
+                    ok = ok && set(dehaze_lab2rgb_kernel, arg++,
+                                   sizeof(cl_mem), &iws_memory);
+                    if (!ok ||
+                        !launch2d(dehaze_lab2rgb_kernel,
+                                  static_cast<std::size_t>(bfw),
+                                  static_cast<std::size_t>(bfh),
+                                  "log Lab to RGB")) {
+                        error = "local.adjustments log Lab to RGB failed";
+                        return RT_STAGE_FALLBACK;
+                    }
+                }
+
+                /* The pre-encode RGB copy: roi_kernel is a three-plane copy. */
+                {
+                    cl_uint arg = 0;
+                    cl_mem src_memory = work_memory;
+                    cl_mem dst_memory = memory_of(log_orig_device);
+                    cl_int x0 = 0;
+                    cl_int y0 = 0;
+                    cl_int rw = bfw;
+                    cl_int rh = bfh;
+                    cl_int src_pitch = work_pitch;
+                    cl_int src_plane = work_plane;
+                    cl_int dst_pitch = log_orig_pitch;
+                    cl_int dst_plane = log_orig_plane;
+                    bool ok = true;
+                    ok = ok && set(roi_kernel, arg++, sizeof(cl_mem),
+                                   &src_memory);
+                    ok = ok && set(roi_kernel, arg++, sizeof(cl_mem),
+                                   &dst_memory);
+                    ok = ok && set(roi_kernel, arg++, sizeof(cl_int), &x0);
+                    ok = ok && set(roi_kernel, arg++, sizeof(cl_int), &y0);
+                    ok = ok && set(roi_kernel, arg++, sizeof(cl_int), &rw);
+                    ok = ok && set(roi_kernel, arg++, sizeof(cl_int), &rh);
+                    ok = ok && set(roi_kernel, arg++, sizeof(cl_int),
+                                   &src_pitch);
+                    ok = ok && set(roi_kernel, arg++, sizeof(cl_int),
+                                   &src_plane);
+                    ok = ok && set(roi_kernel, arg++, sizeof(cl_int),
+                                   &dst_pitch);
+                    ok = ok && set(roi_kernel, arg++, sizeof(cl_int),
+                                   &dst_plane);
+                    if (!ok ||
+                        !launch2d(roi_kernel, static_cast<std::size_t>(bfw),
+                                  static_cast<std::size_t>(bfh),
+                                  "log RGB copy")) {
+                        error = "local.adjustments log RGB copy failed";
+                        return RT_STAGE_FALLBACK;
+                    }
+                }
+
+                /* per-pixel encode and the repar recovery blend. */
+                {
+                    cl_uint arg = 0;
+                    cl_mem record_memory = memory_of(record_device);
+                    cl_mem ws_double_memory = memory_of(ws_double_device);
+                    cl_mem orig_memory = memory_of(log_orig_device);
+                    bool ok = true;
+                    ok = ok && set(log_kernel, arg++, sizeof(cl_mem),
+                                   &work_memory);
+                    ok = ok && set(log_kernel, arg++, sizeof(cl_mem),
+                                   &orig_memory);
+                    ok = ok && set(log_kernel, arg++, sizeof(cl_mem),
+                                   &record_memory);
+                    ok = ok && set(log_kernel, arg++, sizeof(cl_mem),
+                                   &ws_double_memory);
+                    ok = ok && set(log_kernel, arg++, sizeof(cl_int), &bfw);
+                    ok = ok && set(log_kernel, arg++, sizeof(cl_int), &bfh);
+                    ok = ok && set(log_kernel, arg++, sizeof(cl_int),
+                                   &work_pitch);
+                    ok = ok && set(log_kernel, arg++, sizeof(cl_int),
+                                   &work_plane);
+                    ok = ok && set(log_kernel, arg++, sizeof(cl_int),
+                                   &log_orig_pitch);
+                    ok = ok && set(log_kernel, arg++, sizeof(cl_int),
+                                   &log_orig_plane);
+                    if (!ok ||
+                        !launch2d(log_kernel, static_cast<std::size_t>(bfw),
+                                  static_cast<std::size_t>(bfh),
+                                  "log encode")) {
+                        error = "local.adjustments log encode failed";
+                        return RT_STAGE_FALLBACK;
+                    }
+                }
+
+                /* RGB -> Lab back into the ROI copy. */
+                {
+                    cl_uint arg = 0;
+                    cl_mem ws_memory = memory_of(ws_device);
+                    cl_mem cachef_memory = memory_of(cachef_device);
+                    cl_mem cachefy_memory = memory_of(cachefy_device);
+                    bool ok = true;
+                    ok = ok && set(dehaze_rgb2lab_kernel, arg++,
+                                   sizeof(cl_mem), &work_memory);
+                    ok = ok && set(dehaze_rgb2lab_kernel, arg++,
+                                   sizeof(cl_int), &work_pitch);
+                    ok = ok && set(dehaze_rgb2lab_kernel, arg++,
+                                   sizeof(cl_int), &work_plane);
+                    ok = ok && set(dehaze_rgb2lab_kernel, arg++,
+                                   sizeof(cl_mem), &work_memory);
+                    ok = ok && set(dehaze_rgb2lab_kernel, arg++,
+                                   sizeof(cl_int), &work_pitch);
+                    ok = ok && set(dehaze_rgb2lab_kernel, arg++,
+                                   sizeof(cl_int), &work_plane);
+                    ok = ok && set(dehaze_rgb2lab_kernel, arg++,
+                                   sizeof(cl_int), &bfw);
+                    ok = ok && set(dehaze_rgb2lab_kernel, arg++,
+                                   sizeof(cl_int), &bfh);
+                    ok = ok && set(dehaze_rgb2lab_kernel, arg++,
+                                   sizeof(cl_mem), &ws_memory);
+                    ok = ok && set(dehaze_rgb2lab_kernel, arg++,
+                                   sizeof(cl_mem), &cachef_memory);
+                    ok = ok && set(dehaze_rgb2lab_kernel, arg++,
+                                   sizeof(cl_mem), &cachefy_memory);
+                    if (!ok ||
+                        !launch2d(dehaze_rgb2lab_kernel,
+                                  static_cast<std::size_t>(bfw),
+                                  static_cast<std::size_t>(bfh),
+                                  "log RGB to Lab")) {
+                        error = "local.adjustments log RGB to Lab failed";
+                        return RT_STAGE_FALLBACK;
+                    }
+                }
+
+                /* transit_shapedetect2() senstype 11. */
+                {
+                    cl_uint arg = 0;
+                    cl_mem lab_memory = memory_of(image);
+                    cl_mem fin_memory = work_memory;
+                    cl_mem blur_l = memory_of(blur_device[0]);
+                    cl_mem blur_a = memory_of(blur_device[1]);
+                    cl_mem blur_b = memory_of(blur_device[2]);
+                    cl_mem record_memory = memory_of(record_device);
+                    cl_int lp = lab_pitch;
+                    cl_int lpl = lab_plane;
+                    cl_int fp = work_pitch;
+                    cl_int fpl = work_plane;
+                    cl_int rw = bfw;
+                    cl_int rh = bfh;
+                    cl_int x0 = xstart;
+                    cl_int y0 = ystart;
+                    cl_int bp = blur_pitch;
+                    bool ok = true;
+                    ok = ok && set(log_blend_kernel, arg++, sizeof(cl_mem),
+                                   &lab_memory);
+                    ok = ok && set(log_blend_kernel, arg++, sizeof(cl_mem),
+                                   &fin_memory);
+                    ok = ok && set(log_blend_kernel, arg++, sizeof(cl_mem),
+                                   &blur_l);
+                    ok = ok && set(log_blend_kernel, arg++, sizeof(cl_mem),
+                                   &blur_a);
+                    ok = ok && set(log_blend_kernel, arg++, sizeof(cl_mem),
+                                   &blur_b);
+                    ok = ok && set(log_blend_kernel, arg++, sizeof(cl_mem),
+                                   &record_memory);
+                    ok = ok && set(log_blend_kernel, arg++, sizeof(cl_int),
+                                   &lp);
+                    ok = ok && set(log_blend_kernel, arg++, sizeof(cl_int),
+                                   &lpl);
+                    ok = ok && set(log_blend_kernel, arg++, sizeof(cl_int),
+                                   &fp);
+                    ok = ok && set(log_blend_kernel, arg++, sizeof(cl_int),
+                                   &fpl);
+                    ok = ok && set(log_blend_kernel, arg++, sizeof(cl_int),
+                                   &rw);
+                    ok = ok && set(log_blend_kernel, arg++, sizeof(cl_int),
+                                   &rh);
+                    ok = ok && set(log_blend_kernel, arg++, sizeof(cl_int),
+                                   &x0);
+                    ok = ok && set(log_blend_kernel, arg++, sizeof(cl_int),
+                                   &y0);
+                    ok = ok && set(log_blend_kernel, arg++, sizeof(cl_int),
+                                   &bp);
+                    if (!ok ||
+                        !launch2d(log_blend_kernel,
+                                  static_cast<std::size_t>(bfw),
+                                  static_cast<std::size_t>(bfh),
+                                  "log blend")) {
+                        error = "local.adjustments log blend failed";
+                        return RT_STAGE_FALLBACK;
+                    }
+                }
+            }
 
             /*
              * Local dehaze. Lab_Local()'s order is tone map, dehaze, retinex,

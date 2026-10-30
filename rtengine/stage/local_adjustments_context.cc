@@ -32,6 +32,7 @@
 #include "mytime.h"
 #include "procparams.h"
 #include "settings.h"
+#include "sleef.h"
 #include "stage/lab_tools_context.h"
 #include "stage/stage_buffer.h"
 
@@ -42,6 +43,12 @@
 #include <cstring>
 #include <memory>
 
+namespace rtengine
+{
+/* iplocallab.cc's log-encoding scalar helper. */
+float find_gray(float source_gray, float target_gray);
+}
+
 namespace rtengine::stage
 {
 
@@ -51,6 +58,19 @@ namespace
 bool finiteValue(double value)
 {
     return std::isfinite(value);
+}
+
+/* iplocallab.cc's balancedeltaE(), which has internal linkage there. The
+ * values are the block's own and the function is a straight line. */
+float balancedeltaEValue(float kL)
+{
+    constexpr float mincurs = 0.05f;
+    constexpr float maxcurs = 2.5f;
+    constexpr float maxkab = 1.475f;
+    constexpr float minkab = 0.25f;
+    const float abal = (maxkab - minkab) / (mincurs - maxcurs);
+    const float bbal = maxkab - mincurs * abal;
+    return abal * kL + bbal;
 }
 
 /* The host's curve helpers treat an unrecognised or empty method as zero, so
@@ -108,7 +128,7 @@ bool explicitMaskIdle(const procparams::LocallabParams::LocallabSpot& spot)
            !spot.enacieMaskall;
 }
 
-/* Every tool other than the seven this node runs, plus the retinex tool. The
+/* Every tool other than the eight this node runs, plus the retinex tool. The
  * exposure tool also decides the clamp arm; it is a residual here. Local
  * dehaze is not a tool of its own: Lab_Local() gates it on the retinex
  * enable, so expreti is accepted only when the retinex strength is zero
@@ -117,8 +137,59 @@ bool otherToolEnabled(const procparams::LocallabParams::LocallabSpot& spot)
 {
     return spot.expexpose || spot.expblur ||
            spot.exptonemap || spot.expsharp ||
-           spot.explog || spot.expmask || spot.expcie ||
+           spot.expmask || spot.expcie ||
            spot.expprecam;
+}
+
+/* Whether the local log-encoding tool's parameters are inside the device set.
+ *
+ * Lab_Local()'s guard is `lp.logena` with no previous-deltaE arm; logena
+ * requires the tool on, the spot active and no explicit tool mask. The block
+ * copies the ROI to RGB, calls log_encode(), blends with `repar` and converts
+ * back. The device runs log_encode()'s per-pixel arm (`detail == 0`): the
+ * guided-filter local-contrast arm is a residual, as is the gradient
+ * (`strlog`). CIE CAM after the encode (`ciecam` or `expcie`) and the
+ * automatic black/white estimator (`autocompute`) are residuals too.
+ *
+ * The slider ranges are the GUI's. `repar` is the log tool's own recovery
+ * weight, not the Colour & Light `reparcol`. The senstype-11 sensitivity is
+ * the block's `sensilog`. */
+bool logAdmitted(const procparams::LocallabParams::LocallabSpot& spot)
+{
+    if (spot.expcie || spot.ciecam || spot.autocompute) {
+        return false;
+    }
+    if (spot.detail != 0.0) {
+        return false;
+    }
+    if (spot.strlog != 0.0) {
+        return false;
+    }
+    if (!finiteValue(spot.sourceGray) || spot.sourceGray < 1.0 ||
+        spot.sourceGray > 100.0) {
+        return false;
+    }
+    if (!finiteValue(spot.targetGray) || spot.targetGray < 4.0 ||
+        spot.targetGray > 80.0) {
+        return false;
+    }
+    if (!finiteValue(spot.blackEv) || spot.blackEv < -16.0 ||
+        spot.blackEv > 0.0) {
+        return false;
+    }
+    if (!finiteValue(spot.whiteEv) || spot.whiteEv < 0.0 ||
+        spot.whiteEv > 32.0) {
+        return false;
+    }
+    if (!finiteValue(spot.comprlog) || spot.comprlog < 0.0 ||
+        spot.comprlog > 1.0) {
+        return false;
+    }
+    if (!finiteValue(spot.repar) || spot.repar < 1.0 ||
+        spot.repar > 100.0) {
+        return false;
+    }
+    return spot.sensilog >= 0 && spot.sensilog <= 100;
 }
 
 /* Whether the local CBDL tool's parameters are inside the device set.
@@ -408,12 +479,13 @@ bool localAdjustmentsSupported(const procparams::ProcParams& params)
 {
     /*
      * The block is atomic: every spot must be in the set below. An inactive
-     * spot is the clamp-only case; an active spot runs CBDL, Colour & Light,
-     * vibrance, shadows/highlights (Lab-mode std), soft light (per-pixel
-     * soft), local contrast or any combination, with optional L/C/H curves on
-     * the colour tool and MUNS. Curves, Munsell, rectangular spots, inactive
-     * spots and multiple spots are supported; every other tool and the masks,
-     * merge, soft radius, gradients and LAB/XYZ gamut methods are residuals.
+     * spot is the clamp-only case; an active spot runs log encoding, dehaze,
+     * CBDL, Colour & Light, vibrance, shadows/highlights (Lab-mode std), soft
+     * light (per-pixel soft), local contrast or any combination, with optional
+     * L/C/H curves on the colour tool and MUNS. Curves, Munsell, rectangular
+     * spots, inactive spots and multiple spots are supported; every other tool
+     * and the masks, merge, soft radius, gradients and LAB/XYZ gamut methods
+     * are residuals.
      */
     if (!params.locallab.enabled || params.locallab.spots.empty() ||
         params.locallab.spots.size() > RT_LOCAL_ADJUSTMENTS_MAX_SPOTS) {
@@ -512,7 +584,7 @@ bool localAdjustmentsSupported(const procparams::ProcParams& params)
             spot.transitgrad < -10.0 || spot.transitgrad > 10.0) {
             return false;
         }
-        /* An active spot runs at least one of the seven tools in the device
+        /* An active spot runs at least one of the eight tools in the device
          * set, plus the local dehaze pass when the retinex enable exposes it;
          * an inactive spot does no work, so its tool settings are inert and
          * admitted. */
@@ -520,7 +592,7 @@ bool localAdjustmentsSupported(const procparams::ProcParams& params)
             const bool dehaze = spot.expreti && spot.dehaz != 0;
             if ((!spot.expcolor && !spot.expvibrance && !spot.expcontrast &&
                  !spot.expshadhigh && !spot.expsoft && !spot.expcbdl &&
-                 !dehaze) ||
+                 !spot.explog && !dehaze) ||
                 otherToolEnabled(spot)) {
                 return false;
             }
@@ -537,6 +609,9 @@ bool localAdjustmentsSupported(const procparams::ProcParams& params)
                     return false;
                 }
             } else if (spot.dehaz != 0) {
+                return false;
+            }
+            if (spot.explog && !logAdmitted(spot)) {
                 return false;
             }
             if (spot.expcbdl && !cbdlAdmitted(spot)) {
@@ -1473,6 +1548,63 @@ int LocalAdjustmentsContext::build(int spot, const RtStageBuffer* lab,
                               lp.softmet == 0 && lp.strng > 1.f;
 
     /*
+     * Local log encoding. Lab_Local()'s block runs when logena is set, which
+     * needs the tool on, the spot active and no explicit tool mask; the
+     * predicate has already narrowed detail, ciecam and autocompute. The
+     * apply lambda's scalars are host-built exactly as log_encode() builds
+     * them, including find_gray()'s bisection. `repar` is the tool's own
+     * recovery weight.
+     */
+    const bool logRun = profileSpot.explog && lp.activspot;
+    const float logGray =
+        0.01f * static_cast<float>(profileSpot.sourceGray);
+    const float logShadowsRange = static_cast<float>(profileSpot.blackEv);
+    const float logDynamicRange = std::max(
+        static_cast<float>(profileSpot.whiteEv) - logShadowsRange, 0.5f);
+    const float logTargetGray =
+        static_cast<float>(profileSpot.targetGray);
+    const float logComprFactor = static_cast<float>(profileSpot.comprlog);
+    const bool logCompr = logComprFactor > 0.f;
+    /* log_encode() declares comprlog as bool, so its `comprlog < 0.6f`
+     * test is true only when the tool is off; the active branch therefore
+     * always selects 1.f, not the 0.6f split on comprfactorlog. */
+    const float logComprThreshold = logCompr ? 1.f : 4.f;
+    const float logBase =
+        logTargetGray > 1.f && logTargetGray < 100.f &&
+                logDynamicRange > 0.f
+            ? find_gray(std::fabs(logShadowsRange) / logDynamicRange,
+                        0.01f * logTargetGray)
+            : 0.f;
+    const float logLinBase = std::max(logBase, 2.f);
+    const float logNoise = xexpf(-16.f * xlogf(2.f));
+    const float logLog2 = xlogf(2.f);
+    const float logRepart =
+        1.f - 0.01f * static_cast<float>(profileSpot.repar);
+    const float logKabPre =
+        balancedeltaEValue(lp.balance) / (327.68f * 327.68f);
+    const float logSens = static_cast<float>(profileSpot.sensilog);
+
+    /*
+     * transit_shapedetect2()'s senstype-11 arm mutates the spot's threshold,
+     * iteration count and balance before it builds the deltaE ranges. The
+     * mutation is on the shared local_params, so every later tool in the same
+     * spot sees the adjusted values. Reproduce it in the record.
+     */
+    float effectiveThr = lp.thr;
+    float effectiveIterat = lp.iterat;
+    float effectiveBalance = lp.balance;
+    if (logRun) {
+        if (logSens < 50.f) {
+            effectiveThr *= 1.2f;
+            effectiveIterat *= 1.2f;
+        } else {
+            effectiveThr = std::max(0.f, std::min(lp.thr + 10.f, 15.f));
+            effectiveBalance =
+                std::max(0.05f, std::min(lp.balance - 2.3f, 2.5f));
+        }
+    }
+
+    /*
      * Local dehaze. Lab_Local()'s guard is `(lp.dehaze != 0 || lp.prevdE) &&
      * lp.retiena`; the export call site passes no previous-deltaE flag and the
      * predicate has already narrowed the retinex enable, the mask state and
@@ -1633,9 +1765,9 @@ int LocalAdjustmentsContext::build(int spot, const RtStageBuffer* lab,
     record[RT_LOCAL_ADJUSTMENTS_SLOT_LIGH] = lp.ligh;
     record[RT_LOCAL_ADJUSTMENTS_SLOT_STRUCO] = lp.struco;
     record[RT_LOCAL_ADJUSTMENTS_SLOT_SENS] = static_cast<float>(lp.sens);
-    record[RT_LOCAL_ADJUSTMENTS_SLOT_THR] = lp.thr;
-    record[RT_LOCAL_ADJUSTMENTS_SLOT_ITERAT] = lp.iterat;
-    record[RT_LOCAL_ADJUSTMENTS_SLOT_BALANCE] = lp.balance;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_THR] = effectiveThr;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_ITERAT] = effectiveIterat;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_BALANCE] = effectiveBalance;
     record[RT_LOCAL_ADJUSTMENTS_SLOT_BALANCEH] = lp.balanceh;
     record[RT_LOCAL_ADJUSTMENTS_SLOT_BLURCOL] = lp.blurcol;
     record[RT_LOCAL_ADJUSTMENTS_SLOT_HUEREF] =
@@ -1766,6 +1898,25 @@ int LocalAdjustmentsContext::build(int spot, const RtStageBuffer* lab,
         cbdlLumaRun ? static_cast<float>(cbdlLumaLevels) : 0.f;
     record[RT_LOCAL_ADJUSTMENTS_SLOT_CBDL_CHROMA_LEVELS] =
         cbdlChromaTable ? static_cast<float>(cbdlChromaLevels) : 0.f;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_EXPLOG] = logRun ? 1.f : 0.f;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_LOG_SENS] = logSens;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_LOG_GRAY] = logGray;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_LOG_SHADOWS_RANGE] =
+        logShadowsRange;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_LOG_DYNAMIC_RANGE] =
+        logDynamicRange;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_LOG_COMPRLOG] =
+        logCompr ? 1.f : 0.f;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_LOG_COMPRFACTOR] = logComprFactor;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_LOG_COMPRTHLOG] =
+        logComprThreshold;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_LOG_LINBASE] = logLinBase;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_LOG_NOISE] = logNoise;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_LOG_LOG2] = logLog2;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_LOG_SATCONTROL] =
+        profileSpot.satlog ? 1.f : 0.f;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_LOG_REPART] = logRepart;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_LOG_KAB_PRE] = logKabPre;
 
     const auto setTable = [record](int offsetSlot, int activeSlot,
                                    bool active, float offset) {

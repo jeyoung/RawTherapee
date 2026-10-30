@@ -123,6 +123,20 @@ inline constexpr const char* RT_LOCAL_ADJUSTMENTS_CL = R"CLC(
 #define RT_LA_DEHAZE_STRENGTH 116
 #define RT_LA_DEHAZE_DEPTH 117
 #define RT_LA_DEHAZE_SATURATION 118
+#define RT_LA_EXPLOG 119
+#define RT_LA_LOG_SENS 120
+#define RT_LA_LOG_GRAY 121
+#define RT_LA_LOG_SHADOWS_RANGE 122
+#define RT_LA_LOG_DYNAMIC_RANGE 123
+#define RT_LA_LOG_COMPRLOG 124
+#define RT_LA_LOG_COMPRFACTOR 125
+#define RT_LA_LOG_COMPRTHLOG 126
+#define RT_LA_LOG_LINBASE 127
+#define RT_LA_LOG_NOISE 128
+#define RT_LA_LOG_LOG2 129
+#define RT_LA_LOG_SATCONTROL 130
+#define RT_LA_LOG_REPART 131
+#define RT_LA_LOG_KAB_PRE 132
 
 /*
  * The number of trailing columns the host takes through its scalar path.
@@ -769,6 +783,105 @@ __kernel void rt_local_adjustments_blend(__global float* lab,
 }
 
 /*
+ * transit_shapedetect2()'s senstype-11 arm for the log tool. The sensitivity
+ * is lp.sensilog. Below 50 the host raises the threshold and iteration count
+ * by a fifth and divides the lightness balance by 1.2; at 50 and above it adds
+ * 10 to the threshold, subtracts 2.3 from the balance and replaces the
+ * reduction with a sensitivity ramp, clamped to 0.1..1. The record carries the
+ * adjusted threshold, iteration count and balance (the host mutation persists
+ * for later tools) and the pre-adjustment balancedeltaE() for kab.
+ */
+__kernel void rt_local_adjustments_blend_log(
+    __global float* lab, __global const float* fin,
+    __global const float* blurL, __global const float* blurA,
+    __global const float* blurB, __global const float* rec,
+    const int lab_pitch, const int lab_plane, const int fin_pitch,
+    const int fin_plane, const int bfw, const int bfh, const int xstart,
+    const int ystart, const int blur_pitch)
+{
+    const int rx = (int)get_global_id(0);
+    const int ry = (int)get_global_id(1);
+    if (rx >= bfw || ry >= bfh) {
+        return;
+    }
+
+    const int x = rx + xstart;
+    const int y = ry + ystart;
+    int zone = 0;
+    float localFactor = 1.0f;
+    rt_la_transition((float)x, (float)y, rec[RT_LA_TRANS] / 100.0f, rec,
+                     &zone, &localFactor);
+    if (zone == 0) {
+        return;
+    }
+
+    const int bo = ry * blur_pitch + rx;
+    const float ml = blurL[bo];
+    const float ma = blurA[bo];
+    const float mb = blurB[bo];
+    const float varsens = rec[RT_LA_LOG_SENS];
+    const float thr = rec[RT_LA_THR];
+
+    const float refa = rec[RT_LA_CHROMAREF] * cos(rec[RT_LA_HUEREF]) * 327.68f;
+    const float refb = rec[RT_LA_CHROMAREF] * sin(rec[RT_LA_HUEREF]) * 327.68f;
+    const float refL = rec[RT_LA_LUMAREF] * 327.68f;
+
+    const float abdelta2 = (refa - ma) * (refa - ma) +
+                           (refb - mb) * (refb - mb);
+    const float chroma = sqrt(ma * ma + mb * mb);
+    const float chromadelta = chroma - rec[RT_LA_CHROMAREF] * 327.68f;
+    const float chrodelta2 = chromadelta * chromadelta;
+    const float huedelta2 = abdelta2 - chrodelta2;
+
+    /* kL is the adjusted balance; kab is the pre-adjustment value. */
+    const float scale = 327.68f * 327.68f;
+    float kL = rec[RT_LA_BALANCE] / scale;
+    if (varsens < 50.0f) {
+        kL /= 1.2f;
+    }
+    const float kab = rec[RT_LA_LOG_KAB_PRE];
+    const float kH = rec[RT_LA_BALANCEH];
+    const float kch = rt_la_balancedeltaE(kH);
+    const float dE = sqrt(kab * (kch * chrodelta2 + kH * huedelta2) +
+                          kL * (refL - ml) * (refL - ml));
+
+    const float mindE = 2.0f + RT_LA_MINSCOPE * varsens * thr;
+    const float maxdE = 5.0f + RT_LA_MAXSCOPE * varsens * (1.0f + 0.1f * thr);
+    const float mindElim =
+        2.0f + RT_LA_MINSCOPE * (float)RT_LA_LIMSCOPE * thr;
+    const float maxdElim =
+        5.0f + RT_LA_MAXSCOPE * (float)RT_LA_LIMSCOPE * (1.0f + 0.1f * thr);
+    float reducdE = rt_la_calcreducdE(
+        dE, maxdE, mindE, maxdElim, mindElim, rec[RT_LA_ITERAT],
+        RT_LA_LIMSCOPE, (int)varsens);
+    if (varsens >= 50.0f) {
+        const float maxvarsens = 90.0f;
+        const float ared = (1.0f - reducdE) / (maxvarsens - 50.0f);
+        const float bred = 1.0f - ared * maxvarsens;
+        reducdE = ared * varsens + bred;
+        reducdE = fmin(fmax(reducdE, 0.1f), 1.0f);
+    }
+    if (varsens == 100.0f) {
+        reducdE = 1.0f;
+    }
+    const int offset = y * lab_pitch + x;
+    const int fo = ry * fin_pitch + rx;
+    const float origL = lab[offset];
+    const float origA = lab[lab_plane + offset];
+    const float origB = lab[2 * lab_plane + offset];
+    const float realstrdE =
+        reducdE * (fin[fo] - origL);
+    const float realstradE =
+        reducdE * (fin[fin_plane + fo] - origA);
+    const float realstrbdE =
+        reducdE * (fin[2 * fin_plane + fo] - origB);
+
+    lab[offset] = origL + localFactor * realstrdE;
+    lab[lab_plane + offset] = rt_la_clipC(origA + localFactor * realstradE);
+    lab[2 * lab_plane + offset] = rt_la_clipC(origB + localFactor * realstrbdE);
+}
+
+/*
  * Local CBDL. cbdl_local_temp() is the lab.wavelet node's directional
  * pyramid: dirpyr_channel() and idirpyr_eq_channel_loc() are the
  * rt_lab_wavelet_decompose/rt_lab_wavelet_equalize kernels with the block's
@@ -1297,6 +1410,164 @@ __kernel void rt_local_adjustments_softlight(
     work[offset] = out_l;
     work[work_plane + offset] = out_a;
     work[2 * work_plane + offset] = out_b;
+}
+
+/*
+ * Local log encoding. ImProcFunctions::log_encode()'s per-pixel arm:
+ *
+ *   norm2(r, g, b) -> the apply lambda -> the per-channel scale and its
+ *   saturation control -> the tool's `repar` recovery blend.
+ *
+ * The apply scalars are host-built (gray, shadows_range, dynamic_range,
+ * comprthlog, linbase, noise, log2), and find_gray() stays on the host. The
+ * block's guided-filter local-contrast arm (detail != 0) and its gradient are
+ * residuals, so this kernel is per pixel. The sRGB RGB copy before the encode
+ * is `orig`; `rgb` holds the encoded result and receives the intp() recovery
+ * blend.
+ */
+
+/* std::numeric_limits<float>::max() / 100.f, as norm2() uses. */
+#define RT_LA_LOG_FLOAT_MAX 3.4028234663852886e+38f
+
+/* iplocallab.cc power_norm(). */
+inline float rt_la_log_power_norm(const float r, const float g,
+                                  const float b)
+{
+    const float ar = fabs(r);
+    const float ag = fabs(g);
+    const float ab = fabs(b);
+    const float r2 = ar * ar;
+    const float g2 = ag * ag;
+    const float b2 = ab * ab;
+    const float d = r2 + g2 + b2;
+    const float n = ar * r2 + ag * g2 + ab * b2;
+    return n / fmax(d, 1e-12f);
+}
+
+/* Color::rgbLuminance(r, g, b, TMatrix), which accumulates in double. */
+inline float rt_la_log_luminance(const float r, const float g,
+                                 const float b,
+                                 __global const double* ws_double)
+{
+    const double luminance = (double)r * ws_double[3] +
+                             (double)g * ws_double[4] +
+                             (double)b * ws_double[5];
+    return (float)luminance;
+}
+
+/* iplocallab.cc norm2(). */
+inline float rt_la_log_norm2(const float r, const float g, const float b,
+                             __global const double* ws_double)
+{
+    return fmin(RT_LA_LOG_FLOAT_MAX,
+                rt_la_log_power_norm(r, g, b) / 2.0f +
+                    rt_la_log_luminance(r, g, b, ws_double) / 2.0f);
+}
+
+/* sleef.h xlog2lin(). */
+inline float rt_la_log_xlog2lin(const float x, const float base)
+{
+    return (rt_lr_pow_F(base, x) - 1.0f) / (base - 1.0f);
+}
+
+/* log_encode()'s apply lambda. */
+inline float rt_la_log_apply(const float value, __global const float* rec)
+{
+    const float noise = rec[RT_LA_LOG_NOISE];
+    float x = value / 65535.0f;
+    x = fmax(x, noise);
+    x = fmax(x / rec[RT_LA_LOG_GRAY], noise);
+    const float comprthlog = rec[RT_LA_LOG_COMPRTHLOG];
+    if (rec[RT_LA_LOG_COMPRLOG] != 0.0f && x >= comprthlog) {
+        x = rt_lt_intp(rec[RT_LA_LOG_COMPRFACTOR],
+                       (tanh((x - comprthlog) / comprthlog) + 1.0f) *
+                           comprthlog,
+                       x);
+    }
+    x = fmax((rt_lr_xlogf(x) / rec[RT_LA_LOG_LOG2] -
+              rec[RT_LA_LOG_SHADOWS_RANGE]) /
+                 rec[RT_LA_LOG_DYNAMIC_RANGE],
+             noise);
+    if (rec[RT_LA_LOG_LINBASE] > 0.0f) {
+        x = rt_la_log_xlog2lin(x, rec[RT_LA_LOG_LINBASE]);
+    }
+    return x * 65535.0f;
+}
+
+/* log_encode()'s sf() and apply_sat(). */
+inline float rt_la_log_sf(const float s, const float c, const float noise)
+{
+    if (c > noise) {
+        return 1.0f - fmin(fabs(s) / c, 1.0f);
+    }
+    return 0.0f;
+}
+
+inline void rt_la_log_apply_sat(float* r, float* g, float* b, const float f,
+                                __global const float* rec,
+                                __global const double* ws_double)
+{
+    const float noise = rec[RT_LA_LOG_NOISE];
+    const float ll = rt_la_log_luminance(*r, *g, *b, ws_double);
+    const float rl = *r - ll;
+    const float gl = *g - ll;
+    const float bl = *b - ll;
+    const float s = rt_lt_intp(
+        fmax(fmax(rt_la_log_sf(rl, *r, noise),
+                  rt_la_log_sf(gl, *g, noise)),
+             rt_la_log_sf(bl, *b, noise)),
+        rt_lr_pow_F(f, 0.3f) * 0.6f + 0.4f, 1.0f);
+    *r = ll + s * rl;
+    *g = ll + s * gl;
+    *b = ll + s * bl;
+}
+
+__kernel void rt_local_adjustments_log(
+    __global float* rgb, __global const float* orig,
+    __global const float* rec, __global const double* ws_double,
+    const int bfw, const int bfh, const int rgb_pitch,
+    const int rgb_plane, const int orig_pitch, const int orig_plane)
+{
+    const int x = (int)get_global_id(0);
+    const int y = (int)get_global_id(1);
+    if (x >= bfw || y >= bfh) {
+        return;
+    }
+
+    const int offset = y * rgb_pitch + x;
+    const int original = y * orig_pitch + x;
+    const float noise = rec[RT_LA_LOG_NOISE];
+
+    float r = rgb[offset];
+    float g = rgb[rgb_plane + offset];
+    float b = rgb[2 * rgb_plane + offset];
+    const float m = rt_la_log_norm2(r, g, b, ws_double);
+
+    if (m > noise) {
+        const float mm = rt_la_log_apply(m, rec);
+        float f = mm / m;
+        f = fmin(f, 1000000.0f);
+
+        r *= f;
+        b *= f;
+        g *= f;
+
+        if (rec[RT_LA_LOG_SATCONTROL] != 0.0f && f < 1.0f) {
+            rt_la_log_apply_sat(&r, &g, &b, f, rec, ws_double);
+        }
+
+        r = fmax(0.0f, fmin(r, 65535.0f));
+        g = fmax(0.0f, fmin(g, 65535.0f));
+        b = fmax(0.0f, fmin(b, 65535.0f));
+    }
+
+    /* intp(repart, tmpImageorig, tmpImage): the tool's recovery blend. */
+    const float repart = rec[RT_LA_LOG_REPART];
+    rgb[offset] = rt_lt_intp(repart, orig[original], r);
+    rgb[rgb_plane + offset] =
+        rt_lt_intp(repart, orig[orig_plane + original], g);
+    rgb[2 * rgb_plane + offset] =
+        rt_lt_intp(repart, orig[2 * orig_plane + original], b);
 }
 
 /*

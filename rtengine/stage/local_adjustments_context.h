@@ -42,15 +42,16 @@ struct ProcParams;
  * Host context of the local.adjustments node.
  *
  * The node covers a spot set of ImProcFunctions::Lab_Local(): an elliptical or
- * rectangular spot, the local dehaze tool, the local CBDL tool, the Colour &
- * Light chroma/lightness/contrast sliders and L/C/H curves, the vibrance tool,
- * the shadows/highlights tool, the soft-light tool, the Gaussian
- * local-contrast tool, the deltaE scope, the avoid-colour-shift Munsell method
- * and the unconditional per-spot Lab-to-RGB clamp. The block also applies the
- * final Munsell pass and the clamp for an inactive spot, so a block whose
- * spots do no tool work is still a clamp-only block.
+ * rectangular spot, the local log-encoding tool, the local dehaze tool, the
+ * local CBDL tool, the Colour & Light chroma/lightness/contrast sliders and
+ * L/C/H curves, the vibrance tool, the shadows/highlights tool, the soft-light
+ * tool, the Gaussian local-contrast tool, the deltaE scope, the
+ * avoid-colour-shift Munsell method and the unconditional per-spot Lab-to-RGB
+ * clamp. The block also applies the final Munsell pass and the clamp for an
+ * inactive spot, so a block whose spots do no tool work is still a clamp-only
+ * block.
  *
- * The tools run in Lab_Local()'s order: dehaze, CBDL, vibrance,
+ * The tools run in Lab_Local()'s order: log encoding, dehaze, CBDL, vibrance,
  * shadows/highlights, soft light, local contrast, then Colour & Light. The
  * context is C-compatible because the ABI is. `self` points at the C++ object
  * that owns the ProcParams, ImProcFunctions and LabImage references, so the
@@ -61,14 +62,14 @@ struct ProcParams;
  * small, known subset reaches the supported paths. Slots are named by the
  * RT_LOCAL_ADJUSTMENTS_SLOT_* constants and are written once per spot.
  */
-#define RT_LOCAL_ADJUSTMENTS_CONTEXT_VERSION 6u
+#define RT_LOCAL_ADJUSTMENTS_CONTEXT_VERSION 7u
 /* "LAJC": rejects a stale or unrelated pointer before any callback runs. */
 #define RT_LOCAL_ADJUSTMENTS_CONTEXT_MAGIC 0x4C414A43u
 /* The block has no bounded spot count, but a profile that carries more spots
  * than this is outside the device set and runs the host block. */
 #define RT_LOCAL_ADJUSTMENTS_MAX_SPOTS 64u
 /* Floats per spot record; the slot constants below must stay inside it. */
-#define RT_LOCAL_ADJUSTMENTS_SPOT_STRIDE 119u
+#define RT_LOCAL_ADJUSTMENTS_SPOT_STRIDE 133u
 /* A curve table is one LUTf of the block's own size. */
 #define RT_LOCAL_ADJUSTMENTS_LUT_ENTRIES 65536u
 /* Color::gammatab_srgb and Color::igammatab_srgb, the sRGB gamma pair the
@@ -295,6 +296,31 @@ struct ProcParams;
 #define RT_LOCAL_ADJUSTMENTS_SLOT_DEHAZE_STRENGTH 116u
 #define RT_LOCAL_ADJUSTMENTS_SLOT_DEHAZE_DEPTH 117u
 #define RT_LOCAL_ADJUSTMENTS_SLOT_DEHAZE_SATURATION 118u
+/* Local log encoding. EXP_LOG is 1 when Lab_Local()'s log block runs: the tool
+ * on, the spot active, no explicit log mask, no CIE CAM and detail zero. The
+ * block copies the ROI to RGB, calls log_encode(), applies the tool's own
+ * recovery weight (`repar`) and converts back. The apply lambda's scalars are
+ * host-built: `gray`, `shadows_range`, `dynamic_range`, `comprthlog` from
+ * `comprlog`, and `linbase` from find_gray(). `LOG_SENS` is the senstype-11
+ * sensitivity (lp.sensilog); `LOG_REPART` is 1 - 0.01 * repar; `LOG_KAB_PRE`
+ * is balancedeltaE(balance) / 327.68^2 evaluated before the senstype-11
+ * threshold/balance adjustment. The adjusted `thr`, `iterat` and `balance`
+ * are written into the shared slots so later tools see the block's mutation.
+ * detail, the log gradient and autocompute are residuals. */
+#define RT_LOCAL_ADJUSTMENTS_SLOT_EXPLOG 119u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_LOG_SENS 120u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_LOG_GRAY 121u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_LOG_SHADOWS_RANGE 122u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_LOG_DYNAMIC_RANGE 123u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_LOG_COMPRLOG 124u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_LOG_COMPRFACTOR 125u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_LOG_COMPRTHLOG 126u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_LOG_LINBASE 127u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_LOG_NOISE 128u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_LOG_LOG2 129u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_LOG_SATCONTROL 130u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_LOG_REPART 131u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_LOG_KAB_PRE 132u
 
 typedef struct RtLocalAdjustmentsResult {
     /* spot_count RT_LOCAL_ADJUSTMENTS_SPOT_STRIDE floats, spot-major. */
@@ -310,9 +336,9 @@ typedef struct RtLocalAdjustmentsResult {
     const float* ws;
     const float* iws;
     /* The same working RGB -> XYZ matrix in double, nine values. The dehaze
-     * recovery calls Color::rgbLuminance(r, g, b, ws) with the block's TMatrix,
-     * which accumulates in double: the device needs the double values for the
-     * ambient luminance. */
+     * recovery and the log encode call Color::rgbLuminance(r, g, b, ws) with
+     * the block's TMatrix, which accumulates in double: the device needs the
+     * double values for the ambient luminance and log's norm2/saturation. */
     const double* ws_double;
     /* Color::cachef[] and cachefy[], the 65536-sample Lab caches the RGB to
      * Lab half of the clamp reads. */
