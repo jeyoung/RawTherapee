@@ -33,6 +33,7 @@
 #include "cplx_wavelet_dec.h"
 #include "color.h"
 #include "curves.h"
+#include "denoise_tile_buffers.h"
 #include "iccmatrices.h"
 #include "iccstore.h"
 #include "imagefloat.h"
@@ -64,12 +65,6 @@
 
 namespace rtengine
 {
-
-// Number of tile rows whose contributions are buffered before the
-// deterministic overlap merge. Two rows keep twice as many tiles in flight as
-// one row, which restores load balance for a tile row narrower than the thread
-// count, while bounding the extra memory to two tile rows.
-constexpr int TILE_MERGE_BAND_ROWS = 2;
 
 // %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 // %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -807,10 +802,14 @@ BENCHFUN
             std::vector<Imagefloat*> tile_contributions;
 
             if (numtiles > 1) {
-                const int band_buffers = TILE_MERGE_BAND_ROWS * tile_cols;
+                const std::size_t band_buffers = denoiseTileBufferCount(tile_rows, tile_cols);
                 tile_contributions.reserve(band_buffers);
+                if (settings->verbose) {
+                    printf("RGB_denoise merge buffers: rows=%d cols=%d buffers=%zu tile=%dx%d\n",
+                           tile_rows, tile_cols, band_buffers, tilewidth, tileheight);
+                }
 
-                for (int t = 0; t < band_buffers; ++t) {
+                for (std::size_t t = 0; t < band_buffers; ++t) {
                     tile_contributions.push_back(new Imagefloat(tilewidth, tileheight));
                 }
             }

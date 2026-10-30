@@ -383,6 +383,12 @@ target_link_libraries(stage-indexer-test PRIVATE rtengine)
 target_include_directories(stage-indexer-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/stage")
 rt_setup_target(stage-indexer-test)
 
+add_executable(denoise-tile-buffers-test EXCLUDE_FROM_ALL
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/denoise_tile_buffers_test.cc"
+)
+target_include_directories(denoise-tile-buffers-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+rt_setup_target(denoise-tile-buffers-test)
+
 # Stable parameter fingerprint used by per-stage cache keys.
 add_executable(stage-param-hash-test EXCLUDE_FROM_ALL
     "${CMAKE_CURRENT_SOURCE_DIR}/stage/tests/stage_param_hash_test.cc"
