@@ -56,6 +56,9 @@ pairs are exact. The gate is the peak absolute error (PAE) in normalised units;
 | 2026-10-30 | uncommitted | POCL (CPU) | colorspace_flowers.pef / `localadjustments-dehaze.pp3`, `local.adjustments` | off vs auto, 16-bit TIFF | 1 LSB | PASS |
 | 2026-10-30 | uncommitted | POCL (CPU) | 17-case dehaze matrix (alone, negative, colour, CBDL, vibrance, SH, soft light, local contrast, all tools, MUNS, multispot, inactive, ELI/RECT, 179x49, 238x64, 8192x64, 1024x1793 rescale), `stage-residency-test` | device vs host block | 0.053 LSB (worst) | PASS |
 | 2026-10-30 | uncommitted | POCL (CPU) | 10-case dehaze residual matrix, `stage-residency-test` | device vs host block | 0 (host) | PASS |
+| 2026-10-30 | uncommitted | POCL (CPU) | colorspace_flowers.pef / `localadjustments-log.pp3`, `local.adjustments` | off vs auto, 16-bit TIFF | 1 LSB | PASS |
+| 2026-10-30 | uncommitted | POCL (CPU) | 21-case log matrix (alone, no compression, both senstype-11 arms, colour, dehaze, CBDL, vibrance, SH, soft light, local contrast, all tools, MUNS, multispot, inactive, ELI/RECT, 179x49, 238x64, 8192x64), `stage-residency-test` | device vs host block | 0.877 LSB (worst) | PASS |
+| 2026-10-30 | uncommitted | POCL (CPU) | 11-case log residual matrix, `stage-residency-test` | device vs host block | 0 (host) | PASS |
 
 `47c50ee77` changes only CPU export buffer handling; the OpenCL rows above
 re-run the existing GPU stages against the new CPU neighbour.
@@ -169,6 +172,19 @@ peak absolute error is zero for the synthetic node tests:
   configurations (`dehazeblack`, show-depth, mask, soft radius, active
   retinex, four out-of-range sliders and dehaze without the retinex enable)
   run the host builtin byte for byte.
+- Local log encoding, through `local.adjustments`, matches the host block in
+  21 configurations (alone, no compression, both senstype-11 sensitivity
+  arms, colour, dehaze, CBDL, vibrance, shadows/highlights, soft light,
+  local contrast, all tools, MUNS, multispot, inactive/active both orders,
+  ELI/RECT and the 179x49, 238x64 and 8192x64 widths) with a worst peak error
+  of 0.877 LSB16 on log+dehaze at `sensilog = 60`; the all-tools row at
+  `sensilog = 30` is 0.334 and log alone is 0.015. The pass is device-side: the ROI Lab-to-RGB
+  round trip, the per-pixel `apply` with the host-built `find_gray()` base,
+  the saturation control, the `repar` blend and the senstype-11 deltaE blend
+  all run in the kernel. `localadjustments-log.pp3` has a peak error of
+  1 LSB16, and eleven residual configurations (`autocompute`, `expcie`,
+  `ciecam`, non-zero `detail`, `strlog`, mask, soft radius and four
+  out-of-range sliders) run the host builtin byte for byte.
 - `tools/opencl/verify.sh --stage-device`, which `--quick` also runs, asserts
   each record and its parity in one step:
 

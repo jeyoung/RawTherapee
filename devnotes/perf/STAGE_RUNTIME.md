@@ -2744,22 +2744,24 @@ submission.
 
 `local.adjustments` is the export block at `simpleprocess.cc:1468`. The device
 increment covers any number of `norm` spots in list order, both `ELI` and
-`RECT`, inactive clamp-only spots, the L/C/H curves, vibrance, Gaussian local
-contrast, Lab-mode `"std"` shadows/highlights, per-pixel `"soft"` soft light,
-and the `avoidgamutMethod` values `"NONE"` and `"MUNS"`. The per-spot clamp
+`RECT`, inactive clamp-only spots, the L/C/H curves, local log encoding,
+local dehaze, local CBDL, vibrance, Gaussian local contrast, Lab-mode `"std"`
+shadows/highlights, per-pixel `"soft"` soft light, and the
+`avoidgamutMethod` values `"NONE"` and `"MUNS"`. The per-spot clamp
 is bit-exact against the host, so the Munsell pass runs on the device. The
 other tools, the other shadows/highlights methods (tone, GHS,
 Michaelis-Menten) and their tone-eq, recovery and gradient sub-options, the
 soft-light `"reti"` method, explicit masks, soft radius, merge, recursion,
-LabGrid, the RGB and exposure curves, `reparcol != 100` and the
+LabGrid, the RGB and exposure curves, `reparcol != 100`, the log tool's
+guided-filter `detail` arm, `autocompute`, CIE CAM and `strlog`, and the
 LAB/XYZ/XYZREL methods stay on the host. The tools run in the block's order:
-vibrance, shadows/highlights, soft light, local contrast, then Colour &
-Light.
+log encoding, dehaze, CBDL, vibrance, shadows/highlights, soft light, local
+contrast, then Colour & Light.
 
 ### ABI, state and host setup
 
 The node takes a three-plane `F32` Lab buffer, a pointer to
-`RtLocalAdjustmentsContext` (version 4, magic `0x4C414A43`, size checked,
+`RtLocalAdjustmentsContext` (version 7, magic `0x4C414A43`, size checked,
 `spot_count` from the profile) and the block support flag. The call site only
 prefills `labView` with `rgb2lab(baseImg)` when the block is active and the
 whole-block predicate is true; an inactive block never enters the node.
@@ -2768,7 +2770,7 @@ The launcher keeps a contiguous host staging copy of the Lab image and a
 device `reserved` copy of the initial image. For each spot it calls
 `build(self, spot, &staging, &setup)`, which runs the block's own
 `calcLocalParams()`, `calc_ref()` on the current Lab, `complexCurvelocal()`
-and the curve factories. It then uploads that spot's 97-float record and
+and the curve factories. It then uploads that spot's 133-float record and
 tables, runs the passes, and reads the device image back into the staging
 copy. Spot N+1's references therefore see spot N's result through the same
 read-back path as the CPU's `labView`. `reserved` is never updated, matching
@@ -2791,6 +2793,13 @@ lab.regions `xlogf`/`xexpf`/`pow_F` ports, and the local-adjustments kernels:
   for those. The prefilter uses `epsi0 = 1e-6`; the tail uses `epsi = 1e-5`
   and the recorded clamp arm.
 - `rt_local_adjustments_roi`: copies the active spot ROI.
+- `rt_local_adjustments_log`: `log_encode()`'s per-pixel arm: `norm2()`, the
+  host-built `apply` scalars, the saturation control, the `repar` recovery
+  blend and the encode. `find_gray()`, the compression threshold's host
+  boolean quirk, `noise` and `log2` are host-built.
+- `rt_local_adjustments_blend_log`: `transit_shapedetect2()`'s senstype-11
+  arm, including its threshold/iteration/balance adjustment, the
+  sensitivity-50..100 ramp and the 100 early exit.
 - `rt_lab_tools_lc_line`: the existing host-matched IIR Gaussian, sigma
   `(2 + 0.2 * blurcolde)` for colour and `(2 + 0.2 * blurSHde)` for
   shadows/highlights; the colour and SH references take the SSE path only.
@@ -2812,9 +2821,10 @@ lab.regions `xlogf`/`xexpf`/`pow_F` ports, and the local-adjustments kernels:
   the predicate. Its chroma normalisation repeats the host's SIMD/scalar
   split in the same way as the clamp.
 
-The per-spot order is prefilter, then vibrance, shadows/highlights, soft
-light, local contrast and Colour & Light, then the tail clamp. Each tool
-takes a fresh ROI copy and its own deltaE blur. `avoidcolshi()` runs after the tail clamp in the
+The per-spot order is prefilter, then log encoding, dehaze, CBDL, vibrance,
+shadows/highlights, soft light, local contrast and Colour & Light, then the
+tail clamp. Each tool takes a fresh ROI copy and its own deltaE blur.
+`avoidcolshi()` runs after the tail clamp in the
 CPU, so the MUNS kernel is ordered there; the Munsell tables and the fixed
 `reserved` image are uploaded once.
 
@@ -2865,12 +2875,17 @@ all-curves case); no separate MUNS-only worst is claimed.
 
 ### Residuals
 
-An active spot runs Colour & Light, vibrance, Lab-mode `"std"`
-shadows/highlights, per-pixel `"soft"` soft light and/or Gaussian local
-contrast, requires `reparcol == 100`, no explicit mask, soft radius, merge,
-recursion, inversion, gradient, LabGrid, RGB or exposure curve, an
-`avoidgamutMethod` other than `"NONE"`/`"MUNS"`, and a ROI of at least 5 px in
-each dimension (12 px when shadows/highlights runs). Shadows/highlights
+An active spot runs local log encoding, local dehaze, local CBDL, Colour &
+Light, vibrance, Lab-mode `"std"` shadows/highlights, per-pixel `"soft"` soft
+light and/or Gaussian local contrast, requires `reparcol == 100`, no explicit
+mask, soft radius, merge, recursion, inversion, gradient, LabGrid, RGB or
+exposure curve, an `avoidgamutMethod` other than `"NONE"`/`"MUNS"`, and a ROI
+of at least 5 px in each dimension (12 px when shadows/highlights runs).
+Log encoding additionally requires `expcie`, `ciecam` and `autocompute` off,
+`detail == 0`, `strlog == 0`, and the GUI ranges for `sourceGray`,
+`targetGray`, `blackEv`, `whiteEv`, `comprlog`, `repar` and `sensilog`; the
+guided-filter `detail` arm, `autocompute`, CIE CAM, the gradient, an explicit
+mask, a soft radius and an out-of-range value are residuals. Shadows/highlights
 additionally requires `shMethod == "std"`, `reparsh == 100`, `strSH == 0`,
 zero `multsh` multipliers, `gamSH == 2.4`, `sloSH == 12.92` and sliders inside
 their ABI ranges; the `"tone"`, `"ghs"` and `"micha"` methods are host
@@ -2880,8 +2895,9 @@ clamp-only and may carry inert tool settings. Everything else is a residual:
 exposure (FFT PDE), the other shadows/highlights methods and
 tone-eq/recovery/gradient sub-options, the local-contrast wavelet and FFT
 variants, vibrance gamma/gradients/warm, blur/denoise, sharpening, tone
-mapping, Retinex, CBDL, log, soft light `"reti"`, the common mask, CIE CAM,
-dehaze, `exc`/`full`/`main`, merge, explicit masks, soft radius,
+mapping, Retinex, log's guided-filter arm/`autocompute`/CIE CAM/gradient,
+soft light `"reti"`, the common mask, dehaze, `exc`/`full`/`main`, merge,
+explicit masks, soft radius,
 LAB/XYZ/XYZREL, the RGB curve, LabGrid, `avoidrad != 0`, `transit == 100`, a
 blur radius above 100, `ghs_D != 0 && ghs_BLP > 0` and a pre-CBDL pass. A GPU
 device is refused before the upload.
@@ -2911,7 +2927,10 @@ device is refused before the upload.
 | `localadjustments-sh.pp3` (CPU-device row) | PASS, `max_pae=1.5259e-05` (1 LSB16), `impl=opencl`. Non-vacuous: against the neutral export the profile differs by PAE 28 codes on 3,073,092 of 10,139,904 pixels (8,144,216 of 30,419,712 channel samples) |
 | `localadjustments-soft.pp3` (CPU-device row) | PASS, `max_pae=1.5259e-05` (1 LSB16), `impl=opencl`; per-pixel soft light at strength 60 and sensitivity 30 |
 | `localadjustments-cbdl.pp3` (CPU-device row) | PASS, `max_pae=1.5259e-05` (1 LSB16), `impl=opencl`; local CBDL with all six multipliers above one, chroma 0.5, threshold 0.2, sensitivity 60 and clarity 2. Non-vacuous: against the neutral export the profile differs by PAE 3,420 codes on 14,240,286 of 30,419,712 channel samples |
-| Full `verify.sh --stage-device` | PASS, 30 PASS and 0 SKIP on the POCL CPU device; the MUNS, SH, soft-light and CBDL rows are CPU-device rows, consistent with the launcher's CPU-only requirement. `working.trc` stays 1 LSB16 |
+| Log matrix, 21 cases | alone, no compression, both senstype-11 arms (below 50 and 50..100, including 100), colour, dehaze, CBDL, vibrance, shadows/highlights, soft light, local contrast, all tools, MUNS, a second spot, inactive/active both orders, ELI/RECT and the 179x49/238x64/8192x64 widths: `impl=opencl`, finite, worst 0.876953 LSB16 (log+dehaze at `sensilog=60`; all tools at `sensilog=30` 0.333984; log alone 0.015137; 8192x64 0.031250; second spot 0.038086). Non-vacuity: log alone changes 22,817 of 45,696 samples (PAE 9,332.763672 LSB16) against the same spot with the tool off |
+| Log residuals, 11 cases | `autocompute`, `expcie`, the `ciecam` flag, non-zero `detail`, `strlog`, an explicit mask, a soft radius, source gray/compression/`repar`/sensitivity out of range: `impl=host`, no `impl=opencl`, PAE 0. The predicate matrix also covers target gray and black/white EV |
+| `localadjustments-log.pp3` (CPU-device row) | PASS, `max_pae=1.5259e-05` (1 LSB16), `impl=opencl`; log encoding at source gray 10, target gray 18, black/white EV -5/10, compression 0.4, `repar=100`, saturation on, `sensilog=60`, detail zero, combined with Colour & Light. Non-vacuous: against the neutral export the profile differs by PAE 20,952 codes on 5,254,380 of 30,419,712 channel samples |
+| Full `verify.sh --stage-device` | PASS, 32 PASS and 0 SKIP on the POCL CPU device; the MUNS, SH, soft-light, CBDL, dehaze and log rows are CPU-device rows, consistent with the launcher's CPU-only requirement. `working.trc` stays 1 LSB16 |
 | Default path | with `RT_STAGE_OPENCL` unset the host block runs directly; CPU-only `stage-residency-test: PASS (25 skipped)` |
 | Builds | `build/cpu-perf-graph` and `build/opencl-perf-graph` compile |
 | GPU | not run; refused before upload, records `impl=host` |
