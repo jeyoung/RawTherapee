@@ -235,8 +235,8 @@ node ran on the device rather than only comparing pixels.
 | `localadjustments.pp3` | PASS, `max_pae=1.5259e-05` (1 LSB16), `impl=opencl` |
 | `localadjustments-multispot.pp3` | PASS, `max_pae=1.5259e-05` (1 LSB16), `impl=opencl`; now a device row, not a SKIP |
 | `localadjustments-residual.pp3` | host row, informational 1 LSB16 |
-| `localadjustments-munsell.pp3` | PASS, `max_pae=1.5259e-05` (1 LSB16), `impl=opencl`; the device MUNS pass differs by 1 LSB16 on 389,860 of 30,419,712 samples, and the same profile with `NONE` differs by 1 LSB16 on 389,597, so the remaining bit is not a MUNS zone flip. The pre-fix clamp made the MUNS row **136 LSB16** (416,889 samples) |
-| Full `--stage-device` | PASS, **25 PASS and 0 SKIP**, MUNS included as a device row; `working.trc` 1 LSB16 |
+| `localadjustments-munsell.pp3` (CPU-device row) | PASS, `max_pae=1.5259e-05` (1 LSB16), `impl=opencl`; the device MUNS pass differs by 1 LSB16 on 389,860 of 30,419,712 samples, and the same profile with `NONE` differs by 1 LSB16 on 389,597, so the remaining bit is not a MUNS zone flip. The pre-fix clamp made the MUNS row **136 LSB16** (416,889 samples) |
+| Full `--stage-device` | PASS, **25 PASS and 0 SKIP** on the POCL CPU device. MUNS is a CPU-device row, consistent with the launcher's CPU-only requirement; `working.trc` 1 LSB16 |
 | Default path | `RT_STAGE_OPENCL` unset runs the host block; CPU-only test `PASS (25 skipped)` |
 | Builds | both `build/cpu-perf-graph` and `build/opencl-perf-graph` compile |
 

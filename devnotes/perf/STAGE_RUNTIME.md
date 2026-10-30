@@ -2829,7 +2829,9 @@ float matrices, caches, `epsi` and arm; `avoidcolshi()` normalises the MUNS
 sine/cosine with the same split. With this fix all six clamp-only cases are
 bit-exact (0 differing samples of 1,751,721), and the gate MUNS row is
 1 LSB16 (389,860 of 30,419,712 samples; `NONE` is 1 LSB16 on 389,597). The
-remaining 1 LSB is shared with `NONE` and is not a MUNS zone flip.
+remaining 1 LSB is shared with `NONE` and is not a MUNS zone flip. Over the
+MUNS-inclusive 22-case matrix the published worst is 0.125000 LSB16 (the
+all-curves case); no separate MUNS-only worst is claimed.
 
 ### Residuals
 
@@ -2860,8 +2862,8 @@ RGB curve, LabGrid, `avoidrad != 0`, `transit == 100`, a blur radius above
 | `localadjustments.pp3` | PASS, `max_pae=1.5259e-05` (1 LSB16), `impl=opencl` |
 | `localadjustments-multispot.pp3` | PASS, `max_pae=1.5259e-05` (1 LSB16), `impl=opencl` |
 | `localadjustments-residual.pp3` (exposure) | host, informational 1 LSB16 |
-| `localadjustments-munsell.pp3` | PASS, `max_pae=1.5259e-05` (1 LSB16), `impl=opencl`; the device MUNS pass is 1 LSB16 on 389,860 of 30,419,712 samples, and the same profile with `NONE` is 1 LSB16 on 389,597 |
-| Full `verify.sh --stage-device` | PASS, 25 PASS and 0 SKIP; `working.trc` stays 1 LSB16 |
+| `localadjustments-munsell.pp3` (CPU-device row) | PASS, `max_pae=1.5259e-05` (1 LSB16), `impl=opencl`; the device MUNS pass is 1 LSB16 on 389,860 of 30,419,712 samples, and the same profile with `NONE` is 1 LSB16 on 389,597 |
+| Full `verify.sh --stage-device` | PASS, 25 PASS and 0 SKIP on the POCL CPU device; the MUNS row is a CPU-device row, consistent with the launcher's CPU-only requirement. `working.trc` stays 1 LSB16 |
 | Default path | with `RT_STAGE_OPENCL` unset the host block runs directly; CPU-only `stage-residency-test: PASS (25 skipped)` |
 | Builds | `build/cpu-perf-graph` and `build/opencl-perf-graph` compile |
 | GPU | not run; refused before upload, records `impl=host` |
