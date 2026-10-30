@@ -7284,6 +7284,11 @@ void test_local_adjustments(bool available)
             {"MUNS", [](auto& p) {
                  p.locallab.spots[0].avoidgamutMethod = "MUNS";
              }},
+            {"GHS clamp leftovers", [](auto& p) {
+                 p.locallab.spots[0].activ = false;
+                 p.locallab.spots[0].ghs_D = 1.0;
+                 p.locallab.spots[0].ghs_BLP = 1.0;
+             }},
             {"exposure", [](auto& p) {
                  p.locallab.spots[0].expexpose = true;
              }},
@@ -7754,6 +7759,36 @@ void test_local_adjustments(bool available)
              }},
             {"highlight reconstruction", [](auto& p) {
                  p.toneCurve.hrenabled = true;
+             }},
+            {"shadows/highlights", [](auto& p) {
+                 p.locallab.spots[0].expshadhigh = true;
+             }},
+            {"recursion", [](auto& p) {
+                 p.locallab.spots[0].recurs = true;
+             }},
+            {"exclude spot", [](auto& p) {
+                 p.locallab.spots[0].spotMethod = "exc";
+             }},
+            {"merge", [](auto& p) {
+                 p.locallab.spots[0].merMethod = "mtwo";
+             }},
+            {"LAB gamut", [](auto& p) {
+                 p.locallab.spots[0].avoidgamutMethod = "LAB";
+             }},
+            {"XYZ gamut", [](auto& p) {
+                 p.locallab.spots[0].avoidgamutMethod = "XYZ";
+             }},
+            {"avoid radius", [](auto& p) {
+                 p.locallab.spots[0].avoidrad = 5.0;
+             }},
+            {"RGB curve", [](auto& p) {
+                 p.locallab.spots[0].rgbcurve = {
+                     3.0, 0.0, 0.0, 0.5, 0.7, 1.0, 1.0};
+             }},
+            {"GHS clamp leftovers", [](auto& p) {
+                 p.locallab.spots[0].activ = false;
+                 p.locallab.spots[0].ghs_D = 1.0;
+                 p.locallab.spots[0].ghs_BLP = 1.0;
              }},
         };
         for (std::size_t index = 0;
