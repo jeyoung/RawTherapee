@@ -46,6 +46,13 @@
 #include <string>
 #include <vector>
 
+namespace rtengine
+{
+/* The retinex residual reaches retinex_pde(), which takes this mutex. The
+ * test binary does not run rtengine::init(). */
+extern MyMutex* fftwMutex;
+}
+
 namespace
 {
 
@@ -7254,6 +7261,10 @@ void test_local_adjustments(bool available)
     if (rtengine::lcmsMutex == nullptr) {
         rtengine::lcmsMutex = &local_adjustments_lcms_mutex;
     }
+    static MyMutex local_adjustments_fftw_mutex;
+    if (rtengine::fftwMutex == nullptr) {
+        rtengine::fftwMutex = &local_adjustments_fftw_mutex;
+    }
     static rtengine::Settings local_adjustments_settings{};
     /* options.cc's production default: low values make the L=f(H) curve
      * extremely sensitive to the clamp's last-bit differences. */
@@ -7336,8 +7347,32 @@ void test_local_adjustments(bool available)
             {"tone map", [](auto& p) {
                  p.locallab.spots[0].exptonemap = true;
              }},
-            {"soft light", [](auto& p) {
+            {"soft light zero strength", [](auto& p) {
                  p.locallab.spots[0].expsoft = true;
+             }},
+            {"soft light reti", [](auto& p) {
+                 p.locallab.spots[0].expsoft = true;
+                 p.locallab.spots[0].softMethod = "reti";
+                 p.locallab.spots[0].streng = 60;
+             }},
+            {"soft light mask", [](auto& p) {
+                 p.locallab.spots[0].expsoft = true;
+                 p.locallab.spots[0].streng = 60;
+                 p.locallab.spots[0].enaColorMask = true;
+             }},
+            {"soft light soft radius", [](auto& p) {
+                 p.locallab.spots[0].expsoft = true;
+                 p.locallab.spots[0].streng = 60;
+                 p.locallab.spots[0].softradiuscol = 1.0;
+             }},
+            {"soft light strength high", [](auto& p) {
+                 p.locallab.spots[0].expsoft = true;
+                 p.locallab.spots[0].streng = 101;
+             }},
+            {"soft light sensitivity range", [](auto& p) {
+                 p.locallab.spots[0].expsoft = true;
+                 p.locallab.spots[0].streng = 60;
+                 p.locallab.spots[0].sensisf = 101;
              }},
             {"sharpening", [](auto& p) {
                  p.locallab.spots[0].expsharp = true;
@@ -7725,6 +7760,16 @@ void test_local_adjustments(bool available)
                 spot.multsh[index] = 0;
             }
         };
+        /* The per-pixel soft-light method. */
+        const auto soft_spot = [&](rtengine::procparams::ProcParams& p,
+                                   int strength) {
+            auto& spot = p.locallab.spots[0];
+            spot.expcolor = false;
+            spot.expsoft = true;
+            spot.softMethod = "soft";
+            spot.streng = strength;
+            spot.sensisf = 30;
+        };
         complex.push_back({"vibrance only", 238, 64, [&](auto& p) {
             add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
             vibrance_spot(p, 40, 20);
@@ -7811,6 +7856,86 @@ void test_local_adjustments(bool available)
                            [&](auto& p) {
             add_spot(p, 0, 0, 8000, true, 0, 0, 0, "ELI", "NONE");
             sh_spot(p, 50, 50);
+        }});
+        complex.push_back({"soft light only", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            soft_spot(p, 60);
+        }});
+        complex.push_back({"soft light 179x49", 179, 49, [&](auto& p) {
+            add_spot(p, 0, 0, 700, true, 0, 0, 0, "ELI", "NONE");
+            soft_spot(p, 60);
+        }});
+        complex.push_back({"soft light 8192x64", 8192, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 8000, true, 0, 0, 0, "ELI", "NONE");
+            soft_spot(p, 60);
+        }});
+        complex.push_back({"soft light RECT", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "RECT", "NONE");
+            soft_spot(p, 60);
+        }});
+        complex.push_back({"soft light MUNS", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "MUNS");
+            soft_spot(p, 60);
+        }});
+        complex.push_back({"soft light strength 3", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            soft_spot(p, 3);
+        }});
+        complex.push_back({"colour and soft light", 238, 64,
+                           [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 35, 10, -5, "ELI", "NONE");
+            p.locallab.spots[0].expsoft = true;
+            p.locallab.spots[0].softMethod = "soft";
+            p.locallab.spots[0].streng = 60;
+            p.locallab.spots[0].sensisf = 30;
+        }});
+        complex.push_back({"shadows/highlights and soft light", 238, 64,
+                           [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            sh_spot(p, 50, 50);
+            p.locallab.spots[0].expsoft = true;
+            p.locallab.spots[0].softMethod = "soft";
+            p.locallab.spots[0].streng = 60;
+            p.locallab.spots[0].sensisf = 30;
+        }});
+        complex.push_back({"soft light and local contrast", 238, 64,
+                           [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            contrast_spot(p, 40, 0.4);
+            p.locallab.spots[0].expsoft = true;
+            p.locallab.spots[0].softMethod = "soft";
+            p.locallab.spots[0].streng = 60;
+            p.locallab.spots[0].sensisf = 30;
+        }});
+        complex.push_back({"all five tools", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 35, 10, -5, "ELI", "NONE");
+            auto& spot = p.locallab.spots[0];
+            spot.expvibrance = true;
+            spot.pastels = 40;
+            spot.saturated = 20;
+            spot.psthreshold.setValues(0, 75);
+            spot.sensiv = 30;
+            spot.expcontrast = true;
+            spot.localcontMethod = "loc";
+            spot.lcradius = 40;
+            spot.lcamount = 0.4;
+            spot.lcdarkness = 0.9;
+            spot.lclightness = 1.1;
+            spot.reparw = 100.0;
+            spot.sensilc = 60;
+            spot.expshadhigh = true;
+            spot.shMethod = "std";
+            spot.highlights = 50;
+            spot.shadows = 50;
+            spot.h_tonalwidth = 70;
+            spot.s_tonalwidth = 30;
+            spot.sh_radius = 40;
+            spot.sensihs = 30;
+            spot.blurSHde = 5;
+            spot.expsoft = true;
+            spot.softMethod = "soft";
+            spot.streng = 60;
+            spot.sensisf = 30;
         }});
         complex.push_back({"colour and shadows/highlights", 238, 64,
                            [&](auto& p) {
@@ -7997,7 +8122,33 @@ void test_local_adjustments(bool available)
             spot.h_tonalwidth = 70;
             spot.s_tonalwidth = 30;
             spot.sh_radius = 40;
+            spot.expsoft = true;
+            spot.softMethod = "soft";
+            spot.streng = 60;
+            spot.sensisf = 30;
             add_spot(p, 100, 100, 600, true, 35, 10, -5, "ELI", "NONE");
+        }});
+        complex.push_back({"soft light second spot", 238, 64,
+                           [&](auto& p) {
+            add_spot(p, -300, -150, 700, true, 30, 8, 0, "ELI", "NONE");
+            add_spot(p, 300, 150, 700, true, 0, 0, 0, "RECT", "NONE");
+            auto& spot = p.locallab.spots[1];
+            spot.expcolor = false;
+            spot.expsoft = true;
+            spot.softMethod = "soft";
+            spot.streng = 60;
+            spot.sensisf = 30;
+            add_spot(p, 0, 0, 500, true, 0, 0, 0, "ELI", "NONE");
+            auto& lc = p.locallab.spots[2];
+            lc.expcolor = false;
+            lc.expcontrast = true;
+            lc.localcontMethod = "loc";
+            lc.lcradius = 40;
+            lc.lcamount = 0.4;
+            lc.lcdarkness = 0.9;
+            lc.lclightness = 1.1;
+            lc.reparw = 100.0;
+            lc.sensilc = 70;
         }});
         complex.push_back({"gate multispot", 238, 64, [&](auto& p) {
             add_spot(p, -400, -200, 700, true, 30, 10, 5, "ELI", "NONE");
@@ -8080,6 +8231,30 @@ void test_local_adjustments(bool available)
                             changed.max_abs);
                 check(changed.differing > 0,
                       "the shadows/highlights tool changes the image");
+            }
+            if (c.label == "soft light only") {
+                /* The same spot with soft light off: the tool must change the
+                 * image, otherwise the parity above is vacuous. */
+                rtengine::procparams::ProcParams plain_params =
+                    reference_params;
+                plain_params.locallab.spots[0].expsoft = false;
+                Imagefloat plain_base(c.width, c.height);
+                fill_local_adjustments_rgb(plain_base, 211u);
+                std::unique_ptr<LabImage> plain_lab(
+                    new LabImage(c.width, c.height));
+                rtengine::ImProcFunctions plain_ipf(&plain_params, false);
+                localAdjustmentsHostBlock(plain_ipf, plain_params,
+                                          &plain_base, plain_lab.get(),
+                                          c.width, c.height);
+                const Diff changed =
+                    compare(view(*plain_lab), view(*reference_lab));
+                std::printf("stage-residency: local.adjustments soft-light "
+                            "non-vacuity: %zu of %zu samples differ, "
+                            "PAE %.6f LSB16\n",
+                            changed.differing, changed.samples,
+                            changed.max_abs);
+                check(changed.differing > 0,
+                      "the soft-light tool changes the image");
             }
             if (c.label == "three ELI") {
                 forward_three.reset(new LabImage(*reference_lab, true));
@@ -8347,6 +8522,33 @@ void test_local_adjustments(bool available)
             {"exposure tool", [](auto& p) {
                  p.locallab.spots[0].expexpose = true;
              }},
+            {"soft light reti", [](auto& p) {
+                 p.locallab.spots[0].expsoft = true;
+                 p.locallab.spots[0].softMethod = "reti";
+                 p.locallab.spots[0].streng = 60;
+             }},
+            {"soft light mask", [](auto& p) {
+                 p.locallab.spots[0].expsoft = true;
+                 p.locallab.spots[0].streng = 60;
+                 p.locallab.spots[0].enaColorMask = true;
+             }},
+            {"soft light soft radius", [](auto& p) {
+                 p.locallab.spots[0].expsoft = true;
+                 p.locallab.spots[0].streng = 60;
+                 p.locallab.spots[0].softradiuscol = 1.0;
+             }},
+            {"soft light zero strength", [](auto& p) {
+                 p.locallab.spots[0].expsoft = true;
+             }},
+            {"soft light strength high", [](auto& p) {
+                 p.locallab.spots[0].expsoft = true;
+                 p.locallab.spots[0].streng = 101;
+             }},
+            {"soft light sensitivity range", [](auto& p) {
+                 p.locallab.spots[0].expsoft = true;
+                 p.locallab.spots[0].streng = 60;
+                 p.locallab.spots[0].sensisf = 101;
+             }},
             {"reparcol 50", [](auto& p) {
                  p.locallab.spots[0].reparcol = 50.0;
              }},
@@ -8567,6 +8769,9 @@ void test_local_adjustments(bool available)
         check(setup.ws != nullptr && setup.iws != nullptr &&
                   setup.cachef != nullptr && setup.cachefy != nullptr,
               "the local.adjustments setup exports the clamp tables");
+        check(setup.gamma_srgb != nullptr &&
+                  setup.igamma_srgb != nullptr,
+              "the local.adjustments setup exports the sRGB gamma tables");
         check(setup.iir != nullptr &&
                   setup.iir->double_path == 0 &&
                   setup.iir->version == RT_LAB_TOOLS_IIR_VERSION,
@@ -8609,7 +8814,8 @@ void test_local_adjustments(bool available)
         check(record[RT_LOCAL_ADJUSTMENTS_SLOT_QCURVE] == 0.f,
               "the quality curves are off");
         check(record[RT_LOCAL_ADJUSTMENTS_SLOT_EXPVIBRANCE] == 0.f &&
-                  record[RT_LOCAL_ADJUSTMENTS_SLOT_EXPCONTRAST] == 0.f,
+                  record[RT_LOCAL_ADJUSTMENTS_SLOT_EXPCONTRAST] == 0.f &&
+                  record[RT_LOCAL_ADJUSTMENTS_SLOT_EXPSOFT] == 0.f,
               "the extra tools are not recorded on a colour-only spot");
         check(record[RT_LOCAL_ADJUSTMENTS_SLOT_VIB_SKIN_ACTIVE] == 0.f,
               "the idle vibrance skin curve is not recorded");
@@ -8670,6 +8876,54 @@ void test_local_adjustments(bool available)
                   setup.iir_shadows_highlights->double_path == 0,
               "the shadows/highlights setup exports the SSE blur "
               "coefficients");
+    }
+
+    /* The soft-light record: the run flag, strength and sensitivity, and the
+     * strength-dependent clamp arm. */
+    {
+        rtengine::procparams::ProcParams params = supported;
+        auto& spot = params.locallab.spots[0];
+        spot.expcolor = false;
+        spot.expsoft = true;
+        spot.softMethod = "soft";
+        spot.streng = 60;
+        spot.sensisf = 30;
+        check(localAdjustmentsSupported(params),
+              "the soft-light spot is inside the predicate");
+
+        Imagefloat base(179, 48);
+        fill_local_adjustments_rgb(base, 44u);
+        std::unique_ptr<LabImage> lab(new LabImage(179, 48));
+        rtengine::ImProcFunctions ipf(&params, false);
+        rtengine::LabImage source(179, 48);
+        ipf.rgb2lab(base, source, params.icm.workingProfile);
+
+        LabImage* lab_pointer = lab.get();
+        LocalAdjustmentsContext context(params, ipf, &base, lab_pointer,
+                                        179, 48);
+        RtStageBuffer source_view = view(source);
+        RtLocalAdjustmentsResult setup{};
+        check(context.build(0, &source_view, setup) == 0,
+              "the soft-light setup builds one spot");
+        const float* record = setup.spots;
+        check(record[RT_LOCAL_ADJUSTMENTS_SLOT_EXPSOFT] == 1.f,
+              "the soft-light pass is recorded");
+        check(record[RT_LOCAL_ADJUSTMENTS_SLOT_SOFT_STRENGTH] == 60.f &&
+                  record[RT_LOCAL_ADJUSTMENTS_SLOT_SENSSOFT] == 30.f,
+              "the soft-light strength and sensitivity are recorded");
+        check(record[RT_LOCAL_ADJUSTMENTS_SLOT_CLAMPMODE] ==
+                  RT_LOCAL_ADJUSTMENTS_CLAMP_LAPLACIAN,
+              "a strength above two selects the Laplacian clamp arm");
+
+        params.locallab.spots[0].streng = 2;
+        LocalAdjustmentsContext low_context(params, ipf, &base, lab_pointer,
+                                            179, 48);
+        RtLocalAdjustmentsResult low_setup{};
+        check(low_context.build(0, &source_view, low_setup) == 0,
+              "the strength-two soft-light setup builds one spot");
+        check(low_setup.spots[RT_LOCAL_ADJUSTMENTS_SLOT_CLAMPMODE] ==
+                  RT_LOCAL_ADJUSTMENTS_CLAMP_NOTZERO,
+              "a strength of two keeps the notzero clamp arm");
     }
 
     /* The call-site guard is a helper so the inactive/prefill decision is
