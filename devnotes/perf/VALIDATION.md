@@ -225,17 +225,18 @@ node ran on the device rather than only comparing pixels.
 
 | Case | Result |
 |---|---|
-| Single-spot parity, 16 cases | POCL CPU: 2,219,001 samples, `impl=opencl`, finite, worst 0.060547 LSB16 |
-| Complex parity, 17 cases | two/three ELI, reversed order, ELI and RECT, inactive/active both orders, each L/C/H curve alone, L=f(H) alone, all curves and the gate multi-spot profile: 757,449 samples, worst 0.156250 LSB16, `impl=opencl` |
+| Single-spot parity, 16 cases | POCL CPU: 2,219,001 samples, `impl=opencl`, finite, worst 0.031250 LSB16 |
+| Complex parity, 22 cases | two/three ELI, reversed order, ELI and RECT, inactive/active both orders, each L/C/H curve alone, L=f(H) alone, all curves, one MUNS spot, MUNS at 179x49, MUNS and NONE, inactive then MUNS, all curves with MUNS and the gate multi-spot profile: 966,546 samples, worst 0.125000 LSB16, `impl=opencl` |
+| Clamp parity, 6 cases | inactive spots at 238x64 (prefilter and tail only), 237x49 (prefilter, tail 1), 179x49 (both) and 8192x64 (prefilter): 1,751,721 samples, `impl=opencl`, bit-exact (PAE 0, 0 differing samples). The pre-fix clamp failed the same cases at up to 0.045898 LSB16 |
 | Spot order | the three-spot forward and reversed blocks differ on 27,040 of 45,696 samples (PAE 270.833984 LSB16) |
-| Residual parity, 16 cases | MUNS, mask, soft radius, exposure, `reparcol` 50/1, highlight reconstruction, SH, recursion, `exc`, merge, LAB, XYZ, `avoidrad`, RGB curve and GHS clamp leftovers: `impl=host`, no `impl=opencl`, PAE 0 |
+| Residual parity, 15 cases | mask, soft radius, exposure, `reparcol` 50/1, highlight reconstruction, SH, recursion, `exc`, merge, LAB, XYZ, `avoidrad`, RGB curve and GHS clamp leftovers: `impl=host`, no `impl=opencl`, PAE 0 |
 | GHS clamp leftovers before/after | before the fix, an inactive spot with `ghs_D=1` and `ghs_BLP=1` recorded `impl=opencl` and diverged by **1,296 LSB16** on 414,331 of 30,419,712 samples. The predicate now refuses the pair because the host takes the `clipR()` arm; the case is a host residual at PAE 0 |
 | 4-px ROI | host, PAE 0 |
 | `localadjustments.pp3` | PASS, `max_pae=1.5259e-05` (1 LSB16), `impl=opencl` |
 | `localadjustments-multispot.pp3` | PASS, `max_pae=1.5259e-05` (1 LSB16), `impl=opencl`; now a device row, not a SKIP |
 | `localadjustments-residual.pp3` | host row, informational 1 LSB16 |
-| `localadjustments-munsell.pp3` | host residual. The device MUNS attempt is **136 LSB16** (416,889 of 30,419,712 samples); with `NONE` the same profile is 1 LSB16. The clamp's last-bit input differences move Munsell's discontinuous zone thresholds, so MUNS is refused rather than approximated |
-| Full `--stage-device` | PASS, **25 PASS and 0 SKIP**; `working.trc` 1 LSB16 |
+| `localadjustments-munsell.pp3` | PASS, `max_pae=1.5259e-05` (1 LSB16), `impl=opencl`; the device MUNS pass differs by 1 LSB16 on 389,860 of 30,419,712 samples, and the same profile with `NONE` differs by 1 LSB16 on 389,597, so the remaining bit is not a MUNS zone flip. The pre-fix clamp made the MUNS row **136 LSB16** (416,889 samples) |
+| Full `--stage-device` | PASS, **25 PASS and 0 SKIP**, MUNS included as a device row; `working.trc` 1 LSB16 |
 | Default path | `RT_STAGE_OPENCL` unset runs the host block; CPU-only test `PASS (25 skipped)` |
 | Builds | both `build/cpu-perf-graph` and `build/opencl-perf-graph` compile |
 

@@ -2744,11 +2744,11 @@ submission.
 
 `local.adjustments` is the export block at `simpleprocess.cc:1468`. The device
 increment covers any number of `norm` spots in list order, both `ELI` and
-`RECT`, inactive clamp-only spots, and the L/C/H curves with
-`avoidgamutMethod == "NONE"`. Munsell is a measured residual; the other tools,
-explicit masks, soft radius, merge, recursion, gradients, LabGrid, the RGB and
-exposure curves, `reparcol != 100` and the LAB/XYZ/XYZREL methods stay on the
-host.
+`RECT`, inactive clamp-only spots, the L/C/H curves, and the `avoidgamutMethod`
+values `"NONE"` and `"MUNS"`. The per-spot clamp is bit-exact against the
+host, so the Munsell pass runs on the device. The other tools, explicit masks,
+soft radius, merge, recursion, gradients, LabGrid, the RGB and exposure
+curves, `reparcol != 100` and the LAB/XYZ/XYZREL methods stay on the host.
 
 ### ABI, state and host setup
 
@@ -2778,8 +2778,12 @@ local-contrast IIR line kernel, the Sleef `xatan2f`/`xsincosf` and
 lab.regions `xlogf`/`xexpf`/`pow_F` ports, and the local-adjustments kernels:
 
 - `rt_local_adjustments_clamp`: `lab2rgb`, `max(channel, epsi)`, optional
-  `clipR`, `rgb2lab`, with the host float matrices and caches. The prefilter
-  uses `epsi0 = 1e-6`; the tail uses `epsi = 1e-5` and the recorded clamp arm.
+  `clipR`, `rgb2lab`, with the host float matrices and caches. `Lab2XYZ`
+  repeats the host's own split: `lab2rgb()` computes `(fy*fy*fy) * 65535` in
+  its SIMD loop and `65535 * fy * fy * fy` in its scalar tail, so the kernel
+  uses the first order for all but the last `width % 4` columns and the second
+  for those. The prefilter uses `epsi0 = 1e-6`; the tail uses `epsi = 1e-5`
+  and the recorded clamp arm.
 - `rt_local_adjustments_roi`: copies the active spot ROI.
 - `rt_lab_tools_lc_line`: the existing host-matched IIR Gaussian, sigma
   `(2 + 0.2 * blurcolde)`, SSE path only.
@@ -2788,8 +2792,9 @@ lab.regions `xlogf`/`xexpf`/`pow_F` ports, and the local-adjustments kernels:
   original, `calcreducdE()`/`calcLocalFactor()` and the L/C/H curve sequence
   in the block's order: chroma slider, C=f(C), C=f(L), L=f(C), H=f(H),
   lightness/contrast, L=f(L), L=f(H), C=f(H), then the blend.
-- `rt_local_adjustments_munsell`: the `avoidcolshi()` MUNS pass, ported but
-  not admitted by the predicate (see below).
+- `rt_local_adjustments_munsell`: the `avoidcolshi()` MUNS pass, admitted by
+  the predicate. Its chroma normalisation repeats the host's SIMD/scalar
+  split in the same way as the clamp.
 
 The per-spot order is prefilter, ROI blur/apply, tail clamp. `avoidcolshi()`
 runs after the tail clamp in the CPU, so the MUNS kernel is ordered there; the
@@ -2805,31 +2810,38 @@ kernel reads the diagonal tables with the host `LUT_CLIP_OFF` semantics
 `data[500]`. Identity curves are skipped. The two chroma-slider
 `DiagonalCurve`s are host-sampled at 65536 points; all other tables are the
 host LUTs directly. The measured worst case over the supported matrix is
-0.156250 LSB16.
+0.125000 LSB16.
 
-### MUNS blocker
+### Clamp parity and MUNS
 
-The MUNS kernel and `AllMunsellLch()` wrapper are in place, but on the real
-gate image (`ms0`, one MUNS spot) the device differs from the host by
-**136 LSB16 on 416,889 of 30,419,712 samples**. The same profile with
-`avoidgamutMethod == "NONE"` is within 1 LSB16. The cause is the tail clamp's
-last-bit difference feeding Munsell's discontinuous hue/zone thresholds: the
-input is not bit-exact, so a 1-LSB Lab difference can select a different
-Munsell zone or table entry. Making it faithful needs a bit-exact clamp, not
-an approximation. The predicate therefore refuses MUNS and the block runs the
-host builtin; `localadjustments-munsell.pp3` is a host residual row.
+The MUNS refusal was caused by the tail clamp, not by the Munsell kernel. On
+the gate image the pre-fix device MUNS output differed from the host by
+**136 LSB16 on 416,889 of 30,419,712 samples**, while the same profile with
+`avoidgamutMethod == "NONE"` was within 1 LSB16. A one-LSB Y difference moves
+Munsell's discontinuous hue/zone thresholds.
+
+The differing operation is the `Color::Lab2XYZ()` cubic: the host's SIMD loop
+computes `(fy*fy*fy) * 65535`, its scalar tail computes `((65535*fy)*fy)*fy`,
+and the two round differently. `lab2rgb()` scans four columns at a time while
+`j < W - 3`, so exactly the last `width % 4` columns use the scalar order. The
+device clamp now reproduces that split (`rt_la_lab2xyz()`) with the host's
+float matrices, caches, `epsi` and arm; `avoidcolshi()` normalises the MUNS
+sine/cosine with the same split. With this fix all six clamp-only cases are
+bit-exact (0 differing samples of 1,751,721), and the gate MUNS row is
+1 LSB16 (389,860 of 30,419,712 samples; `NONE` is 1 LSB16 on 389,597). The
+remaining 1 LSB is shared with `NONE` and is not a MUNS zone flip.
 
 ### Residuals
 
 Active spots must be Colour & Light only, `reparcol == 100`, no explicit
 mask, soft radius, merge, recursion, inversion, gradient, LabGrid, RGB or
-exposure curve, `avoidgamutMethod == "NONE"`, and a ROI of at least 5 px in
-each dimension. Inactive spots are clamp-only and may carry inert tool
+exposure curve, an `avoidgamutMethod` other than `"NONE"`/`"MUNS"`, and a ROI
+of at least 5 px in each dimension. Inactive spots are clamp-only and may carry inert tool
 settings. Everything else is a residual: exposure (FFT PDE),
 shadows/highlights, vibrance, local contrast, blur/denoise, sharpening, tone
 mapping, Retinex, CBDL, log, soft light, the common mask, CIE CAM, dehaze,
-`exc`/`full`/`main`, merge, explicit masks, soft radius, MUNS, LAB/XYZ/XYZREL,
-the RGB curve, LabGrid, `avoidrad != 0`, `transit == 100`, a blur radius above
+`exc`/`full`/`main`, merge, explicit masks, soft radius, LAB/XYZ/XYZREL, the
+RGB curve, LabGrid, `avoidrad != 0`, `transit == 100`, a blur radius above
 100, `ghs_D != 0 && ghs_BLP > 0` and a pre-CBDL pass. A GPU device is refused before the upload.
 
 ### Evidence
@@ -2838,16 +2850,17 @@ the RGB curve, LabGrid, `avoidrad != 0`, `transit == 100`, a blur radius above
 
 | Case | Result |
 |---|---|
-| Single-spot scalar matrix, 16 cases | 2,219,001 samples, `impl=opencl`, worst 0.060547 LSB16 |
-| Complex matrix, 17 cases | two/three ELI, reversed order, ELI/RECT, inactive/active both orders, each L/C/H curve alone, L=f(H) alone, all curves, and the gate multi-spot profile: 757,449 samples, `impl=opencl`, worst 0.156250 LSB16 |
+| Single-spot scalar matrix, 16 cases | 2,219,001 samples, `impl=opencl`, worst 0.031250 LSB16 |
+| Complex matrix, 22 cases | two/three ELI, reversed order, ELI/RECT, inactive/active both orders, each L/C/H curve alone, L=f(H) alone, all curves, one MUNS spot, MUNS at 179x49, MUNS and NONE, inactive then MUNS, all curves with MUNS, and the gate multi-spot profile: 966,546 samples, `impl=opencl`, worst 0.125000 LSB16 |
+| Clamp only, 6 cases | inactive spots at 238x64 (prefilter and tail only), 237x49 (prefilter, tail 1), 179x49 (both), and 8192x64 (prefilter): 1,751,721 samples, `impl=opencl`, **bit-exact** (PAE 0, 0 differing samples). Before the fix the same cases diverged by up to 0.045898 LSB16 |
 | Spot order | the three-spot forward and reversed blocks differ on 27,040 of 45,696 samples (PAE 270.833984 LSB16), so the sequential state is exercised |
-| Residuals, 16 parity cases | MUNS, explicit mask, soft radius, exposure, `reparcol` 50/1, highlight reconstruction, SH, recursion, `exc`, merge, LAB, XYZ, `avoidrad`, the RGB curve and GHS clamp leftovers record `impl=host` with no `impl=opencl` and are byte-identical to the block (PAE 0) |
+| Residuals, 15 parity cases | explicit mask, soft radius, exposure, `reparcol` 50/1, highlight reconstruction, SH, recursion, `exc`, merge, LAB, XYZ, `avoidrad`, the RGB curve and GHS clamp leftovers record `impl=host` with no `impl=opencl` and are byte-identical to the block (PAE 0) |
 | GHS clamp leftovers | before the admission fix, an inactive spot with `ghs_D=1` and `ghs_BLP=1` recorded `impl=opencl` and diverged by **1,296 LSB16** on 414,331 of 30,419,712 samples; the predicate now refuses the pair and the case is a host residual at PAE 0 |
 | 4-px ROI | host, PAE 0 |
 | `localadjustments.pp3` | PASS, `max_pae=1.5259e-05` (1 LSB16), `impl=opencl` |
 | `localadjustments-multispot.pp3` | PASS, `max_pae=1.5259e-05` (1 LSB16), `impl=opencl` |
 | `localadjustments-residual.pp3` (exposure) | host, informational 1 LSB16 |
-| `localadjustments-munsell.pp3` | host residual; the device MUNS attempt is 136 LSB16, so it is not a device row |
+| `localadjustments-munsell.pp3` | PASS, `max_pae=1.5259e-05` (1 LSB16), `impl=opencl`; the device MUNS pass is 1 LSB16 on 389,860 of 30,419,712 samples, and the same profile with `NONE` is 1 LSB16 on 389,597 |
 | Full `verify.sh --stage-device` | PASS, 25 PASS and 0 SKIP; `working.trc` stays 1 LSB16 |
 | Default path | with `RT_STAGE_OPENCL` unset the host block runs directly; CPU-only `stage-residency-test: PASS (25 skipped)` |
 | Builds | `build/cpu-perf-graph` and `build/opencl-perf-graph` compile |

@@ -1698,8 +1698,8 @@ Still CPU-only: `raw.preprocess`, `raw.demosaic`, `raw.base`, `lab.tools`,
 admitted set is any number of `norm` spots in list order: an active spot is
 `expcolor == true` with every other `exp*` false, `reparcol == 100`, no
 recursion/inversion/mask/soft radius/merge/LabGrid/RGB or exposure curve,
-`qualitycurveMethod` none or std, `avoidgamutMethod == "NONE"`, and
-chroma/lightness/contrast inside `-100..100`; an inactive spot is the
+`qualitycurveMethod` none or std, `avoidgamutMethod` `"NONE"` or `"MUNS"`,
+and chroma/lightness/contrast inside `-100..100`; an inactive spot is the
 clamp-only case and may carry inert tool settings. Both `ELI` and `RECT`
 shapes are admitted, and an active ROI must be at least 5 px in each
 dimension. The node runs, per spot, the negative-value prefilter, the ROI
@@ -1710,10 +1710,15 @@ block, and `lastorig` is unused while merge is a residual. `baseImg` stays
 host and the final `lab2rgb()` is the call site's. The chroma-slider curves
 and the seven L/C/H curves are host-built into 65536-entry tables.
 
-Munsell (`avoidgamutMethod == "MUNS"`) is a measured residual, not an
-approximation: on the real gate image the clamp's last-bit differences move
-Munsell's discontinuous hue/zone thresholds by up to 136 LSB16, so MUNS stays
-on the host until the clamp is bit-exact. Everything else is a residual:
+Munsell (`avoidgamutMethod == "MUNS"`) is admitted after the clamps became
+bit-exact. The pre-fix clamp differed from the host only in the
+`Color::Lab2XYZ()` cubic order: `lab2rgb()`'s SIMD loop computes
+`(fy*fy*fy) * 65535`, its scalar tail `((65535*fy)*fy)*fy`, and the tail is
+the last `width % 4` columns. That one-LSB Y difference moved Munsell's
+discontinuous hue/zone thresholds by up to 136 LSB16 on the gate image. The
+device clamp now repeats both orders and all six clamp-only cases are
+bit-exact (0 of 1,751,721 samples); the gate MUNS row is 1 LSB16, the same as
+`NONE`. Everything else is a residual:
 exposure (FFT PDE), shadows/highlights, vibrance, local contrast,
 blur/denoise, sharpening, tone mapping, Retinex, CBDL, log, soft light, the
 common mask, CIE CAM, dehaze, `exc`/`full`/`main`, merge, explicit masks,
