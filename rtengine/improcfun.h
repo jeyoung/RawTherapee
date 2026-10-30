@@ -217,6 +217,10 @@ enum class BlurType {
         return !(needsCA() || needsDistortion() || needsRotation() || needsPerspective() || needsLCP() || needsLensfun() || needsMetadata()) && (needsVignetting() || needsPCVignetting() || needsGradient());
     }
     void setScale(double iscale);
+    double getScale() const
+    {
+        return scale;
+    }
     void setOpenCLAllowed(bool allowed)
     {
         openCLAllowed = allowed;

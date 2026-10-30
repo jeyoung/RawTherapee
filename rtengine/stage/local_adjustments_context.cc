@@ -108,12 +108,15 @@ bool explicitMaskIdle(const procparams::LocallabParams::LocallabSpot& spot)
            !spot.enacieMaskall;
 }
 
-/* Every tool other than the six this node runs. The exposure tool also
- * decides the clamp arm; it is a residual here. */
+/* Every tool other than the seven this node runs, plus the retinex tool. The
+ * exposure tool also decides the clamp arm; it is a residual here. Local
+ * dehaze is not a tool of its own: Lab_Local() gates it on the retinex
+ * enable, so expreti is accepted only when the retinex strength is zero
+ * (dehazeAdmitted() checks that) and is otherwise a residual. */
 bool otherToolEnabled(const procparams::LocallabParams::LocallabSpot& spot)
 {
     return spot.expexpose || spot.expblur ||
-           spot.exptonemap || spot.expreti || spot.expsharp ||
+           spot.exptonemap || spot.expsharp ||
            spot.explog || spot.expmask || spot.expcie ||
            spot.expprecam;
 }
@@ -295,6 +298,41 @@ bool softLightAdmitted(const procparams::LocallabParams::LocallabSpot& spot)
     return spot.sensisf >= 1 && spot.sensisf <= 100;
 }
 
+/* Whether the local dehaze tool's parameters are inside the device set.
+ *
+ * Lab_Local()'s guard is `(lp.dehaze != 0 || lp.prevdE) && lp.retiena`; the
+ * export call site passes prevDeltaE = false, and lp.retiena is the retinex
+ * enable (expreti on an active spot with no explicit mask), so dehaze needs
+ * the retinex tool switched on even though it is the only caller.
+ *
+ * The device runs dehazeloc(): the retinex tool itself must therefore be a
+ * no-op, which is strength zero. Any non-zero retinex strength is a residual.
+ * dehazeblack would run tone_eqdehaz() on the ROI before the estimate and is
+ * a residual. The strength, depth and saturation ranges are the GUI's, and
+ * the sensitivity is the deltaE blend's (senstype 30 reads lp.sensh). The
+ * local block hardcodes showDepthMap = false, so a global show-depth request
+ * cannot be reproduced here and is refused by the block predicate. */
+bool dehazeAdmitted(const procparams::LocallabParams::LocallabSpot& spot)
+{
+    if (spot.dehaz < -100 || spot.dehaz > 100 || spot.dehaz == 0) {
+        return false;
+    }
+    if (spot.depth < 0 || spot.depth > 100) {
+        return false;
+    }
+    if (!finiteValue(spot.dehazeSaturation) ||
+        spot.dehazeSaturation < 0.0 || spot.dehazeSaturation > 100.0) {
+        return false;
+    }
+    if (spot.dehazeblack != 0.0) {
+        return false;
+    }
+    if (spot.sensih < 0 || spot.sensih > 100) {
+        return false;
+    }
+    return spot.str == 0.0;
+}
+
 /* LocLHCurve/LocHHCurve/LocCHCurve's own activity test: the host scans the
  * first 500 entries for a value other than the identity 0.5. */
 template<typename Curve>
@@ -382,7 +420,7 @@ bool localAdjustmentsSupported(const procparams::ProcParams& params)
         return false;
     }
     if (params.dirpyrequalizer.enabled || params.dehaze.enabled ||
-        params.toneCurve.hrenabled) {
+        params.dehaze.showDepthMap || params.toneCurve.hrenabled) {
         return false;
     }
 
@@ -474,13 +512,31 @@ bool localAdjustmentsSupported(const procparams::ProcParams& params)
             spot.transitgrad < -10.0 || spot.transitgrad > 10.0) {
             return false;
         }
-        /* An active spot runs at least one of the six tools in the device
-         * set; an inactive spot does no work, so its tool settings are inert
-         * and admitted. */
+        /* An active spot runs at least one of the seven tools in the device
+         * set, plus the local dehaze pass when the retinex enable exposes it;
+         * an inactive spot does no work, so its tool settings are inert and
+         * admitted. */
         if (spot.activ) {
+            const bool dehaze = spot.expreti && spot.dehaz != 0;
             if ((!spot.expcolor && !spot.expvibrance && !spot.expcontrast &&
-                 !spot.expshadhigh && !spot.expsoft && !spot.expcbdl) ||
+                 !spot.expshadhigh && !spot.expsoft && !spot.expcbdl &&
+                 !dehaze) ||
                 otherToolEnabled(spot)) {
+                return false;
+            }
+            /* The retinex enable is the dehaze gate. The retinex tool itself
+             * must be a no-op; a strength other than zero is an active
+             * retinex configuration and stays on the host. A dehaze value
+             * without the enable would be silently inert, so it is refused
+             * rather than treated as a clamp-only block. */
+            if (spot.expreti) {
+                if (spot.str != 0.0) {
+                    return false;
+                }
+                if (spot.dehaz != 0 && !dehazeAdmitted(spot)) {
+                    return false;
+                }
+            } else if (spot.dehaz != 0) {
                 return false;
             }
             if (spot.expcbdl && !cbdlAdmitted(spot)) {
@@ -1122,6 +1178,7 @@ int LocalAdjustmentsContext::build(int spot, const RtStageBuffer* lab,
         for (int row = 0; row < 3; ++row) {
             for (int col = 0; col < 3; ++col) {
                 ws_[row * 3 + col] = static_cast<float>(ws[row][col]);
+                wsDouble_[row * 3 + col] = ws[row][col];
                 iws_[row * 3 + col] = static_cast<float>(iws[row][col]);
             }
         }
@@ -1416,6 +1473,20 @@ int LocalAdjustmentsContext::build(int spot, const RtStageBuffer* lab,
                               lp.softmet == 0 && lp.strng > 1.f;
 
     /*
+     * Local dehaze. Lab_Local()'s guard is `(lp.dehaze != 0 || lp.prevdE) &&
+     * lp.retiena`; the export call site passes no previous-deltaE flag and the
+     * predicate has already narrowed the retinex enable, the mask state and
+     * the retinex strength. The block runs dehazeloc() over the spot ROI, so
+     * the host member scale must be the export scale of one.
+     */
+    const bool dehazeRun = profileSpot.expreti && lp.activspot &&
+                           profileSpot.dehaz != 0;
+    if (dehazeRun &&
+        ipf_.getScale() != RT_LOCAL_ADJUSTMENTS_DEHAZE_SCALE) {
+        return 1;
+    }
+
+    /*
      * Local CBDL. cbdl_local_temp() trims the trailing identity levels, then
      * decomposes every level up to the last non-identity one. The luminance
      * pass uses lp.mulloc directly; the chroma pass derives
@@ -1667,6 +1738,17 @@ int LocalAdjustmentsContext::build(int spot, const RtStageBuffer* lab,
     record[RT_LOCAL_ADJUSTMENTS_SLOT_SOFT_STRENGTH] = lp.strng;
     record[RT_LOCAL_ADJUSTMENTS_SLOT_SENSSOFT] =
         static_cast<float>(lp.senssf);
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_EXPDENAZE] = dehazeRun ? 1.f : 0.f;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_SENSH] =
+        static_cast<float>(profileSpot.sensih);
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_DEHAZE_STRENGTH] =
+        static_cast<float>(profileSpot.dehaz);
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_DEHAZE_DEPTH] =
+        static_cast<float>(profileSpot.depth);
+    /* The host narrows the saturation through an int before handing it to
+     * DehazeParams; the record carries the same truncated value. */
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_DEHAZE_SATURATION] =
+        static_cast<float>(static_cast<int>(profileSpot.dehazeSaturation));
     record[RT_LOCAL_ADJUSTMENTS_SLOT_EXPCBDL] =
         (cbdlLumaRun || cbdlChromaBlend) ? 1.f : 0.f;
     record[RT_LOCAL_ADJUSTMENTS_SLOT_SENSCB] =
@@ -1780,6 +1862,7 @@ int LocalAdjustmentsContext::build(int spot, const RtStageBuffer* lab,
     out.lut_count = static_cast<uint32_t>(luts_.size());
     out.ws = ws_;
     out.iws = iws_;
+    out.ws_double = wsDouble_;
     out.cachef = cachef_.data();
     out.cachefy = cachefy_.data();
     out.gamma_srgb = gammaSrgb_.data();

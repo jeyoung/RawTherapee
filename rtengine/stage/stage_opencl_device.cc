@@ -71,6 +71,7 @@
 
 #include "cplx_wavelet_filter_coeffs.h"
 
+#include "dehaze_ambient.h"
 #include "ipshadowshighlights.h"
 #include "transformmap.h"
 
@@ -7961,10 +7962,10 @@ RtStageStatus run_sharpen(const std::shared_ptr<OpenCLEnv>& env,
  * built from the spot's lcradius.
  *
  * Pass order matches Lab_Local(): the optional negative-value prefilter, then,
- * per active spot, local CBDL, vibrance, shadows/highlights, soft light, local
- * contrast and Colour & Light, each with its own ROI copy and deltaE reference
- * blur. The full-image tail clamp and the Munsell pass follow. Every pass writes
- * the device image;
+ * per active spot, local dehaze, local CBDL, vibrance, shadows/highlights, soft
+ * light, local contrast and Colour & Light, each with its own ROI copy and
+ * deltaE reference blur. The full-image tail clamp and the Munsell pass follow.
+ * Every pass writes the device image;
  * the host Lab is read back only after all passes succeeded, so a refusal or
  * a failed launch leaves it untouched for the builtin.
  */
@@ -8062,6 +8063,24 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
     cl_kernel softlight_kernel =
         compiled_kernel_entry(env, def, "rt_local_adjustments_softlight",
                               error);
+    cl_kernel dehaze_lab2rgb_kernel = compiled_kernel_entry(
+        env, def, "rt_local_adjustments_dehaze_lab2rgb", error);
+    cl_kernel dehaze_rowmax_kernel = compiled_kernel_entry(
+        env, def, "rt_local_adjustments_dehaze_rowmax", error);
+    cl_kernel dehaze_scale_kernel = compiled_kernel_entry(
+        env, def, "rt_local_adjustments_dehaze_scale", error);
+    cl_kernel dehaze_subsample_kernel = compiled_kernel_entry(
+        env, def, "rt_local_adjustments_dehaze_subsample", error);
+    cl_kernel dehaze_upsample_kernel = compiled_kernel_entry(
+        env, def, "rt_local_adjustments_dehaze_upsample", error);
+    cl_kernel dehaze_rescale_kernel = compiled_kernel_entry(
+        env, def, "rt_local_adjustments_dehaze_rescale", error);
+    cl_kernel dehaze_dark_kernel = compiled_kernel_entry(
+        env, def, "rt_local_adjustments_dehaze_dark", error);
+    cl_kernel dehaze_recover_kernel = compiled_kernel_entry(
+        env, def, "rt_local_adjustments_dehaze_recover", error);
+    cl_kernel dehaze_rgb2lab_kernel = compiled_kernel_entry(
+        env, def, "rt_local_adjustments_dehaze_rgb2lab", error);
     cl_kernel cbdl_fill_kernel =
         compiled_kernel_entry(env, def, "rt_local_adjustments_cbdl_fill",
                               error);
@@ -8103,6 +8122,15 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
         line_kernel == nullptr || vibrance_kernel == nullptr ||
         lc_blend_kernel == nullptr || blend_kernel == nullptr ||
         softlight_kernel == nullptr ||
+        dehaze_lab2rgb_kernel == nullptr ||
+        dehaze_rowmax_kernel == nullptr ||
+        dehaze_scale_kernel == nullptr ||
+        dehaze_subsample_kernel == nullptr ||
+        dehaze_upsample_kernel == nullptr ||
+        dehaze_rescale_kernel == nullptr ||
+        dehaze_dark_kernel == nullptr ||
+        dehaze_recover_kernel == nullptr ||
+        dehaze_rgb2lab_kernel == nullptr ||
         cbdl_fill_kernel == nullptr || cbdl_copy_kernel == nullptr ||
         cbdl_finish_kernel == nullptr || cbdl_metric_kernel == nullptr ||
         cbdl_luma_kernel == nullptr || cbdl_chroma_kernel == nullptr ||
@@ -8288,6 +8316,14 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
     char cbdl_resid_key = 0;
     char cbdl_rowmax_key = 0;
     char cbdl_pyr_keys[RT_LOCAL_ADJUSTMENTS_CBDL_LEVELS] = {};
+    char dehaze_filt_key = 0;
+    char dehaze_rowmax_key = 0;
+    char dehaze_sub_i1_key = 0;
+    char dehaze_sub_p1_key = 0;
+    char dehaze_sub_meani_key = 0;
+    char dehaze_sub_meanp_key = 0;
+    char dehaze_sub_temp_key = 0;
+    char dehaze_rescale_key = 0;
     StageDeviceBufferPtr blur_device[3];
 
     const auto finite = [](float value) { return std::isfinite(value); };
@@ -8454,6 +8490,8 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
             rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXPSOFT] == 1.0f;
         const bool cbdl =
             rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXPCBDL] == 1.0f;
+        const bool dehazePass =
+            rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXPDENAZE] == 1.0f;
         const uint32_t shape =
             static_cast<uint32_t>(rec[RT_LOCAL_ADJUSTMENTS_SLOT_SHAPE]);
         const uint32_t avoid = static_cast<uint32_t>(
@@ -8473,6 +8511,8 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
             (rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXPSOFT] != 0.0f &&
              !softLight) ||
             (rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXPCBDL] != 0.0f && !cbdl) ||
+            (rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXPDENAZE] != 0.0f &&
+             !dehazePass) ||
             (rec[RT_LOCAL_ADJUSTMENTS_SLOT_MERGE] != 0.0f) ||
             (rec[RT_LOCAL_ADJUSTMENTS_SLOT_HRENABLED] != 0.0f) ||
             (rec[RT_LOCAL_ADJUSTMENTS_SLOT_REPARCOL] != 100.0f) ||
@@ -8487,7 +8527,8 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
             (active && colour &&
              rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXPCOLOR] != 1.0f) ||
             (!active && (colour || vibrance || localContrast ||
-                         shadowsHighlights || softLight || cbdl || islocal))) {
+                         shadowsHighlights || softLight || cbdl ||
+                         dehazePass || islocal))) {
             error = "local.adjustments record is outside the supported set";
             return RT_STAGE_FALLBACK;
         }
@@ -8566,6 +8607,19 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
              rec[RT_LOCAL_ADJUSTMENTS_SLOT_SENSSOFT] > 100.0f)) {
             error = "local.adjustments soft-light setting is outside its "
                     "range";
+            return RT_STAGE_FALLBACK;
+        }
+        if (dehazePass &&
+            (rec[RT_LOCAL_ADJUSTMENTS_SLOT_DEHAZE_STRENGTH] < -100.0f ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_DEHAZE_STRENGTH] > 100.0f ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_DEHAZE_STRENGTH] == 0.0f ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_DEHAZE_DEPTH] < 0.0f ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_DEHAZE_DEPTH] > 100.0f ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_DEHAZE_SATURATION] < 0.0f ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_DEHAZE_SATURATION] > 100.0f ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_SENSH] < 0.0f ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_SENSH] > 100.0f)) {
+            error = "local.adjustments dehaze setting is outside its range";
             return RT_STAGE_FALLBACK;
         }
         const float cbdlLumaLevelsValue =
@@ -9038,6 +9092,118 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
                 sh_temp_device =
                     residency->acquire(&sh_temp_key, sh_sub_shape, &error);
             }
+
+            /*
+             * Local dehaze. guidedfilter.cc's calculate_subsampling() is the
+             * block's own choice: one when either axis fits 600 px or the
+             * radius is one, otherwise the largest divisor of the radius in
+             * 2..5, else clamp(r / 2, 2, 4). The two filter radii are the
+             * initial patch (5) and the final dark-channel radius (4 times
+             * max(max(W, H) / 600, 2)); the sub-grid buffers are sized for
+             * the larger of the two subsampled shapes. The ambient reduction
+             * reads the filtered channels directly when the ROI fits the
+             * 200 px cap, otherwise their nearest-neighbour rescale.
+             */
+            const auto dehaze_subsampling = [](int w, int h, int r) -> int {
+                if (r == 1) {
+                    return 1;
+                }
+                if (std::max(w, h) <=
+                    RT_LOCAL_ADJUSTMENTS_DEHAZE_GUIDE_SMALL) {
+                    return 1;
+                }
+                for (int s = 5; s > 0; --s) {
+                    if (r % s == 0) {
+                        return s;
+                    }
+                }
+                return std::max(2, std::min(r / 2, 4));
+            };
+            const int dehaze_patch0 =
+                RT_LOCAL_ADJUSTMENTS_DEHAZE_PATCH0;
+            const int dehaze_final_patch = std::max(
+                std::max(bfw, bfh) / RT_LOCAL_ADJUSTMENTS_DEHAZE_FINAL_DIVISOR,
+                RT_LOCAL_ADJUSTMENTS_DEHAZE_MIN_PATCH);
+            const int dehaze_final_radius =
+                dehaze_final_patch * RT_LOCAL_ADJUSTMENTS_DEHAZE_RADIUS_FACTOR;
+            const int dehaze_s1 =
+                dehaze_subsampling(bfw, bfh, dehaze_patch0);
+            const int dehaze_s2 =
+                dehaze_subsampling(bfw, bfh, dehaze_final_radius);
+            const int dehaze_sw1 = bfw / dehaze_s1;
+            const int dehaze_sh1 = bfh / dehaze_s1;
+            const int dehaze_sw2 = bfw / dehaze_s2;
+            const int dehaze_sh2 = bfh / dehaze_s2;
+            const int dehaze_max_sw = std::max(dehaze_sw1, dehaze_sw2);
+            const int dehaze_max_sh = std::max(dehaze_sh1, dehaze_sh2);
+            const float dehaze_ratio =
+                static_cast<float>(bfw) / static_cast<float>(bfh);
+            const int dehaze_ww =
+                dehaze_ratio >= 1.f
+                    ? static_cast<int>(
+                          static_cast<float>(
+                              RT_LOCAL_ADJUSTMENTS_DEHAZE_SIZECAP) *
+                          dehaze_ratio)
+                    : RT_LOCAL_ADJUSTMENTS_DEHAZE_SIZECAP;
+            const int dehaze_hh =
+                dehaze_ratio >= 1.f
+                    ? RT_LOCAL_ADJUSTMENTS_DEHAZE_SIZECAP
+                    : static_cast<int>(
+                          static_cast<float>(
+                              RT_LOCAL_ADJUSTMENTS_DEHAZE_SIZECAP) /
+                          dehaze_ratio);
+            const bool dehaze_rescale =
+                !(bfw <= dehaze_ww && bfh <= dehaze_hh);
+            StageDeviceBufferPtr dehaze_filt_device;
+            StageDeviceBufferPtr dehaze_rowmax_device;
+            StageDeviceBufferPtr dehaze_sub_i1_device;
+            StageDeviceBufferPtr dehaze_sub_p1_device;
+            StageDeviceBufferPtr dehaze_sub_meani_device;
+            StageDeviceBufferPtr dehaze_sub_meanp_device;
+            StageDeviceBufferPtr dehaze_sub_temp_device;
+            StageDeviceBufferPtr dehaze_rescale_device;
+            if (dehazePass) {
+                /*
+                 * The block's rescaleNearest() indexes with signed int
+                 * products. Refuse an aspect whose products would overflow
+                 * the kernel's (and the host's) int arithmetic, and a cap
+                 * that rounds to a zero-sized array, rather than reproduce
+                 * undefined behaviour.
+                 */
+                if (dehaze_ww < 1 || dehaze_hh < 1 ||
+                    static_cast<long long>(dehaze_ww - 1) * bfw >
+                        std::numeric_limits<cl_int>::max() ||
+                    static_cast<long long>(dehaze_hh - 1) * bfh >
+                        std::numeric_limits<cl_int>::max()) {
+                    error = "local.adjustments dehaze ambient grid is outside "
+                            "the block's integer range";
+                    return RT_STAGE_FALLBACK;
+                }
+                dehaze_filt_device = residency->acquire(
+                    &dehaze_filt_key,
+                    StageBufferShape{RT_STAGE_F32, bfw, bfh, 3}, &error);
+                dehaze_rowmax_device = residency->acquire(
+                    &dehaze_rowmax_key,
+                    StageBufferShape{RT_STAGE_F32, bfh, 1, 1}, &error);
+                const StageBufferShape sub_shape{RT_STAGE_F32, dehaze_max_sw,
+                                                 dehaze_max_sh, 1};
+                dehaze_sub_i1_device = residency->acquire(
+                    &dehaze_sub_i1_key, sub_shape, &error);
+                dehaze_sub_p1_device = residency->acquire(
+                    &dehaze_sub_p1_key, sub_shape, &error);
+                dehaze_sub_meani_device = residency->acquire(
+                    &dehaze_sub_meani_key, sub_shape, &error);
+                dehaze_sub_meanp_device = residency->acquire(
+                    &dehaze_sub_meanp_key, sub_shape, &error);
+                dehaze_sub_temp_device = residency->acquire(
+                    &dehaze_sub_temp_key, sub_shape, &error);
+                if (dehaze_rescale) {
+                    dehaze_rescale_device = residency->acquire(
+                        &dehaze_rescale_key,
+                        StageBufferShape{RT_STAGE_F32, dehaze_ww, dehaze_hh,
+                                         3}, &error);
+                }
+            }
             bool cbdl_acquired = true;
             if (cbdl) {
                 cbdl_acquired = cbdl_src_device && cbdl_out_device &&
@@ -9048,8 +9214,16 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
                         cbdl_acquired && cbdl_pyr_device[level];
                 }
             }
+            const bool dehaze_acquired =
+                !dehazePass ||
+                (dehaze_filt_device && dehaze_rowmax_device &&
+                 dehaze_sub_i1_device && dehaze_sub_p1_device &&
+                 dehaze_sub_meani_device && dehaze_sub_meanp_device &&
+                 dehaze_sub_temp_device &&
+                 (!dehaze_rescale || dehaze_rescale_device));
             if (!work_device || !scratch_device || !blur_device[0] ||
                 !blur_device[1] || !blur_device[2] || !cbdl_acquired ||
+                !dehaze_acquired ||
                 (shadowsHighlights &&
                  (!sh_full_device || !sh_i1_device || !sh_p1_device ||
                   !sh_meani_device || !sh_meanp_device ||
@@ -9127,6 +9301,50 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
                 if (sh_sw < 3 || sh_sh < 3) {
                     error = "local.adjustments shadows/highlights grid is too "
                             "small";
+                    return RT_STAGE_FALLBACK;
+                }
+            }
+            int dehaze_filt_pitch = 0;
+            int dehaze_filt_plane = 0;
+            int dehaze_rowmax_pitch = 0;
+            int dehaze_sub_pitch = 0;
+            int dehaze_rescale_pitch = 0;
+            int dehaze_rescale_plane = 0;
+            if (dehazePass) {
+                dehaze_filt_pitch =
+                    int_pitch(pitch_of(dehaze_filt_device), "dehaze");
+                dehaze_filt_plane = int_pitch(
+                    plane_pitch_of(dehaze_filt_device), "dehaze plane");
+                dehaze_rowmax_pitch =
+                    int_pitch(pitch_of(dehaze_rowmax_device), "dehaze rowmax");
+                dehaze_sub_pitch =
+                    int_pitch(pitch_of(dehaze_sub_i1_device), "dehaze sub");
+                if (pitch_of(dehaze_sub_p1_device) !=
+                        pitch_of(dehaze_sub_i1_device) ||
+                    pitch_of(dehaze_sub_meani_device) !=
+                        pitch_of(dehaze_sub_i1_device) ||
+                    pitch_of(dehaze_sub_meanp_device) !=
+                        pitch_of(dehaze_sub_i1_device) ||
+                    pitch_of(dehaze_sub_temp_device) !=
+                        pitch_of(dehaze_sub_i1_device)) {
+                    error = "local.adjustments dehaze subsampled buffers have "
+                            "different pitches";
+                    return RT_STAGE_FALLBACK;
+                }
+                if (dehaze_rescale) {
+                    dehaze_rescale_pitch =
+                        int_pitch(pitch_of(dehaze_rescale_device),
+                                  "dehaze rescale");
+                    dehaze_rescale_plane = int_pitch(
+                        plane_pitch_of(dehaze_rescale_device),
+                        "dehaze rescale plane");
+                    if (dehaze_rescale_pitch < 0 ||
+                        dehaze_rescale_plane < 0) {
+                        return RT_STAGE_FALLBACK;
+                    }
+                }
+                if (dehaze_filt_pitch < 0 || dehaze_filt_plane < 0 ||
+                    dehaze_rowmax_pitch < 0 || dehaze_sub_pitch < 0) {
                     return RT_STAGE_FALLBACK;
                 }
             }
@@ -9554,6 +9772,777 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
                                 static_cast<std::size_t>(bfh),
                                 "shadows/highlights blend");
             };
+
+            /*
+             * Local dehaze. Lab_Local()'s order is tone map, dehaze, retinex,
+             * CBDL, vibrance, shadows/highlights, soft light, local contrast,
+             * Colour & Light, so the pass runs before CBDL. The block:
+             *
+             *   copy ROI Lab, blur the deltaE reference,
+             *   Lab -> RGB, normalize by max(max * 2, 65535),
+             *   guidedFilter(img.channel, img.channel, r = 5, eps = 0.1) for
+             *       each channel,
+             *   the ambient reduction (host, see dehaze_ambient.h),
+             *   get_dark_channel() with patch = max(max(W, H) / 600, 2),
+             *   guidedFilter(normalized B, dark, dark, patch * 4, 1e-5),
+             *   the per-pixel recovery, restore, RGB -> Lab,
+             *   transit_shapedetect2() senstype 30.
+             *
+             * The guided filters are the lab.tools fragments with the block's
+             * automatic subsampling. The host reduction is the block's own
+             * percentile/ambient estimate over the device's filtered
+             * channels; it is the only part of the pass that runs on the host.
+             */
+            if (dehazePass) {
+                if (!copy_roi() ||
+                    !blur_roi(*setup.iir_vibrance, "dehaze blur")) {
+                    return RT_STAGE_FALLBACK;
+                }
+
+                cl_mem dehaze_filt_memory =
+                    memory_of(dehaze_filt_device);
+                cl_mem dehaze_sub_i1_memory =
+                    memory_of(dehaze_sub_i1_device);
+                cl_mem dehaze_sub_p1_memory =
+                    memory_of(dehaze_sub_p1_device);
+                cl_mem dehaze_sub_meani_memory =
+                    memory_of(dehaze_sub_meani_device);
+                cl_mem dehaze_sub_meanp_memory =
+                    memory_of(dehaze_sub_meanp_device);
+                cl_mem dehaze_sub_temp_memory =
+                    memory_of(dehaze_sub_temp_device);
+
+                /* boxblur() over one subsampled plane. The horizontal pass
+                 * reads the source and writes the scratch plane; the vertical
+                 * pass reads the scratch plane and writes the destination, so
+                 * an in-place call is safe. */
+                const auto dehaze_box =
+                    [&](cl_mem src, cl_mem dst, cl_int radius_value,
+                        cl_int grid_width, cl_int grid_height) -> bool {
+                    cl_uint arg = 0;
+                    bool ok = true;
+                    ok = ok && set(sh_box_h_kernel, arg++, sizeof(cl_mem),
+                                   &src);
+                    ok = ok && set(sh_box_h_kernel, arg++, sizeof(cl_mem),
+                                   &dehaze_sub_temp_memory);
+                    ok = ok && set(sh_box_h_kernel, arg++, sizeof(cl_int),
+                                   &radius_value);
+                    ok = ok && set(sh_box_h_kernel, arg++, sizeof(cl_int),
+                                   &grid_width);
+                    ok = ok && set(sh_box_h_kernel, arg++, sizeof(cl_int),
+                                   &grid_height);
+                    ok = ok && set(sh_box_h_kernel, arg++, sizeof(cl_int),
+                                   &dehaze_sub_pitch);
+                    if (!ok ||
+                        !launch2d(sh_box_h_kernel, 1,
+                                  static_cast<std::size_t>(grid_height),
+                                  "dehaze horizontal box blur")) {
+                        return false;
+                    }
+                    arg = 0;
+                    ok = true;
+                    ok = ok && set(sh_box_v_kernel, arg++, sizeof(cl_mem),
+                                   &dehaze_sub_temp_memory);
+                    ok = ok && set(sh_box_v_kernel, arg++, sizeof(cl_mem),
+                                   &dst);
+                    ok = ok && set(sh_box_v_kernel, arg++, sizeof(cl_int),
+                                   &radius_value);
+                    ok = ok && set(sh_box_v_kernel, arg++, sizeof(cl_int),
+                                   &grid_width);
+                    ok = ok && set(sh_box_v_kernel, arg++, sizeof(cl_int),
+                                   &grid_height);
+                    ok = ok && set(sh_box_v_kernel, arg++, sizeof(cl_int),
+                                   &dehaze_sub_pitch);
+                    if (!ok) {
+                        return false;
+                    }
+                    return launch2d(sh_box_v_kernel,
+                                    static_cast<std::size_t>(grid_width), 1,
+                                    "dehaze vertical box blur");
+                };
+
+                /* guidedfilter.cc's element-wise operation, op 0 MUL,
+                 * op 1 SUBMUL and op 2 DIVEPSILON. */
+                const auto dehaze_combine =
+                    [&](cl_mem dst, cl_mem a, cl_mem b, cl_mem c,
+                        cl_int op, cl_float epsilon, cl_int width,
+                        cl_int height) -> bool {
+                    cl_uint arg = 0;
+                    bool ok = true;
+                    ok = ok && set(sh_combine_kernel, arg++, sizeof(cl_mem),
+                                   &dst);
+                    ok = ok && set(sh_combine_kernel, arg++, sizeof(cl_mem),
+                                   &a);
+                    ok = ok && set(sh_combine_kernel, arg++, sizeof(cl_mem),
+                                   &b);
+                    ok = ok && set(sh_combine_kernel, arg++, sizeof(cl_mem),
+                                   &c);
+                    ok = ok && set(sh_combine_kernel, arg++, sizeof(cl_int),
+                                   &op);
+                    ok = ok && set(sh_combine_kernel, arg++, sizeof(cl_float),
+                                   &epsilon);
+                    ok = ok && set(sh_combine_kernel, arg++, sizeof(cl_int),
+                                   &dehaze_sub_pitch);
+                    ok = ok && set(sh_combine_kernel, arg++, sizeof(cl_int),
+                                   &width);
+                    ok = ok && set(sh_combine_kernel, arg++, sizeof(cl_int),
+                                   &height);
+                    if (!ok) {
+                        return false;
+                    }
+                    return launch2d(sh_combine_kernel,
+                                    static_cast<std::size_t>(width),
+                                    static_cast<std::size_t>(height),
+                                    "dehaze guided filter");
+                };
+
+                /*
+                 * guidedFilter(guide, src, dst, radius, epsilon) with the
+                 * block's automatic subsampling. `guide_plane`, `src_plane`
+                 * and `dst_plane` are float offsets into the multi-plane
+                 * buffers; the elements follow the same alias order as
+                 * guidedfilter.cc (corrIp reuses p1, corrI reuses I1, and so
+                 * on).
+                 */
+                const auto dehaze_run_guided =
+                    [&](cl_mem guide, cl_int guide_pitch,
+                        cl_int guide_plane, cl_mem src, cl_int src_pitch,
+                        cl_int src_plane, cl_mem dst, cl_int dst_pitch,
+                        cl_int dst_plane, int radius, float epsilon, int sw,
+                        int sh, int subsampling, const char* label) -> bool {
+                    const cl_int cl_sw = sw;
+                    const cl_int cl_sh = sh;
+                    const cl_float sub_col =
+                        static_cast<cl_float>(bfw) /
+                        static_cast<cl_float>(sw);
+                    const cl_float sub_row =
+                        static_cast<cl_float>(bfh) /
+                        static_cast<cl_float>(sh);
+                    cl_uint arg = 0;
+                    bool ok = true;
+                    ok = ok && set(dehaze_subsample_kernel, arg++,
+                                   sizeof(cl_mem), &guide);
+                    ok = ok && set(dehaze_subsample_kernel, arg++,
+                                   sizeof(cl_int), &guide_pitch);
+                    ok = ok && set(dehaze_subsample_kernel, arg++,
+                                   sizeof(cl_int), &guide_plane);
+                    ok = ok && set(dehaze_subsample_kernel, arg++,
+                                   sizeof(cl_mem), &src);
+                    ok = ok && set(dehaze_subsample_kernel, arg++,
+                                   sizeof(cl_int), &src_pitch);
+                    ok = ok && set(dehaze_subsample_kernel, arg++,
+                                   sizeof(cl_int), &src_plane);
+                    ok = ok && set(dehaze_subsample_kernel, arg++,
+                                   sizeof(cl_mem), &dehaze_sub_i1_memory);
+                    ok = ok && set(dehaze_subsample_kernel, arg++,
+                                   sizeof(cl_mem), &dehaze_sub_p1_memory);
+                    ok = ok && set(dehaze_subsample_kernel, arg++,
+                                   sizeof(cl_int), &dehaze_sub_pitch);
+                    ok = ok && set(dehaze_subsample_kernel, arg++,
+                                   sizeof(cl_int), &cl_sw);
+                    ok = ok && set(dehaze_subsample_kernel, arg++,
+                                   sizeof(cl_int), &cl_sh);
+                    ok = ok && set(dehaze_subsample_kernel, arg++,
+                                   sizeof(cl_int), &bfw);
+                    ok = ok && set(dehaze_subsample_kernel, arg++,
+                                   sizeof(cl_int), &bfh);
+                    ok = ok && set(dehaze_subsample_kernel, arg++,
+                                   sizeof(cl_float), &sub_col);
+                    ok = ok && set(dehaze_subsample_kernel, arg++,
+                                   sizeof(cl_float), &sub_row);
+                    if (!ok ||
+                        !launch2d(dehaze_subsample_kernel,
+                                  static_cast<std::size_t>(sw),
+                                  static_cast<std::size_t>(sh), label)) {
+                        error = std::string("local.adjustments ") + label +
+                                " subsample failed";
+                        return false;
+                    }
+
+                    const cl_int box_radius = guidedFilterBoxRadius(
+                        radius, subsampling, sw, sh);
+                    const cl_float cl_epsilon = epsilon;
+                    const cl_int cl_width = sw;
+                    const cl_int cl_height = sh;
+
+                    if (!dehaze_box(dehaze_sub_i1_memory,
+                                    dehaze_sub_meani_memory, box_radius,
+                                    cl_width, cl_height) ||
+                        !dehaze_box(dehaze_sub_p1_memory,
+                                    dehaze_sub_meanp_memory, box_radius,
+                                    cl_width, cl_height)) {
+                        return false;
+                    }
+
+                    cl_mem dummy = dehaze_sub_temp_memory;
+                    if (!dehaze_combine(dehaze_sub_p1_memory,
+                                        dehaze_sub_i1_memory,
+                                        dehaze_sub_p1_memory, dummy, 0,
+                                        cl_epsilon, cl_width, cl_height) ||
+                        !dehaze_box(dehaze_sub_p1_memory,
+                                    dehaze_sub_p1_memory, box_radius,
+                                    cl_width, cl_height) ||
+                        !dehaze_combine(dehaze_sub_i1_memory,
+                                        dehaze_sub_i1_memory,
+                                        dehaze_sub_i1_memory, dummy, 0,
+                                        cl_epsilon, cl_width, cl_height) ||
+                        !dehaze_box(dehaze_sub_i1_memory,
+                                    dehaze_sub_i1_memory, box_radius,
+                                    cl_width, cl_height)) {
+                        return false;
+                    }
+
+                    if (!dehaze_combine(dehaze_sub_i1_memory,
+                                        dehaze_sub_meani_memory,
+                                        dehaze_sub_meani_memory,
+                                        dehaze_sub_i1_memory, 1,
+                                        cl_epsilon, cl_width, cl_height) ||
+                        !dehaze_combine(dehaze_sub_p1_memory,
+                                        dehaze_sub_meani_memory,
+                                        dehaze_sub_meanp_memory,
+                                        dehaze_sub_p1_memory, 1,
+                                        cl_epsilon, cl_width, cl_height)) {
+                        return false;
+                    }
+
+                    if (!dehaze_combine(dehaze_sub_i1_memory,
+                                        dehaze_sub_p1_memory,
+                                        dehaze_sub_i1_memory,
+                                        dehaze_sub_i1_memory, 2,
+                                        cl_epsilon, cl_width, cl_height) ||
+                        !dehaze_combine(dehaze_sub_p1_memory,
+                                        dehaze_sub_i1_memory,
+                                        dehaze_sub_meani_memory,
+                                        dehaze_sub_meanp_memory, 1,
+                                        cl_epsilon, cl_width, cl_height)) {
+                        return false;
+                    }
+
+                    if (!dehaze_box(dehaze_sub_i1_memory,
+                                    dehaze_sub_i1_memory, box_radius,
+                                    cl_width, cl_height) ||
+                        !dehaze_box(dehaze_sub_p1_memory,
+                                    dehaze_sub_p1_memory, box_radius,
+                                    cl_width, cl_height)) {
+                        return false;
+                    }
+
+                    const cl_float up_col =
+                        static_cast<cl_float>(sw) /
+                        static_cast<cl_float>(bfw);
+                    const cl_float up_row =
+                        static_cast<cl_float>(sh) /
+                        static_cast<cl_float>(bfh);
+                    arg = 0;
+                    ok = true;
+                    ok = ok && set(dehaze_upsample_kernel, arg++,
+                                   sizeof(cl_mem), &dehaze_sub_i1_memory);
+                    ok = ok && set(dehaze_upsample_kernel, arg++,
+                                   sizeof(cl_mem), &dehaze_sub_p1_memory);
+                    ok = ok && set(dehaze_upsample_kernel, arg++,
+                                   sizeof(cl_mem), &guide);
+                    ok = ok && set(dehaze_upsample_kernel, arg++,
+                                   sizeof(cl_int), &guide_plane);
+                    ok = ok && set(dehaze_upsample_kernel, arg++,
+                                   sizeof(cl_mem), &dst);
+                    ok = ok && set(dehaze_upsample_kernel, arg++,
+                                   sizeof(cl_int), &dst_plane);
+                    ok = ok && set(dehaze_upsample_kernel, arg++,
+                                   sizeof(cl_int), &cl_sw);
+                    ok = ok && set(dehaze_upsample_kernel, arg++,
+                                   sizeof(cl_int), &cl_sh);
+                    ok = ok && set(dehaze_upsample_kernel, arg++,
+                                   sizeof(cl_int), &bfw);
+                    ok = ok && set(dehaze_upsample_kernel, arg++,
+                                   sizeof(cl_int), &bfh);
+                    ok = ok && set(dehaze_upsample_kernel, arg++,
+                                   sizeof(cl_int), &dehaze_sub_pitch);
+                    ok = ok && set(dehaze_upsample_kernel, arg++,
+                                   sizeof(cl_int), &guide_pitch);
+                    ok = ok && set(dehaze_upsample_kernel, arg++,
+                                   sizeof(cl_int), &dst_pitch);
+                    ok = ok && set(dehaze_upsample_kernel, arg++,
+                                   sizeof(cl_float), &up_col);
+                    ok = ok && set(dehaze_upsample_kernel, arg++,
+                                   sizeof(cl_float), &up_row);
+                    if (!ok ||
+                        !launch2d(dehaze_upsample_kernel,
+                                  static_cast<std::size_t>(bfw),
+                                  static_cast<std::size_t>(bfh), label)) {
+                        error = std::string("local.adjustments ") + label +
+                                " upsample failed";
+                        return false;
+                    }
+                    return true;
+                };
+
+                /* Lab -> RGB over the ROI, in place: the kernel reads all
+                 * three Lab samples before writing the RGB triple. */
+                {
+                    cl_uint arg = 0;
+                    cl_mem iws_memory = memory_of(iws_device);
+                    bool ok = true;
+                    ok = ok && set(dehaze_lab2rgb_kernel, arg++,
+                                   sizeof(cl_mem), &work_memory);
+                    ok = ok && set(dehaze_lab2rgb_kernel, arg++,
+                                   sizeof(cl_mem), &work_memory);
+                    ok = ok && set(dehaze_lab2rgb_kernel, arg++,
+                                   sizeof(cl_int), &bfw);
+                    ok = ok && set(dehaze_lab2rgb_kernel, arg++,
+                                   sizeof(cl_int), &bfh);
+                    ok = ok && set(dehaze_lab2rgb_kernel, arg++,
+                                   sizeof(cl_int), &work_pitch);
+                    ok = ok && set(dehaze_lab2rgb_kernel, arg++,
+                                   sizeof(cl_int), &work_plane);
+                    ok = ok && set(dehaze_lab2rgb_kernel, arg++,
+                                   sizeof(cl_int), &work_pitch);
+                    ok = ok && set(dehaze_lab2rgb_kernel, arg++,
+                                   sizeof(cl_int), &work_plane);
+                    ok = ok && set(dehaze_lab2rgb_kernel, arg++,
+                                   sizeof(cl_mem), &iws_memory);
+                    if (!ok ||
+                        !launch2d(dehaze_lab2rgb_kernel,
+                                  static_cast<std::size_t>(bfw),
+                                  static_cast<std::size_t>(bfh),
+                                  "dehaze Lab to RGB")) {
+                        error = "local.adjustments dehaze Lab to RGB failed";
+                        return RT_STAGE_FALLBACK;
+                    }
+                }
+
+                /* normalize()'s maximum and the host reduction. */
+                float dehaze_max = -std::numeric_limits<float>::infinity();
+                {
+                    cl_uint arg = 0;
+                    bool ok = true;
+                    ok = ok && set(dehaze_rowmax_kernel, arg++,
+                                   sizeof(cl_mem), &work_memory);
+                    ok = ok && set(dehaze_rowmax_kernel, arg++,
+                                   sizeof(cl_int), &bfw);
+                    ok = ok && set(dehaze_rowmax_kernel, arg++,
+                                   sizeof(cl_int), &bfh);
+                    ok = ok && set(dehaze_rowmax_kernel, arg++,
+                                   sizeof(cl_int), &work_pitch);
+                    ok = ok && set(dehaze_rowmax_kernel, arg++,
+                                   sizeof(cl_int), &work_plane);
+                    cl_mem rowmax_memory =
+                        memory_of(dehaze_rowmax_device);
+                    ok = ok && set(dehaze_rowmax_kernel, arg++,
+                                   sizeof(cl_mem), &rowmax_memory);
+                    if (!ok ||
+                        !launch1d(dehaze_rowmax_kernel,
+                                  static_cast<std::size_t>(bfh),
+                                  "dehaze row maximum")) {
+                        error = "local.adjustments dehaze row maximum failed";
+                        return RT_STAGE_FALLBACK;
+                    }
+                    std::vector<float> rowmax(static_cast<std::size_t>(bfh),
+                                              0.f);
+                    RtStageBuffer rowmax_host{};
+                    rowmax_host.size = sizeof(RtStageBuffer);
+                    rowmax_host.data = rowmax.data();
+                    rowmax_host.width = bfh;
+                    rowmax_host.height = 1;
+                    rowmax_host.row_pitch =
+                        static_cast<std::size_t>(bfh) * sizeof(float);
+                    rowmax_host.plane_pitch = rowmax_host.row_pitch;
+                    rowmax_host.planes = 1;
+                    rowmax_host.format = RT_STAGE_F32;
+                    rowmax_host.flags = RT_STAGE_BUFFER_READ;
+                    if (residency->readback(dehaze_rowmax_device,
+                                            rowmax_host) != RT_STAGE_OK) {
+                        error = "local.adjustments dehaze row maximum "
+                                "readback failed";
+                        return RT_STAGE_FALLBACK;
+                    }
+                    for (int row = 0; row < bfh; ++row) {
+                        dehaze_max = std::max(
+                            dehaze_max,
+                            rowmax[static_cast<std::size_t>(row)]);
+                    }
+                    dehaze_max = std::max(dehaze_max * 2.f, 65535.f);
+                    if (!std::isfinite(dehaze_max)) {
+                        error = "local.adjustments dehaze maximum is not "
+                                "finite";
+                        return RT_STAGE_FALLBACK;
+                    }
+                }
+
+                /* normalize() and restore() share the scale kernel. */
+                const auto dehaze_scale =
+                    [&](cl_float factor, cl_int multiply,
+                        const char* label) -> bool {
+                    cl_uint arg = 0;
+                    bool ok = true;
+                    ok = ok && set(dehaze_scale_kernel, arg++, sizeof(cl_mem),
+                                   &work_memory);
+                    ok = ok && set(dehaze_scale_kernel, arg++, sizeof(cl_int),
+                                   &bfw);
+                    ok = ok && set(dehaze_scale_kernel, arg++, sizeof(cl_int),
+                                   &bfh);
+                    ok = ok && set(dehaze_scale_kernel, arg++, sizeof(cl_int),
+                                   &work_pitch);
+                    ok = ok && set(dehaze_scale_kernel, arg++, sizeof(cl_int),
+                                   &work_plane);
+                    ok = ok && set(dehaze_scale_kernel, arg++,
+                                   sizeof(cl_float), &factor);
+                    ok = ok && set(dehaze_scale_kernel, arg++, sizeof(cl_int),
+                                   &multiply);
+                    if (!ok) {
+                        return false;
+                    }
+                    return launch2d(dehaze_scale_kernel,
+                                    static_cast<std::size_t>(bfw),
+                                    static_cast<std::size_t>(bfh), label);
+                };
+                if (!dehaze_scale(dehaze_max, 0, "dehaze normalize")) {
+                    error = "local.adjustments dehaze normalize failed";
+                    return RT_STAGE_FALLBACK;
+                }
+
+                /* The three guided filters of the normalized channels. */
+                for (int plane = 0; plane < 3; ++plane) {
+                    const cl_int work_offset =
+                        static_cast<cl_int>(plane) * work_plane;
+                    const cl_int filt_offset =
+                        static_cast<cl_int>(plane) * dehaze_filt_plane;
+                    if (!dehaze_run_guided(
+                            work_memory, work_pitch, work_offset, work_memory,
+                            work_pitch, work_offset, dehaze_filt_memory,
+                            dehaze_filt_pitch, filt_offset, dehaze_patch0,
+                            RT_LOCAL_ADJUSTMENTS_DEHAZE_EPSILON, dehaze_sw1,
+                            dehaze_sh1, dehaze_s1,
+                            "dehaze channel")) {
+                        return RT_STAGE_FALLBACK;
+                    }
+                }
+
+                /*
+                 * The block's ambient reduction. The filtered channels are
+                 * read back either directly (the ROI fits the 200 px cap) or
+                 * after the nearest-neighbour rescale, and the host runs
+                 * get_dark_channel_downsized() and estimate_ambient_light()
+                 * unchanged.
+                 */
+                const int ambient_w = dehaze_rescale ? dehaze_ww : bfw;
+                const int ambient_h = dehaze_rescale ? dehaze_hh : bfh;
+                std::vector<float> ambient_channels(
+                    static_cast<std::size_t>(3) * ambient_w * ambient_h,
+                    0.f);
+                if (dehaze_rescale) {
+                    cl_mem rescale_memory =
+                        memory_of(dehaze_rescale_device);
+                    for (int plane = 0; plane < 3; ++plane) {
+                        cl_uint arg = 0;
+                        cl_int src_plane_offset =
+                            static_cast<cl_int>(plane) * dehaze_filt_plane;
+                        cl_int dst_plane_offset = static_cast<cl_int>(plane) *
+                                                  dehaze_rescale_plane;
+                        cl_int cl_sw = bfw;
+                        cl_int cl_sh = bfh;
+                        cl_int cl_dw = dehaze_ww;
+                        cl_int cl_dh = dehaze_hh;
+                        bool ok = true;
+                        ok = ok && set(dehaze_rescale_kernel, arg++,
+                                       sizeof(cl_mem), &dehaze_filt_memory);
+                        ok = ok && set(dehaze_rescale_kernel, arg++,
+                                       sizeof(cl_int), &dehaze_filt_pitch);
+                        ok = ok && set(dehaze_rescale_kernel, arg++,
+                                       sizeof(cl_int), &src_plane_offset);
+                        ok = ok && set(dehaze_rescale_kernel, arg++,
+                                       sizeof(cl_mem), &rescale_memory);
+                        ok = ok && set(dehaze_rescale_kernel, arg++,
+                                       sizeof(cl_int), &dehaze_rescale_pitch);
+                        ok = ok && set(dehaze_rescale_kernel, arg++,
+                                       sizeof(cl_int), &dst_plane_offset);
+                        ok = ok && set(dehaze_rescale_kernel, arg++,
+                                       sizeof(cl_int), &cl_sw);
+                        ok = ok && set(dehaze_rescale_kernel, arg++,
+                                       sizeof(cl_int), &cl_sh);
+                        ok = ok && set(dehaze_rescale_kernel, arg++,
+                                       sizeof(cl_int), &cl_dw);
+                        ok = ok && set(dehaze_rescale_kernel, arg++,
+                                       sizeof(cl_int), &cl_dh);
+                        if (!ok ||
+                            !launch2d(dehaze_rescale_kernel,
+                                      static_cast<std::size_t>(dehaze_ww),
+                                      static_cast<std::size_t>(dehaze_hh),
+                                      "dehaze ambient rescale")) {
+                            error = "local.adjustments dehaze ambient rescale "
+                                    "failed";
+                            return RT_STAGE_FALLBACK;
+                        }
+                    }
+                    RtStageBuffer host{};
+                    host.size = sizeof(RtStageBuffer);
+                    host.data = ambient_channels.data();
+                    host.width = dehaze_ww;
+                    host.height = dehaze_hh;
+                    host.row_pitch =
+                        static_cast<std::size_t>(dehaze_ww) * sizeof(float);
+                    host.plane_pitch =
+                        host.row_pitch * static_cast<std::size_t>(dehaze_hh);
+                    host.planes = 3;
+                    host.format = RT_STAGE_F32;
+                    host.flags = RT_STAGE_BUFFER_READ;
+                    if (residency->readback(dehaze_rescale_device, host) !=
+                        RT_STAGE_OK) {
+                        error = "local.adjustments dehaze ambient readback "
+                                "failed";
+                        return RT_STAGE_FALLBACK;
+                    }
+                } else {
+                    RtStageBuffer host{};
+                    host.size = sizeof(RtStageBuffer);
+                    host.data = ambient_channels.data();
+                    host.width = bfw;
+                    host.height = bfh;
+                    host.row_pitch =
+                        static_cast<std::size_t>(bfw) * sizeof(float);
+                    host.plane_pitch =
+                        host.row_pitch * static_cast<std::size_t>(bfh);
+                    host.planes = 3;
+                    host.format = RT_STAGE_F32;
+                    host.flags = RT_STAGE_BUFFER_READ;
+                    if (residency->readback(dehaze_filt_device, host) !=
+                        RT_STAGE_OK) {
+                        error = "local.adjustments dehaze ambient readback "
+                                "failed";
+                        return RT_STAGE_FALLBACK;
+                    }
+                }
+
+                std::vector<const float*> rows_r(
+                    static_cast<std::size_t>(ambient_h));
+                std::vector<const float*> rows_g(
+                    static_cast<std::size_t>(ambient_h));
+                std::vector<const float*> rows_b(
+                    static_cast<std::size_t>(ambient_h));
+                const std::size_t plane_size =
+                    static_cast<std::size_t>(ambient_w) * ambient_h;
+                for (int row = 0; row < ambient_h; ++row) {
+                    const std::size_t offset =
+                        static_cast<std::size_t>(row) * ambient_w;
+                    rows_r[static_cast<std::size_t>(row)] =
+                        ambient_channels.data() + offset;
+                    rows_g[static_cast<std::size_t>(row)] =
+                        ambient_channels.data() + plane_size + offset;
+                    rows_b[static_cast<std::size_t>(row)] =
+                        ambient_channels.data() + 2 * plane_size + offset;
+                }
+                float dehaze_ambient[3] = {};
+                float dehaze_max_distance = 0.f;
+                if (!dehazeAmbientPrefix(
+                        rows_r.data(), rows_g.data(), rows_b.data(), ambient_w,
+                        ambient_h, dehaze_patch0, dehaze_ambient,
+                        dehaze_max_distance)) {
+                    error = "local.adjustments dehaze has no in-range dark "
+                            "sample; the block reads an uninitialised "
+                            "ambient";
+                    return RT_STAGE_FALLBACK;
+                }
+                if (!std::isfinite(dehaze_ambient[0]) ||
+                    !std::isfinite(dehaze_ambient[1]) ||
+                    !std::isfinite(dehaze_ambient[2]) ||
+                    !std::isfinite(dehaze_max_distance)) {
+                    error = "local.adjustments dehaze ambient is not finite";
+                    return RT_STAGE_FALLBACK;
+                }
+
+                const float dehaze_strength = std::fabs(
+                    rec[RT_LOCAL_ADJUSTMENTS_SLOT_DEHAZE_STRENGTH]);
+                const float strength_value =
+                    std::max(0.f, std::min(dehaze_strength / 100.f * 0.9f,
+                                           1.f));
+                const bool add_haze =
+                    rec[RT_LOCAL_ADJUSTMENTS_SLOT_DEHAZE_STRENGTH] < 0.0f;
+                const float sat_blend =
+                    rec[RT_LOCAL_ADJUSTMENTS_SLOT_DEHAZE_SATURATION] / 100.f;
+                const float depth_value =
+                    -rec[RT_LOCAL_ADJUSTMENTS_SLOT_DEHAZE_DEPTH] / 100.f;
+                const float t0 = std::max(
+                    RT_LOCAL_ADJUSTMENTS_DEHAZE_TEPS,
+                    std::exp(depth_value * dehaze_max_distance));
+                const double* wsd = setup.ws_double;
+                if (wsd == nullptr) {
+                    error = "local.adjustments dehaze needs the double "
+                            "working matrix";
+                    return RT_STAGE_FALLBACK;
+                }
+                const float ambient_y = static_cast<float>(
+                    static_cast<double>(dehaze_ambient[0]) * wsd[3] +
+                    static_cast<double>(dehaze_ambient[1]) * wsd[4] +
+                    static_cast<double>(dehaze_ambient[2]) * wsd[5]);
+                const bool no_haze =
+                    std::min(std::min(dehaze_ambient[0], dehaze_ambient[1]),
+                             dehaze_ambient[2]) <
+                    RT_LOCAL_ADJUSTMENTS_DEHAZE_AMBIENT_FLOOR;
+
+                if (!no_haze) {
+                    /* get_dark_channel() writes the filtered R plane in
+                     * place; each work item reads only its own patch. */
+                    {
+                        const cl_int patch = dehaze_final_patch;
+                        const cl_int patch_columns =
+                            (bfw + patch - 1) / patch;
+                        const cl_int patch_rows = (bfh + patch - 1) / patch;
+                        cl_uint arg = 0;
+                        bool ok = true;
+                        ok = ok && set(dehaze_dark_kernel, arg++,
+                                       sizeof(cl_mem), &dehaze_filt_memory);
+                        ok = ok && set(dehaze_dark_kernel, arg++,
+                                       sizeof(cl_int), &dehaze_filt_pitch);
+                        ok = ok && set(dehaze_dark_kernel, arg++,
+                                       sizeof(cl_int), &dehaze_filt_plane);
+                        ok = ok && set(dehaze_dark_kernel, arg++,
+                                       sizeof(cl_mem), &dehaze_filt_memory);
+                        ok = ok && set(dehaze_dark_kernel, arg++,
+                                       sizeof(cl_int), &dehaze_filt_pitch);
+                        ok = ok && set(dehaze_dark_kernel, arg++,
+                                       sizeof(cl_int), &bfw);
+                        ok = ok && set(dehaze_dark_kernel, arg++,
+                                       sizeof(cl_int), &bfh);
+                        ok = ok && set(dehaze_dark_kernel, arg++,
+                                       sizeof(cl_int), &patch);
+                        ok = ok && set(dehaze_dark_kernel, arg++,
+                                       sizeof(cl_float), &dehaze_ambient[0]);
+                        ok = ok && set(dehaze_dark_kernel, arg++,
+                                       sizeof(cl_float), &dehaze_ambient[1]);
+                        ok = ok && set(dehaze_dark_kernel, arg++,
+                                       sizeof(cl_float), &dehaze_ambient[2]);
+                        const cl_float cl_strength = strength_value;
+                        ok = ok && set(dehaze_dark_kernel, arg++,
+                                       sizeof(cl_float), &cl_strength);
+                        if (!ok ||
+                            !launch2d(dehaze_dark_kernel,
+                                      static_cast<std::size_t>(
+                                          patch_columns),
+                                      static_cast<std::size_t>(patch_rows),
+                                      "dehaze dark channel")) {
+                            error = "local.adjustments dehaze dark channel "
+                                    "failed";
+                            return RT_STAGE_FALLBACK;
+                        }
+                    }
+
+                    /* guidedFilter(normalized B, dark, dark, patch * 4,
+                     * 1e-5). The guide is the filtered B plane; the dark
+                     * plane is the filtered R plane. */
+                    if (!dehaze_run_guided(
+                            work_memory, work_pitch,
+                            static_cast<cl_int>(2) * work_plane,
+                            dehaze_filt_memory, dehaze_filt_pitch, 0,
+                            dehaze_filt_memory, dehaze_filt_pitch, 0,
+                            dehaze_final_radius,
+                            RT_LOCAL_ADJUSTMENTS_DEHAZE_GUIDE_EPSILON,
+                            dehaze_sw2, dehaze_sh2, dehaze_s2,
+                            "dehaze dark filter")) {
+                        return RT_STAGE_FALLBACK;
+                    }
+                }
+
+                /* Per-pixel recovery. The block's "no haze" arm restores and
+                 * returns without running the dark channel or the recovery,
+                 * so that path only restores and converts back. */
+                if (!no_haze) {
+                    cl_uint arg = 0;
+                    cl_mem ws_memory = memory_of(ws_device);
+                    const cl_int add_haze_flag = add_haze ? 1 : 0;
+                    bool ok = true;
+                    ok = ok && set(dehaze_recover_kernel, arg++,
+                                   sizeof(cl_mem), &work_memory);
+                    ok = ok && set(dehaze_recover_kernel, arg++,
+                                   sizeof(cl_int), &work_pitch);
+                    ok = ok && set(dehaze_recover_kernel, arg++,
+                                   sizeof(cl_int), &work_plane);
+                    ok = ok && set(dehaze_recover_kernel, arg++,
+                                   sizeof(cl_mem), &dehaze_filt_memory);
+                    ok = ok && set(dehaze_recover_kernel, arg++,
+                                   sizeof(cl_int), &dehaze_filt_pitch);
+                    ok = ok && set(dehaze_recover_kernel, arg++,
+                                   sizeof(cl_int), &bfw);
+                    ok = ok && set(dehaze_recover_kernel, arg++,
+                                   sizeof(cl_int), &bfh);
+                    ok = ok && set(dehaze_recover_kernel, arg++,
+                                   sizeof(cl_mem), &ws_memory);
+                    ok = ok && set(dehaze_recover_kernel, arg++,
+                                   sizeof(cl_float), &dehaze_ambient[0]);
+                    ok = ok && set(dehaze_recover_kernel, arg++,
+                                   sizeof(cl_float), &dehaze_ambient[1]);
+                    ok = ok && set(dehaze_recover_kernel, arg++,
+                                   sizeof(cl_float), &dehaze_ambient[2]);
+                    const cl_float cl_ambient_y = ambient_y;
+                    ok = ok && set(dehaze_recover_kernel, arg++,
+                                   sizeof(cl_float), &cl_ambient_y);
+                    const cl_float cl_t0 = t0;
+                    ok = ok && set(dehaze_recover_kernel, arg++,
+                                   sizeof(cl_float), &cl_t0);
+                    const cl_float cl_sat = sat_blend;
+                    ok = ok && set(dehaze_recover_kernel, arg++,
+                                   sizeof(cl_float), &cl_sat);
+                    ok = ok && set(dehaze_recover_kernel, arg++,
+                                   sizeof(cl_int), &add_haze_flag);
+                    if (!ok ||
+                        !launch2d(dehaze_recover_kernel,
+                                  static_cast<std::size_t>(bfw),
+                                  static_cast<std::size_t>(bfh),
+                                  "dehaze recover")) {
+                        error = "local.adjustments dehaze recover failed";
+                        return RT_STAGE_FALLBACK;
+                    }
+                }
+                if (!dehaze_scale(dehaze_max, 1, "dehaze restore")) {
+                    error = "local.adjustments dehaze restore failed";
+                    return RT_STAGE_FALLBACK;
+                }
+
+                /* RGB -> Lab back into the ROI copy. */
+                {
+                    cl_uint arg = 0;
+                    cl_mem ws_memory = memory_of(ws_device);
+                    cl_mem cachef_memory = memory_of(cachef_device);
+                    cl_mem cachefy_memory = memory_of(cachefy_device);
+                    bool ok = true;
+                    ok = ok && set(dehaze_rgb2lab_kernel, arg++,
+                                   sizeof(cl_mem), &work_memory);
+                    ok = ok && set(dehaze_rgb2lab_kernel, arg++,
+                                   sizeof(cl_int), &work_pitch);
+                    ok = ok && set(dehaze_rgb2lab_kernel, arg++,
+                                   sizeof(cl_int), &work_plane);
+                    ok = ok && set(dehaze_rgb2lab_kernel, arg++,
+                                   sizeof(cl_mem), &work_memory);
+                    ok = ok && set(dehaze_rgb2lab_kernel, arg++,
+                                   sizeof(cl_int), &work_pitch);
+                    ok = ok && set(dehaze_rgb2lab_kernel, arg++,
+                                   sizeof(cl_int), &work_plane);
+                    ok = ok && set(dehaze_rgb2lab_kernel, arg++,
+                                   sizeof(cl_int), &bfw);
+                    ok = ok && set(dehaze_rgb2lab_kernel, arg++,
+                                   sizeof(cl_int), &bfh);
+                    ok = ok && set(dehaze_rgb2lab_kernel, arg++,
+                                   sizeof(cl_mem), &ws_memory);
+                    ok = ok && set(dehaze_rgb2lab_kernel, arg++,
+                                   sizeof(cl_mem), &cachef_memory);
+                    ok = ok && set(dehaze_rgb2lab_kernel, arg++,
+                                   sizeof(cl_mem), &cachefy_memory);
+                    if (!ok ||
+                        !launch2d(dehaze_rgb2lab_kernel,
+                                  static_cast<std::size_t>(bfw),
+                                  static_cast<std::size_t>(bfh),
+                                  "dehaze RGB to Lab")) {
+                        error = "local.adjustments dehaze RGB to Lab failed";
+                        return RT_STAGE_FALLBACK;
+                    }
+                }
+
+                /* transit_shapedetect2() senstype 30 uses the retinex
+                 * sensitivity (lp.sensh) and the default 3/sk reference
+                 * blur already in blur_device. */
+                if (!run_blend("dehaze",
+                               rec[RT_LOCAL_ADJUSTMENTS_SLOT_SENSH])) {
+                    return RT_STAGE_FALLBACK;
+                }
+            }
 
             /*
              * Local CBDL. The host's block runs before vibrance and only when

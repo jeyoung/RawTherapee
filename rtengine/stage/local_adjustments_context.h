@@ -42,33 +42,33 @@ struct ProcParams;
  * Host context of the local.adjustments node.
  *
  * The node covers a spot set of ImProcFunctions::Lab_Local(): an elliptical or
- * rectangular spot, the local CBDL tool, the Colour & Light
- * chroma/lightness/contrast sliders and L/C/H curves, the vibrance tool, the
- * shadows/highlights tool, the soft-light tool, the Gaussian local-contrast
- * tool, the deltaE scope, the avoid-colour-shift Munsell method and the
- * unconditional per-spot Lab-to-RGB clamp. The block also applies the final
- * Munsell pass and the clamp for an inactive spot, so a block whose spots do
- * no tool work is still a clamp-only block.
+ * rectangular spot, the local dehaze tool, the local CBDL tool, the Colour &
+ * Light chroma/lightness/contrast sliders and L/C/H curves, the vibrance tool,
+ * the shadows/highlights tool, the soft-light tool, the Gaussian
+ * local-contrast tool, the deltaE scope, the avoid-colour-shift Munsell method
+ * and the unconditional per-spot Lab-to-RGB clamp. The block also applies the
+ * final Munsell pass and the clamp for an inactive spot, so a block whose
+ * spots do no tool work is still a clamp-only block.
  *
- * The tools run in Lab_Local()'s order: CBDL, vibrance, shadows/highlights,
- * soft light, local contrast, then Colour & Light. The context is C-compatible
- * because the ABI is. `self` points at the C++ object that owns the ProcParams,
- * ImProcFunctions and LabImage references, so the pointer must not outlive
- * them.
+ * The tools run in Lab_Local()'s order: dehaze, CBDL, vibrance,
+ * shadows/highlights, soft light, local contrast, then Colour & Light. The
+ * context is C-compatible because the ABI is. `self` points at the C++ object
+ * that owns the ProcParams, ImProcFunctions and LabImage references, so the
+ * pointer must not outlive them.
  *
  * The per-spot record is a flat float table rather than a structure mirrored
  * between C++ and the device: Lab_Local() takes 270 parameters and only a
  * small, known subset reaches the supported paths. Slots are named by the
  * RT_LOCAL_ADJUSTMENTS_SLOT_* constants and are written once per spot.
  */
-#define RT_LOCAL_ADJUSTMENTS_CONTEXT_VERSION 5u
+#define RT_LOCAL_ADJUSTMENTS_CONTEXT_VERSION 6u
 /* "LAJC": rejects a stale or unrelated pointer before any callback runs. */
 #define RT_LOCAL_ADJUSTMENTS_CONTEXT_MAGIC 0x4C414A43u
 /* The block has no bounded spot count, but a profile that carries more spots
  * than this is outside the device set and runs the host block. */
 #define RT_LOCAL_ADJUSTMENTS_MAX_SPOTS 64u
 /* Floats per spot record; the slot constants below must stay inside it. */
-#define RT_LOCAL_ADJUSTMENTS_SPOT_STRIDE 114u
+#define RT_LOCAL_ADJUSTMENTS_SPOT_STRIDE 119u
 /* A curve table is one LUTf of the block's own size. */
 #define RT_LOCAL_ADJUSTMENTS_LUT_ENTRIES 65536u
 /* Color::gammatab_srgb and Color::igammatab_srgb, the sRGB gamma pair the
@@ -90,6 +90,30 @@ struct ProcParams;
  * one 0x20000-entry range table per level, as dirpyrFillLut() builds them. */
 #define RT_LOCAL_ADJUSTMENTS_CBDL_LEVELS 6u
 #define RT_LOCAL_ADJUSTMENTS_CBDL_LUT_ENTRIES 0x20000u
+/* dehazeloc()'s geometry. `patchsize` starts as max(int(5 / scale), 2); the
+ * stage runs only at scale 1, which the context checks, so the initial patch
+ * is five. The ambient estimate rescales the guided-filtered channels to at
+ * most 200 px on the longer axis and samples the dark channel with the
+ * initial patch; the final dark-channel patch is max(max(W, H) / 600, 2). */
+#define RT_LOCAL_ADJUSTMENTS_DEHAZE_SCALE 1.0
+#define RT_LOCAL_ADJUSTMENTS_DEHAZE_PATCH0 5
+#define RT_LOCAL_ADJUSTMENTS_DEHAZE_MIN_PATCH 2
+#define RT_LOCAL_ADJUSTMENTS_DEHAZE_SIZECAP 200
+#define RT_LOCAL_ADJUSTMENTS_DEHAZE_FINAL_DIVISOR 600
+/* guidedfilter.cc's calculate_subsampling(): an image whose longer axis fits
+ * 600 px is filtered without subsampling. */
+#define RT_LOCAL_ADJUSTMENTS_DEHAZE_GUIDE_SMALL 600
+/* dehazeloc()'s final guided-filter radius is four times its dark-channel
+ * patch. */
+#define RT_LOCAL_ADJUSTMENTS_DEHAZE_RADIUS_FACTOR 4
+/* dehazeloc()'s two fixed tolerances, as written in the block. */
+#define RT_LOCAL_ADJUSTMENTS_DEHAZE_EPSILON 1e-1f
+#define RT_LOCAL_ADJUSTMENTS_DEHAZE_GUIDE_EPSILON 1e-5f
+#define RT_LOCAL_ADJUSTMENTS_DEHAZE_TEPS 1e-6f
+#define RT_LOCAL_ADJUSTMENTS_DEHAZE_LUMINANCE_FLOOR 1e-5f
+/* The darkest ambient channel below which dehazeloc() declares "no haze" and
+ * restores the image unchanged. */
+#define RT_LOCAL_ADJUSTMENTS_DEHAZE_AMBIENT_FLOOR 0.01f
 /* No table at this offset. Offsets below 2^24 are exact in a float. */
 #define RT_LOCAL_ADJUSTMENTS_NO_LUT (-1.0f)
 /* The largest total LUT allocation, in floats. Every offset stays exact in a
@@ -259,6 +283,18 @@ struct ProcParams;
 #define RT_LOCAL_ADJUSTMENTS_SLOT_CBDL_LUMA_ACTIVE 111u
 #define RT_LOCAL_ADJUSTMENTS_SLOT_CBDL_CHROMA_OFFSET 112u
 #define RT_LOCAL_ADJUSTMENTS_SLOT_CBDL_CHROMA_ACTIVE 113u
+/* Local dehaze. EXPDENAZE is 1 when the host's dehaze block runs: the retinex
+ * enable (expreti) is on, the spot is active, there is no explicit mask, and
+ * the dehaze strength is non-zero. The retinex tool itself must be a no-op
+ * (strength zero); an active retinex configuration is a residual. The
+ * strength, depth and saturation slots hold the block's effective values:
+ * `lp.dehaze`, `lp.depth` and the int truncation of `dehazeSaturation`. The
+ * deltaE blend is senstype 30 and uses the retinex sensitivity (SENSH). */
+#define RT_LOCAL_ADJUSTMENTS_SLOT_EXPDENAZE 114u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_SENSH 115u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_DEHAZE_STRENGTH 116u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_DEHAZE_DEPTH 117u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_DEHAZE_SATURATION 118u
 
 typedef struct RtLocalAdjustmentsResult {
     /* spot_count RT_LOCAL_ADJUSTMENTS_SPOT_STRIDE floats, spot-major. */
@@ -273,6 +309,11 @@ typedef struct RtLocalAdjustmentsResult {
      * these float values. */
     const float* ws;
     const float* iws;
+    /* The same working RGB -> XYZ matrix in double, nine values. The dehaze
+     * recovery calls Color::rgbLuminance(r, g, b, ws) with the block's TMatrix,
+     * which accumulates in double: the device needs the double values for the
+     * ambient luminance. */
+    const double* ws_double;
     /* Color::cachef[] and cachefy[], the 65536-sample Lab caches the RGB to
      * Lab half of the clamp reads. */
     const float* cachef;
@@ -346,9 +387,15 @@ namespace rtengine::stage
  * spot is a normal (not exclude/full/main) elliptical or rectangular spot with
  * no recursion, inversion, explicit mask, soft radius, merge, gradient, Lab
  * grid, RGB curve, exposure curve or tool outside the set. An active spot runs
- * any combination of local CBDL, Colour & Light, vibrance, shadows/highlights,
- * soft light and local contrast; the tool variants and ranges are checked
- * separately. The block has no pre-CBDL or dehaze pass.
+ * any combination of local dehaze, local CBDL, Colour & Light, vibrance,
+ * shadows/highlights, soft light and local contrast; the tool variants and
+ * ranges are checked separately. The block has no pre-CBDL pass and no global
+ * dehaze; the local dehaze is part of the spot path.
+ *
+ * Local dehaze is admitted only through its retinex gate: expreti on, the
+ * retinex strength zero and a non-zero dehaz. dehazeblack, show-depth, an
+ * explicit mask, a soft radius, a non-zero retinex strength and an
+ * out-of-range strength, depth, saturation or sensitivity are residuals.
  *
  * Local CBDL is admitted with the block's own multipliers, threshold, clarity,
  * chroma and sensitivity. Its soft radius and contresid are residuals, as is a
@@ -458,6 +505,7 @@ private:
     std::vector<float> spots_;
     std::vector<float> luts_;
     float ws_[9] = {};
+    double wsDouble_[9] = {};
     float iws_[9] = {};
     std::vector<float> cachef_;
     std::vector<float> cachefy_;

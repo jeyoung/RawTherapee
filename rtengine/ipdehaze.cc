@@ -34,6 +34,7 @@
 
 #include "array2D.h"
 #include "color.h"
+#include "dehaze_ambient.h"
 #include "guidedfilter.h"
 #include "iccstore.h"
 #include "imagefloat.h"
@@ -304,6 +305,65 @@ void extract_channels(Imagefloat *img, array2D<float> &r, array2D<float> &g, arr
 }
 
 } // namespace
+
+bool dehazeAmbientPrefix(const float* const* R, const float* const* G,
+                         const float* const* B, int width, int height,
+                         int patchsize, float ambient[3],
+                         float& maxDistance)
+{
+    if (R == nullptr || G == nullptr || B == nullptr || width <= 0 ||
+        height <= 0 || patchsize <= 0) {
+        return false;
+    }
+
+    /* array2D's read-only views take non-const row pointers; the wrapper
+     * never writes through them. */
+    std::vector<float*> rowsR(static_cast<std::size_t>(height));
+    std::vector<float*> rowsG(static_cast<std::size_t>(height));
+    std::vector<float*> rowsB(static_cast<std::size_t>(height));
+    for (int row = 0; row < height; ++row) {
+        rowsR[static_cast<std::size_t>(row)] =
+            const_cast<float*>(R[row]);
+        rowsG[static_cast<std::size_t>(row)] =
+            const_cast<float*>(G[row]);
+        rowsB[static_cast<std::size_t>(row)] =
+            const_cast<float*>(B[row]);
+    }
+    const array2D<float> r(width, height, rowsR.data(),
+                           ARRAY2D_BYREFERENCE);
+    const array2D<float> g(width, height, rowsG.data(),
+                           ARRAY2D_BYREFERENCE);
+    const array2D<float> b(width, height, rowsB.data(),
+                           ARRAY2D_BYREFERENCE);
+
+    int patchsize_dark = 2;
+    array2D<float> dark(width, height);
+    const int npatches = get_dark_channel_downsized(
+        r, g, b, dark, patchsize_dark, false);
+
+    /*
+     * estimate_ambient_light() returns without touching ambient[] when every
+     * sampled dark value is out of range, and dehazeloc() then reads it. Run
+     * the host block instead of reproducing that undefined case.
+     */
+    constexpr float DARK_HIGH = 1.f - 1e-5f;
+    bool any = false;
+    for (int y = 0; y < height && !any; y += patchsize) {
+        for (int x = 0; x < width; x += patchsize) {
+            if (!OOG(dark[y][x], DARK_HIGH)) {
+                any = true;
+                break;
+            }
+        }
+    }
+    if (!any) {
+        return false;
+    }
+
+    maxDistance =
+        estimate_ambient_light(r, g, b, dark, patchsize, npatches, ambient);
+    return true;
+}
 
 void ImProcFunctions::dehaze(Imagefloat *img, const DehazeParams &dehazeParams)
 {

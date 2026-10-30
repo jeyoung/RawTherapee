@@ -35,7 +35,8 @@
  * trip, the caches and the LUT access), the local-contrast IIR line kernel,
  * the Sleef xatan2f/xsincosf port and the lab.regions xlogf/xexpf port. It
  * adds the single-spot colour apply, the ROI copy, the per-pixel soft-light
- * curve, the local CBDL pyramid/blends, and the full-image clamp.
+ * curve, the local dehaze path, the local CBDL pyramid/blends, and the
+ * full-image clamp.
  *
  * The record slots are the host's RT_LOCAL_ADJUSTMENTS_SLOT_* values; the
  * device source repeats the small subset it reads so the program is
@@ -117,6 +118,11 @@ inline constexpr const char* RT_LOCAL_ADJUSTMENTS_CL = R"CLC(
 #define RT_LA_CBDL_LUMA_ACTIVE 111
 #define RT_LA_CBDL_CHROMA_OFFSET 112
 #define RT_LA_CBDL_CHROMA_ACTIVE 113
+#define RT_LA_EXPDENAZE 114
+#define RT_LA_SENSH 115
+#define RT_LA_DEHAZE_STRENGTH 116
+#define RT_LA_DEHAZE_DEPTH 117
+#define RT_LA_DEHAZE_SATURATION 118
 
 /*
  * The number of trailing columns the host takes through its scalar path.
@@ -139,6 +145,9 @@ inline int rt_la_host_tail(const int width)
 #define RT_LA_MAXSCOPE 1.25f
 #define RT_LA_LIMSCOPE 80
 #define RT_LA_PI_F 3.1415927f
+/* dehazeloc()'s fixed tolerances; the constants live in the host context. */
+#define RT_LA_DEHAZE_TEPS 1e-6f
+#define RT_LA_DEHAZE_LUMINANCE_FLOOR 1e-5f
 
 /* iplocallab.cc clipC(). */
 inline float rt_la_clipC(const float x)
@@ -1288,6 +1297,274 @@ __kernel void rt_local_adjustments_softlight(
     work[offset] = out_l;
     work[work_plane + offset] = out_a;
     work[2 * work_plane + offset] = out_b;
+}
+
+/*
+ * Local dehaze. ImProcFunctions::dehazeloc() on the ROI:
+ *
+ *   Lab -> RGB, normalize, three guided filters of the RGB planes,
+ *   ambient-light reduction (host, see dehaze_ambient.h), dark channel,
+ *   guided filter of the dark channel, per-pixel recovery, restore,
+ *   RGB -> Lab.
+ *
+ * The guided-filter kernels are the lab.tools fragments
+ * (rt_lab_tools_subsample/box_h/box_v/combine/upsample) with the block's own
+ * automatic subsampling and box radius, computed on the host. The two extra
+ * kernels here only bridge the multi-plane ROI buffers to the single-plane
+ * fragments.
+ */
+
+/* lab2rgb() over the ROI. `rt_la_lab2xyz` reproduces lab2rgb()'s SIMD/scalar
+ * split for the Y cubic; the inverse working matrix is the block's float
+ * one. */
+__kernel void rt_local_adjustments_dehaze_lab2rgb(
+    __global const float* lab, __global float* rgb, const int width,
+    const int height, const int lab_pitch, const int lab_plane,
+    const int rgb_pitch, const int rgb_plane, __global const float* iws)
+{
+    const int x = (int)get_global_id(0);
+    const int y = (int)get_global_id(1);
+    if (x >= width || y >= height) {
+        return;
+    }
+    const int in = y * lab_pitch + x;
+    const int out = y * rgb_pitch + x;
+    float X = 0.0f;
+    float Y = 0.0f;
+    float Z = 0.0f;
+    rt_la_lab2xyz(lab[in], lab[lab_plane + in], lab[2 * lab_plane + in], x,
+                  width, &X, &Y, &Z);
+    float R = 0.0f;
+    float G = 0.0f;
+    float B = 0.0f;
+    rt_lt_xyz2rgb(X, Y, Z, iws, &R, &G, &B);
+    rgb[out] = R;
+    rgb[rgb_plane + out] = G;
+    rgb[2 * rgb_plane + out] = B;
+}
+
+/* normalize()'s maximum over the three channels, one work item per row. The
+ * host reduces these maxima; a maximum is order independent. */
+__kernel void rt_local_adjustments_dehaze_rowmax(
+    __global const float* rgb, const int width, const int height,
+    const int rgb_pitch, const int rgb_plane, __global float* rowmax)
+{
+    const int y = (int)get_global_id(0);
+    if (y >= height) {
+        return;
+    }
+    const int row = y * rgb_pitch;
+    float value = -INFINITY;
+    for (int x = 0; x < width; ++x) {
+        value = fmax(value, fmax(rgb[row + x],
+                                 fmax(rgb[rgb_plane + row + x],
+                                      rgb[2 * rgb_plane + row + x])));
+    }
+    rowmax[y] = value;
+}
+
+/* normalize()'s division and restore()'s multiplication. */
+__kernel void rt_local_adjustments_dehaze_scale(
+    __global float* rgb, const int width, const int height, const int rgb_pitch,
+    const int rgb_plane, const float factor, const int multiply)
+{
+    const int x = (int)get_global_id(0);
+    const int y = (int)get_global_id(1);
+    if (x >= width || y >= height) {
+        return;
+    }
+    const int out = y * rgb_pitch + x;
+    for (int plane = 0; plane < 3; ++plane) {
+        const int offset = plane * rgb_plane + out;
+        rgb[offset] = multiply != 0 ? rgb[offset] * factor
+                                    : rgb[offset] / factor;
+    }
+}
+
+/* guidedFilter()'s f_subsample() for a guide plane and a source plane.
+ * `rt_lt_bilinear` is rescaleBilinear()'s getBilinearValue(); with a scale of
+ * one it is the host's exact copy branch. */
+__kernel void rt_local_adjustments_dehaze_subsample(
+    __global const float* guide, const int guide_pitch,
+    const int guide_plane, __global const float* src, const int src_pitch,
+    const int src_plane, __global float* i1, __global float* p1,
+    const int sub_pitch, const int sw, const int sh, const int width,
+    const int height, const float col_scale, const float row_scale)
+{
+    const int x = (int)get_global_id(0);
+    const int y = (int)get_global_id(1);
+    if (x >= sw || y >= sh) {
+        return;
+    }
+    const float fx = x * col_scale;
+    const float fy = y * row_scale;
+    const int out = y * sub_pitch + x;
+    i1[out] = rt_lt_bilinear(guide + guide_plane, width, height,
+                             guide_pitch, fx, fy);
+    p1[out] = rt_lt_bilinear(src + src_plane, width, height, src_pitch, fx,
+                             fy);
+}
+
+/* guidedFilter()'s readout: q = bilinear(meana) * guide + bilinear(meanb). */
+__kernel void rt_local_adjustments_dehaze_upsample(
+    __global const float* meana, __global const float* meanb,
+    __global const float* guide, const int guide_plane, __global float* dst,
+    const int dst_plane, const int sw, const int sh, const int width,
+    const int height, const int sub_pitch, const int guide_pitch,
+    const int dst_pitch, const float col_scale, const float row_scale)
+{
+    const int x = (int)get_global_id(0);
+    const int y = (int)get_global_id(1);
+    if (x >= width || y >= height) {
+        return;
+    }
+    const float fx = x * col_scale;
+    const float fy = y * row_scale;
+    const float upper = rt_lt_bilinear(meana, sw, sh, sub_pitch, fx, fy);
+    const float lower = rt_lt_bilinear(meanb, sw, sh, sub_pitch, fx, fy);
+    dst[dst_plane + y * dst_pitch + x] =
+        upper * guide[guide_plane + y * guide_pitch + x] + lower;
+}
+
+/* rescaleNearest() for one plane. The block's integer index arithmetic is
+ * reproduced exactly; the caller refuses an aspect that would overflow it. */
+__kernel void rt_local_adjustments_dehaze_rescale(
+    __global const float* src, const int src_pitch, const int src_plane,
+    __global float* dst, const int dst_pitch, const int dst_plane,
+    const int sw, const int sh, const int dw, const int dh)
+{
+    const int x = (int)get_global_id(0);
+    const int y = (int)get_global_id(1);
+    if (x >= dw || y >= dh) {
+        return;
+    }
+    const int sx = x * sw / dw;
+    const int sy = y * sh / dh;
+    dst[dst_plane + y * dst_pitch + x] =
+        src[src_plane + sy * src_pitch + sx];
+}
+
+/* get_dark_channel(): one work item per patch, the block minimum over the
+ * three guided-filtered channels, then the block's normalized transmission. */
+__kernel void rt_local_adjustments_dehaze_dark(
+    __global const float* rgb, const int rgb_pitch, const int rgb_plane,
+    __global float* dark, const int dark_pitch, const int width,
+    const int height, const int patchsize, const float ambient0,
+    const float ambient1, const float ambient2, const float strength)
+{
+    const int bx = (int)get_global_id(0);
+    const int by = (int)get_global_id(1);
+    const int x = bx * patchsize;
+    const int y = by * patchsize;
+    if (x >= width || y >= height) {
+        return;
+    }
+    const int pW = min(x + patchsize, width);
+    const int pH = min(y + patchsize, height);
+    float minR = INFINITY;
+    float minG = INFINITY;
+    float minB = INFINITY;
+    for (int yy = y; yy < pH; ++yy) {
+        for (int xx = x; xx < pW; ++xx) {
+            const int offset = yy * rgb_pitch + xx;
+            minR = fmin(minR, rgb[offset]);
+            minG = fmin(minG, rgb[rgb_plane + offset]);
+            minB = fmin(minB, rgb[2 * rgb_plane + offset]);
+        }
+    }
+    float value =
+        fmin(fmin(minR / ambient0, minG / ambient1), minB / ambient2);
+    value = 1.0f - strength * rt_lt_lim01(value);
+    for (int yy = y; yy < pH; ++yy) {
+        for (int xx = x; xx < pW; ++xx) {
+            dark[yy * dark_pitch + xx] = value;
+        }
+    }
+}
+
+/* dehazeloc()'s per-pixel recovery on the normalized channels. The ambient
+ * luminance is the block's double-precision Color::rgbLuminance() and is
+ * passed in; `t0`, `satBlend` and `addHaze` are host-built from the block's
+ * expressions so the device does not re-evaluate exp() or the float casts. */
+__kernel void rt_local_adjustments_dehaze_recover(
+    __global float* rgb, const int rgb_pitch, const int rgb_plane,
+    __global const float* dark, const int dark_pitch, const int width,
+    const int height, __global const float* ws, const float ambient0,
+    const float ambient1, const float ambient2, const float ambientY,
+    const float t0, const float satBlend, const int addHaze)
+{
+    const int x = (int)get_global_id(0);
+    const int y = (int)get_global_id(1);
+    if (x >= width || y >= height) {
+        return;
+    }
+    const int offset = y * rgb_pitch + x;
+    const float rIn = rgb[offset];
+    const float gIn = rgb[rgb_plane + offset];
+    const float bIn = rgb[2 * rgb_plane + offset];
+
+    const float tl = 1.0f + RT_LA_DEHAZE_TEPS -
+                     fmin(fmin(rIn / ambient0, gIn / ambient1),
+                          bIn / ambient2);
+    const float mt = fmax(fmax(dark[y * dark_pitch + x], t0), tl);
+
+    /* Color::rgbLuminance(r, g, b, TMatrix) accumulates in double. */
+    const double Yd = (double)rIn * ws[3] + (double)gIn * ws[4] +
+                      (double)bIn * ws[5];
+    const float Y = (float)Yd;
+    float f = 1.0f;
+    if (Y > RT_LA_DEHAZE_LUMINANCE_FLOOR) {
+        float YY = (Y - ambientY) / mt + ambientY;
+        if (addHaze != 0) {
+            YY = Y + Y - YY;
+        }
+        f = YY / Y;
+    }
+    const float r1 = rIn * f;
+    const float g1 = gIn * f;
+    const float b1 = bIn * f;
+
+    float r2 = ((rIn - ambient0) / mt + ambient0);
+    float g2 = ((gIn - ambient1) / mt + ambient1);
+    float b2 = ((bIn - ambient2) / mt + ambient2);
+    if (addHaze != 0) {
+        r2 = rIn + rIn - r2;
+        g2 = gIn + gIn - g2;
+        b2 = bIn + bIn - b2;
+    }
+    /* intp(a, b, c) = a * (b - c) + c. */
+    rgb[offset] = satBlend * (r2 - r1) + r1;
+    rgb[rgb_plane + offset] = satBlend * (g2 - g1) + g1;
+    rgb[2 * rgb_plane + offset] = satBlend * (b2 - b1) + b1;
+}
+
+/* rgb2lab() over the ROI, with the block's Lab caches. */
+__kernel void rt_local_adjustments_dehaze_rgb2lab(
+    __global const float* rgb, const int rgb_pitch, const int rgb_plane,
+    __global float* lab, const int lab_pitch, const int lab_plane,
+    const int width, const int height, __global const float* ws,
+    __global const float* cachef, __global const float* cachefy)
+{
+    const int x = (int)get_global_id(0);
+    const int y = (int)get_global_id(1);
+    if (x >= width || y >= height) {
+        return;
+    }
+    const int in = y * rgb_pitch + x;
+    const int out = y * lab_pitch + x;
+    const float R = rgb[in];
+    const float G = rgb[rgb_plane + in];
+    const float B = rgb[2 * rgb_plane + in];
+    const float X = ws[0] * R + ws[1] * G + ws[2] * B;
+    const float Y = ws[3] * R + ws[4] * G + ws[5] * B;
+    const float Z = ws[6] * R + ws[7] * G + ws[8] * B;
+    float L = 0.0f;
+    float A = 0.0f;
+    float BB = 0.0f;
+    rt_la_xyz2lab(X, Y, Z, cachef, cachefy, &L, &A, &BB);
+    lab[out] = L;
+    lab[lab_plane + out] = A;
+    lab[2 * lab_plane + out] = BB;
 }
 
 /*
