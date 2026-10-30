@@ -50,6 +50,8 @@ pairs are exact. The gate is the peak absolute error (PAE) in normalised units;
 | 2026-10-30 | uncommitted | POCL (CPU) | 12-case shadows/highlights matrix, `stage-residency-test` | device vs host block | 0.054 LSB (worst) | PASS |
 | 2026-10-30 | 52a7a99df | POCL (CPU) | colorspace_flowers.pef / `localadjustments-soft.pp3`, `local.adjustments` | off vs auto, 16-bit TIFF | 1 LSB | PASS |
 | 2026-10-30 | 52a7a99df | POCL (CPU) | soft-light matrix, `stage-residency-test` | device vs host block | 0.054 LSB (worst) | PASS |
+| 2026-10-30 | c79ea2579 | POCL (CPU) | colorspace_flowers.pef / `localadjustments-cbdl.pp3`, `local.adjustments` | off vs auto, 16-bit TIFF | 1 LSB | PASS |
+| 2026-10-30 | c79ea2579 | POCL (CPU) | 20-case CBDL matrix, `stage-residency-test` | device vs host block | 0.068 LSB (worst) | PASS |
 
 `47c50ee77` changes only CPU export buffer handling; the OpenCL rows above
 re-run the existing GPU stages against the new CPU neighbour.

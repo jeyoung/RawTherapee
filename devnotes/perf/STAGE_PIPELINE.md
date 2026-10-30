@@ -1696,16 +1696,17 @@ Still CPU-only: `raw.preprocess`, `raw.demosaic`, `raw.base`, `lab.tools`,
 
 `local.adjustments` is partial through the multi-spot tool path. The
 admitted set is any number of `norm` spots in list order: an active spot runs
-any combination of Colour & Light, vibrance, shadows/highlights, soft light
-and Gaussian local contrast, and an inactive spot is the clamp-only case and
-may carry inert tool settings. Every active spot needs at least one of
-`expcolor`, `expvibrance`, `expshadhigh`, `expsoft` and `expcontrast`; every
-other `exp*` is a residual. The block-wide requirements are
-`reparcol == 100`, no recursion/inversion/mask/soft radius/merge/LabGrid/RGB
-or exposure curve, `qualitycurveMethod` none or std, `avoidgamutMethod`
-`"NONE"` or `"MUNS"`, and chroma/lightness/contrast inside `-100..100`. Both
-`ELI` and `RECT` shapes are admitted, and an active ROI must be at least 5 px
-in each dimension. The tools run in `Lab_Local()`'s order: vibrance,
+any combination of local CBDL, Colour & Light, vibrance, shadows/highlights,
+soft light and Gaussian local contrast, and an inactive spot is the
+clamp-only case and may carry inert tool settings. Every active spot needs at
+least one of `expcbdl`, `expcolor`, `expvibrance`, `expshadhigh`, `expsoft`
+and `expcontrast`; every other `exp*` is a residual. The block-wide
+requirements are `reparcol == 100`, no
+recursion/inversion/mask/soft radius/merge/LabGrid/RGB or exposure curve,
+`qualitycurveMethod` none or std, `avoidgamutMethod` `"NONE"` or `"MUNS"`,
+and chroma/lightness/contrast inside `-100..100`. Both `ELI` and `RECT`
+shapes are admitted, and an active ROI must be at least 5 px in each
+dimension. The tools run in `Lab_Local()`'s order: CBDL, vibrance,
 shadows/highlights, soft light, local contrast, then Colour & Light. Each
 tool takes a fresh ROI copy and its own deltaE reference blur
 (`(2 + 0.2*blurcolde)` for colour, `(2 + 0.2*blurSHde)` for
@@ -1717,6 +1718,24 @@ the start of the block, and `lastorig` is unused while merge is a residual.
 chroma-slider curves, the seven L/C/H curves and the vibrance skin curve are
 host-built into 65536-entry tables; the local-contrast IIR coefficients are
 host-built for the region's sigma.
+
+Local CBDL admits `expcbdl` with the block's own multipliers (each in
+`0..4`), `chromacbdl` in `0..1.5`, `threshold` in `0..1`, `clarityml` in
+`0.1..100` and `sensicb` in `0..100`; `contresid` and `softradiuscb` are
+residuals, as is an explicit mask. The block's own guard is
+`bfw > 65 && bfh > 65`; a smaller ROI does no CBDL work and is the block's
+no-op rather than a refusal. `cbdl_local_temp()` trims the trailing identity
+levels, and `Lab_Local()` also forces level 5 to `1.001` when clarity or the
+residual contrast is set, and the chroma block forces level 0 to `1.01` for
+the same reason; the device reproduces both mutations. The luminance pass
+reuses the `lab.wavelet` node's `dirpyr_channel()`/`idirpyr_eq_channel_loc()`
+kernels with one host-built `dirpyrFillLut()` table per level, and the chroma
+pass repeats them on
+`sqrt(a*a + b*b)`. Each pass blends with `transit_shapedetect()`: senstype 6
+for L and senstype 7 for chroma. The chroma normaliser
+`1 / (0.01 * max |loctemp->L - sqrt(a*a + b*b)|)` is computed on the device,
+with only the per-row maximum read back. The deltaE scope uses `lp.senscb`
+and the spot's deltaE threshold `lp.thr`, not the CBDL range-table threshold.
 
 Vibrance admits `vibgam == 1`, zero `strvib`/`strvibab`/`strvibh` gradients,
 `warm == 0`, pastels/saturated in `-100..100`, both `psthreshold` corners in
@@ -1789,13 +1808,24 @@ tools, MUNS, a second spot, an inactive spot carrying inert settings, ELI and
 RECT, and the 179x49/238x64/8192x64 widths; no sample is non-finite. It is
 non-vacuous: the tool changes 22,897 of 45,696 fixture samples with PAE
 3206.698242 LSB16 against the same spot with soft light off. The gate
-`localadjustments-soft.pp3` row is 1 LSB16.
+`localadjustments-soft.pp3` row is 1 LSB16. The CBDL matrix is within
+0.069 LSB16 (worst 0.068359 on the scope-disabled case, 0.044922 on an
+8192x96 ROI) for CBDL alone, luma-only, chroma-only, RECT, MUNS,
+colour+CBDL, vibrance+CBDL, CBDL+shadows/highlights, CBDL+soft,
+CBDL+local contrast, all six tools, a second spot, an inactive-then-CBDL
+spot, and the 179x96/8192x96 padded rows; the 179x49, 238x64 and 8192x64
+rows are the block's no-op and are bit-exact. No sample is non-finite. It is
+non-vacuous: CBDL alone changes 34,170 of 68,544 fixture samples with PAE
+2,887.008667 LSB16 against the same spot with the tool off. The gate
+`localadjustments-cbdl.pp3` row is 1 LSB16 and differs from the neutral
+export by PAE 3,420 codes on 14,240,286 of 30,419,712 channel samples.
 Everything else is a residual: exposure (FFT PDE), soft light's `"reti"`
 method, the shadows/highlights
 `"tone"`/`"ghs"`/`"micha"` methods, tone-eq multipliers, a non-default tone
 gamma/slope, the SH recovery blend and gradient, vibrance
 gamma/gradients/warm, the local-contrast wavelet (`"wav"`) and FFT variants,
-blur/denoise, sharpening, tone mapping, Retinex, CBDL, log, the
+CBDL's `contresid` and soft radius, blur/denoise, sharpening, tone mapping,
+Retinex, log, the
 common mask, CIE CAM, dehaze, `exc`/`full`/`main`, merge, explicit masks, soft
 radius, LAB/XYZ/XYZREL gamut methods, the RGB curve, LabGrid, `avoidrad != 0`,
 `transit == 100`, a blur radius above 100, `reparcol != 100`, a ROI below
