@@ -7317,6 +7317,12 @@ void test_local_adjustments(bool available)
                  p.locallab.spots[0].localcontMethod = "wav";
                  p.locallab.spots[0].lcamount = 0.4;
              }},
+            {"local contrast empty method", [](auto& p) {
+                 p.locallab.spots[0].expcolor = false;
+                 p.locallab.spots[0].expcontrast = true;
+                 p.locallab.spots[0].localcontMethod = "";
+                 p.locallab.spots[0].lcamount = 0.4;
+             }},
             {"local contrast fft", [](auto& p) {
                  p.locallab.spots[0].expcolor = false;
                  p.locallab.spots[0].expcontrast = true;
@@ -8059,6 +8065,11 @@ void test_local_adjustments(bool available)
             {"local contrast wavelet", [](auto& p) {
                  p.locallab.spots[0].expcontrast = true;
                  p.locallab.spots[0].localcontMethod = "wav";
+                 p.locallab.spots[0].lcamount = 0.4;
+             }},
+            {"local contrast empty method", [](auto& p) {
+                 p.locallab.spots[0].expcontrast = true;
+                 p.locallab.spots[0].localcontMethod = "";
                  p.locallab.spots[0].lcamount = 0.4;
              }},
             {"local contrast amount", [](auto& p) {
