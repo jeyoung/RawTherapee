@@ -7703,6 +7703,28 @@ void test_local_adjustments(bool available)
             spot.fftwlc = false;
             spot.sensilc = 60;
         };
+        /* The std shadows/highlights method in its Lab mode. */
+        const auto sh_spot = [&](rtengine::procparams::ProcParams& p,
+                                 int highlights, int shadows) {
+            auto& spot = p.locallab.spots[0];
+            spot.expcolor = false;
+            spot.expshadhigh = true;
+            spot.shMethod = "std";
+            spot.highlights = highlights;
+            spot.shadows = shadows;
+            spot.h_tonalwidth = 70;
+            spot.s_tonalwidth = 30;
+            spot.sh_radius = 40;
+            spot.sensihs = 30;
+            spot.blurSHde = 5;
+            spot.reparsh = 100.0;
+            spot.strSH = 0.0;
+            spot.gamSH = 2.4;
+            spot.sloSH = 12.92;
+            for (int index = 0; index < 6; ++index) {
+                spot.multsh[index] = 0;
+            }
+        };
         complex.push_back({"vibrance only", 238, 64, [&](auto& p) {
             add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
             vibrance_spot(p, 40, 20);
@@ -7759,6 +7781,130 @@ void test_local_adjustments(bool available)
         complex.push_back({"local contrast 8192x64", 8192, 64, [&](auto& p) {
             add_spot(p, 0, 0, 8000, true, 0, 0, 0, "ELI", "NONE");
             contrast_spot(p, 40, 0.4);
+        }});
+        complex.push_back({"shadows/highlights only", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            sh_spot(p, 50, 50);
+        }});
+        complex.push_back({"highlights only", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            sh_spot(p, 70, 0);
+        }});
+        complex.push_back({"shadows only", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            sh_spot(p, 0, 70);
+        }});
+        complex.push_back({"shadows/highlights RECT", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "RECT", "NONE");
+            sh_spot(p, 50, 50);
+        }});
+        complex.push_back({"shadows/highlights MUNS", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "MUNS");
+            sh_spot(p, 50, 50);
+        }});
+        complex.push_back({"shadows/highlights 179x49", 179, 49,
+                           [&](auto& p) {
+            add_spot(p, 0, 0, 700, true, 0, 0, 0, "ELI", "NONE");
+            sh_spot(p, 50, 50);
+        }});
+        complex.push_back({"shadows/highlights 8192x64", 8192, 64,
+                           [&](auto& p) {
+            add_spot(p, 0, 0, 8000, true, 0, 0, 0, "ELI", "NONE");
+            sh_spot(p, 50, 50);
+        }});
+        complex.push_back({"colour and shadows/highlights", 238, 64,
+                           [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 35, 10, -5, "ELI", "NONE");
+            p.locallab.spots[0].expshadhigh = true;
+            p.locallab.spots[0].shMethod = "std";
+            p.locallab.spots[0].highlights = 50;
+            p.locallab.spots[0].shadows = 50;
+            p.locallab.spots[0].h_tonalwidth = 70;
+            p.locallab.spots[0].s_tonalwidth = 30;
+            p.locallab.spots[0].sh_radius = 40;
+            p.locallab.spots[0].sensihs = 30;
+            p.locallab.spots[0].blurSHde = 5;
+        }});
+        complex.push_back({"vibrance and shadows/highlights", 238, 64,
+                           [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            vibrance_spot(p, 40, 20);
+            p.locallab.spots[0].expshadhigh = true;
+            p.locallab.spots[0].shMethod = "std";
+            p.locallab.spots[0].highlights = 50;
+            p.locallab.spots[0].shadows = 50;
+            p.locallab.spots[0].h_tonalwidth = 70;
+            p.locallab.spots[0].s_tonalwidth = 30;
+            p.locallab.spots[0].sh_radius = 40;
+            p.locallab.spots[0].sensihs = 30;
+            p.locallab.spots[0].blurSHde = 5;
+        }});
+        complex.push_back({"shadows/highlights and local contrast", 238, 64,
+                           [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            contrast_spot(p, 40, 0.4);
+            p.locallab.spots[0].expshadhigh = true;
+            p.locallab.spots[0].shMethod = "std";
+            p.locallab.spots[0].highlights = 50;
+            p.locallab.spots[0].shadows = 50;
+            p.locallab.spots[0].h_tonalwidth = 70;
+            p.locallab.spots[0].s_tonalwidth = 30;
+            p.locallab.spots[0].sh_radius = 40;
+            p.locallab.spots[0].sensihs = 30;
+            p.locallab.spots[0].blurSHde = 5;
+        }});
+        complex.push_back({"all four tools", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 35, 10, -5, "ELI", "NONE");
+            auto& spot = p.locallab.spots[0];
+            spot.expvibrance = true;
+            spot.pastels = 40;
+            spot.saturated = 20;
+            spot.psthreshold.setValues(0, 75);
+            spot.sensiv = 30;
+            spot.expcontrast = true;
+            spot.localcontMethod = "loc";
+            spot.lcradius = 40;
+            spot.lcamount = 0.4;
+            spot.lcdarkness = 0.9;
+            spot.lclightness = 1.1;
+            spot.reparw = 100.0;
+            spot.sensilc = 60;
+            spot.expshadhigh = true;
+            spot.shMethod = "std";
+            spot.highlights = 50;
+            spot.shadows = 50;
+            spot.h_tonalwidth = 70;
+            spot.s_tonalwidth = 30;
+            spot.sh_radius = 40;
+            spot.sensihs = 30;
+            spot.blurSHde = 5;
+        }});
+        complex.push_back({"shadows/highlights second spot", 238, 64,
+                           [&](auto& p) {
+            add_spot(p, -300, -150, 700, true, 30, 8, 0, "ELI", "NONE");
+            add_spot(p, 300, 150, 700, true, 0, 0, 0, "ELI", "NONE");
+            auto& sh = p.locallab.spots[1];
+            sh.expcolor = false;
+            sh.expshadhigh = true;
+            sh.shMethod = "std";
+            sh.highlights = 50;
+            sh.shadows = 50;
+            sh.h_tonalwidth = 70;
+            sh.s_tonalwidth = 30;
+            sh.sh_radius = 40;
+            sh.sensihs = 30;
+            sh.blurSHde = 5;
+            add_spot(p, 0, 0, 500, true, 0, 0, 0, "ELI", "NONE");
+            auto& spot = p.locallab.spots[2];
+            spot.expcolor = false;
+            spot.expcontrast = true;
+            spot.localcontMethod = "loc";
+            spot.lcradius = 40;
+            spot.lcamount = 0.4;
+            spot.lcdarkness = 0.9;
+            spot.lclightness = 1.1;
+            spot.reparw = 100.0;
+            spot.sensilc = 70;
         }});
         complex.push_back({"colour and vibrance", 238, 64, [&](auto& p) {
             add_spot(p, 0, 0, 800, true, 35, 10, -5, "ELI", "NONE");
@@ -7844,6 +7990,13 @@ void test_local_adjustments(bool available)
             spot.localcontMethod = "loc";
             spot.lcamount = 0.4;
             spot.lcradius = 40;
+            spot.expshadhigh = true;
+            spot.shMethod = "std";
+            spot.highlights = 50;
+            spot.shadows = 50;
+            spot.h_tonalwidth = 70;
+            spot.s_tonalwidth = 30;
+            spot.sh_radius = 40;
             add_spot(p, 100, 100, 600, true, 35, 10, -5, "ELI", "NONE");
         }});
         complex.push_back({"gate multispot", 238, 64, [&](auto& p) {
@@ -7902,6 +8055,32 @@ void test_local_adjustments(bool available)
                         diff.samples);
             check(diff.finite && diff.max_abs <= 1.0,
                   "the complex local.adjustments case is within 1 LSB16");
+            if (c.label == "shadows/highlights only") {
+                /* The matching clamp-only block: the same spot with the tool
+                 * off and a zero Colour & Light pass. The tool must change
+                 * the image, otherwise the parity above is vacuous. */
+                rtengine::procparams::ProcParams plain_params =
+                    reference_params;
+                plain_params.locallab.spots[0].expshadhigh = false;
+                plain_params.locallab.spots[0].expcolor = true;
+                Imagefloat plain_base(c.width, c.height);
+                fill_local_adjustments_rgb(plain_base, 211u);
+                std::unique_ptr<LabImage> plain_lab(
+                    new LabImage(c.width, c.height));
+                rtengine::ImProcFunctions plain_ipf(&plain_params, false);
+                localAdjustmentsHostBlock(plain_ipf, plain_params,
+                                          &plain_base, plain_lab.get(),
+                                          c.width, c.height);
+                const Diff changed =
+                    compare(view(*plain_lab), view(*reference_lab));
+                std::printf("stage-residency: local.adjustments "
+                            "shadows/highlights non-vacuity: %zu of %zu "
+                            "samples differ, PAE %.6f LSB16\n",
+                            changed.differing, changed.samples,
+                            changed.max_abs);
+                check(changed.differing > 0,
+                      "the shadows/highlights tool changes the image");
+            }
             if (c.label == "three ELI") {
                 forward_three.reset(new LabImage(*reference_lab, true));
             }
@@ -7964,6 +8143,64 @@ void test_local_adjustments(bool available)
         check(diff.finite && diff.max_abs == 0.0 &&
                   diff.differing == 0,
               "the 4-px local.adjustments case matches the block");
+    }
+
+    /* A shadows/highlights ROI narrower than the guided filter's 3 x 4
+     * subsampled floor is still inside the block predicate but must run the
+     * host block atomically. */
+    {
+        rtengine::procparams::ProcParams params;
+        params.locallab.enabled = true;
+        auto spot = localAdjustmentsSpot("sh-small", 0, 0, 10, true,
+                                         0, 0, 0);
+        spot.expcolor = false;
+        spot.expshadhigh = true;
+        spot.shMethod = "std";
+        spot.highlights = 50;
+        spot.shadows = 50;
+        spot.h_tonalwidth = 70;
+        spot.s_tonalwidth = 30;
+        spot.sh_radius = 40;
+        spot.sensihs = 30;
+        spot.blurSHde = 5;
+        params.locallab.spots.push_back(spot);
+        check(localAdjustmentsSupported(params),
+              "the small shadows/highlights ROI is inside the predicate");
+
+        Imagefloat reference_base(100, 100);
+        fill_local_adjustments_rgb(reference_base, 137u);
+        std::unique_ptr<LabImage> reference_lab(new LabImage(100, 100));
+        rtengine::ImProcFunctions reference_ipf(&params, false);
+        localAdjustmentsHostBlock(reference_ipf, params, &reference_base,
+                                  reference_lab.get(), 100, 100);
+
+        rtengine::procparams::ProcParams node_params = params;
+        Imagefloat node_base(100, 100);
+        fill_local_adjustments_rgb(node_base, 137u);
+        std::unique_ptr<LabImage> node_lab(new LabImage(100, 100));
+        rtengine::ImProcFunctions node_ipf(&node_params, false);
+        const RtStageStatus status =
+            run_local_adjustments_node(node_base, *node_lab, node_params,
+                                       node_ipf, profile_path);
+        check(status == RT_STAGE_OK,
+              "the small shadows/highlights ROI completes through run()");
+        const std::string profile = read_file(profile_path);
+        if (available) {
+            check(profile.find("\"impl\":\"host\"") != std::string::npos,
+                  "the small shadows/highlights ROI records a host "
+                  "execution");
+            check(profile.find("\"impl\":\"opencl\"") ==
+                      std::string::npos,
+                  "the small shadows/highlights ROI never claims a device "
+                  "pass");
+        }
+        const Diff diff = compare(view(*reference_lab), view(*node_lab));
+        std::printf("stage-residency: local.adjustments small "
+                    "shadows/highlights ROI: host, PAE %.6f LSB16, %zu "
+                    "samples differ\n",
+                    diff.max_abs, diff.differing);
+        check(diff.finite && diff.max_abs == 0.0 && diff.differing == 0,
+              "the small shadows/highlights ROI matches the block");
     }
 
     /* The per-spot clamp alone, with no colour work and no MUNS. An inactive
@@ -8119,8 +8356,109 @@ void test_local_adjustments(bool available)
             {"highlight reconstruction", [](auto& p) {
                  p.toneCurve.hrenabled = true;
              }},
-            {"shadows/highlights", [](auto& p) {
+            {"shadows/highlights micha", [](auto& p) {
                  p.locallab.spots[0].expshadhigh = true;
+             }},
+            {"shadows/highlights tone", [](auto& p) {
+                 auto& spot = p.locallab.spots[0];
+                 spot.expshadhigh = true;
+                 spot.shMethod = "tone";
+                 spot.highlights = 50;
+                 spot.shadows = 50;
+             }},
+            {"shadows/highlights ghs", [](auto& p) {
+                 auto& spot = p.locallab.spots[0];
+                 spot.expshadhigh = true;
+                 spot.shMethod = "ghs";
+                 spot.highlights = 50;
+                 spot.shadows = 50;
+             }},
+            {"shadows/highlights toneeq", [](auto& p) {
+                 auto& spot = p.locallab.spots[0];
+                 spot.expshadhigh = true;
+                 spot.shMethod = "std";
+                 spot.highlights = 50;
+                 spot.shadows = 50;
+                 spot.multsh[2] = 20;
+             }},
+            {"shadows/highlights tone gamma", [](auto& p) {
+                 auto& spot = p.locallab.spots[0];
+                 spot.expshadhigh = true;
+                 spot.shMethod = "std";
+                 spot.highlights = 50;
+                 spot.shadows = 50;
+                 spot.gamSH = 2.2;
+             }},
+            {"shadows/highlights tone slope", [](auto& p) {
+                 auto& spot = p.locallab.spots[0];
+                 spot.expshadhigh = true;
+                 spot.shMethod = "std";
+                 spot.highlights = 50;
+                 spot.shadows = 50;
+                 spot.sloSH = 13.0;
+             }},
+            {"shadows/highlights recovery", [](auto& p) {
+                 auto& spot = p.locallab.spots[0];
+                 spot.expshadhigh = true;
+                 spot.shMethod = "std";
+                 spot.highlights = 50;
+                 spot.shadows = 50;
+                 spot.reparsh = 50.0;
+             }},
+            {"shadows/highlights gradient", [](auto& p) {
+                 auto& spot = p.locallab.spots[0];
+                 spot.expshadhigh = true;
+                 spot.shMethod = "std";
+                 spot.highlights = 50;
+                 spot.shadows = 50;
+                 spot.strSH = 1.0;
+             }},
+            {"shadows/highlights highlights range", [](auto& p) {
+                 auto& spot = p.locallab.spots[0];
+                 spot.expshadhigh = true;
+                 spot.shMethod = "std";
+                 spot.highlights = 101;
+             }},
+            {"shadows/highlights shadows range", [](auto& p) {
+                 auto& spot = p.locallab.spots[0];
+                 spot.expshadhigh = true;
+                 spot.shMethod = "std";
+                 spot.shadows = 101;
+             }},
+            {"shadows/highlights tonal range", [](auto& p) {
+                 auto& spot = p.locallab.spots[0];
+                 spot.expshadhigh = true;
+                 spot.shMethod = "std";
+                 spot.highlights = 50;
+                 spot.h_tonalwidth = 5;
+             }},
+            {"shadows/highlights radius range", [](auto& p) {
+                 auto& spot = p.locallab.spots[0];
+                 spot.expshadhigh = true;
+                 spot.shMethod = "std";
+                 spot.highlights = 50;
+                 spot.sh_radius = 101;
+             }},
+            {"shadows/highlights sensitivity range", [](auto& p) {
+                 auto& spot = p.locallab.spots[0];
+                 spot.expshadhigh = true;
+                 spot.shMethod = "std";
+                 spot.highlights = 50;
+                 spot.sensihs = 101;
+             }},
+            {"shadows/highlights blur range", [](auto& p) {
+                 auto& spot = p.locallab.spots[0];
+                 spot.expshadhigh = true;
+                 spot.shMethod = "std";
+                 spot.highlights = 50;
+                 spot.blurSHde = 1;
+             }},
+            {"shadows/highlights explicit mask", [](auto& p) {
+                 auto& spot = p.locallab.spots[0];
+                 spot.expshadhigh = true;
+                 spot.shMethod = "std";
+                 spot.highlights = 50;
+                 spot.enaSHMask = true;
              }},
             {"recursion", [](auto& p) {
                  p.locallab.spots[0].recurs = true;
@@ -8275,6 +8613,63 @@ void test_local_adjustments(bool available)
               "the extra tools are not recorded on a colour-only spot");
         check(record[RT_LOCAL_ADJUSTMENTS_SLOT_VIB_SKIN_ACTIVE] == 0.f,
               "the idle vibrance skin curve is not recorded");
+    }
+
+    /* The shadows/highlights record and its two host-built tone tables. */
+    {
+        rtengine::procparams::ProcParams params = supported;
+        auto& spot = params.locallab.spots[0];
+        spot.expcolor = false;
+        spot.expshadhigh = true;
+        spot.shMethod = "std";
+        spot.highlights = 50;
+        spot.shadows = 50;
+        spot.h_tonalwidth = 70;
+        spot.s_tonalwidth = 30;
+        spot.sh_radius = 40;
+        spot.sensihs = 30;
+        spot.blurSHde = 5;
+        check(localAdjustmentsSupported(params),
+              "the shadows/highlights spot is inside the predicate");
+
+        Imagefloat base(179, 48);
+        fill_local_adjustments_rgb(base, 43u);
+        std::unique_ptr<LabImage> lab(new LabImage(179, 48));
+        rtengine::ImProcFunctions ipf(&params, false);
+        rtengine::LabImage source(179, 48);
+        ipf.rgb2lab(base, source, params.icm.workingProfile);
+
+        LabImage* lab_pointer = lab.get();
+        LocalAdjustmentsContext context(params, ipf, &base, lab_pointer,
+                                        179, 48);
+        RtStageBuffer source_view = view(source);
+        RtLocalAdjustmentsResult setup{};
+        check(context.build(0, &source_view, setup) == 0,
+              "the shadows/highlights setup builds one spot");
+        const float* record = setup.spots;
+        check(record[RT_LOCAL_ADJUSTMENTS_SLOT_EXPSHADHIGHLIGHTS] == 1.f,
+              "the shadows/highlights pass is recorded");
+        check(record[RT_LOCAL_ADJUSTMENTS_SLOT_SH_HL_ACTIVE] == 1.f &&
+                  record[RT_LOCAL_ADJUSTMENTS_SLOT_SH_SH_ACTIVE] == 1.f,
+              "both shadows/highlights tone tables are active");
+        const float hl_offset =
+            record[RT_LOCAL_ADJUSTMENTS_SLOT_SH_HL_OFFSET];
+        const float sh_offset =
+            record[RT_LOCAL_ADJUSTMENTS_SLOT_SH_SH_OFFSET];
+        check(hl_offset >= 0.f && sh_offset >= 0.f &&
+                  static_cast<std::size_t>(hl_offset) +
+                          RT_LOCAL_ADJUSTMENTS_SH_LUT_ENTRIES <=
+                      setup.lut_count &&
+                  static_cast<std::size_t>(sh_offset) +
+                          RT_LOCAL_ADJUSTMENTS_SH_LUT_ENTRIES <=
+                      setup.lut_count,
+              "both shadows/highlights tone tables are inside the flat set");
+        check(setup.iir_shadows_highlights != nullptr &&
+                  setup.iir_shadows_highlights->version ==
+                      RT_LAB_TOOLS_IIR_VERSION &&
+                  setup.iir_shadows_highlights->double_path == 0,
+              "the shadows/highlights setup exports the SSE blur "
+              "coefficients");
     }
 
     /* The call-site guard is a helper so the inactive/prefill decision is
