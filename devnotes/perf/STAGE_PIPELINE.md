@@ -1732,10 +1732,18 @@ reuses the `lab.wavelet` node's `dirpyr_channel()`/`idirpyr_eq_channel_loc()`
 kernels with one host-built `dirpyrFillLut()` table per level, and the chroma
 pass repeats them on
 `sqrt(a*a + b*b)`. Each pass blends with `transit_shapedetect()`: senstype 6
-for L and senstype 7 for chroma. The chroma normaliser
+for L and senstype 7 for chroma. The chroma block runs for every positive
+`chromacbdl`, not only when its derived multipliers survive the trailing
+identity trim; when they do not, `cbdl_local_temp()` returns without writing
+and the senstype-7 blend uses the luminance result in `loctemp->L`, exactly as
+the CPU does. The chroma normaliser
 `1 / (0.01 * max |loctemp->L - sqrt(a*a + b*b)|)` is computed on the device,
 with only the per-row maximum read back. The deltaE scope uses `lp.senscb`
 and the spot's deltaE threshold `lp.thr`, not the CBDL range-table threshold.
+`transit_shapedetect(7)` receives the CPU's `original`, which is the same
+`LabImage` as `transformed`: the luminance blend has already written L there
+while a/b are unchanged, so the chroma and later passes take a fresh pre-tool
+copy of that pair. A pre-luma copy would not match the CPU.
 
 Vibrance admits `vibgam == 1`, zero `strvib`/`strvibab`/`strvibh` gradients,
 `warm == 0`, pastels/saturated in `-100..100`, both `psthreshold` corners in
@@ -1813,12 +1821,21 @@ non-vacuous: the tool changes 22,897 of 45,696 fixture samples with PAE
 8192x96 ROI) for CBDL alone, luma-only, chroma-only, RECT, MUNS,
 colour+CBDL, vibrance+CBDL, CBDL+shadows/highlights, CBDL+soft,
 CBDL+local contrast, all six tools, a second spot, an inactive-then-CBDL
-spot, and the 179x96/8192x96 padded rows; the 179x49, 238x64 and 8192x64
-rows are the block's no-op and are bit-exact. No sample is non-finite. It is
+spot, the 179x96/8192x96 padded rows, and the two chroma regressions below;
+the 179x49, 238x64 and 8192x64 rows are the block's no-op and are bit-exact.
+No sample is non-finite. It is
 non-vacuous: CBDL alone changes 34,170 of 68,544 fixture samples with PAE
 2,887.008667 LSB16 against the same spot with the tool off. The gate
 `localadjustments-cbdl.pp3` row is 1 LSB16 and differs from the neutral
 export by PAE 3,420 codes on 14,240,286 of 30,419,712 channel samples.
+
+The `chromacbdl = 0.01`, default-multiplier, default-clarity case is the
+chroma block's all-ones-multiplier arm: the CPU still enters the block and
+blends the luminance result. The pre-fix device skipped it and diverged by
+16,178.705 LSB16 on 26,091 of 68,544 fixture samples; it is now 0.022949
+(341 samples). The same spot with `balan = 2.5` was 12,771.615 LSB16 on
+26,140 samples and is now 0.029297 (549 samples); a fully active
+`balan = 2.5` block is 0.023438. Both are `impl=opencl` and finite.
 Everything else is a residual: exposure (FFT PDE), soft light's `"reti"`
 method, the shadows/highlights
 `"tone"`/`"ghs"`/`"micha"` methods, tone-eq multipliers, a non-default tone
