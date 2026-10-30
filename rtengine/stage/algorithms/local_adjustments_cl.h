@@ -97,6 +97,22 @@ inline constexpr const char* RT_LOCAL_ADJUSTMENTS_CL = R"CLC(
 #define RT_LA_ADJUSTR 63
 #define RT_LA_AMOUNTCHROM 64
 
+/*
+ * The number of trailing columns the host takes through its scalar path.
+ * lab2rgb() scans blocks of four while `j < W - 3` and avoidcolshi() does the
+ * same, so exactly `width % 4` columns fall through (none when the width is
+ * divisible by four). A build without SSE2/RT_SIMDE is scalar throughout.
+ * The program defines RT_LA_HOST_SIMD from the host's compile-time choice.
+ */
+inline int rt_la_host_tail(const int width)
+{
+#if RT_LA_HOST_SIMD
+    return width % 4;
+#else
+    return width;
+#endif
+}
+
 /* iplocallab.cc's constants. */
 #define RT_LA_MINSCOPE 0.025f
 #define RT_LA_MAXSCOPE 1.25f
@@ -742,11 +758,29 @@ __kernel void rt_local_adjustments_munsell(__global float* lab,
     const float anew = lab[lab_plane + offset];
     const float bnew = lab[2 * lab_plane + offset];
     const float Lprov1 = lab[offset] / 327.68f;
-    const float Chprov = sqrt(anew * anew + bnew * bnew) / 327.68f;
+    const float raw = sqrt(anew * anew + bnew * bnew);
+    const float Chprov = raw / 327.68f;
 
+    /*
+     * avoidcolshi() normalises the sine and cosine differently in its SIMD
+     * loop and its scalar tail: the SIMD loop divides by the raw chroma,
+     * while the scalar tail divides by the chroma after the 327.68 scale.
+     * The clamp already splits at width % 4 for the same reason; reproduce
+     * the split here so the chroma normalisation follows the host's order.
+     */
+    const int tail = rt_la_host_tail(width);
+    const bool scalar_tail = tail != 0 && x >= width - tail;
     float2 sincosval;
-    sincosval.y = Chprov == 0.0f ? 1.0f : anew / (Chprov * 327.68f);
-    sincosval.x = Chprov == 0.0f ? 0.0f : bnew / (Chprov * 327.68f);
+    if (raw == 0.0f) {
+        sincosval.y = 1.0f;
+        sincosval.x = 0.0f;
+    } else if (scalar_tail) {
+        sincosval.y = anew / (Chprov * 327.68f);
+        sincosval.x = bnew / (Chprov * 327.68f);
+    } else {
+        sincosval.y = anew / raw;
+        sincosval.x = bnew / raw;
+    }
     float HH = rt_lt_xatan2f(bnew, anew);
 
     const float Lprov2 = reserved[offset] / 327.68f;
@@ -768,6 +802,39 @@ __kernel void rt_local_adjustments_munsell(__global float* lab,
 
     lab[lab_plane + offset] = 327.68f * Chprov * sincosval.y;
     lab[2 * lab_plane + offset] = 327.68f * Chprov * sincosval.x;
+}
+
+/*
+ * Color::Lab2XYZ() as lab2rgb() evaluates it. The host's SIMD loop computes
+ * `fy * fy * fy` and then scales by 65535, while its scalar tail multiplies
+ * by 65535 first; the two orders round differently. The clamp must reproduce
+ * that split because a one-LSB Y difference moves Munsell's zone thresholds.
+ */
+inline void rt_la_lab2xyz(const float L, const float a, const float b,
+                          const int x, const int width,
+                          float* px, float* py, float* pz)
+{
+    const float LL = L / 327.68f;
+    const float aa = a / 327.68f;
+    const float bb = b / 327.68f;
+    const float fy = (RT_LT_C1BY116 * LL) + RT_LT_C16BY116;
+    const float fx = (0.002f * aa) + fy;
+    const float fz = fy - (0.005f * bb);
+    const float fx3 = fx * fx * fx;
+    const float fz3 = fz * fz * fz;
+    const float fxl = (116.0f * fx - 16.0f) * RT_LT_KAPPAINV;
+    const float fzl = (116.0f * fz - 16.0f) * RT_LT_KAPPAINV;
+    *px = 65535.0f * ((fx > RT_LT_EPSINV3) ? fx3 : fxl) * RT_LT_D50X;
+    *pz = 65535.0f * ((fz > RT_LT_EPSINV3) ? fz3 : fzl) * RT_LT_D50Z;
+
+    const int tail = rt_la_host_tail(width);
+    if (tail != 0 && x >= width - tail) {
+        *py = (LL > RT_LT_EPSKAP) ? 65535.0f * fy * fy * fy
+                                  : 65535.0f * LL / RT_LT_KAPPA;
+    } else {
+        const float cube = fy * fy * fy;
+        *py = ((LL > RT_LT_EPSKAP) ? cube : LL / RT_LT_KAPPA) * 65535.0f;
+    }
 }
 
 /* Color::cachef[]/cachefy[] are LUT_CLIP_BELOW only, so a value above the
@@ -853,7 +920,7 @@ __kernel void rt_local_adjustments_clamp(__global float* lab,
     const float b = lab[2 * lab_plane + offset];
 
     float xyz[3] = {0.0f, 0.0f, 0.0f};
-    rt_lt_lab2xyz(l, a, b, &xyz[0], &xyz[1], &xyz[2]);
+    rt_la_lab2xyz(l, a, b, x, width, &xyz[0], &xyz[1], &xyz[2]);
 
     float rgb[3] = {0.0f, 0.0f, 0.0f};
     rt_lt_xyz2rgb(xyz[0], xyz[1], xyz[2], iws, &rgb[0], &rgb[1], &rgb[2]);
@@ -880,10 +947,16 @@ __kernel void rt_local_adjustments_clamp(__global float* lab,
 )CLC";
 
 /* The one-spot colour program: the shared helpers and kernels plus the
- * local-adjustments fragments. */
+ * local-adjustments fragments. The leading define records whether the host
+ * takes lab2rgb()'s and avoidcolshi()'s SIMD branch. */
 inline std::string local_adjustments_program()
 {
-    return std::string(RT_LAB_TOOLS_CL) + RT_MUNSELL_LCH_CL +
+#if defined(__SSE2__) || defined(RT_SIMDE)
+    static const std::string simd = "#define RT_LA_HOST_SIMD 1\n";
+#else
+    static const std::string simd = "#define RT_LA_HOST_SIMD 0\n";
+#endif
+    return simd + RT_LAB_TOOLS_CL + RT_MUNSELL_LCH_CL +
            RT_LOCAL_CONTRAST_CL + RT_VIBRANCE_CL + RT_LAB_REGIONS_CL +
            RT_LOCAL_ADJUSTMENTS_CL;
 }

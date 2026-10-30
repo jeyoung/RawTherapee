@@ -238,11 +238,12 @@ bool localAdjustmentsSupported(const procparams::ProcParams& params)
               spot.qualitycurveMethod == "std")) {
             return false;
         }
-        /* MUNS is a measured residual: on the real gate image the clamp's
-         * last-bit differences move Munsell's discontinuous zone thresholds
-         * by up to 136 LSB16. NONE only until the clamp is bit-exact. */
+        /* The per-spot clamp is bit-exact against the host, so the MUNS pass
+         * can follow it; LAB, XYZ and XYZREL still need the host gamut
+         * helpers and remain residuals. */
         if (!(spot.avoidgamutMethod.empty() ||
-              spot.avoidgamutMethod == "NONE")) {
+              spot.avoidgamutMethod == "NONE" ||
+              spot.avoidgamutMethod == "MUNS")) {
             return false;
         }
         if (spot.softradiuscol != 0.0 || spot.avoidrad != 0.0) {
