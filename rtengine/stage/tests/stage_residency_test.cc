@@ -7979,6 +7979,30 @@ void test_local_adjustments(bool available)
             add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
             cbdl_spot(p, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.1);
         }});
+        complex.push_back({"CBDL tiny chroma", 238, 96, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            p.locallab.spots[0].expcolor = false;
+            p.locallab.spots[0].expcbdl = true;
+            p.locallab.spots[0].chromacbdl = 0.01;
+        }});
+        complex.push_back({"CBDL balance 2.5", 238, 96, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            cbdl_spot(p, 1.2, 1.1, 1.05, 1.0, 1.0, 1.02, 0.5, 2.0);
+            p.locallab.spots[0].balan = 2.5;
+        }});
+        complex.push_back({"CBDL tiny chroma balance 2.5", 238, 96,
+                           [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            p.locallab.spots[0].expcolor = false;
+            p.locallab.spots[0].expcbdl = true;
+            p.locallab.spots[0].chromacbdl = 0.01;
+            p.locallab.spots[0].balan = 2.5;
+        }});
+        complex.push_back({"CBDL balance 2", 238, 96, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            cbdl_spot(p, 1.2, 1.1, 1.05, 1.0, 1.0, 1.02, 0.5, 2.0);
+            p.locallab.spots[0].balan = 2.0;
+        }});
         complex.push_back({"CBDL no scope", 238, 96, [&](auto& p) {
             add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
             cbdl_spot(p, 1.2, 1.18, 1.15, 1.1, 1.05, 1.02, 0.5, 2.0);
