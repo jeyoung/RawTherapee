@@ -1719,8 +1719,11 @@ Vibrance admits `vibgam == 1`, zero `strvib`/`strvibab`/`strvibh` gradients,
 `warm == 0`, pastels/saturated in `-100..100`, both `psthreshold` corners in
 `0..100` and `sensiv` in `0..100`. A skin curve alone does not run the tool:
 the host's vibrance block guard reads only the sliders, so the device records
-the same no-op. Local contrast admits `localcontMethod` empty or `"loc"` (the
-Gaussian variant), `fftwlc == false`, `reparw == 100`, `lcamount` in `0..1`,
+the same no-op. Local contrast admits `localcontMethod == "loc"` (the
+Gaussian variant) only; `calcLocalParams()` assigns `lp.locmet` only for
+`"loc"` and `"wav"`, so an empty or unknown method leaves the host arm
+indeterminate and is refused, as is `"wav"`. It also requires
+`fftwlc == false`, `reparw == 100`, `lcamount` in `0..1`,
 `lcradius` in `10..100`, `lcdarkness` in `0..3` and `sensilc` in `0..100`, and
 refuses non-zero wavelet settings. The block reads the Colour & Light
 `lightness` slider, not `lclightness`, for local contrast's highlight scaling;
