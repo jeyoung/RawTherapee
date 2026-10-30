@@ -277,6 +277,12 @@ quick() {
     run_stage_device "pef/stage-device-local-adjustments-munsell" \
         "$ROOT/devnotes/opencl/pp3/localadjustments-munsell.pp3" \
         local.adjustments cpu
+    run_stage_device "pef/stage-device-local-adjustments-vibrance" \
+        "$ROOT/devnotes/opencl/pp3/localadjustments-vibrance.pp3" \
+        local.adjustments cpu
+    run_stage_device "pef/stage-device-local-adjustments-localcontrast" \
+        "$ROOT/devnotes/opencl/pp3/localadjustments-localcontrast.pp3" \
+        local.adjustments cpu
 }
 
 stage() {
@@ -602,6 +608,12 @@ stage_device() {
         local.adjustments
     run_stage_device "pef/stage-device-local-adjustments-munsell" \
         "$ROOT/devnotes/opencl/pp3/localadjustments-munsell.pp3" \
+        local.adjustments cpu
+    run_stage_device "pef/stage-device-local-adjustments-vibrance" \
+        "$ROOT/devnotes/opencl/pp3/localadjustments-vibrance.pp3" \
+        local.adjustments cpu
+    run_stage_device "pef/stage-device-local-adjustments-localcontrast" \
+        "$ROOT/devnotes/opencl/pp3/localadjustments-localcontrast.pp3" \
         local.adjustments cpu
 }
 

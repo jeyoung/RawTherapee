@@ -21,6 +21,7 @@
 #include "flatcurvetypes.h"
 #include "iccstore.h"
 #include "improcfun.h"
+#include "localadjustments.h"
 #include "procparams.h"
 #include "settings.h"
 #include "utils.h"
@@ -7292,11 +7293,36 @@ void test_local_adjustments(bool available)
             {"shadows/highlights", [](auto& p) {
                  p.locallab.spots[0].expshadhigh = true;
              }},
-            {"vibrance", [](auto& p) {
+            {"vibrance gamma", [](auto& p) {
+                 p.locallab.spots[0].expcolor = false;
                  p.locallab.spots[0].expvibrance = true;
+                 p.locallab.spots[0].pastels = 40;
+                 p.locallab.spots[0].vibgam = 2.0;
              }},
-            {"local contrast", [](auto& p) {
+            {"vibrance gradient", [](auto& p) {
+                 p.locallab.spots[0].expcolor = false;
+                 p.locallab.spots[0].expvibrance = true;
+                 p.locallab.spots[0].pastels = 40;
+                 p.locallab.spots[0].strvib = 5.0;
+             }},
+            {"vibrance warm", [](auto& p) {
+                 p.locallab.spots[0].expcolor = false;
+                 p.locallab.spots[0].expvibrance = true;
+                 p.locallab.spots[0].pastels = 40;
+                 p.locallab.spots[0].warm = 1;
+             }},
+            {"local contrast wavelet", [](auto& p) {
+                 p.locallab.spots[0].expcolor = false;
                  p.locallab.spots[0].expcontrast = true;
+                 p.locallab.spots[0].localcontMethod = "wav";
+                 p.locallab.spots[0].lcamount = 0.4;
+             }},
+            {"local contrast fft", [](auto& p) {
+                 p.locallab.spots[0].expcolor = false;
+                 p.locallab.spots[0].expcontrast = true;
+                 p.locallab.spots[0].localcontMethod = "loc";
+                 p.locallab.spots[0].lcamount = 0.4;
+                 p.locallab.spots[0].fftwlc = true;
              }},
             {"blur", [](auto& p) {
                  p.locallab.spots[0].expblur = true;
@@ -7638,6 +7664,182 @@ void test_local_adjustments(bool available)
             spot.LHcurve = flat(0.7);
             spot.CHcurve = flat(0.7);
         }});
+
+        /* Vibrance and local contrast, alone and combined with Colour &
+         * Light. The colour tool is switched off in the alone cases, and the
+         * local-contrast method is the Gaussian variant. */
+        const auto vibrance_spot = [&](rtengine::procparams::ProcParams& p,
+                                       int pastels, int saturated) {
+            auto& spot = p.locallab.spots[0];
+            spot.expcolor = false;
+            spot.expvibrance = true;
+            spot.pastels = pastels;
+            spot.saturated = saturated;
+            spot.psthreshold.setValues(0, 75);
+            spot.sensiv = 30;
+            spot.vibgam = 1.0;
+            spot.warm = 0;
+            spot.strvib = 0.0;
+            spot.strvibab = 0.0;
+            spot.strvibh = 0.0;
+        };
+        const auto contrast_spot = [&](rtengine::procparams::ProcParams& p,
+                                       int radius, double amount) {
+            auto& spot = p.locallab.spots[0];
+            spot.expcolor = false;
+            spot.expcontrast = true;
+            spot.localcontMethod = "loc";
+            spot.lcradius = radius;
+            spot.lcamount = amount;
+            spot.lcdarkness = 0.9;
+            spot.lclightness = 1.1;
+            spot.reparw = 100.0;
+            spot.fftwlc = false;
+            spot.sensilc = 60;
+        };
+        complex.push_back({"vibrance only", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            vibrance_spot(p, 40, 20);
+        }});
+        complex.push_back({"vibrance skin curve", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            vibrance_spot(p, 40, 0);
+            p.locallab.spots[0].skintonescurve = diagonal(0.8);
+        }});
+        complex.push_back({"vibrance skin only", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            vibrance_spot(p, 0, 0);
+            p.locallab.spots[0].skintonescurve = diagonal(0.8);
+        }});
+        complex.push_back({"vibrance MUNS", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "MUNS");
+            vibrance_spot(p, 40, 20);
+        }});
+        complex.push_back({"vibrance 179x49", 179, 49, [&](auto& p) {
+            add_spot(p, 0, 0, 700, true, 0, 0, 0, "ELI", "NONE");
+            vibrance_spot(p, 40, 20);
+        }});
+        complex.push_back({"vibrance 8192x64", 8192, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 8000, true, 0, 0, 0, "ELI", "NONE");
+            vibrance_spot(p, 40, 20);
+        }});
+        complex.push_back({"local contrast only", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            contrast_spot(p, 40, 0.4);
+        }});
+        complex.push_back({"local contrast no deltae", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            contrast_spot(p, 40, 0.4);
+            p.locallab.spots[0].deltae = false;
+        }});
+        complex.push_back({"local contrast raw", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            contrast_spot(p, 40, 0.4);
+            p.locallab.spots[0].sensilc = 100;
+            p.locallab.spots[0].transit = 99.0;
+        }});
+        complex.push_back({"local contrast sse", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            contrast_spot(p, 10, 0.3);
+        }});
+        complex.push_back({"local contrast MUNS", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "MUNS");
+            contrast_spot(p, 40, 0.4);
+        }});
+        complex.push_back({"local contrast 179x49", 179, 49, [&](auto& p) {
+            add_spot(p, 0, 0, 700, true, 0, 0, 0, "ELI", "NONE");
+            contrast_spot(p, 10, 0.3);
+        }});
+        complex.push_back({"local contrast 8192x64", 8192, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 8000, true, 0, 0, 0, "ELI", "NONE");
+            contrast_spot(p, 40, 0.4);
+        }});
+        complex.push_back({"colour and vibrance", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 35, 10, -5, "ELI", "NONE");
+            p.locallab.spots[0].expvibrance = true;
+            p.locallab.spots[0].pastels = 40;
+            p.locallab.spots[0].saturated = 20;
+            p.locallab.spots[0].psthreshold.setValues(0, 75);
+            p.locallab.spots[0].sensiv = 30;
+        }});
+        complex.push_back({"colour and local contrast", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 35, 10, -5, "ELI", "NONE");
+            auto& spot = p.locallab.spots[0];
+            spot.expcontrast = true;
+            spot.localcontMethod = "loc";
+            spot.lcradius = 40;
+            spot.lcamount = 0.4;
+            spot.lcdarkness = 0.9;
+            spot.lclightness = 1.1;
+            spot.reparw = 100.0;
+            spot.sensilc = 60;
+        }});
+        complex.push_back({"all three tools", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 35, 10, -5, "ELI", "NONE");
+            auto& spot = p.locallab.spots[0];
+            spot.expvibrance = true;
+            spot.pastels = 40;
+            spot.saturated = 20;
+            spot.psthreshold.setValues(0, 75);
+            spot.sensiv = 30;
+            spot.expcontrast = true;
+            spot.localcontMethod = "loc";
+            spot.lcradius = 40;
+            spot.lcamount = 0.4;
+            spot.lcdarkness = 0.9;
+            spot.lclightness = 1.1;
+            spot.reparw = 100.0;
+            spot.sensilc = 60;
+        }});
+        complex.push_back({"all three tools MUNS", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 35, 10, -5, "ELI", "MUNS");
+            auto& spot = p.locallab.spots[0];
+            spot.expvibrance = true;
+            spot.pastels = 40;
+            spot.saturated = 20;
+            spot.psthreshold.setValues(0, 75);
+            spot.sensiv = 30;
+            spot.expcontrast = true;
+            spot.localcontMethod = "loc";
+            spot.lcradius = 40;
+            spot.lcamount = 0.4;
+            spot.lcdarkness = 0.9;
+            spot.lclightness = 1.1;
+            spot.reparw = 100.0;
+            spot.sensilc = 60;
+        }});
+        complex.push_back({"tools across spots", 238, 64, [&](auto& p) {
+            add_spot(p, -300, -150, 700, true, 30, 8, 0, "ELI", "NONE");
+            add_spot(p, 300, 150, 700, true, 0, 0, 0, "RECT", "NONE");
+            p.locallab.spots[1].expcolor = false;
+            p.locallab.spots[1].expvibrance = true;
+            p.locallab.spots[1].pastels = 40;
+            p.locallab.spots[1].saturated = 20;
+            p.locallab.spots[1].psthreshold.setValues(0, 75);
+            p.locallab.spots[1].sensiv = 40;
+            add_spot(p, 0, 0, 500, true, 0, 0, 0, "ELI", "NONE");
+            auto& spot = p.locallab.spots[2];
+            spot.expcolor = false;
+            spot.expcontrast = true;
+            spot.localcontMethod = "loc";
+            spot.lcradius = 40;
+            spot.lcamount = 0.4;
+            spot.lcdarkness = 0.9;
+            spot.lclightness = 1.1;
+            spot.reparw = 100.0;
+            spot.sensilc = 70;
+        }});
+        complex.push_back({"inactive tools", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 700, false, 0, 0, 0, "ELI", "NONE");
+            auto& spot = p.locallab.spots[0];
+            spot.expvibrance = true;
+            spot.pastels = 40;
+            spot.expcontrast = true;
+            spot.localcontMethod = "loc";
+            spot.lcamount = 0.4;
+            spot.lcradius = 40;
+            add_spot(p, 100, 100, 600, true, 35, 10, -5, "ELI", "NONE");
+        }});
         complex.push_back({"gate multispot", 238, 64, [&](auto& p) {
             add_spot(p, -400, -200, 700, true, 30, 10, 5, "ELI", "NONE");
             p.locallab.spots[0].qualitycurveMethod = "std";
@@ -7835,6 +8037,59 @@ void test_local_adjustments(bool available)
      * and match the block byte for byte. */
     {
         const LocalAdjustmentsResidual residuals[] = {
+            {"vibrance gamma", [](auto& p) {
+                 p.locallab.spots[0].expvibrance = true;
+                 p.locallab.spots[0].pastels = 40;
+                 p.locallab.spots[0].vibgam = 2.0;
+             }},
+            {"vibrance gradient", [](auto& p) {
+                 p.locallab.spots[0].expvibrance = true;
+                 p.locallab.spots[0].pastels = 40;
+                 p.locallab.spots[0].strvibab = 5.0;
+             }},
+            {"vibrance warm", [](auto& p) {
+                 p.locallab.spots[0].expvibrance = true;
+                 p.locallab.spots[0].pastels = 40;
+                 p.locallab.spots[0].warm = 1;
+             }},
+            {"vibrance range", [](auto& p) {
+                 p.locallab.spots[0].expvibrance = true;
+                 p.locallab.spots[0].pastels = 101;
+             }},
+            {"local contrast wavelet", [](auto& p) {
+                 p.locallab.spots[0].expcontrast = true;
+                 p.locallab.spots[0].localcontMethod = "wav";
+                 p.locallab.spots[0].lcamount = 0.4;
+             }},
+            {"local contrast amount", [](auto& p) {
+                 p.locallab.spots[0].expcontrast = true;
+                 p.locallab.spots[0].localcontMethod = "loc";
+                 p.locallab.spots[0].lcamount = 2.0;
+             }},
+            {"local contrast radius", [](auto& p) {
+                 p.locallab.spots[0].expcontrast = true;
+                 p.locallab.spots[0].localcontMethod = "loc";
+                 p.locallab.spots[0].lcamount = 0.4;
+                 p.locallab.spots[0].lcradius = 5;
+             }},
+            {"local contrast darkness", [](auto& p) {
+                 p.locallab.spots[0].expcontrast = true;
+                 p.locallab.spots[0].localcontMethod = "loc";
+                 p.locallab.spots[0].lcamount = 0.4;
+                 p.locallab.spots[0].lcdarkness = 4.0;
+             }},
+            {"local contrast recovery", [](auto& p) {
+                 p.locallab.spots[0].expcontrast = true;
+                 p.locallab.spots[0].localcontMethod = "loc";
+                 p.locallab.spots[0].lcamount = 0.4;
+                 p.locallab.spots[0].reparw = 50.0;
+             }},
+            {"local contrast wavelet strength", [](auto& p) {
+                 p.locallab.spots[0].expcontrast = true;
+                 p.locallab.spots[0].localcontMethod = "loc";
+                 p.locallab.spots[0].lcamount = 0.4;
+                 p.locallab.spots[0].strwav = 10.0;
+             }},
             {"explicit mask", [](auto& p) {
                  p.locallab.spots[0].enaColorMask = true;
              }},
@@ -7968,6 +8223,17 @@ void test_local_adjustments(bool available)
                   setup.iir->version == RT_LAB_TOOLS_IIR_VERSION,
               "the local.adjustments setup exports the SSE blur "
               "coefficients");
+        check(setup.iir_vibrance != nullptr &&
+                  setup.iir_vibrance->double_path == 0 &&
+                  setup.iir_vibrance->version == RT_LAB_TOOLS_IIR_VERSION,
+              "the local.adjustments setup exports the deltaE radius-3 "
+              "coefficients");
+        check(setup.iir_local_contrast != nullptr &&
+                  setup.iir_local_contrast->version ==
+                      RT_LAB_TOOLS_IIR_VERSION &&
+                  setup.iir_local_contrast->double_path == 1,
+              "the local.adjustments setup exports the local-contrast "
+              "coefficients");
         const float* record = setup.spots;
         bool finite = true;
         for (std::size_t slot = 0;
@@ -7993,6 +8259,11 @@ void test_local_adjustments(bool available)
               "highlight reconstruction is off");
         check(record[RT_LOCAL_ADJUSTMENTS_SLOT_QCURVE] == 0.f,
               "the quality curves are off");
+        check(record[RT_LOCAL_ADJUSTMENTS_SLOT_EXPVIBRANCE] == 0.f &&
+                  record[RT_LOCAL_ADJUSTMENTS_SLOT_EXPCONTRAST] == 0.f,
+              "the extra tools are not recorded on a colour-only spot");
+        check(record[RT_LOCAL_ADJUSTMENTS_SLOT_VIB_SKIN_ACTIVE] == 0.f,
+              "the idle vibrance skin curve is not recorded");
     }
 
     /* The call-site guard is a helper so the inactive/prefill decision is
