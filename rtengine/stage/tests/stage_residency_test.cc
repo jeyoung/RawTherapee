@@ -7374,6 +7374,38 @@ void test_local_adjustments(bool available)
                  p.locallab.spots[0].streng = 60;
                  p.locallab.spots[0].sensisf = 101;
              }},
+            {"CBDL soft radius", [](auto& p) {
+                 p.locallab.spots[0].expcbdl = true;
+                 p.locallab.spots[0].softradiuscb = 5.0;
+             }},
+            {"CBDL residual contrast", [](auto& p) {
+                 p.locallab.spots[0].expcbdl = true;
+                 p.locallab.spots[0].contresid = 20;
+             }},
+            {"CBDL mask", [](auto& p) {
+                 p.locallab.spots[0].expcbdl = true;
+                 p.locallab.spots[0].enacbMask = true;
+             }},
+            {"CBDL multiplier range", [](auto& p) {
+                 p.locallab.spots[0].expcbdl = true;
+                 p.locallab.spots[0].mult[2] = 5.0;
+             }},
+            {"CBDL chroma range", [](auto& p) {
+                 p.locallab.spots[0].expcbdl = true;
+                 p.locallab.spots[0].chromacbdl = 2.0;
+             }},
+            {"CBDL threshold range", [](auto& p) {
+                 p.locallab.spots[0].expcbdl = true;
+                 p.locallab.spots[0].threshold = 1.5;
+             }},
+            {"CBDL clarity range", [](auto& p) {
+                 p.locallab.spots[0].expcbdl = true;
+                 p.locallab.spots[0].clarityml = 0.05;
+             }},
+            {"CBDL sensitivity range", [](auto& p) {
+                 p.locallab.spots[0].expcbdl = true;
+                 p.locallab.spots[0].sensicb = 101;
+             }},
             {"sharpening", [](auto& p) {
                  p.locallab.spots[0].expsharp = true;
              }},
@@ -7907,6 +7939,204 @@ void test_local_adjustments(bool available)
             p.locallab.spots[0].streng = 60;
             p.locallab.spots[0].sensisf = 30;
         }});
+        /* Local CBDL, alone and combined. The spot is 238x96 so the block's
+         * bfw > 65 && bfh > 65 guard runs; the 49- and 64-high rows below are
+         * the block's own no-op and exercise the skip. */
+        const auto cbdl_spot = [&](rtengine::procparams::ProcParams& p,
+                                   double m0, double m1, double m2,
+                                   double m3, double m4, double m5,
+                                   double chroma, double clarity) {
+            auto& spot = p.locallab.spots[0];
+            spot.expcolor = false;
+            spot.expcbdl = true;
+            const double multipliers[6] = {m0, m1, m2, m3, m4, m5};
+            for (int level = 0; level < 6; ++level) {
+                spot.mult[level] = multipliers[level];
+            }
+            spot.chromacbdl = chroma;
+            spot.threshold = 0.2;
+            spot.sensicb = 60;
+            spot.clarityml = clarity;
+            spot.contresid = 0;
+            spot.softradiuscb = 0.0;
+        };
+        complex.push_back({"CBDL only", 238, 96, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            cbdl_spot(p, 1.2, 1.18, 1.15, 1.1, 1.05, 1.02, 0.5, 2.0);
+        }});
+        complex.push_back({"CBDL luma only", 238, 96, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            cbdl_spot(p, 1.15, 1.1, 1.05, 1.0, 1.0, 1.0, 0.0, 1.0);
+        }});
+        complex.push_back({"CBDL chroma only no scope", 238, 96,
+                           [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            cbdl_spot(p, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.1);
+            p.locallab.spots[0].thresh = 100;
+            p.locallab.spots[0].sensicb = 100;
+        }});
+        complex.push_back({"CBDL chroma only", 238, 96, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            cbdl_spot(p, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.1);
+        }});
+        complex.push_back({"CBDL no scope", 238, 96, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            cbdl_spot(p, 1.2, 1.18, 1.15, 1.1, 1.05, 1.02, 0.5, 2.0);
+            p.locallab.spots[0].thresh = 100;
+            p.locallab.spots[0].sensicb = 100;
+        }});
+        complex.push_back({"CBDL RECT", 238, 96, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "RECT", "NONE");
+            cbdl_spot(p, 1.2, 1.1, 1.05, 1.0, 1.0, 1.0, 0.5, 2.0);
+        }});
+        complex.push_back({"CBDL MUNS", 238, 96, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "MUNS");
+            cbdl_spot(p, 1.2, 1.1, 1.05, 1.0, 1.0, 1.0, 0.5, 2.0);
+        }});
+        complex.push_back({"CBDL 179x96", 179, 96, [&](auto& p) {
+            add_spot(p, 0, 0, 700, true, 0, 0, 0, "ELI", "NONE");
+            cbdl_spot(p, 1.2, 1.1, 1.05, 1.0, 1.0, 1.0, 0.5, 2.0);
+        }});
+        complex.push_back({"CBDL 8192x96", 8192, 96, [&](auto& p) {
+            add_spot(p, 0, 0, 8000, true, 0, 0, 0, "ELI", "NONE");
+            cbdl_spot(p, 1.2, 1.1, 1.05, 1.0, 1.0, 1.0, 0.5, 2.0);
+        }});
+        complex.push_back({"CBDL 179x49", 179, 49, [&](auto& p) {
+            add_spot(p, 0, 0, 700, true, 0, 0, 0, "ELI", "NONE");
+            cbdl_spot(p, 1.2, 1.1, 1.05, 1.0, 1.0, 1.0, 0.5, 2.0);
+        }});
+        complex.push_back({"CBDL 238x64", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            cbdl_spot(p, 1.2, 1.1, 1.05, 1.0, 1.0, 1.0, 0.5, 2.0);
+        }});
+        complex.push_back({"CBDL 8192x64", 8192, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 8000, true, 0, 0, 0, "ELI", "NONE");
+            cbdl_spot(p, 1.2, 1.1, 1.05, 1.0, 1.0, 1.0, 0.5, 2.0);
+        }});
+        complex.push_back({"colour and CBDL", 238, 96, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 35, 10, -5, "ELI", "NONE");
+            cbdl_spot(p, 1.15, 1.1, 1.05, 1.0, 1.0, 1.0, 0.4, 1.0);
+            p.locallab.spots[0].expcolor = true;
+        }});
+        complex.push_back({"vibrance and CBDL", 238, 96, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            cbdl_spot(p, 1.15, 1.1, 1.05, 1.0, 1.0, 1.0, 0.4, 1.0);
+            p.locallab.spots[0].expvibrance = true;
+            p.locallab.spots[0].pastels = 40;
+            p.locallab.spots[0].saturated = 20;
+            p.locallab.spots[0].psthreshold.setValues(0, 75);
+            p.locallab.spots[0].sensiv = 30;
+        }});
+        complex.push_back({"CBDL and shadows/highlights", 238, 96,
+                           [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            cbdl_spot(p, 1.15, 1.1, 1.05, 1.0, 1.0, 1.0, 0.4, 1.0);
+            p.locallab.spots[0].expshadhigh = true;
+            p.locallab.spots[0].shMethod = "std";
+            p.locallab.spots[0].highlights = 50;
+            p.locallab.spots[0].shadows = 50;
+            p.locallab.spots[0].h_tonalwidth = 70;
+            p.locallab.spots[0].s_tonalwidth = 30;
+            p.locallab.spots[0].sh_radius = 40;
+            p.locallab.spots[0].sensihs = 30;
+            p.locallab.spots[0].blurSHde = 5;
+        }});
+        complex.push_back({"CBDL and soft light", 238, 96, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            cbdl_spot(p, 1.15, 1.1, 1.05, 1.0, 1.0, 1.0, 0.4, 1.0);
+            p.locallab.spots[0].expsoft = true;
+            p.locallab.spots[0].softMethod = "soft";
+            p.locallab.spots[0].streng = 60;
+            p.locallab.spots[0].sensisf = 30;
+        }});
+        complex.push_back({"CBDL and local contrast", 238, 96,
+                           [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            cbdl_spot(p, 1.15, 1.1, 1.05, 1.0, 1.0, 1.0, 0.4, 1.0);
+            p.locallab.spots[0].expcontrast = true;
+            p.locallab.spots[0].localcontMethod = "loc";
+            p.locallab.spots[0].lcradius = 40;
+            p.locallab.spots[0].lcamount = 0.4;
+            p.locallab.spots[0].lcdarkness = 0.9;
+            p.locallab.spots[0].lclightness = 1.1;
+            p.locallab.spots[0].reparw = 100.0;
+            p.locallab.spots[0].sensilc = 60;
+        }});
+        complex.push_back({"all six tools", 238, 96, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 35, 10, -5, "ELI", "NONE");
+            auto& spot = p.locallab.spots[0];
+            spot.expcbdl = true;
+            spot.mult[0] = 1.15;
+            spot.mult[1] = 1.1;
+            spot.mult[2] = 1.05;
+            spot.mult[3] = 1.0;
+            spot.mult[4] = 1.0;
+            spot.mult[5] = 1.0;
+            spot.chromacbdl = 0.4;
+            spot.threshold = 0.2;
+            spot.sensicb = 60;
+            spot.clarityml = 1.0;
+            spot.expvibrance = true;
+            spot.pastels = 40;
+            spot.saturated = 20;
+            spot.psthreshold.setValues(0, 75);
+            spot.sensiv = 30;
+            spot.expcontrast = true;
+            spot.localcontMethod = "loc";
+            spot.lcradius = 40;
+            spot.lcamount = 0.4;
+            spot.lcdarkness = 0.9;
+            spot.lclightness = 1.1;
+            spot.reparw = 100.0;
+            spot.sensilc = 60;
+            spot.expshadhigh = true;
+            spot.shMethod = "std";
+            spot.highlights = 50;
+            spot.shadows = 50;
+            spot.h_tonalwidth = 70;
+            spot.s_tonalwidth = 30;
+            spot.sh_radius = 40;
+            spot.sensihs = 30;
+            spot.blurSHde = 5;
+            spot.expsoft = true;
+            spot.softMethod = "soft";
+            spot.streng = 60;
+            spot.sensisf = 30;
+        }});
+        complex.push_back({"CBDL second spot", 238, 96, [&](auto& p) {
+            add_spot(p, -300, -150, 700, true, 30, 8, 0, "ELI", "NONE");
+            add_spot(p, 300, 150, 700, true, 0, 0, 0, "ELI", "NONE");
+            auto& spot = p.locallab.spots[1];
+            spot.expcolor = false;
+            spot.expcbdl = true;
+            spot.mult[0] = 1.2;
+            spot.mult[1] = 1.1;
+            spot.mult[2] = 1.05;
+            spot.mult[3] = 1.0;
+            spot.mult[4] = 1.0;
+            spot.mult[5] = 1.0;
+            spot.chromacbdl = 0.5;
+            spot.threshold = 0.2;
+            spot.sensicb = 60;
+            spot.clarityml = 2.0;
+        }});
+        complex.push_back({"inactive then CBDL", 238, 96, [&](auto& p) {
+            add_spot(p, 0, 0, 700, false, 0, 0, 0, "ELI", "NONE");
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            auto& spot = p.locallab.spots[1];
+            spot.expcolor = false;
+            spot.expcbdl = true;
+            spot.mult[0] = 1.2;
+            spot.mult[1] = 1.1;
+            spot.mult[2] = 1.05;
+            spot.mult[3] = 1.0;
+            spot.mult[4] = 1.0;
+            spot.mult[5] = 1.0;
+            spot.chromacbdl = 0.5;
+            spot.threshold = 0.2;
+            spot.sensicb = 60;
+            spot.clarityml = 2.0;
+        }});
         complex.push_back({"all five tools", 238, 64, [&](auto& p) {
             add_spot(p, 0, 0, 800, true, 35, 10, -5, "ELI", "NONE");
             auto& spot = p.locallab.spots[0];
@@ -8256,6 +8486,30 @@ void test_local_adjustments(bool available)
                 check(changed.differing > 0,
                       "the soft-light tool changes the image");
             }
+            if (c.label == "CBDL only") {
+                /* The same spot with CBDL off: the tool must change the
+                 * image, otherwise the parity above is vacuous. */
+                rtengine::procparams::ProcParams plain_params =
+                    reference_params;
+                plain_params.locallab.spots[0].expcbdl = false;
+                Imagefloat plain_base(c.width, c.height);
+                fill_local_adjustments_rgb(plain_base, 211u);
+                std::unique_ptr<LabImage> plain_lab(
+                    new LabImage(c.width, c.height));
+                rtengine::ImProcFunctions plain_ipf(&plain_params, false);
+                localAdjustmentsHostBlock(plain_ipf, plain_params,
+                                          &plain_base, plain_lab.get(),
+                                          c.width, c.height);
+                const Diff changed =
+                    compare(view(*plain_lab), view(*reference_lab));
+                std::printf("stage-residency: local.adjustments CBDL "
+                            "non-vacuity: %zu of %zu samples differ, "
+                            "PAE %.6f LSB16\n",
+                            changed.differing, changed.samples,
+                            changed.max_abs);
+                check(changed.differing > 0,
+                      "the CBDL tool changes the image");
+            }
             if (c.label == "three ELI") {
                 forward_three.reset(new LabImage(*reference_lab, true));
             }
@@ -8548,6 +8802,38 @@ void test_local_adjustments(bool available)
                  p.locallab.spots[0].expsoft = true;
                  p.locallab.spots[0].streng = 60;
                  p.locallab.spots[0].sensisf = 101;
+             }},
+            {"CBDL soft radius", [](auto& p) {
+                 p.locallab.spots[0].expcbdl = true;
+                 p.locallab.spots[0].softradiuscb = 5.0;
+             }},
+            {"CBDL residual contrast", [](auto& p) {
+                 p.locallab.spots[0].expcbdl = true;
+                 p.locallab.spots[0].contresid = 20;
+             }},
+            {"CBDL mask", [](auto& p) {
+                 p.locallab.spots[0].expcbdl = true;
+                 p.locallab.spots[0].enacbMask = true;
+             }},
+            {"CBDL multiplier range", [](auto& p) {
+                 p.locallab.spots[0].expcbdl = true;
+                 p.locallab.spots[0].mult[2] = 5.0;
+             }},
+            {"CBDL chroma range", [](auto& p) {
+                 p.locallab.spots[0].expcbdl = true;
+                 p.locallab.spots[0].chromacbdl = 2.0;
+             }},
+            {"CBDL threshold range", [](auto& p) {
+                 p.locallab.spots[0].expcbdl = true;
+                 p.locallab.spots[0].threshold = 1.5;
+             }},
+            {"CBDL clarity range", [](auto& p) {
+                 p.locallab.spots[0].expcbdl = true;
+                 p.locallab.spots[0].clarityml = 0.05;
+             }},
+            {"CBDL sensitivity range", [](auto& p) {
+                 p.locallab.spots[0].expcbdl = true;
+                 p.locallab.spots[0].sensicb = 101;
              }},
             {"reparcol 50", [](auto& p) {
                  p.locallab.spots[0].reparcol = 50.0;
