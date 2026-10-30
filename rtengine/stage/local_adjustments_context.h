@@ -272,8 +272,10 @@ LocalAdjustmentsDispatch localAdjustmentsDispatch(
 
 /* The clamp arm Lab_Local() takes after the spots. The tone curve mode makes
  * notzero true in every exported profile, so a supported block always has an
- * arm; notlaplacian depends on the exposure, soft-light and CBDL state. */
-uint32_t localAdjustmentsClampMode(const procparams::ProcParams& params);
+ * arm; notlaplacian depends on the exposure, soft-light, CBDL and GHS
+ * leftover state. */
+uint32_t localAdjustmentsClampMode(const procparams::ProcParams& params,
+                                   int spot);
 
 /*
  * The block as it ran before the device node, moved here unchanged so the call

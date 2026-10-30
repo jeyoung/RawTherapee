@@ -223,6 +223,13 @@ bool localAdjustmentsSupported(const procparams::ProcParams& params)
         if (spot.expprecam) {
             return false;
         }
+        /* Lab_Local()'s notlaplacian arm also fires when ghsactiv
+         * (ghs_D != 0) and ghs_BLP > 0, even on an inactive spot whose GHS
+         * tool does not run. That arm uses clipR(); the device has no such
+         * arm, so these leftovers are residual. */
+        if (spot.ghs_D != 0.0 && spot.ghs_BLP > 0.0) {
+            return false;
+        }
         if (!isNoMerge(spot.merMethod)) {
             return false;
         }
@@ -307,17 +314,25 @@ LocalAdjustmentsDispatch localAdjustmentsDispatch(
     return out;
 }
 
-uint32_t localAdjustmentsClampMode(const procparams::ProcParams& params)
+uint32_t localAdjustmentsClampMode(const procparams::ProcParams& params,
+                                   int spot)
 {
     /*
      * Lab_Local()'s tail round trip runs when notlaplacian or notzero is set.
      * The tone curve mode is one of the six enumerated modes in every
-     * profile, so notzero is always true; the remaining Laplacian condition
-     * needs an exposure or soft-light tool, both residuals, or the CBDL pass,
-     * which the predicate refuses. The mode is nevertheless derived rather
-     * than assumed so a future wider predicate keeps the right arm.
+     * profile, so notzero is always true. The Laplacian arm also needs
+     * ghsactiv (ghs_D != 0) with ghs_BLP > 0; the predicate refuses that
+     * combination, but the mode is derived so a future wider predicate keeps
+     * the right arm. Exposure and soft light are residuals.
      */
-    const bool notLaplacian = params.dirpyrequalizer.enabled;
+    bool notLaplacian = params.dirpyrequalizer.enabled;
+    if (spot >= 0 &&
+        spot < static_cast<int>(params.locallab.spots.size())) {
+        const auto& profileSpot = params.locallab.spots[spot];
+        if (profileSpot.ghs_D != 0.0 && profileSpot.ghs_BLP > 0.0) {
+            notLaplacian = true;
+        }
+    }
     return notLaplacian ? RT_LOCAL_ADJUSTMENTS_CLAMP_LAPLACIAN
                         : RT_LOCAL_ADJUSTMENTS_CLAMP_NOTZERO;
 }
@@ -889,7 +904,6 @@ int LocalAdjustmentsContext::build(int spot, const RtStageBuffer* lab,
                     (*lut)[static_cast<int>(index)];
             }
         }
-        clamp_mode_ = localAdjustmentsClampMode(params_);
         globals_built_ = true;
     }
 
@@ -920,6 +934,7 @@ int LocalAdjustmentsContext::build(int spot, const RtStageBuffer* lab,
 
     spots_.assign(RT_LOCAL_ADJUSTMENTS_SPOT_STRIDE, 0.f);
     luts_.clear();
+    clamp_mode_ = localAdjustmentsClampMode(params_, spot);
 
     const auto appendTable = [this](const LUTf& table) -> float {
         const unsigned int entries = table.getSize();
