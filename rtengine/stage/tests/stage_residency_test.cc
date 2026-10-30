@@ -7461,6 +7461,70 @@ void test_local_adjustments(bool available)
             {"dehaze", [](auto& p) {
                  p.dehaze.enabled = true;
              }},
+            {"dehaze show depth", [](auto& p) {
+                 p.dehaze.showDepthMap = true;
+             }},
+            {"local dehaze black", [](auto& p) {
+                 auto& spot = p.locallab.spots[0];
+                 spot.expcolor = false;
+                 spot.expreti = true;
+                 spot.dehaz = 50;
+                 spot.dehazeblack = 10.0;
+             }},
+            {"local dehaze mask", [](auto& p) {
+                 auto& spot = p.locallab.spots[0];
+                 spot.expcolor = false;
+                 spot.expreti = true;
+                 spot.dehaz = 50;
+                 spot.enaColorMask = true;
+             }},
+            {"local dehaze soft radius", [](auto& p) {
+                 auto& spot = p.locallab.spots[0];
+                 spot.expcolor = false;
+                 spot.expreti = true;
+                 spot.dehaz = 50;
+                 spot.softradiuscol = 1.0;
+             }},
+            {"local dehaze active retinex", [](auto& p) {
+                 auto& spot = p.locallab.spots[0];
+                 spot.expcolor = false;
+                 spot.expreti = true;
+                 spot.dehaz = 50;
+                 spot.str = 10.0;
+             }},
+            {"local dehaze strength range", [](auto& p) {
+                 auto& spot = p.locallab.spots[0];
+                 spot.expcolor = false;
+                 spot.expreti = true;
+                 spot.dehaz = 101;
+             }},
+            {"local dehaze depth range", [](auto& p) {
+                 auto& spot = p.locallab.spots[0];
+                 spot.expcolor = false;
+                 spot.expreti = true;
+                 spot.dehaz = 50;
+                 spot.depth = 101;
+             }},
+            {"local dehaze saturation range", [](auto& p) {
+                 auto& spot = p.locallab.spots[0];
+                 spot.expcolor = false;
+                 spot.expreti = true;
+                 spot.dehaz = 50;
+                 spot.dehazeSaturation = 101.0;
+             }},
+            {"local dehaze sensitivity range", [](auto& p) {
+                 auto& spot = p.locallab.spots[0];
+                 spot.expcolor = false;
+                 spot.expreti = true;
+                 spot.dehaz = 50;
+                 spot.sensih = 101;
+             }},
+            {"local dehaze without retinex enable", [](auto& p) {
+                 auto& spot = p.locallab.spots[0];
+                 spot.expcolor = false;
+                 spot.expreti = false;
+                 spot.dehaz = 50;
+             }},
             {"highlight reconstruction", [](auto& p) {
                  p.toneCurve.hrenabled = true;
              }},
@@ -8037,6 +8101,156 @@ void test_local_adjustments(bool available)
             add_spot(p, 0, 0, 8000, true, 0, 0, 0, "ELI", "NONE");
             cbdl_spot(p, 1.2, 1.1, 1.05, 1.0, 1.0, 1.0, 0.5, 2.0);
         }});
+        /* Local dehaze. The retinex enable is the block's gate; the retinex
+         * tool itself is a no-op (strength zero). The dehaze pass runs before
+         * CBDL, so every combination below also pins the CPU order. */
+        const auto dehaze_spot = [&](rtengine::procparams::ProcParams& p,
+                                     int strength, int depth, int saturation,
+                                     int sensitivity) {
+            auto& spot = p.locallab.spots[0];
+            spot.expreti = true;
+            spot.str = 0.0;
+            spot.dehaz = strength;
+            spot.depth = depth;
+            spot.dehazeSaturation = saturation;
+            spot.dehazeblack = 0.0;
+            spot.sensih = sensitivity;
+        };
+        complex.push_back({"dehaze only", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            p.locallab.spots[0].expcolor = false;
+            dehaze_spot(p, 50, 25, 50, 60);
+        }});
+        complex.push_back({"dehaze negative", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            p.locallab.spots[0].expcolor = false;
+            dehaze_spot(p, -40, 60, 20, 30);
+        }});
+        complex.push_back({"dehaze and colour", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 35, 10, -5, "ELI", "NONE");
+            dehaze_spot(p, 50, 25, 50, 60);
+        }});
+        complex.push_back({"dehaze and CBDL", 238, 96, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            cbdl_spot(p, 1.15, 1.1, 1.05, 1.0, 1.0, 1.0, 0.4, 1.0);
+            dehaze_spot(p, 50, 25, 50, 60);
+        }});
+        complex.push_back({"dehaze and vibrance", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            vibrance_spot(p, 40, 20);
+            dehaze_spot(p, 50, 25, 50, 60);
+        }});
+        complex.push_back({"dehaze and shadows/highlights", 238, 64,
+                           [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            sh_spot(p, 50, 50);
+            dehaze_spot(p, 50, 25, 50, 60);
+        }});
+        complex.push_back({"dehaze and soft light", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            soft_spot(p, 60);
+            dehaze_spot(p, 50, 25, 50, 60);
+        }});
+        complex.push_back({"dehaze and local contrast", 238, 64,
+                           [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            contrast_spot(p, 40, 0.4);
+            dehaze_spot(p, 50, 25, 50, 60);
+        }});
+        complex.push_back({"dehaze all tools", 238, 96, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 35, 10, -5, "ELI", "NONE");
+            auto& spot = p.locallab.spots[0];
+            spot.expcbdl = true;
+            spot.mult[0] = 1.15;
+            spot.mult[1] = 1.1;
+            spot.mult[2] = 1.05;
+            spot.mult[3] = 1.0;
+            spot.mult[4] = 1.0;
+            spot.mult[5] = 1.0;
+            spot.chromacbdl = 0.4;
+            spot.threshold = 0.2;
+            spot.sensicb = 60;
+            spot.clarityml = 1.0;
+            spot.expvibrance = true;
+            spot.pastels = 40;
+            spot.saturated = 20;
+            spot.psthreshold.setValues(0, 75);
+            spot.sensiv = 30;
+            spot.expcontrast = true;
+            spot.localcontMethod = "loc";
+            spot.lcradius = 40;
+            spot.lcamount = 0.4;
+            spot.lcdarkness = 0.9;
+            spot.lclightness = 1.1;
+            spot.reparw = 100.0;
+            spot.sensilc = 60;
+            spot.expshadhigh = true;
+            spot.shMethod = "std";
+            spot.highlights = 50;
+            spot.shadows = 50;
+            spot.h_tonalwidth = 70;
+            spot.s_tonalwidth = 30;
+            spot.sh_radius = 40;
+            spot.sensihs = 30;
+            spot.blurSHde = 5;
+            spot.expsoft = true;
+            spot.softMethod = "soft";
+            spot.streng = 60;
+            spot.sensisf = 30;
+            dehaze_spot(p, 50, 25, 50, 60);
+        }});
+        complex.push_back({"dehaze MUNS", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "MUNS");
+            p.locallab.spots[0].expcolor = false;
+            dehaze_spot(p, 50, 25, 50, 60);
+        }});
+        complex.push_back({"dehaze RECT", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "RECT", "NONE");
+            p.locallab.spots[0].expcolor = false;
+            dehaze_spot(p, 50, 25, 50, 60);
+        }});
+        complex.push_back({"dehaze 179x49", 179, 49, [&](auto& p) {
+            add_spot(p, 0, 0, 700, true, 0, 0, 0, "ELI", "NONE");
+            p.locallab.spots[0].expcolor = false;
+            dehaze_spot(p, 50, 25, 50, 60);
+        }});
+        complex.push_back({"dehaze 238x64", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            p.locallab.spots[0].expcolor = false;
+            dehaze_spot(p, 50, 25, 50, 60);
+        }});
+        complex.push_back({"dehaze 8192x64", 8192, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 8000, true, 0, 0, 0, "ELI", "NONE");
+            p.locallab.spots[0].expcolor = false;
+            dehaze_spot(p, 50, 25, 50, 60);
+        }});
+        complex.push_back({"dehaze second spot", 238, 64, [&](auto& p) {
+            add_spot(p, -300, -150, 700, true, 30, 8, 0, "ELI", "NONE");
+            add_spot(p, 300, 150, 700, true, 0, 0, 0, "ELI", "NONE");
+            auto& spot = p.locallab.spots[1];
+            spot.expcolor = false;
+            spot.expreti = true;
+            spot.str = 0.0;
+            spot.dehaz = 50;
+            spot.depth = 25;
+            spot.dehazeSaturation = 50;
+            spot.dehazeblack = 0.0;
+            spot.sensih = 60;
+        }});
+        complex.push_back({"dehaze inactive then active", 238, 64,
+                           [&](auto& p) {
+            add_spot(p, 0, 0, 700, false, 0, 0, 0, "ELI", "NONE");
+            add_spot(p, 100, 100, 600, true, 0, 0, 0, "ELI", "NONE");
+            auto& spot = p.locallab.spots[1];
+            spot.expcolor = false;
+            spot.expreti = true;
+            spot.str = 0.0;
+            spot.dehaz = 50;
+            spot.depth = 25;
+            spot.dehazeSaturation = 50;
+            spot.dehazeblack = 0.0;
+            spot.sensih = 60;
+        }});
         complex.push_back({"colour and CBDL", 238, 96, [&](auto& p) {
             add_spot(p, 0, 0, 800, true, 35, 10, -5, "ELI", "NONE");
             cbdl_spot(p, 1.15, 1.1, 1.05, 1.0, 1.0, 1.0, 0.4, 1.0);
@@ -8534,6 +8748,32 @@ void test_local_adjustments(bool available)
                 check(changed.differing > 0,
                       "the CBDL tool changes the image");
             }
+            if (c.label == "dehaze only") {
+                /* The same spot with the retinex enable and dehaze off: the
+                 * dehaze tool must change the image, otherwise the parity
+                 * above is vacuous. */
+                rtengine::procparams::ProcParams plain_params =
+                    reference_params;
+                plain_params.locallab.spots[0].expreti = false;
+                plain_params.locallab.spots[0].dehaz = 0;
+                Imagefloat plain_base(c.width, c.height);
+                fill_local_adjustments_rgb(plain_base, 211u);
+                std::unique_ptr<LabImage> plain_lab(
+                    new LabImage(c.width, c.height));
+                rtengine::ImProcFunctions plain_ipf(&plain_params, false);
+                localAdjustmentsHostBlock(plain_ipf, plain_params,
+                                          &plain_base, plain_lab.get(),
+                                          c.width, c.height);
+                const Diff changed =
+                    compare(view(*plain_lab), view(*reference_lab));
+                std::printf("stage-residency: local.adjustments dehaze "
+                            "non-vacuity: %zu of %zu samples differ, "
+                            "PAE %.6f LSB16\n",
+                            changed.differing, changed.samples,
+                            changed.max_abs);
+                check(changed.differing > 0,
+                      "the dehaze tool changes the image");
+            }
             if (c.label == "three ELI") {
                 forward_three.reset(new LabImage(*reference_lab, true));
             }
@@ -8998,6 +9238,74 @@ void test_local_adjustments(bool available)
                  p.locallab.spots[0].activ = false;
                  p.locallab.spots[0].ghs_D = 1.0;
                  p.locallab.spots[0].ghs_BLP = 1.0;
+             }},
+            {"dehaze black", [](auto& p) {
+                 auto& spot = p.locallab.spots[0];
+                 spot.expcolor = false;
+                 spot.expreti = true;
+                 spot.dehaz = 50;
+                 spot.dehazeblack = 10.0;
+             }},
+            {"dehaze show depth", [](auto& p) {
+                 auto& spot = p.locallab.spots[0];
+                 spot.expcolor = false;
+                 spot.expreti = true;
+                 spot.dehaz = 50;
+                 p.dehaze.showDepthMap = true;
+             }},
+            {"dehaze explicit mask", [](auto& p) {
+                 auto& spot = p.locallab.spots[0];
+                 spot.expcolor = false;
+                 spot.expreti = true;
+                 spot.dehaz = 50;
+                 spot.enaColorMask = true;
+             }},
+            {"dehaze soft radius", [](auto& p) {
+                 auto& spot = p.locallab.spots[0];
+                 spot.expcolor = false;
+                 spot.expreti = true;
+                 spot.dehaz = 50;
+                 spot.softradiuscol = 1.0;
+             }},
+            {"dehaze active retinex", [](auto& p) {
+                 auto& spot = p.locallab.spots[0];
+                 spot.expcolor = false;
+                 spot.expreti = true;
+                 spot.dehaz = 50;
+                 spot.str = 10.0;
+             }},
+            {"dehaze strength range", [](auto& p) {
+                 auto& spot = p.locallab.spots[0];
+                 spot.expcolor = false;
+                 spot.expreti = true;
+                 spot.dehaz = 101;
+             }},
+            {"dehaze depth range", [](auto& p) {
+                 auto& spot = p.locallab.spots[0];
+                 spot.expcolor = false;
+                 spot.expreti = true;
+                 spot.dehaz = 50;
+                 spot.depth = 101;
+             }},
+            {"dehaze saturation range", [](auto& p) {
+                 auto& spot = p.locallab.spots[0];
+                 spot.expcolor = false;
+                 spot.expreti = true;
+                 spot.dehaz = 50;
+                 spot.dehazeSaturation = 101.0;
+             }},
+            {"dehaze sensitivity range", [](auto& p) {
+                 auto& spot = p.locallab.spots[0];
+                 spot.expcolor = false;
+                 spot.expreti = true;
+                 spot.dehaz = 50;
+                 spot.sensih = 101;
+             }},
+            {"dehaze without retinex enable", [](auto& p) {
+                 auto& spot = p.locallab.spots[0];
+                 spot.expcolor = false;
+                 spot.expreti = false;
+                 spot.dehaz = 50;
              }},
         };
         for (std::size_t index = 0;

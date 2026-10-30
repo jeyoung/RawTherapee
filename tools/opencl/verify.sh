@@ -292,6 +292,9 @@ quick() {
     run_stage_device "pef/stage-device-local-adjustments-cbdl" \
         "$ROOT/devnotes/opencl/pp3/localadjustments-cbdl.pp3" \
         local.adjustments cpu
+    run_stage_device "pef/stage-device-local-adjustments-dehaze" \
+        "$ROOT/devnotes/opencl/pp3/localadjustments-dehaze.pp3" \
+        local.adjustments cpu
 }
 
 stage() {
@@ -632,6 +635,9 @@ stage_device() {
         local.adjustments cpu
     run_stage_device "pef/stage-device-local-adjustments-cbdl" \
         "$ROOT/devnotes/opencl/pp3/localadjustments-cbdl.pp3" \
+        local.adjustments cpu
+    run_stage_device "pef/stage-device-local-adjustments-dehaze" \
+        "$ROOT/devnotes/opencl/pp3/localadjustments-dehaze.pp3" \
         local.adjustments cpu
 }
 
