@@ -1,3 +1,9 @@
+## Issue
+
+- Claimed issue: #<number>
+- [ ] The issue is assigned to the pull-request author for the duration of
+      the work, and will be unassigned if the work is dropped
+
 ## Scope
 
 Block or tool:

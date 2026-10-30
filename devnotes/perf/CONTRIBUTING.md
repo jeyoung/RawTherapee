@@ -1,7 +1,22 @@
 # Contributing to the `perf-graph` workstream
 
 This branch is a self-contained workstream. Changes arrive as pull requests
-against `perf-graph`, not as direct pushes.
+against `perf-graph`, not as direct pushes. The branch is protected: force
+pushes and direct pushes by collaborators are blocked, linear history is
+required, and one approving review is required.
+
+## Claiming and dropping work
+
+- **Before starting**, comment `claiming #<issue>` and assign the issue to
+  yourself. One owner per issue. Do not start work on an issue assigned to
+  someone else without an explicit handoff.
+- **The pull request must reference the issue** with `Closes #<issue>`.
+- **If you drop the issue**, comment why, unassign yourself, and leave the
+  current state and evidence on the issue. No stale assignments.
+- **On completion**, the merged pull request closes the issue; the assignment
+  ends with it.
+- A handoff is explicit: unassign yourself, assign the new owner, and state
+  what remains.
 
 ## Before opening a pull request
 
