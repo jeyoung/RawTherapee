@@ -35,6 +35,52 @@ Every device-path pull request must carry:
 Do not relax a tolerance to make a pull request pass. If a path cannot hold
 1 LSB16, keep it as a named host residual and record the measured divergence.
 
+## Continuous integration
+
+The `perf-graph build and host stage tests` workflow runs on pull requests
+targeting `perf-graph` and on pushes to that branch. Two Ubuntu 24.04 jobs use
+GCC, the generic target and `tools/build-rt.sh` with `-j 2`, ccache and stage
+modules. One job disables OpenCL and the other enables it. Both compile the
+applications and run the same bounded host test set:
+
+```text
+stage-cache-test              stage-node-cache-test
+stage-graph-test              stage-indexer-test
+stage-param-hash-test         stage-render-state-test
+stage-param-map-test          stage-dirty-blocks-test
+stage-work-test               stage-parity-test
+stage-pipeline-test           stage-store-test
+editorrequest-test            viewport-admission-test
+denoise-tile-buffers-test
+```
+
+These targets are excluded from the default CMake build, so CI builds them
+explicitly and runs their executables; they are not registered with CTest.
+`stage-parity-test` compares the built-in and module host implementations of
+Lanczos. It does not establish OpenCL device parity. The OpenCL-enabled job
+checks compilation and host behavior without an OpenCL device or POCL.
+
+Every selected test must exit successfully within 120 seconds and report no
+`SKIP` or `skipped` record. A skip fails this host gate, even if the executable
+returns zero. The job summary reports each test result. On failure, build,
+dependency and test logs are retained for seven days; image data, build trees
+and configuration or environment dumps are not uploaded. Each job has a
+60-minute limit and a separate compiler cache capped at 2 GiB. New commits
+cancel older runs of the same pull request or branch.
+
+This is a bounded host gate, not the full stage suite. `stage-abi-test` is
+currently uncovered because its upstream CMake target lacks the project
+support sources needed to link it. CI does not patch that target or count it
+as passing. `stage-device-test` and `stage-residency-test` are outside this
+gate; their device-dependent coverage must be recorded separately.
+
+Device parity, POCL verification, GUI checks, packaging and performance
+measurements remain local gates. A green workflow does not replace the
+device-path evidence above, the relevant full unit-test run, or the gates in
+`AGENTS.md` and the matching `devnotes/` record. Record unavailable checks as
+not run; `SKIP` is not `PASS`. CI needs no repository secrets and uses only
+read access to repository contents.
+
 ## Publication gate
 
 Before a pull request is merged, the range is scanned for:
