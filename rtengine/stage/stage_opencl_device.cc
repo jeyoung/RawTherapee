@@ -7961,11 +7961,11 @@ RtStageStatus run_sharpen(const std::shared_ptr<OpenCLEnv>& env,
  * built from the spot's lcradius.
  *
  * Pass order matches Lab_Local(): the optional negative-value prefilter, then,
- * per active spot, vibrance, local contrast and Colour & Light, each with its
- * own ROI copy and deltaE reference blur. The full-image tail clamp and the
- * Munsell pass follow. Every pass writes the device image; the host Lab is
- * read back only after all passes succeeded, so a refusal or a failed launch
- * leaves it untouched for the builtin.
+ * per active spot, vibrance, shadows/highlights, local contrast and Colour &
+ * Light, each with its own ROI copy and deltaE reference blur. The full-image
+ * tail clamp and the Munsell pass follow. Every pass writes the device image;
+ * the host Lab is read back only after all passes succeeded, so a refusal or
+ * a failed launch leaves it untouched for the builtin.
  */
 RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
                                     const std::shared_ptr<OpenCLResidency>& residency,
