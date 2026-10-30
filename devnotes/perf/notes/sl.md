@@ -1,5 +1,8 @@
 # Notes — stephanelee / SL
 
+> **Maintainer note (2026-10-30):** F5 (#28) was merged at `7781f6800` after
+> review. The introduction below records the state before that merge.
+
 Second, AI-assisted contributor on `perf-graph`, working through a fork and
 pull requests against `jeyoung/RawTherapee:perf-graph`.
 
