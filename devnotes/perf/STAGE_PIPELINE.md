@@ -1738,10 +1738,11 @@ Shadows/highlights admits only the Lab-mode `"std"` method
 `0..100`, both tonal widths in `10..100`, `sh_radius` in `0..100`, `sensihs`
 in `0..100`, `blurSHde` in `2..100`, `reparsh == 100` and `strSH == 0`, with
 the six `multsh` tone-eq multipliers zero and `gamSH`/`sloSH` at their
-`2.4`/`12.92` defaults. The block calls `shadowsHighlights()` twice, highlight
-first and then shadow, each with a host-built `shadowsHighlightsLut()` tone
-table and `guidedFilter()` at an explicit subsampling of four and epsilon
-`0.075`. The device reuses the lab.tools mask, box-blur, combine, upsample
+`2.4`/`12.92` defaults. The block calls `shadowsHighlights()` once
+(`iplocallab.cc:18502`); the call applies the highlight round first and then
+the shadow round internally (`ipshadowshighlights.cc:226-232`), each with a
+host-built `shadowsHighlightsLut()` tone table and `guidedFilter()` at an
+explicit subsampling of four and epsilon `0.075`. The device reuses the lab.tools mask, box-blur, combine, upsample
 and apply kernels and the block's own `shadowsHighlightsRadius()`,
 `shadowsHighlightsThreshold()` and `shadowsHighlightsScale()` helpers. The
 local call site always passes `labmode = 1`, so only the Lab mode exists here;
@@ -1766,8 +1767,9 @@ shadow-only, both rounds, colour, vibrance and local contrast combinations,
 all four tools, MUNS, a second spot, a padded 179x49 and an 8192x64 ROI; no
 sample is non-finite. It is non-vacuous: the tool changes 17,023 of 45,696
 fixture samples with PAE 362.355469 LSB16 against the same spot with the tool
-off. The gate `localadjustments-sh.pp3` row is 1 LSB16 and changes every pixel
-of the sample against the neutral export (PAE 7,138 codes, AE 4,222,180).
+off. The gate `localadjustments-sh.pp3` row is 1 LSB16 and differs from the
+neutral export by PAE 28 codes on 3,073,092 of 10,139,904 pixels (8,144,216 of
+30,419,712 channel samples).
 Everything else is a residual: exposure (FFT PDE), the shadows/highlights
 `"tone"`/`"ghs"`/`"micha"` methods, tone-eq multipliers, a non-default tone
 gamma/slope, the SH recovery blend and gradient, vibrance

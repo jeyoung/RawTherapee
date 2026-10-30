@@ -2892,7 +2892,7 @@ before the upload.
 | `localadjustments-multispot.pp3` | PASS, `max_pae=1.5259e-05` (1 LSB16), `impl=opencl` |
 | `localadjustments-residual.pp3` (exposure) | host, informational 1 LSB16 |
 | `localadjustments-munsell.pp3` (CPU-device row) | PASS, `max_pae=1.5259e-05` (1 LSB16), `impl=opencl`; the device MUNS pass is 1 LSB16 on 389,860 of 30,419,712 samples, and the same profile with `NONE` is 1 LSB16 on 389,597 |
-| `localadjustments-sh.pp3` (CPU-device row) | PASS, `max_pae=1.5259e-05` (1 LSB16), `impl=opencl`. Non-vacuous: against the neutral export the profile changes every pixel (AE 4,222,180 of 10,137,504, PAE 7,138 codes) |
+| `localadjustments-sh.pp3` (CPU-device row) | PASS, `max_pae=1.5259e-05` (1 LSB16), `impl=opencl`. Non-vacuous: against the neutral export the profile differs by PAE 28 codes on 3,073,092 of 10,139,904 pixels (8,144,216 of 30,419,712 channel samples) |
 | Full `verify.sh --stage-device` | PASS, 28 PASS and 0 SKIP on the POCL CPU device; the MUNS and SH rows are CPU-device rows, consistent with the launcher's CPU-only requirement. `working.trc` stays 1 LSB16 |
 | Default path | with `RT_STAGE_OPENCL` unset the host block runs directly; CPU-only `stage-residency-test: PASS (25 skipped)` |
 | Builds | `build/cpu-perf-graph` and `build/opencl-perf-graph` compile |
