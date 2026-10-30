@@ -5165,6 +5165,8 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
                     cl_int src_stride, cl_int dst_stride,
                     cl_int vector_lines) {
                     cl_uint arg = 0;
+                    cl_int src_base = 0;
+                    cl_int dst_base = 0;
                     bool ok = true;
                     ok = ok && set_arg(lc_line_kernel, arg++, sizeof(cl_mem),
                                        &source);
@@ -5184,6 +5186,10 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
                                        &src_stride);
                     ok = ok && set_arg(lc_line_kernel, arg++, sizeof(cl_int),
                                        &dst_stride);
+                    ok = ok && set_arg(lc_line_kernel, arg++, sizeof(cl_int),
+                                       &src_base);
+                    ok = ok && set_arg(lc_line_kernel, arg++, sizeof(cl_int),
+                                       &dst_base);
                     ok = ok && set_arg(lc_line_kernel, arg++, sizeof(cl_int),
                                        &lc_mode);
                     ok = ok && set_arg(lc_line_kernel, arg++, sizeof(cl_int),
@@ -7940,23 +7946,26 @@ RtStageStatus run_sharpen(const std::shared_ptr<OpenCLEnv>& env,
 }
 
 /*
- * The local.adjustments node, one-spot colour increment.
+ * The local.adjustments node, one spot at a time.
  *
  *   [0] Lab three-plane F32 buffer, read and written in place,
  *   [1] PTR host context (RtLocalAdjustmentsContext), host-only,
  *   [2] int support flag, mirrored from the context descriptor.
  *
- * The context build runs once, before the upload, on the Lab image the call
- * site produced with rgb2lab(baseImg). It exports the per-spot record, the
- * host-built light and chroma-slider tables, the working matrices, the Lab
- * caches and the Gaussian coefficients for origblur. calc_ref() and
- * complexCurvelocal() stay host-side.
+ * The context build runs once per spot, before that spot's upload, on the Lab
+ * image the call site produced with rgb2lab(baseImg) and the read-back result
+ * of the previous spot. It exports the per-spot record, the host-built light,
+ * chroma-slider and vibrance-skin tables, the working matrices, the Lab caches
+ * and the Gaussian coefficients for origblur and local contrast. calc_ref()
+ * and complexCurvelocal() stay host-side; the local-contrast coefficients are
+ * built from the spot's lcradius.
  *
- * Pass order matches Lab_Local(): the optional negative-value prefilter, the
- * ROI original blur, the colour/transition/deltaE apply, then the tail clamp.
- * Every pass writes the device image; the host Lab is read back only after all
- * passes succeeded, so a refusal or a failed launch leaves it untouched for
- * the builtin.
+ * Pass order matches Lab_Local(): the optional negative-value prefilter, then,
+ * per active spot, vibrance, local contrast and Colour & Light, each with its
+ * own ROI copy and deltaE reference blur. The full-image tail clamp and the
+ * Munsell pass follow. Every pass writes the device image; the host Lab is
+ * read back only after all passes succeeded, so a refusal or a failed launch
+ * leaves it untouched for the builtin.
  */
 RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
                                     const std::shared_ptr<OpenCLResidency>& residency,
@@ -8043,9 +8052,16 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
         compiled_kernel_entry(env, def, "rt_local_adjustments_munsell", error);
     cl_kernel line_kernel =
         compiled_kernel_entry(env, def, "rt_lab_tools_lc_line", error);
+    cl_kernel vibrance_kernel =
+        compiled_kernel_entry(env, def, "rt_lab_tools_vibrance", error);
+    cl_kernel lc_blend_kernel =
+        compiled_kernel_entry(env, def, "rt_lab_tools_lc_blend", error);
+    cl_kernel blend_kernel =
+        compiled_kernel_entry(env, def, "rt_local_adjustments_blend", error);
     if (apply_kernel == nullptr || clamp_kernel == nullptr ||
         roi_kernel == nullptr || munsell_kernel == nullptr ||
-        line_kernel == nullptr) {
+        line_kernel == nullptr || vibrance_kernel == nullptr ||
+        lc_blend_kernel == nullptr || blend_kernel == nullptr) {
         return RT_STAGE_FALLBACK;
     }
 
@@ -8198,10 +8214,12 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
     char light_key = 0;
     char satur_key = 0;
     char saturmoins_key = 0;
-    char roi_keys[3] = {0, 0, 0};
+    char skin_key = 0;
+    char work_key = 0;
     char scratch_key = 0;
     char blur_keys[3] = {0, 0, 0};
-    StageDeviceBufferPtr roi_device[3];
+    char lc_h_key = 0;
+    char lc_v_key = 0;
     StageDeviceBufferPtr blur_device[3];
 
     const auto finite = [](float value) { return std::isfinite(value); };
@@ -8290,10 +8308,10 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
         [&](cl_kernel kernel, cl_mem src, cl_mem dst, cl_mem state,
             cl_int length, cl_int lines, cl_int src_base_step,
             cl_int dst_base_step, cl_int src_stride, cl_int dst_stride,
+            cl_int src_base, cl_int dst_base, cl_int mode,
             cl_int vector_lines, const RtLabToolsIirDirection& direction,
             const char* label) {
         cl_uint arg = 0;
-        cl_int mode = 0;
         bool ok = true;
         ok = ok && set(kernel, arg++, sizeof(cl_mem), &src);
         ok = ok && set(kernel, arg++, sizeof(cl_mem), &dst);
@@ -8304,6 +8322,8 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
         ok = ok && set(kernel, arg++, sizeof(cl_int), &dst_base_step);
         ok = ok && set(kernel, arg++, sizeof(cl_int), &src_stride);
         ok = ok && set(kernel, arg++, sizeof(cl_int), &dst_stride);
+        ok = ok && set(kernel, arg++, sizeof(cl_int), &src_base);
+        ok = ok && set(kernel, arg++, sizeof(cl_int), &dst_base);
         ok = ok && set(kernel, arg++, sizeof(cl_int), &mode);
         ok = ok && set(kernel, arg++, sizeof(cl_int), &vector_lines);
         for (std::size_t index = 0;
@@ -8355,6 +8375,10 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
         const bool active = rec[RT_LOCAL_ADJUSTMENTS_SLOT_ACTIV] == 1.0f;
         const bool colour = rec[RT_LOCAL_ADJUSTMENTS_SLOT_COLORENA] == 1.0f;
         const bool islocal = rec[RT_LOCAL_ADJUSTMENTS_SLOT_ISLOCAL] == 1.0f;
+        const bool vibrance =
+            rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXPVIBRANCE] == 1.0f;
+        const bool localContrast =
+            rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXPCONTRAST] == 1.0f;
         const uint32_t shape =
             static_cast<uint32_t>(rec[RT_LOCAL_ADJUSTMENTS_SLOT_SHAPE]);
         const uint32_t avoid = static_cast<uint32_t>(
@@ -8365,6 +8389,10 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
             (rec[RT_LOCAL_ADJUSTMENTS_SLOT_ACTIV] != 0.0f && !active) ||
             (rec[RT_LOCAL_ADJUSTMENTS_SLOT_ISLOCAL] != 0.0f && !islocal) ||
             (rec[RT_LOCAL_ADJUSTMENTS_SLOT_COLORENA] != 0.0f && !colour) ||
+            (rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXPVIBRANCE] != 0.0f &&
+             !vibrance) ||
+            (rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXPCONTRAST] != 0.0f &&
+             !localContrast) ||
             (rec[RT_LOCAL_ADJUSTMENTS_SLOT_MERGE] != 0.0f) ||
             (rec[RT_LOCAL_ADJUSTMENTS_SLOT_HRENABLED] != 0.0f) ||
             (rec[RT_LOCAL_ADJUSTMENTS_SLOT_REPARCOL] != 100.0f) ||
@@ -8375,9 +8403,10 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
              rec[RT_LOCAL_ADJUSTMENTS_SLOT_AVOIDNEG] != 1.0f) ||
             (rec[RT_LOCAL_ADJUSTMENTS_SLOT_DELTAE] != 0.0f &&
              rec[RT_LOCAL_ADJUSTMENTS_SLOT_DELTAE] != 1.0f) ||
-            (active && (!colour || !islocal ||
-                        rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXPCOLOR] != 1.0f)) ||
-            (!active && (colour || islocal))) {
+            (active && !islocal) ||
+            (active && colour &&
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXPCOLOR] != 1.0f) ||
+            (!active && (colour || vibrance || localContrast || islocal))) {
             error = "local.adjustments record is outside the supported set";
             return RT_STAGE_FALLBACK;
         }
@@ -8399,12 +8428,91 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
             error = "local.adjustments slider is outside its range";
             return RT_STAGE_FALLBACK;
         }
+        if (vibrance &&
+            (rec[RT_LOCAL_ADJUSTMENTS_SLOT_VIB_PASTELS] < -100.0f ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_VIB_PASTELS] > 100.0f ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_VIB_SATURATED] < -100.0f ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_VIB_SATURATED] > 100.0f ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_VIB_THR_TOP] < 0.0f ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_VIB_THR_TOP] > 100.0f ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_VIB_THR_BOTTOM] < 0.0f ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_VIB_THR_BOTTOM] > 100.0f ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_SENSV] < 0.0f ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_SENSV] > 100.0f)) {
+            error = "local.adjustments vibrance setting is outside its range";
+            return RT_STAGE_FALLBACK;
+        }
+        if (localContrast &&
+            (rec[RT_LOCAL_ADJUSTMENTS_SLOT_LC_AMOUNT] < 0.0f ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_LC_AMOUNT] > 1.0f ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_LC_DARKNESS] < 0.0f ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_LC_DARKNESS] > 3.0f ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_LC_LIGHTNESS] < -100.0f ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_LC_LIGHTNESS] > 100.0f ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_LC_RADIUS] < 10.0f ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_LC_RADIUS] > 100.0f ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_SENSLC] < 0.0f ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_SENSLC] > 100.0f)) {
+            error = "local.adjustments local-contrast setting is outside its "
+                    "range";
+            return RT_STAGE_FALLBACK;
+        }
+        for (const int flag : {RT_LOCAL_ADJUSTMENTS_SLOT_VIB_PROTECTSKINS,
+                               RT_LOCAL_ADJUSTMENTS_SLOT_VIB_AVOIDCOLORSHIFT,
+                               RT_LOCAL_ADJUSTMENTS_SLOT_VIB_SKIN_ACTIVE}) {
+            if (rec[flag] != 0.0f && rec[flag] != 1.0f) {
+                error = "local.adjustments vibrance flag is not 0 or 1";
+                return RT_STAGE_FALLBACK;
+            }
+        }
+        const bool skinActive =
+            rec[RT_LOCAL_ADJUSTMENTS_SLOT_VIB_SKIN_ACTIVE] == 1.0f;
+        if (skinActive &&
+            (rec[RT_LOCAL_ADJUSTMENTS_SLOT_VIB_SKIN_OFFSET] < 0.0f ||
+             static_cast<std::size_t>(
+                 rec[RT_LOCAL_ADJUSTMENTS_SLOT_VIB_SKIN_OFFSET]) +
+                     RT_LOCAL_ADJUSTMENTS_LUT_ENTRIES >
+                 setup.lut_count)) {
+            error = "local.adjustments skin curve is out of range";
+            return RT_STAGE_FALLBACK;
+        }
         if (setup.iir->size != sizeof(RtLabToolsIir) ||
             setup.iir->version != RT_LAB_TOOLS_IIR_VERSION ||
-            setup.iir->double_path != 0) {
+            setup.iir->double_path != 0 ||
+            setup.iir_vibrance == nullptr ||
+            setup.iir_vibrance->size != sizeof(RtLabToolsIir) ||
+            setup.iir_vibrance->version != RT_LAB_TOOLS_IIR_VERSION ||
+            setup.iir_vibrance->double_path != 0 ||
+            setup.iir_local_contrast == nullptr ||
+            setup.iir_local_contrast->size != sizeof(RtLabToolsIir) ||
+            setup.iir_local_contrast->version != RT_LAB_TOOLS_IIR_VERSION ||
+            setup.iir_local_contrast->double_path > 1u) {
             error = "local.adjustments blur needs the SSE coefficient path";
             return RT_STAGE_FALLBACK;
         }
+        if (localContrast &&
+            setup.iir_local_contrast->double_path !=
+                (rec[RT_LOCAL_ADJUSTMENTS_SLOT_LC_RADIUS] >=
+                         LAB_TOOLS_LC_DOUBLE_SIGMA
+                     ? 1u
+                     : 0u)) {
+            error = "local.adjustments local-contrast coefficients use the "
+                    "wrong path";
+            return RT_STAGE_FALLBACK;
+        }
+#if !defined(__SSE2__) && !defined(RT_SIMDE)
+        /*
+         * Below sigma 25 the host takes the SSE float recurrence on an SSE2
+         * build and the double one otherwise; the exported `double_path` is
+         * the sigma test alone. A host without SSE2 would therefore run a
+         * different recurrence from the one the kernel's mode selects.
+         */
+        if (vibrance || localContrast) {
+            error = "local.adjustments vibrance and local contrast need the "
+                    "host's SSE2 blur path";
+            return RT_STAGE_FALLBACK;
+        }
+#endif
 
         /* Curve table ranges. A table that is not active must not be read. */
         struct TableSpec {
@@ -8442,6 +8550,9 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
              static_cast<int>(RT_LOCAL_ADJUSTMENTS_LUT_ENTRIES)},
             {RT_LOCAL_ADJUSTMENTS_SLOT_SATURMOINS_OFFSET,
              RT_LOCAL_ADJUSTMENTS_SLOT_SATURMOINS_ACTIVE,
+             static_cast<int>(RT_LOCAL_ADJUSTMENTS_LUT_ENTRIES)},
+            {RT_LOCAL_ADJUSTMENTS_SLOT_VIB_SKIN_OFFSET,
+             RT_LOCAL_ADJUSTMENTS_SLOT_VIB_SKIN_ACTIVE,
              static_cast<int>(RT_LOCAL_ADJUSTMENTS_LUT_ENTRIES)}};
         for (const TableSpec& table : curves) {
             const bool table_active = rec[table.active] == 1.0f;
@@ -8449,9 +8560,11 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
                 error = "local.adjustments curve flag is not 0 or 1";
                 return RT_STAGE_FALLBACK;
             }
-            if (qcurve == 0u && table.active >=
-                    RT_LOCAL_ADJUSTMENTS_SLOT_LL_ACTIVE &&
-                table.active <= RT_LOCAL_ADJUSTMENTS_SLOT_CH_ACTIVE &&
+            if (qcurve == 0u &&
+                table.active >=
+                    static_cast<int>(RT_LOCAL_ADJUSTMENTS_SLOT_LL_ACTIVE) &&
+                table.active <=
+                    static_cast<int>(RT_LOCAL_ADJUSTMENTS_SLOT_CH_ACTIVE) &&
                 table_active) {
                 error = "local.adjustments has a curve outside the curve "
                         "pass";
@@ -8584,7 +8697,12 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
             RT_LOCAL_ADJUSTMENTS_SLOT_SATURMOINS_ACTIVE,
             RT_LOCAL_ADJUSTMENTS_LUT_ENTRIES, "saturmoins",
             &saturmoins_key);
-        if (!light_device || !satur_device || !saturmoins_device) {
+        StageDeviceBufferPtr skin_device = table_slice(
+            RT_LOCAL_ADJUSTMENTS_SLOT_VIB_SKIN_OFFSET,
+            RT_LOCAL_ADJUSTMENTS_SLOT_VIB_SKIN_ACTIVE,
+            RT_LOCAL_ADJUSTMENTS_LUT_ENTRIES, "skin", &skin_key);
+        if (!light_device || !satur_device || !saturmoins_device ||
+            !skin_device) {
             return RT_STAGE_FALLBACK;
         }
 
@@ -8595,104 +8713,395 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
         }
 
         if (active) {
+            StageDeviceBufferPtr work_device = residency->acquire(
+                &work_key, StageBufferShape{RT_STAGE_F32, bfw, bfh, 3},
+                &error);
             for (int plane = 0; plane < 3; ++plane) {
-                roi_device[plane] = residency->acquire(
-                    &roi_keys[plane],
-                    StageBufferShape{RT_STAGE_F32, bfw, bfh, 1}, &error);
                 blur_device[plane] = residency->acquire(
                     &blur_keys[plane],
                     StageBufferShape{RT_STAGE_F32, bfw, bfh, 1}, &error);
-                if (!roi_device[plane] || !blur_device[plane]) {
-                    error = "local.adjustments ROI allocation failed";
-                    return RT_STAGE_FALLBACK;
-                }
             }
             StageDeviceBufferPtr scratch_device = residency->acquire(
                 &scratch_key, StageBufferShape{RT_STAGE_F32, bfw, bfh, 1},
                 &error);
-            if (!scratch_device) {
-                error = "local.adjustments blur scratch allocation failed";
-                return RT_STAGE_FALLBACK;
-            }
-            const int roi_pitch = static_cast<int>(pitch_of(roi_device[0]));
-            const int blur_pitch = static_cast<int>(pitch_of(blur_device[0]));
-            const int scratch_pitch =
-                static_cast<int>(pitch_of(scratch_device));
-            if (pitch_of(roi_device[0]) >
-                    static_cast<std::size_t>(
-                        std::numeric_limits<cl_int>::max()) ||
-                pitch_of(blur_device[0]) >
-                    static_cast<std::size_t>(
-                        std::numeric_limits<cl_int>::max()) ||
-                pitch_of(scratch_device) >
-                    static_cast<std::size_t>(
-                        std::numeric_limits<cl_int>::max())) {
-                error = "local.adjustments ROI pitch does not fit the "
-                        "kernel's int";
+            if (!work_device || !scratch_device || !blur_device[0] ||
+                !blur_device[1] || !blur_device[2]) {
+                error = "local.adjustments ROI allocation failed";
                 return RT_STAGE_FALLBACK;
             }
 
-            {
+            const auto int_pitch =
+                [&error](std::size_t pitch, const char* label) -> int {
+                if (pitch >
+                    static_cast<std::size_t>(
+                        std::numeric_limits<cl_int>::max())) {
+                    error = std::string("local.adjustments ") + label +
+                            " pitch does not fit the kernel's int";
+                    return -1;
+                }
+                return static_cast<int>(pitch);
+            };
+            const int work_pitch = int_pitch(pitch_of(work_device), "ROI");
+            const int work_plane =
+                int_pitch(plane_pitch_of(work_device), "ROI plane");
+            const int blur_pitch = int_pitch(pitch_of(blur_device[0]), "blur");
+            const int scratch_pitch =
+                int_pitch(pitch_of(scratch_device), "scratch");
+            if (work_pitch < 0 || work_plane < 0 || blur_pitch < 0 ||
+                scratch_pitch < 0) {
+                return RT_STAGE_FALLBACK;
+            }
+            cl_mem work_memory = memory_of(work_device);
+            cl_mem scratch_memory = memory_of(scratch_device);
+
+            /*
+             * The host's tool blocks each start from a fresh copy of the
+             * current image: bufcolorig, bufexporig, bufgb and tmp1. The
+             * three-plane `work` buffer is that copy.
+             */
+            const auto copy_roi = [&]() {
                 cl_uint arg = 0;
                 cl_mem lab_memory = memory_of(image);
-                cl_mem roi_l = memory_of(roi_device[0]);
-                cl_mem roi_a = memory_of(roi_device[1]);
-                cl_mem roi_b = memory_of(roi_device[2]);
                 cl_int x0 = xstart;
                 cl_int y0 = ystart;
                 cl_int rw = bfw;
                 cl_int rh = bfh;
                 cl_int lp = lab_pitch;
                 cl_int lpl = lab_plane;
-                cl_int rp = roi_pitch;
+                cl_int wp = work_pitch;
+                cl_int wpl = work_plane;
                 bool ok = true;
                 ok = ok && set(roi_kernel, arg++, sizeof(cl_mem), &lab_memory);
-                ok = ok && set(roi_kernel, arg++, sizeof(cl_mem), &roi_l);
-                ok = ok && set(roi_kernel, arg++, sizeof(cl_mem), &roi_a);
-                ok = ok && set(roi_kernel, arg++, sizeof(cl_mem), &roi_b);
+                ok = ok && set(roi_kernel, arg++, sizeof(cl_mem),
+                               &work_memory);
                 ok = ok && set(roi_kernel, arg++, sizeof(cl_int), &x0);
                 ok = ok && set(roi_kernel, arg++, sizeof(cl_int), &y0);
                 ok = ok && set(roi_kernel, arg++, sizeof(cl_int), &rw);
                 ok = ok && set(roi_kernel, arg++, sizeof(cl_int), &rh);
                 ok = ok && set(roi_kernel, arg++, sizeof(cl_int), &lp);
                 ok = ok && set(roi_kernel, arg++, sizeof(cl_int), &lpl);
-                ok = ok && set(roi_kernel, arg++, sizeof(cl_int), &rp);
-                if (!ok || !launch2d(roi_kernel,
+                ok = ok && set(roi_kernel, arg++, sizeof(cl_int), &wp);
+                ok = ok && set(roi_kernel, arg++, sizeof(cl_int), &wpl);
+                if (!ok) {
+                    error = "local.adjustments ROI copy arguments failed";
+                    return false;
+                }
+                return launch2d(roi_kernel, static_cast<std::size_t>(bfw),
+                                static_cast<std::size_t>(bfh), "ROI copy");
+            };
+
+            /*
+             * transit_shapedetect2()'s origblur over the work copy. The
+             * colour, vibrance and local-contrast deltaE references all take
+             * the SSE path here, so the float scratch plane doubles as the
+             * kernel's unused double-state argument.
+             */
+            const auto blur_roi = [&](const RtLabToolsIir& iir,
+                                      const char* label) {
+                const cl_int horizontal_lines = bfh - (bfh % 4);
+                const cl_int vertical_lines = bfw - (bfw % 8);
+                for (int plane = 0; plane < 3; ++plane) {
+                    cl_mem dst = memory_of(blur_device[plane]);
+                    const cl_int base =
+                        static_cast<cl_int>(plane) * work_plane;
+                    if (!run_line(line_kernel, work_memory, scratch_memory,
+                                  scratch_memory, bfw, bfh, work_pitch,
+                                  scratch_pitch, 1, 1, base, 0, 0,
+                                  horizontal_lines, iir.horizontal, label) ||
+                        !run_line(line_kernel, scratch_memory, dst,
+                                  scratch_memory, bfh, bfw, 1, 1,
+                                  scratch_pitch, blur_pitch, 0, 0, 0,
+                                  vertical_lines, iir.vertical, label)) {
+                        return false;
+                    }
+                }
+                return true;
+            };
+
+            /* transit_shapedetect2()'s blend for a tool whose output is in
+             * `work`: `varsens` is the tool's own scope sensitivity. */
+            const auto run_blend = [&](const char* label,
+                                       cl_float varsens) {
+                cl_uint arg = 0;
+                cl_mem lab_memory = memory_of(image);
+                cl_mem fin_memory = work_memory;
+                cl_mem blur_l = memory_of(blur_device[0]);
+                cl_mem blur_a = memory_of(blur_device[1]);
+                cl_mem blur_b = memory_of(blur_device[2]);
+                cl_mem record_memory = memory_of(record_device);
+                cl_int lp = lab_pitch;
+                cl_int lpl = lab_plane;
+                cl_int fp = work_pitch;
+                cl_int fpl = work_plane;
+                cl_int rw = bfw;
+                cl_int rh = bfh;
+                cl_int x0 = xstart;
+                cl_int y0 = ystart;
+                cl_int bp = blur_pitch;
+                bool ok = true;
+                ok = ok && set(blend_kernel, arg++, sizeof(cl_mem),
+                               &lab_memory);
+                ok = ok && set(blend_kernel, arg++, sizeof(cl_mem),
+                               &fin_memory);
+                ok = ok && set(blend_kernel, arg++, sizeof(cl_mem), &blur_l);
+                ok = ok && set(blend_kernel, arg++, sizeof(cl_mem), &blur_a);
+                ok = ok && set(blend_kernel, arg++, sizeof(cl_mem), &blur_b);
+                ok = ok && set(blend_kernel, arg++, sizeof(cl_mem),
+                               &record_memory);
+                ok = ok && set(blend_kernel, arg++, sizeof(cl_int), &lp);
+                ok = ok && set(blend_kernel, arg++, sizeof(cl_int), &lpl);
+                ok = ok && set(blend_kernel, arg++, sizeof(cl_int), &fp);
+                ok = ok && set(blend_kernel, arg++, sizeof(cl_int), &fpl);
+                ok = ok && set(blend_kernel, arg++, sizeof(cl_int), &rw);
+                ok = ok && set(blend_kernel, arg++, sizeof(cl_int), &rh);
+                ok = ok && set(blend_kernel, arg++, sizeof(cl_int), &x0);
+                ok = ok && set(blend_kernel, arg++, sizeof(cl_int), &y0);
+                ok = ok && set(blend_kernel, arg++, sizeof(cl_int), &bp);
+                ok = ok && set(blend_kernel, arg++, sizeof(cl_float),
+                               &varsens);
+                if (!ok) {
+                    error = std::string("local.adjustments ") + label +
+                            " blend arguments failed";
+                    return false;
+                }
+                return launch2d(blend_kernel, static_cast<std::size_t>(bfw),
+                                static_cast<std::size_t>(bfh), label);
+            };
+
+            /*
+             * Vibrance. ImProcFunctions::vibrance() runs on the ROI copy;
+             * the blend is transit_shapedetect2() with the vibrance scope
+             * sensitivity (lp.sensv). The skin curve and the Munsell set are
+             * host-built tables.
+             */
+            if (vibrance) {
+                if (!copy_roi() ||
+                    !blur_roi(*setup.iir_vibrance, "vibrance blur")) {
+                    return RT_STAGE_FALLBACK;
+                }
+
+                const cl_int cl_pastels = static_cast<cl_int>(
+                    rec[RT_LOCAL_ADJUSTMENTS_SLOT_VIB_PASTELS]);
+                const cl_int cl_saturated = static_cast<cl_int>(
+                    rec[RT_LOCAL_ADJUSTMENTS_SLOT_VIB_SATURATED]);
+                const cl_int cl_threshold_top = static_cast<cl_int>(
+                    rec[RT_LOCAL_ADJUSTMENTS_SLOT_VIB_THR_TOP]);
+                const cl_int cl_threshold_bottom = static_cast<cl_int>(
+                    rec[RT_LOCAL_ADJUSTMENTS_SLOT_VIB_THR_BOTTOM]);
+                const cl_int cl_protectskins = static_cast<cl_int>(
+                    rec[RT_LOCAL_ADJUSTMENTS_SLOT_VIB_PROTECTSKINS]);
+                const cl_int cl_avoidcolorshift = static_cast<cl_int>(
+                    rec[RT_LOCAL_ADJUSTMENTS_SLOT_VIB_AVOIDCOLORSHIFT]);
+                const cl_int cl_skin_curve_set = skinActive ? 1 : 0;
+                const cl_int cl_vibrance_highlight = 0;
+                cl_mem lab_memory = work_memory;
+                cl_mem iws_memory = memory_of(iws_device);
+                cl_mem skin_memory = memory_of(skin_device);
+                cl_mem munsell_memory = memory_of(munsell_device);
+                cl_mem munsell_sizes_memory =
+                    memory_of(munsell_sizes_device);
+                cl_int rw = bfw;
+                cl_int rh = bfh;
+                cl_int wp = work_pitch;
+                cl_int wpl = work_plane;
+                cl_uint arg = 0;
+                bool ok = true;
+                ok = ok && set(vibrance_kernel, arg++, sizeof(cl_mem),
+                               &lab_memory);
+                ok = ok && set(vibrance_kernel, arg++, sizeof(cl_int), &rw);
+                ok = ok && set(vibrance_kernel, arg++, sizeof(cl_int), &rh);
+                ok = ok && set(vibrance_kernel, arg++, sizeof(cl_int), &wp);
+                ok = ok && set(vibrance_kernel, arg++, sizeof(cl_int), &wpl);
+                ok = ok && set(vibrance_kernel, arg++, sizeof(cl_mem),
+                               &iws_memory);
+                ok = ok && set(vibrance_kernel, arg++, sizeof(cl_mem),
+                               &skin_memory);
+                ok = ok && set(vibrance_kernel, arg++, sizeof(cl_int),
+                               &cl_skin_curve_set);
+                ok = ok && set(vibrance_kernel, arg++, sizeof(cl_mem),
+                               &munsell_memory);
+                ok = ok && set(vibrance_kernel, arg++, sizeof(cl_mem),
+                               &munsell_sizes_memory);
+                ok = ok && set(vibrance_kernel, arg++, sizeof(cl_int),
+                               &cl_pastels);
+                ok = ok && set(vibrance_kernel, arg++, sizeof(cl_int),
+                               &cl_saturated);
+                ok = ok && set(vibrance_kernel, arg++, sizeof(cl_int),
+                               &cl_threshold_top);
+                ok = ok && set(vibrance_kernel, arg++, sizeof(cl_int),
+                               &cl_threshold_bottom);
+                ok = ok && set(vibrance_kernel, arg++, sizeof(cl_int),
+                               &cl_protectskins);
+                ok = ok && set(vibrance_kernel, arg++, sizeof(cl_int),
+                               &cl_avoidcolorshift);
+                ok = ok && set(vibrance_kernel, arg++, sizeof(cl_int),
+                               &cl_vibrance_highlight);
+                if (!ok || !launch2d(vibrance_kernel,
                                      static_cast<std::size_t>(bfw),
                                      static_cast<std::size_t>(bfh),
-                                     "ROI copy")) {
-                    error = "local.adjustments ROI copy failed";
+                                     "vibrance")) {
+                    error = "local.adjustments vibrance failed";
+                    return RT_STAGE_FALLBACK;
+                }
+                if (!run_blend("vibrance",
+                               rec[RT_LOCAL_ADJUSTMENTS_SLOT_SENSV])) {
                     return RT_STAGE_FALLBACK;
                 }
             }
 
-            const cl_int horizontal_vector_lines = bfh - (bfh % 4);
-            const cl_int vertical_vector_lines = bfw - (bfw % 8);
-            for (int plane = 0; plane < 3; ++plane) {
-                cl_mem src = memory_of(roi_device[plane]);
-                StageDeviceBufferPtr scratch_device = residency->acquire(
-                    &scratch_key,
-                    StageBufferShape{RT_STAGE_F32, bfw, bfh, 1}, &error);
-                if (!scratch_device) {
-                    error = "local.adjustments blur scratch allocation "
+            /*
+             * Local contrast. The host's block is guarded by mSPwav = 32; a
+             * smaller ROI does no local-contrast work, so the pass is skipped
+             * and the spot keeps the earlier tools' output.
+             */
+            if (localContrast && bfw >= 32 && bfh >= 32) {
+                StageDeviceBufferPtr lc_h_device = residency->acquire(
+                    &lc_h_key, StageBufferShape{RT_STAGE_F32, bfw, bfh, 1},
+                    &error);
+                StageDeviceBufferPtr lc_v_device = residency->acquire(
+                    &lc_v_key, StageBufferShape{RT_STAGE_F32, bfw, bfh, 1},
+                    &error);
+                if (!lc_h_device || !lc_v_device) {
+                    error = "local.adjustments local-contrast allocation "
                             "failed";
                     return RT_STAGE_FALLBACK;
                 }
-                cl_mem scratch = memory_of(scratch_device);
-                cl_mem dst = memory_of(blur_device[plane]);
-                if (!run_line(line_kernel, src, scratch, scratch, bfw, bfh,
-                              roi_pitch, scratch_pitch, 1, 1,
-                              horizontal_vector_lines,
-                              setup.iir->horizontal, "horizontal blur") ||
-                    !run_line(line_kernel, scratch, dst, scratch, bfh, bfw, 1,
-                              1, scratch_pitch, blur_pitch,
-                              vertical_vector_lines, setup.iir->vertical,
-                              "vertical blur")) {
+                const int lc_h_pitch = int_pitch(pitch_of(lc_h_device),
+                                                 "local-contrast");
+                const int lc_v_pitch = int_pitch(pitch_of(lc_v_device),
+                                                 "local-contrast");
+                if (lc_h_pitch < 0 || lc_v_pitch < 0) {
+                    return RT_STAGE_FALLBACK;
+                }
+                cl_mem lc_h_memory = memory_of(lc_h_device);
+                cl_mem lc_v_memory = memory_of(lc_v_device);
+
+                /*
+                 * gaussianBlur()'s double path keeps a whole line of double
+                 * forward states. The stage formats are fp32 only, so this one
+                 * buffer is created directly and checked against the
+                 * residency's remaining budget; an over-budget ROI falls back
+                 * before any pass runs.
+                 */
+                cl_mem lc_state_memory = scratch_memory;
+                std::shared_ptr<void> lc_state_owner;
+                if (setup.iir_local_contrast->double_path != 0) {
+                    const std::size_t samples =
+                        static_cast<std::size_t>(bfw) *
+                        static_cast<std::size_t>(bfh);
+                    const std::size_t state_bytes = samples * sizeof(cl_double);
+                    const StageResidencyStats stats = residency->stats();
+                    if (stats.used_bytes > stats.budget_bytes ||
+                        state_bytes > stats.budget_bytes - stats.used_bytes) {
+                        error = "local.adjustments local-contrast state "
+                                "exceeds the device budget";
+                        return RT_STAGE_FALLBACK;
+                    }
+                    cl_int state_error = CL_SUCCESS;
+                    cl_mem memory = env->api->CreateBuffer(
+                        env->context, CL_MEM_READ_WRITE, state_bytes, nullptr,
+                        &state_error);
+                    if (memory == nullptr) {
+                        error = "local.adjustments local-contrast state "
+                                "allocation failed";
+                        return RT_STAGE_FALLBACK;
+                    }
+                    lc_state_owner = std::shared_ptr<void>(
+                        static_cast<void*>(memory),
+                        [api = env->api](void* pointer) {
+                            api->ReleaseMemObject(
+                                static_cast<cl_mem>(pointer));
+                        });
+                    lc_state_memory = memory;
+                }
+
+                if (!copy_roi() ||
+                    !blur_roi(*setup.iir_vibrance,
+                              "local-contrast deltaE blur")) {
+                    return RT_STAGE_FALLBACK;
+                }
+
+                const cl_int lc_mode =
+                    static_cast<cl_int>(
+                        setup.iir_local_contrast->double_path);
+                const cl_int lc_h_lines =
+                    lc_mode != 0 ? 0 : bfh - (bfh % 4);
+                const cl_int lc_v_lines =
+                    lc_mode != 0 ? 0 : bfw - (bfw % 8);
+                if (!run_line(line_kernel, work_memory, lc_h_memory,
+                              lc_state_memory, bfw, bfh, work_pitch,
+                              lc_h_pitch, 1, 1, 0, 0, lc_mode, lc_h_lines,
+                              setup.iir_local_contrast->horizontal,
+                              "local-contrast horizontal") ||
+                    !run_line(line_kernel, lc_h_memory, lc_v_memory,
+                              lc_state_memory, bfh, bfw, 1, 1, lc_h_pitch,
+                              lc_v_pitch, 0, 0, lc_mode, lc_v_lines,
+                              setup.iir_local_contrast->vertical,
+                              "local-contrast vertical")) {
+                    return RT_STAGE_FALLBACK;
+                }
+
+                {
+                    cl_uint arg = 0;
+                    cl_mem lab_memory = work_memory;
+                    cl_mem blur_memory = lc_v_memory;
+                    cl_int rw = bfw;
+                    cl_int rh = bfh;
+                    cl_int wp = work_pitch;
+                    cl_int wpl = work_plane;
+                    cl_int lp = lc_v_pitch;
+                    cl_float amount =
+                        rec[RT_LOCAL_ADJUSTMENTS_SLOT_LC_AMOUNT];
+                    cl_float darkness =
+                        rec[RT_LOCAL_ADJUSTMENTS_SLOT_LC_DARKNESS];
+                    cl_float lightness =
+                        rec[RT_LOCAL_ADJUSTMENTS_SLOT_LC_LIGHTNESS];
+                    bool ok = true;
+                    ok = ok && set(lc_blend_kernel, arg++, sizeof(cl_mem),
+                                   &lab_memory);
+                    ok = ok && set(lc_blend_kernel, arg++, sizeof(cl_mem),
+                                   &blur_memory);
+                    ok = ok && set(lc_blend_kernel, arg++, sizeof(cl_int),
+                                   &rw);
+                    ok = ok && set(lc_blend_kernel, arg++, sizeof(cl_int),
+                                   &rh);
+                    ok = ok && set(lc_blend_kernel, arg++, sizeof(cl_int),
+                                   &wp);
+                    ok = ok && set(lc_blend_kernel, arg++, sizeof(cl_int),
+                                   &wpl);
+                    ok = ok && set(lc_blend_kernel, arg++, sizeof(cl_int),
+                                   &lp);
+                    ok = ok && set(lc_blend_kernel, arg++, sizeof(cl_float),
+                                   &amount);
+                    ok = ok && set(lc_blend_kernel, arg++, sizeof(cl_float),
+                                   &darkness);
+                    ok = ok && set(lc_blend_kernel, arg++, sizeof(cl_float),
+                                   &lightness);
+                    if (!ok || !launch2d(lc_blend_kernel,
+                                         static_cast<std::size_t>(bfw),
+                                         static_cast<std::size_t>(bfh),
+                                         "local-contrast blend")) {
+                        error = "local.adjustments local-contrast blend "
+                                "failed";
+                        return RT_STAGE_FALLBACK;
+                    }
+                }
+                if (!run_blend("local-contrast",
+                               rec[RT_LOCAL_ADJUSTMENTS_SLOT_SENSLC])) {
                     return RT_STAGE_FALLBACK;
                 }
             }
 
-            {
+            /*
+             * Colour & Light runs last in Lab_Local(): after vibrance and
+             * local contrast. Its fused apply reads the image as the earlier
+             * tools left it and its own sigma blur.
+             */
+            if (colour) {
+                if (!copy_roi() || !blur_roi(*setup.iir, "colour blur")) {
+                    return RT_STAGE_FALLBACK;
+                }
+
                 cl_uint arg = 0;
                 cl_mem lab_memory = memory_of(image);
                 cl_mem blur_l = memory_of(blur_device[0]);

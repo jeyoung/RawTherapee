@@ -106,14 +106,80 @@ bool explicitMaskIdle(const procparams::LocallabParams::LocallabSpot& spot)
            !spot.enacieMaskall;
 }
 
-/* Every tool other than Colour & Light. The exposure and soft-light tools
- * also decide the clamp arm; they are residuals here. */
+/* Every tool other than the three this node runs. The exposure and soft-light
+ * tools also decide the clamp arm; they are residuals here. */
 bool otherToolEnabled(const procparams::LocallabParams::LocallabSpot& spot)
 {
-    return spot.expexpose || spot.expshadhigh || spot.expvibrance ||
+    return spot.expexpose || spot.expshadhigh ||
            spot.expsoft || spot.expblur || spot.exptonemap || spot.expreti ||
-           spot.expsharp || spot.expcontrast || spot.expcbdl || spot.explog ||
+           spot.expsharp || spot.expcbdl || spot.explog ||
            spot.expmask || spot.expcie || spot.expprecam;
+}
+
+/* The local contrast method the node runs: the Gaussian/IIR variant. The
+ * wavelet variant needs the wavelet port and is a residual. The host maps an
+ * empty string to the Gaussian variant too. */
+bool isLocalContrastMethod(const Glib::ustring& method)
+{
+    return method.empty() || method == "loc";
+}
+
+/* Whether the vibrance tool's parameters are inside the device set. The host's
+ * gamma (vibgam) wraps vibrance in igammalog()/gammalog(); the three gradient
+ * strengths rebuild the tool's output from a local gradient; warm switches to
+ * ciecamloc_02float(). None of those is ported, so each is a residual. */
+bool vibranceAdmitted(const procparams::LocallabParams::LocallabSpot& spot)
+{
+    if (spot.vibgam != 1.0 || spot.warm != 0) {
+        return false;
+    }
+    if (spot.strvib != 0.0 || spot.strvibab != 0.0 || spot.strvibh != 0.0) {
+        return false;
+    }
+    if (spot.pastels < -100 || spot.pastels > 100 ||
+        spot.saturated < -100 || spot.saturated > 100) {
+        return false;
+    }
+    if (spot.psthreshold.getTopLeft() < 0 ||
+        spot.psthreshold.getTopLeft() > 100 ||
+        spot.psthreshold.getBottomLeft() < 0 ||
+        spot.psthreshold.getBottomLeft() > 100) {
+        return false;
+    }
+    return spot.sensiv >= 0 && spot.sensiv <= 100;
+}
+
+/* Whether the local contrast tool's parameters are inside the device set. The
+ * Gaussian variant runs ImProcFunctions::localContrast(); the wavelet variant
+ * (localcontMethod == "wav") and the FFT variant (fftwlc) are residuals, as
+ * are the wavelet-trigger settings the block's guard reads and the recovery
+ * weight that would blend the result back towards the original. */
+bool localContrastAdmitted(
+    const procparams::LocallabParams::LocallabSpot& spot)
+{
+    if (!isLocalContrastMethod(spot.localcontMethod) || spot.fftwlc) {
+        return false;
+    }
+    if (spot.reparw != 100.0) {
+        return false;
+    }
+    if (spot.lcamount < 0.0 || spot.lcamount > 1.0 ||
+        spot.lcradius < 10 || spot.lcradius > 100 ||
+        spot.lcdarkness < 0.0 || spot.lcdarkness > 3.0) {
+        return false;
+    }
+    if (spot.sensilc < 0 || spot.sensilc > 100) {
+        return false;
+    }
+    if (spot.strwav != 0.0 || spot.wavedg || spot.wavgradl || spot.origlc) {
+        return false;
+    }
+    if (spot.residblur > 0.0 || spot.levelblur > 0.0 ||
+        spot.residcont != 0.0 || spot.clarilres != 0.0 ||
+        spot.claricres != 0.0) {
+        return false;
+    }
+    return true;
 }
 
 /* LocLHCurve/LocHHCurve/LocCHCurve's own activity test: the host scans the
@@ -191,8 +257,9 @@ bool localAdjustmentsSupported(const procparams::ProcParams& params)
 {
     /*
      * The block is atomic: every spot must be in the set below. An inactive
-     * spot is the clamp-only case; an active spot is Colour & Light, with
-     * optional L/C/H curves and MUNS. Curves, Munsell, rectangular spots,
+     * spot is the clamp-only case; an active spot runs Colour & Light,
+     * vibrance, local contrast or any combination, with optional L/C/H curves
+     * on the colour tool and MUNS. Curves, Munsell, rectangular spots,
      * inactive spots and multiple spots are supported; every other tool and
      * the masks, merge, soft radius, gradients and LAB/XYZ gamut methods are
      * residuals.
@@ -294,10 +361,18 @@ bool localAdjustmentsSupported(const procparams::ProcParams& params)
             spot.transitgrad < -10.0 || spot.transitgrad > 10.0) {
             return false;
         }
-        /* An active spot is Colour & Light only; an inactive spot does no
-         * colour work, so its other tool settings are inert and admitted. */
+        /* An active spot runs at least one of the three tools in the device
+         * set; an inactive spot does no work, so its tool settings are inert
+         * and admitted. */
         if (spot.activ) {
-            if (!spot.expcolor || otherToolEnabled(spot)) {
+            if ((!spot.expcolor && !spot.expvibrance && !spot.expcontrast) ||
+                otherToolEnabled(spot)) {
+                return false;
+            }
+            if (spot.expvibrance && !vibranceAdmitted(spot)) {
+                return false;
+            }
+            if (spot.expcontrast && !localContrastAdmitted(spot)) {
                 return false;
             }
         }
@@ -802,6 +877,56 @@ void sampleCurve(const std::vector<double>& points, std::vector<float>& table)
     }
 }
 
+/* The host's Gaussian coefficients in the three forms gauss.cc's paths read.
+ * The colour, vibrance and local-contrast passes each need their own sigma;
+ * `double_path` records which of the host's paths the sigma selects. */
+bool fillIir(double sigma, RtLabToolsIir& out)
+{
+    const GaussianIirCoefficients coefficients = gaussianIirCoefficients(sigma);
+    const auto fill = [&coefficients](RtLabToolsIirDirection& direction) {
+        direction.lane[0] = static_cast<float>(coefficients.B);
+        direction.lane[1] = static_cast<float>(coefficients.b1);
+        direction.lane[2] = static_cast<float>(coefficients.b2);
+        direction.lane[3] = static_cast<float>(coefficients.b3);
+        for (int row = 0; row < 3; ++row) {
+            for (int column = 0; column < 3; ++column) {
+                const std::size_t index =
+                    4u + static_cast<std::size_t>(row) * 3u +
+                    static_cast<std::size_t>(column);
+                direction.lane[index] =
+                    static_cast<float>(coefficients.sse_M[row][column]);
+                direction.border[index] = coefficients.sse_M[row][column];
+                direction.wide[index] = coefficients.M[row][column];
+            }
+        }
+        direction.border[0] = coefficients.B;
+        direction.border[1] = coefficients.b1;
+        direction.border[2] = coefficients.b2;
+        direction.border[3] = coefficients.b3;
+        direction.wide[0] = coefficients.B;
+        direction.wide[1] = coefficients.b1;
+        direction.wide[2] = coefficients.b2;
+        direction.wide[3] = coefficients.b3;
+    };
+    out = RtLabToolsIir{};
+    out.size = sizeof(RtLabToolsIir);
+    out.version = RT_LAB_TOOLS_IIR_VERSION;
+    out.double_path = sigma >= GAUSS_DOUBLE_LIMIT ? 1u : 0u;
+    fill(out.horizontal);
+    fill(out.vertical);
+    for (const RtLabToolsIirDirection* direction :
+         {&out.horizontal, &out.vertical}) {
+        for (std::size_t index = 0; index < RT_LAB_TOOLS_IIR_TERMS; ++index) {
+            if (!std::isfinite(direction->lane[index]) ||
+                !std::isfinite(direction->border[index]) ||
+                !std::isfinite(direction->wide[index])) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 } // namespace
 
 LocalAdjustmentsContext::LocalAdjustmentsContext(
@@ -1053,6 +1178,47 @@ int LocalAdjustmentsContext::build(int spot, const RtStageBuffer* lab,
         sampleCurve(moinsPoints, saturMoinsTable);
     }
 
+    /*
+     * Which of the two extra tools the host's own guards would run. The
+     * vibrance block's guard needs a non-zero pastel/saturated slider (the
+     * skin curve alone does not trigger it, because the guard does not read
+     * the curve); the local-contrast block needs a non-zero amount. The
+     * gamma, gradients, warm path, masks and wavelet variant are residuals,
+     * so no other trigger can fire.
+     */
+    const bool vibranceRun = profileSpot.expvibrance && lp.activspot &&
+                             (profileSpot.pastels != 0 ||
+                              profileSpot.saturated != 0);
+    bool skinCurveSet = false;
+    std::vector<float> skinTable;
+    if (vibranceRun) {
+        DiagonalCurve curve(profileSpot.skintonescurve,
+                            CURVES_MIN_POLY_POINTS);
+        skinCurveSet = !curve.isIdentity();
+        if (skinCurveSet) {
+            /* ipvibrance.cc's skbeg, skend and ask, as lab.tools builds it. */
+            constexpr float SKIN_HUE_BEGIN = -0.05f;
+            constexpr float SKIN_HUE_END = 1.60f;
+            const float ask = 65535.f / (SKIN_HUE_END - SKIN_HUE_BEGIN);
+            skinTable.resize(RT_LOCAL_ADJUSTMENTS_LUT_ENTRIES);
+            for (uint32_t index = 0;
+                 index < RT_LOCAL_ADJUSTMENTS_LUT_ENTRIES; ++index) {
+                skinTable[index] = static_cast<float>(
+                    65535.0 * curve.getVal(
+                                 static_cast<double>(index) / 65535.0)) /
+                    ask;
+            }
+        }
+    }
+    const bool localContrastRun = profileSpot.expcontrast && lp.activspot &&
+                                  lp.lcamount > 0.f;
+    const float skinOffset =
+        skinCurveSet ? appendSamples(skinTable)
+                     : RT_LOCAL_ADJUSTMENTS_NO_LUT;
+    if (skinCurveSet && skinOffset == RT_LOCAL_ADJUSTMENTS_NO_LUT) {
+        return 1;
+    }
+
     float* record = spots_.data();
     record[RT_LOCAL_ADJUSTMENTS_SLOT_XC] = lp.xc;
     record[RT_LOCAL_ADJUSTMENTS_SLOT_YC] = lp.yc;
@@ -1122,6 +1288,40 @@ int LocalAdjustmentsContext::build(int spot, const RtStageBuffer* lab,
     record[RT_LOCAL_ADJUSTMENTS_SLOT_AMOUNTCHROM] = amountChroma;
     record[RT_LOCAL_ADJUSTMENTS_SLOT_AVOIDNEG] =
         profileSpot.avoidneg ? 1.f : 0.f;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_EXPVIBRANCE] =
+        vibranceRun ? 1.f : 0.f;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_SENSV] =
+        static_cast<float>(lp.sensv);
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_VIB_PASTELS] =
+        static_cast<float>(profileSpot.pastels);
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_VIB_SATURATED] =
+        static_cast<float>(profileSpot.saturated);
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_VIB_THR_TOP] =
+        static_cast<float>(profileSpot.psthreshold.getTopLeft());
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_VIB_THR_BOTTOM] =
+        static_cast<float>(profileSpot.psthreshold.getBottomLeft());
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_VIB_PROTECTSKINS] =
+        profileSpot.protectskins ? 1.f : 0.f;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_VIB_AVOIDCOLORSHIFT] =
+        profileSpot.avoidcolorshift ? 1.f : 0.f;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_VIB_SKIN_OFFSET] = skinOffset;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_VIB_SKIN_ACTIVE] =
+        skinCurveSet && skinOffset != RT_LOCAL_ADJUSTMENTS_NO_LUT ? 1.f
+                                                                  : 0.f;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_EXPCONTRAST] =
+        localContrastRun ? 1.f : 0.f;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_SENSLC] =
+        static_cast<float>(lp.senslc);
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_LC_AMOUNT] = lp.lcamount;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_LC_DARKNESS] =
+        static_cast<float>(profileSpot.lcdarkness);
+    /* ImProcFunctions::Lab_Local()'s local-contrast block assigns the Colour &
+     * Light lightness slider to LocalContrastParams::lightness (not
+     * lclightness), so the device must read the same field. */
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_LC_LIGHTNESS] =
+        static_cast<float>(profileSpot.lightness);
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_LC_RADIUS] =
+        static_cast<float>(profileSpot.lcradius);
 
     const auto setTable = [record](int offsetSlot, int activeSlot,
                                    bool active, float offset) {
@@ -1180,55 +1380,18 @@ int LocalAdjustmentsContext::build(int spot, const RtStageBuffer* lab,
      * trans-shapedetect2()'s origblur: gaussianBlur() with radius
      * (2 + 0.2 * lp.blurcol) / sk and sk = 1. The host builds the
      * coefficients; only the SSE path is admitted, so double_path is 0 for
-     * every supported blurcolde.
+     * every supported blurcolde. The vibrance and local-contrast tools use
+     * the same blur at the default radius 3/sk = 3, and local contrast has its
+     * own radius sigma = lcradius / sk.
      */
-    {
-        const double sigma = static_cast<double>(
-            2.0f + 0.2f * lp.blurcol);
-        const GaussianIirCoefficients coefficients =
-            gaussianIirCoefficients(sigma);
-        const auto fill = [&coefficients](RtLabToolsIirDirection& direction) {
-            direction.lane[0] = static_cast<float>(coefficients.B);
-            direction.lane[1] = static_cast<float>(coefficients.b1);
-            direction.lane[2] = static_cast<float>(coefficients.b2);
-            direction.lane[3] = static_cast<float>(coefficients.b3);
-            for (int row = 0; row < 3; ++row) {
-                for (int column = 0; column < 3; ++column) {
-                    const std::size_t index =
-                        4u + static_cast<std::size_t>(row) * 3u +
-                        static_cast<std::size_t>(column);
-                    direction.lane[index] =
-                        static_cast<float>(coefficients.sse_M[row][column]);
-                    direction.border[index] = coefficients.sse_M[row][column];
-                    direction.wide[index] = coefficients.M[row][column];
-                }
-            }
-            direction.border[0] = coefficients.B;
-            direction.border[1] = coefficients.b1;
-            direction.border[2] = coefficients.b2;
-            direction.border[3] = coefficients.b3;
-            direction.wide[0] = coefficients.B;
-            direction.wide[1] = coefficients.b1;
-            direction.wide[2] = coefficients.b2;
-            direction.wide[3] = coefficients.b3;
-        };
-        iir_ = RtLabToolsIir{};
-        iir_.size = sizeof(RtLabToolsIir);
-        iir_.version = RT_LAB_TOOLS_IIR_VERSION;
-        iir_.double_path = sigma >= GAUSS_DOUBLE_LIMIT ? 1u : 0u;
-        fill(iir_.horizontal);
-        fill(iir_.vertical);
-        for (const RtLabToolsIirDirection* direction :
-             {&iir_.horizontal, &iir_.vertical}) {
-            for (std::size_t index = 0; index < RT_LAB_TOOLS_IIR_TERMS;
-                 ++index) {
-                if (!std::isfinite(direction->lane[index]) ||
-                    !std::isfinite(direction->border[index]) ||
-                    !std::isfinite(direction->wide[index])) {
-                    return 1;
-                }
-            }
-        }
+    if (!fillIir(static_cast<double>(2.0f + 0.2f * lp.blurcol), iir_)) {
+        return 1;
+    }
+    if (!fillIir(3.0, iirVib_)) {
+        return 1;
+    }
+    if (!fillIir(static_cast<double>(profileSpot.lcradius), iirLc_)) {
+        return 1;
     }
 
     out.spots = spots_.data();
@@ -1245,6 +1408,8 @@ int LocalAdjustmentsContext::build(int spot, const RtStageBuffer* lab,
     out.munsell_tables = RT_LAB_TOOLS_MUNSELL_TABLES;
     out.clamp_mode = clamp_mode_;
     out.iir = &iir_;
+    out.iir_vibrance = &iirVib_;
+    out.iir_local_contrast = &iirLc_;
     built_ = true;
     return 0;
 }

@@ -9151,6 +9151,9 @@ void ImProcFunctions::localAdjustmentsSpotParams(
     out.ligh = lp.ligh;
     out.struco = lp.struco;
     out.sens = lp.sens;
+    out.sensv = lp.sensv;
+    out.senslc = lp.senslc;
+    out.lcamount = lp.lcamount;
     out.thr = lp.thr;
     out.iterat = lp.iterat;
     out.balance = lp.balance;

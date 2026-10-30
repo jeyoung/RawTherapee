@@ -61,6 +61,8 @@ inline constexpr const char* RT_LOCAL_CONTRAST_CL = R"CLC(
  *
  * Horizontal lines advance by one sample and start `src_base_step` samples
  * apart; vertical lines advance by `src_stride` and start one sample apart.
+ * `src_base`/`dst_base` offset the whole pass, which is how a plane of a
+ * three-plane ROI buffer is addressed without a sub-buffer.
  * `mode` 1 is the double path; `mode` 0 is the SSE path, where the first
  * `vector_lines` lines take the float lane recurrence and the rest take the
  * double recurrence with float stores. `state` is the double forward-state
@@ -75,6 +77,8 @@ __kernel void rt_lab_tools_lc_line(__global const float* src,
                                    const int dst_base_step,
                                    const int src_stride,
                                    const int dst_stride,
+                                   const int src_base,
+                                   const int dst_base,
                                    const int mode,
                                    const int vector_lines,
                                    const float lane_B,
@@ -122,8 +126,8 @@ __kernel void rt_lab_tools_lc_line(__global const float* src,
         return;
     }
 
-    const int sb = line * src_base_step;
-    const int db = line * dst_base_step;
+    const int sb = src_base + line * src_base_step;
+    const int db = dst_base + line * dst_base_step;
     const int last = length - 1;
 
     if (mode != 0) {

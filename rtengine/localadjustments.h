@@ -60,6 +60,11 @@ struct LocalAdjustmentsSpotParams {
     float ligh = 0.f;
     float struco = 0.f;
     int sens = 0;
+    /* The vibrance and local-contrast scope sensitivities and the local
+     * contrast amount, as calcLocalParams() narrows them. */
+    int sensv = 0;
+    int senslc = 0;
+    float lcamount = 0.f;
     float thr = 0.f;
     float iterat = 0.f;
     float balance = 0.f;

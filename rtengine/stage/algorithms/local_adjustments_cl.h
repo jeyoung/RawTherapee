@@ -434,19 +434,19 @@ inline float rt_la_huehsv(const float HH)
 }
 
 /*
- * Copy the spot ROI out of the full Lab image into one plane per channel.
- * This is the host's bufcolorig/origblur copy at the start of the colour
- * block.
+ * Copy the spot ROI out of the full Lab image into a three-plane ROI buffer.
+ * This is the host's bufcolorig/bufgb/tmp1 copy at the start of a tool block.
+ * The destination is one buffer whose planes are `dst_pitch * bfh` apart, the
+ * same layout the three-plane kernels read.
  */
 __kernel void rt_local_adjustments_roi(__global const float* lab,
-                                       __global float* roiL,
-                                       __global float* roiA,
-                                       __global float* roiB,
+                                       __global float* dst,
                                        const int xstart, const int ystart,
                                        const int bfw, const int bfh,
                                        const int lab_pitch,
                                        const int lab_plane,
-                                       const int roi_pitch)
+                                       const int dst_pitch,
+                                       const int dst_plane)
 {
     const int x = (int)get_global_id(0);
     const int y = (int)get_global_id(1);
@@ -454,10 +454,68 @@ __kernel void rt_local_adjustments_roi(__global const float* lab,
         return;
     }
     const int src = (y + ystart) * lab_pitch + (x + xstart);
-    const int dst = y * roi_pitch + x;
-    roiL[dst] = lab[src];
-    roiA[dst] = lab[lab_plane + src];
-    roiB[dst] = lab[2 * lab_plane + src];
+    const int out = y * dst_pitch + x;
+    dst[out] = lab[src];
+    dst[dst_plane + out] = lab[lab_plane + src];
+    dst[2 * dst_plane + out] = lab[2 * lab_plane + src];
+}
+
+/*
+ * transit_shapedetect2()'s per-pixel tail, shared by the fused colour apply and
+ * the standalone blend the vibrance and local-contrast tools use. `ml`/`ma`/
+ * `mb` are the blurred original the deltaE scope compares against, `orig` is
+ * the image before the tool, `fin` is the tool's output and `varsens` the
+ * tool's own sensitivity (`lp.sens`, `lp.sensv` or `lp.senslc`).
+ */
+inline void rt_la_scope_blend(const float origL, const float origA,
+                              const float origB, const float finL,
+                              const float finA, const float finB,
+                              const float ml, const float ma, const float mb,
+                              const float localFactor, const float varsens,
+                              __global const float* rec, float* outL,
+                              float* outA, float* outB)
+{
+    const float refa = rec[RT_LA_CHROMAREF] * cos(rec[RT_LA_HUEREF]) * 327.68f;
+    const float refb = rec[RT_LA_CHROMAREF] * sin(rec[RT_LA_HUEREF]) * 327.68f;
+    const float refL = rec[RT_LA_LUMAREF] * 327.68f;
+
+    const float abdelta2 = (refa - ma) * (refa - ma) +
+                           (refb - mb) * (refb - mb);
+    const float chrodelta2 =
+        (sqrt(ma * ma + mb * mb) - rec[RT_LA_CHROMAREF] * 327.68f) *
+        (sqrt(ma * ma + mb * mb) - rec[RT_LA_CHROMAREF] * 327.68f);
+    const float huedelta2 = abdelta2 - chrodelta2;
+
+    const float kL = rec[RT_LA_BALANCE] / (327.68f * 327.68f);
+    const float kab = rt_la_balancedeltaE(rec[RT_LA_BALANCE]) /
+                      (327.68f * 327.68f);
+    const float kH = rec[RT_LA_BALANCEH];
+    const float kch = rt_la_balancedeltaE(rec[RT_LA_BALANCEH]);
+    const float dE = sqrt(kab * (kch * chrodelta2 + kH * huedelta2) +
+                          kL * (refL - ml) * (refL - ml));
+
+    const float thr = rec[RT_LA_THR];
+    const float mindE = 2.0f + RT_LA_MINSCOPE * varsens * thr;
+    const float maxdE = 5.0f + RT_LA_MAXSCOPE * varsens * (1.0f + 0.1f * thr);
+    const float mindElim = 2.0f + RT_LA_MINSCOPE * (float)RT_LA_LIMSCOPE * thr;
+    const float maxdElim =
+        5.0f + RT_LA_MAXSCOPE * (float)RT_LA_LIMSCOPE * (1.0f + 0.1f * thr);
+
+    float reducdE = rt_la_calcreducdE(
+        dE, maxdE, mindE, maxdElim, mindElim, rec[RT_LA_ITERAT],
+        RT_LA_LIMSCOPE, (int)varsens);
+    if (varsens == 100.0f) {
+        reducdE = 1.0f;
+    }
+
+    const float realstrdE = reducdE * (finL - origL);
+    const float realstradE = reducdE * (finA - origA);
+    const float realstrbdE = reducdE * (finB - origB);
+
+    /* clipLoc() is the identity in this build; keep the host's expression. */
+    *outL = origL + localFactor * realstrdE;
+    *outA = rt_la_clipC(origA + localFactor * realstradE);
+    *outB = rt_la_clipC(origB + localFactor * realstrbdE);
 }
 
 /*
@@ -615,54 +673,69 @@ __kernel void rt_local_adjustments_apply(__global float* lab,
         return;
     }
 
-    const float refa = rec[RT_LA_CHROMAREF] * cos(rec[RT_LA_HUEREF]) * 327.68f;
-    const float refb = rec[RT_LA_CHROMAREF] * sin(rec[RT_LA_HUEREF]) * 327.68f;
-    const float refL = rec[RT_LA_LUMAREF] * 327.68f;
-
     const int bo = ry * blur_pitch + rx;
-    const float ml = blurL[bo];
-    const float ma = blurA[bo];
-    const float mb = blurB[bo];
+    float blendedL = 0.0f;
+    float blendedA = 0.0f;
+    float blendedB = 0.0f;
+    rt_la_scope_blend(origL, origA, origB, corrL, corrA, corrB, blurL[bo],
+                      blurA[bo], blurB[bo], localFactor, rec[RT_LA_SENS], rec,
+                      &blendedL, &blendedA, &blendedB);
+    lab[offset] = blendedL;
+    lab[lab_plane + offset] = blendedA;
+    lab[2 * lab_plane + offset] = blendedB;
+}
 
-    const float abdelta2 = (refa - ma) * (refa - ma) +
-                           (refb - mb) * (refb - mb);
-    const float chrodelta2 =
-        (sqrt(ma * ma + mb * mb) - rec[RT_LA_CHROMAREF] * 327.68f) *
-        (sqrt(ma * ma + mb * mb) - rec[RT_LA_CHROMAREF] * 327.68f);
-    const float huedelta2 = abdelta2 - chrodelta2;
-
-    const float kL = rec[RT_LA_BALANCE] / (327.68f * 327.68f);
-    const float kab = rt_la_balancedeltaE(rec[RT_LA_BALANCE]) /
-                      (327.68f * 327.68f);
-    const float kH = rec[RT_LA_BALANCEH];
-    const float kch = rt_la_balancedeltaE(rec[RT_LA_BALANCEH]);
-    const float dE = sqrt(kab * (kch * chrodelta2 + kH * huedelta2) +
-                          kL * (refL - ml) * (refL - ml));
-
-    const float varsens = rec[RT_LA_SENS];
-    const float thr = rec[RT_LA_THR];
-    const float mindE = 2.0f + RT_LA_MINSCOPE * varsens * thr;
-    const float maxdE = 5.0f + RT_LA_MAXSCOPE * varsens * (1.0f + 0.1f * thr);
-    const float mindElim = 2.0f + RT_LA_MINSCOPE * (float)RT_LA_LIMSCOPE * thr;
-    const float maxdElim =
-        5.0f + RT_LA_MAXSCOPE * (float)RT_LA_LIMSCOPE * (1.0f + 0.1f * thr);
-
-    float reducdE = rt_la_calcreducdE(
-        dE, maxdE, mindE, maxdElim, mindElim, rec[RT_LA_ITERAT],
-        RT_LA_LIMSCOPE, (int)varsens);
-    if (varsens == 100.0f) {
-        reducdE = 1.0f;
+/*
+ * The standalone blend for the vibrance and local-contrast tools: the tool has
+ * already written its output into the ROI buffer `fin`, and the original is
+ * still the full-image pixel. `varsens` is lp.sensv or lp.senslc.
+ */
+__kernel void rt_local_adjustments_blend(__global float* lab,
+                                         __global const float* fin,
+                                         __global const float* blurL,
+                                         __global const float* blurA,
+                                         __global const float* blurB,
+                                         __global const float* rec,
+                                         const int lab_pitch,
+                                         const int lab_plane,
+                                         const int fin_pitch,
+                                         const int fin_plane,
+                                         const int bfw, const int bfh,
+                                         const int xstart, const int ystart,
+                                         const int blur_pitch,
+                                         const float varsens)
+{
+    const int rx = (int)get_global_id(0);
+    const int ry = (int)get_global_id(1);
+    if (rx >= bfw || ry >= bfh) {
+        return;
     }
 
-    const float factor = localFactor;
-    const float realstrdE = reducdE * (corrL - origL);
-    const float realstradE = reducdE * (corrA - origA);
-    const float realstrbdE = reducdE * (corrB - origB);
+    const int x = rx + xstart;
+    const int y = ry + ystart;
+    int zone = 0;
+    float localFactor = 1.0f;
+    const float achm = rec[RT_LA_TRANS] / 100.0f;
+    rt_la_transition((float)x, (float)y, achm, rec, &zone, &localFactor);
+    if (zone == 0) {
+        return;
+    }
 
-    /* clipLoc() is the identity in this build; keep the host's expression. */
-    lab[offset] = origL + factor * realstrdE;
-    lab[lab_plane + offset] = rt_la_clipC(origA + factor * realstradE);
-    lab[2 * lab_plane + offset] = rt_la_clipC(origB + factor * realstrbdE);
+    const int offset = y * lab_pitch + x;
+    const int fo = ry * fin_pitch + rx;
+    const int bo = ry * blur_pitch + rx;
+
+    float blendedL = 0.0f;
+    float blendedA = 0.0f;
+    float blendedB = 0.0f;
+    rt_la_scope_blend(lab[offset], lab[lab_plane + offset],
+                      lab[2 * lab_plane + offset], fin[fo],
+                      fin[fin_plane + fo], fin[2 * fin_plane + fo],
+                      blurL[bo], blurA[bo], blurB[bo], localFactor, varsens,
+                      rec, &blendedL, &blendedA, &blendedB);
+    lab[offset] = blendedL;
+    lab[lab_plane + offset] = blendedA;
+    lab[2 * lab_plane + offset] = blendedB;
 }
 
 /*

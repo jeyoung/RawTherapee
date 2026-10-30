@@ -41,30 +41,32 @@ struct ProcParams;
 /*
  * Host context of the local.adjustments node.
  *
- * The node covers the colour-only spot set of ImProcFunctions::Lab_Local():
- * an elliptical or rectangular spot, the chroma/lightness/contrast sliders,
- * the optional L/C/H curves, the deltaE scope, the avoid-colour-shift Munsell
- * method and the unconditional per-spot Lab-to-RGB clamp. The block also
- * applies the final Munsell pass and the clamp for an inactive spot, so a
- * block whose spots do no colour work is still a clamp-only block.
+ * The node covers a spot set of ImProcFunctions::Lab_Local(): an elliptical or
+ * rectangular spot, the Colour & Light chroma/lightness/contrast sliders and
+ * L/C/H curves, the vibrance tool, the Gaussian local-contrast tool, the deltaE
+ * scope, the avoid-colour-shift Munsell method and the unconditional per-spot
+ * Lab-to-RGB clamp. The block also applies the final Munsell pass and the clamp
+ * for an inactive spot, so a block whose spots do no tool work is still a
+ * clamp-only block.
  *
- * The context is C-compatible because the ABI is. `self` points at the C++
- * object that owns the ProcParams, ImProcFunctions and LabImage references, so
- * the pointer must not outlive them.
+ * The tools run in Lab_Local()'s order: vibrance, local contrast, then Colour &
+ * Light. The context is C-compatible because the ABI is. `self` points at the
+ * C++ object that owns the ProcParams, ImProcFunctions and LabImage references,
+ * so the pointer must not outlive them.
  *
  * The per-spot record is a flat float table rather than a structure mirrored
  * between C++ and the device: Lab_Local() takes 270 parameters and only a
- * small, known subset reaches the colour path. Slots are named by the
+ * small, known subset reaches the supported paths. Slots are named by the
  * RT_LOCAL_ADJUSTMENTS_SLOT_* constants and are written once per spot.
  */
-#define RT_LOCAL_ADJUSTMENTS_CONTEXT_VERSION 1u
+#define RT_LOCAL_ADJUSTMENTS_CONTEXT_VERSION 2u
 /* "LAJC": rejects a stale or unrelated pointer before any callback runs. */
 #define RT_LOCAL_ADJUSTMENTS_CONTEXT_MAGIC 0x4C414A43u
 /* The block has no bounded spot count, but a profile that carries more spots
  * than this is outside the device set and runs the host block. */
 #define RT_LOCAL_ADJUSTMENTS_MAX_SPOTS 64u
 /* Floats per spot record; the slot constants below must stay inside it. */
-#define RT_LOCAL_ADJUSTMENTS_SPOT_STRIDE 66u
+#define RT_LOCAL_ADJUSTMENTS_SPOT_STRIDE 82u
 /* A curve table is one LUTf of the block's own size. */
 #define RT_LOCAL_ADJUSTMENTS_LUT_ENTRIES 65536u
 #define RT_LOCAL_ADJUSTMENTS_LIGHT_LUT_ENTRIES 32770u
@@ -169,6 +171,29 @@ struct ProcParams;
 #define RT_LOCAL_ADJUSTMENTS_SLOT_ADJUSTR 63u
 #define RT_LOCAL_ADJUSTMENTS_SLOT_AMOUNTCHROM 64u
 #define RT_LOCAL_ADJUSTMENTS_SLOT_AVOIDNEG 65u
+/* Vibrance. EXP_VIBRANCE is 1 when the tool would change a pixel, which needs
+ * the tool on, the spot active, a non-zero slider or a non-identity skin
+ * curve; the host's gamma, gradients, warm/ciecam path and masks are
+ * residuals. The skin curve is a 65536-entry table in the result's flat set. */
+#define RT_LOCAL_ADJUSTMENTS_SLOT_EXPVIBRANCE 66u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_SENSV 67u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_VIB_PASTELS 68u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_VIB_SATURATED 69u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_VIB_THR_TOP 70u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_VIB_THR_BOTTOM 71u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_VIB_PROTECTSKINS 72u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_VIB_AVOIDCOLORSHIFT 73u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_VIB_SKIN_OFFSET 74u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_VIB_SKIN_ACTIVE 75u
+/* Local contrast. EXP_CONTRAST is 1 when the tool would change a pixel, which
+ * needs the tool on, the spot active and a non-zero amount. The Gaussian
+ * radius and its coefficients are the separate result member. */
+#define RT_LOCAL_ADJUSTMENTS_SLOT_EXPCONTRAST 76u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_SENSLC 77u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_LC_AMOUNT 78u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_LC_DARKNESS 79u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_LC_LIGHTNESS 80u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_LC_RADIUS 81u
 
 typedef struct RtLocalAdjustmentsResult {
     /* spot_count RT_LOCAL_ADJUSTMENTS_SPOT_STRIDE floats, spot-major. */
@@ -198,6 +223,13 @@ typedef struct RtLocalAdjustmentsResult {
      * (2 + 0.2 * blurcolde) / sk with sk = 1. Only the SSE path is admitted;
      * the launcher refuses double_path. */
     const RtLabToolsIir* iir;
+    /* The same coefficients at sigma 3/sk = 3, the deltaE reference radius
+     * transit_shapedetect2() uses for the vibrance (senstype 2) and local
+     * contrast (senstype 10) tools. Only the SSE path is admitted. */
+    const RtLabToolsIir* iir_vibrance;
+    /* Local contrast's own Gaussian, sigma = lcradius / sk. Both the SSE and
+     * the double path are admitted; the launcher reads double_path. */
+    const RtLabToolsIir* iir_local_contrast;
 } RtLocalAdjustmentsResult;
 
 typedef struct RtLocalAdjustmentsContext {
@@ -241,13 +273,15 @@ namespace rtengine::stage
  * Whether the whole block is the local.adjustments node's supported set: every
  * spot is a normal (not exclude/full/main) elliptical or rectangular spot with
  * no recursion, inversion, explicit mask, soft radius, merge, gradient, Lab
- * grid, RGB curve, exposure curve or tool other than Colour & Light, and the
- * block has no pre-CBDL or dehaze pass.
+ * grid, RGB curve, exposure curve or tool outside the set. An active spot runs
+ * any combination of Colour & Light, vibrance and local contrast; the vibrance
+ * and local-contrast variants and ranges are checked separately. The block has
+ * no pre-CBDL or dehaze pass.
  *
  * The predicate is block-level on purpose: the block is atomic, so one spot
  * outside the set makes every spot a host execution. An inactive spot is
- * supported: it does no colour work, but the block's per-spot clamp still
- * runs, and that clamp is part of the node.
+ * supported: it does no tool work, but the block's per-spot clamp still runs,
+ * and that clamp is part of the node.
  */
 bool localAdjustmentsSupported(const procparams::ProcParams& params);
 
@@ -344,6 +378,8 @@ private:
     std::vector<float> munsell_;
     std::vector<float> munsell_sizes_;
     RtLabToolsIir iir_ = {};
+    RtLabToolsIir iirVib_ = {};
+    RtLabToolsIir iirLc_ = {};
     uint32_t clamp_mode_ = RT_LOCAL_ADJUSTMENTS_CLAMP_NONE;
 };
 
