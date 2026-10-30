@@ -75,6 +75,16 @@ struct LocalAdjustmentsSpotParams {
     int senssf = 0;
     bool sfena = false;
     int softmet = 0;
+    /* Local CBDL, as calcLocalParams() narrows it. cbdlena is the host's
+     * enabled-and-unmasked predicate; mulloc is the per-level multiplier
+     * after the block's 0..4 clamp. */
+    bool cbdlena = false;
+    int senscb = 0;
+    float threshol = 0.f;
+    float clarityml = 0.f;
+    float contresid = 0.f;
+    float chromacb = 0.f;
+    float mulloc[6] = {};
     float thr = 0.f;
     float iterat = 0.f;
     float balance = 0.f;

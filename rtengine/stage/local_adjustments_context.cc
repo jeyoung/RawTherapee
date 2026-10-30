@@ -21,6 +21,7 @@
 
 #include "color.h"
 #include "curves.h"
+#include "dirpyr_equalizer.h"
 #include "gauss.h"
 #include "iccstore.h"
 #include "imagefloat.h"
@@ -107,14 +108,61 @@ bool explicitMaskIdle(const procparams::LocallabParams::LocallabSpot& spot)
            !spot.enacieMaskall;
 }
 
-/* Every tool other than the five this node runs. The exposure tool also
+/* Every tool other than the six this node runs. The exposure tool also
  * decides the clamp arm; it is a residual here. */
 bool otherToolEnabled(const procparams::LocallabParams::LocallabSpot& spot)
 {
     return spot.expexpose || spot.expblur ||
            spot.exptonemap || spot.expreti || spot.expsharp ||
-           spot.expcbdl || spot.explog || spot.expmask || spot.expcie ||
+           spot.explog || spot.expmask || spot.expcie ||
            spot.expprecam;
+}
+
+/* Whether the local CBDL tool's parameters are inside the device set.
+ *
+ * The block's guard is
+ *   (any mulloc != 1 || clarityml != 0 || contresid != 0 || enacbMask ||
+ *    showmaskcbmet 2/3/4 || prevdE) && cbdlena
+ * and the export call site passes no mask selector and no previous-deltaE
+ * flag, so with the explicit mask already excluded by the block predicate the
+ * tool runs whenever cbdlena is set. The block's own ROI guard (bfw > 65 and
+ * bfh > 65) is applied when the record is built; a smaller ROI is a no-op,
+ * not a residual.
+ *
+ * contresid is a residual: the block builds a DiagonalCurve from the mean of
+ * the coarsest decomposition, which is image data. The other parameters are
+ * the GUI's ranges and feed the block's own dirpyrFillLut() and multipliers.
+ * Soft radius (softradiuscb) is a residual, as is an explicit mask. */
+bool cbdlAdmitted(const procparams::LocallabParams::LocallabSpot& spot)
+{
+    if (spot.softradiuscb != 0.0) {
+        return false;
+    }
+    if (spot.contresid != 0.0) {
+        return false;
+    }
+    if (!finiteValue(spot.chromacbdl) || spot.chromacbdl < 0.0 ||
+        spot.chromacbdl > 1.5) {
+        return false;
+    }
+    if (!finiteValue(spot.threshold) || spot.threshold < 0.0 ||
+        spot.threshold > 1.0) {
+        return false;
+    }
+    if (!finiteValue(spot.clarityml) || spot.clarityml < 0.1 ||
+        spot.clarityml > 100.0) {
+        return false;
+    }
+    if (spot.sensicb < 0 || spot.sensicb > 100) {
+        return false;
+    }
+    for (double multiplier : spot.mult) {
+        if (!finiteValue(multiplier) || multiplier < 0.0 ||
+            multiplier > 4.0) {
+            return false;
+        }
+    }
+    return true;
 }
 
 /* Whether the shadows/highlights tool's parameters are inside the device set.
@@ -322,7 +370,7 @@ bool localAdjustmentsSupported(const procparams::ProcParams& params)
 {
     /*
      * The block is atomic: every spot must be in the set below. An inactive
-     * spot is the clamp-only case; an active spot runs Colour & Light,
+     * spot is the clamp-only case; an active spot runs CBDL, Colour & Light,
      * vibrance, shadows/highlights (Lab-mode std), soft light (per-pixel
      * soft), local contrast or any combination, with optional L/C/H curves on
      * the colour tool and MUNS. Curves, Munsell, rectangular spots, inactive
@@ -426,13 +474,16 @@ bool localAdjustmentsSupported(const procparams::ProcParams& params)
             spot.transitgrad < -10.0 || spot.transitgrad > 10.0) {
             return false;
         }
-        /* An active spot runs at least one of the five tools in the device
+        /* An active spot runs at least one of the six tools in the device
          * set; an inactive spot does no work, so its tool settings are inert
          * and admitted. */
         if (spot.activ) {
             if ((!spot.expcolor && !spot.expvibrance && !spot.expcontrast &&
-                 !spot.expshadhigh && !spot.expsoft) ||
+                 !spot.expshadhigh && !spot.expsoft && !spot.expcbdl) ||
                 otherToolEnabled(spot)) {
+                return false;
+            }
+            if (spot.expcbdl && !cbdlAdmitted(spot)) {
                 return false;
             }
             if (spot.expvibrance && !vibranceAdmitted(spot)) {
@@ -1364,6 +1415,119 @@ int LocalAdjustmentsContext::build(int spot, const RtStageBuffer* lab,
     const bool softLightRun = profileSpot.expsoft && lp.activspot &&
                               lp.softmet == 0 && lp.strng > 1.f;
 
+    /*
+     * Local CBDL. cbdl_local_temp() trims the trailing identity levels, then
+     * decomposes every level up to the last non-identity one. The luminance
+     * pass uses lp.mulloc directly; the chroma pass derives
+     * max(chromacb * (mulloc - 1) + 1, 0.01) per level. The range table of
+     * each level is the block's own dirpyrFillLut(). The block itself does no
+     * CBDL work when the ROI is 65 px or narrower on either axis.
+     */
+    const int cbdlX0 = std::max(
+        static_cast<int>(lp.xc - lp.lxL), 0);
+    const int cbdlY0 = std::max(
+        static_cast<int>(lp.yc - lp.lyT), 0);
+    const int cbdlX1 = std::min(
+        static_cast<int>(lp.xc + lp.lx), fw_);
+    const int cbdlY1 = std::min(
+        static_cast<int>(lp.yc + lp.ly), fh_);
+    const bool cbdlRoi =
+        lp.cbdlena && cbdlX1 - cbdlX0 >= RT_LOCAL_ADJUSTMENTS_CBDL_MIN_ROI &&
+        cbdlY1 - cbdlY0 >= RT_LOCAL_ADJUSTMENTS_CBDL_MIN_ROI;
+    int cbdlLumaLevels = 0;
+    int cbdlChromaLevels = 0;
+    float cbdlLumaMult[RT_LOCAL_ADJUSTMENTS_CBDL_LEVELS] = {};
+    float cbdlChromaMult[RT_LOCAL_ADJUSTMENTS_CBDL_LEVELS] = {};
+    /*
+     * Lab_Local() forces the coarsest level on when clarity or the residual
+     * contrast is set and the user left level 5 neutral. The clarity merge
+     * reads that level, so the block mutates its local copy of mulloc before
+     * cbdl_local_temp(). The record carries the same effective multipliers.
+     */
+    for (uint32_t level = 0; level < RT_LOCAL_ADJUSTMENTS_CBDL_LEVELS;
+         ++level) {
+        cbdlLumaMult[level] = lp.mulloc[level];
+    }
+    if ((lp.clarityml != 0.f || lp.contresid != 0.f) &&
+        cbdlLumaMult[RT_LOCAL_ADJUSTMENTS_CBDL_LEVELS - 1] == 1.f) {
+        cbdlLumaMult[RT_LOCAL_ADJUSTMENTS_CBDL_LEVELS - 1] = 1.001f;
+    }
+    /*
+     * The chroma block also forces its finest level on when the clarity
+     * merge (or the residual contrast) is set and level 0 was neutral. The
+     * mutation happens after the luminance pass, so it affects the chroma
+     * multipliers only.
+     */
+    float chromaEffective[RT_LOCAL_ADJUSTMENTS_CBDL_LEVELS] = {};
+    for (uint32_t level = 0; level < RT_LOCAL_ADJUSTMENTS_CBDL_LEVELS;
+         ++level) {
+        chromaEffective[level] = cbdlLumaMult[level];
+    }
+    const float clarich = 0.5f * lp.clarityml;
+    if ((clarich > 0.f || lp.contresid != 0.f) && chromaEffective[0] == 1.f) {
+        chromaEffective[0] = 1.01f;
+    }
+    for (uint32_t level = 0; level < RT_LOCAL_ADJUSTMENTS_CBDL_LEVELS;
+         ++level) {
+        cbdlChromaMult[level] = std::max(
+            lp.chromacb * (chromaEffective[level] - 1.f) + 1.f, 0.01f);
+    }
+    if (cbdlRoi) {
+        cbdlLumaLevels = static_cast<int>(
+            RT_LOCAL_ADJUSTMENTS_CBDL_LEVELS);
+        while (cbdlLumaLevels > 0 &&
+               std::fabs(cbdlLumaMult[cbdlLumaLevels - 1] - 1.f) < 0.001f) {
+            --cbdlLumaLevels;
+        }
+        cbdlChromaLevels = static_cast<int>(
+            RT_LOCAL_ADJUSTMENTS_CBDL_LEVELS);
+        while (cbdlChromaLevels > 0 &&
+               std::fabs(cbdlChromaMult[cbdlChromaLevels - 1] - 1.f) <
+                   0.001f) {
+            --cbdlChromaLevels;
+        }
+    }
+    const bool cbdlLumaRun = cbdlRoi && cbdlLumaLevels > 0;
+    const bool cbdlChromaRun =
+        cbdlRoi && lp.chromacb > 0.f && cbdlChromaLevels > 0;
+    const auto buildCbdlTables = [&](const float* mult, int levels,
+                                     std::vector<float>& tables) {
+        tables.resize(static_cast<std::size_t>(levels) *
+                      RT_LOCAL_ADJUSTMENTS_CBDL_LUT_ENTRIES);
+        for (int level = 0; level < levels; ++level) {
+            LUTf table(static_cast<int>(
+                RT_LOCAL_ADJUSTMENTS_CBDL_LUT_ENTRIES));
+            dirpyrFillLut(table, level, static_cast<double>(lp.threshol),
+                          mult[level], 0.f);
+            float* target =
+                tables.data() +
+                static_cast<std::size_t>(level) *
+                    RT_LOCAL_ADJUSTMENTS_CBDL_LUT_ENTRIES;
+            for (uint32_t index = 0;
+                 index < RT_LOCAL_ADJUSTMENTS_CBDL_LUT_ENTRIES; ++index) {
+                target[index] = table[static_cast<int>(index)];
+            }
+        }
+    };
+    std::vector<float> cbdlLumaTables;
+    std::vector<float> cbdlChromaTables;
+    float cbdlLumaOffset = RT_LOCAL_ADJUSTMENTS_NO_LUT;
+    float cbdlChromaOffset = RT_LOCAL_ADJUSTMENTS_NO_LUT;
+    if (cbdlLumaRun) {
+        buildCbdlTables(cbdlLumaMult, cbdlLumaLevels, cbdlLumaTables);
+        cbdlLumaOffset = appendSamples(cbdlLumaTables);
+        if (cbdlLumaOffset == RT_LOCAL_ADJUSTMENTS_NO_LUT) {
+            return 1;
+        }
+    }
+    if (cbdlChromaRun) {
+        buildCbdlTables(cbdlChromaMult, cbdlChromaLevels, cbdlChromaTables);
+        cbdlChromaOffset = appendSamples(cbdlChromaTables);
+        if (cbdlChromaOffset == RT_LOCAL_ADJUSTMENTS_NO_LUT) {
+            return 1;
+        }
+    }
+
     float* record = spots_.data();
     record[RT_LOCAL_ADJUSTMENTS_SLOT_XC] = lp.xc;
     record[RT_LOCAL_ADJUSTMENTS_SLOT_YC] = lp.yc;
@@ -1486,6 +1650,23 @@ int LocalAdjustmentsContext::build(int spot, const RtStageBuffer* lab,
     record[RT_LOCAL_ADJUSTMENTS_SLOT_SOFT_STRENGTH] = lp.strng;
     record[RT_LOCAL_ADJUSTMENTS_SLOT_SENSSOFT] =
         static_cast<float>(lp.senssf);
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_EXPCBDL] =
+        (cbdlLumaRun || cbdlChromaRun) ? 1.f : 0.f;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_SENSCB] =
+        static_cast<float>(lp.senscb);
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_CBDL_THRESHOLD] = lp.threshol;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_CBDL_CLARITY] = lp.clarityml;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_CBDL_CHROMA] = lp.chromacb;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_CBDL_MULT0] = cbdlLumaMult[0];
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_CBDL_MULT1] = cbdlLumaMult[1];
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_CBDL_MULT2] = cbdlLumaMult[2];
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_CBDL_MULT3] = cbdlLumaMult[3];
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_CBDL_MULT4] = cbdlLumaMult[4];
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_CBDL_MULT5] = cbdlLumaMult[5];
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_CBDL_LUMA_LEVELS] =
+        cbdlLumaRun ? static_cast<float>(cbdlLumaLevels) : 0.f;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_CBDL_CHROMA_LEVELS] =
+        cbdlChromaRun ? static_cast<float>(cbdlChromaLevels) : 0.f;
 
     const auto setTable = [record](int offsetSlot, int activeSlot,
                                    bool active, float offset) {
@@ -1547,6 +1728,12 @@ int LocalAdjustmentsContext::build(int spot, const RtStageBuffer* lab,
              RT_LOCAL_ADJUSTMENTS_SLOT_SH_SH_ACTIVE,
              shShadowOffset != RT_LOCAL_ADJUSTMENTS_NO_LUT,
              shShadowOffset);
+    setTable(RT_LOCAL_ADJUSTMENTS_SLOT_CBDL_LUMA_OFFSET,
+             RT_LOCAL_ADJUSTMENTS_SLOT_CBDL_LUMA_ACTIVE, cbdlLumaRun,
+             cbdlLumaOffset);
+    setTable(RT_LOCAL_ADJUSTMENTS_SLOT_CBDL_CHROMA_OFFSET,
+             RT_LOCAL_ADJUSTMENTS_SLOT_CBDL_CHROMA_ACTIVE, cbdlChromaRun,
+             cbdlChromaOffset);
 
     /*
      * trans-shapedetect2()'s origblur: gaussianBlur() with radius

@@ -9160,6 +9160,15 @@ void ImProcFunctions::localAdjustmentsSpotParams(
     out.senssf = lp.senssf;
     out.sfena = lp.sfena;
     out.softmet = lp.softmet;
+    out.cbdlena = lp.cbdlena;
+    out.senscb = lp.senscb;
+    out.threshol = lp.threshol;
+    out.clarityml = lp.clarityml;
+    out.contresid = lp.contresid;
+    out.chromacb = lp.chromacb;
+    for (int level = 0; level < 6; ++level) {
+        out.mulloc[level] = lp.mulloc[level];
+    }
     out.thr = lp.thr;
     out.iterat = lp.iterat;
     out.balance = lp.balance;

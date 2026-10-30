@@ -20,6 +20,7 @@
 #pragma once
 
 #include "stage/algorithms/lab_tools_cl.h"
+#include "stage/algorithms/lab_wavelet_cl.h"
 #include "stage/algorithms/lab_regions_cl.h"
 #include "stage/algorithms/local_contrast_cl.h"
 #include "stage/algorithms/munsell_lch_cl.h"
@@ -34,7 +35,7 @@
  * trip, the caches and the LUT access), the local-contrast IIR line kernel,
  * the Sleef xatan2f/xsincosf port and the lab.regions xlogf/xexpf port. It
  * adds the single-spot colour apply, the ROI copy, the per-pixel soft-light
- * curve, the ROI Gaussian and the full-image clamp.
+ * curve, the local CBDL pyramid/blends, and the full-image clamp.
  *
  * The record slots are the host's RT_LOCAL_ADJUSTMENTS_SLOT_* values; the
  * device source repeats the small subset it reads so the program is
@@ -99,6 +100,23 @@ inline constexpr const char* RT_LOCAL_ADJUSTMENTS_CL = R"CLC(
 #define RT_LA_EXPSOFT 94
 #define RT_LA_SOFT_STRENGTH 95
 #define RT_LA_SENSSOFT 96
+#define RT_LA_EXPCBDL 97
+#define RT_LA_SENSCB 98
+#define RT_LA_CBDL_THRESHOLD 99
+#define RT_LA_CBDL_CLARITY 100
+#define RT_LA_CBDL_CHROMA 101
+#define RT_LA_CBDL_MULT0 102
+#define RT_LA_CBDL_MULT1 103
+#define RT_LA_CBDL_MULT2 104
+#define RT_LA_CBDL_MULT3 105
+#define RT_LA_CBDL_MULT4 106
+#define RT_LA_CBDL_MULT5 107
+#define RT_LA_CBDL_LUMA_LEVELS 108
+#define RT_LA_CBDL_CHROMA_LEVELS 109
+#define RT_LA_CBDL_LUMA_OFFSET 110
+#define RT_LA_CBDL_LUMA_ACTIVE 111
+#define RT_LA_CBDL_CHROMA_OFFSET 112
+#define RT_LA_CBDL_CHROMA_ACTIVE 113
 
 /*
  * The number of trailing columns the host takes through its scalar path.
@@ -742,6 +760,237 @@ __kernel void rt_local_adjustments_blend(__global float* lab,
 }
 
 /*
+ * Local CBDL. cbdl_local_temp() is the lab.wavelet node's directional
+ * pyramid: dirpyr_channel() and idirpyr_eq_channel_loc() are the
+ * rt_lab_wavelet_decompose/rt_lab_wavelet_equalize kernels with the block's
+ * host-built range tables, and skin protection is always zero in the local
+ * tool. These kernels add the ROI source, the final level merge and the two
+ * transit_shapedetect() blends (senstype 6 for L, 7 for chroma).
+ */
+
+/* The tool's source plane: 0 copies L, 1 is sqrt(a * a + b * b). */
+__kernel void rt_local_adjustments_cbdl_fill(__global const float* work,
+                                             const int work_pitch,
+                                             const int work_plane,
+                                             __global float* dst,
+                                             const int dst_pitch,
+                                             const int bfw, const int bfh,
+                                             const int mode)
+{
+    const int x = (int)get_global_id(0);
+    const int y = (int)get_global_id(1);
+    if (x >= bfw || y >= bfh) {
+        return;
+    }
+    const int in = y * work_pitch + x;
+    const float value =
+        mode == 0
+            ? work[in]
+            : sqrt(work[work_plane + in] * work[work_plane + in] +
+                   work[2 * work_plane + in] * work[2 * work_plane + in]);
+    dst[y * dst_pitch + x] = value;
+}
+
+/* residbuff's seed: the coarsest pyramid level, before reconstruction. */
+__kernel void rt_local_adjustments_cbdl_copy(__global const float* src,
+                                             const int src_pitch,
+                                             __global float* dst,
+                                             const int dst_pitch,
+                                             const int bfw, const int bfh)
+{
+    const int x = (int)get_global_id(0);
+    const int y = (int)get_global_id(1);
+    if (x >= bfw || y >= bfh) {
+        return;
+    }
+    dst[y * dst_pitch + x] = src[y * src_pitch + x];
+}
+
+/*
+ * cbdl_local_temp()'s tail: loct is residbuff clamped to [0, 32768], and the
+ * clarity merge is (1 + clar) * loct - clar * resid5, clamped again. `resid5`
+ * is the untouched coarsest level; the reconstruction writes a separate copy.
+ */
+__kernel void rt_local_adjustments_cbdl_finish(__global const float* resid,
+                                               const int resid_pitch,
+                                               __global const float* resid5,
+                                               const int resid5_pitch,
+                                               __global float* out,
+                                               const int out_pitch,
+                                               const int bfw, const int bfh,
+                                               const float clar)
+{
+    const int x = (int)get_global_id(0);
+    const int y = (int)get_global_id(1);
+    if (x >= bfw || y >= bfh) {
+        return;
+    }
+    const float loct = fmax(0.0f, fmin(resid[y * resid_pitch + x], 32768.0f));
+    float value = loct;
+    if (clar > 0.0f) {
+        value = (1.0f + clar) * loct -
+                clar * resid5[y * resid5_pitch + x];
+        value = fmax(0.0f, fmin(value, 32768.0f));
+    }
+    out[y * out_pitch + x] = value;
+}
+
+/*
+ * The chroma pass's normaliser. bufchrom is
+ * loctemp->L - sqrt(a * a + b * b); the block scales it by
+ * 1 / (0.01 * max |value|). One work item per row scans the row and writes its
+ * max magnitude, which the host reduces with the block's own expression.
+ */
+__kernel void rt_local_adjustments_cbdl_metric(__global const float* out,
+                                               const int out_pitch,
+                                               __global const float* lab,
+                                               const int lab_pitch,
+                                               const int lab_plane,
+                                               const int xstart,
+                                               const int ystart,
+                                               const int bfw, const int bfh,
+                                               __global float* rowmax)
+{
+    const int ry = (int)get_global_id(0);
+    if (ry >= bfh) {
+        return;
+    }
+    float magnitude = 0.0f;
+    for (int rx = 0; rx < bfw; ++rx) {
+        const int offset = (ry + ystart) * lab_pitch + (rx + xstart);
+        const float a = lab[lab_plane + offset];
+        const float b = lab[2 * lab_plane + offset];
+        const float raw =
+            out[ry * out_pitch + rx] - sqrt(a * a + b * b);
+        magnitude = fmax(magnitude, fabs(raw));
+    }
+    rowmax[ry] = magnitude;
+}
+
+/* transit_shapedetect()'s deltaE for the CBDL passes. The reference is the
+ * blurred original ROI; only the lightness balance weights are read, exactly
+ * as in the senstype 6/7 arm. */
+inline float rt_la_cbdl_deltae(__global const float* rec, const float blurL,
+                               const float blurA, const float blurB)
+{
+    const float refa = rec[RT_LA_CHROMAREF] * cos(rec[RT_LA_HUEREF]) * 327.68f;
+    const float refb = rec[RT_LA_CHROMAREF] * sin(rec[RT_LA_HUEREF]) * 327.68f;
+    const float refL = rec[RT_LA_LUMAREF] * 327.68f;
+    const float kL = rec[RT_LA_BALANCE] / (327.68f * 327.68f);
+    const float kab = rt_la_balancedeltaE(rec[RT_LA_BALANCE]) /
+                      (327.68f * 327.68f);
+    return sqrt(kab * ((refa - blurA) * (refa - blurA) +
+                       (refb - blurB) * (refb - blurB)) +
+                kL * (refL - blurL) * (refL - blurL));
+}
+
+inline float rt_la_cbdl_reducdE(__global const float* rec, const float dE)
+{
+    const float varsens = rec[RT_LA_SENSCB];
+    /* The scope thresholds use the spot's deltaE threshold (lp.thr), not the
+     * CBDL range-table threshold. */
+    const float thr = rec[RT_LA_THR];
+    const float mindE = 2.0f + RT_LA_MINSCOPE * varsens * thr;
+    const float maxdE = 5.0f + RT_LA_MAXSCOPE * varsens * (1.0f + 0.1f * thr);
+    const float mindElim = 2.0f + RT_LA_MINSCOPE * (float)RT_LA_LIMSCOPE * thr;
+    const float maxdElim =
+        5.0f + RT_LA_MAXSCOPE * (float)RT_LA_LIMSCOPE * (1.0f + 0.1f * thr);
+    return rt_la_calcreducdE(dE, maxdE, mindE, maxdElim, mindElim,
+                             rec[RT_LA_ITERAT], RT_LA_LIMSCOPE,
+                             (int)varsens);
+}
+
+/* transit_shapedetect(6): the luminance change with the block's CLIP to
+ * 65535. The chroma table is zero for this pass, so a and b do not move. */
+__kernel void rt_local_adjustments_cbdl_blend_luma(
+    __global float* lab, __global const float* fin,
+    __global const float* blurL, __global const float* blurA,
+    __global const float* blurB, __global const float* rec,
+    const int lab_pitch, const int lab_plane, const int fin_pitch,
+    const int bfw, const int bfh, const int xstart, const int ystart,
+    const int blur_pitch)
+{
+    const int rx = (int)get_global_id(0);
+    const int ry = (int)get_global_id(1);
+    if (rx >= bfw || ry >= bfh) {
+        return;
+    }
+    const int x = rx + xstart;
+    const int y = ry + ystart;
+    int zone = 0;
+    float localFactor = 1.0f;
+    rt_la_transition((float)x, (float)y, rec[RT_LA_TRANS] / 100.0f, rec,
+                     &zone, &localFactor);
+    if (zone == 0) {
+        return;
+    }
+    const int bo = ry * blur_pitch + rx;
+    const float blur_l = blurL[bo];
+    const float blur_a = blurA[bo];
+    const float blur_b = blurB[bo];
+    if (!(blur_l / 327.68f > 0.1f)) {
+        return;
+    }
+    const float dE = rt_la_cbdl_deltae(rec, blur_l, blur_a, blur_b);
+    const float reducdE = rt_la_cbdl_reducdE(rec, dE);
+    const int offset = y * lab_pitch + x;
+    const float origL = lab[offset];
+    const float difL =
+        (fin[ry * fin_pitch + rx] - origL) * localFactor * reducdE;
+    lab[offset] = fmax(0.0f, fmin(origL + difL, 65535.0f));
+}
+
+/* transit_shapedetect(7): the chroma change. `coefC` is the block's
+ * 1 / (0.01 * max |bufchrom|), applied to the raw difference. */
+__kernel void rt_local_adjustments_cbdl_blend_chroma(
+    __global float* lab, __global const float* fin,
+    __global const float* blurL, __global const float* blurA,
+    __global const float* blurB, __global const float* rec,
+    const int lab_pitch, const int lab_plane, const int fin_pitch,
+    const int bfw, const int bfh, const int xstart, const int ystart,
+    const int blur_pitch, const float coefC)
+{
+    const int rx = (int)get_global_id(0);
+    const int ry = (int)get_global_id(1);
+    if (rx >= bfw || ry >= bfh) {
+        return;
+    }
+    const int x = rx + xstart;
+    const int y = ry + ystart;
+    int zone = 0;
+    float localFactor = 1.0f;
+    rt_la_transition((float)x, (float)y, rec[RT_LA_TRANS] / 100.0f, rec,
+                     &zone, &localFactor);
+    if (zone == 0) {
+        return;
+    }
+    const int bo = ry * blur_pitch + rx;
+    const float blur_l = blurL[bo];
+    const float blur_a = blurA[bo];
+    const float blur_b = blurB[bo];
+    if (!(blur_l / 327.68f > 0.1f)) {
+        return;
+    }
+    const int offset = y * lab_pitch + x;
+    const float origA = lab[lab_plane + offset];
+    const float origB = lab[2 * lab_plane + offset];
+    const float raw =
+        fin[ry * fin_pitch + rx] - sqrt(origA * origA + origB * origB);
+    const float dE = rt_la_cbdl_deltae(rec, blur_l, blur_a, blur_b);
+    const float reducdE = rt_la_cbdl_reducdE(rec, dE);
+    const float clc = raw * coefC;
+    const float realstr = reducdE * clc;
+    const float rhue = rt_lt_xatan2f(blur_b, blur_a);
+    const float2 sincosval = rt_lt_xsincosf(rhue);
+    float difa = raw * sincosval.y;
+    float difb = raw * sincosval.x;
+    difa *= localFactor * (100.0f + realstr) / 100.0f;
+    difb *= localFactor * (100.0f + realstr) / 100.0f;
+    lab[lab_plane + offset] = rt_la_clipC(origA + difa);
+    lab[2 * lab_plane + offset] = rt_la_clipC(origB + difb);
+}
+
+/*
  * Color::AllMunsellLch(true, Lprov1, Lprov2, HH, Chprov1, CC,
  * correctionHue, correctlum). The fragment's rt_lt_munsell_lch() is the
  * host MunsellLch() port; this wrapper is the lumaMuns branch.
@@ -1107,5 +1356,5 @@ inline std::string local_adjustments_program()
 #endif
     return simd + RT_LAB_TOOLS_CL + RT_MUNSELL_LCH_CL +
            RT_LOCAL_CONTRAST_CL + RT_VIBRANCE_CL + RT_LAB_REGIONS_CL +
-           RT_LOCAL_ADJUSTMENTS_CL;
+           RT_LAB_WAVELET_CL + RT_LOCAL_ADJUSTMENTS_CL;
 }

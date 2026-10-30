@@ -42,16 +42,16 @@ struct ProcParams;
  * Host context of the local.adjustments node.
  *
  * The node covers a spot set of ImProcFunctions::Lab_Local(): an elliptical or
- * rectangular spot, the Colour & Light chroma/lightness/contrast sliders and
- * L/C/H curves, the vibrance tool, the shadows/highlights tool, the soft-light
- * tool, the Gaussian local-contrast tool, the deltaE scope, the
- * avoid-colour-shift Munsell method and the unconditional per-spot Lab-to-RGB
- * clamp. The block also applies the final Munsell pass and the clamp for an
- * inactive spot, so a block whose spots do no tool work is still a clamp-only
- * block.
+ * rectangular spot, the local CBDL tool, the Colour & Light
+ * chroma/lightness/contrast sliders and L/C/H curves, the vibrance tool, the
+ * shadows/highlights tool, the soft-light tool, the Gaussian local-contrast
+ * tool, the deltaE scope, the avoid-colour-shift Munsell method and the
+ * unconditional per-spot Lab-to-RGB clamp. The block also applies the final
+ * Munsell pass and the clamp for an inactive spot, so a block whose spots do
+ * no tool work is still a clamp-only block.
  *
- * The tools run in Lab_Local()'s order: vibrance, shadows/highlights, soft
- * light, local contrast, then Colour & Light. The context is C-compatible
+ * The tools run in Lab_Local()'s order: CBDL, vibrance, shadows/highlights,
+ * soft light, local contrast, then Colour & Light. The context is C-compatible
  * because the ABI is. `self` points at the C++ object that owns the ProcParams,
  * ImProcFunctions and LabImage references, so the pointer must not outlive
  * them.
@@ -61,14 +61,14 @@ struct ProcParams;
  * small, known subset reaches the supported paths. Slots are named by the
  * RT_LOCAL_ADJUSTMENTS_SLOT_* constants and are written once per spot.
  */
-#define RT_LOCAL_ADJUSTMENTS_CONTEXT_VERSION 4u
+#define RT_LOCAL_ADJUSTMENTS_CONTEXT_VERSION 5u
 /* "LAJC": rejects a stale or unrelated pointer before any callback runs. */
 #define RT_LOCAL_ADJUSTMENTS_CONTEXT_MAGIC 0x4C414A43u
 /* The block has no bounded spot count, but a profile that carries more spots
  * than this is outside the device set and runs the host block. */
 #define RT_LOCAL_ADJUSTMENTS_MAX_SPOTS 64u
 /* Floats per spot record; the slot constants below must stay inside it. */
-#define RT_LOCAL_ADJUSTMENTS_SPOT_STRIDE 97u
+#define RT_LOCAL_ADJUSTMENTS_SPOT_STRIDE 114u
 /* A curve table is one LUTf of the block's own size. */
 #define RT_LOCAL_ADJUSTMENTS_LUT_ENTRIES 65536u
 /* Color::gammatab_srgb and Color::igammatab_srgb, the sRGB gamma pair the
@@ -83,6 +83,13 @@ struct ProcParams;
 #define RT_LOCAL_ADJUSTMENTS_SH_SUBSAMPLING 4
 #define RT_LOCAL_ADJUSTMENTS_SH_EPSILON 0.075f
 #define RT_LOCAL_ADJUSTMENTS_SH_MIN_ROI 12
+/* Local CBDL's own guard is `bfw > 65 && bfh > 65`; a smaller ROI does no
+ * CBDL work and is not a refusal, because the host block skips the tool. */
+#define RT_LOCAL_ADJUSTMENTS_CBDL_MIN_ROI 66
+/* cbdl_local_temp()'s directional pyramid: six levels at scales 1..32, and
+ * one 0x20000-entry range table per level, as dirpyrFillLut() builds them. */
+#define RT_LOCAL_ADJUSTMENTS_CBDL_LEVELS 6u
+#define RT_LOCAL_ADJUSTMENTS_CBDL_LUT_ENTRIES 0x20000u
 /* No table at this offset. Offsets below 2^24 are exact in a float. */
 #define RT_LOCAL_ADJUSTMENTS_NO_LUT (-1.0f)
 /* The largest total LUT allocation, in floats. Every offset stays exact in a
@@ -230,6 +237,28 @@ struct ProcParams;
 #define RT_LOCAL_ADJUSTMENTS_SLOT_EXPSOFT 94u
 #define RT_LOCAL_ADJUSTMENTS_SLOT_SOFT_STRENGTH 95u
 #define RT_LOCAL_ADJUSTMENTS_SLOT_SENSSOFT 96u
+/* Local CBDL. EXP_CBDL is 1 when a CBDL sub-pass will run: the host's
+ * cbdlena guard, an ROI wider and taller than 65 pixels (the block's own
+ * guard), and at least one pyramid level the luminance or chroma pass would
+ * change. The level count is the block's trailing-identity trim; the chroma
+ * multipliers are derived from `chromacb` and the luminance multipliers. */
+#define RT_LOCAL_ADJUSTMENTS_SLOT_EXPCBDL 97u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_SENSCB 98u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_CBDL_THRESHOLD 99u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_CBDL_CLARITY 100u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_CBDL_CHROMA 101u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_CBDL_MULT0 102u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_CBDL_MULT1 103u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_CBDL_MULT2 104u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_CBDL_MULT3 105u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_CBDL_MULT4 106u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_CBDL_MULT5 107u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_CBDL_LUMA_LEVELS 108u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_CBDL_CHROMA_LEVELS 109u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_CBDL_LUMA_OFFSET 110u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_CBDL_LUMA_ACTIVE 111u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_CBDL_CHROMA_OFFSET 112u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_CBDL_CHROMA_ACTIVE 113u
 
 typedef struct RtLocalAdjustmentsResult {
     /* spot_count RT_LOCAL_ADJUSTMENTS_SPOT_STRIDE floats, spot-major. */
@@ -317,9 +346,13 @@ namespace rtengine::stage
  * spot is a normal (not exclude/full/main) elliptical or rectangular spot with
  * no recursion, inversion, explicit mask, soft radius, merge, gradient, Lab
  * grid, RGB curve, exposure curve or tool outside the set. An active spot runs
- * any combination of Colour & Light, vibrance, shadows/highlights, soft light
- * and local contrast; the tool variants and ranges are checked separately.
- * The block has no pre-CBDL or dehaze pass.
+ * any combination of local CBDL, Colour & Light, vibrance, shadows/highlights,
+ * soft light and local contrast; the tool variants and ranges are checked
+ * separately. The block has no pre-CBDL or dehaze pass.
+ *
+ * Local CBDL is admitted with the block's own multipliers, threshold, clarity,
+ * chroma and sensitivity. Its soft radius and contresid are residuals, as is a
+ * tool mask; an ROI at or below 65 px on either axis is the block's own no-op.
  *
  * The predicate is block-level on purpose: the block is atomic, so one spot
  * outside the set makes every spot a host execution. An inactive spot is
