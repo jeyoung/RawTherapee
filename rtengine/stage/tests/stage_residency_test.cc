@@ -8224,6 +8224,16 @@ void test_local_adjustments(bool available)
             p.locallab.spots[0].expcolor = false;
             dehaze_spot(p, 50, 25, 50, 60);
         }});
+        /* The block rescales the guided-filtered channels to the 200 px cap
+         * only when the ROI's shorter side exceeds 200 px; every case above
+         * has a side at or below 96, so this is the nearest-neighbour
+         * `dehaze_rescale` path. The full 1024x1793 ROI rescales to 200x350. */
+        complex.push_back({"dehaze rescale 1024x1793", 1024, 1793,
+                           [&](auto& p) {
+            add_spot(p, 0, 0, 2000, true, 0, 0, 0, "ELI", "NONE");
+            p.locallab.spots[0].expcolor = false;
+            dehaze_spot(p, 50, 25, 50, 60);
+        }});
         complex.push_back({"dehaze second spot", 238, 64, [&](auto& p) {
             add_spot(p, -300, -150, 700, true, 30, 8, 0, "ELI", "NONE");
             add_spot(p, 300, 150, 700, true, 0, 0, 0, "ELI", "NONE");
