@@ -208,6 +208,36 @@ class ComparatorIntegrationTests(unittest.TestCase):
             self.assertEqual(report["comparisons"][0]["max_abs"], 1)
             self.assertEqual(report["comparisons"][0]["exit"], 0)
 
+    def test_same_binary_repeat_mutation_is_determinism_failure(self):
+        for role in ("base", "candidate"):
+            with self.subTest(role=role), tempfile.TemporaryDirectory() as tmp:
+                directory = Path(tmp)
+                cli = directory / "fake cli"
+                cli.write_text(
+                    FAKE_CLI.replace(
+                        "sample ^ 2",
+                        f"sample ^ (3 if '{role}-repeat' in str(destination) else 2)",
+                    )
+                )
+                cli.chmod(0o755)
+                args = SimpleNamespace(
+                    base_cli=cli,
+                    candidate_cli=cli,
+                    scratch=directory / "run",
+                    timeout=30,
+                )
+                with patch.dict(HARNESS.FIXTURES, {"tiny": (4, 3)}, clear=True):
+                    self.assertEqual(HARNESS.run_harness(args), 1)
+                report = json.loads((args.scratch / "report.json").read_text())
+                self.assertIn("determinism", report["error"])
+                self.assertEqual(report["comparisons"], [])
+                result = report["determinism_comparisons"][-1]
+                self.assertEqual(result["role"], role)
+                self.assertEqual(result["differing"], 1)
+                self.assertEqual(result["max_abs"], 1)
+                self.assertEqual(result["exit"], 0)
+                self.assertTrue((args.scratch / result["repeat_output"]).is_file())
+
     def test_complete_harness_with_spaces_and_failed_cli(self):
         with tempfile.TemporaryDirectory(prefix="denoise harness ") as tmp:
             directory = Path(tmp)
@@ -223,7 +253,14 @@ class ComparatorIntegrationTests(unittest.TestCase):
             with patch.dict(HARNESS.FIXTURES, {"tiny": (4, 3)}, clear=True):
                 self.assertEqual(HARNESS.run_harness(args), 0)
                 report = json.loads((args.scratch / "report.json").read_text())
-                self.assertEqual(len(report["exports"]), 10)
+                self.assertEqual(len(report["exports"]), 18)
+                self.assertEqual(len(report["determinism_comparisons"]), 8)
+                self.assertTrue(
+                    all(
+                        len(record["output_file_sha256"]) == 64
+                        for record in report["exports"]
+                    )
+                )
                 self.assertEqual(len(report["comparisons"]), 4)
                 self.assertNotIn(str(directory), json.dumps(report))
                 cli.write_text("#!/usr/bin/env python3\nraise SystemExit(7)\n")

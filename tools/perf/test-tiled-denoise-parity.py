@@ -249,9 +249,11 @@ def validate_tile_markers(markers, fixture, role):
             raise ValueError(f"{role}/{fixture}: unexpected denoise tile layout")
 
 
-def export(args, scratch, role, binary, fixture, shape, limit, order, disabled):
+def export(
+    args, scratch, role, binary, fixture, shape, limit, order, disabled, repeat=False
+):
     name = f"{fixture}-disabled" if disabled else f"{fixture}-limit{limit}-order{order}"
-    relative = Path(role) / name
+    relative = Path(role + "-repeat" if repeat else role) / name
     folder = scratch / relative
     folder.mkdir(parents=True)
     settings, cache = folder / "settings", folder / "cache"
@@ -316,6 +318,7 @@ def export(args, scratch, role, binary, fixture, shape, limit, order, disabled):
         command=sanitized,
         exit=process.returncode,
         output=str(relative / "output.tif"),
+        output_file_sha256=sha256(folder / "output.tif"),
         log=str(relative / "cli.log"),
         settings_sha256=sha256(settings / "options"),
         thread_reports=threads,
@@ -354,6 +357,7 @@ def run_harness(args):
         tile_orders=[0, 1],
         exports=[],
         comparisons=[],
+        determinism_comparisons=[],
     )
     comparator = Path(__file__).resolve().parents[1] / "opencl/compare_tiff.py"
     try:
@@ -416,6 +420,48 @@ def run_harness(args):
                         if metrics["differing"] == 0:
                             raise ValueError(
                                 f"{active['case']}: denoise did not change disabled control"
+                            )
+                        repeated = export(
+                            args,
+                            scratch,
+                            role,
+                            binary,
+                            name,
+                            shape,
+                            limit,
+                            order,
+                            False,
+                            repeat=True,
+                        )
+                        report["exports"].append(repeated)
+                        save_report(scratch, report)
+                        if repeated["settings_sha256"] != active["settings_sha256"]:
+                            raise ValueError(
+                                f"{active['case']}: repeat settings differ"
+                            )
+                        repeat_metrics = run_comparison(
+                            comparator,
+                            scratch / active["output"],
+                            scratch / repeated["output"],
+                            shape[0] * shape[1] * 3,
+                            scratch
+                            / Path(repeated["case"])
+                            / "determinism-comparison.log",
+                            args.timeout,
+                        )
+                        report["determinism_comparisons"].append(
+                            dict(
+                                role=role,
+                                case=active["case"],
+                                original_output=active["output"],
+                                repeat_output=repeated["output"],
+                                **repeat_metrics,
+                            )
+                        )
+                        save_report(scratch, report)
+                        if not compare_exact(repeat_metrics):
+                            raise ValueError(
+                                f"{active['case']}: same-binary determinism failure"
                             )
         compare_outputs(args, scratch, comparator, report)
         report["status"] = "PASS"
