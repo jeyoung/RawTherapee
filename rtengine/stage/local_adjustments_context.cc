@@ -116,12 +116,14 @@ bool otherToolEnabled(const procparams::LocallabParams::LocallabSpot& spot)
            spot.expmask || spot.expcie || spot.expprecam;
 }
 
-/* The local contrast method the node runs: the Gaussian/IIR variant. The
- * wavelet variant needs the wavelet port and is a residual. The host maps an
- * empty string to the Gaussian variant too. */
+/* The local contrast method the node runs: the Gaussian/IIR variant, spelled
+ * exactly `"loc"`. `calcLocalParams()` assigns `lp.locmet` only for `"loc"`
+ * and `"wav"`, and `local_params` has no initialiser, so an empty or unknown
+ * method leaves the host's arm indeterminate. Only the exact string has a
+ * defined host arm; everything else, including `"wav"`, is a residual. */
 bool isLocalContrastMethod(const Glib::ustring& method)
 {
-    return method.empty() || method == "loc";
+    return method == "loc";
 }
 
 /* Whether the vibrance tool's parameters are inside the device set. The host's
