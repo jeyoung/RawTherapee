@@ -7961,9 +7961,10 @@ RtStageStatus run_sharpen(const std::shared_ptr<OpenCLEnv>& env,
  * built from the spot's lcradius.
  *
  * Pass order matches Lab_Local(): the optional negative-value prefilter, then,
- * per active spot, vibrance, shadows/highlights, local contrast and Colour &
- * Light, each with its own ROI copy and deltaE reference blur. The full-image
- * tail clamp and the Munsell pass follow. Every pass writes the device image;
+ * per active spot, vibrance, shadows/highlights, soft light, local contrast
+ * and Colour & Light, each with its own ROI copy and deltaE reference blur.
+ * The full-image tail clamp and the Munsell pass follow. Every pass writes
+ * the device image;
  * the host Lab is read back only after all passes succeeded, so a refusal or
  * a failed launch leaves it untouched for the builtin.
  */
@@ -8058,6 +8059,9 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
         compiled_kernel_entry(env, def, "rt_lab_tools_lc_blend", error);
     cl_kernel blend_kernel =
         compiled_kernel_entry(env, def, "rt_local_adjustments_blend", error);
+    cl_kernel softlight_kernel =
+        compiled_kernel_entry(env, def, "rt_local_adjustments_softlight",
+                              error);
     /* The shadows/highlights kernels are the lab.tools fragments that the
      * local-adjustments program already concatenates. */
     cl_kernel sh_mask_kernel =
@@ -8078,6 +8082,7 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
         roi_kernel == nullptr || munsell_kernel == nullptr ||
         line_kernel == nullptr || vibrance_kernel == nullptr ||
         lc_blend_kernel == nullptr || blend_kernel == nullptr ||
+        softlight_kernel == nullptr ||
         sh_mask_kernel == nullptr || sh_subsample_kernel == nullptr ||
         sh_box_h_kernel == nullptr || sh_box_v_kernel == nullptr ||
         sh_combine_kernel == nullptr || sh_upsample_kernel == nullptr ||
@@ -8220,12 +8225,16 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
     char iws_key = 0;
     char cachef_key = 0;
     char cachefy_key = 0;
+    char gamma_srgb_key = 0;
+    char igamma_srgb_key = 0;
     char munsell_key = 0;
     char munsell_sizes_key = 0;
     StageDeviceBufferPtr ws_device;
     StageDeviceBufferPtr iws_device;
     StageDeviceBufferPtr cachef_device;
     StageDeviceBufferPtr cachefy_device;
+    StageDeviceBufferPtr gamma_srgb_device;
+    StageDeviceBufferPtr igamma_srgb_device;
     StageDeviceBufferPtr munsell_device;
     StageDeviceBufferPtr munsell_sizes_device;
 
@@ -8388,6 +8397,7 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
             setup.spot_stride != RT_LOCAL_ADJUSTMENTS_SPOT_STRIDE ||
             setup.ws == nullptr || setup.iws == nullptr ||
             setup.cachef == nullptr || setup.cachefy == nullptr ||
+            setup.gamma_srgb == nullptr || setup.igamma_srgb == nullptr ||
             setup.iir == nullptr) {
             error = "local.adjustments setup is incomplete";
             return RT_STAGE_FALLBACK;
@@ -8409,6 +8419,8 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
             rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXPCONTRAST] == 1.0f;
         const bool shadowsHighlights =
             rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXPSHADHIGHLIGHTS] == 1.0f;
+        const bool softLight =
+            rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXPSOFT] == 1.0f;
         const uint32_t shape =
             static_cast<uint32_t>(rec[RT_LOCAL_ADJUSTMENTS_SLOT_SHAPE]);
         const uint32_t avoid = static_cast<uint32_t>(
@@ -8425,6 +8437,8 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
              !localContrast) ||
             (rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXPSHADHIGHLIGHTS] != 0.0f &&
              !shadowsHighlights) ||
+            (rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXPSOFT] != 0.0f &&
+             !softLight) ||
             (rec[RT_LOCAL_ADJUSTMENTS_SLOT_MERGE] != 0.0f) ||
             (rec[RT_LOCAL_ADJUSTMENTS_SLOT_HRENABLED] != 0.0f) ||
             (rec[RT_LOCAL_ADJUSTMENTS_SLOT_REPARCOL] != 100.0f) ||
@@ -8439,7 +8453,7 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
             (active && colour &&
              rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXPCOLOR] != 1.0f) ||
             (!active && (colour || vibrance || localContrast ||
-                         shadowsHighlights || islocal))) {
+                         shadowsHighlights || softLight || islocal))) {
             error = "local.adjustments record is outside the supported set";
             return RT_STAGE_FALLBACK;
         }
@@ -8509,6 +8523,15 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
               rec[RT_LOCAL_ADJUSTMENTS_SLOT_SH_SHADOWS] == 0.0f))) {
             error = "local.adjustments shadows/highlights setting is outside "
                     "its range";
+            return RT_STAGE_FALLBACK;
+        }
+        if (softLight &&
+            (rec[RT_LOCAL_ADJUSTMENTS_SLOT_SOFT_STRENGTH] <= 1.0f ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_SOFT_STRENGTH] > 100.0f ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_SENSSOFT] < 1.0f ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_SENSSOFT] > 100.0f)) {
+            error = "local.adjustments soft-light setting is outside its "
+                    "range";
             return RT_STAGE_FALLBACK;
         }
         for (const int flag : {RT_LOCAL_ADJUSTMENTS_SLOT_VIB_PROTECTSKINS,
@@ -8719,6 +8742,14 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
             cachefy_device = upload_table(setup.cachefy,
                                           RT_LAB_TOOLS_CACHE_ENTRIES,
                                           &cachefy_key, "cachefy");
+            gamma_srgb_device = upload_table(
+                setup.gamma_srgb,
+                RT_LOCAL_ADJUSTMENTS_GAMMA_LUT_ENTRIES, &gamma_srgb_key,
+                "sRGB gamma");
+            igamma_srgb_device = upload_table(
+                setup.igamma_srgb,
+                RT_LOCAL_ADJUSTMENTS_GAMMA_LUT_ENTRIES, &igamma_srgb_key,
+                "inverse sRGB gamma");
             munsell_device = upload_table(
                 setup.munsell,
                 RT_LAB_TOOLS_MUNSELL_TABLES * RT_LAB_TOOLS_MUNSELL_STRIDE,
@@ -8727,7 +8758,8 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
                 setup.munsell_sizes, RT_LAB_TOOLS_MUNSELL_TABLES,
                 &munsell_sizes_key, "Munsell sizes");
             if (!ws_device || !iws_device || !cachef_device ||
-                !cachefy_device || !munsell_device ||
+                !cachefy_device || !gamma_srgb_device ||
+                !igamma_srgb_device || !munsell_device ||
                 !munsell_sizes_device) {
                 return RT_STAGE_FALLBACK;
             }
@@ -9439,6 +9471,66 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
                 }
                 if (!run_blend("shadows/highlights",
                                rec[RT_LOCAL_ADJUSTMENTS_SLOT_SENSSH])) {
+                    return RT_STAGE_FALLBACK;
+                }
+            }
+
+            /*
+             * Soft light. ImProcFunctions::softLight() runs per pixel on the
+             * ROI copy, after shadows/highlights and before local contrast,
+             * as in Lab_Local(). The blend is transit_shapedetect2() with the
+             * soft-light scope sensitivity (lp.senssf) and the default
+             * 3/sk deltaE reference blur (iir_vibrance).
+             */
+            if (softLight) {
+                if (!copy_roi() ||
+                    !blur_roi(*setup.iir_vibrance, "soft-light blur")) {
+                    return RT_STAGE_FALLBACK;
+                }
+
+                cl_mem gamma_memory = memory_of(gamma_srgb_device);
+                cl_mem igamma_memory = memory_of(igamma_srgb_device);
+                cl_mem ws_memory = memory_of(ws_device);
+                cl_mem iws_memory = memory_of(iws_device);
+                cl_mem cachef_memory = memory_of(cachef_device);
+                cl_mem cachefy_memory = memory_of(cachefy_device);
+                cl_int rw = bfw;
+                cl_int rh = bfh;
+                cl_int wp = work_pitch;
+                cl_int wpl = work_plane;
+                cl_float strength =
+                    rec[RT_LOCAL_ADJUSTMENTS_SLOT_SOFT_STRENGTH];
+                cl_uint arg = 0;
+                bool ok = true;
+                ok = ok && set(softlight_kernel, arg++, sizeof(cl_mem),
+                               &work_memory);
+                ok = ok && set(softlight_kernel, arg++, sizeof(cl_mem),
+                               &gamma_memory);
+                ok = ok && set(softlight_kernel, arg++, sizeof(cl_mem),
+                               &igamma_memory);
+                ok = ok && set(softlight_kernel, arg++, sizeof(cl_mem),
+                               &ws_memory);
+                ok = ok && set(softlight_kernel, arg++, sizeof(cl_mem),
+                               &iws_memory);
+                ok = ok && set(softlight_kernel, arg++, sizeof(cl_mem),
+                               &cachef_memory);
+                ok = ok && set(softlight_kernel, arg++, sizeof(cl_mem),
+                               &cachefy_memory);
+                ok = ok && set(softlight_kernel, arg++, sizeof(cl_int), &rw);
+                ok = ok && set(softlight_kernel, arg++, sizeof(cl_int), &rh);
+                ok = ok && set(softlight_kernel, arg++, sizeof(cl_int), &wp);
+                ok = ok && set(softlight_kernel, arg++, sizeof(cl_int), &wpl);
+                ok = ok && set(softlight_kernel, arg++, sizeof(cl_float),
+                               &strength);
+                if (!ok || !launch2d(softlight_kernel,
+                                     static_cast<std::size_t>(bfw),
+                                     static_cast<std::size_t>(bfh),
+                                     "soft light")) {
+                    error = "local.adjustments soft light failed";
+                    return RT_STAGE_FALLBACK;
+                }
+                if (!run_blend("soft light",
+                               rec[RT_LOCAL_ADJUSTMENTS_SLOT_SENSSOFT])) {
                     return RT_STAGE_FALLBACK;
                 }
             }

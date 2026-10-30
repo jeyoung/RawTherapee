@@ -107,11 +107,11 @@ bool explicitMaskIdle(const procparams::LocallabParams::LocallabSpot& spot)
            !spot.enacieMaskall;
 }
 
-/* Every tool other than the four this node runs. The exposure and soft-light
- * tools also decide the clamp arm; they are residuals here. */
+/* Every tool other than the five this node runs. The exposure tool also
+ * decides the clamp arm; it is a residual here. */
 bool otherToolEnabled(const procparams::LocallabParams::LocallabSpot& spot)
 {
-    return spot.expexpose || spot.expsoft || spot.expblur ||
+    return spot.expexpose || spot.expblur ||
            spot.exptonemap || spot.expreti || spot.expsharp ||
            spot.expcbdl || spot.explog || spot.expmask || spot.expcie ||
            spot.expprecam;
@@ -232,6 +232,21 @@ bool localContrastAdmitted(
     return true;
 }
 
+/* Whether the soft-light tool's parameters are inside the device set. The
+ * per-pixel curve is softMethod "soft"; "reti" runs retinex_pde() and is a
+ * residual. The GUI's strength and sensitivity ranges are 1..100, and the
+ * device records the host guard's `strng > 1` run test separately. */
+bool softLightAdmitted(const procparams::LocallabParams::LocallabSpot& spot)
+{
+    if (spot.softMethod != "soft") {
+        return false;
+    }
+    if (spot.streng < 1 || spot.streng > 100) {
+        return false;
+    }
+    return spot.sensisf >= 1 && spot.sensisf <= 100;
+}
+
 /* LocLHCurve/LocHHCurve/LocCHCurve's own activity test: the host scans the
  * first 500 entries for a value other than the identity 0.5. */
 template<typename Curve>
@@ -308,11 +323,11 @@ bool localAdjustmentsSupported(const procparams::ProcParams& params)
     /*
      * The block is atomic: every spot must be in the set below. An inactive
      * spot is the clamp-only case; an active spot runs Colour & Light,
-     * vibrance, shadows/highlights (Lab-mode std), local contrast or any
-     * combination, with optional L/C/H curves on the colour tool and MUNS.
-     * Curves, Munsell, rectangular spots, inactive spots and multiple spots
-     * are supported; every other tool and the masks, merge, soft radius,
-     * gradients and LAB/XYZ gamut methods are residuals.
+     * vibrance, shadows/highlights (Lab-mode std), soft light (per-pixel
+     * soft), local contrast or any combination, with optional L/C/H curves on
+     * the colour tool and MUNS. Curves, Munsell, rectangular spots, inactive
+     * spots and multiple spots are supported; every other tool and the masks,
+     * merge, soft radius, gradients and LAB/XYZ gamut methods are residuals.
      */
     if (!params.locallab.enabled || params.locallab.spots.empty() ||
         params.locallab.spots.size() > RT_LOCAL_ADJUSTMENTS_MAX_SPOTS) {
@@ -411,12 +426,12 @@ bool localAdjustmentsSupported(const procparams::ProcParams& params)
             spot.transitgrad < -10.0 || spot.transitgrad > 10.0) {
             return false;
         }
-        /* An active spot runs at least one of the four tools in the device
+        /* An active spot runs at least one of the five tools in the device
          * set; an inactive spot does no work, so its tool settings are inert
          * and admitted. */
         if (spot.activ) {
             if ((!spot.expcolor && !spot.expvibrance && !spot.expcontrast &&
-                 !spot.expshadhigh) ||
+                 !spot.expshadhigh && !spot.expsoft) ||
                 otherToolEnabled(spot)) {
                 return false;
             }
@@ -427,6 +442,9 @@ bool localAdjustmentsSupported(const procparams::ProcParams& params)
                 return false;
             }
             if (spot.expshadhigh && !shadowsHighlightsAdmitted(spot)) {
+                return false;
+            }
+            if (spot.expsoft && !softLightAdmitted(spot)) {
                 return false;
             }
         }
@@ -453,13 +471,19 @@ uint32_t localAdjustmentsClampMode(const procparams::ProcParams& params,
      * profile, so notzero is always true. The Laplacian arm also needs
      * ghsactiv (ghs_D != 0) with ghs_BLP > 0; the predicate refuses that
      * combination, but the mode is derived so a future wider predicate keeps
-     * the right arm. Exposure and soft light are residuals.
+     * the right arm. The soft-light block's `strng > 2` arm is the same
+     * clipR() clamp; exposure remains a residual.
      */
     bool notLaplacian = params.dirpyrequalizer.enabled;
     if (spot >= 0 &&
         spot < static_cast<int>(params.locallab.spots.size())) {
         const auto& profileSpot = params.locallab.spots[spot];
         if (profileSpot.ghs_D != 0.0 && profileSpot.ghs_BLP > 0.0) {
+            notLaplacian = true;
+        }
+        if (profileSpot.expsoft && profileSpot.activ &&
+            profileSpot.softMethod == "soft" &&
+            static_cast<float>(profileSpot.streng) > 2.f) {
             notLaplacian = true;
         }
     }
@@ -1063,6 +1087,22 @@ int LocalAdjustmentsContext::build(int spot, const RtStageBuffer* lab,
             cachefy_[index] = Color::cachefy[static_cast<int>(index)];
         }
 
+        if (Color::gammatab_srgb.getSize() <
+                RT_LOCAL_ADJUSTMENTS_GAMMA_LUT_ENTRIES ||
+            Color::igammatab_srgb.getSize() <
+                RT_LOCAL_ADJUSTMENTS_GAMMA_LUT_ENTRIES) {
+            return 1;
+        }
+        gammaSrgb_.resize(RT_LOCAL_ADJUSTMENTS_GAMMA_LUT_ENTRIES);
+        igammaSrgb_.resize(RT_LOCAL_ADJUSTMENTS_GAMMA_LUT_ENTRIES);
+        for (uint32_t index = 0;
+             index < RT_LOCAL_ADJUSTMENTS_GAMMA_LUT_ENTRIES; ++index) {
+            gammaSrgb_[index] =
+                Color::gammatab_srgb[static_cast<int>(index)];
+            igammaSrgb_[index] =
+                Color::igammatab_srgb[static_cast<int>(index)];
+        }
+
         if (Color::munsellLutCount() !=
             static_cast<int>(RT_LAB_TOOLS_MUNSELL_TABLES)) {
             return 1;
@@ -1315,6 +1355,15 @@ int LocalAdjustmentsContext::build(int spot, const RtStageBuffer* lab,
         }
     }
 
+    /*
+     * The soft-light block's own guard is `(strng > 1 || prevdE) && call <= 3
+     * && sfena`; the export call site passes no previous-deltaE flag and runs
+     * call 2, so a strength of one is a no-op and is not recorded as a pass.
+     * The method and the mask state are already narrowed by the predicate.
+     */
+    const bool softLightRun = profileSpot.expsoft && lp.activspot &&
+                              lp.softmet == 0 && lp.strng > 1.f;
+
     float* record = spots_.data();
     record[RT_LOCAL_ADJUSTMENTS_SLOT_XC] = lp.xc;
     record[RT_LOCAL_ADJUSTMENTS_SLOT_YC] = lp.yc;
@@ -1433,6 +1482,10 @@ int LocalAdjustmentsContext::build(int spot, const RtStageBuffer* lab,
     record[RT_LOCAL_ADJUSTMENTS_SLOT_SH_SH_TONAL] =
         static_cast<float>(profileSpot.s_tonalwidth);
     record[RT_LOCAL_ADJUSTMENTS_SLOT_SH_BLUR] = lp.blurSH;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_EXPSOFT] = softLightRun ? 1.f : 0.f;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_SOFT_STRENGTH] = lp.strng;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_SENSSOFT] =
+        static_cast<float>(lp.senssf);
 
     const auto setTable = [record](int offsetSlot, int activeSlot,
                                    bool active, float offset) {
@@ -1525,6 +1578,8 @@ int LocalAdjustmentsContext::build(int spot, const RtStageBuffer* lab,
     out.iws = iws_;
     out.cachef = cachef_.data();
     out.cachefy = cachefy_.data();
+    out.gamma_srgb = gammaSrgb_.data();
+    out.igamma_srgb = igammaSrgb_.data();
     out.munsell = munsell_.data();
     out.munsell_sizes = munsell_sizes_.data();
     out.munsell_tables = RT_LAB_TOOLS_MUNSELL_TABLES;

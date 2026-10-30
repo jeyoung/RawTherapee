@@ -9156,6 +9156,10 @@ void ImProcFunctions::localAdjustmentsSpotParams(
     out.senshs = lp.senshs;
     out.lcamount = lp.lcamount;
     out.blurSH = lp.blurSH;
+    out.strng = lp.strng;
+    out.senssf = lp.senssf;
+    out.sfena = lp.sfena;
+    out.softmet = lp.softmet;
     out.thr = lp.thr;
     out.iterat = lp.iterat;
     out.balance = lp.balance;

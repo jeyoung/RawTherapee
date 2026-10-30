@@ -43,15 +43,16 @@ struct ProcParams;
  *
  * The node covers a spot set of ImProcFunctions::Lab_Local(): an elliptical or
  * rectangular spot, the Colour & Light chroma/lightness/contrast sliders and
- * L/C/H curves, the vibrance tool, the shadows/highlights tool, the Gaussian
- * local-contrast tool, the deltaE scope, the avoid-colour-shift Munsell method
- * and the unconditional per-spot Lab-to-RGB clamp. The block also applies the
- * final Munsell pass and the clamp for an inactive spot, so a block whose spots
- * do no tool work is still a clamp-only block.
+ * L/C/H curves, the vibrance tool, the shadows/highlights tool, the soft-light
+ * tool, the Gaussian local-contrast tool, the deltaE scope, the
+ * avoid-colour-shift Munsell method and the unconditional per-spot Lab-to-RGB
+ * clamp. The block also applies the final Munsell pass and the clamp for an
+ * inactive spot, so a block whose spots do no tool work is still a clamp-only
+ * block.
  *
- * The tools run in Lab_Local()'s order: vibrance, shadows/highlights, local
- * contrast, then Colour & Light. The context is C-compatible because the ABI
- * is. `self` points at the C++ object that owns the ProcParams,
+ * The tools run in Lab_Local()'s order: vibrance, shadows/highlights, soft
+ * light, local contrast, then Colour & Light. The context is C-compatible
+ * because the ABI is. `self` points at the C++ object that owns the ProcParams,
  * ImProcFunctions and LabImage references, so the pointer must not outlive
  * them.
  *
@@ -60,16 +61,19 @@ struct ProcParams;
  * small, known subset reaches the supported paths. Slots are named by the
  * RT_LOCAL_ADJUSTMENTS_SLOT_* constants and are written once per spot.
  */
-#define RT_LOCAL_ADJUSTMENTS_CONTEXT_VERSION 3u
+#define RT_LOCAL_ADJUSTMENTS_CONTEXT_VERSION 4u
 /* "LAJC": rejects a stale or unrelated pointer before any callback runs. */
 #define RT_LOCAL_ADJUSTMENTS_CONTEXT_MAGIC 0x4C414A43u
 /* The block has no bounded spot count, but a profile that carries more spots
  * than this is outside the device set and runs the host block. */
 #define RT_LOCAL_ADJUSTMENTS_MAX_SPOTS 64u
 /* Floats per spot record; the slot constants below must stay inside it. */
-#define RT_LOCAL_ADJUSTMENTS_SPOT_STRIDE 94u
+#define RT_LOCAL_ADJUSTMENTS_SPOT_STRIDE 97u
 /* A curve table is one LUTf of the block's own size. */
 #define RT_LOCAL_ADJUSTMENTS_LUT_ENTRIES 65536u
+/* Color::gammatab_srgb and Color::igammatab_srgb, the sRGB gamma pair the
+ * soft-light curve reads. */
+#define RT_LOCAL_ADJUSTMENTS_GAMMA_LUT_ENTRIES 65536u
 #define RT_LOCAL_ADJUSTMENTS_LIGHT_LUT_ENTRIES 32770u
 /* shadowsHighlightsLut()'s Lab-mode tone table, one entry per 16-bit L. */
 #define RT_LOCAL_ADJUSTMENTS_SH_LUT_ENTRIES 32768u
@@ -220,6 +224,12 @@ struct ProcParams;
 #define RT_LOCAL_ADJUSTMENTS_SLOT_SH_HL_ACTIVE 91u
 #define RT_LOCAL_ADJUSTMENTS_SLOT_SH_SH_OFFSET 92u
 #define RT_LOCAL_ADJUSTMENTS_SLOT_SH_SH_ACTIVE 93u
+/* Soft light. EXP_SOFT is 1 when the host's soft-light block would run: the
+ * tool on, the spot active, the per-pixel "soft" method and a strength above
+ * one. The sRGB gamma pair is the separate block-global result member. */
+#define RT_LOCAL_ADJUSTMENTS_SLOT_EXPSOFT 94u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_SOFT_STRENGTH 95u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_SENSSOFT 96u
 
 typedef struct RtLocalAdjustmentsResult {
     /* spot_count RT_LOCAL_ADJUSTMENTS_SPOT_STRIDE floats, spot-major. */
@@ -238,6 +248,10 @@ typedef struct RtLocalAdjustmentsResult {
      * Lab half of the clamp reads. */
     const float* cachef;
     const float* cachefy;
+    /* Color::gammatab_srgb[] and igammatab_srgb[], the 65536-sample sRGB
+     * gamma pair the soft-light curve reads. */
+    const float* gamma_srgb;
+    const float* igamma_srgb;
     /* The flat Munsell table set and one length per table, for the MUNS
      * method of the final avoidcolshi() pass. */
     const float* munsell;
@@ -303,9 +317,9 @@ namespace rtengine::stage
  * spot is a normal (not exclude/full/main) elliptical or rectangular spot with
  * no recursion, inversion, explicit mask, soft radius, merge, gradient, Lab
  * grid, RGB curve, exposure curve or tool outside the set. An active spot runs
- * any combination of Colour & Light, vibrance and local contrast; the vibrance
- * and local-contrast variants and ranges are checked separately. The block has
- * no pre-CBDL or dehaze pass.
+ * any combination of Colour & Light, vibrance, shadows/highlights, soft light
+ * and local contrast; the tool variants and ranges are checked separately.
+ * The block has no pre-CBDL or dehaze pass.
  *
  * The predicate is block-level on purpose: the block is atomic, so one spot
  * outside the set makes every spot a host execution. An inactive spot is
@@ -317,6 +331,10 @@ namespace rtengine::stage
  * every mask left at their defaults. Its per-round tone tables are host-built
  * by the block's own shadowsHighlightsLut() and the guided filter is the
  * lab.tools kernel.
+ *
+ * Soft light is admitted in its per-pixel "soft" method only; "reti" is the
+ * retinex path and stays a residual. The sRGB gamma tables are host-built by
+ * Color::init() and the working matrices are the block's own.
  */
 bool localAdjustmentsSupported(const procparams::ProcParams& params);
 
@@ -410,6 +428,8 @@ private:
     float iws_[9] = {};
     std::vector<float> cachef_;
     std::vector<float> cachefy_;
+    std::vector<float> gammaSrgb_;
+    std::vector<float> igammaSrgb_;
     std::vector<float> munsell_;
     std::vector<float> munsell_sizes_;
     RtLabToolsIir iir_ = {};

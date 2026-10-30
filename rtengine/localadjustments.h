@@ -68,6 +68,13 @@ struct LocalAdjustmentsSpotParams {
     float lcamount = 0.f;
     /* The shadows/highlights deltaE reference blur, through blurSHde. */
     float blurSH = 0.f;
+    /* The soft-light strength, sensitivity and method selector. sfena is the
+     * host's enabled-and-unmasked predicate; only softmet 0 (the per-pixel
+     * soft-light curve) is in the device set. */
+    float strng = 0.f;
+    int senssf = 0;
+    bool sfena = false;
+    int softmet = 0;
     float thr = 0.f;
     float iterat = 0.f;
     float balance = 0.f;

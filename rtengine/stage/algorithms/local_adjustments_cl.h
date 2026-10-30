@@ -33,8 +33,8 @@
  * This program is concatenated after the lab.tools helpers (the Lab round
  * trip, the caches and the LUT access), the local-contrast IIR line kernel,
  * the Sleef xatan2f/xsincosf port and the lab.regions xlogf/xexpf port. It
- * adds the single-spot colour apply, the ROI copy, the ROI Gaussian and the
- * full-image clamp.
+ * adds the single-spot colour apply, the ROI copy, the per-pixel soft-light
+ * curve, the ROI Gaussian and the full-image clamp.
  *
  * The record slots are the host's RT_LOCAL_ADJUSTMENTS_SLOT_* values; the
  * device source repeats the small subset it reads so the program is
@@ -96,6 +96,9 @@ inline constexpr const char* RT_LOCAL_ADJUSTMENTS_CL = R"CLC(
 #define RT_LA_LIGHT_ACTIVE 62
 #define RT_LA_ADJUSTR 63
 #define RT_LA_AMOUNTCHROM 64
+#define RT_LA_EXPSOFT 94
+#define RT_LA_SOFT_STRENGTH 95
+#define RT_LA_SENSSOFT 96
 
 /*
  * The number of trailing columns the host takes through its scalar path.
@@ -963,6 +966,79 @@ inline void rt_la_xyz2lab(const float X, const float Y, const float Z,
     *L = rt_la_compute_fy(Y, cachefy);
     *a = 500.0f * (fx - fy);
     *b = 200.0f * (fy - fz);
+}
+
+/*
+ * ipsoftlight.cc's sl(): Pegtop's soft-light curve on one working-RGB
+ * channel. The two gamma tables are Color::gammatab_srgb and
+ * Color::igammatab_srgb, read with the same LUTf interpolation the host uses.
+ * A channel outside the 16-bit range is returned unchanged, as OOG() does.
+ */
+inline float rt_la_soft_sl(const float blend, const float x,
+                           __global const float* gamma_tab,
+                           __global const float* igamma_tab)
+{
+    if (x < 0.0f || x > 65535.0f) {
+        return x;
+    }
+    const float v = rt_la_lut_off(gamma_tab, 65534.0f, x) / 65535.0f;
+    const float curved = rt_la_lut_off(
+        igamma_tab, 65534.0f,
+        v * v * (3.0f - 2.0f * v) * 65535.0f);
+    return blend * (curved - x) + x;
+}
+
+/*
+ * ImProcFunctions::softLight() on the ROI: Lab -> XYZ -> working RGB, the
+ * per-channel soft-light curve, then back to XYZ -> Lab. The working
+ * matrices, the Lab caches and the sRGB gamma pair are host-built. The
+ * lab2rgb() scalar-tail multiplication order is reproduced by
+ * rt_la_lab2xyz() so the last columns round like the host.
+ */
+__kernel void rt_local_adjustments_softlight(
+    __global float* work, __global const float* gamma_tab,
+    __global const float* igamma_tab, __global const float* ws,
+    __global const float* iws, __global const float* cachef,
+    __global const float* cachefy, const int bfw, const int bfh,
+    const int work_pitch, const int work_plane, const float strength)
+{
+    const int rx = (int)get_global_id(0);
+    const int ry = (int)get_global_id(1);
+    if (rx >= bfw || ry >= bfh) {
+        return;
+    }
+
+    const int offset = ry * work_pitch + rx;
+    const float l = work[offset];
+    const float a = work[work_plane + offset];
+    const float b = work[2 * work_plane + offset];
+
+    float X = 0.0f;
+    float Y = 0.0f;
+    float Z = 0.0f;
+    rt_la_lab2xyz(l, a, b, rx, bfw, &X, &Y, &Z);
+
+    float R = 0.0f;
+    float G = 0.0f;
+    float B = 0.0f;
+    rt_lt_xyz2rgb(X, Y, Z, iws, &R, &G, &B);
+
+    const float blend = strength / 100.0f;
+    R = rt_la_soft_sl(blend, R, gamma_tab, igamma_tab);
+    G = rt_la_soft_sl(blend, G, gamma_tab, igamma_tab);
+    B = rt_la_soft_sl(blend, B, gamma_tab, igamma_tab);
+
+    X = ws[0] * R + ws[1] * G + ws[2] * B;
+    Y = ws[3] * R + ws[4] * G + ws[5] * B;
+    Z = ws[6] * R + ws[7] * G + ws[8] * B;
+
+    float out_l = 0.0f;
+    float out_a = 0.0f;
+    float out_b = 0.0f;
+    rt_la_xyz2lab(X, Y, Z, cachef, cachefy, &out_l, &out_a, &out_b);
+    work[offset] = out_l;
+    work[work_plane + offset] = out_a;
+    work[2 * work_plane + offset] = out_b;
 }
 
 /*
