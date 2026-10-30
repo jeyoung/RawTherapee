@@ -7281,9 +7281,6 @@ void test_local_adjustments(bool available)
     /* The residual matrix: one otherwise supported profile per entry. */
     {
         const LocalAdjustmentsResidual residuals[] = {
-            {"MUNS", [](auto& p) {
-                 p.locallab.spots[0].avoidgamutMethod = "MUNS";
-             }},
             {"GHS clamp leftovers", [](auto& p) {
                  p.locallab.spots[0].activ = false;
                  p.locallab.spots[0].ghs_D = 1.0;
@@ -7615,6 +7612,32 @@ void test_local_adjustments(bool available)
             spot.LHcurve = flat(0.7);
             spot.CHcurve = flat(0.7);
         }});
+        complex.push_back({"MUNS", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 35, 10, -5, "ELI", "MUNS");
+        }});
+        complex.push_back({"MUNS 179x49", 179, 49, [&](auto& p) {
+            add_spot(p, 0, 0, 700, true, 35, 10, -5, "ELI", "MUNS");
+        }});
+        complex.push_back({"MUNS and NONE", 238, 64, [&](auto& p) {
+            add_spot(p, -300, -150, 700, true, 40, 8, 0, "ELI", "MUNS");
+            add_spot(p, 300, 150, 700, true, -30, 0, 10, "ELI", "NONE");
+        }});
+        complex.push_back({"inactive then MUNS", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 700, false, 0, 0, 0, "ELI", "NONE");
+            add_spot(p, 100, 100, 600, true, 35, 10, -5, "ELI", "MUNS");
+        }});
+        complex.push_back({"all curves MUNS", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 35, 10, -5, "ELI", "MUNS");
+            auto& spot = p.locallab.spots[0];
+            spot.qualitycurveMethod = "std";
+            spot.llcurve = diagonal(0.7);
+            spot.clcurve = diagonal(0.65);
+            spot.lccurve = diagonal(1.3);
+            spot.cccurve = diagonal(1.2);
+            spot.HHcurve = flat(0.7);
+            spot.LHcurve = flat(0.7);
+            spot.CHcurve = flat(0.7);
+        }});
         complex.push_back({"gate multispot", 238, 64, [&](auto& p) {
             add_spot(p, -400, -200, 700, true, 30, 10, 5, "ELI", "NONE");
             p.locallab.spots[0].qualitycurveMethod = "std";
@@ -7735,13 +7758,83 @@ void test_local_adjustments(bool available)
               "the 4-px local.adjustments case matches the block");
     }
 
+    /* The per-spot clamp alone, with no colour work and no MUNS. An inactive
+     * spot runs the prefilter (avoidneg) and the tail clamp, so the comparison
+     * is the clamp round trip only. The host's lab2rgb() gives its SIMD loop
+     * and its scalar tail different cubic orders, so the widths cover both a
+     * zero and a non-zero tail. The assertion is bit-exactness, which the
+     * pre-fix clamp failed at PAE 0.045898 LSB16. */
+    {
+        struct ClampCase {
+            const char* label;
+            int width;
+            int height;
+            bool avoidneg;
+        };
+        const ClampCase clamp_cases[] = {
+            {"prefilter 238x64", 238, 64, true},
+            {"tail only 238x64", 238, 64, false},
+            {"prefilter 237x49", 237, 49, true},
+            {"prefilter 179x49", 179, 49, true},
+            {"tail only 179x49", 179, 49, false},
+            {"prefilter 8192x64", 8192, 64, true},
+        };
+        for (const ClampCase& c : clamp_cases) {
+            rtengine::procparams::ProcParams params = supported;
+            params.locallab.spots[0] = localAdjustmentsSpot(
+                "clamp", 0, 0, 800, false, 0, 0, 0);
+            params.locallab.spots[0].avoidgamutMethod = "NONE";
+            params.locallab.spots[0].avoidneg = c.avoidneg;
+            check(localAdjustmentsSupported(params),
+                  "the clamp-only local.adjustments case is inside the "
+                  "predicate");
+
+            Imagefloat reference_base(c.width, c.height);
+            fill_local_adjustments_rgb(reference_base, 301u);
+            std::unique_ptr<LabImage> reference_lab(
+                new LabImage(c.width, c.height));
+            rtengine::ImProcFunctions reference_ipf(&params, false);
+            localAdjustmentsHostBlock(reference_ipf, params, &reference_base,
+                                      reference_lab.get(), c.width,
+                                      c.height);
+
+            rtengine::procparams::ProcParams node_params = params;
+            Imagefloat node_base(c.width, c.height);
+            fill_local_adjustments_rgb(node_base, 301u);
+            std::unique_ptr<LabImage> node_lab(
+                new LabImage(c.width, c.height));
+            rtengine::ImProcFunctions node_ipf(&node_params, false);
+            const RtStageStatus status =
+                run_local_adjustments_node(node_base, *node_lab, node_params,
+                                           node_ipf, profile_path);
+            check(status == RT_STAGE_OK,
+                  "the clamp-only case completes through run()");
+            const std::string profile = read_file(profile_path);
+            if (cpu_device) {
+                check(profile.find("\"impl\":\"opencl\"") !=
+                          std::string::npos,
+                      "the clamp-only case records a device pass");
+                check(profile.find("\"impl\":\"host\"") ==
+                          std::string::npos,
+                      "the clamp-only case never falls back");
+            }
+
+            const Diff diff =
+                compare(view(*reference_lab), view(*node_lab));
+            std::printf("stage-residency: local.adjustments clamp %s: "
+                        "PAE %.6f LSB16, %zu of %zu samples differ\n",
+                        c.label, diff.max_abs, diff.differing,
+                        diff.samples);
+            check(diff.finite && diff.max_abs == 0.0 &&
+                      diff.differing == 0,
+                  "the per-spot clamp is bit-exact against the host");
+        }
+    }
+
     /* Residuals: every one must run the host builtin, never a device pass,
      * and match the block byte for byte. */
     {
         const LocalAdjustmentsResidual residuals[] = {
-            {"MUNS", [](auto& p) {
-                 p.locallab.spots[0].avoidgamutMethod = "MUNS";
-             }},
             {"explicit mask", [](auto& p) {
                  p.locallab.spots[0].enaColorMask = true;
              }},

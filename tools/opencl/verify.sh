@@ -274,9 +274,9 @@ quick() {
     run_stage_host "pef/stage-host-local-adjustments-residual" \
         "$ROOT/devnotes/opencl/pp3/localadjustments-residual.pp3" \
         local.adjustments
-    run_stage_host "pef/stage-host-local-adjustments-munsell" \
+    run_stage_device "pef/stage-device-local-adjustments-munsell" \
         "$ROOT/devnotes/opencl/pp3/localadjustments-munsell.pp3" \
-        local.adjustments
+        local.adjustments cpu
 }
 
 stage() {
@@ -600,9 +600,9 @@ stage_device() {
     run_stage_host "pef/stage-host-local-adjustments-residual" \
         "$ROOT/devnotes/opencl/pp3/localadjustments-residual.pp3" \
         local.adjustments
-    run_stage_host "pef/stage-host-local-adjustments-munsell" \
+    run_stage_device "pef/stage-device-local-adjustments-munsell" \
         "$ROOT/devnotes/opencl/pp3/localadjustments-munsell.pp3" \
-        local.adjustments
+        local.adjustments cpu
 }
 
 rgbproc() {
