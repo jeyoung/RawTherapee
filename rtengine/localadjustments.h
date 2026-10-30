@@ -64,7 +64,10 @@ struct LocalAdjustmentsSpotParams {
      * contrast amount, as calcLocalParams() narrows them. */
     int sensv = 0;
     int senslc = 0;
+    int senshs = 0;
     float lcamount = 0.f;
+    /* The shadows/highlights deltaE reference blur, through blurSHde. */
+    float blurSH = 0.f;
     float thr = 0.f;
     float iterat = 0.f;
     float balance = 0.f;

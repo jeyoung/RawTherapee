@@ -43,33 +43,42 @@ struct ProcParams;
  *
  * The node covers a spot set of ImProcFunctions::Lab_Local(): an elliptical or
  * rectangular spot, the Colour & Light chroma/lightness/contrast sliders and
- * L/C/H curves, the vibrance tool, the Gaussian local-contrast tool, the deltaE
- * scope, the avoid-colour-shift Munsell method and the unconditional per-spot
- * Lab-to-RGB clamp. The block also applies the final Munsell pass and the clamp
- * for an inactive spot, so a block whose spots do no tool work is still a
- * clamp-only block.
+ * L/C/H curves, the vibrance tool, the shadows/highlights tool, the Gaussian
+ * local-contrast tool, the deltaE scope, the avoid-colour-shift Munsell method
+ * and the unconditional per-spot Lab-to-RGB clamp. The block also applies the
+ * final Munsell pass and the clamp for an inactive spot, so a block whose spots
+ * do no tool work is still a clamp-only block.
  *
- * The tools run in Lab_Local()'s order: vibrance, local contrast, then Colour &
- * Light. The context is C-compatible because the ABI is. `self` points at the
- * C++ object that owns the ProcParams, ImProcFunctions and LabImage references,
- * so the pointer must not outlive them.
+ * The tools run in Lab_Local()'s order: vibrance, shadows/highlights, local
+ * contrast, then Colour & Light. The context is C-compatible because the ABI
+ * is. `self` points at the C++ object that owns the ProcParams,
+ * ImProcFunctions and LabImage references, so the pointer must not outlive
+ * them.
  *
  * The per-spot record is a flat float table rather than a structure mirrored
  * between C++ and the device: Lab_Local() takes 270 parameters and only a
  * small, known subset reaches the supported paths. Slots are named by the
  * RT_LOCAL_ADJUSTMENTS_SLOT_* constants and are written once per spot.
  */
-#define RT_LOCAL_ADJUSTMENTS_CONTEXT_VERSION 2u
+#define RT_LOCAL_ADJUSTMENTS_CONTEXT_VERSION 3u
 /* "LAJC": rejects a stale or unrelated pointer before any callback runs. */
 #define RT_LOCAL_ADJUSTMENTS_CONTEXT_MAGIC 0x4C414A43u
 /* The block has no bounded spot count, but a profile that carries more spots
  * than this is outside the device set and runs the host block. */
 #define RT_LOCAL_ADJUSTMENTS_MAX_SPOTS 64u
 /* Floats per spot record; the slot constants below must stay inside it. */
-#define RT_LOCAL_ADJUSTMENTS_SPOT_STRIDE 82u
+#define RT_LOCAL_ADJUSTMENTS_SPOT_STRIDE 94u
 /* A curve table is one LUTf of the block's own size. */
 #define RT_LOCAL_ADJUSTMENTS_LUT_ENTRIES 65536u
 #define RT_LOCAL_ADJUSTMENTS_LIGHT_LUT_ENTRIES 32770u
+/* shadowsHighlightsLut()'s Lab-mode tone table, one entry per 16-bit L. */
+#define RT_LOCAL_ADJUSTMENTS_SH_LUT_ENTRIES 32768u
+/* shadowsHighlights() passes guidedFilter() an explicit subsampling of four
+ * and an epsilon of 0.075. The fast filter needs at least three samples per
+ * axis, so a shadows/highlights ROI below 4 * 3 px is a host execution. */
+#define RT_LOCAL_ADJUSTMENTS_SH_SUBSAMPLING 4
+#define RT_LOCAL_ADJUSTMENTS_SH_EPSILON 0.075f
+#define RT_LOCAL_ADJUSTMENTS_SH_MIN_ROI 12
 /* No table at this offset. Offsets below 2^24 are exact in a float. */
 #define RT_LOCAL_ADJUSTMENTS_NO_LUT (-1.0f)
 /* The largest total LUT allocation, in floats. Every offset stays exact in a
@@ -194,6 +203,23 @@ struct ProcParams;
 #define RT_LOCAL_ADJUSTMENTS_SLOT_LC_DARKNESS 79u
 #define RT_LOCAL_ADJUSTMENTS_SLOT_LC_LIGHTNESS 80u
 #define RT_LOCAL_ADJUSTMENTS_SLOT_LC_RADIUS 81u
+/* Shadows/highlights. EXP_SHADHIGHLIGHTS is 1 when the tool would change a
+ * pixel: the tool on, the spot active and a positive highlights or shadows
+ * slider. The method is Lab-mode "std"; the tonal widths, radius, sensitivity
+ * and deltaE blur radius are the block's own values. The two tone tables are
+ * appended to the result's flat set, one per non-zero round. */
+#define RT_LOCAL_ADJUSTMENTS_SLOT_EXPSHADHIGHLIGHTS 82u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_SENSSH 83u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_SH_HIGHLIGHTS 84u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_SH_SHADOWS 85u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_SH_RADIUS 86u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_SH_HL_TONAL 87u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_SH_SH_TONAL 88u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_SH_BLUR 89u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_SH_HL_OFFSET 90u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_SH_HL_ACTIVE 91u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_SH_SH_OFFSET 92u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_SH_SH_ACTIVE 93u
 
 typedef struct RtLocalAdjustmentsResult {
     /* spot_count RT_LOCAL_ADJUSTMENTS_SPOT_STRIDE floats, spot-major. */
@@ -230,6 +256,9 @@ typedef struct RtLocalAdjustmentsResult {
     /* Local contrast's own Gaussian, sigma = lcradius / sk. Both the SSE and
      * the double path are admitted; the launcher reads double_path. */
     const RtLabToolsIir* iir_local_contrast;
+    /* shadows/highlights' deltaE reference blur, sigma
+     * (2 + 0.2 * blurSHde) / sk. Only the SSE path is admitted. */
+    const RtLabToolsIir* iir_shadows_highlights;
 } RtLocalAdjustmentsResult;
 
 typedef struct RtLocalAdjustmentsContext {
@@ -282,6 +311,12 @@ namespace rtengine::stage
  * outside the set makes every spot a host execution. An inactive spot is
  * supported: it does no tool work, but the block's per-spot clamp still runs,
  * and that clamp is part of the node.
+ *
+ * shadows/highlights is admitted in its Lab-mode "std" method only, with
+ * tone-eq, GHS, the GHS local-contrast arm, the gradient, recovery blend and
+ * every mask left at their defaults. Its per-round tone tables are host-built
+ * by the block's own shadowsHighlightsLut() and the guided filter is the
+ * lab.tools kernel.
  */
 bool localAdjustmentsSupported(const procparams::ProcParams& params);
 
@@ -380,6 +415,7 @@ private:
     RtLabToolsIir iir_ = {};
     RtLabToolsIir iirVib_ = {};
     RtLabToolsIir iirLc_ = {};
+    RtLabToolsIir iirSh_ = {};
     uint32_t clamp_mode_ = RT_LOCAL_ADJUSTMENTS_CLAMP_NONE;
 };
 

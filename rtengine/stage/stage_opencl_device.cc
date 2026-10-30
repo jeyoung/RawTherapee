@@ -8058,10 +8058,30 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
         compiled_kernel_entry(env, def, "rt_lab_tools_lc_blend", error);
     cl_kernel blend_kernel =
         compiled_kernel_entry(env, def, "rt_local_adjustments_blend", error);
+    /* The shadows/highlights kernels are the lab.tools fragments that the
+     * local-adjustments program already concatenates. */
+    cl_kernel sh_mask_kernel =
+        compiled_kernel_entry(env, def, "rt_lab_tools_mask", error);
+    cl_kernel sh_subsample_kernel =
+        compiled_kernel_entry(env, def, "rt_lab_tools_subsample", error);
+    cl_kernel sh_box_h_kernel =
+        compiled_kernel_entry(env, def, "rt_lab_tools_box_h", error);
+    cl_kernel sh_box_v_kernel =
+        compiled_kernel_entry(env, def, "rt_lab_tools_box_v", error);
+    cl_kernel sh_combine_kernel =
+        compiled_kernel_entry(env, def, "rt_lab_tools_combine", error);
+    cl_kernel sh_upsample_kernel =
+        compiled_kernel_entry(env, def, "rt_lab_tools_upsample", error);
+    cl_kernel sh_apply_kernel =
+        compiled_kernel_entry(env, def, "rt_lab_tools_apply", error);
     if (apply_kernel == nullptr || clamp_kernel == nullptr ||
         roi_kernel == nullptr || munsell_kernel == nullptr ||
         line_kernel == nullptr || vibrance_kernel == nullptr ||
-        lc_blend_kernel == nullptr || blend_kernel == nullptr) {
+        lc_blend_kernel == nullptr || blend_kernel == nullptr ||
+        sh_mask_kernel == nullptr || sh_subsample_kernel == nullptr ||
+        sh_box_h_kernel == nullptr || sh_box_v_kernel == nullptr ||
+        sh_combine_kernel == nullptr || sh_upsample_kernel == nullptr ||
+        sh_apply_kernel == nullptr) {
         return RT_STAGE_FALLBACK;
     }
 
@@ -8215,11 +8235,19 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
     char satur_key = 0;
     char saturmoins_key = 0;
     char skin_key = 0;
+    char sh_hl_key = 0;
+    char sh_sh_key = 0;
     char work_key = 0;
     char scratch_key = 0;
     char blur_keys[3] = {0, 0, 0};
     char lc_h_key = 0;
     char lc_v_key = 0;
+    char sh_full_key = 0;
+    char sh_i1_key = 0;
+    char sh_p1_key = 0;
+    char sh_meani_key = 0;
+    char sh_meanp_key = 0;
+    char sh_temp_key = 0;
     StageDeviceBufferPtr blur_device[3];
 
     const auto finite = [](float value) { return std::isfinite(value); };
@@ -8379,6 +8407,8 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
             rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXPVIBRANCE] == 1.0f;
         const bool localContrast =
             rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXPCONTRAST] == 1.0f;
+        const bool shadowsHighlights =
+            rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXPSHADHIGHLIGHTS] == 1.0f;
         const uint32_t shape =
             static_cast<uint32_t>(rec[RT_LOCAL_ADJUSTMENTS_SLOT_SHAPE]);
         const uint32_t avoid = static_cast<uint32_t>(
@@ -8393,6 +8423,8 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
              !vibrance) ||
             (rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXPCONTRAST] != 0.0f &&
              !localContrast) ||
+            (rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXPSHADHIGHLIGHTS] != 0.0f &&
+             !shadowsHighlights) ||
             (rec[RT_LOCAL_ADJUSTMENTS_SLOT_MERGE] != 0.0f) ||
             (rec[RT_LOCAL_ADJUSTMENTS_SLOT_HRENABLED] != 0.0f) ||
             (rec[RT_LOCAL_ADJUSTMENTS_SLOT_REPARCOL] != 100.0f) ||
@@ -8406,7 +8438,8 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
             (active && !islocal) ||
             (active && colour &&
              rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXPCOLOR] != 1.0f) ||
-            (!active && (colour || vibrance || localContrast || islocal))) {
+            (!active && (colour || vibrance || localContrast ||
+                         shadowsHighlights || islocal))) {
             error = "local.adjustments record is outside the supported set";
             return RT_STAGE_FALLBACK;
         }
@@ -8457,6 +8490,27 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
                     "range";
             return RT_STAGE_FALLBACK;
         }
+        if (shadowsHighlights &&
+            (rec[RT_LOCAL_ADJUSTMENTS_SLOT_SH_HIGHLIGHTS] < 0.0f ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_SH_HIGHLIGHTS] > 100.0f ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_SH_SHADOWS] < 0.0f ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_SH_SHADOWS] > 100.0f ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_SH_HL_TONAL] < 10.0f ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_SH_HL_TONAL] > 100.0f ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_SH_SH_TONAL] < 10.0f ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_SH_SH_TONAL] > 100.0f ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_SH_RADIUS] < 0.0f ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_SH_RADIUS] > 100.0f ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_SH_BLUR] < 2.0f ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_SH_BLUR] > 100.0f ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_SENSSH] < 0.0f ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_SENSSH] > 100.0f ||
+             (rec[RT_LOCAL_ADJUSTMENTS_SLOT_SH_HIGHLIGHTS] == 0.0f &&
+              rec[RT_LOCAL_ADJUSTMENTS_SLOT_SH_SHADOWS] == 0.0f))) {
+            error = "local.adjustments shadows/highlights setting is outside "
+                    "its range";
+            return RT_STAGE_FALLBACK;
+        }
         for (const int flag : {RT_LOCAL_ADJUSTMENTS_SLOT_VIB_PROTECTSKINS,
                                RT_LOCAL_ADJUSTMENTS_SLOT_VIB_AVOIDCOLORSHIFT,
                                RT_LOCAL_ADJUSTMENTS_SLOT_VIB_SKIN_ACTIVE}) {
@@ -8486,7 +8540,12 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
             setup.iir_local_contrast == nullptr ||
             setup.iir_local_contrast->size != sizeof(RtLabToolsIir) ||
             setup.iir_local_contrast->version != RT_LAB_TOOLS_IIR_VERSION ||
-            setup.iir_local_contrast->double_path > 1u) {
+            setup.iir_local_contrast->double_path > 1u ||
+            setup.iir_shadows_highlights == nullptr ||
+            setup.iir_shadows_highlights->size != sizeof(RtLabToolsIir) ||
+            setup.iir_shadows_highlights->version !=
+                RT_LAB_TOOLS_IIR_VERSION ||
+            setup.iir_shadows_highlights->double_path != 0) {
             error = "local.adjustments blur needs the SSE coefficient path";
             return RT_STAGE_FALLBACK;
         }
@@ -8553,7 +8612,13 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
              static_cast<int>(RT_LOCAL_ADJUSTMENTS_LUT_ENTRIES)},
             {RT_LOCAL_ADJUSTMENTS_SLOT_VIB_SKIN_OFFSET,
              RT_LOCAL_ADJUSTMENTS_SLOT_VIB_SKIN_ACTIVE,
-             static_cast<int>(RT_LOCAL_ADJUSTMENTS_LUT_ENTRIES)}};
+             static_cast<int>(RT_LOCAL_ADJUSTMENTS_LUT_ENTRIES)},
+            {RT_LOCAL_ADJUSTMENTS_SLOT_SH_HL_OFFSET,
+             RT_LOCAL_ADJUSTMENTS_SLOT_SH_HL_ACTIVE,
+             static_cast<int>(RT_LOCAL_ADJUSTMENTS_SH_LUT_ENTRIES)},
+            {RT_LOCAL_ADJUSTMENTS_SLOT_SH_SH_OFFSET,
+             RT_LOCAL_ADJUSTMENTS_SLOT_SH_SH_ACTIVE,
+             static_cast<int>(RT_LOCAL_ADJUSTMENTS_SH_LUT_ENTRIES)}};
         for (const TableSpec& table : curves) {
             const bool table_active = rec[table.active] == 1.0f;
             if (rec[table.active] != 0.0f && !table_active) {
@@ -8587,7 +8652,12 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
              rec[RT_LOCAL_ADJUSTMENTS_SLOT_SATURMOINS_ACTIVE] != 1.0f) ||
             ((rec[RT_LOCAL_ADJUSTMENTS_SLOT_LIGH] != 0.0f ||
               rec[RT_LOCAL_ADJUSTMENTS_SLOT_CONT] != 0.0f) &&
-             rec[RT_LOCAL_ADJUSTMENTS_SLOT_LIGHT_ACTIVE] != 1.0f)) {
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_LIGHT_ACTIVE] != 1.0f) ||
+            (shadowsHighlights &&
+             ((rec[RT_LOCAL_ADJUSTMENTS_SLOT_SH_HIGHLIGHTS] > 0.0f &&
+               rec[RT_LOCAL_ADJUSTMENTS_SLOT_SH_HL_ACTIVE] != 1.0f) ||
+              (rec[RT_LOCAL_ADJUSTMENTS_SLOT_SH_SHADOWS] > 0.0f &&
+               rec[RT_LOCAL_ADJUSTMENTS_SLOT_SH_SH_ACTIVE] != 1.0f)))) {
             error = "local.adjustments slider table is missing";
             return RT_STAGE_FALLBACK;
         }
@@ -8619,6 +8689,17 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
             if (bfw < 5 || bfh < 5 || bfw > width || bfh > height) {
                 error = "local.adjustments spot ROI is below the colour "
                         "floor";
+                return RT_STAGE_FALLBACK;
+            }
+            /* shadowsHighlights() passes an explicit guided-filter
+             * subsampling of four; the lab.tools port needs at least three
+             * subsampled samples per axis. A smaller ROI is a host
+             * execution. */
+            if (shadowsHighlights &&
+                (bfw < RT_LOCAL_ADJUSTMENTS_SH_MIN_ROI ||
+                 bfh < RT_LOCAL_ADJUSTMENTS_SH_MIN_ROI)) {
+                error = "local.adjustments shadows/highlights ROI is too "
+                        "small for the guided filter";
                 return RT_STAGE_FALLBACK;
             }
         }
@@ -8701,8 +8782,18 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
             RT_LOCAL_ADJUSTMENTS_SLOT_VIB_SKIN_OFFSET,
             RT_LOCAL_ADJUSTMENTS_SLOT_VIB_SKIN_ACTIVE,
             RT_LOCAL_ADJUSTMENTS_LUT_ENTRIES, "skin", &skin_key);
+        StageDeviceBufferPtr sh_hl_device = table_slice(
+            RT_LOCAL_ADJUSTMENTS_SLOT_SH_HL_OFFSET,
+            RT_LOCAL_ADJUSTMENTS_SLOT_SH_HL_ACTIVE,
+            RT_LOCAL_ADJUSTMENTS_SH_LUT_ENTRIES, "shadows/highlights "
+            "highlight", &sh_hl_key);
+        StageDeviceBufferPtr sh_sh_device = table_slice(
+            RT_LOCAL_ADJUSTMENTS_SLOT_SH_SH_OFFSET,
+            RT_LOCAL_ADJUSTMENTS_SLOT_SH_SH_ACTIVE,
+            RT_LOCAL_ADJUSTMENTS_SH_LUT_ENTRIES, "shadows/highlights "
+            "shadow", &sh_sh_key);
         if (!light_device || !satur_device || !saturmoins_device ||
-            !skin_device) {
+            !skin_device || !sh_hl_device || !sh_sh_device) {
             return RT_STAGE_FALLBACK;
         }
 
@@ -8724,8 +8815,41 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
             StageDeviceBufferPtr scratch_device = residency->acquire(
                 &scratch_key, StageBufferShape{RT_STAGE_F32, bfw, bfh, 1},
                 &error);
+            /*
+             * shadows/highlights' mask/guide pair and guidedFilter()'s five
+             * subsampled arrays. They exist only when the tool runs.
+             */
+            const int sh_sw = bfw / RT_LOCAL_ADJUSTMENTS_SH_SUBSAMPLING;
+            const int sh_sh = bfh / RT_LOCAL_ADJUSTMENTS_SH_SUBSAMPLING;
+            StageDeviceBufferPtr sh_full_device;
+            StageDeviceBufferPtr sh_i1_device;
+            StageDeviceBufferPtr sh_p1_device;
+            StageDeviceBufferPtr sh_meani_device;
+            StageDeviceBufferPtr sh_meanp_device;
+            StageDeviceBufferPtr sh_temp_device;
+            if (shadowsHighlights) {
+                const StageBufferShape sh_sub_shape{RT_STAGE_F32, sh_sw,
+                                                    sh_sh, 1};
+                sh_full_device = residency->acquire(
+                    &sh_full_key, StageBufferShape{RT_STAGE_F32, bfw, bfh, 2},
+                    &error);
+                sh_i1_device =
+                    residency->acquire(&sh_i1_key, sh_sub_shape, &error);
+                sh_p1_device =
+                    residency->acquire(&sh_p1_key, sh_sub_shape, &error);
+                sh_meani_device =
+                    residency->acquire(&sh_meani_key, sh_sub_shape, &error);
+                sh_meanp_device =
+                    residency->acquire(&sh_meanp_key, sh_sub_shape, &error);
+                sh_temp_device =
+                    residency->acquire(&sh_temp_key, sh_sub_shape, &error);
+            }
             if (!work_device || !scratch_device || !blur_device[0] ||
-                !blur_device[1] || !blur_device[2]) {
+                !blur_device[1] || !blur_device[2] ||
+                (shadowsHighlights &&
+                 (!sh_full_device || !sh_i1_device || !sh_p1_device ||
+                  !sh_meani_device || !sh_meanp_device ||
+                  !sh_temp_device))) {
                 error = "local.adjustments ROI allocation failed";
                 return RT_STAGE_FALLBACK;
             }
@@ -8747,12 +8871,52 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
             const int blur_pitch = int_pitch(pitch_of(blur_device[0]), "blur");
             const int scratch_pitch =
                 int_pitch(pitch_of(scratch_device), "scratch");
+            int sh_full_pitch = 0;
+            int sh_full_plane = 0;
+            int sh_sub_pitch = 0;
+            if (shadowsHighlights) {
+                sh_full_pitch =
+                    int_pitch(pitch_of(sh_full_device), "shadows/highlights");
+                sh_full_plane = int_pitch(plane_pitch_of(sh_full_device),
+                                          "shadows/highlights plane");
+                sh_sub_pitch = int_pitch(pitch_of(sh_i1_device),
+                                         "shadows/highlights sub");
+                if (pitch_of(sh_p1_device) != pitch_of(sh_i1_device) ||
+                    pitch_of(sh_meani_device) != pitch_of(sh_i1_device) ||
+                    pitch_of(sh_meanp_device) != pitch_of(sh_i1_device) ||
+                    pitch_of(sh_temp_device) != pitch_of(sh_i1_device)) {
+                    error = "local.adjustments shadows/highlights subsampled "
+                            "buffers have different pitches";
+                    return RT_STAGE_FALLBACK;
+                }
+                if (sh_full_pitch < 0 || sh_full_plane < 0 ||
+                    sh_sub_pitch < 0) {
+                    return RT_STAGE_FALLBACK;
+                }
+                if (sh_sw < 3 || sh_sh < 3) {
+                    error = "local.adjustments shadows/highlights grid is too "
+                            "small";
+                    return RT_STAGE_FALLBACK;
+                }
+            }
             if (work_pitch < 0 || work_plane < 0 || blur_pitch < 0 ||
                 scratch_pitch < 0) {
                 return RT_STAGE_FALLBACK;
             }
             cl_mem work_memory = memory_of(work_device);
             cl_mem scratch_memory = memory_of(scratch_device);
+            cl_mem sh_full_memory =
+                shadowsHighlights ? memory_of(sh_full_device) : nullptr;
+            cl_mem sh_i1_memory =
+                shadowsHighlights ? memory_of(sh_i1_device) : nullptr;
+            cl_mem sh_p1_memory =
+                shadowsHighlights ? memory_of(sh_p1_device) : nullptr;
+            cl_mem sh_meani_memory =
+                shadowsHighlights ? memory_of(sh_meani_device) : nullptr;
+            cl_mem sh_meanp_memory =
+                shadowsHighlights ? memory_of(sh_meanp_device) : nullptr;
+            cl_mem sh_temp_memory =
+                shadowsHighlights ? memory_of(sh_temp_device) : nullptr;
 
             /*
              * The host's tool blocks each start from a fresh copy of the
@@ -8869,6 +9033,298 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
             };
 
             /*
+             * shadows/highlights. The Lab-mode "std" method is
+             * ImProcFunctions::shadowsHighlights() on the ROI: a highlight
+             * round, then a shadow round. Each round builds the mask and
+             * guide, runs guidedFilter() with an explicit subsampling of
+             * four, and applies the host-built tone table. The kernels are
+             * the lab.tools fragments.
+             */
+            const auto sh_box_blur =
+                [&](cl_mem src, cl_mem dst, cl_int radius_value,
+                    cl_int grid_width, cl_int grid_height) {
+                cl_uint arg = 0;
+                bool ok = true;
+                ok = ok && set(sh_box_h_kernel, arg++, sizeof(cl_mem), &src);
+                ok = ok && set(sh_box_h_kernel, arg++, sizeof(cl_mem),
+                               &sh_temp_memory);
+                ok = ok && set(sh_box_h_kernel, arg++, sizeof(cl_int),
+                               &radius_value);
+                ok = ok && set(sh_box_h_kernel, arg++, sizeof(cl_int),
+                               &grid_width);
+                ok = ok && set(sh_box_h_kernel, arg++, sizeof(cl_int),
+                               &grid_height);
+                ok = ok && set(sh_box_h_kernel, arg++, sizeof(cl_int),
+                               &sh_sub_pitch);
+                if (!ok) {
+                    error = "local.adjustments shadows/highlights box blur "
+                            "arguments failed";
+                    return false;
+                }
+                if (!launch2d(sh_box_h_kernel, 1,
+                              static_cast<std::size_t>(grid_height),
+                              "shadows/highlights horizontal box blur")) {
+                    return false;
+                }
+                arg = 0;
+                ok = true;
+                ok = ok && set(sh_box_v_kernel, arg++, sizeof(cl_mem),
+                               &sh_temp_memory);
+                ok = ok && set(sh_box_v_kernel, arg++, sizeof(cl_mem), &dst);
+                ok = ok && set(sh_box_v_kernel, arg++, sizeof(cl_int),
+                               &radius_value);
+                ok = ok && set(sh_box_v_kernel, arg++, sizeof(cl_int),
+                               &grid_width);
+                ok = ok && set(sh_box_v_kernel, arg++, sizeof(cl_int),
+                               &grid_height);
+                ok = ok && set(sh_box_v_kernel, arg++, sizeof(cl_int),
+                               &sh_sub_pitch);
+                if (!ok) {
+                    error = "local.adjustments shadows/highlights box blur "
+                            "arguments failed";
+                    return false;
+                }
+                return launch2d(sh_box_v_kernel,
+                                static_cast<std::size_t>(grid_width), 1,
+                                "shadows/highlights vertical box blur");
+            };
+
+            const auto sh_combine =
+                [&](cl_mem dst, cl_mem a, cl_mem b, cl_mem c, cl_int op,
+                    cl_float epsilon, cl_int grid_width,
+                    cl_int grid_height) {
+                cl_uint arg = 0;
+                bool ok = true;
+                ok = ok && set(sh_combine_kernel, arg++, sizeof(cl_mem), &dst);
+                ok = ok && set(sh_combine_kernel, arg++, sizeof(cl_mem), &a);
+                ok = ok && set(sh_combine_kernel, arg++, sizeof(cl_mem), &b);
+                ok = ok && set(sh_combine_kernel, arg++, sizeof(cl_mem), &c);
+                ok = ok && set(sh_combine_kernel, arg++, sizeof(cl_int), &op);
+                ok = ok && set(sh_combine_kernel, arg++, sizeof(cl_float),
+                               &epsilon);
+                ok = ok && set(sh_combine_kernel, arg++, sizeof(cl_int),
+                               &sh_sub_pitch);
+                ok = ok && set(sh_combine_kernel, arg++, sizeof(cl_int),
+                               &grid_width);
+                ok = ok && set(sh_combine_kernel, arg++, sizeof(cl_int),
+                               &grid_height);
+                if (!ok) {
+                    error = "local.adjustments shadows/highlights guided "
+                            "filter arguments failed";
+                    return false;
+                }
+                return launch2d(sh_combine_kernel,
+                                static_cast<std::size_t>(grid_width),
+                                static_cast<std::size_t>(grid_height),
+                                "shadows/highlights guided filter");
+            };
+
+            const auto run_shadows_highlights_round =
+                [&](bool hl, int tonalwidth, cl_mem lut,
+                    const char* label) {
+                const cl_int hl_flag = hl ? 1 : 0;
+                const cl_float thresh =
+                    shadowsHighlightsThreshold(tonalwidth);
+                const cl_float scale_value =
+                    shadowsHighlightsScale(thresh, hl);
+                const cl_int sw = sh_sw;
+                const cl_int sh = sh_sh;
+                const std::size_t sub_global[2] = {
+                    static_cast<std::size_t>(sw),
+                    static_cast<std::size_t>(sh)};
+                const cl_float sub_col_scale =
+                    static_cast<cl_float>(bfw) / static_cast<cl_float>(sw);
+                const cl_float sub_row_scale =
+                    static_cast<cl_float>(bfh) / static_cast<cl_float>(sh);
+                const cl_float up_col_scale =
+                    static_cast<cl_float>(sw) / static_cast<cl_float>(bfw);
+                const cl_float up_row_scale =
+                    static_cast<cl_float>(sh) / static_cast<cl_float>(bfh);
+
+                cl_uint arg = 0;
+                bool ok = true;
+                ok = ok && set(sh_mask_kernel, arg++, sizeof(cl_mem),
+                               &work_memory);
+                ok = ok && set(sh_mask_kernel, arg++, sizeof(cl_mem),
+                               &sh_full_memory);
+                ok = ok && set(sh_mask_kernel, arg++, sizeof(cl_int), &bfw);
+                ok = ok && set(sh_mask_kernel, arg++, sizeof(cl_int), &bfh);
+                ok = ok && set(sh_mask_kernel, arg++, sizeof(cl_int),
+                               &work_pitch);
+                ok = ok && set(sh_mask_kernel, arg++, sizeof(cl_int),
+                               &work_plane);
+                ok = ok && set(sh_mask_kernel, arg++, sizeof(cl_int),
+                               &sh_full_pitch);
+                ok = ok && set(sh_mask_kernel, arg++, sizeof(cl_int),
+                               &sh_full_plane);
+                ok = ok && set(sh_mask_kernel, arg++, sizeof(cl_int),
+                               &hl_flag);
+                ok = ok && set(sh_mask_kernel, arg++, sizeof(cl_float),
+                               &thresh);
+                ok = ok && set(sh_mask_kernel, arg++, sizeof(cl_float),
+                               &scale_value);
+                if (!ok) {
+                    error = std::string("local.adjustments ") + label +
+                            " mask arguments failed";
+                    return false;
+                }
+                if (!launch2d(sh_mask_kernel,
+                              static_cast<std::size_t>(bfw),
+                              static_cast<std::size_t>(bfh),
+                              "shadows/highlights mask")) {
+                    return false;
+                }
+
+                arg = 0;
+                ok = true;
+                ok = ok && set(sh_subsample_kernel, arg++, sizeof(cl_mem),
+                               &sh_full_memory);
+                ok = ok && set(sh_subsample_kernel, arg++, sizeof(cl_mem),
+                               &sh_i1_memory);
+                ok = ok && set(sh_subsample_kernel, arg++, sizeof(cl_mem),
+                               &sh_p1_memory);
+                ok = ok && set(sh_subsample_kernel, arg++, sizeof(cl_int),
+                               &sw);
+                ok = ok && set(sh_subsample_kernel, arg++, sizeof(cl_int),
+                               &sh);
+                ok = ok && set(sh_subsample_kernel, arg++, sizeof(cl_int),
+                               &bfw);
+                ok = ok && set(sh_subsample_kernel, arg++, sizeof(cl_int),
+                               &bfh);
+                ok = ok && set(sh_subsample_kernel, arg++, sizeof(cl_int),
+                               &sh_full_pitch);
+                ok = ok && set(sh_subsample_kernel, arg++, sizeof(cl_int),
+                               &sh_full_plane);
+                ok = ok && set(sh_subsample_kernel, arg++, sizeof(cl_int),
+                               &sh_sub_pitch);
+                ok = ok && set(sh_subsample_kernel, arg++, sizeof(cl_float),
+                               &sub_col_scale);
+                ok = ok && set(sh_subsample_kernel, arg++, sizeof(cl_float),
+                               &sub_row_scale);
+                if (!ok) {
+                    error = std::string("local.adjustments ") + label +
+                            " subsample arguments failed";
+                    return false;
+                }
+                if (!launch2d(sh_subsample_kernel, sub_global[0],
+                              sub_global[1], "shadows/highlights subsample")) {
+                    return false;
+                }
+
+                const cl_int radius_value = guidedFilterBoxRadius(
+                    shadowsHighlightsRadius(
+                        static_cast<int>(
+                            rec[RT_LOCAL_ADJUSTMENTS_SLOT_SH_RADIUS]),
+                        1),
+                    RT_LOCAL_ADJUSTMENTS_SH_SUBSAMPLING, sw, sh);
+                const cl_float epsilon = RT_LOCAL_ADJUSTMENTS_SH_EPSILON;
+
+                if (!sh_box_blur(sh_i1_memory, sh_meani_memory,
+                                 radius_value, sw, sh) ||
+                    !sh_box_blur(sh_p1_memory, sh_meanp_memory,
+                                 radius_value, sw, sh)) {
+                    return false;
+                }
+                if (!sh_combine(sh_p1_memory, sh_i1_memory, sh_p1_memory,
+                                sh_p1_memory, 0, epsilon, sw, sh) ||
+                    !sh_box_blur(sh_p1_memory, sh_p1_memory, radius_value, sw,
+                                 sh)) {
+                    return false;
+                }
+                if (!sh_combine(sh_i1_memory, sh_i1_memory, sh_i1_memory,
+                                sh_i1_memory, 0, epsilon, sw, sh) ||
+                    !sh_box_blur(sh_i1_memory, sh_i1_memory, radius_value, sw,
+                                 sh)) {
+                    return false;
+                }
+                if (!sh_combine(sh_i1_memory, sh_meani_memory, sh_meani_memory,
+                                sh_i1_memory, 1, epsilon, sw, sh) ||
+                    !sh_combine(sh_p1_memory, sh_meani_memory, sh_meanp_memory,
+                                sh_p1_memory, 1, epsilon, sw, sh)) {
+                    return false;
+                }
+                if (!sh_combine(sh_i1_memory, sh_p1_memory, sh_i1_memory,
+                                sh_i1_memory, 2, epsilon, sw, sh) ||
+                    !sh_combine(sh_p1_memory, sh_i1_memory, sh_meani_memory,
+                                sh_meanp_memory, 1, epsilon, sw, sh)) {
+                    return false;
+                }
+                if (!sh_box_blur(sh_i1_memory, sh_i1_memory, radius_value, sw,
+                                 sh) ||
+                    !sh_box_blur(sh_p1_memory, sh_p1_memory, radius_value, sw,
+                                 sh)) {
+                    return false;
+                }
+
+                arg = 0;
+                ok = true;
+                ok = ok && set(sh_upsample_kernel, arg++, sizeof(cl_mem),
+                               &sh_i1_memory);
+                ok = ok && set(sh_upsample_kernel, arg++, sizeof(cl_mem),
+                               &sh_p1_memory);
+                ok = ok && set(sh_upsample_kernel, arg++, sizeof(cl_mem),
+                               &sh_full_memory);
+                ok = ok && set(sh_upsample_kernel, arg++, sizeof(cl_int), &sw);
+                ok = ok && set(sh_upsample_kernel, arg++, sizeof(cl_int), &sh);
+                ok = ok && set(sh_upsample_kernel, arg++, sizeof(cl_int),
+                               &bfw);
+                ok = ok && set(sh_upsample_kernel, arg++, sizeof(cl_int),
+                               &bfh);
+                ok = ok && set(sh_upsample_kernel, arg++, sizeof(cl_int),
+                               &sh_sub_pitch);
+                ok = ok && set(sh_upsample_kernel, arg++, sizeof(cl_int),
+                               &sh_full_pitch);
+                ok = ok && set(sh_upsample_kernel, arg++, sizeof(cl_int),
+                               &sh_full_plane);
+                ok = ok && set(sh_upsample_kernel, arg++, sizeof(cl_float),
+                               &up_col_scale);
+                ok = ok && set(sh_upsample_kernel, arg++, sizeof(cl_float),
+                               &up_row_scale);
+                if (!ok) {
+                    error = std::string("local.adjustments ") + label +
+                            " upsample arguments failed";
+                    return false;
+                }
+                if (!launch2d(sh_upsample_kernel,
+                              static_cast<std::size_t>(bfw),
+                              static_cast<std::size_t>(bfh),
+                              "shadows/highlights upsample")) {
+                    return false;
+                }
+
+                arg = 0;
+                ok = true;
+                ok = ok && set(sh_apply_kernel, arg++, sizeof(cl_mem),
+                               &work_memory);
+                ok = ok && set(sh_apply_kernel, arg++, sizeof(cl_mem),
+                               &sh_full_memory);
+                const cl_int sh_lut_size =
+                    static_cast<cl_int>(RT_LOCAL_ADJUSTMENTS_SH_LUT_ENTRIES);
+                ok = ok && set(sh_apply_kernel, arg++, sizeof(cl_mem), &lut);
+                ok = ok && set(sh_apply_kernel, arg++, sizeof(cl_int),
+                               &sh_lut_size);
+                ok = ok && set(sh_apply_kernel, arg++, sizeof(cl_int), &bfw);
+                ok = ok && set(sh_apply_kernel, arg++, sizeof(cl_int), &bfh);
+                ok = ok && set(sh_apply_kernel, arg++, sizeof(cl_int),
+                               &work_pitch);
+                ok = ok && set(sh_apply_kernel, arg++, sizeof(cl_int),
+                               &work_plane);
+                ok = ok && set(sh_apply_kernel, arg++, sizeof(cl_int),
+                               &sh_full_pitch);
+                ok = ok && set(sh_apply_kernel, arg++, sizeof(cl_int),
+                               &hl_flag);
+                if (!ok) {
+                    error = std::string("local.adjustments ") + label +
+                            " blend arguments failed";
+                    return false;
+                }
+                return launch2d(sh_apply_kernel,
+                                static_cast<std::size_t>(bfw),
+                                static_cast<std::size_t>(bfh),
+                                "shadows/highlights blend");
+            };
+
+            /*
              * Vibrance. ImProcFunctions::vibrance() runs on the ROI copy;
              * the blend is transit_shapedetect2() with the vibrance scope
              * sensitivity (lp.sensv). The skin curve and the Munsell set are
@@ -8945,6 +9401,44 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
                 }
                 if (!run_blend("vibrance",
                                rec[RT_LOCAL_ADJUSTMENTS_SLOT_SENSV])) {
+                    return RT_STAGE_FALLBACK;
+                }
+            }
+
+            /*
+             * shadows/highlights. The Lab-mode "std" method is
+             * ImProcFunctions::shadowsHighlights() on the ROI, after vibrance
+             * and before local contrast, as in Lab_Local(). The pass takes a
+             * fresh ROI copy of the image as vibrance left it.
+             */
+            if (shadowsHighlights) {
+                if (!copy_roi() ||
+                    !blur_roi(*setup.iir_shadows_highlights,
+                              "shadows/highlights blur")) {
+                    return RT_STAGE_FALLBACK;
+                }
+                const cl_int highlight_amount = static_cast<cl_int>(
+                    rec[RT_LOCAL_ADJUSTMENTS_SLOT_SH_HIGHLIGHTS]);
+                const cl_int shadow_amount = static_cast<cl_int>(
+                    rec[RT_LOCAL_ADJUSTMENTS_SLOT_SH_SHADOWS]);
+                if (highlight_amount > 0 &&
+                    !run_shadows_highlights_round(
+                        true,
+                        static_cast<int>(
+                            rec[RT_LOCAL_ADJUSTMENTS_SLOT_SH_HL_TONAL]),
+                        memory_of(sh_hl_device), "highlight")) {
+                    return RT_STAGE_FALLBACK;
+                }
+                if (shadow_amount > 0 &&
+                    !run_shadows_highlights_round(
+                        false,
+                        static_cast<int>(
+                            rec[RT_LOCAL_ADJUSTMENTS_SLOT_SH_SH_TONAL]),
+                        memory_of(sh_sh_device), "shadow")) {
+                    return RT_STAGE_FALLBACK;
+                }
+                if (!run_blend("shadows/highlights",
+                               rec[RT_LOCAL_ADJUSTMENTS_SLOT_SENSSH])) {
                     return RT_STAGE_FALLBACK;
                 }
             }

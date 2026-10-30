@@ -25,6 +25,7 @@
 #include "iccstore.h"
 #include "imagefloat.h"
 #include "improcfun.h"
+#include "ipshadowshighlights.h"
 #include "labimage.h"
 #include "localadjustments.h"
 #include "mytime.h"
@@ -106,14 +107,61 @@ bool explicitMaskIdle(const procparams::LocallabParams::LocallabSpot& spot)
            !spot.enacieMaskall;
 }
 
-/* Every tool other than the three this node runs. The exposure and soft-light
+/* Every tool other than the four this node runs. The exposure and soft-light
  * tools also decide the clamp arm; they are residuals here. */
 bool otherToolEnabled(const procparams::LocallabParams::LocallabSpot& spot)
 {
-    return spot.expexpose || spot.expshadhigh ||
-           spot.expsoft || spot.expblur || spot.exptonemap || spot.expreti ||
-           spot.expsharp || spot.expcbdl || spot.explog ||
-           spot.expmask || spot.expcie || spot.expprecam;
+    return spot.expexpose || spot.expsoft || spot.expblur ||
+           spot.exptonemap || spot.expreti || spot.expsharp ||
+           spot.expcbdl || spot.explog || spot.expmask || spot.expcie ||
+           spot.expprecam;
+}
+
+/* Whether the shadows/highlights tool's parameters are inside the device set.
+ * The device runs the block's Lab-mode "std" method. The other methods are
+ * residuals: "tone" needs workingtrc()/tone_eq() and the tone-curve helpers,
+ * "ghs" is GHS (with its own loccont() arm) and "micha" is the Michaelis-Menten
+ * mapper. The std method's own blend is the block's deltaE blend; the
+ * recovery blend (reparsh), the gradient, tone-eq's multizone multipliers and
+ * a non-default tone gamma are separate paths and are refused. */
+bool shadowsHighlightsAdmitted(
+    const procparams::LocallabParams::LocallabSpot& spot)
+{
+    if (spot.shMethod != "std") {
+        return false;
+    }
+    if (spot.highlights < 0 || spot.highlights > 100 ||
+        spot.shadows < 0 || spot.shadows > 100) {
+        return false;
+    }
+    if (spot.h_tonalwidth < 10 || spot.h_tonalwidth > 100 ||
+        spot.s_tonalwidth < 10 || spot.s_tonalwidth > 100) {
+        return false;
+    }
+    if (spot.sh_radius < 0 || spot.sh_radius > 100) {
+        return false;
+    }
+    if (spot.sensihs < 0 || spot.sensihs > 100) {
+        return false;
+    }
+    if (spot.blurSHde < 2 || spot.blurSHde > 100) {
+        return false;
+    }
+    if (spot.reparsh != 100.0) {
+        return false;
+    }
+    if (spot.strSH != 0.0) {
+        return false;
+    }
+    /* tone_eq() reads the six multizone multipliers; tonecurv reads gamSH and
+     * sloSH. Both are residuals even though the std method does not apply
+     * them, because they would otherwise be silent profile data. */
+    for (double multiplier : spot.multsh) {
+        if (multiplier != 0.0) {
+            return false;
+        }
+    }
+    return spot.gamSH == 2.4 && spot.sloSH == 12.92;
 }
 
 /* The local contrast method the node runs: the Gaussian/IIR variant, spelled
@@ -260,11 +308,11 @@ bool localAdjustmentsSupported(const procparams::ProcParams& params)
     /*
      * The block is atomic: every spot must be in the set below. An inactive
      * spot is the clamp-only case; an active spot runs Colour & Light,
-     * vibrance, local contrast or any combination, with optional L/C/H curves
-     * on the colour tool and MUNS. Curves, Munsell, rectangular spots,
-     * inactive spots and multiple spots are supported; every other tool and
-     * the masks, merge, soft radius, gradients and LAB/XYZ gamut methods are
-     * residuals.
+     * vibrance, shadows/highlights (Lab-mode std), local contrast or any
+     * combination, with optional L/C/H curves on the colour tool and MUNS.
+     * Curves, Munsell, rectangular spots, inactive spots and multiple spots
+     * are supported; every other tool and the masks, merge, soft radius,
+     * gradients and LAB/XYZ gamut methods are residuals.
      */
     if (!params.locallab.enabled || params.locallab.spots.empty() ||
         params.locallab.spots.size() > RT_LOCAL_ADJUSTMENTS_MAX_SPOTS) {
@@ -363,11 +411,12 @@ bool localAdjustmentsSupported(const procparams::ProcParams& params)
             spot.transitgrad < -10.0 || spot.transitgrad > 10.0) {
             return false;
         }
-        /* An active spot runs at least one of the three tools in the device
+        /* An active spot runs at least one of the four tools in the device
          * set; an inactive spot does no work, so its tool settings are inert
          * and admitted. */
         if (spot.activ) {
-            if ((!spot.expcolor && !spot.expvibrance && !spot.expcontrast) ||
+            if ((!spot.expcolor && !spot.expvibrance && !spot.expcontrast &&
+                 !spot.expshadhigh) ||
                 otherToolEnabled(spot)) {
                 return false;
             }
@@ -375,6 +424,9 @@ bool localAdjustmentsSupported(const procparams::ProcParams& params)
                 return false;
             }
             if (spot.expcontrast && !localContrastAdmitted(spot)) {
+                return false;
+            }
+            if (spot.expshadhigh && !shadowsHighlightsAdmitted(spot)) {
                 return false;
             }
         }
@@ -1221,6 +1273,48 @@ int LocalAdjustmentsContext::build(int spot, const RtStageBuffer* lab,
         return 1;
     }
 
+    /*
+     * shadows/highlights. The host guard needs the tool on, an active spot and
+     * a positive highlights or shadows slider; a zero/zero tool would run the
+     * block but change nothing, so the device skips it too. Each positive
+     * round's tone table is built by the block's own shadowsHighlightsLut().
+     */
+    const bool shadowsHighlightsRun =
+        profileSpot.expshadhigh && lp.activspot &&
+        (profileSpot.highlights > 0 || profileSpot.shadows > 0);
+    float shHighlightOffset = RT_LOCAL_ADJUSTMENTS_NO_LUT;
+    float shShadowOffset = RT_LOCAL_ADJUSTMENTS_NO_LUT;
+    if (shadowsHighlightsRun) {
+        const TMatrix ws =
+            ICCStore::getInstance()->workingSpaceMatrix(
+                params_.icm.workingProfile);
+        const TMatrix iws =
+            ICCStore::getInstance()->workingSpaceInverseMatrix(
+                params_.icm.workingProfile);
+        LUTf highlightLut(RT_LOCAL_ADJUSTMENTS_SH_LUT_ENTRIES, LUT_CLIP_OFF);
+        LUTf shadowLut(RT_LOCAL_ADJUSTMENTS_SH_LUT_ENTRIES, LUT_CLIP_OFF);
+        if (profileSpot.highlights > 0) {
+            shadowsHighlightsLut(
+                ws, iws, true,
+                shadowsHighlightsAmount(profileSpot.highlights, true), true,
+                false, highlightLut);
+            shHighlightOffset = appendTable(highlightLut);
+            if (shHighlightOffset == RT_LOCAL_ADJUSTMENTS_NO_LUT) {
+                return 1;
+            }
+        }
+        if (profileSpot.shadows > 0) {
+            shadowsHighlightsLut(
+                ws, iws, true,
+                shadowsHighlightsAmount(profileSpot.shadows, false), false,
+                false, shadowLut);
+            shShadowOffset = appendTable(shadowLut);
+            if (shShadowOffset == RT_LOCAL_ADJUSTMENTS_NO_LUT) {
+                return 1;
+            }
+        }
+    }
+
     float* record = spots_.data();
     record[RT_LOCAL_ADJUSTMENTS_SLOT_XC] = lp.xc;
     record[RT_LOCAL_ADJUSTMENTS_SLOT_YC] = lp.yc;
@@ -1324,6 +1418,21 @@ int LocalAdjustmentsContext::build(int spot, const RtStageBuffer* lab,
         static_cast<float>(profileSpot.lightness);
     record[RT_LOCAL_ADJUSTMENTS_SLOT_LC_RADIUS] =
         static_cast<float>(profileSpot.lcradius);
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_EXPSHADHIGHLIGHTS] =
+        shadowsHighlightsRun ? 1.f : 0.f;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_SENSSH] =
+        static_cast<float>(lp.senshs);
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_SH_HIGHLIGHTS] =
+        static_cast<float>(profileSpot.highlights);
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_SH_SHADOWS] =
+        static_cast<float>(profileSpot.shadows);
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_SH_RADIUS] =
+        static_cast<float>(profileSpot.sh_radius);
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_SH_HL_TONAL] =
+        static_cast<float>(profileSpot.h_tonalwidth);
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_SH_SH_TONAL] =
+        static_cast<float>(profileSpot.s_tonalwidth);
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_SH_BLUR] = lp.blurSH;
 
     const auto setTable = [record](int offsetSlot, int activeSlot,
                                    bool active, float offset) {
@@ -1377,6 +1486,14 @@ int LocalAdjustmentsContext::build(int spot, const RtStageBuffer* lab,
              RT_LOCAL_ADJUSTMENTS_SLOT_LIGHT_ACTIVE, lightActive,
              lightActive ? appendTable(lightCurve)
                          : RT_LOCAL_ADJUSTMENTS_NO_LUT);
+    setTable(RT_LOCAL_ADJUSTMENTS_SLOT_SH_HL_OFFSET,
+             RT_LOCAL_ADJUSTMENTS_SLOT_SH_HL_ACTIVE,
+             shHighlightOffset != RT_LOCAL_ADJUSTMENTS_NO_LUT,
+             shHighlightOffset);
+    setTable(RT_LOCAL_ADJUSTMENTS_SLOT_SH_SH_OFFSET,
+             RT_LOCAL_ADJUSTMENTS_SLOT_SH_SH_ACTIVE,
+             shShadowOffset != RT_LOCAL_ADJUSTMENTS_NO_LUT,
+             shShadowOffset);
 
     /*
      * trans-shapedetect2()'s origblur: gaussianBlur() with radius
@@ -1393,6 +1510,9 @@ int LocalAdjustmentsContext::build(int spot, const RtStageBuffer* lab,
         return 1;
     }
     if (!fillIir(static_cast<double>(profileSpot.lcradius), iirLc_)) {
+        return 1;
+    }
+    if (!fillIir(static_cast<double>(2.0f + 0.2f * lp.blurSH), iirSh_)) {
         return 1;
     }
 
@@ -1412,6 +1532,7 @@ int LocalAdjustmentsContext::build(int spot, const RtStageBuffer* lab,
     out.iir = &iir_;
     out.iir_vibrance = &iirVib_;
     out.iir_local_contrast = &iirLc_;
+    out.iir_shadows_highlights = &iirSh_;
     built_ = true;
     return 0;
 }
