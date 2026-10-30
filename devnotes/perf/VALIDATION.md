@@ -228,7 +228,8 @@ node ran on the device rather than only comparing pixels.
 | Single-spot parity, 16 cases | POCL CPU: 2,219,001 samples, `impl=opencl`, finite, worst 0.060547 LSB16 |
 | Complex parity, 17 cases | two/three ELI, reversed order, ELI and RECT, inactive/active both orders, each L/C/H curve alone, L=f(H) alone, all curves and the gate multi-spot profile: 757,449 samples, worst 0.156250 LSB16, `impl=opencl` |
 | Spot order | the three-spot forward and reversed blocks differ on 27,040 of 45,696 samples (PAE 270.833984 LSB16) |
-| Residual parity, 15 cases | MUNS, mask, soft radius, exposure, `reparcol` 50/1, highlight reconstruction, SH, recursion, `exc`, merge, LAB, XYZ, `avoidrad` and RGB curve: `impl=host`, no `impl=opencl`, PAE 0 |
+| Residual parity, 16 cases | MUNS, mask, soft radius, exposure, `reparcol` 50/1, highlight reconstruction, SH, recursion, `exc`, merge, LAB, XYZ, `avoidrad`, RGB curve and GHS clamp leftovers: `impl=host`, no `impl=opencl`, PAE 0 |
+| GHS clamp leftovers before/after | before the fix, an inactive spot with `ghs_D=1` and `ghs_BLP=1` recorded `impl=opencl` and diverged by **1,296 LSB16** on 414,331 of 30,419,712 samples. The predicate now refuses the pair because the host takes the `clipR()` arm; the case is a host residual at PAE 0 |
 | 4-px ROI | host, PAE 0 |
 | `localadjustments.pp3` | PASS, `max_pae=1.5259e-05` (1 LSB16), `impl=opencl` |
 | `localadjustments-multispot.pp3` | PASS, `max_pae=1.5259e-05` (1 LSB16), `impl=opencl`; now a device row, not a SKIP |

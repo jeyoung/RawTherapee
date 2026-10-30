@@ -2830,7 +2830,7 @@ shadows/highlights, vibrance, local contrast, blur/denoise, sharpening, tone
 mapping, Retinex, CBDL, log, soft light, the common mask, CIE CAM, dehaze,
 `exc`/`full`/`main`, merge, explicit masks, soft radius, MUNS, LAB/XYZ/XYZREL,
 the RGB curve, LabGrid, `avoidrad != 0`, `transit == 100`, a blur radius above
-100 and a pre-CBDL pass. A GPU device is refused before the upload.
+100, `ghs_D != 0 && ghs_BLP > 0` and a pre-CBDL pass. A GPU device is refused before the upload.
 
 ### Evidence
 
@@ -2841,7 +2841,8 @@ the RGB curve, LabGrid, `avoidrad != 0`, `transit == 100`, a blur radius above
 | Single-spot scalar matrix, 16 cases | 2,219,001 samples, `impl=opencl`, worst 0.060547 LSB16 |
 | Complex matrix, 17 cases | two/three ELI, reversed order, ELI/RECT, inactive/active both orders, each L/C/H curve alone, L=f(H) alone, all curves, and the gate multi-spot profile: 757,449 samples, `impl=opencl`, worst 0.156250 LSB16 |
 | Spot order | the three-spot forward and reversed blocks differ on 27,040 of 45,696 samples (PAE 270.833984 LSB16), so the sequential state is exercised |
-| Residuals, 15 parity cases | MUNS, explicit mask, soft radius, exposure, `reparcol` 50/1, highlight reconstruction, SH, recursion, `exc`, merge, LAB, XYZ, `avoidrad` and the RGB curve record `impl=host` with no `impl=opencl` and are byte-identical to the block (PAE 0) |
+| Residuals, 16 parity cases | MUNS, explicit mask, soft radius, exposure, `reparcol` 50/1, highlight reconstruction, SH, recursion, `exc`, merge, LAB, XYZ, `avoidrad`, the RGB curve and GHS clamp leftovers record `impl=host` with no `impl=opencl` and are byte-identical to the block (PAE 0) |
+| GHS clamp leftovers | before the admission fix, an inactive spot with `ghs_D=1` and `ghs_BLP=1` recorded `impl=opencl` and diverged by **1,296 LSB16** on 414,331 of 30,419,712 samples; the predicate now refuses the pair and the case is a host residual at PAE 0 |
 | 4-px ROI | host, PAE 0 |
 | `localadjustments.pp3` | PASS, `max_pae=1.5259e-05` (1 LSB16), `impl=opencl` |
 | `localadjustments-multispot.pp3` | PASS, `max_pae=1.5259e-05` (1 LSB16), `impl=opencl` |

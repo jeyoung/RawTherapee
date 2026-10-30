@@ -1719,7 +1719,7 @@ blur/denoise, sharpening, tone mapping, Retinex, CBDL, log, soft light, the
 common mask, CIE CAM, dehaze, `exc`/`full`/`main`, merge, explicit masks,
 soft radius, LAB/XYZ/XYZREL gamut methods, the RGB curve, LabGrid,
 `avoidrad != 0`, `transit == 100`, a blur radius above 100, `reparcol != 100`,
-a ROI below 5 px and an active pre-CBDL pass. A GPU device is refused before
+a ROI below 5 px, `ghs_D != 0 && ghs_BLP > 0` and an active pre-CBDL pass. A GPU device is refused before
 the upload. An inactive block (`locallab.enabled == false` or no spots) never
 enters the node and takes no Lab round trip.
 
