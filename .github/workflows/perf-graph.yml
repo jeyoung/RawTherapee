@@ -1,0 +1,134 @@
+name: perf-graph build and host stage tests
+
+on:
+  pull_request:
+    branches: [perf-graph]
+  push:
+    branches: [perf-graph]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: perf-graph-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.variant }} build and host tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [cpu, opencl]
+    defaults:
+      run:
+        shell: bash
+    env:
+      VARIANT: ${{ matrix.variant }}
+      CCACHE_DIR: ${{ github.workspace }}/build/ccache
+      CCACHE_MAXSIZE: 2G
+      OMP_NUM_THREADS: 2
+      RT_SETTINGS: ${{ github.workspace }}/build/ci-state/settings
+      RT_CACHE: ${{ github.workspace }}/build/ci-state/cache
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install build dependencies
+        run: |
+          mkdir -p build/ci-logs "$RT_SETTINGS" "$RT_CACHE"
+          sudo apt-get update 2>&1 | tee build/ci-logs/apt-update.log
+          sudo apt-get install -y --no-install-recommends \
+            build-essential ccache cmake pkg-config git ca-certificates \
+            libgtkmm-3.0-dev liblcms2-dev liblensfun-dev libexiv2-dev \
+            libfftw3-dev libpng-dev libtiff-dev libjpeg-dev libjxl-dev \
+            libraw-dev libiptcdata0-dev libcanberra-gtk3-dev librsvg2-dev \
+            libexpat1-dev zlib1g-dev libgif-dev opencl-headers \
+            libtool automake autoconf \
+            2>&1 | tee build/ci-logs/apt-install.log
+
+      - name: Restore compiler cache
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: build/ccache
+          key: perf-graph-ubuntu24-gcc-${{ matrix.variant }}-${{ hashFiles('CMakeLists.txt', '**/CMakeLists.txt', 'cmake/**', 'tools/build-rt.sh', 'tools/ccache-rt.sh') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            perf-graph-ubuntu24-gcc-${{ matrix.variant }}-${{ hashFiles('CMakeLists.txt', '**/CMakeLists.txt', 'cmake/**', 'tools/build-rt.sh', 'tools/ccache-rt.sh') }}-
+            perf-graph-ubuntu24-gcc-${{ matrix.variant }}-
+
+      - name: Build applications and stage tests
+        run: |
+          tools/build-rt.sh "$VARIANT" -j 2 --ccache --stage-modules \
+            --build-root "$PWD/build/ci" \
+            2>&1 | tee build/ci-logs/build.log
+
+          # PR checkouts are detached; the helper derives its own directory suffix.
+          mapfile -t caches < <(find build/ci -mindepth 2 -maxdepth 2 \
+            -name CMakeCache.txt -type f)
+          if (( ${#caches[@]} != 1 )); then
+            echo 'Expected exactly one helper build directory' >&2
+            exit 1
+          fi
+          build_dir="$(dirname "${caches[0]}")"
+          printf 'RT_BUILD_DIR=%s\n' "$PWD/$build_dir" >> "$GITHUB_ENV"
+
+          # Explicit host-only set: see CONTRIBUTING.md for the uncovered gates.
+          tests=(
+            stage-cache-test stage-node-cache-test stage-graph-test
+            stage-indexer-test stage-param-hash-test stage-render-state-test
+            stage-param-map-test stage-dirty-blocks-test stage-work-test
+            stage-parity-test stage-pipeline-test stage-store-test
+            editorrequest-test viewport-admission-test denoise-tile-buffers-test
+          )
+          printf '%s\n' "${tests[@]}" > build/ci-logs/tests.txt
+          cmake --build "$build_dir" --parallel 2 --target "${tests[@]}" \
+            2>&1 | tee build/ci-logs/test-build.log
+
+      - name: Run host stage tests (no device parity)
+        run: |
+          {
+            echo "## $VARIANT build: host stage tests"
+            echo
+            echo 'Device parity, POCL, GUI, packaging and performance: NOT RUN.'
+            echo 'ABI unit test: NOT RUN (existing target linkage gap).'
+            echo
+            echo '| Test | Result |'
+            echo '| --- | --- |'
+          } >> "$GITHUB_STEP_SUMMARY"
+          result=0
+          while IFS= read -r test; do
+            log="build/ci-logs/$test.log"
+            if timeout --kill-after=10s 120s "$RT_BUILD_DIR/rtengine/$test" \
+                2>&1 | tee "$log"; then
+              if grep -Eiq '(^|[^[:alnum:]_])skip(ped)?([^[:alnum:]_]|$)' "$log"; then
+                echo "::error::$test reported a skip; host CI requires complete tests"
+                printf '| %s | SKIP (gate failed) |\n' "$test" >> "$GITHUB_STEP_SUMMARY"
+                result=1
+              else
+                printf '| %s | PASS |\n' "$test" >> "$GITHUB_STEP_SUMMARY"
+              fi
+            else
+              status=$?
+              printf '| %s | FAIL (exit %s) |\n' "$test" "$status" >> "$GITHUB_STEP_SUMMARY"
+              result=1
+            fi
+          done < build/ci-logs/tests.txt
+          exit "$result"
+
+      - name: Report compiler cache statistics
+        if: always()
+        run: ccache --show-stats 2>&1 | tee build/ci-logs/ccache.log
+
+      - name: Upload failure logs
+        if: failure()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: perf-graph-${{ matrix.variant }}-logs
+          path: build/ci-logs/
+          if-no-files-found: warn
+          retention-days: 7
