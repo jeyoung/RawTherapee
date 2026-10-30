@@ -1427,7 +1427,7 @@ __kernel void rt_local_adjustments_softlight(
  */
 
 /* std::numeric_limits<float>::max() / 100.f, as norm2() uses. */
-#define RT_LA_LOG_FLOAT_MAX 3.4028234663852886e+38f
+#define RT_LA_LOG_FLOAT_MAX 3.4028234663852886e+36f
 
 /* iplocallab.cc power_norm(). */
 inline float rt_la_log_power_norm(const float r, const float g,
