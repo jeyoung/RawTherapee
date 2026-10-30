@@ -2745,19 +2745,21 @@ submission.
 `local.adjustments` is the export block at `simpleprocess.cc:1468`. The device
 increment covers any number of `norm` spots in list order, both `ELI` and
 `RECT`, inactive clamp-only spots, the L/C/H curves, vibrance, Gaussian local
-contrast, Lab-mode `"std"` shadows/highlights, and the `avoidgamutMethod`
-values `"NONE"` and `"MUNS"`. The per-spot clamp is bit-exact against the
-host, so the Munsell pass runs on the device. The other tools, the other
-shadows/highlights methods (tone, GHS, Michaelis-Menten) and their tone-eq,
-recovery and gradient sub-options, explicit masks, soft radius, merge,
-recursion, LabGrid, the RGB and exposure curves, `reparcol != 100` and the
+contrast, Lab-mode `"std"` shadows/highlights, per-pixel `"soft"` soft light,
+and the `avoidgamutMethod` values `"NONE"` and `"MUNS"`. The per-spot clamp
+is bit-exact against the host, so the Munsell pass runs on the device. The
+other tools, the other shadows/highlights methods (tone, GHS,
+Michaelis-Menten) and their tone-eq, recovery and gradient sub-options, the
+soft-light `"reti"` method, explicit masks, soft radius, merge, recursion,
+LabGrid, the RGB and exposure curves, `reparcol != 100` and the
 LAB/XYZ/XYZREL methods stay on the host. The tools run in the block's order:
-vibrance, shadows/highlights, local contrast, then Colour & Light.
+vibrance, shadows/highlights, soft light, local contrast, then Colour &
+Light.
 
 ### ABI, state and host setup
 
 The node takes a three-plane `F32` Lab buffer, a pointer to
-`RtLocalAdjustmentsContext` (version 3, magic `0x4C414A43`, size checked,
+`RtLocalAdjustmentsContext` (version 4, magic `0x4C414A43`, size checked,
 `spot_count` from the profile) and the block support flag. The call site only
 prefills `labView` with `rgb2lab(baseImg)` when the block is active and the
 whole-block predicate is true; an inactive block never enters the node.
@@ -2766,7 +2768,7 @@ The launcher keeps a contiguous host staging copy of the Lab image and a
 device `reserved` copy of the initial image. For each spot it calls
 `build(self, spot, &staging, &setup)`, which runs the block's own
 `calcLocalParams()`, `calc_ref()` on the current Lab, `complexCurvelocal()`
-and the curve factories. It then uploads that spot's 94-float record and
+and the curve factories. It then uploads that spot's 97-float record and
 tables, runs the passes, and reads the device image back into the staging
 copy. Spot N+1's references therefore see spot N's result through the same
 read-back path as the CPU's `labView`. `reserved` is never updated, matching
@@ -2798,6 +2800,9 @@ lab.regions `xlogf`/`xexpf`/`pow_F` ports, and the local-adjustments kernels:
   runs it on the ROI once per positive round, highlight then shadow, with the
   host-built `shadowsHighlightsLut()` table and the block's radius, threshold
   and scale helpers.
+- `rt_local_adjustments_softlight`: `ImProcFunctions::softLight()`'s per-pixel
+  Lab -> XYZ -> working RGB round trip and Pegtop curve, using the host's
+  working matrices, `Color::gammatab_srgb`/`igammatab_srgb` and Lab caches.
 - `rt_local_adjustments_apply`: the colour core, `calcTransition()` for ELI
   or `calcTransitionrect()` for RECT, the deltaE scope against the blurred
   original, `calcreducdE()`/`calcLocalFactor()` and the L/C/H curve sequence
@@ -2807,9 +2812,9 @@ lab.regions `xlogf`/`xexpf`/`pow_F` ports, and the local-adjustments kernels:
   the predicate. Its chroma normalisation repeats the host's SIMD/scalar
   split in the same way as the clamp.
 
-The per-spot order is prefilter, then vibrance, shadows/highlights, local
-contrast and Colour & Light, then the tail clamp. Each tool takes a fresh ROI
-copy and its own deltaE blur. `avoidcolshi()` runs after the tail clamp in the
+The per-spot order is prefilter, then vibrance, shadows/highlights, soft
+light, local contrast and Colour & Light, then the tail clamp. Each tool
+takes a fresh ROI copy and its own deltaE blur. `avoidcolshi()` runs after the tail clamp in the
 CPU, so the MUNS kernel is ordered there; the Munsell tables and the fixed
 `reserved` image are uploaded once.
 
@@ -2818,6 +2823,12 @@ plane, `guidedFilter()` on a subsampled grid of four, the tone table, then
 `transit_shapedetect2()`'s deltaE blend with `senshs`. The launcher requires
 an ROI of at least 12 px per axis for the guided filter and falls back to the
 host otherwise.
+
+Soft light takes the default `3/sk` deltaE reference blur and blends with
+`senssf`. The host guard is `strng > 1`, so a strength of one is a recorded
+no-op; a strength above two also selects the host's Laplacian clamp arm. The
+predicate admits only `softMethod == "soft"` with `streng` and `sensisf` in
+`1..100`; `"reti"` is the retinex path and stays on the host.
 
 ### Curve provenance and exactness
 
@@ -2855,23 +2866,25 @@ all-curves case); no separate MUNS-only worst is claimed.
 ### Residuals
 
 An active spot runs Colour & Light, vibrance, Lab-mode `"std"`
-shadows/highlights and/or Gaussian local contrast, requires
-`reparcol == 100`, no explicit mask, soft radius, merge, recursion, inversion,
-gradient, LabGrid, RGB or exposure curve, an `avoidgamutMethod` other than
-`"NONE"`/`"MUNS"`, and a ROI of at least 5 px in each dimension (12 px when
-shadows/highlights runs). Shadows/highlights additionally requires
-`shMethod == "std"`, `reparsh == 100`, `strSH == 0`, zero `multsh`
-multipliers, `gamSH == 2.4`, `sloSH == 12.92` and sliders inside their ABI
-ranges; the `"tone"`, `"ghs"` and `"micha"` methods are host residuals.
-Inactive spots are clamp-only and may carry inert tool settings. Everything
-else is a residual: exposure (FFT PDE), the other shadows/highlights methods
-and tone-eq/recovery/gradient sub-options, the local-contrast wavelet and FFT
+shadows/highlights, per-pixel `"soft"` soft light and/or Gaussian local
+contrast, requires `reparcol == 100`, no explicit mask, soft radius, merge,
+recursion, inversion, gradient, LabGrid, RGB or exposure curve, an
+`avoidgamutMethod` other than `"NONE"`/`"MUNS"`, and a ROI of at least 5 px in
+each dimension (12 px when shadows/highlights runs). Shadows/highlights
+additionally requires `shMethod == "std"`, `reparsh == 100`, `strSH == 0`,
+zero `multsh` multipliers, `gamSH == 2.4`, `sloSH == 12.92` and sliders inside
+their ABI ranges; the `"tone"`, `"ghs"` and `"micha"` methods are host
+residuals. Soft light requires `softMethod == "soft"` with `streng` and
+`sensisf` in `1..100`; `"reti"` is a host residual. Inactive spots are
+clamp-only and may carry inert tool settings. Everything else is a residual:
+exposure (FFT PDE), the other shadows/highlights methods and
+tone-eq/recovery/gradient sub-options, the local-contrast wavelet and FFT
 variants, vibrance gamma/gradients/warm, blur/denoise, sharpening, tone
-mapping, Retinex, CBDL, log, soft light, the common mask, CIE CAM, dehaze,
-`exc`/`full`/`main`, merge, explicit masks, soft radius, LAB/XYZ/XYZREL, the
-RGB curve, LabGrid, `avoidrad != 0`, `transit == 100`, a blur radius above
-100, `ghs_D != 0 && ghs_BLP > 0` and a pre-CBDL pass. A GPU device is refused
-before the upload.
+mapping, Retinex, CBDL, log, soft light `"reti"`, the common mask, CIE CAM,
+dehaze, `exc`/`full`/`main`, merge, explicit masks, soft radius,
+LAB/XYZ/XYZREL, the RGB curve, LabGrid, `avoidrad != 0`, `transit == 100`, a
+blur radius above 100, `ghs_D != 0 && ghs_BLP > 0` and a pre-CBDL pass. A GPU
+device is refused before the upload.
 
 ### Evidence
 
@@ -2882,9 +2895,10 @@ before the upload.
 | Single-spot scalar matrix, 16 cases | 2,219,001 samples, `impl=opencl`, worst 0.031250 LSB16 |
 | Complex matrix, 22 cases | two/three ELI, reversed order, ELI/RECT, inactive/active both orders, each L/C/H curve alone, L=f(H) alone, all curves, one MUNS spot, MUNS at 179x49, MUNS and NONE, inactive then MUNS, all curves with MUNS, and the gate multi-spot profile: 966,546 samples, `impl=opencl`, worst 0.125000 LSB16 |
 | Shadows/highlights matrix, 12 cases | alone, highlight-only, shadow-only, RECT, MUNS, 179x49, 8192x64, colour+SH, vibrance+SH, SH+local contrast, all four tools and a second SH spot: 2,056,137 samples, `impl=opencl`, finite, worst 0.053711 LSB16 (second spot; all four tools 0.031250), every case within 1 LSB16. Non-vacuity: the tool changes 17,023 of 45,696 samples (PAE 362.355469 LSB16) against the same spot with the tool off |
+| Soft-light matrix, 11 cases | alone at 238x64, 179x49 and 8192x64, RECT, MUNS, strength 3, colour+soft, SH+soft, soft+local contrast, all five tools and a second spot: `impl=opencl`, finite, worst 0.053711 LSB16 (second spot; all five tools 0.031250; 8192x64 0.030518). Non-vacuity: the tool changes 22,897 of 45,696 samples (PAE 3206.698242 LSB16) against the same spot with soft light off |
 | Clamp only, 6 cases | inactive spots at 238x64 (prefilter and tail only), 237x49 (prefilter, tail 1), 179x49 (both), and 8192x64 (prefilter): 1,751,721 samples, `impl=opencl`, **bit-exact** (PAE 0, 0 differing samples). Before the fix the same cases diverged by up to 0.045898 LSB16 |
 | Spot order | the three-spot forward and reversed blocks differ on 27,040 of 45,696 samples (PAE 270.833984 LSB16), so the sequential state is exercised |
-| Residual matrix | explicit mask, soft radius, exposure, `reparcol` 50/1, highlight reconstruction, the SH `"micha"`/`"tone"`/`"ghs"` methods, SH tone-eq multipliers, a non-default SH tone gamma/slope, the SH recovery blend and gradient, each SH slider outside its range, the SH explicit mask, recursion, `exc`, merge, LAB, XYZ, `avoidrad`, the RGB curve and GHS clamp leftovers record `impl=host` with no `impl=opencl` and are byte-identical to the block (PAE 0) |
+| Residual matrix | explicit mask, soft radius, exposure, `reparcol` 50/1, highlight reconstruction, the SH `"micha"`/`"tone"`/`"ghs"` methods, SH tone-eq multipliers, a non-default SH tone gamma/slope, the SH recovery blend and gradient, each SH slider outside its range, the SH explicit mask, soft-light `"reti"`, mask, soft radius, zero strength, strength 101 and sensitivity 101, recursion, `exc`, merge, LAB, XYZ, `avoidrad`, the RGB curve and GHS clamp leftovers record `impl=host` with no `impl=opencl` and are byte-identical to the block (PAE 0) |
 | GHS clamp leftovers | before the admission fix, an inactive spot with `ghs_D=1` and `ghs_BLP=1` recorded `impl=opencl` and diverged by **1,296 LSB16** on 414,331 of 30,419,712 samples; the predicate now refuses the pair and the case is a host residual at PAE 0 |
 | 4-px ROI | host, PAE 0 |
 | 10-px shadows/highlights ROI | below the guided filter's 3 x 4 subsampled floor: host, PAE 0, no `impl=opencl` |
@@ -2893,7 +2907,8 @@ before the upload.
 | `localadjustments-residual.pp3` (exposure) | host, informational 1 LSB16 |
 | `localadjustments-munsell.pp3` (CPU-device row) | PASS, `max_pae=1.5259e-05` (1 LSB16), `impl=opencl`; the device MUNS pass is 1 LSB16 on 389,860 of 30,419,712 samples, and the same profile with `NONE` is 1 LSB16 on 389,597 |
 | `localadjustments-sh.pp3` (CPU-device row) | PASS, `max_pae=1.5259e-05` (1 LSB16), `impl=opencl`. Non-vacuous: against the neutral export the profile differs by PAE 28 codes on 3,073,092 of 10,139,904 pixels (8,144,216 of 30,419,712 channel samples) |
-| Full `verify.sh --stage-device` | PASS, 28 PASS and 0 SKIP on the POCL CPU device; the MUNS and SH rows are CPU-device rows, consistent with the launcher's CPU-only requirement. `working.trc` stays 1 LSB16 |
+| `localadjustments-soft.pp3` (CPU-device row) | PASS, `max_pae=1.5259e-05` (1 LSB16), `impl=opencl`; per-pixel soft light at strength 60 and sensitivity 30 |
+| Full `verify.sh --stage-device` | PASS, 29 PASS and 0 SKIP on the POCL CPU device; the MUNS, SH and soft-light rows are CPU-device rows, consistent with the launcher's CPU-only requirement. `working.trc` stays 1 LSB16 |
 | Default path | with `RT_STAGE_OPENCL` unset the host block runs directly; CPU-only `stage-residency-test: PASS (25 skipped)` |
 | Builds | `build/cpu-perf-graph` and `build/opencl-perf-graph` compile |
 | GPU | not run; refused before upload, records `impl=host` |
