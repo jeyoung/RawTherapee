@@ -6016,6 +6016,8 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
     int wavelet_planes = 1;
     bool wavelet_chroma = false;
     bool wavelet_skin = false;
+    bool wavelet_edge = false;
+    bool wavelet_ab = false;
     const float* wavelet_params = nullptr;
     if (wavelet) {
         if (context->wavelet.active != 1 ||
@@ -6032,11 +6034,7 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
         wavelet_planes = static_cast<int>(context->wavelet.planes);
         if (wavelet_levels < 1 ||
             wavelet_levels >
-                static_cast<int>(RT_LAB_WAVELET_MAX_TRANSFORM_LEVELS) ||
-            wavelet_entries != static_cast<int>(RT_LAB_WAVELET_WAVELET_PARAMS) +
-                                   wavelet_planes * wavelet_levels *
-                                       static_cast<int>(
-                                           RT_LAB_WAVELET_MEA_ENTRIES)) {
+                static_cast<int>(RT_LAB_WAVELET_MAX_TRANSFORM_LEVELS)) {
             error = "lab.wavelet wavelet level count is outside its range";
             return RT_STAGE_INVALID;
         }
@@ -6061,8 +6059,19 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
             wavelet_params[RT_LW_PARAM_CHROMA] != 0.0f &&
             static_cast<int>(wavelet_params[RT_LW_PARAM_CHMET]) == 2;
         wavelet_skin = wavelet_params[RT_LW_PARAM_W_SKIN] != 0.0f;
-        if (wavelet_planes != (wavelet_chroma ? 3 : 1)) {
+        wavelet_edge = wavelet_params[RT_LW_PARAM_EDGEENA] != 0.0f;
+        /* RT_LW_PARAM_CHROMA marks the presence of the a/b planes: the chroma
+         * arm and the edge panel both keep the block's a/b round trip alive. */
+        wavelet_ab = wavelet_params[RT_LW_PARAM_CHROMA] != 0.0f;
+        if (wavelet_planes != (wavelet_ab ? 3 : 1)) {
             error = "lab.wavelet plane count disagrees with its table";
+            return RT_STAGE_INVALID;
+        }
+        if (wavelet_entries !=
+            static_cast<int>(labWaveletParamEntries(
+                static_cast<std::uint32_t>(wavelet_planes),
+                static_cast<std::uint32_t>(wavelet_levels), wavelet_edge))) {
+            error = "lab.wavelet parameter table has the wrong length";
             return RT_STAGE_INVALID;
         }
 
@@ -6203,7 +6212,7 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
     }
     StageDeviceBufferPtr plane_a_device;
     StageDeviceBufferPtr plane_b_device;
-    if (wavelet_chroma) {
+    if (wavelet_ab) {
         plane_a_device =
             residency->acquire(&plane_a_key, plane_shape, &error);
         plane_b_device =
@@ -6276,7 +6285,7 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
     if (masks) {
         acquired = acquired && hue_device && chrom_device;
     }
-    if (wavelet_chroma) {
+    if (wavelet_ab) {
         acquired = acquired && plane_a_device && plane_b_device;
     }
     if (!acquired || (wavelet && !wavelet_acquired)) {
@@ -6288,7 +6297,7 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
         (masks &&
          (residency->upload(hue_device, hue) != RT_STAGE_OK ||
           residency->upload(chrom_device, chrom) != RT_STAGE_OK)) ||
-        (wavelet_chroma &&
+        (wavelet_ab &&
          (residency->upload(plane_a_device, plane_view(prepared, 1)) !=
               RT_STAGE_OK ||
           residency->upload(plane_b_device, plane_view(prepared, 2)) !=
@@ -6488,11 +6497,17 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
             env, def, "rt_lab_wavelet_w_contrast", error);
         cl_kernel chroma_kernel = compiled_kernel_entry(
             env, def, "rt_lab_wavelet_w_chroma", error);
+        cl_kernel edge_kernel = nullptr;
+        if (wavelet_edge) {
+            edge_kernel = compiled_kernel_entry(
+                env, def, "rt_lab_wavelet_w_edge", error);
+        }
         if (analysis_v == nullptr || analysis_h == nullptr ||
             haar_v == nullptr || haar_h == nullptr || synth_h == nullptr ||
             synth_v == nullptr || haar_synth_h == nullptr ||
             haar_synth_v == nullptr || stats_kernel == nullptr ||
-            contrast_kernel == nullptr || chroma_kernel == nullptr) {
+            contrast_kernel == nullptr || chroma_kernel == nullptr ||
+            (wavelet_edge && edge_kernel == nullptr)) {
             return RT_STAGE_FALLBACK;
         }
 
@@ -6518,19 +6533,23 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
         const cl_int tmp_hi_pitch = pitch_of(wavelet_tmp[1]);
         const cl_int cl_mea_offset = static_cast<cl_int>(
             RT_LAB_WAVELET_WAVELET_PARAMS);
+        const cl_int cl_edge_offset = static_cast<cl_int>(
+            RT_LAB_WAVELET_WAVELET_PARAMS +
+            wavelet_planes * wavelet_levels *
+                static_cast<int>(RT_LAB_WAVELET_MEA_ENTRIES));
         const cl_int cl_strength_index = static_cast<cl_int>(
             RT_LW_PARAM_STRENGTH);
         const float blend = wavelet_params[cl_strength_index];
         const cl_float cl_blend = blend;
         const cl_int cl_wav_skin = wavelet_skin ? 1 : 0;
         const cl_mem plane_a_memory =
-            wavelet_chroma ? memory_of(plane_a_device) : l_memory;
+            wavelet_ab ? memory_of(plane_a_device) : l_memory;
         const cl_int plane_a_pitch =
-            wavelet_chroma ? pitch_of(plane_a_device) : 0;
+            wavelet_ab ? pitch_of(plane_a_device) : 0;
         const cl_mem plane_b_memory =
-            wavelet_chroma ? memory_of(plane_b_device) : l_memory;
+            wavelet_ab ? memory_of(plane_b_device) : l_memory;
         const cl_int plane_b_pitch =
-            wavelet_chroma ? pitch_of(plane_b_device) : 0;
+            wavelet_ab ? pitch_of(plane_b_device) : 0;
 
         std::vector<float> stats_host(
             static_cast<std::size_t>(wavelet_levels) * 3 *
@@ -6744,6 +6763,37 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
                 cl_int cl_level = level;
                 bool ok = true;
                 if (plane_index == 0) {
+                    if (wavelet_edge) {
+                        ok = ok && set_arg(edge_kernel, 0, sizeof(cl_mem),
+                                           &band1);
+                        ok = ok && set_arg(edge_kernel, 1, sizeof(cl_int),
+                                           &bp1);
+                        ok = ok && set_arg(edge_kernel, 2, sizeof(cl_mem),
+                                           &band2);
+                        ok = ok && set_arg(edge_kernel, 3, sizeof(cl_int),
+                                           &bp2);
+                        ok = ok && set_arg(edge_kernel, 4, sizeof(cl_mem),
+                                           &band3);
+                        ok = ok && set_arg(edge_kernel, 5, sizeof(cl_int),
+                                           &bp3);
+                        ok = ok && set_arg(edge_kernel, 6, sizeof(cl_mem),
+                                           &params_memory);
+                        ok = ok && set_arg(edge_kernel, 7, sizeof(cl_int),
+                                           &cl_edge_offset);
+                        ok = ok && set_arg(edge_kernel, 8, sizeof(cl_int),
+                                           &cl_level);
+                        ok = ok && set_arg(edge_kernel, 9, sizeof(cl_int),
+                                           &wavelet_levels);
+                        ok = ok && set_arg(edge_kernel, 10, sizeof(cl_int),
+                                           &cl_half_w);
+                        ok = ok && set_arg(edge_kernel, 11, sizeof(cl_int),
+                                           &cl_half_h);
+                        if (!ok || !launch(edge_kernel, band_global,
+                                           "lab.wavelet edge")) {
+                            error = "lab.wavelet edge arguments failed";
+                            return false;
+                        }
+                    }
                     cl_mem coeff =
                         memory_of(wavelet_low[(wavelet_levels - 1) % 2]);
                     cl_int coeff_pitch =
@@ -6786,7 +6836,7 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
                         error = "lab.wavelet contrast arguments failed";
                         return false;
                     }
-                } else {
+                } else if (wavelet_chroma) {
                     cl_int chroma_mea_offset = cl_mea_offset +
                         static_cast<cl_int>(plane_index) * wavelet_levels *
                             static_cast<cl_int>(
@@ -6973,7 +7023,7 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
         if (!run_plane(l_memory, l_pitch, 0)) {
             return RT_STAGE_FALLBACK;
         }
-        if (wavelet_chroma &&
+        if (wavelet_ab &&
             (!run_plane(plane_a_memory, plane_a_pitch, 1) ||
              !run_plane(plane_b_memory, plane_b_pitch, 2))) {
             return RT_STAGE_FALLBACK;
@@ -6985,7 +7035,7 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
         return RT_STAGE_FALLBACK;
     }
 
-    if (wavelet_chroma) {
+    if (wavelet_ab) {
         if (residency->readback(plane_a_device, plane_view(lab, 1)) !=
                 RT_STAGE_OK ||
             residency->readback(plane_b_device, plane_view(lab, 2)) !=
@@ -6993,6 +7043,8 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
             error = "lab.wavelet chroma readback failed";
             return RT_STAGE_FALLBACK;
         }
+    }
+    if (wavelet_chroma) {
         /*
          * The L synthesis skipped its clamp so ContAllAB() read the same L
          * the block reads. ip_wavelet() applies it in the final tile copy,
@@ -7008,7 +7060,8 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
                 }
             }
         }
-    } else if (levels > 0 && context->needs_scratch != 0) {
+    }
+    if (!wavelet_ab && levels > 0 && context->needs_scratch != 0) {
         /*
          * BadpixelsLab() also repairs a and b. The prepared copy owns those
          * repaired planes; the device only wrote L.

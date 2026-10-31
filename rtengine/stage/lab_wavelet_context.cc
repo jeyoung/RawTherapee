@@ -290,15 +290,59 @@ bool labWaveletWaveletSupported(const procparams::ProcParams& params,
     }
 
     /*
-     * The contrast panel and the chroma panel's "link" arm are the admitted
-     * set. Every other export panel is a residual.
+     * The contrast panel, the chroma panel's "link" arm and the edge panel's
+     * plain arm are the admitted set. Every other export panel is a residual.
      */
     const bool contrast = wavelet.expcontrast;
     const bool chroma = wavelet.expchroma;
-    if ((!contrast && !chroma) || wavelet.expedge || wavelet.expbl ||
+    const bool edge = wavelet.expedge;
+    const bool edge_active = edge && wavelet.edgval > 0;
+    if ((!contrast && !chroma && !edge_active) || wavelet.expbl ||
         wavelet.expresid || wavelet.expfinal || wavelet.exptoning ||
         wavelet.expnoise || wavelet.expclari) {
         return false;
+    }
+    /*
+     * An enabled edge panel with a zero strength is a no-op, but the panel is
+     * advertised as running, so refuse it rather than record a device pass
+     * that did nothing; the whole block then stays on the host.
+     */
+    if (edge && !edge_active) {
+        return false;
+    }
+    /*
+     * The edge panel runs only its plain arm: no median level detection
+     * (calckoe()'s Lipschitz coefficients), no np-method neighbour smoothing
+     * and no lipst Lipschitz influence. `EDmethod` is displayed by the GUI
+     * but the engine hard-codes EDmet == 2, so the threshold adjuster
+     * (edgcont) is dead code; the SL selection is refused rather than
+     * silently ignoring its visible sliders.
+     */
+    if (edge_active) {
+        if (settings == nullptr) {
+            return false;
+        }
+        if (wavelet.medianlev || wavelet.NPmethod != "none" ||
+            wavelet.lipst || wavelet.EDmethod != "CU") {
+            return false;
+        }
+        if (wavelet.edgval < LAB_WAVELET_MIN_WAVELET_EDGVAL ||
+            wavelet.edgval > LAB_WAVELET_MAX_WAVELET_EDGVAL ||
+            wavelet.edgrad < LAB_WAVELET_MIN_WAVELET_EDGRAD ||
+            wavelet.edgrad > LAB_WAVELET_MAX_WAVELET_EDGRAD ||
+            wavelet.edgthresh < LAB_WAVELET_MIN_WAVELET_EDGTHRESH ||
+            wavelet.edgthresh > LAB_WAVELET_MAX_WAVELET_EDGTHRESH ||
+            !std::isfinite(wavelet.edgeffect) ||
+            wavelet.edgeffect < LAB_WAVELET_MIN_WAVELET_EDGEFFECT ||
+            wavelet.edgeffect > LAB_WAVELET_MAX_WAVELET_EDGEFFECT) {
+            return false;
+        }
+        /* Every Medgreinf mode is arithmetic, but an unknown value leaves the
+         * block's `reinforce` uninitialised, so refuse it. */
+        if (wavelet.Medgreinf != "more" && wavelet.Medgreinf != "none" &&
+            wavelet.Medgreinf != "less") {
+            return false;
+        }
     }
     /*
      * ContAllAB()'s BA arm (balance chroma) runs when BAmethod is not "none"
@@ -678,7 +722,7 @@ RtLabWaveletContext LabWaveletContext::descriptor(bool supported)
     context.wavelet.active = wavelet_active_ ? 1u : 0u;
     context.wavelet.levels = static_cast<uint32_t>(wavelet_levels_);
     context.wavelet.taps = 8u;
-    context.wavelet.planes = wavelet_chroma_ ? 3u : 1u;
+    context.wavelet.planes = wavelet_ab_ ? 3u : 1u;
     context.wavelet.entries = static_cast<uint32_t>(
         wavelet_params_.size());
     context.wavelet.params =
@@ -722,6 +766,31 @@ int LabWaveletContext::build(RtLabWaveletResult& out)
     wavelet_chroma_ = params_.wavelet.enabled &&
                       params_.wavelet.expchroma &&
                       params_.wavelet.CHmethod == "link";
+    /*
+     * The plain edge arm. `edgval == 0` leaves the host's edge block
+     * untouched, so the device pass is only armed when a strength is set.
+     * The sub-mode guards repeat the admission rules so a forced build can
+     * never run a partial edge pass.
+     */
+    wavelet_edge_ = params_.wavelet.enabled && params_.wavelet.expedge &&
+                    params_.wavelet.edgval > 0 &&
+                    !params_.wavelet.medianlev &&
+                    params_.wavelet.NPmethod == "none" &&
+                    !params_.wavelet.lipst &&
+                    params_.wavelet.EDmethod == "CU" &&
+                    (params_.wavelet.Medgreinf == "more" ||
+                     params_.wavelet.Medgreinf == "none" ||
+                     params_.wavelet.Medgreinf == "less") &&
+                    settings != nullptr;
+    /*
+     * ip_wavelet() keeps the a/b decomposition alive whenever the edge panel
+     * is enabled: the level-trim around ContAllAB() has a `!cp.edgeena`
+     * condition, so a/b are decomposed and reconstructed even with Expchroma
+     * off. The round trip is not an exact identity, so the device must run it
+     * to match the block. The chroma multiply itself is still gated by its
+     * own flags in the kernel.
+     */
+    wavelet_ab_ = wavelet_chroma_ || wavelet_edge_;
 
     if (levels_ > 0) {
         if (width_ < 8 || height_ < 8) {
@@ -781,14 +850,11 @@ int LabWaveletContext::build(RtLabWaveletResult& out)
             return 4;
         }
         const procparams::WaveletParams& wavelet = params_.wavelet;
-        constexpr std::size_t params_count =
-            RT_LAB_WAVELET_WAVELET_PARAMS;
-        constexpr std::size_t mea_count = RT_LAB_WAVELET_MEA_ENTRIES;
-        const std::size_t planes = wavelet_chroma_ ? 3u : 1u;
+        const std::size_t planes = wavelet_ab_ ? 3u : 1u;
         wavelet_params_.assign(
-            params_count +
-                planes * static_cast<std::size_t>(wavelet_levels_) *
-                    mea_count,
+            labWaveletParamEntries(static_cast<std::uint32_t>(planes),
+                                   static_cast<std::uint32_t>(wavelet_levels_),
+                                   wavelet_edge_),
             0.f);
 
         float* table = wavelet_params_.data();
@@ -839,11 +905,8 @@ int LabWaveletContext::build(RtLabWaveletResult& out)
             static_cast<float>(wavelet.bllev.getTopRight());
         table[RT_LW_PARAM_CONTENA] = wavelet.expcontrast ? 1.f : 0.f;
         table[RT_LW_PARAM_CHRO] = static_cast<float>(wavelet.chro);
-        table[RT_LW_PARAM_CHMET] =
-            wavelet.CHmethod == "link"
-                ? 2.f
-                : (wavelet.CHmethod == "with" ? 1.f : 0.f);
-        table[RT_LW_PARAM_CHROMA] = wavelet_chroma_ ? 1.f : 0.f;
+        table[RT_LW_PARAM_CHMET] = wavelet_chroma_ ? 2.f : 0.f;
+        table[RT_LW_PARAM_CHROMA] = wavelet_ab_ ? 1.f : 0.f;
         table[RT_LW_PARAM_SIGMACOL] = fold(wavelet.sigmacol);
         table[RT_LW_PARAM_W_SKIN] = wavelet_skinprotect_;
         table[RT_LW_PARAM_W_B_L] = wavelet_b_l_;
@@ -860,6 +923,54 @@ int LabWaveletContext::build(RtLabWaveletResult& out)
             table[RT_LW_PARAM_FILTER_SYNTH_HI + index] =
                 Daub4_anal8[1][taps - 1 - index];
         }
+
+        table[RT_LW_PARAM_EDGEENA] = wavelet_edge_ ? 1.f : 0.f;
+        if (wavelet_edge_) {
+            const int reinforce = wavelet.Medgreinf == "more"
+                                      ? 1
+                                      : (wavelet.Medgreinf == "none" ? 2 : 3);
+            table[RT_LW_PARAM_EDG_VAL] =
+                static_cast<float>(wavelet.edgval);
+            table[RT_LW_PARAM_EDG_RAD] =
+                static_cast<float>(wavelet.edgrad);
+            table[RT_LW_PARAM_EDG_TIL] =
+                static_cast<float>(wavelet.edgthresh);
+            table[RT_LW_PARAM_EDG_EFF] = fold(wavelet.edgeffect);
+            table[RT_LW_PARAM_EDG_REINFORCE] =
+                static_cast<float>(reinforce);
+            table[RT_LW_PARAM_EDG_HIG] =
+                static_cast<float>(settings->edghi);
+            table[RT_LW_PARAM_EDG_LOW] =
+                static_cast<float>(settings->edglo);
+
+            const std::size_t edge_offset =
+                RT_LAB_WAVELET_WAVELET_PARAMS +
+                planes * static_cast<std::size_t>(wavelet_levels_) *
+                    RT_LAB_WAVELET_MEA_ENTRIES;
+            float* edge_tail = table + edge_offset;
+            edge_tail[0] = static_cast<float>(settings->limrad);
+
+            /*
+             * The edge curve is the block's own WavCurve over ccwcurve; the
+             * device reads the same 501 samples through the LUTf float
+             * interpolation, so a curve that builds here is followed exactly.
+             */
+            WavCurve curve;
+            curve.Set(wavelet.ccwcurve);
+            const bool curve_active = static_cast<bool>(curve);
+            table[RT_LW_PARAM_EDG_CURVE] = curve_active ? 1.f : 0.f;
+            if (curve_active) {
+                float* sampled =
+                    edge_tail + 1 +
+                    static_cast<std::size_t>(wavelet_levels_) *
+                        RT_LAB_WAVELET_EDGE_ENTRIES;
+                for (std::uint32_t index = 0;
+                     index < RT_LAB_WAVELET_CURVE_ENTRIES; ++index) {
+                    sampled[index] =
+                        curve[static_cast<int>(index)];
+                }
+            }
+        }
     }
 
     built_ = true;
@@ -870,7 +981,7 @@ int LabWaveletContext::build(RtLabWaveletResult& out)
 int LabWaveletContext::computeMea(const float* stats, uint32_t levels,
                                   uint32_t plane)
 {
-    const uint32_t planes = wavelet_chroma_ ? 3u : 1u;
+    const uint32_t planes = wavelet_ab_ ? 3u : 1u;
     if (!wavelet_active_ || stats == nullptr || plane >= planes ||
         levels != static_cast<uint32_t>(wavelet_levels_) ||
         levels < 1 ||
@@ -891,28 +1002,42 @@ int LabWaveletContext::computeMea(const float* stats, uint32_t levels,
                  static_cast<std::size_t>(plane) *
                      static_cast<std::size_t>(levels) *
                      RT_LAB_WAVELET_MEA_ENTRIES;
+    float* edge_mea = nullptr;
+    if (wavelet_edge_ && plane == 0) {
+        const std::size_t edge_offset =
+            RT_LAB_WAVELET_WAVELET_PARAMS +
+            static_cast<std::size_t>(planes) *
+                static_cast<std::size_t>(levels) *
+                RT_LAB_WAVELET_MEA_ENTRIES;
+        edge_mea = wavelet_params_.data() + edge_offset + 1;
+    }
 
     for (uint32_t level = 0; level < levels; ++level) {
         float averagePlus[4] = {};
         float sigmaPlus[4] = {};
+        float maxPlus[4] = {};
         for (int dir = 1; dir < 4; ++dir) {
             const std::size_t base =
                 (static_cast<std::size_t>(level) * 3 +
                  static_cast<std::size_t>(dir - 1)) *
                 RT_LAB_WAVELET_STATS_PER_BAND;
             averagePlus[dir] = stats[base + 0];
+            maxPlus[dir] = stats[base + 2];
             sigmaPlus[dir] = stats[base + 4];
         }
 
         /* Eval2()'s accumulation order and its / 3. */
         float averageL = 0.f;
         float sigL = 0.f;
+        float maxL = 0.f;
         for (int dir = 1; dir < 4; ++dir) {
             averageL += averagePlus[dir];
             sigL += sigmaPlus[dir];
+            maxL += maxPlus[dir];
         }
         averageL /= 3;
         sigL /= 3;
+        maxL /= 3;
         mean[level] = averageL;
         sigma[level] = sigL;
 
@@ -920,6 +1045,19 @@ int LabWaveletContext::computeMea(const float* stats, uint32_t levels,
                         mea + static_cast<std::size_t>(level) *
                                   RT_LAB_WAVELET_MEA_ENTRIES,
                         effect, offs);
+        if (edge_mea != nullptr) {
+            float* entry = edge_mea +
+                           static_cast<std::size_t>(level) *
+                               RT_LAB_WAVELET_EDGE_ENTRIES;
+            /* ContAllL()'s edge beta uses calceffect() with the edge effect
+             * and an offset of 1. */
+            ipf_.calceffect(
+                static_cast<int>(level), mean, sigma, entry,
+                static_cast<float>(params_.wavelet.edgeffect), 1.f);
+            entry[10] = maxL;
+            entry[11] = averageL;
+            entry[12] = sigL;
+        }
     }
     return 0;
 }

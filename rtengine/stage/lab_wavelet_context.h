@@ -21,6 +21,7 @@
 
 #include "stage_abi.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 
@@ -102,6 +103,8 @@ struct ProcParams;
 #define RT_LW_PARAM_CONTENA 29
 #define RT_LW_PARAM_CHRO 30
 #define RT_LW_PARAM_CHMET 31
+/* 1 when the a/b planes are present: the chroma arm and the edge panel both
+ * keep the block's a/b decomposition and reconstruction alive. */
 #define RT_LW_PARAM_CHROMA 32
 #define RT_LW_PARAM_SIGMACOL 33
 #define RT_LW_PARAM_W_SKIN 34
@@ -109,11 +112,56 @@ struct ProcParams;
 #define RT_LW_PARAM_W_T_L 36
 #define RT_LW_PARAM_W_T_R 37
 #define RT_LW_PARAM_W_B_R 38
+/*
+ * The edge panel. Slots 39..47 are free in the scalar table; the edge mea,
+ * the per-level mean/sigma/MaxP and the sampled edge curve live in the
+ * parameter table's tail after the per-plane mea blocks.
+ */
+#define RT_LW_PARAM_EDGEENA 39
+#define RT_LW_PARAM_EDG_VAL 40
+#define RT_LW_PARAM_EDG_RAD 41
+#define RT_LW_PARAM_EDG_TIL 42
+#define RT_LW_PARAM_EDG_EFF 43
+#define RT_LW_PARAM_EDG_REINFORCE 44
+#define RT_LW_PARAM_EDG_CURVE 45
+#define RT_LW_PARAM_EDG_HIG 46
+#define RT_LW_PARAM_EDG_LOW 47
 /* Slots 48..79 hold Daubechies analysis lo/hi and synthesis lo/hi. */
 #define RT_LW_PARAM_FILTER_ANAL_LO 48
 #define RT_LW_PARAM_FILTER_ANAL_HI 56
 #define RT_LW_PARAM_FILTER_SYNTH_LO 64
 #define RT_LW_PARAM_FILTER_SYNTH_HI 72
+/*
+ * The edge tail, present only when the edge panel runs:
+ *   [0]                 settings->limrad
+ *   [1 + level*13 + 0]  the block's calceffect() mea for the edge beta ramp
+ *   [1 + level*13 + 10] MaxP (the average of the three positive band maxima)
+ *   [1 + level*13 + 11] mean (the positive band average)
+ *   [1 + level*13 + 12] sigma (the positive band standard deviation)
+ *   then 501 sampled points of the block's own WavCurve (ccwcurve).
+ */
+#define RT_LAB_WAVELET_EDGE_ENTRIES 13u
+#define RT_LAB_WAVELET_CURVE_ENTRIES 501u
+
+/*
+ * The exact length of the wavelet parameter table. Both the host builder and
+ * the launcher derive it from this one function so a table built without the
+ * edge tail can never be read past its end.
+ */
+inline std::size_t labWaveletParamEntries(std::uint32_t planes,
+                                          std::uint32_t levels, bool edge)
+{
+    std::size_t entries = RT_LAB_WAVELET_WAVELET_PARAMS +
+                          static_cast<std::size_t>(planes) *
+                              static_cast<std::size_t>(levels) *
+                              RT_LAB_WAVELET_MEA_ENTRIES;
+    if (edge) {
+        entries += 1 + static_cast<std::size_t>(levels) *
+                           RT_LAB_WAVELET_EDGE_ENTRIES +
+                   RT_LAB_WAVELET_CURVE_ENTRIES;
+    }
+    return entries;
+}
 /*
  * One range table per level: 0x20000 entries covering hipass + 0x10000, the
  * LUT size dirpyr_equalizer.cc's fillLut() writes and idirpyr_eq_channel()
@@ -160,7 +208,8 @@ typedef struct RtLabWaveletWavelet {
     uint32_t levels;
     uint32_t taps;
     uint32_t entries;
-    /* 1 for contrast only, 3 when the chroma arm also runs. */
+    /* 1 for L only, 3 when the a/b planes also run (the chroma arm or the
+     * edge panel, whose level-trim change keeps the block's a/b round trip). */
     uint32_t planes;
     float* params;
     int (*compute_mea)(void* self, const float* stats, uint32_t levels,
@@ -237,6 +286,15 @@ inline constexpr int LAB_WAVELET_MIN_WAVELET_CHRO = 0;
 inline constexpr int LAB_WAVELET_MAX_WAVELET_CHRO = 100;
 inline constexpr double LAB_WAVELET_MIN_WAVELET_SIGMACOL = 0.025;
 inline constexpr double LAB_WAVELET_MAX_WAVELET_SIGMACOL = 2.5;
+/* The edge panel's slider ranges, from the widget definitions. */
+inline constexpr int LAB_WAVELET_MIN_WAVELET_EDGVAL = 0;
+inline constexpr int LAB_WAVELET_MAX_WAVELET_EDGVAL = 100;
+inline constexpr int LAB_WAVELET_MIN_WAVELET_EDGRAD = 0;
+inline constexpr int LAB_WAVELET_MAX_WAVELET_EDGRAD = 100;
+inline constexpr int LAB_WAVELET_MIN_WAVELET_EDGTHRESH = -50;
+inline constexpr int LAB_WAVELET_MAX_WAVELET_EDGTHRESH = 100;
+inline constexpr double LAB_WAVELET_MIN_WAVELET_EDGEFFECT = 0.05;
+inline constexpr double LAB_WAVELET_MAX_WAVELET_EDGEFFECT = 2.5;
 
 /* The block's `scale` argument at every export call site. The equaliser's
  * BadpixelsLab() radius is 4 / scale, and the launcher requires this value. */
@@ -259,14 +317,17 @@ int labWaveletTransformLevels(const procparams::ProcParams& params,
                               int width, int height);
 
 /*
- * Whether the wavelet pass is the node's supported set: the contrast panel
- * and the chroma panel's "link" arm, no edge, residual, final, toning, noise,
- * clarity or blur panel, the "all" level method, full-tile processing, no
- * soft radius, no L contrast skin protection, no avoid-colour-shift or
- * blue-sky median, no extra level, the default 8-tap Daubechies, a
- * highlight/shadow method the block implements, identity chroma-by-hue and
- * hue curves, every scalar in range and an image large enough for the
- * undecimated Haar bands.
+ * Whether the wavelet pass is the node's supported set: the contrast panel,
+ * the chroma panel's "link" arm and the edge panel's plain arm, no residual,
+ * final, toning, noise, clarity or blur panel, the "all" level method,
+ * full-tile processing, no soft radius, no L contrast skin protection, no
+ * avoid-colour-shift or blue-sky median, no extra level, the default 8-tap
+ * Daubechies, a highlight/shadow method the block implements, identity
+ * chroma-by-hue and hue curves, every scalar in range and an image large
+ * enough for the undecimated Haar bands. The edge arm additionally requires
+ * the plain sub-mode: no median level detection, np-method smoothing or
+ * lipst influence, and the CU detection method whose hard-coded curve path
+ * is the one ported.
  */
 bool labWaveletWaveletSupported(const procparams::ProcParams& params,
                                 int width, int height);
@@ -341,6 +402,8 @@ private:
 
     bool wavelet_active_ = false;
     bool wavelet_chroma_ = false;
+    bool wavelet_edge_ = false;
+    bool wavelet_ab_ = false;
     int wavelet_levels_ = 0;
     float wavelet_skinprotect_ = 0.f;
     float wavelet_b_l_ = 0.f;

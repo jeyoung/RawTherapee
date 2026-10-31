@@ -401,10 +401,22 @@ __kernel void rt_lab_wavelet_equalize(
 #define RT_LW_W_T_L 36
 #define RT_LW_W_T_R 37
 #define RT_LW_W_B_R 38
+#define RT_LW_W_EDGEENA 39
+#define RT_LW_W_EDG_VAL 40
+#define RT_LW_W_EDG_RAD 41
+#define RT_LW_W_EDG_TIL 42
+#define RT_LW_W_EDG_EFF 43
+#define RT_LW_W_EDG_REINFORCE 44
+#define RT_LW_W_EDG_CURVE 45
+#define RT_LW_W_EDG_HIG 46
+#define RT_LW_W_EDG_LOW 47
 #define RT_LW_W_FILTER_ANAL_LO 48
 #define RT_LW_W_FILTER_ANAL_HI 56
 #define RT_LW_W_FILTER_SYNTH_LO 64
 #define RT_LW_W_FILTER_SYNTH_HI 72
+/* Mirrors RT_LAB_WAVELET_EDGE_ENTRIES and RT_LAB_WAVELET_CURVE_ENTRIES. */
+#define RT_LW_W_EDGE_ENTRIES 13
+#define RT_LW_W_EDGE_CURVE 501
 
 /*
  * Level 0 analysis, vertical half. One work item per output column and output
@@ -1035,6 +1047,205 @@ __kernel void rt_lab_wavelet_w_chroma(
             (1024.0f + 15.0f * cpMul * cpChrom * betaab * scale / 50.0f) /
             1024.0f;
         band[at] = value * alphaC;
+    }
+}
+
+/*
+ * The edge panel's plain arm: ContAllL()'s EDmet == 2 block with the host's
+ * lipschitz flag set and `cp.detectedge` clear, so koeLi plays no part. One
+ * work item per pixel; the block's border ring (borderL == 1) is untouched.
+ *
+ * `level` selects the level's edge mea block; the tail also carries MaxP,
+ * mean and sigma and the sampled ccwcurve. `edge_offset` is the start of the
+ * tail (limrad at [0], then levels * 13 entries, then the curve).
+ */
+inline float rt_lw_edge_curve(__global const float* table, float index)
+{
+    /* LUTf::operator[](float) for the 501-entry WavCurve: maxsf is size - 2. */
+    const float maxsf = (float)(RT_LW_W_EDGE_CURVE - 2);
+    if (index < 0.0f) {
+        return table[0];
+    }
+    if (index > maxsf) {
+        return table[RT_LW_W_EDGE_CURVE - 1];
+    }
+    const int base = (int)index;
+    const float fraction = index - (float)base;
+    const float low = table[base];
+    return low + (table[base + 1] - low) * fraction;
+}
+
+__kernel void rt_lab_wavelet_w_edge(
+    __global float* band1, int p1,
+    __global float* band2, int p2,
+    __global float* band3, int p3,
+    __global const float* params, int edge_offset,
+    int level, int levels, int w, int h)
+{
+    const int x = get_global_id(0);
+    const int y = get_global_id(1);
+    if (x >= w || y >= h) {
+        return;
+    }
+    /* ContAllL()'s EDmet == 2 loop starts at borderL == 1 on every side. */
+    if (x < 1 || y < 1 || x >= w - 1 || y >= h - 1) {
+        return;
+    }
+
+    const int entry = edge_offset + 1 + level * RT_LW_W_EDGE_ENTRIES;
+    const float maxp = params[entry + 10];
+    /* The host only enters the multiply when MaxP[level] > 0. */
+    if (maxp <= 0.0f) {
+        return;
+    }
+    const float mean = params[entry + 11];
+    const float sigma = params[entry + 12];
+
+    const float limrad = params[edge_offset];
+    const float rad = params[RT_LW_W_EDG_RAD] / 60.0f;
+    const float strength = params[RT_LW_W_EDG_VAL] / 8.0f;
+    const float eff = params[RT_LW_W_EDG_EFF];
+    const int reinforce = (int)params[RT_LW_W_EDG_REINFORCE];
+
+    float repart = params[RT_LW_W_EDG_TIL];
+    const float limit = limrad / 60.0f;
+    if (reinforce != 2) {
+        const float brepart =
+            reinforce == 1 ? params[RT_LW_W_EDG_HIG]
+                           : params[RT_LW_W_EDG_LOW];
+        const float arepart = -(brepart - 1.0f) / limit;
+        if (rad < limit) {
+            repart *= (arepart * rad + brepart);
+        }
+    }
+    const float al0 = 1.0f + repart / 50.0f;
+    const float al10 = 1.0f;
+    const float ak = -(al0 - al10) / 10.0f;
+    const float bk = al0;
+    const float koef = ak * (float)level + bk;
+    const float lev = (float)level;
+    float expkoef = -pow(fabs(rad - lev), koef);
+    if (reinforce == 3) {
+        if (rad < limit && level == 0) {
+            expkoef *= fabs(repart);
+        }
+    }
+    if (reinforce == 1) {
+        if (rad < limit && level == 1) {
+            expkoef /= repart;
+        }
+    }
+    const float refin = strength * exp(expkoef);
+    const float edgePrecalc = 1.0f + refin;
+
+    const int edgcurv = params[RT_LW_W_EDG_CURVE] != 0.0f;
+    __global const float* curve =
+        params + edge_offset + 1 + levels * RT_LW_W_EDGE_ENTRIES;
+    const float logmax = log(maxp);
+    const float rapX = (mean + sigma) / maxp;
+    const float inx = log(0.666f);
+    const float iny = log(rapX);
+    const float rap = inx / iny;
+    const float asig = 0.166f / sigma;
+    const float bsig = 0.5f - asig * mean;
+    const float amean = 0.5f / mean;
+
+    const float mea0 = params[entry + 0];
+    const float mea1 = params[entry + 1];
+    const float mea2 = params[entry + 2];
+    const float mea3 = params[entry + 3];
+    const float mea4 = params[entry + 4];
+    const float mea5 = params[entry + 5];
+    const float mea6 = params[entry + 6];
+    const float mea7 = params[entry + 7];
+    const float mea8 = params[entry + 8];
+    const float mea9 = params[entry + 9];
+
+    for (int dir = 0; dir < 3; ++dir) {
+        __global float* band =
+            dir == 0 ? band1 : (dir == 1 ? band2 : band3);
+        const int pitch = dir == 0 ? p1 : (dir == 1 ? p2 : p3);
+        const int at = y * pitch + x;
+        const float value = band[at];
+        const float wavcl = fabs(value);
+
+        float beta;
+        if (eff < 2.5f) {
+            if (wavcl < mea0) {
+                beta = 0.05f;
+            } else if (wavcl < mea1) {
+                beta = 0.2f;
+            } else if (wavcl < mea2) {
+                beta = 0.7f;
+            } else if (wavcl < mea3) {
+                beta = 1.0f;
+            } else if (wavcl < mea4) {
+                beta = 1.0f;
+            } else if (wavcl < mea5) {
+                beta = 0.8f;
+            } else if (wavcl < mea6) {
+                beta = 0.6f;
+            } else if (wavcl < mea7) {
+                beta = 0.4f;
+            } else if (wavcl < mea8) {
+                beta = 0.2f;
+            } else if (wavcl < mea9) {
+                beta = 0.1f;
+            } else {
+                beta = 0.0f;
+            }
+        } else {
+            beta = 1.0f;
+        }
+
+        float edge = edgePrecalc;
+        if (edgcurv != 0) {
+            float absciss = 0.0f;
+            if (wavcl >= (mean + sigma)) {
+                const float valc = log(wavcl) - logmax;
+                absciss = exp(valc * rap);
+            } else if (wavcl >= mean && wavcl < (mean + sigma)) {
+                absciss = asig * wavcl + bsig;
+            } else if (wavcl < mean) {
+                absciss = amean * wavcl;
+            }
+
+            const float abssd = 4.0f;
+            const float bbssd = 2.0f;
+            float kmul;
+            float kmuld;
+            if (absciss > 0.666f && absciss < 1.0f) {
+                const float maxamp = 2.5f;
+                const float maxampd = 10.0f;
+                const float a_abssd = (maxamp - abssd) / 0.333f;
+                const float b_abssd = maxamp - a_abssd;
+                const float da_abssd = (maxampd - abssd) / 0.333f;
+                const float db_abssd = maxampd - da_abssd;
+                kmul = a_abssd * absciss + b_abssd;
+                kmuld = da_abssd * absciss + db_abssd;
+            } else {
+                const float am = (abssd - bbssd) / 0.666f;
+                kmul = absciss * am + bbssd;
+                kmuld = kmul;
+            }
+
+            const float curvev = rt_lw_edge_curve(curve, absciss * 500.0f);
+            const float kc = kmul * (curvev - 0.5f);
+            float kinterm;
+            if (kc >= 0.0f) {
+                kinterm = 1.0f + 0.6f * kmul * (curvev - 0.5f);
+            } else {
+                const float kcd = kmuld * (curvev - 0.5f);
+                kinterm = 1.0f - (kcd * kcd) / 10.0f;
+            }
+            if (kinterm < 0.0f) {
+                kinterm = 0.01f;
+            }
+            edge *= kinterm;
+            edge = max(edge, 1.0f);
+        }
+
+        band[at] = value * (1.0f + (edge - 1.0f) * beta);
     }
 }
 )CLC";
