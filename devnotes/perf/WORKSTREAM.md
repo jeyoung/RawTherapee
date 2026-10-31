@@ -151,7 +151,10 @@ Validated at `3871b7d0c`; the commits after it are documentation only.
   dead under the hard-coded `EDmet == 2`), a zero-strength edge panel,
   out-of-range sliders, an unknown `Medgreinf`, edge with L skin protection,
   and the global `edghi`/`edglo`/`limrad` options are read at build time and
-  are not part of the pp3.
+  are not part of the pp3. Two measured-matrix limits: the host's fast
+  `xlogf()` versus the kernel's `log()` (below 0.0586 LSB16), and a
+  degenerate `mean + sigma == MaxP` level whose curve exponent is singular on
+  both sides and is not covered.
 - **`local.adjustments` groundwork (pushed)**: host block extracted
   byte-for-byte, per-spot context/ABI (`LAJC`), exact block-level predicate,
   refusal path, 25 residual mutations and four multi-spot host cases. No

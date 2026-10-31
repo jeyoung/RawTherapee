@@ -258,6 +258,11 @@ refused; the engine hard-codes `EDmet == 2`, so the `SL` threshold adjuster
 (`edgcont`) is dead code and is never silently ignored. A zero-strength edge
 panel, edge sliders outside their widget range, an unknown `Medgreinf` value
 and edge with the unported L skin protection are also residuals.
+Two limits of the measured matrix are recorded rather than hidden: the host
+evaluates the curve abscissa with the fast `xlogf()` while the kernel uses
+`log()`, a difference below the measured 0.0586 LSB16, and a degenerate level
+where `mean + sigma == MaxP` makes the curve exponent singular on both sides
+and is not exercised by the 17 cases.
 
 It is admitted only on a CPU
 OpenCL device, and the wavelet pass also needs fp64. `CHmethod` `without` and
