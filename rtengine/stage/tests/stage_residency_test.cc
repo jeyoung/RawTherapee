@@ -28,10 +28,12 @@
 #include "stage/algorithms/gamut_cl.h"
 #include "stage/algorithms/sharpen_cl.h"
 #include "stage/lab_tools_context.h"
+#include "stage/lab_sharpening_context.h"
 #include "stage/lab_wavelet_context.h"
 #include "stage/local_adjustments_context.h"
 #include "stage/working_trc_context.h"
 
+#include "rt_algo.h"
 #include "sharpen_core.h"
 
 #include <algorithm>
@@ -3778,6 +3780,660 @@ void test_output_sharpen(bool available)
         std::printf("stage-residency: output.sharpen show-mask residual: "
                     "impl=host, %zu of %zu samples carry the mask\n",
                     written.differing, written.samples);
+    }
+}
+
+/* ------------------------------------------------------- lab.sharpening */
+
+struct LabPlaneDiff {
+    double max_l = 0.0;
+    double max_a = 0.0;
+    double max_b = 0.0;
+    std::size_t differing = 0;
+    std::size_t samples = 0;
+    bool finite = true;
+};
+
+LabPlaneDiff compare_lab_planes(const LabImage& actual,
+                                const LabImage& expected)
+{
+    LabPlaneDiff diff;
+    if (actual.W != expected.W || actual.H != expected.H) {
+        diff.finite = false;
+        return diff;
+    }
+    for (int y = 0; y < actual.H; ++y) {
+        for (int x = 0; x < actual.W; ++x) {
+            ++diff.samples;
+            const double dl = std::fabs(static_cast<double>(actual.L[y][x]) -
+                                        static_cast<double>(expected.L[y][x]));
+            const double da = std::fabs(static_cast<double>(actual.a[y][x]) -
+                                        static_cast<double>(expected.a[y][x]));
+            const double db = std::fabs(static_cast<double>(actual.b[y][x]) -
+                                        static_cast<double>(expected.b[y][x]));
+            if (!close_enough(actual.L[y][x]) ||
+                !close_enough(actual.a[y][x]) ||
+                !close_enough(actual.b[y][x])) {
+                diff.finite = false;
+            }
+            diff.max_l = std::max(diff.max_l, dl);
+            diff.max_a = std::max(diff.max_a, da);
+            diff.max_b = std::max(diff.max_b, db);
+            if (dl > 0.0 || da > 0.0 || db > 0.0) {
+                ++diff.differing;
+            }
+        }
+    }
+    return diff;
+}
+
+/* The observable corrected set: a pixel whose L, a or b differs from input. */
+std::vector<unsigned char> lab_changed_mask(const LabImage& image,
+                                            const LabImage& input)
+{
+    std::vector<unsigned char> changed(
+        static_cast<std::size_t>(image.W) * image.H, 0u);
+    for (int y = 0; y < image.H; ++y) {
+        for (int x = 0; x < image.W; ++x) {
+            if (image.L[y][x] != input.L[y][x] ||
+                image.a[y][x] != input.a[y][x] ||
+                image.b[y][x] != input.b[y][x]) {
+                changed[static_cast<std::size_t>(y) * image.W + x] = 1u;
+            }
+        }
+    }
+    return changed;
+}
+
+std::size_t lab_changed_count(const std::vector<unsigned char>& mask)
+{
+    return static_cast<std::size_t>(
+        std::count(mask.begin(), mask.end(), static_cast<unsigned char>(1u)));
+}
+
+/*
+ * The impulse fixture: a ramp, a flat plateau, a smooth field, isolated
+ * single-pixel spikes (one on the left border and one in the bottom-right
+ * corner), and a 5x5 cluster whose centre has no unmarked neighbour inside its
+ * own window. a and b carry the same spikes so the correction is visible on
+ * all three planes.
+ */
+void fill_impulse_fixture(LabImage& lab)
+{
+    for (int y = 0; y < lab.H; ++y) {
+        for (int x = 0; x < lab.W; ++x) {
+            float value;
+            if (x < 20) {
+                value = 8000.0f + 400.0f * x;
+            } else if (x < 30) {
+                value = 18000.0f;
+            } else {
+                value = 12000.0f + 2000.0f * std::sin(0.2f * y + 0.1f * x);
+            }
+            value += 1000.0f * std::sin(0.37f * x) * std::cos(0.23f * y);
+            lab.L[y][x] = value;
+            lab.a[y][x] = 1000.0f + 30.0f * x - 20.0f * y;
+            lab.b[y][x] = -800.0f - 15.0f * x + 25.0f * y;
+        }
+    }
+
+    const int spikes[][2] = {{5, 5}, {32, 7}, {50, 25}, {0, 3}, {62, 30}};
+    const float spike_l[] = {20000.0f, 25000.0f, -18000.0f, 20000.0f,
+                             -15000.0f};
+    for (int i = 0; i < 5; ++i) {
+        const int x = spikes[i][0];
+        const int y = spikes[i][1];
+        lab.L[y][x] += spike_l[i];
+        lab.a[y][x] += 2500.0f;
+        lab.b[y][x] -= 2000.0f;
+    }
+
+    for (int y = 10; y <= 14; ++y) {
+        for (int x = 38; x <= 42; ++x) {
+            lab.L[y][x] += 15000.0f;
+            lab.a[y][x] += 3000.0f;
+            lab.b[y][x] -= 2500.0f;
+        }
+    }
+}
+
+/*
+ * The defringe fixture: a high-contrast luminance edge, a three-pixel magenta
+ * ring beside it whose hue sits at the default curve's peak, neutral and
+ * saturated patches, and a fringe on the left border. The ring is the only
+ * region with a meaningful chromaticity, so the correction is non-vacuous.
+ */
+void fill_defringe_fixture(LabImage& lab)
+{
+    for (int y = 0; y < lab.H; ++y) {
+        for (int x = 0; x < lab.W; ++x) {
+            lab.L[y][x] = x < 35 ? 4000.0f : 30000.0f;
+            lab.a[y][x] = 0.0f;
+            lab.b[y][x] = 0.0f;
+        }
+    }
+    /* 3-px magenta ring against the dark side of the edge. atan2(b, a) is
+     * -0.529, which huelab_to_huehsv2 maps to the default curve's peak. */
+    for (int y = 0; y < lab.H; ++y) {
+        for (int x = 31; x <= 33; ++x) {
+            lab.a[y][x] = 6000.0f;
+            lab.b[y][x] = -3510.0f;
+        }
+    }
+    /* Neutral patch and a saturated patch away from the fringe. */
+    for (int y = 3; y <= 9; ++y) {
+        for (int x = 3; x <= 9; ++x) {
+            lab.a[y][x] = 0.0f;
+            lab.b[y][x] = 0.0f;
+        }
+    }
+    for (int y = 20; y <= 30; ++y) {
+        for (int x = 45; x <= 55; ++x) {
+            lab.a[y][x] = 9000.0f;
+            lab.b[y][x] = 9000.0f;
+        }
+    }
+    /* One fringe at the left border, where the host's window is asymmetric. */
+    for (int y = 15; y <= 25; ++y) {
+        lab.a[y][0] = 7000.0f;
+        lab.b[y][0] = -4100.0f;
+    }
+}
+
+/* The production CPU path, with the node pinned to the host. */
+void run_cpu_lab_sharpening(rtengine::procparams::ProcParams& params,
+                            LabImage& lab)
+{
+    rtengine::ImProcFunctions ipf(&params, false);
+    ipf.setScale(1.0);
+    set_node_device_override("lab.sharpening", StageNodeDevice::CPU);
+    ipf.impulsedenoise(&lab);
+    ipf.defringe(&lab);
+    clear_node_device_overrides();
+}
+
+RtStageStatus run_device_lab_sharpening(
+    const std::shared_ptr<StageContext>& context,
+    rtengine::procparams::ProcParams& params, LabImage& lab,
+    StageExecution& execution, std::string& error)
+{
+    rtengine::ImProcFunctions ipf(&params, false);
+    ipf.setScale(1.0);
+    LabSharpeningContext node_context(params, ipf, lab.W, lab.H);
+    if (node_context.build(&error) != 0) {
+        return RT_STAGE_INVALID;
+    }
+    const LabSharpeningNodeParams node = labSharpeningNodeParams(params);
+    std::string support_error;
+    const bool supported =
+        labSharpeningSupported(params, lab.W, lab.H, false, &support_error);
+    RtLabSharpeningContext descriptor = node_context.descriptor(supported);
+    std::vector<RtStageArg> args;
+    labSharpeningArgs(lab, node, node_context, descriptor, args);
+
+    StageRequest request;
+    request.name = "lab.sharpening";
+    request.args = args;
+    set_node_device_override("lab.sharpening", StageNodeDevice::OpenCL);
+    const RtStageStatus status = context->execute(request, nullptr, &execution);
+    clear_node_device_overrides();
+    return status;
+}
+
+void test_lab_sharpening(bool available)
+{
+    using namespace rtengine::stage;
+
+    /* ------------------------------------------------ admission predicates */
+    {
+        rtengine::procparams::ProcParams params;
+        std::string error;
+        check(!labSharpeningSupported(params, 63, 31, true, &error),
+              "lab.sharpening refuses the CIE-CAM arm");
+
+        params.impulseDenoise.enabled = true;
+        params.impulseDenoise.thresh = 50;
+        check(labSharpeningSupported(params, 63, 31, false, &error),
+              "lab.sharpening admits impulse denoise alone");
+
+        params.impulseDenoise.thresh = 101;
+        check(!labSharpeningSupported(params, 63, 31, false, &error),
+              "lab.sharpening refuses an impulse threshold above 100");
+        params.impulseDenoise.thresh = -1;
+        check(!labSharpeningSupported(params, 63, 31, false, &error),
+              "lab.sharpening refuses an impulse threshold below 0");
+        params.impulseDenoise.thresh = 50;
+
+        check(!labSharpeningSupported(params, 7, 31, false, &error),
+              "lab.sharpening refuses an image narrower than 8");
+
+        params.defringe.enabled = true;
+        params.defringe.radius = 2.0;
+        params.defringe.threshold = 13;
+        check(labSharpeningSupported(params, 63, 31, false, &error),
+              "lab.sharpening admits the default defringe pair");
+
+        params.defringe.radius = 1.0;
+        check(!labSharpeningSupported(params, 63, 31, false, &error),
+              "a defringe radius in the 5x5/7x7 range refuses the pair");
+        params.defringe.radius = 0.5;
+        check(!labSharpeningSupported(params, 63, 31, false, &error),
+              "a defringe radius of 0.5 refuses the pair");
+        params.defringe.radius = 0.2;
+        check(labSharpeningSupported(params, 63, 31, false, &error),
+              "a defringe radius below 0.25 is the host no-op");
+        params.defringe.radius = 2.0;
+
+        params.defringe.threshold = 101;
+        check(!labSharpeningSupported(params, 63, 31, false, &error),
+              "lab.sharpening refuses a defringe threshold above 100");
+        params.defringe.threshold = 13;
+
+        LabSharpeningNodeParams node = labSharpeningNodeParams(params);
+        check(!lab_sharpening_admitted(node, 63, 31, false, error),
+              "defringe needs device fp64");
+        check(lab_sharpening_admitted(node, 63, 31, true, error),
+              "defringe is admitted with device fp64");
+        /* The impulse-only pair never needs fp64. */
+        node.defringe_enabled = 0;
+        check(lab_sharpening_admitted(node, 63, 31, false, error),
+              "impulse denoise alone needs no fp64");
+
+        /* The image must be wide enough for the host's unclamped left tail. */
+        params.defringe.radius = 5.0;
+        check(!labSharpeningSupported(params, 19, 19, false, &error),
+              "a defringe window wider than the image is refused");
+    }
+
+    if (!available) {
+        skip("lab sharpening: no OpenCL device");
+        return;
+    }
+
+    const auto context = opencl_device()->create_context();
+    check(context != nullptr, "lab sharpening: the device creates a context");
+    if (context == nullptr) {
+        return;
+    }
+
+    /* ------------------------------------------------------ impulse denoise */
+    {
+        rtengine::procparams::ProcParams params;
+        params.impulseDenoise.enabled = true;
+        params.impulseDenoise.thresh = 50;
+
+        LabImage source(63, 31);
+        fill_impulse_fixture(source);
+
+        LabImage cpu(63, 31);
+        copy_sharpen_l(source, cpu);
+        run_cpu_lab_sharpening(params, cpu);
+
+        LabImage device(63, 31);
+        copy_sharpen_l(source, device);
+        StageExecution execution;
+        std::string error;
+        const RtStageStatus status = run_device_lab_sharpening(
+            context, params, device, execution, error);
+        check(status == RT_STAGE_OK,
+              ("lab.sharpening impulse " + error + " completes").c_str());
+        check(execution.device == StageDeviceType::OPENCL,
+              "lab.sharpening impulse runs on the device");
+        check(!execution.asynchronous,
+              "lab.sharpening impulse reads the planes back synchronously");
+
+        /* markImpulse()'s own mask is the reference marked set. */
+        std::vector<char> mask(
+            static_cast<std::size_t>(source.W) * source.H, 0);
+        std::vector<char*> mask_rows(static_cast<std::size_t>(source.H));
+        for (int y = 0; y < source.H; ++y) {
+            mask_rows[y] = mask.data() +
+                           static_cast<std::size_t>(y) * source.W;
+        }
+        rtengine::markImpulse(source.W, source.H, source.L, mask_rows.data(),
+                              static_cast<float>(params.impulseDenoise.thresh /
+                                                 20.0));
+        const std::size_t marked = static_cast<std::size_t>(
+            std::count(mask.begin(), mask.end(), static_cast<char>(1)));
+
+        const std::vector<unsigned char> cpu_changed =
+            lab_changed_mask(cpu, source);
+        const std::vector<unsigned char> device_changed =
+            lab_changed_mask(device, source);
+        const std::size_t cpu_count = lab_changed_count(cpu_changed);
+        const std::size_t device_count = lab_changed_count(device_changed);
+        check(cpu_changed == device_changed,
+              "lab.sharpening impulse corrects exactly the host's pixel set");
+        check(marked >= 25, "lab.sharpening impulse fixture marks a region");
+        check(cpu_count >= 20,
+              "lab.sharpening impulse fixture corrects a region");
+        check(marked >= cpu_count,
+              "lab.sharpening impulse never corrects an unmarked pixel");
+        /* The corrected set is a subset of the marked set, pixel for pixel. */
+        std::size_t unmarked_corrected = 0;
+        for (std::size_t index = 0; index < mask.size(); ++index) {
+            if (cpu_changed[index] != 0u && mask[index] == 0) {
+                ++unmarked_corrected;
+            }
+        }
+        check(unmarked_corrected == 0,
+              "lab.sharpening impulse corrects only pixels the mask marks");
+
+        /* Zero device differences outside the 5x5 correction neighbourhoods. */
+        std::size_t outside = 0;
+        for (int y = 0; y < device.H; ++y) {
+            for (int x = 0; x < device.W; ++x) {
+                const std::size_t here =
+                    static_cast<std::size_t>(y) * device.W + x;
+                if (!device_changed[here]) {
+                    continue;
+                }
+                bool near = false;
+                for (int yy = std::max(0, y - 2);
+                     yy <= std::min(device.H - 1, y + 2) && !near; ++yy) {
+                    for (int xx = std::max(0, x - 2);
+                         xx <= std::min(device.W - 1, x + 2); ++xx) {
+                        const std::size_t there =
+                            static_cast<std::size_t>(yy) * device.W + xx;
+                        if (cpu_changed[there]) {
+                            near = true;
+                            break;
+                        }
+                    }
+                }
+                if (!near) {
+                    ++outside;
+                }
+            }
+        }
+        check(outside == 0,
+              "lab.sharpening impulse changes nothing outside a corrected "
+              "window");
+
+        const LabPlaneDiff diff = compare_lab_planes(device, cpu);
+        check(diff.finite, "lab.sharpening impulse stays finite");
+        check(diff.max_l <= 0.5 && diff.max_a <= 0.5 && diff.max_b <= 0.5,
+              "lab.sharpening impulse is within half a 16-bit LSB");
+        std::printf("stage-residency: lab.sharpening impulse: marked %zu, "
+                    "corrected cpu %zu/device %zu, PAE L %.6f a %.6f b %.6f, "
+                    "%zu of %zu samples differ\n",
+                    marked, cpu_count, device_count, diff.max_l, diff.max_a,
+                    diff.max_b, diff.differing, diff.samples);
+    }
+
+    /* -------------------------------------------------- impulse stress case */
+    {
+        /*
+         * A large deterministic pseudo-random field exercises the SSE bulk
+         * rows and columns and thousands of corrections at once. The impulse
+         * pass has no threshold comparison that a rounding could move, so it
+         * must be bit-identical on all three planes.
+         */
+        rtengine::procparams::ProcParams params;
+        params.impulseDenoise.enabled = true;
+        params.impulseDenoise.thresh = 50;
+
+        LabImage source(128, 80);
+        unsigned state = 0x12345678u;
+        const auto next = [&state]() {
+            state = state * 1664525u + 1013904223u;
+            return static_cast<int>((state >> 8) & 0xffffu);
+        };
+        for (int y = 0; y < source.H; ++y) {
+            for (int x = 0; x < source.W; ++x) {
+                source.L[y][x] = static_cast<float>(next());
+                source.a[y][x] = static_cast<float>(next()) - 32768.0f;
+                source.b[y][x] = static_cast<float>(next()) - 32768.0f;
+                if (((x * 7 + y * 13) % 97) == 0) {
+                    source.L[y][x] += 20000.0f;
+                    source.a[y][x] += 6000.0f;
+                }
+            }
+        }
+
+        LabImage cpu(128, 80);
+        copy_sharpen_l(source, cpu);
+        run_cpu_lab_sharpening(params, cpu);
+
+        LabImage device(128, 80);
+        copy_sharpen_l(source, device);
+        StageExecution execution;
+        std::string error;
+        const RtStageStatus status = run_device_lab_sharpening(
+            context, params, device, execution, error);
+        check(status == RT_STAGE_OK &&
+                  execution.device == StageDeviceType::OPENCL,
+              "lab.sharpening impulse stress runs on the device");
+        const LabPlaneDiff diff = compare_lab_planes(device, cpu);
+        check(diff.finite && diff.max_l == 0.0 && diff.max_a == 0.0 &&
+                  diff.max_b == 0.0,
+              "lab.sharpening impulse is bit-identical on a random field");
+        std::printf("stage-residency: lab.sharpening impulse stress: %zu of "
+                    "%zu samples differ, PAE L %.6f a %.6f b %.6f\n",
+                    diff.differing, diff.samples, diff.max_l, diff.max_a,
+                    diff.max_b);
+    }
+
+    /* ------------------------------------------------------------- defringe */
+    {
+        rtengine::procparams::ProcParams params;
+        params.defringe.enabled = true;
+        params.defringe.radius = 2.0;
+        params.defringe.threshold = 13;
+
+        LabImage source(70, 42);
+        fill_defringe_fixture(source);
+
+        LabImage cpu(70, 42);
+        copy_sharpen_l(source, cpu);
+        run_cpu_lab_sharpening(params, cpu);
+
+        LabImage device(70, 42);
+        copy_sharpen_l(source, device);
+        StageExecution execution;
+        std::string error;
+        const RtStageStatus status = run_device_lab_sharpening(
+            context, params, device, execution, error);
+        check(status == RT_STAGE_OK,
+              ("lab.sharpening defringe " + error + " completes").c_str());
+        check(execution.device == StageDeviceType::OPENCL,
+              "lab.sharpening defringe runs on the device");
+        check(!execution.asynchronous,
+              "lab.sharpening defringe reads the planes back synchronously");
+
+        const std::vector<unsigned char> cpu_changed =
+            lab_changed_mask(cpu, source);
+        const std::vector<unsigned char> device_changed =
+            lab_changed_mask(device, source);
+        const std::size_t cpu_count = lab_changed_count(cpu_changed);
+        const std::size_t device_count = lab_changed_count(device_changed);
+        check(cpu_changed == device_changed,
+              "lab.sharpening defringe corrects exactly the host's pixel set");
+        check(cpu_count >= 30,
+              "lab.sharpening defringe fixture corrects a region");
+        check(cpu.L[10][32] == source.L[10][32],
+              "lab.sharpening defringe leaves L untouched");
+
+        /* Zero device differences outside the halfwin neighbourhood. */
+        const int reach = 4; /* ceil(2 * 2.0) + 1 - 1 */
+        std::size_t outside = 0;
+        for (int y = 0; y < device.H; ++y) {
+            for (int x = 0; x < device.W; ++x) {
+                const std::size_t here =
+                    static_cast<std::size_t>(y) * device.W + x;
+                if (!device_changed[here]) {
+                    continue;
+                }
+                bool near = false;
+                for (int yy = std::max(0, y - reach);
+                     yy <= std::min(device.H - 1, y + reach) && !near; ++yy) {
+                    for (int xx = std::max(0, x - reach);
+                         xx <= std::min(device.W - 1, x + reach); ++xx) {
+                        const std::size_t there =
+                            static_cast<std::size_t>(yy) * device.W + xx;
+                        if (cpu_changed[there]) {
+                            near = true;
+                            break;
+                        }
+                    }
+                }
+                if (!near) {
+                    ++outside;
+                }
+            }
+        }
+        check(outside == 0,
+              "lab.sharpening defringe changes nothing outside a corrected "
+              "window");
+
+        const LabPlaneDiff diff = compare_lab_planes(device, cpu);
+        check(diff.finite, "lab.sharpening defringe stays finite");
+        check(diff.max_l == 0.0,
+              "lab.sharpening defringe never moves L");
+        check(diff.max_a <= 0.5 && diff.max_b <= 0.5,
+              "lab.sharpening defringe is within half a 16-bit LSB");
+        std::printf("stage-residency: lab.sharpening defringe: corrected cpu "
+                    "%zu/device %zu, PAE L %.6f a %.6f b %.6f, %zu of %zu "
+                    "samples differ\n",
+                    cpu_count, device_count, diff.max_l, diff.max_a, diff.max_b,
+                    diff.differing, diff.samples);
+    }
+
+    /* ------------------------------------------------- the pair is atomic */
+    {
+        /* Impulse admits, defringe does not: the whole pair runs on the
+         * host. */
+        rtengine::procparams::ProcParams params;
+        params.impulseDenoise.enabled = true;
+        params.impulseDenoise.thresh = 50;
+        params.defringe.enabled = true;
+        params.defringe.radius = 1.0;
+        params.defringe.threshold = 13;
+
+        LabImage source(63, 31);
+        fill_impulse_fixture(source);
+
+        LabImage cpu(63, 31);
+        copy_sharpen_l(source, cpu);
+        run_cpu_lab_sharpening(params, cpu);
+
+        LabImage device(63, 31);
+        copy_sharpen_l(source, device);
+        StageExecution execution;
+        std::string error;
+        const RtStageStatus status = run_device_lab_sharpening(
+            context, params, device, execution, error);
+        check(status == RT_STAGE_OK,
+              "a refused pair completes through the host builtin");
+        check(execution.device != StageDeviceType::OPENCL,
+              "a refused pair never runs on the device");
+        const LabPlaneDiff diff = compare_lab_planes(device, cpu);
+        check(diff.finite && diff.differing == 0 && diff.max_l == 0.0 &&
+                  diff.max_a == 0.0 && diff.max_b == 0.0,
+              "a refused pair matches the host result exactly");
+
+        const std::string profile_path =
+            std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR")
+                                              : "/tmp") +
+            "/stage-residency-lab-sharpening.jsonl";
+        rtengine::ImProcFunctions ipf(&params, false);
+        ipf.setScale(1.0);
+        LabSharpeningContext node_context(params, ipf, source.W, source.H);
+        check(node_context.build(&error) == 0,
+              "a refused pair builds its hue table");
+        RtLabSharpeningContext descriptor =
+            node_context.descriptor(labSharpeningSupported(
+                params, source.W, source.H, false, &error));
+        std::vector<RtStageArg> args;
+        labSharpeningArgs(device, labSharpeningNodeParams(params),
+                          node_context, descriptor, args);
+
+        std::remove(profile_path.c_str());
+        setenv("RT_STAGE_PROFILE", profile_path.c_str(), 1);
+        set_node_device_override("lab.sharpening", StageNodeDevice::OpenCL);
+        const RtStageStatus run_status = run("lab.sharpening", args);
+        clear_node_device_overrides();
+        const std::string profile = read_file(profile_path);
+        unsetenv("RT_STAGE_PROFILE");
+        check(run_status == RT_STAGE_OK,
+              "a refused pair completes through run()");
+        check(profile.find("\"stage\":\"lab.sharpening\"") != std::string::npos,
+              "a refused pair records the node");
+        check(profile.find("\"impl\":\"host\"") != std::string::npos,
+              "a refused pair records a host execution");
+        check(profile.find("\"impl\":\"opencl\"") == std::string::npos,
+              "a refused pair never records a device pass");
+    }
+    /* ------------------------------------- the pair runs in one device pass */
+    {
+        rtengine::procparams::ProcParams params;
+        params.impulseDenoise.enabled = true;
+        params.impulseDenoise.thresh = 50;
+        params.defringe.enabled = true;
+        params.defringe.radius = 2.0;
+        params.defringe.threshold = 13;
+
+        LabImage source(70, 42);
+        fill_defringe_fixture(source);
+        /* Spikes in the neutral and saturated regions so the impulse pass has
+         * work and the defringe reads its corrected planes. */
+        source.L[5][5] += 18000.0f;
+        source.L[25][50] -= 16000.0f;
+        source.a[25][50] += 3000.0f;
+        source.L[0][69] += 15000.0f;
+
+        LabImage cpu(70, 42);
+        copy_sharpen_l(source, cpu);
+        run_cpu_lab_sharpening(params, cpu);
+
+        LabImage device(70, 42);
+        copy_sharpen_l(source, device);
+        StageExecution execution;
+        std::string error;
+        const RtStageStatus status = run_device_lab_sharpening(
+            context, params, device, execution, error);
+        check(status == RT_STAGE_OK &&
+                  execution.device == StageDeviceType::OPENCL,
+              "the impulse+defringe pair runs in one device pass");
+        const LabPlaneDiff diff = compare_lab_planes(device, cpu);
+        std::printf("stage-residency: lab.sharpening pair: PAE L %.6f a %.6f "
+                    "b %.6f, %zu of %zu samples differ\n",
+                    diff.max_l, diff.max_a, diff.max_b, diff.differing,
+                    diff.samples);
+        check(diff.finite && diff.max_l <= 0.5 && diff.max_a <= 0.5 &&
+                  diff.max_b <= 0.5,
+              "the impulse+defringe pair is within half a 16-bit LSB");
+        const std::vector<unsigned char> cpu_changed =
+            lab_changed_mask(cpu, source);
+        const std::vector<unsigned char> device_changed =
+            lab_changed_mask(device, source);
+        check(cpu_changed == device_changed,
+              "the impulse+defringe pair corrects exactly the host's set");
+    }
+
+    /* The defringe no-op below the Gaussian identity limit. */
+    {
+        rtengine::procparams::ProcParams params;
+        params.defringe.enabled = true;
+        params.defringe.radius = 0.2;
+        params.defringe.threshold = 13;
+
+        LabImage source(63, 31);
+        fill_impulse_fixture(source);
+        LabImage device(63, 31);
+        copy_sharpen_l(source, device);
+
+        StageExecution execution;
+        std::string error;
+        const RtStageStatus status = run_device_lab_sharpening(
+            context, params, device, execution, error);
+        check(status == RT_STAGE_OK, "the defringe no-op completes");
+        check(execution.device == StageDeviceType::OPENCL,
+              "the defringe no-op is a device pass");
+        const LabPlaneDiff untouched = compare_lab_planes(device, source);
+        check(untouched.differing == 0 && untouched.max_l == 0.0 &&
+                  untouched.max_a == 0.0 && untouched.max_b == 0.0,
+              "the defringe no-op leaves every plane untouched");
     }
 }
 
@@ -10996,6 +11652,7 @@ int main()
     test_lab_wavelet_contrast(available);
     test_lab_wavelet_gpu(available);
     test_output_sharpen(available);
+    test_lab_sharpening(available);
     test_run_wiring(available);
 
     if (failures == 0) {
