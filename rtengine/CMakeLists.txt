@@ -383,6 +383,25 @@ target_link_libraries(stage-indexer-test PRIVATE rtengine)
 target_include_directories(stage-indexer-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/stage")
 rt_setup_target(stage-indexer-test)
 
+# Exercise the production AMaZE tile core with synthetic Bayer data.
+add_executable(amaze-tile-parity-test EXCLUDE_FROM_ALL
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/amaze_tile_parity_test.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/editcallbacks.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/multilangmgr.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/options.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/paramsedited.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/pathutils.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/threadutils.cc"
+)
+target_include_directories(amaze-tile-parity-test BEFORE PRIVATE
+    "${CMAKE_BINARY_DIR}/rtgui"
+)
+target_include_directories(amaze-tile-parity-test PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}"
+)
+target_link_libraries(amaze-tile-parity-test PRIVATE rtengine)
+rt_setup_target(amaze-tile-parity-test)
+
 add_executable(denoise-tile-buffers-test EXCLUDE_FROM_ALL
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/denoise_tile_buffers_test.cc"
 )

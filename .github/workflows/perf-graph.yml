@@ -84,6 +84,7 @@ jobs:
             stage-param-map-test stage-dirty-blocks-test stage-work-test
             stage-parity-test stage-pipeline-test stage-store-test
             editorrequest-test viewport-admission-test denoise-tile-buffers-test
+            amaze-tile-parity-test
           )
           printf '%s\n' "${tests[@]}" > build/ci-logs/tests.txt
           cmake --build "$build_dir" --parallel 2 --target "${tests[@]}" \
