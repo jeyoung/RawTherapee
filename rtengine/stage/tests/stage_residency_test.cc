@@ -7406,8 +7406,16 @@ void test_local_adjustments(bool available)
                  p.locallab.spots[0].expcbdl = true;
                  p.locallab.spots[0].sensicb = 101;
              }},
-            {"sharpening", [](auto& p) {
+            {"capture sharpening", [](auto& p) {
+                 p.dirpyrequalizer.cbdlMethod = "aft";
                  p.locallab.spots[0].expsharp = true;
+                 p.locallab.spots[0].methodcap = "cap";
+             }},
+            {"sharpen damping fixup", [](auto& p) {
+                 p.locallab.spots[0].expcolor = false;
+                 p.locallab.spots[0].expsharp = true;
+                 p.locallab.spots[0].methodcap = "rl";
+                 p.dirpyrequalizer.cbdlMethod = "bef";
              }},
             {"log detail", [](auto& p) {
                  p.locallab.spots[0].expcolor = false;
@@ -7934,6 +7942,46 @@ void test_local_adjustments(bool available)
             spot.streng = strength;
             spot.sensisf = 30;
         };
+        /* The local sharpening RL arm the output sharpening core covers:
+         * undamped, no gamma wrapper, no blur pre-pass and a radius below the
+         * core's separable limit. */
+        const auto sharpen_spot = [&](rtengine::procparams::ProcParams& p,
+                                      double radius, int amount,
+                                      int contrast, int sensitivity) {
+            /* The host block raises a zero damping to one under the default
+             * `cbdlMethod == "bef"`; select the other method so the RL arm
+             * stays undamped on both sides. */
+            p.dirpyrequalizer.cbdlMethod = "aft";
+            auto& spot = p.locallab.spots[0];
+            spot.expcolor = false;
+            spot.expsharp = true;
+            spot.methodcap = "rl";
+            spot.sharamount = amount;
+            spot.sharradius = radius;
+            spot.shariter = 30;
+            spot.sharcontrast = contrast;
+            spot.shardamping = 0;
+            spot.sharblur = 0.2;
+            spot.shargam = 1.0;
+            spot.sharshow = false;
+            spot.inverssha = false;
+            spot.deconvAutoshar = false;
+            spot.reparsha = 100.0;
+            spot.sensisha = sensitivity;
+        };
+        /* A spot whose unclipped extent covers the fixture but whose padded
+         * sharpening plane stays small. `loc` is in 1/2000 image units. */
+        const auto add_sharpen_spot =
+            [&](rtengine::procparams::ProcParams& p, int cx, int cy,
+                int loc_x, int loc_y, bool active, const char* shape,
+                const char* avoid) {
+                auto spot = localAdjustmentsSpot("sharpen", cx, cy, 0, active,
+                                                 0, 0, 0);
+                spot.shape = shape;
+                spot.avoidgamutMethod = avoid;
+                spot.loc = {loc_x, loc_x, loc_y, loc_y};
+                p.locallab.spots.push_back(spot);
+            };
         complex.push_back({"vibrance only", 238, 64, [&](auto& p) {
             add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
             vibrance_spot(p, 40, 20);
@@ -8933,6 +8981,206 @@ void test_local_adjustments(bool available)
             p.locallab.spots[2].qualitycurveMethod = "none";
         }});
 
+        /* Local sharpening, the RL arm of the output sharpening core. The
+         * padded extent covering the fixture keeps the test plane small while
+         * still exercising the block's zero-padded geometry. */
+        complex.push_back({"sharpen only", 238, 64, [&](auto& p) {
+            add_sharpen_spot(p, 0, 0, 2000, 2000, true, "ELI", "NONE");
+            sharpen_spot(p, 0.75, 100, 20, 40);
+        }});
+        complex.push_back({"sharpen fir3", 238, 64, [&](auto& p) {
+            add_sharpen_spot(p, 0, 0, 2000, 2000, true, "ELI", "NONE");
+            sharpen_spot(p, 0.55, 80, 40, 60);
+        }});
+        complex.push_back({"sharpen kernel5", 238, 64, [&](auto& p) {
+            add_sharpen_spot(p, 0, 0, 2000, 2000, true, "ELI", "NONE");
+            sharpen_spot(p, 0.70, 90, 20, 40);
+        }});
+        complex.push_back({"sharpen kernel7", 238, 64, [&](auto& p) {
+            add_sharpen_spot(p, 0, 0, 2000, 2000, true, "ELI", "NONE");
+            sharpen_spot(p, 1.00, 70, 10, 80);
+        }});
+        complex.push_back({"sharpen high sensitivity", 238, 64,
+                           [&](auto& p) {
+            add_sharpen_spot(p, 0, 0, 2000, 2000, true, "ELI", "NONE");
+            sharpen_spot(p, 0.75, 100, 20, 90);
+        }});
+        complex.push_back({"sharpen and colour", 238, 64, [&](auto& p) {
+            add_sharpen_spot(p, 0, 0, 2000, 2000, true, "ELI", "NONE");
+            sharpen_spot(p, 0.75, 100, 20, 40);
+            auto& spot = p.locallab.spots[0];
+            spot.expcolor = true;
+            spot.chroma = 35;
+            spot.lightness = 10;
+            spot.contrast = -5;
+        }});
+        complex.push_back({"sharpen and log", 238, 64, [&](auto& p) {
+            add_sharpen_spot(p, 0, 0, 2000, 2000, true, "ELI", "NONE");
+            sharpen_spot(p, 0.75, 100, 20, 40);
+            log_spot(p, 60, true, 0.0, 0.4, 100.0, -5.0, 10.0, 10.0,
+                     18.0);
+        }});
+        complex.push_back({"sharpen and dehaze", 238, 64, [&](auto& p) {
+            add_sharpen_spot(p, 0, 0, 2000, 2000, true, "ELI", "NONE");
+            sharpen_spot(p, 0.75, 100, 20, 40);
+            dehaze_spot(p, 50, 25, 50, 60);
+        }});
+        complex.push_back({"sharpen and CBDL", 238, 96, [&](auto& p) {
+            add_sharpen_spot(p, 0, 0, 2000, 2000, true, "ELI", "NONE");
+            sharpen_spot(p, 0.75, 100, 20, 40);
+            cbdl_spot(p, 1.15, 1.1, 1.05, 1.0, 1.0, 1.0, 0.4, 1.0);
+        }});
+        complex.push_back({"sharpen and vibrance", 238, 64, [&](auto& p) {
+            add_sharpen_spot(p, 0, 0, 2000, 2000, true, "ELI", "NONE");
+            sharpen_spot(p, 0.75, 100, 20, 40);
+            vibrance_spot(p, 40, 20);
+        }});
+        complex.push_back({"sharpen and shadows/highlights", 238, 64,
+                           [&](auto& p) {
+            add_sharpen_spot(p, 0, 0, 2000, 2000, true, "ELI", "NONE");
+            sharpen_spot(p, 0.75, 100, 20, 40);
+            sh_spot(p, 50, 50);
+        }});
+        complex.push_back({"sharpen and soft light", 238, 64,
+                           [&](auto& p) {
+            add_sharpen_spot(p, 0, 0, 2000, 2000, true, "ELI", "NONE");
+            sharpen_spot(p, 0.75, 100, 20, 40);
+            soft_spot(p, 60);
+        }});
+        complex.push_back({"sharpen and local contrast", 238, 64,
+                           [&](auto& p) {
+            add_sharpen_spot(p, 0, 0, 2000, 2000, true, "ELI", "NONE");
+            sharpen_spot(p, 0.75, 100, 20, 40);
+            contrast_spot(p, 40, 0.4);
+        }});
+        complex.push_back({"all tools without sharpen", 238, 96, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            p.locallab.spots[0].transit = 0.0;
+            auto& spot = p.locallab.spots[0];
+            log_spot(p, 60, true, 0.0, 0.4, 100.0, -5.0, 10.0, 10.0,
+                     18.0);
+            dehaze_spot(p, 50, 25, 50, 60);
+            cbdl_spot(p, 1.15, 1.1, 1.05, 1.0, 1.0, 1.0, 0.4, 1.0);
+            spot.expcolor = true;
+            spot.chroma = 35;
+            spot.lightness = 10;
+            spot.contrast = -5;
+            spot.expvibrance = true;
+            spot.pastels = 40;
+            spot.saturated = 20;
+            spot.psthreshold.setValues(0, 75);
+            spot.sensiv = 30;
+            spot.expcontrast = true;
+            spot.localcontMethod = "loc";
+            spot.lcradius = 40;
+            spot.lcamount = 0.4;
+            spot.lcdarkness = 0.9;
+            spot.lclightness = 1.1;
+            spot.reparw = 100.0;
+            spot.sensilc = 60;
+            spot.expshadhigh = true;
+            spot.shMethod = "std";
+            spot.highlights = 50;
+            spot.shadows = 50;
+            spot.h_tonalwidth = 70;
+            spot.s_tonalwidth = 30;
+            spot.sh_radius = 40;
+            spot.sensihs = 30;
+            spot.blurSHde = 5;
+            spot.expsoft = true;
+            spot.softMethod = "soft";
+            spot.streng = 60;
+            spot.sensisf = 30;
+            spot.expsharp = false;
+        }});
+        complex.push_back({"sharpen partial", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            sharpen_spot(p, 0.75, 100, 20, 40);
+            p.locallab.spots[0].transit = 0.0;
+        }});
+        complex.push_back({"sharpen all tools", 238, 96, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            sharpen_spot(p, 0.75, 100, 20, 40);
+            p.locallab.spots[0].transit = 0.0;
+            auto& spot = p.locallab.spots[0];
+            log_spot(p, 60, true, 0.0, 0.4, 100.0, -5.0, 10.0, 10.0,
+                     18.0);
+            dehaze_spot(p, 50, 25, 50, 60);
+            cbdl_spot(p, 1.15, 1.1, 1.05, 1.0, 1.0, 1.0, 0.4, 1.0);
+            /* cbdl_spot() switches Colour & Light off; restore it. */
+            spot.expcolor = true;
+            spot.chroma = 35;
+            spot.lightness = 10;
+            spot.contrast = -5;
+            spot.expvibrance = true;
+            spot.pastels = 40;
+            spot.saturated = 20;
+            spot.psthreshold.setValues(0, 75);
+            spot.sensiv = 30;
+            spot.expcontrast = true;
+            spot.localcontMethod = "loc";
+            spot.lcradius = 40;
+            spot.lcamount = 0.4;
+            spot.lcdarkness = 0.9;
+            spot.lclightness = 1.1;
+            spot.reparw = 100.0;
+            spot.sensilc = 60;
+            spot.expshadhigh = true;
+            spot.shMethod = "std";
+            spot.highlights = 50;
+            spot.shadows = 50;
+            spot.h_tonalwidth = 70;
+            spot.s_tonalwidth = 30;
+            spot.sh_radius = 40;
+            spot.sensihs = 30;
+            spot.blurSHde = 5;
+            spot.expsoft = true;
+            spot.softMethod = "soft";
+            spot.streng = 60;
+            spot.sensisf = 30;
+        }});
+        complex.push_back({"sharpen MUNS", 238, 64, [&](auto& p) {
+            add_sharpen_spot(p, 0, 0, 2000, 2000, true, "ELI", "MUNS");
+            sharpen_spot(p, 0.75, 100, 20, 40);
+        }});
+        complex.push_back({"sharpen RECT", 238, 64, [&](auto& p) {
+            add_sharpen_spot(p, 0, 0, 2000, 2000, true, "RECT", "NONE");
+            sharpen_spot(p, 0.75, 100, 20, 40);
+        }});
+        complex.push_back({"sharpen 179x49", 179, 49, [&](auto& p) {
+            add_sharpen_spot(p, 0, 0, 2000, 2000, true, "ELI", "NONE");
+            sharpen_spot(p, 0.75, 100, 20, 40);
+        }});
+        complex.push_back({"sharpen 8192x64", 8192, 64, [&](auto& p) {
+            add_sharpen_spot(p, 0, 0, 1000, 2000, true, "ELI", "NONE");
+            sharpen_spot(p, 0.75, 100, 20, 40);
+        }});
+        complex.push_back({"sharpen second spot", 238, 64, [&](auto& p) {
+            p.dirpyrequalizer.cbdlMethod = "aft";
+            add_spot(p, -300, -150, 700, true, 30, 8, 0, "ELI", "NONE");
+            add_sharpen_spot(p, 0, 0, 2000, 2000, true, "ELI", "NONE");
+            auto& spot = p.locallab.spots[1];
+            spot.expcolor = false;
+            spot.expsharp = true;
+            spot.methodcap = "rl";
+            spot.sharamount = 100;
+            spot.sharradius = 0.75;
+            spot.shariter = 30;
+            spot.sharcontrast = 20;
+            spot.shardamping = 0;
+            spot.sharblur = 0.2;
+            spot.shargam = 1.0;
+            spot.sharshow = false;
+            spot.reparsha = 100.0;
+            spot.sensisha = 40;
+        }});
+        complex.push_back({"sharpen inactive then active", 238, 64,
+                           [&](auto& p) {
+            add_sharpen_spot(p, 0, 0, 2000, 2000, false, "ELI", "NONE");
+            sharpen_spot(p, 0.75, 100, 20, 40);
+            add_spot(p, 100, 100, 600, true, 35, 10, -5, "ELI", "NONE");
+        }});
+
         std::unique_ptr<LabImage> forward_three;
         for (const ComplexCase& c : complex) {
             rtengine::procparams::ProcParams reference_params;
@@ -9075,6 +9323,31 @@ void test_local_adjustments(bool available)
                             changed.max_abs);
                 check(changed.differing > 0,
                       "the log tool changes the image");
+            }
+            if (c.label == "sharpen only") {
+                /* The same spot with sharpening off: the tool must change the
+                 * image, otherwise the parity above is vacuous. */
+                rtengine::procparams::ProcParams plain_params =
+                    reference_params;
+                plain_params.locallab.spots[0].expsharp = false;
+                plain_params.locallab.spots[0].expcolor = true;
+                Imagefloat plain_base(c.width, c.height);
+                fill_local_adjustments_rgb(plain_base, 211u);
+                std::unique_ptr<LabImage> plain_lab(
+                    new LabImage(c.width, c.height));
+                rtengine::ImProcFunctions plain_ipf(&plain_params, false);
+                localAdjustmentsHostBlock(plain_ipf, plain_params,
+                                          &plain_base, plain_lab.get(),
+                                          c.width, c.height);
+                const Diff changed =
+                    compare(view(*plain_lab), view(*reference_lab));
+                std::printf("stage-residency: local.adjustments sharpen "
+                            "non-vacuity: %zu of %zu samples differ, "
+                            "PAE %.6f LSB16\n",
+                            changed.differing, changed.samples,
+                            changed.max_abs);
+                check(changed.differing > 0,
+                      "the sharpening tool changes the image");
             }
             if (c.label == "dehaze only") {
                 /* The same spot with the retinex enable and dehaze off: the
@@ -9432,6 +9705,88 @@ void test_local_adjustments(bool available)
              }},
             {"reparcol 1", [](auto& p) {
                  p.locallab.spots[0].reparcol = 1.0;
+             }},
+            {"capture sharpening", [](auto& p) {
+                 p.locallab.spots[0].expcolor = false;
+                 p.locallab.spots[0].expsharp = true;
+                 p.locallab.spots[0].methodcap = "cap";
+             }},
+            {"sharpen damping", [](auto& p) {
+                 p.locallab.spots[0].expcolor = false;
+                 p.locallab.spots[0].expsharp = true;
+                 p.locallab.spots[0].methodcap = "rl";
+                 p.dirpyrequalizer.cbdlMethod = "aft";
+                 p.locallab.spots[0].shardamping = 5;
+             }},
+            {"sharpen gamma", [](auto& p) {
+                 p.locallab.spots[0].expcolor = false;
+                 p.locallab.spots[0].expsharp = true;
+                 p.locallab.spots[0].methodcap = "rl";
+                 p.dirpyrequalizer.cbdlMethod = "aft";
+                 p.locallab.spots[0].shargam = 2.0;
+             }},
+            {"sharpen blur", [](auto& p) {
+                 p.locallab.spots[0].expcolor = false;
+                 p.locallab.spots[0].expsharp = true;
+                 p.locallab.spots[0].methodcap = "rl";
+                 p.dirpyrequalizer.cbdlMethod = "aft";
+                 p.locallab.spots[0].sharblur = 0.5;
+             }},
+            {"sharpen separable radius", [](auto& p) {
+                 p.locallab.spots[0].expcolor = false;
+                 p.locallab.spots[0].expsharp = true;
+                 p.locallab.spots[0].methodcap = "rl";
+                 p.dirpyrequalizer.cbdlMethod = "aft";
+                 p.locallab.spots[0].sharradius = 1.5;
+             }},
+            {"sharpen radius range", [](auto& p) {
+                 p.locallab.spots[0].expcolor = false;
+                 p.locallab.spots[0].expsharp = true;
+                 p.locallab.spots[0].methodcap = "rl";
+                 p.dirpyrequalizer.cbdlMethod = "aft";
+                 p.locallab.spots[0].sharradius = 0.3;
+             }},
+            {"sharpen amount range", [](auto& p) {
+                 p.locallab.spots[0].expcolor = false;
+                 p.locallab.spots[0].expsharp = true;
+                 p.locallab.spots[0].methodcap = "rl";
+                 p.dirpyrequalizer.cbdlMethod = "aft";
+                 p.locallab.spots[0].sharamount = 0;
+             }},
+            {"sharpen iterations range", [](auto& p) {
+                 p.locallab.spots[0].expcolor = false;
+                 p.locallab.spots[0].expsharp = true;
+                 p.locallab.spots[0].methodcap = "rl";
+                 p.dirpyrequalizer.cbdlMethod = "aft";
+                 p.locallab.spots[0].shariter = 4;
+             }},
+            {"sharpen contrast range", [](auto& p) {
+                 p.locallab.spots[0].expcolor = false;
+                 p.locallab.spots[0].expsharp = true;
+                 p.locallab.spots[0].methodcap = "rl";
+                 p.dirpyrequalizer.cbdlMethod = "aft";
+                 p.locallab.spots[0].sharcontrast = 2;
+             }},
+            {"sharpen sensitivity range", [](auto& p) {
+                 p.locallab.spots[0].expcolor = false;
+                 p.locallab.spots[0].expsharp = true;
+                 p.locallab.spots[0].methodcap = "rl";
+                 p.dirpyrequalizer.cbdlMethod = "aft";
+                 p.locallab.spots[0].sensisha = 101;
+             }},
+            {"sharpen mask view", [](auto& p) {
+                 p.locallab.spots[0].expcolor = false;
+                 p.locallab.spots[0].expsharp = true;
+                 p.locallab.spots[0].methodcap = "rl";
+                 p.dirpyrequalizer.cbdlMethod = "aft";
+                 p.locallab.spots[0].sharshow = true;
+             }},
+            {"sharpen recovery", [](auto& p) {
+                 p.locallab.spots[0].expcolor = false;
+                 p.locallab.spots[0].expsharp = true;
+                 p.locallab.spots[0].methodcap = "rl";
+                 p.dirpyrequalizer.cbdlMethod = "aft";
+                 p.locallab.spots[0].reparsha = 50.0;
              }},
             {"highlight reconstruction", [](auto& p) {
                  p.toneCurve.hrenabled = true;
@@ -9841,6 +10196,55 @@ void test_local_adjustments(bool available)
               "the extra tools are not recorded on a colour-only spot");
         check(record[RT_LOCAL_ADJUSTMENTS_SLOT_VIB_SKIN_ACTIVE] == 0.f,
               "the idle vibrance skin curve is not recorded");
+    }
+
+    /* The local sharpening record. */
+    {
+        rtengine::procparams::ProcParams params = supported;
+        auto& spot = params.locallab.spots[0];
+        spot.expcolor = false;
+        spot.expsharp = true;
+        spot.methodcap = "rl";
+        spot.sharamount = 80;
+        spot.sharradius = 0.7;
+        spot.shariter = 25;
+        spot.sharcontrast = 40;
+        spot.shardamping = 0;
+        spot.sharblur = 0.2;
+        spot.shargam = 1.0;
+        spot.sharshow = false;
+        spot.sensisha = 55;
+        spot.reparsha = 100.0;
+        spot.loc = {2000, 2000, 2000, 2000};
+        params.dirpyrequalizer.cbdlMethod = "aft";
+
+        Imagefloat base(179, 48);
+        fill_local_adjustments_rgb(base, 43u);
+        std::unique_ptr<LabImage> lab(new LabImage(179, 48));
+        rtengine::ImProcFunctions ipf(&params, false);
+        rtengine::LabImage source(179, 48);
+        ipf.rgb2lab(base, source, params.icm.workingProfile);
+        LabImage* lab_pointer = lab.get();
+        LocalAdjustmentsContext context(params, ipf, &base, lab_pointer,
+                                        179, 48);
+        RtStageBuffer source_view = view(source);
+        RtLocalAdjustmentsResult setup{};
+        check(context.build(0, &source_view, setup) == 0,
+              "the local sharpening setup builds one spot");
+        const float* record = setup.spots;
+        check(record[RT_LOCAL_ADJUSTMENTS_SLOT_EXPSHARP] == 1.f,
+              "the local sharpening pass is recorded");
+        check(record[RT_LOCAL_ADJUSTMENTS_SLOT_SENSSHA] == 55.f,
+              "the sharpening sensitivity is recorded");
+        check(record[RT_LOCAL_ADJUSTMENTS_SLOT_SHAR_AMOUNT] == 80.f &&
+                  record[RT_LOCAL_ADJUSTMENTS_SLOT_SHAR_ITER] == 25.f &&
+                  record[RT_LOCAL_ADJUSTMENTS_SLOT_SHAR_CONTRAST] == 40.f,
+              "the sharpening sliders are recorded");
+        check(std::fabs(record[RT_LOCAL_ADJUSTMENTS_SLOT_SHAR_RADIUS] -
+                        0.7f) < 1e-6f &&
+                  std::fabs(record[RT_LOCAL_ADJUSTMENTS_SLOT_SHAR_BLUR] -
+                            0.2f) < 1e-6f,
+              "the sharpening radius and blur are recorded");
     }
 
     /* The shadows/highlights record and its two host-built tone tables. */

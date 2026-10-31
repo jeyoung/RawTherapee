@@ -298,6 +298,9 @@ quick() {
     run_stage_device "pef/stage-device-local-adjustments-log" \
         "$ROOT/devnotes/opencl/pp3/localadjustments-log.pp3" \
         local.adjustments cpu
+    run_stage_device "pef/stage-device-local-adjustments-sharpen" \
+        "$ROOT/devnotes/opencl/pp3/localadjustments-sharpen.pp3" \
+        local.adjustments cpu
 }
 
 stage() {
@@ -644,6 +647,9 @@ stage_device() {
         local.adjustments cpu
     run_stage_device "pef/stage-device-local-adjustments-log" \
         "$ROOT/devnotes/opencl/pp3/localadjustments-log.pp3" \
+        local.adjustments cpu
+    run_stage_device "pef/stage-device-local-adjustments-sharpen" \
+        "$ROOT/devnotes/opencl/pp3/localadjustments-sharpen.pp3" \
         local.adjustments cpu
 }
 
