@@ -7411,11 +7411,35 @@ void test_local_adjustments(bool available)
                  p.locallab.spots[0].expsharp = true;
                  p.locallab.spots[0].methodcap = "cap";
              }},
-            {"sharpen damping fixup", [](auto& p) {
+            {"sharpen damping range", [](auto& p) {
                  p.locallab.spots[0].expcolor = false;
                  p.locallab.spots[0].expsharp = true;
                  p.locallab.spots[0].methodcap = "rl";
+                 p.locallab.spots[0].shardamping = 101;
+             }},
+            {"sharpen damping negative", [](auto& p) {
+                 p.locallab.spots[0].expcolor = false;
+                 p.locallab.spots[0].expsharp = true;
+                 p.locallab.spots[0].methodcap = "rl";
+                 p.dirpyrequalizer.cbdlMethod = "aft";
+                 p.locallab.spots[0].shardamping = -1;
+             }},
+            {"sharpen damped radius", [](auto& p) {
                  p.dirpyrequalizer.cbdlMethod = "bef";
+                 auto& spot = p.locallab.spots[0];
+                 spot.expcolor = false;
+                 spot.expsharp = true;
+                 spot.methodcap = "rl";
+                 spot.shardamping = 0;
+                 spot.sharradius = 0.55;
+                 spot.sharamount = 100;
+                 spot.shariter = 30;
+                 spot.sharcontrast = 20;
+                 spot.sharblur = 0.2;
+                 spot.shargam = 1.0;
+                 spot.sharshow = false;
+                 spot.reparsha = 100.0;
+                 spot.sensisha = 40;
              }},
             {"log detail", [](auto& p) {
                  p.locallab.spots[0].expcolor = false;
@@ -7942,16 +7966,17 @@ void test_local_adjustments(bool available)
             spot.streng = strength;
             spot.sensisf = 30;
         };
-        /* The local sharpening RL arm the output sharpening core covers:
-         * undamped, no gamma wrapper, no blur pre-pass and a radius below the
-         * core's separable limit. */
+        /* The local sharpening RL arm. Damping zero with `cbdlMethod "aft"`
+         * is the undamped recurrence the output sharpening core covers; a
+         * positive damping value, or zero under the default `"bef"` fixup,
+         * selects dcdamping()'s damped recurrence. The radii keep the RLD
+         * sigma below the core's separable limit. */
         const auto sharpen_spot = [&](rtengine::procparams::ProcParams& p,
                                       double radius, int amount,
-                                      int contrast, int sensitivity) {
-            /* The host block raises a zero damping to one under the default
-             * `cbdlMethod == "bef"`; select the other method so the RL arm
-             * stays undamped on both sides. */
-            p.dirpyrequalizer.cbdlMethod = "aft";
+                                      int contrast, int sensitivity,
+                                      int damping = 0,
+                                      const char* method = "aft") {
+            p.dirpyrequalizer.cbdlMethod = method;
             auto& spot = p.locallab.spots[0];
             spot.expcolor = false;
             spot.expsharp = true;
@@ -7960,7 +7985,7 @@ void test_local_adjustments(bool available)
             spot.sharradius = radius;
             spot.shariter = 30;
             spot.sharcontrast = contrast;
-            spot.shardamping = 0;
+            spot.shardamping = damping;
             spot.sharblur = 0.2;
             spot.shargam = 1.0;
             spot.sharshow = false;
@@ -9181,6 +9206,170 @@ void test_local_adjustments(bool available)
             add_spot(p, 100, 100, 600, true, 35, 10, -5, "ELI", "NONE");
         }});
 
+        /* The damped recurrence. The default `cbdlMethod == "bef"` raises a
+         * zero damping to one, so the first case exercises the host fixup
+         * without the caller's params being mutated. The other cases cover
+         * the GUI range and both methods: the forward blur is the standard
+         * IIR pair and the multiply blur is the 5x5 or 7x7 kernel. */
+        complex.push_back({"sharpen damped default bef", 238, 64,
+                           [&](auto& p) {
+            add_sharpen_spot(p, 0, 0, 2000, 2000, true, "ELI", "NONE");
+            sharpen_spot(p, 0.75, 100, 20, 40, 0, "bef");
+        }});
+        complex.push_back({"sharpen damped one", 238, 64, [&](auto& p) {
+            add_sharpen_spot(p, 0, 0, 2000, 2000, true, "ELI", "NONE");
+            sharpen_spot(p, 0.75, 100, 20, 40, 1, "aft");
+        }});
+        complex.push_back({"sharpen damped minimum radius", 238, 64,
+                           [&](auto& p) {
+            add_sharpen_spot(p, 0, 0, 2000, 2000, true, "ELI", "NONE");
+            sharpen_spot(p, 0.60, 80, 40, 60, 5, "bef");
+        }});
+        complex.push_back({"sharpen damped kernel5", 238, 64,
+                           [&](auto& p) {
+            add_sharpen_spot(p, 0, 0, 2000, 2000, true, "ELI", "NONE");
+            sharpen_spot(p, 0.70, 90, 20, 40, 5, "aft");
+        }});
+        complex.push_back({"sharpen damped kernel7", 238, 64,
+                           [&](auto& p) {
+            add_sharpen_spot(p, 0, 0, 2000, 2000, true, "ELI", "NONE");
+            sharpen_spot(p, 1.00, 70, 10, 80, 10, "bef");
+        }});
+        complex.push_back({"sharpen damped maximum", 238, 64,
+                           [&](auto& p) {
+            add_sharpen_spot(p, 0, 0, 2000, 2000, true, "ELI", "NONE");
+            sharpen_spot(p, 0.75, 100, 20, 40, 100, "aft");
+        }});
+        complex.push_back({"sharpen damped and colour", 238, 64,
+                           [&](auto& p) {
+            add_sharpen_spot(p, 0, 0, 2000, 2000, true, "ELI", "NONE");
+            sharpen_spot(p, 0.75, 100, 20, 40, 5, "bef");
+            auto& spot = p.locallab.spots[0];
+            spot.expcolor = true;
+            spot.chroma = 35;
+            spot.lightness = 10;
+            spot.contrast = -5;
+        }});
+        complex.push_back({"sharpen damped and log", 238, 64,
+                           [&](auto& p) {
+            add_sharpen_spot(p, 0, 0, 2000, 2000, true, "ELI", "NONE");
+            sharpen_spot(p, 0.75, 100, 20, 40, 5, "bef");
+            log_spot(p, 60, true, 0.0, 0.4, 100.0, -5.0, 10.0, 10.0,
+                     18.0);
+        }});
+        complex.push_back({"sharpen damped and dehaze", 238, 64,
+                           [&](auto& p) {
+            add_sharpen_spot(p, 0, 0, 2000, 2000, true, "ELI", "NONE");
+            sharpen_spot(p, 0.75, 100, 20, 40, 5, "bef");
+            dehaze_spot(p, 50, 25, 50, 60);
+        }});
+        complex.push_back({"sharpen damped and CBDL", 238, 96,
+                           [&](auto& p) {
+            add_sharpen_spot(p, 0, 0, 2000, 2000, true, "ELI", "NONE");
+            sharpen_spot(p, 0.75, 100, 20, 40, 5, "bef");
+            cbdl_spot(p, 1.15, 1.1, 1.05, 1.0, 1.0, 1.0, 0.4, 1.0);
+        }});
+        complex.push_back({"sharpen damped and vibrance", 238, 64,
+                           [&](auto& p) {
+            add_sharpen_spot(p, 0, 0, 2000, 2000, true, "ELI", "NONE");
+            sharpen_spot(p, 0.75, 100, 20, 40, 5, "bef");
+            vibrance_spot(p, 40, 20);
+        }});
+        complex.push_back({"sharpen damped and shadows/highlights", 238, 64,
+                           [&](auto& p) {
+            add_sharpen_spot(p, 0, 0, 2000, 2000, true, "ELI", "NONE");
+            sharpen_spot(p, 0.75, 100, 20, 40, 5, "bef");
+            sh_spot(p, 50, 50);
+        }});
+        complex.push_back({"sharpen damped and soft light", 238, 64,
+                           [&](auto& p) {
+            add_sharpen_spot(p, 0, 0, 2000, 2000, true, "ELI", "NONE");
+            sharpen_spot(p, 0.75, 100, 20, 40, 5, "bef");
+            soft_spot(p, 60);
+        }});
+        complex.push_back({"sharpen damped and local contrast", 238, 64,
+                           [&](auto& p) {
+            add_sharpen_spot(p, 0, 0, 2000, 2000, true, "ELI", "NONE");
+            sharpen_spot(p, 0.75, 100, 20, 40, 5, "bef");
+            contrast_spot(p, 40, 0.4);
+        }});
+        complex.push_back({"sharpen damped all tools", 238, 96,
+                           [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            sharpen_spot(p, 0.75, 100, 20, 40, 5, "bef");
+            p.locallab.spots[0].transit = 0.0;
+            auto& spot = p.locallab.spots[0];
+            log_spot(p, 60, true, 0.0, 0.4, 100.0, -5.0, 10.0, 10.0,
+                     18.0);
+            dehaze_spot(p, 50, 25, 50, 60);
+            cbdl_spot(p, 1.15, 1.1, 1.05, 1.0, 1.0, 1.0, 0.4, 1.0);
+            spot.expcolor = true;
+            spot.chroma = 35;
+            spot.lightness = 10;
+            spot.contrast = -5;
+            spot.expvibrance = true;
+            spot.pastels = 40;
+            spot.saturated = 20;
+            spot.psthreshold.setValues(0, 75);
+            spot.sensiv = 30;
+            spot.expcontrast = true;
+            spot.localcontMethod = "loc";
+            spot.lcradius = 40;
+            spot.lcamount = 0.4;
+            spot.lcdarkness = 0.9;
+            spot.lclightness = 1.1;
+            spot.reparw = 100.0;
+            spot.sensilc = 60;
+            spot.expshadhigh = true;
+            spot.shMethod = "std";
+            spot.highlights = 50;
+            spot.shadows = 50;
+            spot.h_tonalwidth = 70;
+            spot.s_tonalwidth = 30;
+            spot.sh_radius = 40;
+            spot.sensihs = 30;
+            spot.blurSHde = 5;
+            spot.expsoft = true;
+            spot.softMethod = "soft";
+            spot.streng = 60;
+            spot.sensisf = 30;
+        }});
+        complex.push_back({"sharpen damped MUNS", 238, 64,
+                           [&](auto& p) {
+            add_sharpen_spot(p, 0, 0, 2000, 2000, true, "ELI", "MUNS");
+            sharpen_spot(p, 0.75, 100, 20, 40, 5, "bef");
+        }});
+        complex.push_back({"sharpen damped 179x49", 179, 49,
+                           [&](auto& p) {
+            add_sharpen_spot(p, 0, 0, 2000, 2000, true, "ELI", "NONE");
+            sharpen_spot(p, 0.75, 100, 20, 40, 5, "bef");
+        }});
+        complex.push_back({"sharpen damped 8192x64", 8192, 64,
+                           [&](auto& p) {
+            add_sharpen_spot(p, 0, 0, 1000, 2000, true, "ELI", "NONE");
+            sharpen_spot(p, 0.75, 100, 20, 40, 5, "bef");
+        }});
+        complex.push_back({"sharpen damped second spot", 238, 64,
+                           [&](auto& p) {
+            p.dirpyrequalizer.cbdlMethod = "bef";
+            add_spot(p, -300, -150, 700, true, 30, 8, 0, "ELI", "NONE");
+            add_sharpen_spot(p, 0, 0, 2000, 2000, true, "ELI", "NONE");
+            auto& spot = p.locallab.spots[1];
+            spot.expcolor = false;
+            spot.expsharp = true;
+            spot.methodcap = "rl";
+            spot.sharamount = 100;
+            spot.sharradius = 0.75;
+            spot.shariter = 30;
+            spot.sharcontrast = 20;
+            spot.shardamping = 5;
+            spot.sharblur = 0.2;
+            spot.shargam = 1.0;
+            spot.sharshow = false;
+            spot.reparsha = 100.0;
+            spot.sensisha = 40;
+        }});
+
         std::unique_ptr<LabImage> forward_three;
         for (const ComplexCase& c : complex) {
             rtengine::procparams::ProcParams reference_params;
@@ -9348,6 +9537,58 @@ void test_local_adjustments(bool available)
                             changed.max_abs);
                 check(changed.differing > 0,
                       "the sharpening tool changes the image");
+            }
+            if (c.label == "sharpen damped default bef") {
+                /* The fixup makes a zero damping damped; the tool must change
+                 * the image, otherwise the parity above is vacuous. */
+                rtengine::procparams::ProcParams plain_params =
+                    reference_params;
+                plain_params.locallab.spots[0].expsharp = false;
+                plain_params.locallab.spots[0].expcolor = true;
+                Imagefloat plain_base(c.width, c.height);
+                fill_local_adjustments_rgb(plain_base, 211u);
+                std::unique_ptr<LabImage> plain_lab(
+                    new LabImage(c.width, c.height));
+                rtengine::ImProcFunctions plain_ipf(&plain_params, false);
+                localAdjustmentsHostBlock(plain_ipf, plain_params,
+                                          &plain_base, plain_lab.get(),
+                                          c.width, c.height);
+                const Diff changed =
+                    compare(view(*plain_lab), view(*reference_lab));
+                std::printf("stage-residency: local.adjustments damped "
+                            "sharpen non-vacuity: %zu of %zu samples "
+                            "differ, PAE %.6f LSB16\n",
+                            changed.differing, changed.samples,
+                            changed.max_abs);
+                check(changed.differing > 0,
+                      "the damped sharpening tool changes the image");
+            }
+            if (c.label == "sharpen damped kernel7") {
+                /* The same spot undamped: the damping itself must change the
+                 * image, otherwise the damped path is untested. */
+                rtengine::procparams::ProcParams undamped_params =
+                    reference_params;
+                undamped_params.dirpyrequalizer.cbdlMethod = "aft";
+                undamped_params.locallab.spots[0].shardamping = 0;
+                Imagefloat undamped_base(c.width, c.height);
+                fill_local_adjustments_rgb(undamped_base, 211u);
+                std::unique_ptr<LabImage> undamped_lab(
+                    new LabImage(c.width, c.height));
+                rtengine::ImProcFunctions undamped_ipf(&undamped_params,
+                                                       false);
+                localAdjustmentsHostBlock(undamped_ipf, undamped_params,
+                                          &undamped_base,
+                                          undamped_lab.get(), c.width,
+                                          c.height);
+                const Diff changed =
+                    compare(view(*undamped_lab), view(*reference_lab));
+                std::printf("stage-residency: local.adjustments damping "
+                            "non-vacuity: %zu of %zu samples differ, "
+                            "PAE %.6f LSB16\n",
+                            changed.differing, changed.samples,
+                            changed.max_abs);
+                check(changed.differing > 0,
+                      "damping changes the sharpened image");
             }
             if (c.label == "dehaze only") {
                 /* The same spot with the retinex enable and dehaze off: the
@@ -9711,12 +9952,20 @@ void test_local_adjustments(bool available)
                  p.locallab.spots[0].expsharp = true;
                  p.locallab.spots[0].methodcap = "cap";
              }},
-            {"sharpen damping", [](auto& p) {
+            {"sharpen damping range", [](auto& p) {
                  p.locallab.spots[0].expcolor = false;
                  p.locallab.spots[0].expsharp = true;
                  p.locallab.spots[0].methodcap = "rl";
                  p.dirpyrequalizer.cbdlMethod = "aft";
-                 p.locallab.spots[0].shardamping = 5;
+                 p.locallab.spots[0].shardamping = 101;
+             }},
+            {"sharpen damped radius", [](auto& p) {
+                 p.locallab.spots[0].expcolor = false;
+                 p.locallab.spots[0].expsharp = true;
+                 p.locallab.spots[0].methodcap = "rl";
+                 p.dirpyrequalizer.cbdlMethod = "bef";
+                 p.locallab.spots[0].shardamping = 0;
+                 p.locallab.spots[0].sharradius = 0.55;
              }},
             {"sharpen gamma", [](auto& p) {
                  p.locallab.spots[0].expcolor = false;
@@ -10073,7 +10322,9 @@ void test_local_adjustments(bool available)
             rtengine::procparams::ProcParams params = supported;
             residual.mutate(params);
             check(!localAdjustmentsSupported(params),
-                  "the residual is outside the local.adjustments predicate");
+                  (std::string("the ") + residual.label +
+                   " residual is outside the local.adjustments predicate")
+                      .c_str());
 
             Imagefloat reference_base(238, 64);
             fill_local_adjustments_rgb(reference_base, 71u + index);
@@ -10350,6 +10601,69 @@ void test_local_adjustments(bool available)
         check(low_setup.spots[RT_LOCAL_ADJUSTMENTS_SLOT_CLAMPMODE] ==
                   RT_LOCAL_ADJUSTMENTS_CLAMP_NOTZERO,
               "a strength of two keeps the notzero clamp arm");
+    }
+
+    /* The damped sharpening record and the host's `"bef"` fixup. The block
+     * raises a zero damping to one even though the equalizer is disabled; the
+     * device context records the effective value and leaves the caller's
+     * params alone. */
+    {
+        rtengine::procparams::ProcParams params;
+        params.locallab.enabled = true;
+        auto spot = localAdjustmentsSpot("sharpen", 0, 0, 2000, true,
+                                         0, 0, 0);
+        spot.expcolor = false;
+        spot.expsharp = true;
+        spot.methodcap = "rl";
+        spot.sharamount = 100;
+        spot.sharradius = 0.75;
+        spot.shariter = 30;
+        spot.sharcontrast = 20;
+        spot.shardamping = 0;
+        spot.sharblur = 0.2;
+        spot.shargam = 1.0;
+        spot.sharshow = false;
+        spot.reparsha = 100.0;
+        spot.sensisha = 40;
+        params.locallab.spots.push_back(spot);
+        params.dirpyrequalizer.cbdlMethod = "bef";
+        check(localAdjustmentsSupported(params),
+              "the default-method damped spot is inside the predicate");
+
+        Imagefloat base(179, 48);
+        fill_local_adjustments_rgb(base, 43u);
+        std::unique_ptr<LabImage> lab(new LabImage(179, 48));
+        rtengine::ImProcFunctions ipf(&params, false);
+        rtengine::LabImage source(179, 48);
+        ipf.rgb2lab(base, source, params.icm.workingProfile);
+
+        LabImage* lab_pointer = lab.get();
+        LocalAdjustmentsContext context(params, ipf, &base, lab_pointer,
+                                        179, 48);
+        RtStageBuffer source_view = view(source);
+        RtLocalAdjustmentsResult setup{};
+        check(context.build(0, &source_view, setup) == 0,
+              "the damped sharpening setup builds one spot");
+        const float* record = setup.spots;
+        check(record[RT_LOCAL_ADJUSTMENTS_SLOT_EXPSHARP] == 1.f,
+              "the damped sharpening pass is recorded");
+        check(record[RT_LOCAL_ADJUSTMENTS_SLOT_SHAR_DAMPING] == 1.f,
+              "the bef fixup records a damping of one");
+        check(params.locallab.spots[0].shardamping == 0,
+              "the bef fixup does not mutate the caller's params");
+
+        params.locallab.spots[0].shardamping = 5;
+        params.dirpyrequalizer.cbdlMethod = "aft";
+        LocalAdjustmentsContext aft_context(params, ipf, &base,
+                                            lab_pointer, 179, 48);
+        RtLocalAdjustmentsResult aft_setup{};
+        check(aft_context.build(0, &source_view, aft_setup) == 0,
+              "the explicitly damped setup builds one spot");
+        check(aft_setup.spots[RT_LOCAL_ADJUSTMENTS_SLOT_SHAR_DAMPING] ==
+                  5.f,
+              "the explicit damping value is recorded");
+        check(aft_setup.spots[RT_LOCAL_ADJUSTMENTS_SLOT_EXPSHARP] == 1.f,
+              "the explicitly damped pass is recorded");
     }
 
     /* The call-site guard is a helper so the inactive/prefill decision is

@@ -301,6 +301,9 @@ quick() {
     run_stage_device "pef/stage-device-local-adjustments-sharpen" \
         "$ROOT/devnotes/opencl/pp3/localadjustments-sharpen.pp3" \
         local.adjustments cpu
+    run_stage_device "pef/stage-device-local-adjustments-sharpen-damped" \
+        "$ROOT/devnotes/opencl/pp3/localadjustments-sharpen-damped.pp3" \
+        local.adjustments cpu
 }
 
 stage() {
@@ -650,6 +653,9 @@ stage_device() {
         local.adjustments cpu
     run_stage_device "pef/stage-device-local-adjustments-sharpen" \
         "$ROOT/devnotes/opencl/pp3/localadjustments-sharpen.pp3" \
+        local.adjustments cpu
+    run_stage_device "pef/stage-device-local-adjustments-sharpen-damped" \
+        "$ROOT/devnotes/opencl/pp3/localadjustments-sharpen-damped.pp3" \
         local.adjustments cpu
 }
 
