@@ -300,6 +300,14 @@ bool labWaveletWaveletSupported(const procparams::ProcParams& params,
         wavelet.expnoise || wavelet.expclari) {
         return false;
     }
+    /*
+     * ContAllAB()'s BA arm (balance chroma) runs when BAmethod is not "none"
+     * and TMr is set, independently of the panels above. It is not ported, so
+     * a profile that can reach it stays on the host.
+     */
+    if (wavelet.tmr || wavelet.BAmethod != "none") {
+        return false;
+    }
     if (wavelet.CLmethod != "all" || wavelet.Tilesmethod != "full") {
         return false;
     }
