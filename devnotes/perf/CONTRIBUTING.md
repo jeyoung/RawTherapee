@@ -67,10 +67,17 @@ stage-work-test               stage-parity-test
 stage-pipeline-test           stage-store-test
 editorrequest-test            viewport-admission-test
 denoise-tile-buffers-test
+amaze-tile-parity-test
 ```
 
 These targets are excluded from the default CMake build, so CI builds them
 explicitly and runs their executables; they are not registered with CTest.
+`amaze-tile-parity-test` runs the production AMaZE tile core on synthetic Bayer
+data with one, two and eight OpenMP threads and two tile chunk sizes. It checks
+every output float, input immutability and full/partial tile histories; it
+requires no RAW download, image decoder, OpenCL device or private sample.
+See [AMAZE_THREAD_PARITY.md](AMAZE_THREAD_PARITY.md) for its failure-before
+proof, scratch-state fix and native Windows export evidence.
 `stage-parity-test` compares the built-in and module host implementations of
 Lanczos. It does not establish OpenCL device parity. The OpenCL-enabled job
 checks compilation and host behavior without an OpenCL device or POCL.
