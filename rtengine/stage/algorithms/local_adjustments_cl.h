@@ -541,6 +541,48 @@ __kernel void rt_local_adjustments_sharpen_fill(
     dst[y * dst_pitch + x] = value;
 }
 
+/* dcdamping()'s per-pixel factor, in place on the blurred estimate. `value`
+ * holds the Gaussian blur of the estimate, `luminance` the original padded L
+ * plane. The host guards non-positive samples by writing zero; the scalar and
+ * SSE arms agree on the factor `(O - I) / I * U + 1` with U the fourth-order
+ * damping polynomial. */
+__kernel void rt_local_adjustments_sharpen_damp(
+    __global float* value, __global const float* luminance,
+    const int width, const int height, const int pitch,
+    const float damping_fac)
+{
+    const int x = (int)get_global_id(0);
+    const int y = (int)get_global_id(1);
+    if (x >= width || y >= height) {
+        return;
+    }
+    const int index = y * pitch + x;
+    const float image = value[index];
+    const float original = luminance[index];
+    if (image <= 0.0f || original <= 0.0f) {
+        value[index] = 0.0f;
+        return;
+    }
+    /* Match dcdamping()'s SIMD/scalar split. The SSE arm handles the columns
+     * below `width - width % 4` and the scalar tail the rest; they group the
+     * U polynomial and the log sum differently. */
+    const float w = original - image;
+    const float log_ratio = rt_lr_xlogf(image / original);
+    float u;
+    if (x < width - (width % 4)) {
+        u = (original * log_ratio + w) * damping_fac;
+        u = u < 1.0f ? u : 1.0f;
+        const float u2 = u * u;
+        const float u4 = u2 * u2;
+        u = u4 * (5.0f - u * 4.0f);
+    } else {
+        u = (original * log_ratio - image + original) * damping_fac;
+        u = u < 1.0f ? u : 1.0f;
+        u = u * u * u * u * (5.0f - u * 4.0f);
+    }
+    value[index] = (w / image) * u + 1.0f;
+}
+
 /* Copy one plane of the full Lab image into a one-plane blur buffer. */
 __kernel void rt_local_adjustments_plane_copy(
     __global const float* src, __global float* dst,

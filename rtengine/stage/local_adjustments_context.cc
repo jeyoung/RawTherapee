@@ -373,25 +373,52 @@ bool softLightAdmitted(const procparams::LocallabParams::LocallabSpot& spot)
  *
  * Lab_Local()'s arm is the RL method: `methodcap == "rl"`, `lp.sharpena`
  * (the tool on, the spot active and no explicit mask) and `lp.shrad > 0.42`.
- * It runs deconvsharpeningloc() on the ROI L plane, which is the output
- * sharpening core's undamped RLD arm: the same blend mask, the same
+ * It runs deconvsharpeningloc() on the ROI L plane. Damping zero is the
+ * output sharpening core's undamped RLD arm: the same blend mask, the same
  * division/multiplication recurrence and the same `amount / 100` final blend.
- * The core has device kernels only below sigma 1.15 (its 3x3, 5x5 and 7x7
- * arms); larger radii take the separable IIR arm and stay on the host.
+ * A positive damping value selects the block's damped arm: a plain Gaussian
+ * blur, dcdamping()'s factor and a GAUSS_MULT blur. Both arms reuse the core's
+ * device kernels. The core has device kernels only below sigma 1.15 (its 3x3,
+ * 5x5 and 7x7 arms); larger radii take the separable IIR arm and stay on the
+ * host.
  *
- * Damping selects the core's damped branch, `blurrad >= 0.25` adds the blur
- * pre-pass, `shargam != 1` wraps the plane in igammalog()/gammalog() and
- * `sharshow` replaces the output with the mask view. Capture sharpening
- * (`methodcap == "cap"`) is a separate deconvolution and is a residual. The
- * remaining ranges are the GUI's; a radius at or below 0.42 is the block's
- * own no-op and is admitted. `reparsha` is capture sharpening's recovery
- * weight, so it is required at its default to avoid silent profile data. */
-bool sharpenAdmitted(const procparams::LocallabParams::LocallabSpot& spot)
+ * `blurrad >= 0.25` adds the blur pre-pass, `shargam != 1` wraps the plane in
+ * igammalog()/gammalog() and `sharshow` replaces the output with the mask
+ * view. Capture sharpening (`methodcap == "cap"`) is a separate deconvolution
+ * and is a residual. The damping range is the GUI's 0..100; the block's
+ * `"bef"` fixup is applied by build(), so the record carries the effective
+ * value. The remaining ranges are the GUI's; a radius at or below 0.42 is the
+ * block's own no-op and is admitted. A damped spot needs `sharradius >= 0.6`,
+ * where the forward blur is the standard IIR pair; below that the host's 3x3
+ * FIR forward does not meet the node's parity and the spot is a residual.
+ * `reparsha` is capture sharpening's recovery weight, so it is required at
+ * its default to avoid silent profile data. */
+/* The block's `shardamping` after its `"bef"` fixup: a zero damping becomes
+ * one when the directional pyramid equaliser's method is the default, even
+ * though the equaliser is disabled. Kept separate from the caller's params so
+ * the device path reproduces the fixup without mutating them. */
+int effectiveSharpeningDamping(
+    const procparams::ProcParams& params,
+    const procparams::LocallabParams::LocallabSpot& spot)
+{
+    if (spot.expsharp && spot.shardamping < 1 &&
+        params.dirpyrequalizer.cbdlMethod == "bef") {
+        return 1;
+    }
+    return spot.shardamping;
+}
+
+bool sharpenAdmitted(const procparams::LocallabParams::LocallabSpot& spot,
+                     int damping)
 {
     if (spot.methodcap != "rl") {
         return false;
     }
-    if (spot.shardamping != 0 || spot.sharshow) {
+    if (spot.shardamping < 0 || spot.shardamping > 100 || spot.sharshow) {
+        return false;
+    }
+    if (damping > 0 &&
+        spot.sharradius < RT_LOCAL_ADJUSTMENTS_SHARPEN_DAMPED_MIN_RADIUS) {
         return false;
     }
     if (!finiteValue(spot.shargam) || spot.shargam != 1.0) {
@@ -547,15 +574,6 @@ bool localAdjustmentsSupported(const procparams::ProcParams& params)
         params.dehaze.showDepthMap || params.toneCurve.hrenabled) {
         return false;
     }
-    /*
-     * The extracted host block's shardamping fixup raises a zero damping to
-     * one while `dirpyrequalizer.cbdlMethod == "bef"`, even when the
-     * equalizer is disabled. That turns the RL arm into the damped branch the
-     * device cannot reproduce, so local sharpening is admitted only when the
-     * fixup is inactive.
-     */
-    const bool sharpenDampingFixup =
-        params.dirpyrequalizer.cbdlMethod == "bef";
 
     for (const auto& spot : params.locallab.spots) {
         if (spot.spotMethod != "norm") {
@@ -690,10 +708,10 @@ bool localAdjustmentsSupported(const procparams::ProcParams& params)
             if (spot.expsoft && !softLightAdmitted(spot)) {
                 return false;
             }
-            if (spot.expsharp && !sharpenAdmitted(spot)) {
-                return false;
-            }
-            if (spot.expsharp && sharpenDampingFixup) {
+            if (spot.expsharp &&
+                !sharpenAdmitted(spot,
+                                 effectiveSharpeningDamping(params,
+                                                            spot))) {
                 return false;
             }
         }
@@ -1617,12 +1635,16 @@ int LocalAdjustmentsContext::build(int spot, const RtStageBuffer* lab,
     /*
      * Local sharpening. Lab_Local()'s RL arm needs `methodcap == "rl"`, the
      * tool on, an active spot with no explicit mask (lp.sharpena), an amount
-     * of at least one and `lp.shrad > 0.42`; the predicate has already
-     * narrowed the params to the core's undamped RLD arm. The host sharpens a
-     * zero-padded extent of `lx + lxL + 3` by `ly + lyT + 3` and blends the
-     * result with Sharp_Local()'s senstype-0 scope (lp.senssha). A radius at
-     * or below 0.42 is the block's no-op and leaves the pass off.
+     * of at least one and `lp.shrad > 0.42`. The host block raises a zero
+     * damping to one before Lab_Local() when `cbdlMethod == "bef"`; the
+     * record carries that effective value, so the launcher can reproduce it
+     * without mutating the caller's params. The host sharpens a zero-padded
+     * extent of `lx + lxL + 3` by `ly + lyT + 3` and blends the result with
+     * Sharp_Local()'s senstype-0 scope (lp.senssha). A radius at or below
+     * 0.42 is the block's no-op and leaves the pass off.
      */
+    const int sharpenDamping =
+        effectiveSharpeningDamping(params_, profileSpot);
     const bool sharpenRun =
         profileSpot.expsharp && lp.activspot &&
         profileSpot.methodcap == "rl" && profileSpot.sharamount >= 1 &&
@@ -1992,6 +2014,8 @@ int LocalAdjustmentsContext::build(int spot, const RtStageBuffer* lab,
         static_cast<float>(profileSpot.sharcontrast);
     record[RT_LOCAL_ADJUSTMENTS_SLOT_SHAR_BLUR] =
         static_cast<float>(profileSpot.sharblur);
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_SHAR_DAMPING] =
+        static_cast<float>(sharpenDamping);
     record[RT_LOCAL_ADJUSTMENTS_SLOT_EXPDENAZE] = dehazeRun ? 1.f : 0.f;
     record[RT_LOCAL_ADJUSTMENTS_SLOT_SENSH] =
         static_cast<float>(profileSpot.sensih);

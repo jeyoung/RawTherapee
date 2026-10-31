@@ -7789,6 +7789,181 @@ RtStageStatus sharpen_rld_plane(const std::shared_ptr<OpenCLEnv>& env,
     return RT_STAGE_OK;
 }
 
+/* The damped Richardson-Lucy recurrence of deconvsharpeningloc(). Each
+ * iteration takes the plain Gaussian blur of the estimate, applies
+ * dcdamping()'s factor to that blur in place and multiplies the estimate by
+ * the Gaussian blur of the factor. The forward blur is the standard IIR pair
+ * and the second blur is GAUSS_MULT, whose 5x5 and 7x7 arms are the same
+ * helpers as the undamped recurrence. The admitted radius stops at sigma 1.15
+ * and starts at 0.6; the 3x3 FIR arm below 0.6 is a host residual. */
+RtStageStatus sharpen_rld_damped_plane(
+    const std::shared_ptr<OpenCLEnv>& env, const KernelDef* def, int width,
+    int height, int pitch, cl_mem luminance, cl_mem mask, cl_mem estimate,
+    cl_mem tmp, double radius, double scale, int iterations, int amount,
+    float damping, std::string& error)
+{
+    if (amount == 0) {
+        return RT_STAGE_OK;
+    }
+    const double sigma = radius / scale;
+    if (!(damping > 0.0f)) {
+        error = "sharpen damped RLD has no damping factor";
+        return RT_STAGE_FALLBACK;
+    }
+    if (!(sigma >= SHARPEN_FIR_LIMIT) || !(sigma <= SHARPEN_7X7_LIMIT)) {
+        error = "sharpen damped RLD sigma is outside the device range";
+        return RT_STAGE_FALLBACK;
+    }
+
+    cl_kernel init_kernel = compiled_kernel_entry(
+        env, def, "rt_sharpen_rld_init", error);
+    cl_kernel final_kernel = compiled_kernel_entry(
+        env, def, "rt_sharpen_rld_final", error);
+    cl_kernel damp_kernel = compiled_kernel_entry(
+        env, def, "rt_local_adjustments_sharpen_damp", error);
+    cl_kernel iir_kernel = compiled_kernel_entry(
+        env, def, "rt_sharpen_iir_line", error);
+    if (init_kernel == nullptr || final_kernel == nullptr ||
+        damp_kernel == nullptr || iir_kernel == nullptr) {
+        return RT_STAGE_FALLBACK;
+    }
+
+    /*
+     * gaussianBlur() with GAUSS_STANDARD uses the SSE IIR pair from 0.6 up to
+     * 25; the admitted radius stops at 1.15. GAUSS_MULT uses the 5x5 kernel up
+     * to 0.84 and the 7x7 kernel above it.
+     */
+    SharpenIirFactors iir_factors;
+    sharpen_iir_factors(sigma, iir_factors);
+
+    enum class MultClass { Kernel5, Kernel7 };
+    MultClass mult_class = MultClass::Kernel5;
+    cl_kernel mult_kernel = nullptr;
+    SharpenKernel5 kernel5;
+    SharpenKernel7 kernel7;
+    if (sigma <= SHARPEN_5X5_LIMIT) {
+        mult_class = MultClass::Kernel5;
+        sharpen_kernel5(sigma, kernel5);
+        mult_kernel =
+            compiled_kernel_entry(env, def, "rt_sharpen_mult5", error);
+    } else {
+        mult_class = MultClass::Kernel7;
+        sharpen_kernel7(sigma, kernel7);
+        mult_kernel =
+            compiled_kernel_entry(env, def, "rt_sharpen_mult7", error);
+    }
+    if (mult_kernel == nullptr) {
+        return RT_STAGE_FALLBACK;
+    }
+
+    const auto set = [&](cl_kernel kernel, cl_uint index,
+                         std::size_t bytes, const void* value) {
+        return env->api->SetKernelArg(kernel, index, bytes, value) ==
+               CL_SUCCESS;
+    };
+    const auto run_2d = [&](cl_kernel kernel) -> bool {
+        const std::size_t global[2] = {
+            static_cast<std::size_t>(width),
+            static_cast<std::size_t>(height)};
+        cl_event done = nullptr;
+        if (env->api->EnqueueNDRangeKernel(env->queue, kernel, 2, nullptr,
+                                           global, nullptr, 0, nullptr,
+                                           &done) != CL_SUCCESS ||
+            done == nullptr) {
+            return false;
+        }
+        const cl_int wait = env->api->WaitForEvents(1, &done);
+        env->api->ReleaseEvent(done);
+        return wait == CL_SUCCESS;
+    };
+
+    const cl_int cl_width = width;
+    const cl_int cl_height = height;
+    const cl_int cl_pitch = pitch;
+    const cl_float damping_fac = -2.0f / (damping * damping);
+
+    bool init_ok =
+        set(init_kernel, 0, sizeof(cl_mem), &luminance) &&
+        set(init_kernel, 1, sizeof(cl_mem), &estimate) &&
+        set(init_kernel, 2, sizeof(cl_int), &cl_width) &&
+        set(init_kernel, 3, sizeof(cl_int), &cl_height) &&
+        set(init_kernel, 4, sizeof(cl_int), &cl_pitch) &&
+        run_2d(init_kernel);
+    if (!init_ok) {
+        error = "sharpen damped RLD initialisation failed";
+        return RT_STAGE_ERROR;
+    }
+
+    const auto forward_blur = [&]() -> bool {
+        /*
+         * gaussHorizontalSse() into `tmp`, then gaussVerticalSse() in place.
+         * The IIR line kernel reads its boundary sample before the forward
+         * pass, so the vertical pass needs no extra plane.
+         */
+        return sharpen_iir_plane(env, iir_kernel, estimate, tmp, tmp,
+                                 width, height, pitch, iir_factors, error);
+    };
+    const bool damp_ok =
+        set(damp_kernel, 0, sizeof(cl_mem), &tmp) &&
+        set(damp_kernel, 1, sizeof(cl_mem), &luminance) &&
+        set(damp_kernel, 2, sizeof(cl_int), &cl_width) &&
+        set(damp_kernel, 3, sizeof(cl_int), &cl_height) &&
+        set(damp_kernel, 4, sizeof(cl_int), &cl_pitch) &&
+        set(damp_kernel, 5, sizeof(cl_float), &damping_fac);
+    const auto multiply = [&]() -> bool {
+        bool ok =
+            set(mult_kernel, 0, sizeof(cl_mem), &tmp) &&
+            set(mult_kernel, 1, sizeof(cl_mem), &estimate) &&
+            set(mult_kernel, 2, sizeof(cl_int), &cl_width) &&
+            set(mult_kernel, 3, sizeof(cl_int), &cl_height) &&
+            set(mult_kernel, 4, sizeof(cl_int), &cl_pitch);
+        cl_uint arg = 5;
+        if (mult_class == MultClass::Kernel5) {
+            ok = ok &&
+                 set(mult_kernel, arg++, sizeof(cl_float), &kernel5.c00) &&
+                 set(mult_kernel, arg++, sizeof(cl_float), &kernel5.c10) &&
+                 set(mult_kernel, arg++, sizeof(cl_float), &kernel5.c11) &&
+                 set(mult_kernel, arg++, sizeof(cl_float), &kernel5.c20) &&
+                 set(mult_kernel, arg++, sizeof(cl_float), &kernel5.c21);
+        } else {
+            ok = ok &&
+                 set(mult_kernel, arg++, sizeof(cl_float), &kernel7.c00) &&
+                 set(mult_kernel, arg++, sizeof(cl_float), &kernel7.c10) &&
+                 set(mult_kernel, arg++, sizeof(cl_float), &kernel7.c11) &&
+                 set(mult_kernel, arg++, sizeof(cl_float), &kernel7.c20) &&
+                 set(mult_kernel, arg++, sizeof(cl_float), &kernel7.c21) &&
+                 set(mult_kernel, arg++, sizeof(cl_float), &kernel7.c22) &&
+                 set(mult_kernel, arg++, sizeof(cl_float), &kernel7.c30) &&
+                 set(mult_kernel, arg++, sizeof(cl_float), &kernel7.c31);
+        }
+        return ok && run_2d(mult_kernel);
+    };
+
+    for (int iteration = 0; iteration < iterations; ++iteration) {
+        if (!forward_blur() || !damp_ok || !run_2d(damp_kernel) ||
+            !multiply()) {
+            error = "sharpen damped RLD iteration failed";
+            return RT_STAGE_ERROR;
+        }
+    }
+
+    const cl_float rld_amount = static_cast<cl_float>(amount) / 100.0f;
+    const bool final_ok =
+        set(final_kernel, 0, sizeof(cl_mem), &luminance) &&
+        set(final_kernel, 1, sizeof(cl_mem), &estimate) &&
+        set(final_kernel, 2, sizeof(cl_mem), &mask) &&
+        set(final_kernel, 3, sizeof(cl_int), &cl_width) &&
+        set(final_kernel, 4, sizeof(cl_int), &cl_height) &&
+        set(final_kernel, 5, sizeof(cl_int), &cl_pitch) &&
+        set(final_kernel, 6, sizeof(cl_float), &rld_amount) &&
+        run_2d(final_kernel);
+    if (!final_ok) {
+        error = "sharpen damped RLD final blend failed";
+        return RT_STAGE_ERROR;
+    }
+    return RT_STAGE_OK;
+}
+
 RtStageStatus run_sharpen(const std::shared_ptr<OpenCLEnv>& env,
                           const std::shared_ptr<OpenCLResidency>& residency,
                           const std::vector<RtStageArg>& args,
@@ -8198,6 +8373,8 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
                               error);
     cl_kernel sharpen_line_kernel =
         compiled_kernel_entry(env, def, "rt_sharpen_iir_line", error);
+    cl_kernel sharpen_damp_kernel = compiled_kernel_entry(
+        env, def, "rt_local_adjustments_sharpen_damp", error);
     cl_kernel munsell_kernel =
         compiled_kernel_entry(env, def, "rt_local_adjustments_munsell", error);
     cl_kernel line_kernel =
@@ -8272,7 +8449,7 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
     if (apply_kernel == nullptr || clamp_kernel == nullptr ||
         roi_kernel == nullptr || munsell_kernel == nullptr ||
         sharpen_fill_kernel == nullptr || plane_copy_kernel == nullptr ||
-        sharpen_line_kernel == nullptr ||
+        sharpen_line_kernel == nullptr || sharpen_damp_kernel == nullptr ||
         line_kernel == nullptr || vibrance_kernel == nullptr ||
         lc_blend_kernel == nullptr || blend_kernel == nullptr ||
         log_kernel == nullptr || log_blend_kernel == nullptr ||
@@ -8795,7 +8972,9 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
              rec[RT_LOCAL_ADJUSTMENTS_SLOT_SHAR_CONTRAST] > 200.0f ||
              rec[RT_LOCAL_ADJUSTMENTS_SLOT_SHAR_BLUR] < 0.2f ||
              rec[RT_LOCAL_ADJUSTMENTS_SLOT_SHAR_BLUR] >=
-                 RT_LOCAL_ADJUSTMENTS_SHARPEN_BLUR_LIMIT)) {
+                 RT_LOCAL_ADJUSTMENTS_SHARPEN_BLUR_LIMIT ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_SHAR_DAMPING] < 0.0f ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_SHAR_DAMPING] > 100.0f)) {
             error = "local.adjustments sharpening setting is outside its "
                     "range";
             return RT_STAGE_FALLBACK;
@@ -12000,11 +12179,13 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
             /*
              * Local sharpening. Lab_Local()'s RL arm runs after local
              * contrast and before Colour & Light. The block copies the image
-             * into its zero-padded extent, runs the output sharpening core's
-             * undamped RLD recurrence on that plane and blends the L
-             * difference with Sharp_Local()'s senstype-0 deltaE scope, whose
-             * varsens is lp.senssha. The mask and the recurrence are the
-             * shared sharpen kernels, not a local re-derivation.
+             * into its zero-padded extent, runs deconvsharpeningloc() on that
+             * plane and blends the L difference with Sharp_Local()'s
+             * senstype-0 deltaE scope, whose varsens is lp.senssha. Damping
+             * zero selects the output sharpening core's undamped RLD
+             * recurrence; a positive value selects dcdamping()'s damped
+             * recurrence. The mask and both recurrences are the shared
+             * sharpen kernels, not a local re-derivation.
              */
             if (sharpenPass) {
                 /* Sharp_Local()'s deltaE reference is a blur of the full
@@ -12107,16 +12288,32 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
                 if (mask_status != RT_STAGE_OK) {
                     return RT_STAGE_FALLBACK;
                 }
-                const RtStageStatus rld_status = sharpen_rld_plane(
-                    env, def, sharpenW, sharpenH, sharpen_pitch,
-                    sharpen_luma_memory, sharpen_mask_memory,
-                    sharpen_estimate_memory, sharpen_tmp_memory,
-                    rec[RT_LOCAL_ADJUSTMENTS_SLOT_SHAR_RADIUS], 1.0,
-                    static_cast<int>(
-                        rec[RT_LOCAL_ADJUSTMENTS_SLOT_SHAR_ITER]),
-                    static_cast<int>(
-                        rec[RT_LOCAL_ADJUSTMENTS_SLOT_SHAR_AMOUNT]),
-                    error);
+                const int sharpenDamping = static_cast<int>(
+                    rec[RT_LOCAL_ADJUSTMENTS_SLOT_SHAR_DAMPING]);
+                const float sharpDampingFactor =
+                    static_cast<float>(sharpenDamping) / 5.0;
+                const RtStageStatus rld_status =
+                    sharpenDamping > 0
+                        ? sharpen_rld_damped_plane(
+                              env, def, sharpenW, sharpenH, sharpen_pitch,
+                              sharpen_luma_memory, sharpen_mask_memory,
+                              sharpen_estimate_memory, sharpen_tmp_memory,
+                              rec[RT_LOCAL_ADJUSTMENTS_SLOT_SHAR_RADIUS], 1.0,
+                              static_cast<int>(
+                                  rec[RT_LOCAL_ADJUSTMENTS_SLOT_SHAR_ITER]),
+                              static_cast<int>(
+                                  rec[RT_LOCAL_ADJUSTMENTS_SLOT_SHAR_AMOUNT]),
+                              sharpDampingFactor, error)
+                        : sharpen_rld_plane(
+                              env, def, sharpenW, sharpenH, sharpen_pitch,
+                              sharpen_luma_memory, sharpen_mask_memory,
+                              sharpen_estimate_memory, sharpen_tmp_memory,
+                              rec[RT_LOCAL_ADJUSTMENTS_SLOT_SHAR_RADIUS], 1.0,
+                              static_cast<int>(
+                                  rec[RT_LOCAL_ADJUSTMENTS_SLOT_SHAR_ITER]),
+                              static_cast<int>(
+                                  rec[RT_LOCAL_ADJUSTMENTS_SLOT_SHAR_AMOUNT]),
+                              error);
                 if (rld_status != RT_STAGE_OK) {
                     return RT_STAGE_FALLBACK;
                 }

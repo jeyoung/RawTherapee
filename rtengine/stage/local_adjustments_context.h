@@ -62,14 +62,14 @@ struct ProcParams;
  * small, known subset reaches the supported paths. Slots are named by the
  * RT_LOCAL_ADJUSTMENTS_SLOT_* constants and are written once per spot.
  */
-#define RT_LOCAL_ADJUSTMENTS_CONTEXT_VERSION 8u
+#define RT_LOCAL_ADJUSTMENTS_CONTEXT_VERSION 9u
 /* "LAJC": rejects a stale or unrelated pointer before any callback runs. */
 #define RT_LOCAL_ADJUSTMENTS_CONTEXT_MAGIC 0x4C414A43u
 /* The block has no bounded spot count, but a profile that carries more spots
  * than this is outside the device set and runs the host block. */
 #define RT_LOCAL_ADJUSTMENTS_MAX_SPOTS 64u
 /* Floats per spot record; the slot constants below must stay inside it. */
-#define RT_LOCAL_ADJUSTMENTS_SPOT_STRIDE 140u
+#define RT_LOCAL_ADJUSTMENTS_SPOT_STRIDE 141u
 /* A curve table is one LUTf of the block's own size. */
 #define RT_LOCAL_ADJUSTMENTS_LUT_ENTRIES 65536u
 /* Color::gammatab_srgb and Color::igammatab_srgb, the sRGB gamma pair the
@@ -328,7 +328,9 @@ struct ProcParams;
  * deconvsharpeningloc() on the ROI L plane and blends with Sharp_Local()'s
  * deltaE scope, whose senstype 0 reads `lp.senssha`. A radius at or below
  * 0.42 is the block's own no-op and is recorded as a skipped pass, not a
- * refusal. */
+ * refusal. SHAR_DAMPING is the block's effective `shardamping`, after the
+ * host fixup: zero selects the undamped recurrence, a positive value the
+ * damped one. */
 #define RT_LOCAL_ADJUSTMENTS_SLOT_EXPSHARP 133u
 #define RT_LOCAL_ADJUSTMENTS_SLOT_SENSSHA 134u
 #define RT_LOCAL_ADJUSTMENTS_SLOT_SHAR_AMOUNT 135u
@@ -336,14 +338,23 @@ struct ProcParams;
 #define RT_LOCAL_ADJUSTMENTS_SLOT_SHAR_ITER 137u
 #define RT_LOCAL_ADJUSTMENTS_SLOT_SHAR_CONTRAST 138u
 #define RT_LOCAL_ADJUSTMENTS_SLOT_SHAR_BLUR 139u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_SHAR_DAMPING 140u
 
-/* deconvsharpeningloc() is the undamped RLD path: a damping value of zero
- * selects the division/multiplication recurrence the output.sharpen core
- * already covers. The block's own guard is `lp.shrad > 0.42`; below it no
- * sharpen work runs. Above 1.15 the core uses its separable IIR arm, which
- * has no device RLD kernel, so those radii stay on the host. */
+/* deconvsharpeningloc() has two arms. Damping zero is the undamped RLD path:
+ * the division/multiplication recurrence the output.sharpen core already
+ * covers. A positive damping value is the damped path: a plain Gaussian blur,
+ * dcdamping()'s factor and a GAUSS_MULT blur. `damp > 0` selects it and the
+ * factor is `damp / 5.0`; the GUI range is 0..100, so both arms are admitted.
+ * The block's own guard is `lp.shrad > 0.42`; below it no sharpen work runs.
+ * Above 1.15 the core uses its separable IIR arm, which has no device RLD
+ * kernel, so those radii stay on the host. The damped arm's forward blur is
+ * the standard Gaussian: below sigma 0.6 the host selects its 3x3 FIR, whose
+ * damped recurrence does not meet this node's 1-LSB16 parity, so a damped
+ * spot below 0.6 is a host residual. At and above 0.6 the forward blur is the
+ * standard IIR pair. */
 #define RT_LOCAL_ADJUSTMENTS_SHARPEN_NOOP_RADIUS 0.42
 #define RT_LOCAL_ADJUSTMENTS_SHARPEN_SIGMA_LIMIT 1.15
+#define RT_LOCAL_ADJUSTMENTS_SHARPEN_DAMPED_MIN_RADIUS 0.6
 /* The block's blur pre-pass is skipped below 0.25; a larger sharblur is a
  * residual for the same reason as output sharpening. */
 #define RT_LOCAL_ADJUSTMENTS_SHARPEN_BLUR_LIMIT 0.25
@@ -455,12 +466,16 @@ namespace rtengine::stage
  * pass and no global dehaze; the local dehaze is part of the spot path.
  *
  * Local sharpening is admitted only in the `"rl"` (RLD) arm that the
- * output.sharpen core covers: undamped, with no capture sharpening, no gamma
- * wrapper, no blur pre-pass and a radius whose RLD sigma is below the core's
- * separable limit. Capture sharpening (`"cap"`), damping, `shargam != 1`,
- * `sharblur >= 0.25`, `sharshow`, a radius outside 0.4..1.15, masks, a soft
- * radius and out-of-range sliders are residuals. A radius at or below 0.42 is
- * the block's own no-op and is admitted without a device pass. A partial spot
+ * output.sharpen core covers: undamped or damped, with no capture sharpening,
+ * no gamma wrapper, no blur pre-pass and a radius whose RLD sigma is below the
+ * core's separable limit. The damping parameter is the block's effective
+ * value after the `"bef"` fixup and spans the GUI's 0..100 range; a damped
+ * spot needs a radius of at least 0.6, where the forward blur is the standard
+ * IIR pair. Capture sharpening (`"cap"`), `shargam != 1`, `sharblur >= 0.25`,
+ * `sharshow`, a radius outside 0.4..1.15, a damped radius below 0.6, masks, a
+ * soft radius, out-of-range sliders and a damping value outside 0..100 are
+ * residuals. A radius at or below 0.42 is the block's own no-op and is
+ * admitted without a device pass. A partial spot
  * with a non-zero transition is also a residual: Sharp_Local() reads the
  * padded deconvolution result across the transition ring, which the block's
  * `lx + lxL + 3` extent does not cover. A zero-width transition keeps the ring

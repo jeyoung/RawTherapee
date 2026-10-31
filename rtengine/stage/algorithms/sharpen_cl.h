@@ -121,6 +121,14 @@ __kernel void rt_sharpen_iir_line(__global const float* src,
                      b3 * s0;
     dst[db + 2 * dst_stride] = t2;
 
+    /*
+     * The tail's boundary sample is the *input* last sample. Reading it
+     * before the forward pass lets the caller run the vertical pass in place:
+     * afterwards dst[last] holds the forward result, not the input.
+     */
+    const int last = length - 1;
+    const float sW = src[sb + last * src_stride];
+
     for (int j = 3; j < length; ++j) {
         dst[db + j * dst_stride] =
             B * src[sb + j * src_stride] +
@@ -129,8 +137,6 @@ __kernel void rt_sharpen_iir_line(__global const float* src,
             b3 * dst[db + (j - 3) * dst_stride];
     }
 
-    const int last = length - 1;
-    const float sW = src[sb + last * src_stride];
     const float f1 = dst[db + last * dst_stride];
     const float f2 = dst[db + (last - 1) * dst_stride];
     const float f3 = dst[db + (last - 2) * dst_stride];
