@@ -2451,6 +2451,194 @@ void gamut_cpu_reference(rtengine::ImProcFunctions& ipf,
     }
 }
 
+struct CropCase {
+    const char* label;
+    int width;
+    int height;
+    int crop_width;
+    int crop_height;
+    int x;
+    int y;
+};
+
+/*
+ * The crop node is a three-plane F32 row copy: identical values, no resampling
+ * and no border rule, so it is compared exactly rather than at the 1 LSB16
+ * processing tolerance. A refused request must leave the destination
+ * untouched, because the call site's memcpy is then the only fallback.
+ */
+void test_crop(bool available)
+{
+    using namespace rtengine::stage;
+
+    const CropCase cases[] = {
+        {"full frame", 238, 64, 238, 64, 0, 0},
+        {"offset odd", 238, 64, 179, 49, 3, 1},
+        {"bottom right", 238, 64, 59, 17, 179, 47},
+        {"single row", 238, 64, 238, 1, 0, 63},
+        {"single pixel", 238, 64, 1, 1, 237, 63},
+        {"8192 wide", 8192, 65, 1000, 33, 4096, 16},
+    };
+
+    /* Device off: the request must fall back, leaving the call site's copy in
+     * charge exactly as before the node existed. */
+    {
+        LabImage source(32, 24);
+        fill_lab(source, 5u);
+        LabImage destination(16, 12);
+        RtStageArg args[4]{};
+        args[0] = buffer_arg(view(source));
+        args[1] = buffer_arg(view(destination));
+        args[2] = int_arg(4);
+        args[3] = int_arg(3);
+
+        unsetenv("RT_STAGE_OPENCL");
+        clear_node_device_overrides();
+        const RtStageStatus status = run("crop", {args[0], args[1], args[2],
+                                                  args[3]}, nullptr);
+        check(status != RT_STAGE_OK,
+              "crop falls back when the device is not enabled");
+    }
+
+    if (!available) {
+        skip("crop: no OpenCL device");
+        return;
+    }
+
+    const auto context = opencl_device()->create_context();
+    check(context != nullptr, "crop: the device creates a context");
+    if (context == nullptr) {
+        return;
+    }
+
+    for (const CropCase& item : cases) {
+        LabImage source(item.width, item.height);
+        fill_lab(source, 41u);
+
+        LabImage reference(item.crop_width, item.crop_height);
+        const std::size_t rowBytes =
+            static_cast<std::size_t>(item.crop_width) * sizeof(float);
+        for (int y = 0; y < item.crop_height; ++y) {
+            std::memcpy(reference.L[y], source.L[y + item.y] + item.x,
+                        rowBytes);
+            std::memcpy(reference.a[y], source.a[y + item.y] + item.x,
+                        rowBytes);
+            std::memcpy(reference.b[y], source.b[y + item.y] + item.x,
+                        rowBytes);
+        }
+
+        LabImage destination(item.crop_width, item.crop_height);
+        fill_lab(destination, 99u);
+
+        RtStageArg args[4]{};
+        args[0] = buffer_arg(view(source));
+        args[1] = buffer_arg(view(destination));
+        args[2] = int_arg(item.x);
+        args[3] = int_arg(item.y);
+
+        set_node_device_override("crop", StageNodeDevice::OpenCL);
+        StageRequest request;
+        request.name = "crop";
+        request.args.assign(args, args + 4);
+        StageExecution execution;
+        const RtStageStatus status =
+            context->execute(request, nullptr, &execution);
+        clear_node_device_overrides();
+
+        check(status == RT_STAGE_OK, "the device executes the crop node");
+        check(execution.device == StageDeviceType::OPENCL,
+              "the crop execution names the device");
+
+        const Diff diff = compare(view(reference), view(destination));
+        std::printf("stage-residency: crop %s: PAE %.6f LSB16, %zu of %zu "
+                    "samples differ\n", item.label, diff.max_abs,
+                    diff.differing, diff.samples);
+        check(diff.finite && diff.max_abs == 0.0 && diff.differing == 0,
+              "the crop copy is exact");
+    }
+
+    /* The call-site form: run() with the node override records a device pass. */
+    {
+        const std::string profile_path =
+            std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp") +
+            "/stage-residency-crop.jsonl";
+        LabImage source(238, 64);
+        fill_lab(source, 43u);
+        LabImage destination(179, 49);
+
+        RtStageArg args[4]{};
+        args[0] = buffer_arg(view(source));
+        args[1] = buffer_arg(view(destination));
+        args[2] = int_arg(2);
+        args[3] = int_arg(3);
+
+        std::remove(profile_path.c_str());
+        setenv("RT_STAGE_PROFILE", profile_path.c_str(), 1);
+        set_node_device_override("crop", StageNodeDevice::OpenCL);
+        const RtStageStatus status = run("crop", {args[0], args[1], args[2],
+                                                  args[3]}, nullptr);
+        clear_node_device_overrides();
+        unsetenv("RT_STAGE_PROFILE");
+
+        check(status == RT_STAGE_OK,
+              "the crop node completes through run()");
+        const std::string profile = read_file(profile_path);
+        check(profile.find("\"stage\":\"crop\"") != std::string::npos &&
+                  profile.find("\"impl\":\"opencl\"") != std::string::npos,
+              "the crop node records a device pass");
+    }
+
+    /* Refusals: an invalid rectangle, an oversized destination and an alias
+     * must not touch the destination. */
+    {
+        LabImage source(64, 48);
+        fill_lab(source, 7u);
+        LabImage destination(32, 32);
+        fill_lab(destination, 8u);
+        const LabImage before(destination, true);
+
+        const auto refused = [&](const RtStageBuffer& src,
+                                 const RtStageBuffer& dst, int x, int y) {
+            RtStageArg args[4]{};
+            args[0] = buffer_arg(src);
+            args[1] = buffer_arg(dst);
+            args[2] = int_arg(x);
+            args[3] = int_arg(y);
+            set_node_device_override("crop", StageNodeDevice::OpenCL);
+            StageRequest request;
+            request.name = "crop";
+            request.args.assign(args, args + 4);
+            StageExecution execution;
+            const RtStageStatus status =
+                context->execute(request, nullptr, &execution);
+            clear_node_device_overrides();
+            return status;
+        };
+
+        check(refused(view(source), view(destination), -1, 0) ==
+                  RT_STAGE_FALLBACK,
+              "crop refuses a negative x offset");
+        check(refused(view(source), view(destination), 33, 0) ==
+                  RT_STAGE_FALLBACK,
+              "crop refuses a rectangle past the right edge");
+        check(refused(view(source), view(destination), 0, 17) ==
+                  RT_STAGE_FALLBACK,
+              "crop refuses a rectangle past the bottom edge");
+
+        LabImage large(33, 32);
+        check(refused(view(destination), view(large), 0, 0) ==
+                  RT_STAGE_FALLBACK,
+              "crop refuses a destination wider than the source");
+
+        check(refused(view(source), view(source), 0, 0) == RT_STAGE_FALLBACK,
+              "crop refuses an aliased source and destination");
+
+        const Diff untouched = compare(view(before), view(destination));
+        check(untouched.max_abs == 0.0 && untouched.differing == 0,
+              "a refused crop leaves the destination untouched");
+    }
+}
+
 struct GamutCase {
     const char* name;
     int width;
@@ -10776,6 +10964,8 @@ int main()
         check(!nodes.empty(), "at least one node has a device implementation");
         check(has_opencl_stage_node("lanczos3"),
               "the resize node has a device implementation");
+        check(has_opencl_stage_node("crop"),
+              "the crop node has a device implementation");
     }
 
     test_cpu_events();
@@ -10793,6 +10983,7 @@ int main()
     test_node_parity(available);
     test_rgb_proc_pitch(available);
     test_framing(available);
+    test_crop(available);
     test_gamut(available);
     test_working_trc(available);
     test_lab_tools(available);

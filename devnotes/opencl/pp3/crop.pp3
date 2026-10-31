@@ -1,0 +1,16 @@
+[Resize]
+Enabled=true
+Scale=0.5
+AppliesTo=Full image
+Method=Lanczos
+AllowUpscaling=true
+
+# A crop that is not tile-aligned and not full frame, so the node copies an
+# offset rectangle rather than the identity. The resize keeps labResize true,
+# which is what makes the export take the Lab crop path at all.
+[Crop]
+Enabled=true
+X=101
+Y=79
+W=1201
+H=903

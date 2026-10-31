@@ -956,6 +956,45 @@ __kernel void rt_framing(__global const float* srcR,
 }
 
 /*
+ * Lab crop. The node copies the requested rectangle out of a three-plane F32
+ * Lab buffer into a smaller one. Row pitches stay explicit because the stage
+ * device pads rows to the stage alignment while the destination is a packed
+ * LabImage. Every destination pixel is written exactly once and the source
+ * rectangle is validated by the launcher before the launch, so the kernel has
+ * no border rule: a crop is a row copy, not a resample.
+ */
+const std::string& crop_source()
+{
+    static const std::string source = R"CLC(
+#pragma OPENCL FP_CONTRACT OFF
+
+__kernel void rt_crop(__global const float* srcL,
+                      __global const float* srcA,
+                      __global const float* srcB,
+                      __global float* dstL,
+                      __global float* dstA,
+                      __global float* dstB,
+                      const int srcPitch, const int dstPitch,
+                      const int width, const int height,
+                      const int xoffset, const int yoffset)
+{
+    const int x = get_global_id(0);
+    const int y = get_global_id(1);
+    if (x >= width || y >= height) {
+        return;
+    }
+
+    const int in = (y + yoffset) * srcPitch + x + xoffset;
+    const int out = y * dstPitch + x;
+    dstL[out] = srcL[in];
+    dstA[out] = srcA[in];
+    dstB[out] = srcB[in];
+}
+)CLC";
+    return source;
+}
+
+/*
  * Thumbnail white balance: a per-pixel multiply with the highlight-average
  * branch. The multipliers and the highlight flag are resolved on the host, so
  * this kernel only reproduces the loop. 65535 is rt_math.h's MAXVALF.
@@ -1308,6 +1347,7 @@ const std::vector<KernelDef>& kernels()
         {"local.adjustments", local_adjustments_source().c_str(), "rt_local_adjustments_apply"},
         {"output.sharpen", RT_SHARPEN_CL, "rt_sharpen_mask"},
         {"framing", framing_source().c_str(), "rt_framing"},
+        {"crop", crop_source().c_str(), "rt_crop"},
         {"thumbnail.whitebalance", thumbnail_wb_source().c_str(), "rt_thumbnail_wb"},
         {"thumbnail.transform", thumbnail_permute_source().c_str(), "rt_thumbnail_permute"},
         {"thumbnail.transform.u8", thumbnail_permute_source().c_str(), "rt_thumbnail_permute_u8"},
@@ -6777,6 +6817,173 @@ RtStageStatus run_framing(const std::shared_ptr<OpenCLEnv>& env,
         if (residency->readback(dst_devices[plane], plane_view(dst, plane)) !=
             RT_STAGE_OK) {
             error = "framing readback failed";
+            return RT_STAGE_ERROR;
+        }
+    }
+
+    return RT_STAGE_OK;
+}
+
+
+/*
+ * Lab crop. Arguments:
+ *   [0] source buffer, [1] destination buffer, [2] int x offset, [3] int y
+ * offset. The rectangle size comes from the destination, which the call site
+ * allocates from the crop parameters. A crop that would read outside the
+ * source is refused before any transfer; the call site then keeps its own
+ * row copy, so a refusal is always byte-identical.
+ */
+RtStageStatus run_crop(const std::shared_ptr<OpenCLEnv>& env,
+                       const std::shared_ptr<OpenCLResidency>& residency,
+                       const std::vector<RtStageArg>& args,
+                       std::string& error)
+{
+    constexpr std::size_t BUFFER_ARGS = 2;
+    constexpr std::size_t INT_ARGS = 2;
+    constexpr std::size_t ARG_COUNT = BUFFER_ARGS + INT_ARGS;
+
+    if (args.size() != ARG_COUNT) {
+        error = "crop expects two buffers and two ints";
+        return RT_STAGE_INVALID;
+    }
+    for (std::size_t i = 0; i < BUFFER_ARGS; ++i) {
+        if (args[i].kind != RT_STAGE_ARG_BUFFER) {
+            error = "crop expects two buffers";
+            return RT_STAGE_INVALID;
+        }
+    }
+    for (std::size_t i = BUFFER_ARGS; i < ARG_COUNT; ++i) {
+        if (args[i].kind != RT_STAGE_ARG_INT) {
+            error = "crop has a non-int offset";
+            return RT_STAGE_INVALID;
+        }
+    }
+
+    const RtStageBuffer& src = args[0].u.buffer;
+    const RtStageBuffer& dst = args[1].u.buffer;
+    if (!valid(src) || !valid(dst) || src.format != RT_STAGE_F32 ||
+        dst.format != RT_STAGE_F32 || src.planes != 3 || dst.planes != 3) {
+        error = "crop needs two three-plane F32 buffers";
+        return RT_STAGE_INVALID;
+    }
+    if (src.data == dst.data) {
+        error = "crop source and destination are the same buffer";
+        return RT_STAGE_INVALID;
+    }
+
+    const std::int64_t xoffset = args[BUFFER_ARGS].u.i;
+    const std::int64_t yoffset = args[BUFFER_ARGS + 1].u.i;
+    if (xoffset < 0 || yoffset < 0 ||
+        xoffset + dst.width > src.width ||
+        yoffset + dst.height > src.height) {
+        error = "crop rectangle is outside the source";
+        return RT_STAGE_INVALID;
+    }
+
+    const KernelDef* def = find_kernel("crop");
+    assert(def != nullptr);
+    cl_kernel kernel = compiled_kernel(env, def, error);
+    if (kernel == nullptr) {
+        return RT_STAGE_FALLBACK;
+    }
+
+    StageDeviceBufferPtr src_devices[3];
+    StageDeviceBufferPtr dst_devices[3];
+    const StageBufferShape src_shape{RT_STAGE_F32, src.width, src.height, 1};
+    const StageBufferShape dst_shape{RT_STAGE_F32, dst.width, dst.height, 1};
+    for (int plane = 0; plane < 3; ++plane) {
+        const RtStageBuffer src_plane = plane_view(src, plane);
+        const RtStageBuffer dst_plane = plane_view(dst, plane);
+        src_devices[plane] = residency->acquire(src_plane.data, src_shape, &error);
+        dst_devices[plane] = residency->acquire(dst_plane.data, dst_shape, &error);
+        if (!src_devices[plane] || !dst_devices[plane]) {
+            return RT_STAGE_FALLBACK;
+        }
+        if (residency->upload(src_devices[plane], src_plane) != RT_STAGE_OK) {
+            error = "crop source upload failed";
+            return RT_STAGE_FALLBACK;
+        }
+    }
+
+    auto memory_of = [](const StageDeviceBufferPtr& buffer) {
+        auto device = std::dynamic_pointer_cast<OpenCLDeviceBuffer>(buffer);
+        return device != nullptr ? device->memory() : nullptr;
+    };
+
+    const std::size_t src_pitch_bytes = src_devices[0]->row_pitch();
+    const std::size_t dst_pitch_bytes = dst_devices[0]->row_pitch();
+    for (int plane = 1; plane < 3; ++plane) {
+        if (src_devices[plane]->row_pitch() != src_pitch_bytes ||
+            dst_devices[plane]->row_pitch() != dst_pitch_bytes) {
+            error = "crop planes disagree on the row pitch";
+            return RT_STAGE_FALLBACK;
+        }
+    }
+    if (src_pitch_bytes % sizeof(float) != 0 ||
+        dst_pitch_bytes % sizeof(float) != 0 ||
+        src_pitch_bytes / sizeof(float) < static_cast<std::size_t>(src.width) ||
+        dst_pitch_bytes / sizeof(float) < static_cast<std::size_t>(dst.width)) {
+        error = "crop row pitch does not cover the image width";
+        return RT_STAGE_FALLBACK;
+    }
+
+    std::lock_guard<std::recursive_mutex> lock(env->queue_mutex);
+
+    const cl_int src_pitch = static_cast<cl_int>(src_pitch_bytes / sizeof(float));
+    const cl_int dst_pitch = static_cast<cl_int>(dst_pitch_bytes / sizeof(float));
+    const cl_int width = dst.width;
+    const cl_int height = dst.height;
+    const cl_int x = static_cast<cl_int>(xoffset);
+    const cl_int y = static_cast<cl_int>(yoffset);
+
+    const auto set_arg = [&](cl_uint index, std::size_t bytes,
+                             const void* value) {
+        return env->api->SetKernelArg(kernel, index, bytes, value) == CL_SUCCESS;
+    };
+
+    cl_uint arg = 0;
+    bool ok = true;
+    for (int plane = 0; plane < 3 && ok; ++plane) {
+        cl_mem memory = memory_of(src_devices[plane]);
+        ok = set_arg(arg++, sizeof(cl_mem), &memory);
+    }
+    for (int plane = 0; plane < 3 && ok; ++plane) {
+        cl_mem memory = memory_of(dst_devices[plane]);
+        ok = set_arg(arg++, sizeof(cl_mem), &memory);
+    }
+    ok = ok && set_arg(arg++, sizeof(cl_int), &src_pitch) &&
+         set_arg(arg++, sizeof(cl_int), &dst_pitch) &&
+         set_arg(arg++, sizeof(cl_int), &width) &&
+         set_arg(arg++, sizeof(cl_int), &height) &&
+         set_arg(arg++, sizeof(cl_int), &x) &&
+         set_arg(arg++, sizeof(cl_int), &y);
+    if (!ok) {
+        error = "crop clSetKernelArg failed";
+        return RT_STAGE_FALLBACK;
+    }
+
+    const std::size_t global[2] = {static_cast<std::size_t>(width),
+                                   static_cast<std::size_t>(height)};
+    cl_event done = nullptr;
+    if (env->api->EnqueueNDRangeKernel(env->queue, kernel, 2, nullptr, global,
+                                       nullptr, 0, nullptr,
+                                       &done) != CL_SUCCESS ||
+        done == nullptr) {
+        error = "crop launch failed";
+        return RT_STAGE_ERROR;
+    }
+
+    const cl_int wait_status = env->api->WaitForEvents(1, &done);
+    env->api->ReleaseEvent(done);
+    if (wait_status != CL_SUCCESS) {
+        error = "crop did not complete";
+        return RT_STAGE_ERROR;
+    }
+
+    for (int plane = 0; plane < 3; ++plane) {
+        if (residency->readback(dst_devices[plane], plane_view(dst, plane)) !=
+            RT_STAGE_OK) {
+            error = "crop readback failed";
             return RT_STAGE_ERROR;
         }
     }
@@ -12741,6 +12948,20 @@ public:
         } else if (request.name == "framing") {
             const RtStageStatus status =
                 run_framing(env_, residency_, request.args, error);
+            if (status == RT_STAGE_OK) {
+                StageEvent done;
+                done.status = StageEventStatus::Complete;
+                done.result = RT_STAGE_OK;
+                done.device = StageDeviceType::OPENCL;
+                done.asynchronous = false;
+                return done;
+            }
+            StageEvent fallback = StageQueue::submit(request, profiling);
+            fallback.note = error;
+            return fallback;
+        } else if (request.name == "crop") {
+            const RtStageStatus status =
+                run_crop(env_, residency_, request.args, error);
             if (status == RT_STAGE_OK) {
                 StageEvent done;
                 done.status = StageEventStatus::Complete;

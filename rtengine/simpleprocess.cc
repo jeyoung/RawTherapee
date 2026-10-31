@@ -2404,15 +2404,42 @@ private:
             if (labResize) { // crop lab data
                 LabImage *tmplab = new LabImage(cw, ch);
 
-                const std::size_t rowBytes =
-                    static_cast<std::size_t>(cw) * sizeof(float);
-                for (int row = 0; row < ch; ++row) {
-                    std::memcpy(tmplab->L[row], labView->L[row + cy] + cx,
-                                rowBytes);
-                    std::memcpy(tmplab->a[row], labView->a[row + cy] + cx,
-                                rowBytes);
-                    std::memcpy(tmplab->b[row], labView->b[row + cy] + cx,
-                                rowBytes);
+                /*
+                 * The crop is a row copy, so the stage node can run it on the
+                 * device and the loop below stays the byte-identical fallback.
+                 * The node is submitted only when the rectangle is inside the
+                 * source; a refused or unavailable device leaves tmplab
+                 * untouched and the loop fills it.
+                 */
+                bool copied = false;
+                if (cx >= 0 && cy >= 0 && cx + cw <= labView->W &&
+                    cy + ch <= labView->H) {
+                    RtStageArg args[4]{};
+                    args[0].kind = RT_STAGE_ARG_BUFFER;
+                    args[0].u.buffer = stage::view(*labView);
+                    args[1].kind = RT_STAGE_ARG_BUFFER;
+                    args[1].u.buffer = stage::view(*tmplab);
+                    args[2].kind = RT_STAGE_ARG_INT;
+                    args[2].u.i = cx;
+                    args[3].kind = RT_STAGE_ARG_INT;
+                    args[3].u.i = cy;
+                    RtStageProfiling profiling{};
+                    copied = stage::run("crop",
+                                        {args[0], args[1], args[2], args[3]},
+                                        &profiling) == RT_STAGE_OK;
+                }
+
+                if (!copied) {
+                    const std::size_t rowBytes =
+                        static_cast<std::size_t>(cw) * sizeof(float);
+                    for (int row = 0; row < ch; ++row) {
+                        std::memcpy(tmplab->L[row], labView->L[row + cy] + cx,
+                                    rowBytes);
+                        std::memcpy(tmplab->a[row], labView->a[row + cy] + cx,
+                                    rowBytes);
+                        std::memcpy(tmplab->b[row], labView->b[row + cy] + cx,
+                                    rowBytes);
+                    }
                 }
 
                 delete labView;
