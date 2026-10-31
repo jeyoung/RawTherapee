@@ -212,8 +212,8 @@ device pass.
 `lab.wavelet` is partial: the directional pyramid equaliser runs on the
 device when it is enabled in after-CBDL position (`cbdlMethod == "aft"`) and
 the CIE-CAM gate admits the pass, and the wavelet tool runs on the device for
-the contrast panel and the chroma panel's `CHmethod == "link"` arm. Either
-pass may run alone, so the node no longer requires
+the contrast panel, the chroma panel's `CHmethod == "link"` arm and the edge
+panel's plain arm. Either pass may run alone, so the node no longer requires
 `dirpyrequalizer.enabled` when only the wavelet runs. The host builds the
 equaliser's per-level range tables through its own `fillLut()` and the
 hue/chroma masks through its own SSE-aware precompute, and exports the
@@ -233,7 +233,33 @@ and undecimated Haar transform, the single-thread ascending double statistics,
 post-L-reconstruction L plane), the strength blend and the final L clamp. The
 chroma arm reuses the equaliser's hue/chroma masks: the equaliser changes only
 L, so a/b are identical at the start of both passes. The L clamp is deferred
-until the chroma pass finishes, as in the block. It is admitted only on a CPU
+until the chroma pass finishes, as in the block.
+
+The edge arm is `ContAllL()`'s `EDmet == 2` block with `cp.detectedge` clear
+and the Lipschitz smoothing off. The host fills a separate edge `mea` through
+`calceffect()` with the `Edgeffect` slider and an offset of 1, samples the
+block's own `WavCurve` over `ccwcurve` into a 501-entry table, and uploads the
+level repartition/reinforce scalars plus the options' `edghi`, `edglo` and
+`limrad`. The kernel reproduces the strength/radius/exponential repartition,
+the `more`/`none`/`less` reinforce arithmetic, the ten-step `beta` ramp, the
+`MaxP` gate and the `ccwcurve` `kmul`/`kinterm` arm with the same `LUTf` float
+interpolation, and modifies only the `borderL == 1` interior of each level's
+three bands, before the contrast multiply. Because the block's a/b level trim
+is disabled while `edgeena` is set, an edge profile also runs the a/b
+decomposition and reconstruction on the device even with `Expchroma` off; the
+round trip is part of the block's result and the chroma multiply stays gated
+by its own flags. The `more`/`none`/`less` reinforce modes read the global
+`edghi`, `edglo` and `limrad` options, which are not pp3 parameters; the node
+captures them in the parameter table at build time. The plain edge arm is the
+only admitted edge sub-mode.
+Median level detection (`calckoe()`'s Lipschitz coefficients), the `NPMethod`
+low/high neighbour smoothing, `Lipst`, and the `EDmethod` `SL` selection are
+refused; the engine hard-codes `EDmet == 2`, so the `SL` threshold adjuster
+(`edgcont`) is dead code and is never silently ignored. A zero-strength edge
+panel, edge sliders outside their widget range, an unknown `Medgreinf` value
+and edge with the unported L skin protection are also residuals.
+
+It is admitted only on a CPU
 OpenCL device, and the wavelet pass also needs fp64. `CHmethod` `without` and
 `with` (the curve and saturation arms), `Expchroma` with a contrast panel that
 also asks for L skin protection, `cbdlMethod == "bef"`, an out-of-range
@@ -243,7 +269,7 @@ gate, strength, Thrend or `c[]`, an all-neutral pyramid, a non-identity
 closed CIE-CAM gate, an image too narrow or too small for its pyramid or Haar
 bands, a GPU or non-fp64 device and nothing enabled at all are residuals:
 each runs the `lab.wavelet` host builtin and records `impl=host`, never a
-device pass. The edge, blur, residual, final, toning, noise and clarity panels
+device pass. The blur, residual, final, toning, noise and clarity panels
 are refused before any upload, as are the balance-chroma arm (`TMr` with a
 `BAmethod` other than `none`) and the soft radius, so a profile that enables
 any of them runs the whole block on the host.

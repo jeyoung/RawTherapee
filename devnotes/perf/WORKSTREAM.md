@@ -135,6 +135,23 @@ Validated at `3871b7d0c`; the commits after it are documentation only.
   final curves, toning, noise, clarity/unsharp, soft-radius guided filter.
   `65c55b9ec`, `8b412e8c5`, `837e4bfec`, `03daa9925`, `c3b2a11ac`,
   `bdcb5ddcf`. Pushed `b4a219bb1..bdcb5ddcf`.
+- **`lab.wavelet` edge panel, plain arm (partial)**: `ContAllL()`'s
+  `EDmet == 2` block with `cp.detectedge` clear and no `lip3`/`lipp`
+  smoothing. The host builds the edge `mea`, the per-level mean/sigma/MaxP
+  and the 501-point `ccwcurve` table (the default `ccwcurve` is non-identity,
+  so the curve arm is the normal path); the kernel reproduces the strength,
+  radius, repartition, `more`/`none`/`less` reinforce, ten-step `beta` and
+  `kmul`/`kinterm` arithmetic and touches only the `borderL == 1` interior.
+  Because `edgeena` disables the block's a/b level trim, the node also runs
+  the a/b decomposition and reconstruction (the round trip is not an
+  identity) and keeps the chroma multiply behind its own flags. 17 cases,
+  777,753 samples, worst 0.058594 LSB16; 12 refusals at host PAE 0.
+  `ed4e71f16`, `c5ed40c3c`. Residuals: median level detection (`calckoe`),
+  `NPMethod` low/high, `Lipst`, `EDmethod` `SL` (the threshold adjuster is
+  dead under the hard-coded `EDmet == 2`), a zero-strength edge panel,
+  out-of-range sliders, an unknown `Medgreinf`, edge with L skin protection,
+  and the global `edghi`/`edglo`/`limrad` options are read at build time and
+  are not part of the pp3.
 - **`local.adjustments` groundwork (pushed)**: host block extracted
   byte-for-byte, per-spot context/ABI (`LAJC`), exact block-level predicate,
   refusal path, 25 residual mutations and four multi-spot host cases. No
@@ -678,16 +695,19 @@ LSB16, and a dense curve refused at host PAE 0. Non-LabGrid tone methods are
 not a refusal: rgb.proc applies them before the Lab block, and
 Splitco/Splitlr/RGBSliders are admitted with PAE 0 at `6c78a463a`. Then the
 `lab.wavelet` panels
-(denoise, edges, final curves, toning, noise, clarity, soft radius; the chroma
-`link` arm landed at `6bb3101da` with 12 cases at PAE 0), then
-`local.adjustments` exposure/retinex/CIE, then the common mask once the
-wavelet panels land. EPD stays a permanent residual.
+(denoise, final curves, toning, noise, clarity, soft radius; the chroma
+`link` arm landed at `6bb3101da` with 12 cases at PAE 0 and the edge plain
+arm at `c5ed40c3c` with 17 cases, worst 0.058594 LSB16, and 12 residuals at
+PAE 0), then `local.adjustments` exposure/retinex/CIE, then the common mask
+once the wavelet panels land. EPD stays a permanent residual.
 
 ## Next immediate task
 
 Move on to the next `lab.wavelet` panel. Read the host first and pick the
-smaller of `expfinal` (final curves) and `expclari` (clarity); the edges panel
-is a full Lipschitz/Canny detector (`calckoe`, 4 levels x 3 directions) and is
-a large unit of its own. The balance-chroma arm (`TMr` + `BAmethod`) is now
-refused fail-closed, so do not reopen it without porting `ContAllAB`'s BA arm.
+smaller of `expfinal` (final curves) and `expclari` (clarity). The edge panel's
+plain arm is landed; its median/Lipschitz detection (`calckoe`), `NPMethod`
+low/high smoothing, `Lipst`, and the dead `EDmethod` `SL` threshold adjuster
+stay residuals, so do not reopen them without porting the detector. The
+balance-chroma arm (`TMr` + `BAmethod`) is now refused fail-closed, so do not
+reopen it without porting `ContAllAB`'s BA arm.
 Keep `OMP_NUM_THREADS=1` in every comparison.

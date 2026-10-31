@@ -77,6 +77,9 @@ pairs are exact. The gate is the peak absolute error (PAE) in normalised units;
 | 2026-10-31 | 5bb35d3ce | POCL (CPU) | colorspace_flowers.pef / `labwavelet-chroma.pp3` (contrast + chroma `link`), `lab.wavelet` | off vs auto, 16-bit TIFF | 1 LSB | PASS |
 | 2026-10-31 | 5bb35d3ce | POCL (CPU) | 12-case chroma matrix (alone at 6/3/7 levels, strength 100, sigmacol 0.5, with contrast, with the equaliser, positive and negative skin, equaliser plus skin, saturated hue, 179x49 padded), `stage-residency-test` | device vs host block | 0 (exact, a/b exact) | PASS |
 | 2026-10-31 | 5bb35d3ce | POCL (CPU) | 9-case chroma residual matrix (CHmethod without/with, chro/sigmacol/skin ranges, non-identity hhcurve, contrast+skin, chroma-only without strength, edge panel), `stage-residency-test` | device vs host block | 0 (host) | PASS |
+| 2026-10-31 | c5ed40c3c | POCL (CPU) | colorspace_flowers.pef / `labwavelet-edge.pp3` (edge plain arm, active `ccwcurve`), `lab.wavelet` | off vs auto, 16-bit TIFF | 1 LSB | PASS |
+| 2026-10-31 | c5ed40c3c | POCL (CPU) | 17-case edge matrix (strengths 50/100, radius 90, thresholds 60/-30, effect 0.6/2.5, reinforce more/none/less, identity and custom `ccwcurve`, with contrast, with chroma, contrast+chroma, 179x49 padded, 3 and 7 levels), `stage-residency-test` | device vs host block | 0.058594 LSB16 (worst) | PASS |
+| 2026-10-31 | c5ed40c3c | POCL (CPU) | 12-case edge residual matrix (median level, NP low/high, Lipst, EDmethod SL, edgval/edgrad/edgthresh/edgeffect ranges, unknown Medgreinf, zero strength, skin protection), `stage-residency-test` | device vs host block | 0 (host) | PASS |
 
 `47c50ee77` changes only CPU export buffer handling; the OpenCL rows above
 re-run the existing GPU stages against the new CPU neighbour.
