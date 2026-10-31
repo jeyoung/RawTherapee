@@ -1,0 +1,15 @@
+[Shadows & Highlights]
+Enabled=true
+Highlights=50
+HighlightTonalWidth=50
+Shadows=50
+ShadowTonalWidth=50
+Radius=40
+Lab=true
+
+# Splitco is applied by rgb.proc before the Lab block, so the lab.tools node
+# must run on the device and ignore the method.
+[ColorToning]
+Enabled=true
+Method=Splitco
+Twocolor=Std

@@ -4889,6 +4889,63 @@ void test_lab_tools(bool available)
     }
 
     /*
+     * Colour toning other than LabGrid is applied by rgbProc() before this
+     * block, so it must not refuse the node: with the same admitted tool the
+     * device pass is identical to the host block, because neither side
+     * evaluates the toning method here.
+     */
+    for (const char* method : {"Splitco", "Splitlr", "RGBSliders"}) {
+        rtengine::procparams::ProcParams params;
+        params.colorToning.enabled = true;
+        params.colorToning.method = method;
+        params.sh.enabled = true;
+        params.sh.lab = true;
+        params.sh.highlights = 50;
+        params.sh.shadows = 50;
+        params.sh.htonalwidth = 50;
+        params.sh.stonalwidth = 50;
+        params.sh.radius = 10;
+
+        check(labToolsSupported(params),
+              "lab.tools admits a tone method rgb.proc owns");
+
+        LabImage source(179, 48);
+        fill_lab_tools(source, 7u);
+
+        rtengine::ImProcFunctions cpu_ipf(&params, false);
+        LabToolsHostState cpu_host;
+        LabImage cpu(179, 48);
+        cpu.CopyFrom(&source);
+        LabToolsLuts cpu_luts = cpu_host.luts();
+        labToolsHostBlock(cpu_ipf, params, cpu, cpu_luts, cpu_host.autili,
+                          cpu_host.butili);
+
+        rtengine::ImProcFunctions device_ipf(&params, false);
+        LabToolsHostState device_host;
+        LabImage device(179, 48);
+        device.CopyFrom(&source);
+        const LabToolsRun result =
+            run_lab_tools_node(device, params, device_host, device_ipf,
+                               profile_path);
+        const std::string profile = read_file(profile_path);
+
+        check(result.supported,
+              "the toning profile resolves to the supported set");
+        check(result.status == RT_STAGE_OK,
+              "the toning profile completes through run()");
+        check(profile.find("\"stage\":\"lab.tools\"") != std::string::npos &&
+                  profile.find("\"impl\":\"opencl\"") != std::string::npos,
+              "the toning profile records a device execution");
+
+        const Diff diff = compare(view(device), view(cpu));
+        std::printf("stage-residency: lab.tools toning %s: PAE %.6f LSB16, "
+                    "%zu of %zu samples differ\n", method, diff.max_abs,
+                    diff.differing, diff.samples);
+        check(diff.finite && diff.max_abs <= 1.0,
+              "the toning profile is within one LSB16");
+    }
+
+    /*
      * Black and white: chromiLuminanceCurve()'s early return zeroes a and b
      * when the Lab curves and colour toning are off. The node repeats it in
      * the Lab-curve pass's slot, so the other admitted tools still run in

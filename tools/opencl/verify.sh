@@ -252,6 +252,8 @@ quick() {
         "$ROOT/devnotes/opencl/pp3/working-trc-residual.pp3" working.trc
     run_stage_device "pef/stage-device-lab-tools-sh" \
         "$ROOT/devnotes/opencl/pp3/labtools-sh.pp3" lab.tools
+    run_stage_device "pef/stage-device-lab-tools-toning" \
+        "$ROOT/devnotes/opencl/pp3/labtools-toning.pp3" lab.tools
     run_stage_device "pef/stage-device-lab-tools-sh-rgb" \
         "$ROOT/devnotes/opencl/pp3/labtools-sh-rgb.pp3" lab.tools
     run_stage_device "pef/stage-device-lab-tools-labgrid" \
@@ -609,6 +611,8 @@ stage_device() {
         "$ROOT/devnotes/opencl/pp3/working-trc-residual.pp3" working.trc
     run_stage_device "pef/stage-device-lab-tools-sh" \
         "$ROOT/devnotes/opencl/pp3/labtools-sh.pp3" lab.tools
+    run_stage_device "pef/stage-device-lab-tools-toning" \
+        "$ROOT/devnotes/opencl/pp3/labtools-toning.pp3" lab.tools
     run_stage_device "pef/stage-device-lab-tools-sh-rgb" \
         "$ROOT/devnotes/opencl/pp3/labtools-sh-rgb.pp3" lab.tools
     run_stage_device "pef/stage-device-lab-tools-labgrid" \
