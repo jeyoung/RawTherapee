@@ -266,9 +266,13 @@ typedef struct RtLabToolsResult {
     uint32_t region_count;
     uint32_t region_lut_stride;
     /*
-     * 1 when chromiLuminanceCurve()'s early black-and-white return applies:
-     * the Lab curves are off, so the block only zeroes a and b and leaves L
-     * alone. The full bwToning arm (Lab curves on) is never a device pass.
+     * 1 when `blackwhite.enabled` is set. The launcher runs the cheap zeroing
+     * (chromiLuminanceCurve()'s early return) only when `lab_curve_active` is
+     * 0. With the Lab-curve pass active, `rt_lab_tools_lab_curve` runs the
+     * full `bwToning` arm in the same slot and writes a and b itself: the
+     * grey, or the a/b tables' deviation from the original chroma. Colour
+     * toning together with black-and-white is refused by the supported set
+     * and by build().
      */
     uint32_t black_white;
 } RtLabToolsResult;

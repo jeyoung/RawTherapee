@@ -3473,12 +3473,16 @@ RtStageStatus run_working_trc(const std::shared_ptr<OpenCLEnv>& env,
  *   [65] int their stride, [66] BUFFER the per-region parameters,
  *   [67] and [68] PTR the working and inverse matrices as nine doubles each
  *        (host-only, copied to a device buffer),
- *   [69] int black-and-white flag (1 when chromiLuminanceCurve()'s early
- *        return zeroes a and b: the Lab curves and colour toning are off).
+ *   [69] int black-and-white flag (1 when `blackwhite.enabled` is set; the
+ *        cheap zeroing runs only with the Lab-curve pass off, otherwise the
+ *        curve kernel runs the `bwToning` arm in its place).
  *
  * The pass order is the block's own: LabGrid, then the highlight round, then
- * the shadow round, then local contrast, then the Lab-curve pass or the
- * black-and-white zeroing, then vibrance, then the regions in region order.
+ * the shadow round, then local contrast, then the Lab-curve pass, which owns
+ * black-and-white output in that slot (the `bwToning` arm with the curves on,
+ * the early zeroing otherwise), then vibrance, then the regions in region
+ * order.
+ *
  * Each tool writes the full image, so the work is sequential in that order and
  * no pass can run out of order.
  *
@@ -3602,10 +3606,10 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
     }
 
     /*
-     * chromiLuminanceCurve()'s early black-and-white return. The call site
-     * sets the flag only for the cheap branch (Lab curves and colour toning
-     * off); the launcher still validates it, because a direct submission must
-     * not invent a pass the block would not run.
+     * `blackwhite.enabled`. Which of the block's two black-and-white arms
+     * runs is decided below from this flag and the Lab-curve flag; the
+     * supported set refuses colour toning with black-and-white, so a
+     * submission with both set can only be the `bwToning` arm.
      */
     const std::int64_t black_white_flag = args[69].u.i;
     if (black_white_flag != 0 && black_white_flag != 1) {
@@ -3769,6 +3773,17 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
         lcurve_entries = static_cast<int>(lcurve_length);
         curve_entries = static_cast<int>(curve_length);
     }
+
+    /*
+     * chromiLuminanceCurve()'s `bwToning` arm. The block's predicate is
+     * `blackwhite.enabled && !colorToning.enabled` (its `bwq` term is
+     * disabled); colour toning with black-and-white is refused by the
+     * supported set and by the context build, so a submission that sets both
+     * the black-and-white and Lab-curve flags can only be that arm. The
+     * lab curve pass then owns the two arms' slot: the early zeroing kernel
+     * is skipped and the curve kernel writes a and b itself.
+     */
+    const bool bw_toning = black_white && lab_curve;
 
     /*
      * Local contrast. The flag is the call site's
@@ -5364,6 +5379,7 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
             const cl_float cl_protect_red_h = protect_red_h_raw;
             const cl_float cl_adjust = adjust;
             const cl_int cl_lcredsk = lcredsk;
+            const cl_int cl_bw_toning = bw_toning ? 1 : 0;
 
             cl_uint arg = 0;
             bool ok = true;
@@ -5409,6 +5425,8 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
                                &cl_adjust);
             ok = ok && set_arg(lab_curve_kernel, arg++, sizeof(cl_int),
                                &cl_lcredsk);
+            ok = ok && set_arg(lab_curve_kernel, arg++, sizeof(cl_int),
+                               &cl_bw_toning);
             ok = ok && set_arg(lab_curve_kernel, arg++, sizeof(cl_mem),
                                &munsell_memory);
             ok = ok && set_arg(lab_curve_kernel, arg++, sizeof(cl_mem),
@@ -5435,9 +5453,12 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
          * chromiLuminanceCurve()'s early black-and-white return, in the
          * Lab-curve pass's slot: after local contrast and before vibrance. It
          * zeroes a and b and leaves L alone, so vibrance and the regions still
-         * run afterwards on grey.
+         * run afterwards on grey. The early return only applies when the Lab
+         * curves are off; with them on, the pass above already ran the
+         * `bwToning` arm in the same slot and wrote the grey or the a/b
+         * tables' deviation, so this kernel must not run as well.
          */
-        if (black_white) {
+        if (black_white && !lab_curve) {
             cl_uint arg = 0;
             bool ok = true;
             ok = ok && set_arg(bw_kernel, arg++, sizeof(cl_mem), &lab_memory);

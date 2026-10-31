@@ -28,12 +28,16 @@
  * semantics. Nothing here re-derives a curve or a Munsell table.
  *
  * Supported: the L, a, b, C=f(C), L=f(C) and C=f(L) tables, the MUN and NONE
- * Munsell methods, the red and skin protection, `lcredsk`, and the block's
- * chroma scale for the working profile. Residual (the launcher never reaches
- * this kernel): a non-zero contrast (it owns the hist16 refill), the
+ * Munsell methods, the red and skin protection, `lcredsk`, the block's
+ * chroma scale for the working profile, and black-and-white output through
+ * `chromiLuminanceCurve()`'s `bwToning` arm. Under `bwToning` the hue and
+ * chroma come from the original pixel before the a and b tables, the C=f(L)
+ * and C=f(C) tables and the red/skin gate are skipped, L=f(C) is skipped, and
+ * the closing write is the a/b tables' deviation from the original chroma
+ * (exactly zero when neither table is active). Residual (the launcher never
+ * reaches this kernel): a non-zero contrast (it owns the hist16 refill), the
  * chromaticity slider and the C=f(H), L=f(H), H=f(H) flat curves, the LAB,
- * XYZ and XYZREL Munsell methods, black-and-white output and a denoised
- * chroma factor.
+ * XYZ and XYZREL Munsell methods and a denoised chroma factor.
  *
  * The source is appended after lab_tools_cl.h, munsell_lch_cl.h and
  * vibrance_cl.h, so it reads their LUT, atan2/sincos and Munsell helpers.
@@ -236,7 +240,7 @@ __kernel void rt_lab_tools_lab_curve(
     const int cc_active, const int lc_active, const int cl_active,
     const int method, const float rst_protection,
     const float protect_red_raw, const float protect_red_h_raw,
-    const float adjust, const int lcredsk,
+    const float adjust, const int lcredsk, const int bw_toning,
     __global const float* munsell, __global const float* munsell_sizes,
     const int width, const int height,
     const int lab_pitch, const int lab_plane)
@@ -250,11 +254,15 @@ __kernel void rt_lab_tools_lab_curve(
     const int offset = y * lab_pitch + x;
     const float Lin = lab[offset];
     const float LL = Lin / 327.68f;
-    float atmp = lab[lab_plane + offset];
-    float btmp = lab[2 * lab_plane + offset];
+    const float a_orig = lab[lab_plane + offset];
+    const float b_orig = lab[2 * lab_plane + offset];
+    float atmp = a_orig;
+    float btmp = b_orig;
 
     float Lprov1 = rt_lt_lut_raw(lcurve, lcurve_size, Lin) / 327.68f;
 
+    /* Both arms apply the a and b tables; `bwToning` keeps the curved values
+     * for its closing deviation instead of re-deriving the hue from them. */
     if (a_active != 0) {
         atmp = rt_lt_lut(acurve, curve_size, atmp + 32768.0f) - 32768.0f;
     }
@@ -267,32 +275,41 @@ __kernel void rt_lab_tools_lab_curve(
      * `for (k = 0; k < W - 3; k += 4)` loop covers: 4 * (floor((W-4)/4) + 1)
      * columns, or none when W < 4. Its tail loop, the last up to three
      * columns, uses the scalar double sqrt instead, and so does the whole
-     * frame when the a or b table is active (the precompute does not run
-     * then). Reproduce both.
+     * frame when the a or b table is active and `bwToning` is off (the
+     * precompute's guard is `bwToning || (!autili && !butili)`). Reproduce
+     * both.
      */
     const int simd_columns = width >= 4 ? 4 * (((width - 4) / 4) + 1) : 0;
-    const bool host_precompute = a_active == 0 && b_active == 0;
-    float CC = rt_lt_sqrt_div(atmp * atmp + btmp * btmp);
+    const bool host_precompute =
+        bw_toning != 0 || (a_active == 0 && b_active == 0);
+    /*
+     * The hue and chroma source. `!bwToning` takes them from the curved a and
+     * b values; `bwToning` takes them from the original pixel, before the
+     * tables, and keeps them for the closing write.
+     */
+    const float hue_a = bw_toning != 0 ? a_orig : atmp;
+    const float hue_b = bw_toning != 0 ? b_orig : btmp;
+    float CC = rt_lt_sqrt_div(hue_a * hue_a + hue_b * hue_b);
     if (host_precompute && x < simd_columns) {
-        CC = rt_lt_sqrt_div_f32(atmp * atmp + btmp * btmp);
+        CC = rt_lt_sqrt_div_f32(hue_a * hue_a + hue_b * hue_b);
     }
-    float HH = rt_lt_xatan2f(btmp, atmp);
+    float HH = rt_lt_xatan2f(hue_b, hue_a);
     float2 sincosval;
     if (CC == 0.0f) {
         sincosval.y = 1.0f;
         sincosval.x = 0.0f;
     } else {
-        sincosval.y = atmp / (CC * 327.68f);
-        sincosval.x = btmp / (CC * 327.68f);
+        sincosval.y = hue_a / (CC * 327.68f);
+        sincosval.x = hue_b / (CC * 327.68f);
     }
     const float memChprov = CC;
     float Chprov1 = CC;
 
     /*
-     * The block's first red/skin gate. With chromapro at 1 and the denoise
-     * factor at 1 every factor is 1, so the block's product leaves a and b
-     * untouched; the sequence is kept so the branch conditions are the
-     * host's.
+     * The block's first red/skin gate, which only the `!bwToning` arm runs.
+     * With chromapro at 1 and the denoise factor at 1 every factor is 1, so
+     * the block's product leaves a and b untouched; the sequence is kept so
+     * the branch conditions are the host's.
      */
     float dred;
     if (Lprov1 < 25.f) {
@@ -309,13 +326,16 @@ __kernel void rt_lab_tools_lab_curve(
 
     const float protect_red = rt_lt_lim(protect_red_raw, 20.f, 180.f);
     const float protect_red_h = rt_lt_lim(protect_red_h_raw, 0.1f, 1.f);
-    float factor = rt_lt_transitred(HH, Chprov1, dred, 1.f, protect_red, 1.f,
-                                    protect_red_h, 1.f, 1.f);
-    atmp *= factor;
-    btmp *= factor;
+    float factor = 1.0f;
+    if (bw_toning == 0) {
+        factor = rt_lt_transitred(HH, Chprov1, dred, 1.f, protect_red, 1.f,
+                                  protect_red_h, 1.f, 1.f);
+        atmp *= factor;
+        btmp *= factor;
+    }
 
-    /* C=f(L) */
-    if (cl_active != 0 && LL > 0.f) {
+    /* C=f(L), skipped under `bwToning`. */
+    if (bw_toning == 0 && cl_active != 0 && LL > 0.f) {
         const float curf = 0.7f;
         float scale = 100.0f / 100.1f;
         float scaleext = 1.0f;
@@ -363,8 +383,8 @@ __kernel void rt_lab_tools_lab_curve(
                          rt_lt_max(42000.f, btmp));
     }
 
-    /* C=f(C) */
-    if (cc_active != 0) {
+    /* C=f(C), skipped under `bwToning`. */
+    if (bw_toning == 0 && cc_active != 0) {
         const float curf = 0.7f;
         float scale = 100.0f / 100.1f;
         float scaleext = 1.0f;
@@ -411,8 +431,8 @@ __kernel void rt_lab_tools_lab_curve(
         btmp *= factor;
     }
 
-    /* L=f(C) */
-    if (lc_active != 0) {
+    /* L=f(C), skipped under `bwToning` (the host's `cclutili && !bwToning`). */
+    if (bw_toning == 0 && lc_active != 0) {
         const float xx = 0.25f;
         float skdeltaHH = rt_lt_lim(protect_red_h_raw, 0.1f, 3.5f);
         float skbeg = -0.05f;
@@ -452,7 +472,25 @@ __kernel void rt_lab_tools_lab_curve(
         Lprov1 *= Lc;
     }
 
-    Chprov1 = rt_lt_sqrt_div(atmp * atmp + btmp * btmp);
+    if (bw_toning != 0) {
+        /*
+         * chromiLuminanceCurve()'s `bwToning` closing block: the hue and
+         * chroma come from the a/b tables' deviation from the original
+         * chroma, not from the curved absolute values.
+         */
+        atmp -= a_orig;
+        btmp -= b_orig;
+        Chprov1 = rt_lt_sqrt_div(atmp * atmp + btmp * btmp);
+        if (Chprov1 == 0.0f) {
+            sincosval.x = 0.0f;
+            sincosval.y = 1.0f;
+        } else {
+            sincosval.x = btmp / (327.68f * Chprov1);
+            sincosval.y = atmp / (327.68f * Chprov1);
+        }
+    } else {
+        Chprov1 = rt_lt_sqrt_div(atmp * atmp + btmp * btmp);
+    }
     float out_l = Lprov1 * 327.68f;
     float out_a = 327.68f * Chprov1 * sincosval.y;
     float out_b = 327.68f * Chprov1 * sincosval.x;
@@ -461,6 +499,11 @@ __kernel void rt_lab_tools_lab_curve(
      * The Munsell correction. The block guards it with the activity test; at
      * least one table is active whenever the method is MUN and the launcher
      * only sends the pass when it has one, but the test is kept.
+     *
+     * The activity test is the block's own list, which excludes `bwToning`;
+     * under black-and-white the six tables can still be active, so the
+     * correction runs on the grey or deviated chroma exactly as the block
+     * does.
      */
     if (method != 0 &&
         (l_active != 0 || a_active != 0 || b_active != 0 || cc_active != 0 ||
@@ -481,6 +524,16 @@ __kernel void rt_lab_tools_lab_curve(
 
         out_a = 327.68f * Chprov * sincosval.y;
         out_b = 327.68f * Chprov * sincosval.x;
+    }
+
+    /*
+     * The block's closing `gamutmuns == 0` branch. Without `bwToning` it
+     * repeats the write above; under `bwToning` it writes the a/b tables'
+     * deviation directly, which is zero when no a or b table is active.
+     */
+    if (method == 0 && bw_toning != 0) {
+        out_a = atmp;
+        out_b = btmp;
     }
 
     lab[offset] = out_l;

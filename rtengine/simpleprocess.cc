@@ -1668,14 +1668,16 @@ private:
 
         /*
          * The device node is opt-in and covers the LabGrid pass,
-         * shadows/highlights, the Lab curves, vibrance, local contrast and the
-         * bounded Lab-region set. Everything else in the block is a residual:
-         * the node is not submitted as supported, the launcher refuses it and
-         * the builtin below runs the host block, recording impl=host. The
-         * launcher also refuses vibrance, the Lab-curve pass, local contrast
-         * and regions on a GPU device, whose arithmetic rounding can move a
-         * Munsell-limit pixel or the region mask, and the Lab-curve,
-         * local-contrast and region passes on a device without fp64.
+         * shadows/highlights, the Lab curves (including black-and-white
+         * output), vibrance, local contrast and the bounded Lab-region set.
+         * Everything else in the block is a residual: the node is not
+         * submitted as supported, the launcher refuses it and the builtin
+         * below runs the host block, recording impl=host. The launcher also
+         * refuses vibrance, the Lab-curve pass, local contrast and regions on
+         * a GPU device, whose arithmetic rounding can move a Munsell-limit
+         * pixel or the region mask, and the Lab-curve, local-contrast and
+         * region passes on a device without fp64. Black-and-white output with
+         * colour toning is a residual.
          */
         if (stage::node_device("lab.tools") == stage::StageNodeDevice::OpenCL) {
             const bool supported = stage::labToolsSupported(params);

@@ -428,15 +428,22 @@ bool labToolsSupported(const procparams::ProcParams& params)
 
     /*
      * chromiLuminanceCurve()'s black-and-white output has two arms. The cheap
-     * one runs when the Lab curves are off and colour toning is off: it only
-     * zeroes a and b and the device repeats it in the Lab-curve pass's slot.
-     * The full bwToning arm needs the Lab curves, and any colour toning takes
-     * the block past the early return, so both stay on the host.
+     * one runs when the Lab curves are off: it only zeroes a and b, and the
+     * device repeats it in the Lab-curve pass's slot. The full `bwToning` arm
+     * runs when the Lab curves are on: the curve pass writes the zero, or the
+     * a/b tables' deviation from the original chroma, in that same slot. Both
+     * are device cases. Colour toning takes the block past both arms (the
+     * host's `bwonly` is `blackwhite.enabled && !colorToning.enabled`), so
+     * black-and-white with any colour toning stays a residual.
      */
-    if (params.blackwhite.enabled &&
-        (params.colorToning.enabled || params.labCurve.enabled)) {
+    if (params.blackwhite.enabled && params.colorToning.enabled) {
         return false;
     }
+    /*
+     * The call site exports `black_white` from this flag. The launcher runs
+     * the cheap zeroing only when the Lab-curve pass is off, so the two are
+     * never both applied.
+     */
     const bool black_white = params.blackwhite.enabled;
 
     /*
@@ -596,13 +603,13 @@ RtLabToolsContext LabToolsContext::descriptor(bool supported)
 int LabToolsContext::build(RtLabToolsResult& out)
 {
     /*
-     * chromiLuminanceCurve()'s early black-and-white return is the only
-     * black-and-white arm the node ports. The predicate refuses the other
-     * arms; repeat the condition here so a direct build never exports a flag
-     * the device cannot honour.
+     * chromiLuminanceCurve()'s black-and-white output is ported in both arms:
+     * the early return's zeroing and, with the Lab curves on, the full
+     * `bwToning` arm. Colour toning takes the block past both, so the
+     * predicate refuses it; repeat the condition here so a direct build never
+     * exports a flag the device cannot honour.
      */
-    if (params_.blackwhite.enabled &&
-        (params_.colorToning.enabled || params_.labCurve.enabled)) {
+    if (params_.blackwhite.enabled && params_.colorToning.enabled) {
         return 1;
     }
     black_white_ = params_.blackwhite.enabled;
