@@ -1684,7 +1684,7 @@ private:
             const bool deviceReady = supported && context.build(setup) == 0;
             RtLabToolsContext descriptor = context.descriptor(deviceReady);
 
-            RtStageArg args[69] = {};
+            RtStageArg args[70] = {};
             args[0].kind = RT_STAGE_ARG_BUFFER;
             args[0].u.buffer = stage::view(*labView);
             args[1].kind = RT_STAGE_ARG_PTR;
@@ -1839,6 +1839,8 @@ private:
             args[67].u.ptr = deviceReady ? setup.ws_double : nullptr;
             args[68].kind = RT_STAGE_ARG_PTR;
             args[68].u.ptr = deviceReady ? setup.iws_double : nullptr;
+            args[69].kind = RT_STAGE_ARG_INT;
+            args[69].u.i = deviceReady ? setup.black_white : 0;
 
             for (int index = 16; index < 22; ++index) {
                 args[index].kind = RT_STAGE_ARG_BUFFER;
@@ -1931,7 +1933,7 @@ private:
 
             RtStageProfiling profiling{};
             if (stage::run("lab.tools",
-                           std::vector<RtStageArg>(args, args + 69),
+                           std::vector<RtStageArg>(args, args + 70),
                            &profiling) == RT_STAGE_OK) {
                 return;
             }

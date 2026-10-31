@@ -22,11 +22,12 @@
 /*
  * Device arithmetic for the lab.tools node.
  *
- * The node runs three of the Lab block's pixel tools: the LabGrid colour-toning
- * pass, shadows/highlights in both its Lab and RGB modes, and vibrance. The
- * Lab-curve pass is a separate fp64 program in lab_curve_cl.h. Everything the
- * block does with pow_F(), the sh_contrast NURBS curve, the diagonal curves or
- * lcms is either not part of this node or is built on the host.
+ * The node runs the Lab block's pixel tools: the LabGrid colour-toning pass,
+ * shadows/highlights in both its Lab and RGB modes, vibrance, and the cheap
+ * black-and-white return that zeroes a and b. The Lab-curve pass is a
+ * separate fp64 program in lab_curve_cl.h. Everything the block does with
+ * pow_F(), the sh_contrast NURBS curve, the diagonal curves or lcms is either
+ * not part of this node or is built on the host.
  *
  * The shadows/highlights round is the block's own sequence:
  *
@@ -629,5 +630,25 @@ __kernel void rt_lab_tools_labgrid(__global float* lab,
     const float l = lab[offset];
     lab[lab_plane + offset] += l * a_scale + a_base;
     lab[2 * lab_plane + offset] += l * b_scale + b_base;
+}
+/*
+ * chromiLuminanceCurve()'s early black-and-white return: `lnew->a` and
+ * `lnew->b` are set to 0 and L is left untouched. The block runs it in the
+ * Lab-curve pass's place, after local contrast and before vibrance, so the
+ * node launches this kernel there and the later tools see grey.
+ */
+__kernel void rt_lab_tools_bw(__global float* lab,
+                              const int width, const int height,
+                              const int lab_pitch, const int lab_plane)
+{
+    const int x = get_global_id(0);
+    const int y = get_global_id(1);
+    if (x >= width || y >= height) {
+        return;
+    }
+
+    const int offset = y * lab_pitch + x;
+    lab[lab_plane + offset] = 0.0f;
+    lab[2 * lab_plane + offset] = 0.0f;
 }
 )CLC";

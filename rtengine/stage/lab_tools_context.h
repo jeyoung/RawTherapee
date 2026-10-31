@@ -53,7 +53,7 @@ struct ProcParams;
  * object that owns the ProcParams and ImProcFunctions references, so the
  * pointer must not outlive them.
  */
-#define RT_LAB_TOOLS_CONTEXT_VERSION 4u
+#define RT_LAB_TOOLS_CONTEXT_VERSION 5u
 /* "LTOC": rejects a stale or unrelated pointer before any callback runs. */
 #define RT_LAB_TOOLS_CONTEXT_MAGIC 0x4C544F43u
 /* The Lab-mode tone table: one entry per 16-bit L value (0..32767). */
@@ -265,6 +265,12 @@ typedef struct RtLabToolsResult {
     const double* iws_double;
     uint32_t region_count;
     uint32_t region_lut_stride;
+    /*
+     * 1 when chromiLuminanceCurve()'s early black-and-white return applies:
+     * the Lab curves are off, so the block only zeroes a and b and leaves L
+     * alone. The full bwToning arm (Lab curves on) is never a device pass.
+     */
+    uint32_t black_white;
 } RtLabToolsResult;
 
 
@@ -344,11 +350,14 @@ struct LabToolsLuts {
  * Fail closed. A Lab curve whose `contrast` is non-zero owns the hist16 refill
  * a later node reads, so it is a residual. So are the chromaticity family
  * (the chromaticity slider and the C=f(H), L=f(H) and H=f(H) flat curves), the
- * LAB, XYZ and XYZREL Munsell methods, black-and-white output (which
- * chromiLuminanceCurve() also touches), EPD and any colour-toning method other
+ * LAB, XYZ and XYZREL Munsell methods, EPD and any colour-toning method other
  * than LabGrid. A local contrast whose sliders are outside the ABI range is a
- * residual as well. A profile where no tool would run is a residual too: the
- * node would be a no-op and the host block records it.
+ * residual as well. Black-and-white output is admitted only through
+ * chromiLuminanceCurve()'s cheap branch: the Lab curves and colour toning are
+ * both off, and the pass only zeroes a and b. The full bwToning arm (Lab
+ * curves on) and black-and-white with colour toning are residuals. A profile
+ * where no tool would run is a residual too: the node would be a no-op and the
+ * host block records it.
  */
 bool labToolsSupported(const procparams::ProcParams& params);
 /* True when a shadows/highlights round would run for the given slider
@@ -483,6 +492,7 @@ private:
     bool regions_active_ = false;
     std::vector<float> region_luts_;
     std::vector<float> region_params_;
+    bool black_white_ = false;
 };
 
 } // namespace rtengine::stage

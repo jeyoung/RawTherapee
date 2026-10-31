@@ -3472,12 +3472,15 @@ RtStageStatus run_working_trc(const std::shared_ptr<OpenCLEnv>& env,
  *   [63] int region count (0 or 1..4), [64] BUFFER the region mask tables,
  *   [65] int their stride, [66] BUFFER the per-region parameters,
  *   [67] and [68] PTR the working and inverse matrices as nine doubles each
- *        (host-only, copied to a device buffer).
+ *        (host-only, copied to a device buffer),
+ *   [69] int black-and-white flag (1 when chromiLuminanceCurve()'s early
+ *        return zeroes a and b: the Lab curves and colour toning are off).
  *
  * The pass order is the block's own: LabGrid, then the highlight round, then
- * the shadow round, then local contrast, then the Lab-curve pass, then
- * vibrance, then the regions in region order. Each tool writes the full image,
- * so the work is sequential in that order and no pass can run out of order.
+ * the shadow round, then local contrast, then the Lab-curve pass or the
+ * black-and-white zeroing, then vibrance, then the regions in region order.
+ * Each tool writes the full image, so the work is sequential in that order and
+ * no pass can run out of order.
  *
  * A clear support flag refuses before the upload: that is the residual path,
  * and it makes the CPU builtin - the extracted host block - execute and record
@@ -3489,7 +3492,7 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
                             const std::vector<RtStageArg>& args,
                             std::string& error)
 {
-    constexpr std::size_t ARG_COUNT = 69;
+    constexpr std::size_t ARG_COUNT = 70;
     constexpr int SUBSAMPLING = 4;
     /* guidedfilter.h's epsilon, passed to f_mean() by shadowsHighlights(). */
     constexpr float LAB_TOOLS_EPSILON = 0.075f;
@@ -3550,7 +3553,8 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
             args[65].kind == RT_STAGE_ARG_INT &&
             args[66].kind == RT_STAGE_ARG_BUFFER &&
             args[67].kind == RT_STAGE_ARG_PTR &&
-            args[68].kind == RT_STAGE_ARG_PTR;
+            args[68].kind == RT_STAGE_ARG_PTR &&
+            args[69].kind == RT_STAGE_ARG_INT;
     if (!kinds) {
         error = "lab.tools has an argument of the wrong kind";
         return RT_STAGE_INVALID;
@@ -3596,6 +3600,19 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
         }
         labgrid_values[index] = static_cast<float>(value);
     }
+
+    /*
+     * chromiLuminanceCurve()'s early black-and-white return. The call site
+     * sets the flag only for the cheap branch (Lab curves and colour toning
+     * off); the launcher still validates it, because a direct submission must
+     * not invent a pass the block would not run.
+     */
+    const std::int64_t black_white_flag = args[69].u.i;
+    if (black_white_flag != 0 && black_white_flag != 1) {
+        error = "lab.tools black-and-white flag must be 0 or 1";
+        return RT_STAGE_INVALID;
+    }
+    const bool black_white = black_white_flag != 0;
 
     const auto int_arg = [&](std::size_t index, int low, int high) {
         const std::int64_t value = args[index].u.i;
@@ -3959,7 +3976,7 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
     }
 
     if (!labgrid && !sh_active && !vibrance && !lab_curve &&
-        !local_contrast && !regions) {
+        !local_contrast && !regions && !black_white) {
         error = "lab.tools has no enabled tool";
         return RT_STAGE_FALLBACK;
     }
@@ -4200,6 +4217,8 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
         error);
     cl_kernel labgrid_kernel =
         compiled_kernel_entry(env, def, "rt_lab_tools_labgrid", error);
+    cl_kernel bw_kernel =
+        compiled_kernel_entry(env, def, "rt_lab_tools_bw", error);
     cl_kernel vibrance_kernel =
         compiled_kernel_entry(env, def, "rt_lab_tools_vibrance", error);
     const KernelDef* curve_def = find_kernel("lab.tools.labcurve");
@@ -4242,6 +4261,7 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
         box_h_kernel == nullptr || box_v_kernel == nullptr ||
         combine_kernel == nullptr || upsample_kernel == nullptr ||
         apply_kernel == nullptr || labgrid_kernel == nullptr ||
+        (black_white && bw_kernel == nullptr) ||
         vibrance_kernel == nullptr || (lab_curve && lab_curve_kernel == nullptr) ||
         (local_contrast && (lc_line_kernel == nullptr ||
                             lc_blend_kernel == nullptr)) ||
@@ -5407,6 +5427,30 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
             }
             if (!launch(lab_curve_kernel, image_global,
                         "lab.tools Lab curves")) {
+                return RT_STAGE_FALLBACK;
+            }
+        }
+
+        /*
+         * chromiLuminanceCurve()'s early black-and-white return, in the
+         * Lab-curve pass's slot: after local contrast and before vibrance. It
+         * zeroes a and b and leaves L alone, so vibrance and the regions still
+         * run afterwards on grey.
+         */
+        if (black_white) {
+            cl_uint arg = 0;
+            bool ok = true;
+            ok = ok && set_arg(bw_kernel, arg++, sizeof(cl_mem), &lab_memory);
+            ok = ok && set_arg(bw_kernel, arg++, sizeof(cl_int), &cl_width);
+            ok = ok && set_arg(bw_kernel, arg++, sizeof(cl_int), &cl_height);
+            ok = ok && set_arg(bw_kernel, arg++, sizeof(cl_int), &lab_pitch);
+            ok = ok && set_arg(bw_kernel, arg++, sizeof(cl_int), &lab_plane);
+            if (!ok) {
+                error = "lab.tools black-and-white arguments failed";
+                return RT_STAGE_FALLBACK;
+            }
+            if (!launch(bw_kernel, image_global,
+                        "lab.tools black and white")) {
                 return RT_STAGE_FALLBACK;
             }
         }

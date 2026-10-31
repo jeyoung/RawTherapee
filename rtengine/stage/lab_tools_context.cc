@@ -425,12 +425,17 @@ bool labToolsSupported(const procparams::ProcParams& params)
     }
 
     /*
-     * chromiLuminanceCurve() zeroes a and b for a black-and-white output even
-     * when the Lab curves are off, so it is outside the node.
+     * chromiLuminanceCurve()'s black-and-white output has two arms. The cheap
+     * one runs when the Lab curves are off and colour toning is off: it only
+     * zeroes a and b and the device repeats it in the Lab-curve pass's slot.
+     * The full bwToning arm needs the Lab curves, and any colour toning takes
+     * the block past the early return, so both stay on the host.
      */
-    if (params.blackwhite.enabled) {
+    if (params.blackwhite.enabled &&
+        (params.colorToning.enabled || params.labCurve.enabled)) {
         return false;
     }
+    const bool black_white = params.blackwhite.enabled;
 
     /*
      * Vibrance runs on the device only when its parameters are inside the
@@ -481,7 +486,7 @@ bool labToolsSupported(const procparams::ProcParams& params)
             (params.colorToning.method == "LabGrid" || lab_regions)) ||
            labToolsShadowsHighlightsActive(params) ||
            labToolsLocalContrastActive(params) || vibrance ||
-           labToolsLabCurveActive(params);
+           labToolsLabCurveActive(params) || black_white;
 }
 
 
@@ -588,6 +593,18 @@ RtLabToolsContext LabToolsContext::descriptor(bool supported)
 
 int LabToolsContext::build(RtLabToolsResult& out)
 {
+    /*
+     * chromiLuminanceCurve()'s early black-and-white return is the only
+     * black-and-white arm the node ports. The predicate refuses the other
+     * arms; repeat the condition here so a direct build never exports a flag
+     * the device cannot honour.
+     */
+    if (params_.blackwhite.enabled &&
+        (params_.colorToning.enabled || params_.labCurve.enabled)) {
+        return 1;
+    }
+    black_white_ = params_.blackwhite.enabled;
+
     const bool labgrid =
         params_.colorToning.enabled &&
         params_.colorToning.method == "LabGrid";
@@ -1167,6 +1184,7 @@ int LabToolsContext::build(RtLabToolsResult& out)
         regions_active_ ? static_cast<uint32_t>(
                               RT_LAB_TOOLS_REGION_LUT_STRIDE)
                         : 0u;
+    out.black_white = black_white_ ? 1u : 0u;
     built_ = true;
     return 0;
 }
