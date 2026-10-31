@@ -391,10 +391,20 @@ __kernel void rt_lab_wavelet_equalize(
 #define RT_LW_W_B_RSL 26
 #define RT_LW_W_T_RSL 27
 #define RT_LW_W_TAPS 28
-#define RT_LW_W_FILTER_ANAL_LO 32
-#define RT_LW_W_FILTER_ANAL_HI 40
-#define RT_LW_W_FILTER_SYNTH_LO 48
-#define RT_LW_W_FILTER_SYNTH_HI 56
+#define RT_LW_W_CONTENA 29
+#define RT_LW_W_CHRO 30
+#define RT_LW_W_CHMET 31
+#define RT_LW_W_CHROMA 32
+#define RT_LW_W_SIGMACOL 33
+#define RT_LW_W_SKIN 34
+#define RT_LW_W_B_L 35
+#define RT_LW_W_T_L 36
+#define RT_LW_W_T_R 37
+#define RT_LW_W_B_R 38
+#define RT_LW_W_FILTER_ANAL_LO 48
+#define RT_LW_W_FILTER_ANAL_HI 56
+#define RT_LW_W_FILTER_SYNTH_LO 64
+#define RT_LW_W_FILTER_SYNTH_HI 72
 
 /*
  * Level 0 analysis, vertical half. One work item per output column and output
@@ -573,16 +583,17 @@ __kernel void rt_lab_wavelet_w_synth_h(
 }
 
 /*
- * Level 0 synthesis, vertical half. Writes the source L plane in place, mixes
- * the original L by the strength blend and applies the block's final
- * L <= 0 -> 1 clamp, which is the last operation the host performs on L.
+ * Level 0 synthesis, vertical half. Writes the source plane in place, mixes
+ * the original plane by the strength blend and, for L, applies the block's
+ * final L <= 0 -> 1 clamp, which is the last operation the host performs on
+ * L. The chroma planes do not clamp.
  */
 __kernel void rt_lab_wavelet_w_synth_v(
     __global const float* lo, int lo_pitch,
     __global const float* hi, int hi_pitch,
     __global float* dst, int dst_pitch,
     __global const float* filters, int taps, int offset,
-    int width, int src_h, int dst_h, float blend)
+    int width, int src_h, int dst_h, float blend, int clamp)
 {
     const int x = get_global_id(0);
     const int i = get_global_id(1);
@@ -606,7 +617,7 @@ __kernel void rt_lab_wavelet_w_synth_v(
 
     const float src_factor = 1.0f - blend;
     float result = dst[i * dst_pitch + x] * src_factor + blend * 4.0f * tot;
-    if (result <= 0.0f) {
+    if (clamp != 0 && result <= 0.0f) {
         result = 1.0f;
     }
     dst[i * dst_pitch + x] = result;
@@ -781,6 +792,12 @@ __kernel void rt_lab_wavelet_w_contrast(
     const float lowthr = params[RT_LW_W_LOWTHR];
     const int half_levels = maxlvl / 2;
 
+    /* ContAllL() skips the whole contrast multiply when Expcontrast is off;
+     * the level stays untouched. */
+    if (params[RT_LW_W_CONTENA] == 0.0f) {
+        return;
+    }
+
     const float LL100 = origL[(2 * y) * l_pitch + 2 * x] / 327.68f;
     const float LL100res = coeff0[y * coeff_pitch + x] / 327.68f;
     const float delta = fabs(LL100 - LL100res) / (float)half_levels;
@@ -911,6 +928,113 @@ __kernel void rt_lab_wavelet_w_contrast(
         }
 
         band[at] = value * kLlev;
+    }
+}
+
+/*
+ * The chroma multiply of ContAllAB() for CHmethod "link" (CHmet == 2). The
+ * arm multiplies the a/b coefficients by alphaC, gated by the level's contrast
+ * multiplier, the chroma strength and Expchroma. The betaab ramp is the same
+ * ten-step ramp as ContAllL(), fed by the a/b mea block built with sigmacol
+ * and an offset of 1. Skin protection reads the hue/chroma masks and the
+ * post-L-reconstruction L plane, exactly as the block does.
+ */
+__kernel void rt_lab_wavelet_w_chroma(
+    __global float* band1, int p1,
+    __global float* band2, int p2,
+    __global float* band3, int p3,
+    __global const float* origL, int l_pitch,
+    __global const float* hue, int hue_pitch,
+    __global const float* chrom, int chrom_pitch,
+    __global const float* params, int mea_offset,
+    int level, int w, int h, int skin)
+{
+    const int x = get_global_id(0);
+    const int y = get_global_id(1);
+    if (x >= w || y >= h) {
+        return;
+    }
+
+    const float cpMul = params[RT_LW_W_C + level];
+    const float cpChrom = params[RT_LW_W_CHRO];
+    if (cpMul == 0.0f || cpChrom == 0.0f) {
+        return;
+    }
+
+    const int base = mea_offset + level * 10;
+    const float mea0 = params[base + 0];
+    const float mea1 = params[base + 1];
+    const float mea2 = params[base + 2];
+    const float mea3 = params[base + 3];
+    const float mea4 = params[base + 4];
+    const float mea5 = params[base + 5];
+    const float mea6 = params[base + 6];
+    const float mea7 = params[base + 7];
+    const float mea8 = params[base + 8];
+    const float mea9 = params[base + 9];
+
+    const int i = y * w + x;
+
+    for (int dir = 0; dir < 3; ++dir) {
+        __global float* band =
+            dir == 0 ? band1 : (dir == 1 ? band2 : band3);
+        const int pitch = dir == 0 ? p1 : (dir == 1 ? p2 : p3);
+        const int at = y * pitch + x;
+        const float value = band[at];
+        const float wavcab = fabs(value);
+
+        float betaab;
+        if (wavcab < mea0) {
+            betaab = 0.05f;
+        } else if (wavcab < mea1) {
+            betaab = 0.2f;
+        } else if (wavcab < mea2) {
+            betaab = 0.7f;
+        } else if (wavcab < mea3) {
+            betaab = 1.0f;
+        } else if (wavcab < mea4) {
+            betaab = 1.0f;
+        } else if (wavcab < mea5) {
+            betaab = 0.8f;
+        } else if (wavcab < mea6) {
+            betaab = 0.6f;
+        } else if (wavcab < mea7) {
+            betaab = 0.4f;
+        } else if (wavcab < mea8) {
+            betaab = 0.2f;
+        } else if (wavcab < mea9) {
+            betaab = 0.1f;
+        } else {
+            betaab = 0.0f;
+        }
+
+        float scale = 1.0f;
+
+        if (skin != 0) {
+            const float skinprot = params[RT_LW_W_SKIN];
+            const float skinprotneg = -skinprot;
+            const float factorHard = 1.0f - skinprotneg / 100.0f;
+            const float LL100 =
+                origL[(2 * y) * l_pitch + 2 * x] / 327.68f;
+            const float modhue = hue[(2 * y) * hue_pitch + 2 * x];
+            const float modchro = chrom[(2 * y) * chrom_pitch + 2 * x];
+
+            if (skinprot > 0.0f) {
+                rt_lw_skin_sat(LL100, modhue, modchro, skinprot, &scale, 1,
+                               params[RT_LW_W_B_L], params[RT_LW_W_T_L],
+                               params[RT_LW_W_T_R]);
+            } else if (skinprot < 0.0f) {
+                rt_lw_skin_sat(LL100, modhue, modchro, skinprotneg, &scale,
+                               0, params[RT_LW_W_B_L],
+                               params[RT_LW_W_T_L], params[RT_LW_W_T_R]);
+                scale = (scale == 1.0f) ? factorHard : 1.0f;
+            }
+        }
+
+        const float alphaC =
+            (1024.0f + 15.0f * cpMul * cpChrom * betaab * scale / 50.0f) /
+            1024.0f;
+        band[at] = value * alphaC;
     }
 }
 )CLC";

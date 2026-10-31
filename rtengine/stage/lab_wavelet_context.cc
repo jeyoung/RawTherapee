@@ -39,9 +39,11 @@ int run_host_thunk(void* self, RtStageBuffer* lab)
     return static_cast<LabWaveletContext*>(self)->runHost(*lab);
 }
 
-int compute_mea_thunk(void* self, const float* stats, uint32_t levels)
+int compute_mea_thunk(void* self, const float* stats, uint32_t levels,
+                      uint32_t plane)
 {
-    return static_cast<LabWaveletContext*>(self)->computeMea(stats, levels);
+    return static_cast<LabWaveletContext*>(self)->computeMea(stats, levels,
+                                                            plane);
 }
 
 /*
@@ -287,10 +289,15 @@ bool labWaveletWaveletSupported(const procparams::ProcParams& params,
         return true;
     }
 
-    /* Contrast only: every other export panel is a residual. */
-    if (!wavelet.expcontrast || wavelet.expchroma || wavelet.expedge ||
-        wavelet.expbl || wavelet.expresid || wavelet.expfinal ||
-        wavelet.exptoning || wavelet.expnoise || wavelet.expclari) {
+    /*
+     * The contrast panel and the chroma panel's "link" arm are the admitted
+     * set. Every other export panel is a residual.
+     */
+    const bool contrast = wavelet.expcontrast;
+    const bool chroma = wavelet.expchroma;
+    if ((!contrast && !chroma) || wavelet.expedge || wavelet.expbl ||
+        wavelet.expresid || wavelet.expfinal || wavelet.exptoning ||
+        wavelet.expnoise || wavelet.expclari) {
         return false;
     }
     if (wavelet.CLmethod != "all" || wavelet.Tilesmethod != "full") {
@@ -299,7 +306,13 @@ bool labWaveletWaveletSupported(const procparams::ProcParams& params,
     if (wavelet.softrad != 0.0 || wavelet.softradend != 0.0) {
         return false;
     }
-    if (wavelet.skinprotect != 0.0) {
+    /*
+     * The contrast path's own skin protection is not ported. The chroma arm
+     * is different: it always uses the wavelet block's skin mask, and when
+     * the contrast panel is off no L coefficient is touched, so the two do
+     * not mix.
+     */
+    if (wavelet.skinprotect != 0.0 && !(chroma && !contrast)) {
         return false;
     }
     if (wavelet.avoid || wavelet.median) {
@@ -315,10 +328,15 @@ bool labWaveletWaveletSupported(const procparams::ProcParams& params,
     if (wavelet.HSmethod != "with" && wavelet.HSmethod != "without") {
         return false;
     }
-    /* An active chroma-by-hue curve would scale the contrast per pixel. */
+    /*
+     * A non-identity chroma-by-hue curve scales the L contrast per pixel, and
+     * a non-identity H curve switches the a/b pass to its joint arm. Neither
+     * is ported.
+     */
     {
         const FlatCurve chroma_curve(wavelet.Chcurve);
-        if (!chroma_curve.isIdentity()) {
+        const FlatCurve hue_curve(wavelet.hhcurve);
+        if (!chroma_curve.isIdentity() || !hue_curve.isIdentity()) {
             return false;
         }
     }
@@ -356,9 +374,53 @@ bool labWaveletWaveletSupported(const procparams::ProcParams& params,
             return false;
         }
     }
-    /* The scoped set leaves the finest level active; an all-zero pyramid
-     * would be a no-op dressed up as a device pass. */
-    if (wavelet.c[0] == 0) {
+    if (chroma) {
+        /* CHmethod "link" is the only arm with a simple coefficient: it
+         * multiplies the contrast c[] by chro through the betaab ramp. */
+        if (wavelet.CHmethod != "link") {
+            return false;
+        }
+        if (wavelet.chro < LAB_WAVELET_MIN_WAVELET_CHRO ||
+            wavelet.chro > LAB_WAVELET_MAX_WAVELET_CHRO) {
+            return false;
+        }
+        if (!std::isfinite(wavelet.sigmacol) ||
+            wavelet.sigmacol < LAB_WAVELET_MIN_WAVELET_SIGMACOL ||
+            wavelet.sigmacol > LAB_WAVELET_MAX_WAVELET_SIGMACOL) {
+            return false;
+        }
+        if (!std::isfinite(wavelet.skinprotect) ||
+            wavelet.skinprotect < LAB_WAVELET_MIN_SKIN ||
+            wavelet.skinprotect > LAB_WAVELET_MAX_SKIN) {
+            return false;
+        }
+        if (!hueInRange(wavelet.hueskin.getBottomLeft()) ||
+            !hueInRange(wavelet.hueskin.getTopLeft()) ||
+            !hueInRange(wavelet.hueskin.getBottomRight()) ||
+            !hueInRange(wavelet.hueskin.getTopRight())) {
+            return false;
+        }
+        /* A chroma-only profile needs both a strength and a contrast
+         * multiplier to do any work; otherwise it is a no-op dressed up as a
+         * device pass. */
+        if (!contrast) {
+            bool active = wavelet.chro != 0;
+            if (active) {
+                active = false;
+                for (int level = 0; level < 9; ++level) {
+                    if (level < wavelet.thres && wavelet.c[level] != 0) {
+                        active = true;
+                    }
+                }
+            }
+            if (!active) {
+                return false;
+            }
+        }
+    }
+    /* The scoped contrast set leaves the finest level active; an all-zero
+     * pyramid would be a no-op dressed up as a device pass. */
+    if (contrast && wavelet.c[0] == 0) {
         return false;
     }
 
@@ -573,6 +635,15 @@ LabWaveletContext::LabWaveletContext(procparams::ProcParams& params,
     b_l_ = static_cast<float>(equalizer.hueskin.getBottomLeft()) / 100.f;
     t_l_ = static_cast<float>(equalizer.hueskin.getTopLeft()) / 100.f;
     t_r_ = static_cast<float>(equalizer.hueskin.getTopRight()) / 100.f;
+
+    const procparams::WaveletParams& wavelet = params.wavelet;
+    wavelet_skinprotect_ = static_cast<float>(wavelet.skinprotect);
+    wavelet_b_l_ =
+        static_cast<float>(wavelet.hueskin.getBottomLeft()) / 100.f;
+    wavelet_t_l_ = static_cast<float>(wavelet.hueskin.getTopLeft()) / 100.f;
+    wavelet_t_r_ = static_cast<float>(wavelet.hueskin.getTopRight()) / 100.f;
+    wavelet_b_r_ =
+        static_cast<float>(wavelet.hueskin.getBottomRight()) / 100.f;
 }
 
 LabWaveletContext::~LabWaveletContext() = default;
@@ -589,12 +660,17 @@ RtLabWaveletContext LabWaveletContext::descriptor(bool supported)
     context.prepare = &prepare_thunk;
     context.run_host = &run_host_thunk;
     context.needs_scratch =
-        gamutlab_ && skinprotect_ != 0.f ? 1u : 0u;
+        levels_ > 0 && gamutlab_ && skinprotect_ != 0.f ? 1u : 0u;
     context.levels = static_cast<uint32_t>(levels_);
-    context.skinprotect = skinprotect_ != 0.f ? 1u : 0u;
+    context.skinprotect =
+        (skinprotect_ != 0.f ||
+         (wavelet_chroma_ && wavelet_skinprotect_ != 0.f))
+            ? 1u
+            : 0u;
     context.wavelet.active = wavelet_active_ ? 1u : 0u;
     context.wavelet.levels = static_cast<uint32_t>(wavelet_levels_);
     context.wavelet.taps = 8u;
+    context.wavelet.planes = wavelet_chroma_ ? 3u : 1u;
     context.wavelet.entries = static_cast<uint32_t>(
         wavelet_params_.size());
     context.wavelet.params =
@@ -611,7 +687,11 @@ int LabWaveletContext::build(RtLabWaveletResult& out)
         out.chrom = chrom_.empty() ? nullptr : chrom_.data();
         out.lut_entries = RT_LAB_WAVELET_LUT_ENTRIES;
         out.levels = static_cast<uint32_t>(levels_);
-        out.skinprotect = skinprotect_ != 0.f ? 1u : 0u;
+        out.skinprotect =
+            (skinprotect_ != 0.f ||
+             (wavelet_chroma_ && wavelet_skinprotect_ != 0.f))
+                ? 1u
+                : 0u;
         out.wavelet = wavelet_active_ ? 1u : 0u;
         out.wavelet_levels = static_cast<uint32_t>(wavelet_levels_);
         out.wavelet_entries =
@@ -631,6 +711,9 @@ int LabWaveletContext::build(RtLabWaveletResult& out)
     if (levels_ > static_cast<int>(RT_LAB_WAVELET_MAX_LEVELS)) {
         return 1;
     }
+    wavelet_chroma_ = params_.wavelet.enabled &&
+                      params_.wavelet.expchroma &&
+                      params_.wavelet.CHmethod == "link";
 
     if (levels_ > 0) {
         if (width_ < 8 || height_ < 8) {
@@ -662,13 +745,19 @@ int LabWaveletContext::build(RtLabWaveletResult& out)
                 target[index] = table[static_cast<int>(index)];
             }
         }
+    }
 
-        if (skinprotect_ != 0.f) {
-            const std::size_t pixels = static_cast<std::size_t>(width_) *
-                                       static_cast<std::size_t>(height_);
-            hue_.assign(pixels, 0.f);
-            chrom_.assign(pixels, 0.f);
-        }
+    /*
+     * The wavelet chroma arm reuses the same hue/chroma masks as the
+     * equaliser: the equaliser only changes L, so a/b are identical at the
+     * start of both passes. Allocate them when either pass needs them.
+     */
+    if (skinprotect_ != 0.f ||
+        (wavelet_chroma_ && wavelet_skinprotect_ != 0.f)) {
+        const std::size_t pixels = static_cast<std::size_t>(width_) *
+                                   static_cast<std::size_t>(height_);
+        hue_.assign(pixels, 0.f);
+        chrom_.assign(pixels, 0.f);
     }
 
     wavelet_levels_ =
@@ -687,9 +776,11 @@ int LabWaveletContext::build(RtLabWaveletResult& out)
         constexpr std::size_t params_count =
             RT_LAB_WAVELET_WAVELET_PARAMS;
         constexpr std::size_t mea_count = RT_LAB_WAVELET_MEA_ENTRIES;
+        const std::size_t planes = wavelet_chroma_ ? 3u : 1u;
         wavelet_params_.assign(
             params_count +
-                static_cast<std::size_t>(wavelet_levels_) * mea_count,
+                planes * static_cast<std::size_t>(wavelet_levels_) *
+                    mea_count,
             0.f);
 
         float* table = wavelet_params_.data();
@@ -738,6 +829,19 @@ int LabWaveletContext::build(RtLabWaveletResult& out)
             static_cast<float>(wavelet.bllev.getBottomRight());
         table[RT_LW_PARAM_T_RSL] =
             static_cast<float>(wavelet.bllev.getTopRight());
+        table[RT_LW_PARAM_CONTENA] = wavelet.expcontrast ? 1.f : 0.f;
+        table[RT_LW_PARAM_CHRO] = static_cast<float>(wavelet.chro);
+        table[RT_LW_PARAM_CHMET] =
+            wavelet.CHmethod == "link"
+                ? 2.f
+                : (wavelet.CHmethod == "with" ? 1.f : 0.f);
+        table[RT_LW_PARAM_CHROMA] = wavelet_chroma_ ? 1.f : 0.f;
+        table[RT_LW_PARAM_SIGMACOL] = fold(wavelet.sigmacol);
+        table[RT_LW_PARAM_W_SKIN] = wavelet_skinprotect_;
+        table[RT_LW_PARAM_W_B_L] = wavelet_b_l_;
+        table[RT_LW_PARAM_W_T_L] = wavelet_t_l_;
+        table[RT_LW_PARAM_W_T_R] = wavelet_t_r_;
+        table[RT_LW_PARAM_W_B_R] = wavelet_b_r_;
         constexpr int taps = 8;
         table[RT_LW_PARAM_TAPS] = static_cast<float>(taps);
         for (int index = 0; index < taps; ++index) {
@@ -755,9 +859,11 @@ int LabWaveletContext::build(RtLabWaveletResult& out)
     return 0;
 }
 
-int LabWaveletContext::computeMea(const float* stats, uint32_t levels)
+int LabWaveletContext::computeMea(const float* stats, uint32_t levels,
+                                  uint32_t plane)
 {
-    if (!wavelet_active_ || stats == nullptr ||
+    const uint32_t planes = wavelet_chroma_ ? 3u : 1u;
+    if (!wavelet_active_ || stats == nullptr || plane >= planes ||
         levels != static_cast<uint32_t>(wavelet_levels_) ||
         levels < 1 ||
         levels > RT_LAB_WAVELET_MAX_TRANSFORM_LEVELS) {
@@ -766,9 +872,17 @@ int LabWaveletContext::computeMea(const float* stats, uint32_t levels)
 
     float mean[RT_LAB_WAVELET_MAX_TRANSFORM_LEVELS] = {};
     float sigma[RT_LAB_WAVELET_MAX_TRANSFORM_LEVELS] = {};
-    const float effect = static_cast<float>(params_.wavelet.sigma);
-    const float offs = static_cast<float>(params_.wavelet.offset);
-    float* mea = wavelet_params_.data() + RT_LAB_WAVELET_WAVELET_PARAMS;
+    /* ContAllL() uses sigma/offset on L; ContAllAB() uses sigmacol with an
+     * offset of 1 on a and b. */
+    const float effect =
+        plane == 0 ? static_cast<float>(params_.wavelet.sigma)
+                   : static_cast<float>(params_.wavelet.sigmacol);
+    const float offs =
+        plane == 0 ? static_cast<float>(params_.wavelet.offset) : 1.f;
+    float* mea = wavelet_params_.data() + RT_LAB_WAVELET_WAVELET_PARAMS +
+                 static_cast<std::size_t>(plane) *
+                     static_cast<std::size_t>(levels) *
+                     RT_LAB_WAVELET_MEA_ENTRIES;
 
     for (uint32_t level = 0; level < levels; ++level) {
         float averagePlus[4] = {};
@@ -804,8 +918,10 @@ int LabWaveletContext::computeMea(const float* stats, uint32_t levels)
 
 int LabWaveletContext::prepare(RtStageBuffer& lab)
 {
-    if (skinprotect_ == 0.f) {
-        /* The gamutlab pre-pass only runs together with skin protection. */
+    const bool need_masks =
+        skinprotect_ != 0.f ||
+        (wavelet_chroma_ && wavelet_skinprotect_ != 0.f);
+    if (!need_masks) {
         return 0;
     }
     if (lab.width != width_ || lab.height != height_ ||
@@ -816,7 +932,10 @@ int LabWaveletContext::prepare(RtStageBuffer& lab)
     LabImage image(width_, height_);
     copy_to_host(lab, image);
 
-    if (gamutlab_) {
+    /* The block's gamutlab pre-pass: dirpyrequalizer() runs it only when the
+     * equaliser is enabled with both gamutlab and its own skin protection. */
+    const bool repaired = levels_ > 0 && gamutlab_ && skinprotect_ != 0.f;
+    if (repaired) {
         const double artifact = 4.0;
         const double radius = artifact / RT_LAB_WAVELET_EXPORT_SCALE;
         ipf_.BadpixelsLab(&image, radius, 5, 50.f);
@@ -833,7 +952,7 @@ int LabWaveletContext::prepare(RtStageBuffer& lab)
     dirpyrHueChroma(image.a, image.b, hue_rows.data(), chrom_rows.data(),
                     width_, height_);
 
-    if (gamutlab_) {
+    if (repaired) {
         copy_from_host(image, lab);
     }
     return 0;

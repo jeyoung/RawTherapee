@@ -43,19 +43,21 @@ struct ProcParams;
  * here is passed to a kernel. The context builds the equaliser's per-level
  * range tables through its own fillLut(), runs the hue/chroma precompute
  * through the equaliser's own SSE-aware code, and builds the wavelet tool's
- * contrast-only parameter table: the level count, the scalars, the 8-tap
- * filters and, after the device statistics read back, one mea block per level
- * through the block's own calceffect(). It can also run the original host
- * block for a residual.
+ * parameter table: the level count, the scalars, the 8-tap filters and, after
+ * the device statistics read back, one mea block per plane and level through
+ * the block's own calceffect(). It can also run the original host block for a
+ * residual.
  *
  * Gamutlab protection is a host pre-pass: the block calls BadpixelsLab()
  * before the equaliser when gamutlab is set and skin protection is non-zero.
  * That pass is a separable Gaussian analysis with host-specific SSE rounding,
  * so the device launcher runs it on a host copy and uploads the result rather
  * than approximating it. The prepared copy is what the hue/chroma masks are
- * built from, in the same order as the block.
+ * built from, in the same order as the block. The same masks serve the
+ * wavelet tool's own skin protection: the equaliser only changes L, so a/b
+ * and their masks are identical at the start of both passes.
  */
-#define RT_LAB_WAVELET_CONTEXT_VERSION 2u
+#define RT_LAB_WAVELET_CONTEXT_VERSION 3u
 /* "LWCT": rejects a stale or unrelated pointer before any callback runs. */
 #define RT_LAB_WAVELET_CONTEXT_MAGIC 0x4C574354u
 /* The number of levels of the directional pyramid. */
@@ -65,11 +67,12 @@ struct ProcParams;
 /*
  * The wavelet parameter table. The host builds one flat float block per
  * submission: the scalars below, then the 8-tap analysis and synthesis
- * filters, then one RT_LAB_WAVELET_MEA_ENTRIES-entry block per level filled by
- * compute_mea() after the device statistics have been read back. The device
+ * filters, then one RT_LAB_WAVELET_MEA_ENTRIES-entry block per (plane, level)
+ * filled by compute_mea() after the device statistics have been read back.
+ * Plane 0 is L, planes 1 and 2 are the chroma pass's a and b. The device
  * never re-derives a filter, a threshold or a range.
  */
-#define RT_LAB_WAVELET_WAVELET_PARAMS 64u
+#define RT_LAB_WAVELET_WAVELET_PARAMS 80u
 #define RT_LAB_WAVELET_MEA_ENTRIES 10u
 /* One block of raw statistics per (level, direction) band. */
 #define RT_LAB_WAVELET_STATS_PER_BAND 6u
@@ -95,11 +98,22 @@ struct ProcParams;
 #define RT_LW_PARAM_B_RSL 26
 #define RT_LW_PARAM_T_RSL 27
 #define RT_LW_PARAM_TAPS 28
-/* Slots 32..63 hold Daubechies analysis lo/hi and synthesis lo/hi. */
-#define RT_LW_PARAM_FILTER_ANAL_LO 32
-#define RT_LW_PARAM_FILTER_ANAL_HI 40
-#define RT_LW_PARAM_FILTER_SYNTH_LO 48
-#define RT_LW_PARAM_FILTER_SYNTH_HI 56
+/* The wavelet tool's other panels and the chroma arm's scalars. */
+#define RT_LW_PARAM_CONTENA 29
+#define RT_LW_PARAM_CHRO 30
+#define RT_LW_PARAM_CHMET 31
+#define RT_LW_PARAM_CHROMA 32
+#define RT_LW_PARAM_SIGMACOL 33
+#define RT_LW_PARAM_W_SKIN 34
+#define RT_LW_PARAM_W_B_L 35
+#define RT_LW_PARAM_W_T_L 36
+#define RT_LW_PARAM_W_T_R 37
+#define RT_LW_PARAM_W_B_R 38
+/* Slots 48..79 hold Daubechies analysis lo/hi and synthesis lo/hi. */
+#define RT_LW_PARAM_FILTER_ANAL_LO 48
+#define RT_LW_PARAM_FILTER_ANAL_HI 56
+#define RT_LW_PARAM_FILTER_SYNTH_LO 64
+#define RT_LW_PARAM_FILTER_SYNTH_HI 72
 /*
  * One range table per level: 0x20000 entries covering hipass + 0x10000, the
  * LUT size dirpyr_equalizer.cc's fillLut() writes and idirpyr_eq_channel()
@@ -123,8 +137,8 @@ typedef struct RtLabWaveletResult {
     /*
      * The wavelet pass. `wavelet` is 1 when the device runs it. `params`
      * carries wavelet_entries floats: the scalar/filter table followed by the
-     * per-level mea blocks that compute_mea() fills after the statistics
-     * readback.
+     * per-(plane, level) mea blocks that compute_mea() fills after the
+     * statistics readback.
      */
     uint32_t wavelet;
     uint32_t wavelet_levels;
@@ -135,18 +149,22 @@ typedef struct RtLabWaveletResult {
 /*
  * The wavelet sub-structure of the context. The launcher reads it to size the
  * transform, the statistics pass and the contrast pass; the host owns every
- * value. compute_mea() is called with the device statistics block
+ * value. compute_mea() is called with one plane's device statistics block
  * (RT_LAB_WAVELET_STATS_PER_BAND floats per (level, direction), level-major,
- * direction 1..3) and fills the mea tail of `params`.
+ * direction 1..3) and fills that plane's mea tail of `params`. Plane 0 is L;
+ * planes 1 and 2 are a and b and exist only when the chroma arm is active.
  */
 typedef struct RtLabWaveletWavelet {
-    /* 1 when the call site admits the wavelet contrast pass on the device. */
+    /* 1 when the call site admits the wavelet pass on the device. */
     uint32_t active;
     uint32_t levels;
     uint32_t taps;
     uint32_t entries;
+    /* 1 for contrast only, 3 when the chroma arm also runs. */
+    uint32_t planes;
     float* params;
-    int (*compute_mea)(void* self, const float* stats, uint32_t levels);
+    int (*compute_mea)(void* self, const float* stats, uint32_t levels,
+                       uint32_t plane);
 } RtLabWaveletWavelet;
 
 typedef struct RtLabWaveletContext {
@@ -214,6 +232,11 @@ inline constexpr int LAB_WAVELET_MIN_STRENGTH = 0;
 inline constexpr int LAB_WAVELET_MAX_STRENGTH = 100;
 inline constexpr double LAB_WAVELET_MIN_WAVELET_THREND = 0.0;
 inline constexpr double LAB_WAVELET_MAX_WAVELET_THREND = 100.0;
+/* The chroma panel's strength and its contrast-modulation sigma. */
+inline constexpr int LAB_WAVELET_MIN_WAVELET_CHRO = 0;
+inline constexpr int LAB_WAVELET_MAX_WAVELET_CHRO = 100;
+inline constexpr double LAB_WAVELET_MIN_WAVELET_SIGMACOL = 0.025;
+inline constexpr double LAB_WAVELET_MAX_WAVELET_SIGMACOL = 2.5;
 
 /* The block's `scale` argument at every export call site. The equaliser's
  * BadpixelsLab() radius is 4 / scale, and the launcher requires this value. */
@@ -236,13 +259,14 @@ int labWaveletTransformLevels(const procparams::ProcParams& params,
                               int width, int height);
 
 /*
- * Whether the wavelet contrast pass is the node's supported set: contrast
- * only, no chroma, edge, residual, final, toning, noise, clarity or blur
- * panel, the "all" level method, full-tile processing, no soft radius, skin
- * protection, avoid-colour-shift or blue-sky median, no extra level, the
- * default 8-tap Daubechies, a highlight/shadow method the block implements,
- * an identity chroma-by-hue curve, every scalar in range and an image large
- * enough for the undecimated Haar bands.
+ * Whether the wavelet pass is the node's supported set: the contrast panel
+ * and the chroma panel's "link" arm, no edge, residual, final, toning, noise,
+ * clarity or blur panel, the "all" level method, full-tile processing, no
+ * soft radius, no L contrast skin protection, no avoid-colour-shift or
+ * blue-sky median, no extra level, the default 8-tap Daubechies, a
+ * highlight/shadow method the block implements, identity chroma-by-hue and
+ * hue curves, every scalar in range and an image large enough for the
+ * undecimated Haar bands.
  */
 bool labWaveletWaveletSupported(const procparams::ProcParams& params,
                                 int width, int height);
@@ -294,8 +318,8 @@ public:
 
     int runHost(RtStageBuffer& lab);
 
-    /* Fill the per-level mea blocks from the device statistics block. */
-    int computeMea(const float* stats, uint32_t levels);
+    /* Fill one plane's per-level mea blocks from its statistics block. */
+    int computeMea(const float* stats, uint32_t levels, uint32_t plane);
 
 private:
     procparams::ProcParams& params_;
@@ -316,7 +340,13 @@ private:
     std::vector<float> chrom_;
 
     bool wavelet_active_ = false;
+    bool wavelet_chroma_ = false;
     int wavelet_levels_ = 0;
+    float wavelet_skinprotect_ = 0.f;
+    float wavelet_b_l_ = 0.f;
+    float wavelet_t_l_ = 0.f;
+    float wavelet_t_r_ = 0.f;
+    float wavelet_b_r_ = 0.f;
     std::vector<float> wavelet_params_;
 };
 

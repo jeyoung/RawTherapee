@@ -5816,8 +5816,8 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
 
 /*
  * The lab.wavelet node. Argument order:
- *   [0] Lab three-plane F32 buffer, read and written in place (only L changes
- *       unless the gamutlab pre-pass also repairs a and b),
+ *   [0] Lab three-plane F32 buffer, read and written in place (L, plus a and b
+ *       when the chroma arm runs),
  *   [1] PTR host context (RtLabWaveletContext), host-only,
  *   [2] int support flag, mirrored from the context descriptor,
  *   [3..8] doubles mult[0..5] (level 0 is the finest),
@@ -5832,7 +5832,9 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
  * BadpixelsLab() pre-pass and the hue/chroma masks on a private copy, then
  * the device decomposes levels 0..levels-1 and reconstructs from the coarsest
  * level down to 0. The last reconstruction level writes the source L plane,
- * which is the block's final copy.
+ * which is the block's final copy. When the chroma arm runs, the same
+ * transform is then run for a and then b, with ContAllAB()'s coefficient in
+ * place of ContAllL()'s, and the L clamp is applied after both.
  *
  * A clear support flag refuses before the upload: that is the residual path,
  * and it makes the CPU builtin - the extracted host block - execute and record
@@ -6005,39 +6007,34 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
         }
     }
 
-    const bool skin = levels > 0 && skinprotect != 0.0;
     const RtStageBuffer& hue = args[18].u.buffer;
     const RtStageBuffer& chrom = args[19].u.buffer;
-    if (skin) {
-        for (const RtStageBuffer* mask : {&hue, &chrom}) {
-            if (!valid(*mask) || mask->format != RT_STAGE_F32 ||
-                mask->planes != 1 || mask->height != height ||
-                mask->width != width) {
-                error = "lab.wavelet needs two hue/chroma masks";
-                return RT_STAGE_INVALID;
-            }
-        }
-    }
 
     const RtStageBuffer& wavelet_params_buffer = args[21].u.buffer;
     int wavelet_levels = 0;
     int wavelet_entries = 0;
+    int wavelet_planes = 1;
+    bool wavelet_chroma = false;
+    bool wavelet_skin = false;
     const float* wavelet_params = nullptr;
     if (wavelet) {
         if (context->wavelet.active != 1 ||
             context->wavelet.compute_mea == nullptr ||
             context->wavelet.params == nullptr ||
-            context->wavelet.taps != 8) {
+            context->wavelet.taps != 8 ||
+            (context->wavelet.planes != 1 &&
+             context->wavelet.planes != 3)) {
             error = "lab.wavelet wavelet pass is not set up";
             return RT_STAGE_FALLBACK;
         }
         wavelet_levels = static_cast<int>(context->wavelet.levels);
         wavelet_entries = static_cast<int>(context->wavelet.entries);
+        wavelet_planes = static_cast<int>(context->wavelet.planes);
         if (wavelet_levels < 1 ||
             wavelet_levels >
                 static_cast<int>(RT_LAB_WAVELET_MAX_TRANSFORM_LEVELS) ||
             wavelet_entries != static_cast<int>(RT_LAB_WAVELET_WAVELET_PARAMS) +
-                                   wavelet_levels *
+                                   wavelet_planes * wavelet_levels *
                                        static_cast<int>(
                                            RT_LAB_WAVELET_MEA_ENTRIES)) {
             error = "lab.wavelet wavelet level count is outside its range";
@@ -6060,6 +6057,14 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
             error = "lab.wavelet parameter table disagrees with its context";
             return RT_STAGE_INVALID;
         }
+        wavelet_chroma =
+            wavelet_params[RT_LW_PARAM_CHROMA] != 0.0f &&
+            static_cast<int>(wavelet_params[RT_LW_PARAM_CHMET]) == 2;
+        wavelet_skin = wavelet_params[RT_LW_PARAM_W_SKIN] != 0.0f;
+        if (wavelet_planes != (wavelet_chroma ? 3 : 1)) {
+            error = "lab.wavelet plane count disagrees with its table";
+            return RT_STAGE_INVALID;
+        }
 
         /*
          * The Haar border leaves the rows and columns in
@@ -6073,6 +6078,24 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
             if (half_w < reach || half_h < reach) {
                 error = "lab.wavelet image is too small for its wavelet bands";
                 return RT_STAGE_FALLBACK;
+            }
+        }
+    }
+
+    /*
+     * The equaliser's skin protection is its own flag; the wavelet chroma
+     * arm's is separate. They share one pair of masks because the equaliser
+     * only changes L, so a/b are identical at the start of both passes.
+     */
+    const bool equalizer_skin = levels > 0 && skinprotect != 0.0;
+    const bool masks = equalizer_skin || wavelet_skin;
+    if (masks) {
+        for (const RtStageBuffer* mask : {&hue, &chrom}) {
+            if (!valid(*mask) || mask->format != RT_STAGE_F32 ||
+                mask->planes != 1 || mask->height != height ||
+                mask->width != width) {
+                error = "lab.wavelet needs two hue/chroma masks";
+                return RT_STAGE_INVALID;
             }
         }
     }
@@ -6113,7 +6136,7 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
      */
     std::vector<float> scratch;
     RtStageBuffer prepared = lab;
-    if (levels > 0) {
+    if (levels > 0 || masks) {
         if (context->needs_scratch != 0) {
             const std::size_t pixels = static_cast<std::size_t>(width) *
                                        static_cast<std::size_t>(height);
@@ -6143,12 +6166,14 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
         }
     }
 
-    /* The L plane is the only input both passes read. */
+    /* The L plane is the only input the equaliser and L contrast read. */
     char l_key = 0;
     char pyramid_keys[RT_LAB_WAVELET_MAX_LEVELS] = {};
     char lut_key = 0;
     char hue_key = 0;
     char chrom_key = 0;
+    char plane_a_key = 0;
+    char plane_b_key = 0;
     const StageBufferShape plane_shape{RT_STAGE_F32, width, height, 1};
     const StageBufferShape lut_shape{
         RT_STAGE_F32,
@@ -6172,9 +6197,17 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
     }
     StageDeviceBufferPtr hue_device;
     StageDeviceBufferPtr chrom_device;
-    if (skin) {
+    if (masks) {
         hue_device = residency->acquire(&hue_key, plane_shape, &error);
         chrom_device = residency->acquire(&chrom_key, plane_shape, &error);
+    }
+    StageDeviceBufferPtr plane_a_device;
+    StageDeviceBufferPtr plane_b_device;
+    if (wavelet_chroma) {
+        plane_a_device =
+            residency->acquire(&plane_a_key, plane_shape, &error);
+        plane_b_device =
+            residency->acquire(&plane_b_key, plane_shape, &error);
     }
 
     /*
@@ -6240,8 +6273,11 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
             acquired = acquired && pyramid[level] != nullptr;
         }
     }
-    if (skin) {
+    if (masks) {
         acquired = acquired && hue_device && chrom_device;
+    }
+    if (wavelet_chroma) {
+        acquired = acquired && plane_a_device && plane_b_device;
     }
     if (!acquired || (wavelet && !wavelet_acquired)) {
         return RT_STAGE_FALLBACK;
@@ -6249,9 +6285,14 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
 
     if (residency->upload(l_device, plane_view(prepared, 0)) != RT_STAGE_OK ||
         (levels > 0 && residency->upload(lut_device, luts) != RT_STAGE_OK) ||
-        (skin &&
+        (masks &&
          (residency->upload(hue_device, hue) != RT_STAGE_OK ||
-          residency->upload(chrom_device, chrom) != RT_STAGE_OK))) {
+          residency->upload(chrom_device, chrom) != RT_STAGE_OK)) ||
+        (wavelet_chroma &&
+         (residency->upload(plane_a_device, plane_view(prepared, 1)) !=
+              RT_STAGE_OK ||
+          residency->upload(plane_b_device, plane_view(prepared, 2)) !=
+              RT_STAGE_OK))) {
         error = "lab.wavelet setup upload failed";
         return RT_STAGE_FALLBACK;
     }
@@ -6332,9 +6373,9 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
         pyramid_pitch[level] = pitch_of(pyramid[level]);
     }
     const cl_mem lut_memory = levels > 0 ? memory_of(lut_device) : l_memory;
-    const cl_mem hue_memory = skin ? memory_of(hue_device) : l_memory;
-    const cl_mem chrom_memory = skin ? memory_of(chrom_device) : l_memory;
-    const cl_int mask_pitch = skin ? pitch_of(hue_device) : 0;
+    const cl_mem hue_memory = masks ? memory_of(hue_device) : l_memory;
+    const cl_mem chrom_memory = masks ? memory_of(chrom_device) : l_memory;
+    const cl_int mask_pitch = masks ? pitch_of(hue_device) : 0;
 
     /* dirpyr_channel(), finest level first. */
     for (int level = 0; level < levels; ++level) {
@@ -6371,7 +6412,7 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
      */
     const int buffer_level = levels - 1;
     const double skinprotect_value = skinprotect;
-    const cl_int cl_skin = skin ? 1 : 0;
+    const cl_int cl_skin = equalizer_skin ? 1 : 0;
     const cl_float cl_skinprotect = static_cast<cl_float>(skinprotect_value);
     const cl_float cl_b_l = static_cast<cl_float>(b_l);
     const cl_float cl_t_l = static_cast<cl_float>(t_l);
@@ -6445,11 +6486,13 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
             env, def, "rt_lab_wavelet_w_stats", error);
         cl_kernel contrast_kernel = compiled_kernel_entry(
             env, def, "rt_lab_wavelet_w_contrast", error);
+        cl_kernel chroma_kernel = compiled_kernel_entry(
+            env, def, "rt_lab_wavelet_w_chroma", error);
         if (analysis_v == nullptr || analysis_h == nullptr ||
             haar_v == nullptr || haar_h == nullptr || synth_h == nullptr ||
             synth_v == nullptr || haar_synth_h == nullptr ||
             haar_synth_v == nullptr || stats_kernel == nullptr ||
-            contrast_kernel == nullptr) {
+            contrast_kernel == nullptr || chroma_kernel == nullptr) {
             return RT_STAGE_FALLBACK;
         }
 
@@ -6473,117 +6516,22 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
         const auto tmp_hi = memory_of(wavelet_tmp[1]);
         const cl_int tmp_lo_pitch = pitch_of(wavelet_tmp[0]);
         const cl_int tmp_hi_pitch = pitch_of(wavelet_tmp[1]);
+        const cl_int cl_mea_offset = static_cast<cl_int>(
+            RT_LAB_WAVELET_WAVELET_PARAMS);
+        const cl_int cl_strength_index = static_cast<cl_int>(
+            RT_LW_PARAM_STRENGTH);
+        const float blend = wavelet_params[cl_strength_index];
+        const cl_float cl_blend = blend;
+        const cl_int cl_wav_skin = wavelet_skin ? 1 : 0;
+        const cl_mem plane_a_memory =
+            wavelet_chroma ? memory_of(plane_a_device) : l_memory;
+        const cl_int plane_a_pitch =
+            wavelet_chroma ? pitch_of(plane_a_device) : 0;
+        const cl_mem plane_b_memory =
+            wavelet_chroma ? memory_of(plane_b_device) : l_memory;
+        const cl_int plane_b_pitch =
+            wavelet_chroma ? pitch_of(plane_b_device) : 0;
 
-        /* Level 0: the decimated 8-tap Daubechies analysis. */
-        {
-            bool ok = true;
-            ok = ok && set_arg(analysis_v, 0, sizeof(cl_mem), &l_memory);
-            ok = ok && set_arg(analysis_v, 1, sizeof(cl_int), &l_pitch);
-            ok = ok && set_arg(analysis_v, 2, sizeof(cl_int), &cl_height);
-            ok = ok && set_arg(analysis_v, 3, sizeof(cl_mem), &tmp_lo);
-            ok = ok && set_arg(analysis_v, 4, sizeof(cl_int), &tmp_lo_pitch);
-            ok = ok && set_arg(analysis_v, 5, sizeof(cl_mem), &tmp_hi);
-            ok = ok && set_arg(analysis_v, 6, sizeof(cl_int), &tmp_hi_pitch);
-            ok = ok && set_arg(analysis_v, 7, sizeof(cl_mem), &params_memory);
-            ok = ok && set_arg(analysis_v, 8, sizeof(cl_int), &cl_taps);
-            ok = ok && set_arg(analysis_v, 9, sizeof(cl_int), &cl_offset);
-            ok = ok && set_arg(analysis_v, 10, sizeof(cl_int), &cl_width);
-            ok = ok && set_arg(analysis_v, 11, sizeof(cl_int), &cl_half_h);
-            if (!ok || !launch(analysis_v, full_global,
-                               "lab.wavelet analysis vertical")) {
-                error = "lab.wavelet analysis vertical arguments failed";
-                return RT_STAGE_FALLBACK;
-            }
-        }
-        {
-            cl_mem low_memory = memory_of(wavelet_low[0]);
-            cl_int low_pitch = pitch_of(wavelet_low[0]);
-            cl_mem band1 = memory_of(bands[0][0]);
-            cl_mem band2 = memory_of(bands[0][1]);
-            cl_mem band3 = memory_of(bands[0][2]);
-            cl_int bp1 = pitch_of(bands[0][0]);
-            cl_int bp2 = pitch_of(bands[0][1]);
-            cl_int bp3 = pitch_of(bands[0][2]);
-            bool ok = true;
-            ok = ok && set_arg(analysis_h, 0, sizeof(cl_mem), &tmp_lo);
-            ok = ok && set_arg(analysis_h, 1, sizeof(cl_int), &tmp_lo_pitch);
-            ok = ok && set_arg(analysis_h, 2, sizeof(cl_mem), &tmp_hi);
-            ok = ok && set_arg(analysis_h, 3, sizeof(cl_int), &tmp_hi_pitch);
-            ok = ok && set_arg(analysis_h, 4, sizeof(cl_mem), &low_memory);
-            ok = ok && set_arg(analysis_h, 5, sizeof(cl_int), &low_pitch);
-            ok = ok && set_arg(analysis_h, 6, sizeof(cl_mem), &band1);
-            ok = ok && set_arg(analysis_h, 7, sizeof(cl_int), &bp1);
-            ok = ok && set_arg(analysis_h, 8, sizeof(cl_mem), &band2);
-            ok = ok && set_arg(analysis_h, 9, sizeof(cl_int), &bp2);
-            ok = ok && set_arg(analysis_h, 10, sizeof(cl_mem), &band3);
-            ok = ok && set_arg(analysis_h, 11, sizeof(cl_int), &bp3);
-            ok = ok && set_arg(analysis_h, 12, sizeof(cl_mem), &params_memory);
-            ok = ok && set_arg(analysis_h, 13, sizeof(cl_int), &cl_taps);
-            ok = ok && set_arg(analysis_h, 14, sizeof(cl_int), &cl_offset);
-            ok = ok && set_arg(analysis_h, 15, sizeof(cl_int), &cl_width);
-            ok = ok && set_arg(analysis_h, 16, sizeof(cl_int), &cl_half_w);
-            ok = ok && set_arg(analysis_h, 17, sizeof(cl_int), &cl_half_h);
-            if (!ok || !launch(analysis_h, half_global,
-                               "lab.wavelet analysis horizontal")) {
-                error = "lab.wavelet analysis horizontal arguments failed";
-                return RT_STAGE_FALLBACK;
-            }
-        }
-
-        /* Levels 1..levels-1: the undecimated Haar analysis. */
-        for (int level = 1; level < wavelet_levels; ++level) {
-            const int skip = 1 << (level - 1);
-            cl_mem src = memory_of(wavelet_low[(level - 1) % 2]);
-            cl_int src_pitch = pitch_of(wavelet_low[(level - 1) % 2]);
-            cl_int cl_skip = skip;
-            bool ok = true;
-            ok = ok && set_arg(haar_v, 0, sizeof(cl_mem), &src);
-            ok = ok && set_arg(haar_v, 1, sizeof(cl_int), &src_pitch);
-            ok = ok && set_arg(haar_v, 2, sizeof(cl_int), &cl_half_w);
-            ok = ok && set_arg(haar_v, 3, sizeof(cl_int), &cl_half_h);
-            ok = ok && set_arg(haar_v, 4, sizeof(cl_int), &cl_skip);
-            ok = ok && set_arg(haar_v, 5, sizeof(cl_mem), &tmp_lo);
-            ok = ok && set_arg(haar_v, 6, sizeof(cl_int), &tmp_lo_pitch);
-            ok = ok && set_arg(haar_v, 7, sizeof(cl_mem), &tmp_hi);
-            ok = ok && set_arg(haar_v, 8, sizeof(cl_int), &tmp_hi_pitch);
-            if (!ok || !launch(haar_v, band_global,
-                               "lab.wavelet haar vertical")) {
-                error = "lab.wavelet haar vertical arguments failed";
-                return RT_STAGE_FALLBACK;
-            }
-
-            cl_mem low_memory = memory_of(wavelet_low[level % 2]);
-            cl_int low_pitch = pitch_of(wavelet_low[level % 2]);
-            cl_mem band1 = memory_of(bands[level][0]);
-            cl_mem band2 = memory_of(bands[level][1]);
-            cl_mem band3 = memory_of(bands[level][2]);
-            cl_int bp1 = pitch_of(bands[level][0]);
-            cl_int bp2 = pitch_of(bands[level][1]);
-            cl_int bp3 = pitch_of(bands[level][2]);
-            ok = true;
-            ok = ok && set_arg(haar_h, 0, sizeof(cl_mem), &tmp_lo);
-            ok = ok && set_arg(haar_h, 1, sizeof(cl_int), &tmp_lo_pitch);
-            ok = ok && set_arg(haar_h, 2, sizeof(cl_mem), &tmp_hi);
-            ok = ok && set_arg(haar_h, 3, sizeof(cl_int), &tmp_hi_pitch);
-            ok = ok && set_arg(haar_h, 4, sizeof(cl_mem), &low_memory);
-            ok = ok && set_arg(haar_h, 5, sizeof(cl_int), &low_pitch);
-            ok = ok && set_arg(haar_h, 6, sizeof(cl_mem), &band1);
-            ok = ok && set_arg(haar_h, 7, sizeof(cl_int), &bp1);
-            ok = ok && set_arg(haar_h, 8, sizeof(cl_mem), &band2);
-            ok = ok && set_arg(haar_h, 9, sizeof(cl_int), &bp2);
-            ok = ok && set_arg(haar_h, 10, sizeof(cl_mem), &band3);
-            ok = ok && set_arg(haar_h, 11, sizeof(cl_int), &bp3);
-            ok = ok && set_arg(haar_h, 12, sizeof(cl_int), &cl_half_w);
-            ok = ok && set_arg(haar_h, 13, sizeof(cl_int), &cl_half_h);
-            ok = ok && set_arg(haar_h, 14, sizeof(cl_int), &cl_skip);
-            if (!ok || !launch(haar_h, band_global,
-                               "lab.wavelet haar horizontal")) {
-                error = "lab.wavelet haar horizontal arguments failed";
-                return RT_STAGE_FALLBACK;
-            }
-        }
-
-        /* Per-band statistics, one work item per band. */
         std::vector<float> stats_host(
             static_cast<std::size_t>(wavelet_levels) * 3 *
                 RT_LAB_WAVELET_STATS_PER_BAND,
@@ -6599,207 +6547,436 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
         stats_view.format = RT_STAGE_F32;
         stats_view.flags = RT_STAGE_BUFFER_READ;
         const cl_mem stats_memory = memory_of(stats_device);
-        for (int level = 0; level < wavelet_levels; ++level) {
-            cl_mem band1 = memory_of(bands[level][0]);
-            cl_mem band2 = memory_of(bands[level][1]);
-            cl_mem band3 = memory_of(bands[level][2]);
-            cl_int bp1 = pitch_of(bands[level][0]);
-            cl_int bp2 = pitch_of(bands[level][1]);
-            cl_int bp3 = pitch_of(bands[level][2]);
-            cl_int cl_bands = 3;
-            bool ok = true;
-            ok = ok && set_arg(stats_kernel, 0, sizeof(cl_mem), &band1);
-            ok = ok && set_arg(stats_kernel, 1, sizeof(cl_int), &bp1);
-            ok = ok && set_arg(stats_kernel, 2, sizeof(cl_mem), &band2);
-            ok = ok && set_arg(stats_kernel, 3, sizeof(cl_int), &bp2);
-            ok = ok && set_arg(stats_kernel, 4, sizeof(cl_mem), &band3);
-            ok = ok && set_arg(stats_kernel, 5, sizeof(cl_int), &bp3);
-            cl_int stats_offset = level * 3 * static_cast<int>(
-                                                    RT_LAB_WAVELET_STATS_PER_BAND);
-            ok = ok && set_arg(stats_kernel, 6, sizeof(cl_mem),
-                               &stats_memory);
-            ok = ok && set_arg(stats_kernel, 7, sizeof(cl_int), &stats_offset);
-            ok = ok && set_arg(stats_kernel, 8, sizeof(cl_int), &cl_half_w);
-            ok = ok && set_arg(stats_kernel, 9, sizeof(cl_int), &cl_half_h);
-            ok = ok && set_arg(stats_kernel, 10, sizeof(cl_int), &cl_bands);
-            if (!ok || !launch(stats_kernel, stats_global,
-                               "lab.wavelet statistics")) {
-                error = "lab.wavelet statistics arguments failed";
-                return RT_STAGE_FALLBACK;
+
+        /*
+         * One full transform of one plane, in the block's order: forward
+         * analysis, per-band statistics, mea build, the level multiply, then
+         * the reconstruction. Plane 0 is L and uses ContAllL()'s contrast
+         * kernel; planes 1 and 2 are a and b and use ContAllAB()'s chroma
+         * kernel. The band, low-pass and temporary buffers are reused between
+         * planes because each plane finishes before the next starts.
+         */
+        auto run_plane = [&](cl_mem plane_memory, cl_int plane_pitch,
+                             uint32_t plane_index) -> bool {
+            /* Level 0: the decimated 8-tap Daubechies analysis. */
+            {
+                bool ok = true;
+                ok = ok && set_arg(analysis_v, 0, sizeof(cl_mem),
+                                   &plane_memory);
+                ok = ok && set_arg(analysis_v, 1, sizeof(cl_int),
+                                   &plane_pitch);
+                ok = ok && set_arg(analysis_v, 2, sizeof(cl_int), &cl_height);
+                ok = ok && set_arg(analysis_v, 3, sizeof(cl_mem), &tmp_lo);
+                ok = ok && set_arg(analysis_v, 4, sizeof(cl_int),
+                                   &tmp_lo_pitch);
+                ok = ok && set_arg(analysis_v, 5, sizeof(cl_mem), &tmp_hi);
+                ok = ok && set_arg(analysis_v, 6, sizeof(cl_int),
+                                   &tmp_hi_pitch);
+                ok = ok && set_arg(analysis_v, 7, sizeof(cl_mem),
+                                   &params_memory);
+                ok = ok && set_arg(analysis_v, 8, sizeof(cl_int), &cl_taps);
+                ok = ok && set_arg(analysis_v, 9, sizeof(cl_int), &cl_offset);
+                ok = ok && set_arg(analysis_v, 10, sizeof(cl_int), &cl_width);
+                ok = ok && set_arg(analysis_v, 11, sizeof(cl_int),
+                                   &cl_half_h);
+                if (!ok || !launch(analysis_v, full_global,
+                                   "lab.wavelet analysis vertical")) {
+                    error = "lab.wavelet analysis vertical arguments failed";
+                    return false;
+                }
             }
-        }
-        if (residency->readback(stats_device, stats_view) != RT_STAGE_OK) {
-            error = "lab.wavelet statistics readback failed";
+            {
+                cl_mem low_memory = memory_of(wavelet_low[0]);
+                cl_int low_pitch = pitch_of(wavelet_low[0]);
+                cl_mem band1 = memory_of(bands[0][0]);
+                cl_mem band2 = memory_of(bands[0][1]);
+                cl_mem band3 = memory_of(bands[0][2]);
+                cl_int bp1 = pitch_of(bands[0][0]);
+                cl_int bp2 = pitch_of(bands[0][1]);
+                cl_int bp3 = pitch_of(bands[0][2]);
+                bool ok = true;
+                ok = ok && set_arg(analysis_h, 0, sizeof(cl_mem), &tmp_lo);
+                ok = ok && set_arg(analysis_h, 1, sizeof(cl_int),
+                                   &tmp_lo_pitch);
+                ok = ok && set_arg(analysis_h, 2, sizeof(cl_mem), &tmp_hi);
+                ok = ok && set_arg(analysis_h, 3, sizeof(cl_int),
+                                   &tmp_hi_pitch);
+                ok = ok && set_arg(analysis_h, 4, sizeof(cl_mem),
+                                   &low_memory);
+                ok = ok && set_arg(analysis_h, 5, sizeof(cl_int), &low_pitch);
+                ok = ok && set_arg(analysis_h, 6, sizeof(cl_mem), &band1);
+                ok = ok && set_arg(analysis_h, 7, sizeof(cl_int), &bp1);
+                ok = ok && set_arg(analysis_h, 8, sizeof(cl_mem), &band2);
+                ok = ok && set_arg(analysis_h, 9, sizeof(cl_int), &bp2);
+                ok = ok && set_arg(analysis_h, 10, sizeof(cl_mem), &band3);
+                ok = ok && set_arg(analysis_h, 11, sizeof(cl_int), &bp3);
+                ok = ok && set_arg(analysis_h, 12, sizeof(cl_mem),
+                                   &params_memory);
+                ok = ok && set_arg(analysis_h, 13, sizeof(cl_int), &cl_taps);
+                ok = ok && set_arg(analysis_h, 14, sizeof(cl_int),
+                                   &cl_offset);
+                ok = ok && set_arg(analysis_h, 15, sizeof(cl_int), &cl_width);
+                ok = ok && set_arg(analysis_h, 16, sizeof(cl_int),
+                                   &cl_half_w);
+                ok = ok && set_arg(analysis_h, 17, sizeof(cl_int),
+                                   &cl_half_h);
+                if (!ok || !launch(analysis_h, half_global,
+                                   "lab.wavelet analysis horizontal")) {
+                    error = "lab.wavelet analysis horizontal arguments "
+                            "failed";
+                    return false;
+                }
+            }
+
+            /* Levels 1..levels-1: the undecimated Haar analysis. */
+            for (int level = 1; level < wavelet_levels; ++level) {
+                const int skip = 1 << (level - 1);
+                cl_mem src = memory_of(wavelet_low[(level - 1) % 2]);
+                cl_int src_pitch = pitch_of(wavelet_low[(level - 1) % 2]);
+                cl_int cl_skip = skip;
+                bool ok = true;
+                ok = ok && set_arg(haar_v, 0, sizeof(cl_mem), &src);
+                ok = ok && set_arg(haar_v, 1, sizeof(cl_int), &src_pitch);
+                ok = ok && set_arg(haar_v, 2, sizeof(cl_int), &cl_half_w);
+                ok = ok && set_arg(haar_v, 3, sizeof(cl_int), &cl_half_h);
+                ok = ok && set_arg(haar_v, 4, sizeof(cl_int), &cl_skip);
+                ok = ok && set_arg(haar_v, 5, sizeof(cl_mem), &tmp_lo);
+                ok = ok && set_arg(haar_v, 6, sizeof(cl_int), &tmp_lo_pitch);
+                ok = ok && set_arg(haar_v, 7, sizeof(cl_mem), &tmp_hi);
+                ok = ok && set_arg(haar_v, 8, sizeof(cl_int), &tmp_hi_pitch);
+                if (!ok || !launch(haar_v, band_global,
+                                   "lab.wavelet haar vertical")) {
+                    error = "lab.wavelet haar vertical arguments failed";
+                    return false;
+                }
+
+                cl_mem low_memory = memory_of(wavelet_low[level % 2]);
+                cl_int low_pitch = pitch_of(wavelet_low[level % 2]);
+                cl_mem band1 = memory_of(bands[level][0]);
+                cl_mem band2 = memory_of(bands[level][1]);
+                cl_mem band3 = memory_of(bands[level][2]);
+                cl_int bp1 = pitch_of(bands[level][0]);
+                cl_int bp2 = pitch_of(bands[level][1]);
+                cl_int bp3 = pitch_of(bands[level][2]);
+                ok = true;
+                ok = ok && set_arg(haar_h, 0, sizeof(cl_mem), &tmp_lo);
+                ok = ok && set_arg(haar_h, 1, sizeof(cl_int), &tmp_lo_pitch);
+                ok = ok && set_arg(haar_h, 2, sizeof(cl_mem), &tmp_hi);
+                ok = ok && set_arg(haar_h, 3, sizeof(cl_int), &tmp_hi_pitch);
+                ok = ok && set_arg(haar_h, 4, sizeof(cl_mem), &low_memory);
+                ok = ok && set_arg(haar_h, 5, sizeof(cl_int), &low_pitch);
+                ok = ok && set_arg(haar_h, 6, sizeof(cl_mem), &band1);
+                ok = ok && set_arg(haar_h, 7, sizeof(cl_int), &bp1);
+                ok = ok && set_arg(haar_h, 8, sizeof(cl_mem), &band2);
+                ok = ok && set_arg(haar_h, 9, sizeof(cl_int), &bp2);
+                ok = ok && set_arg(haar_h, 10, sizeof(cl_mem), &band3);
+                ok = ok && set_arg(haar_h, 11, sizeof(cl_int), &bp3);
+                ok = ok && set_arg(haar_h, 12, sizeof(cl_int), &cl_half_w);
+                ok = ok && set_arg(haar_h, 13, sizeof(cl_int), &cl_half_h);
+                ok = ok && set_arg(haar_h, 14, sizeof(cl_int), &cl_skip);
+                if (!ok || !launch(haar_h, band_global,
+                                   "lab.wavelet haar horizontal")) {
+                    error = "lab.wavelet haar horizontal arguments failed";
+                    return false;
+                }
+            }
+
+            /* Per-band statistics, one work item per band. */
+            for (int level = 0; level < wavelet_levels; ++level) {
+                cl_mem band1 = memory_of(bands[level][0]);
+                cl_mem band2 = memory_of(bands[level][1]);
+                cl_mem band3 = memory_of(bands[level][2]);
+                cl_int bp1 = pitch_of(bands[level][0]);
+                cl_int bp2 = pitch_of(bands[level][1]);
+                cl_int bp3 = pitch_of(bands[level][2]);
+                cl_int cl_bands = 3;
+                bool ok = true;
+                ok = ok && set_arg(stats_kernel, 0, sizeof(cl_mem), &band1);
+                ok = ok && set_arg(stats_kernel, 1, sizeof(cl_int), &bp1);
+                ok = ok && set_arg(stats_kernel, 2, sizeof(cl_mem), &band2);
+                ok = ok && set_arg(stats_kernel, 3, sizeof(cl_int), &bp2);
+                ok = ok && set_arg(stats_kernel, 4, sizeof(cl_mem), &band3);
+                ok = ok && set_arg(stats_kernel, 5, sizeof(cl_int), &bp3);
+                cl_int stats_offset = level * 3 * static_cast<int>(
+                                                        RT_LAB_WAVELET_STATS_PER_BAND);
+                ok = ok && set_arg(stats_kernel, 6, sizeof(cl_mem),
+                                   &stats_memory);
+                ok = ok && set_arg(stats_kernel, 7, sizeof(cl_int),
+                                   &stats_offset);
+                ok = ok && set_arg(stats_kernel, 8, sizeof(cl_int),
+                                   &cl_half_w);
+                ok = ok && set_arg(stats_kernel, 9, sizeof(cl_int),
+                                   &cl_half_h);
+                ok = ok && set_arg(stats_kernel, 10, sizeof(cl_int),
+                                   &cl_bands);
+                if (!ok || !launch(stats_kernel, stats_global,
+                                   "lab.wavelet statistics")) {
+                    error = "lab.wavelet statistics arguments failed";
+                    return false;
+                }
+            }
+            if (residency->readback(stats_device, stats_view) !=
+                RT_STAGE_OK) {
+                error = "lab.wavelet statistics readback failed";
+                return false;
+            }
+            if (context->wavelet.compute_mea(
+                    context->self, stats_host.data(),
+                    static_cast<uint32_t>(wavelet_levels),
+                    plane_index) != 0) {
+                error = "lab.wavelet mea build failed";
+                return false;
+            }
+            if (residency->upload(wavelet_params_device,
+                                  wavelet_params_buffer) != RT_STAGE_OK) {
+                error = "lab.wavelet parameter upload failed";
+                return false;
+            }
+
+            /* The level multiply: contrast on L, the chroma arm on a and b. */
+            for (int level = 0; level < wavelet_levels; ++level) {
+                cl_mem band1 = memory_of(bands[level][0]);
+                cl_mem band2 = memory_of(bands[level][1]);
+                cl_mem band3 = memory_of(bands[level][2]);
+                cl_int bp1 = pitch_of(bands[level][0]);
+                cl_int bp2 = pitch_of(bands[level][1]);
+                cl_int bp3 = pitch_of(bands[level][2]);
+                cl_int cl_level = level;
+                bool ok = true;
+                if (plane_index == 0) {
+                    cl_mem coeff =
+                        memory_of(wavelet_low[(wavelet_levels - 1) % 2]);
+                    cl_int coeff_pitch =
+                        pitch_of(wavelet_low[(wavelet_levels - 1) % 2]);
+                    cl_int cl_max = wavelet_levels;
+                    ok = ok && set_arg(contrast_kernel, 0, sizeof(cl_mem),
+                                       &band1);
+                    ok = ok && set_arg(contrast_kernel, 1, sizeof(cl_int),
+                                       &bp1);
+                    ok = ok && set_arg(contrast_kernel, 2, sizeof(cl_mem),
+                                       &band2);
+                    ok = ok && set_arg(contrast_kernel, 3, sizeof(cl_int),
+                                       &bp2);
+                    ok = ok && set_arg(contrast_kernel, 4, sizeof(cl_mem),
+                                       &band3);
+                    ok = ok && set_arg(contrast_kernel, 5, sizeof(cl_int),
+                                       &bp3);
+                    ok = ok && set_arg(contrast_kernel, 6, sizeof(cl_mem),
+                                       &coeff);
+                    ok = ok && set_arg(contrast_kernel, 7, sizeof(cl_int),
+                                       &coeff_pitch);
+                    ok = ok && set_arg(contrast_kernel, 8, sizeof(cl_mem),
+                                       &l_memory);
+                    ok = ok && set_arg(contrast_kernel, 9, sizeof(cl_int),
+                                       &l_pitch);
+                    ok = ok && set_arg(contrast_kernel, 10, sizeof(cl_mem),
+                                       &params_memory);
+                    ok = ok && set_arg(contrast_kernel, 11, sizeof(cl_int),
+                                       &cl_mea_offset);
+                    ok = ok && set_arg(contrast_kernel, 12, sizeof(cl_int),
+                                       &cl_level);
+                    ok = ok && set_arg(contrast_kernel, 13, sizeof(cl_int),
+                                       &cl_half_w);
+                    ok = ok && set_arg(contrast_kernel, 14, sizeof(cl_int),
+                                       &cl_half_h);
+                    ok = ok && set_arg(contrast_kernel, 15, sizeof(cl_int),
+                                       &cl_max);
+                    if (!ok || !launch(contrast_kernel, band_global,
+                                       "lab.wavelet contrast")) {
+                        error = "lab.wavelet contrast arguments failed";
+                        return false;
+                    }
+                } else {
+                    cl_int chroma_mea_offset = cl_mea_offset +
+                        static_cast<cl_int>(plane_index) * wavelet_levels *
+                            static_cast<cl_int>(
+                                RT_LAB_WAVELET_MEA_ENTRIES);
+                    ok = ok && set_arg(chroma_kernel, 0, sizeof(cl_mem),
+                                       &band1);
+                    ok = ok && set_arg(chroma_kernel, 1, sizeof(cl_int),
+                                       &bp1);
+                    ok = ok && set_arg(chroma_kernel, 2, sizeof(cl_mem),
+                                       &band2);
+                    ok = ok && set_arg(chroma_kernel, 3, sizeof(cl_int),
+                                       &bp2);
+                    ok = ok && set_arg(chroma_kernel, 4, sizeof(cl_mem),
+                                       &band3);
+                    ok = ok && set_arg(chroma_kernel, 5, sizeof(cl_int),
+                                       &bp3);
+                    ok = ok && set_arg(chroma_kernel, 6, sizeof(cl_mem),
+                                       &l_memory);
+                    ok = ok && set_arg(chroma_kernel, 7, sizeof(cl_int),
+                                       &l_pitch);
+                    ok = ok && set_arg(chroma_kernel, 8, sizeof(cl_mem),
+                                       &hue_memory);
+                    ok = ok && set_arg(chroma_kernel, 9, sizeof(cl_int),
+                                       &mask_pitch);
+                    ok = ok && set_arg(chroma_kernel, 10, sizeof(cl_mem),
+                                       &chrom_memory);
+                    ok = ok && set_arg(chroma_kernel, 11, sizeof(cl_int),
+                                       &mask_pitch);
+                    ok = ok && set_arg(chroma_kernel, 12, sizeof(cl_mem),
+                                       &params_memory);
+                    ok = ok && set_arg(chroma_kernel, 13, sizeof(cl_int),
+                                       &chroma_mea_offset);
+                    ok = ok && set_arg(chroma_kernel, 14, sizeof(cl_int),
+                                       &cl_level);
+                    ok = ok && set_arg(chroma_kernel, 15, sizeof(cl_int),
+                                       &cl_half_w);
+                    ok = ok && set_arg(chroma_kernel, 16, sizeof(cl_int),
+                                       &cl_half_h);
+                    ok = ok && set_arg(chroma_kernel, 17, sizeof(cl_int),
+                                       &cl_wav_skin);
+                    if (!ok || !launch(chroma_kernel, band_global,
+                                       "lab.wavelet chroma")) {
+                        error = "lab.wavelet chroma arguments failed";
+                        return false;
+                    }
+                }
+            }
+
+            /* Reconstruction: the Haar levels first, then level 0. */
+            const int coeff_index = (wavelet_levels - 1) % 2;
+            for (int level = wavelet_levels - 1; level >= 1; --level) {
+                const int skip = 1 << (level - 1);
+                cl_int cl_skip = skip;
+                cl_mem low_memory = memory_of(wavelet_low[coeff_index]);
+                cl_int low_pitch = pitch_of(wavelet_low[coeff_index]);
+                cl_mem band1 = memory_of(bands[level][0]);
+                cl_mem band2 = memory_of(bands[level][1]);
+                cl_mem band3 = memory_of(bands[level][2]);
+                cl_int bp1 = pitch_of(bands[level][0]);
+                cl_int bp2 = pitch_of(bands[level][1]);
+                cl_int bp3 = pitch_of(bands[level][2]);
+                bool ok = true;
+                ok = ok && set_arg(haar_synth_h, 0, sizeof(cl_mem),
+                                   &low_memory);
+                ok = ok && set_arg(haar_synth_h, 1, sizeof(cl_int),
+                                   &low_pitch);
+                ok = ok && set_arg(haar_synth_h, 2, sizeof(cl_mem), &band1);
+                ok = ok && set_arg(haar_synth_h, 3, sizeof(cl_int), &bp1);
+                ok = ok && set_arg(haar_synth_h, 4, sizeof(cl_mem), &band2);
+                ok = ok && set_arg(haar_synth_h, 5, sizeof(cl_int), &bp2);
+                ok = ok && set_arg(haar_synth_h, 6, sizeof(cl_mem), &band3);
+                ok = ok && set_arg(haar_synth_h, 7, sizeof(cl_int), &bp3);
+                ok = ok && set_arg(haar_synth_h, 8, sizeof(cl_mem), &tmp_lo);
+                ok = ok && set_arg(haar_synth_h, 9, sizeof(cl_int),
+                                   &tmp_lo_pitch);
+                ok = ok && set_arg(haar_synth_h, 10, sizeof(cl_mem), &tmp_hi);
+                ok = ok && set_arg(haar_synth_h, 11, sizeof(cl_int),
+                                   &tmp_hi_pitch);
+                ok = ok && set_arg(haar_synth_h, 12, sizeof(cl_int),
+                                   &cl_half_w);
+                ok = ok && set_arg(haar_synth_h, 13, sizeof(cl_int),
+                                   &cl_half_h);
+                ok = ok && set_arg(haar_synth_h, 14, sizeof(cl_int),
+                                   &cl_skip);
+                if (!ok || !launch(haar_synth_h, band_global,
+                                   "lab.wavelet haar synthesis horizontal")) {
+                    error = "lab.wavelet haar synthesis horizontal arguments "
+                            "failed";
+                    return false;
+                }
+
+                ok = true;
+                ok = ok && set_arg(haar_synth_v, 0, sizeof(cl_mem), &tmp_lo);
+                ok = ok && set_arg(haar_synth_v, 1, sizeof(cl_int),
+                                   &tmp_lo_pitch);
+                ok = ok && set_arg(haar_synth_v, 2, sizeof(cl_mem), &tmp_hi);
+                ok = ok && set_arg(haar_synth_v, 3, sizeof(cl_int),
+                                   &tmp_hi_pitch);
+                ok = ok && set_arg(haar_synth_v, 4, sizeof(cl_mem),
+                                   &low_memory);
+                ok = ok && set_arg(haar_synth_v, 5, sizeof(cl_int),
+                                   &low_pitch);
+                ok = ok && set_arg(haar_synth_v, 6, sizeof(cl_int),
+                                   &cl_half_w);
+                ok = ok && set_arg(haar_synth_v, 7, sizeof(cl_int),
+                                   &cl_half_h);
+                ok = ok && set_arg(haar_synth_v, 8, sizeof(cl_int), &cl_skip);
+                if (!ok || !launch(haar_synth_v, band_global,
+                                   "lab.wavelet haar synthesis vertical")) {
+                    error = "lab.wavelet haar synthesis vertical arguments "
+                            "failed";
+                    return false;
+                }
+            }
+
+            {
+                cl_mem low_memory = memory_of(wavelet_low[coeff_index]);
+                cl_int low_pitch = pitch_of(wavelet_low[coeff_index]);
+                cl_mem band1 = memory_of(bands[0][0]);
+                cl_mem band2 = memory_of(bands[0][1]);
+                cl_mem band3 = memory_of(bands[0][2]);
+                cl_int bp1 = pitch_of(bands[0][0]);
+                cl_int bp2 = pitch_of(bands[0][1]);
+                cl_int bp3 = pitch_of(bands[0][2]);
+                /* The L clamp is deferred while the chroma arm still reads L;
+                 * the host applies it after readback. */
+                cl_int clamp =
+                    plane_index == 0 && !wavelet_chroma ? 1 : 0;
+                bool ok = true;
+                ok = ok && set_arg(synth_h, 0, sizeof(cl_mem), &low_memory);
+                ok = ok && set_arg(synth_h, 1, sizeof(cl_int), &low_pitch);
+                ok = ok && set_arg(synth_h, 2, sizeof(cl_mem), &band1);
+                ok = ok && set_arg(synth_h, 3, sizeof(cl_int), &bp1);
+                ok = ok && set_arg(synth_h, 4, sizeof(cl_mem), &band2);
+                ok = ok && set_arg(synth_h, 5, sizeof(cl_int), &bp2);
+                ok = ok && set_arg(synth_h, 6, sizeof(cl_mem), &band3);
+                ok = ok && set_arg(synth_h, 7, sizeof(cl_int), &bp3);
+                ok = ok && set_arg(synth_h, 8, sizeof(cl_mem), &tmp_lo);
+                ok = ok && set_arg(synth_h, 9, sizeof(cl_int), &tmp_lo_pitch);
+                ok = ok && set_arg(synth_h, 10, sizeof(cl_mem), &tmp_hi);
+                ok = ok && set_arg(synth_h, 11, sizeof(cl_int),
+                                   &tmp_hi_pitch);
+                ok = ok && set_arg(synth_h, 12, sizeof(cl_mem),
+                                   &params_memory);
+                ok = ok && set_arg(synth_h, 13, sizeof(cl_int), &cl_taps);
+                ok = ok && set_arg(synth_h, 14, sizeof(cl_int), &cl_offset);
+                ok = ok && set_arg(synth_h, 15, sizeof(cl_int), &cl_half_w);
+                ok = ok && set_arg(synth_h, 16, sizeof(cl_int), &cl_width);
+                ok = ok && set_arg(synth_h, 17, sizeof(cl_int), &cl_half_h);
+                if (!ok || !launch(synth_h, full_global,
+                                   "lab.wavelet synthesis horizontal")) {
+                    error = "lab.wavelet synthesis horizontal arguments "
+                            "failed";
+                    return false;
+                }
+
+                ok = true;
+                ok = ok && set_arg(synth_v, 0, sizeof(cl_mem), &tmp_lo);
+                ok = ok && set_arg(synth_v, 1, sizeof(cl_int), &tmp_lo_pitch);
+                ok = ok && set_arg(synth_v, 2, sizeof(cl_mem), &tmp_hi);
+                ok = ok && set_arg(synth_v, 3, sizeof(cl_int),
+                                   &tmp_hi_pitch);
+                ok = ok && set_arg(synth_v, 4, sizeof(cl_mem),
+                                   &plane_memory);
+                ok = ok && set_arg(synth_v, 5, sizeof(cl_int), &plane_pitch);
+                ok = ok && set_arg(synth_v, 6, sizeof(cl_mem),
+                                   &params_memory);
+                ok = ok && set_arg(synth_v, 7, sizeof(cl_int), &cl_taps);
+                ok = ok && set_arg(synth_v, 8, sizeof(cl_int), &cl_offset);
+                ok = ok && set_arg(synth_v, 9, sizeof(cl_int), &cl_width);
+                ok = ok && set_arg(synth_v, 10, sizeof(cl_int), &cl_half_h);
+                ok = ok && set_arg(synth_v, 11, sizeof(cl_int), &cl_height);
+                ok = ok && set_arg(synth_v, 12, sizeof(cl_float), &cl_blend);
+                ok = ok && set_arg(synth_v, 13, sizeof(cl_int), &clamp);
+                if (!ok || !launch(synth_v, image_global,
+                                   "lab.wavelet synthesis vertical")) {
+                    error = "lab.wavelet synthesis vertical arguments failed";
+                    return false;
+                }
+            }
+            return true;
+        };
+
+        if (!run_plane(l_memory, l_pitch, 0)) {
             return RT_STAGE_FALLBACK;
         }
-        if (context->wavelet.compute_mea(
-                context->self, stats_host.data(),
-                static_cast<uint32_t>(wavelet_levels)) != 0) {
-            error = "lab.wavelet mea build failed";
+        if (wavelet_chroma &&
+            (!run_plane(plane_a_memory, plane_a_pitch, 1) ||
+             !run_plane(plane_b_memory, plane_b_pitch, 2))) {
             return RT_STAGE_FALLBACK;
-        }
-        wavelet_params = static_cast<const float*>(wavelet_params_buffer.data);
-        if (residency->upload(wavelet_params_device,
-                              wavelet_params_buffer) != RT_STAGE_OK) {
-            error = "lab.wavelet parameter upload failed";
-            return RT_STAGE_FALLBACK;
-        }
-
-        /* The contrast multiply, one launch per level. */
-        for (int level = 0; level < wavelet_levels; ++level) {
-            cl_mem band1 = memory_of(bands[level][0]);
-            cl_mem band2 = memory_of(bands[level][1]);
-            cl_mem band3 = memory_of(bands[level][2]);
-            cl_int bp1 = pitch_of(bands[level][0]);
-            cl_int bp2 = pitch_of(bands[level][1]);
-            cl_int bp3 = pitch_of(bands[level][2]);
-            cl_mem coeff = memory_of(wavelet_low[(wavelet_levels - 1) % 2]);
-            cl_int coeff_pitch =
-                pitch_of(wavelet_low[(wavelet_levels - 1) % 2]);
-            cl_int cl_mea_offset = static_cast<cl_int>(
-                RT_LAB_WAVELET_WAVELET_PARAMS);
-            cl_int cl_level = level;
-            cl_int cl_max = wavelet_levels;
-            bool ok = true;
-            ok = ok && set_arg(contrast_kernel, 0, sizeof(cl_mem), &band1);
-            ok = ok && set_arg(contrast_kernel, 1, sizeof(cl_int), &bp1);
-            ok = ok && set_arg(contrast_kernel, 2, sizeof(cl_mem), &band2);
-            ok = ok && set_arg(contrast_kernel, 3, sizeof(cl_int), &bp2);
-            ok = ok && set_arg(contrast_kernel, 4, sizeof(cl_mem), &band3);
-            ok = ok && set_arg(contrast_kernel, 5, sizeof(cl_int), &bp3);
-            ok = ok && set_arg(contrast_kernel, 6, sizeof(cl_mem), &coeff);
-            ok = ok && set_arg(contrast_kernel, 7, sizeof(cl_int),
-                               &coeff_pitch);
-            ok = ok && set_arg(contrast_kernel, 8, sizeof(cl_mem), &l_memory);
-            ok = ok && set_arg(contrast_kernel, 9, sizeof(cl_int), &l_pitch);
-            ok = ok && set_arg(contrast_kernel, 10, sizeof(cl_mem),
-                               &params_memory);
-            ok = ok && set_arg(contrast_kernel, 11, sizeof(cl_int),
-                               &cl_mea_offset);
-            ok = ok && set_arg(contrast_kernel, 12, sizeof(cl_int), &cl_level);
-            ok = ok && set_arg(contrast_kernel, 13, sizeof(cl_int),
-                               &cl_half_w);
-            ok = ok && set_arg(contrast_kernel, 14, sizeof(cl_int),
-                               &cl_half_h);
-            ok = ok && set_arg(contrast_kernel, 15, sizeof(cl_int), &cl_max);
-            if (!ok || !launch(contrast_kernel, band_global,
-                               "lab.wavelet contrast")) {
-                error = "lab.wavelet contrast arguments failed";
-                return RT_STAGE_FALLBACK;
-            }
-        }
-
-        /* Reconstruction: the Haar levels first, then level 0. */
-        const int coeff_index = (wavelet_levels - 1) % 2;
-        for (int level = wavelet_levels - 1; level >= 1; --level) {
-            const int skip = 1 << (level - 1);
-            cl_int cl_skip = skip;
-            cl_mem low_memory = memory_of(wavelet_low[coeff_index]);
-            cl_int low_pitch = pitch_of(wavelet_low[coeff_index]);
-            cl_mem band1 = memory_of(bands[level][0]);
-            cl_mem band2 = memory_of(bands[level][1]);
-            cl_mem band3 = memory_of(bands[level][2]);
-            cl_int bp1 = pitch_of(bands[level][0]);
-            cl_int bp2 = pitch_of(bands[level][1]);
-            cl_int bp3 = pitch_of(bands[level][2]);
-            bool ok = true;
-            ok = ok && set_arg(haar_synth_h, 0, sizeof(cl_mem), &low_memory);
-            ok = ok && set_arg(haar_synth_h, 1, sizeof(cl_int), &low_pitch);
-            ok = ok && set_arg(haar_synth_h, 2, sizeof(cl_mem), &band1);
-            ok = ok && set_arg(haar_synth_h, 3, sizeof(cl_int), &bp1);
-            ok = ok && set_arg(haar_synth_h, 4, sizeof(cl_mem), &band2);
-            ok = ok && set_arg(haar_synth_h, 5, sizeof(cl_int), &bp2);
-            ok = ok && set_arg(haar_synth_h, 6, sizeof(cl_mem), &band3);
-            ok = ok && set_arg(haar_synth_h, 7, sizeof(cl_int), &bp3);
-            ok = ok && set_arg(haar_synth_h, 8, sizeof(cl_mem), &tmp_lo);
-            ok = ok && set_arg(haar_synth_h, 9, sizeof(cl_int),
-                               &tmp_lo_pitch);
-            ok = ok && set_arg(haar_synth_h, 10, sizeof(cl_mem), &tmp_hi);
-            ok = ok && set_arg(haar_synth_h, 11, sizeof(cl_int),
-                               &tmp_hi_pitch);
-            ok = ok && set_arg(haar_synth_h, 12, sizeof(cl_int), &cl_half_w);
-            ok = ok && set_arg(haar_synth_h, 13, sizeof(cl_int), &cl_half_h);
-            ok = ok && set_arg(haar_synth_h, 14, sizeof(cl_int), &cl_skip);
-            if (!ok || !launch(haar_synth_h, band_global,
-                               "lab.wavelet haar synthesis horizontal")) {
-                error = "lab.wavelet haar synthesis horizontal arguments "
-                        "failed";
-                return RT_STAGE_FALLBACK;
-            }
-
-            ok = true;
-            ok = ok && set_arg(haar_synth_v, 0, sizeof(cl_mem), &tmp_lo);
-            ok = ok && set_arg(haar_synth_v, 1, sizeof(cl_int), &tmp_lo_pitch);
-            ok = ok && set_arg(haar_synth_v, 2, sizeof(cl_mem), &tmp_hi);
-            ok = ok && set_arg(haar_synth_v, 3, sizeof(cl_int), &tmp_hi_pitch);
-            ok = ok && set_arg(haar_synth_v, 4, sizeof(cl_mem), &low_memory);
-            ok = ok && set_arg(haar_synth_v, 5, sizeof(cl_int), &low_pitch);
-            ok = ok && set_arg(haar_synth_v, 6, sizeof(cl_int), &cl_half_w);
-            ok = ok && set_arg(haar_synth_v, 7, sizeof(cl_int), &cl_half_h);
-            ok = ok && set_arg(haar_synth_v, 8, sizeof(cl_int), &cl_skip);
-            if (!ok || !launch(haar_synth_v, band_global,
-                               "lab.wavelet haar synthesis vertical")) {
-                error = "lab.wavelet haar synthesis vertical arguments "
-                        "failed";
-                return RT_STAGE_FALLBACK;
-            }
-        }
-
-        {
-            cl_mem low_memory = memory_of(wavelet_low[coeff_index]);
-            cl_int low_pitch = pitch_of(wavelet_low[coeff_index]);
-            cl_mem band1 = memory_of(bands[0][0]);
-            cl_mem band2 = memory_of(bands[0][1]);
-            cl_mem band3 = memory_of(bands[0][2]);
-            cl_int bp1 = pitch_of(bands[0][0]);
-            cl_int bp2 = pitch_of(bands[0][1]);
-            cl_int bp3 = pitch_of(bands[0][2]);
-            bool ok = true;
-            ok = ok && set_arg(synth_h, 0, sizeof(cl_mem), &low_memory);
-            ok = ok && set_arg(synth_h, 1, sizeof(cl_int), &low_pitch);
-            ok = ok && set_arg(synth_h, 2, sizeof(cl_mem), &band1);
-            ok = ok && set_arg(synth_h, 3, sizeof(cl_int), &bp1);
-            ok = ok && set_arg(synth_h, 4, sizeof(cl_mem), &band2);
-            ok = ok && set_arg(synth_h, 5, sizeof(cl_int), &bp2);
-            ok = ok && set_arg(synth_h, 6, sizeof(cl_mem), &band3);
-            ok = ok && set_arg(synth_h, 7, sizeof(cl_int), &bp3);
-            ok = ok && set_arg(synth_h, 8, sizeof(cl_mem), &tmp_lo);
-            ok = ok && set_arg(synth_h, 9, sizeof(cl_int), &tmp_lo_pitch);
-            ok = ok && set_arg(synth_h, 10, sizeof(cl_mem), &tmp_hi);
-            ok = ok && set_arg(synth_h, 11, sizeof(cl_int), &tmp_hi_pitch);
-            ok = ok && set_arg(synth_h, 12, sizeof(cl_mem), &params_memory);
-            ok = ok && set_arg(synth_h, 13, sizeof(cl_int), &cl_taps);
-            ok = ok && set_arg(synth_h, 14, sizeof(cl_int), &cl_offset);
-            ok = ok && set_arg(synth_h, 15, sizeof(cl_int), &cl_half_w);
-            ok = ok && set_arg(synth_h, 16, sizeof(cl_int), &cl_width);
-            ok = ok && set_arg(synth_h, 17, sizeof(cl_int), &cl_half_h);
-            if (!ok || !launch(synth_h, full_global,
-                               "lab.wavelet synthesis horizontal")) {
-                error = "lab.wavelet synthesis horizontal arguments failed";
-                return RT_STAGE_FALLBACK;
-            }
-
-            const float blend = wavelet_params[RT_LW_PARAM_STRENGTH];
-            cl_float cl_blend = blend;
-            ok = true;
-            ok = ok && set_arg(synth_v, 0, sizeof(cl_mem), &tmp_lo);
-            ok = ok && set_arg(synth_v, 1, sizeof(cl_int), &tmp_lo_pitch);
-            ok = ok && set_arg(synth_v, 2, sizeof(cl_mem), &tmp_hi);
-            ok = ok && set_arg(synth_v, 3, sizeof(cl_int), &tmp_hi_pitch);
-            ok = ok && set_arg(synth_v, 4, sizeof(cl_mem), &l_memory);
-            ok = ok && set_arg(synth_v, 5, sizeof(cl_int), &l_pitch);
-            ok = ok && set_arg(synth_v, 6, sizeof(cl_mem), &params_memory);
-            ok = ok && set_arg(synth_v, 7, sizeof(cl_int), &cl_taps);
-            ok = ok && set_arg(synth_v, 8, sizeof(cl_int), &cl_offset);
-            ok = ok && set_arg(synth_v, 9, sizeof(cl_int), &cl_width);
-            ok = ok && set_arg(synth_v, 10, sizeof(cl_int), &cl_half_h);
-            ok = ok && set_arg(synth_v, 11, sizeof(cl_int), &cl_height);
-            ok = ok && set_arg(synth_v, 12, sizeof(cl_float), &cl_blend);
-            if (!ok || !launch(synth_v, image_global,
-                               "lab.wavelet synthesis vertical")) {
-                error = "lab.wavelet synthesis vertical arguments failed";
-                return RT_STAGE_FALLBACK;
-            }
         }
     }
 
@@ -6808,11 +6985,34 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
         return RT_STAGE_FALLBACK;
     }
 
-    /*
-     * BadpixelsLab() also repairs a and b. The prepared copy owns those
-     * repaired planes; the device only wrote L.
-     */
-    if (levels > 0 && context->needs_scratch != 0) {
+    if (wavelet_chroma) {
+        if (residency->readback(plane_a_device, plane_view(lab, 1)) !=
+                RT_STAGE_OK ||
+            residency->readback(plane_b_device, plane_view(lab, 2)) !=
+                RT_STAGE_OK) {
+            error = "lab.wavelet chroma readback failed";
+            return RT_STAGE_FALLBACK;
+        }
+        /*
+         * The L synthesis skipped its clamp so ContAllAB() read the same L
+         * the block reads. ip_wavelet() applies it in the final tile copy,
+         * after the chroma pass, so apply it here.
+         */
+        auto* l_base = static_cast<unsigned char*>(lab.data);
+        for (int y = 0; y < height; ++y) {
+            auto* row = reinterpret_cast<float*>(
+                l_base + static_cast<std::size_t>(y) * lab.row_pitch);
+            for (int x = 0; x < width; ++x) {
+                if (row[x] <= 0.f) {
+                    row[x] = 1.f;
+                }
+            }
+        }
+    } else if (levels > 0 && context->needs_scratch != 0) {
+        /*
+         * BadpixelsLab() also repairs a and b. The prepared copy owns those
+         * repaired planes; the device only wrote L.
+         */
         auto* target = static_cast<unsigned char*>(lab.data);
         const auto* source = static_cast<const unsigned char*>(prepared.data);
         for (std::uint32_t plane = 1; plane < 3; ++plane) {
