@@ -45,31 +45,31 @@ struct ProcParams;
  * rectangular spot, the local log-encoding tool, the local dehaze tool, the
  * local CBDL tool, the Colour & Light chroma/lightness/contrast sliders and
  * L/C/H curves, the vibrance tool, the shadows/highlights tool, the soft-light
- * tool, the Gaussian local-contrast tool, the deltaE scope, the
- * avoid-colour-shift Munsell method and the unconditional per-spot Lab-to-RGB
- * clamp. The block also applies the final Munsell pass and the clamp for an
- * inactive spot, so a block whose spots do no tool work is still a clamp-only
- * block.
+ * tool, the Gaussian local-contrast tool, the local sharpening tool, the
+ * deltaE scope, the avoid-colour-shift Munsell method and the unconditional
+ * per-spot Lab-to-RGB clamp. The block also applies the final Munsell pass and
+ * the clamp for an inactive spot, so a block whose spots do no tool work is
+ * still a clamp-only block.
  *
  * The tools run in Lab_Local()'s order: log encoding, dehaze, CBDL, vibrance,
- * shadows/highlights, soft light, local contrast, then Colour & Light. The
- * context is C-compatible because the ABI is. `self` points at the C++ object
- * that owns the ProcParams, ImProcFunctions and LabImage references, so the
- * pointer must not outlive them.
+ * shadows/highlights, soft light, local contrast, local sharpening, then
+ * Colour & Light. The context is C-compatible because the ABI is. `self`
+ * points at the C++ object that owns the ProcParams, ImProcFunctions and
+ * LabImage references, so the pointer must not outlive them.
  *
  * The per-spot record is a flat float table rather than a structure mirrored
  * between C++ and the device: Lab_Local() takes 270 parameters and only a
  * small, known subset reaches the supported paths. Slots are named by the
  * RT_LOCAL_ADJUSTMENTS_SLOT_* constants and are written once per spot.
  */
-#define RT_LOCAL_ADJUSTMENTS_CONTEXT_VERSION 7u
+#define RT_LOCAL_ADJUSTMENTS_CONTEXT_VERSION 8u
 /* "LAJC": rejects a stale or unrelated pointer before any callback runs. */
 #define RT_LOCAL_ADJUSTMENTS_CONTEXT_MAGIC 0x4C414A43u
 /* The block has no bounded spot count, but a profile that carries more spots
  * than this is outside the device set and runs the host block. */
 #define RT_LOCAL_ADJUSTMENTS_MAX_SPOTS 64u
 /* Floats per spot record; the slot constants below must stay inside it. */
-#define RT_LOCAL_ADJUSTMENTS_SPOT_STRIDE 133u
+#define RT_LOCAL_ADJUSTMENTS_SPOT_STRIDE 140u
 /* A curve table is one LUTf of the block's own size. */
 #define RT_LOCAL_ADJUSTMENTS_LUT_ENTRIES 65536u
 /* Color::gammatab_srgb and Color::igammatab_srgb, the sRGB gamma pair the
@@ -321,6 +321,42 @@ struct ProcParams;
 #define RT_LOCAL_ADJUSTMENTS_SLOT_LOG_SATCONTROL 130u
 #define RT_LOCAL_ADJUSTMENTS_SLOT_LOG_REPART 131u
 #define RT_LOCAL_ADJUSTMENTS_SLOT_LOG_KAB_PRE 132u
+/* Local sharpening. EXP_SHARP is 1 when Lab_Local()'s RL arm runs: the tool
+ * on, the spot active and no explicit mask, `methodcap == "rl"`, an amount of
+ * at least one, and a radius above the block's 0.42 no-op threshold but below
+ * the 1.15 sigma where the sharable RLD kernels stop. The block runs
+ * deconvsharpeningloc() on the ROI L plane and blends with Sharp_Local()'s
+ * deltaE scope, whose senstype 0 reads `lp.senssha`. A radius at or below
+ * 0.42 is the block's own no-op and is recorded as a skipped pass, not a
+ * refusal. */
+#define RT_LOCAL_ADJUSTMENTS_SLOT_EXPSHARP 133u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_SENSSHA 134u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_SHAR_AMOUNT 135u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_SHAR_RADIUS 136u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_SHAR_ITER 137u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_SHAR_CONTRAST 138u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_SHAR_BLUR 139u
+
+/* deconvsharpeningloc() is the undamped RLD path: a damping value of zero
+ * selects the division/multiplication recurrence the output.sharpen core
+ * already covers. The block's own guard is `lp.shrad > 0.42`; below it no
+ * sharpen work runs. Above 1.15 the core uses its separable IIR arm, which
+ * has no device RLD kernel, so those radii stay on the host. */
+#define RT_LOCAL_ADJUSTMENTS_SHARPEN_NOOP_RADIUS 0.42
+#define RT_LOCAL_ADJUSTMENTS_SHARPEN_SIGMA_LIMIT 1.15
+/* The block's blur pre-pass is skipped below 0.25; a larger sharblur is a
+ * residual for the same reason as output sharpening. */
+#define RT_LOCAL_ADJUSTMENTS_SHARPEN_BLUR_LIMIT 0.25
+/* iplocallab.cc's mSPsharp: deconvsharpeningloc() needs 39 px on both axes
+ * for buildBlendMask(). A smaller extent makes the block return before its
+ * tail clamp, so the whole block is a host execution. */
+#define RT_LOCAL_ADJUSTMENTS_SHARPEN_MIN_ROI 39
+/* iplocallab.cc's `del`: the RL arm sharpens `lx + lxL + del` by
+ * `ly + lyT + del`, a zero-padded extent rather than the clipped image ROI. */
+#define RT_LOCAL_ADJUSTMENTS_SHARPEN_ROI_PAD 3
+/* Sharp_Local()'s deltaE reference blur: gaussianBlur() at 3 / sk, with
+ * sk = 1 for the export call site. */
+#define RT_LOCAL_ADJUSTMENTS_SHARPEN_SCOPE_SIGMA 3.0
 
 typedef struct RtLocalAdjustmentsResult {
     /* spot_count RT_LOCAL_ADJUSTMENTS_SPOT_STRIDE floats, spot-major. */
@@ -414,9 +450,21 @@ namespace rtengine::stage
  * no recursion, inversion, explicit mask, soft radius, merge, gradient, Lab
  * grid, RGB curve, exposure curve or tool outside the set. An active spot runs
  * any combination of local dehaze, local CBDL, Colour & Light, vibrance,
- * shadows/highlights, soft light and local contrast; the tool variants and
- * ranges are checked separately. The block has no pre-CBDL pass and no global
- * dehaze; the local dehaze is part of the spot path.
+ * shadows/highlights, soft light, local contrast and local sharpening; the
+ * tool variants and ranges are checked separately. The block has no pre-CBDL
+ * pass and no global dehaze; the local dehaze is part of the spot path.
+ *
+ * Local sharpening is admitted only in the `"rl"` (RLD) arm that the
+ * output.sharpen core covers: undamped, with no capture sharpening, no gamma
+ * wrapper, no blur pre-pass and a radius whose RLD sigma is below the core's
+ * separable limit. Capture sharpening (`"cap"`), damping, `shargam != 1`,
+ * `sharblur >= 0.25`, `sharshow`, a radius outside 0.4..1.15, masks, a soft
+ * radius and out-of-range sliders are residuals. A radius at or below 0.42 is
+ * the block's own no-op and is admitted without a device pass. A partial spot
+ * with a non-zero transition is also a residual: Sharp_Local() reads the
+ * padded deconvolution result across the transition ring, which the block's
+ * `lx + lxL + 3` extent does not cover. A zero-width transition keeps the ring
+ * inside the nominal extent.
  *
  * Local dehaze is admitted only through its retinex gate: expreti on, the
  * retinex strength zero and a non-zero dehaz. dehazeblack, show-depth, an

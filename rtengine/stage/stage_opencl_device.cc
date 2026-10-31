@@ -7421,6 +7421,374 @@ RtStageStatus run_thumbnail_scale(
  * stage/algorithms/sharpen_cl.h. The L plane is the only transfer: the mask,
  * the blur, the RLD estimate and the RLD intermediate live in device scratch.
  */
+
+/* gauss.cc's IIR line pair over one plane: horizontal into `state`, then
+ * vertical into `dst`. The caller holds the queue lock. */
+bool sharpen_iir_plane(const std::shared_ptr<OpenCLEnv>& env,
+                       cl_kernel kernel, cl_mem src, cl_mem dst,
+                       cl_mem state, int width, int height, int pitch,
+                       const SharpenIirFactors& factors, std::string& error)
+{
+    const auto set = [&](cl_kernel target, cl_uint index,
+                         std::size_t bytes, const void* value) {
+        return env->api->SetKernelArg(target, index, bytes, value) ==
+               CL_SUCCESS;
+    };
+    const auto run_line = [&](cl_mem source, cl_mem target, int length,
+                              int src_base_step, int dst_base_step,
+                              int src_stride, int dst_stride,
+                              int lines) -> bool {
+        cl_int cl_length = length;
+        cl_int cl_src_base_step = src_base_step;
+        cl_int cl_dst_base_step = dst_base_step;
+        cl_int cl_src_stride = src_stride;
+        cl_int cl_dst_stride = dst_stride;
+        cl_float m[9];
+        for (int i = 0; i < 3; ++i) {
+            for (int j = 0; j < 3; ++j) {
+                m[i * 3 + j] = factors.m[i][j];
+            }
+        }
+        cl_uint arg = 0;
+        bool ok = true;
+        ok = ok && set(kernel, arg++, sizeof(cl_mem), &source);
+        ok = ok && set(kernel, arg++, sizeof(cl_mem), &target);
+        ok = ok && set(kernel, arg++, sizeof(cl_int), &cl_length);
+        ok = ok && set(kernel, arg++, sizeof(cl_int), &cl_src_base_step);
+        ok = ok && set(kernel, arg++, sizeof(cl_int), &cl_dst_base_step);
+        ok = ok && set(kernel, arg++, sizeof(cl_int), &cl_src_stride);
+        ok = ok && set(kernel, arg++, sizeof(cl_int), &cl_dst_stride);
+        ok = ok && set(kernel, arg++, sizeof(cl_float), &factors.B);
+        ok = ok && set(kernel, arg++, sizeof(cl_float), &factors.b1);
+        ok = ok && set(kernel, arg++, sizeof(cl_float), &factors.b2);
+        ok = ok && set(kernel, arg++, sizeof(cl_float), &factors.b3);
+        for (int i = 0; i < 9 && ok; ++i) {
+            ok = ok && set(kernel, arg++, sizeof(cl_float), &m[i]);
+        }
+        if (!ok) {
+            error = "sharpen IIR arguments failed";
+            return false;
+        }
+        const std::size_t global = static_cast<std::size_t>(lines);
+        cl_event done = nullptr;
+        if (env->api->EnqueueNDRangeKernel(env->queue, kernel, 1, nullptr,
+                                           &global, nullptr, 0, nullptr,
+                                           &done) != CL_SUCCESS ||
+            done == nullptr) {
+            error = "sharpen IIR launch failed";
+            return false;
+        }
+        const cl_int wait = env->api->WaitForEvents(1, &done);
+        env->api->ReleaseEvent(done);
+        if (wait != CL_SUCCESS) {
+            error = "sharpen IIR did not complete";
+            return false;
+        }
+        return true;
+    };
+    return run_line(src, state, width, pitch, pitch, 1, 1, height) &&
+           run_line(state, dst, height, 1, 1, pitch, pitch, width);
+}
+
+/* buildBlendMask() plus its sigma-2 blur, the first step of both output and
+ * local sharpening. `image`, `mask` and `temp` share `pitch`. */
+RtStageStatus sharpen_mask_plane(const std::shared_ptr<OpenCLEnv>& env,
+                                 const KernelDef* def, int width, int height,
+                                 int pitch, cl_mem image, cl_mem mask,
+                                 cl_mem temp, float contrast_threshold,
+                                 std::string& error)
+{
+    cl_kernel mask_kernel =
+        compiled_kernel_entry(env, def, "rt_sharpen_mask", error);
+    cl_kernel iir_kernel =
+        compiled_kernel_entry(env, def, "rt_sharpen_iir_line", error);
+    if (mask_kernel == nullptr || iir_kernel == nullptr) {
+        return RT_STAGE_FALLBACK;
+    }
+    const auto set = [&](cl_uint index, std::size_t bytes,
+                         const void* value) {
+        return env->api->SetKernelArg(mask_kernel, index, bytes, value) ==
+               CL_SUCCESS;
+    };
+    const cl_int cl_width = width;
+    const cl_int cl_height = height;
+    const cl_int cl_pitch = pitch;
+    const cl_float threshold = contrast_threshold;
+    const cl_float scale = static_cast<cl_float>(SHARPEN_MASK_GRADIENT_SCALE);
+    cl_uint arg = 0;
+    bool ok = true;
+    ok = ok && set(arg++, sizeof(cl_mem), &image);
+    ok = ok && set(arg++, sizeof(cl_mem), &mask);
+    ok = ok && set(arg++, sizeof(cl_int), &cl_width);
+    ok = ok && set(arg++, sizeof(cl_int), &cl_height);
+    ok = ok && set(arg++, sizeof(cl_int), &cl_pitch);
+    ok = ok && set(arg++, sizeof(cl_float), &threshold);
+    ok = ok && set(arg++, sizeof(cl_float), &scale);
+    const std::size_t global[2] = {
+        static_cast<std::size_t>(width),
+        static_cast<std::size_t>(height)};
+    cl_event done = nullptr;
+    if (!ok ||
+        env->api->EnqueueNDRangeKernel(env->queue, mask_kernel, 2, nullptr,
+                                       global, nullptr, 0, nullptr,
+                                       &done) != CL_SUCCESS ||
+        done == nullptr) {
+        if (done != nullptr) {
+            env->api->ReleaseEvent(done);
+        }
+        error = "sharpen mask launch failed";
+        return RT_STAGE_ERROR;
+    }
+    const cl_int wait = env->api->WaitForEvents(1, &done);
+    env->api->ReleaseEvent(done);
+    if (wait != CL_SUCCESS) {
+        error = "sharpen mask did not complete";
+        return RT_STAGE_ERROR;
+    }
+    if (contrast_threshold == 0.0f) {
+        return RT_STAGE_OK;
+    }
+    SharpenIirFactors factors;
+    sharpen_iir_factors(SHARPEN_MASK_SIGMA, factors);
+    if (!sharpen_iir_plane(env, iir_kernel, mask, mask, temp, width, height,
+                           pitch, factors, error)) {
+        return RT_STAGE_ERROR;
+    }
+    return RT_STAGE_OK;
+}
+
+/* The undamped Richardson-Lucy recurrence of the output-sharpening core.
+ * `luminance` is the padded L plane in place, `mask` the contrast mask,
+ * `estimate` and `tmp` are scratch planes, all with the same pitch. */
+RtStageStatus sharpen_rld_plane(const std::shared_ptr<OpenCLEnv>& env,
+                                const KernelDef* def, int width, int height,
+                                int pitch, cl_mem luminance, cl_mem mask,
+                                cl_mem estimate, cl_mem tmp, double radius,
+                                double scale, int iterations, int amount,
+                                std::string& error)
+{
+    if (amount == 0) {
+        return RT_STAGE_OK;
+    }
+    const double sigma = radius / scale;
+
+    cl_kernel init_kernel =
+        compiled_kernel_entry(env, def, "rt_sharpen_rld_init", error);
+    cl_kernel final_kernel =
+        compiled_kernel_entry(env, def, "rt_sharpen_rld_final", error);
+    if (init_kernel == nullptr || final_kernel == nullptr) {
+        return RT_STAGE_FALLBACK;
+    }
+
+    /*
+     * gaussianBlur() skips below GAUSS_SKIP, uses 3x3 below 0.6, 5x5 up to
+     * 0.84 and 7x7 up to 1.15. The callers have already excluded the
+     * separable IIR range.
+     */
+    enum class RldClass { Skip, Fir3, Kernel5, Kernel7 };
+    RldClass rld_class = RldClass::Skip;
+    if (sigma >= SHARPEN_GAUSS_SKIP) {
+        if (sigma < SHARPEN_FIR_LIMIT) {
+            rld_class = RldClass::Fir3;
+        } else if (sigma <= SHARPEN_5X5_LIMIT) {
+            rld_class = RldClass::Kernel5;
+        } else {
+            rld_class = RldClass::Kernel7;
+        }
+    }
+
+    cl_kernel div_kernel = nullptr;
+    cl_kernel mult_kernel = nullptr;
+    SharpenFirFactors fir_factors;
+    SharpenKernel5 kernel5;
+    SharpenKernel7 kernel7;
+    switch (rld_class) {
+    case RldClass::Skip:
+        break;
+    case RldClass::Fir3:
+        sharpen_fir_factors(sigma, fir_factors);
+        div_kernel =
+            compiled_kernel_entry(env, def, "rt_sharpen_div3", error);
+        mult_kernel =
+            compiled_kernel_entry(env, def, "rt_sharpen_mult3", error);
+        break;
+    case RldClass::Kernel5:
+        sharpen_kernel5(sigma, kernel5);
+        div_kernel =
+            compiled_kernel_entry(env, def, "rt_sharpen_div5", error);
+        mult_kernel =
+            compiled_kernel_entry(env, def, "rt_sharpen_mult5", error);
+        break;
+    case RldClass::Kernel7:
+        sharpen_kernel7(sigma, kernel7);
+        div_kernel =
+            compiled_kernel_entry(env, def, "rt_sharpen_div7", error);
+        mult_kernel =
+            compiled_kernel_entry(env, def, "rt_sharpen_mult7", error);
+        break;
+    }
+    if (rld_class != RldClass::Skip &&
+        (div_kernel == nullptr || mult_kernel == nullptr)) {
+        return RT_STAGE_FALLBACK;
+    }
+
+    const auto set = [&](cl_kernel kernel, cl_uint index,
+                         std::size_t bytes, const void* value) {
+        return env->api->SetKernelArg(kernel, index, bytes, value) ==
+               CL_SUCCESS;
+    };
+    const auto run_2d = [&](cl_kernel kernel) -> bool {
+        const std::size_t global[2] = {
+            static_cast<std::size_t>(width),
+            static_cast<std::size_t>(height)};
+        cl_event done = nullptr;
+        if (env->api->EnqueueNDRangeKernel(env->queue, kernel, 2, nullptr,
+                                           global, nullptr, 0, nullptr,
+                                           &done) != CL_SUCCESS ||
+            done == nullptr) {
+            return false;
+        }
+        const cl_int wait = env->api->WaitForEvents(1, &done);
+        env->api->ReleaseEvent(done);
+        return wait == CL_SUCCESS;
+    };
+
+    const cl_int cl_width = width;
+    const cl_int cl_height = height;
+    const cl_int cl_pitch = pitch;
+    bool init_ok =
+        set(init_kernel, 0, sizeof(cl_mem), &luminance) &&
+        set(init_kernel, 1, sizeof(cl_mem), &estimate) &&
+        set(init_kernel, 2, sizeof(cl_int), &cl_width) &&
+        set(init_kernel, 3, sizeof(cl_int), &cl_height) &&
+        set(init_kernel, 4, sizeof(cl_int), &cl_pitch) &&
+        run_2d(init_kernel);
+    if (!init_ok) {
+        error = "sharpen RLD initialisation failed";
+        return RT_STAGE_ERROR;
+    }
+
+    if (rld_class != RldClass::Skip) {
+        const auto run_div = [&]() -> bool {
+            bool ok =
+                set(div_kernel, 0, sizeof(cl_mem), &estimate) &&
+                set(div_kernel, 1, sizeof(cl_mem), &tmp) &&
+                set(div_kernel, 2, sizeof(cl_mem), &luminance) &&
+                set(div_kernel, 3, sizeof(cl_int), &cl_width) &&
+                set(div_kernel, 4, sizeof(cl_int), &cl_height) &&
+                set(div_kernel, 5, sizeof(cl_int), &cl_pitch);
+            cl_uint arg = 6;
+            if (rld_class == RldClass::Fir3) {
+                ok = ok &&
+                     set(div_kernel, arg++, sizeof(cl_float),
+                         &fir_factors.c0) &&
+                     set(div_kernel, arg++, sizeof(cl_float),
+                         &fir_factors.c1) &&
+                     set(div_kernel, arg++, sizeof(cl_float),
+                         &fir_factors.c2) &&
+                     set(div_kernel, arg++, sizeof(cl_float),
+                         &fir_factors.b0) &&
+                     set(div_kernel, arg++, sizeof(cl_float),
+                         &fir_factors.b1);
+            } else if (rld_class == RldClass::Kernel5) {
+                ok = ok &&
+                     set(div_kernel, arg++, sizeof(cl_float), &kernel5.c00) &&
+                     set(div_kernel, arg++, sizeof(cl_float), &kernel5.c10) &&
+                     set(div_kernel, arg++, sizeof(cl_float), &kernel5.c11) &&
+                     set(div_kernel, arg++, sizeof(cl_float), &kernel5.c20) &&
+                     set(div_kernel, arg++, sizeof(cl_float), &kernel5.c21);
+            } else {
+                ok = ok &&
+                     set(div_kernel, arg++, sizeof(cl_float), &kernel7.c00) &&
+                     set(div_kernel, arg++, sizeof(cl_float), &kernel7.c10) &&
+                     set(div_kernel, arg++, sizeof(cl_float), &kernel7.c11) &&
+                     set(div_kernel, arg++, sizeof(cl_float), &kernel7.c20) &&
+                     set(div_kernel, arg++, sizeof(cl_float), &kernel7.c21) &&
+                     set(div_kernel, arg++, sizeof(cl_float), &kernel7.c22) &&
+                     set(div_kernel, arg++, sizeof(cl_float), &kernel7.c30) &&
+                     set(div_kernel, arg++, sizeof(cl_float), &kernel7.c31);
+            }
+            return ok && run_2d(div_kernel);
+        };
+        const auto run_mult = [&]() -> bool {
+            bool ok =
+                set(mult_kernel, 0, sizeof(cl_mem), &tmp) &&
+                set(mult_kernel, 1, sizeof(cl_mem), &estimate) &&
+                set(mult_kernel, 2, sizeof(cl_int), &cl_width) &&
+                set(mult_kernel, 3, sizeof(cl_int), &cl_height) &&
+                set(mult_kernel, 4, sizeof(cl_int), &cl_pitch);
+            cl_uint arg = 5;
+            if (rld_class == RldClass::Fir3) {
+                ok = ok &&
+                     set(mult_kernel, arg++, sizeof(cl_float),
+                         &fir_factors.c0) &&
+                     set(mult_kernel, arg++, sizeof(cl_float),
+                         &fir_factors.c1) &&
+                     set(mult_kernel, arg++, sizeof(cl_float),
+                         &fir_factors.c2) &&
+                     set(mult_kernel, arg++, sizeof(cl_float),
+                         &fir_factors.b0) &&
+                     set(mult_kernel, arg++, sizeof(cl_float),
+                         &fir_factors.b1);
+            } else if (rld_class == RldClass::Kernel5) {
+                ok = ok &&
+                     set(mult_kernel, arg++, sizeof(cl_float),
+                         &kernel5.c00) &&
+                     set(mult_kernel, arg++, sizeof(cl_float),
+                         &kernel5.c10) &&
+                     set(mult_kernel, arg++, sizeof(cl_float),
+                         &kernel5.c11) &&
+                     set(mult_kernel, arg++, sizeof(cl_float),
+                         &kernel5.c20) &&
+                     set(mult_kernel, arg++, sizeof(cl_float),
+                         &kernel5.c21);
+            } else {
+                ok = ok &&
+                     set(mult_kernel, arg++, sizeof(cl_float),
+                         &kernel7.c00) &&
+                     set(mult_kernel, arg++, sizeof(cl_float),
+                         &kernel7.c10) &&
+                     set(mult_kernel, arg++, sizeof(cl_float),
+                         &kernel7.c11) &&
+                     set(mult_kernel, arg++, sizeof(cl_float),
+                         &kernel7.c20) &&
+                     set(mult_kernel, arg++, sizeof(cl_float),
+                         &kernel7.c21) &&
+                     set(mult_kernel, arg++, sizeof(cl_float),
+                         &kernel7.c22) &&
+                     set(mult_kernel, arg++, sizeof(cl_float),
+                         &kernel7.c30) &&
+                     set(mult_kernel, arg++, sizeof(cl_float),
+                         &kernel7.c31);
+            }
+            return ok && run_2d(mult_kernel);
+        };
+
+        for (int iteration = 0; iteration < iterations; ++iteration) {
+            if (!run_div() || !run_mult()) {
+                error = "sharpen RLD iteration failed";
+                return RT_STAGE_ERROR;
+            }
+        }
+    }
+
+    const cl_float rld_amount = static_cast<cl_float>(amount) / 100.0f;
+    const bool final_ok =
+        set(final_kernel, 0, sizeof(cl_mem), &luminance) &&
+        set(final_kernel, 1, sizeof(cl_mem), &estimate) &&
+        set(final_kernel, 2, sizeof(cl_mem), &mask) &&
+        set(final_kernel, 3, sizeof(cl_int), &cl_width) &&
+        set(final_kernel, 4, sizeof(cl_int), &cl_height) &&
+        set(final_kernel, 5, sizeof(cl_int), &cl_pitch) &&
+        set(final_kernel, 6, sizeof(cl_float), &rld_amount) &&
+        run_2d(final_kernel);
+    if (!final_ok) {
+        error = "sharpen RLD final blend failed";
+        return RT_STAGE_ERROR;
+    }
+    return RT_STAGE_OK;
+}
+
 RtStageStatus run_sharpen(const std::shared_ptr<OpenCLEnv>& env,
                           const std::shared_ptr<OpenCLResidency>& residency,
                           const std::vector<RtStageArg>& args,
@@ -7455,11 +7823,9 @@ RtStageStatus run_sharpen(const std::shared_ptr<OpenCLEnv>& env,
 
     const KernelDef* def = find_kernel("output.sharpen");
     assert(def != nullptr);
-    cl_kernel mask_kernel =
-        compiled_kernel_entry(env, def, "rt_sharpen_mask", error);
     cl_kernel iir_kernel =
         compiled_kernel_entry(env, def, "rt_sharpen_iir_line", error);
-    if (mask_kernel == nullptr || iir_kernel == nullptr) {
+    if (iir_kernel == nullptr) {
         return RT_STAGE_FALLBACK;
     }
 
@@ -7563,21 +7929,12 @@ RtStageStatus run_sharpen(const std::shared_ptr<OpenCLEnv>& env,
     /* Contrast mask, then its sigma-2 blur (skipped when the mask is flat). */
     const cl_float contrast_threshold =
         static_cast<cl_float>(p.contrast / 100.0);
-    const cl_float contrast_scale =
-        static_cast<cl_float>(SHARPEN_MASK_GRADIENT_SCALE);
-    const bool mask_ok =
-        set_arg(mask_kernel, 0, sizeof(cl_mem), &image_memory) &&
-        set_arg(mask_kernel, 1, sizeof(cl_mem), &mask_memory) &&
-        set_arg(mask_kernel, 2, sizeof(cl_int), &cl_width) &&
-        set_arg(mask_kernel, 3, sizeof(cl_int), &cl_height) &&
-        set_arg(mask_kernel, 4, sizeof(cl_int), &cl_pitch) &&
-        set_arg(mask_kernel, 5, sizeof(cl_float), &contrast_threshold) &&
-        set_arg(mask_kernel, 6, sizeof(cl_float), &contrast_scale) &&
-        run_2d(mask_kernel, width, height);
-    if (!mask_ok) {
+    const RtStageStatus mask_status = sharpen_mask_plane(
+        env, def, width, height, pitch, image_memory, mask_memory,
+        temp_memory, contrast_threshold, error);
+    if (mask_status != RT_STAGE_OK) {
         release_scratch();
-        error = "output.sharpen mask failed";
-        return RT_STAGE_ERROR;
+        return mask_status;
     }
 
     const auto run_iir = [&](cl_mem source, cl_mem target, int length,
@@ -7619,235 +7976,17 @@ RtStageStatus run_sharpen(const std::shared_ptr<OpenCLEnv>& env,
         return run_1d(iir_kernel, lines);
     };
 
-    if (contrast_threshold != 0.0f) {
-        SharpenIirFactors mask_factors;
-        sharpen_iir_factors(SHARPEN_MASK_SIGMA, mask_factors);
-        if (!run_iir(mask_memory, temp_memory, width, pitch, pitch, 1, 1,
-                     height, mask_factors) ||
-            !run_iir(temp_memory, mask_memory, height, 1, 1, pitch, pitch,
-                     width, mask_factors)) {
-            release_scratch();
-            error = "output.sharpen mask blur failed";
-            return RT_STAGE_ERROR;
-        }
-    }
-
     if (p.method == SHARPEN_METHOD_RLD) {
-        const double rld_sigma = p.deconvradius / p.scale;
-
-        cl_kernel init_kernel =
-            compiled_kernel_entry(env, def, "rt_sharpen_rld_init", error);
-        cl_kernel final_kernel =
-            compiled_kernel_entry(env, def, "rt_sharpen_rld_final", error);
-        if (init_kernel == nullptr || final_kernel == nullptr) {
+        const RtStageStatus rld_status = sharpen_rld_plane(
+            env, def, width, height, pitch, image_memory, mask_memory,
+            temp_memory, blur_memory, p.deconvradius, p.scale,
+            p.deconviter, p.deconvamount, error);
+        if (rld_status != RT_STAGE_OK) {
             release_scratch();
-            return RT_STAGE_FALLBACK;
+            return rld_status;
         }
-
-        /*
-         * gaussianBlur() skips below GAUSS_SKIP, uses 3x3 below 0.6, 5x5 up
-         * to 0.84 and 7x7 up to 1.15. The support check has already excluded
-         * the separable IIR range.
-         */
-        enum class RldClass { Skip, Fir3, Kernel5, Kernel7 };
-        RldClass rld_class = RldClass::Skip;
-        if (rld_sigma >= SHARPEN_GAUSS_SKIP) {
-            if (rld_sigma < SHARPEN_FIR_LIMIT) {
-                rld_class = RldClass::Fir3;
-            } else if (rld_sigma <= SHARPEN_5X5_LIMIT) {
-                rld_class = RldClass::Kernel5;
-            } else {
-                rld_class = RldClass::Kernel7;
-            }
-        }
-
-        cl_kernel div_kernel = nullptr;
-        cl_kernel mult_kernel = nullptr;
-        SharpenFirFactors fir_factors;
-        SharpenKernel5 kernel5;
-        SharpenKernel7 kernel7;
-        switch (rld_class) {
-        case RldClass::Skip:
-            break;
-        case RldClass::Fir3:
-            sharpen_fir_factors(rld_sigma, fir_factors);
-            div_kernel =
-                compiled_kernel_entry(env, def, "rt_sharpen_div3", error);
-            mult_kernel =
-                compiled_kernel_entry(env, def, "rt_sharpen_mult3", error);
-            break;
-        case RldClass::Kernel5:
-            sharpen_kernel5(rld_sigma, kernel5);
-            div_kernel =
-                compiled_kernel_entry(env, def, "rt_sharpen_div5", error);
-            mult_kernel =
-                compiled_kernel_entry(env, def, "rt_sharpen_mult5", error);
-            break;
-        case RldClass::Kernel7:
-            sharpen_kernel7(rld_sigma, kernel7);
-            div_kernel =
-                compiled_kernel_entry(env, def, "rt_sharpen_div7", error);
-            mult_kernel =
-                compiled_kernel_entry(env, def, "rt_sharpen_mult7", error);
-            break;
-        }
-        if (rld_class != RldClass::Skip &&
-            (div_kernel == nullptr || mult_kernel == nullptr)) {
-            release_scratch();
-            return RT_STAGE_FALLBACK;
-        }
-
-        cl_mem estimate_memory = temp_memory;
-        cl_mem tmp_memory = blur_memory;
-        const bool init_ok =
-            set_arg(init_kernel, 0, sizeof(cl_mem), &image_memory) &&
-            set_arg(init_kernel, 1, sizeof(cl_mem), &estimate_memory) &&
-            set_arg(init_kernel, 2, sizeof(cl_int), &cl_width) &&
-            set_arg(init_kernel, 3, sizeof(cl_int), &cl_height) &&
-            set_arg(init_kernel, 4, sizeof(cl_int), &cl_pitch) &&
-            run_2d(init_kernel, width, height);
-        if (!init_ok) {
-            release_scratch();
-            error = "output.sharpen RLD initialisation failed";
-            return RT_STAGE_ERROR;
-        }
-
-        if (rld_class != RldClass::Skip) {
-            const auto run_div = [&]() -> bool {
-                bool ok =
-                    set_arg(div_kernel, 0, sizeof(cl_mem), &estimate_memory) &&
-                    set_arg(div_kernel, 1, sizeof(cl_mem), &tmp_memory) &&
-                    set_arg(div_kernel, 2, sizeof(cl_mem), &image_memory) &&
-                    set_arg(div_kernel, 3, sizeof(cl_int), &cl_width) &&
-                    set_arg(div_kernel, 4, sizeof(cl_int), &cl_height) &&
-                    set_arg(div_kernel, 5, sizeof(cl_int), &cl_pitch);
-                cl_uint arg = 6;
-                if (rld_class == RldClass::Fir3) {
-                    ok = ok &&
-                         set_arg(div_kernel, arg++, sizeof(cl_float),
-                                 &fir_factors.c0) &&
-                         set_arg(div_kernel, arg++, sizeof(cl_float),
-                                 &fir_factors.c1) &&
-                         set_arg(div_kernel, arg++, sizeof(cl_float),
-                                 &fir_factors.c2) &&
-                         set_arg(div_kernel, arg++, sizeof(cl_float),
-                                 &fir_factors.b0) &&
-                         set_arg(div_kernel, arg++, sizeof(cl_float),
-                                 &fir_factors.b1);
-                } else if (rld_class == RldClass::Kernel5) {
-                    ok = ok &&
-                         set_arg(div_kernel, arg++, sizeof(cl_float),
-                                 &kernel5.c00) &&
-                         set_arg(div_kernel, arg++, sizeof(cl_float),
-                                 &kernel5.c10) &&
-                         set_arg(div_kernel, arg++, sizeof(cl_float),
-                                 &kernel5.c11) &&
-                         set_arg(div_kernel, arg++, sizeof(cl_float),
-                                 &kernel5.c20) &&
-                         set_arg(div_kernel, arg++, sizeof(cl_float),
-                                 &kernel5.c21);
-                } else {
-                    ok = ok &&
-                         set_arg(div_kernel, arg++, sizeof(cl_float),
-                                 &kernel7.c00) &&
-                         set_arg(div_kernel, arg++, sizeof(cl_float),
-                                 &kernel7.c10) &&
-                         set_arg(div_kernel, arg++, sizeof(cl_float),
-                                 &kernel7.c11) &&
-                         set_arg(div_kernel, arg++, sizeof(cl_float),
-                                 &kernel7.c20) &&
-                         set_arg(div_kernel, arg++, sizeof(cl_float),
-                                 &kernel7.c21) &&
-                         set_arg(div_kernel, arg++, sizeof(cl_float),
-                                 &kernel7.c22) &&
-                         set_arg(div_kernel, arg++, sizeof(cl_float),
-                                 &kernel7.c30) &&
-                         set_arg(div_kernel, arg++, sizeof(cl_float),
-                                 &kernel7.c31);
-                }
-                return ok && run_2d(div_kernel, width, height);
-            };
-            const auto run_mult = [&]() -> bool {
-                bool ok =
-                    set_arg(mult_kernel, 0, sizeof(cl_mem), &tmp_memory) &&
-                    set_arg(mult_kernel, 1, sizeof(cl_mem), &estimate_memory) &&
-                    set_arg(mult_kernel, 2, sizeof(cl_int), &cl_width) &&
-                    set_arg(mult_kernel, 3, sizeof(cl_int), &cl_height) &&
-                    set_arg(mult_kernel, 4, sizeof(cl_int), &cl_pitch);
-                cl_uint arg = 5;
-                if (rld_class == RldClass::Fir3) {
-                    ok = ok &&
-                         set_arg(mult_kernel, arg++, sizeof(cl_float),
-                                 &fir_factors.c0) &&
-                         set_arg(mult_kernel, arg++, sizeof(cl_float),
-                                 &fir_factors.c1) &&
-                         set_arg(mult_kernel, arg++, sizeof(cl_float),
-                                 &fir_factors.c2) &&
-                         set_arg(mult_kernel, arg++, sizeof(cl_float),
-                                 &fir_factors.b0) &&
-                         set_arg(mult_kernel, arg++, sizeof(cl_float),
-                                 &fir_factors.b1);
-                } else if (rld_class == RldClass::Kernel5) {
-                    ok = ok &&
-                         set_arg(mult_kernel, arg++, sizeof(cl_float),
-                                 &kernel5.c00) &&
-                         set_arg(mult_kernel, arg++, sizeof(cl_float),
-                                 &kernel5.c10) &&
-                         set_arg(mult_kernel, arg++, sizeof(cl_float),
-                                 &kernel5.c11) &&
-                         set_arg(mult_kernel, arg++, sizeof(cl_float),
-                                 &kernel5.c20) &&
-                         set_arg(mult_kernel, arg++, sizeof(cl_float),
-                                 &kernel5.c21);
-                } else {
-                    ok = ok &&
-                         set_arg(mult_kernel, arg++, sizeof(cl_float),
-                                 &kernel7.c00) &&
-                         set_arg(mult_kernel, arg++, sizeof(cl_float),
-                                 &kernel7.c10) &&
-                         set_arg(mult_kernel, arg++, sizeof(cl_float),
-                                 &kernel7.c11) &&
-                         set_arg(mult_kernel, arg++, sizeof(cl_float),
-                                 &kernel7.c20) &&
-                         set_arg(mult_kernel, arg++, sizeof(cl_float),
-                                 &kernel7.c21) &&
-                         set_arg(mult_kernel, arg++, sizeof(cl_float),
-                                 &kernel7.c22) &&
-                         set_arg(mult_kernel, arg++, sizeof(cl_float),
-                                 &kernel7.c30) &&
-                         set_arg(mult_kernel, arg++, sizeof(cl_float),
-                                 &kernel7.c31);
-                }
-                return ok && run_2d(mult_kernel, width, height);
-            };
-
-            for (int iteration = 0; iteration < p.deconviter; ++iteration) {
-                if (!run_div() || !run_mult()) {
-                    release_scratch();
-                    error = "output.sharpen RLD iteration failed";
-                    return RT_STAGE_ERROR;
-                }
-            }
-        }
-
-        const cl_float rld_amount =
-            static_cast<cl_float>(p.deconvamount) / 100.0f;
-        const bool final_ok =
-            set_arg(final_kernel, 0, sizeof(cl_mem), &image_memory) &&
-            set_arg(final_kernel, 1, sizeof(cl_mem), &estimate_memory) &&
-            set_arg(final_kernel, 2, sizeof(cl_mem), &mask_memory) &&
-            set_arg(final_kernel, 3, sizeof(cl_int), &cl_width) &&
-            set_arg(final_kernel, 4, sizeof(cl_int), &cl_height) &&
-            set_arg(final_kernel, 5, sizeof(cl_int), &cl_pitch) &&
-            set_arg(final_kernel, 6, sizeof(cl_float), &rld_amount) &&
-            run_2d(final_kernel, width, height);
-        if (!final_ok) {
-            release_scratch();
-            error = "output.sharpen RLD final blend failed";
-            return RT_STAGE_ERROR;
-        }
-
-        const RtStageStatus readback = residency->readback(image_device, image);
+        const RtStageStatus readback =
+            residency->readback(image_device, image);
         release_scratch();
         if (readback != RT_STAGE_OK) {
             error = "output.sharpen RLD readback failed";
@@ -7963,9 +8102,9 @@ RtStageStatus run_sharpen(const std::shared_ptr<OpenCLEnv>& env,
  *
  * Pass order matches Lab_Local(): the optional negative-value prefilter, then,
  * per active spot, local log encoding, local dehaze, local CBDL, vibrance,
- * shadows/highlights, soft light, local contrast and Colour & Light, each with
- * its own ROI copy and deltaE reference blur. The full-image tail clamp and
- * the Munsell pass follow.
+ * shadows/highlights, soft light, local contrast, local sharpening and Colour
+ * & Light, each with its own ROI copy and deltaE reference blur. The full-image
+ * tail clamp and the Munsell pass follow.
  * Every pass writes the device image;
  * the host Lab is read back only after all passes succeeded, so a refusal or
  * a failed launch leaves it untouched for the builtin.
@@ -8051,6 +8190,14 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
         compiled_kernel_entry(env, def, "rt_local_adjustments_clamp", error);
     cl_kernel roi_kernel =
         compiled_kernel_entry(env, def, "rt_local_adjustments_roi", error);
+    cl_kernel sharpen_fill_kernel =
+        compiled_kernel_entry(env, def, "rt_local_adjustments_sharpen_fill",
+                              error);
+    cl_kernel plane_copy_kernel =
+        compiled_kernel_entry(env, def, "rt_local_adjustments_plane_copy",
+                              error);
+    cl_kernel sharpen_line_kernel =
+        compiled_kernel_entry(env, def, "rt_sharpen_iir_line", error);
     cl_kernel munsell_kernel =
         compiled_kernel_entry(env, def, "rt_local_adjustments_munsell", error);
     cl_kernel line_kernel =
@@ -8124,6 +8271,8 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
         compiled_kernel_entry(env, def, "rt_lab_tools_apply", error);
     if (apply_kernel == nullptr || clamp_kernel == nullptr ||
         roi_kernel == nullptr || munsell_kernel == nullptr ||
+        sharpen_fill_kernel == nullptr || plane_copy_kernel == nullptr ||
+        sharpen_line_kernel == nullptr ||
         line_kernel == nullptr || vibrance_kernel == nullptr ||
         lc_blend_kernel == nullptr || blend_kernel == nullptr ||
         log_kernel == nullptr || log_blend_kernel == nullptr ||
@@ -8310,6 +8459,12 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
     char cbdl_chroma_key = 0;
     char work_key = 0;
     char scratch_key = 0;
+    char sharpen_luma_key = 0;
+    char sharpen_mask_key = 0;
+    char sharpen_estimate_key = 0;
+    char sharpen_tmp_key = 0;
+    char sharpen_blur_keys[3] = {0, 0, 0};
+    char sharpen_blur_tmp_key = 0;
     char log_orig_key = 0;
     char blur_keys[3] = {0, 0, 0};
     char lc_h_key = 0;
@@ -8503,6 +8658,8 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
             rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXPDENAZE] == 1.0f;
         const bool logPass =
             rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXPLOG] == 1.0f;
+        const bool sharpenPass =
+            rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXPSHARP] == 1.0f;
         const uint32_t shape =
             static_cast<uint32_t>(rec[RT_LOCAL_ADJUSTMENTS_SLOT_SHAPE]);
         const uint32_t avoid = static_cast<uint32_t>(
@@ -8525,6 +8682,8 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
             (rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXPDENAZE] != 0.0f &&
              !dehazePass) ||
             (rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXPLOG] != 0.0f && !logPass) ||
+            (rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXPSHARP] != 0.0f &&
+             !sharpenPass) ||
             (rec[RT_LOCAL_ADJUSTMENTS_SLOT_MERGE] != 0.0f) ||
             (rec[RT_LOCAL_ADJUSTMENTS_SLOT_HRENABLED] != 0.0f) ||
             (rec[RT_LOCAL_ADJUSTMENTS_SLOT_REPARCOL] != 100.0f) ||
@@ -8540,7 +8699,7 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
              rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXPCOLOR] != 1.0f) ||
             (!active && (colour || vibrance || localContrast ||
                          shadowsHighlights || softLight || cbdl ||
-                         dehazePass || logPass || islocal))) {
+                         dehazePass || logPass || sharpenPass || islocal))) {
             error = "local.adjustments record is outside the supported set";
             return RT_STAGE_FALLBACK;
         }
@@ -8618,6 +8777,26 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
              rec[RT_LOCAL_ADJUSTMENTS_SLOT_SENSSOFT] < 1.0f ||
              rec[RT_LOCAL_ADJUSTMENTS_SLOT_SENSSOFT] > 100.0f)) {
             error = "local.adjustments soft-light setting is outside its "
+                    "range";
+            return RT_STAGE_FALLBACK;
+        }
+        if (sharpenPass &&
+            (rec[RT_LOCAL_ADJUSTMENTS_SLOT_SENSSHA] < 0.0f ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_SENSSHA] > 100.0f ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_SHAR_AMOUNT] < 1.0f ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_SHAR_AMOUNT] > 100.0f ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_SHAR_RADIUS] <=
+                 RT_LOCAL_ADJUSTMENTS_SHARPEN_NOOP_RADIUS ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_SHAR_RADIUS] >=
+                 RT_LOCAL_ADJUSTMENTS_SHARPEN_SIGMA_LIMIT ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_SHAR_ITER] < 5.0f ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_SHAR_ITER] > 100.0f ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_SHAR_CONTRAST] < 3.0f ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_SHAR_CONTRAST] > 200.0f ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_SHAR_BLUR] < 0.2f ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_SHAR_BLUR] >=
+                 RT_LOCAL_ADJUSTMENTS_SHARPEN_BLUR_LIMIT)) {
+            error = "local.adjustments sharpening setting is outside its "
                     "range";
             return RT_STAGE_FALLBACK;
         }
@@ -9099,6 +9278,73 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
             StageDeviceBufferPtr scratch_device = residency->acquire(
                 &scratch_key, StageBufferShape{RT_STAGE_F32, bfw, bfh, 1},
                 &error);
+            /*
+             * Local sharpening's padded extent and its three companion
+             * planes (contrast mask, RLD estimate, RLD intermediate). The
+             * extent is the block's `lx + lxL + 3` by `ly + lyT + 3`, not the
+             * clipped ROI.
+             */
+            const int sharpenBegX = static_cast<int>(
+                rec[RT_LOCAL_ADJUSTMENTS_SLOT_XC] -
+                rec[RT_LOCAL_ADJUSTMENTS_SLOT_LXL]);
+            const int sharpenBegY = static_cast<int>(
+                rec[RT_LOCAL_ADJUSTMENTS_SLOT_YC] -
+                rec[RT_LOCAL_ADJUSTMENTS_SLOT_LYT]);
+            const int sharpenW = static_cast<int>(
+                rec[RT_LOCAL_ADJUSTMENTS_SLOT_LX] +
+                rec[RT_LOCAL_ADJUSTMENTS_SLOT_LXL]) +
+                RT_LOCAL_ADJUSTMENTS_SHARPEN_ROI_PAD;
+            const int sharpenH = static_cast<int>(
+                rec[RT_LOCAL_ADJUSTMENTS_SLOT_LY] +
+                rec[RT_LOCAL_ADJUSTMENTS_SLOT_LYT]) +
+                RT_LOCAL_ADJUSTMENTS_SHARPEN_ROI_PAD;
+            const int sharpenEndX = static_cast<int>(
+                rec[RT_LOCAL_ADJUSTMENTS_SLOT_XC] +
+                rec[RT_LOCAL_ADJUSTMENTS_SLOT_LX]);
+            const int sharpenEndY = static_cast<int>(
+                rec[RT_LOCAL_ADJUSTMENTS_SLOT_YC] +
+                rec[RT_LOCAL_ADJUSTMENTS_SLOT_LY]);
+            StageDeviceBufferPtr sharpen_luma_device;
+            StageDeviceBufferPtr sharpen_mask_device;
+            StageDeviceBufferPtr sharpen_estimate_device;
+            StageDeviceBufferPtr sharpen_tmp_device;
+            StageDeviceBufferPtr sharpen_blur_device[3];
+            StageDeviceBufferPtr sharpen_blur_tmp_device;
+            if (sharpenPass) {
+                if (sharpenW < RT_LOCAL_ADJUSTMENTS_SHARPEN_MIN_ROI ||
+                    sharpenH < RT_LOCAL_ADJUSTMENTS_SHARPEN_MIN_ROI ||
+                    static_cast<long long>(sharpenW) * sharpenH >
+                        std::numeric_limits<cl_int>::max() ||
+                    xstart < sharpenBegX || ystart < sharpenBegY ||
+                    sharpenEndX - sharpenBegX > sharpenW ||
+                    sharpenEndY - sharpenBegY > sharpenH) {
+                    error = "local.adjustments sharpening extent is outside "
+                            "the block's range";
+                    return RT_STAGE_FALLBACK;
+                }
+                const StageBufferShape sharpen_shape{
+                    RT_STAGE_F32, sharpenW, sharpenH, 1};
+                sharpen_luma_device = residency->acquire(
+                    &sharpen_luma_key, sharpen_shape, &error);
+                sharpen_mask_device = residency->acquire(
+                    &sharpen_mask_key, sharpen_shape, &error);
+                sharpen_estimate_device = residency->acquire(
+                    &sharpen_estimate_key, sharpen_shape, &error);
+                sharpen_tmp_device = residency->acquire(
+                    &sharpen_tmp_key, sharpen_shape, &error);
+                /* Sharp_Local() blurs the full image for its deltaE
+                 * reference, not the ROI. */
+                for (int plane = 0; plane < 3; ++plane) {
+                    sharpen_blur_device[plane] = residency->acquire(
+                        &sharpen_blur_keys[plane],
+                        StageBufferShape{RT_STAGE_F32, width, height, 1},
+                        &error);
+                }
+                sharpen_blur_tmp_device = residency->acquire(
+                    &sharpen_blur_tmp_key,
+                    StageBufferShape{RT_STAGE_F32, width, height, 1},
+                    &error);
+            }
             StageDeviceBufferPtr log_orig_device;
             if (logPass) {
                 log_orig_device = residency->acquire(
@@ -9294,6 +9540,11 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
             if (!work_device || !scratch_device || !blur_device[0] ||
                 !blur_device[1] || !blur_device[2] || !cbdl_acquired ||
                 !dehaze_acquired || (logPass && !log_orig_device) ||
+                (sharpenPass &&
+                 (!sharpen_luma_device || !sharpen_mask_device ||
+                  !sharpen_estimate_device || !sharpen_tmp_device ||
+                  !sharpen_blur_device[0] || !sharpen_blur_device[1] ||
+                  !sharpen_blur_device[2] || !sharpen_blur_tmp_device)) ||
                 (shadowsHighlights &&
                  (!sh_full_device || !sh_i1_device || !sh_p1_device ||
                   !sh_meani_device || !sh_meanp_device ||
@@ -9327,6 +9578,35 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
             const int blur_pitch = int_pitch(pitch_of(blur_device[0]), "blur");
             const int scratch_pitch =
                 int_pitch(pitch_of(scratch_device), "scratch");
+            int sharpen_pitch = 0;
+            int sharpen_plane = 0;
+            int sharpen_blur_pitch = 0;
+            if (sharpenPass) {
+                sharpen_pitch =
+                    int_pitch(pitch_of(sharpen_luma_device), "sharpen");
+                sharpen_plane = int_pitch(
+                    plane_pitch_of(sharpen_luma_device), "sharpen plane");
+                sharpen_blur_pitch = int_pitch(
+                    pitch_of(sharpen_blur_device[0]), "sharpen blur");
+                if (sharpen_pitch < 0 || sharpen_plane < 0 ||
+                    sharpen_blur_pitch < 0 ||
+                    pitch_of(sharpen_mask_device) !=
+                        pitch_of(sharpen_luma_device) ||
+                    pitch_of(sharpen_estimate_device) !=
+                        pitch_of(sharpen_luma_device) ||
+                    pitch_of(sharpen_tmp_device) !=
+                        pitch_of(sharpen_luma_device) ||
+                    pitch_of(sharpen_blur_device[1]) !=
+                        pitch_of(sharpen_blur_device[0]) ||
+                    pitch_of(sharpen_blur_device[2]) !=
+                        pitch_of(sharpen_blur_device[0]) ||
+                    pitch_of(sharpen_blur_tmp_device) !=
+                        pitch_of(sharpen_blur_device[0])) {
+                    error = "local.adjustments sharpening buffers have "
+                            "different pitches";
+                    return RT_STAGE_FALLBACK;
+                }
+            }
             int cbdl_src_pitch = 0;
             int cbdl_out_pitch = 0;
             int cbdl_resid_pitch = 0;
@@ -9433,6 +9713,24 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
             }
             cl_mem work_memory = memory_of(work_device);
             cl_mem scratch_memory = memory_of(scratch_device);
+            cl_mem sharpen_luma_memory =
+                sharpenPass ? memory_of(sharpen_luma_device) : nullptr;
+            cl_mem sharpen_mask_memory =
+                sharpenPass ? memory_of(sharpen_mask_device) : nullptr;
+            cl_mem sharpen_estimate_memory =
+                sharpenPass ? memory_of(sharpen_estimate_device) : nullptr;
+            cl_mem sharpen_tmp_memory =
+                sharpenPass ? memory_of(sharpen_tmp_device) : nullptr;
+            cl_mem sharpen_blur_memory[3] = {};
+            cl_mem sharpen_blur_tmp_memory = nullptr;
+            if (sharpenPass) {
+                for (int plane = 0; plane < 3; ++plane) {
+                    sharpen_blur_memory[plane] =
+                        memory_of(sharpen_blur_device[plane]);
+                }
+                sharpen_blur_tmp_memory =
+                    memory_of(sharpen_blur_tmp_device);
+            }
             cl_mem sh_full_memory =
                 shadowsHighlights ? memory_of(sh_full_device) : nullptr;
             cl_mem sh_i1_memory =
@@ -9513,13 +9811,19 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
             /* transit_shapedetect2()'s blend for a tool whose output is in
              * `work`: `varsens` is the tool's own scope sensitivity. */
             const auto run_blend = [&](const char* label,
-                                       cl_float varsens) {
+                                       cl_float varsens,
+                                       bool clip_luminance = false,
+                                       bool full_blur = false,
+                                       bool raw_scope = false) {
                 cl_uint arg = 0;
                 cl_mem lab_memory = memory_of(image);
                 cl_mem fin_memory = work_memory;
-                cl_mem blur_l = memory_of(blur_device[0]);
-                cl_mem blur_a = memory_of(blur_device[1]);
-                cl_mem blur_b = memory_of(blur_device[2]);
+                cl_mem blur_l = full_blur ? sharpen_blur_memory[0]
+                                          : memory_of(blur_device[0]);
+                cl_mem blur_a = full_blur ? sharpen_blur_memory[1]
+                                          : memory_of(blur_device[1]);
+                cl_mem blur_b = full_blur ? sharpen_blur_memory[2]
+                                          : memory_of(blur_device[2]);
                 cl_mem record_memory = memory_of(record_device);
                 cl_int lp = lab_pitch;
                 cl_int lpl = lab_plane;
@@ -9529,7 +9833,7 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
                 cl_int rh = bfh;
                 cl_int x0 = xstart;
                 cl_int y0 = ystart;
-                cl_int bp = blur_pitch;
+                cl_int bp = full_blur ? sharpen_blur_pitch : blur_pitch;
                 bool ok = true;
                 ok = ok && set(blend_kernel, arg++, sizeof(cl_mem),
                                &lab_memory);
@@ -9551,6 +9855,23 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
                 ok = ok && set(blend_kernel, arg++, sizeof(cl_int), &bp);
                 ok = ok && set(blend_kernel, arg++, sizeof(cl_float),
                                &varsens);
+                cl_int clip_l = clip_luminance ? 1 : 0;
+                ok = ok && set(blend_kernel, arg++, sizeof(cl_int),
+                               &clip_l);
+                cl_int full = full_blur ? 1 : 0;
+                ok = ok && set(blend_kernel, arg++, sizeof(cl_int), &full);
+                cl_int raw = raw_scope ? 1 : 0;
+                ok = ok && set(blend_kernel, arg++, sizeof(cl_int), &raw);
+                cl_int fin_padded = 0;
+                cl_int fin_l_only = 0;
+                cl_int begx = 0;
+                cl_int begy = 0;
+                ok = ok && set(blend_kernel, arg++, sizeof(cl_int),
+                               &fin_padded);
+                ok = ok && set(blend_kernel, arg++, sizeof(cl_int),
+                               &fin_l_only);
+                ok = ok && set(blend_kernel, arg++, sizeof(cl_int), &begx);
+                ok = ok && set(blend_kernel, arg++, sizeof(cl_int), &begy);
                 if (!ok) {
                     error = std::string("local.adjustments ") + label +
                             " blend arguments failed";
@@ -11673,6 +11994,212 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
                 if (!run_blend("local-contrast",
                                rec[RT_LOCAL_ADJUSTMENTS_SLOT_SENSLC])) {
                     return RT_STAGE_FALLBACK;
+                }
+            }
+
+            /*
+             * Local sharpening. Lab_Local()'s RL arm runs after local
+             * contrast and before Colour & Light. The block copies the image
+             * into its zero-padded extent, runs the output sharpening core's
+             * undamped RLD recurrence on that plane and blends the L
+             * difference with Sharp_Local()'s senstype-0 deltaE scope, whose
+             * varsens is lp.senssha. The mask and the recurrence are the
+             * shared sharpen kernels, not a local re-derivation.
+             */
+            if (sharpenPass) {
+                /* Sharp_Local()'s deltaE reference is a blur of the full
+                 * image, not the ROI. */
+                SharpenIirFactors sharpen_factors;
+                sharpen_iir_factors(
+                    RT_LOCAL_ADJUSTMENTS_SHARPEN_SCOPE_SIGMA,
+                    sharpen_factors);
+                for (int plane = 0; plane < 3; ++plane) {
+                    cl_uint arg = 0;
+                    cl_mem src = memory_of(image);
+                    cl_mem dst = sharpen_blur_memory[plane];
+                    cl_int src_plane = plane * lab_plane;
+                    cl_int src_pitch = lab_pitch;
+                    cl_int dst_pitch = sharpen_blur_pitch;
+                    cl_int w = width;
+                    cl_int h = height;
+                    bool ok = true;
+                    ok = ok && set(plane_copy_kernel, arg++, sizeof(cl_mem),
+                                   &src);
+                    ok = ok && set(plane_copy_kernel, arg++, sizeof(cl_mem),
+                                   &dst);
+                    ok = ok && set(plane_copy_kernel, arg++,
+                                   sizeof(cl_int), &src_plane);
+                    ok = ok && set(plane_copy_kernel, arg++,
+                                   sizeof(cl_int), &src_pitch);
+                    ok = ok && set(plane_copy_kernel, arg++,
+                                   sizeof(cl_int), &dst_pitch);
+                    ok = ok && set(plane_copy_kernel, arg++,
+                                   sizeof(cl_int), &w);
+                    ok = ok && set(plane_copy_kernel, arg++,
+                                   sizeof(cl_int), &h);
+                    if (!ok ||
+                        !launch2d(plane_copy_kernel,
+                                  static_cast<std::size_t>(width),
+                                  static_cast<std::size_t>(height),
+                                  "sharpen blur copy") ||
+                        !sharpen_iir_plane(env, sharpen_line_kernel, dst, dst,
+                                           sharpen_blur_tmp_memory, width,
+                                           height, sharpen_blur_pitch,
+                                           sharpen_factors, error)) {
+                        error = "local.adjustments sharpen reference blur "
+                                "failed";
+                        return RT_STAGE_FALLBACK;
+                    }
+                }
+                {
+                    cl_uint arg = 0;
+                    cl_mem lab_memory = memory_of(image);
+                    cl_int lp = lab_pitch;
+                    cl_int sp = sharpen_pitch;
+                    cl_int sw = sharpenW;
+                    cl_int sh = sharpenH;
+                    cl_int begx = sharpenBegX;
+                    cl_int begy = sharpenBegY;
+                    cl_int xend = sharpenEndX;
+                    cl_int yend = sharpenEndY;
+                    cl_int w = width;
+                    cl_int h = height;
+                    bool ok = true;
+                    ok = ok && set(sharpen_fill_kernel, arg++,
+                                   sizeof(cl_mem), &lab_memory);
+                    ok = ok && set(sharpen_fill_kernel, arg++,
+                                   sizeof(cl_mem), &sharpen_luma_memory);
+                    ok = ok && set(sharpen_fill_kernel, arg++,
+                                   sizeof(cl_int), &lp);
+                    ok = ok && set(sharpen_fill_kernel, arg++,
+                                   sizeof(cl_int), &sp);
+                    ok = ok && set(sharpen_fill_kernel, arg++,
+                                   sizeof(cl_int), &sw);
+                    ok = ok && set(sharpen_fill_kernel, arg++,
+                                   sizeof(cl_int), &sh);
+                    ok = ok && set(sharpen_fill_kernel, arg++,
+                                   sizeof(cl_int), &begx);
+                    ok = ok && set(sharpen_fill_kernel, arg++,
+                                   sizeof(cl_int), &begy);
+                    ok = ok && set(sharpen_fill_kernel, arg++,
+                                   sizeof(cl_int), &xend);
+                    ok = ok && set(sharpen_fill_kernel, arg++,
+                                   sizeof(cl_int), &yend);
+                    ok = ok && set(sharpen_fill_kernel, arg++,
+                                   sizeof(cl_int), &w);
+                    ok = ok && set(sharpen_fill_kernel, arg++,
+                                   sizeof(cl_int), &h);
+                    if (!ok ||
+                        !launch2d(sharpen_fill_kernel,
+                                  static_cast<std::size_t>(sharpenW),
+                                  static_cast<std::size_t>(sharpenH),
+                                  "sharpen fill")) {
+                        error = "local.adjustments sharpen fill failed";
+                        return RT_STAGE_FALLBACK;
+                    }
+                }
+                const cl_float contrast =
+                    rec[RT_LOCAL_ADJUSTMENTS_SLOT_SHAR_CONTRAST] / 100.0f;
+                const RtStageStatus mask_status = sharpen_mask_plane(
+                    env, def, sharpenW, sharpenH, sharpen_pitch,
+                    sharpen_luma_memory, sharpen_mask_memory,
+                    sharpen_tmp_memory, contrast, error);
+                if (mask_status != RT_STAGE_OK) {
+                    return RT_STAGE_FALLBACK;
+                }
+                const RtStageStatus rld_status = sharpen_rld_plane(
+                    env, def, sharpenW, sharpenH, sharpen_pitch,
+                    sharpen_luma_memory, sharpen_mask_memory,
+                    sharpen_estimate_memory, sharpen_tmp_memory,
+                    rec[RT_LOCAL_ADJUSTMENTS_SLOT_SHAR_RADIUS], 1.0,
+                    static_cast<int>(
+                        rec[RT_LOCAL_ADJUSTMENTS_SLOT_SHAR_ITER]),
+                    static_cast<int>(
+                        rec[RT_LOCAL_ADJUSTMENTS_SLOT_SHAR_AMOUNT]),
+                    error);
+                if (rld_status != RT_STAGE_OK) {
+                    return RT_STAGE_FALLBACK;
+                }
+                {
+                    const int blend_x0 = std::max(sharpenBegX, 0);
+                    const int blend_y0 = std::max(sharpenBegY, 0);
+                    const int blend_x1 = std::min(sharpenBegX + sharpenW,
+                                                   width);
+                    const int blend_y1 = std::min(sharpenBegY + sharpenH,
+                                                   height);
+                    const int blend_w = blend_x1 - blend_x0;
+                    const int blend_h = blend_y1 - blend_y0;
+                    cl_uint arg = 0;
+                    cl_mem lab_memory = memory_of(image);
+                    cl_mem fin_memory = sharpen_luma_memory;
+                    cl_mem blur_l = sharpen_blur_memory[0];
+                    cl_mem blur_a = sharpen_blur_memory[1];
+                    cl_mem blur_b = sharpen_blur_memory[2];
+                    cl_mem record_memory = memory_of(record_device);
+                    cl_int lp = lab_pitch;
+                    cl_int lpl = lab_plane;
+                    cl_int fp = sharpen_pitch;
+                    cl_int fpl = 0;
+                    cl_int rw = blend_w;
+                    cl_int rh = blend_h;
+                    cl_int x0 = blend_x0;
+                    cl_int y0 = blend_y0;
+                    cl_int bp = sharpen_blur_pitch;
+                    cl_float varsens =
+                        rec[RT_LOCAL_ADJUSTMENTS_SLOT_SENSSHA];
+                    cl_int clip_l = 1;
+                    cl_int full = 1;
+                    cl_int raw = 1;
+                    cl_int fin_padded = 1;
+                    cl_int fin_l_only = 1;
+                    cl_int begx = sharpenBegX;
+                    cl_int begy = sharpenBegY;
+                    bool ok = true;
+                    ok = ok && set(blend_kernel, arg++, sizeof(cl_mem),
+                                   &lab_memory);
+                    ok = ok && set(blend_kernel, arg++, sizeof(cl_mem),
+                                   &fin_memory);
+                    ok = ok && set(blend_kernel, arg++, sizeof(cl_mem),
+                                   &blur_l);
+                    ok = ok && set(blend_kernel, arg++, sizeof(cl_mem),
+                                   &blur_a);
+                    ok = ok && set(blend_kernel, arg++, sizeof(cl_mem),
+                                   &blur_b);
+                    ok = ok && set(blend_kernel, arg++, sizeof(cl_mem),
+                                   &record_memory);
+                    ok = ok && set(blend_kernel, arg++, sizeof(cl_int), &lp);
+                    ok = ok && set(blend_kernel, arg++, sizeof(cl_int), &lpl);
+                    ok = ok && set(blend_kernel, arg++, sizeof(cl_int), &fp);
+                    ok = ok && set(blend_kernel, arg++, sizeof(cl_int), &fpl);
+                    ok = ok && set(blend_kernel, arg++, sizeof(cl_int), &rw);
+                    ok = ok && set(blend_kernel, arg++, sizeof(cl_int), &rh);
+                    ok = ok && set(blend_kernel, arg++, sizeof(cl_int), &x0);
+                    ok = ok && set(blend_kernel, arg++, sizeof(cl_int), &y0);
+                    ok = ok && set(blend_kernel, arg++, sizeof(cl_int), &bp);
+                    ok = ok && set(blend_kernel, arg++, sizeof(cl_float),
+                                   &varsens);
+                    ok = ok && set(blend_kernel, arg++, sizeof(cl_int),
+                                   &clip_l);
+                    ok = ok && set(blend_kernel, arg++, sizeof(cl_int),
+                                   &full);
+                    ok = ok && set(blend_kernel, arg++, sizeof(cl_int),
+                                   &raw);
+                    ok = ok && set(blend_kernel, arg++, sizeof(cl_int),
+                                   &fin_padded);
+                    ok = ok && set(blend_kernel, arg++, sizeof(cl_int),
+                                   &fin_l_only);
+                    ok = ok && set(blend_kernel, arg++, sizeof(cl_int),
+                                   &begx);
+                    ok = ok && set(blend_kernel, arg++, sizeof(cl_int),
+                                   &begy);
+                    if (!ok || blend_w <= 0 || blend_h <= 0 ||
+                        !launch2d(blend_kernel,
+                                  static_cast<std::size_t>(blend_w),
+                                  static_cast<std::size_t>(blend_h),
+                                  "sharpen blend")) {
+                        error = "local.adjustments sharpen blend failed";
+                        return RT_STAGE_FALLBACK;
+                    }
                 }
             }
 

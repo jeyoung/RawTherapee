@@ -24,6 +24,7 @@
 #include "stage/algorithms/lab_regions_cl.h"
 #include "stage/algorithms/local_contrast_cl.h"
 #include "stage/algorithms/munsell_lch_cl.h"
+#include "stage/algorithms/sharpen_cl.h"
 #include "stage/algorithms/vibrance_cl.h"
 
 #include <string>
@@ -35,8 +36,8 @@
  * trip, the caches and the LUT access), the local-contrast IIR line kernel,
  * the Sleef xatan2f/xsincosf port and the lab.regions xlogf/xexpf port. It
  * adds the single-spot colour apply, the ROI copy, the per-pixel soft-light
- * curve, the local dehaze path, the local CBDL pyramid/blends, and the
- * full-image clamp.
+ * curve, the local dehaze path, the local CBDL pyramid/blends, the local
+ * sharpening padded-plane copy and the full-image clamp.
  *
  * The record slots are the host's RT_LOCAL_ADJUSTMENTS_SLOT_* values; the
  * device source repeats the small subset it reads so the program is
@@ -137,6 +138,13 @@ inline constexpr const char* RT_LOCAL_ADJUSTMENTS_CL = R"CLC(
 #define RT_LA_LOG_SATCONTROL 130
 #define RT_LA_LOG_REPART 131
 #define RT_LA_LOG_KAB_PRE 132
+#define RT_LA_EXPSHARP 133
+#define RT_LA_SENSSHA 134
+#define RT_LA_SHAR_AMOUNT 135
+#define RT_LA_SHAR_RADIUS 136
+#define RT_LA_SHAR_ITER 137
+#define RT_LA_SHAR_CONTRAST 138
+#define RT_LA_SHAR_BLUR 139
 
 /*
  * The number of trailing columns the host takes through its scalar path.
@@ -505,6 +513,50 @@ __kernel void rt_local_adjustments_roi(__global const float* lab,
 }
 
 /*
+ * The local sharpening input plane. Lab_Local()'s RL arm copies the image into
+ * a zero-initialised `(lx + lxL + 3) x (ly + lyT + 3)` extent whose origin is
+ * the spot's unclipped `(xc - lxL, yc - lyT)`, not the clipped image ROI. The
+ * deconvolution therefore sees zero padding at the image border. This kernel
+ * reproduces that copy: every padded sample outside the image or outside the
+ * spot extent is zero.
+ */
+__kernel void rt_local_adjustments_sharpen_fill(
+    __global const float* lab, __global float* dst,
+    const int lab_pitch, const int dst_pitch,
+    const int bfw, const int bfh, const int begx, const int begy,
+    const int xend, const int yend, const int width, const int height)
+{
+    const int x = (int)get_global_id(0);
+    const int y = (int)get_global_id(1);
+    if (x >= bfw || y >= bfh) {
+        return;
+    }
+    const int imgx = x + begx;
+    const int imgy = y + begy;
+    float value = 0.0f;
+    if (imgx >= 0 && imgx < width && imgx < xend &&
+        imgy >= 0 && imgy < height && imgy < yend) {
+        value = lab[imgy * lab_pitch + imgx];
+    }
+    dst[y * dst_pitch + x] = value;
+}
+
+/* Copy one plane of the full Lab image into a one-plane blur buffer. */
+__kernel void rt_local_adjustments_plane_copy(
+    __global const float* src, __global float* dst,
+    const int src_plane, const int src_pitch, const int dst_pitch,
+    const int width, const int height)
+{
+    const int x = (int)get_global_id(0);
+    const int y = (int)get_global_id(1);
+    if (x >= width || y >= height) {
+        return;
+    }
+    dst[y * dst_pitch + x] =
+        src[src_plane + y * src_pitch + x];
+}
+
+/*
  * transit_shapedetect2()'s per-pixel tail, shared by the fused colour apply and
  * the standalone blend the vibrance and local-contrast tools use. `ml`/`ma`/
  * `mb` are the blurred original the deltaE scope compares against, `orig` is
@@ -516,7 +568,8 @@ inline void rt_la_scope_blend(const float origL, const float origA,
                               const float finA, const float finB,
                               const float ml, const float ma, const float mb,
                               const float localFactor, const float varsens,
-                              __global const float* rec, float* outL,
+                              __global const float* rec, const int raw_scope,
+                              float* outL,
                               float* outA, float* outB)
 {
     const float refa = rec[RT_LA_CHROMAREF] * cos(rec[RT_LA_HUEREF]) * 327.68f;
@@ -548,7 +601,7 @@ inline void rt_la_scope_blend(const float origL, const float origA,
     float reducdE = rt_la_calcreducdE(
         dE, maxdE, mindE, maxdElim, mindElim, rec[RT_LA_ITERAT],
         RT_LA_LIMSCOPE, (int)varsens);
-    if (varsens == 100.0f) {
+    if (varsens == 100.0f && raw_scope == 0) {
         reducdE = 1.0f;
     }
 
@@ -723,7 +776,7 @@ __kernel void rt_local_adjustments_apply(__global float* lab,
     float blendedB = 0.0f;
     rt_la_scope_blend(origL, origA, origB, corrL, corrA, corrB, blurL[bo],
                       blurA[bo], blurB[bo], localFactor, rec[RT_LA_SENS], rec,
-                      &blendedL, &blendedA, &blendedB);
+                      0, &blendedL, &blendedA, &blendedB);
     lab[offset] = blendedL;
     lab[lab_plane + offset] = blendedA;
     lab[2 * lab_plane + offset] = blendedB;
@@ -747,7 +800,13 @@ __kernel void rt_local_adjustments_blend(__global float* lab,
                                          const int bfw, const int bfh,
                                          const int xstart, const int ystart,
                                          const int blur_pitch,
-                                         const float varsens)
+                                         const float varsens,
+                                         const int clip_luminance,
+                                         const int blur_is_full,
+                                         const int raw_scope,
+                                         const int fin_is_padded,
+                                         const int fin_l_only,
+                                         const int begx, const int begy)
 {
     const int rx = (int)get_global_id(0);
     const int ry = (int)get_global_id(1);
@@ -766,18 +825,28 @@ __kernel void rt_local_adjustments_blend(__global float* lab,
     }
 
     const int offset = y * lab_pitch + x;
-    const int fo = ry * fin_pitch + rx;
-    const int bo = ry * blur_pitch + rx;
+    const int fo = fin_is_padded != 0
+                       ? (y - begy) * fin_pitch + (x - begx)
+                       : ry * fin_pitch + rx;
+    const int bo = blur_is_full != 0 ? y * blur_pitch + x
+                                     : ry * blur_pitch + rx;
 
+    const float finL = fin[fo];
+    const float finA =
+        fin_l_only != 0 ? lab[lab_plane + offset] : fin[fin_plane + fo];
+    const float finB =
+        fin_l_only != 0 ? lab[2 * lab_plane + offset]
+                        : fin[2 * fin_plane + fo];
     float blendedL = 0.0f;
     float blendedA = 0.0f;
     float blendedB = 0.0f;
     rt_la_scope_blend(lab[offset], lab[lab_plane + offset],
-                      lab[2 * lab_plane + offset], fin[fo],
-                      fin[fin_plane + fo], fin[2 * fin_plane + fo],
+                      lab[2 * lab_plane + offset], finL, finA, finB,
                       blurL[bo], blurA[bo], blurB[bo], localFactor, varsens,
-                      rec, &blendedL, &blendedA, &blendedB);
-    lab[offset] = blendedL;
+                      rec, raw_scope, &blendedL, &blendedA, &blendedB);
+    lab[offset] = clip_luminance != 0
+                      ? fmin(fmax(blendedL, 0.0f), 65535.0f)
+                      : blendedL;
     lab[lab_plane + offset] = blendedA;
     lab[2 * lab_plane + offset] = blendedB;
 }
@@ -1904,5 +1973,5 @@ inline std::string local_adjustments_program()
 #endif
     return simd + RT_LAB_TOOLS_CL + RT_MUNSELL_LCH_CL +
            RT_LOCAL_CONTRAST_CL + RT_VIBRANCE_CL + RT_LAB_REGIONS_CL +
-           RT_LAB_WAVELET_CL + RT_LOCAL_ADJUSTMENTS_CL;
+           RT_LAB_WAVELET_CL + RT_SHARPEN_CL + RT_LOCAL_ADJUSTMENTS_CL;
 }

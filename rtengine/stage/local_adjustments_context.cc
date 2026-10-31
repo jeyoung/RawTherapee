@@ -41,6 +41,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstring>
+#include <limits>
 #include <memory>
 
 namespace rtengine
@@ -128,7 +129,7 @@ bool explicitMaskIdle(const procparams::LocallabParams::LocallabSpot& spot)
            !spot.enacieMaskall;
 }
 
-/* Every tool other than the eight this node runs, plus the retinex tool. The
+/* Every tool other than the nine this node runs, plus the retinex tool. The
  * exposure tool also decides the clamp arm; it is a residual here. Local
  * dehaze is not a tool of its own: Lab_Local() gates it on the retinex
  * enable, so expreti is accepted only when the retinex strength is zero
@@ -136,8 +137,7 @@ bool explicitMaskIdle(const procparams::LocallabParams::LocallabSpot& spot)
 bool otherToolEnabled(const procparams::LocallabParams::LocallabSpot& spot)
 {
     return spot.expexpose || spot.expblur ||
-           spot.exptonemap || spot.expsharp ||
-           spot.expmask || spot.expcie ||
+           spot.exptonemap || spot.expmask || spot.expcie ||
            spot.expprecam;
 }
 
@@ -369,6 +369,58 @@ bool softLightAdmitted(const procparams::LocallabParams::LocallabSpot& spot)
     return spot.sensisf >= 1 && spot.sensisf <= 100;
 }
 
+/* Whether the local sharpening parameters are inside the device set.
+ *
+ * Lab_Local()'s arm is the RL method: `methodcap == "rl"`, `lp.sharpena`
+ * (the tool on, the spot active and no explicit mask) and `lp.shrad > 0.42`.
+ * It runs deconvsharpeningloc() on the ROI L plane, which is the output
+ * sharpening core's undamped RLD arm: the same blend mask, the same
+ * division/multiplication recurrence and the same `amount / 100` final blend.
+ * The core has device kernels only below sigma 1.15 (its 3x3, 5x5 and 7x7
+ * arms); larger radii take the separable IIR arm and stay on the host.
+ *
+ * Damping selects the core's damped branch, `blurrad >= 0.25` adds the blur
+ * pre-pass, `shargam != 1` wraps the plane in igammalog()/gammalog() and
+ * `sharshow` replaces the output with the mask view. Capture sharpening
+ * (`methodcap == "cap"`) is a separate deconvolution and is a residual. The
+ * remaining ranges are the GUI's; a radius at or below 0.42 is the block's
+ * own no-op and is admitted. `reparsha` is capture sharpening's recovery
+ * weight, so it is required at its default to avoid silent profile data. */
+bool sharpenAdmitted(const procparams::LocallabParams::LocallabSpot& spot)
+{
+    if (spot.methodcap != "rl") {
+        return false;
+    }
+    if (spot.shardamping != 0 || spot.sharshow) {
+        return false;
+    }
+    if (!finiteValue(spot.shargam) || spot.shargam != 1.0) {
+        return false;
+    }
+    if (!finiteValue(spot.sharradius) ||
+        spot.sharradius < 0.4 ||
+        spot.sharradius >= RT_LOCAL_ADJUSTMENTS_SHARPEN_SIGMA_LIMIT) {
+        return false;
+    }
+    if (spot.sharamount < 1 || spot.sharamount > 100) {
+        return false;
+    }
+    if (spot.shariter < 5 || spot.shariter > 100) {
+        return false;
+    }
+    if (spot.sharcontrast < 3 || spot.sharcontrast > 200) {
+        return false;
+    }
+    if (!finiteValue(spot.sharblur) || spot.sharblur < 0.2 ||
+        spot.sharblur >= RT_LOCAL_ADJUSTMENTS_SHARPEN_BLUR_LIMIT) {
+        return false;
+    }
+    if (!finiteValue(spot.reparsha) || spot.reparsha != 100.0) {
+        return false;
+    }
+    return spot.sensisha >= 0 && spot.sensisha <= 100;
+}
+
 /* Whether the local dehaze tool's parameters are inside the device set.
  *
  * Lab_Local()'s guard is `(lp.dehaze != 0 || lp.prevdE) && lp.retiena`; the
@@ -481,11 +533,11 @@ bool localAdjustmentsSupported(const procparams::ProcParams& params)
      * The block is atomic: every spot must be in the set below. An inactive
      * spot is the clamp-only case; an active spot runs log encoding, dehaze,
      * CBDL, Colour & Light, vibrance, shadows/highlights (Lab-mode std), soft
-     * light (per-pixel soft), local contrast or any combination, with optional
-     * L/C/H curves on the colour tool and MUNS. Curves, Munsell, rectangular
-     * spots, inactive spots and multiple spots are supported; every other tool
-     * and the masks, merge, soft radius, gradients and LAB/XYZ gamut methods
-     * are residuals.
+     * light (per-pixel soft), local contrast, local sharpening or any
+     * combination, with optional L/C/H curves on the colour tool and MUNS.
+     * Curves, Munsell, rectangular spots, inactive spots and multiple spots
+     * are supported; every other tool and the masks, merge, soft radius,
+     * gradients and LAB/XYZ gamut methods are residuals.
      */
     if (!params.locallab.enabled || params.locallab.spots.empty() ||
         params.locallab.spots.size() > RT_LOCAL_ADJUSTMENTS_MAX_SPOTS) {
@@ -495,6 +547,15 @@ bool localAdjustmentsSupported(const procparams::ProcParams& params)
         params.dehaze.showDepthMap || params.toneCurve.hrenabled) {
         return false;
     }
+    /*
+     * The extracted host block's shardamping fixup raises a zero damping to
+     * one while `dirpyrequalizer.cbdlMethod == "bef"`, even when the
+     * equalizer is disabled. That turns the RL arm into the damped branch the
+     * device cannot reproduce, so local sharpening is admitted only when the
+     * fixup is inactive.
+     */
+    const bool sharpenDampingFixup =
+        params.dirpyrequalizer.cbdlMethod == "bef";
 
     for (const auto& spot : params.locallab.spots) {
         if (spot.spotMethod != "norm") {
@@ -592,7 +653,7 @@ bool localAdjustmentsSupported(const procparams::ProcParams& params)
             const bool dehaze = spot.expreti && spot.dehaz != 0;
             if ((!spot.expcolor && !spot.expvibrance && !spot.expcontrast &&
                  !spot.expshadhigh && !spot.expsoft && !spot.expcbdl &&
-                 !spot.explog && !dehaze) ||
+                 !spot.explog && !spot.expsharp && !dehaze) ||
                 otherToolEnabled(spot)) {
                 return false;
             }
@@ -627,6 +688,12 @@ bool localAdjustmentsSupported(const procparams::ProcParams& params)
                 return false;
             }
             if (spot.expsoft && !softLightAdmitted(spot)) {
+                return false;
+            }
+            if (spot.expsharp && !sharpenAdmitted(spot)) {
+                return false;
+            }
+            if (spot.expsharp && sharpenDampingFixup) {
                 return false;
             }
         }
@@ -1548,6 +1615,48 @@ int LocalAdjustmentsContext::build(int spot, const RtStageBuffer* lab,
                               lp.softmet == 0 && lp.strng > 1.f;
 
     /*
+     * Local sharpening. Lab_Local()'s RL arm needs `methodcap == "rl"`, the
+     * tool on, an active spot with no explicit mask (lp.sharpena), an amount
+     * of at least one and `lp.shrad > 0.42`; the predicate has already
+     * narrowed the params to the core's undamped RLD arm. The host sharpens a
+     * zero-padded extent of `lx + lxL + 3` by `ly + lyT + 3` and blends the
+     * result with Sharp_Local()'s senstype-0 scope (lp.senssha). A radius at
+     * or below 0.42 is the block's no-op and leaves the pass off.
+     */
+    const bool sharpenRun =
+        profileSpot.expsharp && lp.activspot &&
+        profileSpot.methodcap == "rl" && profileSpot.sharamount >= 1 &&
+        profileSpot.sharradius > RT_LOCAL_ADJUSTMENTS_SHARPEN_NOOP_RADIUS;
+    const int sharpenW =
+        static_cast<int>(lp.lx + lp.lxL) +
+        RT_LOCAL_ADJUSTMENTS_SHARPEN_ROI_PAD;
+    const int sharpenH =
+        static_cast<int>(lp.ly + lp.lyT) +
+        RT_LOCAL_ADJUSTMENTS_SHARPEN_ROI_PAD;
+    if (sharpenRun) {
+        /* deconvsharpeningloc() runs only at scale one, needs mSPsharp on
+         * both axes and addresses the padded plane with an int index. The
+         * block's blend also reads the padded `loctemp` for every image pixel
+         * whose transition zone is non-zero; a partial spot with a non-zero
+         * transition would read outside the padded extent, so it is a host
+         * execution. A zero-width transition keeps the blend inside the
+         * nominal extent. */
+        const bool fullCoverage =
+            static_cast<int>(lp.xc - lp.lxL) <= 0 &&
+            static_cast<int>(lp.yc - lp.lyT) <= 0 &&
+            static_cast<int>(lp.xc - lp.lxL) + sharpenW >= fw_ &&
+            static_cast<int>(lp.yc - lp.lyT) + sharpenH >= fh_;
+        if (ipf_.getScale() != 1.0 ||
+            sharpenW < RT_LOCAL_ADJUSTMENTS_SHARPEN_MIN_ROI ||
+            sharpenH < RT_LOCAL_ADJUSTMENTS_SHARPEN_MIN_ROI ||
+            static_cast<long long>(sharpenW) * sharpenH >
+                std::numeric_limits<int>::max() ||
+            (!fullCoverage && lp.trans != 0.f)) {
+            return 1;
+        }
+    }
+
+    /*
      * Local log encoding. Lab_Local()'s block runs when logena is set, which
      * needs the tool on, the spot active and no explicit tool mask; the
      * predicate has already narrowed detail, ciecam and autocompute. The
@@ -1870,6 +1979,19 @@ int LocalAdjustmentsContext::build(int spot, const RtStageBuffer* lab,
     record[RT_LOCAL_ADJUSTMENTS_SLOT_SOFT_STRENGTH] = lp.strng;
     record[RT_LOCAL_ADJUSTMENTS_SLOT_SENSSOFT] =
         static_cast<float>(lp.senssf);
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_EXPSHARP] = sharpenRun ? 1.f : 0.f;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_SENSSHA] =
+        static_cast<float>(profileSpot.sensisha);
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_SHAR_AMOUNT] =
+        static_cast<float>(profileSpot.sharamount);
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_SHAR_RADIUS] =
+        static_cast<float>(profileSpot.sharradius);
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_SHAR_ITER] =
+        static_cast<float>(profileSpot.shariter);
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_SHAR_CONTRAST] =
+        static_cast<float>(profileSpot.sharcontrast);
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_SHAR_BLUR] =
+        static_cast<float>(profileSpot.sharblur);
     record[RT_LOCAL_ADJUSTMENTS_SLOT_EXPDENAZE] = dehazeRun ? 1.f : 0.f;
     record[RT_LOCAL_ADJUSTMENTS_SLOT_SENSH] =
         static_cast<float>(profileSpot.sensih);
@@ -1996,7 +2118,7 @@ int LocalAdjustmentsContext::build(int spot, const RtStageBuffer* lab,
     if (!fillIir(static_cast<double>(2.0f + 0.2f * lp.blurcol), iir_)) {
         return 1;
     }
-    if (!fillIir(3.0, iirVib_)) {
+    if (!fillIir(RT_LOCAL_ADJUSTMENTS_SHARPEN_SCOPE_SIGMA, iirVib_)) {
         return 1;
     }
     if (!fillIir(static_cast<double>(profileSpot.lcradius), iirLc_)) {
