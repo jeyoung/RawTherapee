@@ -2487,17 +2487,20 @@ the block's own `CurveFactory::complexLCurve()`, `complexsgnCurve()` and
 the host's LUTs with `LUTf::operator[](float)`'s clip semantics: the a and b
 tables clip at both ends, and the L, C=f(C), L=f(C) and C=f(L) tables keep the
 `LUT_CLIP_OFF` extrapolation the call site gives them. The kernel follows the
-block order: the L table, the signed a and b tables, the first red/skin gate,
-C=f(L), C=f(C), L=f(C), the closing chroma, and the Munsell correction with
+block order: the L table, the signed a and b tables, L=f(H), C=f(H), H=f(H),
+the first red/skin gate carrying the chromaticity slider, C=f(L), C=f(C),
+L=f(C), the closing chroma, and the Munsell correction with
 `Color::AllMunsellLch(lumaMuns = true)`'s luminance correction. It reads the
 exported Munsell set, `settings->protectred` and `protectredh`, `100 -
-rstprotection`, `lcredsk` and the working-profile chroma scale (1.2 for
-ProPhoto and WideGamut, 1.8 for Adobe RGB and BruceRGB, 2.0 for sRGB, 1.4 for
-Beta RGB and BestRGB, 1.0 otherwise). `settings->amchroma` is exported and
-validated (ABI `[46]`) but not read: it only feeds the residual L=f(H) path.
-The residual families are the chromaticity slider, the C=f(H), L=f(H) and
-H=f(H) flat curves, the LAB, XYZ and XYZREL Munsell methods, a denoise chroma
-factor and black-and-white output.
+rstprotection`, `lcredsk`, `settings->amchroma` (ABI `[46]`, the L=f(H) chroma
+weight) and the working-profile chroma scale (1.2 for ProPhoto and WideGamut,
+1.8 for Adobe RGB and BruceRGB, 2.0 for sRGB, 1.4 for Beta RGB and BestRGB,
+1.0 otherwise). The three hue flat curves arrive as host-sampled
+piecewise-linear tables; a curve the table cannot follow within 5e-7 or the
+node budget is refused. The residual families are a chromaticity slider
+outside -100..100, an unrepresentable hue flat curve, the LAB, XYZ and XYZREL
+Munsell methods, a denoise chroma factor and black-and-white with colour
+toning.
 
 The chroma arithmetic is where a naive float port fails. On the host,
 `sqrt(float) / 327.68f` resolves to the libm double square root divided by the
@@ -2552,9 +2555,8 @@ one float per table with its own length, `[33]` the 65536-entry skin curve
 only when the enabled curve has `contrast == 0`), `[35..40]` the int L, a, b,
 C=f(C), L=f(C) and C=f(L) activity flags, `[41]` the Munsell method (0 or 4),
 `[42]` `lcredsk`, `[43]` `100 - rstprotection`, `[44]` and `[45]` the raw
-`settings->protectred` and `protectredh`, `[46]` `settings->amchroma`
-(validated but not read by the supported path; it only feeds the residual
-L=f(H) curve), `[47]`
+`settings->protectred` and `protectredh`, `[46]` `settings->amchroma` (the
+L=f(H) chroma weight), `[47]`
 the working-profile chroma scale, `[48..53]` the six Lab-curve tables (the L
 table is 32770 floats, the other five 65536), `[54]` and `[55]` those two
 lengths, `[56]` the int local-contrast flag (1 when the enabled tool would
@@ -2567,7 +2569,11 @@ tables (count x 3 tables of 65537 floats, each a node count followed by x and
 y nodes), `[65]` that table stride, `[66]` the per-region parameter table
 (count x 14 floats: abca, abcb, rs, slope, offset, power, channel, maskBlur,
 the two radii, the three mask-active flags and a reserved slot), `[67]` and
-`[68]` the working and inverse matrices as nine doubles each. A submission
+`[68]` the working and inverse matrices as nine doubles each, `[69]` the
+black-and-white flag, `[70]` the hue-table slot stride, `[71]` the three
+host-sampled hue flat-curve tables (3 slots of 65537 floats: a node count,
+then x and y nodes, in C=f(H), L=f(H), H=f(H) order), `[72..74]` their
+activity flags and `[75]` the chromaticity slider. A submission
 with a wrong kind, length or non-finite value,
 a local-contrast setting outside the ABI range, a coefficient block of the
 wrong size or version, a region parameter outside the region ranges, or with a
@@ -2623,9 +2629,10 @@ With `OMP_NUM_THREADS=1`, a 3888x2608 PEF and the POCL CPU device:
 | Slider coverage | amounts 1/50/200/1000, tonal widths 0/100 and a split pair, radii 1/10/100, padded widths 179 and 238, and an 8192-wide image; all finite, no NaN or Inf |
 | Vibrance, 21 cases at 125x160, 179x48, 238x64, 8192x64 and 64x16 | pastels/saturated combinations, negative saturated, thresholds 0/75/100 and split, protect-skins, avoidcolorshift on/off, a skin curve, highlight reconstruction, neutral and saturated images, padded widths, the 8192-wide case and the two-pixel knife-edge case: 2,570,352 samples, measured PAE 0 and asserted within 1 LSB16 (`over == 0`), no NaN/Inf, `impl=opencl` on every case (POCL CPU) |
 | Munsell tables | all 197 tables and 27,580 exported entries equal `Color::MunsellLch()`'s LUTs; the avoidcolorshift path changes 11,696 of 60,000 domain samples, so the comparison is not vacuous |
-| Lab curves, 21 cases at 238x64, 179x48 and 8192x64 | L only, brightness, an enabled pass with all six tables the identity, a only, a/b, C=f(C), L=f(C), C=f(L), all six combined, combined with MUN and with NONE, three red/skin protection settings, `lcredsk` off, neutral and saturated images, padded 179/238 and 8192 wide: 2,347,344 samples, `impl=opencl` on every case, no NaN/Inf, every sample bit-exact (PAE 0, 0 differing samples). The earlier 169 one-ulp samples came from the host's ≤3-column double-sqrt tail, which the kernel now reproduces |
-| Lab-curve non-vacuity | on a 179x48 saturated fixture the MUN correction changes 288 of 25,776 samples and the red/skin protection changes 2,610, so the device comparison exercises both paths |
-| Lab-curve residuals | contrast 15, chromaticity 25, a non-identity C=f(H), L=f(H) or H=f(H) curve, the XYZ Munsell method and black-and-white output are refused, record `impl=host` with no `impl=opencl`, and are byte-identical to the block (PAE 0) |
+| Lab curves, 32 cases at 238x64, 179x48 and 8192x64 | L only, brightness, an enabled pass with all six tables the identity, a only, a/b, C=f(C), L=f(C), C=f(L), all six combined, combined with MUN and with NONE, three red/skin protection settings, `lcredsk` off, neutral and saturated images, padded 179/238 and 8192 wide, and the 11 hue-family cases: 2,810,160 samples, `impl=opencl` on every case, no NaN/Inf. Every diagonal-table case is bit-exact (PAE 0, 0 differing samples); the hue family is at most 0.023438 LSB16. The earlier 169 one-ulp samples came from the host's ≤3-column double-sqrt tail, which the kernel now reproduces |
+| Lab hue family, 11 cases | chromaticity -100 (with and without non-identity hue curves, which the block ignores at the slider minimum), 0, 50 with 30% red/skin protection and 100 with 60%; C=f(H), L=f(H) and H=f(H) alone on the saturated hue-circle fixture; all three with the slider; with active a/b tables (so HH comes from the curved a and b); with vibrance and shadows/highlights; and black-and-white + L=f(H) through the `bwToning` arm. Worst PAE 0.023438 LSB16 over 462,816 samples, no sample over 1 LSB16, `impl=opencl` on every case |
+| Lab hue-family non-vacuity | for every hue-family case the same profile with the slider at 0 and the three curves cleared changes the host image (PAE 12,400.9 to 52,609.6 LSB16), so the comparison is not a copy |
+| Lab-curve residuals | contrast 15, the XYZ Munsell method, black-and-white with colour toning, and a 40 000-point C=f(H) whose table cannot follow the curve within 5e-7 / 32 768 nodes are refused, record `impl=host` with no `impl=opencl`, and are byte-identical to the block (PAE 0) |
 | Local contrast, 23 cases at 238x64, 179x48, 179x50, 238x63 and 8192x64 | radii 1/10/40/80/100 (both blur paths), amounts 0/0.1/1/2, darkness and lightness 0.5/1/2 and the two-way split, padded 179 and 238, an odd height of 50 (the horizontal tail rows), the 8192-wide case, and combinations with the Lab curves, shadows/highlights and vibrance: 2,461,164 samples, `impl=opencl` on every case, no NaN/Inf, every sample bit-exact (PAE 0, 0 differing samples) |
 | Local-contrast tail, sigma 24 | the integer fixture and three wide non-integer fixtures (L alternates around 30000 and 0.4 so the float deviation subtraction rounds) cover the last `H mod 4` rows and `W mod 8` columns at 179x50 and 238x63. With the kernel's deviation kept in double - the pre-fix code - the amount-2 179x50 case moves 7 of 26,850 samples, worst 0.164062 LSB16 (26,843 exact); the fixed kernel is bit-exact on all four cases |
 | Local-contrast non-vacuity | on a 179x48 fixture radius 10, amount 1 changes 8,592 of 25,776 samples (PAE 11,071.999900 LSB16), so the device comparison is not a copy |

@@ -70,6 +70,9 @@ pairs are exact. The gate is the peak absolute error (PAE) in normalised units;
 | 2026-10-31 | uncommitted | POCL (CPU) | 3-case lab.tools tone-method matrix (Splitco, Splitlr, RGBSliders with shadows/highlights), `stage-residency-test` | device vs host block | 0 | PASS |
 | 2026-10-31 | uncommitted | POCL (CPU) | colorspace_flowers.pef / `labtools-blackwhite-labcurve.pp3` (B&W through the `bwToning` arm, L and a/b tables plus the C=f(L), C=f(C) and L=f(C) tables), `lab.tools` | off vs auto, 16-bit TIFF | 1 LSB | PASS |
 | 2026-10-31 | uncommitted | POCL (CPU) | 7-case lab.tools black-and-white Lab-curve matrix (identity tables, L curve, a/b tables, C=f(L), L=f(C), the three chroma tables, and the full set with vibrance, shadows/highlights and local contrast at 179x48 and 238x64), `stage-residency-test` | device vs host block | 0 (exact, a/b exact) | PASS |
+| 2026-10-31 | uncommitted | POCL (CPU) | colorspace_flowers.pef / `labtools-huecurve.pp3` (Lab curves with chromaticity 40, C=f(H), L=f(H) and H=f(H)), `lab.tools` | off vs auto, 16-bit TIFF | 1 LSB | PASS |
+| 2026-10-31 | uncommitted | POCL (CPU) | 11-case lab.tools hue flat-curve matrix (chromaticity -100 ignoring the curves, 0, 50 with red/skin protection and 100; C=f(H), L=f(H), H=f(H) alone; all three with the slider; with a/b tables; with vibrance and shadows/highlights; B&W + L=f(H)), `stage-residency-test` | device vs host block | 0.023438 LSB16 (worst) | PASS |
+| 2026-10-31 | uncommitted | POCL (CPU) | lab.tools hue-family non-vacuity and residuals: same profile with the family off changes the image; a 40 000-point dense C=f(H) is refused for table fidelity and runs the block | non-vacuity PAE 12 400-52 610 LSB16; refusal 0 (host) | PASS |
 
 `47c50ee77` changes only CPU export buffer handling; the OpenCL rows above
 re-run the existing GPU stages against the new CPU neighbour.
