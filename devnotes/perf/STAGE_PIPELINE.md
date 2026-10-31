@@ -1941,12 +1941,13 @@ differs from the neutral export by PAE 6,272 codes on 3,572,230 of
 and undamped RLD kernels on the block's zero-padded `lx + lxL + 3` by
 `ly + lyT + 3` plane, and reproduces `Sharp_Local()`'s full-image deltaE
 reference blur and senstype-0 (`lp.senssha`) blend; it does not re-derive
-USM/RLD. The runtime residual matrix (capture sharpening, damping range and
-negative, a damped radius below 0.6, gamma, blur pre-pass, mask view, a
+USM/RLD. The runtime residual matrix (capture sharpening, damping range
+(101), a damped radius below 0.6, gamma, blur pre-pass, mask view, a
 separable radius, radius/amount/iteration/contrast/sensitivity out of range
 and `reparsha`) runs the host builtin and is byte-identical; a partial spot
 with a non-zero transition is also a host residual for the padded-extent
-reason above.
+reason above. Negative damping is refused by the predicate and is not part of
+the runtime matrix.
 
 The damped local sharpening matrix is within 0.871 LSB16 (damping 10 at
 radius 1.00; 0.626 on sharpen+soft light, 0.547 on 8192x64, 0.443 on all

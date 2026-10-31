@@ -219,11 +219,12 @@ peak absolute error is zero for the synthetic node tests:
   undamped. `localadjustments-sharpen.pp3` and
   `localadjustments-sharpen-damped.pp3` are 1 LSB16; the latter exercises the
   default fixup. Thirteen residual configurations (capture sharpening,
-  damping range and negative, a damped radius below 0.6, gamma, blur, mask
-  view, a separable radius, radius/amount/iteration/contrast/sensitivity out
-  of range and `reparsha`) run the host builtin byte for byte; a partial spot
-  with a non-zero transition is also a host residual because the block's
-  padded extent does not cover the transition ring the host reads.
+  damping range (101), a damped radius below 0.6, gamma, blur, mask view, a
+  separable radius, radius/amount/iteration/contrast/sensitivity out of range
+  and `reparsha`) run the host builtin byte for byte; a partial spot with a
+  non-zero transition is also a host residual because the block's padded
+  extent does not cover the transition ring the host reads. Negative damping
+  is refused by the predicate and is not a runtime case.
 - `tools/opencl/verify.sh --stage-device`, which `--quick` also runs, asserts
   each record and its parity in one step:
 
