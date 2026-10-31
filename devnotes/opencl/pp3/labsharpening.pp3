@@ -1,0 +1,8 @@
+[Impulse Denoising]
+Enabled=true
+Threshold=50
+
+[Defringing]
+Enabled=true
+Radius=2
+Threshold=13

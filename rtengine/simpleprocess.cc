@@ -47,6 +47,7 @@
 #include "stage/stage_graph.h"
 #include "stage/stage_pipeline.h"
 #include "stage/stage_profile.h"
+#include "stage/lab_sharpening_context.h"
 #include "stage/lab_tools_context.h"
 #include "stage/lab_wavelet_context.h"
 #include "stage/local_adjustments_context.h"
@@ -1955,10 +1956,10 @@ private:
         // for all treatments Defringe, Sharpening, Contrast detail ,Microcontrast they are activated if "CIECAM" function are disabled
 
       //  if ((params.colorappearance.enabled && !settings->autocielab) || (!params.colorappearance.enabled)) {
-        if ((params.colorappearance.enabled && !settings->autocielab) || (!cam02)) {
-            ipf.impulsedenoise(labView);
-            ipf.defringe(labView);
-        }
+        const bool ciecam_arm =
+            !((params.colorappearance.enabled && !settings->autocielab) ||
+              (!cam02));
+        stage::labSharpeningRun(ipf, params, *labView, ciecam_arm);
 
         if (params.sharpenEdge.enabled) {
             ipf.MLsharpen(labView);

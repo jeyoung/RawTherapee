@@ -6,6 +6,7 @@
 #include "stage_lanczos.h"
 #include "working_trc_context.h"
 #include "stage/algorithms/sharpen_cl.h"
+#include "lab_sharpening_context.h"
 #include "sharpen_core.h"
 
 #include <cmath>
@@ -327,12 +328,57 @@ RtStageStatus local_adjustments_execute(const RtStageArg* args,
     return status == 0 ? RT_STAGE_OK : RT_STAGE_ERROR;
 }
 
+/*
+ * Host implementation of the lab.sharpening node.
+ *
+ * A refused or unsupported impulse/defringe configuration arrives here because
+ * the device queue falls back to the compiled program. The call-site context
+ * runs the original host block, so the result is the CPU result for both tools
+ * and the runtime records impl=host. Device recursion is disabled for the
+ * duration: the host block must not re-enter this node.
+ */
+RtStageStatus lab_sharpening_execute(const RtStageArg* args, uint32_t nargs,
+                                     RtStageProfiling* profiling)
+{
+    (void)profiling;
+
+    LabSharpeningNodeParams node;
+    RtStageBuffer luminance{};
+    RtStageBuffer a{};
+    RtStageBuffer b{};
+    RtStageBuffer hue{};
+    std::string error;
+    if (!lab_sharpening_decode(args, nargs, node, luminance, a, b, hue,
+                               error)) {
+        return RT_STAGE_INVALID;
+    }
+
+    RtLabSharpeningContext* context =
+        const_cast<RtLabSharpeningContext*>(
+            static_cast<const RtLabSharpeningContext*>(
+                args[LAB_SHARPENING_ARG_CONTEXT].u.ptr));
+    if (context == nullptr ||
+        context->size != sizeof(RtLabSharpeningContext) ||
+        context->version != RT_LAB_SHARPENING_CONTEXT_VERSION ||
+        context->magic != RT_LAB_SHARPENING_CONTEXT_MAGIC ||
+        context->run_host == nullptr) {
+        return RT_STAGE_INVALID;
+    }
+
+    const bool allowed = opencl_stage_allowed();
+    set_opencl_stage_allowed(false);
+    const int status = context->run_host(context->self, &luminance, &a, &b);
+    set_opencl_stage_allowed(allowed);
+    return status == 0 ? RT_STAGE_OK : RT_STAGE_ERROR;
+}
+
 } // namespace
 
 void register_builtin_stages(StageCompiler& compiler)
 {
     compiler.register_builtin("lanczos3", &lanczos_execute);
     compiler.register_builtin("output.sharpen", &sharpen_execute);
+    compiler.register_builtin("lab.sharpening", &lab_sharpening_execute);
     compiler.register_builtin("working.trc", &working_trc_execute);
     compiler.register_builtin("lab.tools", &lab_tools_execute);
     compiler.register_builtin("lab.wavelet", &lab_wavelet_execute);

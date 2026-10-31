@@ -46,6 +46,7 @@
 #include "labimage.h"
 #include "mytime.h"
 #include "procparams.h"
+#include "stage/lab_sharpening_context.h"
 #include "stage/stage_dirty_blocks.h"
 #include "stage/stage_graph.h"
 #include "stage/stage_pipeline.h"
@@ -2323,10 +2324,10 @@ void Crop::stageLabSharpening(CropStageContext& ctx)
     // for all treatments Defringe, Sharpening, Contrast detail , Microcontrast they are activated if "CIECAM" function are disabled
     if (skip == 1) {
       //  if ((params.colorappearance.enabled && !settings->autocielab)  || (!params.colorappearance.enabled)) {
-        if ((params.colorappearance.enabled && !settings->autocielab)  || (!cam02)) {
-            parent->ipf.impulsedenoise(labnCrop);
-            parent->ipf.defringe(labnCrop);
-        }
+        const bool ciecam_arm =
+            !((params.colorappearance.enabled && !settings->autocielab) ||
+              (!cam02));
+        stage::labSharpeningRun(parent->ipf, params, *labnCrop, ciecam_arm);
 
         parent->ipf.MLsharpen(labnCrop);
 

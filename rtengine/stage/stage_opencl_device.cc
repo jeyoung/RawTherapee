@@ -59,6 +59,8 @@
 #include "stage/algorithms/local_contrast_cl.h"
 #include "stage/algorithms/lab_curve_cl.h"
 #include "stage/algorithms/lab_regions_cl.h"
+#include "stage/algorithms/lab_sharpening_cl.h"
+#include "stage/lab_sharpening_context.h"
 #include "stage/algorithms/lab_wavelet_cl.h"
 #include "stage/algorithms/local_adjustments_cl.h"
 #include "stage/algorithms/munsell_lch_cl.h"
@@ -1327,6 +1329,21 @@ __kernel void rt_thumbnail_scale_u8(__global const uchar* src,
     return source;
 }
 
+/*
+ * The lab.sharpening program: impulse denoise and defringe. The separable
+ * Young-van Vliet line kernel is shared with output.sharpen; the pair's own
+ * kernels are in lab_sharpening_cl.h. The defringe reduction is double, so the
+ * launcher requires fp64 for that pass.
+ */
+const std::string& lab_sharpening_source()
+{
+    static const std::string source =
+        std::string("#pragma OPENCL FP_CONTRACT OFF\n"
+                    "#pragma STDC FP_CONTRACT OFF\n") +
+        RT_SHARPEN_CL + RT_LAB_SHARPENING_CL;
+    return source;
+}
+
 const std::vector<KernelDef>& kernels()
 {
     static const std::vector<KernelDef> table = {
@@ -1346,6 +1363,8 @@ const std::vector<KernelDef>& kernels()
         {"lab.wavelet", lab_wavelet_source().c_str(), "rt_lab_wavelet_decompose"},
         {"local.adjustments", local_adjustments_source().c_str(), "rt_local_adjustments_apply"},
         {"output.sharpen", RT_SHARPEN_CL, "rt_sharpen_mask"},
+        {"lab.sharpening", lab_sharpening_source().c_str(),
+         "rt_lab_sharpening_impulse_mark"},
         {"framing", framing_source().c_str(), "rt_framing"},
         {"crop", crop_source().c_str(), "rt_crop"},
         {"thumbnail.whitebalance", thumbnail_wb_source().c_str(), "rt_thumbnail_wb"},
@@ -1972,7 +1991,8 @@ cl_kernel compiled_kernel_entry(const std::shared_ptr<OpenCLEnv>& env,
                 std::strcmp(def->name, "lab.tools.labcurve") == 0 ||
                 std::strcmp(def->name, "lab.tools.localcontrast") == 0 ||
                 std::strcmp(def->name, "local.adjustments") == 0 ||
-                std::strcmp(def->name, "lab.wavelet") == 0
+                std::strcmp(def->name, "lab.wavelet") == 0 ||
+                std::strcmp(def->name, "lab.sharpening") == 0
             ? "-cl-fp32-correctly-rounded-divide-sqrt"
             : nullptr;
     build_error = env->api->BuildProgram(program, 1, &env->device,
@@ -8468,6 +8488,459 @@ RtStageStatus run_sharpen(const std::shared_ptr<OpenCLEnv>& env,
 }
 
 /*
+ * The lab.sharpening node: the impulse-denoise pass and the defringe pass of
+ * the Lab block, in the block's order. Arguments are documented in
+ * stage/lab_sharpening_context.h; the kernels in lab_sharpening_cl.h.
+ *
+ * The pair is atomic: a configuration outside either tool's device set is
+ * refused before the first upload, so the host builtin produces the CPU
+ * result for both tools and no plane is ever half device and half host. The
+ * three planes are read back together, only after every kernel succeeded.
+ */
+RtStageStatus run_lab_sharpening(const std::shared_ptr<OpenCLEnv>& env,
+                                 const std::shared_ptr<OpenCLResidency>& residency,
+                                 const std::vector<RtStageArg>& args,
+                                 std::string& error)
+{
+    LabSharpeningNodeParams p;
+    RtStageBuffer luminance{};
+    RtStageBuffer a{};
+    RtStageBuffer b{};
+    RtStageBuffer hue{};
+    if (!lab_sharpening_decode(args.data(),
+                               static_cast<std::uint32_t>(args.size()), p,
+                               luminance, a, b, hue, error)) {
+        return RT_STAGE_INVALID;
+    }
+
+    cl_device_fp_config fp_config = 0;
+    const bool has_fp64 =
+        env->api->GetDeviceInfo(env->device, CL_DEVICE_DOUBLE_FP_CONFIG,
+                                sizeof(fp_config), &fp_config,
+                                nullptr) == CL_SUCCESS &&
+        fp_config != 0;
+
+    if (!lab_sharpening_admitted(p, luminance.width, luminance.height,
+                                 has_fp64, error)) {
+        return RT_STAGE_FALLBACK;
+    }
+
+    const int width = luminance.width;
+    const int height = luminance.height;
+    const bool defringe_runs =
+        p.defringe_enabled != 0 &&
+        p.defringe_radius >= LAB_SHARPENING_RADIUS_NOOP;
+    if (p.impulse_enabled == 0 && !defringe_runs) {
+        /* Nothing enabled would change the image. */
+        return RT_STAGE_OK;
+    }
+
+    const KernelDef* def = find_kernel("lab.sharpening");
+    assert(def != nullptr);
+
+    cl_kernel iir_kernel =
+        compiled_kernel_entry(env, def, "rt_sharpen_iir_line", error);
+    cl_kernel copy_kernel =
+        compiled_kernel_entry(env, def, "rt_lab_sharpening_copy", error);
+    if (iir_kernel == nullptr || copy_kernel == nullptr) {
+        return RT_STAGE_FALLBACK;
+    }
+    cl_kernel mark_kernel = nullptr;
+    cl_kernel correct_kernel = nullptr;
+    if (p.impulse_enabled != 0) {
+        mark_kernel = compiled_kernel_entry(
+            env, def, "rt_lab_sharpening_impulse_mark", error);
+        correct_kernel = compiled_kernel_entry(
+            env, def, "rt_lab_sharpening_impulse_correct", error);
+        if (mark_kernel == nullptr || correct_kernel == nullptr) {
+            return RT_STAGE_FALLBACK;
+        }
+    }
+    cl_kernel fringe_kernel = nullptr;
+    cl_kernel rows_kernel = nullptr;
+    cl_kernel total_kernel = nullptr;
+    cl_kernel apply_kernel = nullptr;
+    if (defringe_runs) {
+        fringe_kernel = compiled_kernel_entry(
+            env, def, "rt_lab_sharpening_defringe_fringe", error);
+        rows_kernel = compiled_kernel_entry(
+            env, def, "rt_lab_sharpening_defringe_rows", error);
+        total_kernel = compiled_kernel_entry(
+            env, def, "rt_lab_sharpening_defringe_total", error);
+        apply_kernel = compiled_kernel_entry(
+            env, def, "rt_lab_sharpening_defringe_apply", error);
+        if (fringe_kernel == nullptr || rows_kernel == nullptr ||
+            total_kernel == nullptr || apply_kernel == nullptr) {
+            return RT_STAGE_FALLBACK;
+        }
+    }
+
+    const StageBufferShape shape{RT_STAGE_F32, width, height, 1};
+    StageDeviceBufferPtr l_device =
+        residency->acquire(luminance.data, shape, &error);
+    StageDeviceBufferPtr a_device = residency->acquire(a.data, shape, &error);
+    StageDeviceBufferPtr b_device = residency->acquire(b.data, shape, &error);
+    if (!l_device || !a_device || !b_device) {
+        return RT_STAGE_FALLBACK;
+    }
+    if (residency->upload(l_device, luminance) != RT_STAGE_OK ||
+        residency->upload(a_device, a) != RT_STAGE_OK ||
+        residency->upload(b_device, b) != RT_STAGE_OK) {
+        error = "lab.sharpening plane upload failed";
+        return RT_STAGE_FALLBACK;
+    }
+    auto l_buffer = std::dynamic_pointer_cast<OpenCLDeviceBuffer>(l_device);
+    auto a_buffer = std::dynamic_pointer_cast<OpenCLDeviceBuffer>(a_device);
+    auto b_buffer = std::dynamic_pointer_cast<OpenCLDeviceBuffer>(b_device);
+    if (!l_buffer || !a_buffer || !b_buffer ||
+        l_buffer->row_pitch() % sizeof(float) != 0) {
+        error = "lab.sharpening device buffer type mismatch";
+        return RT_STAGE_FALLBACK;
+    }
+    const int pitch = static_cast<int>(l_buffer->row_pitch() / sizeof(float));
+    if (a_buffer->row_pitch() != l_buffer->row_pitch() ||
+        b_buffer->row_pitch() != l_buffer->row_pitch() || pitch < width) {
+        error = "lab.sharpening planes do not share a row pitch";
+        return RT_STAGE_FALLBACK;
+    }
+    cl_mem l_memory = l_buffer->memory();
+    cl_mem a_memory = a_buffer->memory();
+    cl_mem b_memory = b_buffer->memory();
+
+    std::lock_guard<std::recursive_mutex> lock(env->queue_mutex);
+
+    const auto set_arg = [&](cl_kernel kernel, cl_uint index,
+                             std::size_t bytes, const void* value) {
+        return env->api->SetKernelArg(kernel, index, bytes, value) ==
+               CL_SUCCESS;
+    };
+    const auto run_2d = [&](cl_kernel kernel) -> bool {
+        const std::size_t global[2] = {static_cast<std::size_t>(width),
+                                       static_cast<std::size_t>(height)};
+        cl_event done = nullptr;
+        if (env->api->EnqueueNDRangeKernel(env->queue, kernel, 2, nullptr,
+                                           global, nullptr, 0, nullptr,
+                                           &done) != CL_SUCCESS ||
+            done == nullptr) {
+            return false;
+        }
+        const cl_int wait_status = env->api->WaitForEvents(1, &done);
+        env->api->ReleaseEvent(done);
+        return wait_status == CL_SUCCESS;
+    };
+
+    const std::size_t plane_bytes =
+        l_buffer->row_pitch() * static_cast<std::size_t>(height);
+    std::vector<cl_mem> scratch;
+    const auto release_scratch = [&]() {
+        for (cl_mem memory : scratch) {
+            env->api->ReleaseMemObject(memory);
+        }
+        scratch.clear();
+    };
+    const auto create_buffer = [&](std::size_t bytes) -> cl_mem {
+        cl_int buffer_error = CL_SUCCESS;
+        cl_mem memory =
+            env->api->CreateBuffer(env->context, CL_MEM_READ_WRITE, bytes,
+                                   nullptr, &buffer_error);
+        if (memory != nullptr) {
+            scratch.push_back(memory);
+        }
+        return memory;
+    };
+
+    /*
+     * The impulse pass needs a low-pass plane, the IIR state and a byte mask.
+     * The defringe pass needs the state, the blurred a/b, the chromaticity and
+     * the two pre-defringe planes; the state and the impulse low-pass are dead
+     * by then, so they become the original b and a. A node with one tool
+     * therefore allocates only that tool's planes.
+     */
+    cl_mem impulse_lowpass = nullptr;
+    cl_mem state = nullptr;
+    cl_mem mask = nullptr;
+    if (p.impulse_enabled != 0) {
+        impulse_lowpass = create_buffer(plane_bytes);
+        state = create_buffer(plane_bytes);
+        mask = create_buffer(static_cast<std::size_t>(width) *
+                             static_cast<std::size_t>(height));
+        if (impulse_lowpass == nullptr || state == nullptr ||
+            mask == nullptr) {
+            release_scratch();
+            error = "lab.sharpening device scratch allocation failed";
+            return RT_STAGE_FALLBACK;
+        }
+    }
+    cl_mem tmpa = nullptr;
+    cl_mem tmpb = nullptr;
+    cl_mem fringe = nullptr;
+    cl_mem original_a = nullptr;
+    cl_mem original_b = nullptr;
+    cl_mem rows = nullptr;
+    cl_mem total = nullptr;
+    if (defringe_runs) {
+        if (state == nullptr) {
+            state = create_buffer(plane_bytes);
+        }
+        tmpa = create_buffer(plane_bytes);
+        tmpb = create_buffer(plane_bytes);
+        fringe = create_buffer(plane_bytes);
+        original_a = impulse_lowpass != nullptr
+                         ? impulse_lowpass
+                         : create_buffer(plane_bytes);
+        original_b = state;
+        rows = create_buffer(static_cast<std::size_t>(height) *
+                             sizeof(double));
+        total = create_buffer(sizeof(double));
+        if (state == nullptr || tmpa == nullptr || tmpb == nullptr ||
+            fringe == nullptr || original_a == nullptr || rows == nullptr ||
+            total == nullptr) {
+            release_scratch();
+            error = "lab.sharpening device scratch allocation failed";
+            return RT_STAGE_FALLBACK;
+        }
+    }
+
+    if (p.impulse_enabled != 0) {
+        /*
+         * impulse_nr()'s threshold is params.thresh / 20.0. The host's SSE
+         * blur takes a float sigma, so the coefficients are derived from the
+         * same rounded value.
+         */
+        const double threshold = p.impulse_threshold / 20.0;
+        const double sigma = std::max(2.0, threshold - 1.0);
+        SharpenIirFactors factors;
+        sharpen_iir_factors(static_cast<double>(static_cast<float>(sigma)),
+                            factors);
+        if (!sharpen_iir_plane(env, iir_kernel, l_memory, impulse_lowpass,
+                               state, width, height, pitch, factors, error)) {
+            release_scratch();
+            return RT_STAGE_ERROR;
+        }
+        const float impthr =
+            static_cast<float>(std::max(1.0, 5.5 - threshold));
+        const float impthr_div24 = impthr / 24.0f;
+        const cl_int cl_width = width;
+        const cl_int cl_height = height;
+        const cl_int cl_pitch = pitch;
+        const cl_int cl_mask_pitch = width;
+        const bool mark_ok =
+            set_arg(mark_kernel, 0, sizeof(cl_mem), &l_memory) &&
+            set_arg(mark_kernel, 1, sizeof(cl_mem), &impulse_lowpass) &&
+            set_arg(mark_kernel, 2, sizeof(cl_mem), &mask) &&
+            set_arg(mark_kernel, 3, sizeof(cl_int), &cl_width) &&
+            set_arg(mark_kernel, 4, sizeof(cl_int), &cl_height) &&
+            set_arg(mark_kernel, 5, sizeof(cl_int), &cl_pitch) &&
+            set_arg(mark_kernel, 6, sizeof(cl_int), &cl_mask_pitch) &&
+            set_arg(mark_kernel, 7, sizeof(cl_float), &impthr_div24) &&
+            run_2d(mark_kernel);
+        if (!mark_ok) {
+            release_scratch();
+            error = "lab.sharpening impulse mark failed";
+            return RT_STAGE_ERROR;
+        }
+        const bool correct_ok =
+            set_arg(correct_kernel, 0, sizeof(cl_mem), &l_memory) &&
+            set_arg(correct_kernel, 1, sizeof(cl_mem), &a_memory) &&
+            set_arg(correct_kernel, 2, sizeof(cl_mem), &b_memory) &&
+            set_arg(correct_kernel, 3, sizeof(cl_mem), &mask) &&
+            set_arg(correct_kernel, 4, sizeof(cl_int), &cl_width) &&
+            set_arg(correct_kernel, 5, sizeof(cl_int), &cl_height) &&
+            set_arg(correct_kernel, 6, sizeof(cl_int), &cl_pitch) &&
+            set_arg(correct_kernel, 7, sizeof(cl_int), &cl_mask_pitch) &&
+            run_2d(correct_kernel);
+        if (!correct_ok) {
+            release_scratch();
+            error = "lab.sharpening impulse correction failed";
+            return RT_STAGE_ERROR;
+        }
+    }
+
+    if (defringe_runs) {
+        SharpenIirFactors factors;
+        sharpen_iir_factors(
+            static_cast<double>(static_cast<float>(p.defringe_radius)),
+            factors);
+        if (!sharpen_iir_plane(env, iir_kernel, a_memory, tmpa, state, width,
+                               height, pitch, factors, error) ||
+            !sharpen_iir_plane(env, iir_kernel, b_memory, tmpb, state, width,
+                               height, pitch, factors, error)) {
+            release_scratch();
+            error = "lab.sharpening defringe blur failed";
+            return RT_STAGE_ERROR;
+        }
+
+        const cl_int cl_width = width;
+        const cl_int cl_height = height;
+        const cl_int cl_pitch = pitch;
+        const auto copy_plane = [&](cl_mem source, cl_mem target) -> bool {
+            return set_arg(copy_kernel, 0, sizeof(cl_mem), &source) &&
+                   set_arg(copy_kernel, 1, sizeof(cl_mem), &target) &&
+                   set_arg(copy_kernel, 2, sizeof(cl_int), &cl_width) &&
+                   set_arg(copy_kernel, 3, sizeof(cl_int), &cl_height) &&
+                   set_arg(copy_kernel, 4, sizeof(cl_int), &cl_pitch) &&
+                   run_2d(copy_kernel);
+        };
+        /* The apply kernel writes a/b while it reads the pre-defringe planes. */
+        if (!copy_plane(a_memory, original_a) ||
+            !copy_plane(b_memory, original_b)) {
+            release_scratch();
+            error = "lab.sharpening defringe original copy failed";
+            return RT_STAGE_ERROR;
+        }
+
+        cl_mem hue_memory = a_memory;
+        if (p.hue_curve != 0) {
+            const StageBufferShape hue_shape{RT_STAGE_F32, hue.width, 1, 1};
+            StageDeviceBufferPtr hue_device =
+                residency->acquire(hue.data, hue_shape, &error);
+            if (!hue_device ||
+                residency->upload(hue_device, hue) != RT_STAGE_OK) {
+                release_scratch();
+                error = "lab.sharpening hue table upload failed";
+                return RT_STAGE_FALLBACK;
+            }
+            auto hue_buffer =
+                std::dynamic_pointer_cast<OpenCLDeviceBuffer>(hue_device);
+            if (!hue_buffer) {
+                release_scratch();
+                error = "lab.sharpening hue table type mismatch";
+                return RT_STAGE_FALLBACK;
+            }
+            hue_memory = hue_buffer->memory();
+        }
+
+        const cl_int cl_hue_entries = hue.width;
+        const cl_int cl_curve = p.hue_curve;
+        const bool fringe_ok =
+            set_arg(fringe_kernel, 0, sizeof(cl_mem), &a_memory) &&
+            set_arg(fringe_kernel, 1, sizeof(cl_mem), &b_memory) &&
+            set_arg(fringe_kernel, 2, sizeof(cl_mem), &tmpa) &&
+            set_arg(fringe_kernel, 3, sizeof(cl_mem), &tmpb) &&
+            set_arg(fringe_kernel, 4, sizeof(cl_mem), &fringe) &&
+            set_arg(fringe_kernel, 5, sizeof(cl_mem), &hue_memory) &&
+            set_arg(fringe_kernel, 6, sizeof(cl_int), &cl_hue_entries) &&
+            set_arg(fringe_kernel, 7, sizeof(cl_int), &cl_curve) &&
+            set_arg(fringe_kernel, 8, sizeof(cl_int), &cl_width) &&
+            set_arg(fringe_kernel, 9, sizeof(cl_int), &cl_height) &&
+            set_arg(fringe_kernel, 10, sizeof(cl_int), &cl_pitch) &&
+            run_2d(fringe_kernel);
+        if (!fringe_ok) {
+            release_scratch();
+            error = "lab.sharpening defringe chromaticity failed";
+            return RT_STAGE_ERROR;
+        }
+
+        {
+            const std::size_t global = static_cast<std::size_t>(height);
+            const bool rows_ok =
+                set_arg(rows_kernel, 0, sizeof(cl_mem), &fringe) &&
+                set_arg(rows_kernel, 1, sizeof(cl_mem), &rows) &&
+                set_arg(rows_kernel, 2, sizeof(cl_int), &cl_width) &&
+                set_arg(rows_kernel, 3, sizeof(cl_int), &cl_height) &&
+                set_arg(rows_kernel, 4, sizeof(cl_int), &cl_pitch);
+            cl_event done = nullptr;
+            if (!rows_ok ||
+                env->api->EnqueueNDRangeKernel(env->queue, rows_kernel, 1,
+                                               nullptr, &global, nullptr, 0,
+                                               nullptr, &done) != CL_SUCCESS ||
+                done == nullptr) {
+                release_scratch();
+                error = "lab.sharpening defringe row sum failed";
+                return RT_STAGE_ERROR;
+            }
+            const cl_int wait_status = env->api->WaitForEvents(1, &done);
+            env->api->ReleaseEvent(done);
+            if (wait_status != CL_SUCCESS) {
+                release_scratch();
+                error = "lab.sharpening defringe row sum did not complete";
+                return RT_STAGE_ERROR;
+            }
+        }
+
+        {
+            const std::size_t global = 1;
+            const bool total_ok =
+                set_arg(total_kernel, 0, sizeof(cl_mem), &rows) &&
+                set_arg(total_kernel, 1, sizeof(cl_mem), &total) &&
+                set_arg(total_kernel, 2, sizeof(cl_int), &cl_width) &&
+                set_arg(total_kernel, 3, sizeof(cl_int), &cl_height);
+            cl_event done = nullptr;
+            if (!total_ok ||
+                env->api->EnqueueNDRangeKernel(env->queue, total_kernel, 1,
+                                               nullptr, &global, nullptr, 0,
+                                               nullptr, &done) != CL_SUCCESS ||
+                done == nullptr) {
+                release_scratch();
+                error = "lab.sharpening defringe total failed";
+                return RT_STAGE_ERROR;
+            }
+            const cl_int wait_status = env->api->WaitForEvents(1, &done);
+            env->api->ReleaseEvent(done);
+            if (wait_status != CL_SUCCESS) {
+                release_scratch();
+                error = "lab.sharpening defringe total did not complete";
+                return RT_STAGE_ERROR;
+            }
+        }
+
+        double chromave = 0.0;
+        {
+            const std::size_t origin[3] = {0, 0, 0};
+            const std::size_t region[3] = {sizeof(double), 1, 1};
+            if (env->api->EnqueueReadBufferRect(
+                    env->queue, total, CL_TRUE, origin, origin, region, 0, 0,
+                    0, 0, &chromave, 0, nullptr, nullptr) != CL_SUCCESS) {
+                release_scratch();
+                error = "lab.sharpening defringe mean readback failed";
+                return RT_STAGE_ERROR;
+            }
+        }
+
+        if (chromave > 0.0) {
+            const float chromavef = static_cast<float>(chromave);
+            const float ratio =
+                static_cast<float>(p.defringe_threshold) / 33.0f;
+            const float threshfactor =
+                1.0f / (ratio * ratio * chromavef * 5.0f + chromavef);
+            const double halfwin_value =
+                std::ceil(2.0 * p.defringe_radius) + 1.0;
+            const cl_int cl_halfwin = static_cast<cl_int>(halfwin_value);
+            const bool apply_ok =
+                set_arg(apply_kernel, 0, sizeof(cl_mem), &a_memory) &&
+                set_arg(apply_kernel, 1, sizeof(cl_mem), &b_memory) &&
+                set_arg(apply_kernel, 2, sizeof(cl_mem), &original_a) &&
+                set_arg(apply_kernel, 3, sizeof(cl_mem), &original_b) &&
+                set_arg(apply_kernel, 4, sizeof(cl_mem), &fringe) &&
+                set_arg(apply_kernel, 5, sizeof(cl_float), &chromavef) &&
+                set_arg(apply_kernel, 6, sizeof(cl_float), &threshfactor) &&
+                set_arg(apply_kernel, 7, sizeof(cl_int), &cl_halfwin) &&
+                set_arg(apply_kernel, 8, sizeof(cl_int), &cl_width) &&
+                set_arg(apply_kernel, 9, sizeof(cl_int), &cl_height) &&
+                set_arg(apply_kernel, 10, sizeof(cl_int), &cl_pitch) &&
+                run_2d(apply_kernel);
+            if (!apply_ok) {
+                release_scratch();
+                error = "lab.sharpening defringe apply failed";
+                return RT_STAGE_ERROR;
+            }
+        }
+    }
+
+    const RtStageStatus readback_l = residency->readback(l_device, luminance);
+    const RtStageStatus readback_a = residency->readback(a_device, a);
+    const RtStageStatus readback_b = residency->readback(b_device, b);
+    release_scratch();
+    if (readback_l != RT_STAGE_OK || readback_a != RT_STAGE_OK ||
+        readback_b != RT_STAGE_OK) {
+        error = "lab.sharpening plane readback failed";
+        return RT_STAGE_ERROR;
+    }
+
+    return RT_STAGE_OK;
+}
+
+/*
  * The local.adjustments node, one spot at a time.
  *
  *   [0] Lab three-plane F32 buffer, read and written in place,
@@ -12934,6 +13407,20 @@ public:
         } else if (request.name == "output.sharpen") {
             const RtStageStatus status =
                 run_sharpen(env_, residency_, request.args, error);
+            if (status == RT_STAGE_OK) {
+                StageEvent done;
+                done.status = StageEventStatus::Complete;
+                done.result = RT_STAGE_OK;
+                done.device = StageDeviceType::OPENCL;
+                done.asynchronous = false;
+                return done;
+            }
+            StageEvent fallback = StageQueue::submit(request, profiling);
+            fallback.note = error;
+            return fallback;
+        } else if (request.name == "lab.sharpening") {
+            const RtStageStatus status =
+                run_lab_sharpening(env_, residency_, request.args, error);
             if (status == RT_STAGE_OK) {
                 StageEvent done;
                 done.status = StageEventStatus::Complete;
