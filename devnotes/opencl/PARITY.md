@@ -225,6 +225,20 @@ peak absolute error is zero for the synthetic node tests:
   non-zero transition is also a host residual because the block's padded
   extent does not cover the transition ring the host reads. Negative damping
   is refused by the predicate and is not a runtime case.
+- Impulse denoise and defringe, through the `lab.sharpening` node, run as one
+  atomic pair. The device test compares the observable corrected sets and all
+  three planes: the impulse fixture and the combined pair correct exactly the
+  host's pixel sets, the impulse pass is bit-identical on a 128x80 random
+  field and on the fixture (`AE=0`), and the defringe pair is `PAE=0` on L and
+  0.000977 LSB16 on a/b. `xatan2f()` is ported from `rtengine/sleef.h` because
+  a device `atan2` one ulp away moved a fringe across the `fringe <
+  threshfactor` decision: the export corpus went from 1010 LSB16 to 1 LSB16
+  with the port. `labsharpening.pp3` (impulse 50, defringe radius 2.0 and
+  threshold 13) is 1 LSB16, and a one-refused pair (impulse on, defringe
+  radius 1.0) is `impl=host`, byte-identical to the CPU path. A defringe
+  radius below 1.15, a threshold outside 0..100, the CIE-CAM arm, an image
+  narrower than its defringe window and a non-fp64 device are residuals; a
+  radius below 0.25 is the host no-op and leaves every plane untouched.
 - `tools/opencl/verify.sh --stage-device`, which `--quick` also runs, asserts
   each record and its parity in one step:
 

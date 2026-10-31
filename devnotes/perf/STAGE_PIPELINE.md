@@ -195,13 +195,18 @@ bands, a GPU or non-fp64 device and nothing enabled at all are residuals:
 each runs the `lab.wavelet` host builtin and records `impl=host`, never a
 device pass.
 
-`lab.sharpening` is partial through the same `output.sharpen` node:
-`ImProcFunctions::sharpening()` is the entry point for both the Lab block and
-the post-resize block, so a Lab-only profile records `output.sharpen`. The
-rest of the Lab block is host-only: impulse denoise, defringe, ML sharpen
-edges and ML microcontrast. Those tools are off by default; when one is
-enabled the block is not atomic, because that pass stays on the host while the
-main sharpen node may still run on the device.
+`lab.sharpening` is partial. Its impulse-denoise and defringe pair is a device
+node of its own, admitted only in the Lab arm (not the CIE-CAM pipeline) with
+an image of at least 8x8, impulse threshold 0..100, defringe threshold 0..100
+and a defringe radius either below 0.25 (the host's Gaussian identity, a
+no-op) or at least 1.15 (`gauss.cc`'s separable-IIR range), on a device with
+fp64 for the defringe reduction, and an image large enough for the defringe
+window. The pair is atomic: when one enabled tool is refused, both run on the
+host, so a Lab image is never half device and half host. The host builds the
+defringe hue table from the profile's own `FlatCurve` and refuses a curve it
+cannot follow. The main sharpen pass stays the shared `output.sharpen` node;
+ML sharpen edges and ML microcontrast stay on the host, so a profile with those
+panes records them separately. Both tools are off by default.
 
 | Id | Domain (export/preview/crop/thumbnail) | Consumer | Reuse | Role | Device |
 |----|----------------------------------------|----------|-------|------|--------|
@@ -215,7 +220,7 @@ main sharpen node may still run on the device.
 | `local.adjustments` | Full/Full/Roi/Reduced | path | reuse-input | local lab / selective editing | partial |
 | `rgb.proc` | Full/Full/Roi/Reduced | path | reuse-input | RGB curves, tone curve, colour toning, B&W, channel mixer, HSV, film simulation | yes |
 | `lab.tools` | Full/Full/Roi/Reduced | path | reuse-input | shadows/highlights, vibrance, Lab curves, local contrast, EPD, Lab-grid colour toning and Lab colour-correction regions | partial |
-| `lab.sharpening` | Full/-/Roi/- | path | reuse-input | impulse denoise, defringe, ML sharpen edges, ML microcontrast and the main sharpen pass (shared `output.sharpen` node) | partial |
+| `lab.sharpening` | Full/-/Roi/- | path | reuse-input | impulse denoise and defringe (own node), ML sharpen edges, ML microcontrast and the main sharpen pass (shared `output.sharpen` node) | partial |
 | `lab.wavelet` | Full/Full/Roi/Reduced | path | reuse-input | directional pyramid equaliser and wavelet | partial |
 | `working.trc` | Full/Full/Roi/- | path | reuse-input | soft light, tone equaliser and working-TRC conversion | partial |
 | `ciecam` | Full/Full/Roi/- | path | reuse-input | CIE CAM 02 | no |
@@ -1675,21 +1680,22 @@ of truth; this section records the remaining work and the naming exceptions.
 
 Device nodes today: `transform`, `rgb.proc`, `gamut`, `framing`, `lanczos3`
 (block `resize`), `output.convert`, `monitor.output`, `viewport.output`,
-`output.sharpen` (for the supported USM and undamped RLD sets),
-`thumbnail.output`, `thumbnail.whitebalance`, `thumbnail.scale` and
-`thumbnail.transform`, plus the runtime-only packed siblings
-`thumbnail.scale.u8` and `thumbnail.transform.u8`.
+`output.sharpen` (for the supported USM and undamped RLD sets), `lab.sharpening`
+(for the admitted impulse-denoise and defringe pair), `thumbnail.output`,
+`thumbnail.whitebalance`, `thumbnail.scale` and `thumbnail.transform`, plus the
+runtime-only packed siblings `thumbnail.scale.u8` and
+`thumbnail.transform.u8`.
 
 Partial: `thumbnail.rgb` is a composite. Its two dominant pixel passes are the
 `transform` and `rgb.proc` device nodes, so the block is `partial`; the
 colour-space conversion, film negative, first analysis, dehaze, Fattal tone
 mapping and local adjustments around them stay on the host. `lab.sharpening`
-is partial through the shared `output.sharpen` node; its impulse denoise,
-defringe, ML sharpen edges and ML microcontrast stay on the host.
-`output.sharpen` itself is partial: damped RLD, radii at or above 1.15,
-edges-only, halo control, show-mask and `blurradius >= 0.25` run the host
-builtin. The sub-node records, commands and parity results are in
-`STAGE_RUNTIME.md`.
+runs its impulse-denoise and defringe pair on the device and keeps the main
+sharpen pass in the shared `output.sharpen` node; ML sharpen edges and ML
+microcontrast stay on the host. `output.sharpen` itself is partial: damped
+RLD, radii at or above 1.15, edges-only, halo control, show-mask and
+`blurradius >= 0.25` run the host builtin. The sub-node records, commands and
+parity results are in `STAGE_RUNTIME.md`.
 
 Still CPU-only: `raw.preprocess`, `raw.demosaic`, `raw.base`, `lab.tools`,
 `lab.wavelet`, `working.trc`, `ciecam` and `thumbnail.lab`.

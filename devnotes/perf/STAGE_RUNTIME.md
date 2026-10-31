@@ -506,7 +506,91 @@ which POCL does, and float otherwise; the fallback only affects the final
 rounding of a sample. A device that cannot build the program falls back to the
 host builtin, so the node still produces the CPU result.
 
-### Lab sharpening shares the node
+### Lab sharpening: impulse denoise and defringe
+
+`lab.sharpening` is its own node for the Lab block's impulse denoise and
+defringe. The call-site wrapper is `stage::labSharpeningRun()` in
+`rtengine/stage/lab_sharpening_context.h`, used by `stage_lab_sharpening()` in
+`rtengine/simpleprocess.cc` and by the crop path in `rtengine/dcrop.cc`. It
+submits the three Lab planes to the node and falls back to
+`ImProcFunctions::impulsedenoise()` + `ImProcFunctions::defringe()` when the
+node does not complete; a refused configuration reaches the registered host
+builtin, which runs the same two calls through the context, so a residual is
+recorded `impl=host` and never mixed with a device pass.
+
+The ABI is `[0]` a tightly packed one-plane F32 L buffer, `[1]` a, `[2]` b,
+then the scalars `[3]` impulse enabled, `[4]` impulse threshold,
+`[5]` defringe enabled, `[6]` defringe radius, `[7]` defringe threshold, `[8]`
+the hue table (F32, one row), `[9]` its entry count, `[10]` the active-curve
+flag and `[11]` a host-only context pointer. The impulse threshold and the
+defringe radius arrive already prescaled by the export; the crop path does not
+prescale. All three planes must be tightly packed and the same size, because
+the host builtin copies them into a `LabImage` and back.
+
+The pair is atomic. The launcher refuses before the first upload when the Lab
+arm is not the caller's (the CIE-CAM pipeline runs these tools on the
+`CieImage` and is a host residual), the image is below 8x8, either threshold
+is outside 0..100, defringe is enabled with a radius in `0.25..1.15` (the
+host's 3x3/5x5/7x7 Gaussian kernels, whose border rules are not implemented),
+a running defringe meets a device without fp64 (its chromaticity mean is a
+double sum), or the defringe window is wider than the image. A radius below
+0.25 is the host's `gaussianBlur()` identity, so the whole defringe pass is a
+no-op and the node reports OK without touching a plane.
+
+Pass order matches the host: the impulse mark, the impulse correction, then
+the defringe blurs, chromaticity, mean and apply. Both Gaussian blurs reuse
+`rt_sharpen_iir_line` and `sharpen_iir_factors()` from `output.sharpen`, with
+the sigma rounded to float exactly as `gaussHorizontalSse()` receives it.
+Kernels, in one program that also carries the output-sharpening kernels:
+
+- `rt_lab_sharpening_impulse_mark` reproduces `impulse_nr()`'s 5x5 high-pass
+  sum and threshold, including the shortened window at both horizontal tails.
+- `rt_lab_sharpening_impulse_correct` reproduces the range-weighted mean of
+  L, a and b over the same window, skipping marked neighbours. Marked sources
+  are never read after they are written, so the in-place update is
+  deterministic. A 5x5 cluster's centre therefore keeps its value while its
+  border is corrected, exactly as on the host.
+- `rt_lab_sharpening_defringe_fringe` computes `chromaChfactor * (da^2 +
+  db^2)` with `huelab_to_huehsv2()` and a host-built hue table. `xatan2f()`
+  from `rtengine/sleef.h` is ported line for line, because a device `atan2`
+  one ulp away moved one fringe across the `fringe < threshfactor` decision
+  on the export corpus.
+- `rt_lab_sharpening_defringe_rows` and `_total` reduce the float
+  chromaticity in double, one row at a time, and divide by `width * height`;
+  the host launcher computes `threshfactor` from that float mean in the
+  host's operation order.
+- `rt_lab_sharpening_defringe_apply` reproduces the host's three-way window
+  split, including the asymmetric left tail, and the weighted mean of the
+  pre-defringe a and b. The reciprocal is recomputed from the original fringe
+  because neighbours still read it.
+- `rt_lab_sharpening_copy` keeps the pre-defringe planes in scratch so the
+  apply kernel writes the resident planes while reading the originals.
+
+The hue table is a uniform `FlatCurve::getVal()` sample with linear
+interpolation, built by `LabSharpeningContext::build()`. `FlatCurve` stores a
+dense polyline, so the build measures the interpolation error against 8192
+independent points and refuses a curve it cannot follow within `1e-6`. The
+context also owns the host callback, so the same code runs the CPU block for a
+residual.
+
+Device test, POCL CPU, `RT_REQUIRE_GPU=1`, `OMP_NUM_THREADS=1`:
+
+| Case | Result |
+|---|---|
+| impulse fixture: ramp, flat plateau, isolated spikes (one on the border and one in the corner), a 5x5 cluster, a/b spikes | 32 marked and 32 corrected by both paths; the corrected pixel sets are identical; `PAE L/a/b = 0` on 1953 samples |
+| impulse stress: 128x80 deterministic pseudo-random L/a/b with periodic spikes | bit-identical on all three planes, 0 of 10240 samples differ |
+| defringe fixture: high-contrast edge, 3-px magenta ring at the default curve's peak, neutral and saturated patches, a border fringe | 218 corrected by both paths, identical sets; `PAE L = 0`, `PAE a/b = 0.000977` LSB16 |
+| impulse+defringe pair on the defringe fixture | both passes in one device pass; `PAE L = 0`, `PAE a/b = 0.000977`; identical corrected sets |
+| defringe radius 0.2 | device pass, every plane bit-identical (the host no-op) |
+| one-refused pair (impulse threshold 50, defringe radius 1.0) through `stage::run()` | `impl=host`, `source=device-fallback`, bit-identical to the CPU path |
+| admission predicates | CIE-CAM arm, radius 0.5 and 1.0, impulse threshold -1/101, defringe threshold 101, a too-narrow image and a non-fp64 device are all refused; impulse alone needs no fp64; radius 0.2 is admitted |
+
+`devnotes/opencl/pp3/labsharpening.pp3` (impulse threshold 50, defringe radius
+2.0/threshold 13) is the export gate; `verify.sh --quick` asserts
+`"stage":"lab.sharpening".*"impl":"opencl"` and a 16-bit TIFF peak error at or
+below 1 LSB16.
+
+### Lab sharpening shares the output sharpening node
 
 `ImProcFunctions::sharpening()` is the entry point for both blocks. The
 post-resize call is `stage_output_sharpen()` and the Lab call is
@@ -517,12 +601,14 @@ Enabled=false` reaches the node from `lab.sharpening` and records
 `"stage":"output.sharpen","impl":"opencl","source":"opencl"` at the full frame
 size, not at a resized size.
 
-The rest of `lab.sharpening` is host-only: impulse denoise, defringe, ML
-sharpen edges and ML microcontrast run before or beside the main sharpen call.
-They are off by default. When one is enabled the block is only partially
-device-covered: the extra pass stays on the host while the shared sharpen node
-may still run on the device. This is the atomicity caveat for the block — it
-is not one device pass and there is no block-level device record.
+The rest of `lab.sharpening` is host-only: ML sharpen edges and ML
+microcontrast run before or beside the main sharpen call. They are off by
+default. Impulse denoise and defringe are not part of the shared node; they
+are the separate `lab.sharpening` node described above, which is atomic for
+its own pair. A profile that enables only impulse denoise and defringe
+therefore records `"stage":"lab.sharpening","impl":"opencl"`; a profile that
+also enables ML edges or microcontrast records those passes on the host
+beside the device node.
 
 Evidence, POCL CPU, `RT_OPENCL_ALLOW_CPU=1 RT_OPENCL_RGBPROC=1
 RT_STAGE_OPENCL=1 RT_STAGE_PROFILE=... OMP_NUM_THREADS=1`, export with
