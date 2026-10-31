@@ -2903,7 +2903,11 @@ Local sharpening requires `methodcap == "rl"`, undamped, `shargam == 1`,
 `sharblur < 0.25`, no mask view, `reparsha == 100`, a radius in `0.4..1.15`
 and the GUI ranges for amount, iterations, contrast and sensitivity; capture
 sharpening, damping, a gamma wrapper, the blur pre-pass, mask view, a
-separable radius and an out-of-range value are residuals. A radius at or
+separable radius and an out-of-range value are residuals. The host's
+`shardamping` fixup raises a zero damping to one when
+`dirpyrequalizer.cbdlMethod == "bef"` (the default), even with the equalizer
+disabled, so the device path also requires `cbdlMethod == "aft"`; `"bef"` is
+a host residual. A radius at or
 below 0.42 is the block's own no-op and is recorded as a skipped pass. A
 partial spot with a non-zero transition is a residual because the block's
 blend reads the padded result across the transition ring; a zero-width

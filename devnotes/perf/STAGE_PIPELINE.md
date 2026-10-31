@@ -1714,7 +1714,10 @@ view, `reparsha == 100` and a radius in `0.4..1.15` (below 1.15 so the core
 uses its 3x3/5x5/7x7 kernels rather than the separable IIR arm). A radius at
 or below 0.42 is the block's own no-op. Capture sharpening (`"cap"`),
 damping, `shargam != 1`, `sharblur >= 0.25`, `sharshow`, a radius outside
-`0.4..1.15` and out-of-range sliders are residuals. A partial spot with a
+`0.4..1.15` and out-of-range sliders are residuals. The host's
+`shardamping` fixup raises a zero damping to one when
+`dirpyrequalizer.cbdlMethod == "bef"` (the default), so the device path also
+requires `cbdlMethod == "aft"`; `"bef"` is a host residual. A partial spot with a
 non-zero transition is also a residual: `Sharp_Local()` reads the padded
 deconvolution result across the transition ring, which the block's
 `lx + lxL + 3` extent does not cover; a zero-width transition keeps the ring
