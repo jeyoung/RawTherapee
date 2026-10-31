@@ -1709,15 +1709,20 @@ zero, no gradient and its GUI slider ranges; `detail` non-zero (the guided
 filter arm), `expcie`, `ciecam`, `autocompute`, `strlog`, an explicit mask,
 a soft radius and out-of-range values are residuals. Local sharpening is
 admitted only in the `"rl"` RLD arm that the output sharpening core covers:
-undamped, no capture sharpening, `shargam == 1`, `sharblur < 0.25`, no mask
-view, `reparsha == 100` and a radius in `0.4..1.15` (below 1.15 so the core
-uses its 3x3/5x5/7x7 kernels rather than the separable IIR arm). A radius at
+no capture sharpening, `shargam == 1`, `sharblur < 0.25`, no mask view,
+`reparsha == 100` and a radius in `0.4..1.15` (below 1.15 so the forward blur
+uses its 3x3/5x5/7x7 or IIR kernels rather than the separable arm). Damping is
+supported over the GUI's `0..100` range; zero is the undamped recurrence and a
+positive value is `dcdamping()`'s damped recurrence, which additionally needs
+a radius of at least `0.6` so the forward blur is the standard IIR pair. The
+host's `shardamping` fixup raises a zero damping to one when
+`dirpyrequalizer.cbdlMethod == "bef"` (the default), even with the equalizer
+disabled; the context records the effective value without mutating the
+caller's params, so both `cbdlMethod` values are admitted. A radius at
 or below 0.42 is the block's own no-op. Capture sharpening (`"cap"`),
-damping, `shargam != 1`, `sharblur >= 0.25`, `sharshow`, a radius outside
-`0.4..1.15` and out-of-range sliders are residuals. The host's
-`shardamping` fixup raises a zero damping to one when
-`dirpyrequalizer.cbdlMethod == "bef"` (the default), so the device path also
-requires `cbdlMethod == "aft"`; `"bef"` is a host residual. A partial spot with a
+`shargam != 1`, `sharblur >= 0.25`, `sharshow`, a radius outside
+`0.4..1.15`, a damped radius below `0.6` and out-of-range sliders are
+residuals. A partial spot with a
 non-zero transition is also a residual: `Sharp_Local()` reads the padded
 deconvolution result across the transition ring, which the block's
 `lx + lxL + 3` extent does not cover; a zero-width transition keeps the ring
@@ -1936,11 +1941,28 @@ differs from the neutral export by PAE 6,272 codes on 3,572,230 of
 and undamped RLD kernels on the block's zero-padded `lx + lxL + 3` by
 `ly + lyT + 3` plane, and reproduces `Sharp_Local()`'s full-image deltaE
 reference blur and senstype-0 (`lp.senssha`) blend; it does not re-derive
-USM/RLD. The runtime residual matrix (capture sharpening, damping, gamma,
-blur pre-pass, mask view, a separable radius, radius/amount/iteration/
-contrast/sensitivity out of range and `reparsha`) runs the host builtin and
-is byte-identical; a partial spot with a non-zero transition is also a host
-residual for the padded-extent reason above.
+USM/RLD. The runtime residual matrix (capture sharpening, damping range and
+negative, a damped radius below 0.6, gamma, blur pre-pass, mask view, a
+separable radius, radius/amount/iteration/contrast/sensitivity out of range
+and `reparsha`) runs the host builtin and is byte-identical; a partial spot
+with a non-zero transition is also a host residual for the padded-extent
+reason above.
+
+The damped local sharpening matrix is within 0.871 LSB16 (damping 10 at
+radius 1.00; 0.626 on sharpen+soft light, 0.547 on 8192x64, 0.443 on all
+tools, 0.376 on sharpen+dehaze, 0.379 on sharpen+log, 0.318 on 179x49,
+0.213 on the default `"bef"` fixup, 0.139 on the 0.6 minimum radius) over
+nineteen cases: the default `"bef"` fixup at zero-to-one, the 0.6 minimum
+radius, damping 1/5/10/100, both `cbdlMethod` values, colour, log, dehaze,
+CBDL, vibrance, shadows/highlights, soft light, local contrast, all tools,
+MUNS, a second spot and the 179x49, 238x64 and 8192x64 widths; no sample is
+non-finite. The fixup case is non-vacuous: it changes 32,446 of 45,696
+fixture samples with PAE 9,288.169922 LSB16 against the spot with the tool
+off, and damping changes 34,031 samples with PAE 2,806.058594 LSB16 against
+the same spot undamped. The pass reuses the output sharpening core's mask,
+standard IIR forward blur, `dcdamping()` factor and GAUSS_MULT kernels on the
+same padded plane. `localadjustments-sharpen-damped.pp3` is 1 LSB16 and
+exercises the default fixup.
 
 The `chromacbdl = 0.01`, default-multiplier, default-clarity case is the
 chroma block's all-ones-multiplier arm: the CPU still enters the block and
@@ -1954,8 +1976,9 @@ method, the shadows/highlights
 `"tone"`/`"ghs"`/`"micha"` methods, tone-eq multipliers, a non-default tone
 gamma/slope, the SH recovery blend and gradient, vibrance
 gamma/gradients/warm, the local-contrast wavelet (`"wav"`) and FFT variants,
-CBDL's `contresid` and soft radius, blur/denoise, capture sharpening, RLD
-damping, `shargam`, `sharshow`, a separable local-sharpening radius, tone
+CBDL's `contresid` and soft radius, blur/denoise, capture sharpening,
+`shargam`, `sharshow`, a separable local-sharpening radius, a damped radius
+below 0.6, tone
 mapping,
 Retinex, log's guided-filter `detail`/`autocompute`/CIE CAM/gradient, the
 common mask, CIE CAM, the global dehaze, `exc`/`full`/`main`, merge, explicit

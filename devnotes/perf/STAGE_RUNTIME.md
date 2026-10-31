@@ -2755,7 +2755,7 @@ Michaelis-Menten) and their tone-eq, recovery and gradient sub-options, the
 soft-light `"reti"` method, explicit masks, soft radius, merge, recursion,
 LabGrid, the RGB and exposure curves, `reparcol != 100`, the log tool's
 guided-filter `detail` arm, `autocompute`, CIE CAM and `strlog`, capture
-sharpening, sharpening damping/gamma/blur/mask-view and a separable
+sharpening, sharpening gamma/blur/mask-view and a separable
 sharpening radius, and the
 LAB/XYZ/XYZREL methods stay on the host. The tools run in the block's order:
 log encoding, dehaze, CBDL, vibrance, shadows/highlights, soft light, local
@@ -2764,7 +2764,7 @@ contrast, local sharpening, then Colour & Light.
 ### ABI, state and host setup
 
 The node takes a three-plane `F32` Lab buffer, a pointer to
-`RtLocalAdjustmentsContext` (version 8, magic `0x4C414A43`, size checked,
+`RtLocalAdjustmentsContext` (version 9, magic `0x4C414A43`, size checked,
 `spot_count` from the profile) and the block support flag. The call site only
 prefills `labView` with `rgb2lab(baseImg)` when the block is active and the
 whole-block predicate is true; an inactive block never enters the node.
@@ -2773,7 +2773,7 @@ The launcher keeps a contiguous host staging copy of the Lab image and a
 device `reserved` copy of the initial image. For each spot it calls
 `build(self, spot, &staging, &setup)`, which runs the block's own
 `calcLocalParams()`, `calc_ref()` on the current Lab, `complexCurvelocal()`
-and the curve factories. It then uploads that spot's 140-float record and
+and the curve factories. It then uploads that spot's 141-float record and
 tables, runs the passes, and reads the device image back into the staging
 copy. Spot N+1's references therefore see spot N's result through the same
 read-back path as the CPU's `labView`. `reserved` is never updated, matching
@@ -2804,10 +2804,15 @@ lab.regions `xlogf`/`xexpf`/`pow_F` ports, and the local-adjustments kernels:
 - `rt_local_adjustments_plane_copy`: copies one full-image Lab plane into the
   deltaE reference blur.
 - `rt_sharpen_mask`, `rt_sharpen_iir_line`, `rt_sharpen_rld_init`,
-  `rt_sharpen_div3/5/7`, `rt_sharpen_mult3/5/7` and
-  `rt_sharpen_rld_final`: the output sharpening core's contrast mask and
-  undamped RLD recurrence, run on the padded plane. The local pass reuses the
-  same kernels and host coefficient helpers; it does not re-derive USM/RLD.
+  `rt_sharpen_div3/5/7`, `rt_sharpen_mult3/5/7`,
+  `rt_local_adjustments_sharpen_damp` and `rt_sharpen_rld_final`: the output
+  sharpening core's contrast mask, the undamped RLD recurrence and the local
+  damped recurrence, run on the padded plane. The damped pass takes the
+  standard IIR blur of the estimate (in place on the second pass, which the
+  line kernel's early boundary read allows), applies `dcdamping()`'s factor
+  with `rt_local_adjustments_sharpen_damp`, and multiplies by the GAUSS_MULT
+  5x5/7x7 blur. The local pass reuses the same kernels and host coefficient
+  helpers; it does not re-derive USM/RLD.
 - `rt_local_adjustments_log`: `log_encode()`'s per-pixel arm: `norm2()`, the
   host-built `apply` scalars, the saturation control, the `repar` recovery
   blend and the encode. `find_gray()`, the compression threshold's host
@@ -2899,15 +2904,19 @@ mask, soft radius, merge, recursion, inversion, gradient, LabGrid, RGB or
 exposure curve, an `avoidgamutMethod` other than `"NONE"`/`"MUNS"`, and a ROI
 of at least 5 px in each dimension (12 px when shadows/highlights runs, 39 px
 when sharpening runs).
-Local sharpening requires `methodcap == "rl"`, undamped, `shargam == 1`,
+Local sharpening requires `methodcap == "rl"`, `shargam == 1`,
 `sharblur < 0.25`, no mask view, `reparsha == 100`, a radius in `0.4..1.15`
-and the GUI ranges for amount, iterations, contrast and sensitivity; capture
-sharpening, damping, a gamma wrapper, the blur pre-pass, mask view, a
-separable radius and an out-of-range value are residuals. The host's
-`shardamping` fixup raises a zero damping to one when
+and the GUI ranges for amount, iterations, contrast, sensitivity and damping
+(`0..100`). Damping zero selects the undamped recurrence; a positive value
+selects `dcdamping()`'s damped recurrence, and a damped spot additionally
+needs a radius of at least `0.6`, where the forward blur is the standard IIR
+pair. The host's `shardamping` fixup raises a zero damping to one when
 `dirpyrequalizer.cbdlMethod == "bef"` (the default), even with the equalizer
-disabled, so the device path also requires `cbdlMethod == "aft"`; `"bef"` is
-a host residual. A radius at or
+disabled; the context records that effective value and does not mutate the
+caller's params, so both `cbdlMethod` values are admitted. Capture
+sharpening, a gamma wrapper, the blur pre-pass, mask view, a separable
+radius, a damped radius below `0.6` and an out-of-range value are residuals.
+A radius at or
 below 0.42 is the block's own no-op and is recorded as a skipped pass. A
 partial spot with a non-zero transition is a residual because the block's
 blend reads the padded result across the transition ring; a zero-width
@@ -2926,7 +2935,7 @@ clamp-only and may carry inert tool settings. Everything else is a residual:
 exposure (FFT PDE), the other shadows/highlights methods and
 tone-eq/recovery/gradient sub-options, the local-contrast wavelet and FFT
 variants, vibrance gamma/gradients/warm, blur/denoise, capture sharpening,
-sharpening damping/gamma/blur/mask view/separable radius, tone
+sharpening gamma/blur/mask view/separable radius, tone
 mapping, Retinex, log's guided-filter arm/`autocompute`/CIE CAM/gradient,
 soft light `"reti"`, the common mask, dehaze, `exc`/`full`/`main`, merge,
 explicit masks, soft radius,
@@ -2963,9 +2972,12 @@ device is refused before the upload.
 | Log residuals, 11 cases | `autocompute`, `expcie`, the `ciecam` flag, non-zero `detail`, `strlog`, an explicit mask, a soft radius, source gray/compression/`repar`/sensitivity out of range: `impl=host`, no `impl=opencl`, PAE 0. The predicate matrix also covers target gray and black/white EV |
 | `localadjustments-log.pp3` (CPU-device row) | PASS, `max_pae=1.5259e-05` (1 LSB16), `impl=opencl`; log encoding at source gray 10, target gray 18, black/white EV -5/10, compression 0.4, `repar=100`, saturation on, `sensilog=60`, detail zero, combined with Colour & Light. Non-vacuous: against the neutral export the profile differs by PAE 20,952 codes on 5,254,380 of 30,419,712 channel samples |
 | Sharpen matrix, 21 cases | alone, the 3x3/5x5/7x7 radii, sensitivity 90, colour, log, dehaze, CBDL, vibrance, shadows/highlights, soft light, local contrast, all tools, MUNS, a second spot, inactive/active, ELI/RECT, a partial zero-transition spot and the 179x49/238x64/8192x64 widths: `impl=opencl`, finite, worst 0.925781 LSB16 (sensitivity 90; kernel-7 0.765625; sharpen+soft light 0.625977; all tools 0.427734; 8192x64 0.515625; sharpen alone 0.207031; partial zero-transition 0.138672). Non-vacuity: sharpen alone changes 33,709 of 45,696 samples (PAE 8,866.826172 LSB16) against the same spot with the tool off |
-| Sharpen residuals, 12 cases | capture sharpening, damping, gamma, the blur pre-pass, mask view, a separable radius, radius/amount/iteration/contrast/sensitivity out of range and `reparsha`: `impl=host`, no `impl=opencl`, PAE 0. A partial spot with a non-zero transition is also a host residual for the padded-extent reason |
+| Sharpen residuals, 13 cases | capture sharpening, damping range (101), damping negative, a damped radius below 0.6, gamma, the blur pre-pass, mask view, a separable radius, radius/amount/iteration/contrast/sensitivity out of range and `reparsha`: `impl=host`, no `impl=opencl`, PAE 0. A partial spot with a non-zero transition is also a host residual for the padded-extent reason. |
+| Damped sharpen matrix, 19 cases | the default `"bef"` fixup at damping zero-to-one, the 0.6 minimum radius, damping 1/5/10/100, both `cbdlMethod` values, colour, log, dehaze, CBDL, vibrance, shadows/highlights, soft light, local contrast, all tools, MUNS, a second spot and the 179x49/238x64/8192x64 widths: `impl=opencl`, finite, worst 0.871094 LSB16 (damping 10 at radius 1.00; all tools 0.443359; soft light 0.625977; 8192x64 0.546875; default fixup 0.212891; minimum radius 0.138672). The fixup case is non-vacuous (32,446 of 45,696 samples, PAE 9,288.169922 LSB16 against the tool off), and damping changes 34,031 of 45,696 samples (PAE 2,806.058594 LSB16) against the same spot undamped |
 | `localadjustments-sharpen.pp3` (CPU-device row) | PASS, `max_pae=1.5259e-05` (1 LSB16), `impl=opencl`; the RL arm at radius 0.75, amount 100, 30 iterations, contrast 20, sensitivity 40, undamped, with a zero-transition spot. Non-vacuous: against the neutral export the profile differs by PAE 6,272 codes on 3,572,230 of 10,139,904 pixels |
-| Full `verify.sh --stage-device` | PASS, 33 PASS and 0 SKIP on the POCL CPU device; the MUNS, SH, soft-light, CBDL, dehaze, log and sharpen rows are CPU-device rows, consistent with the launcher's CPU-only requirement. `working.trc` stays 1 LSB16 |
+| `localadjustments-sharpen-damped.pp3` (CPU-device row) | PASS, `max_pae=1.5259e-05` (1 LSB16), `impl=opencl`; radius 0.75, `cbdlMethod=bef` and `shardamping=0`, so the host fixup's effective damping of one is exercised on the device. Non-vacuous: against the neutral export the profile differs by PAE 8,197 codes on 3,487,820 of 10,139,904 pixels |
+| Real-image damping 5 | `localadjustments-sharpen-damped.pp3` with `Shardamping_0=5`, `--gpu=off` versus `--gpu=auto`: 1 LSB16, 386,749 of 10,139,904 pixels differ |
+| Full `verify.sh --stage-device` | PASS, 34 PASS and 0 SKIP on the POCL CPU device; the MUNS, SH, soft-light, CBDL, dehaze, log and sharpen rows, including the damped row, are CPU-device rows, consistent with the launcher's CPU-only requirement. `working.trc` stays 1 LSB16 |
 | Default path | with `RT_STAGE_OPENCL` unset the host block runs directly; CPU-only `stage-residency-test: PASS (25 skipped)` |
 | Builds | `build/cpu-perf-graph` and `build/opencl-perf-graph` compile |
 | GPU | not run; refused before upload, records `impl=host` |

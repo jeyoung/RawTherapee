@@ -189,22 +189,29 @@ peak absolute error is zero for the synthetic node tests:
   `ciecam`, non-zero `detail`, `strlog`, mask, soft radius and four
   out-of-range sliders) run the host builtin byte for byte.
 - Local sharpening, through `local.adjustments`, runs the output sharpening
-  core's device mask and undamped RLD kernels on the block's zero-padded
-  extent and reproduces `Sharp_Local()`'s full-image deltaE reference blur
-  and senstype-0 (`lp.senssha`) blend. It matches the host block in twenty-one
-  configurations (alone, the 3x3/5x5/7x7 radii, high sensitivity, colour,
-  log, dehaze, CBDL, vibrance, shadows/highlights, soft light, local contrast,
-  all tools, MUNS, a second spot, inactive/active, ELI/RECT, a partial
-  zero-transition spot and the 179x49, 238x64 and 8192x64 widths) with a worst
-  peak error of 0.926 LSB16 at sensitivity 90 (kernel-7 0.766, sharpen+soft
-  light 0.626, all tools 0.428, sharpen+dehaze 0.355, 8192x64 0.516, sharpen
-  alone 0.207); no sample is non-finite. Sharpen alone changes 33,709 of
-  45,696 samples at PAE 8,866.826172 LSB16, so the parity is not vacuous.
-  `localadjustments-sharpen.pp3` is 1 LSB16 and differs from neutral by PAE
-  6,272 codes on 3,572,230 of 10,139,904 pixels. Twelve residual
-  configurations (capture sharpening, damping, gamma, blur, mask view, a
-  separable radius, radius/amount/iteration/contrast/sensitivity out of
-  range and `reparsha`) run the host builtin byte for byte; a partial spot
+  core's device mask, undamped RLD and damped kernels on the block's
+  zero-padded extent and reproduces `Sharp_Local()`'s full-image deltaE
+  reference blur and senstype-0 (`lp.senssha`) blend. It matches the host
+  block in twenty-one undamped configurations (alone, the 3x3/5x5/7x7 radii,
+  high sensitivity, colour, log, dehaze, CBDL, vibrance, shadows/highlights,
+  soft light, local contrast, all tools, MUNS, a second spot,
+  inactive/active, ELI/RECT, a partial zero-transition spot and the
+  179x49/238x64/8192x64 widths) with a worst peak error of 0.926 LSB16 at
+  sensitivity 90 (kernel-7 0.766, sharpen+soft light 0.626, all tools 0.428,
+  sharpen+dehaze 0.355, 8192x64 0.516, sharpen alone 0.207); no sample is
+  non-finite. Sharpen alone changes 33,709 of 45,696 samples at PAE
+  8,866.826172 LSB16, so the parity is not vacuous. The damped recurrence is
+  within 1 LSB16 in nineteen cases (the default `"bef"` fixup, the 0.6
+  minimum radius, damping 1/5/10/100, both methods, the combined tools, MUNS, a
+  second spot and the three widths) with a worst of 0.871 LSB16; the fixup
+  changes 32,446 samples at PAE 9,288.169922 LSB16 against the tool off, and
+  damping changes 34,031 at PAE 2,806.058594 LSB16 against the same spot
+  undamped. `localadjustments-sharpen.pp3` and
+  `localadjustments-sharpen-damped.pp3` are 1 LSB16; the latter exercises the
+  default fixup. Thirteen residual configurations (capture sharpening,
+  damping range and negative, a damped radius below 0.6, gamma, blur, mask
+  view, a separable radius, radius/amount/iteration/contrast/sensitivity out
+  of range and `reparsha`) run the host builtin byte for byte; a partial spot
   with a non-zero transition is also a host residual because the block's
   padded extent does not cover the transition ring the host reads.
 - `tools/opencl/verify.sh --stage-device`, which `--quick` also runs, asserts
