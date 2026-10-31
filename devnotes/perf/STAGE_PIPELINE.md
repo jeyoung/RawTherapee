@@ -221,7 +221,7 @@ main sharpen node may still run on the device.
 | `ciecam` | Full/Full/Roi/- | path | reuse-input | CIE CAM 02 | no |
 | `gamut` | Full/Full/Roi/Reduced | path | reuse-input | working-space gamut compression | yes |
 | `output.convert` | Full/-/-/- | exact | reuse-output | Lab to output RGB and output profile conversion | yes |
-| `crop` | Full/-/-/- | exact | reuse-output | crop | n/a |
+| `crop` | Full/-/-/- | exact | reuse-output | crop | yes |
 | `resize` | Full/-/-/- | exact | reuse-output | resize (`lanczos3`) | yes |
 | `output.sharpen` | Full/-/-/- | exact | reuse-input | post-resize sharpening (`output.sharpen`); USM without residual switches | partial |
 | `framing` | Full/-/-/- | exact | reuse-output | framing and frame drawing | yes |
@@ -1991,13 +1991,26 @@ an active pre-CBDL pass. A GPU device is refused before the upload. An
 inactive block (`locallab.enabled == false` or no spots) never enters the node
 and takes no Lab round trip.
 
+`crop` runs on the device as a three-plane F32 row copy. `stage_crop()` in
+`simpleprocess.cc` allocates the destination from the crop parameters and
+submits `stage::run("crop", …)` with the source, the destination and the x/y
+offset; the rectangle size comes from the destination. The launcher refuses a
+negative offset, a rectangle that leaves the source, a destination wider or
+taller than the source, an aliased buffer and any view that is not F32 and
+three-plane. A refused or unavailable node falls back to the original
+`memcpy`, so the fallback is byte-identical and the default (device off) path
+is unchanged. The copy is exact: the node test compares all three planes with
+`AE=0` at full frame, an odd offset, the bottom-right corner, a single row, a
+single pixel and an 8192-wide rectangle, and refuses every invalid rectangle
+without touching the destination. The export gate is 1 LSB16 on the final
+TIFF because the same profile also runs the resize node.
+
 Recorded `n/a` exceptions: `source.select` and `source.embedded` are I/O,
-`analysis` produces only histograms, `output.icc` attaches metadata,
-`thumbnail.decode` is a decode, and `crop` is a row `memcpy` whose device round
-trip is more expensive than the copy until residency lands. `analysis` is also
-folded into `raw.base` in the preview path, and the crop path folds
-`raw.preprocess` and `raw.demosaic` into `source.select`; those executions
-have no buffer boundary to submit.
+`analysis` produces only histograms, `output.icc` attaches metadata and
+`thumbnail.decode` is a decode. `analysis` is also folded into `raw.base` in
+the preview path, and the crop path folds `raw.preprocess` and
+`raw.demosaic` into `source.select`; those executions have no buffer boundary
+to submit.
 
 ## Final integration of the request and device branches
 

@@ -282,6 +282,41 @@ There is no residual for the block: it is a pure pixel copy and a constant
 fill, with no arithmetic. The frame geometry stays in `stage_crop()`, as
 before.
 
+## Crop
+
+`crop` copies the Lab rectangle in `stage_crop()` (`simpleprocess.cc`). The
+block has no host stage built-in, so only that call site can select it; the
+classic engine path is the row `memcpy` loop it already ran.
+
+The ABI is `[0]` source, `[1]` destination, `[2]` int x offset and `[3]` int y
+offset. Both buffers are three-plane F32 `LabImage` views; the cropped
+dimensions come from the destination buffer, which the call site allocates
+from `params.crop`, and the launcher inserts the source and destination row
+pitches. The kernel writes every destination pixel once from
+`(y + yoffset, x + xoffset)`; there is no border rule and no resampling,
+because the host copy is a row copy.
+
+The node rejects a view that is not three-plane F32, equal source and
+destination buffers, a negative offset, a rectangle that leaves the source
+and a destination wider or taller than the source. A refused or unavailable
+node falls back to the call site's `memcpy`, which is byte-identical; the
+default (device off) path therefore keeps its exact behaviour. The three
+destination planes are read back after a wait, so the event is complete with
+`asynchronous=false`.
+
+Evidence:
+
+| Case | Result |
+|---|---|
+| device test, six shapes: full frame, an odd offset, the bottom-right corner, a single row, a single pixel and an 8192-wide rectangle | device execution, `device=OPENCL`, PAE 0.000000 LSB16, 0 of 45696, 26313, 3009, 714, 3 and 99000 samples differ from the host row copy |
+| invalid rectangle, oversized destination and aliased buffers | `RT_STAGE_FALLBACK`, destination unchanged (PAE 0.000000 against a pre-run copy) |
+| `run("crop", …)` with the node selected | `"stage":"crop".*"impl":"opencl"` in the profile |
+| `RT_STAGE_OPENCL` unset | `run("crop", …)` falls back; the call site's `memcpy` runs exactly as before |
+| `verify.sh --quick` with `crop.pp3` (crop plus a 0.5 Lanczos resize) | PASS, `"stage":"crop".*"impl":"opencl"`, `max_pae=1.5259e-05` |
+
+There is no residual for the block: it is a pure copy with no arithmetic, and
+the fallback is the original code path.
+
 ## Gamut
 
 `gamut` runs the end-of-process gamut block of `stage_gamut()` in

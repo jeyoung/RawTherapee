@@ -62,6 +62,8 @@ pairs are exact. The gate is the peak absolute error (PAE) in normalised units;
 | 2026-10-31 | uncommitted | POCL (CPU) | colorspace_flowers.pef / `localadjustments-sharpen.pp3`, `local.adjustments` | off vs auto, 16-bit TIFF | 1 LSB | PASS |
 | 2026-10-31 | uncommitted | POCL (CPU) | 21-case sharpen matrix (alone, 3x3/5x5/7x7 radii, high sensitivity, colour, log, dehaze, CBDL, vibrance, SH, soft light, local contrast, all tools, MUNS, multispot, inactive, ELI/RECT, partial zero-transition, 179x49, 238x64, 8192x64), `stage-residency-test` | device vs host block | 0.926 LSB (worst) | PASS |
 | 2026-10-31 | uncommitted | POCL (CPU) | 12-case sharpen residual matrix, `stage-residency-test` | device vs host block | 0 (host) | PASS |
+| 2026-10-31 | uncommitted | POCL (CPU) | colorspace_flowers.pef / `crop.pp3`, `crop` | off vs auto, 16-bit TIFF | 1 LSB | PASS |
+| 2026-10-31 | uncommitted | POCL (CPU) | 6-case crop copy matrix (full frame, odd offset, bottom right, single row, single pixel, 8192 wide), `stage-residency-test` | device vs host row copy | 0 (AE=0) | PASS |
 
 `47c50ee77` changes only CPU export buffer handling; the OpenCL rows above
 re-run the existing GPU stages against the new CPU neighbour.
@@ -188,6 +190,14 @@ peak absolute error is zero for the synthetic node tests:
   1 LSB16, and eleven residual configurations (`autocompute`, `expcie`,
   `ciecam`, non-zero `detail`, `strlog`, mask, soft radius and four
   out-of-range sliders) run the host builtin byte for byte.
+- `crop` copies the requested rectangle out of the three-plane F32 Lab buffer
+  on the device. The node is exact by construction, so the test compares all
+  three planes with `AE=0` at full frame, an odd offset, the bottom-right
+  corner, a single row, a single pixel and an 8192-wide rectangle; every
+  invalid rectangle (negative or out-of-range offset, oversized destination,
+  aliased buffers) is refused without touching the destination, and the
+  call site's row copy stays the fallback. The export gate is 1 LSB16 on the
+  final TIFF because `crop.pp3` also runs the resize node.
 - Local sharpening, through `local.adjustments`, runs the output sharpening
   core's device mask, undamped RLD and damped kernels on the block's
   zero-padded extent and reproduces `Sharp_Local()`'s full-image deltaE
