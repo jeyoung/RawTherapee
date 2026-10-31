@@ -1692,7 +1692,14 @@ colour-space conversion, film negative, first analysis, dehaze, Fattal tone
 mapping and local adjustments around them stay on the host. `lab.sharpening`
 runs its impulse-denoise and defringe pair on the device and keeps the main
 sharpen pass in the shared `output.sharpen` node; ML sharpen edges and ML
-microcontrast stay on the host. `output.sharpen` itself is partial: damped
+microcontrast stay on the host. The pair is atomic: the CIE-CAM arm, an image
+below 8x8, either threshold outside 0..100, a defringe radius in 0.25..1.15
+(the host's 3x3/5x5/7x7 Gaussian arm), a device without fp64 and a defringe
+window wider than the image all run the original host pair. Two prescaled
+inputs leave the admitted range while the GUI value is inside it: an export
+scale of two or more pushes the impulse threshold above 100, and a scale
+around 7.7 pushes the defringe radius to 25.0 (the host's double IIR arm);
+both are refusals, not approximations. `output.sharpen` itself is partial: damped
 RLD, radii at or above 1.15, edges-only, halo control, show-mask and
 `blurradius >= 0.25` run the host builtin. The sub-node records, commands and
 parity results are in `STAGE_RUNTIME.md`.

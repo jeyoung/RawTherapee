@@ -535,7 +535,12 @@ host's 3x3/5x5/7x7 Gaussian kernels, whose border rules are not implemented),
 a running defringe meets a device without fp64 (its chromaticity mean is a
 double sum), or the defringe window is wider than the image. A radius below
 0.25 is the host's `gaussianBlur()` identity, so the whole defringe pass is a
-no-op and the node reports OK without touching a plane.
+no-op and the node reports OK without touching a plane. Two prescaled inputs
+can leave the admitted range even though the GUI value is inside it: an export
+scale of two or more raises the impulse threshold above 100, and a scale
+around 7.7 raises the defringe radius to 25.0, where the host's double IIR arm
+takes over. Both are refusals, so the pair runs on the host and the output is
+unchanged; they are recorded here rather than silently approximated.
 
 Pass order matches the host: the impulse mark, the impulse correction, then
 the defringe blurs, chromaticity, mean and apply. Both Gaussian blurs reuse
