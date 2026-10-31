@@ -113,16 +113,26 @@ single-precision `sqrt`/divide the host uses, while the closing chroma and the
 Munsell index use the host's double-precision `sqrt` divided by the promoted
 `327.68f`. The host's precompute covers only whole four-column blocks and
 falls back to the double path for the last up to three columns, and the kernel
-reproduces that tail. `chromiLuminanceCurve()`'s early black-and-white return
-is a device case through the same slot: when `blackwhite.enabled` is set and
-both `colorToning` and `labCurve` are off, the block only sets a and b to zero
-and leaves L untouched, and the `rt_lab_tools_bw` kernel repeats that after
-local contrast and before vibrance. The shadow and highlight rounds, local
-contrast, vibrance and the regions therefore still run in their own order on
-the grey image. The full per-pixel `bwToning` arm needs `labCurve.enabled`,
-so black-and-white with the Lab curves, and black-and-white with any colour
-toning (which takes the block past the early return), remain residuals and
-run the host builtin. Lab colour-correction regions are a port of
+reproduces that tail. `chromiLuminanceCurve()`'s black-and-white output
+is a device case through the same slot. The cheap early return covers
+`blackwhite.enabled` with the Lab curves off: the block only sets a and b to
+zero and leaves L untouched, and the `rt_lab_tools_bw` kernel repeats that
+after local contrast and before vibrance. The full per-pixel `bwToning` arm
+covers `blackwhite.enabled` with `labCurve.enabled`: it takes the hue and
+chroma from the original pixel before the a and b tables, skips C=f(L),
+C=f(C), L=f(C) and the red/skin gate, still applies the L table, and closes on
+the a/b tables' deviation from the original chroma, which is exactly zero when
+neither table is active. The curve kernel runs that arm in the pass's own slot
+and the early-zeroing kernel is not launched beside it, so the order stays
+curve pass, then vibrance, then regions, and the later tools still run on the
+black-and-white image. Both arms are bit-exact against the host block on the
+tested matrix. Black-and-white with any colour toning, including Lab
+colour-correction regions, is a residual: the host's `bwonly` is
+`blackwhite.enabled && !colorToning.enabled`, so the block takes neither arm,
+the node refuses the configuration and the builtin runs the host block. The
+block's L=f(H) flat curve also runs under `bwToning`, but the whole
+flat-curve family is already a residual, so that arm is not a device case.
+Lab colour-correction regions are a port of
 `ImProcFunctions::labColorCorrectionRegions()` for one to four regions: the
 host samples each region's hue, chromaticity and lightness `FlatCurve` into a
 piecewise-linear table (refusing a curve the table cannot follow within the
@@ -169,10 +179,11 @@ Everything else in the block is a residual: a non-zero Lab
 slider and the C=f(H), L=f(H) and H=f(H) flat curves, the LAB, XYZ and XYZREL
 Munsell methods (they need `gamutLchonly()` and `gamutmap()`), a denoise
 chroma factor, a local contrast outside the ABI range, a local contrast below
-sigma 25 on a host built without SSE2, EPD, black-and-white output with the
-Lab curves or with colour toning (the full `bwToning` arm, or the block past
-its early return), a `LabRegions` profile outside the bounded set, a profile
-where no device tool would run, and an RGB-mode
+sigma 25 on a host built without SSE2, EPD, black-and-white output with
+colour toning (the block's `bwonly` is then false, so neither black-and-white
+arm runs), an L=f(H) flat curve together with black-and-white (the flat-curve
+family is a residual), a `LabRegions` profile outside the bounded set, a
+profile where no device tool would run, and an RGB-mode
 tone table whose steepest step can turn the closing round trip's one-ulp
 channel difference into more than one LSB16. A colour-toning method other
 than `LabGrid`/`LabRegions` (Splitco, Splitlr, RGBSliders and the rest) does
@@ -232,7 +243,7 @@ panes records them separately. Both tools are off by default.
 | `transform` | Full/Full/Roi/- | path | reuse-input | rotation, distortion, perspective, CA, vignetting, gradient, post-crop vignette, dehaze, Fattal | yes |
 | `local.adjustments` | Full/Full/Roi/Reduced | path | reuse-input | local lab / selective editing | partial |
 | `rgb.proc` | Full/Full/Roi/Reduced | path | reuse-input | RGB curves, tone curve, colour toning, B&W, channel mixer, HSV, film simulation | yes |
-| `lab.tools` | Full/Full/Roi/Reduced | path | reuse-input | shadows/highlights, vibrance, Lab curves, local contrast, black-and-white (cheap branch), EPD, Lab-grid colour toning and Lab colour-correction regions | partial |
+| `lab.tools` | Full/Full/Roi/Reduced | path | reuse-input | shadows/highlights, vibrance, Lab curves, local contrast, black-and-white (cheap and `bwToning` arms), EPD, Lab-grid colour toning and Lab colour-correction regions | partial |
 | `lab.sharpening` | Full/-/Roi/- | path | reuse-input | impulse denoise and defringe (own node), ML sharpen edges, ML microcontrast and the main sharpen pass (shared `output.sharpen` node) | partial |
 | `lab.wavelet` | Full/Full/Roi/Reduced | path | reuse-input | directional pyramid equaliser and wavelet | partial |
 | `working.trc` | Full/Full/Roi/- | path | reuse-input | soft light, tone equaliser and working-TRC conversion | partial |

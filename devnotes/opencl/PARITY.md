@@ -68,6 +68,8 @@ pairs are exact. The gate is the peak absolute error (PAE) in normalised units;
 | 2026-10-31 | f744f7bc3 | POCL (CPU) | 8-case lab.tools black-and-white matrix (B&W alone, B&W + SH/local contrast/vibrance and the three combined; B&W + LabGrid, B&W + regions and both as colour-toning refusals), `stage-residency-test` | device vs host block | 0 (device) and 0 (host refusals) | PASS |
 | 2026-10-31 | uncommitted | POCL (CPU) | colorspace_flowers.pef / `labtools-toning.pp3` (Splitco + shadows/highlights), `lab.tools` | off vs auto, 16-bit TIFF | 1 LSB | PASS |
 | 2026-10-31 | uncommitted | POCL (CPU) | 3-case lab.tools tone-method matrix (Splitco, Splitlr, RGBSliders with shadows/highlights), `stage-residency-test` | device vs host block | 0 | PASS |
+| 2026-10-31 | uncommitted | POCL (CPU) | colorspace_flowers.pef / `labtools-blackwhite-labcurve.pp3` (B&W through the `bwToning` arm, L and a/b tables plus the C=f(L), C=f(C) and L=f(C) tables), `lab.tools` | off vs auto, 16-bit TIFF | 1 LSB | PASS |
+| 2026-10-31 | uncommitted | POCL (CPU) | 7-case lab.tools black-and-white Lab-curve matrix (identity tables, L curve, a/b tables, C=f(L), L=f(C), the three chroma tables, and the full set with vibrance, shadows/highlights and local contrast at 179x48 and 238x64), `stage-residency-test` | device vs host block | 0 (exact, a/b exact) | PASS |
 
 `47c50ee77` changes only CPU export buffer handling; the OpenCL rows above
 re-run the existing GPU stages against the new CPU neighbour.
