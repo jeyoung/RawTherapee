@@ -8242,6 +8242,331 @@ void test_lab_wavelet_chroma(bool available)
     }
 }
 
+/* ------------------------------------------------------ lab.wavelet edge */
+
+/*
+ * The edge panel's plain arm. The strength, radius, level repartition and
+ * edge effect are the widget's own sliders; the median detection, np-method
+ * smoothing and lipst influence are not ported and stay on the host.
+ */
+void wavelet_edge_params(rtengine::procparams::ProcParams& params, int levels)
+{
+    params.dirpyrequalizer.enabled = false;
+    params.wavelet.enabled = true;
+    params.wavelet.expcontrast = false;
+    params.wavelet.expchroma = false;
+    params.wavelet.expedge = true;
+    params.wavelet.expbl = false;
+    params.wavelet.expresid = false;
+    params.wavelet.expfinal = false;
+    params.wavelet.exptoning = false;
+    params.wavelet.expnoise = false;
+    params.wavelet.expclari = false;
+    params.wavelet.CLmethod = "all";
+    params.wavelet.Tilesmethod = "full";
+    params.wavelet.HSmethod = "without";
+    params.wavelet.daubcoeffmethod = "6_";
+    params.wavelet.thres = levels;
+    params.wavelet.threshold = 4;
+    params.wavelet.threshold2 = 5;
+    params.wavelet.sigma = 1.0;
+    params.wavelet.offset = 1.0;
+    params.wavelet.lowthr = 40.0;
+    params.wavelet.strength = 100;
+    params.wavelet.softrad = 0.0;
+    params.wavelet.softradend = 0.0;
+    params.wavelet.skinprotect = 0.0;
+    params.wavelet.avoid = false;
+    params.wavelet.median = false;
+    params.wavelet.medianlev = false;
+    params.wavelet.linkedg = false;
+    params.wavelet.lipst = false;
+    params.wavelet.NPmethod = "none";
+    params.wavelet.EDmethod = "CU";
+    params.wavelet.Medgreinf = "less";
+    params.wavelet.sup = 0;
+    params.wavelet.thrend = 0.0;
+    params.wavelet.contrast = 0;
+    params.wavelet.edgval = 50;
+    params.wavelet.edgrad = 15;
+    params.wavelet.edgthresh = 10;
+    params.wavelet.edgeffect = 1.0;
+    for (int level = 0; level < 9; ++level) {
+        params.wavelet.c[level] = 0;
+    }
+}
+
+void test_lab_wavelet_edge(bool available)
+{
+    using namespace rtengine::stage;
+
+    static MyMutex edge_lcms_mutex;
+    if (rtengine::lcmsMutex == nullptr) {
+        rtengine::lcmsMutex = &edge_lcms_mutex;
+    }
+    /*
+     * The edge arm reads the options' Lipschitz influence (edghi/edglo) and
+     * the radius limit, which are not part of the pp3. Use the shipped
+     * defaults so the reinforce arithmetic runs with its real values.
+     */
+    static rtengine::Settings edge_settings{};
+    edge_settings.edghi = 3.0;
+    edge_settings.edglo = 0.5;
+    edge_settings.limrad = 20.0;
+    rtengine::settings = &edge_settings;
+    rtengine::Color::init();
+
+    const std::string profile_path =
+        std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp") +
+        "/stage-residency-lab-wavelet-edge.jsonl";
+
+    if (!available) {
+        skip("lab.wavelet edge: no OpenCL device");
+        return;
+    }
+    check(node_has_device_implementation("lab.wavelet"),
+          "the lab.wavelet node has a device implementation");
+
+    struct EdgeCase {
+        const char* label;
+        int width;
+        int height;
+        int levels;
+        bool contrast;
+        bool chroma;
+        int contrast_values[9];
+        int chro;
+        int edgval;
+        int edgrad;
+        int edgthresh;
+        double edgeffect;
+        const char* reinforce;
+        int curve; /* 0 default (active), 1 identity, 2 custom */
+        int image; /* 0 random, 1 skin */
+    };
+
+    const EdgeCase cases[] = {
+        {"edge alone 50", 238, 64, 6, false, false,
+         {0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, 50, 15, 10, 1.0, "less", 0, 1},
+        {"edge strength 100", 238, 64, 6, false, false,
+         {0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, 100, 15, 10, 1.0, "less", 0, 0},
+        {"edge radius 90", 238, 64, 6, false, false,
+         {0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, 60, 90, 10, 1.0, "less", 0, 1},
+        {"edge threshold 60", 238, 64, 6, false, false,
+         {0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, 50, 15, 60, 1.0, "less", 0, 0},
+        {"edge threshold -30", 238, 64, 6, false, false,
+         {0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, 50, 15, -30, 1.0, "less", 0, 1},
+        {"edge effect 0.6", 238, 64, 6, false, false,
+         {0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, 50, 15, 10, 0.6, "less", 0, 1},
+        {"edge effect 2.5", 238, 64, 6, false, false,
+         {0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, 50, 15, 10, 2.5, "less", 0, 1},
+        {"edge reinforce more", 238, 64, 6, false, false,
+         {0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, 50, 15, 10, 1.0, "more", 0, 1},
+        {"edge reinforce none", 238, 64, 6, false, false,
+         {0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, 50, 15, 10, 1.0, "none", 0, 1},
+        {"edge identity curve", 238, 64, 6, false, false,
+         {0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, 50, 15, 10, 1.0, "less", 1, 1},
+        {"edge custom curve", 238, 64, 6, false, false,
+         {0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, 50, 15, 10, 1.0, "less", 2, 1},
+        {"edge with contrast", 238, 64, 6, true, false,
+         {30, 22, 14, 8, 4, 2, 0, 0, 0}, 0, 50, 15, 10, 1.0, "less", 0, 1},
+        {"edge with chroma", 238, 64, 6, false, true,
+         {40, 30, 20, 10, 5, 2, 0, 0, 0}, 60, 50, 15, 10, 1.0, "less", 0, 1},
+        {"edge contrast chroma", 238, 64, 6, true, true,
+         {30, 22, 14, 8, 4, 2, 0, 0, 0}, 60, 50, 15, 10, 1.0, "less", 0, 1},
+        {"edge padded 179x49", 179, 49, 5, false, false,
+         {0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, 70, 20, 20, 1.2, "less", 0, 1},
+        {"edge levels 3", 179, 48, 3, false, false,
+         {0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, 80, 15, 10, 1.0, "less", 0, 1},
+        {"edge levels 7", 179, 160, 7, false, false,
+         {0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, 50, 15, 10, 1.0, "less", 0, 1},
+    };
+
+    unsigned seed = 0x7f4a7c15u;
+    for (const EdgeCase& item : cases) {
+        rtengine::procparams::ProcParams params;
+        wavelet_edge_params(params, item.levels);
+        params.wavelet.expcontrast = item.contrast;
+        params.wavelet.expchroma = item.chroma;
+        if (item.chroma) {
+            params.wavelet.CHmethod = "link";
+            params.wavelet.chro = item.chro;
+        }
+        for (int level = 0; level < 9; ++level) {
+            params.wavelet.c[level] = item.contrast_values[level];
+        }
+        params.wavelet.edgval = item.edgval;
+        params.wavelet.edgrad = item.edgrad;
+        params.wavelet.edgthresh = item.edgthresh;
+        params.wavelet.edgeffect = item.edgeffect;
+        params.wavelet.Medgreinf = item.reinforce;
+        if (item.curve == 1) {
+            params.wavelet.ccwcurve = {static_cast<double>(FCT_Linear)};
+        } else if (item.curve == 2) {
+            params.wavelet.ccwcurve = {
+                static_cast<double>(FCT_MinMaxCPoints), 0.0, 0.10, 0.35,
+                0.35, 0.50, 0.90, 0.35, 0.35, 1.0, 0.90, 0.35, 0.35};
+        }
+
+        check(labWaveletSupported(params, item.width, item.height),
+              (std::string("lab.wavelet edge ") + item.label +
+               " is the supported set").c_str());
+
+        LabImage source(item.width, item.height);
+        if (item.image == 1) {
+            fill_lab_wavelet_skin(source);
+        } else {
+            fill_lab_tools(source, seed++);
+        }
+
+        rtengine::ImProcFunctions cpu_ipf(&params, false);
+        LabImage cpu(item.width, item.height);
+        cpu.CopyFrom(&source);
+        labWaveletHostBlock(cpu_ipf, params, cpu);
+
+        rtengine::ImProcFunctions device_ipf(&params, false);
+        LabImage device(item.width, item.height);
+        device.CopyFrom(&source);
+        const LabWaveletRun result =
+            run_lab_wavelet_node(device, params, device_ipf, profile_path);
+        const std::string profile = read_file(profile_path);
+
+        check(result.supported,
+              (std::string("lab.wavelet edge ") + item.label +
+               " resolves to the supported set").c_str());
+        check(result.deviceReady,
+              (std::string("lab.wavelet edge ") + item.label +
+               " builds its host setup").c_str());
+        check(result.status == RT_STAGE_OK,
+              (std::string("lab.wavelet edge ") + item.label +
+               " completes through run()").c_str());
+        check(profile.find("\"stage\":\"lab.wavelet\"") != std::string::npos,
+              (std::string("lab.wavelet edge ") + item.label +
+               " records the node").c_str());
+        check(profile.find("\"impl\":\"opencl\"") != std::string::npos,
+              (std::string("lab.wavelet edge ") + item.label +
+               " records a device execution").c_str());
+
+        const Distribution d = distribution(view(device), view(cpu));
+        std::printf("stage-residency: lab.wavelet edge %s %dx%d L%d: PAE "
+                    "%.6f LSB16; exact %zu, <=0.25 %zu, <=0.5 %zu, <=1 %zu, "
+                    ">1 %zu of %zu\n",
+                    item.label, item.width, item.height, item.levels,
+                    d.max_abs, d.exact, d.quarter, d.half, d.one, d.over,
+                    d.samples);
+        check(d.finite,
+              (std::string("lab.wavelet edge ") + item.label +
+               " stays finite").c_str());
+        check(d.over == 0,
+              (std::string("lab.wavelet edge ") + item.label +
+               " is within one LSB16").c_str());
+
+        /* Non-vacuity: switching the edge panel off must change the host
+         * block's own result, so the parity above is not a no-op. */
+        rtengine::procparams::ProcParams off = params;
+        off.wavelet.expedge = false;
+        rtengine::ImProcFunctions off_ipf(&off, false);
+        LabImage off_image(item.width, item.height);
+        off_image.CopyFrom(&source);
+        labWaveletHostBlock(off_ipf, off, off_image);
+        const Diff active = compare(view(cpu), view(off_image));
+        std::printf("stage-residency: lab.wavelet edge %s changes %zu of %zu "
+                    "samples against the panel-off result, PAE %.6f LSB16\n",
+                    item.label, active.differing, active.samples,
+                    active.max_abs);
+        check(active.differing > 0,
+              (std::string("lab.wavelet edge ") + item.label +
+               " is non-vacuous").c_str());
+    }
+
+    /*
+     * Refusals: the unported Lipschitz sub-modes, the threshold-adjuster
+     * selection, sliders outside their widget range and an unknown
+     * reinforce mode must run the host block byte for byte.
+     */
+    const char* residual_labels[] = {
+        "median level", "np low", "np high", "lipst", "EDmethod SL",
+        "edgval range", "edgrad range", "edgthresh range",
+        "edgeffect range", "Medgreinf unknown", "zero strength",
+        "skin protection"};
+    for (const char* label : residual_labels) {
+        rtengine::procparams::ProcParams params;
+        wavelet_edge_params(params, 6);
+
+        if (std::strcmp(label, "median level") == 0) {
+            params.wavelet.medianlev = true;
+        } else if (std::strcmp(label, "np low") == 0) {
+            params.wavelet.NPmethod = "low";
+        } else if (std::strcmp(label, "np high") == 0) {
+            params.wavelet.NPmethod = "high";
+        } else if (std::strcmp(label, "lipst") == 0) {
+            params.wavelet.lipst = true;
+        } else if (std::strcmp(label, "EDmethod SL") == 0) {
+            params.wavelet.EDmethod = "SL";
+        } else if (std::strcmp(label, "edgval range") == 0) {
+            params.wavelet.edgval = 101;
+        } else if (std::strcmp(label, "edgrad range") == 0) {
+            params.wavelet.edgrad = 101;
+        } else if (std::strcmp(label, "edgthresh range") == 0) {
+            params.wavelet.edgthresh = 101;
+        } else if (std::strcmp(label, "edgeffect range") == 0) {
+            params.wavelet.edgeffect = 3.0;
+        } else if (std::strcmp(label, "Medgreinf unknown") == 0) {
+            params.wavelet.Medgreinf = "bogus";
+        } else if (std::strcmp(label, "zero strength") == 0) {
+            params.wavelet.edgval = 0;
+        } else {
+            params.wavelet.skinprotect = 30.0;
+        }
+
+        check(!labWaveletSupported(params, 238, 64),
+              (std::string("lab.wavelet edge residual ") + label +
+               " is a residual").c_str());
+
+        LabImage source(238, 64);
+        fill_lab_wavelet_skin(source);
+
+        rtengine::ImProcFunctions cpu_ipf(&params, false);
+        LabImage cpu(238, 64);
+        cpu.CopyFrom(&source);
+        labWaveletHostBlock(cpu_ipf, params, cpu);
+
+        rtengine::ImProcFunctions device_ipf(&params, false);
+        LabImage device(238, 64);
+        device.CopyFrom(&source);
+        const LabWaveletRun result =
+            run_lab_wavelet_node(device, params, device_ipf, profile_path);
+        const std::string profile = read_file(profile_path);
+
+        check(!result.supported,
+              (std::string("lab.wavelet edge residual ") + label +
+               " is refused as a device configuration").c_str());
+        check(!result.deviceReady,
+              (std::string("lab.wavelet edge residual ") + label +
+               " does not build a device setup").c_str());
+        check(result.status == RT_STAGE_OK,
+              (std::string("lab.wavelet edge residual ") + label +
+               " completes through run()").c_str());
+        check(profile.find("\"impl\":\"host\"") != std::string::npos,
+              (std::string("lab.wavelet edge residual ") + label +
+               " records a host execution").c_str());
+        check(profile.find("\"impl\":\"opencl\"") == std::string::npos,
+              (std::string("lab.wavelet edge residual ") + label +
+               " never mixes a device pass").c_str());
+
+        const Diff diff = compare(view(device), view(cpu));
+        std::printf("stage-residency: lab.wavelet edge residual %s: host, "
+                    "PAE %.6f LSB16, %zu of %zu samples differ\n",
+                    label, diff.max_abs, diff.differing, diff.samples);
+        check(diff.finite,
+              (std::string("lab.wavelet edge residual ") + label +
+               " stays finite").c_str());
+        check(diff.differing == 0 && diff.max_abs == 0.0,
+              (std::string("lab.wavelet edge residual ") + label +
+               " matches the CPU block").c_str());
+    }
+}
+
 /* A GPU device must never run the equaliser; it records a host execution. */
 void test_lab_wavelet_gpu(bool available)
 {
@@ -12597,6 +12922,7 @@ int main()
     test_lab_wavelet(available);
     test_lab_wavelet_contrast(available);
     test_lab_wavelet_chroma(available);
+    test_lab_wavelet_edge(available);
     test_lab_wavelet_gpu(available);
     test_output_sharpen(available);
     test_lab_sharpening(available);
