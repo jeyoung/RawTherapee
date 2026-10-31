@@ -27,17 +27,21 @@
  * exports them; the kernel applies them with LUTf::operator[](float)
  * semantics. Nothing here re-derives a curve or a Munsell table.
  *
- * Supported: the L, a, b, C=f(C), L=f(C) and C=f(L) tables, the MUN and NONE
- * Munsell methods, the red and skin protection, `lcredsk`, the block's
- * chroma scale for the working profile, and black-and-white output through
- * `chromiLuminanceCurve()`'s `bwToning` arm. Under `bwToning` the hue and
- * chroma come from the original pixel before the a and b tables, the C=f(L)
- * and C=f(C) tables and the red/skin gate are skipped, L=f(C) is skipped, and
- * the closing write is the a/b tables' deviation from the original chroma
- * (exactly zero when neither table is active). Residual (the launcher never
- * reaches this kernel): a non-zero contrast (it owns the hist16 refill), the
- * chromaticity slider and the C=f(H), L=f(H), H=f(H) flat curves, the LAB,
- * XYZ and XYZREL Munsell methods and a denoised chroma factor.
+ * Supported: the L, a, b, C=f(C), L=f(C) and C=f(L) tables, the C=f(H),
+ * L=f(H) and H=f(H) hue flat curves (host-sampled piecewise-linear tables),
+ * the chromaticity slider, the MUN and NONE Munsell methods, the red and skin
+ * protection, `lcredsk`, the block's chroma scale for the working profile,
+ * and black-and-white output through `chromiLuminanceCurve()`'s `bwToning`
+ * arm. Under `bwToning` the hue and chroma come from the original pixel
+ * before the a and b tables, the chromaticity gate, the C=f(L) and C=f(C)
+ * tables and the red/skin gate are skipped, L=f(C) is skipped, and the
+ * closing write is the a/b tables' deviation from the original chroma
+ * (exactly zero when neither table is active). The three hue flat curves
+ * still run under `bwToning`, exactly as the block orders them. Residual (the
+ * launcher never reaches this kernel): a non-zero contrast (it owns the
+ * hist16 refill), a hue flat curve the host table cannot follow, a
+ * chromaticity slider outside -100..100, the LAB, XYZ and XYZREL Munsell
+ * methods and a denoised chroma factor.
  *
  * The source is appended after lab_tools_cl.h, munsell_lch_cl.h and
  * vibrance_cl.h, so it reads their LUT, atan2/sincos and Munsell helpers.
@@ -83,6 +87,93 @@ inline float rt_lt_sqrt_div(const float value)
 inline float rt_lt_sqrt_div_f32(const float value)
 {
     return sqrt(value) / 327.68f;
+}
+
+/*
+ * Color::huelab_to_huehsv2(): the block's Lab hue in radians to the HSV-like
+ * hue in [0,1] that indexes the three hue flat curves. The arithmetic is the
+ * host's double expression; the input is the kernel's float HH.
+ */
+inline double rt_lt_huehsv2(const float HH)
+{
+    double hr = 0.0;
+    if (HH >= 0.0f && HH < 0.6f) {
+        hr = 0.11666 * (double)HH + 0.93;
+    } else if (HH >= 0.6f && HH < 1.4f) {
+        hr = 0.1125 * (double)HH - 0.0675;
+    } else if (HH >= 1.4f && HH < 2.0f) {
+        hr = 0.2666 * (double)HH - 0.2833;
+    } else if (HH >= 2.0f && HH < 3.14159f) {
+        hr = 0.1489 * (double)HH - 0.04785;
+    } else if (HH >= -3.14159f && HH < -2.8f) {
+        hr = 0.23419 * (double)HH + 1.1557;
+    } else if (HH >= -2.8f && HH < -2.3f) {
+        hr = 0.16 * (double)HH + 0.948;
+    } else if (HH >= -2.3f && HH < -0.9f) {
+        hr = 0.12143 * (double)HH + 0.85928;
+    } else if (HH >= -0.9f && HH < -0.1f) {
+        hr = 0.2125 * (double)HH + 0.94125;
+    } else if (HH >= -0.1f && HH < 0.0f) {
+        hr = 0.1 * (double)HH + 0.93;
+    }
+    if (hr < 0.0) {
+        hr += 1.0;
+    } else if (hr > 1.0) {
+        hr -= 1.0;
+    }
+    return hr;
+}
+
+/*
+ * One host-sampled hue flat curve. slot[0] is the node count, then that many
+ * x nodes, then that many y nodes. The lookup matches the host's validator:
+ * linear inside the table and extrapolated with the first/last segment slope
+ * outside it.
+ */
+inline double rt_lt_hue_lut(__global const float* slot, const double t)
+{
+    const int count = (int)slot[0];
+    if (count < 2) {
+        return 0.0;
+    }
+    __global const float* xs = slot + 1;
+    __global const float* ys = slot + 1 + count;
+    if (t <= (double)xs[0]) {
+        const double slope = ((double)ys[1] - (double)ys[0]) /
+                             ((double)xs[1] - (double)xs[0]);
+        return (double)ys[0] + (t - (double)xs[0]) * slope;
+    }
+    if (t >= (double)xs[count - 1]) {
+        const double slope = ((double)ys[count - 1] - (double)ys[count - 2]) /
+                             ((double)xs[count - 1] - (double)xs[count - 2]);
+        return (double)ys[count - 1] +
+               (t - (double)xs[count - 1]) * slope;
+    }
+    int low = 0;
+    int high = count - 1;
+    while (high - low > 1) {
+        const int middle = (low + high) / 2;
+        if ((double)xs[middle] <= t) {
+            low = middle;
+        } else {
+            high = middle;
+        }
+    }
+    const double fraction = (t - (double)xs[low]) /
+                            ((double)xs[high] - (double)xs[low]);
+    return (double)ys[low] +
+           ((double)ys[high] - (double)ys[low]) * fraction;
+}
+
+/* Color::xyz2rgb() on the block's double matrix: double products, narrowed on
+ * store like the host's float out-parameters. */
+inline void rt_lt_xyz2rgb_d(const float x, const float y, const float z,
+                            __global const double* m, float* r, float* g,
+                            float* b)
+{
+    *r = (float)(m[0] * (double)x + m[1] * (double)y + m[2] * (double)z);
+    *g = (float)(m[3] * (double)x + m[4] * (double)y + m[5] * (double)z);
+    *b = (float)(m[6] * (double)x + m[7] * (double)y + m[8] * (double)z);
 }
 
 /*
@@ -243,7 +334,11 @@ __kernel void rt_lab_tools_lab_curve(
     const float adjust, const int lcredsk, const int bw_toning,
     __global const float* munsell, __global const float* munsell_sizes,
     const int width, const int height,
-    const int lab_pitch, const int lab_plane)
+    const int lab_pitch, const int lab_plane,
+    __global const float* hue_luts, const int hue_stride,
+    const int ch_active, const int lh_active, const int hh_active,
+    const int chromaticity, const float amount_chroma,
+    __global const double* wip, const int highlight)
 {
     const int x = get_global_id(0);
     const int y = get_global_id(1);
@@ -306,129 +401,250 @@ __kernel void rt_lab_tools_lab_curve(
     float Chprov1 = CC;
 
     /*
-     * The block's first red/skin gate, which only the `!bwToning` arm runs.
-     * With chromapro at 1 and the denoise factor at 1 every factor is 1, so
-     * the block's product leaves a and b untouched; the sequence is kept so
-     * the branch conditions are the host's.
+     * L=f(H). The block builds this curve only when `chromaticity > -100`,
+     * which the host setup enforces, and reads the hue HH as it stands after
+     * the a and b tables. The lightness travels through the block's chroma
+     * weight `kcc = CC / amchroma` and then a gamut loop that scales the
+     * chroma down until the pixel fits the working space.
      */
-    float dred;
-    if (Lprov1 < 25.f) {
-        dred = 40.f;
-    } else if (Lprov1 < 30.f) {
-        dred = 3.f * Lprov1 - 35.f;
-    } else if (Lprov1 < 70.f) {
-        dred = 55.f;
-    } else if (Lprov1 < 75.f) {
-        dred = -3.f * Lprov1 + 265.f;
-    } else {
-        dred = 40.f;
+    if (lh_active != 0) {
+        const float ClipLevel = 65535.f;
+        const float valparam_raw =
+            (float)(rt_lt_hue_lut(hue_luts + hue_stride, rt_lt_huehsv2(HH)) -
+                    0.5);
+        float valparam = valparam_raw;
+        float valparamneg = valparam_raw;
+        const float kcc = CC / amount_chroma;
+        valparam *= 2.f * kcc;
+        valparamneg *= kcc;
+        float l_r = Lprov1 / 100.f;
+        if (valparam > 0.f) {
+            l_r = (1.f - valparam) * l_r +
+                  valparam *
+                      (1.f - rt_lt_pow4(1.f - rt_lt_min(l_r, 1.0f)));
+        } else {
+            const float khue = 1.9f;
+            l_r *= (1.f + khue * valparamneg);
+        }
+        Lprov1 = l_r * 100.f;
+
+        float Chprov2 = rt_lt_sqrt_div(atmp * atmp + btmp * btmp);
+        bool in_rgb;
+        do {
+            in_rgb = true;
+            const float aprov1 = Chprov2 * sincosval.y;
+            const float bprov1 = Chprov2 * sincosval.x;
+            const float fy = (RT_LT_C1BY116 * Lprov1) + RT_LT_C16BY116;
+            const float fx = (0.002f * aprov1) + fy;
+            const float fz = fy - (0.005f * bprov1);
+            const float x_ = 65535.f *
+                             ((fx > RT_LT_EPSINV3) ? fx * fx * fx
+                                                   : (116.f * fx - 16.f) *
+                                                         RT_LT_KAPPAINV) *
+                             RT_LT_D50X;
+            const float z_ = 65535.f *
+                             ((fz > RT_LT_EPSINV3) ? fz * fz * fz
+                                                   : (116.f * fz - 16.f) *
+                                                         RT_LT_KAPPAINV) *
+                             RT_LT_D50Z;
+            const float y_ = Lprov1 > RT_LT_EPSKAP
+                                 ? 65535.f * fy * fy * fy
+                                 : 65535.f * Lprov1 / RT_LT_KAPPA;
+            float R, G, B;
+            rt_lt_xyz2rgb_d(x_, y_, z_, wip, &R, &G, &B);
+            if (R < 0.0f || G < 0.0f || B < 0.0f) {
+                if (Lprov1 < 0.1f) {
+                    Lprov1 = 0.1f;
+                }
+                Chprov2 *= 0.95f;
+                in_rgb = false;
+            } else if (highlight == 0 &&
+                       (R > ClipLevel || G > ClipLevel || B > ClipLevel)) {
+                if (Lprov1 > 99.98f) {
+                    Lprov1 = 99.98f;
+                }
+                Chprov2 *= 0.95f;
+                in_rgb = false;
+            }
+        } while (!in_rgb);
+
+        atmp = 327.68f * Chprov2 * sincosval.y;
+        btmp = 327.68f * Chprov2 * sincosval.x;
     }
 
+    /* C=f(H): the block's `atmp *= 1 + (getVal(hr) - 0.5) * 2`. */
+    if (ch_active != 0) {
+        const float chparam =
+            (float)((rt_lt_hue_lut(hue_luts, rt_lt_huehsv2(HH)) - 0.5) *
+                    2.0);
+        const float chromaChfactor = 1.0f + chparam;
+        atmp *= chromaChfactor;
+        btmp *= chromaChfactor;
+    }
+
+    /* H=f(H): rotate the hue and rebuild the direction, magnitude unchanged. */
+    if (hh_active != 0) {
+        const float valparam =
+            (float)((rt_lt_hue_lut(hue_luts + 2 * hue_stride,
+                                   rt_lt_huehsv2(HH)) -
+                     0.5) *
+                        1.7 +
+                    (double)HH);
+        HH = valparam;
+        sincosval = rt_lt_xsincosf(HH);
+    }
+
+    /*
+     * The block's first red/skin gate, which only the `!bwToning` arm runs.
+     * It carries the chromaticity slider: chromapro scales a and b about the
+     * grey axis, with the red/skin transition when it exceeds one. The
+     * denoise factor is one because the supported set refuses the denoise
+     * tool.
+     */
     const float protect_red = rt_lt_lim(protect_red_raw, 20.f, 180.f);
     const float protect_red_h = rt_lt_lim(protect_red_h_raw, 0.1f, 1.f);
-    float factor = 1.0f;
     if (bw_toning == 0) {
-        factor = rt_lt_transitred(HH, Chprov1, dred, 1.f, protect_red, 1.f,
-                                  protect_red_h, 1.f, 1.f);
-        atmp *= factor;
-        btmp *= factor;
-    }
-
-    /* C=f(L), skipped under `bwToning`. */
-    if (bw_toning == 0 && cl_active != 0 && LL > 0.f) {
-        const float curf = 0.7f;
-        float scale = 100.0f / 100.1f;
-        float scaleext = 1.0f;
-        const float chroma = LL * 655.35f;
-        const float chromaCfactor =
-            rt_lt_lut_raw(clcurve, curve_size, chroma) / chroma;
-        float protect_redcur = curf * protect_red_raw;
-        if (protect_redcur < 20.f) {
-            protect_redcur = 20.0f;
-        }
-        if (protect_redcur > 180.f) {
-            protect_redcur = 180.0f;
-        }
-        float protect_redhcur = curf * protect_red_h_raw;
-        if (protect_redhcur < 0.1f) {
-            protect_redhcur = 0.1f;
-        }
-        if (protect_redhcur > 1.0f) {
-            protect_redhcur = 1.0f;
-        }
-        const float deltaHH = protect_redhcur;
-
-        if (chromaCfactor > 0.f) {
-            rt_lt_scalered(rst_protection, chromaCfactor, 0.0f, HH, deltaHH,
-                           &scale, &scaleext);
-        }
-
-        float factorskin;
-        float factorskinext;
-        if (chromaCfactor > 1.f) {
-            const float interm = (chromaCfactor - 1.0f) * 100.0f;
-            factorskin = 1.0f + (interm * scale) / 100.0f;
-            factorskinext = 1.0f + (interm * scaleext) / 100.0f;
+        const float chromapro =
+            ((float)chromaticity + 100.0f) / 100.0f;
+        float factorskinc;
+        float factorskinextc;
+        if (chromapro > 1.f) {
+            float scale = 100.0f / 100.1f;
+            float scaleext = 1.f;
+            rt_lt_scalered(rst_protection, chromapro, 0.0f, HH,
+                           protect_red_h, &scale, &scaleext);
+            const float interm = chromapro - 1.f;
+            factorskinc = 1.f + (interm * scale);
+            factorskinextc = 1.f + (interm * scaleext);
         } else {
-            factorskin = chromaCfactor;
-            factorskinext = chromaCfactor;
+            factorskinc = chromapro;
+            factorskinextc = chromapro;
         }
+        /*
+         * The block passes `factorsatc` as both the saturation factor and the
+         * reference `factor` argument, so the red/skin gate may overwrite it
+         * before the product.
+         */
+        float factorsatc = chromapro;
 
-        const float factorsat = chromaCfactor;
-        factor = rt_lt_transitred(HH, Chprov1, dred, factorskin, protect_redcur,
-                                  factorskinext, deltaHH, factorsat, factorsat);
-        atmp = rt_lt_lim(atmp * factor, rt_lt_min(-42000.f, atmp),
-                         rt_lt_max(42000.f, atmp));
-        btmp = rt_lt_lim(btmp * factor, rt_lt_min(-42000.f, btmp),
-                         rt_lt_max(42000.f, btmp));
-    }
-
-    /* C=f(C), skipped under `bwToning`. */
-    if (bw_toning == 0 && cc_active != 0) {
-        const float curf = 0.7f;
-        float scale = 100.0f / 100.1f;
-        float scaleext = 1.0f;
-        const float chroma = rt_lt_sqrt_f(atmp * atmp + btmp * btmp + 0.001f);
-        const float chromaCfactor =
-            rt_lt_lut_raw(satcurve, curve_size, chroma * adjust) /
-            (chroma * adjust);
-        float protect_redcur = curf * protect_red_raw;
-        if (protect_redcur < 20.f) {
-            protect_redcur = 20.0f;
-        }
-        if (protect_redcur > 180.f) {
-            protect_redcur = 180.0f;
-        }
-        float protect_redhcur = curf * protect_red_h_raw;
-        if (protect_redhcur < 0.1f) {
-            protect_redhcur = 0.1f;
-        }
-        if (protect_redhcur > 1.0f) {
-            protect_redhcur = 1.0f;
-        }
-        const float deltaHH = protect_redhcur;
-
-        if (chromaCfactor > 0.f) {
-            rt_lt_scalered(rst_protection, chromaCfactor, 0.0f, HH, deltaHH,
-                           &scale, &scaleext);
-        }
-
-        float factorskin;
-        float factorskinext;
-        if (chromaCfactor > 1.f) {
-            const float interm = (chromaCfactor - 1.0f) * 100.0f;
-            factorskin = 1.0f + (interm * scale) / 100.0f;
-            factorskinext = 1.0f + (interm * scaleext) / 100.0f;
+        float dred;
+        if (Lprov1 < 25.f) {
+            dred = 40.f;
+        } else if (Lprov1 < 30.f) {
+            dred = 3.f * Lprov1 - 35.f;
+        } else if (Lprov1 < 70.f) {
+            dred = 55.f;
+        } else if (Lprov1 < 75.f) {
+            dred = -3.f * Lprov1 + 265.f;
         } else {
-            factorskin = chromaCfactor;
-            factorskinext = chromaCfactor;
+            dred = 40.f;
         }
 
-        const float factorsat = chromaCfactor;
-        factor = rt_lt_transitred(HH, Chprov1, dred, factorskin, protect_redcur,
-                                  factorskinext, deltaHH, factorsat, factorsat);
-        atmp *= factor;
-        btmp *= factor;
+        factorsatc = rt_lt_transitred(HH, Chprov1, dred, factorskinc,
+                                      protect_red, factorskinextc,
+                                      protect_red_h, factorsatc, factorsatc);
+        atmp *= factorsatc;
+        btmp *= factorsatc;
+
+        /* C=f(L), skipped under `bwToning`. */
+        if (cl_active != 0 && LL > 0.f) {
+            const float curf = 0.7f;
+            float scale = 100.0f / 100.1f;
+            float scaleext = 1.0f;
+            const float chroma = LL * 655.35f;
+            const float chromaCfactor =
+                rt_lt_lut_raw(clcurve, curve_size, chroma) / chroma;
+            float protect_redcur = curf * protect_red_raw;
+            if (protect_redcur < 20.f) {
+                protect_redcur = 20.0f;
+            }
+            if (protect_redcur > 180.f) {
+                protect_redcur = 180.0f;
+            }
+            float protect_redhcur = curf * protect_red_h_raw;
+            if (protect_redhcur < 0.1f) {
+                protect_redhcur = 0.1f;
+            }
+            if (protect_redhcur > 1.0f) {
+                protect_redhcur = 1.0f;
+            }
+            const float deltaHH = protect_redhcur;
+
+            if (chromaCfactor > 0.f) {
+                rt_lt_scalered(rst_protection, chromaCfactor, 0.0f, HH,
+                               deltaHH, &scale, &scaleext);
+            }
+
+            float factorskin;
+            float factorskinext;
+            if (chromaCfactor > 1.f) {
+                const float interm = (chromaCfactor - 1.0f) * 100.0f;
+                factorskin = 1.0f + (interm * scale) / 100.0f;
+                factorskinext = 1.0f + (interm * scaleext) / 100.0f;
+            } else {
+                factorskin = chromaCfactor;
+                factorskinext = chromaCfactor;
+            }
+
+            const float factorsat = chromaCfactor;
+            const float factor = rt_lt_transitred(
+                HH, Chprov1, dred, factorskin, protect_redcur, factorskinext,
+                deltaHH, factorsat, factorsat);
+            atmp = rt_lt_lim(atmp * factor, rt_lt_min(-42000.f, atmp),
+                             rt_lt_max(42000.f, atmp));
+            btmp = rt_lt_lim(btmp * factor, rt_lt_min(-42000.f, btmp),
+                             rt_lt_max(42000.f, btmp));
+        }
+
+        /* C=f(C), skipped under `bwToning`. */
+        if (cc_active != 0) {
+            const float curf = 0.7f;
+            float scale = 100.0f / 100.1f;
+            float scaleext = 1.0f;
+            const float chroma =
+                rt_lt_sqrt_f(atmp * atmp + btmp * btmp + 0.001f);
+            const float chromaCfactor =
+                rt_lt_lut_raw(satcurve, curve_size, chroma * adjust) /
+                (chroma * adjust);
+            float protect_redcur = curf * protect_red_raw;
+            if (protect_redcur < 20.f) {
+                protect_redcur = 20.0f;
+            }
+            if (protect_redcur > 180.f) {
+                protect_redcur = 180.0f;
+            }
+            float protect_redhcur = curf * protect_red_h_raw;
+            if (protect_redhcur < 0.1f) {
+                protect_redhcur = 0.1f;
+            }
+            if (protect_redhcur > 1.0f) {
+                protect_redhcur = 1.0f;
+            }
+            const float deltaHH = protect_redhcur;
+
+            if (chromaCfactor > 0.f) {
+                rt_lt_scalered(rst_protection, chromaCfactor, 0.0f, HH,
+                               deltaHH, &scale, &scaleext);
+            }
+
+            float factorskin;
+            float factorskinext;
+            if (chromaCfactor > 1.f) {
+                const float interm = (chromaCfactor - 1.0f) * 100.0f;
+                factorskin = 1.0f + (interm * scale) / 100.0f;
+                factorskinext = 1.0f + (interm * scaleext) / 100.0f;
+            } else {
+                factorskin = chromaCfactor;
+                factorskinext = chromaCfactor;
+            }
+
+            const float factorsat = chromaCfactor;
+            const float factor = rt_lt_transitred(
+                HH, Chprov1, dred, factorskin, protect_redcur, factorskinext,
+                deltaHH, factorsat, factorsat);
+            atmp *= factor;
+            btmp *= factor;
+        }
     }
 
     /* L=f(C), skipped under `bwToning` (the host's `cclutili && !bwToning`). */
@@ -507,7 +723,8 @@ __kernel void rt_lab_tools_lab_curve(
      */
     if (method != 0 &&
         (l_active != 0 || a_active != 0 || b_active != 0 || cc_active != 0 ||
-         lc_active != 0 || cl_active != 0)) {
+         lc_active != 0 || cl_active != 0 || ch_active != 0 ||
+         lh_active != 0 || hh_active != 0 || chromaticity != 0)) {
         const float Lprov = out_l / 327.68f;
         const float Chprov = rt_lt_sqrt_div(out_a * out_a + out_b * out_b);
         float correctionHue = 0.f;

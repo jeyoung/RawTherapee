@@ -1686,7 +1686,7 @@ private:
             const bool deviceReady = supported && context.build(setup) == 0;
             RtLabToolsContext descriptor = context.descriptor(deviceReady);
 
-            RtStageArg args[70] = {};
+            RtStageArg args[76] = {};
             args[0].kind = RT_STAGE_ARG_BUFFER;
             args[0].u.buffer = stage::view(*labView);
             args[1].kind = RT_STAGE_ARG_PTR;
@@ -1844,6 +1844,23 @@ private:
             args[69].kind = RT_STAGE_ARG_INT;
             args[69].u.i = deviceReady ? setup.black_white : 0;
 
+            /*
+             * The hue flat-curve family: the three sampled tables in one
+             * buffer, the fixed slot stride, the activity flags and the
+             * chromaticity slider.
+             */
+            args[70].kind = RT_STAGE_ARG_INT;
+            args[70].u.i = deviceReady ? setup.lab_curve_hue_stride : 0;
+            args[71].kind = RT_STAGE_ARG_BUFFER;
+            args[72].kind = RT_STAGE_ARG_INT;
+            args[72].u.i = deviceReady ? setup.lab_curve_ch_active : 0;
+            args[73].kind = RT_STAGE_ARG_INT;
+            args[73].u.i = deviceReady ? setup.lab_curve_lh_active : 0;
+            args[74].kind = RT_STAGE_ARG_INT;
+            args[74].u.i = deviceReady ? setup.lab_curve_hh_active : 0;
+            args[75].kind = RT_STAGE_ARG_INT;
+            args[75].u.i = deviceReady ? setup.lab_curve_chromaticity : 0;
+
             for (int index = 16; index < 22; ++index) {
                 args[index].kind = RT_STAGE_ARG_BUFFER;
             }
@@ -1930,12 +1947,16 @@ private:
                     args[53].u.buffer = host_buffer(
                         setup.lab_curve_cl,
                         static_cast<int>(setup.lab_curve_entries));
+                    args[71].u.buffer = host_buffer(
+                        setup.lab_curve_hue,
+                        static_cast<int>(setup.lab_curve_hue_stride *
+                                         RT_LAB_TOOLS_HUE_CURVES));
                 }
             }
 
             RtStageProfiling profiling{};
             if (stage::run("lab.tools",
-                           std::vector<RtStageArg>(args, args + 70),
+                           std::vector<RtStageArg>(args, args + 76),
                            &profiling) == RT_STAGE_OK) {
                 return;
             }

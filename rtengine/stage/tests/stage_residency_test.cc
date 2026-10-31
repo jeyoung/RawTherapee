@@ -4548,7 +4548,7 @@ LabToolsRun run_lab_tools_node(LabImage& image,
     result.deviceReady = deviceReady;
     RtLabToolsContext descriptor = context.descriptor(deviceReady);
 
-    RtStageArg args[70] = {};
+    RtStageArg args[76] = {};
     args[0].kind = RT_STAGE_ARG_BUFFER;
     args[0].u.buffer = view(image);
     args[1].kind = RT_STAGE_ARG_PTR;
@@ -4666,6 +4666,18 @@ LabToolsRun run_lab_tools_node(LabImage& image,
     args[69].kind = RT_STAGE_ARG_INT;
     args[69].u.i = deviceReady ? setup.black_white : 0;
 
+    args[70].kind = RT_STAGE_ARG_INT;
+    args[70].u.i = deviceReady ? setup.lab_curve_hue_stride : 0;
+    args[71].kind = RT_STAGE_ARG_BUFFER;
+    args[72].kind = RT_STAGE_ARG_INT;
+    args[72].u.i = deviceReady ? setup.lab_curve_ch_active : 0;
+    args[73].kind = RT_STAGE_ARG_INT;
+    args[73].u.i = deviceReady ? setup.lab_curve_lh_active : 0;
+    args[74].kind = RT_STAGE_ARG_INT;
+    args[74].u.i = deviceReady ? setup.lab_curve_hh_active : 0;
+    args[75].kind = RT_STAGE_ARG_INT;
+    args[75].u.i = deviceReady ? setup.lab_curve_chromaticity : 0;
+
     for (int index = 16; index < 22; ++index) {
         args[index].kind = RT_STAGE_ARG_BUFFER;
     }
@@ -4740,6 +4752,10 @@ LabToolsRun run_lab_tools_node(LabImage& image,
                 setup.lab_curve_lc, static_cast<int>(setup.lab_curve_entries));
             args[53].u.buffer = host_buffer(
                 setup.lab_curve_cl, static_cast<int>(setup.lab_curve_entries));
+            args[71].u.buffer = host_buffer(
+                setup.lab_curve_hue,
+                static_cast<int>(setup.lab_curve_hue_stride *
+                                 RT_LAB_TOOLS_HUE_CURVES));
         }
     }
 
@@ -4747,7 +4763,7 @@ LabToolsRun run_lab_tools_node(LabImage& image,
     setenv("RT_STAGE_PROFILE", profile_path.c_str(), 1);
     set_node_device_override("lab.tools", StageNodeDevice::OpenCL);
     result.status =
-        run("lab.tools", std::vector<RtStageArg>(args, args + 70));
+        run("lab.tools", std::vector<RtStageArg>(args, args + 76));
     clear_node_device_overrides();
     unsetenv("RT_STAGE_PROFILE");
     return result;
@@ -5398,7 +5414,7 @@ void test_lab_tools(bool available)
         check(context.build(setup) == 0, "forced fallback setup builds");
         RtLabToolsContext descriptor = context.descriptor(true);
 
-        RtStageArg args[70] = {};
+        RtStageArg args[76] = {};
         args[0].kind = RT_STAGE_ARG_BUFFER;
         args[0].u.buffer = view(device);
         args[1].kind = RT_STAGE_ARG_PTR;
@@ -5481,6 +5497,17 @@ void test_lab_tools(bool available)
         args[68].u.ptr = setup.iws_double;
         args[69].kind = RT_STAGE_ARG_INT;
         args[69].u.i = setup.black_white;
+        args[70].kind = RT_STAGE_ARG_INT;
+        args[70].u.i = setup.lab_curve_hue_stride;
+        args[71].kind = RT_STAGE_ARG_BUFFER;
+        args[72].kind = RT_STAGE_ARG_INT;
+        args[72].u.i = setup.lab_curve_ch_active;
+        args[73].kind = RT_STAGE_ARG_INT;
+        args[73].u.i = setup.lab_curve_lh_active;
+        args[74].kind = RT_STAGE_ARG_INT;
+        args[74].u.i = setup.lab_curve_hh_active;
+        args[75].kind = RT_STAGE_ARG_INT;
+        args[75].u.i = setup.lab_curve_chromaticity;
         args[59].u.f = 1.0;
         args[60].u.f = 1.0;
         args[61].u.i = LAB_TOOLS_EXPORT_SCALE;
@@ -5500,7 +5527,7 @@ void test_lab_tools(bool available)
         setenv("RT_STAGE_PROFILE", profile_path.c_str(), 1);
         set_node_device_override("lab.tools", StageNodeDevice::OpenCL);
         const RtStageStatus status =
-            run("lab.tools", std::vector<RtStageArg>(args, args + 70));
+            run("lab.tools", std::vector<RtStageArg>(args, args + 76));
         clear_node_device_overrides();
         const std::string profile = read_file(profile_path);
         unsetenv("RT_STAGE_PROFILE");
@@ -6000,7 +6027,27 @@ struct LabCurveCase {
     bool lcredsk;
     int protectred;
     double protectredh;
+    /* The hue flat-curve family and the tools that run beside it. */
+    bool chcurve = false;
+    bool lhcurve = false;
+    bool hhcurve = false;
+    bool blackwhite = false;
+    bool vibrance = false;
+    bool shadowsHighlights = false;
 };
+
+/* A non-identity hue flat curve: a wave through (0,0.5), (0.25,0.72),
+ * (0.5,0.5), (0.75,0.28) and (1,0.5). The zero tangents make every segment
+ * linear, so the host table follows it exactly. */
+std::vector<double> lab_hue_points()
+{
+    return {static_cast<double>(FCT_MinMaxCPoints),
+            0.0, 0.5, 0.0, 0.0,
+            0.25, 0.72, 0.0, 0.0,
+            0.5, 0.5, 0.0, 0.0,
+            0.75, 0.28, 0.0, 0.0,
+            1.0, 0.5, 0.0, 0.0};
+}
 
 void test_lab_tools_lab_curve(bool available)
 {
@@ -6071,6 +6118,37 @@ void test_lab_tools_lab_curve(bool available)
          true, 0, "MUN", 0.0, true, 60, 0.3},
         {"large width 8192", 8192, 64, 0, 0, 0.62, true, true, true, true, true,
          true, 0, "MUN", 0.0, true, 60, 0.3},
+        /*
+         * The chromaticity slider and the three hue flat curves. The
+         * saturated image spans the hue circle so each curve has work to do.
+         */
+        {"chromaticity -100", 238, 64, 2, 0, 0.62, false, false, false, false,
+         false, false, -100, "MUN", 0.0, true, 60, 0.3},
+        {"chromaticity -100 ignores the hue curves", 238, 64, 2, 0, 0.62,
+         false, false, false, false, false, false, -100, "MUN", 0.0, true,
+         60, 0.3, true, true, true},
+        {"chromaticity midpoint", 238, 64, 2, 0, 0.62, false, false, false,
+         false, false, false, 50, "MUN", 30.0, true, 60, 0.3},
+        {"chromaticity +100", 179, 48, 2, 0, 0.62, false, false, false, false,
+         false, false, 100, "MUN", 60.0, true, 60, 0.3},
+        {"C=f(H)", 238, 64, 2, 0, 0.62, false, false, false, false, false,
+         false, 0, "MUN", 0.0, true, 60, 0.3, true},
+        {"L=f(H)", 238, 64, 2, 0, 0.62, false, false, false, false, false,
+         false, 0, "MUN", 0.0, true, 60, 0.3, false, true},
+        {"H=f(H)", 179, 48, 2, 0, 0.62, false, false, false, false, false,
+         false, 0, "MUN", 0.0, true, 60, 0.3, false, false, true},
+        {"hue curves with the chromaticity slider", 238, 64, 2, 0, 0.62,
+         false, false, false, false, false, false, 50, "MUN", 30.0, true, 60,
+         0.3, true, true, true},
+        {"a/b tables with the hue curves", 238, 64, 2, 0, 0.62, false, true,
+         true, false, false, false, 0, "MUN", 0.0, true, 60, 0.3, true, true,
+         true},
+        {"hue curves with vibrance and shadows/highlights", 238, 64, 2, 0,
+         0.62, false, false, false, false, false, false, 0, "MUN", 0.0, true,
+         60, 0.3, true, true, true, false, true, true},
+        {"black and white L=f(H)", 238, 64, 2, 0, 0.62, false, false, false,
+         false, false, false, 0, "MUN", 0.0, true, 60, 0.3, false, true, false,
+         true},
     };
 
     unsigned seed = 0x51ed270bu;
@@ -6100,6 +6178,32 @@ void test_lab_tools_lab_curve(bool available)
         }
         if (item.clcurve) {
             params.labCurve.clcurve = lab_curve_points(item.mid);
+        }
+        if (item.chcurve) {
+            params.labCurve.chcurve = lab_hue_points();
+        }
+        if (item.lhcurve) {
+            params.labCurve.lhcurve = lab_hue_points();
+        }
+        if (item.hhcurve) {
+            params.labCurve.hhcurve = lab_hue_points();
+        }
+        if (item.blackwhite) {
+            params.blackwhite.enabled = true;
+        }
+        if (item.vibrance) {
+            params.vibrance.enabled = true;
+            params.vibrance.pastels = 50;
+            params.vibrance.saturated = 30;
+        }
+        if (item.shadowsHighlights) {
+            params.sh.enabled = true;
+            params.sh.lab = true;
+            params.sh.highlights = 60;
+            params.sh.shadows = 60;
+            params.sh.htonalwidth = 40;
+            params.sh.stonalwidth = 40;
+            params.sh.radius = 10;
         }
 
         lab_curve_settings.protectred = item.protectred;
@@ -6133,6 +6237,34 @@ void test_lab_tools_lab_curve(bool available)
         LabToolsLuts cpu_luts = cpu_host.luts();
         labToolsHostBlock(cpu_ipf, params, cpu, cpu_luts, cpu_host.autili,
                           cpu_host.butili);
+
+        /*
+         * Non-vacuity: the same profile with the hue family switched off must
+         * produce a different image, otherwise the case proves nothing about
+         * the port.
+         */
+        if (item.chcurve || item.lhcurve || item.hhcurve ||
+            item.chromaticity != 0) {
+            rtengine::procparams::ProcParams plain = params;
+            plain.labCurve.chromaticity = 0;
+            plain.labCurve.chcurve.clear();
+            plain.labCurve.lhcurve.clear();
+            plain.labCurve.hhcurve.clear();
+            rtengine::ImProcFunctions plain_ipf(&plain, false);
+            LabToolsHostState plain_host;
+            LabImage plain_image(item.width, item.height);
+            plain_image.CopyFrom(&source);
+            LabToolsLuts plain_luts = plain_host.luts();
+            labToolsHostBlock(plain_ipf, plain, plain_image, plain_luts,
+                              plain_host.autili, plain_host.butili);
+            const Diff vacuity = compare(view(cpu), view(plain_image));
+            std::printf("stage-residency: lab.tools Lab curve %s: PAE %.6f "
+                        "against the family off\n",
+                        item.label, vacuity.max_abs);
+            check(vacuity.differing > 0,
+                  (std::string("lab.tools Lab curve ") + item.label +
+                   " is not a no-op").c_str());
+        }
 
         rtengine::ImProcFunctions device_ipf(&params, false);
         LabToolsHostState device_host;
@@ -6207,8 +6339,8 @@ void test_lab_tools_lab_curve(bool available)
      * must run the block on the host byte for byte.
      */
     const char* residual_labels[] = {
-        "contrast", "chromaticity slider", "C=f(H) curve", "L=f(H) curve",
-        "H=f(H) curve", "XYZ Munsell", "black and white with colour toning"};
+        "contrast", "XYZ Munsell", "black and white with colour toning",
+        "dense hue curve"};
     for (const char* label : residual_labels) {
         rtengine::procparams::ProcParams params;
         params.labCurve.enabled = true;
@@ -6222,23 +6354,30 @@ void test_lab_tools_lab_curve(bool available)
 
         if (std::strcmp(label, "contrast") == 0) {
             params.labCurve.contrast = 15;
-        } else if (std::strcmp(label, "chromaticity slider") == 0) {
-            params.labCurve.chromaticity = 25;
-        } else if (std::strcmp(label, "C=f(H) curve") == 0) {
-            params.labCurve.chcurve = {
-                static_cast<double>(FCT_MinMaxCPoints),
-                0.0, 0.5, 0.0, 0.0, 0.5, 0.6, 0.0, 0.0,
-                1.0, 0.5, 0.0, 0.0};
-        } else if (std::strcmp(label, "L=f(H) curve") == 0) {
-            params.labCurve.lhcurve = {
-                static_cast<double>(FCT_MinMaxCPoints),
-                0.0, 0.5, 0.0, 0.0, 0.5, 0.6, 0.0, 0.0,
-                1.0, 0.5, 0.0, 0.0};
-        } else if (std::strcmp(label, "H=f(H) curve") == 0) {
-            params.labCurve.hhcurve = {
-                static_cast<double>(FCT_MinMaxCPoints),
-                0.0, 0.5, 0.0, 0.0, 0.5, 0.6, 0.0, 0.0,
-                1.0, 0.5, 0.0, 0.0};
+        } else if (std::strcmp(label, "dense hue curve") == 0) {
+            /*
+             * A hand-built curve with more knots than the table budget can
+             * carry: forty thousand linear control points. FlatCurve's
+             * polyline has one knot per segment and the host sampler cannot
+             * follow it within 32768 nodes, so the predicate refuses the node
+             * and the builtin runs the block.
+             */
+            constexpr int POINTS = 40000;
+            std::vector<double> dense;
+            dense.reserve(1 + 4 * POINTS);
+            dense.push_back(static_cast<double>(FCT_MinMaxCPoints));
+            for (int index = 0; index < POINTS; ++index) {
+                dense.push_back(static_cast<double>(index) /
+                                static_cast<double>(POINTS - 1));
+                double y = 0.5;
+                if (index != 0 && index != POINTS - 1) {
+                    y = (index % 2) != 0 ? 0.55 : 0.45;
+                }
+                dense.push_back(y);
+                dense.push_back(0.0);
+                dense.push_back(0.0);
+            }
+            params.labCurve.chcurve = dense;
         } else if (std::strcmp(label, "XYZ Munsell") == 0) {
             params.labCurve.gamutmunselmethod = "XYZ";
         } else {
@@ -6310,9 +6449,9 @@ void test_lab_tools_lab_curve(bool available)
      * original chroma: exactly zero with neither table active, and the curve's
      * delta with one. Every case is compared with the host block.
      *
-     * The block's L=f(H) flat curve also runs under `bwToning`, but the node
-     * already refuses the whole flat-curve family (see the residual list
-     * above), so that arm cannot be a device case.
+     * The block's L=f(H) flat curve also runs under `bwToning`; the main
+     * Lab-curve matrix above covers black-and-white with L=f(H) as a device
+     * case, so this matrix stays the diagonal-table and activity-flag one.
      *
      * `chroma_max` is the zero test for the closing write: the host leaves a
      * and b at exactly 0.0f when no a/b table is active.

@@ -3496,7 +3496,7 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
                             const std::vector<RtStageArg>& args,
                             std::string& error)
 {
-    constexpr std::size_t ARG_COUNT = 70;
+    constexpr std::size_t ARG_COUNT = 76;
     constexpr int SUBSAMPLING = 4;
     /* guidedfilter.h's epsilon, passed to f_mean() by shadowsHighlights(). */
     constexpr float LAB_TOOLS_EPSILON = 0.075f;
@@ -3559,6 +3559,11 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
             args[67].kind == RT_STAGE_ARG_PTR &&
             args[68].kind == RT_STAGE_ARG_PTR &&
             args[69].kind == RT_STAGE_ARG_INT;
+    kinds = kinds && args[70].kind == RT_STAGE_ARG_INT &&
+            args[71].kind == RT_STAGE_ARG_BUFFER;
+    for (std::size_t index = 72; index <= 75; ++index) {
+        kinds = kinds && args[index].kind == RT_STAGE_ARG_INT;
+    }
     if (!kinds) {
         error = "lab.tools has an argument of the wrong kind";
         return RT_STAGE_INVALID;
@@ -3657,6 +3662,16 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
     int avoidcolorshift = 0;
     int skin_curve_set = 0;
     int vibrance_highlight = 0;
+    /*
+     * toneCurve.hrenabled, which L=f(H)'s gamut loop reads to decide which
+     * branch of the block's clip test applies. It is the same flag vibrance
+     * passes as `vibrance_highlight`.
+     */
+    const int highlight = int_arg(30, 0, 1);
+    if (highlight < 0) {
+        error = "lab.tools highlight flag outside its range";
+        return RT_STAGE_INVALID;
+    }
     if (vibrance) {
         const auto in = [&](std::size_t index, int low, int high) {
             const std::int64_t value = args[index].u.i;
@@ -3706,6 +3721,11 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
     float adjust = 1.f;
     int lcurve_entries = 0;
     int curve_entries = 0;
+    int hue_stride = 0;
+    int ch_active = 0;
+    int lh_active = 0;
+    int hh_active = 0;
+    int chromaticity = 0;
     if (lab_curve) {
         const auto in = [&](std::size_t index, int low, int high) {
             const std::int64_t value = args[index].u.i;
@@ -3772,6 +3792,31 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
         }
         lcurve_entries = static_cast<int>(lcurve_length);
         curve_entries = static_cast<int>(curve_length);
+
+        /*
+         * The hue flat-curve family. The stride is the fixed slot size; the
+         * three flags say which slots the kernel may read, and the slider is
+         * the block's chromaticity value, which also gates whether the block
+         * builds the curves at all.
+         */
+        hue_stride = in(70, 0, static_cast<int>(RT_LAB_TOOLS_HUE_CURVES *
+                                               RT_LAB_TOOLS_HUE_LUT_STRIDE));
+        ch_active = in(72, 0, 1);
+        lh_active = in(73, 0, 1);
+        hh_active = in(74, 0, 1);
+        chromaticity = in(75, -100, 100);
+        if (hue_stride !=
+                static_cast<int>(RT_LAB_TOOLS_HUE_LUT_STRIDE) ||
+            ch_active < 0 || lh_active < 0 || hh_active < 0 ||
+            chromaticity < -100) {
+            error = "lab.tools has a Lab-curve hue family outside its range";
+            return RT_STAGE_INVALID;
+        }
+        if (chromaticity == -100 &&
+            (ch_active != 0 || lh_active != 0 || hh_active != 0)) {
+            error = "lab.tools applies the hue curves at the slider minimum";
+            return RT_STAGE_INVALID;
+        }
     }
 
     /*
@@ -4156,6 +4201,26 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
                 return RT_STAGE_INVALID;
             }
         }
+
+        const RtStageBuffer& hue_luts = args[71].u.buffer;
+        if (!valid(hue_luts) || hue_luts.format != RT_STAGE_F32 ||
+            hue_luts.planes != 1 || hue_luts.height != 1 ||
+            static_cast<std::uint32_t>(hue_luts.width) !=
+                RT_LAB_TOOLS_HUE_CURVES *
+                    static_cast<std::uint32_t>(hue_stride)) {
+            error = "lab.tools needs the three hue flat-curve tables";
+            return RT_STAGE_INVALID;
+        }
+        /*
+         * L=f(H) runs the block's gamut loop through Color::xyz2rgb() on the
+         * working-space inverse in double. The float matrix is one ulp away
+         * and can flip the loop's in-gamut test, so the pass carries the
+         * double matrix whether or not the curve is active.
+         */
+        if (args[68].u.ptr == nullptr) {
+            error = "lab.tools needs the double working matrix";
+            return RT_STAGE_INVALID;
+        }
     }
 
     const int width = lab.width;
@@ -4388,6 +4453,13 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
     StageDeviceBufferPtr satcurve_device;
     StageDeviceBufferPtr lhskcurve_device;
     StageDeviceBufferPtr clcurve_device;
+    char hue_luts_key = 0;
+    char wip_key = 0;
+    const StageBufferShape hue_shape{
+        RT_STAGE_F32,
+        static_cast<std::int32_t>(RT_LAB_TOOLS_HUE_CURVES * hue_stride), 1, 1};
+    StageDeviceBufferPtr hue_luts_device;
+    StageDeviceBufferPtr wip_device;
     if (lab_curve) {
         lcurve_device = residency->acquire(&lcurve_key, lcurve_shape, &error);
         acurve_device = residency->acquire(&acurve_key, curve_shape, &error);
@@ -4397,6 +4469,11 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
         lhskcurve_device =
             residency->acquire(&lhskcurve_key, curve_shape, &error);
         clcurve_device = residency->acquire(&clcurve_key, curve_shape, &error);
+        hue_luts_device =
+            residency->acquire(&hue_luts_key, hue_shape, &error);
+        /* Nine doubles occupy 18 floats in the residency's byte count. */
+        wip_device = residency->acquire(
+            &wip_key, StageBufferShape{RT_STAGE_F32, 18, 1, 1}, &error);
     }
 
     /*
@@ -4456,7 +4533,8 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
         (vibrance && !skin_curve_device) ||
         (lab_curve &&
          (!lcurve_device || !acurve_device || !bcurve_device ||
-          !satcurve_device || !lhskcurve_device || !clcurve_device)) ||
+          !satcurve_device || !lhskcurve_device || !clcurve_device ||
+          !hue_luts_device || !wip_device)) ||
         (local_contrast && (!lc_h_device || !lc_v_device)) ||
         (regions && (!snapshot_device || !region_masks_device ||
                      !region_luts_device || !region_params_device))) {
@@ -4470,6 +4548,24 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
             return false;
         }
         return true;
+    };
+    /*
+     * The double inverse matrix as the residency's byte-counted shape: nine
+     * doubles occupy eighteen float slots, which is the same upload the
+     * region pass uses for its double matrices.
+     */
+    const auto double_matrix_buffer = [](const double* data) {
+        RtStageBuffer buffer{};
+        buffer.size = sizeof(RtStageBuffer);
+        buffer.data = const_cast<double*>(data);
+        buffer.width = 18;
+        buffer.height = 1;
+        buffer.row_pitch = 18u * sizeof(float);
+        buffer.plane_pitch = buffer.row_pitch;
+        buffer.planes = 1;
+        buffer.format = RT_STAGE_F32;
+        buffer.flags = RT_STAGE_BUFFER_READ;
+        return buffer;
     };
     if (!upload(lab_device, lab, "lab") ||
         !upload(lut_highlight_device, lut_highlight, "highlight") ||
@@ -4487,7 +4583,12 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
           !upload(bcurve_device, bcurve, "bcurve") ||
           !upload(satcurve_device, satcurve, "satcurve") ||
           !upload(lhskcurve_device, lhskcurve, "lhskcurve") ||
-          !upload(clcurve_device, clcurve, "clcurve"))) ||
+          !upload(clcurve_device, clcurve, "clcurve") ||
+          !upload(hue_luts_device, args[71].u.buffer, "hue tables") ||
+          !upload(wip_device,
+                  double_matrix_buffer(
+                      static_cast<const double*>(args[68].u.ptr)),
+                  "double inverse"))) ||
         (regions &&
          (!upload(region_luts_device, args[64].u.buffer, "region tables") ||
           !upload(region_params_device, args[66].u.buffer,
@@ -5439,6 +5540,34 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
                                &lab_pitch);
             ok = ok && set_arg(lab_curve_kernel, arg++, sizeof(cl_int),
                                &lab_plane);
+            const cl_mem hue_luts_memory = memory_of(hue_luts_device);
+            const cl_int cl_hue_stride = hue_stride;
+            const cl_int cl_ch_active = ch_active;
+            const cl_int cl_lh_active = lh_active;
+            const cl_int cl_hh_active = hh_active;
+            const cl_int cl_chromaticity = chromaticity;
+            const cl_float cl_amount_chroma =
+                static_cast<cl_float>(args[46].u.f);
+            const cl_mem wip_memory = memory_of(wip_device);
+            const cl_int cl_highlight = highlight;
+            ok = ok && set_arg(lab_curve_kernel, arg++, sizeof(cl_mem),
+                               &hue_luts_memory);
+            ok = ok && set_arg(lab_curve_kernel, arg++, sizeof(cl_int),
+                               &cl_hue_stride);
+            ok = ok && set_arg(lab_curve_kernel, arg++, sizeof(cl_int),
+                               &cl_ch_active);
+            ok = ok && set_arg(lab_curve_kernel, arg++, sizeof(cl_int),
+                               &cl_lh_active);
+            ok = ok && set_arg(lab_curve_kernel, arg++, sizeof(cl_int),
+                               &cl_hh_active);
+            ok = ok && set_arg(lab_curve_kernel, arg++, sizeof(cl_int),
+                               &cl_chromaticity);
+            ok = ok && set_arg(lab_curve_kernel, arg++, sizeof(cl_float),
+                               &cl_amount_chroma);
+            ok = ok && set_arg(lab_curve_kernel, arg++, sizeof(cl_mem),
+                               &wip_memory);
+            ok = ok && set_arg(lab_curve_kernel, arg++, sizeof(cl_int),
+                               &cl_highlight);
             if (!ok) {
                 error = "lab.tools Lab-curve arguments failed";
                 return RT_STAGE_FALLBACK;

@@ -46,14 +46,15 @@ struct ProcParams;
  * host memory, and nothing here is passed to a kernel. The launcher validates
  * the per-pixel arguments from the ABI on its own; the context supplies the
  * tone tables that need pow_F(), the sh_contrast NURBS curve, the working
- * colour matrices, the six Lab-curve tables and the Munsell table set, and it
- * runs the original block for a residual.
+ * colour matrices, the six Lab-curve tables, the three sampled hue flat
+ * curves and the Munsell table set, and it runs the original block for a
+ * residual.
  *
  * The struct is C-compatible because the ABI is. `self` points at the C++
  * object that owns the ProcParams and ImProcFunctions references, so the
  * pointer must not outlive them.
  */
-#define RT_LAB_TOOLS_CONTEXT_VERSION 5u
+#define RT_LAB_TOOLS_CONTEXT_VERSION 6u
 /* "LTOC": rejects a stale or unrelated pointer before any callback runs. */
 #define RT_LAB_TOOLS_CONTEXT_MAGIC 0x4C544F43u
 /* The Lab-mode tone table: one entry per 16-bit L value (0..32767). */
@@ -76,6 +77,29 @@ struct ProcParams;
  */
 #define RT_LAB_TOOLS_LUMA_LUT_ENTRIES 32770u
 #define RT_LAB_TOOLS_CURVE_LUT_ENTRIES 65536u
+/*
+ * The three hue flat curves: C=f(H), L=f(H) and H=f(H). `FlatCurve::getVal()`
+ * is exactly piecewise linear, so a node at every polyline knot reproduces it;
+ * the host refines a piecewise-linear table where the chord misses the curve
+ * and refuses a curve that needs more than the node budget.
+ * Each table is a float node count, then that many x nodes and that many y
+ * nodes, in one buffer of RT_LAB_TOOLS_HUE_CURVES slots of
+ * RT_LAB_TOOLS_HUE_LUT_STRIDE floats, in the order C=f(H), L=f(H), H=f(H).
+ * The kernel interpolates the table in double, like the region mask tables.
+ *
+ * The fidelity bound is RT_LAB_TOOLS_HUE_LUT_ACCEPT on the curve value. The
+ * largest lever is C=f(H), which turns a value error `e` into a chroma factor
+ * error of `2e`; at chroma 200 and the block's 327.68 scale that is
+ * 327.68 * 2 * 5e-7 * 200 = 0.066 LSB16, far below the one-LSB gate. H=f(H)
+ * turns it into a hue error of 1.7e rad, i.e. 0.03 LSB16 at the largest a/b.
+ * L=f(H) multiplies it by 2 * CC / amchroma before the lightness blend, which
+ * stays well inside the gate for a chroma up to the Munsell limit. A table
+ * that cannot meet the bound is refused, never approximated.
+ */
+#define RT_LAB_TOOLS_HUE_CURVES 3u
+#define RT_LAB_TOOLS_HUE_LUT_NODES 32768u
+#define RT_LAB_TOOLS_HUE_LUT_STRIDE (1u + 2u * RT_LAB_TOOLS_HUE_LUT_NODES)
+#define RT_LAB_TOOLS_HUE_LUT_ACCEPT 5.0e-7
 /* params.labCurve.gamutmunselmethod, as chromiLuminanceCurve() maps it. NONE
  * and MUN are the device methods; LAB, XYZ and XYZREL are residuals because
  * they need gamutLchonly() and gamutmap(). */
@@ -218,6 +242,19 @@ typedef struct RtLabToolsResult {
     uint32_t lab_curve_cc_active;
     uint32_t lab_curve_lc_active;
     uint32_t lab_curve_cl_active;
+    /*
+     * The hue flat-curve family: one buffer of lab_curve_hue_stride floats
+     * holding RT_LAB_TOOLS_HUE_CURVES sampled tables, and the three activity
+     * flags. The family is inactive when the chromaticity slider is at its
+     * minimum (-100): the block then never constructs the curves.
+     */
+    const float* lab_curve_hue;
+    uint32_t lab_curve_hue_stride;
+    uint32_t lab_curve_ch_active;
+    uint32_t lab_curve_lh_active;
+    uint32_t lab_curve_hh_active;
+    /* The chromaticity slider, -100..100; the kernel derives chromapro. */
+    int32_t lab_curve_chromaticity;
     /* RT_LAB_TOOLS_MUNSELL_NONE or RT_LAB_TOOLS_MUNSELL_MUN. */
     uint32_t lab_curve_munsell;
     /*
@@ -259,7 +296,9 @@ typedef struct RtLabToolsResult {
      * The working matrices at the host's full double precision. The region
      * CDL and channel-copy round trips are host double matrix products; the
      * float matrices above are one ulp away and can move a gamut-edge sample
-     * by two LSB16, so the region program reads these instead.
+     * by two LSB16, so the region program reads these instead. The Lab-curve
+     * kernel reads the inverse for L=f(H)'s gamut loop, which is
+     * Color::xyz2rgb() on the block's double matrix.
      */
     const double* ws_double;
     const double* iws_double;
@@ -352,16 +391,18 @@ struct LabToolsLuts {
  * curves, with every other pixel tool off.
  *
  * Fail closed. A Lab curve whose `contrast` is non-zero owns the hist16 refill
- * a later node reads, so it is a residual. So are the chromaticity family
- * (the chromaticity slider and the C=f(H), L=f(H) and H=f(H) flat curves), the
- * LAB, XYZ and XYZREL Munsell methods, EPD and any colour-toning method other
- * than LabGrid. A local contrast whose sliders are outside the ABI range is a
- * residual as well. Black-and-white output is admitted only through
- * chromiLuminanceCurve()'s cheap branch: the Lab curves and colour toning are
- * both off, and the pass only zeroes a and b. The full bwToning arm (Lab
- * curves on) and black-and-white with colour toning are residuals. A profile
- * where no tool would run is a residual too: the node would be a no-op and the
- * host block records it.
+ * a later node reads, so it is a residual. So are a chromaticity slider
+ * outside its -100..100 GUI range, a C=f(H), L=f(H) or H=f(H) flat curve the
+ * host table cannot follow within RT_LAB_TOOLS_HUE_LUT_ACCEPT, the LAB, XYZ
+ * and XYZREL Munsell methods, EPD and any colour-toning method other than
+ * LabGrid. A local contrast whose sliders are outside the ABI range is a
+ * residual as well. Black-and-white output is admitted through both of
+ * chromiLuminanceCurve()'s arms: the cheap one when the Lab curves are off
+ * (it only zeroes a and b) and the full `bwToning` one when they are on.
+ * Black-and-white with colour toning is a residual because the host's
+ * `bwonly` is then false, so neither arm runs. A profile where no tool would
+ * run is a residual too: the node would be a no-op and the host block records
+ * it.
  */
 bool labToolsSupported(const procparams::ProcParams& params);
 /* True when a shadows/highlights round would run for the given slider
@@ -479,6 +520,11 @@ private:
     bool lab_curve_cc_active_ = false;
     bool lab_curve_lc_active_ = false;
     bool lab_curve_cl_active_ = false;
+    std::vector<float> lab_curve_hue_;
+    bool lab_curve_ch_active_ = false;
+    bool lab_curve_lh_active_ = false;
+    bool lab_curve_hh_active_ = false;
+    int32_t lab_curve_chromaticity_ = 0;
     uint32_t lab_curve_munsell_ = RT_LAB_TOOLS_MUNSELL_NONE;
     float lab_curve_rst_protection_ = 0.f;
     float lab_curve_protect_red_ = 0.f;

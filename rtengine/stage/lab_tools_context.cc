@@ -25,18 +25,6 @@ static_assert(LAB_TOOLS_LC_DOUBLE_SIGMA == GAUSS_DOUBLE_LIMIT,
 namespace
 {
 
-/* chromiLuminanceCurve()'s own construction: a flat curve that is non-identity
- * only when its points move away from 0.5. The three flat-curve families are
- * the chromaticity path, which the node does not port. */
-bool flatCurveActive(const std::vector<double>& points)
-{
-    if (points.empty() || points[0] == 0) {
-        return false;
-    }
-    FlatCurve curve(points);
-    return !curve.isIdentity();
-}
-
 /* Color::init() fills the Munsell tables MunsellLch() reads. A process
  * without them cannot run the host block either, so the block is a residual. */
 bool munsellTablesAvailable()
@@ -222,6 +210,74 @@ bool regionCurveSupported(const std::vector<double>& points)
     return points[0] == FCT_MinMaxCPoints || points[0] == FCT_Empty;
 }
 
+/*
+ * One hue flat curve, C=f(H), L=f(H) or H=f(H). The block reads
+ * FlatCurve::getVal() at Color::huelab_to_huehsv2(HH), which is in [0,1], and
+ * getVal() is exactly piecewise linear, so the region sampler's table can
+ * reproduce it: it refines where the chord misses the polyline and the same
+ * bound decides acceptance. An empty, FCT_Linear or identity curve leaves the
+ * identity table (the block would not construct the curve either) and the
+ * activity flag false.
+ */
+static_assert(RT_LAB_TOOLS_HUE_LUT_ACCEPT == REGION_LUT_ACCEPT,
+              "the hue and region tables share one fidelity bound");
+static_assert(RT_LAB_TOOLS_HUE_LUT_NODES == RT_LAB_TOOLS_REGION_LUT_NODES,
+              "the hue slot must fit the sampler's node budget");
+
+bool sampleHueCurve(const std::vector<double>& points, float* slot,
+                    bool& active)
+{
+    active = false;
+    slot[0] = 2.f;
+    slot[1] = 0.f;
+    slot[2] = 1.f;
+    slot[3] = 0.5f;
+    slot[4] = 0.5f;
+    if (points.empty() || points[0] == FCT_Linear) {
+        return true;
+    }
+    if (!regionCurveSupported(points)) {
+        return false;
+    }
+    FlatCurve curve(points, true);
+    if (curve.isIdentity()) {
+        return true;
+    }
+    if (!sampleRegionCurve(points, true, 0.0, 1.0, false, false, slot)) {
+        return false;
+    }
+    active = true;
+    return true;
+}
+
+/*
+ * The block constructs the three curves only when
+ * `labCurve.chromaticity > -100`. At the slider's minimum they are not
+ * applied at all, whatever the profile carries, so a non-identity curve there
+ * is neither active nor a reason to refuse the node.
+ */
+bool hueCurveFamilySupported(const procparams::ProcParams& params)
+{
+    const int chromaticity = params.labCurve.chromaticity;
+    if (chromaticity < -100 || chromaticity > 100) {
+        return false;
+    }
+    if (chromaticity == -100) {
+        return true;
+    }
+    const std::vector<double>* curves[] = {&params.labCurve.chcurve,
+                                           &params.labCurve.lhcurve,
+                                           &params.labCurve.hhcurve};
+    std::vector<float> scratch(RT_LAB_TOOLS_HUE_LUT_STRIDE);
+    for (const std::vector<double>* points : curves) {
+        bool active = false;
+        if (!sampleHueCurve(*points, scratch.data(), active)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool regionFinite(double value)
 {
     return std::isfinite(value);
@@ -377,16 +433,14 @@ bool labToolsSupported(const procparams::ProcParams& params)
 
     /*
      * The Lab-curve pass is a device case only when everything it reads is
-     * ported. The chromaticity slider and the three flat curves (C=f(H),
-     * L=f(H) and H=f(H)) are a separate family; the LAB, XYZ and XYZREL
-     * Munsell methods need gamutLchonly() and gamutmap(); factnoise reads the
-     * denoise tool. Each is a residual.
+     * ported. The chromaticity slider must be inside its GUI range and the
+     * three hue flat curves (C=f(H), L=f(H) and H=f(H)) must be ones the
+     * host table can follow; the LAB, XYZ and XYZREL Munsell methods need
+     * gamutLchonly() and gamutmap(); factnoise reads the denoise tool. Each
+     * is a residual.
      */
     if (params.labCurve.enabled) {
-        if (params.labCurve.chromaticity != 0 ||
-            flatCurveActive(params.labCurve.chcurve) ||
-            flatCurveActive(params.labCurve.lhcurve) ||
-            flatCurveActive(params.labCurve.hhcurve) ||
+        if (!hueCurveFamilySupported(params) ||
             params.dirpyrDenoise.enabled) {
             return false;
         }
@@ -850,6 +904,10 @@ int LabToolsContext::build(RtLabToolsResult& out)
     lab_curve_cc_active_ = false;
     lab_curve_lc_active_ = false;
     lab_curve_cl_active_ = false;
+    lab_curve_ch_active_ = false;
+    lab_curve_lh_active_ = false;
+    lab_curve_hh_active_ = false;
+    lab_curve_chromaticity_ = 0;
     lab_curve_lcredsk_ = params_.labCurve.lcredsk;
     lab_curve_adjust_ = 1.f;
     if (lab_curve_active_) {
@@ -911,6 +969,51 @@ int LabToolsContext::build(RtLabToolsResult& out)
         lab_curve_cl_active_ = clcutili;
 
         /*
+         * The hue flat-curve family. The predicate has already sampled the
+         * same curves, so this only repeats the derivation for the exported
+         * table. A non-identity curve the table cannot follow returns 1 and
+         * the call site runs the host block, exactly as the predicate's
+         * refusal does.
+         */
+        lab_curve_chromaticity_ = params_.labCurve.chromaticity;
+        lab_curve_ch_active_ = false;
+        lab_curve_lh_active_ = false;
+        lab_curve_hh_active_ = false;
+        const std::size_t hue_stride = RT_LAB_TOOLS_HUE_LUT_STRIDE;
+        if (lab_curve_hue_.size() !=
+            RT_LAB_TOOLS_HUE_CURVES * hue_stride) {
+            lab_curve_hue_.assign(RT_LAB_TOOLS_HUE_CURVES * hue_stride, 0.f);
+        }
+        if (!hueCurveFamilySupported(params_)) {
+            return 1;
+        }
+        if (lab_curve_chromaticity_ > -100) {
+            if (!sampleHueCurve(params_.labCurve.chcurve,
+                                &lab_curve_hue_[0 * hue_stride],
+                                lab_curve_ch_active_) ||
+                !sampleHueCurve(params_.labCurve.lhcurve,
+                                &lab_curve_hue_[1 * hue_stride],
+                                lab_curve_lh_active_) ||
+                !sampleHueCurve(params_.labCurve.hhcurve,
+                                &lab_curve_hue_[2 * hue_stride],
+                                lab_curve_hh_active_)) {
+                return 1;
+            }
+        } else {
+            /* The block never constructs the curves at the slider minimum;
+             * leave the identity tables so a stray read is a no-op. */
+            for (std::size_t curve = 0; curve < RT_LAB_TOOLS_HUE_CURVES;
+                 ++curve) {
+                float* slot = &lab_curve_hue_[curve * hue_stride];
+                slot[0] = 2.f;
+                slot[1] = 0.f;
+                slot[2] = 1.f;
+                slot[3] = 0.5f;
+                slot[4] = 0.5f;
+            }
+        }
+
+        /*
          * chromiLuminanceCurve()'s working-profile chroma scale, for the
          * C=f(C) and C=f(L) table index.
          */
@@ -945,6 +1048,15 @@ int LabToolsContext::build(RtLabToolsResult& out)
             !std::isfinite(lab_curve_protect_red_) ||
             !std::isfinite(lab_curve_protect_red_h_) ||
             !std::isfinite(lab_curve_amount_chroma_)) {
+            return 1;
+        }
+        /*
+         * L=f(H) divides the chroma by settings->amchroma. The option's GUI
+         * range is 20..140; a hand-edited zero would make the host's kcc
+         * infinite and the device's identical only by accident, so the setup
+         * refuses it instead.
+         */
+        if (lab_curve_lh_active_ && lab_curve_amount_chroma_ <= 0.f) {
             return 1;
         }
     }
@@ -1166,6 +1278,15 @@ int LabToolsContext::build(RtLabToolsResult& out)
     out.lab_curve_cc_active = lab_curve_cc_active_ ? 1u : 0u;
     out.lab_curve_lc_active = lab_curve_lc_active_ ? 1u : 0u;
     out.lab_curve_cl_active = lab_curve_cl_active_ ? 1u : 0u;
+    out.lab_curve_hue =
+        lab_curve_active_ ? lab_curve_hue_.data() : nullptr;
+    out.lab_curve_hue_stride =
+        lab_curve_active_ ? static_cast<uint32_t>(RT_LAB_TOOLS_HUE_LUT_STRIDE)
+                          : 0u;
+    out.lab_curve_ch_active = lab_curve_ch_active_ ? 1u : 0u;
+    out.lab_curve_lh_active = lab_curve_lh_active_ ? 1u : 0u;
+    out.lab_curve_hh_active = lab_curve_hh_active_ ? 1u : 0u;
+    out.lab_curve_chromaticity = lab_curve_chromaticity_;
     out.lab_curve_munsell = lab_curve_munsell_;
     out.lab_curve_rst_protection = lab_curve_rst_protection_;
     out.lab_curve_protect_red = lab_curve_protect_red_;
@@ -1183,8 +1304,8 @@ int LabToolsContext::build(RtLabToolsResult& out)
         local_contrast_active_ ? &local_contrast_iir_ : nullptr;
     out.region_luts = regions_active_ ? region_luts_.data() : nullptr;
     out.region_params = regions_active_ ? region_params_.data() : nullptr;
-    out.ws_double = regions_active_ ? ws_double_ : nullptr;
-    out.iws_double = regions_active_ ? iws_double_ : nullptr;
+    out.ws_double = ws_double_;
+    out.iws_double = iws_double_;
     out.region_count =
         regions_active_
             ? static_cast<uint32_t>(params_.colorToning.labregions.size())
