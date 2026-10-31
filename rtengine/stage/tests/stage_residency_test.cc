@@ -8159,7 +8159,8 @@ void test_lab_wavelet_chroma(bool available)
     const char* residual_labels[] = {
         "CHmethod without", "CHmethod with", "chro range", "sigmacol range",
         "skin range", "hhcurve", "contrast and skin", "chroma only no "
-        "strength", "edge panel"};
+        "strength", "edge panel", "balance chroma method",
+        "balance chroma flag"};
     for (const char* label : residual_labels) {
         rtengine::procparams::ProcParams params;
         const int contrast[9] = {30, 22, 14, 8, 4, 2, 0, 0, 0};
@@ -8185,6 +8186,10 @@ void test_lab_wavelet_chroma(bool available)
         } else if (std::strcmp(label,
                                 "chroma only no strength") == 0) {
             params.wavelet.chro = 0;
+        } else if (std::strcmp(label, "balance chroma method") == 0) {
+            params.wavelet.BAmethod = "sli";
+        } else if (std::strcmp(label, "balance chroma flag") == 0) {
+            params.wavelet.tmr = true;
         } else {
             params.wavelet.expedge = true;
         }
