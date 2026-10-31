@@ -260,6 +260,9 @@ quick() {
         "$ROOT/devnotes/opencl/pp3/labtools-labgrid.pp3" lab.tools
     run_stage_device "pef/stage-device-lab-tools-blackwhite" \
         "$ROOT/devnotes/opencl/pp3/labtools-blackwhite.pp3" lab.tools
+    run_stage_device "pef/stage-device-lab-tools-blackwhite-labcurve" \
+        "$ROOT/devnotes/opencl/pp3/labtools-blackwhite-labcurve.pp3" \
+        lab.tools cpu
     run_stage_device "pef/stage-device-lab-tools-vibrance" \
         "$ROOT/devnotes/opencl/pp3/labtools-vibrance.pp3" lab.tools cpu
     run_stage_device "pef/stage-device-lab-tools-labcurve" \

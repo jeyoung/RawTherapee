@@ -4952,9 +4952,11 @@ void test_lab_tools(bool available)
      * their own positions and see the grey image. The zeroing is exact, so a
      * B&W-only profile must leave L bit-identical to the block.
      *
-     * Black and white with colour toning or with the Lab curves takes neither
-     * the early return nor the cheap zeroing, so those profiles are refusals:
-     * the builtin runs the block and the result must match it exactly.
+     * Black and white with colour toning takes neither the early return nor
+     * the cheap zeroing, so those profiles are refusals: the builtin runs the
+     * block and the result must match it exactly. Black and white with the Lab
+     * curves on is the full `bwToning` arm and is covered by the Lab-curve
+     * matrix below.
      */
     struct BwCase {
         const char* label;
@@ -5180,8 +5182,7 @@ void test_lab_tools(bool available)
     const char* residual_labels[] = {
         "vibrance + Lab contrast", "vibrance + local contrast out of range",
         "vibrance + EPD", "vibrance + Lab regions show mask",
-        "black and white + colour toning",
-        "black and white + Lab curve", "vibrance no-op",
+        "black and white + colour toning", "vibrance no-op",
         "vibrance pastels out of range"};
     for (const char* label : residual_labels) {
         rtengine::procparams::ProcParams params;
@@ -5241,9 +5242,6 @@ void test_lab_tools(bool available)
             params.blackwhite.enabled = true;
             params.colorToning.enabled = true;
             params.colorToning.method = "LabGrid";
-        } else if (std::strcmp(label, "black and white + Lab curve") == 0) {
-            params.blackwhite.enabled = true;
-            params.labCurve.enabled = true;
         } else {
             check(false, label);
         }
@@ -6210,7 +6208,7 @@ void test_lab_tools_lab_curve(bool available)
      */
     const char* residual_labels[] = {
         "contrast", "chromaticity slider", "C=f(H) curve", "L=f(H) curve",
-        "H=f(H) curve", "XYZ Munsell", "black and white"};
+        "H=f(H) curve", "XYZ Munsell", "black and white with colour toning"};
     for (const char* label : residual_labels) {
         rtengine::procparams::ProcParams params;
         params.labCurve.enabled = true;
@@ -6244,7 +6242,11 @@ void test_lab_tools_lab_curve(bool available)
         } else if (std::strcmp(label, "XYZ Munsell") == 0) {
             params.labCurve.gamutmunselmethod = "XYZ";
         } else {
+            /* black and white with colour toning: the host's `bwonly` is
+             * false, so neither black-and-white arm runs. */
             params.blackwhite.enabled = true;
+            params.colorToning.enabled = true;
+            params.colorToning.method = "LabGrid";
         }
 
         check(!labToolsSupported(params),
@@ -6297,6 +6299,246 @@ void test_lab_tools_lab_curve(bool available)
         check(diff.differing == 0 && diff.max_abs == 0.0,
               (std::string("lab.tools Lab curve residual ") + label +
                " matches the CPU block").c_str());
+    }
+
+    /*
+     * Black-and-white output through `chromiLuminanceCurve()`'s full
+     * `bwToning` arm. With `blackwhite.enabled` and the Lab curves on, the
+     * block takes the hue and chroma from the original pixel before the a and
+     * b tables, skips C=f(L), C=f(C) and L=f(C) and the red/skin gate, still
+     * applies the L table, and closes on the a/b tables' deviation from the
+     * original chroma: exactly zero with neither table active, and the curve's
+     * delta with one. Every case is compared with the host block.
+     *
+     * The block's L=f(H) flat curve also runs under `bwToning`, but the node
+     * already refuses the whole flat-curve family (see the residual list
+     * above), so that arm cannot be a device case.
+     *
+     * `chroma_max` is the zero test for the closing write: the host leaves a
+     * and b at exactly 0.0f when no a/b table is active.
+     */
+    {
+        const auto chroma_max = [](const LabImage& image) {
+            double worst = 0.0;
+            for (int y = 0; y < image.H; ++y) {
+                for (int x = 0; x < image.W; ++x) {
+                    worst = std::max(
+                        worst,
+                        std::abs(static_cast<double>(image.a[y][x])));
+                    worst = std::max(
+                        worst,
+                        std::abs(static_cast<double>(image.b[y][x])));
+                }
+            }
+            return worst;
+        };
+
+        struct BwCurveCase {
+            const char* label;
+            int width;
+            int height;
+            bool lcurve;
+            bool abcurve;
+            bool cccurve;
+            bool lccurve;
+            bool clcurve;
+            bool vibrance;
+            bool shadowsHighlights;
+            bool localContrast;
+            const char* munsell;
+        };
+        const BwCurveCase bw_curve_cases[] = {
+            {"black and white identity curves", 238, 64, false, false, false,
+             false, false, false, false, false, "MUN"},
+            {"black and white L curve", 238, 64, true, false, false, false,
+             false, false, false, false, "MUN"},
+            {"black and white a/b curves", 238, 64, false, true, false, false,
+             false, false, false, false, "MUN"},
+            {"black and white C=f(L)", 179, 48, false, false, false, false,
+             true, false, false, false, "MUN"},
+            {"black and white L=f(C)", 238, 64, false, false, false, true,
+             false, false, false, false, "MUN"},
+            {"black and white C=f(C) + C=f(L) + L=f(C)", 238, 64, false,
+             false, true, true, true, false, false, false, "NONE"},
+            {"black and white curve set with vibrance, shadows/highlights "
+             "and local contrast", 238, 64, true, true, true, true, true,
+             true, true, true, "NONE"},
+        };
+
+        for (const BwCurveCase& item : bw_curve_cases) {
+            rtengine::procparams::ProcParams params;
+            params.blackwhite.enabled = true;
+            params.labCurve.enabled = true;
+            params.labCurve.contrast = 0;
+            params.labCurve.gamutmunselmethod = item.munsell;
+            params.labCurve.rstprotection = 0.0;
+            params.labCurve.lcredsk = true;
+            if (item.lcurve) {
+                params.labCurve.lcurve = lab_curve_points(0.58);
+            }
+            if (item.abcurve) {
+                params.labCurve.acurve = lab_curve_points(0.60);
+                params.labCurve.bcurve = lab_curve_points(0.60);
+            }
+            if (item.cccurve) {
+                params.labCurve.cccurve = lab_curve_points(1.10);
+            }
+            if (item.lccurve) {
+                params.labCurve.lccurve = lab_curve_points(1.10);
+            }
+            if (item.clcurve) {
+                params.labCurve.clcurve = lab_curve_points(0.52);
+            }
+            if (item.vibrance) {
+                params.vibrance.enabled = true;
+                params.vibrance.pastels = 50;
+                params.vibrance.saturated = 30;
+            }
+            if (item.shadowsHighlights) {
+                params.sh.enabled = true;
+                params.sh.lab = true;
+                params.sh.highlights = 60;
+                params.sh.shadows = 60;
+                params.sh.htonalwidth = 40;
+                params.sh.stonalwidth = 40;
+                params.sh.radius = 10;
+            }
+            if (item.localContrast) {
+                params.localContrast.enabled = true;
+                params.localContrast.radius = 20;
+                params.localContrast.amount = 0.3;
+                params.localContrast.darkness = 0.9;
+                params.localContrast.lightness = 1.1;
+            }
+            lab_curve_settings.protectred = 60;
+            lab_curve_settings.protectredh = 0.3;
+            lab_curve_settings.amchroma = 40;
+
+            const std::string label =
+                std::string("lab.tools ") + item.label;
+            check(labToolsSupported(params),
+                  (label + " is the supported set").c_str());
+            check(labToolsLabCurveActive(params),
+                  (label + " runs the Lab-curve pass").c_str());
+
+            LabImage source(item.width, item.height);
+            fill_lab_curve_saturated(source);
+
+            rtengine::ImProcFunctions cpu_ipf(&params, false);
+            LabToolsHostState cpu_host;
+            LabImage cpu(item.width, item.height);
+            cpu.CopyFrom(&source);
+            LabToolsLuts cpu_luts = cpu_host.luts();
+            labToolsHostBlock(cpu_ipf, params, cpu, cpu_luts, cpu_host.autili,
+                              cpu_host.butili);
+
+            rtengine::ImProcFunctions device_ipf(&params, false);
+            LabToolsHostState device_host;
+            LabImage device(item.width, item.height);
+            device.CopyFrom(&source);
+            const LabToolsRun result =
+                run_lab_tools_node(device, params, device_host, device_ipf,
+                                   profile_path);
+            const std::string profile = read_file(profile_path);
+
+            check(result.supported,
+                  (label + " resolves to the supported set").c_str());
+            check(result.deviceReady,
+                  (label + " builds its host setup").c_str());
+            check(result.status == RT_STAGE_OK,
+                  (label + " completes through run()").c_str());
+            check(profile.find("\"stage\":\"lab.tools\"") !=
+                      std::string::npos &&
+                      profile.find("\"impl\":\"opencl\"") !=
+                          std::string::npos,
+                  (label + " records a device execution").c_str());
+
+            const Distribution d = distribution(view(device), view(cpu));
+            std::printf("stage-residency: %s %dx%d: PAE %.6f LSB16; exact "
+                        "%zu, <=0.25 %zu, <=0.5 %zu, <=1 %zu, >1 %zu of "
+                        "%zu\n",
+                        item.label, item.width, item.height, d.max_abs,
+                        d.exact, d.quarter, d.half, d.one, d.over, d.samples);
+            check(d.finite, (label + " stays finite").c_str());
+            check(d.over == 0,
+                  (label + " is within one LSB16").c_str());
+
+            const double host_chroma = chroma_max(cpu);
+            const double device_chroma = chroma_max(device);
+            std::printf("stage-residency: %s: host chroma %.6f, device "
+                        "chroma %.6f\n",
+                        item.label, host_chroma, device_chroma);
+            if (item.abcurve) {
+                check(host_chroma > 0.0 && device_chroma > 0.0,
+                      (label + " keeps the a/b tables' deviation").c_str());
+            } else {
+                check(host_chroma == 0.0,
+                      (label + " leaves the host's a and b at exactly "
+                               "zero").c_str());
+                check(device_chroma == 0.0,
+                      (label + " leaves a and b at exactly zero").c_str());
+            }
+
+            /*
+             * Non-vacuity: the same profile with black-and-white off must
+             * produce a different host result, so the arm cannot pass by
+             * being skipped.
+             */
+            rtengine::procparams::ProcParams colour_params = params;
+            colour_params.blackwhite.enabled = false;
+            rtengine::ImProcFunctions colour_ipf(&colour_params, false);
+            LabToolsHostState colour_host;
+            LabImage colour(item.width, item.height);
+            colour.CopyFrom(&source);
+            LabToolsLuts colour_luts = colour_host.luts();
+            labToolsHostBlock(colour_ipf, colour_params, colour, colour_luts,
+                              colour_host.autili, colour_host.butili);
+            const Diff without = compare(view(colour), view(cpu));
+            std::printf("stage-residency: %s: black and white changes %zu of "
+                        "%zu host samples, PAE %.6f LSB16\n",
+                        item.label, without.differing, without.samples,
+                        without.max_abs);
+            check(without.differing > 0,
+                  (label + " changes the host result").c_str());
+        }
+
+        /*
+         * The a/b tables' deviation is the arm colour toning would otherwise
+         * hide: with the same tables and black-and-white off, the host writes
+         * the curved absolute chroma instead. The two host results must
+         * differ, so the deviation path is exercised rather than a no-op.
+         */
+        rtengine::procparams::ProcParams bw;
+        bw.blackwhite.enabled = true;
+        bw.labCurve.enabled = true;
+        bw.labCurve.acurve = lab_curve_points(0.60);
+        bw.labCurve.bcurve = lab_curve_points(0.60);
+        bw.labCurve.gamutmunselmethod = "MUN";
+        rtengine::procparams::ProcParams curved = bw;
+        curved.blackwhite.enabled = false;
+
+        LabImage source(238, 64);
+        fill_lab_curve_saturated(source);
+        const auto host_block = [&](const rtengine::procparams::ProcParams& p) {
+            LabImage image(238, 64);
+            image.CopyFrom(&source);
+            rtengine::ImProcFunctions ipf(&p, false);
+            LabToolsHostState state;
+            LabToolsLuts luts = state.luts();
+            labToolsHostBlock(ipf, p, image, luts, state.autili, state.butili);
+            return image;
+        };
+        const LabImage grey_deviation = host_block(bw);
+        const LabImage curved_absolute = host_block(curved);
+        const Diff deviation = compare(view(grey_deviation),
+                                       view(curved_absolute));
+        std::printf("stage-residency: black-and-white a/b deviation differs "
+                    "from the curved chroma on %zu of %zu samples, PAE %.6f "
+                    "LSB16\n",
+                    deviation.differing, deviation.samples,
+                    deviation.max_abs);
+        check(deviation.differing > 0,
+              "the black-and-white a/b deviation is not the curved chroma");
     }
 
     /*
