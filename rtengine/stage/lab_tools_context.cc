@@ -355,13 +355,15 @@ bool labToolsLabCurveActive(const procparams::ProcParams& params)
 bool labToolsSupported(const procparams::ProcParams& params)
 {
     /*
-     * The two colour-toning methods this node implements are LabGrid and the
-     * bounded LabRegions set. Every other method, and a LabRegions profile
-     * outside the set, is a residual.
+     * Colour toning other than the two methods this block implements is
+     * applied by rgbProc() before the Lab block, so it must not refuse the
+     * node: the block's own work is identical with and without it. A
+     * LabRegions profile outside the bounded set is still a residual, because
+     * that method is evaluated here.
      */
     const bool lab_regions = labToolsRegionsActive(params);
     if (params.colorToning.enabled &&
-        params.colorToning.method != "LabGrid" && !lab_regions) {
+        params.colorToning.method == "LabRegions" && !lab_regions) {
         return false;
     }
 
