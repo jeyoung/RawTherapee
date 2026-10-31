@@ -1697,15 +1697,28 @@ Still CPU-only: `raw.preprocess`, `raw.demosaic`, `raw.base`, `lab.tools`,
 `local.adjustments` is partial through the multi-spot tool path. The
 admitted set is any number of `norm` spots in list order: an active spot runs
 any combination of local log encoding, local dehaze, local CBDL, Colour &
-Light, vibrance, shadows/highlights, soft light and Gaussian local contrast,
-and an inactive spot is the clamp-only case and may carry inert tool settings.
+Light, vibrance, shadows/highlights, soft light, Gaussian local contrast and
+local sharpening, and an inactive spot is the clamp-only case and may carry
+inert tool settings.
 Every active spot needs at least one of `explog`, `expcbdl`, `expcolor`,
-`expvibrance`, `expshadhigh`, `expsoft`, `expcontrast` and the dehaze pair
-(`expreti` on with a non-zero `dehaz`); every other `exp*` is a residual.
+`expvibrance`, `expshadhigh`, `expsoft`, `expcontrast`, `expsharp` and the
+dehaze pair (`expreti` on with a non-zero `dehaz`); every other `exp*` is a
+residual.
 Local log encoding is admitted with `expcie` off, `autocompute` off, `detail`
 zero, no gradient and its GUI slider ranges; `detail` non-zero (the guided
 filter arm), `expcie`, `ciecam`, `autocompute`, `strlog`, an explicit mask,
-a soft radius and out-of-range values are residuals. Local dehaze is exposed through
+a soft radius and out-of-range values are residuals. Local sharpening is
+admitted only in the `"rl"` RLD arm that the output sharpening core covers:
+undamped, no capture sharpening, `shargam == 1`, `sharblur < 0.25`, no mask
+view, `reparsha == 100` and a radius in `0.4..1.15` (below 1.15 so the core
+uses its 3x3/5x5/7x7 kernels rather than the separable IIR arm). A radius at
+or below 0.42 is the block's own no-op. Capture sharpening (`"cap"`),
+damping, `shargam != 1`, `sharblur >= 0.25`, `sharshow`, a radius outside
+`0.4..1.15` and out-of-range sliders are residuals. A partial spot with a
+non-zero transition is also a residual: `Sharp_Local()` reads the padded
+deconvolution result across the transition ring, which the block's
+`lx + lxL + 3` extent does not cover; a zero-width transition keeps the ring
+inside the nominal extent. Local dehaze is exposed through
 the retinex enable: `expreti` must be on, the retinex strength must be zero
 (the retinex tool itself is a no-op), and `dehazeblack`, show-depth, an active
 retinex strength, a mask or a soft radius are residuals. `dehaz`,
@@ -1715,9 +1728,11 @@ recursion/inversion/mask/soft radius/merge/LabGrid/RGB or exposure curve,
 `qualitycurveMethod` none or std, `avoidgamutMethod` `"NONE"` or `"MUNS"`,
 and chroma/lightness/contrast inside `-100..100`. Both `ELI` and `RECT`
 shapes are admitted, and an active ROI must be at least 5 px in each
-dimension. The tools run in `Lab_Local()`'s order: local log encoding,
+dimension (39 px when sharpening runs, where a smaller extent makes the host
+return before its tail clamp).
+The tools run in `Lab_Local()`'s order: local log encoding,
 local dehaze, CBDL, vibrance, shadows/highlights, soft light, local contrast,
-then Colour & Light.
+local sharpening, then Colour & Light.
 Each tool takes a fresh ROI copy and its own deltaE reference blur
 (`(2 + 0.2*blurcolde)` for colour, `(2 + 0.2*blurSHde)` for
 shadows/highlights, 3 for vibrance, soft light and dehaze, and `lcradius` for
@@ -1902,6 +1917,28 @@ radius, source gray, compression, `repar` and sensitivity out of range) runs
 the host builtin and is byte-identical; the predicate matrix also covers
 target gray and black/white EV.
 
+The local sharpening matrix is within 0.926 LSB16 (high sensitivity at 90;
+0.766 on the kernel-7 radius, 0.626 on sharpen+soft light, 0.516 on the
+8192x64 width, 0.428 on all tools, 0.355 on sharpen+dehaze, 0.354 on
+sharpen+log, 0.303 on 179x49, 0.207 on sharpen alone, 0.139 on the
+zero-transition partial spot) for sharpen alone, the 3x3/5x5/7x7 radii, a
+high sensitivity, colour, log, dehaze, CBDL, vibrance,
+shadows/highlights, soft light, local contrast, all tools, MUNS, a second
+spot, an inactive-then-active spot, ELI/RECT and the 179x49, 238x64 and
+8192x64 widths; no sample is non-finite. Sharpen alone changes 33,709 of
+45,696 fixture samples with PAE 8,866.826172 LSB16 against the same spot with
+the tool off. The gate `localadjustments-sharpen.pp3` row is 1 LSB16 and
+differs from the neutral export by PAE 6,272 codes on 3,572,230 of
+10,139,904 pixels. The pass reuses the output sharpening core's mask
+and undamped RLD kernels on the block's zero-padded `lx + lxL + 3` by
+`ly + lyT + 3` plane, and reproduces `Sharp_Local()`'s full-image deltaE
+reference blur and senstype-0 (`lp.senssha`) blend; it does not re-derive
+USM/RLD. The runtime residual matrix (capture sharpening, damping, gamma,
+blur pre-pass, mask view, a separable radius, radius/amount/iteration/
+contrast/sensitivity out of range and `reparsha`) runs the host builtin and
+is byte-identical; a partial spot with a non-zero transition is also a host
+residual for the padded-extent reason above.
+
 The `chromacbdl = 0.01`, default-multiplier, default-clarity case is the
 chroma block's all-ones-multiplier arm: the CPU still enters the block and
 blends the luminance result. The pre-fix device skipped it and diverged by
@@ -1914,14 +1951,16 @@ method, the shadows/highlights
 `"tone"`/`"ghs"`/`"micha"` methods, tone-eq multipliers, a non-default tone
 gamma/slope, the SH recovery blend and gradient, vibrance
 gamma/gradients/warm, the local-contrast wavelet (`"wav"`) and FFT variants,
-CBDL's `contresid` and soft radius, blur/denoise, sharpening, tone mapping,
+CBDL's `contresid` and soft radius, blur/denoise, capture sharpening, RLD
+damping, `shargam`, `sharshow`, a separable local-sharpening radius, tone
+mapping,
 Retinex, log's guided-filter `detail`/`autocompute`/CIE CAM/gradient, the
 common mask, CIE CAM, the global dehaze, `exc`/`full`/`main`, merge, explicit
 masks, soft
 radius, LAB/XYZ/XYZREL gamut methods, the RGB curve, LabGrid, `avoidrad != 0`,
 `transit == 100`, a blur radius above 100, `reparcol != 100`, a ROI below
 5 px (12 px with shadows/highlights active, where a 10-px ROI falls back to
-the host at PAE 0), `ghs_D != 0 && ghs_BLP > 0` and
+the host at PAE 0; 39 px with sharpening active), `ghs_D != 0 && ghs_BLP > 0` and
 an active pre-CBDL pass. A GPU device is refused before the upload. An
 inactive block (`locallab.enabled == false` or no spots) never enters the node
 and takes no Lab round trip.

@@ -59,6 +59,9 @@ pairs are exact. The gate is the peak absolute error (PAE) in normalised units;
 | 2026-10-30 | uncommitted | POCL (CPU) | colorspace_flowers.pef / `localadjustments-log.pp3`, `local.adjustments` | off vs auto, 16-bit TIFF | 1 LSB | PASS |
 | 2026-10-30 | uncommitted | POCL (CPU) | 21-case log matrix (alone, no compression, both senstype-11 arms, colour, dehaze, CBDL, vibrance, SH, soft light, local contrast, all tools, MUNS, multispot, inactive, ELI/RECT, 179x49, 238x64, 8192x64), `stage-residency-test` | device vs host block | 0.877 LSB (worst) | PASS |
 | 2026-10-30 | uncommitted | POCL (CPU) | 11-case log residual matrix, `stage-residency-test` | device vs host block | 0 (host) | PASS |
+| 2026-10-31 | uncommitted | POCL (CPU) | colorspace_flowers.pef / `localadjustments-sharpen.pp3`, `local.adjustments` | off vs auto, 16-bit TIFF | 1 LSB | PASS |
+| 2026-10-31 | uncommitted | POCL (CPU) | 21-case sharpen matrix (alone, 3x3/5x5/7x7 radii, high sensitivity, colour, log, dehaze, CBDL, vibrance, SH, soft light, local contrast, all tools, MUNS, multispot, inactive, ELI/RECT, partial zero-transition, 179x49, 238x64, 8192x64), `stage-residency-test` | device vs host block | 0.926 LSB (worst) | PASS |
+| 2026-10-31 | uncommitted | POCL (CPU) | 12-case sharpen residual matrix, `stage-residency-test` | device vs host block | 0 (host) | PASS |
 
 `47c50ee77` changes only CPU export buffer handling; the OpenCL rows above
 re-run the existing GPU stages against the new CPU neighbour.
@@ -185,6 +188,25 @@ peak absolute error is zero for the synthetic node tests:
   1 LSB16, and eleven residual configurations (`autocompute`, `expcie`,
   `ciecam`, non-zero `detail`, `strlog`, mask, soft radius and four
   out-of-range sliders) run the host builtin byte for byte.
+- Local sharpening, through `local.adjustments`, runs the output sharpening
+  core's device mask and undamped RLD kernels on the block's zero-padded
+  extent and reproduces `Sharp_Local()`'s full-image deltaE reference blur
+  and senstype-0 (`lp.senssha`) blend. It matches the host block in twenty-one
+  configurations (alone, the 3x3/5x5/7x7 radii, high sensitivity, colour,
+  log, dehaze, CBDL, vibrance, shadows/highlights, soft light, local contrast,
+  all tools, MUNS, a second spot, inactive/active, ELI/RECT, a partial
+  zero-transition spot and the 179x49, 238x64 and 8192x64 widths) with a worst
+  peak error of 0.926 LSB16 at sensitivity 90 (kernel-7 0.766, sharpen+soft
+  light 0.626, all tools 0.428, sharpen+dehaze 0.355, 8192x64 0.516, sharpen
+  alone 0.207); no sample is non-finite. Sharpen alone changes 33,709 of
+  45,696 samples at PAE 8,866.826172 LSB16, so the parity is not vacuous.
+  `localadjustments-sharpen.pp3` is 1 LSB16 and differs from neutral by PAE
+  6,272 codes on 3,572,230 of 10,139,904 pixels. Twelve residual
+  configurations (capture sharpening, damping, gamma, blur, mask view, a
+  separable radius, radius/amount/iteration/contrast/sensitivity out of
+  range and `reparsha`) run the host builtin byte for byte; a partial spot
+  with a non-zero transition is also a host residual because the block's
+  padded extent does not cover the transition ring the host reads.
 - `tools/opencl/verify.sh --stage-device`, which `--quick` also runs, asserts
   each record and its parity in one step:
 
