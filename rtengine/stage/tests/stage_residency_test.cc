@@ -7974,6 +7974,269 @@ void test_lab_wavelet_contrast(bool available)
     }
 }
 
+/* ------------------------------------------------ lab.wavelet chroma arm */
+
+/*
+ * The chroma panel's "link" arm: the contrast multipliers c[] drive both the
+ * L contrast path (when it is on) and the a/b coefficient. The panel's own
+ * strength is chro and its contrast-modulation sigma is sigmacol.
+ */
+void wavelet_chroma_params(rtengine::procparams::ProcParams& params,
+                           int levels, const int* contrast, int chro,
+                           double sigmacol, double skinprotect,
+                           bool expcontrast, bool expchroma)
+{
+    wavelet_contrast_params(params, levels, false, contrast, 1.0, 1.0, 100);
+    params.wavelet.expcontrast = expcontrast;
+    params.wavelet.expchroma = expchroma;
+    params.wavelet.CHmethod = "link";
+    params.wavelet.chro = chro;
+    params.wavelet.sigmacol = sigmacol;
+    params.wavelet.skinprotect = skinprotect;
+}
+
+void test_lab_wavelet_chroma(bool available)
+{
+    using namespace rtengine::stage;
+
+    static MyMutex chroma_lcms_mutex;
+    if (rtengine::lcmsMutex == nullptr) {
+        rtengine::lcmsMutex = &chroma_lcms_mutex;
+    }
+    static rtengine::Settings chroma_settings{};
+    rtengine::settings = &chroma_settings;
+    rtengine::Color::init();
+
+    const std::string profile_path =
+        std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp") +
+        "/stage-residency-lab-wavelet-chroma.jsonl";
+
+    if (!available) {
+        skip("lab.wavelet chroma: no OpenCL device");
+        return;
+    }
+    check(node_has_device_implementation("lab.wavelet"),
+          "the lab.wavelet node has a device implementation");
+
+    struct ChromaCase {
+        const char* label;
+        int width;
+        int height;
+        int levels;
+        int contrast[9];
+        int chro;
+        double sigmacol;
+        double skinprotect;
+        bool expcontrast;
+        bool equalizer;
+        int image; /* 0 random, 1 skin, 2 saturated hue circle */
+    };
+
+    const ChromaCase cases[] = {
+        {"chroma alone levels 6", 238, 64, 6,
+         {40, 30, 20, 10, 5, 2, 0, 0, 0}, 60, 1.0, 0.0, false, false, 0},
+        {"chroma alone levels 3", 179, 48, 3,
+         {40, 20, 10, 0, 0, 0, 0, 0, 0}, 80, 1.0, 0.0, false, false, 0},
+        {"chroma strength 100", 238, 64, 6,
+         {30, 22, 14, 8, 4, 2, 0, 0, 0}, 100, 1.0, 0.0, false, false, 0},
+        {"chroma sigma 0.5", 238, 64, 6,
+         {30, 22, 14, 8, 4, 2, 0, 0, 0}, 70, 0.5, 0.0, false, false, 0},
+        {"chroma with contrast", 238, 64, 6,
+         {30, 22, 14, 8, 4, 2, 0, 0, 0}, 50, 1.0, 0.0, true, false, 0},
+        {"chroma equalizer", 238, 64, 6,
+         {30, 22, 14, 8, 4, 2, 0, 0, 0}, 60, 1.0, 0.0, false, true, 1},
+        {"chroma skin positive", 238, 64, 6,
+         {30, 22, 14, 8, 4, 2, 0, 0, 0}, 60, 1.0, 60.0, false, false, 1},
+        {"chroma skin negative", 238, 64, 6,
+         {30, 22, 14, 8, 4, 2, 0, 0, 0}, 60, 1.0, -60.0, false, false, 1},
+        {"chroma equalizer skin", 238, 64, 6,
+         {30, 22, 14, 8, 4, 2, 0, 0, 0}, 60, 1.0, 60.0, false, true, 1},
+        {"chroma saturated hue", 238, 64, 6,
+         {30, 22, 14, 8, 4, 2, 0, 0, 0}, 70, 1.0, 40.0, false, false, 2},
+        {"chroma padded 179", 179, 49, 5,
+         {40, 30, 20, 10, 4, 0, 0, 0, 0}, 60, 1.0, 40.0, false, false, 1},
+        {"chroma levels 7", 179, 160, 7,
+         {40, 30, 20, 10, 5, 3, 2, 0, 0}, 60, 1.0, 0.0, false, false, 0},
+    };
+
+    unsigned seed = 0x2f7c1a93u;
+    for (const ChromaCase& item : cases) {
+        rtengine::procparams::ProcParams params;
+        wavelet_chroma_params(params, item.levels, item.contrast, item.chro,
+                              item.sigmacol, item.skinprotect,
+                              item.expcontrast, true);
+        if (item.equalizer) {
+            params.dirpyrequalizer.enabled = true;
+            params.dirpyrequalizer.cbdlMethod = "aft";
+            params.dirpyrequalizer.mult[0] = 1.4;
+            params.dirpyrequalizer.threshold = 0.2;
+        }
+
+        LabImage source(item.width, item.height);
+        if (item.image == 1) {
+            fill_lab_wavelet_skin(source);
+        } else if (item.image == 2) {
+            fill_lab_curve_saturated(source);
+        } else {
+            fill_lab_tools(source, seed++);
+        }
+
+        check(labWaveletSupported(params, item.width, item.height),
+              (std::string("lab.wavelet chroma ") + item.label +
+               " is the supported set").c_str());
+
+        rtengine::ImProcFunctions cpu_ipf(&params, false);
+        LabImage cpu(item.width, item.height);
+        cpu.CopyFrom(&source);
+        labWaveletHostBlock(cpu_ipf, params, cpu);
+
+        rtengine::ImProcFunctions device_ipf(&params, false);
+        LabImage device(item.width, item.height);
+        device.CopyFrom(&source);
+        const LabWaveletRun result =
+            run_lab_wavelet_node(device, params, device_ipf, profile_path);
+        const std::string profile = read_file(profile_path);
+
+        check(result.supported,
+              (std::string("lab.wavelet chroma ") + item.label +
+               " resolves to the supported set").c_str());
+        check(result.deviceReady,
+              (std::string("lab.wavelet chroma ") + item.label +
+               " builds its host setup").c_str());
+        check(result.status == RT_STAGE_OK,
+              (std::string("lab.wavelet chroma ") + item.label +
+               " completes through run()").c_str());
+        check(profile.find("\"stage\":\"lab.wavelet\"") != std::string::npos,
+              (std::string("lab.wavelet chroma ") + item.label +
+               " records the node").c_str());
+        check(profile.find("\"impl\":\"opencl\"") != std::string::npos,
+              (std::string("lab.wavelet chroma ") + item.label +
+               " records a device execution").c_str());
+
+        const Distribution d = distribution(view(device), view(cpu));
+        std::printf("stage-residency: lab.wavelet chroma %s %dx%d L%d: "
+                    "PAE %.6f LSB16; exact %zu, <=0.25 %zu, <=0.5 %zu, "
+                    "<=1 %zu, >1 %zu of %zu\n",
+                    item.label, item.width, item.height, item.levels,
+                    d.max_abs, d.exact, d.quarter, d.half, d.one, d.over,
+                    d.samples);
+        check(d.finite,
+              (std::string("lab.wavelet chroma ") + item.label +
+               " stays finite").c_str());
+        check(d.over == 0,
+              (std::string("lab.wavelet chroma ") + item.label +
+               " is within one LSB16").c_str());
+
+        /*
+         * Non-vacuity: with the chroma panel off and everything else equal,
+         * the host block's a/b pass must change the image, otherwise the
+         * parity above compares a no-op.
+         */
+        rtengine::procparams::ProcParams off = params;
+        off.wavelet.expchroma = false;
+        off.wavelet.skinprotect = 0.0;
+        rtengine::ImProcFunctions off_ipf(&off, false);
+        LabImage off_image(item.width, item.height);
+        off_image.CopyFrom(&source);
+        labWaveletHostBlock(off_ipf, off, off_image);
+        const Diff active = compare(view(cpu), view(off_image));
+        std::printf("stage-residency: lab.wavelet chroma %s changes %zu of "
+                    "%zu samples against the panel-off result, PAE %.6f "
+                    "LSB16\n",
+                    item.label, active.differing, active.samples,
+                    active.max_abs);
+        check(active.differing > 0,
+              (std::string("lab.wavelet chroma ") + item.label +
+               " is non-vacuous").c_str());
+    }
+
+    /*
+     * Refusals: the unported CHmethod arms, sliders outside their GUI range,
+     * a non-identity H curve, chroma mixed with the unported L skin
+     * protection, a chroma-only profile with no strength and another enabled
+     * panel must all run the host block byte for byte.
+     */
+    const char* residual_labels[] = {
+        "CHmethod without", "CHmethod with", "chro range", "sigmacol range",
+        "skin range", "hhcurve", "contrast and skin", "chroma only no "
+        "strength", "edge panel"};
+    for (const char* label : residual_labels) {
+        rtengine::procparams::ProcParams params;
+        const int contrast[9] = {30, 22, 14, 8, 4, 2, 0, 0, 0};
+        wavelet_chroma_params(params, 6, contrast, 60, 1.0, 0.0, false,
+                              true);
+
+        if (std::strcmp(label, "CHmethod without") == 0) {
+            params.wavelet.CHmethod = "without";
+        } else if (std::strcmp(label, "CHmethod with") == 0) {
+            params.wavelet.CHmethod = "with";
+        } else if (std::strcmp(label, "chro range") == 0) {
+            params.wavelet.chro = 101;
+        } else if (std::strcmp(label, "sigmacol range") == 0) {
+            params.wavelet.sigmacol = 3.0;
+        } else if (std::strcmp(label, "skin range") == 0) {
+            params.wavelet.skinprotect = 200.0;
+        } else if (std::strcmp(label, "hhcurve") == 0) {
+            params.wavelet.hhcurve = {1.0, 0.0, 0.5, 0.35, 0.35, 0.5, 0.2,
+                                      0.35, 0.35, 1.0, 0.5, 0.35, 0.35};
+        } else if (std::strcmp(label, "contrast and skin") == 0) {
+            params.wavelet.expcontrast = true;
+            params.wavelet.skinprotect = 30.0;
+        } else if (std::strcmp(label,
+                                "chroma only no strength") == 0) {
+            params.wavelet.chro = 0;
+        } else {
+            params.wavelet.expedge = true;
+        }
+
+        check(!labWaveletSupported(params, 238, 64),
+              (std::string("lab.wavelet chroma residual ") + label +
+               " is a residual").c_str());
+
+        LabImage source(238, 64);
+        fill_lab_wavelet_skin(source);
+
+        rtengine::ImProcFunctions cpu_ipf(&params, false);
+        LabImage cpu(238, 64);
+        cpu.CopyFrom(&source);
+        labWaveletHostBlock(cpu_ipf, params, cpu);
+
+        rtengine::ImProcFunctions device_ipf(&params, false);
+        LabImage device(238, 64);
+        device.CopyFrom(&source);
+        const LabWaveletRun result =
+            run_lab_wavelet_node(device, params, device_ipf, profile_path);
+        const std::string profile = read_file(profile_path);
+
+        check(!result.supported,
+              (std::string("lab.wavelet chroma residual ") + label +
+               " is refused as a device configuration").c_str());
+        check(!result.deviceReady,
+              (std::string("lab.wavelet chroma residual ") + label +
+               " does not build a device setup").c_str());
+        check(result.status == RT_STAGE_OK,
+              (std::string("lab.wavelet chroma residual ") + label +
+               " completes through run()").c_str());
+        check(profile.find("\"impl\":\"host\"") != std::string::npos,
+              (std::string("lab.wavelet chroma residual ") + label +
+               " records a host execution").c_str());
+        check(profile.find("\"impl\":\"opencl\"") == std::string::npos,
+              (std::string("lab.wavelet chroma residual ") + label +
+               " never mixes a device pass").c_str());
+
+        const Diff diff = compare(view(device), view(cpu));
+        std::printf("stage-residency: lab.wavelet chroma residual %s: host, "
+                    "PAE %.6f LSB16, %zu of %zu samples differ\n",
+                    label, diff.max_abs, diff.differing, diff.samples);
+        check(diff.finite,
+              (std::string("lab.wavelet chroma residual ") + label +
+               " stays finite").c_str());
+        check(diff.differing == 0 && diff.max_abs == 0.0,
+              (std::string("lab.wavelet chroma residual ") + label +
+               " matches the CPU block").c_str());
+    }
+}
+
 /* A GPU device must never run the equaliser; it records a host execution. */
 void test_lab_wavelet_gpu(bool available)
 {
@@ -12328,6 +12591,7 @@ int main()
     test_local_adjustments(available);
     test_lab_wavelet(available);
     test_lab_wavelet_contrast(available);
+    test_lab_wavelet_chroma(available);
     test_lab_wavelet_gpu(available);
     test_output_sharpen(available);
     test_lab_sharpening(available);

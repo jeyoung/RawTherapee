@@ -279,6 +279,8 @@ quick() {
         "$ROOT/devnotes/opencl/pp3/labwavelet.pp3" lab.wavelet cpu
     run_stage_device "pef/stage-device-lab-wavelet-contrast" \
         "$ROOT/devnotes/opencl/pp3/labwavelet-contrast.pp3" lab.wavelet cpu
+    run_stage_device "pef/stage-device-lab-wavelet-chroma" \
+        "$ROOT/devnotes/opencl/pp3/labwavelet-chroma.pp3" lab.wavelet cpu
     run_stage_device "pef/stage-device-local-adjustments" \
         "$ROOT/devnotes/opencl/pp3/localadjustments.pp3" local.adjustments cpu
     run_stage_device "pef/stage-device-local-adjustments-multispot" \
@@ -640,6 +642,8 @@ stage_device() {
         "$ROOT/devnotes/opencl/pp3/labwavelet.pp3" lab.wavelet cpu
     run_stage_device "pef/stage-device-lab-wavelet-contrast" \
         "$ROOT/devnotes/opencl/pp3/labwavelet-contrast.pp3" lab.wavelet cpu
+    run_stage_device "pef/stage-device-lab-wavelet-chroma" \
+        "$ROOT/devnotes/opencl/pp3/labwavelet-chroma.pp3" lab.wavelet cpu
     run_stage_device "pef/stage-device-local-adjustments" \
         "$ROOT/devnotes/opencl/pp3/localadjustments.pp3" local.adjustments cpu
     run_stage_device "pef/stage-device-local-adjustments-multispot" \
