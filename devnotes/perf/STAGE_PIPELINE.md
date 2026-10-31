@@ -243,7 +243,10 @@ gate, strength, Thrend or `c[]`, an all-neutral pyramid, a non-identity
 closed CIE-CAM gate, an image too narrow or too small for its pyramid or Haar
 bands, a GPU or non-fp64 device and nothing enabled at all are residuals:
 each runs the `lab.wavelet` host builtin and records `impl=host`, never a
-device pass.
+device pass. The edge, blur, residual, final, toning, noise and clarity panels
+are refused before any upload, as are the balance-chroma arm (`TMr` with a
+`BAmethod` other than `none`) and the soft radius, so a profile that enables
+any of them runs the whole block on the host.
 
 `lab.sharpening` is partial. Its impulse-denoise and defringe pair is a device
 node of its own, admitted only in the Lab arm (not the CIE-CAM pipeline) with
