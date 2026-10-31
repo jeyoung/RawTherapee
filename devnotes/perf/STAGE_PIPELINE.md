@@ -171,10 +171,13 @@ Munsell methods (they need `gamutLchonly()` and `gamutmap()`), a denoise
 chroma factor, a local contrast outside the ABI range, a local contrast below
 sigma 25 on a host built without SSE2, EPD, black-and-white output with the
 Lab curves or with colour toning (the full `bwToning` arm, or the block past
-its early return), a colour-toning method other than `LabGrid` and the bounded
-`LabRegions` set, a profile where no device tool would run, and an RGB-mode
+its early return), a `LabRegions` profile outside the bounded set, a profile
+where no device tool would run, and an RGB-mode
 tone table whose steepest step can turn the closing round trip's one-ulp
-channel difference into more than one LSB16. A
+channel difference into more than one LSB16. A colour-toning method other
+than `LabGrid`/`LabRegions` (Splitco, Splitlr, RGBSliders and the rest) does
+not refuse the node: `rgbProc()` applies it before the Lab block, so the
+block's own work is identical with and without it. A
 residual runs the `lab.tools` host builtin and records `impl=host`, never a
 device pass.
 
