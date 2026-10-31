@@ -4548,7 +4548,7 @@ LabToolsRun run_lab_tools_node(LabImage& image,
     result.deviceReady = deviceReady;
     RtLabToolsContext descriptor = context.descriptor(deviceReady);
 
-    RtStageArg args[69] = {};
+    RtStageArg args[70] = {};
     args[0].kind = RT_STAGE_ARG_BUFFER;
     args[0].u.buffer = view(image);
     args[1].kind = RT_STAGE_ARG_PTR;
@@ -4663,6 +4663,8 @@ LabToolsRun run_lab_tools_node(LabImage& image,
     args[67].u.ptr = deviceReady ? setup.ws_double : nullptr;
     args[68].kind = RT_STAGE_ARG_PTR;
     args[68].u.ptr = deviceReady ? setup.iws_double : nullptr;
+    args[69].kind = RT_STAGE_ARG_INT;
+    args[69].u.i = deviceReady ? setup.black_white : 0;
 
     for (int index = 16; index < 22; ++index) {
         args[index].kind = RT_STAGE_ARG_BUFFER;
@@ -4745,7 +4747,7 @@ LabToolsRun run_lab_tools_node(LabImage& image,
     setenv("RT_STAGE_PROFILE", profile_path.c_str(), 1);
     set_node_device_override("lab.tools", StageNodeDevice::OpenCL);
     result.status =
-        run("lab.tools", std::vector<RtStageArg>(args, args + 69));
+        run("lab.tools", std::vector<RtStageArg>(args, args + 70));
     clear_node_device_overrides();
     unsetenv("RT_STAGE_PROFILE");
     return result;
@@ -4887,6 +4889,233 @@ void test_lab_tools(bool available)
     }
 
     /*
+     * Black and white: chromiLuminanceCurve()'s early return zeroes a and b
+     * when the Lab curves and colour toning are off. The node repeats it in
+     * the Lab-curve pass's slot, so the other admitted tools still run in
+     * their own positions and see the grey image. The zeroing is exact, so a
+     * B&W-only profile must leave L bit-identical to the block.
+     *
+     * Black and white with colour toning or with the Lab curves takes neither
+     * the early return nor the cheap zeroing, so those profiles are refusals:
+     * the builtin runs the block and the result must match it exactly.
+     */
+    struct BwCase {
+        const char* label;
+        bool labgrid;
+        bool shadowsHighlights;
+        bool localContrast;
+        bool vibrance;
+        bool regions;
+        bool admitted;
+    };
+    const BwCase bw_cases[] = {
+        {"black and white only", false, false, false, false, false, true},
+        {"black and white + shadows/highlights", false, true, false, false,
+         false, true},
+        {"black and white + local contrast", false, false, true, false, false,
+         true},
+        {"black and white + vibrance", false, false, false, true, false, true},
+        {"black and white + shadows/highlights + local contrast + vibrance",
+         false, true, true, true, false, true},
+        {"black and white + LabGrid", true, false, false, false, false, false},
+        {"black and white + Lab regions", false, false, false, false, true,
+         false},
+        {"black and white + LabGrid + Lab regions", true, false, false, false,
+         true, false},
+    };
+
+    const auto bw_params = [](const BwCase& item, bool enabled) {
+        rtengine::procparams::ProcParams params;
+        params.blackwhite.enabled = enabled;
+        if (item.labgrid) {
+            params.colorToning.enabled = true;
+            params.colorToning.method = "LabGrid";
+            params.colorToning.labgridALow = -40.0;
+            params.colorToning.labgridAHigh = 25.0;
+            params.colorToning.labgridBLow = 12.0;
+            params.colorToning.labgridBHigh = 55.0;
+        }
+        if (item.shadowsHighlights) {
+            params.sh.enabled = true;
+            params.sh.lab = true;
+            params.sh.highlights = 60;
+            params.sh.shadows = 60;
+            params.sh.htonalwidth = 40;
+            params.sh.stonalwidth = 40;
+            params.sh.radius = 10;
+        }
+        if (item.localContrast) {
+            params.localContrast.enabled = true;
+            params.localContrast.radius = 20;
+            params.localContrast.amount = 0.3;
+            params.localContrast.darkness = 0.9;
+            params.localContrast.lightness = 1.1;
+        }
+        if (item.vibrance) {
+            params.vibrance.enabled = true;
+            params.vibrance.pastels = 50;
+            params.vibrance.saturated = 30;
+        }
+        if (item.regions) {
+            params.colorToning.enabled = true;
+            params.colorToning.method = "LabRegions";
+            rtengine::procparams::ColorToningParams::LabCorrectionRegion
+                region;
+            region.a = 10.0;
+            region.b = -8.0;
+            region.saturation = 30.0;
+            region.slope = 1.0;
+            region.offset = 0.0;
+            region.power = 1.0;
+            region.maskBlur = 0.4;
+            region.channel = rtengine::procparams::ColorToningParams::
+                LabCorrectionRegion::CHAN_ALL;
+            params.colorToning.labregions.push_back(region);
+        }
+        return params;
+    };
+
+    const auto chroma_max = [](const LabImage& image) {
+        double worst = 0.0;
+        for (int y = 0; y < image.H; ++y) {
+            for (int x = 0; x < image.W; ++x) {
+                worst = std::max(
+                    worst,
+                    std::abs(static_cast<double>(image.a[y][x])));
+                worst = std::max(
+                    worst,
+                    std::abs(static_cast<double>(image.b[y][x])));
+            }
+        }
+        return worst;
+    };
+
+    for (const BwCase& item : bw_cases) {
+        const rtengine::procparams::ProcParams params = bw_params(item, true);
+
+        check(labToolsSupported(params) == item.admitted,
+              (std::string("lab.tools ") + item.label +
+               (item.admitted ? " is the supported set"
+                              : " is refused as a device configuration"))
+                  .c_str());
+
+        LabImage source(179, 48);
+        fill_lab_tools(source, seed++);
+
+        rtengine::ImProcFunctions cpu_ipf(&params, false);
+        LabToolsHostState cpu_host;
+        LabImage cpu(179, 48);
+        cpu.CopyFrom(&source);
+        LabToolsLuts cpu_luts = cpu_host.luts();
+        labToolsHostBlock(cpu_ipf, params, cpu, cpu_luts, cpu_host.autili,
+                          cpu_host.butili);
+
+        rtengine::ImProcFunctions device_ipf(&params, false);
+        LabToolsHostState device_host;
+        LabImage device(179, 48);
+        device.CopyFrom(&source);
+        const LabToolsRun result =
+            run_lab_tools_node(device, params, device_host, device_ipf,
+                               profile_path);
+        const std::string profile = read_file(profile_path);
+
+        check(result.supported == item.admitted,
+              (std::string("lab.tools ") + item.label +
+               (item.admitted ? " resolves to the supported set"
+                              : " is refused by the node"))
+                  .c_str());
+        check(result.deviceReady == item.admitted,
+              (std::string("lab.tools ") + item.label +
+               (item.admitted ? " builds its host setup"
+                              : " does not build a device setup"))
+                  .c_str());
+        check(result.status == RT_STAGE_OK,
+              (std::string("lab.tools ") + item.label +
+               " completes through run()").c_str());
+        check(profile.find("\"stage\":\"lab.tools\"") != std::string::npos,
+              (std::string("lab.tools ") + item.label +
+               " records the node").c_str());
+        if (item.admitted) {
+            check(profile.find("\"impl\":\"opencl\"") != std::string::npos,
+                  (std::string("lab.tools ") + item.label +
+                   " records a device execution").c_str());
+        } else {
+            check(profile.find("\"impl\":\"host\"") != std::string::npos &&
+                      profile.find("\"impl\":\"opencl\"") ==
+                          std::string::npos,
+                  (std::string("lab.tools ") + item.label +
+                   " records a host execution only").c_str());
+        }
+
+        const Diff diff = compare(view(device), view(cpu));
+        std::printf("stage-residency: lab.tools %s %dx%d: PAE %.6f LSB16, "
+                    "%zu of %zu samples differ\n",
+                    item.label, 179, 48, diff.max_abs, diff.differing,
+                    diff.samples);
+        check(diff.finite,
+              (std::string("lab.tools ") + item.label +
+               " stays finite").c_str());
+        if (item.admitted) {
+            check(diff.max_abs <= 1.0,
+                  (std::string("lab.tools ") + item.label +
+                   " is within one LSB16").c_str());
+        } else {
+            check(diff.differing == 0 && diff.max_abs == 0.0,
+                  (std::string("lab.tools ") + item.label +
+                   " matches the CPU block exactly").c_str());
+        }
+
+        const double host_chroma = chroma_max(cpu);
+        const double device_chroma = chroma_max(device);
+        if (host_chroma == 0.0) {
+            check(device_chroma == 0.0,
+                  (std::string("lab.tools ") + item.label +
+                   " leaves a and b at exactly zero").c_str());
+            std::printf("stage-residency: lab.tools %s: a/b are exactly 0 "
+                        "on both sides\n",
+                        item.label);
+        } else {
+            std::printf("stage-residency: lab.tools %s: the host block "
+                        "reintroduces chroma (max %.6f); the device chroma "
+                        "is %.6f\n",
+                        item.label, host_chroma, device_chroma);
+        }
+
+        if (std::strcmp(item.label, "black and white only") == 0) {
+            check(diff.differing == 0 && diff.max_abs == 0.0,
+                  "lab.tools black and white only leaves L bit-identical");
+        }
+
+        /*
+         * Non-vacuity: the combined admitted profile with black and white off
+         * must differ from the grey result, so a no-op zeroing cannot pass.
+         */
+        if (std::strcmp(item.label,
+                        "black and white + shadows/highlights + local "
+                        "contrast + vibrance") == 0) {
+            const rtengine::procparams::ProcParams colour_params =
+                bw_params(item, false);
+            rtengine::ImProcFunctions colour_ipf(&colour_params, false);
+            LabToolsHostState colour_host;
+            LabImage colour(179, 48);
+            colour.CopyFrom(&source);
+            const LabToolsRun colour_result = run_lab_tools_node(
+                colour, colour_params, colour_host, colour_ipf, profile_path);
+            check(colour_result.status == RT_STAGE_OK,
+                  "lab.tools combined tools without black and white "
+                  "completes");
+            const Diff diff_colour = compare(view(colour), view(device));
+            std::printf("stage-residency: lab.tools combined tools without "
+                        "black and white: PAE %.6f LSB16, %zu of %zu samples "
+                        "differ from the grey result\n",
+                        diff_colour.max_abs, diff_colour.differing,
+                        diff_colour.samples);
+            check(diff_colour.differing > 0,
+                  "lab.tools black and white changes the combined result");
+        }
+    }
+
+    /*
      * Residuals: an otherwise supported profile plus one tool the node does
      * not implement. The launcher must refuse it, the builtin must run the
      * block, and the result must be the block's own output.
@@ -4894,7 +5123,8 @@ void test_lab_tools(bool available)
     const char* residual_labels[] = {
         "vibrance + Lab contrast", "vibrance + local contrast out of range",
         "vibrance + EPD", "vibrance + Lab regions show mask",
-        "vibrance + black and white", "vibrance no-op",
+        "black and white + colour toning",
+        "black and white + Lab curve", "vibrance no-op",
         "vibrance pastels out of range"};
     for (const char* label : residual_labels) {
         rtengine::procparams::ProcParams params;
@@ -4950,8 +5180,15 @@ void test_lab_tools(bool available)
             region.channel = rtengine::procparams::ColorToningParams::
                 LabCorrectionRegion::CHAN_ALL;
             params.colorToning.labregions.push_back(region);
-        } else {
+        } else if (std::strcmp(label, "black and white + colour toning") == 0) {
             params.blackwhite.enabled = true;
+            params.colorToning.enabled = true;
+            params.colorToning.method = "LabGrid";
+        } else if (std::strcmp(label, "black and white + Lab curve") == 0) {
+            params.blackwhite.enabled = true;
+            params.labCurve.enabled = true;
+        } else {
+            check(false, label);
         }
 
         check(!labToolsSupported(params),
@@ -5106,7 +5343,7 @@ void test_lab_tools(bool available)
         check(context.build(setup) == 0, "forced fallback setup builds");
         RtLabToolsContext descriptor = context.descriptor(true);
 
-        RtStageArg args[69] = {};
+        RtStageArg args[70] = {};
         args[0].kind = RT_STAGE_ARG_BUFFER;
         args[0].u.buffer = view(device);
         args[1].kind = RT_STAGE_ARG_PTR;
@@ -5186,6 +5423,9 @@ void test_lab_tools(bool available)
         args[66].kind = RT_STAGE_ARG_BUFFER;
         args[67].kind = RT_STAGE_ARG_PTR;
         args[68].kind = RT_STAGE_ARG_PTR;
+        args[68].u.ptr = setup.iws_double;
+        args[69].kind = RT_STAGE_ARG_INT;
+        args[69].u.i = setup.black_white;
         args[59].u.f = 1.0;
         args[60].u.f = 1.0;
         args[61].u.i = LAB_TOOLS_EXPORT_SCALE;
@@ -5205,7 +5445,7 @@ void test_lab_tools(bool available)
         setenv("RT_STAGE_PROFILE", profile_path.c_str(), 1);
         set_node_device_override("lab.tools", StageNodeDevice::OpenCL);
         const RtStageStatus status =
-            run("lab.tools", std::vector<RtStageArg>(args, args + 69));
+            run("lab.tools", std::vector<RtStageArg>(args, args + 70));
         clear_node_device_overrides();
         const std::string profile = read_file(profile_path);
         unsetenv("RT_STAGE_PROFILE");
