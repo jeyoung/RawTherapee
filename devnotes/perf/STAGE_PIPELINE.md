@@ -211,26 +211,35 @@ device pass.
 
 `lab.wavelet` is partial: the directional pyramid equaliser runs on the
 device when it is enabled in after-CBDL position (`cbdlMethod == "aft"`) and
-the CIE-CAM gate admits the pass, and the wavelet tool's contrast-only path
-runs on the device when `Expcontrast` is set with every other panel clear.
-Either pass may run alone, so the node no longer requires
+the CIE-CAM gate admits the pass, and the wavelet tool runs on the device for
+the contrast panel and the chroma panel's `CHmethod == "link"` arm. Either
+pass may run alone, so the node no longer requires
 `dirpyrequalizer.enabled` when only the wavelet runs. The host builds the
 equaliser's per-level range tables through its own `fillLut()` and the
 hue/chroma masks through its own SSE-aware precompute, and exports the
 `badpixels` protection as a host pre-pass when `gamutlab` and `skinprotect`
 are both set. The wavelet host builds the level count (including the
 unconditional `Thrend` restore of the trailing-zero trim), the
-`c[]`/threshold/sigma/offset/strength/corner scalar table and the 8-tap
-analysis and synthesis filters, and fills each level's `mea` through the
-block's own `calceffect()` after the device statistics read back. The kernels port `dirpyr_channel()`,
+`c[]`/threshold/sigma/offset/strength/corner scalar table, the chroma arm's
+`chro`, `sigmacol` and `Expcontrast`/`Expchroma` scalars, the wavelet tool's
+own skin corners and the 8-tap analysis and synthesis filters, and fills each
+plane's and level's `mea` through the block's own `calceffect()` after the
+device statistics read back. The kernels port `dirpyr_channel()`,
 `idirpyr_eq_channel()`/`Color::SkinSatCbdl()`, the decimated 8-tap Daubechies
 and undecimated Haar transform, the single-thread ascending double statistics,
-`ContAllL()`'s `lbeta`/`alpha`/highlight-shadow ramp, the strength blend and
-the final clamp. It is admitted only on a CPU OpenCL device, and the wavelet
-pass also needs fp64. An enabled wavelet panel other than contrast,
-`cbdlMethod == "bef"`, an out-of-range multiplier, threshold, skin, hue,
-sigma, offset, lowthr, gate, strength, Thrend or `c[]`, an all-neutral
-pyramid, a
+`ContAllL()`'s `lbeta`/`alpha`/highlight-shadow ramp, `ContAllAB()`'s
+`CHmet == 2` coefficient (`alphaC` over the same `betaab` ramp, with its own
+`sigmacol`/offset-1 `mea`, positive and negative skin protection and the
+post-L-reconstruction L plane), the strength blend and the final L clamp. The
+chroma arm reuses the equaliser's hue/chroma masks: the equaliser changes only
+L, so a/b are identical at the start of both passes. The L clamp is deferred
+until the chroma pass finishes, as in the block. It is admitted only on a CPU
+OpenCL device, and the wavelet pass also needs fp64. `CHmethod` `without` and
+`with` (the curve and saturation arms), `Expchroma` with a contrast panel that
+also asks for L skin protection, `cbdlMethod == "bef"`, an out-of-range
+multiplier, threshold, skin, hue, `chro`, `sigmacol`, sigma, offset, lowthr,
+gate, strength, Thrend or `c[]`, an all-neutral pyramid, a non-identity
+`Chcurve` or `hhcurve`, a
 closed CIE-CAM gate, an image too narrow or too small for its pyramid or Haar
 bands, a GPU or non-fp64 device and nothing enabled at all are residuals:
 each runs the `lab.wavelet` host builtin and records `impl=host`, never a

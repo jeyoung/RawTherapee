@@ -74,6 +74,10 @@ pairs are exact. The gate is the peak absolute error (PAE) in normalised units;
 | 2026-10-31 | uncommitted | POCL (CPU) | 11-case lab.tools hue flat-curve matrix (chromaticity -100 ignoring the curves, 0, 50 with red/skin protection and 100; C=f(H), L=f(H), H=f(H) alone; all three with the slider; with a/b tables; with vibrance and shadows/highlights; B&W + L=f(H)), `stage-residency-test` | device vs host block | 0.023438 LSB16 (worst) | PASS |
 | 2026-10-31 | uncommitted | POCL (CPU) | lab.tools hue-family non-vacuity and residuals: same profile with the family off changes the image; a 40 000-point dense C=f(H) is refused for table fidelity and runs the block | non-vacuity PAE 12 400-52 610 LSB16; refusal 0 (host) | PASS |
 
+| 2026-10-31 | 5bb35d3ce | POCL (CPU) | colorspace_flowers.pef / `labwavelet-chroma.pp3` (contrast + chroma `link`), `lab.wavelet` | off vs auto, 16-bit TIFF | 1 LSB | PASS |
+| 2026-10-31 | 5bb35d3ce | POCL (CPU) | 12-case chroma matrix (alone at 6/3/7 levels, strength 100, sigmacol 0.5, with contrast, with the equaliser, positive and negative skin, equaliser plus skin, saturated hue, 179x49 padded), `stage-residency-test` | device vs host block | 0 (exact, a/b exact) | PASS |
+| 2026-10-31 | 5bb35d3ce | POCL (CPU) | 9-case chroma residual matrix (CHmethod without/with, chro/sigmacol/skin ranges, non-identity hhcurve, contrast+skin, chroma-only without strength, edge panel), `stage-residency-test` | device vs host block | 0 (host) | PASS |
+
 `47c50ee77` changes only CPU export buffer handling; the OpenCL rows above
 re-run the existing GPU stages against the new CPU neighbour.
 `verify.sh --quick` also re-ran the monitor self-test: max 1 byte, 14 of
