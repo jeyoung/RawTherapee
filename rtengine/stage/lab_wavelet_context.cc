@@ -52,6 +52,12 @@ int compute_final_thunk(void* self, const float* stats, uint32_t levels)
                                                                    levels);
 }
 
+int compute_mad_thunk(void* self, const uint32_t* histogram, uint32_t levels)
+{
+    return static_cast<LabWaveletContext*>(self)->computeMad(histogram,
+                                                             levels);
+}
+
 /*
  * Copy one pitched three-plane F32 buffer into a LabImage, and back. The
  * buffer's planes may carry padding, so every row is copied by width.
@@ -136,6 +142,26 @@ int labWaveletLastLevel(const double* mult)
         --last;
     }
     return last;
+}
+
+float labWaveletMadFromHistogram(const std::uint32_t* histogram,
+                                 std::uint32_t samples)
+{
+    if (histogram == nullptr || samples <= 1) {
+        return 0.f;
+    }
+    const std::uint32_t half = samples / 2;
+    std::uint32_t count = 0;
+    int median = 0;
+    while (count < half) {
+        count += histogram[median];
+        ++median;
+    }
+    const std::uint32_t previous = count - histogram[median - 1];
+    return ((static_cast<float>(median - 1) +
+             static_cast<float>(half - previous) /
+                 static_cast<float>(count - previous)) /
+            0.6745f);
 }
 
 /*
@@ -798,6 +824,8 @@ RtLabWaveletContext LabWaveletContext::descriptor(bool supported)
     context.wavelet.planes = wavelet_ab_ ? 3u : 1u;
     context.wavelet.final = wavelet_final_ ? 1u : 0u;
     context.wavelet.toning = wavelet_toning_ ? 1u : 0u;
+    context.wavelet.denoise = wavelet_denoise_ ? 1u : 0u;
+    context.wavelet.compute_mad = &compute_mad_thunk;
     context.wavelet.entries = static_cast<uint32_t>(
         wavelet_params_.size());
     context.wavelet.params =
@@ -900,6 +928,8 @@ int LabWaveletContext::build(RtLabWaveletResult& out)
      */
     wavelet_ab_ = wavelet_chroma_ || wavelet_edge_ || wavelet_final_ ||
                   wavelet_toning_;
+    /* The standard-L denoise arm is armed by the next groundwork step. */
+    wavelet_denoise_ = false;
 
     if (levels_ > 0) {
         if (width_ < 8 || height_ < 8) {
@@ -964,7 +994,7 @@ int LabWaveletContext::build(RtLabWaveletResult& out)
             labWaveletParamEntries(static_cast<std::uint32_t>(planes),
                                    static_cast<std::uint32_t>(wavelet_levels_),
                                    wavelet_edge_, wavelet_final_,
-                                   wavelet_toning_),
+                                   wavelet_toning_, wavelet_denoise_),
             0.f);
 
         float* table = wavelet_params_.data();
@@ -1348,6 +1378,56 @@ int LabWaveletContext::computeFinalStats(const float* stats, uint32_t levels)
         entry[0] = maxL;
         entry[1] = averageL;
         entry[2] = sigL;
+    }
+    return 0;
+}
+
+int LabWaveletContext::computeMad(const std::uint32_t* histogram,
+                                  uint32_t levels)
+{
+    const uint32_t planes = wavelet_ab_ ? 3u : 1u;
+    if (!wavelet_active_ || !wavelet_denoise_ || histogram == nullptr ||
+        levels != static_cast<uint32_t>(wavelet_levels_) || levels < 1 ||
+        levels > RT_LAB_WAVELET_MAX_TRANSFORM_LEVELS) {
+        return 1;
+    }
+
+    const std::size_t denoise_offset =
+        RT_LAB_WAVELET_WAVELET_PARAMS +
+        static_cast<std::size_t>(planes) *
+            static_cast<std::size_t>(levels) *
+            RT_LAB_WAVELET_MEA_ENTRIES +
+        (wavelet_edge_
+             ? 1 + static_cast<std::size_t>(levels) *
+                       RT_LAB_WAVELET_EDGE_ENTRIES +
+                   RT_LAB_WAVELET_CURVE_ENTRIES
+             : 0) +
+        (wavelet_final_
+             ? 1 + static_cast<std::size_t>(levels) *
+                       RT_LAB_WAVELET_FINAL_STATS_ENTRIES +
+                   RT_LAB_WAVELET_CURVE_ENTRIES +
+                   RT_LAB_WAVELET_FINAL_LUT_ENTRIES
+             : 0) +
+        (wavelet_toning_
+             ? RT_LAB_WAVELET_TONING_HEADER +
+                   2 * static_cast<std::size_t>(levels) *
+                       RT_LAB_WAVELET_TONING_MEA_ENTRIES
+             : 0);
+    float* tail = wavelet_params_.data() + denoise_offset +
+                  RT_LAB_WAVELET_DENOISE_HEADER;
+    const std::uint32_t samples =
+        static_cast<std::uint32_t>(((width_ + 1) / 2) * ((height_ + 1) / 2));
+
+    for (uint32_t level = 0; level < levels; ++level) {
+        for (uint32_t dir = 0; dir < 3; ++dir) {
+            const std::uint32_t* band =
+                histogram +
+                (static_cast<std::size_t>(level) * 3 + dir) * 32768u;
+            const float mad = labWaveletMadFromHistogram(band, samples);
+            tail[static_cast<std::size_t>(level) *
+                     RT_LAB_WAVELET_DENOISE_MAD_ENTRIES +
+                 dir] = SQR(mad);
+        }
     }
     return 0;
 }

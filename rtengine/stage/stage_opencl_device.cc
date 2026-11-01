@@ -6019,6 +6019,7 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
     bool wavelet_edge = false;
     bool wavelet_final = false;
     bool wavelet_toning = false;
+    bool wavelet_denoise = false;
     bool wavelet_ab = false;
     const float* wavelet_params = nullptr;
     if (wavelet) {
@@ -6033,7 +6034,11 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
             (context->wavelet.final != 0 &&
              context->wavelet.compute_final == nullptr) ||
             (context->wavelet.toning != 0 &&
-             context->wavelet.toning != 1)) {
+             context->wavelet.toning != 1) ||
+            (context->wavelet.denoise != 0 &&
+             context->wavelet.denoise != 1) ||
+            (context->wavelet.denoise != 0 &&
+             context->wavelet.compute_mad == nullptr)) {
             error = "lab.wavelet wavelet pass is not set up";
             return RT_STAGE_FALLBACK;
         }
@@ -6070,6 +6075,7 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
         wavelet_edge = wavelet_params[RT_LW_PARAM_EDGEENA] != 0.0f;
         wavelet_final = context->wavelet.final != 0;
         wavelet_toning = context->wavelet.toning != 0;
+        wavelet_denoise = context->wavelet.denoise != 0;
         /* RT_LW_PARAM_CHROMA marks the presence of the a/b planes: the chroma
          * arm, the edge panel and the final curves all keep the block's a/b
          * round trip alive. */
@@ -6082,7 +6088,7 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
             static_cast<int>(labWaveletParamEntries(
                 static_cast<std::uint32_t>(wavelet_planes),
                 static_cast<std::uint32_t>(wavelet_levels), wavelet_edge,
-                wavelet_final, wavelet_toning))) {
+                wavelet_final, wavelet_toning, wavelet_denoise))) {
             error = "lab.wavelet parameter table has the wrong length";
             return RT_STAGE_INVALID;
         }

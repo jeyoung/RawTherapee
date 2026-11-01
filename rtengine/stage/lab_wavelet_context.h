@@ -58,7 +58,7 @@ struct ProcParams;
  * wavelet tool's own skin protection: the equaliser only changes L, so a/b
  * and their masks are identical at the start of both passes.
  */
-#define RT_LAB_WAVELET_CONTEXT_VERSION 5u
+#define RT_LAB_WAVELET_CONTEXT_VERSION 6u
 /* "LWCT": rejects a stale or unrelated pointer before any callback runs. */
 #define RT_LAB_WAVELET_CONTEXT_MAGIC 0x4C574354u
 /* The number of levels of the directional pyramid. */
@@ -164,6 +164,16 @@ struct ProcParams;
 #define RT_LAB_WAVELET_TONING_MULS 9u
 #define RT_LAB_WAVELET_TONING_HEADER 19u
 #define RT_LAB_WAVELET_TONING_MEA_ENTRIES 10u
+/*
+ * The denoise groundwork tail, present only when the standard-L denoise arm
+ * is armed:
+ *   [0..5] vari[0..5]
+ *   [6]    ballum
+ *   then levels * 3 squared madL entries, direction-major inside each level.
+ * The MAD histogram is a separate device buffer argument.
+ */
+#define RT_LAB_WAVELET_DENOISE_HEADER 7u
+#define RT_LAB_WAVELET_DENOISE_MAD_ENTRIES 3u
 
 /*
  * The exact length of the wavelet parameter table. Both the host builder and
@@ -172,7 +182,8 @@ struct ProcParams;
  */
 inline std::size_t labWaveletParamEntries(std::uint32_t planes,
                                           std::uint32_t levels, bool edge,
-                                          bool final_curves, bool toning)
+                                          bool final_curves, bool toning,
+                                          bool denoise)
 {
     std::size_t entries = RT_LAB_WAVELET_WAVELET_PARAMS +
                           static_cast<std::size_t>(planes) *
@@ -193,6 +204,11 @@ inline std::size_t labWaveletParamEntries(std::uint32_t planes,
         entries += RT_LAB_WAVELET_TONING_HEADER +
                    2 * static_cast<std::size_t>(levels) *
                        RT_LAB_WAVELET_TONING_MEA_ENTRIES;
+    }
+    if (denoise) {
+        entries += RT_LAB_WAVELET_DENOISE_HEADER +
+                   static_cast<std::size_t>(levels) *
+                       RT_LAB_WAVELET_DENOISE_MAD_ENTRIES;
     }
     return entries;
 }
@@ -251,6 +267,8 @@ typedef struct RtLabWaveletWavelet {
     uint32_t final;
     /* 1 when the toning tail is present in `params`. */
     uint32_t toning;
+    /* 1 when the denoise tail is present in `params`. */
+    uint32_t denoise;
     float* params;
     int (*compute_mea)(void* self, const float* stats, uint32_t levels,
                        uint32_t plane);
@@ -261,6 +279,11 @@ typedef struct RtLabWaveletWavelet {
      * build. Used only when `final` is set.
      */
     int (*compute_final)(void* self, const float* stats, uint32_t levels);
+    /*
+     * Fills the denoise tail's squared madL entries from one histogram per
+     * (level, direction), direction-major.
+     */
+    int (*compute_mad)(void* self, const uint32_t* histogram, uint32_t levels);
 } RtLabWaveletWavelet;
 
 typedef struct RtLabWaveletContext {
@@ -361,6 +384,13 @@ inline constexpr int LAB_WAVELET_EXPORT_SCALE = RT_LAB_WAVELET_EXPORT_SCALE;
 int labWaveletLastLevel(const double* mult);
 
 /*
+ * ImProcFunctions::Mad()'s median step over a 32768-bin histogram of
+ * truncated absolute coefficients. Exposed for the groundwork test.
+ */
+float labWaveletMadFromHistogram(const std::uint32_t* histogram,
+                                 std::uint32_t samples);
+
+/*
  * The number of transform levels ip_wavelet() actually builds for this image:
  * the MaxLev slider, trimmed by the image-size caps, the ContExtra level and
  * the trailing zero contrast multipliers. Zero means the block returns before
@@ -440,6 +470,9 @@ public:
     /* Fill the final-curve tail from the post-contrast statistics block. */
     int computeFinalStats(const float* stats, uint32_t levels);
 
+    /* Fill the denoise tail's squared madL entries from band histograms. */
+    int computeMad(const std::uint32_t* histogram, uint32_t levels);
+
 private:
     procparams::ProcParams& params_;
     ImProcFunctions& ipf_;
@@ -463,6 +496,7 @@ private:
     bool wavelet_edge_ = false;
     bool wavelet_final_ = false;
     bool wavelet_toning_ = false;
+    bool wavelet_denoise_ = false;
     bool wavelet_ab_ = false;
     int wavelet_levels_ = 0;
     float wavelet_skinprotect_ = 0.f;
