@@ -7787,7 +7787,7 @@ void test_lab_wavelet_contrast(bool available)
      */
     const char* residual_labels[] = {
         "expcontrast off", "expchroma on", "expedge on", "expbl on",
-        "expresid on", "expfinal on", "exptoning on", "expnoise on",
+        "expresid on", "exptoning on", "expnoise on",
         "expclari on", "CLmethod one", "Tilesmethod big", "softrad",
         "skinprotect", "avoid", "median", "sup", "daubcoeffmethod 4_",
         "HSmethod other", "Chcurve", "sigma range", "offset range",
@@ -7809,8 +7809,6 @@ void test_lab_wavelet_contrast(bool available)
             params.wavelet.expbl = true;
         } else if (std::strcmp(label, "expresid on") == 0) {
             params.wavelet.expresid = true;
-        } else if (std::strcmp(label, "expfinal on") == 0) {
-            params.wavelet.expfinal = true;
         } else if (std::strcmp(label, "exptoning on") == 0) {
             params.wavelet.exptoning = true;
         } else if (std::strcmp(label, "expnoise on") == 0) {
@@ -8563,6 +8561,357 @@ void test_lab_wavelet_edge(bool available)
                " stays finite").c_str());
         check(diff.differing == 0 && diff.max_abs == 0.0,
               (std::string("lab.wavelet edge residual ") + label +
+               " matches the CPU block").c_str());
+    }
+}
+
+
+/* ----------------------------------------------------- lab.wavelet final */
+
+/*
+ * The final panel's curve arm: the coefficient-domain finalContAllL() curve
+ * and the pixel-domain wavclCurve. The edge-like a/b round trip is forced by
+ * Expfinal, so the device must keep it alive even without Expchroma.
+ */
+void wavelet_final_params(rtengine::procparams::ProcParams& params,
+                          int levels)
+{
+    params.dirpyrequalizer.enabled = false;
+    params.wavelet.enabled = true;
+    params.wavelet.expcontrast = false;
+    params.wavelet.expchroma = false;
+    params.wavelet.expedge = false;
+    params.wavelet.expbl = false;
+    params.wavelet.expresid = false;
+    params.wavelet.expfinal = true;
+    params.wavelet.exptoning = false;
+    params.wavelet.expnoise = false;
+    params.wavelet.expclari = false;
+    params.wavelet.CLmethod = "all";
+    params.wavelet.Tilesmethod = "full";
+    params.wavelet.HSmethod = "without";
+    params.wavelet.daubcoeffmethod = "6_";
+    params.wavelet.thres = levels;
+    params.wavelet.threshold = 4;
+    params.wavelet.threshold2 = 5;
+    params.wavelet.sigma = 1.0;
+    params.wavelet.offset = 1.0;
+    params.wavelet.lowthr = 40.0;
+    params.wavelet.strength = 100;
+    params.wavelet.softrad = 0.0;
+    params.wavelet.softradend = 0.0;
+    params.wavelet.skinprotect = 0.0;
+    params.wavelet.avoid = false;
+    params.wavelet.median = false;
+    params.wavelet.medianlev = false;
+    params.wavelet.linkedg = false;
+    params.wavelet.lipst = false;
+    params.wavelet.NPmethod = "none";
+    params.wavelet.EDmethod = "CU";
+    params.wavelet.Medgreinf = "less";
+    params.wavelet.sup = 0;
+    params.wavelet.thrend = 0.0;
+    params.wavelet.contrast = 0;
+    params.wavelet.edgval = 50;
+    params.wavelet.edgrad = 15;
+    params.wavelet.edgthresh = 10;
+    params.wavelet.edgeffect = 1.0;
+    params.wavelet.sigmafin = 1.0;
+    params.wavelet.BAmethod = "none";
+    params.wavelet.tmr = false;
+    params.wavelet.balance = 0;
+    params.wavelet.iter = 0;
+    params.wavelet.sigmadir = 1.0;
+    params.wavelet.wavclCurve = {static_cast<double>(DCT_Linear)};
+    params.wavelet.opacityCurveWL = {
+        static_cast<double>(FCT_MinMaxCPoints), 0.0, 0.50, 0.35, 0.35,
+        1.0, 0.50, 0.35, 0.35};
+    for (int level = 0; level < 9; ++level) {
+        params.wavelet.c[level] = 0;
+    }
+}
+
+const std::vector<double>& final_diagonal_curve()
+{
+    static const std::vector<double> curve = {
+        static_cast<double>(DCT_Spline), 0.0, 0.05, 0.5, 0.90, 1.0, 0.95};
+    return curve;
+}
+
+const std::vector<double>& final_opacity_curve()
+{
+    static const std::vector<double> curve = {
+        static_cast<double>(FCT_MinMaxCPoints), 0.0, 0.20, 0.35, 0.35,
+        0.5, 0.80, 0.35, 0.35, 1.0, 0.30, 0.35, 0.35};
+    return curve;
+}
+
+void test_lab_wavelet_final(bool available)
+{
+    using namespace rtengine::stage;
+
+    static MyMutex final_lcms_mutex;
+    if (rtengine::lcmsMutex == nullptr) {
+        rtengine::lcmsMutex = &final_lcms_mutex;
+    }
+    static rtengine::Settings final_settings{};
+    final_settings.edghi = 3.0;
+    final_settings.edglo = 0.5;
+    final_settings.limrad = 20.0;
+    rtengine::settings = &final_settings;
+    rtengine::Color::init();
+
+    const std::string profile_path =
+        std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp") +
+        "/stage-residency-lab-wavelet-final.jsonl";
+
+    if (!available) {
+        skip("lab.wavelet final: no OpenCL device");
+        return;
+    }
+    check(node_has_device_implementation("lab.wavelet"),
+          "the lab.wavelet node has a device implementation");
+
+    struct FinalCase {
+        const char* label;
+        int width;
+        int height;
+        int levels;
+        bool contrast;
+        bool chroma;
+        bool edge;
+        int contrast_values[9];
+        int chro;
+        int diagonal; /* 0 identity, 1 custom */
+        int opacity;  /* 0 default constant, 1 custom */
+        double sigmafin;
+        bool expect_change;
+        int image; /* 0 random, 1 skin */
+    };
+
+    const FinalCase cases[] = {
+        {"final diagonal only", 238, 64, 6, false, false, false,
+         {0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, 1, 0, 1.0, true, 1},
+        {"final opacity only", 238, 64, 6, false, false, false,
+         {0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, 0, 1, 1.0, true, 1},
+        {"final both curves", 238, 64, 6, false, false, false,
+         {0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, 1, 1, 1.0, true, 1},
+        {"final sigmafin 0.5", 238, 64, 6, false, false, false,
+         {0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, 1, 1, 0.5, true, 1},
+        {"final sigmafin 2.0", 238, 64, 6, false, false, false,
+         {0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, 1, 1, 2.0, true, 1},
+        {"final default curves", 238, 64, 6, false, false, false,
+         {0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, 0, 0, 1.0, false, 1},
+        {"final with contrast", 238, 64, 6, true, false, false,
+         {30, 22, 14, 8, 4, 2, 0, 0, 0}, 0, 1, 1, 1.0, true, 1},
+        {"final with chroma", 238, 64, 6, false, true, false,
+         {40, 30, 20, 10, 5, 2, 0, 0, 0}, 60, 1, 1, 1.0, true, 1},
+        {"final with edge", 238, 64, 6, false, false, true,
+         {0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, 1, 1, 1.0, true, 1},
+        {"final padded 179x49", 179, 49, 5, false, false, false,
+         {0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, 1, 1, 1.2, true, 1},
+        {"final levels 3", 179, 48, 3, false, false, false,
+         {0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, 1, 1, 1.0, true, 1},
+        {"final levels 7", 179, 160, 7, false, false, false,
+         {0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, 1, 1, 1.0, true, 1},
+        {"final inert balance controls", 238, 64, 6, false, false, false,
+         {0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, 1, 1, 1.0, true, 1},
+    };
+
+    unsigned seed = 0x2545f491u;
+    for (const FinalCase& item : cases) {
+        rtengine::procparams::ProcParams params;
+        wavelet_final_params(params, item.levels);
+        params.wavelet.expcontrast = item.contrast;
+        params.wavelet.expchroma = item.chroma;
+        params.wavelet.expedge = item.edge;
+        if (item.chroma) {
+            params.wavelet.CHmethod = "link";
+            params.wavelet.chro = item.chro;
+        }
+        for (int level = 0; level < 9; ++level) {
+            params.wavelet.c[level] = item.contrast_values[level];
+        }
+        if (item.diagonal == 1) {
+            params.wavelet.wavclCurve = final_diagonal_curve();
+        }
+        if (item.opacity == 1) {
+            params.wavelet.opacityCurveWL = final_opacity_curve();
+        }
+        params.wavelet.sigmafin = item.sigmafin;
+        if (std::strcmp(item.label, "final inert balance controls") == 0) {
+            /* BAmethod is "none", so these final-panel controls are inert in
+             * the host block; the device pass must still match it. */
+            params.wavelet.balance = 20;
+            params.wavelet.iter = 2;
+            params.wavelet.sigmadir = 1.7;
+            params.wavelet.opacityCurveW = final_opacity_curve();
+        }
+
+        check(labWaveletSupported(params, item.width, item.height),
+              (std::string("lab.wavelet final ") + item.label +
+               " is the supported set").c_str());
+
+        LabImage source(item.width, item.height);
+        if (item.image == 1) {
+            fill_lab_wavelet_skin(source);
+        } else {
+            fill_lab_tools(source, seed++);
+        }
+
+        rtengine::ImProcFunctions cpu_ipf(&params, false);
+        LabImage cpu(item.width, item.height);
+        cpu.CopyFrom(&source);
+        labWaveletHostBlock(cpu_ipf, params, cpu);
+
+        rtengine::ImProcFunctions device_ipf(&params, false);
+        LabImage device(item.width, item.height);
+        device.CopyFrom(&source);
+        const LabWaveletRun result =
+            run_lab_wavelet_node(device, params, device_ipf, profile_path);
+        const std::string profile = read_file(profile_path);
+
+        check(result.supported,
+              (std::string("lab.wavelet final ") + item.label +
+               " resolves to the supported set").c_str());
+        check(result.deviceReady,
+              (std::string("lab.wavelet final ") + item.label +
+               " builds its host setup").c_str());
+        check(result.status == RT_STAGE_OK,
+              (std::string("lab.wavelet final ") + item.label +
+               " completes through run()").c_str());
+        check(profile.find("\"stage\":\"lab.wavelet\"") != std::string::npos,
+              (std::string("lab.wavelet final ") + item.label +
+               " records the node").c_str());
+        check(profile.find("\"impl\":\"opencl\"") != std::string::npos,
+              (std::string("lab.wavelet final ") + item.label +
+               " records a device execution").c_str());
+
+        const Distribution d = distribution(view(device), view(cpu));
+        std::printf("stage-residency: lab.wavelet final %s %dx%d L%d: PAE "
+                    "%.6f LSB16; exact %zu, <=0.25 %zu, <=0.5 %zu, <=1 %zu, "
+                    ">1 %zu of %zu\n",
+                    item.label, item.width, item.height, item.levels,
+                    d.max_abs, d.exact, d.quarter, d.half, d.one, d.over,
+                    d.samples);
+        check(d.finite,
+              (std::string("lab.wavelet final ") + item.label +
+               " stays finite").c_str());
+        check(d.over == 0,
+              (std::string("lab.wavelet final ") + item.label +
+               " is within one LSB16").c_str());
+
+        if (item.expect_change) {
+            /* Non-vacuity: switching the final panel off must change the host
+             * block's own result. */
+            rtengine::procparams::ProcParams off = params;
+            off.wavelet.expfinal = false;
+            rtengine::ImProcFunctions off_ipf(&off, false);
+            LabImage off_image(item.width, item.height);
+            off_image.CopyFrom(&source);
+            labWaveletHostBlock(off_ipf, off, off_image);
+            const Diff active = compare(view(cpu), view(off_image));
+            std::printf("stage-residency: lab.wavelet final %s changes %zu of "
+                        "%zu samples against the panel-off result, PAE "
+                        "%.6f LSB16\n",
+                        item.label, active.differing, active.samples,
+                        active.max_abs);
+            check(active.differing > 0,
+                  (std::string("lab.wavelet final ") + item.label +
+                   " is non-vacuous").c_str());
+        }
+    }
+
+    /*
+     * Refusals: the residual tone mapping, the balance-chroma method, the
+     * clarity panel, out-of-range scalars and the panels the node never
+     * admits must run the host block byte for byte.
+     */
+    const char* residual_labels[] = {
+        "softradend", "softrad", "BAmethod sli", "tmr", "expclari",
+        "sigmafin low", "sigmafin high", "avoid", "median", "expbl",
+        "expresid", "exptoning", "expnoise", "CLmethod one",
+        "skin protection"};
+    for (const char* label : residual_labels) {
+        rtengine::procparams::ProcParams params;
+        wavelet_final_params(params, 6);
+
+        if (std::strcmp(label, "softradend") == 0) {
+            params.wavelet.softradend = 0.5;
+        } else if (std::strcmp(label, "softrad") == 0) {
+            params.wavelet.softrad = 0.2;
+        } else if (std::strcmp(label, "BAmethod sli") == 0) {
+            params.wavelet.BAmethod = "sli";
+        } else if (std::strcmp(label, "tmr") == 0) {
+            params.wavelet.tmr = true;
+        } else if (std::strcmp(label, "expclari") == 0) {
+            params.wavelet.expclari = true;
+        } else if (std::strcmp(label, "sigmafin low") == 0) {
+            params.wavelet.sigmafin = 0.0;
+        } else if (std::strcmp(label, "sigmafin high") == 0) {
+            params.wavelet.sigmafin = 3.0;
+        } else if (std::strcmp(label, "avoid") == 0) {
+            params.wavelet.avoid = true;
+        } else if (std::strcmp(label, "median") == 0) {
+            params.wavelet.median = true;
+        } else if (std::strcmp(label, "expbl") == 0) {
+            params.wavelet.expbl = true;
+        } else if (std::strcmp(label, "expresid") == 0) {
+            params.wavelet.expresid = true;
+        } else if (std::strcmp(label, "exptoning") == 0) {
+            params.wavelet.exptoning = true;
+        } else if (std::strcmp(label, "expnoise") == 0) {
+            params.wavelet.expnoise = true;
+        } else if (std::strcmp(label, "CLmethod one") == 0) {
+            params.wavelet.CLmethod = "one";
+        } else {
+            params.wavelet.skinprotect = 30.0;
+        }
+
+        check(!labWaveletSupported(params, 238, 64),
+              (std::string("lab.wavelet final residual ") + label +
+               " is a residual").c_str());
+
+        LabImage source(238, 64);
+        fill_lab_wavelet_skin(source);
+
+        rtengine::ImProcFunctions cpu_ipf(&params, false);
+        LabImage cpu(238, 64);
+        cpu.CopyFrom(&source);
+        labWaveletHostBlock(cpu_ipf, params, cpu);
+
+        rtengine::ImProcFunctions device_ipf(&params, false);
+        LabImage device(238, 64);
+        device.CopyFrom(&source);
+        const LabWaveletRun result =
+            run_lab_wavelet_node(device, params, device_ipf, profile_path);
+        const std::string profile = read_file(profile_path);
+
+        check(!result.supported,
+              (std::string("lab.wavelet final residual ") + label +
+               " is refused as a device configuration").c_str());
+        check(!result.deviceReady,
+              (std::string("lab.wavelet final residual ") + label +
+               " does not build a device setup").c_str());
+        check(result.status == RT_STAGE_OK,
+              (std::string("lab.wavelet final residual ") + label +
+               " completes through run()").c_str());
+        check(profile.find("\"impl\":\"host\"") != std::string::npos,
+              (std::string("lab.wavelet final residual ") + label +
+               " records a host execution").c_str());
+        check(profile.find("\"impl\":\"opencl\"") == std::string::npos,
+              (std::string("lab.wavelet final residual ") + label +
+               " never mixes a device pass").c_str());
+
+        const Diff diff = compare(view(device), view(cpu));
+        std::printf("stage-residency: lab.wavelet final residual %s: host, "
+                    "PAE %.6f LSB16, %zu of %zu samples differ\n",
+                    label, diff.max_abs, diff.differing, diff.samples);
+        check(diff.finite,
+              (std::string("lab.wavelet final residual ") + label +
+               " stays finite").c_str());
+        check(diff.differing == 0 && diff.max_abs == 0.0,
+              (std::string("lab.wavelet final residual ") + label +
                " matches the CPU block").c_str());
     }
 }
@@ -12923,6 +13272,7 @@ int main()
     test_lab_wavelet_contrast(available);
     test_lab_wavelet_chroma(available);
     test_lab_wavelet_edge(available);
+    test_lab_wavelet_final(available);
     test_lab_wavelet_gpu(available);
     test_output_sharpen(available);
     test_lab_sharpening(available);

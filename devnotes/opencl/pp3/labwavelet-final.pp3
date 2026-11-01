@@ -1,0 +1,24 @@
+[Directional Pyramid Equalizer]
+Enabled=false
+
+[Wavelet]
+Enabled=true
+Strength=100
+Expcontrast=false
+Expchroma=false
+Expedge=false
+Expfinal=true
+WavclCurve=1;0;0.05;0.5;0.9;1;0.95;
+OpacityCurveWL=1;0;0.2;0.35;0.35;0.5;0.8;0.35;0.35;1;0.3;0.35;0.35;
+Sigmafin=1
+ChoiceLevMethod=all
+LevMethod=6
+MaxLev=6
+HSMethod=without
+TilesMethod=full
+DaubMethod=6_
+Sigma=1
+Offset=1
+Lowthr=40
+ThresholdHighlight=4
+ThresholdShadow=5
