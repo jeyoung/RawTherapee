@@ -14,9 +14,9 @@ and are ordered below. Each stable, scanned range is pushed from 2026-10-29 on.
 ## State
 
 - Repository: `$REPO`
-- Worktree: the main checkout, branch `perf-graph`, clean and three commits
+- Worktree: the main checkout, branch `perf-graph`, clean and six commits
   ahead of `origin/perf-graph`; the last pushed tip is `bb074e317`. All
-  pushed ranges were scanned per the publication gate; the three local
+  pushed ranges were scanned per the publication gate; the six local
   commits are not pushed.
 - Stage C landed 2026-10-31: `local.adjustments` local sharpening (undamped
   `cd38028bb..7467f563f`, damped `211c12597..ebbeab951`), the `crop` device
@@ -164,13 +164,26 @@ Validated at `3871b7d0c`; the commits after it are documentation only.
   Thirteen device cases (diagonal only, opacity only, both, sigmafin
   0.5/2.0, default curves, with contrast, with chroma, with edge, 179x49
   padded, 3 and 7 levels, inert balance controls) match the host block with
-  a worst 0.015625 LSB16; fifteen residual configurations (softradend,
+  a worst 0.015625 LSB16; fourteen residual configurations (softradend,
   softrad, `BAmethod` sli, `tmr`, `expclari`, sigmafin below/above range,
-  avoid, median, expbl, expresid, exptoning, expnoise, `CLmethod` one and
+  avoid, median, expbl, expresid, expnoise, `CLmethod` one and
   skin protection) run the host builtin byte for byte. The export gate
   `labwavelet-final.pp3` records `impl=opencl` at 1 LSB16. The remaining
   final-panel residuals are the guided soft-radius tone mapping and the
   balance-chroma arms. `6a54860e1`, `873000037`.
+- **`lab.wavelet` toning (zero-protection)**: `ExpToning`'s opacity-curve
+  multiply on the a/b bands. The host builds the nine `mulopaRG`/`mulopaBY`
+  samples from the 501-point curves; `computeMea()` fills the per-level
+  `calceffect()` thresholds with `sigmaton`; the kernel runs after the chroma
+  arm. Twelve device cases (a only, b only, both, sigmaton 0.5/2.0, with
+  contrast, with chroma, with edge, with final curves, 179x49 padded, 3 and 7
+  levels) match the host block with a worst 0.011719 LSB16; the panel-off
+  comparison changes 17,112-57,280 samples. Ten residuals (protab above zero,
+  sigmaton below/above range, no opacity multiplier, expnoise, expbl,
+  expresid, expclari, `CLmethod` one and skin protection) run the host
+  builtin byte for byte. `labwavelet-toning.pp3` is exact on the export TIFF.
+  The protection range (`protab > 0`) remains a host residual. `0abd76894`,
+  `5781f1c38`.
 - **`local.adjustments` groundwork (pushed)**: host block extracted
   byte-for-byte, per-spot context/ABI (`LAJC`), exact block-level predicate,
   refusal path, 25 residual mutations and four multi-spot host cases. No
@@ -714,10 +727,11 @@ LSB16, and a dense curve refused at host PAE 0. Non-LabGrid tone methods are
 not a refusal: rgb.proc applies them before the Lab block, and
 Splitco/Splitlr/RGBSliders are admitted with PAE 0 at `6c78a463a`. Then the
 `lab.wavelet` panels
-(denoise, toning, noise, clarity, soft radius; the chroma `link` arm landed
-at `6bb3101da` with 12 cases at PAE 0, the edge plain arm at `c5ed40c3c`
-with 17 cases, worst 0.058594 LSB16, and 12 residuals at PAE 0, and the
-final curves with 13 cases, worst 0.015625 LSB16, and 15 residuals at PAE 0),
+(denoise, noise, clarity, soft radius; the chroma `link` arm landed at
+`6bb3101da` with 12 cases at PAE 0, the edge plain arm at `c5ed40c3c` with
+17 cases, worst 0.058594 LSB16, and 12 residuals at PAE 0, the final curves
+with 13 cases, worst 0.015625 LSB16, and 14 residuals at PAE 0, and toning
+with 12 cases, worst 0.011719 LSB16, and 10 residuals at PAE 0),
 then `local.adjustments` exposure/retinex/CIE, then the common mask
 once the wavelet panels land. EPD stays a permanent residual.
 
@@ -725,9 +739,9 @@ once the wavelet panels land. EPD stays a permanent residual.
 
 Move on to the next `lab.wavelet` panel: the denoise panel (`expnoise`,
 including the level/threshold/mix controls and the noise curves). The final
-curves landed with the unit above; clarity still needs the `CLmethod`
-`one`/`inf`/`sup` residual-painting arms before it can be attempted, so do not
-start it first. The edge panel's plain arm is landed; its median/Lipschitz
+curves and the toning zero-protection arm landed with the units above;
+clarity still needs the `CLmethod` `one`/`inf`/`sup` residual-painting arms
+before it can be attempted, so do not start it first. The edge panel's plain arm is landed; its median/Lipschitz
 detection (`calckoe`), `NPMethod` low/high smoothing, `Lipst`, and the dead
 `EDmethod` `SL` threshold adjuster stay residuals, so do not reopen them
 without porting the detector. The balance-chroma arm (`TMr` + `BAmethod`) and

@@ -82,7 +82,10 @@ pairs are exact. The gate is the peak absolute error (PAE) in normalised units;
 | 2026-10-31 | c5ed40c3c | POCL (CPU) | 12-case edge residual matrix (median level, NP low/high, Lipst, EDmethod SL, edgval/edgrad/edgthresh/edgeffect ranges, unknown Medgreinf, zero strength, skin protection), `stage-residency-test` | device vs host block | 0 (host) | PASS |
 | 2026-11-01 | 6a54860e1..873000037 | POCL (CPU) | colorspace_flowers.pef / `labwavelet-final.pp3` (final curves: non-identity `wavclCurve` and `opacityCurveWL`, sigmafin 1), `lab.wavelet` | off vs auto, 16-bit TIFF | 1 LSB | PASS |
 | 2026-11-01 | 6a54860e1..873000037 | POCL (CPU) | 13-case final-curve matrix (diagonal only, opacity only, both, sigmafin 0.5/2.0, default curves, with contrast, with chroma, with edge, 179x49 padded, 3 and 7 levels, inert balance controls), `stage-residency-test` | device vs host block | 0.015625 LSB16 (worst) | PASS |
-| 2026-11-01 | 6a54860e1..873000037 | POCL (CPU) | 15-case final-curve residual matrix (softradend, softrad, BAmethod sli, tmr, expclari, sigmafin low/high, avoid, median, expbl, expresid, exptoning, expnoise, CLmethod one, skin protection), `stage-residency-test` | device vs host block | 0 (host) | PASS |
+| 2026-11-01 | 6a54860e1..873000037 | POCL (CPU) | 14-case final-curve residual matrix (softradend, softrad, BAmethod sli, tmr, expclari, sigmafin low/high, avoid, median, expbl, expresid, expnoise, CLmethod one, skin protection), `stage-residency-test` | device vs host block | 0 (host) | PASS |
+| 2026-11-01 | 0abd76894..5781f1c38 | POCL (CPU) | colorspace_flowers.pef / `labwavelet-toning.pp3` (zero-protection toning, non-identity `opacityCurveRG` and `opacityCurveBY`), `lab.wavelet` | off vs auto, 16-bit TIFF | 0 (exact) | PASS |
+| 2026-11-01 | 0abd76894..5781f1c38 | POCL (CPU) | 12-case toning matrix (a only, b only, both, sigmaton 0.5/2.0, with contrast, with chroma, with edge, with final curves, 179x49 padded, 3 and 7 levels), `stage-residency-test` | device vs host block | 0.011719 LSB16 (worst) | PASS |
+| 2026-11-01 | 0abd76894..5781f1c38 | POCL (CPU) | 10-case toning residual matrix (protab on, sigmaton low/high, no opacity multiplier, expnoise, expbl, expresid, expclari, CLmethod one, skin protection), `stage-residency-test` | device vs host block | 0 (host) | PASS |
 
 `47c50ee77` changes only CPU export buffer handling; the OpenCL rows above
 re-run the existing GPU stages against the new CPU neighbour.
@@ -261,12 +264,23 @@ peak absolute error is zero for the synthetic node tests:
   default curves, with contrast, with chroma, with edge, 179x49 padded, 3 and
   7 levels, inert balance controls) match the host block with a worst peak
   error of 0.015625 LSB16; the panel-off comparison changes 15,232-76,640
-  samples in the twelve checked cases, so the parity is not vacuous. Fifteen
-  residual
-  configurations (softradend, softrad, `BAmethod` sli, `tmr`, `expclari`,
-  sigmafin below/above its slider range, avoid, median, expbl, expresid,
-  exptoning, expnoise, CLmethod one and skin protection) run the host
+  samples in the twelve checked cases, so the parity is not vacuous.
+  Fourteen residual configurations (softradend, softrad, `BAmethod` sli,
+  `tmr`, `expclari`, sigmafin below/above its slider range, avoid, median,
+  expbl, expresid, expnoise, CLmethod one and skin protection) run the host
   builtin byte for byte. `labwavelet-final.pp3` is 1 LSB16 on the export TIFF.
+- The `lab.wavelet` toning panel's zero-protection arm reproduces
+  `ContAllAB()`'s opacity-curve multiply on the a/b bands: the nine
+  `mulopaRG`/`mulopaBY` samples are built on the host, the per-level
+  `calceffect()` thresholds use `sigmaton`, and the coefficient multiply runs
+  after the chroma arm. Twelve device cases (a only, b only, both, sigmaton
+  0.5/2.0, with contrast, with chroma, with edge, with final curves, 179x49
+  padded, 3 and 7 levels) match the host block with a worst peak error of
+  0.011719 LSB16; the panel-off comparison changes 17,112-57,280 samples per
+  checked case. Ten residual configurations (protab above zero, sigmaton
+  below/above its slider range, no opacity multiplier, expnoise, expbl,
+  expresid, expclari, CLmethod one and skin protection) run the host
+  builtin byte for byte. `labwavelet-toning.pp3` is exact on the export TIFF.
 - Impulse denoise and defringe, through the `lab.sharpening` node, run as one
   atomic pair. The device test compares the observable corrected sets and all
   three planes: the impulse fixture and the combined pair correct exactly the
