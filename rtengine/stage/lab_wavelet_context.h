@@ -58,7 +58,7 @@ struct ProcParams;
  * wavelet tool's own skin protection: the equaliser only changes L, so a/b
  * and their masks are identical at the start of both passes.
  */
-#define RT_LAB_WAVELET_CONTEXT_VERSION 3u
+#define RT_LAB_WAVELET_CONTEXT_VERSION 4u
 /* "LWCT": rejects a stale or unrelated pointer before any callback runs. */
 #define RT_LAB_WAVELET_CONTEXT_MAGIC 0x4C574354u
 /* The number of levels of the directional pyramid. */
@@ -142,14 +142,27 @@ struct ProcParams;
  */
 #define RT_LAB_WAVELET_EDGE_ENTRIES 13u
 #define RT_LAB_WAVELET_CURVE_ENTRIES 501u
+/*
+ * The final-curve tail, present only when the final curves run:
+ *   [0]                 sigmafin
+ *   [1 + level*3 + 0]   MaxP (the average of the three positive band maxima)
+ *   [1 + level*3 + 1]   mean (the positive band average)
+ *   [1 + level*3 + 2]   sigma (the positive band standard deviation)
+ *   then RT_LAB_WAVELET_CURVE_ENTRIES samples of the block's own
+ *   WavOpacityCurveWL (opacityCurveWL), then RT_LAB_WAVELET_FINAL_LUT_ENTRIES
+ *   samples of the block's wavclCurve LUT.
+ */
+#define RT_LAB_WAVELET_FINAL_STATS_ENTRIES 3u
+#define RT_LAB_WAVELET_FINAL_LUT_ENTRIES 65536u
 
 /*
  * The exact length of the wavelet parameter table. Both the host builder and
- * the launcher derive it from this one function so a table built without the
- * edge tail can never be read past its end.
+ * the launcher derive it from this one function so a table built without a
+ * tail can never be read past its end.
  */
 inline std::size_t labWaveletParamEntries(std::uint32_t planes,
-                                          std::uint32_t levels, bool edge)
+                                          std::uint32_t levels, bool edge,
+                                          bool final_curves)
 {
     std::size_t entries = RT_LAB_WAVELET_WAVELET_PARAMS +
                           static_cast<std::size_t>(planes) *
@@ -159,6 +172,12 @@ inline std::size_t labWaveletParamEntries(std::uint32_t planes,
         entries += 1 + static_cast<std::size_t>(levels) *
                            RT_LAB_WAVELET_EDGE_ENTRIES +
                    RT_LAB_WAVELET_CURVE_ENTRIES;
+    }
+    if (final_curves) {
+        entries += 1 + static_cast<std::size_t>(levels) *
+                           RT_LAB_WAVELET_FINAL_STATS_ENTRIES +
+                   RT_LAB_WAVELET_CURVE_ENTRIES +
+                   RT_LAB_WAVELET_FINAL_LUT_ENTRIES;
     }
     return entries;
 }
@@ -200,7 +219,8 @@ typedef struct RtLabWaveletResult {
  * value. compute_mea() is called with one plane's device statistics block
  * (RT_LAB_WAVELET_STATS_PER_BAND floats per (level, direction), level-major,
  * direction 1..3) and fills that plane's mea tail of `params`. Plane 0 is L;
- * planes 1 and 2 are a and b and exist only when the chroma arm is active.
+ * planes 1 and 2 are a and b and exist when the chroma arm, the edge panel or
+ * the final curves keep the block's a/b round trip alive.
  */
 typedef struct RtLabWaveletWavelet {
     /* 1 when the call site admits the wavelet pass on the device. */
@@ -208,12 +228,22 @@ typedef struct RtLabWaveletWavelet {
     uint32_t levels;
     uint32_t taps;
     uint32_t entries;
-    /* 1 for L only, 3 when the a/b planes also run (the chroma arm or the
-     * edge panel, whose level-trim change keeps the block's a/b round trip). */
+    /* 1 for L only, 3 when the a/b planes also run (the chroma arm, the edge
+     * panel or the final curves, whose level-trim change keeps the block's
+     * a/b round trip). */
     uint32_t planes;
+    /* 1 when the final-curve tail is present in `params`. */
+    uint32_t final;
     float* params;
     int (*compute_mea)(void* self, const float* stats, uint32_t levels,
                        uint32_t plane);
+    /*
+     * Fills the final-curve tail from the post-contrast statistics block.
+     * finalContAllL() reads the statistics Evaluate2() recomputes after the
+     * contrast and edge passes, so this callback is separate from the mea
+     * build. Used only when `final` is set.
+     */
+    int (*compute_final)(void* self, const float* stats, uint32_t levels);
 } RtLabWaveletWavelet;
 
 typedef struct RtLabWaveletContext {
@@ -295,6 +325,9 @@ inline constexpr int LAB_WAVELET_MIN_WAVELET_EDGTHRESH = -50;
 inline constexpr int LAB_WAVELET_MAX_WAVELET_EDGTHRESH = 100;
 inline constexpr double LAB_WAVELET_MIN_WAVELET_EDGEFFECT = 0.05;
 inline constexpr double LAB_WAVELET_MAX_WAVELET_EDGEFFECT = 2.5;
+/* The final panel's sigmafin slider range. */
+inline constexpr double LAB_WAVELET_MIN_WAVELET_SIGMAFIN = 0.025;
+inline constexpr double LAB_WAVELET_MAX_WAVELET_SIGMAFIN = 2.5;
 
 /* The block's `scale` argument at every export call site. The equaliser's
  * BadpixelsLab() radius is 4 / scale, and the launcher requires this value. */
@@ -318,16 +351,18 @@ int labWaveletTransformLevels(const procparams::ProcParams& params,
 
 /*
  * Whether the wavelet pass is the node's supported set: the contrast panel,
- * the chroma panel's "link" arm and the edge panel's plain arm, no residual,
- * final, toning, noise, clarity or blur panel, the "all" level method,
- * full-tile processing, no soft radius, no L contrast skin protection, no
- * avoid-colour-shift or blue-sky median, no extra level, the default 8-tap
- * Daubechies, a highlight/shadow method the block implements, identity
- * chroma-by-hue and hue curves, every scalar in range and an image large
- * enough for the undecimated Haar bands. The edge arm additionally requires
- * the plain sub-mode: no median level detection, np-method smoothing or
- * lipst influence, and the CU detection method whose hard-coded curve path
- * is the one ported.
+ * the chroma panel's "link" arm, the edge panel's plain arm and the final
+ * panel's curve arm, no residual, toning, noise, clarity or blur panel, the
+ * "all" level method, full-tile processing, no soft radius, no L contrast
+ * skin protection, no avoid-colour-shift or blue-sky median, no extra level,
+ * the default 8-tap Daubechies, a highlight/shadow method the block
+ * implements, identity chroma-by-hue and hue curves, every scalar in range
+ * and an image large enough for the undecimated Haar bands. The edge arm
+ * additionally requires the plain sub-mode: no median level detection,
+ * np-method smoothing or lipst influence, and the CU detection method whose
+ * hard-coded curve path is the one ported. The final arm requires the two
+ * curve controls only: no balance-chroma method, no residual tone mapping
+ * (soft radius end is refused) and a sigmafin inside its slider range.
  */
 bool labWaveletWaveletSupported(const procparams::ProcParams& params,
                                 int width, int height);
@@ -382,6 +417,9 @@ public:
     /* Fill one plane's per-level mea blocks from its statistics block. */
     int computeMea(const float* stats, uint32_t levels, uint32_t plane);
 
+    /* Fill the final-curve tail from the post-contrast statistics block. */
+    int computeFinalStats(const float* stats, uint32_t levels);
+
 private:
     procparams::ProcParams& params_;
     ImProcFunctions& ipf_;
@@ -403,6 +441,7 @@ private:
     bool wavelet_active_ = false;
     bool wavelet_chroma_ = false;
     bool wavelet_edge_ = false;
+    bool wavelet_final_ = false;
     bool wavelet_ab_ = false;
     int wavelet_levels_ = 0;
     float wavelet_skinprotect_ = 0.f;

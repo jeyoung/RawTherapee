@@ -46,6 +46,12 @@ int compute_mea_thunk(void* self, const float* stats, uint32_t levels,
                                                             plane);
 }
 
+int compute_final_thunk(void* self, const float* stats, uint32_t levels)
+{
+    return static_cast<LabWaveletContext*>(self)->computeFinalStats(stats,
+                                                                   levels);
+}
+
 /*
  * Copy one pitched three-plane F32 buffer into a LabImage, and back. The
  * buffer's planes may carry padding, so every row is copied by width.
@@ -290,15 +296,17 @@ bool labWaveletWaveletSupported(const procparams::ProcParams& params,
     }
 
     /*
-     * The contrast panel, the chroma panel's "link" arm and the edge panel's
-     * plain arm are the admitted set. Every other export panel is a residual.
+     * The contrast panel, the chroma panel's "link" arm, the edge panel's
+     * plain arm and the final panel's curve arm are the admitted set. Every
+     * other export panel is a residual.
      */
     const bool contrast = wavelet.expcontrast;
     const bool chroma = wavelet.expchroma;
     const bool edge = wavelet.expedge;
     const bool edge_active = edge && wavelet.edgval > 0;
-    if ((!contrast && !chroma && !edge_active) || wavelet.expbl ||
-        wavelet.expresid || wavelet.expfinal || wavelet.exptoning ||
+    const bool final_curves = wavelet.expfinal;
+    if ((!contrast && !chroma && !edge_active && !final_curves) ||
+        wavelet.expbl || wavelet.expresid || wavelet.exptoning ||
         wavelet.expnoise || wavelet.expclari) {
         return false;
     }
@@ -343,6 +351,18 @@ bool labWaveletWaveletSupported(const procparams::ProcParams& params,
             wavelet.Medgreinf != "less") {
             return false;
         }
+    }
+    /*
+     * The final panel's curve arm needs only the two curve controls. Its
+     * balance-chroma method and residual tone mapping stay host residuals,
+     * and sigmafin must be inside the GUI slider range because the block
+     * divides by it.
+     */
+    if (final_curves &&
+        (!std::isfinite(wavelet.sigmafin) ||
+         wavelet.sigmafin < LAB_WAVELET_MIN_WAVELET_SIGMAFIN ||
+         wavelet.sigmafin > LAB_WAVELET_MAX_WAVELET_SIGMAFIN)) {
+        return false;
     }
     /*
      * ContAllAB()'s BA arm (balance chroma) runs when BAmethod is not "none"
@@ -723,11 +743,13 @@ RtLabWaveletContext LabWaveletContext::descriptor(bool supported)
     context.wavelet.levels = static_cast<uint32_t>(wavelet_levels_);
     context.wavelet.taps = 8u;
     context.wavelet.planes = wavelet_ab_ ? 3u : 1u;
+    context.wavelet.final = wavelet_final_ ? 1u : 0u;
     context.wavelet.entries = static_cast<uint32_t>(
         wavelet_params_.size());
     context.wavelet.params =
         wavelet_params_.empty() ? nullptr : wavelet_params_.data();
     context.wavelet.compute_mea = &compute_mea_thunk;
+    context.wavelet.compute_final = &compute_final_thunk;
     return context;
 }
 
@@ -783,14 +805,30 @@ int LabWaveletContext::build(RtLabWaveletResult& out)
                      params_.wavelet.Medgreinf == "less") &&
                     settings != nullptr;
     /*
-     * ip_wavelet() keeps the a/b decomposition alive whenever the edge panel
-     * is enabled: the level-trim around ContAllAB() has a `!cp.edgeena`
-     * condition, so a/b are decomposed and reconstructed even with Expchroma
-     * off. The round trip is not an exact identity, so the device must run it
-     * to match the block. The chroma multiply itself is still gated by its
-     * own flags in the kernel.
+     * The final panel's curve arm. The admission rules repeat here so a
+     * forced build can never run a partial final pass: the balance-chroma
+     * method, the residual tone mapping and the curves outside their range
+     * are host residuals.
      */
-    wavelet_ab_ = wavelet_chroma_ || wavelet_edge_;
+    wavelet_final_ = params_.wavelet.enabled && params_.wavelet.expfinal &&
+                     params_.wavelet.BAmethod == "none" &&
+                     !params_.wavelet.tmr &&
+                     params_.wavelet.softradend == 0.0 &&
+                     params_.wavelet.softrad == 0.0 &&
+                     std::isfinite(params_.wavelet.sigmafin) &&
+                     params_.wavelet.sigmafin >=
+                         LAB_WAVELET_MIN_WAVELET_SIGMAFIN &&
+                     params_.wavelet.sigmafin <=
+                         LAB_WAVELET_MAX_WAVELET_SIGMAFIN;
+    /*
+     * ip_wavelet() keeps the a/b decomposition alive whenever the edge or
+     * final panel is enabled: the level-trim around ContAllAB() has a
+     * `!cp.edgeena`/`!cp.finena` condition, so a/b are decomposed and
+     * reconstructed even with Expchroma off. The round trip is not an exact
+     * identity, so the device must run it to match the block. The chroma
+     * multiply itself is still gated by its own flags in the kernel.
+     */
+    wavelet_ab_ = wavelet_chroma_ || wavelet_edge_ || wavelet_final_;
 
     if (levels_ > 0) {
         if (width_ < 8 || height_ < 8) {
@@ -854,7 +892,7 @@ int LabWaveletContext::build(RtLabWaveletResult& out)
         wavelet_params_.assign(
             labWaveletParamEntries(static_cast<std::uint32_t>(planes),
                                    static_cast<std::uint32_t>(wavelet_levels_),
-                                   wavelet_edge_),
+                                   wavelet_edge_, wavelet_final_),
             0.f);
 
         float* table = wavelet_params_.data();
@@ -971,6 +1009,54 @@ int LabWaveletContext::build(RtLabWaveletResult& out)
                 }
             }
         }
+        if (wavelet_final_) {
+            const std::size_t final_offset =
+                RT_LAB_WAVELET_WAVELET_PARAMS +
+                planes * static_cast<std::size_t>(wavelet_levels_) *
+                    RT_LAB_WAVELET_MEA_ENTRIES +
+                (wavelet_edge_
+                     ? 1 + static_cast<std::size_t>(wavelet_levels_) *
+                               RT_LAB_WAVELET_EDGE_ENTRIES +
+                           RT_LAB_WAVELET_CURVE_ENTRIES
+                     : 0);
+            float* final_tail = table + final_offset;
+            final_tail[0] = static_cast<float>(wavelet.sigmafin);
+            /*
+             * Both tables are the block's own LUTs, sampled at every integer
+             * index so the device reproduces the host float lookup exactly.
+             * The final diagonal LUT is built with no clipping flags, as the
+             * host block does, so its lookup extrapolates beyond the last
+             * interval rather than clamping.
+             */
+            WavOpacityCurveWL opacity;
+            opacity.Set(wavelet.opacityCurveWL);
+            /* An empty curve leaves the host LUT unallocated and the block
+             * skips finalContAllL(); refuse the device pass rather than
+             * apply a coefficient curve the host did not. The pixel curve
+             * would still match, but the host fallback keeps both arms on
+             * one path. */
+            if (!opacity) {
+                return 5;
+            }
+            float* final_curve =
+                final_tail + 1 +
+                static_cast<std::size_t>(wavelet_levels_) *
+                    RT_LAB_WAVELET_FINAL_STATS_ENTRIES;
+            for (std::uint32_t index = 0;
+                 index < RT_LAB_WAVELET_CURVE_ENTRIES; ++index) {
+                final_curve[index] = opacity[static_cast<int>(index)];
+            }
+            LUTf wavcl_curve(static_cast<int>(
+                                 RT_LAB_WAVELET_FINAL_LUT_ENTRIES),
+                             0);
+            CurveFactory::diagonalCurve2Lut(wavelet.wavclCurve, wavcl_curve,
+                                            1);
+            float* final_lut = final_curve + RT_LAB_WAVELET_CURVE_ENTRIES;
+            for (std::uint32_t index = 0;
+                 index < RT_LAB_WAVELET_FINAL_LUT_ENTRIES; ++index) {
+                final_lut[index] = wavcl_curve[static_cast<int>(index)];
+            }
+        }
     }
 
     built_ = true;
@@ -1003,12 +1089,12 @@ int LabWaveletContext::computeMea(const float* stats, uint32_t levels,
                      static_cast<std::size_t>(levels) *
                      RT_LAB_WAVELET_MEA_ENTRIES;
     float* edge_mea = nullptr;
+    const std::size_t edge_offset =
+        RT_LAB_WAVELET_WAVELET_PARAMS +
+        static_cast<std::size_t>(planes) *
+            static_cast<std::size_t>(levels) *
+            RT_LAB_WAVELET_MEA_ENTRIES;
     if (wavelet_edge_ && plane == 0) {
-        const std::size_t edge_offset =
-            RT_LAB_WAVELET_WAVELET_PARAMS +
-            static_cast<std::size_t>(planes) *
-                static_cast<std::size_t>(levels) *
-                RT_LAB_WAVELET_MEA_ENTRIES;
         edge_mea = wavelet_params_.data() + edge_offset + 1;
     }
 
@@ -1058,6 +1144,78 @@ int LabWaveletContext::computeMea(const float* stats, uint32_t levels,
             entry[11] = averageL;
             entry[12] = sigL;
         }
+    }
+    return 0;
+}
+
+int LabWaveletContext::computeFinalStats(const float* stats, uint32_t levels)
+{
+    const uint32_t planes = wavelet_ab_ ? 3u : 1u;
+    if (!wavelet_active_ || !wavelet_final_ || stats == nullptr ||
+        levels != static_cast<uint32_t>(wavelet_levels_) ||
+        levels < 1 ||
+        levels > RT_LAB_WAVELET_MAX_TRANSFORM_LEVELS) {
+        return 1;
+    }
+
+    const std::size_t edge_offset =
+        RT_LAB_WAVELET_WAVELET_PARAMS +
+        static_cast<std::size_t>(planes) *
+            static_cast<std::size_t>(levels) *
+            RT_LAB_WAVELET_MEA_ENTRIES;
+    const std::size_t final_offset =
+        edge_offset +
+        (wavelet_edge_
+             ? 1 + static_cast<std::size_t>(levels) *
+                       RT_LAB_WAVELET_EDGE_ENTRIES +
+                   RT_LAB_WAVELET_CURVE_ENTRIES
+             : 0);
+    float* final_stats = wavelet_params_.data() + final_offset + 1;
+    const float sigmafin = static_cast<float>(params_.wavelet.sigmafin);
+
+    for (uint32_t level = 0; level < levels; ++level) {
+        float averagePlus[4] = {};
+        float sigmaPlus[4] = {};
+        float maxPlus[4] = {};
+        for (int dir = 1; dir < 4; ++dir) {
+            const std::size_t base =
+                (static_cast<std::size_t>(level) * 3 +
+                 static_cast<std::size_t>(dir - 1)) *
+                RT_LAB_WAVELET_STATS_PER_BAND;
+            averagePlus[dir] = stats[base + 0];
+            maxPlus[dir] = stats[base + 2];
+            sigmaPlus[dir] = stats[base + 4];
+        }
+
+        /* Eval2()'s accumulation order and its / 3, over the bands the
+         * contrast and edge passes have already multiplied. */
+        float averageL = 0.f;
+        float sigL = 0.f;
+        float maxL = 0.f;
+        for (int dir = 1; dir < 4; ++dir) {
+            averageL += averagePlus[dir];
+            sigL += sigmaPlus[dir];
+            maxL += maxPlus[dir];
+        }
+        averageL /= 3;
+        sigL /= 3;
+        maxL /= 3;
+
+        /*
+         * finalContAllL() divides by log(rapX); an exact rapX of one (the
+         * degenerate mean + sigmafin * sigma == MaxP level) is singular on the
+         * host too. Fall back before any image write.
+         */
+        if (maxL > 0.f && averageL + sigmafin * sigL == maxL) {
+            return 2;
+        }
+
+        float* entry = final_stats +
+                       static_cast<std::size_t>(level) *
+                           RT_LAB_WAVELET_FINAL_STATS_ENTRIES;
+        entry[0] = maxL;
+        entry[1] = averageL;
+        entry[2] = sigL;
     }
     return 0;
 }

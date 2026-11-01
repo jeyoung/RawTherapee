@@ -6017,6 +6017,7 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
     bool wavelet_chroma = false;
     bool wavelet_skin = false;
     bool wavelet_edge = false;
+    bool wavelet_final = false;
     bool wavelet_ab = false;
     const float* wavelet_params = nullptr;
     if (wavelet) {
@@ -6025,7 +6026,11 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
             context->wavelet.params == nullptr ||
             context->wavelet.taps != 8 ||
             (context->wavelet.planes != 1 &&
-             context->wavelet.planes != 3)) {
+             context->wavelet.planes != 3) ||
+            (context->wavelet.final != 0 &&
+             context->wavelet.final != 1) ||
+            (context->wavelet.final != 0 &&
+             context->wavelet.compute_final == nullptr)) {
             error = "lab.wavelet wavelet pass is not set up";
             return RT_STAGE_FALLBACK;
         }
@@ -6060,8 +6065,10 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
             static_cast<int>(wavelet_params[RT_LW_PARAM_CHMET]) == 2;
         wavelet_skin = wavelet_params[RT_LW_PARAM_W_SKIN] != 0.0f;
         wavelet_edge = wavelet_params[RT_LW_PARAM_EDGEENA] != 0.0f;
+        wavelet_final = context->wavelet.final != 0;
         /* RT_LW_PARAM_CHROMA marks the presence of the a/b planes: the chroma
-         * arm and the edge panel both keep the block's a/b round trip alive. */
+         * arm, the edge panel and the final curves all keep the block's a/b
+         * round trip alive. */
         wavelet_ab = wavelet_params[RT_LW_PARAM_CHROMA] != 0.0f;
         if (wavelet_planes != (wavelet_ab ? 3 : 1)) {
             error = "lab.wavelet plane count disagrees with its table";
@@ -6070,7 +6077,8 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
         if (wavelet_entries !=
             static_cast<int>(labWaveletParamEntries(
                 static_cast<std::uint32_t>(wavelet_planes),
-                static_cast<std::uint32_t>(wavelet_levels), wavelet_edge))) {
+                static_cast<std::uint32_t>(wavelet_levels), wavelet_edge,
+                wavelet_final))) {
             error = "lab.wavelet parameter table has the wrong length";
             return RT_STAGE_INVALID;
         }
@@ -6502,12 +6510,22 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
             edge_kernel = compiled_kernel_entry(
                 env, def, "rt_lab_wavelet_w_edge", error);
         }
+        cl_kernel final_kernel = nullptr;
+        cl_kernel final_pixel_kernel = nullptr;
+        if (wavelet_final) {
+            final_kernel = compiled_kernel_entry(
+                env, def, "rt_lab_wavelet_w_final", error);
+            final_pixel_kernel = compiled_kernel_entry(
+                env, def, "rt_lab_wavelet_w_final_pixel", error);
+        }
         if (analysis_v == nullptr || analysis_h == nullptr ||
             haar_v == nullptr || haar_h == nullptr || synth_h == nullptr ||
             synth_v == nullptr || haar_synth_h == nullptr ||
             haar_synth_v == nullptr || stats_kernel == nullptr ||
             contrast_kernel == nullptr || chroma_kernel == nullptr ||
-            (wavelet_edge && edge_kernel == nullptr)) {
+            (wavelet_edge && edge_kernel == nullptr) ||
+            (wavelet_final &&
+             (final_kernel == nullptr || final_pixel_kernel == nullptr))) {
             return RT_STAGE_FALLBACK;
         }
 
@@ -6537,6 +6555,14 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
             RT_LAB_WAVELET_WAVELET_PARAMS +
             wavelet_planes * wavelet_levels *
                 static_cast<int>(RT_LAB_WAVELET_MEA_ENTRIES));
+        const cl_int cl_final_offset =
+            cl_edge_offset +
+            (wavelet_edge
+                 ? static_cast<cl_int>(
+                       1 + wavelet_levels *
+                               static_cast<int>(RT_LAB_WAVELET_EDGE_ENTRIES) +
+                           RT_LAB_WAVELET_CURVE_ENTRIES)
+                 : 0);
         const cl_int cl_strength_index = static_cast<cl_int>(
             RT_LW_PARAM_STRENGTH);
         const float blend = wavelet_params[cl_strength_index];
@@ -6885,6 +6911,105 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
                 }
             }
 
+            /*
+             * finalContAllL() uses the statistics Evaluate2() recomputes
+             * after the contrast and edge passes, not the pre-contrast
+             * statistics the mea blocks were built from. Re-run the per-band
+             * statistics now that the bands are multiplied, then build the
+             * final tail and apply the coefficient curve to every level.
+             */
+            if (wavelet_final && plane_index == 0) {
+                for (int level = 0; level < wavelet_levels; ++level) {
+                    cl_mem band1 = memory_of(bands[level][0]);
+                    cl_mem band2 = memory_of(bands[level][1]);
+                    cl_mem band3 = memory_of(bands[level][2]);
+                    cl_int bp1 = pitch_of(bands[level][0]);
+                    cl_int bp2 = pitch_of(bands[level][1]);
+                    cl_int bp3 = pitch_of(bands[level][2]);
+                    cl_int cl_bands = 3;
+                    cl_int stats_offset = level * 3 * static_cast<int>(
+                                                          RT_LAB_WAVELET_STATS_PER_BAND);
+                    bool ok = true;
+                    ok = ok && set_arg(stats_kernel, 0, sizeof(cl_mem),
+                                       &band1);
+                    ok = ok && set_arg(stats_kernel, 1, sizeof(cl_int), &bp1);
+                    ok = ok && set_arg(stats_kernel, 2, sizeof(cl_mem),
+                                       &band2);
+                    ok = ok && set_arg(stats_kernel, 3, sizeof(cl_int), &bp2);
+                    ok = ok && set_arg(stats_kernel, 4, sizeof(cl_mem),
+                                       &band3);
+                    ok = ok && set_arg(stats_kernel, 5, sizeof(cl_int), &bp3);
+                    ok = ok && set_arg(stats_kernel, 6, sizeof(cl_mem),
+                                       &stats_memory);
+                    ok = ok && set_arg(stats_kernel, 7, sizeof(cl_int),
+                                       &stats_offset);
+                    ok = ok && set_arg(stats_kernel, 8, sizeof(cl_int),
+                                       &cl_half_w);
+                    ok = ok && set_arg(stats_kernel, 9, sizeof(cl_int),
+                                       &cl_half_h);
+                    ok = ok && set_arg(stats_kernel, 10, sizeof(cl_int),
+                                       &cl_bands);
+                    if (!ok || !launch(stats_kernel, stats_global,
+                                       "lab.wavelet final statistics")) {
+                        error = "lab.wavelet final statistics arguments "
+                                "failed";
+                        return false;
+                    }
+                }
+                if (residency->readback(stats_device, stats_view) !=
+                    RT_STAGE_OK) {
+                    error = "lab.wavelet final statistics readback failed";
+                    return false;
+                }
+                if (context->wavelet.compute_final(
+                        context->self, stats_host.data(),
+                        static_cast<uint32_t>(wavelet_levels)) != 0) {
+                    error = "lab.wavelet final statistics build failed";
+                    return false;
+                }
+                if (residency->upload(wavelet_params_device,
+                                      wavelet_params_buffer) != RT_STAGE_OK) {
+                    error = "lab.wavelet final parameter upload failed";
+                    return false;
+                }
+                for (int level = 0; level < wavelet_levels; ++level) {
+                    cl_mem band1 = memory_of(bands[level][0]);
+                    cl_mem band2 = memory_of(bands[level][1]);
+                    cl_mem band3 = memory_of(bands[level][2]);
+                    cl_int bp1 = pitch_of(bands[level][0]);
+                    cl_int bp2 = pitch_of(bands[level][1]);
+                    cl_int bp3 = pitch_of(bands[level][2]);
+                    cl_int cl_level = level;
+                    bool ok = true;
+                    ok = ok && set_arg(final_kernel, 0, sizeof(cl_mem),
+                                       &band1);
+                    ok = ok && set_arg(final_kernel, 1, sizeof(cl_int), &bp1);
+                    ok = ok && set_arg(final_kernel, 2, sizeof(cl_mem),
+                                       &band2);
+                    ok = ok && set_arg(final_kernel, 3, sizeof(cl_int), &bp2);
+                    ok = ok && set_arg(final_kernel, 4, sizeof(cl_mem),
+                                       &band3);
+                    ok = ok && set_arg(final_kernel, 5, sizeof(cl_int), &bp3);
+                    ok = ok && set_arg(final_kernel, 6, sizeof(cl_mem),
+                                       &params_memory);
+                    ok = ok && set_arg(final_kernel, 7, sizeof(cl_int),
+                                       &cl_final_offset);
+                    ok = ok && set_arg(final_kernel, 8, sizeof(cl_int),
+                                       &cl_level);
+                    ok = ok && set_arg(final_kernel, 9, sizeof(cl_int),
+                                       &wavelet_levels);
+                    ok = ok && set_arg(final_kernel, 10, sizeof(cl_int),
+                                       &cl_half_w);
+                    ok = ok && set_arg(final_kernel, 11, sizeof(cl_int),
+                                       &cl_half_h);
+                    if (!ok || !launch(final_kernel, band_global,
+                                       "lab.wavelet final curve")) {
+                        error = "lab.wavelet final curve arguments failed";
+                        return false;
+                    }
+                }
+            }
+
             /* Reconstruction: the Haar levels first, then level 0. */
             const int coeff_index = (wavelet_levels - 1) % 2;
             for (int level = wavelet_levels - 1; level >= 1; --level) {
@@ -6963,8 +7088,12 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
                 cl_int bp3 = pitch_of(bands[0][2]);
                 /* The L clamp is deferred while the chroma arm still reads L;
                  * the host applies it after readback. */
+                /* The final-curve kernel applies the curve before the clamp,
+                 * so it owns both when it is active. */
                 cl_int clamp =
-                    plane_index == 0 && !wavelet_chroma ? 1 : 0;
+                    plane_index == 0 && !wavelet_chroma && !wavelet_final
+                        ? 1
+                        : 0;
                 bool ok = true;
                 ok = ok && set_arg(synth_h, 0, sizeof(cl_mem), &low_memory);
                 ok = ok && set_arg(synth_h, 1, sizeof(cl_int), &low_pitch);
@@ -7028,6 +7157,28 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
              !run_plane(plane_b_memory, plane_b_pitch, 2))) {
             return RT_STAGE_FALLBACK;
         }
+        if (wavelet_final) {
+            bool ok = true;
+            ok = ok && set_arg(final_pixel_kernel, 0, sizeof(cl_mem),
+                               &l_memory);
+            ok = ok && set_arg(final_pixel_kernel, 1, sizeof(cl_int),
+                               &l_pitch);
+            ok = ok && set_arg(final_pixel_kernel, 2, sizeof(cl_mem),
+                               &params_memory);
+            ok = ok && set_arg(final_pixel_kernel, 3, sizeof(cl_int),
+                               &cl_final_offset);
+            ok = ok && set_arg(final_pixel_kernel, 4, sizeof(cl_int),
+                               &wavelet_levels);
+            ok = ok && set_arg(final_pixel_kernel, 5, sizeof(cl_int),
+                               &cl_width);
+            ok = ok && set_arg(final_pixel_kernel, 6, sizeof(cl_int),
+                               &cl_height);
+            if (!ok || !launch(final_pixel_kernel, image_global,
+                               "lab.wavelet final pixel curve")) {
+                error = "lab.wavelet final pixel curve arguments failed";
+                return RT_STAGE_FALLBACK;
+            }
+        }
     }
 
     if (residency->readback(l_device, plane_view(lab, 0)) != RT_STAGE_OK) {
@@ -7044,11 +7195,12 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
             return RT_STAGE_FALLBACK;
         }
     }
-    if (wavelet_chroma) {
+    if (wavelet_chroma && !wavelet_final) {
         /*
          * The L synthesis skipped its clamp so ContAllAB() read the same L
          * the block reads. ip_wavelet() applies it in the final tile copy,
-         * after the chroma pass, so apply it here.
+         * after the chroma pass, so apply it here. The final-curve kernel
+         * already applied the curve and clamp when it is active.
          */
         auto* l_base = static_cast<unsigned char*>(lab.data);
         for (int y = 0; y < height; ++y) {

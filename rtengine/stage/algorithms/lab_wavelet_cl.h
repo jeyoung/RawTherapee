@@ -417,6 +417,9 @@ __kernel void rt_lab_wavelet_equalize(
 /* Mirrors RT_LAB_WAVELET_EDGE_ENTRIES and RT_LAB_WAVELET_CURVE_ENTRIES. */
 #define RT_LW_W_EDGE_ENTRIES 13
 #define RT_LW_W_EDGE_CURVE 501
+/* Mirrors RT_LAB_WAVELET_FINAL_STATS_ENTRIES and FINAL_LUT_ENTRIES. */
+#define RT_LW_W_FINAL_STATS 3
+#define RT_LW_W_FINAL_LUT 65536
 
 /*
  * Level 0 analysis, vertical half. One work item per output column and output
@@ -1059,7 +1062,7 @@ __kernel void rt_lab_wavelet_w_chroma(
  * mean and sigma and the sampled ccwcurve. `edge_offset` is the start of the
  * tail (limrad at [0], then levels * 13 entries, then the curve).
  */
-inline float rt_lw_edge_curve(__global const float* table, float index)
+inline float rt_lw_curve501(__global const float* table, float index)
 {
     /* LUTf::operator[](float) for the 501-entry WavCurve: maxsf is size - 2. */
     const float maxsf = (float)(RT_LW_W_EDGE_CURVE - 2);
@@ -1229,7 +1232,7 @@ __kernel void rt_lab_wavelet_w_edge(
                 kmuld = kmul;
             }
 
-            const float curvev = rt_lw_edge_curve(curve, absciss * 500.0f);
+            const float curvev = rt_lw_curve501(curve, absciss * 500.0f);
             const float kc = kmul * (curvev - 0.5f);
             float kinterm;
             if (kc >= 0.0f) {
@@ -1247,5 +1250,125 @@ __kernel void rt_lab_wavelet_w_edge(
 
         band[at] = value * (1.0f + (edge - 1.0f) * beta);
     }
+}
+
+/*
+ * The final panel's coefficient curve: finalContAllL() with finena set and
+ * the block's own WavOpacityCurveWL. One work item per band pixel; `level`
+ * selects the level's MaxP/mean/sigma in the final tail. The tail starts at
+ * `final_offset`: sigmafin at [0], levels * 3 statistics entries, then the
+ * 501-point opacity curve.
+ *
+ * The host uses xlogf()/xexpf() for the per-coefficient exponential; this
+ * kernel uses log()/exp(), the same substitution the edge arm documents. The
+ * scalars use double log() as the host does.
+ */
+__kernel void rt_lab_wavelet_w_final(
+    __global float* band1, int p1,
+    __global float* band2, int p2,
+    __global float* band3, int p3,
+    __global const float* params, int final_offset,
+    int level, int levels, int w, int h)
+{
+    const int x = get_global_id(0);
+    const int y = get_global_id(1);
+    if (x >= w || y >= h) {
+        return;
+    }
+
+    const int entry = final_offset + 1 + level * RT_LW_W_FINAL_STATS;
+    const float maxp = params[entry + 0];
+    const float mean = params[entry + 1];
+    const float sigma = params[entry + 2];
+    if (maxp <= 0.0f || mean == 0.0f || sigma == 0.0f) {
+        return;
+    }
+
+    const float sigmafin = params[final_offset];
+    const __global float* curve =
+        params + final_offset + 1 + levels * RT_LW_W_FINAL_STATS;
+
+    const float logmax = (float)log((double)maxp);
+    const float rapX = (mean + sigmafin * sigma) / maxp;
+    /* The host's insigma is the float 0.666f promoted to double. */
+    const float inx = (float)log((double)0.666f);
+    const float iny = (float)log((double)rapX);
+    const float rap = inx / iny;
+    const float asig = 0.166f / (sigma * sigmafin);
+    const float bsig = 0.5f - asig * mean;
+    const float amean = 0.5f / mean;
+    const float threshold = mean + sigmafin * sigma;
+
+    for (int dir = 0; dir < 3; ++dir) {
+        __global float* band =
+            dir == 0 ? band1 : (dir == 1 ? band2 : band3);
+        const int pitch = dir == 0 ? p1 : (dir == 1 ? p2 : p3);
+        const int at = y * pitch + x;
+        const float value = band[at];
+        const float magnitude = fabs(value);
+
+        float absciss;
+        if (magnitude >= threshold) {
+            const float vald = (log(magnitude) - logmax) * rap;
+            absciss = exp(vald);
+        } else if (magnitude >= mean) {
+            absciss = asig * magnitude + bsig;
+        } else {
+            absciss = amean * magnitude;
+        }
+
+        const float kc = rt_lw_curve501(curve, absciss * 500.0f) - 0.5f;
+        const float reduce = kc <= 0.0f ? 1.0f : 1.5f;
+        float kinterm = 1.0f + reduce * kc;
+        if (kinterm <= 0.0f) {
+            kinterm = 0.01f;
+        }
+        band[at] = value * kinterm;
+    }
+}
+
+/*
+ * The final panel's pixel curve: ip_wavelet()'s tile finalize applies
+ * wavclCurve to L before the block's `L <= 0 -> 1` clamp. The 65536-entry
+ * LUT is the block's LUTf built with no clipping flags, so the float lookup
+ * extrapolates through the last interval instead of clamping there.
+ */
+inline float rt_lw_curve65536(__global const float* table, float index)
+{
+    const int maxs = RT_LW_W_FINAL_LUT - 2;
+    int base = (int)index;
+    if (index < 0.0f) {
+        base = 0;
+    } else if (index > (float)maxs) {
+        base = maxs;
+    }
+    const float fraction = index - (float)base;
+    const float low = table[base];
+    return low + (table[base + 1] - low) * fraction;
+}
+
+__kernel void rt_lab_wavelet_w_final_pixel(
+    __global float* l, int pitch,
+    __global const float* params, int final_offset,
+    int levels, int w, int h)
+{
+    const int x = get_global_id(0);
+    const int y = get_global_id(1);
+    if (x >= w || y >= h) {
+        return;
+    }
+
+    const __global float* curve = params + final_offset + 1 +
+                                  levels * RT_LW_W_FINAL_STATS +
+                                  RT_LW_W_EDGE_CURVE;
+    const int at = y * pitch + x;
+    const float value = l[at];
+    const float lin = max(value, 0.0f);
+    const float curved = rt_lw_curve65536(curve, lin);
+    float out = (0.5f * lin + 1.5f * curved) / 2.0f;
+    if (out <= 0.0f) {
+        out = 1.0f;
+    }
+    l[at] = out;
 }
 )CLC";
