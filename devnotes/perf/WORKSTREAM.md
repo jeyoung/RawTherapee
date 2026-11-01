@@ -14,9 +14,9 @@ and are ordered below. Each stable, scanned range is pushed from 2026-10-29 on.
 ## State
 
 - Repository: `$REPO`
-- Worktree: the main checkout, branch `perf-graph`, clean and six commits
+- Worktree: the main checkout, branch `perf-graph`, clean and nine commits
   ahead of `origin/perf-graph`; the last pushed tip is `bb074e317`. All
-  pushed ranges were scanned per the publication gate; the six local
+  pushed ranges were scanned per the publication gate; the nine local
   commits are not pushed.
 - Stage C landed 2026-10-31: `local.adjustments` local sharpening (undamped
   `cd38028bb..7467f563f`, damped `211c12597..ebbeab951`), the `crop` device
@@ -184,6 +184,14 @@ Validated at `3871b7d0c`; the commits after it are documentation only.
   builtin byte for byte. `labwavelet-toning.pp3` is exact on the export TIFF.
   The protection range (`protab > 0`) remains a host residual. `0abd76894`,
   `5781f1c38`.
+- **`lab.wavelet` denoise groundwork**: the denoise tail ABI and the
+  `compute_mad` callback. The tail carries `vari[0..5]`, `ballum` and one
+  squared `madL` entry per level and direction; the histogram itself will be
+  a separate device buffer. `labWaveletMadFromHistogram()` reproduces
+  `ImProcFunctions::Mad()`'s truncated-absolute-value histogram and
+  interpolated median, compared against the host on four fixtures. The
+  standard-L arm is still refused: `wavelet_denoise_` stays false until the
+  histogram, noise-variance and shrink kernels land. `e3c35322d`, `93b9a671d`.
 - **`local.adjustments` groundwork (pushed)**: host block extracted
   byte-for-byte, per-spot context/ABI (`LAJC`), exact block-level predicate,
   refusal path, 25 residual mutations and four multi-spot host cases. No
