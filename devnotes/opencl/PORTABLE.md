@@ -18,19 +18,31 @@ The first build downloads the Debian 12 image and installs build dependencies.
 The container is always based on Debian 12 so the package keeps the bookworm
 baseline.
 
-Verified artefact from commit `6ed4b80c2` (FAST preview toggle):
+Verified artefact from commit `32821115a` (dev tip):
 
 ```
-build/portable/rawtherapee-5.13-143-g6ed4b80c2_5.13+git13164.6ed4b80c2-1_amd64.deb
-sha256 683134642cdaf1266aee0d39eace33786a76d4996858154b0e1592ecdea3d242
+build/portable/rawtherapee-5.13-169-g32821115a_5.13+git13190.32821115a-1_amd64.deb
+sha256 64dda18a6e0efe4481bb7a12e9311ae840c9399f3e4f6d67a3e22c48c8a8e674
 ```
 
 The Debian 12 and Debian 13 package tests installed the `.deb`, listed formats
 (including JPEG XL), exported the 10.2 MP PEF through the CLI and started the
-GUI under Xvfb. The test containers have no OpenCL ICD, so `--gpu-test` and
-`--gpu-test-monitor` were recorded as not run rather than passed. Interactive
-toggle checks used host Xvfb; the package test is a functional install and
-startup smoke test.
+GUI under Xvfb. Both releases produced pixel-identical 16-bit TIFF output
+(AE=0 over 10,139,904 pixels), and a Debian 13 source build of the same commit
+matched both exactly. That reference was built in a Debian 13 container
+because the build host has no C++ build dependencies installed; the package
+itself is still built in the documented Debian 12 container. The test
+containers have no OpenCL ICD, so `--gpu-test` and `--gpu-test-monitor`
+reported "No OpenCL device found" (exit 2) and are recorded as not run rather
+than passed. The package test is a functional install and startup smoke test;
+no performance is claimed.
+
+Container images used for the tests:
+
+- `debian:12`:
+  `sha256:763cbdcdd70f724557c36ad2f9ff506a702c206412d5f7fc81342698b0e0f0c1`
+- `debian:13`:
+  `sha256:e94e0ef014004824e778a450941b2d74896bd1be7ebd5b31f0465134797c38c8`
 
 ## Layout
 
