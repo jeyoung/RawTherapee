@@ -14,10 +14,10 @@ and are ordered below. Each stable, scanned range is pushed from 2026-10-29 on.
 ## State
 
 - Repository: `$REPO`
-- Worktree: the main checkout, branch `perf-graph`, clean and nine commits
-  ahead of `origin/perf-graph`; the last pushed tip is `bb074e317`. All
-  pushed ranges were scanned per the publication gate; the nine local
-  commits are not pushed.
+- Worktree: the main checkout, branch `perf-graph`, clean and eleven commits
+  ahead of `origin/perf-graph` (`e77993457`); the last pushed tip is
+  `e77993457`. All pushed ranges were scanned per the publication gate; the
+  eleven local commits are not pushed.
 - Stage C landed 2026-10-31: `local.adjustments` local sharpening (undamped
   `cd38028bb..7467f563f`, damped `211c12597..ebbeab951`), the `crop` device
   node (`544f01573`, `0885d952c`), the `lab.sharpening` impulse-denoise +
