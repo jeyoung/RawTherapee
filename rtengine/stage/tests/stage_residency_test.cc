@@ -7244,6 +7244,54 @@ LabWaveletRun run_lab_wavelet_node(LabImage& image,
  * equaliser on the device and must stay within one LSB16; residual cases must
  * be refused, run the builtin and match the block byte for byte.
  */
+/*
+ * The denoise groundwork's median step must match ImProcFunctions::Mad()
+ * exactly, including the truncating absolute-value histogram and the
+ * interpolated median.
+ */
+void test_lab_wavelet_mad()
+{
+    using namespace rtengine::stage;
+
+    static MyMutex mad_lcms_mutex;
+    if (rtengine::lcmsMutex == nullptr) {
+        rtengine::lcmsMutex = &mad_lcms_mutex;
+    }
+    static rtengine::Settings mad_settings{};
+    rtengine::settings = &mad_settings;
+
+    rtengine::procparams::ProcParams params;
+    rtengine::ImProcFunctions ipf(&params, false);
+
+    const std::vector<std::vector<float>> fixtures = {
+        {0.f, 1.f, -1.f, 2.f, -2.f, 3.f, -3.f},
+        {0.4f, -0.6f, 100.9f, -100.1f, 32767.9f, -40000.f, 12.25f,
+         -12.25f},
+        {5.f, 5.f, 5.f, 5.f, -5.f},
+        {-0.9f, -0.1f, 0.1f, 0.9f, 1.1f, -1.1f, 7.7f, -7.7f},
+    };
+    for (const std::vector<float>& data : fixtures) {
+        std::vector<std::uint32_t> histogram(32768u, 0u);
+        for (float value : data) {
+            const int bin = static_cast<int>(
+                std::min(32767.f, std::fabs(value)));
+            ++histogram[static_cast<std::size_t>(bin)];
+        }
+        const float expected =
+            ipf.Mad(data.data(), static_cast<int>(data.size()));
+        const float actual = labWaveletMadFromHistogram(
+            histogram.data(), static_cast<std::uint32_t>(data.size()));
+        check(actual == expected,
+              "lab.wavelet MAD matches ImProcFunctions::Mad()");
+    }
+
+    std::uint32_t empty[32768] = {};
+    check(labWaveletMadFromHistogram(empty, 0) == 0.f,
+          "lab.wavelet MAD handles an empty band");
+    check(labWaveletMadFromHistogram(empty, 1) == 0.f,
+          "lab.wavelet MAD handles a single sample");
+}
+
 void test_lab_wavelet(bool available)
 {
     using namespace rtengine::stage;
@@ -13606,6 +13654,7 @@ int main()
     test_lab_tools_local_contrast(available);
     test_lab_tools_regions(available);
     test_local_adjustments(available);
+    test_lab_wavelet_mad();
     test_lab_wavelet(available);
     test_lab_wavelet_contrast(available);
     test_lab_wavelet_chroma(available);
