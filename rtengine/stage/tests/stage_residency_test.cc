@@ -7240,11 +7240,6 @@ LabWaveletRun run_lab_wavelet_node(LabImage& image,
 }
 
 /*
- * The lab.wavelet node against the production block. Supported cases run the
- * equaliser on the device and must stay within one LSB16; residual cases must
- * be refused, run the builtin and match the block byte for byte.
- */
-/*
  * The denoise groundwork's median step must match ImProcFunctions::Mad()
  * exactly, including the truncating absolute-value histogram and the
  * interpolated median.
@@ -7285,6 +7280,8 @@ void test_lab_wavelet_mad()
               "lab.wavelet MAD matches ImProcFunctions::Mad()");
     }
 
+    check(labWaveletMadFromHistogram(nullptr, 2) == 0.f,
+          "lab.wavelet MAD handles a null histogram");
     std::uint32_t empty[32768] = {};
     check(labWaveletMadFromHistogram(empty, 0) == 0.f,
           "lab.wavelet MAD handles an empty band");
@@ -7292,6 +7289,11 @@ void test_lab_wavelet_mad()
           "lab.wavelet MAD handles a single sample");
 }
 
+/*
+ * The lab.wavelet node against the production block. Supported cases run the
+ * equaliser on the device and must stay within one LSB16; residual cases must
+ * be refused, run the builtin and match the block byte for byte.
+ */
 void test_lab_wavelet(bool available)
 {
     using namespace rtengine::stage;
