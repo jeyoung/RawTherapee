@@ -7787,7 +7787,7 @@ void test_lab_wavelet_contrast(bool available)
      */
     const char* residual_labels[] = {
         "expcontrast off", "expchroma on", "expedge on", "expbl on",
-        "expresid on", "exptoning on", "expnoise on",
+        "expresid on", "expnoise on",
         "expclari on", "CLmethod one", "Tilesmethod big", "softrad",
         "skinprotect", "avoid", "median", "sup", "daubcoeffmethod 4_",
         "HSmethod other", "Chcurve", "sigma range", "offset range",
@@ -7809,8 +7809,6 @@ void test_lab_wavelet_contrast(bool available)
             params.wavelet.expbl = true;
         } else if (std::strcmp(label, "expresid on") == 0) {
             params.wavelet.expresid = true;
-        } else if (std::strcmp(label, "exptoning on") == 0) {
-            params.wavelet.exptoning = true;
         } else if (std::strcmp(label, "expnoise on") == 0) {
             params.wavelet.expnoise = true;
         } else if (std::strcmp(label, "expclari on") == 0) {
@@ -8830,7 +8828,7 @@ void test_lab_wavelet_final(bool available)
     const char* residual_labels[] = {
         "softradend", "softrad", "BAmethod sli", "tmr", "expclari",
         "sigmafin low", "sigmafin high", "avoid", "median", "expbl",
-        "expresid", "exptoning", "expnoise", "CLmethod one",
+        "expresid", "expnoise", "CLmethod one",
         "skin protection"};
     for (const char* label : residual_labels) {
         rtengine::procparams::ProcParams params;
@@ -8858,8 +8856,6 @@ void test_lab_wavelet_final(bool available)
             params.wavelet.expbl = true;
         } else if (std::strcmp(label, "expresid") == 0) {
             params.wavelet.expresid = true;
-        } else if (std::strcmp(label, "exptoning") == 0) {
-            params.wavelet.exptoning = true;
         } else if (std::strcmp(label, "expnoise") == 0) {
             params.wavelet.expnoise = true;
         } else if (std::strcmp(label, "CLmethod one") == 0) {
@@ -8912,6 +8908,348 @@ void test_lab_wavelet_final(bool available)
                " stays finite").c_str());
         check(diff.differing == 0 && diff.max_abs == 0.0,
               (std::string("lab.wavelet final residual ") + label +
+               " matches the CPU block").c_str());
+    }
+}
+
+
+/* --------------------------------------------------- lab.wavelet toning */
+
+/*
+ * The toning panel's zero-protection arm: the opacity-curve multiplier on
+ * the a/b bands. The protection range and the nonzero-protab reductions are
+ * host residuals.
+ */
+void wavelet_toning_params(rtengine::procparams::ProcParams& params,
+                           int levels)
+{
+    params.dirpyrequalizer.enabled = false;
+    params.wavelet.enabled = true;
+    params.wavelet.expcontrast = false;
+    params.wavelet.expchroma = false;
+    params.wavelet.expedge = false;
+    params.wavelet.expbl = false;
+    params.wavelet.expresid = false;
+    params.wavelet.expfinal = false;
+    params.wavelet.exptoning = true;
+    params.wavelet.expnoise = false;
+    params.wavelet.expclari = false;
+    params.wavelet.CLmethod = "all";
+    params.wavelet.Tilesmethod = "full";
+    params.wavelet.HSmethod = "without";
+    params.wavelet.daubcoeffmethod = "6_";
+    params.wavelet.thres = levels;
+    params.wavelet.threshold = 4;
+    params.wavelet.threshold2 = 5;
+    params.wavelet.sigma = 1.0;
+    params.wavelet.offset = 1.0;
+    params.wavelet.lowthr = 40.0;
+    params.wavelet.strength = 100;
+    params.wavelet.softrad = 0.0;
+    params.wavelet.softradend = 0.0;
+    params.wavelet.skinprotect = 0.0;
+    params.wavelet.avoid = false;
+    params.wavelet.median = false;
+    params.wavelet.medianlev = false;
+    params.wavelet.linkedg = false;
+    params.wavelet.lipst = false;
+    params.wavelet.NPmethod = "none";
+    params.wavelet.EDmethod = "CU";
+    params.wavelet.Medgreinf = "less";
+    params.wavelet.sup = 0;
+    params.wavelet.thrend = 0.0;
+    params.wavelet.contrast = 0;
+    params.wavelet.edgval = 50;
+    params.wavelet.edgrad = 15;
+    params.wavelet.edgthresh = 10;
+    params.wavelet.edgeffect = 1.0;
+    params.wavelet.sigmafin = 1.0;
+    params.wavelet.sigmaton = 1.0;
+    params.wavelet.protab = 0.0;
+    params.wavelet.rangeab = 20.0;
+    params.wavelet.BAmethod = "none";
+    params.wavelet.tmr = false;
+    params.wavelet.wavclCurve = {static_cast<double>(DCT_Linear)};
+    params.wavelet.opacityCurveWL = {
+        static_cast<double>(FCT_MinMaxCPoints), 0.0, 0.50, 0.35, 0.35,
+        1.0, 0.50, 0.35, 0.35};
+    params.wavelet.opacityCurveRG = {
+        static_cast<double>(FCT_MinMaxCPoints), 0.0, 0.50, 0.35, 0.35,
+        1.0, 0.50, 0.35, 0.35};
+    params.wavelet.opacityCurveBY = {
+        static_cast<double>(FCT_MinMaxCPoints), 0.0, 0.50, 0.35, 0.35,
+        1.0, 0.50, 0.35, 0.35};
+    for (int level = 0; level < 9; ++level) {
+        params.wavelet.c[level] = 0;
+    }
+}
+
+const std::vector<double>& toning_red_green_curve()
+{
+    static const std::vector<double> curve = {
+        static_cast<double>(FCT_MinMaxCPoints), 0.0, 0.20, 0.35, 0.35,
+        0.5, 0.80, 0.35, 0.35, 1.0, 0.30, 0.35, 0.35};
+    return curve;
+}
+
+const std::vector<double>& toning_blue_yellow_curve()
+{
+    static const std::vector<double> curve = {
+        static_cast<double>(FCT_MinMaxCPoints), 0.0, 0.80, 0.35, 0.35,
+        0.5, 0.20, 0.35, 0.35, 1.0, 0.70, 0.35, 0.35};
+    return curve;
+}
+
+void test_lab_wavelet_toning(bool available)
+{
+    using namespace rtengine::stage;
+
+    static MyMutex toning_lcms_mutex;
+    if (rtengine::lcmsMutex == nullptr) {
+        rtengine::lcmsMutex = &toning_lcms_mutex;
+    }
+    static rtengine::Settings toning_settings{};
+    toning_settings.edghi = 3.0;
+    toning_settings.edglo = 0.5;
+    toning_settings.limrad = 20.0;
+    rtengine::settings = &toning_settings;
+    rtengine::Color::init();
+
+    const std::string profile_path =
+        std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp") +
+        "/stage-residency-lab-wavelet-toning.jsonl";
+
+    if (!available) {
+        skip("lab.wavelet toning: no OpenCL device");
+        return;
+    }
+    check(node_has_device_implementation("lab.wavelet"),
+          "the lab.wavelet node has a device implementation");
+
+    struct ToningCase {
+        const char* label;
+        int width;
+        int height;
+        int levels;
+        bool contrast;
+        bool chroma;
+        bool edge;
+        bool final_curves;
+        int contrast_values[9];
+        int chro;
+        int rg; /* 0 default no-op, 1 custom */
+        int by;
+        double sigmaton;
+        bool expect_change;
+        int image; /* 0 random, 1 skin */
+    };
+
+    const ToningCase cases[] = {
+        {"toning a only", 238, 64, 6, false, false, false, false,
+         {0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, 1, 0, 1.0, true, 1},
+        {"toning b only", 238, 64, 6, false, false, false, false,
+         {0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, 0, 1, 1.0, true, 1},
+        {"toning both", 238, 64, 6, false, false, false, false,
+         {0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, 1, 1, 1.0, true, 1},
+        {"toning sigmaton 0.5", 238, 64, 6, false, false, false, false,
+         {0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, 1, 1, 0.5, true, 0},
+        {"toning sigmaton 2.0", 238, 64, 6, false, false, false, false,
+         {0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, 1, 1, 2.0, true, 1},
+        {"toning with contrast", 238, 64, 6, true, false, false, false,
+         {30, 22, 14, 8, 4, 2, 0, 0, 0}, 0, 1, 1, 1.0, true, 1},
+        {"toning with chroma", 238, 64, 6, false, true, false, false,
+         {40, 30, 20, 10, 5, 2, 0, 0, 0}, 60, 1, 1, 1.0, true, 1},
+        {"toning with edge", 238, 64, 6, false, false, true, false,
+         {0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, 1, 1, 1.0, true, 1},
+        {"toning with final curves", 238, 64, 6, false, false, false, true,
+         {0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, 1, 1, 1.0, true, 1},
+        {"toning padded 179x49", 179, 49, 5, false, false, false, false,
+         {0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, 1, 1, 1.2, true, 1},
+        {"toning levels 3", 179, 48, 3, false, false, false, false,
+         {0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, 1, 1, 1.0, true, 1},
+        {"toning levels 7", 179, 160, 7, false, false, false, false,
+         {0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, 1, 1, 1.0, true, 1},
+    };
+
+    unsigned seed = 0x9e3779b9u;
+    for (const ToningCase& item : cases) {
+        rtengine::procparams::ProcParams params;
+        wavelet_toning_params(params, item.levels);
+        params.wavelet.expcontrast = item.contrast;
+        params.wavelet.expchroma = item.chroma;
+        params.wavelet.expedge = item.edge;
+        params.wavelet.expfinal = item.final_curves;
+        if (item.chroma) {
+            params.wavelet.CHmethod = "link";
+            params.wavelet.chro = item.chro;
+        }
+        for (int level = 0; level < 9; ++level) {
+            params.wavelet.c[level] = item.contrast_values[level];
+        }
+        if (item.rg == 1) {
+            params.wavelet.opacityCurveRG = toning_red_green_curve();
+        }
+        if (item.by == 1) {
+            params.wavelet.opacityCurveBY = toning_blue_yellow_curve();
+        }
+        if (item.final_curves) {
+            params.wavelet.wavclCurve = final_diagonal_curve();
+            params.wavelet.opacityCurveWL = final_opacity_curve();
+        }
+        params.wavelet.sigmaton = item.sigmaton;
+
+        check(labWaveletSupported(params, item.width, item.height),
+              (std::string("lab.wavelet toning ") + item.label +
+               " is the supported set").c_str());
+
+        LabImage source(item.width, item.height);
+        if (item.image == 1) {
+            fill_lab_wavelet_skin(source);
+        } else {
+            fill_lab_tools(source, seed++);
+        }
+
+        rtengine::ImProcFunctions cpu_ipf(&params, false);
+        LabImage cpu(item.width, item.height);
+        cpu.CopyFrom(&source);
+        labWaveletHostBlock(cpu_ipf, params, cpu);
+
+        rtengine::ImProcFunctions device_ipf(&params, false);
+        LabImage device(item.width, item.height);
+        device.CopyFrom(&source);
+        const LabWaveletRun result =
+            run_lab_wavelet_node(device, params, device_ipf, profile_path);
+        const std::string profile = read_file(profile_path);
+
+        check(result.supported,
+              (std::string("lab.wavelet toning ") + item.label +
+               " resolves to the supported set").c_str());
+        check(result.deviceReady,
+              (std::string("lab.wavelet toning ") + item.label +
+               " builds its host setup").c_str());
+        check(result.status == RT_STAGE_OK,
+              (std::string("lab.wavelet toning ") + item.label +
+               " completes through run()").c_str());
+        check(profile.find("\"stage\":\"lab.wavelet\"") != std::string::npos,
+              (std::string("lab.wavelet toning ") + item.label +
+               " records the node").c_str());
+        check(profile.find("\"impl\":\"opencl\"") != std::string::npos,
+              (std::string("lab.wavelet toning ") + item.label +
+               " records a device execution").c_str());
+
+        const Distribution d = distribution(view(device), view(cpu));
+        std::printf("stage-residency: lab.wavelet toning %s %dx%d L%d: PAE "
+                    "%.6f LSB16; exact %zu, <=0.25 %zu, <=0.5 %zu, <=1 %zu, "
+                    ">1 %zu of %zu\n",
+                    item.label, item.width, item.height, item.levels,
+                    d.max_abs, d.exact, d.quarter, d.half, d.one, d.over,
+                    d.samples);
+        check(d.finite,
+              (std::string("lab.wavelet toning ") + item.label +
+               " stays finite").c_str());
+        check(d.over == 0,
+              (std::string("lab.wavelet toning ") + item.label +
+               " is within one LSB16").c_str());
+
+        if (item.expect_change) {
+            rtengine::procparams::ProcParams off = params;
+            off.wavelet.exptoning = false;
+            rtengine::ImProcFunctions off_ipf(&off, false);
+            LabImage off_image(item.width, item.height);
+            off_image.CopyFrom(&source);
+            labWaveletHostBlock(off_ipf, off, off_image);
+            const Diff active = compare(view(cpu), view(off_image));
+            std::printf("stage-residency: lab.wavelet toning %s changes %zu of "
+                        "%zu samples against the panel-off result, PAE "
+                        "%.6f LSB16\n",
+                        item.label, active.differing, active.samples,
+                        active.max_abs);
+            check(active.differing > 0,
+                  (std::string("lab.wavelet toning ") + item.label +
+                   " is non-vacuous").c_str());
+        }
+    }
+
+    /*
+     * Refusals: the protection range, out-of-range sigmaton, a no-op opacity
+     * pair and every panel the node never admits must run the host block byte
+     * for byte.
+     */
+    const char* residual_labels[] = {
+        "protab on", "sigmaton low", "sigmaton high",
+        "no opacity multiplier", "expnoise", "expbl", "expresid",
+        "expclari", "CLmethod one", "skin protection"};
+    for (const char* label : residual_labels) {
+        rtengine::procparams::ProcParams params;
+        wavelet_toning_params(params, 6);
+        params.wavelet.opacityCurveRG = toning_red_green_curve();
+
+        if (std::strcmp(label, "protab on") == 0) {
+            params.wavelet.protab = 10.0;
+        } else if (std::strcmp(label, "sigmaton low") == 0) {
+            params.wavelet.sigmaton = 0.0;
+        } else if (std::strcmp(label, "sigmaton high") == 0) {
+            params.wavelet.sigmaton = 3.0;
+        } else if (std::strcmp(label, "no opacity multiplier") == 0) {
+            wavelet_toning_params(params, 6);
+        } else if (std::strcmp(label, "expnoise") == 0) {
+            params.wavelet.expnoise = true;
+        } else if (std::strcmp(label, "expbl") == 0) {
+            params.wavelet.expbl = true;
+        } else if (std::strcmp(label, "expresid") == 0) {
+            params.wavelet.expresid = true;
+        } else if (std::strcmp(label, "expclari") == 0) {
+            params.wavelet.expclari = true;
+        } else if (std::strcmp(label, "CLmethod one") == 0) {
+            params.wavelet.CLmethod = "one";
+        } else {
+            params.wavelet.skinprotect = 30.0;
+        }
+
+        check(!labWaveletSupported(params, 238, 64),
+              (std::string("lab.wavelet toning residual ") + label +
+               " is a residual").c_str());
+
+        LabImage source(238, 64);
+        fill_lab_wavelet_skin(source);
+
+        rtengine::ImProcFunctions cpu_ipf(&params, false);
+        LabImage cpu(238, 64);
+        cpu.CopyFrom(&source);
+        labWaveletHostBlock(cpu_ipf, params, cpu);
+
+        rtengine::ImProcFunctions device_ipf(&params, false);
+        LabImage device(238, 64);
+        device.CopyFrom(&source);
+        const LabWaveletRun result =
+            run_lab_wavelet_node(device, params, device_ipf, profile_path);
+        const std::string profile = read_file(profile_path);
+
+        check(!result.supported,
+              (std::string("lab.wavelet toning residual ") + label +
+               " is refused as a device configuration").c_str());
+        check(!result.deviceReady,
+              (std::string("lab.wavelet toning residual ") + label +
+               " does not build a device setup").c_str());
+        check(result.status == RT_STAGE_OK,
+              (std::string("lab.wavelet toning residual ") + label +
+               " completes through run()").c_str());
+        check(profile.find("\"impl\":\"host\"") != std::string::npos,
+              (std::string("lab.wavelet toning residual ") + label +
+               " records a host execution").c_str());
+        check(profile.find("\"impl\":\"opencl\"") == std::string::npos,
+              (std::string("lab.wavelet toning residual ") + label +
+               " never mixes a device pass").c_str());
+
+        const Diff diff = compare(view(device), view(cpu));
+        std::printf("stage-residency: lab.wavelet toning residual %s: host, "
+                    "PAE %.6f LSB16, %zu of %zu samples differ\n",
+                    label, diff.max_abs, diff.differing, diff.samples);
+        check(diff.finite,
+              (std::string("lab.wavelet toning residual ") + label +
+               " stays finite").c_str());
+        check(diff.differing == 0 && diff.max_abs == 0.0,
+              (std::string("lab.wavelet toning residual ") + label +
                " matches the CPU block").c_str());
     }
 }
@@ -13273,6 +13611,7 @@ int main()
     test_lab_wavelet_chroma(available);
     test_lab_wavelet_edge(available);
     test_lab_wavelet_final(available);
+    test_lab_wavelet_toning(available);
     test_lab_wavelet_gpu(available);
     test_output_sharpen(available);
     test_lab_sharpening(available);
