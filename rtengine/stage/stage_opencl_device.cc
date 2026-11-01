@@ -6018,6 +6018,7 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
     bool wavelet_skin = false;
     bool wavelet_edge = false;
     bool wavelet_final = false;
+    bool wavelet_toning = false;
     bool wavelet_ab = false;
     const float* wavelet_params = nullptr;
     if (wavelet) {
@@ -6030,7 +6031,9 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
             (context->wavelet.final != 0 &&
              context->wavelet.final != 1) ||
             (context->wavelet.final != 0 &&
-             context->wavelet.compute_final == nullptr)) {
+             context->wavelet.compute_final == nullptr) ||
+            (context->wavelet.toning != 0 &&
+             context->wavelet.toning != 1)) {
             error = "lab.wavelet wavelet pass is not set up";
             return RT_STAGE_FALLBACK;
         }
@@ -6066,6 +6069,7 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
         wavelet_skin = wavelet_params[RT_LW_PARAM_W_SKIN] != 0.0f;
         wavelet_edge = wavelet_params[RT_LW_PARAM_EDGEENA] != 0.0f;
         wavelet_final = context->wavelet.final != 0;
+        wavelet_toning = context->wavelet.toning != 0;
         /* RT_LW_PARAM_CHROMA marks the presence of the a/b planes: the chroma
          * arm, the edge panel and the final curves all keep the block's a/b
          * round trip alive. */
@@ -6078,7 +6082,7 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
             static_cast<int>(labWaveletParamEntries(
                 static_cast<std::uint32_t>(wavelet_planes),
                 static_cast<std::uint32_t>(wavelet_levels), wavelet_edge,
-                wavelet_final))) {
+                wavelet_final, wavelet_toning))) {
             error = "lab.wavelet parameter table has the wrong length";
             return RT_STAGE_INVALID;
         }
@@ -6518,6 +6522,11 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
             final_pixel_kernel = compiled_kernel_entry(
                 env, def, "rt_lab_wavelet_w_final_pixel", error);
         }
+        cl_kernel toning_kernel = nullptr;
+        if (wavelet_toning) {
+            toning_kernel = compiled_kernel_entry(
+                env, def, "rt_lab_wavelet_w_toning", error);
+        }
         if (analysis_v == nullptr || analysis_h == nullptr ||
             haar_v == nullptr || haar_h == nullptr || synth_h == nullptr ||
             synth_v == nullptr || haar_synth_h == nullptr ||
@@ -6525,7 +6534,8 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
             contrast_kernel == nullptr || chroma_kernel == nullptr ||
             (wavelet_edge && edge_kernel == nullptr) ||
             (wavelet_final &&
-             (final_kernel == nullptr || final_pixel_kernel == nullptr))) {
+             (final_kernel == nullptr || final_pixel_kernel == nullptr)) ||
+            (wavelet_toning && toning_kernel == nullptr)) {
             return RT_STAGE_FALLBACK;
         }
 
@@ -6562,6 +6572,16 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
                        1 + wavelet_levels *
                                static_cast<int>(RT_LAB_WAVELET_EDGE_ENTRIES) +
                            RT_LAB_WAVELET_CURVE_ENTRIES)
+                 : 0);
+        const cl_int cl_toning_offset =
+            cl_final_offset +
+            (wavelet_final
+                 ? static_cast<cl_int>(
+                       1 + wavelet_levels *
+                               static_cast<int>(
+                                   RT_LAB_WAVELET_FINAL_STATS_ENTRIES) +
+                           RT_LAB_WAVELET_CURVE_ENTRIES +
+                           RT_LAB_WAVELET_FINAL_LUT_ENTRIES)
                  : 0);
         const cl_int cl_strength_index = static_cast<cl_int>(
             RT_LW_PARAM_STRENGTH);
@@ -6906,6 +6926,40 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
                     if (!ok || !launch(chroma_kernel, band_global,
                                        "lab.wavelet chroma")) {
                         error = "lab.wavelet chroma arguments failed";
+                        return false;
+                    }
+                }
+                if (wavelet_toning && plane_index > 0) {
+                    cl_int channel = plane_index == 1 ? 0 : 1;
+                    ok = ok && set_arg(toning_kernel, 0, sizeof(cl_mem),
+                                       &band1);
+                    ok = ok && set_arg(toning_kernel, 1, sizeof(cl_int),
+                                       &bp1);
+                    ok = ok && set_arg(toning_kernel, 2, sizeof(cl_mem),
+                                       &band2);
+                    ok = ok && set_arg(toning_kernel, 3, sizeof(cl_int),
+                                       &bp2);
+                    ok = ok && set_arg(toning_kernel, 4, sizeof(cl_mem),
+                                       &band3);
+                    ok = ok && set_arg(toning_kernel, 5, sizeof(cl_int),
+                                       &bp3);
+                    ok = ok && set_arg(toning_kernel, 6, sizeof(cl_mem),
+                                       &params_memory);
+                    ok = ok && set_arg(toning_kernel, 7, sizeof(cl_int),
+                                       &cl_toning_offset);
+                    ok = ok && set_arg(toning_kernel, 8, sizeof(cl_int),
+                                       &cl_level);
+                    ok = ok && set_arg(toning_kernel, 9, sizeof(cl_int),
+                                       &wavelet_levels);
+                    ok = ok && set_arg(toning_kernel, 10, sizeof(cl_int),
+                                       &channel);
+                    ok = ok && set_arg(toning_kernel, 11, sizeof(cl_int),
+                                       &cl_half_w);
+                    ok = ok && set_arg(toning_kernel, 12, sizeof(cl_int),
+                                       &cl_half_h);
+                    if (!ok || !launch(toning_kernel, band_global,
+                                       "lab.wavelet toning")) {
+                        error = "lab.wavelet toning arguments failed";
                         return false;
                     }
                 }

@@ -58,7 +58,7 @@ struct ProcParams;
  * wavelet tool's own skin protection: the equaliser only changes L, so a/b
  * and their masks are identical at the start of both passes.
  */
-#define RT_LAB_WAVELET_CONTEXT_VERSION 4u
+#define RT_LAB_WAVELET_CONTEXT_VERSION 5u
 /* "LWCT": rejects a stale or unrelated pointer before any callback runs. */
 #define RT_LAB_WAVELET_CONTEXT_MAGIC 0x4C574354u
 /* The number of levels of the directional pyramid. */
@@ -154,6 +154,16 @@ struct ProcParams;
  */
 #define RT_LAB_WAVELET_FINAL_STATS_ENTRIES 3u
 #define RT_LAB_WAVELET_FINAL_LUT_ENTRIES 65536u
+/*
+ * The toning tail, present only when the toning panel runs:
+ *   [0]                  sigmaton
+ *   [1 + channel*9 + l]  mulopaRG/mulopaBY at level l (channel 0 = a, 1 = b)
+ *   then 2 * levels * 10 mea entries: channel-major, level-major, the
+ *   block's calceffect() with sigmaton and an offset of 1.
+ */
+#define RT_LAB_WAVELET_TONING_MULS 9u
+#define RT_LAB_WAVELET_TONING_HEADER 19u
+#define RT_LAB_WAVELET_TONING_MEA_ENTRIES 10u
 
 /*
  * The exact length of the wavelet parameter table. Both the host builder and
@@ -162,7 +172,7 @@ struct ProcParams;
  */
 inline std::size_t labWaveletParamEntries(std::uint32_t planes,
                                           std::uint32_t levels, bool edge,
-                                          bool final_curves)
+                                          bool final_curves, bool toning)
 {
     std::size_t entries = RT_LAB_WAVELET_WAVELET_PARAMS +
                           static_cast<std::size_t>(planes) *
@@ -178,6 +188,11 @@ inline std::size_t labWaveletParamEntries(std::uint32_t planes,
                            RT_LAB_WAVELET_FINAL_STATS_ENTRIES +
                    RT_LAB_WAVELET_CURVE_ENTRIES +
                    RT_LAB_WAVELET_FINAL_LUT_ENTRIES;
+    }
+    if (toning) {
+        entries += RT_LAB_WAVELET_TONING_HEADER +
+                   2 * static_cast<std::size_t>(levels) *
+                       RT_LAB_WAVELET_TONING_MEA_ENTRIES;
     }
     return entries;
 }
@@ -234,6 +249,8 @@ typedef struct RtLabWaveletWavelet {
     uint32_t planes;
     /* 1 when the final-curve tail is present in `params`. */
     uint32_t final;
+    /* 1 when the toning tail is present in `params`. */
+    uint32_t toning;
     float* params;
     int (*compute_mea)(void* self, const float* stats, uint32_t levels,
                        uint32_t plane);
@@ -328,6 +345,9 @@ inline constexpr double LAB_WAVELET_MAX_WAVELET_EDGEFFECT = 2.5;
 /* The final panel's sigmafin slider range. */
 inline constexpr double LAB_WAVELET_MIN_WAVELET_SIGMAFIN = 0.025;
 inline constexpr double LAB_WAVELET_MAX_WAVELET_SIGMAFIN = 2.5;
+/* The toning panel's sigmaton slider range. */
+inline constexpr double LAB_WAVELET_MIN_WAVELET_SIGMATON = 0.025;
+inline constexpr double LAB_WAVELET_MAX_WAVELET_SIGMATON = 2.5;
 
 /* The block's `scale` argument at every export call site. The equaliser's
  * BadpixelsLab() radius is 4 / scale, and the launcher requires this value. */
@@ -351,9 +371,9 @@ int labWaveletTransformLevels(const procparams::ProcParams& params,
 
 /*
  * Whether the wavelet pass is the node's supported set: the contrast panel,
- * the chroma panel's "link" arm, the edge panel's plain arm and the final
- * panel's curve arm, no residual, toning, noise, clarity or blur panel, the
- * "all" level method, full-tile processing, no soft radius, no L contrast
+ * the chroma panel's "link" arm, the edge panel's plain arm, the final
+ * panel's curve arm and the toning panel's zero-protection arm, no residual,
+ * noise, clarity or blur panel, the "all" level method, full-tile processing, no soft radius, no L contrast
  * skin protection, no avoid-colour-shift or blue-sky median, no extra level,
  * the default 8-tap Daubechies, a highlight/shadow method the block
  * implements, identity chroma-by-hue and hue curves, every scalar in range
@@ -442,6 +462,7 @@ private:
     bool wavelet_chroma_ = false;
     bool wavelet_edge_ = false;
     bool wavelet_final_ = false;
+    bool wavelet_toning_ = false;
     bool wavelet_ab_ = false;
     int wavelet_levels_ = 0;
     float wavelet_skinprotect_ = 0.f;

@@ -97,6 +97,36 @@ bool hueInRange(int value)
            normalised <= LAB_WAVELET_MAX_HUE;
 }
 
+/*
+ * ip_wavelet()'s mulopaRG/mulopaBY: nine samples of the 501-point opacity
+ * curve at the fixed indices, scaled to a percentage. An unallocated curve
+ * leaves every multiplier at zero, which is the block's own no-op.
+ */
+void toningMultipliers(const procparams::WaveletParams& wavelet,
+                       float rg[RT_LAB_WAVELET_TONING_MULS],
+                       float by[RT_LAB_WAVELET_TONING_MULS], bool& any)
+{
+    static constexpr int indices[RT_LAB_WAVELET_TONING_MULS] = {
+        0, 62, 125, 187, 250, 312, 375, 438, 500};
+    WavOpacityCurveRG curve_rg;
+    WavOpacityCurveBY curve_by;
+    curve_rg.Set(wavelet.opacityCurveRG);
+    curve_by.Set(wavelet.opacityCurveBY);
+    const bool rg_active = static_cast<bool>(curve_rg);
+    const bool by_active = static_cast<bool>(curve_by);
+    any = false;
+    for (std::uint32_t level = 0; level < RT_LAB_WAVELET_TONING_MULS;
+         ++level) {
+        rg[level] = rg_active
+                        ? 200.f * (curve_rg[indices[level]] - 0.5f)
+                        : 0.f;
+        by[level] = by_active
+                        ? 200.f * (curve_by[indices[level]] - 0.5f)
+                        : 0.f;
+        any = any || rg[level] != 0.f || by[level] != 0.f;
+    }
+}
+
 } // namespace
 
 int labWaveletLastLevel(const double* mult)
@@ -305,10 +335,33 @@ bool labWaveletWaveletSupported(const procparams::ProcParams& params,
     const bool edge = wavelet.expedge;
     const bool edge_active = edge && wavelet.edgval > 0;
     const bool final_curves = wavelet.expfinal;
-    if ((!contrast && !chroma && !edge_active && !final_curves) ||
-        wavelet.expbl || wavelet.expresid || wavelet.exptoning ||
-        wavelet.expnoise || wavelet.expclari) {
+    const bool toning = wavelet.exptoning;
+    if ((!contrast && !chroma && !edge_active && !final_curves && !toning) ||
+        wavelet.expbl || wavelet.expresid || wavelet.expnoise ||
+        wavelet.expclari) {
         return false;
+    }
+    /*
+     * Toning's protection range is not ported; the zero-protection arm
+     * (protab == 0) is the coefficient multiply. The opacity curves must
+     * actually produce a multiplier, otherwise the panel is a no-op dressed
+     * up as a device pass. sigmaton must be inside its slider range because
+     * calceffect() divides by it.
+     */
+    if (toning) {
+        if (wavelet.protab != 0.0 ||
+            !std::isfinite(wavelet.sigmaton) ||
+            wavelet.sigmaton < LAB_WAVELET_MIN_WAVELET_SIGMATON ||
+            wavelet.sigmaton > LAB_WAVELET_MAX_WAVELET_SIGMATON) {
+            return false;
+        }
+        float rg[RT_LAB_WAVELET_TONING_MULS] = {};
+        float by[RT_LAB_WAVELET_TONING_MULS] = {};
+        bool any = false;
+        toningMultipliers(wavelet, rg, by, any);
+        if (!any) {
+            return false;
+        }
     }
     /*
      * An enabled edge panel with a zero strength is a no-op, but the panel is
@@ -744,6 +797,7 @@ RtLabWaveletContext LabWaveletContext::descriptor(bool supported)
     context.wavelet.taps = 8u;
     context.wavelet.planes = wavelet_ab_ ? 3u : 1u;
     context.wavelet.final = wavelet_final_ ? 1u : 0u;
+    context.wavelet.toning = wavelet_toning_ ? 1u : 0u;
     context.wavelet.entries = static_cast<uint32_t>(
         wavelet_params_.size());
     context.wavelet.params =
@@ -821,14 +875,31 @@ int LabWaveletContext::build(RtLabWaveletResult& out)
                      params_.wavelet.sigmafin <=
                          LAB_WAVELET_MAX_WAVELET_SIGMAFIN;
     /*
-     * ip_wavelet() keeps the a/b decomposition alive whenever the edge or
-     * final panel is enabled: the level-trim around ContAllAB() has a
-     * `!cp.edgeena`/`!cp.finena` condition, so a/b are decomposed and
-     * reconstructed even with Expchroma off. The round trip is not an exact
-     * identity, so the device must run it to match the block. The chroma
-     * multiply itself is still gated by its own flags in the kernel.
+     * The toning panel's zero-protection arm. The admission rules repeat here
+     * so a forced build can never run a partial toning pass.
      */
-    wavelet_ab_ = wavelet_chroma_ || wavelet_edge_ || wavelet_final_;
+    wavelet_toning_ = false;
+    if (params_.wavelet.enabled && params_.wavelet.exptoning &&
+        params_.wavelet.protab == 0.0 &&
+        std::isfinite(params_.wavelet.sigmaton) &&
+        params_.wavelet.sigmaton >= LAB_WAVELET_MIN_WAVELET_SIGMATON &&
+        params_.wavelet.sigmaton <= LAB_WAVELET_MAX_WAVELET_SIGMATON) {
+        float rg[RT_LAB_WAVELET_TONING_MULS] = {};
+        float by[RT_LAB_WAVELET_TONING_MULS] = {};
+        bool any = false;
+        toningMultipliers(params_.wavelet, rg, by, any);
+        wavelet_toning_ = any;
+    }
+    /*
+     * ip_wavelet() keeps the a/b decomposition alive whenever the edge,
+     * final or toning panel is enabled: the level-trim around ContAllAB() has
+     * a `!cp.edgeena`/`!cp.finena`/`!cp.toningena` condition, so a/b are
+     * decomposed and reconstructed even with Expchroma off. The round trip is
+     * not an exact identity, so the device must run it to match the block. The
+     * chroma multiply itself is still gated by its own flags in the kernel.
+     */
+    wavelet_ab_ = wavelet_chroma_ || wavelet_edge_ || wavelet_final_ ||
+                  wavelet_toning_;
 
     if (levels_ > 0) {
         if (width_ < 8 || height_ < 8) {
@@ -892,7 +963,8 @@ int LabWaveletContext::build(RtLabWaveletResult& out)
         wavelet_params_.assign(
             labWaveletParamEntries(static_cast<std::uint32_t>(planes),
                                    static_cast<std::uint32_t>(wavelet_levels_),
-                                   wavelet_edge_, wavelet_final_),
+                                   wavelet_edge_, wavelet_final_,
+                                   wavelet_toning_),
             0.f);
 
         float* table = wavelet_params_.data();
@@ -1057,6 +1129,35 @@ int LabWaveletContext::build(RtLabWaveletResult& out)
                 final_lut[index] = wavcl_curve[static_cast<int>(index)];
             }
         }
+        if (wavelet_toning_) {
+            const std::size_t toning_offset =
+                RT_LAB_WAVELET_WAVELET_PARAMS +
+                planes * static_cast<std::size_t>(wavelet_levels_) *
+                    RT_LAB_WAVELET_MEA_ENTRIES +
+                (wavelet_edge_
+                     ? 1 + static_cast<std::size_t>(wavelet_levels_) *
+                               RT_LAB_WAVELET_EDGE_ENTRIES +
+                           RT_LAB_WAVELET_CURVE_ENTRIES
+                     : 0) +
+                (wavelet_final_
+                     ? 1 + static_cast<std::size_t>(wavelet_levels_) *
+                               RT_LAB_WAVELET_FINAL_STATS_ENTRIES +
+                           RT_LAB_WAVELET_CURVE_ENTRIES +
+                           RT_LAB_WAVELET_FINAL_LUT_ENTRIES
+                     : 0);
+            float* toning_tail = table + toning_offset;
+            toning_tail[0] = static_cast<float>(wavelet.sigmaton);
+            float rg[RT_LAB_WAVELET_TONING_MULS] = {};
+            float by[RT_LAB_WAVELET_TONING_MULS] = {};
+            bool any = false;
+            toningMultipliers(wavelet, rg, by, any);
+            for (std::uint32_t level = 0;
+                 level < RT_LAB_WAVELET_TONING_MULS; ++level) {
+                toning_tail[1 + level] = rg[level];
+                toning_tail[1 + RT_LAB_WAVELET_TONING_MULS + level] =
+                    by[level];
+            }
+        }
     }
 
     built_ = true;
@@ -1097,6 +1198,29 @@ int LabWaveletContext::computeMea(const float* stats, uint32_t levels,
     if (wavelet_edge_ && plane == 0) {
         edge_mea = wavelet_params_.data() + edge_offset + 1;
     }
+    float* toning_mea = nullptr;
+    if (wavelet_toning_ && plane >= 1) {
+        const std::size_t final_offset =
+            edge_offset +
+            (wavelet_edge_
+                 ? 1 + static_cast<std::size_t>(levels) *
+                           RT_LAB_WAVELET_EDGE_ENTRIES +
+                       RT_LAB_WAVELET_CURVE_ENTRIES
+                 : 0);
+        const std::size_t toning_offset =
+            final_offset +
+            (wavelet_final_
+                 ? 1 + static_cast<std::size_t>(levels) *
+                           RT_LAB_WAVELET_FINAL_STATS_ENTRIES +
+                       RT_LAB_WAVELET_CURVE_ENTRIES +
+                       RT_LAB_WAVELET_FINAL_LUT_ENTRIES
+                 : 0);
+        toning_mea = wavelet_params_.data() + toning_offset +
+                     RT_LAB_WAVELET_TONING_HEADER +
+                     static_cast<std::size_t>(plane - 1) *
+                         static_cast<std::size_t>(levels) *
+                         RT_LAB_WAVELET_TONING_MEA_ENTRIES;
+    }
 
     for (uint32_t level = 0; level < levels; ++level) {
         float averagePlus[4] = {};
@@ -1126,6 +1250,14 @@ int LabWaveletContext::computeMea(const float* stats, uint32_t levels,
         maxL /= 3;
         mean[level] = averageL;
         sigma[level] = sigL;
+
+        if (toning_mea != nullptr) {
+            ipf_.calceffect(
+                static_cast<int>(level), mean, sigma,
+                toning_mea + static_cast<std::size_t>(level) *
+                                 RT_LAB_WAVELET_TONING_MEA_ENTRIES,
+                static_cast<float>(params_.wavelet.sigmaton), 1.f);
+        }
 
         ipf_.calceffect(static_cast<int>(level), mean, sigma,
                         mea + static_cast<std::size_t>(level) *

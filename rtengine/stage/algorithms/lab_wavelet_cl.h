@@ -420,6 +420,10 @@ __kernel void rt_lab_wavelet_equalize(
 /* Mirrors RT_LAB_WAVELET_FINAL_STATS_ENTRIES and FINAL_LUT_ENTRIES. */
 #define RT_LW_W_FINAL_STATS 3
 #define RT_LW_W_FINAL_LUT 65536
+/* Mirrors the toning tail constants. */
+#define RT_LW_W_TONING_MULS 9
+#define RT_LW_W_TONING_HEADER 19
+#define RT_LW_W_TONING_MEA_ENTRIES 10
 
 /*
  * Level 0 analysis, vertical half. One work item per output column and output
@@ -1370,5 +1374,71 @@ __kernel void rt_lab_wavelet_w_final_pixel(
         out = 1.0f;
     }
     l[at] = out;
+}
+
+/*
+ * The toning panel's zero-protection arm: ContAllAB()'s opacity-curve
+ * multiply on the a/b bands. `channel` selects the a (0) or b (1) plane.
+ * The protection range (protab > 0) is a host residual, so kreduc1/kreduc2
+ * are one and the host's full-resolution reference is not read.
+ */
+__kernel void rt_lab_wavelet_w_toning(
+    __global float* band1, int p1,
+    __global float* band2, int p2,
+    __global float* band3, int p3,
+    __global const float* params, int toning_offset,
+    int level, int levels, int channel, int w, int h)
+{
+    const int x = get_global_id(0);
+    const int y = get_global_id(1);
+    if (x >= w || y >= h || level >= RT_LW_W_TONING_MULS) {
+        return;
+    }
+
+    const float mul =
+        params[toning_offset + 1 + channel * RT_LW_W_TONING_MULS + level];
+    if (mul == 0.0f) {
+        return;
+    }
+
+    const __global float* mea =
+        params + toning_offset + RT_LW_W_TONING_HEADER +
+        (channel * levels + level) * RT_LW_W_TONING_MEA_ENTRIES;
+
+    for (int dir = 0; dir < 3; ++dir) {
+        __global float* band =
+            dir == 0 ? band1 : (dir == 1 ? band2 : band3);
+        const int pitch = dir == 0 ? p1 : (dir == 1 ? p2 : p3);
+        const int at = y * pitch + x;
+        const float magnitude = fabs(band[at]);
+
+        float betaab;
+        if (magnitude < mea[0]) {
+            betaab = 0.05f;
+        } else if (magnitude < mea[1]) {
+            betaab = 0.2f;
+        } else if (magnitude < mea[2]) {
+            betaab = 0.7f;
+        } else if (magnitude < mea[3]) {
+            betaab = 1.0f;
+        } else if (magnitude < mea[4]) {
+            betaab = 1.0f;
+        } else if (magnitude < mea[5]) {
+            betaab = 0.8f;
+        } else if (magnitude < mea[6]) {
+            betaab = 0.6f;
+        } else if (magnitude < mea[7]) {
+            betaab = 0.4f;
+        } else if (magnitude < mea[8]) {
+            betaab = 0.2f;
+        } else if (magnitude < mea[9]) {
+            betaab = 0.1f;
+        } else {
+            betaab = 0.0f;
+        }
+
+        const float beta = (1024.0f + 50.0f * mul * betaab) / 1024.0f;
+        band[at] *= beta;
+    }
 }
 )CLC";
