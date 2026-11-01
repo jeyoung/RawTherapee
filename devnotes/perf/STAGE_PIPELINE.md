@@ -305,7 +305,7 @@ panes records them separately. Both tools are off by default.
 | `rgb.proc` | Full/Full/Roi/Reduced | path | reuse-input | RGB curves, tone curve, colour toning, B&W, channel mixer, HSV, film simulation | yes |
 | `lab.tools` | Full/Full/Roi/Reduced | path | reuse-input | shadows/highlights, vibrance, Lab curves (including the chromaticity slider and the C=f(H)/L=f(H)/H=f(H) hue flat curves), local contrast, black-and-white (cheap and `bwToning` arms), EPD, Lab-grid colour toning and Lab colour-correction regions | partial |
 | `lab.sharpening` | Full/-/Roi/- | path | reuse-input | impulse denoise and defringe (own node), ML sharpen edges, ML microcontrast and the main sharpen pass (shared `output.sharpen` node) | partial |
-| `lab.wavelet` | Full/Full/Roi/Reduced | path | reuse-input | directional pyramid equaliser and wavelet | partial |
+| `lab.wavelet` | Full/Full/Roi/Reduced | path | reuse-input | directional pyramid equaliser and wavelet contrast, chroma `link`, edge plain arm and final curves | partial |
 | `working.trc` | Full/Full/Roi/- | path | reuse-input | soft light, tone equaliser and working-TRC conversion | partial |
 | `ciecam` | Full/Full/Roi/- | path | reuse-input | CIE CAM 02 | no |
 | `gamut` | Full/Full/Roi/Reduced | path | reuse-input | working-space gamut compression | yes |

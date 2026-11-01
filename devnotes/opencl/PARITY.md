@@ -80,9 +80,19 @@ pairs are exact. The gate is the peak absolute error (PAE) in normalised units;
 | 2026-10-31 | c5ed40c3c | POCL (CPU) | colorspace_flowers.pef / `labwavelet-edge.pp3` (edge plain arm, active `ccwcurve`), `lab.wavelet` | off vs auto, 16-bit TIFF | 1 LSB | PASS |
 | 2026-10-31 | c5ed40c3c | POCL (CPU) | 17-case edge matrix (strengths 50/100, radius 90, thresholds 60/-30, effect 0.6/2.5, reinforce more/none/less, identity and custom `ccwcurve`, with contrast, with chroma, contrast+chroma, 179x49 padded, 3 and 7 levels), `stage-residency-test` | device vs host block | 0.058594 LSB16 (worst) | PASS |
 | 2026-10-31 | c5ed40c3c | POCL (CPU) | 12-case edge residual matrix (median level, NP low/high, Lipst, EDmethod SL, edgval/edgrad/edgthresh/edgeffect ranges, unknown Medgreinf, zero strength, skin protection), `stage-residency-test` | device vs host block | 0 (host) | PASS |
+| 2026-11-01 | 6a54860e1..873000037 | POCL (CPU) | colorspace_flowers.pef / `labwavelet-final.pp3` (final curves: non-identity `wavclCurve` and `opacityCurveWL`, sigmafin 1), `lab.wavelet` | off vs auto, 16-bit TIFF | 1 LSB | PASS |
+| 2026-11-01 | 6a54860e1..873000037 | POCL (CPU) | 13-case final-curve matrix (diagonal only, opacity only, both, sigmafin 0.5/2.0, default curves, with contrast, with chroma, with edge, 179x49 padded, 3 and 7 levels, inert balance controls), `stage-residency-test` | device vs host block | 0.015625 LSB16 (worst) | PASS |
+| 2026-11-01 | 6a54860e1..873000037 | POCL (CPU) | 15-case final-curve residual matrix (softradend, softrad, BAmethod sli, tmr, expclari, sigmafin low/high, avoid, median, expbl, expresid, exptoning, expnoise, CLmethod one, skin protection), `stage-residency-test` | device vs host block | 0 (host) | PASS |
 
 `47c50ee77` changes only CPU export buffer handling; the OpenCL rows above
 re-run the existing GPU stages against the new CPU neighbour.
+
+The `--quick` neutral row and the `--stage-device` sweep could not complete on
+this host: the neutral export records no classic `lab2srgb` stage, and the
+sweep stops at its baseline `output.convert` row. The final-curve gate was
+therefore run directly with the same off/auto commands and profile; it records
+`impl=opencl` for `lab.wavelet` at 1 LSB16. The stage-residency POCL run above
+is complete and is the parity evidence for this unit.
 `verify.sh --quick` also re-ran the monitor self-test: max 1 byte, 14 of
 196608 samples. The exact CPU export parity for that commit (neutral, sidecar,
 sidecar `-f`, both `WorkingTRC` profiles, `AE=0`) is recorded in
@@ -241,6 +251,22 @@ peak absolute error is zero for the synthetic node tests:
   non-zero transition is also a host residual because the block's padded
   extent does not cover the transition ring the host reads. Negative damping
   is refused by the predicate and is not a runtime case.
+- The `lab.wavelet` final-curve arm runs `finalContAllL()` on the statistics
+  `Evaluate2()` recomputes after the contrast and edge passes, then applies
+  the pixel-domain `wavclCurve` before the block's `L <= 0 -> 1` clamp. Both
+  the 501-point `opacityCurveWL` and the 65536-entry diagonal LUT are sampled
+  on the host through the block's own curves. `Expfinal` also keeps the a/b
+  round trip alive, so the device runs it without `Expchroma`/`Expedge`.
+  Thirteen device cases (diagonal only, opacity only, both, sigmafin 0.5/2.0,
+  default curves, with contrast, with chroma, with edge, 179x49 padded, 3 and
+  7 levels, inert balance controls) match the host block with a worst peak
+  error of 0.015625 LSB16; the panel-off comparison changes 15,232-76,640
+  samples in the twelve checked cases, so the parity is not vacuous. Fifteen
+  residual
+  configurations (softradend, softrad, `BAmethod` sli, `tmr`, `expclari`,
+  sigmafin below/above its slider range, avoid, median, expbl, expresid,
+  exptoning, expnoise, CLmethod one and skin protection) run the host
+  builtin byte for byte. `labwavelet-final.pp3` is 1 LSB16 on the export TIFF.
 - Impulse denoise and defringe, through the `lab.sharpening` node, run as one
   atomic pair. The device test compares the observable corrected sets and all
   three planes: the impulse fixture and the combined pair correct exactly the
