@@ -5,7 +5,7 @@ without the local plan file. It records state, decisions, per-unit
 evidence and next tasks; architecture and invariants stay in the sibling
 records. Update it with each landed unit.
 
-Refreshed 2026-10-31. P0 blocks 1-4.1 are complete; block 4 device coverage is
+Refreshed 2026-11-02. P0 blocks 1-4.1 are complete; block 4 device coverage is
 the remaining large piece and is scoped below. Stage C has landed local
 sharpening (base and damped), `crop` and the `lab.sharpening`
 impulse-denoise/defringe pair; the remaining Stage C units are multi-session
@@ -14,10 +14,9 @@ and are ordered below. Each stable, scanned range is pushed from 2026-10-29 on.
 ## State
 
 - Repository: `$REPO`
-- Worktree: the main checkout, branch `perf-graph`, clean and fifteen
-  commits ahead of `origin/perf-graph` (`e77993457`); the last pushed tip is
-  `e77993457`. All pushed ranges were scanned per the publication gate; the
-  fifteen local commits are not pushed.
+- Worktree: the main checkout, branch `perf-graph`, clean and in sync with
+  `origin/perf-graph`; the last pushed tip is `d6fc75aa8`. All pushed ranges
+  were scanned per the publication gate.
 - Stage C landed 2026-10-31: `local.adjustments` local sharpening (undamped
   `cd38028bb..7467f563f`, damped `211c12597..ebbeab951`), the `crop` device
   node (`544f01573`, `0885d952c`), the `lab.sharpening` impulse-denoise +
