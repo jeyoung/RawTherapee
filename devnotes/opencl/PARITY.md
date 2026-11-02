@@ -91,6 +91,8 @@ pairs are exact. The gate is the peak absolute error (PAE) in normalised units;
 | 2026-11-02 | uncommitted | POCL (CPU) | colorspace_flowers.pef / `labtools-labcurve-contrast.pp3` with `Gamutmunse=XYZ`, `lab.tools` | off vs auto, 16-bit TIFF | 0 (exact) | PASS |
 | 2026-11-02 | uncommitted | POCL (CPU) | colorspace_flowers.pef / `labtools-labcurve-contrast.pp3` with `Gamutmunse=XYZREL`, `lab.tools` | off vs auto, 16-bit TIFF | 0 (exact) | PASS |
 | 2026-11-02 | uncommitted | POCL (CPU) | 4-case lab.tools XYZ/XYZREL Lab-curve matrix (XYZ with all six tables on the saturated image, XYZREL, XYZ neutral, XYZ with the three hue curves), `stage-residency-test` | device vs host block | 0.753906 LSB16 (worst: XYZ with hue curves, 0 samples over 1); XYZ 0.317383, XYZREL 0.066406, XYZ neutral 0 | PASS |
+| 2026-11-02 | uncommitted | POCL (CPU) | colorspace_flowers.pef / `labtools-labcurve-contrast.pp3` with `Gamutmunse=LAB`, `lab.tools` | off vs auto, 16-bit TIFF | 0 (exact) | PASS |
+| 2026-11-02 | uncommitted | POCL (CPU) | 3-case lab.tools LAB Lab-curve matrix (LAB with all six tables on the saturated image, LAB neutral, LAB with the three hue curves), `stage-residency-test` | device vs host block | 0.011719 LSB16 (worst: LAB with hue curves); LAB all tables 0, LAB neutral 0 | PASS |
 
 The XYZ and XYZREL rows use `ICCStore::workingSpaceMatrix()` as
 `Color::gamutmap()`'s `p`, which is the host's `wp` in
@@ -100,6 +102,23 @@ output-gamut control in `iplab2rgb.cc`; it is not this block's argument. The
 device export records `"impl":"opencl"` for `lab.tools` in both rows, and the
 device runs `XYZREL` with the block's `0.5` halfway blend, not the local
 adjustments' `0.3`.
+
+The LAB row is `Color::gamutLchonly()`'s RGB overload, which is a different
+function from the saturation overload vibrance already uses. It converts the
+current L and C to XYZ at the block's 65535 scale, multiplies by
+`ICCStore::workingSpaceInverseMatrix()` as a double matrix, and iterates on
+the RGB clip tests: a negative channel drives the chroma down by 0.96 and
+lifts a very low L, and a clipped coloured highlight (`!isHLEnabled`, max
+above 65535 with min at or below it) does the same with a lower L. `HH` is
+passed only for the ultra-blue L floor, and the function returns nothing but
+the corrected L, C and RGB. `isHLEnabled` is `toneCurve.hrenabled`, the same
+flag the launcher already passes as `highlight`, and the lower and higher
+factors are the block's `0.15` and `0.96`. The arm then rebuilds `lnew`'s L,
+a and b from the corrected L and C and runs the Munsell arm after it, exactly
+as the host orders the two. The device export above records `"impl":"opencl"`
+and is pixel-identical, and the all-tables and neutral matrix cases are
+bit-exact; the hue-curve case differs by 0.011719 LSB16, below the one-LSB
+gate.
 
 `47c50ee77` changes only CPU export buffer handling; the OpenCL rows above
 re-run the existing GPU stages against the new CPU neighbour.
