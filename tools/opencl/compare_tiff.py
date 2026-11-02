@@ -9,6 +9,7 @@
 #
 import argparse
 import os
+import shutil
 import struct
 import subprocess
 import sys
@@ -21,10 +22,24 @@ CHUNK_ROWS = 256
 
 
 def normalise(path, destination):
-    subprocess.run(
-        ["magick", path, "-depth", "16", "-endian", "LSB",
-         "-compress", "none", "tiff:" + destination],
-        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if shutil.which("magick") is not None:
+        subprocess.run(
+            ["magick", path, "-depth", "16", "-endian", "LSB",
+             "-compress", "none", "tiff:" + destination],
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return
+
+    # RawTherapee's 16-bit TIFF export is already uncompressed and planar, so
+    # the ImageMagick conversion is a byte copy. Keep the gate usable on hosts
+    # without ImageMagick, but refuse anything that still needs converting.
+    reader = TiffReader(path)
+    if reader.bits == 16 and reader.compression == 1 and reader.planar == 1:
+        reader.file.close()
+        shutil.copyfile(path, destination)
+        return
+    reader.file.close()
+    raise SystemExit(
+        "ImageMagick is required to normalise a compressed or non-16-bit TIFF")
 
 
 class TiffReader:

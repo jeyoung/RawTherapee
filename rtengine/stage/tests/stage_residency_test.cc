@@ -7857,7 +7857,7 @@ void test_lab_wavelet_contrast(bool available)
     const char* residual_labels[] = {
         "expcontrast off", "expchroma on", "expedge on", "expbl on",
         "expresid on", "expnoise on",
-        "expclari on", "CLmethod one", "Tilesmethod big", "softrad",
+        "Tilesmethod big", "softrad",
         "skinprotect", "avoid", "median", "sup", "daubcoeffmethod 4_",
         "HSmethod other", "Chcurve", "sigma range", "offset range",
         "lowthr range", "threshold range", "threshold2 range",
@@ -7880,10 +7880,6 @@ void test_lab_wavelet_contrast(bool available)
             params.wavelet.expresid = true;
         } else if (std::strcmp(label, "expnoise on") == 0) {
             params.wavelet.expnoise = true;
-        } else if (std::strcmp(label, "expclari on") == 0) {
-            params.wavelet.expclari = true;
-        } else if (std::strcmp(label, "CLmethod one") == 0) {
-            params.wavelet.CLmethod = "one";
         } else if (std::strcmp(label, "Tilesmethod big") == 0) {
             params.wavelet.Tilesmethod = "big";
         } else if (std::strcmp(label, "softrad") == 0) {
@@ -8895,9 +8891,9 @@ void test_lab_wavelet_final(bool available)
      * admits must run the host block byte for byte.
      */
     const char* residual_labels[] = {
-        "softradend", "softrad", "BAmethod sli", "tmr", "expclari",
+        "softradend", "softrad", "BAmethod sli", "tmr",
         "sigmafin low", "sigmafin high", "avoid", "median", "expbl",
-        "expresid", "expnoise", "CLmethod one",
+        "expresid", "expnoise",
         "skin protection"};
     for (const char* label : residual_labels) {
         rtengine::procparams::ProcParams params;
@@ -8911,8 +8907,6 @@ void test_lab_wavelet_final(bool available)
             params.wavelet.BAmethod = "sli";
         } else if (std::strcmp(label, "tmr") == 0) {
             params.wavelet.tmr = true;
-        } else if (std::strcmp(label, "expclari") == 0) {
-            params.wavelet.expclari = true;
         } else if (std::strcmp(label, "sigmafin low") == 0) {
             params.wavelet.sigmafin = 0.0;
         } else if (std::strcmp(label, "sigmafin high") == 0) {
@@ -8927,8 +8921,6 @@ void test_lab_wavelet_final(bool available)
             params.wavelet.expresid = true;
         } else if (std::strcmp(label, "expnoise") == 0) {
             params.wavelet.expnoise = true;
-        } else if (std::strcmp(label, "CLmethod one") == 0) {
-            params.wavelet.CLmethod = "one";
         } else {
             params.wavelet.skinprotect = 30.0;
         }
@@ -9247,7 +9239,7 @@ void test_lab_wavelet_toning(bool available)
     const char* residual_labels[] = {
         "protab on", "sigmaton low", "sigmaton high",
         "no opacity multiplier", "expnoise", "expbl", "expresid",
-        "expclari", "CLmethod one", "skin protection"};
+        "skin protection"};
     for (const char* label : residual_labels) {
         rtengine::procparams::ProcParams params;
         wavelet_toning_params(params, 6);
@@ -9267,10 +9259,6 @@ void test_lab_wavelet_toning(bool available)
             params.wavelet.expbl = true;
         } else if (std::strcmp(label, "expresid") == 0) {
             params.wavelet.expresid = true;
-        } else if (std::strcmp(label, "expclari") == 0) {
-            params.wavelet.expclari = true;
-        } else if (std::strcmp(label, "CLmethod one") == 0) {
-            params.wavelet.CLmethod = "one";
         } else {
             params.wavelet.skinprotect = 30.0;
         }
@@ -9407,6 +9395,8 @@ void wavelet_denoise_params(rtengine::procparams::ProcParams& params,
         params.wavelet.c[level] = 0;
     }
 }
+
+void test_lab_wavelet_clarity();
 
 void test_lab_wavelet_denoise(bool available)
 {
@@ -9694,6 +9684,306 @@ void test_lab_wavelet_denoise(bool available)
                " stays finite").c_str());
         check(diff.differing == 0 && diff.max_abs == 0.0,
               (std::string("lab.wavelet denoise residual ") + label +
+               " matches the CPU block").c_str());
+    }
+
+    /* The clarity unit shares this test's device gate so it does not add a
+     * second skipped entry to the suite. */
+    test_lab_wavelet_clarity();
+}
+
+/* ---------------------------------------------- lab.wavelet clarity */
+
+/*
+ * CLmethod's level selection and the clarity arm. The selection is
+ * finalContAllL()/ContAllAB()'s coefficient zeroing and background paint; the
+ * clarity arm is the block's two-pass sequence, the optional guided filter
+ * excepted, followed by the mergeL/mergeC merge. Every Backmethod branch and
+ * both merge sliders are covered, alone and with contrast, chroma and denoise.
+ */
+void test_lab_wavelet_clarity()
+{
+    using namespace rtengine::stage;
+
+    static MyMutex clarity_lcms_mutex;
+    if (rtengine::lcmsMutex == nullptr) {
+        rtengine::lcmsMutex = &clarity_lcms_mutex;
+    }
+    static rtengine::Settings clarity_settings{};
+    clarity_settings.edghi = 3.0;
+    clarity_settings.edglo = 0.5;
+    clarity_settings.limrad = 20.0;
+    rtengine::settings = &clarity_settings;
+    rtengine::Color::init();
+
+    const std::string profile_path =
+        std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp") +
+        "/stage-residency-lab-wavelet-clarity.jsonl";
+
+    check(node_has_device_implementation("lab.wavelet"),
+          "the lab.wavelet node has a device implementation");
+
+    struct ClarityCase {
+        const char* label;
+        int width;
+        int height;
+        int levels;
+        const char* cl_method;
+        const char* back_method;
+        double merge_l;
+        double merge_c;
+        const char* dir_method;
+        int lmethod;
+        bool contrast;
+        bool chroma;
+        bool denoise;
+        bool expclari;
+        bool highlight_shadow;
+    };
+
+    const int contrast[9] = {30, 22, 14, 8, 4, 2, 0, 0, 0};
+    const double noise[5] = {40, 30, 20, 10, 5};
+
+    const ClarityCase cases[] = {
+        {"one black contrast", 238, 64, 5, "one", "black", 20, 20, "all", 4,
+         true, false, false, true},
+        {"inf black contrast", 179, 48, 6, "inf", "black", 35, 0, "all", 4,
+         true, false, false, true},
+        {"sup resid contrast", 238, 64, 6, "sup", "resid", 20, 20, "all", 4,
+         true, false, false, true},
+        {"one grey contrast", 238, 64, 5, "one", "grey", 20, 20, "all", 4,
+         true, false, false, true},
+        {"sup black contrast", 179, 48, 5, "sup", "black", 20, 20, "all", 4,
+         true, false, false, true},
+        {"one resid contrast", 238, 64, 5, "one", "resid", 20, 20, "all", 4,
+         true, false, false, true},
+        {"one black zero merge", 238, 64, 5, "one", "black", 0, 0, "all", 4,
+         true, false, false, true},
+        {"inf black mergeC only", 238, 64, 5, "inf", "black", 0, 50, "all", 4,
+         true, false, false, true},
+        {"one black dir one L2", 238, 64, 5, "one", "black", 20, 20, "one", 2,
+         true, false, false, true},
+        {"inf black dir two L5", 238, 64, 5, "inf", "black", 20, 20, "two", 5,
+         true, false, false, true},
+        {"sup resid dir thr L6", 238, 64, 6, "sup", "resid", 20, 20, "thr", 6,
+         true, false, false, true},
+        {"one black contrast L7", 238, 160, 7, "one", "black", 60, 60, "all",
+         4, true, false, false, true},
+        /* Highlight/shadow makes the trimmed first pass observable: kH is
+         * built from maxlvl, so the export profile's Lmethod 7 arm is a
+         * separate case from the untrimmed two-pass probes. */
+        {"one black contrast L7 HS", 238, 160, 7, "one", "black", 60, 60,
+         "all", 7, true, false, false, true, true},
+        {"sup resid contrast L7 HS", 238, 160, 7, "sup", "resid", 60, 60,
+         "all", 7, true, false, false, true, true},
+        {"sup resid contrast L7", 238, 160, 7, "sup", "resid", 30, 30, "all",
+         4, true, false, false, true},
+        {"one black chroma", 238, 64, 6, "one", "black", 20, 20, "all", 4,
+         true, true, false, true},
+        {"one black denoise", 238, 160, 6, "one", "black", 20, 20, "all", 4,
+         false, false, true, true},
+        {"sup resid denoise", 238, 160, 6, "sup", "resid", 30, 10, "all", 4,
+         false, false, true, true},
+        {"selection only", 238, 64, 5, "one", "grey", 20, 20, "all", 4, true,
+         false, false, false},
+        {"expclari with all", 238, 64, 5, "all", "grey", 20, 20, "all", 4,
+         true, false, false, true},
+    };
+
+    unsigned seed = 0x51c1a7u;
+    for (const ClarityCase& item : cases) {
+        rtengine::procparams::ProcParams params;
+        if (item.denoise) {
+            wavelet_denoise_params(params, item.levels, noise, 5.0);
+        } else {
+            wavelet_contrast_params(params, item.levels, false, contrast, 1.0,
+                                    1.0, 100);
+        }
+        params.wavelet.CLmethod = item.cl_method;
+        params.wavelet.Backmethod = item.back_method;
+        params.wavelet.mergeL = item.merge_l;
+        params.wavelet.mergeC = item.merge_c;
+        params.wavelet.Dirmethod = item.dir_method;
+        params.wavelet.Lmethod = item.lmethod;
+        params.wavelet.expclari = item.expclari;
+        params.wavelet.ushamethod = "sharp";
+        if (item.highlight_shadow) {
+            params.wavelet.HSmethod = "with";
+        }
+        if (!item.contrast) {
+            params.wavelet.expcontrast = false;
+        }
+        if (item.chroma) {
+            params.wavelet.expchroma = true;
+            params.wavelet.CHmethod = "link";
+            params.wavelet.chro = 50;
+        }
+
+        LabImage source(item.width, item.height);
+        fill_lab_tools(source, seed++);
+
+        check(labWaveletSupported(params, item.width, item.height),
+              (std::string("lab.wavelet clarity ") + item.label +
+               " is the supported set").c_str());
+
+        rtengine::ImProcFunctions cpu_ipf(&params, false);
+        LabImage cpu(item.width, item.height);
+        cpu.CopyFrom(&source);
+        labWaveletHostBlock(cpu_ipf, params, cpu);
+
+        rtengine::ImProcFunctions device_ipf(&params, false);
+        LabImage device(item.width, item.height);
+        device.CopyFrom(&source);
+        const LabWaveletRun result =
+            run_lab_wavelet_node(device, params, device_ipf, profile_path);
+        const std::string profile = read_file(profile_path);
+
+        check(result.deviceReady,
+              (std::string("lab.wavelet clarity ") + item.label +
+               " builds its host setup").c_str());
+        check(result.status == RT_STAGE_OK,
+              (std::string("lab.wavelet clarity ") + item.label +
+               " completes through run()").c_str());
+        check(profile.find("\"stage\":\"lab.wavelet\"") != std::string::npos,
+              (std::string("lab.wavelet clarity ") + item.label +
+               " records the node").c_str());
+        check(profile.find("\"impl\":\"opencl\"") != std::string::npos,
+              (std::string("lab.wavelet clarity ") + item.label +
+               " records a device execution").c_str());
+
+        const Distribution d = distribution(view(device), view(cpu));
+        std::printf("stage-residency: lab.wavelet clarity %s %dx%d: PAE "
+                    "%.6f LSB16; exact %zu, <=0.25 %zu, <=0.5 %zu, <=1 %zu, "
+                    ">1 %zu of %zu\n",
+                    item.label, item.width, item.height, d.max_abs, d.exact,
+                    d.quarter, d.half, d.one, d.over, d.samples);
+        check(d.finite,
+              (std::string("lab.wavelet clarity ") + item.label +
+               " stays finite").c_str());
+        check(d.over == 0,
+              (std::string("lab.wavelet clarity ") + item.label +
+               " is within one LSB16").c_str());
+
+        const Diff changed = compare(view(source), view(device));
+        check(changed.differing > 0,
+              (std::string("lab.wavelet clarity ") + item.label +
+               " changes the image").c_str());
+    }
+
+    /*
+     * The merge must not be a no-op: the one/black arm and the sup/resid arm
+     * must differ from the same profile with the selection forced to "all".
+     */
+    {
+        rtengine::procparams::ProcParams params;
+        wavelet_contrast_params(params, 5, false, contrast, 1.0, 1.0, 100);
+        params.wavelet.expclari = true;
+        params.wavelet.ushamethod = "sharp";
+        params.wavelet.Backmethod = "black";
+        params.wavelet.mergeL = 80;
+        params.wavelet.mergeC = 80;
+        params.wavelet.CLmethod = "one";
+
+        rtengine::procparams::ProcParams plain = params;
+        plain.wavelet.expclari = false;
+        plain.wavelet.CLmethod = "all";
+
+        LabImage source(238, 64);
+        fill_lab_tools(source, seed++);
+
+        rtengine::ImProcFunctions clarity_ipf(&params, false);
+        LabImage clarity(238, 64);
+        clarity.CopyFrom(&source);
+        labWaveletHostBlock(clarity_ipf, params, clarity);
+
+        rtengine::ImProcFunctions plain_ipf(&plain, false);
+        LabImage plain_image(238, 64);
+        plain_image.CopyFrom(&source);
+        labWaveletHostBlock(plain_ipf, plain, plain_image);
+
+        const Diff diff = compare(view(plain_image), view(clarity));
+        std::printf("stage-residency: lab.wavelet clarity merge changes %zu "
+                    "of %zu samples, PAE %.6f LSB16\n",
+                    diff.differing, diff.samples, diff.max_abs);
+        check(diff.differing > 1000 && diff.max_abs > 1.0,
+              "lab.wavelet clarity merge changes the image");
+    }
+
+    /*
+     * Refusals: the CLmethod, Backmethod and Dirmethod values the block would
+     * leave to an uninitialised field, an Lmethod or merge slider outside the
+     * widget range, and the guided soft radius the unit does not port.
+     */
+    const char* residual_labels[] = {
+        "CLmethod unknown", "Backmethod unknown", "Dirmethod unknown",
+        "Lmethod low", "Lmethod high", "mergeL high", "mergeC low", "softrad"};
+    for (const char* label : residual_labels) {
+        rtengine::procparams::ProcParams params;
+        wavelet_contrast_params(params, 5, false, contrast, 1.0, 1.0, 100);
+        params.wavelet.expclari = true;
+        params.wavelet.ushamethod = "sharp";
+        params.wavelet.Backmethod = "black";
+        params.wavelet.CLmethod = "one";
+
+        if (std::strcmp(label, "CLmethod unknown") == 0) {
+            params.wavelet.CLmethod = "bogus";
+        } else if (std::strcmp(label, "Backmethod unknown") == 0) {
+            params.wavelet.Backmethod = "bogus";
+        } else if (std::strcmp(label, "Dirmethod unknown") == 0) {
+            params.wavelet.Dirmethod = "bogus";
+        } else if (std::strcmp(label, "Lmethod low") == 0) {
+            params.wavelet.Lmethod = -1;
+        } else if (std::strcmp(label, "Lmethod high") == 0) {
+            params.wavelet.Lmethod = 11;
+        } else if (std::strcmp(label, "mergeL high") == 0) {
+            params.wavelet.mergeL = 101.0;
+        } else if (std::strcmp(label, "mergeC low") == 0) {
+            params.wavelet.mergeC = -51.0;
+        } else if (std::strcmp(label, "softrad") == 0) {
+            params.wavelet.softrad = 5.0;
+        }
+
+        check(!labWaveletSupported(params, 238, 64),
+              (std::string("lab.wavelet clarity residual ") + label +
+               " is a residual").c_str());
+
+        LabImage source(238, 64);
+        fill_lab_wavelet_skin(source);
+
+        rtengine::ImProcFunctions cpu_ipf(&params, false);
+        LabImage cpu(238, 64);
+        cpu.CopyFrom(&source);
+        labWaveletHostBlock(cpu_ipf, params, cpu);
+
+        rtengine::ImProcFunctions device_ipf(&params, false);
+        LabImage device(238, 64);
+        device.CopyFrom(&source);
+        const LabWaveletRun result =
+            run_lab_wavelet_node(device, params, device_ipf, profile_path);
+        const std::string profile = read_file(profile_path);
+
+        check(!result.supported,
+              (std::string("lab.wavelet clarity residual ") + label +
+               " is refused as a device configuration").c_str());
+        check(!result.deviceReady,
+              (std::string("lab.wavelet clarity residual ") + label +
+               " does not build a device setup").c_str());
+        check(result.status == RT_STAGE_OK,
+              (std::string("lab.wavelet clarity residual ") + label +
+               " completes through run()").c_str());
+        check(profile.find("\"impl\":\"host\"") != std::string::npos,
+              (std::string("lab.wavelet clarity residual ") + label +
+               " records a host execution").c_str());
+        check(profile.find("\"impl\":\"opencl\"") == std::string::npos,
+              (std::string("lab.wavelet clarity residual ") + label +
+               " never mixes a device pass").c_str());
+
+        const Diff diff = compare(view(device), view(cpu));
+        std::printf("stage-residency: lab.wavelet clarity residual %s: host, "
+                    "PAE %.6f LSB16, %zu of %zu samples differ\n",
+                    label, diff.max_abs, diff.differing, diff.samples);
+        check(diff.differing == 0 && diff.max_abs == 0.0,
+              (std::string("lab.wavelet clarity residual ") + label +
                " matches the CPU block").c_str());
     }
 }
