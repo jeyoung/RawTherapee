@@ -200,11 +200,11 @@ Validated at `3871b7d0c`; the commits after it are documentation only.
   whose kernel truncates and clamps exactly as `Mad()` does. The
   `noisevarlum`/`noisevarchrom` last write uses the clamped `(2y+1, 2x+1)`
   sample, and the `ShrinkAllL`/`ShrinkAllAB` kernels reuse the lab.tools box
-  blur. Fifteen device cases (levels 3/5/6, ballum 10/7/5/0/-2, high-level
+  blur. Seventeen device cases (levels 3/5/6, ballum 10/7/5/0/-2, high-level
   sliders only, a light slider, odd width, odd height, odd both, with
   contrast, edge, final curves, toning, all panels and all panels padded)
   match the host block with a worst 0.105469 LSB16; the panel-off comparison
-  changes 86,453-114,240 samples. Twelve residuals (`quaMethod` agre, user
+  changes 85,918-114,240 samples. Twelve residuals (`quaMethod` agre, user
   chromfi/chromco, balchrom, `Wavhuecurve`, `CBenab`, `sliMethod` cur,
   Thrden, Ballum range, level range, all sliders zero and the 128-pixel
   window) run the host builtin byte for byte. `labwavelet-denoise.pp3` records
