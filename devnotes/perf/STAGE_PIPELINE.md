@@ -303,17 +303,36 @@ evaluates the curve abscissa with the fast `xlogf()` while the kernel uses
 where `mean + sigma == MaxP` makes the curve exponent singular on both sides
 and is not exercised by the 17 cases.
 
+The CLmethod selection and the clarity arm run on the device for every
+admitted panel set. `finalContAllL()` and `ContAllAB()` zero the bands the
+selected level/direction excludes and paint coefficient 0 with the block's
+black, grey or residual background; the selection kernel reproduces that for L
+and the a/b planes, and the contrast kernel takes the pass's own level count so
+its `kH` table matches `maxlvl` even when the trailing-zero trim shortens the
+first pass. The clarity arm (`Ushamethod` sharp or clari, `Expclari`, and
+`CLmethod` other than `all`) runs `ip_wavelet()` twice: the first with
+`CLmethod` forced to `all`, the second with the profile's selection. The first
+result is copied out and the band buffers are reused, then a merge kernel
+applies the block's `mergeL`/`mergeC` arithmetic. The `one`/`inf` + black and
+`sup` + resid arms run the second pass; every other `Backmethod` arm collapses
+to the clamped first pass. The first pass skips the a/b planes when the block's
+own trim drops them to zero, which is the contrast-only case, and a profile
+whose `ch[]`, opacity curve, `cbenab`, `CHmethod`/`chro` or residual sliders
+would stop that trim short of zero stays a host residual. The guided soft
+radius (`softrad`) remains refused.
+
 It is admitted only on a CPU
 OpenCL device, and the wavelet pass also needs fp64. `CHmethod` `without` and
 `with` (the curve and saturation arms), `Expchroma` with a contrast panel that
 also asks for L skin protection, `cbdlMethod == "bef"`, an out-of-range
 multiplier, threshold, skin, hue, `chro`, `sigmacol`, sigma, offset, lowthr,
 gate, strength, Thrend or `c[]`, an all-neutral pyramid, a non-identity
-`Chcurve` or `hhcurve`, a
+`Chcurve` or `hhcurve`, an unknown `CLmethod`/`Backmethod`/`Dirmethod`, an
+out-of-range `Lmethod` or merge slider, a
 closed CIE-CAM gate, an image too narrow or too small for its pyramid or Haar
 bands, a GPU or non-fp64 device and nothing enabled at all are residuals:
 each runs the `lab.wavelet` host builtin and records `impl=host`, never a
-device pass. The blur, residual, final, toning, noise and clarity panels
+device pass. The blur, residual, final, toning and noise panels
 are refused before any upload, as are the balance-chroma arm (`TMr` with a
 `BAmethod` other than `none`) and the soft radius, so a profile that enables
 any of them runs the whole block on the host.
@@ -344,7 +363,7 @@ panes records them separately. Both tools are off by default.
 | `rgb.proc` | Full/Full/Roi/Reduced | path | reuse-input | RGB curves, tone curve, colour toning, B&W, channel mixer, HSV, film simulation | yes |
 | `lab.tools` | Full/Full/Roi/Reduced | path | reuse-input | shadows/highlights, vibrance, Lab curves (including non-zero contrast, the chromaticity slider, the C=f(H)/L=f(H)/H=f(H) hue flat curves and the NONE/LAB/XYZ/XYZREL/MUN gamut methods), local contrast, black-and-white (cheap and `bwToning` arms), EPD, Lab-grid colour toning and Lab colour-correction regions | partial |
 | `lab.sharpening` | Full/-/Roi/- | path | reuse-input | impulse denoise and defringe (own node), ML sharpen edges, ML microcontrast and the main sharpen pass (shared `output.sharpen` node) | partial |
-| `lab.wavelet` | Full/Full/Roi/Reduced | path | reuse-input | directional pyramid equaliser and wavelet contrast, standard denoise (L and the forced chroma arm), chroma `link`, edge plain arm, final curves and the toning zero-protection arm | partial |
+| `lab.wavelet` | Full/Full/Roi/Reduced | path | reuse-input | directional pyramid equaliser and wavelet contrast, standard denoise (L and the forced chroma arm), chroma `link`, edge plain arm, final curves, the toning zero-protection arm, CLmethod's level selection and the clarity two-pass merge | partial |
 | `working.trc` | Full/Full/Roi/- | path | reuse-input | soft light, tone equaliser and working-TRC conversion | partial |
 | `ciecam` | Full/Full/Roi/- | path | reuse-input | CIE CAM 02 | no |
 | `gamut` | Full/Full/Roi/Reduced | path | reuse-input | working-space gamut compression | yes |

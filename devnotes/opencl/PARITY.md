@@ -96,6 +96,32 @@ pairs are exact. The gate is the peak absolute error (PAE) in normalised units;
 | 2026-11-02 | uncommitted | POCL (CPU) | 4-case lab.tools XYZ/XYZREL Lab-curve matrix (XYZ with all six tables on the saturated image, XYZREL, XYZ neutral, XYZ with the three hue curves), `stage-residency-test` | device vs host block | 0.753906 LSB16 (worst: XYZ with hue curves, 0 samples over 1); XYZ 0.317383, XYZREL 0.066406, XYZ neutral 0 | PASS |
 | 2026-11-02 | uncommitted | POCL (CPU) | colorspace_flowers.pef / `labtools-labcurve-contrast.pp3` with `Gamutmunse=LAB`, `lab.tools` | off vs auto, 16-bit TIFF | 0 (exact) | PASS |
 | 2026-11-02 | uncommitted | POCL (CPU) | 3-case lab.tools LAB Lab-curve matrix (LAB with all six tables on the saturated image, LAB neutral, LAB with the three hue curves), `stage-residency-test` | device vs host block | 0.011719 LSB16 (worst: LAB with hue curves); LAB all tables 0, LAB neutral 0 | PASS |
+| 2026-11-02 | 5ff287bda..dba2cc58a | POCL (CPU) | colorspace_flowers.pef / `labwavelet-clarity.pp3` (contrast + clarity `one`, black background, `MergeL/MergeC=60`), `lab.wavelet` | off vs auto, 16-bit TIFF | 0 (AE=0, 0 of 30 419 712) | PASS |
+| 2026-11-02 | 5ff287bda..dba2cc58a | POCL (CPU) | colorspace_flowers.pef / `labwavelet-clarity-sup.pp3` (contrast + clarity `sup`, residual background, `MergeL/MergeC=30`), `lab.wavelet` | off vs auto, 16-bit TIFF | 0 (AE=0, 0 of 30 419 712) | PASS |
+| 2026-11-02 | 5ff287bda..dba2cc58a | POCL (CPU) | 20-case clarity matrix (`one`/`inf`/`sup`, every `Backmethod` branch, zero and non-zero merge sliders, Dirmethod one/two/thr, Lmethod 2..7, trimmed 7-level first pass with highlight/shadow, contrast, chroma and denoise), `stage-residency-test` | device vs host block | 0 (exact) except denoise 0.015625 LSB16 | PASS |
+| 2026-11-02 | 5ff287bda..dba2cc58a | POCL (CPU) | 8-case clarity residual matrix (unknown CLmethod/Backmethod/Dirmethod, Lmethod -1/11, mergeL 101, mergeC -51, softrad), `stage-residency-test` | device vs host block | 0 (host) | PASS |
+
+The clarity rows are the block's two-pass sequence, not a single kernel.
+`CLmethod`'s `one`/`inf`/`sup` selection is `finalContAllL()`'s and
+`ContAllAB()`'s coefficient zeroing plus the L0 background paint; the device
+runs it for every admitted panel set, so `CLmethod` no longer forces the host.
+The clarity arm additionally runs `ip_wavelet()` twice: the first pass with
+`CLmethod` forced to `"all"`, the second with the profile's selection, then the
+`mergeL`/`mergeC` merge. The first pass uses the trimmed level count, because
+its `CLmethod` is `"all"`; the second uses the untrimmed count. Highlight and
+shadow make the difference observable, since `ContAllL()`'s `kH` table is
+built from `maxlvl` even at levels whose multiplier is zero. The first pass
+also skips the a/b planes when the block's own trim drops them to zero levels,
+which is the contrast-only case; a profile whose `ch[]`, opacity curve,
+`cbenab`, `CHmethod`/`chro` or residual sliders would stop the trim short of
+zero stays a host residual. The merge's `one`/`inf` + black and `sup` + resid
+arms run the second pass; every other `Backmethod` arm collapses to the
+clamped first pass, which the device reproduces with the merge kernel's zero
+factors. The guided soft radius (`softrad`) is still refused.
+
+`compare_tiff.py` now copies an already-uncompressed 16-bit TIFF instead of
+calling ImageMagick. That is the form RawTherapee's `-t -b16` export writes,
+and the gate hosts available here do not carry the ImageMagick binaries.
 
 The XYZ and XYZREL rows use `ICCStore::workingSpaceMatrix()` as
 `Color::gamutmap()`'s `p`, which is the host's `wp` in

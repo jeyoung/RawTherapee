@@ -780,30 +780,38 @@ Splitco/Splitlr/RGBSliders are admitted with PAE 0 at `6c78a463a`. Then the
 `6bb3101da` with 12 cases at PAE 0, the edge plain arm at `c5ed40c3c` with
 17 cases, worst 0.058594 LSB16, and 12 residuals at PAE 0, the final curves
 with 13 cases, worst 0.015625 LSB16, and 14 residuals at PAE 0, toning
-with 12 cases, worst 0.011719 LSB16, and 10 residuals at PAE 0, and the
+with 12 cases, worst 0.011719 LSB16, and 10 residuals at PAE 0, the
 standard denoise L arm plus its forced chroma arm with 17 cases, worst
-0.015625 LSB16, and 12 residuals at PAE 0),
+0.015625 LSB16, and 12 residuals at PAE 0, and CLmethod's selection plus
+the clarity arm with 20 cases, exact except the denoise pair at
+0.015625 LSB16, and 8 residuals at PAE 0),
 then `local.adjustments` exposure/retinex/CIE, then the common mask
 once the wavelet panels land. EPD stays a permanent residual.
 
 ## Next immediate task
 
-Move on to the `lab.wavelet` clarity arm (`expclari` with `CLmethod`
-`one`/`inf`/`sup`), which is a two-pass merge rather than a single kernel: the
-host runs a panels-off pass into `unshar`, runs the main pass, optionally
-applies the guided soft-radius filter and then merges the two with
-`mergeL`/`mergeC` and the `Backmethod` rules. Those blocks are already written
-out in `lab_wavelet_context.cc` (the host builtin), so the unit is a port of
-that sequence, not new research. The standard denoise arm (and the chroma
-denoise the block forces at six levels) landed with the unit above; its
-denoise curves, expert pairing, BiShrink arms, user chroma strength, noise
-balance and hue curve stay residuals. The
-final curves and the toning zero-protection arm landed with the units above.
-The edge panel's plain arm is landed; its median/Lipschitz
+The `lab.wavelet` clarity arm landed with `5ff287bda` (engine) and
+`dba2cc58a` (test and export gate). `CLmethod`'s `one`/`inf`/`sup` selection
+now runs on the device for every admitted panel set, the clarity sequence runs
+both `ip_wavelet()` passes with the block's forced-`all` first pass, and the
+merge kernel reproduces the `mergeL`/`mergeC` and `Backmethod` rules. The
+twenty-case matrix is bit-exact except the denoise pair at 0.015625 LSB16, and
+both `labwavelet-clarity.pp3` and `labwavelet-clarity-sup.pp3` export with
+`AE=0`. The first pass uses the trimmed level count and skips the a/b planes
+when the block's own trim drops them to zero; a profile whose `ch[]`, opacity
+curve, `cbenab`, `CHmethod`/`chro` or residual sliders would stop that trim
+short of zero stays a host residual.
+
+Next is the guided soft radius: `softrad` on the clarity arm and `softradend`
+on the final panel both call `guidedFilter()` on a host-built guide, so the
+unit is a separable box/reduction kernel pair plus the XYZ round trip, not a
+new merge. The standard denoise arm (and the chroma denoise the block forces
+at six levels) landed with the unit above; its denoise curves, expert pairing,
+BiShrink arms, user chroma strength, noise balance and hue curve stay
+residuals. The final curves and the toning zero-protection arm landed with the
+units above. The edge panel's plain arm is landed; its median/Lipschitz
 detection (`calckoe`), `NPMethod` low/high smoothing, `Lipst`, and the dead
 `EDmethod` `SL` threshold adjuster stay residuals, so do not reopen them
-without porting the detector. The balance-chroma arm (`TMr` + `BAmethod`) and
-the final panel's guided soft-radius tone mapping are refused fail-closed, so
-do not reopen them without porting `ContAllAB`'s BA arm and the
-`softradend`/`strend`/`detend`/`thrend` block.
+without porting the detector. The balance-chroma arm (`TMr` + `BAmethod`) is
+refused fail-closed, so do not reopen it without porting `ContAllAB`'s BA arm.
 Keep `OMP_NUM_THREADS=1` in every comparison.
