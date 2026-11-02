@@ -4541,6 +4541,9 @@ LabToolsRun run_lab_tools_node(LabImage& image,
     LabToolsRun result;
     result.supported = labToolsSupported(params);
 
+    if (params.labCurve.enabled && params.labCurve.contrast != 0) {
+        labToolsBuildHistogram(image, host.hist16);
+    }
     LabToolsLuts luts = host.luts();
     LabToolsContext context(params, ipf, luts, host.autili, host.butili);
     RtLabToolsResult setup{};
@@ -5196,7 +5199,7 @@ void test_lab_tools(bool available)
      * block, and the result must be the block's own output.
      */
     const char* residual_labels[] = {
-        "vibrance + Lab contrast", "vibrance + local contrast out of range",
+        "vibrance + local contrast out of range",
         "vibrance + EPD", "vibrance + Lab regions show mask",
         "black and white + colour toning", "vibrance no-op",
         "vibrance pastels out of range"};
@@ -5213,15 +5216,7 @@ void test_lab_tools(bool available)
         params.vibrance.pastels = 50;
         params.vibrance.saturated = 30;
 
-        if (std::strcmp(label, "vibrance + Lab contrast") == 0) {
-            params.labCurve.enabled = true;
-            params.labCurve.contrast = 10;
-            params.labCurve.lcurve = {
-                static_cast<double>(DCT_Spline),
-                0.0, 0.0,
-                0.5, 0.6,
-                1.0, 1.0};
-        } else if (std::strcmp(label, "vibrance + local contrast out of range") ==
+        if (std::strcmp(label, "vibrance + local contrast out of range") ==
                    0) {
             params.localContrast.enabled = true;
             params.localContrast.radius = 20;
@@ -6034,6 +6029,7 @@ struct LabCurveCase {
     bool blackwhite = false;
     bool vibrance = false;
     bool shadowsHighlights = false;
+    int contrast = 0;
 };
 
 /* A non-identity hue flat curve: a wave through (0,0.5), (0.25,0.72),
@@ -6118,6 +6114,15 @@ void test_lab_tools_lab_curve(bool available)
          true, 0, "MUN", 0.0, true, 60, 0.3},
         {"large width 8192", 8192, 64, 0, 0, 0.62, true, true, true, true, true,
          true, 0, "MUN", 0.0, true, 60, 0.3},
+        {"contrast 5", 238, 64, 0, 0, 0.58, true, false, false, false, false,
+         false, 0, "MUN", 0.0, true, 60, 0.3, false, false, false, false,
+         false, false, 5},
+        {"contrast 15 L curve", 238, 64, 0, 10, 0.58, true, false, false,
+         false, false, false, 0, "MUN", 0.0, true, 60, 0.3, false, false,
+         false, false, false, false, 15},
+        {"contrast 30 combined", 179, 48, 0, 0, 0.62, true, true, true, true,
+         true, true, 0, "MUN", 0.0, true, 60, 0.3, false, false, false,
+         false, false, false, 30},
         /*
          * The chromaticity slider and the three hue flat curves. The
          * saturated image spans the hue circle so each curve has work to do.
@@ -6156,7 +6161,7 @@ void test_lab_tools_lab_curve(bool available)
         rtengine::procparams::ProcParams params;
         params.labCurve.enabled = true;
         params.labCurve.brightness = item.brightness;
-        params.labCurve.contrast = 0;
+        params.labCurve.contrast = item.contrast;
         params.labCurve.chromaticity = item.chromaticity;
         params.labCurve.gamutmunselmethod = item.munsell;
         params.labCurve.rstprotection = item.rstprotection;
@@ -6339,7 +6344,7 @@ void test_lab_tools_lab_curve(bool available)
      * must run the block on the host byte for byte.
      */
     const char* residual_labels[] = {
-        "contrast", "XYZ Munsell", "black and white with colour toning",
+        "XYZ Munsell", "black and white with colour toning",
         "dense hue curve"};
     for (const char* label : residual_labels) {
         rtengine::procparams::ProcParams params;
@@ -6352,9 +6357,7 @@ void test_lab_tools_lab_curve(bool available)
         lab_curve_settings.protectredh = 0.3;
         lab_curve_settings.amchroma = 40;
 
-        if (std::strcmp(label, "contrast") == 0) {
-            params.labCurve.contrast = 15;
-        } else if (std::strcmp(label, "dense hue curve") == 0) {
+        if (std::strcmp(label, "dense hue curve") == 0) {
             /*
              * A hand-built curve with more knots than the table budget can
              * carry: forty thousand linear control points. FlatCurve's
@@ -6971,18 +6974,16 @@ void test_lab_tools_local_contrast(bool available)
         double darkness;
         double lightness;
         bool epd;
-        bool labContrast;
     };
     const LocalContrastResidual residuals[] = {
-        {"radius below the ABI range", 0, 1.0, 1.0, 1.0, false, false},
-        {"radius above the ABI range", 300, 1.0, 1.0, 1.0, false, false},
-        {"amount above the ABI range", 40, 3.0, 1.0, 1.0, false, false},
-        {"negative amount", 40, -0.1, 1.0, 1.0, false, false},
-        {"darkness above the ABI range", 40, 1.0, 4.0, 1.0, false, false},
-        {"negative lightness", 40, 1.0, 1.0, -0.5, false, false},
-        {"not a number amount", 40, std::nan(""), 1.0, 1.0, false, false},
-        {"with EPD", 40, 1.0, 1.0, 1.0, true, false},
-        {"with Lab contrast", 40, 1.0, 1.0, 1.0, false, true},
+        {"radius below the ABI range", 0, 1.0, 1.0, 1.0, false},
+        {"radius above the ABI range", 300, 1.0, 1.0, 1.0, false},
+        {"amount above the ABI range", 40, 3.0, 1.0, 1.0, false},
+        {"negative amount", 40, -0.1, 1.0, 1.0, false},
+        {"darkness above the ABI range", 40, 1.0, 4.0, 1.0, false},
+        {"negative lightness", 40, 1.0, 1.0, -0.5, false},
+        {"not a number amount", 40, std::nan(""), 1.0, 1.0, false},
+        {"with EPD", 40, 1.0, 1.0, 1.0, true},
     };
     for (const LocalContrastResidual& item : residuals) {
         rtengine::procparams::ProcParams params;
@@ -6996,11 +6997,6 @@ void test_lab_tools_local_contrast(bool available)
             params.epd.strength = 0.5;
             params.epd.gamma = 1.0;
         }
-        if (item.labContrast) {
-            params.labCurve.enabled = true;
-            params.labCurve.contrast = 10;
-        }
-
         check(!labToolsSupported(params),
               (std::string("lab.tools local contrast residual ") + item.label +
                " is a residual").c_str());
