@@ -3701,7 +3701,9 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
      * The Lab-curve pass. `lab_curve` is the call site's
      * labToolsLabCurveActive(): the enabled curve with the residual contrast
      * at zero. The six flags are the six host-built tables' activity, and the
-     * method is the block's gamutmunselmethod mapping (NONE or MUN only).
+     * method is the block's gamutmunselmethod mapping, restricted to the
+     * admitted set: NONE, XYZ, XYZREL or MUN. LAB is not a device method and
+     * stays a host residual.
      */
     const std::int64_t lab_curve_flag = args[34].u.i;
     if (lab_curve_flag != 0 && lab_curve_flag != 1) {

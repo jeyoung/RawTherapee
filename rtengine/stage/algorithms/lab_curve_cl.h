@@ -67,7 +67,6 @@ inline float rt_lt_lim(const float value, const float low, const float high)
 #define RT_LT_METHOD_NONE 0
 #define RT_LT_METHOD_XYZ 2
 #define RT_LT_METHOD_XYZREL 3
-#define RT_LT_METHOD_MUN 4
 
 /*
  * chromiLuminanceCurve()'s scalar chroma: `sqrt(float) / 327.68f` in the host
@@ -408,10 +407,11 @@ inline void rt_lt_all_munsell_lch_lum(
 /*
  * chromiLuminanceCurve()'s per-pixel body for the supported configuration.
  *
- * `method` is RT_LAB_TOOLS_MUNSELL_NONE or _MUN. `rst_protection` is
- * 100 - rstprotection, `protect_red`/`protect_red_h` are the raw
- * settings->protectred and settings->protectredh values, and `adjust` is the
- * working-profile chroma scale for the C=f(C) and C=f(L) table index.
+ * `method` is RT_LAB_TOOLS_MUNSELL_NONE, _XYZ, _XYZREL or _MUN.
+ * `rst_protection` is 100 - rstprotection, `protect_red`/`protect_red_h` are
+ * the raw settings->protectred and settings->protectredh values, and
+ * `adjust` is the working-profile chroma scale for the C=f(C) and C=f(L)
+ * table index.
  */
 __kernel void rt_lab_tools_lab_curve(
     __global float* lab,
@@ -857,15 +857,16 @@ __kernel void rt_lab_tools_lab_curve(
     }
 
     /*
-     * The Munsell correction. The block guards it with the activity test; a
-     * non-NONE method always has at least one activity flag or the
-     * chromaticity slider set when it reaches here, but the test is kept
-     * because the block has it.
+     * The Munsell correction. The guard is the block's own: a non-NONE method
+     * followed by its activity list. The activity test is load-bearing, not
+     * defensive: a configured XYZ or XYZREL method can reach here with
+     * identity tables and the chromaticity slider at zero, and then every
+     * flag is clear and the correction is skipped, exactly as the block
+     * skips it.
      *
-     * The activity test is the block's own list, which excludes `bwToning`;
-     * under black-and-white the six tables can still be active, so the
-     * correction runs on the grey or deviated chroma exactly as the block
-     * does.
+     * The activity list excludes `bwToning`; under black-and-white the six
+     * tables can still be active, so the correction runs on the grey or
+     * deviated chroma exactly as the block does.
      */
     if (method != RT_LT_METHOD_NONE &&
         (l_active != 0 || a_active != 0 || b_active != 0 || cc_active != 0 ||

@@ -90,7 +90,7 @@ pairs are exact. The gate is the peak absolute error (PAE) in normalised units;
 | 2026-11-02 | 89e0a844b..47b9980fb | POCL (CPU) | 3-case Lab-contrast matrix (contrast 5, contrast 15 with L curve+brightness, contrast 30 with all six tables), `stage-residency-test` | device vs host block | 0 (exact) | PASS |
 | 2026-11-02 | uncommitted | POCL (CPU) | colorspace_flowers.pef / `labtools-labcurve-contrast.pp3` with `Gamutmunse=XYZ`, `lab.tools` | off vs auto, 16-bit TIFF | 0 (exact) | PASS |
 | 2026-11-02 | uncommitted | POCL (CPU) | colorspace_flowers.pef / `labtools-labcurve-contrast.pp3` with `Gamutmunse=XYZREL`, `lab.tools` | off vs auto, 16-bit TIFF | 0 (exact) | PASS |
-| 2026-11-02 | uncommitted | POCL (CPU) | 4-case lab.tools XYZ/XYZREL Lab-curve matrix (XYZ with all six tables on the saturated image, XYZREL, XYZ neutral, XYZ with the three hue curves), `stage-residency-test` | device vs host block | 0.753906 LSB16 (worst), 0 over 1 | PASS |
+| 2026-11-02 | uncommitted | POCL (CPU) | 4-case lab.tools XYZ/XYZREL Lab-curve matrix (XYZ with all six tables on the saturated image, XYZREL, XYZ neutral, XYZ with the three hue curves), `stage-residency-test` | device vs host block | 0.753906 LSB16 (worst: XYZ with hue curves, 0 samples over 1); XYZ 0.317383, XYZREL 0.066406, XYZ neutral 0 | PASS |
 
 The XYZ and XYZREL rows use `ICCStore::workingSpaceMatrix()` as
 `Color::gamutmap()`'s `p`, which is the host's `wp` in
