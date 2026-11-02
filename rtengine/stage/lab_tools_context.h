@@ -101,9 +101,11 @@ struct ProcParams;
 #define RT_LAB_TOOLS_HUE_LUT_STRIDE (1u + 2u * RT_LAB_TOOLS_HUE_LUT_NODES)
 #define RT_LAB_TOOLS_HUE_LUT_ACCEPT 5.0e-7
 /* params.labCurve.gamutmunselmethod, with the block's numbering: NONE 0,
- * XYZ 2, XYZREL 3 and MUN 4. NONE, XYZ, XYZREL and MUN are the device
- * methods; LAB (1) is a residual because it needs gamutLchonly(). */
+ * LAB 1, XYZ 2, XYZREL 3 and MUN 4. All five are device methods; LAB runs
+ * Color::gamutLchonly()'s RGB overload before the Munsell arm, exactly as the
+ * block does. */
 #define RT_LAB_TOOLS_MUNSELL_NONE 0u
+#define RT_LAB_TOOLS_MUNSELL_LAB 1u
 #define RT_LAB_TOOLS_MUNSELL_XYZ 2u
 #define RT_LAB_TOOLS_MUNSELL_XYZREL 3u
 #define RT_LAB_TOOLS_MUNSELL_MUN 4u
@@ -257,7 +259,7 @@ typedef struct RtLabToolsResult {
     uint32_t lab_curve_hh_active;
     /* The chromaticity slider, -100..100; the kernel derives chromapro. */
     int32_t lab_curve_chromaticity;
-    /* RT_LAB_TOOLS_MUNSELL_NONE, _XYZ, _XYZREL or _MUN. */
+    /* RT_LAB_TOOLS_MUNSELL_NONE, _LAB, _XYZ, _XYZREL or _MUN. */
     uint32_t lab_curve_munsell;
     /*
      * The red and skin protection inputs: settings->protectred and
@@ -405,10 +407,10 @@ struct LabToolsLuts {
  * Fail closed. A Lab curve with non-zero `contrast` is admitted; its hist16
  * refill is built by the call site before the node. A chromaticity slider
  * outside its -100..100 GUI range, a C=f(H), L=f(H) or H=f(H) flat curve the
- * host table cannot follow within RT_LAB_TOOLS_HUE_LUT_ACCEPT, the LAB
- * Munsell method, EPD and any colour-toning method other than
- * LabGrid. A local contrast whose sliders are outside the ABI range is a
- * residual as well. Black-and-white output is admitted through both of
+ * host table cannot follow within RT_LAB_TOOLS_HUE_LUT_ACCEPT, EPD and any
+ * colour-toning method other than LabGrid. A local contrast whose sliders are
+ * outside the ABI range is a residual as well. Black-and-white output is
+ * admitted through both of
  * chromiLuminanceCurve()'s arms: the cheap one when the Lab curves are off
  * (it only zeroes a and b) and the full `bwToning` one when they are on.
  * Black-and-white with colour toning is a residual because the host's

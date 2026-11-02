@@ -29,7 +29,7 @@
  *
  * Supported: the L, a, b, C=f(C), L=f(C) and C=f(L) tables, the C=f(H),
  * L=f(H) and H=f(H) hue flat curves (host-sampled piecewise-linear tables),
- * the chromaticity slider, the NONE, XYZ, XYZREL and MUN Munsell methods,
+ * the chromaticity slider, the NONE, LAB, XYZ, XYZREL and MUN Munsell methods,
  * the red and skin protection, `lcredsk`, the block's chroma scale for the
  * working profile, and black-and-white output through
  * `chromiLuminanceCurve()`'s `bwToning` arm. Under `bwToning` the hue and
@@ -40,8 +40,8 @@
  * active). The three hue flat curves still run under `bwToning`, exactly as
  * the block orders them. Residual (the launcher never reaches this kernel): a
  * non-zero contrast (it owns the hist16 refill), a hue flat curve the host
- * table cannot follow, a chromaticity slider outside -100..100, the LAB
- * Munsell method and a denoised chroma factor.
+ * table cannot follow, a chromaticity slider outside -100..100 and a denoised
+ * chroma factor.
  *
  * The source is appended after lab_tools_cl.h, munsell_lch_cl.h and
  * vibrance_cl.h, so it reads their LUT, atan2/sincos and Munsell helpers.
@@ -65,6 +65,7 @@ inline float rt_lt_lim(const float value, const float low, const float high)
 
 /* chromiLuminanceCurve()'s gamutmunselmethod numbering. */
 #define RT_LT_METHOD_NONE 0
+#define RT_LT_METHOD_LAB 1
 #define RT_LT_METHOD_XYZ 2
 #define RT_LT_METHOD_XYZREL 3
 
@@ -179,6 +180,120 @@ inline void rt_lt_xyz2rgb_d(const float x, const float y, const float z,
     *r = (float)(m[0] * (double)x + m[1] * (double)y + m[2] * (double)z);
     *g = (float)(m[3] * (double)x + m[4] * (double)y + m[5] * (double)z);
     *b = (float)(m[6] * (double)x + m[7] * (double)y + m[8] * (double)z);
+}
+
+/*
+ * Color::gamutLchonly(HH, sincosval, Lprov1, Chprov1, R, G, B, wip,
+ * isHLEnabled, lowerCoef, higherCoef): the RGB overload chromiLuminanceCurve()'s
+ * LAB method calls, with ClipLevel 65535 and the working-space inverse matrix
+ * as a flat nine-double array. It writes the corrected R, G, B and the
+ * corrected L and C back. `HH` is finite at the host call because the block
+ * derives it before this arm; the host's `isnan(HH)` recovery is kept so the
+ * helper still follows the source if that ever changes.
+ */
+inline void rt_lt_gamut_lchonly_rgb(
+    const float HH, const float2 sincosval, float* Lprov1_out,
+    float* Chprov1_out, float* R_out, float* G_out, float* B_out,
+    __global const double* wip, const int isHLEnabled, const float lowerCoef,
+    const float higherCoef)
+{
+    /* Color::gamutLchonly()'s RGB overload: ClipLevel 65535, not vibrance's
+     * saturation overload's 1.0. */
+    const float clip_level = 65535.0f;
+    float Lprov1 = *Lprov1_out;
+    float Chprov1 = *Chprov1_out;
+    const float ChprovSave = Chprov1;
+    float hh = HH;
+    float R = 0.0f;
+    float G = 0.0f;
+    float B = 0.0f;
+    int inGamut;
+
+    do {
+        inGamut = 1;
+
+        const float aprov1 = Chprov1 * sincosval.y;
+        const float bprov1 = Chprov1 * sincosval.x;
+
+        const float fy = RT_LT_C1BY116 * Lprov1 + RT_LT_C16BY116;
+        const float fx = 0.002f * aprov1 + fy;
+        const float fz = fy - 0.005f * bprov1;
+
+        const float x_ = 65535.0f * rt_lt_f2xyz(fx) * RT_LT_D50X;
+        const float z_ = 65535.0f * rt_lt_f2xyz(fz) * RT_LT_D50Z;
+        const float y_ = (Lprov1 > RT_LT_EPSKAP)
+                             ? 65535.0f * fy * fy * fy
+                             : 65535.0f * Lprov1 / RT_LT_KAPPA;
+
+        rt_lt_xyz2rgb_d(x_, y_, z_, wip, &R, &G, &B);
+
+        if (R < 0.0f || G < 0.0f || B < 0.0f) {
+            if (isnan(HH)) {
+                const float atemp = ChprovSave * sincosval.y * 327.68;
+                const float btemp = ChprovSave * sincosval.x * 327.68;
+                hh = rt_lt_xatan2f(btemp, atemp);
+            }
+
+            if (Lprov1 < 0.1f) {
+                Lprov1 = 0.1f;
+            }
+
+            /* Gamut for L with ultra blue. */
+            if (hh < -0.9f && hh > -1.55f) {
+                if (Chprov1 > 160.0f && Lprov1 < 5.0f) {
+                    Lprov1 = 5.0f;
+                }
+                if (Chprov1 > 140.0f && Lprov1 < 3.5f) {
+                    Lprov1 = 3.5f;
+                }
+                if (Chprov1 > 120.0f && Lprov1 < 2.0f) {
+                    Lprov1 = 2.0f;
+                }
+                if (Chprov1 > 105.0f && Lprov1 < 1.0f) {
+                    Lprov1 = 1.0f;
+                }
+                if (Chprov1 > 90.0f && Lprov1 < 0.7f) {
+                    Lprov1 = 0.7f;
+                }
+                if (Chprov1 > 50.0f && Lprov1 < 0.5f) {
+                    Lprov1 = 0.5f;
+                }
+                if (Chprov1 > 20.0f && Lprov1 < 0.4f) {
+                    Lprov1 = 0.4f;
+                }
+            }
+
+            Chprov1 *= higherCoef;
+
+            if (Chprov1 <= 3.0f) {
+                Lprov1 += lowerCoef;
+            }
+
+            inGamut = 0;
+        } else if (!isHLEnabled &&
+                   rt_lt_max(rt_lt_max(R, G), B) > clip_level &&
+                   rt_lt_min(rt_lt_min(R, G), B) <= clip_level) {
+            /* A clipped, coloured highlight: only with highlight
+             * reconstruction off, as in the host. */
+            if (Lprov1 > 99.999f) {
+                Lprov1 = 99.98f;
+            }
+
+            Chprov1 *= higherCoef;
+
+            if (Chprov1 <= 3.0f) {
+                Lprov1 -= lowerCoef;
+            }
+
+            inGamut = 0;
+        }
+    } while (!inGamut);
+
+    *Lprov1_out = Lprov1;
+    *Chprov1_out = Chprov1;
+    *R_out = R;
+    *G_out = G;
+    *B_out = B;
 }
 
 /*
@@ -407,7 +522,7 @@ inline void rt_lt_all_munsell_lch_lum(
 /*
  * chromiLuminanceCurve()'s per-pixel body for the supported configuration.
  *
- * `method` is RT_LAB_TOOLS_MUNSELL_NONE, _XYZ, _XYZREL or _MUN.
+ * `method` is RT_LAB_TOOLS_MUNSELL_NONE, _LAB, _XYZ, _XYZREL or _MUN.
  * `rst_protection` is 100 - rstprotection, `protect_red`/`protect_red_h` are
  * the raw settings->protectred and settings->protectredh values, and
  * `adjust` is the working-profile chroma scale for the C=f(C) and C=f(L)
@@ -850,6 +965,26 @@ __kernel void rt_lab_tools_lab_curve(
             sincosval.y = aag2 / (Chprov1 * 327.68f);
             sincosval.x = bbg2 / (Chprov1 * 327.68f);
         }
+
+        out_l = Lprov1 * 327.68f;
+        out_a = 327.68f * Chprov1 * sincosval.y;
+        out_b = 327.68f * Chprov1 * sincosval.x;
+    }
+
+    /*
+     * gamutmuns 1: the block's LAB correction. Color::gamutLchonly()'s RGB
+     * overload projects the pixel through the double working-space inverse and
+     * iterates on the RGB clip tests with ClipLevel 65535, writing L and C
+     * back; the arm then rebuilds lnew's L, a and b from them. It runs before
+     * the Munsell arm, exactly as the host orders it, so the Munsell block
+     * below sees the corrected L and a/b.
+     */
+    if (method == RT_LT_METHOD_LAB) {
+        float R;
+        float G;
+        float B;
+        rt_lt_gamut_lchonly_rgb(HH, sincosval, &Lprov1, &Chprov1, &R, &G, &B,
+                                wip, highlight, 0.15f, 0.96f);
 
         out_l = Lprov1 * 327.68f;
         out_a = 327.68f * Chprov1 * sincosval.y;

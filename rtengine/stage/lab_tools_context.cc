@@ -436,10 +436,10 @@ bool labToolsSupported(const procparams::ProcParams& params)
      * The Lab-curve pass is a device case only when everything it reads is
      * ported. The chromaticity slider must be inside its GUI range and the
      * three hue flat curves (C=f(H), L=f(H) and H=f(H)) must be ones the
-     * host table can follow; the LAB Munsell method needs gamutLchonly();
-     * factnoise reads the denoise tool. Each is a residual. NONE, XYZ,
-     * XYZREL and MUN are the device methods; every non-NONE method runs the
-     * block's Munsell arm, which reads the host Munsell tables.
+     * host table can follow; factnoise reads the denoise tool. Each is a
+     * residual. NONE, LAB, XYZ, XYZREL and MUN are the device methods; every
+     * non-NONE method runs the block's Munsell arm, which reads the host
+     * Munsell tables.
      */
     if (params.labCurve.enabled) {
         if (!hueCurveFamilySupported(params) ||
@@ -447,8 +447,8 @@ bool labToolsSupported(const procparams::ProcParams& params)
             return false;
         }
         const auto& method = params.labCurve.gamutmunselmethod;
-        if (method != "NONE" && method != "XYZ" && method != "XYZREL" &&
-            method != "MUN") {
+        if (method != "NONE" && method != "LAB" && method != "XYZ" &&
+            method != "XYZREL" && method != "MUN") {
             return false;
         }
         if (method != "NONE" && !munsellTablesAvailable()) {
@@ -825,6 +825,8 @@ int LabToolsContext::build(RtLabToolsResult& out)
         const auto& method = params_.labCurve.gamutmunselmethod;
         if (method == "NONE") {
             lab_curve_munsell_ = RT_LAB_TOOLS_MUNSELL_NONE;
+        } else if (method == "LAB") {
+            lab_curve_munsell_ = RT_LAB_TOOLS_MUNSELL_LAB;
         } else if (method == "XYZ") {
             lab_curve_munsell_ = RT_LAB_TOOLS_MUNSELL_XYZ;
         } else if (method == "XYZREL") {

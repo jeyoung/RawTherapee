@@ -3454,8 +3454,8 @@ RtStageStatus run_working_trc(const std::shared_ptr<OpenCLEnv>& env,
  *   [35] int L table active, [36] int a table active, [37] int b table active,
  *   [38] int C=f(C) table active, [39] int L=f(C) table active,
  *   [40] int C=f(L) table active,
- *   [41] int Munsell method (RT_LAB_TOOLS_MUNSELL_NONE, _XYZ, _XYZREL or
- *        _MUN),
+ *   [41] int Munsell method (RT_LAB_TOOLS_MUNSELL_NONE, _LAB, _XYZ, _XYZREL
+ *        or _MUN),
  *   [42] int lcredsk,
  *   [43] double 100 - rstprotection, [44] double settings->protectred,
  *   [45] double settings->protectredh, [46] double settings->amchroma,
@@ -3699,11 +3699,10 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
 
     /*
      * The Lab-curve pass. `lab_curve` is the call site's
-     * labToolsLabCurveActive(): the enabled curve with the residual contrast
-     * at zero. The six flags are the six host-built tables' activity, and the
-     * method is the block's gamutmunselmethod mapping, restricted to the
-     * admitted set: NONE, XYZ, XYZREL or MUN. LAB is not a device method and
-     * stays a host residual.
+     * labToolsLabCurveActive(): the block's enabled Lab curve. The six flags
+     * are the six host-built tables' activity, and the method is the block's
+     * gamutmunselmethod mapping, restricted to the admitted set: NONE, LAB,
+     * XYZ, XYZREL and MUN.
      */
     const std::int64_t lab_curve_flag = args[34].u.i;
     if (lab_curve_flag != 0 && lab_curve_flag != 1) {
@@ -3752,6 +3751,7 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
 
         const std::int64_t method = args[41].u.i;
         if (method != static_cast<std::int64_t>(RT_LAB_TOOLS_MUNSELL_NONE) &&
+            method != static_cast<std::int64_t>(RT_LAB_TOOLS_MUNSELL_LAB) &&
             method != static_cast<std::int64_t>(RT_LAB_TOOLS_MUNSELL_XYZ) &&
             method != static_cast<std::int64_t>(RT_LAB_TOOLS_MUNSELL_XYZREL) &&
             method != static_cast<std::int64_t>(RT_LAB_TOOLS_MUNSELL_MUN)) {
