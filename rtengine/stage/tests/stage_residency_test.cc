@@ -6108,6 +6108,18 @@ void test_lab_tools_lab_curve(bool available)
         {"XYZ with hue curves", 238, 64, 2, 0, 0.62, false, false, false,
          false, false, false, 50, "XYZ", 30.0, true, 60, 0.3, true, true,
          true},
+        /*
+         * The LAB gamut correction: Color::gamutLchonly()'s RGB overload on
+         * the double working-space inverse, iterating on the 65535 clip
+         * tests, then the same Munsell arm the other non-NONE methods run.
+         */
+        {"LAB gamut correction", 238, 64, 2, 0, 0.62, true, true, true, true,
+         true, true, 0, "LAB", 0.0, true, 60, 0.3},
+        {"LAB neutral", 179, 48, 1, 0, 0.5, false, false, false, false, false,
+         false, 0, "LAB", 0.0, true, 60, 0.3},
+        {"LAB with hue curves", 238, 64, 2, 0, 0.62, false, false, false,
+         false, false, false, 50, "LAB", 30.0, true, 60, 0.3, true, true,
+         true},
         {"red/skin protection", 238, 64, 2, 0, 1.20, false, false, false, true,
          true, false, 0, "MUN", 30.0, true, 60, 0.3},
         {"protection low red", 179, 48, 2, 0, 1.20, false, false, false, true,
@@ -6358,8 +6370,7 @@ void test_lab_tools_lab_curve(bool available)
      * must run the block on the host byte for byte.
      */
     const char* residual_labels[] = {
-        "LAB Munsell", "black and white with colour toning",
-        "dense hue curve"};
+        "black and white with colour toning", "dense hue curve"};
     for (const char* label : residual_labels) {
         rtengine::procparams::ProcParams params;
         params.labCurve.enabled = true;
@@ -6395,8 +6406,6 @@ void test_lab_tools_lab_curve(bool available)
                 dense.push_back(0.0);
             }
             params.labCurve.chcurve = dense;
-        } else if (std::strcmp(label, "LAB Munsell") == 0) {
-            params.labCurve.gamutmunselmethod = "LAB";
         } else {
             /* black and white with colour toning: the host's `bwonly` is
              * false, so neither black-and-white arm runs. */
