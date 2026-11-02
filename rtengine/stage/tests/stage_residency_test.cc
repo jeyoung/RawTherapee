@@ -6094,6 +6094,20 @@ void test_lab_tools_lab_curve(bool available)
          true, 0, "NONE", 0.0, true, 60, 0.3},
         {"combined MUN", 238, 64, 0, 0, 0.62, true, true, true, true, true,
          true, 0, "MUN", 0.0, true, 60, 0.3},
+        /*
+         * The XYZ and XYZREL gamut corrections: Color::gamutmap() on the
+         * saturated image, which leaves the working-space gamut, then the
+         * Munsell arm that follows every non-NONE method.
+         */
+        {"XYZ gamut correction", 238, 64, 2, 0, 0.62, true, true, true, true,
+         true, true, 0, "XYZ", 0.0, true, 60, 0.3},
+        {"XYZREL gamut correction", 238, 64, 2, 0, 0.62, true, true, true,
+         true, true, true, 0, "XYZREL", 0.0, true, 60, 0.3},
+        {"XYZ neutral", 179, 48, 1, 0, 0.5, false, false, false, false, false,
+         false, 0, "XYZ", 0.0, true, 60, 0.3},
+        {"XYZ with hue curves", 238, 64, 2, 0, 0.62, false, false, false,
+         false, false, false, 50, "XYZ", 30.0, true, 60, 0.3, true, true,
+         true},
         {"red/skin protection", 238, 64, 2, 0, 1.20, false, false, false, true,
          true, false, 0, "MUN", 30.0, true, 60, 0.3},
         {"protection low red", 179, 48, 2, 0, 1.20, false, false, false, true,
@@ -6344,7 +6358,7 @@ void test_lab_tools_lab_curve(bool available)
      * must run the block on the host byte for byte.
      */
     const char* residual_labels[] = {
-        "XYZ Munsell", "black and white with colour toning",
+        "LAB Munsell", "black and white with colour toning",
         "dense hue curve"};
     for (const char* label : residual_labels) {
         rtengine::procparams::ProcParams params;
@@ -6381,8 +6395,8 @@ void test_lab_tools_lab_curve(bool available)
                 dense.push_back(0.0);
             }
             params.labCurve.chcurve = dense;
-        } else if (std::strcmp(label, "XYZ Munsell") == 0) {
-            params.labCurve.gamutmunselmethod = "XYZ";
+        } else if (std::strcmp(label, "LAB Munsell") == 0) {
+            params.labCurve.gamutmunselmethod = "LAB";
         } else {
             /* black and white with colour toning: the host's `bwonly` is
              * false, so neither black-and-white arm runs. */
