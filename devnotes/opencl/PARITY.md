@@ -86,6 +86,8 @@ pairs are exact. The gate is the peak absolute error (PAE) in normalised units;
 | 2026-11-01 | 0abd76894..5781f1c38 | POCL (CPU) | colorspace_flowers.pef / `labwavelet-toning.pp3` (zero-protection toning, non-identity `opacityCurveRG` and `opacityCurveBY`), `lab.wavelet` | off vs auto, 16-bit TIFF | 0 (exact) | PASS |
 | 2026-11-01 | 0abd76894..5781f1c38 | POCL (CPU) | 12-case toning matrix (a only, b only, both, sigmaton 0.5/2.0, with contrast, with chroma, with edge, with final curves, 179x49 padded, 3 and 7 levels), `stage-residency-test` | device vs host block | 0.011719 LSB16 (worst) | PASS |
 | 2026-11-01 | 0abd76894..5781f1c38 | POCL (CPU) | 10-case toning residual matrix (protab on, sigmaton low/high, no opacity multiplier, expnoise, expbl, expresid, expclari, CLmethod one, skin protection), `stage-residency-test` | device vs host block | 0 (host) | PASS |
+| 2026-11-02 | 89e0a844b..47b9980fb | POCL (CPU) | colorspace_flowers.pef / `labtools-labcurve-contrast.pp3` (Lab curves with contrast 30, L/a/b/cc/lc/cl tables), `lab.tools` | off vs auto, 16-bit TIFF | 0 (exact) | PASS |
+| 2026-11-02 | 89e0a844b..47b9980fb | POCL (CPU) | 3-case Lab-contrast matrix (contrast 5, contrast 15 with L curve+brightness, contrast 30 with all six tables), `stage-residency-test` | device vs host block | 0 (exact) | PASS |
 
 `47c50ee77` changes only CPU export buffer handling; the OpenCL rows above
 re-run the existing GPU stages against the new CPU neighbour.

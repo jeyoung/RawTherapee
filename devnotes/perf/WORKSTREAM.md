@@ -14,10 +14,10 @@ and are ordered below. Each stable, scanned range is pushed from 2026-10-29 on.
 ## State
 
 - Repository: `$REPO`
-- Worktree: the main checkout, branch `perf-graph`, clean and eleven commits
-  ahead of `origin/perf-graph` (`e77993457`); the last pushed tip is
+- Worktree: the main checkout, branch `perf-graph`, clean and fourteen
+  commits ahead of `origin/perf-graph` (`e77993457`); the last pushed tip is
   `e77993457`. All pushed ranges were scanned per the publication gate; the
-  eleven local commits are not pushed.
+  fourteen local commits are not pushed.
 - Stage C landed 2026-10-31: `local.adjustments` local sharpening (undamped
   `cd38028bb..7467f563f`, damped `211c12597..ebbeab951`), the `crop` device
   node (`544f01573`, `0885d952c`), the `lab.sharpening` impulse-denoise +
@@ -184,6 +184,13 @@ Validated at `3871b7d0c`; the commits after it are documentation only.
   builtin byte for byte. `labwavelet-toning.pp3` is exact on the export TIFF.
   The protection range (`protab > 0`) remains a host residual. `0abd76894`,
   `5781f1c38`.
+- **`lab.tools` Lab contrast**: non-zero `labCurve.contrast` is now a device
+  pass. The host builds the `hist16` refill from the input L before the node
+  and `complexLCurve()` builds the luma table the existing kernel applies;
+  the histogram is a host prefix because it is a later node's input. Three
+  cases (contrast 5, contrast 15 with L curve and brightness, contrast 30
+  with all six tables) are exact; `labtools-labcurve-contrast.pp3` is exact
+  on the export TIFF. `89e0a844b`, `47b9980fb`.
 - **`lab.wavelet` denoise groundwork**: the denoise tail ABI and the
   `compute_mad` callback. The tail carries `vari[0..5]`, `ballum` and one
   squared `madL` entry per level and direction; the histogram itself will be
