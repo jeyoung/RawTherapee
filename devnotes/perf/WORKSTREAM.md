@@ -15,7 +15,7 @@ and are ordered below. Each stable, scanned range is pushed from 2026-10-29 on.
 
 - Repository: `$REPO`
 - Worktree: the main checkout, branch `perf-graph`, clean and in sync with
-  `origin/perf-graph`; the last pushed tip is `d6fc75aa8`. All pushed ranges
+  `origin/perf-graph`; the last pushed tip is `f4fce9ee0`. All pushed ranges
   were scanned per the publication gate.
 - Stage C landed 2026-10-31: `local.adjustments` local sharpening (undamped
   `cd38028bb..7467f563f`, damped `211c12597..ebbeab951`), the `crop` device
@@ -788,11 +788,16 @@ once the wavelet panels land. EPD stays a permanent residual.
 
 ## Next immediate task
 
-Move on to the next `lab.wavelet` panel: clarity (`expbl`/`expclari`), once
-the `CLmethod` `one`/`inf`/`sup` residual-painting arms are ported. The
-standard denoise arm (and the chroma denoise the block forces at six levels)
-landed with the unit above; its denoise curves, expert pairing, BiShrink
-arms, user chroma strength, noise balance and hue curve stay residuals. The
+Move on to the `lab.wavelet` clarity arm (`expclari` with `CLmethod`
+`one`/`inf`/`sup`), which is a two-pass merge rather than a single kernel: the
+host runs a panels-off pass into `unshar`, runs the main pass, optionally
+applies the guided soft-radius filter and then merges the two with
+`mergeL`/`mergeC` and the `Backmethod` rules. Those blocks are already written
+out in `lab_wavelet_context.cc` (the host builtin), so the unit is a port of
+that sequence, not new research. The standard denoise arm (and the chroma
+denoise the block forces at six levels) landed with the unit above; its
+denoise curves, expert pairing, BiShrink arms, user chroma strength, noise
+balance and hue curve stay residuals. The
 final curves and the toning zero-protection arm landed with the units above.
 The edge panel's plain arm is landed; its median/Lipschitz
 detection (`calckoe`), `NPMethod` low/high smoothing, `Lipst`, and the dead
