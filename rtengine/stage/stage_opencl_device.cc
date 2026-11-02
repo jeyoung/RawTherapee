@@ -3454,7 +3454,8 @@ RtStageStatus run_working_trc(const std::shared_ptr<OpenCLEnv>& env,
  *   [35] int L table active, [36] int a table active, [37] int b table active,
  *   [38] int C=f(C) table active, [39] int L=f(C) table active,
  *   [40] int C=f(L) table active,
- *   [41] int Munsell method (RT_LAB_TOOLS_MUNSELL_NONE or _MUN),
+ *   [41] int Munsell method (RT_LAB_TOOLS_MUNSELL_NONE, _XYZ, _XYZREL or
+ *        _MUN),
  *   [42] int lcredsk,
  *   [43] double 100 - rstprotection, [44] double settings->protectred,
  *   [45] double settings->protectredh, [46] double settings->amchroma,
@@ -3472,7 +3473,8 @@ RtStageStatus run_working_trc(const std::shared_ptr<OpenCLEnv>& env,
  *   [63] int region count (0 or 1..4), [64] BUFFER the region mask tables,
  *   [65] int their stride, [66] BUFFER the per-region parameters,
  *   [67] and [68] PTR the working and inverse matrices as nine doubles each
- *        (host-only, copied to a device buffer),
+ *        (host-only, copied to a device buffer). [67] is also
+ *        Color::gamutmap()'s `p` for the XYZ methods,
  *   [69] int black-and-white flag (1 when `blackwhite.enabled` is set; the
  *        cheap zeroing runs only with the Lab-curve pass off, otherwise the
  *        curve kernel runs the `bwToning` arm in its place).
@@ -3748,6 +3750,8 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
 
         const std::int64_t method = args[41].u.i;
         if (method != static_cast<std::int64_t>(RT_LAB_TOOLS_MUNSELL_NONE) &&
+            method != static_cast<std::int64_t>(RT_LAB_TOOLS_MUNSELL_XYZ) &&
+            method != static_cast<std::int64_t>(RT_LAB_TOOLS_MUNSELL_XYZREL) &&
             method != static_cast<std::int64_t>(RT_LAB_TOOLS_MUNSELL_MUN)) {
             error = "lab.tools has a Lab-curve Munsell method outside its range";
             return RT_STAGE_INVALID;
@@ -4144,9 +4148,12 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
     const RtStageBuffer& munsell = args[31].u.buffer;
     const RtStageBuffer& munsell_sizes = args[32].u.buffer;
     const RtStageBuffer& skin_curve = args[33].u.buffer;
-    const bool lab_curve_munsell =
-        lab_curve && lab_curve_method == static_cast<int>(RT_LAB_TOOLS_MUNSELL_MUN);
-    if ((vibrance && avoidcolorshift != 0) || lab_curve_munsell) {
+    const bool lab_curve_needs_munsell =
+        lab_curve &&
+        lab_curve_method != static_cast<int>(RT_LAB_TOOLS_MUNSELL_NONE);
+    /* The block's Munsell arm runs for every non-NONE method, so the flat
+     * table set is required whenever the pass has one. */
+    if ((vibrance && avoidcolorshift != 0) || lab_curve_needs_munsell) {
         const std::uint32_t flats =
             RT_LAB_TOOLS_MUNSELL_TABLES * RT_LAB_TOOLS_MUNSELL_STRIDE;
         if (!valid(munsell) || munsell.format != RT_STAGE_F32 ||
@@ -4213,12 +4220,13 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
         }
         /*
          * L=f(H) runs the block's gamut loop through Color::xyz2rgb() on the
-         * working-space inverse in double. The float matrix is one ulp away
-         * and can flip the loop's in-gamut test, so the pass carries the
-         * double matrix whether or not the curve is active.
+         * working-space inverse in double, and the XYZ gamut correction reads
+         * Color::gamutmap()'s forward matrix in double. The float matrices
+         * are one ulp away and can flip a gamut test, so the pass carries
+         * both.
          */
-        if (args[68].u.ptr == nullptr) {
-            error = "lab.tools needs the double working matrix";
+        if (args[67].u.ptr == nullptr || args[68].u.ptr == nullptr) {
+            error = "lab.tools needs the double working matrices";
             return RT_STAGE_INVALID;
         }
     }
@@ -4426,7 +4434,7 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
     StageDeviceBufferPtr munsell_device;
     StageDeviceBufferPtr munsell_sizes_device;
     StageDeviceBufferPtr skin_curve_device;
-    if (vibrance || lab_curve_munsell) {
+    if (vibrance || lab_curve_needs_munsell) {
         munsell_device = residency->acquire(&munsell_key, munsell_shape, &error);
         munsell_sizes_device =
             residency->acquire(&munsell_sizes_key, munsell_sizes_shape, &error);
@@ -4455,11 +4463,13 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
     StageDeviceBufferPtr clcurve_device;
     char hue_luts_key = 0;
     char wip_key = 0;
+    char wp_key = 0;
     const StageBufferShape hue_shape{
         RT_STAGE_F32,
         static_cast<std::int32_t>(RT_LAB_TOOLS_HUE_CURVES * hue_stride), 1, 1};
     StageDeviceBufferPtr hue_luts_device;
     StageDeviceBufferPtr wip_device;
+    StageDeviceBufferPtr wp_device;
     if (lab_curve) {
         lcurve_device = residency->acquire(&lcurve_key, lcurve_shape, &error);
         acurve_device = residency->acquire(&acurve_key, curve_shape, &error);
@@ -4471,9 +4481,13 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
         clcurve_device = residency->acquire(&clcurve_key, curve_shape, &error);
         hue_luts_device =
             residency->acquire(&hue_luts_key, hue_shape, &error);
-        /* Nine doubles occupy 18 floats in the residency's byte count. */
+        /* Nine doubles occupy 18 floats in the residency's byte count. The
+         * forward matrix is Color::gamutmap()'s `p` for the XYZ methods; the
+         * inverse is L=f(H)'s Color::xyz2rgb(). */
         wip_device = residency->acquire(
             &wip_key, StageBufferShape{RT_STAGE_F32, 18, 1, 1}, &error);
+        wp_device = residency->acquire(
+            &wp_key, StageBufferShape{RT_STAGE_F32, 18, 1, 1}, &error);
     }
 
     /*
@@ -4528,13 +4542,13 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
         !sub_meanp || !sub_temp || !lut_highlight_device ||
         !lut_shadow_device || !ws_device || !iws_device || !cachef_device ||
         !cachefy_device ||
-        ((vibrance || lab_curve_munsell) &&
+        ((vibrance || lab_curve_needs_munsell) &&
          (!munsell_device || !munsell_sizes_device)) ||
         (vibrance && !skin_curve_device) ||
         (lab_curve &&
          (!lcurve_device || !acurve_device || !bcurve_device ||
           !satcurve_device || !lhskcurve_device || !clcurve_device ||
-          !hue_luts_device || !wip_device)) ||
+          !hue_luts_device || !wip_device || !wp_device)) ||
         (local_contrast && (!lc_h_device || !lc_v_device)) ||
         (regions && (!snapshot_device || !region_masks_device ||
                      !region_luts_device || !region_params_device))) {
@@ -4573,7 +4587,7 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
         !upload(ws_device, ws, "ws") || !upload(iws_device, iws, "iws") ||
         !upload(cachef_device, cachef, "cachef") ||
         !upload(cachefy_device, cachefy, "cachefy") ||
-        ((vibrance || lab_curve_munsell) &&
+        ((vibrance || lab_curve_needs_munsell) &&
          (!upload(munsell_device, munsell, "munsell") ||
           !upload(munsell_sizes_device, munsell_sizes, "munsell sizes"))) ||
         (vibrance && !upload(skin_curve_device, skin_curve, "skin curve")) ||
@@ -4588,7 +4602,11 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
           !upload(wip_device,
                   double_matrix_buffer(
                       static_cast<const double*>(args[68].u.ptr)),
-                  "double inverse"))) ||
+                  "double inverse") ||
+          !upload(wp_device,
+                  double_matrix_buffer(
+                      static_cast<const double*>(args[67].u.ptr)),
+                  "double working matrix"))) ||
         (regions &&
          (!upload(region_luts_device, args[64].u.buffer, "region tables") ||
           !upload(region_params_device, args[66].u.buffer,
@@ -4684,10 +4702,12 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
     cl_mem cachef_memory = memory_of(cachef_device);
     cl_mem cachefy_memory = memory_of(cachefy_device);
     cl_mem munsell_memory =
-        (vibrance || lab_curve_munsell) ? memory_of(munsell_device) : nullptr;
+        (vibrance || lab_curve_needs_munsell) ? memory_of(munsell_device)
+                                              : nullptr;
     cl_mem munsell_sizes_memory =
-        (vibrance || lab_curve_munsell) ? memory_of(munsell_sizes_device)
-                                        : nullptr;
+        (vibrance || lab_curve_needs_munsell)
+            ? memory_of(munsell_sizes_device)
+            : nullptr;
     cl_mem skin_curve_memory =
         vibrance ? memory_of(skin_curve_device) : nullptr;
     cl_mem lcurve_memory = lab_curve ? memory_of(lcurve_device) : nullptr;
@@ -4713,7 +4733,7 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
         sh_memory == nullptr || ws_memory == nullptr ||
         iws_memory == nullptr || cachef_memory == nullptr ||
         cachefy_memory == nullptr ||
-        ((vibrance || lab_curve_munsell) &&
+        ((vibrance || lab_curve_needs_munsell) &&
          (munsell_memory == nullptr || munsell_sizes_memory == nullptr)) ||
         (vibrance && skin_curve_memory == nullptr) ||
         (lab_curve &&
@@ -5549,6 +5569,7 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
             const cl_float cl_amount_chroma =
                 static_cast<cl_float>(args[46].u.f);
             const cl_mem wip_memory = memory_of(wip_device);
+            const cl_mem wp_memory = memory_of(wp_device);
             const cl_int cl_highlight = highlight;
             ok = ok && set_arg(lab_curve_kernel, arg++, sizeof(cl_mem),
                                &hue_luts_memory);
@@ -5568,6 +5589,12 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
                                &wip_memory);
             ok = ok && set_arg(lab_curve_kernel, arg++, sizeof(cl_int),
                                &cl_highlight);
+            ok = ok && set_arg(lab_curve_kernel, arg++, sizeof(cl_mem),
+                               &wp_memory);
+            ok = ok && set_arg(lab_curve_kernel, arg++, sizeof(cl_mem),
+                               &cachef_memory);
+            ok = ok && set_arg(lab_curve_kernel, arg++, sizeof(cl_mem),
+                               &cachefy_memory);
             if (!ok) {
                 error = "lab.tools Lab-curve arguments failed";
                 return RT_STAGE_FALLBACK;

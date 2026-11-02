@@ -29,19 +29,19 @@
  *
  * Supported: the L, a, b, C=f(C), L=f(C) and C=f(L) tables, the C=f(H),
  * L=f(H) and H=f(H) hue flat curves (host-sampled piecewise-linear tables),
- * the chromaticity slider, the MUN and NONE Munsell methods, the red and skin
- * protection, `lcredsk`, the block's chroma scale for the working profile,
- * and black-and-white output through `chromiLuminanceCurve()`'s `bwToning`
- * arm. Under `bwToning` the hue and chroma come from the original pixel
- * before the a and b tables, the chromaticity gate, the C=f(L) and C=f(C)
- * tables and the red/skin gate are skipped, L=f(C) is skipped, and the
- * closing write is the a/b tables' deviation from the original chroma
- * (exactly zero when neither table is active). The three hue flat curves
- * still run under `bwToning`, exactly as the block orders them. Residual (the
- * launcher never reaches this kernel): a non-zero contrast (it owns the
- * hist16 refill), a hue flat curve the host table cannot follow, a
- * chromaticity slider outside -100..100, the LAB, XYZ and XYZREL Munsell
- * methods and a denoised chroma factor.
+ * the chromaticity slider, the NONE, XYZ, XYZREL and MUN Munsell methods,
+ * the red and skin protection, `lcredsk`, the block's chroma scale for the
+ * working profile, and black-and-white output through
+ * `chromiLuminanceCurve()`'s `bwToning` arm. Under `bwToning` the hue and
+ * chroma come from the original pixel before the a and b tables, the
+ * chromaticity gate, the C=f(L) and C=f(C) tables and the red/skin gate are
+ * skipped, L=f(C) is skipped, and the closing write is the a/b tables'
+ * deviation from the original chroma (exactly zero when neither table is
+ * active). The three hue flat curves still run under `bwToning`, exactly as
+ * the block orders them. Residual (the launcher never reaches this kernel): a
+ * non-zero contrast (it owns the hist16 refill), a hue flat curve the host
+ * table cannot follow, a chromaticity slider outside -100..100, the LAB
+ * Munsell method and a denoised chroma factor.
  *
  * The source is appended after lab_tools_cl.h, munsell_lch_cl.h and
  * vibrance_cl.h, so it reads their LUT, atan2/sincos and Munsell helpers.
@@ -62,6 +62,12 @@ inline float rt_lt_lim(const float value, const float low, const float high)
 {
     return rt_lt_max(low, rt_lt_min(value, high));
 }
+
+/* chromiLuminanceCurve()'s gamutmunselmethod numbering. */
+#define RT_LT_METHOD_NONE 0
+#define RT_LT_METHOD_XYZ 2
+#define RT_LT_METHOD_XYZREL 3
+#define RT_LT_METHOD_MUN 4
 
 /*
  * chromiLuminanceCurve()'s scalar chroma: `sqrt(float) / 327.68f` in the host
@@ -174,6 +180,95 @@ inline void rt_lt_xyz2rgb_d(const float x, const float y, const float z,
     *r = (float)(m[0] * (double)x + m[1] * (double)y + m[2] * (double)z);
     *g = (float)(m[3] * (double)x + m[4] * (double)y + m[5] * (double)z);
     *b = (float)(m[6] * (double)x + m[7] * (double)y + m[8] * (double)z);
+}
+
+/*
+ * Color::gamutmap(), arithmetic for arithmetic. `p` is chromiLuminanceCurve()'s
+ * `wp`, ICCStore::workingSpaceMatrix(), row-major: columns are the RGB
+ * tristimulus primaries, which is how the host indexes `p[0][c]`, `p[1][c]`
+ * and `p[2][c]`. The lam ratios are double because `p` is; u, v, lam_min and
+ * the final XYZ stay float, as in the host.
+ */
+inline void rt_lt_gamutmap(float* X, const float Y, float* Z,
+                           __global const double* p)
+{
+    const float epsil = 0.0001f;
+    float intermXYZ = *X + 15.f * Y + 3.f * *Z;
+    if (intermXYZ <= 0.f) {
+        intermXYZ = epsil;
+    }
+
+    /* Color::u0 and Color::v0, from the same float D50 constants. */
+    const double u0 = 4.0 * (double)RT_LT_D50X /
+                      ((double)RT_LT_D50X + 15.0 + 3.0 * (double)RT_LT_D50Z);
+    const double v0 = 9.0 /
+                      ((double)RT_LT_D50X + 15.0 + 3.0 * (double)RT_LT_D50Z);
+
+    /*
+     * The host's `4 * X / intermXYZ - u0`: the quotient is float and the
+     * subtraction uses the double u0, narrowed on assignment.
+     */
+    const float uq = 4.f * *X / intermXYZ;
+    const float vq = 9.f * Y / intermXYZ;
+    float u = (float)((double)uq - u0);
+    float v = (float)((double)vq - v0);
+    float lam[6];
+    float lam_min = 1.0f;
+
+    const double p0[3] = {p[0], p[1], p[2]};
+    const double p1[3] = {p[3], p[4], p[5]};
+    const double p2[3] = {p[6], p[7], p[8]};
+
+    for (int c = 0; c < 3; ++c) {
+        const int c1 = (c + 1) % 3;
+        const int c2 = (c + 2) % 3;
+        for (int m = 0; m < 2; ++m) {
+            double value =
+                -(p0[c1] * p1[c] *
+                  ((-12.0 + 3.0 * u0 + 20.0 * v0) * (double)Y +
+                   4.0 * (double)(m * 65535) * v0 * p2[c2])) +
+                p0[c] * p1[c1] *
+                    ((-12.0 + 3.0 * u0 + 20.0 * v0) * (double)Y +
+                     4.0 * (double)(m * 65535) * v0 * p2[c2]) -
+                4.0 * v0 * p0[c1] *
+                    ((double)Y - (double)(m * 65535) * p1[c2]) * p2[c] +
+                4.0 * v0 * p0[c] *
+                    ((double)Y - (double)(m * 65535) * p1[c2]) * p2[c1] -
+                (4.0 * (double)(m * 65535) * v0 * p0[c2] -
+                 9.0 * u0 * (double)Y) *
+                    (p1[c1] * p2[c] - p1[c] * p2[c1]);
+            const double denominator =
+                (3.f * u * Y) *
+                    (p0[c1] * p1[c] - p1[c1] * (p0[c] + 3.0 * p2[c]) +
+                     3.0 * p1[c] * p2[c1]) +
+                (4.f * v) *
+                    (p0[c1] * ((5.f * Y) * p1[c] +
+                               (double)(m * 65535) * p1[c] * p2[c2] +
+                               (double)Y * p2[c] -
+                               (double)(m * 65535) * p1[c2] * p2[c]) -
+                     p0[c] * ((5.f * Y) * p1[c1] +
+                              (double)(m * 65535) * p1[c1] * p2[c2] +
+                              (double)Y * p2[c1] -
+                              (double)(m * 65535) * p1[c2] * p2[c1]) +
+                     (double)(m * 65535) * p0[c2] *
+                         (p1[c1] * p2[c] - p1[c] * p2[c1]));
+            lam[c * 2 + m] = (float)value;
+            lam[c * 2 + m] = (float)((double)lam[c * 2 + m] / denominator);
+            if (lam[c * 2 + m] < lam_min && lam[c * 2 + m] > 0.f) {
+                lam_min = lam[c * 2 + m];
+            }
+        }
+    }
+
+    u = (float)((double)u * (double)lam_min + u0);
+    v = (float)((double)v * (double)lam_min + v0);
+
+    *X = (9.f * u * Y) / (4.f * v);
+    float intermuv = 12.f - 3.f * u - 20.f * v;
+    if (intermuv < 0.f) {
+        intermuv = 0.f;
+    }
+    *Z = intermuv * Y / (4.f * v);
 }
 
 /*
@@ -338,7 +433,9 @@ __kernel void rt_lab_tools_lab_curve(
     __global const float* hue_luts, const int hue_stride,
     const int ch_active, const int lh_active, const int hh_active,
     const int chromaticity, const float amount_chroma,
-    __global const double* wip, const int highlight)
+    __global const double* wip, const int highlight,
+    __global const double* wp, __global const float* cachef,
+    __global const float* cachefy)
 {
     const int x = get_global_id(0);
     const int y = get_global_id(1);
@@ -712,16 +809,65 @@ __kernel void rt_lab_tools_lab_curve(
     float out_b = 327.68f * Chprov1 * sincosval.x;
 
     /*
-     * The Munsell correction. The block guards it with the activity test; at
-     * least one table is active whenever the method is MUN and the launcher
-     * only sends the pass when it has one, but the test is kept.
+     * gamutmuns 2/3: the block's XYZ correction. It takes lnew's L and the
+     * a/b it has just written, projects them onto the working-space gamut
+     * through Color::gamutmap(), blends the projection halfway back to the
+     * original for XYZREL, and rebuilds L, HH, the chroma and the direction
+     * from the projected XYZ. `wp` is the same working matrix the host
+     * passes. The host's XYZREL blend is 0.5 here, not the local
+     * adjustments' 0.3.
+     */
+    if (method == RT_LT_METHOD_XYZ ||
+        method == RT_LT_METHOD_XYZREL) {
+        float xg;
+        float yg;
+        float zg;
+        rt_lt_lab2xyz(out_l, atmp, btmp, &xg, &yg, &zg);
+        const float x0 = xg;
+        const float y0 = yg;
+        const float z0 = zg;
+
+        rt_lt_gamutmap(&xg, yg, &zg, wp);
+
+        if (method == RT_LT_METHOD_XYZREL) {
+            xg = xg + 0.5f * (x0 - xg);
+            yg = yg + 0.5f * (y0 - yg);
+            zg = zg + 0.5f * (z0 - zg);
+        }
+
+        float lag;
+        float aag2;
+        float bbg2;
+        rt_lt_xyz2lab(xg, yg, zg, cachef, cachefy, &lag, &aag2, &bbg2);
+        Lprov1 = lag / 327.68f;
+        HH = rt_lt_xatan2f(bbg2, aag2);
+        Chprov1 = sqrt(aag2 * aag2 + bbg2 * bbg2) / 327.68f;
+
+        if (Chprov1 == 0.0f) {
+            sincosval.y = 1.f;
+            sincosval.x = 0.f;
+        } else {
+            sincosval.y = aag2 / (Chprov1 * 327.68f);
+            sincosval.x = bbg2 / (Chprov1 * 327.68f);
+        }
+
+        out_l = Lprov1 * 327.68f;
+        out_a = 327.68f * Chprov1 * sincosval.y;
+        out_b = 327.68f * Chprov1 * sincosval.x;
+    }
+
+    /*
+     * The Munsell correction. The block guards it with the activity test; a
+     * non-NONE method always has at least one activity flag or the
+     * chromaticity slider set when it reaches here, but the test is kept
+     * because the block has it.
      *
      * The activity test is the block's own list, which excludes `bwToning`;
      * under black-and-white the six tables can still be active, so the
      * correction runs on the grey or deviated chroma exactly as the block
      * does.
      */
-    if (method != 0 &&
+    if (method != RT_LT_METHOD_NONE &&
         (l_active != 0 || a_active != 0 || b_active != 0 || cc_active != 0 ||
          lc_active != 0 || cl_active != 0 || ch_active != 0 ||
          lh_active != 0 || hh_active != 0 || chromaticity != 0)) {
@@ -748,7 +894,7 @@ __kernel void rt_lab_tools_lab_curve(
      * repeats the write above; under `bwToning` it writes the a/b tables'
      * deviation directly, which is zero when no a or b table is active.
      */
-    if (method == 0 && bw_toning != 0) {
+    if (method == RT_LT_METHOD_NONE && bw_toning != 0) {
         out_a = atmp;
         out_b = btmp;
     }

@@ -436,21 +436,22 @@ bool labToolsSupported(const procparams::ProcParams& params)
      * The Lab-curve pass is a device case only when everything it reads is
      * ported. The chromaticity slider must be inside its GUI range and the
      * three hue flat curves (C=f(H), L=f(H) and H=f(H)) must be ones the
-     * host table can follow; the LAB, XYZ and XYZREL Munsell methods need
-     * gamutLchonly() and gamutmap(); factnoise reads the denoise tool. Each
-     * is a residual.
+     * host table can follow; the LAB Munsell method needs gamutLchonly();
+     * factnoise reads the denoise tool. Each is a residual. NONE, XYZ,
+     * XYZREL and MUN are the device methods; every non-NONE method runs the
+     * block's Munsell arm, which reads the host Munsell tables.
      */
     if (params.labCurve.enabled) {
         if (!hueCurveFamilySupported(params) ||
             params.dirpyrDenoise.enabled) {
             return false;
         }
-        const bool munsell =
-            params.labCurve.gamutmunselmethod == "MUN";
-        if (!munsell && params.labCurve.gamutmunselmethod != "NONE") {
+        const auto& method = params.labCurve.gamutmunselmethod;
+        if (method != "NONE" && method != "XYZ" && method != "XYZREL" &&
+            method != "MUN") {
             return false;
         }
-        if (munsell && !munsellTablesAvailable()) {
+        if (method != "NONE" && !munsellTablesAvailable()) {
             return false;
         }
         if (!(params.labCurve.rstprotection >= 0.0 &&
@@ -803,8 +804,8 @@ int LabToolsContext::build(RtLabToolsResult& out)
 
     /*
      * The two host-built table families: the Munsell set the vibrance
-     * avoidcolorshift path and the MUN Lab-curve method read, and vibrance's
-     * skin-hue curve.
+     * avoidcolorshift path and every non-NONE Lab-curve method's Munsell arm
+     * read, and vibrance's skin-hue curve.
      */
     static_assert(Color::MUNSELL_LUT_COUNT ==
                       static_cast<int>(RT_LAB_TOOLS_MUNSELL_TABLES),
@@ -821,9 +822,14 @@ int LabToolsContext::build(RtLabToolsResult& out)
     lab_curve_active_ = labToolsLabCurveActive(params_);
     lab_curve_munsell_ = RT_LAB_TOOLS_MUNSELL_NONE;
     if (lab_curve_active_) {
-        if (params_.labCurve.gamutmunselmethod == "NONE") {
+        const auto& method = params_.labCurve.gamutmunselmethod;
+        if (method == "NONE") {
             lab_curve_munsell_ = RT_LAB_TOOLS_MUNSELL_NONE;
-        } else if (params_.labCurve.gamutmunselmethod == "MUN") {
+        } else if (method == "XYZ") {
+            lab_curve_munsell_ = RT_LAB_TOOLS_MUNSELL_XYZ;
+        } else if (method == "XYZREL") {
+            lab_curve_munsell_ = RT_LAB_TOOLS_MUNSELL_XYZREL;
+        } else if (method == "MUN") {
             lab_curve_munsell_ = RT_LAB_TOOLS_MUNSELL_MUN;
         } else {
             /* The predicate must have refused it; never guess a method. */
@@ -833,7 +839,8 @@ int LabToolsContext::build(RtLabToolsResult& out)
 
     const bool need_munsell =
         vibrance_active_ ||
-        (lab_curve_active_ && lab_curve_munsell_ == RT_LAB_TOOLS_MUNSELL_MUN);
+        (lab_curve_active_ &&
+         lab_curve_munsell_ != RT_LAB_TOOLS_MUNSELL_NONE);
 
     if (need_munsell) {
         const std::size_t table_count = RT_LAB_TOOLS_MUNSELL_TABLES;

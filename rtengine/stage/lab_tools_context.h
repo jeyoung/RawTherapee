@@ -100,10 +100,12 @@ struct ProcParams;
 #define RT_LAB_TOOLS_HUE_LUT_NODES 32768u
 #define RT_LAB_TOOLS_HUE_LUT_STRIDE (1u + 2u * RT_LAB_TOOLS_HUE_LUT_NODES)
 #define RT_LAB_TOOLS_HUE_LUT_ACCEPT 5.0e-7
-/* params.labCurve.gamutmunselmethod, as chromiLuminanceCurve() maps it. NONE
- * and MUN are the device methods; LAB, XYZ and XYZREL are residuals because
- * they need gamutLchonly() and gamutmap(). */
+/* params.labCurve.gamutmunselmethod, with the block's numbering: NONE 0,
+ * XYZ 2, XYZREL 3 and MUN 4. NONE, XYZ, XYZREL and MUN are the device
+ * methods; LAB (1) is a residual because it needs gamutLchonly(). */
 #define RT_LAB_TOOLS_MUNSELL_NONE 0u
+#define RT_LAB_TOOLS_MUNSELL_XYZ 2u
+#define RT_LAB_TOOLS_MUNSELL_XYZREL 3u
 #define RT_LAB_TOOLS_MUNSELL_MUN 4u
 /*
  * One direction's Young-van Vliet IIR coefficients, in the three forms the
@@ -255,7 +257,7 @@ typedef struct RtLabToolsResult {
     uint32_t lab_curve_hh_active;
     /* The chromaticity slider, -100..100; the kernel derives chromapro. */
     int32_t lab_curve_chromaticity;
-    /* RT_LAB_TOOLS_MUNSELL_NONE or RT_LAB_TOOLS_MUNSELL_MUN. */
+    /* RT_LAB_TOOLS_MUNSELL_NONE, _XYZ, _XYZREL or _MUN. */
     uint32_t lab_curve_munsell;
     /*
      * The red and skin protection inputs: settings->protectred and
@@ -298,7 +300,10 @@ typedef struct RtLabToolsResult {
      * float matrices above are one ulp away and can move a gamut-edge sample
      * by two LSB16, so the region program reads these instead. The Lab-curve
      * kernel reads the inverse for L=f(H)'s gamut loop, which is
-     * Color::xyz2rgb() on the block's double matrix.
+     * Color::xyz2rgb() on the block's double matrix, and the forward matrix
+     * as Color::gamutmap()'s `p`: chromiLuminanceCurve() passes its `wp`,
+     * which is ICCStore::workingSpaceMatrix() with the RGB primaries in the
+     * columns, and gamutmap() indexes exactly that layout.
      */
     const double* ws_double;
     const double* iws_double;
@@ -400,8 +405,8 @@ struct LabToolsLuts {
  * Fail closed. A Lab curve with non-zero `contrast` is admitted; its hist16
  * refill is built by the call site before the node. A chromaticity slider
  * outside its -100..100 GUI range, a C=f(H), L=f(H) or H=f(H) flat curve the
- * host table cannot follow within RT_LAB_TOOLS_HUE_LUT_ACCEPT, the LAB, XYZ
- * and XYZREL Munsell methods, EPD and any colour-toning method other than
+ * host table cannot follow within RT_LAB_TOOLS_HUE_LUT_ACCEPT, the LAB
+ * Munsell method, EPD and any colour-toning method other than
  * LabGrid. A local contrast whose sliders are outside the ABI range is a
  * residual as well. Black-and-white output is admitted through both of
  * chromiLuminanceCurve()'s arms: the cheap one when the Lab curves are off
