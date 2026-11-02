@@ -14,10 +14,10 @@ and are ordered below. Each stable, scanned range is pushed from 2026-10-29 on.
 ## State
 
 - Repository: `$REPO`
-- Worktree: the main checkout, branch `perf-graph`, clean and fourteen
+- Worktree: the main checkout, branch `perf-graph`, clean and fifteen
   commits ahead of `origin/perf-graph` (`e77993457`); the last pushed tip is
   `e77993457`. All pushed ranges were scanned per the publication gate; the
-  fourteen local commits are not pushed.
+  fifteen local commits are not pushed.
 - Stage C landed 2026-10-31: `local.adjustments` local sharpening (undamped
   `cd38028bb..7467f563f`, damped `211c12597..ebbeab951`), the `crop` device
   node (`544f01573`, `0885d952c`), the `lab.sharpening` impulse-denoise +
@@ -729,9 +729,9 @@ landed at `43d6f88bd`: `chromiLuminanceCurve()`'s early return zeroes a/b when
 `labCurve.enabled` and `colorToning.enabled` are both false, and the node now
 reproduces that in the Lab-curve slot (B&W-only exact, a/b exactly 0, combos
 with SH/LC/vibrance at PAE 0, both other arms refused with host PAE 0).
-Remaining: B&W with colour toning (the `bwonly` condition excludes it), non-zero
-Lab contrast (owns the `hist16` refill a later node reads) and the
-LAB/XYZ/XYZREL Munsell methods (`gamutLchonly`/`gamutmap`). B&W with
+Remaining: B&W with colour toning (the `bwonly` condition excludes it) and the
+LAB/XYZ/XYZREL Munsell methods (`gamutLchonly`/`gamutmap`). Non-zero Lab
+contrast landed with the host `hist16` prefix. B&W with
 `labCurve.enabled` landed at `9fca53a2d`: the `bwToning` arm is faithful,
 including the non-zero a/b delta when an a/b table is active (the closing
 block writes `a=atmp, b=btmp`, not zero) and MUN through the Munsell tables

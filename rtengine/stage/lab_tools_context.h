@@ -397,8 +397,8 @@ struct LabToolsLuts {
  * toning pass, shadows/highlights, local contrast, vibrance and/or the Lab
  * curves, with every other pixel tool off.
  *
- * Fail closed. A Lab curve whose `contrast` is non-zero owns the hist16 refill
- * a later node reads, so it is a residual. So are a chromaticity slider
+ * Fail closed. A Lab curve with non-zero `contrast` is admitted; its hist16
+ * refill is built by the call site before the node. A chromaticity slider
  * outside its -100..100 GUI range, a C=f(H), L=f(H) or H=f(H) flat curve the
  * host table cannot follow within RT_LAB_TOOLS_HUE_LUT_ACCEPT, the LAB, XYZ
  * and XYZREL Munsell methods, EPD and any colour-toning method other than
@@ -424,9 +424,9 @@ bool labToolsVibranceActive(const procparams::ProcParams& params);
  * block's LIM() can clamp an out-of-range sample. */
 bool labToolsLocalContrastActive(const procparams::ProcParams& params);
 /* True when chromiLuminanceCurve()'s Lab-curve pass runs on the device: the
- * curves are enabled and `contrast` is zero. The six per-table activity flags
- * are separate: a pass whose tables are all the identity still rewrites L, a
- * and b through the block's divides, so it is not a no-op. */
+ * curves are enabled. The six per-table activity flags are separate: a pass
+ * whose tables are all the identity still rewrites L, a and b through the
+ * block's divides, so it is not a no-op. */
 bool labToolsLabCurveActive(const procparams::ProcParams& params);
 /*
  * True when the colour-toning method is LabRegions and the bounded set holds:

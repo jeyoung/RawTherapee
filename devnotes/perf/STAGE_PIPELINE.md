@@ -191,8 +191,7 @@ an fp64 device (their mask product, hue mapping and working-matrix products
 are double expressions) and the bounded set: no mask display, one to four
 regions, mask curves that are empty, `FCT_Linear` or a `FCT_MinMaxCPoints`
 curve the host table can follow, and every slider inside the ABI range.
-Everything else in the block is a residual: a non-zero Lab
-`contrast` (it owns the `hist16` refill a later node reads), a chromaticity
+Everything else in the block is a residual: a chromaticity
 slider outside its -100..100 GUI range, a C=f(H), L=f(H) or H=f(H) curve the
 host table cannot follow within 5e-7 or the node budget, the LAB, XYZ and
 XYZREL Munsell methods (they need `gamutLchonly()` and `gamutmap()`), a
