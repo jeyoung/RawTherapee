@@ -4222,10 +4222,10 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
         }
         /*
          * L=f(H) runs the block's gamut loop through Color::xyz2rgb() on the
-         * working-space inverse in double, and the XYZ gamut correction reads
-         * Color::gamutmap()'s forward matrix in double. The float matrices
-         * are one ulp away and can flip a gamut test, so the pass carries
-         * both.
+         * working-space inverse in double, the LAB gamut correction reads the
+         * same inverse, and the XYZ gamut correction reads the forward matrix
+         * from Color::gamutmap() in double. The float matrices are one ulp
+         * away and can flip a gamut test, so the pass carries both.
          */
         if (args[67].u.ptr == nullptr || args[68].u.ptr == nullptr) {
             error = "lab.tools needs the double working matrices";
@@ -4485,7 +4485,8 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
             residency->acquire(&hue_luts_key, hue_shape, &error);
         /* Nine doubles occupy 18 floats in the residency's byte count. The
          * forward matrix is Color::gamutmap()'s `p` for the XYZ methods; the
-         * inverse is L=f(H)'s Color::xyz2rgb(). */
+         * inverse is L=f(H)'s Color::xyz2rgb(), and the LAB gamut correction
+         * reads it as well. */
         wip_device = residency->acquire(
             &wip_key, StageBufferShape{RT_STAGE_F32, 18, 1, 1}, &error);
         wp_device = residency->acquire(

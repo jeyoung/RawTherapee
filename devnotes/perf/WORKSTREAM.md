@@ -356,6 +356,20 @@ Validated at `3871b7d0c`; the commits after it are documentation only.
   under `--gpu=auto` hits a null `opencl::initLocked` call with
   `gamut.pp3`, avoided by `verify.sh`'s `RT_OPENCL_RGBPROC=1` (pre-existing,
   record in P2).
+- **`lab.tools` XYZ/XYZREL gamut correction**: `Color::gamutmap()` is ported
+  with its double lam ratios and XYZREL's `0.5` blend, reading the double
+  working matrices the launcher already uploads. XYZ 0.317383 LSB16, XYZREL
+  0.066406, XYZ neutral 0 and XYZ with the three hue curves 0.753906 (0
+  samples over 1); export gate `AE=0` with `impl=opencl`. `206c60df9`,
+  `0574346b5`, `fc824e7d5`, follow-up `773c19d07`. Landed on `perf-graph`
+  and pushed at `773c19d07`, the current `origin/perf-graph` tip.
+- **`lab.tools` LAB gamut correction**: `Color::gamutLchonly()`'s RGB
+  overload is ported on the same working-space inverse, so the Lab-curve
+  method set is NONE/LAB/XYZ/XYZREL/MUN. LAB all tables 0, exact (45696 of
+  45696 samples); LAB neutral 0, exact; LAB with the three hue curves
+  0.011719 LSB16 (0 over 1); export gate exact with `impl=opencl`.
+  `add8558fe`, `1815ffe8c`, `1f31f106d` and this documentation commit.
+  Landed on `perf-graph`; not pushed.
 
 ### Wave B scoping decisions (2026-10-28)
 
@@ -729,17 +743,18 @@ landed at `43d6f88bd`: `chromiLuminanceCurve()`'s early return zeroes a/b when
 `labCurve.enabled` and `colorToning.enabled` are both false, and the node now
 reproduces that in the Lab-curve slot (B&W-only exact, a/b exactly 0, combos
 with SH/LC/vibrance at PAE 0, both other arms refused with host PAE 0).
-Remaining: B&W with colour toning (the `bwonly` condition excludes it) and the
-LAB/XYZ/XYZREL Munsell methods (`gamutLchonly`/`gamutmap`). Non-zero Lab
-contrast landed with the host `hist16` prefix. B&W with
-`labCurve.enabled` landed at `9fca53a2d`: the `bwToning` arm is faithful,
-including the non-zero a/b delta when an a/b table is active (the closing
-block writes `a=atmp, b=btmp`, not zero) and MUN through the Munsell tables
-(not `gamutLchonly`, which is the refused LAB method). All seven variants are
-PAE 0. The chromaticity slider and C=f(H)/L=f(H)/H=f(H) landed at `eb3aa5b81`
-with host-built `FlatCurve` tables, a 5e-7 fidelity bound, worst 0.023438
-LSB16, and a dense curve refused at host PAE 0. Non-LabGrid tone methods are
-not a refusal: rgb.proc applies them before the Lab block, and
+Remaining: B&W with colour toning (the `bwonly` condition excludes it). The
+LAB/XYZ/XYZREL Munsell methods (`gamutLchonly`/`gamutmap`) are device cases
+now; see the progress log. Non-zero Lab contrast landed with the host `hist16`
+prefix. B&W with `labCurve.enabled` landed at `9fca53a2d`: the `bwToning` arm
+is faithful, including the non-zero a/b delta when an a/b table is active
+(the closing block writes `a=atmp, b=btmp`, not zero) and MUN through the
+Munsell tables (not `gamutLchonly`, which is the Lab gamut correction). All
+seven variants are PAE 0. The chromaticity slider and C=f(H)/L=f(H)/H=f(H)
+landed at `eb3aa5b81` with host-built `FlatCurve` tables, a 5e-7 fidelity
+bound, worst 0.023438 LSB16, and a dense curve refused at host PAE 0.
+Non-LabGrid tone methods are not a refusal: rgb.proc applies them before the
+Lab block, and
 Splitco/Splitlr/RGBSliders are admitted with PAE 0 at `6c78a463a`. Then the
 `lab.wavelet` panels
 (denoise, noise, clarity, soft radius; the chroma `link` arm landed at

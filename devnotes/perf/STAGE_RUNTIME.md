@@ -2497,10 +2497,11 @@ weight) and the working-profile chroma scale (1.2 for ProPhoto and WideGamut,
 1.8 for Adobe RGB and BruceRGB, 2.0 for sRGB, 1.4 for Beta RGB and BestRGB,
 1.0 otherwise). The three hue flat curves arrive as host-sampled
 piecewise-linear tables; a curve the table cannot follow within 5e-7 or the
-node budget is refused. The residual families are a chromaticity slider
-outside -100..100, an unrepresentable hue flat curve, the LAB, XYZ and XYZREL
-Munsell methods, a denoise chroma factor and black-and-white with colour
-toning.
+node budget is refused. The Lab-curve gamut correction is a device case for
+every method - NONE, LAB, XYZ, XYZREL and MUN - measured against the host
+block with the per-case figures in `devnotes/opencl/PARITY.md`. The residual
+families are a chromaticity slider outside -100..100, an unrepresentable hue
+flat curve, a denoise chroma factor and black-and-white with colour toning.
 
 The chroma arithmetic is where a naive float port fails. On the host,
 `sqrt(float) / 327.68f` resolves to the libm double square root divided by the
@@ -2599,9 +2600,9 @@ succeeded, so a refusal leaves the host image untouched.
 
 A residual runs the `lab.tools` host builtin, which disables device recursion
 for the duration and runs the original block, and the runtime records
-`impl=host`: a non-zero Lab contrast, the chromaticity family and the LAB, XYZ
-and XYZREL Munsell methods, a local contrast outside the ABI range or combined
-with any other residual tool, EPD, black-and-white output, a
+`impl=host`: a non-zero Lab contrast, the chromaticity family, a local
+contrast outside the ABI range or combined with any other residual tool, EPD,
+black-and-white output, a
 colour-toning method other than `LabGrid` and the bounded `LabRegions` set (a
 mask display, more than four regions, an unsupported mask curve, or a region
 slider outside its range), a profile with no active tool, an
@@ -2889,8 +2890,8 @@ soft-light `"reti"` method, explicit masks, soft radius, merge, recursion,
 LabGrid, the RGB and exposure curves, `reparcol != 100`, the log tool's
 guided-filter `detail` arm, `autocompute`, CIE CAM and `strlog`, capture
 sharpening, sharpening gamma/blur/mask-view and a separable
-sharpening radius, and the
-LAB/XYZ/XYZREL methods stay on the host. The tools run in the block's order:
+sharpening radius, and this node's own `avoidgamutMethod` LAB/XYZ/XYZREL arms
+stay on the host. The tools run in the block's order:
 log encoding, dehaze, CBDL, vibrance, shadows/highlights, soft light, local
 contrast, local sharpening, then Colour & Light.
 
@@ -3071,10 +3072,10 @@ variants, vibrance gamma/gradients/warm, blur/denoise, capture sharpening,
 sharpening gamma/blur/mask view/separable radius, tone
 mapping, Retinex, log's guided-filter arm/`autocompute`/CIE CAM/gradient,
 soft light `"reti"`, the common mask, dehaze, `exc`/`full`/`main`, merge,
-explicit masks, soft radius,
-LAB/XYZ/XYZREL, the RGB curve, LabGrid, `avoidrad != 0`, `transit == 100`, a
-blur radius above 100, `ghs_D != 0 && ghs_BLP > 0` and a pre-CBDL pass. A GPU
-device is refused before the upload.
+explicit masks, soft radius, the `avoidgamutMethod` LAB/XYZ/XYZREL arms, the
+RGB curve, LabGrid, `avoidrad != 0`, `transit == 100`, a blur radius above
+100, `ghs_D != 0 && ghs_BLP > 0` and a pre-CBDL pass. A GPU device is refused
+before the upload.
 
 ### Evidence
 

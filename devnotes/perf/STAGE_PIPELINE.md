@@ -146,8 +146,9 @@ a lower L. The block passes `0.15` and `0.96`; the launcher's existing
 `highlight` argument, which is `toneCurve.hrenabled`, is the same
 `isHLEnabled` the host passes. The
 arm rebuilds L, a and b from the corrected L and C before the Munsell arm, in
-the host's order. All three methods run the block's Munsell arm as well, so
-every non-NONE method needs the exported Munsell table set.
+the host's order. All three gamut corrections (LAB, XYZ and XYZREL) run the
+block's Munsell arm as well, so every non-NONE method needs the exported
+Munsell table set.
 `chromiLuminanceCurve()`'s black-and-white output
 is a device case through the same slot. The cheap early return covers
 `blackwhite.enabled` with the Lab curves off: the block only sets a and b to
