@@ -9323,6 +9323,381 @@ void test_lab_wavelet_toning(bool available)
     }
 }
 
+/* ---------------------------------------------- lab.wavelet denoise */
+
+/*
+ * The standard denoise arm plus the chroma arm ip_wavelet() forces when
+ * Expnoise selects six levels. Every other panel is neutral unless the case
+ * asks for it.
+ */
+void wavelet_denoise_params(rtengine::procparams::ProcParams& params,
+                            int levels, const double noise[5],
+                            double ballum)
+{
+    params.dirpyrequalizer.enabled = false;
+    params.wavelet.enabled = true;
+    params.wavelet.expcontrast = false;
+    params.wavelet.expchroma = false;
+    params.wavelet.expedge = false;
+    params.wavelet.expbl = false;
+    params.wavelet.expresid = false;
+    params.wavelet.expfinal = false;
+    params.wavelet.exptoning = false;
+    params.wavelet.expnoise = true;
+    params.wavelet.expclari = false;
+    params.wavelet.CLmethod = "all";
+    params.wavelet.Tilesmethod = "full";
+    params.wavelet.HSmethod = "without";
+    params.wavelet.daubcoeffmethod = "6_";
+    params.wavelet.thres = levels;
+    params.wavelet.threshold = 4;
+    params.wavelet.threshold2 = 5;
+    params.wavelet.sigma = 1.0;
+    params.wavelet.offset = 1.0;
+    params.wavelet.lowthr = 40.0;
+    params.wavelet.strength = 100;
+    params.wavelet.softrad = 0.0;
+    params.wavelet.softradend = 0.0;
+    params.wavelet.skinprotect = 0.0;
+    params.wavelet.avoid = false;
+    params.wavelet.median = false;
+    params.wavelet.medianlev = false;
+    params.wavelet.linkedg = false;
+    params.wavelet.lipst = false;
+    params.wavelet.NPmethod = "none";
+    params.wavelet.EDmethod = "CU";
+    params.wavelet.Medgreinf = "less";
+    params.wavelet.sup = 0;
+    params.wavelet.thrend = 0.0;
+    params.wavelet.contrast = 0;
+    params.wavelet.edgval = 50;
+    params.wavelet.edgrad = 15;
+    params.wavelet.edgthresh = 10;
+    params.wavelet.edgeffect = 1.0;
+    params.wavelet.sigmafin = 1.0;
+    params.wavelet.sigmaton = 1.0;
+    params.wavelet.protab = 0.0;
+    params.wavelet.BAmethod = "none";
+    params.wavelet.tmr = false;
+    params.wavelet.quamethod = "cons";
+    params.wavelet.slimethod = "sli";
+    params.wavelet.thrden = 0.0;
+    params.wavelet.complexmethod = "normal";
+    params.wavelet.cbenab = false;
+    params.wavelet.balchrom = 0.0;
+    params.wavelet.chromfi = 0.0;
+    params.wavelet.chromco = 0.0;
+    params.wavelet.ballum = ballum;
+    params.wavelet.level0noise.setValues(0.0, noise[0]);
+    params.wavelet.level1noise.setValues(0.0, noise[1]);
+    params.wavelet.level2noise.setValues(0.0, noise[2]);
+    params.wavelet.level3noise.setValues(0.0, noise[3]);
+    params.wavelet.leveldenoise.setValues(0.0, noise[4]);
+    params.wavelet.wavclCurve = {static_cast<double>(DCT_Linear)};
+    params.wavelet.opacityCurveWL = {
+        static_cast<double>(FCT_MinMaxCPoints), 0.0, 0.50, 0.35, 0.35,
+        1.0, 0.50, 0.35, 0.35};
+    params.wavelet.opacityCurveRG = {
+        static_cast<double>(FCT_MinMaxCPoints), 0.0, 0.50, 0.35, 0.35,
+        1.0, 0.50, 0.35, 0.35};
+    params.wavelet.opacityCurveBY = {
+        static_cast<double>(FCT_MinMaxCPoints), 0.0, 0.50, 0.35, 0.35,
+        1.0, 0.50, 0.35, 0.35};
+    for (int level = 0; level < 9; ++level) {
+        params.wavelet.c[level] = 0;
+    }
+}
+
+void test_lab_wavelet_denoise(bool available)
+{
+    using namespace rtengine::stage;
+
+    static MyMutex denoise_lcms_mutex;
+    if (rtengine::lcmsMutex == nullptr) {
+        rtengine::lcmsMutex = &denoise_lcms_mutex;
+    }
+    static rtengine::Settings denoise_settings{};
+    denoise_settings.edghi = 3.0;
+    denoise_settings.edglo = 0.5;
+    denoise_settings.limrad = 20.0;
+    rtengine::settings = &denoise_settings;
+    rtengine::Color::init();
+
+    const std::string profile_path =
+        std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp") +
+        "/stage-residency-lab-wavelet-denoise.jsonl";
+
+    if (!available) {
+        skip("lab.wavelet denoise: no OpenCL device");
+        return;
+    }
+    check(node_has_device_implementation("lab.wavelet"),
+          "the lab.wavelet node has a device implementation");
+
+    struct DenoiseCase {
+        const char* label;
+        int width;
+        int height;
+        int levels;
+        double noise[5];
+        double ballum;
+        bool contrast;
+        bool edge;
+        bool final;
+        bool toning;
+        int image; /* 0 random, 1 skin */
+    };
+
+    const DenoiseCase cases[] = {
+        {"denoise levels 3", 238, 160, 3, {30, 20, 10, 0, 0}, 7.0, false,
+         false, false, false, 0},
+        {"denoise levels 5", 238, 160, 5, {40, 30, 20, 10, 5}, 5.0, false,
+         false, false, false, 0},
+        {"denoise levels 6 ballum 10", 238, 160, 6, {50, 40, 30, 20, 10},
+         10.0, false, false, false, false, 0},
+        {"denoise ballum 0", 238, 160, 6, {35, 25, 15, 8, 4}, 0.0, false,
+         false, false, false, 1},
+        {"denoise ballum -2", 238, 160, 6, {35, 25, 15, 8, 4}, -2.0, false,
+         false, false, false, 0},
+        {"denoise high levels only", 238, 160, 6, {0, 0, 0, 40, 30}, 7.0,
+         false, false, false, false, 0},
+        {"denoise odd size 179x161", 179, 161, 6, {45, 35, 25, 12, 6},
+         7.0,
+         false, false, false, false, 0},
+        {"denoise odd width 179x160", 179, 160, 6,
+         {45, 35, 25, 12, 6}, 7.0, false, false, false, false, 0},
+        {"denoise odd height 180x161", 180, 161, 6,
+         {45, 35, 25, 12, 6}, 7.0, false, false, false, false, 0},
+        {"denoise odd both 179x161", 179, 161, 6,
+         {45, 35, 25, 12, 6}, 7.0, false, false, false, false, 0},
+        {"denoise light odd", 180, 161, 6, {0.11, 0, 0, 0, 0}, 7.0, false,
+         false, false, false, 0},
+        {"denoise with contrast", 238, 160, 6, {40, 30, 20, 10, 5}, 7.0,
+         true, false, false, false, 0},
+        {"denoise with edge", 238, 160, 6, {40, 30, 20, 10, 5}, 7.0, false,
+         true, false, false, 1},
+        {"denoise with final curves", 238, 160, 5, {40, 30, 20, 10, 5}, 7.0,
+         false, false, true, false, 0},
+        {"denoise with toning", 238, 160, 6, {40, 30, 20, 10, 5}, 7.0, false,
+         false, false, true, 1},
+        {"denoise all panels", 238, 160, 6, {45, 35, 25, 12, 6}, 7.0, true,
+         true, true, true, 0},
+        {"denoise padded all panels", 179, 161, 5, {40, 30, 20, 10, 0}, 5.0,
+         true, true, true, true, 1},
+    };
+
+    unsigned seed = 0x51b9e3a7u;
+    for (const DenoiseCase& item : cases) {
+        rtengine::procparams::ProcParams params;
+        wavelet_denoise_params(params, item.levels, item.noise, item.ballum);
+        if (item.contrast) {
+            params.wavelet.expcontrast = true;
+            const int contrast[9] = {30, 22, 14, 8, 4, 2, 0, 0, 0};
+            for (int level = 0; level < 9; ++level) {
+                params.wavelet.c[level] = contrast[level];
+            }
+        }
+        if (item.edge) {
+            params.wavelet.expedge = true;
+            params.wavelet.edgval = 50;
+            params.wavelet.edgrad = 15;
+            params.wavelet.edgthresh = 10;
+            params.wavelet.edgeffect = 1.0;
+        }
+        if (item.final) {
+            params.wavelet.expfinal = true;
+            params.wavelet.sigmafin = 1.0;
+            params.wavelet.wavclCurve = final_diagonal_curve();
+            params.wavelet.opacityCurveWL = final_opacity_curve();
+        }
+        if (item.toning) {
+            params.wavelet.exptoning = true;
+            params.wavelet.sigmaton = 1.0;
+            params.wavelet.opacityCurveRG = toning_red_green_curve();
+            params.wavelet.opacityCurveBY = toning_blue_yellow_curve();
+        }
+
+        LabImage source(item.width, item.height);
+        if (item.image == 1) {
+            fill_lab_wavelet_skin(source);
+        } else {
+            fill_lab_tools(source, seed++);
+        }
+
+        check(labWaveletSupported(params, item.width, item.height),
+              (std::string("lab.wavelet denoise ") + item.label +
+               " is the supported set").c_str());
+
+        rtengine::ImProcFunctions cpu_ipf(&params, false);
+        LabImage cpu(item.width, item.height);
+        cpu.CopyFrom(&source);
+        labWaveletHostBlock(cpu_ipf, params, cpu);
+
+        rtengine::ImProcFunctions device_ipf(&params, false);
+        LabImage device(item.width, item.height);
+        device.CopyFrom(&source);
+        const LabWaveletRun result =
+            run_lab_wavelet_node(device, params, device_ipf, profile_path);
+        const std::string profile = read_file(profile_path);
+
+        check(result.supported,
+              (std::string("lab.wavelet denoise ") + item.label +
+               " resolves to the supported set").c_str());
+        check(result.deviceReady,
+              (std::string("lab.wavelet denoise ") + item.label +
+               " builds its host setup").c_str());
+        check(result.status == RT_STAGE_OK,
+              (std::string("lab.wavelet denoise ") + item.label +
+               " completes through run()").c_str());
+        check(profile.find("\"stage\":\"lab.wavelet\"") != std::string::npos,
+              (std::string("lab.wavelet denoise ") + item.label +
+               " records the node").c_str());
+        check(profile.find("\"impl\":\"opencl\"") != std::string::npos,
+              (std::string("lab.wavelet denoise ") + item.label +
+               " records a device execution").c_str());
+
+        const Distribution d = distribution(view(device), view(cpu));
+        double plane_pae[3] = {0.0, 0.0, 0.0};
+        for (int y = 0; y < item.height; ++y) {
+            for (int x = 0; x < item.width; ++x) {
+                plane_pae[0] = std::max(
+                    plane_pae[0], static_cast<double>(std::fabs(
+                                      device.L[y][x] - cpu.L[y][x])));
+                plane_pae[1] = std::max(
+                    plane_pae[1], static_cast<double>(std::fabs(
+                                      device.a[y][x] - cpu.a[y][x])));
+                plane_pae[2] = std::max(
+                    plane_pae[2], static_cast<double>(std::fabs(
+                                      device.b[y][x] - cpu.b[y][x])));
+            }
+        }
+        std::printf("stage-residency: lab.wavelet denoise %s %dx%d L%d: "
+                    "PAE %.6f LSB16; exact %zu, <=0.25 %zu, <=0.5 %zu, "
+                    "<=1 %zu, >1 %zu of %zu\n",
+                    item.label, item.width, item.height, item.levels,
+                    d.max_abs, d.exact, d.quarter, d.half, d.one, d.over,
+                    d.samples);
+        check(d.finite,
+              (std::string("lab.wavelet denoise ") + item.label +
+               " stays finite").c_str());
+        check(d.over == 0,
+              (std::string("lab.wavelet denoise ") + item.label +
+               " is within one LSB16").c_str());
+
+        /* Non-vacuity: the same profile with the denoise panel off must
+         * produce a different host result. */
+        rtengine::procparams::ProcParams off = params;
+        off.wavelet.expnoise = false;
+        rtengine::ImProcFunctions off_ipf(&off, false);
+        LabImage off_image(item.width, item.height);
+        off_image.CopyFrom(&source);
+        labWaveletHostBlock(off_ipf, off, off_image);
+        const Diff active = compare(view(cpu), view(off_image));
+        std::printf("stage-residency: lab.wavelet denoise %s changes %zu of "
+                    "%zu samples against the panel-off result, PAE %.6f "
+                    "LSB16\n",
+                    item.label, active.differing, active.samples,
+                    active.max_abs);
+        check(active.differing > 0,
+              (std::string("lab.wavelet denoise ") + item.label +
+               " is non-vacuous").c_str());
+    }
+
+    /*
+     * Refusals: BiShrink, a user chroma denoise or balance, the hue curve,
+     * colour-by-noise, the denoise curves, an all-zero slider set, an
+     * out-of-range slider and the 128-pixel window must run the host block
+     * byte for byte.
+     */
+    const char* residual_labels[] = {
+        "quamethod agre", "user chromfi", "user chromco", "balance chroma",
+        "wavhuecurve", "cbenab", "slimethod cur", "thrden", "ballum range",
+        "level range", "all sliders zero", "sub-128 window"};
+    for (const char* label : residual_labels) {
+        rtengine::procparams::ProcParams params;
+        const double noise[5] = {35, 25, 15, 8, 4};
+        wavelet_denoise_params(params, 6, noise, 7.0);
+        int width = 238;
+        int height = 160;
+
+        if (std::strcmp(label, "quamethod agre") == 0) {
+            params.wavelet.quamethod = "agre";
+        } else if (std::strcmp(label, "user chromfi") == 0) {
+            params.wavelet.chromfi = 1.0;
+        } else if (std::strcmp(label, "user chromco") == 0) {
+            params.wavelet.chromco = 1.0;
+        } else if (std::strcmp(label, "balance chroma") == 0) {
+            params.wavelet.balchrom = 10.0;
+        } else if (std::strcmp(label, "wavhuecurve") == 0) {
+            params.wavelet.wavhuecurve = {1.0, 0.0, 0.5, 0.35, 0.35, 0.5,
+                                          0.2, 0.35, 0.35, 1.0, 0.5, 0.35,
+                                          0.35};
+        } else if (std::strcmp(label, "cbenab") == 0) {
+            params.wavelet.cbenab = true;
+        } else if (std::strcmp(label, "slimethod cur") == 0) {
+            params.wavelet.slimethod = "cur";
+        } else if (std::strcmp(label, "thrden") == 0) {
+            params.wavelet.thrden = 5.0;
+        } else if (std::strcmp(label, "ballum range") == 0) {
+            params.wavelet.ballum = 10.5;
+        } else if (std::strcmp(label, "level range") == 0) {
+            params.wavelet.level2noise.setValues(0.0, 120.0);
+        } else if (std::strcmp(label, "all sliders zero") == 0) {
+            const double zero[5] = {0, 0, 0, 0, 0};
+            wavelet_denoise_params(params, 6, zero, 7.0);
+        } else {
+            width = 128;
+            height = 160;
+        }
+
+        check(!labWaveletSupported(params, width, height),
+              (std::string("lab.wavelet denoise residual ") + label +
+               " is a residual").c_str());
+
+        LabImage source(width, height);
+        fill_lab_wavelet_skin(source);
+
+        rtengine::ImProcFunctions cpu_ipf(&params, false);
+        LabImage cpu(width, height);
+        cpu.CopyFrom(&source);
+        labWaveletHostBlock(cpu_ipf, params, cpu);
+
+        rtengine::ImProcFunctions device_ipf(&params, false);
+        LabImage device(width, height);
+        device.CopyFrom(&source);
+        const LabWaveletRun result =
+            run_lab_wavelet_node(device, params, device_ipf, profile_path);
+        const std::string profile = read_file(profile_path);
+
+        check(!result.supported,
+              (std::string("lab.wavelet denoise residual ") + label +
+               " is refused as a device configuration").c_str());
+        check(!result.deviceReady,
+              (std::string("lab.wavelet denoise residual ") + label +
+               " does not build a device setup").c_str());
+        check(result.status == RT_STAGE_OK,
+              (std::string("lab.wavelet denoise residual ") + label +
+               " completes through run()").c_str());
+        check(profile.find("\"impl\":\"host\"") != std::string::npos,
+              (std::string("lab.wavelet denoise residual ") + label +
+               " records a host execution").c_str());
+        check(profile.find("\"impl\":\"opencl\"") == std::string::npos,
+              (std::string("lab.wavelet denoise residual ") + label +
+               " never mixes a device pass").c_str());
+
+        const Diff diff = compare(view(device), view(cpu));
+        std::printf("stage-residency: lab.wavelet denoise residual %s: "
+                    "host, PAE %.6f LSB16, %zu of %zu samples differ\n",
+                    label, diff.max_abs, diff.differing, diff.samples);
+        check(diff.finite,
+              (std::string("lab.wavelet denoise residual ") + label +
+               " stays finite").c_str());
+        check(diff.differing == 0 && diff.max_abs == 0.0,
+              (std::string("lab.wavelet denoise residual ") + label +
+               " matches the CPU block").c_str());
+    }
+}
+
 /* A GPU device must never run the equaliser; it records a host execution. */
 void test_lab_wavelet_gpu(bool available)
 {
@@ -13682,6 +14057,7 @@ int main()
     test_lab_wavelet_edge(available);
     test_lab_wavelet_final(available);
     test_lab_wavelet_toning(available);
+    test_lab_wavelet_denoise(available);
     test_lab_wavelet_gpu(available);
     test_output_sharpen(available);
     test_lab_sharpening(available);
