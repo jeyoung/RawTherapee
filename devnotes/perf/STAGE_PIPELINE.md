@@ -253,6 +253,19 @@ chroma arm reuses the equaliser's hue/chroma masks: the equaliser changes only
 L, so a/b are identical at the start of both passes. The L clamp is deferred
 until the chroma pass finishes, as in the block.
 
+The denoise arm runs `WaveletDenoiseAllL()` and the chroma denoise that
+`Expnoise` couples to it: the block raises the L decomposition to seven levels,
+forces `chromfi = 0.01` and then runs `WaveletDenoiseAllAB()` on the a/b bands
+with the post-contrast L coefficients. The device keeps a second band set for
+those L coefficients, builds the MAD median from a 32768-bin device histogram,
+reproduces `noisevarlum`/`noisevarchrom` at the clamped `(2y+1, 2x+1)` sample,
+and ports `ShrinkAllL`/`ShrinkAllAB` with the lab.tools box blur. Only the
+plain `quaMethod == "cons"` slider arm is admitted; the denoise curves, expert
+pairing, user chroma strength, noise balance, hue curve and colour-by-noise
+stay host residuals. The pass order is forward analysis, statistics/mea,
+MAD/shrink L, contrast/edge/final, noise variance and chroma denoise, then the
+a/b planes and the deferred L reconstruction.
+
 The edge arm is `ContAllL()`'s `EDmet == 2` block with `cp.detectedge` clear
 and the Lipschitz smoothing off. The host fills a separate edge `mea` through
 `calceffect()` with the `Edgeffect` slider and an offset of 1, samples the
@@ -323,7 +336,7 @@ panes records them separately. Both tools are off by default.
 | `rgb.proc` | Full/Full/Roi/Reduced | path | reuse-input | RGB curves, tone curve, colour toning, B&W, channel mixer, HSV, film simulation | yes |
 | `lab.tools` | Full/Full/Roi/Reduced | path | reuse-input | shadows/highlights, vibrance, Lab curves (including non-zero contrast, the chromaticity slider, the C=f(H)/L=f(H)/H=f(H) hue flat curves and the NONE/LAB/XYZ/XYZREL/MUN gamut methods), local contrast, black-and-white (cheap and `bwToning` arms), EPD, Lab-grid colour toning and Lab colour-correction regions | partial |
 | `lab.sharpening` | Full/-/Roi/- | path | reuse-input | impulse denoise and defringe (own node), ML sharpen edges, ML microcontrast and the main sharpen pass (shared `output.sharpen` node) | partial |
-| `lab.wavelet` | Full/Full/Roi/Reduced | path | reuse-input | directional pyramid equaliser and wavelet contrast, chroma `link`, edge plain arm, final curves and the toning zero-protection arm | partial |
+| `lab.wavelet` | Full/Full/Roi/Reduced | path | reuse-input | directional pyramid equaliser and wavelet contrast, standard denoise (L and the forced chroma arm), chroma `link`, edge plain arm, final curves and the toning zero-protection arm | partial |
 | `working.trc` | Full/Full/Roi/- | path | reuse-input | soft light, tone equaliser and working-TRC conversion | partial |
 | `ciecam` | Full/Full/Roi/- | path | reuse-input | CIE CAM 02 | no |
 | `gamut` | Full/Full/Roi/Reduced | path | reuse-input | working-space gamut compression | yes |

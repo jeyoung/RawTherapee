@@ -190,14 +190,28 @@ Validated at `3871b7d0c`; the commits after it are documentation only.
   cases (contrast 5, contrast 15 with L curve and brightness, contrast 30
   with all six tables) are exact; `labtools-labcurve-contrast.pp3` is exact
   on the export TIFF. `89e0a844b`, `47b9980fb`.
-- **`lab.wavelet` denoise groundwork**: the denoise tail ABI and the
-  `compute_mad` callback. The tail carries `vari[0..5]`, `ballum` and one
-  squared `madL` entry per level and direction; the histogram itself will be
-  a separate device buffer. `labWaveletMadFromHistogram()` reproduces
-  `ImProcFunctions::Mad()`'s truncated-absolute-value histogram and
-  interpolated median, compared against the host on four fixtures. The
-  standard-L arm is still refused: `wavelet_denoise_` stays false until the
-  histogram, noise-variance and shrink kernels land. `e3c35322d`, `93b9a671d`.
+- **`lab.wavelet` standard denoise**: `Expnoise`'s standard-L arm together
+  with the chroma denoise `ip_wavelet()` forces at six levels. The block
+  raises the L decomposition to seven levels, sets `cp.chromfi = 0.01` and
+  runs `WaveletDenoiseAllAB()` on the a/b bands with the post-contrast L
+  coefficients; the device keeps a second band set for those coefficients.
+  The host builds `vari[0..5]`, `ballum` and one squared MAD entry per plane,
+  level and direction; the MAD median comes from a 32768-bin device histogram
+  whose kernel truncates and clamps exactly as `Mad()` does. The
+  `noisevarlum`/`noisevarchrom` last write uses the clamped `(2y+1, 2x+1)`
+  sample, and the `ShrinkAllL`/`ShrinkAllAB` kernels reuse the lab.tools box
+  blur. Fifteen device cases (levels 3/5/6, ballum 10/7/5/0/-2, high-level
+  sliders only, a light slider, odd width, odd height, odd both, with
+  contrast, edge, final curves, toning, all panels and all panels padded)
+  match the host block with a worst 0.105469 LSB16; the panel-off comparison
+  changes 86,453-114,240 samples. Twelve residuals (`quaMethod` agre, user
+  chromfi/chromco, balchrom, `Wavhuecurve`, `CBenab`, `sliMethod` cur,
+  Thrden, Ballum range, level range, all sliders zero and the 128-pixel
+  window) run the host builtin byte for byte. `labwavelet-denoise.pp3` records
+  `impl=opencl` at 1 LSB16. Every comparison pins `OMP_NUM_THREADS=1`: the
+  host's `noisevarlum` loop races under OpenMP and is not a deterministic
+  reference. The denoise curves, the expert pairing and the BiShrink arms
+  remain host residuals. `66613d0a9`, `6db958afe`.
 - **`local.adjustments` groundwork (pushed)**: host block extracted
   byte-for-byte, per-spot context/ABI (`LAJC`), exact block-level predicate,
   refusal path, 25 residual mutations and four multi-spot host cases. No
@@ -759,18 +773,22 @@ Splitco/Splitlr/RGBSliders are admitted with PAE 0 at `6c78a463a`. Then the
 (denoise, noise, clarity, soft radius; the chroma `link` arm landed at
 `6bb3101da` with 12 cases at PAE 0, the edge plain arm at `c5ed40c3c` with
 17 cases, worst 0.058594 LSB16, and 12 residuals at PAE 0, the final curves
-with 13 cases, worst 0.015625 LSB16, and 14 residuals at PAE 0, and toning
-with 12 cases, worst 0.011719 LSB16, and 10 residuals at PAE 0),
+with 13 cases, worst 0.015625 LSB16, and 14 residuals at PAE 0, toning
+with 12 cases, worst 0.011719 LSB16, and 10 residuals at PAE 0, and the
+standard denoise L arm plus its forced chroma arm with 15 cases, worst
+0.105469 LSB16, and 12 residuals at PAE 0),
 then `local.adjustments` exposure/retinex/CIE, then the common mask
 once the wavelet panels land. EPD stays a permanent residual.
 
 ## Next immediate task
 
-Move on to the next `lab.wavelet` panel: the denoise panel (`expnoise`,
-including the level/threshold/mix controls and the noise curves). The final
-curves and the toning zero-protection arm landed with the units above;
-clarity still needs the `CLmethod` `one`/`inf`/`sup` residual-painting arms
-before it can be attempted, so do not start it first. The edge panel's plain arm is landed; its median/Lipschitz
+Move on to the next `lab.wavelet` panel: clarity (`expbl`/`expclari`), once
+the `CLmethod` `one`/`inf`/`sup` residual-painting arms are ported. The
+standard denoise arm (and the chroma denoise the block forces at six levels)
+landed with the unit above; its denoise curves, expert pairing, BiShrink
+arms, user chroma strength, noise balance and hue curve stay residuals. The
+final curves and the toning zero-protection arm landed with the units above.
+The edge panel's plain arm is landed; its median/Lipschitz
 detection (`calckoe`), `NPMethod` low/high smoothing, `Lipst`, and the dead
 `EDmethod` `SL` threshold adjuster stay residuals, so do not reopen them
 without porting the detector. The balance-chroma arm (`TMr` + `BAmethod`) and
