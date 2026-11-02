@@ -1719,4 +1719,130 @@ __kernel void rt_lw_box_v(__global const float* src,
         len = lenm1;
     }
 }
+
+/*
+ * finalContAllL()/ContAllAB()'s CLmethod selection. `method` is 0 one,
+ * 1 inf and 2 sup; `direction` is 0 all, 1 one, 2 two and 3 thr. The kernel
+ * zeroes the bands the block zeroes and, at level 0, paints the coefficient-0
+ * plane: L uses 12000 for the grey background and 0 for black, the a/b planes
+ * always use 0, and the residual background leaves the plane untouched.
+ */
+__kernel void rt_lab_wavelet_w_select(
+    __global float* band1, int p1,
+    __global float* band2, int p2,
+    __global float* band3, int p3,
+    __global float* coeff0, int coeff_pitch,
+    int level, int w, int h,
+    int method, int back_method,
+    int choice_level, int direction,
+    int dir1, int dir2, int max_ilev, int ab)
+{
+    const int x = get_global_id(0);
+    const int y = get_global_id(1);
+    if (x >= w || y >= h) {
+        return;
+    }
+
+    if (level == 0 && back_method != 2) {
+        const float background =
+            (ab == 0 && back_method == 1) ? 12000.0f : 0.0f;
+        coeff0[y * coeff_pitch + x] = background;
+    }
+
+    int zero_all = 0;
+    int zero_pair = 0;
+    if (method == 0) {
+        if (direction == 0) {
+            if (level != choice_level) {
+                zero_all = 1;
+            }
+        } else if (choice_level >= max_ilev) {
+            zero_all = 1;
+        } else if (level != choice_level) {
+            zero_pair = 1;
+        }
+    } else if (method == 1) {
+        if (direction == 0) {
+            if (level > choice_level) {
+                zero_all = 1;
+            }
+        } else if (level > choice_level) {
+            zero_pair = 1;
+        }
+    } else if (method == 2) {
+        if (direction == 0) {
+            if (level <= choice_level) {
+                zero_all = 1;
+            }
+        } else if (choice_level >= max_ilev) {
+            zero_all = 1;
+        } else if (level <= choice_level) {
+            zero_pair = 1;
+        }
+    }
+
+    if (zero_all) {
+        band1[y * p1 + x] = 0.0f;
+        band2[y * p2 + x] = 0.0f;
+        band3[y * p3 + x] = 0.0f;
+    } else if (zero_pair) {
+        if (dir1 == 1) {
+            band1[y * p1 + x] = 0.0f;
+        } else if (dir1 == 2) {
+            band2[y * p2 + x] = 0.0f;
+        } else {
+            band3[y * p3 + x] = 0.0f;
+        }
+        if (dir2 == 1) {
+            band1[y * p1 + x] = 0.0f;
+        } else if (dir2 == 2) {
+            band2[y * p2 + x] = 0.0f;
+        } else {
+            band3[y * p3 + x] = 0.0f;
+        }
+    }
+}
+
+/*
+ * The clarity arm's merge, from the export block's final loop:
+ *   L = LIM((1 + mL0) * unshar_L - mL * L, 0, 32768)
+ *   a = (1 + mC0) * unshar_a - mC * a
+ *   b = (1 + mC0) * unshar_b - mC * b
+ * The second pass left L <= 0 raised to 1 by its final tile copy, so the
+ * kernel reproduces that before the merge. When the block's merge is the
+ * zero-factor arm the unshar buffers alias the working planes, which collapses
+ * the arithmetic to the clamped first pass.
+ */
+__kernel void rt_lab_wavelet_w_clarity_merge(
+    __global float* l, int l_pitch,
+    __global const float* unshar_l, int unshar_l_pitch,
+    __global float* a, int a_pitch,
+    __global const float* unshar_a, int unshar_a_pitch,
+    __global float* b, int b_pitch,
+    __global const float* unshar_b, int unshar_b_pitch,
+    int w, int h,
+    float mL0, float mL, float mC0, float mC)
+{
+    const int x = get_global_id(0);
+    const int y = get_global_id(1);
+    if (x >= w || y >= h) {
+        return;
+    }
+
+    const int at = y * l_pitch + x;
+    float second = l[at];
+    if (second <= 0.0f) {
+        second = 1.0f;
+    }
+    float value =
+        (1.0f + mL0) * unshar_l[y * unshar_l_pitch + x] - mL * second;
+    value = fmin(fmax(value, 0.0f), 32768.0f);
+    l[at] = value;
+
+    a[y * a_pitch + x] = (1.0f + mC0) * unshar_a[y * unshar_a_pitch + x] -
+                         mC * a[y * a_pitch + x];
+    const int b_at = y * b_pitch + x;
+    b[b_at] = (1.0f + mC0) * unshar_b[y * unshar_b_pitch + x] -
+              mC * b[b_at];
+}
 )CLC";

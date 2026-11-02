@@ -105,6 +105,132 @@ bool hueInRange(int value)
 }
 
 /*
+ * The CLmethod selection and the clarity arm, decoded from the wavelet
+ * parameters exactly as ip_wavelet()'s finalContAllL()/ContAllAB() and the
+ * export block's clarity sequence decode them. The admission predicate, the
+ * host context builder and the descriptor all read this one structure, so a
+ * refused value can never reach the launcher.
+ */
+struct WaveletClarity
+{
+    bool select = false;
+    std::uint32_t cl_method = RT_LAB_WAVELET_CL_ALL;
+    std::uint32_t back_method = RT_LAB_WAVELET_BACK_GREY;
+    std::uint32_t choice_level = LAB_WAVELET_DEFAULT_CHOICE_LEVEL;
+    std::uint32_t choice_dir = RT_LAB_WAVELET_DIR_ALL;
+    std::uint32_t dir1 = 2;
+    std::uint32_t dir2 = 3;
+    std::uint32_t max_ilev = 0;
+
+    bool active = false;
+    bool merge = false;
+    float merge_l0 = 0.f;
+    float merge_l = 0.f;
+    float merge_c0 = 0.f;
+    float merge_c = 0.f;
+};
+
+bool decodeWaveletClarity(const procparams::WaveletParams& wavelet,
+                          WaveletClarity& out)
+{
+    out = WaveletClarity{};
+
+    if (wavelet.CLmethod == "one") {
+        out.cl_method = RT_LAB_WAVELET_CL_ONE;
+    } else if (wavelet.CLmethod == "inf") {
+        out.cl_method = RT_LAB_WAVELET_CL_INF;
+    } else if (wavelet.CLmethod == "sup") {
+        out.cl_method = RT_LAB_WAVELET_CL_SUP;
+    } else if (wavelet.CLmethod == "all") {
+        out.cl_method = RT_LAB_WAVELET_CL_ALL;
+    } else {
+        return false;
+    }
+    out.select = out.cl_method != RT_LAB_WAVELET_CL_ALL;
+
+    /* The clarity sequence is the block's exact gate. */
+    out.active = wavelet.enabled &&
+                 (wavelet.ushamethod == "sharp" ||
+                  wavelet.ushamethod == "clari") &&
+                 wavelet.expclari && out.select;
+    if (!out.select) {
+        return true;
+    }
+
+    if (wavelet.Backmethod == "black") {
+        out.back_method = RT_LAB_WAVELET_BACK_BLACK;
+    } else if (wavelet.Backmethod == "grey") {
+        out.back_method = RT_LAB_WAVELET_BACK_GREY;
+    } else if (wavelet.Backmethod == "resid") {
+        out.back_method = RT_LAB_WAVELET_BACK_RESID;
+    } else {
+        return false;
+    }
+
+    if (wavelet.Dirmethod == "all") {
+        out.choice_dir = RT_LAB_WAVELET_DIR_ALL;
+    } else if (wavelet.Dirmethod == "one") {
+        out.choice_dir = RT_LAB_WAVELET_DIR_ONE;
+    } else if (wavelet.Dirmethod == "two") {
+        out.choice_dir = RT_LAB_WAVELET_DIR_TWO;
+    } else if (wavelet.Dirmethod == "thr") {
+        out.choice_dir = RT_LAB_WAVELET_DIR_THR;
+    } else {
+        return false;
+    }
+    out.dir1 = out.choice_dir == RT_LAB_WAVELET_DIR_TWO ? 1 : 2;
+    out.dir2 = out.choice_dir == RT_LAB_WAVELET_DIR_THR ? 1 : 3;
+
+    if (wavelet.Lmethod < LAB_WAVELET_MIN_LMETHOD ||
+        wavelet.Lmethod > LAB_WAVELET_MAX_LMETHOD) {
+        return false;
+    }
+    out.choice_level =
+        wavelet.Lmethod == 0
+            ? LAB_WAVELET_DEFAULT_CHOICE_LEVEL
+            : static_cast<std::uint32_t>(wavelet.Lmethod - 1);
+    out.max_ilev = static_cast<std::uint32_t>(wavelet.thres);
+
+    if (!out.active) {
+        return true;
+    }
+
+    if (!std::isfinite(wavelet.mergeL) ||
+        wavelet.mergeL < LAB_WAVELET_MIN_MERGE ||
+        wavelet.mergeL > LAB_WAVELET_MAX_MERGE ||
+        !std::isfinite(wavelet.mergeC) ||
+        wavelet.mergeC < LAB_WAVELET_MIN_MERGE ||
+        wavelet.mergeC > LAB_WAVELET_MAX_MERGE) {
+        return false;
+    }
+
+    /*
+     * The merge's three arms. The block scales the sliders by 100 and then
+     * negates the luminance factor by 1.5 for the black background arms; every
+     * other combination collapses the merge to the clamped first pass.
+     */
+    const float mL = static_cast<float>(wavelet.mergeL / 100.f);
+    const float mC = static_cast<float>(wavelet.mergeC / 100.f);
+    if ((out.cl_method == RT_LAB_WAVELET_CL_ONE ||
+         out.cl_method == RT_LAB_WAVELET_CL_INF) &&
+        out.back_method == RT_LAB_WAVELET_BACK_BLACK) {
+        out.merge = true;
+        out.merge_l0 = 0.f;
+        out.merge_l = -1.5f * mL;
+        out.merge_c0 = 0.f;
+        out.merge_c = -mC;
+    } else if (out.cl_method == RT_LAB_WAVELET_CL_SUP &&
+               out.back_method == RT_LAB_WAVELET_BACK_RESID) {
+        out.merge = true;
+        out.merge_l0 = mL;
+        out.merge_l = mL;
+        out.merge_c0 = mC;
+        out.merge_c = mC;
+    }
+    return true;
+}
+
+/*
  * ip_wavelet()'s mulopaRG/mulopaBY: nine samples of the 501-point opacity
  * curve at the fixed indices, scaled to a percentage. An unallocated curve
  * leaves every multiplier at zero, which is the block's own no-op.
@@ -299,7 +425,7 @@ bool labWaveletSupported(const procparams::ProcParams& params, int width,
 }
 
 int labWaveletTransformLevels(const procparams::ProcParams& params,
-                              int width, int height)
+                              int width, int height, bool force_all_method)
 {
     const procparams::WaveletParams& wavelet = params.wavelet;
     if (!wavelet.enabled || width <= 0 || height <= 0) {
@@ -406,7 +532,7 @@ int labWaveletTransformLevels(const procparams::ProcParams& params,
                       !wavelet.expfinal && !wavelet.expedge &&
                       wavelet.rescon == 0 && wavelet.resconH == 0 &&
                       wavelet.edgval == 0 && !ref0 &&
-                      wavelet.CLmethod == "all";
+                      (force_all_method || wavelet.CLmethod == "all");
     if (dead) {
         const auto multiplier = [&](int index) -> int {
             if (index < wavelet.thres && index < 9) {
@@ -447,7 +573,7 @@ bool labWaveletWaveletSupported(const procparams::ProcParams& params,
     const bool denoise = wavelet.expnoise;
     if ((!contrast && !chroma && !edge_active && !final_curves && !toning &&
          !denoise) ||
-        wavelet.expbl || wavelet.expresid || wavelet.expclari) {
+        wavelet.expbl || wavelet.expresid) {
         return false;
     }
     /*
@@ -543,8 +669,52 @@ bool labWaveletWaveletSupported(const procparams::ProcParams& params,
     if (wavelet.tmr || wavelet.BAmethod != "none") {
         return false;
     }
-    if (wavelet.CLmethod != "all" || wavelet.Tilesmethod != "full") {
+    if (wavelet.Tilesmethod != "full") {
         return false;
+    }
+    /*
+     * CLmethod's level selection runs on the device for every admitted panel
+     * set; the clarity arm's two-pass sequence additionally needs its own
+     * decoded merge. Unknown CLmethod, Backmethod or Dirmethod values and an
+     * out-of-range Lmethod or merge slider are residuals.
+     */
+    WaveletClarity clarity;
+    if (!decodeWaveletClarity(wavelet, clarity)) {
+        return false;
+    }
+    /*
+     * The clarity arm's first pass runs with CLmethod forced to "all", so
+     * ip_wavelet()'s a/b level trim runs. With no a/b-modifying panel the
+     * device skips the a/b planes, which matches the block only when the trim
+     * actually reaches zero levels. These are the values that would stop it
+     * short of zero; a profile that sets one stays on the host.
+     */
+    if (clarity.active &&
+        !(chroma || edge_active || final_curves || toning || denoise)) {
+        bool ch_zero = true;
+        for (int level = 0; level < 9; ++level) {
+            ch_zero = ch_zero && wavelet.ch[level] == 0;
+        }
+        WavOpacityCurveRG opacity_rg;
+        opacity_rg.Set(wavelet.opacityCurveRG);
+        bool opacity_zero = true;
+        if (static_cast<bool>(opacity_rg)) {
+            static constexpr int samples[9] = {
+                0, 62, 125, 187, 250, 312, 375, 438, 500};
+            for (int level = 0; level < 9; ++level) {
+                opacity_zero =
+                    opacity_zero &&
+                    200.f * (opacity_rg[samples[level]] - 0.5f) == 0.f;
+            }
+        }
+        if (wavelet.cbenab || !ch_zero || !opacity_zero ||
+            (wavelet.CHmethod == "link" && wavelet.chro != 0) ||
+            wavelet.contrast != 0 || wavelet.rescon != 0 ||
+            wavelet.resconH != 0 || wavelet.reschro != 0 ||
+            wavelet.resblur != 0 || wavelet.resblurc != 0 ||
+            wavelet.tmrs != 0.0) {
+            return false;
+        }
     }
     if (wavelet.softrad != 0.0 || wavelet.softradend != 0.0) {
         return false;
@@ -925,6 +1095,22 @@ RtLabWaveletContext LabWaveletContext::descriptor(bool supported)
         wavelet_params_.empty() ? nullptr : wavelet_params_.data();
     context.wavelet.compute_mea = &compute_mea_thunk;
     context.wavelet.compute_final = &compute_final_thunk;
+    context.selection.active = selection_active_ ? 1u : 0u;
+    context.selection.method = cl_method_;
+    context.selection.back_method = back_method_;
+    context.selection.choice_level = choice_level_;
+    context.selection.choice_dir = choice_dir_;
+    context.selection.dir1 = dir1_;
+    context.selection.dir2 = dir2_;
+    context.selection.max_ilev = max_ilev_;
+    context.clarity.active = clarity_active_ ? 1u : 0u;
+    context.clarity.merge = clarity_merge_ ? 1u : 0u;
+    context.clarity.levels_first =
+        static_cast<uint32_t>(clarity_levels_first_);
+    context.clarity.merge_l0 = clarity_l0_;
+    context.clarity.merge_l = clarity_l_;
+    context.clarity.merge_c0 = clarity_c0_;
+    context.clarity.merge_c = clarity_c_;
     return context;
 }
 
@@ -953,6 +1139,30 @@ int LabWaveletContext::build(RtLabWaveletResult& out)
         fill_result();
         return 0;
     }
+
+    /*
+     * Decode CLmethod's selection and the clarity arm once. A value the block
+     * would leave to an uninitialised cp field is refused here, before the
+     * launcher sees the descriptor.
+     */
+    WaveletClarity clarity;
+    if (!decodeWaveletClarity(params_.wavelet, clarity)) {
+        return 5;
+    }
+    selection_active_ = clarity.select;
+    cl_method_ = clarity.cl_method;
+    back_method_ = clarity.back_method;
+    choice_level_ = clarity.choice_level;
+    choice_dir_ = clarity.choice_dir;
+    dir1_ = clarity.dir1;
+    dir2_ = clarity.dir2;
+    max_ilev_ = clarity.max_ilev;
+    clarity_active_ = clarity.active;
+    clarity_merge_ = clarity.merge;
+    clarity_l0_ = clarity.merge_l0;
+    clarity_l_ = clarity.merge_l;
+    clarity_c0_ = clarity.merge_c0;
+    clarity_c_ = clarity.merge_c;
 
     levels_ = params_.dirpyrequalizer.enabled
                   ? labWaveletLastLevel(params_.dirpyrequalizer.mult)
@@ -1018,11 +1228,13 @@ int LabWaveletContext::build(RtLabWaveletResult& out)
      * decomposed and reconstructed even with Expchroma off. The round trip is
      * not an exact identity, so the device must run it to match the block. The
      * denoise arm adds the forced chroma denoise, which needs the a/b planes
-     * too.
+     * too. A CLmethod selection zeroes and repaints the a/b coefficients as
+     * well, so it needs the planes even when no panel modifies them.
      */
     wavelet_denoise_ = denoiseAdmitted(params_.wavelet, width_, height_);
     wavelet_ab_ = wavelet_chroma_ || wavelet_edge_ || wavelet_final_ ||
-                  wavelet_toning_ || wavelet_denoise_;
+                  wavelet_toning_ || wavelet_denoise_ ||
+                  (params_.wavelet.enabled && selection_active_);
 
     if (levels_ > 0) {
         if (width_ < 8 || height_ < 8) {
@@ -1071,6 +1283,16 @@ int LabWaveletContext::build(RtLabWaveletResult& out)
 
     wavelet_levels_ =
         labWaveletTransformLevels(params_, width_, height_);
+    /*
+     * The clarity arm's first pass forces CLmethod to "all", so its L
+     * decomposition can be trimmed below the profile's untrimmed count. The
+     * trim is invisible without highlight/shadow, where maxlvl only feeds the
+     * unused kH table, but the contrast kernel's kH depends on it.
+     */
+    clarity_levels_first_ =
+        clarity_active_
+            ? labWaveletTransformLevels(params_, width_, height_, true)
+            : wavelet_levels_;
     wavelet_active_ = params_.wavelet.enabled && wavelet_levels_ >= 1;
     if (params_.wavelet.enabled && !wavelet_active_) {
         return 3;

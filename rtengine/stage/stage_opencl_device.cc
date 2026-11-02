@@ -6051,7 +6051,12 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
     bool wavelet_toning = false;
     bool wavelet_denoise = false;
     bool wavelet_ab = false;
+    bool select_active = false;
+    bool clarity_active = false;
+    bool clarity_merge = false;
     const float* wavelet_params = nullptr;
+    const RtLabWaveletSelection& selection = context->selection;
+    const RtLabWaveletClarity& clarity = context->clarity;
     if (wavelet) {
         if (context->wavelet.active != 1 ||
             context->wavelet.compute_mea == nullptr ||
@@ -6130,6 +6135,70 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
         }
 
         /*
+         * CLmethod's level selection, decoded by the host context. The
+         * launcher re-checks every field so a stale or hand-built context can
+         * never index a band or a plane outside the block's ranges.
+         */
+        if (selection.active != 0 && selection.active != 1) {
+            error = "lab.wavelet selection flag must be 0 or 1";
+            return RT_STAGE_INVALID;
+        }
+        select_active = selection.active == 1;
+        if (select_active) {
+            if (selection.method > RT_LAB_WAVELET_CL_SUP ||
+                selection.back_method > RT_LAB_WAVELET_BACK_RESID ||
+                selection.choice_dir > RT_LAB_WAVELET_DIR_THR ||
+                selection.choice_level >
+                    static_cast<std::uint32_t>(
+                        LAB_WAVELET_MAX_LMETHOD - 1) ||
+                selection.dir1 < 1 || selection.dir1 > 3 ||
+                selection.dir2 < 1 || selection.dir2 > 3 ||
+                selection.dir1 == selection.dir2 ||
+                selection.max_ilev < 1 ||
+                selection.max_ilev >
+                    static_cast<std::uint32_t>(
+                        LAB_WAVELET_MAX_THRESHOLD_LEVEL)) {
+                error = "lab.wavelet selection is outside its range";
+                return RT_STAGE_INVALID;
+            }
+        }
+        if (clarity.active != 0 && clarity.active != 1) {
+            error = "lab.wavelet clarity flag must be 0 or 1";
+            return RT_STAGE_INVALID;
+        }
+        if (clarity.merge != 0 && clarity.merge != 1) {
+            error = "lab.wavelet clarity merge flag must be 0 or 1";
+            return RT_STAGE_INVALID;
+        }
+        clarity_active = clarity.active == 1;
+        clarity_merge = clarity.merge == 1;
+        if (clarity_merge && !clarity_active) {
+            error = "lab.wavelet clarity merge needs the clarity arm";
+            return RT_STAGE_INVALID;
+        }
+        if (clarity_active) {
+            if (!select_active || !wavelet_ab) {
+                error = "lab.wavelet clarity needs the level selection and "
+                        "the a/b planes";
+                return RT_STAGE_FALLBACK;
+            }
+            if (clarity.levels_first < 1 ||
+                clarity.levels_first >
+                    static_cast<std::uint32_t>(wavelet_levels)) {
+                error = "lab.wavelet clarity first-pass level count is "
+                        "outside its range";
+                return RT_STAGE_INVALID;
+            }
+            if (!std::isfinite(clarity.merge_l0) ||
+                !std::isfinite(clarity.merge_l) ||
+                !std::isfinite(clarity.merge_c0) ||
+                !std::isfinite(clarity.merge_c)) {
+                error = "lab.wavelet clarity merge factors are not finite";
+                return RT_STAGE_INVALID;
+            }
+        }
+
+        /*
          * The Haar border leaves the rows and columns in
          * [size - skip, skip) unwritten, so every undecimated level needs a
          * half-size grid at least as large as its stride.
@@ -6144,6 +6213,17 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
             }
         }
     }
+
+    /*
+     * The clarity arm's first pass runs ip_wavelet() with CLmethod forced to
+     * "all", so the a/b level trim applies exactly as it does in a plain
+     * pass: with no a/b-modifying panel the trim drops the decomposition to
+     * zero levels and the block leaves a/b untouched (the predicate refuses
+     * the few trim-stopping values). The second pass sees the profile's
+     * CLmethod, skips the trim and always runs the planes.
+     */
+    const bool ab_panels = wavelet_chroma || wavelet_edge || wavelet_final ||
+                           wavelet_toning || wavelet_denoise;
 
     /*
      * The equaliser's skin protection is its own flag; the wavelet chroma
@@ -6301,6 +6381,14 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
     char sftmp_key = 0;
     char sfaved_key = 0;
     char histogram_key = 0;
+    /*
+     * The clarity arm's copy of the first pass. The second pass reuses the
+     * band and low-pass buffers, so only the three merged planes are held.
+     */
+    char clarity_keys[3] = {};
+    StageDeviceBufferPtr clarity_l;
+    StageDeviceBufferPtr clarity_a;
+    StageDeviceBufferPtr clarity_b;
     StageDeviceBufferPtr nvc_device;
     StageDeviceBufferPtr sfave_device;
     StageDeviceBufferPtr sftmp_device;
@@ -6351,6 +6439,16 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
                            wavelet_low[1] && wavelet_tmp[0] &&
                            wavelet_tmp[1] && stats_device &&
                            wavelet_params_device;
+        if (clarity_merge) {
+            clarity_l = residency->acquire(&clarity_keys[0], plane_shape,
+                                           &error);
+            clarity_a = residency->acquire(&clarity_keys[1], plane_shape,
+                                           &error);
+            clarity_b = residency->acquire(&clarity_keys[2], plane_shape,
+                                           &error);
+            wavelet_acquired = wavelet_acquired && clarity_l && clarity_a &&
+                               clarity_b;
+        }
         if (wavelet_denoise) {
             for (int level = 0; level < wavelet_levels; ++level) {
                 for (int dir = 0; dir < 3; ++dir) {
@@ -6628,6 +6726,16 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
         cl_kernel shrink_apply_kernel = nullptr;
         cl_kernel box_h_kernel = nullptr;
         cl_kernel box_v_kernel = nullptr;
+        cl_kernel select_kernel = nullptr;
+        if (select_active) {
+            select_kernel = compiled_kernel_entry(
+                env, def, "rt_lab_wavelet_w_select", error);
+        }
+        cl_kernel clarity_kernel = nullptr;
+        if (clarity_active) {
+            clarity_kernel = compiled_kernel_entry(
+                env, def, "rt_lab_wavelet_w_clarity_merge", error);
+        }
         if (wavelet_denoise) {
             mad_kernel =
                 compiled_kernel_entry(env, def, "rt_lab_wavelet_w_mad",
@@ -6657,6 +6765,8 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
             (wavelet_final &&
              (final_kernel == nullptr || final_pixel_kernel == nullptr)) ||
             (wavelet_toning && toning_kernel == nullptr) ||
+            (select_active && select_kernel == nullptr) ||
+            (clarity_active && clarity_kernel == nullptr) ||
             (wavelet_denoise &&
              (mad_kernel == nullptr || noisevar_kernel == nullptr ||
               shrink_l_kernel == nullptr || shrink_ab_kernel == nullptr ||
@@ -6969,11 +7079,14 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
 
         auto multiply = [&](StageDeviceBufferPtr (*bandset)[3],
                             StageDeviceBufferPtr* lowset,
-                            uint32_t plane_index) -> bool {
+                            uint32_t plane_index, int maxlvl) -> bool {
             /* The level multiply: contrast on L, the chroma arm on a and b. */
+            const cl_int cl_maxlvl = maxlvl;
+            const cl_int cl_toning_levels = wavelet_levels;
             const int multiply_levels =
-                wavelet_denoise && plane_index > 0 ? denoise_levels
-                                                   : wavelet_levels;
+                plane_index == 0
+                    ? maxlvl
+                    : (wavelet_denoise ? denoise_levels : wavelet_levels);
             for (int level = 0; level < multiply_levels; ++level) {
                 cl_mem band1 = memory_of(bandset[level][0]);
                 cl_mem band2 = memory_of(bandset[level][1]);
@@ -7004,7 +7117,7 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
                         ok = ok && set_arg(edge_kernel, 8, sizeof(cl_int),
                                            &cl_level);
                         ok = ok && set_arg(edge_kernel, 9, sizeof(cl_int),
-                                           &wavelet_levels);
+                                           &cl_maxlvl);
                         ok = ok && set_arg(edge_kernel, 10, sizeof(cl_int),
                                            &cl_half_w);
                         ok = ok && set_arg(edge_kernel, 11, sizeof(cl_int),
@@ -7015,11 +7128,16 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
                             return false;
                         }
                     }
+                    /*
+                     * coeff0 lives at the buffer the plane's own level count
+                     * leaves it in; the clarity arm's first pass can be
+                     * shorter than the table stride.
+                     */
                     cl_mem coeff =
-                        memory_of(lowset[(wavelet_levels - 1) % 2]);
+                        memory_of(lowset[(maxlvl - 1) % 2]);
                     cl_int coeff_pitch =
-                        pitch_of(lowset[(wavelet_levels - 1) % 2]);
-                    cl_int cl_max = wavelet_levels;
+                        pitch_of(lowset[(maxlvl - 1) % 2]);
+                    cl_int cl_max = maxlvl;
                     ok = ok && set_arg(contrast_kernel, 0, sizeof(cl_mem),
                                        &band1);
                     ok = ok && set_arg(contrast_kernel, 1, sizeof(cl_int),
@@ -7125,7 +7243,7 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
                     ok = ok && set_arg(toning_kernel, 8, sizeof(cl_int),
                                        &cl_level);
                     ok = ok && set_arg(toning_kernel, 9, sizeof(cl_int),
-                                       &wavelet_levels);
+                                       &cl_toning_levels);
                     ok = ok && set_arg(toning_kernel, 10, sizeof(cl_int),
                                        &channel);
                     ok = ok && set_arg(toning_kernel, 11, sizeof(cl_int),
@@ -7144,7 +7262,8 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
         };
 
         auto final_curve = [&](StageDeviceBufferPtr (*bandset)[3],
-                               uint32_t plane_index) -> bool {
+                               uint32_t plane_index, int levels) -> bool {
+            const cl_int cl_final_levels = levels;
             /*
              * finalContAllL() reads the statistics Evaluate2() built just
              * before it. ip_wavelet() re-evaluates them after the contrast,
@@ -7161,7 +7280,7 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
                      * multiplied; `stats_host` still holds the block's own
                      * pre-contrast pass when the refresh is skipped.
                      */
-                    for (int level = 0; level < wavelet_levels; ++level) {
+                    for (int level = 0; level < levels; ++level) {
                         cl_mem band1 = memory_of(bandset[level][0]);
                         cl_mem band2 = memory_of(bandset[level][1]);
                         cl_mem band3 = memory_of(bandset[level][2]);
@@ -7210,7 +7329,7 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
                 }
                 if (context->wavelet.compute_final(
                         context->self, stats_host.data(),
-                        static_cast<uint32_t>(wavelet_levels)) != 0) {
+                        static_cast<uint32_t>(levels)) != 0) {
                     error = "lab.wavelet final statistics build failed";
                     return false;
                 }
@@ -7219,7 +7338,7 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
                     error = "lab.wavelet final parameter upload failed";
                     return false;
                 }
-                for (int level = 0; level < wavelet_levels; ++level) {
+                for (int level = 0; level < levels; ++level) {
                     cl_mem band1 = memory_of(bandset[level][0]);
                     cl_mem band2 = memory_of(bandset[level][1]);
                     cl_mem band3 = memory_of(bandset[level][2]);
@@ -7244,7 +7363,7 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
                     ok = ok && set_arg(final_kernel, 8, sizeof(cl_int),
                                        &cl_level);
                     ok = ok && set_arg(final_kernel, 9, sizeof(cl_int),
-                                       &wavelet_levels);
+                                       &cl_final_levels);
                     ok = ok && set_arg(final_kernel, 10, sizeof(cl_int),
                                        &cl_half_w);
                     ok = ok && set_arg(final_kernel, 11, sizeof(cl_int),
@@ -7403,15 +7522,92 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
             return true;
         };
 
+        /*
+         * finalContAllL()'s CLmethod selection, applied per level after the
+         * plane's own multiplies. The block zeroes the bands outside the
+         * selected level/direction and paints the coefficient-0 plane; the
+         * a/b planes carry their own background rule.
+         */
+        auto selection_pass = [&](StageDeviceBufferPtr (*bandset)[3],
+                                  StageDeviceBufferPtr* lowset,
+                                  uint32_t plane_index, int levels) -> bool {
+            if (!select_active) {
+                return true;
+            }
+            const int coeff_index = (levels - 1) % 2;
+            cl_mem coeff = memory_of(lowset[coeff_index]);
+            cl_int coeff_pitch = pitch_of(lowset[coeff_index]);
+            const cl_int cl_method = static_cast<cl_int>(selection.method);
+            const cl_int cl_back =
+                static_cast<cl_int>(selection.back_method);
+            const cl_int cl_choice =
+                static_cast<cl_int>(selection.choice_level);
+            const cl_int cl_direction =
+                static_cast<cl_int>(selection.choice_dir);
+            const cl_int cl_dir1 = static_cast<cl_int>(selection.dir1);
+            const cl_int cl_dir2 = static_cast<cl_int>(selection.dir2);
+            const cl_int cl_max_ilev =
+                static_cast<cl_int>(selection.max_ilev);
+            const cl_int cl_ab = plane_index == 0 ? 0 : 1;
+            for (int level = 0; level < levels; ++level) {
+                cl_mem band1 = memory_of(bandset[level][0]);
+                cl_mem band2 = memory_of(bandset[level][1]);
+                cl_mem band3 = memory_of(bandset[level][2]);
+                cl_int bp1 = pitch_of(bandset[level][0]);
+                cl_int bp2 = pitch_of(bandset[level][1]);
+                cl_int bp3 = pitch_of(bandset[level][2]);
+                cl_int cl_level = level;
+                bool ok = true;
+                ok = ok && set_arg(select_kernel, 0, sizeof(cl_mem), &band1);
+                ok = ok && set_arg(select_kernel, 1, sizeof(cl_int), &bp1);
+                ok = ok && set_arg(select_kernel, 2, sizeof(cl_mem), &band2);
+                ok = ok && set_arg(select_kernel, 3, sizeof(cl_int), &bp2);
+                ok = ok && set_arg(select_kernel, 4, sizeof(cl_mem), &band3);
+                ok = ok && set_arg(select_kernel, 5, sizeof(cl_int), &bp3);
+                ok = ok && set_arg(select_kernel, 6, sizeof(cl_mem), &coeff);
+                ok = ok && set_arg(select_kernel, 7, sizeof(cl_int),
+                                   &coeff_pitch);
+                ok = ok && set_arg(select_kernel, 8, sizeof(cl_int),
+                                   &cl_level);
+                ok = ok && set_arg(select_kernel, 9, sizeof(cl_int),
+                                   &cl_half_w);
+                ok = ok && set_arg(select_kernel, 10, sizeof(cl_int),
+                                   &cl_half_h);
+                ok = ok && set_arg(select_kernel, 11, sizeof(cl_int),
+                                   &cl_method);
+                ok = ok && set_arg(select_kernel, 12, sizeof(cl_int),
+                                   &cl_back);
+                ok = ok && set_arg(select_kernel, 13, sizeof(cl_int),
+                                   &cl_choice);
+                ok = ok && set_arg(select_kernel, 14, sizeof(cl_int),
+                                   &cl_direction);
+                ok = ok && set_arg(select_kernel, 15, sizeof(cl_int), &cl_dir1);
+                ok = ok && set_arg(select_kernel, 16, sizeof(cl_int), &cl_dir2);
+                ok = ok && set_arg(select_kernel, 17, sizeof(cl_int),
+                                   &cl_max_ilev);
+                ok = ok && set_arg(select_kernel, 18, sizeof(cl_int), &cl_ab);
+                if (!ok || !launch(select_kernel, band_global,
+                                   "lab.wavelet selection")) {
+                    error = "lab.wavelet selection arguments failed";
+                    return false;
+                }
+            }
+            return true;
+        };
+
         auto run_plane = [&](cl_mem plane_memory, cl_int plane_pitch,
-                             uint32_t plane_index) -> bool {
+                             uint32_t plane_index, int levels,
+                             bool select) -> bool {
             return forward_analysis(plane_memory, plane_pitch, bands,
-                                    wavelet_low, wavelet_levels) &&
-                   statistics(bands, plane_index, wavelet_levels) &&
-                   multiply(bands, wavelet_low, plane_index) &&
-                   final_curve(bands, plane_index) &&
+                                    wavelet_low, levels) &&
+                   statistics(bands, plane_index, levels) &&
+                   multiply(bands, wavelet_low, plane_index, levels) &&
+                   final_curve(bands, plane_index, levels) &&
+                   (!select ||
+                    selection_pass(bands, wavelet_low, plane_index,
+                                   levels)) &&
                    synthesize(bands, wavelet_low, plane_memory, plane_pitch,
-                              plane_index, wavelet_levels);
+                              plane_index, levels);
         };
 
         /*
@@ -7768,83 +7964,228 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
             return true;
         };
 
-        if (wavelet_denoise) {
-            /*
-             * WaveletDenoiseAllL() runs on the pre-contrast L bands, the
-             * contrast and edge passes follow, and L is not reconstructed
-             * yet because the forced chroma denoise reads its coefficients.
-             * ip_wavelet() clamps levwava and levwavb with min(levwav, ...),
-             * so the a and b planes run ip_wavelet()'s base decomposition
-             * level, which the forced Expnoise arm fixes at six, while L
-             * keeps seven. Every per-plane pass therefore takes its own
-             * count; the parameter-table stride stays at `wavelet_levels`
-             * and the unused level of each a/b tail is left untouched.
-             */
-            const int ab_levels = denoise_levels;
-            if (!forward_analysis(l_memory, l_pitch, bands_hold,
-                                  wavelet_low_hold, wavelet_levels) ||
-                !statistics(bands_hold, 0, wavelet_levels) ||
-                !run_mad(bands_hold, 0, wavelet_levels) ||
-                !denoise_l(bands_hold) ||
-                !multiply(bands_hold, wavelet_low_hold, 0) ||
-                !final_curve(bands_hold, 0) || !compute_noisevar()) {
-                return RT_STAGE_FALLBACK;
-            }
-            if (!forward_analysis(plane_a_memory, plane_a_pitch, bands,
-                                  wavelet_low, ab_levels) ||
-                !run_mad(bands, 1, ab_levels) || !denoise_ab(bands, 1) ||
-                !statistics(bands, 1, ab_levels) ||
-                !multiply(bands, wavelet_low, 1) ||
-                !synthesize(bands, wavelet_low, plane_a_memory,
-                            plane_a_pitch, 1, ab_levels)) {
-                return RT_STAGE_FALLBACK;
-            }
-            if (!forward_analysis(plane_b_memory, plane_b_pitch, bands,
-                                  wavelet_low, ab_levels) ||
-                !run_mad(bands, 2, ab_levels) || !denoise_ab(bands, 2) ||
-                !statistics(bands, 2, ab_levels) ||
-                !multiply(bands, wavelet_low, 2) ||
-                !synthesize(bands, wavelet_low, plane_b_memory,
-                            plane_b_pitch, 2, ab_levels)) {
-                return RT_STAGE_FALLBACK;
-            }
-            if (!synthesize(bands_hold, wavelet_low_hold, l_memory, l_pitch,
-                            0, wavelet_levels)) {
-                return RT_STAGE_FALLBACK;
-            }
-        } else if (!run_plane(l_memory, l_pitch, 0)) {
-            return RT_STAGE_FALLBACK;
-        } else if (wavelet_ab &&
-                   (!run_plane(plane_a_memory, plane_a_pitch, 1) ||
-                    !run_plane(plane_b_memory, plane_b_pitch, 2))) {
-            return RT_STAGE_FALLBACK;
-        }
         /*
-         * The final panel's pixel curve runs on the reconstructed L plane
-         * after the chroma planes, in the block's tile-finalise order. The
-         * denoise path reaches it after the deferred L reconstruction.
+         * One full ip_wavelet() pass. `select` applies CLmethod's coefficient
+         * selection at the point finalContAllL()/ContAllAB() run it: after
+         * the L final curve and after each a/b multiply. The clarity arm calls
+         * this twice, with the block's "all" method for the first pass and the
+         * profile's selection for the second; the first result is copied out
+         * before the bands are reused.
          */
-        if (wavelet_final) {
-            bool ok = true;
-            ok = ok && set_arg(final_pixel_kernel, 0, sizeof(cl_mem),
-                               &l_memory);
-            ok = ok && set_arg(final_pixel_kernel, 1, sizeof(cl_int),
-                               &l_pitch);
-            ok = ok && set_arg(final_pixel_kernel, 2, sizeof(cl_mem),
-                               &params_memory);
-            ok = ok && set_arg(final_pixel_kernel, 3, sizeof(cl_int),
-                               &cl_final_offset);
-            ok = ok && set_arg(final_pixel_kernel, 4, sizeof(cl_int),
-                               &wavelet_levels);
-            ok = ok && set_arg(final_pixel_kernel, 5, sizeof(cl_int),
-                               &cl_width);
-            ok = ok && set_arg(final_pixel_kernel, 6, sizeof(cl_int),
-                               &cl_height);
-            if (!ok || !launch(final_pixel_kernel, image_global,
-                               "lab.wavelet final pixel curve")) {
-                error = "lab.wavelet final pixel curve arguments failed";
+        auto run_transform = [&](bool select, bool a_b, int levels) -> bool {
+            const cl_int cl_pass_levels = levels;
+            if (wavelet_denoise) {
+                /*
+                 * WaveletDenoiseAllL() runs on the pre-contrast L bands, the
+                 * contrast and edge passes follow, and L is not reconstructed
+                 * yet because the forced chroma denoise reads its
+                 * coefficients. ip_wavelet() clamps levwava and levwavb with
+                 * min(levwav, ...), so the a and b planes run ip_wavelet()'s
+                 * base decomposition level, which the forced Expnoise arm
+                 * fixes at six, while L keeps seven. Every per-plane pass
+                 * therefore takes its own count; the parameter-table stride
+                 * stays at `wavelet_levels` and the unused level of each a/b
+                 * tail is left untouched.
+                 */
+                const int ab_levels = denoise_levels;
+                if (!forward_analysis(l_memory, l_pitch, bands_hold,
+                                      wavelet_low_hold, levels) ||
+                    !statistics(bands_hold, 0, levels) ||
+                    !run_mad(bands_hold, 0, levels) ||
+                    !denoise_l(bands_hold) ||
+                    !multiply(bands_hold, wavelet_low_hold, 0, levels) ||
+                    !final_curve(bands_hold, 0, levels) ||
+                    (select && !selection_pass(bands_hold, wavelet_low_hold,
+                                               0, levels)) ||
+                    !compute_noisevar()) {
+                    return false;
+                }
+                if (!forward_analysis(plane_a_memory, plane_a_pitch, bands,
+                                      wavelet_low, ab_levels) ||
+                    !run_mad(bands, 1, ab_levels) || !denoise_ab(bands, 1) ||
+                    !statistics(bands, 1, ab_levels) ||
+                    !multiply(bands, wavelet_low, 1, ab_levels) ||
+                    (select && !selection_pass(bands, wavelet_low, 1,
+                                               ab_levels)) ||
+                    !synthesize(bands, wavelet_low, plane_a_memory,
+                                plane_a_pitch, 1, ab_levels)) {
+                    return false;
+                }
+                if (!forward_analysis(plane_b_memory, plane_b_pitch, bands,
+                                      wavelet_low, ab_levels) ||
+                    !run_mad(bands, 2, ab_levels) || !denoise_ab(bands, 2) ||
+                    !statistics(bands, 2, ab_levels) ||
+                    !multiply(bands, wavelet_low, 2, ab_levels) ||
+                    (select && !selection_pass(bands, wavelet_low, 2,
+                                               ab_levels)) ||
+                    !synthesize(bands, wavelet_low, plane_b_memory,
+                                plane_b_pitch, 2, ab_levels)) {
+                    return false;
+                }
+                if (!synthesize(bands_hold, wavelet_low_hold, l_memory,
+                                l_pitch, 0, levels)) {
+                    return false;
+                }
+            } else if (!run_plane(l_memory, l_pitch, 0, levels, select)) {
+                return false;
+            } else if (a_b &&
+                       (!run_plane(plane_a_memory, plane_a_pitch, 1, levels,
+                                   select) ||
+                        !run_plane(plane_b_memory, plane_b_pitch, 2, levels,
+                                   select))) {
+                return false;
+            }
+            /*
+             * The final panel's pixel curve runs on the reconstructed L plane
+             * after the chroma planes, in the block's tile-finalise order. The
+             * denoise path reaches it after the deferred L reconstruction.
+             */
+            if (wavelet_final) {
+                bool ok = true;
+                ok = ok && set_arg(final_pixel_kernel, 0, sizeof(cl_mem),
+                                   &l_memory);
+                ok = ok && set_arg(final_pixel_kernel, 1, sizeof(cl_int),
+                                   &l_pitch);
+                ok = ok && set_arg(final_pixel_kernel, 2, sizeof(cl_mem),
+                                   &params_memory);
+                ok = ok && set_arg(final_pixel_kernel, 3, sizeof(cl_int),
+                                   &cl_final_offset);
+                ok = ok && set_arg(final_pixel_kernel, 4, sizeof(cl_int),
+                                   &cl_pass_levels);
+                ok = ok && set_arg(final_pixel_kernel, 5, sizeof(cl_int),
+                                   &cl_width);
+                ok = ok && set_arg(final_pixel_kernel, 6, sizeof(cl_int),
+                                   &cl_height);
+                if (!ok || !launch(final_pixel_kernel, image_global,
+                                   "lab.wavelet final pixel curve")) {
+                    error = "lab.wavelet final pixel curve arguments failed";
+                    return false;
+                }
+            }
+            return true;
+        };
+
+        if (clarity_active) {
+            /*
+             * The clarity arm. The first pass runs with CLmethod forced to
+             * "all"; its three planes are copied out, then the same transform
+             * runs again with the profile's selection and the two are merged.
+             * The block's second pass reads the clamped first pass, so the L
+             * tile-copy clamp is applied before the copy-out and before the
+             * second pass.
+             */
+            if (!run_transform(false, ab_panels,
+                               static_cast<int>(clarity.levels_first))) {
                 return RT_STAGE_FALLBACK;
             }
+            if (clarity_merge) {
+                const std::size_t pixels =
+                    static_cast<std::size_t>(width) *
+                    static_cast<std::size_t>(height);
+                std::vector<float> first_pass(pixels * 3, 0.f);
+                RtStageBuffer first_view{};
+                first_view.size = sizeof(RtStageBuffer);
+                first_view.data = first_pass.data();
+                first_view.width = width;
+                first_view.height = height;
+                first_view.row_pitch =
+                    static_cast<std::size_t>(width) * sizeof(float);
+                first_view.plane_pitch = first_view.row_pitch * height;
+                first_view.planes = 3;
+                first_view.format = RT_STAGE_F32;
+                first_view.flags = RT_STAGE_BUFFER_READ;
+                if (residency->readback(l_device, plane_view(first_view, 0)) !=
+                        RT_STAGE_OK ||
+                    residency->readback(plane_a_device,
+                                        plane_view(first_view, 1)) !=
+                        RT_STAGE_OK ||
+                    residency->readback(plane_b_device,
+                                        plane_view(first_view, 2)) !=
+                        RT_STAGE_OK) {
+                    error = "lab.wavelet clarity readback failed";
+                    return RT_STAGE_FALLBACK;
+                }
+                /* ip_wavelet()'s final tile copy: L <= 0 becomes 1. */
+                for (std::size_t index = 0; index < pixels; ++index) {
+                    if (first_pass[index] <= 0.f) {
+                        first_pass[index] = 1.f;
+                    }
+                }
+                if (residency->upload(l_device, plane_view(first_view, 0)) !=
+                        RT_STAGE_OK ||
+                    residency->upload(clarity_l,
+                                      plane_view(first_view, 0)) !=
+                        RT_STAGE_OK ||
+                    residency->upload(clarity_a,
+                                      plane_view(first_view, 1)) !=
+                        RT_STAGE_OK ||
+                    residency->upload(clarity_b,
+                                      plane_view(first_view, 2)) !=
+                        RT_STAGE_OK) {
+                    error = "lab.wavelet clarity copy-out failed";
+                    return RT_STAGE_FALLBACK;
+                }
+                if (!run_transform(true, true, wavelet_levels)) {
+                    return RT_STAGE_FALLBACK;
+                }
+            }
+
+            const cl_mem unshar_l_memory =
+                clarity_merge ? memory_of(clarity_l) : l_memory;
+            const cl_mem unshar_a_memory =
+                clarity_merge ? memory_of(clarity_a) : plane_a_memory;
+            const cl_mem unshar_b_memory =
+                clarity_merge ? memory_of(clarity_b) : plane_b_memory;
+            const cl_int unshar_l_pitch =
+                clarity_merge ? pitch_of(clarity_l) : l_pitch;
+            const cl_int unshar_a_pitch =
+                clarity_merge ? pitch_of(clarity_a) : plane_a_pitch;
+            const cl_int unshar_b_pitch =
+                clarity_merge ? pitch_of(clarity_b) : plane_b_pitch;
+            const cl_float cl_merge_l0 = clarity.merge_l0;
+            const cl_float cl_merge_l = clarity.merge_l;
+            const cl_float cl_merge_c0 = clarity.merge_c0;
+            const cl_float cl_merge_c = clarity.merge_c;
+            bool ok = true;
+            ok = ok && set_arg(clarity_kernel, 0, sizeof(cl_mem), &l_memory);
+            ok = ok && set_arg(clarity_kernel, 1, sizeof(cl_int), &l_pitch);
+            ok = ok && set_arg(clarity_kernel, 2, sizeof(cl_mem),
+                               &unshar_l_memory);
+            ok = ok && set_arg(clarity_kernel, 3, sizeof(cl_int),
+                               &unshar_l_pitch);
+            ok = ok && set_arg(clarity_kernel, 4, sizeof(cl_mem),
+                               &plane_a_memory);
+            ok = ok && set_arg(clarity_kernel, 5, sizeof(cl_int),
+                               &plane_a_pitch);
+            ok = ok && set_arg(clarity_kernel, 6, sizeof(cl_mem),
+                               &unshar_a_memory);
+            ok = ok && set_arg(clarity_kernel, 7, sizeof(cl_int),
+                               &unshar_a_pitch);
+            ok = ok && set_arg(clarity_kernel, 8, sizeof(cl_mem),
+                               &plane_b_memory);
+            ok = ok && set_arg(clarity_kernel, 9, sizeof(cl_int),
+                               &plane_b_pitch);
+            ok = ok && set_arg(clarity_kernel, 10, sizeof(cl_mem),
+                               &unshar_b_memory);
+            ok = ok && set_arg(clarity_kernel, 11, sizeof(cl_int),
+                               &unshar_b_pitch);
+            ok = ok && set_arg(clarity_kernel, 12, sizeof(cl_int), &cl_width);
+            ok = ok && set_arg(clarity_kernel, 13, sizeof(cl_int), &cl_height);
+            ok = ok && set_arg(clarity_kernel, 14, sizeof(cl_float),
+                               &cl_merge_l0);
+            ok = ok && set_arg(clarity_kernel, 15, sizeof(cl_float),
+                               &cl_merge_l);
+            ok = ok && set_arg(clarity_kernel, 16, sizeof(cl_float),
+                               &cl_merge_c0);
+            ok = ok && set_arg(clarity_kernel, 17, sizeof(cl_float),
+                               &cl_merge_c);
+            if (!ok || !launch(clarity_kernel, image_global,
+                               "lab.wavelet clarity merge")) {
+                error = "lab.wavelet clarity merge arguments failed";
+                return RT_STAGE_FALLBACK;
+            }
+        } else if (!run_transform(true, wavelet_ab, wavelet_levels)) {
+            return RT_STAGE_FALLBACK;
         }
     }
 
@@ -7862,7 +8203,7 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
             return RT_STAGE_FALLBACK;
         }
     }
-    if (wavelet_chroma && !wavelet_final) {
+    if (!clarity_active && wavelet_chroma && !wavelet_final) {
         /*
          * The L synthesis skipped its clamp so ContAllAB() read the same L
          * the block reads. ip_wavelet() applies it in the final tile copy,

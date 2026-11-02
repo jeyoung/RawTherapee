@@ -58,7 +58,7 @@ struct ProcParams;
  * wavelet tool's own skin protection: the equaliser only changes L, so a/b
  * and their masks are identical at the start of both passes.
  */
-#define RT_LAB_WAVELET_CONTEXT_VERSION 8u
+#define RT_LAB_WAVELET_CONTEXT_VERSION 9u
 /* "LWCT": rejects a stale or unrelated pointer before any callback runs. */
 #define RT_LAB_WAVELET_CONTEXT_MAGIC 0x4C574354u
 /* The number of levels of the directional pyramid. */
@@ -312,6 +312,67 @@ typedef struct RtLabWaveletWavelet {
                        uint32_t plane);
 } RtLabWaveletWavelet;
 
+/*
+ * finalContAllL()'s level selection. CLmethod is decoded exactly as the block
+ * decodes it: "one" keeps a single level, "inf" the levels above it, "sup" the
+ * levels below it and "all" disables the selection. `choice_level` is
+ * Lmethod - 1 (4 when Lmethod is zero), and `choice_dir`/`dir1`/`dir2` are the
+ * Dirmethod arms: "all" keeps every direction, otherwise the two listed
+ * directions are zeroed and the remaining one is kept.
+ */
+#define RT_LAB_WAVELET_CL_ONE 0u
+#define RT_LAB_WAVELET_CL_INF 1u
+#define RT_LAB_WAVELET_CL_SUP 2u
+#define RT_LAB_WAVELET_CL_ALL 3u
+
+#define RT_LAB_WAVELET_BACK_BLACK 0u
+#define RT_LAB_WAVELET_BACK_GREY 1u
+#define RT_LAB_WAVELET_BACK_RESID 2u
+
+#define RT_LAB_WAVELET_DIR_ALL 0u
+#define RT_LAB_WAVELET_DIR_ONE 1u
+#define RT_LAB_WAVELET_DIR_TWO 2u
+#define RT_LAB_WAVELET_DIR_THR 3u
+
+typedef struct RtLabWaveletSelection {
+    /* 1 when CLmethod selects levels (every value except "all"). */
+    uint32_t active;
+    uint32_t method;       /* RT_LAB_WAVELET_CL_* */
+    uint32_t back_method;  /* RT_LAB_WAVELET_BACK_* */
+    uint32_t choice_level;
+    uint32_t choice_dir;   /* RT_LAB_WAVELET_DIR_* */
+    uint32_t dir1;
+    uint32_t dir2;
+    /* The block's cp.maxilev: wavelet.thres, the level count the widget
+     * advertises. finalContAllL() compares choice_level with it. */
+    uint32_t max_ilev;
+} RtLabWaveletSelection;
+
+/*
+ * The clarity arm's merge. `active` is 1 for the block's
+ * `ushamethod` sharp/clari + `expclari` + `CLmethod != "all"` sequence;
+ * `merge` is 1 when the second pass feeds the merge (the one/inf + black and
+ * sup + resid arms). Every other Backmethod arm leaves the merge factors zero,
+ * so the block returns the clamped first pass. The four factors are already
+ * scaled as the block scales them: mergeL/mergeC over 100, and the -1.5
+ * luminance factor of the black arms.
+ */
+typedef struct RtLabWaveletClarity {
+    uint32_t active;
+    uint32_t merge;
+    /*
+     * The clarity arm's first pass runs with CLmethod forced to "all", so its
+     * L decomposition can be shorter than the profile's untrimmed count: the
+     * trailing-zero trim applies. The launcher runs the first pass with this
+     * many levels and the second with the context's wavelet level count.
+     */
+    uint32_t levels_first;
+    float merge_l0;
+    float merge_l;
+    float merge_c0;
+    float merge_c;
+} RtLabWaveletClarity;
+
 typedef struct RtLabWaveletContext {
     uint32_t size;
     uint32_t version;
@@ -338,6 +399,10 @@ typedef struct RtLabWaveletContext {
     uint32_t skinprotect;
     /* The wavelet contrast pass; zero-filled when it is off. */
     RtLabWaveletWavelet wavelet;
+    /* CLmethod's level selection; `active` is zero for "all". */
+    RtLabWaveletSelection selection;
+    /* The clarity arm's merge; `active` is zero when it does not run. */
+    RtLabWaveletClarity clarity;
 } RtLabWaveletContext;
 
 namespace rtengine::stage
@@ -410,6 +475,17 @@ inline constexpr double LAB_WAVELET_MAX_WAVELET_SIGMAFIN = 2.5;
 /* The toning panel's sigmaton slider range. */
 inline constexpr double LAB_WAVELET_MIN_WAVELET_SIGMATON = 0.025;
 inline constexpr double LAB_WAVELET_MAX_WAVELET_SIGMATON = 2.5;
+/*
+ * The clarity panel's merge sliders. The widget admits -50..100 for both; the
+ * merge reads them directly, so a value outside that range is a residual.
+ */
+inline constexpr double LAB_WAVELET_MIN_MERGE = -50.0;
+inline constexpr double LAB_WAVELET_MAX_MERGE = 100.0;
+/* Lmethod's combo box: the nine level entries and the "SUPE" entry. */
+inline constexpr int LAB_WAVELET_MIN_LMETHOD = 0;
+inline constexpr int LAB_WAVELET_MAX_LMETHOD = 10;
+/* finalContAllL()'s fallback when Lmethod is zero. */
+inline constexpr std::uint32_t LAB_WAVELET_DEFAULT_CHOICE_LEVEL = 4;
 
 /* The block's `scale` argument at every export call site. The equaliser's
  * BadpixelsLab() radius is 4 / scale, and the launcher requires this value. */
@@ -436,15 +512,19 @@ float labWaveletMadFromHistogram(const std::uint32_t* histogram,
  * returns before the decomposition. The device reproduces this derivation
  * exactly. The a and b planes are not raised with L: ip_wavelet() clamps
  * levwava and levwavb with min(levwav, ...), so they keep the base level.
+ * `force_all_method` evaluates the trailing-zero trim as if CLmethod were
+ * "all", which is the clarity arm's first pass.
  */
 int labWaveletTransformLevels(const procparams::ProcParams& params,
-                              int width, int height);
+                              int width, int height,
+                              bool force_all_method = false);
 
 /*
  * Whether the wavelet pass is the node's supported set: the contrast panel,
  * the chroma panel's "link" arm, the edge panel's plain arm, the final
  * panel's curve arm and the toning panel's zero-protection arm, no residual,
- * noise, clarity or blur panel, the "all" level method, full-tile processing, no soft radius, no L contrast
+ * noise or blur panel, full-tile processing, no soft radius,
+ * no L contrast
  * skin protection, no avoid-colour-shift or blue-sky median, no extra level,
  * the default 8-tap Daubechies, a highlight/shadow method the block
  * implements, identity chroma-by-hue and hue curves, every scalar in range
@@ -454,6 +534,14 @@ int labWaveletTransformLevels(const procparams::ProcParams& params,
  * hard-coded curve path is the one ported. The final arm requires the two
  * curve controls only: no balance-chroma method, no residual tone mapping
  * (soft radius end is refused) and a sigmafin inside its slider range.
+ *
+ * CLmethod's "one"/"inf"/"sup" level selection is ported for every admitted
+ * panel set: the selection is finalContAllL()'s own coefficient zeroing and
+ * L0 background paint, so the device reproduces it whenever the selection is
+ * active. The clarity arm additionally requires `ushamethod` sharp or clari,
+ * `expclari` and a known Backmethod; it runs the block's two-pass sequence and
+ * merge. Lmethod, Dirmethod, Backmethod and the merge sliders must be inside
+ * the widget ranges whenever the selection runs.
  */
 bool labWaveletWaveletSupported(const procparams::ProcParams& params,
                                 int width, int height);
@@ -549,6 +637,25 @@ private:
     float wavelet_t_r_ = 0.f;
     float wavelet_b_r_ = 0.f;
     std::vector<float> wavelet_params_;
+
+    /* The CLmethod selection, decoded once for the descriptor and the
+     * launcher. `selection_active_` is false for "all". */
+    bool selection_active_ = false;
+    std::uint32_t cl_method_ = RT_LAB_WAVELET_CL_ALL;
+    std::uint32_t back_method_ = RT_LAB_WAVELET_BACK_GREY;
+    std::uint32_t choice_level_ = LAB_WAVELET_DEFAULT_CHOICE_LEVEL;
+    std::uint32_t choice_dir_ = RT_LAB_WAVELET_DIR_ALL;
+    std::uint32_t dir1_ = 2;
+    std::uint32_t dir2_ = 3;
+    std::uint32_t max_ilev_ = 0;
+    /* The clarity arm and, when the merge is non-trivial, its factors. */
+    bool clarity_active_ = false;
+    bool clarity_merge_ = false;
+    int clarity_levels_first_ = 0;
+    float clarity_l0_ = 0.f;
+    float clarity_l_ = 0.f;
+    float clarity_c0_ = 0.f;
+    float clarity_c_ = 0.f;
 };
 
 } // namespace rtengine::stage
