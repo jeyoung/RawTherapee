@@ -1441,4 +1441,282 @@ __kernel void rt_lab_wavelet_w_toning(
         band[at] *= beta;
     }
 }
+
+/* ------------------------------------------------------------------------
+ * The standard denoise arm: WaveletDenoiseAllL(), the chroma arm the block
+ * forces at six levels (WaveletDenoiseAllAB() with useNoiseCCurve and the
+ * plain noise-variance plane), and the MAD histogram behind both.
+ *
+ * Every coefficient and table value stays single precision. The device uses
+ * exp() where the host uses the scalar or vector xexpf(); the measured
+ * difference is recorded in PARITY.md.
+ * --------------------------------------------------------------------- */
+/* Mirrors RT_LAB_WAVELET_DENOISE_HEADER and the histogram's bin count. */
+#define RT_LW_W_DENOISE_HEADER 7
+#define RT_LW_W_MAD_BINS 32768
+
+/*
+ * ImProcFunctions::Mad()'s histogram, one work item per (level, direction)
+ * band. The band scans in ascending row-major order and truncates the
+ * absolute value to a bin, clamping at the top; each band owns its own
+ * 32768-bin range, so no atomics are needed.
+ */
+__kernel void rt_lab_wavelet_w_mad(
+    __global const float* band1, int p1,
+    __global const float* band2, int p2,
+    __global const float* band3, int p3,
+    __global uint* histogram, int histogram_offset,
+    int w, int h, int bands)
+{
+    const int band = get_global_id(0);
+    if (band >= bands) {
+        return;
+    }
+    const int dir = band % 3;
+    __global const float* data = dir == 0 ? band1 : (dir == 1 ? band2 : band3);
+    const int pitch = dir == 0 ? p1 : (dir == 1 ? p2 : p3);
+    __global uint* bins = histogram + histogram_offset + band * RT_LW_W_MAD_BINS;
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            const float magnitude = fabs(data[y * pitch + x]);
+            const int bin = (int)min(32767.0f, magnitude);
+            bins[bin] += 1u;
+        }
+    }
+}
+
+/*
+ * noisevarchrom: ip_wavelet()'s chroma-magnitude ramp, written on the half
+ * grid. The full-resolution loop writes each half-grid cell four times; the
+ * last write wins, which is the sample at the clamped (2y+1, 2x+1) corner.
+ */
+__kernel void rt_lab_wavelet_w_noisevar(
+    __global const float* plane_a, int a_pitch,
+    __global const float* plane_b, int b_pitch,
+    __global float* nvc, int nvc_pitch,
+    int w, int h, int width, int height)
+{
+    const int x = get_global_id(0);
+    const int y = get_global_id(1);
+    if (x >= w || y >= h) {
+        return;
+    }
+    const int px = min(2 * x + 1, width - 1);
+    const int py = min(2 * y + 1, height - 1);
+    const float a = plane_a[py * a_pitch + px];
+    const float b = plane_b[py * b_pitch + px];
+    const float chroma = sqrt(a * a + b * b);
+    const float nvch = 0.6f;
+    const float nvcl = 0.1f;
+    const float seuil = 4000.0f;
+    const float seuil2 = 15000.0f;
+    const float ac = (nvch - nvcl) / (seuil - seuil2);
+    const float bc = nvch - seuil * ac;
+    float value;
+    if (chroma < seuil) {
+        value = nvch;
+    } else if (chroma < seuil2) {
+        value = ac * chroma + bc;
+    } else {
+        value = nvcl;
+    }
+    nvc[y * nvc_pitch + x] = value;
+}
+
+/*
+ * ShrinkAllL()'s local shrinkage, before boxblur(). `vari` is vari[level] and
+ * `mad` is the level's squared madL for this direction; `ballum` selects the
+ * noisevarlum table entry. The host's vector and scalar forms differ only by
+ * the grouping of the same product, which this form reproduces.
+ */
+__kernel void rt_lab_wavelet_w_shrink_l(
+    __global const float* band, int band_pitch,
+    __global const float* orig_l, int l_pitch,
+    __global float* sfave, int sfave_pitch,
+    float vari, float mad, float ballum,
+    int level, int w, int h, int width, int height)
+{
+    const int x = get_global_id(0);
+    const int y = get_global_id(1);
+    if (x >= w || y >= h) {
+        return;
+    }
+    const int px = min(2 * x + 1, width - 1);
+    const int py = min(2 * y + 1, height - 1);
+    const float l = orig_l[py * l_pitch + px];
+    const float nvlh[13] = {1.f, 1.f, 1.f, 1.f, 1.f, 1.f, 1.f,
+                            1.f, 1.f, 1.f, 1.f, 0.7f, 0.5f};
+    const float nvll[13] = {0.1f, 0.15f, 0.2f, 0.25f, 0.3f, 0.35f, 0.4f,
+                            0.45f, 0.7f, 0.8f, 1.f, 1.f, 1.f};
+    const float seuillow = 3000.0f;
+    const float seuilhigh = 18000.0f;
+    const int index = (int)(10.0f - ballum);
+    const float ac = (nvlh[index] - nvll[index]) / (seuillow - seuilhigh);
+    const float bc = nvlh[index] - seuillow * ac;
+    float nv;
+    if (l < seuillow) {
+        nv = nvlh[index];
+    } else if (l < seuilhigh) {
+        nv = ac * l + bc;
+    } else {
+        nv = nvll[index];
+    }
+    const float nvl = vari * nv * nv;
+    const float level_factor = mad * 5.0f / (float)(level + 1);
+    const float m = level_factor * nvl;
+    const float value = band[y * band_pitch + x];
+    const float mag = value * value;
+    sfave[y * sfave_pitch + x] =
+        mag / (mag + m * exp(-mag / (9.0f * m)) + 0.01f);
+}
+
+/*
+ * ShrinkAllAB()'s local shrinkage. The chroma noise variance is the
+ * half-grid `nvc` plane, `madab` is the band's own squared MAD and `mad_l`
+ * the L band's squared MAD for the same level and direction.
+ */
+__kernel void rt_lab_wavelet_w_shrink_ab(
+    __global const float* band_ab, int ab_pitch,
+    __global const float* band_l, int l_pitch,
+    __global const float* nvc, int nvc_pitch,
+    __global float* sfave, int sfave_pitch,
+    float mad_l, float mad_ab,
+    int w, int h)
+{
+    const int x = get_global_id(0);
+    const int y = get_global_id(1);
+    if (x >= w || y >= h) {
+        return;
+    }
+    const int at = y * ab_pitch + x;
+    const float value_ab = band_ab[at];
+    const float value_l = band_l[y * l_pitch + x];
+    const float mag_ab = value_ab * value_ab;
+    const float mag_l = value_l * value_l;
+    const float noise = nvc[y * nvc_pitch + x] * mad_ab;
+    sfave[y * sfave_pitch + x] =
+        1.0f - exp(-(mag_ab / noise) - (mag_l / (9.0f * mad_l)));
+}
+
+/*
+ * ShrinkAllL()/ShrinkAllAB()'s blend of the local and box-blurred shrinkage.
+ */
+__kernel void rt_lab_wavelet_w_shrink_apply(
+    __global float* band, int band_pitch,
+    __global const float* sfave, int sfave_pitch,
+    __global const float* sfaved, int sfaved_pitch,
+    int w, int h)
+{
+    const int x = get_global_id(0);
+    const int y = get_global_id(1);
+    if (x >= w || y >= h) {
+        return;
+    }
+    const int at = y * band_pitch + x;
+    const float sf = sfave[y * sfave_pitch + x];
+    const float sfd = sfaved[y * sfaved_pitch + x];
+    band[at] *= (sfd * sfd + sf * sf) / (sfd + sf + 0.01f);
+}
+
+/*
+ * boxblur()'s horizontal pass, one work item per row. Copied from
+ * lab.tools' rt_lab_tools_box_h so the running-sum arithmetic is identical.
+ */
+__kernel void rt_lw_box_h(__global const float* src,
+                          __global float* dst,
+                          const int radius,
+                          const int width, const int height,
+                          const int pitch)
+{
+    const int row = get_global_id(1);
+    if (row >= height) {
+        return;
+    }
+
+    __global const float* s = src + row * pitch;
+    __global float* d = dst + row * pitch;
+    if (radius == 0) {
+        for (int col = 0; col < width; ++col) {
+            d[col] = s[col];
+        }
+        return;
+    }
+
+    float len = (float)radius + 1.0f;
+    float tempval = s[0];
+    for (int j = 1; j <= radius; ++j) {
+        tempval += s[j];
+    }
+    tempval /= len;
+    d[0] = tempval;
+
+    for (int col = 1; col <= radius; ++col) {
+        tempval = (tempval * len + s[col + radius]) / (len + 1.0f);
+        d[col] = tempval;
+        len += 1.0f;
+    }
+
+    for (int col = radius + 1; col < width - radius; ++col) {
+        const float departing = s[col - radius - 1];
+        tempval = tempval + (s[col + radius] - departing) / len;
+        d[col] = tempval;
+    }
+
+    for (int col = width - radius; col < width; ++col) {
+        tempval = (tempval * len - s[col - radius - 1]) / (len - 1.0f);
+        d[col] = tempval;
+        len -= 1.0f;
+    }
+}
+
+/* boxblur()'s vertical pass, one work item per column. */
+__kernel void rt_lw_box_v(__global const float* src,
+                          __global float* dst,
+                          const int radius,
+                          const int width, const int height,
+                          const int pitch)
+{
+    const int col = get_global_id(0);
+    if (col >= width) {
+        return;
+    }
+
+    if (radius == 0) {
+        for (int row = 0; row < height; ++row) {
+            dst[row * pitch + col] = src[row * pitch + col];
+        }
+        return;
+    }
+
+    float len = (float)radius + 1.0f;
+    float tempval = src[col];
+    for (int i = 1; i <= radius; ++i) {
+        tempval += src[i * pitch + col];
+    }
+    tempval /= len;
+    dst[col] = tempval;
+
+    for (int row = 1; row <= radius; ++row) {
+        tempval = (tempval * len + src[(row + radius) * pitch + col]) /
+                  (len + 1.0f);
+        dst[row * pitch + col] = tempval;
+        len += 1.0f;
+    }
+
+    const float rlen = 1.0f / len;
+    for (int row = radius + 1; row < height - radius; ++row) {
+        const float departing = src[(row - radius - 1) * pitch + col];
+        tempval = tempval +
+                  (src[(row + radius) * pitch + col] - departing) * rlen;
+        dst[row * pitch + col] = tempval;
+    }
+
+    for (int row = height - radius; row < height; ++row) {
+        const float lenm1 = len - 1.0f;
+        tempval = (tempval * len -
+                   src[(row - radius - 1) * pitch + col]) / lenm1;
+        dst[row * pitch + col] = tempval;
+        len = lenm1;
+    }
+}
 )CLC";

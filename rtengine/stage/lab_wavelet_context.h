@@ -58,7 +58,7 @@ struct ProcParams;
  * wavelet tool's own skin protection: the equaliser only changes L, so a/b
  * and their masks are identical at the start of both passes.
  */
-#define RT_LAB_WAVELET_CONTEXT_VERSION 6u
+#define RT_LAB_WAVELET_CONTEXT_VERSION 7u
 /* "LWCT": rejects a stale or unrelated pointer before any callback runs. */
 #define RT_LAB_WAVELET_CONTEXT_MAGIC 0x4C574354u
 /* The number of levels of the directional pyramid. */
@@ -165,12 +165,15 @@ struct ProcParams;
 #define RT_LAB_WAVELET_TONING_HEADER 19u
 #define RT_LAB_WAVELET_TONING_MEA_ENTRIES 10u
 /*
- * The denoise groundwork tail, present only when the standard-L denoise arm
- * is armed:
+ * The denoise tail, present only when the standard-L arm and the chroma arm
+ * the block forces at six levels are armed:
  *   [0..5] vari[0..5]
  *   [6]    ballum
- *   then levels * 3 squared madL entries, direction-major inside each level.
- * The MAD histogram is a separate device buffer argument.
+ *   then one plane-major block per plane: levels * 3 squared MAD entries,
+ *   direction-major inside each level. Plane 0 is L, planes 1 and 2 are the
+ *   a and b bands the forced chroma arm denoises.
+ * The MAD histogram is a separate internal device buffer, not a node
+ * argument.
  */
 #define RT_LAB_WAVELET_DENOISE_HEADER 7u
 #define RT_LAB_WAVELET_DENOISE_MAD_ENTRIES 3u
@@ -207,7 +210,8 @@ inline std::size_t labWaveletParamEntries(std::uint32_t planes,
     }
     if (denoise) {
         entries += RT_LAB_WAVELET_DENOISE_HEADER +
-                   static_cast<std::size_t>(levels) *
+                   static_cast<std::size_t>(planes) *
+                       static_cast<std::size_t>(levels) *
                        RT_LAB_WAVELET_DENOISE_MAD_ENTRIES;
     }
     return entries;
@@ -280,10 +284,11 @@ typedef struct RtLabWaveletWavelet {
      */
     int (*compute_final)(void* self, const float* stats, uint32_t levels);
     /*
-     * Fills the denoise tail's squared madL entries from one histogram per
-     * (level, direction), direction-major.
+     * Fills the denoise tail's squared MAD entries for one plane from one
+     * histogram per (level, direction), direction-major.
      */
-    int (*compute_mad)(void* self, const uint32_t* histogram, uint32_t levels);
+    int (*compute_mad)(void* self, const uint32_t* histogram, uint32_t levels,
+                       uint32_t plane);
 } RtLabWaveletWavelet;
 
 typedef struct RtLabWaveletContext {
@@ -365,6 +370,19 @@ inline constexpr int LAB_WAVELET_MIN_WAVELET_EDGTHRESH = -50;
 inline constexpr int LAB_WAVELET_MAX_WAVELET_EDGTHRESH = 100;
 inline constexpr double LAB_WAVELET_MIN_WAVELET_EDGEFFECT = 0.05;
 inline constexpr double LAB_WAVELET_MAX_WAVELET_EDGEFFECT = 2.5;
+/* The denoise panel's five level sliders. The widget's upper value (the
+ * strength) is the one the block reads; the lower value belongs to the
+ * denoise curve, which this unit refuses. */
+inline constexpr double LAB_WAVELET_MIN_WAVELET_NOISE = 0.0;
+inline constexpr double LAB_WAVELET_MAX_WAVELET_NOISE = 100.0;
+/* The noise-balance slider (Ballum) maps to a thirteen-entry table through
+ * index = 10 - ballum, so the widget's -2..10 range is also the table range. */
+inline constexpr double LAB_WAVELET_MIN_WAVELET_BALLUM = -2.0;
+inline constexpr double LAB_WAVELET_MAX_WAVELET_BALLUM = 10.0;
+/* The 128-pixel gate ip_wavelet() applies before it enables denoise. */
+inline constexpr int LAB_WAVELET_MIN_DENOISE_WINDOW = 128;
+/* At least one level slider must exceed this before the block denoises. */
+inline constexpr double LAB_WAVELET_DENOISE_ACTIVE = 0.1;
 /* The final panel's sigmafin slider range. */
 inline constexpr double LAB_WAVELET_MIN_WAVELET_SIGMAFIN = 0.025;
 inline constexpr double LAB_WAVELET_MAX_WAVELET_SIGMAFIN = 2.5;
@@ -470,8 +488,10 @@ public:
     /* Fill the final-curve tail from the post-contrast statistics block. */
     int computeFinalStats(const float* stats, uint32_t levels);
 
-    /* Fill the denoise tail's squared madL entries from band histograms. */
-    int computeMad(const std::uint32_t* histogram, uint32_t levels);
+    /* Fill the denoise tail's squared MAD entries for one plane from band
+     * histograms. */
+    int computeMad(const std::uint32_t* histogram, uint32_t levels,
+                   uint32_t plane);
 
 private:
     procparams::ProcParams& params_;

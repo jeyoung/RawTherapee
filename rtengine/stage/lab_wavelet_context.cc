@@ -52,10 +52,11 @@ int compute_final_thunk(void* self, const float* stats, uint32_t levels)
                                                                    levels);
 }
 
-int compute_mad_thunk(void* self, const uint32_t* histogram, uint32_t levels)
+int compute_mad_thunk(void* self, const uint32_t* histogram, uint32_t levels,
+                      uint32_t plane)
 {
-    return static_cast<LabWaveletContext*>(self)->computeMad(histogram,
-                                                             levels);
+    return static_cast<LabWaveletContext*>(self)->computeMad(histogram, levels,
+                                                             plane);
 }
 
 /*
@@ -131,6 +132,70 @@ void toningMultipliers(const procparams::WaveletParams& wavelet,
                         : 0.f;
         any = any || rg[level] != 0.f || by[level] != 0.f;
     }
+}
+
+/*
+ * The standard-L denoise panel's arithmetic plus the chroma denoise arm the
+ * block forces when Expnoise selects six levels. Only the plain slider set is
+ * ported: the denoise curves, the "cur" slim method, the expert arm and the
+ * hue modulation all stay host residuals, and a user chroma denoise or noise
+ * balance would change the forced 0.01 chroma strength.
+ */
+bool denoiseAdmitted(const procparams::WaveletParams& wavelet, int width,
+                     int height)
+{
+    if (!wavelet.enabled || !wavelet.expnoise) {
+        return false;
+    }
+    if (width <= 0 || height <= 0 ||
+        std::min(width, height) <= LAB_WAVELET_MIN_DENOISE_WINDOW) {
+        return false;
+    }
+    /* The standard WaveletDenoiseAllL/AB arms, not the BiShrink pair. */
+    if (wavelet.quamethod != "cons") {
+        return false;
+    }
+    /* The chroma strength is the block's own forced 0.01, so no user chroma
+     * denoise, no balance and no colour-by-noise may alter it. */
+    if (wavelet.chromfi != 0.0 || wavelet.chromco != 0.0 ||
+        wavelet.balchrom != 0.0 || wavelet.cbenab) {
+        return false;
+    }
+    /* The post-denoise slider refinement (slimethod "cur" and Thrden) is a
+     * separate host multiply; the expert arm changes its level pairing. */
+    if (wavelet.slimethod != "sli" || wavelet.thrden != 0.0 ||
+        wavelet.complexmethod != "normal") {
+        return false;
+    }
+    /* A non-identity hue curve modulates noisevarlum per pixel. */
+    {
+        const FlatCurve hue_curve(wavelet.wavhuecurve);
+        if (!hue_curve.isIdentity()) {
+            return false;
+        }
+    }
+    const double levels[5] = {
+        wavelet.level0noise.getTop(), wavelet.level1noise.getTop(),
+        wavelet.level2noise.getTop(), wavelet.level3noise.getTop(),
+        wavelet.leveldenoise.getTop()};
+    bool active = false;
+    for (double value : levels) {
+        if (!std::isfinite(value) ||
+            value < LAB_WAVELET_MIN_WAVELET_NOISE ||
+            value > LAB_WAVELET_MAX_WAVELET_NOISE) {
+            return false;
+        }
+        active = active || value > LAB_WAVELET_DENOISE_ACTIVE;
+    }
+    if (!active) {
+        return false;
+    }
+    if (!std::isfinite(wavelet.ballum) ||
+        wavelet.ballum < LAB_WAVELET_MIN_WAVELET_BALLUM ||
+        wavelet.ballum > LAB_WAVELET_MAX_WAVELET_BALLUM) {
+        return false;
+    }
+    return true;
 }
 
 } // namespace
@@ -273,6 +338,18 @@ int labWaveletTransformLevels(const procparams::ProcParams& params,
     if (wavelet.expnoise) {
         levwav = 6;
     }
+    /*
+     * ip_wavelet() forces the chroma denoise strength to 0.01 when Expnoise
+     * runs at six levels, and any chroma denoise strength raises the L
+     * decomposition to seven levels. The chroma planes keep six levels.
+     */
+    const bool chroma_user = wavelet.chromfi > 0.0 || wavelet.chromco > 0.0;
+    if (chroma_user && levwav < 7) {
+        levwav = 7;
+    } else if (!chroma_user && wavelet.expnoise && minwin > 128 &&
+               levwav == 6) {
+        levwav = 7;
+    }
     if (levwav == 9 && extra) {
         levwav = 10;
     }
@@ -362,9 +439,19 @@ bool labWaveletWaveletSupported(const procparams::ProcParams& params,
     const bool edge_active = edge && wavelet.edgval > 0;
     const bool final_curves = wavelet.expfinal;
     const bool toning = wavelet.exptoning;
-    if ((!contrast && !chroma && !edge_active && !final_curves && !toning) ||
-        wavelet.expbl || wavelet.expresid || wavelet.expnoise ||
-        wavelet.expclari) {
+    const bool denoise = wavelet.expnoise;
+    if ((!contrast && !chroma && !edge_active && !final_curves && !toning &&
+         !denoise) ||
+        wavelet.expbl || wavelet.expresid || wavelet.expclari) {
+        return false;
+    }
+    /*
+     * The standard denoise arm. ip_wavelet() forces six levels and, at six
+     * levels, forces the chroma denoise strength to 0.01 when the profile's
+     * own strength is zero, so the host always denoises the a and b bands as
+     * well. The admitted set is the plain slider arm only.
+     */
+    if (denoise && !denoiseAdmitted(wavelet, width, height)) {
         return false;
     }
     /*
@@ -924,12 +1011,12 @@ int LabWaveletContext::build(RtLabWaveletResult& out)
      * a `!cp.edgeena`/`!cp.finena`/`!cp.toningena` condition, so a/b are
      * decomposed and reconstructed even with Expchroma off. The round trip is
      * not an exact identity, so the device must run it to match the block. The
-     * chroma multiply itself is still gated by its own flags in the kernel.
+     * denoise arm adds the forced chroma denoise, which needs the a/b planes
+     * too.
      */
+    wavelet_denoise_ = denoiseAdmitted(params_.wavelet, width_, height_);
     wavelet_ab_ = wavelet_chroma_ || wavelet_edge_ || wavelet_final_ ||
-                  wavelet_toning_;
-    /* The standard-L denoise arm is armed by the next groundwork step. */
-    wavelet_denoise_ = false;
+                  wavelet_toning_ || wavelet_denoise_;
 
     if (levels_ > 0) {
         if (width_ < 8 || height_ < 8) {
@@ -1188,6 +1275,67 @@ int LabWaveletContext::build(RtLabWaveletResult& out)
                     by[level];
             }
         }
+        if (wavelet_denoise_) {
+            const std::size_t denoise_offset =
+                RT_LAB_WAVELET_WAVELET_PARAMS +
+                planes * static_cast<std::size_t>(wavelet_levels_) *
+                    RT_LAB_WAVELET_MEA_ENTRIES +
+                (wavelet_edge_
+                     ? 1 + static_cast<std::size_t>(wavelet_levels_) *
+                               RT_LAB_WAVELET_EDGE_ENTRIES +
+                           RT_LAB_WAVELET_CURVE_ENTRIES
+                     : 0) +
+                (wavelet_final_
+                     ? 1 + static_cast<std::size_t>(wavelet_levels_) *
+                               RT_LAB_WAVELET_FINAL_STATS_ENTRIES +
+                           RT_LAB_WAVELET_CURVE_ENTRIES +
+                           RT_LAB_WAVELET_FINAL_LUT_ENTRIES
+                     : 0) +
+                (wavelet_toning_
+                     ? RT_LAB_WAVELET_TONING_HEADER +
+                           2 * static_cast<std::size_t>(wavelet_levels_) *
+                               RT_LAB_WAVELET_TONING_MEA_ENTRIES
+                     : 0);
+            float* denoise_tail = table + denoise_offset;
+            const float lev[5] = {
+                static_cast<float>(wavelet.level0noise.getTop()),
+                static_cast<float>(wavelet.level1noise.getTop()),
+                static_cast<float>(wavelet.level2noise.getTop()),
+                static_cast<float>(wavelet.level3noise.getTop()),
+                static_cast<float>(wavelet.leveldenoise.getTop())};
+            /* ip_wavelet(): vari[0..2], then kr3 and kr4 on vari[3..5]. The
+             * multipliers are part of the denoise arithmetic, not a curve. */
+            const auto variance = [](float value) {
+                return 0.8f *
+                       SQR((value / 125.f) * (1.f + value / 25.f));
+            };
+            float kr3 = 1.f;
+            if (lev[3] < 10.f) {
+                kr3 = 0.3f;
+            } else if (lev[3] < 30.f) {
+                kr3 = 0.6f;
+            } else if (lev[3] < 70.f) {
+                kr3 = 0.8f;
+            }
+            float kr4 = 1.f;
+            if (lev[4] < 10.f) {
+                kr4 = 0.6f;
+            } else if (lev[4] < 30.f) {
+                kr4 = 0.8f;
+            } else if (lev[4] < 70.f) {
+                kr4 = 0.9f;
+            }
+            denoise_tail[0] = std::max(0.000001f, variance(lev[0]));
+            denoise_tail[1] = std::max(0.000001f, variance(lev[1]));
+            denoise_tail[2] = std::max(0.000001f, variance(lev[2]));
+            denoise_tail[3] =
+                std::max(0.000001f, kr3 * variance(lev[3]));
+            denoise_tail[4] =
+                std::max(0.000001f, kr4 * variance(lev[4]));
+            denoise_tail[5] =
+                std::max(0.000001f, kr4 * variance(lev[4]));
+            denoise_tail[6] = static_cast<float>(wavelet.ballum);
+        }
     }
 
     built_ = true;
@@ -1383,10 +1531,11 @@ int LabWaveletContext::computeFinalStats(const float* stats, uint32_t levels)
 }
 
 int LabWaveletContext::computeMad(const std::uint32_t* histogram,
-                                  uint32_t levels)
+                                  uint32_t levels, uint32_t plane)
 {
     const uint32_t planes = wavelet_ab_ ? 3u : 1u;
     if (!wavelet_active_ || !wavelet_denoise_ || histogram == nullptr ||
+        plane >= planes ||
         levels != static_cast<uint32_t>(wavelet_levels_) || levels < 1 ||
         levels > RT_LAB_WAVELET_MAX_TRANSFORM_LEVELS) {
         return 1;
@@ -1424,7 +1573,7 @@ int LabWaveletContext::computeMad(const std::uint32_t* histogram,
                 histogram +
                 (static_cast<std::size_t>(level) * 3 + dir) * 32768u;
             const float mad = labWaveletMadFromHistogram(band, samples);
-            tail[static_cast<std::size_t>(level) *
+            tail[(static_cast<std::size_t>(plane) * levels + level) *
                      RT_LAB_WAVELET_DENOISE_MAD_ENTRIES +
                  dir] = SQR(mad);
         }
