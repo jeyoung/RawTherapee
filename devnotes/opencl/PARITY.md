@@ -88,6 +88,18 @@ pairs are exact. The gate is the peak absolute error (PAE) in normalised units;
 | 2026-11-01 | 0abd76894..5781f1c38 | POCL (CPU) | 10-case toning residual matrix (protab on, sigmaton low/high, no opacity multiplier, expnoise, expbl, expresid, expclari, CLmethod one, skin protection), `stage-residency-test` | device vs host block | 0 (host) | PASS |
 | 2026-11-02 | 89e0a844b..47b9980fb | POCL (CPU) | colorspace_flowers.pef / `labtools-labcurve-contrast.pp3` (Lab curves with contrast 30, L/a/b/cc/lc/cl tables), `lab.tools` | off vs auto, 16-bit TIFF | 0 (exact) | PASS |
 | 2026-11-02 | 89e0a844b..47b9980fb | POCL (CPU) | 3-case Lab-contrast matrix (contrast 5, contrast 15 with L curve+brightness, contrast 30 with all six tables), `stage-residency-test` | device vs host block | 0 (exact) | PASS |
+| 2026-11-02 | uncommitted | POCL (CPU) | colorspace_flowers.pef / `labtools-labcurve-contrast.pp3` with `Gamutmunse=XYZ`, `lab.tools` | off vs auto, 16-bit TIFF | 0 (exact) | PASS |
+| 2026-11-02 | uncommitted | POCL (CPU) | colorspace_flowers.pef / `labtools-labcurve-contrast.pp3` with `Gamutmunse=XYZREL`, `lab.tools` | off vs auto, 16-bit TIFF | 0 (exact) | PASS |
+| 2026-11-02 | uncommitted | POCL (CPU) | 4-case lab.tools XYZ/XYZREL Lab-curve matrix (XYZ with all six tables on the saturated image, XYZREL, XYZ neutral, XYZ with the three hue curves), `stage-residency-test` | device vs host block | 0.753906 LSB16 (worst), 0 over 1 | PASS |
+
+The XYZ and XYZREL rows use `ICCStore::workingSpaceMatrix()` as
+`Color::gamutmap()`'s `p`, which is the host's `wp` in
+`chromiLuminanceCurve()`: row-major, with the RGB tristimulus primaries in
+the columns. `Color::primaries_to_xyz()` builds the same matrix for the
+output-gamut control in `iplab2rgb.cc`; it is not this block's argument. The
+device export records `"impl":"opencl"` for `lab.tools` in both rows, and the
+device runs `XYZREL` with the block's `0.5` halfway blend, not the local
+adjustments' `0.3`.
 
 `47c50ee77` changes only CPU export buffer handling; the OpenCL rows above
 re-run the existing GPU stages against the new CPU neighbour.

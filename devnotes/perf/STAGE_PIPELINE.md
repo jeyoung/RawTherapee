@@ -129,7 +129,15 @@ node, and the builtin runs the block. The three curves are gated by
 minimum a curve in the profile is ignored rather than refused. L=f(H) runs the
 block's gamut loop through `Color::xyz2rgb()` on the double working-space
 inverse, so the launcher requires the double matrix and refuses the pass
-without it. `chromiLuminanceCurve()`'s black-and-white output
+without it. The XYZ and XYZREL Munsell methods are device cases too: the
+kernel ports `Color::gamutmap()` with its double lam ratios, reading the same
+`ICCStore::workingSpaceMatrix()` the host passes as `wp` (row-major, RGB
+primaries in the columns), then rebuilds L, HH, the chroma and the direction
+through `Color::XYZ2Lab()`. XYZREL blends the projection halfway back to the
+original XYZ with the host block's `0.5` factor; the local adjustments'
+`0.3` is a different block. Both methods run the block's Munsell arm as well,
+so every non-NONE method needs the exported Munsell table set.
+`chromiLuminanceCurve()`'s black-and-white output
 is a device case through the same slot. The cheap early return covers
 `blackwhite.enabled` with the Lab curves off: the block only sets a and b to
 zero and leaves L untouched, and the `rt_lab_tools_bw` kernel repeats that
@@ -193,8 +201,8 @@ regions, mask curves that are empty, `FCT_Linear` or a `FCT_MinMaxCPoints`
 curve the host table can follow, and every slider inside the ABI range.
 Everything else in the block is a residual: a chromaticity
 slider outside its -100..100 GUI range, a C=f(H), L=f(H) or H=f(H) curve the
-host table cannot follow within 5e-7 or the node budget, the LAB, XYZ and
-XYZREL Munsell methods (they need `gamutLchonly()` and `gamutmap()`), a
+host table cannot follow within 5e-7 or the node budget, the LAB Munsell
+method (it needs `gamutLchonly()`), a
 denoise chroma factor, a local contrast outside the ABI range, a local
 contrast below sigma 25 on a host built without SSE2, EPD, black-and-white
 output with colour toning (the block's `bwonly` is then false, so neither
@@ -302,7 +310,7 @@ panes records them separately. Both tools are off by default.
 | `transform` | Full/Full/Roi/- | path | reuse-input | rotation, distortion, perspective, CA, vignetting, gradient, post-crop vignette, dehaze, Fattal | yes |
 | `local.adjustments` | Full/Full/Roi/Reduced | path | reuse-input | local lab / selective editing | partial |
 | `rgb.proc` | Full/Full/Roi/Reduced | path | reuse-input | RGB curves, tone curve, colour toning, B&W, channel mixer, HSV, film simulation | yes |
-| `lab.tools` | Full/Full/Roi/Reduced | path | reuse-input | shadows/highlights, vibrance, Lab curves (including non-zero contrast, the chromaticity slider and the C=f(H)/L=f(H)/H=f(H) hue flat curves), local contrast, black-and-white (cheap and `bwToning` arms), EPD, Lab-grid colour toning and Lab colour-correction regions | partial |
+| `lab.tools` | Full/Full/Roi/Reduced | path | reuse-input | shadows/highlights, vibrance, Lab curves (including non-zero contrast, the chromaticity slider, the C=f(H)/L=f(H)/H=f(H) hue flat curves and the NONE/XYZ/XYZREL/MUN gamut methods), local contrast, black-and-white (cheap and `bwToning` arms), EPD, Lab-grid colour toning and Lab colour-correction regions | partial |
 | `lab.sharpening` | Full/-/Roi/- | path | reuse-input | impulse denoise and defringe (own node), ML sharpen edges, ML microcontrast and the main sharpen pass (shared `output.sharpen` node) | partial |
 | `lab.wavelet` | Full/Full/Roi/Reduced | path | reuse-input | directional pyramid equaliser and wavelet contrast, chroma `link`, edge plain arm, final curves and the toning zero-protection arm | partial |
 | `working.trc` | Full/Full/Roi/- | path | reuse-input | soft light, tone equaliser and working-TRC conversion | partial |
