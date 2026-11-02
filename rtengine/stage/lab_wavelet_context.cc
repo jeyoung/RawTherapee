@@ -339,9 +339,12 @@ int labWaveletTransformLevels(const procparams::ProcParams& params,
         levwav = 6;
     }
     /*
-     * ip_wavelet() forces the chroma denoise strength to 0.01 when Expnoise
-     * runs at six levels, and any chroma denoise strength raises the L
-     * decomposition to seven levels. The chroma planes keep six levels.
+     * `levwav` is ip_wavelet()'s base decomposition level: the MaxLev
+     * slider, forced to six by Expnoise. The chroma panel, and the chroma
+     * denoise Expnoise forces, raise only the L decomposition (`levwavL`) to
+     * seven. `levwava` and `levwavb` start from the same base and are then
+     * clamped with `min(levwav, levwava)`, so the a and b planes keep this
+     * base count and do not follow L to seven.
      */
     const bool chroma_user = wavelet.chromfi > 0.0 || wavelet.chromco > 0.0;
     if (chroma_user && levwav < 7) {
@@ -912,6 +915,7 @@ RtLabWaveletContext LabWaveletContext::descriptor(bool supported)
     context.wavelet.final = wavelet_final_ ? 1u : 0u;
     context.wavelet.toning = wavelet_toning_ ? 1u : 0u;
     context.wavelet.denoise = wavelet_denoise_ ? 1u : 0u;
+    context.wavelet.final_refresh = wavelet_final_refresh_ ? 1u : 0u;
     context.wavelet.compute_mad = &compute_mad_thunk;
     context.wavelet.entries = static_cast<uint32_t>(
         wavelet_params_.size());
@@ -1068,6 +1072,45 @@ int LabWaveletContext::build(RtLabWaveletResult& out)
     wavelet_active_ = params_.wavelet.enabled && wavelet_levels_ >= 1;
     if (params_.wavelet.enabled && !wavelet_active_) {
         return 3;
+    }
+    {
+        /*
+         * ip_wavelet() re-evaluates the L statistics after the contrast,
+         * edge and final multiplies only when
+         * `cp.val > 0 || ref || contr || cp.diagcurv` (ipwavelet.cc:1573).
+         * Otherwise finalContAllL() keeps the statistics Evaluate2() built
+         * before the denoise and the multiply. cp.val is the edge strength,
+         * ref a non-zero noise-curve bottom under the 128-pixel gate, contr
+         * any level multiplier below the L count and diagcurv a non-identity
+         * WL opacity curve.
+         */
+        const procparams::WaveletParams& wavelet = params_.wavelet;
+        const bool noiseena =
+            wavelet.expnoise &&
+            std::min(width_, height_) > LAB_WAVELET_MIN_DENOISE_WINDOW;
+        const bool ref =
+            noiseena && (wavelet.level0noise.getBottom() > 0.0 ||
+                         wavelet.level1noise.getBottom() > 0.0 ||
+                         wavelet.level2noise.getBottom() > 0.0 ||
+                         wavelet.level3noise.getBottom() > 0.0);
+        bool contr = false;
+        for (int level = 0; level < wavelet_levels_; ++level) {
+            /* cp.mul[f] is c[f] below MaxLev and sup at index 9. */
+            double value = 0.0;
+            if (level == 9) {
+                value = wavelet.sup;
+            } else if (level < wavelet.thres && level < 9) {
+                value = wavelet.c[level];
+            }
+            if (value != 0.0) {
+                contr = true;
+            }
+        }
+        WavOpacityCurveWL opacity_curve;
+        opacity_curve.Set(wavelet.opacityCurveWL);
+        const bool diagcurv = static_cast<bool>(opacity_curve);
+        wavelet_final_refresh_ = wavelet.edgval > 0 || ref || contr ||
+                                 diagcurv;
     }
     if (wavelet_active_) {
         if (width_ <= 0 || height_ <= 0 ||
@@ -1347,10 +1390,10 @@ int LabWaveletContext::computeMea(const float* stats, uint32_t levels,
                                   uint32_t plane)
 {
     const uint32_t planes = wavelet_ab_ ? 3u : 1u;
+    const uint32_t stride = static_cast<uint32_t>(wavelet_levels_);
     if (!wavelet_active_ || stats == nullptr || plane >= planes ||
-        levels != static_cast<uint32_t>(wavelet_levels_) ||
-        levels < 1 ||
-        levels > RT_LAB_WAVELET_MAX_TRANSFORM_LEVELS) {
+        levels < 1 || levels > stride ||
+        stride > RT_LAB_WAVELET_MAX_TRANSFORM_LEVELS) {
         return 1;
     }
 
@@ -1365,13 +1408,13 @@ int LabWaveletContext::computeMea(const float* stats, uint32_t levels,
         plane == 0 ? static_cast<float>(params_.wavelet.offset) : 1.f;
     float* mea = wavelet_params_.data() + RT_LAB_WAVELET_WAVELET_PARAMS +
                  static_cast<std::size_t>(plane) *
-                     static_cast<std::size_t>(levels) *
+                     static_cast<std::size_t>(stride) *
                      RT_LAB_WAVELET_MEA_ENTRIES;
     float* edge_mea = nullptr;
     const std::size_t edge_offset =
         RT_LAB_WAVELET_WAVELET_PARAMS +
         static_cast<std::size_t>(planes) *
-            static_cast<std::size_t>(levels) *
+            static_cast<std::size_t>(stride) *
             RT_LAB_WAVELET_MEA_ENTRIES;
     if (wavelet_edge_ && plane == 0) {
         edge_mea = wavelet_params_.data() + edge_offset + 1;
@@ -1381,14 +1424,14 @@ int LabWaveletContext::computeMea(const float* stats, uint32_t levels,
         const std::size_t final_offset =
             edge_offset +
             (wavelet_edge_
-                 ? 1 + static_cast<std::size_t>(levels) *
+                 ? 1 + static_cast<std::size_t>(stride) *
                            RT_LAB_WAVELET_EDGE_ENTRIES +
                        RT_LAB_WAVELET_CURVE_ENTRIES
                  : 0);
         const std::size_t toning_offset =
             final_offset +
             (wavelet_final_
-                 ? 1 + static_cast<std::size_t>(levels) *
+                 ? 1 + static_cast<std::size_t>(stride) *
                            RT_LAB_WAVELET_FINAL_STATS_ENTRIES +
                        RT_LAB_WAVELET_CURVE_ENTRIES +
                        RT_LAB_WAVELET_FINAL_LUT_ENTRIES
@@ -1396,7 +1439,7 @@ int LabWaveletContext::computeMea(const float* stats, uint32_t levels,
         toning_mea = wavelet_params_.data() + toning_offset +
                      RT_LAB_WAVELET_TONING_HEADER +
                      static_cast<std::size_t>(plane - 1) *
-                         static_cast<std::size_t>(levels) *
+                         static_cast<std::size_t>(stride) *
                          RT_LAB_WAVELET_TONING_MEA_ENTRIES;
     }
 
@@ -1534,32 +1577,32 @@ int LabWaveletContext::computeMad(const std::uint32_t* histogram,
                                   uint32_t levels, uint32_t plane)
 {
     const uint32_t planes = wavelet_ab_ ? 3u : 1u;
+    const uint32_t stride = static_cast<uint32_t>(wavelet_levels_);
     if (!wavelet_active_ || !wavelet_denoise_ || histogram == nullptr ||
-        plane >= planes ||
-        levels != static_cast<uint32_t>(wavelet_levels_) || levels < 1 ||
-        levels > RT_LAB_WAVELET_MAX_TRANSFORM_LEVELS) {
+        plane >= planes || levels < 1 || levels > stride ||
+        stride > RT_LAB_WAVELET_MAX_TRANSFORM_LEVELS) {
         return 1;
     }
 
     const std::size_t denoise_offset =
         RT_LAB_WAVELET_WAVELET_PARAMS +
         static_cast<std::size_t>(planes) *
-            static_cast<std::size_t>(levels) *
+            static_cast<std::size_t>(stride) *
             RT_LAB_WAVELET_MEA_ENTRIES +
         (wavelet_edge_
-             ? 1 + static_cast<std::size_t>(levels) *
+             ? 1 + static_cast<std::size_t>(stride) *
                        RT_LAB_WAVELET_EDGE_ENTRIES +
                    RT_LAB_WAVELET_CURVE_ENTRIES
              : 0) +
         (wavelet_final_
-             ? 1 + static_cast<std::size_t>(levels) *
+             ? 1 + static_cast<std::size_t>(stride) *
                        RT_LAB_WAVELET_FINAL_STATS_ENTRIES +
                    RT_LAB_WAVELET_CURVE_ENTRIES +
                    RT_LAB_WAVELET_FINAL_LUT_ENTRIES
              : 0) +
         (wavelet_toning_
              ? RT_LAB_WAVELET_TONING_HEADER +
-                   2 * static_cast<std::size_t>(levels) *
+                   2 * static_cast<std::size_t>(stride) *
                        RT_LAB_WAVELET_TONING_MEA_ENTRIES
              : 0);
     float* tail = wavelet_params_.data() + denoise_offset +
@@ -1573,7 +1616,7 @@ int LabWaveletContext::computeMad(const std::uint32_t* histogram,
                 histogram +
                 (static_cast<std::size_t>(level) * 3 + dir) * 32768u;
             const float mad = labWaveletMadFromHistogram(band, samples);
-            tail[(static_cast<std::size_t>(plane) * levels + level) *
+            tail[(static_cast<std::size_t>(plane) * stride + level) *
                      RT_LAB_WAVELET_DENOISE_MAD_ENTRIES +
                  dir] = SQR(mad);
         }

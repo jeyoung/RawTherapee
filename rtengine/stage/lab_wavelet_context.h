@@ -58,7 +58,7 @@ struct ProcParams;
  * wavelet tool's own skin protection: the equaliser only changes L, so a/b
  * and their masks are identical at the start of both passes.
  */
-#define RT_LAB_WAVELET_CONTEXT_VERSION 7u
+#define RT_LAB_WAVELET_CONTEXT_VERSION 8u
 /* "LWCT": rejects a stale or unrelated pointer before any callback runs. */
 #define RT_LAB_WAVELET_CONTEXT_MAGIC 0x4C574354u
 /* The number of levels of the directional pyramid. */
@@ -260,6 +260,10 @@ typedef struct RtLabWaveletResult {
 typedef struct RtLabWaveletWavelet {
     /* 1 when the call site admits the wavelet pass on the device. */
     uint32_t active;
+    /* L's transform level count. The a and b planes run ip_wavelet()'s base
+     * decomposition level, which is lower whenever only the chroma panel or
+     * the forced chroma denoise raises L to seven; the parameter table is
+     * always laid out with this stride. */
     uint32_t levels;
     uint32_t taps;
     uint32_t entries;
@@ -273,7 +277,23 @@ typedef struct RtLabWaveletWavelet {
     uint32_t toning;
     /* 1 when the denoise tail is present in `params`. */
     uint32_t denoise;
+    /*
+     * 1 when ip_wavelet() re-evaluates the L statistics after the contrast,
+     * edge and final multiplies: `cp.val > 0 || ref || contr || cp.diagcurv`
+     * at ipwavelet.cc:1573. A zero value means the block passes the
+     * statistics Evaluate2() produced before the denoise and the contrast
+     * multiply to finalContAllL(), so the final tail must be built from that
+     * earlier block. Evaluated by the host; the launcher never re-derives it.
+     */
+    uint32_t final_refresh;
     float* params;
+    /*
+     * Fills one plane's per-level mea blocks from the statistics the device
+     * computed for it. `levels` is the number of levels that plane ran, which
+     * can be smaller than the table's stride: the a and b planes keep
+     * ip_wavelet()'s base decomposition level while L keeps seven. Entries
+     * above `levels` are left untouched.
+     */
     int (*compute_mea)(void* self, const float* stats, uint32_t levels,
                        uint32_t plane);
     /*
@@ -285,7 +305,8 @@ typedef struct RtLabWaveletWavelet {
     int (*compute_final)(void* self, const float* stats, uint32_t levels);
     /*
      * Fills the denoise tail's squared MAD entries for one plane from one
-     * histogram per (level, direction), direction-major.
+     * histogram per (level, direction), direction-major. `levels` is the
+     * number of levels that plane ran, as for compute_mea().
      */
     int (*compute_mad)(void* self, const uint32_t* histogram, uint32_t levels,
                        uint32_t plane);
@@ -409,10 +430,12 @@ float labWaveletMadFromHistogram(const std::uint32_t* histogram,
                                  std::uint32_t samples);
 
 /*
- * The number of transform levels ip_wavelet() actually builds for this image:
- * the MaxLev slider, trimmed by the image-size caps, the ContExtra level and
- * the trailing zero contrast multipliers. Zero means the block returns before
- * the decomposition. The device reproduces this derivation exactly.
+ * The number of transform levels ip_wavelet() actually builds for the L
+ * plane: the MaxLev slider, trimmed by the image-size caps, the ContExtra
+ * level and the trailing zero contrast multipliers. Zero means the block
+ * returns before the decomposition. The device reproduces this derivation
+ * exactly. The a and b planes are not raised with L: ip_wavelet() clamps
+ * levwava and levwavb with min(levwav, ...), so they keep the base level.
  */
 int labWaveletTransformLevels(const procparams::ProcParams& params,
                               int width, int height);
@@ -518,6 +541,7 @@ private:
     bool wavelet_toning_ = false;
     bool wavelet_denoise_ = false;
     bool wavelet_ab_ = false;
+    bool wavelet_final_refresh_ = false;
     int wavelet_levels_ = 0;
     float wavelet_skinprotect_ = 0.f;
     float wavelet_b_l_ = 0.f;

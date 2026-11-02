@@ -6067,6 +6067,8 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
              context->wavelet.toning != 1) ||
             (context->wavelet.denoise != 0 &&
              context->wavelet.denoise != 1) ||
+            (context->wavelet.final_refresh != 0 &&
+             context->wavelet.final_refresh != 1) ||
             (context->wavelet.denoise != 0 &&
              context->wavelet.compute_mad == nullptr)) {
             error = "lab.wavelet wavelet pass is not set up";
@@ -6781,7 +6783,8 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
          */
         auto forward_analysis = [&](cl_mem plane_memory, cl_int plane_pitch,
                                     StageDeviceBufferPtr (*bandset)[3],
-                                    StageDeviceBufferPtr* lowset) -> bool {
+                                    StageDeviceBufferPtr* lowset,
+                                    int levels) -> bool {
             /* Level 0: the decimated 8-tap Daubechies analysis. */
             {
                 bool ok = true;
@@ -6853,7 +6856,7 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
             }
 
             /* Levels 1..levels-1: the undecimated Haar analysis. */
-            for (int level = 1; level < wavelet_levels; ++level) {
+            for (int level = 1; level < levels; ++level) {
                 const int skip = 1 << (level - 1);
                 cl_mem src = memory_of(lowset[(level - 1) % 2]);
                 cl_int src_pitch = pitch_of(lowset[(level - 1) % 2]);
@@ -6909,9 +6912,9 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
         };
 
         auto statistics = [&](StageDeviceBufferPtr (*bandset)[3],
-                              uint32_t plane_index) -> bool {
+                              uint32_t plane_index, int levels) -> bool {
             /* Per-band statistics, one work item per band. */
-            for (int level = 0; level < wavelet_levels; ++level) {
+            for (int level = 0; level < levels; ++level) {
                 cl_mem band1 = memory_of(bandset[level][0]);
                 cl_mem band2 = memory_of(bandset[level][1]);
                 cl_mem band3 = memory_of(bandset[level][2]);
@@ -6951,8 +6954,7 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
             }
             if (context->wavelet.compute_mea(
                     context->self, stats_host.data(),
-                    static_cast<uint32_t>(wavelet_levels),
-                    plane_index) != 0) {
+                    static_cast<uint32_t>(levels), plane_index) != 0) {
                 error = "lab.wavelet mea build failed";
                 return false;
             }
@@ -7144,54 +7146,67 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
         auto final_curve = [&](StageDeviceBufferPtr (*bandset)[3],
                                uint32_t plane_index) -> bool {
             /*
-             * finalContAllL() uses the statistics Evaluate2() recomputes
-             * after the contrast and edge passes, not the pre-contrast
-             * statistics the mea blocks were built from. Re-run the per-band
-             * statistics now that the bands are multiplied, then build the
-             * final tail and apply the coefficient curve to every level.
+             * finalContAllL() reads the statistics Evaluate2() built just
+             * before it. ip_wavelet() re-evaluates them after the contrast,
+             * edge and final multiplies only when
+             * `cp.val > 0 || ref || contr || cp.diagcurv` (ipwavelet.cc:1573);
+             * otherwise the block keeps the statistics Evaluate2() built
+             * before the denoise and the multiply. The host evaluates that
+             * condition and passes it as `final_refresh`.
              */
             if (wavelet_final && plane_index == 0) {
-                for (int level = 0; level < wavelet_levels; ++level) {
-                    cl_mem band1 = memory_of(bandset[level][0]);
-                    cl_mem band2 = memory_of(bandset[level][1]);
-                    cl_mem band3 = memory_of(bandset[level][2]);
-                    cl_int bp1 = pitch_of(bandset[level][0]);
-                    cl_int bp2 = pitch_of(bandset[level][1]);
-                    cl_int bp3 = pitch_of(bandset[level][2]);
-                    cl_int cl_bands = 3;
-                    cl_int stats_offset = level * 3 * static_cast<int>(
-                                                          RT_LAB_WAVELET_STATS_PER_BAND);
-                    bool ok = true;
-                    ok = ok && set_arg(stats_kernel, 0, sizeof(cl_mem),
-                                       &band1);
-                    ok = ok && set_arg(stats_kernel, 1, sizeof(cl_int), &bp1);
-                    ok = ok && set_arg(stats_kernel, 2, sizeof(cl_mem),
-                                       &band2);
-                    ok = ok && set_arg(stats_kernel, 3, sizeof(cl_int), &bp2);
-                    ok = ok && set_arg(stats_kernel, 4, sizeof(cl_mem),
-                                       &band3);
-                    ok = ok && set_arg(stats_kernel, 5, sizeof(cl_int), &bp3);
-                    ok = ok && set_arg(stats_kernel, 6, sizeof(cl_mem),
-                                       &stats_memory);
-                    ok = ok && set_arg(stats_kernel, 7, sizeof(cl_int),
-                                       &stats_offset);
-                    ok = ok && set_arg(stats_kernel, 8, sizeof(cl_int),
-                                       &cl_half_w);
-                    ok = ok && set_arg(stats_kernel, 9, sizeof(cl_int),
-                                       &cl_half_h);
-                    ok = ok && set_arg(stats_kernel, 10, sizeof(cl_int),
-                                       &cl_bands);
-                    if (!ok || !launch(stats_kernel, stats_global,
-                                       "lab.wavelet final statistics")) {
-                        error = "lab.wavelet final statistics arguments "
+                if (context->wavelet.final_refresh != 0) {
+                    /*
+                     * Re-run the per-band statistics now that the bands are
+                     * multiplied; `stats_host` still holds the block's own
+                     * pre-contrast pass when the refresh is skipped.
+                     */
+                    for (int level = 0; level < wavelet_levels; ++level) {
+                        cl_mem band1 = memory_of(bandset[level][0]);
+                        cl_mem band2 = memory_of(bandset[level][1]);
+                        cl_mem band3 = memory_of(bandset[level][2]);
+                        cl_int bp1 = pitch_of(bandset[level][0]);
+                        cl_int bp2 = pitch_of(bandset[level][1]);
+                        cl_int bp3 = pitch_of(bandset[level][2]);
+                        cl_int cl_bands = 3;
+                        cl_int stats_offset = level * 3 * static_cast<int>(
+                                                              RT_LAB_WAVELET_STATS_PER_BAND);
+                        bool ok = true;
+                        ok = ok && set_arg(stats_kernel, 0, sizeof(cl_mem),
+                                           &band1);
+                        ok = ok && set_arg(stats_kernel, 1, sizeof(cl_int),
+                                           &bp1);
+                        ok = ok && set_arg(stats_kernel, 2, sizeof(cl_mem),
+                                           &band2);
+                        ok = ok && set_arg(stats_kernel, 3, sizeof(cl_int),
+                                           &bp2);
+                        ok = ok && set_arg(stats_kernel, 4, sizeof(cl_mem),
+                                           &band3);
+                        ok = ok && set_arg(stats_kernel, 5, sizeof(cl_int),
+                                           &bp3);
+                        ok = ok && set_arg(stats_kernel, 6, sizeof(cl_mem),
+                                           &stats_memory);
+                        ok = ok && set_arg(stats_kernel, 7, sizeof(cl_int),
+                                           &stats_offset);
+                        ok = ok && set_arg(stats_kernel, 8, sizeof(cl_int),
+                                           &cl_half_w);
+                        ok = ok && set_arg(stats_kernel, 9, sizeof(cl_int),
+                                           &cl_half_h);
+                        ok = ok && set_arg(stats_kernel, 10, sizeof(cl_int),
+                                           &cl_bands);
+                        if (!ok || !launch(stats_kernel, stats_global,
+                                           "lab.wavelet final statistics")) {
+                            error = "lab.wavelet final statistics arguments "
+                                    "failed";
+                            return false;
+                        }
+                    }
+                    if (residency->readback(stats_device, stats_view) !=
+                        RT_STAGE_OK) {
+                        error = "lab.wavelet final statistics readback "
                                 "failed";
                         return false;
                     }
-                }
-                if (residency->readback(stats_device, stats_view) !=
-                    RT_STAGE_OK) {
-                    error = "lab.wavelet final statistics readback failed";
-                    return false;
                 }
                 if (context->wavelet.compute_final(
                         context->self, stats_host.data(),
@@ -7248,10 +7263,10 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
         auto synthesize = [&](StageDeviceBufferPtr (*bandset)[3],
                               StageDeviceBufferPtr* lowset,
                               cl_mem plane_memory, cl_int plane_pitch,
-                              uint32_t plane_index) -> bool {
+                              uint32_t plane_index, int levels) -> bool {
             /* Reconstruction: the Haar levels first, then level 0. */
-            const int coeff_index = (wavelet_levels - 1) % 2;
-            for (int level = wavelet_levels - 1; level >= 1; --level) {
+            const int coeff_index = (levels - 1) % 2;
+            for (int level = levels - 1; level >= 1; --level) {
                 const int skip = 1 << (level - 1);
                 cl_int cl_skip = skip;
                 cl_mem low_memory = memory_of(lowset[coeff_index]);
@@ -7391,12 +7406,12 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
         auto run_plane = [&](cl_mem plane_memory, cl_int plane_pitch,
                              uint32_t plane_index) -> bool {
             return forward_analysis(plane_memory, plane_pitch, bands,
-                                    wavelet_low) &&
-                   statistics(bands, plane_index) &&
+                                    wavelet_low, wavelet_levels) &&
+                   statistics(bands, plane_index, wavelet_levels) &&
                    multiply(bands, wavelet_low, plane_index) &&
                    final_curve(bands, plane_index) &&
                    synthesize(bands, wavelet_low, plane_memory, plane_pitch,
-                              plane_index);
+                              plane_index, wavelet_levels);
         };
 
         /*
@@ -7405,14 +7420,14 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
          * copy before each upload.
          */
         auto run_mad = [&](StageDeviceBufferPtr (*bandset)[3],
-                           uint32_t plane_index) -> bool {
+                           uint32_t plane_index, int levels) -> bool {
             std::fill(histogram_host.begin(), histogram_host.end(), 0.f);
             if (residency->upload(histogram_device, histogram_view) !=
                 RT_STAGE_OK) {
                 error = "lab.wavelet histogram upload failed";
                 return false;
             }
-            for (int level = 0; level < wavelet_levels; ++level) {
+            for (int level = 0; level < levels; ++level) {
                 cl_mem band1 = memory_of(bandset[level][0]);
                 cl_mem band2 = memory_of(bandset[level][1]);
                 cl_mem band3 = memory_of(bandset[level][2]);
@@ -7449,7 +7464,7 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
                     context->self,
                     reinterpret_cast<const std::uint32_t*>(
                         histogram_host.data()),
-                    static_cast<uint32_t>(wavelet_levels), plane_index) != 0) {
+                    static_cast<uint32_t>(levels), plane_index) != 0) {
                 error = "lab.wavelet MAD build failed";
                 return false;
             }
@@ -7758,33 +7773,43 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
              * WaveletDenoiseAllL() runs on the pre-contrast L bands, the
              * contrast and edge passes follow, and L is not reconstructed
              * yet because the forced chroma denoise reads its coefficients.
+             * ip_wavelet() clamps levwava and levwavb with min(levwav, ...),
+             * so the a and b planes run ip_wavelet()'s base decomposition
+             * level, which the forced Expnoise arm fixes at six, while L
+             * keeps seven. Every per-plane pass therefore takes its own
+             * count; the parameter-table stride stays at `wavelet_levels`
+             * and the unused level of each a/b tail is left untouched.
              */
+            const int ab_levels = denoise_levels;
             if (!forward_analysis(l_memory, l_pitch, bands_hold,
-                                  wavelet_low_hold) ||
-                !statistics(bands_hold, 0) || !run_mad(bands_hold, 0) ||
+                                  wavelet_low_hold, wavelet_levels) ||
+                !statistics(bands_hold, 0, wavelet_levels) ||
+                !run_mad(bands_hold, 0, wavelet_levels) ||
                 !denoise_l(bands_hold) ||
                 !multiply(bands_hold, wavelet_low_hold, 0) ||
                 !final_curve(bands_hold, 0) || !compute_noisevar()) {
                 return RT_STAGE_FALLBACK;
             }
             if (!forward_analysis(plane_a_memory, plane_a_pitch, bands,
-                                  wavelet_low) ||
-                !run_mad(bands, 1) || !denoise_ab(bands, 1) ||
-                !statistics(bands, 1) || !multiply(bands, wavelet_low, 1) ||
+                                  wavelet_low, ab_levels) ||
+                !run_mad(bands, 1, ab_levels) || !denoise_ab(bands, 1) ||
+                !statistics(bands, 1, ab_levels) ||
+                !multiply(bands, wavelet_low, 1) ||
                 !synthesize(bands, wavelet_low, plane_a_memory,
-                            plane_a_pitch, 1)) {
+                            plane_a_pitch, 1, ab_levels)) {
                 return RT_STAGE_FALLBACK;
             }
             if (!forward_analysis(plane_b_memory, plane_b_pitch, bands,
-                                  wavelet_low) ||
-                !run_mad(bands, 2) || !denoise_ab(bands, 2) ||
-                !statistics(bands, 2) || !multiply(bands, wavelet_low, 2) ||
+                                  wavelet_low, ab_levels) ||
+                !run_mad(bands, 2, ab_levels) || !denoise_ab(bands, 2) ||
+                !statistics(bands, 2, ab_levels) ||
+                !multiply(bands, wavelet_low, 2) ||
                 !synthesize(bands, wavelet_low, plane_b_memory,
-                            plane_b_pitch, 2)) {
+                            plane_b_pitch, 2, ab_levels)) {
                 return RT_STAGE_FALLBACK;
             }
             if (!synthesize(bands_hold, wavelet_low_hold, l_memory, l_pitch,
-                            0)) {
+                            0, wavelet_levels)) {
                 return RT_STAGE_FALLBACK;
             }
         } else if (!run_plane(l_memory, l_pitch, 0)) {
