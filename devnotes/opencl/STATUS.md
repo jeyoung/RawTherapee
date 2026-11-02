@@ -4,8 +4,10 @@
 
 - Branch: `perf` (based on `opencl`, which is based on `dev` at `b2ee504c4`)
 - Milestone: M12 — opt-in GPU `rgbProc` core complete; GPU porting paused
-- Last verified: 2026-10-22, public PEF baseline export, monitor parity and
-  opt-in `rgbProc` parity on AMD RX 550; capture opt-in and 5×5 fast path
+- Last verified: 2026-11-02, ROCm 7.2.4 `amdocl` on `gfx1200`, export
+  benchmark and parity on `dev` at `61ac74691`; 2026-10-22, public PEF
+  baseline export, monitor parity and opt-in `rgbProc` parity on AMD RX 550;
+  capture opt-in and 5×5 fast path
 - Next task: none scheduled. RCD demosaic was evaluated and deferred; the next
   candidate, only if requested, is wavelet/denoise
 - Known limitations: single-stage acceleration is roughly neutral end-to-end;
@@ -19,7 +21,29 @@
   conversion falls back to lcms for LUT profiles, soft proofing, gamut check,
   non-relative intent, and black-point compensation with a non-zero black
   point; `rgbProc` is opt-in, batch-only because of the tone-curve histogram,
-  and slower than the 8-thread CPU on the RX 550
+  and slower than the 8-thread CPU on the RX 550; GPU Capture Sharpening is
+  unavailable on ROCm `amdocl` because the tiled kernel needs 1024
+  work-items and `gfx1200` reports 256
+
+## ROCm gfx1200 evidence — 2026-11-02
+
+- `dev` at `61ac74691`, ROCm 7.2.4 `amdocl` 3581.0, Radeon RX 9060 XT
+  (`gfx1200`), `OMP_NUM_THREADS=8`, six interleaved runs, medians.
+- CPU/GPU export: 45.7 MP NEF neutral 1.12×, rotate 1.12×, capture 1.22×,
+  opt-in `rgbProc` 1.38×. 10.2 MP PEF neutral 1.00×, resize 0.87×,
+  rotate 0.95×, capture 0.98×, `rgbProc` 1.00×. The GPU pays off only where
+  transfer and setup are amortised.
+- GPU transform raises peak RSS by 1.36 GB at 45.7 MP (3.33 GB versus
+  1.97 GB).
+- All twelve CPU/GPU pairs PASS at 1 LSB, single-threaded. At eight threads
+  the CPU path itself differs by up to 19 LSB (resize) and 63 LSB
+  (`rgbProc`), so parity must stay single-threaded.
+- GPU capture sharpening falls back to the CPU on this driver; see the
+  handover limitation above.
+- `verify.sh` could not run because ImageMagick is not installed on the host.
+  Parity used the same method and comparator without the ImageMagick
+  normalisation step.
+- Full tables in `BENCHMARKS.md`; parity rows in `PARITY.md`.
 
 ## M12 evidence — opt-in GPU `rgbProc` core
 

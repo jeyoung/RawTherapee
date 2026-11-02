@@ -66,3 +66,37 @@ Notes:
 - `verify.sh --rgbproc` sets `RT_OPENCL_RGBPROC=1`, asserts that
   `opencl rgbproc:` ran, and compares neutral and exposure profiles. The
   stage is batch-only because preview supplies a tone-curve histogram.
+
+## ROCm 7.2.4 on gfx1200 (Radeon RX 9060 XT)
+
+`dev` at `61ac74691`, ROCm 7.2.4 `amdocl` 3581.0, 16-bit TIFF,
+`OMP_NUM_THREADS=1`. The host has no ImageMagick, so `verify.sh` could not
+run; the same run-pair method and the repository's TIFF reader
+(`compare_tiff.TiffReader`) were used on uncompressed output.
+
+| Image | Profile | Mode | PAE | Result |
+|---|---|---|---|---|
+| colorspace_flowers.pef | neutral (default) | off vs auto | 1 LSB | PASS |
+| colorspace_flowers.pef | resize 0.5× | off vs auto | 1 LSB | PASS |
+| colorspace_flowers.pef | rotate 5° | off vs auto | 1 LSB | PASS |
+| colorspace_flowers.pef | capture 0.75/20 | off vs auto | 1 LSB | PASS |
+| colorspace_flowers.pef | capture 0.75/20 | off vs forced GPU | 1 LSB | PASS |
+| colorspace_flowers.pef | rgbProc exposure | off vs auto | 1 LSB | PASS |
+| 45.7 MP NEF | neutral (default) | off vs auto | 1 LSB | PASS |
+| 45.7 MP NEF | resize 0.5× | off vs auto | 1 LSB | PASS |
+| 45.7 MP NEF | rotate 5° | off vs auto | 1 LSB | PASS |
+| 45.7 MP NEF | capture 0.75/20 | off vs auto | 1 LSB | PASS |
+| 45.7 MP NEF | capture 0.75/20 | off vs forced GPU | 1 LSB | PASS |
+| 45.7 MP NEF | rgbProc exposure | off vs auto | 1 LSB | PASS |
+
+Notes:
+
+- Forced GPU capture is a CPU fallback on this driver: the tiled kernel needs
+  1024 work-items and `gfx1200` reports a maximum work-group size of 256, so
+  only `opencl capture sharpening cpu` runs. The two forced-GPU rows therefore
+  validate the fallback, not the GPU deconvolution.
+- Multi-threaded CPU output is less reproducible here than the 5 LSB noted
+  above: `OMP_NUM_THREADS=8` differs from `OMP_NUM_THREADS=1` by up to 19 LSB
+  for resize and 63 LSB for rgbProc, with only 33 and 79 samples affected.
+  This is a CPU-thread effect, not an OpenCL difference, and it does not
+  appear in the single-threaded comparisons above.
