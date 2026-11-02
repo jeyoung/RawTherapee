@@ -339,12 +339,14 @@ int labWaveletTransformLevels(const procparams::ProcParams& params,
         levwav = 6;
     }
     /*
-     * `levwav` is ip_wavelet()'s base decomposition level: the MaxLev
-     * slider, forced to six by Expnoise. The chroma panel, and the chroma
-     * denoise Expnoise forces, raise only the L decomposition (`levwavL`) to
-     * seven. `levwava` and `levwavb` start from the same base and are then
-     * clamped with `min(levwav, levwava)`, so the a and b planes keep this
-     * base count and do not follow L to seven.
+     * Start from ip_wavelet()'s base decomposition level: the MaxLev slider,
+     * forced to six by Expnoise. The chroma panel, and the chroma denoise
+     * Expnoise forces, raise only the L decomposition (`levwavL`) to seven,
+     * and this function returns that L count. `levwava` and `levwavb` start
+     * from the unraised base and are then clamped with `min(levwav, ...)`,
+     * so the a and b planes keep the base count and do not follow L to
+     * seven; the launcher derives their count from the same base. Everything
+     * below the raise therefore computes L's level count.
      */
     const bool chroma_user = wavelet.chromfi > 0.0 || wavelet.chromco > 0.0;
     if (chroma_user && levwav < 7) {

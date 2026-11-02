@@ -65,7 +65,9 @@ build/portable/rawtherapee-graph-5.13-342-g3871b7d0c_5.13+git13363.3871b7d0c-1_a
 sha256 c347ed4d42753cbea8bb30848a083ee068f6de920bf40eb474b1cbc480ce5a61
 ```
 
-Validated at `3871b7d0c`; the commits after it are documentation only.
+Validated at `3871b7d0c`. The branch has advanced since with unit code and
+documentation, so the package is evidence for that build only, not for the
+current tip.
 
 ## Progress log — resumed 2026-10-28 (Block 4 completion)
 
@@ -203,15 +205,19 @@ Validated at `3871b7d0c`; the commits after it are documentation only.
   blur. Seventeen device cases (levels 3/5/6, ballum 10/7/5/0/-2, high-level
   sliders only, a light slider, odd width, odd height, odd both, with
   contrast, edge, final curves, toning, all panels and all panels padded)
-  match the host block with a worst 0.105469 LSB16; the panel-off comparison
-  changes 85,918-114,240 samples. Twelve residuals (`quaMethod` agre, user
+  match the host block with a worst 0.015625 LSB16; the panel-off comparison
+  changes 85,918-114,240 samples. The a and b planes keep the base six levels
+  that `levwava`/`levwavb` clamp to, while L keeps seven, so no plane carries
+  an extra round trip the host does not perform; the final tail reuses the
+  pre-denoise statistics unless `cp.val`, `ref`, `contr` or `cp.diagcurv`
+  asks for a refresh (`679f5b4d8`). Twelve residuals (`quaMethod` agre, user
   chromfi/chromco, balchrom, `Wavhuecurve`, `CBenab`, `sliMethod` cur,
   Thrden, Ballum range, level range, all sliders zero and the 128-pixel
   window) run the host builtin byte for byte. `labwavelet-denoise.pp3` records
   `impl=opencl` at 1 LSB16. Every comparison pins `OMP_NUM_THREADS=1`: the
   host's `noisevarlum` loop races under OpenMP and is not a deterministic
   reference. The denoise curves, the expert pairing and the BiShrink arms
-  remain host residuals. `66613d0a9`, `6db958afe`.
+  remain host residuals. `66613d0a9`, `6db958afe`, `679f5b4d8`.
 - **`local.adjustments` groundwork (pushed)**: host block extracted
   byte-for-byte, per-spot context/ABI (`LAJC`), exact block-level predicate,
   refusal path, 25 residual mutations and four multi-spot host cases. No
@@ -775,8 +781,8 @@ Splitco/Splitlr/RGBSliders are admitted with PAE 0 at `6c78a463a`. Then the
 17 cases, worst 0.058594 LSB16, and 12 residuals at PAE 0, the final curves
 with 13 cases, worst 0.015625 LSB16, and 14 residuals at PAE 0, toning
 with 12 cases, worst 0.011719 LSB16, and 10 residuals at PAE 0, and the
-standard denoise L arm plus its forced chroma arm with 15 cases, worst
-0.105469 LSB16, and 12 residuals at PAE 0),
+standard denoise L arm plus its forced chroma arm with 17 cases, worst
+0.015625 LSB16, and 12 residuals at PAE 0),
 then `local.adjustments` exposure/retinex/CIE, then the common mask
 once the wavelet panels land. EPD stays a permanent residual.
 

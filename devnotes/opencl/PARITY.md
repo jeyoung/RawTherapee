@@ -86,8 +86,8 @@ pairs are exact. The gate is the peak absolute error (PAE) in normalised units;
 | 2026-11-01 | 0abd76894..5781f1c38 | POCL (CPU) | colorspace_flowers.pef / `labwavelet-toning.pp3` (zero-protection toning, non-identity `opacityCurveRG` and `opacityCurveBY`), `lab.wavelet` | off vs auto, 16-bit TIFF | 0 (exact) | PASS |
 | 2026-11-01 | 0abd76894..5781f1c38 | POCL (CPU) | 12-case toning matrix (a only, b only, both, sigmaton 0.5/2.0, with contrast, with chroma, with edge, with final curves, 179x49 padded, 3 and 7 levels), `stage-residency-test` | device vs host block | 0.011719 LSB16 (worst) | PASS |
 | 2026-11-01 | 0abd76894..5781f1c38 | POCL (CPU) | 10-case toning residual matrix (protab on, sigmaton low/high, no opacity multiplier, expnoise, expbl, expresid, expclari, CLmethod one, skin protection), `stage-residency-test` | device vs host block | 0 (host) | PASS |
-| 2026-11-02 | 66613d0a9..6db958afe | POCL (CPU) | colorspace_flowers.pef / `labwavelet-denoise.pp3` (Expnoise, `Lev0..4` non-zero, `quaMethod=cons`, no user chroma), `lab.wavelet` | off vs auto, 16-bit TIFF | 1 LSB | PASS |
-| 2026-11-02 | 66613d0a9..6db958afe | POCL (CPU) | 17-case denoise matrix (levels 3/5/6, ballum 10/7/5/0/-2, high-level sliders only, a light slider, odd width 179x160, odd height 180x161, odd both 179x161, with contrast, edge, final curves, toning, all panels and all panels padded), `stage-residency-test` | device vs host block | 0.105469 LSB16 (worst: all panels) | PASS |
+| 2026-11-02 | 1005b12da..679f5b4d8 | POCL (CPU) | colorspace_flowers.pef / `labwavelet-denoise.pp3` (Expnoise, `Lev0..4` non-zero, `quaMethod=cons`, no user chroma), `lab.wavelet` | off vs auto, 16-bit TIFF | 1 LSB | PASS |
+| 2026-11-02 | 1005b12da..679f5b4d8 | POCL (CPU) | 17-case denoise matrix (levels 3/5/6, ballum 10/7/5/0/-2, high-level sliders only, a light slider, odd width 179x160, odd height 180x161, odd both 179x161, with contrast, edge, final curves, toning, all panels and all panels padded), `stage-residency-test` | device vs host block | 0.015625 LSB16 (worst: ballum 0) | PASS |
 | 2026-11-02 | 66613d0a9..6db958afe | POCL (CPU) | 12-case denoise residual matrix (`quaMethod=agre`, user chromfi/chromco, balchrom, `Wavhuecurve`, `CBenab`, `sliMethod=cur`, Thrden, Ballum range, level range, all sliders zero, sub-128 window), `stage-residency-test` | device vs host block | 0 (host) | PASS |
 | 2026-11-02 | 89e0a844b..47b9980fb | POCL (CPU) | colorspace_flowers.pef / `labtools-labcurve-contrast.pp3` (Lab curves with contrast 30, L/a/b/cc/lc/cl tables), `lab.tools` | off vs auto, 16-bit TIFF | 0 (exact) | PASS |
 | 2026-11-02 | 89e0a844b..47b9980fb | POCL (CPU) | 3-case Lab-contrast matrix (contrast 5, contrast 15 with L curve+brightness, contrast 30 with all six tables), `stage-residency-test` | device vs host block | 0 (exact) | PASS |
@@ -325,10 +325,15 @@ peak absolute error is zero for the synthetic node tests:
   second band set for those L coefficients, computes `Mad()` from a 32768-bin
   device histogram, reproduces the host's `noisevarlum`/`noisevarchrom` last
   write at the clamped `(2y+1, 2x+1)` sample, and ports `ShrinkAllL`/
-  `ShrinkAllAB` with the lab.tools box blur. It uses `exp()` where the host
-  uses `xexpf()`; the measured worst peak error is 0.105469 LSB16, well inside
-  one LSB, so the SLEEF port is not needed. Seventeen device cases (levels
-  3/5/6, ballum 10/7/5/0/-2, high-level sliders only, a light slider, odd
+  `ShrinkAllAB` with the lab.tools box blur. The a and b planes keep
+  `ip_wavelet()`'s base decomposition level, which `levwava`/`levwavb` clamp
+  to six even when the forced chroma denoise raises L to seven, so each plane
+  runs its own analyse/statistics/synthesise count. The final tail reuses the
+  pre-denoise statistics unless `cp.val > 0 || ref || contr || cp.diagcurv`;
+  the host evaluates that condition and passes it as `final_refresh`. The
+  kernels use `exp()` where the host uses `xexpf()`; the measured worst peak
+  error is 0.015625 LSB16, well inside one LSB, so the SLEEF port is not
+  needed. Seventeen device cases (levels 3/5/6, ballum 10/7/5/0/-2, high-level sliders only, a light slider, odd
   width, odd height, odd both, with contrast, edge, final curves, toning, all
   panels and all panels padded) match the host block; the panel-off comparison
   changes 85,918-114,240 samples per case, so the parity is not vacuous.
@@ -336,9 +341,10 @@ peak absolute error is zero for the synthetic node tests:
   balchrom, a non-identity `Wavhuecurve`, `CBenab`, `sliMethod` cur, Thrden,
   Ballum outside its widget range, a level slider outside its range, all
   sliders zero and the 128-pixel window) run the host builtin byte for byte.
-  `labwavelet-denoise.pp3` is 1 LSB16 on the export TIFF and records
-  `impl=opencl`. Every comparison uses `OMP_NUM_THREADS=1`: the host's
-  `noisevarlum` loop writes each half-grid cell four times under
+  `labwavelet-denoise.pp3` is 1 LSB16 on the export TIFF (26,639 of
+  30,419,712 samples) and records `impl=opencl`. Every comparison uses
+  `OMP_NUM_THREADS=1`: the host's `noisevarlum` loop writes each half-grid
+  cell four times under
   `#pragma omp parallel for`, so a multi-threaded host run is not
   deterministic and cannot be a parity reference. The denoise path holds a
   second seven-level L band set while a and b run; a 45.7 MP frame exceeds

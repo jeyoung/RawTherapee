@@ -256,7 +256,11 @@ until the chroma pass finishes, as in the block.
 The denoise arm runs `WaveletDenoiseAllL()` and the chroma denoise that
 `Expnoise` couples to it: the block raises the L decomposition to seven levels,
 forces `chromfi = 0.01` and then runs `WaveletDenoiseAllAB()` on the a/b bands
-with the post-contrast L coefficients. The device keeps a second band set for
+with the post-contrast L coefficients. The a and b planes do not follow L up:
+`ip_wavelet()` clamps `levwava` and `levwavb` with `min(levwav, ...)`, so they
+keep the base six levels while L keeps seven, and the device runs each plane's
+analyse/statistics/synthesise passes at that plane's own count. The device
+keeps a second band set for
 those L coefficients, builds the MAD median from a 32768-bin device histogram,
 reproduces `noisevarlum`/`noisevarchrom` at the clamped `(2y+1, 2x+1)` sample,
 and ports `ShrinkAllL`/`ShrinkAllAB` with the lab.tools box blur. Only the
@@ -264,7 +268,11 @@ plain `quaMethod == "cons"` slider arm is admitted; the denoise curves, expert
 pairing, user chroma strength, noise balance, hue curve and colour-by-noise
 stay host residuals. The pass order is forward analysis, statistics/mea,
 MAD/shrink L, contrast/edge/final, noise variance and chroma denoise, then the
-a/b planes and the deferred L reconstruction.
+a/b planes and the deferred L reconstruction. The final tail reuses the
+statistics the block built before the denoise unless
+`cp.val > 0 || ref || contr || cp.diagcurv`; the host evaluates that condition
+and the device passes it as `final_refresh`, so the tail sees the same
+statistics as `WaveletcontAllLfinal()`.
 
 The edge arm is `ContAllL()`'s `EDmet == 2` block with `cp.detectedge` clear
 and the Lipschitz smoothing off. The host fills a separate edge `mea` through
