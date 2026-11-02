@@ -19,6 +19,16 @@
 namespace rtengine::stage
 {
 
+void labToolsBuildHistogram(const LabImage& lab, LUTu& hist16)
+{
+    hist16.clear();
+    for (int y = 0; y < lab.H; ++y) {
+        for (int x = 0; x < lab.W; ++x) {
+            ++hist16[static_cast<int>(lab.L[y][x])];
+        }
+    }
+}
+
 static_assert(LAB_TOOLS_LC_DOUBLE_SIGMA == GAUSS_DOUBLE_LIMIT,
               "the stage ABI and gauss.cc must agree on the double IIR limit");
 
@@ -398,14 +408,13 @@ bool labToolsLocalContrastActive(const procparams::ProcParams& params)
 bool labToolsLabCurveActive(const procparams::ProcParams& params)
 {
     /*
-     * chromiLuminanceCurve() owns the hist16 refill when `contrast` is
-     * non-zero; that refill is a side effect a later node reads, so the
-     * contrast path is never a device pass. With contrast at zero the pass
-     * always runs when the curves are enabled, even if every table is the
-     * identity: the pass still rewrites L, a and b through the block's own
-     * divides, which is why it is not a no-op.
+     * chromiLuminanceCurve() runs whenever the Lab curve is enabled. A
+     * non-zero contrast needs the host hist16 refill; the call site builds
+     * that histogram and the context consumes it through complexLCurve().
+     * The pass rewrites L, a and b through the block's own divides, which is
+     * why it is not a no-op even with identity tables.
      */
-    return params.labCurve.enabled && params.labCurve.contrast == 0;
+    return params.labCurve.enabled;
 }
 
 bool labToolsSupported(const procparams::ProcParams& params)
@@ -420,14 +429,6 @@ bool labToolsSupported(const procparams::ProcParams& params)
     const bool lab_regions = labToolsRegionsActive(params);
     if (params.colorToning.enabled &&
         params.colorToning.method == "LabRegions" && !lab_regions) {
-        return false;
-    }
-
-    /*
-     * The Lab contrast value refills hist16, which a later block reads. The
-     * refill stays on the host, so a non-zero contrast is a residual.
-     */
-    if (params.labCurve.contrast != 0) {
         return false;
     }
 
@@ -813,7 +814,7 @@ int LabToolsContext::build(RtLabToolsResult& out)
 
     /*
      * The Lab-curve pass. `labToolsLabCurveActive()` is the block's
-     * `labCurve.enabled` with the residual contrast at zero; the six activity
+     * `labCurve.enabled`, including a non-zero contrast; the six activity
      * flags come from the host LUT build below. The method is mapped here so
      * the Munsell export knows whether the pass needs the tables.
      */

@@ -1665,6 +1665,9 @@ private:
 
         stage::LabToolsLuts luts{&hist16, &lumacurve, &dummy, &clcurve,
                                  &curve1, &curve2, &satcurve, &lhskcurve};
+        if (params.labCurve.enabled && params.labCurve.contrast != 0) {
+            stage::labToolsBuildHistogram(*labView, hist16);
+        }
 
         /*
          * The device node is opt-in and covers the LabGrid pass,

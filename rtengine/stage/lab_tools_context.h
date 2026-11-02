@@ -344,6 +344,13 @@ namespace rtengine::stage
 {
 
 /*
+ * The block's hist16 refill: one histogram of the input L, used when the Lab
+ * curve has a non-zero contrast. It is a host pass because the histogram is
+ * a later node's input; the device only consumes the resulting lumacurve.
+ */
+void labToolsBuildHistogram(const LabImage& lab, LUTu& hist16);
+
+/*
  * The block's `scal` argument at every export call site. shadowsHighlights()
  * divides the guided-filter radius by it, so a different value would be a
  * different configuration; the device ABI carries it and the launcher
