@@ -502,6 +502,20 @@ current tip.
   0.011719 LSB16 (0 over 1); export gate exact with `impl=opencl`.
   `add8558fe`, `1815ffe8c`, `1f31f106d` and this documentation commit.
   Landed on `perf-graph`; not pushed.
+- **`lab.tools` black-and-white with colour toning**: the host's `bwToning`
+  is `bwonly` (`improcfun.cc:4602-4606`, `bwq` compiled out), so colour
+  toning takes the block past both black-and-white arms and the Lab pass does
+  the work it does with black-and-white off. `rgbProc()` owns the
+  black-and-white image and the non-LabGrid toning; LabGrid and the regions
+  run in the block. The node now exports the block's `bwonly` as its
+  black-and-white flag instead of `blackwhite.enabled`, so a combination
+  keeps the chroma LabGrid and the regions write. Fourteen matrix cases are
+  within 0.75 LSB16 (worst: B&W + Splitlr + Lab curves, 1 sample; the rest
+  exact), with B&W off bit-identical, the flag 0/1 as the host decides, and
+  `labtools-blackwhite-toning.pp3` pixel-exact with `impl=opencl`.
+  `lab.tools` now covers B&W alone, B&W through both arms and the colour-
+  toning combination; only a `LabRegions` profile outside the bounded set
+  stays a host refusal. Landed on `perf-graph`; not pushed.
 
 ### Wave B scoping decisions (2026-10-28)
 
@@ -875,7 +889,11 @@ landed at `43d6f88bd`: `chromiLuminanceCurve()`'s early return zeroes a/b when
 `labCurve.enabled` and `colorToning.enabled` are both false, and the node now
 reproduces that in the Lab-curve slot (B&W-only exact, a/b exactly 0, combos
 with SH/LC/vibrance at PAE 0, both other arms refused with host PAE 0).
-Remaining: B&W with colour toning (the `bwonly` condition excludes it). The
+Remaining: the `lab.tools` residuals are now only a `LabRegions` profile
+outside the bounded set, a local-contrast slider outside the ABI range, EPD
+and a profile where no device tool would run. B&W with colour toning landed
+as a device case: the host's `bwonly` excludes it, so the block takes neither
+arm and the node exports the block's flag. The
 LAB/XYZ/XYZREL Munsell methods (`gamutLchonly`/`gamutmap`) are device cases
 now; see the progress log. Non-zero Lab contrast landed with the host `hist16`
 prefix. B&W with `labCurve.enabled` landed at `9fca53a2d`: the `bwToning` arm

@@ -2501,7 +2501,10 @@ node budget is refused. The Lab-curve gamut correction is a device case for
 every method - NONE, LAB, XYZ, XYZREL and MUN - measured against the host
 block with the per-case figures in `devnotes/opencl/PARITY.md`. The residual
 families are a chromaticity slider outside -100..100, an unrepresentable hue
-flat curve, a denoise chroma factor and black-and-white with colour toning.
+flat curve and a denoise chroma factor. Black-and-white with colour toning is
+not a residual: the block's `bwToning` is false for it, so neither
+black-and-white arm runs and the node exports a zero black-and-white flag (see
+`devnotes/perf/STAGE_PIPELINE.md`).
 
 The chroma arithmetic is where a naive float port fails. On the host,
 `sqrt(float) / 327.68f` resolves to the libm double square root divided by the
@@ -2633,7 +2636,7 @@ With `OMP_NUM_THREADS=1`, a 3888x2608 PEF and the POCL CPU device:
 | Lab curves, 32 cases at 238x64, 179x48 and 8192x64 | L only, brightness, an enabled pass with all six tables the identity, a only, a/b, C=f(C), L=f(C), C=f(L), all six combined, combined with MUN and with NONE, three red/skin protection settings, `lcredsk` off, neutral and saturated images, padded 179/238 and 8192 wide, and the 11 hue-family cases: 2,810,160 samples, `impl=opencl` on every case, no NaN/Inf. Every diagonal-table case is bit-exact (PAE 0, 0 differing samples); the hue family is at most 0.023438 LSB16. The earlier 169 one-ulp samples came from the host's ≤3-column double-sqrt tail, which the kernel now reproduces |
 | Lab hue family, 11 cases | chromaticity -100 (with and without non-identity hue curves, which the block ignores at the slider minimum), 0, 50 with 30% red/skin protection and 100 with 60%; C=f(H), L=f(H) and H=f(H) alone on the saturated hue-circle fixture; all three with the slider; with active a/b tables (so HH comes from the curved a and b); with vibrance and shadows/highlights; and black-and-white + L=f(H) through the `bwToning` arm. Worst PAE 0.023438 LSB16 over 462,816 samples, no sample over 1 LSB16, `impl=opencl` on every case |
 | Lab hue-family non-vacuity | for every hue-family case the same profile with the slider at 0 and the three curves cleared changes the host image (PAE 12,400.9 to 52,609.6 LSB16), so the comparison is not a copy |
-| Lab-curve residuals | contrast 15, the XYZ Munsell method, black-and-white with colour toning, and a 40 000-point C=f(H) whose table cannot follow the curve within 5e-7 / 32 768 nodes are refused, record `impl=host` with no `impl=opencl`, and are byte-identical to the block (PAE 0) |
+| Lab-curve residuals | contrast 15, the XYZ Munsell method, and a 40 000-point C=f(H) whose table cannot follow the curve within 5e-7 / 32 768 nodes are refused, record `impl=host` with no `impl=opencl`, and are byte-identical to the block (PAE 0). Black-and-white with colour toning was refused in that session; it is admitted now (see the black-and-white matrix in `devnotes/opencl/PARITY.md`) |
 | Local contrast, 23 cases at 238x64, 179x48, 179x50, 238x63 and 8192x64 | radii 1/10/40/80/100 (both blur paths), amounts 0/0.1/1/2, darkness and lightness 0.5/1/2 and the two-way split, padded 179 and 238, an odd height of 50 (the horizontal tail rows), the 8192-wide case, and combinations with the Lab curves, shadows/highlights and vibrance: 2,461,164 samples, `impl=opencl` on every case, no NaN/Inf, every sample bit-exact (PAE 0, 0 differing samples) |
 | Local-contrast tail, sigma 24 | the integer fixture and three wide non-integer fixtures (L alternates around 30000 and 0.4 so the float deviation subtraction rounds) cover the last `H mod 4` rows and `W mod 8` columns at 179x50 and 238x63. With the kernel's deviation kept in double - the pre-fix code - the amount-2 179x50 case moves 7 of 26,850 samples, worst 0.164062 LSB16 (26,843 exact); the fixed kernel is bit-exact on all four cases |
 | Local-contrast non-vacuity | on a 179x48 fixture radius 10, amount 1 changes 8,592 of 25,776 samples (PAE 11,071.999900 LSB16), so the device comparison is not a copy |

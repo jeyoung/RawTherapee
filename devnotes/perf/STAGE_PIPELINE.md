@@ -162,10 +162,16 @@ neither table is active. The curve kernel runs that arm in the pass's own slot
 and the early-zeroing kernel is not launched beside it, so the order stays
 curve pass, then vibrance, then regions, and the later tools still run on the
 black-and-white image. Both arms are bit-exact against the host block on the
-tested matrix. Black-and-white with any colour toning, including Lab
-colour-correction regions, is a residual: the host's `bwonly` is
-`blackwhite.enabled && !colorToning.enabled`, so the block takes neither arm,
-the node refuses the configuration and the builtin runs the host block. The
+tested matrix. Black-and-white with colour toning takes neither arm: the
+host's `bwonly` is `blackwhite.enabled && !colorToning.enabled` and its `bwq`
+term is compiled out, so `bwToning` is false and the block does exactly the
+work it does with black-and-white off. `rgbProc()` has already produced the
+black-and-white image and applied the toning (LabGrid and the Lab
+colour-correction regions run in the Lab block itself), so the node exports
+the block's `bwonly` as the black-and-white flag rather than
+`blackwhite.enabled`, keeps chroma written by LabGrid and the regions, and
+launches neither arm. The combination is therefore a device case for every
+colour-toning method the node already admits. The
 block's hue flat curves also run under `bwToning`, outside the `!bwToning`
 gate; the kernel applies them before the closing deviation write, so
 black-and-white with L=f(H) is a device case with its own matrix row.
@@ -215,10 +221,10 @@ Everything else in the block is a residual: a chromaticity
 slider outside its -100..100 GUI range, a C=f(H), L=f(H) or H=f(H) curve the
 host table cannot follow within 5e-7 or the node budget, a
 denoise chroma factor, a local contrast outside the ABI range, a local
-contrast below sigma 25 on a host built without SSE2, EPD, black-and-white
-output with colour toning (the block's `bwonly` is then false, so neither
-black-and-white arm runs), a `LabRegions` profile outside the bounded set, a
-profile where no device tool would run, and an RGB-mode
+contrast below sigma 25 on a host built without SSE2, EPD, a `LabRegions`
+profile outside the bounded set, a profile where no device tool would run
+(colour toning with black-and-white and no other tool is one, because the
+block does no black-and-white work), and an RGB-mode
 tone table whose steepest step can turn the closing round trip's one-ulp
 channel difference into more than one LSB16. A colour-toning method other
 than `LabGrid`/`LabRegions` (Splitco, Splitlr, RGBSliders and the rest) does
@@ -453,7 +459,7 @@ panes records them separately. Both tools are off by default.
 | `transform` | Full/Full/Roi/- | path | reuse-input | rotation, distortion, perspective, CA, vignetting, gradient, post-crop vignette, dehaze, Fattal | yes |
 | `local.adjustments` | Full/Full/Roi/Reduced | path | reuse-input | local lab / selective editing | partial |
 | `rgb.proc` | Full/Full/Roi/Reduced | path | reuse-input | RGB curves, tone curve, colour toning, B&W, channel mixer, HSV, film simulation | yes |
-| `lab.tools` | Full/Full/Roi/Reduced | path | reuse-input | shadows/highlights, vibrance, Lab curves (including non-zero contrast, the chromaticity slider, the C=f(H)/L=f(H)/H=f(H) hue flat curves and the NONE/LAB/XYZ/XYZREL/MUN gamut methods), local contrast, black-and-white (cheap and `bwToning` arms), EPD, Lab-grid colour toning and Lab colour-correction regions | partial |
+| `lab.tools` | Full/Full/Roi/Reduced | path | reuse-input | shadows/highlights, vibrance, Lab curves (including non-zero contrast, the chromaticity slider, the C=f(H)/L=f(H)/H=f(H) hue flat curves and the NONE/LAB/XYZ/XYZREL/MUN gamut methods), local contrast, black-and-white (cheap and `bwToning` arms, and the colour-toning combination, which runs neither arm), EPD, Lab-grid colour toning and Lab colour-correction regions | partial |
 | `lab.sharpening` | Full/-/Roi/- | path | reuse-input | impulse denoise and defringe (own node), ML sharpen edges, ML microcontrast and the main sharpen pass (shared `output.sharpen` node) | partial |
 | `lab.wavelet` | Full/Full/Roi/Reduced | path | reuse-input | directional pyramid equaliser and wavelet contrast, standard and BiShrink denoise (L and the forced chroma arm), chroma `link`, edge plain arm and Medianlev Lipschitz control, final curves, balance-chroma `sli`/`cur`, the toning zero-protection arm, CLmethod's level selection and the clarity two-pass merge | partial |
 | `working.trc` | Full/Full/Roi/- | path | reuse-input | soft light, tone equaliser and working-TRC conversion | partial |
