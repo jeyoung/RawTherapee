@@ -2248,6 +2248,70 @@ __kernel void rt_lab_wavelet_w_soft_write(
 }
 
 /*
+ * The final panel's guided soft radius. The export block runs it after the
+ * final pixel curve on the reconstructed L. The guide is xlin2log(L / 32768)
+ * and the source is xlin2log(L), both at base ten; guidedFilterLog() converts
+ * the source into the log domain, guidedFilter() filters it, and the block
+ * blends the converted result with the pre-filter L. The xlin2log/xlog2lin
+ * pair is sleef.h's, so the device rounds as the host does.
+ */
+#define RT_LW_SOFTEND_BASE 10.0f
+#define RT_LW_SOFTEND_BASE_MINUS_ONE 9.0f
+#define RT_LW_SOFTEND_L_SCALE (1.0f / 32768.0f)
+
+inline float rt_lw_xlin2log10(float x)
+{
+    return rt_lw_xlogf(x * RT_LW_SOFTEND_BASE_MINUS_ONE + 1.0f) /
+           rt_lw_xlogf(RT_LW_SOFTEND_BASE);
+}
+
+inline float rt_lw_xlog2lin10(float x)
+{
+    return (rt_lw_pow(RT_LW_SOFTEND_BASE, x) - 1.0f) /
+           RT_LW_SOFTEND_BASE_MINUS_ONE;
+}
+
+/*
+ * The guide, the source and the pre-filter L. `iL` is the block's copy of L
+ * before guidedFilterLog() converts it, and it is what the final blend uses.
+ */
+__kernel void rt_lab_wavelet_w_softend_prepare(
+    __global const float* l, int l_pitch,
+    __global float* guide, int guide_pitch,
+    __global float* src, int src_pitch,
+    __global float* il, int il_pitch,
+    int w, int h)
+{
+    const int x = get_global_id(0);
+    const int y = get_global_id(1);
+    if (x >= w || y >= h) {
+        return;
+    }
+    const float value = l[y * l_pitch + x];
+    il[y * il_pitch + x] = value;
+    guide[y * guide_pitch + x] =
+        rt_lw_xlin2log10(max(value * RT_LW_SOFTEND_L_SCALE, 0.0f));
+    src[y * src_pitch + x] = rt_lw_xlin2log10(max(value, 0.0f));
+}
+
+/* q -> xlog2lin -> intp(blend, q, iL) -> L, the block's final loop. */
+__kernel void rt_lab_wavelet_w_softend_finish(
+    __global const float* q, int q_pitch,
+    __global float* l, int l_pitch,
+    __global const float* il, int il_pitch,
+    int w, int h, float blend)
+{
+    const int x = get_global_id(0);
+    const int y = get_global_id(1);
+    if (x >= w || y >= h) {
+        return;
+    }
+    const float linear = rt_lw_xlog2lin10(max(q[y * q_pitch + x], 0.0f));
+    l[y * l_pitch + x] =
+        rt_lw_soft_intp(blend, linear, il[y * il_pitch + x]);
+}
+
+/*
  * finalContAllL()/ContAllAB()'s CLmethod selection. `method` is 0 one,
  * 1 inf and 2 sup; `direction` is 0 all, 1 one, 2 two and 3 thr. The kernel
  * zeroes the bands the block zeroes and, at level 0, paints the coefficient-0

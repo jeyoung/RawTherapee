@@ -6057,6 +6057,7 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
     bool clarity_active = false;
     bool clarity_merge = false;
     bool soft_active = false;
+    bool softend_active = false;
     cl_float soft_epsilon = 0.0f;
     cl_int soft_w = 0;
     cl_int soft_h = 0;
@@ -6065,6 +6066,15 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
     cl_float soft_scale_dy = 1.0f;
     cl_float soft_scale_ux = 1.0f;
     cl_float soft_scale_uy = 1.0f;
+    cl_float softend_blend = 0.0f;
+    cl_float softend_epsilon = 0.0f;
+    cl_int softend_w = 0;
+    cl_int softend_h = 0;
+    cl_int softend_box_rad = 0;
+    cl_float softend_scale_dx = 1.0f;
+    cl_float softend_scale_dy = 1.0f;
+    cl_float softend_scale_ux = 1.0f;
+    cl_float softend_scale_uy = 1.0f;
     const float* wavelet_params = nullptr;
     const RtLabWaveletSelection& selection = context->selection;
     const RtLabWaveletClarity& clarity = context->clarity;
@@ -6152,6 +6162,11 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
         }
         const bool wavelet_soft =
             wavelet_params[RT_LW_PARAM_SOFT_ACTIVE] != 0.0f;
+        if (context->wavelet.softend != 0 && context->wavelet.softend != 1) {
+            error = "lab.wavelet soft-end flag must be 0 or 1";
+            return RT_STAGE_INVALID;
+        }
+        softend_active = context->wavelet.softend == 1;
         if (wavelet_entries !=
             static_cast<int>(labWaveletParamEntries(
                 static_cast<std::uint32_t>(wavelet_planes),
@@ -6159,7 +6174,7 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
                 wavelet_final, wavelet_toning, wavelet_denoise,
                 wavelet_refine,
                 static_cast<std::uint32_t>(wavelet_refine_poly),
-                wavelet_soft))) {
+                wavelet_soft, softend_active))) {
             error = "lab.wavelet parameter table has the wrong length";
             return RT_STAGE_INVALID;
         }
@@ -6280,6 +6295,84 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
                     error = "lab.wavelet soft radius is outside its range";
                     return RT_STAGE_INVALID;
                 }
+            }
+        }
+
+        /*
+         * The final panel's guided soft radius. The host derives every scalar
+         * with the block's arithmetic; the launcher only re-checks the ranges
+         * and the exact scales. It needs the final pixel curve (it runs after
+         * it), and cannot share the run with the clarity arm or the clarity
+         * soft radius.
+         */
+        if (softend_active) {
+            if (soft_active || clarity_active) {
+                error = "lab.wavelet soft-end radius needs the final arm "
+                        "alone";
+                return RT_STAGE_FALLBACK;
+            }
+            if (!wavelet_final) {
+                error = "lab.wavelet soft-end radius needs the final arm";
+                return RT_STAGE_FALLBACK;
+            }
+            const int softend_offset =
+                wavelet_entries -
+                static_cast<int>(RT_LAB_WAVELET_SOFTEND_ENTRIES);
+            softend_blend =
+                wavelet_params[softend_offset + RT_LAB_WAVELET_SOFTEND_BLEND];
+            softend_epsilon =
+                wavelet_params[softend_offset +
+                               RT_LAB_WAVELET_SOFTEND_EPSILON];
+            softend_w = static_cast<int>(
+                wavelet_params[softend_offset + RT_LAB_WAVELET_SOFTEND_W]);
+            softend_h = static_cast<int>(
+                wavelet_params[softend_offset + RT_LAB_WAVELET_SOFTEND_H]);
+            softend_box_rad = static_cast<int>(
+                wavelet_params[softend_offset +
+                               RT_LAB_WAVELET_SOFTEND_BOXRAD]);
+            softend_scale_dx =
+                wavelet_params[softend_offset +
+                               RT_LAB_WAVELET_SOFTEND_SCALE_DX];
+            softend_scale_dy =
+                wavelet_params[softend_offset +
+                               RT_LAB_WAVELET_SOFTEND_SCALE_DY];
+            softend_scale_ux =
+                wavelet_params[softend_offset +
+                               RT_LAB_WAVELET_SOFTEND_SCALE_UX];
+            softend_scale_uy =
+                wavelet_params[softend_offset +
+                               RT_LAB_WAVELET_SOFTEND_SCALE_UY];
+            const int sub_w =
+                softend_w > 0 ? width / softend_w : 0;
+            const int sub_h =
+                softend_h > 0 ? height / softend_h : 0;
+            if (!std::isfinite(softend_blend) || softend_blend < 0.0f ||
+                softend_blend > 1.0f ||
+                !std::isfinite(softend_epsilon) ||
+                softend_epsilon < 0.0f || softend_w < 1 ||
+                softend_w > width || softend_h < 1 ||
+                softend_h > height || sub_w < 1 || sub_w > 5 ||
+                sub_w != sub_h || softend_box_rad < 0 ||
+                softend_box_rad > softend_w - 1 ||
+                softend_box_rad > softend_h - 1 ||
+                !std::isfinite(softend_scale_dx) ||
+                !std::isfinite(softend_scale_dy) ||
+                !std::isfinite(softend_scale_ux) ||
+                !std::isfinite(softend_scale_uy) ||
+                softend_scale_dx !=
+                    static_cast<cl_float>(width) /
+                        static_cast<cl_float>(softend_w) ||
+                softend_scale_dy !=
+                    static_cast<cl_float>(height) /
+                        static_cast<cl_float>(softend_h) ||
+                softend_scale_ux !=
+                    static_cast<cl_float>(softend_w) /
+                        static_cast<cl_float>(width) ||
+                softend_scale_uy !=
+                    static_cast<cl_float>(softend_h) /
+                        static_cast<cl_float>(height)) {
+                error = "lab.wavelet soft-end radius is outside its range";
+                return RT_STAGE_INVALID;
             }
         }
 
@@ -6476,11 +6569,13 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
     StageDeviceBufferPtr clarity_a;
     StageDeviceBufferPtr clarity_b;
     /*
-     * The clarity arm's guided soft radius. Two full-resolution planes carry
-     * the guide and the guided filter's output; the seven subsampled planes
-     * hold the block's I1/p1 copies and the intermediate means.
+     * The guided soft radius. Two full-resolution planes carry the guide and
+     * the guided filter's output; the seven subsampled planes hold the
+     * block's I1/p1 copies and the intermediate means. The final panel's
+     * radius adds the pre-filter L plane. The clarity and soft-end radii
+     * cannot run together, so the shared planes are acquired for either.
      */
-    char soft_keys[9] = {};
+    char soft_keys[10] = {};
     StageDeviceBufferPtr soft_guide;
     StageDeviceBufferPtr soft_ble;
     StageDeviceBufferPtr soft_guide_lo;
@@ -6490,6 +6585,7 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
     StageDeviceBufferPtr soft_corr_p;
     StageDeviceBufferPtr soft_corr_i;
     StageDeviceBufferPtr soft_tmp;
+    StageDeviceBufferPtr soft_il;
     StageDeviceBufferPtr nvc_device;
     StageDeviceBufferPtr sfave_device;
     StageDeviceBufferPtr sftmp_device;
@@ -6550,9 +6646,11 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
             wavelet_acquired = wavelet_acquired && clarity_l && clarity_a &&
                                clarity_b;
         }
-        if (soft_active) {
+        if (soft_active || softend_active) {
+            const int grid_w = softend_active ? softend_w : soft_w;
+            const int grid_h = softend_active ? softend_h : soft_h;
             const StageBufferShape soft_shape{
-                RT_STAGE_F32, soft_w, soft_h, 1};
+                RT_STAGE_F32, grid_w, grid_h, 1};
             soft_guide = residency->acquire(&soft_keys[0], plane_shape,
                                             &error);
             soft_ble = residency->acquire(&soft_keys[1], plane_shape, &error);
@@ -6573,6 +6671,11 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
                                soft_guide_lo && soft_src_lo && soft_mean_i &&
                                soft_mean_p && soft_corr_p && soft_corr_i &&
                                soft_tmp;
+            if (softend_active) {
+                soft_il = residency->acquire(&soft_keys[9], plane_shape,
+                                             &error);
+                wavelet_acquired = wavelet_acquired && soft_il;
+            }
         }
         if (wavelet_denoise) {
             for (int level = 0; level < wavelet_levels; ++level) {
@@ -6873,11 +6976,9 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
         cl_kernel soft_reduce_kernel = nullptr;
         cl_kernel soft_upsample_kernel = nullptr;
         cl_kernel soft_write_kernel = nullptr;
-        if (soft_active) {
-            soft_guide_kernel = compiled_kernel_entry(
-                env, def, "rt_lab_wavelet_w_soft_guide", error);
-            soft_src_kernel = compiled_kernel_entry(
-                env, def, "rt_lab_wavelet_w_soft_src", error);
+        cl_kernel softend_prepare_kernel = nullptr;
+        cl_kernel softend_finish_kernel = nullptr;
+        if (soft_active || softend_active) {
             soft_rescale_kernel = compiled_kernel_entry(
                 env, def, "rt_lab_wavelet_w_soft_rescale", error);
             soft_mul_kernel = compiled_kernel_entry(
@@ -6886,12 +6987,24 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
                 env, def, "rt_lab_wavelet_w_soft_reduce", error);
             soft_upsample_kernel = compiled_kernel_entry(
                 env, def, "rt_lab_wavelet_w_soft_upsample", error);
-            soft_write_kernel = compiled_kernel_entry(
-                env, def, "rt_lab_wavelet_w_soft_write", error);
             box_h_kernel =
                 compiled_kernel_entry(env, def, "rt_lw_box_h", error);
             box_v_kernel =
                 compiled_kernel_entry(env, def, "rt_lw_box_v", error);
+        }
+        if (soft_active) {
+            soft_guide_kernel = compiled_kernel_entry(
+                env, def, "rt_lab_wavelet_w_soft_guide", error);
+            soft_src_kernel = compiled_kernel_entry(
+                env, def, "rt_lab_wavelet_w_soft_src", error);
+            soft_write_kernel = compiled_kernel_entry(
+                env, def, "rt_lab_wavelet_w_soft_write", error);
+        }
+        if (softend_active) {
+            softend_prepare_kernel = compiled_kernel_entry(
+                env, def, "rt_lab_wavelet_w_softend_prepare", error);
+            softend_finish_kernel = compiled_kernel_entry(
+                env, def, "rt_lab_wavelet_w_softend_finish", error);
         }
         if (wavelet_denoise) {
             mad_kernel =
@@ -6930,12 +7043,16 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
             (wavelet_toning && toning_kernel == nullptr) ||
             (select_active && select_kernel == nullptr) ||
             (clarity_active && clarity_kernel == nullptr) ||
+            ((soft_active || softend_active) &&
+             (soft_rescale_kernel == nullptr || soft_mul_kernel == nullptr ||
+              soft_reduce_kernel == nullptr || soft_upsample_kernel == nullptr ||
+              box_h_kernel == nullptr || box_v_kernel == nullptr)) ||
             (soft_active &&
              (soft_guide_kernel == nullptr || soft_src_kernel == nullptr ||
-              soft_rescale_kernel == nullptr || soft_mul_kernel == nullptr ||
-              soft_reduce_kernel == nullptr || soft_upsample_kernel == nullptr ||
-              soft_write_kernel == nullptr || box_h_kernel == nullptr ||
-              box_v_kernel == nullptr)) ||
+              soft_write_kernel == nullptr)) ||
+            (softend_active &&
+             (softend_prepare_kernel == nullptr ||
+              softend_finish_kernel == nullptr)) ||
             (wavelet_denoise &&
              (mad_kernel == nullptr || noisevar_kernel == nullptr ||
               shrink_l_kernel == nullptr || shrink_ab_kernel == nullptr ||
@@ -8733,6 +8850,296 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
             return true;
         };
 
+        /*
+         * The final panel's guided soft radius. It runs after the final pixel
+         * curve, on the reconstructed L: prepare() writes the log-domain
+         * guide and source and keeps the pre-filter L, then the same
+         * guidedFilter() chain as the clarity radius runs, and finish()
+         * converts q back and blends it with the pre-filter L. The radius,
+         * the subsampled grid and the four bilinear scales are the host's.
+         */
+        const auto run_softend = [&]() -> bool {
+            const cl_mem guide_memory = memory_of(soft_guide);
+            const cl_mem ble_memory = memory_of(soft_ble);
+            const cl_mem il_memory = memory_of(soft_il);
+            const cl_mem guide_lo_memory = memory_of(soft_guide_lo);
+            const cl_mem src_lo_memory = memory_of(soft_src_lo);
+            const cl_mem mean_i_memory = memory_of(soft_mean_i);
+            const cl_mem mean_p_memory = memory_of(soft_mean_p);
+            const cl_mem corr_p_memory = memory_of(soft_corr_p);
+            const cl_mem corr_i_memory = memory_of(soft_corr_i);
+            const cl_mem tmp_memory = memory_of(soft_tmp);
+            const cl_int guide_pitch = pitch_of(soft_guide);
+            const cl_int ble_pitch = pitch_of(soft_ble);
+            const cl_int il_pitch = pitch_of(soft_il);
+            const cl_int soft_pitch = pitch_of(soft_guide_lo);
+            if (pitch_of(soft_src_lo) != soft_pitch ||
+                pitch_of(soft_mean_i) != soft_pitch ||
+                pitch_of(soft_mean_p) != soft_pitch ||
+                pitch_of(soft_corr_p) != soft_pitch ||
+                pitch_of(soft_corr_i) != soft_pitch ||
+                pitch_of(soft_tmp) != soft_pitch) {
+                error = "lab.wavelet soft-end buffers disagree on pitch";
+                return false;
+            }
+            const cl_int guide_lo_pitch = soft_pitch;
+            const cl_int src_lo_pitch = soft_pitch;
+            const cl_int mean_i_pitch = soft_pitch;
+            const cl_int mean_p_pitch = soft_pitch;
+            const cl_int corr_p_pitch = soft_pitch;
+            const cl_int corr_i_pitch = soft_pitch;
+            const std::size_t low_global[2] = {
+                static_cast<std::size_t>(softend_w),
+                static_cast<std::size_t>(softend_h)};
+            const std::size_t low_rows[2] = {
+                1, static_cast<std::size_t>(softend_h)};
+            const std::size_t low_cols[2] = {
+                static_cast<std::size_t>(softend_w), 1};
+
+            const auto box = [&](const cl_mem& src, cl_int src_pitch,
+                                 const cl_mem& dst, cl_int dst_pitch,
+                                 const char* label) -> bool {
+                bool ok = true;
+                ok = ok && set_arg(box_h_kernel, 0, sizeof(cl_mem), &src);
+                ok = ok && set_arg(box_h_kernel, 1, sizeof(cl_mem),
+                                   &tmp_memory);
+                ok = ok && set_arg(box_h_kernel, 2, sizeof(cl_int),
+                                   &softend_box_rad);
+                ok = ok && set_arg(box_h_kernel, 3, sizeof(cl_int),
+                                   &softend_w);
+                ok = ok && set_arg(box_h_kernel, 4, sizeof(cl_int),
+                                   &softend_h);
+                ok = ok && set_arg(box_h_kernel, 5, sizeof(cl_int),
+                                   &src_pitch);
+                if (!ok || !launch(box_h_kernel, low_rows, label)) {
+                    error = std::string(label) + " arguments failed";
+                    return false;
+                }
+                ok = true;
+                ok = ok && set_arg(box_v_kernel, 0, sizeof(cl_mem),
+                                   &tmp_memory);
+                ok = ok && set_arg(box_v_kernel, 1, sizeof(cl_mem), &dst);
+                ok = ok && set_arg(box_v_kernel, 2, sizeof(cl_int),
+                                   &softend_box_rad);
+                ok = ok && set_arg(box_v_kernel, 3, sizeof(cl_int),
+                                   &softend_w);
+                ok = ok && set_arg(box_v_kernel, 4, sizeof(cl_int),
+                                   &softend_h);
+                ok = ok && set_arg(box_v_kernel, 5, sizeof(cl_int),
+                                   &dst_pitch);
+                if (!ok || !launch(box_v_kernel, low_cols, label)) {
+                    error = std::string(label) + " arguments failed";
+                    return false;
+                }
+                return true;
+            };
+
+            bool ok = true;
+            ok = ok && set_arg(softend_prepare_kernel, 0, sizeof(cl_mem),
+                               &l_memory);
+            ok = ok && set_arg(softend_prepare_kernel, 1, sizeof(cl_int),
+                               &l_pitch);
+            ok = ok && set_arg(softend_prepare_kernel, 2, sizeof(cl_mem),
+                               &guide_memory);
+            ok = ok && set_arg(softend_prepare_kernel, 3, sizeof(cl_int),
+                               &guide_pitch);
+            ok = ok && set_arg(softend_prepare_kernel, 4, sizeof(cl_mem),
+                               &ble_memory);
+            ok = ok && set_arg(softend_prepare_kernel, 5, sizeof(cl_int),
+                               &ble_pitch);
+            ok = ok && set_arg(softend_prepare_kernel, 6, sizeof(cl_mem),
+                               &il_memory);
+            ok = ok && set_arg(softend_prepare_kernel, 7, sizeof(cl_int),
+                               &il_pitch);
+            ok = ok && set_arg(softend_prepare_kernel, 8, sizeof(cl_int),
+                               &cl_width);
+            ok = ok && set_arg(softend_prepare_kernel, 9, sizeof(cl_int),
+                               &cl_height);
+            if (!ok || !launch(softend_prepare_kernel, image_global,
+                               "lab.wavelet soft-end prepare")) {
+                error = "lab.wavelet soft-end prepare arguments failed";
+                return false;
+            }
+
+            ok = true;
+            ok = ok && set_arg(soft_rescale_kernel, 0, sizeof(cl_mem),
+                               &guide_memory);
+            ok = ok && set_arg(soft_rescale_kernel, 1, sizeof(cl_int),
+                               &guide_pitch);
+            ok = ok && set_arg(soft_rescale_kernel, 2, sizeof(cl_mem),
+                               &guide_lo_memory);
+            ok = ok && set_arg(soft_rescale_kernel, 3, sizeof(cl_int),
+                               &guide_lo_pitch);
+            ok = ok && set_arg(soft_rescale_kernel, 4, sizeof(cl_mem),
+                               &ble_memory);
+            ok = ok && set_arg(soft_rescale_kernel, 5, sizeof(cl_int),
+                               &ble_pitch);
+            ok = ok && set_arg(soft_rescale_kernel, 6, sizeof(cl_mem),
+                               &src_lo_memory);
+            ok = ok && set_arg(soft_rescale_kernel, 7, sizeof(cl_int),
+                               &src_lo_pitch);
+            ok = ok && set_arg(soft_rescale_kernel, 8, sizeof(cl_int),
+                               &cl_width);
+            ok = ok && set_arg(soft_rescale_kernel, 9, sizeof(cl_int),
+                               &cl_height);
+            ok = ok && set_arg(soft_rescale_kernel, 10, sizeof(cl_int),
+                               &softend_w);
+            ok = ok && set_arg(soft_rescale_kernel, 11, sizeof(cl_int),
+                               &softend_h);
+            ok = ok && set_arg(soft_rescale_kernel, 12, sizeof(cl_float),
+                               &softend_scale_dx);
+            ok = ok && set_arg(soft_rescale_kernel, 13, sizeof(cl_float),
+                               &softend_scale_dy);
+            if (!ok || !launch(soft_rescale_kernel, low_global,
+                               "lab.wavelet soft-end rescale")) {
+                error = "lab.wavelet soft-end rescale arguments failed";
+                return false;
+            }
+
+            ok = true;
+            ok = ok && set_arg(soft_mul_kernel, 0, sizeof(cl_mem),
+                               &guide_lo_memory);
+            ok = ok && set_arg(soft_mul_kernel, 1, sizeof(cl_int),
+                               &guide_lo_pitch);
+            ok = ok && set_arg(soft_mul_kernel, 2, sizeof(cl_mem),
+                               &src_lo_memory);
+            ok = ok && set_arg(soft_mul_kernel, 3, sizeof(cl_int),
+                               &src_lo_pitch);
+            ok = ok && set_arg(soft_mul_kernel, 4, sizeof(cl_mem),
+                               &corr_p_memory);
+            ok = ok && set_arg(soft_mul_kernel, 5, sizeof(cl_int),
+                               &corr_p_pitch);
+            ok = ok && set_arg(soft_mul_kernel, 6, sizeof(cl_mem),
+                               &corr_i_memory);
+            ok = ok && set_arg(soft_mul_kernel, 7, sizeof(cl_int),
+                               &corr_i_pitch);
+            ok = ok && set_arg(soft_mul_kernel, 8, sizeof(cl_int),
+                               &softend_w);
+            ok = ok && set_arg(soft_mul_kernel, 9, sizeof(cl_int),
+                               &softend_h);
+            if (!ok || !launch(soft_mul_kernel, low_global,
+                               "lab.wavelet soft-end multiply")) {
+                error = "lab.wavelet soft-end multiply arguments failed";
+                return false;
+            }
+
+            if (!box(guide_lo_memory, guide_lo_pitch, mean_i_memory,
+                     mean_i_pitch, "lab.wavelet soft-end mean I") ||
+                !box(src_lo_memory, src_lo_pitch, mean_p_memory,
+                     mean_p_pitch, "lab.wavelet soft-end mean p") ||
+                !box(corr_p_memory, corr_p_pitch, corr_p_memory,
+                     corr_p_pitch, "lab.wavelet soft-end corr p") ||
+                !box(corr_i_memory, corr_i_pitch, corr_i_memory,
+                     corr_i_pitch, "lab.wavelet soft-end corr I")) {
+                return false;
+            }
+
+            ok = true;
+            ok = ok && set_arg(soft_reduce_kernel, 0, sizeof(cl_mem),
+                               &mean_i_memory);
+            ok = ok && set_arg(soft_reduce_kernel, 1, sizeof(cl_int),
+                               &mean_i_pitch);
+            ok = ok && set_arg(soft_reduce_kernel, 2, sizeof(cl_mem),
+                               &mean_p_memory);
+            ok = ok && set_arg(soft_reduce_kernel, 3, sizeof(cl_int),
+                               &mean_p_pitch);
+            ok = ok && set_arg(soft_reduce_kernel, 4, sizeof(cl_mem),
+                               &corr_i_memory);
+            ok = ok && set_arg(soft_reduce_kernel, 5, sizeof(cl_int),
+                               &corr_i_pitch);
+            ok = ok && set_arg(soft_reduce_kernel, 6, sizeof(cl_mem),
+                               &corr_p_memory);
+            ok = ok && set_arg(soft_reduce_kernel, 7, sizeof(cl_int),
+                               &corr_p_pitch);
+            ok = ok && set_arg(soft_reduce_kernel, 8, sizeof(cl_mem),
+                               &corr_i_memory);
+            ok = ok && set_arg(soft_reduce_kernel, 9, sizeof(cl_int),
+                               &corr_i_pitch);
+            ok = ok && set_arg(soft_reduce_kernel, 10, sizeof(cl_mem),
+                               &corr_p_memory);
+            ok = ok && set_arg(soft_reduce_kernel, 11, sizeof(cl_int),
+                               &corr_p_pitch);
+            ok = ok && set_arg(soft_reduce_kernel, 12, sizeof(cl_int),
+                               &softend_w);
+            ok = ok && set_arg(soft_reduce_kernel, 13, sizeof(cl_int),
+                               &softend_h);
+            ok = ok && set_arg(soft_reduce_kernel, 14, sizeof(cl_float),
+                               &softend_epsilon);
+            if (!ok || !launch(soft_reduce_kernel, low_global,
+                               "lab.wavelet soft-end reduce")) {
+                error = "lab.wavelet soft-end reduce arguments failed";
+                return false;
+            }
+
+            if (!box(corr_i_memory, corr_i_pitch, corr_i_memory,
+                     corr_i_pitch, "lab.wavelet soft-end mean a") ||
+                !box(corr_p_memory, corr_p_pitch, corr_p_memory,
+                     corr_p_pitch, "lab.wavelet soft-end mean b")) {
+                return false;
+            }
+
+            ok = true;
+            ok = ok && set_arg(soft_upsample_kernel, 0, sizeof(cl_mem),
+                               &corr_i_memory);
+            ok = ok && set_arg(soft_upsample_kernel, 1, sizeof(cl_int),
+                               &corr_i_pitch);
+            ok = ok && set_arg(soft_upsample_kernel, 2, sizeof(cl_mem),
+                               &corr_p_memory);
+            ok = ok && set_arg(soft_upsample_kernel, 3, sizeof(cl_int),
+                               &corr_p_pitch);
+            ok = ok && set_arg(soft_upsample_kernel, 4, sizeof(cl_mem),
+                               &guide_memory);
+            ok = ok && set_arg(soft_upsample_kernel, 5, sizeof(cl_int),
+                               &guide_pitch);
+            ok = ok && set_arg(soft_upsample_kernel, 6, sizeof(cl_mem),
+                               &ble_memory);
+            ok = ok && set_arg(soft_upsample_kernel, 7, sizeof(cl_int),
+                               &ble_pitch);
+            ok = ok && set_arg(soft_upsample_kernel, 8, sizeof(cl_int),
+                               &cl_width);
+            ok = ok && set_arg(soft_upsample_kernel, 9, sizeof(cl_int),
+                               &cl_height);
+            ok = ok && set_arg(soft_upsample_kernel, 10, sizeof(cl_int),
+                               &softend_w);
+            ok = ok && set_arg(soft_upsample_kernel, 11, sizeof(cl_int),
+                               &softend_h);
+            ok = ok && set_arg(soft_upsample_kernel, 12, sizeof(cl_float),
+                               &softend_scale_ux);
+            ok = ok && set_arg(soft_upsample_kernel, 13, sizeof(cl_float),
+                               &softend_scale_uy);
+            if (!ok || !launch(soft_upsample_kernel, image_global,
+                               "lab.wavelet soft-end upsample")) {
+                error = "lab.wavelet soft-end upsample arguments failed";
+                return false;
+            }
+
+            ok = true;
+            ok = ok && set_arg(softend_finish_kernel, 0, sizeof(cl_mem),
+                               &ble_memory);
+            ok = ok && set_arg(softend_finish_kernel, 1, sizeof(cl_int),
+                               &ble_pitch);
+            ok = ok && set_arg(softend_finish_kernel, 2, sizeof(cl_mem),
+                               &l_memory);
+            ok = ok && set_arg(softend_finish_kernel, 3, sizeof(cl_int),
+                               &l_pitch);
+            ok = ok && set_arg(softend_finish_kernel, 4, sizeof(cl_mem),
+                               &il_memory);
+            ok = ok && set_arg(softend_finish_kernel, 5, sizeof(cl_int),
+                               &il_pitch);
+            ok = ok && set_arg(softend_finish_kernel, 6, sizeof(cl_int),
+                               &cl_width);
+            ok = ok && set_arg(softend_finish_kernel, 7, sizeof(cl_int),
+                               &cl_height);
+            ok = ok && set_arg(softend_finish_kernel, 8, sizeof(cl_float),
+                               &softend_blend);
+            if (!ok || !launch(softend_finish_kernel, image_global,
+                               "lab.wavelet soft-end finish")) {
+                error = "lab.wavelet soft-end finish arguments failed";
+                return false;
+            }
+            return true;
+        };
+
         if (clarity_active) {
             /*
              * The clarity arm. The first pass runs with CLmethod forced to
@@ -8882,6 +9289,16 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
                 return RT_STAGE_FALLBACK;
             }
         } else if (!run_transform(true, wavelet_ab, wavelet_levels)) {
+            return RT_STAGE_FALLBACK;
+        }
+
+        /*
+         * The final panel's guided soft radius runs after the final pixel
+         * curve on the reconstructed L, in both the denoise and the plain
+         * branch, exactly where ip_wavelet() runs it at the end of its block.
+         */
+        if (softend_active && !run_softend()) {
+            error = "lab.wavelet soft-end radius failed";
             return RT_STAGE_FALLBACK;
         }
     }

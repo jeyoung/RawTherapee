@@ -340,6 +340,111 @@ bool decodeWaveletSoftRadius(const procparams::WaveletParams& wavelet,
 }
 
 
+/*
+ * The final panel's guided soft radius, decoded from the export block's
+ * `softradend` sequence. Only the portable sub-case is admitted: the block's
+ * second, coefficient-domain pass (Thrend > 0) and the hue modulation
+ * (non-identity wavguidcurve) stay host residuals. The block derives the
+ * radius from the slider and the image extent; guidedfilter.cc derives the
+ * subsampling, the box radius and the bilinear scales from that radius. Every
+ * derived value is computed here with the block's own arithmetic.
+ */
+struct WaveletSoftEnd
+{
+    bool active = false;
+    float blend = 0.f;
+    float epsilon = 0.f;
+    int subsampling = 1;
+    int width = 0;
+    int height = 0;
+    int box_rad = 0;
+    float scale_dx = 1.f;
+    float scale_dy = 1.f;
+    float scale_ux = 1.f;
+    float scale_uy = 1.f;
+};
+
+bool decodeWaveletSoftEnd(const procparams::WaveletParams& wavelet,
+                          int width, int height, WaveletSoftEnd& out)
+{
+    out = WaveletSoftEnd{};
+    if (wavelet.softradend == 0.0) {
+        return true;
+    }
+    if (!std::isfinite(wavelet.softradend) ||
+        wavelet.softradend < LAB_WAVELET_MIN_SOFT_END ||
+        wavelet.softradend > LAB_WAVELET_MAX_SOFT_END) {
+        return false;
+    }
+    /* The block gates the block on `cp.finena`, and the two unported arms
+     * are the coefficient-domain second pass and the hue modulation. */
+    if (!wavelet.expfinal || wavelet.thrend != 0.0) {
+        return false;
+    }
+    {
+        const FlatCurve guid_curve(wavelet.wavguidcurve);
+        if (!guid_curve.isIdentity()) {
+            return false;
+        }
+    }
+    if (!std::isfinite(wavelet.strend) ||
+        wavelet.strend < LAB_WAVELET_MIN_STREND ||
+        wavelet.strend > LAB_WAVELET_MAX_STREND ||
+        wavelet.detend < LAB_WAVELET_MIN_DETEND ||
+        wavelet.detend > LAB_WAVELET_MAX_DETEND) {
+        return false;
+    }
+    if (width <= 0 || height <= 0) {
+        return false;
+    }
+
+    /*
+     * ip_wavelet(): `r = max(int(softradend / skip), 1)`. The node is
+     * full-tile only, so the call site's skip is one; assert rather than
+     * silently deriving a different radius.
+     */
+    constexpr int skip = 1;
+    static_assert(skip == 1, "the lab.wavelet node is full-tile only");
+    const float guid = static_cast<float>(wavelet.softradend);
+    const int radius = std::max(static_cast<int>(guid / skip), 1);
+
+    const int subsampling =
+        calculateGuidedSubsampling(width, height, radius);
+    const int w = width / subsampling;
+    const int h = height / subsampling;
+    if (w < 1 || h < 1) {
+        return false;
+    }
+
+    /* f_mean()'s radius: the block truncates float(r) / subsampling to int,
+     * clamps with LIM(rad, 0, (min(w, h) - 1) / 2 - 1) and boxblur() then
+     * clamps with min(radius, W - 1, H - 1). */
+    const float r1 = static_cast<float>(radius) / subsampling;
+    int rad = static_cast<int>(r1);
+    rad = std::max(0, std::min(rad, (std::min(w, h) - 1) / 2 - 1));
+    rad = std::min(std::min(rad, w - 1), h - 1);
+
+    /* blend = LIM01(float(strend) / 100.f), epsilon = 0.001f * 2^-detend. */
+    const float blend = std::min(
+        1.f, std::max(0.f, static_cast<float>(wavelet.strend) / 100.f));
+    const float epsilon = static_cast<float>(
+        0.001f * std::pow(2.0, -static_cast<double>(wavelet.detend)));
+
+    out.active = true;
+    out.blend = blend;
+    out.epsilon = epsilon;
+    out.subsampling = subsampling;
+    out.width = w;
+    out.height = h;
+    out.box_rad = rad;
+    out.scale_dx = static_cast<float>(width) / static_cast<float>(w);
+    out.scale_dy = static_cast<float>(height) / static_cast<float>(h);
+    out.scale_ux = static_cast<float>(w) / static_cast<float>(width);
+    out.scale_uy = static_cast<float>(h) / static_cast<float>(height);
+    return true;
+}
+
+
 void toningMultipliers(const procparams::WaveletParams& wavelet,
                        float rg[RT_LAB_WAVELET_TONING_MULS],
                        float by[RT_LAB_WAVELET_TONING_MULS], bool& any)
@@ -854,15 +959,28 @@ bool labWaveletWaveletSupported(const procparams::ProcParams& params,
         }
     }
     /*
-     * The clarity arm's guided soft radius. The final panel's guided soft
-     * radius (`softradend`) is not ported and stays a residual. The clarity
-     * arm reads `softrad` only inside its two-pass sequence, so a value set
-     * while the arm is off is refused rather than silently ignored, and an
-     * admitted value must be inside the 0..100 slider range and leave a
-     * non-empty subsampled guided-filter grid.
+     * The clarity arm's guided soft radius. The clarity arm reads `softrad`
+     * only inside its two-pass sequence, so a value set while the arm is off
+     * is refused rather than silently ignored, and an admitted value must be
+     * inside the 0..100 slider range and leave a non-empty subsampled
+     * guided-filter grid.
+     */
+    /*
+     * The final panel's guided soft radius (`softradend`). It runs only with
+     * the final panel enabled, and only the portable sub-case is admitted:
+     * the block's coefficient-domain second block (Thrend > 0) and the hue
+     * modulation (non-identity wavguidcurve) stay host residuals. The clarity
+     * arm and the clarity soft radius cannot run alongside it, and a value
+     * outside the 0..1000 slider range or a derived grid with no pixels is
+     * refused.
      */
     if (wavelet.softradend != 0.0) {
-        return false;
+        WaveletSoftEnd softend;
+        if (!decodeWaveletSoftEnd(wavelet, width, height, softend) ||
+            !softend.active || !final_curves || clarity.active ||
+            wavelet.softrad != 0.0) {
+            return false;
+        }
     }
     if (wavelet.softrad != 0.0) {
         if (!clarity.active) {
@@ -1244,6 +1362,7 @@ RtLabWaveletContext LabWaveletContext::descriptor(bool supported)
     context.wavelet.final = wavelet_final_ ? 1u : 0u;
     context.wavelet.toning = wavelet_toning_ ? 1u : 0u;
     context.wavelet.denoise = wavelet_denoise_ ? 1u : 0u;
+    context.wavelet.softend = softend_active_ ? 1u : 0u;
     context.wavelet.refine = wavelet_refine_ ? 1u : 0u;
     context.wavelet.refine_poly = static_cast<uint32_t>(
         wavelet_refine_poly_x_.size());
@@ -1383,13 +1502,37 @@ int LabWaveletContext::build(RtLabWaveletResult& out)
     wavelet_final_ = params_.wavelet.enabled && params_.wavelet.expfinal &&
                      params_.wavelet.BAmethod == "none" &&
                      !params_.wavelet.tmr &&
-                     params_.wavelet.softradend == 0.0 &&
                      params_.wavelet.softrad == 0.0 &&
                      std::isfinite(params_.wavelet.sigmafin) &&
                      params_.wavelet.sigmafin >=
                          LAB_WAVELET_MIN_WAVELET_SIGMAFIN &&
                      params_.wavelet.sigmafin <=
                          LAB_WAVELET_MAX_WAVELET_SIGMAFIN;
+    /*
+     * The final panel's guided soft radius. It runs after the final pixel
+     * curve, so it needs the final arm; the clarity arm and the clarity soft
+     * radius are refused alongside it. `decodeWaveletSoftEnd()` repeats the
+     * admission rules so a forced build can never run a partial pass.
+     */
+    {
+        WaveletSoftEnd softend;
+        if (!decodeWaveletSoftEnd(params_.wavelet, width_, height_, softend) ||
+            (softend.active &&
+             (!wavelet_final_ || clarity_active_ ||
+              params_.wavelet.softrad != 0.0))) {
+            return 5;
+        }
+        softend_active_ = softend.active;
+        softend_blend_ = softend.blend;
+        softend_epsilon_ = softend.epsilon;
+        softend_w_ = softend.width;
+        softend_h_ = softend.height;
+        softend_box_rad_ = softend.box_rad;
+        softend_scale_dx_ = softend.scale_dx;
+        softend_scale_dy_ = softend.scale_dy;
+        softend_scale_ux_ = softend.scale_ux;
+        softend_scale_uy_ = softend.scale_uy;
+    }
     /*
      * The toning panel's zero-protection arm. The admission rules repeat here
      * so a forced build can never run a partial toning pass.
@@ -1621,7 +1764,7 @@ int LabWaveletContext::build(RtLabWaveletResult& out)
                                    wavelet_refine_,
                                    static_cast<std::uint32_t>(
                                        wavelet_refine_poly_x_.size()),
-                                   wavelet_soft_),
+                                   wavelet_soft_, softend_active_),
             0.f);
 
         float* table = wavelet_params_.data();
@@ -1948,7 +2091,7 @@ int LabWaveletContext::build(RtLabWaveletResult& out)
                 wavelet_final_, wavelet_toning_, wavelet_denoise_,
                 wavelet_refine_,
                 static_cast<std::uint32_t>(wavelet_refine_poly_x_.size()),
-                false);
+                false, false);
             if (soft_offset + RT_LAB_WAVELET_SOFT_LUT_ENTRIES !=
                 wavelet_params_.size()) {
                 return 5;
@@ -1958,6 +2101,27 @@ int LabWaveletContext::build(RtLabWaveletResult& out)
                  index < RT_LAB_WAVELET_SOFT_LUT_ENTRIES; ++index) {
                 soft_lut[index] = Color::cachefy[static_cast<int>(index)];
             }
+        }
+        if (softend_active_) {
+            const std::size_t softend_offset =
+                wavelet_params_.size() - RT_LAB_WAVELET_SOFTEND_ENTRIES;
+            float* softend_tail = table + softend_offset;
+            softend_tail[RT_LAB_WAVELET_SOFTEND_BLEND] = softend_blend_;
+            softend_tail[RT_LAB_WAVELET_SOFTEND_EPSILON] = softend_epsilon_;
+            softend_tail[RT_LAB_WAVELET_SOFTEND_W] =
+                static_cast<float>(softend_w_);
+            softend_tail[RT_LAB_WAVELET_SOFTEND_H] =
+                static_cast<float>(softend_h_);
+            softend_tail[RT_LAB_WAVELET_SOFTEND_BOXRAD] =
+                static_cast<float>(softend_box_rad_);
+            softend_tail[RT_LAB_WAVELET_SOFTEND_SCALE_DX] =
+                softend_scale_dx_;
+            softend_tail[RT_LAB_WAVELET_SOFTEND_SCALE_DY] =
+                softend_scale_dy_;
+            softend_tail[RT_LAB_WAVELET_SOFTEND_SCALE_UX] =
+                softend_scale_ux_;
+            softend_tail[RT_LAB_WAVELET_SOFTEND_SCALE_UY] =
+                softend_scale_uy_;
         }
     }
 
