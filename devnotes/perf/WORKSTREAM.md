@@ -218,6 +218,19 @@ current tip.
   host's `noisevarlum` loop races under OpenMP and is not a deterministic
   reference. The denoise curves, the expert pairing and the BiShrink arms
   remain host residuals. `66613d0a9`, `6db958afe`, `679f5b4d8`.
+- **`lab.wavelet` denoise curve (`sliMethod=cur`)**: the post-denoise
+  refinement. The host samples the block's `WavCurve` over `wavdenoise` into
+  501 entries, detects `cp.denoicurv` exactly as the block does, keeps the
+  pre-denoise L coefficients and runs `Evaluate2()` before and after the
+  denoise. The device carries both statistics, computes the `mixmet` weight,
+  the `intp()` mixes and the per-level `logmax`/`rap`/`asig`/`bsig`/`amean`/
+  `k`/`maxVal` on the host's doubles, and the kernel ports
+  `xlogf`/`xexpf`/`pow_F` and the block's repeated four-band write. Ten cases
+  (mixmet 0-3, an identity curve, contrast, edge, final curves, an odd size
+  and all panels) match the host with worst 0.043945 LSB16; four residuals
+  (`sigm` range, expert pairing, Thrden and user chromi) stay on the host.
+  `labwavelet-denoise-cur.pp3` records `impl=opencl` at 1 LSB16 (21,068 of
+  30,419,712 samples). `ba5f8f1d3`, `dca455499`.
 - **`local.adjustments` groundwork (pushed)**: host block extracted
   byte-for-byte, per-spot context/ABI (`LAJC`), exact block-level predicate,
   refusal path, 25 residual mutations and four multi-spot host cases. No
@@ -802,8 +815,11 @@ when the block's own trim drops them to zero; a profile whose `ch[]`, opacity
 curve, `cbenab`, `CHmethod`/`chro` or residual sliders would stop that trim
 short of zero stays a host residual.
 
-Next is the guided soft radius: `softrad` on the clarity arm and `softradend`
-on the final panel both call `guidedFilter()` on a host-built guide, so the
+The denoise-curve refinement landed (`ba5f8f1d3`, `dca455499`). Next is the
+`sli` `Thrden` refinement, which reuses the same machinery with
+`kc = wavlow[absciss] - 1` and admits a non-zero `Thrden`; then the guided
+soft radius, whose WIP branch narrows the remaining fault to the
+`CLmethod=inf` pre-merge L (see `wip/lab-wavelet-softrad`). The soft radius
 unit is a separable box/reduction kernel pair plus the XYZ round trip, not a
 new merge. The standard denoise arm (and the chroma denoise the block forces
 at six levels) landed with the unit above; its denoise curves, expert pairing,

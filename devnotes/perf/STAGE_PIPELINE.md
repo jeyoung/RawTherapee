@@ -264,11 +264,25 @@ keeps a second band set for
 those L coefficients, builds the MAD median from a 32768-bin device histogram,
 reproduces `noisevarlum`/`noisevarchrom` at the clamped `(2y+1, 2x+1)` sample,
 and ports `ShrinkAllL`/`ShrinkAllAB` with the lab.tools box blur. Only the
-plain `quaMethod == "cons"` slider arm is admitted; the denoise curves, expert
-pairing, user chroma strength, noise balance, hue curve and colour-by-noise
-stay host residuals. The pass order is forward analysis, statistics/mea,
-MAD/shrink L, contrast/edge/final, noise variance and chroma denoise, then the
-a/b planes and the deferred L reconstruction. The final tail reuses the
+plain `quaMethod == "cons"` slider arm is admitted, and with `sliMethod ==
+"cur"` the post-denoise curve refinement runs too: the host samples the
+block's `WavCurve` over `wavdenoise`, detects `cp.denoicurv` over the first
+500 entries, and keeps the pre-denoise L coefficients in the free `bands` set
+so no extra band memory is allocated. The pre- and post-denoise `Evaluate2()`
+blocks are read back separately; the host reproduces the near-zero early-out,
+the `mixmet` weight and the per-level curve scalars, and the kernel ports
+`xlogf()`/`xexpf()`/`pow_F()` rather than substituting the platform
+transcendentals. The refinement is launched direction-major, level-minor and
+writes levels 0..3 on every level iteration, exactly as the block's repeated
+application. `cp.denmet` is hard-coded to four, so the only level factors are
+0.3 on levels 0 and 1 and one on levels 2 and 3. The `sli` Thrden arm, the
+expert pairing, the user chroma strength, noise balance, hue curve and
+colour-by-noise stay host residuals, as does an unknown `mixMethod` or a
+sigma outside its widget range. The pass order is forward analysis,
+statistics/mea, MAD/shrink L, the pre-denoise snapshot, denoise, the
+post-denoise statistics and curve refinement, contrast/edge/final, noise
+variance and chroma denoise, then the a/b planes and the deferred L
+reconstruction. The final tail reuses the
 statistics the block built before the denoise unless
 `cp.val > 0 || ref || contr || cp.diagcurv`; the host evaluates that condition
 and the device passes it as `final_refresh`, so the tail sees the same

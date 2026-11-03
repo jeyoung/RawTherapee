@@ -88,7 +88,10 @@ pairs are exact. The gate is the peak absolute error (PAE) in normalised units;
 | 2026-11-01 | 0abd76894..5781f1c38 | POCL (CPU) | 10-case toning residual matrix (protab on, sigmaton low/high, no opacity multiplier, expnoise, expbl, expresid, expclari, CLmethod one, skin protection), `stage-residency-test` | device vs host block | 0 (host) | PASS |
 | 2026-11-02 | 1005b12da..679f5b4d8 | POCL (CPU) | colorspace_flowers.pef / `labwavelet-denoise.pp3` (Expnoise, `Lev0..4` non-zero, `quaMethod=cons`, no user chroma), `lab.wavelet` | off vs auto, 16-bit TIFF | 1 LSB | PASS |
 | 2026-11-02 | 1005b12da..679f5b4d8 | POCL (CPU) | 17-case denoise matrix (levels 3/5/6, ballum 10/7/5/0/-2, high-level sliders only, a light slider, odd width 179x160, odd height 180x161, odd both 179x161, with contrast, edge, final curves, toning, all panels and all panels padded), `stage-residency-test` | device vs host block | 0.015625 LSB16 (worst: ballum 0) | PASS |
-| 2026-11-02 | 66613d0a9..6db958afe | POCL (CPU) | 12-case denoise residual matrix (`quaMethod=agre`, user chromfi/chromco, balchrom, `Wavhuecurve`, `CBenab`, `sliMethod=cur`, Thrden, Ballum range, level range, all sliders zero, sub-128 window), `stage-residency-test` | device vs host block | 0 (host) | PASS |
+| 2026-11-02 | 66613d0a9..6db958afe | POCL (CPU) | 11-case denoise residual matrix (`quaMethod=agre`, user chromfi/chromco, balchrom, `Wavhuecurve`, `CBenab`, Thrden, Ballum range, level range, all sliders zero, sub-128 window), `stage-residency-test` | device vs host block | 0 (host) | PASS |
+| 2026-11-03 | `6bcd826f9..dca455499` | POCL (CPU) | colorspace_flowers.pef / `labwavelet-denoise-cur.pp3` (Expnoise, `sliMethod=cur`, `mixMethod=mix7`, non-identity `wavdenoise`), `lab.wavelet` | off vs auto, 16-bit TIFF | 1 LSB (AE=1, 21,068 of 30,419,712) | PASS |
+| 2026-11-03 | `6bcd826f9..dca455499` | POCL (CPU) | 10-case "cur" matrix (mixmet 0/1/2/3, identity curve, contrast, edge, final curves, odd 179x161, all panels), `stage-residency-test` | device vs host block | 0.043945 LSB16 (worst: final curves) | PASS |
+| 2026-11-03 | `6bcd826f9..dca455499` | POCL (CPU) | 4-case "cur" residual matrix (sigm above range, expert pairing, Thrden, user chromfi), `stage-residency-test` | device vs host block | 0 (host) | PASS |
 | 2026-11-02 | 89e0a844b..47b9980fb | POCL (CPU) | colorspace_flowers.pef / `labtools-labcurve-contrast.pp3` (Lab curves with contrast 30, L/a/b/cc/lc/cl tables), `lab.tools` | off vs auto, 16-bit TIFF | 0 (exact) | PASS |
 | 2026-11-02 | 89e0a844b..47b9980fb | POCL (CPU) | 3-case Lab-contrast matrix (contrast 5, contrast 15 with L curve+brightness, contrast 30 with all six tables), `stage-residency-test` | device vs host block | 0 (exact) | PASS |
 | 2026-11-02 | uncommitted | POCL (CPU) | colorspace_flowers.pef / `labtools-labcurve-contrast.pp3` with `Gamutmunse=XYZ`, `lab.tools` | off vs auto, 16-bit TIFF | 0 (exact) | PASS |
@@ -363,8 +366,8 @@ peak absolute error is zero for the synthetic node tests:
   width, odd height, odd both, with contrast, edge, final curves, toning, all
   panels and all panels padded) match the host block; the panel-off comparison
   changes 85,918-114,240 samples per case, so the parity is not vacuous.
-  Twelve residual configurations (`quaMethod` agre, user chromfi/chromco,
-  balchrom, a non-identity `Wavhuecurve`, `CBenab`, `sliMethod` cur, Thrden,
+  Eleven residual configurations (`quaMethod` agre, user chromfi/chromco,
+  balchrom, a non-identity `Wavhuecurve`, `CBenab`, Thrden,
   Ballum outside its widget range, a level slider outside its range, all
   sliders zero and the 128-pixel window) run the host builtin byte for byte.
   `labwavelet-denoise.pp3` is 1 LSB16 on the export TIFF (26,639 of
@@ -376,6 +379,36 @@ peak absolute error is zero for the synthetic node tests:
   second seven-level L band set while a and b run; a 45.7 MP frame exceeds
   the 1 GiB default stage budget and falls back to the host, recorded as
   `impl=host`, so large-frame denoise is not a device case yet.
+- The `lab.wavelet` denoise-curve refinement (`sliMethod == "cur"`) ports
+  `ip_wavelet()`'s post-denoise curve multiply. The host samples the block's
+  own `WavCurve` over `wavdenoise` into 501 entries, detects `cp.denoicurv`
+  exactly as the block does (any of the first 500 entries differs from one)
+  and uploads the curve in the refinement tail. `cp.denmet` is hard-coded to
+  four, so the only level factors are 0.3 on levels 0 and 1 and one on levels
+  2 and 3; each level iteration writes all four bands. The host evaluates
+  `Evaluate2()` before and after `WaveletDenoiseAllL()`, reproduces the
+  near-zero early-out, computes the `mixmet` weight (0, 0.5, 0.7, 1), the
+  `intp()` post/pre mix and the per-level `logmax`/`rap`/`asig`/`bsig`/
+  `amean`/`k`/`maxVal` on the same doubles the block uses, and passes them as
+  scalars. The kernel ports `xlogf()`/`xexpf()`/`pow_F()` from
+  `rtengine/sleef.h` rather than substituting the platform `log()`/`exp()`,
+  because a one-ulp abscissa difference can move the refinement factor. The
+  pre-denoise L set is snapshotted into the free `bands` set before
+  `denoise_l`, so the memory budget is unchanged, and the refinement is
+  launched direction-major, level-minor, writing levels 0..3 on every level
+  iteration exactly as the block does. Ten device cases (mixmet 0/1/2/3, an
+  identity curve, contrast, edge, final curves, odd 179x161, all panels) match
+  the host block with a worst peak error of 0.043945 LSB16; the sli/cur host
+  comparison changes 86,454-114,237 samples per case, so the refinement is not
+  vacuous. The identity-curve case runs the device denoise without the
+  refinement, as the block does. Four residual configurations (sigma above
+  its widget range, the expert level pairing, Thrden and a user chromfi)
+  run the host builtin byte for byte. `labwavelet-denoise-cur.pp3` is 1 LSB16
+  on the export TIFF (AE=1, 21,068 of 30,419,712 samples), records
+  `impl=opencl`, and differs from the same profile with `sliMethod=sli` at
+  30,064,859 of 30,419,712 samples (PAE 1600 LSB16), so the export exercises
+  the refinement. The `sli` Thrden arm, the expert pairing, an unknown
+  `mixmethod` and a sigma outside the widget range stay host residuals.
 - Impulse denoise and defringe, through the `lab.sharpening` node, run as one
   atomic pair. The device test compares the observable corrected sets and all
   three planes: the impulse fixture and the combined pair correct exactly the
