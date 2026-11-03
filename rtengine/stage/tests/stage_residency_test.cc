@@ -13556,10 +13556,26 @@ void test_local_adjustments(bool available)
             {"blur", [](auto& p) {
                  p.locallab.spots[0].expblur = true;
              }},
-            {"blur median", [](auto& p) {
+            {"blur median method none", [](auto& p) {
                  p.locallab.spots[0].expcolor = false;
                  p.locallab.spots[0].expblur = true;
                  p.locallab.spots[0].radius = 10.0;
+                 p.locallab.spots[0].locwavcurveden.clear();
+                 p.locallab.spots[0].blMethod = "med";
+                 p.locallab.spots[0].medMethod = "none";
+             }},
+            {"blur median passes", [](auto& p) {
+                 p.locallab.spots[0].expcolor = false;
+                 p.locallab.spots[0].expblur = true;
+                 p.locallab.spots[0].radius = 10.0;
+                 p.locallab.spots[0].locwavcurveden.clear();
+                 p.locallab.spots[0].blMethod = "med";
+                 p.locallab.spots[0].itera = 5;
+             }},
+            {"blur median radius", [](auto& p) {
+                 p.locallab.spots[0].expcolor = false;
+                 p.locallab.spots[0].expblur = true;
+                 p.locallab.spots[0].radius = 40.0;
                  p.locallab.spots[0].locwavcurveden.clear();
                  p.locallab.spots[0].blMethod = "med";
              }},
@@ -13622,8 +13638,16 @@ void test_local_adjustments(bool available)
                  p.locallab.spots[0].expcolor = false;
                  p.locallab.spots[0].expblur = true;
                  p.locallab.spots[0].radius = 10.0;
+                 p.locallab.spots[0].quamethod = "cons";
                  p.locallab.spots[0].locwavcurveden = {
                      1.0, 0.0, 0.5, 0.35, 0.35, 1.0, 0.5, 0.35, 0.35};
+             }},
+            {"blur denoise enhden", [](auto& p) {
+                 p.locallab.spots[0].expcolor = false;
+                 p.locallab.spots[0].expblur = true;
+                 p.locallab.spots[0].radius = 10.0;
+                 p.locallab.spots[0].locwavcurveden.clear();
+                 p.locallab.spots[0].qualityMethod = "enhden";
              }},
             {"blur chroma channel", [](auto& p) {
                  p.locallab.spots[0].expcolor = false;
@@ -14302,9 +14326,8 @@ void test_local_adjustments(bool available)
                 spot.loc = {loc_x, loc_x, loc_y, loc_y};
                 p.locallab.spots.push_back(spot);
             };
-        /* Blur & Noise's Gaussian arm. The spot radius is the block's sigma
-         * source (sigma = radius / 1.4), not the spot extent; `loc` still
-         * sets the ROI. */
+        /* Blur & Noise. The spot radius is the block's sigma source (sigma =
+         * radius / 1.4) for the Gaussian arm; `loc` still sets the ROI. */
         const auto blur_spot = [&](rtengine::procparams::ProcParams& p,
                                    double radius, const char* chroma,
                                    int sensitivity) {
@@ -14321,7 +14344,8 @@ void test_local_adjustments(bool available)
             spot.blMethod = "blur";
             spot.chroMethod = chroma;
             spot.sensibn = sensitivity;
-            /* An idle denoise curve; the denoise arm is a residual. */
+            /* An idle denoise curve; the cases that exercise the curve set
+             * their own. */
             spot.locwavcurveden.clear();
         };
         complex.push_back({"vibrance only", 238, 64, [&](auto& p) {
@@ -15464,6 +15488,123 @@ void test_local_adjustments(bool available)
             add_spot(p, 0, 0, 700, true, 0, 0, 0, "ELI", "NONE");
             blur_spot(p, 18.0, "all", 40);
         }});
+        /* The GUI default denoise curve, which the predicate admits because
+         * the default Quality method "none" leaves DeNoise() idle. Several
+         * curve amounts reach the same no-op, and the default blur arm is the
+         * acceptance profile. */
+        const auto default_denoise_curve = [](auto& p) {
+            p.locallab.spots[0].locwavcurveden = {
+                1.0, 0.0, 0.09, 0.35, 0.0, 0.33, 0.17, 0.33, 0.35,
+                1.0, 0.03, 0.35, 0.35};
+        };
+        const auto flat_denoise_curve = [](auto& p, double amount) {
+            p.locallab.spots[0].locwavcurveden = {
+                1.0, 0.0, amount, 0.35, 0.35, 1.0, amount, 0.35, 0.35};
+        };
+        complex.push_back({"blur default denoise curve", 238, 64,
+                           [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            blur_spot(p, 10.0, "all", 40);
+            default_denoise_curve(p);
+        }});
+        complex.push_back({"blur denoise curve 0.2", 238, 64,
+                           [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            blur_spot(p, 10.0, "lum", 40);
+            flat_denoise_curve(p, 0.2);
+        }});
+        complex.push_back({"blur denoise curve 0.9", 238, 64,
+                           [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            blur_spot(p, 10.0, "lum", 40);
+            flat_denoise_curve(p, 0.9);
+        }});
+        /* The median arm: Median_Denoise()'s four window sizes, its pass
+         * count, the plane selectors and ROI edges. */
+        const auto median_spot = [&](rtengine::procparams::ProcParams& p,
+                                     const char* method, int passes) {
+            blur_spot(p, 10.0, "all", 40);
+            p.locallab.spots[0].blMethod = "med";
+            p.locallab.spots[0].medMethod = method;
+            p.locallab.spots[0].itera = passes;
+        };
+        complex.push_back({"median 3x3", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            median_spot(p, "33", 1);
+        }});
+        complex.push_back({"median 5x5", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            median_spot(p, "55", 1);
+        }});
+        complex.push_back({"median 7x7", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            median_spot(p, "77", 1);
+        }});
+        complex.push_back({"median 9x9", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            median_spot(p, "99", 1);
+        }});
+        complex.push_back({"median 5x5 four passes", 238, 64,
+                           [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            median_spot(p, "55", 4);
+        }});
+        complex.push_back({"median 7x7 three passes", 238, 64,
+                           [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            median_spot(p, "77", 3);
+        }});
+        complex.push_back({"median chroma", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            median_spot(p, "55", 1);
+            p.locallab.spots[0].chroMethod = "chr";
+        }});
+        complex.push_back({"median ROI edges", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 200, true, 0, 0, 0, "ELI", "NONE");
+            median_spot(p, "77", 1);
+        }});
+        complex.push_back({"median and colour", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 35, 10, -5, "ELI", "NONE");
+            median_spot(p, "55", 1);
+            p.locallab.spots[0].expcolor = true;
+            p.locallab.spots[0].chroma = 35;
+            p.locallab.spots[0].lightness = 10;
+            p.locallab.spots[0].contrast = -5;
+        }});
+        complex.push_back({"median and log", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            median_spot(p, "55", 1);
+            log_spot(p, 60, true, 0.0, 0.4, 100.0, -5.0, 10.0, 10.0,
+                     18.0);
+        }});
+        complex.push_back({"median 179x49", 179, 49, [&](auto& p) {
+            add_spot(p, 0, 0, 700, true, 0, 0, 0, "ELI", "NONE");
+            median_spot(p, "77", 1);
+        }});
+        /* Blur then median in list order: each spot reads the previous
+         * spot's read-back image, as the host's labView does. */
+        complex.push_back({"blur then median spot", 238, 64, [&](auto& p) {
+            add_spot(p, -300, -150, 700, true, 0, 0, 0, "ELI", "NONE");
+            blur_spot(p, 10.0, "all", 40);
+            default_denoise_curve(p);
+            add_spot(p, 0, 0, 500, true, 0, 0, 0, "ELI", "NONE");
+            auto& second = p.locallab.spots[1];
+            second.expcolor = false;
+            second.expblur = true;
+            second.radius = 10.0;
+            second.strength = 0;
+            second.strengr = 0;
+            second.guidbl = 0;
+            second.invbl = false;
+            second.fftwbl = false;
+            second.enablMask = false;
+            second.blMethod = "med";
+            second.chroMethod = "all";
+            second.sensibn = 40;
+            second.medMethod = "55";
+            second.itera = 2;
+            second.locwavcurveden.clear();
+        }});
         complex.push_back({"all tools without sharpen", 238, 96, [&](auto& p) {
             add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
             p.locallab.spots[0].transit = 0.0;
@@ -15923,6 +16064,55 @@ void test_local_adjustments(bool available)
                             changed.max_abs);
                 check(changed.differing > 0,
                       "the blur tool changes the image");
+            }
+            if (c.label == "blur default denoise curve") {
+                /* The GUI default curve must be pixel-inert under the default
+                 * Quality method "Off": the same profile with an empty curve
+                 * has to match the host result exactly. */
+                rtengine::procparams::ProcParams plain_params =
+                    reference_params;
+                plain_params.locallab.spots[0].locwavcurveden.clear();
+                Imagefloat plain_base(c.width, c.height);
+                fill_local_adjustments_rgb(plain_base, 211u);
+                std::unique_ptr<LabImage> plain_lab(
+                    new LabImage(c.width, c.height));
+                rtengine::ImProcFunctions plain_ipf(&plain_params, false);
+                localAdjustmentsHostBlock(plain_ipf, plain_params,
+                                          &plain_base, plain_lab.get(),
+                                          c.width, c.height);
+                const Diff same =
+                    compare(view(*plain_lab), view(*reference_lab));
+                std::printf("stage-residency: local.adjustments default "
+                            "denoise curve inertia: %zu of %zu samples "
+                            "differ, PAE %.6f LSB16\n",
+                            same.differing, same.samples, same.max_abs);
+                check(same.differing == 0,
+                      "the default denoise curve is inert under Quality Off");
+            }
+            if (c.label == "median 5x5") {
+                /* The same spot with medMethod "none": Median_Denoise() is
+                 * skipped and the tool must leave the image unchanged, so the
+                 * parity above is not vacuous. */
+                rtengine::procparams::ProcParams plain_params =
+                    reference_params;
+                plain_params.locallab.spots[0].medMethod = "none";
+                Imagefloat plain_base(c.width, c.height);
+                fill_local_adjustments_rgb(plain_base, 211u);
+                std::unique_ptr<LabImage> plain_lab(
+                    new LabImage(c.width, c.height));
+                rtengine::ImProcFunctions plain_ipf(&plain_params, false);
+                localAdjustmentsHostBlock(plain_ipf, plain_params,
+                                          &plain_base, plain_lab.get(),
+                                          c.width, c.height);
+                const Diff changed =
+                    compare(view(*plain_lab), view(*reference_lab));
+                std::printf("stage-residency: local.adjustments median "
+                            "non-vacuity: %zu of %zu samples differ, "
+                            "PAE %.6f LSB16\n",
+                            changed.differing, changed.samples,
+                            changed.max_abs);
+                check(changed.differing > 0,
+                      "the median tool changes the image");
             }
             if (c.label == "sharpen only") {
                 /* The same spot with sharpening off: the tool must change the
