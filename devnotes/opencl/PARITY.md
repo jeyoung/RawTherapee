@@ -145,8 +145,9 @@ box grid and four bilinear scales with the block's arithmetic. The device
 builds `guide = xlin2log(L / 32768)` and `src = xlin2log(L)`, reuses the
 clarity arm's guided-filter chain, keeps the pre-filter L in its own plane and
 finishes with `xlog2lin(q)`, `intp(blend, q, iL)`. It runs after the final
-pixel curve in both the denoise and the plain branch. The clarity arm, the
-clarity soft radius and a non-zero `Thrend` stay host residuals; a non-zero
+pixel curve in both the denoise and the plain branch. Combined with
+`softradend`, the clarity arm, the clarity soft radius and a non-zero
+`Thrend` stay host residuals, as does a non-identity `wavguidcurve`; a
 `softradend` without `Expfinal` is refused.
 
 The filter operates in the log domain, where the derivative back to L is
@@ -365,10 +366,10 @@ peak absolute error is zero for the synthetic node tests:
   7 levels, inert balance controls) match the host block with a worst peak
   error of 0.015625 LSB16; the panel-off comparison changes 15,232-76,640
   samples in the twelve checked cases, so the parity is not vacuous.
-  Fourteen residual configurations (softradend, softrad, `BAmethod` sli,
-  `tmr`, `expclari`, sigmafin below/above its slider range, avoid, median,
-  expbl, expresid, expnoise, CLmethod one and skin protection) run the host
-  builtin byte for byte. `labwavelet-final.pp3` is 1 LSB16 on the export TIFF.
+  Thirteen residual configurations (softrad, `BAmethod` sli, `tmr`,
+  `expclari`, sigmafin below/above its slider range, avoid, median, expbl,
+  expresid, expnoise, CLmethod one and skin protection) run the host builtin
+  byte for byte. `labwavelet-final.pp3` is 1 LSB16 on the export TIFF.
 - The `lab.wavelet` toning panel's zero-protection arm reproduces
   `ContAllAB()`'s opacity-curve multiply on the a/b bands: the nine
   `mulopaRG`/`mulopaBY` samples are built on the host, the per-level

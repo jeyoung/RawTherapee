@@ -170,7 +170,9 @@ current tip.
   avoid, median, expbl, expresid, expnoise, `CLmethod` one and
   skin protection) run the host builtin byte for byte. The export gate
   `labwavelet-final.pp3` records `impl=opencl` at 1 LSB16. The remaining
-  final-panel residual is the balance-chroma arm. `6a54860e1`, `873000037`.
+  `softradend` residuals are a non-zero `Thrend` second block, a non-identity
+  `wavguidcurve` hue modulation and the clarity combinations; the final
+  panel's balance-chroma arm is a separate residual. `6a54860e1`, `873000037`.
 - **`lab.wavelet` toning (zero-protection)**: `ExpToning`'s opacity-curve
   multiply on the a/b bands. The host builds the nine `mulopaRG`/`mulopaBY`
   samples from the 501-point curves; `computeMea()` fills the per-level
