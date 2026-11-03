@@ -13556,6 +13556,89 @@ void test_local_adjustments(bool available)
             {"blur", [](auto& p) {
                  p.locallab.spots[0].expblur = true;
              }},
+            {"blur median", [](auto& p) {
+                 p.locallab.spots[0].expcolor = false;
+                 p.locallab.spots[0].expblur = true;
+                 p.locallab.spots[0].radius = 10.0;
+                 p.locallab.spots[0].locwavcurveden.clear();
+                 p.locallab.spots[0].blMethod = "med";
+             }},
+            {"blur guided", [](auto& p) {
+                 p.locallab.spots[0].expcolor = false;
+                 p.locallab.spots[0].expblur = true;
+                 p.locallab.spots[0].radius = 10.0;
+                 p.locallab.spots[0].locwavcurveden.clear();
+                 p.locallab.spots[0].blMethod = "guid";
+             }},
+            {"blur inverse", [](auto& p) {
+                 p.locallab.spots[0].expcolor = false;
+                 p.locallab.spots[0].expblur = true;
+                 p.locallab.spots[0].radius = 10.0;
+                 p.locallab.spots[0].locwavcurveden.clear();
+                 p.locallab.spots[0].invbl = true;
+             }},
+            {"blur fft", [](auto& p) {
+                 p.locallab.spots[0].expcolor = false;
+                 p.locallab.spots[0].expblur = true;
+                 p.locallab.spots[0].radius = 10.0;
+                 p.locallab.spots[0].locwavcurveden.clear();
+                 p.locallab.spots[0].fftwbl = true;
+             }},
+            {"blur mask", [](auto& p) {
+                 p.locallab.spots[0].expcolor = false;
+                 p.locallab.spots[0].expblur = true;
+                 p.locallab.spots[0].radius = 10.0;
+                 p.locallab.spots[0].locwavcurveden.clear();
+                 p.locallab.spots[0].enablMask = true;
+             }},
+            {"blur noise", [](auto& p) {
+                 p.locallab.spots[0].expcolor = false;
+                 p.locallab.spots[0].expblur = true;
+                 p.locallab.spots[0].radius = 10.0;
+                 p.locallab.spots[0].locwavcurveden.clear();
+                 p.locallab.spots[0].strength = 10;
+             }},
+            {"blur grain", [](auto& p) {
+                 p.locallab.spots[0].expcolor = false;
+                 p.locallab.spots[0].expblur = true;
+                 p.locallab.spots[0].radius = 10.0;
+                 p.locallab.spots[0].locwavcurveden.clear();
+                 p.locallab.spots[0].strengr = 10;
+             }},
+            {"blur guided radius", [](auto& p) {
+                 p.locallab.spots[0].expcolor = false;
+                 p.locallab.spots[0].expblur = true;
+                 p.locallab.spots[0].radius = 10.0;
+                 p.locallab.spots[0].locwavcurveden.clear();
+                 p.locallab.spots[0].guidbl = 5;
+             }},
+            {"blur radius above the FFT gate", [](auto& p) {
+                 p.locallab.spots[0].expcolor = false;
+                 p.locallab.spots[0].expblur = true;
+                 p.locallab.spots[0].radius = 40.0;
+                 p.locallab.spots[0].locwavcurveden.clear();
+             }},
+            {"blur denoise curve", [](auto& p) {
+                 p.locallab.spots[0].expcolor = false;
+                 p.locallab.spots[0].expblur = true;
+                 p.locallab.spots[0].radius = 10.0;
+                 p.locallab.spots[0].locwavcurveden = {
+                     1.0, 0.0, 0.5, 0.35, 0.35, 1.0, 0.5, 0.35, 0.35};
+             }},
+            {"blur chroma channel", [](auto& p) {
+                 p.locallab.spots[0].expcolor = false;
+                 p.locallab.spots[0].expblur = true;
+                 p.locallab.spots[0].radius = 10.0;
+                 p.locallab.spots[0].locwavcurveden.clear();
+                 p.locallab.spots[0].chroMethod = "xyz";
+             }},
+            {"blur sensitivity range", [](auto& p) {
+                 p.locallab.spots[0].expcolor = false;
+                 p.locallab.spots[0].expblur = true;
+                 p.locallab.spots[0].radius = 10.0;
+                 p.locallab.spots[0].locwavcurveden.clear();
+                 p.locallab.spots[0].sensibn = 101;
+             }},
             {"tone map", [](auto& p) {
                  p.locallab.spots[0].exptonemap = true;
              }},
@@ -14219,6 +14302,28 @@ void test_local_adjustments(bool available)
                 spot.loc = {loc_x, loc_x, loc_y, loc_y};
                 p.locallab.spots.push_back(spot);
             };
+        /* Blur & Noise's Gaussian arm. The spot radius is the block's sigma
+         * source (sigma = radius / 1.4), not the spot extent; `loc` still
+         * sets the ROI. */
+        const auto blur_spot = [&](rtengine::procparams::ProcParams& p,
+                                   double radius, const char* chroma,
+                                   int sensitivity) {
+            auto& spot = p.locallab.spots[0];
+            spot.expcolor = false;
+            spot.expblur = true;
+            spot.radius = radius;
+            spot.strength = 0;
+            spot.strengr = 0;
+            spot.guidbl = 0;
+            spot.invbl = false;
+            spot.fftwbl = false;
+            spot.enablMask = false;
+            spot.blMethod = "blur";
+            spot.chroMethod = chroma;
+            spot.sensibn = sensitivity;
+            /* An idle denoise curve; the denoise arm is a residual. */
+            spot.locwavcurveden.clear();
+        };
         complex.push_back({"vibrance only", 238, 64, [&](auto& p) {
             add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
             vibrance_spot(p, 40, 20);
@@ -15290,6 +15395,75 @@ void test_local_adjustments(bool available)
             sharpen_spot(p, 0.75, 100, 20, 40);
             contrast_spot(p, 40, 0.4);
         }});
+        /* Blur & Noise's Gaussian arm. Several spot radii (the Gaussian
+         * sigma), the three plane selectors, the scope sensitivity range and
+         * a strict sub-rectangle ROI. The two combined cases pin the pass
+         * order against Colour & Light and log encoding. */
+        complex.push_back({"blur only", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            blur_spot(p, 2.0, "lum", 40);
+        }});
+        complex.push_back({"blur radius 5", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            blur_spot(p, 5.0, "lum", 40);
+        }});
+        complex.push_back({"blur radius 10 chroma", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            blur_spot(p, 10.0, "chr", 30);
+        }});
+        complex.push_back({"blur radius 18 all", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            blur_spot(p, 18.0, "all", 60);
+        }});
+        complex.push_back({"blur radius 28", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            blur_spot(p, 28.0, "lum", 20);
+        }});
+        complex.push_back({"blur sensitivity 100", 238, 64,
+                           [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            blur_spot(p, 10.0, "all", 100);
+        }});
+        complex.push_back({"blur no scope", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            blur_spot(p, 10.0, "lum", 0);
+            p.locallab.spots[0].deltae = false;
+        }});
+        complex.push_back({"blur ROI edges", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 200, true, 0, 0, 0, "ELI", "NONE");
+            blur_spot(p, 10.0, "all", 40);
+        }});
+        complex.push_back({"blur RECT", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "RECT", "NONE");
+            blur_spot(p, 10.0, "lum", 40);
+        }});
+        complex.push_back({"blur and colour", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 35, 10, -5, "ELI", "NONE");
+            blur_spot(p, 10.0, "all", 40);
+            p.locallab.spots[0].expcolor = true;
+            p.locallab.spots[0].chroma = 35;
+            p.locallab.spots[0].lightness = 10;
+            p.locallab.spots[0].contrast = -5;
+        }});
+        complex.push_back({"blur and log", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            blur_spot(p, 10.0, "lum", 40);
+            log_spot(p, 60, true, 0.0, 0.4, 100.0, -5.0, 10.0, 10.0,
+                     18.0);
+        }});
+        complex.push_back({"blur and soft light", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
+            blur_spot(p, 10.0, "lum", 40);
+            soft_spot(p, 60);
+        }});
+        complex.push_back({"blur MUNS", 238, 64, [&](auto& p) {
+            add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "MUNS");
+            blur_spot(p, 10.0, "lum", 40);
+        }});
+        complex.push_back({"blur 179x49", 179, 49, [&](auto& p) {
+            add_spot(p, 0, 0, 700, true, 0, 0, 0, "ELI", "NONE");
+            blur_spot(p, 18.0, "all", 40);
+        }});
         complex.push_back({"all tools without sharpen", 238, 96, [&](auto& p) {
             add_spot(p, 0, 0, 800, true, 0, 0, 0, "ELI", "NONE");
             p.locallab.spots[0].transit = 0.0;
@@ -15724,6 +15898,31 @@ void test_local_adjustments(bool available)
                             changed.max_abs);
                 check(changed.differing > 0,
                       "the log tool changes the image");
+            }
+            if (c.label == "blur only") {
+                /* The same spot with the blur off: the table must change the
+                 * image, otherwise the parity above is vacuous. */
+                rtengine::procparams::ProcParams plain_params =
+                    reference_params;
+                plain_params.locallab.spots[0].expblur = false;
+                plain_params.locallab.spots[0].expcolor = true;
+                Imagefloat plain_base(c.width, c.height);
+                fill_local_adjustments_rgb(plain_base, 211u);
+                std::unique_ptr<LabImage> plain_lab(
+                    new LabImage(c.width, c.height));
+                rtengine::ImProcFunctions plain_ipf(&plain_params, false);
+                localAdjustmentsHostBlock(plain_ipf, plain_params,
+                                          &plain_base, plain_lab.get(),
+                                          c.width, c.height);
+                const Diff changed =
+                    compare(view(*plain_lab), view(*reference_lab));
+                std::printf("stage-residency: local.adjustments blur "
+                            "non-vacuity: %zu of %zu samples differ, "
+                            "PAE %.6f LSB16\n",
+                            changed.differing, changed.samples,
+                            changed.max_abs);
+                check(changed.differing > 0,
+                      "the blur tool changes the image");
             }
             if (c.label == "sharpen only") {
                 /* The same spot with sharpening off: the tool must change the
@@ -16628,6 +16827,10 @@ void test_local_adjustments(bool available)
                   setup.iir_local_contrast->double_path == 1,
               "the local.adjustments setup exports the local-contrast "
               "coefficients");
+        check(setup.iir_blur != nullptr &&
+                  setup.iir_blur->double_path == 0 &&
+                  setup.iir_blur->version == RT_LAB_TOOLS_IIR_VERSION,
+              "the local.adjustments setup exports the blur coefficients");
         const float* record = setup.spots;
         bool finite = true;
         for (std::size_t slot = 0;
