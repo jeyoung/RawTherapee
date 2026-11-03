@@ -13374,6 +13374,34 @@ void fill_local_adjustments_rgb(Imagefloat& image, unsigned seed)
     }
 }
 
+/*
+ * Tone Mapping's fixture. The arm's result is sensitive to the per-spot
+ * clamp's out-of-gamut discontinuity, which turns a sub-LSB difference into a
+ * large one at the handful of deliberately out-of-range samples the colour
+ * cases carry; these cases stay inside the working range because the clamp
+ * has its own cases.
+ */
+void fill_tonemap_rgb(Imagefloat& image, unsigned seed)
+{
+    for (int y = 0; y < image.getHeight(); ++y) {
+        for (int x = 0; x < image.getWidth(); ++x) {
+            const float phase = 0.0021f * static_cast<float>(seed);
+            const float r =
+                11000.f + 5000.f * std::sin(0.021f * x + phase) +
+                2000.f * std::cos(0.013f * y);
+            const float g =
+                13000.f + 4000.f * std::cos(0.017f * x + 0.4f) +
+                1500.f * std::sin(0.011f * y + phase);
+            const float b =
+                9000.f + 4500.f * std::sin(0.015f * y + 0.7f) +
+                1800.f * std::cos(0.019f * x);
+            image.r(y, x) = std::max(1000.f, std::min(30000.f, r));
+            image.g(y, x) = std::max(1000.f, std::min(30000.f, g));
+            image.b(y, x) = std::max(1000.f, std::min(30000.f, b));
+        }
+    }
+}
+
 rtengine::procparams::LocallabParams::LocallabSpot localAdjustmentsSpot(
     const char* name, int centre_x, int centre_y, int extent,
     bool active, int chroma, int lightness, int contrast)
@@ -13663,8 +13691,54 @@ void test_local_adjustments(bool available)
                  p.locallab.spots[0].locwavcurveden.clear();
                  p.locallab.spots[0].sensibn = 101;
              }},
-            {"tone map", [](auto& p) {
+            {"tone map strength range", [](auto& p) {
+                 auto& spot = p.locallab.spots[0];
+                 spot.exptonemap = true;
+                 spot.stren = 2.5;
+             }},
+            {"tone map gamma range", [](auto& p) {
+                 auto& spot = p.locallab.spots[0];
+                 spot.exptonemap = true;
+                 spot.gamma = 5.0;
+             }},
+            {"tone map edge stopping range", [](auto& p) {
+                 auto& spot = p.locallab.spots[0];
+                 spot.exptonemap = true;
+                 spot.estop = 5.0;
+             }},
+            {"tone map scale range", [](auto& p) {
+                 auto& spot = p.locallab.spots[0];
+                 spot.exptonemap = true;
+                 spot.scaltm = 0.05;
+             }},
+            {"tone map repart range", [](auto& p) {
+                 auto& spot = p.locallab.spots[0];
+                 spot.exptonemap = true;
+                 spot.repartm = 0.0;
+             }},
+            {"tone map saturation range", [](auto& p) {
+                 auto& spot = p.locallab.spots[0];
+                 spot.exptonemap = true;
+                 spot.satur = 120.0;
+             }},
+            {"tone map reweight range", [](auto& p) {
+                 auto& spot = p.locallab.spots[0];
+                 spot.exptonemap = true;
+                 spot.rewei = 4;
+             }},
+            {"tone map sensitivity range", [](auto& p) {
+                 auto& spot = p.locallab.spots[0];
+                 spot.exptonemap = true;
+                 spot.sensitm = 101;
+             }},
+            {"tone map recovery threshold", [](auto& p) {
+                 auto& spot = p.locallab.spots[0];
+                 spot.exptonemap = true;
+                 spot.recothrest = 0.5;
+             }},
+            {"tone map global EPD", [](auto& p) {
                  p.locallab.spots[0].exptonemap = true;
+                 p.epd.enabled = true;
              }},
             {"soft light zero strength", [](auto& p) {
                  p.locallab.spots[0].expsoft = true;
@@ -14100,6 +14174,167 @@ void test_local_adjustments(bool available)
         skip("local.adjustments: GPU device selected; device parity not run");
     } else {
         skip("local.adjustments: no OpenCL device");
+    }
+
+    /*
+     * Tone Mapping. Lab_Local()'s "tm" block gates itself on a 128 px ROI, so
+     * every case uses an image and spot extent large enough for the arm to
+     * run. Each case compares the host block against the device node, records
+     * the node's own implementation and checks the result against the same
+     * spot with the tool switched off.
+     */
+    {
+        struct ToneMapCase {
+            const char* label;
+            int width;
+            int height;
+            int centre_x;
+            int centre_y;
+            int extent;
+            double strength;
+            double gamma;
+            double edge_stopping;
+            double scale;
+            int reweight;
+            double saturation;
+            int sensitivity;
+            bool equalise;
+            bool colour;
+            bool blur;
+            bool expect_change;
+        };
+        const ToneMapCase tm_cases[] = {
+            {"tonemap 0.5 260x200", 260, 200, 0, 0, 2000, 0.5, 1.0, 1.4,
+             1.0, 0, 0.0, 60, true, false, false, true},
+            {"tonemap 1.2 gamma 2.0", 260, 200, 0, 0, 2000, 1.2, 2.0, 1.4,
+             1.0, 0, 0.0, 60, true, false, false, true},
+            {"tonemap uncompressed", 260, 200, 0, 0, 2000, -0.4, 1.0, 1.4,
+             1.0, 0, 0.0, 60, true, false, false, true},
+            {"tonemap dense edges", 260, 200, 0, 0, 2000, 0.8, 1.0, 0.5, 1.0,
+             0, 0.0, 60, true, false, false, true},
+            {"tonemap soft edges", 260, 200, 0, 0, 2000, 0.8, 1.0, 3.5, 1.0,
+             0, 0.0, 60, true, false, false, true},
+            {"tonemap scale 4", 260, 200, 0, 0, 2000, 0.8, 1.0, 1.4, 4.0, 0,
+             60.0, 60, true, false, false, true},
+            {"tonemap reweight 2", 320, 256, 0, 0, 2000, 0.8, 1.0, 1.4, 1.0,
+             2, 30.0, 60, true, false, false, true},
+            {"tonemap no equalise", 260, 200, 0, 0, 2000, 0.8, 1.0, 1.4, 1.0,
+             0, 0.0, 60, false, false, false, true},
+            {"tonemap no equalise sens 100", 260, 200, 0, 0, 2000, 0.8, 1.0,
+             1.4, 1.0, 0, 0.0, 100, false, false, false, true},
+            {"tonemap sens 0", 260, 200, 0, 0, 2000, 0.8, 1.0, 1.4, 1.0, 0,
+             0.0, 0, true, false, false, true},
+            {"tonemap sens 100", 260, 200, 0, 0, 2000, 0.8, 1.0, 1.4, 1.0, 0,
+             0.0, 100, true, false, false, true},
+            {"tonemap colour", 260, 200, 0, 0, 2000, 0.8, 1.0, 1.4, 1.0, 0,
+             0.0, 60, true, true, false, true},
+            {"tonemap blur", 260, 200, 0, 0, 2000, 0.8, 1.0, 1.4, 1.0, 0,
+             0.0, 60, true, false, true, true},
+            {"tonemap offset ROI", 260, 200, 200, 160, 1200, 0.8, 1.0, 1.4,
+             1.0, 0, 0.0, 60, true, false, false, true},
+            {"tonemap strength 0", 260, 200, 0, 0, 2000, 0.0, 1.0, 1.4, 1.0,
+             0, 0.0, 60, true, false, false, false},
+            {"tonemap below the mDEN gate", 238, 64, 0, 0, 800, 0.8, 1.0, 1.4,
+             1.0, 0, 0.0, 60, true, false, false, false},
+        };
+        for (std::size_t index = 0;
+             index < sizeof(tm_cases) / sizeof(tm_cases[0]); ++index) {
+            const ToneMapCase& c = tm_cases[index];
+            const auto make_params = [&](rtengine::procparams::ProcParams& p) {
+                p.locallab.enabled = true;
+                auto& spot = p.locallab.spots[0];
+                spot.exptonemap = true;
+                spot.stren = c.strength;
+                spot.gamma = c.gamma;
+                spot.estop = c.edge_stopping;
+                spot.scaltm = c.scale;
+                spot.rewei = c.reweight;
+                spot.satur = c.saturation;
+                spot.sensitm = c.sensitivity;
+                spot.equiltm = c.equalise;
+                spot.repartm = 100.0;
+                spot.recothrest = 1.0;
+                spot.chroma = 0;
+                spot.lightness = 0;
+                spot.contrast = 0;
+                if (c.colour) {
+                    spot.chroma = 35;
+                    spot.lightness = 10;
+                    spot.contrast = -5;
+                }
+                if (c.blur) {
+                    spot.expblur = true;
+                    spot.radius = 10.0;
+                    spot.locwavcurveden.clear();
+                }
+            };
+
+            rtengine::procparams::ProcParams reference_params;
+            reference_params.locallab.spots.push_back(localAdjustmentsSpot(
+                "tonemap", c.centre_x, c.centre_y, c.extent, true, 0, 0, 0));
+            make_params(reference_params);
+            check(localAdjustmentsSupported(reference_params),
+                  "the tone-map case is inside the predicate");
+
+            Imagefloat reference_base(c.width, c.height);
+            fill_tonemap_rgb(reference_base, 101u + index);
+            std::unique_ptr<LabImage> reference_lab(
+                new LabImage(c.width, c.height));
+            rtengine::ImProcFunctions reference_ipf(&reference_params, false);
+            localAdjustmentsHostBlock(reference_ipf, reference_params,
+                                      &reference_base, reference_lab.get(),
+                                      c.width, c.height);
+
+            rtengine::procparams::ProcParams node_params = reference_params;
+            Imagefloat node_base(c.width, c.height);
+            fill_tonemap_rgb(node_base, 101u + index);
+            std::unique_ptr<LabImage> node_lab(
+                new LabImage(c.width, c.height));
+            rtengine::ImProcFunctions node_ipf(&node_params, false);
+            const RtStageStatus status = run_local_adjustments_node(
+                node_base, *node_lab, node_params, node_ipf, profile_path);
+            check(status == RT_STAGE_OK,
+                  "the tone-map node completes through run()");
+
+            const std::string profile = read_file(profile_path);
+            if (cpu_device) {
+                check(profile.find("\"impl\":\"opencl\"") !=
+                          std::string::npos,
+                      "the tone-map case records a device pass");
+                check(profile.find("\"impl\":\"host\"") ==
+                          std::string::npos,
+                      "the tone-map case never falls back");
+            }
+
+            const Diff diff =
+                compare(view(*reference_lab), view(*node_lab));
+            std::printf("stage-residency: local.adjustments %s: PAE %.6f "
+                        "LSB16, %zu of %zu samples differ\n", c.label,
+                        diff.max_abs, diff.differing, diff.samples);
+            check(diff.finite && diff.max_abs <= 1.0,
+                  "the tone-map result is within 1 LSB16");
+
+            if (c.expect_change) {
+                rtengine::procparams::ProcParams off_params =
+                    reference_params;
+                off_params.locallab.spots[0].exptonemap = false;
+                Imagefloat off_base(c.width, c.height);
+                fill_tonemap_rgb(off_base, 101u + index);
+                std::unique_ptr<LabImage> off_lab(
+                    new LabImage(c.width, c.height));
+                rtengine::ImProcFunctions off_ipf(&off_params, false);
+                localAdjustmentsHostBlock(off_ipf, off_params, &off_base,
+                                          off_lab.get(), c.width, c.height);
+                const Diff changed =
+                    compare(view(*off_lab), view(*reference_lab));
+                std::printf("stage-residency: local.adjustments %s changes "
+                            "%zu of %zu samples against the tool-off result, "
+                            "PAE %.6f LSB16\n", c.label, changed.differing,
+                            changed.samples, changed.max_abs);
+                check(changed.differing > 0,
+                      "the tone-map case is non-vacuous");
+            }
+        }
     }
 
     /* Multi-spot state, RECT, inactive spots, curves and MUNS. Each case is
