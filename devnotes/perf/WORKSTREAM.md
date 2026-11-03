@@ -192,6 +192,16 @@ current tip.
   cases (contrast 5, contrast 15 with L curve and brightness, contrast 30
   with all six tables) are exact; `labtools-labcurve-contrast.pp3` is exact
   on the export TIFF. `89e0a844b`, `47b9980fb`.
+- **`lab.wavelet` clarity soft radius**: `guidedFilter()`'s box means, `a`/`b`
+  reduction and bilinear upsample run on the device over the block's
+  `provradius` guide, with the subsampling, radius and four scales derived on
+  the host. The second pass reproduces `ip_wavelet()`'s final tile-copy clamp
+  (`L <= 0 -> 1`) and the merge uses the soft-filtered L unclamped, which can
+  be negative; the earlier `inf` failures were the merge kernel's own clamp,
+  now removed. Nine cases (softrad 0.5/2/5/100, zero merge, chroma, denoise,
+  703x67 subsampled and 8192x64) are exact except the denoise pair at 0.011719
+  LSB16, and `labwavelet-softrad.pp3` is exact with `impl=opencl`. `softradend`
+  remains a residual.
 - **`lab.wavelet` standard denoise**: `Expnoise`'s standard-L arm together
   with the chroma denoise `ip_wavelet()` forces at six levels. The block
   raises the L decomposition to seven levels, sets `cp.chromfi = 0.01` and
@@ -821,11 +831,14 @@ when the block's own trim drops them to zero; a profile whose `ch[]`, opacity
 curve, `cbenab`, `CHmethod`/`chro` or residual sliders would stop that trim
 short of zero stays a host residual.
 
-The denoise-curve and `sli` Thrden refinements landed. Next is the guided soft
-radius, whose WIP branch narrows the remaining fault to the `CLmethod=inf`
-pre-merge L (see `wip/lab-wavelet-softrad`). The soft radius
-unit is a separable box/reduction kernel pair plus the XYZ round trip, not a
-new merge. The standard denoise arm (and the chroma denoise the block forces
+The clarity arm's guided soft radius (`softrad`) landed: the host exports the
+block's `provradius` guide and the subsampling scales, the kernels port
+`guidedFilter()`, and the second pass now applies the block's `L <= 0 -> 1`
+tile-copy clamp while the merge keeps the soft-filtered L unclamped. Nine
+cases are exact except the denoise pair at 0.011719 LSB16, and
+`labwavelet-softrad.pp3` is exact. Next is `softradend`, the final panel's
+guided tone mapping, which adds `guidedFilterLog`, the `strend`/`detend`/
+`thrend` blend and its statistics. The standard denoise arm (and the chroma denoise the block forces
 at six levels) landed with the unit above; its denoise curves, expert pairing,
 BiShrink arms, user chroma strength, noise balance and hue curve stay
 residuals. The final curves and the toning zero-protection arm landed with the

@@ -95,6 +95,8 @@ pairs are exact. The gate is the peak absolute error (PAE) in normalised units;
 | 2026-11-03 | `43732fb51..8cef1c71b` | POCL (CPU) | 3-case user chroma matrix (`chromfi` 40, `chromco` 60, both 100), `stage-residency-test` | device vs host block | 0.011719 LSB16 (denoise pair) | PASS |
 | 2026-11-03 | `4338a0570..27c9cffac` | POCL (CPU) | colorspace_flowers.pef / `labwavelet-thrden.pp3` (Expnoise, `sliMethod=sli`, `Thrden=5`), `lab.wavelet` | off vs auto, 16-bit TIFF | 1 LSB (24,753 of 30,419,712) | PASS |
 | 2026-11-03 | `4338a0570..27c9cffac` | POCL (CPU) | 4-case Thrden matrix (1, 5, 20 and 20 with the final curves), `stage-residency-test` | device vs host block | 0.050781 LSB16 (worst: with final curves) | PASS |
+| 2026-11-03 | `e54056e0a..29cc140ad` | POCL (CPU) | colorspace_flowers.pef / `labwavelet-softrad.pp3` (clarity, `Softrad=5`), `lab.wavelet` | off vs auto, 16-bit TIFF | 0 (exact) | PASS |
+| 2026-11-03 | `e54056e0a..29cc140ad` | POCL (CPU) | 9-case soft-radius matrix (softrad 0.5/2/5/100, zero merge, chroma, denoise, 703x67 subsampled, 8192x64), `stage-residency-test` | device vs host block | 0.011719 LSB16 (denoise pair; the rest exact) | PASS |
 | 2026-11-02 | 89e0a844b..47b9980fb | POCL (CPU) | colorspace_flowers.pef / `labtools-labcurve-contrast.pp3` (Lab curves with contrast 30, L/a/b/cc/lc/cl tables), `lab.tools` | off vs auto, 16-bit TIFF | 0 (exact) | PASS |
 | 2026-11-02 | 89e0a844b..47b9980fb | POCL (CPU) | 3-case Lab-contrast matrix (contrast 5, contrast 15 with L curve+brightness, contrast 30 with all six tables), `stage-residency-test` | device vs host block | 0 (exact) | PASS |
 | 2026-11-02 | uncommitted | POCL (CPU) | colorspace_flowers.pef / `labtools-labcurve-contrast.pp3` with `Gamutmunse=XYZ`, `lab.tools` | off vs auto, 16-bit TIFF | 0 (exact) | PASS |
@@ -123,7 +125,14 @@ which is the contrast-only case; a profile whose `ch[]`, opacity curve,
 zero stays a host residual. The merge's `one`/`inf` + black and `sup` + resid
 arms run the second pass; every other `Backmethod` arm collapses to the
 clamped first pass, which the device reproduces with the merge kernel's zero
-factors. The guided soft radius (`softrad`) is still refused.
+factors. The clarity arm's guided soft radius (`softrad`) is a device case:
+the host builds the block's own `FlatCurve`-free guide from the pre-pass
+`provradius` Y, derives the subsampling, radius and four bilinear scales, and
+the kernels port `guidedFilter()`'s box means, `a`/`b` reduction and bilinear
+upsample. `ip_wavelet()`'s final tile copy raises an L at or below zero to one
+before the radius reads it; the soft-filtered L itself may be negative and the
+merge uses it unclamped. `softradend`, the final panel's guided tone mapping,
+stays a residual.
 
 `compare_tiff.py` now copies an already-uncompressed 16-bit TIFF instead of
 calling ImageMagick. That is the form RawTherapee's `-t -b16` export writes,

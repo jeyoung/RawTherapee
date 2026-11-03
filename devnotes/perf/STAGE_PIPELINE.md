@@ -334,8 +334,14 @@ applies the block's `mergeL`/`mergeC` arithmetic. The `one`/`inf` + black and
 to the clamped first pass. The first pass skips the a/b planes when the block's
 own trim drops them to zero, which is the contrast-only case, and a profile
 whose `ch[]`, opacity curve, `cbenab`, `CHmethod`/`chro` or residual sliders
-would stop that trim short of zero stays a host residual. The guided soft
-radius (`softrad`) remains refused.
+would stop that trim short of zero stays a host residual. The clarity arm's
+guided soft radius (`softrad`) also runs on the device: the host builds the
+block's `provradius` guide, the subsampling and the four bilinear scales, and
+the kernels port `guidedFilter()`'s box means, `a`/`b` reduction and bilinear
+upsample before the merge. The second pass clamps L at or below zero to one,
+as the block's final tile copy does; the soft-filtered L may be negative and
+the merge uses it unclamped. `softradend`, the final panel's guided tone
+mapping, remains refused.
 
 It is admitted only on a CPU
 OpenCL device, and the wavelet pass also needs fp64. `CHmethod` `without` and
