@@ -145,6 +145,19 @@ inline constexpr const char* RT_LOCAL_ADJUSTMENTS_CL = R"CLC(
 #define RT_LA_SHAR_ITER 137
 #define RT_LA_SHAR_CONTRAST 138
 #define RT_LA_SHAR_BLUR 139
+#define RT_LA_EXP_TONEMAP 148
+#define RT_LA_TM_SENS 149
+#define RT_LA_TM_REPART 150
+#define RT_LA_TM_GAMMA 151
+#define RT_LA_TM_COMPRESSION 152
+#define RT_LA_TM_DETAILBOOST 153
+#define RT_LA_TM_TEMP 154
+#define RT_LA_TM_SAT 155
+#define RT_LA_TM_EDGEST 156
+#define RT_LA_TM_SCALE 157
+#define RT_LA_TM_ITERATES 158
+#define RT_LA_TM_REWEIGHT 159
+#define RT_LA_TM_EQUIL 160
 
 /*
  * The number of trailing columns the host takes through its scalar path.
@@ -2053,6 +2066,562 @@ __kernel void rt_local_adjustments_clamp(__global float* lab,
     lab[offset] = out_l;
     lab[lab_plane + offset] = out_a;
     lab[2 * lab_plane + offset] = out_b;
+}
+
+/*
+ * Tone Mapping: ImProcFunctions::EPDToneMaplocal() followed by
+ * transit_shapedetect2()'s `equiltm` normalization and its senstype-8
+ * recovery blend.
+ *
+ * EdgePreservingDecomposition is a fixed-iteration conjugate gradient on a
+ * five-diagonal finite-element Laplacian, preconditioned by an incomplete
+ * Cholesky factorisation with one level of fill. Every one of its steps is
+ * order-sensitive: the dot products accumulate in double with the even and
+ * odd samples in separate accumulators, the factorisation is a column
+ * recurrence, and the matrix-vector product takes three different summation
+ * orders by region. The kernel therefore runs the whole decomposition in one
+ * work item, reproducing the host's arithmetic and its order, and leaves only
+ * the exact ROI minimum and maximum to a reduction.
+ *
+ * Scratch plane layout, one plane per array of bfw * bfh floats:
+ *   0 source (log domain, then the compressed result)
+ *   1 blur (the CG iterate, warm-started between reweighting passes)
+ *   2 r, 3 s, 4 direction, 5 matrix product
+ *   6 edge-stopping weights
+ *   7..11 the five system diagonals (offsets 0, 1, w - 1, w, w + 1)
+ *   12..17 the six incomplete-Cholesky diagonals
+ * The ROI is at least 128 px on both axes, so the factorisation always has
+ * six diagonals at offsets {0, 1, w - 3, w - 2, w, w + 1} and the file's fill
+ * map has exactly the four entries worked out below.
+ */
+#define RT_LA_TM_EPS 0.0001f
+#define RT_LA_TM_SQREPS 0.0004f
+#define RT_LA_TM_PLANE_SRC 0
+#define RT_LA_TM_PLANE_BLUR 1
+#define RT_LA_TM_PLANE_R 2
+#define RT_LA_TM_PLANE_S 3
+#define RT_LA_TM_PLANE_DIR 4
+#define RT_LA_TM_PLANE_AX 5
+#define RT_LA_TM_PLANE_WEIGHTS 6
+#define RT_LA_TM_PLANE_DIAG 7
+#define RT_LA_TM_PLANE_IC 12
+
+/* rt_algo.cc's accumulateProduct() single-threaded: two double accumulators
+ * over the even and the odd samples, the odd tail folded into the first. */
+inline double rt_la_tm_product(__global const float* first,
+                               __global const float* second, const int n)
+{
+    if (n == 0) {
+        return 0.0;
+    }
+    double acc1 = 0.0;
+    double acc2 = 0.0;
+    for (int i = 0; i < n - 1; i += 2) {
+        acc1 += (double)first[i] * (double)second[i];
+        acc2 += (double)first[i + 1] * (double)second[i + 1];
+    }
+    if ((n & 1) != 0) {
+        acc1 += (double)first[n - 1] * (double)second[n - 1];
+    }
+    return acc1 + acc2;
+}
+
+/* sleef.h EPD's SSE loops evaluate xexpf() with the vector form of
+ * sleefsseavx.h, whose last polynomial step groups as ((s*s)*u + s) + 1
+ * instead of the scalar form's s*((s*u) + 1) + 1. EdgePreservingDecomposition
+ * takes the vector form for every column below 4 * (w / 4) and every sample
+ * below 4 * (n / 4), and the difference reaches the tone-map result through
+ * the conjugate gradient, so the kernel reproduces both forms. */
+inline float rt_la_tm_xexpf_vector(const float d)
+{
+    const int q = rt_lr_xrintf(d * RT_LR_RLN2);
+    float s = (float)q * -RT_LR_L2Uf + d;
+    s = (float)q * -RT_LR_L2Lf + s;
+    float u = 0.00136324646882712841033936f;
+    u = u * s + 0.00836596917361021041870117f;
+    u = u * s + 0.0416710823774337768554688f;
+    u = u * s + 0.166665524244308471679688f;
+    u = u * s + 0.499999850988388061523438f;
+    u = ((s * s) * u + s) + 1.0f;
+    const float value = rt_lr_ldexpkf(u, q);
+    return -104.0f > d ? 0.0f : value;
+}
+
+inline float rt_la_tm_pow_vector(const float a, const float b)
+{
+    return rt_la_tm_xexpf_vector(b * rt_lr_xlogf(a));
+}
+
+/*
+ * MultiDiagonalSymmetricMatrix::VectorProduct(). `diag` is the base of the
+ * five system diagonals and `plane` their plane stride. The host writes the
+ * middle block with the diagonals taken in descending order and the borders
+ * in ascending order, so the three regions keep their own summation order.
+ */
+inline void rt_la_tm_vector_product(__global float* product,
+                                    __global const float* x,
+                                    __global const float* diag,
+                                    const int plane, const int n,
+                                    const int w)
+{
+    const int srm = w + 1;
+    const int lm = n - (w + 1);
+    const int sr[5] = {0, 1, w - 1, w, w + 1};
+    for (int j = 0; j < n; ++j) {
+        float p = diag[j] * x[j];
+        if (j >= srm && j < lm) {
+            for (int i = 4; i > 0; --i) {
+                const int s = sr[i];
+                p += (diag[i * plane + j - s] * x[j - s]) +
+                     (diag[i * plane + j] * x[j + s]);
+            }
+        } else if (j < srm) {
+            for (int i = 1; i < 5; ++i) {
+                const int s = sr[i];
+                if (j < s) {
+                    p += diag[i * plane + j] * x[j + s];
+                } else {
+                    p += (diag[i * plane + j - s] * x[j - s]) +
+                         (diag[i * plane + j] * x[j + s]);
+                }
+            }
+        } else {
+            for (int i = 1; i < 5; ++i) {
+                const int s = sr[i];
+                if (j < n - s) {
+                    p += (diag[i * plane + j - s] * x[j - s]) +
+                         (diag[i * plane + j] * x[j + s]);
+                } else {
+                    p += diag[i * plane + j - s] * x[j - s];
+                }
+            }
+        }
+        product[j] = p;
+    }
+}
+
+/*
+ * MultiDiagonalSymmetricMatrix::CholeskyBackSolve(): solve L D Lt x = b for
+ * the six-diagonal factor. The forward substitution walks j upwards and the
+ * back substitution downwards, both in the host's order.
+ */
+inline void rt_la_tm_backsolve(__global float* x, __global const float* b,
+                               __global const float* ic, const int plane,
+                               const int n, const int w)
+{
+    const int s[6] = {0, 1, w - 2, w - 1, w, w + 1};
+    /* The host splits the forward substitution at s[5]: the short prefix keeps
+     * the ascending `while` form, the rest takes the unrolled descending
+     * order. */
+    for (int j = 0; j <= s[5] && j < n; ++j) {
+        float sub = b[j];
+        for (int i = 1; i <= 5 && j - s[i] >= 0; ++i) {
+            const int c = j - s[i];
+            sub -= ic[i * plane + c] * x[c];
+        }
+        x[j] = sub;
+    }
+    for (int j = s[5] + 1; j < n; ++j) {
+        float sub = b[j];
+        for (int i = 5; i > 0; --i) {
+            const int c = j - s[i];
+            sub -= ic[i * plane + c] * x[c];
+        }
+        x[j] = sub;
+    }
+    for (int j = 0; j < n; ++j) {
+        x[j] = x[j] / ic[j];
+    }
+    for (int j = n - 1; j >= (n - 1) - s[5]; --j) {
+        float sub = x[j];
+        for (int i = 1; i <= 5 && j + s[i] < n; ++i) {
+            sub -= ic[i * plane + j] * x[j + s[i]];
+        }
+        x[j] = sub;
+    }
+    for (int j = (n - 2) - s[5]; j >= 0; --j) {
+        float sub = x[j];
+        for (int i = 5; i > 0; --i) {
+            sub -= ic[i * plane + j] * x[j + s[i]];
+        }
+        x[j] = sub;
+    }
+}
+
+/*
+ * MultiDiagonalSymmetricMatrix::CreateIncompleteCholeskyFactorization(1) for
+ * the five-diagonal system. The source start rows are {0, 1, w - 1, w, w + 1};
+ * one level of fill produces the factor's rows {0, 1, w - 2, w - 1, w, w + 1}
+ * (two fill diagonals below the w - 1 row, one below each of the others).
+ * The fill map pairs the factor's own indices whose offsets sum to another
+ * factor offset: (1, w - 2), (1, w - 1), (1, w), (w - 2, 1), (w - 1, 1) and
+ * (w, 1). The host scans that map as a single prefix from one column to the
+ * next, so an entry with a larger offset than the current column blocks every
+ * later one; the loop below keeps that behaviour. Returns 1 on the host's
+ * division-by-zero failure, where the block zeroes the blur.
+ */
+inline int rt_la_tm_factor(__global const float* diag,
+                           __global float* ic, const int plane,
+                           const int n, const int w)
+{
+    const int sw[6] = {0, 1, w - 2, w - 1, w, w + 1};
+    const int map_ss[6] = {2, 3, 4, 1, 1, 1};
+    const int map_sss[6] = {3, 4, 5, 3, 4, 5};
+    const int map_k[6] = {w - 2, w - 1, w, 1, 1, 1};
+    const int map_max[6] = {-1, 2, 3, 4, 5, 5};
+    const int find_map[6] = {-1, 1, -1, 2, 3, 4};
+    __global float* d0 = ic;
+    for (int j = 0; j < n; ++j) {
+        float dv = diag[j];
+        for (int s = 1; s <= 5; ++s) {
+            const int k = sw[s];
+            if (k <= j) {
+                const float l = ic[s * plane + j - k];
+                dv -= l * l * d0[j - k];
+            }
+        }
+        d0[j] = dv;
+        if (dv == 0.0f) {
+            return 1;
+        }
+        const float id = 1.0f / dv;
+        const int j_max = n - j;
+        int map_index = 0;
+        for (int s = 1; s <= 5; ++s) {
+            if (sw[s] >= j_max) {
+                break;
+            }
+            float temp = 0.0f;
+            while (map_index <= map_max[s] && map_k[map_index] <= j) {
+                const int c = j - map_k[map_index];
+                temp -= (ic[map_sss[map_index] * plane + c] *
+                         ic[map_ss[map_index] * plane + c]) * d0[c];
+                ++map_index;
+            }
+            const int a = find_map[s];
+            ic[s * plane + j] =
+                a < 0 ? id * temp : id * (diag[a * plane + j] + temp);
+        }
+    }
+    return 0;
+}
+
+/*
+ * SparseConjugateGradient() with RMSResidual zero, so the iteration count is
+ * exactly `iterates` unless the step is exactly singular. `x` is the
+ * warm-start guess and the result; `b` is the right-hand side.
+ */
+inline void rt_la_tm_conjugate_gradient(__global float* x,
+                                        __global const float* b,
+                                        __global float* work,
+                                        __global const float* diag,
+                                        __global const float* ic,
+                                        const int plane, const int n,
+                                        const int w, const int iterates)
+{
+    __global float* r = work;
+    __global float* s = work + plane;
+    __global float* dir = work + 2 * plane;
+    __global float* ax = work + 3 * plane;
+    rt_la_tm_vector_product(ax, x, diag, plane, n, w);
+    for (int i = 0; i < n; ++i) {
+        r[i] = b[i] - ax[i];
+    }
+    rt_la_tm_backsolve(s, r, ic, plane, n, w);
+    double rs = rt_la_tm_product(r, s, n);
+    for (int i = 0; i < n; ++i) {
+        dir[i] = s[i];
+    }
+    for (int it = 0; it < iterates; ++it) {
+        rt_la_tm_vector_product(ax, dir, diag, plane, n, w);
+        double ab = rt_la_tm_product(dir, ax, n);
+        if (ab == 0.0) {
+            break;
+        }
+        ab = rs / ab;
+        const float abf = (float)ab;
+        for (int i = 0; i < n; ++i) {
+            x[i] += abf * dir[i];
+            r[i] -= abf * ax[i];
+        }
+        rt_la_tm_backsolve(s, r, ic, plane, n, w);
+        ab = rs;
+        rs = rt_la_tm_product(r, s, n);
+        ab = rs / ab;
+        const float abf2 = (float)ab;
+        for (int i = 0; i < n; ++i) {
+            dir[i] = s[i] + abf2 * dir[i];
+        }
+    }
+}
+
+/*
+ * EdgePreservingDecomposition::CreateBlur(). `g` is the image the edge
+ * stopping reads (the source, or the previous blur for a reweighting pass),
+ * `x` the iterate to warm-start from and overwrite. The weights are written
+ * for the interior only; the assembly below reads no border weight.
+ */
+inline void rt_la_tm_create_blur(__global const float* source,
+                                 __global const float* g,
+                                 __global float* x,
+                                 __global float* weights,
+                                 __global float* diag,
+                                 __global float* ic,
+                                 __global float* work,
+                                 const int plane, const int w, const int h,
+                                 const float scale, const float edgest,
+                                 const int iterates, const int warm)
+{
+    const int n = w * h;
+    const int w1 = w - 1;
+    const int h1 = h - 1;
+    /* The host's SSE loop covers every column below 4 * (w1 / 4); the rest
+     * takes the scalar xexpf() form. */
+    const int vector_columns = 4 * (w1 / 4);
+    for (int y = 0; y < h1; ++y) {
+        for (int xx = 0; xx < w1; ++xx) {
+            const int i = y * w + xx;
+            const float gx =
+                (g[i + 1] - g[i]) + (g[i + w + 1] - g[i + w]);
+            const float gy =
+                (g[i + w] - g[i]) + (g[i + w + 1] - g[i + 1]);
+            const float base =
+                0.5f * sqrt(gx * gx + gy * gy + RT_LA_TM_SQREPS);
+            weights[i] = xx < vector_columns
+                             ? scale * rt_la_tm_pow_vector(base, -edgest)
+                             : scale * rt_lr_pow_F(base, -edgest);
+        }
+    }
+
+    for (int i = 0; i < n - 1; ++i) {
+        diag[plane + i] = 0.0f;
+    }
+    for (int i = 0; i < n - (w - 1); ++i) {
+        diag[2 * plane + i] = 0.0f;
+    }
+    for (int i = 0; i < n - w; ++i) {
+        diag[3 * plane + i] = 0.0f;
+    }
+    for (int i = 0; i < n - (w + 1); ++i) {
+        diag[4 * plane + i] = 0.0f;
+    }
+    for (int y = 0; y < h; ++y) {
+        for (int xx = 0; xx < w; ++xx) {
+            const int i = y * w + xx;
+            float acc = 0.25f;
+            if (xx > 0 && y > 0) {
+                const float ac = weights[i - w - 1] / 6.0f;
+                diag[4 * plane + i - w - 1] -= 2.0f * ac;
+                diag[3 * plane + i - w] -= ac;
+                diag[plane + i - 1] -= ac;
+                acc += ac;
+            }
+            if (xx < w1 && y > 0) {
+                const float ac = weights[i - w] / 6.0f;
+                diag[3 * plane + i - w] -= ac;
+                diag[2 * plane + i - w + 1] -= 2.0f * ac;
+                acc += ac;
+            }
+            if (xx > 0 && y < h1) {
+                const float ac = weights[i - 1] / 6.0f;
+                diag[plane + i - 1] -= ac;
+                acc += ac;
+            }
+            if (xx < w1 && y < h1) {
+                acc += weights[i] / 6.0f;
+            }
+            diag[i] = 4.0f * acc;
+        }
+    }
+
+    for (int p = 0; p < 6; ++p) {
+        for (int i = 0; i < n; ++i) {
+            ic[p * plane + i] = 0.0f;
+        }
+    }
+    if (rt_la_tm_factor(diag, ic, plane, n, w) != 0) {
+        for (int i = 0; i < n; ++i) {
+            x[i] = 0.0f;
+        }
+        return;
+    }
+    if (warm == 0) {
+        for (int i = 0; i < n; ++i) {
+            x[i] = source[i];
+        }
+    }
+    rt_la_tm_conjugate_gradient(x, source, work, diag, ic, plane, n, w,
+                                iterates);
+}
+
+/*
+ * normalize_mean_dt()'s two moment reductions, single-threaded:
+ * mean_dt() accumulates the values and their float squares into doubles in
+ * ascending order.
+ */
+inline void rt_la_tm_mean(__global const float* data, const int n,
+                          double* mean, double* deviation)
+{
+    double sum = 0.0;
+    double squares = 0.0;
+    for (int i = 0; i < n; ++i) {
+        sum += (double)data[i];
+        squares += (double)(data[i] * data[i]);
+    }
+    sum /= n;
+    squares /= n;
+    squares -= sum * sum;
+    *mean = sum;
+    *deviation = sqrt(squares);
+}
+
+__kernel void rt_local_adjustments_tonemap(
+    __global const float* lab, const int lab_pitch, const int lab_plane,
+    __global float* fin, const int fin_pitch, const int fin_plane,
+    __global float* scratch, const int plane,
+    const int bfw, const int bfh, const int xstart, const int ystart,
+    __global const float* rec)
+{
+    const int w = bfw;
+    const int h = bfh;
+    const int n = w * h;
+    __global float* src = scratch + RT_LA_TM_PLANE_SRC * plane;
+    __global float* blur = scratch + RT_LA_TM_PLANE_BLUR * plane;
+    __global float* work = scratch + RT_LA_TM_PLANE_R * plane;
+    __global float* weights = scratch + RT_LA_TM_PLANE_WEIGHTS * plane;
+    __global float* diag = scratch + RT_LA_TM_PLANE_DIAG * plane;
+    __global float* ic = scratch + RT_LA_TM_PLANE_IC * plane;
+
+    /* EPDToneMaplocal()'s range reduction. min() and max() are the host's
+     * std::min/std::max, which are exact in any order. */
+    float min_l = lab[ystart * lab_pitch + xstart];
+    float max_l = min_l;
+    for (int y = 0; y < h; ++y) {
+        const int row = (ystart + y) * lab_pitch + xstart;
+        for (int x = 0; x < w; ++x) {
+            const float v = lab[row + x];
+            min_l = v < min_l ? v : min_l;
+            max_l = v > max_l ? v : max_l;
+        }
+    }
+    if (min_l > 0.0f) {
+        min_l = 0.0f;
+    }
+    if (max_l == 0.0f) {
+        max_l = 1.0f;
+    }
+    const float gamma = rec[RT_LA_TM_GAMMA];
+    const float mult = gamma / max_l;
+
+    /* The block's own scale, then CompressDynamicRange()'s logarithm. */
+    for (int y = 0; y < h; ++y) {
+        const int row = (ystart + y) * lab_pitch + xstart;
+        for (int x = 0; x < w; ++x) {
+            const float scaled =
+                (lab[row + x] - min_l) * mult;
+            const float positive = scaled > 0.0f ? scaled : 0.0f;
+            src[y * w + x] = rt_lr_xlogf(positive + RT_LA_TM_EPS);
+        }
+    }
+
+    const float scale = rec[RT_LA_TM_SCALE];
+    const float edgest = rec[RT_LA_TM_EDGEST];
+    const int iterates = (int)rec[RT_LA_TM_ITERATES];
+    int reweight = (int)rec[RT_LA_TM_REWEIGHT];
+    if (w < 300 && h < 300) {
+        reweight = 0;
+    }
+    if (reweight == 0) {
+        rt_la_tm_create_blur(src, src, blur, weights, diag, ic, work, plane,
+                             w, h, scale, edgest, iterates, 0);
+    } else {
+        for (int i = 0; i < n; ++i) {
+            blur[i] = src[i];
+        }
+        for (int pass = 0; pass <= reweight; ++pass) {
+            rt_la_tm_create_blur(src, blur, blur, weights, diag, ic, work,
+                                 plane, w, h, scale, edgest, iterates, 1);
+        }
+    }
+
+    /* CompressDynamicRange()'s compression, detail boost and unlogging. The
+     * host's SSE loop covers the samples below 4 * (n / 4) and its scalar
+     * tail the rest; both xexpf() forms appear. */
+    const float detail = rec[RT_LA_TM_DETAILBOOST];
+    const float temp = rec[RT_LA_TM_TEMP];
+    const int vector_samples = 4 * (n / 4);
+    for (int i = 0; i < vector_samples; ++i) {
+        const float ce = rt_la_tm_xexpf_vector(src[i] + blur[i] * temp) -
+                         RT_LA_TM_EPS;
+        const float ue = rt_la_tm_xexpf_vector(blur[i]) - RT_LA_TM_EPS;
+        const float raw = rt_la_tm_xexpf_vector(src[i]) - RT_LA_TM_EPS;
+        src[i] = ce + detail * (raw - ue);
+    }
+    for (int i = vector_samples; i < n; ++i) {
+        const float ce = rt_lr_xexpf(src[i] + blur[i] * temp) -
+                         RT_LA_TM_EPS;
+        const float ue = rt_lr_xexpf(blur[i]) - RT_LA_TM_EPS;
+        const float raw = rt_lr_xexpf(src[i]) - RT_LA_TM_EPS;
+        src[i] = ce + detail * (raw - ue);
+    }
+
+    /* EPDToneMaplocal()'s range restore. The equiltm normalization below runs
+     * on the restored lightness, not on the compressed scale. */
+    const float inv_gamma = 1.0f / gamma;
+    for (int i = 0; i < n; ++i) {
+        work[i] = src[i] * max_l * inv_gamma + min_l;
+    }
+
+    /* transit_shapedetect2()'s `equiltm` arm: normalize_mean_dt() with
+     * mod = 1 and no supplied moments, so the restored lightness becomes
+     * a * data + b against the pre-tool ROI lightness. */
+    if (rec[RT_LA_TM_EQUIL] != 0.0f) {
+        __global float* ref = blur;
+        for (int y = 0; y < h; ++y) {
+            const int row = (ystart + y) * lab_pitch + xstart;
+            for (int x = 0; x < w; ++x) {
+                ref[y * w + x] = lab[row + x];
+            }
+        }
+        double mean_ref = 0.0;
+        double dev_ref = 0.0;
+        double mean_data = 0.0;
+        double dev_data = 0.0;
+        rt_la_tm_mean(ref, n, &mean_ref, &dev_ref);
+        rt_la_tm_mean(work, n, &mean_data, &dev_data);
+        const double ratio = dev_ref / dev_data;
+        const double offset = mean_ref - ratio * mean_data;
+        const float modma = (float)(1.0 * ratio);
+        const float modmb = (float)(1.0 * 1.0 * offset);
+        const float onesmod = 1.0f - 1.0f;
+        for (int i = 0; i < n; ++i) {
+            work[i] = (modma * work[i] + modmb) + onesmod * ref[i];
+        }
+    }
+
+    /* EPDToneMaplocal()'s colour correction and transit_shapedetect2()'s
+     * senstype-8 recovery blend. */
+    const float sat = rec[RT_LA_TM_SAT];
+    const float repart = rec[RT_LA_TM_REPART];
+    for (int y = 0; y < h; ++y) {
+        const int row = (ystart + y) * lab_pitch + xstart;
+        const int frow = y * fin_pitch;
+        for (int x = 0; x < w; ++x) {
+            const int i = y * w + x;
+            const int o = row + x;
+            const float orig_l = lab[o];
+            const float orig_a = lab[lab_plane + o];
+            const float orig_b = lab[2 * lab_plane + o];
+            const float epd_l = work[i];
+            const float epd_a = sat * orig_a;
+            const float epd_b = sat * orig_b;
+            fin[frow + x] = repart * (orig_l - epd_l) + epd_l;
+            fin[fin_plane + frow + x] =
+                repart * (orig_a - epd_a) + epd_a;
+            fin[2 * fin_plane + frow + x] =
+                repart * (orig_b - epd_b) + epd_b;
+        }
+    }
 }
 )CLC";
 

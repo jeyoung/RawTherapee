@@ -42,8 +42,9 @@ struct ProcParams;
  * Host context of the local.adjustments node.
  *
  * The node covers a spot set of ImProcFunctions::Lab_Local(): an elliptical or
- * rectangular spot, the local log-encoding tool, the local dehaze tool, the
- * local CBDL tool, the Colour & Light chroma/lightness/contrast sliders and
+ * rectangular spot, the local log-encoding tool, the local tone-mapping tool,
+ * the local dehaze tool, the local CBDL tool, the Colour & Light
+ * chroma/lightness/contrast sliders and
  * L/C/H curves, the vibrance tool, the shadows/highlights tool, the soft-light
  * tool, the Gaussian local-contrast tool, the local sharpening tool, the
  * local Blur & Noise tool (Gaussian and median arms), the deltaE scope, the
@@ -52,9 +53,9 @@ struct ProcParams;
  * inactive spot, so a block whose spots do no tool work is still a
  * clamp-only block.
  *
- * The tools run in Lab_Local()'s order: log encoding, blur, dehaze, CBDL,
- * vibrance, shadows/highlights, soft light, local contrast, local sharpening,
- * then Colour & Light. The context is C-compatible because the ABI is. `self`
+ * The tools run in Lab_Local()'s order: log encoding, blur, tone mapping,
+ * dehaze, CBDL, vibrance, shadows/highlights, soft light, local contrast,
+ * local sharpening, then Colour & Light. The context is C-compatible because the ABI is. `self`
  * points at the C++ object that owns the ProcParams, ImProcFunctions and
  * LabImage references, so the pointer must not outlive them.
  *
@@ -63,14 +64,14 @@ struct ProcParams;
  * small, known subset reaches the supported paths. Slots are named by the
  * RT_LOCAL_ADJUSTMENTS_SLOT_* constants and are written once per spot.
  */
-#define RT_LOCAL_ADJUSTMENTS_CONTEXT_VERSION 11u
+#define RT_LOCAL_ADJUSTMENTS_CONTEXT_VERSION 12u
 /* "LAJC": rejects a stale or unrelated pointer before any callback runs. */
 #define RT_LOCAL_ADJUSTMENTS_CONTEXT_MAGIC 0x4C414A43u
 /* The block has no bounded spot count, but a profile that carries more spots
  * than this is outside the device set and runs the host block. */
 #define RT_LOCAL_ADJUSTMENTS_MAX_SPOTS 64u
 /* Floats per spot record; the slot constants below must stay inside it. */
-#define RT_LOCAL_ADJUSTMENTS_SPOT_STRIDE 148u
+#define RT_LOCAL_ADJUSTMENTS_SPOT_STRIDE 161u
 /* A curve table is one LUTf of the block's own size. */
 #define RT_LOCAL_ADJUSTMENTS_LUT_ENTRIES 65536u
 /* Color::gammatab_srgb and Color::igammatab_srgb, the sRGB gamma pair the
@@ -358,6 +359,38 @@ struct ProcParams;
 #define RT_LOCAL_ADJUSTMENTS_SLOT_BLUR_ARM 145u
 #define RT_LOCAL_ADJUSTMENTS_SLOT_BLUR_MED 146u
 #define RT_LOCAL_ADJUSTMENTS_SLOT_BLUR_ITERS 147u
+/* Tone Mapping. EXP_TONEMAP is 1 when Lab_Local()'s "tm" block runs: the tool
+ * on an active spot with every explicit mask idle, the global EPD pass
+ * disabled, a non-zero strength and an ROI of at least 128 px on both axes
+ * (the block's own mDEN gate; a smaller ROI makes the tool a no-op). The
+ * device runs EPDToneMaplocal()'s edge-preserving decomposition over the ROI
+ * and blends it with transit_shapedetect2()'s senstype-8 arm. TM_SENS is the
+ * block's `lp.senstm`, TM_REPART the recovery weight `1 - 0.01 * repartm`,
+ * TM_GAMMA the tone gamma. The remaining scalars are host-built exactly as
+ * EPDToneMaplocal() and EdgePreservingDecomposition build them: the
+ * compression exponent `expf(-stren)`, the detail boost (zero for a negative
+ * strength), the decompression `temp`, the colour-correction factor `sat`,
+ * the effective edge stopping (capped at three when the global local-contrast
+ * tool is on, else four), the EPD scale `scaltm / sk`, the auto iteration
+ * count and the effective reweighting count (zero for an ROI smaller than
+ * 300 px on either axis). */
+#define RT_LOCAL_ADJUSTMENTS_SLOT_EXP_TONEMAP 148u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_TM_SENS 149u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_TM_REPART 150u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_TM_GAMMA 151u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_TM_COMPRESSION 152u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_TM_DETAILBOOST 153u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_TM_TEMP 154u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_TM_SAT 155u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_TM_EDGEST 156u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_TM_SCALE 157u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_TM_ITERATES 158u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_TM_REWEIGHT 159u
+/* `equiltm`, the block's luminance-normalisation switch. The GUI default is
+ * on, so both arms are admitted: the device reproduces
+ * normalize_mean_dt()'s two double-precision reductions and its `a * data + b`
+ * rescale. */
+#define RT_LOCAL_ADJUSTMENTS_SLOT_TM_EQUIL 160u
 
 /* deconvsharpeningloc() has two arms. Damping zero is the undamped RLD path:
  * the division/multiplication recurrence the output.sharpen core already
@@ -419,6 +452,46 @@ struct ProcParams;
 /* iplocallab.cc's mSP: the blur block only runs when the ROI is at least this
  * size on both axes. */
 #define RT_LOCAL_ADJUSTMENTS_BLUR_MIN_ROI 5
+
+/* Lab_Local()'s tone-map block runs only when the ROI is at least mDEN = 128
+ * px on both axes; a smaller ROI makes the tool a no-op rather than a
+ * refusal. EPDToneMaplocal() caps its edge stopping at three when the global
+ * local-contrast tool is enabled and at four otherwise, and turns it into an
+ * automatic iteration count of `edgest * 15`. */
+#define RT_LOCAL_ADJUSTMENTS_TM_MIN_ROI 128
+#define RT_LOCAL_ADJUSTMENTS_TM_EDGEST_LOCAL_CONTRAST 3.0
+#define RT_LOCAL_ADJUSTMENTS_TM_EDGEST_DEFAULT 4.0
+#define RT_LOCAL_ADJUSTMENTS_TM_ITERATE_FACTOR 15.0f
+/* The largest automatic iteration count: the edge stopping caps at four. */
+#define RT_LOCAL_ADJUSTMENTS_TM_MAX_ITERATES 60
+/* CompressDynamicRange() drops the reweighting passes when both axes are
+ * below 300 px. */
+#define RT_LOCAL_ADJUSTMENTS_TM_REWEIGHT_LIMIT 300
+/* The GUI ranges the tone-map sliders are admitted over. */
+#define RT_LOCAL_ADJUSTMENTS_TM_MIN_STRENGTH (-0.5)
+#define RT_LOCAL_ADJUSTMENTS_TM_MAX_STRENGTH 2.0
+#define RT_LOCAL_ADJUSTMENTS_TM_MIN_GAMMA 0.4
+#define RT_LOCAL_ADJUSTMENTS_TM_MAX_GAMMA 4.0
+#define RT_LOCAL_ADJUSTMENTS_TM_MIN_EDGE_STOPPING 0.1
+#define RT_LOCAL_ADJUSTMENTS_TM_MAX_EDGE_STOPPING 4.0
+#define RT_LOCAL_ADJUSTMENTS_TM_MIN_SCALE 0.1
+#define RT_LOCAL_ADJUSTMENTS_TM_MAX_SCALE 10.0
+#define RT_LOCAL_ADJUSTMENTS_TM_MIN_REPART 1.0
+#define RT_LOCAL_ADJUSTMENTS_TM_MAX_REPART 100.0
+/* The recovery weight the record carries, `1 - 0.01 * repartm`. */
+#define RT_LOCAL_ADJUSTMENTS_TM_MIN_WEIGHT 0.0f
+#define RT_LOCAL_ADJUSTMENTS_TM_MAX_WEIGHT 0.99f
+#define RT_LOCAL_ADJUSTMENTS_TM_MIN_SATUR (-100.0)
+#define RT_LOCAL_ADJUSTMENTS_TM_MAX_SATUR 100.0
+#define RT_LOCAL_ADJUSTMENTS_TM_MIN_REWEIGHT 0
+#define RT_LOCAL_ADJUSTMENTS_TM_MAX_REWEIGHT 3
+#define RT_LOCAL_ADJUSTMENTS_TM_MIN_SENS 0
+#define RT_LOCAL_ADJUSTMENTS_TM_MAX_SENS 100
+/* Scratch planes the tone-map kernel needs: the log-domain source, the blur
+ * iterate, the conjugate-gradient vectors (r, s, direction, product), the edge
+ * weights, the five system diagonals and the six incomplete-Cholesky
+ * diagonals. */
+#define RT_LOCAL_ADJUSTMENTS_TM_SCRATCH_PLANES 18
 
 typedef struct RtLocalAdjustmentsResult {
     /* spot_count RT_LOCAL_ADJUSTMENTS_SPOT_STRIDE floats, spot-major. */

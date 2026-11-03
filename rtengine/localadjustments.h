@@ -119,6 +119,13 @@ struct LocalAdjustmentsSpotParams {
     bool deltaem = false;
     /* spot.blwh: the deltaE mask keeps L only. */
     bool blwh = false;
+    /* Tone Mapping. tonemapena is the host's enabled-and-unmasked predicate;
+     * repartm is the recovery weight's slider, senstm the senstype-8 scope
+     * sensitivity and equtm the `equiltm` luminance-normalisation switch. */
+    bool tonemapena = false;
+    float repartm = 100.f;
+    int senstm = 0;
+    bool equtm = true;
 };
 
 } // namespace rtengine

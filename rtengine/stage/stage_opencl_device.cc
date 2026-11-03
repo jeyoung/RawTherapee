@@ -12926,6 +12926,8 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
         env, def, "rt_local_adjustments_dehaze_recover", error);
     cl_kernel dehaze_rgb2lab_kernel = compiled_kernel_entry(
         env, def, "rt_local_adjustments_dehaze_rgb2lab", error);
+    cl_kernel tonemap_kernel = compiled_kernel_entry(
+        env, def, "rt_local_adjustments_tonemap", error);
     cl_kernel cbdl_fill_kernel =
         compiled_kernel_entry(env, def, "rt_local_adjustments_cbdl_fill",
                               error);
@@ -12979,6 +12981,7 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
         dehaze_dark_kernel == nullptr ||
         dehaze_recover_kernel == nullptr ||
         dehaze_rgb2lab_kernel == nullptr ||
+        tonemap_kernel == nullptr ||
         cbdl_fill_kernel == nullptr || cbdl_copy_kernel == nullptr ||
         cbdl_finish_kernel == nullptr || cbdl_metric_kernel == nullptr ||
         cbdl_luma_kernel == nullptr || cbdl_chroma_kernel == nullptr ||
@@ -13160,6 +13163,8 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
     char sharpen_blur_keys[3] = {0, 0, 0};
     char sharpen_blur_tmp_key = 0;
     char log_orig_key = 0;
+    char tone_map_fin_key = 0;
+    char tone_map_scratch_key = 0;
     char blur_keys[3] = {0, 0, 0};
     char lc_h_key = 0;
     char lc_v_key = 0;
@@ -13356,6 +13361,8 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
             rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXPSHARP] == 1.0f;
         const bool blurPass =
             rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXPBLUR] == 1.0f;
+        const bool toneMapPass =
+            rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXP_TONEMAP] == 1.0f;
         const uint32_t shape =
             static_cast<uint32_t>(rec[RT_LOCAL_ADJUSTMENTS_SLOT_SHAPE]);
         const uint32_t avoid = static_cast<uint32_t>(
@@ -13381,6 +13388,8 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
             (rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXPSHARP] != 0.0f &&
              !sharpenPass) ||
             (rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXPBLUR] != 0.0f && !blurPass) ||
+            (rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXP_TONEMAP] != 0.0f &&
+             !toneMapPass) ||
             (rec[RT_LOCAL_ADJUSTMENTS_SLOT_MERGE] != 0.0f) ||
             (rec[RT_LOCAL_ADJUSTMENTS_SLOT_HRENABLED] != 0.0f) ||
             (rec[RT_LOCAL_ADJUSTMENTS_SLOT_REPARCOL] != 100.0f) ||
@@ -13397,7 +13406,7 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
             (!active && (colour || vibrance || localContrast ||
                          shadowsHighlights || softLight || cbdl ||
                          dehazePass || logPass || sharpenPass || blurPass ||
-                         islocal))) {
+                         toneMapPass || islocal))) {
             error = "local.adjustments record is outside the supported set";
             return RT_STAGE_FALLBACK;
         }
@@ -13572,6 +13581,42 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
              rec[RT_LOCAL_ADJUSTMENTS_SLOT_LOG_REPART] < 0.0f ||
              rec[RT_LOCAL_ADJUSTMENTS_SLOT_LOG_REPART] > 1.0f)) {
             error = "local.adjustments log setting is outside its range";
+            return RT_STAGE_FALLBACK;
+        }
+        if (toneMapPass &&
+            (rec[RT_LOCAL_ADJUSTMENTS_SLOT_TM_SENS] <
+                 static_cast<float>(RT_LOCAL_ADJUSTMENTS_TM_MIN_SENS) ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_TM_SENS] >
+                 static_cast<float>(RT_LOCAL_ADJUSTMENTS_TM_MAX_SENS) ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_TM_REPART] <
+                 RT_LOCAL_ADJUSTMENTS_TM_MIN_WEIGHT ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_TM_REPART] >
+                 RT_LOCAL_ADJUSTMENTS_TM_MAX_WEIGHT ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_TM_GAMMA] <
+                 RT_LOCAL_ADJUSTMENTS_TM_MIN_GAMMA ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_TM_GAMMA] >
+                 RT_LOCAL_ADJUSTMENTS_TM_MAX_GAMMA ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_TM_COMPRESSION] <= 0.0f ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_TM_DETAILBOOST] < 0.0f ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_TM_SAT] <= 0.0f ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_TM_EDGEST] <
+                 RT_LOCAL_ADJUSTMENTS_TM_MIN_EDGE_STOPPING ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_TM_EDGEST] >
+                 RT_LOCAL_ADJUSTMENTS_TM_MAX_EDGE_STOPPING ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_TM_SCALE] <
+                 RT_LOCAL_ADJUSTMENTS_TM_MIN_SCALE ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_TM_SCALE] >
+                 RT_LOCAL_ADJUSTMENTS_TM_MAX_SCALE ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_TM_ITERATES] < 1.0f ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_TM_ITERATES] >
+                 static_cast<float>(
+                     RT_LOCAL_ADJUSTMENTS_TM_MAX_ITERATES) ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_TM_REWEIGHT] < 0.0f ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_TM_REWEIGHT] >
+                 static_cast<float>(RT_LOCAL_ADJUSTMENTS_TM_MAX_REWEIGHT) ||
+             (rec[RT_LOCAL_ADJUSTMENTS_SLOT_TM_EQUIL] != 0.0f &&
+              rec[RT_LOCAL_ADJUSTMENTS_SLOT_TM_EQUIL] != 1.0f))) {
+            error = "local.adjustments tone-map setting is outside its range";
             return RT_STAGE_FALLBACK;
         }
         const float cbdlLumaLevelsValue =
@@ -13857,6 +13902,23 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
                         "small for the guided filter";
                 return RT_STAGE_FALLBACK;
             }
+            /* Tone mapping's incomplete-Cholesky fill map is derived for the
+             * block's own mDEN gate; a smaller ROI is the block's no-op and
+             * must not reach the kernel. */
+            if (toneMapPass &&
+                (bfw < RT_LOCAL_ADJUSTMENTS_TM_MIN_ROI ||
+                 bfh < RT_LOCAL_ADJUSTMENTS_TM_MIN_ROI)) {
+                error = "local.adjustments tone-map ROI is below the block's "
+                        "gate";
+                return RT_STAGE_FALLBACK;
+            }
+            if (toneMapPass &&
+                static_cast<long long>(bfw) * bfh >
+                    std::numeric_limits<cl_int>::max() /
+                        RT_LOCAL_ADJUSTMENTS_TM_SCRATCH_PLANES) {
+                error = "local.adjustments tone-map ROI is too large";
+                return RT_STAGE_FALLBACK;
+            }
         }
 
         /* The matrices, caches and Munsell tables are block-global. */
@@ -14110,6 +14172,32 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
                     &error);
             }
             /*
+             * Tone mapping's ROI-sized decomposition result and the kernel's
+             * scratch set: the log-domain source, the blur iterate, the four
+             * conjugate-gradient vectors, the edge weights, the five system
+             * diagonals and the six incomplete-Cholesky diagonals.
+             */
+            StageDeviceBufferPtr tone_map_fin_device;
+            StageDeviceBufferPtr tone_map_scratch_device;
+            if (toneMapPass) {
+                tone_map_fin_device = residency->acquire(
+                    &tone_map_fin_key, StageBufferShape{RT_STAGE_F32, bfw,
+                                                        bfh, 3},
+                    &error);
+                /* One contiguous block: the kernel treats it as
+                 * RT_LOCAL_ADJUSTMENTS_TM_SCRATCH_PLANES arrays of
+                 * bfw * bfh floats. */
+                tone_map_scratch_device = residency->acquire(
+                    &tone_map_scratch_key,
+                    StageBufferShape{
+                        RT_STAGE_F32,
+                        bfw * bfh *
+                            static_cast<int>(
+                                RT_LOCAL_ADJUSTMENTS_TM_SCRATCH_PLANES),
+                        1, 1},
+                    &error);
+            }
+            /*
              * shadows/highlights' mask/guide pair and guidedFilter()'s five
              * subsampled arrays. They exist only when the tool runs.
              */
@@ -14295,11 +14383,15 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
                  dehaze_sub_meani_device && dehaze_sub_meanp_device &&
                  dehaze_sub_temp_device &&
                  (!dehaze_rescale || dehaze_rescale_device));
+            const bool tone_map_acquired =
+                !toneMapPass ||
+                (tone_map_fin_device && tone_map_scratch_device);
             if (!work_device || !scratch_device || !blur_device[0] ||
                 !blur_device[1] || !blur_device[2] || !cbdl_acquired ||
                 (blurPass && blurArm == RT_LOCAL_ADJUSTMENTS_BLUR_ARM_MEDIAN &&
                  !median_device) ||
-                !dehaze_acquired || (logPass && !log_orig_device) ||
+                !dehaze_acquired || !tone_map_acquired ||
+                (logPass && !log_orig_device) ||
                 (sharpenPass &&
                  (!sharpen_luma_device || !sharpen_mask_device ||
                   !sharpen_estimate_device || !sharpen_tmp_device)) ||
@@ -14345,6 +14437,18 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
                                            "log original");
                 log_orig_plane = int_pitch(plane_pitch_of(log_orig_device),
                                            "log original plane");
+            }
+            int tone_map_fin_pitch = 0;
+            int tone_map_fin_plane = 0;
+            int tone_map_scratch_plane = 0;
+            if (toneMapPass) {
+                tone_map_fin_pitch = int_pitch(
+                    pitch_of(tone_map_fin_device), "tone map result");
+                tone_map_fin_plane = int_pitch(
+                    plane_pitch_of(tone_map_fin_device),
+                    "tone map result plane");
+                /* The kernel indexes the block as 18 arrays of bfw * bfh. */
+                tone_map_scratch_plane = bfw * bfh;
             }
             const int blur_pitch = int_pitch(pitch_of(blur_device[0]), "blur");
             const int scratch_pitch =
@@ -14588,16 +14692,21 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
             };
 
             /* transit_shapedetect2()'s blend for a tool whose output is in
-             * `work`: `varsens` is the tool's own scope sensitivity. */
+             * `work`: `varsens` is the tool's own scope sensitivity. A tool
+             * that writes its own ROI buffer passes it as `fin`. */
             const auto run_blend = [&](const char* label,
                                        cl_float varsens,
                                        bool clip_luminance = false,
                                        bool full_blur = false,
                                        bool raw_scope = false,
-                                       float scope_base = 2.0f) {
+                                       float scope_base = 2.0f,
+                                       cl_mem fin_override = nullptr,
+                                       cl_int fin_pitch_arg = 0,
+                                       cl_int fin_plane_arg = 0) {
                 cl_uint arg = 0;
                 cl_mem lab_memory = memory_of(image);
-                cl_mem fin_memory = work_memory;
+                cl_mem fin_memory =
+                    fin_override != nullptr ? fin_override : work_memory;
                 cl_mem blur_l = full_blur ? sharpen_blur_memory[0]
                                           : memory_of(blur_device[0]);
                 cl_mem blur_a = full_blur ? sharpen_blur_memory[1]
@@ -14607,8 +14716,10 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
                 cl_mem record_memory = memory_of(record_device);
                 cl_int lp = lab_pitch;
                 cl_int lpl = lab_plane;
-                cl_int fp = work_pitch;
-                cl_int fpl = work_plane;
+                cl_int fp = fin_override != nullptr ? fin_pitch_arg
+                                                    : work_pitch;
+                cl_int fpl = fin_override != nullptr ? fin_plane_arg
+                                                     : work_plane;
                 cl_int rw = bfw;
                 cl_int rh = bfh;
                 cl_int x0 = xstart;
@@ -15374,6 +15485,73 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
                                rec[RT_LOCAL_ADJUSTMENTS_SLOT_BLUR_SENS],
                                true, true, true,
                                RT_LOCAL_ADJUSTMENTS_BLUR_SCOPE_BASE)) {
+                    return RT_STAGE_FALLBACK;
+                }
+            }
+
+            /*
+             * Tone Mapping. Lab_Local()'s "tm" block runs after Blur & Noise
+             * and before dehaze: EPDToneMaplocal() decomposes the ROI
+             * lightness with EdgePreservingDecomposition, then
+             * transit_shapedetect2()'s senstype-8 arm normalizes it and blends
+             * it against the deltaE scope. The kernel reproduces the
+             * decomposition, its two host reductions and the recovery blend in
+             * one work item; the deltaE reference is the default 3 / sk ROI
+             * blur, the same one vibrance uses.
+             */
+            if (toneMapPass) {
+                if (!copy_roi() ||
+                    !blur_roi(*setup.iir_vibrance, "tone map blur")) {
+                    return RT_STAGE_FALLBACK;
+                }
+                const cl_mem scratch_tonemap =
+                    memory_of(tone_map_scratch_device);
+                const cl_mem fin_tonemap = memory_of(tone_map_fin_device);
+                if (tone_map_fin_pitch < 0 || tone_map_fin_plane < 0 ||
+                    tone_map_scratch_plane < 0 || scratch_tonemap == nullptr ||
+                    fin_tonemap == nullptr) {
+                    error = "local.adjustments tone-map buffers are invalid";
+                    return RT_STAGE_FALLBACK;
+                }
+                cl_uint tm_arg = 0;
+                cl_mem lab_memory = memory_of(image);
+                cl_mem record_memory = memory_of(record_device);
+                cl_int lp = lab_pitch;
+                cl_int lpl = lab_plane;
+                cl_int rw = bfw;
+                cl_int rh = bfh;
+                cl_int x0 = xstart;
+                cl_int y0 = ystart;
+                bool ok = true;
+                ok = ok && set(tonemap_kernel, tm_arg++, sizeof(cl_mem),
+                               &lab_memory);
+                ok = ok && set(tonemap_kernel, tm_arg++, sizeof(cl_int), &lp);
+                ok = ok && set(tonemap_kernel, tm_arg++, sizeof(cl_int), &lpl);
+                ok = ok && set(tonemap_kernel, tm_arg++, sizeof(cl_mem),
+                               &fin_tonemap);
+                ok = ok && set(tonemap_kernel, tm_arg++, sizeof(cl_int),
+                               &tone_map_fin_pitch);
+                ok = ok && set(tonemap_kernel, tm_arg++, sizeof(cl_int),
+                               &tone_map_fin_plane);
+                ok = ok && set(tonemap_kernel, tm_arg++, sizeof(cl_mem),
+                               &scratch_tonemap);
+                ok = ok && set(tonemap_kernel, tm_arg++, sizeof(cl_int),
+                               &tone_map_scratch_plane);
+                ok = ok && set(tonemap_kernel, tm_arg++, sizeof(cl_int), &rw);
+                ok = ok && set(tonemap_kernel, tm_arg++, sizeof(cl_int), &rh);
+                ok = ok && set(tonemap_kernel, tm_arg++, sizeof(cl_int), &x0);
+                ok = ok && set(tonemap_kernel, tm_arg++, sizeof(cl_int), &y0);
+                ok = ok && set(tonemap_kernel, tm_arg++, sizeof(cl_mem),
+                               &record_memory);
+                if (!ok ||
+                    !launch1d(tonemap_kernel, 1, "tone map")) {
+                    error = "local.adjustments tone map failed";
+                    return RT_STAGE_FALLBACK;
+                }
+                if (!run_blend("tone map blend",
+                               rec[RT_LOCAL_ADJUSTMENTS_SLOT_TM_SENS],
+                               true, false, false, 2.0f, fin_tonemap,
+                               tone_map_fin_pitch, tone_map_fin_plane)) {
                     return RT_STAGE_FALLBACK;
                 }
             }

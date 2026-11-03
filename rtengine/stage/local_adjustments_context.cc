@@ -129,15 +129,73 @@ bool explicitMaskIdle(const procparams::LocallabParams::LocallabSpot& spot)
            !spot.enacieMaskall;
 }
 
-/* Every tool other than the nine this node runs, plus the retinex tool. The
+/* Whether the local tone-mapping tool's parameters are inside the device set.
+ *
+ * Lab_Local()'s "tm" block guard is
+ * `(lp.strengt != 0 || mask display) && lp.tonemapena && !params->epd.enabled`;
+ * the block predicate has already narrowed the mask state, the spot method and
+ * the global EPD pass. The block keeps its own mDEN gate (a 128 px ROI on both
+ * axes), so a smaller ROI makes the tool a no-op rather than a residual.
+ *
+ * The device runs EPDToneMaplocal()'s edge-preserving decomposition and
+ * transit_shapedetect2()'s senstype-8 blend, including the `equiltm`
+ * normalization arm the GUI enables by default. The recovery mask
+ * (`recothrest`) and every explicit mask stay on the host. The slider ranges
+ * are the GUI's. */
+bool toneMapAdmitted(const procparams::LocallabParams::LocallabSpot& spot)
+{
+    if (!finiteValue(spot.stren) || !finiteValue(spot.gamma) ||
+        !finiteValue(spot.estop) || !finiteValue(spot.scaltm) ||
+        !finiteValue(spot.repartm) || !finiteValue(spot.satur)) {
+        return false;
+    }
+    if (spot.stren < RT_LOCAL_ADJUSTMENTS_TM_MIN_STRENGTH ||
+        spot.stren > RT_LOCAL_ADJUSTMENTS_TM_MAX_STRENGTH) {
+        return false;
+    }
+    if (spot.gamma < RT_LOCAL_ADJUSTMENTS_TM_MIN_GAMMA ||
+        spot.gamma > RT_LOCAL_ADJUSTMENTS_TM_MAX_GAMMA) {
+        return false;
+    }
+    if (spot.estop < RT_LOCAL_ADJUSTMENTS_TM_MIN_EDGE_STOPPING ||
+        spot.estop > RT_LOCAL_ADJUSTMENTS_TM_MAX_EDGE_STOPPING) {
+        return false;
+    }
+    if (spot.scaltm < RT_LOCAL_ADJUSTMENTS_TM_MIN_SCALE ||
+        spot.scaltm > RT_LOCAL_ADJUSTMENTS_TM_MAX_SCALE) {
+        return false;
+    }
+    if (spot.repartm < RT_LOCAL_ADJUSTMENTS_TM_MIN_REPART ||
+        spot.repartm > RT_LOCAL_ADJUSTMENTS_TM_MAX_REPART) {
+        return false;
+    }
+    if (spot.satur < RT_LOCAL_ADJUSTMENTS_TM_MIN_SATUR ||
+        spot.satur > RT_LOCAL_ADJUSTMENTS_TM_MAX_SATUR) {
+        return false;
+    }
+    if (spot.rewei < RT_LOCAL_ADJUSTMENTS_TM_MIN_REWEIGHT ||
+        spot.rewei > RT_LOCAL_ADJUSTMENTS_TM_MAX_REWEIGHT) {
+        return false;
+    }
+    if (spot.sensitm < RT_LOCAL_ADJUSTMENTS_TM_MIN_SENS ||
+        spot.sensitm > RT_LOCAL_ADJUSTMENTS_TM_MAX_SENS) {
+        return false;
+    }
+    /* recothrest below one selects the recovery-mask blend, which the block
+     * feeds `originalmasktm`; every mask is a residual here. */
+    return spot.recothrest == 1.0;
+}
+
+/* Every tool other than the eleven this node runs, plus the retinex tool. The
  * exposure tool also decides the clamp arm; it is a residual here. Local
  * dehaze is not a tool of its own: Lab_Local() gates it on the retinex
  * enable, so expreti is accepted only when the retinex strength is zero
- * (dehazeAdmitted() checks that) and is otherwise a residual. */
+ * (dehazeAdmitted() checks that) and is otherwise a residual. Tone mapping is
+ * admitted through toneMapAdmitted(). */
 bool otherToolEnabled(const procparams::LocallabParams::LocallabSpot& spot)
 {
     return spot.expexpose ||
-           spot.exptonemap || spot.expmask || spot.expcie ||
+           spot.expmask || spot.expcie ||
            spot.expprecam;
 }
 
@@ -789,8 +847,15 @@ bool localAdjustmentsSupported(const procparams::ProcParams& params)
             if ((!spot.expcolor && !spot.expvibrance && !spot.expcontrast &&
                  !spot.expshadhigh && !spot.expsoft && !spot.expcbdl &&
                  !spot.explog && !spot.expsharp && !spot.expblur &&
-                 !dehaze) ||
+                 !spot.exptonemap && !dehaze) ||
                 otherToolEnabled(spot)) {
+                return false;
+            }
+            /* The tone-mapping block is skipped entirely when the global EPD
+             * pass is enabled, so an active exptonemap spot would be a
+             * silent no-op; it stays a host execution. */
+            if (spot.exptonemap &&
+                (params.epd.enabled || !toneMapAdmitted(spot))) {
                 return false;
             }
             /* The retinex enable is the dehaze gate. The retinex tool itself
@@ -1828,6 +1893,74 @@ int LocalAdjustmentsContext::build(int spot, const RtStageBuffer* lab,
          RT_LOCAL_ADJUSTMENTS_BLUR_RADIUS_DIVISOR));
 
     /*
+     * Tone Mapping. Lab_Local()'s "tm" block guard is
+     * `(lp.strengt != 0 || mask display) && lp.tonemapena && !params->epd.enabled`;
+     * the predicate has narrowed the masks, the spot method, the global EPD
+     * pass and the slider ranges, and the export call site has no
+     * previous-deltaE arm. The block keeps its own mDEN gate, so a ROI below
+     * 128 px on either axis is a no-op and is not recorded as a pass.
+     *
+     * EPDToneMaplocal() builds these scalars around the ROI reduction it runs
+     * on its own copy: the compression exponent, the detail boost, the
+     * decompression temperature `temp`, the colour-correction factor `sat`,
+     * the effective edge stopping and the automatic iteration count. They are
+     * host-built here so the kernel reads the block's own values; the ROI
+     * minimum and maximum are exact on the device and stay there.
+     */
+    const int toneMapXStart = std::max(
+        static_cast<int>(lp.xc - lp.lxL), 0);
+    const int toneMapYStart = std::max(
+        static_cast<int>(lp.yc - lp.lyT), 0);
+    const int toneMapWidth =
+        std::min(static_cast<int>(lp.xc + lp.lx), fw_) - toneMapXStart;
+    const int toneMapHeight =
+        std::min(static_cast<int>(lp.yc + lp.ly), fh_) - toneMapYStart;
+    const bool toneMapRun = profileSpot.exptonemap && lp.activspot &&
+                            lp.tonemapena && profileSpot.stren != 0.0 &&
+                            toneMapWidth >=
+                                RT_LOCAL_ADJUSTMENTS_TM_MIN_ROI &&
+                            toneMapHeight >=
+                                RT_LOCAL_ADJUSTMENTS_TM_MIN_ROI;
+    if (toneMapRun && ipf_.getScale() != 1.0) {
+        return 1;
+    }
+    const float tmStrength = static_cast<float>(profileSpot.stren);
+    const float tmEdgeStopping = static_cast<float>(std::min(
+        profileSpot.estop,
+        params_.localContrast.enabled
+            ? RT_LOCAL_ADJUSTMENTS_TM_EDGEST_LOCAL_CONTRAST
+            : RT_LOCAL_ADJUSTMENTS_TM_EDGEST_DEFAULT));
+    const float tmCompression =
+        std::exp(-tmStrength);
+    const float tmDetailBoost = tmStrength < 0.f ? 0.f : tmStrength;
+    /* CompressDynamicRange()'s `temp`: the detail boost arm uses
+     * expf(-(2 - DetailBoost + log 2)) - 1, the plain arm Compression - 1. */
+    const float tmTemp =
+        tmDetailBoost > 0.f
+            ? 1.2f * xlogf(-(std::exp(-(2.f - tmDetailBoost + 0.693147f)) -
+                             1.f))
+            : tmCompression - 1.0f;
+    /* Mantiuk's colour correction: s = 39.7889 p / (1 + 38.7889 p) with
+     * p = Compression ^ 1.5856, then sat = s + 0.3 s (satur / 100). */
+    const float tmPow = std::pow(tmCompression, 1.5856f);
+    float tmSat = (1.0f + 38.7889f) * tmPow / (1.0f + 38.7889f * tmPow);
+    tmSat = tmSat + 0.3f * tmSat *
+                        (static_cast<float>(profileSpot.satur) / 100.f);
+    if (tmSat == 1.f) {
+        tmSat = 1.001f;
+    }
+    const int tmIterates = static_cast<int>(
+        tmEdgeStopping * RT_LOCAL_ADJUSTMENTS_TM_ITERATE_FACTOR);
+    /* CompressDynamicRange() drops the reweightings for a thumbnail-sized
+     * ROI; the test is on the ROI, not on the spot. */
+    const int tmReweight =
+        toneMapWidth < RT_LOCAL_ADJUSTMENTS_TM_REWEIGHT_LIMIT &&
+                toneMapHeight < RT_LOCAL_ADJUSTMENTS_TM_REWEIGHT_LIMIT
+            ? 0
+            : profileSpot.rewei;
+    const float tmScale = static_cast<float>(profileSpot.scaltm);
+
+    /*
      * Local log encoding. Lab_Local()'s block runs when logena is set, which
      * needs the tool on, the spot active and no explicit tool mask; the
      * predicate has already narrowed detail, ciecam and autocompute. The
@@ -2179,6 +2312,26 @@ int LocalAdjustmentsContext::build(int spot, const RtStageBuffer* lab,
         static_cast<float>(lp.blmedmet);
     record[RT_LOCAL_ADJUSTMENTS_SLOT_BLUR_ITERS] =
         static_cast<float>(lp.bliters);
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_EXP_TONEMAP] =
+        toneMapRun ? 1.f : 0.f;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_TM_SENS] =
+        static_cast<float>(profileSpot.sensitm);
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_TM_REPART] =
+        1.0f - 0.01f * lp.repartm;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_TM_GAMMA] =
+        static_cast<float>(profileSpot.gamma);
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_TM_COMPRESSION] = tmCompression;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_TM_DETAILBOOST] = tmDetailBoost;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_TM_TEMP] = tmTemp;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_TM_SAT] = tmSat;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_TM_EDGEST] = tmEdgeStopping;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_TM_SCALE] = tmScale;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_TM_ITERATES] =
+        static_cast<float>(tmIterates);
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_TM_REWEIGHT] =
+        static_cast<float>(tmReweight);
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_TM_EQUIL] =
+        profileSpot.equiltm ? 1.f : 0.f;
     record[RT_LOCAL_ADJUSTMENTS_SLOT_EXPDENAZE] = dehazeRun ? 1.f : 0.f;
     record[RT_LOCAL_ADJUSTMENTS_SLOT_SENSH] =
         static_cast<float>(profileSpot.sensih);
