@@ -38,10 +38,12 @@
  * skipped, L=f(C) is skipped, and the closing write is the a/b tables'
  * deviation from the original chroma (exactly zero when neither table is
  * active). The three hue flat curves still run under `bwToning`, exactly as
- * the block orders them. Residual (the launcher never reaches this kernel): a
- * non-zero contrast (it owns the hist16 refill), a hue flat curve the host
- * table cannot follow, a chromaticity slider outside -100..100 and a denoised
- * chroma factor.
+ * the block orders them; each is the host's faceted polyline, carried as
+ * double knots, so a dense curve reproduces exactly. Residual (the launcher
+ * never reaches this kernel): a non-zero contrast (it owns the hist16
+ * refill), a hue flat curve neither the polyline nor the refiner can follow
+ * within the host's bound, a chromaticity slider outside -100..100 and a
+ * denoised chroma factor.
  *
  * The source is appended after lab_tools_cl.h, munsell_lch_cl.h and
  * vibrance_cl.h, so it reads their LUT, atan2/sincos and Munsell helpers.
@@ -131,44 +133,42 @@ inline double rt_lt_huehsv2(const float HH)
 }
 
 /*
- * One host-sampled hue flat curve. slot[0] is the node count, then that many
- * x nodes, then that many y nodes. The lookup matches the host's validator:
+ * One host-carried hue flat curve. slot[0] is the node count, then that many
+ * x nodes, then that many y nodes, all doubles: the polyline knots are
+ * abscissae in [0,1] and a float one moves a dense steep curve by far more
+ * than the host's 5e-7 value bound. The lookup matches the host's validator:
  * linear inside the table and extrapolated with the first/last segment slope
  * outside it.
  */
-inline double rt_lt_hue_lut(__global const float* slot, const double t)
+inline double rt_lt_hue_lut(__global const double* slot, const double t)
 {
     const int count = (int)slot[0];
     if (count < 2) {
         return 0.0;
     }
-    __global const float* xs = slot + 1;
-    __global const float* ys = slot + 1 + count;
-    if (t <= (double)xs[0]) {
-        const double slope = ((double)ys[1] - (double)ys[0]) /
-                             ((double)xs[1] - (double)xs[0]);
-        return (double)ys[0] + (t - (double)xs[0]) * slope;
+    __global const double* xs = slot + 1;
+    __global const double* ys = slot + 1 + count;
+    if (t <= xs[0]) {
+        const double slope = (ys[1] - ys[0]) / (xs[1] - xs[0]);
+        return ys[0] + (t - xs[0]) * slope;
     }
-    if (t >= (double)xs[count - 1]) {
-        const double slope = ((double)ys[count - 1] - (double)ys[count - 2]) /
-                             ((double)xs[count - 1] - (double)xs[count - 2]);
-        return (double)ys[count - 1] +
-               (t - (double)xs[count - 1]) * slope;
+    if (t >= xs[count - 1]) {
+        const double slope =
+            (ys[count - 1] - ys[count - 2]) / (xs[count - 1] - xs[count - 2]);
+        return ys[count - 1] + (t - xs[count - 1]) * slope;
     }
     int low = 0;
     int high = count - 1;
     while (high - low > 1) {
         const int middle = (low + high) / 2;
-        if ((double)xs[middle] <= t) {
+        if (xs[middle] <= t) {
             low = middle;
         } else {
             high = middle;
         }
     }
-    const double fraction = (t - (double)xs[low]) /
-                            ((double)xs[high] - (double)xs[low]);
-    return (double)ys[low] +
-           ((double)ys[high] - (double)ys[low]) * fraction;
+    const double fraction = (t - xs[low]) / (xs[high] - xs[low]);
+    return ys[low] + (ys[high] - ys[low]) * fraction;
 }
 
 /* Color::xyz2rgb() on the block's double matrix: double products, narrowed on
@@ -545,7 +545,7 @@ __kernel void rt_lab_tools_lab_curve(
     __global const float* munsell, __global const float* munsell_sizes,
     const int width, const int height,
     const int lab_pitch, const int lab_plane,
-    __global const float* hue_luts, const int hue_stride,
+    __global const double* hue_luts, const int hue_stride,
     const int ch_active, const int lh_active, const int hh_active,
     const int chromaticity, const float amount_chroma,
     __global const double* wip, const int highlight,

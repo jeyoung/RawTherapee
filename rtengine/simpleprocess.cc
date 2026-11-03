@@ -1887,6 +1887,28 @@ private:
                     buffer.flags = RT_STAGE_BUFFER_READ;
                     return buffer;
                 };
+                /*
+                 * A double table in the residency's float-counted shape: two
+                 * float words per value, the same upload the region pass uses
+                 * for its double matrices. The hue flat-curve nodes are
+                 * doubles because a float knot abscissa moves a dense steep
+                 * curve far past the host's value bound.
+                 */
+                const auto host_double_buffer = [](const double* data,
+                                                   int count) {
+                    RtStageBuffer buffer{};
+                    buffer.size = sizeof(RtStageBuffer);
+                    buffer.data = const_cast<double*>(data);
+                    buffer.width = 2 * count;
+                    buffer.height = 1;
+                    buffer.row_pitch = static_cast<std::size_t>(buffer.width) *
+                                       sizeof(float);
+                    buffer.plane_pitch = buffer.row_pitch;
+                    buffer.planes = 1;
+                    buffer.format = RT_STAGE_F32;
+                    buffer.flags = RT_STAGE_BUFFER_READ;
+                    return buffer;
+                };
                 args[16].u.buffer = host_buffer(
                     setup.lut_highlight, static_cast<int>(setup.lut_entries));
                 args[17].u.buffer = host_buffer(
@@ -1952,7 +1974,7 @@ private:
                     args[53].u.buffer = host_buffer(
                         setup.lab_curve_cl,
                         static_cast<int>(setup.lab_curve_entries));
-                    args[71].u.buffer = host_buffer(
+                    args[71].u.buffer = host_double_buffer(
                         setup.lab_curve_hue,
                         static_cast<int>(setup.lab_curve_hue_stride *
                                          RT_LAB_TOOLS_HUE_CURVES));

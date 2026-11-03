@@ -3802,10 +3802,10 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
         curve_entries = static_cast<int>(curve_length);
 
         /*
-         * The hue flat-curve family. The stride is the fixed slot size; the
-         * three flags say which slots the kernel may read, and the slider is
-         * the block's chromaticity value, which also gates whether the block
-         * builds the curves at all.
+         * The hue flat-curve family. The stride is the fixed slot size in
+         * doubles; the three flags say which slots the kernel may read, and
+         * the slider is the block's chromaticity value, which also gates
+         * whether the block builds the curves at all.
          */
         hue_stride = in(70, 0, static_cast<int>(RT_LAB_TOOLS_HUE_CURVES *
                                                RT_LAB_TOOLS_HUE_LUT_STRIDE));
@@ -4214,11 +4214,16 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
         }
 
         const RtStageBuffer& hue_luts = args[71].u.buffer;
+        /*
+         * The hue slots hold doubles: two float words per node, uploaded as
+         * the residency's byte-counted F32 shape exactly like the working
+         * matrices below.
+         */
         if (!valid(hue_luts) || hue_luts.format != RT_STAGE_F32 ||
             hue_luts.planes != 1 || hue_luts.height != 1 ||
             static_cast<std::uint32_t>(hue_luts.width) !=
                 RT_LAB_TOOLS_HUE_CURVES *
-                    static_cast<std::uint32_t>(hue_stride)) {
+                    static_cast<std::uint32_t>(hue_stride) * 2u) {
             error = "lab.tools needs the three hue flat-curve tables";
             return RT_STAGE_INVALID;
         }
@@ -4468,9 +4473,13 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
     char hue_luts_key = 0;
     char wip_key = 0;
     char wp_key = 0;
+    /* The hue slots hold doubles, two float words per node. */
     const StageBufferShape hue_shape{
         RT_STAGE_F32,
-        static_cast<std::int32_t>(RT_LAB_TOOLS_HUE_CURVES * hue_stride), 1, 1};
+        static_cast<std::int32_t>(RT_LAB_TOOLS_HUE_CURVES *
+                                  RT_LAB_TOOLS_HUE_LUT_WORDS),
+        1,
+        1};
     StageDeviceBufferPtr hue_luts_device;
     StageDeviceBufferPtr wip_device;
     StageDeviceBufferPtr wp_device;

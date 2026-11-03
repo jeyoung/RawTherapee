@@ -63,12 +63,13 @@ struct RegionCurveNode {
 
 void regionCurveRefine(const FlatCurve& curve, const RegionCurveNode& left,
                        const RegionCurveNode& right, int depth,
-                       std::vector<RegionCurveNode>& nodes, bool& ok)
+                       std::vector<RegionCurveNode>& nodes, bool& ok,
+                       std::size_t budget)
 {
     if (!ok) {
         return;
     }
-    if (nodes.size() + 2 > RT_LAB_TOOLS_REGION_LUT_NODES) {
+    if (nodes.size() + 2 > budget) {
         ok = false;
         return;
     }
@@ -93,31 +94,38 @@ void regionCurveRefine(const FlatCurve& curve, const RegionCurveNode& left,
     }
 
     const RegionCurveNode middle{half, f_half};
-    regionCurveRefine(curve, left, middle, depth + 1, nodes, ok);
+    regionCurveRefine(curve, left, middle, depth + 1, nodes, ok, budget);
     nodes.push_back(middle);
-    regionCurveRefine(curve, middle, right, depth + 1, nodes, ok);
+    regionCurveRefine(curve, middle, right, depth + 1, nodes, ok, budget);
 }
 
-/* The kernel's table lookup, on the host, over the float table as stored. */
-double regionLutValue(const float* slot, double t)
+/* The kernel's table lookup, on the host, over the table as stored. The hue
+ * slots hold doubles and the region slots floats; the parameters are double
+ * either way, exactly as the two kernels interpolate. */
+template <typename T>
+double regionLutValue(const T* slot, double t)
 {
     const int count = static_cast<int>(slot[0]);
     if (count < 2) {
         return 0.0;
     }
-    const float* xs = slot + 1;
-    const float* ys = slot + 1 + count;
+    const T* xs = slot + 1;
+    const T* ys = slot + 1 + count;
     if (t <= static_cast<double>(xs[0])) {
         const double slope =
-            (static_cast<double>(ys[1]) - ys[0]) /
-            (static_cast<double>(xs[1]) - xs[0]);
-        return ys[0] + (t - xs[0]) * slope;
+            (static_cast<double>(ys[1]) - static_cast<double>(ys[0])) /
+            (static_cast<double>(xs[1]) - static_cast<double>(xs[0]));
+        return static_cast<double>(ys[0]) +
+               (t - static_cast<double>(xs[0])) * slope;
     }
     if (t >= static_cast<double>(xs[count - 1])) {
         const double slope =
-            (static_cast<double>(ys[count - 1]) - ys[count - 2]) /
-            (static_cast<double>(xs[count - 1]) - xs[count - 2]);
-        return ys[count - 1] + (t - xs[count - 1]) * slope;
+            (static_cast<double>(ys[count - 1]) -
+             static_cast<double>(ys[count - 2])) /
+            (static_cast<double>(xs[count - 1]) -
+             static_cast<double>(xs[count - 2]));
+        return static_cast<double>(ys[count - 1]) +
+               (t - static_cast<double>(xs[count - 1])) * slope;
     }
     int low = 0;
     int high = count - 1;
@@ -130,18 +138,85 @@ double regionLutValue(const float* slot, double t)
         }
     }
     const double fraction =
-        (t - xs[low]) /
+        (t - static_cast<double>(xs[low])) /
         (static_cast<double>(xs[high]) - static_cast<double>(xs[low]));
-    return ys[low] + (static_cast<double>(ys[high]) - ys[low]) * fraction;
+    return static_cast<double>(ys[low]) +
+           (static_cast<double>(ys[high]) - static_cast<double>(ys[low])) *
+               fraction;
 }
 
-/* Sample one FlatCurve into `slot`. `low`/`high` is the query domain; the
- * kernel extrapolates both sides with the first and last segment slopes, so
- * the table is validated a little outside its domain as well. Returns false
- * when the curve cannot be represented within the error bound. */
+/* Whether the stored table follows `curve` within the mask error budget over
+ * `[low, high]`, at the query points the kernel can receive. A probe that
+ * returns a non-finite value is a collision in the stored abscissae: it fails
+ * closed rather than slipping past `std::max()`'s NaN comparison. */
+template <typename T>
+bool regionTableFollows(const FlatCurve& curve, const T* slot, double low,
+                        double high, bool wrap_below, bool check_above)
+{
+    const int count = static_cast<int>(slot[0]);
+    const int probes = std::max<int>(REGION_LUT_MIN_PROBES, count * 4);
+    double worst = 0.0;
+    for (int index = 0; index <= probes; ++index) {
+        const double t = low + (high - low) * index / probes;
+        const double error =
+            std::abs(regionLutValue(slot, t) - curve.getVal(t));
+        if (!std::isfinite(error)) {
+            return false;
+        }
+        worst = std::max(worst, error);
+    }
+    const double margin = high - low;
+    if (check_above) {
+        for (int index = 1; index <= 8; ++index) {
+            const double t = high + margin * index / 4.0;
+            const double error =
+                std::abs(regionLutValue(slot, t) - curve.getVal(t));
+            if (!std::isfinite(error)) {
+                return false;
+            }
+            worst = std::max(worst, error);
+        }
+    }
+    if (wrap_below) {
+        /*
+         * FlatCurve::getVal() adds 1.0 when t is below the first polyline
+         * node. A negative L/32768 therefore wraps into the table once, and
+         * the kernel repeats that rule; the host value is getVal() at the
+         * original argument. The table covers one unit below zero, which is
+         * L >= -32768.
+         */
+        for (int index = 1; index <= 8; ++index) {
+            const double t = -static_cast<double>(index) / 8.0;
+            const double wrapped = t + 1.0;
+            const double error =
+                std::abs(regionLutValue(slot, wrapped) - curve.getVal(t));
+            if (!std::isfinite(error)) {
+                return false;
+            }
+            worst = std::max(worst, error);
+        }
+    }
+    return worst <= REGION_LUT_ACCEPT;
+}
+
+bool regionCurveSupported(const std::vector<double>& points)
+{
+    if (points.empty() || points[0] == FCT_Linear) {
+        return true;
+    }
+    return points[0] == FCT_MinMaxCPoints || points[0] == FCT_Empty;
+}
+
+/* Sample one FlatCurve into `slot` with the chord refiner. `low`/`high` is
+ * the query domain; the kernel extrapolates both sides with the first and
+ * last segment slopes, so the table is validated a little outside its domain
+ * as well. Returns false when the curve cannot be represented within the
+ * error bound and the node budget. */
+template <typename T>
 bool sampleRegionCurve(const std::vector<double>& points, bool periodic,
                        double low, double high, bool wrap_below,
-                       bool check_above, float* slot)
+                       bool check_above, T* slot,
+                       std::size_t budget = RT_LAB_TOOLS_REGION_LUT_NODES)
 {
     if (points.empty() || points[0] == FCT_Linear) {
         return true;
@@ -157,92 +232,114 @@ bool sampleRegionCurve(const std::vector<double>& points, bool periodic,
     const RegionCurveNode last_node{high, curve.getVal(high)};
     nodes.push_back(first_node);
     bool ok = true;
-    regionCurveRefine(curve, first_node, last_node, 0, nodes, ok);
+    regionCurveRefine(curve, first_node, last_node, 0, nodes, ok, budget);
     nodes.push_back(last_node);
-    if (!ok || nodes.size() > RT_LAB_TOOLS_REGION_LUT_NODES) {
+    if (!ok || nodes.size() > budget) {
         return false;
     }
 
-    slot[0] = static_cast<float>(nodes.size());
+    slot[0] = static_cast<T>(nodes.size());
     for (std::size_t index = 0; index < nodes.size(); ++index) {
-        slot[1 + index] = static_cast<float>(nodes[index].x);
-        slot[1 + nodes.size() + index] =
-            static_cast<float>(nodes[index].y);
+        slot[1 + index] = static_cast<T>(nodes[index].x);
+        slot[1 + nodes.size() + index] = static_cast<T>(nodes[index].y);
     }
 
     /*
-     * Validate the stored float table against getVal(), including the linear
-     * extrapolation the kernel uses outside the domain. The lightness argument
-     * is raw L/32768 and can leave [0,1], and the chroma argument is a log
-     * scale; both are extrapolated on the far side only.
+     * Validate the stored table against getVal(), including the linear
+     * extrapolation the kernel uses outside the domain. The lightness
+     * argument is raw L/32768 and can leave [0,1], and the chroma argument is
+     * a log scale; both are extrapolated on the far side only.
      */
-    const int probes = std::max<int>(
-        REGION_LUT_MIN_PROBES, static_cast<int>(nodes.size()) * 4);
-    double worst = 0.0;
-    for (int index = 0; index <= probes; ++index) {
-        const double t = low + (high - low) * index / probes;
-        const double error =
-            std::abs(regionLutValue(slot, t) - curve.getVal(t));
-        worst = std::max(worst, error);
-    }
-    const double margin = high - low;
-    if (check_above) {
-        for (int index = 1; index <= 8; ++index) {
-            const double t = high + margin * index / 4.0;
-            worst = std::max(
-                worst, std::abs(regionLutValue(slot, t) - curve.getVal(t)));
-        }
-    }
-    if (wrap_below) {
-        /*
-         * FlatCurve::getVal() adds 1.0 when t is below the first polyline
-         * node. A negative L/32768 therefore wraps into the table once, and
-         * the kernel repeats that rule; the host value is getVal() at the
-         * original argument. The table covers one unit below zero, which is
-         * L >= -32768.
-         */
-        for (int index = 1; index <= 8; ++index) {
-            const double t = -static_cast<double>(index) / 8.0;
-            const double wrapped = t + 1.0;
-            worst = std::max(
-                worst, std::abs(regionLutValue(slot, wrapped) -
-                                curve.getVal(t)));
-        }
-    }
-    return worst <= REGION_LUT_ACCEPT;
+    return regionTableFollows(curve, slot, low, high, wrap_below, check_above);
 }
 
-bool regionCurveSupported(const std::vector<double>& points)
+/*
+ * The exact hue representation: one node per knot of the faceted polyline
+ * FlatCurve::getVal() walks, which is the curve itself, so the table follows
+ * it to the last bit of the stored doubles. The double precision is what
+ * makes a dense curve representable: a float abscissa would move a 40 000
+ * point zigzag by `slope * 6e-8`, 240 times the budget.
+ *
+ * The kernel is asked for `Color::huelab_to_huehsv2(HH)`, which is in [0,1),
+ * and getVal() wraps a query below its first knot by one period. A periodic
+ * polyline spans `[x0, x0 + 1]`, so every knot maps into a period at `x -
+ * floor(x)` and the boundary nodes 0 and 1 are added. Evaluating getVal() at
+ * each mapped knot reproduces the wrap, and the resulting set holds every
+ * breakpoint of the query function, so linear interpolation between the nodes
+ * is exact.
+ *
+ * Returns false when the polyline has more knots than the slot holds or its
+ * stored abscissae collapse, leaving the caller to try the refiner.
+ */
+bool sampleHuePolyline(const FlatCurve& curve, double* slot)
 {
-    if (points.empty() || points[0] == FCT_Linear) {
-        return true;
+    const std::vector<double>& px = curve.polylineX();
+    const std::vector<double>& py = curve.polylineY();
+    if (px.size() < 2 || px.size() != py.size()) {
+        return false;
     }
-    return points[0] == FCT_MinMaxCPoints || points[0] == FCT_Empty;
+    /* One boundary node is dropped by the period mapping, so a polyline of
+     * budget + 2 knots still fits; anything longer cannot. */
+    if (px.size() > RT_LAB_TOOLS_HUE_LUT_NODES + 2) {
+        return false;
+    }
+    std::vector<double> xs;
+    xs.reserve(px.size() + 2);
+    xs.push_back(0.0);
+    xs.push_back(1.0);
+    for (double x : px) {
+        if (!std::isfinite(x)) {
+            return false;
+        }
+        const double mapped = x - std::floor(x);
+        if (mapped > 0.0 && mapped < 1.0) {
+            xs.push_back(mapped);
+        }
+    }
+    std::sort(xs.begin(), xs.end());
+    std::size_t count = 0;
+    for (std::size_t index = 0; index < xs.size(); ++index) {
+        /* Two knots of a wrapped period can map a rounding apart; keep the
+         * first so the stored abscissae stay strictly increasing. */
+        if (count != 0 && xs[index] <= xs[count - 1]) {
+            continue;
+        }
+        xs[count++] = xs[index];
+    }
+    if (count > RT_LAB_TOOLS_HUE_LUT_NODES) {
+        return false;
+    }
+
+    slot[0] = static_cast<double>(count);
+    for (std::size_t index = 0; index < count; ++index) {
+        slot[1 + index] = xs[index];
+        slot[1 + count + index] = curve.getVal(xs[index]);
+    }
+    return regionTableFollows(curve, slot, 0.0, 1.0, false, false);
 }
 
 /*
  * One hue flat curve, C=f(H), L=f(H) or H=f(H). The block reads
- * FlatCurve::getVal() at Color::huelab_to_huehsv2(HH), which is in [0,1], and
- * getVal() is exactly piecewise linear, so the region sampler's table can
- * reproduce it: it refines where the chord misses the polyline and the same
- * bound decides acceptance. An empty, FCT_Linear or identity curve leaves the
- * identity table (the block would not construct the curve either) and the
- * activity flag false.
+ * FlatCurve::getVal() at Color::huelab_to_huehsv2(HH), which is in [0,1), and
+ * getVal() is exactly piecewise linear, so the carried polyline reproduces it
+ * exactly; a polyline longer than the node budget falls back to the chord
+ * refiner, which needs a node per kink instead of a node per knot. The same
+ * value bound decides acceptance either way. An empty, FCT_Linear or identity
+ * curve leaves the identity table (the block would not construct the curve
+ * either) and the activity flag false.
  */
 static_assert(RT_LAB_TOOLS_HUE_LUT_ACCEPT == REGION_LUT_ACCEPT,
               "the hue and region tables share one fidelity bound");
-static_assert(RT_LAB_TOOLS_HUE_LUT_NODES == RT_LAB_TOOLS_REGION_LUT_NODES,
-              "the hue slot must fit the sampler's node budget");
 
-bool sampleHueCurve(const std::vector<double>& points, float* slot,
+bool sampleHueCurve(const std::vector<double>& points, double* slot,
                     bool& active)
 {
     active = false;
-    slot[0] = 2.f;
-    slot[1] = 0.f;
-    slot[2] = 1.f;
-    slot[3] = 0.5f;
-    slot[4] = 0.5f;
+    slot[0] = 2.0;
+    slot[1] = 0.0;
+    slot[2] = 1.0;
+    slot[3] = 0.5;
+    slot[4] = 0.5;
     if (points.empty() || points[0] == FCT_Linear) {
         return true;
     }
@@ -253,7 +350,9 @@ bool sampleHueCurve(const std::vector<double>& points, float* slot,
     if (curve.isIdentity()) {
         return true;
     }
-    if (!sampleRegionCurve(points, true, 0.0, 1.0, false, false, slot)) {
+    if (!sampleHuePolyline(curve, slot) &&
+        !sampleRegionCurve(points, true, 0.0, 1.0, false, false, slot,
+                           RT_LAB_TOOLS_HUE_LUT_NODES)) {
         return false;
     }
     active = true;
@@ -278,7 +377,7 @@ bool hueCurveFamilySupported(const procparams::ProcParams& params)
     const std::vector<double>* curves[] = {&params.labCurve.chcurve,
                                            &params.labCurve.lhcurve,
                                            &params.labCurve.hhcurve};
-    std::vector<float> scratch(RT_LAB_TOOLS_HUE_LUT_STRIDE);
+    std::vector<double> scratch(RT_LAB_TOOLS_HUE_LUT_STRIDE);
     for (const std::vector<double>* points : curves) {
         bool active = false;
         if (!sampleHueCurve(*points, scratch.data(), active)) {
@@ -984,9 +1083,9 @@ int LabToolsContext::build(RtLabToolsResult& out)
         /*
          * The hue flat-curve family. The predicate has already sampled the
          * same curves, so this only repeats the derivation for the exported
-         * table. A non-identity curve the table cannot follow returns 1 and
-         * the call site runs the host block, exactly as the predicate's
-         * refusal does.
+         * table. A non-identity curve neither representation can follow
+         * returns 1 and the call site runs the host block, exactly as the
+         * predicate's refusal does.
          */
         lab_curve_chromaticity_ = params_.labCurve.chromaticity;
         lab_curve_ch_active_ = false;
@@ -995,7 +1094,7 @@ int LabToolsContext::build(RtLabToolsResult& out)
         const std::size_t hue_stride = RT_LAB_TOOLS_HUE_LUT_STRIDE;
         if (lab_curve_hue_.size() !=
             RT_LAB_TOOLS_HUE_CURVES * hue_stride) {
-            lab_curve_hue_.assign(RT_LAB_TOOLS_HUE_CURVES * hue_stride, 0.f);
+            lab_curve_hue_.assign(RT_LAB_TOOLS_HUE_CURVES * hue_stride, 0.0);
         }
         if (!hueCurveFamilySupported(params_)) {
             return 1;
@@ -1017,12 +1116,12 @@ int LabToolsContext::build(RtLabToolsResult& out)
              * leave the identity tables so a stray read is a no-op. */
             for (std::size_t curve = 0; curve < RT_LAB_TOOLS_HUE_CURVES;
                  ++curve) {
-                float* slot = &lab_curve_hue_[curve * hue_stride];
-                slot[0] = 2.f;
-                slot[1] = 0.f;
-                slot[2] = 1.f;
-                slot[3] = 0.5f;
-                slot[4] = 0.5f;
+                double* slot = &lab_curve_hue_[curve * hue_stride];
+                slot[0] = 2.0;
+                slot[1] = 0.0;
+                slot[2] = 1.0;
+                slot[3] = 0.5;
+                slot[4] = 0.5;
             }
         }
 

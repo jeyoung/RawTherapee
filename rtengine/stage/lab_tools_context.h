@@ -46,7 +46,7 @@ struct ProcParams;
  * host memory, and nothing here is passed to a kernel. The launcher validates
  * the per-pixel arguments from the ABI on its own; the context supplies the
  * tone tables that need pow_F(), the sh_contrast NURBS curve, the working
- * colour matrices, the six Lab-curve tables, the three sampled hue flat
+ * colour matrices, the six Lab-curve tables, the three carried hue flat
  * curves and the Munsell table set, and it runs the original block for a
  * residual.
  *
@@ -54,7 +54,7 @@ struct ProcParams;
  * object that owns the ProcParams and ImProcFunctions references, so the
  * pointer must not outlive them.
  */
-#define RT_LAB_TOOLS_CONTEXT_VERSION 6u
+#define RT_LAB_TOOLS_CONTEXT_VERSION 7u
 /* "LTOC": rejects a stale or unrelated pointer before any callback runs. */
 #define RT_LAB_TOOLS_CONTEXT_MAGIC 0x4C544F43u
 /* The Lab-mode tone table: one entry per 16-bit L value (0..32767). */
@@ -79,13 +79,28 @@ struct ProcParams;
 #define RT_LAB_TOOLS_CURVE_LUT_ENTRIES 65536u
 /*
  * The three hue flat curves: C=f(H), L=f(H) and H=f(H). `FlatCurve::getVal()`
- * is exactly piecewise linear, so a node at every polyline knot reproduces it;
- * the host refines a piecewise-linear table where the chord misses the curve
- * and refuses a curve that needs more than the node budget.
- * Each table is a float node count, then that many x nodes and that many y
+ * is exactly piecewise linear, so a node at every polyline knot reproduces it
+ * exactly; the host carries the polyline itself, as the wavelet refine arms
+ * do, and falls back to refining a chord sampler where the polyline has more
+ * knots than the slot holds. A curve that neither representation can follow
+ * within the bound is refused.
+ *
+ * The nodes are doubles, not floats: a knot abscissa in [0,1] rounded to float
+ * moves a dense steep curve by `slope * 6e-8`, which is 1.2e-4 for a 40 000
+ * point zigzag and 240 times the bound. The residency's shape is float
+ * counted, so a slot of RT_LAB_TOOLS_HUE_LUT_STRIDE doubles occupies
+ * 2 * RT_LAB_TOOLS_HUE_LUT_STRIDE float words; the launcher uploads the
+ * doubles' bytes exactly as it does the working-space matrices.
+ *
+ * Each table is a double node count, then that many x nodes and that many y
  * nodes, in one buffer of RT_LAB_TOOLS_HUE_CURVES slots of
- * RT_LAB_TOOLS_HUE_LUT_STRIDE floats, in the order C=f(H), L=f(H), H=f(H).
+ * RT_LAB_TOOLS_HUE_LUT_STRIDE doubles, in the order C=f(H), L=f(H), H=f(H).
  * The kernel interpolates the table in double, like the region mask tables.
+ *
+ * The node budget is the largest polyline `FlatCurve` can subdivide: its `ppn`
+ * is capped at 65 500 and the periodic polylines add the two boundary knots,
+ * so 65 536 nodes hold every curve the GUI's own sampling can produce. A
+ * hand-built knot list above that falls back to the refiner.
  *
  * The fidelity bound is RT_LAB_TOOLS_HUE_LUT_ACCEPT on the curve value. The
  * largest lever is C=f(H), which turns a value error `e` into a chroma factor
@@ -97,8 +112,11 @@ struct ProcParams;
  * that cannot meet the bound is refused, never approximated.
  */
 #define RT_LAB_TOOLS_HUE_CURVES 3u
-#define RT_LAB_TOOLS_HUE_LUT_NODES 32768u
+#define RT_LAB_TOOLS_HUE_LUT_NODES 65536u
 #define RT_LAB_TOOLS_HUE_LUT_STRIDE (1u + 2u * RT_LAB_TOOLS_HUE_LUT_NODES)
+/* The slot's width in the residency's float-counted shape: two float words per
+ * double node. */
+#define RT_LAB_TOOLS_HUE_LUT_WORDS (2u * RT_LAB_TOOLS_HUE_LUT_STRIDE)
 #define RT_LAB_TOOLS_HUE_LUT_ACCEPT 5.0e-7
 /* params.labCurve.gamutmunselmethod, with the block's numbering: NONE 0,
  * LAB 1, XYZ 2, XYZREL 3 and MUN 4. All five are device methods; LAB runs
@@ -247,12 +265,12 @@ typedef struct RtLabToolsResult {
     uint32_t lab_curve_lc_active;
     uint32_t lab_curve_cl_active;
     /*
-     * The hue flat-curve family: one buffer of lab_curve_hue_stride floats
+     * The hue flat-curve family: one buffer of lab_curve_hue_stride doubles
      * holding RT_LAB_TOOLS_HUE_CURVES sampled tables, and the three activity
      * flags. The family is inactive when the chromaticity slider is at its
      * minimum (-100): the block then never constructs the curves.
      */
-    const float* lab_curve_hue;
+    const double* lab_curve_hue;
     uint32_t lab_curve_hue_stride;
     uint32_t lab_curve_ch_active;
     uint32_t lab_curve_lh_active;
@@ -408,10 +426,11 @@ struct LabToolsLuts {
  *
  * Fail closed. A Lab curve with non-zero `contrast` is admitted; its hist16
  * refill is built by the call site before the node. A chromaticity slider
- * outside its -100..100 GUI range, a C=f(H), L=f(H) or H=f(H) flat curve the
- * host table cannot follow within RT_LAB_TOOLS_HUE_LUT_ACCEPT, EPD and any
- * colour-toning method other than LabGrid. A local contrast whose sliders are
- * outside the ABI range is a residual as well. Black-and-white output is
+ * outside its -100..100 GUI range, a C=f(H), L=f(H) or H=f(H) flat curve
+ * neither the carried polyline nor the refined table can follow within
+ * RT_LAB_TOOLS_HUE_LUT_ACCEPT, EPD and any colour-toning method other than
+ * LabGrid. A local contrast whose sliders are outside the ABI range is a
+ * residual as well. Black-and-white output is
  * admitted through both of chromiLuminanceCurve()'s arms: the cheap one when
  * the Lab curves are off (it only zeroes a and b) and the full `bwToning` one
  * when they are on. With colour toning the block's `bwonly` is false, so
@@ -536,7 +555,7 @@ private:
     bool lab_curve_cc_active_ = false;
     bool lab_curve_lc_active_ = false;
     bool lab_curve_cl_active_ = false;
-    std::vector<float> lab_curve_hue_;
+    std::vector<double> lab_curve_hue_;
     bool lab_curve_ch_active_ = false;
     bool lab_curve_lh_active_ = false;
     bool lab_curve_hh_active_ = false;
