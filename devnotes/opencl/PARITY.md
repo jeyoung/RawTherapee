@@ -91,7 +91,7 @@ pairs are exact. The gate is the peak absolute error (PAE) in normalised units;
 | 2026-11-02 | 66613d0a9..6db958afe | POCL (CPU) | 11-case denoise residual matrix (`quaMethod=agre`, user chromfi/chromco, balchrom, `Wavhuecurve`, `CBenab`, Thrden, Ballum range, level range, all sliders zero, sub-128 window), `stage-residency-test` | device vs host block | 0 (host) | PASS |
 | 2026-11-03 | `6bcd826f9..dca455499` | POCL (CPU) | colorspace_flowers.pef / `labwavelet-denoise-cur.pp3` (Expnoise, `sliMethod=cur`, `mixMethod=mix7`, non-identity `wavdenoise`), `lab.wavelet` | off vs auto, 16-bit TIFF | 1 LSB (AE=1, 21,068 of 30,419,712) | PASS |
 | 2026-11-03 | `6bcd826f9..dca455499` | POCL (CPU) | 10-case "cur" matrix (mixmet 0/1/2/3, identity curve, contrast, edge, final curves, odd 179x161, all panels), `stage-residency-test` | device vs host block | 0.043945 LSB16 (worst: final curves) | PASS |
-| 2026-11-03 | `6bcd826f9..dca455499` | POCL (CPU) | 3-case "cur" residual matrix (sigm above range, expert pairing, Thrden), `stage-residency-test` | device vs host block | 0 (host) | PASS |
+| 2026-11-03 | `6bcd826f9..dca455499` | POCL (CPU) | "cur" residual matrix (sigm above range; the expert pairing was a residual then and is a device case since `7fc43d8a3`) | device vs host block | 0 (host) | PASS |
 | 2026-11-03 | `43732fb51..8cef1c71b` | POCL (CPU) | 3-case user chroma matrix (`chromfi` 40, `chromco` 60, both 100), `stage-residency-test` | device vs host block | 0.011719 LSB16 (denoise pair) | PASS |
 | 2026-11-03 | `4338a0570..27c9cffac` | POCL (CPU) | colorspace_flowers.pef / `labwavelet-thrden.pp3` (Expnoise, `sliMethod=sli`, `Thrden=5`), `lab.wavelet` | off vs auto, 16-bit TIFF | 1 LSB (24,753 of 30,419,712) | PASS |
 | 2026-11-03 | `4338a0570..27c9cffac` | POCL (CPU) | 4-case Thrden matrix (1, 5, 20 and 20 with the final curves), `stage-residency-test` | device vs host block | 0.050781 LSB16 (worst: with final curves) | PASS |
@@ -102,6 +102,9 @@ pairs are exact. The gate is the peak absolute error (PAE) in normalised units;
 | 2026-11-03 | `4f476722d..aaa41f842` | POCL (CPU) | 10-case final soft-radius refusal matrix (Thrend, non-identity wavguidcurve, no Expfinal, softradend 1001/-1, strend 101, detend ±11, clarity soft radius, clarity arm), `stage-residency-test` | device vs host block | 0 (host) | PASS |
 | 2026-11-03 | `294e4eec6..062403ad9` | POCL (CPU) | colorspace_flowers.pef / `labwavelet-softradend-hue.pp3` and `labwavelet-softradend-thrend.pp3`, `lab.wavelet` | off vs auto, 16-bit TIFF | 1 LSB (231 and 1 of 30,419,712) | PASS |
 | 2026-11-03 | `294e4eec6..062403ad9` | POCL (CPU) | final soft-radius coefficient/hue matrix (thrend 1/5/20, hue curves 5..60, each with final curves, contrast, denoise, odd, wide and smooth grids), `stage-residency-test` | device vs host block | 0.964844 LSB16 (worst: hue 20 with curves) | PASS |
+| 2026-11-03 | `7fc43d8a3..uncommitted` | POCL (CPU) | colorspace_flowers.pef / `labwavelet-denoise-expert.pp3` (Expnoise, `complexMethod=expert`, `sliMethod=cur`, `mixMethod=mix7`, non-identity `wavdenoise`, `Levelsigm=0.7;1.6`, `Leveldenoise=5;4`, `Limden=0.4`), `lab.wavelet` | off vs auto, 16-bit TIFF | 1 LSB (AE=1, 15,637 of 30,419,712) | PASS |
+| 2026-11-03 | `7fc43d8a3..uncommitted` | POCL (CPU) | 8-case expert-pairing matrix (`sliMethod` cur and sli+Thrden, `Levelsigm` 1/1, 3/3, 3/0.05, 0.05/3, 2.5/1.5, 0.05/0.05, 1.5/0.75, `Limden` 0, 0.5, 0.75 and 1, contrast, edge, final curves, odd 179x161), `stage-residency-test` | device vs host block | 0.158691 LSB16 (worst: odd all panels) | PASS |
+| 2026-11-03 | `7fc43d8a3..uncommitted` | POCL (CPU) | 4-case expert refusal matrix (`Levelsigm` top and bottom out of range, `Limden` above range, non-identity `Wavdenoiseh`), `stage-residency-test` | device vs host block | 0 (host) | PASS |
 | 2026-11-02 | 89e0a844b..47b9980fb | POCL (CPU) | colorspace_flowers.pef / `labtools-labcurve-contrast.pp3` (Lab curves with contrast 30, L/a/b/cc/lc/cl tables), `lab.tools` | off vs auto, 16-bit TIFF | 0 (exact) | PASS |
 | 2026-11-02 | 89e0a844b..47b9980fb | POCL (CPU) | 3-case Lab-contrast matrix (contrast 5, contrast 15 with L curve+brightness, contrast 30 with all six tables), `stage-residency-test` | device vs host block | 0 (exact) | PASS |
 | 2026-11-02 | uncommitted | POCL (CPU) | colorspace_flowers.pef / `labtools-labcurve-contrast.pp3` with `Gamutmunse=XYZ`, `lab.tools` | off vs auto, 16-bit TIFF | 0 (exact) | PASS |
@@ -458,8 +461,34 @@ peak absolute error is zero for the synthetic node tests:
   on the export TIFF (AE=1, 21,068 of 30,419,712 samples), records
   `impl=opencl`, and differs from the same profile with `sliMethod=sli` at
   30,064,859 of 30,419,712 samples (PAE 1600 LSB16), so the export exercises
-  the refinement. The `sli` Thrden arm, the expert pairing, an unknown
-  `mixmethod` and a sigma outside the widget range stay host residuals.
+  the refinement. An unknown `mixmethod` and a sigma outside the widget range
+  stay host residuals.
+- The expert level pairing (`complexMethod == "expert"`) runs the same
+  refinement at `levref == 6`. `Levelsigm`'s top value is `siglh` for levels
+  0..3 and its bottom for levels 4..5; every level iteration rewrites bands
+  0..3 with the curve factor, the first four add the `wavmed` factor when
+  `Limden` is positive, and all six rewrite bands 4..5 with `wavhigh`, whose
+  breaking point is `Leveldenoise`'s lower value. `cp.denmet` still applies
+  only to the low factor, so the `wavmed`/`wavhigh` factors are derived from
+  their own curve values with the shared `reduceeffect`. The host exports
+  `wavmed`/`wavhigh` in the same faceted-polyline encoding as `wavlow`, the
+  kernel takes six post/pre bands plus an `expert` flag and leaves the
+  standard path's writes untouched, and the launcher re-checks the level
+  count, the two knot counts and the flag. Eight cases (both `sliMethod`
+  arms, `Levelsigm` ends 1/1, 3/3, 3/0.05, 0.05/3, 2.5/1.5, 0.05/0.05 and
+  1.5/0.75, `Limden` 0, 0.5, 0.75 and 1, contrast, edge, final curves and an
+  odd 179x161 grid) match the host with worst 0.158691 LSB16. Each differs
+  from `complexMethod=normal` by 0.25 to 32,124 LSB16, so the six-level
+  pairing is not vacuous. Four configurations (`Levelsigm` top and bottom
+  outside 0.05..3, `Limden` outside 0..1, and a non-identity `Wavdenoiseh`)
+  run the host builtin byte for byte. The `Wavdenoiseh` curve is inert for
+  this arm today — `cp.denoicurvh` only re-arms the `Evaluate2` gate at
+  `ipwavelet.cc:1219`, and the `levwavL` restore at `1155-1160` is commented
+  out — but the device does not model it, so the arm fails closed rather than
+  depend on that coincidence. `labwavelet-denoise-expert.pp3` records
+  `impl=opencl` at 1 LSB16 (AE=1, 15,637 of 30,419,712 samples) and differs
+  from the same profile with `complexMethod=normal` on 29,442,428 samples
+  (PAE 1084 LSB16), so the export exercises the pairing.
 - Impulse denoise and defringe, through the `lab.sharpening` node, run as one
   atomic pair. The device test compares the observable corrected sets and all
   three planes: the impulse fixture and the combined pair correct exactly the

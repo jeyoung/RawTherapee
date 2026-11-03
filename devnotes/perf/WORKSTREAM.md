@@ -257,8 +257,8 @@ current tip.
   zeroed. `labwavelet-denoise.pp3` records
   `impl=opencl` at 1 LSB16. Every comparison pins `OMP_NUM_THREADS=1`: the
   host's `noisevarlum` loop races under OpenMP and is not a deterministic
-  reference. The denoise curves, the expert pairing and the BiShrink arms
-  remain host residuals. `66613d0a9`, `6db958afe`, `679f5b4d8`.
+  reference. The BiShrink arms and noise balance remain host residuals.
+  `66613d0a9`, `6db958afe`, `679f5b4d8`.
 - **`lab.wavelet` denoise curve (`sliMethod=cur`)**: the post-denoise
   refinement. The host samples the block's `WavCurve` over `wavdenoise` into
   501 entries, detects `cp.denoicurv` exactly as the block does, keeps the
@@ -268,10 +268,28 @@ current tip.
   `k`/`maxVal` on the host's doubles, and the kernel ports
   `xlogf`/`xexpf`/`pow_F` and the block's repeated four-band write. Ten cases
   (mixmet 0-3, an identity curve, contrast, edge, final curves, an odd size
-  and all panels) match the host with worst 0.043945 LSB16; four residuals
-  (`sigm` range and expert pairing) stay on the host.
-  `labwavelet-denoise-cur.pp3` records `impl=opencl` at 1 LSB16 (21,068 of
-  30,419,712 samples). `ba5f8f1d3`, `dca455499`.
+  and all panels) match the host with worst 0.043945 LSB16; two residuals
+  (`sigm` range and an out-of-range `Levelsigm`/`Limden`/`Wavdenoiseh`) stay
+  on the host. `labwavelet-denoise-cur.pp3` records `impl=opencl` at 1 LSB16
+  (21,068 of 30,419,712 samples). `ba5f8f1d3`, `dca455499`.
+- **`lab.wavelet` denoise expert pairing (`complexMethod=expert`)**: the same
+  refinement at `levref == 6`. `Levelsigm`'s top value is `siglh` for levels
+  0..3 and its bottom for 4..5; every level iteration rewrites bands 0..3 with
+  the curve factor, the first four add the `wavmed` factor when `Limden` is
+  positive, and all six rewrite bands 4..5 with `wavhigh` from
+  `Leveldenoise`'s lower value. The host exports `wavmed`/`wavhigh` as the
+  same faceted polylines the Thrden arm already uses, the kernel takes six
+  post/pre bands and an `expert` flag while the standard path keeps its exact
+  writes, and the launcher re-checks the level count, the two extra knot
+  counts and the flag. Eight cases (both `sliMethod` arms, `Levelsigm` ends at
+  0.05/0.05, 3/3, 0.05/3 and 3/0.05, `Limden` 0, 0.5, 0.75 and 1, contrast,
+  edge, final curves, odd 179x161) match the host with worst 0.158691 LSB16,
+  and each differs from `complexMethod=normal` (PAE 0.25 to 32,124 LSB16), so
+  the pairing is not vacuous. Four refusals (`Levelsigm` top and bottom,
+  `Limden` above range, a non-identity `Wavdenoiseh`) run the host byte for
+  byte. `labwavelet-denoise-expert.pp3` records `impl=opencl` at 1 LSB16
+  (AE=1 on 15,637 of 30,419,712 samples) and differs from the same profile
+  with `complexMethod=normal` on 29,442,428 samples (PAE 1084 LSB16).
 - **`local.adjustments` groundwork (pushed)**: host block extracted
   byte-for-byte, per-spot context/ABI (`LAJC`), exact block-level predicate,
   refusal path, 25 residual mutations and four multi-spot host cases. No
@@ -880,9 +898,10 @@ block's `provradius` guide and the subsampling scales, the kernels port
 tile-copy clamp while the merge keeps the soft-filtered L unclamped. Nine
 cases are exact except the denoise pair at 0.011719 LSB16, and
 `labwavelet-softrad.pp3` is exact. The standard denoise arm (and the chroma
-denoise the block forces at six levels) landed with the unit above; its
-denoise curves, expert pairing,
-BiShrink arms, user chroma strength, noise balance and hue curve stay
+denoise the block forces at six levels) landed with the unit above, and its
+`cur` and `sli`+Thrden refinements followed; the expert pairing landed with
+the unit above too. The BiShrink arms, user chroma strength, noise balance and
+hue curve stay
 residuals. The final curves and the toning zero-protection arm landed with the
 units above. The edge panel's plain arm is landed; its median/Lipschitz
 detection (`calckoe`), `NPMethod` low/high smoothing, `Lipst`, and the dead

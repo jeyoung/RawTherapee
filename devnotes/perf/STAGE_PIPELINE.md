@@ -278,8 +278,20 @@ application. `cp.denmet` is hard-coded to four, so the only level factors are
 0.3 on levels 0 and 1 and one on levels 2 and 3. The `sli` Thrden arm runs the
 same refinement with the block's four-point `wavlow` flat curve: the host
 exports the faceted polyline and the kernel walks it exactly. The expert
-pairing, noise balance, the hue curve and colour-by-noise stay host residuals,
-as does an unknown `mixMethod` or a sigma outside its widget range. A user chroma strength is admitted and inert: `variC` is dead at the
+pairing (`complexMethod == "expert"`) runs the same two arms at `levref == 6`:
+levels 0..3 take `Levelsigm`'s top value as `siglh` and levels 4..5 its bottom,
+and every level iteration rewrites bands 0..3 with the curve factor, then the
+first four iterations add the `wavmed` factor when `Limden` is positive, and
+all six rewrite bands 4..5 with the `wavhigh` factor built from
+`Leveldenoise`'s lower value. The host exports all three flat curves as
+faceted polylines, and the kernel walks each with the same periodic wrap,
+binary search and double interpolation. Noise balance, the hue curve and
+colour-by-noise stay host residuals, as does an unknown `mixMethod`, a sigma,
+`Levelsigm` end, `Limden` or `Leveldenoise` lower value outside its widget
+range, and a non-identity `Wavdenoiseh` (its `cp.denoicurvh` only re-arms the
+block's `Evaluate2` gate, which this arm already satisfies, so the device
+refuses it instead of relying on that coincidence). A user chroma strength is
+admitted and inert: `variC` is dead at the
 forced `local == 1` and `cp.chromco` cannot reach its `> 30` ramp test. The pass order is forward analysis,
 statistics/mea, MAD/shrink L, the pre-denoise snapshot, denoise, the
 post-denoise statistics and curve refinement, contrast/edge/final, noise
