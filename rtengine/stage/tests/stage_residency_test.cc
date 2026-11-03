@@ -4559,6 +4559,8 @@ struct LabToolsRun {
     RtStageStatus status = RT_STAGE_INVALID;
     /* The black-and-white flag the context exported to the launcher. */
     uint32_t black_white = 0;
+    /* The exported C=f(H) table's node count, 0 when the slot is inactive. */
+    uint32_t hue_nodes = 0;
 };
 
 /*
@@ -4585,6 +4587,10 @@ LabToolsRun run_lab_tools_node(LabImage& image,
     const bool deviceReady = result.supported && context.build(setup) == 0;
     result.deviceReady = deviceReady;
     result.black_white = deviceReady ? setup.black_white : 0;
+    if (deviceReady && setup.lab_curve_active != 0 &&
+        setup.lab_curve_ch_active != 0 && setup.lab_curve_hue != nullptr) {
+        result.hue_nodes = static_cast<uint32_t>(setup.lab_curve_hue[0]);
+    }
     RtLabToolsContext descriptor = context.descriptor(deviceReady);
 
     RtStageArg args[76] = {};
@@ -4737,6 +4743,22 @@ LabToolsRun run_lab_tools_node(LabImage& image,
             buffer.flags = RT_STAGE_BUFFER_READ;
             return buffer;
         };
+        /* The hue flat-curve nodes are doubles: two float words per node, the
+         * same byte-counted upload the launcher makes. */
+        const auto host_double_buffer = [](const double* data, int count) {
+            RtStageBuffer buffer{};
+            buffer.size = sizeof(RtStageBuffer);
+            buffer.data = const_cast<double*>(data);
+            buffer.width = 2 * count;
+            buffer.height = 1;
+            buffer.row_pitch = static_cast<std::size_t>(buffer.width) *
+                               sizeof(float);
+            buffer.plane_pitch = buffer.row_pitch;
+            buffer.planes = 1;
+            buffer.format = RT_STAGE_F32;
+            buffer.flags = RT_STAGE_BUFFER_READ;
+            return buffer;
+        };
         args[16].u.buffer = host_buffer(
             setup.lut_highlight, static_cast<int>(setup.lut_entries));
         args[17].u.buffer = host_buffer(
@@ -4791,7 +4813,7 @@ LabToolsRun run_lab_tools_node(LabImage& image,
                 setup.lab_curve_lc, static_cast<int>(setup.lab_curve_entries));
             args[53].u.buffer = host_buffer(
                 setup.lab_curve_cl, static_cast<int>(setup.lab_curve_entries));
-            args[71].u.buffer = host_buffer(
+            args[71].u.buffer = host_double_buffer(
                 setup.lab_curve_hue,
                 static_cast<int>(setup.lab_curve_hue_stride *
                                  RT_LAB_TOOLS_HUE_CURVES));
@@ -6196,6 +6218,11 @@ struct LabCurveCase {
     bool vibrance = false;
     bool shadowsHighlights = false;
     int contrast = 0;
+    /* A dense C=f(H) instead of the five-knot wave: the control-point count,
+     * and whether the values alternate (steep) or follow a smooth wave. */
+    int densePoints = 0;
+    bool denseSteep = false;
+    double denseStart = 0.0;
 };
 
 /* A non-identity hue flat curve: a wave through (0,0.5), (0.25,0.72),
@@ -6209,6 +6236,46 @@ std::vector<double> lab_hue_points()
             0.5, 0.5, 0.0, 0.0,
             0.75, 0.28, 0.0, 0.0,
             1.0, 0.5, 0.0, 0.0};
+}
+
+/*
+ * A dense hue flat curve: `points` knots from `start` to 1 with zero tangents,
+ * so every segment is linear and FlatCurve's polyline carries exactly one knot
+ * per control point. The steep variant alternates between 0.55 and 0.45, which
+ * at 40 000 points is a segment slope of 4 000 - the case a float knot
+ * abscissa cannot represent within the table's 5e-7 value bound. The smooth
+ * variant follows a three-cycle wave of the same amplitude, whose local slope
+ * stays below 2, so it is dense without being steep.
+ *
+ * The closing knot repeats the opening value, as a periodic hue curve does:
+ * FlatCurve::getVal(1.0) reads the periodic copy of the first point, so a
+ * curve whose last value differs jumps at the period boundary. A `start`
+ * above zero leaves the polyline spanning [start, start + 1], which is the
+ * table's wrap case: getVal() adds one period to a query below the first knot.
+ */
+std::vector<double> lab_hue_points_dense(int points, bool steep,
+                                         double start = 0.0)
+{
+    const double last = static_cast<double>(points - 1);
+    std::vector<double> dense;
+    dense.reserve(1 + 4 * static_cast<std::size_t>(points));
+    dense.push_back(static_cast<double>(FCT_MinMaxCPoints));
+    for (int index = 0; index < points; ++index) {
+        const double fraction = static_cast<double>(index) / last;
+        /* The convex form keeps the closing knot exactly at 1. */
+        const double x = start * (1.0 - fraction) + fraction;
+        double y = 0.5;
+        if (steep) {
+            y = (index % 2 == 0 || index == points - 1) ? 0.55 : 0.45;
+        } else {
+            y = 0.5 + 0.1 * std::sin(6.0 * M_PI * x);
+        }
+        dense.push_back(x);
+        dense.push_back(y);
+        dense.push_back(0.0);
+        dense.push_back(0.0);
+    }
+    return dense;
 }
 
 void test_lab_tools_lab_curve(bool available)
@@ -6348,8 +6415,39 @@ void test_lab_tools_lab_curve(bool available)
          true},
     };
 
+    /*
+     * Dense C=f(H) curves, run through the same case body. The host carries
+     * one table node per polyline knot, so the exported node count equals the
+     * control-point count; the steep variants are the ones a float table
+     * cannot follow. `tables` adds the L curve and the a/b tables, so the
+     * hue table is read on the chroma the tables wrote after it.
+     */
+    struct LabHueDenseCase {
+        const char* label;
+        int points;
+        bool steep;
+        int chromaticity;
+        bool tables;
+        /* The first knot's abscissa; above zero exercises the period wrap. */
+        double start;
+    };
+    const LabHueDenseCase dense_cases[] = {
+        {"dense C=f(H) 512", 512, true, 0, false, 0.0},
+        {"dense C=f(H) 4096", 4096, true, 0, false, 0.0},
+        {"dense C=f(H) 40000", 40000, true, 0, false, 0.0},
+        {"dense smooth C=f(H) 8000", 8000, false, 0, false, 0.0},
+        {"dense C=f(H) 40000 and the chromaticity slider", 40000, true, 50,
+         false, 0.0},
+        {"dense C=f(H) 40000 with a/b tables and L curve", 40000, true, 50,
+         true, 0.0},
+        {"dense smooth C=f(H) 8000 with a/b tables and L curve", 8000, false,
+         50, true, 0.0},
+        /* A polyline spanning [0.2, 1.2]: the table's wrap case. */
+        {"dense C=f(H) 4096 from 0.2", 4096, true, 50, false, 0.2},
+    };
+
     unsigned seed = 0x51ed270bu;
-    for (const LabCurveCase& item : cases) {
+    const auto run_case = [&](const LabCurveCase& item) {
         rtengine::procparams::ProcParams params;
         params.labCurve.enabled = true;
         params.labCurve.brightness = item.brightness;
@@ -6376,7 +6474,10 @@ void test_lab_tools_lab_curve(bool available)
         if (item.clcurve) {
             params.labCurve.clcurve = lab_curve_points(item.mid);
         }
-        if (item.chcurve) {
+        if (item.densePoints != 0) {
+            params.labCurve.chcurve = lab_hue_points_dense(
+                item.densePoints, item.denseSteep, item.denseStart);
+        } else if (item.chcurve) {
             params.labCurve.chcurve = lab_hue_points();
         }
         if (item.lhcurve) {
@@ -6488,6 +6589,29 @@ void test_lab_tools_lab_curve(bool available)
               (std::string("lab.tools Lab curve ") + item.label +
                " records a device execution").c_str());
 
+        /*
+         * The dense cases carry the polyline itself: one node per control
+         * point (plus the wrap boundary when the polyline starts above zero),
+         * which is exact and is what admits a 40 000-point curve.
+         */
+        if (item.densePoints != 0) {
+            /*
+             * One node per knot, plus at most the two period boundary nodes:
+             * a closing knot at x=1 maps to 0 and its periodic copy can land a
+             * rounding away from the opening knot. The refiner would need
+             * more than two nodes per kink, so this bound is what proves the
+             * polyline was carried.
+             */
+            const uint32_t knots = static_cast<uint32_t>(item.densePoints);
+            std::printf("stage-residency: lab.tools Lab curve %s: %u table "
+                        "nodes for %d control points\n",
+                        item.label, result.hue_nodes, item.densePoints);
+            check(result.hue_nodes >= knots &&
+                      result.hue_nodes <= knots + 2,
+                  (std::string("lab.tools Lab curve ") + item.label +
+                   " carries one node per polyline knot").c_str());
+        }
+
         const Distribution d = distribution(view(device), view(cpu));
         std::printf("stage-residency: lab.tools Lab curve %s %dx%d: PAE "
                     "%.6f LSB16; exact %zu, <=0.25 %zu, <=0.5 %zu, <=1 %zu, "
@@ -6529,13 +6653,39 @@ void test_lab_tools_lab_curve(bool available)
                         cpu.b[wy][wx], device.L[wy][wx], device.a[wy][wx],
                         device.b[wy][wx]);
         }
+    };
+
+    for (const LabCurveCase& item : cases) {
+        run_case(item);
+    }
+    for (const LabHueDenseCase& item : dense_cases) {
+        LabCurveCase dense{};
+        dense.label = item.label;
+        dense.width = 238;
+        dense.height = 64;
+        dense.image = 2;
+        dense.mid = 0.62;
+        dense.chromaticity = item.chromaticity;
+        dense.munsell = "MUN";
+        dense.rstprotection = 0.0;
+        dense.lcredsk = true;
+        dense.protectred = 60;
+        dense.protectredh = 0.3;
+        dense.lcurve = item.tables;
+        dense.acurve = item.tables;
+        dense.bcurve = item.tables;
+        dense.chcurve = true;
+        dense.densePoints = item.points;
+        dense.denseSteep = item.steep;
+        dense.denseStart = item.start;
+        run_case(dense);
     }
 
     /*
      * Residuals: every other Lab-curve family or setting must be refused and
      * must run the block on the host byte for byte.
      */
-    const char* residual_labels[] = {"dense hue curve"};
+    const char* residual_labels[] = {"over-budget hue curve"};
     for (const char* label : residual_labels) {
         rtengine::procparams::ProcParams params;
         params.labCurve.enabled = true;
@@ -6547,30 +6697,18 @@ void test_lab_tools_lab_curve(bool available)
         lab_curve_settings.protectredh = 0.3;
         lab_curve_settings.amchroma = 40;
 
-        if (std::strcmp(label, "dense hue curve") == 0) {
+        if (std::strcmp(label, "over-budget hue curve") == 0) {
             /*
-             * A hand-built curve with more knots than the table budget can
-             * carry: forty thousand linear control points. FlatCurve's
-             * polyline has one knot per segment and the host sampler cannot
-             * follow it within 32768 nodes, so the predicate refuses the node
-             * and the builtin runs the block.
+             * A hand-built curve with more knots than the slot can carry and
+             * more kinks than the refiner can subdivide: 100 000 linear
+             * control points alternating between 0.55 and 0.45. FlatCurve's
+             * polyline has one knot per segment, above the 65 536-node
+             * budget, and the refiner needs a node on each side of every one
+             * of its 100 000 kinks, so neither representation fits and the
+             * predicate refuses the node.
              */
-            constexpr int POINTS = 40000;
-            std::vector<double> dense;
-            dense.reserve(1 + 4 * POINTS);
-            dense.push_back(static_cast<double>(FCT_MinMaxCPoints));
-            for (int index = 0; index < POINTS; ++index) {
-                dense.push_back(static_cast<double>(index) /
-                                static_cast<double>(POINTS - 1));
-                double y = 0.5;
-                if (index != 0 && index != POINTS - 1) {
-                    y = (index % 2) != 0 ? 0.55 : 0.45;
-                }
-                dense.push_back(y);
-                dense.push_back(0.0);
-                dense.push_back(0.0);
-            }
-            params.labCurve.chcurve = dense;
+            constexpr int POINTS = 100000;
+            params.labCurve.chcurve = lab_hue_points_dense(POINTS, true);
         }
 
         check(!labToolsSupported(params),

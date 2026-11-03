@@ -294,6 +294,8 @@ quick() {
         "$ROOT/devnotes/opencl/pp3/labtools-labcurve-contrast.pp3" lab.tools cpu
     run_stage_device "pef/stage-device-lab-tools-huecurve" \
         "$ROOT/devnotes/opencl/pp3/labtools-huecurve.pp3" lab.tools cpu
+    run_stage_device "pef/stage-device-lab-tools-huecurve-dense" \
+        "$ROOT/devnotes/opencl/pp3/labtools-huecurve-dense.pp3" lab.tools cpu
     run_stage_device "pef/stage-device-lab-tools-localcontrast" \
         "$ROOT/devnotes/opencl/pp3/labtools-localcontrast.pp3" lab.tools cpu
     run_stage_device "pef/stage-device-lab-tools-regions" \
@@ -684,6 +686,8 @@ stage_device() {
         "$ROOT/devnotes/opencl/pp3/labtools-labcurve-contrast.pp3" lab.tools cpu
     run_stage_device "pef/stage-device-lab-tools-huecurve" \
         "$ROOT/devnotes/opencl/pp3/labtools-huecurve.pp3" lab.tools cpu
+    run_stage_device "pef/stage-device-lab-tools-huecurve-dense" \
+        "$ROOT/devnotes/opencl/pp3/labtools-huecurve-dense.pp3" lab.tools cpu
     run_stage_device "pef/stage-device-lab-tools-localcontrast" \
         "$ROOT/devnotes/opencl/pp3/labtools-localcontrast.pp3" lab.tools cpu
     run_stage_device "pef/stage-device-lab-tools-regions" \
