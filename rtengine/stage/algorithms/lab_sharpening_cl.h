@@ -26,11 +26,14 @@
  * Device kernels for the lab.sharpening block: impulse denoise, defringe,
  * ML sharpen edges and ML microcontrast.
  *
- * The program is compiled together with RT_SHARPEN_CL, so the separable
- * Young-van Vliet line kernel `rt_sharpen_iir_line` is the Gaussian blur of
- * every pass here, and `rt_sharpen_mask` is buildBlendMask()'s contrast mask;
- * the launcher derives the IIR coefficients with `sharpen_iir_factors()`
- * exactly as the mask blur of output.sharpen does.
+ * The program is compiled together with RT_SHARPEN_CL, so the Gaussian blur of
+ * every pass here is one of the shared kernels: `rt_sharpen_iir_line` for the
+ * separable Young-van Vliet pair (impulse denoise and a defringe radius of 0.6
+ * or more), `rt_sharpen_fir3` for the 3x3 convolution a defringe radius from
+ * 0.25 to below 0.6 selects, and `rt_sharpen_mask` for buildBlendMask()'s
+ * contrast mask; the launcher derives the coefficients with
+ * `sharpen_iir_factors()` and `sharpen_fir_factors()` exactly as
+ * `gaussianBlur()` does in the mask blur of output.sharpen.
  *
  * Every arithmetic quirk of impulse_denoise.cc, PF_correct_RT.cc,
  * ipsharpenedges.cc and ipsharpen.cc is kept:

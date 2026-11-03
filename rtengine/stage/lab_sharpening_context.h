@@ -78,12 +78,18 @@ inline constexpr int LAB_SHARPENING_MIN_THRESHOLD = 0;
 inline constexpr int LAB_SHARPENING_MAX_THRESHOLD = 100;
 inline constexpr double LAB_SHARPENING_MIN_RADIUS = 0.0;
 inline constexpr double LAB_SHARPENING_MAX_RADIUS = 25.0;
-/* gaussianBlur()'s identity limit: below it the blur copies the plane, so the
- * chromaticity difference is zero and the whole defringe pass is a no-op. */
+/* gaussianBlur()'s identity limit (GAUSS_SKIP): below it the blur copies the
+ * plane, so the chromaticity difference is zero and the whole defringe pass is
+ * a no-op. */
 inline constexpr double LAB_SHARPENING_RADIUS_NOOP = 0.25;
-/* gaussianBlur()'s separable-IIR limit: below it the host uses the 3x3, 5x5 or
- * 7x7 kernels, whose border rules this node does not implement. */
-inline constexpr double LAB_SHARPENING_RADIUS_IIR = 1.15;
+/*
+ * gaussianBlur()'s 3x3 limit (GAUSS_3X3_LIMIT). PF_correct_RT() always calls
+ * gaussianBlur() with the default GAUSS_STANDARD type, so below this value the
+ * host runs gauss3x3() with its own border rules and from it the separable
+ * Young-van Vliet pair. The 5x5 and 7x7 kernels belong to GAUSS_MULT and
+ * GAUSS_DIV, which defringe never asks for.
+ */
+inline constexpr double LAB_SHARPENING_RADIUS_FIR = 0.6;
 
 /* The GUI ranges: sharpen edges passes 1..4 and amount 0..100, microcontrast
  * amount 0..100, contrast 0..200 and uniformity 0..10. The lower ends below
@@ -179,9 +185,11 @@ bool lab_sharpening_decode(const RtStageArg* args, uint32_t nargs,
 /*
  * The device set: at least one enabled tool, every enabled parameter set
  * inside its GUI range, the image large enough for the 5x5 windows, and
- * either no defringe or a defringe radius in the separable-IIR range (or the
- * no-op below 0.25). A defringe that runs needs device fp64 for its double
- * chromaticity mean. Anything else is a residual, never an approximation.
+ * either no defringe or a defringe radius inside the whole legal range: below
+ * 0.25 the host's blur is the identity (a no-op), below 0.6 it is the 3x3
+ * convolution and from 0.6 the separable-IIR pair. A defringe that runs needs
+ * device fp64 for its double chromaticity mean. Anything else is a residual,
+ * never an approximation.
  */
 bool lab_sharpening_admitted(const LabSharpeningNodeParams& params, int width,
                              int height, bool has_fp64, std::string& error);
@@ -251,7 +259,10 @@ public:
     RtLabSharpeningContext descriptor(bool supported);
 
     /* Build the hue table. Returns 0 on success; an error means the call site
-     * must run the host block. */
+     * must run the host block. The table is only built when the defringe pass
+     * can read it: in the CIE-CAM arm, with defringe disabled, or below the
+     * host's Gaussian identity the pass never runs, so a curve the device
+     * table cannot follow must not refuse the tools that do. */
     int build(std::string* error = nullptr);
 
     int runHost(RtStageBuffer* luminance, RtStageBuffer* a, RtStageBuffer* b);

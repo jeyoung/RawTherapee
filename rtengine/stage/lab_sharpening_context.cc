@@ -356,11 +356,6 @@ bool lab_sharpening_admitted(const LabSharpeningNodeParams& params, int width,
          * host early-out leaves the image untouched. */
         return true;
     }
-    if (params.defringe_radius < LAB_SHARPENING_RADIUS_IIR) {
-        error = "lab.sharpening defringe radius below 1.15 needs the host's "
-                "3x3/5x5/7x7 Gaussian kernels";
-        return false;
-    }
     if (!has_fp64) {
         error = "lab.sharpening defringe needs device fp64 for its double "
                 "chromaticity mean";
@@ -467,8 +462,10 @@ void labSharpeningArgs(LabImage& lab, const LabSharpeningNodeParams& node,
     args[LAB_SHARPENING_ARG_HUE_TABLE].u.buffer = hue;
     args[LAB_SHARPENING_ARG_HUE_ENTRIES].kind = RT_STAGE_ARG_INT;
     args[LAB_SHARPENING_ARG_HUE_ENTRIES].u.i = context.hueEntries();
+    /* The flag describes the table that was actually built, not the profile:
+     * a pass that cannot read it must not make the launcher upload one. */
     args[LAB_SHARPENING_ARG_HUE_CURVE].kind = RT_STAGE_ARG_INT;
-    args[LAB_SHARPENING_ARG_HUE_CURVE].u.i = node.hue_curve;
+    args[LAB_SHARPENING_ARG_HUE_CURVE].u.i = context.hueCurve() ? 1 : 0;
     args[LAB_SHARPENING_ARG_EDGES_ENABLED].kind = RT_STAGE_ARG_INT;
     args[LAB_SHARPENING_ARG_EDGES_ENABLED].u.i = node.edges_enabled;
     args[LAB_SHARPENING_ARG_EDGES_PASSES].kind = RT_STAGE_ARG_INT;
@@ -583,8 +580,17 @@ int LabSharpeningContext::build(std::string* error)
     hue_entries_ = 0;
     hue_curve_ = false;
 
+    /*
+     * The table is only read by a defringe pass that runs on the device. In
+     * the CIE-CAM arm the pass belongs to the CIE-CAM pipeline on the
+     * CieImage, and below the host's Gaussian identity it is a no-op, so the
+     * profile's curve must not refuse the tools that do run here.
+     */
     const procparams::DefringeParams& defringe = params_.defringe;
-    if (defringe.huecurve.size() &&
+    const bool table_needed =
+        !ciecam_arm_ && defringe.enabled &&
+        defringe.radius >= LAB_SHARPENING_RADIUS_NOOP;
+    if (table_needed && defringe.huecurve.size() &&
         FlatCurveType(defringe.huecurve[0]) > FCT_Linear) {
         FlatCurve curve(defringe.huecurve);
         std::string reason;

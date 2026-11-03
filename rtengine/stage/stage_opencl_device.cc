@@ -12220,6 +12220,7 @@ RtStageStatus run_lab_sharpening(const std::shared_ptr<OpenCLEnv>& env,
     cl_kernel rows_kernel = nullptr;
     cl_kernel total_kernel = nullptr;
     cl_kernel apply_kernel = nullptr;
+    cl_kernel fir_kernel = nullptr;
     if (defringe_runs) {
         fringe_kernel = compiled_kernel_entry(
             env, def, "rt_lab_sharpening_defringe_fringe", error);
@@ -12232,6 +12233,13 @@ RtStageStatus run_lab_sharpening(const std::shared_ptr<OpenCLEnv>& env,
         if (fringe_kernel == nullptr || rows_kernel == nullptr ||
             total_kernel == nullptr || apply_kernel == nullptr) {
             return RT_STAGE_FALLBACK;
+        }
+        if (p.defringe_radius < LAB_SHARPENING_RADIUS_FIR) {
+            fir_kernel =
+                compiled_kernel_entry(env, def, "rt_sharpen_fir3", error);
+            if (fir_kernel == nullptr) {
+                return RT_STAGE_FALLBACK;
+            }
         }
     }
 
@@ -12440,14 +12448,53 @@ RtStageStatus run_lab_sharpening(const std::shared_ptr<OpenCLEnv>& env,
     }
 
     if (defringe_runs) {
-        SharpenIirFactors factors;
-        sharpen_iir_factors(
-            static_cast<double>(static_cast<float>(p.defringe_radius)),
-            factors);
-        if (!sharpen_iir_plane(env, iir_kernel, a_memory, tmpa, state, width,
-                               height, pitch, factors, error) ||
-            !sharpen_iir_plane(env, iir_kernel, b_memory, tmpb, state, width,
-                               height, pitch, factors, error)) {
+        /*
+         * PF_correct_RT() calls gaussianBlur() with the default
+         * GAUSS_STANDARD type, so the blur is gauss3x3() below
+         * GAUSS_3X3_LIMIT and the separable Young-van Vliet pair from there.
+         * The 5x5 and 7x7 kernels belong to GAUSS_MULT and GAUSS_DIV, which
+         * this pass never selects.
+         */
+        bool blur_ok;
+        if (p.defringe_radius < LAB_SHARPENING_RADIUS_FIR) {
+            SharpenFirFactors factors;
+            sharpen_fir_factors(p.defringe_radius, factors);
+            const cl_int cl_width = width;
+            const cl_int cl_height = height;
+            const cl_int cl_src_pitch = pitch;
+            const cl_int cl_dst_pitch = pitch;
+            const cl_float c0 = factors.c0;
+            const cl_float c1 = factors.c1;
+            const cl_float c2 = factors.c2;
+            const cl_float b0 = factors.b0;
+            const cl_float b1 = factors.b1;
+            const auto fir_blur = [&](cl_mem source, cl_mem target) -> bool {
+                return set_arg(fir_kernel, 0, sizeof(cl_mem), &source) &&
+                       set_arg(fir_kernel, 1, sizeof(cl_mem), &target) &&
+                       set_arg(fir_kernel, 2, sizeof(cl_int), &cl_width) &&
+                       set_arg(fir_kernel, 3, sizeof(cl_int), &cl_height) &&
+                       set_arg(fir_kernel, 4, sizeof(cl_int), &cl_src_pitch) &&
+                       set_arg(fir_kernel, 5, sizeof(cl_int), &cl_dst_pitch) &&
+                       set_arg(fir_kernel, 6, sizeof(cl_float), &c0) &&
+                       set_arg(fir_kernel, 7, sizeof(cl_float), &c1) &&
+                       set_arg(fir_kernel, 8, sizeof(cl_float), &c2) &&
+                       set_arg(fir_kernel, 9, sizeof(cl_float), &b0) &&
+                       set_arg(fir_kernel, 10, sizeof(cl_float), &b1) &&
+                       run_2d(fir_kernel);
+            };
+            blur_ok = fir_blur(a_memory, tmpa) && fir_blur(b_memory, tmpb);
+        } else {
+            SharpenIirFactors factors;
+            sharpen_iir_factors(
+                static_cast<double>(static_cast<float>(p.defringe_radius)),
+                factors);
+            blur_ok =
+                sharpen_iir_plane(env, iir_kernel, a_memory, tmpa, state,
+                                  width, height, pitch, factors, error) &&
+                sharpen_iir_plane(env, iir_kernel, b_memory, tmpb, state,
+                                  width, height, pitch, factors, error);
+        }
+        if (!blur_ok) {
             release_scratch();
             error = "lab.sharpening defringe blur failed";
             return RT_STAGE_ERROR;
