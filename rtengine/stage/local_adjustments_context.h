@@ -46,14 +46,14 @@ struct ProcParams;
  * local CBDL tool, the Colour & Light chroma/lightness/contrast sliders and
  * L/C/H curves, the vibrance tool, the shadows/highlights tool, the soft-light
  * tool, the Gaussian local-contrast tool, the local sharpening tool, the
- * deltaE scope, the avoid-colour-shift Munsell method and the unconditional
- * per-spot Lab-to-RGB clamp. The block also applies the final Munsell pass and
- * the clamp for an inactive spot, so a block whose spots do no tool work is
- * still a clamp-only block.
+ * local Gaussian blur tool, the deltaE scope, the avoid-colour-shift Munsell
+ * method and the unconditional per-spot Lab-to-RGB clamp. The block also
+ * applies the final Munsell pass and the clamp for an inactive spot, so a
+ * block whose spots do no tool work is still a clamp-only block.
  *
- * The tools run in Lab_Local()'s order: log encoding, dehaze, CBDL, vibrance,
- * shadows/highlights, soft light, local contrast, local sharpening, then
- * Colour & Light. The context is C-compatible because the ABI is. `self`
+ * The tools run in Lab_Local()'s order: log encoding, blur, dehaze, CBDL,
+ * vibrance, shadows/highlights, soft light, local contrast, local sharpening,
+ * then Colour & Light. The context is C-compatible because the ABI is. `self`
  * points at the C++ object that owns the ProcParams, ImProcFunctions and
  * LabImage references, so the pointer must not outlive them.
  *
@@ -62,14 +62,14 @@ struct ProcParams;
  * small, known subset reaches the supported paths. Slots are named by the
  * RT_LOCAL_ADJUSTMENTS_SLOT_* constants and are written once per spot.
  */
-#define RT_LOCAL_ADJUSTMENTS_CONTEXT_VERSION 9u
+#define RT_LOCAL_ADJUSTMENTS_CONTEXT_VERSION 10u
 /* "LAJC": rejects a stale or unrelated pointer before any callback runs. */
 #define RT_LOCAL_ADJUSTMENTS_CONTEXT_MAGIC 0x4C414A43u
 /* The block has no bounded spot count, but a profile that carries more spots
  * than this is outside the device set and runs the host block. */
 #define RT_LOCAL_ADJUSTMENTS_MAX_SPOTS 64u
 /* Floats per spot record; the slot constants below must stay inside it. */
-#define RT_LOCAL_ADJUSTMENTS_SPOT_STRIDE 141u
+#define RT_LOCAL_ADJUSTMENTS_SPOT_STRIDE 145u
 /* A curve table is one LUTf of the block's own size. */
 #define RT_LOCAL_ADJUSTMENTS_LUT_ENTRIES 65536u
 /* Color::gammatab_srgb and Color::igammatab_srgb, the sRGB gamma pair the
@@ -339,6 +339,18 @@ struct ProcParams;
 #define RT_LOCAL_ADJUSTMENTS_SLOT_SHAR_CONTRAST 138u
 #define RT_LOCAL_ADJUSTMENTS_SLOT_SHAR_BLUR 139u
 #define RT_LOCAL_ADJUSTMENTS_SLOT_SHAR_DAMPING 140u
+/* Blur & Noise's blur arm. EXPBLUR is 1 when the host's second blur gate runs
+ * with the tool on, the spot active and no mask: `blMethod == "blur"` in its
+ * normal direction, with the noise, grain, median, guided-filter and denoise
+ * additions idle and the FFT switch off. BLUR_RADIUS is the block's
+ * `lp.rad / (sk * 1.4)`; the context also exports its Gaussian coefficients
+ * so the device reads the host's own sigma. BLUR_CHRO is 0 for luminance, 1
+ * for chroma and 2 for all three planes. BLUR_SENS is `lp.sensbn`, the scope
+ * sensitivity. */
+#define RT_LOCAL_ADJUSTMENTS_SLOT_EXPBLUR 141u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_BLUR_CHRO 142u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_BLUR_SENS 143u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_BLUR_RADIUS 144u
 
 /* deconvsharpeningloc() has two arms. Damping zero is the undamped RLD path:
  * the division/multiplication recurrence the output.sharpen core already
@@ -368,6 +380,21 @@ struct ProcParams;
 /* Sharp_Local()'s deltaE reference blur: gaussianBlur() at 3 / sk, with
  * sk = 1 for the export call site. */
 #define RT_LOCAL_ADJUSTMENTS_SHARPEN_SCOPE_SIGMA 3.0
+
+/* Blur & Noise's blur arm. The block runs only at scale one and derives its
+ * Gaussian sigma as `lp.rad / (sk * 1.4)`. The block's own gate needs a spot
+ * radius above 1.6, and above 30 (or with fftwbl) it switches to the FFT
+ * path. Within that range gaussianBlur() is the SSE IIR pair: at or below
+ * sigma 0.6 it is the 3x3 FIR and at or above 25 it is the double path, and
+ * neither has a matching device recurrence. BlurNoise_Local() blends with a
+ * scope base of four, not transit_shapedetect2()'s two. Its deltaE reference
+ * is the block's default 3 / sk blur, the same sigma as the sharpening
+ * scope. */
+#define RT_LOCAL_ADJUSTMENTS_BLUR_SK 1.0
+#define RT_LOCAL_ADJUSTMENTS_BLUR_RADIUS_DIVISOR 1.4
+#define RT_LOCAL_ADJUSTMENTS_BLUR_MIN_RADIUS 1.6f
+#define RT_LOCAL_ADJUSTMENTS_BLUR_MAX_RADIUS 30.0f
+#define RT_LOCAL_ADJUSTMENTS_BLUR_SCOPE_BASE 4.0f
 
 typedef struct RtLocalAdjustmentsResult {
     /* spot_count RT_LOCAL_ADJUSTMENTS_SPOT_STRIDE floats, spot-major. */
@@ -416,6 +443,9 @@ typedef struct RtLocalAdjustmentsResult {
     /* shadows/highlights' deltaE reference blur, sigma
      * (2 + 0.2 * blurSHde) / sk. Only the SSE path is admitted. */
     const RtLabToolsIir* iir_shadows_highlights;
+    /* Blur & Noise's blur arm, sigma `lp.rad / (sk * 1.4)`. Only the SSE
+     * path is admitted. */
+    const RtLabToolsIir* iir_blur;
 } RtLocalAdjustmentsResult;
 
 typedef struct RtLocalAdjustmentsContext {
@@ -480,6 +510,16 @@ namespace rtengine::stage
  * padded deconvolution result across the transition ring, which the block's
  * `lx + lxL + 3` extent does not cover. A zero-width transition keeps the ring
  * inside the nominal extent.
+ *
+ * Blur & Noise is admitted in its Gaussian blur arm only: `blMethod ==
+ * "blur"` in its normal direction with `chroMethod` luminance, chroma or all,
+ * the noise (`strength`), grain (`strengr`), median, guided-filter, bilateral,
+ * non-local-means and wavelet-denoise additions idle, no explicit mask and no
+ * FFT. The Gaussian sigma is the block's `lp.rad / (sk * 1.4)`, so the spot
+ * radius must be above the block's 1.6 gate and at most 30; the device reads
+ * the host-built coefficients for that sigma. A spot radius below the gate,
+ * the median, guided and inverse arms, a non-zero denoise amount or curve, an
+ * FFT or mask request and the `"nlmean"` quality method are residuals.
  *
  * Local dehaze is admitted only through its retinex gate: expreti on, the
  * retinex strength zero and a non-zero dehaz. dehazeblack, show-depth, an
@@ -606,6 +646,7 @@ private:
     RtLabToolsIir iirVib_ = {};
     RtLabToolsIir iirLc_ = {};
     RtLabToolsIir iirSh_ = {};
+    RtLabToolsIir iirBlur_ = {};
     uint32_t clamp_mode_ = RT_LOCAL_ADJUSTMENTS_CLAMP_NONE;
 };
 

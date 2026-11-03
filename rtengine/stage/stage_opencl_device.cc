@@ -13351,6 +13351,8 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
             rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXPLOG] == 1.0f;
         const bool sharpenPass =
             rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXPSHARP] == 1.0f;
+        const bool blurPass =
+            rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXPBLUR] == 1.0f;
         const uint32_t shape =
             static_cast<uint32_t>(rec[RT_LOCAL_ADJUSTMENTS_SLOT_SHAPE]);
         const uint32_t avoid = static_cast<uint32_t>(
@@ -13375,6 +13377,7 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
             (rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXPLOG] != 0.0f && !logPass) ||
             (rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXPSHARP] != 0.0f &&
              !sharpenPass) ||
+            (rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXPBLUR] != 0.0f && !blurPass) ||
             (rec[RT_LOCAL_ADJUSTMENTS_SLOT_MERGE] != 0.0f) ||
             (rec[RT_LOCAL_ADJUSTMENTS_SLOT_HRENABLED] != 0.0f) ||
             (rec[RT_LOCAL_ADJUSTMENTS_SLOT_REPARCOL] != 100.0f) ||
@@ -13390,7 +13393,8 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
              rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXPCOLOR] != 1.0f) ||
             (!active && (colour || vibrance || localContrast ||
                          shadowsHighlights || softLight || cbdl ||
-                         dehazePass || logPass || sharpenPass || islocal))) {
+                         dehazePass || logPass || sharpenPass || blurPass ||
+                         islocal))) {
             error = "local.adjustments record is outside the supported set";
             return RT_STAGE_FALLBACK;
         }
@@ -13491,6 +13495,20 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
              rec[RT_LOCAL_ADJUSTMENTS_SLOT_SHAR_DAMPING] > 100.0f)) {
             error = "local.adjustments sharpening setting is outside its "
                     "range";
+            return RT_STAGE_FALLBACK;
+        }
+        if (blurPass &&
+            (rec[RT_LOCAL_ADJUSTMENTS_SLOT_BLUR_CHRO] < 0.0f ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_BLUR_CHRO] > 2.0f ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_BLUR_SENS] < 0.0f ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_BLUR_SENS] > 100.0f ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_BLUR_RADIUS] <=
+                 RT_LOCAL_ADJUSTMENTS_BLUR_MIN_RADIUS /
+                     RT_LOCAL_ADJUSTMENTS_BLUR_RADIUS_DIVISOR ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_BLUR_RADIUS] >
+                 RT_LOCAL_ADJUSTMENTS_BLUR_MAX_RADIUS /
+                     RT_LOCAL_ADJUSTMENTS_BLUR_RADIUS_DIVISOR)) {
+            error = "local.adjustments blur setting is outside its range";
             return RT_STAGE_FALLBACK;
         }
         if (dehazePass &&
@@ -13601,7 +13619,12 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
             setup.iir_shadows_highlights->size != sizeof(RtLabToolsIir) ||
             setup.iir_shadows_highlights->version !=
                 RT_LAB_TOOLS_IIR_VERSION ||
-            setup.iir_shadows_highlights->double_path != 0) {
+            setup.iir_shadows_highlights->double_path != 0 ||
+            (blurPass &&
+             (setup.iir_blur == nullptr ||
+              setup.iir_blur->size != sizeof(RtLabToolsIir) ||
+              setup.iir_blur->version != RT_LAB_TOOLS_IIR_VERSION ||
+              setup.iir_blur->double_path != 0))) {
             error = "local.adjustments blur needs the SSE coefficient path";
             return RT_STAGE_FALLBACK;
         }
@@ -13622,7 +13645,7 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
          * the sigma test alone. A host without SSE2 would therefore run a
          * different recurrence from the one the kernel's mode selects.
          */
-        if (vibrance || localContrast) {
+        if (vibrance || localContrast || blurPass) {
             error = "local.adjustments vibrance and local contrast need the "
                     "host's SSE2 blur path";
             return RT_STAGE_FALLBACK;
@@ -14025,8 +14048,14 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
                     &sharpen_estimate_key, sharpen_shape, &error);
                 sharpen_tmp_device = residency->acquire(
                     &sharpen_tmp_key, sharpen_shape, &error);
-                /* Sharp_Local() blurs the full image for its deltaE
-                 * reference, not the ROI. */
+            }
+            /*
+             * Sharp_Local() and BlurNoise_Local() both blur the full image for
+             * their deltaE reference, not the ROI, at the block's 3 / sk
+             * radius. The two passes share the buffer and recompute it from the
+             * image as each pass starts.
+             */
+            if (sharpenPass || blurPass) {
                 for (int plane = 0; plane < 3; ++plane) {
                     sharpen_blur_device[plane] = residency->acquire(
                         &sharpen_blur_keys[plane],
@@ -14235,8 +14264,9 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
                 !dehaze_acquired || (logPass && !log_orig_device) ||
                 (sharpenPass &&
                  (!sharpen_luma_device || !sharpen_mask_device ||
-                  !sharpen_estimate_device || !sharpen_tmp_device ||
-                  !sharpen_blur_device[0] || !sharpen_blur_device[1] ||
+                  !sharpen_estimate_device || !sharpen_tmp_device)) ||
+                ((sharpenPass || blurPass) &&
+                 (!sharpen_blur_device[0] || !sharpen_blur_device[1] ||
                   !sharpen_blur_device[2] || !sharpen_blur_tmp_device)) ||
                 (shadowsHighlights &&
                  (!sh_full_device || !sh_i1_device || !sh_p1_device ||
@@ -14274,27 +14304,33 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
             int sharpen_pitch = 0;
             int sharpen_plane = 0;
             int sharpen_blur_pitch = 0;
-            if (sharpenPass) {
-                sharpen_pitch =
-                    int_pitch(pitch_of(sharpen_luma_device), "sharpen");
-                sharpen_plane = int_pitch(
-                    plane_pitch_of(sharpen_luma_device), "sharpen plane");
+            if (sharpenPass || blurPass) {
                 sharpen_blur_pitch = int_pitch(
-                    pitch_of(sharpen_blur_device[0]), "sharpen blur");
-                if (sharpen_pitch < 0 || sharpen_plane < 0 ||
-                    sharpen_blur_pitch < 0 ||
-                    pitch_of(sharpen_mask_device) !=
-                        pitch_of(sharpen_luma_device) ||
-                    pitch_of(sharpen_estimate_device) !=
-                        pitch_of(sharpen_luma_device) ||
-                    pitch_of(sharpen_tmp_device) !=
-                        pitch_of(sharpen_luma_device) ||
+                    pitch_of(sharpen_blur_device[0]), "scope blur");
+                if (sharpen_blur_pitch < 0 ||
                     pitch_of(sharpen_blur_device[1]) !=
                         pitch_of(sharpen_blur_device[0]) ||
                     pitch_of(sharpen_blur_device[2]) !=
                         pitch_of(sharpen_blur_device[0]) ||
                     pitch_of(sharpen_blur_tmp_device) !=
                         pitch_of(sharpen_blur_device[0])) {
+                    error = "local.adjustments scope blur buffers have "
+                            "different pitches";
+                    return RT_STAGE_FALLBACK;
+                }
+            }
+            if (sharpenPass) {
+                sharpen_pitch =
+                    int_pitch(pitch_of(sharpen_luma_device), "sharpen");
+                sharpen_plane = int_pitch(
+                    plane_pitch_of(sharpen_luma_device), "sharpen plane");
+                if (sharpen_pitch < 0 || sharpen_plane < 0 ||
+                    pitch_of(sharpen_mask_device) !=
+                        pitch_of(sharpen_luma_device) ||
+                    pitch_of(sharpen_estimate_device) !=
+                        pitch_of(sharpen_luma_device) ||
+                    pitch_of(sharpen_tmp_device) !=
+                        pitch_of(sharpen_luma_device)) {
                     error = "local.adjustments sharpening buffers have "
                             "different pitches";
                     return RT_STAGE_FALLBACK;
@@ -14416,7 +14452,7 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
                 sharpenPass ? memory_of(sharpen_tmp_device) : nullptr;
             cl_mem sharpen_blur_memory[3] = {};
             cl_mem sharpen_blur_tmp_memory = nullptr;
-            if (sharpenPass) {
+            if (sharpenPass || blurPass) {
                 for (int plane = 0; plane < 3; ++plane) {
                     sharpen_blur_memory[plane] =
                         memory_of(sharpen_blur_device[plane]);
@@ -14507,7 +14543,8 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
                                        cl_float varsens,
                                        bool clip_luminance = false,
                                        bool full_blur = false,
-                                       bool raw_scope = false) {
+                                       bool raw_scope = false,
+                                       float scope_base = 2.0f) {
                 cl_uint arg = 0;
                 cl_mem lab_memory = memory_of(image);
                 cl_mem fin_memory = work_memory;
@@ -14565,6 +14602,9 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
                                &fin_l_only);
                 ok = ok && set(blend_kernel, arg++, sizeof(cl_int), &begx);
                 ok = ok && set(blend_kernel, arg++, sizeof(cl_int), &begy);
+                cl_float scope = scope_base;
+                ok = ok && set(blend_kernel, arg++, sizeof(cl_float),
+                               &scope);
                 if (!ok) {
                     error = std::string("local.adjustments ") + label +
                             " blend arguments failed";
@@ -14867,6 +14907,58 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
             };
 
             /*
+             * Sharp_Local() and BlurNoise_Local() both take the block's
+             * default 3 / sk Gaussian of the full image as their deltaE
+             * reference. The buffer is recomputed from the current image
+             * whenever a pass needs it, because each host tool block reads the
+             * image as it stands at its own point in Lab_Local()'s order.
+             */
+            const auto full_scope_blur = [&]() -> bool {
+                SharpenIirFactors factors;
+                sharpen_iir_factors(
+                    RT_LOCAL_ADJUSTMENTS_SHARPEN_SCOPE_SIGMA, factors);
+                for (int plane = 0; plane < 3; ++plane) {
+                    cl_uint arg = 0;
+                    cl_mem src = memory_of(image);
+                    cl_mem dst = sharpen_blur_memory[plane];
+                    cl_int src_plane = plane * lab_plane;
+                    cl_int src_pitch = lab_pitch;
+                    cl_int dst_pitch = sharpen_blur_pitch;
+                    cl_int w = width;
+                    cl_int h = height;
+                    bool ok = true;
+                    ok = ok && set(plane_copy_kernel, arg++, sizeof(cl_mem),
+                                   &src);
+                    ok = ok && set(plane_copy_kernel, arg++, sizeof(cl_mem),
+                                   &dst);
+                    ok = ok && set(plane_copy_kernel, arg++,
+                                   sizeof(cl_int), &src_plane);
+                    ok = ok && set(plane_copy_kernel, arg++,
+                                   sizeof(cl_int), &src_pitch);
+                    ok = ok && set(plane_copy_kernel, arg++,
+                                   sizeof(cl_int), &dst_pitch);
+                    ok = ok && set(plane_copy_kernel, arg++,
+                                   sizeof(cl_int), &w);
+                    ok = ok && set(plane_copy_kernel, arg++,
+                                   sizeof(cl_int), &h);
+                    if (!ok ||
+                        !launch2d(plane_copy_kernel,
+                                  static_cast<std::size_t>(width),
+                                  static_cast<std::size_t>(height),
+                                  "scope blur copy") ||
+                        !sharpen_iir_plane(env, sharpen_line_kernel, dst, dst,
+                                           sharpen_blur_tmp_memory, width,
+                                           height, sharpen_blur_pitch,
+                                           factors, error)) {
+                        error = "local.adjustments scope reference blur "
+                                "failed";
+                        return false;
+                    }
+                }
+                return true;
+            };
+
+            /*
              * Local log encoding runs first, before dehaze, CBDL and the
              * colour tools. The block copies the ROI Lab to RGB, keeps the
              * encoded RGB for the `repar` recovery blend, runs log_encode()'s
@@ -15082,6 +15174,56 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
                         error = "local.adjustments log blend failed";
                         return RT_STAGE_FALLBACK;
                     }
+                }
+            }
+
+            /*
+             * Blur & Noise's Gaussian arm runs after log encoding and before
+             * dehaze in Lab_Local()'s order. The block copies the ROI, blurs
+             * the selected planes with gaussianBlur() at `lp.rad / (sk * 1.4)`
+             * and blends the difference with BlurNoise_Local()'s senstype-0
+             * scope. The scope's reference is the full-image 3 / sk blur, not
+             * the ROI. The kernel runs the host's SSE recurrence with the
+             * context's host-built coefficients; the unselected planes keep
+             * the ROI copy and contribute no difference.
+             */
+            if (blurPass) {
+                if (!copy_roi()) {
+                    return RT_STAGE_FALLBACK;
+                }
+                const int chromet = static_cast<int>(
+                    rec[RT_LOCAL_ADJUSTMENTS_SLOT_BLUR_CHRO]);
+                const RtLabToolsIir& blur_iir = *setup.iir_blur;
+                const cl_int horizontal_lines = bfh - (bfh % 4);
+                const cl_int vertical_lines = bfw - (bfw % 8);
+                for (int plane = 0; plane < 3; ++plane) {
+                    const bool selected =
+                        chromet == 2 || (chromet == 0 && plane == 0) ||
+                        (chromet == 1 && plane != 0);
+                    if (!selected) {
+                        continue;
+                    }
+                    const cl_int base =
+                        static_cast<cl_int>(plane) * work_plane;
+                    if (!run_line(line_kernel, work_memory, scratch_memory,
+                                  scratch_memory, bfw, bfh, work_pitch,
+                                  scratch_pitch, 1, 1, base, 0, 0,
+                                  horizontal_lines, blur_iir.horizontal,
+                                  "blur") ||
+                        !run_line(line_kernel, scratch_memory, work_memory,
+                                  scratch_memory, bfh, bfw, 1, 1,
+                                  scratch_pitch, work_pitch, 0, base, 0,
+                                  vertical_lines, blur_iir.vertical,
+                                  "blur")) {
+                        return RT_STAGE_FALLBACK;
+                    }
+                }
+                if (!full_scope_blur() ||
+                    !run_blend("blur",
+                               rec[RT_LOCAL_ADJUSTMENTS_SLOT_BLUR_SENS],
+                               true, true, true,
+                               RT_LOCAL_ADJUSTMENTS_BLUR_SCOPE_BASE)) {
+                    return RT_STAGE_FALLBACK;
                 }
             }
 
@@ -16704,47 +16846,8 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
             if (sharpenPass) {
                 /* Sharp_Local()'s deltaE reference is a blur of the full
                  * image, not the ROI. */
-                SharpenIirFactors sharpen_factors;
-                sharpen_iir_factors(
-                    RT_LOCAL_ADJUSTMENTS_SHARPEN_SCOPE_SIGMA,
-                    sharpen_factors);
-                for (int plane = 0; plane < 3; ++plane) {
-                    cl_uint arg = 0;
-                    cl_mem src = memory_of(image);
-                    cl_mem dst = sharpen_blur_memory[plane];
-                    cl_int src_plane = plane * lab_plane;
-                    cl_int src_pitch = lab_pitch;
-                    cl_int dst_pitch = sharpen_blur_pitch;
-                    cl_int w = width;
-                    cl_int h = height;
-                    bool ok = true;
-                    ok = ok && set(plane_copy_kernel, arg++, sizeof(cl_mem),
-                                   &src);
-                    ok = ok && set(plane_copy_kernel, arg++, sizeof(cl_mem),
-                                   &dst);
-                    ok = ok && set(plane_copy_kernel, arg++,
-                                   sizeof(cl_int), &src_plane);
-                    ok = ok && set(plane_copy_kernel, arg++,
-                                   sizeof(cl_int), &src_pitch);
-                    ok = ok && set(plane_copy_kernel, arg++,
-                                   sizeof(cl_int), &dst_pitch);
-                    ok = ok && set(plane_copy_kernel, arg++,
-                                   sizeof(cl_int), &w);
-                    ok = ok && set(plane_copy_kernel, arg++,
-                                   sizeof(cl_int), &h);
-                    if (!ok ||
-                        !launch2d(plane_copy_kernel,
-                                  static_cast<std::size_t>(width),
-                                  static_cast<std::size_t>(height),
-                                  "sharpen blur copy") ||
-                        !sharpen_iir_plane(env, sharpen_line_kernel, dst, dst,
-                                           sharpen_blur_tmp_memory, width,
-                                           height, sharpen_blur_pitch,
-                                           sharpen_factors, error)) {
-                        error = "local.adjustments sharpen reference blur "
-                                "failed";
-                        return RT_STAGE_FALLBACK;
-                    }
+                if (!full_scope_blur()) {
+                    return RT_STAGE_FALLBACK;
                 }
                 {
                     cl_uint arg = 0;

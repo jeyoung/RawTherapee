@@ -136,7 +136,7 @@ bool explicitMaskIdle(const procparams::LocallabParams::LocallabSpot& spot)
  * (dehazeAdmitted() checks that) and is otherwise a residual. */
 bool otherToolEnabled(const procparams::LocallabParams::LocallabSpot& spot)
 {
-    return spot.expexpose || spot.expblur ||
+    return spot.expexpose ||
            spot.exptonemap || spot.expmask || spot.expcie ||
            spot.expprecam;
 }
@@ -448,6 +448,81 @@ bool sharpenAdmitted(const procparams::LocallabParams::LocallabSpot& spot,
     return spot.sensisha >= 0 && spot.sensisha <= 100;
 }
 
+/* Whether the profile's wavelet denoise curve leaves DeNoise() idle.
+ *
+ * calcLocalParams() reads `locwavCurveden` whenever `denoiena` (expblur) is
+ * set: a curve whose LUT is non-zero turns the eight `noiself*`/`noiselc`
+ * values non-zero and runs DeNoise(). The device has no denoise kernel, so
+ * such a curve is a residual. An empty curve, and a flat curve at the zero
+ * identity value, both reset the LUT and skip the read. LocwavCurve::Set()
+ * clamps a non-identity sample below 0.02 up to 0.02, so only the identity
+ * case is idle; that is what this test measures, rather than the curve's
+ * type. */
+bool denoiseCurveIdle(const procparams::LocallabParams::LocallabSpot& spot)
+{
+    LocwavCurve curve;
+    if (!curve.Set(spot.locwavcurveden)) {
+        return true;
+    }
+    if (!curve) {
+        /* A flat curve at the zero identity value resets the LUT. */
+        return true;
+    }
+    for (int index = 0; index < 501; ++index) {
+        if (curve[static_cast<float>(index)] != 0.f) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Whether the Blur & Noise parameters are inside the device set.
+ *
+ * Lab_Local()'s blur block runs `blurena` (the tool on, the spot active and
+ * no explicit mask) and its Gaussian arm is `blmet == 0` (blMethod "blur") in
+ * the normal direction (`invbl` false). `lp.rad` is the spot radius and the
+ * Gaussian sigma is `lp.rad / (sk * 1.4)`; the block's own gate needs it above
+ * 1.6, and above 30 (or with `fftwbl`) it takes optfft()/fftw_convol_blur2(),
+ * which has no device kernel. The noise strength (`stren` above 0.1), grain
+ * (`strengr`), median (`blmet == 1`), guided filter (`blmet == 2` or
+ * `guidb > 0`), bilateral, non-local-means and wavelet denoise additions all
+ * change the block's output and stay on the host. `chroMethod` selects the
+ * planes the Gaussian runs on. The `"nlmean"` quality method sets
+ * `noiscfactiv`, which can expose DeNoise() for a combined spot, so it is a
+ * residual. The denoise amounts that are read directly (`noisechrof`,
+ * `noisechroc`) and the wavelet curve are required idle. */
+bool blurAdmitted(const procparams::LocallabParams::LocallabSpot& spot)
+{
+    if (spot.blMethod != "blur" || spot.invbl) {
+        return false;
+    }
+    if (spot.chroMethod != "lum" && spot.chroMethod != "chr" &&
+        spot.chroMethod != "all") {
+        return false;
+    }
+    if (spot.guidbl != 0 || spot.strength != 0 || spot.strengr != 0 ||
+        spot.bilateral != 0 || spot.nlstr != 0 || spot.fftwbl) {
+        return false;
+    }
+    if (spot.enablMask || spot.noisechrof != 0.0 ||
+        spot.noisechroc != 0.0) {
+        return false;
+    }
+    if (spot.quamethod == "nlmean") {
+        return false;
+    }
+    if (!finiteValue(spot.radius)) {
+        return false;
+    }
+    const float radius = static_cast<float>(spot.radius);
+    if (!(radius > RT_LOCAL_ADJUSTMENTS_BLUR_MIN_RADIUS &&
+          radius <= RT_LOCAL_ADJUSTMENTS_BLUR_MAX_RADIUS)) {
+        return false;
+    }
+    return spot.sensibn >= 0 && spot.sensibn <= 100 &&
+           denoiseCurveIdle(spot);
+}
+
 /* Whether the local dehaze tool's parameters are inside the device set.
  *
  * Lab_Local()'s guard is `(lp.dehaze != 0 || lp.prevdE) && lp.retiena`; the
@@ -558,13 +633,13 @@ bool localAdjustmentsSupported(const procparams::ProcParams& params)
 {
     /*
      * The block is atomic: every spot must be in the set below. An inactive
-     * spot is the clamp-only case; an active spot runs log encoding, dehaze,
-     * CBDL, Colour & Light, vibrance, shadows/highlights (Lab-mode std), soft
-     * light (per-pixel soft), local contrast, local sharpening or any
-     * combination, with optional L/C/H curves on the colour tool and MUNS.
-     * Curves, Munsell, rectangular spots, inactive spots and multiple spots
-     * are supported; every other tool and the masks, merge, soft radius,
-     * gradients and LAB/XYZ gamut methods are residuals.
+     * spot is the clamp-only case; an active spot runs log encoding, Gaussian
+     * blur, dehaze, CBDL, Colour & Light, vibrance, shadows/highlights
+     * (Lab-mode std), soft light (per-pixel soft), local contrast, local
+     * sharpening or any combination, with optional L/C/H curves on the colour
+     * tool and MUNS. Curves, Munsell, rectangular spots, inactive spots and
+     * multiple spots are supported; every other tool and the masks, merge,
+     * soft radius, gradients and LAB/XYZ gamut methods are residuals.
      */
     if (!params.locallab.enabled || params.locallab.spots.empty() ||
         params.locallab.spots.size() > RT_LOCAL_ADJUSTMENTS_MAX_SPOTS) {
@@ -663,7 +738,7 @@ bool localAdjustmentsSupported(const procparams::ProcParams& params)
             spot.transitgrad < -10.0 || spot.transitgrad > 10.0) {
             return false;
         }
-        /* An active spot runs at least one of the eight tools in the device
+        /* An active spot runs at least one of the nine tools in the device
          * set, plus the local dehaze pass when the retinex enable exposes it;
          * an inactive spot does no work, so its tool settings are inert and
          * admitted. */
@@ -671,7 +746,8 @@ bool localAdjustmentsSupported(const procparams::ProcParams& params)
             const bool dehaze = spot.expreti && spot.dehaz != 0;
             if ((!spot.expcolor && !spot.expvibrance && !spot.expcontrast &&
                  !spot.expshadhigh && !spot.expsoft && !spot.expcbdl &&
-                 !spot.explog && !spot.expsharp && !dehaze) ||
+                 !spot.explog && !spot.expsharp && !spot.expblur &&
+                 !dehaze) ||
                 otherToolEnabled(spot)) {
                 return false;
             }
@@ -712,6 +788,9 @@ bool localAdjustmentsSupported(const procparams::ProcParams& params)
                 !sharpenAdmitted(spot,
                                  effectiveSharpeningDamping(params,
                                                             spot))) {
+                return false;
+            }
+            if (spot.expblur && !blurAdmitted(spot)) {
                 return false;
             }
         }
@@ -1679,6 +1758,27 @@ int LocalAdjustmentsContext::build(int spot, const RtStageBuffer* lab,
     }
 
     /*
+     * Blur & Noise's blur arm. The predicate narrowed the method and the
+     * noise, grain, median, guided, denoise and FFT additions. Lab_Local()'s
+     * second gate runs when the spot radius is above 1.6; the Gaussian sigma
+     * is `lp.rad / (sk * 1.4)`, and above a spot radius of 30 (or with
+     * `fftwbl`) the block takes the FFT path. The record carries the sigma and
+     * the host-built coefficients.
+     */
+    const bool blurRun =
+        profileSpot.expblur && lp.activspot && lp.blurena &&
+        lp.blmet == 0 && lp.blurmet == 0 && lp.stren <= 0.1f &&
+        lp.rad > RT_LOCAL_ADJUSTMENTS_BLUR_MIN_RADIUS &&
+        lp.rad <= RT_LOCAL_ADJUSTMENTS_BLUR_MAX_RADIUS;
+    if (blurRun && ipf_.getScale() != RT_LOCAL_ADJUSTMENTS_BLUR_SK) {
+        return 1;
+    }
+    const float blurRadius = static_cast<float>(
+        static_cast<double>(lp.rad) /
+        (RT_LOCAL_ADJUSTMENTS_BLUR_SK *
+         RT_LOCAL_ADJUSTMENTS_BLUR_RADIUS_DIVISOR));
+
+    /*
      * Local log encoding. Lab_Local()'s block runs when logena is set, which
      * needs the tool on, the spot active and no explicit tool mask; the
      * predicate has already narrowed detail, ciecam and autocompute. The
@@ -2016,6 +2116,12 @@ int LocalAdjustmentsContext::build(int spot, const RtStageBuffer* lab,
         static_cast<float>(profileSpot.sharblur);
     record[RT_LOCAL_ADJUSTMENTS_SLOT_SHAR_DAMPING] =
         static_cast<float>(sharpenDamping);
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_EXPBLUR] = blurRun ? 1.f : 0.f;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_BLUR_CHRO] =
+        static_cast<float>(lp.chromet);
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_BLUR_SENS] =
+        static_cast<float>(lp.sensbn);
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_BLUR_RADIUS] = blurRadius;
     record[RT_LOCAL_ADJUSTMENTS_SLOT_EXPDENAZE] = dehazeRun ? 1.f : 0.f;
     record[RT_LOCAL_ADJUSTMENTS_SLOT_SENSH] =
         static_cast<float>(profileSpot.sensih);
@@ -2151,6 +2257,11 @@ int LocalAdjustmentsContext::build(int spot, const RtStageBuffer* lab,
     if (!fillIir(static_cast<double>(2.0f + 0.2f * lp.blurSH), iirSh_)) {
         return 1;
     }
+    if (!fillIir(blurRun ? static_cast<double>(blurRadius)
+                         : RT_LOCAL_ADJUSTMENTS_SHARPEN_SCOPE_SIGMA,
+                 iirBlur_)) {
+        return 1;
+    }
 
     out.spots = spots_.data();
     out.spot_count = 1;
@@ -2172,6 +2283,7 @@ int LocalAdjustmentsContext::build(int spot, const RtStageBuffer* lab,
     out.iir_vibrance = &iirVib_;
     out.iir_local_contrast = &iirLc_;
     out.iir_shadows_highlights = &iirSh_;
+    out.iir_blur = &iirBlur_;
     built_ = true;
     return 0;
 }

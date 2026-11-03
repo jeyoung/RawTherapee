@@ -9160,6 +9160,13 @@ void ImProcFunctions::localAdjustmentsSpotParams(
     out.senssf = lp.senssf;
     out.sfena = lp.sfena;
     out.softmet = lp.softmet;
+    out.blurena = lp.blurena;
+    out.blmet = lp.blmet;
+    out.blurmet = lp.blurmet;
+    out.chromet = lp.chromet;
+    out.stren = lp.stren;
+    out.sensbn = lp.sensbn;
+    out.guidb = lp.guidb;
     out.cbdlena = lp.cbdlena;
     out.senscb = lp.senscb;
     out.threshol = lp.threshol;

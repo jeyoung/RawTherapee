@@ -75,6 +75,18 @@ struct LocalAdjustmentsSpotParams {
     int senssf = 0;
     bool sfena = false;
     int softmet = 0;
+    /* Blur & Noise. blurena is the host's enabled-and-unmasked predicate;
+     * blmet is the method (0 blur, 1 median, 2 guided), blurmet the
+     * normal/inverse direction, chromet the plane selector (0 luminance,
+     * 1 chroma, 2 all), stren the added-noise strength and sensbn the deltaE
+     * scope sensitivity. */
+    bool blurena = false;
+    int blmet = 0;
+    int blurmet = 0;
+    int chromet = 0;
+    float stren = 0.f;
+    int sensbn = 0;
+    int guidb = 0;
     /* Local CBDL, as calcLocalParams() narrows it. cbdlena is the host's
      * enabled-and-unmasked predicate; mulloc is the per-level multiplier
      * after the block's 0..4 clamp. */

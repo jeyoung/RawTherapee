@@ -599,11 +599,13 @@ __kernel void rt_local_adjustments_plane_copy(
 }
 
 /*
- * transit_shapedetect2()'s per-pixel tail, shared by the fused colour apply and
- * the standalone blend the vibrance and local-contrast tools use. `ml`/`ma`/
- * `mb` are the blurred original the deltaE scope compares against, `orig` is
- * the image before the tool, `fin` is the tool's output and `varsens` the
- * tool's own sensitivity (`lp.sens`, `lp.sensv` or `lp.senslc`).
+ * transit_shapedetect2()'s per-pixel tail, shared by the fused colour apply,
+ * the standalone blend and the blur arm. `ml`/`ma`/`mb` are the blurred
+ * original the deltaE scope compares against, `orig` is the image before the
+ * tool, `fin` is the tool's output and `varsens` the tool's own sensitivity
+ * (`lp.sens`, `lp.sensv`, `lp.senslc` or `lp.sensbn`). `scope_base` is the
+ * mindE constant: two for transit_shapedetect2() and four for
+ * BlurNoise_Local().
  */
 inline void rt_la_scope_blend(const float origL, const float origA,
                               const float origB, const float finL,
@@ -611,7 +613,7 @@ inline void rt_la_scope_blend(const float origL, const float origA,
                               const float ml, const float ma, const float mb,
                               const float localFactor, const float varsens,
                               __global const float* rec, const int raw_scope,
-                              float* outL,
+                              const float scope_base, float* outL,
                               float* outA, float* outB)
 {
     const float refa = rec[RT_LA_CHROMAREF] * cos(rec[RT_LA_HUEREF]) * 327.68f;
@@ -634,7 +636,7 @@ inline void rt_la_scope_blend(const float origL, const float origA,
                           kL * (refL - ml) * (refL - ml));
 
     const float thr = rec[RT_LA_THR];
-    const float mindE = 2.0f + RT_LA_MINSCOPE * varsens * thr;
+    const float mindE = scope_base + RT_LA_MINSCOPE * varsens * thr;
     const float maxdE = 5.0f + RT_LA_MAXSCOPE * varsens * (1.0f + 0.1f * thr);
     const float mindElim = 2.0f + RT_LA_MINSCOPE * (float)RT_LA_LIMSCOPE * thr;
     const float maxdElim =
@@ -818,7 +820,7 @@ __kernel void rt_local_adjustments_apply(__global float* lab,
     float blendedB = 0.0f;
     rt_la_scope_blend(origL, origA, origB, corrL, corrA, corrB, blurL[bo],
                       blurA[bo], blurB[bo], localFactor, rec[RT_LA_SENS], rec,
-                      0, &blendedL, &blendedA, &blendedB);
+                      0, 2.0f, &blendedL, &blendedA, &blendedB);
     lab[offset] = blendedL;
     lab[lab_plane + offset] = blendedA;
     lab[2 * lab_plane + offset] = blendedB;
@@ -848,7 +850,8 @@ __kernel void rt_local_adjustments_blend(__global float* lab,
                                          const int raw_scope,
                                          const int fin_is_padded,
                                          const int fin_l_only,
-                                         const int begx, const int begy)
+                                         const int begx, const int begy,
+                                         const float scope_base)
 {
     const int rx = (int)get_global_id(0);
     const int ry = (int)get_global_id(1);
@@ -885,7 +888,8 @@ __kernel void rt_local_adjustments_blend(__global float* lab,
     rt_la_scope_blend(lab[offset], lab[lab_plane + offset],
                       lab[2 * lab_plane + offset], finL, finA, finB,
                       blurL[bo], blurA[bo], blurB[bo], localFactor, varsens,
-                      rec, raw_scope, &blendedL, &blendedA, &blendedB);
+                      rec, raw_scope, scope_base, &blendedL, &blendedA,
+                      &blendedB);
     lab[offset] = clip_luminance != 0
                       ? fmin(fmax(blendedL, 0.0f), 65535.0f)
                       : blendedL;
