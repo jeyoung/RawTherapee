@@ -1269,7 +1269,6 @@ void labWaveletHostBlock(ImProcFunctions& ipf,
         if ((WaveParams.ushamethod == "sharp" || WaveParams.ushamethod == "clari") && WaveParams.expclari && WaveParams.CLmethod != "all") {
             float mL = (float)(WaveParams.mergeL / 100.f);
             float mC = (float)(WaveParams.mergeC / 100.f);
-            std::fprintf(stderr, "DBGCLAR method=%s back=%s soft=%.1f mL=%.4f mC=%.4f\n", WaveParams.CLmethod.c_str(), WaveParams.Backmethod.c_str(), WaveParams.softrad, mL, mC);
             float mL0;
             float mC0;
 
@@ -1283,7 +1282,6 @@ void labWaveletHostBlock(ImProcFunctions& ipf,
             } else {
                 mL0 = mL = mC0 = mC = 0.f;
             }
-            std::fprintf(stderr, "DBGCLAR2 method=%s back=%s soft=%.1f L0=%.4f L=%.4f C0=%.4f C=%.4f\n", WaveParams.CLmethod.c_str(), WaveParams.Backmethod.c_str(), WaveParams.softrad, mL0, mL, mC0, mC);
 
 
 #ifdef _OPENMP

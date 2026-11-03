@@ -6253,7 +6253,6 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
                     return RT_STAGE_INVALID;
                 }
                 soft_active = true;
-                std::fprintf(stderr, "DBGDEV L0=%.4f L=%.4f C0=%.4f C=%.4f\n", static_cast<double>(clarity.merge_l0), static_cast<double>(clarity.merge_l), static_cast<double>(clarity.merge_c0), static_cast<double>(clarity.merge_c));
                 soft_epsilon = wavelet_params[RT_LW_PARAM_SOFT_EPSILON];
                 soft_w = static_cast<int>(wavelet_params[RT_LW_PARAM_SOFT_W]);
                 soft_h = static_cast<int>(wavelet_params[RT_LW_PARAM_SOFT_H]);
