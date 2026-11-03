@@ -1969,11 +1969,13 @@ Still CPU-only: `raw.preprocess`, `raw.demosaic`, `raw.base`, `lab.tools`,
 `local.adjustments` is partial through the multi-spot tool path. The
 admitted set is any number of `norm` spots in list order: an active spot runs
 any combination of local log encoding, Blur & Noise (Gaussian and median),
-local dehaze, local CBDL, Colour & Light, vibrance, shadows/highlights, soft
+Tone Mapping, local dehaze, local CBDL,
+Colour & Light, vibrance, shadows/highlights, soft
 light, Gaussian local contrast and local sharpening, and an inactive spot is
 the clamp-only case and may carry inert tool settings.
-Every active spot needs at least one of `explog`, `expblur`, `expcbdl`,
-`expcolor`, `expvibrance`, `expshadhigh`, `expsoft`, `expcontrast`, `expsharp`
+Every active spot needs at least one of `explog`, `expblur`, `exptonemap`,
+`expcbdl`, `expcolor`, `expvibrance`, `expshadhigh`, `expsoft`, `expcontrast`,
+`expsharp`
 and the dehaze pair (`expreti` on with a non-zero `dehaz`); every other `exp*`
 is a residual.
 Local log encoding is admitted with `expcie` off, `autocompute` off, `detail`
@@ -2011,8 +2013,8 @@ shapes are admitted, and an active ROI must be at least 5 px in each
 dimension (39 px when sharpening runs, where a smaller extent makes the host
 return before its tail clamp).
 The tools run in `Lab_Local()`'s order: local log encoding, Blur & Noise,
-local dehaze, CBDL, vibrance, shadows/highlights, soft light, local contrast,
-local sharpening, then Colour & Light.
+Tone Mapping, local dehaze, CBDL, vibrance, shadows/highlights, soft light,
+local contrast, local sharpening, then Colour & Light.
 Each tool takes a fresh ROI copy and its own deltaE reference blur
 (`(2 + 0.2*blurcolde)` for colour, `(2 + 0.2*blurSHde)` for
 shadows/highlights, 3 for vibrance, soft light and dehaze, and `lcradius` for
@@ -2055,6 +2057,48 @@ range, the guided and inverse arms, a zero median method, out-of-range passes,
 added noise or grain, a mask, an FFT request and the `"nlmean"` quality
 method are residuals too; the wavelet denoise itself and the remaining
 denoise additions stay on the host.
+
+Tone Mapping runs `EPDToneMaplocal()` on the spot ROI and then
+`transit_shapedetect2()`'s senstype-8 blend. The block's guard needs the tool
+on an active spot, every explicit mask idle, the global EPD pass off, a
+non-zero strength and a ROI of at least `mDEN = 128` px on both axes; a
+smaller ROI makes the tool a no-op. The host scales the ROI lightness by
+`gamma / maxL`, logs it and hands it to
+`EdgePreservingDecomposition::CompressDynamicRange()`, a fixed-iteration
+preconditioned conjugate gradient on a five-diagonal finite-element Laplacian
+with one level of fill. Every step of it is order-sensitive, so one work item
+runs the whole decomposition in the host's order: the ROI minimum and maximum
+(their orders are equivalent), the edge-stopping weights
+`Scale * pow_F(0.5 * sqrt(gx^2 + gy^2 + 0.0004), -EdgeStopping)`, the
+five-diagonal assembly, the incomplete-Cholesky column recurrence with its
+single-prefix fill map (`{0, 1, w-2, w-1, w, w+1}` from one level of fill),
+the matrix-vector product's three summation regions, the `SparseConjugate
+Gradient` loop with `RMSResidual` zero and double-precision dot products that
+keep the even and the odd samples in separate accumulators, and the
+compression step. The host's SSE loops evaluate `xexpf()` with the vector
+polynomial grouping for the samples below `4 * (n / 4)` and the weights below
+`4 * (w1 / 4)`, and the scalar grouping for the tail, so the kernel carries
+both forms; the scalar form alone differs in the last bit and the conjugate
+gradient amplifies it. `equiltm`, the luminance normalisation the GUI enables
+by default, then rescales the restored lightness to the pre-tool ROI mean and
+standard deviation with `normalize_mean_dt()`'s two double-precision
+reductions, and the `repartm` recovery blend and the colour correction `sat`
+follow before the deltaE blend, whose reference is the default `3/sk` ROI
+blur and whose sense is `lp.senstm`. Sixteen device cases (strength
+0.5/1.2/-0.4/0.8, gamma 1/2, edge stopping 0.5/1.4/3.5, scale 1/4, reweight
+2, the equalise-off arm alone and at sensitivity 100, sensitivity 0/100,
+colour, blur, an offset ROI, a zero-strength no-op and a ROI below the mDEN
+gate) are within 0.023438
+LSB16, and the zero-strength case and the sub-mDEN no-op are exact; the matrix is non-vacuous, with
+the 0.5-strength case changing 155,998 of 156,000 fixture samples at PAE
+350.917969 LSB16 against the same spot with the tool off.
+`localadjustments-tonemap.pp3` records `impl=opencl` and its 16-bit TIFF pair
+differs on 3 of 30,419,712 samples at 1 LSB16, while the same export against
+the neutral profile differs by PAE 50 codes on 1,929,902 samples. The
+recovery threshold (`recothrest != 1`), the eight out-of-range sliders and
+the global EPD pass are residuals. The arm needs eighteen ROI-sized scratch
+planes, so a ROI beyond the device budget (a full-frame spot on a 10 MP
+image) runs the host block.
 
 Local dehaze runs `dehazeloc()` on the spot ROI. The device converts the ROI
 Lab to RGB, normalizes it, runs the three guided filters of the RGB channels,
@@ -2274,15 +2318,18 @@ gamma/slope, the SH recovery blend and gradient, vibrance
 gamma/gradients/warm, the local-contrast wavelet (`"wav"`) and FFT variants,
 CBDL's `contresid` and soft radius, blur/denoise, capture sharpening,
 `shargam`, `sharshow`, a separable local-sharpening radius, a damped radius
-below 0.6, tone
-mapping,
+below 0.6,
+Tone Mapping's recovery threshold, its out-of-range sliders and the global
+EPD pass,
 Retinex, log's guided-filter `detail`/`autocompute`/CIE CAM/gradient, the
 common mask, CIE CAM, the global dehaze, `exc`/`full`/`main`, merge, explicit
 masks, soft
 radius, LAB/XYZ/XYZREL gamut methods, the RGB curve, LabGrid, `avoidrad != 0`,
 `transit == 100`, a blur radius above 100, `reparcol != 100`, a ROI below
 5 px (12 px with shadows/highlights active, where a 10-px ROI falls back to
-the host at PAE 0; 39 px with sharpening active), `ghs_D != 0 && ghs_BLP > 0` and
+the host at PAE 0; 39 px with sharpening active; a Tone Mapping ROI below
+the block's 128 px mDEN gate is its own no-op, and a ROI beyond the device
+budget falls back to the host), `ghs_D != 0 && ghs_BLP > 0` and
 an active pre-CBDL pass. A GPU device is refused before the upload. An
 inactive block (`locallab.enabled == false` or no spots) never enters the node
 and takes no Lab round trip.

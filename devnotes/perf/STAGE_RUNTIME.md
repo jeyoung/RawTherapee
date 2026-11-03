@@ -2917,7 +2917,8 @@ non-local-means additions, an active wavelet denoise (a non-zero curve with
 Quality other than "Off", or `qualityMethod "enhden"`), and this node's own
 `avoidgamutMethod` LAB/XYZ/XYZREL arms
 stay on the host. The tools run in the block's order:
-log encoding, Blur & Noise, dehaze, CBDL, vibrance, shadows/highlights, soft
+log encoding, Blur & Noise, Tone Mapping, dehaze, CBDL, vibrance,
+shadows/highlights, soft
 light, local contrast, local sharpening, then Colour & Light.
 
 ### ABI, state and host setup
@@ -2995,6 +2996,19 @@ lab.regions `xlogf`/`xexpf`/`pow_F` ports, and the local-adjustments kernels:
   sort is exact. The blend reuses `rt_local_adjustments_blend` with the
   `mindE` base set to four and the full-image `3/sk` reference blur, which is
   shared with local sharpening.
+- `rt_local_adjustments_tonemap`: the whole of `EPDToneMaplocal()`, in one
+  work item. It scales and logs the ROI lightness, runs
+  `EdgePreservingDecomposition`'s edge-stopping weights, five-diagonal
+  assembly, incomplete-Cholesky factorisation and fixed-iteration conjugate
+  gradient (with `rt_algo.cc`'s two-accumulator double dot products and the
+  matrix-vector product's three regions in the host's orders), compresses and
+  restores, applies `normalize_mean_dt()` on the restored lightness for the
+  `equiltm` arm, and writes the colour-corrected, `repartm`-blended ROI into
+  a three-plane buffer. The weights use both `xexpf()` forms (the SSE vector
+  grouping below `4 * (w1 / 4)` and the scalar one for the tail), the
+  compression step below `4 * (n / 4)`. The finish blend is the shared
+  `rt_local_adjustments_blend` with `lp.senstm` and the default `3/sk` blur.
+  Eighteen ROI-sized arrays come from one contiguous scratch buffer.
 - `rt_lab_tools_mask`, `rt_lab_tools_subsample`, `rt_lab_tools_box_h`,
   `rt_lab_tools_box_v`, `rt_lab_tools_combine`, `rt_lab_tools_upsample` and
   `rt_lab_tools_apply`: the lab.tools shadows/highlights round. The local node
@@ -3068,7 +3082,8 @@ all-curves case); no separate MUNS-only worst is claimed.
 
 ### Residuals
 
-An active spot runs local log encoding, local dehaze, local CBDL, Colour &
+An active spot runs local log encoding, Tone Mapping, local dehaze, local
+CBDL, Colour &
 Light, vibrance, Lab-mode `"std"` shadows/highlights, per-pixel `"soft"` soft
 light, Gaussian local contrast and/or local sharpening, requires
 `reparcol == 100`, no explicit
@@ -3110,9 +3125,15 @@ variants, vibrance gamma/gradients/warm, blur/denoise, capture sharpening,
 sharpening gamma/blur/mask view/separable radius, tone
 mapping, Retinex, log's guided-filter arm/`autocompute`/CIE CAM/gradient,
 soft light `"reti"`, the common mask, dehaze, `exc`/`full`/`main`, merge,
-explicit masks, soft radius, the `avoidgamutMethod` LAB/XYZ/XYZREL arms, the
+explicit masks, soft radius, Tone Mapping's recovery threshold and
+out-of-range sliders and the global EPD pass, the `avoidgamutMethod`
+LAB/XYZ/XYZREL arms, the
 RGB curve, LabGrid, `avoidrad != 0`, `transit == 100`, a blur radius above
-100, `ghs_D != 0 && ghs_BLP > 0` and a pre-CBDL pass. A GPU device is refused
+100, `ghs_D != 0 && ghs_BLP > 0` and a pre-CBDL pass. Tone Mapping is
+admitted with `exptonemap` on, the masks idle, the global EPD pass off, a
+non-zero strength and a ROI of at least 128 px on both axes (the block's own
+mDEN gate, below which the tool is a no-op); its eight sliders must be inside
+their GUI ranges and `recothrest` must be one. A GPU device is refused
 before the upload.
 
 ### Evidence
@@ -3149,8 +3170,11 @@ before the upload.
 | `localadjustments-sharpen.pp3` (CPU-device row) | PASS, `max_pae=1.5259e-05` (1 LSB16), `impl=opencl`; the RL arm at radius 0.75, amount 100, 30 iterations, contrast 20, sensitivity 40, undamped, with a zero-transition spot. Non-vacuous: against the neutral export the profile differs by PAE 6,272 codes on 3,572,230 of 10,139,904 pixels |
 | `localadjustments-sharpen-damped.pp3` (CPU-device row) | PASS, `max_pae=1.5259e-05` (1 LSB16), `impl=opencl`; radius 0.75, `cbdlMethod=bef` and `shardamping=0`, so the host fixup's effective damping of one is exercised on the device. Non-vacuous: against the neutral export the profile differs by PAE 8,197 codes on 3,487,820 of 10,139,904 pixels |
 | Real-image damping 5 | `localadjustments-sharpen-damped.pp3` with `Shardamping_0=5`, `--gpu=off` versus `--gpu=auto`: 1 LSB16, 386,749 of 10,139,904 pixels differ |
-| Full `verify.sh --stage-device` | PASS, 34 PASS and 0 SKIP on the POCL CPU device; the MUNS, SH, soft-light, CBDL, dehaze, log and sharpen rows, including the damped row, are CPU-device rows, consistent with the launcher's CPU-only requirement. `working.trc` stays 1 LSB16 |
-| Default path | with `RT_STAGE_OPENCL` unset the host block runs directly; CPU-only `stage-residency-test: PASS (25 skipped)` |
+| Tone-map matrix, 16 cases | strength 0.5/1.2/-0.4/0.8, gamma 1/2, edge stopping 0.5/1.4/3.5, scale 1/4, reweight 2, the equalise-off arm alone and at sensitivity 100, sensitivity 0/100, colour, blur, an offset ROI, a zero-strength no-op and a ROI below the block's mDEN gate: `impl=opencl`, finite, worst 0.023438 LSB16 (the equalise-off, scale-4, sensitivity and offset-ROI arms are within 0.0156; the zero-strength no-op and the sub-mDEN case are exact). Non-vacuity: the 0.5-strength case changes 155,998 of 156,000 samples (PAE 350.917969 LSB16) against the same spot with the tool off |
+| Tone-map residuals, 10 cases | strength/gamma/edge-stopping/scale/repart/saturation/reweight/sensitivity out of range, `recothrest` 0.5 and `epd.enabled`: refused by the predicate, `impl=host`, PAE 0 |
+| `localadjustments-tonemap.pp3` (CPU-device row) | PASS, 1 LSB16, `impl=opencl`; strength 0.8, gamma 1, edge stopping 1.4, scale 1, `equiltm` on, sensitivity 60 and a 525x522 ROI. The 16-bit TIFF pair differs on 3 of 30,419,712 samples at 1 LSB16. Non-vacuous: against the neutral export the profile differs by PAE 50 codes on 1,929,902 of 30,419,712 channel samples. Measured by running the `run_stage_device` recipe directly (`--gpu=off` versus `--gpu=auto` with `RT_STAGE_OPENCL=1` and `RT_OPENCL_ALLOW_CPU=1` under `tools/opencl/pocl-run.sh`, then a numpy TIFF comparison), because ImageMagick is not installed in this environment; the full `--stage-device` corpus was therefore not re-run |
+| Full `verify.sh --stage-device` | PASS, 34 PASS and 0 SKIP on the POCL CPU device; the MUNS, SH, soft-light, CBDL, dehaze, log, sharpen and tone-map rows, including the damped row, are CPU-device rows, consistent with the launcher's CPU-only requirement. `working.trc` stays 1 LSB16 |
+| Default path | with `RT_STAGE_OPENCL` unset the host block runs directly; CPU-only `stage-residency-test: PASS (34 skipped)` |
 | Builds | `build/cpu-perf-graph` and `build/opencl-perf-graph` compile |
 | GPU | not run; refused before upload, records `impl=host` |
 

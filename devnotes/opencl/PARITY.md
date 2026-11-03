@@ -67,6 +67,9 @@ pairs are exact. The gate is the peak absolute error (PAE) in normalised units;
 | 2026-11-03 | uncommitted | POCL (CPU) | 13-case blur residual matrix, `stage-residency-test` | device vs host block | 0 (host) | PASS |
 | 2026-11-03 | uncommitted | POCL (CPU) | colorspace_flowers.pef / `localadjustments-blur-denoise.pp3`, `local.adjustments` | off vs auto, 16-bit TIFF | 1 LSB | PASS |
 | 2026-11-03 | uncommitted | POCL (CPU) | 15-case Blur & Noise median and denoise-curve matrix (3x3/5x5/7x7/9x9, 1/3/4 passes, chroma, ROI edges, colour, log, 179x49, blur-then-median, the default curve and flat curves 0.2/0.9), `stage-residency-test` | device vs host block | 0.031 LSB (worst) | PASS |
+| 2026-11-03 | uncommitted | POCL (CPU) | colorspace_flowers.pef / `localadjustments-tonemap.pp3`, `local.adjustments` | off vs auto, 16-bit TIFF | 1 LSB (AE 3 of 30,419,712; PAE 1 code) | PASS |
+| 2026-11-03 | uncommitted | POCL (CPU) | 16-case tone-map matrix (strengths 0.5/1.2/-0.4/0.8, gamma 1/2, edge stopping 0.5/1.4/3.5, scale 1/4, reweight 2, the equalise off arm alone and at sensitivity 100, sensitivity 0/100, colour, blur, an offset ROI, a zero-strength no-op and a ROI below the block's mDEN gate), `stage-residency-test` | device vs host block | 0.023 LSB (worst) | PASS |
+| 2026-11-03 | uncommitted | POCL (CPU) | 10-case tone-map residual matrix (strength/gamma/edge-stopping/scale/repart/saturation/reweight/sensitivity ranges, the recovery threshold and the global EPD pass), `stage-residency-test` | predicate refuses | 0 (host) | PASS |
 | 2026-10-31 | uncommitted | POCL (CPU) | colorspace_flowers.pef / `crop.pp3`, `crop` | off vs auto, 16-bit TIFF | 1 LSB | PASS |
 | 2026-10-31 | uncommitted | POCL (CPU) | 6-case crop copy matrix (full frame, odd offset, bottom right, single row, single pixel, 8192 wide), `stage-residency-test` | device vs host row copy | 0 (AE=0) | PASS |
 | 2026-10-31 | f744f7bc3 | POCL (CPU) | colorspace_flowers.pef / `labtools-blackwhite.pp3`, `lab.tools` | off vs auto, 16-bit TIFF | 1 LSB | PASS |
@@ -449,6 +452,38 @@ peak absolute error is zero for the synthetic node tests:
   Quality "Conservative" and `qualityMethod "enhden"`. The wavelet denoise
   itself (Quality "Conservative"/"Aggressive"/"Non-local means only"), added
   noise, grain, bilateral and non-local means remain host residuals.
+- Tone Mapping runs `EPDToneMaplocal()` on the device: the ROI lightness is
+  scaled by the host's `gamma / maxL`, logged, decomposed by
+  `EdgePreservingDecomposition` (a fixed-iteration preconditioned conjugate
+  gradient on a five-diagonal finite-element Laplacian) and blended with
+  `transit_shapedetect2()`'s senstype-8 arm, including the `equiltm`
+  luminance normalisation the GUI enables by default. The decomposition's
+  steps are order-sensitive, so the kernel runs the whole of it in one work
+  item and reproduces the host's arithmetic: the ROI minimum and maximum (an
+  exact reduction), the edge-stopping weights, the five-diagonal assembly,
+  the incomplete-Cholesky column recurrence with its single-prefix fill map,
+  the matrix-vector product's three summation regions, the double-precision
+  dot products with separate even and odd accumulators, and both the scalar
+  and the SSE vector `xexpf()` forms (the host's weight and compression loops
+  take the vector form below `4 * (n / 4)` and `4 * (w1 / 4)`). Sixteen
+  device cases (strength 0.5/1.2/-0.4/0.8, gamma 1/2, edge stopping
+  0.5/1.4/3.5, scale 1/4, reweight 2, the equalise-off arm alone and at
+  sensitivity 100, sensitivity 0/100, colour, blur, an offset ROI, a
+  zero-strength no-op and a ROI below the block's 128 px mDEN gate) are all
+  within 0.023438 LSB16, the equalise-off,
+  scale-4, sensitivity and offset-ROI arms within 0.0156, and the zero
+  strength and sub-mDEN cases exact. The tone map changes 155,998 of 156,000 fixture
+  samples at PAE 350.917969 LSB16 against the same spot with the tool off, so
+  the parity is not vacuous. `localadjustments-tonemap.pp3` records
+  `impl=opencl` and its 16-bit TIFF pair differs on 3 of 30,419,712 samples
+  at 1 LSB16, while the same export against the neutral profile differs by
+  PAE 50 codes on 1,929,902 samples. Ten residual configurations (the
+  strength, gamma, edge-stopping, scale, repart, saturation, reweight and
+  sensitivity ranges, a recovery threshold other than one and the global EPD
+  pass) are refused by the predicate. The block's own mDEN gate makes a ROI
+  below 128 px on either axis a no-op, not a residual, and the arm needs 18
+  ROI-sized scratch planes, so a ROI beyond the device budget (a full-frame
+  spot on a 10 MP image) falls back to the host.
 - The `lab.wavelet` edge panel's Medianlev arm reproduces `calckoe()` and
   the Lipschitz control. The raw pass runs the 3x3 or 5x5 convolution, the
   `thr` clamp and the `|tmC / temp|` ratio for the level's three

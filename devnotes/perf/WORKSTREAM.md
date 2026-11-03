@@ -441,8 +441,30 @@ current tip.
   host residuals, as do a non-zero curve with an active Quality method and
   `qualityMethod "enhden"`. The predicate refuses a Gaussian radius at or
   below 1.6 and any radius above the 30 FFT gate.
+- **`local.adjustments` Tone Mapping**: `EPDToneMaplocal()` runs on the
+  device, including the `equiltm` normalisation the GUI enables by default.
+  The edge-preserving decomposition's steps are order-sensitive, so one work
+  item reproduces the host's arithmetic: the ROI min/max reduction, the
+  edge-stopping weights, the five-diagonal assembly, the incomplete-Cholesky
+  column recurrence with its single-prefix fill map, the matrix-vector
+  product's three summation regions, the double-precision two-accumulator dot
+  products and both `xexpf()` forms (the SSE weight and compression loops take
+  the vector grouping below `4 * (w1 / 4)` and `4 * (n / 4)`). 16 device
+  cases (strengths 0.5/1.2/-0.4/0.8, gamma 1/2, edge stopping 0.5/1.4/3.5,
+  scale 1/4, reweight 2, the equalise-off arm alone and at sensitivity 100,
+  sensitivity 0/100, colour, blur, an offset ROI, a zero-strength no-op and a
+  ROI below the mDEN gate) are within 0.023438 LSB16; the tone map alone moves 155,998 of 156,000
+  samples at PAE 350.9 LSB16, so the parity is not vacuous.
+  `localadjustments-tonemap.pp3` records `impl=opencl` and its 16-bit TIFF
+  pair differs on 3 of 30,419,712 samples at 1 LSB16 (the neutral export
+  differs from it by PAE 50 codes on 1,929,902 samples). Ten residual
+  configurations are refused by the predicate. A ROI below the block's
+  128 px mDEN gate is its own no-op; the arm needs eighteen ROI-sized scratch
+  planes, so a ROI beyond the device budget (a full-frame spot on a 10 MP
+  image) falls back to the host. POCL gate PASS (1 skipped), CPU suite PASS
+  (34 skipped).
 - **Remaining Stage C**: exposure (FFT PDE), the Blur & Noise wavelet denoise
-  and remaining denoise additions, tone map, retinex, CIE, common mask, local
+  and remaining denoise additions, retinex, CIE, common mask, local
   sharpening capture; then the wavelet
   denoise/chroma/edges/final/clarity/soft-radius panels. Each is a
   separate multi-session unit. Gate environment: set `TMPDIR` to a
