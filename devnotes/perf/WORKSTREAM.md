@@ -5,11 +5,12 @@ without the local plan file. It records state, decisions, per-unit
 evidence and next tasks; architecture and invariants stay in the sibling
 records. Update it with each landed unit.
 
-Refreshed 2026-11-02. P0 blocks 1-4.1 are complete; block 4 device coverage is
+Refreshed 2026-11-03. P0 blocks 1-4.1 are complete; block 4 device coverage is
 the remaining large piece and is scoped below. Stage C has landed local
-sharpening (base and damped), `crop` and the `lab.sharpening`
-impulse-denoise/defringe pair; the remaining Stage C units are multi-session
-and are ordered below. Each stable, scanned range is pushed from 2026-10-29 on.
+sharpening (base and damped), the Blur & Noise Gaussian blur arm, `crop` and
+the `lab.sharpening` impulse-denoise/defringe pair; the remaining Stage C
+units are multi-session and are ordered below. Each stable, scanned range is
+pushed from 2026-10-29 on.
 
 ## State
 
@@ -417,12 +418,25 @@ current tip.
   `476dc9f24`, `db99dc054`, `7467f563f`, `211c12597`, `2ce2a7aff`,
   `ebbeab951`, `6fe238ede`. Pushed `41d6b5507..6fe238ede`; full gate
   **35 PASS, 0 FAIL, 0 gate SKIP**; CI green.
-- **Remaining Stage C**: exposure (FFT PDE), blur/denoise, tone map, retinex,
-  CIE, common mask, local sharpening capture; then the wavelet
-  denoise/chroma/edges/final/clarity/soft-radius panels. Each is a separate
-  multi-session unit. Gate environment: set `TMPDIR` to a project-local
-  directory (`/dev/shm` was 100% full and the second 60 MB TIFF in each stage
-  row failed).
+- **`local.adjustments` blur (partial)**: Blur & Noise's Gaussian arm runs
+  after log encoding and before dehaze, reusing the lab.tools IIR line kernel
+  with the context's host-built coefficients at `lp.rad / (sk * 1.4)`, and
+  blends with `BlurNoise_Local()`'s senstype-0 scope (`mindE` base four, the
+  full-image `3/sk` reference). 14 device cases (radii 2/5/10/18/28,
+  luminance/chroma/all planes, sensitivity 0/100, no scope, a strict
+  sub-rectangle ROI, RECT, colour, log, soft light, MUNS and 179x49), worst
+  0.023438 LSB16; blur alone moves 16,634 samples at PAE 7,162.726562 LSB16;
+  `localadjustments-blur.pp3` records `impl=opencl` at 1 LSB16. 13 runtime
+  residuals host at PAE 0. The denoise arm (noise, grain, bilateral,
+  non-local-means, the wavelet denoise curve) remains a host residual, so a
+  GUI profile with the default denoise curve falls back. The predicate
+  refuses a radius below the block's 1.6 gate and above the 30 FFT gate.
+- **Remaining Stage C**: exposure (FFT PDE), the Blur & Noise denoise arm,
+  tone map, retinex, CIE, common mask, local sharpening capture; then the
+  wavelet denoise/chroma/edges/final/clarity/soft-radius panels. Each is a
+  separate multi-session unit. Gate environment: set `TMPDIR` to a
+  project-local directory (`/dev/shm` was 100% full and the second 60 MB TIFF
+  in each stage row failed).
 - Contributor PRs merged: #37 AMaZE scratch reset at `6e0fd158e`, #36 SL notes
   at `41d6b5507`; #34 stays draft, #35 assigned. Branch tip `6fe238ede`,
   pushed, CI green on both required jobs.

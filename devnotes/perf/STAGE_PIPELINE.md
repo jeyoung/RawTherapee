@@ -1968,14 +1968,14 @@ Still CPU-only: `raw.preprocess`, `raw.demosaic`, `raw.base`, `lab.tools`,
 
 `local.adjustments` is partial through the multi-spot tool path. The
 admitted set is any number of `norm` spots in list order: an active spot runs
-any combination of local log encoding, local dehaze, local CBDL, Colour &
-Light, vibrance, shadows/highlights, soft light, Gaussian local contrast and
-local sharpening, and an inactive spot is the clamp-only case and may carry
-inert tool settings.
-Every active spot needs at least one of `explog`, `expcbdl`, `expcolor`,
-`expvibrance`, `expshadhigh`, `expsoft`, `expcontrast`, `expsharp` and the
-dehaze pair (`expreti` on with a non-zero `dehaz`); every other `exp*` is a
-residual.
+any combination of local log encoding, Gaussian blur, local dehaze, local
+CBDL, Colour & Light, vibrance, shadows/highlights, soft light, Gaussian
+local contrast and local sharpening, and an inactive spot is the clamp-only
+case and may carry inert tool settings.
+Every active spot needs at least one of `explog`, `expblur`, `expcbdl`,
+`expcolor`, `expvibrance`, `expshadhigh`, `expsoft`, `expcontrast`, `expsharp`
+and the dehaze pair (`expreti` on with a non-zero `dehaz`); every other `exp*`
+is a residual.
 Local log encoding is admitted with `expcie` off, `autocompute` off, `detail`
 zero, no gradient and its GUI slider ranges; `detail` non-zero (the guided
 filter arm), `expcie`, `ciecam`, `autocompute`, `strlog`, an explicit mask,
@@ -2010,7 +2010,7 @@ and chroma/lightness/contrast inside `-100..100`. Both `ELI` and `RECT`
 shapes are admitted, and an active ROI must be at least 5 px in each
 dimension (39 px when sharpening runs, where a smaller extent makes the host
 return before its tail clamp).
-The tools run in `Lab_Local()`'s order: local log encoding,
+The tools run in `Lab_Local()`'s order: local log encoding, Gaussian blur,
 local dehaze, CBDL, vibrance, shadows/highlights, soft light, local contrast,
 local sharpening, then Colour & Light.
 Each tool takes a fresh ROI copy and its own deltaE reference blur
@@ -2032,6 +2032,21 @@ the start of the block, and `lastorig` is unused while merge is a residual.
 chroma-slider curves, the seven L/C/H curves and the vibrance skin curve are
 host-built into 65536-entry tables; the local-contrast IIR coefficients are
 host-built for the region's sigma.
+
+Local Blur & Noise is admitted in its Gaussian arm only: `blMethod == "blur"`
+in its normal direction, `chroMethod` luminance/chroma/all, the noise,
+grain, median, guided-filter, bilateral, non-local-means and wavelet-denoise
+additions idle, no explicit mask and no FFT. The Gaussian sigma is the
+block's `lp.rad / (sk * 1.4)`, so the spot radius must be above the block's
+`1.6` gate and at most `30`; the context exports the host-built SSE IIR
+coefficients for that sigma. The device copies the ROI, blurs the selected
+planes in place and blends with `BlurNoise_Local()`'s senstype-0 scope, whose
+`mindE` base is `4` and whose deltaE reference is the full-image `3/sk`
+blur (shared with `Sharp_Local()`). A radius below the gate, the median,
+guided and inverse arms, added noise or grain, a mask, an FFT request, the
+`"nlmean"` quality method and a denoise curve whose LUT is non-zero are
+residuals; a GUI profile with the default denoise curve therefore runs the
+host block.
 
 Local dehaze runs `dehazeloc()` on the spot ROI. The device converts the ROI
 Lab to RGB, normalizes it, runs the three guided filters of the RGB channels,
