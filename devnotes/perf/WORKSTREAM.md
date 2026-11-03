@@ -15,7 +15,7 @@ and are ordered below. Each stable, scanned range is pushed from 2026-10-29 on.
 
 - Repository: `$REPO`
 - Worktree: the main checkout, branch `perf-graph`, clean and in sync with
-  `origin/perf-graph`; the last pushed tip is `0eb091389`. All pushed ranges
+  `origin/perf-graph`; the last pushed tip is `3595995d2`. All pushed ranges
   were scanned per the publication gate.
 - Stage C landed 2026-10-31: `local.adjustments` local sharpening (undamped
   `cd38028bb..7467f563f`, damped `211c12597..ebbeab951`), the `crop` device
