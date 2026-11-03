@@ -1,0 +1,6 @@
+[SharpenMicro]
+Enabled=true
+Matrix=false
+Strength=20
+Contrast=20
+Uniformity=5

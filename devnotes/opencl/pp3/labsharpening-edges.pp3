@@ -1,0 +1,5 @@
+[SharpenEdge]
+Enabled=true
+Passes=2
+Strength=50
+ThreeChannels=false

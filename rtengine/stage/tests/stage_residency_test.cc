@@ -3943,33 +3943,64 @@ void fill_defringe_fixture(LabImage& lab)
     }
 }
 
+/*
+ * The ML fixture: a broad luminance ramp with hard blocks, diagonal ridges and
+ * fine texture, plus chroma that varies on both axes with its own edges. It
+ * gives every 5x5 window of both ML passes non-zero weights and drives L both
+ * below and above MLsharpen()'s v < 92 guard.
+ */
+void fill_ml_fixture(LabImage& lab)
+{
+    for (int y = 0; y < lab.H; ++y) {
+        for (int x = 0; x < lab.W; ++x) {
+            const float u =
+                static_cast<float>(x) / static_cast<float>(lab.W - 1);
+            const float v =
+                static_cast<float>(y) / static_cast<float>(lab.H - 1);
+            float l = 2500.0f +
+                      28000.0f * (0.45f * u + 0.55f * v) +
+                      4200.0f * std::sin(0.35f * x) * std::cos(0.29f * y);
+            if (((x / 7 + y / 5) & 1) == 0) {
+                l += 6500.0f;
+            }
+            l += 2200.0f * static_cast<float>((x * 37 + y * 17) % 13) / 13.0f;
+            l += 900.0f * static_cast<float>((x * 11 + y * 23) % 7) / 7.0f;
+            lab.L[y][x] = l;
+            lab.a[y][x] = 8500.0f * std::sin(0.21f * x + 0.13f * y) +
+                          2600.0f * static_cast<float>(x % 9) - 9000.0f;
+            lab.b[y][x] = 8500.0f * std::cos(0.17f * x - 0.19f * y) +
+                          2600.0f * static_cast<float>(y % 7) - 7000.0f;
+        }
+    }
+}
+
 /* The production CPU path, with the node pinned to the host. */
 void run_cpu_lab_sharpening(rtengine::procparams::ProcParams& params,
-                            LabImage& lab)
+                            LabImage& lab, bool ciecam_arm = false)
 {
     rtengine::ImProcFunctions ipf(&params, false);
     ipf.setScale(1.0);
     set_node_device_override("lab.sharpening", StageNodeDevice::CPU);
-    ipf.impulsedenoise(&lab);
-    ipf.defringe(&lab);
+    labSharpeningHostBlock(ipf, params, lab, ciecam_arm);
     clear_node_device_overrides();
 }
 
 RtStageStatus run_device_lab_sharpening(
     const std::shared_ptr<StageContext>& context,
     rtengine::procparams::ProcParams& params, LabImage& lab,
-    StageExecution& execution, std::string& error)
+    StageExecution& execution, std::string& error, bool ciecam_arm = false)
 {
     rtengine::ImProcFunctions ipf(&params, false);
     ipf.setScale(1.0);
-    LabSharpeningContext node_context(params, ipf, lab.W, lab.H);
+    LabSharpeningContext node_context(params, ipf, lab.W, lab.H, ciecam_arm);
     if (node_context.build(&error) != 0) {
         return RT_STAGE_INVALID;
     }
-    const LabSharpeningNodeParams node = labSharpeningNodeParams(params);
+    const LabSharpeningNodeParams node =
+        labSharpeningNodeParams(params, ciecam_arm);
     std::string support_error;
-    const bool supported =
-        labSharpeningSupported(params, lab.W, lab.H, false, &support_error);
+    const bool supported = labSharpeningSupported(
+        params, lab.W, lab.H, ciecam_arm, &support_error);
     RtLabSharpeningContext descriptor = node_context.descriptor(supported);
     std::vector<RtStageArg> args;
     labSharpeningArgs(lab, node, node_context, descriptor, args);
@@ -3986,6 +4017,10 @@ RtStageStatus run_device_lab_sharpening(
 void test_lab_sharpening(bool available)
 {
     using namespace rtengine::stage;
+
+    /* MLmicrocontrast() reads settings->verbose. */
+    static rtengine::Settings lab_sharpening_settings{};
+    rtengine::settings = &lab_sharpening_settings;
 
     /* ------------------------------------------------ admission predicates */
     {
@@ -4046,6 +4081,75 @@ void test_lab_sharpening(bool available)
         params.defringe.radius = 5.0;
         check(!labSharpeningSupported(params, 19, 19, false, &error),
               "a defringe window wider than the image is refused");
+    }
+
+    /* ------------------------------------- ML edge and micro admission set */
+    {
+        rtengine::procparams::ProcParams params;
+        std::string error;
+        params.sharpenEdge.enabled = true;
+        params.sharpenEdge.passes = 2;
+        params.sharpenEdge.amount = 50.0;
+        check(labSharpeningSupported(params, 63, 31, false, &error),
+              "lab.sharpening admits ML sharpen edges alone");
+
+        params.sharpenEdge.threechannels = true;
+        check(labSharpeningSupported(params, 63, 31, false, &error),
+              "lab.sharpening admits the three-channel edge arm");
+
+        params.sharpenEdge.passes = 5;
+        check(!labSharpeningSupported(params, 63, 31, false, &error),
+              "lab.sharpening refuses more than four edge passes");
+        params.sharpenEdge.passes = 2;
+        params.sharpenEdge.amount = 101.0;
+        check(!labSharpeningSupported(params, 63, 31, false, &error),
+              "lab.sharpening refuses an edge amount above 100");
+        params.sharpenEdge.amount = -1.0;
+        check(!labSharpeningSupported(params, 63, 31, false, &error),
+              "lab.sharpening refuses an edge amount below 0");
+        params.sharpenEdge.amount = 50.0;
+        params.sharpenEdge.passes = 0;
+        check(labSharpeningSupported(params, 63, 31, false, &error),
+              "zero edge passes is the host no-op");
+
+        rtengine::procparams::ProcParams micro;
+        micro.sharpenMicro.enabled = true;
+        micro.sharpenMicro.amount = 20.0;
+        micro.sharpenMicro.contrast = 20.0;
+        micro.sharpenMicro.uniformity = 5;
+        check(labSharpeningSupported(micro, 63, 31, false, &error),
+              "lab.sharpening admits ML microcontrast alone");
+        micro.sharpenMicro.matrix = true;
+        check(labSharpeningSupported(micro, 63, 31, false, &error),
+              "lab.sharpening admits the 3x3 microcontrast arm");
+        micro.sharpenMicro.uniformity = 11;
+        check(!labSharpeningSupported(micro, 63, 31, false, &error),
+              "lab.sharpening refuses uniformity above 10");
+        micro.sharpenMicro.uniformity = 5;
+        micro.sharpenMicro.amount = 101.0;
+        check(!labSharpeningSupported(micro, 63, 31, false, &error),
+              "lab.sharpening refuses a microcontrast amount above 100");
+        micro.sharpenMicro.amount = 20.0;
+        micro.sharpenMicro.contrast = 201.0;
+        check(!labSharpeningSupported(micro, 63, 31, false, &error),
+              "lab.sharpening refuses microcontrast contrast above 200");
+        micro.sharpenMicro.contrast = 100.0;
+        check(labSharpeningSupported(micro, 63, 31, false, &error),
+              "contrast 100 is the host no-op");
+
+        /* Edges are a Lab pass in both arms; the other three are not. */
+        params.sharpenEdge.passes = 2;
+        params.impulseDenoise.enabled = true;
+        params.defringe.enabled = true;
+        params.defringe.radius = 2.0;
+        params.defringe.threshold = 13;
+        const LabSharpeningNodeParams ciecam =
+            labSharpeningNodeParams(params, true);
+        check(ciecam.impulse_enabled == 0 && ciecam.defringe_enabled == 0 &&
+                  ciecam.edges_enabled == 1 && ciecam.micro_enabled == 0,
+              "the CIE-CAM arm keeps only ML sharpen edges on the Lab image");
+        check(labSharpeningSupported(params, 63, 31, true, &error),
+              "the CIE-CAM arm admits ML sharpen edges");
     }
 
     if (!available) {
@@ -4437,6 +4541,114 @@ void test_lab_sharpening(bool available)
         check(untouched.differing == 0 && untouched.max_l == 0.0 &&
                   untouched.max_a == 0.0 && untouched.max_b == 0.0,
               "the defringe no-op leaves every plane untouched");
+    }
+
+    /* --------------------------------- ML sharpen edges and microcontrast */
+    {
+        struct MlCase {
+            const char* label;
+            bool edges;
+            bool micro;
+            bool pairs;
+            bool ciecam;
+            int passes;
+            double edge_amount;
+            bool threechannels;
+            bool matrix;
+            double micro_amount;
+            double micro_contrast;
+            int uniformity;
+        };
+        const MlCase cases[] = {
+            {"edges L/a/b 1 pass 50", true, false, false, false, 1, 50.0,
+             false, false, 0.0, 0.0, 0},
+            {"edges L/a/b 4 passes 100", true, false, false, false, 4, 100.0,
+             false, false, 0.0, 0.0, 0},
+            {"edges L only 2 passes 35", true, false, false, false, 2, 35.0,
+             true, false, 0.0, 0.0, 0},
+            {"edges L only 3 passes 80", true, false, false, false, 3, 80.0,
+             true, false, 0.0, 0.0, 0},
+            {"micro 5x5 20/20/5", false, true, false, false, 2, 0.0, false,
+             false, 20.0, 20.0, 5},
+            {"micro 5x5 60/0/0", false, true, false, false, 2, 0.0, false,
+             false, 60.0, 0.0, 0},
+            {"micro 3x3 20/50/10", false, true, false, false, 2, 0.0, false,
+             true, 20.0, 50.0, 10},
+            {"micro 3x3 100/200/0", false, true, false, false, 2, 0.0, false,
+             true, 100.0, 200.0, 0},
+            {"impulse+defringe+edges L only 50", true, false, true, false, 2,
+             50.0, true, false, 0.0, 0.0, 0},
+            {"impulse+defringe+edges L/a/b+micro", true, true, true, false,
+             2, 40.0, false, false, 30.0, 30.0, 6},
+            {"CIE-CAM arm edges only", true, true, true, true, 2, 60.0, true,
+             false, 20.0, 20.0, 5},
+        };
+
+        std::size_t device_cases = 0;
+        for (const MlCase& item : cases) {
+            rtengine::procparams::ProcParams params;
+            if (item.pairs) {
+                params.impulseDenoise.enabled = true;
+                params.impulseDenoise.thresh = 50;
+                params.defringe.enabled = true;
+                params.defringe.radius = 2.0;
+                params.defringe.threshold = 13;
+            }
+            if (item.edges) {
+                params.sharpenEdge.enabled = true;
+                params.sharpenEdge.passes = item.passes;
+                params.sharpenEdge.amount = item.edge_amount;
+                params.sharpenEdge.threechannels = item.threechannels;
+            }
+            if (item.micro) {
+                params.sharpenMicro.enabled = true;
+                params.sharpenMicro.matrix = item.matrix;
+                params.sharpenMicro.amount = item.micro_amount;
+                params.sharpenMicro.contrast = item.micro_contrast;
+                params.sharpenMicro.uniformity = item.uniformity;
+            }
+
+            LabImage source(70, 42);
+            fill_ml_fixture(source);
+
+            LabImage cpu(70, 42);
+            copy_sharpen_l(source, cpu);
+            run_cpu_lab_sharpening(params, cpu, item.ciecam);
+
+            LabImage device(70, 42);
+            copy_sharpen_l(source, device);
+            StageExecution execution;
+            std::string error;
+            const RtStageStatus status = run_device_lab_sharpening(
+                context, params, device, execution, error, item.ciecam);
+            const std::string label = std::string("lab.sharpening ML ") +
+                                      item.label;
+            check(status == RT_STAGE_OK,
+                  (label + " completes: " + error).c_str());
+            check(execution.device == StageDeviceType::OPENCL,
+                  (label + " runs on the device").c_str());
+            if (status == RT_STAGE_OK &&
+                execution.device == StageDeviceType::OPENCL) {
+                ++device_cases;
+            }
+
+            const LabPlaneDiff diff = compare_lab_planes(device, cpu);
+            check(diff.finite, (label + " stays finite").c_str());
+            check(diff.max_l <= 0.5 && diff.max_a <= 0.5 &&
+                      diff.max_b <= 0.5,
+                  (label + " is within half a 16-bit LSB").c_str());
+
+            const std::vector<unsigned char> changed =
+                lab_changed_mask(device, source);
+            const std::size_t count = lab_changed_count(changed);
+            check(count > 0, (label + " is not vacuous").c_str());
+            std::printf("stage-residency: %s: %zu of %zu samples differ, "
+                        "PAE L %.6f a %.6f b %.6f\n",
+                        label.c_str(), diff.differing, diff.samples,
+                        diff.max_l, diff.max_a, diff.max_b);
+        }
+        check(device_cases >= 8,
+              "lab.sharpening ML covers at least eight device cases");
     }
 }
 
