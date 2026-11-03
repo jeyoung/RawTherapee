@@ -9440,6 +9440,8 @@ void test_lab_wavelet_denoise(bool available)
         /* User chroma strength; inert for the forced arm but admitted. */
         double chromfi;
         double chromco;
+        /* Non-zero selects the sli+Thrden refinement. */
+        double thrden;
     };
 
     const DenoiseCase cases[] = {
@@ -9483,7 +9485,15 @@ void test_lab_wavelet_denoise(bool available)
         {"denoise chroma coarse", 238, 160, 6, {40, 30, 20, 10, 5}, 7.0, true,
          false, false, false, 0, 0.0, 60.0},
         {"denoise chroma both", 238, 160, 6, {40, 30, 20, 10, 5}, 7.0, false,
-         false, false, false, 0, 100.0, 100.0},
+         false, false, false, 0, 100.0, 100.0, 0.0},
+        {"denoise thrden 1", 238, 160, 6, {40, 30, 20, 10, 5}, 7.0, true,
+         false, false, false, 0, 0.0, 0.0, 1.0},
+        {"denoise thrden 5", 238, 160, 6, {40, 30, 20, 10, 5}, 7.0, true,
+         false, false, false, 0, 0.0, 0.0, 5.0},
+        {"denoise thrden 20", 238, 160, 6, {40, 30, 20, 10, 5}, 7.0, false,
+         false, false, false, 0, 0.0, 0.0, 20.0},
+        {"denoise thrden with final", 238, 160, 5, {40, 30, 20, 10, 0}, 7.0,
+         false, false, true, false, 0, 0.0, 0.0, 40.0},
     };
 
     unsigned seed = 0x51b9e3a7u;
@@ -9512,6 +9522,7 @@ void test_lab_wavelet_denoise(bool available)
         }
         params.wavelet.chromfi = item.chromfi;
         params.wavelet.chromco = item.chromco;
+        params.wavelet.thrden = item.thrden;
         if (item.toning) {
             params.wavelet.exptoning = true;
             params.wavelet.sigmaton = 1.0;
@@ -9585,6 +9596,19 @@ void test_lab_wavelet_denoise(bool available)
         check(d.over == 0,
               (std::string("lab.wavelet denoise ") + item.label +
                " is within one LSB16").c_str());
+        if (item.thrden != 0.0) {
+            /* Non-vacuity: the same profile with Thrden zero must differ. */
+            rtengine::procparams::ProcParams off = params;
+            off.wavelet.thrden = 0.0;
+            rtengine::ImProcFunctions off_ipf(&off, false);
+            LabImage off_image(item.width, item.height);
+            off_image.CopyFrom(&source);
+            labWaveletHostBlock(off_ipf, off, off_image);
+            const Distribution fd = distribution(view(off_image), view(cpu));
+            check(fd.max_abs > 1.0,
+                  (std::string("lab.wavelet denoise ") + item.label +
+                   " refines the coefficients").c_str());
+        }
         if (item.chromfi != 0.0 || item.chromco != 0.0) {
             /* The forced arm ignores variC at local == 1 and cp.chromco stays
              * below the ramp threshold, so the host result must be identical
@@ -9628,7 +9652,7 @@ void test_lab_wavelet_denoise(bool available)
      * byte for byte. The "cur" refinement has its own matrix below.
      */
     const char* residual_labels[] = {
-        "quamethod agre", "balance chroma", "wavhuecurve", "cbenab", "thrden",
+        "quamethod agre", "balance chroma", "wavhuecurve", "cbenab",
         "ballum range", "level range", "all sliders zero",
         "sub-128 window"};
     for (const char* label : residual_labels) {
@@ -9648,8 +9672,6 @@ void test_lab_wavelet_denoise(bool available)
                                           0.35};
         } else if (std::strcmp(label, "cbenab") == 0) {
             params.wavelet.cbenab = true;
-        } else if (std::strcmp(label, "thrden") == 0) {
-            params.wavelet.thrden = 5.0;
         } else if (std::strcmp(label, "ballum range") == 0) {
             params.wavelet.ballum = 10.5;
         } else if (std::strcmp(label, "level range") == 0) {
@@ -9902,12 +9924,12 @@ void test_lab_wavelet_denoise_curve()
     }
 
     /*
-     * Refusals specific to "cur": an out-of-range sigma (the block divides
-     * by it), the expert level pairing and the Thrden path must run the host
-     * block byte for byte. A user chroma strength is admitted and inert.
+     * Refusals specific to the refinement: an out-of-range sigma (the block
+     * divides by it) and the expert level pairing must run the host block
+     * byte for byte. Thrden and a user chroma strength are admitted.
      */
     const char* residual_labels[] = {
-        "cur sigm above range", "cur expert", "cur thrden"};
+        "cur sigm above range", "cur expert"};
     for (const char* label : residual_labels) {
         rtengine::procparams::ProcParams params;
         wavelet_denoise_params(params, 6, noise, 7.0);
@@ -9916,10 +9938,8 @@ void test_lab_wavelet_denoise_curve()
         params.wavelet.wavdenoise = denoise_curve();
         if (std::strcmp(label, "cur sigm above range") == 0) {
             params.wavelet.sigm = 5.0;
-        } else if (std::strcmp(label, "cur expert") == 0) {
-            params.wavelet.complexmethod = "expert";
         } else {
-            params.wavelet.thrden = 5.0;
+            params.wavelet.complexmethod = "expert";
         }
 
         const int width = 238;
