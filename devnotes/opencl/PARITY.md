@@ -108,6 +108,9 @@ pairs are exact. The gate is the peak absolute error (PAE) in normalised units;
 | 2026-11-03 | `b3fed699f..uncommitted` | POCL (CPU) | colorspace_flowers.pef / `labwavelet-ba-sli.pp3` (`Expfinal`, `BAmethod=sli`, `TMr`, `Balance=60`, `Iter=1`, `Sigmadir=1.2`) and `labwavelet-ba-cur.pp3` (`BAmethod=cur`, non-identity `opacityCurveW`, `Balance=-20`, `Iter=-2`), `lab.wavelet` | off vs auto, 16-bit TIFF | 0 (AE=0, PAE=0, both) | PASS |
 | 2026-11-03 | `b3fed699f..uncommitted` | POCL (CPU) | 10-case balance-chroma matrix (both methods, `Expfinal` on/off, `TMr` on/off, `Iter` -3/3, `Sigmadir` 0.4/2.5, `Balance` -30/100, final curves with/without, `TMr`+chroma, `TMr`+contrast, denoise and the combined set), `stage-residency-test` | device vs host block | 0.052734 LSB16 (worst: `cur`+`TMr`+contrast; the rest exact or <=0.04) | PASS |
 | 2026-11-03 | `b3fed699f..uncommitted` | POCL (CPU) | 11-case balance-chroma refusal matrix (unknown method, `cur` without a curve, `Balance`/`Iter`/`Sigmadir` out of range, no gate, `TMr` without a method, `TMr`-only dead trim), `stage-residency-test` | device vs host block | 0 (host) | PASS |
+| 2026-11-03 | `ed9f2a1e7..f53d06d4c` | POCL (CPU) | colorspace_flowers.pef / `labwavelet-edge-median.pp3`, `labwavelet-edge-nplow.pp3`, `labwavelet-edge-nphigh.pp3`, `labwavelet-edge-lipst.pp3` and `labwavelet-edge-sl.pp3` (Medianlev, NPMethod low/high with Lipst, Lipst influence, EDmethod SL), `lab.wavelet` | off vs auto, 16-bit TIFF | 1 LSB (940-1,196 of 30,419,712) | PASS |
+| 2026-11-03 | `ed9f2a1e7..f53d06d4c` | POCL (CPU) | 15-case edge Lipschitz matrix (3x3 thresholds 20/40/65, 5x5 85/95, Lipst influence, NPMethod low/high and low at threshold 0, EDmethod SL, contrast, denoise, final curves, combined arms, padded 179x49), `stage-residency-test` | device vs host block | 0.023438 LSB16 (worst: 5x5 threshold 95) | PASS |
+| 2026-11-03 | `ed9f2a1e7..f53d06d4c` | POCL (CPU) | 14-case edge refusal matrix (unknown NPmethod/EDmethod, `edgedetect`/`edgedetectthr`/`edgedetectthr2`/`edgesensi`/`edgeampli` out of range, plain slider ranges, unknown `Medgreinf`, zero strength, L skin protection), `stage-residency-test` | device vs host block | 0 (host) | PASS |
 | 2026-11-02 | 89e0a844b..47b9980fb | POCL (CPU) | colorspace_flowers.pef / `labtools-labcurve-contrast.pp3` (Lab curves with contrast 30, L/a/b/cc/lc/cl tables), `lab.tools` | off vs auto, 16-bit TIFF | 0 (exact) | PASS |
 | 2026-11-02 | 89e0a844b..47b9980fb | POCL (CPU) | 3-case Lab-contrast matrix (contrast 5, contrast 15 with L curve+brightness, contrast 30 with all six tables), `stage-residency-test` | device vs host block | 0 (exact) | PASS |
 | 2026-11-02 | uncommitted | POCL (CPU) | colorspace_flowers.pef / `labtools-labcurve-contrast.pp3` with `Gamutmunse=XYZ`, `lab.tools` | off vs auto, 16-bit TIFF | 0 (exact) | PASS |
@@ -364,6 +367,33 @@ peak absolute error is zero for the synthetic node tests:
   non-zero transition is also a host residual because the block's padded
   extent does not cover the transition ring the host reads. Negative damping
   is refused by the predicate and is not a runtime case.
+- The `lab.wavelet` edge panel's Medianlev arm reproduces `calckoe()` and
+  the Lipschitz control. The raw pass runs the 3x3 or 5x5 convolution, the
+  `thr` clamp and the `|tmC / temp|` ratio for the level's three
+  directions; the running maximum `calckoe()` folds into every coefficient
+  is a raster-order prefix maximum, so it is replayed through a rowmax,
+  carry and resolve pass rather than approximated by the global maximum.
+  The control pass rebuilds the direction-combination `interm` with the
+  influence sliders' `eddlipinfl`/`eddlipampl`, `aamp` and the threshold
+  clamp. `NPMethod` low/high with `Lipst` replays the in-place 28/40 or
+  38/50 neighbour smoothing with one work item per level, because the host
+  scan reads its already-updated neighbours. Fifteen device cases (3x3
+  thresholds 20/40/65, 5x5 85/95, Lipst influence, NPMethod low/high and
+  low at threshold 0, EDmethod SL, contrast, denoise, final curves, the
+  combined arms and a padded 179x49 image) match the host block with a
+  worst peak error of 0.023438 LSB16; the 3x3 default, 3x3 threshold 65,
+  5x5 threshold 85, Lipst, NPMethod low/high and EDmethod SL cases are
+  exact. Against the same profile with Medianlev off the host result
+  changes by 8,654-114,223 samples, so the parity is not vacuous;
+  `NPMethod` none moves the host result by up to 46,899 samples and `Lipst`
+  off by up to 11,102, so the smoothing and influence arms are not no-ops.
+  `EDmethod` SL is byte-identical to CU because the engine forces
+  `EDmet == 2`; the `EDmet == 1` threshold adjuster is unreachable.
+  Fourteen residual configurations (unknown `NPmethod` or `EDmethod`, the
+  five detection sliders out of range, the plain slider ranges, an unknown
+  `Medgreinf`, zero strength and L skin protection) run the host builtin
+  byte for byte. The five export profiles record `impl=opencl` and are
+  within 1 LSB16 (940-1,196 of 30,419,712 samples differ).
 - The `lab.wavelet` final-curve arm runs `finalContAllL()` on the statistics
   `Evaluate2()` recomputes after the contrast and edge passes, then applies
   the pixel-domain `wavclCurve` before the block's `L <= 0 -> 1` clamp. Both

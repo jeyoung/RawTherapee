@@ -230,8 +230,9 @@ device pass.
 `lab.wavelet` is partial: the directional pyramid equaliser runs on the
 device when it is enabled in after-CBDL position (`cbdlMethod == "aft"`) and
 the CIE-CAM gate admits the pass, and the wavelet tool runs on the device for
-the contrast panel, the chroma panel's `CHmethod == "link"` arm and the edge
-panel's plain arm. Either pass may run alone, so the node no longer requires
+the contrast panel, the chroma panel's `CHmethod == "link"` arm, the edge
+panel's plain arm and its Medianlev Lipschitz control. Either pass may run
+alone, so the node no longer requires
 `dirpyrequalizer.enabled` when only the wavelet runs. The host builds the
 equaliser's per-level range tables through its own `fillLut()` and the
 hue/chroma masks through its own SSE-aware precompute, and exports the
@@ -302,34 +303,46 @@ statistics the block built before the denoise unless
 and the device passes it as `final_refresh`, so the tail sees the same
 statistics as `WaveletcontAllLfinal()`.
 
-The edge arm is `ContAllL()`'s `EDmet == 2` block with `cp.detectedge` clear
-and the Lipschitz smoothing off. The host fills a separate edge `mea` through
-`calceffect()` with the `Edgeffect` slider and an offset of 1, samples the
-block's own `WavCurve` over `ccwcurve` into a 501-entry table, and uploads the
-level repartition/reinforce scalars plus the options' `edghi`, `edglo` and
-`limrad`. The kernel reproduces the strength/radius/exponential repartition,
-the `more`/`none`/`less` reinforce arithmetic, the ten-step `beta` ramp, the
-`MaxP` gate and the `ccwcurve` `kmul`/`kinterm` arm with the same `LUTf` float
-interpolation, and modifies only the `borderL == 1` interior of each level's
-three bands, before the contrast multiply. Because the block's a/b level trim
+The edge arm is `ContAllL()`'s `EDmet == 2` block. The host fills a separate
+edge `mea` through `calceffect()` with the `Edgeffect` slider and an offset
+of 1, samples the block's own `WavCurve` over `ccwcurve` into a 501-entry
+table, and uploads the level repartition/reinforce scalars plus the options'
+`edghi`, `edglo` and `limrad`. The kernel reproduces the
+strength/radius/exponential repartition, the `more`/`none`/`less` reinforce
+arithmetic, the ten-step `beta` ramp, the `MaxP` gate and the `ccwcurve`
+`kmul`/`kinterm` arm with the same `LUTf` float interpolation, and modifies
+only the `borderL == 1` interior of each level's three bands, before the
+contrast multiply.
+`Medianlev` adds `calckoe()` and the Lipschitz control. The raw pass runs the
+3x3 or 5x5 convolution, the `thr` clamp and the `|tmC / temp|` ratio for the
+level's three directions; the running maximum `calckoe()` folds into every
+coefficient is a raster-order prefix maximum, so it is replayed through a
+rowmax, carry and resolve pass rather than approximated by the global
+maximum. The control pass then rebuilds the direction-combination `interm`
+with the influence sliders' `eddlipinfl`/`eddlipampl`, `aamp` and the
+threshold clamp; `NPMethod` low/high with `Lipst` replays the host's in-place
+28/40 or 38/50 neighbour smoothing with one work item per level, because the
+scan reads its already-updated neighbours. The seven detection scalars use
+the free parameter-table slots 89..95.
+Because the block's a/b level trim
 is disabled while `edgeena` is set, an edge profile also runs the a/b
 decomposition and reconstruction on the device even with `Expchroma` off; the
 round trip is part of the block's result and the chroma multiply stays gated
 by its own flags. The `more`/`none`/`less` reinforce modes read the global
 `edghi`, `edglo` and `limrad` options, which are not pp3 parameters; the node
-captures them in the parameter table at build time. The plain edge arm is the
-only admitted edge sub-mode.
-Median level detection (`calckoe()`'s Lipschitz coefficients), the `NPMethod`
-low/high neighbour smoothing, `Lipst`, and the `EDmethod` `SL` selection are
-refused; the engine hard-codes `EDmet == 2`, so the `SL` threshold adjuster
-(`edgcont`) is dead code and is never silently ignored. A zero-strength edge
-panel, edge sliders outside their widget range, an unknown `Medgreinf` value
-and edge with the unported L skin protection are also residuals.
+captures them in the parameter table at build time.
+The admitted edge sub-modes are the plain arm and the `Medianlev` Lipschitz
+control with `NPMethod` none/low/high and `Lipst` on or off. `EDmethod` `CU`
+and `SL` are both admitted: the engine hard-codes `EDmet == 2`, so the `SL`
+threshold adjuster (`edgcont`) is unreachable and both selections run the
+same block. A zero-strength edge panel, detection or plain sliders outside
+their widget ranges, an unknown `NPMethod`/`EDmethod`/`Medgreinf` value and
+edge with the unported L skin protection are residuals.
 Two limits of the measured matrix are recorded rather than hidden: the host
 evaluates the curve abscissa with the fast `xlogf()` while the kernel uses
 `log()`, a difference below the measured 0.0586 LSB16, and a degenerate level
 where `mean + sigma == MaxP` makes the curve exponent singular on both sides
-and is not exercised by the 17 cases.
+and is not exercised by the 17 plain and 15 Medianlev cases.
 
 The CLmethod selection and the clarity arm run on the device for every
 admitted panel set. `finalContAllL()` and `ContAllAB()` zero the bands the
@@ -401,7 +414,9 @@ device pass. The blur and residual panels are refused before any upload, as
 are an unknown `BAmethod`, `TMr` without a method, a `BAmethod` whose sliders
 are out of range, `cur` without an opacity curve, the `TMr`-only profile whose
 L trim differs from the a/b count, the
-unported edge and denoise sub-arms, and a non-zero `softradend` combined with
+unported denoise sub-arms and the edge sub-arms that stay residual (an unknown
+`NPmethod`/`EDmethod`, the detection sliders out of range, zero strength and
+L skin protection), and a non-zero `softradend` combined with
 the clarity arm or the clarity soft radius, so a profile that enables any of
 them runs the whole block on the host.
 
@@ -431,7 +446,7 @@ panes records them separately. Both tools are off by default.
 | `rgb.proc` | Full/Full/Roi/Reduced | path | reuse-input | RGB curves, tone curve, colour toning, B&W, channel mixer, HSV, film simulation | yes |
 | `lab.tools` | Full/Full/Roi/Reduced | path | reuse-input | shadows/highlights, vibrance, Lab curves (including non-zero contrast, the chromaticity slider, the C=f(H)/L=f(H)/H=f(H) hue flat curves and the NONE/LAB/XYZ/XYZREL/MUN gamut methods), local contrast, black-and-white (cheap and `bwToning` arms), EPD, Lab-grid colour toning and Lab colour-correction regions | partial |
 | `lab.sharpening` | Full/-/Roi/- | path | reuse-input | impulse denoise and defringe (own node), ML sharpen edges, ML microcontrast and the main sharpen pass (shared `output.sharpen` node) | partial |
-| `lab.wavelet` | Full/Full/Roi/Reduced | path | reuse-input | directional pyramid equaliser and wavelet contrast, standard denoise (L and the forced chroma arm), chroma `link`, edge plain arm, final curves, balance-chroma `sli`/`cur`, the toning zero-protection arm, CLmethod's level selection and the clarity two-pass merge | partial |
+| `lab.wavelet` | Full/Full/Roi/Reduced | path | reuse-input | directional pyramid equaliser and wavelet contrast, standard denoise (L and the forced chroma arm), chroma `link`, edge plain arm and Medianlev Lipschitz control, final curves, balance-chroma `sli`/`cur`, the toning zero-protection arm, CLmethod's level selection and the clarity two-pass merge | partial |
 | `working.trc` | Full/Full/Roi/- | path | reuse-input | soft light, tone equaliser and working-TRC conversion | partial |
 | `ciecam` | Full/Full/Roi/- | path | reuse-input | CIE CAM 02 | no |
 | `gamut` | Full/Full/Roi/Reduced | path | reuse-input | working-space gamut compression | yes |

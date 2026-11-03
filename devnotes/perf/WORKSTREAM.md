@@ -136,26 +136,45 @@ current tip.
   final curves, toning, noise, clarity/unsharp, soft-radius guided filter.
   `65c55b9ec`, `8b412e8c5`, `837e4bfec`, `03daa9925`, `c3b2a11ac`,
   `bdcb5ddcf`. Pushed `b4a219bb1..bdcb5ddcf`.
-- **`lab.wavelet` edge panel, plain arm (partial)**: `ContAllL()`'s
-  `EDmet == 2` block with `cp.detectedge` clear and no `lip3`/`lipp`
-  smoothing. The host builds the edge `mea`, the per-level mean/sigma/MaxP
-  and the 501-point `ccwcurve` table (the default `ccwcurve` is non-identity,
-  so the curve arm is the normal path); the kernel reproduces the strength,
-  radius, repartition, `more`/`none`/`less` reinforce, ten-step `beta` and
-  `kmul`/`kinterm` arithmetic and touches only the `borderL == 1` interior.
-  Because `edgeena` disables the block's a/b level trim, the node also runs
-  the a/b decomposition and reconstruction (the round trip is not an
-  identity) and keeps the chroma multiply behind its own flags. 17 cases,
-  777,753 samples, worst 0.058594 LSB16; 12 refusals at host PAE 0.
-  `ed4e71f16`, `c5ed40c3c`. Residuals: median level detection (`calckoe`),
-  `NPMethod` low/high, `Lipst`, `EDmethod` `SL` (the threshold adjuster is
-  dead under the hard-coded `EDmet == 2`), a zero-strength edge panel,
-  out-of-range sliders, an unknown `Medgreinf`, edge with L skin protection,
-  and the global `edghi`/`edglo`/`limrad` options are read at build time and
-  are not part of the pp3. Two measured-matrix limits: the host's fast
-  `xlogf()` versus the kernel's `log()` (below 0.0586 LSB16), and a
-  degenerate `mean + sigma == MaxP` level whose curve exponent is singular on
-  both sides and is not covered.
+- **`lab.wavelet` edge panel, plain arm and Medianlev Lipschitz control
+  (partial)**: `ContAllL()`'s `EDmet == 2` block. The host builds the edge
+  `mea`, the per-level mean/sigma/MaxP and the 501-point `ccwcurve` table
+  (the default `ccwcurve` is non-identity, so the curve arm is the normal
+  path); the kernel reproduces the strength, radius, repartition,
+  `more`/`none`/`less` reinforce, ten-step `beta` and `kmul`/`kinterm`
+  arithmetic and touches only the `borderL == 1` interior. Because `edgeena`
+  disables the block's a/b level trim, the node also runs the a/b
+  decomposition and reconstruction (the round trip is not an identity) and
+  keeps the chroma multiply behind its own flags. 17 plain cases, 777,753
+  samples, worst 0.058594 LSB16; 12 refusals at host PAE 0.
+  `ed4e71f16`, `c5ed40c3c`.
+  `Medianlev` adds `calckoe()` and the Lipschitz control. The raw pass runs
+  the 3x3 or 5x5 convolution, the `thr` clamp and the `|tmC / temp|` ratio
+  for the level's three directions; the running maximum `calckoe()` folds
+  into each coefficient is a raster-order prefix maximum, replayed through a
+  rowmax, carry and resolve pass rather than approximated by the global
+  maximum. The control pass rebuilds the direction-combination `interm`
+  with the influence sliders' `eddlipinfl`/`eddlipampl`, `aamp` and the
+  threshold clamp. `NPMethod` low/high with `Lipst` replays the in-place
+  28/40 or 38/50 neighbour smoothing with one work item per level, because
+  the host scan reads its already-updated neighbours. Fifteen device cases
+  (3x3 thresholds 20/40/65, 5x5 85/95, Lipst influence, NPMethod low/high
+  and low at threshold 0, EDmethod SL, contrast, denoise, final curves, the
+  combined arms and a padded 179x49 image) match the host block with a
+  worst 0.023438 LSB16 (5x5 threshold 95). Against Medianlev off the host
+  result changes by 8,654-114,223 samples, so the parity is not vacuous;
+  NPMethod none and Lipst off move it too. `EDmethod` SL is byte-identical
+  to CU under the hard-coded `EDmet == 2`, so the `EDmet == 1` threshold
+  adjuster is unreachable. Fourteen refusals cover unknown
+  `NPmethod`/`EDmethod`, the five detection sliders out of range, the plain
+  slider ranges, an unknown `Medgreinf`, zero strength and L skin
+  protection. The five export profiles record `impl=opencl` at 1 LSB16.
+  `ed9f2a1e7`, `f53d06d4c`. Residuals: a zero-strength edge panel, edge with
+  L skin protection, and the global `edghi`/`edglo`/`limrad` options are read
+  at build time and are not part of the pp3. Two measured-matrix limits: the
+  host's fast `xlogf()` versus the kernel's `log()` (below 0.0586 LSB16), and
+  a degenerate `mean + sigma == MaxP` level whose curve exponent is singular
+  on both sides and is not covered.
 - **`lab.wavelet` final curves**: `Expfinal`'s curve arm.
   `finalContAllL()` runs on the statistics `Evaluate2()` recomputes after
   the contrast and edge passes, with the host-sampled 501-point
@@ -850,7 +869,9 @@ Splitco/Splitlr/RGBSliders are admitted with PAE 0 at `6c78a463a`. Then the
 `lab.wavelet` panels
 (denoise, noise, clarity, soft radius; the chroma `link` arm landed at
 `6bb3101da` with 12 cases at PAE 0, the edge plain arm at `c5ed40c3c` with
-17 cases, worst 0.058594 LSB16, and 12 residuals at PAE 0, the final curves
+17 cases, worst 0.058594 LSB16, and 12 residuals at PAE 0, the Medianlev
+Lipschitz control at `ed9f2a1e7` with 15 cases, worst 0.023438 LSB16, and 14
+residuals at PAE 0, the final curves
 with 13 cases, worst 0.015625 LSB16, and 14 residuals at PAE 0, toning
 with 12 cases, worst 0.011719 LSB16, and 10 residuals at PAE 0, the
 standard denoise L arm plus its forced chroma arm with 17 cases, worst
@@ -904,10 +925,13 @@ denoise the block forces at six levels) landed with the unit above, and its
 the unit above too. The BiShrink arms, user chroma strength, noise balance and
 hue curve stay
 residuals. The final curves and the toning zero-protection arm landed with the
-units above. The edge panel's plain arm is landed; its median/Lipschitz
-detection (`calckoe`), `NPMethod` low/high smoothing, `Lipst`, and the dead
-`EDmethod` `SL` threshold adjuster stay residuals, so do not reopen them
-without porting the detector. The balance-chroma arm (`BAmethod` `sli`/`cur`,
+units above. The edge panel's plain arm landed with the unit above; its
+median/Lipschitz detection (`calckoe`), `NPMethod` low/high smoothing, `Lipst`
+and `EDmethod` `SL` landed with this unit, so the whole edge panel now runs on
+the device except a zero-strength panel and L skin protection. `EDmethod` `SL`
+selects the same hard-coded `EDmet == 2` block as `CU`; the `EDmet == 1`
+threshold adjuster is unreachable, so there is nothing to port.
+The balance-chroma arm (`BAmethod` `sli`/`cur`,
 `TMr` for the a/b pass and `Expfinal` for the L pass) landed with this unit:
 the L arm rebuilds the `sigmadir` beta ramp, the a/b arm multiplies by the
 raw `kba`, and the `sli` and `cur` variants both run. The coefficient curve
