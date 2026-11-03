@@ -10511,6 +10511,7 @@ void wavelet_denoise_params(rtengine::procparams::ProcParams& params,
 void test_lab_wavelet_clarity();
 void test_lab_wavelet_denoise_curve();
 void test_lab_wavelet_denoise_expert();
+void test_lab_wavelet_bishrink();
 
 void test_lab_wavelet_denoise(bool available)
 {
@@ -10759,13 +10760,14 @@ void test_lab_wavelet_denoise(bool available)
     }
 
     /*
-     * Refusals: BiShrink, balance chroma, the hue curve,
+     * Refusals: an unknown `quaMethod`, balance chroma, the hue curve,
      * colour-by-noise, the Thrden arm, an all-zero slider set, an
      * out-of-range slider and the 128-pixel window must run the host block
-     * byte for byte. The "cur" refinement has its own matrix below.
+     * byte for byte. The "cur" refinement has its own matrix below, and the
+     * `agre` BiShrink pair has one of its own.
      */
     const char* residual_labels[] = {
-        "quamethod agre", "balance chroma", "wavhuecurve", "cbenab",
+        "unknown quamethod", "balance chroma", "wavhuecurve", "cbenab",
         "ballum range", "level range", "all sliders zero",
         "sub-128 window"};
     for (const char* label : residual_labels) {
@@ -10775,8 +10777,8 @@ void test_lab_wavelet_denoise(bool available)
         int width = 238;
         int height = 160;
 
-        if (std::strcmp(label, "quamethod agre") == 0) {
-            params.wavelet.quamethod = "agre";
+        if (std::strcmp(label, "unknown quamethod") == 0) {
+            params.wavelet.quamethod = "unknown";
         } else if (std::strcmp(label, "balance chroma") == 0) {
             params.wavelet.balchrom = 10.0;
         } else if (std::strcmp(label, "wavhuecurve") == 0) {
@@ -10848,11 +10850,275 @@ void test_lab_wavelet_denoise(bool available)
     if (available) {
         test_lab_wavelet_denoise_curve();
         test_lab_wavelet_denoise_expert();
+        test_lab_wavelet_bishrink();
     }
 
     /* The clarity unit shares this test's device gate so it does not add a
      * second skipped entry to the suite. */
     test_lab_wavelet_clarity();
+}
+
+/* ------------------------------------ lab.wavelet denoise BiShrink ("agre") */
+
+/*
+ * `quaMethod == "agre"` runs `WaveletDenoiseAll_BiShrinkL()` and then
+ * `WaveletDenoiseAllL()` on L, and `WaveletDenoiseAll_BiShrinkAB()` and then
+ * `WaveletDenoiseAllAB()` on each a/b plane. The L pair is the same
+ * `ShrinkAllL()` arithmetic twice (the block's `edge == 6` makes the pair's
+ * per-level formula identical to the standard one, and its coarsest level
+ * calls `ShrinkAllL()` outright). The chroma pair instead applies
+ * `SQR(1 - exp(...))` with no box blur on levels 0..4 and `ShrinkAllAB()` on
+ * level 5, and the standard pass after it rebuilds its squared MAD from the
+ * post-pair bands.
+ *
+ * Every case is checked against `quaMethod == "cons"` for non-vacuity: the
+ * pair has to change the host result.
+ */
+void test_lab_wavelet_bishrink()
+{
+    using namespace rtengine::stage;
+
+    const std::string profile_path =
+        std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp") +
+        "/stage-residency-lab-wavelet-bishrink.jsonl";
+
+    struct BiShrinkCase {
+        const char* label;
+        int width;
+        int height;
+        int levels;
+        double noise[5];
+        double ballum;
+        bool contrast;
+        bool edge;
+        bool final;
+        bool toning;
+        int image; /* 0 random, 1 skin */
+        /* Non-zero selects the sli+Thrden refinement. */
+        double thrden;
+    };
+
+    const BiShrinkCase cases[] = {
+        {"bishrink levels 3", 238, 160, 3, {30, 20, 10, 0, 0}, 7.0, false,
+         false, false, false, 0},
+        {"bishrink levels 5", 238, 160, 5, {40, 30, 20, 10, 5}, 5.0, false,
+         false, false, false, 0},
+        {"bishrink levels 6 ballum 10", 238, 160, 6, {50, 40, 30, 20, 10},
+         10.0, false, false, false, false, 0},
+        {"bishrink ballum 0", 238, 160, 6, {35, 25, 15, 8, 4}, 0.0, false,
+         false, false, false, 1},
+        {"bishrink ballum -2", 238, 160, 6, {35, 25, 15, 8, 4}, -2.0, false,
+         false, false, false, 0},
+        {"bishrink odd size 179x161", 179, 161, 6, {45, 35, 25, 12, 6},
+         7.0, false, false, false, false, 0},
+        {"bishrink odd height 180x161", 180, 161, 6,
+         {45, 35, 25, 12, 6}, 7.0, false, false, false, false, 0},
+        {"bishrink with contrast", 238, 160, 6, {40, 30, 20, 10, 5}, 7.0,
+         true, false, false, false, 0},
+        {"bishrink with edge", 238, 160, 6, {40, 30, 20, 10, 5}, 7.0, false,
+         true, false, false, 1},
+        {"bishrink with final curves", 238, 160, 5,
+         {40, 30, 20, 10, 5}, 7.0, false, false, true, false, 0},
+        {"bishrink with toning", 238, 160, 6, {40, 30, 20, 10, 5}, 7.0,
+         false, false, false, true, 1},
+        {"bishrink all panels 179x161", 179, 161, 6,
+         {45, 35, 25, 12, 6}, 7.0, true, true, true, true, 0},
+        {"bishrink thrden 5", 238, 160, 6, {40, 30, 20, 10, 5}, 7.0, true,
+         false, false, false, 0, 5.0},
+    };
+
+    unsigned seed = 0x7c31a5e9u;
+    for (const BiShrinkCase& item : cases) {
+        rtengine::procparams::ProcParams params;
+        wavelet_denoise_params(params, item.levels, item.noise, item.ballum);
+        params.wavelet.quamethod = "agre";
+        if (item.contrast) {
+            params.wavelet.expcontrast = true;
+            const int contrast[9] = {30, 22, 14, 8, 4, 2, 0, 0, 0};
+            for (int level = 0; level < 9; ++level) {
+                params.wavelet.c[level] = contrast[level];
+            }
+        }
+        if (item.edge) {
+            params.wavelet.expedge = true;
+            params.wavelet.edgval = 50;
+            params.wavelet.edgrad = 15;
+            params.wavelet.edgthresh = 10;
+            params.wavelet.edgeffect = 1.0;
+        }
+        if (item.final) {
+            params.wavelet.expfinal = true;
+            params.wavelet.sigmafin = 1.0;
+            params.wavelet.wavclCurve = final_diagonal_curve();
+            params.wavelet.opacityCurveWL = final_opacity_curve();
+        }
+        if (item.toning) {
+            params.wavelet.exptoning = true;
+            params.wavelet.sigmaton = 1.0;
+            params.wavelet.opacityCurveRG = toning_red_green_curve();
+            params.wavelet.opacityCurveBY = toning_blue_yellow_curve();
+        }
+        params.wavelet.thrden = item.thrden;
+
+        LabImage source(item.width, item.height);
+        if (item.image == 1) {
+            fill_lab_wavelet_skin(source);
+        } else {
+            fill_lab_tools(source, seed++);
+        }
+
+        check(labWaveletSupported(params, item.width, item.height),
+              (std::string("lab.wavelet bishrink ") + item.label +
+               " is the supported set").c_str());
+
+        rtengine::ImProcFunctions cpu_ipf(&params, false);
+        LabImage cpu(item.width, item.height);
+        cpu.CopyFrom(&source);
+        labWaveletHostBlock(cpu_ipf, params, cpu);
+
+        rtengine::ImProcFunctions device_ipf(&params, false);
+        LabImage device(item.width, item.height);
+        device.CopyFrom(&source);
+        const LabWaveletRun result =
+            run_lab_wavelet_node(device, params, device_ipf, profile_path);
+        const std::string profile = read_file(profile_path);
+
+        check(result.supported,
+              (std::string("lab.wavelet bishrink ") + item.label +
+               " resolves to the supported set").c_str());
+        check(result.deviceReady,
+              (std::string("lab.wavelet bishrink ") + item.label +
+               " builds its host setup").c_str());
+        check(result.status == RT_STAGE_OK,
+              (std::string("lab.wavelet bishrink ") + item.label +
+               " completes through run()").c_str());
+        check(profile.find("\"stage\":\"lab.wavelet\"") != std::string::npos,
+              (std::string("lab.wavelet bishrink ") + item.label +
+               " records the node").c_str());
+        check(profile.find("\"impl\":\"opencl\"") != std::string::npos,
+              (std::string("lab.wavelet bishrink ") + item.label +
+               " records a device execution").c_str());
+
+        const Distribution d = distribution(view(device), view(cpu));
+        double plane_pae[3] = {0.0, 0.0, 0.0};
+        for (int y = 0; y < item.height; ++y) {
+            for (int x = 0; x < item.width; ++x) {
+                plane_pae[0] = std::max(
+                    plane_pae[0], static_cast<double>(std::fabs(
+                                      device.L[y][x] - cpu.L[y][x])));
+                plane_pae[1] = std::max(
+                    plane_pae[1], static_cast<double>(std::fabs(
+                                      device.a[y][x] - cpu.a[y][x])));
+                plane_pae[2] = std::max(
+                    plane_pae[2], static_cast<double>(std::fabs(
+                                      device.b[y][x] - cpu.b[y][x])));
+            }
+        }
+        std::printf("stage-residency: lab.wavelet bishrink %s %dx%d L%d: "
+                    "PAE %.6f LSB16; exact %zu, <=0.25 %zu, <=0.5 %zu, "
+                    "<=1 %zu, >1 %zu of %zu\n",
+                    item.label, item.width, item.height, item.levels,
+                    d.max_abs, d.exact, d.quarter, d.half, d.one, d.over,
+                    d.samples);
+        check(d.finite,
+              (std::string("lab.wavelet bishrink ") + item.label +
+               " stays finite").c_str());
+        check(d.over == 0,
+              (std::string("lab.wavelet bishrink ") + item.label +
+               " is within one LSB16").c_str());
+
+        /* Non-vacuity: the same profile with `quaMethod = "cons"` must
+         * produce a different host result. */
+        rtengine::procparams::ProcParams cons = params;
+        cons.wavelet.quamethod = "cons";
+        rtengine::ImProcFunctions cons_ipf(&cons, false);
+        LabImage cons_image(item.width, item.height);
+        cons_image.CopyFrom(&source);
+        labWaveletHostBlock(cons_ipf, cons, cons_image);
+        const Distribution cd = distribution(view(cons_image), view(cpu));
+        std::printf("stage-residency: lab.wavelet bishrink %s differs from "
+                    "cons on PAE %.6f LSB16\n",
+                    item.label, cd.max_abs);
+        check(cd.max_abs > 1.0,
+              (std::string("lab.wavelet bishrink ") + item.label +
+               " changes the result against quaMethod cons").c_str());
+    }
+
+    /*
+     * Refusals: an unknown `quaMethod`, and the agre pair with a slider or
+     * the window outside its admitted range, must run the host block byte for
+     * byte.
+     */
+    const char* residual_labels[] = {
+        "unknown quamethod", "agre ballum range", "agre level range",
+        "agre sub-128 window"};
+    for (const char* label : residual_labels) {
+        rtengine::procparams::ProcParams params;
+        const double noise[5] = {35, 25, 15, 8, 4};
+        wavelet_denoise_params(params, 6, noise, 7.0);
+        params.wavelet.quamethod = "agre";
+        int width = 238;
+        int height = 160;
+
+        if (std::strcmp(label, "unknown quamethod") == 0) {
+            params.wavelet.quamethod = "unknown";
+        } else if (std::strcmp(label, "agre ballum range") == 0) {
+            params.wavelet.ballum = 10.5;
+        } else if (std::strcmp(label, "agre level range") == 0) {
+            params.wavelet.level2noise.setValues(0.0, 120.0);
+        } else {
+            width = 128;
+            height = 160;
+        }
+
+        check(!labWaveletSupported(params, width, height),
+              (std::string("lab.wavelet bishrink residual ") + label +
+               " is a residual").c_str());
+
+        LabImage source(width, height);
+        fill_lab_wavelet_skin(source);
+
+        rtengine::ImProcFunctions cpu_ipf(&params, false);
+        LabImage cpu(width, height);
+        cpu.CopyFrom(&source);
+        labWaveletHostBlock(cpu_ipf, params, cpu);
+
+        rtengine::ImProcFunctions device_ipf(&params, false);
+        LabImage device(width, height);
+        device.CopyFrom(&source);
+        const LabWaveletRun result =
+            run_lab_wavelet_node(device, params, device_ipf, profile_path);
+        const std::string profile = read_file(profile_path);
+
+        check(!result.supported,
+              (std::string("lab.wavelet bishrink residual ") + label +
+               " is refused as a device configuration").c_str());
+        check(!result.deviceReady,
+              (std::string("lab.wavelet bishrink residual ") + label +
+               " does not build a device setup").c_str());
+        check(result.status == RT_STAGE_OK,
+              (std::string("lab.wavelet bishrink residual ") + label +
+               " completes through run()").c_str());
+        check(profile.find("\"impl\":\"host\"") != std::string::npos,
+              (std::string("lab.wavelet bishrink residual ") + label +
+               " records a host execution").c_str());
+        check(profile.find("\"impl\":\"opencl\"") == std::string::npos,
+              (std::string("lab.wavelet bishrink residual ") + label +
+               " never mixes a device pass").c_str());
+
+        const Diff diff = compare(view(device), view(cpu));
+        std::printf("stage-residency: lab.wavelet bishrink residual %s: "
+                    "host, PAE %.6f LSB16, %zu of %zu samples differ\n",
+                    label, diff.max_abs, diff.differing, diff.samples);
+        check(diff.finite,
+              (std::string("lab.wavelet bishrink residual ") + label +
+               " stays finite").c_str());
+        check(diff.differing == 0 && diff.max_abs == 0.0,
+              (std::string("lab.wavelet bishrink residual ") + label +
+               " matches the CPU block").c_str());
+    }
+
+    std::remove(profile_path.c_str());
 }
 
 /* ------------------------------------- lab.wavelet denoise curve "cur" */

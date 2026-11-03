@@ -319,6 +319,8 @@ quick() {
         "$ROOT/devnotes/opencl/pp3/labwavelet-toning.pp3" lab.wavelet cpu
     run_stage_device "pef/stage-device-lab-wavelet-denoise" \
         "$ROOT/devnotes/opencl/pp3/labwavelet-denoise.pp3" lab.wavelet cpu
+    run_stage_device "pef/stage-device-lab-wavelet-denoise-agre" \
+        "$ROOT/devnotes/opencl/pp3/labwavelet-denoise-agre.pp3" lab.wavelet cpu
     run_stage_device "pef/stage-device-lab-wavelet-clarity" \
         "$ROOT/devnotes/opencl/pp3/labwavelet-clarity.pp3" lab.wavelet cpu
     run_stage_device "pef/stage-device-lab-wavelet-clarity-sup" \
@@ -704,6 +706,8 @@ stage_device() {
         "$ROOT/devnotes/opencl/pp3/labwavelet-toning.pp3" lab.wavelet cpu
     run_stage_device "pef/stage-device-lab-wavelet-denoise" \
         "$ROOT/devnotes/opencl/pp3/labwavelet-denoise.pp3" lab.wavelet cpu
+    run_stage_device "pef/stage-device-lab-wavelet-denoise-agre" \
+        "$ROOT/devnotes/opencl/pp3/labwavelet-denoise-agre.pp3" lab.wavelet cpu
     run_stage_device "pef/stage-device-lab-wavelet-clarity" \
         "$ROOT/devnotes/opencl/pp3/labwavelet-clarity.pp3" lab.wavelet cpu
     run_stage_device "pef/stage-device-lab-wavelet-clarity-sup" \
