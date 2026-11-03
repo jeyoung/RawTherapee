@@ -528,26 +528,36 @@ defringe radius arrive already prescaled by the export; the crop path does not
 prescale. All three planes must be tightly packed and the same size, because
 the host builtin copies them into a `LabImage` and back.
 
-The pair is atomic. The launcher refuses before the first upload when the Lab
-arm is not the caller's (the CIE-CAM pipeline runs these tools on the
-`CieImage` and is a host residual), the image is below 8x8, either threshold
-is outside 0..100, defringe is enabled with a radius in `0.25..1.15` (the
-host's 3x3/5x5/7x7 Gaussian kernels, whose border rules are not implemented),
-a running defringe meets a device without fp64 (its chromaticity mean is a
-double sum), or the defringe window is wider than the image. A radius below
-0.25 is the host's `gaussianBlur()` identity, so the whole defringe pass is a
-no-op and the node reports OK without touching a plane. Two prescaled inputs
-can leave the admitted range even though the GUI value is inside it: an export
+The block is atomic. The launcher refuses before the first upload when the
+image is below 8x8, either threshold is outside 0..100, defringe is enabled
+with a radius outside `0..25`, a running defringe meets a device without fp64
+(its chromaticity mean is a double sum), or the defringe window is wider than
+the image. The whole legal radius range is device, because `PF_correct_RT()`
+always calls `gaussianBlur()` with the default `GAUSS_STANDARD` type: below
+0.25 the blur is the identity, so the pass is a no-op and the node reports OK
+without touching a plane; from 0.25 to below 0.6 it is the 3x3 convolution
+(`rt_sharpen_fir3`, the same kernel as the USM blur); from 0.6 it is the
+separable-IIR pair (`rt_sharpen_iir_line` and `sharpen_iir_factors()`, with the
+sigma rounded to float exactly as `gaussHorizontalSse()` receives it). The
+5x5 and 7x7 kernels belong to `GAUSS_MULT` and `GAUSS_DIV`, which defringe
+never selects, so they are not part of the port. Two prescaled inputs can
+leave the admitted range even though the GUI value is inside it: an export
 scale of two or more raises the impulse threshold above 100, and a scale
 around 7.7 raises the defringe radius to 25.0, where the host's double IIR arm
-takes over. Both are refusals, so the pair runs on the host and the output is
+takes over. Both are refusals, so the block runs on the host and the output is
 unchanged; they are recorded here rather than silently approximated.
 
+In the CIE-CAM arm the Lab image carries only ML sharpen edges: impulse
+denoise, defringe and microcontrast run in the CIE-CAM pipeline on the
+`CieImage`, which is the separate `ciecam` node and stays on the host. The
+defringe hue table is therefore not built in that arm, nor with defringe
+disabled or below the Gaussian identity; the hue-curve flag in the ABI
+describes the table that was built, so a pass that cannot read it never makes
+the launcher upload one.
+
 Pass order matches the host: the impulse mark, the impulse correction, then
-the defringe blurs, chromaticity, mean and apply. Both Gaussian blurs reuse
-`rt_sharpen_iir_line` and `sharpen_iir_factors()` from `output.sharpen`, with
-the sigma rounded to float exactly as `gaussHorizontalSse()` receives it.
-Kernels, in one program that also carries the output-sharpening kernels:
+the defringe blurs, chromaticity, mean and apply. Kernels, in one program that
+also carries the output-sharpening kernels:
 
 - `rt_lab_sharpening_impulse_mark` reproduces `impulse_nr()`'s 5x5 high-pass
   sum and threshold, including the shortened window at both horizontal tails.
@@ -573,11 +583,11 @@ Kernels, in one program that also carries the output-sharpening kernels:
   apply kernel writes the resident planes while reading the originals.
 
 The hue table is a uniform `FlatCurve::getVal()` sample with linear
-interpolation, built by `LabSharpeningContext::build()`. `FlatCurve` stores a
-dense polyline, so the build measures the interpolation error against 8192
-independent points and refuses a curve it cannot follow within `1e-6`. The
-context also owns the host callback, so the same code runs the CPU block for a
-residual.
+interpolation, built by `LabSharpeningContext::build()` when the defringe pass
+can read it. `FlatCurve` stores a dense polyline, so the build measures the
+interpolation error against 8192 independent points and refuses a curve it
+cannot follow within `1e-6`. The context also owns the host callback, so the
+same code runs the CPU block for a residual.
 
 Device test, POCL CPU, `RT_REQUIRE_GPU=1`, `OMP_NUM_THREADS=1`:
 
@@ -588,13 +598,20 @@ Device test, POCL CPU, `RT_REQUIRE_GPU=1`, `OMP_NUM_THREADS=1`:
 | defringe fixture: high-contrast edge, 3-px magenta ring at the default curve's peak, neutral and saturated patches, a border fringe | 218 corrected by both paths, identical sets; `PAE L = 0`, `PAE a/b = 0.000977` LSB16 |
 | impulse+defringe pair on the defringe fixture | both passes in one device pass; `PAE L = 0`, `PAE a/b = 0.000977`; identical corrected sets |
 | defringe radius 0.2 | device pass, every plane bit-identical (the host no-op) |
-| one-refused pair (impulse threshold 50, defringe radius 1.0) through `stage::run()` | `impl=host`, `source=device-fallback`, bit-identical to the CPU path |
-| admission predicates | CIE-CAM arm, radius 0.5 and 1.0, impulse threshold -1/101, defringe threshold 101, a too-narrow image and a non-fp64 device are all refused; impulse alone needs no fp64; radius 0.2 is admitted |
+| defringe radii 0.25, 0.5 and 0.59 on the 3x3 arm, each non-vacuous | bit-identical to the host on all three planes (`PAE 0`), L untouched |
+| defringe radii 0.6, 1.0 and 1.15 on the separable-IIR arm | `PAE a/b <= 0.000732` LSB16, L untouched; each changes pixels |
+| radius 0.5 with edges, and radius 1.0 with edges and microcontrast | `PAE L <= 0.012695`, `a/b <= 0.004883` LSB16 |
+| CIE-CAM arm with a radius 0.5 or 1.0 and edges, also with the main pass enabled | edges bit-identical (`PAE 0`), the Lab node skips defringe and microcontrast; each changes pixels |
+| one-refused pair (impulse threshold 50, prescaled defringe threshold 101) through `stage::run()` | `impl=host`, `source=device-fallback`, bit-identical to the CPU path |
+| the defringe hue table | sampled only when the pass can read it: 65537 entries in the Lab arm with defringe enabled, 2 identity entries in the CIE-CAM arm, with defringe disabled and below 0.25 |
+| admission predicates | a profile with no enabled tool, an impulse or defringe threshold outside 0..100, a radius below 0 or at or above 25, a too-narrow image and a non-fp64 device are refused; radius 0.2, 0.25, 0.5, 0.6, 1.0 and 1.15 are admitted; impulse alone needs no fp64 |
 
 `devnotes/opencl/pp3/labsharpening.pp3` (impulse threshold 50, defringe radius
-2.0/threshold 13) is the export gate; `verify.sh --quick` asserts
+2.0/threshold 13) is the export gate, `labsharpening-fir3.pp3` (radius 0.5)
+covers the 3x3 arm and `labsharpening-iir.pp3` (radius 1.0) the newly admitted
+IIR range; `verify.sh --quick` asserts
 `"stage":"lab.sharpening".*"impl":"opencl"` and a 16-bit TIFF peak error at or
-below 1 LSB16.
+below 1 LSB16. All three record `impl=opencl` and are 1 LSB16.
 
 ### Lab sharpening shares the output sharpening node
 

@@ -636,16 +636,37 @@ peak absolute error is zero for the synthetic node tests:
   Each case changes pixels, so none is vacuous.
 - `labsharpening.pp3` (impulse 50, defringe radius 2.0 and threshold 13) is
   1 LSB16, `labsharpening-edges.pp3` (three-channel edges, two passes,
-  strength 50) is `AE=0` on the export corpus, and `labsharpening-micro.pp3`
-  (5x5 matrix, amount 20, contrast 20, uniformity 5) is 1 LSB16; all record
-  `impl=opencl`. A one-refused pair (impulse on, defringe radius 1.0) is
-  `impl=host`, byte-identical to the CPU path. A defringe radius below 1.15, a
+  strength 50) is `AE=0` on the export corpus, `labsharpening-micro.pp3`
+  (5x5 matrix, amount 20, contrast 20, uniformity 5) is 1 LSB16, and the two
+  radius gates `labsharpening-fir3.pp3` (radius 0.5) and
+  `labsharpening-iir.pp3` (radius 1.0) are 1 LSB16; all record
+  `impl=opencl`. A one-refused pair (impulse on, a prescaled defringe
+  threshold 101) is `impl=host`, byte-identical to the CPU path.
+- The defringe radius covers the whole legal range on the device because
+  `PF_correct_RT()` requests the default `GAUSS_STANDARD` blur: below 0.25 it
+  is the identity (a host no-op), from 0.25 to below 0.6 the 3x3 convolution,
+  from 0.6 the separable-IIR pair, and the 5x5/7x7 kernels are only selected
+  for `GAUSS_MULT`/`GAUSS_DIV`. The 3x3 arm reuses `rt_sharpen_fir3` and is
+  bit-identical to the host (`PAE 0`) at radii 0.25, 0.5 and 0.59; the IIR arm
+  is within 0.000732 LSB16 at 0.6, 1.0 and 1.15. Combined with edges and
+  microcontrast the worst radius case is 0.012695 LSB16 on L and 0.004883 on
+  a/b, and every case changes pixels. Eleven radius device cases cover the
+  four arms, both channel combinations and the main pass beside the block.
+  A radius outside 0..25, a
   threshold outside 0..100, an edge pass count outside 0..4, an edge amount
   outside 0..100, a microcontrast amount outside 0..100, a contrast outside
   0..200, a uniformity outside 0..10, an image narrower than its defringe
-  window and a non-fp64 device are residuals; a defringe radius below 0.25,
+  window and a non-fp64 device are residuals. A defringe radius below 0.25,
   zero edge passes, an edge amount of 0, microcontrast amount below 1 and
   contrast exactly 100 are the host no-ops and leave every plane untouched.
+- The CIE-CAM arm is device for the only pass it owns on the Lab image: ML
+  sharpen edges at radii 0.5 and 1.0, with and without the main sharpen pass,
+  is bit-identical (`AE=0`) and non-vacuous. The defringe hue table is not
+  built there, with defringe disabled, or below the Gaussian identity, so a
+  curve the device table cannot follow cannot refuse a pass that never reads
+  it; impulse denoise, defringe and microcontrast run in the CIE-CAM pipeline
+  on the `CieImage`, which is the separate `ciecam` node and stays a host
+  residual there.
 - `tools/opencl/verify.sh --stage-device`, which `--quick` also runs, asserts
   each record and its parity in one step:
 

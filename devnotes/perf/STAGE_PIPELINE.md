@@ -442,20 +442,23 @@ them runs the whole block on the host.
 `lab.sharpening` is partial. Its impulse denoise, defringe, ML sharpen edges
 and ML microcontrast run as one atomic device block in the host's order
 (`impulsedenoise`, `defringe`, `MLsharpen`, `MLmicrocontrast`), with an image
-of at least 8x8, impulse threshold 0..100, defringe threshold 0..100 and a
-defringe radius either below 0.25 (the host's Gaussian identity, a no-op) or
-at least 1.15 (`gauss.cc`'s separable-IIR range), on a device with fp64 for the
-defringe reduction, and an image large enough for the defringe window. Edge
+of at least 8x8, impulse threshold 0..100, defringe threshold 0..100, the
+whole defringe radius range (`0..25`: below 0.25 the host's Gaussian identity
+is a no-op, from 0.25 to below 0.6 the 3x3 convolution and from 0.6 the
+separable-IIR pair), on a device with fp64 for the defringe reduction, and an
+image large enough for the defringe window. Edge
 passes are 0..4, edge amount 0..100, microcontrast amount 0..100, contrast
 0..200 and uniformity 0..10; zero passes, a zero edge amount, a microcontrast
 amount below 1 and contrast 100 reproduce the host's own no-ops. In the
 CIE-CAM arm the Lab node keeps only ML sharpen edges: impulse denoise,
 defringe and microcontrast belong to the CIE-CAM pipeline on the CieImage and
-run there. The block is atomic: when one enabled tool is refused, the whole
+run there, so the node does not build the defringe hue table for them. The
+block is atomic: when one enabled tool is refused, the whole
 block runs on the host, so a Lab image is never half device and half host.
-The host builds the defringe hue table from the profile's own `FlatCurve` and
-refuses a curve it cannot follow. The main sharpen pass stays the shared
-`output.sharpen` node. All four tools are off by default.
+The host builds the defringe hue table from the profile's own `FlatCurve`
+when the pass can read it, and refuses a curve it cannot follow. The main
+sharpen pass stays the shared `output.sharpen` node. All four tools are off
+by default.
 
 | Id | Domain (export/preview/crop/thumbnail) | Consumer | Reuse | Role | Device |
 |----|----------------------------------------|----------|-------|------|--------|
@@ -1943,11 +1946,14 @@ mapping and local adjustments around them stay on the host. `lab.sharpening`
 runs impulse denoise, defringe, ML sharpen edges and ML microcontrast on the
 device and keeps the main sharpen pass in the shared `output.sharpen` node.
 The block is atomic: an image below 8x8, a threshold outside 0..100, a
-defringe radius in 0.25..1.15 (the host's 3x3/5x5/7x7 Gaussian arm), a device
-without fp64, a defringe window wider than the image, an edge pass count
-outside 0..4, an edge amount outside 0..100, a microcontrast amount outside
-0..100, a contrast outside 0..200 and a uniformity outside 0..10 all run the
-original host block. In the CIE-CAM arm the node keeps only ML sharpen edges;
+defringe radius outside 0..25, a device without fp64, a defringe window wider
+than the image, an edge pass count outside 0..4, an edge amount outside 0..100,
+a microcontrast amount outside 0..100, a contrast outside 0..200 and a
+uniformity outside 0..10 all run the original host block. The whole legal
+radius range is device: the 3x3 convolution below 0.6 and the separable-IIR
+pair from 0.6, the split `gaussianBlur()` makes for the default
+`GAUSS_STANDARD` type the defringe pass requests. In the CIE-CAM arm the node
+keeps only ML sharpen edges;
 the other three run in the CIE-CAM pipeline on the CieImage. Two prescaled
 inputs leave the admitted range while the GUI value is inside it: an export
 scale of two or more pushes the impulse threshold above 100, and a scale

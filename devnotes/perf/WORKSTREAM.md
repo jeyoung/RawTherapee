@@ -894,11 +894,8 @@ Done and pushed:
 Next unit: `lab.sharpening` impulse denoise + defringe landed 2026-10-31 as a
 new `lab.sharpening` node with a three-plane L/A/B ABI (`a0040d028`).
 Impulse is bit-exact; defringe corrected 218/218 with a/b within 0.000977
-LSB16; the pair refuses the CIE-CAM arm, images below 8x8, thresholds outside
+LSB16; the pair refused the CIE-CAM arm, images below 8x8, thresholds outside
 0..100, a radius in 0.25..1.15, a device without fp64 and an oversized window.
-Residuals: that radius range, the CIE-CAM arm for impulse/defringe and
-microcontrast, and prescaled inputs that leave the admitted range (threshold >
-100 at scale >= 2, radius >= 25 at scale ~7.7).
 ML sharpen edges and ML microcontrast landed 2026-11-03 in the same node and
 the same atomic block (`b864f6168`). Edges is bit-exact (`AE=0`) for 1..4 passes, the L-only
 and L/a/b arms and the CIE-CAM arm; microcontrast is within 0.036 LSB16 because
@@ -910,6 +907,24 @@ and the combined impulse+defringe pass, all non-vacuous.
 outside 0..100, microcontrast amount outside 0..100, contrast outside 0..200
 and uniformity outside 0..10. The CIE-CAM arm keeps ML sharpen edges on the Lab
 image and leaves impulse, defringe and microcontrast to the CIE-CAM pipeline.
+
+The last two `lab.sharpening` residuals closed 2026-11-03 in the same node:
+the whole legal defringe radius range and the CIE-CAM arm. `PF_correct_RT()`
+uses the default `GAUSS_STANDARD` blur, so the host split is 3x3 below 0.6 and
+the separable IIR from 0.6; the device reuses `rt_sharpen_fir3` for the 3x3
+arm, which is bit-identical (`PAE 0`) at radii 0.25, 0.5 and 0.59, and the IIR
+arm is within 0.000732 LSB16 at 0.6, 1.0 and 1.15. Eleven radius cases include
+the edges and microcontrast combinations (worst 0.012695 LSB16), and each is
+non-vacuous. The CIE-CAM arm is device for the only pass it owns on the Lab
+image: edges at radii 0.5 and 1.0, with the main pass beside it, is `AE=0` and
+non-vacuous; the defringe hue table is not built there, nor with defringe off
+or below 0.25, so a curve the device table cannot follow never refuses a pass
+it cannot reach. `labsharpening-fir3.pp3` (radius 0.5) and
+`labsharpening-iir.pp3` (radius 1.0) are 1 LSB16 export gates recording
+`impl=opencl`. Remaining: the CIE-CAM pipeline's own `defringecam`,
+`impulsedenoisecam` and `MLmicrocontrastcam` on the `CieImage`, which belong to
+the CPU-only `ciecam` node, and prescaled inputs that leave the admitted range
+(threshold > 100 at scale >= 2, radius >= 25 at scale ~7.7).
 
 After that, in order: `lab.tools` residuals. The black-and-white cheap branch
 landed at `43d6f88bd`: `chromiLuminanceCurve()`'s early return zeroes a/b when
