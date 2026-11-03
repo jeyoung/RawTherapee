@@ -9382,7 +9382,7 @@ void test_lab_wavelet_final(bool available)
      * admits must run the host block byte for byte.
      */
     const char* residual_labels[] = {
-        "softrad", "BAmethod sli", "tmr",
+        "softrad", "BAmethod cur no curve", "tmr",
         "sigmafin low", "sigmafin high", "avoid", "median", "expbl",
         "expresid", "expnoise",
         "skin protection"};
@@ -9392,8 +9392,12 @@ void test_lab_wavelet_final(bool available)
 
         if (std::strcmp(label, "softrad") == 0) {
             params.wavelet.softrad = 0.2;
-        } else if (std::strcmp(label, "BAmethod sli") == 0) {
-            params.wavelet.BAmethod = "sli";
+        } else if (std::strcmp(label, "BAmethod cur no curve") == 0) {
+            /* "cur" reads a non-identity opacity curve; with none the block
+             * skips the arm, so the node keeps it on the host. */
+            params.wavelet.BAmethod = "cur";
+            params.wavelet.opacityCurveW = {
+                static_cast<double>(FCT_Linear)};
         } else if (std::strcmp(label, "tmr") == 0) {
             params.wavelet.tmr = true;
         } else if (std::strcmp(label, "sigmafin low") == 0) {
@@ -9466,8 +9470,350 @@ void test_lab_wavelet_final(bool available)
 }
 
 
-/* --------------------------------------------------- lab.wavelet toning */
+/* ------------------------------------------------- lab.wavelet balance chroma */
 
+/*
+ * The balance-chroma arm: ContAllL()'s and ContAllAB()'s coefficient multiply.
+ * The L arm runs inside the final panel's coefficient pass (`expfinal`) and
+ * rebuilds the sigmadir beta ramp; the a/b arm runs with `TMr` and multiplies
+ * by the raw kba. Both read the luminance-dependent factor ("sli") or the
+ * opacity curve ("cur"), and both repeat the multiply by the per-level
+ * iteration count.
+ */
+void wavelet_ba_params(rtengine::procparams::ProcParams& params, int levels)
+{
+    params.dirpyrequalizer.enabled = false;
+    params.wavelet.enabled = true;
+    params.wavelet.expcontrast = false;
+    params.wavelet.expchroma = false;
+    params.wavelet.expedge = false;
+    params.wavelet.expbl = false;
+    params.wavelet.expresid = false;
+    params.wavelet.expfinal = false;
+    params.wavelet.exptoning = false;
+    params.wavelet.expnoise = false;
+    params.wavelet.expclari = false;
+    params.wavelet.CLmethod = "all";
+    params.wavelet.Tilesmethod = "full";
+    params.wavelet.HSmethod = "without";
+    params.wavelet.daubcoeffmethod = "6_";
+    params.wavelet.thres = levels;
+    params.wavelet.threshold = 4;
+    params.wavelet.threshold2 = 5;
+    params.wavelet.sigma = 1.0;
+    params.wavelet.offset = 1.0;
+    params.wavelet.lowthr = 40.0;
+    params.wavelet.strength = 100;
+    params.wavelet.softrad = 0.0;
+    params.wavelet.softradend = 0.0;
+    params.wavelet.skinprotect = 0.0;
+    params.wavelet.avoid = false;
+    params.wavelet.median = false;
+    params.wavelet.medianlev = false;
+    params.wavelet.linkedg = false;
+    params.wavelet.lipst = false;
+    params.wavelet.NPmethod = "none";
+    params.wavelet.EDmethod = "CU";
+    params.wavelet.Medgreinf = "less";
+    params.wavelet.sup = 0;
+    params.wavelet.thrend = 0.0;
+    params.wavelet.contrast = 0;
+    params.wavelet.edgval = 0;
+    params.wavelet.edgrad = 15;
+    params.wavelet.edgthresh = 10;
+    params.wavelet.edgeffect = 1.0;
+    params.wavelet.sigmafin = 1.0;
+    params.wavelet.sigmaton = 1.0;
+    params.wavelet.protab = 0.0;
+    params.wavelet.BAmethod = "none";
+    params.wavelet.tmr = false;
+    params.wavelet.balance = 0;
+    params.wavelet.iter = 0;
+    params.wavelet.sigmadir = 1.0;
+    params.wavelet.wavclCurve = {static_cast<double>(DCT_Linear)};
+    params.wavelet.opacityCurveWL = {
+        static_cast<double>(FCT_MinMaxCPoints), 0.0, 0.50, 0.35, 0.35,
+        1.0, 0.50, 0.35, 0.35};
+    params.wavelet.opacityCurveW = {
+        static_cast<double>(FCT_Linear)};
+    for (int level = 0; level < 9; ++level) {
+        params.wavelet.c[level] = 0;
+    }
+}
+
+void test_lab_wavelet_ba(bool available)
+{
+    using namespace rtengine::stage;
+
+    static MyMutex ba_lcms_mutex;
+    if (rtengine::lcmsMutex == nullptr) {
+        rtengine::lcmsMutex = &ba_lcms_mutex;
+    }
+    static rtengine::Settings ba_settings{};
+    rtengine::settings = &ba_settings;
+    rtengine::Color::init();
+
+    const std::string profile_path =
+        std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp") +
+        "/stage-residency-lab-wavelet-ba.jsonl";
+
+    if (!available) {
+        skip("lab.wavelet balance chroma: no OpenCL device");
+        return;
+    }
+    check(node_has_device_implementation("lab.wavelet"),
+          "the lab.wavelet balance-chroma arm has a device implementation");
+
+    struct BaCase {
+        const char* label;
+        int width;
+        int height;
+        int levels;
+        const char* method;
+        bool expfinal;
+        bool tmr;
+        bool final_curve;
+        bool ba_curve;
+        bool contrast;
+        bool chroma;
+        bool noise;
+        int contrast_values[9];
+        int balance;
+        int iter;
+        double sigmadir;
+    };
+
+    const BaCase cases[] = {
+        {"ba sli final", 238, 64, 6, "sli", true, false, true, false, false,
+         false, false, {0, 0, 0, 0, 0, 0, 0, 0, 0}, 40, 0, 1.0},
+        {"ba sli final no curve", 238, 64, 6, "sli", true, false, false,
+         false, false, false, false, {0, 0, 0, 0, 0, 0, 0, 0, 0}, -20, 2,
+         1.4},
+        {"ba sli final tmr", 238, 64, 6, "sli", true, true, true, false, false,
+         false, false, {0, 0, 0, 0, 0, 0, 0, 0, 0}, 100, -3, 0.4},
+        {"ba cur final", 238, 64, 6, "cur", true, false, true, true, false,
+         false, false, {0, 0, 0, 0, 0, 0, 0, 0, 0}, 20, 1, 1.0},
+        {"ba cur final tmr", 238, 64, 6, "cur", true, true, true, true, false,
+         false, false, {0, 0, 0, 0, 0, 0, 0, 0, 0}, -30, 3, 2.5},
+        {"ba sli tmr chroma", 238, 64, 6, "sli", false, true, false, false,
+         false, true, false, {40, 30, 20, 10, 5, 2, 0, 0, 0}, 60, -1, 1.0},
+        {"ba cur tmr contrast", 238, 64, 6, "cur", false, true, false, true,
+         true, false, false, {30, 22, 14, 8, 4, 2, 0, 0, 0}, 30, 2, 0.8},
+        {"ba sli tmr denoise", 238, 160, 6, "sli", false, true, false, false,
+         false, false, true, {0, 0, 0, 0, 0, 0, 0, 0, 0}, 50, 0, 0.7},
+        {"ba sli final tmr contrast chroma", 238, 64, 6, "sli", true, true,
+         true, false, true, true, false, {30, 22, 14, 8, 4, 2, 0, 0, 0}, 80,
+         -2, 1.8},
+        {"ba cur final tmr denoise", 238, 160, 6, "cur", true, true, true,
+         true, false, false, true, {0, 0, 0, 0, 0, 0, 0, 0, 0}, 10, 3, 0.5},
+    };
+
+    unsigned seed = 0x7a31c9e5u;
+    for (const BaCase& item : cases) {
+        rtengine::procparams::ProcParams params;
+        wavelet_ba_params(params, item.levels);
+        params.wavelet.BAmethod = item.method;
+        params.wavelet.expfinal = item.expfinal;
+        params.wavelet.tmr = item.tmr;
+        params.wavelet.balance = item.balance;
+        params.wavelet.iter = item.iter;
+        params.wavelet.sigmadir = item.sigmadir;
+        if (item.final_curve) {
+            params.wavelet.wavclCurve = final_diagonal_curve();
+            params.wavelet.opacityCurveWL = final_opacity_curve();
+        }
+        if (item.ba_curve) {
+            params.wavelet.opacityCurveW = final_opacity_curve();
+        }
+        if (item.contrast) {
+            params.wavelet.expcontrast = true;
+        }
+        if (item.contrast || item.chroma) {
+            /* ContAllAB()'s chroma arm reads cp.mul[] even with the contrast
+             * panel off, so a chroma-only profile still needs a non-zero
+             * multiplier to do work. */
+            for (int level = 0; level < 9; ++level) {
+                params.wavelet.c[level] = item.contrast_values[level];
+            }
+        }
+        if (item.chroma) {
+            params.wavelet.expchroma = true;
+            params.wavelet.CHmethod = "link";
+            params.wavelet.chro = 60;
+        }
+        if (item.noise) {
+            params.wavelet.expnoise = true;
+            const double noise[5] = {40.0, 30.0, 20.0, 10.0, 5.0};
+            params.wavelet.level0noise.setValues(0.0, noise[0]);
+            params.wavelet.level1noise.setValues(0.0, noise[1]);
+            params.wavelet.level2noise.setValues(0.0, noise[2]);
+            params.wavelet.level3noise.setValues(0.0, noise[3]);
+            params.wavelet.leveldenoise.setValues(0.0, noise[4]);
+        }
+
+        check(labWaveletSupported(params, item.width, item.height),
+              (std::string("lab.wavelet ba ") + item.label +
+               " is the supported set").c_str());
+
+        LabImage source(item.width, item.height);
+        fill_lab_tools(source, seed++);
+
+        rtengine::ImProcFunctions cpu_ipf(&params, false);
+        LabImage cpu(item.width, item.height);
+        cpu.CopyFrom(&source);
+        labWaveletHostBlock(cpu_ipf, params, cpu);
+
+        rtengine::ImProcFunctions device_ipf(&params, false);
+        LabImage device(item.width, item.height);
+        device.CopyFrom(&source);
+        const LabWaveletRun result =
+            run_lab_wavelet_node(device, params, device_ipf, profile_path);
+        const std::string profile = read_file(profile_path);
+
+        check(result.supported,
+              (std::string("lab.wavelet ba ") + item.label +
+               " resolves to the supported set").c_str());
+        check(result.deviceReady,
+              (std::string("lab.wavelet ba ") + item.label +
+               " builds its host setup").c_str());
+        check(result.status == RT_STAGE_OK,
+              (std::string("lab.wavelet ba ") + item.label +
+               " completes through run()").c_str());
+        check(profile.find("\"stage\":\"lab.wavelet\"") != std::string::npos,
+              (std::string("lab.wavelet ba ") + item.label +
+               " records the node").c_str());
+        check(profile.find("\"impl\":\"opencl\"") != std::string::npos,
+              (std::string("lab.wavelet ba ") + item.label +
+               " records a device execution").c_str());
+
+        const Distribution d = distribution(view(device), view(cpu));
+        double plane_pae[3] = {0.0, 0.0, 0.0};
+        for (int y = 0; y < item.height; ++y) {
+            for (int x = 0; x < item.width; ++x) {
+                plane_pae[0] = std::max(
+                    plane_pae[0], static_cast<double>(std::fabs(
+                                      device.L[y][x] - cpu.L[y][x])));
+                plane_pae[1] = std::max(
+                    plane_pae[1], static_cast<double>(std::fabs(
+                                      device.a[y][x] - cpu.a[y][x])));
+                plane_pae[2] = std::max(
+                    plane_pae[2], static_cast<double>(std::fabs(
+                                      device.b[y][x] - cpu.b[y][x])));
+            }
+        }
+        std::printf("stage-residency: lab.wavelet ba %s %dx%d L%d: PAE "
+                    "%.6f LSB16 (L %.6f, a %.6f, b %.6f); exact %zu, "
+                    "<=0.25 %zu, <=0.5 %zu, <=1 %zu, >1 %zu of %zu\n",
+                    item.label, item.width, item.height, item.levels,
+                    d.max_abs, plane_pae[0], plane_pae[1], plane_pae[2],
+                    d.exact, d.quarter, d.half, d.one, d.over,
+                    d.samples);
+        check(d.finite,
+              (std::string("lab.wavelet ba ") + item.label +
+               " stays finite").c_str());
+        check(d.over == 0,
+              (std::string("lab.wavelet ba ") + item.label +
+               " is within one LSB16").c_str());
+
+        /* Non-vacuity against the method-off host result. */
+        rtengine::procparams::ProcParams off = params;
+        off.wavelet.BAmethod = "none";
+        off.wavelet.tmr = false;
+        rtengine::ImProcFunctions off_ipf(&off, false);
+        LabImage off_image(item.width, item.height);
+        off_image.CopyFrom(&source);
+        labWaveletHostBlock(off_ipf, off, off_image);
+        const Diff active = compare(view(cpu), view(off_image));
+        std::printf("stage-residency: lab.wavelet ba %s changes %zu of "
+                    "%zu samples against BAmethod none, PAE %.6f LSB16\n",
+                    item.label, active.differing, active.samples,
+                    active.max_abs);
+        check(active.differing > 0,
+              (std::string("lab.wavelet ba ") + item.label +
+               " is non-vacuous").c_str());
+    }
+
+    /*
+     * Refusals: an unknown method, "cur" without an opacity curve, the
+     * sliders outside their ranges, a method that never reaches either gate,
+     * TMr without a method and the L-only trim the node cannot represent.
+     */
+    struct BaResidual {
+        const char* label;
+        const char* method;
+        bool expfinal;
+        bool tmr;
+        bool ba_curve;
+        int balance;
+        int iter;
+        double sigmadir;
+    };
+    const BaResidual residuals[] = {
+        {"unknown method", "mystery", true, false, true, 0, 0, 1.0},
+        {"cur without curve", "cur", true, false, false, 0, 0, 1.0},
+        {"balance high", "sli", true, false, false, 101, 0, 1.0},
+        {"balance low", "sli", true, false, false, -31, 0, 1.0},
+        {"iter high", "sli", true, false, false, 0, 4, 1.0},
+        {"iter low", "sli", true, false, false, 0, -4, 1.0},
+        {"sigmadir high", "sli", true, false, false, 0, 0, 3.0},
+        {"sigmadir low", "sli", true, false, false, 0, 0, 0.0},
+        {"no active gate", "sli", false, false, false, 0, 0, 1.0},
+        {"tmr without method", "none", true, true, false, 0, 0, 1.0},
+        {"tmr only dead trim", "sli", false, true, false, 0, 0, 1.0},
+    };
+    for (const BaResidual& item : residuals) {
+        rtengine::procparams::ProcParams params;
+        wavelet_ba_params(params, 6);
+        params.wavelet.BAmethod = item.method;
+        params.wavelet.expfinal = item.expfinal;
+        params.wavelet.tmr = item.tmr;
+        params.wavelet.balance = item.balance;
+        params.wavelet.iter = item.iter;
+        params.wavelet.sigmadir = item.sigmadir;
+        if (item.ba_curve) {
+            params.wavelet.opacityCurveW = final_opacity_curve();
+        }
+
+        check(!labWaveletSupported(params, 238, 64),
+              (std::string("lab.wavelet ba residual ") + item.label +
+               " is a residual").c_str());
+
+        LabImage source(238, 64);
+        fill_lab_tools(source, 0x1b2c3d4eu);
+
+        rtengine::ImProcFunctions cpu_ipf(&params, false);
+        LabImage cpu(238, 64);
+        cpu.CopyFrom(&source);
+        labWaveletHostBlock(cpu_ipf, params, cpu);
+
+        rtengine::ImProcFunctions device_ipf(&params, false);
+        LabImage device(238, 64);
+        device.CopyFrom(&source);
+        const LabWaveletRun result =
+            run_lab_wavelet_node(device, params, device_ipf, profile_path);
+        const std::string profile = read_file(profile_path);
+
+        check(!result.supported,
+              (std::string("lab.wavelet ba residual ") + item.label +
+               " is refused as a device configuration").c_str());
+        check(profile.find("\"impl\":\"host\"") != std::string::npos,
+              (std::string("lab.wavelet ba residual ") + item.label +
+               " records a host execution").c_str());
+
+        const Diff diff = compare(view(device), view(cpu));
+        std::printf("stage-residency: lab.wavelet ba residual %s: host, "
+                    "PAE %.6f LSB16, %zu of %zu samples differ\n",
+                    item.label, diff.max_abs, diff.differing, diff.samples);
+        check(diff.differing == 0 && diff.max_abs == 0.0,
+              (std::string("lab.wavelet ba residual ") + item.label +
+               " matches the CPU block").c_str());
+    }
+
+    std::remove(profile_path.c_str());
+}
+
+
+/* --------------------------------------------------- lab.wavelet toning */
 /*
  * The toning panel's zero-protection arm: the opacity-curve multiplier on
  * the a/b bands. The protection range and the nonzero-protab reductions are
@@ -15467,6 +15813,7 @@ int main()
     test_lab_wavelet_chroma(available);
     test_lab_wavelet_edge(available);
     test_lab_wavelet_final(available);
+    test_lab_wavelet_ba(available);
     test_lab_wavelet_toning(available);
     test_lab_wavelet_denoise(available);
     test_lab_wavelet_gpu(available);
