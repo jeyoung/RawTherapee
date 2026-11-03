@@ -983,19 +983,23 @@ bool labWaveletWaveletSupported(const procparams::ProcParams& params,
         return false;
     }
     /*
-     * The edge panel runs only its plain arm: no median level detection
-     * (calckoe()'s Lipschitz coefficients), no np-method neighbour smoothing
-     * and no lipst Lipschitz influence. `EDmethod` is displayed by the GUI
-     * but the engine hard-codes EDmet == 2, so the threshold adjuster
-     * (edgcont) is dead code; the SL selection is refused rather than
-     * silently ignoring its visible sliders.
+     * The edge panel runs the plain arm and, with Medianlev, the Lipschitz
+     * control: calckoe() per level and direction, the neighbour smoothing
+     * that NPMethod selects with Lipst, and the direction-combination
+     * conversion in the block's order. `EDmethod` is displayed by the GUI but
+     * the engine hard-codes EDmet == 2 (ipwavelet.cc:419), so its "SL"
+     * threshold-adjuster branch is unreachable and both selections produce
+     * the same EDmet == 2 block; unknown selections stay refused.
      */
     if (edge_active) {
         if (settings == nullptr) {
             return false;
         }
-        if (wavelet.medianlev || wavelet.NPmethod != "none" ||
-            wavelet.lipst || wavelet.EDmethod != "CU") {
+        if (wavelet.NPmethod != "none" && wavelet.NPmethod != "low" &&
+            wavelet.NPmethod != "high") {
+            return false;
+        }
+        if (wavelet.EDmethod != "CU" && wavelet.EDmethod != "SL") {
             return false;
         }
         if (wavelet.edgval < LAB_WAVELET_MIN_WAVELET_EDGVAL ||
@@ -1013,6 +1017,29 @@ bool labWaveletWaveletSupported(const procparams::ProcParams& params,
          * block's `reinforce` uninitialised, so refuse it. */
         if (wavelet.Medgreinf != "more" && wavelet.Medgreinf != "none" &&
             wavelet.Medgreinf != "less") {
+            return false;
+        }
+        /* The Lipschitz control's sliders, read only by the Medianlev arm. */
+        if (wavelet.medianlev &&
+            (wavelet.edgedetect < LAB_WAVELET_MIN_WAVELET_EDGEDETECT ||
+             wavelet.edgedetect > LAB_WAVELET_MAX_WAVELET_EDGEDETECT ||
+             wavelet.edgedetectthr <
+                 LAB_WAVELET_MIN_WAVELET_EDGEDETECTTHR ||
+             wavelet.edgedetectthr >
+                 LAB_WAVELET_MAX_WAVELET_EDGEDETECTTHR ||
+             wavelet.edgedetectthr2 <
+                 LAB_WAVELET_MIN_WAVELET_EDGEDETECTTHR2 ||
+             wavelet.edgedetectthr2 >
+                 LAB_WAVELET_MAX_WAVELET_EDGEDETECTTHR2)) {
+            return false;
+        }
+        /* Lipst selects the influence sliders, so their range matters only
+         * when the control reads them. */
+        if (wavelet.medianlev && wavelet.lipst &&
+            (wavelet.edgesensi < LAB_WAVELET_MIN_WAVELET_EDGESENSI ||
+             wavelet.edgesensi > LAB_WAVELET_MAX_WAVELET_EDGESENSI ||
+             wavelet.edgeampli < LAB_WAVELET_MIN_WAVELET_EDGEAMPLI ||
+             wavelet.edgeampli > LAB_WAVELET_MAX_WAVELET_EDGEAMPLI)) {
             return false;
         }
     }
@@ -1652,17 +1679,19 @@ int LabWaveletContext::build(RtLabWaveletResult& out)
                       params_.wavelet.expchroma &&
                       params_.wavelet.CHmethod == "link";
     /*
-     * The plain edge arm. `edgval == 0` leaves the host's edge block
-     * untouched, so the device pass is only armed when a strength is set.
-     * The sub-mode guards repeat the admission rules so a forced build can
-     * never run a partial edge pass.
+     * The edge arm: the plain sliders plus, with Medianlev, the Lipschitz
+     * control. `edgval == 0` leaves the host's edge block untouched, so the
+     * device pass is only armed when a strength is set. The sub-mode guards
+     * repeat the admission rules so a forced build can never run a partial
+     * edge pass.
      */
     wavelet_edge_ = params_.wavelet.enabled && params_.wavelet.expedge &&
                     params_.wavelet.edgval > 0 &&
-                    !params_.wavelet.medianlev &&
-                    params_.wavelet.NPmethod == "none" &&
-                    !params_.wavelet.lipst &&
-                    params_.wavelet.EDmethod == "CU" &&
+                    (params_.wavelet.NPmethod == "none" ||
+                     params_.wavelet.NPmethod == "low" ||
+                     params_.wavelet.NPmethod == "high") &&
+                    (params_.wavelet.EDmethod == "CU" ||
+                     params_.wavelet.EDmethod == "SL") &&
                     (params_.wavelet.Medgreinf == "more" ||
                      params_.wavelet.Medgreinf == "none" ||
                      params_.wavelet.Medgreinf == "less") &&
@@ -2243,6 +2272,37 @@ int LabWaveletContext::build(RtLabWaveletResult& out)
                     RT_LAB_WAVELET_MEA_ENTRIES;
             float* edge_tail = table + edge_offset;
             edge_tail[0] = static_cast<float>(settings->limrad);
+
+            /*
+             * The Lipschitz control's scalars, derived with the block's own
+             * float arithmetic (ipwavelet.cc:284, 2912). `detectedge` gates
+             * calckoe(); the smoothing mode is lip3 && lipp, with `neigh`
+             * selecting the 28/40 or 38/50 tap pair. EDmethod is not carried:
+             * the engine forces EDmet == 2 for both selections.
+             */
+            const bool detectedge = wavelet.medianlev;
+            float edgsens = 60.f;
+            float edgampl = 10.f;
+            if (wavelet.lipst) {
+                edgsens = static_cast<float>(wavelet.edgesensi);
+                edgampl = static_cast<float>(wavelet.edgeampli);
+            }
+            table[RT_LW_PARAM_EDG_DETECT] = detectedge ? 1.f : 0.f;
+            table[RT_LW_PARAM_EDG_GRADW] =
+                static_cast<float>(wavelet.edgedetect);
+            table[RT_LW_PARAM_EDG_TLOWW] =
+                static_cast<float>(wavelet.edgedetectthr);
+            table[RT_LW_PARAM_EDG_AAMP] =
+                1.f + static_cast<float>(wavelet.edgedetectthr2) / 100.f;
+            table[RT_LW_PARAM_EDG_LIPINFL] = 0.005f * edgsens + 0.4f;
+            table[RT_LW_PARAM_EDG_LIPAMPL] = 1.f + edgampl / 50.f;
+            int smoothing = 0;
+            if (detectedge && wavelet.lipst &&
+                wavelet.NPmethod != "none") {
+                smoothing = wavelet.NPmethod == "high" ? 2 : 1;
+            }
+            table[RT_LW_PARAM_EDG_SMOOTH] =
+                static_cast<float>(smoothing);
 
             /*
              * The edge curve is the block's own WavCurve over ccwcurve; the

@@ -410,6 +410,13 @@ __kernel void rt_lab_wavelet_equalize(
 #define RT_LW_W_EDG_CURVE 45
 #define RT_LW_W_EDG_HIG 46
 #define RT_LW_W_EDG_LOW 47
+#define RT_LW_W_EDG_DETECT 89
+#define RT_LW_W_EDG_GRADW 90
+#define RT_LW_W_EDG_TLOWW 91
+#define RT_LW_W_EDG_AAMP 92
+#define RT_LW_W_EDG_LIPINFL 93
+#define RT_LW_W_EDG_LIPAMPL 94
+#define RT_LW_W_EDG_SMOOTH 95
 #define RT_LW_W_FILTER_ANAL_LO 48
 #define RT_LW_W_FILTER_ANAL_HI 56
 #define RT_LW_W_FILTER_SYNTH_LO 64
@@ -1300,12 +1307,352 @@ inline float rt_lw_pow(float a, float b)
     return rt_lw_xexpf(b * rt_lw_xlogf(a));
 }
 
+/*
+ * calckoe() (ipwavelet.cc:3362) and the Lipschitz control
+ * (ipwavelet.cc:2915-3035). The host computes the control only when
+ * `cp.detectedge && cp.val > 0`; the launcher runs these kernels only for the
+ * Medianlev arm.
+ *
+ * The raw pass reproduces calckoe()'s convolution, the `thr` clamp and the
+ * min(thr2, |tmC / temp|) ratio. The running maximum that calckoe() folds into
+ * each coefficient is a raster-order prefix maximum, so the resolve pass
+ * replays it row by row instead of approximating it with the global maximum.
+ * The control pass then rebuilds the block's direction-combination `interm`
+ * and, when NPMethod and Lipst select the neighbour smoothing, replays the
+ * in-place raster scan the host performs.
+ */
+inline float rt_lw_koe_tmc3(__global const float* band, int pitch, int i,
+                            int j, float c0, float c1, float c2)
+{
+    return c0 * band[i * pitch + j] +
+           c1 * ((band[(i - 1) * pitch + j] + band[(i + 1) * pitch + j]) +
+                 (band[i * pitch + j + 1] + band[i * pitch + j - 1])) +
+           c2 * ((band[(i - 1) * pitch + j - 1] +
+                  band[(i - 1) * pitch + j + 1]) +
+                 (band[(i + 1) * pitch + j - 1] +
+                  band[(i + 1) * pitch + j + 1]));
+}
+
+inline float rt_lw_koe_tmc5(__global const float* band, int pitch, int i,
+                            int j, float c0, float c1, float c2, float c3,
+                            float c4, float c5)
+{
+    return c0 * band[i * pitch + j] +
+           c1 * ((band[(i - 1) * pitch + j] + band[(i + 1) * pitch + j]) +
+                 (band[i * pitch + j + 1] + band[i * pitch + j - 1])) +
+           c2 * ((band[(i - 1) * pitch + j - 1] +
+                  band[(i - 1) * pitch + j + 1]) +
+                 (band[(i + 1) * pitch + j - 1] +
+                  band[(i + 1) * pitch + j + 1])) +
+           c3 * ((band[(i - 2) * pitch + j] + band[(i + 2) * pitch + j]) +
+                 (band[i * pitch + j - 2] + band[i * pitch + j + 2])) +
+           c4 * ((band[(i - 2) * pitch + j - 1] +
+                  band[(i - 2) * pitch + j + 1]) +
+                 (band[(i + 2) * pitch + j + 1] +
+                  band[(i + 2) * pitch + j - 1]) +
+                 (band[(i - 1) * pitch + j - 2] +
+                  band[(i - 1) * pitch + j + 2]) +
+                 (band[(i + 1) * pitch + j + 2] +
+                  band[(i + 1) * pitch + j - 2])) +
+           c5 * ((band[(i - 2) * pitch + j - 2] +
+                  band[(i - 2) * pitch + j + 2]) +
+                 (band[(i + 2) * pitch + j - 2] +
+                  band[(i + 2) * pitch + j + 2]));
+}
+
+/* One work item per band pixel; the three directions in one pass. */
+__kernel void rt_lab_wavelet_w_koe_raw(
+    __global const float* band1, int p1,
+    __global const float* band2, int p2,
+    __global const float* band3, int p3,
+    __global float* koe1, __global float* koe2, __global float* koe3,
+    int kp, int w, int h, int level, int tloww, int gradw)
+{
+    const int x = get_global_id(0);
+    const int y = get_global_id(1);
+    if (x >= w || y >= h) {
+        return;
+    }
+    const int at = y * kp + x;
+    const int borderL = tloww < 75 ? 1 : 2;
+    /* calckoe() zeroes the coefficients when the 5x5 arm meets level 0/1. */
+    if (tloww >= 75 && level <= 1) {
+        koe1[at] = 0.0f;
+        koe2[at] = 0.0f;
+        koe3[at] = 0.0f;
+        return;
+    }
+    /* calckoe() fills the border ring with 1.f. */
+    if (x < borderL || y < borderL || x >= w - borderL ||
+        y >= h - borderL) {
+        koe1[at] = 1.0f;
+        koe2[at] = 1.0f;
+        koe3[at] = 1.0f;
+        return;
+    }
+
+    const float edd = 3.0f;
+    const float thr = 40.0f;
+    const float thr2 = 1.5f * edd + (float)gradw / 30.0f;
+    float t1;
+    float t2;
+    float t3;
+
+    if (tloww < 75) {
+        float c0;
+        float c1;
+        float c2;
+        float mult;
+        if (tloww < 30) {
+            c0 = 8.94f;
+            c1 = 1.71f;
+            c2 = 0.33f;
+            mult = 0.0584795f;
+        } else if (tloww < 50) {
+            c0 = 4.0091f;
+            c1 = 2.0068f;
+            c2 = 1.0045f;
+            mult = 0.062288f;
+        } else {
+            c0 = 3.025f;
+            c1 = 2.001f;
+            c2 = 1.323f;
+            mult = 0.06127f;
+        }
+        c0 *= mult;
+        c1 *= mult;
+        c2 *= mult;
+        t1 = rt_lw_koe_tmc3(band1, p1, y, x, c0, c1, c2);
+        t2 = rt_lw_koe_tmc3(band2, p2, y, x, c0, c1, c2);
+        t3 = rt_lw_koe_tmc3(band3, p3, y, x, c0, c1, c2);
+    } else {
+        float c0;
+        float c1;
+        float c2;
+        float c3;
+        float c4;
+        float c5;
+        float mult;
+        if (tloww < 85) {
+            c0 = 15.0f;
+            c1 = 10.0f;
+            c2 = 7.0f;
+            c3 = 3.0f;
+            c4 = 2.0f;
+            c5 = 0.5f;
+            mult = 0.0088495f;
+        } else {
+            c0 = 15.0f;
+            c1 = 12.0f;
+            c2 = 9.0f;
+            c3 = 5.0f;
+            c4 = 4.0f;
+            c5 = 2.0f;
+            mult = 0.0062893f;
+        }
+        c0 *= mult;
+        c1 *= mult;
+        c2 *= mult;
+        c3 *= mult;
+        c4 *= mult;
+        c5 *= mult;
+        t1 = rt_lw_koe_tmc5(band1, p1, y, x, c0, c1, c2, c3, c4, c5);
+        t2 = rt_lw_koe_tmc5(band2, p2, y, x, c0, c1, c2, c3, c4, c5);
+        t3 = rt_lw_koe_tmc5(band3, p3, y, x, c0, c1, c2, c3, c4, c5);
+    }
+
+    const float v1 = band1[y * p1 + x];
+    const float v2 = band2[y * p2 + x];
+    const float v3 = band3[y * p3 + x];
+    koe1[at] = min(thr2, fabs(t1 / max(fabs(v1), thr)));
+    koe2[at] = min(thr2, fabs(t2 / max(fabs(v2), thr)));
+    koe3[at] = min(thr2, fabs(t3 / max(fabs(v3), thr)));
+}
+
+/* One work item per (direction, row): the row's interior maximum. */
+__kernel void rt_lab_wavelet_w_koe_rowmax(
+    __global float* koe1, __global float* koe2, __global float* koe3,
+    int kp, __global float* stats, int row_offset, int w, int h,
+    int borderL)
+{
+    const int dir = get_global_id(0);
+    const int y = get_global_id(1);
+    if (dir >= 3 || y >= h) {
+        return;
+    }
+    __global float* koe = dir == 0 ? koe1 : (dir == 1 ? koe2 : koe3);
+    float m = 0.0f;
+    if (y >= borderL && y < h - borderL) {
+        for (int j = borderL; j < w - borderL; ++j) {
+            m = max(m, koe[y * kp + j]);
+        }
+    }
+    stats[row_offset + dir * h + y] = m;
+}
+
+/*
+ * One work item per direction: the prefix maximum over the rows above, and
+ * the global maximum calckoe() returns. `max` starts at zero exactly as the
+ * host's maxkoeLi does.
+ */
+__kernel void rt_lab_wavelet_w_koe_carry(
+    __global float* stats, int row_offset, int carry_offset,
+    int max_offset, int h)
+{
+    const int dir = get_global_id(0);
+    if (dir >= 3) {
+        return;
+    }
+    float m = 0.0f;
+    for (int i = 0; i < h; ++i) {
+        stats[carry_offset + dir * h + i] = m;
+        const float r = stats[row_offset + dir * h + i];
+        if (r > m) {
+            m = r;
+        }
+    }
+    stats[max_offset + dir] = m;
+}
+
+/* One work item per (direction, row): replay calckoe()'s diff fold. */
+__kernel void rt_lab_wavelet_w_koe_resolve(
+    __global float* koe1, __global float* koe2, __global float* koe3,
+    int kp, __global const float* stats, int carry_offset, int w, int h,
+    int borderL, float diff_factor)
+{
+    const int dir = get_global_id(0);
+    const int y = get_global_id(1);
+    if (dir >= 3 || y >= h || y < borderL || y >= h - borderL) {
+        return;
+    }
+    __global float* koe = dir == 0 ? koe1 : (dir == 1 ? koe2 : koe3);
+    float m = stats[carry_offset + dir * h + y];
+    for (int j = borderL; j < w - borderL; ++j) {
+        const int at = y * kp + j;
+        const float k = koe[at];
+        if (k > m) {
+            m = k;
+        }
+        float diff = m - k;
+        diff *= diff_factor;
+        koe[at] = m - diff;
+    }
+}
+
+inline float rt_lw_koe_interm(float k1, float k2, float k3,
+                              float eddetthr, float eddlow,
+                              float eddlipinfl, float eddlipampl,
+                              float aamp)
+{
+    float sum = k1 * k1;
+    sum += k2 * k2;
+    sum += k3 * k3;
+    float interm = sqrt(sum);
+    interm *= 0.57736721f;
+
+    const float eps = 0.0001f;
+    float alph = k1 / (k2 + eps);
+    float beta = k3 / (k2 + eps);
+    const float alipinfl = (eddlipampl - 1.0f) / (1.0f - eddlipinfl);
+    const float blipinfl = eddlipampl - alipinfl;
+    if (alph > 1.0f) {
+        alph = 1.0f / alph;
+    }
+    if (beta > 1.0f) {
+        beta = 1.0f / beta;
+    }
+    float bet = 1.0f;
+    if (alph > eddlipinfl && beta < 0.85f * eddlipinfl) {
+        bet = beta;
+    }
+    float kampli;
+    if (alph > eddlipinfl) {
+        const float amplip = alipinfl * alph + blipinfl;
+        kampli = (bet * bet) * amplip * aamp;
+    } else {
+        const float t = alph * bet;
+        const float sq = t * t;
+        const float amplip = (1.0f / eddlipinfl) * (sq * sq);
+        kampli = amplip / aamp;
+    }
+    interm *= kampli;
+    if (interm < eddetthr / eddlow) {
+        interm = 0.01f;
+    }
+    return interm;
+}
+
+/* The control's direction combination, one work item per pixel. */
+__kernel void rt_lab_wavelet_w_koe_control(
+    __global float* koe1, __global float* koe2, __global float* koe3,
+    int kp, int w, int h, float eddetthr, float eddlow, float eddlipinfl,
+    float eddlipampl, float aamp)
+{
+    const int x = get_global_id(0);
+    const int y = get_global_id(1);
+    if (x < 1 || y < 1 || x >= w - 1 || y >= h - 1) {
+        return;
+    }
+    const int at = y * kp + x;
+    const float interm = rt_lw_koe_interm(
+        koe1[at], koe2[at], koe3[at], eddetthr, eddlow, eddlipinfl,
+        eddlipampl, aamp);
+    koe1[at] = interm;
+    koe2[at] = interm;
+    koe3[at] = interm;
+}
+
+/*
+ * The same control with the NPMethod neighbour smoothing. The host's
+ * smoothing is an in-place raster scan: a pixel reads the already-updated
+ * upper and left neighbours and the still-raw lower and right ones, so it
+ * cannot be parallelised per pixel and is replayed by one work item.
+ */
+__kernel void rt_lab_wavelet_w_koe_control_smooth(
+    __global float* koe1, __global float* koe2, __global float* koe3,
+    int kp, int w, int h, float eddetthr, float eddlow, float eddlipinfl,
+    float eddlipampl, float aamp, int smoothing)
+{
+    if (get_global_id(0) != 0) {
+        return;
+    }
+    const float kneigh = smoothing == 2 ? 28.0f : 38.0f;
+    const float somm = smoothing == 2 ? 40.0f : 50.0f;
+    for (int i = 1; i < h - 1; ++i) {
+        for (int j = 1; j < w - 1; ++j) {
+            const int at = i * kp + j;
+            __global float* koe[3] = {koe1, koe2, koe3};
+            for (int dir = 0; dir < 3; ++dir) {
+                __global float* b = koe[dir];
+                b[at] = (kneigh * b[at] +
+                         2.0f * b[(i - 1) * kp + j] +
+                         2.0f * b[(i + 1) * kp + j] +
+                         2.0f * b[i * kp + j + 1] +
+                         2.0f * b[i * kp + j - 1] +
+                         b[(i - 1) * kp + j - 1] +
+                         b[(i - 1) * kp + j + 1] +
+                         b[(i + 1) * kp + j - 1] +
+                         b[(i + 1) * kp + j + 1]) / somm;
+            }
+            const float interm = rt_lw_koe_interm(
+                koe1[at], koe2[at], koe3[at], eddetthr, eddlow, eddlipinfl,
+                eddlipampl, aamp);
+            koe1[at] = interm;
+            koe2[at] = interm;
+            koe3[at] = interm;
+        }
+    }
+}
+
 __kernel void rt_lab_wavelet_w_edge(
     __global float* band1, int p1,
     __global float* band2, int p2,
     __global float* band3, int p3,
     __global const float* params, int edge_offset,
-    int level, int levels, int w, int h)
+    int level, int levels, int w, int h,
+    __global const float* koe, int kp,
+    __global const float* koe_stats, int stats_max_offset,
+    int detectedge)
 {
     const int x = get_global_id(0);
     const int y = get_global_id(1);
@@ -1424,6 +1771,21 @@ __kernel void rt_lab_wavelet_w_edge(
         }
 
         float edge = edgePrecalc;
+        /*
+         * ContAllL()'s Lipschitz branch: with cp.detectedge set and level < 4
+         * the precomputed `interm` (koeLi[level * 3]) scales the strength.
+         * Levels 4 and above keep the plain edgePrecalc.
+         */
+        if (detectedge != 0) {
+            if (level < 4) {
+                const float maxkoe = koe_stats[stats_max_offset + dir];
+                edge = 1.0f +
+                       (edgePrecalc - 1.0f) * koe[y * kp + x] /
+                           (1.0f + 0.9f * maxkoe);
+            } else {
+                edge = edgePrecalc;
+            }
+        }
         if (edgcurv != 0) {
             float absciss = 0.0f;
             if (wavcl >= (mean + sigma)) {

@@ -126,6 +126,24 @@ struct ProcParams;
 #define RT_LW_PARAM_EDG_CURVE 45
 #define RT_LW_PARAM_EDG_HIG 46
 #define RT_LW_PARAM_EDG_LOW 47
+/*
+ * The edge panel's Lipschitz control (calckoe() and the neighbour
+ * smoothing). Slots 89..95 sit after the clarity soft-radius scalars:
+ *   [89] 1 when medianlev() detection runs (cp.detectedge)
+ *   [90] edgedetect (calckoe()'s gradw, 0..100)
+ *   [91] edgedetectthr (calckoe()'s tloww, 0..100; 75 selects the 5x5 arm)
+ *   [92] aamp = 1 + edgedetectthr2 / 100
+ *   [93] eddlipinfl = 0.005 * edgsens + 0.4
+ *   [94] eddlipampl = 1 + edgampl / 50
+ *   [95] smoothing mode: 0 off, 1 NPmethod "low", 2 "high"
+ */
+#define RT_LW_PARAM_EDG_DETECT 89
+#define RT_LW_PARAM_EDG_GRADW 90
+#define RT_LW_PARAM_EDG_TLOWW 91
+#define RT_LW_PARAM_EDG_AAMP 92
+#define RT_LW_PARAM_EDG_LIPINFL 93
+#define RT_LW_PARAM_EDG_LIPAMPL 94
+#define RT_LW_PARAM_EDG_SMOOTH 95
 /* Slots 48..79 hold Daubechies analysis lo/hi and synthesis lo/hi. */
 #define RT_LW_PARAM_FILTER_ANAL_LO 48
 #define RT_LW_PARAM_FILTER_ANAL_HI 56
@@ -683,6 +701,17 @@ inline constexpr int LAB_WAVELET_MIN_WAVELET_EDGTHRESH = -50;
 inline constexpr int LAB_WAVELET_MAX_WAVELET_EDGTHRESH = 100;
 inline constexpr double LAB_WAVELET_MIN_WAVELET_EDGEFFECT = 0.05;
 inline constexpr double LAB_WAVELET_MAX_WAVELET_EDGEFFECT = 2.5;
+/* The Lipschitz control's sliders, from the widget definitions. */
+inline constexpr int LAB_WAVELET_MIN_WAVELET_EDGEDETECT = 0;
+inline constexpr int LAB_WAVELET_MAX_WAVELET_EDGEDETECT = 100;
+inline constexpr int LAB_WAVELET_MIN_WAVELET_EDGEDETECTTHR = 0;
+inline constexpr int LAB_WAVELET_MAX_WAVELET_EDGEDETECTTHR = 100;
+inline constexpr int LAB_WAVELET_MIN_WAVELET_EDGEDETECTTHR2 = -10;
+inline constexpr int LAB_WAVELET_MAX_WAVELET_EDGEDETECTTHR2 = 100;
+inline constexpr int LAB_WAVELET_MIN_WAVELET_EDGESENSI = 0;
+inline constexpr int LAB_WAVELET_MAX_WAVELET_EDGESENSI = 100;
+inline constexpr int LAB_WAVELET_MIN_WAVELET_EDGEAMPLI = 0;
+inline constexpr int LAB_WAVELET_MAX_WAVELET_EDGEAMPLI = 100;
 /* The denoise panel's five level sliders. The widget's upper value (the
  * strength) is the one the block reads; the lower value belongs to the
  * denoise curve. */

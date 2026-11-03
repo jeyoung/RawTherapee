@@ -6047,6 +6047,8 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
     bool wavelet_chroma = false;
     bool wavelet_skin = false;
     bool wavelet_edge = false;
+    bool wavelet_edge_lipschitz = false;
+    int wavelet_edge_smooth = 0;
     bool wavelet_final = false;
     bool wavelet_toning = false;
     bool wavelet_denoise = false;
@@ -6150,6 +6152,22 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
             static_cast<int>(wavelet_params[RT_LW_PARAM_CHMET]) == 2;
         wavelet_skin = wavelet_params[RT_LW_PARAM_W_SKIN] != 0.0f;
         wavelet_edge = wavelet_params[RT_LW_PARAM_EDGEENA] != 0.0f;
+        if (wavelet_edge) {
+            const float detect = wavelet_params[RT_LW_PARAM_EDG_DETECT];
+            if (detect != 0.0f && detect != 1.0f) {
+                error = "lab.wavelet edge detection flag must be 0 or 1";
+                return RT_STAGE_INVALID;
+            }
+            wavelet_edge_lipschitz = detect == 1.0f;
+            const int smooth =
+                static_cast<int>(wavelet_params[RT_LW_PARAM_EDG_SMOOTH]);
+            if (smooth < 0 || smooth > 2 ||
+                (!wavelet_edge_lipschitz && smooth != 0)) {
+                error = "lab.wavelet edge smoothing mode is out of range";
+                return RT_STAGE_INVALID;
+            }
+            wavelet_edge_smooth = wavelet_edge_lipschitz ? smooth : 0;
+        }
         wavelet_final = context->wavelet.final != 0;
         wavelet_toning = context->wavelet.toning != 0;
         wavelet_denoise = context->wavelet.denoise != 0;
@@ -6750,6 +6768,9 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
     StageDeviceBufferPtr bands[RT_LAB_WAVELET_MAX_TRANSFORM_LEVELS][3];
     StageDeviceBufferPtr wavelet_low[2];
     StageDeviceBufferPtr wavelet_tmp[2];
+    StageDeviceBufferPtr koe_band[3];
+    StageDeviceBufferPtr koe_stats_device;
+    char koe_keys[4] = {};
     StageDeviceBufferPtr stats_device;
     StageDeviceBufferPtr wavelet_params_device;
     /*
@@ -6808,6 +6829,10 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
         1, 1};
     const StageBufferShape wavelet_params_shape{
         RT_STAGE_F32, static_cast<std::int32_t>(wavelet_entries), 1, 1};
+    /* rowmax[3 * half_h], carry[3 * half_h], then the three maxkoe values. */
+    const StageBufferShape koe_stats_shape{
+        RT_STAGE_F32,
+        static_cast<std::int32_t>(6 * half_h + 3), 1, 1};
     const StageBufferShape histogram_shape{
         RT_STAGE_F32,
         static_cast<std::int32_t>(wavelet_levels * 3 * 32768),
@@ -6843,6 +6868,16 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
                            wavelet_low[1] && wavelet_tmp[0] &&
                            wavelet_tmp[1] && stats_device &&
                            wavelet_params_device;
+        if (wavelet_edge_lipschitz) {
+            for (int dir = 0; dir < 3; ++dir) {
+                koe_band[dir] = residency->acquire(&koe_keys[dir],
+                                                    band_shape, &error);
+                wavelet_acquired = wavelet_acquired && koe_band[dir];
+            }
+            koe_stats_device = residency->acquire(&koe_keys[3],
+                                                   koe_stats_shape, &error);
+            wavelet_acquired = wavelet_acquired && koe_stats_device;
+        }
         if (clarity_merge) {
             clarity_l = residency->acquire(&clarity_keys[0], plane_shape,
                                            &error);
@@ -7152,9 +7187,32 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
         cl_kernel chroma_kernel = compiled_kernel_entry(
             env, def, "rt_lab_wavelet_w_chroma", error);
         cl_kernel edge_kernel = nullptr;
+        cl_kernel koe_raw_kernel = nullptr;
+        cl_kernel koe_rowmax_kernel = nullptr;
+        cl_kernel koe_carry_kernel = nullptr;
+        cl_kernel koe_resolve_kernel = nullptr;
+        cl_kernel koe_control_kernel = nullptr;
+        cl_kernel koe_smooth_kernel = nullptr;
         if (wavelet_edge) {
             edge_kernel = compiled_kernel_entry(
                 env, def, "rt_lab_wavelet_w_edge", error);
+        }
+        if (wavelet_edge_lipschitz) {
+            koe_raw_kernel = compiled_kernel_entry(
+                env, def, "rt_lab_wavelet_w_koe_raw", error);
+            koe_rowmax_kernel = compiled_kernel_entry(
+                env, def, "rt_lab_wavelet_w_koe_rowmax", error);
+            koe_carry_kernel = compiled_kernel_entry(
+                env, def, "rt_lab_wavelet_w_koe_carry", error);
+            koe_resolve_kernel = compiled_kernel_entry(
+                env, def, "rt_lab_wavelet_w_koe_resolve", error);
+            if (wavelet_edge_smooth == 0) {
+                koe_control_kernel = compiled_kernel_entry(
+                    env, def, "rt_lab_wavelet_w_koe_control", error);
+            } else {
+                koe_smooth_kernel = compiled_kernel_entry(
+                    env, def, "rt_lab_wavelet_w_koe_control_smooth", error);
+            }
         }
         cl_kernel final_kernel = nullptr;
         cl_kernel final_pixel_kernel = nullptr;
@@ -7278,6 +7336,11 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
             haar_synth_v == nullptr || stats_kernel == nullptr ||
             contrast_kernel == nullptr || chroma_kernel == nullptr ||
             (wavelet_edge && edge_kernel == nullptr) ||
+            (wavelet_edge_lipschitz &&
+             (koe_raw_kernel == nullptr || koe_rowmax_kernel == nullptr ||
+              koe_carry_kernel == nullptr || koe_resolve_kernel == nullptr ||
+              (wavelet_edge_smooth == 0 && koe_control_kernel == nullptr) ||
+              (wavelet_edge_smooth != 0 && koe_smooth_kernel == nullptr))) ||
             (wavelet_final &&
              (final_kernel == nullptr || final_pixel_kernel == nullptr)) ||
             (wavelet_toning && toning_kernel == nullptr) ||
@@ -7653,6 +7716,161 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
             return true;
         };
 
+        /*
+         * The Medianlev Lipschitz control: calckoe() for the level's three
+         * directions, the raster prefix maximum it folds in, then the
+         * direction-combination control. The host recomputes these from the
+         * pre-contrast coefficients of all four finest levels before the edge
+         * multiply; because each level's koe depends only on its own bands,
+         * the per-level order below is equivalent. Only the horizontal
+         * direction's `interm` is read by ContAllL(); the other two are
+         * computed for their maxkoeLi only.
+         */
+        const cl_int koe_rows_offset = 0;
+        const cl_int koe_carry_offset = 3 * half_h;
+        const cl_int koe_max_offset = 6 * half_h;
+        const auto edge_prepare = [&](cl_mem band1, cl_int bp1,
+                                      cl_mem band2, cl_int bp2,
+                                      cl_mem band3, cl_int bp3,
+                                      int level) -> bool {
+            if (!wavelet_edge_lipschitz || level >= 4) {
+                return true;
+            }
+            const cl_int kp = pitch_of(koe_band[0]);
+            const cl_mem koe1 = memory_of(koe_band[0]);
+            const cl_mem koe2 = memory_of(koe_band[1]);
+            const cl_mem koe3 = memory_of(koe_band[2]);
+            const cl_mem stats = memory_of(koe_stats_device);
+            const cl_int tloww =
+                static_cast<cl_int>(wavelet_params[RT_LW_PARAM_EDG_TLOWW]);
+            const cl_int gradw =
+                static_cast<cl_int>(wavelet_params[RT_LW_PARAM_EDG_GRADW]);
+            const cl_int border =
+                tloww < 75 ? 1 : 2;
+            const cl_int cl_level = level;
+            bool ok = true;
+            ok = ok && set_arg(koe_raw_kernel, 0, sizeof(cl_mem), &band1);
+            ok = ok && set_arg(koe_raw_kernel, 1, sizeof(cl_int), &bp1);
+            ok = ok && set_arg(koe_raw_kernel, 2, sizeof(cl_mem), &band2);
+            ok = ok && set_arg(koe_raw_kernel, 3, sizeof(cl_int), &bp2);
+            ok = ok && set_arg(koe_raw_kernel, 4, sizeof(cl_mem), &band3);
+            ok = ok && set_arg(koe_raw_kernel, 5, sizeof(cl_int), &bp3);
+            ok = ok && set_arg(koe_raw_kernel, 6, sizeof(cl_mem), &koe1);
+            ok = ok && set_arg(koe_raw_kernel, 7, sizeof(cl_mem), &koe2);
+            ok = ok && set_arg(koe_raw_kernel, 8, sizeof(cl_mem), &koe3);
+            ok = ok && set_arg(koe_raw_kernel, 9, sizeof(cl_int), &kp);
+            ok = ok && set_arg(koe_raw_kernel, 10, sizeof(cl_int), &cl_half_w);
+            ok = ok && set_arg(koe_raw_kernel, 11, sizeof(cl_int), &cl_half_h);
+            ok = ok && set_arg(koe_raw_kernel, 12, sizeof(cl_int), &cl_level);
+            ok = ok && set_arg(koe_raw_kernel, 13, sizeof(cl_int), &tloww);
+            ok = ok && set_arg(koe_raw_kernel, 14, sizeof(cl_int), &gradw);
+            if (!ok || !launch(koe_raw_kernel, band_global,
+                               "lab.wavelet edge koe raw")) {
+                error = "lab.wavelet edge koe raw arguments failed";
+                return false;
+            }
+            const std::size_t dir_rows[2] = {
+                3, static_cast<std::size_t>(half_h)};
+            const cl_int cl_border = border;
+            cl_int rows_offset = koe_rows_offset;
+            cl_int carry_offset = koe_carry_offset;
+            cl_int max_offset = koe_max_offset;
+            ok = true;
+            ok = ok && set_arg(koe_rowmax_kernel, 0, sizeof(cl_mem), &koe1);
+            ok = ok && set_arg(koe_rowmax_kernel, 1, sizeof(cl_mem), &koe2);
+            ok = ok && set_arg(koe_rowmax_kernel, 2, sizeof(cl_mem), &koe3);
+            ok = ok && set_arg(koe_rowmax_kernel, 3, sizeof(cl_int), &kp);
+            ok = ok && set_arg(koe_rowmax_kernel, 4, sizeof(cl_mem), &stats);
+            ok = ok && set_arg(koe_rowmax_kernel, 5, sizeof(cl_int),
+                               &rows_offset);
+            ok = ok && set_arg(koe_rowmax_kernel, 6, sizeof(cl_int),
+                               &cl_half_w);
+            ok = ok && set_arg(koe_rowmax_kernel, 7, sizeof(cl_int),
+                               &cl_half_h);
+            ok = ok && set_arg(koe_rowmax_kernel, 8, sizeof(cl_int),
+                               &cl_border);
+            if (!ok || !launch(koe_rowmax_kernel, dir_rows,
+                               "lab.wavelet edge koe rowmax")) {
+                error = "lab.wavelet edge koe rowmax arguments failed";
+                return false;
+            }
+            const std::size_t dir_global[2] = {3, 1};
+            ok = true;
+            ok = ok && set_arg(koe_carry_kernel, 0, sizeof(cl_mem), &stats);
+            ok = ok && set_arg(koe_carry_kernel, 1, sizeof(cl_int),
+                               &rows_offset);
+            ok = ok && set_arg(koe_carry_kernel, 2, sizeof(cl_int),
+                               &carry_offset);
+            ok = ok && set_arg(koe_carry_kernel, 3, sizeof(cl_int),
+                               &max_offset);
+            ok = ok && set_arg(koe_carry_kernel, 4, sizeof(cl_int),
+                               &cl_half_h);
+            if (!ok || !launch(koe_carry_kernel, dir_global,
+                               "lab.wavelet edge koe carry")) {
+                error = "lab.wavelet edge koe carry arguments failed";
+                return false;
+            }
+            const float diff_factor = static_cast<float>(gradw) / 100.0f;
+            const cl_float cl_diff = diff_factor;
+            ok = true;
+            ok = ok && set_arg(koe_resolve_kernel, 0, sizeof(cl_mem), &koe1);
+            ok = ok && set_arg(koe_resolve_kernel, 1, sizeof(cl_mem), &koe2);
+            ok = ok && set_arg(koe_resolve_kernel, 2, sizeof(cl_mem), &koe3);
+            ok = ok && set_arg(koe_resolve_kernel, 3, sizeof(cl_int), &kp);
+            ok = ok && set_arg(koe_resolve_kernel, 4, sizeof(cl_mem), &stats);
+            ok = ok && set_arg(koe_resolve_kernel, 5, sizeof(cl_int),
+                               &carry_offset);
+            ok = ok && set_arg(koe_resolve_kernel, 6, sizeof(cl_int),
+                               &cl_half_w);
+            ok = ok && set_arg(koe_resolve_kernel, 7, sizeof(cl_int),
+                               &cl_half_h);
+            ok = ok && set_arg(koe_resolve_kernel, 8, sizeof(cl_int),
+                               &cl_border);
+            ok = ok && set_arg(koe_resolve_kernel, 9, sizeof(cl_float),
+                               &cl_diff);
+            if (!ok || !launch(koe_resolve_kernel, dir_rows,
+                               "lab.wavelet edge koe resolve")) {
+                error = "lab.wavelet edge koe resolve arguments failed";
+                return false;
+            }
+            const cl_float cl_eddlow = 15.0f;
+            const cl_float cl_thr =
+                static_cast<cl_float>(wavelet_params[
+                    RT_LW_PARAM_EDG_TLOWW]);
+            const cl_float cl_infl = wavelet_params[
+                RT_LW_PARAM_EDG_LIPINFL];
+            const cl_float cl_ampl = wavelet_params[
+                RT_LW_PARAM_EDG_LIPAMPL];
+            const cl_float cl_aamp = wavelet_params[RT_LW_PARAM_EDG_AAMP];
+            cl_kernel control = wavelet_edge_smooth == 0
+                                    ? koe_control_kernel
+                                    : koe_smooth_kernel;
+            ok = true;
+            ok = ok && set_arg(control, 0, sizeof(cl_mem), &koe1);
+            ok = ok && set_arg(control, 1, sizeof(cl_mem), &koe2);
+            ok = ok && set_arg(control, 2, sizeof(cl_mem), &koe3);
+            ok = ok && set_arg(control, 3, sizeof(cl_int), &kp);
+            ok = ok && set_arg(control, 4, sizeof(cl_int), &cl_half_w);
+            ok = ok && set_arg(control, 5, sizeof(cl_int), &cl_half_h);
+            ok = ok && set_arg(control, 6, sizeof(cl_float), &cl_thr);
+            ok = ok && set_arg(control, 7, sizeof(cl_float), &cl_eddlow);
+            ok = ok && set_arg(control, 8, sizeof(cl_float), &cl_infl);
+            ok = ok && set_arg(control, 9, sizeof(cl_float), &cl_ampl);
+            ok = ok && set_arg(control, 10, sizeof(cl_float), &cl_aamp);
+            if (wavelet_edge_smooth != 0) {
+                const cl_int cl_smooth = wavelet_edge_smooth;
+                ok = ok && set_arg(control, 11, sizeof(cl_int), &cl_smooth);
+            }
+            if (!ok || !launch(control,
+                               wavelet_edge_smooth == 0 ? band_global
+                                                        : dir_global,
+                               "lab.wavelet edge koe control")) {
+                error = "lab.wavelet edge koe control arguments failed";
+                return false;
+            }
+            return true;
+        };
+
         auto multiply = [&](StageDeviceBufferPtr (*bandset)[3],
                             StageDeviceBufferPtr* lowset,
                             uint32_t plane_index, int maxlvl) -> bool {
@@ -7674,6 +7892,23 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
                 bool ok = true;
                 if (plane_index == 0) {
                     if (wavelet_edge) {
+                        if (!edge_prepare(band1, bp1, band2, bp2, band3, bp3,
+                                          level)) {
+                            return false;
+                        }
+                        const cl_mem koe_memory =
+                            wavelet_edge_lipschitz ? memory_of(koe_band[0])
+                                                   : band1;
+                        const cl_int koe_pitch =
+                            wavelet_edge_lipschitz ? pitch_of(koe_band[0])
+                                                   : bp1;
+                        const cl_mem koe_stats_memory =
+                            wavelet_edge_lipschitz
+                                ? memory_of(koe_stats_device)
+                                : band1;
+                        const cl_int cl_max_offset = koe_max_offset;
+                        const cl_int cl_detectedge =
+                            wavelet_edge_lipschitz ? 1 : 0;
                         ok = ok && set_arg(edge_kernel, 0, sizeof(cl_mem),
                                            &band1);
                         ok = ok && set_arg(edge_kernel, 1, sizeof(cl_int),
@@ -7698,6 +7933,16 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
                                            &cl_half_w);
                         ok = ok && set_arg(edge_kernel, 11, sizeof(cl_int),
                                            &cl_half_h);
+                        ok = ok && set_arg(edge_kernel, 12, sizeof(cl_mem),
+                                           &koe_memory);
+                        ok = ok && set_arg(edge_kernel, 13, sizeof(cl_int),
+                                           &koe_pitch);
+                        ok = ok && set_arg(edge_kernel, 14, sizeof(cl_mem),
+                                           &koe_stats_memory);
+                        ok = ok && set_arg(edge_kernel, 15, sizeof(cl_int),
+                                           &cl_max_offset);
+                        ok = ok && set_arg(edge_kernel, 16, sizeof(cl_int),
+                                           &cl_detectedge);
                         if (!ok || !launch(edge_kernel, band_global,
                                            "lab.wavelet edge")) {
                             error = "lab.wavelet edge arguments failed";
