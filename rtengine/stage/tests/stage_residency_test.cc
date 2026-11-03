@@ -4027,7 +4027,7 @@ void test_lab_sharpening(bool available)
         rtengine::procparams::ProcParams params;
         std::string error;
         check(!labSharpeningSupported(params, 63, 31, true, &error),
-              "lab.sharpening refuses the CIE-CAM arm");
+              "lab.sharpening refuses a profile with no enabled tool");
 
         params.impulseDenoise.enabled = true;
         params.impulseDenoise.thresh = 50;
@@ -4051,15 +4051,33 @@ void test_lab_sharpening(bool available)
         check(labSharpeningSupported(params, 63, 31, false, &error),
               "lab.sharpening admits the default defringe pair");
 
+        params.defringe.radius = 1.15;
+        check(labSharpeningSupported(params, 63, 31, false, &error),
+              "a defringe radius of 1.15 is the separable-IIR arm");
         params.defringe.radius = 1.0;
-        check(!labSharpeningSupported(params, 63, 31, false, &error),
-              "a defringe radius in the 5x5/7x7 range refuses the pair");
+        check(labSharpeningSupported(params, 63, 31, false, &error),
+              "a defringe radius of 1.0 is the separable-IIR arm");
+        params.defringe.radius = 0.6;
+        check(labSharpeningSupported(params, 63, 31, false, &error),
+              "a defringe radius of 0.6 is the separable-IIR boundary");
         params.defringe.radius = 0.5;
-        check(!labSharpeningSupported(params, 63, 31, false, &error),
-              "a defringe radius of 0.5 refuses the pair");
+        check(labSharpeningSupported(params, 63, 31, false, &error),
+              "a defringe radius of 0.5 is the 3x3 arm");
+        params.defringe.radius = 0.25;
+        check(labSharpeningSupported(params, 63, 31, false, &error),
+              "a defringe radius of 0.25 is the 3x3 boundary");
         params.defringe.radius = 0.2;
         check(labSharpeningSupported(params, 63, 31, false, &error),
               "a defringe radius below 0.25 is the host no-op");
+        params.defringe.radius = 25.0;
+        check(!labSharpeningSupported(params, 63, 31, false, &error),
+              "lab.sharpening refuses a defringe radius of 25");
+        params.defringe.radius = 30.0;
+        check(!labSharpeningSupported(params, 63, 31, false, &error),
+              "lab.sharpening refuses a defringe radius above 25");
+        params.defringe.radius = -1.0;
+        check(!labSharpeningSupported(params, 63, 31, false, &error),
+              "lab.sharpening refuses a negative defringe radius");
         params.defringe.radius = 2.0;
 
         params.defringe.threshold = 101;
@@ -4150,6 +4168,66 @@ void test_lab_sharpening(bool available)
               "the CIE-CAM arm keeps only ML sharpen edges on the Lab image");
         check(labSharpeningSupported(params, 63, 31, true, &error),
               "the CIE-CAM arm admits ML sharpen edges");
+
+        /*
+         * The defringe hue table is only sampled when the defringe pass can
+         * read it. In the CIE-CAM arm the CIE-CAM pipeline owns that pass, so
+         * a curve the device table cannot follow must not refuse the edges
+         * pass; the same applies with defringe disabled or below the host's
+         * Gaussian identity.
+         */
+        rtengine::procparams::ProcParams curve_params;
+        curve_params.sharpenEdge.enabled = true;
+        curve_params.sharpenEdge.passes = 1;
+        curve_params.sharpenEdge.amount = 50.0;
+        curve_params.defringe.enabled = true;
+        curve_params.defringe.radius = 1.0;
+        curve_params.defringe.threshold = 13;
+        curve_params.defringe.huecurve = {1.0, 0.0, 0.5, 0.35, 0.35,
+                                          0.2, 0.9, 0.35, 0.35,
+                                          0.8, 0.1, 0.35, 0.35,
+                                          1.0, 0.5, 0.35, 0.35};
+        {
+            rtengine::ImProcFunctions curve_ipf(&curve_params, false);
+            curve_ipf.setScale(1.0);
+
+            LabSharpeningContext lab_context(curve_params, curve_ipf, 63, 31,
+                                             false);
+            std::string build_error;
+            check(lab_context.build(&build_error) == 0,
+                  ("the Lab arm builds the defringe hue table: " +
+                   build_error).c_str());
+            check(lab_context.hueCurve() &&
+                      lab_context.hueEntries() ==
+                          static_cast<int>(RT_LAB_SHARPENING_HUE_ENTRIES),
+                  "the Lab arm samples the active defringe hue curve");
+
+            LabSharpeningContext cam_context(curve_params, curve_ipf, 63, 31,
+                                             true);
+            check(cam_context.build(&build_error) == 0,
+                  ("the CIE-CAM arm builds without a hue table: " +
+                   build_error).c_str());
+            check(!cam_context.hueCurve() && cam_context.hueEntries() == 2,
+                  "the CIE-CAM arm skips the defringe hue table");
+
+            rtengine::procparams::ProcParams off_params = curve_params;
+            off_params.defringe.enabled = false;
+            LabSharpeningContext off_context(off_params, curve_ipf, 63, 31,
+                                             false);
+            check(off_context.build(&build_error) == 0 &&
+                      !off_context.hueCurve() &&
+                      off_context.hueEntries() == 2,
+                  "a disabled defringe skips the hue table");
+
+            rtengine::procparams::ProcParams noop_params = curve_params;
+            noop_params.defringe.radius = 0.2;
+            LabSharpeningContext noop_context(noop_params, curve_ipf, 63, 31,
+                                              false);
+            check(noop_context.build(&build_error) == 0 &&
+                      !noop_context.hueCurve() &&
+                      noop_context.hueEntries() == 2,
+                  "the defringe Gaussian identity skips the hue table");
+        }
     }
 
     if (!available) {
@@ -4409,13 +4487,13 @@ void test_lab_sharpening(bool available)
     /* ------------------------------------------------- the pair is atomic */
     {
         /* Impulse admits, defringe does not: the whole pair runs on the
-         * host. */
+         * host. A prescaled threshold above 100 is the documented residual. */
         rtengine::procparams::ProcParams params;
         params.impulseDenoise.enabled = true;
         params.impulseDenoise.thresh = 50;
         params.defringe.enabled = true;
-        params.defringe.radius = 1.0;
-        params.defringe.threshold = 13;
+        params.defringe.radius = 2.0;
+        params.defringe.threshold = 101;
 
         LabImage source(63, 31);
         fill_impulse_fixture(source);
@@ -4435,6 +4513,10 @@ void test_lab_sharpening(bool available)
         check(execution.device != StageDeviceType::OPENCL,
               "a refused pair never runs on the device");
         const LabPlaneDiff diff = compare_lab_planes(device, cpu);
+        std::printf("stage-residency: lab.sharpening refused pair: %zu of %zu "
+                    "samples differ, PAE L %.6f a %.6f b %.6f\n",
+                    diff.differing, diff.samples, diff.max_l, diff.max_a,
+                    diff.max_b);
         check(diff.finite && diff.differing == 0 && diff.max_l == 0.0 &&
                   diff.max_a == 0.0 && diff.max_b == 0.0,
               "a refused pair matches the host result exactly");
@@ -4541,6 +4623,117 @@ void test_lab_sharpening(bool available)
         check(untouched.differing == 0 && untouched.max_l == 0.0 &&
                   untouched.max_a == 0.0 && untouched.max_b == 0.0,
               "the defringe no-op leaves every plane untouched");
+    }
+
+    /*
+     * --------------------------------- the defringe radius range on the device
+     *
+     * PF_correct_RT() calls gaussianBlur() with GAUSS_STANDARD, so the whole
+     * legal GUI range is device: the 3x3 convolution from 0.25 to below 0.6,
+     * the separable-IIR pair from 0.6. Each case is compared with the host
+     * block and must change pixels, so none is vacuous. The CIE-CAM cases set
+     * a radius the Lab node must skip, because the CIE-CAM pipeline owns the
+     * pass there.
+     */
+    {
+        struct RadiusCase {
+            const char* label;
+            double radius;
+            bool edges;
+            bool micro;
+            bool ciecam;
+            bool main_pass;
+        };
+        const RadiusCase cases[] = {
+            {"radius 0.25 3x3 lower edge", 0.25, false, false, false, false},
+            {"radius 0.5 3x3", 0.5, false, false, false, false},
+            {"radius 0.59 3x3 upper edge", 0.59, false, false, false, false},
+            {"radius 0.6 IIR boundary", 0.6, false, false, false, false},
+            {"radius 1.0 IIR", 1.0, false, false, false, false},
+            {"radius 1.15 IIR", 1.15, false, false, false, false},
+            {"radius 0.5 + edges", 0.5, true, false, false, false},
+            {"radius 1.0 + edges + micro", 1.0, true, true, false, false},
+            {"radius 0.5 CIE-CAM arm + edges", 0.5, true, false, true, false},
+            {"radius 1.0 CIE-CAM arm + edges", 1.0, true, false, true, false},
+            {"radius 1.0 CIE-CAM arm + edges + main", 1.0, true, false, true,
+             true},
+        };
+
+        std::size_t device_cases = 0;
+        for (const RadiusCase& item : cases) {
+            rtengine::procparams::ProcParams params;
+            params.defringe.enabled = true;
+            params.defringe.radius = item.radius;
+            params.defringe.threshold = 13;
+            if (item.edges) {
+                params.sharpenEdge.enabled = true;
+                params.sharpenEdge.passes = 2;
+                params.sharpenEdge.amount = 50.0;
+            }
+            if (item.micro) {
+                params.sharpenMicro.enabled = true;
+                params.sharpenMicro.amount = 20.0;
+                params.sharpenMicro.contrast = 20.0;
+                params.sharpenMicro.uniformity = 5;
+            }
+            if (item.main_pass) {
+                /* The main sharpen pass is the shared output.sharpen node; it
+                 * must not change this block's result. */
+                params.sharpening.enabled = true;
+            }
+
+            LabImage source(70, 42);
+            if (item.edges || item.micro) {
+                fill_ml_fixture(source);
+            } else {
+                fill_defringe_fixture(source);
+            }
+
+            LabImage cpu(70, 42);
+            copy_sharpen_l(source, cpu);
+            run_cpu_lab_sharpening(params, cpu, item.ciecam);
+
+            LabImage device(70, 42);
+            copy_sharpen_l(source, device);
+            StageExecution execution;
+            std::string error;
+            const RtStageStatus status = run_device_lab_sharpening(
+                context, params, device, execution, error, item.ciecam);
+            const std::string label =
+                std::string("lab.sharpening ") + item.label;
+            check(status == RT_STAGE_OK,
+                  (label + " completes: " + error).c_str());
+            check(execution.device == StageDeviceType::OPENCL,
+                  (label + " runs on the device").c_str());
+            if (status == RT_STAGE_OK &&
+                execution.device == StageDeviceType::OPENCL) {
+                ++device_cases;
+            }
+
+            const LabPlaneDiff diff = compare_lab_planes(device, cpu);
+            check(diff.finite, (label + " stays finite").c_str());
+            check(diff.max_l <= 0.5 && diff.max_a <= 0.5 &&
+                      diff.max_b <= 0.5,
+                  (label + " is within half a 16-bit LSB").c_str());
+
+            if (!item.edges && !item.micro) {
+                /* Defringe never touches L, on the host or the device. */
+                const LabPlaneDiff l_only = compare_lab_planes(device, source);
+                check(l_only.max_l == 0.0,
+                      (label + " leaves L untouched").c_str());
+            }
+
+            const std::vector<unsigned char> changed =
+                lab_changed_mask(device, source);
+            const std::size_t count = lab_changed_count(changed);
+            check(count > 0, (label + " is not vacuous").c_str());
+            std::printf("stage-residency: %s: %zu of %zu samples differ, "
+                        "PAE L %.6f a %.6f b %.6f\n",
+                        label.c_str(), diff.differing, diff.samples,
+                        diff.max_l, diff.max_a, diff.max_b);
+        }
+        check(device_cases >= 8,
+              "lab.sharpening covers at least eight defringe radius cases");
     }
 
     /* --------------------------------- ML sharpen edges and microcontrast */

@@ -264,6 +264,10 @@ quick() {
         "$ROOT/devnotes/opencl/pp3/sharpen-rld.pp3" output.sharpen
     run_stage_device "pef/stage-device-lab-sharpening" \
         "$ROOT/devnotes/opencl/pp3/labsharpening.pp3" lab.sharpening
+    run_stage_device "pef/stage-device-lab-sharpening-fir3" \
+        "$ROOT/devnotes/opencl/pp3/labsharpening-fir3.pp3" lab.sharpening
+    run_stage_device "pef/stage-device-lab-sharpening-iir" \
+        "$ROOT/devnotes/opencl/pp3/labsharpening-iir.pp3" lab.sharpening
     run_stage_device "pef/stage-device-lab-sharpening-edges" \
         "$ROOT/devnotes/opencl/pp3/labsharpening-edges.pp3" lab.sharpening
     run_stage_device "pef/stage-device-lab-sharpening-micro" \

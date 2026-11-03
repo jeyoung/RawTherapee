@@ -1,0 +1,4 @@
+[Defringing]
+Enabled=true
+Radius=0.5
+Threshold=13
