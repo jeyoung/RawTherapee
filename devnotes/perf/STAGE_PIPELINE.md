@@ -342,18 +342,18 @@ upsample before the merge. The second pass clamps L at or below zero to one,
 as the block's final tile copy does; the soft-filtered L may be negative and
 the merge uses it unclamped.
 
-The final panel's guided soft radius (`softradend`) also runs on the device
-for its portable sub-case: `Expfinal` set, `Thrend == 0` and an identity
-`wavguidcurve`. The host derives `blend = LIM01(strend / 100)`, `epsilon =
+The final panel's guided soft radius (`softradend`) also runs on the device,
+including the `Thrend > 0` coefficient-domain second block and the hue
+modulation over a non-identity `wavguidcurve`. The host derives `blend = LIM01(strend / 100)`, `epsilon =
 0.001 * 2^-detend`, the radius `max(int(softradend), 1)` and the subsampled
 box grid and four bilinear scales. The prepare kernel writes `guide =
 xlin2log(L / 32768)`, `src = xlin2log(L)` and the pre-filter L into its own
 plane; the clarity arm's guided-filter chain runs unchanged; the finish kernel
 applies `xlog2lin(q)` and `intp(blend, q, iL)` to L. It runs after the final
 pixel curve in both the denoise and the plain branch, exactly at the end of
-`ip_wavelet()`. The clarity arm, the clarity soft radius and the non-zero
-`Thrend` second block remain host residuals, and a `softradend` without
-`Expfinal` is refused.
+`ip_wavelet()`. The clarity arm and the clarity soft radius, combined with
+`softradend`, remain host residuals, and a `softradend` without `Expfinal`
+is refused.
 
 It is admitted only on a CPU
 OpenCL device, and the wavelet pass also needs fp64. `CHmethod` `without` and

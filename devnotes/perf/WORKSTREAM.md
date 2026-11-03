@@ -170,9 +170,8 @@ current tip.
   avoid, median, expbl, expresid, expnoise, `CLmethod` one and
   skin protection) run the host builtin byte for byte. The export gate
   `labwavelet-final.pp3` records `impl=opencl` at 1 LSB16. The remaining
-  `softradend` residuals are a non-zero `Thrend` second block, a non-identity
-  `wavguidcurve` hue modulation and the clarity combinations; the final
-  panel's balance-chroma arm is a separate residual. `6a54860e1`, `873000037`.
+  `softradend` residual is the clarity combination; the final panel's
+  balance-chroma arm is a separate residual. `6a54860e1`, `873000037`.
 - **`lab.wavelet` toning (zero-protection)**: `ExpToning`'s opacity-curve
   multiply on the a/b bands. The host builds the nine `mulopaRG`/`mulopaBY`
   samples from the 501-point curves; `computeMea()` fills the per-level
@@ -218,7 +217,12 @@ current tip.
   out-of-range sliders, clarity arm and clarity soft radius) run the host
   builtin byte for byte. `labwavelet-softradend.pp3` is exact with
   `impl=opencl`. The coefficient-domain second block (`Thrend > 0`) and the
-  hue modulation remain residuals. Because the filter works in the log
+  hue modulation over a non-identity `wavguidcurve` are device cases as well:
+  the host exports the `wavguid` flat-curve polyline, both decompositions and
+  `Evaluate2` aggregates, and the kernels reproduce the per-coefficient
+  `intp`; the hue arm applies the block's `huelab_to_huehsv2` lookup. The
+  added cases reach 0.964844 LSB16 (hue 20 with curves) and both gates are
+  1 LSB16 with `impl=opencl`. Because the filter works in the log
   domain, it amplifies a one-LSB16 input difference by up to about five
   LSB16, so the export gate uses identity final curves; a non-identity final
   curve can leave a sub-LSB difference that the radius amplifies.
