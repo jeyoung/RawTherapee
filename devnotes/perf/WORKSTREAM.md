@@ -516,6 +516,22 @@ current tip.
   `lab.tools` now covers B&W alone, B&W through both arms and the colour-
   toning combination; only a `LabRegions` profile outside the bounded set
   stays a host refusal. Landed on `perf-graph`; not pushed.
+- **`lab.tools` dense hue curves**: `FlatCurve::getVal()` is exactly the
+  faceted polyline it builds, so the three hue flat curves are now exported as
+  one node per polyline knot in double rather than resampled with the chord
+  refiner. The double node is what admits a dense curve: a float abscissa in
+  [0,1] moves a 40 000-point alternating C=f(H) by 1.2e-4, 240 times the
+  5e-7 bound. The slot doubles to 65 536 nodes, the most `FlatCurve`
+  subdivides, and a longer hand-built list falls back to the refiner; a curve
+  neither can follow (100 000 alternating knots) stays a host refusal. Eight
+  dense matrix cases (512/4 096/40 000 steep, 8 000 smooth, slider on, a/b
+  and L tables, and a polyline that starts at 0.2 and wraps through the
+  period) are bit-exact and carry one node per control point, the
+  existing hue matrix is now bit-exact instead of 0.023438 LSB16, and
+  `labtools-huecurve-dense.pp3` is pixel-exact with `impl=opencl`. The
+  earlier `labtools-huecurve.pp3` wrote two-number points, which `FlatCurve`
+  read as the identity; it now carries four per point. Landed on
+  `perf-graph`; not pushed.
 
 ### Wave B scoping decisions (2026-10-28)
 
@@ -891,7 +907,10 @@ reproduces that in the Lab-curve slot (B&W-only exact, a/b exactly 0, combos
 with SH/LC/vibrance at PAE 0, both other arms refused with host PAE 0).
 Remaining: the `lab.tools` residuals are now only a `LabRegions` profile
 outside the bounded set, a local-contrast slider outside the ABI range, EPD
-and a profile where no device tool would run. B&W with colour toning landed
+and a profile where no device tool would run. Dense hue curves are device
+cases now: the host carries each `FlatCurve` polyline as double nodes and the
+40 000-point curve that used to be refused is bit-exact. B&W with colour
+toning landed
 as a device case: the host's `bwonly` excludes it, so the block takes neither
 arm and the node exports the block's flag. The
 LAB/XYZ/XYZREL Munsell methods (`gamutLchonly`/`gamutmap`) are device cases

@@ -70,9 +70,9 @@ pairs are exact. The gate is the peak absolute error (PAE) in normalised units;
 | 2026-10-31 | uncommitted | POCL (CPU) | 3-case lab.tools tone-method matrix (Splitco, Splitlr, RGBSliders with shadows/highlights), `stage-residency-test` | device vs host block | 0 | PASS |
 | 2026-10-31 | uncommitted | POCL (CPU) | colorspace_flowers.pef / `labtools-blackwhite-labcurve.pp3` (B&W through the `bwToning` arm, L and a/b tables plus the C=f(L), C=f(C) and L=f(C) tables), `lab.tools` | off vs auto, 16-bit TIFF | 1 LSB | PASS |
 | 2026-10-31 | uncommitted | POCL (CPU) | 7-case lab.tools black-and-white Lab-curve matrix (identity tables, L curve, a/b tables, C=f(L), L=f(C), the three chroma tables, and the full set with vibrance, shadows/highlights and local contrast at 179x48 and 238x64), `stage-residency-test` | device vs host block | 0 (exact, a/b exact) | PASS |
-| 2026-10-31 | uncommitted | POCL (CPU) | colorspace_flowers.pef / `labtools-huecurve.pp3` (Lab curves with chromaticity 40, C=f(H), L=f(H) and H=f(H)), `lab.tools` | off vs auto, 16-bit TIFF | 1 LSB | PASS |
-| 2026-10-31 | uncommitted | POCL (CPU) | 11-case lab.tools hue flat-curve matrix (chromaticity -100 ignoring the curves, 0, 50 with red/skin protection and 100; C=f(H), L=f(H), H=f(H) alone; all three with the slider; with a/b tables; with vibrance and shadows/highlights; B&W + L=f(H)), `stage-residency-test` | device vs host block | 0.023438 LSB16 (worst) | PASS |
-| 2026-10-31 | uncommitted | POCL (CPU) | lab.tools hue-family non-vacuity and residuals: same profile with the family off changes the image; a 40 000-point dense C=f(H) is refused for table fidelity and runs the block | non-vacuity PAE 12 400-52 610 LSB16; refusal 0 (host) | PASS |
+| 2026-10-31 | uncommitted | POCL (CPU) | colorspace_flowers.pef / `labtools-huecurve.pp3` (Lab curves with chromaticity 40, C=f(H), L=f(H) and H=f(H)), `lab.tools` | off vs auto, 16-bit TIFF | 0 (AE=0, 0 of 30 419 712) | PASS |
+| 2026-10-31 | uncommitted | POCL (CPU) | 11-case lab.tools hue flat-curve matrix (chromaticity -100 ignoring the curves, 0, 50 with red/skin protection and 100; C=f(H), L=f(H), H=f(H) alone; all three with the slider; with a/b tables; with vibrance and shadows/highlights; B&W + L=f(H)), `stage-residency-test` | device vs host block | 0 (exact) | PASS |
+| 2026-10-31 | uncommitted | POCL (CPU) | lab.tools hue-family non-vacuity and residuals: same profile with the family off changes the image; a 100 000-point dense C=f(H) is refused for table fidelity and runs the block | non-vacuity PAE 12 400-52 610 LSB16; refusal 0 (host) | PASS |
 
 | 2026-10-31 | 5bb35d3ce | POCL (CPU) | colorspace_flowers.pef / `labwavelet-chroma.pp3` (contrast + chroma `link`), `lab.wavelet` | off vs auto, 16-bit TIFF | 1 LSB | PASS |
 | 2026-10-31 | 5bb35d3ce | POCL (CPU) | 12-case chroma matrix (alone at 6/3/7 levels, strength 100, sigmacol 0.5, with contrast, with the equaliser, positive and negative skin, equaliser plus skin, saturated hue, 179x49 padded), `stage-residency-test` | device vs host block | 0 (exact, a/b exact) | PASS |
@@ -129,6 +129,10 @@ pairs are exact. The gate is the peak absolute error (PAE) in normalised units;
 | 2026-11-03 | uncommitted | POCL (CPU) | colorspace_flowers.pef / `labtools-blackwhite-toning.pp3` (B&W ChannelMixer mixer weights, gamma TRC and before/after curves; LabGrid; Lab L/a/b curves; shadows/highlights; vibrance), `lab.tools` | off vs auto, 16-bit TIFF, `impl=opencl` | 0 (AE=0, PAE=0, 0 of 30 419 712) | PASS |
 | 2026-11-03 | uncommitted | POCL (CPU) | 14-case `lab.tools` black-and-white matrix (B&W alone and with shadows/highlights, local contrast and vibrance; B&W + LabGrid, with and without Lab curves, shadows/highlights and vibrance; B&W + Splitco; B&W + Splitlr with Lab curves; B&W + B&W toning controls, with and without LabGrid; B&W + Lab regions; B&W + LabGrid + regions), `stage-residency-test` | device vs host block | 0.75 LSB16 (worst: B&W + Splitlr + Lab curves, 1 sample of 25 776); the rest exact | PASS |
 | 2026-11-03 | uncommitted | POCL (CPU) | black-and-white non-vacuity and flag encoding under colour toning: with B&W off the node's output is bit-identical, the exported black-and-white flag is 0 (and 1 with the toning off), and the toning keeps chroma on both sides (max 20 007-125 273); a `LabRegions` profile outside the bounded set stays a host refusal in the existing residual matrix | device vs host block | 0 (flag and non-vacuity), 31 511 LSB16 for the toning-off variant | PASS |
+| 2026-11-03 | uncommitted | POCL (CPU) | colorspace_flowers.pef / `labtools-huecurve-dense.pp3` (chromaticity 50 with a 64-knot C=f(H), a 48-knot L=f(H) and a 32-knot H=f(H), all linear so the polyline is exact), `lab.tools` | off vs auto, 16-bit TIFF, `impl=opencl` | 0 (AE=0, PAE=0, 0 of 30 419 712) | PASS |
+| 2026-11-03 | uncommitted | POCL (CPU) | 8-case dense C=f(H) matrix (512, 4 096 and 40 000 steep knots; 8 000 smooth knots; 40 000 with the chromaticity slider at 50; 40 000 with the L curve and a/b tables; 8 000 smooth with the L curve and a/b tables; 4 096 knots from x=0.2, which wraps the polyline through the period), `stage-residency-test` | device vs host block | 0 (exact, every case) | PASS |
+| 2026-11-03 | uncommitted | POCL (CPU) | dense hue-curve non-vacuity: every dense case carries one exported table node per control point (512-40 000, plus the wrap boundary) and differs from the same profile with the family off (PAE 4 086-30 851 LSB16); `labtools-huecurve-dense.pp3` against the same profile with the three curves cleared changes 28 463 057 of 30 419 712 samples (PAE 22 575 LSB16) | device vs host block | 0 (device), non-zero against the family off | PASS |
+| 2026-11-03 | uncommitted | POCL (CPU) | 100 000-point alternating C=f(H): more knots than the slot holds and more kinks than the refiner can subdivide, so the predicate refuses it | device vs host block | 0 (host, `impl=host`) | PASS |
 
 The clarity rows are the block's two-pass sequence, not a single kernel.
 `CLmethod`'s `one`/`inf`/`sup` selection is `finalContAllL()`'s and
@@ -204,8 +208,32 @@ factors are the block's `0.15` and `0.96`. The arm then rebuilds `lnew`'s L,
 a and b from the corrected L and C and runs the Munsell arm after it, exactly
 as the host orders the two. The device export above records `"impl":"opencl"`
 and is pixel-identical, and the all-tables and neutral matrix cases are
-bit-exact; the hue-curve case differs by 0.011719 LSB16, below the one-LSB
-gate.
+bit-exact; the hue-curve cases are bit-exact as well since the host began
+carrying the polyline (below).
+
+The three hue flat curves - C=f(H), L=f(H) and H=f(H) - are carried, not
+resampled. `FlatCurve::getVal()` is exactly the faceted polyline the curve
+builds, so the host exports one node per knot and the kernel walks it with the
+same binary search, the way the wavelet refine arms carry their polylines. The
+nodes are doubles: a float knot abscissa in [0,1] is worth `slope * 6e-8` of
+curve value, which is 1.2e-4 - 240 times the host's 5e-7 bound - for a 40 000
+point alternating C=f(H). The slot holds 65 536 nodes, the most `FlatCurve`
+can subdivide (`ppn` is capped at 65 500 and the periodic polylines add the
+boundary knots). A hand-built knot list above that falls back to the chord
+refiner, which needs a node per kink instead of a node per knot, and a curve
+neither representation can follow is refused. An endpoint whose value differs
+from its opening one is such a residual: `getVal(1.0)` reads the periodic copy
+of the first point, so no continuous table can match the block at both ends of
+the period, and the block itself jumps there.
+
+The earlier `labtools-huecurve.pp3` wrote its points as two numbers each, which
+`FlatCurve` reads as two control points whose odd slots are the identity value:
+the three curves were the identity and only the chromaticity slider ran. The
+pp3 now carries four numbers per point, so its row exercises the curves (28 557
+791 of 30 419 712 samples change when they are cleared) and is pixel-exact. The
+dense `labtools-huecurve-dense.pp3` covers the carried tables directly: 64, 48
+and 32 knots of linear segments, all pixel-exact, and 28 463 057 samples
+change when the three curves are cleared.
 
 `47c50ee77` changes only CPU export buffer handling; the OpenCL rows above
 re-run the existing GPU stages against the new CPU neighbour.

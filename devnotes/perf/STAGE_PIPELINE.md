@@ -119,11 +119,15 @@ C=f(H), L=f(H) and H=f(H) - are part of the same pass. The slider is a scalar
 b through the block's red/skin `transitred()` gate, whose by-reference factor
 overwrites the scale when the pixel sits in the red or skin hue band. The three
 flat curves are `FlatCurve`s read at `Color::huelab_to_huehsv2(HH)`; the host
-samples each into a piecewise-linear table with the same refiner and 5e-7
-value bound as the region mask curves (the largest lever, C=f(H)'s factor
-`1 + 2 (value - 0.5)`, turns that into at most 0.066 LSB16 at chroma 200). A
-table that cannot follow its curve within the bound or the node budget is
-refused, never approximated: the predicate samples the curve, refuses the
+carries each one's faceted polyline as one double table node per knot, which is
+the curve itself, and the kernel walks the same binary search `getVal()` does.
+The doubles matter: a float knot abscissa in [0,1] moves a 40 000-point
+alternating C=f(H) by 1.2e-4, 240 times the 5e-7 value bound (the largest
+lever, C=f(H)'s factor `1 + 2 (value - 0.5)`, turns the bound into at most
+0.066 LSB16 at chroma 200). The slot holds 65 536 nodes, the most `FlatCurve`
+subdivides; a hand-built list above that falls back to the chord refiner of
+5e-7 and a curve neither can follow is refused, never approximated: the
+predicate samples the curve, refuses the
 node, and the builtin runs the block. The three curves are gated by
 `chromaticity > -100`, exactly as the block constructs them, so at the slider
 minimum a curve in the profile is ignored rather than refused. L=f(H) runs the
@@ -218,8 +222,8 @@ are double expressions) and the bounded set: no mask display, one to four
 regions, mask curves that are empty, `FCT_Linear` or a `FCT_MinMaxCPoints`
 curve the host table can follow, and every slider inside the ABI range.
 Everything else in the block is a residual: a chromaticity
-slider outside its -100..100 GUI range, a C=f(H), L=f(H) or H=f(H) curve the
-host table cannot follow within 5e-7 or the node budget, a
+slider outside its -100..100 GUI range, a C=f(H), L=f(H) or H=f(H) curve
+neither the carried polyline nor the refined table can follow within 5e-7, a
 denoise chroma factor, a local contrast outside the ABI range, a local
 contrast below sigma 25 on a host built without SSE2, EPD, a `LabRegions`
 profile outside the bounded set, a profile where no device tool would run
