@@ -439,18 +439,23 @@ L skin protection), and a non-zero `softradend` combined with
 the clarity arm or the clarity soft radius, so a profile that enables any of
 them runs the whole block on the host.
 
-`lab.sharpening` is partial. Its impulse-denoise and defringe pair is a device
-node of its own, admitted only in the Lab arm (not the CIE-CAM pipeline) with
-an image of at least 8x8, impulse threshold 0..100, defringe threshold 0..100
-and a defringe radius either below 0.25 (the host's Gaussian identity, a
-no-op) or at least 1.15 (`gauss.cc`'s separable-IIR range), on a device with
-fp64 for the defringe reduction, and an image large enough for the defringe
-window. The pair is atomic: when one enabled tool is refused, both run on the
-host, so a Lab image is never half device and half host. The host builds the
-defringe hue table from the profile's own `FlatCurve` and refuses a curve it
-cannot follow. The main sharpen pass stays the shared `output.sharpen` node;
-ML sharpen edges and ML microcontrast stay on the host, so a profile with those
-panes records them separately. Both tools are off by default.
+`lab.sharpening` is partial. Its impulse denoise, defringe, ML sharpen edges
+and ML microcontrast run as one atomic device block in the host's order
+(`impulsedenoise`, `defringe`, `MLsharpen`, `MLmicrocontrast`), with an image
+of at least 8x8, impulse threshold 0..100, defringe threshold 0..100 and a
+defringe radius either below 0.25 (the host's Gaussian identity, a no-op) or
+at least 1.15 (`gauss.cc`'s separable-IIR range), on a device with fp64 for the
+defringe reduction, and an image large enough for the defringe window. Edge
+passes are 0..4, edge amount 0..100, microcontrast amount 0..100, contrast
+0..200 and uniformity 0..10; zero passes, a zero edge amount, a microcontrast
+amount below 1 and contrast 100 reproduce the host's own no-ops. In the
+CIE-CAM arm the Lab node keeps only ML sharpen edges: impulse denoise,
+defringe and microcontrast belong to the CIE-CAM pipeline on the CieImage and
+run there. The block is atomic: when one enabled tool is refused, the whole
+block runs on the host, so a Lab image is never half device and half host.
+The host builds the defringe hue table from the profile's own `FlatCurve` and
+refuses a curve it cannot follow. The main sharpen pass stays the shared
+`output.sharpen` node. All four tools are off by default.
 
 | Id | Domain (export/preview/crop/thumbnail) | Consumer | Reuse | Role | Device |
 |----|----------------------------------------|----------|-------|------|--------|
@@ -464,7 +469,7 @@ panes records them separately. Both tools are off by default.
 | `local.adjustments` | Full/Full/Roi/Reduced | path | reuse-input | local lab / selective editing | partial |
 | `rgb.proc` | Full/Full/Roi/Reduced | path | reuse-input | RGB curves, tone curve, colour toning, B&W, channel mixer, HSV, film simulation | yes |
 | `lab.tools` | Full/Full/Roi/Reduced | path | reuse-input | shadows/highlights, vibrance, Lab curves (including non-zero contrast, the chromaticity slider, the C=f(H)/L=f(H)/H=f(H) hue flat curves and the NONE/LAB/XYZ/XYZREL/MUN gamut methods), local contrast, black-and-white (cheap and `bwToning` arms, and the colour-toning combination, which runs neither arm), EPD, Lab-grid colour toning and Lab colour-correction regions | partial |
-| `lab.sharpening` | Full/-/Roi/- | path | reuse-input | impulse denoise and defringe (own node), ML sharpen edges, ML microcontrast and the main sharpen pass (shared `output.sharpen` node) | partial |
+| `lab.sharpening` | Full/-/Roi/- | path | reuse-input | impulse denoise, defringe, ML sharpen edges and ML microcontrast (own node); the main sharpen pass stays the shared `output.sharpen` node | partial |
 | `lab.wavelet` | Full/Full/Roi/Reduced | path | reuse-input | directional pyramid equaliser and wavelet contrast, standard and BiShrink denoise (L and the forced chroma arm), chroma `link`, edge plain arm and Medianlev Lipschitz control, final curves, balance-chroma `sli`/`cur`, the toning zero-protection arm, CLmethod's level selection and the clarity two-pass merge | partial |
 | `working.trc` | Full/Full/Roi/- | path | reuse-input | soft light, tone equaliser and working-TRC conversion | partial |
 | `ciecam` | Full/Full/Roi/- | path | reuse-input | CIE CAM 02 | no |
@@ -1925,7 +1930,8 @@ of truth; this section records the remaining work and the naming exceptions.
 Device nodes today: `transform`, `rgb.proc`, `gamut`, `framing`, `lanczos3`
 (block `resize`), `output.convert`, `monitor.output`, `viewport.output`,
 `output.sharpen` (for the supported USM and undamped RLD sets), `lab.sharpening`
-(for the admitted impulse-denoise and defringe pair), `thumbnail.output`,
+(for the admitted impulse denoise, defringe, ML sharpen edges and ML
+microcontrast block), `thumbnail.output`,
 `thumbnail.whitebalance`, `thumbnail.scale` and `thumbnail.transform`, plus the
 runtime-only packed siblings `thumbnail.scale.u8` and
 `thumbnail.transform.u8`.
@@ -1934,12 +1940,15 @@ Partial: `thumbnail.rgb` is a composite. Its two dominant pixel passes are the
 `transform` and `rgb.proc` device nodes, so the block is `partial`; the
 colour-space conversion, film negative, first analysis, dehaze, Fattal tone
 mapping and local adjustments around them stay on the host. `lab.sharpening`
-runs its impulse-denoise and defringe pair on the device and keeps the main
-sharpen pass in the shared `output.sharpen` node; ML sharpen edges and ML
-microcontrast stay on the host. The pair is atomic: the CIE-CAM arm, an image
-below 8x8, either threshold outside 0..100, a defringe radius in 0.25..1.15
-(the host's 3x3/5x5/7x7 Gaussian arm), a device without fp64 and a defringe
-window wider than the image all run the original host pair. Two prescaled
+runs impulse denoise, defringe, ML sharpen edges and ML microcontrast on the
+device and keeps the main sharpen pass in the shared `output.sharpen` node.
+The block is atomic: an image below 8x8, a threshold outside 0..100, a
+defringe radius in 0.25..1.15 (the host's 3x3/5x5/7x7 Gaussian arm), a device
+without fp64, a defringe window wider than the image, an edge pass count
+outside 0..4, an edge amount outside 0..100, a microcontrast amount outside
+0..100, a contrast outside 0..200 and a uniformity outside 0..10 all run the
+original host block. In the CIE-CAM arm the node keeps only ML sharpen edges;
+the other three run in the CIE-CAM pipeline on the CieImage. Two prescaled
 inputs leave the admitted range while the GUI value is inside it: an export
 scale of two or more pushes the impulse threshold above 100, and a scale
 around 7.7 pushes the defringe radius to 25.0 (the host's double IIR arm);

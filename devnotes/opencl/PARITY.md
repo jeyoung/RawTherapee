@@ -610,20 +610,42 @@ peak absolute error is zero for the synthetic node tests:
   `impl=opencl` at 1 LSB16 (AE=1, 15,637 of 30,419,712 samples) and differs
   from the same profile with `complexMethod=normal` on 29,442,428 samples
   (PAE 1084 LSB16), so the export exercises the pairing.
-- Impulse denoise and defringe, through the `lab.sharpening` node, run as one
-  atomic pair. The device test compares the observable corrected sets and all
-  three planes: the impulse fixture and the combined pair correct exactly the
-  host's pixel sets, the impulse pass is bit-identical on a 128x80 random
-  field and on the fixture (`AE=0`), and the defringe pair is `PAE=0` on L and
-  0.000977 LSB16 on a/b. `xatan2f()` is ported from `rtengine/sleef.h` because
-  a device `atan2` one ulp away moved a fringe across the `fringe <
+- Impulse denoise, defringe, ML sharpen edges and ML microcontrast, through the
+  `lab.sharpening` node, run as one atomic block in production order
+  (`impulsedenoise`, `defringe`, `MLsharpen`, `MLmicrocontrast`). The device
+  test compares the observable corrected sets and all three planes: the
+  impulse fixture and the combined pair correct exactly the host's pixel sets,
+  the impulse pass is bit-identical on a 128x80 random field and on the
+  fixture (`AE=0`), and the defringe pair is `PAE=0` on L and 0.000977 LSB16 on
+  a/b. `xatan2f()` is ported from `rtengine/sleef.h` because a device `atan2`
+  one ulp away moved a fringe across the `fringe <
   threshfactor` decision: the export corpus went from 1010 LSB16 to 1 LSB16
-  with the port. `labsharpening.pp3` (impulse 50, defringe radius 2.0 and
-  threshold 13) is 1 LSB16, and a one-refused pair (impulse on, defringe
-  radius 1.0) is `impl=host`, byte-identical to the CPU path. A defringe
-  radius below 1.15, a threshold outside 0..100, the CIE-CAM arm, an image
-  narrower than its defringe window and a non-fp64 device are residuals; a
-  radius below 0.25 is the host no-op and leaves every plane untouched.
+  with the port.
+- ML sharpen edges is bit-identical to the host (`AE=0`) for one to four
+  passes, both channel arms (L only and L/a/b) and the CIE-CAM arm; the
+  working copy is the host's `channel / 327.68f`, and the interior 2..W-3 by
+  2..H-3 write window, the `v < 92` L guard and the `SQR(f2 * f3)` product
+  grouping are all part of the port. ML microcontrast is within 0.037 LSB16
+  (worst 0.036133): the host's `buildBlendMask` sigmoid uses the SSE
+  reciprocal square root, while the device evaluates `x / sqrt(1 + x*x)`
+  exactly, so the mask differs by a fraction of an LSB. Eleven device cases
+  cover edges at 1/2/3/4 passes and 35..100 strength, both channel arms, the
+  3x3 and 5x5 microcontrast matrices across the amount/contrast/uniformity
+  ranges, the impulse+defringe pair combined with each arm, and the CIE-CAM
+  arm (edges only; impulse, defringe and microcontrast are skipped there).
+  Each case changes pixels, so none is vacuous.
+- `labsharpening.pp3` (impulse 50, defringe radius 2.0 and threshold 13) is
+  1 LSB16, `labsharpening-edges.pp3` (three-channel edges, two passes,
+  strength 50) is `AE=0` on the export corpus, and `labsharpening-micro.pp3`
+  (5x5 matrix, amount 20, contrast 20, uniformity 5) is 1 LSB16; all record
+  `impl=opencl`. A one-refused pair (impulse on, defringe radius 1.0) is
+  `impl=host`, byte-identical to the CPU path. A defringe radius below 1.15, a
+  threshold outside 0..100, an edge pass count outside 0..4, an edge amount
+  outside 0..100, a microcontrast amount outside 0..100, a contrast outside
+  0..200, a uniformity outside 0..10, an image narrower than its defringe
+  window and a non-fp64 device are residuals; a defringe radius below 0.25,
+  zero edge passes, an edge amount of 0, microcontrast amount below 1 and
+  contrast exactly 100 are the host no-ops and leave every plane untouched.
 - `tools/opencl/verify.sh --stage-device`, which `--quick` also runs, asserts
   each record and its parity in one step:
 

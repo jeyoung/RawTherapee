@@ -896,9 +896,20 @@ new `lab.sharpening` node with a three-plane L/A/B ABI (`a0040d028`).
 Impulse is bit-exact; defringe corrected 218/218 with a/b within 0.000977
 LSB16; the pair refuses the CIE-CAM arm, images below 8x8, thresholds outside
 0..100, a radius in 0.25..1.15, a device without fp64 and an oversized window.
-Residuals: that radius range, the CIE-CAM arm, ML sharpen edges/microcontrast,
-and prescaled inputs that leave the admitted range (threshold > 100 at scale
->= 2, radius >= 25 at scale ~7.7).
+Residuals: that radius range, the CIE-CAM arm for impulse/defringe and
+microcontrast, and prescaled inputs that leave the admitted range (threshold >
+100 at scale >= 2, radius >= 25 at scale ~7.7).
+ML sharpen edges and ML microcontrast landed 2026-11-03 in the same node and
+the same atomic block (`b864f6168`). Edges is bit-exact (`AE=0`) for 1..4 passes, the L-only
+and L/a/b arms and the CIE-CAM arm; microcontrast is within 0.036 LSB16 because
+the host's `buildBlendMask` sigmoid uses the SSE reciprocal square root while
+the device evaluates it exactly. Eleven device cases cover the arms, strengths
+and the combined impulse+defringe pass, all non-vacuous.
+`labsharpening-edges.pp3` is `AE=0` on the export corpus and
+`labsharpening-micro.pp3` is 1 LSB16, both recording `impl=opencl`. Refusals: edge passes outside 0..4, edge amount
+outside 0..100, microcontrast amount outside 0..100, contrast outside 0..200
+and uniformity outside 0..10. The CIE-CAM arm keeps ML sharpen edges on the Lab
+image and leaves impulse, defringe and microcontrast to the CIE-CAM pipeline.
 
 After that, in order: `lab.tools` residuals. The black-and-white cheap branch
 landed at `43d6f88bd`: `chromiLuminanceCurve()`'s early return zeroes a/b when

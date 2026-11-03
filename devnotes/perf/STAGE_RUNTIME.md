@@ -506,17 +506,18 @@ which POCL does, and float otherwise; the fallback only affects the final
 rounding of a sample. A device that cannot build the program falls back to the
 host builtin, so the node still produces the CPU result.
 
-### Lab sharpening: impulse denoise and defringe
+### Lab sharpening: impulse denoise, defringe and the ML passes
 
-`lab.sharpening` is its own node for the Lab block's impulse denoise and
-defringe. The call-site wrapper is `stage::labSharpeningRun()` in
-`rtengine/stage/lab_sharpening_context.h`, used by `stage_lab_sharpening()` in
-`rtengine/simpleprocess.cc` and by the crop path in `rtengine/dcrop.cc`. It
-submits the three Lab planes to the node and falls back to
-`ImProcFunctions::impulsedenoise()` + `ImProcFunctions::defringe()` when the
-node does not complete; a refused configuration reaches the registered host
-builtin, which runs the same two calls through the context, so a residual is
-recorded `impl=host` and never mixed with a device pass.
+`lab.sharpening` is its own node for the Lab block's impulse denoise,
+defringe, ML sharpen edges and ML microcontrast. The call-site wrapper is
+`stage::labSharpeningRun()` in `rtengine/stage/lab_sharpening_context.h`, used
+by `stage_lab_sharpening()` in `rtengine/simpleprocess.cc` and by the crop
+path in `rtengine/dcrop.cc`. It submits the three Lab planes to the node and
+falls back to `ImProcFunctions::impulsedenoise()` + `defringe()` + `MLsharpen()`
++ `MLmicrocontrast()` when the node does not complete; a refused configuration
+reaches the registered host builtin, which runs the same block through the
+context, so a residual is recorded `impl=host` and never mixed with a device
+pass.
 
 The ABI is `[0]` a tightly packed one-plane F32 L buffer, `[1]` a, `[2]` b,
 then the scalars `[3]` impulse enabled, `[4]` impulse threshold,
@@ -606,14 +607,11 @@ Enabled=false` reaches the node from `lab.sharpening` and records
 `"stage":"output.sharpen","impl":"opencl","source":"opencl"` at the full frame
 size, not at a resized size.
 
-The rest of `lab.sharpening` is host-only: ML sharpen edges and ML
-microcontrast run before or beside the main sharpen call. They are off by
-default. Impulse denoise and defringe are not part of the shared node; they
-are the separate `lab.sharpening` node described above, which is atomic for
-its own pair. A profile that enables only impulse denoise and defringe
-therefore records `"stage":"lab.sharpening","impl":"opencl"`; a profile that
-also enables ML edges or microcontrast records those passes on the host
-beside the device node.
+All four tools are off by default and belong to the separate `lab.sharpening`
+node described above, which is atomic for the whole block. A profile that
+enables any of them records `"stage":"lab.sharpening","impl":"opencl"` when
+the configuration is admitted, and `impl=host` when it is a residual. The
+main sharpen call is not part of this node; it stays in `output.sharpen`.
 
 Evidence, POCL CPU, `RT_OPENCL_ALLOW_CPU=1 RT_OPENCL_RGBPROC=1
 RT_STAGE_OPENCL=1 RT_STAGE_PROFILE=... OMP_NUM_THREADS=1`, export with
