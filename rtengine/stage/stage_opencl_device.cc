@@ -3475,9 +3475,10 @@ RtStageStatus run_working_trc(const std::shared_ptr<OpenCLEnv>& env,
  *   [67] and [68] PTR the working and inverse matrices as nine doubles each
  *        (host-only, copied to a device buffer). [67] is also
  *        Color::gamutmap()'s `p` for the XYZ methods,
- *   [69] int black-and-white flag (1 when `blackwhite.enabled` is set; the
- *        cheap zeroing runs only with the Lab-curve pass off, otherwise the
- *        curve kernel runs the `bwToning` arm in its place).
+ *   [69] int black-and-white flag (1 when the block's `bwonly` holds, i.e.
+ *        `blackwhite.enabled && !colorToning.enabled`; the cheap zeroing runs
+ *        only with the Lab-curve pass off, otherwise the curve kernel runs the
+ *        `bwToning` arm in its place).
  *
  * The pass order is the block's own: LabGrid, then the highlight round, then
  * the shadow round, then local contrast, then the Lab-curve pass, which owns
@@ -3614,9 +3615,10 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
 
     /*
      * `blackwhite.enabled`. Which of the block's two black-and-white arms
-     * runs is decided below from this flag and the Lab-curve flag; the
-     * supported set refuses colour toning with black-and-white, so a
-     * submission with both set can only be the `bwToning` arm.
+     * runs is decided below from this flag and the Lab-curve flag. The call
+     * site exports the block's `bwonly` (`blackwhite.enabled &&
+     * !colorToning.enabled`), so a submission with colour toning carries 0
+     * here: the host's `bwToning` is false and neither arm runs.
      */
     const std::int64_t black_white_flag = args[69].u.i;
     if (black_white_flag != 0 && black_white_flag != 1) {
@@ -3828,11 +3830,11 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
     /*
      * chromiLuminanceCurve()'s `bwToning` arm. The block's predicate is
      * `blackwhite.enabled && !colorToning.enabled` (its `bwq` term is
-     * disabled); colour toning with black-and-white is refused by the
-     * supported set and by the context build, so a submission that sets both
-     * the black-and-white and Lab-curve flags can only be that arm. The
-     * lab curve pass then owns the two arms' slot: the early zeroing kernel
-     * is skipped and the curve kernel writes a and b itself.
+     * compiled out), and the call site exports exactly that as the flag
+     * above, so a submission that sets both the black-and-white and
+     * Lab-curve flags can only be that arm. The lab curve pass then owns the
+     * two arms' slot: the early zeroing kernel is skipped and the curve
+     * kernel writes a and b itself.
      */
     const bool bw_toning = black_white && lab_curve;
 

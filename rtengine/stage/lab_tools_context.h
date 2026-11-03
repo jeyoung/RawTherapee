@@ -312,13 +312,15 @@ typedef struct RtLabToolsResult {
     uint32_t region_count;
     uint32_t region_lut_stride;
     /*
-     * 1 when `blackwhite.enabled` is set. The launcher runs the cheap zeroing
-     * (chromiLuminanceCurve()'s early return) only when `lab_curve_active` is
-     * 0. With the Lab-curve pass active, `rt_lab_tools_lab_curve` runs the
-     * full `bwToning` arm in the same slot and writes a and b itself: the
-     * grey, or the a/b tables' deviation from the original chroma. Colour
-     * toning together with black-and-white is refused by the supported set
-     * and by build().
+     * 1 when chromiLuminanceCurve() runs a black-and-white arm, which is the
+     * block's `bwonly`: `blackwhite.enabled && !colorToning.enabled`. The
+     * launcher runs the cheap zeroing (the block's early return) only when
+     * `lab_curve_active` is 0. With the Lab-curve pass active,
+     * `rt_lab_tools_lab_curve` runs the full `bwToning` arm in the same slot
+     * and writes a and b itself: the grey, or the a/b tables' deviation from
+     * the original chroma. The combination with colour toning is 0 because
+     * the block's `bwToning` is then false and rgbProc() has already done the
+     * black-and-white output.
      */
     uint32_t black_white;
 } RtLabToolsResult;
@@ -410,13 +412,13 @@ struct LabToolsLuts {
  * host table cannot follow within RT_LAB_TOOLS_HUE_LUT_ACCEPT, EPD and any
  * colour-toning method other than LabGrid. A local contrast whose sliders are
  * outside the ABI range is a residual as well. Black-and-white output is
- * admitted through both of
- * chromiLuminanceCurve()'s arms: the cheap one when the Lab curves are off
- * (it only zeroes a and b) and the full `bwToning` one when they are on.
- * Black-and-white with colour toning is a residual because the host's
- * `bwonly` is then false, so neither arm runs. A profile where no tool would
- * run is a residual too: the node would be a no-op and the host block records
- * it.
+ * admitted through both of chromiLuminanceCurve()'s arms: the cheap one when
+ * the Lab curves are off (it only zeroes a and b) and the full `bwToning` one
+ * when they are on. With colour toning the block's `bwonly` is false, so
+ * neither arm runs: the combination is admitted and the block does the same
+ * work as with black-and-white off, because rgbProc() has already produced
+ * the black-and-white image and the toning. A profile where no tool would run
+ * is a residual too: the node would be a no-op and the host block records it.
  */
 bool labToolsSupported(const procparams::ProcParams& params);
 /* True when a shadows/highlights round would run for the given slider

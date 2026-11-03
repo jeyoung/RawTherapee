@@ -488,19 +488,22 @@ bool labToolsSupported(const procparams::ProcParams& params)
      * device repeats it in the Lab-curve pass's slot. The full `bwToning` arm
      * runs when the Lab curves are on: the curve pass writes the zero, or the
      * a/b tables' deviation from the original chroma, in that same slot. Both
-     * are device cases. Colour toning takes the block past both arms (the
-     * host's `bwonly` is `blackwhite.enabled && !colorToning.enabled`), so
-     * black-and-white with any colour toning stays a residual.
+     * are device cases.
+     *
+     * The block computes `bwonly = blackwhite.enabled && !colorToning.enabled`
+     * and `bwToning = bwonly`, because its `bwq` term is compiled out
+     * (improcfun.cc:4602-4606). Colour toning therefore takes the block past
+     * both arms: the Lab pass does exactly the work it does with
+     * black-and-white off. The B&W mixer and the non-LabGrid toning methods
+     * run earlier, in rgbProc(), before this node, so nothing in this block
+     * depends on the combination. The flag below repeats the block's `bwonly`
+     * rather than `blackwhite.enabled`, so the device skips both arms for the
+     * combination exactly as the host does. The launcher runs the cheap
+     * zeroing only when the Lab-curve pass is off, so the two arms are never
+     * both applied.
      */
-    if (params.blackwhite.enabled && params.colorToning.enabled) {
-        return false;
-    }
-    /*
-     * The call site exports `black_white` from this flag. The launcher runs
-     * the cheap zeroing only when the Lab-curve pass is off, so the two are
-     * never both applied.
-     */
-    const bool black_white = params.blackwhite.enabled;
+    const bool black_white =
+        params.blackwhite.enabled && !params.colorToning.enabled;
 
     /*
      * Vibrance runs on the device only when its parameters are inside the
@@ -661,14 +664,14 @@ int LabToolsContext::build(RtLabToolsResult& out)
     /*
      * chromiLuminanceCurve()'s black-and-white output is ported in both arms:
      * the early return's zeroing and, with the Lab curves on, the full
-     * `bwToning` arm. Colour toning takes the block past both, so the
-     * predicate refuses it; repeat the condition here so a direct build never
-     * exports a flag the device cannot honour.
+     * `bwToning` arm. The block runs an arm only when its `bwonly`, and so its
+     * `bwToning`, is true; colour toning makes `bwonly` false, so neither arm
+     * runs and the block is the plain Lab pass. Export the block's `bwonly`
+     * here, not `blackwhite.enabled`, so a direct build cannot zero a and b
+     * for a combination the host leaves coloured (improcfun.cc:4602-4606).
      */
-    if (params_.blackwhite.enabled && params_.colorToning.enabled) {
-        return 1;
-    }
-    black_white_ = params_.blackwhite.enabled;
+    black_white_ =
+        params_.blackwhite.enabled && !params_.colorToning.enabled;
 
     const bool labgrid =
         params_.colorToning.enabled &&

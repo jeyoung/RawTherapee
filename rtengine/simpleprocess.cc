@@ -1679,8 +1679,10 @@ private:
          * refuses vibrance, the Lab-curve pass, local contrast and regions on
          * a GPU device, whose arithmetic rounding can move a Munsell-limit
          * pixel or the region mask, and the Lab-curve, local-contrast and
-         * region passes on a device without fp64. Black-and-white output with
-         * colour toning is a residual.
+         * region passes on a device without fp64. Black-and-white with colour
+         * toning is a device case: rgbProc() has already produced the
+         * black-and-white image and the toning, and the block's `bwonly` is
+         * false, so the node skips both black-and-white arms.
          */
         if (stage::node_device("lab.tools") == stage::StageNodeDevice::OpenCL) {
             const bool supported = stage::labToolsSupported(params);
