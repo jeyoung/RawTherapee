@@ -9437,6 +9437,9 @@ void test_lab_wavelet_denoise(bool available)
         bool final;
         bool toning;
         int image; /* 0 random, 1 skin */
+        /* User chroma strength; inert for the forced arm but admitted. */
+        double chromfi;
+        double chromco;
     };
 
     const DenoiseCase cases[] = {
@@ -9475,6 +9478,12 @@ void test_lab_wavelet_denoise(bool available)
          true, true, true, 0},
         {"denoise padded all panels", 179, 161, 5, {40, 30, 20, 10, 0}, 5.0,
          true, true, true, true, 1},
+        {"denoise chroma fine", 238, 160, 6, {40, 30, 20, 10, 5}, 7.0, true,
+         false, false, false, 0, 40.0, 0.0},
+        {"denoise chroma coarse", 238, 160, 6, {40, 30, 20, 10, 5}, 7.0, true,
+         false, false, false, 0, 0.0, 60.0},
+        {"denoise chroma both", 238, 160, 6, {40, 30, 20, 10, 5}, 7.0, false,
+         false, false, false, 0, 100.0, 100.0},
     };
 
     unsigned seed = 0x51b9e3a7u;
@@ -9501,6 +9510,8 @@ void test_lab_wavelet_denoise(bool available)
             params.wavelet.wavclCurve = final_diagonal_curve();
             params.wavelet.opacityCurveWL = final_opacity_curve();
         }
+        params.wavelet.chromfi = item.chromfi;
+        params.wavelet.chromco = item.chromco;
         if (item.toning) {
             params.wavelet.exptoning = true;
             params.wavelet.sigmaton = 1.0;
@@ -9574,6 +9585,22 @@ void test_lab_wavelet_denoise(bool available)
         check(d.over == 0,
               (std::string("lab.wavelet denoise ") + item.label +
                " is within one LSB16").c_str());
+        if (item.chromfi != 0.0 || item.chromco != 0.0) {
+            /* The forced arm ignores variC at local == 1 and cp.chromco stays
+             * below the ramp threshold, so the host result must be identical
+             * with the sliders zeroed. */
+            rtengine::procparams::ProcParams zero = params;
+            zero.wavelet.chromfi = 0.0;
+            zero.wavelet.chromco = 0.0;
+            rtengine::ImProcFunctions zero_ipf(&zero, false);
+            LabImage zero_image(item.width, item.height);
+            zero_image.CopyFrom(&source);
+            labWaveletHostBlock(zero_ipf, zero, zero_image);
+            const Distribution zd = distribution(view(zero_image), view(cpu));
+            check(zd.max_abs == 0.0,
+                  (std::string("lab.wavelet denoise ") + item.label +
+                   " leaves the forced arm unchanged").c_str());
+        }
 
         /* Non-vacuity: the same profile with the denoise panel off must
          * produce a different host result. */
@@ -9595,15 +9622,15 @@ void test_lab_wavelet_denoise(bool available)
     }
 
     /*
-     * Refusals: BiShrink, a user chroma denoise or balance, the hue curve,
+     * Refusals: BiShrink, balance chroma, the hue curve,
      * colour-by-noise, the Thrden arm, an all-zero slider set, an
      * out-of-range slider and the 128-pixel window must run the host block
      * byte for byte. The "cur" refinement has its own matrix below.
      */
     const char* residual_labels[] = {
-        "quamethod agre", "user chromfi", "user chromco", "balance chroma",
-        "wavhuecurve", "cbenab", "thrden", "ballum range",
-        "level range", "all sliders zero", "sub-128 window"};
+        "quamethod agre", "balance chroma", "wavhuecurve", "cbenab", "thrden",
+        "ballum range", "level range", "all sliders zero",
+        "sub-128 window"};
     for (const char* label : residual_labels) {
         rtengine::procparams::ProcParams params;
         const double noise[5] = {35, 25, 15, 8, 4};
@@ -9613,10 +9640,6 @@ void test_lab_wavelet_denoise(bool available)
 
         if (std::strcmp(label, "quamethod agre") == 0) {
             params.wavelet.quamethod = "agre";
-        } else if (std::strcmp(label, "user chromfi") == 0) {
-            params.wavelet.chromfi = 1.0;
-        } else if (std::strcmp(label, "user chromco") == 0) {
-            params.wavelet.chromco = 1.0;
         } else if (std::strcmp(label, "balance chroma") == 0) {
             params.wavelet.balchrom = 10.0;
         } else if (std::strcmp(label, "wavhuecurve") == 0) {
@@ -9880,12 +9903,11 @@ void test_lab_wavelet_denoise_curve()
 
     /*
      * Refusals specific to "cur": an out-of-range sigma (the block divides
-     * by it), the expert level pairing, the Thrden path and a user chroma
-     * strength must run the host block byte for byte.
+     * by it), the expert level pairing and the Thrden path must run the host
+     * block byte for byte. A user chroma strength is admitted and inert.
      */
     const char* residual_labels[] = {
-        "cur sigm above range", "cur expert", "cur thrden",
-        "cur user chromfi"};
+        "cur sigm above range", "cur expert", "cur thrden"};
     for (const char* label : residual_labels) {
         rtengine::procparams::ProcParams params;
         wavelet_denoise_params(params, 6, noise, 7.0);
@@ -9896,10 +9918,8 @@ void test_lab_wavelet_denoise_curve()
             params.wavelet.sigm = 5.0;
         } else if (std::strcmp(label, "cur expert") == 0) {
             params.wavelet.complexmethod = "expert";
-        } else if (std::strcmp(label, "cur thrden") == 0) {
-            params.wavelet.thrden = 5.0;
         } else {
-            params.wavelet.chromfi = 1.0;
+            params.wavelet.thrden = 5.0;
         }
 
         const int width = 238;
