@@ -6052,6 +6052,7 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
     bool wavelet_final = false;
     bool wavelet_toning = false;
     bool wavelet_denoise = false;
+    bool wavelet_bishrink = false;
     bool wavelet_refine = false;
     std::uint32_t wavelet_refine_poly = 0;
     bool wavelet_refine_expert = false;
@@ -6110,6 +6111,8 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
              context->wavelet.toning != 1) ||
             (context->wavelet.denoise != 0 &&
              context->wavelet.denoise != 1) ||
+            (context->wavelet.bishrink != 0 &&
+             context->wavelet.bishrink != 1) ||
             (context->wavelet.refine != 0 &&
              context->wavelet.refine != 1) ||
             (context->wavelet.final_refresh != 0 &&
@@ -6171,6 +6174,11 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
         wavelet_final = context->wavelet.final != 0;
         wavelet_toning = context->wavelet.toning != 0;
         wavelet_denoise = context->wavelet.denoise != 0;
+        if (context->wavelet.bishrink != 0 && !wavelet_denoise) {
+            error = "lab.wavelet BiShrink pair needs the denoise arm";
+            return RT_STAGE_INVALID;
+        }
+        wavelet_bishrink = context->wavelet.bishrink != 0;
         wavelet_refine = context->wavelet.refine != 0;
         wavelet_refine_poly = context->wavelet.refine_poly;
         if (wavelet_refine_poly > RT_LAB_WAVELET_REFINE_POLY_MAX) {
@@ -7231,6 +7239,7 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
         cl_kernel noisevar_kernel = nullptr;
         cl_kernel shrink_l_kernel = nullptr;
         cl_kernel shrink_ab_kernel = nullptr;
+        cl_kernel bishrink_ab_kernel = nullptr;
         cl_kernel shrink_apply_kernel = nullptr;
         cl_kernel box_h_kernel = nullptr;
         cl_kernel box_v_kernel = nullptr;
@@ -7315,6 +7324,10 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
                                       error);
             shrink_apply_kernel = compiled_kernel_entry(
                 env, def, "rt_lab_wavelet_w_shrink_apply", error);
+            if (wavelet_bishrink) {
+                bishrink_ab_kernel = compiled_kernel_entry(
+                    env, def, "rt_lab_wavelet_w_bishrink_ab", error);
+            }
             box_h_kernel =
                 compiled_kernel_entry(env, def, "rt_lw_box_h", error);
             box_v_kernel =
@@ -7365,6 +7378,7 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
               shrink_l_kernel == nullptr || shrink_ab_kernel == nullptr ||
               shrink_apply_kernel == nullptr || box_h_kernel == nullptr ||
               box_v_kernel == nullptr)) ||
+            (wavelet_bishrink && bishrink_ab_kernel == nullptr) ||
             (wavelet_refine &&
              (refine_kernel == nullptr || copy_kernel == nullptr)) ||
             (wavelet_ba && ba_kernel == nullptr)) {
@@ -8838,10 +8852,13 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
          * The forced chroma denoise: WaveletDenoiseAllAB() with local == 1,
          * useNoiseCCurve true and the plain noisevarchrom plane. The L bands
          * held by the caller are the post-contrast coefficients the host
-         * reads for mag_L.
+         * reads for mag_L. `level_begin`/`level_end` select the level range:
+         * the BiShrink pair's own coarsest level is this same ShrinkAllAB()
+         * pass, and it runs before the second MAD build.
          */
         auto denoise_ab = [&](StageDeviceBufferPtr (*bandset)[3],
-                              uint32_t plane_index) -> bool {
+                              uint32_t plane_index, int level_begin,
+                              int level_end) -> bool {
             const cl_int nvc_pitch = pitch_of(nvc_device);
             const cl_int cl_sfave_pitch = pitch_of(sfave_device);
             const cl_int cl_sfaved_pitch = pitch_of(sfaved_device);
@@ -8849,7 +8866,7 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
             cl_mem sfave_memory = memory_of(sfave_device);
             cl_mem sftmp_memory = memory_of(sftmp_device);
             cl_mem sfaved_memory = memory_of(sfaved_device);
-            for (int level = 0; level < denoise_levels; ++level) {
+            for (int level = level_begin; level < level_end; ++level) {
                 const cl_int cl_radius =
                     std::min(level + 2, std::min(cl_half_w - 1, cl_half_h - 1));
                 for (int dir = 0; dir < 3; ++dir) {
@@ -8967,6 +8984,72 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
         };
 
         /*
+         * WaveletDenoiseAll_BiShrinkAB()'s local shrink on a level below the
+         * coarsest. `ip_wavelet()` runs the pair and then the standard arm, so
+         * the coarsest level and the whole second pass are the standard
+         * `shrink_ab_kernel`.
+         */
+        auto bishrink_ab = [&](StageDeviceBufferPtr (*bandset)[3],
+                               uint32_t plane_index) -> bool {
+            const cl_int nvc_pitch = pitch_of(nvc_device);
+            cl_mem nvc_memory = memory_of(nvc_device);
+            const cl_float noisevar = RT_LAB_WAVELET_DENOISE_NOISEVAR_AB;
+            for (int level = 0; level < denoise_levels; ++level) {
+                for (int dir = 0; dir < 3; ++dir) {
+                    /* The coarsest level runs ShrinkAllAB() inside the pair. */
+                    if (level == denoise_levels - 1) {
+                        continue;
+                    }
+                    const float mad_l_dir =
+                        wavelet_params[cl_denoise_offset +
+                                       static_cast<int>(
+                                           RT_LAB_WAVELET_DENOISE_HEADER) +
+                                       level * 3 + dir];
+                    const float mad_ab =
+                        wavelet_params[cl_denoise_offset +
+                                       static_cast<int>(
+                                           RT_LAB_WAVELET_DENOISE_HEADER) +
+                                       static_cast<int>(plane_index) *
+                                           wavelet_levels * 3 +
+                                       level * 3 + dir];
+                    cl_mem band_ab = memory_of(bandset[level][dir]);
+                    cl_int ab_pitch = pitch_of(bandset[level][dir]);
+                    cl_mem band_l = memory_of(bands_hold[level][dir]);
+                    cl_int band_l_pitch = pitch_of(bands_hold[level][dir]);
+                    bool ok = true;
+                    ok = ok && set_arg(bishrink_ab_kernel, 0, sizeof(cl_mem),
+                                       &band_ab);
+                    ok = ok && set_arg(bishrink_ab_kernel, 1, sizeof(cl_int),
+                                       &ab_pitch);
+                    ok = ok && set_arg(bishrink_ab_kernel, 2, sizeof(cl_mem),
+                                       &band_l);
+                    ok = ok && set_arg(bishrink_ab_kernel, 3, sizeof(cl_int),
+                                       &band_l_pitch);
+                    ok = ok && set_arg(bishrink_ab_kernel, 4, sizeof(cl_mem),
+                                       &nvc_memory);
+                    ok = ok && set_arg(bishrink_ab_kernel, 5, sizeof(cl_int),
+                                       &nvc_pitch);
+                    ok = ok && set_arg(bishrink_ab_kernel, 6, sizeof(cl_float),
+                                       &mad_l_dir);
+                    ok = ok && set_arg(bishrink_ab_kernel, 7, sizeof(cl_float),
+                                       &mad_ab);
+                    ok = ok && set_arg(bishrink_ab_kernel, 8, sizeof(cl_float),
+                                       &noisevar);
+                    ok = ok && set_arg(bishrink_ab_kernel, 9, sizeof(cl_int),
+                                       &cl_half_w);
+                    ok = ok && set_arg(bishrink_ab_kernel, 10,
+                                       sizeof(cl_int), &cl_half_h);
+                    if (!ok || !launch(bishrink_ab_kernel, half_global,
+                                       "lab.wavelet BiShrink AB")) {
+                        error = "lab.wavelet BiShrink AB arguments failed";
+                        return false;
+                    }
+                }
+            }
+            return true;
+        };
+
+        /*
          * noisevarchrom is computed once from the still-original a and b
          * planes, exactly as the host does before it denoises either of them.
          */
@@ -8998,6 +9081,35 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
                 return false;
             }
             return true;
+        };
+
+        /*
+         * `quaMethod == "agre"`: the BiShrink pair runs before the standard
+         * arm on every plane. `WaveletDenoiseAll_BiShrinkL()` is, at the
+         * block's `edge == 6`, the same `ShrinkAllL()` arithmetic as
+         * `WaveletDenoiseAllL()` with the same `madL` and `vari`, so the L
+         * pair is the standard tail twice with no new MAD. The chroma pair
+         * differs: `ShrinkAllAB()` calls `Mad()` on the band it is about to
+         * shrink, so the second pass needs squared MAD from the post-BiShrink
+         * bands.
+         */
+        auto denoise_l_pair = [&](StageDeviceBufferPtr (*bandset)[3]) -> bool {
+            return (!wavelet_bishrink || denoise_l(bandset)) &&
+                   denoise_l(bandset);
+        };
+        auto denoise_ab_pair = [&](StageDeviceBufferPtr (*bandset)[3],
+                                   uint32_t plane_index) -> bool {
+            if (wavelet_bishrink &&
+                (!bishrink_ab(bandset, plane_index) ||
+                 /* The pair's coarsest level is ShrinkAllAB() itself, with
+                  * the pre-denoise squared MAD the first build left in the
+                  * tail. */
+                 !denoise_ab(bandset, plane_index, denoise_levels - 1,
+                             denoise_levels) ||
+                 !run_mad(bandset, plane_index, denoise_levels))) {
+                return false;
+            }
+            return denoise_ab(bandset, plane_index, 0, denoise_levels);
         };
 
         /*
@@ -9042,7 +9154,7 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
                         return false;
                     }
                 }
-                if (!denoise_l(bands_hold)) {
+                if (!denoise_l_pair(bands_hold)) {
                     return false;
                 }
                 if (wavelet_refine) {
@@ -9081,7 +9193,8 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
                 }
                 if (!forward_analysis(plane_a_memory, plane_a_pitch, bands,
                                       wavelet_low, ab_levels) ||
-                    !run_mad(bands, 1, ab_levels) || !denoise_ab(bands, 1) ||
+                    !run_mad(bands, 1, ab_levels) ||
+                    !denoise_ab_pair(bands, 1) ||
                     !statistics(bands, 1, ab_levels) ||
                     !multiply(bands, wavelet_low, 1, ab_levels) ||
                     (select && !selection_pass(bands, wavelet_low, 1,
@@ -9092,7 +9205,8 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
                 }
                 if (!forward_analysis(plane_b_memory, plane_b_pitch, bands,
                                       wavelet_low, ab_levels) ||
-                    !run_mad(bands, 2, ab_levels) || !denoise_ab(bands, 2) ||
+                    !run_mad(bands, 2, ab_levels) ||
+                    !denoise_ab_pair(bands, 2) ||
                     !statistics(bands, 2, ab_levels) ||
                     !multiply(bands, wavelet_low, 2, ab_levels) ||
                     (select && !selection_pass(bands, wavelet_low, 2,

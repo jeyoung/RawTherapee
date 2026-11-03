@@ -58,7 +58,7 @@ struct ProcParams;
  * wavelet tool's own skin protection: the equaliser only changes L, so a/b
  * and their masks are identical at the start of both passes.
  */
-#define RT_LAB_WAVELET_CONTEXT_VERSION 15u
+#define RT_LAB_WAVELET_CONTEXT_VERSION 16u
 /* "LWCT": rejects a stale or unrelated pointer before any callback runs. */
 #define RT_LAB_WAVELET_CONTEXT_MAGIC 0x4C574354u
 /* The number of levels of the directional pyramid. */
@@ -270,18 +270,27 @@ struct ProcParams;
 #define RT_LAB_WAVELET_TONING_HEADER 19u
 #define RT_LAB_WAVELET_TONING_MEA_ENTRIES 10u
 /*
- * The denoise tail, present only when the standard-L arm and the chroma arm
- * the block forces at six levels are armed:
+ * The denoise tail, present only when the denoise arm the block forces at six
+ * levels is armed:
  *   [0..5] vari[0..5]
  *   [6]    ballum
  *   then one plane-major block per plane: levels * 3 squared MAD entries,
  *   direction-major inside each level. Plane 0 is L, planes 1 and 2 are the
  *   a and b bands the forced chroma arm denoises.
- * The MAD histogram is a separate internal device buffer, not a node
- * argument.
+ * `quaMethod` "cons" runs `WaveletDenoiseAllL()` and `WaveletDenoiseAllAB()`
+ * once per plane; "agre" runs the BiShrink pair first and then those same
+ * passes, reusing this tail. The MAD histogram is a separate internal device
+ * buffer, not a node argument.
  */
 #define RT_LAB_WAVELET_DENOISE_HEADER 7u
 #define RT_LAB_WAVELET_DENOISE_MAD_ENTRIES 3u
+/*
+ * The chroma noise variance `noisevarab_r` that ip_wavelet() passes to
+ * WaveletDenoiseAllAB() and WaveletDenoiseAll_BiShrinkAB(). The block
+ * hard-codes 100.f; it is not a profile value, so the device takes it from
+ * here rather than from the parameter table.
+ */
+#define RT_LAB_WAVELET_DENOISE_NOISEVAR_AB 100.0f
 /*
  * The denoise refinement tail (`sliMethod == "cur"`, or `sliMethod == "sli"`
  * with a non-zero Thrden), present only when the refinement is admitted. It
@@ -470,6 +479,17 @@ typedef struct RtLabWaveletWavelet {
     uint32_t toning;
     /* 1 when the denoise tail is present in `params`. */
     uint32_t denoise;
+    /*
+     * 1 when `quaMethod == "agre"` selects the BiShrink pair. `ip_wavelet()`
+     * runs `WaveletDenoiseAll_BiShrinkL()` and then `WaveletDenoiseAllL()`,
+     * and each a/b plane gets `WaveletDenoiseAll_BiShrinkAB()` and then
+     * `WaveletDenoiseAllAB()`. The pair reads the same `vari`, `ballum` and
+     * squared MAD tail as the standard arm, so the table is unchanged; only
+     * the number of coefficient passes differs. The forced chroma pair
+     * recomputes its own squared MAD from the post-BiShrink bands, because
+     * `ShrinkAllAB()` calls `Mad()` on the band it is about to shrink.
+     */
+    uint32_t bishrink;
     /* 1 when the final panel's guided soft radius tail is present. */
     uint32_t softend;
     /* 1 when the tail carries the coefficient-domain second block (Thrend >
@@ -867,6 +887,12 @@ int labWaveletUntrimmedLevels(const procparams::ProcParams& params,
  * variant needs a non-identity `opacityCurveW`, the sliders and `sigmadir`
  * must be inside their widget ranges, and the L and a/b level counts must
  * agree because this node carries one count for both planes.
+ *
+ * The denoise arm carries `quaMethod` "cons" (the standard passes) and "agre"
+ * (the BiShrink pair before them on L and on each a/b plane). The pair reads
+ * the same `vari`, `ballum` and squared MAD tail; only the coefficient passes
+ * differ. An unknown method stays a residual because the block leaves
+ * `cp.quamet` uninitialised.
  */
 bool labWaveletWaveletSupported(const procparams::ProcParams& params,
                                 int width, int height);
@@ -963,6 +989,9 @@ private:
     bool wavelet_final_ = false;
     bool wavelet_toning_ = false;
     bool wavelet_denoise_ = false;
+    /* 1 when `quaMethod == "agre"` runs the BiShrink pair before the standard
+     * arm on L and on each a/b plane. */
+    bool wavelet_bishrink_ = false;
     bool wavelet_refine_ = false;
     bool wavelet_refine_active_ = false;
     /* The refinement's levref and its expert pairing. */

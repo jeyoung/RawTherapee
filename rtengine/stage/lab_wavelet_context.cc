@@ -511,10 +511,10 @@ void toningMultipliers(const procparams::WaveletParams& wavelet,
 /*
  * The standard-L denoise panel's arithmetic plus the chroma denoise arm the
  * block forces when Expnoise selects six levels. The plain slider set, the
- * "sli" Thrden refinement, the "cur" denoise-curve refinement and the expert
- * level pairing are ported; the hue modulation stays a host residual, and a
- * user chroma denoise or noise balance would change the forced 0.01 chroma
- * strength.
+ * "sli" Thrden refinement, the "cur" denoise-curve refinement, the expert
+ * level pairing and the BiShrink pair (`quaMethod == "agre"`) are ported; the
+ * hue modulation stays a host residual, and a user chroma denoise or noise
+ * balance would change the forced 0.01 chroma strength.
  */
 bool denoiseAdmitted(const procparams::WaveletParams& wavelet, int width,
                      int height)
@@ -526,8 +526,13 @@ bool denoiseAdmitted(const procparams::WaveletParams& wavelet, int width,
         std::min(width, height) <= LAB_WAVELET_MIN_DENOISE_WINDOW) {
         return false;
     }
-    /* The standard WaveletDenoiseAllL/AB arms, not the BiShrink pair. */
-    if (wavelet.quamethod != "cons") {
+    /*
+     * "cons" runs WaveletDenoiseAllL()/WaveletDenoiseAllAB() once per plane;
+     * "agre" runs WaveletDenoiseAll_BiShrinkL()/AB() first and then those same
+     * passes, so the pair reuses `vari`, `ballum` and the squared MAD tail.
+     * An unknown method leaves cp.quamet uninitialised in the block.
+     */
+    if (wavelet.quamethod != "cons" && wavelet.quamethod != "agre") {
         return false;
     }
     /*
@@ -1546,6 +1551,7 @@ RtLabWaveletContext LabWaveletContext::descriptor(bool supported)
     context.wavelet.final = wavelet_final_ ? 1u : 0u;
     context.wavelet.toning = wavelet_toning_ ? 1u : 0u;
     context.wavelet.denoise = wavelet_denoise_ ? 1u : 0u;
+    context.wavelet.bishrink = wavelet_bishrink_ ? 1u : 0u;
     context.wavelet.softend = softend_active_ ? 1u : 0u;
     context.wavelet.softend_thrend = softend_thrend_ ? 1u : 0u;
     context.wavelet.softend_thrend_poly = static_cast<uint32_t>(
@@ -1811,6 +1817,8 @@ int LabWaveletContext::build(RtLabWaveletResult& out)
      * well, so it needs the planes even when no panel modifies them.
      */
     wavelet_denoise_ = denoiseAdmitted(params_.wavelet, width_, height_);
+    wavelet_bishrink_ =
+        wavelet_denoise_ && params_.wavelet.quamethod == "agre";
     {
         const procparams::WaveletParams& wavelet = params_.wavelet;
         /* The "cur" arm samples the block's WavCurve over wavdenoise when

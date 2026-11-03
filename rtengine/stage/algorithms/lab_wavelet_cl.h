@@ -2186,6 +2186,43 @@ __kernel void rt_lab_wavelet_w_shrink_ab(
 }
 
 /*
+ * WaveletDenoiseAll_BiShrinkAB()'s local shrink for a level below the
+ * coarsest. Unlike ShrinkAllAB() it applies `SQR(1 - exp(...))` directly,
+ * with no box blur, and the chroma noise variance is `noisevarchrom *
+ * (noisevar_ab * madab)`. `mad_ab` is the block's squared MAD and `mad_l` the
+ * L band's for the same level and direction; the L term uses the host's
+ * vectorised grouping, `mag_L * (1 / (9 * mad_L))`.
+ */
+__kernel void rt_lab_wavelet_w_bishrink_ab(
+    __global float* band_ab, int ab_pitch,
+    __global const float* band_l, int l_pitch,
+    __global const float* nvc, int nvc_pitch,
+    float mad_l, float mad_ab, float noisevar,
+    int w, int h)
+{
+    const int x = get_global_id(0);
+    const int y = get_global_id(1);
+    if (x >= w || y >= h) {
+        return;
+    }
+    /* The block runs the whole multiply only above this noise variance. */
+    if (noisevar <= 0.001f) {
+        return;
+    }
+    const int at = y * ab_pitch + x;
+    const float value_ab = band_ab[at];
+    const float value_l = band_l[y * l_pitch + x];
+    const float mag_ab = value_ab * value_ab;
+    const float mag_l = value_l * value_l;
+    const float mad_abr = noisevar * mad_ab;
+    const float noise = nvc[y * nvc_pitch + x] * mad_abr;
+    const float rmad_l = 1.0f / (mad_l * 9.0f);
+    const float factor =
+        1.0f - exp(-(mag_ab / noise) - (mag_l * rmad_l));
+    band_ab[at] = value_ab * (factor * factor);
+}
+
+/*
  * ShrinkAllL()/ShrinkAllAB()'s blend of the local and box-blurred shrinkage.
  */
 __kernel void rt_lab_wavelet_w_shrink_apply(
