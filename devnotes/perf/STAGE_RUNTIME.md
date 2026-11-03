@@ -2900,8 +2900,8 @@ submission.
 `local.adjustments` is the export block at `simpleprocess.cc:1468`. The device
 increment covers any number of `norm` spots in list order, both `ELI` and
 `RECT`, inactive clamp-only spots, the L/C/H curves, local log encoding,
-Gaussian blur, local dehaze, local CBDL, vibrance, Gaussian local contrast,
-local sharpening, Lab-mode `"std"`
+Blur & Noise (Gaussian and median), local dehaze, local CBDL, vibrance,
+Gaussian local contrast, local sharpening, Lab-mode `"std"`
 shadows/highlights, per-pixel `"soft"` soft light, and the
 `avoidgamutMethod` values `"NONE"` and `"MUNS"`. The per-spot clamp
 is bit-exact against the host, so the Munsell pass runs on the device. The
@@ -2911,17 +2911,19 @@ soft-light `"reti"` method, explicit masks, soft radius, merge, recursion,
 LabGrid, the RGB and exposure curves, `reparcol != 100`, the log tool's
 guided-filter `detail` arm, `autocompute`, CIE CAM and `strlog`, capture
 sharpening, sharpening gamma/blur/mask-view and a separable
-sharpening radius, Blur & Noise's median, guided, inverse, FFT, noise, grain,
-bilateral, non-local-means and wavelet-denoise arms and a non-zero denoise
-curve, and this node's own `avoidgamutMethod` LAB/XYZ/XYZREL arms
+sharpening radius, Blur & Noise's guided and inverse arms, a zero median
+method, out-of-range passes, the FFT, noise, grain, bilateral and
+non-local-means additions, an active wavelet denoise (a non-zero curve with
+Quality other than "Off", or `qualityMethod "enhden"`), and this node's own
+`avoidgamutMethod` LAB/XYZ/XYZREL arms
 stay on the host. The tools run in the block's order:
-log encoding, blur, dehaze, CBDL, vibrance, shadows/highlights, soft light,
-local contrast, local sharpening, then Colour & Light.
+log encoding, Blur & Noise, dehaze, CBDL, vibrance, shadows/highlights, soft
+light, local contrast, local sharpening, then Colour & Light.
 
 ### ABI, state and host setup
 
 The node takes a three-plane `F32` Lab buffer, a pointer to
-`RtLocalAdjustmentsContext` (version 10, magic `0x4C414A43`, size checked,
+`RtLocalAdjustmentsContext` (version 11, magic `0x4C414A43`, size checked,
 `spot_count` from the profile) and the block support flag. The call site only
 prefills `labView` with `rgb2lab(baseImg)` when the block is active and the
 whole-block predicate is true; an inactive block never enters the node.
@@ -2930,7 +2932,7 @@ The launcher keeps a contiguous host staging copy of the Lab image and a
 device `reserved` copy of the initial image. For each spot it calls
 `build(self, spot, &staging, &setup)`, which runs the block's own
 `calcLocalParams()`, `calc_ref()` on the current Lab, `complexCurvelocal()`
-and the curve factories. It then uploads that spot's 145-float record and
+and the curve factories. It then uploads that spot's 148-float record and
 tables, runs the passes, and reads the device image back into the staging
 copy. Spot N+1's references therefore see spot N's result through the same
 read-back path as the CPU's `labView`. `reserved` is never updated, matching
@@ -2958,8 +2960,9 @@ lab.regions `xlogf`/`xexpf`/`pow_F` ports, and the local-adjustments kernels:
   block's deconvolution sees zeros outside the image, not the IIR border
   rule. The blend reads the sharpened L plane directly at
   `(x - begx, y - begy)`.
-- `rt_local_adjustments_plane_copy`: copies one full-image Lab plane into the
-  deltaE reference blur.
+- `rt_local_adjustments_plane_copy`: copies one Lab plane, with source and
+  destination plane offsets, into the deltaE reference blur, and copies the
+  median arm's odd final pass back into the ROI.
 - `rt_sharpen_mask`, `rt_sharpen_iir_line`, `rt_sharpen_rld_init`,
   `rt_sharpen_div3/5/7`, `rt_sharpen_mult3/5/7`,
   `rt_local_adjustments_sharpen_damp` and `rt_sharpen_rld_final`: the output
@@ -2981,11 +2984,17 @@ lab.regions `xlogf`/`xexpf`/`pow_F` ports, and the local-adjustments kernels:
   `(2 + 0.2 * blurcolde)` for colour, `(2 + 0.2 * blurSHde)` for
   shadows/highlights and `lp.rad / (sk * 1.4)` for Blur & Noise; the colour,
   SH and blur references take the SSE path only.
-- Blur & Noise pass: copies the ROI, blurs the luminance, chroma or all
-  planes in place with the blur arm's host-built coefficients and blends with
-  `BlurNoise_Local()`'s senstype-0 scope. The blend reuses
-  `rt_local_adjustments_blend` with the `mindE` base set to four and the
-  full-image `3/sk` reference blur, which is shared with local sharpening.
+- Blur & Noise pass: copies the ROI, applies one of two arms to the
+  luminance, chroma or all planes and blends with `BlurNoise_Local()`'s
+  senstype-0 scope. The Gaussian arm blurs in place with the blur arm's
+  host-built coefficients at `lp.rad / (sk * 1.4)`; the median arm runs
+  `rt_local_adjustments_median` once per pass, ping-ponging the ROI copy with
+  a second three-plane buffer, and copies an odd final pass back. The kernel
+  reproduces `Median_Denoise()`'s sorted-window interior, its border copy and
+  the value at index `count / 2`; only the value is read, so an insertion
+  sort is exact. The blend reuses `rt_local_adjustments_blend` with the
+  `mindE` base set to four and the full-image `3/sk` reference blur, which is
+  shared with local sharpening.
 - `rt_lab_tools_mask`, `rt_lab_tools_subsample`, `rt_lab_tools_box_h`,
   `rt_lab_tools_box_v`, `rt_lab_tools_combine`, `rt_lab_tools_upsample` and
   `rt_lab_tools_apply`: the lab.tools shadows/highlights round. The local node
@@ -3004,7 +3013,7 @@ lab.regions `xlogf`/`xexpf`/`pow_F` ports, and the local-adjustments kernels:
   the predicate. Its chroma normalisation repeats the host's SIMD/scalar
   split in the same way as the clamp.
 
-The per-spot order is prefilter, then log encoding, blur, dehaze, CBDL,
+The per-spot order is prefilter, then log encoding, Blur & Noise, dehaze, CBDL,
 vibrance, shadows/highlights, soft light, local contrast, local sharpening and
 Colour & Light, then the
 tail clamp. Each tool takes a fresh ROI copy and its own deltaE blur.

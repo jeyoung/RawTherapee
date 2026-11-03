@@ -65,6 +65,8 @@ pairs are exact. The gate is the peak absolute error (PAE) in normalised units;
 | 2026-11-03 | uncommitted | POCL (CPU) | colorspace_flowers.pef / `localadjustments-blur.pp3`, `local.adjustments` | off vs auto, 16-bit TIFF | 1 LSB | PASS |
 | 2026-11-03 | uncommitted | POCL (CPU) | 14-case blur matrix (radii 2/5/10/18/28, luminance/chroma/all planes, sensitivity 0/100, no scope, sub-rectangle ROI, RECT, colour, log, soft light, MUNS, 179x49), `stage-residency-test` | device vs host block | 0.023 LSB (worst) | PASS |
 | 2026-11-03 | uncommitted | POCL (CPU) | 13-case blur residual matrix, `stage-residency-test` | device vs host block | 0 (host) | PASS |
+| 2026-11-03 | uncommitted | POCL (CPU) | colorspace_flowers.pef / `localadjustments-blur-denoise.pp3`, `local.adjustments` | off vs auto, 16-bit TIFF | 1 LSB | PASS |
+| 2026-11-03 | uncommitted | POCL (CPU) | 15-case Blur & Noise median and denoise-curve matrix (3x3/5x5/7x7/9x9, 1/3/4 passes, chroma, ROI edges, colour, log, 179x49, blur-then-median, the default curve and flat curves 0.2/0.9), `stage-residency-test` | device vs host block | 0.031 LSB (worst) | PASS |
 | 2026-10-31 | uncommitted | POCL (CPU) | colorspace_flowers.pef / `crop.pp3`, `crop` | off vs auto, 16-bit TIFF | 1 LSB | PASS |
 | 2026-10-31 | uncommitted | POCL (CPU) | 6-case crop copy matrix (full frame, odd offset, bottom right, single row, single pixel, 8192 wide), `stage-residency-test` | device vs host row copy | 0 (AE=0) | PASS |
 | 2026-10-31 | f744f7bc3 | POCL (CPU) | colorspace_flowers.pef / `labtools-blackwhite.pp3`, `lab.tools` | off vs auto, 16-bit TIFF | 1 LSB | PASS |
@@ -405,28 +407,48 @@ peak absolute error is zero for the synthetic node tests:
   non-zero transition is also a host residual because the block's padded
   extent does not cover the transition ring the host reads. Negative damping
   is refused by the predicate and is not a runtime case.
-- Blur & Noise's Gaussian arm, through `local.adjustments`, reuses the
-  blur arm's line kernel with the context's host-built coefficients at the
-  block's `lp.rad / (sk * 1.4)` sigma, and blends with `BlurNoise_Local()`'s
-  senstype-0 (`lp.sensbn`) scope, whose `mindE` base is four rather than
+- Blur & Noise, through `local.adjustments`, has two arms. The Gaussian arm
+  reuses the blur arm's line kernel with the context's host-built
+  coefficients at the block's `lp.rad / (sk * 1.4)` sigma; the median arm
+  reproduces `Median_Denoise()`'s sorted-window interior, its border copy and
+  its pass ping-pong. Both blend with `BlurNoise_Local()`'s senstype-0
+  (`lp.sensbn`) scope, whose `mindE` base is four rather than
   `transit_shapedetect2()`'s two and whose deltaE reference is the full-image
-  3/sk blur. It matches the host block in fourteen configurations (spot
-  radius 2/5/10/18/28, the luminance, chroma and all-planes selectors,
-  sensitivity 0/100, a no-scope deltaE-off case, a strict sub-rectangle ROI,
-  RECT, colour, log, soft light, MUNS and 179x49) with a worst peak error of
-  0.023438 LSB16 (colour 0.022949, log 0.015625, all-planes 0.015625, ROI
-  edges 0.001953, blur alone 0.007812). Blur alone changes 16,634 of 45,696
-  samples at PAE 7,162.726562 LSB16 against the tool off, so the parity is
-  not vacuous. `localadjustments-blur.pp3` records `impl=opencl` and its
-  16-bit TIFF pair differs on 387 of 30,419,712 samples at 1 LSB16. Thirteen
-  residual configurations (the default radius below the block's 1.6 gate,
-  median, guided, inverse, FFT, mask, added noise, grain, the guided radius,
-  a radius above the FFT gate, a non-zero denoise curve, an unknown chroma
-  method and an out-of-range sensitivity) run the host builtin byte for byte.
-  The denoise arm (noise, grain, bilateral, non-local means and the wavelet
-  denoise curve) is not ported; a spot whose denoise curve leaves the LUT
-  non-zero is a residual, so a GUI profile with the default denoise curve
-  falls back to the host.
+  3/sk blur. The Gaussian arm matches the host block in fourteen
+  configurations (spot radius 2/5/10/18/28, the luminance, chroma and
+  all-planes selectors, sensitivity 0/100, a no-scope deltaE-off case, a
+  strict sub-rectangle ROI, RECT, colour, log, soft light, MUNS and 179x49)
+  with a worst peak error of 0.023438 LSB16 (colour 0.022949, log 0.015625,
+  all-planes 0.015625, ROI edges 0.001953, blur alone 0.007812). Blur alone
+  changes 16,634 of 45,696 samples at PAE 7,162.726562 LSB16 against the tool
+  off, so the parity is not vacuous. `localadjustments-blur.pp3` records
+  `impl=opencl` and its 16-bit TIFF pair differs on 387 of 30,419,712 samples
+  at 1 LSB16.
+- The median arm matches in fifteen further configurations (3x3/5x5/7x7/9x9,
+  1/3/4 passes, chroma, ROI edges, colour, log, 179x49, blur-then-median and
+  the denoise curves) with a worst peak error of 0.031250 LSB16 (median 3x3
+  and the default curve 0.031250, 179x49 0.023438, colour/log/chroma
+  0.015625, ROI edges 0.007629). Median 5x5 changes 8,010 of 45,696 samples
+  at PAE 26,979.698730 LSB16 against `medMethod "none"`, so the parity is not
+  vacuous. `localadjustments-blur-denoise.pp3` records `impl=opencl` and its
+  16-bit TIFF pair differs on 387 of 30,419,712 samples at 1 LSB16, the same
+  pair as the blur-only profile.
+- The denoise curve is admitted only when `DeNoise()` is idle. `DeNoise()`'s
+  outer guard requires the Quality method to be other than "Off" and a
+  non-zero curve amount, or the `"enhden"` artifact-shaping path; the GUI
+  default is Quality "Off", so a profile carrying the default
+  `LocwavCurveden` curve exports identically to one with an empty curve
+  (AE=0 over 30,419,712 export samples and over the 45,696-sample device
+  fixture, measured on the host). The curve's only
+  effects are the `noiself*`/`noiselc` amounts, the `wavcurvedenoi` flag and
+  `calc_ref()`'s `isdenoise` blur references, and the last of these is read
+  only by `DeNoise_Local()`. Predicate residuals include the default radius
+  below the Gaussian arm's 1.6 gate, the guided and inverse arms, a zero
+  median method, out-of-range passes, a radius above the 30 FFT gate, an
+  unknown chroma method, an out-of-range sensitivity, a non-zero curve with
+  Quality "Conservative" and `qualityMethod "enhden"`. The wavelet denoise
+  itself (Quality "Conservative"/"Aggressive"/"Non-local means only"), added
+  noise, grain, bilateral and non-local means remain host residuals.
 - The `lab.wavelet` edge panel's Medianlev arm reproduces `calckoe()` and
   the Lipschitz control. The raw pass runs the 3x3 or 5x5 convolution, the
   `thr` clamp and the `|tmC / temp|` ratio for the level's three
