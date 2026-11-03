@@ -6056,6 +6056,9 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
     int wavelet_refine_levels = 0;
     int wavelet_refine_med_poly = 0;
     int wavelet_refine_high_poly = 0;
+    bool wavelet_ba = false;
+    bool wavelet_ba_l = false;
+    bool wavelet_ba_ab = false;
     bool wavelet_ab = false;
     bool select_active = false;
     bool clarity_active = false;
@@ -6198,6 +6201,64 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
             error = "lab.wavelet refinement needs the denoise arm";
             return RT_STAGE_FALLBACK;
         }
+        /*
+         * The balance-chroma arm. The host sets `ba` when either gate runs;
+         * `ba_l` is cp.finena and `ba_ab` is cp.diag. A tail present without
+         * a gate, or a gate without the tail, is a context that disagrees
+         * with its table.
+         */
+        if (context->wavelet.ba != 0 && context->wavelet.ba != 1) {
+            error = "lab.wavelet balance-chroma flag must be 0 or 1";
+            return RT_STAGE_INVALID;
+        }
+        wavelet_ba = context->wavelet.ba == 1;
+        if (context->wavelet.ba_l != 0 && context->wavelet.ba_l != 1) {
+            error = "lab.wavelet balance-chroma L flag must be 0 or 1";
+            return RT_STAGE_INVALID;
+        }
+        if (context->wavelet.ba_ab != 0 && context->wavelet.ba_ab != 1) {
+            error = "lab.wavelet balance-chroma a/b flag must be 0 or 1";
+            return RT_STAGE_INVALID;
+        }
+        wavelet_ba_l = wavelet_ba && context->wavelet.ba_l == 1;
+        wavelet_ba_ab = wavelet_ba && context->wavelet.ba_ab == 1;
+        if (wavelet_ba && !wavelet_ba_l && !wavelet_ba_ab) {
+            error = "lab.wavelet balance-chroma tail has no active gate";
+            return RT_STAGE_INVALID;
+        }
+        if (!wavelet_ba && (context->wavelet.ba_l != 0 ||
+                            context->wavelet.ba_ab != 0)) {
+            error = "lab.wavelet balance-chroma gate has no tail";
+            return RT_STAGE_INVALID;
+        }
+        if (wavelet_ba) {
+            const int ba_entries =
+                static_cast<int>(RT_LAB_WAVELET_BA_HEADER) +
+                wavelet_levels *
+                    static_cast<int>(RT_LAB_WAVELET_BA_MEA_ENTRIES) +
+                static_cast<int>(RT_LAB_WAVELET_CURVE_ENTRIES);
+            if (wavelet_entries < ba_entries) {
+                error = "lab.wavelet balance-chroma tail is outside its table";
+                return RT_STAGE_INVALID;
+            }
+            const int ba_offset = wavelet_entries - ba_entries;
+            const int method =
+                static_cast<int>(wavelet_params[ba_offset + 1]);
+            const float balan = wavelet_params[ba_offset + 2];
+            const int ite = static_cast<int>(wavelet_params[ba_offset + 3]);
+            if (wavelet_params[ba_offset] != 1.0f ||
+                (method != 1 && method != 2) ||
+                !std::isfinite(balan) ||
+                balan < static_cast<float>(
+                            LAB_WAVELET_MIN_WAVELET_BALANCE) ||
+                balan > static_cast<float>(
+                            LAB_WAVELET_MAX_WAVELET_BALANCE) ||
+                ite < LAB_WAVELET_MIN_WAVELET_ITER ||
+                ite > LAB_WAVELET_MAX_WAVELET_ITER) {
+                error = "lab.wavelet balance-chroma tail is out of range";
+                return RT_STAGE_INVALID;
+            }
+        }
         /* RT_LW_PARAM_CHROMA marks the presence of the a/b planes: the chroma
          * arm, the edge panel and the final curves all keep the block's a/b
          * round trip alive. */
@@ -6256,7 +6317,8 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
                 static_cast<std::uint32_t>(wavelet_refine_high_poly),
                 wavelet_soft, softend_active, softend_thrend,
                 static_cast<std::uint32_t>(softend_thrend_poly),
-                static_cast<std::uint32_t>(softend_hue_poly)))) {
+                static_cast<std::uint32_t>(softend_hue_poly),
+                wavelet_ba))) {
             error = "lab.wavelet parameter table has the wrong length";
             return RT_STAGE_INVALID;
         }
@@ -7116,6 +7178,7 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
         cl_kernel box_v_kernel = nullptr;
         cl_kernel refine_kernel = nullptr;
         cl_kernel copy_kernel = nullptr;
+        cl_kernel ba_kernel = nullptr;
         cl_kernel select_kernel = nullptr;
         if (select_active) {
             select_kernel = compiled_kernel_entry(
@@ -7205,6 +7268,10 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
             copy_kernel = compiled_kernel_entry(
                 env, def, "rt_lab_wavelet_w_copy", error);
         }
+        if (wavelet_ba) {
+            ba_kernel = compiled_kernel_entry(
+                env, def, "rt_lab_wavelet_w_ba", error);
+        }
         if (analysis_v == nullptr || analysis_h == nullptr ||
             haar_v == nullptr || haar_h == nullptr || synth_h == nullptr ||
             synth_v == nullptr || haar_synth_h == nullptr ||
@@ -7236,7 +7303,8 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
               shrink_apply_kernel == nullptr || box_h_kernel == nullptr ||
               box_v_kernel == nullptr)) ||
             (wavelet_refine &&
-             (refine_kernel == nullptr || copy_kernel == nullptr))) {
+             (refine_kernel == nullptr || copy_kernel == nullptr)) ||
+            (wavelet_ba && ba_kernel == nullptr)) {
             return RT_STAGE_FALLBACK;
         }
 
@@ -7302,6 +7370,16 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
                            static_cast<int>(
                                RT_LAB_WAVELET_DENOISE_MAD_ENTRIES))
                  : 0);
+        const cl_int cl_ba_offset =
+            wavelet_ba
+                ? static_cast<cl_int>(
+                      wavelet_entries -
+                      (static_cast<int>(RT_LAB_WAVELET_BA_HEADER) +
+                       wavelet_levels *
+                           static_cast<int>(
+                               RT_LAB_WAVELET_BA_MEA_ENTRIES) +
+                       static_cast<int>(RT_LAB_WAVELET_CURVE_ENTRIES)))
+                : 0;
         /* The clarity arm's cachefy table is the table's last tail. */
         const cl_int cl_soft_lut_offset =
             cl_refine_offset +
@@ -7673,6 +7751,51 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
                         error = "lab.wavelet contrast arguments failed";
                         return false;
                     }
+                    if (wavelet_ba_l) {
+                        cl_int cl_ba_level = level;
+                        cl_int cl_ba_max = maxlvl;
+                        cl_int cl_ba_stride = wavelet_levels;
+                        cl_int cl_ba_l_arm = 1;
+                        ok = true;
+                        ok = ok && set_arg(ba_kernel, 0, sizeof(cl_mem),
+                                           &band1);
+                        ok = ok && set_arg(ba_kernel, 1, sizeof(cl_int),
+                                           &bp1);
+                        ok = ok && set_arg(ba_kernel, 2, sizeof(cl_mem),
+                                           &band2);
+                        ok = ok && set_arg(ba_kernel, 3, sizeof(cl_int),
+                                           &bp2);
+                        ok = ok && set_arg(ba_kernel, 4, sizeof(cl_mem),
+                                           &band3);
+                        ok = ok && set_arg(ba_kernel, 5, sizeof(cl_int),
+                                           &bp3);
+                        ok = ok && set_arg(ba_kernel, 6, sizeof(cl_mem),
+                                           &l_memory);
+                        ok = ok && set_arg(ba_kernel, 7, sizeof(cl_int),
+                                           &l_pitch);
+                        ok = ok && set_arg(ba_kernel, 8, sizeof(cl_mem),
+                                           &params_memory);
+                        ok = ok && set_arg(ba_kernel, 9, sizeof(cl_int),
+                                           &cl_ba_offset);
+                        ok = ok && set_arg(ba_kernel, 10, sizeof(cl_int),
+                                           &cl_ba_level);
+                        ok = ok && set_arg(ba_kernel, 11, sizeof(cl_int),
+                                           &cl_ba_max);
+                        ok = ok && set_arg(ba_kernel, 12, sizeof(cl_int),
+                                           &cl_ba_stride);
+                        ok = ok && set_arg(ba_kernel, 13, sizeof(cl_int),
+                                           &cl_half_w);
+                        ok = ok && set_arg(ba_kernel, 14, sizeof(cl_int),
+                                           &cl_half_h);
+                        ok = ok && set_arg(ba_kernel, 15, sizeof(cl_int),
+                                           &cl_ba_l_arm);
+                        if (!ok || !launch(ba_kernel, band_global,
+                                           "lab.wavelet balance-chroma")) {
+                            error = "lab.wavelet balance-chroma arguments "
+                                    "failed";
+                            return false;
+                        }
+                    }
                 } else if (wavelet_chroma) {
                     cl_int chroma_mea_offset = cl_mea_offset +
                         static_cast<cl_int>(plane_index) * wavelet_levels *
@@ -7751,6 +7874,43 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
                     if (!ok || !launch(toning_kernel, band_global,
                                        "lab.wavelet toning")) {
                         error = "lab.wavelet toning arguments failed";
+                        return false;
+                    }
+                }
+                if (wavelet_ba_ab && plane_index > 0) {
+                    cl_int cl_ba_level = level;
+                    cl_int cl_ba_max = maxlvl;
+                    cl_int cl_ba_stride = wavelet_levels;
+                    cl_int cl_ba_l_arm = 0;
+                    ok = true;
+                    ok = ok && set_arg(ba_kernel, 0, sizeof(cl_mem), &band1);
+                    ok = ok && set_arg(ba_kernel, 1, sizeof(cl_int), &bp1);
+                    ok = ok && set_arg(ba_kernel, 2, sizeof(cl_mem), &band2);
+                    ok = ok && set_arg(ba_kernel, 3, sizeof(cl_int), &bp2);
+                    ok = ok && set_arg(ba_kernel, 4, sizeof(cl_mem), &band3);
+                    ok = ok && set_arg(ba_kernel, 5, sizeof(cl_int), &bp3);
+                    ok = ok && set_arg(ba_kernel, 6, sizeof(cl_mem), &l_memory);
+                    ok = ok && set_arg(ba_kernel, 7, sizeof(cl_int), &l_pitch);
+                    ok = ok && set_arg(ba_kernel, 8, sizeof(cl_mem),
+                                       &params_memory);
+                    ok = ok && set_arg(ba_kernel, 9, sizeof(cl_int),
+                                       &cl_ba_offset);
+                    ok = ok && set_arg(ba_kernel, 10, sizeof(cl_int),
+                                       &cl_ba_level);
+                    ok = ok && set_arg(ba_kernel, 11, sizeof(cl_int),
+                                       &cl_ba_max);
+                    ok = ok && set_arg(ba_kernel, 12, sizeof(cl_int),
+                                       &cl_ba_stride);
+                    ok = ok && set_arg(ba_kernel, 13, sizeof(cl_int),
+                                       &cl_half_w);
+                    ok = ok && set_arg(ba_kernel, 14, sizeof(cl_int),
+                                       &cl_half_h);
+                    ok = ok && set_arg(ba_kernel, 15, sizeof(cl_int),
+                                       &cl_ba_l_arm);
+                    if (!ok || !launch(ba_kernel, band_global,
+                                       "lab.wavelet balance-chroma a/b")) {
+                        error = "lab.wavelet balance-chroma a/b arguments "
+                                "failed";
                         return false;
                     }
                 }

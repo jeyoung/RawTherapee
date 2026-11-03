@@ -424,6 +424,9 @@ __kernel void rt_lab_wavelet_equalize(
 #define RT_LW_W_TONING_MULS 9
 #define RT_LW_W_TONING_HEADER 19
 #define RT_LW_W_TONING_MEA_ENTRIES 10
+/* Mirrors the balance-chroma tail: [method][balan][ite] plus the mea block. */
+#define RT_LW_W_BA_HEADER 4
+#define RT_LW_W_BA_MEA_ENTRIES 10
 /*
  * Mirrors RT_LAB_WAVELET_SOFTEND_*: the per-level scalars of the final soft
  * radius's coefficient-domain second pass and its level-count header.
@@ -1089,6 +1092,130 @@ inline float rt_lw_curve501(__global const float* table, float index)
 }
 
 /*
+ * ContAllL()/ContAllAB()'s balance-chroma arm. The L arm (`l_arm`) multiplies
+ * each band by `1 + (kba - 1) * beta`, where beta is the sigmadir ramp the
+ * host computes from the current coefficient; the a/b arm multiplies by the
+ * raw kba. Both repeat the multiply `it` times, as the block's per-level
+ * iteration loop does.
+ *
+ * `kba` follows the block's two variants: "sli" (method 1) uses the balance
+ * over a luminance-dependent 600/300 divisor, and "cur" (method 2) reads the
+ * per-pixel opacity curve. The curve lookup index is `6 * LL100`, clamped by
+ * rt_lw_curve501() exactly as the 501-entry LUTf does. Directions 1 and 2 use
+ * `1 + k` and direction 3 uses `1 - 2k`; the band array is direction-minor
+ * here, so dir 0 and 1 are the "dir < 3" arm and dir 2 is the diagonal.
+ */
+__kernel void rt_lab_wavelet_w_ba(
+    __global float* band1, int p1,
+    __global float* band2, int p2,
+    __global float* band3, int p3,
+    __global const float* origL, int l_pitch,
+    __global const float* params, int ba_offset,
+    int level, int maxlvl, int levels, int w, int h, int l_arm)
+{
+    const int x = get_global_id(0);
+    const int y = get_global_id(1);
+    if (x >= w || y >= h) {
+        return;
+    }
+
+    const int method = (int)params[ba_offset + 1];
+    if (method != 1 && method != 2) {
+        return;
+    }
+    const float bal = params[ba_offset + 2];
+    const int ite = (int)params[ba_offset + 3];
+
+    const int med = maxlvl / 2;
+    int it;
+    if (level < med) {
+        it = 7 - ite;
+    } else if (level == med) {
+        it = 7;
+    } else {
+        it = 7 + ite;
+    }
+
+    const float LL100 = origL[(2 * y) * l_pitch + 2 * x] / 327.68f;
+
+    __global const float* mea =
+        params + ba_offset + RT_LW_W_BA_HEADER +
+        level * RT_LW_W_BA_MEA_ENTRIES;
+    __global const float* curve =
+        params + ba_offset + RT_LW_W_BA_HEADER +
+        levels * RT_LW_W_BA_MEA_ENTRIES;
+
+    for (int dir = 0; dir < 3; ++dir) {
+        __global float* band =
+            dir == 0 ? band1 : (dir == 1 ? band2 : band3);
+        const int pitch = dir == 0 ? p1 : (dir == 1 ? p2 : p3);
+        const int at = y * pitch + x;
+        float value = band[at];
+
+        float kba;
+        if (method == 2) {
+            const float k1 =
+                0.3f * (rt_lw_curve501(curve, 6.0f * LL100) - 0.5f);
+            const float k2 = k1 * 2.0f;
+            kba = dir < 2 ? 1.0f + k1 : 1.0f - k2;
+        } else {
+            const float aa = 4970.0f;
+            const float bb = -397000.0f;
+            const float b0 = 100000.0f;
+            const float a0 = -4970.0f;
+            float k1 = 600.0f;
+            float k2 = 300.0f;
+            if (LL100 > 80.0f) {
+                k1 = aa * LL100 + bb;
+                k2 = 0.5f * k1;
+            }
+            if (LL100 < 20.0f) {
+                k1 = a0 * LL100 + b0;
+                k2 = 0.5f * k1;
+            }
+            kba = dir < 2 ? 1.0f + bal / k1 : 1.0f - bal / k2;
+        }
+
+        if (l_arm != 0) {
+            const float wavcl = fabs(value);
+            float beta;
+            if (wavcl < mea[0]) {
+                beta = 0.05f;
+            } else if (wavcl < mea[1]) {
+                beta = 0.2f;
+            } else if (wavcl < mea[2]) {
+                beta = 0.7f;
+            } else if (wavcl < mea[3]) {
+                beta = 1.0f;
+            } else if (wavcl < mea[4]) {
+                beta = 1.0f;
+            } else if (wavcl < mea[5]) {
+                beta = 0.8f;
+            } else if (wavcl < mea[6]) {
+                beta = 0.6f;
+            } else if (wavcl < mea[7]) {
+                beta = 0.4f;
+            } else if (wavcl < mea[8]) {
+                beta = 0.2f;
+            } else if (wavcl < mea[9]) {
+                beta = 0.1f;
+            } else {
+                beta = 0.01f;
+            }
+            const float factor = 1.0f + (kba - 1.0f) * beta;
+            for (int j = 0; j < it; ++j) {
+                value *= factor;
+            }
+        } else {
+            for (int j = 0; j < it; ++j) {
+                value *= kba;
+            }
+        }
+        band[at] = value;
+    }
+}
+
+/*
  * rtengine/sleef.h's xlogf()/xexpf()/pow_F() as the denoise-curve refinement
  * uses them. The host substitutes these approximations for log()/exp(); a
  * one-ulp difference in the curve abscissa can move the refinement factor,
@@ -1355,8 +1482,9 @@ __kernel void rt_lab_wavelet_w_edge(
  * 501-point opacity curve.
  *
  * The host uses xlogf()/xexpf() for the per-coefficient exponential; this
- * kernel uses log()/exp(), the same substitution the edge arm documents. The
- * scalars use double log() as the host does.
+ * kernel reproduces those polynomials (rt_lw_xlogf()/rt_lw_xexpf()) so the
+ * reconstructed L, which the balance-chroma a/b arm reads, stays within one
+ * LSB16. The scalars use double log() as the host does.
  */
 __kernel void rt_lab_wavelet_w_final(
     __global float* band1, int p1,
@@ -1404,8 +1532,8 @@ __kernel void rt_lab_wavelet_w_final(
 
         float absciss;
         if (magnitude >= threshold) {
-            const float vald = (log(magnitude) - logmax) * rap;
-            absciss = exp(vald);
+            const float vald = (rt_lw_xlogf(magnitude) - logmax) * rap;
+            absciss = rt_lw_xexpf(vald);
         } else if (magnitude >= mean) {
             absciss = asig * magnitude + bsig;
         } else {

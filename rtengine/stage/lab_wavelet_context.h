@@ -58,7 +58,7 @@ struct ProcParams;
  * wavelet tool's own skin protection: the equaliser only changes L, so a/b
  * and their masks are identical at the start of both passes.
  */
-#define RT_LAB_WAVELET_CONTEXT_VERSION 14u
+#define RT_LAB_WAVELET_CONTEXT_VERSION 15u
 /* "LWCT": rejects a stale or unrelated pointer before any callback runs. */
 #define RT_LAB_WAVELET_CONTEXT_MAGIC 0x4C574354u
 /* The number of levels of the directional pyramid. */
@@ -293,6 +293,21 @@ struct ProcParams;
 #define RT_LAB_WAVELET_REFINE_CURVE_HEADER 2u
 /* FlatCurve's default polyline count is 1000 plus the closing point. */
 #define RT_LAB_WAVELET_REFINE_POLY_MAX 1024u
+/*
+ * The balance-chroma (BA) tail, present only when `BAmethod` is "sli" or
+ * "cur". It reproduces ContAllL()/ContAllAB()'s BA arm:
+ *   [0]                 reserved (one when the tail is present)
+ *   [1]                 BAmet: 1 for "sli", 2 for "cur"
+ *   [2]                 balan (the Balance slider as a float)
+ *   [3]                 ite (the Iterations slider)
+ *   [4 + level*10 + k]  ContAllL()'s calceffect() with sigmadir and an
+ *                       offset of 1, one mea block per level
+ *   then RT_LAB_WAVELET_CURVE_ENTRIES samples of WavOpacityCurveW, the
+ *   "cur" arm's opacity curve.
+ * The a/b arm reads no mea block; its multiplier is the raw kba.
+ */
+#define RT_LAB_WAVELET_BA_HEADER 4u
+#define RT_LAB_WAVELET_BA_MEA_ENTRIES 10u
 
 /*
  * The exact length of the wavelet parameter table. Both the host builder and
@@ -309,7 +324,8 @@ inline std::size_t labWaveletParamEntries(std::uint32_t planes,
                                           bool soft, bool softend,
                                           bool softend_thrend,
                                           std::uint32_t softend_thrend_poly,
-                                          std::uint32_t softend_hue_poly)
+                                          std::uint32_t softend_hue_poly,
+                                          bool ba = false)
 {
     std::size_t entries = RT_LAB_WAVELET_WAVELET_PARAMS +
                           static_cast<std::size_t>(planes) *
@@ -366,6 +382,13 @@ inline std::size_t labWaveletParamEntries(std::uint32_t planes,
         }
         entries += static_cast<std::size_t>(softend_hue_poly) * 3u;
     }
+    if (ba) {
+        /* The balance-chroma tail is the table's last block. */
+        entries += RT_LAB_WAVELET_BA_HEADER +
+                   static_cast<std::size_t>(levels) *
+                       RT_LAB_WAVELET_BA_MEA_ENTRIES +
+                   RT_LAB_WAVELET_CURVE_ENTRIES;
+    }
     return entries;
 }
 /*
@@ -420,8 +443,8 @@ typedef struct RtLabWaveletWavelet {
     uint32_t taps;
     uint32_t entries;
     /* 1 for L only, 3 when the a/b planes also run (the chroma arm, the edge
-     * panel or the final curves, whose level-trim change keeps the block's
-     * a/b round trip). */
+     * panel, the final curves or the balance-chroma a/b arm, whose level-trim
+     * change keeps the block's a/b round trip). */
     uint32_t planes;
     /* 1 when the final-curve tail is present in `params`. */
     uint32_t final;
@@ -453,6 +476,15 @@ typedef struct RtLabWaveletWavelet {
     uint32_t refine_expert;
     uint32_t refine_med_poly;
     uint32_t refine_high_poly;
+    /*
+     * The balance-chroma arm. `ba` is one when the tail is present; `ba_l`
+     * and `ba_ab` are the two block gates: the L arm runs with `expfinal`
+     * (cp.finena) and the a/b arm with `TMr` (cp.diag). The method and its
+     * scalars live in the tail itself, so the launcher only re-checks them.
+     */
+    uint32_t ba;
+    uint32_t ba_l;
+    uint32_t ba_ab;
     /*
      * 1 when ip_wavelet() re-evaluates the L statistics after the contrast,
      * edge and final multiplies: `cp.val > 0 || ref || contr || cp.diagcurv`
@@ -693,6 +725,13 @@ inline constexpr double LAB_WAVELET_MAX_WAVELET_SIGMAFIN = 2.5;
 /* The toning panel's sigmaton slider range. */
 inline constexpr double LAB_WAVELET_MIN_WAVELET_SIGMATON = 0.025;
 inline constexpr double LAB_WAVELET_MAX_WAVELET_SIGMATON = 2.5;
+/* The balance-chroma arm's slider ranges, from the widget definitions. */
+inline constexpr int LAB_WAVELET_MIN_WAVELET_BALANCE = -30;
+inline constexpr int LAB_WAVELET_MAX_WAVELET_BALANCE = 100;
+inline constexpr int LAB_WAVELET_MIN_WAVELET_ITER = -3;
+inline constexpr int LAB_WAVELET_MAX_WAVELET_ITER = 3;
+inline constexpr double LAB_WAVELET_MIN_WAVELET_SIGMADIR = 0.025;
+inline constexpr double LAB_WAVELET_MAX_WAVELET_SIGMADIR = 2.5;
 /*
  * The clarity panel's merge sliders. The widget admits -50..100 for both; the
  * merge reads them directly, so a value outside that range is a residual.
@@ -751,6 +790,16 @@ int labWaveletTransformLevels(const procparams::ProcParams& params,
                               bool force_all_method = false);
 
 /*
+ * The same derivation with ip_wavelet()'s trailing-zero trim skipped: the
+ * number of levels the block builds before it drops dead multipliers. The
+ * balance-chroma arm needs this because its a/b passes disable that trim
+ * (`!cp.diag`/`!cp.finena`) while L may still trim, and this node carries one
+ * level count for both. Admission refuses a profile whose two counts differ.
+ */
+int labWaveletUntrimmedLevels(const procparams::ProcParams& params,
+                              int width, int height);
+
+/*
  * Whether the wavelet pass is the node's supported set: the contrast panel,
  * the chroma panel's "link" arm, the edge panel's plain arm, the final
  * panel's curve arm and the toning panel's zero-protection arm, no residual,
@@ -783,6 +832,12 @@ int labWaveletTransformLevels(const procparams::ProcParams& params,
  * modulation (a non-identity `wavguidcurve`) are both ported and admitted
  * alongside it. It does not run together with the clarity arm or the clarity
  * soft radius.
+ *
+ * The balance-chroma arm (`BAmethod` "sli" or "cur") runs inside the final
+ * panel's coefficient pass and, for the a/b planes, with `TMr`. The "cur"
+ * variant needs a non-identity `opacityCurveW`, the sliders and `sigmadir`
+ * must be inside their widget ranges, and the L and a/b level counts must
+ * agree because this node carries one count for both planes.
  */
 bool labWaveletWaveletSupported(const procparams::ProcParams& params,
                                 int width, int height);
@@ -896,6 +951,15 @@ private:
     std::vector<float> wavelet_refine_high_slope_;
     bool wavelet_ab_ = false;
     bool wavelet_final_refresh_ = false;
+    /*
+     * The balance-chroma arm. `wavelet_ba_l_` is the L arm (`expfinal`) and
+     * `wavelet_ba_ab_` the a/b arm (`TMr`); `wavelet_ba_` is either.
+     * `wavelet_ba_offset_` is the tail's index inside `wavelet_params_`.
+     */
+    bool wavelet_ba_ = false;
+    bool wavelet_ba_l_ = false;
+    bool wavelet_ba_ab_ = false;
+    std::size_t wavelet_ba_offset_ = 0;
     /* 0 samples the wavdenoise LUT, 1 walks the Thrden wavlow polyline. */
     std::uint32_t wavelet_refine_mode_ = 0;
     std::vector<float> wavelet_refine_poly_x_;

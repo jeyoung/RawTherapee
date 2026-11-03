@@ -752,8 +752,12 @@ bool labWaveletSupported(const procparams::ProcParams& params, int width,
     return !waveletOn || labWaveletWaveletSupported(params, width, height);
 }
 
-int labWaveletTransformLevels(const procparams::ProcParams& params,
-                              int width, int height, bool force_all_method)
+namespace
+{
+
+int labWaveletLevels(const procparams::ProcParams& params,
+                     int width, int height, bool force_all_method,
+                     bool keep_untrimmed)
 {
     const procparams::WaveletParams& wavelet = params.wavelet;
     if (!wavelet.enabled || width <= 0 || height <= 0) {
@@ -869,7 +873,7 @@ int labWaveletTransformLevels(const procparams::ProcParams& params,
                       wavelet.rescon == 0 && wavelet.resconH == 0 &&
                       wavelet.edgval == 0 && !ref0 &&
                       (force_all_method || wavelet.CLmethod == "all");
-    if (dead) {
+    if (dead && !keep_untrimmed) {
         const auto multiplier = [&](int index) -> int {
             if (index < wavelet.thres && index < 9) {
                 return wavelet.c[index];
@@ -885,6 +889,20 @@ int labWaveletTransformLevels(const procparams::ProcParams& params,
         levwav = base;
     }
     return levwav > 0 ? levwav : 0;
+}
+
+} // namespace
+
+int labWaveletTransformLevels(const procparams::ProcParams& params,
+                              int width, int height, bool force_all_method)
+{
+    return labWaveletLevels(params, width, height, force_all_method, false);
+}
+
+int labWaveletUntrimmedLevels(const procparams::ProcParams& params,
+                              int width, int height)
+{
+    return labWaveletLevels(params, width, height, false, true);
 }
 
 bool labWaveletWaveletSupported(const procparams::ProcParams& params,
@@ -1000,9 +1018,9 @@ bool labWaveletWaveletSupported(const procparams::ProcParams& params,
     }
     /*
      * The final panel's curve arm needs only the two curve controls. Its
-     * balance-chroma method and residual tone mapping stay host residuals,
-     * and sigmafin must be inside the GUI slider range because the block
-     * divides by it.
+     * sigmafin must be inside the GUI slider range because the block
+     * divides by it. The balance-chroma method is admitted separately below
+     * and shares the same `expfinal` gate.
      */
     if (final_curves &&
         (!std::isfinite(wavelet.sigmafin) ||
@@ -1011,11 +1029,46 @@ bool labWaveletWaveletSupported(const procparams::ProcParams& params,
         return false;
     }
     /*
-     * ContAllAB()'s BA arm (balance chroma) runs when BAmethod is not "none"
-     * and TMr is set, independently of the panels above. It is not ported, so
-     * a profile that can reach it stays on the host.
+     * ContAllL()/ContAllAB()'s balance-chroma arm. The L arm runs with
+     * `expfinal` (cp.finena) and the a/b arm with `TMr` (cp.diag); both need
+     * a known method (1 for "sli", 2 for "cur"). "cur" additionally reads a
+     * non-identity WavOpacityCurveW (cp.opaW), otherwise the block skips it.
+     * The arm multiplies the bands by a per-pixel factor derived from the
+     * original (L) or reconstructed (a/b) luminance, so the node carries one
+     * level count only when both planes keep the same count; the block
+     * disables the a/b trailing-zero trim while TMr is set, so a profile that
+     * would trim L alone stays on the host.
      */
-    if (wavelet.tmr || wavelet.BAmethod != "none") {
+    if (wavelet.BAmethod != "none") {
+        if (wavelet.BAmethod != "sli" && wavelet.BAmethod != "cur") {
+            return false;
+        }
+        if (!wavelet.expfinal && !wavelet.tmr) {
+            return false;
+        }
+        if (wavelet.balance < LAB_WAVELET_MIN_WAVELET_BALANCE ||
+            wavelet.balance > LAB_WAVELET_MAX_WAVELET_BALANCE ||
+            wavelet.iter < LAB_WAVELET_MIN_WAVELET_ITER ||
+            wavelet.iter > LAB_WAVELET_MAX_WAVELET_ITER ||
+            !std::isfinite(wavelet.sigmadir) ||
+            wavelet.sigmadir < LAB_WAVELET_MIN_WAVELET_SIGMADIR ||
+            wavelet.sigmadir > LAB_WAVELET_MAX_WAVELET_SIGMADIR) {
+            return false;
+        }
+        if (wavelet.BAmethod == "cur") {
+            WavOpacityCurveW opacity;
+            opacity.Set(wavelet.opacityCurveW);
+            if (!static_cast<bool>(opacity)) {
+                return false;
+            }
+        }
+        if (labWaveletTransformLevels(params, width, height) !=
+            labWaveletUntrimmedLevels(params, width, height)) {
+            return false;
+        }
+    } else if (wavelet.tmr) {
+        /* With no method the block's BA arm never runs, but cp.diag still
+         * disables the a/b trim; that is a residual. */
         return false;
     }
     if (wavelet.Tilesmethod != "full") {
@@ -1473,6 +1526,9 @@ RtLabWaveletContext LabWaveletContext::descriptor(bool supported)
     context.wavelet.softend_hue_poly = static_cast<uint32_t>(
         softend_hue_ ? softend_hue_curve_.size() / 3 : 0);
     context.wavelet.compute_softend = &compute_softend_thunk;
+    context.wavelet.ba = wavelet_ba_ ? 1u : 0u;
+    context.wavelet.ba_l = wavelet_ba_l_ ? 1u : 0u;
+    context.wavelet.ba_ab = wavelet_ba_ab_ ? 1u : 0u;
     context.wavelet.refine = wavelet_refine_ ? 1u : 0u;
     context.wavelet.refine_poly = static_cast<uint32_t>(
         wavelet_refine_poly_x_.size());
@@ -1614,12 +1670,15 @@ int LabWaveletContext::build(RtLabWaveletResult& out)
     /*
      * The final panel's curve arm. The admission rules repeat here so a
      * forced build can never run a partial final pass: the balance-chroma
-     * method, the residual tone mapping and the curves outside their range
-     * are host residuals.
+     * method (when present) must be known, the residual tone mapping stays a
+     * host residual and the curves outside their range are refused. The
+     * balance-chroma arm runs inside this panel's coefficient pass, so the
+     * two share the same `expfinal` gate.
      */
     wavelet_final_ = params_.wavelet.enabled && params_.wavelet.expfinal &&
-                     params_.wavelet.BAmethod == "none" &&
-                     !params_.wavelet.tmr &&
+                     (params_.wavelet.BAmethod == "none" ||
+                      params_.wavelet.BAmethod == "sli" ||
+                      params_.wavelet.BAmethod == "cur") &&
                      params_.wavelet.softrad == 0.0 &&
                      std::isfinite(params_.wavelet.sigmafin) &&
                      params_.wavelet.sigmafin >=
@@ -1885,8 +1944,46 @@ int LabWaveletContext::build(RtLabWaveletResult& out)
             }
         }
     }
+    /*
+     * The balance-chroma arm. The admission rules repeat here so a forced
+     * build can never run a partial arm: the method must be known, at least
+     * one of the two gates must be set, the sliders must be in range, "cur"
+     * needs a non-identity opacity curve and the L and a/b level counts must
+     * agree.
+     */
+    wavelet_ba_ = false;
+    wavelet_ba_l_ = false;
+    wavelet_ba_ab_ = false;
+    if (params_.wavelet.BAmethod != "none") {
+        const procparams::WaveletParams& wavelet = params_.wavelet;
+        if ((wavelet.BAmethod != "sli" && wavelet.BAmethod != "cur") ||
+            (!wavelet.expfinal && !wavelet.tmr) ||
+            wavelet.balance < LAB_WAVELET_MIN_WAVELET_BALANCE ||
+            wavelet.balance > LAB_WAVELET_MAX_WAVELET_BALANCE ||
+            wavelet.iter < LAB_WAVELET_MIN_WAVELET_ITER ||
+            wavelet.iter > LAB_WAVELET_MAX_WAVELET_ITER ||
+            !std::isfinite(wavelet.sigmadir) ||
+            wavelet.sigmadir < LAB_WAVELET_MIN_WAVELET_SIGMADIR ||
+            wavelet.sigmadir > LAB_WAVELET_MAX_WAVELET_SIGMADIR ||
+            labWaveletTransformLevels(params_, width_, height_) !=
+                labWaveletUntrimmedLevels(params_, width_, height_)) {
+            return 5;
+        }
+        if (wavelet.BAmethod == "cur") {
+            WavOpacityCurveW opacity;
+            opacity.Set(wavelet.opacityCurveW);
+            if (!static_cast<bool>(opacity)) {
+                return 5;
+            }
+        }
+        wavelet_ba_ = true;
+        wavelet_ba_l_ = wavelet.expfinal;
+        wavelet_ba_ab_ = wavelet.tmr;
+    } else if (params_.wavelet.tmr) {
+        return 5;
+    }
     wavelet_ab_ = wavelet_chroma_ || wavelet_edge_ || wavelet_final_ ||
-                  wavelet_toning_ || wavelet_denoise_ ||
+                  wavelet_toning_ || wavelet_denoise_ || wavelet_ba_ ||
                   (params_.wavelet.enabled && selection_active_);
 
     if (levels_ > 0) {
@@ -1991,6 +2088,11 @@ int LabWaveletContext::build(RtLabWaveletResult& out)
                 contr = true;
             }
         }
+        /* ip_wavelet() forces cp.mul[0] to 0.01f when cp.BAmet != 0, so the
+         * block's `contr` gate is always true for the balance-chroma arm. */
+        if (wavelet_ba_) {
+            contr = true;
+        }
         WavOpacityCurveWL opacity_curve;
         opacity_curve.Set(wavelet.opacityCurveWL);
         const bool diagcurv = static_cast<bool>(opacity_curve);
@@ -2023,7 +2125,8 @@ int LabWaveletContext::build(RtLabWaveletResult& out)
                                        softend_thrend_curve_.size() / 3),
                                    static_cast<std::uint32_t>(
                                        softend_hue_ ? softend_hue_curve_.size() / 3
-                                                    : 0)),
+                                                    : 0),
+                                   wavelet_ba_),
             0.f);
 
         float* table = wavelet_params_.data();
@@ -2046,6 +2149,14 @@ int LabWaveletContext::build(RtLabWaveletResult& out)
                 value = static_cast<float>(wavelet.sup);
             }
             table[RT_LW_PARAM_C + level] = value;
+        }
+        /*
+         * ip_wavelet() forces cp.mul[0] to 0.01f when cp.BAmet != 0 so the L
+         * pass always runs; the contrast and chroma multiplies read that
+         * value, so the table must carry it.
+         */
+        if (wavelet_ba_ && table[RT_LW_PARAM_C] == 0.f) {
+            table[RT_LW_PARAM_C] = 0.01f;
         }
         table[RT_LW_PARAM_THRESHOLD] =
             static_cast<float>(wavelet.threshold);
@@ -2392,7 +2503,7 @@ int LabWaveletContext::build(RtLabWaveletResult& out)
                 static_cast<std::uint32_t>(wavelet_refine_med_x_.size()),
                 static_cast<std::uint32_t>(wavelet_refine_high_x_.size()),
                 false, false, false, 0, 0);
-            if (soft_offset + RT_LAB_WAVELET_SOFT_LUT_ENTRIES !=
+            if (soft_offset + RT_LAB_WAVELET_SOFT_LUT_ENTRIES >
                 wavelet_params_.size()) {
                 return 5;
             }
@@ -2457,8 +2568,44 @@ int LabWaveletContext::build(RtLabWaveletResult& out)
                     *cursor++ = value;
                 }
             }
-            if (cursor != table + wavelet_params_.size()) {
+            if (cursor > table + wavelet_params_.size()) {
                 return 5;
+            }
+        }
+        /*
+         * The balance-chroma arm. It is the table's last tail; the mea block
+         * is filled by computeMea() once the device statistics are read back,
+         * so only the header and the opacity curve are written here.
+         */
+        if (wavelet_ba_) {
+            const std::size_t ba_entries =
+                RT_LAB_WAVELET_BA_HEADER +
+                static_cast<std::size_t>(wavelet_levels_) *
+                    RT_LAB_WAVELET_BA_MEA_ENTRIES +
+                RT_LAB_WAVELET_CURVE_ENTRIES;
+            if (ba_entries > wavelet_params_.size()) {
+                return 5;
+            }
+            wavelet_ba_offset_ = wavelet_params_.size() - ba_entries;
+            float* ba_tail = table + wavelet_ba_offset_;
+            ba_tail[0] = 1.f;
+            ba_tail[1] = wavelet.BAmethod == "cur" ? 2.f : 1.f;
+            ba_tail[2] = static_cast<float>(wavelet.balance);
+            ba_tail[3] = static_cast<float>(wavelet.iter);
+            if (wavelet.BAmethod == "cur") {
+                WavOpacityCurveW opacity;
+                opacity.Set(wavelet.opacityCurveW);
+                if (!static_cast<bool>(opacity)) {
+                    return 5;
+                }
+                float* curve =
+                    ba_tail + RT_LAB_WAVELET_BA_HEADER +
+                    static_cast<std::size_t>(wavelet_levels_) *
+                        RT_LAB_WAVELET_BA_MEA_ENTRIES;
+                for (std::uint32_t index = 0;
+                     index < RT_LAB_WAVELET_CURVE_ENTRIES; ++index) {
+                    curve[index] = opacity[static_cast<int>(index)];
+                }
             }
         }
     }
@@ -2524,6 +2671,15 @@ int LabWaveletContext::computeMea(const float* stats, uint32_t levels,
                          static_cast<std::size_t>(stride) *
                          RT_LAB_WAVELET_TONING_MEA_ENTRIES;
     }
+    /*
+     * The balance-chroma L arm rebuilds ContAllL()'s beta ramp with sigmadir.
+     * ContAllAB()'s arm reads no ramp, so only plane 0 needs a block.
+     */
+    float* ba_mea = nullptr;
+    if (wavelet_ba_l_ && plane == 0) {
+        ba_mea = wavelet_params_.data() + wavelet_ba_offset_ +
+                 RT_LAB_WAVELET_BA_HEADER;
+    }
 
     for (uint32_t level = 0; level < levels; ++level) {
         float averagePlus[4] = {};
@@ -2578,6 +2734,13 @@ int LabWaveletContext::computeMea(const float* stats, uint32_t levels,
             entry[10] = maxL;
             entry[11] = averageL;
             entry[12] = sigL;
+        }
+        if (ba_mea != nullptr) {
+            ipf_.calceffect(
+                static_cast<int>(level), mean, sigma,
+                ba_mea + static_cast<std::size_t>(level) *
+                             RT_LAB_WAVELET_BA_MEA_ENTRIES,
+                static_cast<float>(params_.wavelet.sigmadir), 1.f);
         }
     }
     return 0;
