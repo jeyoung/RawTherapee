@@ -238,10 +238,108 @@ bool decodeWaveletClarity(const procparams::WaveletParams& wavelet,
 }
 
 /*
- * ip_wavelet()'s mulopaRG/mulopaBY: nine samples of the 501-point opacity
- * curve at the fixed indices, scaled to a percentage. An unallocated curve
- * leaves every multiplier at zero, which is the block's own no-op.
+ * The clarity arm's guided soft radius, decoded from the export block's
+ * `softrad` sequence. guidedfilter.cc derives its subsampling, radius and
+ * scales from the image extent; the block derives epsilon and the blur radius
+ * from the slider. Every derived value is computed here with the block's own
+ * float arithmetic so the device never re-derives one and cannot drift.
  */
+struct WaveletSoftRadius
+{
+    bool active = false;
+    float epsilon = 0.f;
+    int subsampling = 1;
+    int width = 0;
+    int height = 0;
+    int box_rad = 0;
+    float scale_dx = 1.f;
+    float scale_dy = 1.f;
+    float scale_ux = 1.f;
+    float scale_uy = 1.f;
+};
+
+/* guidedfilter.cc's calculate_subsampling(), copied unchanged. */
+int calculateGuidedSubsampling(int w, int h, int r)
+{
+    if (r == 1) {
+        return 1;
+    }
+    if (std::max(w, h) <= 600) {
+        return 1;
+    }
+    for (int s = 5; s > 0; --s) {
+        if (r % s == 0) {
+            return s;
+        }
+    }
+    return LIM(r / 2, 2, 4);
+}
+
+/*
+ * The block reads `softrad` only inside the clarity sequence. When the clarity
+ * arm does not run the slider has no effect, so the admission predicate treats
+ * a non-zero value as a residual there rather than silently ignoring it.
+ */
+bool decodeWaveletSoftRadius(const procparams::WaveletParams& wavelet,
+                             int width, int height,
+                             WaveletSoftRadius& out)
+{
+    out = WaveletSoftRadius{};
+    if (wavelet.softrad == 0.0) {
+        return true;
+    }
+    if (!std::isfinite(wavelet.softrad) ||
+        wavelet.softrad < LAB_WAVELET_MIN_SOFT_RAD ||
+        wavelet.softrad > LAB_WAVELET_MAX_SOFT_RAD) {
+        return false;
+    }
+    if (width <= 0 || height <= 0) {
+        return false;
+    }
+
+    /* The block's blur, kept in the block's own types: the slider is a
+     * double, so the literal products round as doubles before the float
+     * assignment and the int truncation. */
+    const float blur = 10.f / 1 * (0.5f + 0.8f * wavelet.softrad);
+    const int radius = static_cast<int>(blur);
+    const int subsampling = calculateGuidedSubsampling(width, height, radius);
+    const int w = width / subsampling;
+    const int h = height / subsampling;
+    if (w < 1 || h < 1) {
+        return false;
+    }
+
+    /*
+     * f_mean()'s radius: the block truncates float(r) / subsampling to int,
+     * clamps with LIM(rad, 0, (min(w, h) - 1) / 2 - 1) and boxblur() then
+     * clamps with min(radius, W - 1, H - 1).
+     */
+    const float r1 = static_cast<float>(radius) / subsampling;
+    int rad = static_cast<int>(r1);
+    rad = std::max(0, std::min(rad, (std::min(w, h) - 1) / 2 - 1));
+    rad = std::min(std::min(rad, w - 1), h - 1);
+
+    /* epsil = aepsil * softrad + bepsil, in double as the block computes it. */
+    const double epsilmax = 0.0001;
+    const double epsilmin = 0.00001;
+    const double aepsil = (epsilmax - epsilmin) / 100.f;
+    const double epsil = aepsil * wavelet.softrad + epsilmin;
+
+    out.active = true;
+    out.epsilon = static_cast<float>(epsil);
+    out.subsampling = subsampling;
+    out.width = w;
+    out.height = h;
+    out.box_rad = rad;
+    /* rescaleBilinear()'s float(Ws) / float(Wd), both directions. */
+    out.scale_dx = static_cast<float>(width) / static_cast<float>(w);
+    out.scale_dy = static_cast<float>(height) / static_cast<float>(h);
+    out.scale_ux = static_cast<float>(w) / static_cast<float>(width);
+    out.scale_uy = static_cast<float>(h) / static_cast<float>(height);
+    return true;
+}
+
+
 void toningMultipliers(const procparams::WaveletParams& wavelet,
                        float rg[RT_LAB_WAVELET_TONING_MULS],
                        float by[RT_LAB_WAVELET_TONING_MULS], bool& any)
@@ -755,8 +853,26 @@ bool labWaveletWaveletSupported(const procparams::ProcParams& params,
             return false;
         }
     }
-    if (wavelet.softrad != 0.0 || wavelet.softradend != 0.0) {
+    /*
+     * The clarity arm's guided soft radius. The final panel's guided soft
+     * radius (`softradend`) is not ported and stays a residual. The clarity
+     * arm reads `softrad` only inside its two-pass sequence, so a value set
+     * while the arm is off is refused rather than silently ignored, and an
+     * admitted value must be inside the 0..100 slider range and leave a
+     * non-empty subsampled guided-filter grid.
+     */
+    if (wavelet.softradend != 0.0) {
         return false;
+    }
+    if (wavelet.softrad != 0.0) {
+        if (!clarity.active) {
+            return false;
+        }
+        WaveletSoftRadius soft;
+        if (!decodeWaveletSoftRadius(wavelet, width, height, soft) ||
+            !soft.active) {
+            return false;
+        }
     }
     /*
      * The contrast path's own skin protection is not ported. The chroma arm
@@ -1035,6 +1151,7 @@ void labWaveletHostBlock(ImProcFunctions& ipf,
         if ((WaveParams.ushamethod == "sharp" || WaveParams.ushamethod == "clari") && WaveParams.expclari && WaveParams.CLmethod != "all") {
             float mL = (float)(WaveParams.mergeL / 100.f);
             float mC = (float)(WaveParams.mergeC / 100.f);
+            std::fprintf(stderr, "DBGCLAR method=%s back=%s soft=%.1f mL=%.4f mC=%.4f\n", WaveParams.CLmethod.c_str(), WaveParams.Backmethod.c_str(), WaveParams.softrad, mL, mC);
             float mL0;
             float mC0;
 
@@ -1048,6 +1165,7 @@ void labWaveletHostBlock(ImProcFunctions& ipf,
             } else {
                 mL0 = mL = mC0 = mC = 0.f;
             }
+            std::fprintf(stderr, "DBGCLAR2 method=%s back=%s soft=%.1f L0=%.4f L=%.4f C0=%.4f C=%.4f\n", WaveParams.CLmethod.c_str(), WaveParams.Backmethod.c_str(), WaveParams.softrad, mL0, mL, mC0, mC);
 
 
 #ifdef _OPENMP
@@ -1206,6 +1324,30 @@ int LabWaveletContext::build(RtLabWaveletResult& out)
     clarity_l_ = clarity.merge_l;
     clarity_c0_ = clarity.merge_c0;
     clarity_c_ = clarity.merge_c;
+
+    /*
+     * The guided soft radius. It only runs inside the clarity sequence and
+     * only affects the merged result when the merge reads the second pass, so
+     * it is armed exactly when both hold. `decodeWaveletSoftRadius()` repeats
+     * the admission rules so a forced build can never run a partial guided
+     * filter.
+     */
+    {
+        WaveletSoftRadius soft;
+        if (!decodeWaveletSoftRadius(params_.wavelet, width_, height_, soft) ||
+            (soft.active && !clarity.active)) {
+            return 5;
+        }
+        wavelet_soft_ = soft.active && clarity.active && clarity.merge;
+        soft_epsilon_ = soft.epsilon;
+        soft_w_ = soft.width;
+        soft_h_ = soft.height;
+        soft_box_rad_ = soft.box_rad;
+        soft_scale_dx_ = soft.scale_dx;
+        soft_scale_dy_ = soft.scale_dy;
+        soft_scale_ux_ = soft.scale_ux;
+        soft_scale_uy_ = soft.scale_uy;
+    }
 
     levels_ = params_.dirpyrequalizer.enabled
                   ? labWaveletLastLevel(params_.dirpyrequalizer.mult)
@@ -1478,7 +1620,8 @@ int LabWaveletContext::build(RtLabWaveletResult& out)
                                    wavelet_toning_, wavelet_denoise_,
                                    wavelet_refine_,
                                    static_cast<std::uint32_t>(
-                                       wavelet_refine_poly_x_.size())),
+                                       wavelet_refine_poly_x_.size()),
+                                   wavelet_soft_),
             0.f);
 
         float* table = wavelet_params_.data();
@@ -1546,6 +1689,20 @@ int LabWaveletContext::build(RtLabWaveletResult& out)
                 Daub4_anal8[0][taps - 1 - index];
             table[RT_LW_PARAM_FILTER_SYNTH_HI + index] =
                 Daub4_anal8[1][taps - 1 - index];
+        }
+
+        /* The clarity arm's guided soft radius, computed by the host. */
+        table[RT_LW_PARAM_SOFT_ACTIVE] = wavelet_soft_ ? 1.f : 0.f;
+        if (wavelet_soft_) {
+            table[RT_LW_PARAM_SOFT_EPSILON] = soft_epsilon_;
+            table[RT_LW_PARAM_SOFT_W] = static_cast<float>(soft_w_);
+            table[RT_LW_PARAM_SOFT_H] = static_cast<float>(soft_h_);
+            table[RT_LW_PARAM_SOFT_BOXRAD] =
+                static_cast<float>(soft_box_rad_);
+            table[RT_LW_PARAM_SOFT_SCALE_DX] = soft_scale_dx_;
+            table[RT_LW_PARAM_SOFT_SCALE_DY] = soft_scale_dy_;
+            table[RT_LW_PARAM_SOFT_SCALE_UX] = soft_scale_ux_;
+            table[RT_LW_PARAM_SOFT_SCALE_UY] = soft_scale_uy_;
         }
 
         table[RT_LW_PARAM_EDGEENA] = wavelet_edge_ ? 1.f : 0.f;
@@ -1773,6 +1930,33 @@ int LabWaveletContext::build(RtLabWaveletResult& out)
                             wavelet_refine_poly_slope_[index];
                     }
                 }
+            }
+        }
+        if (wavelet_soft_) {
+            /*
+             * XYZ2Lab()'s L output is a float lookup through the block's own
+             * Color::cachefy table. Uploading the table reproduces the host
+             * rounding; std::cbrt() on the device would not. The tail is the
+             * last one, so its offset is the table length without it.
+             */
+            if (!Color::cachefy) {
+                return 5;
+            }
+            const std::size_t soft_offset = labWaveletParamEntries(
+                static_cast<std::uint32_t>(planes),
+                static_cast<std::uint32_t>(wavelet_levels_), wavelet_edge_,
+                wavelet_final_, wavelet_toning_, wavelet_denoise_,
+                wavelet_refine_,
+                static_cast<std::uint32_t>(wavelet_refine_poly_x_.size()),
+                false);
+            if (soft_offset + RT_LAB_WAVELET_SOFT_LUT_ENTRIES !=
+                wavelet_params_.size()) {
+                return 5;
+            }
+            float* soft_lut = table + soft_offset;
+            for (std::uint32_t index = 0;
+                 index < RT_LAB_WAVELET_SOFT_LUT_ENTRIES; ++index) {
+                soft_lut[index] = Color::cachefy[static_cast<int>(index)];
             }
         }
     }

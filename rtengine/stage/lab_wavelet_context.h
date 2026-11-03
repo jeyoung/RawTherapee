@@ -73,7 +73,7 @@ struct ProcParams;
  * Plane 0 is L, planes 1 and 2 are the chroma pass's a and b. The device
  * never re-derives a filter, a threshold or a range.
  */
-#define RT_LAB_WAVELET_WAVELET_PARAMS 80u
+#define RT_LAB_WAVELET_WAVELET_PARAMS 96u
 #define RT_LAB_WAVELET_MEA_ENTRIES 10u
 /* One block of raw statistics per (level, direction) band. */
 #define RT_LAB_WAVELET_STATS_PER_BAND 6u
@@ -131,6 +131,39 @@ struct ProcParams;
 #define RT_LW_PARAM_FILTER_ANAL_HI 56
 #define RT_LW_PARAM_FILTER_SYNTH_LO 64
 #define RT_LW_PARAM_FILTER_SYNTH_HI 72
+/*
+ * The clarity arm's guided soft radius, present in every table and zero when
+ * the arm does not run. The host computes the guided filter's derived scalars
+ * once, with the block's own float arithmetic, so the device never re-derives
+ * the radius, the subsampling or the bilinear scales:
+ *   [80] 1 when the soft radius runs (clarity arm with softrad > 0)
+ *   [81] the block's epsilon (guidedFilter's `epsilon` float argument)
+ *   [82] the subsampled width (guidedfilter.cc's W / subsampling)
+ *   [83] the subsampled height
+ *   [84] the box-blur radius: f_mean()'s LIM and boxblur()'s own clamp
+ *   [85] the downscale column factor, float(W) / float(w)
+ *   [86] the downscale row factor
+ *   [87] the upscale column factor, float(w) / float(W)
+ *   [88] the upscale row factor
+ * Slots 89..95 are reserved for the final panel's guided soft radius.
+ */
+#define RT_LW_PARAM_SOFT_ACTIVE 80
+#define RT_LW_PARAM_SOFT_EPSILON 81
+#define RT_LW_PARAM_SOFT_W 82
+#define RT_LW_PARAM_SOFT_H 83
+#define RT_LW_PARAM_SOFT_BOXRAD 84
+#define RT_LW_PARAM_SOFT_SCALE_DX 85
+#define RT_LW_PARAM_SOFT_SCALE_DY 86
+#define RT_LW_PARAM_SOFT_SCALE_UX 87
+#define RT_LW_PARAM_SOFT_SCALE_UY 88
+/*
+ * The soft-radius tail, present only when the clarity arm's soft radius runs:
+ * RT_LAB_WAVELET_SOFT_LUT_ENTRIES samples of the block's own Color::cachefy
+ * table. The L write-back is XYZ2Lab()'s L output, which is a float lookup of
+ * the new Y through that table; uploading the table reproduces the host
+ * rounding exactly instead of approximating std::cbrt() on the device.
+ */
+#define RT_LAB_WAVELET_SOFT_LUT_ENTRIES 65536u
 /*
  * The edge tail, present only when the edge panel runs:
  *   [0]                 settings->limrad
@@ -207,7 +240,8 @@ inline std::size_t labWaveletParamEntries(std::uint32_t planes,
                                           std::uint32_t levels, bool edge,
                                           bool final_curves, bool toning,
                                           bool denoise, bool refine,
-                                          std::uint32_t refine_poly)
+                                          std::uint32_t refine_poly,
+                                          bool soft)
 {
     std::size_t entries = RT_LAB_WAVELET_WAVELET_PARAMS +
                           static_cast<std::size_t>(planes) *
@@ -241,6 +275,9 @@ inline std::size_t labWaveletParamEntries(std::uint32_t planes,
                        RT_LAB_WAVELET_REFINE_SCALARS +
                    RT_LAB_WAVELET_REFINE_LUT + 2 +
                    3 * static_cast<std::size_t>(refine_poly);
+    }
+    if (soft) {
+        entries += RT_LAB_WAVELET_SOFT_LUT_ENTRIES;
     }
     return entries;
 }
@@ -534,6 +571,9 @@ inline constexpr double LAB_WAVELET_MAX_WAVELET_SIGMATON = 2.5;
  */
 inline constexpr double LAB_WAVELET_MIN_MERGE = -50.0;
 inline constexpr double LAB_WAVELET_MAX_MERGE = 100.0;
+/* The clarity panel's guided soft radius slider: 0..100 in steps of 0.5. */
+inline constexpr double LAB_WAVELET_MIN_SOFT_RAD = 0.0;
+inline constexpr double LAB_WAVELET_MAX_SOFT_RAD = 100.0;
 /* Lmethod's combo box: the nine level entries and the "SUPE" entry. */
 inline constexpr int LAB_WAVELET_MIN_LMETHOD = 0;
 inline constexpr int LAB_WAVELET_MAX_LMETHOD = 10;
@@ -576,7 +616,7 @@ int labWaveletTransformLevels(const procparams::ProcParams& params,
  * Whether the wavelet pass is the node's supported set: the contrast panel,
  * the chroma panel's "link" arm, the edge panel's plain arm, the final
  * panel's curve arm and the toning panel's zero-protection arm, no residual,
- * noise or blur panel, full-tile processing, no soft radius,
+ * noise or blur panel, full-tile processing, no final soft radius,
  * no L contrast
  * skin protection, no avoid-colour-shift or blue-sky median, no extra level,
  * the default 8-tap Daubechies, a highlight/shadow method the block
@@ -595,6 +635,11 @@ int labWaveletTransformLevels(const procparams::ProcParams& params,
  * `expclari` and a known Backmethod; it runs the block's two-pass sequence and
  * merge. Lmethod, Dirmethod, Backmethod and the merge sliders must be inside
  * the widget ranges whenever the selection runs.
+ *
+ * The guided soft radius (`softrad`) belongs to the clarity arm: the block
+ * reads it only inside the two-pass sequence, so it is admitted only there and
+ * must be inside its 0..100 slider range. The final panel's guided soft radius
+ * (`softradend`) is not ported and stays a residual.
  */
 bool labWaveletWaveletSupported(const procparams::ProcParams& params,
                                 int width, int height);
@@ -722,6 +767,21 @@ private:
     float clarity_l_ = 0.f;
     float clarity_c0_ = 0.f;
     float clarity_c_ = 0.f;
+
+    /*
+     * The clarity arm's guided soft radius. `wavelet_soft_` is set when the
+     * arm runs and softrad is non-zero; the derived scalars are the block's
+     * own guidedFilter() inputs, computed once at build time.
+     */
+    bool wavelet_soft_ = false;
+    float soft_epsilon_ = 0.f;
+    int soft_w_ = 0;
+    int soft_h_ = 0;
+    int soft_box_rad_ = 0;
+    float soft_scale_dx_ = 1.f;
+    float soft_scale_dy_ = 1.f;
+    float soft_scale_ux_ = 1.f;
+    float soft_scale_uy_ = 1.f;
 };
 
 } // namespace rtengine::stage

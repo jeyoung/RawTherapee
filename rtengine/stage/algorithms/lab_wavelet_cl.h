@@ -1937,6 +1937,317 @@ __kernel void rt_lw_box_v(__global const float* src,
 }
 
 /*
+ * The clarity arm's guided soft radius: guidedfilter.cc's guidedFilter() plus
+ * the export block's provradius guide and L write-back. The host computes
+ * every derived scalar with the block's own arithmetic (the epsilon, the
+ * subsampled extent, the box-blur radius and the two bilinear scale pairs), so
+ * the kernels below only evaluate the per-pixel steps. The box blur is
+ * rt_lw_box_h()/_v() above; the block's six f_mean() calls run through it with
+ * the radius the host derived.
+ */
+
+/* The block's own Color::cachefy table, uploaded at every integer index. */
+#define RT_LW_SOFT_LUT_ENTRIES 65536
+#define RT_LW_SOFT_LUT_MAXS 65534.0f
+/* Color::Lab2XYZ()'s constants, in the host's types. */
+#define RT_LW_SOFT_KAPPA (24389.0 / 27.0)
+#define RT_LW_SOFT_KAPPAF (float)(24389.0 / 27.0)
+#define RT_LW_SOFT_C1BY116 (float)(1.0 / 116.0)
+#define RT_LW_SOFT_C16BY116 (float)(16.0 / 116.0)
+#define RT_LW_SOFT_EPSCAP 8.0f
+
+/*
+ * Color::Lab2XYZ()'s Y. Y depends on L alone, so the guide and the source
+ * plane read one value per pixel; the block's a and b arguments only reach X
+ * and Z, which the L write-back never reads.
+ */
+inline float rt_lw_soft_lab_y(float l)
+{
+    const float ll = l / 327.68f;
+    const float fy = (RT_LW_SOFT_C1BY116 * ll) + RT_LW_SOFT_C16BY116;
+    return (ll > RT_LW_SOFT_EPSCAP) ? 65535.0f * fy * fy * fy
+                                    : 65535.0f * ll / RT_LW_SOFT_KAPPAF;
+}
+
+/*
+ * LUTf::operator[](float) with LUT_CLIP_BELOW | LUT_CLIP_ABOVE, the lookup
+ * Color::XYZ2Lab() uses for f in [0, 65535]. The table's size is
+ * RT_LW_SOFT_LUT_ENTRIES, so its last interpolable index is two below it.
+ */
+inline float rt_lw_soft_lut(__global const float* table, float index)
+{
+    if (index < 0.0f) {
+        return table[0];
+    }
+    if (index > RT_LW_SOFT_LUT_MAXS) {
+        return table[RT_LW_SOFT_LUT_ENTRIES - 1];
+    }
+    const int base = (int)index;
+    const float low = table[base];
+    return low + (table[base + 1] - low) * (index - (float)base);
+}
+
+/* sleef.h's mlaf(), left uncontracted as the host builds it. */
+inline float rt_lw_soft_mlaf(float x, float y, float z)
+{
+    const float product = x * y;
+    return product + z;
+}
+
+/* sleef.h's ilogbp1f(), ldexpkf(), mulsignf() and xcbrtf(), copied verbatim
+ * so Color::computeXYZ2LabY()'s out-of-range branch rounds as the host does. */
+inline int rt_lw_soft_ilogbp1(float d)
+{
+    const int m = d < 5.421010862427522E-20f;
+    d = m ? 1.8446744073709552E19f * d : d;
+    int q = (as_int(d) >> 23) & 0xff;
+    q = m ? q - (64 + 0x7e) : q - 0x7e;
+    return q;
+}
+
+inline float rt_lw_soft_ldexpk(float x, int q)
+{
+    int m = q >> 31;
+    m = (((m + q) >> 6) - m) << 4;
+    q = q - (m << 2);
+    float u = as_float((int)(m + 0x7f) << 23);
+    u = u * u;
+    x = x * u * u;
+    u = as_float((int)(q + 0x7f) << 23);
+    return x * u;
+}
+
+inline float rt_lw_soft_mulsign(float x, float y)
+{
+    return as_float(as_int(x) ^ (as_int(y) & (int)0x80000000u));
+}
+
+inline float rt_lw_soft_cbrtf(float d)
+{
+    float x;
+    float q = 1.0f;
+    const int e = rt_lw_soft_ilogbp1(d);
+    d = rt_lw_soft_ldexpk(d, -e);
+    const int r = (e + 6144) % 3;
+    q = (r == 1) ? 1.2599210498948731647672106f : q;
+    q = (r == 2) ? 1.5874010519681994747517056f : q;
+    q = rt_lw_soft_ldexpk(q, (e + 6144) / 3 - 2048);
+    q = rt_lw_soft_mulsign(q, d);
+    d = fabs(d);
+
+    x = -0.601564466953277587890625f;
+    x = rt_lw_soft_mlaf(x, d, 2.8208892345428466796875f);
+    x = rt_lw_soft_mlaf(x, d, -5.532182216644287109375f);
+    x = rt_lw_soft_mlaf(x, d, 5.898262500762939453125f);
+    x = rt_lw_soft_mlaf(x, d, -3.8095417022705078125f);
+    x = rt_lw_soft_mlaf(x, d, 2.2241256237030029296875f);
+
+    const float y = d * x * x;
+    return (y - (2.0f / 3.0f) * y * (y * x - 1.0f)) * q;
+}
+
+/* Color::computeXYZ2LabY(), the L write-back's only conversion. */
+inline float rt_lw_soft_xyz_l(float f, __global const float* table)
+{
+    if (f < 0.0f) {
+        return (float)(327.68f * (RT_LW_SOFT_KAPPA * (double)f / 65535.0));
+    }
+    if (f > 65535.0f) {
+        return 327.68f * (116.0f * rt_lw_soft_cbrtf(f / 65535.0f) - 16.0f);
+    }
+    return rt_lw_soft_lut(table, f);
+}
+
+/*
+ * rescaleBilinear()'s getBilinearValue(): integer and fractional parts by
+ * truncation, the neighbour clamped to the plane's last row or column.
+ */
+/* rt_math.h's intp(), left uncontracted as the host builds it. */
+inline float rt_lw_soft_intp(float a, float b, float c)
+{
+    const float difference = b - c;
+    const float product = a * difference;
+    return product + c;
+}
+
+inline float rt_lw_soft_bilinear(__global const float* src, int pitch, int width,
+                                 int height, float x, float y)
+{
+    const int xi = (int)x;
+    const int yi = (int)y;
+    const float xf = x - (float)xi;
+    const float yf = y - (float)yi;
+    const int xi1 = min(xi + 1, width - 1);
+    const int yi1 = min(yi + 1, height - 1);
+    const float bl = src[yi * pitch + xi];
+    const float br = src[yi * pitch + xi1];
+    const float tl = src[yi1 * pitch + xi];
+    const float tr = src[yi1 * pitch + xi1];
+    const float bottom = rt_lw_soft_intp(xf, br, bl);
+    const float top = rt_lw_soft_intp(xf, tr, tl);
+    return rt_lw_soft_intp(yf, top, bottom);
+}
+
+/* The clarity arm's provradius guide: the pre-pass Y / 32768. */
+__kernel void rt_lab_wavelet_w_soft_guide(
+    __global const float* l, int l_pitch,
+    __global float* guide, int guide_pitch,
+    int w, int h)
+{
+    const int x = get_global_id(0);
+    const int y = get_global_id(1);
+    if (x >= w || y >= h) {
+        return;
+    }
+    guide[y * guide_pitch + x] = rt_lw_soft_lab_y(l[y * l_pitch + x]) / 32768.0f;
+}
+
+/*
+ * The second pass' Y / 32768 into `src`, with ip_wavelet()'s final tile copy
+ * applied to L first: the export block reads the clamped pass, so the guided
+ * filter and the merge must see the same value.
+ */
+__kernel void rt_lab_wavelet_w_soft_src(
+    __global float* l, int l_pitch,
+    __global float* src, int src_pitch,
+    int w, int h)
+{
+    const int x = get_global_id(0);
+    const int y = get_global_id(1);
+    if (x >= w || y >= h) {
+        return;
+    }
+    const float value = l[y * l_pitch + x];
+    const float clamped = value <= 0.0f ? 1.0f : value;
+    src[y * src_pitch + x] = rt_lw_soft_lab_y(clamped) / 32768.0f;
+}
+
+/* f_subsample(): both guidances at once, since they share the scales. */
+__kernel void rt_lab_wavelet_w_soft_rescale(
+    __global const float* guide, int guide_pitch,
+    __global float* guide_out, int guide_out_pitch,
+    __global const float* src, int src_pitch,
+    __global float* src_out, int src_out_pitch,
+    int width, int height, int out_w, int out_h,
+    float col_scale, float row_scale)
+{
+    const int x = get_global_id(0);
+    const int y = get_global_id(1);
+    if (x >= out_w || y >= out_h) {
+        return;
+    }
+    const float sx = (float)x * col_scale;
+    const float sy = (float)y * row_scale;
+    guide_out[y * guide_out_pitch + x] =
+        rt_lw_soft_bilinear(guide, guide_pitch, width, height, sx, sy);
+    src_out[y * src_out_pitch + x] =
+        rt_lw_soft_bilinear(src, src_pitch, width, height, sx, sy);
+}
+
+/* apply(MUL, corrIp, I1, p1) and apply(MUL, corrI, I1, I1) together. */
+__kernel void rt_lab_wavelet_w_soft_mul(
+    __global const float* guide, int guide_pitch,
+    __global const float* src, int src_pitch,
+    __global float* corr_p, int corr_p_pitch,
+    __global float* corr_i, int corr_i_pitch,
+    int w, int h)
+{
+    const int x = get_global_id(0);
+    const int y = get_global_id(1);
+    if (x >= w || y >= h) {
+        return;
+    }
+    const float i = guide[y * guide_pitch + x];
+    corr_p[y * corr_p_pitch + x] = i * src[y * src_pitch + x];
+    corr_i[y * corr_i_pitch + x] = i * i;
+}
+
+/*
+ * The per-pixel reduction: varI, covIp, a and b. Each is the block's own
+ * single operation, in the block's order.
+ */
+__kernel void rt_lab_wavelet_w_soft_reduce(
+    __global const float* mean_i, int mean_i_pitch,
+    __global const float* mean_p, int mean_p_pitch,
+    __global const float* corr_i, int corr_i_pitch,
+    __global const float* corr_p, int corr_p_pitch,
+    __global float* a_out, int a_pitch,
+    __global float* b_out, int b_pitch,
+    int w, int h, float epsilon)
+{
+    const int x = get_global_id(0);
+    const int y = get_global_id(1);
+    if (x >= w || y >= h) {
+        return;
+    }
+    const float mi = mean_i[y * mean_i_pitch + x];
+    const float mp = mean_p[y * mean_p_pitch + x];
+    const float var_i = corr_i[y * corr_i_pitch + x] - mi * mi;
+    const float cov_ip = corr_p[y * corr_p_pitch + x] - mi * mp;
+    const float a = cov_ip / (var_i + epsilon);
+    a_out[y * a_pitch + x] = a;
+    b_out[y * b_pitch + x] = mp - a * mi;
+}
+
+/* q = bilinear(meana) * I + bilinear(meanb), the block's final loop. */
+__kernel void rt_lab_wavelet_w_soft_upsample(
+    __global const float* mean_a, int mean_a_pitch,
+    __global const float* mean_b, int mean_b_pitch,
+    __global const float* guide, int guide_pitch,
+    __global float* out, int out_pitch,
+    int width, int height, int small_w, int small_h,
+    float col_scale, float row_scale)
+{
+    const int x = get_global_id(0);
+    const int y = get_global_id(1);
+    if (x >= width || y >= height) {
+        return;
+    }
+    const float sx = (float)x * col_scale;
+    const float sy = (float)y * row_scale;
+    const float a = rt_lw_soft_bilinear(mean_a, mean_a_pitch, small_w, small_h,
+                                        sx, sy);
+    const float b = rt_lw_soft_bilinear(mean_b, mean_b_pitch, small_w, small_h,
+                                        sx, sy);
+    out[y * out_pitch + x] = a * guide[y * guide_pitch + x] + b;
+}
+
+/*
+ * ip_wavelet()'s final tile copy: an L at or below zero becomes one. The
+ * clarity second pass zeroes bands, so its reconstruction can undershoot.
+ */
+__kernel void rt_lab_wavelet_w_clamp_l(
+    __global float* l, int l_pitch, int w, int h)
+{
+    const int x = get_global_id(0);
+    const int y = get_global_id(1);
+    if (x >= w || y >= h) {
+        return;
+    }
+    const int at = y * l_pitch + x;
+    if (l[at] <= 0.0f) {
+        l[at] = 1.0f;
+    }
+}
+
+/* The block's L write-back: L = XYZ2Lab(X, 32768 * ble, Z).L. */
+__kernel void rt_lab_wavelet_w_soft_write(
+    __global float* l, int l_pitch,
+    __global const float* src, int src_pitch,
+    __global const float* params, int lut_offset,
+    int w, int h)
+{
+    const int x = get_global_id(0);
+    const int y = get_global_id(1);
+    if (x >= w || y >= h) {
+        return;
+    }
+    const float y_value = 32768.0f * src[y * src_pitch + x];
+    l[y * l_pitch + x] =
+        rt_lw_soft_xyz_l(y_value, params + lut_offset);
+}
+
+/*
  * finalContAllL()/ContAllAB()'s CLmethod selection. `method` is 0 one,
  * 1 inf and 2 sup; `direction` is 0 all, 1 one, 2 two and 3 thr. The kernel
  * zeroes the bands the block zeroes and, at level 0, paints the coefficient-0
@@ -2046,10 +2357,7 @@ __kernel void rt_lab_wavelet_w_clarity_merge(
     }
 
     const int at = y * l_pitch + x;
-    float second = l[at];
-    if (second <= 0.0f) {
-        second = 1.0f;
-    }
+    const float second = l[at];
     float value =
         (1.0f + mL0) * unshar_l[y * unshar_l_pitch + x] - mL * second;
     value = fmin(fmax(value, 0.0f), 32768.0f);
