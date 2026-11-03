@@ -264,8 +264,13 @@ analyse/statistics/synthesise passes at that plane's own count. The device
 keeps a second band set for
 those L coefficients, builds the MAD median from a 32768-bin device histogram,
 reproduces `noisevarlum`/`noisevarchrom` at the clamped `(2y+1, 2x+1)` sample,
-and ports `ShrinkAllL`/`ShrinkAllAB` with the lab.tools box blur. Only the
-plain `quaMethod == "cons"` slider arm is admitted, and with `sliMethod ==
+and ports `ShrinkAllL`/`ShrinkAllAB` with the lab.tools box blur. `quaMethod`
+admits `"cons"` (one standard pass per plane) and `"agre"` (the BiShrink pair
+first): at the export call site's `edge == 6` the L pair is the same
+`ShrinkAllL` arithmetic twice, while the chroma pair applies
+`SQR(1 - exp(...))` with no box blur on levels 0..4 and `ShrinkAllAB` on level
+5, so the standard pass after it rebuilds the squared MAD from the post-pair
+bands. With `sliMethod ==
 "cur"` the post-denoise curve refinement runs too: the host samples the
 block's `WavCurve` over `wavdenoise`, detects `cp.denoicurv` over the first
 500 entries, and keeps the pre-denoise L coefficients in the free `bands` set
@@ -294,9 +299,11 @@ block's `Evaluate2` gate, which this arm already satisfies, so the device
 refuses it instead of relying on that coincidence). A user chroma strength is
 admitted and inert: `variC` is dead at the
 forced `local == 1` and `cp.chromco` cannot reach its `> 30` ramp test. The pass order is forward analysis,
-statistics/mea, MAD/shrink L, the pre-denoise snapshot, denoise, the
+statistics/mea, MAD/shrink L (twice for `agre`), the pre-denoise snapshot,
+denoise, the
 post-denoise statistics and curve refinement, contrast/edge/final, noise
-variance and chroma denoise, then the a/b planes and the deferred L
+variance and chroma denoise (BiShrink pair, second MAD build and the standard
+pass per plane for `agre`), then the a/b planes and the deferred L
 reconstruction. The final tail reuses the
 statistics the block built before the denoise unless
 `cp.val > 0 || ref || contr || cp.diagcurv`; the host evaluates that condition
@@ -414,7 +421,9 @@ device pass. The blur and residual panels are refused before any upload, as
 are an unknown `BAmethod`, `TMr` without a method, a `BAmethod` whose sliders
 are out of range, `cur` without an opacity curve, the `TMr`-only profile whose
 L trim differs from the a/b count, the
-unported denoise sub-arms and the edge sub-arms that stay residual (an unknown
+denoise sub-arms that stay residual (an unknown `quaMethod`, noise balance,
+the hue curve, colour-by-noise and a Thrend the device does not model) and the
+edge sub-arms that stay residual (an unknown
 `NPmethod`/`EDmethod`, the detection sliders out of range, zero strength and
 L skin protection), and a non-zero `softradend` combined with
 the clarity arm or the clarity soft radius, so a profile that enables any of
@@ -446,7 +455,7 @@ panes records them separately. Both tools are off by default.
 | `rgb.proc` | Full/Full/Roi/Reduced | path | reuse-input | RGB curves, tone curve, colour toning, B&W, channel mixer, HSV, film simulation | yes |
 | `lab.tools` | Full/Full/Roi/Reduced | path | reuse-input | shadows/highlights, vibrance, Lab curves (including non-zero contrast, the chromaticity slider, the C=f(H)/L=f(H)/H=f(H) hue flat curves and the NONE/LAB/XYZ/XYZREL/MUN gamut methods), local contrast, black-and-white (cheap and `bwToning` arms), EPD, Lab-grid colour toning and Lab colour-correction regions | partial |
 | `lab.sharpening` | Full/-/Roi/- | path | reuse-input | impulse denoise and defringe (own node), ML sharpen edges, ML microcontrast and the main sharpen pass (shared `output.sharpen` node) | partial |
-| `lab.wavelet` | Full/Full/Roi/Reduced | path | reuse-input | directional pyramid equaliser and wavelet contrast, standard denoise (L and the forced chroma arm), chroma `link`, edge plain arm and Medianlev Lipschitz control, final curves, balance-chroma `sli`/`cur`, the toning zero-protection arm, CLmethod's level selection and the clarity two-pass merge | partial |
+| `lab.wavelet` | Full/Full/Roi/Reduced | path | reuse-input | directional pyramid equaliser and wavelet contrast, standard and BiShrink denoise (L and the forced chroma arm), chroma `link`, edge plain arm and Medianlev Lipschitz control, final curves, balance-chroma `sli`/`cur`, the toning zero-protection arm, CLmethod's level selection and the clarity two-pass merge | partial |
 | `working.trc` | Full/Full/Roi/- | path | reuse-input | soft light, tone equaliser and working-TRC conversion | partial |
 | `ciecam` | Full/Full/Roi/- | path | reuse-input | CIE CAM 02 | no |
 | `gamut` | Full/Full/Roi/Reduced | path | reuse-input | working-space gamut compression | yes |

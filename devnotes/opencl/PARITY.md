@@ -111,6 +111,9 @@ pairs are exact. The gate is the peak absolute error (PAE) in normalised units;
 | 2026-11-03 | `ed9f2a1e7..f53d06d4c` | POCL (CPU) | colorspace_flowers.pef / `labwavelet-edge-median.pp3`, `labwavelet-edge-nplow.pp3`, `labwavelet-edge-nphigh.pp3`, `labwavelet-edge-lipst.pp3` and `labwavelet-edge-sl.pp3` (Medianlev, NPMethod low/high with Lipst, Lipst influence, EDmethod SL), `lab.wavelet` | off vs auto, 16-bit TIFF | 1 LSB (940-1,196 of 30,419,712) | PASS |
 | 2026-11-03 | `ed9f2a1e7..f53d06d4c` | POCL (CPU) | 15-case edge Lipschitz matrix (3x3 thresholds 20/40/65, 5x5 85/95, Lipst influence, NPMethod low/high and low at threshold 0, EDmethod SL, contrast, denoise, final curves, combined arms, padded 179x49), `stage-residency-test` | device vs host block | 0.023438 LSB16 (worst: 5x5 threshold 95) | PASS |
 | 2026-11-03 | `ed9f2a1e7..f53d06d4c` | POCL (CPU) | 14-case edge refusal matrix (unknown NPmethod/EDmethod, `edgedetect`/`edgedetectthr`/`edgedetectthr2`/`edgesensi`/`edgeampli` out of range, plain slider ranges, unknown `Medgreinf`, zero strength, L skin protection), `stage-residency-test` | device vs host block | 0 (host) | PASS |
+| 2026-11-03 | `d8b09ee47..uncommitted` | POCL (CPU) | colorspace_flowers.pef / `labwavelet-denoise-agre.pp3` (Expnoise, `quaMethod=agre`, `Lev0..4` non-zero, `Ballum=7`), `lab.wavelet` | off vs auto, 16-bit TIFF | 1 LSB (30,024 of 30,419,712) | PASS |
+| 2026-11-03 | `d8b09ee47..uncommitted` | POCL (CPU) | 13-case BiShrink matrix (levels 3/5/6, ballum 10/7/5/0/-2, odd 179x161, odd height 180x161, contrast, edge, final curves, toning, all panels padded, Thrden 5), `stage-residency-test` | device vs host block | 0.037109 LSB16 (worst: all panels 179x161) | PASS |
+| 2026-11-03 | `d8b09ee47..uncommitted` | POCL (CPU) | 4-case BiShrink refusal matrix (unknown `quaMethod`, `agre` with Ballum above range, `agre` with a level slider above range, `agre` at the 128-pixel window), `stage-residency-test` | device vs host block | 0 (host) | PASS |
 | 2026-11-02 | 89e0a844b..47b9980fb | POCL (CPU) | colorspace_flowers.pef / `labtools-labcurve-contrast.pp3` (Lab curves with contrast 30, L/a/b/cc/lc/cl tables), `lab.tools` | off vs auto, 16-bit TIFF | 0 (exact) | PASS |
 | 2026-11-02 | 89e0a844b..47b9980fb | POCL (CPU) | 3-case Lab-contrast matrix (contrast 5, contrast 15 with L curve+brightness, contrast 30 with all six tables), `stage-residency-test` | device vs host block | 0 (exact) | PASS |
 | 2026-11-02 | uncommitted | POCL (CPU) | colorspace_flowers.pef / `labtools-labcurve-contrast.pp3` with `Gamutmunse=XYZ`, `lab.tools` | off vs auto, 16-bit TIFF | 0 (exact) | PASS |
@@ -466,7 +469,7 @@ peak absolute error is zero for the synthetic node tests:
   width, odd height, odd both, with contrast, edge, final curves, toning, all
   panels and all panels padded) match the host block; the panel-off comparison
   changes 85,918-114,240 samples per case, so the parity is not vacuous.
-  Eleven residual configurations (`quaMethod` agre, user chromfi/chromco,
+  Eleven residual configurations (an unknown `quaMethod`, user chromfi/chromco,
   balchrom, a non-identity `Wavhuecurve`, `CBenab`, Thrden,
   Ballum outside its widget range, a level slider outside its range, all
   sliders zero and the 128-pixel window) run the host builtin byte for byte.
@@ -479,6 +482,34 @@ peak absolute error is zero for the synthetic node tests:
   second seven-level L band set while a and b run; a 45.7 MP frame exceeds
   the 1 GiB default stage budget and falls back to the host, recorded as
   `impl=host`, so large-frame denoise is not a device case yet.
+- The `lab.wavelet` denoise arm also admits `quaMethod == "agre"`, the
+  BiShrink pair. `ip_wavelet()` runs `WaveletDenoiseAll_BiShrinkL()` and then
+  `WaveletDenoiseAllL()` on L, and each a/b plane gets
+  `WaveletDenoiseAll_BiShrinkAB()` and then `WaveletDenoiseAllAB()`. At the
+  export call site's `edge == 6` the L pair's per-level formula is the same
+  `ShrinkAllL()` arithmetic with the same `madL[lvl]` and `vari[lvl]`, and its
+  coarsest level calls `ShrinkAllL()` outright, so the L arm is the standard
+  tail twice over the same squared MAD; dropping the second pass moves the
+  device result by 8,052 LSB16, so the pair is not an alias for a single
+  pass. The chroma pair is a different formula: levels 0..4 multiply by
+  `SQR(1 - exp(-(mag_ab / (nvc * noisevar_ab * madab)) - mag_L / (9 * madL)))`
+  with no box blur, and level 5 runs `ShrinkAllAB()` with the pre-denoise
+  squared MAD. The standard pass that follows rebuilds `Mad()` from the
+  post-pair bands, which the host also does because `ShrinkAllAB()` measures
+  the band it is about to shrink, so the device runs the MAD histogram and
+  `compute_mad()` a second time for that plane. `noisevarab_r` is the block's
+  hard-coded 100.f and lives in `RT_LAB_WAVELET_DENOISE_NOISEVAR_AB`, not in
+  the parameter table. Thirteen device cases (levels 3/5/6, ballum
+  10/7/5/0/-2, odd 179x161, odd height 180x161, contrast, edge, final curves,
+  toning, all panels padded and the Thrden refinement) match the host block
+  with a worst peak error of 0.037109 LSB16, and each differs from the same
+  profile with `quaMethod = "cons"` by 15,956-60,007 LSB16, so the pair is not
+  vacuous. Four residuals (an unknown `quaMethod`, `agre` with Ballum or a
+  level slider outside its widget range, and `agre` at the 128-pixel window)
+  run the host builtin byte for byte. `labwavelet-denoise-agre.pp3` is 1 LSB16
+  on the export TIFF (30,024 of 30,419,712 samples) and records `impl=opencl`.
+  Every comparison still pins `OMP_NUM_THREADS=1` for the host's
+  `noisevarlum` race. `d8b09ee47`.
 - The `lab.wavelet` denoise-curve refinement (`sliMethod == "cur"`) ports
   `ip_wavelet()`'s post-denoise curve multiply. The host samples the block's
   own `WavCurve` over `wavdenoise` into 501 entries, detects `cp.denoicurv`

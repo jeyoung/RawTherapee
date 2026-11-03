@@ -264,7 +264,7 @@ current tip.
   that `levwava`/`levwavb` clamp to, while L keeps seven, so no plane carries
   an extra round trip the host does not perform; the final tail reuses the
   pre-denoise statistics unless `cp.val`, `ref`, `contr` or `cp.diagcurv`
-  asks for a refresh (`679f5b4d8`). Ten residuals (`quaMethod` agre,
+  asks for a refresh (`679f5b4d8`). Ten residuals (an unknown `quaMethod`,
   balchrom, `Wavhuecurve`, `CBenab`, `sliMethod` cur, Ballum range, level
   range, all sliders zero and the 128-pixel window) run the host builtin byte
   for byte. The `sliMethod == "sli"` Thrden refinement is a device case: the
@@ -276,8 +276,30 @@ current tip.
   zeroed. `labwavelet-denoise.pp3` records
   `impl=opencl` at 1 LSB16. Every comparison pins `OMP_NUM_THREADS=1`: the
   host's `noisevarlum` loop races under OpenMP and is not a deterministic
-  reference. The BiShrink arms and noise balance remain host residuals.
+  reference. Noise balance remains a host residual.
   `66613d0a9`, `6db958afe`, `679f5b4d8`.
+- **`lab.wavelet` denoise BiShrink (`quaMethod=agre`)**: the pair
+  `ip_wavelet()` runs before the standard arm. On L it is
+  `WaveletDenoiseAll_BiShrinkL()` and then `WaveletDenoiseAllL()`; at the
+  export call site's `edge == 6` the pair's per-level formula is the same
+  `ShrinkAllL()` arithmetic with the same `madL` and `vari`, and its coarsest
+  level calls `ShrinkAllL()` outright, so the L arm is the standard tail twice
+  over one MAD build (removing the second pass moves the device result by
+  8,052 LSB16). On chroma it is `WaveletDenoiseAll_BiShrinkAB()` and then
+  `WaveletDenoiseAllAB()`: the pair multiplies levels 0..4 by
+  `SQR(1 - exp(-(mag_ab / (nvc * 100 * madab)) - mag_L / (9 * madL)))` with no
+  box blur and runs `ShrinkAllAB()` on level 5 with the pre-denoise squared
+  MAD, and the standard pass rebuilds `Mad()` from the post-pair bands, so the
+  device measures the histogram twice for that plane. The block's hard-coded
+  `noisevarab_r = 100.f` lives in `RT_LAB_WAVELET_DENOISE_NOISEVAR_AB`.
+  Thirteen device cases (levels 3/5/6, ballum 10/7/5/0/-2, odd 179x161, odd
+  height 180x161, contrast, edge, final curves, toning, all panels padded and
+  Thrden 5) match the host with worst 0.037109 LSB16, and each differs from
+  `quaMethod=cons` by 15,956-60,007 LSB16, so the pair is not vacuous. Four
+  refusals (an unknown `quaMethod`, `agre` with Ballum or a level slider out
+  of range, `agre` at the 128-pixel window) run the host byte for byte.
+  `labwavelet-denoise-agre.pp3` is 1 LSB16 with `impl=opencl` (30,024 of
+  30,419,712 samples). `d8b09ee47`.
 - **`lab.wavelet` denoise curve (`sliMethod=cur`)**: the post-denoise
   refinement. The host samples the block's `WavCurve` over `wavdenoise` into
   501 entries, detects `cp.denoicurv` exactly as the block does, keeps the
@@ -875,7 +897,8 @@ residuals at PAE 0, the final curves
 with 13 cases, worst 0.015625 LSB16, and 14 residuals at PAE 0, toning
 with 12 cases, worst 0.011719 LSB16, and 10 residuals at PAE 0, the
 standard denoise L arm plus its forced chroma arm with 17 cases, worst
-0.015625 LSB16, and 12 residuals at PAE 0, and CLmethod's selection plus
+0.015625 LSB16, and 12 residuals at PAE 0, the BiShrink pair with 13 cases,
+worst 0.037109 LSB16, and 4 residuals at PAE 0, and CLmethod's selection plus
 the clarity arm with 20 cases, exact except the denoise pair at
 0.015625 LSB16, and 8 residuals at PAE 0, balance chroma with 10 cases,
 worst 0.052734 LSB16, and 11 residuals at PAE 0),
@@ -921,10 +944,11 @@ tile-copy clamp while the merge keeps the soft-filtered L unclamped. Nine
 cases are exact except the denoise pair at 0.011719 LSB16, and
 `labwavelet-softrad.pp3` is exact. The standard denoise arm (and the chroma
 denoise the block forces at six levels) landed with the unit above, and its
-`cur` and `sli`+Thrden refinements followed; the expert pairing landed with
-the unit above too. The BiShrink arms, user chroma strength, noise balance and
-hue curve stay
-residuals. The final curves and the toning zero-protection arm landed with the
+`cur` and `sli`+Thrden refinements followed; the expert pairing and the
+BiShrink pair (`quaMethod` `agre`) landed with the units above too, so the
+whole denoise panel now runs on the device except noise balance and the hue
+curve. A user chroma strength is admitted and inert. The final curves and the
+toning zero-protection arm landed with the
 units above. The edge panel's plain arm landed with the unit above; its
 median/Lipschitz detection (`calckoe`), `NPMethod` low/high smoothing, `Lipst`
 and `EDmethod` `SL` landed with this unit, so the whole edge panel now runs on
