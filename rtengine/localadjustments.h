@@ -79,7 +79,8 @@ struct LocalAdjustmentsSpotParams {
      * blmet is the method (0 blur, 1 median, 2 guided), blurmet the
      * normal/inverse direction, chromet the plane selector (0 luminance,
      * 1 chroma, 2 all), stren the added-noise strength and sensbn the deltaE
-     * scope sensitivity. */
+     * scope sensitivity. blmedmet is lp.medmet (0 3x3 strong .. 3 9x9) and
+     * bliters the Median_Denoise() pass count. */
     bool blurena = false;
     int blmet = 0;
     int blurmet = 0;
@@ -87,6 +88,8 @@ struct LocalAdjustmentsSpotParams {
     float stren = 0.f;
     int sensbn = 0;
     int guidb = 0;
+    int blmedmet = -1;
+    int bliters = 1;
     /* Local CBDL, as calcLocalParams() narrows it. cbdlena is the host's
      * enabled-and-unmasked predicate; mulloc is the per-level multiplier
      * after the block's 0..4 clamp. */

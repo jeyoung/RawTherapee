@@ -12899,6 +12899,8 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
         compiled_kernel_entry(env, def, "rt_lab_tools_lc_blend", error);
     cl_kernel blend_kernel =
         compiled_kernel_entry(env, def, "rt_local_adjustments_blend", error);
+    cl_kernel median_kernel =
+        compiled_kernel_entry(env, def, "rt_local_adjustments_median", error);
     cl_kernel log_kernel =
         compiled_kernel_entry(env, def, "rt_local_adjustments_log", error);
     cl_kernel log_blend_kernel = compiled_kernel_entry(
@@ -13150,6 +13152,7 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
     char cbdl_chroma_key = 0;
     char work_key = 0;
     char scratch_key = 0;
+    char median_key = 0;
     char sharpen_luma_key = 0;
     char sharpen_mask_key = 0;
     char sharpen_estimate_key = 0;
@@ -13497,18 +13500,43 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
                     "range";
             return RT_STAGE_FALLBACK;
         }
+        const int blurArm = static_cast<int>(
+            rec[RT_LOCAL_ADJUSTMENTS_SLOT_BLUR_ARM]);
+        const int blurMed = static_cast<int>(
+            rec[RT_LOCAL_ADJUSTMENTS_SLOT_BLUR_MED]);
+        const int blurIters = static_cast<int>(
+            rec[RT_LOCAL_ADJUSTMENTS_SLOT_BLUR_ITERS]);
+        /* The Gaussian arm's sigma has the block's 1.6 spot-radius gate baked
+         * in; the median arm has no radius gate of its own. */
+        const float blurMinSigma =
+            blurArm == RT_LOCAL_ADJUSTMENTS_BLUR_ARM_GAUSSIAN
+                ? RT_LOCAL_ADJUSTMENTS_BLUR_MIN_RADIUS /
+                      RT_LOCAL_ADJUSTMENTS_BLUR_RADIUS_DIVISOR
+                : RT_LOCAL_ADJUSTMENTS_BLUR_MEDIAN_MIN_RADIUS;
+        if (blurPass &&
+            (blurArm != RT_LOCAL_ADJUSTMENTS_BLUR_ARM_GAUSSIAN &&
+             blurArm != RT_LOCAL_ADJUSTMENTS_BLUR_ARM_MEDIAN)) {
+            error = "local.adjustments blur arm is unknown";
+            return RT_STAGE_FALLBACK;
+        }
         if (blurPass &&
             (rec[RT_LOCAL_ADJUSTMENTS_SLOT_BLUR_CHRO] < 0.0f ||
              rec[RT_LOCAL_ADJUSTMENTS_SLOT_BLUR_CHRO] > 2.0f ||
              rec[RT_LOCAL_ADJUSTMENTS_SLOT_BLUR_SENS] < 0.0f ||
              rec[RT_LOCAL_ADJUSTMENTS_SLOT_BLUR_SENS] > 100.0f ||
-             rec[RT_LOCAL_ADJUSTMENTS_SLOT_BLUR_RADIUS] <=
-                 RT_LOCAL_ADJUSTMENTS_BLUR_MIN_RADIUS /
-                     RT_LOCAL_ADJUSTMENTS_BLUR_RADIUS_DIVISOR ||
+             rec[RT_LOCAL_ADJUSTMENTS_SLOT_BLUR_RADIUS] <= blurMinSigma ||
              rec[RT_LOCAL_ADJUSTMENTS_SLOT_BLUR_RADIUS] >
                  RT_LOCAL_ADJUSTMENTS_BLUR_MAX_RADIUS /
                      RT_LOCAL_ADJUSTMENTS_BLUR_RADIUS_DIVISOR)) {
             error = "local.adjustments blur setting is outside its range";
+            return RT_STAGE_FALLBACK;
+        }
+        if (blurPass && blurArm == RT_LOCAL_ADJUSTMENTS_BLUR_ARM_MEDIAN &&
+            (blurMed < RT_LOCAL_ADJUSTMENTS_BLUR_MIN_MED ||
+             blurMed > RT_LOCAL_ADJUSTMENTS_BLUR_MAX_MED ||
+             blurIters < RT_LOCAL_ADJUSTMENTS_BLUR_MIN_ITERS ||
+             blurIters > RT_LOCAL_ADJUSTMENTS_BLUR_MAX_ITERS)) {
+            error = "local.adjustments median setting is outside its range";
             return RT_STAGE_FALLBACK;
         }
         if (dehazePass &&
@@ -13994,6 +14022,14 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
             StageDeviceBufferPtr scratch_device = residency->acquire(
                 &scratch_key, StageBufferShape{RT_STAGE_F32, bfw, bfh, 1},
                 &error);
+            /* Median_Denoise() swaps its input and output buffers on every
+             * pass, so the median arm needs a second three-plane ROI. */
+            StageDeviceBufferPtr median_device;
+            if (blurPass && blurArm == RT_LOCAL_ADJUSTMENTS_BLUR_ARM_MEDIAN) {
+                median_device = residency->acquire(
+                    &median_key, StageBufferShape{RT_STAGE_F32, bfw, bfh, 3},
+                    &error);
+            }
             /*
              * Local sharpening's padded extent and its three companion
              * planes (contrast mask, RLD estimate, RLD intermediate). The
@@ -14261,6 +14297,8 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
                  (!dehaze_rescale || dehaze_rescale_device));
             if (!work_device || !scratch_device || !blur_device[0] ||
                 !blur_device[1] || !blur_device[2] || !cbdl_acquired ||
+                (blurPass && blurArm == RT_LOCAL_ADJUSTMENTS_BLUR_ARM_MEDIAN &&
+                 !median_device) ||
                 !dehaze_acquired || (logPass && !log_orig_device) ||
                 (sharpenPass &&
                  (!sharpen_luma_device || !sharpen_mask_device ||
@@ -14290,6 +14328,16 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
             const int work_pitch = int_pitch(pitch_of(work_device), "ROI");
             const int work_plane =
                 int_pitch(plane_pitch_of(work_device), "ROI plane");
+            int median_pitch = 0;
+            int median_plane = 0;
+            if (median_device) {
+                median_pitch = int_pitch(pitch_of(median_device), "median");
+                median_plane =
+                    int_pitch(plane_pitch_of(median_device), "median plane");
+                if (median_pitch < 0 || median_plane < 0) {
+                    return RT_STAGE_FALLBACK;
+                }
+            }
             int log_orig_pitch = 0;
             int log_orig_plane = 0;
             if (logPass) {
@@ -14442,6 +14490,8 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
             }
             cl_mem work_memory = memory_of(work_device);
             cl_mem scratch_memory = memory_of(scratch_device);
+            cl_mem median_memory =
+                median_device ? memory_of(median_device) : nullptr;
             cl_mem sharpen_luma_memory =
                 sharpenPass ? memory_of(sharpen_luma_device) : nullptr;
             cl_mem sharpen_mask_memory =
@@ -14923,6 +14973,7 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
                     cl_mem dst = sharpen_blur_memory[plane];
                     cl_int src_plane = plane * lab_plane;
                     cl_int src_pitch = lab_pitch;
+                    cl_int dst_plane = 0;
                     cl_int dst_pitch = sharpen_blur_pitch;
                     cl_int w = width;
                     cl_int h = height;
@@ -14935,6 +14986,8 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
                                    sizeof(cl_int), &src_plane);
                     ok = ok && set(plane_copy_kernel, arg++,
                                    sizeof(cl_int), &src_pitch);
+                    ok = ok && set(plane_copy_kernel, arg++,
+                                   sizeof(cl_int), &dst_plane);
                     ok = ok && set(plane_copy_kernel, arg++,
                                    sizeof(cl_int), &dst_pitch);
                     ok = ok && set(plane_copy_kernel, arg++,
@@ -15178,14 +15231,17 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
             }
 
             /*
-             * Blur & Noise's Gaussian arm runs after log encoding and before
-             * dehaze in Lab_Local()'s order. The block copies the ROI, blurs
-             * the selected planes with gaussianBlur() at `lp.rad / (sk * 1.4)`
-             * and blends the difference with BlurNoise_Local()'s senstype-0
-             * scope. The scope's reference is the full-image 3 / sk blur, not
-             * the ROI. The kernel runs the host's SSE recurrence with the
-             * context's host-built coefficients; the unselected planes keep
-             * the ROI copy and contribute no difference.
+             * Blur & Noise runs after log encoding and before dehaze in
+             * Lab_Local()'s order. The block copies the ROI, applies its arm
+             * to the selected planes and blends the difference with
+             * BlurNoise_Local()'s senstype-0 scope. The Gaussian arm blurs
+             * with gaussianBlur() at `lp.rad / (sk * 1.4)`; the kernel runs
+             * the host's SSE recurrence with the context's host-built
+             * coefficients. The median arm reproduces Median_Denoise(): a
+             * sorted-window median over the interior with the border copied
+             * from the input, ping-ponged once per pass. The unselected
+             * planes keep the ROI copy and contribute no difference. The
+             * scope's reference is the full-image 3 / sk blur, not the ROI.
              */
             if (blurPass) {
                 if (!copy_roi()) {
@@ -15193,29 +15249,124 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
                 }
                 const int chromet = static_cast<int>(
                     rec[RT_LOCAL_ADJUSTMENTS_SLOT_BLUR_CHRO]);
-                const RtLabToolsIir& blur_iir = *setup.iir_blur;
-                const cl_int horizontal_lines = bfh - (bfh % 4);
-                const cl_int vertical_lines = bfw - (bfw % 8);
-                for (int plane = 0; plane < 3; ++plane) {
-                    const bool selected =
-                        chromet == 2 || (chromet == 0 && plane == 0) ||
-                        (chromet == 1 && plane != 0);
-                    if (!selected) {
-                        continue;
+                if (blurArm == RT_LOCAL_ADJUSTMENTS_BLUR_ARM_MEDIAN) {
+                    const cl_int border = static_cast<cl_int>(blurMed + 1);
+                    for (int plane = 0; plane < 3; ++plane) {
+                        const bool selected =
+                            chromet == 2 || (chromet == 0 && plane == 0) ||
+                            (chromet == 1 && plane != 0);
+                        if (!selected) {
+                            continue;
+                        }
+                        cl_mem src = work_memory;
+                        cl_mem dst = median_memory;
+                        cl_int src_pitch = work_pitch;
+                        cl_int dst_pitch = median_pitch;
+                        cl_int src_plane =
+                            static_cast<cl_int>(plane) * work_plane;
+                        cl_int dst_plane =
+                            static_cast<cl_int>(plane) * median_plane;
+                        for (int pass = 0; pass < blurIters; ++pass) {
+                            cl_uint arg = 0;
+                            cl_int w = bfw;
+                            cl_int h = bfh;
+                            bool ok = true;
+                            ok = ok && set(median_kernel, arg++,
+                                           sizeof(cl_mem), &src);
+                            ok = ok && set(median_kernel, arg++,
+                                           sizeof(cl_int), &src_pitch);
+                            ok = ok && set(median_kernel, arg++,
+                                           sizeof(cl_int), &src_plane);
+                            ok = ok && set(median_kernel, arg++,
+                                           sizeof(cl_mem), &dst);
+                            ok = ok && set(median_kernel, arg++,
+                                           sizeof(cl_int), &dst_pitch);
+                            ok = ok && set(median_kernel, arg++,
+                                           sizeof(cl_int), &dst_plane);
+                            ok = ok && set(median_kernel, arg++,
+                                           sizeof(cl_int), &w);
+                            ok = ok && set(median_kernel, arg++,
+                                           sizeof(cl_int), &h);
+                            ok = ok && set(median_kernel, arg++,
+                                           sizeof(cl_int), &border);
+                            if (!ok ||
+                                !launch2d(median_kernel,
+                                          static_cast<std::size_t>(bfw),
+                                          static_cast<std::size_t>(bfh),
+                                          "median")) {
+                                error = "local.adjustments median pass failed";
+                                return RT_STAGE_FALLBACK;
+                            }
+                            std::swap(src, dst);
+                            std::swap(src_pitch, dst_pitch);
+                            std::swap(src_plane, dst_plane);
+                        }
+                        /* An odd pass count leaves the result in the scratch
+                         * buffer, whose unselected planes are not valid. */
+                        if ((blurIters % 2) != 0) {
+                            cl_uint arg = 0;
+                            cl_mem copy_src = median_memory;
+                            cl_mem copy_dst = work_memory;
+                            cl_int copy_src_plane =
+                                static_cast<cl_int>(plane) * median_plane;
+                            cl_int copy_src_pitch = median_pitch;
+                            cl_int copy_dst_plane =
+                                static_cast<cl_int>(plane) * work_plane;
+                            cl_int copy_dst_pitch = work_pitch;
+                            cl_int w = bfw;
+                            cl_int h = bfh;
+                            bool ok = true;
+                            ok = ok && set(plane_copy_kernel, arg++,
+                                           sizeof(cl_mem), &copy_src);
+                            ok = ok && set(plane_copy_kernel, arg++,
+                                           sizeof(cl_mem), &copy_dst);
+                            ok = ok && set(plane_copy_kernel, arg++,
+                                           sizeof(cl_int), &copy_src_plane);
+                            ok = ok && set(plane_copy_kernel, arg++,
+                                           sizeof(cl_int), &copy_src_pitch);
+                            ok = ok && set(plane_copy_kernel, arg++,
+                                           sizeof(cl_int), &copy_dst_plane);
+                            ok = ok && set(plane_copy_kernel, arg++,
+                                           sizeof(cl_int), &copy_dst_pitch);
+                            ok = ok && set(plane_copy_kernel, arg++,
+                                           sizeof(cl_int), &w);
+                            ok = ok && set(plane_copy_kernel, arg++,
+                                           sizeof(cl_int), &h);
+                            if (!ok ||
+                                !launch2d(plane_copy_kernel,
+                                          static_cast<std::size_t>(bfw),
+                                          static_cast<std::size_t>(bfh),
+                                          "median result")) {
+                                error = "local.adjustments median copy failed";
+                                return RT_STAGE_FALLBACK;
+                            }
+                        }
                     }
-                    const cl_int base =
-                        static_cast<cl_int>(plane) * work_plane;
-                    if (!run_line(line_kernel, work_memory, scratch_memory,
-                                  scratch_memory, bfw, bfh, work_pitch,
-                                  scratch_pitch, 1, 1, base, 0, 0,
-                                  horizontal_lines, blur_iir.horizontal,
-                                  "blur") ||
-                        !run_line(line_kernel, scratch_memory, work_memory,
-                                  scratch_memory, bfh, bfw, 1, 1,
-                                  scratch_pitch, work_pitch, 0, base, 0,
-                                  vertical_lines, blur_iir.vertical,
-                                  "blur")) {
-                        return RT_STAGE_FALLBACK;
+                } else {
+                    const RtLabToolsIir& blur_iir = *setup.iir_blur;
+                    const cl_int horizontal_lines = bfh - (bfh % 4);
+                    const cl_int vertical_lines = bfw - (bfw % 8);
+                    for (int plane = 0; plane < 3; ++plane) {
+                        const bool selected =
+                            chromet == 2 || (chromet == 0 && plane == 0) ||
+                            (chromet == 1 && plane != 0);
+                        if (!selected) {
+                            continue;
+                        }
+                        const cl_int base =
+                            static_cast<cl_int>(plane) * work_plane;
+                        if (!run_line(line_kernel, work_memory, scratch_memory,
+                                      scratch_memory, bfw, bfh, work_pitch,
+                                      scratch_pitch, 1, 1, base, 0, 0,
+                                      horizontal_lines, blur_iir.horizontal,
+                                      "blur") ||
+                            !run_line(line_kernel, scratch_memory, work_memory,
+                                      scratch_memory, bfh, bfw, 1, 1,
+                                      scratch_pitch, work_pitch, 0, base, 0,
+                                      vertical_lines, blur_iir.vertical,
+                                      "blur")) {
+                            return RT_STAGE_FALLBACK;
+                        }
                     }
                 }
                 if (!full_scope_blur() ||

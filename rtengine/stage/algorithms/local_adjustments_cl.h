@@ -586,15 +586,15 @@ __kernel void rt_local_adjustments_sharpen_damp(
 /* Copy one plane of the full Lab image into a one-plane blur buffer. */
 __kernel void rt_local_adjustments_plane_copy(
     __global const float* src, __global float* dst,
-    const int src_plane, const int src_pitch, const int dst_pitch,
-    const int width, const int height)
+    const int src_plane, const int src_pitch, const int dst_plane,
+    const int dst_pitch, const int width, const int height)
 {
     const int x = (int)get_global_id(0);
     const int y = (int)get_global_id(1);
     if (x >= width || y >= height) {
         return;
     }
-    dst[y * dst_pitch + x] =
+    dst[dst_plane + y * dst_pitch + x] =
         src[src_plane + y * src_pitch + x];
 }
 
@@ -895,6 +895,55 @@ __kernel void rt_local_adjustments_blend(__global float* lab,
                       : blendedL;
     lab[lab_plane + offset] = blendedA;
     lab[2 * lab_plane + offset] = blendedB;
+}
+
+/*
+ * Median_Denoise()'s interior, one plane and one pass. The host runs a
+ * `(2 * border + 1) ^ 2` window over `[border, height - border) x
+ * [border, width - border)`, copies the border rows and columns from the
+ * input, and repeats with the buffers swapped; the border keeps the original
+ * values on every pass because it is copied from the previous buffer, whose
+ * border is original. The median is the value at index count / 2 of the
+ * sorted window, which an insertion sort reproduces bit-exactly; only the
+ * VALUE is read, so no sorting network is needed. `src` and `dst` are the
+ * same ROI buffer in the host, so the launcher ping-pongs them.
+ */
+__kernel void rt_local_adjustments_median(
+    __global const float* src, const int src_pitch, const int src_plane,
+    __global float* dst, const int dst_pitch, const int dst_plane,
+    const int width, const int height, const int border)
+{
+    const int x = (int)get_global_id(0);
+    const int y = (int)get_global_id(1);
+    if (x >= width || y >= height) {
+        return;
+    }
+    const int so = src_plane + y * src_pitch + x;
+    const int doff = dst_plane + y * dst_pitch + x;
+    /* Median::TYPE_9X9 is the widest admitted window: 9 x 9. */
+    if (border < 1 || border > 4 || x < border || y < border ||
+        x >= width - border || y >= height - border) {
+        dst[doff] = src[so];
+        return;
+    }
+    float window[81];
+    int count = 0;
+    for (int row = -border; row <= border; ++row) {
+        const int line = src_plane + (y + row) * src_pitch + x;
+        for (int col = -border; col <= border; ++col) {
+            window[count++] = src[line + col];
+        }
+    }
+    for (int index = 1; index < count; ++index) {
+        const float value = window[index];
+        int slot = index - 1;
+        while (slot >= 0 && window[slot] > value) {
+            window[slot + 1] = window[slot];
+            --slot;
+        }
+        window[slot + 1] = value;
+    }
+    dst[doff] = window[count / 2];
 }
 
 /*

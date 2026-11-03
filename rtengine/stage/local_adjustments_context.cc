@@ -448,18 +448,37 @@ bool sharpenAdmitted(const procparams::LocallabParams::LocallabSpot& spot,
     return spot.sensisha >= 0 && spot.sensisha <= 100;
 }
 
-/* Whether the profile's wavelet denoise curve leaves DeNoise() idle.
+/* Whether the spot's DeNoise() call leaves the image unchanged.
  *
- * calcLocalParams() reads `locwavCurveden` whenever `denoiena` (expblur) is
- * set: a curve whose LUT is non-zero turns the eight `noiself*`/`noiselc`
- * values non-zero and runs DeNoise(). The device has no denoise kernel, so
- * such a curve is a residual. An empty curve, and a flat curve at the zero
- * identity value, both reset the LUT and skip the read. LocwavCurve::Set()
- * clamps a non-identity sample below 0.02 up to 0.02, so only the identity
- * case is idle; that is what this test measures, rather than the curve's
- * type. */
-bool denoiseCurveIdle(const procparams::LocallabParams::LocallabSpot& spot)
+ * Lab_Local() calls DeNoise() whenever the Blur & Noise tool is on and any of
+ * the noise amounts or the wavelet curve is non-zero, but DeNoise()'s own
+ * outer guard is
+ *
+ *   ((amounts || execmaskden || aut != 0) && denoiena && quamet != 3) ||
+ *   execdenoi
+ *
+ * with aut == 0 at both export call sites and execmaskden false because an
+ * explicit tool mask is refused. `quamet` is 3 for the GUI's Quality method
+ * "Off", which is the profile default, so the default denoise curve is inert:
+ * the curve only feeds the amounts that arm DeNoise(). `execdenoi` needs
+ * noiscfactiv (`qualityMethod == "enhden"`, the artifact-shaping path), which
+ * can arm DeNoise() from another tool's work, so such a spot is refused.
+ *
+ * The amounts are sampled from the curve at fixed indices, and
+ * `wavcurvedenoi` scans the first 500 samples, so a curve that is non-zero
+ * only at the last sample arms nothing.
+ */
+bool deNoiseIdle(const procparams::LocallabParams::LocallabSpot& spot)
 {
+    if (!spot.expblur) {
+        return true;
+    }
+    if (spot.qualityMethod == "enhden") {
+        return false;
+    }
+    if (spot.quamethod == "none") {
+        return true;
+    }
     LocwavCurve curve;
     if (!curve.Set(spot.locwavcurveden)) {
         return true;
@@ -468,7 +487,7 @@ bool denoiseCurveIdle(const procparams::LocallabParams::LocallabSpot& spot)
         /* A flat curve at the zero identity value resets the LUT. */
         return true;
     }
-    for (int index = 0; index < 501; ++index) {
+    for (int index = 0; index < 500; ++index) {
         if (curve[static_cast<float>(index)] != 0.f) {
             return false;
         }
@@ -479,21 +498,31 @@ bool denoiseCurveIdle(const procparams::LocallabParams::LocallabSpot& spot)
 /* Whether the Blur & Noise parameters are inside the device set.
  *
  * Lab_Local()'s blur block runs `blurena` (the tool on, the spot active and
- * no explicit mask) and its Gaussian arm is `blmet == 0` (blMethod "blur") in
- * the normal direction (`invbl` false). `lp.rad` is the spot radius and the
- * Gaussian sigma is `lp.rad / (sk * 1.4)`; the block's own gate needs it above
- * 1.6, and above 30 (or with `fftwbl`) it takes optfft()/fftw_convol_blur2(),
- * which has no device kernel. The noise strength (`stren` above 0.1), grain
- * (`strengr`), median (`blmet == 1`), guided filter (`blmet == 2` or
- * `guidb > 0`), bilateral, non-local-means and wavelet denoise additions all
- * change the block's output and stay on the host. `chroMethod` selects the
- * planes the Gaussian runs on. The `"nlmean"` quality method sets
+ * no explicit mask) and admits two arms. The Gaussian arm is `blmet == 0`
+ * (blMethod "blur") in the normal direction (`invbl` false) with `lp.rad /
+ * (sk * 1.4)` as gaussianBlur()'s sigma; the block's own gate needs the spot
+ * radius above 1.6, and above 30 (or with `fftwbl`) it takes
+ * optfft()/fftw_convol_blur2(), which has no device kernel. The median arm is
+ * `blmet == 1` (blMethod "med") in the normal direction: Median_Denoise()
+ * replaces the Gaussian, so the radius only has to keep optfft() out, and
+ * `medMethod` must name one of the four kernels with 1..4 passes.
+ *
+ * The noise strength (`stren` above 0.1), grain (`strengr`), guided filter
+ * (`blmet == 2` or `guidb > 0`), bilateral, non-local-means and FFT additions
+ * all change the block's output and stay on the host. `chroMethod` selects
+ * the planes both arms process. The `"nlmean"` quality method sets
  * `noiscfactiv`, which can expose DeNoise() for a combined spot, so it is a
- * residual. The denoise amounts that are read directly (`noisechrof`,
- * `noisechroc`) and the wavelet curve are required idle. */
+ * residual, and `deNoiseIdle()` carries the remaining DeNoise() conditions.
+ * The denoise amounts that are read directly (`noisechrof`, `noisechroc`)
+ * are required idle. */
 bool blurAdmitted(const procparams::LocallabParams::LocallabSpot& spot)
 {
-    if (spot.blMethod != "blur" || spot.invbl) {
+    const bool gaussian = spot.blMethod == "blur";
+    const bool median = spot.blMethod == "med";
+    if (!gaussian && !median) {
+        return false;
+    }
+    if (spot.invbl) {
         return false;
     }
     if (spot.chroMethod != "lum" && spot.chroMethod != "chr" &&
@@ -515,12 +544,25 @@ bool blurAdmitted(const procparams::LocallabParams::LocallabSpot& spot)
         return false;
     }
     const float radius = static_cast<float>(spot.radius);
-    if (!(radius > RT_LOCAL_ADJUSTMENTS_BLUR_MIN_RADIUS &&
-          radius <= RT_LOCAL_ADJUSTMENTS_BLUR_MAX_RADIUS)) {
+    if (radius <= RT_LOCAL_ADJUSTMENTS_BLUR_MEDIAN_MIN_RADIUS ||
+        radius > RT_LOCAL_ADJUSTMENTS_BLUR_MAX_RADIUS) {
         return false;
     }
+    if (gaussian && radius <= RT_LOCAL_ADJUSTMENTS_BLUR_MIN_RADIUS) {
+        return false;
+    }
+    if (median) {
+        if (spot.medMethod != "33" && spot.medMethod != "55" &&
+            spot.medMethod != "77" && spot.medMethod != "99") {
+            return false;
+        }
+        if (spot.itera < RT_LOCAL_ADJUSTMENTS_BLUR_MIN_ITERS ||
+            spot.itera > RT_LOCAL_ADJUSTMENTS_BLUR_MAX_ITERS) {
+            return false;
+        }
+    }
     return spot.sensibn >= 0 && spot.sensibn <= 100 &&
-           denoiseCurveIdle(spot);
+           deNoiseIdle(spot);
 }
 
 /* Whether the local dehaze tool's parameters are inside the device set.
@@ -1758,18 +1800,25 @@ int LocalAdjustmentsContext::build(int spot, const RtStageBuffer* lab,
     }
 
     /*
-     * Blur & Noise's blur arm. The predicate narrowed the method and the
-     * noise, grain, median, guided, denoise and FFT additions. Lab_Local()'s
-     * second gate runs when the spot radius is above 1.6; the Gaussian sigma
-     * is `lp.rad / (sk * 1.4)`, and above a spot radius of 30 (or with
-     * `fftwbl`) the block takes the FFT path. The record carries the sigma and
-     * the host-built coefficients.
+     * Blur & Noise. The predicate narrowed the method and the noise, grain,
+     * guided, bilateral, non-local-means, denoise and FFT additions. The
+     * Gaussian arm runs when the spot radius is above 1.6; its sigma is
+     * `lp.rad / (sk * 1.4)`, and above a spot radius of 30 (or with `fftwbl`)
+     * the block takes the FFT path. The median arm replaces the Gaussian with
+     * Median_Denoise() and only needs the radius at or below 30. The record
+     * carries the arm, the sigma and the host-built coefficients.
      */
-    const bool blurRun =
+    const bool blurArmRun =
         profileSpot.expblur && lp.activspot && lp.blurena &&
-        lp.blmet == 0 && lp.blurmet == 0 && lp.stren <= 0.1f &&
-        lp.rad > RT_LOCAL_ADJUSTMENTS_BLUR_MIN_RADIUS &&
+        lp.blurmet == 0 && lp.stren <= 0.1f &&
+        lp.rad > RT_LOCAL_ADJUSTMENTS_BLUR_MEDIAN_MIN_RADIUS &&
         lp.rad <= RT_LOCAL_ADJUSTMENTS_BLUR_MAX_RADIUS;
+    const bool gaussianRun = blurArmRun && lp.blmet == 0 &&
+                             lp.rad > RT_LOCAL_ADJUSTMENTS_BLUR_MIN_RADIUS;
+    const bool medianRun = blurArmRun && lp.blmet == 1 &&
+                           lp.blmedmet >= RT_LOCAL_ADJUSTMENTS_BLUR_MIN_MED &&
+                           lp.blmedmet <= RT_LOCAL_ADJUSTMENTS_BLUR_MAX_MED;
+    const bool blurRun = gaussianRun || medianRun;
     if (blurRun && ipf_.getScale() != RT_LOCAL_ADJUSTMENTS_BLUR_SK) {
         return 1;
     }
@@ -2122,6 +2171,14 @@ int LocalAdjustmentsContext::build(int spot, const RtStageBuffer* lab,
     record[RT_LOCAL_ADJUSTMENTS_SLOT_BLUR_SENS] =
         static_cast<float>(lp.sensbn);
     record[RT_LOCAL_ADJUSTMENTS_SLOT_BLUR_RADIUS] = blurRadius;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_BLUR_ARM] =
+        medianRun ? static_cast<float>(RT_LOCAL_ADJUSTMENTS_BLUR_ARM_MEDIAN)
+                  : static_cast<float>(
+                        RT_LOCAL_ADJUSTMENTS_BLUR_ARM_GAUSSIAN);
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_BLUR_MED] =
+        static_cast<float>(lp.blmedmet);
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_BLUR_ITERS] =
+        static_cast<float>(lp.bliters);
     record[RT_LOCAL_ADJUSTMENTS_SLOT_EXPDENAZE] = dehazeRun ? 1.f : 0.f;
     record[RT_LOCAL_ADJUSTMENTS_SLOT_SENSH] =
         static_cast<float>(profileSpot.sensih);

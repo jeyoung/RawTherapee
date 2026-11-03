@@ -46,10 +46,11 @@ struct ProcParams;
  * local CBDL tool, the Colour & Light chroma/lightness/contrast sliders and
  * L/C/H curves, the vibrance tool, the shadows/highlights tool, the soft-light
  * tool, the Gaussian local-contrast tool, the local sharpening tool, the
- * local Gaussian blur tool, the deltaE scope, the avoid-colour-shift Munsell
- * method and the unconditional per-spot Lab-to-RGB clamp. The block also
- * applies the final Munsell pass and the clamp for an inactive spot, so a
- * block whose spots do no tool work is still a clamp-only block.
+ * local Blur & Noise tool (Gaussian and median arms), the deltaE scope, the
+ * avoid-colour-shift Munsell method and the unconditional per-spot Lab-to-RGB
+ * clamp. The block also applies the final Munsell pass and the clamp for an
+ * inactive spot, so a block whose spots do no tool work is still a
+ * clamp-only block.
  *
  * The tools run in Lab_Local()'s order: log encoding, blur, dehaze, CBDL,
  * vibrance, shadows/highlights, soft light, local contrast, local sharpening,
@@ -62,14 +63,14 @@ struct ProcParams;
  * small, known subset reaches the supported paths. Slots are named by the
  * RT_LOCAL_ADJUSTMENTS_SLOT_* constants and are written once per spot.
  */
-#define RT_LOCAL_ADJUSTMENTS_CONTEXT_VERSION 10u
+#define RT_LOCAL_ADJUSTMENTS_CONTEXT_VERSION 11u
 /* "LAJC": rejects a stale or unrelated pointer before any callback runs. */
 #define RT_LOCAL_ADJUSTMENTS_CONTEXT_MAGIC 0x4C414A43u
 /* The block has no bounded spot count, but a profile that carries more spots
  * than this is outside the device set and runs the host block. */
 #define RT_LOCAL_ADJUSTMENTS_MAX_SPOTS 64u
 /* Floats per spot record; the slot constants below must stay inside it. */
-#define RT_LOCAL_ADJUSTMENTS_SPOT_STRIDE 145u
+#define RT_LOCAL_ADJUSTMENTS_SPOT_STRIDE 148u
 /* A curve table is one LUTf of the block's own size. */
 #define RT_LOCAL_ADJUSTMENTS_LUT_ENTRIES 65536u
 /* Color::gammatab_srgb and Color::igammatab_srgb, the sRGB gamma pair the
@@ -339,18 +340,24 @@ struct ProcParams;
 #define RT_LOCAL_ADJUSTMENTS_SLOT_SHAR_CONTRAST 138u
 #define RT_LOCAL_ADJUSTMENTS_SLOT_SHAR_BLUR 139u
 #define RT_LOCAL_ADJUSTMENTS_SLOT_SHAR_DAMPING 140u
-/* Blur & Noise's blur arm. EXPBLUR is 1 when the host's second blur gate runs
- * with the tool on, the spot active and no mask: `blMethod == "blur"` in its
- * normal direction, with the noise, grain, median, guided-filter and denoise
- * additions idle and the FFT switch off. BLUR_RADIUS is the block's
+/* Blur & Noise. EXPBLUR is 1 when the host's second blur gate runs with the
+ * tool on, the spot active and no mask, in either admitted arm: `blMethod ==
+ * "blur"` (Gaussian) or `"med"` (median) in their normal direction, with the
+ * noise, grain, guided-filter, bilateral, non-local-means and denoise
+ * additions idle and the FFT switch off. BLUR_ARM is 0 for the Gaussian arm
+ * and 1 for the median arm. BLUR_RADIUS is the block's
  * `lp.rad / (sk * 1.4)`; the context also exports its Gaussian coefficients
  * so the device reads the host's own sigma. BLUR_CHRO is 0 for luminance, 1
  * for chroma and 2 for all three planes. BLUR_SENS is `lp.sensbn`, the scope
- * sensitivity. */
+ * sensitivity. BLUR_MED and BLUR_ITERS are the median arm's `lp.medmet`
+ * (0 3x3 strong, 1 5x5 strong, 2 7x7, 3 9x9) and `lp.it` pass count. */
 #define RT_LOCAL_ADJUSTMENTS_SLOT_EXPBLUR 141u
 #define RT_LOCAL_ADJUSTMENTS_SLOT_BLUR_CHRO 142u
 #define RT_LOCAL_ADJUSTMENTS_SLOT_BLUR_SENS 143u
 #define RT_LOCAL_ADJUSTMENTS_SLOT_BLUR_RADIUS 144u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_BLUR_ARM 145u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_BLUR_MED 146u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_BLUR_ITERS 147u
 
 /* deconvsharpeningloc() has two arms. Damping zero is the undamped RLD path:
  * the division/multiplication recurrence the output.sharpen core already
@@ -381,20 +388,37 @@ struct ProcParams;
  * sk = 1 for the export call site. */
 #define RT_LOCAL_ADJUSTMENTS_SHARPEN_SCOPE_SIGMA 3.0
 
-/* Blur & Noise's blur arm. The block runs only at scale one and derives its
- * Gaussian sigma as `lp.rad / (sk * 1.4)`. The block's own gate needs a spot
- * radius above 1.6, and above 30 (or with fftwbl) it switches to the FFT
- * path. Within that range gaussianBlur() is the SSE IIR pair: at or below
- * sigma 0.6 it is the 3x3 FIR and at or above 25 it is the double path, and
- * neither has a matching device recurrence. BlurNoise_Local() blends with a
- * scope base of four, not transit_shapedetect2()'s two. Its deltaE reference
- * is the block's default 3 / sk blur, the same sigma as the sharpening
- * scope. */
+/* Blur & Noise. The block runs only at scale one and derives its Gaussian
+ * sigma as `lp.rad / (sk * 1.4)`. The Gaussian arm's own gate needs a spot
+ * radius above 1.6, and above 30 (or with fftwbl) the block switches to the
+ * FFT path, which has no device kernel. Within that range gaussianBlur() is
+ * the SSE IIR pair: at or below sigma 0.6 it is the 3x3 FIR and at or above
+ * 25 it is the double path, and neither has a matching device recurrence.
+ * The median arm does not read the radius at all, but the same 30 ceiling
+ * keeps optfft() out of the ROI. BlurNoise_Local() blends with a scope base
+ * of four, not transit_shapedetect2()'s two. Its deltaE reference is the
+ * block's default 3 / sk blur, the same sigma as the sharpening scope. */
 #define RT_LOCAL_ADJUSTMENTS_BLUR_SK 1.0
 #define RT_LOCAL_ADJUSTMENTS_BLUR_RADIUS_DIVISOR 1.4
 #define RT_LOCAL_ADJUSTMENTS_BLUR_MIN_RADIUS 1.6f
 #define RT_LOCAL_ADJUSTMENTS_BLUR_MAX_RADIUS 30.0f
 #define RT_LOCAL_ADJUSTMENTS_BLUR_SCOPE_BASE 4.0f
+/* The GUI's minimum spot radius; the median arm has no radius gate of its own
+ * but the block's optfft() branch starts above 30. */
+#define RT_LOCAL_ADJUSTMENTS_BLUR_MEDIAN_MIN_RADIUS 0.0f
+/* Median_Denoise()'s pass count and the GUI's medMethod range. */
+#define RT_LOCAL_ADJUSTMENTS_BLUR_MIN_ITERS 1
+#define RT_LOCAL_ADJUSTMENTS_BLUR_MAX_ITERS 4
+/* lp.medmet: 0 is TYPE_3X3_STRONG, 1 TYPE_5X5_STRONG, 2 TYPE_7X7, 3
+ * TYPE_9X9. The kernel's half extent is medmet + 1. */
+#define RT_LOCAL_ADJUSTMENTS_BLUR_MIN_MED 0
+#define RT_LOCAL_ADJUSTMENTS_BLUR_MAX_MED 3
+/* Blur & Noise's two arms. */
+#define RT_LOCAL_ADJUSTMENTS_BLUR_ARM_GAUSSIAN 0
+#define RT_LOCAL_ADJUSTMENTS_BLUR_ARM_MEDIAN 1
+/* iplocallab.cc's mSP: the blur block only runs when the ROI is at least this
+ * size on both axes. */
+#define RT_LOCAL_ADJUSTMENTS_BLUR_MIN_ROI 5
 
 typedef struct RtLocalAdjustmentsResult {
     /* spot_count RT_LOCAL_ADJUSTMENTS_SPOT_STRIDE floats, spot-major. */
@@ -443,8 +467,8 @@ typedef struct RtLocalAdjustmentsResult {
     /* shadows/highlights' deltaE reference blur, sigma
      * (2 + 0.2 * blurSHde) / sk. Only the SSE path is admitted. */
     const RtLabToolsIir* iir_shadows_highlights;
-    /* Blur & Noise's blur arm, sigma `lp.rad / (sk * 1.4)`. Only the SSE
-     * path is admitted. */
+    /* Blur & Noise's Gaussian arm, sigma `lp.rad / (sk * 1.4)`. Only the SSE
+     * path is admitted. The median arm does not read it. */
     const RtLabToolsIir* iir_blur;
 } RtLocalAdjustmentsResult;
 
@@ -511,15 +535,23 @@ namespace rtengine::stage
  * `lx + lxL + 3` extent does not cover. A zero-width transition keeps the ring
  * inside the nominal extent.
  *
- * Blur & Noise is admitted in its Gaussian blur arm only: `blMethod ==
- * "blur"` in its normal direction with `chroMethod` luminance, chroma or all,
- * the noise (`strength`), grain (`strengr`), median, guided-filter, bilateral,
- * non-local-means and wavelet-denoise additions idle, no explicit mask and no
- * FFT. The Gaussian sigma is the block's `lp.rad / (sk * 1.4)`, so the spot
- * radius must be above the block's 1.6 gate and at most 30; the device reads
- * the host-built coefficients for that sigma. A spot radius below the gate,
- * the median, guided and inverse arms, a non-zero denoise amount or curve, an
- * FFT or mask request and the `"nlmean"` quality method are residuals.
+ * Blur & Noise admits two arms. The Gaussian arm is `blMethod == "blur"` in
+ * its normal direction with `chroMethod` luminance, chroma or all; the block's
+ * sigma is `lp.rad / (sk * 1.4)`, so the spot radius must be above the block's
+ * 1.6 gate and at most 30, and the device reads the host-built coefficients
+ * for that sigma. The median arm is `blMethod == "med"` with `medMethod`
+ * `33`/`55`/`77`/`99` and 1..4 passes: Median_Denoise() replaces the Gaussian,
+ * so the radius only has to stay at or below 30 to keep optfft() out. Both arms
+ * need the noise (`strength`), grain (`strengr`), guided-filter, bilateral,
+ * non-local-means and FFT additions idle, no explicit mask, and the wavelet
+ * denoise curve must leave DeNoise() idle. DeNoise() only runs when the tool is
+ * on and either the Quality method is not `"none"` with a non-zero curve amount
+ * or the `"enhden"` quality method arms artifact shaping, so the GUI's default
+ * denoise curve is inert under the default `"none"` Quality method. A radius
+ * outside its arm's range, the guided and inverse arms, `medMethod "none"`,
+ * out-of-range passes, a non-zero denoise amount with an active Quality method,
+ * `qualityMethod "enhden"`, an FFT or mask request and the `"nlmean"` quality
+ * method are residuals.
  *
  * Local dehaze is admitted only through its retinex gate: expreti on, the
  * retinex strength zero and a non-zero dehaz. dehazeblack, show-depth, an

@@ -9167,6 +9167,8 @@ void ImProcFunctions::localAdjustmentsSpotParams(
     out.stren = lp.stren;
     out.sensbn = lp.sensbn;
     out.guidb = lp.guidb;
+    out.blmedmet = lp.medmet;
+    out.bliters = lp.it;
     out.cbdlena = lp.cbdlena;
     out.senscb = lp.senscb;
     out.threshol = lp.threshol;
