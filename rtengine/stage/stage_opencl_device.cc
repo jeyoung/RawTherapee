@@ -1330,10 +1330,11 @@ __kernel void rt_thumbnail_scale_u8(__global const uchar* src,
 }
 
 /*
- * The lab.sharpening program: impulse denoise and defringe. The separable
- * Young-van Vliet line kernel is shared with output.sharpen; the pair's own
- * kernels are in lab_sharpening_cl.h. The defringe reduction is double, so the
- * launcher requires fp64 for that pass.
+ * The lab.sharpening program: impulse denoise, defringe, ML sharpen edges and
+ * ML microcontrast. The separable Young-van Vliet line and blend-mask kernels
+ * are shared with output.sharpen; the block's own kernels are in
+ * lab_sharpening_cl.h. The defringe reduction is double, so the launcher
+ * requires fp64 for that pass.
  */
 const std::string& lab_sharpening_source()
 {
@@ -12109,14 +12110,14 @@ RtStageStatus run_sharpen(const std::shared_ptr<OpenCLEnv>& env,
 }
 
 /*
- * The lab.sharpening node: the impulse-denoise pass and the defringe pass of
- * the Lab block, in the block's order. Arguments are documented in
+ * The lab.sharpening node: impulse denoise, defringe, ML sharpen edges and ML
+ * microcontrast, in the block's order. Arguments are documented in
  * stage/lab_sharpening_context.h; the kernels in lab_sharpening_cl.h.
  *
- * The pair is atomic: a configuration outside either tool's device set is
- * refused before the first upload, so the host builtin produces the CPU
- * result for both tools and no plane is ever half device and half host. The
- * three planes are read back together, only after every kernel succeeded.
+ * The block is atomic: a configuration outside any enabled tool's device set
+ * is refused before the first upload, so the host builtin produces the CPU
+ * result for the whole block and no plane is ever half device and half host.
+ * The three planes are read back together, only after every kernel succeeded.
  */
 RtStageStatus run_lab_sharpening(const std::shared_ptr<OpenCLEnv>& env,
                                  const std::shared_ptr<OpenCLResidency>& residency,
@@ -12151,7 +12152,20 @@ RtStageStatus run_lab_sharpening(const std::shared_ptr<OpenCLEnv>& env,
     const bool defringe_runs =
         p.defringe_enabled != 0 &&
         p.defringe_radius >= LAB_SHARPENING_RADIUS_NOOP;
-    if (p.impulse_enabled == 0 && !defringe_runs) {
+    /*
+     * The ML passes have their own early-outs. A pass that the host would
+     * return from unchanged is a device no-op, not a residual.
+     */
+    const bool edges_run =
+        p.edges_enabled != 0 && p.edges_passes > 0 &&
+        p.edges_amount != 0.0;
+    const bool micro_run =
+        p.micro_enabled != 0 &&
+        p.micro_amount >= LAB_SHARPENING_MICRO_NOOP_AMOUNT &&
+        p.micro_contrast != LAB_SHARPENING_MICRO_NOOP_CONTRAST;
+
+    if (p.impulse_enabled == 0 && !defringe_runs && !edges_run &&
+        !micro_run) {
         /* Nothing enabled would change the image. */
         return RT_STAGE_OK;
     }
@@ -12177,6 +12191,31 @@ RtStageStatus run_lab_sharpening(const std::shared_ptr<OpenCLEnv>& env,
             return RT_STAGE_FALLBACK;
         }
     }
+    cl_kernel scale_kernel = nullptr;
+    cl_kernel edges_kernel = nullptr;
+    cl_kernel micro_kernel = nullptr;
+    if (edges_run || micro_run) {
+        scale_kernel = compiled_kernel_entry(
+            env, def, "rt_lab_sharpening_scale", error);
+        if (scale_kernel == nullptr) {
+            return RT_STAGE_FALLBACK;
+        }
+    }
+    if (edges_run) {
+        edges_kernel = compiled_kernel_entry(
+            env, def, "rt_lab_sharpening_ml_edges", error);
+        if (edges_kernel == nullptr) {
+            return RT_STAGE_FALLBACK;
+        }
+    }
+    if (micro_run) {
+        micro_kernel = compiled_kernel_entry(
+            env, def, "rt_lab_sharpening_ml_micro", error);
+        if (micro_kernel == nullptr) {
+            return RT_STAGE_FALLBACK;
+        }
+    }
+
     cl_kernel fringe_kernel = nullptr;
     cl_kernel rows_kernel = nullptr;
     cl_kernel total_kernel = nullptr;
@@ -12316,6 +12355,29 @@ RtStageStatus run_lab_sharpening(const std::shared_ptr<OpenCLEnv>& env,
         if (state == nullptr || tmpa == nullptr || tmpb == nullptr ||
             fringe == nullptr || original_a == nullptr || rows == nullptr ||
             total == nullptr) {
+            release_scratch();
+            error = "lab.sharpening device scratch allocation failed";
+            return RT_STAGE_FALLBACK;
+        }
+    }
+
+    /* ML sharpen edges needs the pre-pass working copy. MLmicrocontrast needs
+     * the same copy and buildBlendMask()'s mask plus its blur scratch. */
+    cl_mem l_work = nullptr;
+    cl_mem blend = nullptr;
+    cl_mem blend_temp = nullptr;
+    if (edges_run || micro_run) {
+        l_work = create_buffer(plane_bytes);
+        if (l_work == nullptr) {
+            release_scratch();
+            error = "lab.sharpening device scratch allocation failed";
+            return RT_STAGE_FALLBACK;
+        }
+    }
+    if (micro_run) {
+        blend = create_buffer(plane_bytes);
+        blend_temp = create_buffer(plane_bytes);
+        if (blend == nullptr || blend_temp == nullptr) {
             release_scratch();
             error = "lab.sharpening device scratch allocation failed";
             return RT_STAGE_FALLBACK;
@@ -12545,6 +12607,110 @@ RtStageStatus run_lab_sharpening(const std::shared_ptr<OpenCLEnv>& env,
                 error = "lab.sharpening defringe apply failed";
                 return RT_STAGE_ERROR;
             }
+        }
+    }
+
+    /*
+     * MLsharpen(): the host repeats each channel for `passes` iterations,
+     * rebuilding the /327.68 working copy from the current channel before
+     * every pass. The kernel writes only the interior, exactly as the host.
+     */
+    if (edges_run) {
+        const cl_int cl_width = width;
+        const cl_int cl_height = height;
+        const cl_int cl_pitch = pitch;
+        const cl_float edges_amount =
+            static_cast<cl_float>(p.edges_amount / 100.0);
+        const cl_float edges_amountby3 =
+            static_cast<cl_float>(p.edges_amount / 300.0);
+        const int channels = p.edges_threechannels != 0 ? 1 : 3;
+        for (int c = 0; c < channels; ++c) {
+            cl_mem plane = c == 0 ? l_memory : (c == 1 ? a_memory : b_memory);
+            const cl_int cl_channel = c;
+            for (int pass = 0; pass < p.edges_passes; ++pass) {
+                const bool scale_ok =
+                    set_arg(scale_kernel, 0, sizeof(cl_mem), &plane) &&
+                    set_arg(scale_kernel, 1, sizeof(cl_mem), &l_work) &&
+                    set_arg(scale_kernel, 2, sizeof(cl_int), &cl_width) &&
+                    set_arg(scale_kernel, 3, sizeof(cl_int), &cl_height) &&
+                    set_arg(scale_kernel, 4, sizeof(cl_int), &cl_pitch) &&
+                    run_2d(scale_kernel);
+                if (!scale_ok) {
+                    release_scratch();
+                    error = "lab.sharpening edge working copy failed";
+                    return RT_STAGE_ERROR;
+                }
+                const bool edges_ok =
+                    set_arg(edges_kernel, 0, sizeof(cl_mem), &l_work) &&
+                    set_arg(edges_kernel, 1, sizeof(cl_mem), &plane) &&
+                    set_arg(edges_kernel, 2, sizeof(cl_int), &cl_width) &&
+                    set_arg(edges_kernel, 3, sizeof(cl_int), &cl_height) &&
+                    set_arg(edges_kernel, 4, sizeof(cl_int), &cl_pitch) &&
+                    set_arg(edges_kernel, 5, sizeof(cl_int), &cl_channel) &&
+                    set_arg(edges_kernel, 6, sizeof(cl_float),
+                            &edges_amount) &&
+                    set_arg(edges_kernel, 7, sizeof(cl_float),
+                            &edges_amountby3) &&
+                    run_2d(edges_kernel);
+                if (!edges_ok) {
+                    release_scratch();
+                    error = "lab.sharpening ML edge pass failed";
+                    return RT_STAGE_ERROR;
+                }
+            }
+        }
+    }
+
+    /*
+     * MLmicrocontrast(): buildBlendMask() with the profile's contrast
+     * threshold, then one per-pixel mix. The host early-outs are checked
+     * before this block, so no disabled or no-op pass reaches the device.
+     */
+    if (micro_run) {
+        const cl_int cl_width = width;
+        const cl_int cl_height = height;
+        const cl_int cl_pitch = pitch;
+        const cl_float contrast_threshold =
+            static_cast<cl_float>(p.micro_contrast / 100.0);
+        const RtStageStatus mask_status = sharpen_mask_plane(
+            env, def, width, height, pitch, l_memory, blend, blend_temp,
+            contrast_threshold, error);
+        if (mask_status != RT_STAGE_OK) {
+            release_scratch();
+            return mask_status;
+        }
+        const int k = p.micro_matrix != 0 ? 1 : 2;
+        const cl_float micro_amount = static_cast<cl_float>(
+            (k == 1 ? 2.7 : 1.0) * p.micro_amount / 1500.0);
+        const cl_int cl_k = k;
+        const cl_int cl_uniformity = p.micro_uniformity;
+        const bool scale_ok =
+            set_arg(scale_kernel, 0, sizeof(cl_mem), &l_memory) &&
+            set_arg(scale_kernel, 1, sizeof(cl_mem), &l_work) &&
+            set_arg(scale_kernel, 2, sizeof(cl_int), &cl_width) &&
+            set_arg(scale_kernel, 3, sizeof(cl_int), &cl_height) &&
+            set_arg(scale_kernel, 4, sizeof(cl_int), &cl_pitch) &&
+            run_2d(scale_kernel);
+        if (!scale_ok) {
+            release_scratch();
+            error = "lab.sharpening microcontrast working copy failed";
+            return RT_STAGE_ERROR;
+        }
+        const bool micro_ok =
+            set_arg(micro_kernel, 0, sizeof(cl_mem), &l_memory) &&
+            set_arg(micro_kernel, 1, sizeof(cl_mem), &l_work) &&
+            set_arg(micro_kernel, 2, sizeof(cl_mem), &blend) &&
+            set_arg(micro_kernel, 3, sizeof(cl_int), &cl_width) &&
+            set_arg(micro_kernel, 4, sizeof(cl_int), &cl_height) &&
+            set_arg(micro_kernel, 5, sizeof(cl_int), &cl_pitch) &&
+            set_arg(micro_kernel, 6, sizeof(cl_int), &cl_k) &&
+            set_arg(micro_kernel, 7, sizeof(cl_float), &micro_amount) &&
+            set_arg(micro_kernel, 8, sizeof(cl_int), &cl_uniformity) &&
+            run_2d(micro_kernel);
+        if (!micro_ok) {
+            release_scratch();
+            error = "lab.sharpening microcontrast pass failed";
+            return RT_STAGE_ERROR;
         }
     }
 

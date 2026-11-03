@@ -23,14 +23,17 @@
 #include <string>
 
 /*
- * Device kernels for the lab.sharpening impulse-denoise and defringe pair.
+ * Device kernels for the lab.sharpening block: impulse denoise, defringe,
+ * ML sharpen edges and ML microcontrast.
  *
  * The program is compiled together with RT_SHARPEN_CL, so the separable
  * Young-van Vliet line kernel `rt_sharpen_iir_line` is the Gaussian blur of
- * every pass here; the launcher derives its coefficients with
- * `sharpen_iir_factors()` exactly as the mask blur of output.sharpen does.
+ * every pass here, and `rt_sharpen_mask` is buildBlendMask()'s contrast mask;
+ * the launcher derives the IIR coefficients with `sharpen_iir_factors()`
+ * exactly as the mask blur of output.sharpen does.
  *
- * Every arithmetic quirk of impulse_denoise.cc and PF_correct_RT.cc is kept:
+ * Every arithmetic quirk of impulse_denoise.cc, PF_correct_RT.cc,
+ * ipsharpenedges.cc and ipsharpen.cc is kept:
  * the 5x5 mark and correction windows shorten at both horizontal edges, the
  * correction skips marked neighbours and divides by the unclamped weight sum,
  * and the defringe windows are asymmetric at the left edge. Both passes are
@@ -41,7 +44,12 @@
  * The defringe fringe sum accumulates in double on the host, so the device
  * reduction keeps double through the row sums and the total. The program is
  * only used for the defringe pass on a device that advertises fp64; the
- * impulse pass alone runs on any device.
+ * impulse and ML passes alone run on any device.
+ *
+ * MLsharpen()'s `f1 * SQR(f2 * f3) * f4` is evaluated as
+ * `f1 * ((f2 * f3) * (f2 * f3)) * f4`. Regrouping the product changes the
+ * last bit, and a second pass then amplifies it into a branch flip, so the
+ * grouping is part of the port.
  *
  * The hue table is a uniform sample of the defringe FlatCurve with linear
  * interpolation. FlatCurve::getVal() is a dense polyline, so the host can
@@ -399,6 +407,464 @@ __kernel void rt_lab_sharpening_defringe_total(
  * right tail reads x-halfwin+1..width-1. The weight is the reciprocal fringe
  * value, evaluated here exactly as the host stores it.
  */
+/*
+ * MLsharpen() and MLmicrocontrast() both work on a Chanel/327.68f working
+ * copy. This is that copy, shared by the edge and microcontrast passes.
+ */
+__kernel void rt_lab_sharpening_scale(__global const float* src,
+                                      __global float* dst,
+                                      const int width,
+                                      const int height,
+                                      const int pitch)
+{
+    const int x = (int)get_global_id(0);
+    const int y = (int)get_global_id(1);
+    if (x >= width || y >= height) {
+        return;
+    }
+    const int index = y * pitch + x;
+    dst[index] = src[index] / 327.68f;
+}
+
+/*
+ * MLmicrocontrast()'s luminance tables. They are algorithm invariants of
+ * ipsharpen.cc, indexed by the uniformity slider 0..10.
+ */
+__constant float rt_ls_L98[11] = {0.001f, 0.0015f, 0.002f, 0.004f, 0.006f,
+                                  0.008f, 0.01f, 0.03f, 0.05f, 0.1f, 0.1f};
+__constant float rt_ls_L95[11] = {0.0012f, 0.002f, 0.005f, 0.01f, 0.02f,
+                                  0.05f, 0.1f, 0.12f, 0.15f, 0.2f, 0.25f};
+__constant float rt_ls_L92[11] = {0.01f, 0.015f, 0.02f, 0.06f, 0.10f, 0.13f,
+                                  0.17f, 0.25f, 0.3f, 0.32f, 0.35f};
+__constant float rt_ls_L90[11] = {0.015f, 0.02f, 0.04f, 0.08f, 0.12f, 0.15f,
+                                  0.2f, 0.3f, 0.4f, 0.5f, 0.6f};
+__constant float rt_ls_L87[11] = {0.025f, 0.03f, 0.05f, 0.1f, 0.15f, 0.25f,
+                                  0.3f, 0.4f, 0.5f, 0.63f, 0.75f};
+__constant float rt_ls_L83[11] = {0.055f, 0.08f, 0.1f, 0.15f, 0.2f, 0.3f,
+                                  0.4f, 0.5f, 0.6f, 0.75f, 0.85f};
+__constant float rt_ls_L80[11] = {0.15f, 0.2f, 0.25f, 0.3f, 0.35f, 0.4f, 0.5f,
+                                  0.6f, 0.7f, 0.8f, 0.9f};
+__constant float rt_ls_L75[11] = {0.22f, 0.25f, 0.3f, 0.4f, 0.5f, 0.6f, 0.7f,
+                                  0.8f, 0.85f, 0.9f, 0.95f};
+__constant float rt_ls_L70[11] = {0.35f, 0.4f, 0.5f, 0.6f, 0.7f, 0.8f, 0.97f,
+                                  1.0f, 1.0f, 1.0f, 1.0f};
+__constant float rt_ls_L63[11] = {0.55f, 0.6f, 0.7f, 0.8f, 0.85f, 0.9f, 1.0f,
+                                  1.0f, 1.0f, 1.0f, 1.0f};
+__constant float rt_ls_L58[11] = {0.75f, 0.77f, 0.8f, 0.9f, 1.0f, 1.0f, 1.0f,
+                                  1.0f, 1.0f, 1.0f, 1.0f};
+__constant float rt_ls_Cont0[11] = {0.05f, 0.1f, 0.2f, 0.25f, 0.3f, 0.4f,
+                                    0.5f, 0.6f, 0.7f, 0.8f, 0.9f};
+__constant float rt_ls_Cont1[11] = {0.1f, 0.2f, 0.3f, 0.4f, 0.5f, 0.6f, 0.7f,
+                                    0.8f, 0.9f, 0.95f, 1.0f};
+__constant float rt_ls_Cont2[11] = {0.2f, 0.40f, 0.6f, 0.7f, 0.8f, 0.85f,
+                                    0.90f, 0.95f, 1.0f, 1.05f, 1.10f};
+__constant float rt_ls_Cont3[11] = {0.5f, 0.6f, 0.7f, 0.8f, 0.85f, 0.9f, 1.0f,
+                                    1.0f, 1.05f, 1.10f, 1.20f};
+__constant float rt_ls_Cont4[11] = {0.8f, 0.85f, 0.9f, 0.95f, 1.0f, 1.05f,
+                                    1.10f, 1.150f, 1.2f, 1.25f, 1.40f};
+__constant float rt_ls_Cont5[11] = {1.0f, 1.1f, 1.2f, 1.25f, 1.3f, 1.4f,
+                                    1.45f, 1.50f, 1.6f, 1.65f, 1.80f};
+
+inline float rt_ls_intp(const float a, const float b, const float c)
+{
+    return a * (b - c) + c;
+}
+
+inline float rt_ls_in_interval(const float a, const float b, const float c)
+{
+    return (a < fmax(b, c)) && (a > fmin(b, c));
+}
+
+inline float rt_ls_select_weight(const float a, const float b, const float low,
+                                 const float high)
+{
+    const float min_val = fmin(a, b);
+    const float max_val = fmax(a, b);
+    const float res = (min_val < 0.45f * max_val) ? low : high;
+    return (min_val > 0.05f * max_val) ? res : high;
+}
+
+/*
+ * MLsharpen()'s single pass for one channel. `l` is the pre-pass working copy
+ * of `channel`, so every neighbour read is the pass's input. The host writes
+ * only the interior 2..W-3 x 2..H-3 and, for L, only where v < 92.
+ */
+__kernel void rt_lab_sharpening_ml_edges(__global const float* l,
+                                         __global float* channel,
+                                         const int width,
+                                         const int height,
+                                         const int pitch,
+                                         const int channel_index,
+                                         const float amount,
+                                         const float amountby3)
+{
+    const int x = (int)get_global_id(0);
+    const int y = (int)get_global_id(1);
+    if (x < 2 || y < 2 || x >= width - 2 || y >= height - 2) {
+        return;
+    }
+    const int offset = y * pitch + x;
+    const float eps2 = 0.001f;
+    const float chmax[3] = {0.125f, 0.33333334f, 0.33333334f};
+    const int width2 = 2 * pitch;
+
+    const float wH = eps2 + fabs(l[offset + 1] - l[offset - 1]);
+    const float wV = eps2 + fabs(l[offset + pitch] - l[offset - pitch]);
+
+    float s = 2.f / (2.f + fabs(wH - wV));
+    float wD1 =
+        eps2 + fabs(l[offset + pitch + 1] - l[offset - pitch - 1]) * s;
+    float wD2 =
+        eps2 + fabs(l[offset + pitch - 1] - l[offset - pitch + 1]) * s;
+    s = wD1;
+    wD1 /= wD2;
+    wD2 /= s;
+
+    const float v = l[offset];
+    float lumH = v;
+    float lumV = v;
+    float lumD1 = v;
+    float lumD2 = v;
+
+    const float contrast =
+        fmin(sqrt((l[offset + 1] - l[offset - 1]) *
+                      (l[offset + 1] - l[offset - 1]) +
+                  (l[offset + pitch] - l[offset - pitch]) *
+                      (l[offset + pitch] - l[offset - pitch])) *
+                 chmax[channel_index],
+             1.f);
+
+    if (rt_ls_in_interval(v, l[offset - 1], l[offset + 1])) {
+        float f1 = fabs(l[offset - 2] - l[offset - 1]);
+        float f2 = l[offset - 1] - v;
+        float f3 = (l[offset - 1] - l[offset - pitch]) *
+                   (l[offset - 1] - l[offset + pitch]);
+        float f4 = sqrt(fabs((l[offset - 1] - l[offset - width2]) *
+                             (l[offset - 1] - l[offset + width2])));
+        const float difL = f1 * ((f2 * f3) * (f2 * f3)) * f4;
+        if (difL > 0.f) {
+            f1 = fabs(l[offset + 2] - l[offset + 1]);
+            f2 = l[offset + 1] - v;
+            f3 = (l[offset + 1] - l[offset - pitch]) *
+                 (l[offset + 1] - l[offset + pitch]);
+            f4 = sqrt(fabs((l[offset + 1] - l[offset - width2]) *
+                           (l[offset + 1] - l[offset + width2])));
+            const float difR = f1 * ((f2 * f3) * (f2 * f3)) * f4;
+            if (difR > 0.f) {
+                lumH = (l[offset - 1] * difR + l[offset + 1] * difL) /
+                       (difL + difR);
+                lumH = rt_ls_intp(contrast, lumH, v);
+            }
+        }
+    }
+
+    if (rt_ls_in_interval(v, l[offset - pitch], l[offset + pitch])) {
+        float f1 = fabs(l[offset - width2] - l[offset - pitch]);
+        float f2 = l[offset - pitch] - v;
+        float f3 = (l[offset - pitch] - l[offset - 1]) *
+                   (l[offset - pitch] - l[offset + 1]);
+        float f4 = sqrt(fabs((l[offset - pitch] - l[offset - 2]) *
+                             (l[offset - pitch] - l[offset + 2])));
+        const float difT = f1 * ((f2 * f3) * (f2 * f3)) * f4;
+        if (difT > 0.f) {
+            f1 = fabs(l[offset + width2] - l[offset + pitch]);
+            f2 = l[offset + pitch] - v;
+            f3 = (l[offset + pitch] - l[offset - 1]) *
+                 (l[offset + pitch] - l[offset + 1]);
+            f4 = sqrt(fabs((l[offset + pitch] - l[offset - 2]) *
+                           (l[offset + pitch] - l[offset + 2])));
+            const float difB = f1 * ((f2 * f3) * (f2 * f3)) * f4;
+            if (difB > 0.f) {
+                lumV = (l[offset - pitch] * difB + l[offset + pitch] * difT) /
+                       (difT + difB);
+                lumV = rt_ls_intp(contrast, lumV, v);
+            }
+        }
+    }
+
+    if (rt_ls_in_interval(v, l[offset - 1 - pitch],
+                          l[offset + 1 + pitch])) {
+        float f1 =
+            fabs(l[offset - 2 - width2] - l[offset - 1 - pitch]);
+        float f2 = l[offset - 1 - pitch] - v;
+        float f3 = (l[offset - 1 - pitch] - l[offset - pitch + 1]) *
+                   (l[offset - 1 - pitch] - l[offset + pitch - 1]);
+        float f4 =
+            sqrt(fabs((l[offset - 1 - pitch] - l[offset - width2 + 2]) *
+                      (l[offset - 1 - pitch] - l[offset + width2 - 2])));
+        const float difLT = f1 * ((f2 * f3) * (f2 * f3)) * f4;
+        if (difLT > 0.f) {
+            f1 = fabs(l[offset + 2 + width2] - l[offset + 1 + pitch]);
+            f2 = l[offset + 1 + pitch] - v;
+            f3 = (l[offset + 1 + pitch] - l[offset - pitch + 1]) *
+                 (l[offset + 1 + pitch] - l[offset + pitch - 1]);
+            f4 = sqrt(
+                fabs((l[offset + 1 + pitch] - l[offset - width2 + 2]) *
+                     (l[offset + 1 + pitch] - l[offset + width2 - 2])));
+            const float difRB = f1 * ((f2 * f3) * (f2 * f3)) * f4;
+            if (difRB > 0.f) {
+                lumD1 = (l[offset - 1 - pitch] * difRB +
+                         l[offset + 1 + pitch] * difLT) /
+                        (difLT + difRB);
+                lumD1 = rt_ls_intp(contrast, lumD1, v);
+            }
+        }
+    }
+
+    if (rt_ls_in_interval(v, l[offset + 1 - pitch],
+                          l[offset - 1 + pitch])) {
+        float f1 =
+            fabs(l[offset - 2 + width2] - l[offset - 1 + pitch]);
+        float f2 = l[offset - 1 + pitch] - v;
+        float f3 = (l[offset - 1 + pitch] - l[offset - pitch - 1]) *
+                   (l[offset - 1 + pitch] - l[offset + pitch + 1]);
+        float f4 =
+            sqrt(fabs((l[offset - 1 + pitch] - l[offset - width2 - 2]) *
+                      (l[offset - 1 + pitch] - l[offset + width2 + 2])));
+        const float difLB = f1 * ((f2 * f3) * (f2 * f3)) * f4;
+        if (difLB > 0.f) {
+            f1 = fabs(l[offset + 2 - width2] - l[offset + 1 - pitch]);
+            f2 = l[offset + 1 - pitch] - v;
+            f3 = (l[offset + 1 - pitch] - l[offset + pitch + 1]) *
+                 (l[offset + 1 - pitch] - l[offset - pitch - 1]);
+            f4 = sqrt(
+                fabs((l[offset + 1 - pitch] - l[offset + width2 + 2]) *
+                     (l[offset + 1 - pitch] - l[offset - width2 - 2])));
+            const float difRT = f1 * ((f2 * f3) * (f2 * f3)) * f4;
+            if (difRT > 0.f) {
+                lumD2 = (l[offset + 1 - pitch] * difLB +
+                         l[offset - 1 + pitch] * difRT) /
+                        (difLB + difRT);
+                lumD2 = rt_ls_intp(contrast, lumD2, v);
+            }
+        }
+    }
+
+    const float weight = rt_ls_select_weight(wH, wV, amountby3, amount);
+    const float combined = (lumH * wH + lumV * wV + lumD1 * wD1 +
+                            lumD2 * wD2) /
+                           (wH + wV + wD1 + wD2);
+    const float mixed = rt_ls_intp(weight, combined, v);
+    if (channel_index == 0) {
+        if (v < 92.f) {
+            channel[offset] = fabs(327.68f * mixed);
+        }
+    } else {
+        channel[offset] = 327.68f * mixed;
+    }
+}
+
+/*
+ * MLmicrocontrast()'s final mix. `luminance` is read and written in place; `lm`
+ * is its pre-pass working copy and `blend` the contrast mask produced by
+ * buildBlendMask(). The pyramid tables and the uniformity index follow
+ * ipsharpen.cc exactly.
+ */
+__kernel void rt_lab_sharpening_ml_micro(__global float* luminance,
+                                         __global const float* lm,
+                                         __global const float* blend,
+                                         const int width,
+                                         const int height,
+                                         const int pitch,
+                                         const int k,
+                                         const float amount,
+                                         const int uniformity)
+{
+    const int x = (int)get_global_id(0);
+    const int y = (int)get_global_id(1);
+    if (x < k || y < k || x >= width - k || y >= height - k) {
+        return;
+    }
+    const int offset = y * pitch + x;
+    const int unif = uniformity;
+    const float v = lm[offset];
+    const float sqrt2 = sqrt(2.0f);
+    const float sqrt1d25 = sqrt(1.25f);
+
+    float contrast;
+    if (k == 1) {
+        contrast = sqrt((lm[offset + 1] - lm[offset - 1]) *
+                            (lm[offset + 1] - lm[offset - 1]) +
+                        (lm[offset + pitch] - lm[offset - pitch]) *
+                            (lm[offset + pitch] - lm[offset - pitch])) *
+                   0.125f;
+    } else {
+        contrast =
+            sqrt((lm[offset + 1] - lm[offset - 1]) *
+                     (lm[offset + 1] - lm[offset - 1]) +
+                 (lm[offset + pitch] - lm[offset - pitch]) *
+                     (lm[offset + pitch] - lm[offset - pitch]) +
+                 (lm[offset + 2] - lm[offset - 2]) *
+                     (lm[offset + 2] - lm[offset - 2]) +
+                 (lm[offset + 2 * pitch] - lm[offset - 2 * pitch]) *
+                     (lm[offset + 2 * pitch] - lm[offset - 2 * pitch])) *
+            0.0625f;
+    }
+    contrast = fmin(contrast, 1.f);
+
+    float temp = v + 4.f * (v * (amount + sqrt2 * amount));
+    float temp1 =
+        sqrt2 * amount *
+        (lm[offset - pitch - 1] + lm[offset - pitch + 1] +
+         lm[offset + pitch - 1] + lm[offset + pitch + 1]);
+    temp1 += amount * (lm[offset - pitch] + lm[offset - 1] +
+                       lm[offset + 1] + lm[offset + pitch]);
+    temp -= temp1;
+
+    if (k == 2) {
+        float temp2 = -(lm[offset + 2 * pitch] + lm[offset - 2 * pitch] +
+                        lm[offset - 2] + lm[offset + 2]);
+        temp2 -= sqrt1d25 *
+                 (lm[offset + 2 * pitch - 1] + lm[offset + 2 * pitch + 1] +
+                  lm[offset + pitch + 2] + lm[offset + pitch - 2] +
+                  lm[offset - 2 * pitch - 1] + lm[offset - 2 * pitch + 1] +
+                  lm[offset - pitch + 2] + lm[offset - pitch - 2]);
+        temp2 -= sqrt2 * (lm[offset + 2 * pitch - 2] +
+                          lm[offset + 2 * pitch + 2] +
+                          lm[offset - 2 * pitch - 2] +
+                          lm[offset - 2 * pitch + 2]);
+        temp2 += 18.601126159f * v;
+        temp2 *= 2.f * amount;
+        temp += temp2;
+    }
+
+    temp = fmax(temp, 0.f);
+
+    int stop = 0;
+    for (int row = y - k; row <= y + k && stop == 0; ++row) {
+        for (int index2 = row * pitch + x - k;
+             index2 <= row * pitch + x + k; ++index2) {
+            if ((lm[index2] - temp) * (v - lm[index2]) > 0.f) {
+                temp = rt_ls_intp(0.75f, temp, lm[index2]);
+                stop = 1;
+                break;
+            }
+        }
+    }
+
+    if (v > 95.0f || v < 5.0f) {
+        contrast *= rt_ls_Cont0[unif];
+    } else if (v > 90.0f || v < 10.0f) {
+        contrast *= rt_ls_Cont1[unif];
+    } else if (v > 80.0f || v < 20.0f) {
+        contrast *= rt_ls_Cont2[unif];
+    } else if (v > 70.0f || v < 30.0f) {
+        contrast *= rt_ls_Cont3[unif];
+    } else if (v > 60.0f || v < 40.0f) {
+        contrast *= rt_ls_Cont4[unif];
+    } else {
+        contrast *= rt_ls_Cont5[unif];
+    }
+    contrast = fmin(contrast, 1.f);
+
+    const float tempL = rt_ls_intp(contrast, v, temp);
+    if (tempL > v) {
+        float t2 = tempL / v;
+        t2 = fmin(t2, 1.7f);
+        t2 -= 1.f;
+        float lum_mod;
+        if (v > 98.0f) {
+            lum_mod = 0.f;
+        } else if (v > 95.0f) {
+            lum_mod = rt_ls_L95[unif];
+        } else if (v > 92.0f) {
+            lum_mod = rt_ls_L92[unif];
+        } else if (v > 90.0f) {
+            lum_mod = rt_ls_L90[unif];
+        } else if (v > 87.0f) {
+            lum_mod = rt_ls_L87[unif];
+        } else if (v > 83.0f) {
+            lum_mod = rt_ls_L83[unif];
+        } else if (v > 80.0f) {
+            lum_mod = rt_ls_L80[unif];
+        } else if (v > 75.0f) {
+            lum_mod = rt_ls_L75[unif];
+        } else if (v > 70.0f) {
+            lum_mod = rt_ls_L70[unif];
+        } else if (v > 63.0f) {
+            lum_mod = rt_ls_L63[unif];
+        } else if (v > 58.0f) {
+            lum_mod = rt_ls_L58[unif];
+        } else if (v > 42.0f) {
+            lum_mod = rt_ls_L58[unif];
+        } else if (v > 37.0f) {
+            lum_mod = rt_ls_L63[unif];
+        } else if (v > 30.0f) {
+            lum_mod = rt_ls_L70[unif];
+        } else if (v > 25.0f) {
+            lum_mod = rt_ls_L75[unif];
+        } else if (v > 20.0f) {
+            lum_mod = rt_ls_L80[unif];
+        } else if (v > 17.0f) {
+            lum_mod = rt_ls_L83[unif];
+        } else if (v > 13.0f) {
+            lum_mod = rt_ls_L87[unif];
+        } else if (v > 10.0f) {
+            lum_mod = rt_ls_L90[unif];
+        } else if (v > 5.0f) {
+            lum_mod = rt_ls_L95[unif];
+        } else {
+            lum_mod = 0.f;
+        }
+        luminance[offset] = rt_ls_intp(
+            blend[offset], luminance[offset] * (lum_mod * t2 + 1.f),
+            luminance[offset]);
+    } else {
+        float t4 = v / tempL;
+        if (t4 > 1.0f) {
+            t4 = fmin(t4, 1.7f);
+            t4 -= 1.f;
+            float lum_mod;
+            if (v < 2.0f) {
+                lum_mod = rt_ls_L98[unif];
+            } else if (v < 5.0f) {
+                lum_mod = rt_ls_L95[unif];
+            } else if (v < 8.0f) {
+                lum_mod = rt_ls_L92[unif];
+            } else if (v < 10.0f) {
+                lum_mod = rt_ls_L90[unif];
+            } else if (v < 13.0f) {
+                lum_mod = rt_ls_L87[unif];
+            } else if (v < 17.0f) {
+                lum_mod = rt_ls_L83[unif];
+            } else if (v < 20.0f) {
+                lum_mod = rt_ls_L80[unif];
+            } else if (v < 25.0f) {
+                lum_mod = rt_ls_L75[unif];
+            } else if (v < 30.0f) {
+                lum_mod = rt_ls_L70[unif];
+            } else if (v < 37.0f) {
+                lum_mod = rt_ls_L63[unif];
+            } else if (v < 42.0f) {
+                lum_mod = rt_ls_L58[unif];
+            } else if (v < 58.0f) {
+                lum_mod = rt_ls_L58[unif];
+            } else if (v < 63.0f) {
+                lum_mod = rt_ls_L63[unif];
+            } else if (v < 70.0f) {
+                lum_mod = rt_ls_L70[unif];
+            } else if (v < 75.0f) {
+                lum_mod = rt_ls_L75[unif];
+            } else if (v < 80.0f) {
+                lum_mod = rt_ls_L80[unif];
+            } else if (v < 83.0f) {
+                lum_mod = rt_ls_L83[unif];
+            } else if (v < 87.0f) {
+                lum_mod = rt_ls_L87[unif];
+            } else if (v < 90.0f) {
+                lum_mod = rt_ls_L90[unif];
+            } else if (v < 95.0f) {
+                lum_mod = rt_ls_L95[unif];
+            } else {
+                lum_mod = 0.f;
+            }
+            luminance[offset] = rt_ls_intp(
+                blend[offset], luminance[offset] / (lum_mod * t4 + 1.f),
+                luminance[offset]);
+        }
+    }
+}
+
 __kernel void rt_lab_sharpening_defringe_apply(
     __global float* a,
     __global float* b,

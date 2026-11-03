@@ -2329,11 +2329,8 @@ void Crop::stageLabSharpening(CropStageContext& ctx)
               (!cam02));
         stage::labSharpeningRun(parent->ipf, params, *labnCrop, ciecam_arm);
 
-        parent->ipf.MLsharpen(labnCrop);
-
        // if ((params.colorappearance.enabled && !settings->autocielab)  || (!params.colorappearance.enabled)) {
         if ((params.colorappearance.enabled && !settings->autocielab)  || (!cam02)) {
-            parent->ipf.MLmicrocontrast(labnCrop);
             parent->ipf.sharpening(labnCrop, params.sharpening, parent->sharpMask);
         }
     }

@@ -341,11 +341,11 @@ RtStageStatus local_adjustments_execute(const RtStageArg* args,
 /*
  * Host implementation of the lab.sharpening node.
  *
- * A refused or unsupported impulse/defringe configuration arrives here because
+ * A refused or unsupported lab.sharpening configuration arrives here because
  * the device queue falls back to the compiled program. The call-site context
- * runs the original host block, so the result is the CPU result for both tools
- * and the runtime records impl=host. Device recursion is disabled for the
- * duration: the host block must not re-enter this node.
+ * runs the original host block, so the result is the CPU result for the whole
+ * block and the runtime records impl=host. Device recursion is disabled for
+ * the duration: the host block must not re-enter this node.
  */
 RtStageStatus lab_sharpening_execute(const RtStageArg* args, uint32_t nargs,
                                      RtStageProfiling* profiling)

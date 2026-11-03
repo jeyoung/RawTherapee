@@ -37,18 +37,23 @@ struct ProcParams;
 }
 
 /*
- * Host side of the lab.sharpening impulse-denoise and defringe node.
+ * Host side of the lab.sharpening node.
  *
- * The device runs only the Lab arm of ImProcFunctions::impulsedenoise() and
- * ImProcFunctions::defringe(). The two tools are one atomic pair: if either
- * enabled tool is outside the device set, both run on the host, so a Lab image
- * is never half device and half host. ML sharpen edges, ML microcontrast and
- * the main sharpen pass are not part of this node and keep their own paths.
+ * The node runs the Lab block in its production order:
  *
- * The context owns the host-built hue table of the defringe FlatCurve and the
- * callback that runs the original host block for a residual, so a refused or
- * unsupported configuration still produces the CPU result and is recorded as a
- * host execution.
+ *   impulsedenoise() -> defringe() -> MLsharpen() -> MLmicrocontrast()
+ *
+ * The first two and the last run only in the Lab arm; MLsharpen runs in both
+ * arms because the call sites invoke it before the CIE-CAM split. The main
+ * sharpen pass is not part of this node and keeps the shared `output.sharpen`
+ * path.
+ *
+ * The block is atomic: if any enabled tool is outside the device set, the
+ * whole block runs on the host, so a Lab image is never half device and half
+ * host. The context owns the host-built hue table of the defringe FlatCurve
+ * and the callback that runs the original host block for a residual, so a
+ * refused or unsupported configuration still produces the CPU result and is
+ * recorded as a host execution.
  */
 
 #define RT_LAB_SHARPENING_CONTEXT_VERSION 1u
@@ -80,6 +85,25 @@ inline constexpr double LAB_SHARPENING_RADIUS_NOOP = 0.25;
  * 7x7 kernels, whose border rules this node does not implement. */
 inline constexpr double LAB_SHARPENING_RADIUS_IIR = 1.15;
 
+/* The GUI ranges: sharpen edges passes 1..4 and amount 0..100, microcontrast
+ * amount 0..100, contrast 0..200 and uniformity 0..10. The lower ends below
+ * also admit the values that make the host pass an exact no-op (passes 0,
+ * amount 0, microcontrast amount below 1 and contrast exactly 100). */
+inline constexpr int LAB_SHARPENING_EDGES_MIN_PASSES = 0;
+inline constexpr int LAB_SHARPENING_EDGES_MAX_PASSES = 4;
+inline constexpr double LAB_SHARPENING_EDGES_MIN_AMOUNT = 0.0;
+inline constexpr double LAB_SHARPENING_EDGES_MAX_AMOUNT = 100.0;
+inline constexpr double LAB_SHARPENING_MICRO_MIN_AMOUNT = 0.0;
+inline constexpr double LAB_SHARPENING_MICRO_MAX_AMOUNT = 100.0;
+/* MLmicrocontrast()'s own early-out: amount below 1.0 leaves the image. */
+inline constexpr double LAB_SHARPENING_MICRO_NOOP_AMOUNT = 1.0;
+inline constexpr double LAB_SHARPENING_MICRO_MIN_CONTRAST = 0.0;
+inline constexpr double LAB_SHARPENING_MICRO_MAX_CONTRAST = 200.0;
+/* MLmicrocontrast()'s own early-out: contrast exactly 100 leaves the image. */
+inline constexpr double LAB_SHARPENING_MICRO_NOOP_CONTRAST = 100.0;
+inline constexpr int LAB_SHARPENING_MICRO_MIN_UNIFORMITY = 0;
+inline constexpr int LAB_SHARPENING_MICRO_MAX_UNIFORMITY = 10;
+
 /* Argument order; see the header comment of lab_sharpening_cl.h. */
 enum LabSharpeningArg : std::size_t {
     LAB_SHARPENING_ARG_LUMINANCE = 0,
@@ -93,6 +117,15 @@ enum LabSharpeningArg : std::size_t {
     LAB_SHARPENING_ARG_HUE_TABLE,
     LAB_SHARPENING_ARG_HUE_ENTRIES,
     LAB_SHARPENING_ARG_HUE_CURVE,
+    LAB_SHARPENING_ARG_EDGES_ENABLED,
+    LAB_SHARPENING_ARG_EDGES_PASSES,
+    LAB_SHARPENING_ARG_EDGES_AMOUNT,
+    LAB_SHARPENING_ARG_EDGES_THREECHANNELS,
+    LAB_SHARPENING_ARG_MICRO_ENABLED,
+    LAB_SHARPENING_ARG_MICRO_MATRIX,
+    LAB_SHARPENING_ARG_MICRO_AMOUNT,
+    LAB_SHARPENING_ARG_MICRO_CONTRAST,
+    LAB_SHARPENING_ARG_MICRO_UNIFORMITY,
     LAB_SHARPENING_ARG_CONTEXT,
     LAB_SHARPENING_NODE_ARGS
 };
@@ -106,6 +139,17 @@ struct LabSharpeningNodeParams {
     int defringe_threshold = 0;
     /* 1 when the profile has an active defringe hue curve. */
     int hue_curve = 0;
+    int edges_enabled = 0;
+    int edges_passes = 0;
+    double edges_amount = 0.0;
+    /* 1 when the edge pass is restricted to L, 0 for L, a and b. */
+    int edges_threechannels = 0;
+    int micro_enabled = 0;
+    /* 1 for the 3x3 matrix, 0 for the 5x5 matrix. */
+    int micro_matrix = 0;
+    double micro_amount = 0.0;
+    double micro_contrast = 0.0;
+    int micro_uniformity = 0;
 };
 
 typedef struct RtLabSharpeningContext {
@@ -133,18 +177,27 @@ bool lab_sharpening_decode(const RtStageArg* args, uint32_t nargs,
                            std::string& error);
 
 /*
- * The device set: at least one enabled tool, both parameter sets inside the
- * GUI ranges, the image large enough for both 5x5 windows, and either no
- * defringe or a defringe radius in the separable-IIR range (or the no-op
- * below 0.25). A defringe that runs needs device fp64 for its double
+ * The device set: at least one enabled tool, every enabled parameter set
+ * inside its GUI range, the image large enough for the 5x5 windows, and
+ * either no defringe or a defringe radius in the separable-IIR range (or the
+ * no-op below 0.25). A defringe that runs needs device fp64 for its double
  * chromaticity mean. Anything else is a residual, never an approximation.
  */
 bool lab_sharpening_admitted(const LabSharpeningNodeParams& params, int width,
                              int height, bool has_fp64, std::string& error);
 
-/* Everything the node reads, derived from the production parameters. */
+/* 1 when at least one enabled tool would change a plane. */
+bool lab_sharpening_active(const LabSharpeningNodeParams& params);
+
+/*
+ * Everything the node reads, derived from the production parameters.
+ * `ciecam_arm` mirrors the call site: impulse denoise, defringe and
+ * microcontrast are skipped there because the CIE-CAM pipeline owns them on
+ * the CieImage, while ML sharpen edges still runs on the Lab image.
+ */
 LabSharpeningNodeParams
-labSharpeningNodeParams(const procparams::ProcParams& params);
+labSharpeningNodeParams(const procparams::ProcParams& params,
+                        bool ciecam_arm = false);
 
 /*
  * Build the argument list for one submission. The context's hue table and the
@@ -158,8 +211,8 @@ void labSharpeningArgs(LabImage& lab, const LabSharpeningNodeParams& node,
 
 /*
  * Whether the Lab block is the node's supported set. `ciecam_arm` is true when
- * the caller's gate leaves impulse denoise and defringe to the CIE-CAM
- * pipeline, which runs on the CieImage and is not this node.
+ * the caller's gate leaves impulse denoise, defringe and microcontrast to the
+ * CIE-CAM pipeline, which runs on the CieImage and is not this node.
  */
 bool labSharpeningSupported(const procparams::ProcParams& params, int width,
                             int height, bool ciecam_arm, std::string* error);
@@ -169,10 +222,11 @@ bool labSharpeningSupported(const procparams::ProcParams& params, int width,
  * site, the host builtin and the tests share exactly one CPU implementation.
  */
 void labSharpeningHostBlock(ImProcFunctions& ipf,
-                            procparams::ProcParams& params, LabImage& lab);
+                            procparams::ProcParams& params, LabImage& lab,
+                            bool ciecam_arm);
 
 /*
- * Submit the pair to the device and fall back to the host block. This is the
+ * Submit the block to the device and fall back to the host block. This is the
  * only entry point the Lab call sites use.
  */
 void labSharpeningRun(ImProcFunctions& ipf, procparams::ProcParams& params,
@@ -187,7 +241,7 @@ class LabSharpeningContext
 {
 public:
     LabSharpeningContext(procparams::ProcParams& params, ImProcFunctions& ipf,
-                         int width, int height);
+                         int width, int height, bool ciecam_arm = false);
     ~LabSharpeningContext();
 
     LabSharpeningContext(const LabSharpeningContext&) = delete;
@@ -223,6 +277,7 @@ private:
     ImProcFunctions& ipf_;
     int width_;
     int height_;
+    bool ciecam_arm_;
 
     std::vector<float> hue_table_;
     int hue_entries_ = 0;

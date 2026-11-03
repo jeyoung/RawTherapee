@@ -2013,17 +2013,6 @@ private:
               (!cam02));
         stage::labSharpeningRun(ipf, params, *labView, ciecam_arm);
 
-        if (params.sharpenEdge.enabled) {
-            ipf.MLsharpen(labView);
-        }
-
-        if (params.sharpenMicro.enabled) {
-          //  if ((params.colorappearance.enabled && !settings->autocielab) || (!params.colorappearance.enabled)) {
-            if ((params.colorappearance.enabled && !settings->autocielab) || (!cam02)) {
-                ipf.MLmicrocontrast(labView);     //!params.colorappearance.sharpcie
-            }
-        }
-
       //  if (((params.colorappearance.enabled && !settings->autocielab) || (!params.colorappearance.enabled)) && params.sharpening.enabled) {
         if (((params.colorappearance.enabled && !settings->autocielab) || (!cam02)) && params.sharpening.enabled) {
             stage::ScopedProfile profile("finish.sharpening");

@@ -206,7 +206,13 @@ bool lab_sharpening_decode(const RtStageArg* args, uint32_t nargs,
         LAB_SHARPENING_ARG_DEFRINGE_ENABLED,
         LAB_SHARPENING_ARG_DEFRINGE_THRESHOLD,
         LAB_SHARPENING_ARG_HUE_ENTRIES,
-        LAB_SHARPENING_ARG_HUE_CURVE};
+        LAB_SHARPENING_ARG_HUE_CURVE,
+        LAB_SHARPENING_ARG_EDGES_ENABLED,
+        LAB_SHARPENING_ARG_EDGES_PASSES,
+        LAB_SHARPENING_ARG_EDGES_THREECHANNELS,
+        LAB_SHARPENING_ARG_MICRO_ENABLED,
+        LAB_SHARPENING_ARG_MICRO_MATRIX,
+        LAB_SHARPENING_ARG_MICRO_UNIFORMITY};
     for (LabSharpeningArg index : intArgs) {
         if (!is_int(index)) {
             error = "lab.sharpening argument " + std::to_string(index) +
@@ -214,9 +220,17 @@ bool lab_sharpening_decode(const RtStageArg* args, uint32_t nargs,
             return false;
         }
     }
-    if (args[LAB_SHARPENING_ARG_DEFRINGE_RADIUS].kind != RT_STAGE_ARG_DOUBLE) {
-        error = "lab.sharpening defringe radius is not a double";
-        return false;
+    const LabSharpeningArg doubleArgs[] = {
+        LAB_SHARPENING_ARG_DEFRINGE_RADIUS,
+        LAB_SHARPENING_ARG_EDGES_AMOUNT,
+        LAB_SHARPENING_ARG_MICRO_AMOUNT,
+        LAB_SHARPENING_ARG_MICRO_CONTRAST};
+    for (LabSharpeningArg index : doubleArgs) {
+        if (args[index].kind != RT_STAGE_ARG_DOUBLE) {
+            error = "lab.sharpening argument " + std::to_string(index) +
+                    " is not a double";
+            return false;
+        }
     }
     if (args[LAB_SHARPENING_ARG_HUE_TABLE].kind != RT_STAGE_ARG_BUFFER ||
         args[LAB_SHARPENING_ARG_CONTEXT].kind != RT_STAGE_ARG_PTR) {
@@ -234,8 +248,15 @@ bool lab_sharpening_decode(const RtStageArg* args, uint32_t nargs,
     params.impulse_enabled = flag(LAB_SHARPENING_ARG_IMPULSE_ENABLED);
     params.defringe_enabled = flag(LAB_SHARPENING_ARG_DEFRINGE_ENABLED);
     params.hue_curve = flag(LAB_SHARPENING_ARG_HUE_CURVE);
+    params.edges_enabled = flag(LAB_SHARPENING_ARG_EDGES_ENABLED);
+    params.edges_threechannels =
+        flag(LAB_SHARPENING_ARG_EDGES_THREECHANNELS);
+    params.micro_enabled = flag(LAB_SHARPENING_ARG_MICRO_ENABLED);
+    params.micro_matrix = flag(LAB_SHARPENING_ARG_MICRO_MATRIX);
     if (params.impulse_enabled < 0 || params.defringe_enabled < 0 ||
-        params.hue_curve < 0) {
+        params.hue_curve < 0 || params.edges_enabled < 0 ||
+        params.edges_threechannels < 0 || params.micro_enabled < 0 ||
+        params.micro_matrix < 0) {
         error = "lab.sharpening flags must be 0 or 1";
         return false;
     }
@@ -244,6 +265,13 @@ bool lab_sharpening_decode(const RtStageArg* args, uint32_t nargs,
     params.defringe_threshold =
         static_cast<int>(args[LAB_SHARPENING_ARG_DEFRINGE_THRESHOLD].u.i);
     params.defringe_radius = args[LAB_SHARPENING_ARG_DEFRINGE_RADIUS].u.f;
+    params.edges_passes =
+        static_cast<int>(args[LAB_SHARPENING_ARG_EDGES_PASSES].u.i);
+    params.edges_amount = args[LAB_SHARPENING_ARG_EDGES_AMOUNT].u.f;
+    params.micro_amount = args[LAB_SHARPENING_ARG_MICRO_AMOUNT].u.f;
+    params.micro_contrast = args[LAB_SHARPENING_ARG_MICRO_CONTRAST].u.f;
+    params.micro_uniformity =
+        static_cast<int>(args[LAB_SHARPENING_ARG_MICRO_UNIFORMITY].u.i);
 
     hue = args[LAB_SHARPENING_ARG_HUE_TABLE].u.buffer;
     const std::int64_t hue_entries =
@@ -265,7 +293,8 @@ bool lab_sharpening_admitted(const LabSharpeningNodeParams& params, int width,
         error = "lab.sharpening needs at least 8x8 pixels";
         return false;
     }
-    if (params.impulse_enabled == 0 && params.defringe_enabled == 0) {
+    if (params.impulse_enabled == 0 && params.defringe_enabled == 0 &&
+        params.edges_enabled == 0 && params.micro_enabled == 0) {
         error = "lab.sharpening has no enabled tool";
         return false;
     }
@@ -274,6 +303,38 @@ bool lab_sharpening_admitted(const LabSharpeningNodeParams& params, int width,
          params.impulse_threshold > LAB_SHARPENING_MAX_THRESHOLD)) {
         error = "lab.sharpening impulse threshold is outside 0..100";
         return false;
+    }
+    if (params.edges_enabled != 0) {
+        if (params.edges_passes < LAB_SHARPENING_EDGES_MIN_PASSES ||
+            params.edges_passes > LAB_SHARPENING_EDGES_MAX_PASSES) {
+            error = "lab.sharpening edge pass count is outside 0..4";
+            return false;
+        }
+        if (!std::isfinite(params.edges_amount) ||
+            params.edges_amount < LAB_SHARPENING_EDGES_MIN_AMOUNT ||
+            params.edges_amount > LAB_SHARPENING_EDGES_MAX_AMOUNT) {
+            error = "lab.sharpening edge amount is outside 0..100";
+            return false;
+        }
+    }
+    if (params.micro_enabled != 0) {
+        if (!std::isfinite(params.micro_amount) ||
+            params.micro_amount < LAB_SHARPENING_MICRO_MIN_AMOUNT ||
+            params.micro_amount > LAB_SHARPENING_MICRO_MAX_AMOUNT) {
+            error = "lab.sharpening microcontrast amount is outside 0..100";
+            return false;
+        }
+        if (!std::isfinite(params.micro_contrast) ||
+            params.micro_contrast < LAB_SHARPENING_MICRO_MIN_CONTRAST ||
+            params.micro_contrast > LAB_SHARPENING_MICRO_MAX_CONTRAST) {
+            error = "lab.sharpening microcontrast contrast is outside 0..200";
+            return false;
+        }
+        if (params.micro_uniformity < LAB_SHARPENING_MICRO_MIN_UNIFORMITY ||
+            params.micro_uniformity > LAB_SHARPENING_MICRO_MAX_UNIFORMITY) {
+            error = "lab.sharpening microcontrast uniformity is outside 0..10";
+            return false;
+        }
     }
     if (params.defringe_enabled == 0) {
         return true;
@@ -324,13 +385,27 @@ bool lab_sharpening_admitted(const LabSharpeningNodeParams& params, int width,
     return true;
 }
 
+bool lab_sharpening_active(const LabSharpeningNodeParams& params)
+{
+    /* An enabled tool is active even when the host would turn it into a
+     * no-op: the node still has to reproduce that no-op, and treating it as
+     * inactive would move the decision out of the device set. */
+    return params.impulse_enabled != 0 || params.defringe_enabled != 0 ||
+           params.edges_enabled != 0 || params.micro_enabled != 0;
+}
+
 LabSharpeningNodeParams
-labSharpeningNodeParams(const procparams::ProcParams& params)
+labSharpeningNodeParams(const procparams::ProcParams& params,
+                        bool ciecam_arm)
 {
     LabSharpeningNodeParams node;
-    node.impulse_enabled = params.impulseDenoise.enabled ? 1 : 0;
+    /* The CIE-CAM pipeline owns these tools on the CieImage. ML sharpen edges
+     * is a Lab pass in both arms, so it stays enabled. */
+    node.impulse_enabled =
+        !ciecam_arm && params.impulseDenoise.enabled ? 1 : 0;
     node.impulse_threshold = params.impulseDenoise.thresh;
-    node.defringe_enabled = params.defringe.enabled ? 1 : 0;
+    node.defringe_enabled =
+        !ciecam_arm && params.defringe.enabled ? 1 : 0;
     node.defringe_radius = params.defringe.radius;
     node.defringe_threshold = params.defringe.threshold;
     /*
@@ -341,6 +416,16 @@ labSharpeningNodeParams(const procparams::ProcParams& params)
         FlatCurveType(params.defringe.huecurve[0]) > FCT_Linear) {
         node.hue_curve = 1;
     }
+    node.edges_enabled = params.sharpenEdge.enabled ? 1 : 0;
+    node.edges_passes = params.sharpenEdge.passes;
+    node.edges_amount = params.sharpenEdge.amount;
+    node.edges_threechannels = params.sharpenEdge.threechannels ? 1 : 0;
+    node.micro_enabled =
+        !ciecam_arm && params.sharpenMicro.enabled ? 1 : 0;
+    node.micro_matrix = params.sharpenMicro.matrix ? 1 : 0;
+    node.micro_amount = params.sharpenMicro.amount;
+    node.micro_contrast = params.sharpenMicro.contrast;
+    node.micro_uniformity = params.sharpenMicro.uniformity;
     return node;
 }
 
@@ -384,6 +469,25 @@ void labSharpeningArgs(LabImage& lab, const LabSharpeningNodeParams& node,
     args[LAB_SHARPENING_ARG_HUE_ENTRIES].u.i = context.hueEntries();
     args[LAB_SHARPENING_ARG_HUE_CURVE].kind = RT_STAGE_ARG_INT;
     args[LAB_SHARPENING_ARG_HUE_CURVE].u.i = node.hue_curve;
+    args[LAB_SHARPENING_ARG_EDGES_ENABLED].kind = RT_STAGE_ARG_INT;
+    args[LAB_SHARPENING_ARG_EDGES_ENABLED].u.i = node.edges_enabled;
+    args[LAB_SHARPENING_ARG_EDGES_PASSES].kind = RT_STAGE_ARG_INT;
+    args[LAB_SHARPENING_ARG_EDGES_PASSES].u.i = node.edges_passes;
+    args[LAB_SHARPENING_ARG_EDGES_AMOUNT].kind = RT_STAGE_ARG_DOUBLE;
+    args[LAB_SHARPENING_ARG_EDGES_AMOUNT].u.f = node.edges_amount;
+    args[LAB_SHARPENING_ARG_EDGES_THREECHANNELS].kind = RT_STAGE_ARG_INT;
+    args[LAB_SHARPENING_ARG_EDGES_THREECHANNELS].u.i =
+        node.edges_threechannels;
+    args[LAB_SHARPENING_ARG_MICRO_ENABLED].kind = RT_STAGE_ARG_INT;
+    args[LAB_SHARPENING_ARG_MICRO_ENABLED].u.i = node.micro_enabled;
+    args[LAB_SHARPENING_ARG_MICRO_MATRIX].kind = RT_STAGE_ARG_INT;
+    args[LAB_SHARPENING_ARG_MICRO_MATRIX].u.i = node.micro_matrix;
+    args[LAB_SHARPENING_ARG_MICRO_AMOUNT].kind = RT_STAGE_ARG_DOUBLE;
+    args[LAB_SHARPENING_ARG_MICRO_AMOUNT].u.f = node.micro_amount;
+    args[LAB_SHARPENING_ARG_MICRO_CONTRAST].kind = RT_STAGE_ARG_DOUBLE;
+    args[LAB_SHARPENING_ARG_MICRO_CONTRAST].u.f = node.micro_contrast;
+    args[LAB_SHARPENING_ARG_MICRO_UNIFORMITY].kind = RT_STAGE_ARG_INT;
+    args[LAB_SHARPENING_ARG_MICRO_UNIFORMITY].u.i = node.micro_uniformity;
     args[LAB_SHARPENING_ARG_CONTEXT].kind = RT_STAGE_ARG_PTR;
     args[LAB_SHARPENING_ARG_CONTEXT].u.ptr = &descriptor;
 }
@@ -398,12 +502,11 @@ bool labSharpeningSupported(const procparams::ProcParams& params, int width,
         return false;
     };
 
-    if (ciecam_arm) {
-        return fail("lab.sharpening: the CIE-CAM arm runs these tools on the "
-                    "CieImage and is a host residual");
+    const LabSharpeningNodeParams node =
+        labSharpeningNodeParams(params, ciecam_arm);
+    if (!lab_sharpening_active(node)) {
+        return fail("lab.sharpening has no tool that would change the image");
     }
-
-    const LabSharpeningNodeParams node = labSharpeningNodeParams(params);
     std::string reason;
     if (!lab_sharpening_admitted(node, width, height, true, reason)) {
         return fail(reason.c_str());
@@ -415,43 +518,44 @@ bool labSharpeningSupported(const procparams::ProcParams& params, int width,
 }
 
 void labSharpeningHostBlock(ImProcFunctions& ipf,
-                            procparams::ProcParams& params, LabImage& lab)
+                            procparams::ProcParams& params, LabImage& lab,
+                            bool ciecam_arm)
 {
     (void)params;
-    /* The same order as the call site before the device node existed. */
-    ipf.impulsedenoise(&lab);
-    ipf.defringe(&lab);
+    /* The same order as the call sites had before the device node existed. */
+    if (!ciecam_arm) {
+        ipf.impulsedenoise(&lab);
+        ipf.defringe(&lab);
+    }
+    ipf.MLsharpen(&lab);
+    if (!ciecam_arm) {
+        ipf.MLmicrocontrast(&lab);
+    }
 }
 
 void labSharpeningRun(ImProcFunctions& ipf, procparams::ProcParams& params,
                       LabImage& lab, bool ciecam_arm)
 {
-    if (ciecam_arm) {
-        /* The CIE-CAM pipeline owns impulse denoise and defringe for this
-         * profile; the Lab block must not run them a second time. */
-        return;
-    }
-    if (!params.impulseDenoise.enabled && !params.defringe.enabled) {
+    LabSharpeningNodeParams node = labSharpeningNodeParams(params, ciecam_arm);
+    if (!lab_sharpening_active(node)) {
         return;
     }
 
     if (node_device("lab.sharpening") != StageNodeDevice::OpenCL) {
-        labSharpeningHostBlock(ipf, params, lab);
+        labSharpeningHostBlock(ipf, params, lab, ciecam_arm);
         return;
     }
 
-    LabSharpeningContext context(params, ipf, lab.W, lab.H);
+    LabSharpeningContext context(params, ipf, lab.W, lab.H, ciecam_arm);
     std::string error;
     if (context.build(&error) != 0) {
-        labSharpeningHostBlock(ipf, params, lab);
+        labSharpeningHostBlock(ipf, params, lab, ciecam_arm);
         return;
     }
-
-    LabSharpeningNodeParams node = labSharpeningNodeParams(params);
 
     std::string support_error;
     const bool supported = labSharpeningSupported(
-        params, lab.W, lab.H, false, &support_error);
+        params, lab.W, lab.H, ciecam_arm, &support_error);
     RtLabSharpeningContext descriptor = context.descriptor(supported);
 
     std::vector<RtStageArg> args;
@@ -459,14 +563,15 @@ void labSharpeningRun(ImProcFunctions& ipf, procparams::ProcParams& params,
 
     const RtStageStatus status = run("lab.sharpening", args);
     if (status != RT_STAGE_OK) {
-        labSharpeningHostBlock(ipf, params, lab);
+        labSharpeningHostBlock(ipf, params, lab, ciecam_arm);
     }
 }
 
 LabSharpeningContext::LabSharpeningContext(procparams::ProcParams& params,
                                            ImProcFunctions& ipf, int width,
-                                           int height)
-    : params_(params), ipf_(ipf), width_(width), height_(height)
+                                           int height, bool ciecam_arm)
+    : params_(params), ipf_(ipf), width_(width), height_(height),
+      ciecam_arm_(ciecam_arm)
 {
 }
 
@@ -536,7 +641,7 @@ int LabSharpeningContext::runHost(RtStageBuffer* luminance, RtStageBuffer* a,
     copy_plane_in(*a, lab.a);
     copy_plane_in(*b, lab.b);
 
-    labSharpeningHostBlock(ipf_, params_, lab);
+    labSharpeningHostBlock(ipf_, params_, lab, ciecam_arm_);
 
     copy_plane_out(lab.L, *luminance);
     copy_plane_out(lab.a, *a);
