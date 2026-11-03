@@ -489,3 +489,35 @@ unset.
 | `OCL_ICD_VENDORS` = empty directory, `RT_REQUIRE_GPU=1` | FAIL, exit 1, "no OpenCL platform" and the host fallback; a missing device still cannot pass as a skip |
 | CPU build (`WITH_OPENCL=OFF`) and OpenCL build, 16 stage test executables plus `editorrequest-test` | both compile without warnings, 17 of 17 executables PASS in both trees (34 runs) |
 | kill switch, `--gpu=off` with `RT_STAGE_OPENCL=1`, resize profile | the stage profile records one `lanczos3` node with `impl=module`; no `impl=opencl` record |
+
+## Vendor containment
+
+The stage binaries load the ICD loader at runtime, so the OpenCL platform is
+chosen by `OCL_ICD_VENDORS` or, when it is unset, by the ambient
+`/etc/OpenCL/vendors` set. On a machine with a vendor ICD a faulty kernel
+therefore reaches the real GPU: an out-of-bounds access that POCL turns into a
+process crash becomes a `gfxhub` page fault, a ring timeout and a mode1 reset
+under the vendor driver, losing VRAM and the desktop session.
+
+That happened once, on 2026-11-02 at 22:00:52, when a `stage-residency`
+process ran without the override against `amdocl64` on `gfx1200`. Every
+device run now goes through `tools/opencl/pocl-run.sh`, which:
+
+- exports a pocl-only `OCL_ICD_VENDORS`, `POCL_DEVICES=cpu` and, when
+  unset, `OMP_NUM_THREADS=1`;
+- fails closed when the ICD directory holds a non-POCL entry or when
+  `clinfo -l` reports anything but one POCL platform;
+- masks `/dev/dri` with bubblewrap by default, so even a command that drops
+  the override cannot reach the vendor driver (`RT_POCL_CONTAIN=0` opts out).
+
+`tools/opencl/verify.sh` applies the same check to `OCL_ICD_VENDORS` and dies
+unless `RT_VERIFY_ALLOW_GPU=1` is set for a deliberate hardware run.
+
+Evidence, 2026-11-03:
+
+| Check | Result |
+|---|---|
+| `tools/opencl/pocl-env.sh --check` | `POCL only: Platform #0: Portable Computing Language` |
+| `tools/opencl/pocl-run.sh env -u OCL_ICD_VENDORS clinfo -l` | no platform; the `/dev/dri` mask blocks the vendor runtime |
+| `tools/opencl/verify.sh --list-coverage` without the override | exit 1, "refusing the ambient OpenCL vendors" |
+| `tools/opencl/pocl-run.sh ./stage-residency-test` with `RT_OPENCL_ALLOW_CPU=1 RT_REQUIRE_GPU=1` | PASS (1 skipped), 0 FAIL |

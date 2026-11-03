@@ -148,6 +148,14 @@ tools/opencl/verify.sh --list-coverage
 tools/perf/test-preview-base-cache.sh "$RT_BUILD_DIR"
 ```
 
+- Run every local device test through `tools/opencl/pocl-run.sh`, or source
+  `tools/opencl/pocl-env.sh` first. The test binaries load the ICD loader at
+  runtime, so a direct run uses the ambient vendor ICD; a kernel fault that
+  POCL reports as a process crash then resets the GPU, loses VRAM and takes
+  the desktop session with it. The wrapper selects POCL's CPU device, fails
+  closed when another platform is visible, and masks `/dev/dri` with
+  bubblewrap. `RT_VERIFY_ALLOW_GPU=1` is the only opt-in for a deliberate
+  hardware run.
 - Keep `RT_VERIFY_THREADS=1` for parity runs (see
   `devnotes/opencl/PARITY.md`).
 - `SKIP` is not `PASS`. On an OpenCL-enabled build with no selected device,
