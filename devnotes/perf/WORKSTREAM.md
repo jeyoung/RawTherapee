@@ -210,10 +210,13 @@ current tip.
   that `levwava`/`levwavb` clamp to, while L keeps seven, so no plane carries
   an extra round trip the host does not perform; the final tail reuses the
   pre-denoise statistics unless `cp.val`, `ref`, `contr` or `cp.diagcurv`
-  asks for a refresh (`679f5b4d8`). Twelve residuals (`quaMethod` agre, user
-  chromfi/chromco, balchrom, `Wavhuecurve`, `CBenab`, `sliMethod` cur,
-  Thrden, Ballum range, level range, all sliders zero and the 128-pixel
-  window) run the host builtin byte for byte. `labwavelet-denoise.pp3` records
+  asks for a refresh (`679f5b4d8`). Ten residuals (`quaMethod` agre,
+  balchrom, `Wavhuecurve`, `CBenab`, `sliMethod` cur, Thrden, Ballum range,
+  level range, all sliders zero and the 128-pixel window) run the host
+  builtin byte for byte. A user chroma strength is admitted and inert: the
+  forced arm's `variC` is dead at `local == 1` and `cp.chromco` never reaches
+  its `> 30` ramp test, so the host output is byte-identical with the sliders
+  zeroed. `labwavelet-denoise.pp3` records
   `impl=opencl` at 1 LSB16. Every comparison pins `OMP_NUM_THREADS=1`: the
   host's `noisevarlum` loop races under OpenMP and is not a deterministic
   reference. The denoise curves, the expert pairing and the BiShrink arms

@@ -91,7 +91,8 @@ pairs are exact. The gate is the peak absolute error (PAE) in normalised units;
 | 2026-11-02 | 66613d0a9..6db958afe | POCL (CPU) | 11-case denoise residual matrix (`quaMethod=agre`, user chromfi/chromco, balchrom, `Wavhuecurve`, `CBenab`, Thrden, Ballum range, level range, all sliders zero, sub-128 window), `stage-residency-test` | device vs host block | 0 (host) | PASS |
 | 2026-11-03 | `6bcd826f9..dca455499` | POCL (CPU) | colorspace_flowers.pef / `labwavelet-denoise-cur.pp3` (Expnoise, `sliMethod=cur`, `mixMethod=mix7`, non-identity `wavdenoise`), `lab.wavelet` | off vs auto, 16-bit TIFF | 1 LSB (AE=1, 21,068 of 30,419,712) | PASS |
 | 2026-11-03 | `6bcd826f9..dca455499` | POCL (CPU) | 10-case "cur" matrix (mixmet 0/1/2/3, identity curve, contrast, edge, final curves, odd 179x161, all panels), `stage-residency-test` | device vs host block | 0.043945 LSB16 (worst: final curves) | PASS |
-| 2026-11-03 | `6bcd826f9..dca455499` | POCL (CPU) | 4-case "cur" residual matrix (sigm above range, expert pairing, Thrden, user chromfi), `stage-residency-test` | device vs host block | 0 (host) | PASS |
+| 2026-11-03 | `6bcd826f9..dca455499` | POCL (CPU) | 3-case "cur" residual matrix (sigm above range, expert pairing, Thrden), `stage-residency-test` | device vs host block | 0 (host) | PASS |
+| 2026-11-03 | `43732fb51..8cef1c71b` | POCL (CPU) | 3-case user chroma matrix (`chromfi` 40, `chromco` 60, both 100), `stage-residency-test` | device vs host block | 0.011719 LSB16 (denoise pair) | PASS |
 | 2026-11-02 | 89e0a844b..47b9980fb | POCL (CPU) | colorspace_flowers.pef / `labtools-labcurve-contrast.pp3` (Lab curves with contrast 30, L/a/b/cc/lc/cl tables), `lab.tools` | off vs auto, 16-bit TIFF | 0 (exact) | PASS |
 | 2026-11-02 | 89e0a844b..47b9980fb | POCL (CPU) | 3-case Lab-contrast matrix (contrast 5, contrast 15 with L curve+brightness, contrast 30 with all six tables), `stage-residency-test` | device vs host block | 0 (exact) | PASS |
 | 2026-11-02 | uncommitted | POCL (CPU) | colorspace_flowers.pef / `labtools-labcurve-contrast.pp3` with `Gamutmunse=XYZ`, `lab.tools` | off vs auto, 16-bit TIFF | 0 (exact) | PASS |
@@ -401,9 +402,13 @@ peak absolute error is zero for the synthetic node tests:
   the host block with a worst peak error of 0.043945 LSB16; the sli/cur host
   comparison changes 86,454-114,237 samples per case, so the refinement is not
   vacuous. The identity-curve case runs the device denoise without the
-  refinement, as the block does. Four residual configurations (sigma above
-  its widget range, the expert level pairing, Thrden and a user chromfi)
-  run the host builtin byte for byte. `labwavelet-denoise-cur.pp3` is 1 LSB16
+  refinement, as the block does. Three residual configurations (sigma above
+  its widget range, the expert level pairing and Thrden) run the host builtin
+  byte for byte. A user chroma strength is admitted and provably inert for
+  this arm: the block's `variC` is dead at the forced `local == 1`, and
+  `cp.chromco` is 0.1 times a 0..100 slider, so its `> 30` ramp test is
+  unreachable. The three admitted cases are device-exact against the host and
+  the host output is byte-identical with the sliders zeroed. `labwavelet-denoise-cur.pp3` is 1 LSB16
   on the export TIFF (AE=1, 21,068 of 30,419,712 samples), records
   `impl=opencl`, and differs from the same profile with `sliMethod=sli` at
   30,064,859 of 30,419,712 samples (PAE 1600 LSB16), so the export exercises

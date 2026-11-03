@@ -276,9 +276,10 @@ transcendentals. The refinement is launched direction-major, level-minor and
 writes levels 0..3 on every level iteration, exactly as the block's repeated
 application. `cp.denmet` is hard-coded to four, so the only level factors are
 0.3 on levels 0 and 1 and one on levels 2 and 3. The `sli` Thrden arm, the
-expert pairing, the user chroma strength, noise balance, hue curve and
-colour-by-noise stay host residuals, as does an unknown `mixMethod` or a
-sigma outside its widget range. The pass order is forward analysis,
+expert pairing, noise balance, the hue curve and colour-by-noise stay host
+residuals, as does an unknown `mixMethod` or a sigma outside its widget
+range. A user chroma strength is admitted and inert: `variC` is dead at the
+forced `local == 1` and `cp.chromco` cannot reach its `> 30` ramp test. The pass order is forward analysis,
 statistics/mea, MAD/shrink L, the pre-denoise snapshot, denoise, the
 post-denoise statistics and curve refinement, contrast/edge/final, noise
 variance and chroma denoise, then the a/b planes and the deferred L
