@@ -502,6 +502,9 @@ inline constexpr double LAB_WAVELET_MAX_WAVELET_SIGM = 3.5;
  * index = 10 - ballum, so the widget's -2..10 range is also the table range. */
 inline constexpr double LAB_WAVELET_MIN_WAVELET_BALLUM = -2.0;
 inline constexpr double LAB_WAVELET_MAX_WAVELET_BALLUM = 10.0;
+/* The wavelet chroma-denoise sliders' widget range (0..100). */
+inline constexpr double LAB_WAVELET_MIN_CHROMA_STRENGTH = 0.0;
+inline constexpr double LAB_WAVELET_MAX_CHROMA_STRENGTH = 100.0;
 /* The 128-pixel gate ip_wavelet() applies before it enables denoise. */
 inline constexpr int LAB_WAVELET_MIN_DENOISE_WINDOW = 128;
 /* At least one level slider must exceed this before the block denoises. */

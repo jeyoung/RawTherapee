@@ -288,9 +288,18 @@ bool denoiseAdmitted(const procparams::WaveletParams& wavelet, int width,
     if (wavelet.quamethod != "cons") {
         return false;
     }
-    /* The chroma strength is the block's own forced 0.01, so no user chroma
-     * denoise, no balance and no colour-by-noise may alter it. */
-    if (wavelet.chromfi != 0.0 || wavelet.chromco != 0.0 ||
+    /*
+     * The user chroma strength is inert for this arm: the block's `variC` is
+     * dead at the forced `local == 1`, and only `cp.chromco`'s `> 30` test
+     * changes the chroma-magnitude ramp. Balance-chroma would move `variC`
+     * and colour-by-noise changes the source, so both stay refused.
+     */
+    if (!std::isfinite(wavelet.chromfi) ||
+        wavelet.chromfi < LAB_WAVELET_MIN_CHROMA_STRENGTH ||
+        wavelet.chromfi > LAB_WAVELET_MAX_CHROMA_STRENGTH ||
+        !std::isfinite(wavelet.chromco) ||
+        wavelet.chromco < LAB_WAVELET_MIN_CHROMA_STRENGTH ||
+        wavelet.chromco > LAB_WAVELET_MAX_CHROMA_STRENGTH ||
         wavelet.balchrom != 0.0 || wavelet.cbenab) {
         return false;
     }
