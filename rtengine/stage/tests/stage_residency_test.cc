@@ -4557,6 +4557,8 @@ struct LabToolsRun {
     bool supported = false;
     bool deviceReady = false;
     RtStageStatus status = RT_STAGE_INVALID;
+    /* The black-and-white flag the context exported to the launcher. */
+    uint32_t black_white = 0;
 };
 
 /*
@@ -4582,6 +4584,7 @@ LabToolsRun run_lab_tools_node(LabImage& image,
     RtLabToolsResult setup{};
     const bool deviceReady = result.supported && context.build(setup) == 0;
     result.deviceReady = deviceReady;
+    result.black_white = deviceReady ? setup.black_white : 0;
     RtLabToolsContext descriptor = context.descriptor(deviceReady);
 
     RtStageArg args[76] = {};
@@ -4805,6 +4808,15 @@ LabToolsRun run_lab_tools_node(LabImage& image,
     return result;
 }
 
+/* The block's diagonal curve point list: 0 -> 0, 0.5 -> mid, 1 -> 1. */
+std::vector<double> lab_curve_points(double mid)
+{
+    return {static_cast<double>(DCT_Spline),
+            0.0, 0.0,
+            0.5, mid,
+            1.0, 1.0};
+}
+
 /*
  * The lab.tools node against the production block.
  *
@@ -4999,16 +5011,19 @@ void test_lab_tools(bool available)
 
     /*
      * Black and white: chromiLuminanceCurve()'s early return zeroes a and b
-     * when the Lab curves and colour toning are off. The node repeats it in
-     * the Lab-curve pass's slot, so the other admitted tools still run in
-     * their own positions and see the grey image. The zeroing is exact, so a
+     * when the Lab curves are off (`bwonly`). The node repeats it in the
+     * Lab-curve pass's slot, so the other admitted tools still run in their
+     * own positions and see the grey image. The zeroing is exact, so a
      * B&W-only profile must leave L bit-identical to the block.
      *
      * Black and white with colour toning takes neither the early return nor
-     * the cheap zeroing, so those profiles are refusals: the builtin runs the
-     * block and the result must match it exactly. Black and white with the Lab
-     * curves on is the full `bwToning` arm and is covered by the Lab-curve
-     * matrix below.
+     * the full arm: the block's `bwonly` is false, so `bwToning` is false and
+     * the Lab pass does exactly the work it does with black-and-white off.
+     * rgbProc() has already produced the black-and-white image and applied
+     * the toning, so the node is admitted with the flag at 0 and must keep
+     * the chroma LabGrid/regions write. Black and white with the Lab curves
+     * on and no colour toning is the full `bwToning` arm, covered by the
+     * Lab-curve matrix below.
      */
     struct BwCase {
         const char* label;
@@ -5017,22 +5032,40 @@ void test_lab_tools(bool available)
         bool localContrast;
         bool vibrance;
         bool regions;
+        bool labCurve;
+        const char* toningMethod;
+        bool bwToningControls;
         bool admitted;
     };
     const BwCase bw_cases[] = {
-        {"black and white only", false, false, false, false, false, true},
+        {"black and white only", false, false, false, false, false, false,
+         nullptr, false, true},
         {"black and white + shadows/highlights", false, true, false, false,
-         false, true},
+         false, false, nullptr, false, true},
         {"black and white + local contrast", false, false, true, false, false,
-         true},
-        {"black and white + vibrance", false, false, false, true, false, true},
+         false, nullptr, false, true},
+        {"black and white + vibrance", false, false, false, true, false, false,
+         nullptr, false, true},
         {"black and white + shadows/highlights + local contrast + vibrance",
-         false, true, true, true, false, true},
-        {"black and white + LabGrid", true, false, false, false, false, false},
+         false, true, true, true, false, false, nullptr, false, true},
+        {"black and white + LabGrid", true, false, false, false, false, false,
+         nullptr, false, true},
+        {"black and white + LabGrid + Lab curves", true, false, false, false,
+         false, true, nullptr, false, true},
+        {"black and white + LabGrid + shadows/highlights + vibrance", true,
+         true, false, true, false, false, nullptr, false, true},
+        {"black and white + Splitco", false, true, false, false, false, false,
+         "Splitco", false, true},
+        {"black and white + Splitlr + Lab curves", false, true, false, false,
+         true, true, "Splitlr", false, true},
+        {"black and white + B&W toning controls", false, true, false, false,
+         false, false, nullptr, true, true},
+        {"black and white + LabGrid + B&W toning controls", true, true, false,
+         false, false, false, nullptr, true, true},
         {"black and white + Lab regions", false, false, false, false, true,
-         false},
+         false, nullptr, false, true},
         {"black and white + LabGrid + Lab regions", true, false, false, false,
-         true, false},
+         true, false, nullptr, true, true},
     };
 
     const auto bw_params = [](const BwCase& item, bool enabled) {
@@ -5045,6 +5078,37 @@ void test_lab_tools(bool available)
             params.colorToning.labgridAHigh = 25.0;
             params.colorToning.labgridBLow = 12.0;
             params.colorToning.labgridBHigh = 55.0;
+        }
+        if (item.toningMethod != nullptr) {
+            params.colorToning.enabled = true;
+            params.colorToning.method = item.toningMethod;
+            params.colorToning.strength = 60;
+            params.colorToning.balance = 20;
+        }
+        if (item.bwToningControls) {
+            /* rgbProc()'s B&W output controls: the mixer weights, the
+             * before/after tone curves and the gamma TRC. The Lab block reads
+             * none of them, so the node's work must not change. */
+            params.blackwhite.method = "ChannelMixer";
+            params.blackwhite.mixerRed = 50;
+            params.blackwhite.mixerGreen = 30;
+            params.blackwhite.mixerBlue = 20;
+            params.blackwhite.gammaRed = 10;
+            params.blackwhite.gammaGreen = 5;
+            params.blackwhite.gammaBlue = 0;
+            params.blackwhite.beforeCurveMode =
+                rtengine::procparams::BlackWhiteParams::TcMode::STD_BW;
+            params.blackwhite.afterCurveMode =
+                rtengine::procparams::BlackWhiteParams::TcMode::
+                    WEIGHTEDSTD_BW;
+            params.blackwhite.beforeCurve = lab_curve_points(0.45);
+            params.blackwhite.afterCurve = lab_curve_points(0.55);
+        }
+        if (item.labCurve) {
+            params.labCurve.enabled = true;
+            params.labCurve.lcurve = lab_curve_points(0.55);
+            params.labCurve.acurve = lab_curve_points(0.6);
+            params.labCurve.bcurve = lab_curve_points(0.4);
         }
         if (item.shadowsHighlights) {
             params.sh.enabled = true;
@@ -5146,17 +5210,9 @@ void test_lab_tools(bool available)
         check(profile.find("\"stage\":\"lab.tools\"") != std::string::npos,
               (std::string("lab.tools ") + item.label +
                " records the node").c_str());
-        if (item.admitted) {
-            check(profile.find("\"impl\":\"opencl\"") != std::string::npos,
-                  (std::string("lab.tools ") + item.label +
-                   " records a device execution").c_str());
-        } else {
-            check(profile.find("\"impl\":\"host\"") != std::string::npos &&
-                      profile.find("\"impl\":\"opencl\"") ==
-                          std::string::npos,
-                  (std::string("lab.tools ") + item.label +
-                   " records a host execution only").c_str());
-        }
+        check(profile.find("\"impl\":\"opencl\"") != std::string::npos,
+              (std::string("lab.tools ") + item.label +
+               " records a device execution").c_str());
 
         const Diff diff = compare(view(device), view(cpu));
         std::printf("stage-residency: lab.tools %s %dx%d: PAE %.6f LSB16, "
@@ -5166,15 +5222,24 @@ void test_lab_tools(bool available)
         check(diff.finite,
               (std::string("lab.tools ") + item.label +
                " stays finite").c_str());
-        if (item.admitted) {
-            check(diff.max_abs <= 1.0,
-                  (std::string("lab.tools ") + item.label +
-                   " is within one LSB16").c_str());
-        } else {
-            check(diff.differing == 0 && diff.max_abs == 0.0,
-                  (std::string("lab.tools ") + item.label +
-                   " matches the CPU block exactly").c_str());
-        }
+        check(diff.max_abs <= 1.0,
+              (std::string("lab.tools ") + item.label +
+               " is within one LSB16").c_str());
+
+        /*
+         * The exported flag is the block's `bwonly`. Colour toning makes it
+         * zero, so the device skips both black-and-white arms exactly as the
+         * host does. Had it stayed at `blackwhite.enabled`, the device would
+         * zero a and b and the one-LSB check above would fail by the whole
+         * chroma the toning writes.
+         */
+        const bool toning =
+            item.labgrid || item.regions || item.toningMethod != nullptr;
+        check(result.black_white == (toning ? 0u : 1u),
+              (std::string("lab.tools ") + item.label +
+               (toning ? " exports a zero black-and-white flag"
+                       : " exports the black-and-white flag"))
+                  .c_str());
 
         const double host_chroma = chroma_max(cpu);
         const double device_chroma = chroma_max(device);
@@ -5190,6 +5255,17 @@ void test_lab_tools(bool available)
                         "reintroduces chroma (max %.6f); the device chroma "
                         "is %.6f\n",
                         item.label, host_chroma, device_chroma);
+        }
+        if (toning) {
+            /*
+             * Non-vacuity against the old refusal's zeroing: the toning must
+             * still write chroma on both sides, so a result that greyed the
+             * image cannot pass.
+             */
+            check(host_chroma > 0.0 && device_chroma > 0.0,
+                  (std::string("lab.tools ") + item.label +
+                   " keeps the colour-toning chroma")
+                      .c_str());
         }
 
         if (std::strcmp(item.label, "black and white only") == 0) {
@@ -5224,6 +5300,77 @@ void test_lab_tools(bool available)
             check(diff_colour.differing > 0,
                   "lab.tools black and white changes the combined result");
         }
+
+        /*
+         * Black and white with colour toning, seen from the block: the
+         * host's `bwonly` is false either way, so switching the black-and-
+         * white tool off must leave the node's output bit-identical. That is
+         * the encoded host behaviour, and it separates this node from
+         * rgbProc(), which owns the black-and-white image.
+         */
+        if (std::strcmp(item.label,
+                        "black and white + LabGrid + shadows/highlights + "
+                        "vibrance") == 0) {
+            const rtengine::procparams::ProcParams bw_off = bw_params(item, false);
+            rtengine::ImProcFunctions bw_off_ipf(&bw_off, false);
+            LabToolsHostState bw_off_host;
+            LabImage bw_off_image(179, 48);
+            bw_off_image.CopyFrom(&source);
+            const LabToolsRun bw_off_result =
+                run_lab_tools_node(bw_off_image, bw_off, bw_off_host,
+                                   bw_off_ipf, profile_path);
+            const std::string bw_off_profile = read_file(profile_path);
+            check(bw_off_result.status == RT_STAGE_OK &&
+                      bw_off_result.black_white == 0 &&
+                      bw_off_profile.find("\"impl\":\"opencl\"") !=
+                          std::string::npos,
+                  "lab.tools black and white off exports a zero flag on the "
+                  "device");
+            const Diff diff_bw_off =
+                compare(view(bw_off_image), view(device));
+            std::printf("stage-residency: lab.tools black and white off "
+                        "under colour toning: PAE %.6f LSB16, %zu of %zu "
+                        "samples differ from the black-and-white result\n",
+                        diff_bw_off.max_abs, diff_bw_off.differing,
+                        diff_bw_off.samples);
+            check(diff_bw_off.differing == 0 && diff_bw_off.max_abs == 0.0,
+                  "lab.tools black and white does not change the Lab block "
+                  "under colour toning");
+        }
+
+        /*
+         * Non-vacuity against colour toning off: the same profile without the
+         * toning must change the result, so the admitted combination cannot be
+         * a no-op that merely passes the flag check.
+         */
+        if (std::strcmp(item.label,
+                        "black and white + LabGrid + shadows/highlights + "
+                        "vibrance") == 0) {
+            rtengine::procparams::ProcParams toning_off = params;
+            toning_off.colorToning.enabled = false;
+            rtengine::ImProcFunctions toning_off_ipf(&toning_off, false);
+            LabToolsHostState toning_off_host;
+            LabImage toning_off_image(179, 48);
+            toning_off_image.CopyFrom(&source);
+            const LabToolsRun toning_off_result =
+                run_lab_tools_node(toning_off_image, toning_off,
+                                   toning_off_host, toning_off_ipf,
+                                   profile_path);
+            check(toning_off_result.status == RT_STAGE_OK &&
+                      toning_off_result.black_white == 1,
+                  "lab.tools colour toning off restores the "
+                  "black-and-white flag");
+            const Diff diff_toning_off =
+                compare(view(device), view(toning_off_image));
+            std::printf("stage-residency: lab.tools colour toning off under "
+                        "black and white: PAE %.6f LSB16, %zu of %zu samples "
+                        "differ from the toned result\n",
+                        diff_toning_off.max_abs, diff_toning_off.differing,
+                        diff_toning_off.samples);
+            check(diff_toning_off.differing > 0,
+                  "lab.tools colour toning changes the black-and-white "
+                  "result");
+        }
     }
 
     /*
@@ -5234,8 +5381,7 @@ void test_lab_tools(bool available)
     const char* residual_labels[] = {
         "vibrance + local contrast out of range",
         "vibrance + EPD", "vibrance + Lab regions show mask",
-        "black and white + colour toning", "vibrance no-op",
-        "vibrance pastels out of range"};
+        "vibrance no-op", "vibrance pastels out of range"};
     for (const char* label : residual_labels) {
         rtengine::procparams::ProcParams params;
         params.sh.enabled = true;
@@ -5282,10 +5428,6 @@ void test_lab_tools(bool available)
             region.channel = rtengine::procparams::ColorToningParams::
                 LabCorrectionRegion::CHAN_ALL;
             params.colorToning.labregions.push_back(region);
-        } else if (std::strcmp(label, "black and white + colour toning") == 0) {
-            params.blackwhite.enabled = true;
-            params.colorToning.enabled = true;
-            params.colorToning.method = "LabGrid";
         } else {
             check(false, label);
         }
@@ -6027,15 +6169,6 @@ void fill_lab_curve_saturated(LabImage& lab)
     }
 }
 
-/* The block's diagonal curve point list: 0 -> 0, 0.5 -> mid, 1 -> 1. */
-std::vector<double> lab_curve_points(double mid)
-{
-    return {static_cast<double>(DCT_Spline),
-            0.0, 0.0,
-            0.5, mid,
-            1.0, 1.0};
-}
-
 struct LabCurveCase {
     const char* label;
     int width;
@@ -6402,8 +6535,7 @@ void test_lab_tools_lab_curve(bool available)
      * Residuals: every other Lab-curve family or setting must be refused and
      * must run the block on the host byte for byte.
      */
-    const char* residual_labels[] = {
-        "black and white with colour toning", "dense hue curve"};
+    const char* residual_labels[] = {"dense hue curve"};
     for (const char* label : residual_labels) {
         rtengine::procparams::ProcParams params;
         params.labCurve.enabled = true;
@@ -6439,12 +6571,6 @@ void test_lab_tools_lab_curve(bool available)
                 dense.push_back(0.0);
             }
             params.labCurve.chcurve = dense;
-        } else {
-            /* black and white with colour toning: the host's `bwonly` is
-             * false, so neither black-and-white arm runs. */
-            params.blackwhite.enabled = true;
-            params.colorToning.enabled = true;
-            params.colorToning.method = "LabGrid";
         }
 
         check(!labToolsSupported(params),

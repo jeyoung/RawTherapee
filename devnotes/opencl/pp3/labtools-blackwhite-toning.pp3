@@ -1,0 +1,61 @@
+# Black and white together with colour toning. The host's `bwonly` is
+# `blackwhite.enabled && !colorToning.enabled`, so this profile takes neither
+# of chromiLuminanceCurve()'s black-and-white arms: rgbProc() builds the
+# black-and-white image and applies the Lab-grid toning in the Lab block.
+# The B&W output controls and the Lab curves make the black-and-white path
+# observable end to end.
+[Black & White]
+Enabled=true
+Method=ChannelMixer
+MixerRed=50
+MixerGreen=30
+MixerBlue=20
+GammaRed=10
+GammaGreen=5
+GammaBlue=0
+BeforeCurveMode=Standard
+AfterCurveMode=WeightedStd
+BeforeCurve=1;0;0;0.5;0.45;1;1;
+AfterCurve=1;0;0;0.5;0.55;1;1;
+
+[ColorToning]
+Enabled=true
+Method=LabGrid
+LabGridALow=-40
+LabGridAHigh=25
+LabGridBLow=12
+LabGridBHigh=55
+
+[Luminance Curve]
+Enabled=true
+Brightness=0
+Contrast=0
+Chromaticity=0
+LCurve=1;0;0;0.5;0.55;1;1;
+aCurve=1;0;0;0.5;0.6;1;1;
+bCurve=1;0;0;0.5;0.4;1;1;
+ccCurve=0;
+chCurve=0;
+lhCurve=0;
+hhCurve=0;
+LcCurve=0;
+ClCurve=0;
+
+[Shadows & Highlights]
+Enabled=true
+Highlights=50
+HighlightTonalWidth=50
+Shadows=50
+ShadowTonalWidth=50
+Radius=40
+Lab=true
+
+[Vibrance]
+Enabled=true
+Pastels=40
+Saturated=25
+PSThreshold=0;75;
+ProtectSkins=false
+AvoidColorShift=false
+PastSatTog=false
+SkinTonesCurve=0;
