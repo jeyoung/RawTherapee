@@ -367,6 +367,25 @@ pixel curve in both the denoise and the plain branch, exactly at the end of
 `softradend`, remain host residuals, and a `softradend` without `Expfinal`
 is refused.
 
+The balance-chroma arm (`BAmethod` `sli` or `cur`) runs in two places,
+matching `ContAllL()` and `ContAllAB()`. The L arm runs at the end of the
+contrast pass, gated by `Expfinal` (`cp.finena`), and rebuilds the block's
+`sigmadir` beta ramp from its own `calceffect()` mea block; the a/b arm runs
+after the toning multiply, gated by `TMr` (`cp.diag`), and multiplies by the
+raw `kba` with no ramp. `sli` uses the luminance-dependent 600/300 divisor,
+with the 4970/-4970 ramps outside 20..80; `cur` reads the non-identity
+`opacityCurveW` through the block's 501-entry `LUTf` at `6 * LL100`. Both
+repeat the multiply by the block's per-level iteration count (`Iter` -3..3,
+`med = maxlvl / 2`). The L coefficient pass also forces `cp.mul[0]` to 0.01,
+which the host table carries. The arm carries one tail:
+`[active][BAmet][balan][ite]`, one `calceffect()` mea block per L level for
+`sigmadir`, then the 501 opacity samples. The device uses one level count for
+both planes, so admission refuses a `TMr`-only profile whose L trim would
+shorten L below the a/b count. The coefficient curve now evaluates
+`xlogf()`/`xexpf()`, so the reconstructed L the a/b arm reads matches the host
+exactly; without that port the `sli` divisor amplified the sub-LSB L
+difference to several LSB16.
+
 It is admitted only on a CPU
 OpenCL device, and the wavelet pass also needs fp64. `CHmethod` `without` and
 `with` (the curve and saturation arms), `Expchroma` with a contrast panel that
@@ -379,7 +398,9 @@ closed CIE-CAM gate, an image too narrow or too small for its pyramid or Haar
 bands, a GPU or non-fp64 device and nothing enabled at all are residuals:
 each runs the `lab.wavelet` host builtin and records `impl=host`, never a
 device pass. The blur and residual panels are refused before any upload, as
-are the balance-chroma arm (`TMr` with a `BAmethod` other than `none`), the
+are an unknown `BAmethod`, `TMr` without a method, a `BAmethod` whose sliders
+are out of range, `cur` without an opacity curve, the `TMr`-only profile whose
+L trim differs from the a/b count, the
 unported edge and denoise sub-arms, and a non-zero `softradend` combined with
 the clarity arm or the clarity soft radius, so a profile that enables any of
 them runs the whole block on the host.
@@ -410,7 +431,7 @@ panes records them separately. Both tools are off by default.
 | `rgb.proc` | Full/Full/Roi/Reduced | path | reuse-input | RGB curves, tone curve, colour toning, B&W, channel mixer, HSV, film simulation | yes |
 | `lab.tools` | Full/Full/Roi/Reduced | path | reuse-input | shadows/highlights, vibrance, Lab curves (including non-zero contrast, the chromaticity slider, the C=f(H)/L=f(H)/H=f(H) hue flat curves and the NONE/LAB/XYZ/XYZREL/MUN gamut methods), local contrast, black-and-white (cheap and `bwToning` arms), EPD, Lab-grid colour toning and Lab colour-correction regions | partial |
 | `lab.sharpening` | Full/-/Roi/- | path | reuse-input | impulse denoise and defringe (own node), ML sharpen edges, ML microcontrast and the main sharpen pass (shared `output.sharpen` node) | partial |
-| `lab.wavelet` | Full/Full/Roi/Reduced | path | reuse-input | directional pyramid equaliser and wavelet contrast, standard denoise (L and the forced chroma arm), chroma `link`, edge plain arm, final curves, the toning zero-protection arm, CLmethod's level selection and the clarity two-pass merge | partial |
+| `lab.wavelet` | Full/Full/Roi/Reduced | path | reuse-input | directional pyramid equaliser and wavelet contrast, standard denoise (L and the forced chroma arm), chroma `link`, edge plain arm, final curves, balance-chroma `sli`/`cur`, the toning zero-protection arm, CLmethod's level selection and the clarity two-pass merge | partial |
 | `working.trc` | Full/Full/Roi/- | path | reuse-input | soft light, tone equaliser and working-TRC conversion | partial |
 | `ciecam` | Full/Full/Roi/- | path | reuse-input | CIE CAM 02 | no |
 | `gamut` | Full/Full/Roi/Reduced | path | reuse-input | working-space gamut compression | yes |

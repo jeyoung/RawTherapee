@@ -105,6 +105,9 @@ pairs are exact. The gate is the peak absolute error (PAE) in normalised units;
 | 2026-11-03 | `7fc43d8a3..uncommitted` | POCL (CPU) | colorspace_flowers.pef / `labwavelet-denoise-expert.pp3` (Expnoise, `complexMethod=expert`, `sliMethod=cur`, `mixMethod=mix7`, non-identity `wavdenoise`, `Levelsigm=0.7;1.6`, `Leveldenoise=5;4`, `Limden=0.4`), `lab.wavelet` | off vs auto, 16-bit TIFF | 1 LSB (AE=1, 15,637 of 30,419,712) | PASS |
 | 2026-11-03 | `7fc43d8a3..uncommitted` | POCL (CPU) | 8-case expert-pairing matrix (`sliMethod` cur and sli+Thrden, `Levelsigm` 1/1, 3/3, 3/0.05, 0.05/3, 2.5/1.5, 0.05/0.05, 1.5/0.75, `Limden` 0, 0.5, 0.75 and 1, contrast, edge, final curves, odd 179x161), `stage-residency-test` | device vs host block | 0.158691 LSB16 (worst: odd all panels) | PASS |
 | 2026-11-03 | `7fc43d8a3..uncommitted` | POCL (CPU) | 4-case expert refusal matrix (`Levelsigm` top and bottom out of range, `Limden` above range, non-identity `Wavdenoiseh`), `stage-residency-test` | device vs host block | 0 (host) | PASS |
+| 2026-11-03 | `b3fed699f..uncommitted` | POCL (CPU) | colorspace_flowers.pef / `labwavelet-ba-sli.pp3` (`Expfinal`, `BAmethod=sli`, `TMr`, `Balance=60`, `Iter=1`, `Sigmadir=1.2`) and `labwavelet-ba-cur.pp3` (`BAmethod=cur`, non-identity `opacityCurveW`, `Balance=-20`, `Iter=-2`), `lab.wavelet` | off vs auto, 16-bit TIFF | 0 (AE=0, PAE=0, both) | PASS |
+| 2026-11-03 | `b3fed699f..uncommitted` | POCL (CPU) | 10-case balance-chroma matrix (both methods, `Expfinal` on/off, `TMr` on/off, `Iter` -3/3, `Sigmadir` 0.4/2.5, `Balance` -30/100, final curves with/without, `TMr`+chroma, `TMr`+contrast, denoise and the combined set), `stage-residency-test` | device vs host block | 0.052734 LSB16 (worst: `cur`+`TMr`+contrast; the rest exact or <=0.04) | PASS |
+| 2026-11-03 | `b3fed699f..uncommitted` | POCL (CPU) | 11-case balance-chroma refusal matrix (unknown method, `cur` without a curve, `Balance`/`Iter`/`Sigmadir` out of range, no gate, `TMr` without a method, `TMr`-only dead trim), `stage-residency-test` | device vs host block | 0 (host) | PASS |
 | 2026-11-02 | 89e0a844b..47b9980fb | POCL (CPU) | colorspace_flowers.pef / `labtools-labcurve-contrast.pp3` (Lab curves with contrast 30, L/a/b/cc/lc/cl tables), `lab.tools` | off vs auto, 16-bit TIFF | 0 (exact) | PASS |
 | 2026-11-02 | 89e0a844b..47b9980fb | POCL (CPU) | 3-case Lab-contrast matrix (contrast 5, contrast 15 with L curve+brightness, contrast 30 with all six tables), `stage-residency-test` | device vs host block | 0 (exact) | PASS |
 | 2026-11-02 | uncommitted | POCL (CPU) | colorspace_flowers.pef / `labtools-labcurve-contrast.pp3` with `Gamutmunse=XYZ`, `lab.tools` | off vs auto, 16-bit TIFF | 0 (exact) | PASS |
@@ -372,10 +375,35 @@ peak absolute error is zero for the synthetic node tests:
   7 levels, inert balance controls) match the host block with a worst peak
   error of 0.015625 LSB16; the panel-off comparison changes 15,232-76,640
   samples in the twelve checked cases, so the parity is not vacuous.
-  Thirteen residual configurations (softrad, `BAmethod` sli, `tmr`,
-  `expclari`, sigmafin below/above its slider range, avoid, median, expbl,
-  expresid, expnoise, CLmethod one and skin protection) run the host builtin
-  byte for byte. `labwavelet-final.pp3` is 1 LSB16 on the export TIFF.
+  Thirteen residual configurations (softrad, `BAmethod` cur without an
+  opacity curve, `tmr`, `expclari`, sigmafin below/above its slider range,
+  avoid, median, expbl, expresid, expnoise, CLmethod one and skin
+  protection) run the host builtin byte for byte. The coefficient curve now
+  evaluates `xlogf()`/`xexpf()` instead of `log()`/`exp()`, which matches the
+  host's reconstructed L exactly and keeps the balance-chroma a/b arm, which
+  reads that L, within one LSB16. `labwavelet-final.pp3` is exact on the
+  export TIFF.
+- The `lab.wavelet` balance-chroma arm reproduces `ContAllL()`/
+  `ContAllAB()`'s BA multiply. The L arm runs inside the final panel's
+  coefficient pass (`Expfinal`) and rebuilds the `sigmadir` beta ramp from
+  its own `calceffect()` mea block; the a/b arm runs with `TMr` and
+  multiplies by the raw `kba`. `BAmethod = sli` uses the block's
+  luminance-dependent 600/300 divisor (the 4970/-4970 ramps outside 20..80)
+  and `cur` reads the non-identity `opacityCurveW` through the 501-entry
+  LUT; both repeat the multiply by the per-level iteration count (`Iter`
+  -3..3). Ten device cases (both methods, `Iter` -3/3, `Sigmadir` 0.4..2.5,
+  `Balance` -30..100, with and without the final curves, with and without
+  `Expfinal`, `TMr` alone with chroma, contrast and denoise, and the
+  combined set) match the host block with a worst peak error of 0.052734
+  LSB16; most cases are exact. Each differs from the same profile with
+  `BAmethod = none` by 14,156-114,169 samples (PAE 19,137-98,604 LSB16), so
+  the arm is not vacuous. Eleven configurations (an unknown method, `cur`
+  without an opacity curve, `Balance` outside -30..100, `Iter` outside
+  -3..3, `Sigmadir` outside 0.025..2.5, neither gate, `TMr` without a
+  method and the `TMr`-only profile whose L trim differs from the a/b
+  count) run the host builtin byte for byte. `labwavelet-ba-sli.pp3` and
+  `labwavelet-ba-cur.pp3` record `impl=opencl` and are pixel-exact (AE=0) on
+  the export TIFF.
 - The `lab.wavelet` toning panel's zero-protection arm reproduces
   `ContAllAB()`'s opacity-curve multiply on the a/b bands: the nine
   `mulopaRG`/`mulopaBY` samples are built on the host, the per-level

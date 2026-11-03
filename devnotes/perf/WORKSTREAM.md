@@ -856,7 +856,8 @@ with 12 cases, worst 0.011719 LSB16, and 10 residuals at PAE 0, the
 standard denoise L arm plus its forced chroma arm with 17 cases, worst
 0.015625 LSB16, and 12 residuals at PAE 0, and CLmethod's selection plus
 the clarity arm with 20 cases, exact except the denoise pair at
-0.015625 LSB16, and 8 residuals at PAE 0),
+0.015625 LSB16, and 8 residuals at PAE 0, balance chroma with 10 cases,
+worst 0.052734 LSB16, and 11 residuals at PAE 0),
 then `local.adjustments` exposure/retinex/CIE, then the common mask
 once the wavelet panels land. EPD stays a permanent residual.
 
@@ -906,6 +907,13 @@ residuals. The final curves and the toning zero-protection arm landed with the
 units above. The edge panel's plain arm is landed; its median/Lipschitz
 detection (`calckoe`), `NPMethod` low/high smoothing, `Lipst`, and the dead
 `EDmethod` `SL` threshold adjuster stay residuals, so do not reopen them
-without porting the detector. The balance-chroma arm (`TMr` + `BAmethod`) is
-refused fail-closed, so do not reopen it without porting `ContAllAB`'s BA arm.
-Keep `OMP_NUM_THREADS=1` in every comparison.
+without porting the detector. The balance-chroma arm (`BAmethod` `sli`/`cur`,
+`TMr` for the a/b pass and `Expfinal` for the L pass) landed with this unit:
+the L arm rebuilds the `sigmadir` beta ramp, the a/b arm multiplies by the
+raw `kba`, and the `sli` and `cur` variants both run. The coefficient curve
+now uses `xlogf()`/`xexpf()` so the reconstructed L the a/b arm reads matches
+the host; without that, the `sli` divisor amplified the sub-LSB L difference.
+Ten device cases are within 0.052734 LSB16 (most exact), eleven refusals run
+the host byte for byte, and both `labwavelet-ba-sli.pp3` and
+`labwavelet-ba-cur.pp3` export pixel-exact with `impl=opencl`. Keep
+`OMP_NUM_THREADS=1` in every comparison.
