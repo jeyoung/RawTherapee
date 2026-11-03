@@ -1082,6 +1082,91 @@ inline float rt_lw_curve501(__global const float* table, float index)
     return low + (table[base + 1] - low) * fraction;
 }
 
+/*
+ * rtengine/sleef.h's xlogf()/xexpf()/pow_F() as the denoise-curve refinement
+ * uses them. The host substitutes these approximations for log()/exp(); a
+ * one-ulp difference in the curve abscissa can move the refinement factor,
+ * so the refinement reproduces the polynomials rather than substituting the
+ * platform's log()/exp(). `mlaf(x, y, z)` in the host is a plain multiply-add
+ * with both roundings, which is what the expressions below do.
+ */
+inline int rt_lw_ilogbp1(float d)
+{
+    const int m = d < 5.421010862427522E-20f;
+    d = m ? 1.8446744073709552E19f * d : d;
+    int q = (as_int(d) >> 23) & 0xff;
+    q = m ? q - (64 + 0x7e) : q - 0x7e;
+    return q;
+}
+
+inline float rt_lw_ldexpk(float x, int q)
+{
+    int m = q >> 31;
+    m = (((m + q) >> 6) - m) << 4;
+    q = q - (m << 2);
+    float u = as_float((m + 0x7f) << 23);
+    u = u * u;
+    x = x * u;
+    x = x * u;
+    u = as_float((q + 0x7f) << 23);
+    return x * u;
+}
+
+inline float rt_lw_xlogf(float d)
+{
+    const int e = rt_lw_ilogbp1(d * 0.7071f);
+    const float m = rt_lw_ldexpk(d, -e);
+    float x = (m - 1.0f) / (m + 1.0f);
+    const float x2 = x * x;
+
+    float t = 0.2371599674224853515625f;
+    t = t * x2 + 0.285279005765914916992188f;
+    t = t * x2 + 0.400005519390106201171875f;
+    t = t * x2 + 0.666666567325592041015625f;
+    t = t * x2 + 2.0f;
+
+    x = x * t + 0.693147180559945286226764f * (float)e;
+
+    if (d == INFINITY) {
+        x = INFINITY;
+    }
+    if (d < 0.0f) {
+        x = NAN;
+    }
+    if (d == 0.0f) {
+        x = -INFINITY;
+    }
+    return x;
+}
+
+inline float rt_lw_xexpf(float d)
+{
+    if (d <= -104.0f) {
+        return 0.0f;
+    }
+
+    /* xrintf() rounds the double product to float first, then to int. */
+    const int q = convert_int_rte(
+        (float)((double)d * 1.442695040888963407359924681001892137426645954152985934135449406931));
+    const float qf = (float)q;
+    float s = qf * (-0.693145751953125f) + d;
+    s = qf * (-1.428606765330187045e-06f) + s;
+
+    float u = 0.00136324646882712841033936f;
+    u = u * s + 0.00836596917361021041870117f;
+    u = u * s + 0.0416710823774337768554688f;
+    u = u * s + 0.166665524244308471679688f;
+    u = u * s + 0.499999850988388061523438f;
+
+    u = s * (s * u + 1.0f) + 1.0f;
+    return rt_lw_ldexpk(u, q);
+}
+
+inline float rt_lw_pow(float a, float b)
+{
+    return rt_lw_xexpf(b * rt_lw_xlogf(a));
+}
+
 __kernel void rt_lab_wavelet_w_edge(
     __global float* band1, int p1,
     __global float* band2, int p2,
@@ -1454,6 +1539,10 @@ __kernel void rt_lab_wavelet_w_toning(
 /* Mirrors RT_LAB_WAVELET_DENOISE_HEADER and the histogram's bin count. */
 #define RT_LW_W_DENOISE_HEADER 7
 #define RT_LW_W_MAD_BINS 32768
+#define RT_LW_W_REFINE_LEVELS 4
+#define RT_LW_W_REFINE_SCALARS 11
+#define RT_LW_W_REFINE_HEADER 1
+#define RT_LW_W_REFINE_LUT 501
 
 /*
  * ImProcFunctions::Mad()'s histogram, one work item per (level, direction)
@@ -1616,6 +1705,101 @@ __kernel void rt_lab_wavelet_w_shrink_apply(
     const float sf = sfave[y * sfave_pitch + x];
     const float sfd = sfaved[y * sfaved_pitch + x];
     band[at] *= (sfd * sfd + sf * sf) / (sfd + sf + 0.01f);
+}
+
+/* A band snapshot: the "cur" refinement keeps the pre-denoise L set. */
+__kernel void rt_lab_wavelet_w_copy(
+    __global const float* src, int src_pitch,
+    __global float* dst, int dst_pitch,
+    int w, int h)
+{
+    const int x = get_global_id(0);
+    const int y = get_global_id(1);
+    if (x >= w || y >= h) {
+        return;
+    }
+    dst[y * dst_pitch + x] = src[y * src_pitch + x];
+}
+
+/*
+ * ip_wavelet()'s denoise-curve refinement for one (direction, level). The
+ * host launches it direction-major, level-minor, and the block writes levels
+ * 0..3 on every level iteration, so the four post bands are both read and
+ * written and the current level's values are the ones this iteration reads.
+ * `cur`/`cur_pre` are the current level's post/pre bands. The per-level
+ * scalars and the 501-entry wavdenoise LUT live in the refine tail.
+ */
+__kernel void rt_lab_wavelet_w_refine(
+    __global const float* cur, int cur_pitch,
+    __global const float* cur_pre, int cur_pre_pitch,
+    __global float* post0, int p0,
+    __global float* post1, int p1,
+    __global float* post2, int p2,
+    __global float* post3, int p3,
+    __global const float* pre0, int q0,
+    __global const float* pre1, int q1,
+    __global const float* pre2, int q2,
+    __global const float* pre3, int q3,
+    __global const float* params, int offset,
+    int level, int w, int h)
+{
+    const int x = get_global_id(0);
+    const int y = get_global_id(1);
+    if (x >= w || y >= h) {
+        return;
+    }
+
+    __global const float* entry =
+        params + offset + RT_LW_W_REFINE_HEADER +
+        level * RT_LW_W_REFINE_SCALARS;
+    if (entry[0] == 0.0f) {
+        return;
+    }
+    const float weight = entry[1];
+    const float logmax = entry[2];
+    const float rap = entry[3];
+    const float asig = entry[4];
+    const float bsig = entry[5];
+    const float amean = entry[6];
+    const float k = entry[7];
+    const float maxval = entry[8];
+    const float tempmean = entry[9];
+    const float kc_factor = entry[10];
+    __global const float* lut =
+        params + offset + RT_LW_W_REFINE_HEADER +
+        RT_LW_W_REFINE_LEVELS * RT_LW_W_REFINE_SCALARS;
+
+    const float wav = cur[y * cur_pitch + x];
+    const float prew = cur_pre[y * cur_pre_pitch + x];
+    /* intp(weightL, post, pre) and fabs(). */
+    const float tempwav = fabs(weight * (wav - prew) + prew);
+
+    float absciss;
+    if (tempwav >= maxval) {
+        absciss = rt_lw_xexpf((rt_lw_xlogf(tempwav) - logmax) * rap);
+    } else if (tempwav >= tempmean) {
+        absciss = asig * tempwav + bsig;
+    } else {
+        absciss = 0.5f * rt_lw_pow(amean * tempwav, k);
+    }
+
+    float kc = rt_lw_curve501(lut, absciss * 500.0f) - 1.0f;
+    if (kc < 0.0f) {
+        kc = -(kc * kc);
+    }
+    kc *= kc_factor;
+    const float reduceeffect = kc <= 0.0f ? 1.0f : 1.2f;
+    float kinterm = 1.0f + reduceeffect * kc;
+    kinterm = kinterm <= 0.0f ? 0.01f : kinterm;
+
+    const int i0 = y * p0 + x;
+    const int i1 = y * p1 + x;
+    const int i2 = y * p2 + x;
+    const int i3 = y * p3 + x;
+    post0[i0] = pre0[y * q0 + x] + (post0[i0] - pre0[y * q0 + x]) * kinterm;
+    post1[i1] = pre1[y * q1 + x] + (post1[i1] - pre1[y * q1 + x]) * kinterm;
+    post2[i2] = pre2[y * q2 + x] + (post2[i2] - pre2[y * q2 + x]) * kinterm;
+    post3[i3] = pre3[y * q3 + x] + (post3[i3] - pre3[y * q3 + x]) * kinterm;
 }
 
 /*

@@ -58,7 +58,7 @@ struct ProcParams;
  * wavelet tool's own skin protection: the equaliser only changes L, so a/b
  * and their masks are identical at the start of both passes.
  */
-#define RT_LAB_WAVELET_CONTEXT_VERSION 9u
+#define RT_LAB_WAVELET_CONTEXT_VERSION 10u
 /* "LWCT": rejects a stale or unrelated pointer before any callback runs. */
 #define RT_LAB_WAVELET_CONTEXT_MAGIC 0x4C574354u
 /* The number of levels of the directional pyramid. */
@@ -177,6 +177,21 @@ struct ProcParams;
  */
 #define RT_LAB_WAVELET_DENOISE_HEADER 7u
 #define RT_LAB_WAVELET_DENOISE_MAD_ENTRIES 3u
+/*
+ * The denoise-curve refinement tail (`sliMethod == "cur"`), present only when
+ * the refinement is admitted. It follows the denoise tail:
+ *   [0]                  1 when the block would run the refinement
+ *   [1 + level*11 + k]   level 0..3, k = active, weightL, logmax, rap, asig,
+ *                        bsig, amean, k, maxVal, tempmean, kcFactor
+ *   then RT_LAB_WAVELET_REFINE_LUT samples of the block's own wavdenoise
+ *   curve (the WavCurve 501-entry float LUT).
+ * The refinement runs at levref == 4 levels when cp.complex is zero; the
+ * expert arm is a host residual.
+ */
+#define RT_LAB_WAVELET_REFINE_LEVELS 4u
+#define RT_LAB_WAVELET_REFINE_SCALARS 11u
+#define RT_LAB_WAVELET_REFINE_HEADER 1u
+#define RT_LAB_WAVELET_REFINE_LUT 501u
 
 /*
  * The exact length of the wavelet parameter table. Both the host builder and
@@ -186,7 +201,7 @@ struct ProcParams;
 inline std::size_t labWaveletParamEntries(std::uint32_t planes,
                                           std::uint32_t levels, bool edge,
                                           bool final_curves, bool toning,
-                                          bool denoise)
+                                          bool denoise, bool refine)
 {
     std::size_t entries = RT_LAB_WAVELET_WAVELET_PARAMS +
                           static_cast<std::size_t>(planes) *
@@ -213,6 +228,12 @@ inline std::size_t labWaveletParamEntries(std::uint32_t planes,
                    static_cast<std::size_t>(planes) *
                        static_cast<std::size_t>(levels) *
                        RT_LAB_WAVELET_DENOISE_MAD_ENTRIES;
+    }
+    if (refine) {
+        entries += RT_LAB_WAVELET_REFINE_HEADER +
+                   static_cast<std::size_t>(RT_LAB_WAVELET_REFINE_LEVELS) *
+                       RT_LAB_WAVELET_REFINE_SCALARS +
+                   RT_LAB_WAVELET_REFINE_LUT;
     }
     return entries;
 }
@@ -277,6 +298,8 @@ typedef struct RtLabWaveletWavelet {
     uint32_t toning;
     /* 1 when the denoise tail is present in `params`. */
     uint32_t denoise;
+    /* 1 when the denoise-curve refinement tail is present in `params`. */
+    uint32_t refine;
     /*
      * 1 when ip_wavelet() re-evaluates the L statistics after the contrast,
      * edge and final multiplies: `cp.val > 0 || ref || contr || cp.diagcurv`
@@ -310,6 +333,16 @@ typedef struct RtLabWaveletWavelet {
      */
     int (*compute_mad)(void* self, const uint32_t* histogram, uint32_t levels,
                        uint32_t plane);
+    /*
+     * Fills the denoise-curve refinement tail from the pre-denoise and
+     * post-denoise statistics blocks, both laid out as compute_mea()'s input.
+     * `levels` is the pass's own L level count. The tail's first entry is set
+     * to one when `ip_wavelet()` would run the refinement: the curve is
+     * non-identity and the block's near-zero early-out does not fire. Used
+     * only when `refine` is set.
+     */
+    int (*compute_refine)(void* self, const float* pre_stats,
+                          const float* post_stats, uint32_t levels);
 } RtLabWaveletWavelet;
 
 /*
@@ -458,9 +491,13 @@ inline constexpr double LAB_WAVELET_MIN_WAVELET_EDGEFFECT = 0.05;
 inline constexpr double LAB_WAVELET_MAX_WAVELET_EDGEFFECT = 2.5;
 /* The denoise panel's five level sliders. The widget's upper value (the
  * strength) is the one the block reads; the lower value belongs to the
- * denoise curve, which this unit refuses. */
+ * denoise curve. */
 inline constexpr double LAB_WAVELET_MIN_WAVELET_NOISE = 0.0;
 inline constexpr double LAB_WAVELET_MAX_WAVELET_NOISE = 100.0;
+/* The denoise-curve refinement's sigma slider. ip_wavelet() divides by it,
+ * so a value outside the widget range is a residual. */
+inline constexpr double LAB_WAVELET_MIN_WAVELET_SIGM = 0.05;
+inline constexpr double LAB_WAVELET_MAX_WAVELET_SIGM = 3.5;
 /* The noise-balance slider (Ballum) maps to a thirteen-entry table through
  * index = 10 - ballum, so the widget's -2..10 range is also the table range. */
 inline constexpr double LAB_WAVELET_MIN_WAVELET_BALLUM = -2.0;
@@ -604,6 +641,11 @@ public:
     int computeMad(const std::uint32_t* histogram, uint32_t levels,
                    uint32_t plane);
 
+    /* Fill the denoise-curve refinement tail from the pre- and post-denoise
+     * statistics blocks. */
+    int computeRefine(const float* pre_stats, const float* post_stats,
+                      uint32_t levels);
+
 private:
     procparams::ProcParams& params_;
     ImProcFunctions& ipf_;
@@ -628,6 +670,9 @@ private:
     bool wavelet_final_ = false;
     bool wavelet_toning_ = false;
     bool wavelet_denoise_ = false;
+    bool wavelet_refine_ = false;
+    bool wavelet_refine_active_ = false;
+    std::vector<float> wavelet_refine_curve_;
     bool wavelet_ab_ = false;
     bool wavelet_final_refresh_ = false;
     int wavelet_levels_ = 0;

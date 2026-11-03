@@ -59,6 +59,13 @@ int compute_mad_thunk(void* self, const uint32_t* histogram, uint32_t levels,
                                                              plane);
 }
 
+int compute_refine_thunk(void* self, const float* pre_stats,
+                         const float* post_stats, uint32_t levels)
+{
+    return static_cast<LabWaveletContext*>(self)->computeRefine(
+        pre_stats, post_stats, levels);
+}
+
 /*
  * Copy one pitched three-plane F32 buffer into a LabImage, and back. The
  * buffer's planes may carry padding, so every row is copied by width.
@@ -262,10 +269,10 @@ void toningMultipliers(const procparams::WaveletParams& wavelet,
 
 /*
  * The standard-L denoise panel's arithmetic plus the chroma denoise arm the
- * block forces when Expnoise selects six levels. Only the plain slider set is
- * ported: the denoise curves, the "cur" slim method, the expert arm and the
- * hue modulation all stay host residuals, and a user chroma denoise or noise
- * balance would change the forced 0.01 chroma strength.
+ * block forces when Expnoise selects six levels. The plain slider set and the
+ * "cur" denoise-curve refinement are ported; the "sli" Thrden refinement, the
+ * expert arm and the hue modulation stay host residuals, and a user chroma
+ * denoise or noise balance would change the forced 0.01 chroma strength.
  */
 bool denoiseAdmitted(const procparams::WaveletParams& wavelet, int width,
                      int height)
@@ -287,11 +294,30 @@ bool denoiseAdmitted(const procparams::WaveletParams& wavelet, int width,
         wavelet.balchrom != 0.0 || wavelet.cbenab) {
         return false;
     }
-    /* The post-denoise slider refinement (slimethod "cur" and Thrden) is a
-     * separate host multiply; the expert arm changes its level pairing. */
-    if (wavelet.slimethod != "sli" || wavelet.thrden != 0.0 ||
-        wavelet.complexmethod != "normal") {
+    /*
+     * "sli" is the slider arm; "cur" adds the denoise-curve refinement. The
+     * "sli" Thrden path is a separate host multiply. The expert arm changes
+     * the refinement's level pairing, so both methods keep cp.complex zero.
+     */
+    if ((wavelet.slimethod != "sli" && wavelet.slimethod != "cur") ||
+        wavelet.thrden != 0.0 || wavelet.complexmethod != "normal") {
         return false;
+    }
+    /*
+     * The "cur" refinement reads cp.mixmet and cp.sigmm. An unknown method
+     * leaves the block's mixmet uninitialised, and sigma divides the curve
+     * abscissa, so both must be inside their widget ranges.
+     */
+    if (wavelet.slimethod == "cur") {
+        if (wavelet.mixmethod != "nois" && wavelet.mixmethod != "mix" &&
+            wavelet.mixmethod != "mix7" && wavelet.mixmethod != "den") {
+            return false;
+        }
+        if (!std::isfinite(wavelet.sigm) ||
+            wavelet.sigm < LAB_WAVELET_MIN_WAVELET_SIGM ||
+            wavelet.sigm > LAB_WAVELET_MAX_WAVELET_SIGM) {
+            return false;
+        }
     }
     /* A non-identity hue curve modulates noisevarlum per pixel. */
     {
@@ -1087,8 +1113,10 @@ RtLabWaveletContext LabWaveletContext::descriptor(bool supported)
     context.wavelet.final = wavelet_final_ ? 1u : 0u;
     context.wavelet.toning = wavelet_toning_ ? 1u : 0u;
     context.wavelet.denoise = wavelet_denoise_ ? 1u : 0u;
+    context.wavelet.refine = wavelet_refine_ ? 1u : 0u;
     context.wavelet.final_refresh = wavelet_final_refresh_ ? 1u : 0u;
     context.wavelet.compute_mad = &compute_mad_thunk;
+    context.wavelet.compute_refine = &compute_refine_thunk;
     context.wavelet.entries = static_cast<uint32_t>(
         wavelet_params_.size());
     context.wavelet.params =
@@ -1232,6 +1260,35 @@ int LabWaveletContext::build(RtLabWaveletResult& out)
      * well, so it needs the planes even when no panel modifies them.
      */
     wavelet_denoise_ = denoiseAdmitted(params_.wavelet, width_, height_);
+    wavelet_refine_ = wavelet_denoise_ && params_.wavelet.slimethod == "cur";
+    /*
+     * The refinement's curve is the block's own WavCurve over wavdenoise.
+     * `cp.denoicurv` is set when any of the first 500 entries differs from
+     * one; an identity curve leaves the LUT unallocated and the block skips
+     * the refinement, so the device only samples a live curve.
+     */
+    wavelet_refine_active_ = false;
+    wavelet_refine_curve_.clear();
+    if (wavelet_refine_) {
+        WavCurve denoise_curve;
+        denoise_curve.Set(params_.wavelet.wavdenoise);
+        if (static_cast<bool>(denoise_curve)) {
+            for (int index = 0; index < 500; ++index) {
+                if (denoise_curve[index] != 1.0f) {
+                    wavelet_refine_active_ = true;
+                    break;
+                }
+            }
+        }
+        if (wavelet_refine_active_) {
+            wavelet_refine_curve_.resize(RT_LAB_WAVELET_REFINE_LUT);
+            for (std::uint32_t index = 0;
+                 index < RT_LAB_WAVELET_REFINE_LUT; ++index) {
+                wavelet_refine_curve_[index] =
+                    denoise_curve[static_cast<int>(index)];
+            }
+        }
+    }
     wavelet_ab_ = wavelet_chroma_ || wavelet_edge_ || wavelet_final_ ||
                   wavelet_toning_ || wavelet_denoise_ ||
                   (params_.wavelet.enabled && selection_active_);
@@ -1348,7 +1405,8 @@ int LabWaveletContext::build(RtLabWaveletResult& out)
             labWaveletParamEntries(static_cast<std::uint32_t>(planes),
                                    static_cast<std::uint32_t>(wavelet_levels_),
                                    wavelet_edge_, wavelet_final_,
-                                   wavelet_toning_, wavelet_denoise_),
+                                   wavelet_toning_, wavelet_denoise_,
+                                   wavelet_refine_),
             0.f);
 
         float* table = wavelet_params_.data();
@@ -1602,6 +1660,27 @@ int LabWaveletContext::build(RtLabWaveletResult& out)
             denoise_tail[5] =
                 std::max(0.000001f, kr4 * variance(lev[4]));
             denoise_tail[6] = static_cast<float>(wavelet.ballum);
+
+            if (wavelet_refine_) {
+                const std::size_t refine_offset =
+                    denoise_offset + RT_LAB_WAVELET_DENOISE_HEADER +
+                    static_cast<std::size_t>(planes) *
+                        static_cast<std::size_t>(wavelet_levels_) *
+                        RT_LAB_WAVELET_DENOISE_MAD_ENTRIES;
+                float* refine_tail = table + refine_offset;
+                refine_tail[0] = 0.f;
+                if (wavelet_refine_active_) {
+                    float* lut = refine_tail +
+                                 RT_LAB_WAVELET_REFINE_HEADER +
+                                 static_cast<std::size_t>(
+                                     RT_LAB_WAVELET_REFINE_LEVELS) *
+                                     RT_LAB_WAVELET_REFINE_SCALARS;
+                    for (std::uint32_t index = 0;
+                         index < RT_LAB_WAVELET_REFINE_LUT; ++index) {
+                        lut[index] = wavelet_refine_curve_[index];
+                    }
+                }
+            }
         }
     }
 
@@ -1845,6 +1924,169 @@ int LabWaveletContext::computeMad(const std::uint32_t* histogram,
                  dir] = SQR(mad);
         }
     }
+    return 0;
+}
+
+int LabWaveletContext::computeRefine(const float* pre_stats,
+                                     const float* post_stats,
+                                     uint32_t levels)
+{
+    const uint32_t planes = wavelet_ab_ ? 3u : 1u;
+    const uint32_t stride = static_cast<uint32_t>(wavelet_levels_);
+    if (!wavelet_active_ || !wavelet_refine_ || pre_stats == nullptr ||
+        post_stats == nullptr || levels < 1 || levels > stride ||
+        stride > RT_LAB_WAVELET_MAX_TRANSFORM_LEVELS) {
+        return 1;
+    }
+
+    const auto aggregate = [](const float* stats, uint32_t level,
+                              float& mean, float& sigma, float& maxp) {
+        const auto value = [&](int direction, int entry) {
+            return stats[(static_cast<std::size_t>(level) * 3 +
+                          static_cast<std::size_t>(direction)) *
+                             RT_LAB_WAVELET_STATS_PER_BAND +
+                         static_cast<std::size_t>(entry)];
+        };
+        /* Eval2()'s accumulation order and its / 3. */
+        mean = (value(0, 0) + value(1, 0) + value(2, 0)) / 3.f;
+        sigma = (value(0, 4) + value(1, 4) + value(2, 4)) / 3.f;
+        maxp = (value(0, 2) + value(1, 2) + value(2, 2)) / 3.f;
+    };
+
+    const std::size_t denoise_offset =
+        RT_LAB_WAVELET_WAVELET_PARAMS +
+        static_cast<std::size_t>(planes) *
+            static_cast<std::size_t>(stride) *
+            RT_LAB_WAVELET_MEA_ENTRIES +
+        (wavelet_edge_
+             ? 1 + static_cast<std::size_t>(stride) *
+                       RT_LAB_WAVELET_EDGE_ENTRIES +
+                   RT_LAB_WAVELET_CURVE_ENTRIES
+             : 0) +
+        (wavelet_final_
+             ? 1 + static_cast<std::size_t>(stride) *
+                       RT_LAB_WAVELET_FINAL_STATS_ENTRIES +
+                   RT_LAB_WAVELET_CURVE_ENTRIES +
+                   RT_LAB_WAVELET_FINAL_LUT_ENTRIES
+             : 0) +
+        (wavelet_toning_
+             ? RT_LAB_WAVELET_TONING_HEADER +
+                   2 * static_cast<std::size_t>(stride) *
+                       RT_LAB_WAVELET_TONING_MEA_ENTRIES
+             : 0);
+    const std::size_t refine_offset =
+        denoise_offset + RT_LAB_WAVELET_DENOISE_HEADER +
+        static_cast<std::size_t>(planes) *
+            static_cast<std::size_t>(stride) *
+            RT_LAB_WAVELET_DENOISE_MAD_ENTRIES;
+    float* tail = wavelet_params_.data() + refine_offset;
+    tail[0] = 0.f;
+
+    /*
+     * ip_wavelet()'s early-out: any level whose pre- or post-denoise mean or
+     * sigma is below 0.1 makes the block skip the whole refinement. It is a
+     * per-pass decision over the pass's own level count.
+     */
+    bool exitifzero = true;
+    for (uint32_t level = 0; level < levels; ++level) {
+        float mean = 0.f;
+        float sigma = 0.f;
+        float maxp = 0.f;
+        float meand = 0.f;
+        float sigmad = 0.f;
+        float maxpd = 0.f;
+        aggregate(pre_stats, level, mean, sigma, maxp);
+        aggregate(post_stats, level, meand, sigmad, maxpd);
+        if (mean < 0.1f || meand < 0.1f || sigma < 0.1f ||
+            sigmad < 0.1f) {
+            exitifzero = false;
+        }
+    }
+
+    if (!wavelet_refine_active_ || !exitifzero ||
+        levels < RT_LAB_WAVELET_REFINE_LEVELS) {
+        return 0;
+    }
+
+    int mixmet = 3;
+    if (params_.wavelet.mixmethod == "nois") {
+        mixmet = 0;
+    } else if (params_.wavelet.mixmethod == "mix") {
+        mixmet = 1;
+    } else if (params_.wavelet.mixmethod == "mix7") {
+        mixmet = 2;
+    }
+    constexpr float weights[4] = {0.f, 0.5f, 0.7f, 1.f};
+    const float weight = weights[mixmet];
+    const float siglh = static_cast<float>(params_.wavelet.sigm);
+    /* ip_wavelet.cc calls the double `log()` and stores into a float. */
+    const float inx = static_cast<float>(std::log(static_cast<double>(0.666f)));
+
+    for (std::uint32_t level = 0; level < RT_LAB_WAVELET_REFINE_LEVELS;
+         ++level) {
+        float mean = 0.f;
+        float sigma = 0.f;
+        float maxp = 0.f;
+        float meand = 0.f;
+        float sigmad = 0.f;
+        float maxpd = 0.f;
+        aggregate(pre_stats, level, mean, sigma, maxp);
+        aggregate(post_stats, level, meand, sigmad, maxpd);
+
+        /*
+         * The block enters the per-level arithmetic only when the pre-denoise
+         * MaxP and mean/sigma are non-zero. A degenerate level is skipped,
+         * not refused: the other levels still apply their factor.
+         */
+        const bool active = maxp > 0.f && mean != 0.f && sigma != 0.f;
+        float* entry = tail + RT_LAB_WAVELET_REFINE_HEADER +
+                       static_cast<std::size_t>(level) *
+                           RT_LAB_WAVELET_REFINE_SCALARS;
+        entry[0] = active ? 1.f : 0.f;
+        if (!active) {
+            continue;
+        }
+
+        /* intp(a, b, c) = a * (b - c) + c: post is b, pre is c. */
+        const float tempmax = weight * (maxpd - maxp) + maxp;
+        const float tempmean = weight * (meand - mean) + mean;
+        const float tempsig = weight * (sigmad - sigma) + sigma;
+        if (!(tempmax > 0.f) || !(tempsig > 0.f)) {
+            /* The host would take log()/divide of a non-positive value and
+             * produce a non-finite coefficient. Fail closed instead. */
+            return 2;
+        }
+        const float logmax =
+            static_cast<float>(std::log(static_cast<double>(tempmax)));
+        const float rap_x = (tempmean + siglh * tempsig) / tempmax;
+        if (!(rap_x > 0.f)) {
+            return 2;
+        }
+        const float iny =
+            static_cast<float>(std::log(static_cast<double>(rap_x)));
+        const float rap = inx / iny;
+        const float asig = 0.166f / (tempsig * siglh);
+        const float bsig = 0.5f - asig * tempmean;
+        const float amean = 1.f / tempmean;
+        const float k =
+            1.f / (siglh > 1.f ? SQR(siglh) : siglh);
+        const float maxval = tempmean + siglh * tempsig;
+        /* cp.denmet is hard-coded to 4: levels 0 and 1 get 0.3, the rest 1. */
+        const float kc_factor =
+            (level == 0 || level == 1) ? 0.3f : 1.f;
+
+        entry[1] = weight;
+        entry[2] = logmax;
+        entry[3] = rap;
+        entry[4] = asig;
+        entry[5] = bsig;
+        entry[6] = amean;
+        entry[7] = k;
+        entry[8] = maxval;
+        entry[9] = tempmean;
+        entry[10] = kc_factor;
+    }
+    tail[0] = 1.f;
     return 0;
 }
 

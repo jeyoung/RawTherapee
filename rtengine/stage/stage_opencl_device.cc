@@ -6050,6 +6050,7 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
     bool wavelet_final = false;
     bool wavelet_toning = false;
     bool wavelet_denoise = false;
+    bool wavelet_refine = false;
     bool wavelet_ab = false;
     bool select_active = false;
     bool clarity_active = false;
@@ -6072,10 +6073,14 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
              context->wavelet.toning != 1) ||
             (context->wavelet.denoise != 0 &&
              context->wavelet.denoise != 1) ||
+            (context->wavelet.refine != 0 &&
+             context->wavelet.refine != 1) ||
             (context->wavelet.final_refresh != 0 &&
              context->wavelet.final_refresh != 1) ||
             (context->wavelet.denoise != 0 &&
-             context->wavelet.compute_mad == nullptr)) {
+             context->wavelet.compute_mad == nullptr) ||
+            (context->wavelet.refine != 0 &&
+             context->wavelet.compute_refine == nullptr)) {
             error = "lab.wavelet wavelet pass is not set up";
             return RT_STAGE_FALLBACK;
         }
@@ -6113,6 +6118,11 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
         wavelet_final = context->wavelet.final != 0;
         wavelet_toning = context->wavelet.toning != 0;
         wavelet_denoise = context->wavelet.denoise != 0;
+        wavelet_refine = context->wavelet.refine != 0;
+        if (wavelet_refine && !wavelet_denoise) {
+            error = "lab.wavelet refinement needs the denoise arm";
+            return RT_STAGE_FALLBACK;
+        }
         /* RT_LW_PARAM_CHROMA marks the presence of the a/b planes: the chroma
          * arm, the edge panel and the final curves all keep the block's a/b
          * round trip alive. */
@@ -6129,7 +6139,8 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
             static_cast<int>(labWaveletParamEntries(
                 static_cast<std::uint32_t>(wavelet_planes),
                 static_cast<std::uint32_t>(wavelet_levels), wavelet_edge,
-                wavelet_final, wavelet_toning, wavelet_denoise))) {
+                wavelet_final, wavelet_toning, wavelet_denoise,
+                wavelet_refine))) {
             error = "lab.wavelet parameter table has the wrong length";
             return RT_STAGE_INVALID;
         }
@@ -6726,6 +6737,8 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
         cl_kernel shrink_apply_kernel = nullptr;
         cl_kernel box_h_kernel = nullptr;
         cl_kernel box_v_kernel = nullptr;
+        cl_kernel refine_kernel = nullptr;
+        cl_kernel copy_kernel = nullptr;
         cl_kernel select_kernel = nullptr;
         if (select_active) {
             select_kernel = compiled_kernel_entry(
@@ -6756,6 +6769,12 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
             box_v_kernel =
                 compiled_kernel_entry(env, def, "rt_lw_box_v", error);
         }
+        if (wavelet_refine) {
+            refine_kernel = compiled_kernel_entry(
+                env, def, "rt_lab_wavelet_w_refine", error);
+            copy_kernel = compiled_kernel_entry(
+                env, def, "rt_lab_wavelet_w_copy", error);
+        }
         if (analysis_v == nullptr || analysis_h == nullptr ||
             haar_v == nullptr || haar_h == nullptr || synth_h == nullptr ||
             synth_v == nullptr || haar_synth_h == nullptr ||
@@ -6771,7 +6790,9 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
              (mad_kernel == nullptr || noisevar_kernel == nullptr ||
               shrink_l_kernel == nullptr || shrink_ab_kernel == nullptr ||
               shrink_apply_kernel == nullptr || box_h_kernel == nullptr ||
-              box_v_kernel == nullptr))) {
+              box_v_kernel == nullptr)) ||
+            (wavelet_refine &&
+             (refine_kernel == nullptr || copy_kernel == nullptr))) {
             return RT_STAGE_FALLBACK;
         }
 
@@ -6827,6 +6848,15 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
                        2 * wavelet_levels *
                            static_cast<int>(
                                RT_LAB_WAVELET_TONING_MEA_ENTRIES))
+                 : 0);
+        const cl_int cl_refine_offset =
+            cl_denoise_offset +
+            (wavelet_denoise
+                 ? static_cast<cl_int>(
+                       RT_LAB_WAVELET_DENOISE_HEADER +
+                       wavelet_planes * wavelet_levels *
+                           static_cast<int>(
+                               RT_LAB_WAVELET_DENOISE_MAD_ENTRIES))
                  : 0);
         /* WaveletDenoiseAllL() and WaveletDenoiseAllAB() both stop at six
          * levels; the forced Expnoise decomposition is six levels anyway. */
@@ -7021,8 +7051,8 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
             return true;
         };
 
-        auto statistics = [&](StageDeviceBufferPtr (*bandset)[3],
-                              uint32_t plane_index, int levels) -> bool {
+        auto read_stats = [&](StageDeviceBufferPtr (*bandset)[3],
+                              int levels) -> bool {
             /* Per-band statistics, one work item per band. */
             for (int level = 0; level < levels; ++level) {
                 cl_mem band1 = memory_of(bandset[level][0]);
@@ -7060,6 +7090,14 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
             if (residency->readback(stats_device, stats_view) !=
                 RT_STAGE_OK) {
                 error = "lab.wavelet statistics readback failed";
+                return false;
+            }
+            return true;
+        };
+
+        auto statistics = [&](StageDeviceBufferPtr (*bandset)[3],
+                              uint32_t plane_index, int levels) -> bool {
+            if (!read_stats(bandset, levels)) {
                 return false;
             }
             if (context->wavelet.compute_mea(
@@ -7799,6 +7837,127 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
         };
 
         /*
+         * A device-side band snapshot. The "cur" refinement needs the
+         * pre-denoise L coefficients while the post-denoise set is held for
+         * the contrast pass; `bands` is free until the a and b planes
+         * decompose, so the snapshot reuses it.
+         */
+        auto copy_bands = [&](StageDeviceBufferPtr (*src)[3],
+                              StageDeviceBufferPtr (*dst)[3],
+                              int levels) -> bool {
+            for (int level = 0; level < levels; ++level) {
+                for (int dir = 0; dir < 3; ++dir) {
+                    cl_mem src_memory = memory_of(src[level][dir]);
+                    cl_mem dst_memory = memory_of(dst[level][dir]);
+                    cl_int src_pitch = pitch_of(src[level][dir]);
+                    cl_int dst_pitch = pitch_of(dst[level][dir]);
+                    bool ok = true;
+                    ok = ok && set_arg(copy_kernel, 0, sizeof(cl_mem),
+                                       &src_memory);
+                    ok = ok && set_arg(copy_kernel, 1, sizeof(cl_int),
+                                       &src_pitch);
+                    ok = ok && set_arg(copy_kernel, 2, sizeof(cl_mem),
+                                       &dst_memory);
+                    ok = ok && set_arg(copy_kernel, 3, sizeof(cl_int),
+                                       &dst_pitch);
+                    ok = ok && set_arg(copy_kernel, 4, sizeof(cl_int),
+                                       &cl_half_w);
+                    ok = ok && set_arg(copy_kernel, 5, sizeof(cl_int),
+                                       &cl_half_h);
+                    if (!ok || !launch(copy_kernel, band_global,
+                                       "lab.wavelet band copy")) {
+                        error = "lab.wavelet band copy arguments failed";
+                        return false;
+                    }
+                }
+            }
+            return true;
+        };
+
+        /*
+         * ip_wavelet()'s denoise-curve refinement. The block loops
+         * directions outside levels and, for each current level, writes
+         * levels 0..3 with the factor that level's post/pre statistics
+         * produced. The repeated application is part of the result, so the
+         * kernel writes the four post bands and reads the current level's
+         * already-updated coefficients.
+         */
+        auto refine_l = [&](StageDeviceBufferPtr (*post)[3],
+                            StageDeviceBufferPtr (*pre)[3]) -> bool {
+            const float* tail = wavelet_params + cl_refine_offset;
+            if (tail[0] == 0.f) {
+                return true;
+            }
+            for (int dir = 0; dir < 3; ++dir) {
+                cl_mem post_mem[4];
+                cl_int post_pitch[4];
+                cl_mem pre_mem[4];
+                cl_int pre_pitch[4];
+                for (int level = 0; level < 4; ++level) {
+                    post_mem[level] = memory_of(post[level][dir]);
+                    post_pitch[level] = pitch_of(post[level][dir]);
+                    pre_mem[level] = memory_of(pre[level][dir]);
+                    pre_pitch[level] = pitch_of(pre[level][dir]);
+                }
+                for (int level = 0; level < 4; ++level) {
+                    const float* entry =
+                        tail + RT_LAB_WAVELET_REFINE_HEADER +
+                        level * RT_LAB_WAVELET_REFINE_SCALARS;
+                    if (entry[0] == 0.f) {
+                        continue;
+                    }
+                    cl_mem cur = post_mem[level];
+                    cl_int cur_pitch = post_pitch[level];
+                    cl_mem cur_pre = pre_mem[level];
+                    cl_int cur_pre_pitch = pre_pitch[level];
+                    cl_int cl_level = level;
+                    bool ok = true;
+                    ok = ok && set_arg(refine_kernel, 0, sizeof(cl_mem),
+                                       &cur);
+                    ok = ok && set_arg(refine_kernel, 1, sizeof(cl_int),
+                                       &cur_pitch);
+                    ok = ok && set_arg(refine_kernel, 2, sizeof(cl_mem),
+                                       &cur_pre);
+                    ok = ok && set_arg(refine_kernel, 3, sizeof(cl_int),
+                                       &cur_pre_pitch);
+                    int arg = 4;
+                    for (int index = 0; index < 4; ++index) {
+                        ok = ok && set_arg(refine_kernel, arg++,
+                                           sizeof(cl_mem),
+                                           &post_mem[index]);
+                        ok = ok && set_arg(refine_kernel, arg++,
+                                           sizeof(cl_int),
+                                           &post_pitch[index]);
+                    }
+                    for (int index = 0; index < 4; ++index) {
+                        ok = ok && set_arg(refine_kernel, arg++,
+                                           sizeof(cl_mem),
+                                           &pre_mem[index]);
+                        ok = ok && set_arg(refine_kernel, arg++,
+                                           sizeof(cl_int),
+                                           &pre_pitch[index]);
+                    }
+                    ok = ok && set_arg(refine_kernel, arg++,
+                                       sizeof(cl_mem), &params_memory);
+                    ok = ok && set_arg(refine_kernel, arg++,
+                                       sizeof(cl_int), &cl_refine_offset);
+                    ok = ok && set_arg(refine_kernel, arg++,
+                                       sizeof(cl_int), &cl_level);
+                    ok = ok && set_arg(refine_kernel, arg++,
+                                       sizeof(cl_int), &cl_half_w);
+                    ok = ok && set_arg(refine_kernel, arg++,
+                                       sizeof(cl_int), &cl_half_h);
+                    if (!ok || !launch(refine_kernel, band_global,
+                                       "lab.wavelet refine")) {
+                        error = "lab.wavelet refine arguments failed";
+                        return false;
+                    }
+                }
+            }
+            return true;
+        };
+
+        /*
          * The forced chroma denoise: WaveletDenoiseAllAB() with local == 1,
          * useNoiseCCurve true and the plain noisevarchrom plane. The L bands
          * held by the caller are the post-contrast coefficients the host
@@ -7991,9 +8150,52 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
                 if (!forward_analysis(l_memory, l_pitch, bands_hold,
                                       wavelet_low_hold, levels) ||
                     !statistics(bands_hold, 0, levels) ||
-                    !run_mad(bands_hold, 0, levels) ||
-                    !denoise_l(bands_hold) ||
-                    !multiply(bands_hold, wavelet_low_hold, 0, levels) ||
+                    !run_mad(bands_hold, 0, levels)) {
+                    return false;
+                }
+                /*
+                 * The refinement needs the pre-denoise L coefficients. The
+                 * pre statistics are already in stats_host; keep a copy
+                 * before the post-denoise read overwrites them.
+                 */
+                std::vector<float> pre_stats;
+                if (wavelet_refine) {
+                    pre_stats = stats_host;
+                    if (!copy_bands(bands_hold, bands, denoise_levels)) {
+                        return false;
+                    }
+                }
+                if (!denoise_l(bands_hold)) {
+                    return false;
+                }
+                if (wavelet_refine) {
+                    /*
+                     * Evaluate2() after WaveletDenoiseAllL(): the guard and
+                     * the per-level scalars are host-side, as the block
+                     * computes them, and the kernel only runs the per-pixel
+                     * curve multiply.
+                     */
+                    if (!read_stats(bands_hold, levels)) {
+                        return false;
+                    }
+                    if (context->wavelet.compute_refine(
+                            context->self, pre_stats.data(),
+                            stats_host.data(),
+                            static_cast<uint32_t>(levels)) != 0) {
+                        error = "lab.wavelet refine build failed";
+                        return false;
+                    }
+                    if (residency->upload(wavelet_params_device,
+                                          wavelet_params_buffer) !=
+                        RT_STAGE_OK) {
+                        error = "lab.wavelet refine parameter upload failed";
+                        return false;
+                    }
+                    if (!refine_l(bands_hold, bands)) {
+                        return false;
+                    }
+                }
+                if (!multiply(bands_hold, wavelet_low_hold, 0, levels) ||
                     !final_curve(bands_hold, 0, levels) ||
                     (select && !selection_pass(bands_hold, wavelet_low_hold,
                                                0, levels)) ||
