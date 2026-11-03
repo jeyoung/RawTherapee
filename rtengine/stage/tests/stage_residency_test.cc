@@ -8574,30 +8574,23 @@ void test_lab_wavelet_edge(bool available)
     }
 
     /*
-     * Refusals: the unported Lipschitz sub-modes, the threshold-adjuster
-     * selection, sliders outside their widget range and an unknown
-     * reinforce mode must run the host block byte for byte.
+     * Refusals: unknown sub-mode selections, the Lipschitz sliders outside
+     * their widget ranges (read only when Medianlev runs), the plain sliders'
+     * ranges, an unknown reinforce mode and the unported skin protection must
+     * run the host block byte for byte. EDmethod SL is admitted: the engine
+     * forces EDmet == 2 for both selections, so the arm is the same block.
      */
     const char* residual_labels[] = {
-        "median level", "np low", "np high", "lipst", "EDmethod SL",
         "edgval range", "edgrad range", "edgthresh range",
         "edgeffect range", "Medgreinf unknown", "zero strength",
-        "skin protection"};
+        "skin protection", "np unknown", "edmethod unknown",
+        "edgedetect range", "edgedetectthr range",
+        "edgedetectthr2 range", "edgesensi range", "edgeampli range"};
     for (const char* label : residual_labels) {
         rtengine::procparams::ProcParams params;
         wavelet_edge_params(params, 6);
 
-        if (std::strcmp(label, "median level") == 0) {
-            params.wavelet.medianlev = true;
-        } else if (std::strcmp(label, "np low") == 0) {
-            params.wavelet.NPmethod = "low";
-        } else if (std::strcmp(label, "np high") == 0) {
-            params.wavelet.NPmethod = "high";
-        } else if (std::strcmp(label, "lipst") == 0) {
-            params.wavelet.lipst = true;
-        } else if (std::strcmp(label, "EDmethod SL") == 0) {
-            params.wavelet.EDmethod = "SL";
-        } else if (std::strcmp(label, "edgval range") == 0) {
+        if (std::strcmp(label, "edgval range") == 0) {
             params.wavelet.edgval = 101;
         } else if (std::strcmp(label, "edgrad range") == 0) {
             params.wavelet.edgrad = 101;
@@ -8609,6 +8602,27 @@ void test_lab_wavelet_edge(bool available)
             params.wavelet.Medgreinf = "bogus";
         } else if (std::strcmp(label, "zero strength") == 0) {
             params.wavelet.edgval = 0;
+        } else if (std::strcmp(label, "np unknown") == 0) {
+            params.wavelet.NPmethod = "bogus";
+        } else if (std::strcmp(label, "edmethod unknown") == 0) {
+            params.wavelet.EDmethod = "XX";
+        } else if (std::strcmp(label, "edgedetect range") == 0) {
+            params.wavelet.medianlev = true;
+            params.wavelet.edgedetect = 101;
+        } else if (std::strcmp(label, "edgedetectthr range") == 0) {
+            params.wavelet.medianlev = true;
+            params.wavelet.edgedetectthr = 101;
+        } else if (std::strcmp(label, "edgedetectthr2 range") == 0) {
+            params.wavelet.medianlev = true;
+            params.wavelet.edgedetectthr2 = 101;
+        } else if (std::strcmp(label, "edgesensi range") == 0) {
+            params.wavelet.medianlev = true;
+            params.wavelet.lipst = true;
+            params.wavelet.edgesensi = 101;
+        } else if (std::strcmp(label, "edgeampli range") == 0) {
+            params.wavelet.medianlev = true;
+            params.wavelet.lipst = true;
+            params.wavelet.edgeampli = 101;
         } else {
             params.wavelet.skinprotect = 30.0;
         }
@@ -8661,6 +8675,266 @@ void test_lab_wavelet_edge(bool available)
     }
 }
 
+
+/* ------------------------------------ lab.wavelet edge Lipschitz control */
+
+void wavelet_denoise_params(rtengine::procparams::ProcParams& params,
+                            int levels, const double noise[5],
+                            double ballum);
+
+/*
+ * The edge panel's Lipschitz control: calckoe()'s detection, the NPMethod
+ * neighbour smoothing with Lipst, the influence sliders, and EDmethod "SL"
+ * (which selects the same EDmet == 2 block as "CU" because the engine forces
+ * EDmet). Every case is checked against the host block and against the same
+ * profile with Medianlev off, so the parity is not vacuous.
+ */
+void test_lab_wavelet_edge_lipschitz(bool available)
+{
+    using namespace rtengine::stage;
+
+    static MyMutex lipschitz_lcms_mutex;
+    if (rtengine::lcmsMutex == nullptr) {
+        rtengine::lcmsMutex = &lipschitz_lcms_mutex;
+    }
+    static rtengine::Settings lipschitz_settings{};
+    lipschitz_settings.edghi = 3.0;
+    lipschitz_settings.edglo = 0.5;
+    lipschitz_settings.limrad = 20.0;
+    rtengine::settings = &lipschitz_settings;
+    rtengine::Color::init();
+
+    const std::string profile_path =
+        std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp") +
+        "/stage-residency-lab-wavelet-edge-lipschitz.jsonl";
+
+    if (!available) {
+        skip("lab.wavelet edge lipschitz: no OpenCL device");
+        return;
+    }
+
+    struct LipschitzCase {
+        const char* label;
+        int width;
+        int height;
+        int levels;
+        int detect;
+        int detect_thr;
+        int detect_thr2;
+        int sensi;
+        int ampli;
+        bool median;
+        bool lipst;
+        int np; /* 0 none, 1 low, 2 high */
+        bool sl;
+        bool contrast;
+        bool denoise;
+        bool final;
+        int image; /* 0 random, 1 skin */
+    };
+
+    const int contrast[9] = {30, 22, 14, 8, 4, 2, 0, 0, 0};
+    const double noise[5] = {40, 30, 20, 10, 5};
+    const LipschitzCase cases[] = {
+        {"detect 3x3 default", 238, 64, 6, 90, 20, 0, 60, 10, true,
+         false, 0, false, false, false, false, 1},
+        {"detect thr 40", 238, 64, 6, 90, 40, 0, 60, 10, true, false, 0,
+         false, false, false, false, 0},
+        {"detect thr 65", 238, 64, 6, 90, 65, 0, 60, 10, true, false, 0,
+         false, false, false, false, 1},
+        {"detect 5x5 thr 85", 238, 64, 6, 90, 85, 0, 60, 10, true, false, 0,
+         false, false, false, false, 1},
+        {"detect 5x5 thr 95 amp", 238, 64, 6, 60, 95, 20, 60, 10, true,
+         false, 0, false, false, false, false, 0},
+        {"lipst influence", 238, 64, 6, 90, 20, 0, 85, 40, true, true, 0,
+         false, false, false, false, 1},
+        {"np low", 238, 64, 6, 90, 20, 0, 60, 10, true, true, 1, false,
+         false, false, false, 1},
+        {"np high", 238, 64, 6, 90, 20, 0, 60, 10, true, true, 2, false,
+         false, false, false, 1},
+        {"np low thr 0", 179, 49, 5, 90, 0, 0, 60, 10, true, true, 1,
+         false, false, false, false, 1},
+        {"edmethod sl", 238, 64, 6, 90, 20, 0, 60, 10, true, false, 0, true,
+         false, false, false, 1},
+        {"median with contrast", 238, 64, 6, 90, 20, 0, 60, 10, true,
+         false, 0, false, true, false, false, 1},
+        {"np high with denoise", 238, 160, 6, 90, 20, 0, 60, 10, true, true,
+         2, false, false, true, false, 1},
+        {"np low with final", 238, 160, 6, 90, 20, 0, 60, 10, true, true, 1,
+         false, false, false, true, 1},
+        {"combined arms", 238, 160, 6, 70, 85, 20, 85, 40, true, true, 2,
+         true, true, true, true, 0},
+        {"padded 179x49 np high", 179, 49, 5, 90, 20, 0, 60, 10, true, true,
+         2, false, false, false, false, 1},
+    };
+
+    unsigned seed = 0x51ab3d7fu;
+    bool smoothing_moved = false;
+    bool lipst_moved = false;
+    for (const LipschitzCase& item : cases) {
+        rtengine::procparams::ProcParams params;
+        wavelet_edge_params(params, item.levels);
+        if (item.denoise) {
+            wavelet_denoise_params(params, 6, noise, 0.0);
+            params.wavelet.expedge = true;
+            params.wavelet.edgval = 50;
+            params.wavelet.edgrad = 15;
+            params.wavelet.edgthresh = 10;
+            params.wavelet.edgeffect = 1.0;
+            params.wavelet.Medgreinf = "less";
+        }
+        if (item.final) {
+            params.wavelet.expfinal = true;
+            params.wavelet.sigmafin = 1.0;
+            params.wavelet.opacityCurveWL = {
+                static_cast<double>(FCT_MinMaxCPoints), 0.0, 0.25, 0.35,
+                0.35, 0.5, 0.75, 0.35, 0.35, 1.0, 0.25, 0.35, 0.35};
+        }
+        params.wavelet.expcontrast = item.contrast;
+        for (int level = 0; level < 9; ++level) {
+            params.wavelet.c[level] =
+                item.contrast ? contrast[level] : 0;
+        }
+        params.wavelet.medianlev = item.median;
+        params.wavelet.edgedetect = item.detect;
+        params.wavelet.edgedetectthr = item.detect_thr;
+        params.wavelet.edgedetectthr2 = item.detect_thr2;
+        params.wavelet.edgesensi = item.sensi;
+        params.wavelet.edgeampli = item.ampli;
+        params.wavelet.lipst = item.lipst;
+        params.wavelet.NPmethod =
+            item.np == 2 ? "high" : (item.np == 1 ? "low" : "none");
+        params.wavelet.EDmethod = item.sl ? "SL" : "CU";
+
+        check(labWaveletSupported(params, item.width, item.height),
+              (std::string("lab.wavelet edge lipschitz ") + item.label +
+               " is the supported set").c_str());
+
+        LabImage source(item.width, item.height);
+        if (item.image == 1) {
+            fill_lab_wavelet_skin(source);
+        } else {
+            fill_lab_tools(source, seed++);
+        }
+
+        rtengine::ImProcFunctions cpu_ipf(&params, false);
+        LabImage cpu(item.width, item.height);
+        cpu.CopyFrom(&source);
+        labWaveletHostBlock(cpu_ipf, params, cpu);
+
+        rtengine::ImProcFunctions device_ipf(&params, false);
+        LabImage device(item.width, item.height);
+        device.CopyFrom(&source);
+        const LabWaveletRun result =
+            run_lab_wavelet_node(device, params, device_ipf, profile_path);
+        const std::string profile = read_file(profile_path);
+
+        check(result.supported,
+              (std::string("lab.wavelet edge lipschitz ") + item.label +
+               " resolves to the supported set").c_str());
+        check(result.deviceReady,
+              (std::string("lab.wavelet edge lipschitz ") + item.label +
+               " builds its host setup").c_str());
+        check(result.status == RT_STAGE_OK,
+              (std::string("lab.wavelet edge lipschitz ") + item.label +
+               " completes through run()").c_str());
+        check(profile.find("\"stage\":\"lab.wavelet\"") != std::string::npos,
+              (std::string("lab.wavelet edge lipschitz ") + item.label +
+               " records the node").c_str());
+        check(profile.find("\"impl\":\"opencl\"") != std::string::npos,
+              (std::string("lab.wavelet edge lipschitz ") + item.label +
+               " records a device execution").c_str());
+
+        const Distribution d = distribution(view(device), view(cpu));
+        std::printf("stage-residency: lab.wavelet edge lipschitz %s %dx%d "
+                    "L%d: PAE %.6f LSB16; exact %zu, <=0.25 %zu, <=0.5 %zu, "
+                    "<=1 %zu, >1 %zu of %zu\n",
+                    item.label, item.width, item.height, item.levels,
+                    d.max_abs, d.exact, d.quarter, d.half, d.one, d.over,
+                    d.samples);
+        check(d.finite,
+              (std::string("lab.wavelet edge lipschitz ") + item.label +
+               " stays finite").c_str());
+        check(d.over == 0,
+              (std::string("lab.wavelet edge lipschitz ") + item.label +
+               " is within one LSB16").c_str());
+
+        /* Non-vacuity against the plain arm: switching Medianlev off must
+         * change the host block's own result. */
+        rtengine::procparams::ProcParams off = params;
+        off.wavelet.medianlev = false;
+        rtengine::ImProcFunctions off_ipf(&off, false);
+        LabImage off_image(item.width, item.height);
+        off_image.CopyFrom(&source);
+        labWaveletHostBlock(off_ipf, off, off_image);
+        const Diff active = compare(view(cpu), view(off_image));
+        std::printf("stage-residency: lab.wavelet edge lipschitz %s changes "
+                    "%zu of %zu samples against the plain arm, PAE %.6f "
+                    "LSB16\n",
+                    item.label, active.differing, active.samples,
+                    active.max_abs);
+        check(active.differing > 0,
+              (std::string("lab.wavelet edge lipschitz ") + item.label +
+               " is non-vacuous").c_str());
+
+        /* EDmethod "SL" must be byte-identical to "CU": the engine forces
+         * EDmet == 2 before the commented-out selection runs. */
+        if (item.sl) {
+            rtengine::procparams::ProcParams cu = params;
+            cu.wavelet.EDmethod = "CU";
+            rtengine::ImProcFunctions cu_ipf(&cu, false);
+            LabImage cu_image(item.width, item.height);
+            cu_image.CopyFrom(&source);
+            labWaveletHostBlock(cu_ipf, cu, cu_image);
+            const Diff same = compare(view(cpu), view(cu_image));
+            std::printf("stage-residency: lab.wavelet edge lipschitz %s "
+                        "differs from EDmethod CU in %zu of %zu samples, "
+                        "PAE %.6f LSB16\n",
+                        item.label, same.differing, same.samples,
+                        same.max_abs);
+            check(same.differing == 0 && same.max_abs == 0.0,
+                  (std::string("lab.wavelet edge lipschitz ") + item.label +
+                   " matches EDmethod CU").c_str());
+        }
+
+        /* The smoothing and influence arms must also move the host result on
+         * their own, otherwise the admitted sub-mode is a no-op. */
+        if (item.np != 0 && item.lipst) {
+            rtengine::procparams::ProcParams plain_smoothing = params;
+            plain_smoothing.wavelet.NPmethod = "none";
+            rtengine::ImProcFunctions plain_ipf(&plain_smoothing, false);
+            LabImage plain_image(item.width, item.height);
+            plain_image.CopyFrom(&source);
+            labWaveletHostBlock(plain_ipf, plain_smoothing, plain_image);
+            const Diff moved = compare(view(cpu), view(plain_image));
+            std::printf("stage-residency: lab.wavelet edge lipschitz %s "
+                        "changes %zu of %zu samples against NPmethod none, "
+                        "PAE %.6f LSB16\n",
+                        item.label, moved.differing, moved.samples,
+                        moved.max_abs);
+            smoothing_moved = smoothing_moved || moved.differing > 0;
+        }
+        if (item.lipst) {
+            rtengine::procparams::ProcParams no_lipst = params;
+            no_lipst.wavelet.lipst = false;
+            rtengine::ImProcFunctions no_lipst_ipf(&no_lipst, false);
+            LabImage no_lipst_image(item.width, item.height);
+            no_lipst_image.CopyFrom(&source);
+            labWaveletHostBlock(no_lipst_ipf, no_lipst, no_lipst_image);
+            const Diff moved = compare(view(cpu), view(no_lipst_image));
+            std::printf("stage-residency: lab.wavelet edge lipschitz %s "
+                        "changes %zu of %zu samples against Lipst off, PAE "
+                        "%.6f LSB16\n",
+                        item.label, moved.differing, moved.samples,
+                        moved.max_abs);
+            lipst_moved = lipst_moved || moved.differing > 0;
+        }
+    }
+    check(smoothing_moved,
+          "the edge lipschitz NPMethod smoothing moves the host result");
+    check(lipst_moved,
+          "the edge lipschitz Lipst influence moves the host result");
+}
 
 /* ----------------------------------------------------- lab.wavelet final */
 
@@ -15812,6 +16086,7 @@ int main()
     test_lab_wavelet_contrast(available);
     test_lab_wavelet_chroma(available);
     test_lab_wavelet_edge(available);
+    test_lab_wavelet_edge_lipschitz(available);
     test_lab_wavelet_final(available);
     test_lab_wavelet_ba(available);
     test_lab_wavelet_toning(available);
