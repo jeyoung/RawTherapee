@@ -35,6 +35,9 @@
 
 #include "rt_algo.h"
 #include "sharpen_core.h"
+#include "array2D.h"
+#include "boxblur.h"
+#include "guidedfilter.h"
 
 #include <algorithm>
 #include <cmath>
@@ -9996,9 +9999,11 @@ void test_lab_wavelet_denoise_curve()
 /*
  * CLmethod's level selection and the clarity arm. The selection is
  * finalContAllL()/ContAllAB()'s coefficient zeroing and background paint; the
- * clarity arm is the block's two-pass sequence, the optional guided filter
- * excepted, followed by the mergeL/mergeC merge. Every Backmethod branch and
- * both merge sliders are covered, alone and with contrast, chroma and denoise.
+ * clarity arm is the block's two-pass sequence, the guided soft radius and
+ * then the mergeL/mergeC merge. Every Backmethod branch and both merge sliders
+ * are covered, alone and with contrast, chroma and denoise, and the soft
+ * radius is covered at both subsampling arms: the plain one the small images
+ * take and the bilinear one the wide images take.
  */
 void test_lab_wavelet_clarity()
 {
@@ -10038,6 +10043,8 @@ void test_lab_wavelet_clarity()
         bool denoise;
         bool expclari;
         bool highlight_shadow;
+        /* The clarity panel's guided soft radius; zero for every other case. */
+        double softrad;
     };
 
     const int contrast[9] = {30, 22, 14, 8, 4, 2, 0, 0, 0};
@@ -10087,6 +10094,32 @@ void test_lab_wavelet_clarity()
          false, false, false},
         {"expclari with all", 238, 64, 5, "all", "grey", 20, 20, "all", 4,
          true, false, false, true},
+        /*
+         * The guided soft radius. Small images take guidedfilter.cc's
+         * subsampling of one (max(w, h) <= 600), so the block's box radius is
+         * the slider's own; the wide cases take 5 and run the bilinear
+         * down/upsample, with 703 leaving a non-integral scale.
+         */
+        {"softrad 5", 238, 64, 5, "one", "black", 60, 60, "all", 4, true,
+         false, false, true, false, 5.0},
+        {"softrad 0.5", 238, 64, 5, "sup", "resid", 30, 30, "all", 4, true,
+         false, false, true, false, 0.5},
+        {"softrad 2", 179, 48, 5, "inf", "black", 20, 20, "all", 4, true,
+         false, false, true, false, 2.0},
+        {"softrad 100", 238, 64, 5, "one", "black", 60, 60, "all", 4, true,
+         false, false, true, false, 100.0},
+        /* The zero-factor merge ignores the second pass, so the soft radius is
+         * a no-op there and must still match the block byte for byte. */
+        {"softrad zero merge", 238, 64, 5, "inf", "grey", 20, 20, "all", 4,
+         true, false, false, true, false, 5.0},
+        {"softrad 5 chroma", 238, 64, 6, "one", "black", 20, 20, "all", 4,
+         true, true, false, true, false, 5.0},
+        {"softrad 5 denoise", 238, 160, 6, "one", "black", 20, 20, "all", 4,
+         false, false, true, true, false, 5.0},
+        {"softrad 5 subsampled", 703, 67, 5, "one", "black", 60, 60, "all", 4,
+         true, false, false, true, false, 5.0},
+        {"softrad 20 wide", 8192, 64, 6, "one", "black", 60, 60, "all", 4,
+         true, false, false, true, false, 20.0},
     };
 
     unsigned seed = 0x51c1a7u;
@@ -10106,6 +10139,7 @@ void test_lab_wavelet_clarity()
         params.wavelet.Lmethod = item.lmethod;
         params.wavelet.expclari = item.expclari;
         params.wavelet.ushamethod = "sharp";
+        params.wavelet.softrad = item.softrad;
         if (item.highlight_shadow) {
             params.wavelet.HSmethod = "with";
         }
@@ -10136,7 +10170,6 @@ void test_lab_wavelet_clarity()
         const LabWaveletRun result =
             run_lab_wavelet_node(device, params, device_ipf, profile_path);
         const std::string profile = read_file(profile_path);
-
         check(result.deviceReady,
               (std::string("lab.wavelet clarity ") + item.label +
                " builds its host setup").c_str());
@@ -10209,13 +10242,54 @@ void test_lab_wavelet_clarity()
     }
 
     /*
+     * The guided soft radius must not be a no-op: the same profile with and
+     * without it must differ on the host block, so the device cases above
+     * cannot pass by ignoring the slider.
+     */
+    {
+        rtengine::procparams::ProcParams params;
+        wavelet_contrast_params(params, 5, false, contrast, 1.0, 1.0, 100);
+        params.wavelet.expclari = true;
+        params.wavelet.ushamethod = "sharp";
+        params.wavelet.Backmethod = "black";
+        params.wavelet.CLmethod = "one";
+        params.wavelet.mergeL = 60;
+        params.wavelet.mergeC = 60;
+
+        rtengine::procparams::ProcParams plain = params;
+        params.wavelet.softrad = 5.0;
+
+        LabImage source(238, 64);
+        fill_lab_tools(source, seed++);
+
+        rtengine::ImProcFunctions soft_ipf(&params, false);
+        LabImage soft(238, 64);
+        soft.CopyFrom(&source);
+        labWaveletHostBlock(soft_ipf, params, soft);
+
+        rtengine::ImProcFunctions plain_ipf(&plain, false);
+        LabImage plain_image(238, 64);
+        plain_image.CopyFrom(&source);
+        labWaveletHostBlock(plain_ipf, plain, plain_image);
+
+        const Diff diff = compare(view(plain_image), view(soft));
+        std::printf("stage-residency: lab.wavelet clarity soft radius changes "
+                    "%zu of %zu samples, PAE %.6f LSB16\n",
+                    diff.differing, diff.samples, diff.max_abs);
+        check(diff.differing > 1000 && diff.max_abs > 1.0,
+              "lab.wavelet clarity soft radius changes the image");
+    }
+
+    /*
      * Refusals: the CLmethod, Backmethod and Dirmethod values the block would
      * leave to an uninitialised field, an Lmethod or merge slider outside the
-     * widget range, and the guided soft radius the unit does not port.
+     * widget range, and the final panel's guided soft radius, which is not
+     * ported.
      */
     const char* residual_labels[] = {
         "CLmethod unknown", "Backmethod unknown", "Dirmethod unknown",
-        "Lmethod low", "Lmethod high", "mergeL high", "mergeC low", "softrad"};
+        "Lmethod low", "Lmethod high", "mergeL high", "mergeC low",
+        "softradend"};
     for (const char* label : residual_labels) {
         rtengine::procparams::ProcParams params;
         wavelet_contrast_params(params, 5, false, contrast, 1.0, 1.0, 100);
@@ -10238,8 +10312,8 @@ void test_lab_wavelet_clarity()
             params.wavelet.mergeL = 101.0;
         } else if (std::strcmp(label, "mergeC low") == 0) {
             params.wavelet.mergeC = -51.0;
-        } else if (std::strcmp(label, "softrad") == 0) {
-            params.wavelet.softrad = 5.0;
+        } else if (std::strcmp(label, "softradend") == 0) {
+            params.wavelet.softradend = 0.5;
         }
 
         check(!labWaveletSupported(params, 238, 64),
