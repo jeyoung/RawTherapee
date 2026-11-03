@@ -211,9 +211,12 @@ current tip.
   an extra round trip the host does not perform; the final tail reuses the
   pre-denoise statistics unless `cp.val`, `ref`, `contr` or `cp.diagcurv`
   asks for a refresh (`679f5b4d8`). Ten residuals (`quaMethod` agre,
-  balchrom, `Wavhuecurve`, `CBenab`, `sliMethod` cur, Thrden, Ballum range,
-  level range, all sliders zero and the 128-pixel window) run the host
-  builtin byte for byte. A user chroma strength is admitted and inert: the
+  balchrom, `Wavhuecurve`, `CBenab`, `sliMethod` cur, Ballum range, level
+  range, all sliders zero and the 128-pixel window) run the host builtin byte
+  for byte. The `sliMethod == "sli"` Thrden refinement is a device case: the
+  host exports the block's `wavlow` flat-curve polyline and the kernel walks
+  it exactly (new accessors on `FlatCurve`), with four cases at worst
+  0.050781 LSB16 and `labwavelet-thrden.pp3` at 1 LSB16 with `impl=opencl`. A user chroma strength is admitted and inert: the
   forced arm's `variC` is dead at `local == 1` and `cp.chromco` never reaches
   its `> 30` ramp test, so the host output is byte-identical with the sliders
   zeroed. `labwavelet-denoise.pp3` records
@@ -231,7 +234,7 @@ current tip.
   `xlogf`/`xexpf`/`pow_F` and the block's repeated four-band write. Ten cases
   (mixmet 0-3, an identity curve, contrast, edge, final curves, an odd size
   and all panels) match the host with worst 0.043945 LSB16; four residuals
-  (`sigm` range, expert pairing, Thrden and user chromi) stay on the host.
+  (`sigm` range and expert pairing) stay on the host.
   `labwavelet-denoise-cur.pp3` records `impl=opencl` at 1 LSB16 (21,068 of
   30,419,712 samples). `ba5f8f1d3`, `dca455499`.
 - **`local.adjustments` groundwork (pushed)**: host block extracted
@@ -818,11 +821,9 @@ when the block's own trim drops them to zero; a profile whose `ch[]`, opacity
 curve, `cbenab`, `CHmethod`/`chro` or residual sliders would stop that trim
 short of zero stays a host residual.
 
-The denoise-curve refinement landed (`ba5f8f1d3`, `dca455499`). Next is the
-`sli` `Thrden` refinement, which reuses the same machinery with
-`kc = wavlow[absciss] - 1` and admits a non-zero `Thrden`; then the guided
-soft radius, whose WIP branch narrows the remaining fault to the
-`CLmethod=inf` pre-merge L (see `wip/lab-wavelet-softrad`). The soft radius
+The denoise-curve and `sli` Thrden refinements landed. Next is the guided soft
+radius, whose WIP branch narrows the remaining fault to the `CLmethod=inf`
+pre-merge L (see `wip/lab-wavelet-softrad`). The soft radius
 unit is a separable box/reduction kernel pair plus the XYZ round trip, not a
 new merge. The standard denoise arm (and the chroma denoise the block forces
 at six levels) landed with the unit above; its denoise curves, expert pairing,

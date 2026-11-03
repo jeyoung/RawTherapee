@@ -93,6 +93,8 @@ pairs are exact. The gate is the peak absolute error (PAE) in normalised units;
 | 2026-11-03 | `6bcd826f9..dca455499` | POCL (CPU) | 10-case "cur" matrix (mixmet 0/1/2/3, identity curve, contrast, edge, final curves, odd 179x161, all panels), `stage-residency-test` | device vs host block | 0.043945 LSB16 (worst: final curves) | PASS |
 | 2026-11-03 | `6bcd826f9..dca455499` | POCL (CPU) | 3-case "cur" residual matrix (sigm above range, expert pairing, Thrden), `stage-residency-test` | device vs host block | 0 (host) | PASS |
 | 2026-11-03 | `43732fb51..8cef1c71b` | POCL (CPU) | 3-case user chroma matrix (`chromfi` 40, `chromco` 60, both 100), `stage-residency-test` | device vs host block | 0.011719 LSB16 (denoise pair) | PASS |
+| 2026-11-03 | `4338a0570..27c9cffac` | POCL (CPU) | colorspace_flowers.pef / `labwavelet-thrden.pp3` (Expnoise, `sliMethod=sli`, `Thrden=5`), `lab.wavelet` | off vs auto, 16-bit TIFF | 1 LSB (24,753 of 30,419,712) | PASS |
+| 2026-11-03 | `4338a0570..27c9cffac` | POCL (CPU) | 4-case Thrden matrix (1, 5, 20 and 20 with the final curves), `stage-residency-test` | device vs host block | 0.050781 LSB16 (worst: with final curves) | PASS |
 | 2026-11-02 | 89e0a844b..47b9980fb | POCL (CPU) | colorspace_flowers.pef / `labtools-labcurve-contrast.pp3` (Lab curves with contrast 30, L/a/b/cc/lc/cl tables), `lab.tools` | off vs auto, 16-bit TIFF | 0 (exact) | PASS |
 | 2026-11-02 | 89e0a844b..47b9980fb | POCL (CPU) | 3-case Lab-contrast matrix (contrast 5, contrast 15 with L curve+brightness, contrast 30 with all six tables), `stage-residency-test` | device vs host block | 0 (exact) | PASS |
 | 2026-11-02 | uncommitted | POCL (CPU) | colorspace_flowers.pef / `labtools-labcurve-contrast.pp3` with `Gamutmunse=XYZ`, `lab.tools` | off vs auto, 16-bit TIFF | 0 (exact) | PASS |
@@ -408,7 +410,15 @@ peak absolute error is zero for the synthetic node tests:
   this arm: the block's `variC` is dead at the forced `local == 1`, and
   `cp.chromco` is 0.1 times a 0..100 slider, so its `> 30` ramp test is
   unreachable. The three admitted cases are device-exact against the host and
-  the host output is byte-identical with the sliders zeroed. `labwavelet-denoise-cur.pp3` is 1 LSB16
+  the host output is byte-identical with the sliders zeroed.  With `sliMethod == "sli"` and a non-zero `Thrden`, the refinement instead
+  samples the block's four-point `wavlow` flat curve. The host builds the same
+  `FlatCurve` the block builds, exports its faceted polyline through the new
+  `FlatCurve::polylineX/Y/Slope()` accessors, and the kernel walks it with the
+  block's periodic wrap, binary search and linear interpolation in double.
+  Four cases (Thrden 1, 5, 20 and 20 with the final curves) match the host with
+  worst 0.050781 LSB16, and each differs from `Thrden = 0` (PAE 12,476 LSB16 or
+  more), so the refinement is not vacuous; `labwavelet-thrden.pp3` records
+  `impl=opencl` at 1 LSB16. `labwavelet-denoise-cur.pp3` is 1 LSB16
   on the export TIFF (AE=1, 21,068 of 30,419,712 samples), records
   `impl=opencl`, and differs from the same profile with `sliMethod=sli` at
   30,064,859 of 30,419,712 samples (PAE 1600 LSB16), so the export exercises

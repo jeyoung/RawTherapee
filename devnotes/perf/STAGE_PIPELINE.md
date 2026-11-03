@@ -275,10 +275,11 @@ the `mixmet` weight and the per-level curve scalars, and the kernel ports
 transcendentals. The refinement is launched direction-major, level-minor and
 writes levels 0..3 on every level iteration, exactly as the block's repeated
 application. `cp.denmet` is hard-coded to four, so the only level factors are
-0.3 on levels 0 and 1 and one on levels 2 and 3. The `sli` Thrden arm, the
-expert pairing, noise balance, the hue curve and colour-by-noise stay host
-residuals, as does an unknown `mixMethod` or a sigma outside its widget
-range. A user chroma strength is admitted and inert: `variC` is dead at the
+0.3 on levels 0 and 1 and one on levels 2 and 3. The `sli` Thrden arm runs the
+same refinement with the block's four-point `wavlow` flat curve: the host
+exports the faceted polyline and the kernel walks it exactly. The expert
+pairing, noise balance, the hue curve and colour-by-noise stay host residuals,
+as does an unknown `mixMethod` or a sigma outside its widget range. A user chroma strength is admitted and inert: `variC` is dead at the
 forced `local == 1` and `cp.chromco` cannot reach its `> 30` ramp test. The pass order is forward analysis,
 statistics/mea, MAD/shrink L, the pre-denoise snapshot, denoise, the
 post-denoise statistics and curve refinement, contrast/edge/final, noise
