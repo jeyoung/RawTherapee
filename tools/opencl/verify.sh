@@ -18,6 +18,8 @@
 #    RT_REPORT      Output directory for CSV results (default: $RT_TESTDATA)
 #    RT_OPENCL_ALLOW_CPU=1  Select a CPU OpenCL device for testing
 #    RT_ALLOW_CPU_PARITY=1 Compare CPU paths when no OpenCL device is selected
+#    RT_VERIFY_ALLOW_GPU=1  Permit the ambient vendor ICD; otherwise only a
+#                           pocl-only OCL_ICD_VENDORS directory is accepted
 #
 set -euo pipefail
 
@@ -48,6 +50,24 @@ die() {
     printf 'error: %s\n' "$*" >&2
     exit 1
 }
+
+# Refuse the ambient vendor ICD by default. A kernel fault that POCL reports
+# as a process crash becomes a GPU ring reset under the vendor driver, losing
+# VRAM and the desktop session. Source tools/opencl/pocl-env.sh for device
+# work, or set RT_VERIFY_ALLOW_GPU=1 for a deliberate hardware run.
+require_safe_icd() {
+    [ "${RT_VERIFY_ALLOW_GPU:-0}" = "1" ] && return 0
+    [ -n "${OCL_ICD_VENDORS:-}" ] ||
+        die "refusing the ambient OpenCL vendors; source tools/opencl/pocl-env.sh or set RT_VERIFY_ALLOW_GPU=1"
+    [ -d "$OCL_ICD_VENDORS" ] ||
+        die "OCL_ICD_VENDORS is not a directory: $OCL_ICD_VENDORS"
+    if find "$OCL_ICD_VENDORS" -maxdepth 1 -name '*.icd' \
+        ! -name 'pocl.icd' -print -quit 2>/dev/null | grep -q .; then
+        die "OCL_ICD_VENDORS contains a non-POCL ICD; source tools/opencl/pocl-env.sh or set RT_VERIFY_ALLOW_GPU=1"
+    fi
+}
+
+require_safe_icd
 
 find_cli() {
     if [ -n "${RT_BUILD_DIR:-}" ]; then
