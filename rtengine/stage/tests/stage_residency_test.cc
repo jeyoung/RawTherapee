@@ -9397,6 +9397,7 @@ void wavelet_denoise_params(rtengine::procparams::ProcParams& params,
 }
 
 void test_lab_wavelet_clarity();
+void test_lab_wavelet_denoise_curve();
 
 void test_lab_wavelet_denoise(bool available)
 {
@@ -9595,13 +9596,13 @@ void test_lab_wavelet_denoise(bool available)
 
     /*
      * Refusals: BiShrink, a user chroma denoise or balance, the hue curve,
-     * colour-by-noise, the denoise curves, an all-zero slider set, an
+     * colour-by-noise, the Thrden arm, an all-zero slider set, an
      * out-of-range slider and the 128-pixel window must run the host block
-     * byte for byte.
+     * byte for byte. The "cur" refinement has its own matrix below.
      */
     const char* residual_labels[] = {
         "quamethod agre", "user chromfi", "user chromco", "balance chroma",
-        "wavhuecurve", "cbenab", "slimethod cur", "thrden", "ballum range",
+        "wavhuecurve", "cbenab", "thrden", "ballum range",
         "level range", "all sliders zero", "sub-128 window"};
     for (const char* label : residual_labels) {
         rtengine::procparams::ProcParams params;
@@ -9624,8 +9625,6 @@ void test_lab_wavelet_denoise(bool available)
                                           0.35};
         } else if (std::strcmp(label, "cbenab") == 0) {
             params.wavelet.cbenab = true;
-        } else if (std::strcmp(label, "slimethod cur") == 0) {
-            params.wavelet.slimethod = "cur";
         } else if (std::strcmp(label, "thrden") == 0) {
             params.wavelet.thrden = 5.0;
         } else if (std::strcmp(label, "ballum range") == 0) {
@@ -9687,13 +9686,273 @@ void test_lab_wavelet_denoise(bool available)
                " matches the CPU block").c_str());
     }
 
+    /* The denoise-curve refinement shares this test's device gate. */
+    if (available) {
+        test_lab_wavelet_denoise_curve();
+    }
+
     /* The clarity unit shares this test's device gate so it does not add a
      * second skipped entry to the suite. */
     test_lab_wavelet_clarity();
 }
 
-/* ---------------------------------------------- lab.wavelet clarity */
+/* ------------------------------------- lab.wavelet denoise curve "cur" */
 
+/*
+ * A non-identity denoise curve for the "cur" refinement. The block's
+ * `wavdenoise` curve is a FlatCurve sampled into a 501-entry WavCurve; every
+ * value below one gives `kc = value - 1` and the negative branch, which is
+ * the arm the GUI can produce (FlatCurve values stay in 0..1). The curve's
+ * entries differ from one, so `cp.denoicurv` is set and the refinement runs.
+ */
+const std::vector<double>& denoise_curve()
+{
+    static const std::vector<double> curve = {
+        static_cast<double>(FCT_MinMaxCPoints), 0.0, 0.55, 0.35, 0.35,
+        0.5, 0.25, 0.35, 0.35, 1.0, 0.90, 0.35, 0.35};
+    return curve;
+}
+
+/*
+ * The "cur" arm: `sliMethod == "cur"` replaces the post-denoise statistics
+ * with the pre/post mix and applies the block's `wavdenoise` curve. `denmet`
+ * is hard-coded to four, so the only level factors are 0.3 on levels 0 and 1
+ * and one on levels 2 and 3; every case exercises both because each level
+ * iteration writes all four bands. The refinement's early-out uses the
+ * pre- and post-denoise statistics, so a case is only meaningful when the
+ * sli/cur host results differ.
+ */
+void test_lab_wavelet_denoise_curve()
+{
+    using namespace rtengine::stage;
+
+    const std::string profile_path =
+        std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp") +
+        "/stage-residency-lab-wavelet-denoise-cur.jsonl";
+
+    struct CurveCase {
+        const char* label;
+        int width;
+        int height;
+        const char* mix;
+        bool curve;
+        bool contrast;
+        bool edge;
+        bool final;
+        int image; /* 0 random, 1 skin */
+    };
+
+    const double noise[5] = {40, 30, 20, 10, 5};
+    const CurveCase cases[] = {
+        {"cur nois", 238, 160, "nois", true, false, false, false, 0},
+        {"cur mix", 238, 160, "mix", true, false, false, false, 0},
+        {"cur mix7", 238, 160, "mix7", true, false, false, false, 0},
+        {"cur den", 238, 160, "den", true, false, false, false, 1},
+        {"cur identity curve", 238, 160, "mix7", false, false, false, false,
+         0},
+        {"cur mix7 contrast", 238, 160, "mix7", true, true, false, false, 0},
+        {"cur mix7 edge", 238, 160, "mix7", true, false, true, false, 1},
+        {"cur mix7 final", 238, 160, "mix7", true, false, false, true, 0},
+        {"cur odd 179x161", 179, 161, "mix7", true, false, false, false, 0},
+        {"cur all panels", 238, 160, "mix", true, true, true, true, 1},
+    };
+
+    unsigned seed = 0x6c2b91u;
+    for (const CurveCase& item : cases) {
+        rtengine::procparams::ProcParams params;
+        wavelet_denoise_params(params, 6, noise, 7.0);
+        params.wavelet.slimethod = "cur";
+        params.wavelet.mixmethod = item.mix;
+        if (item.curve) {
+            params.wavelet.wavdenoise = denoise_curve();
+        }
+        if (item.contrast) {
+            params.wavelet.expcontrast = true;
+            const int contrast[9] = {30, 22, 14, 8, 4, 2, 0, 0, 0};
+            for (int level = 0; level < 9; ++level) {
+                params.wavelet.c[level] = contrast[level];
+            }
+        }
+        if (item.edge) {
+            params.wavelet.expedge = true;
+            params.wavelet.edgval = 50;
+            params.wavelet.edgrad = 15;
+            params.wavelet.edgthresh = 10;
+            params.wavelet.edgeffect = 1.0;
+        }
+        if (item.final) {
+            params.wavelet.expfinal = true;
+            params.wavelet.sigmafin = 1.0;
+            params.wavelet.wavclCurve = final_diagonal_curve();
+            params.wavelet.opacityCurveWL = final_opacity_curve();
+        }
+
+        LabImage source(item.width, item.height);
+        if (item.image == 1) {
+            fill_lab_wavelet_skin(source);
+        } else {
+            fill_lab_tools(source, seed++);
+        }
+
+        check(labWaveletSupported(params, item.width, item.height),
+              (std::string("lab.wavelet denoise curve ") + item.label +
+               " is the supported set").c_str());
+
+        rtengine::ImProcFunctions cpu_ipf(&params, false);
+        LabImage cpu(item.width, item.height);
+        cpu.CopyFrom(&source);
+        labWaveletHostBlock(cpu_ipf, params, cpu);
+
+        rtengine::ImProcFunctions device_ipf(&params, false);
+        LabImage device(item.width, item.height);
+        device.CopyFrom(&source);
+        const LabWaveletRun result =
+            run_lab_wavelet_node(device, params, device_ipf, profile_path);
+        const std::string profile = read_file(profile_path);
+
+        check(result.supported,
+              (std::string("lab.wavelet denoise curve ") + item.label +
+               " resolves to the supported set").c_str());
+        check(result.deviceReady,
+              (std::string("lab.wavelet denoise curve ") + item.label +
+               " builds its host setup").c_str());
+        check(result.status == RT_STAGE_OK,
+              (std::string("lab.wavelet denoise curve ") + item.label +
+               " completes through run()").c_str());
+        check(profile.find("\"stage\":\"lab.wavelet\"") != std::string::npos,
+              (std::string("lab.wavelet denoise curve ") + item.label +
+               " records the node").c_str());
+        check(profile.find("\"impl\":\"opencl\"") != std::string::npos,
+              (std::string("lab.wavelet denoise curve ") + item.label +
+               " records a device execution").c_str());
+
+        const Distribution d = distribution(view(device), view(cpu));
+        std::printf("stage-residency: lab.wavelet denoise curve %s %dx%d: "
+                    "PAE %.6f LSB16; exact %zu, <=0.25 %zu, <=0.5 %zu, "
+                    "<=1 %zu, >1 %zu of %zu\n",
+                    item.label, item.width, item.height, d.max_abs, d.exact,
+                    d.quarter, d.half, d.one, d.over, d.samples);
+        check(d.finite,
+              (std::string("lab.wavelet denoise curve ") + item.label +
+               " stays finite").c_str());
+        check(d.over == 0,
+              (std::string("lab.wavelet denoise curve ") + item.label +
+               " is within one LSB16").c_str());
+
+        /* Non-vacuity against the panel-off result. */
+        rtengine::procparams::ProcParams off = params;
+        off.wavelet.expnoise = false;
+        rtengine::ImProcFunctions off_ipf(&off, false);
+        LabImage off_image(item.width, item.height);
+        off_image.CopyFrom(&source);
+        labWaveletHostBlock(off_ipf, off, off_image);
+        const Diff active = compare(view(cpu), view(off_image));
+        std::printf("stage-residency: lab.wavelet denoise curve %s changes "
+                    "%zu of %zu samples against the panel-off result\n",
+                    item.label, active.differing, active.samples);
+        check(active.differing > 0,
+              (std::string("lab.wavelet denoise curve ") + item.label +
+               " is non-vacuous").c_str());
+
+        /*
+         * Non-vacuity of the refinement itself: the same profile with the
+         * "sli" method leaves the curve unused, so the host difference is
+         * the refinement's contribution.
+         */
+        if (item.curve) {
+            rtengine::procparams::ProcParams sli = params;
+            sli.wavelet.slimethod = "sli";
+            rtengine::ImProcFunctions sli_ipf(&sli, false);
+            LabImage sli_image(item.width, item.height);
+            sli_image.CopyFrom(&source);
+            labWaveletHostBlock(sli_ipf, sli, sli_image);
+            const Diff refined = compare(view(cpu), view(sli_image));
+            std::printf("stage-residency: lab.wavelet denoise curve %s "
+                        "refines %zu of %zu samples against sli, PAE %.6f "
+                        "LSB16\n",
+                        item.label, refined.differing, refined.samples,
+                        refined.max_abs);
+            check(refined.differing > 0,
+                  (std::string("lab.wavelet denoise curve ") + item.label +
+                   " refines the result").c_str());
+        }
+    }
+
+    /*
+     * Refusals specific to "cur": an out-of-range sigma (the block divides
+     * by it), the expert level pairing, the Thrden path and a user chroma
+     * strength must run the host block byte for byte.
+     */
+    const char* residual_labels[] = {
+        "cur sigm above range", "cur expert", "cur thrden",
+        "cur user chromfi"};
+    for (const char* label : residual_labels) {
+        rtengine::procparams::ProcParams params;
+        wavelet_denoise_params(params, 6, noise, 7.0);
+        params.wavelet.slimethod = "cur";
+        params.wavelet.mixmethod = "mix7";
+        params.wavelet.wavdenoise = denoise_curve();
+        if (std::strcmp(label, "cur sigm above range") == 0) {
+            params.wavelet.sigm = 5.0;
+        } else if (std::strcmp(label, "cur expert") == 0) {
+            params.wavelet.complexmethod = "expert";
+        } else if (std::strcmp(label, "cur thrden") == 0) {
+            params.wavelet.thrden = 5.0;
+        } else {
+            params.wavelet.chromfi = 1.0;
+        }
+
+        const int width = 238;
+        const int height = 160;
+        check(!labWaveletSupported(params, width, height),
+              (std::string("lab.wavelet denoise curve residual ") + label +
+               " is a residual").c_str());
+
+        LabImage source(width, height);
+        fill_lab_wavelet_skin(source);
+
+        rtengine::ImProcFunctions cpu_ipf(&params, false);
+        LabImage cpu(width, height);
+        cpu.CopyFrom(&source);
+        labWaveletHostBlock(cpu_ipf, params, cpu);
+
+        rtengine::ImProcFunctions device_ipf(&params, false);
+        LabImage device(width, height);
+        device.CopyFrom(&source);
+        const LabWaveletRun result =
+            run_lab_wavelet_node(device, params, device_ipf, profile_path);
+        const std::string profile = read_file(profile_path);
+
+        check(!result.supported,
+              (std::string("lab.wavelet denoise curve residual ") + label +
+               " is refused as a device configuration").c_str());
+        check(!result.deviceReady,
+              (std::string("lab.wavelet denoise curve residual ") + label +
+               " does not build a device setup").c_str());
+        check(result.status == RT_STAGE_OK,
+              (std::string("lab.wavelet denoise curve residual ") + label +
+               " completes through run()").c_str());
+        check(profile.find("\"impl\":\"host\"") != std::string::npos,
+              (std::string("lab.wavelet denoise curve residual ") + label +
+               " records a host execution").c_str());
+        check(profile.find("\"impl\":\"opencl\"") == std::string::npos,
+              (std::string("lab.wavelet denoise curve residual ") + label +
+               " never mixes a device pass").c_str());
+
+        const Diff diff = compare(view(device), view(cpu));
+        std::printf("stage-residency: lab.wavelet denoise curve residual %s: "
+                    "host, PAE %.6f LSB16, %zu of %zu samples differ\n",
+                    label, diff.max_abs, diff.differing, diff.samples);
+        check(diff.finite,
+              (std::string("lab.wavelet denoise curve residual ") + label +
+               " stays finite").c_str());
+        check(diff.differing == 0 && diff.max_abs == 0.0,
+              (std::string("lab.wavelet denoise curve residual ") + label +
+               " matches the CPU block").c_str());
+    }
+}
+
+/* ---------------------------------------------- lab.wavelet clarity */
 /*
  * CLmethod's level selection and the clarity arm. The selection is
  * finalContAllL()/ContAllAB()'s coefficient zeroing and background paint; the
