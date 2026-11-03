@@ -165,13 +165,12 @@ current tip.
   Thirteen device cases (diagonal only, opacity only, both, sigmafin
   0.5/2.0, default curves, with contrast, with chroma, with edge, 179x49
   padded, 3 and 7 levels, inert balance controls) match the host block with
-  a worst 0.015625 LSB16; fourteen residual configurations (softradend,
-  softrad, `BAmethod` sli, `tmr`, `expclari`, sigmafin below/above range,
+  a worst 0.015625 LSB16; thirteen residual configurations (softrad,
+  `BAmethod` sli, `tmr`, `expclari`, sigmafin below/above range,
   avoid, median, expbl, expresid, expnoise, `CLmethod` one and
   skin protection) run the host builtin byte for byte. The export gate
   `labwavelet-final.pp3` records `impl=opencl` at 1 LSB16. The remaining
-  final-panel residuals are the guided soft-radius tone mapping and the
-  balance-chroma arms. `6a54860e1`, `873000037`.
+  final-panel residual is the balance-chroma arm. `6a54860e1`, `873000037`.
 - **`lab.wavelet` toning (zero-protection)**: `ExpToning`'s opacity-curve
   multiply on the a/b bands. The host builds the nine `mulopaRG`/`mulopaBY`
   samples from the 501-point curves; `computeMea()` fills the per-level
@@ -200,8 +199,28 @@ current tip.
   be negative; the earlier `inf` failures were the merge kernel's own clamp,
   now removed. Nine cases (softrad 0.5/2/5/100, zero merge, chroma, denoise,
   703x67 subsampled and 8192x64) are exact except the denoise pair at 0.011719
-  LSB16, and `labwavelet-softrad.pp3` is exact with `impl=opencl`. `softradend`
-  remains a residual.
+  LSB16, and `labwavelet-softrad.pp3` is exact with `impl=opencl`.
+- **`lab.wavelet` final soft radius**: `softradend`'s portable sub-case runs
+  `guidedFilterLog()` on the device. The host derives the blend
+  `LIM01(strend / 100)`, `epsilon = 0.001 * 2^-detend`, the radius
+  `max(int(softradend), 1)` and the subsampled box grid and four bilinear
+  scales; the prepare kernel writes `guide = xlin2log(L / 32768)`,
+  `src = xlin2log(L)` and the pre-filter L, the clarity arm's guided-filter
+  chain runs unchanged, and the finish kernel applies `xlog2lin(q)` and
+  `intp(blend, q, iL)`. It runs after the final pixel curve in both the
+  denoise and the plain branch. Eighteen cases (softradend 1..1000, every
+  blend and detail-adjust extreme, final curves, contrast, denoise, odd,
+  subsampled and smooth grids) match the host block with a worst 0.765625
+  LSB16 (curves); the plain, odd, subsampled and smooth cases are exact. Ten
+  refusals (Thrend, non-identity `wavguidcurve`, missing `Expfinal`,
+  out-of-range sliders, clarity arm and clarity soft radius) run the host
+  builtin byte for byte. `labwavelet-softradend.pp3` is exact with
+  `impl=opencl`. The coefficient-domain second block (`Thrend > 0`) and the
+  hue modulation remain residuals. Because the filter works in the log
+  domain, it amplifies a one-LSB16 input difference by up to about five
+  LSB16, so the export gate uses identity final curves; a non-identity final
+  curve can leave a sub-LSB difference that the radius amplifies.
+  `4f476722d`, `aaa41f842`.
 - **`lab.wavelet` standard denoise**: `Expnoise`'s standard-L arm together
   with the chroma denoise `ip_wavelet()` forces at six levels. The block
   raises the L decomposition to seven levels, sets `cp.chromfi = 0.01` and
@@ -819,6 +838,24 @@ once the wavelet panels land. EPD stays a permanent residual.
 
 ## Next immediate task
 
+The `lab.wavelet` final soft radius (`softradend`) landed with `4f476722d`
+(engine) and `aaa41f842` (test and export gate). Only the portable sub-case
+runs on the device: `Expfinal` set, `Thrend == 0` and an identity
+`wavguidcurve`. The host exports the blend `LIM01(strend / 100)`, the epsilon
+`0.001 * 2^-detend`, the radius `max(int(softradend), 1)` and the subsampled
+box grid and four bilinear scales. The prepare kernel builds
+`guide = xlin2log(L / 32768)` and `src = xlin2log(L)` and keeps the pre-filter
+L; the clarity arm's guided-filter chain runs unchanged; the finish kernel
+applies `xlog2lin(q)` and `intp(blend, q, iL)`. It runs after the final pixel
+curve in both the denoise and the plain branch. Eighteen cases are within
+0.765625 LSB16 (the plain, odd, subsampled and smooth cases are exact), ten
+refusals run the host builtin byte for byte, and `labwavelet-softradend.pp3`
+is exact with `impl=opencl`. The coefficient-domain second block (`Thrend >
+0`) and the hue modulation remain residuals. The export gate uses identity
+final curves because the log-domain filter amplifies a one-LSB16 input
+difference by up to about five LSB16; a non-identity final curve can leave a
+sub-LSB difference that the radius amplifies.
+
 The `lab.wavelet` clarity arm landed with `5ff287bda` (engine) and
 `dba2cc58a` (test and export gate). `CLmethod`'s `one`/`inf`/`sup` selection
 now runs on the device for every admitted panel set, the clarity sequence runs
@@ -836,10 +873,9 @@ block's `provradius` guide and the subsampling scales, the kernels port
 `guidedFilter()`, and the second pass now applies the block's `L <= 0 -> 1`
 tile-copy clamp while the merge keeps the soft-filtered L unclamped. Nine
 cases are exact except the denoise pair at 0.011719 LSB16, and
-`labwavelet-softrad.pp3` is exact. Next is `softradend`, the final panel's
-guided tone mapping, which adds `guidedFilterLog`, the `strend`/`detend`/
-`thrend` blend and its statistics. The standard denoise arm (and the chroma denoise the block forces
-at six levels) landed with the unit above; its denoise curves, expert pairing,
+`labwavelet-softrad.pp3` is exact. The standard denoise arm (and the chroma
+denoise the block forces at six levels) landed with the unit above; its
+denoise curves, expert pairing,
 BiShrink arms, user chroma strength, noise balance and hue curve stay
 residuals. The final curves and the toning zero-protection arm landed with the
 units above. The edge panel's plain arm is landed; its median/Lipschitz

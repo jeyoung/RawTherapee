@@ -97,6 +97,9 @@ pairs are exact. The gate is the peak absolute error (PAE) in normalised units;
 | 2026-11-03 | `4338a0570..27c9cffac` | POCL (CPU) | 4-case Thrden matrix (1, 5, 20 and 20 with the final curves), `stage-residency-test` | device vs host block | 0.050781 LSB16 (worst: with final curves) | PASS |
 | 2026-11-03 | `e54056e0a..29cc140ad` | POCL (CPU) | colorspace_flowers.pef / `labwavelet-softrad.pp3` (clarity, `Softrad=5`), `lab.wavelet` | off vs auto, 16-bit TIFF | 0 (exact) | PASS |
 | 2026-11-03 | `e54056e0a..29cc140ad` | POCL (CPU) | 9-case soft-radius matrix (softrad 0.5/2/5/100, zero merge, chroma, denoise, 703x67 subsampled, 8192x64), `stage-residency-test` | device vs host block | 0.011719 LSB16 (denoise pair; the rest exact) | PASS |
+| 2026-11-03 | `4f476722d..aaa41f842` | POCL (CPU) | colorspace_flowers.pef / `labwavelet-softradend.pp3` (final panel, identity `wavclCurve`/`opacityCurveWL`, `Softradend=20`, `Strend=70`, `Detend=1`, `Thrend=0`), `lab.wavelet` | off vs auto, 16-bit TIFF | 0 (AE=0, 0 of 30,419,712) | PASS |
+| 2026-11-03 | `4f476722d..aaa41f842` | POCL (CPU) | 18-case final soft-radius matrix (softradend 1/2/3/5/7/10/20/40/1000, strend 0/40/50/60/70/80/100, detend -10/-2/0/2/4/10, final curves, contrast, denoise, 179x161, 703x67, 1024x64, 400x300 smooth, 1024x64 and 703x67 subsampled smooth), `stage-residency-test` | device vs host block | 0.765625 LSB16 (worst: curves); plain, odd, subsampled and smooth cases exact | PASS |
+| 2026-11-03 | `4f476722d..aaa41f842` | POCL (CPU) | 10-case final soft-radius refusal matrix (Thrend, non-identity wavguidcurve, no Expfinal, softradend 1001/-1, strend 101, detend ±11, clarity soft radius, clarity arm), `stage-residency-test` | device vs host block | 0 (host) | PASS |
 | 2026-11-02 | 89e0a844b..47b9980fb | POCL (CPU) | colorspace_flowers.pef / `labtools-labcurve-contrast.pp3` (Lab curves with contrast 30, L/a/b/cc/lc/cl tables), `lab.tools` | off vs auto, 16-bit TIFF | 0 (exact) | PASS |
 | 2026-11-02 | 89e0a844b..47b9980fb | POCL (CPU) | 3-case Lab-contrast matrix (contrast 5, contrast 15 with L curve+brightness, contrast 30 with all six tables), `stage-residency-test` | device vs host block | 0 (exact) | PASS |
 | 2026-11-02 | uncommitted | POCL (CPU) | colorspace_flowers.pef / `labtools-labcurve-contrast.pp3` with `Gamutmunse=XYZ`, `lab.tools` | off vs auto, 16-bit TIFF | 0 (exact) | PASS |
@@ -131,8 +134,28 @@ the host builds the block's own `FlatCurve`-free guide from the pre-pass
 the kernels port `guidedFilter()`'s box means, `a`/`b` reduction and bilinear
 upsample. `ip_wavelet()`'s final tile copy raises an L at or below zero to one
 before the radius reads it; the soft-filtered L itself may be negative and the
-merge uses it unclamped. `softradend`, the final panel's guided tone mapping,
-stays a residual.
+merge uses it unclamped.
+
+The final panel's guided soft radius (`softradend`) is a device case only for
+the portable sub-case: `Expfinal` set, `Thrend == 0` (the coefficient-domain
+second block is skipped) and an identity `wavguidcurve` (the hue modulation is
+skipped). The host derives the blend `LIM01(strend / 100)`, the epsilon
+`0.001 * 2^-detend`, the radius `max(int(softradend), 1)` and the subsampled
+box grid and four bilinear scales with the block's arithmetic. The device
+builds `guide = xlin2log(L / 32768)` and `src = xlin2log(L)`, reuses the
+clarity arm's guided-filter chain, keeps the pre-filter L in its own plane and
+finishes with `xlog2lin(q)`, `intp(blend, q, iL)`. It runs after the final
+pixel curve in both the denoise and the plain branch. The clarity arm, the
+clarity soft radius and a non-zero `Thrend` stay host residuals; a non-zero
+`softradend` without `Expfinal` is refused.
+
+The filter operates in the log domain, where the derivative back to L is
+largest in the highlights, so it amplifies a one-LSB16 difference in its input
+L by up to about five LSB16 on the smooth case. The export gate therefore uses
+identity final curves, which makes the final pixel curve bit-exact and the
+gate `AE=0`. A non-identity final curve can leave a sub-LSB difference that
+the radius amplifies; the stage matrix covers that combination within one
+LSB16 on identical input, but the end-to-end TIFF can exceed it.
 
 `compare_tiff.py` now copies an already-uncompressed 16-bit TIFF instead of
 calling ImageMagick. That is the form RawTherapee's `-t -b16` export writes,

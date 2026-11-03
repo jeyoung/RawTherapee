@@ -340,8 +340,20 @@ block's `provradius` guide, the subsampling and the four bilinear scales, and
 the kernels port `guidedFilter()`'s box means, `a`/`b` reduction and bilinear
 upsample before the merge. The second pass clamps L at or below zero to one,
 as the block's final tile copy does; the soft-filtered L may be negative and
-the merge uses it unclamped. `softradend`, the final panel's guided tone
-mapping, remains refused.
+the merge uses it unclamped.
+
+The final panel's guided soft radius (`softradend`) also runs on the device
+for its portable sub-case: `Expfinal` set, `Thrend == 0` and an identity
+`wavguidcurve`. The host derives `blend = LIM01(strend / 100)`, `epsilon =
+0.001 * 2^-detend`, the radius `max(int(softradend), 1)` and the subsampled
+box grid and four bilinear scales. The prepare kernel writes `guide =
+xlin2log(L / 32768)`, `src = xlin2log(L)` and the pre-filter L into its own
+plane; the clarity arm's guided-filter chain runs unchanged; the finish kernel
+applies `xlog2lin(q)` and `intp(blend, q, iL)` to L. It runs after the final
+pixel curve in both the denoise and the plain branch, exactly at the end of
+`ip_wavelet()`. The clarity arm, the clarity soft radius and the non-zero
+`Thrend` second block remain host residuals, and a `softradend` without
+`Expfinal` is refused.
 
 It is admitted only on a CPU
 OpenCL device, and the wavelet pass also needs fp64. `CHmethod` `without` and
@@ -354,10 +366,11 @@ out-of-range `Lmethod` or merge slider, a
 closed CIE-CAM gate, an image too narrow or too small for its pyramid or Haar
 bands, a GPU or non-fp64 device and nothing enabled at all are residuals:
 each runs the `lab.wavelet` host builtin and records `impl=host`, never a
-device pass. The blur, residual, final, toning and noise panels
-are refused before any upload, as are the balance-chroma arm (`TMr` with a
-`BAmethod` other than `none`) and the soft radius, so a profile that enables
-any of them runs the whole block on the host.
+device pass. The blur and residual panels are refused before any upload, as
+are the balance-chroma arm (`TMr` with a `BAmethod` other than `none`), the
+unported edge and denoise sub-arms, and a non-zero `softradend` combined with
+the clarity arm or the clarity soft radius, so a profile that enables any of
+them runs the whole block on the host.
 
 `lab.sharpening` is partial. Its impulse-denoise and defringe pair is a device
 node of its own, admitted only in the Lab arm (not the CIE-CAM pipeline) with
