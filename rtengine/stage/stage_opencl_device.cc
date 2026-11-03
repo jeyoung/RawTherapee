@@ -6075,6 +6075,14 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
     cl_float softend_scale_dy = 1.0f;
     cl_float softend_scale_ux = 1.0f;
     cl_float softend_scale_uy = 1.0f;
+    bool softend_thrend = false;
+    bool softend_hue = false;
+    int softend_thrend_poly = 0;
+    int softend_hue_poly = 0;
+    cl_int softend_thrend_entry_offset = 0;
+    cl_int softend_thrend_curve_offset = 0;
+    cl_int softend_hue_curve_offset = 0;
+    cl_int softend_hue_active = 0;
     const float* wavelet_params = nullptr;
     const RtLabWaveletSelection& selection = context->selection;
     const RtLabWaveletClarity& clarity = context->clarity;
@@ -6167,6 +6175,34 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
             return RT_STAGE_INVALID;
         }
         softend_active = context->wavelet.softend == 1;
+        if (context->wavelet.softend_thrend != 0 &&
+            context->wavelet.softend_thrend != 1) {
+            error = "lab.wavelet soft-end thrend flag must be 0 or 1";
+            return RT_STAGE_INVALID;
+        }
+        softend_thrend = softend_active &&
+                         context->wavelet.softend_thrend == 1;
+        if (softend_thrend &&
+            (context->wavelet.softend_thrend_poly < 2 ||
+             context->wavelet.softend_thrend_poly >
+                 RT_LAB_WAVELET_REFINE_POLY_MAX)) {
+            error = "lab.wavelet soft-end wavguid curve knot count is out of "
+                    "range";
+            return RT_STAGE_INVALID;
+        }
+        softend_thrend_poly =
+            softend_thrend
+                ? static_cast<int>(context->wavelet.softend_thrend_poly)
+                : 0;
+        if (context->wavelet.softend_hue_poly >
+            RT_LAB_WAVELET_REFINE_POLY_MAX) {
+            error = "lab.wavelet soft-end hue curve knot count is out of "
+                    "range";
+            return RT_STAGE_INVALID;
+        }
+        softend_hue_poly =
+            static_cast<int>(context->wavelet.softend_hue_poly);
+        softend_hue = softend_active && softend_hue_poly >= 2;
         if (wavelet_entries !=
             static_cast<int>(labWaveletParamEntries(
                 static_cast<std::uint32_t>(wavelet_planes),
@@ -6174,7 +6210,9 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
                 wavelet_final, wavelet_toning, wavelet_denoise,
                 wavelet_refine,
                 static_cast<std::uint32_t>(wavelet_refine_poly),
-                wavelet_soft, softend_active))) {
+                wavelet_soft, softend_active, softend_thrend,
+                static_cast<std::uint32_t>(softend_thrend_poly),
+                static_cast<std::uint32_t>(softend_hue_poly)))) {
             error = "lab.wavelet parameter table has the wrong length";
             return RT_STAGE_INVALID;
         }
@@ -6315,8 +6353,19 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
                 return RT_STAGE_FALLBACK;
             }
             const int softend_offset =
-                wavelet_entries -
-                static_cast<int>(RT_LAB_WAVELET_SOFTEND_ENTRIES);
+                static_cast<int>(labWaveletParamEntries(
+                    static_cast<std::uint32_t>(wavelet_planes),
+                    static_cast<std::uint32_t>(wavelet_levels), wavelet_edge,
+                    wavelet_final, wavelet_toning, wavelet_denoise,
+                    wavelet_refine,
+                    static_cast<std::uint32_t>(wavelet_refine_poly),
+                    wavelet_soft, false, false, 0, 0));
+            if (softend_offset + static_cast<int>(
+                                     RT_LAB_WAVELET_SOFTEND_ENTRIES) >
+                wavelet_entries) {
+                error = "lab.wavelet soft-end tail is outside its table";
+                return RT_STAGE_INVALID;
+            }
             softend_blend =
                 wavelet_params[softend_offset + RT_LAB_WAVELET_SOFTEND_BLEND];
             softend_epsilon =
@@ -6371,6 +6420,57 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
                     static_cast<cl_float>(softend_h) /
                         static_cast<cl_float>(height)) {
                 error = "lab.wavelet soft-end radius is outside its range";
+                return RT_STAGE_INVALID;
+            }
+            /*
+             * The two optional blocks follow the nine scalars: the
+             * coefficient-domain second pass (its level-count header, the
+             * per-level scalars compute_softend() fills, then the wavguid
+             * polyline) and the hue modulation's polyline. Both tails are
+             * found from the context's own counts, and the block order is the
+             * context's.
+             */
+            int cursor =
+                softend_offset + static_cast<int>(
+                                     RT_LAB_WAVELET_SOFTEND_ENTRIES);
+            if (softend_thrend) {
+                if (cursor + 1 > wavelet_entries ||
+                    static_cast<int>(wavelet_params[cursor]) !=
+                        wavelet_levels) {
+                    error = "lab.wavelet soft-end second pass disagrees on "
+                            "its level count";
+                    return RT_STAGE_INVALID;
+                }
+                if (wavelet_levels < 2) {
+                    error = "lab.wavelet soft-end second pass needs two "
+                            "levels";
+                    return RT_STAGE_FALLBACK;
+                }
+                if (!wavelet_ab) {
+                    error = "lab.wavelet soft-end second pass needs the a/b "
+                            "planes";
+                    return RT_STAGE_FALLBACK;
+                }
+                softend_thrend_entry_offset = cursor + 1;
+                cursor += 1 + (wavelet_levels - 1) *
+                                  static_cast<int>(
+                                      RT_LAB_WAVELET_SOFTEND_LEVEL_SCALARS);
+                softend_thrend_curve_offset = cursor;
+                cursor += 3 * softend_thrend_poly;
+            }
+            if (softend_hue) {
+                if (!wavelet_ab) {
+                    error = "lab.wavelet soft-end hue curve needs the a/b "
+                            "planes";
+                    return RT_STAGE_FALLBACK;
+                }
+                softend_hue_curve_offset = cursor;
+                cursor += 3 * softend_hue_poly;
+                softend_hue_active = 1;
+            }
+            if (cursor != wavelet_entries) {
+                error = "lab.wavelet soft-end optional tails disagree on "
+                        "their length";
                 return RT_STAGE_INVALID;
             }
         }
@@ -6676,8 +6776,20 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
                 wavelet_acquired = wavelet_acquired && soft_il;
             }
         }
-        if (wavelet_denoise) {
-            for (int level = 0; level < wavelet_levels; ++level) {
+        /*
+         * The second decomposition set. The denoise arm keeps the post-contrast
+         * L bands and the coarsest low-pass alive while a and b are decomposed
+         * and denoised, because the forced chroma denoise reads the L
+         * coefficients. The final soft radius's coefficient-domain second pass
+         * reuses it for the pre-filter L decomposition, which stops one level
+         * short of the transform's count.
+         */
+        const int hold_levels =
+            wavelet_denoise
+                ? wavelet_levels
+                : (softend_thrend ? wavelet_levels - 1 : 0);
+        if (hold_levels > 0) {
+            for (int level = 0; level < hold_levels; ++level) {
                 for (int dir = 0; dir < 3; ++dir) {
                     bands_hold[level][dir] = residency->acquire(
                         &hold_band_keys[level * 3 + dir], band_shape,
@@ -6690,6 +6802,10 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
                 residency->acquire(&hold_low_keys[0], band_shape, &error);
             wavelet_low_hold[1] =
                 residency->acquire(&hold_low_keys[1], band_shape, &error);
+            wavelet_acquired = wavelet_acquired && wavelet_low_hold[0] &&
+                               wavelet_low_hold[1];
+        }
+        if (wavelet_denoise) {
             nvc_device = residency->acquire(&nvc_key, band_shape, &error);
             sfave_device =
                 residency->acquire(&sfave_key, band_shape, &error);
@@ -6699,8 +6815,7 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
                 residency->acquire(&sfaved_key, band_shape, &error);
             histogram_device =
                 residency->acquire(&histogram_key, histogram_shape, &error);
-            wavelet_acquired = wavelet_acquired && wavelet_low_hold[0] &&
-                               wavelet_low_hold[1] && nvc_device &&
+            wavelet_acquired = wavelet_acquired && nvc_device &&
                                sfave_device && sftmp_device &&
                                sfaved_device && histogram_device;
         }
@@ -6977,6 +7092,9 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
         cl_kernel soft_write_kernel = nullptr;
         cl_kernel softend_prepare_kernel = nullptr;
         cl_kernel softend_finish_kernel = nullptr;
+        cl_kernel softend_linear_kernel = nullptr;
+        cl_kernel softend_blend_kernel = nullptr;
+        cl_kernel softend_band_kernel = nullptr;
         if (soft_active || softend_active) {
             soft_rescale_kernel = compiled_kernel_entry(
                 env, def, "rt_lab_wavelet_w_soft_rescale", error);
@@ -7004,6 +7122,16 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
                 env, def, "rt_lab_wavelet_w_softend_prepare", error);
             softend_finish_kernel = compiled_kernel_entry(
                 env, def, "rt_lab_wavelet_w_softend_finish", error);
+            if (softend_hue || softend_thrend) {
+                softend_linear_kernel = compiled_kernel_entry(
+                    env, def, "rt_lab_wavelet_w_softend_linear", error);
+                softend_blend_kernel = compiled_kernel_entry(
+                    env, def, "rt_lab_wavelet_w_softend_blend", error);
+            }
+            if (softend_thrend) {
+                softend_band_kernel = compiled_kernel_entry(
+                    env, def, "rt_lab_wavelet_w_softend_band", error);
+            }
         }
         if (wavelet_denoise) {
             mad_kernel =
@@ -7052,6 +7180,10 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
             (softend_active &&
              (softend_prepare_kernel == nullptr ||
               softend_finish_kernel == nullptr)) ||
+            ((softend_hue || softend_thrend) &&
+             (softend_linear_kernel == nullptr ||
+              softend_blend_kernel == nullptr)) ||
+            (softend_thrend && softend_band_kernel == nullptr) ||
             (wavelet_denoise &&
              (mad_kernel == nullptr || noisevar_kernel == nullptr ||
               shrink_l_kernel == nullptr || shrink_ab_kernel == nullptr ||
@@ -9110,6 +9242,182 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
                                "lab.wavelet soft-end upsample")) {
                 error = "lab.wavelet soft-end upsample arguments failed";
                 return false;
+            }
+
+            /*
+             * The block's cross terms. Both need the guided filter's output in
+             * the linear domain before the final blend, so the simple finish
+             * kernel is replaced by the linear/optional-hue kernel, optionally
+             * followed by the coefficient-domain second pass, then the blend.
+             */
+            if (softend_hue || softend_thrend) {
+                ok = true;
+                ok = ok && set_arg(softend_linear_kernel, 0, sizeof(cl_mem),
+                                   &ble_memory);
+                ok = ok && set_arg(softend_linear_kernel, 1, sizeof(cl_int),
+                                   &ble_pitch);
+                ok = ok && set_arg(softend_linear_kernel, 2, sizeof(cl_mem),
+                                   &il_memory);
+                ok = ok && set_arg(softend_linear_kernel, 3, sizeof(cl_int),
+                                   &il_pitch);
+                ok = ok && set_arg(softend_linear_kernel, 4, sizeof(cl_mem),
+                                   &plane_a_memory);
+                ok = ok && set_arg(softend_linear_kernel, 5, sizeof(cl_int),
+                                   &plane_a_pitch);
+                ok = ok && set_arg(softend_linear_kernel, 6, sizeof(cl_mem),
+                                   &plane_b_memory);
+                ok = ok && set_arg(softend_linear_kernel, 7, sizeof(cl_int),
+                                   &plane_b_pitch);
+                ok = ok && set_arg(softend_linear_kernel, 8, sizeof(cl_mem),
+                                   &params_memory);
+                ok = ok && set_arg(softend_linear_kernel, 9, sizeof(cl_int),
+                                   &softend_hue_curve_offset);
+                ok = ok && set_arg(softend_linear_kernel, 10, sizeof(cl_int),
+                                   &cl_width);
+                ok = ok && set_arg(softend_linear_kernel, 11, sizeof(cl_int),
+                                   &cl_height);
+                ok = ok && set_arg(softend_linear_kernel, 12, sizeof(cl_int),
+                                   &softend_hue_active);
+                if (!ok || !launch(softend_linear_kernel, image_global,
+                                   "lab.wavelet soft-end linear")) {
+                    error = "lab.wavelet soft-end linear arguments failed";
+                    return false;
+                }
+
+                if (softend_thrend) {
+                    /*
+                     * The block's coefficient-domain second pass. It
+                     * decomposes the guided filter's output and the pre-filter
+                     * L, evaluates both sets of band statistics, and
+                     * interpolates each coefficient of the first towards the
+                     * second. The second decomposition stops one level short
+                     * of the transform's count, which is the block's loop
+                     * bound.
+                     */
+                    if (!forward_analysis(ble_memory, ble_pitch, bands,
+                                          wavelet_low, wavelet_levels) ||
+                        !read_stats(bands, wavelet_levels)) {
+                        error = "lab.wavelet soft-end second-pass "
+                                "decomposition failed";
+                        return false;
+                    }
+                    const std::vector<float> ll_stats = stats_host;
+                    if (!forward_analysis(il_memory, il_pitch, bands_hold,
+                                          wavelet_low_hold,
+                                          wavelet_levels - 1) ||
+                        !read_stats(bands_hold, wavelet_levels - 1)) {
+                        error = "lab.wavelet soft-end pre-filter "
+                                "decomposition failed";
+                        return false;
+                    }
+                    if (context->wavelet.compute_softend == nullptr ||
+                        context->wavelet.compute_softend(
+                            context->self, ll_stats.data(), stats_host.data(),
+                            static_cast<std::uint32_t>(wavelet_levels)) != 0) {
+                        error = "lab.wavelet soft-end second-pass build "
+                                "failed";
+                        return false;
+                    }
+                    if (residency->upload(wavelet_params_device,
+                                          wavelet_params_buffer) !=
+                        RT_STAGE_OK) {
+                        error = "lab.wavelet soft-end second-pass parameter "
+                                "upload failed";
+                        return false;
+                    }
+                    for (int level = 0; level + 1 < wavelet_levels; ++level) {
+                        cl_mem band0 = memory_of(bands[level][0]);
+                        cl_mem band1 = memory_of(bands[level][1]);
+                        cl_mem band2 = memory_of(bands[level][2]);
+                        cl_int bp0 = pitch_of(bands[level][0]);
+                        cl_int bp1 = pitch_of(bands[level][1]);
+                        cl_int bp2 = pitch_of(bands[level][2]);
+                        cl_mem ref0 = memory_of(bands_hold[level][0]);
+                        cl_mem ref1 = memory_of(bands_hold[level][1]);
+                        cl_mem ref2 = memory_of(bands_hold[level][2]);
+                        cl_int rp0 = pitch_of(bands_hold[level][0]);
+                        cl_int rp1 = pitch_of(bands_hold[level][1]);
+                        cl_int rp2 = pitch_of(bands_hold[level][2]);
+                        cl_int cl_level = level;
+                        ok = true;
+                        ok = ok && set_arg(softend_band_kernel, 0,
+                                           sizeof(cl_mem), &band0);
+                        ok = ok && set_arg(softend_band_kernel, 1,
+                                           sizeof(cl_int), &bp0);
+                        ok = ok && set_arg(softend_band_kernel, 2,
+                                           sizeof(cl_mem), &band1);
+                        ok = ok && set_arg(softend_band_kernel, 3,
+                                           sizeof(cl_int), &bp1);
+                        ok = ok && set_arg(softend_band_kernel, 4,
+                                           sizeof(cl_mem), &band2);
+                        ok = ok && set_arg(softend_band_kernel, 5,
+                                           sizeof(cl_int), &bp2);
+                        ok = ok && set_arg(softend_band_kernel, 6,
+                                           sizeof(cl_mem), &ref0);
+                        ok = ok && set_arg(softend_band_kernel, 7,
+                                           sizeof(cl_int), &rp0);
+                        ok = ok && set_arg(softend_band_kernel, 8,
+                                           sizeof(cl_mem), &ref1);
+                        ok = ok && set_arg(softend_band_kernel, 9,
+                                           sizeof(cl_int), &rp1);
+                        ok = ok && set_arg(softend_band_kernel, 10,
+                                           sizeof(cl_mem), &ref2);
+                        ok = ok && set_arg(softend_band_kernel, 11,
+                                           sizeof(cl_int), &rp2);
+                        ok = ok && set_arg(softend_band_kernel, 12,
+                                           sizeof(cl_mem), &params_memory);
+                        ok = ok && set_arg(softend_band_kernel, 13,
+                                           sizeof(cl_int),
+                                           &softend_thrend_entry_offset);
+                        ok = ok && set_arg(softend_band_kernel, 14,
+                                           sizeof(cl_int),
+                                           &softend_thrend_curve_offset);
+                        ok = ok && set_arg(softend_band_kernel, 15,
+                                           sizeof(cl_int), &cl_level);
+                        ok = ok && set_arg(softend_band_kernel, 16,
+                                           sizeof(cl_int), &cl_half_w);
+                        ok = ok && set_arg(softend_band_kernel, 17,
+                                           sizeof(cl_int), &cl_half_h);
+                        if (!ok ||
+                            !launch(softend_band_kernel, band_global,
+                                    "lab.wavelet soft-end coefficients")) {
+                            error = "lab.wavelet soft-end coefficient "
+                                    "arguments failed";
+                            return false;
+                        }
+                    }
+                    if (!synthesize(bands, wavelet_low, ble_memory,
+                                    ble_pitch, 0, wavelet_levels)) {
+                        error = "lab.wavelet soft-end reconstruction failed";
+                        return false;
+                    }
+                }
+
+                ok = true;
+                ok = ok && set_arg(softend_blend_kernel, 0, sizeof(cl_mem),
+                                   &ble_memory);
+                ok = ok && set_arg(softend_blend_kernel, 1, sizeof(cl_int),
+                                   &ble_pitch);
+                ok = ok && set_arg(softend_blend_kernel, 2, sizeof(cl_mem),
+                                   &l_memory);
+                ok = ok && set_arg(softend_blend_kernel, 3, sizeof(cl_int),
+                                   &l_pitch);
+                ok = ok && set_arg(softend_blend_kernel, 4, sizeof(cl_mem),
+                                   &il_memory);
+                ok = ok && set_arg(softend_blend_kernel, 5, sizeof(cl_int),
+                                   &il_pitch);
+                ok = ok && set_arg(softend_blend_kernel, 6, sizeof(cl_int),
+                                   &cl_width);
+                ok = ok && set_arg(softend_blend_kernel, 7, sizeof(cl_int),
+                                   &cl_height);
+                ok = ok && set_arg(softend_blend_kernel, 8, sizeof(cl_float),
+                                   &softend_blend);
+                if (!ok || !launch(softend_blend_kernel, image_global,
+                                   "lab.wavelet soft-end blend")) {
+                    error = "lab.wavelet soft-end blend arguments failed";
+                    return false;
+                }
+                return true;
             }
 
             ok = true;

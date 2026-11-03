@@ -66,6 +66,13 @@ int compute_refine_thunk(void* self, const float* pre_stats,
         pre_stats, post_stats, levels);
 }
 
+int compute_softend_thunk(void* self, const float* stats_ll,
+                          const float* stats_dst, uint32_t levels)
+{
+    return static_cast<LabWaveletContext*>(self)->computeSoftend(
+        stats_ll, stats_dst, levels);
+}
+
 /*
  * Copy one pitched three-plane F32 buffer into a LabImage, and back. The
  * buffer's planes may carry padding, so every row is copied by width.
@@ -342,12 +349,12 @@ bool decodeWaveletSoftRadius(const procparams::WaveletParams& wavelet,
 
 /*
  * The final panel's guided soft radius, decoded from the export block's
- * `softradend` sequence. Only the portable sub-case is admitted: the block's
- * second, coefficient-domain pass (Thrend > 0) and the hue modulation
- * (non-identity wavguidcurve) stay host residuals. The block derives the
- * radius from the slider and the image extent; guidedfilter.cc derives the
- * subsampling, the box radius and the bilinear scales from that radius. Every
- * derived value is computed here with the block's own arithmetic.
+ * `softradend` sequence. The whole block is ported: the guided filter, the
+ * coefficient-domain second pass (`Thrend > 0`) and the hue modulation (a
+ * non-identity `wavguidcurve`). The block derives the radius from the slider
+ * and the image extent; guidedfilter.cc derives the subsampling, the box
+ * radius and the bilinear scales from that radius. Every derived value is
+ * computed here with the block's own arithmetic.
  */
 struct WaveletSoftEnd
 {
@@ -376,16 +383,14 @@ bool decodeWaveletSoftEnd(const procparams::WaveletParams& wavelet,
         wavelet.softradend > LAB_WAVELET_MAX_SOFT_END) {
         return false;
     }
-    /* The block gates the block on `cp.finena`, and the two unported arms
-     * are the coefficient-domain second pass and the hue modulation. */
-    if (!wavelet.expfinal || wavelet.thrend != 0.0) {
+    /* The block gates the whole sequence on `cp.finena`. */
+    if (!wavelet.expfinal) {
         return false;
     }
-    {
-        const FlatCurve guid_curve(wavelet.wavguidcurve);
-        if (!guid_curve.isIdentity()) {
-            return false;
-        }
+    if (!std::isfinite(wavelet.thrend) ||
+        wavelet.thrend < LAB_WAVELET_MIN_WAVELET_THREND ||
+        wavelet.thrend > LAB_WAVELET_MAX_WAVELET_THREND) {
+        return false;
     }
     if (!std::isfinite(wavelet.strend) ||
         wavelet.strend < LAB_WAVELET_MIN_STREND ||
@@ -441,6 +446,39 @@ bool decodeWaveletSoftEnd(const procparams::WaveletParams& wavelet,
     out.scale_dy = static_cast<float>(height) / static_cast<float>(h);
     out.scale_ux = static_cast<float>(w) / static_cast<float>(width);
     out.scale_uy = static_cast<float>(h) / static_cast<float>(height);
+    return true;
+}
+
+/*
+ * A FlatCurve's faceted polyline in the tail encoding the refinement uses:
+ * the knot count, then the knot abscissae, the ordinates and the slopes, each
+ * array `count` long except the slopes, which stop one short. The device walks
+ * the same binary search FlatCurve::getVal() walks. Returns false when the
+ * polyline is empty or longer than the tail's bound.
+ */
+bool encodeFlatCurvePolyline(const FlatCurve& curve,
+                             std::vector<float>& out)
+{
+    const std::vector<double>& px = curve.polylineX();
+    const std::vector<double>& py = curve.polylineY();
+    const std::vector<double>& ps = curve.polylineSlope();
+    out.clear();
+    if (px.empty() || px.size() > RT_LAB_WAVELET_REFINE_POLY_MAX ||
+        py.size() != px.size() || ps.size() + 1 != px.size()) {
+        return false;
+    }
+    const std::size_t count = px.size();
+    /* count, count x, count y and count-1 slopes. */
+    out.resize(3 * count);
+    out[0] = static_cast<float>(count);
+    for (std::size_t index = 0; index < count; ++index) {
+        out[1 + index] = static_cast<float>(px[index]);
+        out[1 + count + index] = static_cast<float>(py[index]);
+        if (index + 1 < count) {
+            out[1 + 2 * count + index] =
+                static_cast<float>(ps[index]);
+        }
+    }
     return true;
 }
 
@@ -707,6 +745,12 @@ int labWaveletTransformLevels(const procparams::ProcParams& params,
         levwav = 6;
     }
     /*
+     * ip_wavelet() keeps the unraised count in `levwav` and writes it back
+     * into `levwavL` when Thrend is positive, so the restore target is this
+     * base (after the two caps) and not L's raised count.
+     */
+    int base = levwav;
+    /*
      * Start from ip_wavelet()'s base decomposition level: the MaxLev slider,
      * forced to six by Expnoise. The chroma panel, and the chroma denoise
      * Expnoise forces, raise only the L decomposition (`levwavL`) to seven,
@@ -725,8 +769,10 @@ int labWaveletTransformLevels(const procparams::ProcParams& params,
     }
     if (levwav == 9 && extra) {
         levwav = 10;
+        base = 10;
     }
     levwav = std::min(maxlevelcrop, levwav);
+    base = std::min(maxlevelcrop, base);
     if (levwav < 1) {
         return 0;
     }
@@ -752,15 +798,15 @@ int labWaveletTransformLevels(const procparams::ProcParams& params,
         maxlev2 = 4;
     }
     levwav = std::min(maxlev2, levwav);
+    base = std::min(maxlev2, base);
 
     /*
      * The trailing-zero trim in ip_wavelet(): a level whose multiplier is
      * exactly zero is dead when nothing else in the block needs it. Thrend is
      * read unconditionally afterwards and, when positive, restores the
-     * untrimmed count so the residual tone mapping keeps its levels; delta and
-     * the highlight/shadow kH then use that larger maxlvl.
+     * unraised, untrimmed count so the residual tone mapping keeps its levels;
+     * delta and the highlight/shadow kH then use that larger maxlvl.
      */
-    const int capped = levwav;
     const bool noiseena = wavelet.expnoise && minwin > 128;
     const bool ref0 =
         noiseena && (wavelet.level0noise.getBottom() > 0. ||
@@ -788,7 +834,7 @@ int labWaveletTransformLevels(const procparams::ProcParams& params,
     }
     const float thrend = 0.01f * static_cast<float>(wavelet.thrend);
     if (thrend > 0.f) {
-        levwav = capped;
+        levwav = base;
     }
     return levwav > 0 ? levwav : 0;
 }
@@ -967,12 +1013,11 @@ bool labWaveletWaveletSupported(const procparams::ProcParams& params,
      */
     /*
      * The final panel's guided soft radius (`softradend`). It runs only with
-     * the final panel enabled, and only the portable sub-case is admitted:
-     * the block's coefficient-domain second block (Thrend > 0) and the hue
-     * modulation (non-identity wavguidcurve) stay host residuals. The clarity
-     * arm and the clarity soft radius cannot run alongside it, and a value
-     * outside the 0..1000 slider range or a derived grid with no pixels is
-     * refused.
+     * the final panel enabled; the block's coefficient-domain second pass
+     * (Thrend > 0) and its hue modulation (non-identity wavguidcurve) are both
+     * ported and admitted alongside it. The clarity arm and the clarity soft
+     * radius cannot run alongside it, and a value outside the 0..1000 slider
+     * range or a derived grid with no pixels is refused.
      */
     if (wavelet.softradend != 0.0) {
         WaveletSoftEnd softend;
@@ -1361,6 +1406,12 @@ RtLabWaveletContext LabWaveletContext::descriptor(bool supported)
     context.wavelet.toning = wavelet_toning_ ? 1u : 0u;
     context.wavelet.denoise = wavelet_denoise_ ? 1u : 0u;
     context.wavelet.softend = softend_active_ ? 1u : 0u;
+    context.wavelet.softend_thrend = softend_thrend_ ? 1u : 0u;
+    context.wavelet.softend_thrend_poly = static_cast<uint32_t>(
+        softend_thrend_ ? softend_thrend_curve_.size() / 3 : 0);
+    context.wavelet.softend_hue_poly = static_cast<uint32_t>(
+        softend_hue_ ? softend_hue_curve_.size() / 3 : 0);
+    context.wavelet.compute_softend = &compute_softend_thunk;
     context.wavelet.refine = wavelet_refine_ ? 1u : 0u;
     context.wavelet.refine_poly = static_cast<uint32_t>(
         wavelet_refine_poly_x_.size());
@@ -1530,6 +1581,51 @@ int LabWaveletContext::build(RtLabWaveletResult& out)
         softend_scale_dy_ = softend.scale_dy;
         softend_scale_ux_ = softend.scale_ux;
         softend_scale_uy_ = softend.scale_uy;
+        softend_thrend_ = false;
+        softend_hue_ = false;
+        softend_thrend_curve_.clear();
+        softend_hue_curve_.clear();
+        if (softend.active) {
+            /*
+             * The block's coefficient-domain second pass. Its wavguid curve is
+             * a four-point FlatCurve whose breaking point and plateau follow
+             * thrend, built with the block's own float arithmetic.
+             */
+            const float thrend =
+                static_cast<float>(0.01f * params_.wavelet.thrend);
+            if (thrend > 0.f) {
+                float thr = 0.f;
+                if (thrend < 0.02f) {
+                    thr = 0.5f;
+                } else if (thrend < 0.1f) {
+                    thr = 0.2f;
+                } else {
+                    thr = 0.f;
+                }
+                const std::vector<double> points = {
+                    static_cast<double>(FCT_MinMaxCPoints), 0.0, 1.0, 0.35,
+                    0.35, static_cast<double>(thrend), 1.0, 0.35, 0.35,
+                    static_cast<double>(thrend + 0.01f),
+                    static_cast<double>(thr), 0.35, 0.35, 1.0,
+                    static_cast<double>(thr), 0.35, 0.35};
+                FlatCurve wavguid(points);
+                if (!encodeFlatCurvePolyline(wavguid,
+                                             softend_thrend_curve_)) {
+                    return 5;
+                }
+                softend_thrend_ = true;
+                softend_thrend_value_ = thrend;
+            }
+            /* The hue modulation: the block's own wavguidCurve. */
+            const FlatCurve guid_curve(params_.wavelet.wavguidcurve);
+            if (!guid_curve.isIdentity()) {
+                if (!encodeFlatCurvePolyline(guid_curve,
+                                             softend_hue_curve_)) {
+                    return 5;
+                }
+                softend_hue_ = true;
+            }
+        }
     }
     /*
      * The toning panel's zero-protection arm. The admission rules repeat here
@@ -1762,7 +1858,13 @@ int LabWaveletContext::build(RtLabWaveletResult& out)
                                    wavelet_refine_,
                                    static_cast<std::uint32_t>(
                                        wavelet_refine_poly_x_.size()),
-                                   wavelet_soft_, softend_active_),
+                                   wavelet_soft_, softend_active_,
+                                   softend_thrend_,
+                                   static_cast<std::uint32_t>(
+                                       softend_thrend_curve_.size() / 3),
+                                   static_cast<std::uint32_t>(
+                                       softend_hue_ ? softend_hue_curve_.size() / 3
+                                                    : 0)),
             0.f);
 
         float* table = wavelet_params_.data();
@@ -2089,7 +2191,7 @@ int LabWaveletContext::build(RtLabWaveletResult& out)
                 wavelet_final_, wavelet_toning_, wavelet_denoise_,
                 wavelet_refine_,
                 static_cast<std::uint32_t>(wavelet_refine_poly_x_.size()),
-                false, false);
+                false, false, false, 0, 0);
             if (soft_offset + RT_LAB_WAVELET_SOFT_LUT_ENTRIES !=
                 wavelet_params_.size()) {
                 return 5;
@@ -2101,8 +2203,17 @@ int LabWaveletContext::build(RtLabWaveletResult& out)
             }
         }
         if (softend_active_) {
-            const std::size_t softend_offset =
-                wavelet_params_.size() - RT_LAB_WAVELET_SOFTEND_ENTRIES;
+            const std::size_t softend_offset = labWaveletParamEntries(
+                static_cast<std::uint32_t>(planes),
+                static_cast<std::uint32_t>(wavelet_levels_), wavelet_edge_,
+                wavelet_final_, wavelet_toning_, wavelet_denoise_,
+                wavelet_refine_,
+                static_cast<std::uint32_t>(wavelet_refine_poly_x_.size()),
+                wavelet_soft_, false, false, 0, 0);
+            if (softend_offset + RT_LAB_WAVELET_SOFTEND_ENTRIES >
+                wavelet_params_.size()) {
+                return 5;
+            }
             float* softend_tail = table + softend_offset;
             softend_tail[RT_LAB_WAVELET_SOFTEND_BLEND] = softend_blend_;
             softend_tail[RT_LAB_WAVELET_SOFTEND_EPSILON] = softend_epsilon_;
@@ -2120,6 +2231,33 @@ int LabWaveletContext::build(RtLabWaveletResult& out)
                 softend_scale_ux_;
             softend_tail[RT_LAB_WAVELET_SOFTEND_SCALE_UY] =
                 softend_scale_uy_;
+            float* cursor =
+                softend_tail + RT_LAB_WAVELET_SOFTEND_ENTRIES;
+            softend_thrend_offset_ = 0;
+            if (softend_thrend_) {
+                softend_thrend_offset_ =
+                    static_cast<std::size_t>(cursor - table);
+                /* The level count, then the per-level scalars that
+                 * computeSoftend() fills once both decompositions have run. */
+                cursor[0] = static_cast<float>(wavelet_levels_);
+                cursor += RT_LAB_WAVELET_SOFTEND_THREND_HEADER +
+                          (wavelet_levels_ > 1
+                               ? static_cast<std::size_t>(
+                                     wavelet_levels_ - 1) *
+                                     RT_LAB_WAVELET_SOFTEND_LEVEL_SCALARS
+                               : 0);
+                for (float value : softend_thrend_curve_) {
+                    *cursor++ = value;
+                }
+            }
+            if (softend_hue_) {
+                for (float value : softend_hue_curve_) {
+                    *cursor++ = value;
+                }
+            }
+            if (cursor != table + wavelet_params_.size()) {
+                return 5;
+            }
         }
     }
 
@@ -2526,6 +2664,104 @@ int LabWaveletContext::computeRefine(const float* pre_stats,
         entry[10] = kc_factor;
     }
     tail[0] = 1.f;
+    return 0;
+}
+
+int LabWaveletContext::computeSoftend(const float* stats_ll,
+                                      const float* stats_dst,
+                                      uint32_t levels)
+{
+    const uint32_t stride = static_cast<uint32_t>(wavelet_levels_);
+    if (!wavelet_active_ || !softend_active_ || !softend_thrend_ ||
+        stats_ll == nullptr || stats_dst == nullptr ||
+        softend_thrend_offset_ == 0 || levels < 1 || levels > stride ||
+        stride > RT_LAB_WAVELET_MAX_TRANSFORM_LEVELS) {
+        return 1;
+    }
+
+    const auto aggregate = [](const float* stats, uint32_t level,
+                              float& mean, float& sigma, float& maxp) {
+        const auto value = [&](int direction, int entry) {
+            return stats[(static_cast<std::size_t>(level) * 3 +
+                          static_cast<std::size_t>(direction)) *
+                             RT_LAB_WAVELET_STATS_PER_BAND +
+                         static_cast<std::size_t>(entry)];
+        };
+        /* Eval2()'s accumulation order and its / 3. */
+        mean = (value(0, 0) + value(1, 0) + value(2, 0)) / 3.f;
+        sigma = (value(0, 4) + value(1, 4) + value(2, 4)) / 3.f;
+        maxp = (value(0, 2) + value(1, 2) + value(2, 2)) / 3.f;
+    };
+
+    /* ip_wavelet()'s fixed `sig = 2.f`, so `k` is SQR(sig) and the amean
+     * branch takes the sqrt(sqrt()) shortcut. */
+    constexpr float sig = 2.f;
+    /* ip_wavelet.cc calls the double log() and stores into a float. */
+    const float inx =
+        static_cast<float>(std::log(static_cast<double>(0.666f)));
+
+    float* tail = wavelet_params_.data() + softend_thrend_offset_;
+    if (tail[0] != static_cast<float>(levels)) {
+        return 1;
+    }
+
+    /*
+     * The block's loop stops one level short of the decomposition's count;
+     * the last level's coefficients are left untouched.
+     */
+    for (uint32_t level = 0; level + 1 < levels; ++level) {
+        float mean = 0.f;
+        float sigma = 0.f;
+        float maxp = 0.f;
+        float meang = 0.f;
+        float sigmag = 0.f;
+        float maxpg = 0.f;
+        aggregate(stats_dst, level, mean, sigma, maxp);
+        aggregate(stats_ll, level, meang, sigmag, maxpg);
+
+        float* entry = tail + RT_LAB_WAVELET_SOFTEND_THREND_HEADER +
+                       static_cast<std::size_t>(level) *
+                           RT_LAB_WAVELET_SOFTEND_LEVEL_SCALARS;
+        /*
+         * The block enters the per-level arithmetic only when the pre-filter
+         * MaxP and mean/sigma are non-zero. A degenerate level is skipped,
+         * not refused: the other levels still apply their factor.
+         */
+        const bool active = maxp > 0.f && mean != 0.f && sigma != 0.f;
+        entry[0] = active ? 1.f : 0.f;
+        if (!active) {
+            continue;
+        }
+
+        const float tempmean = 0.3f * mean + 0.7f * meang;
+        const float tempsig = 0.3f * sigma + 0.7f * sigmag;
+        const float tempmax = 0.3f * maxp + 0.7f * maxpg;
+        if (!(tempmax > 0.f) || !(tempsig > 0.f) || tempmean == 0.f) {
+            /* The block would take log()/divide of a non-positive value and
+             * produce a non-finite coefficient. Fail closed instead. */
+            return 2;
+        }
+        const float logmax =
+            static_cast<float>(std::log(static_cast<double>(tempmax)));
+        const float rap_x = (tempmean + sig * tempsig) / tempmax;
+        if (!(rap_x > 0.f)) {
+            return 2;
+        }
+        const float iny =
+            static_cast<float>(std::log(static_cast<double>(rap_x)));
+        const float rap = inx / iny;
+        const float asig = 0.166f / (tempsig * sig);
+        const float bsig = 0.5f - asig * tempmean;
+        const float amean = 1.f / tempmean;
+
+        entry[1] = tempmean;
+        entry[2] = tempmean + sig * tempsig;
+        entry[3] = logmax;
+        entry[4] = rap;
+        entry[5] = asig;
+        entry[6] = bsig;
+        entry[7] = amean;
+    }
     return 0;
 }
 

@@ -58,7 +58,7 @@ struct ProcParams;
  * wavelet tool's own skin protection: the equaliser only changes L, so a/b
  * and their masks are identical at the start of both passes.
  */
-#define RT_LAB_WAVELET_CONTEXT_VERSION 12u
+#define RT_LAB_WAVELET_CONTEXT_VERSION 13u
 /* "LWCT": rejects a stale or unrelated pointer before any callback runs. */
 #define RT_LAB_WAVELET_CONTEXT_MAGIC 0x4C574354u
 /* The number of levels of the directional pyramid. */
@@ -179,7 +179,30 @@ struct ProcParams;
  *   [7] the upscale column factor, float(w) / float(W)
  *   [8] the upscale row factor
  * The tail always follows the clarity soft LUT, so the launcher can find it
- * at `entries - RT_LAB_WAVELET_SOFTEND_ENTRIES`.
+ * at `entries - RT_LAB_WAVELET_SOFTEND_ENTRIES` when the two optional blocks
+ * below are absent.
+ *
+ * Two optional blocks follow the nine scalars:
+ *
+ * The coefficient-domain second block (`Thrend > 0`), present only when the
+ * block runs it:
+ *   [0] the level count L (the transform's own count)
+ *   [1 + l*8 + k] the per-level scalars built by compute_softend() for
+ *                 level l = 0..L-2:
+ *                   k = 0 the block's guard (MaxP > 0 && mean != 0 &&
+ *                         sigma != 0) as 1 or 0
+ *                   k = 1 tempmean = 0.3*mean + 0.7*meang
+ *                   k = 2 the upper knot tempmean + sig*tempsig
+ *                   k = 3 logmax = log(tempmax), the block's double log
+ *                   k = 4 rap = log(insigma) / log(rapX)
+ *                   k = 5 asig = 0.166 / (tempsig*sig)
+ *                   k = 6 bsig = 0.5 - asig*tempmean
+ *                   k = 7 amean = 1 / tempmean
+ *   then the wavguid FlatCurve's polyline: count, count x, count y and
+ *   count-1 slopes, the same encoding the refinement tail uses.
+ *
+ * The hue modulation (`wavguidcurve` non-identity), present only when the
+ * curve is non-identity: the wavguidCurve polyline in the same encoding.
  */
 #define RT_LAB_WAVELET_SOFTEND_ENTRIES 9u
 #define RT_LAB_WAVELET_SOFTEND_BLEND 0u
@@ -191,6 +214,10 @@ struct ProcParams;
 #define RT_LAB_WAVELET_SOFTEND_SCALE_DY 6u
 #define RT_LAB_WAVELET_SOFTEND_SCALE_UX 7u
 #define RT_LAB_WAVELET_SOFTEND_SCALE_UY 8u
+/* One per-level scalar block of the coefficient-domain second pass. */
+#define RT_LAB_WAVELET_SOFTEND_LEVEL_SCALARS 8u
+/* The second block's level-count header. */
+#define RT_LAB_WAVELET_SOFTEND_THREND_HEADER 1u
 /*
  * The edge tail, present only when the edge panel runs:
  *   [0]                 settings->limrad
@@ -268,7 +295,10 @@ inline std::size_t labWaveletParamEntries(std::uint32_t planes,
                                           bool final_curves, bool toning,
                                           bool denoise, bool refine,
                                           std::uint32_t refine_poly,
-                                          bool soft, bool softend)
+                                          bool soft, bool softend,
+                                          bool softend_thrend,
+                                          std::uint32_t softend_thrend_poly,
+                                          std::uint32_t softend_hue_poly)
 {
     std::size_t entries = RT_LAB_WAVELET_WAVELET_PARAMS +
                           static_cast<std::size_t>(planes) *
@@ -308,6 +338,17 @@ inline std::size_t labWaveletParamEntries(std::uint32_t planes,
     }
     if (softend) {
         entries += RT_LAB_WAVELET_SOFTEND_ENTRIES;
+        if (softend_thrend) {
+            /* One entry per transformed level above the last, which the
+             * block's `level < levwavL - 1` loop skips. */
+            entries += RT_LAB_WAVELET_SOFTEND_THREND_HEADER;
+            if (levels > 1) {
+                entries += static_cast<std::size_t>(levels - 1) *
+                           RT_LAB_WAVELET_SOFTEND_LEVEL_SCALARS;
+            }
+            entries += static_cast<std::size_t>(softend_thrend_poly) * 3u;
+        }
+        entries += static_cast<std::size_t>(softend_hue_poly) * 3u;
     }
     return entries;
 }
@@ -374,6 +415,12 @@ typedef struct RtLabWaveletWavelet {
     uint32_t denoise;
     /* 1 when the final panel's guided soft radius tail is present. */
     uint32_t softend;
+    /* 1 when the tail carries the coefficient-domain second block (Thrend >
+     * 0). `softend_thrend_poly` is that block's wavguid polyline knot count
+     * and `softend_hue_poly` the hue curve's, both zero when absent. */
+    uint32_t softend_thrend;
+    uint32_t softend_thrend_poly;
+    uint32_t softend_hue_poly;
     /* 1 when the denoising refinement tail is present in `params`. */
     uint32_t refine;
     /* The Thrden wavlow polyline's knot count in that tail, or zero when the
@@ -422,6 +469,15 @@ typedef struct RtLabWaveletWavelet {
      */
     int (*compute_refine)(void* self, const float* pre_stats,
                           const float* post_stats, uint32_t levels);
+    /*
+     * Fills the final soft radius's coefficient-domain second block from the
+     * two decomposition statistics blocks: `stats_ll` is Evaluate2() over the
+     * guided filter's output and `stats_dst` over the pre-filter L. Both are
+     * laid out as compute_mea()'s input. Used only when `softend_thrend` is
+     * set.
+     */
+    int (*compute_softend)(void* self, const float* stats_ll,
+                           const float* stats_dst, uint32_t levels);
 } RtLabWaveletWavelet;
 
 /*
@@ -681,11 +737,12 @@ int labWaveletTransformLevels(const procparams::ProcParams& params,
  * The guided soft radius (`softrad`) belongs to the clarity arm: the block
  * reads it only inside the two-pass sequence, so it is admitted only there and
  * must be inside its 0..100 slider range. The final panel's guided soft radius
- * (`softradend`) is admitted on its own: it needs `expfinal`, a zero Thrend
- * (the coefficient-domain second block is not ported) and an identity
- * wavguidcurve (the hue modulation is not ported), and it must be inside its
- * 0..1000 slider range. It does not run together with the clarity arm or the
- * clarity soft radius.
+ * (`softradend`) is admitted on its own: it needs `expfinal`, its strength and
+ * detail-adjust sliders inside their ranges and the radius inside its 0..1000
+ * range. The block's coefficient-domain second pass (`Thrend > 0`) and its hue
+ * modulation (a non-identity `wavguidcurve`) are both ported and admitted
+ * alongside it. It does not run together with the clarity arm or the clarity
+ * soft radius.
  */
 bool labWaveletWaveletSupported(const procparams::ProcParams& params,
                                 int width, int height);
@@ -752,6 +809,11 @@ public:
      * statistics blocks. */
     int computeRefine(const float* pre_stats, const float* post_stats,
                       uint32_t levels);
+
+    /* Fill the final soft radius's coefficient-domain second block from the
+     * two decomposition statistics blocks. */
+    int computeSoftend(const float* stats_ll, const float* stats_dst,
+                       uint32_t levels);
 
 private:
     procparams::ProcParams& params_;
@@ -844,6 +906,23 @@ private:
     float softend_scale_dy_ = 1.f;
     float softend_scale_ux_ = 1.f;
     float softend_scale_uy_ = 1.f;
+    /*
+     * The block's coefficient-domain second pass (`Thrend > 0`). Its wavguid
+     * FlatCurve is a four-point curve whose plateau and breaking point follow
+     * thrend; the polyline is uploaded in the same encoding as the refinement
+     * tail's. `softend_thrend_offset_` is the tail block's index inside
+     * wavelet_params_, so computeSoftend() can fill the per-level scalars.
+     */
+    bool softend_thrend_ = false;
+    float softend_thrend_value_ = 0.f;
+    std::size_t softend_thrend_offset_ = 0;
+    std::vector<float> softend_thrend_curve_;
+    /*
+     * The hue modulation (`wavguidcurve` non-identity): the block's own
+     * wavguidCurve polyline, in the same encoding.
+     */
+    bool softend_hue_ = false;
+    std::vector<float> softend_hue_curve_;
 };
 
 } // namespace rtengine::stage

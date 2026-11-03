@@ -424,6 +424,12 @@ __kernel void rt_lab_wavelet_equalize(
 #define RT_LW_W_TONING_MULS 9
 #define RT_LW_W_TONING_HEADER 19
 #define RT_LW_W_TONING_MEA_ENTRIES 10
+/*
+ * Mirrors RT_LAB_WAVELET_SOFTEND_*: the per-level scalars of the final soft
+ * radius's coefficient-domain second pass and its level-count header.
+ */
+#define RT_LW_W_SOFTEND_LEVEL_SCALARS 8
+#define RT_LW_W_SOFTEND_THREND_HEADER 1
 
 /*
  * Level 0 analysis, vertical half. One work item per output column and output
@@ -2309,6 +2315,247 @@ __kernel void rt_lab_wavelet_w_softend_finish(
     const float linear = rt_lw_xlog2lin10(max(q[y * q_pitch + x], 0.0f));
     l[y * l_pitch + x] =
         rt_lw_soft_intp(blend, linear, il[y * il_pitch + x]);
+}
+
+/*
+ * The block's cross terms. `Thrend > 0` and the hue modulation both need the
+ * guided filter's output in the linear domain before the block's final blend,
+ * and the hue arm then pulls it towards the pre-filter L by
+ * `1 + (wavguidCurve(hue) - 0.5)` where the hue is xatan2f(b, a) put through
+ * Color::huelab_to_huehsv2(). This kernel is the same q -> xlog2lin step the
+ * finish kernel does, optionally followed by that modulation, and it leaves
+ * the result in `src` for the decomposition and the final blend.
+ *
+ * `curve_offset` is the hue polyline's index in the parameter table, in the
+ * tail encoding: the knot count, the abscissae, the ordinates and the slopes.
+ */
+inline double rt_lw_softend_polyline(__global const float* source, double t)
+{
+    const int count = (int)source[0];
+    if (count < 2) {
+        return 1.0;
+    }
+    __global const float* px = source + 1;
+    __global const float* py = px + count;
+    __global const float* ps = py + count;
+    /* FlatCurve::getVal()'s periodic wrap and binary search. */
+    if (t < (double)px[0]) {
+        t += 1.0;
+    }
+    int lo = 0;
+    int hi = count - 1;
+    while (hi > 1 + lo) {
+        const int mid = (hi + lo) / 2;
+        if ((double)px[mid] > t) {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    return (double)py[lo] + (t - (double)px[lo]) * (double)ps[lo];
+}
+
+/* sleef.h's atan2kf() and xatan2f(), as Color::huelab_to_huehsv2() expects. */
+#define RT_LW_PI_F 3.1415927f
+#define RT_LW_PI_F_2 (RT_LW_PI_F / 2.0f)
+
+inline float rt_lw_softend_atan2kf(float y, float x)
+{
+    float s, t, u;
+    float q = 0.0f;
+
+    if (x < 0.0f) {
+        x = -x;
+        q = -2.0f;
+    }
+    if (y > x) {
+        t = x;
+        x = y;
+        y = -t;
+        q += 1.0f;
+    }
+
+    s = y / x;
+    t = s * s;
+
+    u = 0.00282363896258175373077393f;
+    u = u * t + -0.0159569028764963150024414f;
+    u = u * t + 0.0425049886107444763183594f;
+    u = u * t + -0.0748900920152664184570312f;
+    u = u * t + 0.106347933411598205566406f;
+    u = u * t + -0.142027363181114196777344f;
+    u = u * t + 0.199926957488059997558594f;
+    u = u * t + -0.333331018686294555664062f;
+
+    t = u * t;
+    t = t * s + s;
+    return q * RT_LW_PI_F_2 + t;
+}
+
+inline float rt_lw_softend_xatan2f(float y, float x)
+{
+    float r = rt_lw_softend_atan2kf(fabs(y), x);
+
+    r = rt_lw_soft_mulsign(r, x);
+    if (isinf(x) || x == 0.0f) {
+        r = RT_LW_PI_F_2 -
+            (isinf(x) ? (copysign(1.0f, x) * RT_LW_PI_F_2) : 0.0f);
+    }
+    if (isinf(y)) {
+        r = RT_LW_PI_F_2 -
+            (isinf(x) ? (copysign(1.0f, x) * (RT_LW_PI_F * 0.25f)) : 0.0f);
+    }
+    if (y == 0.0f) {
+        r = (copysign(1.0f, x) == -1.0f) ? RT_LW_PI_F : 0.0f;
+    }
+    return (isnan(x) || isnan(y)) ? NAN : rt_lw_soft_mulsign(r, y);
+}
+
+/* Color::huelab_to_huehsv2(): the block's double arithmetic. */
+inline double rt_lw_softend_huehsv2(float hh)
+{
+    double hr = 0.0;
+    if (hh >= 0.0f && hh < 0.6f) {
+        hr = 0.11666 * (double)hh + 0.93;
+    } else if (hh >= 0.6f && hh < 1.4f) {
+        hr = 0.1125 * (double)hh - 0.0675;
+    } else if (hh >= 1.4f && hh < 2.0f) {
+        hr = 0.2666 * (double)hh - 0.2833;
+    } else if (hh >= 2.0f && hh < 3.14159f) {
+        hr = 0.1489 * (double)hh - 0.04785;
+    } else if (hh >= -3.14159f && hh < -2.8f) {
+        hr = 0.23419 * (double)hh + 1.1557;
+    } else if (hh >= -2.8f && hh < -2.3f) {
+        hr = 0.16 * (double)hh + 0.948;
+    } else if (hh >= -2.3f && hh < -0.9f) {
+        hr = 0.12143 * (double)hh + 0.85928;
+    } else if (hh >= -0.9f && hh < -0.1f) {
+        hr = 0.2125 * (double)hh + 0.94125;
+    } else if (hh >= -0.1f && hh < 0.0f) {
+        hr = 0.1 * (double)hh + 0.93;
+    }
+    if (hr < 0.0) {
+        hr += 1.0;
+    } else if (hr > 1.0) {
+        hr -= 1.0;
+    }
+    return hr;
+}
+
+__kernel void rt_lab_wavelet_w_softend_linear(
+    __global float* src, int src_pitch,
+    __global const float* il, int il_pitch,
+    __global const float* a, int a_pitch,
+    __global const float* b, int b_pitch,
+    __global const float* params, int curve_offset,
+    int w, int h, int hue_active)
+{
+    const int x = get_global_id(0);
+    const int y = get_global_id(1);
+    if (x >= w || y >= h) {
+        return;
+    }
+    const int at = y * src_pitch + x;
+    float value = rt_lw_xlog2lin10(max(src[at], 0.0f));
+    if (hue_active) {
+        const float hue =
+            rt_lw_softend_xatan2f(b[y * b_pitch + x], a[y * a_pitch + x]);
+        const double hsv = rt_lw_softend_huehsv2(hue);
+        const float curve =
+            (float)rt_lw_softend_polyline(params + curve_offset, hsv);
+        const float valparam = 1.0f * (curve - 0.5f);
+        const float base = il[y * il_pitch + x];
+        value = base + (value - base) * (1.0f + valparam);
+    }
+    src[at] = value;
+}
+
+/*
+ * The block's coefficient-domain second pass. For each (level, direction) it
+ * mixes the guided filter's coefficients with the pre-filter L's, maps the
+ * magnitude through the wavguid FlatCurve, and interpolates the guided
+ * filter's coefficient towards the pre-filter one. `entry_offset` points at
+ * the level-count header; `curve_offset` at the wavguid polyline.
+ */
+inline float rt_lw_softend_band(float wav, float ref, float tempmean,
+                                float upper, float logmax, float rap,
+                                float asig, float bsig, float amean,
+                                __global const float* curve)
+{
+    const float tempwav = fabs(0.7f * wav + 0.3f * ref);
+    float absciss;
+    if (tempwav >= upper) {
+        absciss = rt_lw_xexpf((rt_lw_xlogf(tempwav) - logmax) * rap);
+    } else if (tempwav >= tempmean) {
+        absciss = asig * tempwav + bsig;
+    } else {
+        absciss = 0.5f * sqrt(sqrt(amean * tempwav));
+    }
+    float kc = (float)(rt_lw_softend_polyline(curve, (double)absciss) - 1.0);
+    kc = kc < 0.0f ? -(kc * kc) : kc;
+    const float reduceeffect = kc <= 0.0f ? 1.0f : 1.2f;
+    const float kinterm = fmax(1.0f + reduceeffect * kc, 0.0f);
+    return rt_lw_soft_intp(kinterm, wav, ref);
+}
+
+__kernel void rt_lab_wavelet_w_softend_band(
+    __global float* band0, int p0,
+    __global float* band1, int p1,
+    __global float* band2, int p2,
+    __global const float* ref0, int q0,
+    __global const float* ref1, int q1,
+    __global const float* ref2, int q2,
+    __global const float* params, int entry_offset, int curve_offset,
+    int level, int w, int h)
+{
+    const int x = get_global_id(0);
+    const int y = get_global_id(1);
+    if (x >= w || y >= h) {
+        return;
+    }
+    __global const float* entry =
+        params + entry_offset + level * RT_LW_W_SOFTEND_LEVEL_SCALARS;
+    if (entry[0] == 0.0f) {
+        return;
+    }
+    __global const float* curve = params + curve_offset;
+    const float tempmean = entry[1];
+    const float upper = entry[2];
+    const float logmax = entry[3];
+    const float rap = entry[4];
+    const float asig = entry[5];
+    const float bsig = entry[6];
+    const float amean = entry[7];
+
+    const int at0 = y * p0 + x;
+    band0[at0] = rt_lw_softend_band(
+        band0[at0], ref0[y * q0 + x], tempmean, upper, logmax, rap, asig,
+        bsig, amean, curve);
+    const int at1 = y * p1 + x;
+    band1[at1] = rt_lw_softend_band(
+        band1[at1], ref1[y * q1 + x], tempmean, upper, logmax, rap, asig,
+        bsig, amean, curve);
+    const int at2 = y * p2 + x;
+    band2[at2] = rt_lw_softend_band(
+        band2[at2], ref2[y * q2 + x], tempmean, upper, logmax, rap, asig,
+        bsig, amean, curve);
+}
+
+/* The block's final blend when the second pass or the hue arm already left
+ * the guided filter's output in the linear domain. */
+__kernel void rt_lab_wavelet_w_softend_blend(
+    __global const float* q, int q_pitch,
+    __global float* l, int l_pitch,
+    __global const float* il, int il_pitch,
+    int w, int h, float blend)
+{
+    const int x = get_global_id(0);
+    const int y = get_global_id(1);
+    if (x >= w || y >= h) {
+        return;
+    }
+    l[y * l_pitch + x] =
+        rt_lw_soft_intp(blend, q[y * q_pitch + x], il[y * il_pitch + x]);
 }
 
 /*
