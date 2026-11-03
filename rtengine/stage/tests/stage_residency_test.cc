@@ -8747,13 +8747,26 @@ void wavelet_denoise_params(rtengine::procparams::ProcParams& params,
 
 /*
  * The final panel's guided soft radius. It runs after the final pixel curve
- * on the reconstructed L, and only the portable sub-case is admitted: Thrend
- * is zero and wavguidcurve is identity. The matrix covers the radius, the
- * blend and the detail-adjust sliders, the identity and curved final panels,
- * contrast and denoise, and the subsampling arms a small and a wide image
- * take. A strength of zero leaves the image unchanged by construction, so
+ * on the reconstructed L, and the whole block is ported: the guided filter,
+ * the coefficient-domain second pass (`Thrend > 0`) and the hue modulation
+ * (`wavguidcurve`). The matrix covers the radius, the blend and the
+ * detail-adjust sliders, the identity and curved final panels, contrast and
+ * denoise, and the subsampling arms a small and a wide image take, and it
+ * repeats the sweep for each of the two coefficient-domain arms alone and
+ * together. A strength of zero leaves the image unchanged by construction, so
  * only cases with a non-zero blend are checked for non-vacuity.
  */
+const std::vector<double>& softend_hue_curve()
+{
+    /* Four knots with both a pull-down and a push-up arm, so the modulation
+     * runs in both directions over the image's hues. */
+    static const std::vector<double> curve = {
+        static_cast<double>(FCT_MinMaxCPoints), 0.0, 0.20, 0.35, 0.35,
+        0.35, 0.70, 0.35, 0.35, 0.70, 0.30, 0.35, 0.35, 1.0, 0.85, 0.35,
+        0.35};
+    return curve;
+}
+
 void test_lab_wavelet_softend()
 {
     using namespace rtengine::stage;
@@ -8769,6 +8782,8 @@ void test_lab_wavelet_softend()
         double softradend;
         double strend;
         int detend;
+        double thrend;
+        bool hue;
         bool curves;
         bool contrast;
         bool denoise;
@@ -8779,42 +8794,99 @@ void test_lab_wavelet_softend()
     const double noise[5] = {40, 30, 20, 10, 5};
     const int contrast[9] = {30, 22, 14, 8, 4, 2, 0, 0, 0};
     const SoftEndCase cases[] = {
-        {"softradend 2", 238, 64, 2.0, 50.0, 0, false, false, false, false,
-         true},
-        {"softradend 10", 238, 64, 10.0, 40.0, 2, false, false, false, false,
-         true},
-        {"softradend 40", 238, 64, 40.0, 100.0, 4, false, false, false, false,
-         true},
-        {"softradend 10 blend 0", 238, 64, 10.0, 0.0, -2, false, false,
-         false, false, false},
-        {"softradend 5 curves", 238, 64, 5.0, 40.0, 0, true, false, false,
-         false, true},
-        {"softradend 20 contrast", 238, 64, 20.0, 60.0, 2, true, true, false,
-         false, true},
-        {"softradend 10 denoise", 238, 160, 10.0, 50.0, -2, false, false,
-         true, false, true},
-        {"softradend 10 odd 179x161", 179, 161, 10.0, 50.0, 0, false, false,
+        {"softradend 2", 238, 64, 2.0, 50.0, 0, 0.0, false, false, false,
          false, false, true},
-        {"softradend 40 odd 703x67", 703, 67, 40.0, 80.0, 4, false, false,
+        {"softradend 10", 238, 64, 10.0, 40.0, 2, 0.0, false, false, false,
          false, false, true},
-        {"softradend 1", 238, 64, 1.0, 70.0, 0, false, false, false, false,
-         true},
-        {"softradend 3 detail -10", 238, 64, 3.0, 60.0, -10, false, false,
+        {"softradend 40", 238, 64, 40.0, 100.0, 4, 0.0, false, false, false,
          false, false, true},
-        {"softradend 1000", 238, 64, 1000.0, 100.0, 10, false, false, false,
-         false, true},
-        {"softradend 20 wide", 1024, 64, 20.0, 80.0, 0, false, false, false,
-         false, true},
-        {"softradend 7 wide", 1024, 64, 7.0, 80.0, 0, false, false, false,
-         false, true},
-        {"softradend 10 smooth", 400, 300, 10.0, 70.0, 0, false, false, false,
-         true, true},
-        {"softradend 40 smooth blend 1", 400, 300, 40.0, 100.0, 2, false,
+        {"softradend 10 blend 0", 238, 64, 10.0, 0.0, -2, 0.0, false, false,
+         false, false, false, false},
+        {"softradend 5 curves", 238, 64, 5.0, 40.0, 0, 0.0, false, true,
+         false, false, false, true},
+        {"softradend 20 contrast", 238, 64, 20.0, 60.0, 2, 0.0, false, true,
+         true, false, false, true},
+        {"softradend 10 denoise", 238, 160, 10.0, 50.0, -2, 0.0, false,
+         false, false, true, false, true},
+        {"softradend 10 odd 179x161", 179, 161, 10.0, 50.0, 0, 0.0, false,
+         false, false, false, false, true},
+        {"softradend 40 odd 703x67", 703, 67, 40.0, 80.0, 4, 0.0, false,
+         false, false, false, false, true},
+        {"softradend 1", 238, 64, 1.0, 70.0, 0, 0.0, false, false, false,
+         false, false, true},
+        {"softradend 3 detail -10", 238, 64, 3.0, 60.0, -10, 0.0, false,
+         false, false, false, false, true},
+        {"softradend 1000", 238, 64, 1000.0, 100.0, 10, 0.0, false, false,
+         false, false, false, true},
+        {"softradend 20 wide", 1024, 64, 20.0, 80.0, 0, 0.0, false, false,
+         false, false, false, true},
+        {"softradend 7 wide", 1024, 64, 7.0, 80.0, 0, 0.0, false, false,
+         false, false, false, true},
+        {"softradend 10 smooth", 400, 300, 10.0, 70.0, 0, 0.0, false, false,
          false, false, true, true},
-        {"softradend 20 smooth wide", 1024, 64, 20.0, 80.0, 0, false, false,
+        {"softradend 40 smooth blend 1", 400, 300, 40.0, 100.0, 2, 0.0,
+         false, false, false, false, true, true},
+        {"softradend 20 smooth wide", 1024, 64, 20.0, 80.0, 0, 0.0, false,
+         false, false, false, true, true},
+        {"softradend 40 smooth odd 703x67", 703, 67, 40.0, 80.0, 4, 0.0,
+         false, false, false, false, true, true},
+        /* The coefficient-domain second pass: the block's Thrend slider. */
+        {"thrend 1", 238, 64, 20.0, 60.0, 0, 1.0, false, false, false,
+         false, false, true},
+        {"thrend 5", 238, 64, 20.0, 70.0, 1, 5.0, false, false, false,
+         false, false, true},
+        {"thrend 20", 238, 64, 20.0, 80.0, 2, 20.0, false, false, false,
+         false, false, true},
+        {"thrend 50", 238, 64, 30.0, 90.0, 3, 50.0, false, false, false,
+         false, false, true},
+        {"thrend 5 curves", 238, 64, 20.0, 70.0, 0, 5.0, false, true, false,
+         false, false, true},
+        {"thrend 5 contrast", 238, 64, 20.0, 60.0, -2, 5.0, false, true,
+         true, false, false, true},
+        {"thrend 5 denoise", 238, 160, 20.0, 60.0, -2, 5.0, false, false,
+         false, true, false, true},
+        {"thrend 20 odd 179x161", 179, 161, 20.0, 80.0, 1, 20.0, false,
+         false, false, false, false, true},
+        {"thrend 1 wide 1024x64", 1024, 64, 20.0, 70.0, 0, 1.0, false,
+         false, false, false, false, true},
+        {"thrend 5 smooth", 400, 300, 20.0, 80.0, 2, 5.0, false, false,
+         false, false, true, true},
+        {"thrend 5 smooth blend 0", 400, 300, 20.0, 0.0, 2, 5.0, false,
+         false, false, false, true, false},
+        /* The hue modulation: a non-identity wavguidcurve. */
+        {"hue 5", 238, 64, 5.0, 50.0, 0, 0.0, true, false, false, false,
+         false, true},
+        {"hue 20", 238, 64, 20.0, 70.0, 2, 0.0, true, false, false, false,
+         false, true},
+        {"hue 40", 238, 64, 40.0, 100.0, 4, 0.0, true, false, false, false,
+         false, true},
+        {"hue 60", 238, 64, 60.0, 90.0, -3, 0.0, true, false, false, false,
+         false, true},
+        {"hue 20 curves", 238, 64, 20.0, 70.0, 1, 0.0, true, true, false,
+         false, false, true},
+        {"hue 10 contrast", 238, 64, 10.0, 60.0, 0, 0.0, true, true, true,
+         false, false, true},
+        {"hue 20 denoise", 238, 160, 20.0, 70.0, -2, 0.0, true, false,
+         false, true, false, true},
+        {"hue 20 odd 179x161", 179, 161, 20.0, 70.0, 0, 0.0, true, false,
+         false, false, false, true},
+        {"hue 10 wide 1024x64", 1024, 64, 10.0, 70.0, 2, 0.0, true, false,
+         false, false, false, true},
+        {"hue 10 smooth", 400, 300, 10.0, 70.0, 1, 0.0, true, false, false,
          false, true, true},
-        {"softradend 40 smooth odd 703x67", 703, 67, 40.0, 80.0, 4, false,
-         false, false, true, true},
+        {"hue 40 smooth blend 0", 400, 300, 40.0, 0.0, 0, 0.0, true, false,
+         false, false, true, false},
+        /* Both coefficient-domain arms together. */
+        {"thrend 5 hue", 238, 64, 20.0, 70.0, 0, 5.0, true, false, false,
+         false, false, true},
+        {"thrend 5 hue curves", 238, 64, 20.0, 70.0, 1, 5.0, true, true,
+         false, false, false, true},
+        {"thrend 5 hue denoise", 238, 160, 20.0, 70.0, -2, 5.0, true, false,
+         false, true, false, true},
+        {"thrend 1 hue wide 1024x64", 1024, 64, 20.0, 80.0, 0, 1.0, true,
+         false, false, false, false, true},
+        {"thrend 20 hue odd 179x161", 179, 161, 30.0, 80.0, 2, 20.0, true,
+         false, false, false, false, true},
     };
 
     unsigned seed = 0x50f7e2d1u;
@@ -8840,7 +8912,11 @@ void test_lab_wavelet_softend()
         params.wavelet.softradend = item.softradend;
         params.wavelet.strend = item.strend;
         params.wavelet.detend = item.detend;
-        params.wavelet.thrend = 0.0;
+        params.wavelet.thrend = item.thrend;
+        params.wavelet.wavguidcurve =
+            item.hue ? softend_hue_curve()
+                     : std::vector<double>{
+                           static_cast<double>(FCT_Linear)};
 
         LabImage source(item.width, item.height);
         if (item.smooth) {
@@ -8945,6 +9021,69 @@ void test_lab_wavelet_softend()
     }
 
     /*
+     * Non-vacuity of the two coefficient-domain arms: each must change the
+     * result against the same profile with its own control neutralised. The
+     * Thrend arm is compared with Thrend zero, the hue arm with an identity
+     * wavguidcurve, and the pair with both neutral.
+     */
+    {
+        rtengine::procparams::ProcParams thrend;
+        wavelet_final_params(thrend, 6);
+        thrend.wavelet.softradend = 20.0;
+        thrend.wavelet.strend = 70.0;
+        thrend.wavelet.detend = 1;
+        thrend.wavelet.thrend = 5.0;
+        thrend.wavelet.wavguidcurve = softend_hue_curve();
+
+        rtengine::procparams::ProcParams thrend_off = thrend;
+        thrend_off.wavelet.thrend = 0.0;
+        rtengine::procparams::ProcParams hue_off = thrend;
+        hue_off.wavelet.wavguidcurve = {
+            static_cast<double>(FCT_Linear)};
+        rtengine::procparams::ProcParams both_off = thrend;
+        both_off.wavelet.thrend = 0.0;
+        both_off.wavelet.wavguidcurve = {
+            static_cast<double>(FCT_Linear)};
+
+        LabImage source(238, 64);
+        fill_lab_tools(source, seed++);
+
+        const auto run = [&](rtengine::procparams::ProcParams& p) {
+            rtengine::ImProcFunctions ipf(&p, false);
+            LabImage image(238, 64);
+            image.CopyFrom(&source);
+            labWaveletHostBlock(ipf, p, image);
+            return image;
+        };
+
+        const LabImage full = run(thrend);
+        const Diff thrend_diff = compare(view(run(thrend_off)), view(full));
+        std::printf("stage-residency: lab.wavelet softend thrend arm changes "
+                    "%zu of %zu samples against thrend 0, PAE %.6f LSB16\n",
+                    thrend_diff.differing, thrend_diff.samples,
+                    thrend_diff.max_abs);
+        check(thrend_diff.differing > 1000 && thrend_diff.max_abs > 1.0,
+              "lab.wavelet softend thrend arm changes the image");
+
+        const Diff hue_diff = compare(view(run(hue_off)), view(full));
+        std::printf("stage-residency: lab.wavelet softend hue arm changes "
+                    "%zu of %zu samples against an identity wavguidcurve, "
+                    "PAE %.6f LSB16\n",
+                    hue_diff.differing, hue_diff.samples, hue_diff.max_abs);
+        check(hue_diff.differing > 1000 && hue_diff.max_abs > 1.0,
+              "lab.wavelet softend hue arm changes the image");
+
+        const Diff both_diff = compare(view(run(both_off)), view(full));
+        std::printf("stage-residency: lab.wavelet softend coefficient arms "
+                    "change %zu of %zu samples against both neutral, PAE "
+                    "%.6f LSB16\n",
+                    both_diff.differing, both_diff.samples,
+                    both_diff.max_abs);
+        check(both_diff.differing > 1000 && both_diff.max_abs > 1.0,
+              "lab.wavelet softend coefficient arms change the image");
+    }
+
+    /*
      * Sensitivity: the log-domain guided filter has a high gain, so a
      * one-LSB16 change in its input L can move the output by several LSB16.
      * This bounds how much of an end-to-end export difference can be
@@ -8981,28 +9120,19 @@ void test_lab_wavelet_softend()
     }
 
     /*
-     * Refusals: the coefficient-domain second block (non-zero Thrend), the hue
-     * modulation (non-identity wavguidcurve), a radius without the final panel,
-     * out-of-range sliders, and the clarity arm or clarity soft radius
-     * alongside it.
+     * Refusals: a radius without the final panel, out-of-range sliders, and
+     * the clarity arm or clarity soft radius alongside it.
      */
     const char* residual_labels[] = {
-        "thrend", "wavguidcurve", "no expfinal", "softradend high",
-        "softradend negative", "strend high", "detend high", "detend low",
-        "softrad", "clarity"};
+        "no expfinal", "softradend high", "softradend negative",
+        "strend high", "detend high", "detend low", "softrad", "clarity"};
     for (const char* label : residual_labels) {
         rtengine::procparams::ProcParams params;
         wavelet_final_params(params, 6);
         params.wavelet.softradend = 10.0;
         params.wavelet.strend = 50.0;
 
-        if (std::strcmp(label, "thrend") == 0) {
-            params.wavelet.thrend = 5.0;
-        } else if (std::strcmp(label, "wavguidcurve") == 0) {
-            params.wavelet.wavguidcurve = {
-                static_cast<double>(FCT_MinMaxCPoints), 0.0, 0.20, 0.35, 0.35,
-                1.0, 0.80, 0.35, 0.35};
-        } else if (std::strcmp(label, "no expfinal") == 0) {
+        if (std::strcmp(label, "no expfinal") == 0) {
             params.wavelet.expfinal = false;
         } else if (std::strcmp(label, "softradend high") == 0) {
             params.wavelet.softradend = 1001.0;
