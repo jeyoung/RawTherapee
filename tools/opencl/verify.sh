@@ -307,6 +307,8 @@ quick() {
         "$ROOT/devnotes/opencl/pp3/labwavelet-edge.pp3" lab.wavelet cpu
     run_stage_device "pef/stage-device-lab-wavelet-final" \
         "$ROOT/devnotes/opencl/pp3/labwavelet-final.pp3" lab.wavelet cpu
+    run_stage_device "pef/stage-device-lab-wavelet-softradend" \
+        "$ROOT/devnotes/opencl/pp3/labwavelet-softradend.pp3" lab.wavelet cpu
     run_stage_device "pef/stage-device-lab-wavelet-toning" \
         "$ROOT/devnotes/opencl/pp3/labwavelet-toning.pp3" lab.wavelet cpu
     run_stage_device "pef/stage-device-lab-wavelet-denoise" \
@@ -684,6 +686,8 @@ stage_device() {
         "$ROOT/devnotes/opencl/pp3/labwavelet-edge.pp3" lab.wavelet cpu
     run_stage_device "pef/stage-device-lab-wavelet-final" \
         "$ROOT/devnotes/opencl/pp3/labwavelet-final.pp3" lab.wavelet cpu
+    run_stage_device "pef/stage-device-lab-wavelet-softradend" \
+        "$ROOT/devnotes/opencl/pp3/labwavelet-softradend.pp3" lab.wavelet cpu
     run_stage_device "pef/stage-device-lab-wavelet-toning" \
         "$ROOT/devnotes/opencl/pp3/labwavelet-toning.pp3" lab.wavelet cpu
     run_stage_device "pef/stage-device-lab-wavelet-denoise" \

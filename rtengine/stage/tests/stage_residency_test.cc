@@ -4509,6 +4509,36 @@ void fill_lab_tools(LabImage& lab, unsigned seed)
     }
 }
 
+/*
+ * A smooth, photo-like Lab plane: a diagonal luminance ramp with a broad
+ * highlight, a deep shadow and a low-amplitude ripple, plus small chroma. The
+ * guided soft radius is sensitive to local variance, which the random
+ * generator keeps large, so this image exercises the low-variance arm.
+ */
+void fill_lab_smooth(LabImage& lab, unsigned seed)
+{
+    const int width = lab.W;
+    const int height = lab.H;
+    const float phase = static_cast<float>(seed % 97u) * 0.031f;
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            const float u = static_cast<float>(x) / static_cast<float>(width);
+            const float v = static_cast<float>(y) / static_cast<float>(height);
+            float l = 3000.f + 24000.f * (0.6f * u + 0.4f * v);
+            l += 900.f * std::sin(12.0f * u + phase) *
+                 std::cos(9.0f * v - phase);
+            if (u < 0.12f) {
+                l *= 0.02f;
+            } else if (u > 0.88f) {
+                l = 30000.f + 2000.f * u;
+            }
+            lab.L[y][x] = l;
+            lab.a[y][x] = 2500.f * (u - 0.5f);
+            lab.b[y][x] = 2500.f * (v - 0.5f);
+        }
+    }
+}
+
 struct LabToolsCase {
     const char* label;
     int width;
@@ -8712,6 +8742,334 @@ const std::vector<double>& final_opacity_curve()
     return curve;
 }
 
+void wavelet_denoise_params(rtengine::procparams::ProcParams& params,
+                            int levels, const double noise[5], double ballum);
+
+/*
+ * The final panel's guided soft radius. It runs after the final pixel curve
+ * on the reconstructed L, and only the portable sub-case is admitted: Thrend
+ * is zero and wavguidcurve is identity. The matrix covers the radius, the
+ * blend and the detail-adjust sliders, the identity and curved final panels,
+ * contrast and denoise, and the subsampling arms a small and a wide image
+ * take. A strength of zero leaves the image unchanged by construction, so
+ * only cases with a non-zero blend are checked for non-vacuity.
+ */
+void test_lab_wavelet_softend()
+{
+    using namespace rtengine::stage;
+
+    const std::string profile_path =
+        std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp") +
+        "/stage-residency-lab-wavelet-softend.jsonl";
+
+    struct SoftEndCase {
+        const char* label;
+        int width;
+        int height;
+        double softradend;
+        double strend;
+        int detend;
+        bool curves;
+        bool contrast;
+        bool denoise;
+        bool smooth;
+        bool expect_change;
+    };
+
+    const double noise[5] = {40, 30, 20, 10, 5};
+    const int contrast[9] = {30, 22, 14, 8, 4, 2, 0, 0, 0};
+    const SoftEndCase cases[] = {
+        {"softradend 2", 238, 64, 2.0, 50.0, 0, false, false, false, false,
+         true},
+        {"softradend 10", 238, 64, 10.0, 40.0, 2, false, false, false, false,
+         true},
+        {"softradend 40", 238, 64, 40.0, 100.0, 4, false, false, false, false,
+         true},
+        {"softradend 10 blend 0", 238, 64, 10.0, 0.0, -2, false, false,
+         false, false, false},
+        {"softradend 5 curves", 238, 64, 5.0, 40.0, 0, true, false, false,
+         false, true},
+        {"softradend 20 contrast", 238, 64, 20.0, 60.0, 2, true, true, false,
+         false, true},
+        {"softradend 10 denoise", 238, 160, 10.0, 50.0, -2, false, false,
+         true, false, true},
+        {"softradend 10 odd 179x161", 179, 161, 10.0, 50.0, 0, false, false,
+         false, false, true},
+        {"softradend 40 odd 703x67", 703, 67, 40.0, 80.0, 4, false, false,
+         false, false, true},
+        {"softradend 1", 238, 64, 1.0, 70.0, 0, false, false, false, false,
+         true},
+        {"softradend 3 detail -10", 238, 64, 3.0, 60.0, -10, false, false,
+         false, false, true},
+        {"softradend 1000", 238, 64, 1000.0, 100.0, 10, false, false, false,
+         false, true},
+        {"softradend 20 wide", 1024, 64, 20.0, 80.0, 0, false, false, false,
+         false, true},
+        {"softradend 7 wide", 1024, 64, 7.0, 80.0, 0, false, false, false,
+         false, true},
+        {"softradend 10 smooth", 400, 300, 10.0, 70.0, 0, false, false, false,
+         true, true},
+        {"softradend 40 smooth blend 1", 400, 300, 40.0, 100.0, 2, false,
+         false, false, true, true},
+        {"softradend 20 smooth wide", 1024, 64, 20.0, 80.0, 0, false, false,
+         false, true, true},
+        {"softradend 40 smooth odd 703x67", 703, 67, 40.0, 80.0, 4, false,
+         false, false, true, true},
+    };
+
+    unsigned seed = 0x50f7e2d1u;
+    for (const SoftEndCase& item : cases) {
+        rtengine::procparams::ProcParams params;
+        if (item.denoise) {
+            wavelet_denoise_params(params, 6, noise, 5.0);
+        } else {
+            wavelet_final_params(params, 6);
+        }
+        params.wavelet.expfinal = true;
+        params.wavelet.sigmafin = 1.0;
+        if (item.curves) {
+            params.wavelet.wavclCurve = final_diagonal_curve();
+            params.wavelet.opacityCurveWL = final_opacity_curve();
+        }
+        if (item.contrast) {
+            params.wavelet.expcontrast = true;
+            for (int level = 0; level < 9; ++level) {
+                params.wavelet.c[level] = contrast[level];
+            }
+        }
+        params.wavelet.softradend = item.softradend;
+        params.wavelet.strend = item.strend;
+        params.wavelet.detend = item.detend;
+        params.wavelet.thrend = 0.0;
+
+        LabImage source(item.width, item.height);
+        if (item.smooth) {
+            fill_lab_smooth(source, seed++);
+        } else {
+            fill_lab_tools(source, seed++);
+        }
+
+        check(labWaveletSupported(params, item.width, item.height),
+              (std::string("lab.wavelet softend ") + item.label +
+               " is the supported set").c_str());
+
+        rtengine::ImProcFunctions cpu_ipf(&params, false);
+        LabImage cpu(item.width, item.height);
+        cpu.CopyFrom(&source);
+        labWaveletHostBlock(cpu_ipf, params, cpu);
+
+        rtengine::ImProcFunctions device_ipf(&params, false);
+        LabImage device(item.width, item.height);
+        device.CopyFrom(&source);
+        const LabWaveletRun result =
+            run_lab_wavelet_node(device, params, device_ipf, profile_path);
+        const std::string profile = read_file(profile_path);
+        check(result.deviceReady,
+              (std::string("lab.wavelet softend ") + item.label +
+               " builds its host setup").c_str());
+        check(result.status == RT_STAGE_OK,
+              (std::string("lab.wavelet softend ") + item.label +
+               " completes through run()").c_str());
+        check(profile.find("\"stage\":\"lab.wavelet\"") != std::string::npos,
+              (std::string("lab.wavelet softend ") + item.label +
+               " records the node").c_str());
+        check(profile.find("\"impl\":\"opencl\"") != std::string::npos,
+              (std::string("lab.wavelet softend ") + item.label +
+               " records a device execution").c_str());
+
+        const Distribution d = distribution(view(device), view(cpu));
+        std::printf("stage-residency: lab.wavelet softend %s %dx%d: PAE "
+                    "%.6f LSB16; exact %zu, <=0.25 %zu, <=0.5 %zu, <=1 %zu, "
+                    ">1 %zu of %zu\n",
+                    item.label, item.width, item.height, d.max_abs, d.exact,
+                    d.quarter, d.half, d.one, d.over, d.samples);
+        check(d.finite,
+              (std::string("lab.wavelet softend ") + item.label +
+               " stays finite").c_str());
+        check(d.over == 0,
+              (std::string("lab.wavelet softend ") + item.label +
+               " is within one LSB16").c_str());
+
+        if (item.expect_change) {
+            const Diff changed = compare(view(source), view(device));
+            check(changed.differing > 0,
+                  (std::string("lab.wavelet softend ") + item.label +
+                   " changes the image").c_str());
+        }
+    }
+
+    /*
+     * Non-vacuity: the same profile with softradend 0 and with its blend
+     * forced to zero must differ from the filtered result, so the device cases
+     * cannot pass by ignoring the slider. The blend-zero case proves the
+     * filter itself, and the slider-off case a blend of one.
+     */
+    {
+        rtengine::procparams::ProcParams params;
+        wavelet_final_params(params, 6);
+        params.wavelet.softradend = 40.0;
+        params.wavelet.strend = 100.0;
+        params.wavelet.detend = 4;
+
+        rtengine::procparams::ProcParams off = params;
+        off.wavelet.softradend = 0.0;
+        rtengine::procparams::ProcParams blend_zero = params;
+        blend_zero.wavelet.strend = 0.0;
+
+        LabImage source(238, 64);
+        fill_lab_tools(source, seed++);
+
+        const auto run = [&](rtengine::procparams::ProcParams& p) {
+            rtengine::ImProcFunctions ipf(&p, false);
+            LabImage image(238, 64);
+            image.CopyFrom(&source);
+            labWaveletHostBlock(ipf, p, image);
+            return image;
+        };
+
+        const Diff off_diff = compare(view(run(off)), view(run(params)));
+        std::printf("stage-residency: lab.wavelet softend changes %zu of %zu "
+                    "samples against softradend 0, PAE %.6f LSB16\n",
+                    off_diff.differing, off_diff.samples, off_diff.max_abs);
+        check(off_diff.differing > 1000 && off_diff.max_abs > 1.0,
+              "lab.wavelet softend changes the image against the slider off");
+
+        const Diff blend_diff =
+            compare(view(run(blend_zero)), view(run(params)));
+        std::printf("stage-residency: lab.wavelet softend filter changes %zu "
+                    "of %zu samples against blend 0, PAE %.6f LSB16\n",
+                    blend_diff.differing, blend_diff.samples,
+                    blend_diff.max_abs);
+        check(blend_diff.differing > 1000 && blend_diff.max_abs > 1.0,
+              "lab.wavelet softend guided filter changes the image");
+    }
+
+    /*
+     * Sensitivity: the log-domain guided filter has a high gain, so a
+     * one-LSB16 change in its input L can move the output by several LSB16.
+     * This bounds how much of an end-to-end export difference can be
+     * attributed to the node rather than to an upstream rounding difference.
+     */
+    {
+        rtengine::procparams::ProcParams params;
+        wavelet_final_params(params, 6);
+        params.wavelet.softradend = 40.0;
+        params.wavelet.strend = 100.0;
+        params.wavelet.detend = 2;
+
+        LabImage source(400, 300);
+        fill_lab_smooth(source, seed++);
+        LabImage bumped(400, 300);
+        bumped.CopyFrom(&source);
+        for (int y = 0; y < bumped.H; ++y) {
+            for (int x = 0; x < bumped.W; ++x) {
+                bumped.L[y][x] += 1.f;
+            }
+        }
+
+        const auto run = [&](LabImage& image) {
+            rtengine::ImProcFunctions ipf(&params, false);
+            labWaveletHostBlock(ipf, params, image);
+        };
+        run(source);
+        run(bumped);
+        const Diff gain = compare(view(source), view(bumped));
+        std::printf("stage-residency: lab.wavelet softend one-LSB input gain: "
+                    "PAE %.6f LSB16, %zu of %zu samples differ\n",
+                    gain.max_abs, gain.differing, gain.samples);
+        check(gain.finite, "lab.wavelet softend gain stays finite");
+    }
+
+    /*
+     * Refusals: the coefficient-domain second block (non-zero Thrend), the hue
+     * modulation (non-identity wavguidcurve), a radius without the final panel,
+     * out-of-range sliders, and the clarity arm or clarity soft radius
+     * alongside it.
+     */
+    const char* residual_labels[] = {
+        "thrend", "wavguidcurve", "no expfinal", "softradend high",
+        "softradend negative", "strend high", "detend high", "detend low",
+        "softrad", "clarity"};
+    for (const char* label : residual_labels) {
+        rtengine::procparams::ProcParams params;
+        wavelet_final_params(params, 6);
+        params.wavelet.softradend = 10.0;
+        params.wavelet.strend = 50.0;
+
+        if (std::strcmp(label, "thrend") == 0) {
+            params.wavelet.thrend = 5.0;
+        } else if (std::strcmp(label, "wavguidcurve") == 0) {
+            params.wavelet.wavguidcurve = {
+                static_cast<double>(FCT_MinMaxCPoints), 0.0, 0.20, 0.35, 0.35,
+                1.0, 0.80, 0.35, 0.35};
+        } else if (std::strcmp(label, "no expfinal") == 0) {
+            params.wavelet.expfinal = false;
+        } else if (std::strcmp(label, "softradend high") == 0) {
+            params.wavelet.softradend = 1001.0;
+        } else if (std::strcmp(label, "softradend negative") == 0) {
+            params.wavelet.softradend = -1.0;
+        } else if (std::strcmp(label, "strend high") == 0) {
+            params.wavelet.strend = 101.0;
+        } else if (std::strcmp(label, "detend high") == 0) {
+            params.wavelet.detend = 11;
+        } else if (std::strcmp(label, "detend low") == 0) {
+            params.wavelet.detend = -11;
+        } else if (std::strcmp(label, "softrad") == 0) {
+            params.wavelet.softrad = 5.0;
+        } else {
+            params.wavelet.expclari = true;
+            params.wavelet.ushamethod = "sharp";
+            params.wavelet.CLmethod = "one";
+        }
+
+        check(!labWaveletSupported(params, 238, 64),
+              (std::string("lab.wavelet softend residual ") + label +
+               " is a residual").c_str());
+
+        LabImage source(238, 64);
+        fill_lab_tools(source, seed++);
+
+        rtengine::ImProcFunctions cpu_ipf(&params, false);
+        LabImage cpu(238, 64);
+        cpu.CopyFrom(&source);
+        labWaveletHostBlock(cpu_ipf, params, cpu);
+
+        rtengine::ImProcFunctions device_ipf(&params, false);
+        LabImage device(238, 64);
+        device.CopyFrom(&source);
+        const LabWaveletRun result =
+            run_lab_wavelet_node(device, params, device_ipf, profile_path);
+        const std::string profile = read_file(profile_path);
+
+        check(!result.supported,
+              (std::string("lab.wavelet softend residual ") + label +
+               " is refused as a device configuration").c_str());
+        check(!result.deviceReady,
+              (std::string("lab.wavelet softend residual ") + label +
+               " does not build a device setup").c_str());
+        check(result.status == RT_STAGE_OK,
+              (std::string("lab.wavelet softend residual ") + label +
+               " completes through run()").c_str());
+        check(profile.find("\"impl\":\"host\"") != std::string::npos,
+              (std::string("lab.wavelet softend residual ") + label +
+               " records a host execution").c_str());
+        check(profile.find("\"impl\":\"opencl\"") == std::string::npos,
+              (std::string("lab.wavelet softend residual ") + label +
+               " never mixes a device pass").c_str());
+
+        const Diff diff = compare(view(device), view(cpu));
+        std::printf("stage-residency: lab.wavelet softend residual %s: host, "
+                    "PAE %.6f LSB16, %zu of %zu samples differ\n",
+                    label, diff.max_abs, diff.differing, diff.samples);
+        check(diff.finite,
+              (std::string("lab.wavelet softend residual ") + label +
+               " stays finite").c_str());
+        check(diff.differing == 0 && diff.max_abs == 0.0,
+              (std::string("lab.wavelet softend residual ") + label +
+               " matches the CPU block").c_str());
+    }
+}
+
 void test_lab_wavelet_final(bool available)
 {
     using namespace rtengine::stage;
@@ -8894,7 +9252,7 @@ void test_lab_wavelet_final(bool available)
      * admits must run the host block byte for byte.
      */
     const char* residual_labels[] = {
-        "softradend", "softrad", "BAmethod sli", "tmr",
+        "softrad", "BAmethod sli", "tmr",
         "sigmafin low", "sigmafin high", "avoid", "median", "expbl",
         "expresid", "expnoise",
         "skin protection"};
@@ -8902,9 +9260,7 @@ void test_lab_wavelet_final(bool available)
         rtengine::procparams::ProcParams params;
         wavelet_final_params(params, 6);
 
-        if (std::strcmp(label, "softradend") == 0) {
-            params.wavelet.softradend = 0.5;
-        } else if (std::strcmp(label, "softrad") == 0) {
+        if (std::strcmp(label, "softrad") == 0) {
             params.wavelet.softrad = 0.2;
         } else if (std::strcmp(label, "BAmethod sli") == 0) {
             params.wavelet.BAmethod = "sli";
@@ -8974,6 +9330,9 @@ void test_lab_wavelet_final(bool available)
               (std::string("lab.wavelet final residual ") + label +
                " matches the CPU block").c_str());
     }
+
+    /* The final panel's guided soft radius shares this test's device gate. */
+    test_lab_wavelet_softend();
 }
 
 
