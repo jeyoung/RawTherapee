@@ -304,29 +304,33 @@ bool denoiseAdmitted(const procparams::WaveletParams& wavelet, int width,
         return false;
     }
     /*
-     * "sli" is the slider arm; "cur" adds the denoise-curve refinement. The
-     * "sli" Thrden path is a separate host multiply. The expert arm changes
-     * the refinement's level pairing, so both methods keep cp.complex zero.
+     * "sli" is the slider arm, refined by the Thrden wavlow curve when the
+     * slider is non-zero; "cur" adds the wavdenoise refinement. The expert
+     * arm changes the refinement's level pairing, so both methods keep
+     * cp.complex zero.
      */
     if ((wavelet.slimethod != "sli" && wavelet.slimethod != "cur") ||
-        wavelet.thrden != 0.0 || wavelet.complexmethod != "normal") {
+        wavelet.complexmethod != "normal") {
+        return false;
+    }
+    if (!std::isfinite(wavelet.thrden) ||
+        wavelet.thrden < LAB_WAVELET_MIN_THRDEN ||
+        wavelet.thrden > LAB_WAVELET_MAX_THRDEN) {
         return false;
     }
     /*
-     * The "cur" refinement reads cp.mixmet and cp.sigmm. An unknown method
-     * leaves the block's mixmet uninitialised, and sigma divides the curve
-     * abscissa, so both must be inside their widget ranges.
+     * The refinement reads cp.mixmet and cp.sigmm whichever curve feeds it.
+     * An unknown method leaves the block's mixmet uninitialised, and sigma
+     * divides the curve abscissa, so both must be inside their ranges.
      */
-    if (wavelet.slimethod == "cur") {
-        if (wavelet.mixmethod != "nois" && wavelet.mixmethod != "mix" &&
-            wavelet.mixmethod != "mix7" && wavelet.mixmethod != "den") {
-            return false;
-        }
-        if (!std::isfinite(wavelet.sigm) ||
-            wavelet.sigm < LAB_WAVELET_MIN_WAVELET_SIGM ||
-            wavelet.sigm > LAB_WAVELET_MAX_WAVELET_SIGM) {
-            return false;
-        }
+    if (wavelet.mixmethod != "nois" && wavelet.mixmethod != "mix" &&
+        wavelet.mixmethod != "mix7" && wavelet.mixmethod != "den") {
+        return false;
+    }
+    if (!std::isfinite(wavelet.sigm) ||
+        wavelet.sigm < LAB_WAVELET_MIN_WAVELET_SIGM ||
+        wavelet.sigm > LAB_WAVELET_MAX_WAVELET_SIGM) {
+        return false;
     }
     /* A non-identity hue curve modulates noisevarlum per pixel. */
     {
@@ -1123,6 +1127,8 @@ RtLabWaveletContext LabWaveletContext::descriptor(bool supported)
     context.wavelet.toning = wavelet_toning_ ? 1u : 0u;
     context.wavelet.denoise = wavelet_denoise_ ? 1u : 0u;
     context.wavelet.refine = wavelet_refine_ ? 1u : 0u;
+    context.wavelet.refine_poly = static_cast<uint32_t>(
+        wavelet_refine_poly_x_.size());
     context.wavelet.final_refresh = wavelet_final_refresh_ ? 1u : 0u;
     context.wavelet.compute_mad = &compute_mad_thunk;
     context.wavelet.compute_refine = &compute_refine_thunk;
@@ -1269,33 +1275,88 @@ int LabWaveletContext::build(RtLabWaveletResult& out)
      * well, so it needs the planes even when no panel modifies them.
      */
     wavelet_denoise_ = denoiseAdmitted(params_.wavelet, width_, height_);
-    wavelet_refine_ = wavelet_denoise_ && params_.wavelet.slimethod == "cur";
-    /*
-     * The refinement's curve is the block's own WavCurve over wavdenoise.
-     * `cp.denoicurv` is set when any of the first 500 entries differs from
-     * one; an identity curve leaves the LUT unallocated and the block skips
-     * the refinement, so the device only samples a live curve.
-     */
-    wavelet_refine_active_ = false;
-    wavelet_refine_curve_.clear();
-    if (wavelet_refine_) {
-        WavCurve denoise_curve;
-        denoise_curve.Set(params_.wavelet.wavdenoise);
-        if (static_cast<bool>(denoise_curve)) {
-            for (int index = 0; index < 500; ++index) {
-                if (denoise_curve[index] != 1.0f) {
-                    wavelet_refine_active_ = true;
-                    break;
+    {
+        const procparams::WaveletParams& wavelet = params_.wavelet;
+        /* The "cur" arm samples the block's WavCurve over wavdenoise when
+         * `cp.denoicurv` is set (any of the first 500 entries differs from
+         * one). The "sli" arm instead samples the Thrden wavlow curve the
+         * block builds from the slider. */
+        const bool cur = wavelet.slimethod == "cur";
+        const bool sli_thrden =
+            wavelet.slimethod == "sli" && wavelet.thrden > 0.0;
+        wavelet_refine_ = wavelet_denoise_ && (cur || sli_thrden);
+        wavelet_refine_active_ = false;
+        wavelet_refine_mode_ = 0;
+        wavelet_refine_curve_.clear();
+        wavelet_refine_poly_x_.clear();
+        wavelet_refine_poly_y_.clear();
+        wavelet_refine_poly_slope_.clear();
+        if (wavelet_refine_ && cur) {
+            WavCurve denoise_curve;
+            denoise_curve.Set(wavelet.wavdenoise);
+            if (static_cast<bool>(denoise_curve)) {
+                for (int index = 0; index < 500; ++index) {
+                    if (denoise_curve[index] != 1.0f) {
+                        wavelet_refine_active_ = true;
+                        break;
+                    }
                 }
             }
-        }
-        if (wavelet_refine_active_) {
-            wavelet_refine_curve_.resize(RT_LAB_WAVELET_REFINE_LUT);
-            for (std::uint32_t index = 0;
-                 index < RT_LAB_WAVELET_REFINE_LUT; ++index) {
-                wavelet_refine_curve_[index] =
-                    denoise_curve[static_cast<int>(index)];
+            if (wavelet_refine_active_) {
+                wavelet_refine_curve_.resize(RT_LAB_WAVELET_REFINE_LUT);
+                for (std::uint32_t index = 0;
+                     index < RT_LAB_WAVELET_REFINE_LUT; ++index) {
+                    wavelet_refine_curve_[index] =
+                        denoise_curve[static_cast<int>(index)];
+                }
             }
+        } else if (wavelet_refine_) {
+            /* ip_wavelet()'s wavlow: a four-point flat curve whose breaking
+             * point and plateau follow `cp.thrden`. */
+            const float thrend = static_cast<float>(0.01f * wavelet.thrden);
+            float thr = 0.f;
+            if (thrend < 0.01f) {
+                thr = 0.95f;
+            } else if (thrend < 0.02f) {
+                thr = 0.9f;
+            } else if (thrend < 0.04f) {
+                thr = 0.8f;
+            } else if (thrend < 0.06f) {
+                thr = 0.7f;
+            } else if (thrend < 0.08f) {
+                thr = 0.6f;
+            } else if (thrend < 0.1f) {
+                thr = 0.5f;
+            } else if (thrend < 0.2f) {
+                thr = 0.2f;
+            }
+            const std::vector<double> points = {
+                static_cast<double>(FCT_MinMaxCPoints), 0.0, 1.0, 0.35, 0.35,
+                static_cast<double>(thrend), 1.0, 0.35, 0.35,
+                static_cast<double>(thrend + 0.01f),
+                static_cast<double>(thr), 0.35, 0.35, 1.0,
+                static_cast<double>(thr), 0.35, 0.35};
+            FlatCurve low_curve(points);
+            const std::vector<double>& px = low_curve.polylineX();
+            const std::vector<double>& py = low_curve.polylineY();
+            const std::vector<double>& ps = low_curve.polylineSlope();
+            if (px.empty() || px.size() > RT_LAB_WAVELET_REFINE_POLY_MAX ||
+                py.size() != px.size() || ps.size() + 1 != px.size()) {
+                return 3;
+            }
+            wavelet_refine_poly_x_.resize(px.size());
+            wavelet_refine_poly_y_.resize(px.size());
+            wavelet_refine_poly_slope_.resize(ps.size());
+            for (std::size_t index = 0; index < px.size(); ++index) {
+                wavelet_refine_poly_x_[index] = static_cast<float>(px[index]);
+                wavelet_refine_poly_y_[index] = static_cast<float>(py[index]);
+                if (index < ps.size()) {
+                    wavelet_refine_poly_slope_[index] =
+                        static_cast<float>(ps[index]);
+                }
+            }
+            wavelet_refine_mode_ = 1;
+            wavelet_refine_active_ = true;
         }
     }
     wavelet_ab_ = wavelet_chroma_ || wavelet_edge_ || wavelet_final_ ||
@@ -1415,7 +1476,9 @@ int LabWaveletContext::build(RtLabWaveletResult& out)
                                    static_cast<std::uint32_t>(wavelet_levels_),
                                    wavelet_edge_, wavelet_final_,
                                    wavelet_toning_, wavelet_denoise_,
-                                   wavelet_refine_),
+                                   wavelet_refine_,
+                                   static_cast<std::uint32_t>(
+                                       wavelet_refine_poly_x_.size())),
             0.f);
 
         float* table = wavelet_params_.data();
@@ -1686,7 +1749,28 @@ int LabWaveletContext::build(RtLabWaveletResult& out)
                                      RT_LAB_WAVELET_REFINE_SCALARS;
                     for (std::uint32_t index = 0;
                          index < RT_LAB_WAVELET_REFINE_LUT; ++index) {
-                        lut[index] = wavelet_refine_curve_[index];
+                        lut[index] = wavelet_refine_curve_.empty()
+                                         ? 1.f
+                                         : wavelet_refine_curve_[index];
+                    }
+                    float* source =
+                        lut + RT_LAB_WAVELET_REFINE_LUT;
+                    const std::uint32_t count =
+                        static_cast<std::uint32_t>(
+                            wavelet_refine_poly_x_.size());
+                    source[0] = static_cast<float>(wavelet_refine_mode_);
+                    source[1] = static_cast<float>(count);
+                    for (std::uint32_t index = 0; index < count; ++index) {
+                        source[2 + index] =
+                            wavelet_refine_poly_x_[index];
+                        source[2 + count + index] =
+                            wavelet_refine_poly_y_[index];
+                    }
+                    for (std::size_t index = 0;
+                         index < wavelet_refine_poly_slope_.size();
+                         ++index) {
+                        source[2 + 2 * count + index] =
+                            wavelet_refine_poly_slope_[index];
                     }
                 }
             }

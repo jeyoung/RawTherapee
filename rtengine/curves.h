@@ -529,6 +529,20 @@ public:
     {
         return kind == FCT_Empty;
     };
+    /* The faceted polyline getVal() walks. The stage copies it so the device
+     * can reproduce the same lookup without re-deriving the curve. */
+    const std::vector<double>& polylineX() const
+    {
+        return poly_x;
+    }
+    const std::vector<double>& polylineY() const
+    {
+        return poly_y;
+    }
+    const std::vector<double>& polylineSlope() const
+    {
+        return dyByDx;
+    }
 };
 
 class RetinextransmissionCurve

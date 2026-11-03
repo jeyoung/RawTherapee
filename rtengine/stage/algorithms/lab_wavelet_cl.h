@@ -1783,7 +1783,39 @@ __kernel void rt_lab_wavelet_w_refine(
         absciss = 0.5f * rt_lw_pow(amean * tempwav, k);
     }
 
-    float kc = rt_lw_curve501(lut, absciss * 500.0f) - 1.0f;
+    /*
+     * `sli`+Thrden feeds a FlatCurve polyline instead of the wavdenoise LUT.
+     * The walk copies FlatCurve::getVal(): periodic wrap below the first knot,
+     * a binary search, then linear interpolation in double.
+     */
+    __global const float* source = lut + RT_LW_W_REFINE_LUT;
+    const int curve_mode = (int)source[0];
+    const int curve_count = (int)source[1];
+    float curve;
+    if (curve_mode == 1 && curve_count > 1) {
+        __global const float* px = source + 2;
+        __global const float* py = source + 2 + curve_count;
+        __global const float* ps = source + 2 + 2 * curve_count;
+        double t = (double)absciss;
+        if (t < (double)px[0]) {
+            t += 1.0;
+        }
+        int lo = 0;
+        int hi = curve_count - 1;
+        while (hi > 1 + lo) {
+            const int mid = (hi + lo) / 2;
+            if ((double)px[mid] > t) {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        curve = (float)((double)py[lo] +
+                        (t - (double)px[lo]) * (double)ps[lo]);
+    } else {
+        curve = rt_lw_curve501(lut, absciss * 500.0f);
+    }
+    float kc = curve - 1.0f;
     if (kc < 0.0f) {
         kc = -(kc * kc);
     }

@@ -6051,6 +6051,7 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
     bool wavelet_toning = false;
     bool wavelet_denoise = false;
     bool wavelet_refine = false;
+    std::uint32_t wavelet_refine_poly = 0;
     bool wavelet_ab = false;
     bool select_active = false;
     bool clarity_active = false;
@@ -6119,6 +6120,11 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
         wavelet_toning = context->wavelet.toning != 0;
         wavelet_denoise = context->wavelet.denoise != 0;
         wavelet_refine = context->wavelet.refine != 0;
+        wavelet_refine_poly = context->wavelet.refine_poly;
+        if (wavelet_refine_poly > RT_LAB_WAVELET_REFINE_POLY_MAX) {
+            error = "lab.wavelet refinement polyline is out of range";
+            return RT_STAGE_INVALID;
+        }
         if (wavelet_refine && !wavelet_denoise) {
             error = "lab.wavelet refinement needs the denoise arm";
             return RT_STAGE_FALLBACK;
@@ -6140,7 +6146,8 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
                 static_cast<std::uint32_t>(wavelet_planes),
                 static_cast<std::uint32_t>(wavelet_levels), wavelet_edge,
                 wavelet_final, wavelet_toning, wavelet_denoise,
-                wavelet_refine))) {
+                wavelet_refine,
+                static_cast<std::uint32_t>(wavelet_refine_poly)))) {
             error = "lab.wavelet parameter table has the wrong length";
             return RT_STAGE_INVALID;
         }
