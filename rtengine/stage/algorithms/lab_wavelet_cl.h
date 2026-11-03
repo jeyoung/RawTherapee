@@ -1545,10 +1545,12 @@ __kernel void rt_lab_wavelet_w_toning(
 /* Mirrors RT_LAB_WAVELET_DENOISE_HEADER and the histogram's bin count. */
 #define RT_LW_W_DENOISE_HEADER 7
 #define RT_LW_W_MAD_BINS 32768
-#define RT_LW_W_REFINE_LEVELS 4
+#define RT_LW_W_REFINE_LEVELS 6
+#define RT_LW_W_REFINE_LEVELS_STANDARD 4
 #define RT_LW_W_REFINE_SCALARS 11
 #define RT_LW_W_REFINE_HEADER 1
 #define RT_LW_W_REFINE_LUT 501
+#define RT_LW_W_REFINE_CURVE_HEADER 2
 
 /*
  * ImProcFunctions::Mad()'s histogram, one work item per (level, direction)
@@ -1728,12 +1730,48 @@ __kernel void rt_lab_wavelet_w_copy(
 }
 
 /*
+ * FlatCurve::getVal() over an encoded polyline block: [mode][count] followed
+ * by count x values, count y values and count-1 slopes. The walk copies the
+ * host: periodic wrap below the first knot, a binary search, then linear
+ * interpolation in double.
+ */
+inline float rt_lw_refine_curve(__global const float* block, float absciss)
+{
+    const int curve_mode = (int)block[0];
+    const int curve_count = (int)block[1];
+    if (curve_mode != 1 || curve_count <= 1) {
+        return 1.0f;
+    }
+    __global const float* px = block + 2;
+    __global const float* py = block + 2 + curve_count;
+    __global const float* ps = block + 2 + 2 * curve_count;
+    double t = (double)absciss;
+    if (t < (double)px[0]) {
+        t += 1.0;
+    }
+    int lo = 0;
+    int hi = curve_count - 1;
+    while (hi > 1 + lo) {
+        const int mid = (hi + lo) / 2;
+        if ((double)px[mid] > t) {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    return (float)((double)py[lo] + (t - (double)px[lo]) * (double)ps[lo]);
+}
+
+/*
  * ip_wavelet()'s denoise-curve refinement for one (direction, level). The
- * host launches it direction-major, level-minor, and the block writes levels
- * 0..3 on every level iteration, so the four post bands are both read and
- * written and the current level's values are the ones this iteration reads.
- * `cur`/`cur_pre` are the current level's post/pre bands. The per-level
- * scalars and the 501-entry wavdenoise LUT live in the refine tail.
+ * host launches it direction-major, level-minor. The standard pairing
+ * (`expert` zero) writes bands 0..3 on every level iteration, so the four
+ * post bands are both read and written and the current level's values are
+ * the ones this iteration reads. The expert pairing writes bands 0..3 on the
+ * first four iterations and bands 4 and 5 on all six, and applies the wavmed
+ * factor between the two. `cur`/`cur_pre` are the current level's post/pre
+ * bands. The per-level scalars, the 501-entry wavdenoise LUT and the three
+ * curve blocks live in the refine tail.
  */
 __kernel void rt_lab_wavelet_w_refine(
     __global const float* cur, int cur_pitch,
@@ -1742,12 +1780,16 @@ __kernel void rt_lab_wavelet_w_refine(
     __global float* post1, int p1,
     __global float* post2, int p2,
     __global float* post3, int p3,
+    __global float* post4, int p4,
+    __global float* post5, int p5,
     __global const float* pre0, int q0,
     __global const float* pre1, int q1,
     __global const float* pre2, int q2,
     __global const float* pre3, int q3,
+    __global const float* pre4, int q4,
+    __global const float* pre5, int q5,
     __global const float* params, int offset,
-    int level, int w, int h)
+    int level, int w, int h, int expert)
 {
     const int x = get_global_id(0);
     const int y = get_global_id(1);
@@ -1790,34 +1832,15 @@ __kernel void rt_lab_wavelet_w_refine(
     }
 
     /*
-     * `sli`+Thrden feeds a FlatCurve polyline instead of the wavdenoise LUT.
-     * The walk copies FlatCurve::getVal(): periodic wrap below the first knot,
-     * a binary search, then linear interpolation in double.
+     * `sli`+Thrden feeds the wavlow FlatCurve polyline instead of the
+     * wavdenoise LUT.
      */
-    __global const float* source = lut + RT_LW_W_REFINE_LUT;
-    const int curve_mode = (int)source[0];
-    const int curve_count = (int)source[1];
+    __global const float* low = lut + RT_LW_W_REFINE_LUT;
+    const int curve_mode = (int)low[0];
+    const int curve_count = (int)low[1];
     float curve;
     if (curve_mode == 1 && curve_count > 1) {
-        __global const float* px = source + 2;
-        __global const float* py = source + 2 + curve_count;
-        __global const float* ps = source + 2 + 2 * curve_count;
-        double t = (double)absciss;
-        if (t < (double)px[0]) {
-            t += 1.0;
-        }
-        int lo = 0;
-        int hi = curve_count - 1;
-        while (hi > 1 + lo) {
-            const int mid = (hi + lo) / 2;
-            if ((double)px[mid] > t) {
-                hi = mid;
-            } else {
-                lo = mid;
-            }
-        }
-        curve = (float)((double)py[lo] +
-                        (t - (double)px[lo]) * (double)ps[lo]);
+        curve = rt_lw_refine_curve(low, absciss);
     } else {
         curve = rt_lw_curve501(lut, absciss * 500.0f);
     }
@@ -1830,14 +1853,64 @@ __kernel void rt_lab_wavelet_w_refine(
     float kinterm = 1.0f + reduceeffect * kc;
     kinterm = kinterm <= 0.0f ? 0.01f : kinterm;
 
-    const int i0 = y * p0 + x;
-    const int i1 = y * p1 + x;
-    const int i2 = y * p2 + x;
-    const int i3 = y * p3 + x;
-    post0[i0] = pre0[y * q0 + x] + (post0[i0] - pre0[y * q0 + x]) * kinterm;
-    post1[i1] = pre1[y * q1 + x] + (post1[i1] - pre1[y * q1 + x]) * kinterm;
-    post2[i2] = pre2[y * q2 + x] + (post2[i2] - pre2[y * q2 + x]) * kinterm;
-    post3[i3] = pre3[y * q3 + x] + (post3[i3] - pre3[y * q3 + x]) * kinterm;
+    if (level < RT_LW_W_REFINE_LEVELS_STANDARD) {
+        const int i0 = y * p0 + x;
+        const int i1 = y * p1 + x;
+        const int i2 = y * p2 + x;
+        const int i3 = y * p3 + x;
+        post0[i0] = pre0[y * q0 + x] + (post0[i0] - pre0[y * q0 + x]) * kinterm;
+        post1[i1] = pre1[y * q1 + x] + (post1[i1] - pre1[y * q1 + x]) * kinterm;
+        post2[i2] = pre2[y * q2 + x] + (post2[i2] - pre2[y * q2 + x]) * kinterm;
+        post3[i3] = pre3[y * q3 + x] + (post3[i3] - pre3[y * q3 + x]) * kinterm;
+    }
+    if (expert == 0) {
+        return;
+    }
+    /*
+     * The expert pairing: the wavmed factor on bands 0..3 when Limden is
+     * positive (its block's mode is zero otherwise), then the wavhigh factor
+     * on bands 4 and 5. Both walk their own polyline at the same abscissa.
+     */
+    __global const float* med =
+        low + RT_LW_W_REFINE_CURVE_HEADER + 3 * curve_count;
+    if ((int)med[0] == 1) {
+        float kcmed = rt_lw_refine_curve(med, absciss) - 1.0f;
+        if (kcmed < 0.0f) {
+            kcmed = -(kcmed * kcmed);
+        }
+        /* The block derives this factor from its own curve value, without
+         * the low curve's kcFactor; only `reduceeffect` is shared. */
+        float kintermed = 1.0f + reduceeffect * kcmed;
+        kintermed = kintermed <= 0.0f ? 0.01f : kintermed;
+        const int i0 = y * p0 + x;
+        const int i1 = y * p1 + x;
+        const int i2 = y * p2 + x;
+        const int i3 = y * p3 + x;
+        post0[i0] = pre0[y * q0 + x] +
+                    (post0[i0] - pre0[y * q0 + x]) * kintermed;
+        post1[i1] = pre1[y * q1 + x] +
+                    (post1[i1] - pre1[y * q1 + x]) * kintermed;
+        post2[i2] = pre2[y * q2 + x] +
+                    (post2[i2] - pre2[y * q2 + x]) * kintermed;
+        post3[i3] = pre3[y * q3 + x] +
+                    (post3[i3] - pre3[y * q3 + x]) * kintermed;
+    }
+    __global const float* high =
+        med + RT_LW_W_REFINE_CURVE_HEADER + 3 * (int)med[1];
+    if ((int)high[0] == 1) {
+        float kchigh = rt_lw_refine_curve(high, absciss) - 1.0f;
+        if (kchigh < 0.0f) {
+            kchigh = -(kchigh * kchigh);
+        }
+        float kintermhigh = 1.0f + reduceeffect * kchigh;
+        kintermhigh = kintermhigh <= 0.0f ? 0.01f : kintermhigh;
+        const int i4 = y * p4 + x;
+        const int i5 = y * p5 + x;
+        post4[i4] = pre4[y * q4 + x] +
+                    (post4[i4] - pre4[y * q4 + x]) * kintermhigh;
+        post5[i5] = pre5[y * q5 + x] +
+                    (post5[i5] - pre5[y * q5 + x]) * kintermhigh;
+    }
 }
 
 /*

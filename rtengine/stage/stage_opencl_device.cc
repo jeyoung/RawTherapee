@@ -6052,6 +6052,10 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
     bool wavelet_denoise = false;
     bool wavelet_refine = false;
     std::uint32_t wavelet_refine_poly = 0;
+    bool wavelet_refine_expert = false;
+    int wavelet_refine_levels = 0;
+    int wavelet_refine_med_poly = 0;
+    int wavelet_refine_high_poly = 0;
     bool wavelet_ab = false;
     bool select_active = false;
     bool clarity_active = false;
@@ -6152,6 +6156,44 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
             error = "lab.wavelet refinement polyline is out of range";
             return RT_STAGE_INVALID;
         }
+        if (context->wavelet.refine_expert != 0 &&
+            context->wavelet.refine_expert != 1) {
+            error = "lab.wavelet refinement expert flag must be 0 or 1";
+            return RT_STAGE_INVALID;
+        }
+        wavelet_refine_expert = wavelet_refine &&
+                                context->wavelet.refine_expert == 1;
+        wavelet_refine_levels = static_cast<int>(
+            wavelet_refine ? context->wavelet.refine_levels : 0);
+        if (wavelet_refine &&
+            wavelet_refine_levels !=
+                static_cast<int>(wavelet_refine_expert
+                                     ? RT_LAB_WAVELET_REFINE_LEVELS_EXPERT
+                                     : RT_LAB_WAVELET_REFINE_LEVELS_STANDARD)) {
+            error = "lab.wavelet refinement level count is out of range";
+            return RT_STAGE_INVALID;
+        }
+        wavelet_refine_med_poly =
+            static_cast<int>(context->wavelet.refine_med_poly);
+        wavelet_refine_high_poly =
+            static_cast<int>(context->wavelet.refine_high_poly);
+        if (wavelet_refine_med_poly < 0 ||
+            wavelet_refine_med_poly >
+                static_cast<int>(RT_LAB_WAVELET_REFINE_POLY_MAX) ||
+            wavelet_refine_high_poly < 0 ||
+            wavelet_refine_high_poly >
+                static_cast<int>(RT_LAB_WAVELET_REFINE_POLY_MAX)) {
+            error = "lab.wavelet refinement expert curve knot count is out "
+                    "of range";
+            return RT_STAGE_INVALID;
+        }
+        if (!wavelet_refine_expert &&
+            (wavelet_refine_med_poly != 0 ||
+             wavelet_refine_high_poly != 0)) {
+            error = "lab.wavelet refinement expert curves need the expert "
+                    "pairing";
+            return RT_STAGE_INVALID;
+        }
         if (wavelet_refine && !wavelet_denoise) {
             error = "lab.wavelet refinement needs the denoise arm";
             return RT_STAGE_FALLBACK;
@@ -6210,6 +6252,8 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
                 wavelet_final, wavelet_toning, wavelet_denoise,
                 wavelet_refine,
                 static_cast<std::uint32_t>(wavelet_refine_poly),
+                static_cast<std::uint32_t>(wavelet_refine_med_poly),
+                static_cast<std::uint32_t>(wavelet_refine_high_poly),
                 wavelet_soft, softend_active, softend_thrend,
                 static_cast<std::uint32_t>(softend_thrend_poly),
                 static_cast<std::uint32_t>(softend_hue_poly)))) {
@@ -6359,6 +6403,8 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
                     wavelet_final, wavelet_toning, wavelet_denoise,
                     wavelet_refine,
                     static_cast<std::uint32_t>(wavelet_refine_poly),
+                    static_cast<std::uint32_t>(wavelet_refine_med_poly),
+                    static_cast<std::uint32_t>(wavelet_refine_high_poly),
                     wavelet_soft, false, false, 0, 0));
             if (softend_offset + static_cast<int>(
                                      RT_LAB_WAVELET_SOFTEND_ENTRIES) >
@@ -7264,8 +7310,13 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
                        RT_LAB_WAVELET_REFINE_HEADER +
                        RT_LAB_WAVELET_REFINE_LEVELS *
                            RT_LAB_WAVELET_REFINE_SCALARS +
-                       RT_LAB_WAVELET_REFINE_LUT + 2 +
-                       3 * static_cast<cl_int>(wavelet_refine_poly))
+                       RT_LAB_WAVELET_REFINE_LUT +
+                       RT_LAB_WAVELET_REFINE_CURVE_HEADER +
+                       3 * static_cast<cl_int>(wavelet_refine_poly) +
+                       RT_LAB_WAVELET_REFINE_CURVE_HEADER +
+                       3 * static_cast<cl_int>(wavelet_refine_med_poly) +
+                       RT_LAB_WAVELET_REFINE_CURVE_HEADER +
+                       3 * static_cast<cl_int>(wavelet_refine_high_poly))
                  : 0);
         /* WaveletDenoiseAllL() and WaveletDenoiseAllAB() both stop at six
          * levels; the forced Expnoise decomposition is six levels anyway. */
@@ -8285,11 +8336,13 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
 
         /*
          * ip_wavelet()'s denoise-curve refinement. The block loops
-         * directions outside levels and, for each current level, writes
-         * levels 0..3 with the factor that level's post/pre statistics
+         * directions outside levels and, for each current level, writes the
+         * low bands with the factor that level's post/pre statistics
          * produced. The repeated application is part of the result, so the
-         * kernel writes the four post bands and reads the current level's
-         * already-updated coefficients.
+         * kernel writes the post bands and reads the current level's
+         * already-updated coefficients. The standard pairing writes levels
+         * 0..3; the expert pairing writes 0..3 on the first four iterations
+         * and 4..5 on all six, plus the wavmed factor in between.
          */
         auto refine_l = [&](StageDeviceBufferPtr (*post)[3],
                             StageDeviceBufferPtr (*pre)[3]) -> bool {
@@ -8297,18 +8350,20 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
             if (tail[0] == 0.f) {
                 return true;
             }
+            const int refine_levels = wavelet_refine_levels;
+            const cl_int cl_expert = wavelet_refine_expert ? 1 : 0;
             for (int dir = 0; dir < 3; ++dir) {
-                cl_mem post_mem[4];
-                cl_int post_pitch[4];
-                cl_mem pre_mem[4];
-                cl_int pre_pitch[4];
-                for (int level = 0; level < 4; ++level) {
+                cl_mem post_mem[RT_LAB_WAVELET_REFINE_LEVELS] = {};
+                cl_int post_pitch[RT_LAB_WAVELET_REFINE_LEVELS] = {};
+                cl_mem pre_mem[RT_LAB_WAVELET_REFINE_LEVELS] = {};
+                cl_int pre_pitch[RT_LAB_WAVELET_REFINE_LEVELS] = {};
+                for (int level = 0; level < refine_levels; ++level) {
                     post_mem[level] = memory_of(post[level][dir]);
                     post_pitch[level] = pitch_of(post[level][dir]);
                     pre_mem[level] = memory_of(pre[level][dir]);
                     pre_pitch[level] = pitch_of(pre[level][dir]);
                 }
-                for (int level = 0; level < 4; ++level) {
+                for (int level = 0; level < refine_levels; ++level) {
                     const float* entry =
                         tail + RT_LAB_WAVELET_REFINE_HEADER +
                         level * RT_LAB_WAVELET_REFINE_SCALARS;
@@ -8330,7 +8385,10 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
                     ok = ok && set_arg(refine_kernel, 3, sizeof(cl_int),
                                        &cur_pre_pitch);
                     int arg = 4;
-                    for (int index = 0; index < 4; ++index) {
+                    for (int index = 0;
+                         index < static_cast<int>(
+                                     RT_LAB_WAVELET_REFINE_LEVELS);
+                         ++index) {
                         ok = ok && set_arg(refine_kernel, arg++,
                                            sizeof(cl_mem),
                                            &post_mem[index]);
@@ -8338,7 +8396,10 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
                                            sizeof(cl_int),
                                            &post_pitch[index]);
                     }
-                    for (int index = 0; index < 4; ++index) {
+                    for (int index = 0;
+                         index < static_cast<int>(
+                                     RT_LAB_WAVELET_REFINE_LEVELS);
+                         ++index) {
                         ok = ok && set_arg(refine_kernel, arg++,
                                            sizeof(cl_mem),
                                            &pre_mem[index]);
@@ -8356,6 +8417,8 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
                                        sizeof(cl_int), &cl_half_w);
                     ok = ok && set_arg(refine_kernel, arg++,
                                        sizeof(cl_int), &cl_half_h);
+                    ok = ok && set_arg(refine_kernel, arg++,
+                                       sizeof(cl_int), &cl_expert);
                     if (!ok || !launch(refine_kernel, band_global,
                                        "lab.wavelet refine")) {
                         error = "lab.wavelet refine arguments failed";

@@ -58,7 +58,7 @@ struct ProcParams;
  * wavelet tool's own skin protection: the equaliser only changes L, so a/b
  * and their masks are identical at the start of both passes.
  */
-#define RT_LAB_WAVELET_CONTEXT_VERSION 13u
+#define RT_LAB_WAVELET_CONTEXT_VERSION 14u
 /* "LWCT": rejects a stale or unrelated pointer before any callback runs. */
 #define RT_LAB_WAVELET_CONTEXT_MAGIC 0x4C574354u
 /* The number of levels of the directional pyramid. */
@@ -269,19 +269,28 @@ struct ProcParams;
  * with a non-zero Thrden), present only when the refinement is admitted. It
  * follows the denoise tail:
  *   [0]                  1 when the block would run the refinement
- *   [1 + level*11 + k]   level 0..3, k = active, weightL, logmax, rap, asig,
+ *   [1 + level*11 + k]   level 0..5, k = active, weightL, logmax, rap, asig,
  *                        bsig, amean, k, maxVal, tempmean, kcFactor
  *   then RT_LAB_WAVELET_REFINE_LUT samples of the block's own wavdenoise
  *   curve (the WavCurve 501-entry float LUT), used when mode is zero
  *   then [mode] and [count]; mode 1 carries the Thrden wavlow polyline as
  *   count x values, count y values and count slopes.
- * The refinement runs at levref == 4 levels when cp.complex is zero; the
- * expert arm is a host residual.
+ *   then the expert arm's two extra curves in the same encoding: wavmed
+ *   (`Limden > 0`) and wavhigh (always).
+ * The refinement runs at levref == 4 levels when cp.complex is zero and six
+ * when it is one; the expert pairing maps levels 0..3 to sigmm14 and 4..5 to
+ * sigmm56, and rewrites bands 0..3 with the wavmed factor and bands 4..5 with
+ * the wavhigh factor on every level iteration.
  */
-#define RT_LAB_WAVELET_REFINE_LEVELS 4u
+#define RT_LAB_WAVELET_REFINE_LEVELS 6u
+/* The standard pairing's levref, and the expert pairing's. */
+#define RT_LAB_WAVELET_REFINE_LEVELS_STANDARD 4u
+#define RT_LAB_WAVELET_REFINE_LEVELS_EXPERT 6u
 #define RT_LAB_WAVELET_REFINE_SCALARS 11u
 #define RT_LAB_WAVELET_REFINE_HEADER 1u
 #define RT_LAB_WAVELET_REFINE_LUT 501u
+/* The two expert curve blocks: [mode] and [count] then the encoded polyline. */
+#define RT_LAB_WAVELET_REFINE_CURVE_HEADER 2u
 /* FlatCurve's default polyline count is 1000 plus the closing point. */
 #define RT_LAB_WAVELET_REFINE_POLY_MAX 1024u
 
@@ -295,6 +304,8 @@ inline std::size_t labWaveletParamEntries(std::uint32_t planes,
                                           bool final_curves, bool toning,
                                           bool denoise, bool refine,
                                           std::uint32_t refine_poly,
+                                          std::uint32_t refine_med_poly,
+                                          std::uint32_t refine_high_poly,
                                           bool soft, bool softend,
                                           bool softend_thrend,
                                           std::uint32_t softend_thrend_poly,
@@ -330,8 +341,13 @@ inline std::size_t labWaveletParamEntries(std::uint32_t planes,
         entries += RT_LAB_WAVELET_REFINE_HEADER +
                    static_cast<std::size_t>(RT_LAB_WAVELET_REFINE_LEVELS) *
                        RT_LAB_WAVELET_REFINE_SCALARS +
-                   RT_LAB_WAVELET_REFINE_LUT + 2 +
-                   3 * static_cast<std::size_t>(refine_poly);
+                   RT_LAB_WAVELET_REFINE_LUT +
+                   RT_LAB_WAVELET_REFINE_CURVE_HEADER +
+                   3 * static_cast<std::size_t>(refine_poly) +
+                   RT_LAB_WAVELET_REFINE_CURVE_HEADER +
+                   3 * static_cast<std::size_t>(refine_med_poly) +
+                   RT_LAB_WAVELET_REFINE_CURVE_HEADER +
+                   3 * static_cast<std::size_t>(refine_high_poly);
     }
     if (soft) {
         entries += RT_LAB_WAVELET_SOFT_LUT_ENTRIES;
@@ -426,6 +442,17 @@ typedef struct RtLabWaveletWavelet {
     /* The Thrden wavlow polyline's knot count in that tail, or zero when the
      * refinement samples the wavdenoise LUT instead. */
     uint32_t refine_poly;
+    /*
+     * The refinement's levref: four for the standard pairing, six for the
+     * expert one. `refine_expert` is one when the block pairs levels 0..3 and
+     * 4..5 separately (`cp.complex == 1`); `refine_med_poly` is the wavmed
+     * curve's knot count (zero when Limden is zero) and `refine_high_poly`
+     * the wavhigh curve's, both zero when the expert arm is off.
+     */
+    uint32_t refine_levels;
+    uint32_t refine_expert;
+    uint32_t refine_med_poly;
+    uint32_t refine_high_poly;
     /*
      * 1 when ip_wavelet() re-evaluates the L statistics after the contrast,
      * edge and final multiplies: `cp.val > 0 || ref || contr || cp.diagcurv`
@@ -633,6 +660,19 @@ inline constexpr double LAB_WAVELET_MAX_WAVELET_NOISE = 100.0;
  * so a value outside the widget range is a residual. */
 inline constexpr double LAB_WAVELET_MIN_WAVELET_SIGM = 0.05;
 inline constexpr double LAB_WAVELET_MAX_WAVELET_SIGM = 3.5;
+/*
+ * The expert arm's per-level sigma pair (`Levelsigm`). The block reads the
+ * top value for levels 0..3 and the bottom for 4..5 through the same
+ * divisions as Sigm, so both ends share the widget's 0.05..3 range.
+ */
+inline constexpr double LAB_WAVELET_MIN_LEVELSIGM = 0.05;
+inline constexpr double LAB_WAVELET_MAX_LEVELSIGM = 3.0;
+/*
+ * The expert arm's wavmed strength (`Limden`). The widget admits 0..1 and
+ * the block derives the curve's breaking point from `1 - Limden`.
+ */
+inline constexpr double LAB_WAVELET_MIN_LIMDEN = 0.0;
+inline constexpr double LAB_WAVELET_MAX_LIMDEN = 1.0;
 /* The noise-balance slider (Ballum) maps to a thirteen-entry table through
  * index = 10 - ballum, so the widget's -2..10 range is also the table range. */
 inline constexpr double LAB_WAVELET_MIN_WAVELET_BALLUM = -2.0;
@@ -841,7 +881,19 @@ private:
     bool wavelet_denoise_ = false;
     bool wavelet_refine_ = false;
     bool wavelet_refine_active_ = false;
+    /* The refinement's levref and its expert pairing. */
+    std::uint32_t wavelet_refine_levels_ =
+        RT_LAB_WAVELET_REFINE_LEVELS_STANDARD;
+    bool wavelet_refine_expert_ = false;
     std::vector<float> wavelet_refine_curve_;
+    /* The expert arm's wavmed and wavhigh curves, in the same encoding as
+     * wavelet_refine_poly_*: count x, count y and count-1 slopes. */
+    std::vector<float> wavelet_refine_med_x_;
+    std::vector<float> wavelet_refine_med_y_;
+    std::vector<float> wavelet_refine_med_slope_;
+    std::vector<float> wavelet_refine_high_x_;
+    std::vector<float> wavelet_refine_high_y_;
+    std::vector<float> wavelet_refine_high_slope_;
     bool wavelet_ab_ = false;
     bool wavelet_final_refresh_ = false;
     /* 0 samples the wavdenoise LUT, 1 walks the Thrden wavlow polyline. */

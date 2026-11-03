@@ -510,10 +510,11 @@ void toningMultipliers(const procparams::WaveletParams& wavelet,
 
 /*
  * The standard-L denoise panel's arithmetic plus the chroma denoise arm the
- * block forces when Expnoise selects six levels. The plain slider set and the
- * "cur" denoise-curve refinement are ported; the "sli" Thrden refinement, the
- * expert arm and the hue modulation stay host residuals, and a user chroma
- * denoise or noise balance would change the forced 0.01 chroma strength.
+ * block forces when Expnoise selects six levels. The plain slider set, the
+ * "sli" Thrden refinement, the "cur" denoise-curve refinement and the expert
+ * level pairing are ported; the hue modulation stays a host residual, and a
+ * user chroma denoise or noise balance would change the forced 0.01 chroma
+ * strength.
  */
 bool denoiseAdmitted(const procparams::WaveletParams& wavelet, int width,
                      int height)
@@ -546,12 +547,14 @@ bool denoiseAdmitted(const procparams::WaveletParams& wavelet, int width,
     }
     /*
      * "sli" is the slider arm, refined by the Thrden wavlow curve when the
-     * slider is non-zero; "cur" adds the wavdenoise refinement. The expert
-     * arm changes the refinement's level pairing, so both methods keep
-     * cp.complex zero.
+     * slider is non-zero; "cur" adds the wavdenoise refinement. Both feed the
+     * standard pairing (levref four) or the expert pairing (levref six); an
+     * unknown method is refused because the block leaves `cp.complex`
+     * uninitialised.
      */
+    const bool expert = wavelet.complexmethod == "expert";
     if ((wavelet.slimethod != "sli" && wavelet.slimethod != "cur") ||
-        wavelet.complexmethod != "normal") {
+        (wavelet.complexmethod != "normal" && !expert)) {
         return false;
     }
     if (!std::isfinite(wavelet.thrden) ||
@@ -572,6 +575,51 @@ bool denoiseAdmitted(const procparams::WaveletParams& wavelet, int width,
         wavelet.sigm < LAB_WAVELET_MIN_WAVELET_SIGM ||
         wavelet.sigm > LAB_WAVELET_MAX_WAVELET_SIGM) {
         return false;
+    }
+    /*
+     * The expert arm's three extra inputs. `Levelsigm` feeds siglh per level
+     * through the same divisions as Sigm, `Limden` moves the wavmed curve's
+     * breaking point and `Leveldenoise`'s lower value is the wavhigh
+     * curve's threshold. All three must be inside their widget ranges.
+     */
+    if (expert) {
+        const double sigmm14 = wavelet.levelsigm.getTop();
+        const double sigmm56 = wavelet.levelsigm.getBottom();
+        if (!std::isfinite(sigmm14) || !std::isfinite(sigmm56) ||
+            sigmm14 < LAB_WAVELET_MIN_LEVELSIGM ||
+            sigmm14 > LAB_WAVELET_MAX_LEVELSIGM ||
+            sigmm56 < LAB_WAVELET_MIN_LEVELSIGM ||
+            sigmm56 > LAB_WAVELET_MAX_LEVELSIGM) {
+            return false;
+        }
+        if (!std::isfinite(wavelet.limden) ||
+            wavelet.limden < LAB_WAVELET_MIN_LIMDEN ||
+            wavelet.limden > LAB_WAVELET_MAX_LIMDEN) {
+            return false;
+        }
+        if (!std::isfinite(wavelet.leveldenoise.getBottom()) ||
+            wavelet.leveldenoise.getBottom() < 0.0 ||
+            wavelet.leveldenoise.getBottom() > 100.0) {
+            return false;
+        }
+        /*
+         * cp.denoicurvh is the only thing `wavdenoiseh` feeds: it re-arms the
+         * block's Evaluate2 gate at ipwavelet.cc:1219 (the levwavL restore at
+         * 1155-1160 is commented out), which this arm's curve or Thrden
+         * already satisfies. The block sets denoicurvh when any of the first
+         * 500 WavCurve entries differs from one; the device does not model
+         * the curve, so refuse that state rather than rely on the
+         * coincidence.
+         */
+        WavCurve high_curve;
+        high_curve.Set(wavelet.wavdenoiseh);
+        if (static_cast<bool>(high_curve)) {
+            for (int index = 0; index < 500; ++index) {
+                if (high_curve[index] != 1.0f) {
+                    return false;
+                }
+            }
+        }
     }
     /* A non-identity hue curve modulates noisevarlum per pixel. */
     {
@@ -868,9 +916,22 @@ bool labWaveletWaveletSupported(const procparams::ProcParams& params,
      * The standard denoise arm. ip_wavelet() forces six levels and, at six
      * levels, forces the chroma denoise strength to 0.01 when the profile's
      * own strength is zero, so the host always denoises the a and b bands as
-     * well. The admitted set is the plain slider arm only.
+     * well. The admitted set is the plain slider arm, its "cur" and
+     * "sli"+Thrden refinements, and the expert level pairing for both.
      */
     if (denoise && !denoiseAdmitted(wavelet, width, height)) {
+        return false;
+    }
+    /*
+     * The expert pairing's refinement reads levels 0..5; a decomposition
+     * shorter than that would index past the last band. The block's own
+     * Expnoise raise makes L seven, so this only fires on a degenerate grid.
+     */
+    if (denoise && wavelet.complexmethod == "expert" &&
+        (wavelet.slimethod == "cur" ||
+         (wavelet.slimethod == "sli" && wavelet.thrden > 0.0)) &&
+        labWaveletTransformLevels(params, width, height) <
+            static_cast<int>(RT_LAB_WAVELET_REFINE_LEVELS_EXPERT)) {
         return false;
     }
     /*
@@ -1415,6 +1476,14 @@ RtLabWaveletContext LabWaveletContext::descriptor(bool supported)
     context.wavelet.refine = wavelet_refine_ ? 1u : 0u;
     context.wavelet.refine_poly = static_cast<uint32_t>(
         wavelet_refine_poly_x_.size());
+    context.wavelet.refine_levels =
+        wavelet_refine_ ? wavelet_refine_levels_ : 0u;
+    context.wavelet.refine_expert =
+        (wavelet_refine_ && wavelet_refine_expert_) ? 1u : 0u;
+    context.wavelet.refine_med_poly = static_cast<uint32_t>(
+        wavelet_refine_med_x_.size());
+    context.wavelet.refine_high_poly = static_cast<uint32_t>(
+        wavelet_refine_high_x_.size());
     context.wavelet.final_refresh = wavelet_final_refresh_ ? 1u : 0u;
     context.wavelet.compute_mad = &compute_mad_thunk;
     context.wavelet.compute_refine = &compute_refine_thunk;
@@ -1665,11 +1734,47 @@ int LabWaveletContext::build(RtLabWaveletResult& out)
             wavelet.slimethod == "sli" && wavelet.thrden > 0.0;
         wavelet_refine_ = wavelet_denoise_ && (cur || sli_thrden);
         wavelet_refine_active_ = false;
+        wavelet_refine_expert_ = wavelet.complexmethod == "expert";
+        wavelet_refine_levels_ =
+            wavelet_refine_expert_
+                ? RT_LAB_WAVELET_REFINE_LEVELS_EXPERT
+                : RT_LAB_WAVELET_REFINE_LEVELS_STANDARD;
         wavelet_refine_mode_ = 0;
         wavelet_refine_curve_.clear();
         wavelet_refine_poly_x_.clear();
         wavelet_refine_poly_y_.clear();
         wavelet_refine_poly_slope_.clear();
+        wavelet_refine_med_x_.clear();
+        wavelet_refine_med_y_.clear();
+        wavelet_refine_med_slope_.clear();
+        wavelet_refine_high_x_.clear();
+        wavelet_refine_high_y_.clear();
+        wavelet_refine_high_slope_.clear();
+        /* Encode one FlatCurve into the triple the tail stores. */
+        const auto encode = [](const std::vector<double>& points,
+                               std::vector<float>& px_out,
+                               std::vector<float>& py_out,
+                               std::vector<float>& ps_out) -> bool {
+            const FlatCurve curve(points);
+            const std::vector<double>& px = curve.polylineX();
+            const std::vector<double>& py = curve.polylineY();
+            const std::vector<double>& ps = curve.polylineSlope();
+            if (px.empty() || px.size() > RT_LAB_WAVELET_REFINE_POLY_MAX ||
+                py.size() != px.size() || ps.size() + 1 != px.size()) {
+                return false;
+            }
+            px_out.resize(px.size());
+            py_out.resize(px.size());
+            ps_out.resize(ps.size());
+            for (std::size_t index = 0; index < px.size(); ++index) {
+                px_out[index] = static_cast<float>(px[index]);
+                py_out[index] = static_cast<float>(py[index]);
+                if (index < ps.size()) {
+                    ps_out[index] = static_cast<float>(ps[index]);
+                }
+            }
+            return true;
+        };
         if (wavelet_refine_ && cur) {
             WavCurve denoise_curve;
             denoise_curve.Set(wavelet.wavdenoise);
@@ -1715,27 +1820,69 @@ int LabWaveletContext::build(RtLabWaveletResult& out)
                 static_cast<double>(thrend + 0.01f),
                 static_cast<double>(thr), 0.35, 0.35, 1.0,
                 static_cast<double>(thr), 0.35, 0.35};
-            FlatCurve low_curve(points);
-            const std::vector<double>& px = low_curve.polylineX();
-            const std::vector<double>& py = low_curve.polylineY();
-            const std::vector<double>& ps = low_curve.polylineSlope();
-            if (px.empty() || px.size() > RT_LAB_WAVELET_REFINE_POLY_MAX ||
-                py.size() != px.size() || ps.size() + 1 != px.size()) {
+            if (!encode(points, wavelet_refine_poly_x_,
+                        wavelet_refine_poly_y_,
+                        wavelet_refine_poly_slope_)) {
                 return 3;
-            }
-            wavelet_refine_poly_x_.resize(px.size());
-            wavelet_refine_poly_y_.resize(px.size());
-            wavelet_refine_poly_slope_.resize(ps.size());
-            for (std::size_t index = 0; index < px.size(); ++index) {
-                wavelet_refine_poly_x_[index] = static_cast<float>(px[index]);
-                wavelet_refine_poly_y_[index] = static_cast<float>(py[index]);
-                if (index < ps.size()) {
-                    wavelet_refine_poly_slope_[index] =
-                        static_cast<float>(ps[index]);
-                }
             }
             wavelet_refine_mode_ = 1;
             wavelet_refine_active_ = true;
+        }
+        /*
+         * The expert pairing's two extra curves, both built with the block's
+         * own float arithmetic. wavmed follows `1 - Limden` and is only
+         * consulted when Limden is positive; wavhigh always runs and takes
+         * its breaking point from Leveldenoise's lower value.
+         */
+        if (wavelet_refine_ && wavelet_refine_expert_) {
+            if (wavelet.limden > 0.0) {
+                const float threndmed =
+                    1.f - static_cast<float>(wavelet.limden);
+                float thrmed = 0.f;
+                if (threndmed < 0.02f) {
+                    thrmed = 0.5f;
+                } else if (threndmed < 0.05f) {
+                    thrmed = 0.2f;
+                }
+                const std::vector<double> points = {
+                    static_cast<double>(FCT_MinMaxCPoints), 0.0, 1.0, 0.35,
+                    0.35, static_cast<double>(threndmed), 1.0, 0.35, 0.35,
+                    static_cast<double>(threndmed + 0.01f),
+                    static_cast<double>(thrmed), 0.35, 0.35, 1.0,
+                    static_cast<double>(thrmed), 0.35, 0.35};
+                if (!encode(points, wavelet_refine_med_x_,
+                            wavelet_refine_med_y_,
+                            wavelet_refine_med_slope_)) {
+                    return 3;
+                }
+            }
+            const float threndhigh =
+                0.01f * static_cast<float>(wavelet.leveldenoise.getBottom());
+            float thrhigh = 0.f;
+            if (threndhigh < 0.01f) {
+                thrhigh = 0.95f;
+            } else if (threndhigh < 0.02f) {
+                thrhigh = 0.9f;
+            } else if (threndhigh < 0.04f) {
+                thrhigh = 0.8f;
+            } else if (threndhigh < 0.06f) {
+                thrhigh = 0.7f;
+            } else if (threndhigh < 0.08f) {
+                thrhigh = 0.6f;
+            } else if (threndhigh < 0.1f) {
+                thrhigh = 0.5f;
+            }
+            const std::vector<double> points = {
+                static_cast<double>(FCT_MinMaxCPoints), 0.0, 1.0, 0.35, 0.35,
+                static_cast<double>(threndhigh), 1.0, 0.35, 0.35,
+                static_cast<double>(threndhigh + 0.01f),
+                static_cast<double>(thrhigh), 0.35, 0.35, 1.0,
+                static_cast<double>(thrhigh), 0.35, 0.35};
+            if (!encode(points, wavelet_refine_high_x_,
+                        wavelet_refine_high_y_,
+                        wavelet_refine_high_slope_)) {
+                return 3;
+            }
         }
     }
     wavelet_ab_ = wavelet_chroma_ || wavelet_edge_ || wavelet_final_ ||
@@ -1803,6 +1950,14 @@ int LabWaveletContext::build(RtLabWaveletResult& out)
     if (params_.wavelet.enabled && !wavelet_active_) {
         return 3;
     }
+    /*
+     * The refinement indexes the pairing's own levref bands on both sides, so
+     * a decomposition shorter than that would read past the last band.
+     */
+    if (wavelet_refine_ &&
+        wavelet_levels_ < static_cast<int>(wavelet_refine_levels_)) {
+        return 3;
+    }
     {
         /*
          * ip_wavelet() re-evaluates the L statistics after the contrast,
@@ -1858,6 +2013,10 @@ int LabWaveletContext::build(RtLabWaveletResult& out)
                                    wavelet_refine_,
                                    static_cast<std::uint32_t>(
                                        wavelet_refine_poly_x_.size()),
+                                   static_cast<std::uint32_t>(
+                                       wavelet_refine_med_x_.size()),
+                                   static_cast<std::uint32_t>(
+                                       wavelet_refine_high_x_.size()),
                                    wavelet_soft_, softend_active_,
                                    softend_thrend_,
                                    static_cast<std::uint32_t>(
@@ -2172,6 +2331,45 @@ int LabWaveletContext::build(RtLabWaveletResult& out)
                         source[2 + 2 * count + index] =
                             wavelet_refine_poly_slope_[index];
                     }
+                    /*
+                     * The expert pairing's wavmed and wavhigh curves follow in
+                     * the same encoding. The mode is zero when the curve is
+                     * absent: wavmed only runs with a positive Limden.
+                     */
+                    const auto write_curve = [](float* block, float mode,
+                                                const std::vector<float>& px,
+                                                const std::vector<float>& py,
+                                                const std::vector<float>& ps) {
+                        const std::uint32_t knots =
+                            static_cast<std::uint32_t>(px.size());
+                        block[0] = mode;
+                        block[1] = static_cast<float>(knots);
+                        for (std::uint32_t index = 0; index < knots; ++index) {
+                            block[2 + index] = px[index];
+                            block[2 + knots + index] = py[index];
+                        }
+                        for (std::size_t index = 0; index < ps.size();
+                             ++index) {
+                            block[2 + 2 * knots + index] = ps[index];
+                        }
+                    };
+                    float* med = source +
+                                 RT_LAB_WAVELET_REFINE_CURVE_HEADER +
+                                 3 * static_cast<std::size_t>(count);
+                    write_curve(med,
+                                wavelet_refine_med_x_.empty() ? 0.f : 1.f,
+                                wavelet_refine_med_x_,
+                                wavelet_refine_med_y_,
+                                wavelet_refine_med_slope_);
+                    const std::size_t med_count =
+                        wavelet_refine_med_x_.size();
+                    float* high = med + RT_LAB_WAVELET_REFINE_CURVE_HEADER +
+                                  3 * med_count;
+                    write_curve(high,
+                                wavelet_refine_high_x_.empty() ? 0.f : 1.f,
+                                wavelet_refine_high_x_,
+                                wavelet_refine_high_y_,
+                                wavelet_refine_high_slope_);
                 }
             }
         }
@@ -2191,6 +2389,8 @@ int LabWaveletContext::build(RtLabWaveletResult& out)
                 wavelet_final_, wavelet_toning_, wavelet_denoise_,
                 wavelet_refine_,
                 static_cast<std::uint32_t>(wavelet_refine_poly_x_.size()),
+                static_cast<std::uint32_t>(wavelet_refine_med_x_.size()),
+                static_cast<std::uint32_t>(wavelet_refine_high_x_.size()),
                 false, false, false, 0, 0);
             if (soft_offset + RT_LAB_WAVELET_SOFT_LUT_ENTRIES !=
                 wavelet_params_.size()) {
@@ -2209,6 +2409,8 @@ int LabWaveletContext::build(RtLabWaveletResult& out)
                 wavelet_final_, wavelet_toning_, wavelet_denoise_,
                 wavelet_refine_,
                 static_cast<std::uint32_t>(wavelet_refine_poly_x_.size()),
+                static_cast<std::uint32_t>(wavelet_refine_med_x_.size()),
+                static_cast<std::uint32_t>(wavelet_refine_high_x_.size()),
                 wavelet_soft_, false, false, 0, 0);
             if (softend_offset + RT_LAB_WAVELET_SOFTEND_ENTRIES >
                 wavelet_params_.size()) {
@@ -2581,7 +2783,7 @@ int LabWaveletContext::computeRefine(const float* pre_stats,
     }
 
     if (!wavelet_refine_active_ || !exitifzero ||
-        levels < RT_LAB_WAVELET_REFINE_LEVELS) {
+        levels < wavelet_refine_levels_) {
         return 0;
     }
 
@@ -2595,11 +2797,16 @@ int LabWaveletContext::computeRefine(const float* pre_stats,
     }
     constexpr float weights[4] = {0.f, 0.5f, 0.7f, 1.f};
     const float weight = weights[mixmet];
-    const float siglh = static_cast<float>(params_.wavelet.sigm);
+    const float sigm = static_cast<float>(params_.wavelet.sigm);
+    /* The expert pairing's two ends, levels 0..3 and 4..5. */
+    const float sigmm14 =
+        static_cast<float>(params_.wavelet.levelsigm.getTop());
+    const float sigmm56 =
+        static_cast<float>(params_.wavelet.levelsigm.getBottom());
     /* ip_wavelet.cc calls the double `log()` and stores into a float. */
     const float inx = static_cast<float>(std::log(static_cast<double>(0.666f)));
 
-    for (std::uint32_t level = 0; level < RT_LAB_WAVELET_REFINE_LEVELS;
+    for (std::uint32_t level = 0; level < wavelet_refine_levels_;
          ++level) {
         float mean = 0.f;
         float sigma = 0.f;
@@ -2623,6 +2830,9 @@ int LabWaveletContext::computeRefine(const float* pre_stats,
         if (!active) {
             continue;
         }
+        /* siglh[level] is the expert pairing's sigmm14 or sigmm56. */
+        const float siglh =
+            wavelet_refine_expert_ ? (level > 3 ? sigmm56 : sigmm14) : sigm;
 
         /* intp(a, b, c) = a * (b - c) + c: post is b, pre is c. */
         const float tempmax = weight * (maxpd - maxp) + maxp;
