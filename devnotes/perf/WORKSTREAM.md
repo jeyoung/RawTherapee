@@ -213,6 +213,11 @@ current tip.
   cases (contrast 5, contrast 15 with L curve and brightness, contrast 30
   with all six tables) are exact; `labtools-labcurve-contrast.pp3` is exact
   on the export TIFF. `89e0a844b`, `47b9980fb`.
+- **`local.adjustments` Retinex**: the spot Retinex arm runs on the device
+  (`Lab_Local()`'s decompositions, mean/stdv reductions and the senstype-4
+  blend), with the chroma Retinex slider and a non-identity luminance mask
+  left as refusals. The matrix reaches 0.357422 LSB16 and
+  `localadjustments-retinex.pp3` records 1 LSB16 with `impl=opencl`.
 - **`lab.wavelet` clarity soft radius**: `guidedFilter()`'s box means, `a`/`b`
   reduction and bilinear upsample run on the device over the block's
   `provradius` guide, with the subsampling, radius and four scales derived on
