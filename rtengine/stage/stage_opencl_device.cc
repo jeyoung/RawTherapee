@@ -1394,6 +1394,7 @@ const std::vector<KernelDef>& kernels()
         {"raw.preprocess", RT_RAW_CL, "rt_raw_preprocess_scale"},
         {"raw.demosaic", RT_RAW_DEMOSAIC_CL, "rt_raw_demosaic_nodemosaic"},
         {"raw.base", RT_RAW_BASE_CL, "rt_raw_base_matrix"},
+        {"raw.base.wb", RT_RAW_BASE_CL, "rt_raw_base_wb"},
         {"framing", framing_source().c_str(), "rt_framing"},
         {"crop", crop_source().c_str(), "rt_crop"},
         {"thumbnail.whitebalance", thumbnail_wb_source().c_str(), "rt_thumbnail_wb"},
@@ -12118,6 +12119,155 @@ RtStageStatus run_raw_demosaic(
 }
 
 /*
+ * raw.base.wb: the white-balance multiply and optional out-of-gamut clamp of
+ * RawImageSource::getImage(). The host derives rm, gm and bm as floats and
+ * this launcher passes them unchanged; the kernel repeats the host's float
+ * product and CLIP() arithmetic exactly. The call site defers the multiply
+ * until the image has been assembled by transLine(), so the node works on the
+ * same in-place three-plane buffer. Every other getImage() case -- a skipped
+ * or reduced preview, D1X, Fuji SuperCCD, highlight recovery or a non-planar
+ * source -- stays on the host, and the caller's in-place pass rewrites the
+ * image if this node refuses.
+ */
+RtStageStatus run_raw_base_wb(
+    const std::shared_ptr<OpenCLEnv>& env,
+    const std::shared_ptr<OpenCLResidency>& residency,
+    const std::vector<RtStageArg>& args, std::string& error)
+{
+    if (args.size() != RAW_BASE_WB_ARG_COUNT ||
+        args[RAW_BASE_WB_ARG_IMAGE].kind != RT_STAGE_ARG_BUFFER ||
+        args[RAW_BASE_WB_ARG_CLIP].kind != RT_STAGE_ARG_INT ||
+        args[RAW_BASE_WB_ARG_CLIP].u.i < 0 ||
+        args[RAW_BASE_WB_ARG_CLIP].u.i > 1) {
+        error = "raw.base.wb expects one buffer, an int clip flag and three doubles";
+        return RT_STAGE_INVALID;
+    }
+    for (int i = 0; i < RAW_BASE_WB_MULTIPLIER_COUNT; ++i) {
+        if (args[RAW_BASE_WB_ARG_MULTIPLIERS + i].kind != RT_STAGE_ARG_DOUBLE) {
+            error = "raw.base.wb expects one buffer, an int clip flag and three doubles";
+            return RT_STAGE_INVALID;
+        }
+        if (!std::isfinite(args[RAW_BASE_WB_ARG_MULTIPLIERS + i].u.f)) {
+            error = "raw.base.wb has a non-finite multiplier";
+            return RT_STAGE_INVALID;
+        }
+    }
+
+    const RtStageBuffer& image = args[RAW_BASE_WB_ARG_IMAGE].u.buffer;
+    if (!valid(image) || image.format != RT_STAGE_F32 ||
+        image.planes != 3 || image.width <= 0 || image.height <= 0) {
+        error = "raw.base.wb needs a three-plane F32 image";
+        return RT_STAGE_INVALID;
+    }
+    if (image.row_pitch <
+            static_cast<std::size_t>(image.width) * sizeof(float) ||
+        image.plane_pitch <
+            image.row_pitch * static_cast<std::size_t>(image.height)) {
+        error = "raw.base.wb image pitch does not cover the image";
+        return RT_STAGE_INVALID;
+    }
+
+    const KernelDef* def = find_kernel("raw.base.wb");
+    assert(def != nullptr);
+    cl_kernel kernel = compiled_kernel(env, def, error);
+    if (kernel == nullptr) {
+        return RT_STAGE_FALLBACK;
+    }
+
+    const StageBufferShape shape{RT_STAGE_F32, image.width, image.height, 3};
+    StageDeviceBufferPtr device = residency->acquire(image.data, shape, &error);
+    if (!device) {
+        return RT_STAGE_FALLBACK;
+    }
+    if (residency->upload(device, image) != RT_STAGE_OK) {
+        error = "raw.base.wb image upload failed";
+        return RT_STAGE_FALLBACK;
+    }
+
+    auto device_image = std::dynamic_pointer_cast<OpenCLDeviceBuffer>(device);
+    if (!device_image) {
+        error = "raw.base.wb device buffer mismatch";
+        return RT_STAGE_FALLBACK;
+    }
+
+    const std::size_t row_pitch_bytes = device_image->row_pitch();
+    const std::size_t plane_pitch_bytes = device_image->plane_pitch();
+    if (row_pitch_bytes % sizeof(float) != 0 ||
+        plane_pitch_bytes % sizeof(float) != 0 ||
+        row_pitch_bytes / sizeof(float) <
+            static_cast<std::size_t>(image.width) ||
+        plane_pitch_bytes / sizeof(float) <
+            static_cast<std::size_t>(image.height) *
+                (row_pitch_bytes / sizeof(float))) {
+        error = "raw.base.wb row or plane pitch does not cover the image";
+        return RT_STAGE_FALLBACK;
+    }
+    const std::int64_t row_pitch =
+        static_cast<std::int64_t>(row_pitch_bytes / sizeof(float));
+    const std::int64_t plane_pitch =
+        static_cast<std::int64_t>(plane_pitch_bytes / sizeof(float));
+    if (row_pitch > std::numeric_limits<cl_int>::max() ||
+        plane_pitch > std::numeric_limits<cl_int>::max() / 3) {
+        error = "raw.base.wb pitch does not fit the kernel's int arithmetic";
+        return RT_STAGE_FALLBACK;
+    }
+
+    std::lock_guard<std::recursive_mutex> lock(env->queue_mutex);
+
+    const cl_mem image_memory = device_image->memory();
+    const cl_int clip = static_cast<cl_int>(args[RAW_BASE_WB_ARG_CLIP].u.i);
+    const cl_int width = image.width;
+    const cl_int height = image.height;
+    const cl_int pitch = static_cast<cl_int>(row_pitch);
+    const cl_int plane = static_cast<cl_int>(plane_pitch);
+
+    const auto set_arg = [&](cl_uint index, std::size_t bytes,
+                             const void* value) {
+        return env->api->SetKernelArg(kernel, index, bytes, value) == CL_SUCCESS;
+    };
+
+    cl_uint arg = 0;
+    bool args_ok = set_arg(arg++, sizeof(cl_mem), &image_memory) &&
+                   set_arg(arg++, sizeof(cl_int), &clip);
+    for (int i = 0; i < RAW_BASE_WB_MULTIPLIER_COUNT && args_ok; ++i) {
+        const cl_float multiplier = static_cast<cl_float>(
+            args[RAW_BASE_WB_ARG_MULTIPLIERS + i].u.f);
+        args_ok = set_arg(arg++, sizeof(cl_float), &multiplier);
+    }
+    args_ok = args_ok &&
+              set_arg(arg++, sizeof(cl_int), &width) &&
+              set_arg(arg++, sizeof(cl_int), &height) &&
+              set_arg(arg++, sizeof(cl_int), &pitch) &&
+              set_arg(arg++, sizeof(cl_int), &plane);
+    if (!args_ok) {
+        error = "raw.base.wb clSetKernelArg failed";
+        return RT_STAGE_FALLBACK;
+    }
+
+    const std::size_t global = static_cast<std::size_t>(height);
+    cl_event done = nullptr;
+    if (env->api->EnqueueNDRangeKernel(env->queue, kernel, 1, nullptr, &global,
+                                       nullptr, 0, nullptr,
+                                       &done) != CL_SUCCESS ||
+        done == nullptr) {
+        error = "raw.base.wb launch failed";
+        return RT_STAGE_ERROR;
+    }
+    const cl_int wait_status = env->api->WaitForEvents(1, &done);
+    env->api->ReleaseEvent(done);
+    if (wait_status != CL_SUCCESS) {
+        error = "raw.base.wb did not complete";
+        return RT_STAGE_ERROR;
+    }
+    if (residency->readback(device, image) != RT_STAGE_OK) {
+        error = "raw.base.wb readback failed";
+        return RT_STAGE_ERROR;
+    }
+
+    return RT_STAGE_OK;
+}
+
+/*
  * raw.base: the camera-to-working-space matrix multiply of
  * RawImageSource::colorSpaceConversion_() when no input or DCP profile is
  * supplied. The host computes the matrix in double precision and this
@@ -21009,6 +21159,20 @@ public:
         } else if (request.name == "raw.base") {
             const RtStageStatus status =
                 run_raw_base(env_, residency_, request.args, error);
+            if (status == RT_STAGE_OK) {
+                StageEvent done;
+                done.status = StageEventStatus::Complete;
+                done.result = RT_STAGE_OK;
+                done.device = StageDeviceType::OPENCL;
+                done.asynchronous = false;
+                return done;
+            }
+            StageEvent fallback = StageQueue::submit(request, profiling);
+            fallback.note = error;
+            return fallback;
+        } else if (request.name == "raw.base.wb") {
+            const RtStageStatus status =
+                run_raw_base_wb(env_, residency_, request.args, error);
             if (status == RT_STAGE_OK) {
                 StageEvent done;
                 done.status = StageEventStatus::Complete;

@@ -930,6 +930,40 @@ void RawImageSource::getImage(const ColorTemp &ctemp, int tran, Imagefloat* imag
     gm /= area;
     bm /= area;
 
+    /*
+     * raw.base, white balance: the device runs the per-pixel multiply and the
+     * optional CLIP that the loop below applies to every sampled pixel. It is
+     * admitted only where the host loop is a pure per-pixel operation on the
+     * three interpolated planes: a full-resolution sample (skip == 1), no
+     * D1X or Fuji line assembly, no highlight recovery, and the planar source
+     * branch. Everything else keeps the original in-register multiply. The
+     * host-derived rm/gm/bm are floats and are passed unchanged.
+     *
+     * When the node is admitted the loop writes the unmultiplied samples and
+     * the post-loop pass applies the multiply in place. If the node refuses,
+     * that pass is the host fallback and computes the same float products and
+     * CLIP on the same values.
+     */
+    const bool wb_planar_source =
+        ri->getSensorType() == ST_BAYER ||
+        ri->getSensorType() == ST_FUJI_XTRANS ||
+        ri->get_colors() == 1 || ri->get_colors() == 3;
+    const bool wb_deferred =
+        wb_planar_source && skip == 1 && !d1x && !fuji && !doHr &&
+        stage::node_device("raw.base") == stage::StageNodeDevice::OpenCL &&
+        stage::node_device("raw.base.wb") ==
+            stage::StageNodeDevice::OpenCL;
+    const float wb_rm = rm;
+    const float wb_gm = gm;
+    const float wb_bm = bm;
+
+    if (wb_deferred) {
+        rm = 1.0f;
+        gm = 1.0f;
+        bm = 1.0f;
+    }
+
+    const bool clip_line = doClip && !wb_deferred;
 
 #ifdef _OPENMP
     #pragma omp parallel if(!d1x)       // omp disabled for D1x to avoid race conditions (see Issue 1088 http://code.google.com/p/rawtherapee/issues/detail?id=1088)
@@ -965,7 +999,7 @@ void RawImageSource::getImage(const ColorTemp &ctemp, int tran, Imagefloat* imag
                     gtot *= gm;
                     btot *= bm;
 
-                    if (doClip) {
+                    if (clip_line) {
                         // note: as hlmax[] can be larger than CLIP and we can later apply negative
                         // exposure this means that we can clip away local highlights which actually
                         // are not clipped. We have to do that though as we only check pixel by pixel
@@ -1000,7 +1034,7 @@ void RawImageSource::getImage(const ColorTemp &ctemp, int tran, Imagefloat* imag
                     gtot *= gm;
                     btot *= bm;
 
-                    if (doClip) {
+                    if (clip_line) {
                         rtot = CLIP(rtot);
                         gtot = CLIP(gtot);
                         btot = CLIP(btot);
@@ -1031,6 +1065,47 @@ void RawImageSource::getImage(const ColorTemp &ctemp, int tran, Imagefloat* imag
 #ifdef _OPENMP
     }
 #endif
+
+    if (wb_deferred) {
+        bool applied = false;
+
+        std::vector<RtStageArg> args(RAW_BASE_WB_ARG_COUNT);
+        args[RAW_BASE_WB_ARG_IMAGE].kind = RT_STAGE_ARG_BUFFER;
+        args[RAW_BASE_WB_ARG_IMAGE].u.buffer = stage::view(*image);
+        args[RAW_BASE_WB_ARG_CLIP].kind = RT_STAGE_ARG_INT;
+        args[RAW_BASE_WB_ARG_CLIP].u.i = doClip ? 1 : 0;
+        const float multipliers[RAW_BASE_WB_MULTIPLIER_COUNT] = {
+            wb_rm, wb_gm, wb_bm};
+        for (int i = 0; i < RAW_BASE_WB_MULTIPLIER_COUNT; ++i) {
+            args[RAW_BASE_WB_ARG_MULTIPLIERS + i].kind = RT_STAGE_ARG_DOUBLE;
+            args[RAW_BASE_WB_ARG_MULTIPLIERS + i].u.f = multipliers[i];
+        }
+
+        applied = stage::run("raw.base.wb", args) == RT_STAGE_OK;
+
+        if (!applied) {
+#ifdef _OPENMP
+            #pragma omp parallel for
+#endif
+            for (int i = 0; i < image->getHeight(); ++i) {
+                for (int j = 0; j < image->getWidth(); ++j) {
+                    float r = image->r(i, j) * wb_rm;
+                    float g = image->g(i, j) * wb_gm;
+                    float b = image->b(i, j) * wb_bm;
+
+                    if (doClip) {
+                        r = CLIP(r);
+                        g = CLIP(g);
+                        b = CLIP(b);
+                    }
+
+                    image->r(i, j) = r;
+                    image->g(i, j) = g;
+                    image->b(i, j) = b;
+                }
+            }
+        }
+    }
 
     if (fuji) {
         int a = ((tran & TR_ROT) == TR_R90 && image->getWidth() % 2 == 0) || ((tran & TR_ROT) == TR_R180 && image->getHeight() % 2 + image->getWidth() % 2 == 1) || ((tran & TR_ROT) == TR_R270 && image->getHeight() % 2 == 0);
