@@ -473,7 +473,7 @@ by default.
 | `source.select` | Full/Full/Full/Full | path | recompute | select the frame to process | n/a |
 | `source.embedded` | -/-/-/Reduced | interactive | recompute | select the embedded JPEG | n/a |
 | `raw.preprocess` | Full/Full/Full/Full | path | reuse-output | raw black/white, hot/dead pixel, CA, flat field; the Bayer arm of `scaleColors()` is the device node | partial |
-| `raw.demosaic` | Full/Full/Full/Full | path | reuse-output | demosaic and capture sharpening | no |
+| `raw.demosaic` | Full/Full/Full/Full | path | reuse-output | demosaic and capture sharpening; the MONO/NONE arms of `nodemosaic()` are the device node | partial |
 | `raw.base` | Full/Full/Roi/Reduced | path | reuse-output | `getImage()`, spot removal, denoise, film negative, Retinex, source-side gamut | no |
 | `analysis` | Full/Full/Roi/- | path | reuse-output | histogram and auto-exposure analysis | n/a |
 | `transform` | Full/Full/Roi/- | path | reuse-input | rotation, distortion, perspective, CA, vignetting, gradient, post-crop vignette, dehaze, Fattal | yes |
@@ -2004,7 +2004,17 @@ four-colour filter patterns and the host prelude that derives the black
 offsets and multipliers never leave the host. A refused or unavailable launch
 returns to the unchanged CPU loop, which rewrites every pixel.
 
-Still CPU-only: `raw.demosaic`, `raw.base`, `lab.tools`, `lab.wavelet`,
+Partial: `raw.demosaic` runs the MONO and NONE arms of
+`RawImageSource::nodemosaic()` on the device. MONO copies the mosaic into all
+three planes; NONE routes each pixel to the plane named by the CFA. Both are
+assignments, so the device and host planes are identical. Every interpolating
+arm stays on the host: the fast arm derives its gradient weights with the SSE
+reciprocal approximation, and AHD, EAHD, HPHD, VNG4, DCB, IGV, LMMSE, AMaZE,
+RCD, pixel shift and dual demosaic are full multi-pass algorithms. X-Trans
+NONE, an RGB source and a four-colour filter pattern are refused by the call
+site. Capture sharpening is part of the block and stays on the host.
+
+Still CPU-only: `raw.base`, `lab.tools`, `lab.wavelet`,
 `working.trc`, `ciecam` and `thumbnail.lab`'s working-TRC, CIE CAM and gamut
 remainder.
 

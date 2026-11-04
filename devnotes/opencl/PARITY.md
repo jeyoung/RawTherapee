@@ -177,6 +177,11 @@ pairs are exact. The gate is the peak absolute error (PAE) in normalised units;
 | 2026-11-04 | uncommitted | POCL (CPU) | `raw.preprocess` refusals: wrong argument count, U8 image, two-plane image, seven coefficients, two-row coefficients, short row-max buffer, undersized row pitch, four-colour filters, negative origin | launcher refuses before upload | 0 (host; 153 samples untouched) | PASS |
 | 2026-11-04 | uncommitted | POCL (CPU) | colorspace_flowers.pef / neutral, `raw.preprocess` scale arm | off vs auto, 16-bit TIFF | 0 (AE=0, 0 of 30 419 712), `impl=opencl` | PASS |
 | 2026-11-04 | uncommitted | POCL (CPU) | 45.7 MP NEF / neutral, `raw.preprocess` scale arm | off vs auto, 16-bit TIFF | 0 (AE=0, 0 of 136 918 080), `impl=opencl` | PASS |
+| 2026-11-04 | uncommitted | POCL (CPU) | 13-case `raw.demosaic` matrix (mono 63x31, 17x9, 17x1, one column, one pixel, idle filters word; split RGGB/BGGR/GRBG/GBRG, a mixed filter word at 17x17, one row, one column), `stage-residency-test` | device vs host loop, three planes | 0 (bit-exact, every output pixel written) | PASS |
+| 2026-11-04 | uncommitted | POCL (CPU) | `raw.demosaic` non-vacuity: every plane is written from the `-1` sentinel, the mono plane equals the mosaic and the split planes sum to it | device vs sentinel and mosaic | all cases | PASS |
+| 2026-11-04 | uncommitted | POCL (CPU) | `raw.demosaic` refusals: wrong argument count, U8 mosaic, two-plane red, mismatched size, shared buffer, mono flag 2, filters out of range, four-colour filters | launcher refuses before upload | 0 (host; three planes untouched) | PASS |
+| 2026-11-04 | uncommitted | POCL (CPU) | colorspace_flowers.pef / `raw-demosaic.pp3` (`Method=mono`), `raw.demosaic` MONO arm, default internal profiles | off vs auto, 16-bit TIFF | 0 (AE=0, 0 of 30 419 712), `impl=opencl` | PASS |
+| 2026-11-04 | uncommitted | POCL (CPU) | 45.7 MP NEF / `raw-demosaic.pp3`, `raw.demosaic` MONO arm, default internal profiles | off vs auto, 16-bit TIFF | 0 (AE=0, 0 of 136 918 080), `impl=opencl` | PASS |
 
 The `raw.preprocess` rows cover the Bayer arm of `scaleColors()` only. The
 node is a partial block: the prelude that derives the black offsets and the
@@ -184,6 +189,15 @@ multipliers, and every other preprocess step, stays on the host. A profile that
 selects the node records `impl=opencl`; an unselected run never calls the node,
 so the default path is unchanged and emits no record. X-Trans, monochrome and
 four-colour filter patterns are refused by the call site, not approximated.
+
+The `raw.demosaic` rows cover the MONO and NONE arms of `nodemosaic()` only.
+The block is partial: every interpolating method, and capture sharpening, stays
+on the host. The node's arithmetic is assignments, so the three planes are
+identical by construction rather than within a tolerance. `raw-demosaic.pp3`
+selects `Method=mono`, because the neutral profile leaves AMaZE in place and an
+AMaZE run never reaches the node. The fast arm cannot be ported exactly: its
+gradient weights use `_mm_rcp_ps`, whose approximation has no portable OpenCL
+equivalent.
 
 The clarity rows are the block's two-pass sequence, not a single kernel.
 `CLmethod`'s `one`/`inf`/`sup` selection is `finalContAllL()`'s and

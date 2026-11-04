@@ -435,6 +435,67 @@ Evidence:
 | `colorspace_flowers.pef` (10.2 MP PEF) neutral, `--gpu=off` vs `--gpu=auto`, 16-bit TIFF | AE=0, 0 of 30 419 712 samples, record `"impl":"opencl"` |
 | 45.7 MP NEF neutral, `--gpu=off` vs `--gpu=auto`, 16-bit TIFF | AE=0, 0 of 136 918 080 samples, record `"impl":"opencl"` |
 
+## Raw demosaic
+
+`raw.demosaic` owns the MONO and NONE arms of
+`RawImageSource::nodemosaic()` in `rtengine/demosaic_algos.cc`. Every
+interpolating arm stays on the host, so the call site is inside
+`nodemosaic()` rather than in the dispatch: the dispatch still chooses the
+method, and the two arms it hands to `nodemosaic()` are the only ones that
+can be reproduced exactly.
+
+The reason the interpolating arms are not ported is arithmetic, not effort.
+The simplest of them, the fast arm, weights its green interpolation with
+`fast_demo.cc`'s `INVGRADV`, which is `16.0f / (4.0f + d)^2` computed as
+`c16v * _mm_rcp_ps(...)` in the SSE path. The reciprocal approximation has no
+portable OpenCL equivalent, so a kernel cannot be shown to match the host on
+any compiler. AHD, EAHD, HPHD, VNG4, DCB, IGV, LMMSE, AMaZE, RCD, pixel shift
+and dual demosaic are full multi-pass algorithms with their own scratch state;
+they are not a "smallest exact sub-arm" and are left for later units.
+
+The ABI is `[0]` the one-plane F32 mosaic, `[1]`, `[2]` and `[3]` the red,
+green and blue planes, `[4]` an int that is 1 for the monochrome copy and 0
+for the CFA split, and `[5]` the raw filters word. The four buffers are
+separate images so the residency keys each host array by its own address; the
+three destinations are write-only and are not uploaded, so the node moves one
+plane in and three out.
+
+One work item owns one row. For MONO the kernel writes the mosaic value to all
+three planes. For NONE it reproduces `RawImage::FC()` from the filters word,
+writes the value to the plane the CFA names and zeroes the other two, exactly
+as the CPU `switch` does. There are no arithmetic operations, so the planes
+are identical by construction rather than by tolerance.
+
+The call site enters the node only when the stage policy selects it and either
+the arm is the monochrome copy or the source is `ST_BAYER` with a filter word
+`raw_demosaic_filters_supported()` accepts. The launcher rejects a buffer that
+is not one-plane F32, buffers that disagree on the image size or share an
+address, a mono flag outside 0 and 1, a filters word outside the unsigned
+32-bit range, and a four-colour pattern in the split form (the CPU `switch`
+has no case for colour 3, so those pixels would be left unwritten). A refusal
+returns before the upload and the CPU loop rewrites every pixel of all three
+planes.
+
+Evidence:
+
+| Case | Result |
+|---|---|
+| device test, thirteen shapes: mono 63x31, 17x9, 17x1, a single column, a single pixel and an idle filters word; split RGGB/BGGR/GRBG/GBRG at 63x31, a mixed filter word at 17x17, one row and one column | device execution, `device=OPENCL`, PAE 0.000000 on every plane, every output pixel written, no mosaic value lost |
+| non-vacuity | all three planes are written from the `-1` sentinel in every case, and the mono plane equals the mosaic while the split planes sum to it |
+| `run("raw.demosaic", …)` with the node selected | `"stage":"raw.demosaic".*"impl":"opencl"` in the profile |
+| refusals: wrong argument count, U8 mosaic, two-plane red, mismatched size, shared buffer, mono flag 2, filters out of range and a four-colour filters word | not `RT_STAGE_OK`, all three planes untouched |
+| `colorspace_flowers.pef` (10.2 MP PEF), `raw-demosaic.pp3` (`Method=mono`), `--gpu=off` vs `--gpu=auto`, 16-bit TIFF, default internal profiles | AE=0, 0 of 30 419 712 samples, record `"impl":"opencl"` |
+| 45.7 MP NEF, `raw-demosaic.pp3`, `--gpu=off` vs `--gpu=auto`, 16-bit TIFF, default internal profiles | AE=0, 0 of 136 918 080 samples, record `"impl":"opencl"` |
+| `verify.sh --stage-device`, `pef/stage-device-raw-demosaic`, POCL CPU, `OMP_NUM_THREADS=1` | PASS, `max_pae=1.5259e-05` (1 LSB16), `impl=opencl` on a 3888x2608 frame |
+
+The two byte-exact rows use the default internal profiles. In an environment
+whose ICC directory is populated, the same pair differs by 1 LSB16 at 500 820
+of 30 419 712 samples, but the neutral profile (AMaZE, so `nodemosaic()` never
+runs) differs at 388 622 of them with the same settings, so the LSB comes from
+another device node and not from `raw.demosaic`. The node itself has no
+arithmetic: the residency matrix and the plane-sum check pin it at PAE 0
+regardless of the profile set.
+
 ## Output sharpening
 
 `output.sharpen` runs the unsupported-mask path of

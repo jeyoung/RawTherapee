@@ -604,9 +604,19 @@ export and a GUI smoke test are not yet run for this package.
   (`588301647`). `crop` is a row copy deferred to residency.
 - Remaining CPU-only pixel nodes: `working.trc`, `lab.tools`,
   `lab.wavelet`, `local.adjustments`, `thumbnail.lab`'s working-TRC/CIE-CAM/
-  gamut remainder, and the raw three (`raw.demosaic`, `raw.base`; `source.*`/
-  `analysis` are exceptions). `raw.preprocess` is partial through its
-  `scaleColors()` Bayer arm.
+  gamut remainder, and the raw nodes (`raw.base`; `source.*`/`analysis` are
+  exceptions). `raw.preprocess` is partial through its `scaleColors()` Bayer
+  arm and `raw.demosaic` through the MONO/NONE arms of `nodemosaic()`.
+- **`raw.demosaic` (partial)**: the MONO and NONE arms of `nodemosaic()` run
+  on the device; every interpolating method and capture sharpening stay on the
+  host. MONO is a three-plane copy and NONE routes each pixel through
+  `RawImage::FC()`, so both are bit-exact by construction. The fast arm cannot
+  be ported exactly because its `INVGRADV` weights use `_mm_rcp_ps`; the
+  remaining arms are full multi-pass algorithms. Thirteen residency shapes
+  (mono and split, four filter words, one row, one column, one pixel, a mixed
+  word over the eight-row period) are exact, eight launcher refusals leave the
+  planes untouched, and the PEF/NEF `Method=mono` exports are AE=0 with
+  `impl=opencl`. `perf:`, `test:`, `docs:` in this unit.
 - **`working.trc` (partial)**: W1 exposed the probe means, the lcms-built
   profile and the probe primaries matrix via setup-only out-params
   (`78c314f00`, `92ec1641b`). W2 runs a host prefix (`lab2rgb` + fixed sRGB
