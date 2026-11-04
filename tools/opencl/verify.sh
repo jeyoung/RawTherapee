@@ -259,6 +259,8 @@ quick() {
     run_stage_device "pef/stage-device-raw-base" "" raw.base
     run_stage_device "pef/stage-device-raw-demosaic" \
         "$ROOT/devnotes/opencl/pp3/raw-demosaic.pp3" raw.demosaic
+    run_stage_device "pef/stage-device-raw-demosaic-split" \
+        "$ROOT/devnotes/opencl/pp3/raw-demosaic-split.pp3" raw.demosaic
     run_stage_device "pef/stage-device-rgbproc" \
         "$ROOT/devnotes/opencl/pp3/rgbproc-exposure.pp3" rgb.proc
     run_stage_device "pef/stage-device-framing" \
@@ -705,6 +707,8 @@ stage_device() {
     run_stage_device "pef/stage-device-raw-base" "" raw.base
     run_stage_device "pef/stage-device-raw-demosaic" \
         "$ROOT/devnotes/opencl/pp3/raw-demosaic.pp3" raw.demosaic
+    run_stage_device "pef/stage-device-raw-demosaic-split" \
+        "$ROOT/devnotes/opencl/pp3/raw-demosaic-split.pp3" raw.demosaic
     run_stage_device "pef/stage-device-rgbproc" \
         "$ROOT/devnotes/opencl/pp3/rgbproc-exposure.pp3" rgb.proc
     run_stage_device "pef/stage-device-framing" \

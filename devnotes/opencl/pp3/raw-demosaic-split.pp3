@@ -1,0 +1,18 @@
+# The NONE arm of the demosaic dispatch, which is the raw.demosaic device
+# node's Bayer CFA split path. The default AMaZE method never enters
+# nodemosaic(), so the vibrance canary cannot cover the split on its own.
+# Keep the vibrance correction from labtools-vibrance.pp3 so the row also
+# pins the split plane contents at the correction that exposed the original
+# three-sample RGBPROC difference.
+[Vibrance]
+Enabled=true
+Pastels=60
+Saturated=35
+PSThreshold=0;75;
+ProtectSkins=true
+AvoidColorShift=true
+PastSatTog=false
+SkinTonesCurve=0;
+
+[RAW Bayer]
+Method=none
