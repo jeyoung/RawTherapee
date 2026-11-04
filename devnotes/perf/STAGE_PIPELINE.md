@@ -2463,6 +2463,24 @@ the preview path, and the crop path folds `raw.preprocess` and
 `raw.demosaic` into `source.select`; those executions have no buffer boundary
 to submit.
 
+`source.select` carries no portable pixel step on any path. The export body
+(`simpleprocess.cc:482-569`) takes or loads the initial image (`:493-496`),
+binds its image source (`:507`), sets the sensor border and frame size
+(`:511-521`), clamps the crop rectangle (`:523-550`) and resolves the frame
+(`:568`). The preview body is the frame resolution alone
+(`improccoordinator.cc:1405-1412`), gated by the work item. The thumbnail raw
+fallback opens the container, resolves the Hasselblad H6D-100cMS second frame
+and records the sensor and crop geometry (`rtthumbnail.cc:901-946`).
+`setCurrentFrame()` only swaps the already-decoded frame pointer and bumps the
+source generation when the frame changes (`rawimagesource.h:212-227`,
+`imagesource.h:90-93`); the decode and per-frame `compress_image()` run in
+`RawImageSource::load()` (`rawimagesource.cc:1213-1328`), reached from
+`loadinitial.cc:34-44` before the node. The crop body sets its tiles and
+levels and performs only the denoise preparation `getImage()`
+(`dcrop.cc:1049-1058`), which is the folded `raw.preprocess`/`raw.demosaic`
+work, not a source-select pixel pass. None of these executions has a buffer
+boundary that a device node could take.
+
 ## Final integration of the request and device branches
 
 The typed-request branch (`perf-graph-request2`, head `81e73b9be`) and the
