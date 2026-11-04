@@ -12905,6 +12905,18 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
         compiled_kernel_entry(env, def, "rt_local_adjustments_log", error);
     cl_kernel log_blend_kernel = compiled_kernel_entry(
         env, def, "rt_local_adjustments_blend_log", error);
+    cl_kernel mask_curve_kernel = compiled_kernel_entry(
+        env, def, "rt_local_adjustments_mask_curve", error);
+    cl_kernel mask_finish_kernel = compiled_kernel_entry(
+        env, def, "rt_local_adjustments_mask_finish", error);
+    cl_kernel mask_box_h_kernel = compiled_kernel_entry(
+        env, def, "rt_local_adjustments_mask_box_h", error);
+    cl_kernel mask_box_v_kernel = compiled_kernel_entry(
+        env, def, "rt_local_adjustments_mask_box_v", error);
+    cl_kernel mask_recov_mask_kernel = compiled_kernel_entry(
+        env, def, "rt_local_adjustments_mask_recov_mask", error);
+    cl_kernel mask_recov_apply_kernel = compiled_kernel_entry(
+        env, def, "rt_local_adjustments_mask_recov_apply", error);
     cl_kernel softlight_kernel =
         compiled_kernel_entry(env, def, "rt_local_adjustments_softlight",
                               error);
@@ -12985,6 +12997,10 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
         line_kernel == nullptr || vibrance_kernel == nullptr ||
         lc_blend_kernel == nullptr || blend_kernel == nullptr ||
         log_kernel == nullptr || log_blend_kernel == nullptr ||
+        mask_curve_kernel == nullptr || mask_finish_kernel == nullptr ||
+        mask_box_h_kernel == nullptr || mask_box_v_kernel == nullptr ||
+        mask_recov_mask_kernel == nullptr ||
+        mask_recov_apply_kernel == nullptr ||
         softlight_kernel == nullptr ||
         dehaze_lab2rgb_kernel == nullptr ||
         dehaze_rowmax_kernel == nullptr ||
@@ -13183,6 +13199,8 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
     char sharpen_blur_keys[3] = {0, 0, 0};
     char sharpen_blur_tmp_key = 0;
     char log_orig_key = 0;
+    char mask_blur_key = 0;
+    char mask_out_key = 0;
     char tone_map_fin_key = 0;
     char tone_map_scratch_key = 0;
     char reti_reduc_key = 0;
@@ -13359,7 +13377,7 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
             setup.ws == nullptr || setup.iws == nullptr ||
             setup.cachef == nullptr || setup.cachefy == nullptr ||
             setup.gamma_srgb == nullptr || setup.igamma_srgb == nullptr ||
-            setup.iir == nullptr) {
+            setup.iir == nullptr || setup.iir_mask == nullptr) {
             error = "local.adjustments setup is incomplete";
             return RT_STAGE_FALLBACK;
         }
@@ -13619,6 +13637,69 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
              rec[RT_LOCAL_ADJUSTMENTS_SLOT_LOG_REPART] < 0.0f ||
              rec[RT_LOCAL_ADJUSTMENTS_SLOT_LOG_REPART] > 1.0f)) {
             error = "local.adjustments log setting is outside its range";
+            return RT_STAGE_FALLBACK;
+        }
+        /* Common mask. The two arms each carry a curve offset, a recovery
+         * threshold and its low/high/decay scalars; the offset must name 501
+         * floats of the result's flat table when the curve is active. */
+        const auto maskRangeOk = [&](uint32_t flag, uint32_t active,
+                                     uint32_t offset_slot,
+                                     uint32_t recoth_slot, uint32_t low_slot,
+                                     uint32_t high_slot,
+                                     uint32_t decay_slot) -> bool {
+            const bool enabled = rec[flag] == 1.0f;
+            if (rec[flag] != 0.0f && !enabled) {
+                return false;
+            }
+            if (!enabled) {
+                return rec[active] == 0.0f &&
+                       rec[offset_slot] == RT_LOCAL_ADJUSTMENTS_NO_LUT;
+            }
+            if (rec[active] != 0.0f && rec[active] != 1.0f) {
+                return false;
+            }
+            if (rec[active] == 1.0f) {
+                if (rec[offset_slot] < 0.0f ||
+                    rec[offset_slot] +
+                            RT_LOCAL_ADJUSTMENTS_MASK_CURVE_ENTRIES >
+                        static_cast<float>(setup.lut_count)) {
+                    return false;
+                }
+            } else if (rec[offset_slot] != RT_LOCAL_ADJUSTMENTS_NO_LUT) {
+                return false;
+            }
+            return rec[recoth_slot] >=
+                       RT_LOCAL_ADJUSTMENTS_MASK_MIN_RECOTH &&
+                   rec[recoth_slot] <=
+                       RT_LOCAL_ADJUSTMENTS_MASK_MAX_RECOTH &&
+                   rec[low_slot] >= RT_LOCAL_ADJUSTMENTS_MASK_MIN_LOW &&
+                   rec[low_slot] <= RT_LOCAL_ADJUSTMENTS_MASK_MAX_LOW &&
+                   rec[high_slot] >= RT_LOCAL_ADJUSTMENTS_MASK_MIN_HIGH &&
+                   rec[high_slot] <= RT_LOCAL_ADJUSTMENTS_MASK_MAX_HIGH &&
+                   rec[decay_slot] >=
+                       RT_LOCAL_ADJUSTMENTS_MASK_MIN_DECAY &&
+                   rec[decay_slot] <= RT_LOCAL_ADJUSTMENTS_MASK_MAX_DECAY;
+        };
+        if (!maskRangeOk(RT_LOCAL_ADJUSTMENTS_SLOT_MASK_LOG,
+                         RT_LOCAL_ADJUSTMENTS_SLOT_MASK_LOG_ACTIVE,
+                         RT_LOCAL_ADJUSTMENTS_SLOT_MASK_LOG_OFFSET,
+                         RT_LOCAL_ADJUSTMENTS_SLOT_MASK_LOG_RECOTH,
+                         RT_LOCAL_ADJUSTMENTS_SLOT_MASK_LOG_LOW,
+                         RT_LOCAL_ADJUSTMENTS_SLOT_MASK_LOG_HIGH,
+                         RT_LOCAL_ADJUSTMENTS_SLOT_MASK_LOG_DECAY) ||
+            !maskRangeOk(RT_LOCAL_ADJUSTMENTS_SLOT_MASK_CIE,
+                         RT_LOCAL_ADJUSTMENTS_SLOT_MASK_CIE_ACTIVE,
+                         RT_LOCAL_ADJUSTMENTS_SLOT_MASK_CIE_OFFSET,
+                         RT_LOCAL_ADJUSTMENTS_SLOT_MASK_CIE_RECOTH,
+                         RT_LOCAL_ADJUSTMENTS_SLOT_MASK_CIE_LOW,
+                         RT_LOCAL_ADJUSTMENTS_SLOT_MASK_CIE_HIGH,
+                         RT_LOCAL_ADJUSTMENTS_SLOT_MASK_CIE_DECAY)) {
+            error = "local.adjustments common mask is outside its range";
+            return RT_STAGE_FALLBACK;
+        }
+        if ((rec[RT_LOCAL_ADJUSTMENTS_SLOT_MASK_LOG] == 1.0f && !logPass) ||
+            (rec[RT_LOCAL_ADJUSTMENTS_SLOT_MASK_CIE] == 1.0f && !ciePass)) {
+            error = "local.adjustments common mask has no owning tool";
             return RT_STAGE_FALLBACK;
         }
         if (toneMapPass &&
@@ -14374,6 +14455,18 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
                     &log_orig_key, StageBufferShape{RT_STAGE_F32, bfw, bfh, 3},
                     &error);
             }
+            const bool maskLog = rec[RT_LOCAL_ADJUSTMENTS_SLOT_MASK_LOG] == 1.0f;
+            const bool maskCie = rec[RT_LOCAL_ADJUSTMENTS_SLOT_MASK_CIE] == 1.0f;
+            StageDeviceBufferPtr mask_blur_device;
+            StageDeviceBufferPtr mask_out_device;
+            if (maskLog || maskCie) {
+                mask_blur_device = residency->acquire(
+                    &mask_blur_key, StageBufferShape{RT_STAGE_F32, bfw, bfh, 1},
+                    &error);
+                mask_out_device = residency->acquire(
+                    &mask_out_key, StageBufferShape{RT_STAGE_F32, bfw, bfh, 3},
+                    &error);
+            }
             /*
              * Tone mapping's ROI-sized decomposition result and the kernel's
              * scratch set: the log-domain source, the blur iterate, the four
@@ -14595,6 +14688,8 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
                  !median_device) ||
                 !dehaze_acquired || !tone_map_acquired ||
                 (logPass && !log_orig_device) ||
+                ((maskLog || maskCie) &&
+                 (!mask_blur_device || !mask_out_device)) ||
                 (sharpenPass &&
                  (!sharpen_luma_device || !sharpen_mask_device ||
                   !sharpen_estimate_device || !sharpen_tmp_device)) ||
@@ -14640,6 +14735,21 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
                                            "log original");
                 log_orig_plane = int_pitch(plane_pitch_of(log_orig_device),
                                            "log original plane");
+            }
+            int mask_blur_pitch = 0;
+            int mask_out_pitch = 0;
+            int mask_out_plane = 0;
+            if (maskLog || maskCie) {
+                mask_blur_pitch = int_pitch(pitch_of(mask_blur_device),
+                                            "mask");
+                mask_out_pitch = int_pitch(pitch_of(mask_out_device),
+                                           "mask result");
+                mask_out_plane = int_pitch(plane_pitch_of(mask_out_device),
+                                           "mask result plane");
+                if (mask_blur_pitch < 0 || mask_out_pitch < 0 ||
+                    mask_out_plane < 0) {
+                    return RT_STAGE_FALLBACK;
+                }
             }
             int tone_map_fin_pitch = 0;
             int tone_map_fin_plane = 0;
@@ -14890,6 +15000,263 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
                                   vertical_lines, iir.vertical, label)) {
                         return false;
                     }
+                }
+                return true;
+            };
+
+            /* The common mask's own Gaussian and a three-plane reference blur
+             * from an arbitrary ROI source. `blur_roi` always sources the work
+             * copy; the mask's deltaE reference is built from the mask buffer
+             * instead. */
+            const auto blur_plane_from = [&](cl_mem src, cl_int src_pitch,
+                                             cl_int src_base, cl_mem dst,
+                                             cl_int dst_pitch,
+                                             cl_int dst_base,
+                                             const RtLabToolsIir& iir,
+                                             const char* label) {
+                const cl_int horizontal_lines = bfh - (bfh % 4);
+                const cl_int vertical_lines = bfw - (bfw % 8);
+                return run_line(line_kernel, src, scratch_memory,
+                                scratch_memory, bfw, bfh, src_pitch,
+                                scratch_pitch, 1, 1, src_base, 0, 0,
+                                horizontal_lines, iir.horizontal, label) &&
+                       run_line(line_kernel, scratch_memory, dst,
+                                scratch_memory, bfh, bfw, 1, 1,
+                                scratch_pitch, dst_pitch, 0, dst_base, 0,
+                                vertical_lines, iir.vertical, label);
+            };
+
+            /* maskcalccol()'s admitted arm: sample the luminance curve, blur
+             * the mask at 1 / sk, then blendmask()'s copy and clip. When the
+             * recovery threshold is one or more the mask feeds the deltaE
+             * reference; otherwise maskrecov() consumes it. */
+            const auto build_common_mask =
+                [&](cl_mem orig, cl_int orig_pitch, cl_int orig_plane,
+                    cl_float offset, cl_int active,
+                    const RtLabToolsIir& scope_iir, cl_float recoth,
+                    cl_float low, cl_float high, cl_float decay,
+                    const char* label) -> bool {
+                cl_uint arg = 0;
+                cl_mem luts_memory = memory_of(luts_device);
+                cl_mem mask_blur_memory = memory_of(mask_blur_device);
+                bool ok = true;
+                ok = ok && set(mask_curve_kernel, arg++, sizeof(cl_mem),
+                               &orig);
+                ok = ok && set(mask_curve_kernel, arg++, sizeof(cl_mem),
+                               &mask_blur_memory);
+                ok = ok && set(mask_curve_kernel, arg++, sizeof(cl_mem),
+                               &luts_memory);
+                ok = ok && set(mask_curve_kernel, arg++, sizeof(cl_float),
+                               &offset);
+                ok = ok && set(mask_curve_kernel, arg++, sizeof(cl_int),
+                               &active);
+                cl_int rw = bfw;
+                cl_int rh = bfh;
+                ok = ok && set(mask_curve_kernel, arg++, sizeof(cl_int),
+                               &rw);
+                ok = ok && set(mask_curve_kernel, arg++, sizeof(cl_int),
+                               &rh);
+                ok = ok && set(mask_curve_kernel, arg++, sizeof(cl_int),
+                               &orig_pitch);
+                ok = ok && set(mask_curve_kernel, arg++, sizeof(cl_int),
+                               &mask_blur_pitch);
+                if (!ok ||
+                    !launch2d(mask_curve_kernel,
+                              static_cast<std::size_t>(bfw),
+                              static_cast<std::size_t>(bfh), label)) {
+                    error = std::string("local.adjustments ") + label +
+                            " curve failed";
+                    return false;
+                }
+                if (!blur_plane_from(mask_blur_memory, mask_blur_pitch, 0,
+                                     mask_blur_memory, mask_blur_pitch, 0,
+                                     *setup.iir_mask, label)) {
+                    return false;
+                }
+                arg = 0;
+                ok = true;
+                cl_mem mask_out_memory = memory_of(mask_out_device);
+                cl_mem lab_memory = memory_of(image);
+                cl_mem record_memory = memory_of(record_device);
+                cl_int lab_p = lab_pitch;
+                cl_int lab_pl = lab_plane;
+                cl_int out_p = mask_out_pitch;
+                cl_int out_pl = mask_out_plane;
+                cl_int x0 = xstart;
+                cl_int y0 = ystart;
+                ok = ok && set(mask_finish_kernel, arg++, sizeof(cl_mem),
+                               &orig);
+                ok = ok && set(mask_finish_kernel, arg++, sizeof(cl_mem),
+                               &mask_blur_memory);
+                ok = ok && set(mask_finish_kernel, arg++, sizeof(cl_mem),
+                               &mask_out_memory);
+                ok = ok && set(mask_finish_kernel, arg++, sizeof(cl_mem),
+                               &lab_memory);
+                ok = ok && set(mask_finish_kernel, arg++, sizeof(cl_mem),
+                               &record_memory);
+                ok = ok && set(mask_finish_kernel, arg++, sizeof(cl_int),
+                               &lab_p);
+                ok = ok && set(mask_finish_kernel, arg++, sizeof(cl_int),
+                               &lab_pl);
+                ok = ok && set(mask_finish_kernel, arg++, sizeof(cl_int),
+                               &orig_pitch);
+                ok = ok && set(mask_finish_kernel, arg++, sizeof(cl_int),
+                               &orig_plane);
+                ok = ok && set(mask_finish_kernel, arg++, sizeof(cl_int),
+                               &out_p);
+                ok = ok && set(mask_finish_kernel, arg++, sizeof(cl_int),
+                               &out_pl);
+                ok = ok && set(mask_finish_kernel, arg++, sizeof(cl_int),
+                               &mask_blur_pitch);
+                ok = ok && set(mask_finish_kernel, arg++, sizeof(cl_int),
+                               &rw);
+                ok = ok && set(mask_finish_kernel, arg++, sizeof(cl_int),
+                               &rh);
+                ok = ok && set(mask_finish_kernel, arg++, sizeof(cl_int),
+                               &x0);
+                ok = ok && set(mask_finish_kernel, arg++, sizeof(cl_int),
+                               &y0);
+                if (!ok ||
+                    !launch2d(mask_finish_kernel,
+                              static_cast<std::size_t>(bfw),
+                              static_cast<std::size_t>(bfh), label)) {
+                    error = std::string("local.adjustments ") + label +
+                            " blend failed";
+                    return false;
+                }
+                if (recoth == 1.0f) {
+                    for (int plane = 0; plane < 3; ++plane) {
+                        if (!blur_plane_from(
+                                mask_out_memory, mask_out_pitch,
+                                static_cast<cl_int>(plane) * mask_out_plane,
+                                memory_of(blur_device[plane]), blur_pitch, 0,
+                                scope_iir, label)) {
+                            return false;
+                        }
+                    }
+                }
+                return true;
+            };
+
+            /* maskrecov()'s decay arm. It rewrites the tool's ROI result in
+             * place from the pre-tool image and the mask's blurred luminance. */
+            const auto apply_common_mask_recov =
+                [&](cl_float recoth, cl_float low, cl_float high,
+                    cl_float decay, const char* label) -> bool {
+                if (recoth == 1.0f) {
+                    return true;
+                }
+                cl_mem mask_blur_memory = memory_of(mask_blur_device);
+                cl_uint arg = 0;
+                bool ok = true;
+                cl_int rw = bfw;
+                cl_int rh = bfh;
+                ok = ok && set(mask_recov_mask_kernel, arg++, sizeof(cl_mem),
+                               &mask_blur_memory);
+                ok = ok && set(mask_recov_mask_kernel, arg++, sizeof(cl_mem),
+                               &mask_blur_memory);
+                ok = ok && set(mask_recov_mask_kernel, arg++,
+                               sizeof(cl_int), &rw);
+                ok = ok && set(mask_recov_mask_kernel, arg++,
+                               sizeof(cl_int), &rh);
+                ok = ok && set(mask_recov_mask_kernel, arg++,
+                               sizeof(cl_int), &mask_blur_pitch);
+                ok = ok && set(mask_recov_mask_kernel, arg++,
+                               sizeof(cl_int), &mask_blur_pitch);
+                ok = ok && set(mask_recov_mask_kernel, arg++,
+                               sizeof(cl_float), &recoth);
+                ok = ok && set(mask_recov_mask_kernel, arg++,
+                               sizeof(cl_float), &low);
+                ok = ok && set(mask_recov_mask_kernel, arg++,
+                               sizeof(cl_float), &high);
+                ok = ok && set(mask_recov_mask_kernel, arg++,
+                               sizeof(cl_float), &decay);
+                if (!ok ||
+                    !launch2d(mask_recov_mask_kernel,
+                              static_cast<std::size_t>(bfw),
+                              static_cast<std::size_t>(bfh), label)) {
+                    error = std::string("local.adjustments ") + label +
+                            " recovery mask failed";
+                    return false;
+                }
+                cl_int radius = std::min(
+                    std::min(RT_LOCAL_ADJUSTMENTS_MASK_BOX_RADIUS, bfw - 1),
+                    bfh - 1);
+                for (int pass = 0;
+                     pass < RT_LOCAL_ADJUSTMENTS_MASK_BOX_PASSES; ++pass) {
+                    arg = 0;
+                    ok = set(mask_box_h_kernel, arg++, sizeof(cl_mem),
+                             &mask_blur_memory) &&
+                         set(mask_box_h_kernel, arg++, sizeof(cl_int), &rw) &&
+                         set(mask_box_h_kernel, arg++, sizeof(cl_int), &rh) &&
+                         set(mask_box_h_kernel, arg++, sizeof(cl_int),
+                             &mask_blur_pitch) &&
+                         set(mask_box_h_kernel, arg++, sizeof(cl_int),
+                             &radius);
+                    if (!ok ||
+                        !launch1d(mask_box_h_kernel,
+                                  static_cast<std::size_t>(bfh), label)) {
+                        error = std::string("local.adjustments ") + label +
+                                " recovery box failed";
+                        return false;
+                    }
+                    arg = 0;
+                    ok = set(mask_box_v_kernel, arg++, sizeof(cl_mem),
+                             &mask_blur_memory) &&
+                         set(mask_box_v_kernel, arg++, sizeof(cl_int), &rw) &&
+                         set(mask_box_v_kernel, arg++, sizeof(cl_int), &rh) &&
+                         set(mask_box_v_kernel, arg++, sizeof(cl_int),
+                             &mask_blur_pitch) &&
+                         set(mask_box_v_kernel, arg++, sizeof(cl_int),
+                             &radius);
+                    if (!ok ||
+                        !launch1d(mask_box_v_kernel,
+                                  static_cast<std::size_t>(bfw), label)) {
+                        error = std::string("local.adjustments ") + label +
+                                " recovery box failed";
+                        return false;
+                    }
+                }
+                arg = 0;
+                ok = true;
+                cl_mem lab_memory = memory_of(image);
+                cl_int lab_p = lab_pitch;
+                cl_int lab_pl = lab_plane;
+                cl_int work_p = work_pitch;
+                cl_int work_pl = work_plane;
+                cl_int x0 = xstart;
+                cl_int y0 = ystart;
+                ok = ok && set(mask_recov_apply_kernel, arg++, sizeof(cl_mem),
+                               &lab_memory);
+                ok = ok && set(mask_recov_apply_kernel, arg++, sizeof(cl_mem),
+                               &work_memory);
+                ok = ok && set(mask_recov_apply_kernel, arg++, sizeof(cl_mem),
+                               &mask_blur_memory);
+                ok = ok && set(mask_recov_apply_kernel, arg++,
+                               sizeof(cl_int), &lab_p);
+                ok = ok && set(mask_recov_apply_kernel, arg++,
+                               sizeof(cl_int), &lab_pl);
+                ok = ok && set(mask_recov_apply_kernel, arg++,
+                               sizeof(cl_int), &work_p);
+                ok = ok && set(mask_recov_apply_kernel, arg++,
+                               sizeof(cl_int), &work_pl);
+                ok = ok && set(mask_recov_apply_kernel, arg++,
+                               sizeof(cl_int), &mask_blur_pitch);
+                ok = ok && set(mask_recov_apply_kernel, arg++,
+                               sizeof(cl_int), &rw);
+                ok = ok && set(mask_recov_apply_kernel, arg++,
+                               sizeof(cl_int), &rh);
+                ok = ok && set(mask_recov_apply_kernel, arg++,
+                               sizeof(cl_int), &x0);
+                ok = ok && set(mask_recov_apply_kernel, arg++,
+                               sizeof(cl_int), &y0);
+                if (!ok ||
+                    !launch2d(mask_recov_apply_kernel,
+                              static_cast<std::size_t>(bfw),
+                              static_cast<std::size_t>(bfh), label)) {
+                    error = std::string("local.adjustments ") + label +
+                            " recovery failed";
+                    return false;
                 }
                 return true;
             };
@@ -15371,6 +15738,32 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
                     !blur_roi(*setup.iir_vibrance, "log encoding blur")) {
                     return RT_STAGE_FALLBACK;
                 }
+                /*
+                 * maskcalccol() runs before log_encode() in Lab_Local(), on the
+                 * pre-log Lab image. Its mask is also the pre-log copy the
+                 * recovery blend later needs, so build it here while `work`
+                 * still holds that image; the log encode rewrites `work`.
+                 */
+                if (maskLog) {
+                    const cl_float mask_offset =
+                        rec[RT_LOCAL_ADJUSTMENTS_SLOT_MASK_LOG_OFFSET];
+                    const cl_int mask_active = static_cast<cl_int>(
+                        rec[RT_LOCAL_ADJUSTMENTS_SLOT_MASK_LOG_ACTIVE]);
+                    const cl_float mask_recoth =
+                        rec[RT_LOCAL_ADJUSTMENTS_SLOT_MASK_LOG_RECOTH];
+                    const cl_float mask_low =
+                        rec[RT_LOCAL_ADJUSTMENTS_SLOT_MASK_LOG_LOW];
+                    const cl_float mask_high =
+                        rec[RT_LOCAL_ADJUSTMENTS_SLOT_MASK_LOG_HIGH];
+                    const cl_float mask_decay =
+                        rec[RT_LOCAL_ADJUSTMENTS_SLOT_MASK_LOG_DECAY];
+                    if (!build_common_mask(
+                            work_memory, work_pitch, work_plane, mask_offset,
+                            mask_active, *setup.iir_vibrance, mask_recoth,
+                            mask_low, mask_high, mask_decay, "log mask")) {
+                        return RT_STAGE_FALLBACK;
+                    }
+                }
 
                 /* ROI Lab -> RGB, in place. */
                 {
@@ -15518,6 +15911,21 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
                 }
 
                 /* transit_shapedetect2() senstype 11. */
+                if (maskLog) {
+                    const cl_float mask_recoth =
+                        rec[RT_LOCAL_ADJUSTMENTS_SLOT_MASK_LOG_RECOTH];
+                    const cl_float mask_low =
+                        rec[RT_LOCAL_ADJUSTMENTS_SLOT_MASK_LOG_LOW];
+                    const cl_float mask_high =
+                        rec[RT_LOCAL_ADJUSTMENTS_SLOT_MASK_LOG_HIGH];
+                    const cl_float mask_decay =
+                        rec[RT_LOCAL_ADJUSTMENTS_SLOT_MASK_LOG_DECAY];
+                    if (!apply_common_mask_recov(mask_recoth, mask_low,
+                                                 mask_high, mask_decay,
+                                                 "log mask")) {
+                        return RT_STAGE_FALLBACK;
+                    }
+                }
                 {
                     cl_uint arg = 0;
                     cl_mem lab_memory = memory_of(image);
@@ -18034,6 +18442,31 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
                 if (!copy_roi() || !blur_roi(*setup.iir_cie, "CIE blur")) {
                     return RT_STAGE_FALLBACK;
                 }
+                if (maskCie) {
+                    const cl_float mask_offset =
+                        rec[RT_LOCAL_ADJUSTMENTS_SLOT_MASK_CIE_OFFSET];
+                    const cl_int mask_active = static_cast<cl_int>(
+                        rec[RT_LOCAL_ADJUSTMENTS_SLOT_MASK_CIE_ACTIVE]);
+                    const cl_float mask_recoth =
+                        rec[RT_LOCAL_ADJUSTMENTS_SLOT_MASK_CIE_RECOTH];
+                    const cl_float mask_low =
+                        rec[RT_LOCAL_ADJUSTMENTS_SLOT_MASK_CIE_LOW];
+                    const cl_float mask_high =
+                        rec[RT_LOCAL_ADJUSTMENTS_SLOT_MASK_CIE_HIGH];
+                    const cl_float mask_decay =
+                        rec[RT_LOCAL_ADJUSTMENTS_SLOT_MASK_CIE_DECAY];
+                    if (!build_common_mask(
+                            work_memory, work_pitch, work_plane, mask_offset,
+                            mask_active, *setup.iir_cie, mask_recoth,
+                            mask_low, mask_high, mask_decay, "CIE mask")) {
+                        return RT_STAGE_FALLBACK;
+                    }
+                    /* maskcalccol() runs before the block fills bufexpfin, so
+                     * the CIE input is the image after blendmask()'s clip. */
+                    if (!copy_roi()) {
+                        return RT_STAGE_FALLBACK;
+                    }
+                }
                 cl_uint arg = 0;
                 cl_mem record_memory = memory_of(record_device);
                 cl_mem luts_memory = memory_of(luts_device);
@@ -18070,6 +18503,21 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
                                      "CIE CAM")) {
                     error = "local.adjustments CIE CAM failed";
                     return RT_STAGE_FALLBACK;
+                }
+                if (maskCie) {
+                    const cl_float mask_recoth =
+                        rec[RT_LOCAL_ADJUSTMENTS_SLOT_MASK_CIE_RECOTH];
+                    const cl_float mask_low =
+                        rec[RT_LOCAL_ADJUSTMENTS_SLOT_MASK_CIE_LOW];
+                    const cl_float mask_high =
+                        rec[RT_LOCAL_ADJUSTMENTS_SLOT_MASK_CIE_HIGH];
+                    const cl_float mask_decay =
+                        rec[RT_LOCAL_ADJUSTMENTS_SLOT_MASK_CIE_DECAY];
+                    if (!apply_common_mask_recov(mask_recoth, mask_low,
+                                                 mask_high, mask_decay,
+                                                 "CIE mask")) {
+                        return RT_STAGE_FALLBACK;
+                    }
                 }
                 if (!run_blend("CIE CAM",
                                rec[RT_LOCAL_ADJUSTMENTS_SLOT_CIE_SENS])) {

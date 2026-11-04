@@ -3642,6 +3642,288 @@ __kernel void rt_local_adjustments_cie(__global float* work,
     work[plane + offset] = a;
     work[2 * plane + offset] = b;
 }
+/*
+ * Common mask. maskcalccol() builds the mask the log-encoding and CIE CAM
+ * tools pass to transit_shapedetect2() as their deltaE reference. The admitted
+ * arm keeps the luminance curve and zeroes the chroma/hue curves, so the mask's
+ * a/b channels are zero and the mask is a pure luminance field. The first
+ * kernel samples LocLLmaskCurve with the host's 501-point interpolation; the
+ * finish kernel reproduces blendmask()'s copy and clip; the box pair replays
+ * boxblur(); the recovery pair replays maskrecov().
+ */
+#define RT_LA_MASK_BOX_MAX 16
+
+/* LocLLmaskCurve::operator[]: LUT_CLIP_BELOW/ABOVE with linear
+ * interpolation on a 501-entry table (maxs = size - 2). */
+inline float rt_la_mask_curve(__global const float* table, const float index)
+{
+    if (index < 0.0f) {
+        return table[0];
+    }
+    if (index > 499.0f) {
+        return table[500];
+    }
+    const int idx = (int)index;
+    const float diff = index - (float)idx;
+    const float low = table[idx];
+    return low + (table[idx + 1] - low) * diff;
+}
+
+/* maskcalccol()'s luminance mask before its own 1 / sk Gaussian:
+ * `32768 * LIM01(1 - curve[(500 / 32768) * L])`; the identity table is the
+ * gamma-1 / slope-0 LUT, which passes kmaskL through unchanged. */
+__kernel void rt_local_adjustments_mask_curve(
+    __global const float* src, __global float* dst,
+    __global const float* luts, const float offset, const int active,
+    const int width, const int height, const int src_pitch,
+    const int dst_pitch)
+{
+    const int x = (int)get_global_id(0);
+    const int y = (int)get_global_id(1);
+    if (x >= width || y >= height) {
+        return;
+    }
+    const float l = src[y * src_pitch + x];
+    float value = 0.0f;
+    if (active != 0) {
+        value = rt_la_mask_curve(luts + (int)offset,
+                                 (500.0f / 32768.0f) * l);
+    }
+    dst[y * dst_pitch + x] = 32768.0f * rt_lt_lim01(1.0f - value);
+}
+
+/* blendmask() with blendm = blendmab = 0: the mask copy stays unclipped
+ * outside the spot, inside it the image is CLIP/clipC'd and the mask is the
+ * clipped image minus the blurred mask (its a/b are the clipped image). */
+__kernel void rt_local_adjustments_mask_finish(
+    __global const float* orig, __global const float* mask,
+    __global float* out, __global float* lab,
+    __global const float* rec,
+    const int lab_pitch, const int lab_plane,
+    const int orig_pitch, const int orig_plane,
+    const int out_pitch, const int out_plane,
+    const int mask_pitch, const int bfw, const int bfh,
+    const int xstart, const int ystart)
+{
+    const int rx = (int)get_global_id(0);
+    const int ry = (int)get_global_id(1);
+    if (rx >= bfw || ry >= bfh) {
+        return;
+    }
+    const int oo = ry * orig_pitch + rx;
+    const int mo = ry * mask_pitch + rx;
+    const int outo = ry * out_pitch + rx;
+    const int lx = rx + xstart;
+    const int ly = ry + ystart;
+    int zone = 0;
+    float localFactor = 1.0f;
+    rt_la_transition((float)lx, (float)ly, rec[RT_LA_TRANS] / 100.0f, rec,
+                     &zone, &localFactor);
+    const float origL = orig[oo];
+    const float origA = orig[orig_plane + oo];
+    const float origB = orig[2 * orig_plane + oo];
+    if (zone > 0) {
+        const float l = fmin(fmax(origL, 0.0f), 65535.0f);
+        const float a = rt_la_clipC(origA);
+        const float b = rt_la_clipC(origB);
+        out[outo] = fmin(fmax(l - mask[mo], 0.0f), 65535.0f);
+        out[out_plane + outo] = rt_la_clipC(a);
+        out[2 * out_plane + outo] = rt_la_clipC(b);
+        const int lo = ly * lab_pitch + lx;
+        lab[lo] = l;
+        lab[lab_plane + lo] = a;
+        lab[2 * lab_plane + lo] = b;
+    } else {
+        out[outo] = origL;
+        out[out_plane + outo] = origA;
+        out[2 * out_plane + outo] = origB;
+    }
+}
+
+/* boxblur()'s horizontal pass, one work item per row. The host runs this
+ * pass scalar; the running mean keeps its float operation order and its
+ * shrinking/growing border windows. */
+__kernel void rt_local_adjustments_mask_box_h(
+    __global float* plane, const int width, const int height,
+    const int pitch, const int radius)
+{
+    const int row = (int)get_global_id(0);
+    if (row >= height) {
+        return;
+    }
+    float* line = plane + row * pitch;
+    if (radius <= 0) {
+        return;
+    }
+    float lineBuffer[RT_LA_MASK_BOX_MAX + 1];
+    float len = (float)(radius + 1);
+    float tempval = line[0];
+    lineBuffer[0] = tempval;
+    for (int j = 1; j <= radius; ++j) {
+        tempval += line[j];
+    }
+    tempval /= len;
+    line[0] = tempval;
+    for (int col = 1; col <= radius; ++col) {
+        lineBuffer[col] = line[col];
+        tempval = (tempval * len + line[col + radius]) / (len + 1.0f);
+        line[col] = tempval;
+        len += 1.0f;
+    }
+    int pos = 0;
+    for (int col = radius + 1; col < width - radius; ++col) {
+        const float oldVal = lineBuffer[pos];
+        lineBuffer[pos] = line[col];
+        tempval = tempval + (line[col + radius] - oldVal) / len;
+        line[col] = tempval;
+        ++pos;
+        pos = pos <= radius ? pos : 0;
+    }
+    for (int col = width - radius; col < width; ++col) {
+        tempval = (tempval * len - lineBuffer[pos]) / (len - 1.0f);
+        line[col] = tempval;
+        len -= 1.0f;
+        ++pos;
+        pos = pos <= radius ? pos : 0;
+    }
+}
+
+/* boxblur()'s vertical pass. The host's SSE groups of eight columns use a
+ * reciprocal multiply in the interior loop; the scalar tail divides. Both
+ * are lane-wise recurrences, so one work item per column reproduces each
+ * column's own arithmetic. */
+__kernel void rt_local_adjustments_mask_box_v(
+    __global float* plane, const int width, const int height,
+    const int pitch, const int radius)
+{
+    const int col = (int)get_global_id(0);
+    if (col >= width) {
+        return;
+    }
+    if (radius <= 0) {
+        return;
+    }
+    float rowBuffer[RT_LA_MASK_BOX_MAX + 1];
+    const int vector_end = width - (width % 8);
+    const int vector = col < vector_end ? 1 : 0;
+    float len = (float)(radius + 1);
+    float tempval = plane[col];
+    rowBuffer[0] = tempval;
+    for (int i = 1; i <= radius; ++i) {
+        tempval += plane[i * pitch + col];
+    }
+    tempval /= len;
+    plane[col] = tempval;
+    for (int row = 1; row <= radius; ++row) {
+        rowBuffer[row] = plane[row * pitch + col];
+        tempval = (tempval * len + plane[(row + radius) * pitch + col]) /
+                  (len + 1.0f);
+        plane[row * pitch + col] = tempval;
+        len += 1.0f;
+    }
+    int pos = 0;
+    if (vector != 0) {
+        const float rlen = 1.0f / len;
+        for (int row = radius + 1; row < height - radius; ++row) {
+            const float oldVal = rowBuffer[pos];
+            rowBuffer[pos] = plane[row * pitch + col];
+            tempval = tempval +
+                      (plane[(row + radius) * pitch + col] - oldVal) * rlen;
+            plane[row * pitch + col] = tempval;
+            ++pos;
+            pos = pos <= radius ? pos : 0;
+        }
+    } else {
+        for (int row = radius + 1; row < height - radius; ++row) {
+            const float oldVal = rowBuffer[pos];
+            rowBuffer[pos] = plane[row * pitch + col];
+            tempval = tempval +
+                      (plane[(row + radius) * pitch + col] - oldVal) / len;
+            plane[row * pitch + col] = tempval;
+            ++pos;
+            pos = pos <= radius ? pos : 0;
+        }
+    }
+    for (int row = height - radius; row < height; ++row) {
+        tempval = (tempval * len - rowBuffer[pos]) / (len - 1.0f);
+        plane[row * pitch + col] = tempval;
+        len -= 1.0f;
+        ++pos;
+        pos = pos <= radius ? pos : 0;
+    }
+}
+
+/* iplocallab.cc calcdif(): the sRGB/Lab dark-and-light breakpoints. */
+inline float rt_la_mask_calcdif(const float lmr)
+{
+    if (lmr < 11.6f) {
+        return (7.6f / 11.6f) * lmr;
+    } else if (lmr < 60.0f) {
+        const float a1 = (62.0f - 7.6f) / (60.0f - 11.6f);
+        return a1 * lmr + (62.0f - a1 * 60.0f);
+    }
+    const float a2 = (100.0f - 62.0f) / (100.0f - 60.0f);
+    return a2 * lmr + (100.0f - a2 * 100.0f);
+}
+
+/* maskrecov()'s masklum: the low/high ramps and `1 - pow(k, decay)` for the
+ * block's `invmask == false`. */
+__kernel void rt_local_adjustments_mask_recov_mask(
+    __global const float* mask, __global float* masklum,
+    const int width, const int height, const int mask_pitch,
+    const int dst_pitch, const float recoth, const float low,
+    const float high, const float decay)
+{
+    const int x = (int)get_global_id(0);
+    const int y = (int)get_global_id(1);
+    if (x >= width || y >= height) {
+        return;
+    }
+    const float higc0 = rt_la_mask_calcdif(high);
+    const float lowc = rt_la_mask_calcdif(low);
+    const float higc = higc0 < lowc ? lowc + 0.01f : higc0;
+    const float th = recoth - 1.0f;
+    const float ahigh = th / (higc - 100.0f);
+    const float bhigh = 1.0f - higc * ahigh;
+    const float alow = th / lowc;
+    const float blow = 1.0f - th;
+    const float lM = mask[y * mask_pitch + x];
+    const float lmr = lM / 327.68f;
+    float k = 1.0f;
+    if (lM < 327.68f * lowc) {
+        k = alow * lmr + blow;
+    } else if (lM >= 327.68f * higc) {
+        k = ahigh * lmr + bhigh;
+    }
+    masklum[y * dst_pitch + x] = 1.0f - pow(k, decay);
+}
+
+/* maskrecov()'s final blend: `(original - result) * LIM01(masklum) + result`. */
+__kernel void rt_local_adjustments_mask_recov_apply(
+    __global const float* lab, __global float* work,
+    __global const float* masklum,
+    const int lab_pitch, const int lab_plane,
+    const int work_pitch, const int work_plane,
+    const int mask_pitch, const int width, const int height,
+    const int xstart, const int ystart)
+{
+    const int rx = (int)get_global_id(0);
+    const int ry = (int)get_global_id(1);
+    if (rx >= width || ry >= height) {
+        return;
+    }
+    const float k = rt_lt_lim01(masklum[ry * mask_pitch + rx]);
+    const int lo = (ry + ystart) * lab_pitch + (rx + xstart);
+    const int wo = ry * work_pitch + rx;
+    work[wo] = (lab[lo] - work[wo]) * k + work[wo];
+    work[work_plane + wo] =
+        (lab[lab_plane + lo] - work[work_plane + wo]) * k +
+        work[work_plane + wo];
+    work[2 * work_plane + wo] =
+        (lab[2 * lab_plane + lo] - work[2 * work_plane + wo]) * k +
+        work[2 * work_plane + wo];
+}
+
 )CLC";
 
 /* The one-spot colour program: the shared helpers and kernels plus the

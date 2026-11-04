@@ -48,14 +48,17 @@ struct ProcParams;
  * L/C/H curves, the vibrance tool, the shadows/highlights tool, the soft-light
  * tool, the Gaussian local-contrast tool, the local sharpening tool, the
  * local Blur & Noise tool (Gaussian and median arms), the Retinex tool, the
- * CIE CAM (CAM16) tool, the deltaE scope, the avoid-colour-shift Munsell
- * method and the unconditional per-spot Lab-to-RGB clamp. The block also
+ * CIE CAM (CAM16) tool, the common mask for the log and CIE arms, the deltaE
+ * scope, the avoid-colour-shift Munsell method and the unconditional
+ * per-spot Lab-to-RGB clamp. The block also
  * applies the final Munsell pass and the clamp for an inactive spot, so a
  * block whose spots do no tool work is still a clamp-only block.
  *
  * The tools run in Lab_Local()'s order: log encoding, blur, tone mapping,
  * dehaze, Retinex, CBDL, vibrance, shadows/highlights, soft light, local
- * contrast, local sharpening, Colour & Light, then the CIE CAM. The context is C-compatible because the ABI is. `self`
+ * contrast, local sharpening, Colour & Light, then the CIE CAM. The common
+ * mask is built before its owning tool and applied by that tool's blend. The
+ * context is C-compatible because the ABI is. `self`
  * points at the C++ object that owns the ProcParams, ImProcFunctions and
  * LabImage references, so the pointer must not outlive them.
  *
@@ -64,7 +67,7 @@ struct ProcParams;
  * small, known subset reaches the supported paths. Slots are named by the
  * RT_LOCAL_ADJUSTMENTS_SLOT_* constants and are written once per spot.
  */
-#define RT_LOCAL_ADJUSTMENTS_CONTEXT_VERSION 14u
+#define RT_LOCAL_ADJUSTMENTS_CONTEXT_VERSION 15u
 /* "LAJC": rejects a stale or unrelated pointer before any callback runs. */
 #define RT_LOCAL_ADJUSTMENTS_CONTEXT_MAGIC 0x4C414A43u
 /* The block has no bounded spot count, but a profile that carries more spots
@@ -495,6 +498,58 @@ struct ProcParams;
 #define RT_LOCAL_ADJUSTMENTS_SLOT_CIE_SCHRGREEN 314u
 #define RT_LOCAL_ADJUSTMENTS_SLOT_CIE_HUEBLUE 315u
 #define RT_LOCAL_ADJUSTMENTS_SLOT_CIE_SCHRBLUE 316u
+/* Common mask. `maskcalccol()` builds the mask the log-encoding and CIE CAM
+ * tools pass to transit_shapedetect2() as their deltaE reference. The admitted
+ * arm is the luminance mask curve alone: the chroma and hue curves are at
+ * their constant-one defaults, which zero the mask's a/b channels, and the
+ * recovery blend (`maskrecov()`) is the decay arm. MASK_LOG and MASK_CIE
+ * record which tool enabled the mask; MASK_CURVE_ACTIVE is the curve's own
+ * `utili` flag and MASK_CURVE_OFFSET the 501-entry LUT. MASK_RECOTH is the
+ * effective recovery threshold after the block's `2 - x` inversion for a
+ * value below one; MASK_LOW, MASK_HIGH and MASK_DECAY are the other
+ * `maskrecov()` scalars. */
+#define RT_LOCAL_ADJUSTMENTS_SLOT_MASK_LOG 317u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_MASK_CIE 318u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_MASK_LOG_ACTIVE 319u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_MASK_LOG_OFFSET 320u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_MASK_LOG_RECOTH 321u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_MASK_LOG_LOW 322u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_MASK_LOG_HIGH 323u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_MASK_LOG_DECAY 324u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_MASK_CIE_ACTIVE 325u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_MASK_CIE_OFFSET 326u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_MASK_CIE_RECOTH 327u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_MASK_CIE_LOW 328u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_MASK_CIE_HIGH 329u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_MASK_CIE_DECAY 330u
+/* LocLLmaskCurve's LUT size: `(500 / 32768) * L` indexes it with a
+ * 501-point interpolation. */
+#define RT_LOCAL_ADJUSTMENTS_MASK_CURVE_ENTRIES 501u
+/* maskcalccol() blurs its own mask with gaussianBlur() at 1 / sk; the export
+ * call site passes sk = 1. maskrecov()'s box blur uses 10 / sk, three times. */
+#define RT_LOCAL_ADJUSTMENTS_MASK_SIGMA 1.0
+#define RT_LOCAL_ADJUSTMENTS_MASK_BOX_RADIUS 10
+#define RT_LOCAL_ADJUSTMENTS_MASK_BOX_PASSES 3
+/* The admitted `maskrecov()` sliders are the GUI's. */
+/* The recovery threshold's upper half (1..2) also enables the mask itself as
+ * transit_shapedetect2()'s deltaE reference; that combined arm needs one more
+ * reference build and stays a host residual, so only the lower half is
+ * admitted. The block inverts it to the same 1..2 effective threshold the
+ * record carries and the launcher validates. */
+#define RT_LOCAL_ADJUSTMENTS_MASK_MIN_RECOTH 1.0
+#define RT_LOCAL_ADJUSTMENTS_MASK_MAX_RECOTH 2.0
+#define RT_LOCAL_ADJUSTMENTS_MASK_MIN_RECOTH_INPUT 0.0
+#define RT_LOCAL_ADJUSTMENTS_MASK_MAX_RECOTH_INPUT 1.0
+#define RT_LOCAL_ADJUSTMENTS_MASK_MIN_LOW 0.0
+#define RT_LOCAL_ADJUSTMENTS_MASK_MAX_LOW 100.0
+#define RT_LOCAL_ADJUSTMENTS_MASK_MIN_HIGH 0.0
+#define RT_LOCAL_ADJUSTMENTS_MASK_MAX_HIGH 100.0
+#define RT_LOCAL_ADJUSTMENTS_MASK_MIN_DECAY 0.5
+#define RT_LOCAL_ADJUSTMENTS_MASK_MAX_DECAY 4.0
+/* The CIE mask's own blur and contrast sliders. Above the 0.25 structure
+ * gate the block builds a structure mask (and may take optfft), so the
+ * admitted blur stays below it; contrast zero keeps buildBlendMask() idle. */
+#define RT_LOCAL_ADJUSTMENTS_MASK_MAX_BLUR 0.25
 
 /* deconvsharpeningloc() has two arms. Damping zero is the undamped RLD path:
  * the division/multiplication recurrence the output.sharpen core already
@@ -735,6 +790,9 @@ typedef struct RtLocalAdjustmentsResult {
     /* transit_shapedetect2()'s senstype-31 deltaE reference blur, sigma
      * (2 + 0.2 * blurciede) / sk. Only the SSE path is admitted. */
     const RtLabToolsIir* iir_cie;
+    /* maskcalccol()'s own Gaussian, sigma 1 / sk. Both the log and the CIE
+     * mask pass their mask through it before blendmask()/maskrecov(). */
+    const RtLabToolsIir* iir_mask;
     /* The same working XYZ -> RGB matrix in double, nine values. The block's
      * final gain and gamut round trip calls Color::xyz2rgb(), which multiplies
      * with the double matrix. */
@@ -781,8 +839,11 @@ namespace rtengine::stage
 /*
  * Whether the whole block is the local.adjustments node's supported set: every
  * spot is a normal (not exclude/full/main) elliptical or rectangular spot with
- * no recursion, inversion, explicit mask, soft radius, merge, gradient, Lab
- * grid, RGB curve, exposure curve or tool outside the set. An active spot runs
+ * no recursion, inversion, explicit per-tool mask, soft radius, merge,
+ * gradient, Lab grid, RGB curve, exposure curve or tool outside the set. The
+ * common mask is admitted for the log and CIE arms only; its luminance curve
+ * and recovery blend are device cases and the rest is fail-closed. An active
+ * spot runs
  * any combination of local dehaze, local CBDL, Colour & Light, vibrance,
  * shadows/highlights, soft light, local contrast and local sharpening; the
  * tool variants and ranges are checked separately. The block has no pre-CBDL
@@ -962,6 +1023,7 @@ private:
     RtLabToolsIir iirSh_ = {};
     RtLabToolsIir iirBlur_ = {};
     RtLabToolsIir iirCie_ = {};
+    RtLabToolsIir iirMask_ = {};
     uint32_t clamp_mode_ = RT_LOCAL_ADJUSTMENTS_CLAMP_NONE;
 };
 

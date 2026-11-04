@@ -122,13 +122,145 @@ bool explicitMaskIdle(const procparams::LocallabParams::LocallabSpot& spot)
     /* A mask flag for a tool that is switched off is inert: the block's
      * `ena*Mask` predicates require the tool as well. enacontrast and
      * enaretiMasktmap default to true, so only the flags of tools that can be
-     * active here are checked. */
+     * active here are checked. The common-mask flags are narrowed separately
+     * by logMaskAdmitted()/cieMaskAdmitted(); enamask is the standalone Mask
+     * tool's own switch and remains a residual. */
     return !spot.enaColorMask && !spot.enaExpMask &&
            !spot.enaExpMaskaft && !spot.enaSHMask && !spot.enavibMask &&
            !spot.enablMask && !spot.enatmMask && !spot.enatmMaskaft &&
            !spot.enaretiMask && !spot.enalcMask && !spot.enacbMask &&
-           !spot.enaLMask && !spot.enamask && !spot.enacieMask &&
-           !spot.enacieMaskall;
+           !spot.enamask && !spot.enacieMaskall;
+}
+
+/* A mask C(C) or H(H) curve the common mask admits: either the block's curve
+ * is the identity (the LUT is not built, so maskcalccol() leaves kmaskC or
+ * kmaskH at zero) or the default constant-one curve, which also yields
+ * `LIM01(1 - 1) == 0`. Any other shape would feed the mask's a/b channels. */
+bool maskChromaHueCurveZero(const std::vector<double>& points, bool hue)
+{
+    if (hue) {
+        LocHHmaskCurve curve;
+        if (!curve.Set(points)) {
+            return true;
+        }
+        for (int i = 0; i < 501; ++i) {
+            if (curve[(float)i] != 1.0f) {
+                return false;
+            }
+        }
+        return true;
+    }
+    LocCCmaskCurve curve;
+    if (!curve.Set(points)) {
+        return true;
+    }
+    for (int i = 0; i < 501; ++i) {
+        if (curve[(float)i] != 1.0f) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Whether the common-mask recovery scalars are inside the GUI range. */
+bool maskRecoveryAdmitted(double recothres, double low, double high,
+                          double decay)
+{
+    return finiteValue(recothres) &&
+           recothres >= RT_LOCAL_ADJUSTMENTS_MASK_MIN_RECOTH_INPUT &&
+           recothres <= RT_LOCAL_ADJUSTMENTS_MASK_MAX_RECOTH_INPUT &&
+           finiteValue(low) &&
+           low >= RT_LOCAL_ADJUSTMENTS_MASK_MIN_LOW &&
+           low <= RT_LOCAL_ADJUSTMENTS_MASK_MAX_LOW &&
+           finiteValue(high) &&
+           high >= RT_LOCAL_ADJUSTMENTS_MASK_MIN_HIGH &&
+           high <= RT_LOCAL_ADJUSTMENTS_MASK_MAX_HIGH &&
+           finiteValue(decay) &&
+           decay >= RT_LOCAL_ADJUSTMENTS_MASK_MIN_DECAY &&
+           decay <= RT_LOCAL_ADJUSTMENTS_MASK_MAX_DECAY;
+}
+
+/* The log-encoding common mask. maskcalccol()'s luminance curve is the only
+ * field this arm keeps; the chroma/hue curves must be zero, the mask blur,
+ * chroma, structure, contrast and blend sliders must be at their defaults,
+ * and the deltaE mask (spot.deltae) stays on the host. The recovery blend is
+ * admitted. */
+bool logMaskAdmitted(const procparams::LocallabParams::LocallabSpot& spot)
+{
+    if (!spot.enaLMask) {
+        return true;
+    }
+    if (!spot.explog || spot.deltae) {
+        return false;
+    }
+    if (spot.blendmaskL != 0.0 || spot.radmaskL != 0.0 ||
+        spot.chromaskL != 0.0) {
+        return false;
+    }
+    if (!maskRecoveryAdmitted(spot.recothresl, spot.lowthresl,
+                              spot.higthresl, spot.decayl)) {
+        return false;
+    }
+    if (!maskChromaHueCurveZero(spot.CCmaskcurveL, false) ||
+        !maskChromaHueCurveZero(spot.HHmaskcurveL, true)) {
+        return false;
+    }
+    if (diagonalCurveActive(spot.LmaskcurveL)) {
+        return false;
+    }
+    return true;
+}
+
+/* The CIE CAM common mask. The CIE mask has its own blur, contrast, gamma,
+ * slope, structure, tool, shad/high and lap sliders; only the luminance curve
+ * and the recovery blend are admitted. The scope blur must stay below the
+ * block's 0.25 structure gate. */
+bool cieMaskAdmitted(const procparams::LocallabParams::LocallabSpot& spot)
+{
+    if (!spot.enacieMask) {
+        return true;
+    }
+    if (!spot.expcie || spot.deltae) {
+        return false;
+    }
+    /* The tone-map arm's `equiltm` normalisation moves the image under the
+     * mask's deltaE reference by more than 1 LSB16; the combination stays on
+     * the host. */
+    if (spot.exptonemap) {
+        return false;
+    }
+    if (spot.blendmaskcie != 0 || spot.radmaskcie != 0.0 ||
+        spot.chromaskcie != 0.0 || spot.lapmaskcie != 0.0 ||
+        spot.gammaskcie != 1.0 || spot.slomaskcie != 0.0 ||
+        spot.strumaskcie != 0.0 || spot.toolcie || spot.laplac ||
+        spot.contcie != 0.0 || spot.highmaskcie != 0.0 ||
+        spot.shadmaskcie != 0.0) {
+        return false;
+    }
+    if (!finiteValue(spot.blurcie) || spot.blurcie < 0.0 ||
+        spot.blurcie >= RT_LOCAL_ADJUSTMENTS_MASK_MAX_BLUR) {
+        return false;
+    }
+    if (!maskRecoveryAdmitted(spot.recothrescie, spot.lowthrescie,
+                              spot.higthrescie, spot.decaycie)) {
+        return false;
+    }
+    if (!maskChromaHueCurveZero(spot.CCmaskciecurve, false) ||
+        !maskChromaHueCurveZero(spot.HHmaskciecurve, true)) {
+        return false;
+    }
+    if (diagonalCurveActive(spot.Lmaskciecurve)) {
+        return false;
+    }
+    LocwavCurve waveletMask;
+    if (waveletMask.Set(spot.LLmaskciecurvewav)) {
+        for (int i = 0; i < 501; ++i) {
+            if (waveletMask[(float)i] != 0.5f) {
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 /* Whether the local tone-mapping tool's parameters are inside the device set.
@@ -203,8 +335,9 @@ bool toneMapAdmitted(const procparams::LocallabParams::LocallabSpot& spot)
  * pre-CAM RGB tone mapping (`expprecam`), `smoothciemet`, the CIE and per-hue
  * curves, the contrast sliders (whose brightness tables read the ROI
  * histogram the host builds after the earlier tools in the same spot),
- * `detailcie`'s local contrast, the gradient, the final gain and gamut
- * compression and every mask stay on the host. The plain CAM16 arm is
+ * `detailcie`'s local contrast, the gradient and the final gain and gamut
+ * compression stay on the host. The CIE arm's common mask (`enacieMask`) is
+ * narrowed separately by cieMaskAdmitted(). The plain CAM16 arm is
  * `pqremapcam16 <= 100`; above it the block selects the CAM16-PQ transform.
  *
  * The per-hue brightness curves are FlatCurve fields, so they cannot be run
@@ -330,21 +463,26 @@ bool cieAdmitted(const procparams::LocallabParams::LocallabSpot& spot)
         spot.smoothciethtrc != 0.0) {
         return false;
     }
-    /* The mask parameters and the recovery mask. Any mask blur at or above
-     * 0.25 with the FFT switch on takes optfft() even when no mask is drawn,
-     * so both stay at their defaults. `visicie` is the UI panel flag and is
-     * not read by the block; the mask display itself is a runtime argument. */
-    if (!spot.fftcieMask || spot.recothrescie != 1.0 ||
-        spot.lowthrescie != 12.0 || spot.higthrescie != 85.0 ||
-        spot.decaycie != 2.0 || spot.contcie != 0.0 ||
-        spot.blurcie != 0.2 || spot.lumask != 10 || spot.scopemask != 60 ||
-        spot.toolcie || !spot.deltae || !spot.laplac ||
-        spot.strumaskcie != 0.0 || spot.radmaskcie != 0.0 ||
-        spot.chromaskcie != 0.0 || spot.lapmaskcie != 0.0 ||
-        spot.gammaskcie != 1.0 || spot.slomaskcie != 0.0 ||
-        spot.blendmaskcie != 0 || spot.highmaskcie != 0.0 ||
-        spot.shadmaskcie != 0.0) {
-        return false;
+    /* The mask parameters and the recovery mask. Without the common mask the
+     * block's own defaults are required: any mask blur at or above 0.25 with
+     * the FFT switch on takes optfft() even when no mask is drawn, and a
+     * non-default recovery threshold would run maskrecov(). With the common
+     * mask enabled cieMaskAdmitted() narrows the mask fields instead.
+     * `visicie` is the UI panel flag and is not read by the block; the mask
+     * display itself is a runtime argument. */
+    if (!spot.enacieMask) {
+        if (!spot.fftcieMask || spot.recothrescie != 1.0 ||
+            spot.lowthrescie != 12.0 || spot.higthrescie != 85.0 ||
+            spot.decaycie != 2.0 || spot.contcie != 0.0 ||
+            spot.blurcie != 0.2 || spot.lumask != 10 ||
+            spot.scopemask != 60 || spot.toolcie || !spot.deltae ||
+            !spot.laplac || spot.strumaskcie != 0.0 ||
+            spot.radmaskcie != 0.0 || spot.chromaskcie != 0.0 ||
+            spot.lapmaskcie != 0.0 || spot.gammaskcie != 1.0 ||
+            spot.slomaskcie != 0.0 || spot.blendmaskcie != 0 ||
+            spot.highmaskcie != 0.0 || spot.shadmaskcie != 0.0) {
+            return false;
+        }
     }
     /* The camera primaries and CAT matrices feed the Jz pre-processing only;
      * a non-default value here would be silent profile data. */
@@ -380,7 +518,8 @@ bool otherToolEnabled(const procparams::LocallabParams::LocallabSpot& spot)
  *
  * The slider ranges are the GUI's. `repar` is the log tool's own recovery
  * weight, not the Colour & Light `reparcol`. The senstype-11 sensitivity is
- * the block's `sensilog`. */
+ * the block's `sensilog`. The log arm's common mask (`enaLMask`) is narrowed
+ * separately by logMaskAdmitted(). */
 bool logAdmitted(const procparams::LocallabParams::LocallabSpot& spot)
 {
     if (spot.expcie || spot.ciecam || spot.autocompute) {
@@ -1241,6 +1380,9 @@ bool localAdjustmentsSupported(const procparams::ProcParams& params)
                 return false;
             }
             if (spot.expblur && !blurAdmitted(spot)) {
+                return false;
+            }
+            if (!logMaskAdmitted(spot) || !cieMaskAdmitted(spot)) {
                 return false;
             }
         }
@@ -2435,6 +2577,48 @@ int LocalAdjustmentsContext::build(int spot, const RtStageBuffer* lab,
     if (cieRun && ipf_.getScale() != 1.0) {
         return 1;
     }
+    /*
+     * The common mask curves. The log and CIE tools each own one luminance
+     * curve; the LUT is 501 points sampled at i / 500, exactly as
+     * LocLLmaskCurve::Set() builds it. The predicate has zeroed the chroma
+     * and hue curves, so the mask is a pure luminance field.
+     */
+    bool maskLogActive = false;
+    float maskLogOffset = RT_LOCAL_ADJUSTMENTS_NO_LUT;
+    if (profileSpot.enaLMask && logRun) {
+        LocLLmaskCurve maskCurve;
+        maskLogActive = maskCurve.Set(profileSpot.LLmaskcurveL);
+        if (maskLogActive) {
+            std::vector<float> table(
+                RT_LOCAL_ADJUSTMENTS_MASK_CURVE_ENTRIES);
+            for (uint32_t index = 0;
+                 index < RT_LOCAL_ADJUSTMENTS_MASK_CURVE_ENTRIES; ++index) {
+                table[index] = maskCurve[static_cast<float>(index)];
+            }
+            maskLogOffset = appendSamples(table);
+            if (maskLogOffset == RT_LOCAL_ADJUSTMENTS_NO_LUT) {
+                return 1;
+            }
+        }
+    }
+    bool maskCieActive = false;
+    float maskCieOffset = RT_LOCAL_ADJUSTMENTS_NO_LUT;
+    if (profileSpot.enacieMask && cieRun) {
+        LocLLmaskCurve maskCurve;
+        maskCieActive = maskCurve.Set(profileSpot.LLmaskciecurve);
+        if (maskCieActive) {
+            std::vector<float> table(
+                RT_LOCAL_ADJUSTMENTS_MASK_CURVE_ENTRIES);
+            for (uint32_t index = 0;
+                 index < RT_LOCAL_ADJUSTMENTS_MASK_CURVE_ENTRIES; ++index) {
+                table[index] = maskCurve[static_cast<float>(index)];
+            }
+            maskCieOffset = appendSamples(table);
+            if (maskCieOffset == RT_LOCAL_ADJUSTMENTS_NO_LUT) {
+                return 1;
+            }
+        }
+    }
     float cieC = 1.0f;
     float cieNc = 1.0f;
     float cieAw = 0.0f;
@@ -3215,6 +3399,36 @@ int LocalAdjustmentsContext::build(int spot, const RtStageBuffer* lab,
         profileSpot.satlog ? 1.f : 0.f;
     record[RT_LOCAL_ADJUSTMENTS_SLOT_LOG_REPART] = logRepart;
     record[RT_LOCAL_ADJUSTMENTS_SLOT_LOG_KAB_PRE] = logKabPre;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_MASK_LOG] =
+        profileSpot.enaLMask && logRun ? 1.f : 0.f;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_MASK_LOG_ACTIVE] =
+        maskLogActive ? 1.f : 0.f;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_MASK_LOG_OFFSET] = maskLogOffset;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_MASK_LOG_RECOTH] =
+        static_cast<float>(profileSpot.recothresl < 1.0
+                               ? 2.0 - profileSpot.recothresl
+                               : profileSpot.recothresl);
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_MASK_LOG_LOW] =
+        static_cast<float>(profileSpot.lowthresl);
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_MASK_LOG_HIGH] =
+        static_cast<float>(profileSpot.higthresl);
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_MASK_LOG_DECAY] =
+        static_cast<float>(profileSpot.decayl);
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_MASK_CIE] =
+        profileSpot.enacieMask && cieRun ? 1.f : 0.f;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_MASK_CIE_ACTIVE] =
+        maskCieActive ? 1.f : 0.f;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_MASK_CIE_OFFSET] = maskCieOffset;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_MASK_CIE_RECOTH] =
+        static_cast<float>(profileSpot.recothrescie < 1.0
+                               ? 2.0 - profileSpot.recothrescie
+                               : profileSpot.recothrescie);
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_MASK_CIE_LOW] =
+        static_cast<float>(profileSpot.lowthrescie);
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_MASK_CIE_HIGH] =
+        static_cast<float>(profileSpot.higthrescie);
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_MASK_CIE_DECAY] =
+        static_cast<float>(profileSpot.decaycie);
 
     const auto setTable = [record](int offsetSlot, int activeSlot,
                                    bool active, float offset) {
@@ -3313,6 +3527,9 @@ int LocalAdjustmentsContext::build(int spot, const RtStageBuffer* lab,
                  iirCie_)) {
         return 1;
     }
+    if (!fillIir(RT_LOCAL_ADJUSTMENTS_MASK_SIGMA, iirMask_)) {
+        return 1;
+    }
 
     out.spots = spots_.data();
     out.spot_count = 1;
@@ -3337,6 +3554,7 @@ int LocalAdjustmentsContext::build(int spot, const RtStageBuffer* lab,
     out.iir_shadows_highlights = &iirSh_;
     out.iir_blur = &iirBlur_;
     out.iir_cie = &iirCie_;
+    out.iir_mask = &iirMask_;
     built_ = true;
     return 0;
 }
