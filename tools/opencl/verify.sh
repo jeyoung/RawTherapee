@@ -294,6 +294,10 @@ quick() {
         "$ROOT/devnotes/opencl/pp3/working-trc.pp3" working.trc
     run_stage_device "pef/stage-device-working-trc-residual" \
         "$ROOT/devnotes/opencl/pp3/working-trc-residual.pp3" working.trc
+    run_stage_device "pef/stage-device-working-trc-tone" \
+        "$ROOT/devnotes/opencl/pp3/working-trc-tone.pp3" working.trc
+    run_stage_device "pef/stage-device-working-trc-tone-smooth" \
+        "$ROOT/devnotes/opencl/pp3/working-trc-tone-smooth.pp3" working.trc
     run_stage_host "pef/stage-host-ciecam-residual" \
         "$ROOT/devnotes/opencl/pp3/ciecam-residual.pp3" ciecam
     run_stage_device "pef/stage-device-lab-tools-sh" \
@@ -740,6 +744,10 @@ stage_device() {
         "$ROOT/devnotes/opencl/pp3/working-trc.pp3" working.trc
     run_stage_device "pef/stage-device-working-trc-residual" \
         "$ROOT/devnotes/opencl/pp3/working-trc-residual.pp3" working.trc
+    run_stage_device "pef/stage-device-working-trc-tone" \
+        "$ROOT/devnotes/opencl/pp3/working-trc-tone.pp3" working.trc
+    run_stage_device "pef/stage-device-working-trc-tone-smooth" \
+        "$ROOT/devnotes/opencl/pp3/working-trc-tone-smooth.pp3" working.trc
     run_stage_host "pef/stage-host-ciecam-residual" \
         "$ROOT/devnotes/opencl/pp3/ciecam-residual.pp3" ciecam
     run_stage_device "pef/stage-device-lab-tools-sh" \

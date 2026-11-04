@@ -3893,6 +3893,9 @@ struct WorkingTrcCase {
     bool setupAccepted;
     /* Use the source that reaches both ends of the 16-bit RGB scale. */
     bool bright;
+    /* The block's tone-equaliser sliders; zero is the block's own no-op. */
+    double midtone;
+    double smooth;
 };
 
 /* A prepare() that fails after the device soft-light pre-pass, to prove the
@@ -3947,7 +3950,18 @@ void test_working_trc(bool available)
         {"full saturation", 238, 24, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, true, 1.0, false, 0, true, true, true},
         {"odd width", 179, 17, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, true, 0.5, false, 0, true, true, true},
         {"out of gamut", 238, 24, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, true, 0.5, false, 0, true, false, false},
-        {"midtone equaliser", 238, 24, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, true, 0.5, false, 0, false, false, true},
+        {"midtone +25", 238, 24, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, true, 0.5, false, 0, true, true, true, false, 25.0},
+        {"midtone -70", 238, 24, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, true, 0.5, false, 0, true, true, true, false, -70.0},
+        {"midtone +100", 238, 24, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, true, 0.5, false, 0, true, true, false, false, 100.0},
+        {"midtone bt709", 238, 24, WorkingTrc::BT709, 2.2, 4.5, true, 0.5, false, 0, true, true, true, false, 40.0},
+        {"smooth 0.5", 179, 17, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, true, 0.5, false, 0, true, true, true, false, 0.0, 0.5},
+        {"smooth 1.5", 238, 24, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, true, 0.5, false, 0, true, true, true, false, 0.0, 1.5},
+        {"midtone + smooth", 238, 24, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, true, 0.5, false, 0, true, true, true, false, 40.0, 0.5},
+        {"midtone soft light 50", 238, 24, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, true, 0.5, true, 50, true, true, true, false, 40.0},
+        {"smooth soft light 50", 238, 24, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, true, 0.5, true, 50, true, true, true, false, 0.0, 0.5},
+        {"midtone 101", 238, 24, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, true, 0.5, false, 0, false, true, false, false, 101.0},
+        {"smooth 1.6", 238, 24, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, true, 0.5, false, 0, false, true, false, false, 0.0, 1.6},
+        {"smooth negative", 238, 24, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, true, 0.5, false, 0, false, true, false, false, 0.0, -0.1},
         {"soft light 3", 238, 24, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, true, 0.5, true, 3, true, true, true},
         {"soft light 30", 238, 24, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, true, 0.5, true, 30, true, true, true},
         {"soft light 50", 179, 17, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, true, 0.5, true, 50, true, true, true},
@@ -3992,9 +4006,9 @@ void test_working_trc(bool available)
         params.icm.wapsat = item.saturation;
         params.softlight.enabled = item.softlightEnabled;
         params.softlight.strength = item.softlightStrength;
-        if (std::strcmp(item.label, "midtone equaliser") == 0) {
-            params.icm.wmidtcie = 25.0;
-        } else if (std::strcmp(item.label, "empty opacity") == 0) {
+        params.icm.wmidtcie = item.midtone;
+        params.icm.wsmoothciesli = item.smooth;
+        if (std::strcmp(item.label, "empty opacity") == 0) {
             params.icm.wavExp = true;
             params.icm.opacityCurveWLI = {
                 static_cast<double>(FCT_Linear)};
@@ -4215,6 +4229,71 @@ void test_working_trc(bool available)
                     diff.max_abs, diff.differing, diff.samples);
         check(diff.finite && diff.differing > 0 && diff.max_abs > 10.0,
               "soft light is non-vacuous at strength 50");
+    }
+
+    /*
+     * Both tone equalisers are non-vacuous: each arm must change the device
+     * image, not merely record a device execution.
+     */
+    {
+        const auto render = [](const rtengine::procparams::ProcParams& params,
+                               LabImage& image) {
+            rtengine::ImProcFunctions ipf(&params, false);
+            fill_lab_in_gamut(image, params.icm.workingProfile);
+            WorkingTrcContext context(params, ipf);
+            RtWorkingTrcContext descriptor = context.descriptor(true);
+            RtStageArg args[4] = {};
+            args[0].kind = RT_STAGE_ARG_BUFFER;
+            args[0].u.buffer = view(image);
+            args[1].kind = RT_STAGE_ARG_PTR;
+            args[1].u.ptr = &descriptor;
+            args[2].kind = RT_STAGE_ARG_INT;
+            args[2].u.i = 1;
+            args[3].kind = RT_STAGE_ARG_DOUBLE;
+            args[3].u.f = params.icm.wapsat;
+            set_node_device_override("working.trc",
+                                     StageNodeDevice::OpenCL);
+            const RtStageStatus status =
+                run("working.trc", std::vector<RtStageArg>(args, args + 4));
+            clear_node_device_overrides();
+            check(status == RT_STAGE_OK,
+                  "the tone-equaliser non-vacuity run completes");
+        };
+
+        rtengine::procparams::ProcParams off;
+        off.icm.workingProfile = "Rec2020";
+        off.icm.workingTRC = WorkingTrc::GAMMA_2_2;
+        off.icm.trcExp = true;
+        off.icm.gamut = true;
+        off.icm.wapsat = 0.5;
+        rtengine::procparams::ProcParams mid = off;
+        mid.icm.wmidtcie = 40.0;
+        rtengine::procparams::ProcParams smooth = off;
+        smooth.icm.wsmoothciesli = 0.5;
+
+        LabImage base(238, 24);
+        LabImage lifted(238, 24);
+        LabImage softened(238, 24);
+        render(off, base);
+        render(mid, lifted);
+        render(smooth, softened);
+
+        const Diff midDiff = compare(view(base), view(lifted));
+        std::printf("stage-residency: working.trc midtone non-vacuity: "
+                    "PAE %.6f LSB16, %zu of %zu samples differ\n",
+                    midDiff.max_abs, midDiff.differing, midDiff.samples);
+        check(midDiff.finite && midDiff.differing > 0 &&
+                  midDiff.max_abs > 10.0,
+              "the midtone equaliser is non-vacuous at 40");
+
+        const Diff smoothDiff = compare(view(base), view(softened));
+        std::printf("stage-residency: working.trc smooth non-vacuity: "
+                    "PAE %.6f LSB16, %zu of %zu samples differ\n",
+                    smoothDiff.max_abs, smoothDiff.differing,
+                    smoothDiff.samples);
+        check(smoothDiff.finite && smoothDiff.differing > 0 &&
+                  smoothDiff.max_abs > 1.0,
+              "the white-distribution equaliser is non-vacuous at 0.5");
     }
 
     /*

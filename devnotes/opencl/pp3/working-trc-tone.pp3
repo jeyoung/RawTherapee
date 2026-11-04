@@ -1,0 +1,5 @@
+[Color Management]
+WorkingProfile=Rec2020
+WorkingTRC=22
+TrcExp=true
+Wmidtcie=-30
