@@ -496,6 +496,57 @@ another device node and not from `raw.demosaic`. The node itself has no
 arithmetic: the residency matrix and the plane-sum check pin it at PAE 0
 regardless of the profile set.
 
+## Raw base
+
+`raw.base` owns one coherent pixel sub-step of
+`RawImageSource::colorSpaceConversion_()` in `rtengine/rawimagesource.cc`: the
+camera-to-working-space matrix multiply when `findInputProfile()` supplied
+neither an input ICC profile nor a DCP profile (`in == nullptr` and
+`dcpProf == nullptr`). The rest of `raw.base` remains host work: white balance
+in `getImage()`, Retinex, spot removal, denoise, film negative, gamut
+compression and the analysis folded into the block. The input-profile, DCP,
+LUT and Lab arms of `colorSpaceConversion_()` are also host residuals.
+
+The host computes the 3x3 matrix in double precision from
+`ICCStore::workingSpaceInverseMatrix(cmp.workingProfile)` and
+`imatrices.xyz_cam`, and passes it unchanged. The kernel repeats the host
+loop's arithmetic exactly: each product is a double matrix entry times a float
+pixel promoted to double, the two additions are left-associative doubles, and
+only the three write-backs round to float. The node therefore requires an
+fp64 device; a device without `CL_DEVICE_DOUBLE_FP_CONFIG` refuses before the
+upload and the host loop rewrites the image.
+
+The ABI is `[0]` the three-plane F32 image, read and written in place, and
+`[1..9]` the row-major matrix `m00..m22` as nine doubles. One work item owns
+one row. The kernel takes the device row and plane pitches so a padded host
+allocation is copied row by row and a refused launch leaves the caller's image
+untouched.
+
+The call site enters the node only when the stage policy selects it, the image
+is non-empty and the no-profile matrix arm is the one running. The launcher
+also rejects a buffer that is not three-plane F32, a row or plane pitch that
+does not cover the image, a non-finite matrix entry and an argument list that
+is not one buffer plus nine doubles.
+
+Evidence:
+
+| Case | Result |
+|---|---|
+| device test, five shapes (full 63x31, padded rows 61x31, one pixel, one column, one row) with a fractional, partly negative matrix | device execution, `device=OPENCL`, PAE 0.000000, 0 differing on every shape |
+| non-vacuity | every case changes the image against its input |
+| `run("raw.base", …)` with the node selected | `"stage":"raw.base".*"impl":"opencl"` in the profile |
+| refusals: wrong argument count, U8 image, two-plane image, short row pitch, short plane pitch, non-finite matrix and an int matrix entry | not `RT_STAGE_OK`, image untouched (459 samples) |
+| `colorspace_flowers.pef` (10.2 MP PEF) neutral, `--gpu=off` vs `--gpu=auto`, 16-bit TIFF | AE=0, 0 of 30 419 712 samples, record `"impl":"opencl"` |
+| 45.7 MP NEF neutral, `--gpu=off` vs `--gpu=auto`, 16-bit TIFF | AE=0, 0 of 136 918 080 samples, record `"impl":"opencl"` |
+| `labtools-vibrance.pp3` canary, `colorspace_flowers.pef`, stage nodes only, 16-bit TIFF | 0 differing of 30 419 712 samples, `raw.base` and `lab.tools` both record `"impl":"opencl"` |
+| `verify.sh --stage-device`, `pef/stage-device-raw-base`, POCL CPU, `OMP_NUM_THREADS=1` | PASS, `max_pae=0`, `impl=opencl` on a 3888x2608 frame |
+
+The vibrance canary must run with the stage nodes alone. `RT_OPENCL_RGBPROC`
+additionally routes the same RGB block through the classic backend, whose
+last-bit differences at three clipped samples move the final TIFF by up to
+110 LSB16 even with every stage node host; `verify.sh` now sets that variable
+only on the `rgb.proc` row so the other rows isolate their own node.
+
 ## Output sharpening
 
 `output.sharpen` runs the unsupported-mask path of

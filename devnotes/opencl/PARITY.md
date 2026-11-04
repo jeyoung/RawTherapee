@@ -182,6 +182,27 @@ pairs are exact. The gate is the peak absolute error (PAE) in normalised units;
 | 2026-11-04 | uncommitted | POCL (CPU) | `raw.demosaic` refusals: wrong argument count, U8 mosaic, two-plane red, mismatched size, shared buffer, mono flag 2, filters out of range, four-colour filters | launcher refuses before upload | 0 (host; three planes untouched) | PASS |
 | 2026-11-04 | uncommitted | POCL (CPU) | colorspace_flowers.pef / `raw-demosaic.pp3` (`Method=mono`), `raw.demosaic` MONO arm, default internal profiles | off vs auto, 16-bit TIFF | 0 (AE=0, 0 of 30 419 712), `impl=opencl` | PASS |
 | 2026-11-04 | uncommitted | POCL (CPU) | 45.7 MP NEF / `raw-demosaic.pp3`, `raw.demosaic` MONO arm, default internal profiles | off vs auto, 16-bit TIFF | 0 (AE=0, 0 of 136 918 080), `impl=opencl` | PASS |
+| 2026-11-04 | uncommitted | POCL (CPU) | 5-case `raw.base` matrix test (full 63x31, padded rows 61x31, one pixel, one column, one row; fractional, partly negative matrix), `stage-residency-test` | device vs host loop | 0 (bit-exact, every shape) | PASS |
+| 2026-11-04 | uncommitted | POCL (CPU) | `raw.base` non-vacuity: every case changes the image against its input | device vs input | non-zero, all cases | PASS |
+| 2026-11-04 | uncommitted | POCL (CPU) | `raw.base` refusals: wrong argument count, U8 image, two-plane image, short row pitch, short plane pitch, non-finite matrix, int matrix entry | launcher refuses before upload | 0 (host; 459 samples untouched) | PASS |
+| 2026-11-04 | uncommitted | POCL (CPU) | colorspace_flowers.pef / neutral, `raw.base` matrix arm, default internal profiles | off vs auto, 16-bit TIFF | 0 (AE=0, 0 of 30 419 712), `impl=opencl` | PASS |
+| 2026-11-04 | uncommitted | POCL (CPU) | 45.7 MP NEF / neutral, `raw.base` matrix arm, default internal profiles | off vs auto, 16-bit TIFF | 0 (AE=0, 0 of 136 918 080), `impl=opencl` | PASS |
+| 2026-11-04 | uncommitted | POCL (CPU) | colorspace_flowers.pef / `labtools-vibrance.pp3`, stage nodes only (no classic `RT_OPENCL_RGBPROC`) | off vs auto, 16-bit TIFF | 0 (0 of 30 419 712), `raw.base` and `lab.tools` `impl=opencl` | PASS |
+
+The `raw.base` rows cover the camera-to-working-space matrix multiply in
+`RawImageSource::colorSpaceConversion_()` when neither an input ICC profile nor
+a DCP profile is supplied. The block is partial: that matrix arm is a device
+node; white balance, `getImage()`, Retinex, spot removal, denoise, film
+negative, gamut compression and analysis stay on the host, as do the
+input-profile, DCP, LUT and Lab arms of the conversion. The matrix is computed
+on the host in double precision and passed unchanged; the kernel repeats the
+double products and additions and rounds to float only at the write, so the
+node requires an fp64 device and refuses one without it. The vibrance canary
+must run with the stage nodes alone: `RT_OPENCL_RGBPROC` also routes the same
+RGB block through the classic backend, whose last-bit differences at three
+clipped samples move the final TIFF by up to 110 LSB16 even with every stage
+node on the host. `verify.sh` now sets that variable only on the `rgb.proc`
+row.
 
 The `raw.preprocess` rows cover the Bayer arm of `scaleColors()` only. The
 node is a partial block: the prelude that derives the black offsets and the

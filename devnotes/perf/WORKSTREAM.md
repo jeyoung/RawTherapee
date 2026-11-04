@@ -48,6 +48,13 @@ pushed from 2026-10-29 on.
 - Local shadows/highlights is **done and pushed** (`509f90731..5f674e5ba`):
   worst 0.053711 LSB16, full POCL gate 28 PASS, 0 SKIP. Issue #32 is closed
   and unassigned.
+- `raw.base` now has a partial device node: the camera-to-working-space matrix
+  multiply of `colorSpaceConversion_()` when no input or DCP profile is
+  supplied. PEF and 45.7 MP NEF are AE=0, the `labtools-vibrance.pp3` canary
+  is 0 differing with the stage nodes alone, and the rest of `raw.base` stays
+  host. `verify.sh` sets `RT_OPENCL_RGBPROC` only on the `rgb.proc` row, so
+  the classic RGB block no longer perturbs every other row's parity
+  (three clipped samples, up to 110 LSB16).
 - `perf-graph` is protected (no direct or force pushes by collaborators,
   linear history, one approving review, admins bypass). The claiming rule is
   in `devnotes/perf/CONTRIBUTING.md` and the PR template.
@@ -72,6 +79,20 @@ Install, `--list-formats`, a CLI export against a single-threaded host
 export and a GUI smoke test are not yet run for this package.
 
 ## Progress log — resumed 2026-10-28 (Block 4 completion)
+
+- **`raw.base` matrix arm (2026-11-04)**: the camera-to-working-space matrix
+  multiply in `RawImageSource::colorSpaceConversion_()` is the `raw.base`
+  device node. It runs only for the no-input-profile, no-DCP arm, where the
+  host computes the matrix in double precision; the kernel repeats the double
+  products and additions and rounds to float at the write, so it requires an
+  fp64 device. Five device shapes are bit-exact (0 of 5,952 samples worst) and
+  seven refusals leave the image untouched. `colorspace_flowers.pef` and the
+  45.7 MP NEF are AE=0 (0 of 30,419,712 and 0 of 136,918,080), and the
+  `labtools-vibrance.pp3` canary is 0 differing with the stage nodes alone.
+  The canary exposed a harness issue, not a node issue: `RT_OPENCL_RGBPROC`
+  also routes the RGB block through the classic backend and moves three
+  clipped samples by up to 110 LSB16; `verify.sh` now sets it only on the
+  `rgb.proc` row.
 
 - **`raw.demosaic` CFA split withdrawn (2026-11-04)**: the MONO/NONE unit
   admitted a Bayer CFA split, but with `labtools-vibrance.pp3` on

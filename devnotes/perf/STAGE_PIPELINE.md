@@ -474,7 +474,7 @@ by default.
 | `source.embedded` | -/-/-/Reduced | interactive | recompute | select the embedded JPEG | n/a |
 | `raw.preprocess` | Full/Full/Full/Full | path | reuse-output | raw black/white, hot/dead pixel, CA, flat field; the Bayer arm of `scaleColors()` is the device node | partial |
 | `raw.demosaic` | Full/Full/Full/Full | path | reuse-output | demosaic and capture sharpening; the MONO/NONE arms of `nodemosaic()` are the device node | partial |
-| `raw.base` | Full/Full/Roi/Reduced | path | reuse-output | `getImage()`, spot removal, denoise, film negative, Retinex, source-side gamut | no |
+| `raw.base` | Full/Full/Roi/Reduced | path | reuse-output | `getImage()`, spot removal, denoise, film negative, Retinex, source-side gamut; the camera-to-working-space matrix multiply in `colorSpaceConversion_()` when no input or DCP profile is supplied is the device node | partial |
 | `analysis` | Full/Full/Roi/- | path | reuse-output | histogram and auto-exposure analysis | n/a |
 | `transform` | Full/Full/Roi/- | path | reuse-input | rotation, distortion, perspective, CA, vignetting, gradient, post-crop vignette, dehaze, Fattal | yes |
 | `local.adjustments` | Full/Full/Roi/Reduced | path | reuse-input | local lab / selective editing | partial |
@@ -500,6 +500,20 @@ by default.
 | `thumbnail.rgb` | -/-/-/Reduced | interactive | reuse-input | thumbnail RGB processing | yes |
 | `thumbnail.lab` | -/-/-/Reduced | interactive | reuse-input | thumbnail Lab tools on the device; working TRC, CIE CAM and gamut stay host | partial |
 | `thumbnail.output` | -/-/-/Reduced | interactive | recompute | Lab to 8-bit thumbnail with gamma | yes |
+
+`raw.base` is partial: the device runs only the camera-to-working-space matrix
+multiply of `RawImageSource::colorSpaceConversion_()` when
+`findInputProfile()` supplied neither an input ICC profile nor a DCP profile
+(`in == nullptr` and `dcpProf == nullptr`). The matrix is computed on the host
+in double precision from `ICCStore::workingSpaceInverseMatrix()` and
+`imatrices.xyz_cam`; the kernel repeats the host loop's double products and
+left-associative additions and rounds the three results to float at the write,
+so an fp64 device is required. Every other arm of `colorSpaceConversion_()` (an
+input ICC profile, a DCP profile, the LUT and Lab paths) and every other step of
+`raw.base` (white balance, `getImage()`, Retinex, spot removal, denoise, film
+negative, gamut compression and analysis) stays on the host. A device without
+fp64, a non-three-plane image or a bad buffer shape is refused and the host
+loop rewrites the image.
 
 ## Path specifications
 
