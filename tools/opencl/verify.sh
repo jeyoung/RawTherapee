@@ -256,6 +256,7 @@ quick() {
         "$ROOT/devnotes/opencl/pp3/rotate.pp3" transform
     run_stage_device "pef/stage-device-output" "" output.convert
     run_stage_device "pef/stage-device-raw-preprocess" "" raw.preprocess
+    run_stage_device "pef/stage-device-raw-base" "" raw.base
     run_stage_device "pef/stage-device-raw-demosaic" \
         "$ROOT/devnotes/opencl/pp3/raw-demosaic.pp3" raw.demosaic
     run_stage_device "pef/stage-device-rgbproc" \
@@ -577,10 +578,17 @@ run_stage_device() {
         return 1
     fi
 
-    # RT_OPENCL_RGBPROC opts the RGB tone stage in; it affects only rgb.proc,
-    # so every device run may set it.
+    # RT_OPENCL_RGBPROC opts the classic RGB tone stage in. It is the stage
+    # gate for the rgb.proc node, but it also routes the same block through the
+    # classic backend in every other row, where its last-bit differences at
+    # clipped samples would be counted as stage-node parity. Keep it on the
+    # rgb.proc row only, so the other rows isolate their own node.
+    local -a rgbProcEnv=()
+    if [ "$node" = "rgb.proc" ]; then
+        rgbProcEnv=(RT_OPENCL_RGBPROC=1)
+    fi
     if ! env OMP_NUM_THREADS="$THREADS" RT_STAGE_OPENCL=1 \
-            RT_OPENCL_RGBPROC=1 RT_STAGE_PROFILE="$record" \
+            "${rgbProcEnv[@]}" RT_STAGE_PROFILE="$record" \
             "$cli" --gpu=auto "${profileArg[@]}" \
             -o "$device" -t -b16 -Y -c "$sample" >"$outdir/device.log" 2>&1; then
         printf 'FAIL\t%s\tload or export failed (stage device)\n' "$label"
@@ -694,6 +702,7 @@ stage_device() {
         "$ROOT/devnotes/opencl/pp3/rotate.pp3" transform
     run_stage_device "pef/stage-device-output" "" output.convert
     run_stage_device "pef/stage-device-raw-preprocess" "" raw.preprocess
+    run_stage_device "pef/stage-device-raw-base" "" raw.base
     run_stage_device "pef/stage-device-raw-demosaic" \
         "$ROOT/devnotes/opencl/pp3/raw-demosaic.pp3" raw.demosaic
     run_stage_device "pef/stage-device-rgbproc" \
