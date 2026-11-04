@@ -13000,6 +13000,22 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
         env, def, "rt_local_adjustments_capture_finish", error);
     cl_kernel capture_mix_kernel = compiled_kernel_entry(
         env, def, "rt_local_adjustments_capture_mix", error);
+    cl_kernel exposure_tone_kernel = compiled_kernel_entry(
+        env, def, "rt_local_adjustments_exposure_tone", error);
+    cl_kernel exposure_input_kernel = compiled_kernel_entry(
+        env, def, "rt_local_adjustments_exposure_input", error);
+    cl_kernel exposure_laplacian_kernel = compiled_kernel_entry(
+        env, def, "rt_local_adjustments_exposure_laplacian", error);
+    cl_kernel exposure_dct_rows_kernel = compiled_kernel_entry(
+        env, def, "rt_local_adjustments_exposure_dct_rows", error);
+    cl_kernel exposure_dct_cols_kernel = compiled_kernel_entry(
+        env, def, "rt_local_adjustments_exposure_dct_cols", error);
+    cl_kernel exposure_poisson_kernel = compiled_kernel_entry(
+        env, def, "rt_local_adjustments_exposure_poisson", error);
+    cl_kernel exposure_normalize_kernel = compiled_kernel_entry(
+        env, def, "rt_local_adjustments_exposure_normalize", error);
+    cl_kernel exposure_gamma_kernel = compiled_kernel_entry(
+        env, def, "rt_local_adjustments_exposure_gamma", error);
     if (apply_kernel == nullptr || clamp_kernel == nullptr ||
         roi_kernel == nullptr || munsell_kernel == nullptr ||
         sharpen_fill_kernel == nullptr || plane_copy_kernel == nullptr ||
@@ -13037,7 +13053,15 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
         capture_luma_kernel == nullptr || capture_init_kernel == nullptr ||
         capture_kernel == nullptr ||
         capture_finish_kernel == nullptr ||
-        capture_mix_kernel == nullptr) {
+        capture_mix_kernel == nullptr ||
+        exposure_tone_kernel == nullptr ||
+        exposure_input_kernel == nullptr ||
+        exposure_laplacian_kernel == nullptr ||
+        exposure_dct_rows_kernel == nullptr ||
+        exposure_dct_cols_kernel == nullptr ||
+        exposure_poisson_kernel == nullptr ||
+        exposure_normalize_kernel == nullptr ||
+        exposure_gamma_kernel == nullptr) {
         return RT_STAGE_FALLBACK;
     }
 
@@ -13216,6 +13240,8 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
     char capture_luma_key = 0;
     char capture_mask_key = 0;
     char capture_y_key = 0;
+    char exposure_ref_key = 0;
+    char exposure_tmp_key = 0;
     char log_orig_key = 0;
     char mask_blur_key = 0;
     char mask_out_key = 0;
@@ -13395,7 +13421,8 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
             setup.ws == nullptr || setup.iws == nullptr ||
             setup.cachef == nullptr || setup.cachefy == nullptr ||
             setup.gamma_srgb == nullptr || setup.igamma_srgb == nullptr ||
-            setup.iir == nullptr || setup.iir_mask == nullptr) {
+            setup.iir == nullptr || setup.iir_mask == nullptr ||
+            setup.iir_exposure == nullptr) {
             error = "local.adjustments setup is incomplete";
             return RT_STAGE_FALLBACK;
         }
@@ -13428,6 +13455,8 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
             rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXPSHARP] == 1.0f;
         const bool capturePass =
             rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXP_CAPTURE] == 1.0f;
+        const bool exposurePass =
+            rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXP_EXPOSURE] == 1.0f;
         const bool blurPass =
             rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXPBLUR] == 1.0f;
         const bool toneMapPass =
@@ -13462,6 +13491,8 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
              !sharpenPass) ||
             (rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXP_CAPTURE] != 0.0f &&
              !capturePass) ||
+            (rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXP_EXPOSURE] != 0.0f &&
+             !exposurePass) ||
             (rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXPBLUR] != 0.0f && !blurPass) ||
             (rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXP_TONEMAP] != 0.0f &&
              !toneMapPass) ||
@@ -13484,7 +13515,7 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
             (!active && (colour || vibrance || localContrast ||
                          shadowsHighlights || softLight || cbdl ||
                          dehazePass || logPass || sharpenPass ||
-                         capturePass || blurPass ||
+                         capturePass || blurPass || exposurePass ||
                          toneMapPass || ciePass || islocal))) {
             error = "local.adjustments record is outside the supported set";
             return RT_STAGE_FALLBACK;
@@ -14113,6 +14144,91 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
                 error = "local.adjustments spot ROI is below the colour "
                         "floor";
                 return RT_STAGE_FALLBACK;
+            }
+            if (exposurePass) {
+                const int ebw = static_cast<int>(
+                    rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXP_BFW]);
+                const int ebh = static_cast<int>(
+                    rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXP_BFH]);
+                if (ebw != bfw || ebh != bfh ||
+                    !localAdjustmentsExposureRoiAdmitted(ebw, ebh)) {
+                    error = "local.adjustments exposure ROI is outside the "
+                            "admitted fftw_size set";
+                    return RT_STAGE_FALLBACK;
+                }
+                if (!(rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXP_LINEAR] > 0.0f &&
+                      rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXP_LINEAR] <= 1.0f) ||
+                    !(rec[RT_LOCAL_ADJUSTMENTS_SLOT_LAPLACEXP] > 0.1f &&
+                      rec[RT_LOCAL_ADJUSTMENTS_SLOT_LAPLACEXP] <= 1.0f) ||
+                    !(rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXP_GAM] > 0.0f &&
+                      rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXP_GAM] <= 10.0f) ||
+                    rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXPCOMP] < -2.0f ||
+                    rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXPCOMP] > 4.0f ||
+                    rec[RT_LOCAL_ADJUSTMENTS_SLOT_HLCOMP] < 0.0f ||
+                    rec[RT_LOCAL_ADJUSTMENTS_SLOT_HLCOMP] > 100.0f ||
+                    rec[RT_LOCAL_ADJUSTMENTS_SLOT_HLCOMPTHR] < 0.0f ||
+                    rec[RT_LOCAL_ADJUSTMENTS_SLOT_HLCOMPTHR] > 100.0f ||
+                    rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXP_SENS] < 0.0f ||
+                    rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXP_SENS] > 100.0f ||
+                    rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXP_BLUREXP] < 0.0f ||
+                    rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXP_BLUREXP] > 100.0f) {
+                    error = "local.adjustments exposure setting is outside "
+                            "its range";
+                    return RT_STAGE_FALLBACK;
+                }
+                const auto table_range =
+                    [&](int offset_slot, long long count,
+                        const char* label) -> bool {
+                    const float offset = rec[offset_slot];
+                    if (offset < 0.0f ||
+                        static_cast<long long>(offset) + count >
+                            static_cast<long long>(setup.lut_count)) {
+                        error = std::string("local.adjustments exposure ") +
+                                label + " table is missing";
+                        return false;
+                    }
+                    return true;
+                };
+                if (!table_range(
+                        RT_LOCAL_ADJUSTMENTS_SLOT_EXP_HL_OFFSET,
+                        RT_LOCAL_ADJUSTMENTS_LUT_ENTRIES,
+                        "highlight") ||
+                    !table_range(
+                        RT_LOCAL_ADJUSTMENTS_SLOT_EXP_SH_OFFSET,
+                        RT_LOCAL_ADJUSTMENTS_LUT_ENTRIES,
+                        "shadow") ||
+                    !table_range(
+                        RT_LOCAL_ADJUSTMENTS_SLOT_EXP_TONE_OFFSET,
+                        RT_LOCAL_ADJUSTMENTS_LUT_ENTRIES,
+                        "tone") ||
+                    !table_range(
+                        RT_LOCAL_ADJUSTMENTS_SLOT_EXP_FWDW_OFFSET,
+                        static_cast<long long>(ebw) * ebw, "DCT width") ||
+                    !table_range(
+                        RT_LOCAL_ADJUSTMENTS_SLOT_EXP_FWDH_OFFSET,
+                        static_cast<long long>(ebh) * ebh, "DCT height") ||
+                    !table_range(
+                        RT_LOCAL_ADJUSTMENTS_SLOT_EXP_INVW_OFFSET,
+                        static_cast<long long>(ebw) * ebw, "DCT width") ||
+                    !table_range(
+                        RT_LOCAL_ADJUSTMENTS_SLOT_EXP_INVH_OFFSET,
+                        static_cast<long long>(ebh) * ebh, "DCT height") ||
+                    !table_range(
+                        RT_LOCAL_ADJUSTMENTS_SLOT_EXP_POISW_OFFSET, ebw,
+                        "Poisson width") ||
+                    !table_range(
+                        RT_LOCAL_ADJUSTMENTS_SLOT_EXP_POISH_OFFSET, ebh,
+                        "Poisson height")) {
+                    return RT_STAGE_FALLBACK;
+                }
+                if (colour || vibrance || localContrast ||
+                    shadowsHighlights || softLight || cbdl || dehazePass ||
+                    logPass || sharpenPass || capturePass || blurPass ||
+                    toneMapPass || retinexPass || ciePass) {
+                    error = "local.adjustments exposure is mixed with "
+                            "another tool";
+                    return RT_STAGE_FALLBACK;
+                }
             }
             /* shadowsHighlights() passes an explicit guided-filter
              * subsampling of four; the lab.tools port needs at least three
@@ -15481,6 +15597,323 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
                 return launch2d(blend_kernel, static_cast<std::size_t>(bfw),
                                 static_cast<std::size_t>(bfh), label);
             };
+
+            /*
+             * Local exposure's PDE arm. The tone/gamma plane is exlabLocal()'s
+             * per-pixel branch; the Laplacian input is pow_F(LIM01(L/32768),
+             * gam) * 32768. With that input bit-identical the discontinuous
+             * threshold takes the host's decisions, so the device PDE and the
+             * final blend match. The direct DCT pair reproduces FFTW's
+             * REDFT10/REDFT01 in double.
+             */
+            if (exposurePass) {
+                const StageBufferShape exposure_plane{RT_STAGE_F32, bfw,
+                                                      bfh, 1};
+                StageDeviceBufferPtr exposure_ref_device =
+                    residency->acquire(&exposure_ref_key, exposure_plane,
+                                       &error);
+                StageDeviceBufferPtr exposure_tmp_device =
+                    residency->acquire(&exposure_tmp_key, exposure_plane,
+                                       &error);
+                if (!exposure_ref_device || !exposure_tmp_device ||
+                    !copy_roi() || !blur_roi(*setup.iir_exposure,
+                                             "exposure blur")) {
+                    return RT_STAGE_FALLBACK;
+                }
+                const int exposure_ref_pitch =
+                    int_pitch(pitch_of(exposure_ref_device), "exposure ref");
+                const int exposure_tmp_pitch =
+                    int_pitch(pitch_of(exposure_tmp_device), "exposure tmp");
+                if (exposure_ref_pitch < 0 || exposure_tmp_pitch < 0) {
+                    return RT_STAGE_FALLBACK;
+                }
+                cl_mem luts_memory = memory_of(luts_device);
+                cl_mem work_memory = memory_of(work_device);
+                cl_mem input_memory = scratch_memory;
+                cl_mem ref_memory = memory_of(exposure_ref_device);
+                cl_mem tmp_memory = memory_of(exposure_tmp_device);
+                cl_float expcomp =
+                    rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXPCOMP];
+                cl_float hlcomp =
+                    rec[RT_LOCAL_ADJUSTMENTS_SLOT_HLCOMP];
+                cl_float hlcompthr =
+                    rec[RT_LOCAL_ADJUSTMENTS_SLOT_HLCOMPTHR];
+                cl_float linear =
+                    rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXP_LINEAR];
+                cl_float laplacexp =
+                    rec[RT_LOCAL_ADJUSTMENTS_SLOT_LAPLACEXP];
+                cl_float balanexp =
+                    rec[RT_LOCAL_ADJUSTMENTS_SLOT_BALANEXP];
+                cl_float gam = rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXP_GAM];
+                cl_float sens = rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXP_SENS];
+                cl_float hl_offset =
+                    rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXP_HL_OFFSET];
+                cl_float sh_offset =
+                    rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXP_SH_OFFSET];
+                cl_float tone_offset =
+                    rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXP_TONE_OFFSET];
+                cl_float fwdw_offset =
+                    rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXP_FWDW_OFFSET];
+                cl_float fwdh_offset =
+                    rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXP_FWDH_OFFSET];
+                cl_float invw_offset =
+                    rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXP_INVW_OFFSET];
+                cl_float invh_offset =
+                    rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXP_INVH_OFFSET];
+                cl_float poisw_offset =
+                    rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXP_POISW_OFFSET];
+                cl_float poish_offset =
+                    rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXP_POISH_OFFSET];
+                cl_int rw = bfw;
+                cl_int rh = bfh;
+                cl_int wp = work_pitch;
+                cl_int wpl = 0;
+                cl_int ip = int_pitch(pitch_of(scratch_device),
+                                      "exposure input");
+                cl_int tp = exposure_tmp_pitch;
+                cl_int rp = exposure_ref_pitch;
+
+                cl_float m2 = static_cast<float>(
+                    1.0 / (static_cast<double>(bfw) * bfh) / 2.0);
+                cl_uint arg = 0;
+                bool ok = true;
+                ok = ok && set(exposure_tone_kernel, arg++, sizeof(cl_mem),
+                               &work_memory);
+                ok = ok && set(exposure_tone_kernel, arg++, sizeof(cl_mem),
+                               &luts_memory);
+                ok = ok && set(exposure_tone_kernel, arg++, sizeof(cl_int),
+                               &wp);
+                ok = ok && set(exposure_tone_kernel, arg++, sizeof(cl_int),
+                               &wpl);
+                ok = ok && set(exposure_tone_kernel, arg++, sizeof(cl_int),
+                               &rw);
+                ok = ok && set(exposure_tone_kernel, arg++, sizeof(cl_int),
+                               &rh);
+                ok = ok && set(exposure_tone_kernel, arg++, sizeof(cl_float),
+                               &hl_offset);
+                ok = ok && set(exposure_tone_kernel, arg++, sizeof(cl_float),
+                               &sh_offset);
+                ok = ok && set(exposure_tone_kernel, arg++, sizeof(cl_float),
+                               &tone_offset);
+                ok = ok && set(exposure_tone_kernel, arg++, sizeof(cl_float),
+                               &expcomp);
+                ok = ok && set(exposure_tone_kernel, arg++, sizeof(cl_float),
+                               &hlcomp);
+                ok = ok && set(exposure_tone_kernel, arg++, sizeof(cl_float),
+                               &hlcompthr);
+                ok = ok && set(exposure_tone_kernel, arg++, sizeof(cl_float),
+                               &linear);
+                if (!ok ||
+                    !launch2d(exposure_tone_kernel,
+                              static_cast<std::size_t>(bfw),
+                              static_cast<std::size_t>(bfh),
+                              "exposure tone")) {
+                    return RT_STAGE_FALLBACK;
+                }
+                arg = 0;
+                ok = true;
+                ok = ok && set(exposure_input_kernel, arg++, sizeof(cl_mem),
+                               &work_memory);
+                ok = ok && set(exposure_input_kernel, arg++, sizeof(cl_mem),
+                               &input_memory);
+                ok = ok && set(exposure_input_kernel, arg++, sizeof(cl_mem),
+                               &ref_memory);
+                ok = ok && set(exposure_input_kernel, arg++, sizeof(cl_int),
+                               &wp);
+                ok = ok && set(exposure_input_kernel, arg++, sizeof(cl_int),
+                               &wpl);
+                ok = ok && set(exposure_input_kernel, arg++, sizeof(cl_int),
+                               &ip);
+                ok = ok && set(exposure_input_kernel, arg++, sizeof(cl_int),
+                               &rp);
+                ok = ok && set(exposure_input_kernel, arg++, sizeof(cl_int),
+                               &rw);
+                ok = ok && set(exposure_input_kernel, arg++, sizeof(cl_int),
+                               &rh);
+                ok = ok && set(exposure_input_kernel, arg++, sizeof(cl_float),
+                               &gam);
+                cl_float lap_threshold = 12.0f * laplacexp;
+                if (!ok ||
+                    !launch2d(exposure_input_kernel,
+                              static_cast<std::size_t>(bfw),
+                              static_cast<std::size_t>(bfh),
+                              "exposure input")) {
+                    return RT_STAGE_FALLBACK;
+                }
+                arg = 0;
+                ok = true;
+                ok = ok && set(exposure_laplacian_kernel, arg++,
+                               sizeof(cl_mem), &input_memory);
+                ok = ok && set(exposure_laplacian_kernel, arg++,
+                               sizeof(cl_mem), &tmp_memory);
+                ok = ok && set(exposure_laplacian_kernel, arg++,
+                               sizeof(cl_int), &ip);
+                ok = ok && set(exposure_laplacian_kernel, arg++,
+                               sizeof(cl_int), &rw);
+                ok = ok && set(exposure_laplacian_kernel, arg++,
+                               sizeof(cl_int), &rh);
+                ok = ok && set(exposure_laplacian_kernel, arg++,
+                               sizeof(cl_float), &lap_threshold);
+                if (!ok ||
+                    !launch2d(exposure_laplacian_kernel,
+                              static_cast<std::size_t>(bfw),
+                              static_cast<std::size_t>(bfh),
+                              "exposure laplacian")) {
+                    return RT_STAGE_FALLBACK;
+                }
+                const auto dct_rows = [&](cl_mem src, cl_int src_pitch,
+                                          cl_mem dst, cl_int dst_pitch,
+                                          cl_float offset, cl_int length,
+                                          cl_int lines, cl_int inverse,
+                                          const char* label) {
+                    cl_uint i = 0;
+                    bool ok2 = true;
+                    cl_mem luts_arg = luts_memory;
+                    cl_int off = static_cast<cl_int>(offset);
+                    ok2 = ok2 && set(exposure_dct_rows_kernel, i++,
+                                     sizeof(cl_mem), &src);
+                    ok2 = ok2 && set(exposure_dct_rows_kernel, i++,
+                                     sizeof(cl_mem), &dst);
+                    ok2 = ok2 && set(exposure_dct_rows_kernel, i++,
+                                     sizeof(cl_mem), &luts_arg);
+                    ok2 = ok2 && set(exposure_dct_rows_kernel, i++,
+                                     sizeof(cl_int), &off);
+                    ok2 = ok2 && set(exposure_dct_rows_kernel, i++,
+                                     sizeof(cl_int), &length);
+                    ok2 = ok2 && set(exposure_dct_rows_kernel, i++,
+                                     sizeof(cl_int), &lines);
+                    ok2 = ok2 && set(exposure_dct_rows_kernel, i++,
+                                     sizeof(cl_int), &src_pitch);
+                    ok2 = ok2 && set(exposure_dct_rows_kernel, i++,
+                                     sizeof(cl_int), &dst_pitch);
+                    ok2 = ok2 && set(exposure_dct_rows_kernel, i++,
+                                     sizeof(cl_int), &inverse);
+                    return ok2 &&
+                           launch2d(exposure_dct_rows_kernel,
+                                    static_cast<std::size_t>(length),
+                                    static_cast<std::size_t>(lines), label);
+                };
+                const auto dct_cols = [&](cl_mem src, cl_int src_pitch,
+                                          cl_mem dst, cl_int dst_pitch,
+                                          cl_float offset, cl_int length,
+                                          cl_int lines, cl_int inverse,
+                                          const char* label) {
+                    cl_uint i = 0;
+                    bool ok2 = true;
+                    cl_mem luts_arg = luts_memory;
+                    cl_int off = static_cast<cl_int>(offset);
+                    ok2 = ok2 && set(exposure_dct_cols_kernel, i++,
+                                     sizeof(cl_mem), &src);
+                    ok2 = ok2 && set(exposure_dct_cols_kernel, i++,
+                                     sizeof(cl_mem), &dst);
+                    ok2 = ok2 && set(exposure_dct_cols_kernel, i++,
+                                     sizeof(cl_mem), &luts_arg);
+                    ok2 = ok2 && set(exposure_dct_cols_kernel, i++,
+                                     sizeof(cl_int), &off);
+                    ok2 = ok2 && set(exposure_dct_cols_kernel, i++,
+                                     sizeof(cl_int), &length);
+                    ok2 = ok2 && set(exposure_dct_cols_kernel, i++,
+                                     sizeof(cl_int), &lines);
+                    ok2 = ok2 && set(exposure_dct_cols_kernel, i++,
+                                     sizeof(cl_int), &src_pitch);
+                    ok2 = ok2 && set(exposure_dct_cols_kernel, i++,
+                                     sizeof(cl_int), &dst_pitch);
+                    ok2 = ok2 && set(exposure_dct_cols_kernel, i++,
+                                     sizeof(cl_int), &inverse);
+                    return ok2 &&
+                           launch2d(exposure_dct_cols_kernel,
+                                    static_cast<std::size_t>(length),
+                                    static_cast<std::size_t>(lines), label);
+                };
+                if (!dct_rows(tmp_memory, tp, input_memory, ip, fwdw_offset,
+                              rw, rh, 0, "exposure DCT rows forward") ||
+                    !dct_cols(input_memory, ip, tmp_memory, tp, fwdh_offset,
+                              rh, rw, 0, "exposure DCT cols forward")) {
+                    return RT_STAGE_FALLBACK;
+                }
+                arg = 0;
+                ok = true;
+                cl_int poisw = static_cast<cl_int>(poisw_offset);
+                cl_int poish = static_cast<cl_int>(poish_offset);
+                ok = ok && set(exposure_poisson_kernel, arg++, sizeof(cl_mem),
+                               &tmp_memory);
+                ok = ok && set(exposure_poisson_kernel, arg++, sizeof(cl_mem),
+                               &luts_memory);
+                ok = ok && set(exposure_poisson_kernel, arg++, sizeof(cl_int),
+                               &poisw);
+                ok = ok && set(exposure_poisson_kernel, arg++, sizeof(cl_int),
+                               &poish);
+                ok = ok && set(exposure_poisson_kernel, arg++, sizeof(cl_int),
+                               &tp);
+                ok = ok && set(exposure_poisson_kernel, arg++, sizeof(cl_int),
+                               &rw);
+                ok = ok && set(exposure_poisson_kernel, arg++, sizeof(cl_int),
+                               &rh);
+                ok = ok && set(exposure_poisson_kernel, arg++, sizeof(cl_float),
+                               &m2);
+                if (!ok ||
+                    !launch2d(exposure_poisson_kernel,
+                              static_cast<std::size_t>(bfw),
+                              static_cast<std::size_t>(bfh),
+                              "exposure Poisson")) {
+                    return RT_STAGE_FALLBACK;
+                }
+                if (!dct_cols(tmp_memory, tp, input_memory, ip, invh_offset,
+                              rh, rw, 1, "exposure DCT cols inverse") ||
+                    !dct_rows(input_memory, ip, tmp_memory, tp, invw_offset,
+                              rw, rh, 1, "exposure DCT rows inverse")) {
+                    return RT_STAGE_FALLBACK;
+                }
+                arg = 0;
+                ok = true;
+                ok = ok && set(exposure_normalize_kernel, arg++,
+                               sizeof(cl_mem), &tmp_memory);
+                ok = ok && set(exposure_normalize_kernel, arg++,
+                               sizeof(cl_mem), &ref_memory);
+                ok = ok && set(exposure_normalize_kernel, arg++,
+                               sizeof(cl_int), &tp);
+                ok = ok && set(exposure_normalize_kernel, arg++,
+                               sizeof(cl_int), &rp);
+                ok = ok && set(exposure_normalize_kernel, arg++,
+                               sizeof(cl_int), &rw);
+                ok = ok && set(exposure_normalize_kernel, arg++,
+                               sizeof(cl_int), &rh);
+                ok = ok && set(exposure_normalize_kernel, arg++,
+                               sizeof(cl_float), &balanexp);
+                if (!ok ||
+                    !launch1d(exposure_normalize_kernel, 1,
+                              "exposure normalize")) {
+                    return RT_STAGE_FALLBACK;
+                }
+                arg = 0;
+                ok = true;
+                ok = ok && set(exposure_gamma_kernel, arg++, sizeof(cl_mem),
+                               &work_memory);
+                ok = ok && set(exposure_gamma_kernel, arg++, sizeof(cl_mem),
+                               &tmp_memory);
+                ok = ok && set(exposure_gamma_kernel, arg++, sizeof(cl_int),
+                               &wp);
+                ok = ok && set(exposure_gamma_kernel, arg++, sizeof(cl_int),
+                               &wpl);
+                ok = ok && set(exposure_gamma_kernel, arg++, sizeof(cl_int),
+                               &tp);
+                ok = ok && set(exposure_gamma_kernel, arg++, sizeof(cl_int),
+                               &rw);
+                ok = ok && set(exposure_gamma_kernel, arg++, sizeof(cl_int),
+                               &rh);
+                ok = ok && set(exposure_gamma_kernel, arg++, sizeof(cl_float),
+                               &gam);
+                if (!ok ||
+                    !launch2d(exposure_gamma_kernel,
+                              static_cast<std::size_t>(bfw),
+                              static_cast<std::size_t>(bfh),
+                              "exposure gamma")) {
+                    return RT_STAGE_FALLBACK;
+                }
+                if (!run_blend("exposure", sens, false, false, false, 2.0f)) {
+                    return RT_STAGE_FALLBACK;
+                }
+            }
 
             /*
              * shadows/highlights. The Lab-mode "std" method is

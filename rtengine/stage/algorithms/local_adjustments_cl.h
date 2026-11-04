@@ -44,6 +44,7 @@
  * self-contained. Keep the two lists in step.
  */
 inline constexpr const char* RT_LOCAL_ADJUSTMENTS_CL = R"CLC(
+#pragma OPENCL FP_CONTRACT OFF
 /* RtLocalAdjustmentsResult record slots used here. */
 #define RT_LA_XC 0
 #define RT_LA_YC 1
@@ -242,6 +243,27 @@ inline constexpr const char* RT_LOCAL_ADJUSTMENTS_CL = R"CLC(
 #define RT_LA_CAP_KERNEL_N 338
 #define RT_LA_CAP_BORDER 339
 #define RT_LA_CAP_CHECK_STOP 340
+#define RT_LA_EXP_EXPOSURE 341
+#define RT_LA_EXPCOMP 342
+#define RT_LA_HLCOMP 343
+#define RT_LA_HLCOMPTHR 344
+#define RT_LA_LAPLACEXP 345
+#define RT_LA_BALANEXP 346
+#define RT_LA_EXP_LINEAR 347
+#define RT_LA_EXP_GAM 348
+#define RT_LA_EXP_BLUREXP 349
+#define RT_LA_EXP_SENS 350
+#define RT_LA_EXP_HL_OFFSET 351
+#define RT_LA_EXP_SH_OFFSET 352
+#define RT_LA_EXP_TONE_OFFSET 353
+#define RT_LA_EXP_FWDW_OFFSET 354
+#define RT_LA_EXP_FWDH_OFFSET 355
+#define RT_LA_EXP_INVW_OFFSET 356
+#define RT_LA_EXP_INVH_OFFSET 357
+#define RT_LA_EXP_POISW_OFFSET 358
+#define RT_LA_EXP_POISH_OFFSET 359
+#define RT_LA_EXP_BFW 360
+#define RT_LA_EXP_BFH 361
 #define RT_LA_CAP_TILE 32
 #define RT_LA_CAP_MAX_FULL 48
 #define RT_LA_CAP_MIN_BLEND 0.01f
@@ -4380,6 +4402,312 @@ __kernel void rt_local_adjustments_capture_mix(
     fin[2 * fin_plane + fo] =
         repart * (lab[2 * lab_plane + lo] - fin[2 * fin_plane + fo]) +
         fin[2 * fin_plane + fo];
+}
+
+/*
+ * Local exposure's LUTf access. The host's operator[](float) truncates toward
+ * zero, clips at the configured end and interpolates the two nearest samples.
+ * hlCurve is LUT_CLIP_BELOW, shCurve LUT_CLIP_ABOVE and the tone curve is
+ * LUT_CLIP_OFF; the 65536-entry tables make maxsf 65534.
+ */
+inline float rt_la_exposure_lut_lo(__global const float* table,
+                                   const float index)
+{
+    int idx = (int)index;
+    if (index < 0.0f) {
+        return table[0];
+    }
+    if (index > 65534.0f) {
+        idx = 65534;
+    }
+    const float low = table[idx];
+    return low + (table[idx + 1] - low) * (index - (float)idx);
+}
+
+inline float rt_la_exposure_lut_hi(__global const float* table,
+                                   const float index)
+{
+    int idx = (int)index;
+    if (index < 0.0f) {
+        idx = 0;
+    } else if (index > 65534.0f) {
+        return table[65535];
+    }
+    const float low = table[idx];
+    return low + (table[idx + 1] - low) * (index - (float)idx);
+}
+
+/* LUT_CLIP_OFF: neither end clips, so an index above the last sample
+ * extrapolates from the final pair. */
+inline float rt_la_exposure_lut_off(__global const float* table,
+                                    const float index)
+{
+    int idx = (int)index;
+    if (index < 0.0f) {
+        idx = 0;
+    } else if (index > 65534.0f) {
+        idx = 65534;
+    }
+    const float low = table[idx];
+    return low + (table[idx + 1] - low) * (index - (float)idx);
+}
+
+/* curves.h CurveFactory::hlcurve(). */
+inline float rt_la_exposure_hlcurve(const float exp_scale,
+                                    const float comp,
+                                    const float hlrange,
+                                    const float level)
+{
+    if (comp > 0.0f) {
+        float val = level + (hlrange - 65536.0f);
+        if (val == 0.0f) {
+            val = 0.000001f;
+        }
+        float Y = val * exp_scale / hlrange;
+        Y *= comp;
+        if (Y <= -1.0f) {
+            Y = -0.999999f;
+        }
+        const float R = hlrange / (val * comp);
+        return log1p(Y) * R;
+    }
+    return exp_scale;
+}
+
+/*
+ * exlabLocal()'s PDE branch: the per-pixel exposure, highlight and shadow
+ * curve. `work` holds the block's ROI; only L is read and rewritten, exactly
+ * as bufexporig -> bufexpfin. The curve mode is fixed by the admitted arm.
+ */
+__kernel void rt_local_adjustments_exposure_tone(
+    __global float* work, __global const float* luts,
+    const int pitch, const int plane, const int width, const int height,
+    const float hl_offset, const float sh_offset, const float tone_offset,
+    const float expcomp, const float hlcomp, const float hlcompthr,
+    const float linear)
+{
+    const int x = (int)get_global_id(0);
+    const int y = (int)get_global_id(1);
+    if (x >= width || y >= height) {
+        return;
+    }
+    const int offset = plane + y * pitch + x;
+    float L = work[offset];
+    const float Llin = fmax(0.0f, fmin(L / 32768.0f, 1.0f));
+    const float addcomp = linear * (-Llin + 1.0f);
+    const float exp_scale = rt_lr_pow_F(2.0f, expcomp + addcomp);
+    const float shoulder =
+        (65536.0f / fmax(1.0f, exp_scale)) * (hlcompthr / 200.0f) +
+        0.1f;
+    const float comp =
+        (fmax(0.0f, expcomp + addcomp) + 1.0f) * (hlcomp / 100.0f);
+    const float hlrange = 65536.0f - shoulder;
+    const float hlfactor =
+        2.0f * L < 65535.0f
+            ? rt_la_exposure_lut_lo(luts + (int)hl_offset, 2.0f * L)
+            : rt_la_exposure_hlcurve(exp_scale, comp, hlrange, 2.0f * L);
+    L *= hlfactor * rt_lr_pow_F(2.0f, addcomp);
+    L *= rt_la_exposure_lut_hi(luts + (int)sh_offset, 2.0f * L);
+    work[offset] =
+        0.5f * rt_la_exposure_lut_off(luts + (int)tone_offset, 2.0f * L);
+}
+
+/* The Laplacian input plane: LIM01(L / 32768) ^ gam * 32768. The same plane
+ * is kept as normalize_mean_dt()'s reference. */
+__kernel void rt_local_adjustments_exposure_input(
+    __global const float* work, __global float* input,
+    __global float* reference, const int pitch, const int plane,
+    const int input_pitch_arg, const int ref_pitch_arg,
+    const int width, const int height, const float gam)
+{
+    const int x = (int)get_global_id(0);
+    const int y = (int)get_global_id(1);
+    if (x >= width || y >= height) {
+        return;
+    }
+    const int source = plane + y * pitch + x;
+    const float L = work[source];
+    const float value =
+        rt_lr_pow_F(fmax(0.0f, fmin(L / 32768.0f, 1.0f)), gam) *
+        32768.0f;
+    input[y * input_pitch_arg + x] = value;
+    reference[y * ref_pitch_arg + x] = value;
+}
+
+/* ImProcFunctions::discrete_laplacian_threshold(). */
+__kernel void rt_local_adjustments_exposure_laplacian(
+    __global const float* in, __global float* out,
+    const int pitch, const int width, const int height,
+    const float threshold)
+{
+    const int i = (int)get_global_id(0);
+    const int j = (int)get_global_id(1);
+    if (i >= width || j >= height) {
+        return;
+    }
+    const int index = j * pitch + i;
+    float val = 0.0f;
+    if (i > 0) {
+        const float diff = in[index] - in[index - 1];
+        val += fabs(diff) > threshold ? diff : 0.0f;
+    }
+    if (i < width - 1) {
+        const float diff = in[index] - in[index + 1];
+        val += fabs(diff) > threshold ? diff : 0.0f;
+    }
+    if (j > 0) {
+        const float diff = in[index] - in[index - pitch];
+        val += fabs(diff) > threshold ? diff : 0.0f;
+    }
+    if (j < height - 1) {
+        const float diff = in[index] - in[index + pitch];
+        val += fabs(diff) > threshold ? diff : 0.0f;
+    }
+    out[index] = val;
+}
+
+/* One axis of FFTW's REDFT10 (inverse == 0) or REDFT01 (inverse != 0). The
+ * direct transform accumulates in double; the double-precision result is
+ * within FFTW's own single-precision error. */
+__kernel void rt_local_adjustments_exposure_dct_rows(
+    __global const float* src, __global float* dst,
+    __global const float* tables, const int offset,
+    const int length, const int lines,
+    const int src_pitch, const int dst_pitch, const int inverse)
+{
+    const int k = (int)get_global_id(0);
+    const int y = (int)get_global_id(1);
+    if (k >= length || y >= lines) {
+        return;
+    }
+    __global const float* table = tables + offset;
+    double sum = 0.0;
+    if (inverse == 0) {
+        for (int n = 0; n < length; ++n) {
+            sum += (double)src[y * src_pitch + n] *
+                   (double)table[k * length + n];
+        }
+        sum *= 2.0;
+    } else {
+        sum = (double)src[y * src_pitch];
+        for (int n = 1; n < length; ++n) {
+            sum += 2.0 * (double)src[y * src_pitch + n] *
+                   (double)table[k * length + n];
+        }
+    }
+    dst[y * dst_pitch + k] = (float)sum;
+}
+
+__kernel void rt_local_adjustments_exposure_dct_cols(
+    __global const float* src, __global float* dst,
+    __global const float* tables, const int offset,
+    const int length, const int lines,
+    const int src_pitch, const int dst_pitch, const int inverse)
+{
+    const int k = (int)get_global_id(0);
+    const int x = (int)get_global_id(1);
+    if (k >= length || x >= lines) {
+        return;
+    }
+    __global const float* table = tables + offset;
+    double sum = 0.0;
+    if (inverse == 0) {
+        for (int n = 0; n < length; ++n) {
+            sum += (double)src[n * src_pitch + x] *
+                   (double)table[k * length + n];
+        }
+        sum *= 2.0;
+    } else {
+        sum = (double)src[x];
+        for (int n = 1; n < length; ++n) {
+            sum += 2.0 * (double)src[n * src_pitch + x] *
+                   (double)table[k * length + n];
+        }
+    }
+    dst[k * dst_pitch + x] = (float)sum;
+}
+
+/* ImProcFunctions::rex_poisson_dct()'s diagonal scaling, plus data[0] = 0. */
+__kernel void rt_local_adjustments_exposure_poisson(
+    __global float* data, __global const float* tables,
+    const int offset_x, const int offset_y, const int pitch,
+    const int width, const int height, const float m2)
+{
+    const int j = (int)get_global_id(0);
+    const int i = (int)get_global_id(1);
+    if (j >= width || i >= height) {
+        return;
+    }
+    const int index = i * pitch + j;
+    data[index] *=
+        m2 / (tables[offset_x + j] + tables[offset_y + i]);
+    if (index == 0) {
+        data[0] = 0.0f;
+    }
+}
+
+/* normalize_mean_dt(data, reference, size, 1, 1, 0, 0, 0, 0, 1): the two
+ * double reductions, then the host's float a*data + b. */
+__kernel void rt_local_adjustments_exposure_normalize(
+    __global float* data, __global const float* reference,
+    const int data_pitch, const int ref_pitch,
+    const int width, const int height, const float mod)
+{
+    if (get_global_id(0) != 0) {
+        return;
+    }
+    double mean_ref = 0.0;
+    double dt_ref = 0.0;
+    double mean_data = 0.0;
+    double dt_data = 0.0;
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            const float ref = reference[y * ref_pitch + x];
+            const float value = data[y * data_pitch + x];
+            mean_ref += (double)ref;
+            dt_ref += (double)ref * (double)ref;
+            mean_data += (double)value;
+            dt_data += (double)value * (double)value;
+        }
+    }
+    const int size = width * height;
+    mean_ref /= size;
+    dt_ref /= size;
+    dt_ref -= mean_ref * mean_ref;
+    mean_data /= size;
+    dt_data /= size;
+    dt_data -= mean_data * mean_data;
+    dt_ref = sqrt(dt_ref);
+    dt_data = sqrt(dt_data);
+    const double a = dt_ref / dt_data;
+    const double b = mean_ref - a * mean_data;
+    const float modma = (float)((double)mod * a);
+    const float sigmmmodmb = (float)((double)mod * b);
+    const float onesmod = 1.0f - mod;
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            const int index = y * data_pitch + x;
+            const float ref = reference[y * ref_pitch + x];
+            data[index] = (modma * data[index] + sigmmmodmb) +
+                          onesmod * ref;
+        }
+    }
+}
+
+/* The inverse Laplacian gamma: pow_F(Y, 1 / gam) * 32768 back into L. */
+__kernel void rt_local_adjustments_exposure_gamma(
+    __global float* work, __global const float* data,
+    const int pitch, const int plane, const int data_pitch,
+    const int width, const int height, const float gam)
+{
+    const int x = (int)get_global_id(0);
+    const int y = (int)get_global_id(1);
+    if (x >= width || y >= height) {
+        return;
+    }
+    const float Y = data[y * data_pitch + x] / 32768.0f;
+    work[plane + y * pitch + x] =
+        rt_lr_pow_F(Y, 1.0f / gam) * 32768.0f;
 }
 
 )CLC";

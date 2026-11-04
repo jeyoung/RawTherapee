@@ -503,8 +503,71 @@ bool cieAdmitted(const procparams::LocallabParams::LocallabSpot& spot)
  * admitted through toneMapAdmitted() and CIE CAM through cieAdmitted(). */
 bool otherToolEnabled(const procparams::LocallabParams::LocallabSpot& spot)
 {
-    return spot.expexpose || spot.expmask ||
+    return spot.expmask ||
            (spot.expcie && !cieAdmitted(spot)) || spot.expprecam;
+}
+
+/* Whether the local exposure tool is inside the device set: the PDE arm,
+ * where exlabLocal() takes its `expmet == 1 && linear > 0 && laplacexp > 0.1`
+ * branch and the outer exposure_pde() then runs. The block must be reduced to
+ * the tone-curve/LUT plane and the PDE; the gamma wrapper, recovery weight,
+ * gradient, structure, chroma, black point, shadow recovery, fat, mask,
+ * soft radius and noise-median additions are residuals. */
+bool exposureAdmitted(const procparams::LocallabParams::LocallabSpot& spot)
+{
+    if (spot.gamex != 1.0) {
+        return false;
+    }
+    if (spot.expMethod != "std" && spot.expMethod != "pde") {
+        return false;
+    }
+    if (!(spot.linear > 0.0 && spot.linear <= 1.0) ||
+        !(spot.laplacexp > 0.1 && spot.laplacexp <= 1.0)) {
+        return false;
+    }
+    if (!(spot.gamm > 0.0 && spot.gamm <= 10.0)) {
+        return false;
+    }
+    if (!(spot.expcomp >= -2.0 && spot.expcomp <= 4.0)) {
+        return false;
+    }
+    if (spot.hlcompr < 0 || spot.hlcompr > 100 ||
+        spot.hlcomprthresh < 0 || spot.hlcomprthresh > 100 ||
+        spot.shcompr < 0 || spot.shcompr > 100) {
+        return false;
+    }
+    if (spot.black != 0 || spot.shadex != 0 || spot.expchroma != 0 ||
+        spot.strexp != 0.0 || spot.structexp != 0 ||
+        spot.softradiusexp != 0.0 || spot.fatamount > 1.0) {
+        return false;
+    }
+    /* An exposure of zero with a weak linear blend is the block's own
+     * no-exlabLocal() case; the device tone plane would then diverge. */
+    if (spot.expcomp == 0.0 && spot.linear <= 0.01) {
+        return false;
+    }
+    if (spot.enaExpMask || spot.enaExpMaskaft) {
+        return false;
+    }
+    if (spot.reparexp != 100.0) {
+        return false;
+    }
+    if (spot.sensiex < 0 || spot.sensiex > 100 ||
+        spot.blurexpde < 0 || spot.blurexpde > 100) {
+        return false;
+    }
+    /* With the black point at zero the median-noise branch cannot run, but
+     * keep the method out of the admitted set so a future black-point arm
+     * cannot silently change the Laplacian input. */
+    if (spot.exnoiseMethod == "med" || spot.exnoiseMethod == "medhi") {
+        return false;
+    }
+    /* The exposure tool has no companion tool in this arm. */
+    return !spot.expcolor && !spot.expvibrance && !spot.expcontrast &&
+           !spot.expshadhigh && !spot.expsoft && !spot.expcbdl &&
+           !spot.explog && !spot.expsharp && !spot.expblur &&
+           !spot.exptonemap && !spot.expcie && !spot.expreti &&
+           !spot.expmask;
 }
 
 /* Whether the local log-encoding tool's parameters are inside the device set.
@@ -1261,6 +1324,21 @@ int retinexBoxSizes(double sigma, int width, int height, int* radii)
 
 } // namespace
 
+bool localAdjustmentsExposureRoiAdmitted(int width, int height)
+{
+    /* Every value is an fftw_size[] entry, so optfft() keeps the extent. */
+    static const int sizes[] = {64, 65, 80, 96, 100, 128};
+    const auto admitted = [](int value) {
+        for (const int size : sizes) {
+            if (value == size) {
+                return true;
+            }
+        }
+        return false;
+    };
+    return admitted(width) && admitted(height);
+}
+
 bool localAdjustmentsSupported(const procparams::ProcParams& params)
 {
     /*
@@ -1382,7 +1460,8 @@ bool localAdjustmentsSupported(const procparams::ProcParams& params)
             if ((!spot.expcolor && !spot.expvibrance && !spot.expcontrast &&
                  !spot.expshadhigh && !spot.expsoft && !spot.expcbdl &&
                  !spot.explog && !spot.expsharp && !spot.expblur &&
-                 !spot.exptonemap && !spot.expcie && !dehaze && !retinex) ||
+                 !spot.exptonemap && !spot.expcie && !spot.expexpose &&
+                 !dehaze && !retinex) ||
                 otherToolEnabled(spot)) {
                 return false;
             }
@@ -1447,6 +1526,9 @@ bool localAdjustmentsSupported(const procparams::ProcParams& params)
             if (spot.expblur && !blurAdmitted(spot)) {
                 return false;
             }
+            if (spot.expexpose && !exposureAdmitted(spot)) {
+                return false;
+            }
             if (!logMaskAdmitted(spot) || !cieMaskAdmitted(spot)) {
                 return false;
             }
@@ -1475,7 +1557,8 @@ uint32_t localAdjustmentsClampMode(const procparams::ProcParams& params,
      * ghsactiv (ghs_D != 0) with ghs_BLP > 0; the predicate refuses that
      * combination, but the mode is derived so a future wider predicate keeps
      * the right arm. The soft-light block's `strng > 2` arm is the same
-     * clipR() clamp; exposure remains a residual.
+     * clipR() clamp. The admitted exposure PDE block does not select the
+     * Laplacian clamp, so the tail stays NOTZERO.
      */
     bool notLaplacian = params.dirpyrequalizer.enabled;
     if (spot >= 0 &&
@@ -3269,6 +3352,122 @@ int LocalAdjustmentsContext::build(int spot, const RtStageBuffer* lab,
     }
 
     float* record = spots_.data();
+
+    /*
+     * Local exposure's tone tables and DCT matrices. The ROI is computed with
+     * the block's own clipped extent and cx/cy = 0; a size outside the
+     * admitted fftw_size[] set leaves the offsets empty and the launcher
+     * refuses before touching the image.
+     */
+    const bool exposureRun = lp.exposena && exposureAdmitted(profileSpot);
+    int exposureBfw = 0;
+    int exposureBfh = 0;
+    float exposureHlOffset = RT_LOCAL_ADJUSTMENTS_NO_LUT;
+    float exposureShOffset = RT_LOCAL_ADJUSTMENTS_NO_LUT;
+    float exposureToneOffset = RT_LOCAL_ADJUSTMENTS_NO_LUT;
+    float exposureFwdWOffset = RT_LOCAL_ADJUSTMENTS_NO_LUT;
+    float exposureFwdHOffset = RT_LOCAL_ADJUSTMENTS_NO_LUT;
+    float exposureInvWOffset = RT_LOCAL_ADJUSTMENTS_NO_LUT;
+    float exposureInvHOffset = RT_LOCAL_ADJUSTMENTS_NO_LUT;
+    float exposurePoisWOffset = RT_LOCAL_ADJUSTMENTS_NO_LUT;
+    float exposurePoisHOffset = RT_LOCAL_ADJUSTMENTS_NO_LUT;
+    if (exposureRun) {
+        const int xstart = std::max(
+            static_cast<int>(lp.xc - lp.lxL), 0);
+        const int ystart = std::max(
+            static_cast<int>(lp.yc - lp.lyT), 0);
+        const int xend = std::min(
+            static_cast<int>(lp.xc + lp.lx), fw_);
+        const int yend = std::min(
+            static_cast<int>(lp.yc + lp.ly), fh_);
+        exposureBfw = std::max(xend - xstart, 0);
+        exposureBfh = std::max(yend - ystart, 0);
+        if (localAdjustmentsExposureRoiAdmitted(exposureBfw, exposureBfh)) {
+            exposureHlOffset = appendTable(hlCurve);
+            exposureShOffset = appendTable(shCurve);
+            exposureToneOffset = appendTable(toneCurve);
+            const auto cosFwd = [](int n) {
+                std::vector<float> table(
+                    static_cast<std::size_t>(n) * n);
+                for (int k = 0; k < n; ++k) {
+                    for (int m = 0; m < n; ++m) {
+                        table[static_cast<std::size_t>(k) * n + m] =
+                            static_cast<float>(std::cos(
+                                rtengine::RT_PI * (m + 0.5) * k / n));
+                    }
+                }
+                return table;
+            };
+            const auto cosInv = [](int n) {
+                std::vector<float> table(
+                    static_cast<std::size_t>(n) * n);
+                for (int k = 0; k < n; ++k) {
+                    for (int m = 0; m < n; ++m) {
+                        table[static_cast<std::size_t>(k) * n + m] =
+                            static_cast<float>(std::cos(
+                                rtengine::RT_PI * m * (k + 0.5) / n));
+                    }
+                }
+                return table;
+            };
+            const auto cosTable = [](int n) {
+                std::vector<float> table(
+                    static_cast<std::size_t>(n), 0.f);
+                for (int i = 0; i < n; ++i) {
+                    table[static_cast<std::size_t>(i)] =
+                        static_cast<float>(
+                            1.0 - std::cos(rtengine::RT_PI / n * i));
+                }
+                return table;
+            };
+            exposureFwdWOffset = appendSamples(cosFwd(exposureBfw));
+            exposureFwdHOffset = appendSamples(cosFwd(exposureBfh));
+            exposureInvWOffset = appendSamples(cosInv(exposureBfw));
+            exposureInvHOffset = appendSamples(cosInv(exposureBfh));
+            exposurePoisWOffset = appendSamples(cosTable(exposureBfw));
+            exposurePoisHOffset = appendSamples(cosTable(exposureBfh));
+        }
+    }
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_EXP_EXPOSURE] =
+        exposureRun ? 1.f : 0.f;
+    float exposureExpcomp = lp.expcomp;
+    if (exposureExpcomp == 0.f && lp.linear > 0.01f &&
+        lp.laplacexp > 0.1f) {
+        exposureExpcomp = 0.001f;
+    }
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_EXPCOMP] = exposureExpcomp;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_HLCOMP] =
+        static_cast<float>(lp.hlcompr);
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_HLCOMPTHR] =
+        static_cast<float>(lp.hlcomprthresh);
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_LAPLACEXP] = lp.laplacexp;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_BALANEXP] = lp.balanexp;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_EXP_LINEAR] = lp.linear;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_EXP_GAM] =
+        static_cast<float>(profileSpot.gamm);
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_EXP_BLUREXP] = lp.blurexpde;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_EXP_SENS] =
+        static_cast<float>(lp.sensex);
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_EXP_HL_OFFSET] = exposureHlOffset;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_EXP_SH_OFFSET] = exposureShOffset;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_EXP_TONE_OFFSET] =
+        exposureToneOffset;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_EXP_FWDW_OFFSET] =
+        exposureFwdWOffset;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_EXP_FWDH_OFFSET] =
+        exposureFwdHOffset;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_EXP_INVW_OFFSET] =
+        exposureInvWOffset;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_EXP_INVH_OFFSET] =
+        exposureInvHOffset;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_EXP_POISW_OFFSET] =
+        exposurePoisWOffset;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_EXP_POISH_OFFSET] =
+        exposurePoisHOffset;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_EXP_BFW] =
+        static_cast<float>(exposureBfw);
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_EXP_BFH] =
+        static_cast<float>(exposureBfh);
     record[RT_LOCAL_ADJUSTMENTS_SLOT_XC] = lp.xc;
     record[RT_LOCAL_ADJUSTMENTS_SLOT_YC] = lp.yc;
     record[RT_LOCAL_ADJUSTMENTS_SLOT_LX] = lp.lx;
@@ -3728,6 +3927,11 @@ int LocalAdjustmentsContext::build(int spot, const RtStageBuffer* lab,
     if (!fillIir(RT_LOCAL_ADJUSTMENTS_MASK_SIGMA, iirMask_)) {
         return 1;
     }
+    if (!fillIir(exposureRun ? static_cast<double>(2.0f + 0.2f * lp.blurexpde)
+                             : RT_LOCAL_ADJUSTMENTS_SHARPEN_SCOPE_SIGMA,
+                 iirExposure_)) {
+        return 1;
+    }
 
     out.spots = spots_.data();
     out.spot_count = 1;
@@ -3753,6 +3957,7 @@ int LocalAdjustmentsContext::build(int spot, const RtStageBuffer* lab,
     out.iir_blur = &iirBlur_;
     out.iir_cie = &iirCie_;
     out.iir_mask = &iirMask_;
+    out.iir_exposure = &iirExposure_;
     built_ = true;
     return 0;
 }

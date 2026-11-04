@@ -137,6 +137,20 @@ struct LocalAdjustmentsSpotParams {
     int sursouci = 0;
     int sensicie = 0;
     float blurciede = 0.f;
+    /* Local exposure (PDE arm). exposena is the host's enabled-and-unmasked
+     * predicate; expcomp is the block's clamped value, before the 0.001
+     * fixup that the device mirrors. gamex must be 1, so the gamma wrapper is
+     * the identity and the Laplacian input is the tone-curve plane. */
+    bool exposena = false;
+    float expcomp = 0.f;
+    int hlcompr = 0;
+    int hlcomprthresh = 0;
+    float laplacexp = 0.f;
+    float balanexp = 1.f;
+    float linear = 0.f;
+    float gamm = 0.f;
+    float blurexpde = 0.f;
+    int sensex = 0;
 };
 
 } // namespace rtengine

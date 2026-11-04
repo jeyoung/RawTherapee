@@ -74,7 +74,7 @@ struct ProcParams;
  * than this is outside the device set and runs the host block. */
 #define RT_LOCAL_ADJUSTMENTS_MAX_SPOTS 64u
 /* Floats per spot record; the slot constants below must stay inside it. */
-#define RT_LOCAL_ADJUSTMENTS_SPOT_STRIDE 352u
+#define RT_LOCAL_ADJUSTMENTS_SPOT_STRIDE 384u
 /* A curve table is one LUTf of the block's own size. */
 #define RT_LOCAL_ADJUSTMENTS_LUT_ENTRIES 65536u
 /* Color::gammatab_srgb and Color::igammatab_srgb, the sRGB gamma pair the
@@ -580,6 +580,36 @@ struct ProcParams;
 #define RT_LOCAL_ADJUSTMENTS_SLOT_CAP_KERNEL_N 338u
 #define RT_LOCAL_ADJUSTMENTS_SLOT_CAP_BORDER 339u
 #define RT_LOCAL_ADJUSTMENTS_SLOT_CAP_CHECK_STOP 340u
+/* Local exposure. EXP_EXPOSURE is 1 when Lab_Local()'s exposure block runs
+ * with the PDE arm: the tool on, the spot active, no explicit mask,
+ * `linear > 0`, `laplacexp > 0.1`, the gamma wrapper at 1, no recovery
+ * weight, gradient, chroma, black-point, shadow-recovery, structure or fat
+ * addition, and an ROI whose width and height are each an `fftw_size[]`
+ * entry, so optfft() is the identity. EXP_SENS is `lp.sensex` (senstype 1).
+ * The tone tables are the block's own hltonecurveloc, shtonecurveloc and
+ * tonecurveloc; the six DCT tables are host-built for the exact ROI so the
+ * device reproduces FFTW's REDFT10/REDFT01 pair. */
+#define RT_LOCAL_ADJUSTMENTS_SLOT_EXP_EXPOSURE 341u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_EXPCOMP 342u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_HLCOMP 343u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_HLCOMPTHR 344u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_LAPLACEXP 345u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_BALANEXP 346u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_EXP_LINEAR 347u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_EXP_GAM 348u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_EXP_BLUREXP 349u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_EXP_SENS 350u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_EXP_HL_OFFSET 351u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_EXP_SH_OFFSET 352u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_EXP_TONE_OFFSET 353u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_EXP_FWDW_OFFSET 354u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_EXP_FWDH_OFFSET 355u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_EXP_INVW_OFFSET 356u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_EXP_INVH_OFFSET 357u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_EXP_POISW_OFFSET 358u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_EXP_POISH_OFFSET 359u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_EXP_BFW 360u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_EXP_BFH 361u
 /* iplocallab.cc's mSPsharpCS: buildBlendMask2() needs 150 px on both axes.
  * A smaller ROI makes the capture block a no-op, not a refusal. */
 #define RT_LOCAL_ADJUSTMENTS_CAPTURE_MIN_ROI 150
@@ -838,6 +868,9 @@ typedef struct RtLocalAdjustmentsResult {
      * transit_shapedetect2() uses for the vibrance (senstype 2) and local
      * contrast (senstype 10) tools. Only the SSE path is admitted. */
     const RtLabToolsIir* iir_vibrance;
+    /* Local exposure's deltaE reference blur, sigma (2 + 0.2 * blurexpde) /
+     * sk. Only the SSE path is admitted. */
+    const RtLabToolsIir* iir_exposure;
     /* Local contrast's own Gaussian, sigma = lcradius / sk. Both the SSE and
      * the double path are admitted; the launcher reads double_path. */
     const RtLabToolsIir* iir_local_contrast;
@@ -973,6 +1006,17 @@ namespace rtengine::stage
  * retinex path and stays a residual. The sRGB gamma tables are host-built by
  * Color::init() and the working matrices are the block's own.
  *
+ * Local exposure is admitted in its PDE arm only: `expmet == 1` (the block's
+ * hard-wired value), `linear > 0`, `laplacexp > 0.1`, `gamex == 1`, no black
+ * point, shadow recovery, chroma, gradient, structure, fat, mask or soft
+ * radius and `reparexp == 100`. The ROI must be a 64, 65, 80, 96, 100 or 128
+ * px `fftw_size[]` entry on each axis, so optfft() leaves the extent
+ * unchanged. The tone plane is exlabLocal()'s host-built highlight, shadow
+ * and tone LUT sequence, and the Laplacian input is bit-identical to the
+ * host; the device runs the threshold, a direct double DCT pair, the
+ * Poisson scaling, normalize_mean_dt() and the senstype-1 blend. Other
+ * exposure settings and an ROI outside the set are residuals.
+ *
  * CIE CAM is admitted in its CAM16 "com" mode only: `expcie` on, `modecie`
  * `"com"`, `modecam` `"cam16"`, `pqremapcam16` at most 100 (the plain CAM16
  * arm) and `smoothciemet` `"none"`. The device runs ciecamloc_02float()'s
@@ -1012,6 +1056,12 @@ LocalAdjustmentsDispatch localAdjustmentsDispatch(
  * leftover state. */
 uint32_t localAdjustmentsClampMode(const procparams::ProcParams& params,
                                    int spot);
+
+/* Whether a local-exposure ROI is one of the admitted sizes. The block's
+ * optfft() shrinks an ROI to the largest fftw_size[] entry not above each
+ * axis, so an exact entry leaves the PDE extent unchanged. The set is capped
+ * at 128 px because the device DCT is a direct transform. */
+bool localAdjustmentsExposureRoiAdmitted(int width, int height);
 
 /*
  * The block as it ran before the device node, moved here unchanged so the call
@@ -1090,6 +1140,7 @@ private:
     RtLabToolsIir iirBlur_ = {};
     RtLabToolsIir iirCie_ = {};
     RtLabToolsIir iirMask_ = {};
+    RtLabToolsIir iirExposure_ = {};
     uint32_t clamp_mode_ = RT_LOCAL_ADJUSTMENTS_CLAMP_NONE;
 };
 

@@ -9200,6 +9200,16 @@ void ImProcFunctions::localAdjustmentsSpotParams(
     out.sursouci = lp.sursouci;
     out.sensicie = lp.sensicie;
     out.blurciede = lp.blurcie;
+    out.exposena = lp.exposena;
+    out.expcomp = lp.expcomp;
+    out.hlcompr = lp.hlcomp;
+    out.hlcomprthresh = lp.hlcompthr;
+    out.laplacexp = lp.laplacexp;
+    out.balanexp = lp.balanexp;
+    out.linear = lp.linear;
+    out.gamm = static_cast<float>(params->locallab.spots.at(sp).gamm);
+    out.blurexpde = lp.blurexp;
+    out.sensex = lp.sensex;
 }
 
 void ImProcFunctions::calc_ref(int sp, LabImage * original, LabImage * transformed, int cx, int cy, int oW, int oH, int sk, double & huerefblur, double & chromarefblur, double & lumarefblur, double & hueref, double & chromaref, double & lumaref, double & sobelref, float & avg, const LocwavCurve & locwavCurveden, bool locwavdenutili)
