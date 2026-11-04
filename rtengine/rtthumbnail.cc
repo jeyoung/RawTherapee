@@ -57,6 +57,7 @@
 #include "opencl/openclengine.h"
 #include "settings.h"
 #include "stage/stage_graph.h"
+#include "stage/lab_tools_context.h"
 #include "stage/stage_pipeline.h"
 #include "stage/stage_buffer.h"
 #include "stage/stage_runtime.h"
@@ -1651,6 +1652,64 @@ bool run_thumbnail_scale_stage(ImageIO* source, Imagefloat& dst,
                       &profiling) == RT_STAGE_OK;
 }
 
+/*
+ * CurveFactory's sampling divisor for the reduced path's Lab tables.
+ * `Thumbnail::stageLab()` builds `lumacurve`, `clcurve`, `satcurve` and
+ * `lhskcurve` with skip 16, whereas the export block uses 1. The device
+ * context must build the same tables, so it takes this value.
+ */
+inline constexpr int THUMBNAIL_LAB_CURVE_SKIP = 16;
+
+/*
+ * Whether the reduced Lab block can run through the `thumbnail.lab` device
+ * node.
+ *
+ * The node reuses the `lab.tools` kernel, whose LabGrid, Lab-curve,
+ * black-and-white and vibrance passes are scale independent and consume the
+ * host-built tables. Everything else the reduced block does keeps a different
+ * configuration and is refused as a whole, so the caller runs the unchanged
+ * host block:
+ *
+ * - shadows/highlights and local contrast divide their radii by the call
+ *   site's scale, which is 16 here and 1 in the export block the node
+ *   implements;
+ * - Lab colour-correction regions derive their radii from `ImProcFunctions`
+ *   scale, which is the thumbnail ratio;
+ * - EPD tone mapping and soft light have no device node on the reduced path;
+ * - CIE CAM has no device node at all;
+ * - the working-TRC block calls `workingtrc()` with gamut control off and a
+ *   fixed CAT, which is not the export block's configuration, so the working
+ *   TRC and the gamut pass that depends on it stay hosts.
+ *
+ * A profile with no admitted Lab tool is not submitted: the host block is a
+ * no-op for it.
+ */
+bool thumbnailLabDeviceAdmitted(const procparams::ProcParams& params)
+{
+    if (params.sh.enabled &&
+        (params.sh.highlights > 0 || params.sh.shadows > 0)) {
+        return false;
+    }
+    if (params.localContrast.enabled) {
+        return false;
+    }
+    if (params.colorToning.enabled &&
+        params.colorToning.method == "LabRegions") {
+        return false;
+    }
+    if (params.epd.enabled ||
+        (params.softlight.enabled && params.softlight.strength != 0) ||
+        params.colorappearance.enabled) {
+        return false;
+    }
+    if (params.icm.workingTRC !=
+            procparams::ColorManagementParams::WorkingTrc::NONE &&
+        params.icm.trcExp) {
+        return false;
+    }
+    return stage::labToolsSupported(params);
+}
+
 } // namespace
 
 /*
@@ -2736,6 +2795,30 @@ void Thumbnail::stageLab(StageState& state)
     CurveFactory::complexsgnCurve (autili, butili, ccutili, cclutili, params.labCurve.acurve, params.labCurve.bcurve, params.labCurve.cccurve,
                                    params.labCurve.lccurve, curve1, curve2, satcurve, lhskcurve, 16);
 
+    /*
+     * thumbnail.lab on the device. The node reuses the lab.tools kernel with
+     * the reduced path's curve sampling, and the whole admitted block runs on
+     * a copy so a refused or failed launch cannot leave `labView` half
+     * processed; the host block below is then the result. The residual tools
+     * listed in thumbnailLabDeviceAdmitted() keep the whole block on the
+     * host.
+     */
+    if (stage::node_device("thumbnail.lab") == stage::StageNodeDevice::OpenCL &&
+        thumbnailLabDeviceAdmitted(params)) {
+        stage::LabToolsLuts luts{&hist16, &lumacurve, &dummy, &clcurve,
+                                 &curve1, &curve2, &satcurve, &lhskcurve};
+        bool deviceAutili = false;
+        bool deviceButili = false;
+        std::unique_ptr<LabImage> deviceLab(new LabImage(fw, fh));
+        deviceLab->CopyFrom(labView);
+        if (stage::labToolsSubmit(params, ipf, *deviceLab, luts, deviceAutili,
+                                  deviceButili, "thumbnail.lab",
+                                  THUMBNAIL_LAB_CURVE_SKIP,
+                                  stage::labToolsSupported(params))) {
+            labView->CopyFrom(deviceLab.get());
+            return;
+        }
+    }
 
     if (params.colorToning.enabled && params.colorToning.method == "LabGrid") {
         ipf.colorToningLabGrid(labView, 0,labView->W , 0, labView->H, false);

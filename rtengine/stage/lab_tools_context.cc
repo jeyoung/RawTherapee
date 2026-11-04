@@ -10,6 +10,7 @@
 #include "procparams.h"
 #include "sleef.h"
 #include "stage/stage_buffer.h"
+#include "stage/stage_runtime.h"
 
 #include <cassert>
 #include <cmath>
@@ -730,10 +731,12 @@ LabToolsContext::LabToolsContext(const procparams::ProcParams& params,
                                  ImProcFunctions& ipf,
                                  LabToolsLuts luts,
                                  bool& autili,
-                                 bool& butili)
+                                 bool& butili,
+                                 int skip)
     : params_(params),
       ipf_(ipf),
       luts_(luts),
+      skip_(skip),
       autili_(&autili),
       butili_(&butili)
 {
@@ -1046,16 +1049,16 @@ int LabToolsContext::build(RtLabToolsResult& out)
         CurveFactory::complexLCurve(
             params_.labCurve.brightness, params_.labCurve.contrast,
             params_.labCurve.lcurve, *luts_.hist16, *luts_.lumacurve,
-            *luts_.dummy, 1, utili);
+            *luts_.dummy, skip_, utili);
         const bool clcutili = CurveFactory::diagonalCurve2Lut(
-            params_.labCurve.clcurve, *luts_.clcurve, 1);
+            params_.labCurve.clcurve, *luts_.clcurve, skip_);
         bool ccutili = false;
         bool cclutili = false;
         CurveFactory::complexsgnCurve(
             *autili_, *butili_, ccutili, cclutili, params_.labCurve.acurve,
             params_.labCurve.bcurve, params_.labCurve.cccurve,
             params_.labCurve.lccurve, *luts_.curve1, *luts_.curve2,
-            *luts_.satcurve, *luts_.lhskcurve, 1);
+            *luts_.satcurve, *luts_.lhskcurve, skip_);
 
         const auto copy = [](const LUTf& lut, std::vector<float>& flat) {
             const std::size_t size = lut.getSize();
@@ -1467,6 +1470,316 @@ int LabToolsContext::runHost(RtStageBuffer& lab)
         }
     }
     return 0;
+}
+
+bool labToolsSubmit(const procparams::ProcParams& params,
+                    ImProcFunctions& ipf,
+                    LabImage& labImage,
+                    LabToolsLuts luts,
+                    bool& autili,
+                    bool& butili,
+                    const char* node,
+                    int skip,
+                    bool supported)
+{
+    LabToolsContext context(params, ipf, luts, autili, butili, skip);
+    RtLabToolsResult setup{};
+    const bool deviceReady = supported && context.build(setup) == 0;
+    RtLabToolsContext descriptor = context.descriptor(deviceReady);
+
+    RtStageArg args[76] = {};
+    args[0].kind = RT_STAGE_ARG_BUFFER;
+    args[0].u.buffer = rtengine::stage::view(labImage);
+    args[1].kind = RT_STAGE_ARG_PTR;
+    args[1].u.ptr = &descriptor;
+    args[2].kind = RT_STAGE_ARG_INT;
+    args[2].u.i = deviceReady ? 1 : 0;
+    args[3].kind = RT_STAGE_ARG_INT;
+    args[3].u.i = (params.colorToning.enabled &&
+                   params.colorToning.method == "LabGrid")
+                      ? 1
+                      : 0;
+    for (int index = 0; index < 4; ++index) {
+        args[4 + index].kind = RT_STAGE_ARG_DOUBLE;
+        args[4 + index].u.f =
+            deviceReady ? setup.labgrid[index] : 0.0;
+    }
+    args[8].kind = RT_STAGE_ARG_INT;
+    args[8].u.i = params.sh.enabled ? 1 : 0;
+    args[9].kind = RT_STAGE_ARG_INT;
+    args[9].u.i = params.sh.highlights;
+    args[10].kind = RT_STAGE_ARG_INT;
+    args[10].u.i = params.sh.shadows;
+    args[11].kind = RT_STAGE_ARG_INT;
+    args[11].u.i = params.sh.htonalwidth;
+    args[12].kind = RT_STAGE_ARG_INT;
+    args[12].u.i = params.sh.stonalwidth;
+    args[13].kind = RT_STAGE_ARG_INT;
+    args[13].u.i = params.sh.radius;
+    args[14].kind = RT_STAGE_ARG_INT;
+    args[14].u.i = params.sh.lab ? 1 : 0;
+    args[15].kind = RT_STAGE_ARG_INT;
+    args[15].u.i = LAB_TOOLS_EXPORT_SCALE;
+
+    /*
+     * Vibrance's own parameters. The flag is the same predicate the
+     * supported set uses, so a vibrance block that would not touch a
+     * pixel never reaches the launcher as a device tool.
+     */
+    const bool vibrance = labToolsVibranceActive(params);
+    args[22].kind = RT_STAGE_ARG_INT;
+    args[22].u.i = deviceReady && vibrance ? 1 : 0;
+    args[23].kind = RT_STAGE_ARG_INT;
+    args[23].u.i = params.vibrance.pastels;
+    args[24].kind = RT_STAGE_ARG_INT;
+    args[24].u.i = params.vibrance.saturated;
+    args[25].kind = RT_STAGE_ARG_INT;
+    args[25].u.i = params.vibrance.psthreshold.getTopLeft();
+    args[26].kind = RT_STAGE_ARG_INT;
+    args[26].u.i = params.vibrance.psthreshold.getBottomLeft();
+    args[27].kind = RT_STAGE_ARG_INT;
+    args[27].u.i = params.vibrance.protectskins ? 1 : 0;
+    args[28].kind = RT_STAGE_ARG_INT;
+    args[28].u.i = params.vibrance.avoidcolorshift ? 1 : 0;
+    args[29].kind = RT_STAGE_ARG_INT;
+    args[29].u.i = deviceReady && vibrance &&
+                          setup.skin_curve_set != 0
+                      ? 1
+                      : 0;
+    args[30].kind = RT_STAGE_ARG_INT;
+    args[30].u.i = params.toneCurve.hrenabled ? 1 : 0;
+
+    /*
+     * The Lab-curve pass. The six activity flags and the tables come
+     * from the host build; the method, the red/skin settings and the
+     * chroma scale are read from the same values the block reads.
+     */
+    args[34].kind = RT_STAGE_ARG_INT;
+    args[34].u.i = deviceReady ? setup.lab_curve_active : 0;
+    args[35].kind = RT_STAGE_ARG_INT;
+    args[35].u.i = deviceReady ? setup.lab_curve_l_active : 0;
+    args[36].kind = RT_STAGE_ARG_INT;
+    args[36].u.i = deviceReady ? setup.lab_curve_a_active : 0;
+    args[37].kind = RT_STAGE_ARG_INT;
+    args[37].u.i = deviceReady ? setup.lab_curve_b_active : 0;
+    args[38].kind = RT_STAGE_ARG_INT;
+    args[38].u.i = deviceReady ? setup.lab_curve_cc_active : 0;
+    args[39].kind = RT_STAGE_ARG_INT;
+    args[39].u.i = deviceReady ? setup.lab_curve_lc_active : 0;
+    args[40].kind = RT_STAGE_ARG_INT;
+    args[40].u.i = deviceReady ? setup.lab_curve_cl_active : 0;
+    args[41].kind = RT_STAGE_ARG_INT;
+    args[41].u.i = deviceReady ? setup.lab_curve_munsell : 0;
+    args[42].kind = RT_STAGE_ARG_INT;
+    args[42].u.i = deviceReady ? setup.lab_curve_lcredsk : 0;
+    const double lab_curve_doubles[5] = {
+        deviceReady ? setup.lab_curve_rst_protection : 0.0,
+        deviceReady ? setup.lab_curve_protect_red : 0.0,
+        deviceReady ? setup.lab_curve_protect_red_h : 0.0,
+        deviceReady ? setup.lab_curve_amount_chroma : 0.0,
+        deviceReady ? setup.lab_curve_adjust : 1.0};
+    for (int index = 0; index < 5; ++index) {
+        args[43 + index].kind = RT_STAGE_ARG_DOUBLE;
+        args[43 + index].u.f = lab_curve_doubles[index];
+    }
+    for (int index = 48; index < 54; ++index) {
+        args[index].kind = RT_STAGE_ARG_BUFFER;
+    }
+    args[54].kind = RT_STAGE_ARG_INT;
+    args[54].u.i = deviceReady
+                       ? static_cast<std::int64_t>(
+                             setup.lab_curve_l_entries)
+                       : 0;
+    args[55].kind = RT_STAGE_ARG_INT;
+    args[55].u.i = deviceReady
+                       ? static_cast<std::int64_t>(
+                             setup.lab_curve_entries)
+                       : 0;
+
+    /*
+     * Local contrast. The flag is the context's active flag; the three
+     * sliders arrive as the block's own float narrowing and the
+     * coefficients as a host-only pointer.
+     */
+    args[56].kind = RT_STAGE_ARG_INT;
+    args[56].u.i = deviceReady ? setup.local_contrast_enabled : 0;
+    args[57].kind = RT_STAGE_ARG_INT;
+    args[57].u.i = deviceReady
+                       ? static_cast<std::int64_t>(
+                             setup.local_contrast_radius)
+                       : 0;
+    args[58].kind = RT_STAGE_ARG_DOUBLE;
+    args[58].u.f = deviceReady ? setup.local_contrast_amount : 0.0;
+    args[59].kind = RT_STAGE_ARG_DOUBLE;
+    args[59].u.f =
+        deviceReady ? setup.local_contrast_darkness : 1.0;
+    args[60].kind = RT_STAGE_ARG_DOUBLE;
+    args[60].u.f =
+        deviceReady ? setup.local_contrast_lightness : 1.0;
+    args[61].kind = RT_STAGE_ARG_INT;
+    args[61].u.i = deviceReady
+                       ? static_cast<std::int64_t>(
+                             setup.local_contrast_scale)
+                       : LAB_TOOLS_EXPORT_SCALE;
+    args[62].kind = RT_STAGE_ARG_PTR;
+    args[62].u.ptr =
+        deviceReady ? setup.local_contrast_iir : nullptr;
+
+    /*
+     * Lab regions. The count is the context's region set; the mask
+     * tables and per-region floats are uploaded from the host build.
+     */
+    args[63].kind = RT_STAGE_ARG_INT;
+    args[63].u.i = deviceReady ? setup.region_count : 0;
+    args[64].kind = RT_STAGE_ARG_BUFFER;
+    args[65].kind = RT_STAGE_ARG_INT;
+    args[65].u.i = deviceReady
+                       ? static_cast<std::int64_t>(
+                             setup.region_lut_stride)
+                       : 0;
+    args[66].kind = RT_STAGE_ARG_BUFFER;
+    args[67].kind = RT_STAGE_ARG_PTR;
+    args[67].u.ptr = deviceReady ? setup.ws_double : nullptr;
+    args[68].kind = RT_STAGE_ARG_PTR;
+    args[68].u.ptr = deviceReady ? setup.iws_double : nullptr;
+    args[69].kind = RT_STAGE_ARG_INT;
+    args[69].u.i = deviceReady ? setup.black_white : 0;
+
+    /*
+     * The hue flat-curve family: the three sampled tables in one
+     * buffer, the fixed slot stride, the activity flags and the
+     * chromaticity slider.
+     */
+    args[70].kind = RT_STAGE_ARG_INT;
+    args[70].u.i = deviceReady ? setup.lab_curve_hue_stride : 0;
+    args[71].kind = RT_STAGE_ARG_BUFFER;
+    args[72].kind = RT_STAGE_ARG_INT;
+    args[72].u.i = deviceReady ? setup.lab_curve_ch_active : 0;
+    args[73].kind = RT_STAGE_ARG_INT;
+    args[73].u.i = deviceReady ? setup.lab_curve_lh_active : 0;
+    args[74].kind = RT_STAGE_ARG_INT;
+    args[74].u.i = deviceReady ? setup.lab_curve_hh_active : 0;
+    args[75].kind = RT_STAGE_ARG_INT;
+    args[75].u.i = deviceReady ? setup.lab_curve_chromaticity : 0;
+
+    for (int index = 16; index < 22; ++index) {
+        args[index].kind = RT_STAGE_ARG_BUFFER;
+    }
+    for (int index = 31; index < 34; ++index) {
+        args[index].kind = RT_STAGE_ARG_BUFFER;
+    }
+    if (deviceReady) {
+        const auto host_buffer = [](const float* data, int width) {
+            RtStageBuffer buffer{};
+            buffer.size = sizeof(RtStageBuffer);
+            buffer.data = const_cast<float*>(data);
+            buffer.width = width;
+            buffer.height = 1;
+            buffer.row_pitch = static_cast<std::size_t>(width) *
+                               sizeof(float);
+            buffer.plane_pitch = buffer.row_pitch;
+            buffer.planes = 1;
+            buffer.format = RT_STAGE_F32;
+            buffer.flags = RT_STAGE_BUFFER_READ;
+            return buffer;
+        };
+        /*
+         * A double table in the residency's float-counted shape: two
+         * float words per value, the same upload the region pass uses
+         * for its double matrices. The hue flat-curve nodes are
+         * doubles because a float knot abscissa moves a dense steep
+         * curve far past the host's value bound.
+         */
+        const auto host_double_buffer = [](const double* data,
+                                           int count) {
+            RtStageBuffer buffer{};
+            buffer.size = sizeof(RtStageBuffer);
+            buffer.data = const_cast<double*>(data);
+            buffer.width = 2 * count;
+            buffer.height = 1;
+            buffer.row_pitch = static_cast<std::size_t>(buffer.width) *
+                               sizeof(float);
+            buffer.plane_pitch = buffer.row_pitch;
+            buffer.planes = 1;
+            buffer.format = RT_STAGE_F32;
+            buffer.flags = RT_STAGE_BUFFER_READ;
+            return buffer;
+        };
+        args[16].u.buffer = host_buffer(
+            setup.lut_highlight, static_cast<int>(setup.lut_entries));
+        args[17].u.buffer = host_buffer(
+            setup.lut_shadow, static_cast<int>(setup.lut_entries));
+        args[18].u.buffer = host_buffer(setup.ws, 9);
+        args[19].u.buffer = host_buffer(setup.iws, 9);
+        args[20].u.buffer = host_buffer(
+            setup.cachef, static_cast<int>(RT_LAB_TOOLS_CACHE_ENTRIES));
+        args[21].u.buffer = host_buffer(
+            setup.cachefy, static_cast<int>(RT_LAB_TOOLS_CACHE_ENTRIES));
+        if (vibrance) {
+            args[31].u.buffer = host_buffer(
+                setup.munsell,
+                static_cast<int>(RT_LAB_TOOLS_MUNSELL_TABLES *
+                                 RT_LAB_TOOLS_MUNSELL_STRIDE));
+            args[32].u.buffer = host_buffer(
+                setup.munsell_sizes,
+                static_cast<int>(RT_LAB_TOOLS_MUNSELL_TABLES));
+            args[33].u.buffer = host_buffer(
+                setup.skin_curve,
+                setup.skin_curve_set != 0
+                    ? static_cast<int>(
+                          RT_LAB_TOOLS_SKIN_CURVE_ENTRIES)
+                    : 1);
+        } else if (setup.lab_curve_munsell != 0) {
+            args[31].u.buffer = host_buffer(
+                setup.munsell,
+                static_cast<int>(RT_LAB_TOOLS_MUNSELL_TABLES *
+                                 RT_LAB_TOOLS_MUNSELL_STRIDE));
+            args[32].u.buffer = host_buffer(
+                setup.munsell_sizes,
+                static_cast<int>(RT_LAB_TOOLS_MUNSELL_TABLES));
+        }
+        if (setup.region_count != 0) {
+            args[64].u.buffer = host_buffer(
+                setup.region_luts,
+                static_cast<int>(
+                    setup.region_count *
+                    RT_LAB_TOOLS_REGION_CURVES *
+                    setup.region_lut_stride));
+            args[66].u.buffer = host_buffer(
+                setup.region_params,
+                static_cast<int>(
+                    setup.region_count *
+                    RT_LAB_TOOLS_REGION_PARAM_STRIDE));
+        }
+        if (setup.lab_curve_active != 0) {
+            args[48].u.buffer = host_buffer(
+                setup.lab_curve_l,
+                static_cast<int>(setup.lab_curve_l_entries));
+            args[49].u.buffer = host_buffer(
+                setup.lab_curve_a,
+                static_cast<int>(setup.lab_curve_entries));
+            args[50].u.buffer = host_buffer(
+                setup.lab_curve_b,
+                static_cast<int>(setup.lab_curve_entries));
+            args[51].u.buffer = host_buffer(
+                setup.lab_curve_cc,
+                static_cast<int>(setup.lab_curve_entries));
+            args[52].u.buffer = host_buffer(
+                setup.lab_curve_lc,
+                static_cast<int>(setup.lab_curve_entries));
+            args[53].u.buffer = host_buffer(
+                setup.lab_curve_cl,
+                static_cast<int>(setup.lab_curve_entries));
+            args[71].u.buffer = host_double_buffer(
+                setup.lab_curve_hue,
+                static_cast<int>(setup.lab_curve_hue_stride *
+                                 RT_LAB_TOOLS_HUE_CURVES));
+        }
+    }
+
+    RtStageProfiling profiling{};
+    return run(node, std::vector<RtStageArg>(args, args + 76), &profiling) ==
+           RT_STAGE_OK;
 }
 
 } // namespace rtengine::stage

@@ -485,6 +485,30 @@ void labToolsHostBlock(ImProcFunctions& ipf,
                        bool& butili);
 
 /*
+ * Build and submit the lab.tools node for `lab`.
+ *
+ * `supported` is the call site's predicate. The host setup may still refuse
+ * the configuration; the node is then submitted with the support flag clear,
+ * exactly as the export block does. `skip` is CurveFactory's sampling
+ * divisor: 1 for the export block, 16 for the reduced thumbnail path, whose
+ * curve tables are built at a coarser sampling. `node` names the kernel
+ * request; the thumbnail block submits the same program under
+ * `thumbnail.lab`, so its record names the unit that owns the pass.
+ *
+ * Returns true when stage::run() reports success. The caller owns the host
+ * fallback, which must run only when this returns false.
+ */
+bool labToolsSubmit(const procparams::ProcParams& params,
+                    ImProcFunctions& ipf,
+                    LabImage& lab,
+                    LabToolsLuts luts,
+                    bool& autili,
+                    bool& butili,
+                    const char* node,
+                    int skip,
+                    bool supported);
+
+/*
  * The host-owned setup for one lab.tools submission.
  *
  * `build` derives the four LabGrid parameters with the block's float
@@ -505,7 +529,8 @@ public:
                     ImProcFunctions& ipf,
                     LabToolsLuts luts,
                     bool& autili,
-                    bool& butili);
+                    bool& butili,
+                    int skip = LAB_TOOLS_EXPORT_SCALE);
     ~LabToolsContext();
 
     LabToolsContext(const LabToolsContext&) = delete;
@@ -523,6 +548,12 @@ private:
     const procparams::ProcParams& params_;
     ImProcFunctions& ipf_;
     LabToolsLuts luts_;
+    /*
+     * CurveFactory's `skip` argument. The export block samples its curves at
+     * 1; the reduced thumbnail path samples them at 16, so the device context
+     * must build the same tables the thumbnail call site would.
+     */
+    int skip_;
 
     bool built_ = false;
     /* complexsgnCurve()'s two flags, owned by the block's caller. */

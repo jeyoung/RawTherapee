@@ -1359,6 +1359,7 @@ const std::vector<KernelDef>& kernels()
         {"gamut", RT_GAMUT_CL, "rt_gamut"},
         {"working.trc", working_trc_source().c_str(), "rt_working_trc_second"},
         {"lab.tools", lab_tools_source().c_str(), "rt_lab_tools_mask"},
+        {"thumbnail.lab", lab_tools_source().c_str(), "rt_lab_tools_mask"},
         {"lab.tools.labcurve", lab_curve_source().c_str(), "rt_lab_tools_lab_curve"},
         {"lab.tools.localcontrast", local_contrast_source().c_str(), "rt_lab_tools_lc_line"},
         {"lab.tools.regions", lab_regions_source().c_str(), "rt_lab_tools_region_mask"},
@@ -1990,6 +1991,7 @@ cl_kernel compiled_kernel_entry(const std::shared_ptr<OpenCLEnv>& env,
     const char* build_options =
         std::strcmp(def->name, "working.trc") == 0 ||
                 std::strcmp(def->name, "lab.tools") == 0 ||
+                std::strcmp(def->name, "thumbnail.lab") == 0 ||
                 std::strcmp(def->name, "lab.tools.labcurve") == 0 ||
                 std::strcmp(def->name, "lab.tools.localcontrast") == 0 ||
                 std::strcmp(def->name, "local.adjustments") == 0 ||
@@ -3499,7 +3501,8 @@ RtStageStatus run_working_trc(const std::shared_ptr<OpenCLEnv>& env,
 RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
                             const std::shared_ptr<OpenCLResidency>& residency,
                             const std::vector<RtStageArg>& args,
-                            std::string& error)
+                            std::string& error,
+                            const char* node = "lab.tools")
 {
     constexpr std::size_t ARG_COUNT = 76;
     constexpr int SUBSAMPLING = 4;
@@ -4296,7 +4299,7 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
         return RT_STAGE_FALLBACK;
     }
 
-    const KernelDef* def = find_kernel("lab.tools");
+    const KernelDef* def = find_kernel(node);
     assert(def != nullptr);
     cl_kernel mask_kernel =
         compiled_kernel_entry(env, def, "rt_lab_tools_mask", error);
@@ -19708,6 +19711,21 @@ public:
         } else if (request.name == "working.trc") {
             const RtStageStatus status =
                 run_working_trc(env_, residency_, request.args, error);
+            if (status == RT_STAGE_OK) {
+                StageEvent done;
+                done.status = StageEventStatus::Complete;
+                done.result = RT_STAGE_OK;
+                done.device = StageDeviceType::OPENCL;
+                done.asynchronous = false;
+                return done;
+            }
+            StageEvent fallback = StageQueue::submit(request, profiling);
+            fallback.note = error;
+            return fallback;
+        } else if (request.name == "thumbnail.lab") {
+            const RtStageStatus status =
+                run_lab_tools(env_, residency_, request.args, error,
+                              "thumbnail.lab");
             if (status == RT_STAGE_OK) {
                 StageEvent done;
                 done.status = StageEventStatus::Complete;
