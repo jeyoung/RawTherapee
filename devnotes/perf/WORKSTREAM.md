@@ -679,7 +679,7 @@ export and a GUI smoke test are not yet run for this package.
   matrix + inverse type-5 TRC, `apsatur`, RGB→Lab). 1 LSB16 on POCL and the
   AMD RX 550, probe means exact. Type-5 profiles only; a type -5 profile
   (CUSTOM gamma < 1) is a host residual, as are unknown working profiles,
-  non-relative intents, local contrast, both tone equalisers and B&W.
+  non-relative intents, local contrast and B&W.
   `e5f142741`, `d408ca0df`, `2b2fe1efc`, `67a37700c`, `897c25fd3`,
   `0f1a819cc`, `b07462094`, `8fdcb2fb3`.
 - **`working.trc` soft light**: `ImProcFunctions::softLight()` now runs as a
@@ -697,9 +697,29 @@ export and a GUI smoke test are not yet run for this package.
   the 101/-1 refusals) are within 0.099609 LSB16; strength 50 changes all
   17,136 samples at PAE 4,282.638672 against the tool off.
   `working-trc-residual.pp3` is 1 LSB16 with `impl=opencl`.
-  `2b3fcd5a9..4a8b1ae85`. Residuals: local contrast, both tone equalisers,
+  `2b3fcd5a9..4a8b1ae85`. Residuals: local contrast,
   B&W, a soft-light strength outside 1..100, type -5 profiles and
   out-of-gamut first passes.
+- **`working.trc` tone equalisers**: the block's two
+  `ImProcFunctions::toneEqualizer()` calls now run on the device. The host
+  derives the block's own `ToneEqualizerParams` (the midtone `wmidtcie` and
+  white-distribution `wsmoothciesli` derivations are shared with the host
+  block), builds the 65536-entry correction table and the fifteen band factors
+  through the shared `toneEqualizerTable()`, and exports the double working
+  luminance row. The device computes `Color::rgbLuminance()` in fp64, ports
+  `guidedFilterLog()` exactly - `calculate_subsampling()`, `boxblur()`'s
+  running sums and the bilinear rescale/readout - and applies the table, with
+  `process_pixel()` above 1. The host prefix is split so the midtone arm runs
+  between `lab2rgb()` and the fixed sRGB inverse; the white-distribution arm
+  runs in place on the post-TRC image. Twelve residency cases at 238x24 and
+  179x17 are within 0.083984 LSB16, both arms are non-vacuous (PAE 2 634.8 and
+  1 351.8 LSB16 against the tool off), and `working-trc-tone.pp3` (midtone
+  -30) and `working-trc-tone-smooth.pp3` (smooth 0.5) are 1 LSB16 with
+  `impl=opencl` on the full 3888x2608 PEF, which exercises the subsampling-5
+  path. Midtone 101, smooth 1.6 and smooth -0.1 are predicate refusals;
+  midtone 100 on the synthetic source and midtone 40 on the full image leave
+  the working gamut, so the setup refuses them and they run `impl=host`.
+  `perf:`, `test:`, `docs:` in this unit.
 - **`output.sharpen` residual switches**: the fallback arms are now device
   kernels with host-derived scalars: edges-only (`bilateral2.h`'s twenty-one
   sigma buckets, upper-triangle integer weights, `0x20000`-entry range table

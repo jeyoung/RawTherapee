@@ -84,10 +84,20 @@ tool on it first runs the per-pixel `softLight()` arm over a device copy,
 reads the result into a private host buffer and calls the prefix on that copy,
 so a later refusal leaves the caller's image untouched. The device work then
 starts at the second pass: the matrix-shaper transform, `apsatur()` and RGB to
-Lab. A configuration with `workingTRC == NONE`, `trcExp == false`, a profile
-outside the twelve-name list, a non-relative intent, non-default primaries or
-illuminant, a soft-light strength outside 1..100, local contrast on, either
-tone equaliser on, black-and-white output on, a first pass above the
+Lab. The block's two tone equalisers also run on the device when their sliders
+are inside the GUI ranges (`wmidtcie` -100..100, `wsmoothciesli` 0..1.5): the
+host derives the block's own `ToneEqualizerParams`, builds the 65536-entry
+correction table and the fifteen band factors through the shared
+`toneEqualizerTable()`, and exports the working-space luminance row; the device
+computes `Color::rgbLuminance()` in double, ports `guidedFilterLog()` exactly
+(the fast-guided-filter subsampling, `boxblur()`'s running sums and the
+bilinear rescale/readout) and applies the table per pixel. The midtone arm runs
+between `lab2rgb()` and the fixed sRGB inverse, so the launcher reads it back
+before the host inverse; the white-distribution arm runs in place on the
+post-TRC image. A configuration with `workingTRC == NONE`, `trcExp == false`,
+a profile outside the twelve-name list, a non-relative intent, non-default
+primaries or illuminant, a soft-light or tone-equaliser value outside its
+range, local contrast on, black-and-white output on, a first pass above the
 working-gamut tolerance, a non-matrix-shaper profile or a `buildGpuProfile()`
 failure is a residual: it runs the `working.trc` host builtin and records
 `impl=host`, never a device pass.

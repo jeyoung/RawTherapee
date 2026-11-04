@@ -2521,6 +2521,10 @@ Evidence, with `OMP_NUM_THREADS=1` and a 3888x2608 PEF:
 | `verify.sh --stage-device`, AMD RX 550 (rusticl), `working-trc.pp3` | PASS, `max_pae=1.5259e-05`, record `"stage":"working.trc","impl":"opencl","source":"opencl"` |
 | AMD RX 550, `Gamut=false` | PASS, `max_pae=1.5259e-05` |
 | `working-trc-residual.pp3` (soft light on, strength 50), 3888x2608 PEF | device row: `"stage":"working.trc","impl":"opencl"`, `max_pae=1.5259e-05` (1 LSB16, 547,600 of 30,419,712 samples). The row was 0 (host) before this unit |
+| `stage-residency-test` on POCL, 12 tone-equaliser cases at 238x24 and 179x17 (midtone 25/-70/100/40-bt709, smooth 0.5/1.5, both together, each with soft light 50) | tone PAE 0.061523 to 0.083984 LSB16, all finite; the matrix worst stays 0.099609 (soft light srgb). Midtone 100 is `impl=host` because the lift pushes the first pass above the working-gamut tolerance; 101, smooth 1.6 and smooth -0.1 are refused by the predicate and run `impl=host` with 0 differing samples |
+| tone non-vacuity, same node | midtone 40 changes 17,136 of 17,136 samples at PAE 2,634.826172 LSB16; smooth 0.5 changes all samples at PAE 1,351.759766 |
+| colorspace_flowers.pef / `working-trc-tone.pp3` (midtone -30) and `working-trc-tone-smooth.pp3` (smooth 0.5) | `impl=opencl`; 1 LSB16 on both (PAE 1.5259e-05; 587,435 and 638,233 of 30,419,712 samples), which exercises the subsampling-5 rescale path on the full 3888x2608 image |
+| colorspace_flowers.pef / `Wmidtcie=40` | `impl=host` (`source=device-fallback`): the first pass leaves the working gamut, so the setup refuses and the builtin runs |
 | CUSTOM `WorkingTRC`, gamma 0.4, slope 4.5 (type -5) | host residual: `impl=host`, no `impl=opencl`, PAE 0 against the CPU block; observed TRC type -5, `params 2.5, 0.868743, 0.131257, 0.222222, 0.100725` |
 | `--gpu=off` CPU path, two runs | identical (`PAE 0`) |
 
