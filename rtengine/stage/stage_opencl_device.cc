@@ -11830,6 +11830,86 @@ bool sharpen_iir_plane(const std::shared_ptr<OpenCLEnv>& env,
            run_line(state, dst, height, 1, 1, pitch, pitch, width);
 }
 
+/* One plain gaussianBlur(): a copy below GAUSS_SKIP, the 3x3 FIR below 0.6
+ * and the SSE IIR pair above it. `state` may equal `dst` only for the IIR
+ * arm, where the vertical pass runs in place. The caller holds the queue
+ * lock. */
+bool sharpen_blur_plane(const std::shared_ptr<OpenCLEnv>& env,
+                        const KernelDef* def, cl_mem src, cl_mem dst,
+                        cl_mem state, int width, int height, int pitch,
+                        double sigma, std::string& error)
+{
+    const auto set_arg = [&](cl_kernel kernel, cl_uint index,
+                             std::size_t bytes, const void* value) {
+        return env->api->SetKernelArg(kernel, index, bytes, value) ==
+               CL_SUCCESS;
+    };
+    const auto run_2d = [&](cl_kernel kernel) -> bool {
+        const std::size_t global[2] = {
+            static_cast<std::size_t>(width),
+            static_cast<std::size_t>(height)};
+        cl_event done = nullptr;
+        if (env->api->EnqueueNDRangeKernel(env->queue, kernel, 2, nullptr,
+                                           global, nullptr, 0, nullptr,
+                                           &done) != CL_SUCCESS ||
+            done == nullptr) {
+            return false;
+        }
+        const cl_int wait = env->api->WaitForEvents(1, &done);
+        env->api->ReleaseEvent(done);
+        return wait == CL_SUCCESS;
+    };
+
+    const cl_int cl_width = width;
+    const cl_int cl_height = height;
+    const cl_int cl_pitch = pitch;
+
+    if (sigma < SHARPEN_GAUSS_SKIP) {
+        cl_kernel copy_kernel =
+            compiled_kernel_entry(env, def, "rt_sharpen_copy", error);
+        if (copy_kernel == nullptr) {
+            return false;
+        }
+        return set_arg(copy_kernel, 0, sizeof(cl_mem), &src) &&
+               set_arg(copy_kernel, 1, sizeof(cl_mem), &dst) &&
+               set_arg(copy_kernel, 2, sizeof(cl_int), &cl_width) &&
+               set_arg(copy_kernel, 3, sizeof(cl_int), &cl_height) &&
+               set_arg(copy_kernel, 4, sizeof(cl_int), &cl_pitch) &&
+               set_arg(copy_kernel, 5, sizeof(cl_int), &cl_pitch) &&
+               run_2d(copy_kernel);
+    }
+    if (sigma < SHARPEN_FIR_LIMIT) {
+        SharpenFirFactors factors;
+        sharpen_fir_factors(sigma, factors);
+        cl_kernel fir_kernel =
+            compiled_kernel_entry(env, def, "rt_sharpen_fir3", error);
+        if (fir_kernel == nullptr) {
+            return false;
+        }
+        return set_arg(fir_kernel, 0, sizeof(cl_mem), &src) &&
+               set_arg(fir_kernel, 1, sizeof(cl_mem), &dst) &&
+               set_arg(fir_kernel, 2, sizeof(cl_int), &cl_width) &&
+               set_arg(fir_kernel, 3, sizeof(cl_int), &cl_height) &&
+               set_arg(fir_kernel, 4, sizeof(cl_int), &cl_pitch) &&
+               set_arg(fir_kernel, 5, sizeof(cl_int), &cl_pitch) &&
+               set_arg(fir_kernel, 6, sizeof(cl_float), &factors.c0) &&
+               set_arg(fir_kernel, 7, sizeof(cl_float), &factors.c1) &&
+               set_arg(fir_kernel, 8, sizeof(cl_float), &factors.c2) &&
+               set_arg(fir_kernel, 9, sizeof(cl_float), &factors.b0) &&
+               set_arg(fir_kernel, 10, sizeof(cl_float), &factors.b1) &&
+               run_2d(fir_kernel);
+    }
+    cl_kernel iir_kernel =
+        compiled_kernel_entry(env, def, "rt_sharpen_iir_line", error);
+    if (iir_kernel == nullptr) {
+        return false;
+    }
+    SharpenIirFactors factors;
+    sharpen_iir_factors(sigma, factors);
+    return sharpen_iir_plane(env, iir_kernel, src, dst, state, width, height,
+                             pitch, factors, error);
+}
+
 /* buildBlendMask() plus its sigma-2 blur, the first step of both output and
  * local sharpening. `image`, `mask` and `temp` share `pitch`. */
 RtStageStatus sharpen_mask_plane(const std::shared_ptr<OpenCLEnv>& env,
@@ -11905,18 +11985,30 @@ RtStageStatus sharpen_rld_plane(const std::shared_ptr<OpenCLEnv>& env,
                                 int pitch, cl_mem luminance, cl_mem mask,
                                 cl_mem estimate, cl_mem tmp, double radius,
                                 double scale, int iterations, int amount,
-                                std::string& error)
+                                int damping, double blurradius, cl_mem preblur,
+                                cl_mem state, std::string& error)
 {
-    if (amount == 0) {
+    if (amount == 0 && blurradius < SHARPEN_BLUR_RADIUS_LIMIT) {
         return RT_STAGE_OK;
     }
     const double sigma = radius / scale;
+    const bool needdamp = damping > 0;
+    const float damping_scale = static_cast<float>(damping) / 5.0f;
 
     cl_kernel init_kernel =
         compiled_kernel_entry(env, def, "rt_sharpen_rld_init", error);
     cl_kernel final_kernel =
         compiled_kernel_entry(env, def, "rt_sharpen_rld_final", error);
     if (init_kernel == nullptr || final_kernel == nullptr) {
+        return RT_STAGE_FALLBACK;
+    }
+    const bool use_preblur = blurradius >= SHARPEN_BLUR_RADIUS_LIMIT;
+    if (use_preblur && preblur == nullptr) {
+        error = "output.sharpen RLD blur radius has no scratch plane";
+        return RT_STAGE_FALLBACK;
+    }
+    if ((needdamp || use_preblur) && state == nullptr) {
+        error = "output.sharpen RLD has no Gaussian state plane";
         return RT_STAGE_FALLBACK;
     }
 
@@ -12008,7 +12100,34 @@ RtStageStatus sharpen_rld_plane(const std::shared_ptr<OpenCLEnv>& env,
         return RT_STAGE_ERROR;
     }
 
-    if (rld_class != RldClass::Skip) {
+    /* The blur-radius pre-pass: a plain Gaussian, then the mask merge. */
+    if (use_preblur) {
+        if (!sharpen_blur_plane(env, def, estimate, preblur, state, width,
+                                height, pitch, blurradius, error)) {
+            error = "sharpen RLD blur radius failed";
+            return RT_STAGE_ERROR;
+        }
+        cl_kernel blend_kernel = compiled_kernel_entry(
+            env, def, "rt_sharpen_blend_max", error);
+        if (blend_kernel == nullptr) {
+            return RT_STAGE_FALLBACK;
+        }
+        const bool blend_ok =
+            set(blend_kernel, 0, sizeof(cl_mem), &preblur) &&
+            set(blend_kernel, 1, sizeof(cl_mem), &preblur) &&
+            set(blend_kernel, 2, sizeof(cl_mem), &luminance) &&
+            set(blend_kernel, 3, sizeof(cl_mem), &mask) &&
+            set(blend_kernel, 4, sizeof(cl_int), &cl_width) &&
+            set(blend_kernel, 5, sizeof(cl_int), &cl_height) &&
+            set(blend_kernel, 6, sizeof(cl_int), &cl_pitch) &&
+            run_2d(blend_kernel);
+        if (!blend_ok) {
+            error = "sharpen RLD blur merge failed";
+            return RT_STAGE_ERROR;
+        }
+    }
+
+    {
         const auto run_div = [&]() -> bool {
             bool ok =
                 set(div_kernel, 0, sizeof(cl_mem), &estimate) &&
@@ -12104,10 +12223,54 @@ RtStageStatus sharpen_rld_plane(const std::shared_ptr<OpenCLEnv>& env,
             return ok && run_2d(mult_kernel);
         };
 
-        for (int iteration = 0; iteration < iterations; ++iteration) {
-            if (!run_div() || !run_mult()) {
-                error = "sharpen RLD iteration failed";
-                return RT_STAGE_ERROR;
+        if (needdamp) {
+            cl_kernel damp_kernel =
+                compiled_kernel_entry(env, def, "rt_sharpen_damp", error);
+            cl_kernel copy_kernel = nullptr;
+            if (rld_class == RldClass::Skip) {
+                copy_kernel =
+                    compiled_kernel_entry(env, def, "rt_sharpen_copy", error);
+            }
+            if (damp_kernel == nullptr ||
+                (rld_class == RldClass::Skip && copy_kernel == nullptr)) {
+                return RT_STAGE_FALLBACK;
+            }
+            const cl_float damping_fac =
+                -2.0f / (damping_scale * damping_scale);
+            const bool damp_ok =
+                set(damp_kernel, 0, sizeof(cl_mem), &tmp) &&
+                set(damp_kernel, 1, sizeof(cl_mem), &luminance) &&
+                set(damp_kernel, 2, sizeof(cl_int), &cl_width) &&
+                set(damp_kernel, 3, sizeof(cl_int), &cl_height) &&
+                set(damp_kernel, 4, sizeof(cl_int), &cl_pitch) &&
+                set(damp_kernel, 5, sizeof(cl_float), &damping_fac);
+            /* A skipped sigma makes GAUSS_MULT a plain copy, not a product. */
+            const auto multiply = [&]() -> bool {
+                if (rld_class != RldClass::Skip) {
+                    return run_mult();
+                }
+                return set(copy_kernel, 0, sizeof(cl_mem), &tmp) &&
+                       set(copy_kernel, 1, sizeof(cl_mem), &estimate) &&
+                       set(copy_kernel, 2, sizeof(cl_int), &cl_width) &&
+                       set(copy_kernel, 3, sizeof(cl_int), &cl_height) &&
+                       set(copy_kernel, 4, sizeof(cl_int), &cl_pitch) &&
+                       set(copy_kernel, 5, sizeof(cl_int), &cl_pitch) &&
+                       run_2d(copy_kernel);
+            };
+            for (int iteration = 0; iteration < iterations; ++iteration) {
+                if (!sharpen_blur_plane(env, def, estimate, tmp, state,
+                                        width, height, pitch, sigma, error) ||
+                    !damp_ok || !run_2d(damp_kernel) || !multiply()) {
+                    error = "sharpen damped RLD iteration failed";
+                    return RT_STAGE_ERROR;
+                }
+            }
+        } else if (rld_class != RldClass::Skip) {
+            for (int iteration = 0; iteration < iterations; ++iteration) {
+                if (!run_div() || !run_mult()) {
+                    error = "sharpen RLD iteration failed";
+                    return RT_STAGE_ERROR;
+                }
             }
         }
     }
@@ -12125,6 +12288,27 @@ RtStageStatus sharpen_rld_plane(const std::shared_ptr<OpenCLEnv>& env,
     if (!final_ok) {
         error = "sharpen RLD final blend failed";
         return RT_STAGE_ERROR;
+    }
+
+    if (use_preblur) {
+        cl_kernel blend_kernel = compiled_kernel_entry(
+            env, def, "rt_sharpen_blend_max", error);
+        if (blend_kernel == nullptr) {
+            return RT_STAGE_FALLBACK;
+        }
+        const bool blend_ok =
+            set(blend_kernel, 0, sizeof(cl_mem), &luminance) &&
+            set(blend_kernel, 1, sizeof(cl_mem), &preblur) &&
+            set(blend_kernel, 2, sizeof(cl_mem), &luminance) &&
+            set(blend_kernel, 3, sizeof(cl_mem), &mask) &&
+            set(blend_kernel, 4, sizeof(cl_int), &cl_width) &&
+            set(blend_kernel, 5, sizeof(cl_int), &cl_height) &&
+            set(blend_kernel, 6, sizeof(cl_int), &cl_pitch) &&
+            run_2d(blend_kernel);
+        if (!blend_ok) {
+            error = "sharpen RLD blur final merge failed";
+            return RT_STAGE_ERROR;
+        }
     }
     return RT_STAGE_OK;
 }
@@ -12326,23 +12510,17 @@ RtStageStatus run_sharpen(const std::shared_ptr<OpenCLEnv>& env,
 
     const int width = image.width;
     const int height = image.height;
-
+    const bool use_preblur = p.blurradius >= SHARPEN_BLUR_RADIUS_LIMIT;
+    const bool rld = p.method == SHARPEN_METHOD_RLD;
     /*
-     * The CPU deconvolution returns before it clamps L when the amount is zero
-     * and there is no blur-radius pre-pass, so the plane is unchanged. Report
-     * OK without touching it; this is the same no-op on the host.
+     * The RLD recurrence needs a Gaussian state plane for its blur-radius
+     * pre-pass and for the damped forward blur; the USM blur can reuse the
+     * mask temp because the two never overlap in time.
      */
-    if (p.method == SHARPEN_METHOD_RLD && p.deconvamount == 0) {
-        return RT_STAGE_OK;
-    }
+    const bool rld_state = rld && (p.deconvdamping > 0 || use_preblur);
 
     const KernelDef* def = find_kernel("output.sharpen");
     assert(def != nullptr);
-    cl_kernel iir_kernel =
-        compiled_kernel_entry(env, def, "rt_sharpen_iir_line", error);
-    if (iir_kernel == nullptr) {
-        return RT_STAGE_FALLBACK;
-    }
 
     StageDeviceBufferPtr image_device =
         residency->acquire(image.data, {RT_STAGE_F32, width, height, 1}, &error);
@@ -12370,6 +12548,16 @@ RtStageStatus run_sharpen(const std::shared_ptr<OpenCLEnv>& env,
     }
     cl_mem image_memory = device->memory();
 
+    int scratch_count = 3;
+    if (p.edgesonly) {
+        ++scratch_count;
+    }
+    if (use_preblur) {
+        ++scratch_count;
+    }
+    if (rld_state) {
+        ++scratch_count;
+    }
     std::vector<cl_mem> scratch;
     const std::size_t scratch_bytes = device->row_pitch() *
                                       static_cast<std::size_t>(height);
@@ -12380,7 +12568,7 @@ RtStageStatus run_sharpen(const std::shared_ptr<OpenCLEnv>& env,
         scratch.clear();
     };
     const auto create_scratch = [&]() -> bool {
-        for (int i = 0; i < 3; ++i) {
+        for (int i = 0; i < scratch_count; ++i) {
             cl_int scratch_error = CL_SUCCESS;
             cl_mem memory =
                 env->api->CreateBuffer(env->context, CL_MEM_READ_WRITE,
@@ -12397,9 +12585,13 @@ RtStageStatus run_sharpen(const std::shared_ptr<OpenCLEnv>& env,
         error = "output.sharpen device scratch allocation failed";
         return RT_STAGE_FALLBACK;
     }
-    cl_mem mask_memory = scratch[0];
-    cl_mem temp_memory = scratch[1];
-    cl_mem blur_memory = scratch[2];
+    int next_scratch = 0;
+    cl_mem mask_memory = scratch[next_scratch++];
+    cl_mem temp_memory = scratch[next_scratch++];
+    cl_mem blur_memory = scratch[next_scratch++];
+    cl_mem edge_memory = p.edgesonly ? scratch[next_scratch++] : nullptr;
+    cl_mem preblur_memory = use_preblur ? scratch[next_scratch++] : nullptr;
+    cl_mem state_memory = rld_state ? scratch[next_scratch++] : nullptr;
 
     std::lock_guard<std::recursive_mutex> lock(env->queue_mutex);
 
@@ -12441,6 +12633,19 @@ RtStageStatus run_sharpen(const std::shared_ptr<OpenCLEnv>& env,
     const cl_int cl_height = height;
     const cl_int cl_pitch = pitch;
 
+    const auto copy_plane = [&](cl_mem source, cl_mem target) -> bool {
+        cl_kernel copy_kernel =
+            compiled_kernel_entry(env, def, "rt_sharpen_copy", error);
+        return copy_kernel != nullptr &&
+               set_arg(copy_kernel, 0, sizeof(cl_mem), &source) &&
+               set_arg(copy_kernel, 1, sizeof(cl_mem), &target) &&
+               set_arg(copy_kernel, 2, sizeof(cl_int), &cl_width) &&
+               set_arg(copy_kernel, 3, sizeof(cl_int), &cl_height) &&
+               set_arg(copy_kernel, 4, sizeof(cl_int), &cl_pitch) &&
+               set_arg(copy_kernel, 5, sizeof(cl_int), &cl_pitch) &&
+               run_2d(copy_kernel, width, height);
+    };
+
     /* Contrast mask, then its sigma-2 blur (skipped when the mask is flat). */
     const cl_float contrast_threshold =
         static_cast<cl_float>(p.contrast / 100.0);
@@ -12452,50 +12657,12 @@ RtStageStatus run_sharpen(const std::shared_ptr<OpenCLEnv>& env,
         return mask_status;
     }
 
-    const auto run_iir = [&](cl_mem source, cl_mem target, int length,
-                             int src_base_step, int dst_base_step,
-                             int src_stride, int dst_stride, int lines,
-                             const SharpenIirFactors& factors) -> bool {
-        const cl_int cl_length = length;
-        const cl_int cl_src_base_step = src_base_step;
-        const cl_int cl_dst_base_step = dst_base_step;
-        const cl_int cl_src_stride = src_stride;
-        const cl_int cl_dst_stride = dst_stride;
-        cl_float m[9];
-        for (int i = 0; i < 3; ++i) {
-            for (int j = 0; j < 3; ++j) {
-                m[i * 3 + j] = factors.m[i][j];
-            }
-        }
-        const bool ok =
-            set_arg(iir_kernel, 0, sizeof(cl_mem), &source) &&
-            set_arg(iir_kernel, 1, sizeof(cl_mem), &target) &&
-            set_arg(iir_kernel, 2, sizeof(cl_int), &cl_length) &&
-            set_arg(iir_kernel, 3, sizeof(cl_int), &cl_src_base_step) &&
-            set_arg(iir_kernel, 4, sizeof(cl_int), &cl_dst_base_step) &&
-            set_arg(iir_kernel, 5, sizeof(cl_int), &cl_src_stride) &&
-            set_arg(iir_kernel, 6, sizeof(cl_int), &cl_dst_stride) &&
-            set_arg(iir_kernel, 7, sizeof(cl_float), &factors.B) &&
-            set_arg(iir_kernel, 8, sizeof(cl_float), &factors.b1) &&
-            set_arg(iir_kernel, 9, sizeof(cl_float), &factors.b2) &&
-            set_arg(iir_kernel, 10, sizeof(cl_float), &factors.b3);
-        if (!ok) {
-            return false;
-        }
-        for (int i = 0; i < 9; ++i) {
-            if (!set_arg(iir_kernel, static_cast<cl_uint>(11 + i),
-                         sizeof(cl_float), &m[i])) {
-                return false;
-            }
-        }
-        return run_1d(iir_kernel, lines);
-    };
-
-    if (p.method == SHARPEN_METHOD_RLD) {
+    if (rld) {
         const RtStageStatus rld_status = sharpen_rld_plane(
             env, def, width, height, pitch, image_memory, mask_memory,
-            temp_memory, blur_memory, p.deconvradius, p.scale,
-            p.deconviter, p.deconvamount, error);
+            temp_memory, blur_memory, p.deconvradius, p.scale, p.deconviter,
+            p.deconvamount, p.deconvdamping, p.blurradius, preblur_memory,
+            state_memory, error);
         if (rld_status != RT_STAGE_OK) {
             release_scratch();
             return rld_status;
@@ -12510,57 +12677,135 @@ RtStageStatus run_sharpen(const std::shared_ptr<OpenCLEnv>& env,
         return RT_STAGE_OK;
     }
 
+    /* The blur-radius pre-pass, common to both methods' USM arm. */
+    if (use_preblur) {
+        if (!sharpen_blur_plane(env, def, image_memory, preblur_memory,
+                                temp_memory, width, height, pitch,
+                                p.blurradius, error)) {
+            release_scratch();
+            error = "output.sharpen blur radius failed";
+            return RT_STAGE_ERROR;
+        }
+        cl_kernel blend_kernel = compiled_kernel_entry(
+            env, def, "rt_sharpen_blend_max", error);
+        if (blend_kernel == nullptr) {
+            release_scratch();
+            return RT_STAGE_FALLBACK;
+        }
+        const bool blend_ok =
+            set_arg(blend_kernel, 0, sizeof(cl_mem), &preblur_memory) &&
+            set_arg(blend_kernel, 1, sizeof(cl_mem), &preblur_memory) &&
+            set_arg(blend_kernel, 2, sizeof(cl_mem), &image_memory) &&
+            set_arg(blend_kernel, 3, sizeof(cl_mem), &mask_memory) &&
+            set_arg(blend_kernel, 4, sizeof(cl_int), &cl_width) &&
+            set_arg(blend_kernel, 5, sizeof(cl_int), &cl_height) &&
+            set_arg(blend_kernel, 6, sizeof(cl_int), &cl_pitch) &&
+            run_2d(blend_kernel, width, height);
+        if (!blend_ok) {
+            release_scratch();
+            error = "output.sharpen blur radius merge failed";
+            return RT_STAGE_ERROR;
+        }
+    }
+
+    cl_mem base_memory = image_memory;
+    if (p.edgesonly) {
+        const double edge_sigma = p.edges_radius / p.scale;
+        int radius = 0;
+        int scale = 1;
+        const int* weights = nullptr;
+        int count = 0;
+        if (!sharpen_bilateral_grade(edge_sigma, radius, scale, weights,
+                                     count)) {
+            release_scratch();
+            error = "output.sharpen unsupported edge radius";
+            return RT_STAGE_FALLBACK;
+        }
+        if (radius == 0) {
+            if (!copy_plane(image_memory, edge_memory)) {
+                release_scratch();
+                error = "output.sharpen edge copy failed";
+                return RT_STAGE_ERROR;
+            }
+        } else {
+            cl_kernel lut_kernel = compiled_kernel_entry(
+                env, def, "rt_sharpen_bilateral_lut", error);
+            cl_kernel bilateral_kernel = compiled_kernel_entry(
+                env, def, "rt_sharpen_bilateral", error);
+            if (lut_kernel == nullptr || bilateral_kernel == nullptr) {
+                release_scratch();
+                return RT_STAGE_FALLBACK;
+            }
+            cl_int lut_error = CL_SUCCESS;
+            const std::size_t lut_bytes =
+                SHARPEN_BILATERAL_LUT_ENTRIES * sizeof(cl_float);
+            cl_mem lut_memory = env->api->CreateBuffer(
+                env->context, CL_MEM_READ_WRITE, lut_bytes, nullptr,
+                &lut_error);
+            cl_mem weight_memory = nullptr;
+            if (lut_memory != nullptr) {
+                weight_memory = env->api->CreateBuffer(
+                    env->context,
+                    CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                    static_cast<std::size_t>(count) * sizeof(cl_int),
+                    const_cast<int*>(weights), &lut_error);
+            }
+            if (lut_memory == nullptr || weight_memory == nullptr) {
+                if (lut_memory != nullptr) {
+                    env->api->ReleaseMemObject(lut_memory);
+                }
+                if (weight_memory != nullptr) {
+                    env->api->ReleaseMemObject(weight_memory);
+                }
+                release_scratch();
+                error = "output.sharpen edge scratch allocation failed";
+                return RT_STAGE_FALLBACK;
+            }
+            const cl_int entries = SHARPEN_BILATERAL_LUT_ENTRIES;
+            const cl_int centre = SHARPEN_BILATERAL_LUT_CENTRE;
+            const cl_float sens = static_cast<cl_float>(p.edges_tolerance);
+            const cl_float table_scale = static_cast<cl_float>(scale);
+            const cl_int cl_radius = radius;
+            const bool lut_ok =
+                set_arg(lut_kernel, 0, sizeof(cl_mem), &lut_memory) &&
+                set_arg(lut_kernel, 1, sizeof(cl_int), &entries) &&
+                set_arg(lut_kernel, 2, sizeof(cl_int), &centre) &&
+                set_arg(lut_kernel, 3, sizeof(cl_float), &sens) &&
+                set_arg(lut_kernel, 4, sizeof(cl_float), &table_scale) &&
+                run_1d(lut_kernel, SHARPEN_BILATERAL_LUT_ENTRIES);
+            const bool bilateral_ok =
+                lut_ok &&
+                set_arg(bilateral_kernel, 0, sizeof(cl_mem), &image_memory) &&
+                set_arg(bilateral_kernel, 1, sizeof(cl_mem), &edge_memory) &&
+                set_arg(bilateral_kernel, 2, sizeof(cl_mem), &lut_memory) &&
+                set_arg(bilateral_kernel, 3, sizeof(cl_mem), &weight_memory) &&
+                set_arg(bilateral_kernel, 4, sizeof(cl_int), &cl_width) &&
+                set_arg(bilateral_kernel, 5, sizeof(cl_int), &cl_height) &&
+                set_arg(bilateral_kernel, 6, sizeof(cl_int), &cl_pitch) &&
+                set_arg(bilateral_kernel, 7, sizeof(cl_int), &cl_radius) &&
+                set_arg(bilateral_kernel, 8, sizeof(cl_int), &centre) &&
+                set_arg(bilateral_kernel, 9, sizeof(cl_int), &entries) &&
+                run_2d(bilateral_kernel, width, height);
+            env->api->ReleaseMemObject(lut_memory);
+            env->api->ReleaseMemObject(weight_memory);
+            if (!bilateral_ok) {
+                release_scratch();
+                error = "output.sharpen edge filter failed";
+                return RT_STAGE_ERROR;
+            }
+        }
+        base_memory = edge_memory;
+    }
+
+    /* Main USM blur, from the edge-limited base when edges only is on. */
     const double sigma = p.radius / p.scale;
-    cl_kernel fir_kernel =
-        compiled_kernel_entry(env, def, "rt_sharpen_fir3", error);
-    cl_kernel apply_kernel =
-        compiled_kernel_entry(env, def, "rt_sharpen_apply", error);
-    if (fir_kernel == nullptr || apply_kernel == nullptr) {
+    if (!sharpen_blur_plane(env, def, base_memory, blur_memory, temp_memory,
+                            width, height, pitch, sigma, error)) {
         release_scratch();
-        return RT_STAGE_FALLBACK;
+        error = "output.sharpen blur failed";
+        return RT_STAGE_ERROR;
     }
 
-    /* Main USM blur. */
-    int use_blur = 1;
-    if (sigma < SHARPEN_GAUSS_SKIP) {
-        use_blur = 0;
-    } else if (sigma < SHARPEN_FIR_LIMIT) {
-        SharpenFirFactors factors;
-        sharpen_fir_factors(sigma, factors);
-        const cl_int src_pitch = pitch;
-        const cl_int dst_pitch = pitch;
-        const bool ok =
-            set_arg(fir_kernel, 0, sizeof(cl_mem), &image_memory) &&
-            set_arg(fir_kernel, 1, sizeof(cl_mem), &blur_memory) &&
-            set_arg(fir_kernel, 2, sizeof(cl_int), &cl_width) &&
-            set_arg(fir_kernel, 3, sizeof(cl_int), &cl_height) &&
-            set_arg(fir_kernel, 4, sizeof(cl_int), &src_pitch) &&
-            set_arg(fir_kernel, 5, sizeof(cl_int), &dst_pitch) &&
-            set_arg(fir_kernel, 6, sizeof(cl_float), &factors.c0) &&
-            set_arg(fir_kernel, 7, sizeof(cl_float), &factors.c1) &&
-            set_arg(fir_kernel, 8, sizeof(cl_float), &factors.c2) &&
-            set_arg(fir_kernel, 9, sizeof(cl_float), &factors.b0) &&
-            set_arg(fir_kernel, 10, sizeof(cl_float), &factors.b1) &&
-            run_2d(fir_kernel, width, height);
-        if (!ok) {
-            release_scratch();
-            error = "output.sharpen FIR blur failed";
-            return RT_STAGE_ERROR;
-        }
-    } else {
-        SharpenIirFactors factors;
-        sharpen_iir_factors(sigma, factors);
-        if (!run_iir(image_memory, temp_memory, width, pitch, pitch, 1, 1,
-                     height, factors) ||
-            !run_iir(temp_memory, blur_memory, height, 1, 1, pitch, pitch,
-                     width, factors)) {
-            release_scratch();
-            error = "output.sharpen IIR blur failed";
-            return RT_STAGE_ERROR;
-        }
-    }
-
-    const cl_int use_blur_flag = use_blur;
     const cl_int cl_amount = p.amount;
     const cl_int cl_bl = p.threshold_bottom_left;
     const cl_int cl_tl = p.threshold_top_left;
@@ -12568,26 +12813,106 @@ RtStageStatus run_sharpen(const std::shared_ptr<OpenCLEnv>& env,
     const cl_int cl_tr = p.threshold_top_right;
     const cl_int cl_is_double = p.threshold_is_double ? 1 : 0;
     const cl_int cl_start_at_one = p.threshold_start_at_one ? 1 : 0;
-    const bool apply_ok =
-        set_arg(apply_kernel, 0, sizeof(cl_mem), &image_memory) &&
-        set_arg(apply_kernel, 1, sizeof(cl_mem), &blur_memory) &&
-        set_arg(apply_kernel, 2, sizeof(cl_mem), &mask_memory) &&
-        set_arg(apply_kernel, 3, sizeof(cl_int), &cl_width) &&
-        set_arg(apply_kernel, 4, sizeof(cl_int), &cl_height) &&
-        set_arg(apply_kernel, 5, sizeof(cl_int), &cl_pitch) &&
-        set_arg(apply_kernel, 6, sizeof(cl_int), &use_blur_flag) &&
-        set_arg(apply_kernel, 7, sizeof(cl_int), &cl_amount) &&
-        set_arg(apply_kernel, 8, sizeof(cl_int), &cl_bl) &&
-        set_arg(apply_kernel, 9, sizeof(cl_int), &cl_tl) &&
-        set_arg(apply_kernel, 10, sizeof(cl_int), &cl_br) &&
-        set_arg(apply_kernel, 11, sizeof(cl_int), &cl_tr) &&
-        set_arg(apply_kernel, 12, sizeof(cl_int), &cl_is_double) &&
-        set_arg(apply_kernel, 13, sizeof(cl_int), &cl_start_at_one) &&
-        run_2d(apply_kernel, width, height);
-    if (!apply_ok) {
-        release_scratch();
-        error = "output.sharpen apply failed";
-        return RT_STAGE_ERROR;
+
+    if (!p.halocontrol) {
+        cl_kernel apply_kernel =
+            compiled_kernel_entry(env, def, "rt_sharpen_apply", error);
+        if (apply_kernel == nullptr) {
+            release_scratch();
+            return RT_STAGE_FALLBACK;
+        }
+        const cl_int use_blur_flag = 1;
+        const bool apply_ok =
+            set_arg(apply_kernel, 0, sizeof(cl_mem), &image_memory) &&
+            set_arg(apply_kernel, 1, sizeof(cl_mem), &base_memory) &&
+            set_arg(apply_kernel, 2, sizeof(cl_mem), &blur_memory) &&
+            set_arg(apply_kernel, 3, sizeof(cl_mem), &mask_memory) &&
+            set_arg(apply_kernel, 4, sizeof(cl_int), &cl_width) &&
+            set_arg(apply_kernel, 5, sizeof(cl_int), &cl_height) &&
+            set_arg(apply_kernel, 6, sizeof(cl_int), &cl_pitch) &&
+            set_arg(apply_kernel, 7, sizeof(cl_int), &use_blur_flag) &&
+            set_arg(apply_kernel, 8, sizeof(cl_int), &cl_amount) &&
+            set_arg(apply_kernel, 9, sizeof(cl_int), &cl_bl) &&
+            set_arg(apply_kernel, 10, sizeof(cl_int), &cl_tl) &&
+            set_arg(apply_kernel, 11, sizeof(cl_int), &cl_br) &&
+            set_arg(apply_kernel, 12, sizeof(cl_int), &cl_tr) &&
+            set_arg(apply_kernel, 13, sizeof(cl_int), &cl_is_double) &&
+            set_arg(apply_kernel, 14, sizeof(cl_int), &cl_start_at_one) &&
+            run_2d(apply_kernel, width, height);
+        if (!apply_ok) {
+            release_scratch();
+            error = "output.sharpen apply failed";
+            return RT_STAGE_ERROR;
+        }
+    } else {
+        /*
+         * sharpenHaloCtrl() reads the plane it writes, so the non-edge arm
+         * needs the deep copy the host makes; the edge arm already has its
+         * own base plane.
+         */
+        cl_mem halo_base = base_memory;
+        if (!p.edgesonly) {
+            if (!copy_plane(image_memory, temp_memory)) {
+                release_scratch();
+                error = "output.sharpen halo copy failed";
+                return RT_STAGE_ERROR;
+            }
+            halo_base = temp_memory;
+        }
+        cl_kernel halo_kernel =
+            compiled_kernel_entry(env, def, "rt_sharpen_halo", error);
+        if (halo_kernel == nullptr) {
+            release_scratch();
+            return RT_STAGE_FALLBACK;
+        }
+        const cl_float halo_scale =
+            static_cast<cl_float>((100 - p.halocontrol_amount) * 0.01);
+        const cl_float sharp_fac = static_cast<cl_float>(p.amount * 0.01f);
+        const bool halo_ok =
+            set_arg(halo_kernel, 0, sizeof(cl_mem), &image_memory) &&
+            set_arg(halo_kernel, 1, sizeof(cl_mem), &blur_memory) &&
+            set_arg(halo_kernel, 2, sizeof(cl_mem), &halo_base) &&
+            set_arg(halo_kernel, 3, sizeof(cl_mem), &mask_memory) &&
+            set_arg(halo_kernel, 4, sizeof(cl_int), &cl_width) &&
+            set_arg(halo_kernel, 5, sizeof(cl_int), &cl_height) &&
+            set_arg(halo_kernel, 6, sizeof(cl_int), &cl_pitch) &&
+            set_arg(halo_kernel, 7, sizeof(cl_float), &halo_scale) &&
+            set_arg(halo_kernel, 8, sizeof(cl_float), &sharp_fac) &&
+            set_arg(halo_kernel, 9, sizeof(cl_int), &cl_bl) &&
+            set_arg(halo_kernel, 10, sizeof(cl_int), &cl_tl) &&
+            set_arg(halo_kernel, 11, sizeof(cl_int), &cl_br) &&
+            set_arg(halo_kernel, 12, sizeof(cl_int), &cl_tr) &&
+            set_arg(halo_kernel, 13, sizeof(cl_int), &cl_is_double) &&
+            set_arg(halo_kernel, 14, sizeof(cl_int), &cl_start_at_one) &&
+            run_1d(halo_kernel, height);
+        if (!halo_ok) {
+            release_scratch();
+            error = "output.sharpen halo control failed";
+            return RT_STAGE_ERROR;
+        }
+    }
+
+    if (use_preblur) {
+        cl_kernel blend_kernel = compiled_kernel_entry(
+            env, def, "rt_sharpen_blend_max", error);
+        if (blend_kernel == nullptr) {
+            release_scratch();
+            return RT_STAGE_FALLBACK;
+        }
+        const bool blend_ok =
+            set_arg(blend_kernel, 0, sizeof(cl_mem), &image_memory) &&
+            set_arg(blend_kernel, 1, sizeof(cl_mem), &preblur_memory) &&
+            set_arg(blend_kernel, 2, sizeof(cl_mem), &image_memory) &&
+            set_arg(blend_kernel, 3, sizeof(cl_mem), &mask_memory) &&
+            set_arg(blend_kernel, 4, sizeof(cl_int), &cl_width) &&
+            set_arg(blend_kernel, 5, sizeof(cl_int), &cl_height) &&
+            set_arg(blend_kernel, 6, sizeof(cl_int), &cl_pitch) &&
+            run_2d(blend_kernel, width, height);
+        if (!blend_ok) {
+            release_scratch();
+            error = "output.sharpen blur final merge failed";
+            return RT_STAGE_ERROR;
+        }
     }
 
     const RtStageStatus readback = residency->readback(image_device, image);
@@ -12600,16 +12925,6 @@ RtStageStatus run_sharpen(const std::shared_ptr<OpenCLEnv>& env,
     return RT_STAGE_OK;
 }
 
-/*
- * The lab.sharpening node: impulse denoise, defringe, ML sharpen edges and ML
- * microcontrast, in the block's order. Arguments are documented in
- * stage/lab_sharpening_context.h; the kernels in lab_sharpening_cl.h.
- *
- * The block is atomic: a configuration outside any enabled tool's device set
- * is refused before the first upload, so the host builtin produces the CPU
- * result for the whole block and no plane is ever half device and half host.
- * The three planes are read back together, only after every kernel succeeded.
- */
 RtStageStatus run_lab_sharpening(const std::shared_ptr<OpenCLEnv>& env,
                                  const std::shared_ptr<OpenCLResidency>& residency,
                                  const std::vector<RtStageArg>& args,
@@ -19342,7 +19657,7 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
                                   rec[RT_LOCAL_ADJUSTMENTS_SLOT_SHAR_ITER]),
                               static_cast<int>(
                                   rec[RT_LOCAL_ADJUSTMENTS_SLOT_SHAR_AMOUNT]),
-                              error);
+                              0, 0.0, nullptr, nullptr, error);
                 if (rld_status != RT_STAGE_OK) {
                     return RT_STAGE_FALLBACK;
                 }

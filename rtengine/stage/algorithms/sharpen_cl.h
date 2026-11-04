@@ -21,6 +21,7 @@
 #include "procparams.h"
 #include "stage/stage_abi.h"
 
+#include <cassert>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -268,8 +269,14 @@ float rt_sharpen_threshold(const float x,
     return 0.0f;
 }
 
-/* Threshold, delta and the intp(a, b, c) = a * (b - c) + c blend, in place. */
+/*
+ * Threshold, delta and the intp(a, b, c) = a * (b - c) + c blend, in place.
+ * `base` is the plane the difference is taken from: the luminance plane, or
+ * the edge-limited plane when edges only is on. The result always replaces
+ * the luminance plane.
+ */
 __kernel void rt_sharpen_apply(__global float* luminance,
+                               __global const float* base_plane,
                                __global const float* blur,
                                __global const float* mask,
                                const int width,
@@ -290,7 +297,8 @@ __kernel void rt_sharpen_apply(__global float* luminance,
         return;
     }
     const int index = y * pitch + x;
-    const float base = luminance[index];
+    const float base = base_plane[index];
+    const float current = luminance[index];
     const float diff = use_blur != 0 ? base - blur[index] : 0.0f;
     const float y_max = (float)amount * diff * 0.01f;
     const float magnitude = fabs(diff) < RT_SHARPEN_THRESHOLD_UPPER_BOUND
@@ -298,8 +306,8 @@ __kernel void rt_sharpen_apply(__global float* luminance,
                                 : RT_SHARPEN_THRESHOLD_UPPER_BOUND;
     const float delta = rt_sharpen_threshold(magnitude, y_max, bl, tl, br, tr,
                                              is_double, start_at_one);
-    const float updated = base + delta;
-    luminance[index] = mask[index] * (updated - base) + base;
+    const float updated = current + delta;
+    luminance[index] = mask[index] * (updated - current) + current;
 }
 
 /* Richardson-Lucy initialisation: clamp L and seed the running estimate. */
@@ -587,6 +595,301 @@ __kernel void rt_sharpen_rld_final(__global float* luminance,
     const float blend = mask[index] * amount;
     luminance[index] = blend * (positive - current) + current;
 }
+
+/* A plane copy, used where gaussianBlur() skips below GAUSS_SKIP. */
+__kernel void rt_sharpen_copy(__global const float* src,
+                              __global float* dst,
+                              const int width,
+                              const int height,
+                              const int src_pitch,
+                              const int dst_pitch)
+{
+    const int x = (int)get_global_id(0);
+    const int y = (int)get_global_id(1);
+    if (x >= width || y >= height) {
+        return;
+    }
+    dst[y * dst_pitch + x] = src[y * src_pitch + x];
+}
+
+/*
+ * The blur-radius merge of both arms:
+ *   intp(blend, luminance, max(clamped, 0))
+ * with `out` and `luminance` possibly the same plane.
+ */
+__kernel void rt_sharpen_blend_max(__global float* out,
+                                   __global const float* clamped,
+                                   __global const float* luminance,
+                                   __global const float* mask,
+                                   const int width,
+                                   const int height,
+                                   const int pitch)
+{
+    const int x = (int)get_global_id(0);
+    const int y = (int)get_global_id(1);
+    if (x >= width || y >= height) {
+        return;
+    }
+    const int index = y * pitch + x;
+    const float value = clamped[index] < 0.0f ? 0.0f : clamped[index];
+    const float base = luminance[index];
+    out[index] = mask[index] * (base - value) + value;
+}
+
+/* sleef.h ilogbp1f(), the xlogf() exponent probe. */
+inline int rt_sharpen_ilogbp1f(float d)
+{
+    const int m = d < 5.421010862427522E-20f;
+    d = m ? 1.8446744073709552E19f * d : d;
+    int q = (as_int(d) >> 23) & 0xff;
+    q = m ? q - (64 + 0x7e) : q - 0x7e;
+    return q;
+}
+
+/* sleef.h ldexpkf(). */
+inline float rt_sharpen_ldexpkf(float x, int q)
+{
+    int m = q >> 31;
+    m = (((m + q) >> 6) - m) << 4;
+    q = q - (m << 2);
+    float u = as_float(((int)(m + 0x7f)) << 23);
+    u = u * u;
+    x = x * u * u;
+    u = as_float(((int)(q + 0x7f)) << 23);
+    return x * u;
+}
+
+/* sleef.h xlogf(), the logarithm dcdamping() uses on both CPU arms. */
+inline float rt_sharpen_xlogf(float d)
+{
+    const int e = rt_sharpen_ilogbp1f(d * 0.7071f);
+    const float m = rt_sharpen_ldexpkf(d, -e);
+    float x = (m - 1.0f) / (m + 1.0f);
+    const float x2 = x * x;
+
+    float t = 0.2371599674224853515625f;
+    t = t * x2 + 0.285279005765914916992188f;
+    t = t * x2 + 0.400005519390106201171875f;
+    t = t * x2 + 0.666666567325592041015625f;
+    t = t * x2 + 2.0f;
+
+    x = x * t + 0.693147180559945286226764f * (float)e;
+    if (isinf(d) && d > 0.0f) {
+        x = INFINITY;
+    }
+    if (d < 0.0f) {
+        x = NAN;
+    }
+    if (d == 0.0f) {
+        x = -INFINITY;
+    }
+    return x;
+}
+
+/*
+ * dcdamping() of the deconvolution, including its SIMD/scalar split: the
+ * vector arm covers the columns below `width - width % 4` and groups the
+ * polynomial and the log sum differently from the scalar tail.
+ */
+__kernel void rt_sharpen_damp(__global float* value,
+                              __global const float* luminance,
+                              const int width,
+                              const int height,
+                              const int pitch,
+                              const float damping_fac)
+{
+    const int x = (int)get_global_id(0);
+    const int y = (int)get_global_id(1);
+    if (x >= width || y >= height) {
+        return;
+    }
+    const int index = y * pitch + x;
+    const float image = value[index];
+    const float original = luminance[index];
+    if (image <= 0.0f || original <= 0.0f) {
+        value[index] = 0.0f;
+        return;
+    }
+    const float w = original - image;
+    const float log_ratio = rt_sharpen_xlogf(image / original);
+    float u;
+    if (x < width - (width % 4)) {
+        u = (original * log_ratio + w) * damping_fac;
+        u = u < 1.0f ? u : 1.0f;
+        const float u2 = u * u;
+        const float u4 = u2 * u2;
+        u = u4 * (5.0f - u * 4.0f);
+    } else {
+        u = (original * log_ratio - image + original) * damping_fac;
+        u = u < 1.0f ? u : 1.0f;
+        u = u * u * u * u * (5.0f - u * 4.0f);
+    }
+    value[index] = (w / image) * u + 1.0f;
+}
+
+/*
+ * sharpenHaloCtrl(): one work item per interior row, because the sliding
+ * three-row maximum and minimum carry across the row.
+ */
+__kernel void rt_sharpen_halo(__global float* luminance,
+                              __global const float* blur,
+                              __global const float* base,
+                              __global const float* mask,
+                              const int width,
+                              const int height,
+                              const int pitch,
+                              const float scale,
+                              const float sharp_fac,
+                              const int bl,
+                              const int tl,
+                              const int br,
+                              const int tr,
+                              const int is_double,
+                              const int start_at_one)
+{
+    const int i = (int)get_global_id(0);
+    if (i < 2 || i >= height - 2) {
+        return;
+    }
+    float max1 = 0.0f;
+    float max2 = 0.0f;
+    float min1 = 0.0f;
+    float min2 = 0.0f;
+    for (int j = 2; j < width - 2; ++j) {
+        const int a = (i - 2) * pitch + j;
+        const int b = (i - 1) * pitch + j;
+        const int c = i * pitch + j;
+        const int d = (i + 1) * pitch + j;
+        const int e = (i + 2) * pitch + j;
+        const float np1 =
+            2.0f * (base[a] + base[a + 1] + base[a + 2] +
+                    base[b] + base[b + 1] + base[b + 2] +
+                    base[c] + base[c + 1] + base[c + 2]) / 27.0f +
+            base[b + 1] / 3.0f;
+        const float np2 =
+            2.0f * (base[b] + base[b + 1] + base[b + 2] +
+                    base[c] + base[c + 1] + base[c + 2] +
+                    base[d] + base[d + 1] + base[d + 2]) / 27.0f +
+            base[c + 1] / 3.0f;
+        const float np3 =
+            2.0f * (base[c] + base[c + 1] + base[c + 2] +
+                    base[d] + base[d + 1] + base[d + 2] +
+                    base[e] + base[e + 1] + base[e + 2]) / 27.0f +
+            base[d + 1] / 3.0f;
+
+        const float maxn = np1 < np2 ? (np2 < np3 ? np3 : np2)
+                                     : (np1 < np3 ? np3 : np1);
+        const float minn = np1 < np2 ? (np1 < np3 ? np1 : np3)
+                                     : (np2 < np3 ? np2 : np3);
+        float max_all = max1 < max2 ? max2 : max1;
+        max_all = max_all < maxn ? maxn : max_all;
+        float min_all = min1 < min2 ? min1 : min2;
+        min_all = min_all < minn ? min_all : minn;
+
+        max1 = max2;
+        max2 = maxn;
+        min1 = min2;
+        min2 = minn;
+
+        const float current = luminance[c];
+        if (max_all < current) {
+            max_all = current;
+        }
+        if (min_all > current) {
+            min_all = current;
+        }
+
+        const float diff = base[c] - blur[c];
+        const float magnitude = fabs(diff) < RT_SHARPEN_THRESHOLD_UPPER_BOUND
+                                    ? fabs(diff)
+                                    : RT_SHARPEN_THRESHOLD_UPPER_BOUND;
+        const float delta = rt_sharpen_threshold(
+            magnitude, sharp_fac * diff, bl, tl, br, tr, is_double,
+            start_at_one);
+        float new_l = current + delta;
+
+        if (new_l > max_all) {
+            new_l = max_all + (new_l - max_all) * scale;
+        } else if (new_l < min_all) {
+            new_l = min_all - (min_all - new_l) * scale;
+        }
+        luminance[c] = mask[c] * (new_l - current) + current;
+    }
+}
+
+/* bilateral2.h's exponential table, built once per edges-only pass. */
+__kernel void rt_sharpen_bilateral_lut(__global float* lut,
+                                       const int entries,
+                                       const int centre,
+                                       const float sens,
+                                       const float scale)
+{
+    const int i = (int)get_global_id(0);
+    if (i >= entries) {
+        return;
+    }
+    const int offset = i - centre;
+#ifdef cl_khr_fp64
+    const double exponent =
+        -((double)offset * (double)offset) /
+        (2.0 * (double)sens * (double)sens);
+    lut[i] = (float)(exp(exponent) * (double)scale);
+#else
+    const float exponent =
+        -((float)offset * (float)offset) / (2.0f * sens * sens);
+    lut[i] = exp(exponent) * scale;
+#endif
+}
+
+/*
+ * bilateral2.h's filter: `weights` holds the upper triangle of the symmetric
+ * kernel, rows and columns ordered from the outermost offset inwards.
+ */
+__kernel void rt_sharpen_bilateral(__global const float* src,
+                                   __global float* dst,
+                                   __global const float* lut,
+                                   __global const int* weights,
+                                   const int width,
+                                   const int height,
+                                   const int pitch,
+                                   const int radius,
+                                   const int centre,
+                                   const int entries)
+{
+    const int x = (int)get_global_id(0);
+    const int y = (int)get_global_id(1);
+    if (x >= width || y >= height) {
+        return;
+    }
+    const int index = y * pitch + x;
+    if (x < radius || x >= width - radius || y < radius ||
+        y >= height - radius) {
+        dst[index] = src[index];
+        return;
+    }
+    const float self = src[index];
+    float numerator = 0.0f;
+    float denominator = 0.0f;
+    for (int di = -radius; di <= radius; ++di) {
+        const int row = radius - (di < 0 ? -di : di);
+        for (int dj = -radius; dj <= radius; ++dj) {
+            const int column = radius - (dj < 0 ? -dj : dj);
+            const float weight = (float)weights[row * (radius + 1) + column];
+            const float other = src[index + di * pitch + dj];
+            const float probe = other - self + (float)centre;
+            int lookup = (int)probe;
+            if (probe < 0.0f) {
+                lookup = 0;
+            } else if (probe > (float)(entries - 1)) {
+                lookup = entries - 1;
+            }
+            const float factor = lut[lookup];
+            numerator += weight * (other * factor);
+            denominator += weight * factor;
+        }
+    }
+    dst[index] = numerator / denominator;
+}
 )CLC";
 
 /*
@@ -703,6 +1006,12 @@ constexpr double SHARPEN_MASK_GRADIENT_SCALE = 0.0625 / 327.68;
 constexpr double SHARPEN_5X5_LIMIT = 0.84;
 constexpr double SHARPEN_7X7_LIMIT = 1.15;
 constexpr int SHARPEN_DECONV_ITERATION_LIMIT = 1000;
+/* bilateral2.h's range-weight table and its sigma buckets. */
+constexpr int SHARPEN_BILATERAL_LUT_ENTRIES = 0x20000;
+constexpr int SHARPEN_BILATERAL_LUT_CENTRE = 0x10000;
+/* Below this sigma the host copies the plane instead of filtering it. */
+constexpr double SHARPEN_BILATERAL_COPY_SIGMA = 0.45;
+constexpr int SHARPEN_BILATERAL_MAX_WEIGHTS = 36;
 
 /*
  * Coefficients of the 1-D Young-van Vliet recurrence, computed in double on
@@ -881,31 +1190,243 @@ inline void sharpen_kernel7(double sigma_value, SharpenKernel7& out)
 }
 
 /*
- * The device accepts the USM path and the undamped RLD path with the kernels
- * this launcher implements. Everything else returns false with a reason, so
- * the host builtin runs and the record says host.
+ * bilateral2.h's per-sigma kernel coefficients, in its bucket order. Each row
+ * lists the upper sigma bound, the support radius, the table scale, the
+ * upper-triangle weights and their count. The final bucket has no upper bound.
+ */
+struct SharpenBilateralGrade {
+    double upper;
+    int radius;
+    int scale;
+    const int* weights;
+    int count;
+};
+
+inline const int* sharpen_bilateral_05()
+{
+    static const int w[] = {1, 7, 7, 55};
+    return w;
+}
+
+inline const int* sharpen_bilateral_06()
+{
+    static const int w[] = {1, 4, 4, 16};
+    return w;
+}
+
+inline const int* sharpen_bilateral_07()
+{
+    static const int w[] = {0, 0, 1, 0, 8, 21, 1, 21, 59};
+    return w;
+}
+
+inline const int* sharpen_bilateral_08()
+{
+    static const int w[] = {0, 0, 1, 0, 5, 10, 1, 10, 23};
+    return w;
+}
+
+inline const int* sharpen_bilateral_09()
+{
+    static const int w[] = {0, 1, 2, 1, 6, 12, 2, 12, 22};
+    return w;
+}
+
+inline const int* sharpen_bilateral_10()
+{
+    static const int w[] = {0, 1, 2, 1, 4, 7, 2, 7, 12};
+    return w;
+}
+
+inline const int* sharpen_bilateral_11()
+{
+    static const int w[] = {0, 0, 1, 1, 0, 2, 5, 8,
+                            1, 5, 18, 27, 1, 8, 27, 41};
+    return w;
+}
+
+inline const int* sharpen_bilateral_12()
+{
+    static const int w[] = {0, 0, 1, 1, 0, 1, 4, 6,
+                            1, 4, 11, 16, 1, 6, 16, 23};
+    return w;
+}
+
+inline const int* sharpen_bilateral_13()
+{
+    static const int w[] = {0, 0, 1, 1, 0, 2, 4, 6,
+                            1, 4, 11, 14, 1, 6, 14, 19};
+    return w;
+}
+
+inline const int* sharpen_bilateral_14()
+{
+    static const int w[] = {0, 1, 2, 3, 1, 4, 8, 10,
+                            2, 8, 17, 21, 3, 10, 21, 28};
+    return w;
+}
+
+inline const int* sharpen_bilateral_15()
+{
+    static const int w[] = {0, 0, 0, 1, 1, 0, 1, 2, 4, 5, 0, 2, 6,
+                            12, 14, 1, 4, 12, 22, 28, 1, 5, 14, 28, 35};
+    return w;
+}
+
+inline const int* sharpen_bilateral_16()
+{
+    static const int w[] = {0, 0, 0, 1, 1, 0, 1, 2, 3, 4, 0, 2, 5,
+                            9, 10, 1, 3, 9, 15, 19, 1, 4, 10, 19, 23};
+    return w;
+}
+
+inline const int* sharpen_bilateral_17()
+{
+    static const int w[] = {0, 0, 1, 1, 1, 0, 1, 2, 3, 4, 1, 2, 5,
+                            8, 9, 1, 3, 8, 13, 16, 1, 4, 9, 16, 19};
+    return w;
+}
+
+inline const int* sharpen_bilateral_18()
+{
+    static const int w[] = {0, 0, 1, 2, 2, 0, 1, 3, 5, 5, 1, 3, 6,
+                            10, 12, 2, 5, 10, 16, 19, 2, 5, 12, 19, 22};
+    return w;
+}
+
+inline const int* sharpen_bilateral_19()
+{
+    static const int w[] = {0, 0, 1, 2, 2, 0, 1, 3, 4, 5, 1, 3, 5,
+                            8, 9, 2, 4, 8, 12, 14, 2, 5, 9, 14, 16};
+    return w;
+}
+
+inline const int* sharpen_bilateral_20()
+{
+    static const int w[] = {0, 0, 0, 1, 1, 1, 0, 0, 1, 2, 3, 3, 0, 1, 2, 4,
+                            7, 7, 1, 2, 4, 8, 12, 14, 1, 3, 7, 12, 18, 20,
+                            1, 3, 7, 14, 20, 23};
+    return w;
+}
+
+inline const int* sharpen_bilateral_21()
+{
+    static const int w[] = {0, 0, 0, 1, 1, 1, 0, 0, 1, 2, 3, 3, 0, 1, 2, 4,
+                            6, 7, 1, 2, 4, 8, 11, 12, 1, 3, 6, 11, 15, 17,
+                            1, 3, 7, 12, 17, 19};
+    return w;
+}
+
+inline const int* sharpen_bilateral_22()
+{
+    static const int w[] = {0, 0, 0, 1, 1, 2, 0, 1, 2, 3, 3, 4, 1, 2, 3, 5,
+                            7, 8, 1, 3, 5, 9, 12, 13, 1, 3, 7, 12, 16, 18,
+                            2, 4, 8, 13, 18, 20};
+    return w;
+}
+
+inline const int* sharpen_bilateral_23()
+{
+    static const int w[] = {0, 0, 1, 1, 1, 1, 0, 1, 1, 2, 3, 3, 1, 1, 3, 5,
+                            6, 7, 1, 2, 5, 7, 10, 11, 1, 3, 6, 10, 13, 14,
+                            1, 3, 7, 11, 14, 16};
+    return w;
+}
+
+inline const int* sharpen_bilateral_24()
+{
+    static const int w[] = {0, 0, 1, 1, 1, 1, 0, 1, 1, 2, 3, 3, 1, 1, 3, 4,
+                            5, 6, 1, 2, 4, 6, 8, 9, 1, 3, 5, 8, 10, 11,
+                            1, 3, 6, 9, 11, 12};
+    return w;
+}
+
+inline const int* sharpen_bilateral_25()
+{
+    static const int w[] = {0, 0, 1, 1, 1, 1, 0, 1, 1, 2, 3, 3, 1, 1, 2, 4,
+                            5, 5, 1, 2, 4, 5, 7, 7, 1, 3, 5, 7, 9, 9,
+                            1, 3, 5, 7, 9, 10};
+    return w;
+}
+
+/*
+ * Select bilateral2.h's bucket for `sigma`. A radius of zero means the host
+ * copies the plane; false means the request cannot be reproduced.
+ */
+inline bool sharpen_bilateral_grade(double sigma, int& radius, int& scale,
+                                    const int*& weights, int& count)
+{
+    static const SharpenBilateralGrade grades[] = {
+        {0.55, 1, 318, sharpen_bilateral_05(), 4},
+        {0.65, 1, 768, sharpen_bilateral_06(), 4},
+        {0.75, 2, 366, sharpen_bilateral_07(), 9},
+        {0.85, 2, 753, sharpen_bilateral_08(), 9},
+        {0.95, 2, 595, sharpen_bilateral_09(), 9},
+        {1.05, 2, 910, sharpen_bilateral_10(), 9},
+        {1.15, 3, 209, sharpen_bilateral_11(), 16},
+        {1.25, 3, 322, sharpen_bilateral_12(), 16},
+        {1.35, 3, 336, sharpen_bilateral_13(), 16},
+        {1.45, 3, 195, sharpen_bilateral_14(), 16},
+        {1.55, 4, 132, sharpen_bilateral_15(), 25},
+        {1.65, 4, 180, sharpen_bilateral_16(), 25},
+        {1.75, 4, 195, sharpen_bilateral_17(), 25},
+        {1.85, 4, 151, sharpen_bilateral_18(), 25},
+        {1.95, 4, 151, sharpen_bilateral_19(), 25},
+        {2.05, 5, 116, sharpen_bilateral_20(), 36},
+        {2.15, 5, 127, sharpen_bilateral_21(), 36},
+        {2.25, 5, 109, sharpen_bilateral_22(), 36},
+        {2.35, 5, 132, sharpen_bilateral_23(), 36},
+        {2.45, 5, 156, sharpen_bilateral_24(), 36},
+    };
+    if (sigma < SHARPEN_BILATERAL_COPY_SIGMA) {
+        radius = 0;
+        scale = 1;
+        weights = nullptr;
+        count = 0;
+        return true;
+    }
+    for (const SharpenBilateralGrade& grade : grades) {
+        if (sigma < grade.upper) {
+            radius = grade.radius;
+            scale = grade.scale;
+            weights = grade.weights;
+            count = grade.count;
+            return true;
+        }
+    }
+    radius = 5;
+    scale = 173;
+    weights = sharpen_bilateral_25();
+    count = 36;
+    return true;
+}
+
+/*
+ * The device accepts the USM path and the RLD path with the kernels this
+ * launcher implements, including the residual switches. Anything the kernels
+ * do not reproduce returns false with a reason, so the host builtin runs and
+ * the record says host.
  */
 inline bool sharpen_device_supported(const SharpenNodeParams& p,
                                      std::string& error)
 {
-    if (p.edgesonly) {
-        error = "output.sharpen: edges only is a host residual";
-        return false;
-    }
-    if (p.halocontrol) {
-        error = "output.sharpen: halo control is a host residual";
-        return false;
-    }
-    if (p.showMask) {
-        error = "output.sharpen: show mask is a host residual";
-        return false;
-    }
-    if (p.blurradius >= SHARPEN_BLUR_RADIUS_LIMIT) {
-        error = "output.sharpen: the blur radius is a host residual";
-        return false;
-    }
     if (!(p.scale > 0.0) || !std::isfinite(p.scale)) {
         error = "output.sharpen: invalid scale";
+        return false;
+    }
+    /*
+     * The show-mask output is the mask itself, and buildBlendMask()'s SIMD
+     * arm evaluates the sigmoid with _mm_rsqrt_ps(). That approximation is
+     * not reproducible by an exact kernel to the mask's full scale, so the
+     * arm stays on the host.
+     */
+    if (p.showMask) {
+        error = "output.sharpen: show mask needs the host's approximate "
+                "reciprocal square root";
+        return false;
+    }
+    if (p.blurradius >= SHARPEN_SIGMA_LIMIT) {
+        error = "output.sharpen: the blur radius uses the double Gaussian";
         return false;
     }
 
@@ -919,14 +1440,36 @@ inline bool sharpen_device_supported(const SharpenNodeParams& p,
             error = "output.sharpen: sigma is outside the device range";
             return false;
         }
+        if (p.edgesonly) {
+            if (!std::isfinite(p.edges_radius)) {
+                error = "output.sharpen: invalid edge radius";
+                return false;
+            }
+            /*
+             * A non-positive tolerance makes the host's range-weight table
+             * NaN at the centre sample, so the whole plane is NaN. There is
+             * no meaningful result to reproduce.
+             */
+            if (p.edges_tolerance <= 0) {
+                error = "output.sharpen: a non-positive edge tolerance is a "
+                        "host residual";
+                return false;
+            }
+            int radius = 0;
+            int scale = 0;
+            const int* weights = nullptr;
+            int count = 0;
+            if (!sharpen_bilateral_grade(p.edges_radius / p.scale, radius,
+                                         scale, weights, count)) {
+                error = "output.sharpen: unsupported edge radius";
+                return false;
+            }
+            assert(radius == 0 || count <= SHARPEN_BILATERAL_MAX_WEIGHTS);
+        }
         return true;
     }
 
     if (p.method == SHARPEN_METHOD_RLD) {
-        if (p.deconvdamping != 0) {
-            error = "output.sharpen: deconvolution damping is a host residual";
-            return false;
-        }
         if (p.deconviter < 0 ||
             p.deconviter > SHARPEN_DECONV_ITERATION_LIMIT) {
             error = "output.sharpen: deconvolution iteration count is outside "
