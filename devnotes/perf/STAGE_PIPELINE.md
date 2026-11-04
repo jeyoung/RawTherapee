@@ -490,7 +490,7 @@ by default.
 | `thumbnail.transform` | -/-/-/Reduced | interactive | reuse-input | coarse rotate and flip | yes |
 | `thumbnail.whitebalance` | -/-/-/Reduced | interactive | reuse-input | apply white balance to the thumbnail | yes |
 | `thumbnail.rgb` | -/-/-/Reduced | interactive | reuse-input | thumbnail RGB processing | yes |
-| `thumbnail.lab` | -/-/-/Reduced | interactive | reuse-input | thumbnail Lab tools, working TRC, CIE CAM and gamut in one pass | no |
+| `thumbnail.lab` | -/-/-/Reduced | interactive | reuse-input | thumbnail Lab tools on the device; working TRC, CIE CAM and gamut stay host | partial |
 | `thumbnail.output` | -/-/-/Reduced | interactive | recompute | Lab to 8-bit thumbnail with gamma | yes |
 
 ## Path specifications
@@ -707,13 +707,18 @@ by the graph executor.
   dehaze, Fattal tone mapping, geometry transform, local adjustments and
   `rgbProc()`; the RGB pass runs on the `thumbnail.rgb` node.
 - `thumbnail.lab` `stageLab()`: Lab tools, local contrast, working TRC,
-  CIE CAM and gamut compression in one reduced-scale pass.
+  CIE CAM and gamut compression in one reduced-scale pass; the admitted Lab
+  tools run on the `thumbnail.lab` node and the rest stay on the host.
 - `thumbnail.output` `stageOutput()`: Lab to 8-bit monitor or output RGB, the
   reported scale factor and the crop mask.
 
 `thumbnail.lab` folds the Lab tools, working TRC, CIE CAM and gamut work that
 the export and preview paths split into separate blocks, because the thumbnail
-path runs them at reduced scale in one pass.
+path runs them at reduced scale in one pass. Its device node reuses the
+`lab.tools` kernel with the reduced path's skip-16 curve tables; the working
+TRC and the gamut pass that depends on it, CIE CAM, EPD, soft light,
+shadows/highlights, local contrast and Lab regions keep the whole block on the
+host.
 `thumbnail.output` folds both the monitor and output conversions and the
 8-bit gamma table.
 
@@ -1930,13 +1935,14 @@ device run is slower than the host and exists for parity and correctness.
 The `Device` column of the canonical block catalogue above is the single source
 of truth; this section records the remaining work and the naming exceptions.
 
-Device nodes today: `transform`, `rgb.proc`, `thumbnail.rgb`, `gamut`,
-`framing`, `lanczos3` (block `resize`), `output.convert`, `monitor.output`,
-`viewport.output`, `output.sharpen` (for the supported USM and undamped RLD
-sets), `lab.sharpening` (for the admitted impulse denoise, defringe, ML sharpen
-edges and ML microcontrast block), `thumbnail.output`, `thumbnail.whitebalance`,
-`thumbnail.scale` and `thumbnail.transform`, plus the runtime-only packed
-siblings `thumbnail.scale.u8` and `thumbnail.transform.u8`.
+Device nodes today: `transform`, `rgb.proc`, `thumbnail.rgb`, `thumbnail.lab`,
+`gamut`, `framing`, `lanczos3` (block `resize`), `output.convert`,
+`monitor.output`, `viewport.output`, `output.sharpen` (for the supported USM
+and undamped RLD sets), `lab.sharpening` (for the admitted impulse denoise,
+defringe, ML sharpen edges and ML microcontrast block), `thumbnail.output`,
+`thumbnail.whitebalance`, `thumbnail.scale` and `thumbnail.transform`, plus the
+runtime-only packed siblings `thumbnail.scale.u8` and
+`thumbnail.transform.u8`.
 
 `thumbnail.rgb` owns a node that runs the block's RGB tone and Lab conversion
 pass through the shared `rgb.proc` kernel. The node is offered under the stage
@@ -1947,6 +1953,20 @@ luma-mode RGB curves, tone equaliser, ProPhoto working space and `clampOOG`
 off stay on the host. The colour-space conversion, film negative, first
 analysis, dehaze, Fattal tone mapping, geometry transform and local adjustments
 around it also stay host-side; they are not part of the RGB pass.
+
+`thumbnail.lab` owns a node that reuses the `lab.tools` kernel for the reduced
+Lab block. It is offered under the same stage policy and its host setup builds
+the reduced path's curve tables with `CurveFactory`'s skip 16 instead of the
+export block's 1, so the device consumes exactly the tables the thumbnail call
+site would. The admitted set is LabGrid colour toning, the Lab curves
+(including black-and-white output) and vibrance, all scale independent.
+Shadows/highlights and local contrast divide their radii by the call site's
+scale (16 here), Lab regions derive theirs from `ImProcFunctions` scale, EPD and
+soft light have no node on this path, CIE CAM has no device node, and the
+working-TRC block calls `workingtrc()` with gamut control off and a fixed CAT,
+so the working TRC and the gamut pass that depends on it stay on the host. Any
+of those in the profile keeps the whole block on the host, and the node runs on
+a copy so a refused launch cannot leave the image half processed.
 
 Partial: `lab.sharpening` runs impulse denoise, defringe, ML sharpen edges and
 ML microcontrast on the device and keeps the main sharpen pass in the shared
@@ -1970,7 +1990,8 @@ RLD, radii at or above 1.15, edges-only, halo control, show-mask and
 parity results are in `STAGE_RUNTIME.md`.
 
 Still CPU-only: `raw.preprocess`, `raw.demosaic`, `raw.base`, `lab.tools`,
-`lab.wavelet`, `working.trc`, `ciecam` and `thumbnail.lab`.
+`lab.wavelet`, `working.trc`, `ciecam` and `thumbnail.lab`'s working-TRC, CIE
+CAM and gamut remainder.
 
 `local.adjustments` is partial through the multi-spot tool path. The
 admitted set is any number of `norm` spots in list order: an active spot runs

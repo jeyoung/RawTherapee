@@ -160,6 +160,10 @@ pairs are exact. The gate is the peak absolute error (PAE) in normalised units;
 | 2026-11-04 | uncommitted | POCL (CPU) | colorspace_flowers.pef / `thumb-rgb.pp3` (exposure + rotation), `thumbnail.rgb` via the thumbnail stage policy, no `RT_OPENCL_RGBPROC` | off vs stage device, PPM | 0 (byte-identical: embedded 239x160 and raw 238x160) | PASS |
 | 2026-11-04 | uncommitted | POCL (CPU) | the same sidecar plus `[Channel Mixer]` (admitted sub-tool) | off vs stage device, PPM | 1 LSB8 (AE=1 of 114 240 raw samples; PAE=1) | PASS |
 | 2026-11-04 | uncommitted | POCL (CPU) | the same sidecar plus `[Black & White] Enabled=true` (refused sub-tool) | off vs stage device, PPM | 0 (host; no `thumbnail.rgb` record, byte-identical) | PASS |
+| 2026-11-04 | uncommitted | POCL (CPU) | 5-case thumbnail Lab matrix (8-bit and 16-bit Lab grids; LabGrid; Lab curves; Lab curves plus vibrance; black-and-white), 24x17 padded rows, `stage-residency-test` | device vs the reduced path's skip-16 host sequence | 0 (exact, PAE 0.000000 LSB16, 0 of 1 224 samples) | PASS |
+| 2026-11-04 | uncommitted | POCL (CPU) | colorspace_flowers.pef / `labgrid.pp3` (LabGrid only; admitted sub-tool), `thumbnail.lab` via the thumbnail stage policy | off vs stage device, PPM | 0 (byte-identical: embedded 239x160 and raw 238x160) | PASS |
+| 2026-11-04 | uncommitted | POCL (CPU) | the same image with `labcurve.pp3` (Lab curves), `vib.pp3` (vibrance) and `labfull.pp3` (all three), `thumbnail.lab` | off vs stage device, PPM | 0 (byte-identical, both thumbnail branches, every profile) | PASS |
+| 2026-11-04 | uncommitted | POCL (CPU) | `thumbnail.lab` with no admitted tool (empty profile) | device request vs host fallback | no record; the call site keeps the block on the host | PASS |
 
 The clarity rows are the block's two-pass sequence, not a single kernel.
 `CLmethod`'s `one`/`inf`/`sup` selection is `finalContAllL()`'s and
@@ -362,6 +366,16 @@ peak absolute error is zero for the synthetic node tests:
   exposure profile; the channel mixer moves one of 114 240 raw samples by
   1 LSB8. A black-and-white sidecar is refused: no `thumbnail.rgb` record and
   byte-identical PPMs.
+- `thumbnail.lab` reuses the `lab.tools` kernel under its own node name and is
+  offered by the same stage policy. Its five device cases build the reduced
+  path's skip-16 curve tables and split the two thumbnail cache depths (8-bit
+  and 16-bit Lab grids) across LabGrid, the Lab curves, Lab curves plus
+  vibrance and black-and-white output; all are exact against the production
+  host sequence (PAE 0.000000 LSB16). End-to-end PPMs with LabGrid, Lab curves,
+  vibrance and all three together are byte-identical on both the embedded and
+  raw branches. The residual tools (shadows/highlights, local contrast, Lab
+  regions, EPD, soft light, CIE CAM and the working TRC) keep the whole block
+  on the host; an empty profile produces no record.
 - `rgb.proc` through the device, against the `--gpu=off` reference, has a peak
   error of 1 LSB16 on 401 708 of 10 139 424 pixels (4.0%). The classic path is
   byte-identical to the package built before the kernel moved.

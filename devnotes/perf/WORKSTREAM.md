@@ -567,6 +567,17 @@ export and a GUI smoke test are not yet run for this package.
   padded widths sheared and width 179 crashed; regression test at widths
   238/179 against compact-width references. Commits `36fae8d35`, `2a8381228`,
   `c7c3387d9`, `96feabcb0`, `065d3ca53`, `186988ff7`.
+- **A3 `thumbnail.lab`**: the block now owns a `thumbnail.lab` device node that
+  reuses the `lab.tools` kernel with the reduced path's skip-16 curve tables
+  and is offered under the stage policy. The admitted set is LabGrid, the Lab
+  curves (with black-and-white output) and vibrance; shadows/highlights, local
+  contrast, Lab regions, EPD, soft light, CIE CAM, the working TRC and the
+  gamut pass that depends on it keep the whole block on the host, which runs
+  the unchanged code on a copy so a refused launch cannot leave it half
+  processed. Five device cases cover 8-bit and 16-bit Lab grids and all four
+  admitted sub-tools, exact against the production host sequence; end-to-end
+  PPMs for LabGrid, Lab curves, vibrance and all three are byte-identical.
+  Commits `perf:`, `test:`, `docs:` in this unit.
 - Kernel pitch audit: every other stage kernel already takes pitches; only
   `rgb.proc` was compact. Padded-width tests added for wb/permute/scale are
   listed in `STAGE_RUNTIME.md` for the next sweep.
@@ -592,9 +603,9 @@ export and a GUI smoke test are not yet run for this package.
   `output.icc`, `thumbnail.decode` and `crop` are `n/a` with reasons
   (`588301647`). `crop` is a row copy deferred to residency.
 - Remaining CPU-only pixel nodes: `working.trc`, `ciecam`, `lab.tools`,
-  `lab.wavelet`, `local.adjustments`, `thumbnail.lab`, and the raw four
-  (`raw.preprocess`, `raw.demosaic`, `raw.base`; `source.*`/`analysis` are
-  exceptions).
+  `lab.wavelet`, `local.adjustments`, `thumbnail.lab`'s working-TRC/CIE-CAM/
+  gamut remainder, and the raw four (`raw.preprocess`, `raw.demosaic`,
+  `raw.base`; `source.*`/`analysis` are exceptions).
 - **`working.trc` (partial)**: W1 exposed the probe means, the lcms-built
   profile and the probe primaries matrix via setup-only out-params
   (`78c314f00`, `92ec1641b`). W2 runs a host prefix (`lab2rgb` + fixed sRGB
@@ -812,8 +823,8 @@ Order (reuse before new kernels, cheapest parity first):
 6. Composites: `local.adjustments`, `lab.tools`, `lab.sharpening`,
    `lab.wavelet`, `crop`.
 7. Thumbnail nodes. `thumbnail.output`, `thumbnail.whitebalance`,
-   `thumbnail.transform` (both formats), `thumbnail.scale` and
-   `thumbnail.rgb` are done. `thumbnail.lab` and `thumbnail.decode` remain.
+   `thumbnail.transform` (both formats), `thumbnail.scale`, `thumbnail.rgb`
+   and `thumbnail.lab` are done. `thumbnail.decode` remains.
    Each new kernel needs a device test as well as a call-site gate: the
    white-balance test paid for itself immediately.
 8. Destructive raw nodes last: `source.select`, `source.embedded`,

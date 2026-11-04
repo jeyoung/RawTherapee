@@ -656,7 +656,9 @@ The plan assumed these were cheaper than step 5's kernels. Inspection says
 otherwise, so the next session does not start from that assumption:
 
 - `thumbnail.lab` is a composite: Lab tools, local contrast, working-TRC
-  conversion, CIE CAM and gamut compression folded into one block.
+  conversion, CIE CAM and gamut compression folded into one block. Its Lab
+  tools now run through the `thumbnail.lab` node; the working TRC, CIE CAM,
+  local contrast and gamut remain host (see *Thumbnail Lab* below).
 - `thumbnail.decode` is a JPEG decode, not a kernel.
 
 `thumbnail.rgb` owns its node but still has host-side residual passes; see
@@ -873,6 +875,77 @@ The device test and the thumbnail harness are the evidence, and POCL's CPU
 device means these are CPU-device runs, never GPU parity. The stage-residency
 suite passes with one skip (the GPU-only residual), and the CPU build passes
 with 36 skips.
+
+`thumbnail.lab` now owns a node for the admitted Lab tools; see *Thumbnail
+Lab* below.
+
+## Thumbnail Lab
+
+`thumbnail.lab` is the Lab block of `Thumbnail::stageLab()`
+(`rtengine/rtthumbnail.cc:2687`). The full block folds Lab tools, local
+contrast, the working-TRC conversion, CIE CAM and gamut compression into one
+reduced-scale pass, but only the Lab-tools subset matches an existing device
+kernel. The node therefore reuses the `lab.tools` program under its own name;
+the call site gates it on `stage::node_device("thumbnail.lab")` and runs it on
+a copy of the Lab image, so a refusal or launch failure discards the copy and
+the unchanged host block produces the result.
+
+### Passes and coverage
+
+In execution order, with the call site in `stageLab()`:
+
+| Pass | Coverage |
+|------|----------|
+| luminance histogram for a non-zero Lab contrast | host prefix |
+| `CurveFactory` tone, hue and curve tables | host tables, skip 16 |
+| LabGrid colour toning | device node `thumbnail.lab` |
+| shadows/highlights | host (radius divides by scale 16) |
+| local contrast | host (radius and coefficients divide by scale 16) |
+| `chromiLuminanceCurve` and black-and-white output | device node `thumbnail.lab` |
+| EPD tone mapping | host (no reduced-path node) |
+| vibrance | device node `thumbnail.lab` |
+| Lab colour-correction regions | host (radii follow `ImProcFunctions` scale) |
+| soft light | host |
+| working TRC | host (`workingtrc()` runs with gamut control off and a fixed CAT, unlike the export block) |
+| CIE CAM | host (no device node) |
+| end-of-process gamut | host (it depends on the working TRC) |
+
+The host setup is `LabToolsContext` with `skip = 16`, the value the reduced
+path passes to `complexLCurve()`, `diagonalCurve2Lut()` and
+`complexsgnCurve()`; the export block keeps 1. The node is offered by the
+stage policy, not `RT_OPENCL_RGBPROC`, and the launcher's sh/local-contrast
+scale arguments stay at the export value because those tools are never
+submitted from this path.
+
+### Evidence
+
+Device test (`stage-residency-test`, POCL CPU device,
+`RT_OPENCL_ALLOW_CPU=1 RT_REQUIRE_GPU=1 OMP_NUM_THREADS=1`): five cases at
+24x17 with padded rows, two cache depths (Lab grids quantised to 8 and 16
+bits) and LabGrid, the Lab curve, Lab curves plus vibrance, and black-and-white
+output. Each case is compared with the production host sequence at skip 16:
+PAE 0.000000 LSB16, 0 of 1 224 samples. The sub-tools move the same source by
+17.8 (LabGrid), 7 542 (Lab curve), 18 922 (curve plus vibrance) and 20 046
+(black-and-white) LSB16, so the cases are not vacuous. The node records
+`"stage":"thumbnail.lab","impl":"opencl"`. A profile with no admitted tool is
+not submitted (no record, host fallback), and an empty request is refused
+without naming the device.
+
+End-to-end `thumbnail-stage-test` on the public 10.2 MP PEF, 160 px, POCL CPU
+device, against the same binary with `RT_STAGE_OPENCL` unset and an empty
+`OCL_ICD_VENDORS`. Four sidecars exercise the admitted sub-tools: LabGrid,
+Lab curves, vibrance, and all three together. Both the embedded (239x160) and
+raw (238x160) PPMs are byte-identical in every case; the device profile
+contains two `thumbnail.lab` records with `impl=opencl`. Shadows/highlights,
+local contrast, Lab regions, EPD, soft light, CIE CAM, the working TRC and a
+profile with no admitted tool keep the block on the host.
+
+No export gate applies: thumbnail generation is not on the
+`rawtherapee-graph-cli` export path, so `verify.sh` has no row for this node.
+The device test and the thumbnail harness are the evidence, and POCL's CPU
+device means these are CPU-device runs, never GPU parity. The stage-residency
+suite passes with one skip (the GPU-only residual), and the CPU build passes
+with 37 skips.
 
 ### `rgb.proc` row pitch
 
