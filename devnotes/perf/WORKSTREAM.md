@@ -94,12 +94,17 @@ export and a GUI smoke test are not yet run for this package.
   clipped samples by up to 110 LSB16; `verify.sh` now sets it only on the
   `rgb.proc` row.
 
-- **`raw.demosaic` CFA split withdrawn (2026-11-04)**: the MONO/NONE unit
-  admitted a Bayer CFA split, but with `labtools-vibrance.pp3` on
-  `colorspace_flowers.pef` the split path moved three output samples by up to
-  110 LSB16 (0 differing at `650499617`, i.e. after `raw.preprocess`, and at
-  `cbf8c506b`). The CFA split is now refused and the host loop runs; the
-  monochrome copy stays on the device. The vibrance gate is exact again.
+- **`raw.demosaic` CFA split re-admitted (2026-11-04)**: the earlier
+  withdrawal blamed the split for three samples that moved by up to
+  110 LSB16 on the `labtools-vibrance.pp3` canary. That profile leaves AMaZE
+  in place, so `nodemosaic()` never runs; the three samples are the classic
+  `RT_OPENCL_RGBPROC` backend at clipped pixels and are identical with the
+  split admitted and refused. The split itself is exact: 0 of 30 419 712
+  samples on the PEF and 0 of 136 918 080 on the NEF with a `Method=none`
+  variant of the vibrance profile, with and without `RT_OPENCL_RGBPROC`, and
+  the residency matrix is PAE 0. The MONO and NONE arms are both admitted
+  again; `raw-demosaic-split.pp3` and the `pef/stage-device-raw-demosaic-split`
+  row keep the split covered, and the AMaZE canary stays at 0.
 
 - **Cleanup incident (2026-11-04)**: the build-tree purge also removed
   `build/portable`, which is the package directory and must be retained. The

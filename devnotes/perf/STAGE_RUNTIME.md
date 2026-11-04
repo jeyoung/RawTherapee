@@ -486,7 +486,12 @@ Evidence:
 | refusals: wrong argument count, U8 mosaic, two-plane red, mismatched size, shared buffer, mono flag 2, filters out of range and a four-colour filters word | not `RT_STAGE_OK`, all three planes untouched |
 | `colorspace_flowers.pef` (10.2 MP PEF), `raw-demosaic.pp3` (`Method=mono`), `--gpu=off` vs `--gpu=auto`, 16-bit TIFF, default internal profiles | AE=0, 0 of 30 419 712 samples, record `"impl":"opencl"` |
 | 45.7 MP NEF, `raw-demosaic.pp3`, `--gpu=off` vs `--gpu=auto`, 16-bit TIFF, default internal profiles | AE=0, 0 of 136 918 080 samples, record `"impl":"opencl"` |
-| `verify.sh --stage-device`, `pef/stage-device-raw-demosaic`, POCL CPU, `OMP_NUM_THREADS=1` | PASS, `max_pae=1.5259e-05` (1 LSB16), `impl=opencl` on a 3888x2608 frame |
+| `colorspace_flowers.pef`, `raw-demosaic-split.pp3` (the vibrance correction with `Method=none`, so the CFA split runs), `--gpu=off` vs `--gpu=auto`, 16-bit TIFF | AE=0, 0 of 30 419 712 samples, record `"impl":"opencl"` |
+| 45.7 MP NEF, `raw-demosaic-split.pp3`, `--gpu=off` vs `--gpu=auto`, 16-bit TIFF | AE=0, 0 of 136 918 080 samples, record `"impl":"opencl"` |
+| split row repeated with `RT_OPENCL_RGBPROC=1` on the PEF | AE=0, 0 of 30 419 712 samples against the same host export |
+| `labtools-vibrance.pp3` canary, PEF, `--gpu=off` vs `--gpu=auto` | AE=0, 0 of 30 419 712 samples; the profile leaves AMaZE, so it does not enter the split |
+| same canary with `RT_OPENCL_RGBPROC=1` | 3 of 30 419 712 samples differ by up to 110 LSB16, identically with the split admitted and refused: the classic RGB backend, not this node |
+| `verify.sh --stage-device`, `pef/stage-device-raw-demosaic` and `pef/stage-device-raw-demosaic-split`, POCL CPU, `OMP_NUM_THREADS=1` | PASS, `max_pae=1.5259e-05` (1 LSB16), `impl=opencl` on a 3888x2608 frame |
 
 The two byte-exact rows use the default internal profiles. In an environment
 whose ICC directory is populated, the same pair differs by 1 LSB16 at 500 820
