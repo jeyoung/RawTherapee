@@ -2902,14 +2902,17 @@ increment covers any number of `norm` spots in list order, both `ELI` and
 `RECT`, inactive clamp-only spots, the L/C/H curves, local log encoding,
 Blur & Noise (Gaussian and median), local dehaze, local CBDL, vibrance,
 Gaussian local contrast, local sharpening, Lab-mode `"std"`
-shadows/highlights, per-pixel `"soft"` soft light, and the
+shadows/highlights, per-pixel `"soft"` soft light, the CAM16 `"com"` CIE CAM
+arm, and the
 `avoidgamutMethod` values `"NONE"` and `"MUNS"`. The per-spot clamp
 is bit-exact against the host, so the Munsell pass runs on the device. The
 other tools, the other shadows/highlights methods (tone, GHS,
 Michaelis-Menten) and their tone-eq, recovery and gradient sub-options, the
 soft-light `"reti"` method, explicit masks, soft radius, merge, recursion,
 LabGrid, the RGB and exposure curves, `reparcol != 100`, the log tool's
-guided-filter `detail` arm, `autocompute`, CIE CAM and `strlog`, capture
+guided-filter `detail` arm, `autocompute`, `strlog`, the CIE CAM Jz
+pre-processing, pre-CAM tone map, curves, contrast sliders, `detailcie`,
+gradient and final gain/gamut compression, capture
 sharpening, sharpening gamma/blur/mask-view and a separable
 sharpening radius, Blur & Noise's guided and inverse arms, a zero median
 method, out-of-range passes, the FFT, noise, grain, bilateral and
@@ -2919,12 +2922,12 @@ Quality other than "Off", or `qualityMethod "enhden"`), and this node's own
 stay on the host. The tools run in the block's order:
 log encoding, Blur & Noise, Tone Mapping, dehaze, CBDL, vibrance,
 shadows/highlights, soft
-light, local contrast, local sharpening, then Colour & Light.
+light, local contrast, local sharpening, Colour & Light, then CIE CAM.
 
 ### ABI, state and host setup
 
 The node takes a three-plane `F32` Lab buffer, a pointer to
-`RtLocalAdjustmentsContext` (version 11, magic `0x4C414A43`, size checked,
+`RtLocalAdjustmentsContext` (version 14, magic `0x4C414A43`, size checked,
 `spot_count` from the profile) and the block support flag. The call site only
 prefills `labView` with `rgb2lab(baseImg)` when the block is active and the
 whole-block predicate is true; an inactive block never enters the node.
@@ -2933,7 +2936,7 @@ The launcher keeps a contiguous host staging copy of the Lab image and a
 device `reserved` copy of the initial image. For each spot it calls
 `build(self, spot, &staging, &setup)`, which runs the block's own
 `calcLocalParams()`, `calc_ref()` on the current Lab, `complexCurvelocal()`
-and the curve factories. It then uploads that spot's 148-float record and
+and the curve factories. It then uploads that spot's 352-float record and
 tables, runs the passes, and reads the device image back into the staging
 copy. Spot N+1's references therefore see spot N's result through the same
 read-back path as the CPU's `labView`. `reserved` is never updated, matching
@@ -3009,6 +3012,17 @@ lab.regions `xlogf`/`xexpf`/`pow_F` ports, and the local-adjustments kernels:
   compression step below `4 * (n / 4)`. The finish blend is the shared
   `rt_local_adjustments_blend` with `lp.senstm` and the default `3/sk` blur.
   Eighteen ROI-sized arrays come from one contiguous scratch buffer.
+- `rt_local_adjustments_cie`: `ciecamloc_02float()`'s call==0 CAM16 arm,
+  the `repar` recovery blend and the final gain/gamut round trip in one
+  work item. The host builds the two viewing-condition sets
+  (`initcam1float()`/`initcam2float()`), the two whites, the derived powers,
+  coefficients and acceptance clamps, and the `CAMBrightCurveJ`/`Q` tables;
+  the kernel reproduces the per-pixel `xyz2jchqms`/`jch2xyz` pair, the
+  `curvecolorfloat()` and `skinredfloat()` sequence and the working-matrix
+  round trip. It uses the SIMD `xexpf` grouping for `pow_F` because the
+  chroma and saturation sliders amplify the last-bit difference between the
+  scalar and vector forms. The senstype-31 blend then applies the result
+  with its own `(2 + 0.2 * blurciede)` reference blur.
 - `rt_lab_tools_mask`, `rt_lab_tools_subsample`, `rt_lab_tools_box_h`,
   `rt_lab_tools_box_v`, `rt_lab_tools_combine`, `rt_lab_tools_upsample` and
   `rt_lab_tools_apply`: the lab.tools shadows/highlights round. The local node
@@ -3028,8 +3042,8 @@ lab.regions `xlogf`/`xexpf`/`pow_F` ports, and the local-adjustments kernels:
   split in the same way as the clamp.
 
 The per-spot order is prefilter, then log encoding, Blur & Noise, dehaze, CBDL,
-vibrance, shadows/highlights, soft light, local contrast, local sharpening and
-Colour & Light, then the
+vibrance, shadows/highlights, soft light, local contrast, local sharpening,
+Colour & Light and CIE CAM, then the
 tail clamp. Each tool takes a fresh ROI copy and its own deltaE blur.
 `avoidcolshi()` runs after the tail clamp in the
 CPU, so the MUNS kernel is ordered there; the Munsell tables and the fixed
@@ -3085,7 +3099,8 @@ all-curves case); no separate MUNS-only worst is claimed.
 An active spot runs local log encoding, Tone Mapping, local dehaze, local
 CBDL, Colour &
 Light, vibrance, Lab-mode `"std"` shadows/highlights, per-pixel `"soft"` soft
-light, Gaussian local contrast and/or local sharpening, requires
+light, Gaussian local contrast, local sharpening and/or the CAM16 `"com"` CIE
+CAM, requires
 `reparcol == 100`, no explicit
 mask, soft radius, merge, recursion, inversion, gradient, LabGrid, RGB or
 exposure curve, an `avoidgamutMethod` other than `"NONE"`/`"MUNS"`, and a ROI
@@ -3123,13 +3138,23 @@ exposure (FFT PDE), the other shadows/highlights methods and
 tone-eq/recovery/gradient sub-options, the local-contrast wavelet and FFT
 variants, vibrance gamma/gradients/warm, blur/denoise, capture sharpening,
 sharpening gamma/blur/mask view/separable radius, tone
-mapping, Retinex, log's guided-filter arm/`autocompute`/CIE CAM/gradient,
+mapping, Retinex, log's guided-filter arm/`autocompute`/gradient,
 soft light `"reti"`, the common mask, dehaze, `exc`/`full`/`main`, merge,
 explicit masks, soft radius, Tone Mapping's recovery threshold and
 out-of-range sliders and the global EPD pass, the `avoidgamutMethod`
 LAB/XYZ/XYZREL arms, the
 RGB curve, LabGrid, `avoidrad != 0`, `transit == 100`, a blur radius above
-100, `ghs_D != 0 && ghs_BLP > 0` and a pre-CBDL pass. Tone Mapping is
+100, `ghs_D != 0 && ghs_BLP > 0` and a pre-CBDL pass.
+
+CIE CAM is admitted only in `modecie "com"` / `modecam "cam16"` with
+`smoothciemet "none"` and `pqremapcam16 <= 100`; its Jz pre-processing,
+pre-CAM tone map, CIE and per-hue curves, contrast sliders (their tables
+read the ROI histogram), `detailcie` local contrast, gradient, sigmoid Q
+arms, the final gain and gamut compression, the camera primaries and the
+mask parameters are residuals. `visicie` is the UI panel flag and is not
+read by the block, so it does not affect admission.
+
+Tone Mapping is
 admitted with `exptonemap` on, the masks idle, the global EPD pass off, a
 non-zero strength and a ROI of at least 128 px on both axes (the block's own
 mDEN gate, below which the tool is a no-op); its eight sliders must be inside
@@ -3173,7 +3198,11 @@ before the upload.
 | Tone-map matrix, 16 cases | strength 0.5/1.2/-0.4/0.8, gamma 1/2, edge stopping 0.5/1.4/3.5, scale 1/4, reweight 2, the equalise-off arm alone and at sensitivity 100, sensitivity 0/100, colour, blur, an offset ROI, a zero-strength no-op and a ROI below the block's mDEN gate: `impl=opencl`, finite, worst 0.023438 LSB16 (the equalise-off, scale-4, sensitivity and offset-ROI arms are within 0.0156; the zero-strength no-op and the sub-mDEN case are exact). Non-vacuity: the 0.5-strength case changes 155,998 of 156,000 samples (PAE 350.917969 LSB16) against the same spot with the tool off |
 | Tone-map residuals, 10 cases | strength/gamma/edge-stopping/scale/repart/saturation/reweight/sensitivity out of range, `recothrest` 0.5 and `epd.enabled`: refused by the predicate, `impl=host`, PAE 0 |
 | `localadjustments-tonemap.pp3` (CPU-device row) | PASS, 1 LSB16, `impl=opencl`; strength 0.8, gamma 1, edge stopping 1.4, scale 1, `equiltm` on, sensitivity 60 and a 525x522 ROI. The 16-bit TIFF pair differs on 3 of 30,419,712 samples at 1 LSB16. Non-vacuous: against the neutral export the profile differs by PAE 50 codes on 1,929,902 of 30,419,712 channel samples. Measured by running the `run_stage_device` recipe directly (`--gpu=off` versus `--gpu=auto` with `RT_STAGE_OPENCL=1` and `RT_OPENCL_ALLOW_CPU=1` under `tools/opencl/pocl-run.sh`, then a numpy TIFF comparison), because ImageMagick is not installed in this environment; the full `--stage-device` corpus was therefore not re-run |
-| Full `verify.sh --stage-device` | PASS, 34 PASS and 0 SKIP on the POCL CPU device; the MUNS, SH, soft-light, CBDL, dehaze, log, sharpen and tone-map rows, including the damped row, are CPU-device rows, consistent with the launcher's CPU-only requirement. `working.trc` stays 1 LSB16 |
+| CIE CAM matrix, 18 cases | defaults, dim/dark source and viewing surrounds, an extremely dark viewer, source/target grey and absolute luminance, warm adaptation, saturation/chroma/hue/colourfulness/red protection alone, a combined colour case, light and recovery, offset and interior ROIs, and the colour, blur and tone-map combinations: `impl=opencl`, finite, worst 0.399902 LSB16 (combined colour sliders; saturation alone 0.320557; chroma 0.170898; the rest at or below 0.099182). Non-vacuity: every case changes at least 59,851 of 156,000 samples (PAE 284.802246 LSB16 at the lowest) against the same spot with the tool off. A combined saturation 60 / chroma 40 / hue -20 / colourfulness 30 / red protection 40 case measured 1.288086 LSB16; the block's `skinredfloat()` changes `dred` in steps at J = 16/22/60/70, so the host's own output is discontinuous there and a last-bit input difference straddles a step. The matrix therefore combines moderate colour amounts and tests each slider at its own extreme. |
+| CIE CAM residuals, 26 cases | log/Jz modes, PQ remap, smoothing, contrast and per-hue sliders, the CIE/per-hue/Jz curves, pre-tone-map, `detailcie`, gradient, final gain and gamut compression, black and white, the recovery and explicit masks, source/target grey, absolute luminance and adaptation ranges, unknown surrounds and sigmoid Q: `impl=host`, no `impl=opencl`, PAE 0 |
+| `localadjustments-cie.pp3` (CPU-device row) | PASS, 1 LSB16, `impl=opencl`; source/viewing surround Dim, grey 18/16, absolute luminance 2000/16, adaptation 10, saturation 25, chroma 15, hue -8, colourfulness 10, lightness 10, brightness -8, red protection 40 and `reparcie` 70. The 16-bit TIFF pair is AE=1 and PAE 1 LSB16 on 34,733 of 30,419,712 samples. Non-vacuous: against the neutral export the profile differs by PAE 9,805 codes on 15,241,115 of 30,419,712 samples. Measured by running the `run_stage_device` recipe directly (`--gpu=off` versus `--gpu=auto` with `RT_STAGE_OPENCL=1` and `RT_OPENCL_ALLOW_CPU=1` under `tools/opencl/pocl-env.sh`), then `compare_tiff.py --bits 16` |
+| `Expcie_` round trip | before the loader fix, `Expcie_0=true` loaded into `visicie` and the tool came back off, so the export profile fell back with "support flag is not set"; the key now sets `expcie` and the panel flag, and the same profile records `impl=opencl` |
+| Full `verify.sh --stage-device` | PASS, 34 PASS and 0 SKIP on the POCL CPU device before this row was added; the MUNS, SH, soft-light, CBDL, dehaze, log, sharpen and tone-map rows, including the damped row, are CPU-device rows, consistent with the launcher's CPU-only requirement. `working.trc` stays 1 LSB16. The CIE row above was measured with the same recipe rather than by re-running the corpus, because ImageMagick is not installed in this environment |
 | Default path | with `RT_STAGE_OPENCL` unset the host block runs directly; CPU-only `stage-residency-test: PASS (34 skipped)` |
 | Builds | `build/cpu-perf-graph` and `build/opencl-perf-graph` compile |
 | GPU | not run; refused before upload, records `impl=host` |

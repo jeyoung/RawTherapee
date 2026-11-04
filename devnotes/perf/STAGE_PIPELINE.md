@@ -1971,11 +1971,11 @@ admitted set is any number of `norm` spots in list order: an active spot runs
 any combination of local log encoding, Blur & Noise (Gaussian and median),
 Tone Mapping, local dehaze, local CBDL,
 Colour & Light, vibrance, shadows/highlights, soft
-light, Gaussian local contrast and local sharpening, and an inactive spot is
-the clamp-only case and may carry inert tool settings.
+light, Gaussian local contrast, local sharpening and CIE CAM, and an
+inactive spot is the clamp-only case and may carry inert tool settings.
 Every active spot needs at least one of `explog`, `expblur`, `exptonemap`,
 `expcbdl`, `expcolor`, `expvibrance`, `expshadhigh`, `expsoft`, `expcontrast`,
-`expsharp`
+`expsharp`, `expcie`
 and the dehaze pair (`expreti` on with a non-zero `dehaz`); every other `exp*`
 is a residual.
 Local log encoding is admitted with `expcie` off, `autocompute` off, `detail`
@@ -2014,7 +2014,7 @@ dimension (39 px when sharpening runs, where a smaller extent makes the host
 return before its tail clamp).
 The tools run in `Lab_Local()`'s order: local log encoding, Blur & Noise,
 Tone Mapping, local dehaze, CBDL, vibrance, shadows/highlights, soft light,
-local contrast, local sharpening, then Colour & Light.
+local contrast, local sharpening, then Colour & Light and CIE CAM.
 Each tool takes a fresh ROI copy and its own deltaE reference blur
 (`(2 + 0.2*blurcolde)` for colour, `(2 + 0.2*blurSHde)` for
 shadows/highlights, 3 for vibrance, soft light and dehaze, and `lcradius` for
@@ -2057,6 +2057,23 @@ range, the guided and inverse arms, a zero median method, out-of-range passes,
 added noise or grain, a mask, an FFT request and the `"nlmean"` quality
 method are residuals too; the wavelet denoise itself and the remaining
 denoise additions stay on the host.
+
+Local CIE CAM is admitted only in the `modecie "com"` / `modecam "cam16"`
+arm with `smoothciemet "none"` and `pqremapcam16` at or below 100, which is
+the block's plain CAM16 transform rather than its PQ arm. The four surround
+names (`sursourcie` Average/Dim/Dark/exDark and `surroundcie`
+Average/Dim/Dark/ExtremelyDark), source and target grey, the two absolute
+luminances and the adaptation temperature are free inside their GUI ranges,
+as are the acceptance, lightness, brightness, chroma, saturation,
+colourfulness, hue and red-protection sliders, the recovery `reparcie` and
+the senstype-31 sensitivity. The device runs `ciecamloc_02float()`'s
+call==0 transform, the `repar` recovery blend and the final gain/gamut
+round trip, then `transit_shapedetect2()`'s senstype-31 blend with its own
+`(2 + 0.2*blurciede)` deltaE blur. The Jz pre-processing, the pre-CAM RGB
+tone map, the CIE and per-hue curves, the contrast sliders (their tables
+read the ROI histogram), `detailcie`'s local contrast, the gradient, the
+sigmoid Q arms, the mask parameters, the recovery mask, the final gain and
+gamut compression and the camera primaries stay residuals.
 
 Tone Mapping runs `EPDToneMaplocal()` on the spot ROI and then
 `transit_shapedetect2()`'s senstype-8 blend. The block's guard needs the tool

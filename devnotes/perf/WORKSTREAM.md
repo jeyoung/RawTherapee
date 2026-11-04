@@ -218,6 +218,16 @@ current tip.
   blend), with the chroma Retinex slider and a non-identity luminance mask
   left as refusals. The matrix reaches 0.357422 LSB16 and
   `localadjustments-retinex.pp3` records 1 LSB16 with `impl=opencl`.
+- **`local.adjustments` CIE CAM**: the spot "com" block runs
+  `ciecamloc_02float()`'s call==0 CAM16 transform, the `repar` recovery
+  blend and the final gain/gamut round trip on the device, then
+  `transit_shapedetect2()`'s senstype-31 blend. The Jz pre-processing, the
+  CIE and per-hue curves, the contrast sliders, local contrast, the
+  gradient, the final gain and gamut compression and every mask stay
+  refusals. The matrix reaches 0.399902 LSB16 and
+  `localadjustments-cie.pp3` records 1 LSB16 (AE=1) with `impl=opencl`.
+  `Expcie_` now loads into the tool enable as well as the UI panel flag, so
+  a CIE profile round-trips.
 - **`lab.wavelet` clarity soft radius**: `guidedFilter()`'s box means, `a`/`b`
   reduction and bilinear upsample run on the device over the block's
   `provradius` guide, with the subsampling, radius and four scales derived on
