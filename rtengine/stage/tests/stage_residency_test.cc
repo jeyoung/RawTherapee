@@ -6376,7 +6376,8 @@ void run_cpu_lab_sharpening(rtengine::procparams::ProcParams& params,
 RtStageStatus run_device_lab_sharpening(
     const std::shared_ptr<StageContext>& context,
     rtengine::procparams::ProcParams& params, LabImage& lab,
-    StageExecution& execution, std::string& error, bool ciecam_arm = false)
+    StageExecution& execution, std::string& error, bool ciecam_arm = false,
+    double scale = 1.0)
 {
     rtengine::ImProcFunctions ipf(&params, false);
     ipf.setScale(1.0);
@@ -6385,10 +6386,10 @@ RtStageStatus run_device_lab_sharpening(
         return RT_STAGE_INVALID;
     }
     const LabSharpeningNodeParams node =
-        labSharpeningNodeParams(params, ciecam_arm);
+        labSharpeningNodeParams(params, ciecam_arm, scale);
     std::string support_error;
     const bool supported = labSharpeningSupported(
-        params, lab.W, lab.H, ciecam_arm, &support_error);
+        params, lab.W, lab.H, ciecam_arm, &support_error, scale);
     RtLabSharpeningContext descriptor = node_context.descriptor(supported);
     std::vector<RtStageArg> args;
     labSharpeningArgs(lab, node, node_context, descriptor, args);
@@ -6487,6 +6488,84 @@ void test_lab_sharpening(bool available)
         params.defringe.radius = 5.0;
         check(!labSharpeningSupported(params, 19, 19, false, &error),
               "a defringe window wider than the image is refused");
+    }
+
+    /* ------------------------------------------- prescaled export admission */
+    {
+        rtengine::procparams::ProcParams params;
+        std::string error;
+
+        /*
+         * A slope of two pushes a GUI threshold of 60 to 120, above the raw
+         * 0..100 bound but still a legal GUI value. The admission must derive
+         * the bound from the scale, and labSharpeningScaleParams() must be the
+         * single formula for both the call site and this check.
+         */
+        params.impulseDenoise.enabled = true;
+        params.impulseDenoise.thresh = 60;
+        params.defringe.enabled = true;
+        params.defringe.radius = 5.0;
+        params.defringe.threshold = 13;
+
+        rtengine::procparams::ProcParams scaled = params;
+        labSharpeningScaleParams(scaled, 2.0);
+        check(scaled.impulseDenoise.thresh == 120,
+              "the export doubles the impulse threshold");
+        check(scaled.defringe.radius == 8.0,
+              "the export interpolates the defringe radius about 2.0");
+        check(labSharpeningSupported(scaled, 63, 63, false, &error, 2.0),
+              "a scale of two admits the prescaled pair");
+
+        const LabSharpeningNodeParams node =
+            labSharpeningNodeParams(scaled, false, 2.0);
+        check(node.scale == 2.0,
+              "the node carries the export scale for the launcher");
+        check(node.impulse_threshold == 120 && node.defringe_radius == 8.0,
+              "the node carries the host-derived values unchanged");
+
+        /* A scale only multiplies the legal bound; it never censors a GUI
+         * value that the host would run. */
+        scaled.impulseDenoise.thresh = 201;
+        check(!labSharpeningSupported(scaled, 63, 31, false, &error, 2.0),
+              "a prescaled threshold above 100 * scale is refused");
+        check(!lab_sharpening_admitted(
+                  labSharpeningNodeParams(scaled, false, 2.0), 63, 31, true,
+                  error),
+              "the launcher refuses the same prescaled threshold");
+
+        rtengine::procparams::ProcParams radius_slope = params;
+        labSharpeningScaleParams(radius_slope, 3.0);
+        check(radius_slope.defringe.radius == 11.0,
+              "a scale of three maps radius 5 to 11");
+        check(labSharpeningSupported(radius_slope, 63, 63, false, &error, 3.0),
+              "a prescaled radius inside the derived bound is admitted");
+        radius_slope.defringe.radius = 11.5;
+        check(!labSharpeningSupported(radius_slope, 63, 63, false, &error,
+                                      3.0),
+              "a radius above the derived GUI maximum is refused");
+
+        /* The supported scale range ends where the widest GUI radius meets
+         * gaussianBlur()'s double-precision IIR limit. */
+        check(!labSharpeningSupported(params, 63, 31, false, &error, 0.0),
+              "a zero scale is refused");
+        check(!labSharpeningSupported(params, 63, 31, false, &error, -1.0),
+              "a negative scale is refused");
+        check(!labSharpeningSupported(params, 63, 31, false, &error, 8.0),
+              "a scale above the block range is refused");
+        check(!labSharpeningSupported(params, 63, 31, false, &error,
+                                      std::numeric_limits<double>::quiet_NaN()),
+              "a non-finite scale is refused");
+
+        /* The ML arms are not prescaled by the export, but the scale itself
+         * still has to be usable. */
+        rtengine::procparams::ProcParams ml;
+        ml.sharpenEdge.enabled = true;
+        ml.sharpenEdge.passes = 2;
+        ml.sharpenEdge.amount = 50.0;
+        check(labSharpeningSupported(ml, 63, 31, false, &error, 0.25),
+              "the ML arm admits a quarter scale");
+        check(!labSharpeningSupported(ml, 63, 31, false, &error, 8.0),
+              "the ML arm keeps the out-of-range scale fail-closed");
     }
 
     /* ------------------------------------- ML edge and micro admission set */
@@ -7122,6 +7201,180 @@ void test_lab_sharpening(bool available)
         }
         check(device_cases >= 8,
               "lab.sharpening covers at least eight defringe radius cases");
+    }
+
+    /*
+     * -------------------------------------- the prescaled export inputs
+     *
+     * adjust_procparams() multiplies the impulse threshold and interpolates
+     * the defringe radius before the block runs. The device must run the same
+     * prescaled values, admitted against the bounds the scale derives. The
+     * scale set spans the export's downscale and upscale arms, each combined
+     * with the ML passes and with the main sharpen pass beside the block.
+     */
+    {
+        struct ScaleCase {
+            const char* label;
+            double scale;
+            int impulse_threshold;
+            double radius;
+            bool edges;
+            bool micro;
+            bool ciecam;
+            bool main_pass;
+        };
+        const ScaleCase cases[] = {
+            {"scale 0.25 impulse+defringe+main", 0.25, 80, 3.0, false, false,
+             false, true},
+            {"scale 0.5 impulse+defringe+edges", 0.5, 80, 3.0, true, false,
+             false, false},
+            {"scale 0.75 impulse+defringe+micro", 0.75, 80, 3.0, false, true,
+             false, false},
+            {"scale 1.5 impulse+defringe+edges+micro+main", 1.5, 80, 3.0,
+             true, true, false, true},
+            {"scale 2 impulse+defringe+edges+main", 2.0, 80, 3.0, true, false,
+             false, true},
+            {"scale 2 impulse only", 2.0, 75, 0.0, false, false, false, false},
+            {"scale 1.5 defringe only+main", 1.5, 0, 5.0, false, false, false,
+             true},
+            {"scale 0.5 edges+micro", 0.5, 0, 0.0, true, true, false, false},
+            {"scale 0.25 CIE-CAM arm+edges", 0.25, 0, 0.0, true, false, true,
+             false},
+            {"scale 1.5 CIE-CAM arm+edges+main", 1.5, 0, 0.0, true, false,
+             true, true},
+        };
+
+        std::size_t device_cases = 0;
+        for (const ScaleCase& item : cases) {
+            rtengine::procparams::ProcParams params;
+            if (item.impulse_threshold != 0) {
+                params.impulseDenoise.enabled = true;
+                params.impulseDenoise.thresh = item.impulse_threshold;
+            }
+            if (item.radius > 0.0) {
+                params.defringe.enabled = true;
+                params.defringe.radius = item.radius;
+                params.defringe.threshold = 13;
+            }
+            if (item.edges) {
+                params.sharpenEdge.enabled = true;
+                params.sharpenEdge.passes = 2;
+                params.sharpenEdge.amount = 50.0;
+            }
+            if (item.micro) {
+                params.sharpenMicro.enabled = true;
+                params.sharpenMicro.amount = 20.0;
+                params.sharpenMicro.contrast = 20.0;
+                params.sharpenMicro.uniformity = 5;
+            }
+            if (item.main_pass) {
+                /* The main pass is the shared output.sharpen node; enabling it
+                 * must not change this block's result. */
+                params.sharpening.enabled = true;
+            }
+
+            /* Prescale exactly as the export does before the block runs. */
+            labSharpeningScaleParams(params, item.scale);
+
+            LabImage source(70, 42);
+            if (item.edges || item.micro) {
+                fill_ml_fixture(source);
+            } else if (item.impulse_threshold != 0) {
+                fill_impulse_fixture(source);
+            } else {
+                fill_defringe_fixture(source);
+            }
+
+            LabImage cpu(70, 42);
+            copy_sharpen_l(source, cpu);
+            run_cpu_lab_sharpening(params, cpu, item.ciecam);
+
+            LabImage device(70, 42);
+            copy_sharpen_l(source, device);
+            StageExecution execution;
+            std::string error;
+            const RtStageStatus status = run_device_lab_sharpening(
+                context, params, device, execution, error, item.ciecam,
+                item.scale);
+            const std::string label =
+                std::string("lab.sharpening ") + item.label;
+            check(status == RT_STAGE_OK,
+                  (label + " completes: " + error).c_str());
+            check(execution.device == StageDeviceType::OPENCL,
+                  (label + " runs on the device").c_str());
+            if (status == RT_STAGE_OK &&
+                execution.device == StageDeviceType::OPENCL) {
+                ++device_cases;
+            }
+
+            const LabPlaneDiff diff = compare_lab_planes(device, cpu);
+            check(diff.finite, (label + " stays finite").c_str());
+            check(diff.max_l <= 0.5 && diff.max_a <= 0.5 &&
+                      diff.max_b <= 0.5,
+                  (label + " is within half a 16-bit LSB").c_str());
+
+            const std::vector<unsigned char> changed =
+                lab_changed_mask(device, source);
+            const std::size_t count = lab_changed_count(changed);
+            check(count > 0, (label + " is not vacuous").c_str());
+            std::printf("stage-residency: %s: %zu of %zu samples differ, "
+                        "PAE L %.6f a %.6f b %.6f\n",
+                        label.c_str(), diff.differing, diff.samples,
+                        diff.max_l, diff.max_a, diff.max_b);
+        }
+        check(device_cases >= 8,
+              "lab.sharpening covers at least eight prescaled export cases");
+    }
+
+    /* ---------------------------------------- prescaled export refusals */
+    {
+        struct RefusalCase {
+            const char* label;
+            double scale;
+            int impulse_threshold;
+            double radius;
+        };
+        const RefusalCase cases[] = {
+            {"zero scale", 0.0, 50, 2.0},
+            {"negative scale", -1.0, 50, 2.0},
+            {"scale above the block range", 8.0, 50, 5.0},
+            {"threshold above 100 * scale", 2.0, 250, 2.0},
+            {"radius above the derived maximum", 2.0, 50, 9.0},
+        };
+
+        for (const RefusalCase& item : cases) {
+            rtengine::procparams::ProcParams params;
+            params.impulseDenoise.enabled = true;
+            params.impulseDenoise.thresh = item.impulse_threshold;
+            params.defringe.enabled = true;
+            params.defringe.radius = item.radius;
+            params.defringe.threshold = 13;
+
+            LabImage source(63, 31);
+            fill_impulse_fixture(source);
+
+            LabImage cpu(63, 31);
+            copy_sharpen_l(source, cpu);
+            run_cpu_lab_sharpening(params, cpu);
+
+            LabImage device(63, 31);
+            copy_sharpen_l(source, device);
+            StageExecution execution;
+            std::string error;
+            const RtStageStatus status = run_device_lab_sharpening(
+                context, params, device, execution, error, false,
+                item.scale);
+            const std::string label =
+                std::string("lab.sharpening prescaled ") + item.label;
+            check(status == RT_STAGE_OK,
+                  (label + " completes through the host builtin").c_str());
+            check(execution.device != StageDeviceType::OPENCL,
+                  (label + " never runs on the device").c_str());
+            const LabPlaneDiff diff = compare_lab_planes(device, cpu);
+            check(diff.finite && diff.differing == 0 && diff.max_l == 0.0 &&
+                      diff.max_a == 0.0 && diff.max_b == 0.0,
+                  (label + " matches the host result exactly").c_str());
+        }
     }
 
     /* --------------------------------- ML sharpen edges and microcontrast */

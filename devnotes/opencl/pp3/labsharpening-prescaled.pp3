@@ -1,0 +1,12 @@
+[Defringing]
+Enabled=true
+Radius=0.5
+Threshold=13
+
+[Resize]
+Enabled=true
+Scale=1.5
+AppliesTo=Full image
+Method=Lanczos
+DataSpecified=0
+AllowUpscaling=true

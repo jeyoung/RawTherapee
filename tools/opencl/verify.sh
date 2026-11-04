@@ -286,6 +286,12 @@ quick() {
         "$ROOT/devnotes/opencl/pp3/labsharpening-edges.pp3" lab.sharpening
     run_stage_device "pef/stage-device-lab-sharpening-micro" \
         "$ROOT/devnotes/opencl/pp3/labsharpening-micro.pp3" lab.sharpening
+    run_stage_device "pef/stage-device-lab-sharpening-scaled" \
+        "$ROOT/devnotes/opencl/pp3/labsharpening-scaled.pp3" lab.sharpening \
+        any -f
+    run_stage_device "pef/stage-device-lab-sharpening-prescaled" \
+        "$ROOT/devnotes/opencl/pp3/labsharpening-prescaled.pp3" \
+        lab.sharpening any -f
     run_stage_device "pef/stage-device-sharpen-rld-damped" \
         "$ROOT/devnotes/opencl/pp3/sharpen-rld-damped.pp3" output.sharpen
     run_stage_device "pef/stage-device-sharpen-usm-halo" \
@@ -552,6 +558,7 @@ run_stage_device() {
     local node="$3"
     local device_class="${4:-any}"
     local sample="${sample_override:-$TESTDATA/colorspace_flowers.pef}"
+    local -a extraArgs=("${@:5}")
 
     [ -f "$sample" ] || die "missing $sample (run tools/opencl/fetch-testdata.sh)"
     # An empty profile selects the neutral defaults, which is what the output
@@ -586,7 +593,7 @@ run_stage_device() {
     local device="$outdir/device.tif"
 
     if ! env OMP_NUM_THREADS="$THREADS" "$cli" --gpu=off "${profileArg[@]}" \
-            -o "$host" -t -b16 -Y -c "$sample" >"$outdir/host.log" 2>&1; then
+            "${extraArgs[@]}" -o "$host" -t -b16 -Y -c "$sample" >"$outdir/host.log" 2>&1; then
         printf 'FAIL\t%s\tload or export failed (gpu=off)\n' "$label"
         rm -rf "$outdir"
         return 1
@@ -603,7 +610,7 @@ run_stage_device() {
     fi
     if ! env OMP_NUM_THREADS="$THREADS" RT_STAGE_OPENCL=1 \
             "${rgbProcEnv[@]}" RT_STAGE_PROFILE="$record" \
-            "$cli" --gpu=auto "${profileArg[@]}" \
+            "$cli" --gpu=auto "${profileArg[@]}" "${extraArgs[@]}" \
             -o "$device" -t -b16 -Y -c "$sample" >"$outdir/device.log" 2>&1; then
         printf 'FAIL\t%s\tload or export failed (stage device)\n' "$label"
         rm -rf "$outdir"
