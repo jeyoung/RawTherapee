@@ -14337,6 +14337,229 @@ void test_local_adjustments(bool available)
         }
     }
 
+    /*
+     * Retinex. Lab_Local()'s call==2 arm needs an ROI at least 5 px wide and
+     * more than 5 px tall, and the block's 0.2 strength gate. Each case
+     * compares the host block against the device node, records the node's
+     * implementation and checks the result against the same spot with the
+     * tool switched off.
+     */
+    {
+        struct RetinexCase {
+            const char* label;
+            int width;
+            int height;
+            int centre_x;
+            int centre_y;
+            int extent;
+            double strength;
+            double scales;
+            const char* method;
+            double neigh;
+            double vart;
+            double limd;
+            double cliptm;
+            double darkness;
+            double lightness;
+            double offs;
+            bool loglin;
+            int chroma;
+            int lightness_slider;
+            bool blur;
+            bool expect_change;
+        };
+        const RetinexCase reti_cases[] = {
+            {"retinex 1 pct scale 2", 260, 200, 0, 0, 2000, 1.0, 2.0,
+             "high", 50.0, 150.0, 8.0, 1.0, 2.0, 1.0, 0.0, true, 0, 0,
+             false, true},
+            {"retinex 5 pct scale 2", 260, 200, 0, 0, 2000, 5.0, 2.0,
+             "high", 50.0, 150.0, 8.0, 1.0, 2.0, 1.0, 0.0, true, 0, 0,
+             false, true},
+            {"retinex 20 pct scale 3", 260, 200, 0, 0, 2000, 20.0, 3.0,
+             "high", 120.0, 120.0, 8.0, 1.0, 2.0, 1.0, 0.0, true, 0, 0,
+             false, true},
+            {"retinex uniform scale 4", 260, 200, 0, 0, 2000, 3.0, 4.0,
+             "uni", 200.0, 100.0, 8.0, 1.0, 2.0, 1.0, 0.0, true, 0, 0,
+             false, true},
+            {"retinex low scale 5", 260, 200, 0, 0, 2000, 2.0, 5.0,
+             "low", 300.0, 200.0, 8.0, 1.0, 2.0, 1.0, 0.0, true, 0, 0,
+             false, true},
+            {"retinex dark light", 260, 200, 0, 0, 2000, 8.0, 3.0,
+             "high", 80.0, 150.0, 8.0, 1.0, 4.0, 2.0, 0.0, true, 0, 0,
+             false, true},
+            {"retinex linear light", 260, 200, 0, 0, 2000, 8.0, 2.0,
+             "high", 50.0, 150.0, 8.0, 1.0, 2.0, 1.0, 0.0, false, 0, 0,
+             false, true},
+            {"retinex clip and offset", 260, 200, 0, 0, 2000, 6.0, 3.0,
+             "high", 50.0, 150.0, 20.0, 0.5, 3.0, 0.5, 500.0, true, 0, 0,
+             false, true},
+            {"retinex colour spot", 260, 200, 0, 0, 2000, 5.0, 2.0,
+             "high", 50.0, 150.0, 8.0, 1.0, 2.0, 1.0, 0.0, true, 35, 10,
+             false, true},
+            {"retinex blur spot", 260, 200, 0, 0, 2000, 5.0, 2.0,
+             "high", 50.0, 150.0, 8.0, 1.0, 2.0, 1.0, 0.0, true, 0, 0,
+             true, true},
+            {"retinex offset ROI", 260, 200, 200, 160, 700, 5.0, 2.0,
+             "high", 80.0, 150.0, 8.0, 1.0, 2.0, 1.0, 0.0, true, 0, 0,
+             false, true},
+            {"retinex full ROI same params", 260, 200, 0, 0, 2000, 5.0, 2.0,
+             "high", 80.0, 150.0, 8.0, 1.0, 2.0, 1.0, 0.0, true, 0, 0,
+             false, true},
+            {"retinex interior ROI", 260, 200, -200, -200, 700, 5.0, 2.0,
+             "high", 80.0, 150.0, 8.0, 1.0, 2.0, 1.0, 0.0, true, 0, 0,
+             false, true},
+            {"retinex zero strength", 260, 200, 0, 0, 2000, 0.0,
+             2.0, "high", 50.0, 150.0, 8.0, 1.0, 2.0, 1.0, 0.0, true, 0, 0,
+             false, false},
+        };
+        for (std::size_t index = 0;
+             index < sizeof(reti_cases) / sizeof(reti_cases[0]); ++index) {
+            const RetinexCase& c = reti_cases[index];
+            const auto make_params = [&](rtengine::procparams::ProcParams& p) {
+                p.locallab.enabled = true;
+                auto& spot = p.locallab.spots[0];
+                spot.expreti = true;
+                spot.str = c.strength;
+                spot.scalereti = c.scales;
+                spot.retinexMethod = c.method;
+                spot.neigh = c.neigh;
+                spot.vart = c.vart;
+                spot.limd = c.limd;
+                spot.cliptm = c.cliptm;
+                spot.darkness = c.darkness;
+                spot.lightnessreti = c.lightness;
+                spot.offs = c.offs;
+                spot.loglin = c.loglin;
+                spot.equilret = false;
+                spot.fftwreti = false;
+                spot.chrrt = 0.0;
+                spot.chroma = c.chroma;
+                spot.lightness = c.lightness_slider;
+                spot.contrast = 0;
+                if (c.blur) {
+                    spot.expblur = true;
+                    spot.radius = 10.0;
+                    spot.locwavcurveden.clear();
+                }
+            };
+
+            rtengine::procparams::ProcParams reference_params;
+            reference_params.locallab.spots.push_back(localAdjustmentsSpot(
+                "retinex", c.centre_x, c.centre_y, c.extent, true, 0, 0,
+                0));
+            make_params(reference_params);
+            check(localAdjustmentsSupported(reference_params),
+                  "the Retinex case is inside the predicate");
+
+            Imagefloat reference_base(c.width, c.height);
+            fill_tonemap_rgb(reference_base, 131u + index);
+            std::unique_ptr<LabImage> reference_lab(
+                new LabImage(c.width, c.height));
+            rtengine::ImProcFunctions reference_ipf(&reference_params, false);
+            localAdjustmentsHostBlock(reference_ipf, reference_params,
+                                      &reference_base, reference_lab.get(),
+                                      c.width, c.height);
+
+            rtengine::procparams::ProcParams node_params = reference_params;
+            Imagefloat node_base(c.width, c.height);
+            fill_tonemap_rgb(node_base, 131u + index);
+            std::unique_ptr<LabImage> node_lab(
+                new LabImage(c.width, c.height));
+            rtengine::ImProcFunctions node_ipf(&node_params, false);
+            const RtStageStatus status = run_local_adjustments_node(
+                node_base, *node_lab, node_params, node_ipf, profile_path);
+            check(status == RT_STAGE_OK,
+                  "the Retinex node completes through run()");
+
+            const std::string profile = read_file(profile_path);
+            if (cpu_device) {
+                check(profile.find("\"impl\":\"opencl\"") !=
+                          std::string::npos,
+                      "the Retinex case records a device pass");
+                check(profile.find("\"impl\":\"host\"") ==
+                          std::string::npos,
+                      "the Retinex case never falls back");
+            }
+
+            const Diff diff =
+                compare(view(*reference_lab), view(*node_lab));
+            std::printf("stage-residency: local.adjustments %s: PAE %.6f "
+                        "LSB16, %zu of %zu samples differ\n", c.label,
+                        diff.max_abs, diff.differing, diff.samples);
+            check(diff.finite && diff.max_abs <= 1.0,
+                  "the Retinex result is within 1 LSB16");
+
+            if (c.expect_change) {
+                rtengine::procparams::ProcParams off_params =
+                    reference_params;
+                off_params.locallab.spots[0].expreti = false;
+                Imagefloat off_base(c.width, c.height);
+                fill_tonemap_rgb(off_base, 131u + index);
+                std::unique_ptr<LabImage> off_lab(
+                    new LabImage(c.width, c.height));
+                rtengine::ImProcFunctions off_ipf(&off_params, false);
+                localAdjustmentsHostBlock(off_ipf, off_params, &off_base,
+                                          off_lab.get(), c.width, c.height);
+                const Diff changed =
+                    compare(view(*off_lab), view(*reference_lab));
+                std::printf("stage-residency: local.adjustments %s changes "
+                            "%zu of %zu samples against the tool-off result, "
+                            "PAE %.6f LSB16\n", c.label, changed.differing,
+                            changed.samples, changed.max_abs);
+                check(changed.differing > 0,
+                      "the Retinex case is non-vacuous");
+            }
+        }
+    }
+
+    /* Retinex refusals: every configuration outside the admitted set must
+     * leave the whole block on the host. */
+    {
+        const auto refuse = [](const char* label,
+                               void (*mutate)(
+                                   rtengine::procparams::LocallabParams::
+                                       LocallabSpot&)) {
+            rtengine::procparams::ProcParams params;
+            params.locallab.spots.push_back(localAdjustmentsSpot(
+                "retinex", 0, 0, 2000, true, 0, 0, 0));
+            auto& spot = params.locallab.spots[0];
+            spot.expreti = true;
+            spot.str = 5.0;
+            spot.scalereti = 2.0;
+            mutate(spot);
+            check(!localAdjustmentsSupported(params), label);
+        };
+        refuse("Retinex scale 1 stays on the host", [](auto& spot) {
+            spot.scalereti = 1.0;
+        });
+        refuse("Retinex FFT stays on the host", [](auto& spot) {
+            spot.fftwreti = true;
+        });
+        refuse("Retinex equalise stays on the host", [](auto& spot) {
+            spot.equilret = true;
+        });
+        refuse("Retinex chroma slider stays on the host", [](auto& spot) {
+            spot.chrrt = 25.0;
+        });
+        refuse("Retinex scale above ten stays on the host", [](auto& spot) {
+            spot.scalereti = 11.0;
+        });
+        refuse("Retinex neighbour below the GUI range stays on the host",
+               [](auto& spot) { spot.neigh = 0.0; });
+        refuse("Retinex variance above the GUI range stays on the host",
+               [](auto& spot) { spot.vart = 600.0; });
+        refuse("Retinex limit below the GUI range stays on the host",
+               [](auto& spot) { spot.limd = 1.0; });
+        refuse("Retinex clip above the GUI range stays on the host",
+               [](auto& spot) { spot.cliptm = 3.0; });
+        refuse("Retinex darkness above the GUI range stays on the host",
+               [](auto& spot) { spot.darkness = 7.0; });
+        refuse("Retinex offset above the GUI range stays on the host",
+               [](auto& spot) { spot.offs = 40000.0; });
+        refuse("an unknown Retinex method stays on the host",
+               [](auto& spot) { spot.retinexMethod = "pde"; });
+    }
+
     /* Multi-spot state, RECT, inactive spots, curves and MUNS. Each case is
      * built from scratch so the make lambda owns the spot list. */
     {
