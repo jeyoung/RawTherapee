@@ -679,4 +679,16 @@ enum class BlurType {
     void lab2rgb(const LabImage &src, Imagefloat &dst, const Glib::ustring &workingSpace);
 };
 
+/*
+ * Build the tone-equaliser correction table and its fifteen band factors
+ * exactly as ImProcFunctions::toneEqualizer() does. `lut` receives one entry
+ * per 16-bit luminance code for luminance 0..1, `factors` the fifteen band
+ * factors, `w_sum` their Gaussian sum and `log2base` the host's xlogf(2)
+ * divisor used by the per-pixel branch above 1. The device node uploads this
+ * table so it cannot drift from the host path.
+ */
+void toneEqualizerTable(const procparams::ToneEqualizerParams& params,
+                        float* lut, float* factors, float& w_sum,
+                        float& log2base);
+
 }

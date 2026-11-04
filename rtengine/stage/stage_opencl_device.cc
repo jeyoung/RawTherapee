@@ -781,6 +781,22 @@ const std::string& working_trc_source()
 }
 
 /*
+ * The working.trc tone-equaliser program. The equaliser's luminance is the
+ * double-expression Color::rgbLuminance() overload, so the program needs fp64
+ * and is built only on a device that advertises it; the launcher refuses the
+ * equaliser passes otherwise and the block stays on the host.
+ */
+const std::string& working_trc_tone_source()
+{
+    static const std::string source =
+        std::string("#pragma OPENCL FP_CONTRACT OFF\n"
+                    "#pragma STDC FP_CONTRACT OFF\n"
+                    "#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n") +
+        RT_WORKING_TRC_TONE_CL;
+    return source;
+}
+
+/*
  * The ciecam program: CIE-CAM 02. The host context supplies the
  * viewing-condition scalars, the two brightness tables and the optional
  * working-space inverse; the block's arithmetic is in ciecam_cl.h. The
@@ -1380,6 +1396,8 @@ const std::vector<KernelDef>& kernels()
         {"thumbnail.rgb", rgb_proc_source().c_str(), "rt_rgb_proc"},
         {"gamut", RT_GAMUT_CL, "rt_gamut"},
         {"working.trc", working_trc_source().c_str(), "rt_working_trc_second"},
+        {"working.trc.tone", working_trc_tone_source().c_str(),
+         "rt_wt_tone_luma"},
         {"ciecam", ciecam_source().c_str(), "rt_ciecam"},
         {"lab.tools", lab_tools_source().c_str(), "rt_lab_tools_mask"},
         {"thumbnail.lab", lab_tools_source().c_str(), "rt_lab_tools_mask"},
@@ -2017,6 +2035,7 @@ cl_kernel compiled_kernel_entry(const std::shared_ptr<OpenCLEnv>& env,
      * division to a reciprocal approximation. */
     const char* build_options =
         std::strcmp(def->name, "working.trc") == 0 ||
+                std::strcmp(def->name, "working.trc.tone") == 0 ||
                 std::strcmp(def->name, "ciecam") == 0 ||
                 std::strcmp(def->name, "lab.tools") == 0 ||
                 std::strcmp(def->name, "thumbnail.lab") == 0 ||
@@ -3364,6 +3383,7 @@ RtStageStatus run_working_trc(const std::shared_ptr<OpenCLEnv>& env,
         context->version != RT_WORKING_TRC_CONTEXT_VERSION ||
         context->magic != RT_WORKING_TRC_CONTEXT_MAGIC ||
         context->build == nullptr || context->prepare == nullptr ||
+        context->host_image == nullptr || context->first_pass == nullptr ||
         context->images == nullptr) {
         error = "working.trc has an invalid host context";
         return RT_STAGE_INVALID;
@@ -3431,9 +3451,9 @@ RtStageStatus run_working_trc(const std::shared_ptr<OpenCLEnv>& env,
                              const void* value) {
         return env->api->SetKernelArg(kernel, index, bytes, value) == CL_SUCCESS;
     };
-    const auto launch = [&](cl_kernel kernel, const char* label) {
-        const std::size_t global[2] = {static_cast<std::size_t>(width),
-                                       static_cast<std::size_t>(height)};
+    const auto launch_grid = [&](cl_kernel kernel, std::size_t gw,
+                                 std::size_t gh, const char* label) {
+        const std::size_t global[2] = {gw, gh};
         cl_event done = nullptr;
         if (env->api->EnqueueNDRangeKernel(env->queue, kernel, 2, nullptr,
                                            global, nullptr, 0, nullptr,
@@ -3450,10 +3470,439 @@ RtStageStatus run_working_trc(const std::shared_ptr<OpenCLEnv>& env,
         }
         return true;
     };
+    const auto launch = [&](cl_kernel kernel, const char* label) {
+        return launch_grid(kernel, static_cast<std::size_t>(width),
+                           static_cast<std::size_t>(height), label);
+    };
 
     StageDeviceBufferPtr lab_device;
     std::vector<float> prepared_scratch;
     RtStageBuffer prepared = lab;
+
+    /*
+     * The tone-equaliser arms. The host context carries the block's own
+     * correction tables and scalars; the device reproduces guidedFilterLog()
+     * and the per-pixel apply. The kernels need fp64 for the double
+     * luminance, so a device without it refuses and the block stays on the
+     * host.
+     */
+    const bool tone_mid = context->tone_mid != 0;
+    const bool tone_smooth = context->tone_smooth != 0;
+    const bool tone = tone_mid || tone_smooth;
+
+    cl_kernel tone_luma_kernel = nullptr;
+    cl_kernel tone_log_kernel = nullptr;
+    cl_kernel tone_subsample_kernel = nullptr;
+    cl_kernel tone_box_h_kernel = nullptr;
+    cl_kernel tone_box_v_kernel = nullptr;
+    cl_kernel tone_combine_kernel = nullptr;
+    cl_kernel tone_upsample_kernel = nullptr;
+    cl_kernel tone_apply_kernel = nullptr;
+    StageDeviceBufferPtr tone_y;
+    StageDeviceBufferPtr tone_q;
+    StageDeviceBufferPtr tone_i1;
+    StageDeviceBufferPtr tone_p1;
+    StageDeviceBufferPtr tone_meani;
+    StageDeviceBufferPtr tone_meanp;
+    StageDeviceBufferPtr tone_temp;
+    StageDeviceBufferPtr tone_mid_lut_device;
+    StageDeviceBufferPtr tone_mid_param_device;
+    StageDeviceBufferPtr tone_smooth_lut_device;
+    StageDeviceBufferPtr tone_smooth_param_device;
+    int tone_sw = 0;
+    int tone_sh = 0;
+    int tone_box_radius = 0;
+    char tone_keys[12] = {};
+
+    if (tone) {
+        cl_device_fp_config fp64 = 0;
+        if (env->api->GetDeviceInfo(env->device, CL_DEVICE_DOUBLE_FP_CONFIG,
+                                    sizeof(fp64), &fp64, nullptr) != CL_SUCCESS ||
+            fp64 == 0) {
+            error = "working.trc tone equaliser needs device fp64";
+            return RT_STAGE_FALLBACK;
+        }
+        const KernelDef* tone_def = find_kernel("working.trc.tone");
+        assert(tone_def != nullptr);
+        tone_luma_kernel = compiled_kernel_entry(
+            env, tone_def, "rt_wt_tone_luma", error);
+        tone_log_kernel = compiled_kernel_entry(
+            env, tone_def, "rt_wt_tone_log", error);
+        tone_subsample_kernel = compiled_kernel_entry(
+            env, tone_def, "rt_wt_tone_subsample", error);
+        tone_box_h_kernel = compiled_kernel_entry(
+            env, tone_def, "rt_wt_tone_box_h", error);
+        tone_box_v_kernel = compiled_kernel_entry(
+            env, tone_def, "rt_wt_tone_box_v", error);
+        tone_combine_kernel = compiled_kernel_entry(
+            env, tone_def, "rt_wt_tone_combine", error);
+        tone_upsample_kernel = compiled_kernel_entry(
+            env, tone_def, "rt_wt_tone_upsample", error);
+        tone_apply_kernel = compiled_kernel_entry(
+            env, tone_def, "rt_wt_tone_apply", error);
+        if (tone_luma_kernel == nullptr || tone_log_kernel == nullptr ||
+            tone_subsample_kernel == nullptr ||
+            tone_box_h_kernel == nullptr || tone_box_v_kernel == nullptr ||
+            tone_combine_kernel == nullptr ||
+            tone_upsample_kernel == nullptr || tone_apply_kernel == nullptr) {
+            return RT_STAGE_FALLBACK;
+        }
+
+        /* guidedfilter.cc's calculate_subsampling() for the block's fixed
+         * radius of five. */
+        const int subsampling = workingTrcToneSubsampling(width, height);
+        tone_sw = width / subsampling;
+        tone_sh = height / subsampling;
+        if (tone_sw < 3 || tone_sh < 3) {
+            error = "working.trc tone equaliser image is too small";
+            return RT_STAGE_FALLBACK;
+        }
+        /* f_mean()'s radius clamp for the block's fixed detail of five. */
+        tone_box_radius =
+            guidedFilterBoxRadius(5, subsampling, tone_sw, tone_sh);
+
+        const StageBufferShape full_plane{RT_STAGE_F32, width, height, 1};
+        const StageBufferShape sub_plane{RT_STAGE_F32, tone_sw, tone_sh, 1};
+        const StageBufferShape lut_shape{
+            RT_STAGE_F32,
+            static_cast<std::int32_t>(RT_WORKING_TRC_TONE_ENTRIES), 1, 1};
+        const StageBufferShape tone_param_shape{RT_STAGE_F32, 17, 1, 1};
+
+        tone_y = residency->acquire(&tone_keys[0], full_plane, &error);
+        tone_q = residency->acquire(&tone_keys[1], full_plane, &error);
+        tone_i1 = residency->acquire(&tone_keys[2], sub_plane, &error);
+        tone_p1 = residency->acquire(&tone_keys[3], sub_plane, &error);
+        tone_meani = residency->acquire(&tone_keys[4], sub_plane, &error);
+        tone_meanp = residency->acquire(&tone_keys[5], sub_plane, &error);
+        tone_temp = residency->acquire(&tone_keys[6], sub_plane, &error);
+        if (!tone_y || !tone_q || !tone_i1 || !tone_p1 || !tone_meani ||
+            !tone_meanp || !tone_temp) {
+            return RT_STAGE_FALLBACK;
+        }
+        if (pitch_of(tone_y) != pitch_of(tone_q) ||
+            pitch_of(tone_i1) != pitch_of(tone_p1) ||
+            pitch_of(tone_i1) != pitch_of(tone_meani) ||
+            pitch_of(tone_i1) != pitch_of(tone_meanp) ||
+            pitch_of(tone_i1) != pitch_of(tone_temp)) {
+            error = "working.trc tone scratch pitches disagree";
+            return RT_STAGE_FALLBACK;
+        }
+
+        /* One table and one scalar block per arm that runs. */
+        const auto upload_tone = [&](char* lut_key, char* param_key,
+                                     const float* lut, const float* factors,
+                                     float wsum, float log2base,
+                                     StageDeviceBufferPtr& lut_device,
+                                     StageDeviceBufferPtr& param_device) {
+            lut_device = residency->acquire(lut_key, lut_shape, &error);
+            param_device = residency->acquire(param_key, tone_param_shape,
+                                              &error);
+            if (!lut_device || !param_device) {
+                return false;
+            }
+            RtStageBuffer lut_host{};
+            lut_host.size = sizeof(RtStageBuffer);
+            lut_host.data = const_cast<float*>(lut);
+            lut_host.width = RT_WORKING_TRC_TONE_ENTRIES;
+            lut_host.height = 1;
+            lut_host.row_pitch =
+                RT_WORKING_TRC_TONE_ENTRIES * sizeof(float);
+            lut_host.plane_pitch = lut_host.row_pitch;
+            lut_host.planes = 1;
+            lut_host.format = RT_STAGE_F32;
+            lut_host.flags = RT_STAGE_BUFFER_READ;
+
+            float params[17] = {};
+            for (unsigned band = 0; band < RT_WORKING_TRC_TONE_BANDS;
+                 ++band) {
+                params[band] = factors[band];
+            }
+            params[15] = wsum;
+            params[16] = log2base;
+            RtStageBuffer param_host = lut_host;
+            param_host.data = params;
+            param_host.width = 17;
+            param_host.row_pitch = 17 * sizeof(float);
+            param_host.plane_pitch = param_host.row_pitch;
+            return residency->upload(lut_device, lut_host) == RT_STAGE_OK &&
+                   residency->upload(param_device, param_host) ==
+                       RT_STAGE_OK;
+        };
+
+        if ((tone_mid &&
+             !upload_tone(&tone_keys[7], &tone_keys[8], context->tone_mid_lut,
+                          context->tone_mid_factors, context->tone_mid_wsum,
+                          context->tone_mid_log2, tone_mid_lut_device,
+                          tone_mid_param_device)) ||
+            (tone_smooth &&
+             !upload_tone(&tone_keys[9], &tone_keys[10],
+                          context->tone_smooth_lut,
+                          context->tone_smooth_factors,
+                          context->tone_smooth_wsum,
+                          context->tone_smooth_log2, tone_smooth_lut_device,
+                          tone_smooth_param_device))) {
+            error = "working.trc tone table upload failed";
+            return RT_STAGE_FALLBACK;
+        }
+    }
+
+    /*
+     * One tone-equaliser round on a three-plane RGB image, in place: the
+     * luminance, guidedFilterLog() and the per-pixel apply. `rgb_pitch` and
+     * `rgb_plane` describe the caller's device buffer.
+     */
+    const auto run_tone = [&](cl_mem rgb_memory, const cl_int rgb_pitch,
+                              const cl_int rgb_plane, cl_mem lut_memory,
+                              cl_mem param_memory, const cl_float gain,
+                              const cl_float inv_gain,
+                              const char* label) -> bool {
+        const cl_mem y_memory = memory_of(tone_y);
+        const cl_mem q_memory = memory_of(tone_q);
+        const cl_mem i1_memory = memory_of(tone_i1);
+        const cl_mem p1_memory = memory_of(tone_p1);
+        const cl_mem meani_memory = memory_of(tone_meani);
+        const cl_mem meanp_memory = memory_of(tone_meanp);
+        const cl_mem temp_memory = memory_of(tone_temp);
+        if (rgb_memory == nullptr || lut_memory == nullptr ||
+            param_memory == nullptr || y_memory == nullptr ||
+            q_memory == nullptr || i1_memory == nullptr ||
+            p1_memory == nullptr || meani_memory == nullptr ||
+            meanp_memory == nullptr || temp_memory == nullptr) {
+            error = std::string(label) + " could not address its buffers";
+            return false;
+        }
+
+        const cl_int cl_width = width;
+        const cl_int cl_height = height;
+        const cl_int cl_sw = tone_sw;
+        const cl_int cl_sh = tone_sh;
+        const cl_int cl_rad = tone_box_radius;
+        const cl_int y_pitch = static_cast<cl_int>(pitch_of(tone_y));
+        const cl_int sub_pitch = static_cast<cl_int>(pitch_of(tone_i1));
+        const cl_float sub_col =
+            static_cast<cl_float>(width) / static_cast<cl_float>(tone_sw);
+        const cl_float sub_row =
+            static_cast<cl_float>(height) / static_cast<cl_float>(tone_sh);
+        const cl_float up_col =
+            static_cast<cl_float>(tone_sw) / static_cast<cl_float>(width);
+        const cl_float up_row =
+            static_cast<cl_float>(tone_sh) / static_cast<cl_float>(height);
+        const cl_double wy0 = context->tone_wy[0];
+        const cl_double wy1 = context->tone_wy[1];
+        const cl_double wy2 = context->tone_wy[2];
+        const cl_float epsilon = 0.014f;
+
+        std::lock_guard<std::recursive_mutex> lock(env->queue_mutex);
+        cl_uint arg = 0;
+        bool ok = true;
+
+        arg = 0;
+        ok = ok && set_arg(tone_luma_kernel, arg++, sizeof(cl_mem),
+                           &rgb_memory);
+        ok = ok && set_arg(tone_luma_kernel, arg++, sizeof(cl_mem),
+                           &y_memory);
+        ok = ok && set_arg(tone_luma_kernel, arg++, sizeof(cl_double), &wy0);
+        ok = ok && set_arg(tone_luma_kernel, arg++, sizeof(cl_double), &wy1);
+        ok = ok && set_arg(tone_luma_kernel, arg++, sizeof(cl_double), &wy2);
+        ok = ok && set_arg(tone_luma_kernel, arg++, sizeof(cl_float), &gain);
+        ok = ok && set_arg(tone_luma_kernel, arg++, sizeof(cl_int), &cl_width);
+        ok = ok && set_arg(tone_luma_kernel, arg++, sizeof(cl_int), &cl_height);
+        ok = ok && set_arg(tone_luma_kernel, arg++, sizeof(cl_int), &rgb_pitch);
+        ok = ok && set_arg(tone_luma_kernel, arg++, sizeof(cl_int), &rgb_plane);
+        ok = ok && set_arg(tone_luma_kernel, arg++, sizeof(cl_int), &y_pitch);
+        if (!ok || !launch_grid(tone_luma_kernel, width, height,
+                                "working.trc tone luminance")) {
+            error = std::string(label) + " luminance failed";
+            return false;
+        }
+
+        arg = 0;
+        ok = ok && set_arg(tone_log_kernel, arg++, sizeof(cl_mem), &y_memory);
+        ok = ok && set_arg(tone_log_kernel, arg++, sizeof(cl_int), &cl_width);
+        ok = ok && set_arg(tone_log_kernel, arg++, sizeof(cl_int), &cl_height);
+        ok = ok && set_arg(tone_log_kernel, arg++, sizeof(cl_int), &y_pitch);
+        if (!ok || !launch_grid(tone_log_kernel, width, height,
+                                "working.trc tone log")) {
+            error = std::string(label) + " log failed";
+            return false;
+        }
+
+        arg = 0;
+        ok = ok && set_arg(tone_subsample_kernel, arg++, sizeof(cl_mem),
+                           &y_memory);
+        ok = ok && set_arg(tone_subsample_kernel, arg++, sizeof(cl_mem),
+                           &i1_memory);
+        ok = ok && set_arg(tone_subsample_kernel, arg++, sizeof(cl_mem),
+                           &p1_memory);
+        ok = ok && set_arg(tone_subsample_kernel, arg++, sizeof(cl_int),
+                           &cl_sw);
+        ok = ok && set_arg(tone_subsample_kernel, arg++, sizeof(cl_int),
+                           &cl_sh);
+        ok = ok && set_arg(tone_subsample_kernel, arg++, sizeof(cl_int),
+                           &cl_width);
+        ok = ok && set_arg(tone_subsample_kernel, arg++, sizeof(cl_int),
+                           &cl_height);
+        ok = ok && set_arg(tone_subsample_kernel, arg++, sizeof(cl_int),
+                           &y_pitch);
+        ok = ok && set_arg(tone_subsample_kernel, arg++, sizeof(cl_int),
+                           &sub_pitch);
+        ok = ok && set_arg(tone_subsample_kernel, arg++, sizeof(cl_float),
+                           &sub_col);
+        ok = ok && set_arg(tone_subsample_kernel, arg++, sizeof(cl_float),
+                           &sub_row);
+        if (!ok || !launch_grid(tone_subsample_kernel, tone_sw, tone_sh,
+                                "working.trc tone subsample")) {
+            error = std::string(label) + " subsample failed";
+            return false;
+        }
+
+        const auto box = [&](cl_mem src, cl_mem dst) -> bool {
+            cl_uint index = 0;
+            bool good = true;
+            good = good && set_arg(tone_box_h_kernel, index++, sizeof(cl_mem),
+                                   &src);
+            good = good && set_arg(tone_box_h_kernel, index++, sizeof(cl_mem),
+                                   &temp_memory);
+            good = good && set_arg(tone_box_h_kernel, index++, sizeof(cl_int),
+                                   &cl_rad);
+            good = good && set_arg(tone_box_h_kernel, index++, sizeof(cl_int),
+                                   &cl_sw);
+            good = good && set_arg(tone_box_h_kernel, index++, sizeof(cl_int),
+                                   &cl_sh);
+            good = good && set_arg(tone_box_h_kernel, index++, sizeof(cl_int),
+                                   &sub_pitch);
+            if (!good || !launch_grid(tone_box_h_kernel, 1, tone_sh,
+                                      "working.trc tone box h")) {
+                return false;
+            }
+            index = 0;
+            good = true;
+            good = good && set_arg(tone_box_v_kernel, index++, sizeof(cl_mem),
+                                   &temp_memory);
+            good = good && set_arg(tone_box_v_kernel, index++, sizeof(cl_mem),
+                                   &dst);
+            good = good && set_arg(tone_box_v_kernel, index++, sizeof(cl_int),
+                                   &cl_rad);
+            good = good && set_arg(tone_box_v_kernel, index++, sizeof(cl_int),
+                                   &cl_sw);
+            good = good && set_arg(tone_box_v_kernel, index++, sizeof(cl_int),
+                                   &cl_sh);
+            good = good && set_arg(tone_box_v_kernel, index++, sizeof(cl_int),
+                                   &sub_pitch);
+            return good && launch_grid(tone_box_v_kernel, tone_sw, 1,
+                                       "working.trc tone box v");
+        };
+        const auto combine = [&](cl_mem dst, cl_mem a, cl_mem b, cl_mem c,
+                                 cl_int op) -> bool {
+            cl_uint index = 0;
+            bool good = true;
+            good = good && set_arg(tone_combine_kernel, index++, sizeof(cl_mem),
+                                   &dst);
+            good = good && set_arg(tone_combine_kernel, index++, sizeof(cl_mem),
+                                   &a);
+            good = good && set_arg(tone_combine_kernel, index++, sizeof(cl_mem),
+                                   &b);
+            good = good && set_arg(tone_combine_kernel, index++, sizeof(cl_mem),
+                                   &c);
+            good = good && set_arg(tone_combine_kernel, index++, sizeof(cl_int),
+                                   &op);
+            good = good && set_arg(tone_combine_kernel, index++,
+                                   sizeof(cl_float), &epsilon);
+            good = good && set_arg(tone_combine_kernel, index++, sizeof(cl_int),
+                                   &sub_pitch);
+            good = good && set_arg(tone_combine_kernel, index++, sizeof(cl_int),
+                                   &cl_sw);
+            good = good && set_arg(tone_combine_kernel, index++, sizeof(cl_int),
+                                   &cl_sh);
+            return good && launch_grid(tone_combine_kernel, tone_sw, tone_sh,
+                                       "working.trc tone combine");
+        };
+
+        if (!box(i1_memory, meani_memory) ||
+            !box(p1_memory, meanp_memory)) {
+            error = std::string(label) + " mean passes failed";
+            return false;
+        }
+        if (!combine(p1_memory, i1_memory, p1_memory, p1_memory, 0) ||
+            !box(p1_memory, p1_memory)) {
+            error = std::string(label) + " source correlation failed";
+            return false;
+        }
+        if (!combine(i1_memory, i1_memory, i1_memory, i1_memory, 0) ||
+            !box(i1_memory, i1_memory)) {
+            error = std::string(label) + " guide correlation failed";
+            return false;
+        }
+        if (!combine(i1_memory, meani_memory, meani_memory, i1_memory, 1) ||
+            !combine(p1_memory, meani_memory, meanp_memory, p1_memory, 1)) {
+            error = std::string(label) + " variance failed";
+            return false;
+        }
+        if (!combine(i1_memory, p1_memory, i1_memory, i1_memory, 2) ||
+            !combine(p1_memory, i1_memory, meani_memory, meanp_memory, 1)) {
+            error = std::string(label) + " coefficients failed";
+            return false;
+        }
+        if (!box(i1_memory, i1_memory) || !box(p1_memory, p1_memory)) {
+            error = std::string(label) + " coefficient means failed";
+            return false;
+        }
+
+        arg = 0;
+        ok = ok && set_arg(tone_upsample_kernel, arg++, sizeof(cl_mem),
+                           &i1_memory);
+        ok = ok && set_arg(tone_upsample_kernel, arg++, sizeof(cl_mem),
+                           &p1_memory);
+        ok = ok && set_arg(tone_upsample_kernel, arg++, sizeof(cl_mem),
+                           &y_memory);
+        ok = ok && set_arg(tone_upsample_kernel, arg++, sizeof(cl_mem),
+                           &q_memory);
+        ok = ok && set_arg(tone_upsample_kernel, arg++, sizeof(cl_int),
+                           &cl_sw);
+        ok = ok && set_arg(tone_upsample_kernel, arg++, sizeof(cl_int),
+                           &cl_sh);
+        ok = ok && set_arg(tone_upsample_kernel, arg++, sizeof(cl_int),
+                           &cl_width);
+        ok = ok && set_arg(tone_upsample_kernel, arg++, sizeof(cl_int),
+                           &cl_height);
+        ok = ok && set_arg(tone_upsample_kernel, arg++, sizeof(cl_int),
+                           &sub_pitch);
+        ok = ok && set_arg(tone_upsample_kernel, arg++, sizeof(cl_int),
+                           &y_pitch);
+        ok = ok && set_arg(tone_upsample_kernel, arg++, sizeof(cl_float),
+                           &up_col);
+        ok = ok && set_arg(tone_upsample_kernel, arg++, sizeof(cl_float),
+                           &up_row);
+        if (!ok || !launch_grid(tone_upsample_kernel, width, height,
+                                "working.trc tone upsample")) {
+            error = std::string(label) + " upsample failed";
+            return false;
+        }
+
+        arg = 0;
+        ok = ok && set_arg(tone_apply_kernel, arg++, sizeof(cl_mem),
+                           &rgb_memory);
+        ok = ok && set_arg(tone_apply_kernel, arg++, sizeof(cl_mem),
+                           &q_memory);
+        ok = ok && set_arg(tone_apply_kernel, arg++, sizeof(cl_mem),
+                           &lut_memory);
+        ok = ok && set_arg(tone_apply_kernel, arg++, sizeof(cl_mem),
+                           &param_memory);
+        ok = ok && set_arg(tone_apply_kernel, arg++, sizeof(cl_float), &gain);
+        ok = ok && set_arg(tone_apply_kernel, arg++, sizeof(cl_float),
+                           &inv_gain);
+        ok = ok && set_arg(tone_apply_kernel, arg++, sizeof(cl_int), &cl_width);
+        ok = ok && set_arg(tone_apply_kernel, arg++, sizeof(cl_int), &cl_height);
+        ok = ok && set_arg(tone_apply_kernel, arg++, sizeof(cl_int), &rgb_pitch);
+        ok = ok && set_arg(tone_apply_kernel, arg++, sizeof(cl_int), &rgb_plane);
+        ok = ok && set_arg(tone_apply_kernel, arg++, sizeof(cl_int), &y_pitch);
+        if (!ok || !launch_grid(tone_apply_kernel, width, height,
+                                "working.trc tone apply")) {
+            error = std::string(label) + " apply failed";
+            return false;
+        }
+        return true;
+    };
 
     /*
      * The soft-light pre-pass. It writes only the private device copy; the
@@ -3633,6 +4082,55 @@ RtStageStatus run_working_trc(const std::shared_ptr<OpenCLEnv>& env,
      * caller's Lab or the frozen readback. */
     if (context->prepare(context->self, &prepared) != 0) {
         error = "working.trc host prefix failed";
+        return RT_STAGE_FALLBACK;
+    }
+
+    /*
+     * The block's midtone equaliser runs between lab2rgb() and the fixed
+     * sRGB inverse. It is a device round on the prepared host first pass; the
+     * result is read back before the host inverse, so build() sees exactly
+     * the image the CPU block passes to its second workingtrc() call.
+     */
+    if (tone_mid) {
+        RtStageBuffer mid_host{};
+        if (context->host_image(context->self, &mid_host) != 0 ||
+            !valid(mid_host) || mid_host.format != RT_STAGE_F32 ||
+            mid_host.planes != 3 || mid_host.width != width ||
+            mid_host.height != height) {
+            error = "working.trc tone host image is unusable";
+            return RT_STAGE_FALLBACK;
+        }
+        StageDeviceBufferPtr mid_device =
+            residency->acquire(mid_host.data, image_shape, &error);
+        if (!mid_device ||
+            residency->upload(mid_device, mid_host) != RT_STAGE_OK) {
+            error = "working.trc tone upload failed";
+            return RT_STAGE_FALLBACK;
+        }
+        if (!covers(mid_device)) {
+            error = "working.trc tone pitch does not cover the image";
+            return RT_STAGE_FALLBACK;
+        }
+        const cl_mem mid_memory = memory_of(mid_device);
+        const cl_mem mid_lut_memory = memory_of(tone_mid_lut_device);
+        const cl_mem mid_param_memory = memory_of(tone_mid_param_device);
+        if (!run_tone(mid_memory,
+                      static_cast<cl_int>(pitch_of(mid_device)),
+                      static_cast<cl_int>(plane_pitch_of(mid_device)),
+                      mid_lut_memory, mid_param_memory, context->tone_gain,
+                      context->tone_inv_gain, "working.trc midtone")) {
+            return RT_STAGE_FALLBACK;
+        }
+        if (residency->readback(mid_device, mid_host) != RT_STAGE_OK) {
+            error = "working.trc tone readback failed";
+            return RT_STAGE_FALLBACK;
+        }
+    }
+
+    /* The fixed sRGB inverse runs on the prepared (and possibly equalised)
+     * host first pass. */
+    if (context->first_pass(context->self) != 0) {
+        error = "working.trc first pass failed";
         return RT_STAGE_FALLBACK;
     }
 
@@ -3888,6 +4386,21 @@ RtStageStatus run_working_trc(const std::shared_ptr<OpenCLEnv>& env,
                 return RT_STAGE_FALLBACK;
             }
             if (!launch(apsatur_kernel, "working.trc saturation")) {
+                return RT_STAGE_FALLBACK;
+            }
+        }
+
+        /*
+         * The block's white-distribution equaliser runs on the post-TRC
+         * image, after apsatur() and before the return to Lab. `post` is
+         * already on the device, so the round happens in place.
+         */
+        if (tone_smooth) {
+            if (!run_tone(post_memory, cl_rgb_pitch, cl_rgb_plane,
+                          memory_of(tone_smooth_lut_device),
+                          memory_of(tone_smooth_param_device),
+                          context->tone_gain, context->tone_inv_gain,
+                          "working.trc smooth equaliser")) {
                 return RT_STAGE_FALLBACK;
             }
         }

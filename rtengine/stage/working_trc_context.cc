@@ -64,6 +64,13 @@ constexpr int OPACITY_CURVE_ENTRIES = 501;
 /* complete_local_contrast() treats an all-0.5 curve as inactive. */
 constexpr float OPACITY_CURVE_FLAT = 0.5f;
 
+/* The GUI ranges of the working-TRC tone equalisers (icmpanel.cc): the
+ * midtone slider spans +-100 and the white-distribution slider 0..1.5. */
+constexpr double WMIDTCIE_MIN = -100.0;
+constexpr double WMIDTCIE_MAX = 100.0;
+constexpr double WSMOOTHSLI_MIN = 0.0;
+constexpr double WSMOOTHSLI_MAX = 1.5;
+
 /* One pixel copy across pitches, in the engine's own chain order. */
 void copy_first_pass(const RtStageBuffer& src, Imagefloat& dst)
 {
@@ -100,9 +107,47 @@ int prepare_thunk(void* self, const RtStageBuffer* lab)
     return static_cast<WorkingTrcContext*>(self)->prepareBuffer(*lab);
 }
 
+int host_image_thunk(void* self, RtStageBuffer* out)
+{
+    return static_cast<WorkingTrcContext*>(self)->hostImage(*out);
+}
+
+int first_pass_thunk(void* self)
+{
+    return static_cast<WorkingTrcContext*>(self)->firstPass() ? 0 : 1;
+}
+
 int images_thunk(void* self, RtStageBuffer* xyz, RtStageBuffer* linear)
 {
     return static_cast<WorkingTrcContext*>(self)->images(*xyz, *linear);
+}
+
+/* The block's own midtone-equaliser derivation (wmidtcie). */
+void midtoneEqualizerParams(int midton, ToneEqualizerParams& teParams)
+{
+    teParams.enabled = true;
+    teParams.regularization = 0;
+    teParams.pivot = 0.f;
+    teParams.bands = {0, 0, 0, 0, 0, 0};
+    teParams.bands[2] = midton;
+    const int mid = std::abs(midton);
+    const int threshmid = 50;
+    if (mid > threshmid) {
+        teParams.bands[1] = sign(midton) * (mid - threshmid);
+        teParams.bands[3] = sign(midton) * (mid - threshmid);
+    }
+}
+
+/* The block's own white-distribution equaliser derivation (wsmoothciesli). */
+void smoothEqualizerParams(float smoothisli, ToneEqualizerParams& teParams)
+{
+    teParams.enabled = true;
+    teParams.regularization = 0;
+    teParams.pivot = 0.f;
+    teParams.bands = {0, 0, 0, 0, 0, 0};
+    teParams.bands[4] = -30 * smoothisli;
+    const float smooth5 = std::min(smoothisli, 1.f);
+    teParams.bands[5] = -80 * smooth5;
 }
 
 } // namespace
@@ -115,6 +160,18 @@ bool workingTrcProfileSupported(const Glib::ustring& profile)
         }
     }
     return false;
+}
+
+int workingTrcToneSubsampling(int width, int height)
+{
+    /* guidedfilter.cc's calculate_subsampling() for the equaliser's fixed
+     * radius of five. A radius of one is excluded by the fixed detail of
+     * five, and the 600-pixel short circuit covers small previews; above it
+     * five divides the radius, so the loop's first test wins. */
+    if (std::max(width, height) <= 600) {
+        return 1;
+    }
+    return 5;
 }
 
 bool workingTrcSupported(const procparams::ProcParams& params)
@@ -143,10 +200,16 @@ bool workingTrcSupported(const procparams::ProcParams& params)
         (params.softlight.strength < 1 || params.softlight.strength > 100)) {
         return false;
     }
-    if (icm.wmidtcie != 0.0) {
+    /* The two tone equalisers the block runs on this image. Both are admitted
+     * at their GUI ranges; the block fixes their pivot at zero, their scale at
+     * one and their regularization at zero, so the host can build the
+     * correction table and the device apply it. A value outside the range (or
+     * a NaN, which fails both comparisons) stays a host residual. */
+    if (!(icm.wmidtcie >= WMIDTCIE_MIN && icm.wmidtcie <= WMIDTCIE_MAX)) {
         return false;
     }
-    if (icm.wsmoothciesli != 0.0) {
+    if (!(icm.wsmoothciesli >= WSMOOTHSLI_MIN &&
+          icm.wsmoothciesli <= WSMOOTHSLI_MAX)) {
         return false;
     }
     if (icm.fbw) {
@@ -235,19 +298,7 @@ void workingTrcHostBlock(ImProcFunctions& ipf,
         const int midton = params.icm.wmidtcie;
         if (midton != 0) {
             ToneEqualizerParams teParams;
-            teParams.enabled = true;
-            teParams.regularization = 0.f;
-            teParams.pivot = 0.f;
-            teParams.bands[0] = 0;
-            teParams.bands[2] = midton;
-            teParams.bands[4] = 0;
-            teParams.bands[5] = 0;
-            int mid = abs(midton);
-            int threshmid = 50;
-            if (mid > threshmid) {
-                teParams.bands[1] = sign(midton) * (mid - threshmid);
-                teParams.bands[3] = sign(midton) * (mid - threshmid);
-            }
+            midtoneEqualizerParams(midton, teParams);
             ipf.toneEqualizer(tmpImage1.get(), teParams, prof, 1, false);
         }
 
@@ -266,22 +317,7 @@ void workingTrcHostBlock(ImProcFunctions& ipf,
 
         if (smoothisli > 0.f) {
             ToneEqualizerParams teParams;
-            teParams.enabled = true;
-            teParams.regularization = 0.f;
-            teParams.pivot = 0.f;
-            teParams.bands[0] = 0;
-            teParams.bands[1] = 0;
-            teParams.bands[2] = 0;
-            teParams.bands[3] = 0;
-            teParams.bands[4] = -40; //arbitrary value to adapt with WhiteEvjz - here White Ev # 10
-            teParams.bands[5] = -80; //8 Ev and above
-            bool Evsix = true;
-            if (Evsix) { //EV = 6 majority of images
-                teParams.bands[4] = -30 * smoothisli;
-                float smmothsli5 = std::min(smoothisli, 1.f);
-                teParams.bands[5] = -80 * smmothsli5;
-            }
-
+            smoothEqualizerParams(smoothisli, teParams);
             ipf.toneEqualizer(tmpImage1.get(), teParams, prof, 1, false);
         }
 
@@ -325,6 +361,8 @@ RtWorkingTrcContext WorkingTrcContext::descriptor(bool supported)
     context.build = &build_thunk;
     context.run_host = &run_host_thunk;
     context.prepare = &prepare_thunk;
+    context.host_image = &host_image_thunk;
+    context.first_pass = &first_pass_thunk;
     context.images = &images_thunk;
 
     const bool softlight = params_.softlight.enabled &&
@@ -349,6 +387,54 @@ RtWorkingTrcContext WorkingTrcContext::descriptor(bool supported)
             }
         }
     }
+
+    /*
+     * The two tone equalisers the block runs. The host derives the same
+     * parameters the block does, builds the correction table through the
+     * shared host builder and exports only scalars and tables; the device
+     * computes the guided-filtered luminance and applies the correction.
+     */
+    const int midton = params_.icm.wmidtcie;
+    const float smoothisli = params_.icm.wsmoothciesli;
+    const bool toneMid = supported && midton != 0;
+    const bool toneSmooth = supported && smoothisli > 0.f;
+    context.tone_mid = toneMid ? 1u : 0u;
+    context.tone_smooth = toneSmooth ? 1u : 0u;
+    if (toneMid || toneSmooth) {
+        /* Color::rgbLuminance()'s working-space row, in double. */
+        const TMatrix ws = ICCStore::getInstance()->workingSpaceMatrix(
+            params_.icm.workingProfile);
+        for (int i = 0; i < 3; ++i) {
+            context.tone_wy[i] = ws[1][i];
+        }
+        /* Both block calls pass pivot 0, so the gain is 1/65535 and its
+         * reciprocal is what the closing multiply uses. */
+        const float gain = 1.f / 65535.f;
+        context.tone_gain = gain;
+        context.tone_inv_gain = 1.f / gain;
+
+        const auto build_tone = [&](const ToneEqualizerParams& te,
+                                    std::vector<float>& lut, float* factors,
+                                    float& wsum, float& log2v) {
+            lut.resize(RT_WORKING_TRC_TONE_ENTRIES);
+            rtengine::toneEqualizerTable(te, lut.data(), factors, wsum,
+                                         log2v);
+        };
+        if (toneMid) {
+            ToneEqualizerParams te;
+            midtoneEqualizerParams(midton, te);
+            build_tone(te, toneMidLut_, context.tone_mid_factors,
+                       context.tone_mid_wsum, context.tone_mid_log2);
+            context.tone_mid_lut = toneMidLut_.data();
+        }
+        if (toneSmooth) {
+            ToneEqualizerParams te;
+            smoothEqualizerParams(smoothisli, te);
+            build_tone(te, toneSmoothLut_, context.tone_smooth_factors,
+                       context.tone_smooth_wsum, context.tone_smooth_log2);
+            context.tone_smooth_lut = toneSmoothLut_.data();
+        }
+    }
     return context;
 }
 
@@ -365,14 +451,32 @@ bool WorkingTrcContext::prepare(const LabImage& lab)
     }
 
     /*
-     * The host prefix: the block's own lab2rgb() and fixed first pass. The
-     * reference copy is taken before the inverse so apsatur() has the same
-     * linear image the block copies. Doing this on the host is what makes the
-     * probe, the profile and the pass-2 input independent of the device
-     * compiler's float semantics.
+     * The host prefix's first half: the block's own lab2rgb() and the linear
+     * reference copy. The reference is taken before the inverse (and before
+     * the midtone equaliser) so apsatur() has the same linear image the block
+     * copies. Doing this on the host is what makes the probe, the profile and
+     * the pass-2 input independent of the device compiler's float semantics.
      */
     ipf_.lab2rgb(lab, *firstPass_, params_.icm.workingProfile);
     firstPass_->copyData(linearRef_.get());
+    prepared_ = true;
+    return true;
+}
+
+int WorkingTrcContext::hostImage(RtStageBuffer& out) const
+{
+    if (!prepared_ || firstPass_ == nullptr) {
+        return 1;
+    }
+    out = stage::view(*firstPass_);
+    return 0;
+}
+
+bool WorkingTrcContext::firstPass()
+{
+    if (!prepared_ || firstPass_ == nullptr) {
+        return false;
+    }
 
     float rdx = 0.f;
     float rdy = 0.f;
@@ -390,11 +494,11 @@ bool WorkingTrcContext::prepare(const LabImage& lab)
     int illum = 0;
     Glib::ustring prof = params_.icm.workingProfile;
 
-    ipf_.workingtrc(0, firstPass_.get(), firstPass_.get(), lab.W, lab.H, -5,
-                    prof, WORKING_TRC_FIRST_GAMMA, WORKING_TRC_FIRST_SLOPE,
-                    0, illum, 0, 0, rdx, rdy, grx, gry, blx, bly, meanx,
-                    meany, meanxe, meanye, maxdat, p, dummy, true, false,
-                    false, false);
+    ipf_.workingtrc(0, firstPass_.get(), firstPass_.get(), firstPass_->getWidth(),
+                    firstPass_->getHeight(), -5, prof, WORKING_TRC_FIRST_GAMMA,
+                    WORKING_TRC_FIRST_SLOPE, 0, illum, 0, 0, rdx, rdy, grx,
+                    gry, blx, bly, meanx, meany, meanxe, meanye, maxdat, p,
+                    dummy, true, false, false, false);
     return true;
 }
 

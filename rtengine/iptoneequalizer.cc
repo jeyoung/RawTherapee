@@ -29,6 +29,44 @@ const std::vector<std::array<float, 3>> colormap = {
 
 };
 
+/* The equaliser's fifteen luminance bands, spaced by 2 EV and centred on
+ * 0 EV at index 8. */
+constexpr int TONE_EQ_BANDS = 15;
+/* The host's correction table has one entry per 16-bit luminance code. */
+constexpr int TONE_EQ_LUT_ENTRIES = 65536;
+/* process_pixel()'s luma limits. */
+constexpr float TONE_EQ_LUMA_LO = -14.0f;
+constexpr float TONE_EQ_LUMA_HI = 6.0f;
+
+constexpr float TONE_EQ_CENTERS[TONE_EQ_BANDS] = {
+    -16.0f, -14.0f, -12.0f, -10.0f, -8.0f, -6.0f, -4.0f, -2.0f,
+    0.0f, 2.0f, 4.0f, 6.0f, 8.0f, 10.0f, 12.0f
+};
+
+/* The band's Gaussian window of std 2 EV. */
+float toneEqGauss(float b, float x)
+{
+    return xexpf(-rtengine::SQR(x - b) / 4.0f);
+}
+
+/* process_pixel(): the correction for one (guided-filtered) luminance. The
+ * caller supplies the host's own xlogf(2) divisor so the table built here and
+ * the per-pixel branch above 1 agree bit for bit. */
+float toneEqCorrection(float y, const float *factors, float w_sum,
+                       float log2base)
+{
+    const float luma = rtengine::LIM(xlogf(rtengine::max(y, 0.0f)) / log2base,
+                                     TONE_EQ_LUMA_LO, TONE_EQ_LUMA_HI);
+
+    float correction = 0.0f;
+
+    for (int c = 0; c < TONE_EQ_BANDS; ++c) {
+        correction += toneEqGauss(TONE_EQ_CENTERS[c], luma) * factors[c];
+    }
+
+    return correction / w_sum;
+}
+
 
 void toneEqualizer(
     array2D<float> &R, array2D<float> &G, array2D<float> &B,
@@ -64,45 +102,26 @@ void toneEqualizer(
     const int H = R.getHeight();
     array2D<float> Y(W, H);
 
+    /*
+     * The correction table and the fifteen band factors are built by the
+     * shared builder so the device node, which uploads the same table, cannot
+     * drift from this host path. `log2base` is the host's xlogf(2) divisor.
+     */
+    std::vector<float> table(TONE_EQ_LUT_ENTRIES);
+    float factors[TONE_EQ_BANDS];
+    float w_sum = 0.f;
+    float log2base = 0.f;
+    rtengine::toneEqualizerTable(params, table.data(), factors, w_sum,
+                                 log2base);
+
     const auto log2 =
-    [](float x) -> float {
-        static const float l2 = xlogf(2);
-        return xlogf(x) / l2;
+    [log2base](float x) -> float {
+        return xlogf(x) / log2base;
     };
 
     const auto exp2 =
     [](float x) -> float {
         return pow_F(2.f, x);
-    };
-    // Build the luma channels: band-pass filters with gaussian windows of
-    // std 2 EV, spaced by 2 EV
-    const float centers[15] = {
-        -16.0f, -14.0f, -12.0f, -10.0f, -8.0f, -6.0f,
-        -4.0f, -2.0f, 0.0f, 2.0f, 4.0f, 6.0f, 8.0f, 10.0f, 12.0f
-    };
-
-    const auto conv = [&](int v, float lo, float hi) -> float {
-        const float f = v < 0 ? lo : hi;
-        return exp2(float(v) / 100.f * f);
-    };
-    const float factors[15] = {
-        conv(params.bands[0], 2.f, 3.f), // -16 EV
-        conv(params.bands[0], 2.f, 3.f), // -14 EV
-        conv(params.bands[0], 2.f, 3.f), // -12 EV
-        conv(params.bands[0], 2.f, 3.f), // -10 EV
-        conv(params.bands[0], 2.f, 3.f), //  -8 EV
-        conv(params.bands[1], 2.f, 3.f), //  -6 EV
-        conv(params.bands[2], 2.5f, 2.5f), //  -4 EV
-        conv(params.bands[3], 3.f, 2.f), //  -2 EV
-        conv(params.bands[4], 3.f, 2.f), //   0 EV
-        conv(params.bands[4], 3.f, 2.f), //   2 EV
-        conv(params.bands[4], 3.f, 2.f), //   4 EV
-        conv(params.bands[4], 3.f, 2.f),  //   6 EV
-        // this settings under are very rarely used...images with very high DR - I add a slider, but it's not the goal: the goal is white distribution (in very rare case)
-        // I have not change "main" Tone Equalizer.
-        conv(params.bands[5], 3.f, 2.f),  //   8 EV  Added for white distribution (Cam16 and Log encode) and images with very high DR
-        conv(params.bands[5], 3.f, 2.f),  //   10 EV Added for white distribution(Cam16 and Log encode) and images with very high DR
-        conv(params.bands[5], 3.f, 2.f)  //   12 EV Added for white distribution(Cam16 and Log encode) and images with very high DR
     };
 
     rtengine::TMatrix ws = rtengine::ICCStore::getInstance()->workingSpaceMatrix(workingProfile);
@@ -134,7 +153,7 @@ void toneEqualizer(
 #endif
         for (int y = 0; y < H; ++y) {
             for (int x = 0; x < W; ++x) {
-                float l = rtengine::LIM(log2(rtengine::max(Y[y][x], 1e-9f)), centers[0], centers[13]);
+                float l = rtengine::LIM(log2(rtengine::max(Y[y][x], 1e-9f)), TONE_EQ_CENTERS[0], TONE_EQ_CENTERS[13]);
                 float ll = round(l * base_posterization) / base_posterization;
                 Y2[y][x] = Y[y][x];
                 Y[y][x] = exp2(ll);
@@ -151,33 +170,12 @@ void toneEqualizer(
         return xexpf((-rtengine::SQR(x - b) / 4.0f));
     };
 
-    // For every pixel luminance, the sum of the gaussian masks
-    float w_sum = 0.f;
-
-    for (int i = 0; i < 15; ++i) {
-        w_sum += gauss(centers[i], 0.f);
-    }
-
     constexpr float luma_lo = -14.f;
     constexpr float luma_hi = 6.f;
 
     const auto process_pixel =
     [&](float y) -> float {
-        // convert to log space
-        const float luma = rtengine::LIM(log2(rtengine::max(y, 0.f)), luma_lo, luma_hi);
-
-        // build the correction as the sum of the contribution of each
-        // luminance channel to current pixel
-        float correction = 0.0f;
-
-        for (int c = 0; c < 15; ++c)
-        {
-            correction += gauss(centers[c], luma) * factors[c];
-        }
-
-        correction /= w_sum;
-
-        return correction;
+        return toneEqCorrection(y, factors, w_sum, log2base);
     };
 
     std::vector<std::array<float, 3>> cur_colormap;
@@ -208,7 +206,7 @@ void toneEqualizer(
             // build the correction as the sum of the contribution of each
             // luminance channel to current pixel
             for (int c = 0; c < 15; ++c) {
-                float w = gauss(centers[c], luma);
+                float w = gauss(TONE_EQ_CENTERS[c], luma);
                 for (int i = 0; i < 3; ++i) {
                     ret[i] += w * cur_colormap[c][i];
                 }
@@ -227,7 +225,7 @@ void toneEqualizer(
 
     for (int i = 0; i < 15; ++i) {
         vfactors[i] = F2V(factors[i]);
-        vcenters[i] = F2V(centers[i]);
+        vcenters[i] = F2V(TONE_EQ_CENTERS[i]);
     }
 
     const auto vgauss =
@@ -293,12 +291,10 @@ void toneEqualizer(
     }
 
 
-    LUTf lut(65536);
+    LUTf lut(TONE_EQ_LUT_ENTRIES);
 
-    for (int i = 0; i < 65536; ++i) {
-        float y = float(i) / 65535.f;
-        float c = process_pixel(y);
-        lut[i] = c;
+    for (int i = 0; i < TONE_EQ_LUT_ENTRIES; ++i) {
+        lut[i] = table[i];
     }
 
 #ifdef _OPENMP
@@ -344,6 +340,45 @@ void toneEqualizer(
 
 namespace rtengine
 {
+
+void toneEqualizerTable(const ToneEqualizerParams &params, float *lut,
+                        float *factors, float &w_sum, float &log2base)
+{
+    const auto conv = [](int v, float lo, float hi) -> float {
+        const float f = v < 0 ? lo : hi;
+        return pow_F(2.f, float(v) / 100.f * f);
+    };
+
+    factors[0] = conv(params.bands[0], 2.f, 3.f);   // -16 EV
+    factors[1] = conv(params.bands[0], 2.f, 3.f);   // -14 EV
+    factors[2] = conv(params.bands[0], 2.f, 3.f);   // -12 EV
+    factors[3] = conv(params.bands[0], 2.f, 3.f);   // -10 EV
+    factors[4] = conv(params.bands[0], 2.f, 3.f);   //  -8 EV
+    factors[5] = conv(params.bands[1], 2.f, 3.f);   //  -6 EV
+    factors[6] = conv(params.bands[2], 2.5f, 2.5f); //  -4 EV
+    factors[7] = conv(params.bands[3], 3.f, 2.f);   //  -2 EV
+    factors[8] = conv(params.bands[4], 3.f, 2.f);   //   0 EV
+    factors[9] = conv(params.bands[4], 3.f, 2.f);   //   2 EV
+    factors[10] = conv(params.bands[4], 3.f, 2.f);  //   4 EV
+    factors[11] = conv(params.bands[4], 3.f, 2.f);  //   6 EV
+    factors[12] = conv(params.bands[5], 3.f, 2.f);  //   8 EV
+    factors[13] = conv(params.bands[5], 3.f, 2.f);  //  10 EV
+    factors[14] = conv(params.bands[5], 3.f, 2.f);  //  12 EV
+
+    /* The sum of the Gaussian masks at 0 EV. */
+    w_sum = 0.f;
+    for (int c = 0; c < TONE_EQ_BANDS; ++c) {
+        w_sum += toneEqGauss(TONE_EQ_CENTERS[c], 0.f);
+    }
+    /* The divisor the per-pixel branch uses, computed exactly as the host
+     * does before it evaluates process_pixel(). */
+    log2base = xlogf(2.0f);
+
+    for (int i = 0; i < TONE_EQ_LUT_ENTRIES; ++i) {
+        lut[i] = toneEqCorrection(float(i) / 65535.f, factors, w_sum,
+                                  log2base);
+    }
+}
 
 void ImProcFunctions::toneEqualizer(
     Imagefloat *rgb,

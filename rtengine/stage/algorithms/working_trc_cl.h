@@ -440,3 +440,463 @@ __kernel void rt_working_trc_lab(__global const float* post,
     lab[2 * lab_plane_pitch + out] = b;
 }
 )CLC";
+
+/*
+ * Device arithmetic for the working.trc tone equalisers.
+ *
+ * The block runs ImProcFunctions::toneEqualizer() twice on this image: the
+ * midtone equaliser on the linear first pass and the white-distribution
+ * equaliser on the post-TRC image. The host builds the 65536-entry correction
+ * table and the fifteen band factors (through toneEqualizerTable(), the same
+ * builder the host path uses) and supplies the working-space luminance row;
+ * the device computes the luminance, ports guidedFilterLog() exactly as
+ * guidedfilter.cc implements it - the fast-guided-filter subsampling, the
+ * bilinear rescale and readout, and boxblur()'s running sums - and applies the
+ * table per pixel.
+ *
+ * This is a separate program from RT_WORKING_TRC_CL because the luminance is
+ * a double expression (Color::rgbLuminance() promotes its float inputs), so
+ * the program needs fp64 and is only built on a device that advertises it.
+ */
+inline constexpr const char* RT_WORKING_TRC_TONE_CL = R"CLC(
+/* The equaliser's fifteen bands, spaced by 2 EV and centred on 0 EV. */
+__constant float rt_wt_tone_centers[15] = {
+    -16.0f, -14.0f, -12.0f, -10.0f, -8.0f, -6.0f, -4.0f, -2.0f,
+    0.0f, 2.0f, 4.0f, 6.0f, 8.0f, 10.0f, 12.0f
+};
+/* The host table's length and its last interpolating index (LUT::maxs). */
+#define RT_WT_TONE_ENTRIES 65536
+#define RT_WT_TONE_LAST_INTERVAL 65534.0f
+
+/* The guided filter's base for xlin2log()/xlog2lin(). */
+#define RT_WT_TONE_BASE 10.0f
+
+/* sleef.h's L2Uf/L2Lf and R_LN2f. */
+#define RT_WT_TONE_L2Uf 0.693145751953125f
+#define RT_WT_TONE_L2Lf 1.428606765330187045e-06f
+#define RT_WT_TONE_RLN2 1.442695040888963407359924681001892137426645954152985934135449406931f
+
+/* sleef.h ilogbp1f(). */
+inline int rt_wt_ilogbp1f(float d)
+{
+    const int m = d < 5.421010862427522E-20f;
+    d = m ? 1.8446744073709552E19f * d : d;
+    int q = (as_int(d) >> 23) & 0xff;
+    q = m ? q - (64 + 0x7e) : q - 0x7e;
+    return q;
+}
+
+/* sleef.h ldexpkf(). */
+inline float rt_wt_ldexpkf(float x, int q)
+{
+    int m = q >> 31;
+    m = (((m + q) >> 6) - m) << 4;
+    q = q - (m << 2);
+    float u = as_float(((int)(m + 0x7f)) << 23);
+    u = u * u;
+    x = x * u * u;
+    u = as_float(((int)(q + 0x7f)) << 23);
+    return x * u;
+}
+
+/* sleef.h xlogf(), the chain the host's log2 lambda calls. */
+inline float rt_wt_xlogf(float d)
+{
+    const int e = rt_wt_ilogbp1f(d * 0.7071f);
+    const float m = rt_wt_ldexpkf(d, -e);
+    float x = (m - 1.0f) / (m + 1.0f);
+    const float x2 = x * x;
+
+    float t = 0.2371599674224853515625f;
+    t = t * x2 + 0.285279005765914916992188f;
+    t = t * x2 + 0.400005519390106201171875f;
+    t = t * x2 + 0.666666567325592041015625f;
+    t = t * x2 + 2.0f;
+
+    x = x * t + 0.693147180559945286226764f * (float)e;
+    if (isinf(d) && d > 0.0f) {
+        x = INFINITY;
+    }
+    if (d < 0.0f) {
+        x = NAN;
+    }
+    if (d == 0.0f) {
+        x = -INFINITY;
+    }
+    return x;
+}
+
+/* sleef.h xrintf(): round to nearest even. */
+inline int rt_wt_xrintf(float x)
+{
+    return (int)rint(x);
+}
+
+/* sleef.h xexpf(). */
+inline float rt_wt_xexpf(float d)
+{
+    if (d <= -104.0f) {
+        return 0.0f;
+    }
+    const int q = rt_wt_xrintf(d * RT_WT_TONE_RLN2);
+    float s = (float)q * -RT_WT_TONE_L2Uf + d;
+    s = (float)q * -RT_WT_TONE_L2Lf + s;
+
+    float u = 0.00136324646882712841033936f;
+    u = u * s + 0.00836596917361021041870117f;
+    u = u * s + 0.0416710823774337768554688f;
+    u = u * s + 0.166665524244308471679688f;
+    u = u * s + 0.499999850988388061523438f;
+
+    u = s * (s * u + 1.0f) + 1.0f;
+    return rt_wt_ldexpkf(u, q);
+}
+
+/* sleef.h xlin2log(x, 10). */
+inline float rt_wt_xlin2log10(float x)
+{
+    const float one = 1.0f;
+    return rt_wt_xlogf(x * (RT_WT_TONE_BASE - one) + one) /
+           rt_wt_xlogf(RT_WT_TONE_BASE);
+}
+
+/* sleef.h xlog2lin(x, 10) = (pow_F(10, x) - 1) / 9. */
+inline float rt_wt_xlog2lin10(float x)
+{
+    const float one = 1.0f;
+    return (rt_wt_xexpf(x * rt_wt_xlogf(RT_WT_TONE_BASE)) - one) /
+           (RT_WT_TONE_BASE - one);
+}
+
+/* getBilinearValue() from rescale.h. */
+inline float rt_wt_tone_bilinear(__global const float* src, const int width,
+                                 const int height, const int pitch,
+                                 const float x, const float y)
+{
+    const int xi = (int)x;
+    const int yi = (int)y;
+    const float xf = x - (float)xi;
+    const float yf = y - (float)yi;
+    const int xi1 = min(xi + 1, width - 1);
+    const int yi1 = min(yi + 1, height - 1);
+    const int row = yi * pitch;
+    const int row1 = yi1 * pitch;
+    const float bottom = xf * (src[row + xi1] - src[row + xi]) +
+                         src[row + xi];
+    const float top = xf * (src[row1 + xi1] - src[row1 + xi]) +
+                      src[row1 + xi];
+    return yf * (top - bottom) + bottom;
+}
+
+/*
+ * Tone equaliser's first step: Y = Color::rgbLuminance(R, G, B, ws). The
+ * block has already scaled the image by `gain`, and rgbLuminance() promotes
+ * each float to double, so the products and the sum are double and the result
+ * rounds once to float.
+ */
+__kernel void rt_wt_tone_luma(__global const float* rgb,
+                              __global float* luma,
+                              const double wy0, const double wy1,
+                              const double wy2,
+                              const float gain,
+                              const int width, const int height,
+                              const int rgb_pitch, const int rgb_plane,
+                              const int luma_pitch)
+{
+    const int x = get_global_id(0);
+    const int y = get_global_id(1);
+    if (x >= width || y >= height) {
+        return;
+    }
+
+    const int in = y * rgb_pitch + x;
+    const double r = (double)(rgb[in] * gain);
+    const double g = (double)(rgb[rgb_plane + in] * gain);
+    const double b = (double)(rgb[2 * rgb_plane + in] * gain);
+    luma[y * luma_pitch + x] = (float)(r * wy0 + g * wy1 + b * wy2);
+}
+
+/* guidedFilterLog()'s first loop: xlin2log(max(Y, 0), 10). */
+__kernel void rt_wt_tone_log(__global float* luma,
+                             const int width, const int height,
+                             const int pitch)
+{
+    const int x = get_global_id(0);
+    const int y = get_global_id(1);
+    if (x >= width || y >= height) {
+        return;
+    }
+
+    const int at = y * pitch + x;
+    luma[at] = rt_wt_xlin2log10(max(luma[at], 0.0f));
+}
+
+/*
+ * guidedFilter()'s f_subsample(): rescaleBilinear() for the guide and the
+ * source (they are the same plane here), written to i1 and p1.
+ */
+__kernel void rt_wt_tone_subsample(__global const float* luma,
+                                   __global float* i1,
+                                   __global float* p1,
+                                   const int sw, const int sh,
+                                   const int width, const int height,
+                                   const int luma_pitch,
+                                   const int sub_pitch,
+                                   const float col_scale,
+                                   const float row_scale)
+{
+    const int x = get_global_id(0);
+    const int y = get_global_id(1);
+    if (x >= sw || y >= sh) {
+        return;
+    }
+
+    const float fx = x * col_scale;
+    const float fy = y * row_scale;
+    const float value = rt_wt_tone_bilinear(luma, width, height, luma_pitch,
+                                            fx, fy);
+    const int out = y * sub_pitch + x;
+    i1[out] = value;
+    p1[out] = value;
+}
+
+/*
+ * boxblur()'s horizontal pass, one work item per row. The host keeps the
+ * departing samples in a ring buffer; here they are read from the read-only
+ * source plane, which holds the same values because the destination is a
+ * different buffer.
+ */
+__kernel void rt_wt_tone_box_h(__global const float* src,
+                               __global float* dst,
+                               const int radius,
+                               const int width, const int height,
+                               const int pitch)
+{
+    const int row = get_global_id(1);
+    if (row >= height) {
+        return;
+    }
+
+    __global const float* s = src + row * pitch;
+    __global float* d = dst + row * pitch;
+    if (radius == 0) {
+        for (int col = 0; col < width; ++col) {
+            d[col] = s[col];
+        }
+        return;
+    }
+
+    float len = (float)radius + 1.0f;
+    float tempval = s[0];
+    for (int j = 1; j <= radius; ++j) {
+        tempval += s[j];
+    }
+    tempval /= len;
+    d[0] = tempval;
+
+    for (int col = 1; col <= radius; ++col) {
+        tempval = (tempval * len + s[col + radius]) / (len + 1.0f);
+        d[col] = tempval;
+        len += 1.0f;
+    }
+
+    for (int col = radius + 1; col < width - radius; ++col) {
+        const float departing = s[col - radius - 1];
+        tempval = tempval + (s[col + radius] - departing) / len;
+        d[col] = tempval;
+    }
+
+    for (int col = width - radius; col < width; ++col) {
+        tempval = (tempval * len - s[col - radius - 1]) / (len - 1.0f);
+        d[col] = tempval;
+        len -= 1.0f;
+    }
+}
+
+/*
+ * boxblur()'s vertical pass, one work item per column. The interior uses the
+ * reciprocal multiply the host's SSE and remaining-column paths both use; the
+ * head and tail divide, as the host does.
+ */
+__kernel void rt_wt_tone_box_v(__global const float* src,
+                               __global float* dst,
+                               const int radius,
+                               const int width, const int height,
+                               const int pitch)
+{
+    const int col = get_global_id(0);
+    if (col >= width) {
+        return;
+    }
+
+    if (radius == 0) {
+        for (int row = 0; row < height; ++row) {
+            dst[row * pitch + col] = src[row * pitch + col];
+        }
+        return;
+    }
+
+    float len = (float)radius + 1.0f;
+    float tempval = src[col];
+    for (int i = 1; i <= radius; ++i) {
+        tempval += src[i * pitch + col];
+    }
+    tempval /= len;
+    dst[col] = tempval;
+
+    for (int row = 1; row <= radius; ++row) {
+        tempval = (tempval * len + src[(row + radius) * pitch + col]) /
+                  (len + 1.0f);
+        dst[row * pitch + col] = tempval;
+        len += 1.0f;
+    }
+
+    const float rlen = 1.0f / len;
+    for (int row = radius + 1; row < height - radius; ++row) {
+        const float departing = src[(row - radius - 1) * pitch + col];
+        tempval = tempval +
+                  (src[(row + radius) * pitch + col] - departing) * rlen;
+        dst[row * pitch + col] = tempval;
+    }
+
+    for (int row = height - radius; row < height; ++row) {
+        const float lenm1 = len - 1.0f;
+        tempval = (tempval * len -
+                   src[(row - radius - 1) * pitch + col]) / lenm1;
+        dst[row * pitch + col] = tempval;
+        len = lenm1;
+    }
+}
+
+/*
+ * guidedFilter()'s element-wise operations:
+ *   0: dst = a * b
+ *   1: dst = c - a * b
+ *   2: dst = a / (b + epsilon)
+ */
+__kernel void rt_wt_tone_combine(__global float* dst,
+                                 __global const float* a,
+                                 __global const float* b,
+                                 __global const float* c,
+                                 const int op, const float epsilon,
+                                 const int pitch, const int width,
+                                 const int height)
+{
+    const int x = get_global_id(0);
+    const int y = get_global_id(1);
+    if (x >= width || y >= height) {
+        return;
+    }
+
+    const int o = y * pitch + x;
+    const float av = a[o];
+    const float bv = b[o];
+    float result = 0.0f;
+    if (op == 0) {
+        result = av * bv;
+    } else if (op == 1) {
+        result = c[o] - (av * bv);
+    } else {
+        result = av / (bv + epsilon);
+    }
+    dst[o] = result;
+}
+
+/*
+ * guidedFilter()'s readout plus guidedFilterLog()'s closing loop: the
+ * bilinear upsample of meana and meanb, q = meana * I + meanb on the full
+ * resolution guide, then xlog2lin(max(q, 0), 10).
+ */
+__kernel void rt_wt_tone_upsample(__global const float* meana,
+                                  __global const float* meanb,
+                                  __global const float* guide,
+                                  __global float* out,
+                                  const int sw, const int sh,
+                                  const int width, const int height,
+                                  const int sub_pitch,
+                                  const int out_pitch,
+                                  const float col_scale,
+                                  const float row_scale)
+{
+    const int x = get_global_id(0);
+    const int y = get_global_id(1);
+    if (x >= width || y >= height) {
+        return;
+    }
+
+    const float fx = x * col_scale;
+    const float fy = y * row_scale;
+    const float upper = rt_wt_tone_bilinear(meana, sw, sh, sub_pitch, fx, fy);
+    const float lower = rt_wt_tone_bilinear(meanb, sw, sh, sub_pitch, fx, fy);
+    const int o = y * out_pitch + x;
+    const float q = upper * guide[o] + lower;
+    out[o] = rt_wt_xlog2lin10(max(q, 0.0f));
+}
+
+/* LUTf::operator[](float) with LUT_CLIP_BELOW | LUT_CLIP_ABOVE. */
+inline float rt_wt_tone_lut(__global const float* lut, const float index)
+{
+    if (index < 0.0f) {
+        return lut[0];
+    }
+    if (index > RT_WT_TONE_LAST_INTERVAL) {
+        return lut[RT_WT_TONE_ENTRIES - 1];
+    }
+    const int idx = (int)index;
+    const float low = lut[idx];
+    return low + (lut[idx + 1] - low) * (index - (float)idx);
+}
+
+/* The block's gauss() window. */
+inline float rt_wt_tone_gauss(const float b, const float x)
+{
+    const float d = x - b;
+    return rt_wt_xexpf(-(d * d) / 4.0f);
+}
+
+/* process_pixel(): the correction for a luminance above 1. `params` holds the
+ * fifteen factors, their Gaussian sum and the host's xlogf(2) divisor. */
+inline float rt_wt_tone_correction(const float y,
+                                   __global const float* params)
+{
+    const float luma = max(-14.0f,
+                           min(rt_wt_xlogf(max(y, 0.0f)) / params[16], 6.0f));
+    float correction = 0.0f;
+    for (int c = 0; c < 15; ++c) {
+        correction += rt_wt_tone_gauss(rt_wt_tone_centers[c], luma) * params[c];
+    }
+    return correction / params[15];
+}
+
+/*
+ * The per-pixel apply: corr from the host table below 1, process_pixel() above
+ * it, then the block's scale-apply-unscale sequence in the same order.
+ */
+__kernel void rt_wt_tone_apply(__global float* rgb,
+                               __global const float* luma,
+                               __global const float* lut,
+                               __global const float* params,
+                               const float gain, const float inv_gain,
+                               const int width, const int height,
+                               const int rgb_pitch, const int rgb_plane,
+                               const int luma_pitch)
+{
+    const int x = get_global_id(0);
+    const int y = get_global_id(1);
+    if (x >= width || y >= height) {
+        return;
+    }
+
+    const int o = y * rgb_pitch + x;
+    const float cY = luma[y * luma_pitch + x];
+    const float corr = cY > 1.0f
+        ? rt_wt_tone_correction(cY, params)
+        : rt_wt_tone_lut(lut, cY * 65535.0f);
+    const float r = rgb[o] * gain;
+    const float g = rgb[rgb_plane + o] * gain;
+    const float b = rgb[2 * rgb_plane + o] * gain;
+    rgb[o] = (r * corr) * inv_gain;
+    rgb[rgb_plane + o] = (g * corr) * inv_gain;
+    rgb[2 * rgb_plane + o] = (b * corr) * inv_gain;
+}
+)CLC";
