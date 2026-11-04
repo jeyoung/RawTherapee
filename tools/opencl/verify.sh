@@ -388,6 +388,9 @@ quick() {
     run_stage_device "pef/stage-device-local-adjustments-retinex" \
         "$ROOT/devnotes/opencl/pp3/localadjustments-retinex.pp3" \
         local.adjustments cpu
+    run_stage_device "pef/stage-device-local-adjustments-cie" \
+        "$ROOT/devnotes/opencl/pp3/localadjustments-cie.pp3" \
+        local.adjustments cpu
 }
 
 stage() {
@@ -791,6 +794,9 @@ stage_device() {
         local.adjustments cpu
     run_stage_device "pef/stage-device-local-adjustments-retinex" \
         "$ROOT/devnotes/opencl/pp3/localadjustments-retinex.pp3" \
+        local.adjustments cpu
+    run_stage_device "pef/stage-device-local-adjustments-cie" \
+        "$ROOT/devnotes/opencl/pp3/localadjustments-cie.pp3" \
         local.adjustments cpu
 }
 

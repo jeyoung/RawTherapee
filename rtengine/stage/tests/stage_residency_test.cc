@@ -14560,6 +14560,301 @@ void test_local_adjustments(bool available)
                [](auto& spot) { spot.retinexMethod = "pde"; });
     }
 
+    /*
+     * CIE CAM. Lab_Local()'s "com" block needs an ROI at least mSP = 5 px on
+     * both axes and runs ciecamloc_02float()'s call==0 arm. Each case compares
+     * the host block against the device node, records the node's
+     * implementation, and checks the result against the same spot with the
+     * tool switched off. The images stay inside the working range because the
+     * per-spot clamp's discontinuity would turn a sub-LSB difference into a
+     * large one.
+     */
+    {
+        struct CieCase {
+            const char* label;
+            int width;
+            int height;
+            int centre_x;
+            int centre_y;
+            int extent;
+            const char* sursourcie;
+            const char* surroundcie;
+            double source_gray;
+            double target_gray;
+            double source_abs;
+            double target_abs;
+            double catad;
+            double satur;
+            double chroml;
+            double hue;
+            double colorfl;
+            double lightl;
+            double lightq;
+            double rstprotect;
+            double repar;
+            double blur_de;
+            int sensitivity;
+            bool colour;
+            bool blur;
+            bool tonemap;
+        };
+        const CieCase cie_cases[] = {
+            {"CIE defaults", 260, 200, 0, 0, 2000, "Average", "Average",
+             18.0, 18.0, 2000.0, 16.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+             0.0, 0.0, 100.0, 5.0, 60, false, false, false},
+            {"CIE dim surround", 260, 200, 0, 0, 2000, "Dim", "Dim",
+             18.0, 18.0, 2000.0, 16.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+             0.0, 0.0, 100.0, 5.0, 60, false, false, false},
+            {"CIE dark surround", 260, 200, 0, 0, 2000, "Dark", "Dark",
+             18.0, 18.0, 2000.0, 16.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+             0.0, 0.0, 100.0, 5.0, 60, false, false, false},
+            {"CIE extremely dark viewing", 260, 200, 0, 0, 2000, "exDark",
+             "ExtremelyDark", 18.0, 12.0, 2000.0, 16.0, 0.0, 0.0, 0.0,
+             0.0, 0.0, 0.0, 0.0, 0.0, 100.0, 5.0, 60, false, false,
+             false},
+            {"CIE grey and luminance", 260, 200, 0, 0, 2000, "Average",
+             "Average", 12.0, 28.0, 600.0, 8.0, 40.0, 0.0, 0.0, 0.0, 0.0,
+             0.0, 0.0, 0.0, 100.0, 5.0, 60, false, false, false},
+            {"CIE warm adaptation", 260, 200, 0, 0, 2000, "Dim", "Average",
+             18.0, 8.0, 2000.0, 16.0, -30.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+             0.0, 0.0, 100.0, 5.0, 60, false, false, false},
+            {"CIE saturation", 260, 200, 0, 0, 2000, "Average",
+             "Average", 18.0, 18.0, 2000.0, 16.0, 0.0, 60.0, 0.0, 0.0,
+             0.0, 0.0, 0.0, 0.0, 100.0, 5.0, 60, false, false, false},
+            {"CIE chroma", 260, 200, 0, 0, 2000, "Average",
+             "Average", 18.0, 18.0, 2000.0, 16.0, 0.0, 0.0, 40.0, 0.0,
+             0.0, 0.0, 0.0, 0.0, 100.0, 5.0, 60, false, false, false},
+            {"CIE hue rotation", 260, 200, 0, 0, 2000, "Average",
+             "Average", 18.0, 18.0, 2000.0, 16.0, 0.0, 0.0, 0.0, -20.0,
+             0.0, 0.0, 0.0, 0.0, 100.0, 5.0, 60, false, false, false},
+            {"CIE colourfulness", 260, 200, 0, 0, 2000, "Average",
+             "Average", 18.0, 18.0, 2000.0, 16.0, 0.0, 0.0, 0.0, 0.0,
+             30.0, 0.0, 0.0, 0.0, 100.0, 5.0, 60, false, false, false},
+            {"CIE red protection", 260, 200, 0, 0, 2000, "Average",
+             "Average", 18.0, 18.0, 2000.0, 16.0, 0.0, 0.0, 0.0, 0.0,
+             0.0, 0.0, 0.0, 40.0, 100.0, 5.0, 60, false, false, false},
+            {"CIE colour sliders", 260, 200, 0, 0, 2000, "Average",
+             "Average", 18.0, 18.0, 2000.0, 16.0, 0.0, 30.0, 20.0, -10.0,
+             15.0, 0.0, 0.0, 40.0, 100.0, 5.0, 60, false, false, false},
+            {"CIE light and recovery", 260, 200, 0, 0, 2000, "Average",
+             "Average", 18.0, 18.0, 2000.0, 16.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+             25.0, -20.0, 0.0, 40.0, 20.0, 30, false, false, false},
+            {"CIE offset ROI", 260, 200, 200, 160, 700, "Average", "Average",
+             18.0, 18.0, 2000.0, 16.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+             0.0, 0.0, 100.0, 5.0, 60, false, false, false},
+            {"CIE interior ROI", 260, 200, -200, -200, 700, "Average",
+             "Average", 18.0, 18.0, 2000.0, 16.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+             0.0, 0.0, 0.0, 100.0, 5.0, 60, false, false, false},
+            {"CIE colour spot", 260, 200, 0, 0, 2000, "Average", "Average",
+             18.0, 18.0, 2000.0, 16.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+             0.0, 0.0, 100.0, 5.0, 60, true, false, false},
+            {"CIE blur spot", 260, 200, 0, 0, 2000, "Average", "Average",
+             18.0, 18.0, 2000.0, 16.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+             0.0, 0.0, 100.0, 5.0, 60, false, true, false},
+            {"CIE tone map spot", 260, 200, 0, 0, 2000, "Average", "Average",
+             18.0, 18.0, 2000.0, 16.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+             0.0, 0.0, 100.0, 5.0, 60, false, false, true},
+        };
+        for (std::size_t index = 0;
+             index < sizeof(cie_cases) / sizeof(cie_cases[0]); ++index) {
+            const CieCase& c = cie_cases[index];
+            const auto make_params = [&](rtengine::procparams::ProcParams& p) {
+                p.locallab.enabled = true;
+                auto& spot = p.locallab.spots[0];
+                spot.expcie = true;
+                spot.sursourcie = c.sursourcie;
+                spot.surroundcie = c.surroundcie;
+                spot.sourceGraycie = c.source_gray;
+                spot.targetGraycie = c.target_gray;
+                spot.sourceabscie = c.source_abs;
+                spot.targabscie = c.target_abs;
+                spot.catadcie = c.catad;
+                spot.saturlcie = c.satur;
+                spot.chromlcie = c.chroml;
+                spot.huecie = c.hue;
+                spot.colorflcie = c.colorfl;
+                spot.lightlcie = c.lightl;
+                spot.lightqcie = c.lightq;
+                spot.rstprotectcie = c.rstprotect;
+                spot.reparcie = c.repar;
+                spot.blurciede = c.blur_de;
+                spot.sensicie = c.sensitivity;
+                if (c.colour) {
+                    spot.chroma = 35;
+                    spot.lightness = 10;
+                    spot.contrast = -5;
+                }
+                if (c.blur) {
+                    spot.expblur = true;
+                    spot.radius = 10.0;
+                    spot.locwavcurveden.clear();
+                }
+                if (c.tonemap) {
+                    spot.exptonemap = true;
+                    spot.stren = 0.8;
+                    spot.gamma = 1.0;
+                    spot.estop = 1.4;
+                    spot.scaltm = 1.0;
+                    spot.rewei = 0;
+                    spot.satur = 0.0;
+                    spot.sensitm = 60;
+                    spot.equiltm = true;
+                    spot.repartm = 100.0;
+                    spot.recothrest = 1.0;
+                }
+            };
+
+            rtengine::procparams::ProcParams reference_params;
+            reference_params.locallab.spots.push_back(localAdjustmentsSpot(
+                "cie", c.centre_x, c.centre_y, c.extent, true, 0, 0, 0));
+            make_params(reference_params);
+            check(localAdjustmentsSupported(reference_params),
+                  "the CIE case is inside the predicate");
+
+            Imagefloat reference_base(c.width, c.height);
+            fill_tonemap_rgb(reference_base, 211u + index);
+            std::unique_ptr<LabImage> reference_lab(
+                new LabImage(c.width, c.height));
+            rtengine::ImProcFunctions reference_ipf(&reference_params, false);
+            localAdjustmentsHostBlock(reference_ipf, reference_params,
+                                      &reference_base, reference_lab.get(),
+                                      c.width, c.height);
+
+            rtengine::procparams::ProcParams node_params = reference_params;
+            Imagefloat node_base(c.width, c.height);
+            fill_tonemap_rgb(node_base, 211u + index);
+            std::unique_ptr<LabImage> node_lab(
+                new LabImage(c.width, c.height));
+            rtengine::ImProcFunctions node_ipf(&node_params, false);
+            const RtStageStatus status = run_local_adjustments_node(
+                node_base, *node_lab, node_params, node_ipf, profile_path);
+            check(status == RT_STAGE_OK,
+                  "the CIE node completes through run()");
+
+            const std::string profile = read_file(profile_path);
+            if (cpu_device) {
+                check(profile.find("\"impl\":\"opencl\"") !=
+                          std::string::npos,
+                      "the CIE case records a device pass");
+                check(profile.find("\"impl\":\"host\"") ==
+                          std::string::npos,
+                      "the CIE case never falls back");
+            }
+
+            const Diff diff =
+                compare(view(*reference_lab), view(*node_lab));
+            std::printf("stage-residency: local.adjustments %s: PAE %.6f "
+                        "LSB16, %zu of %zu samples differ\n", c.label,
+                        diff.max_abs, diff.differing, diff.samples);
+            check(diff.finite && diff.max_abs <= 1.0,
+                  "the CIE result is within 1 LSB16");
+
+            rtengine::procparams::ProcParams off_params = reference_params;
+            off_params.locallab.spots[0].expcie = false;
+            Imagefloat off_base(c.width, c.height);
+            fill_tonemap_rgb(off_base, 211u + index);
+            std::unique_ptr<LabImage> off_lab(
+                new LabImage(c.width, c.height));
+            rtengine::ImProcFunctions off_ipf(&off_params, false);
+            localAdjustmentsHostBlock(off_ipf, off_params, &off_base,
+                                      off_lab.get(), c.width, c.height);
+            const Diff changed =
+                compare(view(*off_lab), view(*reference_lab));
+            std::printf("stage-residency: local.adjustments %s changes "
+                        "%zu of %zu samples against the tool-off result, "
+                        "PAE %.6f LSB16\n", c.label, changed.differing,
+                        changed.samples, changed.max_abs);
+            check(changed.differing > 0,
+                  "the CIE case is non-vacuous");
+        }
+    }
+
+    /* CIE refusals: every configuration outside the admitted set must leave
+     * the whole block on the host. */
+    {
+        const auto refuse = [](const char* label,
+                               void (*mutate)(
+                                   rtengine::procparams::LocallabParams::
+                                       LocallabSpot&)) {
+            rtengine::procparams::ProcParams params;
+            params.locallab.spots.push_back(localAdjustmentsSpot(
+                "cie", 0, 0, 2000, true, 0, 0, 0));
+            auto& spot = params.locallab.spots[0];
+            spot.expcie = true;
+            mutate(spot);
+            check(!localAdjustmentsSupported(params), label);
+        };
+        refuse("CIE log encoding mode stays on the host", [](auto& spot) {
+            spot.modecie = "log";
+        });
+        refuse("CIE Jz mode stays on the host", [](auto& spot) {
+            spot.modecam = "jz";
+        });
+        refuse("CIE PQ remap stays on the host", [](auto& spot) {
+            spot.pqremapcam16 = 120.0;
+        });
+        refuse("CIE smoothing stays on the host", [](auto& spot) {
+            spot.smoothciemet = "gam";
+        });
+        refuse("CIE contrast slider stays on the host", [](auto& spot) {
+            spot.contlcie = 20.0;
+        });
+        refuse("CIE per-hue brightness stays on the host", [](auto& spot) {
+            spot.colorhred = 10.0;
+        });
+        refuse("CIE red curve stays on the host", [](auto& spot) {
+            spot.redcurve = {3.0, 0.0, 0.0, 0.5, 0.55, 1.0, 1.0};
+        });
+        refuse("CIE tone curve stays on the host", [](auto& spot) {
+            spot.ciecurve = {3.0, 0.0, 0.0, 0.5, 0.55, 1.0, 1.0};
+        });
+        refuse("CIE pre-tone-map stays on the host", [](auto& spot) {
+            spot.expprecam = true;
+        });
+        refuse("CIE local contrast stays on the host", [](auto& spot) {
+            spot.detailcie = 20.0;
+        });
+        refuse("CIE gradient stays on the host", [](auto& spot) {
+            spot.strgradcie = 5.0;
+        });
+        refuse("CIE final gain stays on the host", [](auto& spot) {
+            spot.gamgain = 0.5;
+        });
+        refuse("CIE gamut compression stays on the host", [](auto& spot) {
+            spot.gamutw = "srgb";
+        });
+        refuse("CIE black and white stays on the host", [](auto& spot) {
+            spot.bwcie = true;
+        });
+        refuse("CIE recovery mask stays on the host", [](auto& spot) {
+            spot.recothrescie = 0.5;
+        });
+        refuse("CIE explicit mask stays on the host", [](auto& spot) {
+            spot.enacieMask = true;
+        });
+        refuse("CIE source grey below the GUI range stays on the host",
+               [](auto& spot) { spot.sourceGraycie = 0.5; });
+        refuse("CIE target grey above the GUI range stays on the host",
+               [](auto& spot) { spot.targetGraycie = 90.0; });
+        refuse("CIE absolute luminance below the GUI range stays on the host",
+               [](auto& spot) { spot.targabscie = 0.001; });
+        refuse("CIE adaptation temperature above the GUI range stays on the "
+               "host", [](auto& spot) { spot.catadcie = 200.0; });
+        refuse("CIE recovery below the GUI range stays on the host",
+               [](auto& spot) { spot.reparcie = 0.0; });
+        refuse("CIE deltaE blur below the GUI range stays on the host",
+               [](auto& spot) { spot.blurciede = 1.0; });
+        refuse("CIE sensitivity above the GUI range stays on the host",
+               [](auto& spot) { spot.sensicie = 101; });
+        refuse("an unknown CIE source surround stays on the host",
+               [](auto& spot) { spot.sursourcie = "disacie"; });
+        refuse("an unknown CIE viewing surround stays on the host",
+               [](auto& spot) { spot.surroundcie = "none"; });
+        refuse("CIE sigmoid Q stays on the host", [](auto& spot) {
+            spot.sigq = true;
+        });
+    }
+
     /* Multi-spot state, RECT, inactive spots, curves and MUNS. Each case is
      * built from scratch so the make lambda owns the spot list. */
     {
