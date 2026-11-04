@@ -3139,12 +3139,23 @@ tone-eq/recovery/gradient sub-options, the local-contrast wavelet and FFT
 variants, vibrance gamma/gradients/warm, blur/denoise, capture sharpening,
 sharpening gamma/blur/mask view/separable radius, tone
 mapping, Retinex, log's guided-filter arm/`autocompute`/gradient,
-soft light `"reti"`, the common mask, dehaze, `exc`/`full`/`main`, merge,
+soft light `"reti"`, dehaze, `exc`/`full`/`main`, merge,
 explicit masks, soft radius, Tone Mapping's recovery threshold and
 out-of-range sliders and the global EPD pass, the `avoidgamutMethod`
 LAB/XYZ/XYZREL arms, the
 RGB curve, LabGrid, `avoidrad != 0`, `transit == 100`, a blur radius above
 100, `ghs_D != 0 && ghs_BLP > 0` and a pre-CBDL pass.
+
+The common mask is admitted for the log-encoding and CIE CAM arms. The host
+samples the luminance curve, the device blurs the mask at 1/sk, reproduces
+`blendmask()`'s copy and clip and, when the recovery threshold is below one,
+runs `maskrecov()`'s ramps, `1 - pow(k, decay)` and the host's three-pass
+`boxblur()` recurrence. Fifteen device cases are within 0.106689 LSB16
+(worst: CIE recovery at decay 4); the masks are non-vacuous at PAE 7.537
+(log) and 249.451 (CIE) against the mask-off result. `localadjustments-mask.pp3`
+exports `AE=0`. Residuals: chroma/hue mask curves, structure, contrast, mask
+gamma/slope, the laplacian, the standalone `enamask` tool, the recovery
+threshold's upper half and a CIE mask combined with tone mapping.
 
 CIE CAM is admitted only in `modecie "com"` / `modecam "cam16"` with
 `smoothciemet "none"` and `pqremapcam16 <= 100`; its Jz pre-processing,

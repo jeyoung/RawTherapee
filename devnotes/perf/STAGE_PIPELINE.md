@@ -2328,6 +2328,23 @@ blends the luminance result. The pre-fix device skipped it and diverged by
 (341 samples). The same spot with `balan = 2.5` was 12,771.615 LSB16 on
 26,140 samples and is now 0.029297 (549 samples); a fully active
 `balan = 2.5` block is 0.023438. Both are `impl=opencl` and finite.
+The common mask runs on the device for the log-encoding and CIE CAM arms.
+`maskcalccol()`'s luminance curve is sampled by the host (the 501-point
+`LocLLmaskCurve` LUT), the mask is blurred at 1/sk with the host-built IIR
+coefficients and `blendmask()` copies/clips it, and `transit_shapedetect2()`
+uses the blurred mask as its deltaE reference. `maskrecov()`'s decay arm is
+ported too: the masklum ramps, `1 - pow(k, decay)` and the host's in-place
+three-pass `boxblur()` recurrence run on the device. Fifteen device cases
+(log and CIE bands, a narrow band, an inverted band, recovery at decay 2 and
+4, colour, blur and a no-mask control) are within 0.106689 LSB16; the log
+mask moves 1,352 of 45,696 samples at PAE 7.537 LSB16 and the CIE mask
+156,000 of 156,000 at PAE 249.451 LSB16 against the mask-off result, so the
+parity is not vacuous. `localadjustments-mask.pp3` exports `AE=0`. Residuals:
+the chroma/hue mask curves, structure, contrast, mask gamma/slope, the
+laplacian, the standalone `enamask` tool, the recovery threshold's upper half
+(1..2, which also enables the mask deltaE reference), a CIE mask combined
+with tone mapping, and the deltaE mask (`spot.deltae`).
+
 Everything else is a residual: exposure (FFT PDE), soft light's `"reti"`
 method, the shadows/highlights
 `"tone"`/`"ghs"`/`"micha"` methods, tone-eq multipliers, a non-default tone
@@ -2338,8 +2355,8 @@ CBDL's `contresid` and soft radius, blur/denoise, capture sharpening,
 below 0.6,
 Tone Mapping's recovery threshold, its out-of-range sliders and the global
 EPD pass,
-Retinex, log's guided-filter `detail`/`autocompute`/CIE CAM/gradient, the
-common mask, CIE CAM, the global dehaze, `exc`/`full`/`main`, merge, explicit
+Retinex, log's guided-filter `detail`/`autocompute`/CIE CAM/gradient,
+the global dehaze, `exc`/`full`/`main`, merge, explicit
 masks, soft
 radius, LAB/XYZ/XYZREL gamut methods, the RGB curve, LabGrid, `avoidrad != 0`,
 `transit == 100`, a blur radius above 100, `reparcol != 100`, a ROI below

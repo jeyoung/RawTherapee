@@ -228,6 +228,22 @@ current tip.
   `localadjustments-cie.pp3` records 1 LSB16 (AE=1) with `impl=opencl`.
   `Expcie_` now loads into the tool enable as well as the UI panel flag, so
   a CIE profile round-trips.
+- **`local.adjustments` common mask**: the log-encoding and CIE CAM arms
+  admit `enaLMask`/`enacieMask` with the luminance mask curve. The host
+  samples the 501-point `LocLLmaskCurve`; the device reproduces
+  `maskcalccol()`'s `32768 * LIM01(1 - curve[(500 / 32768) * L])`, the
+  1/sk IIR mask blur, `blendmask()`'s copy/clip and, when the recovery
+  threshold is below one, `maskrecov()`'s ramps, `1 - pow(k, decay)` and the
+  host's three-pass `boxblur()` recurrence. `transit_shapedetect2()` then
+  uses the blurred mask as its deltaE reference. Fifteen device cases
+  (log/CIE bands, narrow and inverted bands, decay 2 and 4, colour, blur and
+  a no-mask control) are within 0.106689 LSB16; the masks move 1,352 of
+  45,696 (log, PAE 7.537) and 156,000 of 156,000 (CIE, PAE 249.451) samples
+  against mask-off, and `localadjustments-mask.pp3` exports `AE=0`.
+  Residuals: chroma/hue mask curves, structure, contrast, mask gamma/slope,
+  the laplacian, the standalone `enamask` tool, the recovery threshold's
+  upper half (1..2), a CIE mask combined with tone mapping, and the deltaE
+  mask. POCL gate PASS (1 skipped), CPU suite PASS (34 skipped).
 - **`lab.wavelet` clarity soft radius**: `guidedFilter()`'s box means, `a`/`b`
   reduction and bilinear upsample run on the device over the block's
   `provradius` guide, with the subsampling, radius and four scales derived on
@@ -479,8 +495,7 @@ current tip.
   image) falls back to the host. POCL gate PASS (1 skipped), CPU suite PASS
   (34 skipped).
 - **Remaining Stage C**: exposure (FFT PDE), the Blur & Noise wavelet denoise
-  and remaining denoise additions, retinex, CIE, common mask, local
-  sharpening capture; then the wavelet
+  and remaining denoise additions, local sharpening capture; then the wavelet
   denoise/chroma/edges/final/clarity/soft-radius panels. Each is a
   separate multi-session unit. Gate environment: set `TMPDIR` to a
   project-local directory (`/dev/shm` was 100% full and the second 60 MB TIFF
@@ -1027,8 +1042,8 @@ worst 0.037109 LSB16, and 4 residuals at PAE 0, and CLmethod's selection plus
 the clarity arm with 20 cases, exact except the denoise pair at
 0.015625 LSB16, and 8 residuals at PAE 0, balance chroma with 10 cases,
 worst 0.052734 LSB16, and 11 residuals at PAE 0),
-then `local.adjustments` exposure/retinex/CIE, then the common mask
-once the wavelet panels land. EPD stays a permanent residual.
+then `local.adjustments` exposure, then the wavelet panels. The common mask,
+Retinex and CIE CAM have landed. EPD stays a permanent residual.
 
 ## Next immediate task
 
