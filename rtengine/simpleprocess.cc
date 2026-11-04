@@ -1716,7 +1716,8 @@ private:
         const bool ciecam_arm =
             !((params.colorappearance.enabled && !settings->autocielab) ||
               (!cam02));
-        stage::labSharpeningRun(ipf, params, *labView, ciecam_arm);
+        stage::labSharpeningRun(ipf, params, *labView, ciecam_arm,
+                                exportScale);
 
       //  if (((params.colorappearance.enabled && !settings->autocielab) || (!params.colorappearance.enabled)) && params.sharpening.enabled) {
         if (((params.colorappearance.enabled && !settings->autocielab) || (!cam02)) && params.sharpening.enabled) {
@@ -2447,6 +2448,7 @@ private:
 
         int imw, imh;
         double scale_factor = ipf.resizeScale(&params, fw, fh, imw, imh);
+        exportScale = scale_factor;
 
         std::unique_ptr<LabImage> tmplab;
 
@@ -2503,12 +2505,11 @@ private:
             params.sharpening.deconvradius *= scale_factor;
         }
 
-        params.impulseDenoise.thresh *= scale_factor;
-
-        if (scale_factor < 0.5) {
-            params.impulseDenoise.enabled = false;
-        }
-
+        /*
+         * The lab.sharpening inputs are prescaled by the same formula the
+         * node admits against, so the helper is the single definition.
+         */
+        stage::labSharpeningScaleParams(params, scale_factor);
         params.wavelet.strength *= scale_factor;
         double noise_factor = (1.0 - scale_factor);
         params.dirpyrDenoise.luma *= noise_factor; // * scale_factor;
@@ -2552,8 +2553,6 @@ private:
 
         params.dirpyrequalizer.threshold *= scale_factor;
 
-        adjust_radius(defaultparams.defringe.radius, scale_factor,
-                      params.defringe.radius);
         params.sh.radius *= scale_factor;
         params.localContrast.radius *= scale_factor;
 
@@ -2628,6 +2627,12 @@ private:
      * the resize runs on the output RGB buffer.
      */
     bool labResize;
+    /*
+     * The early-resize scale factor, 1.0 when the fast path does not resize.
+     * lab.sharpening admits its prescaled impulse threshold and defringe
+     * radius against the bounds this factor derives.
+     */
+    double exportScale = 1.0;
     /* Framing geometry shared by crop, resize, output.convert and framing. */
     ImProcFunctions::FramingData framingData;
     /* Output image produced by output.convert and completed by output.icc. */

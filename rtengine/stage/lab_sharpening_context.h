@@ -78,6 +78,33 @@ inline constexpr int LAB_SHARPENING_MIN_THRESHOLD = 0;
 inline constexpr int LAB_SHARPENING_MAX_THRESHOLD = 100;
 inline constexpr double LAB_SHARPENING_MIN_RADIUS = 0.0;
 inline constexpr double LAB_SHARPENING_MAX_RADIUS = 25.0;
+/* The GUI's defringe radius maximum and the default the export interpolates
+ * about. adjust_procparams() maps r to 2 + (r - 2) * scale, so the prescaled
+ * inputs are derived from these two constants as well. */
+inline constexpr double LAB_SHARPENING_GUI_MIN_RADIUS = 0.5;
+inline constexpr double LAB_SHARPENING_GUI_MAX_RADIUS = 5.0;
+inline constexpr double LAB_SHARPENING_DEFRINGE_DEFAULT_RADIUS = 2.0;
+
+/*
+ * The export's resize scale factor.
+ *
+ * adjust_procparams() prescales the impulse threshold (`thresh *= scale`,
+ * truncated to int) and the defringe radius (interpolated about the 2.0
+ * default) before the block runs. The node validates the prescaled values by
+ * deriving the same bounds from this factor. Any finite positive scale is
+ * supported up to the point where the widest GUI radius reaches
+ * gaussianBlur()'s double-precision IIR limit (GAUSS_DOUBLE_LIMIT, 25.0):
+ * 2 + (5 - 2) * 23/3 = 25. From there the host switches to the double
+ * recurrence while the device keeps the float SSE arm, so it is a host
+ * residual. A non-positive or non-finite scale is refused outright.
+ */
+inline constexpr double LAB_SHARPENING_MIN_SCALE = 0.0;
+inline constexpr double LAB_SHARPENING_MAX_SCALE = 23.0 / 3.0;
+/* adjust_procparams() disables impulse denoise below this export scale. */
+inline constexpr double LAB_SHARPENING_IMPULSE_MIN_SCALE = 0.5;
+/* Tolerance for the derived radius bounds; the values mirror the host
+ * expression exactly, so this only absorbs an independently rounded input. */
+inline constexpr double LAB_SHARPENING_SCALE_EPSILON = 1e-9;
 /* gaussianBlur()'s identity limit (GAUSS_SKIP): below it the blur copies the
  * plane, so the chromaticity difference is zero and the whole defringe pass is
  * a no-op. */
@@ -110,6 +137,19 @@ inline constexpr double LAB_SHARPENING_MICRO_NOOP_CONTRAST = 100.0;
 inline constexpr int LAB_SHARPENING_MICRO_MIN_UNIFORMITY = 0;
 inline constexpr int LAB_SHARPENING_MICRO_MAX_UNIFORMITY = 10;
 
+/*
+ * impulse_nr() clamps its low-pass sigma to this value. At and below it the
+ * device mark kernel reproduces the host's mask on the parity fixtures; above
+ * it the host's SSE blur and the device's float recurrence can move a border
+ * sample across `hpfabs > hfnbrave * impthrDiv24`. The launcher therefore
+ * derives the mask on the host for the prescaled thresholds above the clamp
+ * and keeps only the correction on the device, so a scaled export never
+ * trades parity for the mask.
+ */
+inline constexpr double LAB_SHARPENING_IMPULSE_DEVICE_SIGMA = 2.0;
+/* GUI threshold whose impulse sigma is still the clamp: thresh / 20 - 1 = 2. */
+inline constexpr int LAB_SHARPENING_IMPULSE_DEVICE_THRESHOLD = 60;
+
 /* Argument order; see the header comment of lab_sharpening_cl.h. */
 enum LabSharpeningArg : std::size_t {
     LAB_SHARPENING_ARG_LUMINANCE = 0,
@@ -132,6 +172,7 @@ enum LabSharpeningArg : std::size_t {
     LAB_SHARPENING_ARG_MICRO_AMOUNT,
     LAB_SHARPENING_ARG_MICRO_CONTRAST,
     LAB_SHARPENING_ARG_MICRO_UNIFORMITY,
+    LAB_SHARPENING_ARG_SCALE,
     LAB_SHARPENING_ARG_CONTEXT,
     LAB_SHARPENING_NODE_ARGS
 };
@@ -156,6 +197,9 @@ struct LabSharpeningNodeParams {
     double micro_amount = 0.0;
     double micro_contrast = 0.0;
     int micro_uniformity = 0;
+    /* The export's resize scale factor; 1.0 for the crop path. The impulse
+     * threshold and defringe radius above arrive already prescaled by it. */
+    double scale = 1.0;
 };
 
 typedef struct RtLabSharpeningContext {
@@ -188,11 +232,22 @@ bool lab_sharpening_decode(const RtStageArg* args, uint32_t nargs,
  * either no defringe or a defringe radius inside the whole legal range: below
  * 0.25 the host's blur is the identity (a no-op), below 0.6 it is the 3x3
  * convolution and from 0.6 the separable-IIR pair. A defringe that runs needs
- * device fp64 for its double chromaticity mean. Anything else is a residual,
- * never an approximation.
+ * device fp64 for its double chromaticity mean. The prescaled impulse
+ * threshold and defringe radius are checked against the bounds the same scale
+ * factor derives, so a legal GUI value is admitted at every supported scale.
+ * Anything else is a residual, never an approximation.
  */
 bool lab_sharpening_admitted(const LabSharpeningNodeParams& params, int width,
                              int height, bool has_fp64, std::string& error);
+
+/*
+ * Apply the export's resize scale to the block's prescaled inputs, exactly as
+ * adjust_procparams() does: the impulse threshold is multiplied and truncated
+ * to int, the defringe radius is interpolated about its 2.0 default, and
+ * impulse denoise is disabled below 0.5. Kept here so the call site, the
+ * tests and the admission bounds share one formula.
+ */
+void labSharpeningScaleParams(procparams::ProcParams& params, double scale);
 
 /* 1 when at least one enabled tool would change a plane. */
 bool lab_sharpening_active(const LabSharpeningNodeParams& params);
@@ -201,11 +256,12 @@ bool lab_sharpening_active(const LabSharpeningNodeParams& params);
  * Everything the node reads, derived from the production parameters.
  * `ciecam_arm` mirrors the call site: impulse denoise, defringe and
  * microcontrast are skipped there because the CIE-CAM pipeline owns them on
- * the CieImage, while ML sharpen edges still runs on the Lab image.
+ * the CieImage, while ML sharpen edges still runs on the Lab image. `scale`
+ * is the export's resize factor and 1.0 on the crop path.
  */
 LabSharpeningNodeParams
 labSharpeningNodeParams(const procparams::ProcParams& params,
-                        bool ciecam_arm = false);
+                        bool ciecam_arm = false, double scale = 1.0);
 
 /*
  * Build the argument list for one submission. The context's hue table and the
@@ -220,10 +276,12 @@ void labSharpeningArgs(LabImage& lab, const LabSharpeningNodeParams& node,
 /*
  * Whether the Lab block is the node's supported set. `ciecam_arm` is true when
  * the caller's gate leaves impulse denoise, defringe and microcontrast to the
- * CIE-CAM pipeline, which runs on the CieImage and is not this node.
+ * CIE-CAM pipeline, which runs on the CieImage and is not this node. `scale`
+ * is the export's resize factor and 1.0 on the crop path.
  */
 bool labSharpeningSupported(const procparams::ProcParams& params, int width,
-                            int height, bool ciecam_arm, std::string* error);
+                            int height, bool ciecam_arm, std::string* error,
+                            double scale = 1.0);
 
 /*
  * The block as it ran before the device node, moved here unchanged so the call
@@ -235,10 +293,12 @@ void labSharpeningHostBlock(ImProcFunctions& ipf,
 
 /*
  * Submit the block to the device and fall back to the host block. This is the
- * only entry point the Lab call sites use.
+ * only entry point the Lab call sites use. `scale` is the export's resize
+ * factor and 1.0 on the crop path.
  */
 void labSharpeningRun(ImProcFunctions& ipf, procparams::ProcParams& params,
-                      LabImage& lab, bool ciecam_arm);
+                      LabImage& lab, bool ciecam_arm,
+                      double scale = 1.0);
 
 /*
  * Host-owned setup for one lab.sharpening submission. `build` derives the

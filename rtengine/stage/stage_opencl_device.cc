@@ -48,6 +48,7 @@
 #include <glibmm/module.h>
 
 #include "color.h"
+#include "rt_algo.h"
 #include "rt_math.h"
 #include "sleef.h"
 #include "stage/algorithms/ciecam_cl.h"
@@ -14401,41 +14402,81 @@ RtStageStatus run_lab_sharpening(const std::shared_ptr<OpenCLEnv>& env,
 
     if (p.impulse_enabled != 0) {
         /*
-         * impulse_nr()'s threshold is params.thresh / 20.0. The host's SSE
-         * blur takes a float sigma, so the coefficients are derived from the
-         * same rounded value.
+         * impulse_nr() clamps the low-pass sigma to 2.0. At scale 1 and that
+         * clamp the device mark kernel reproduces the host mask; a scaled
+         * export, or any threshold that lifts the sigma above the clamp,
+         * reaches the region where the host's SSE blur and the device's float
+         * recurrence can move a border sample across the mask comparison.
+         * Derive the mask with the host's own markImpulse() there and keep
+         * only the correction on the device.
          */
         const double threshold = p.impulse_threshold / 20.0;
         const double sigma = std::max(2.0, threshold - 1.0);
-        SharpenIirFactors factors;
-        sharpen_iir_factors(static_cast<double>(static_cast<float>(sigma)),
-                            factors);
-        if (!sharpen_iir_plane(env, iir_kernel, l_memory, impulse_lowpass,
-                               state, width, height, pitch, factors, error)) {
-            release_scratch();
-            return RT_STAGE_ERROR;
-        }
-        const float impthr =
-            static_cast<float>(std::max(1.0, 5.5 - threshold));
-        const float impthr_div24 = impthr / 24.0f;
+        const bool host_mask =
+            p.scale != 1.0 ||
+            p.impulse_threshold > LAB_SHARPENING_IMPULSE_DEVICE_THRESHOLD;
         const cl_int cl_width = width;
         const cl_int cl_height = height;
         const cl_int cl_pitch = pitch;
         const cl_int cl_mask_pitch = width;
-        const bool mark_ok =
-            set_arg(mark_kernel, 0, sizeof(cl_mem), &l_memory) &&
-            set_arg(mark_kernel, 1, sizeof(cl_mem), &impulse_lowpass) &&
-            set_arg(mark_kernel, 2, sizeof(cl_mem), &mask) &&
-            set_arg(mark_kernel, 3, sizeof(cl_int), &cl_width) &&
-            set_arg(mark_kernel, 4, sizeof(cl_int), &cl_height) &&
-            set_arg(mark_kernel, 5, sizeof(cl_int), &cl_pitch) &&
-            set_arg(mark_kernel, 6, sizeof(cl_int), &cl_mask_pitch) &&
-            set_arg(mark_kernel, 7, sizeof(cl_float), &impthr_div24) &&
-            run_2d(mark_kernel);
-        if (!mark_ok) {
-            release_scratch();
-            error = "lab.sharpening impulse mark failed";
-            return RT_STAGE_ERROR;
+        if (host_mask) {
+            std::vector<float*> rows(static_cast<std::size_t>(height));
+            std::vector<char*> mask_rows(static_cast<std::size_t>(height));
+            std::vector<char> host_mask(static_cast<std::size_t>(width) *
+                                        static_cast<std::size_t>(height));
+            float* const base = static_cast<float*>(luminance.data);
+            const std::size_t row_values =
+                luminance.row_pitch / sizeof(float);
+            for (int y = 0; y < height; ++y) {
+                rows[static_cast<std::size_t>(y)] =
+                    base + static_cast<std::size_t>(y) * row_values;
+                mask_rows[static_cast<std::size_t>(y)] =
+                    host_mask.data() +
+                    static_cast<std::size_t>(y) * static_cast<std::size_t>(width);
+            }
+            markImpulse(width, height, rows.data(), mask_rows.data(),
+                        static_cast<float>(threshold));
+            const std::size_t mask_bytes =
+                static_cast<std::size_t>(width) *
+                static_cast<std::size_t>(height);
+            const std::size_t origin[3] = {0, 0, 0};
+            const std::size_t region[3] = {mask_bytes, 1, 1};
+            if (env->api->EnqueueWriteBufferRect(
+                    env->queue, mask, CL_TRUE, origin, origin, region, 0, 0,
+                    0, 0, host_mask.data(), 0, nullptr, nullptr) !=
+                CL_SUCCESS) {
+                release_scratch();
+                error = "lab.sharpening impulse mask upload failed";
+                return RT_STAGE_ERROR;
+            }
+        } else {
+            SharpenIirFactors factors;
+            sharpen_iir_factors(
+                static_cast<double>(static_cast<float>(sigma)), factors);
+            if (!sharpen_iir_plane(env, iir_kernel, l_memory, impulse_lowpass,
+                                   state, width, height, pitch, factors,
+                                   error)) {
+                release_scratch();
+                return RT_STAGE_ERROR;
+            }
+            const float impthr =
+                static_cast<float>(std::max(1.0, 5.5 - threshold));
+            const float impthr_div24 = impthr / 24.0f;
+            const bool mark_ok =
+                set_arg(mark_kernel, 0, sizeof(cl_mem), &l_memory) &&
+                set_arg(mark_kernel, 1, sizeof(cl_mem), &impulse_lowpass) &&
+                set_arg(mark_kernel, 2, sizeof(cl_mem), &mask) &&
+                set_arg(mark_kernel, 3, sizeof(cl_int), &cl_width) &&
+                set_arg(mark_kernel, 4, sizeof(cl_int), &cl_height) &&
+                set_arg(mark_kernel, 5, sizeof(cl_int), &cl_pitch) &&
+                set_arg(mark_kernel, 6, sizeof(cl_int), &cl_mask_pitch) &&
+                set_arg(mark_kernel, 7, sizeof(cl_float), &impthr_div24) &&
+                run_2d(mark_kernel);
+            if (!mark_ok) {
+                release_scratch();
+                error = "lab.sharpening impulse mark failed";
+                return RT_STAGE_ERROR;
+            }
         }
         const bool correct_ok =
             set_arg(correct_kernel, 0, sizeof(cl_mem), &l_memory) &&

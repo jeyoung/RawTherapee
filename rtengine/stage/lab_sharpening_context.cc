@@ -224,7 +224,8 @@ bool lab_sharpening_decode(const RtStageArg* args, uint32_t nargs,
         LAB_SHARPENING_ARG_DEFRINGE_RADIUS,
         LAB_SHARPENING_ARG_EDGES_AMOUNT,
         LAB_SHARPENING_ARG_MICRO_AMOUNT,
-        LAB_SHARPENING_ARG_MICRO_CONTRAST};
+        LAB_SHARPENING_ARG_MICRO_CONTRAST,
+        LAB_SHARPENING_ARG_SCALE};
     for (LabSharpeningArg index : doubleArgs) {
         if (args[index].kind != RT_STAGE_ARG_DOUBLE) {
             error = "lab.sharpening argument " + std::to_string(index) +
@@ -272,6 +273,7 @@ bool lab_sharpening_decode(const RtStageArg* args, uint32_t nargs,
     params.micro_contrast = args[LAB_SHARPENING_ARG_MICRO_CONTRAST].u.f;
     params.micro_uniformity =
         static_cast<int>(args[LAB_SHARPENING_ARG_MICRO_UNIFORMITY].u.i);
+    params.scale = args[LAB_SHARPENING_ARG_SCALE].u.f;
 
     hue = args[LAB_SHARPENING_ARG_HUE_TABLE].u.buffer;
     const std::int64_t hue_entries =
@@ -293,15 +295,37 @@ bool lab_sharpening_admitted(const LabSharpeningNodeParams& params, int width,
         error = "lab.sharpening needs at least 8x8 pixels";
         return false;
     }
+    /*
+     * The export prescales the impulse threshold and defringe radius before
+     * the block runs. The scale itself must be usable: a non-positive or
+     * non-finite factor cannot describe a resize, and above the point where
+     * the widest GUI radius reaches gaussianBlur()'s double-precision IIR
+     * limit the host and device recurrences differ, so the block is a host
+     * residual.
+     */
+    if (!std::isfinite(params.scale) ||
+        params.scale <= LAB_SHARPENING_MIN_SCALE ||
+        params.scale > LAB_SHARPENING_MAX_SCALE) {
+        error = "lab.sharpening export scale is outside the device range";
+        return false;
+    }
     if (params.impulse_enabled == 0 && params.defringe_enabled == 0 &&
         params.edges_enabled == 0 && params.micro_enabled == 0) {
         error = "lab.sharpening has no enabled tool";
         return false;
     }
+    /*
+     * adjust_procparams() multiplies the GUI threshold by the scale and
+     * truncates the product into the int field, so the prescaled maximum is
+     * the same truncation of the GUI maximum. A legal GUI value therefore
+     * stays inside the derived bound at every supported scale.
+     */
     if (params.impulse_enabled != 0 &&
-        (params.impulse_threshold < LAB_SHARPENING_MIN_THRESHOLD ||
-         params.impulse_threshold > LAB_SHARPENING_MAX_THRESHOLD)) {
-        error = "lab.sharpening impulse threshold is outside 0..100";
+        (params.impulse_threshold <
+             static_cast<int>(LAB_SHARPENING_MIN_THRESHOLD * params.scale) ||
+         params.impulse_threshold >
+             static_cast<int>(LAB_SHARPENING_MAX_THRESHOLD * params.scale))) {
+        error = "lab.sharpening impulse threshold is outside 0..100 * scale";
         return false;
     }
     if (params.edges_enabled != 0) {
@@ -340,8 +364,27 @@ bool lab_sharpening_admitted(const LabSharpeningNodeParams& params, int width,
         return true;
     }
 
+    /*
+     * adjust_procparams() maps the GUI radius r to
+     * 2 + (r - 2) * scale. Invert that mapping into the same bounds so a
+     * prescaled radius inside the GUI range is admitted while a value the
+     * export could not have produced from a GUI radius stays a residual. The
+     * lower bound uses the admitted no-op floor (0), not the GUI's 0.5,
+     * because a stored radius below 0.5 still runs on the host.
+     */
+    const double radius_lo =
+        LAB_SHARPENING_DEFRINGE_DEFAULT_RADIUS +
+        (LAB_SHARPENING_MIN_RADIUS -
+         LAB_SHARPENING_DEFRINGE_DEFAULT_RADIUS) *
+            params.scale;
+    const double radius_hi =
+        LAB_SHARPENING_DEFRINGE_DEFAULT_RADIUS +
+        (LAB_SHARPENING_GUI_MAX_RADIUS -
+         LAB_SHARPENING_DEFRINGE_DEFAULT_RADIUS) *
+            params.scale;
     if (!std::isfinite(params.defringe_radius) ||
-        params.defringe_radius < LAB_SHARPENING_MIN_RADIUS ||
+        params.defringe_radius < radius_lo - LAB_SHARPENING_SCALE_EPSILON ||
+        params.defringe_radius > radius_hi + LAB_SHARPENING_SCALE_EPSILON ||
         params.defringe_radius >= LAB_SHARPENING_MAX_RADIUS) {
         error = "lab.sharpening defringe radius is outside the device range";
         return false;
@@ -389,9 +432,26 @@ bool lab_sharpening_active(const LabSharpeningNodeParams& params)
            params.edges_enabled != 0 || params.micro_enabled != 0;
 }
 
+void labSharpeningScaleParams(procparams::ProcParams& params, double scale)
+{
+    /*
+     * The production operator is `int *= double`, which truncates towards
+     * zero. Keep the same assignment here rather than an explicit cast so the
+     * call site and the admission bound cannot drift apart.
+     */
+    params.impulseDenoise.thresh *= scale;
+    params.defringe.radius =
+        LAB_SHARPENING_DEFRINGE_DEFAULT_RADIUS +
+        (params.defringe.radius - LAB_SHARPENING_DEFRINGE_DEFAULT_RADIUS) *
+            scale;
+    if (scale < LAB_SHARPENING_IMPULSE_MIN_SCALE) {
+        params.impulseDenoise.enabled = false;
+    }
+}
+
 LabSharpeningNodeParams
 labSharpeningNodeParams(const procparams::ProcParams& params,
-                        bool ciecam_arm)
+                        bool ciecam_arm, double scale)
 {
     LabSharpeningNodeParams node;
     /* The CIE-CAM pipeline owns these tools on the CieImage. ML sharpen edges
@@ -403,6 +463,7 @@ labSharpeningNodeParams(const procparams::ProcParams& params,
         !ciecam_arm && params.defringe.enabled ? 1 : 0;
     node.defringe_radius = params.defringe.radius;
     node.defringe_threshold = params.defringe.threshold;
+    node.scale = scale;
     /*
      * The active hue curve is the block's own condition: a stored curve whose
      * type is beyond FCT_Linear.
@@ -485,12 +546,15 @@ void labSharpeningArgs(LabImage& lab, const LabSharpeningNodeParams& node,
     args[LAB_SHARPENING_ARG_MICRO_CONTRAST].u.f = node.micro_contrast;
     args[LAB_SHARPENING_ARG_MICRO_UNIFORMITY].kind = RT_STAGE_ARG_INT;
     args[LAB_SHARPENING_ARG_MICRO_UNIFORMITY].u.i = node.micro_uniformity;
+    args[LAB_SHARPENING_ARG_SCALE].kind = RT_STAGE_ARG_DOUBLE;
+    args[LAB_SHARPENING_ARG_SCALE].u.f = node.scale;
     args[LAB_SHARPENING_ARG_CONTEXT].kind = RT_STAGE_ARG_PTR;
     args[LAB_SHARPENING_ARG_CONTEXT].u.ptr = &descriptor;
 }
 
 bool labSharpeningSupported(const procparams::ProcParams& params, int width,
-                            int height, bool ciecam_arm, std::string* error)
+                            int height, bool ciecam_arm, std::string* error,
+                            double scale)
 {
     const auto fail = [error](const char* message) {
         if (error != nullptr) {
@@ -500,7 +564,7 @@ bool labSharpeningSupported(const procparams::ProcParams& params, int width,
     };
 
     const LabSharpeningNodeParams node =
-        labSharpeningNodeParams(params, ciecam_arm);
+        labSharpeningNodeParams(params, ciecam_arm, scale);
     if (!lab_sharpening_active(node)) {
         return fail("lab.sharpening has no tool that would change the image");
     }
@@ -531,9 +595,10 @@ void labSharpeningHostBlock(ImProcFunctions& ipf,
 }
 
 void labSharpeningRun(ImProcFunctions& ipf, procparams::ProcParams& params,
-                      LabImage& lab, bool ciecam_arm)
+                      LabImage& lab, bool ciecam_arm, double scale)
 {
-    LabSharpeningNodeParams node = labSharpeningNodeParams(params, ciecam_arm);
+    LabSharpeningNodeParams node =
+        labSharpeningNodeParams(params, ciecam_arm, scale);
     if (!lab_sharpening_active(node)) {
         return;
     }
@@ -552,7 +617,7 @@ void labSharpeningRun(ImProcFunctions& ipf, procparams::ProcParams& params,
 
     std::string support_error;
     const bool supported = labSharpeningSupported(
-        params, lab.W, lab.H, ciecam_arm, &support_error);
+        params, lab.W, lab.H, ciecam_arm, &support_error, scale);
     RtLabSharpeningContext descriptor = context.descriptor(supported);
 
     std::vector<RtStageArg> args;
