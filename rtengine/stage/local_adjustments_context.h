@@ -67,7 +67,7 @@ struct ProcParams;
  * small, known subset reaches the supported paths. Slots are named by the
  * RT_LOCAL_ADJUSTMENTS_SLOT_* constants and are written once per spot.
  */
-#define RT_LOCAL_ADJUSTMENTS_CONTEXT_VERSION 15u
+#define RT_LOCAL_ADJUSTMENTS_CONTEXT_VERSION 16u
 /* "LAJC": rejects a stale or unrelated pointer before any callback runs. */
 #define RT_LOCAL_ADJUSTMENTS_CONTEXT_MAGIC 0x4C414A43u
 /* The block has no bounded spot count, but a profile that carries more spots
@@ -551,6 +551,66 @@ struct ProcParams;
  * admitted blur stays below it; contrast zero keeps buildBlendMask() idle. */
 #define RT_LOCAL_ADJUSTMENTS_MASK_MAX_BLUR 0.25
 
+/*
+ * Capture sharpening. Lab_Local()'s `"cap"` arm is separate from the RL arm:
+ * it copies the clipped ROI, converts it to working RGB, builds a contrast
+ * mask from RGB2L and runs CaptureDeconvSharpening_SE() on the Rec2020
+ * luminance, then multiplies the RGB channels by the new/old ratio and
+ * returns through rgb2lab(). EXP_CAPTURE is 1 when the arm runs: the tool on,
+ * an active spot with no explicit mask, a clipped ROI of at least mSPsharpCS
+ * (150) px on both axes, and the configuration below.
+ *
+ * The admitted configuration keeps the deconvolution deterministic and
+ * scalar: no gamma wrapper (`deconvCogam == 1`), no corner radius boost
+ * (`deconvCoBoost == 0`), the manual contrast (`deconvAutoshar == false`) so
+ * buildBlendMask2()'s data-dependent tile search is not needed, and the
+ * GUI's iteration radius. CAP_SIGMA is `capradius`, CAP_ITER the truncated
+ * `deconvCoLat`, CAP_CONTRAST the manual `sharcontrast` and CAP_REPART the
+ * `1 - 0.01 * reparsha` blend weight. The device reproduces the block's tiled
+ * division/multiplication recurrence, including the end-of-row/column tiles,
+ * the `itercheck` early exit and the sigma-selected 3x3..13x13 kernels.
+ */
+#define RT_LOCAL_ADJUSTMENTS_SLOT_EXP_CAPTURE 331u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_CAP_SIGMA 332u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_CAP_ITER 333u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_CAP_CONTRAST 334u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_CAP_REPART 335u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_CAP_GAMMA 336u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_CAP_KERNEL_OFFSET 337u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_CAP_KERNEL_N 338u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_CAP_BORDER 339u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_CAP_CHECK_STOP 340u
+/* iplocallab.cc's mSPsharpCS: buildBlendMask2() needs 150 px on both axes.
+ * A smaller ROI makes the capture block a no-op, not a refusal. */
+#define RT_LOCAL_ADJUSTMENTS_CAPTURE_MIN_ROI 150
+/* The GUI ranges of the capture sliders. */
+#define RT_LOCAL_ADJUSTMENTS_CAPTURE_MIN_SIGMA 0.4
+#define RT_LOCAL_ADJUSTMENTS_CAPTURE_MAX_SIGMA 2.5
+#define RT_LOCAL_ADJUSTMENTS_CAPTURE_MIN_ITER 0
+#define RT_LOCAL_ADJUSTMENTS_CAPTURE_MAX_ITER 100
+#define RT_LOCAL_ADJUSTMENTS_CAPTURE_MIN_CONTRAST 3
+#define RT_LOCAL_ADJUSTMENTS_CAPTURE_MAX_CONTRAST 200
+#define RT_LOCAL_ADJUSTMENTS_CAPTURE_MIN_REPART 0.0
+#define RT_LOCAL_ADJUSTMENTS_CAPTURE_MAX_REPART 100.0
+/* CaptureDeconvSharpening_SE()'s kernel selection thresholds. The offset-zero
+ * arm picks the kernel from sigma alone; the border also depends on whether
+ * the iteration count exceeds 30. */
+#define RT_LOCAL_ADJUSTMENTS_CAPTURE_SIGMA_3 0.6
+#define RT_LOCAL_ADJUSTMENTS_CAPTURE_SIGMA_5 0.84
+#define RT_LOCAL_ADJUSTMENTS_CAPTURE_SIGMA_7 1.15
+#define RT_LOCAL_ADJUSTMENTS_CAPTURE_SIGMA_9 1.5
+#define RT_LOCAL_ADJUSTMENTS_CAPTURE_BORDER_LOW 5
+#define RT_LOCAL_ADJUSTMENTS_CAPTURE_BORDER_HIGH 7
+#define RT_LOCAL_ADJUSTMENTS_CAPTURE_BORDER_WIDE 8
+#define RT_LOCAL_ADJUSTMENTS_CAPTURE_BORDER_ITER_LIMIT 30
+/* The block's tile geometry and skipped-tile floor. */
+#define RT_LOCAL_ADJUSTMENTS_CAPTURE_TILE 32
+#define RT_LOCAL_ADJUSTMENTS_CAPTURE_MAX_BORDER 8
+#define RT_LOCAL_ADJUSTMENTS_CAPTURE_MAX_FULL 48
+#define RT_LOCAL_ADJUSTMENTS_CAPTURE_MIN_BLEND 0.01f
+/* One workgroup per tile; the size is the kernel's local work size. */
+#define RT_LOCAL_ADJUSTMENTS_CAPTURE_WORKGROUP 64u
+
 /* deconvsharpeningloc() has two arms. Damping zero is the undamped RLD path:
  * the division/multiplication recurrence the output.sharpen core already
  * covers. A positive damping value is the damped path: a plain Gaussian blur,
@@ -849,21 +909,27 @@ namespace rtengine::stage
  * tool variants and ranges are checked separately. The block has no pre-CBDL
  * pass and no global dehaze; the local dehaze is part of the spot path.
  *
- * Local sharpening is admitted only in the `"rl"` (RLD) arm that the
- * output.sharpen core covers: undamped or damped, with no capture sharpening,
- * no gamma wrapper, no blur pre-pass and a radius whose RLD sigma is below the
- * core's separable limit. The damping parameter is the block's effective
- * value after the `"bef"` fixup and spans the GUI's 0..100 range; a damped
- * spot needs a radius of at least 0.6, where the forward blur is the standard
- * IIR pair. Capture sharpening (`"cap"`), `shargam != 1`, `sharblur >= 0.25`,
- * `sharshow`, a radius outside 0.4..1.15, a damped radius below 0.6, masks, a
- * soft radius, out-of-range sliders and a damping value outside 0..100 are
- * residuals. A radius at or below 0.42 is the block's own no-op and is
- * admitted without a device pass. A partial spot
- * with a non-zero transition is also a residual: Sharp_Local() reads the
- * padded deconvolution result across the transition ring, which the block's
- * `lx + lxL + 3` extent does not cover. A zero-width transition keeps the ring
- * inside the nominal extent.
+ * Local sharpening has two arms. The `"rl"` (RLD) arm is admitted undamped or
+ * damped, with no gamma wrapper, no blur pre-pass and a radius whose RLD
+ * sigma is below the core's separable limit. The damping parameter is the
+ * block's effective value after the `"bef"` fixup and spans the GUI's 0..100
+ * range; a damped spot needs a radius of at least 0.6, where the forward blur
+ * is the standard IIR pair. `shargam != 1`, `sharblur >= 0.25`, `sharshow`, a
+ * radius outside 0.4..1.15, a damped radius below 0.6, masks, a soft radius,
+ * out-of-range sliders and a damping value outside 0..100 are residuals. A
+ * radius at or below 0.42 is the block's own no-op and is admitted without a
+ * device pass. A partial spot with a non-zero transition is also a residual:
+ * Sharp_Local() reads the padded deconvolution result across the transition
+ * ring, which the block's `lx + lxL + 3` extent does not cover. A zero-width
+ * transition keeps the ring inside the nominal extent.
+ *
+ * The `"cap"` (capture) arm is admitted without a gamma wrapper, without the
+ * corner radius boost and with the manual contrast: `deconvCogam == 1`,
+ * `deconvCoBoost == 0` and `deconvAutoshar == false`. The sigma, iteration
+ * count, contrast and recovery sliders stay inside the GUI ranges. The
+ * automatic tile contrast, the gamma wrapper, the corner boost and the mask
+ * display are residuals. An ROI below the block's 150 px mSPsharpCS gate is a
+ * no-op, not a device pass.
  *
  * Blur & Noise admits two arms. The Gaussian arm is `blMethod == "blur"` in
  * its normal direction with `chroMethod` luminance, chroma or all; the block's

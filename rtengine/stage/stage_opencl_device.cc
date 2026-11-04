@@ -12990,6 +12990,16 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
         compiled_kernel_entry(env, def, "rt_lab_tools_upsample", error);
     cl_kernel sh_apply_kernel =
         compiled_kernel_entry(env, def, "rt_lab_tools_apply", error);
+    cl_kernel capture_luma_kernel = compiled_kernel_entry(
+        env, def, "rt_local_adjustments_capture_luma", error);
+    cl_kernel capture_init_kernel = compiled_kernel_entry(
+        env, def, "rt_local_adjustments_capture_init", error);
+    cl_kernel capture_kernel = compiled_kernel_entry(
+        env, def, "rt_local_adjustments_capture", error);
+    cl_kernel capture_finish_kernel = compiled_kernel_entry(
+        env, def, "rt_local_adjustments_capture_finish", error);
+    cl_kernel capture_mix_kernel = compiled_kernel_entry(
+        env, def, "rt_local_adjustments_capture_mix", error);
     if (apply_kernel == nullptr || clamp_kernel == nullptr ||
         roi_kernel == nullptr || munsell_kernel == nullptr ||
         sharpen_fill_kernel == nullptr || plane_copy_kernel == nullptr ||
@@ -13023,7 +13033,11 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
         sh_mask_kernel == nullptr || sh_subsample_kernel == nullptr ||
         sh_box_h_kernel == nullptr || sh_box_v_kernel == nullptr ||
         sh_combine_kernel == nullptr || sh_upsample_kernel == nullptr ||
-        sh_apply_kernel == nullptr) {
+        sh_apply_kernel == nullptr ||
+        capture_luma_kernel == nullptr || capture_init_kernel == nullptr ||
+        capture_kernel == nullptr ||
+        capture_finish_kernel == nullptr ||
+        capture_mix_kernel == nullptr) {
         return RT_STAGE_FALLBACK;
     }
 
@@ -13198,6 +13212,10 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
     char sharpen_tmp_key = 0;
     char sharpen_blur_keys[3] = {0, 0, 0};
     char sharpen_blur_tmp_key = 0;
+    char capture_rgb_key = 0;
+    char capture_luma_key = 0;
+    char capture_mask_key = 0;
+    char capture_y_key = 0;
     char log_orig_key = 0;
     char mask_blur_key = 0;
     char mask_out_key = 0;
@@ -13408,6 +13426,8 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
             rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXPLOG] == 1.0f;
         const bool sharpenPass =
             rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXPSHARP] == 1.0f;
+        const bool capturePass =
+            rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXP_CAPTURE] == 1.0f;
         const bool blurPass =
             rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXPBLUR] == 1.0f;
         const bool toneMapPass =
@@ -13440,6 +13460,8 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
             (rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXPLOG] != 0.0f && !logPass) ||
             (rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXPSHARP] != 0.0f &&
              !sharpenPass) ||
+            (rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXP_CAPTURE] != 0.0f &&
+             !capturePass) ||
             (rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXPBLUR] != 0.0f && !blurPass) ||
             (rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXP_TONEMAP] != 0.0f &&
              !toneMapPass) ||
@@ -13461,7 +13483,8 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
              rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXPCOLOR] != 1.0f) ||
             (!active && (colour || vibrance || localContrast ||
                          shadowsHighlights || softLight || cbdl ||
-                         dehazePass || logPass || sharpenPass || blurPass ||
+                         dehazePass || logPass || sharpenPass ||
+                         capturePass || blurPass ||
                          toneMapPass || ciePass || islocal))) {
             error = "local.adjustments record is outside the supported set";
             return RT_STAGE_FALLBACK;
@@ -13564,6 +13587,65 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
             error = "local.adjustments sharpening setting is outside its "
                     "range";
             return RT_STAGE_FALLBACK;
+        }
+        /* Capture sharpening's record. The kernel offset must name N * N
+         * floats of the result's flat table and the kernel size must be one
+         * of the block's five. The border and the manual-contrast scalars are
+         * validated here so a stale record cannot reach the kernel. */
+        const int captureN = static_cast<int>(
+            rec[RT_LOCAL_ADJUSTMENTS_SLOT_CAP_KERNEL_N]);
+        const int captureBorder = static_cast<int>(
+            rec[RT_LOCAL_ADJUSTMENTS_SLOT_CAP_BORDER]);
+        const float captureSigma =
+            rec[RT_LOCAL_ADJUSTMENTS_SLOT_CAP_SIGMA];
+        const int captureIterations = static_cast<int>(
+            rec[RT_LOCAL_ADJUSTMENTS_SLOT_CAP_ITER]);
+        if (capturePass) {
+            if (captureN != 3 && captureN != 5 && captureN != 7 &&
+                captureN != 9 && captureN != 13) {
+                error = "local.adjustments capture kernel size is unknown";
+                return RT_STAGE_FALLBACK;
+            }
+            if (captureBorder < RT_LOCAL_ADJUSTMENTS_CAPTURE_BORDER_LOW ||
+                captureBorder >
+                    RT_LOCAL_ADJUSTMENTS_CAPTURE_BORDER_WIDE) {
+                error = "local.adjustments capture border is out of range";
+                return RT_STAGE_FALLBACK;
+            }
+            const float captureOffset =
+                rec[RT_LOCAL_ADJUSTMENTS_SLOT_CAP_KERNEL_OFFSET];
+            if (captureOffset < 0.0f ||
+                captureOffset +
+                        static_cast<float>(captureN * captureN) >
+                    static_cast<float>(setup.lut_count)) {
+                error = "local.adjustments capture kernel table is missing";
+                return RT_STAGE_FALLBACK;
+            }
+            if (captureSigma <
+                    RT_LOCAL_ADJUSTMENTS_CAPTURE_MIN_SIGMA ||
+                captureSigma >
+                    RT_LOCAL_ADJUSTMENTS_CAPTURE_MAX_SIGMA ||
+                captureIterations <
+                    RT_LOCAL_ADJUSTMENTS_CAPTURE_MIN_ITER ||
+                captureIterations >
+                    RT_LOCAL_ADJUSTMENTS_CAPTURE_MAX_ITER ||
+                rec[RT_LOCAL_ADJUSTMENTS_SLOT_CAP_CONTRAST] <
+                    RT_LOCAL_ADJUSTMENTS_CAPTURE_MIN_CONTRAST ||
+                rec[RT_LOCAL_ADJUSTMENTS_SLOT_CAP_CONTRAST] >
+                    RT_LOCAL_ADJUSTMENTS_CAPTURE_MAX_CONTRAST ||
+                rec[RT_LOCAL_ADJUSTMENTS_SLOT_CAP_REPART] <
+                    RT_LOCAL_ADJUSTMENTS_CAPTURE_MIN_REPART ||
+                rec[RT_LOCAL_ADJUSTMENTS_SLOT_CAP_REPART] >
+                    RT_LOCAL_ADJUSTMENTS_CAPTURE_MAX_REPART ||
+                rec[RT_LOCAL_ADJUSTMENTS_SLOT_CAP_GAMMA] != 1.0f ||
+                (rec[RT_LOCAL_ADJUSTMENTS_SLOT_CAP_CHECK_STOP] != 0.0f &&
+                 rec[RT_LOCAL_ADJUSTMENTS_SLOT_CAP_CHECK_STOP] != 1.0f) ||
+                rec[RT_LOCAL_ADJUSTMENTS_SLOT_SENSSHA] < 0.0f ||
+                rec[RT_LOCAL_ADJUSTMENTS_SLOT_SENSSHA] > 100.0f) {
+                error = "local.adjustments capture setting is outside its "
+                        "range";
+                return RT_STAGE_FALLBACK;
+            }
         }
         const int blurArm = static_cast<int>(
             rec[RT_LOCAL_ADJUSTMENTS_SLOT_BLUR_ARM]);
@@ -14395,12 +14477,37 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
                     &sharpen_tmp_key, sharpen_shape, &error);
             }
             /*
+             * Capture sharpening's clipped-ROI planes: the working RGB copy,
+             * the RGB2L mask source/blur scratch, the contrast mask and the
+             * deconvolved Rec2020 luminance. The mask scratch is also the
+             * luma source: the mask copy is complete before the blur reuses
+             * it.
+             */
+            StageDeviceBufferPtr capture_rgb_device;
+            StageDeviceBufferPtr capture_luma_device;
+            StageDeviceBufferPtr capture_mask_device;
+            StageDeviceBufferPtr capture_y_device;
+            if (capturePass) {
+                capture_rgb_device = residency->acquire(
+                    &capture_rgb_key,
+                    StageBufferShape{RT_STAGE_F32, bfw, bfh, 3}, &error);
+                capture_luma_device = residency->acquire(
+                    &capture_luma_key,
+                    StageBufferShape{RT_STAGE_F32, bfw, bfh, 1}, &error);
+                capture_mask_device = residency->acquire(
+                    &capture_mask_key,
+                    StageBufferShape{RT_STAGE_F32, bfw, bfh, 1}, &error);
+                capture_y_device = residency->acquire(
+                    &capture_y_key,
+                    StageBufferShape{RT_STAGE_F32, bfw, bfh, 1}, &error);
+            }
+            /*
              * Sharp_Local() and BlurNoise_Local() both blur the full image for
              * their deltaE reference, not the ROI, at the block's 3 / sk
              * radius. The two passes share the buffer and recompute it from the
              * image as each pass starts.
              */
-            if (sharpenPass || blurPass || retinexPass) {
+            if (sharpenPass || capturePass || blurPass || retinexPass) {
                 for (int plane = 0; plane < 3; ++plane) {
                     sharpen_blur_device[plane] = residency->acquire(
                         &sharpen_blur_keys[plane],
@@ -14693,7 +14800,10 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
                 (sharpenPass &&
                  (!sharpen_luma_device || !sharpen_mask_device ||
                   !sharpen_estimate_device || !sharpen_tmp_device)) ||
-                ((sharpenPass || blurPass) &&
+                (capturePass &&
+                 (!capture_rgb_device || !capture_luma_device ||
+                  !capture_mask_device || !capture_y_device)) ||
+                ((sharpenPass || capturePass || blurPass) &&
                  (!sharpen_blur_device[0] || !sharpen_blur_device[1] ||
                   !sharpen_blur_device[2] || !sharpen_blur_tmp_device)) ||
                 (shadowsHighlights &&
@@ -14769,7 +14879,7 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
             int sharpen_pitch = 0;
             int sharpen_plane = 0;
             int sharpen_blur_pitch = 0;
-            if (sharpenPass || blurPass || retinexPass) {
+            if (sharpenPass || capturePass || blurPass || retinexPass) {
                 sharpen_blur_pitch = int_pitch(
                     pitch_of(sharpen_blur_device[0]), "scope blur");
                 if (sharpen_blur_pitch < 0 ||
@@ -14798,6 +14908,25 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
                         pitch_of(sharpen_luma_device)) {
                     error = "local.adjustments sharpening buffers have "
                             "different pitches";
+                    return RT_STAGE_FALLBACK;
+                }
+            }
+            int capture_pitch = 0;
+            int capture_plane = 0;
+            if (capturePass) {
+                capture_pitch =
+                    int_pitch(pitch_of(capture_rgb_device), "capture");
+                capture_plane = int_pitch(
+                    plane_pitch_of(capture_rgb_device), "capture plane");
+                if (capture_pitch < 0 || capture_plane < 0 ||
+                    pitch_of(capture_luma_device) !=
+                        pitch_of(capture_rgb_device) ||
+                    pitch_of(capture_mask_device) !=
+                        pitch_of(capture_rgb_device) ||
+                    pitch_of(capture_y_device) !=
+                        pitch_of(capture_rgb_device)) {
+                    error = "local.adjustments capture buffers have different "
+                            "pitches";
                     return RT_STAGE_FALLBACK;
                 }
             }
@@ -14917,9 +15046,17 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
                 sharpenPass ? memory_of(sharpen_estimate_device) : nullptr;
             cl_mem sharpen_tmp_memory =
                 sharpenPass ? memory_of(sharpen_tmp_device) : nullptr;
+            cl_mem capture_rgb_memory =
+                capturePass ? memory_of(capture_rgb_device) : nullptr;
+            cl_mem capture_luma_memory =
+                capturePass ? memory_of(capture_luma_device) : nullptr;
+            cl_mem capture_mask_memory =
+                capturePass ? memory_of(capture_mask_device) : nullptr;
+            cl_mem capture_y_memory =
+                capturePass ? memory_of(capture_y_device) : nullptr;
             cl_mem sharpen_blur_memory[3] = {};
             cl_mem sharpen_blur_tmp_memory = nullptr;
-            if (sharpenPass || blurPass || retinexPass) {
+            if (sharpenPass || capturePass || blurPass || retinexPass) {
                 for (int plane = 0; plane < 3; ++plane) {
                     sharpen_blur_memory[plane] =
                         memory_of(sharpen_blur_device[plane]);
@@ -18365,6 +18502,405 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
                         error = "local.adjustments sharpen blend failed";
                         return RT_STAGE_FALLBACK;
                     }
+                }
+            }
+
+            /*
+             * Capture sharpening. Lab_Local()'s "cap" arm is independent of
+             * the RL arm and runs on the clipped ROI. The block converts the
+             * ROI to working RGB, builds the RGB2L contrast mask with the
+             * manual threshold and the sigma-two blur, runs the tiled
+             * deconvolution on the Rec2020 luminance, multiplies each RGB
+             * channel by the new/old ratio, returns through rgb2lab() and
+             * blends with transit_shapedetect2()'s senstype-99 scope.
+             */
+            if (capturePass) {
+                cl_mem luts_memory = memory_of(luts_device);
+                cl_mem ws_memory = memory_of(ws_device);
+                cl_mem iws_memory = memory_of(iws_device);
+                cl_mem cachef_memory = memory_of(cachef_device);
+                cl_mem cachefy_memory = memory_of(cachefy_device);
+                /* Copy the clipped Lab ROI into the capture buffer. */
+                {
+                    cl_uint arg = 0;
+                    cl_mem lab_memory = memory_of(image);
+                    cl_int x0 = xstart;
+                    cl_int y0 = ystart;
+                    cl_int w = bfw;
+                    cl_int h = bfh;
+                    cl_int lp = lab_pitch;
+                    cl_int lpl = lab_plane;
+                    cl_int p = capture_pitch;
+                    cl_int pl = capture_plane;
+                    bool ok = true;
+                    ok = ok && set(roi_kernel, arg++, sizeof(cl_mem),
+                                   &lab_memory);
+                    ok = ok && set(roi_kernel, arg++, sizeof(cl_mem),
+                                   &capture_rgb_memory);
+                    ok = ok && set(roi_kernel, arg++, sizeof(cl_int), &x0);
+                    ok = ok && set(roi_kernel, arg++, sizeof(cl_int), &y0);
+                    ok = ok && set(roi_kernel, arg++, sizeof(cl_int), &w);
+                    ok = ok && set(roi_kernel, arg++, sizeof(cl_int), &h);
+                    ok = ok && set(roi_kernel, arg++, sizeof(cl_int), &lp);
+                    ok = ok && set(roi_kernel, arg++, sizeof(cl_int), &lpl);
+                    ok = ok && set(roi_kernel, arg++, sizeof(cl_int), &p);
+                    ok = ok && set(roi_kernel, arg++, sizeof(cl_int), &pl);
+                    if (!ok ||
+                        !launch2d(roi_kernel,
+                                  static_cast<std::size_t>(bfw),
+                                  static_cast<std::size_t>(bfh),
+                                  "capture ROI")) {
+                        error = "local.adjustments capture ROI failed";
+                        return RT_STAGE_FALLBACK;
+                    }
+                }
+                /* Lab -> working RGB over the clipped ROI, in place. */
+                {
+                    cl_uint arg = 0;
+                    cl_int w = bfw;
+                    cl_int h = bfh;
+                    cl_int p = capture_pitch;
+                    cl_int pl = capture_plane;
+                    bool ok = true;
+                    ok = ok && set(dehaze_lab2rgb_kernel, arg++,
+                                   sizeof(cl_mem), &capture_rgb_memory);
+                    ok = ok && set(dehaze_lab2rgb_kernel, arg++,
+                                   sizeof(cl_mem), &capture_rgb_memory);
+                    ok = ok && set(dehaze_lab2rgb_kernel, arg++,
+                                   sizeof(cl_int), &w);
+                    ok = ok && set(dehaze_lab2rgb_kernel, arg++,
+                                   sizeof(cl_int), &h);
+                    ok = ok && set(dehaze_lab2rgb_kernel, arg++,
+                                   sizeof(cl_int), &p);
+                    ok = ok && set(dehaze_lab2rgb_kernel, arg++,
+                                   sizeof(cl_int), &pl);
+                    ok = ok && set(dehaze_lab2rgb_kernel, arg++,
+                                   sizeof(cl_int), &p);
+                    ok = ok && set(dehaze_lab2rgb_kernel, arg++,
+                                   sizeof(cl_int), &pl);
+                    ok = ok && set(dehaze_lab2rgb_kernel, arg++,
+                                   sizeof(cl_mem), &iws_memory);
+                    if (!ok ||
+                        !launch2d(dehaze_lab2rgb_kernel,
+                                  static_cast<std::size_t>(bfw),
+                                  static_cast<std::size_t>(bfh),
+                                  "capture RGB")) {
+                        error = "local.adjustments capture RGB failed";
+                        return RT_STAGE_FALLBACK;
+                    }
+                }
+                /* RGB2L() into the luma scratch plane. */
+                {
+                    cl_uint arg = 0;
+                    cl_int w = bfw;
+                    cl_int h = bfh;
+                    cl_int p = capture_pitch;
+                    cl_int pl = capture_plane;
+                    bool ok = true;
+                    ok = ok && set(capture_luma_kernel, arg++, sizeof(cl_mem),
+                                   &capture_rgb_memory);
+                    ok = ok && set(capture_luma_kernel, arg++,
+                                   sizeof(cl_int), &p);
+                    ok = ok && set(capture_luma_kernel, arg++,
+                                   sizeof(cl_int), &pl);
+                    ok = ok && set(capture_luma_kernel, arg++,
+                                   sizeof(cl_mem), &capture_luma_memory);
+                    ok = ok && set(capture_luma_kernel, arg++,
+                                   sizeof(cl_int), &p);
+                    ok = ok && set(capture_luma_kernel, arg++,
+                                   sizeof(cl_mem), &ws_memory);
+                    ok = ok && set(capture_luma_kernel, arg++,
+                                   sizeof(cl_mem), &cachefy_memory);
+                    ok = ok && set(capture_luma_kernel, arg++,
+                                   sizeof(cl_int), &w);
+                    ok = ok && set(capture_luma_kernel, arg++,
+                                   sizeof(cl_int), &h);
+                    if (!ok ||
+                        !launch2d(capture_luma_kernel,
+                                  static_cast<std::size_t>(bfw),
+                                  static_cast<std::size_t>(bfh),
+                                  "capture luma")) {
+                        error = "local.adjustments capture luma failed";
+                        return RT_STAGE_FALLBACK;
+                    }
+                }
+                /* buildBlendMask2() with autoContrast off: the manual
+                 * `sharcontrast / 100` threshold, the block's gradient scale
+                 * and the sigma-two blur. */
+                const float captureThreshold =
+                    rec[RT_LOCAL_ADJUSTMENTS_SLOT_CAP_CONTRAST] / 100.0f;
+                const RtStageStatus capture_mask_status =
+                    sharpen_mask_plane(
+                        env, def, bfw, bfh, capture_pitch,
+                        capture_luma_memory, capture_mask_memory,
+                        capture_luma_memory, captureThreshold, error);
+                if (capture_mask_status != RT_STAGE_OK) {
+                    return RT_STAGE_FALLBACK;
+                }
+                /* Seed the deconvolution plane with the Rec2020 luminance, as
+                 * the host's RGB2Y() call does before the tile loop. */
+                {
+                    cl_uint arg = 0;
+                    cl_int w = bfw;
+                    cl_int h = bfh;
+                    bool ok = true;
+                    ok = ok && set(capture_init_kernel, arg++, sizeof(cl_mem),
+                                   &capture_rgb_memory);
+                    ok = ok && set(capture_init_kernel, arg++,
+                                   sizeof(cl_int), &capture_pitch);
+                    ok = ok && set(capture_init_kernel, arg++,
+                                   sizeof(cl_int), &capture_plane);
+                    ok = ok && set(capture_init_kernel, arg++,
+                                   sizeof(cl_mem), &capture_y_memory);
+                    ok = ok && set(capture_init_kernel, arg++,
+                                   sizeof(cl_int), &w);
+                    ok = ok && set(capture_init_kernel, arg++,
+                                   sizeof(cl_int), &h);
+                    if (!ok ||
+                        !launch2d(capture_init_kernel,
+                                  static_cast<std::size_t>(bfw),
+                                  static_cast<std::size_t>(bfh),
+                                  "capture init")) {
+                        error = "local.adjustments capture init failed";
+                        return RT_STAGE_FALLBACK;
+                    }
+                }
+                /* CaptureDeconvSharpening_SE()'s four ordered tile phases. */
+                const int captureTile =
+                    RT_LOCAL_ADJUSTMENTS_CAPTURE_TILE;
+                const int captureFull =
+                    captureTile + 2 * captureBorder;
+                const int captureRadius = captureN / 2;
+                const int captureTilesX =
+                    (bfw - 2 * captureBorder + captureTile - 1) /
+                    captureTile;
+                const int captureTilesY =
+                    (bfh - 2 * captureBorder + captureTile - 1) /
+                    captureTile;
+                if (captureTilesX < 1 || captureTilesY < 1 ||
+                    captureFull >
+                        RT_LOCAL_ADJUSTMENTS_CAPTURE_MAX_FULL) {
+                    error = "local.adjustments capture tile grid is outside "
+                            "the block's range";
+                    return RT_STAGE_FALLBACK;
+                }
+                const cl_int captureKernelOffset = static_cast<cl_int>(
+                    rec[RT_LOCAL_ADJUSTMENTS_SLOT_CAP_KERNEL_OFFSET]);
+                const cl_int captureIters = static_cast<cl_int>(
+                    rec[RT_LOCAL_ADJUSTMENTS_SLOT_CAP_ITER]);
+                const cl_int captureCheck =
+                    rec[RT_LOCAL_ADJUSTMENTS_SLOT_CAP_CHECK_STOP] == 1.0f
+                        ? 1
+                        : 0;
+                for (int phase = 0; phase < 4; ++phase) {
+                    int groups = 0;
+                    if (phase == 0) {
+                        groups = (captureTilesX - 1) *
+                                 (captureTilesY - 1);
+                    } else if (phase == 1) {
+                        groups = captureTilesY - 1;
+                    } else if (phase == 2) {
+                        groups = captureTilesX - 1;
+                    } else {
+                        groups = 1;
+                    }
+                    if (groups <= 0) {
+                        continue;
+                    }
+                    cl_uint arg = 0;
+                    cl_int phaseValue = phase;
+                    cl_int tilesX = captureTilesX;
+                    cl_int tilesY = captureTilesY;
+                    cl_int tile = captureTile;
+                    cl_int border = captureBorder;
+                    cl_int full = captureFull;
+                    cl_int radius = captureRadius;
+                    cl_int n = captureN;
+                    cl_int w = bfw;
+                    cl_int h = bfh;
+                    cl_int iterations = captureIters;
+                    cl_int checkStop = captureCheck;
+                    bool ok = true;
+                    ok = ok && set(capture_kernel, arg++, sizeof(cl_mem),
+                                   &capture_rgb_memory);
+                    ok = ok && set(capture_kernel, arg++, sizeof(cl_int),
+                                   &capture_pitch);
+                    ok = ok && set(capture_kernel, arg++, sizeof(cl_int),
+                                   &capture_plane);
+                    ok = ok && set(capture_kernel, arg++, sizeof(cl_mem),
+                                   &capture_y_memory);
+                    ok = ok && set(capture_kernel, arg++, sizeof(cl_mem),
+                                   &capture_mask_memory);
+                    ok = ok && set(capture_kernel, arg++, sizeof(cl_int),
+                                   &capture_pitch);
+                    ok = ok && set(capture_kernel, arg++, sizeof(cl_mem),
+                                   &luts_memory);
+                    ok = ok && set(capture_kernel, arg++, sizeof(cl_int),
+                                   &captureKernelOffset);
+                    ok = ok && set(capture_kernel, arg++, sizeof(cl_int),
+                                   &phaseValue);
+                    ok = ok && set(capture_kernel, arg++, sizeof(cl_int),
+                                   &tilesX);
+                    ok = ok && set(capture_kernel, arg++, sizeof(cl_int),
+                                   &tilesY);
+                    ok = ok && set(capture_kernel, arg++, sizeof(cl_int),
+                                   &tile);
+                    ok = ok && set(capture_kernel, arg++, sizeof(cl_int),
+                                   &border);
+                    ok = ok && set(capture_kernel, arg++, sizeof(cl_int),
+                                   &full);
+                    ok = ok && set(capture_kernel, arg++, sizeof(cl_int),
+                                   &radius);
+                    ok = ok && set(capture_kernel, arg++, sizeof(cl_int),
+                                   &n);
+                    ok = ok && set(capture_kernel, arg++, sizeof(cl_int),
+                                   &w);
+                    ok = ok && set(capture_kernel, arg++, sizeof(cl_int),
+                                   &h);
+                    ok = ok && set(capture_kernel, arg++, sizeof(cl_int),
+                                   &iterations);
+                    ok = ok && set(capture_kernel, arg++, sizeof(cl_int),
+                                   &checkStop);
+                    if (!ok) {
+                        error = "local.adjustments capture arguments failed";
+                        return RT_STAGE_FALLBACK;
+                    }
+                    const std::size_t local[1] = {
+                        RT_LOCAL_ADJUSTMENTS_CAPTURE_WORKGROUP};
+                    const std::size_t global[1] = {
+                        static_cast<std::size_t>(groups) * local[0]};
+                    cl_event done = nullptr;
+                    if (env->api->EnqueueNDRangeKernel(
+                            env->queue, capture_kernel, 1, nullptr, global,
+                            local, 0, nullptr, &done) != CL_SUCCESS ||
+                        done == nullptr) {
+                        error = "local.adjustments capture launch failed";
+                        return RT_STAGE_FALLBACK;
+                    }
+                    const cl_int wait = env->api->WaitForEvents(1, &done);
+                    env->api->ReleaseEvent(done);
+                    if (wait != CL_SUCCESS) {
+                        error = "local.adjustments capture did not complete";
+                        return RT_STAGE_FALLBACK;
+                    }
+                }
+                /* The RGB ratio, the rgb2lab() round trip and the recovery
+                 * blend. */
+                {
+                    cl_uint arg = 0;
+                    cl_int w = bfw;
+                    cl_int h = bfh;
+                    bool ok = true;
+                    ok = ok && set(capture_finish_kernel, arg++,
+                                   sizeof(cl_mem), &capture_rgb_memory);
+                    ok = ok && set(capture_finish_kernel, arg++,
+                                   sizeof(cl_int), &capture_pitch);
+                    ok = ok && set(capture_finish_kernel, arg++,
+                                   sizeof(cl_int), &capture_plane);
+                    ok = ok && set(capture_finish_kernel, arg++,
+                                   sizeof(cl_mem), &capture_y_memory);
+                    ok = ok && set(capture_finish_kernel, arg++,
+                                   sizeof(cl_int), &w);
+                    ok = ok && set(capture_finish_kernel, arg++,
+                                   sizeof(cl_int), &h);
+                    if (!ok ||
+                        !launch2d(capture_finish_kernel,
+                                  static_cast<std::size_t>(bfw),
+                                  static_cast<std::size_t>(bfh),
+                                  "capture finish")) {
+                        error = "local.adjustments capture finish failed";
+                        return RT_STAGE_FALLBACK;
+                    }
+                }
+                {
+                    cl_uint arg = 0;
+                    cl_int w = bfw;
+                    cl_int h = bfh;
+                    cl_int p = capture_pitch;
+                    cl_int pl = capture_plane;
+                    bool ok = true;
+                    ok = ok && set(dehaze_rgb2lab_kernel, arg++,
+                                   sizeof(cl_mem), &capture_rgb_memory);
+                    ok = ok && set(dehaze_rgb2lab_kernel, arg++,
+                                   sizeof(cl_int), &p);
+                    ok = ok && set(dehaze_rgb2lab_kernel, arg++,
+                                   sizeof(cl_int), &pl);
+                    ok = ok && set(dehaze_rgb2lab_kernel, arg++,
+                                   sizeof(cl_mem), &capture_rgb_memory);
+                    ok = ok && set(dehaze_rgb2lab_kernel, arg++,
+                                   sizeof(cl_int), &p);
+                    ok = ok && set(dehaze_rgb2lab_kernel, arg++,
+                                   sizeof(cl_int), &pl);
+                    ok = ok && set(dehaze_rgb2lab_kernel, arg++,
+                                   sizeof(cl_int), &w);
+                    ok = ok && set(dehaze_rgb2lab_kernel, arg++,
+                                   sizeof(cl_int), &h);
+                    ok = ok && set(dehaze_rgb2lab_kernel, arg++,
+                                   sizeof(cl_mem), &ws_memory);
+                    ok = ok && set(dehaze_rgb2lab_kernel, arg++,
+                                   sizeof(cl_mem), &cachef_memory);
+                    ok = ok && set(dehaze_rgb2lab_kernel, arg++,
+                                   sizeof(cl_mem), &cachefy_memory);
+                    if (!ok ||
+                        !launch2d(dehaze_rgb2lab_kernel,
+                                  static_cast<std::size_t>(bfw),
+                                  static_cast<std::size_t>(bfh),
+                                  "capture Lab")) {
+                        error = "local.adjustments capture Lab failed";
+                        return RT_STAGE_FALLBACK;
+                    }
+                }
+                {
+                    cl_uint arg = 0;
+                    cl_mem lab_memory = memory_of(image);
+                    cl_int fp = capture_pitch;
+                    cl_int fpl = capture_plane;
+                    cl_int lp = lab_pitch;
+                    cl_int lpl = lab_plane;
+                    cl_int w = bfw;
+                    cl_int h = bfh;
+                    cl_int x0 = xstart;
+                    cl_int y0 = ystart;
+                    cl_float repart = rec[
+                        RT_LOCAL_ADJUSTMENTS_SLOT_CAP_REPART];
+                    bool ok = true;
+                    ok = ok && set(capture_mix_kernel, arg++,
+                                   sizeof(cl_mem), &capture_rgb_memory);
+                    ok = ok && set(capture_mix_kernel, arg++,
+                                   sizeof(cl_int), &fp);
+                    ok = ok && set(capture_mix_kernel, arg++,
+                                   sizeof(cl_int), &fpl);
+                    ok = ok && set(capture_mix_kernel, arg++,
+                                   sizeof(cl_mem), &lab_memory);
+                    ok = ok && set(capture_mix_kernel, arg++,
+                                   sizeof(cl_int), &lp);
+                    ok = ok && set(capture_mix_kernel, arg++,
+                                   sizeof(cl_int), &lpl);
+                    ok = ok && set(capture_mix_kernel, arg++,
+                                   sizeof(cl_int), &w);
+                    ok = ok && set(capture_mix_kernel, arg++,
+                                   sizeof(cl_int), &h);
+                    ok = ok && set(capture_mix_kernel, arg++,
+                                   sizeof(cl_int), &x0);
+                    ok = ok && set(capture_mix_kernel, arg++,
+                                   sizeof(cl_int), &y0);
+                    ok = ok && set(capture_mix_kernel, arg++,
+                                   sizeof(cl_float), &repart);
+                    if (!ok ||
+                        !launch2d(capture_mix_kernel,
+                                  static_cast<std::size_t>(bfw),
+                                  static_cast<std::size_t>(bfh),
+                                  "capture mix")) {
+                        error = "local.adjustments capture mix failed";
+                        return RT_STAGE_FALLBACK;
+                    }
+                }
+                if (!full_scope_blur() ||
+                    !run_blend(
+                        "capture", rec[RT_LOCAL_ADJUSTMENTS_SLOT_SENSSHA],
+                        false, true, false, 2.0f, capture_rgb_memory,
+                        capture_pitch, capture_plane)) {
+                    return RT_STAGE_FALLBACK;
                 }
             }
 

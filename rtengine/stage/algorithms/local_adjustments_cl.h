@@ -232,6 +232,20 @@ inline constexpr const char* RT_LOCAL_ADJUSTMENTS_CL = R"CLC(
 #define RT_LA_CIE_SCHRBLUE 316
 #define RT_LA_CIE_CAM_ENTRIES 32768
 #define RT_LA_CIE_EPSIL 0.0001f
+#define RT_LA_EXP_CAPTURE 331
+#define RT_LA_CAP_SIGMA 332
+#define RT_LA_CAP_ITER 333
+#define RT_LA_CAP_CONTRAST 334
+#define RT_LA_CAP_REPART 335
+#define RT_LA_CAP_GAMMA 336
+#define RT_LA_CAP_KERNEL_OFFSET 337
+#define RT_LA_CAP_KERNEL_N 338
+#define RT_LA_CAP_BORDER 339
+#define RT_LA_CAP_CHECK_STOP 340
+#define RT_LA_CAP_TILE 32
+#define RT_LA_CAP_MAX_FULL 48
+#define RT_LA_CAP_MIN_BLEND 0.01f
+#define RT_LA_CAP_WORKGROUP 64
 #define RT_LA_CIE_HUE_ATTENUATION 0.555f
 
 /*
@@ -3922,6 +3936,450 @@ __kernel void rt_local_adjustments_mask_recov_apply(
     work[2 * work_plane + wo] =
         (lab[2 * lab_plane + lo] - work[2 * work_plane + wo]) * k +
         work[2 * work_plane + wo];
+}
+
+/*
+ * Capture sharpening. doCapture_Sharpening_SE() converts the clipped ROI to
+ * working RGB, builds a contrast mask from RGB2L(), runs
+ * CaptureDeconvSharpening_SE() on the Rec2020 luminance and multiplies each
+ * RGB channel by the new/old luminance ratio. The admitted arm has no gamma
+ * wrapper and no corner radius boost, so the RGB values are used unchanged
+ * and the kernel is chosen by sigma alone.
+ */
+
+/* Color::RGB2Y()'s Rec2020 luminance: each channel floored at zero, then the
+ * host's left-to-right sum. */
+inline float rt_la_capture_y(__global const float* rgb, const int pitch,
+                             const int plane, const int index)
+{
+    const float r = fmax(rgb[index], 0.0f);
+    const float g = fmax(rgb[plane + index], 0.0f);
+    const float b = fmax(rgb[2 * plane + index], 0.0f);
+    return 0.2627f * r + 0.6780f * g + 0.0593f * b;
+}
+
+/* RGB2L()'s working-matrix luminance through Color::computeXYZ2LabY(). */
+__kernel void rt_local_adjustments_capture_luma(
+    __global const float* rgb, const int rgb_pitch, const int rgb_plane,
+    __global float* luma, const int luma_pitch,
+    __global const float* ws, __global const float* cachefy,
+    const int width, const int height)
+{
+    const int x = (int)get_global_id(0);
+    const int y = (int)get_global_id(1);
+    if (x >= width || y >= height) {
+        return;
+    }
+    const int index = y * rgb_pitch + x;
+    const float r = rgb[index];
+    const float g = rgb[rgb_plane + index];
+    const float b = rgb[2 * rgb_plane + index];
+    const float value = ws[3] * r + ws[4] * g + ws[5] * b;
+    luma[y * luma_pitch + x] = rt_la_compute_fy(value, cachefy);
+}
+
+/* CaptureDeconvSharpening_SE()'s grouped Gaussian sums. The host reads one
+ * representative of each symmetric coefficient pair and groups the taps in a
+ * fixed order; the helper repeats that order so the recurrence's rounding
+ * matches. `src` is the tile estimate and `kernel` the host-built N x N
+ * matrix in row-major order. */
+#define RT_LA_CAP_S(di, dj) src[base + (di) * ft + (dj)]
+inline float rt_la_capture_gauss(__local float* src, const int ft,
+                                 const int k, const int l, const int n,
+                                 __global const float* coeff)
+{
+    const int base = k * ft + l;
+    if (n == 3) {
+        const float c11 = coeff[0];
+        const float c10 = coeff[1];
+        const float c00 = coeff[4];
+        return c11 * (RT_LA_CAP_S(-1, -1) + RT_LA_CAP_S(-1, 1) +
+                      RT_LA_CAP_S(1, -1) + RT_LA_CAP_S(1, 1)) +
+               c10 * (RT_LA_CAP_S(-1, 0) + RT_LA_CAP_S(0, -1) +
+                      RT_LA_CAP_S(0, 1) + RT_LA_CAP_S(1, 0)) +
+               c00 * RT_LA_CAP_S(0, 0);
+    }
+    if (n == 5) {
+        const float c21 = coeff[1];
+        const float c20 = coeff[2];
+        const float c11 = coeff[6];
+        const float c10 = coeff[7];
+        const float c00 = coeff[12];
+        return c21 * ((RT_LA_CAP_S(-2, -1) + RT_LA_CAP_S(-2, 1)) +
+                      (RT_LA_CAP_S(-1, -2) + RT_LA_CAP_S(-1, 2)) +
+                      (RT_LA_CAP_S(1, -2) + RT_LA_CAP_S(1, 2)) +
+                      (RT_LA_CAP_S(2, -1) + RT_LA_CAP_S(2, 1))) +
+               c20 * (RT_LA_CAP_S(-2, 0) + RT_LA_CAP_S(0, -2) +
+                      RT_LA_CAP_S(0, 2) + RT_LA_CAP_S(2, 0)) +
+               c11 * (RT_LA_CAP_S(-1, -1) + RT_LA_CAP_S(-1, 1) +
+                      RT_LA_CAP_S(1, -1) + RT_LA_CAP_S(1, 1)) +
+               c10 * (RT_LA_CAP_S(-1, 0) + RT_LA_CAP_S(0, -1) +
+                      RT_LA_CAP_S(0, 1) + RT_LA_CAP_S(1, 0)) +
+               c00 * RT_LA_CAP_S(0, 0);
+    }
+    if (n == 7) {
+        const float c31 = coeff[2];
+        const float c30 = coeff[3];
+        const float c22 = coeff[8];
+        const float c21 = coeff[9];
+        const float c20 = coeff[10];
+        const float c11 = coeff[16];
+        const float c10 = coeff[17];
+        const float c00 = coeff[24];
+        return c31 * ((RT_LA_CAP_S(-3, -1) + RT_LA_CAP_S(-3, 1)) +
+                      (RT_LA_CAP_S(-1, -3) + RT_LA_CAP_S(-1, 3)) +
+                      (RT_LA_CAP_S(1, -3) + RT_LA_CAP_S(1, 3)) +
+                      (RT_LA_CAP_S(3, -1) + RT_LA_CAP_S(3, 1))) +
+               c30 * (RT_LA_CAP_S(-3, 0) + RT_LA_CAP_S(0, -3) +
+                      RT_LA_CAP_S(0, 3) + RT_LA_CAP_S(3, 0)) +
+               c22 * (RT_LA_CAP_S(-2, -2) + RT_LA_CAP_S(-2, 2) +
+                      RT_LA_CAP_S(2, -2) + RT_LA_CAP_S(2, 2)) +
+               c21 * ((RT_LA_CAP_S(-2, -1) + RT_LA_CAP_S(-2, 1)) +
+                      (RT_LA_CAP_S(-1, -2) + RT_LA_CAP_S(-1, 2)) +
+                      (RT_LA_CAP_S(1, -2) + RT_LA_CAP_S(1, 2)) +
+                      (RT_LA_CAP_S(2, -1) + RT_LA_CAP_S(2, 1))) +
+               c20 * (RT_LA_CAP_S(-2, 0) + RT_LA_CAP_S(0, -2) +
+                      RT_LA_CAP_S(0, 2) + RT_LA_CAP_S(2, 0)) +
+               c11 * (RT_LA_CAP_S(-1, -1) + RT_LA_CAP_S(-1, 1) +
+                      RT_LA_CAP_S(1, -1) + RT_LA_CAP_S(1, 1)) +
+               c10 * (RT_LA_CAP_S(-1, 0) + RT_LA_CAP_S(0, -1) +
+                      RT_LA_CAP_S(0, 1) + RT_LA_CAP_S(1, 0)) +
+               c00 * RT_LA_CAP_S(0, 0);
+    }
+    if (n == 9) {
+        const float c42 = coeff[2];
+        const float c41 = coeff[3];
+        const float c40 = coeff[4];
+        const float c33 = coeff[10];
+        const float c32 = coeff[11];
+        const float c31 = coeff[12];
+        const float c30 = coeff[13];
+        const float c22 = coeff[20];
+        const float c21 = coeff[21];
+        const float c20 = coeff[22];
+        const float c11 = coeff[30];
+        const float c10 = coeff[31];
+        const float c00 = coeff[40];
+        return c42 * ((RT_LA_CAP_S(-4, -2) + RT_LA_CAP_S(-4, 2)) +
+                      (RT_LA_CAP_S(-2, -4) + RT_LA_CAP_S(-2, 4)) +
+                      (RT_LA_CAP_S(2, -4) + RT_LA_CAP_S(2, 4)) +
+                      (RT_LA_CAP_S(4, -2) + RT_LA_CAP_S(4, 2))) +
+               c41 * ((RT_LA_CAP_S(-4, -1) + RT_LA_CAP_S(-4, 1)) +
+                      (RT_LA_CAP_S(-1, -4) + RT_LA_CAP_S(-1, 4)) +
+                      (RT_LA_CAP_S(1, -4) + RT_LA_CAP_S(1, 4)) +
+                      (RT_LA_CAP_S(4, -1) + RT_LA_CAP_S(4, 1))) +
+               c40 * (RT_LA_CAP_S(-4, 0) + RT_LA_CAP_S(0, -4) +
+                      RT_LA_CAP_S(0, 4) + RT_LA_CAP_S(4, 0)) +
+               c33 * (RT_LA_CAP_S(-3, -3) + RT_LA_CAP_S(-3, 3) +
+                      RT_LA_CAP_S(3, -3) + RT_LA_CAP_S(3, 3)) +
+               c32 * ((RT_LA_CAP_S(-3, -2) + RT_LA_CAP_S(-3, 2)) +
+                      (RT_LA_CAP_S(-2, -3) + RT_LA_CAP_S(-2, 3)) +
+                      (RT_LA_CAP_S(2, -3) + RT_LA_CAP_S(2, 3)) +
+                      (RT_LA_CAP_S(3, -2) + RT_LA_CAP_S(3, 2))) +
+               c31 * ((RT_LA_CAP_S(-3, -1) + RT_LA_CAP_S(-3, 1)) +
+                      (RT_LA_CAP_S(-1, -3) + RT_LA_CAP_S(-1, 3)) +
+                      (RT_LA_CAP_S(1, -3) + RT_LA_CAP_S(1, 3)) +
+                      (RT_LA_CAP_S(3, -1) + RT_LA_CAP_S(3, 1))) +
+               c30 * (RT_LA_CAP_S(-3, 0) + RT_LA_CAP_S(0, -3) +
+                      RT_LA_CAP_S(0, 3) + RT_LA_CAP_S(3, 0)) +
+               c22 * (RT_LA_CAP_S(-2, -2) + RT_LA_CAP_S(-2, 2) +
+                      RT_LA_CAP_S(2, -2) + RT_LA_CAP_S(2, 2)) +
+               c21 * ((RT_LA_CAP_S(-2, -1) + RT_LA_CAP_S(-2, 1)) +
+                      (RT_LA_CAP_S(-1, -2) + RT_LA_CAP_S(-1, 2)) +
+                      (RT_LA_CAP_S(1, -2) + RT_LA_CAP_S(1, 2)) +
+                      (RT_LA_CAP_S(2, -1) + RT_LA_CAP_S(2, 1))) +
+               c20 * (RT_LA_CAP_S(-2, 0) + RT_LA_CAP_S(0, -2) +
+                      RT_LA_CAP_S(0, 2) + RT_LA_CAP_S(2, 0)) +
+               c11 * (RT_LA_CAP_S(-1, -1) + RT_LA_CAP_S(-1, 1) +
+                      RT_LA_CAP_S(1, -1) + RT_LA_CAP_S(1, 1)) +
+               c10 * (RT_LA_CAP_S(-1, 0) + RT_LA_CAP_S(0, -1) +
+                      RT_LA_CAP_S(0, 1) + RT_LA_CAP_S(1, 0)) +
+               c00 * RT_LA_CAP_S(0, 0);
+    }
+    const float c60 = coeff[6];
+    const float c53 = coeff[16];
+    const float c52 = coeff[17];
+    const float c51 = coeff[18];
+    const float c50 = coeff[19];
+    const float c44 = coeff[28];
+    const float c42 = coeff[30];
+    const float c41 = coeff[31];
+    const float c40 = coeff[32];
+    const float c33 = coeff[42];
+    const float c32 = coeff[43];
+    const float c31 = coeff[44];
+    const float c30 = coeff[45];
+    const float c22 = coeff[56];
+    const float c21 = coeff[57];
+    const float c20 = coeff[58];
+    const float c11 = coeff[70];
+    const float c10 = coeff[71];
+    const float c00 = coeff[84];
+    return c60 * (RT_LA_CAP_S(-6, 0) + RT_LA_CAP_S(0, -6) +
+                  RT_LA_CAP_S(0, 6) + RT_LA_CAP_S(6, 0)) +
+           c53 * ((RT_LA_CAP_S(-5, -3) + RT_LA_CAP_S(-5, 3)) +
+                  (RT_LA_CAP_S(-3, -5) + RT_LA_CAP_S(-3, 5)) +
+                  (RT_LA_CAP_S(3, -5) + RT_LA_CAP_S(3, 5)) +
+                  (RT_LA_CAP_S(5, -3) + RT_LA_CAP_S(5, 3))) +
+           c52 * ((RT_LA_CAP_S(-5, -2) + RT_LA_CAP_S(-5, 2)) +
+                  (RT_LA_CAP_S(-2, -5) + RT_LA_CAP_S(-2, 5)) +
+                  (RT_LA_CAP_S(2, -5) + RT_LA_CAP_S(2, 5)) +
+                  (RT_LA_CAP_S(5, -2) + RT_LA_CAP_S(5, 2))) +
+           c51 * ((RT_LA_CAP_S(-5, -1) + RT_LA_CAP_S(-5, 1)) +
+                  (RT_LA_CAP_S(-1, -5) + RT_LA_CAP_S(-1, 5)) +
+                  (RT_LA_CAP_S(1, -5) + RT_LA_CAP_S(1, 5)) +
+                  (RT_LA_CAP_S(5, -1) + RT_LA_CAP_S(5, 1))) +
+           c50 * ((RT_LA_CAP_S(-5, 0) + RT_LA_CAP_S(0, -5) +
+                   RT_LA_CAP_S(0, 5) + RT_LA_CAP_S(5, 0)) +
+                  ((RT_LA_CAP_S(-4, -3) + RT_LA_CAP_S(-4, 3)) +
+                   (RT_LA_CAP_S(-3, -4) + RT_LA_CAP_S(-3, 4)) +
+                   (RT_LA_CAP_S(3, -4) + RT_LA_CAP_S(3, 4)) +
+                   (RT_LA_CAP_S(4, -3) + RT_LA_CAP_S(4, 3)))) +
+           c44 * (RT_LA_CAP_S(-4, -4) + RT_LA_CAP_S(-4, 4) +
+                  RT_LA_CAP_S(4, -4) + RT_LA_CAP_S(4, 4)) +
+           c42 * ((RT_LA_CAP_S(-4, -2) + RT_LA_CAP_S(-4, 2)) +
+                  (RT_LA_CAP_S(-2, -4) + RT_LA_CAP_S(-2, 4)) +
+                  (RT_LA_CAP_S(2, -4) + RT_LA_CAP_S(2, 4)) +
+                  (RT_LA_CAP_S(4, -2) + RT_LA_CAP_S(4, 2))) +
+           c41 * ((RT_LA_CAP_S(-4, -1) + RT_LA_CAP_S(-4, 1)) +
+                  (RT_LA_CAP_S(-1, -4) + RT_LA_CAP_S(-1, 4)) +
+                  (RT_LA_CAP_S(1, -4) + RT_LA_CAP_S(1, 4)) +
+                  (RT_LA_CAP_S(4, -1) + RT_LA_CAP_S(4, 1))) +
+           c40 * (RT_LA_CAP_S(-4, 0) + RT_LA_CAP_S(0, -4) +
+                  RT_LA_CAP_S(0, 4) + RT_LA_CAP_S(4, 0)) +
+           c33 * (RT_LA_CAP_S(-3, -3) + RT_LA_CAP_S(-3, 3) +
+                  RT_LA_CAP_S(3, -3) + RT_LA_CAP_S(3, 3)) +
+           c32 * ((RT_LA_CAP_S(-3, -2) + RT_LA_CAP_S(-3, 2)) +
+                  (RT_LA_CAP_S(-2, -3) + RT_LA_CAP_S(-2, 3)) +
+                  (RT_LA_CAP_S(2, -3) + RT_LA_CAP_S(2, 3)) +
+                  (RT_LA_CAP_S(3, -2) + RT_LA_CAP_S(3, 2))) +
+           c31 * ((RT_LA_CAP_S(-3, -1) + RT_LA_CAP_S(-3, 1)) +
+                  (RT_LA_CAP_S(-1, -3) + RT_LA_CAP_S(-1, 3)) +
+                  (RT_LA_CAP_S(1, -3) + RT_LA_CAP_S(1, 3)) +
+                  (RT_LA_CAP_S(3, -1) + RT_LA_CAP_S(3, 1))) +
+           c30 * (RT_LA_CAP_S(-3, 0) + RT_LA_CAP_S(0, -3) +
+                  RT_LA_CAP_S(0, 3) + RT_LA_CAP_S(3, 0)) +
+           c22 * (RT_LA_CAP_S(-2, -2) + RT_LA_CAP_S(-2, 2) +
+                  RT_LA_CAP_S(2, -2) + RT_LA_CAP_S(2, 2)) +
+           c21 * ((RT_LA_CAP_S(-2, -1) + RT_LA_CAP_S(-2, 1)) +
+                  (RT_LA_CAP_S(-1, -2) + RT_LA_CAP_S(-1, 2)) +
+                  (RT_LA_CAP_S(1, -2) + RT_LA_CAP_S(1, 2)) +
+                  (RT_LA_CAP_S(2, -1) + RT_LA_CAP_S(2, 1))) +
+           c20 * (RT_LA_CAP_S(-2, 0) + RT_LA_CAP_S(0, -2) +
+                  RT_LA_CAP_S(0, 2) + RT_LA_CAP_S(2, 0)) +
+           c11 * (RT_LA_CAP_S(-1, -1) + RT_LA_CAP_S(-1, 1) +
+                  RT_LA_CAP_S(1, -1) + RT_LA_CAP_S(1, 1)) +
+           c10 * (RT_LA_CAP_S(-1, 0) + RT_LA_CAP_S(0, -1) +
+                  RT_LA_CAP_S(0, 1) + RT_LA_CAP_S(1, 0)) +
+           c00 * RT_LA_CAP_S(0, 0);
+}
+#undef RT_LA_CAP_S
+
+/* The host initialises the deconvolution output to the Rec2020 luminance
+ * before its tile loop, so skipped and never-covered pixels keep that value.
+ * The device plane needs the same initial state. */
+__kernel void rt_local_adjustments_capture_init(
+    __global const float* rgb, const int rgb_pitch, const int rgb_plane,
+    __global float* y, const int width, const int height)
+{
+    const int x = (int)get_global_id(0);
+    const int yy = (int)get_global_id(1);
+    if (x >= width || yy >= height) {
+        return;
+    }
+    const int index = yy * rgb_pitch + x;
+    y[index] = rt_la_capture_y(rgb, rgb_pitch, rgb_plane, index);
+}
+
+/*
+ * CaptureDeconvSharpening_SE()'s tile recurrence. One workgroup owns one tile
+ * and processes it in the host's order. Tiles overlap only at the end of a
+ * row or column (the host's end tile starts at `size - full`); the launcher
+ * splits the work into four phases so those tiles run after the interior
+ * ones, reproducing the host's row-major last-writer order without races.
+ * `phase` 0 is interior, 1 the last column, 2 the last row and 3 the corner.
+ */
+__kernel void rt_local_adjustments_capture(
+    __global const float* rgb, const int rgb_pitch, const int rgb_plane,
+    __global float* y, __global const float* mask, const int mask_pitch,
+    __global const float* coeff, const int kernel_offset,
+    const int phase, const int tiles_x, const int tiles_y,
+    const int tile_size, const int border, const int full,
+    const int radius, const int n,
+    const int bfw, const int bfh, const int iterations, const int check_stop)
+{
+    __local float tile0[RT_LA_CAP_MAX_FULL * RT_LA_CAP_MAX_FULL];
+    __local float tile1[RT_LA_CAP_MAX_FULL * RT_LA_CAP_MAX_FULL];
+    __local int any_low;
+    __local int skip;
+
+    const int group = (int)get_group_id(0);
+    const int lid = (int)get_local_id(0);
+    const int wg = (int)get_local_size(0);
+    __global const float* kptr = coeff + kernel_offset;
+    int ti;
+    int tj;
+    if (phase == 0) {
+        const int cols = tiles_x - 1;
+        ti = group / cols;
+        tj = group - ti * cols;
+    } else if (phase == 1) {
+        ti = group;
+        tj = tiles_x - 1;
+    } else if (phase == 2) {
+        ti = tiles_y - 1;
+        tj = group;
+    } else {
+        ti = tiles_y - 1;
+        tj = tiles_x - 1;
+    }
+    const int i = border + ti * tile_size;
+    const int j = border + tj * tile_size;
+    const int end_col = (i + tile_size + border) >= bfh ? 1 : 0;
+    const int end_row = (j + tile_size + border) >= bfw ? 1 : 0;
+    const int base_y = end_col ? bfh - full : i - border;
+    const int base_x = end_row ? bfw - full : j - border;
+    const int full_elems = full * full;
+
+    /* The host fills tmpThr with one before its tile loop and never resets
+     * it; the border therefore stays one for every tile and iteration. */
+    for (int p = lid; p < full_elems; p += wg) {
+        tile0[p] = 0.0f;
+        tile1[p] = 1.0f;
+    }
+    if (lid == 0) {
+        const int my = end_col ? bfh - full + border : i;
+        const int mx = end_row ? bfw - full + border : j;
+        float maxv = 0.0f;
+        for (int k = 0; k < tile_size; ++k) {
+            for (int l = 0; l < tile_size; ++l) {
+                maxv = fmax(maxv, mask[(my + k) * mask_pitch + mx + l]);
+            }
+        }
+        skip = maxv < RT_LA_CAP_MIN_BLEND ? 1 : 0;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (skip != 0) {
+        return;
+    }
+
+    for (int p = lid; p < full_elems; p += wg) {
+        const int k = p / full;
+        const int l = p - k * full;
+        const int index = (base_y + k) * rgb_pitch + base_x + l;
+        tile0[p] = rt_la_capture_y(rgb, rgb_pitch, rgb_plane, index);
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    int stop = 0;
+    for (int iter = 0; iter < iterations && stop == 0; ++iter) {
+        for (int p = lid; p < full_elems; p += wg) {
+            const int k = p / full;
+            const int l = p - k * full;
+            if (k >= radius && k < full - radius &&
+                l >= radius && l < full - radius) {
+                const float val =
+                    rt_la_capture_gauss(tile0, full, k, l, n, kptr);
+                const int index = (base_y + k) * rgb_pitch + base_x + l;
+                const float old =
+                    rt_la_capture_y(rgb, rgb_pitch, rgb_plane, index);
+                tile1[p] = old / fmax(val, 0.00001f);
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        for (int p = lid; p < full_elems; p += wg) {
+            const int k = p / full;
+            const int l = p - k * full;
+            if (k >= radius && k < full - radius &&
+                l >= radius && l < full - radius) {
+                tile0[p] *=
+                    rt_la_capture_gauss(tile1, full, k, l, n, kptr);
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (check_stop != 0 && iter < iterations - 1) {
+            if (lid == 0) {
+                any_low = 0;
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
+            for (int p = lid; p < tile_size * tile_size; p += wg) {
+                const int kk = p / tile_size;
+                const int ll = p - kk * tile_size;
+                const int k = border + kk;
+                const int l = border + ll;
+                const int index = (base_y + k) * rgb_pitch + base_x + l;
+                const float old =
+                    rt_la_capture_y(rgb, rgb_pitch, rgb_plane, index);
+                if (tile0[k * full + l] < old * mask[index] * 0.5f) {
+                    atomic_or(&any_low, 1);
+                }
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
+            if (any_low != 0) {
+                stop = 1;
+            }
+        }
+    }
+
+    for (int p = lid; p < tile_size * tile_size; p += wg) {
+        const int kk = p / tile_size;
+        const int ll = p - kk * tile_size;
+        const int k = border + kk;
+        const int l = border + ll;
+        const int index = (base_y + k) * rgb_pitch + base_x + l;
+        /* The host's output write blends with `luminance`, which the end
+         * tile has already seen modified by the preceding tile in the
+         * overlap. `y` was seeded with the Rec2020 luminance, so it carries
+         * the same previous writer's value. */
+        const float current = y[index];
+        y[index] = mask[index] * (tile0[k * full + l] - current) + current;
+    }
+}
+
+/* doCapture_Sharpening_SE()'s RGB recovery: each channel is scaled by the
+ * deconvolved/old luminance ratio. */
+__kernel void rt_local_adjustments_capture_finish(
+    __global float* rgb, const int rgb_pitch, const int rgb_plane,
+    __global const float* y, const int width, const int height)
+{
+    const int x = (int)get_global_id(0);
+    const int yy = (int)get_global_id(1);
+    if (x >= width || yy >= height) {
+        return;
+    }
+    const int index = yy * rgb_pitch + x;
+    const float r = rgb[index];
+    const float g = rgb[rgb_plane + index];
+    const float b = rgb[2 * rgb_plane + index];
+    const float old = rt_la_capture_y(rgb, rgb_pitch, rgb_plane, index);
+    const float factor = y[index] / fmax(old, 0.00001f);
+    rgb[index] = r * factor;
+    rgb[rgb_plane + index] = g * factor;
+    rgb[2 * rgb_plane + index] = b * factor;
+}
+
+/* intp(repart, bufexporig, rgb2lab(output)): `repart == 0` keeps the
+ * sharpened result and `repart == 1` the original. */
+__kernel void rt_local_adjustments_capture_mix(
+    __global float* fin, const int fin_pitch, const int fin_plane,
+    __global const float* lab, const int lab_pitch, const int lab_plane,
+    const int width, const int height, const int xstart, const int ystart,
+    const float repart)
+{
+    const int x = (int)get_global_id(0);
+    const int y = (int)get_global_id(1);
+    if (x >= width || y >= height) {
+        return;
+    }
+    const int fo = y * fin_pitch + x;
+    const int lo = (y + ystart) * lab_pitch + (x + xstart);
+    fin[fo] = repart * (lab[lo] - fin[fo]) + fin[fo];
+    fin[fin_plane + fo] =
+        repart * (lab[lab_plane + lo] - fin[fin_plane + fo]) +
+        fin[fin_plane + fo];
+    fin[2 * fin_plane + fo] =
+        repart * (lab[2 * lab_plane + lo] - fin[2 * fin_plane + fo]) +
+        fin[2 * fin_plane + fo];
 }
 
 )CLC";

@@ -19,6 +19,7 @@
 
 #include "stage/local_adjustments_context.h"
 
+#include "boxblur.h"
 #include "ciecam02.h"
 #include "color.h"
 #include "colortemp.h"
@@ -814,6 +815,61 @@ bool sharpenAdmitted(const procparams::LocallabParams::LocallabSpot& spot,
     return spot.sensisha >= 0 && spot.sensisha <= 100;
 }
 
+/* Whether the capture sharpening parameters are inside the device set.
+ *
+ * Lab_Local()'s capture arm runs when the tool is on, the spot is active with
+ * no explicit mask, the method is `"cap"`, the spot is not inverted and the
+ * clipped ROI is at least 150 px on both axes. The arm copies the ROI to RGB,
+ * builds a contrast mask from RGB2L, runs the tiled deconvolution on the
+ * Rec2020 luminance and multiplies the RGB channels by the new/old ratio.
+ *
+ * The device reproduces the offset-zero, gamma-one configuration: the
+ * deconvolution kernel is selected by `capradius` alone and the mask threshold
+ * is the manual `sharcontrast / 100`. The automatic contrast
+ * (`deconvAutoshar`) reads the ROI through buildBlendMask2()'s tile search,
+ * the gamma wrapper (`deconvCogam != 1`) and the corner radius boost
+ * (`deconvCoBoost != 0`) are residuals. The mask display needs the host's
+ * mask view. The remaining sliders are the GUI ranges; `deconvCoLat` is
+ * truncated to an integer exactly as the host does when it passes the float
+ * to CaptureDeconvSharpening_SE()'s `int iterations`. */
+bool captureAdmitted(const procparams::LocallabParams::LocallabSpot& spot)
+{
+    if (spot.methodcap != "cap" || spot.sharshow || spot.inverssha) {
+        return false;
+    }
+    if (!finiteValue(spot.capradius) ||
+        spot.capradius < RT_LOCAL_ADJUSTMENTS_CAPTURE_MIN_SIGMA ||
+        spot.capradius > RT_LOCAL_ADJUSTMENTS_CAPTURE_MAX_SIGMA) {
+        return false;
+    }
+    if (!finiteValue(spot.deconvCoLat) ||
+        spot.deconvCoLat < RT_LOCAL_ADJUSTMENTS_CAPTURE_MIN_ITER ||
+        spot.deconvCoLat > RT_LOCAL_ADJUSTMENTS_CAPTURE_MAX_ITER) {
+        return false;
+    }
+    if (spot.sharcontrast < RT_LOCAL_ADJUSTMENTS_CAPTURE_MIN_CONTRAST ||
+        spot.sharcontrast > RT_LOCAL_ADJUSTMENTS_CAPTURE_MAX_CONTRAST) {
+        return false;
+    }
+    if (!finiteValue(spot.reparsha) ||
+        spot.reparsha < RT_LOCAL_ADJUSTMENTS_CAPTURE_MIN_REPART ||
+        spot.reparsha > RT_LOCAL_ADJUSTMENTS_CAPTURE_MAX_REPART) {
+        return false;
+    }
+    if (!finiteValue(spot.deconvCogam) || spot.deconvCogam != 1.0) {
+        return false;
+    }
+    if (!finiteValue(spot.deconvCoBoost) || spot.deconvCoBoost != 0.0) {
+        return false;
+    }
+    /* buildBlendMask2()'s automatic contrast is a data-dependent tile search
+     * the device does not reproduce. */
+    if (spot.deconvAutoshar) {
+        return false;
+    }
+    return spot.sensisha >= 0 && spot.sensisha <= 100;
+}
+
 /* Whether the spot's DeNoise() call leaves the image unchanged.
  *
  * Lab_Local() calls DeNoise() whenever the Blur & Noise tool is on and any of
@@ -1373,11 +1429,20 @@ bool localAdjustmentsSupported(const procparams::ProcParams& params)
             if (spot.expsoft && !softLightAdmitted(spot)) {
                 return false;
             }
-            if (spot.expsharp &&
-                !sharpenAdmitted(spot,
-                                 effectiveSharpeningDamping(params,
-                                                            spot))) {
-                return false;
+            if (spot.expsharp) {
+                if (spot.methodcap == "rl") {
+                    if (!sharpenAdmitted(spot,
+                                         effectiveSharpeningDamping(params,
+                                                                    spot))) {
+                        return false;
+                    }
+                } else if (spot.methodcap == "cap") {
+                    if (!captureAdmitted(spot)) {
+                        return false;
+                    }
+                } else {
+                    return false;
+                }
             }
             if (spot.expblur && !blurAdmitted(spot)) {
                 return false;
@@ -2351,6 +2416,119 @@ int LocalAdjustmentsContext::build(int spot, const RtStageBuffer* lab,
     }
 
     /*
+     * Capture sharpening. Lab_Local()'s `"cap"` arm is independent of the RL
+     * arm and runs on the clipped ROI, not the padded extent. The predicate
+     * has narrowed the method and the offset-zero / gamma-one / manual-
+     * contrast configuration. The block's own mSPsharpCS gate makes a small
+     * ROI a no-op, so a spot that misses it records no capture pass and falls
+     * through to the tail clamp. The record carries the sigma, the truncated
+     * iteration count, the manual contrast and the `reparsha` blend weight.
+     */
+    const int captureXStart = std::max(
+        static_cast<int>(lp.xc - lp.lxL), 0);
+    const int captureYStart = std::max(
+        static_cast<int>(lp.yc - lp.lyT), 0);
+    const int captureXEnd = std::min(
+        static_cast<int>(lp.xc + lp.lx), fw_);
+    const int captureYEnd = std::min(
+        static_cast<int>(lp.yc + lp.ly), fh_);
+    const int captureW = captureXEnd - captureXStart;
+    const int captureH = captureYEnd - captureYStart;
+    const bool captureRun =
+        profileSpot.expsharp && lp.activspot &&
+        profileSpot.methodcap == "cap" &&
+        ipf_.getScale() == 1.0 &&
+        captureW >= RT_LOCAL_ADJUSTMENTS_CAPTURE_MIN_ROI &&
+        captureH >= RT_LOCAL_ADJUSTMENTS_CAPTURE_MIN_ROI;
+    if (captureRun &&
+        static_cast<long long>(captureW) * captureH >
+            std::numeric_limits<int>::max()) {
+        return 1;
+    }
+    /* CaptureDeconvSharpening_SE()'s offset-zero kernel selection is a
+     * function of sigma alone, and the tile halo also depends on the
+     * iteration count. The host builds the same kernel here so the device
+     * receives the block's own coefficients. */
+    int captureKernelN = 3;
+    int captureBorder = RT_LOCAL_ADJUSTMENTS_CAPTURE_BORDER_LOW;
+    float captureKernelOffset = RT_LOCAL_ADJUSTMENTS_NO_LUT;
+    if (captureRun) {
+        const float captureSigma =
+            static_cast<float>(profileSpot.capradius);
+        const int captureIterations =
+            static_cast<int>(profileSpot.deconvCoLat);
+        if (captureSigma <
+            RT_LOCAL_ADJUSTMENTS_CAPTURE_SIGMA_3) {
+            captureKernelN = 3;
+        } else if (captureSigma <=
+                   RT_LOCAL_ADJUSTMENTS_CAPTURE_SIGMA_5) {
+            captureKernelN = 5;
+        } else if (captureSigma <=
+                   RT_LOCAL_ADJUSTMENTS_CAPTURE_SIGMA_7) {
+            captureKernelN = 7;
+        } else if (captureSigma <=
+                   RT_LOCAL_ADJUSTMENTS_CAPTURE_SIGMA_9) {
+            captureKernelN = 9;
+        } else {
+            captureKernelN = 13;
+        }
+        captureBorder =
+            captureKernelN <= 7
+                ? (captureIterations <=
+                           RT_LOCAL_ADJUSTMENTS_CAPTURE_BORDER_ITER_LIMIT
+                       ? RT_LOCAL_ADJUSTMENTS_CAPTURE_BORDER_LOW
+                       : RT_LOCAL_ADJUSTMENTS_CAPTURE_BORDER_HIGH)
+                : RT_LOCAL_ADJUSTMENTS_CAPTURE_BORDER_WIDE;
+        std::vector<float> captureKernel(
+            static_cast<std::size_t>(captureKernelN) * captureKernelN);
+        if (captureKernelN == 3) {
+            float kernel[3][3];
+            compute3x3kernel2(captureSigma, kernel);
+            for (int row = 0; row < 3; ++row) {
+                for (int column = 0; column < 3; ++column) {
+                    captureKernel[row * 3 + column] = kernel[row][column];
+                }
+            }
+        } else if (captureKernelN == 5) {
+            float kernel[5][5];
+            compute5x5kernel2(captureSigma, kernel);
+            for (int row = 0; row < 5; ++row) {
+                for (int column = 0; column < 5; ++column) {
+                    captureKernel[row * 5 + column] = kernel[row][column];
+                }
+            }
+        } else if (captureKernelN == 7) {
+            float kernel[7][7];
+            compute7x7kernel2(captureSigma, kernel);
+            for (int row = 0; row < 7; ++row) {
+                for (int column = 0; column < 7; ++column) {
+                    captureKernel[row * 7 + column] = kernel[row][column];
+                }
+            }
+        } else if (captureKernelN == 9) {
+            float kernel[9][9];
+            compute9x9kernel2(captureSigma, kernel);
+            for (int row = 0; row < 9; ++row) {
+                for (int column = 0; column < 9; ++column) {
+                    captureKernel[row * 9 + column] = kernel[row][column];
+                }
+            }
+        } else {
+            float kernel[13][13];
+            compute13x13kernel2(captureSigma, kernel);
+            for (int row = 0; row < 13; ++row) {
+                for (int column = 0; column < 13; ++column) {
+                    captureKernel[row * 13 + column] = kernel[row][column];
+                }
+            }
+        }
+        captureKernelOffset = appendSamples(captureKernel);
+        if (captureKernelOffset == RT_LOCAL_ADJUSTMENTS_NO_LUT) {
+            return 1;
+        }
+    }
+
+    /*
      * Blur & Noise. The predicate narrowed the method and the noise, grain,
      * guided, bilateral, non-local-means, denoise and FFT additions. The
      * Gaussian arm runs when the spot radius is above 1.6; its sigma is
@@ -3227,6 +3405,26 @@ int LocalAdjustmentsContext::build(int spot, const RtStageBuffer* lab,
         static_cast<float>(profileSpot.sharblur);
     record[RT_LOCAL_ADJUSTMENTS_SLOT_SHAR_DAMPING] =
         static_cast<float>(sharpenDamping);
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_EXP_CAPTURE] =
+        captureRun ? 1.f : 0.f;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_CAP_SIGMA] =
+        static_cast<float>(profileSpot.capradius);
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_CAP_ITER] =
+        static_cast<float>(static_cast<int>(profileSpot.deconvCoLat));
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_CAP_CONTRAST] =
+        static_cast<float>(profileSpot.sharcontrast);
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_CAP_REPART] =
+        static_cast<float>(1.0 - 0.01 * profileSpot.reparsha);
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_CAP_GAMMA] =
+        static_cast<float>(profileSpot.deconvCogam);
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_CAP_KERNEL_OFFSET] =
+        captureKernelOffset;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_CAP_KERNEL_N] =
+        static_cast<float>(captureKernelN);
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_CAP_BORDER] =
+        static_cast<float>(captureBorder);
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_CAP_CHECK_STOP] =
+        profileSpot.itercheck ? 1.f : 0.f;
     record[RT_LOCAL_ADJUSTMENTS_SLOT_EXPBLUR] = blurRun ? 1.f : 0.f;
     record[RT_LOCAL_ADJUSTMENTS_SLOT_BLUR_CHRO] =
         static_cast<float>(lp.chromet);
