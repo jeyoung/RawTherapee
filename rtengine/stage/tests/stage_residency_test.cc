@@ -5565,7 +5565,9 @@ LabToolsRun run_lab_tools_node(LabImage& image,
                                const rtengine::procparams::ProcParams& params,
                                LabToolsHostState& host,
                                rtengine::ImProcFunctions& ipf,
-                               const std::string& profile_path)
+                               const std::string& profile_path,
+                               const char* node = "lab.tools",
+                               int context_skip = LAB_TOOLS_EXPORT_SCALE)
 {
     using namespace rtengine::stage;
 
@@ -5576,7 +5578,8 @@ LabToolsRun run_lab_tools_node(LabImage& image,
         labToolsBuildHistogram(image, host.hist16);
     }
     LabToolsLuts luts = host.luts();
-    LabToolsContext context(params, ipf, luts, host.autili, host.butili);
+    LabToolsContext context(params, ipf, luts, host.autili, host.butili,
+                            context_skip);
     RtLabToolsResult setup{};
     const bool deviceReady = result.supported && context.build(setup) == 0;
     result.deviceReady = deviceReady;
@@ -5816,9 +5819,9 @@ LabToolsRun run_lab_tools_node(LabImage& image,
 
     std::remove(profile_path.c_str());
     setenv("RT_STAGE_PROFILE", profile_path.c_str(), 1);
-    set_node_device_override("lab.tools", StageNodeDevice::OpenCL);
+    set_node_device_override(node, StageNodeDevice::OpenCL);
     result.status =
-        run("lab.tools", std::vector<RtStageArg>(args, args + 76));
+        run(node, std::vector<RtStageArg>(args, args + 76));
     clear_node_device_overrides();
     unsetenv("RT_STAGE_PROFILE");
     return result;
@@ -8085,6 +8088,251 @@ void fill_lab_tools_wide(LabImage& lab, unsigned seed)
                 static_cast<float>(static_cast<int>((hash / 11u) % 48000u) -
                                    24000) +
                 0.75f;
+        }
+    }
+}
+
+/* ---------------------------------------------------------- thumbnail lab */
+
+/*
+ * The reduced thumbnail Lab block builds its curve tables with CurveFactory's
+ * skip 16, so the reference repeats the production sequence at that sampling:
+ * the LabGrid pass, the luminance/chrominance curve pass (which also owns the
+ * black-and-white output) and vibrance. The sub-tools the reduced path cannot
+ * use - shadows/highlights, local contrast, Lab regions, EPD, soft light, CIE
+ * CAM and the working TRC - are refused by the call site and are not part of
+ * this fixture.
+ */
+void thumbnail_lab_reference(rtengine::ImProcFunctions& ipf,
+                             const rtengine::procparams::ProcParams& params,
+                             LabImage& image, LabToolsHostState& host,
+                             bool labgrid, bool labcurve, bool vibrance)
+{
+    bool utili = false;
+    rtengine::CurveFactory::complexLCurve(params.labCurve.brightness,
+                                params.labCurve.contrast, params.labCurve.lcurve,
+                                host.hist16, host.lumacurve, host.dummy, 16,
+                                utili);
+    const bool clcutili =
+        rtengine::CurveFactory::diagonalCurve2Lut(params.labCurve.clcurve, host.clcurve,
+                                        16);
+    bool ccutili = false;
+    bool cclutili = false;
+    rtengine::CurveFactory::complexsgnCurve(
+        host.autili, host.butili, ccutili, cclutili, params.labCurve.acurve,
+        params.labCurve.bcurve, params.labCurve.cccurve,
+        params.labCurve.lccurve, host.curve1, host.curve2, host.satcurve,
+        host.lhskcurve, 16);
+
+    if (labgrid) {
+        ipf.colorToningLabGrid(&image, 0, image.W, 0, image.H, false);
+    }
+    ipf.chromiLuminanceCurve(nullptr, 1, &image, &image, host.curve1,
+                             host.curve2, host.satcurve, host.lhskcurve,
+                             host.clcurve, host.lumacurve, utili, host.autili,
+                             host.butili, ccutili, cclutili, clcutili,
+                             host.dummy, host.dummy);
+    if (vibrance) {
+        ipf.vibrance(&image, params.vibrance, params.toneCurve.hrenabled,
+                     params.icm.workingProfile);
+    }
+    (void)labcurve;
+}
+
+/*
+ * `thumbnail.lab` is the reduced Lab block's device node. It reuses the
+ * lab.tools kernel, so the fixture is the same Lab image as the lab.tools
+ * tests, quantised to the two thumbnail cache depths (8-bit embedded JPEG and
+ * 16-bit raw). The cases exercise the sub-tools the reduced path admits:
+ * LabGrid colour toning, the Lab curve, vibrance and black-and-white output.
+ */
+void test_thumbnail_lab(bool available)
+{
+    using namespace rtengine::stage;
+
+    static MyMutex thumbnail_lab_lcms_mutex;
+    if (rtengine::lcmsMutex == nullptr) {
+        rtengine::lcmsMutex = &thumbnail_lab_lcms_mutex;
+    }
+    static rtengine::Settings thumbnail_lab_settings{};
+    rtengine::settings = &thumbnail_lab_settings;
+    rtengine::Color::init();
+
+    if (!available) {
+        skip("thumbnail.lab: no OpenCL device");
+        return;
+    }
+
+    constexpr int WIDTH = 24;
+    constexpr int HEIGHT = 17;
+    /* The reduced path's CurveFactory skip, mirrored from rtthumbnail.cc. */
+    constexpr int CURVE_SKIP = 16;
+    const std::string profile_path =
+        std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp") +
+        "/stage-residency-thumbnail-lab.jsonl";
+
+    check(node_has_device_implementation("thumbnail.lab"),
+          "thumbnail.lab has a device implementation");
+    const StageNodeSelection selection =
+        select_node_device("thumbnail.lab", StageNodeDevice::CPU);
+    check(selection.implemented,
+          "thumbnail.lab reports an implementation");
+
+    const struct {
+        const char* label;
+        bool eight_bit;
+        bool labgrid;
+        bool labcurve;
+        bool vibrance;
+        bool blackwhite;
+    } cases[] = {
+        {"8-bit LabGrid", true, true, false, false, false},
+        {"16-bit LabGrid", false, true, false, false, false},
+        {"8-bit Lab curve", true, false, true, false, false},
+        {"16-bit Lab curve and vibrance", false, false, true, true, false},
+        {"8-bit black and white", true, false, false, false, true},
+    };
+
+    unsigned seed = 101u;
+    for (const auto& item : cases) {
+        rtengine::procparams::ProcParams params;
+        if (item.labgrid) {
+            params.colorToning.enabled = true;
+            params.colorToning.method = "LabGrid";
+            params.colorToning.labgridALow = -40.0;
+            params.colorToning.labgridAHigh = 25.0;
+            params.colorToning.labgridBLow = 12.0;
+            params.colorToning.labgridBHigh = 55.0;
+        }
+        if (item.labcurve) {
+            params.labCurve.enabled = true;
+            params.labCurve.brightness = 8.0;
+            params.labCurve.contrast = 35.0;
+            params.labCurve.lcurve = lab_curve_points(0.62);
+            params.labCurve.acurve = lab_curve_points(0.4);
+        }
+        if (item.vibrance) {
+            params.vibrance.enabled = true;
+            params.vibrance.pastels = 45;
+            params.vibrance.saturated = 20;
+        }
+        if (item.blackwhite) {
+            params.blackwhite.enabled = true;
+        }
+
+        check(labToolsSupported(params),
+              (std::string("thumbnail.lab ") + item.label +
+               " is an admitted set").c_str());
+
+        LabImage source(WIDTH, HEIGHT);
+        fill_lab_tools(source, seed++);
+        const float step = item.eight_bit ? 257.0f : 1.0f;
+        for (int y = 0; y < HEIGHT; ++y) {
+            for (int x = 0; x < WIDTH; ++x) {
+                source.L[y][x] =
+                    std::round(source.L[y][x] / step) * step;
+                source.a[y][x] =
+                    std::round(source.a[y][x] / step) * step;
+                source.b[y][x] =
+                    std::round(source.b[y][x] / step) * step;
+            }
+        }
+
+        rtengine::ImProcFunctions reference_ipf(&params, false);
+        LabToolsHostState reference_host;
+        LabImage reference(WIDTH, HEIGHT);
+        reference.CopyFrom(&source);
+        if (params.labCurve.enabled && params.labCurve.contrast != 0) {
+            labToolsBuildHistogram(reference, reference_host.hist16);
+        }
+        thumbnail_lab_reference(reference_ipf, params, reference,
+                                reference_host, item.labgrid, item.labcurve,
+                                item.vibrance);
+
+        rtengine::ImProcFunctions device_ipf(&params, false);
+        LabToolsHostState device_host;
+        LabImage device(WIDTH, HEIGHT);
+        device.CopyFrom(&source);
+        const LabToolsRun result =
+            run_lab_tools_node(device, params, device_host, device_ipf,
+                               profile_path, "thumbnail.lab", CURVE_SKIP);
+        const std::string profile = read_file(profile_path);
+
+        check(result.supported,
+              (std::string("thumbnail.lab ") + item.label +
+               " resolves to the admitted set").c_str());
+        check(result.deviceReady,
+              (std::string("thumbnail.lab ") + item.label +
+               " builds its host setup").c_str());
+        check(result.status == RT_STAGE_OK,
+              (std::string("thumbnail.lab ") + item.label +
+               " completes through run()").c_str());
+        check(profile.find("\"stage\":\"thumbnail.lab\"") !=
+                  std::string::npos,
+              (std::string("thumbnail.lab ") + item.label +
+               " records the node").c_str());
+        check(profile.find("\"impl\":\"opencl\"") != std::string::npos,
+              (std::string("thumbnail.lab ") + item.label +
+               " records a device execution").c_str());
+
+        const Diff diff = compare(view(device), view(reference));
+        std::printf("stage-residency: thumbnail.lab %s: PAE %.6f LSB16, "
+                    "%zu of %zu samples differ\n",
+                    item.label, diff.max_abs, diff.differing, diff.samples);
+        check(diff.finite,
+              (std::string("thumbnail.lab ") + item.label +
+               " stays finite").c_str());
+        check(diff.max_abs <= 1.0,
+              (std::string("thumbnail.lab ") + item.label +
+               " is within one LSB16").c_str());
+
+        const Diff moved = compare(view(device), view(source));
+        std::printf("stage-residency: thumbnail.lab %s moves the image by "
+                    "%.6f LSB16\n",
+                    item.label, moved.max_abs);
+        check(moved.max_abs > 0.0,
+              (std::string("thumbnail.lab ") + item.label +
+               " is not vacuous").c_str());
+    }
+
+    /*
+     * A profile with no admitted tool is not submitted: the device launcher
+     * refuses the clear support flag, no host builtin exists for this node,
+     * and so the call site keeps the whole block on the host.
+     */
+    {
+        rtengine::procparams::ProcParams params;
+        LabImage image(WIDTH, HEIGHT);
+        fill_lab_tools(image, 211u);
+        rtengine::ImProcFunctions ipf(&params, false);
+        LabToolsHostState host;
+        const LabToolsRun result =
+            run_lab_tools_node(image, params, host, ipf, profile_path,
+                               "thumbnail.lab", CURVE_SKIP);
+        check(!result.supported && !result.deviceReady,
+              "thumbnail.lab refuses a profile with no admitted tool");
+        check(result.status != RT_STAGE_OK,
+              "thumbnail.lab does not report a pass for an empty profile");
+        const std::string profile = read_file(profile_path);
+        check(profile.find("\"stage\":\"thumbnail.lab\"") ==
+                  std::string::npos,
+              "thumbnail.lab records nothing for an empty profile");
+    }
+
+    /* Malformed requests are invalidd and never name the device. */
+    {
+        auto context = opencl_device()->create_context();
+        check(context != nullptr, "thumbnail.lab: the device creates a context");
+        if (context != nullptr) {
+            StageRequest bad;
+            bad.name = "thumbnail.lab";
+            StageExecution execution;
+            const RtStageStatus status =
+                context->execute(bad, nullptr, &execution);
+            check(status != RT_STAGE_OK,
+                  "thumbnail.lab refuses an empty request");
+            check(execution.device != StageDeviceType::OPENCL,
+                  "thumbnail.lab does not run an empty request on the device");
         }
     }
 }
@@ -19530,6 +19778,7 @@ int main()
     test_residency();
     test_node_parity(available);
     test_thumbnail_rgb(available);
+    test_thumbnail_lab(available);
     test_rgb_proc_pitch(available);
     test_framing(available);
     test_crop(available);
