@@ -1975,6 +1975,595 @@ bool last_row_finite(const RtStageBuffer& buffer)
     return true;
 }
 
+/* ---------------------------------------------------------- thumbnail rgb */
+
+/*
+ * `thumbnail.rgb` runs the shared RGB tone and Lab conversion kernel for the
+ * thumbnail block. The host LUTs are the ones `Thumbnail::stageRgb()` builds;
+ * the node admits only the sub-tools the kernel carries (tone curve, RGB
+ * curves, channel mixer) and the call site keeps the rest on the host.
+ *
+ * The device is compared with an independent implementation of the kernel
+ * arithmetic. Two source grids stand for the thumbnail cache types: values
+ * quantised to 8 bits (the embedded-JPEG quick path) and to 16 bits (the raw
+ * cache). Two table sets exercise the admitted sub-tools: a tone curve alone,
+ * then tone plus the shadow curve, per-channel RGB curves and the mixer.
+ */
+struct ThumbnailRgbTables {
+    std::vector<float> hl;
+    std::vector<float> sh;
+    std::vector<float> tone;
+    std::vector<float> rCurve;
+    std::vector<float> gCurve;
+    std::vector<float> bCurve;
+    std::vector<float> cachef;
+    std::vector<float> cachefy;
+    float mixer[9];
+    float toxyz[9];
+    int toneCurveBlack = 0;
+    int clampOog = 1;
+    int mixChannels = 0;
+    int rgbCurveMask = 0;
+    float expScale = 1.0f;
+    float comp = 0.0f;
+    float hlRange = 65535.0f;
+};
+
+ThumbnailRgbTables make_thumbnail_rgb_tables(bool full)
+{
+    constexpr int ENTRIES = 65536;
+    constexpr float RANGE = 65535.0f;
+
+    ThumbnailRgbTables tables;
+    for (auto* table : {&tables.hl, &tables.sh, &tables.tone, &tables.rCurve,
+                        &tables.gCurve, &tables.bCurve, &tables.cachef,
+                        &tables.cachefy}) {
+        table->resize(ENTRIES);
+    }
+    for (int i = 0; i < ENTRIES; ++i) {
+        const float value = static_cast<float>(i);
+        const float unit = value / RANGE;
+        /* A multiplicative highlight curve, as the production LUT carries. */
+        tables.hl[i] = 0.5f + 0.5f * unit;
+        tables.sh[i] = 0.5f;
+        tables.tone[i] = value;
+        tables.rCurve[i] = value * 0.75f;
+        tables.gCurve[i] = value * 0.75f;
+        tables.bCurve[i] = value * 0.75f;
+        tables.cachef[i] = value;
+        tables.cachefy[i] = value;
+    }
+    const float identity[9] = {1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f,
+                               0.0f, 0.0f, 1.0f};
+    const float mixed[9] = {0.9f, 0.08f, 0.02f, 0.05f, 0.9f, 0.05f,
+                            0.02f, 0.08f, 0.9f};
+    for (int i = 0; i < 9; ++i) {
+        tables.mixer[i] = full ? mixed[i] : identity[i];
+        tables.toxyz[i] = identity[i];
+    }
+    tables.toneCurveBlack = full ? 1 : 0;
+    tables.mixChannels = full ? 1 : 0;
+    tables.rgbCurveMask = full ? 7 : 0;
+    return tables;
+}
+
+float thumbnail_lut(const std::vector<float>& table, float value)
+{
+    const float clamped = std::min(std::max(value, 0.0f), 65535.0f);
+    const int index = static_cast<int>(clamped);
+    const int upper = std::min(index + 1, 65535);
+    const float fraction = clamped - static_cast<float>(index);
+    return table[index] + (table[upper] - table[index]) * fraction;
+}
+
+float thumbnail_hl_curve(const ThumbnailRgbTables& tables, float level)
+{
+    if (tables.comp > 0.0f) {
+        float value = level + (tables.hlRange - 65536.0f);
+        if (value == 0.0f) {
+            value = 0.000001f;
+        }
+        float Y = value * tables.expScale / tables.hlRange;
+        Y *= tables.comp;
+        if (Y <= -1.0f) {
+            Y = -0.999999f;
+        }
+        const float R = tables.hlRange / (value * tables.comp);
+        return std::log1p(Y) * R;
+    }
+    return tables.expScale;
+}
+
+void thumbnail_filmlike_tone(float& r, float& g, float& b, float limit)
+{
+    const float rr = r > limit ? limit : r;
+    const float bb = b > limit ? limit : b;
+    const float gg = bb + ((rr - bb) * (g - b) / (r - b));
+    r = rr;
+    g = gg;
+    b = bb;
+}
+
+void thumbnail_filmlike_clip(float& r, float& g, float& b)
+{
+    constexpr float LIMIT = 65535.0f;
+    if (r >= g) {
+        if (g > b) {
+            thumbnail_filmlike_tone(r, g, b, LIMIT);
+        } else if (b > r) {
+            thumbnail_filmlike_tone(b, r, g, LIMIT);
+        } else if (b > g) {
+            thumbnail_filmlike_tone(r, b, g, LIMIT);
+        } else {
+            r = r > LIMIT ? LIMIT : r;
+            g = g > LIMIT ? LIMIT : g;
+            b = g;
+        }
+    } else {
+        if (r >= b) {
+            thumbnail_filmlike_tone(g, r, b, LIMIT);
+        } else if (b > g) {
+            thumbnail_filmlike_tone(b, g, r, LIMIT);
+        } else {
+            thumbnail_filmlike_tone(g, b, r, LIMIT);
+        }
+    }
+}
+
+float thumbnail_compute_f(const std::vector<float>& table, float value)
+{
+    if (value < 0.0f) {
+        return 327.68f * ((903.2962962962963f * value / 65535.0f + 16.0f) /
+                          116.0f);
+    }
+    if (value > 65535.0f) {
+        return 327.68f * std::cbrt(value / 65535.0f);
+    }
+    return thumbnail_lut(table, value);
+}
+
+float thumbnail_compute_fy(const std::vector<float>& table, float value)
+{
+    if (value < 0.0f) {
+        return 327.68f * (903.2962962962963f * value / 65535.0f);
+    }
+    if (value > 65535.0f) {
+        return 327.68f * (116.0f * std::cbrt(value / 65535.0f) - 16.0f);
+    }
+    return thumbnail_lut(table, value);
+}
+
+void reference_thumbnail_rgb(const float sample[3],
+                             const ThumbnailRgbTables& tables, float out[3])
+{
+    float r = sample[0];
+    float g = sample[1];
+    float b = sample[2];
+
+    if (tables.mixChannels) {
+        const float rmix =
+            (r * tables.mixer[0] + g * tables.mixer[1] + b * tables.mixer[2]) /
+            100.0f;
+        const float gmix =
+            (r * tables.mixer[3] + g * tables.mixer[4] + b * tables.mixer[5]) /
+            100.0f;
+        const float bmix =
+            (r * tables.mixer[6] + g * tables.mixer[7] + b * tables.mixer[8]) /
+            100.0f;
+        r = rmix;
+        g = gmix;
+        b = bmix;
+    }
+
+    float toneFactor;
+    if (std::max(r, std::max(g, b)) >= 65535.0f) {
+        const auto high = [&](float value) {
+            return value < 65535.0f ? thumbnail_lut(tables.hl, value)
+                                    : thumbnail_hl_curve(tables, value);
+        };
+        toneFactor = (high(r) + high(g) + high(b)) / 3.0f;
+    } else {
+        toneFactor = (thumbnail_lut(tables.hl, r) +
+                      thumbnail_lut(tables.hl, g) +
+                      thumbnail_lut(tables.hl, b)) /
+                     3.0f;
+    }
+    r *= toneFactor;
+    g *= toneFactor;
+    b *= toneFactor;
+
+    if (tables.toneCurveBlack != 0) {
+        const float Y = 0.299f * r + 0.587f * g + 0.114f * b;
+        toneFactor = thumbnail_lut(tables.sh, Y);
+        r *= toneFactor;
+        g *= toneFactor;
+        b *= toneFactor;
+    }
+
+    if (tables.clampOog != 0) {
+        r = std::max(r, 0.0f);
+        g = std::max(g, 0.0f);
+        b = std::max(b, 0.0f);
+        if (r > 65535.0f || g > 65535.0f || b > 65535.0f) {
+            thumbnail_filmlike_clip(r, g, b);
+        }
+    }
+
+    if (r >= 0.0f && r <= 65535.0f) {
+        r = thumbnail_lut(tables.tone, r);
+    }
+    if (g >= 0.0f && g <= 65535.0f) {
+        g = thumbnail_lut(tables.tone, g);
+    }
+    if (b >= 0.0f && b <= 65535.0f) {
+        b = thumbnail_lut(tables.tone, b);
+    }
+    if ((tables.rgbCurveMask & 1) != 0 && r >= 0.0f && r <= 65535.0f) {
+        r = thumbnail_lut(tables.rCurve, r);
+    }
+    if ((tables.rgbCurveMask & 2) != 0 && g >= 0.0f && g <= 65535.0f) {
+        g = thumbnail_lut(tables.gCurve, g);
+    }
+    if ((tables.rgbCurveMask & 4) != 0 && b >= 0.0f && b <= 65535.0f) {
+        b = thumbnail_lut(tables.bCurve, b);
+    }
+
+    const float X = tables.toxyz[0] * r + tables.toxyz[1] * g +
+                    tables.toxyz[2] * b;
+    const float Y = tables.toxyz[3] * r + tables.toxyz[4] * g +
+                    tables.toxyz[5] * b;
+    const float Z = tables.toxyz[6] * r + tables.toxyz[7] * g +
+                    tables.toxyz[8] * b;
+    const float fx = thumbnail_compute_f(tables.cachef, X);
+    const float fy = thumbnail_compute_f(tables.cachef, Y);
+    const float fz = thumbnail_compute_f(tables.cachef, Z);
+    out[0] = thumbnail_compute_fy(tables.cachefy, Y);
+    out[1] = 500.0f * (fx - fy);
+    out[2] = 200.0f * (fy - fz);
+}
+
+void fill_thumbnail_rgb_source(RtStageBuffer& image, bool eight_bit)
+{
+    for (std::uint32_t plane = 0; plane < image.planes; ++plane) {
+        unsigned char* base = static_cast<unsigned char*>(image.data) +
+                              static_cast<std::size_t>(plane) *
+                                  image.plane_pitch;
+        for (int y = 0; y < image.height; ++y) {
+            float* row = reinterpret_cast<float*>(
+                base + static_cast<std::size_t>(y) * image.row_pitch);
+            for (int x = 0; x < image.width; ++x) {
+                const int index = y * image.width + x;
+                row[x] = eight_bit
+                             ? static_cast<float>(
+                                   ((index * 37 +
+                                     static_cast<int>(plane) * 71 + y * 13) &
+                                    0xff) *
+                                   257)
+                             : static_cast<float>(
+                                   (index * 4099 +
+                                    static_cast<int>(plane) * 7919 + x * 101) &
+                                   0xffff);
+            }
+        }
+    }
+}
+
+struct ThumbnailRgbFixture {
+    RtStageBuffer source;
+    RtStageBuffer output;
+    RtStageBuffer reference;
+    ThumbnailRgbTables tables;
+
+    static RtStageArg table(const std::vector<float>& data)
+    {
+        RtStageBuffer buffer{};
+        buffer.size = sizeof(RtStageBuffer);
+        buffer.data = const_cast<float*>(data.data());
+        buffer.width = static_cast<int>(data.size());
+        buffer.height = 1;
+        buffer.row_pitch = data.size() * sizeof(float);
+        buffer.plane_pitch = buffer.row_pitch;
+        buffer.planes = 1;
+        buffer.format = RT_STAGE_F32;
+        buffer.flags = RT_STAGE_BUFFER_READ;
+        return buffer_arg(buffer);
+    }
+
+    static RtStageArg matrix(const float* data)
+    {
+        RtStageBuffer buffer{};
+        buffer.size = sizeof(RtStageBuffer);
+        buffer.data = const_cast<float*>(data);
+        buffer.width = 9;
+        buffer.height = 1;
+        buffer.row_pitch = 9 * sizeof(float);
+        buffer.plane_pitch = buffer.row_pitch;
+        buffer.planes = 1;
+        buffer.format = RT_STAGE_F32;
+        buffer.flags = RT_STAGE_BUFFER_READ;
+        return buffer_arg(buffer);
+    }
+
+    std::vector<RtStageArg> args(RtStageBuffer& dst) const
+    {
+        std::vector<RtStageArg> result;
+        result.push_back(buffer_arg(source));
+        result.push_back(buffer_arg(dst));
+        result.push_back(table(tables.hl));
+        result.push_back(table(tables.sh));
+        result.push_back(table(tables.tone));
+        result.push_back(table(tables.rCurve));
+        result.push_back(table(tables.gCurve));
+        result.push_back(table(tables.bCurve));
+        result.push_back(table(tables.cachef));
+        result.push_back(table(tables.cachefy));
+        result.push_back(matrix(tables.mixer));
+        result.push_back(matrix(tables.toxyz));
+        result.push_back(int_arg(source.width));
+        result.push_back(int_arg(source.height));
+        result.push_back(int_arg(tables.toneCurveBlack));
+        result.push_back(int_arg(tables.clampOog));
+        result.push_back(int_arg(tables.mixChannels));
+        result.push_back(int_arg(tables.rgbCurveMask));
+        result.push_back(double_arg(tables.expScale));
+        result.push_back(double_arg(tables.comp));
+        result.push_back(double_arg(tables.hlRange));
+        return result;
+    }
+};
+
+/*
+ * Fill a Lab buffer from the fixture source and the supplied tables.
+ */
+void fill_thumbnail_rgb_reference(ThumbnailRgbFixture& fixture,
+                                  const ThumbnailRgbTables& tables)
+{
+    fill(fixture.reference, 0u);
+    for (int y = 0; y < fixture.source.height; ++y) {
+        for (int x = 0; x < fixture.source.width; ++x) {
+            float sample[3];
+            for (int plane = 0; plane < 3; ++plane) {
+                const unsigned char* base =
+                    static_cast<const unsigned char*>(fixture.source.data) +
+                    static_cast<std::size_t>(plane) *
+                        fixture.source.plane_pitch;
+                const float* row = reinterpret_cast<const float*>(
+                    base + static_cast<std::size_t>(y) *
+                               fixture.source.row_pitch);
+                sample[plane] = row[x];
+            }
+            float out[3];
+            reference_thumbnail_rgb(sample, tables, out);
+            for (int plane = 0; plane < 3; ++plane) {
+                unsigned char* base =
+                    static_cast<unsigned char*>(fixture.reference.data) +
+                    static_cast<std::size_t>(plane) *
+                        fixture.reference.plane_pitch;
+                float* row = reinterpret_cast<float*>(
+                    base + static_cast<std::size_t>(y) *
+                               fixture.reference.row_pitch);
+                row[x] = out[plane];
+            }
+        }
+    }
+}
+
+/*
+ * Compare two same-shaped F32 three-plane buffers and return the peak
+ * absolute error and the number of samples beyond half a 16-bit LSB.
+ */
+void compare_thumbnail_rgb(const RtStageBuffer& actual,
+                           const RtStageBuffer& expected, double& pae,
+                           std::size_t& differing)
+{
+    pae = 0.0;
+    differing = 0;
+    for (std::uint32_t plane = 0; plane < actual.planes; ++plane) {
+        const unsigned char* a_base =
+            static_cast<const unsigned char*>(actual.data) +
+            static_cast<std::size_t>(plane) * actual.plane_pitch;
+        const unsigned char* e_base =
+            static_cast<const unsigned char*>(expected.data) +
+            static_cast<std::size_t>(plane) * expected.plane_pitch;
+        for (int y = 0; y < actual.height; ++y) {
+            const float* a_row = reinterpret_cast<const float*>(
+                a_base + static_cast<std::size_t>(y) * actual.row_pitch);
+            const float* e_row = reinterpret_cast<const float*>(
+                e_base + static_cast<std::size_t>(y) * expected.row_pitch);
+            for (int x = 0; x < actual.width; ++x) {
+                const double delta = std::fabs(
+                    static_cast<double>(a_row[x]) -
+                    static_cast<double>(e_row[x]));
+                pae = std::max(pae, delta);
+                if (delta > 0.5) {
+                    ++differing;
+                }
+            }
+        }
+    }
+}
+
+void test_thumbnail_rgb(bool available)
+{
+    using namespace rtengine::stage;
+
+    if (!available) {
+        skip("thumbnail.rgb: no OpenCL device");
+        return;
+    }
+
+    constexpr int WIDTH = 24;
+    constexpr int HEIGHT = 17;
+
+    check(node_has_device_implementation("thumbnail.rgb"),
+          "thumbnail.rgb has a device implementation");
+    const StageNodeSelection selection =
+        select_node_device("thumbnail.rgb", StageNodeDevice::CPU);
+    check(selection.implemented,
+          "thumbnail.rgb reports an implementation");
+
+    auto context = opencl_device()->create_context();
+    check(context != nullptr, "thumbnail.rgb: the device creates a context");
+    if (context == nullptr) {
+        return;
+    }
+
+    StageBufferAllocator host(StageDeviceType::CPU);
+    const struct {
+        const char* label;
+        bool eight_bit;
+        bool full;
+    } cases[] = {
+        {"8-bit tone curve", true, false},
+        {"16-bit tone curve", false, false},
+        {"8-bit tone, shadow, curves and mixer", true, true},
+        {"16-bit tone, shadow, curves and mixer", false, true},
+    };
+
+    for (const auto& item : cases) {
+        ThumbnailRgbFixture fixture;
+        fixture.tables = make_thumbnail_rgb_tables(item.full);
+        std::string error;
+        fixture.source =
+            host.allocate({RT_STAGE_F32, WIDTH, HEIGHT, 3}, &error);
+        fixture.output =
+            host.allocate({RT_STAGE_F32, WIDTH, HEIGHT, 3}, &error);
+        fixture.reference =
+            host.allocate({RT_STAGE_F32, WIDTH, HEIGHT, 3}, &error);
+        if (!valid(fixture.source) || !valid(fixture.output) ||
+            !valid(fixture.reference)) {
+            check(false, "thumbnail.rgb fixture allocates");
+            continue;
+        }
+        fill_thumbnail_rgb_source(fixture.source, item.eight_bit);
+        fill(fixture.output, 0u);
+        fill_thumbnail_rgb_reference(fixture, fixture.tables);
+
+        set_node_device_override("thumbnail.rgb",
+                                 StageNodeDevice::OpenCL);
+        StageRequest request;
+        request.name = "thumbnail.rgb";
+        request.args = fixture.args(fixture.output);
+        StageExecution execution;
+        const RtStageStatus status =
+            context->execute(request, nullptr, &execution);
+        clear_node_device_overrides();
+
+        check(status == RT_STAGE_OK,
+              (std::string("the device executes thumbnail.rgb: ") +
+               item.label).c_str());
+        check(execution.device == StageDeviceType::OPENCL,
+              (std::string("thumbnail.rgb names the device: ") + item.label)
+                  .c_str());
+        check(!execution.asynchronous,
+              (std::string("thumbnail.rgb completes on readback: ") +
+               item.label).c_str());
+
+        double pae = 0.0;
+        std::size_t differing = 0;
+        compare_thumbnail_rgb(fixture.output, fixture.reference, pae,
+                              differing);
+        std::printf("stage-residency: thumbnail.rgb %s: PAE %.6f LSB16, "
+                    "%zu of %d samples beyond 0.5 LSB\n",
+                    item.label, pae, differing, WIDTH * HEIGHT * 3);
+        check(differing == 0,
+              (std::string("thumbnail.rgb matches the reference: ") +
+               item.label).c_str());
+        check(pae <= 0.5,
+              (std::string("thumbnail.rgb is within half an LSB16: ") +
+               item.label).c_str());
+
+        /*
+         * Non-vacuity: the full sub-tool set must move the same source away
+         * from the tone-only reference.
+         */
+        if (item.full) {
+            const ThumbnailRgbTables basic =
+                make_thumbnail_rgb_tables(false);
+            fill_thumbnail_rgb_reference(fixture, basic);
+            double moved = 0.0;
+            std::size_t ignored = 0;
+            compare_thumbnail_rgb(fixture.output, fixture.reference, moved,
+                                  ignored);
+            std::printf("stage-residency: thumbnail.rgb %s sub-tools move "
+                        "the image by %.6f LSB16\n",
+                        item.label, moved);
+            check(moved > 0.0,
+                  "thumbnail.rgb sub-tools are not vacuous");
+        }
+
+        /* The runtime form records the implementation per node. */
+        {
+            const std::string profile_path =
+                std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR")
+                                                 : "/tmp") +
+                "/stage-residency-thumbnail-rgb.jsonl";
+            std::remove(profile_path.c_str());
+            setenv("RT_STAGE_PROFILE", profile_path.c_str(), 1);
+            set_node_device_override("thumbnail.rgb",
+                                     StageNodeDevice::OpenCL);
+            const RtStageStatus run_status = run(
+                "thumbnail.rgb", fixture.args(fixture.output), nullptr);
+            clear_node_device_overrides();
+            unsetenv("RT_STAGE_PROFILE");
+            check(run_status == RT_STAGE_OK,
+                  (std::string("thumbnail.rgb completes through run(): ") +
+                   item.label).c_str());
+            const std::string profile = read_file(profile_path);
+            check(profile.find("\"stage\":\"thumbnail.rgb\"") !=
+                      std::string::npos &&
+                      profile.find("\"impl\":\"opencl\"") !=
+                          std::string::npos,
+                  (std::string("thumbnail.rgb records a device pass: ") +
+                   item.label).c_str());
+        }
+
+        /* Refusals: malformed requests must not be counted as a device pass. */
+        const auto refused = [&](const std::vector<RtStageArg>& args,
+                                 const char* what) {
+            StageRequest bad;
+            bad.name = "thumbnail.rgb";
+            bad.args = args;
+            set_node_device_override("thumbnail.rgb",
+                                     StageNodeDevice::OpenCL);
+            StageExecution bad_execution;
+            const RtStageStatus bad_status =
+                context->execute(bad, nullptr, &bad_execution);
+            clear_node_device_overrides();
+            check(bad_status != RT_STAGE_OK,
+                  (std::string("thumbnail.rgb refuses ") + what).c_str());
+            check(bad_execution.device != StageDeviceType::OPENCL,
+                  (std::string("thumbnail.rgb does not run ") + what +
+                   " on the device").c_str());
+        };
+
+        {
+            std::vector<RtStageArg> args = fixture.args(fixture.output);
+            args.pop_back();
+            refused(args, "a missing scalar");
+        }
+        {
+            std::vector<RtStageArg> args = fixture.args(fixture.output);
+            args[0].u.buffer.format = RT_STAGE_U8;
+            refused(args, "an 8-bit source buffer");
+        }
+        {
+            std::vector<RtStageArg> args = fixture.args(fixture.output);
+            args[1] = args[0];
+            refused(args, "an aliased source and destination");
+        }
+        {
+            std::vector<RtStageArg> args = fixture.args(fixture.output);
+            args[2].u.buffer.width = 32768;
+            refused(args, "a truncated tone table");
+        }
+
+        host.release(fixture.source);
+        host.release(fixture.output);
+        host.release(fixture.reference);
+    }
+}
+
 void test_rgb_proc_pitch(bool available)
 {
     using namespace rtengine::stage;
@@ -18940,6 +19529,7 @@ int main()
     test_selection(available);
     test_residency();
     test_node_parity(available);
+    test_thumbnail_rgb(available);
     test_rgb_proc_pitch(available);
     test_framing(available);
     test_crop(available);
