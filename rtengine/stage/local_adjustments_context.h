@@ -48,14 +48,14 @@ struct ProcParams;
  * L/C/H curves, the vibrance tool, the shadows/highlights tool, the soft-light
  * tool, the Gaussian local-contrast tool, the local sharpening tool, the
  * local Blur & Noise tool (Gaussian and median arms), the Retinex tool, the
- * deltaE scope, the avoid-colour-shift Munsell method and the unconditional
- * per-spot Lab-to-RGB clamp. The block also applies the final Munsell pass and
- * the clamp for an inactive spot, so a block whose spots do no tool work is
- * still a clamp-only block.
+ * CIE CAM (CAM16) tool, the deltaE scope, the avoid-colour-shift Munsell
+ * method and the unconditional per-spot Lab-to-RGB clamp. The block also
+ * applies the final Munsell pass and the clamp for an inactive spot, so a
+ * block whose spots do no tool work is still a clamp-only block.
  *
  * The tools run in Lab_Local()'s order: log encoding, blur, tone mapping,
  * dehaze, Retinex, CBDL, vibrance, shadows/highlights, soft light, local
- * contrast, local sharpening, then Colour & Light. The context is C-compatible because the ABI is. `self`
+ * contrast, local sharpening, Colour & Light, then the CIE CAM. The context is C-compatible because the ABI is. `self`
  * points at the C++ object that owns the ProcParams, ImProcFunctions and
  * LabImage references, so the pointer must not outlive them.
  *
@@ -64,14 +64,14 @@ struct ProcParams;
  * small, known subset reaches the supported paths. Slots are named by the
  * RT_LOCAL_ADJUSTMENTS_SLOT_* constants and are written once per spot.
  */
-#define RT_LOCAL_ADJUSTMENTS_CONTEXT_VERSION 13u
+#define RT_LOCAL_ADJUSTMENTS_CONTEXT_VERSION 14u
 /* "LAJC": rejects a stale or unrelated pointer before any callback runs. */
 #define RT_LOCAL_ADJUSTMENTS_CONTEXT_MAGIC 0x4C414A43u
 /* The block has no bounded spot count, but a profile that carries more spots
  * than this is outside the device set and runs the host block. */
 #define RT_LOCAL_ADJUSTMENTS_MAX_SPOTS 64u
 /* Floats per spot record; the slot constants below must stay inside it. */
-#define RT_LOCAL_ADJUSTMENTS_SPOT_STRIDE 280u
+#define RT_LOCAL_ADJUSTMENTS_SPOT_STRIDE 352u
 /* A curve table is one LUTf of the block's own size. */
 #define RT_LOCAL_ADJUSTMENTS_LUT_ENTRIES 65536u
 /* Color::gammatab_srgb and Color::igammatab_srgb, the sRGB gamma pair the
@@ -434,6 +434,68 @@ struct ProcParams;
 /* Ten box-blur stages, each n + six radii, starting here. */
 #define RT_LOCAL_ADJUSTMENTS_SLOT_RETI_BLUR_BASE 200u
 
+/* CIE CAM (CAM16). EXP_CIE is 1 when Lab_Local()'s "com" block runs on an
+ * active spot: the tool on, the spot active, no explicit mask and an ROI at
+ * least mSP = 5 px on both axes. The device runs ciecamloc_02float()'s
+ * call==0 arm for the CAM16 appearance transform, the block's final gain and
+ * gamut round trip and transit_shapedetect2()'s senstype-31 blend.
+ *
+ * Every scalar the host derives is exported rather than recomputed, so the
+ * kernel reads the block's own values: the two set of CAM16 viewing
+ * conditions (initcam1float()/initcam2float() outputs), the two whites, the
+ * derived powers and coefficients, and the tone-slider amounts. The kernel
+ * reads the host-built CAMBrightCurveJ and CAMBrightCurveQ tables, which
+ * depend only on the admitted light sliders (the contrast sliders, whose
+ * tables read the ROI histogram, stay on the host).
+ */
+#define RT_LOCAL_ADJUSTMENTS_SLOT_EXP_CIE 270u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_CIE_C 271u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_CIE_NC 272u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_CIE_AW 273u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_CIE_FL 274u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_CIE_WH 275u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_CIE_NBB 276u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_CIE_NCB 277u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_CIE_CZ 278u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_CIE_D 279u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_CIE_POW1 280u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_CIE_POW1N 281u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_CIE_COEFQ 282u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_CIE_QPRO 283u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_CIE_PFL 284u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_CIE_PLUM 285u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_CIE_XW1 286u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_CIE_YW1 287u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_CIE_ZW1 288u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_CIE_XW2 289u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_CIE_YW2 290u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_CIE_ZW2 291u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_CIE_C2 292u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_CIE_NC2 293u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_CIE_AWJ 294u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_CIE_FLJ 295u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_CIE_NBBJ 296u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_CIE_NCBJ 297u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_CIE_CZJ 298u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_CIE_DJ 299u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_CIE_RECCMCZ 300u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_CIE_COE 301u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_CIE_MCHR 302u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_CIE_SCHR 303u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_CIE_CCHR 304u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_CIE_HUE 305u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_CIE_RSTPROTECT 306u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_CIE_SENS 307u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_CIE_REPART 308u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_CIE_CAMJ_OFFSET 309u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_CIE_CAMQ_OFFSET 310u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_CIE_HUERED 311u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_CIE_SCHRRED 312u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_CIE_HUEGREEN 313u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_CIE_SCHRGREEN 314u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_CIE_HUEBLUE 315u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_CIE_SCHRBLUE 316u
+
 /* deconvsharpeningloc() has two arms. Damping zero is the undamped RLD path:
  * the division/multiplication recurrence the output.sharpen core already
  * covers. A positive damping value is the damped path: a plain Gaussian blur,
@@ -573,6 +635,53 @@ struct ProcParams;
 #define RT_LOCAL_ADJUSTMENTS_RETI_MIN_SOFT_RADIUS 0.0
 #define RT_LOCAL_ADJUSTMENTS_RETI_MAX_SOFT_RADIUS 100.0
 
+/*
+ * CIE CAM. Lab_Local()'s "com" block needs an ROI at least mSP = 5 px on
+ * both axes. The CAMBrightCurveJ and CAMBrightCurveQ tables are 32768-entry
+ * LUTf, the same size ciecamloc_02float() constructs. `pqremapcam16` above
+ * 100 selects the CAM16-PQ (c16 == 21) transform, which is a residual; at or
+ * below it the block runs the plain CAM16 (c16 == 16) arm.
+ *
+ * The admitted sliders are the GUI ranges. The contrast sliders
+ * (`contlcie`, `contqcie`) build their curve from the ROI histogram, which
+ * depends on the tools that ran before the CIE pass in the same spot, so they
+ * are residuals; the light sliders need no histogram and are admitted. The
+ * final gain and gamut compression is admitted only at its neutral settings.
+ */
+#define RT_LOCAL_ADJUSTMENTS_CIE_MIN_ROI 5
+#define RT_LOCAL_ADJUSTMENTS_CIE_CAM_ENTRIES 32768u
+#define RT_LOCAL_ADJUSTMENTS_CIE_MAX_PLUM 100.0
+#define RT_LOCAL_ADJUSTMENTS_CIE_MIN_GRAY 1.0
+#define RT_LOCAL_ADJUSTMENTS_CIE_MAX_GRAY 100.0
+#define RT_LOCAL_ADJUSTMENTS_CIE_MIN_TARGET_GRAY 5.0
+#define RT_LOCAL_ADJUSTMENTS_CIE_MAX_TARGET_GRAY 80.0
+#define RT_LOCAL_ADJUSTMENTS_CIE_MIN_ABS 0.01
+#define RT_LOCAL_ADJUSTMENTS_CIE_MAX_ABS 16384.0
+#define RT_LOCAL_ADJUSTMENTS_CIE_MIN_CATAD (-100.0)
+#define RT_LOCAL_ADJUSTMENTS_CIE_MAX_CATAD 100.0
+#define RT_LOCAL_ADJUSTMENTS_CIE_MIN_SLIDER (-100.0)
+#define RT_LOCAL_ADJUSTMENTS_CIE_MAX_SLIDER 100.0
+#define RT_LOCAL_ADJUSTMENTS_CIE_MIN_PROTECT 0.0
+#define RT_LOCAL_ADJUSTMENTS_CIE_MAX_PROTECT 100.0
+#define RT_LOCAL_ADJUSTMENTS_CIE_MIN_SENS 0
+#define RT_LOCAL_ADJUSTMENTS_CIE_MAX_SENS 100
+#define RT_LOCAL_ADJUSTMENTS_CIE_MIN_BLUR 2.0
+#define RT_LOCAL_ADJUSTMENTS_CIE_MAX_BLUR 100.0
+#define RT_LOCAL_ADJUSTMENTS_CIE_MIN_REPART 1.0
+#define RT_LOCAL_ADJUSTMENTS_CIE_MAX_REPART 100.0
+/* The block's reheat point for the target white, and the source white
+ * (5000 K) the forward transform is anchored to. */
+#define RT_LOCAL_ADJUSTMENTS_CIE_TEMP_BASE 5000
+#define RT_LOCAL_ADJUSTMENTS_CIE_TEMP_UP 30.0
+#define RT_LOCAL_ADJUSTMENTS_CIE_TEMP_DOWN 70.0
+/* ciecamloc_02float()'s fixed epsil, and the four hue sectors of the per-hue
+ * brightness sliders (all zero in the admitted set). */
+#define RT_LOCAL_ADJUSTMENTS_CIE_EPSIL 0.0001f
+#define RT_LOCAL_ADJUSTMENTS_CIE_HUE_RED_END 100.0f
+#define RT_LOCAL_ADJUSTMENTS_CIE_HUE_GREEN_END 190.0f
+#define RT_LOCAL_ADJUSTMENTS_CIE_HUE_BLUE_END 340.0f
+#define RT_LOCAL_ADJUSTMENTS_CIE_HUE_ATTENUATION 0.555f
+
 typedef struct RtLocalAdjustmentsResult {
     /* spot_count RT_LOCAL_ADJUSTMENTS_SPOT_STRIDE floats, spot-major. */
     const float* spots;
@@ -623,6 +732,13 @@ typedef struct RtLocalAdjustmentsResult {
     /* Blur & Noise's Gaussian arm, sigma `lp.rad / (sk * 1.4)`. Only the SSE
      * path is admitted. The median arm does not read it. */
     const RtLabToolsIir* iir_blur;
+    /* transit_shapedetect2()'s senstype-31 deltaE reference blur, sigma
+     * (2 + 0.2 * blurciede) / sk. Only the SSE path is admitted. */
+    const RtLabToolsIir* iir_cie;
+    /* The same working XYZ -> RGB matrix in double, nine values. The block's
+     * final gain and gamut round trip calls Color::xyz2rgb(), which multiplies
+     * with the double matrix. */
+    const double* iws_double;
 } RtLocalAdjustmentsResult;
 
 typedef struct RtLocalAdjustmentsContext {
@@ -729,6 +845,18 @@ namespace rtengine::stage
  * Soft light is admitted in its per-pixel "soft" method only; "reti" is the
  * retinex path and stays a residual. The sRGB gamma tables are host-built by
  * Color::init() and the working matrices are the block's own.
+ *
+ * CIE CAM is admitted in its CAM16 "com" mode only: `expcie` on, `modecie`
+ * `"com"`, `modecam` `"cam16"`, `pqremapcam16` at most 100 (the plain CAM16
+ * arm) and `smoothciemet` `"none"`. The device runs ciecamloc_02float()'s
+ * call==0 transform with every viewing-condition, white-point, acceptance and
+ * lightness/brightness slider at its GUI range, plus the chroma, saturation,
+ * colourfulness, hue and red-protection sliders. The per-hue brightness
+ * sliders and their curves, the CIE tone curves, the contrast sliders (whose
+ * tables read the ROI histogram the host builds after the earlier tools), the
+ * Jz pre-processing, the pre-CAM RGB tone mapping, the mask display, the
+ * recovery mask, `detailcie`'s local contrast, the gradient and the final gain
+ * and gamut compression are residuals.
  */
 bool localAdjustmentsSupported(const procparams::ProcParams& params);
 
@@ -821,6 +949,7 @@ private:
     float ws_[9] = {};
     double wsDouble_[9] = {};
     float iws_[9] = {};
+    double iwsDouble_[9] = {};
     std::vector<float> cachef_;
     std::vector<float> cachefy_;
     std::vector<float> gammaSrgb_;
@@ -832,6 +961,7 @@ private:
     RtLabToolsIir iirLc_ = {};
     RtLabToolsIir iirSh_ = {};
     RtLabToolsIir iirBlur_ = {};
+    RtLabToolsIir iirCie_ = {};
     uint32_t clamp_mode_ = RT_LOCAL_ADJUSTMENTS_CLAMP_NONE;
 };
 

@@ -183,6 +183,56 @@ inline constexpr const char* RT_LOCAL_ADJUSTMENTS_CL = R"CLC(
 #define RT_LA_RETI_BLUR_BASE 200
 #define RT_LA_RETI_BLUR_STRIDE 7
 #define RT_LA_RETI_MAX_BOX_ITERATIONS 6
+#define RT_LA_EXP_CIE 270
+#define RT_LA_CIE_C 271
+#define RT_LA_CIE_NC 272
+#define RT_LA_CIE_AW 273
+#define RT_LA_CIE_FL 274
+#define RT_LA_CIE_WH 275
+#define RT_LA_CIE_NBB 276
+#define RT_LA_CIE_NCB 277
+#define RT_LA_CIE_CZ 278
+#define RT_LA_CIE_D 279
+#define RT_LA_CIE_POW1 280
+#define RT_LA_CIE_POW1N 281
+#define RT_LA_CIE_COEFQ 282
+#define RT_LA_CIE_QPRO 283
+#define RT_LA_CIE_PFL 284
+#define RT_LA_CIE_PLUM 285
+#define RT_LA_CIE_XW1 286
+#define RT_LA_CIE_YW1 287
+#define RT_LA_CIE_ZW1 288
+#define RT_LA_CIE_XW2 289
+#define RT_LA_CIE_YW2 290
+#define RT_LA_CIE_ZW2 291
+#define RT_LA_CIE_C2 292
+#define RT_LA_CIE_NC2 293
+#define RT_LA_CIE_AWJ 294
+#define RT_LA_CIE_FLJ 295
+#define RT_LA_CIE_NBBJ 296
+#define RT_LA_CIE_NCBJ 297
+#define RT_LA_CIE_CZJ 298
+#define RT_LA_CIE_DJ 299
+#define RT_LA_CIE_RECCMCZ 300
+#define RT_LA_CIE_COE 301
+#define RT_LA_CIE_MCHR 302
+#define RT_LA_CIE_SCHR 303
+#define RT_LA_CIE_CCHR 304
+#define RT_LA_CIE_HUE 305
+#define RT_LA_CIE_RSTPROTECT 306
+#define RT_LA_CIE_SENS 307
+#define RT_LA_CIE_REPART 308
+#define RT_LA_CIE_CAMJ_OFFSET 309
+#define RT_LA_CIE_CAMQ_OFFSET 310
+#define RT_LA_CIE_HUERED 311
+#define RT_LA_CIE_SCHRRED 312
+#define RT_LA_CIE_HUEGREEN 313
+#define RT_LA_CIE_SCHRGREEN 314
+#define RT_LA_CIE_HUEBLUE 315
+#define RT_LA_CIE_SCHRBLUE 316
+#define RT_LA_CIE_CAM_ENTRIES 32768
+#define RT_LA_CIE_EPSIL 0.0001f
+#define RT_LA_CIE_HUE_ATTENUATION 0.555f
 
 /*
  * The number of trailing columns the host takes through its scalar path.
@@ -3070,6 +3120,527 @@ __kernel void rt_local_adjustments_reti_blend(
         diflc *= localFactor;
         lab[o] = fmin(fmax(originalL + diflc, 0.0f), 65535.0f);
     }
+}
+/*
+ * CIE CAM (CAM16). ciecamloc_02float()'s call==0 arm: the forward CAM16
+ * transform under the scene viewing conditions, the tone and colour sliders,
+ * and the inverse transform under the viewing conditions. The host builds the
+ * viewing-condition scalars and the two brightness tables; this program only
+ * reproduces the per-pixel arithmetic. The `c16 == 16` (CAT16) arm is the only
+ * one admitted; the PQ arm above pqremap 100 is a host residual.
+ */
+inline void rt_la_cie_xyz_cat16(float* r, float* g, float* b, const float x,
+                                const float y, const float z)
+{
+    *r = 0.401288f * x + 0.650173f * y - 0.051461f * z;
+    *g = -0.250268f * x + 1.204414f * y + 0.045854f * z;
+    *b = -0.002079f * x + 0.048952f * y + 0.953127f * z;
+}
+
+/* Ciecam02::cat02_to_xyzfloat()'s c16 == 16 arm. The host's per-pixel loop
+ * runs the vector form, whose y row carries 0.621447744f. */
+inline void rt_la_cie_cat16_xyz(float* x, float* y, float* z, const float r,
+                                const float g, const float b)
+{
+    *x = 1.86206786f * r - 1.01125463f * g + 0.14918677f * b;
+    *y = 0.38752654f * r + 0.621447744f * g - 0.00897398f * b;
+    *z = -0.0158415f * r - 0.03412294f * g + 1.04996444f * b;
+}
+
+/*
+ * opthelper.h pow_F(a, b) = xexpf(b * xlogf(a)). The block's per-pixel loop
+ * calls the SIMD form, whose xexpf evaluates `1 + (s * s) * u + s`; the shared
+ * rt_lr_pow_F port keeps the scalar grouping `s * (s * u + 1) + 1`, which
+ * rounds differently in the last bit. The CAM16 chain amplifies that
+ * difference through the chroma and saturation sliders, so this program uses
+ * the vector grouping.
+ */
+inline float rt_la_cie_pow(const float a, const float b)
+{
+    const float d = b * rt_lr_xlogf(a);
+    const int q = rt_lr_xrintf(d * RT_LR_RLN2);
+    float s = (float)q * -RT_LR_L2Uf + d;
+    s = (float)q * -RT_LR_L2Lf + s;
+
+    float u = 0.00136324646882712841033936f;
+    u = u * s + 0.00836596917361021041870117f;
+    u = u * s + 0.0416710823774337768554688f;
+    u = u * s + 0.166665524244308471679688f;
+    u = u * s + 0.499999850988388061523438f;
+
+    u = 1.0f + ((s * s) * u + s);
+    return rt_lr_ldexpkf(u, q);
+}
+
+inline float rt_la_cie_nonlin(const float c, const float fl)
+{
+    if (c < 0.0f) {
+        const float p = rt_la_cie_pow((-1.0f * fl * c) / 100.0f, 0.42f);
+        return ((-1.0f * 400.0f * p) / (27.13f + p)) + 0.1f;
+    }
+    const float p = rt_la_cie_pow((fl * c) / 100.0f, 0.42f);
+    return ((400.0f * p) / (27.13f + p)) + 0.1f;
+}
+
+inline float rt_la_cie_inv_nonlin(float c, float fl)
+{
+    c -= 0.1f;
+    if (c < 0.0f) {
+        fl *= -1.0f;
+        if (c < -399.99f) {
+            c = -399.99f;
+        }
+    } else if (c > 399.99f) {
+        c = 399.99f;
+    }
+    return (100.0f / fl) * rt_la_cie_pow(
+                                (27.13f * fabs(c)) / (400.0f - fabs(c)),
+                                2.38095238f);
+}
+
+inline float rt_la_cie_sign(const float x)
+{
+    return (x > 0.0f) - (x < 0.0f);
+}
+
+inline void rt_la_cie_calc_ab(float* aa, float* bb, const float h,
+                              const float e, const float t, const float nbb,
+                              const float a)
+{
+    const float2 sincosval =
+        rt_lt_xsincosf((h * RT_LA_PI_F) / 180.0f);
+    float sinh = sincosval.x;
+    float cosh = sincosval.y;
+    const float x = (a / nbb) + 0.305f;
+    const float p3 = 1.05f;
+    const bool swapValues = fabs(sinh) > fabs(cosh);
+    if (swapValues) {
+        const float tmp = sinh;
+        sinh = cosh;
+        cosh = tmp;
+    }
+    float c1 = 1.0f;
+    float c2 = sinh / cosh;
+    if (swapValues) {
+        const float tmp = c1;
+        c1 = c2;
+        c2 = tmp;
+    }
+    float div = ((e / (t * cosh)) -
+                 (-0.31362f - (p3 * 0.15681f)) * c1 -
+                 ((0.01924f - (p3 * 4.49038f)) * c2));
+    if (rt_la_cie_sign(div) != rt_la_cie_sign(cosh) ||
+        fabs(div) <= fabs(cosh) * 2.0f) {
+        div = cosh * 2.0f;
+    }
+    *aa = ((0.32787f * x) * (2.0f + p3)) / div;
+    *bb = (*aa * sinh) / cosh;
+    if (swapValues) {
+        const float tmp = *aa;
+        *aa = *bb;
+        *bb = tmp;
+    }
+}
+
+inline void rt_la_cie_aab_to_rgb(float* r, float* g, float* b, const float A,
+                                 const float aa, const float bb,
+                                 const float nbb)
+{
+    const float x = (A / nbb) + 0.305f;
+    *r = (0.32787f * x) + (0.32145f * aa) + (0.20527f * bb);
+    *g = (0.32787f * x) - (0.63507f * aa) - (0.18603f * bb);
+    *b = (0.32787f * x) - (0.15681f * aa) - (4.49038f * bb);
+}
+
+inline void rt_la_cie_xyz2jchqms(float* J, float* C, float* h, float* Q,
+                                 float* M, float* s, const float aw,
+                                 const float fl, const float wh,
+                                 const float x, const float y,
+                                 const float z, const float xw,
+                                 const float yw, const float zw,
+                                 const float c, const float nc,
+                                 const float pow1, const float nbb,
+                                 const float ncb, const float pfl,
+                                 const float cz, const float d)
+{
+    float r, g, b;
+    float rw, gw, bw;
+    rt_la_cie_xyz_cat16(&r, &g, &b, x, y, z);
+    rt_la_cie_xyz_cat16(&rw, &gw, &bw, xw, yw, zw);
+    const float rc = r * (((yw * d) / rw) + (1.0f - d));
+    const float gc = g * (((yw * d) / gw) + (1.0f - d));
+    const float bc = b * (((yw * d) / bw) + (1.0f - d));
+    /* cat02_to_hpefloat() is the identity for CAT16. */
+    float rp = fmax(rc, 0.0f);
+    float gp = fmax(gc, 0.0f);
+    float bp = fmax(bc, 0.0f);
+    const float rpa = rt_la_cie_nonlin(rp, fl);
+    const float gpa = rt_la_cie_nonlin(gp, fl);
+    const float bpa = rt_la_cie_nonlin(bp, fl);
+    const float ca = rpa - ((12.0f * gpa) - bpa) / 11.0f;
+    const float cb = (0.11111111f) * (rpa + gpa - (2.0f * bpa));
+    float myh = rt_lt_xatan2f(cb, ca);
+    if (myh < 0.0f) {
+        myh += 2.0f * RT_LA_PI_F;
+    }
+    float a = ((2.0f * rpa) + gpa + (0.05f * bpa) - 0.305f) * nbb;
+    a = fmax(a, 0.0f);
+    *J = rt_la_cie_pow(a / aw, c * cz * 0.5f);
+    const float e =
+        ((961.53846f) * nc * ncb) *
+        (rt_lt_xsincosf(myh + 2.0f).y + 3.8f);
+    const float t =
+        (e * sqrt((ca * ca) + (cb * cb))) / (rpa + gpa + (1.05f * bpa));
+    *C = rt_la_cie_pow(t, 0.9f) * (*J) * pow1;
+    *Q = wh * (*J);
+    *J *= (*J) * 100.0f;
+    *M = (*C) * pfl;
+    *Q = fmax(*Q, 0.0001f);
+    *s = 100.0f * sqrt((*M) / (*Q));
+    *h = (myh * 180.0f) / RT_LA_PI_F;
+}
+
+inline void rt_la_cie_jch2xyz(float* x, float* y, float* z, const float J,
+                              const float C, const float h, const float xw,
+                              const float yw, const float zw, const float nc,
+                              const float pow1, const float nbb,
+                              const float ncb, const float fl, const float d,
+                              const float aw, const float reccmcz)
+{
+    float rw, gw, bw;
+    rt_la_cie_xyz_cat16(&rw, &gw, &bw, xw, yw, zw);
+    const float e =
+        ((961.53846f) * nc * ncb) *
+        (rt_lt_xsincosf(((h * RT_LA_PI_F) / 180.0f) + 2.0f).y + 3.8f);
+    const float a = rt_la_cie_pow(J / 100.0f, reccmcz) * aw;
+    const float t =
+        rt_la_cie_pow((10.0f * C) / (sqrt(J) * pow1), 1.1111111f);
+    float ca, cb;
+    rt_la_cie_calc_ab(&ca, &cb, h, e, t, nbb, a);
+    float rpa, gpa, bpa;
+    rt_la_cie_aab_to_rgb(&rpa, &gpa, &bpa, a, ca, cb, nbb);
+    float rp = rt_la_cie_inv_nonlin(rpa, fl);
+    float gp = rt_la_cie_inv_nonlin(gpa, fl);
+    float bp = rt_la_cie_inv_nonlin(bpa, fl);
+    const float r = rp / (((yw * d) / rw) + (1.0f - d));
+    const float g = gp / (((yw * d) / gw) + (1.0f - d));
+    const float b = bp / (((yw * d) / bw) + (1.0f - d));
+    rt_la_cie_cat16_xyz(x, y, z, r, g, b);
+}
+
+/* Ciecam02::curvecolorfloat(). */
+inline float rt_la_cie_curve_color(const float satind, const float satval,
+                                   const float parsat)
+{
+    float sres;
+    if (satind > 0.0f) {
+        if (satval >= 1.0f) {
+            sres = satval;
+        } else {
+            const float one = 1.0f - fmin(satval, 1.0f);
+            const float pow4 = one * one * one * one;
+            sres = (1.0f - satind / 100.0f) * satval +
+                   (satind / 100.0f) * (1.0f - pow4);
+        }
+        if (sres > parsat) {
+            sres = fmax(parsat, satval);
+        }
+    } else if (satind < 0.0f) {
+        sres = satval * (1.0f + satind / 100.0f);
+    } else {
+        sres = satval;
+    }
+    return sres;
+}
+
+/* Color::scalered() and Color::transitred(). */
+inline void rt_la_cie_scalered(const float rstprotection, const float param,
+                               const float limit, const float HH,
+                               const float deltaHH, float* scale,
+                               float* scaleext)
+{
+    if (rstprotection < 99.9999f) {
+        if (param > limit) {
+            *scale = rstprotection / 100.1f;
+        }
+        if (HH < (1.3f + deltaHH) && HH >= 1.3f) {
+            *scaleext = (HH * (1.0f - *scale) + deltaHH -
+                         (1.3f + deltaHH) * (1.0f - *scale)) /
+                        deltaHH;
+        } else if (HH < 0.15f && HH > (0.15f - deltaHH)) {
+            *scaleext = (HH * (*scale - 1.0f) + deltaHH -
+                         (0.15f - deltaHH) * (*scale - 1.0f)) /
+                        deltaHH;
+        }
+    }
+}
+
+inline void rt_la_cie_transitred(const float HH, const float Chprov1,
+                                 const float dred, const float factorskin,
+                                 const float protect_red,
+                                 const float factorskinext,
+                                 const float deltaHH,
+                                 const float factorsat, float* factor)
+{
+    if (HH >= 0.15f && HH < 1.3f) {
+        if (Chprov1 < dred) {
+            *factor = factorskin;
+        } else if (Chprov1 < (dred + protect_red)) {
+            *factor = ((factorsat - factorskin) * Chprov1 +
+                       factorsat * protect_red -
+                       (dred + protect_red) * (factorsat - factorskin)) /
+                      protect_red;
+        }
+    } else if (HH > (0.15f - deltaHH) && HH < (1.3f + deltaHH)) {
+        if (Chprov1 < dred) {
+            *factor = factorskinext;
+        } else if (Chprov1 < (dred + protect_red)) {
+            *factor = ((factorsat - factorskinext) * Chprov1 +
+                       factorsat * protect_red -
+                       (dred + protect_red) * (factorsat - factorskinext)) /
+                      protect_red;
+        }
+    }
+}
+
+/* Color::skinredfloat(). `s` is the value the caller passes and receives. */
+inline float rt_la_cie_skinred(const float J, const float h, const float sres,
+                               const float Sp, float dred,
+                               float protect_red, const int sk,
+                               const float rstprotection, const float ko,
+                               const float s)
+{
+    float result = s;
+    float HH = 0.0f;
+    bool doskin = false;
+    if (h > 8.6f && h <= 74.0f) {
+        HH = (1.15f / 65.4f) * h - 0.0012f;
+        doskin = true;
+    } else if (h > 0.0f && h <= 8.6f) {
+        HH = (0.19f / 8.6f) * h - 0.04f;
+        doskin = true;
+    } else if (h > 355.0f && h <= 360.0f) {
+        HH = (0.11f / 5.0f) * h - 7.96f;
+        doskin = true;
+    } else if (h > 74.0f && h < 95.0f) {
+        HH = (0.30f / 21.0f) * h + 0.24285f;
+        doskin = true;
+    }
+    if (doskin) {
+        const float deltaHH = 0.3f;
+        const float chromapro = sres / Sp;
+        if (sk == 1) {
+            if (J < 16.0f) {
+                dred = 40.0f;
+            } else if (J < 22.0f) {
+                dred = 2.5f * J;
+            } else if (J < 60.0f) {
+                dred = 55.0f;
+            } else if (J < 70.0f) {
+                dred = 145.0f - 1.5f * J;
+            } else {
+                dred = 40.0f;
+            }
+        }
+        float factorskin;
+        float factorskinext;
+        if (chromapro > 1.0f) {
+            float scale = 0.999000999f;
+            float scaleext = 1.0f;
+            rt_la_cie_scalered(rstprotection, chromapro, 0.0f, HH, deltaHH,
+                               &scale, &scaleext);
+            const float interm = chromapro - 1.0f;
+            factorskin = 1.0f + (interm * scale);
+            factorskinext = 1.0f + (interm * scaleext);
+        } else {
+            factorskin = chromapro;
+            factorskinext = chromapro;
+        }
+        float factor = chromapro;
+        rt_la_cie_transitred(HH, result, dred, factorskin, protect_red,
+                             factorskinext, deltaHH, chromapro, &factor);
+        result *= factor;
+    } else {
+        result = ko * sres;
+    }
+    return result;
+}
+
+/*
+ * The CIE CAM pass: the ROI copy `work` is the block's bufexpfin (a copy of
+ * the image as the earlier tools left it), transformed in place. The launcher
+ * then blends it over the image with transit_shapedetect2()'s senstype-31
+ * arm.
+ */
+__kernel void rt_local_adjustments_cie(__global float* work,
+                                       __global const float* rec,
+                                       __global const float* luts,
+                                       __global const double* ws_double,
+                                       __global const double* iws_double,
+                                       __global const float* cachef,
+                                       __global const float* cachefy,
+                                       const int width, const int height,
+                                       const int pitch, const int plane)
+{
+    const int x = (int)get_global_id(0);
+    const int y = (int)get_global_id(1);
+    if (x >= width || y >= height) {
+        return;
+    }
+    const int offset = y * pitch + x;
+    const float origL = work[offset];
+    const float origA = work[plane + offset];
+    const float origB = work[2 * plane + offset];
+
+    float X, Y, Z;
+    rt_lt_lab2xyz(origL, origA, origB, &X, &Y, &Z);
+
+    const float c = rec[RT_LA_CIE_C];
+    const float nc = rec[RT_LA_CIE_NC];
+    const float aw = rec[RT_LA_CIE_AW];
+    const float fl = rec[RT_LA_CIE_FL];
+    const float wh = rec[RT_LA_CIE_WH];
+    const float nbb = rec[RT_LA_CIE_NBB];
+    const float ncb = rec[RT_LA_CIE_NCB];
+    const float cz = rec[RT_LA_CIE_CZ];
+    const float d = rec[RT_LA_CIE_D];
+    const float pow1 = rec[RT_LA_CIE_POW1];
+    const float pfl = rec[RT_LA_CIE_PFL];
+    const float coefQ = rec[RT_LA_CIE_COEFQ];
+    const float qpro = rec[RT_LA_CIE_QPRO];
+
+    float J, C, h, Q, M, s;
+    rt_la_cie_xyz2jchqms(&J, &C, &h, &Q, &M, &s, aw, fl, wh,
+                         X / 655.35f, Y / 655.35f, Z / 655.35f,
+                         rec[RT_LA_CIE_XW1], rec[RT_LA_CIE_YW1],
+                         rec[RT_LA_CIE_ZW1], c, nc, pow1, nbb, ncb, pfl,
+                         cz, d);
+
+    float Jpro = J;
+    float Cpro = C;
+    float hpro = h;
+    float Qpro = Q;
+    float Mpro = M;
+    float spro = s;
+
+    /* The per-hue brightness sliders are at their defaults, so only the
+     * block's chroma/colourfulness recomputation runs. */
+    if ((hpro > 340.0f && hpro <= 360.0f) ||
+        (hpro > 0.0f && hpro <= 100.0f)) {
+        hpro = hpro + RT_LA_CIE_HUE_ATTENUATION * rec[RT_LA_CIE_HUERED];
+        spro = spro * (1.0f + rec[RT_LA_CIE_SCHRRED] / 100.0f);
+        const float Cp = (spro * spro * Qpro) / (1000000.0f);
+        Mpro = (spro * spro * Qpro) / 10000.0f;
+        Cpro = Cp * 100.0f;
+        if (hpro < 0.0f) {
+            hpro += 360.0f;
+        }
+    }
+    if (hpro > 100.0f && hpro <= 190.0f) {
+        hpro = hpro + RT_LA_CIE_HUE_ATTENUATION * rec[RT_LA_CIE_HUEGREEN];
+        spro = spro * (1.0f + rec[RT_LA_CIE_SCHRGREEN] / 100.0f);
+        const float Cp = (spro * spro * Qpro) / (1000000.0f);
+        Mpro = (spro * spro * Qpro) / 10000.0f;
+        Cpro = Cp * 100.0f;
+        if (hpro < 0.0f) {
+            hpro += 360.0f;
+        }
+    }
+    if (hpro > 190.0f && hpro <= 340.0f) {
+        hpro = hpro + RT_LA_CIE_HUE_ATTENUATION * rec[RT_LA_CIE_HUEBLUE];
+        spro = spro * (1.0f + rec[RT_LA_CIE_SCHRBLUE] / 100.0f);
+        const float Cp = (spro * spro * Qpro) / (1000000.0f);
+        Mpro = (spro * spro * Qpro) / 10000.0f;
+        Cpro = Cp * 100.0f;
+        if (hpro < 0.0f) {
+            hpro += 360.0f;
+        }
+    }
+
+    const float mchr = rec[RT_LA_CIE_MCHR];
+    const float schr = rec[RT_LA_CIE_SCHR];
+    const float cchr = rec[RT_LA_CIE_CCHR];
+    const float hue = rec[RT_LA_CIE_HUE];
+    const float rstprotect = rec[RT_LA_CIE_RSTPROTECT];
+    const float coe = rec[RT_LA_CIE_COE];
+
+    Qpro = rt_lt_lut(luts + (int)rec[RT_LA_CIE_CAMQ_OFFSET],
+                     RT_LA_CIE_CAM_ENTRIES, Qpro * coefQ) / coefQ;
+
+    const float Mp = Mpro / 100.0f;
+    float sres = rt_la_cie_curve_color(mchr, Mp, 2.5f);
+    Mpro = rt_la_cie_skinred(Jpro, hpro, sres, Mp, 100.0f * coe,
+                             80.0f * coe, 0, rstprotect, 100.0f, Mpro);
+    Jpro = (10.0f * Qpro) / wh;
+    Jpro *= Jpro;
+    Qpro = (Qpro == 0.0f ? RT_LA_CIE_EPSIL : Qpro);
+    spro = 100.0f * sqrt(Mpro / Qpro);
+    Jpro = rt_lt_lut(luts + (int)rec[RT_LA_CIE_CAMJ_OFFSET],
+                     RT_LA_CIE_CAM_ENTRIES, Jpro * 327.68f);
+    const float Sp = spro / 100.0f;
+    sres = rt_la_cie_curve_color(schr, Sp, 1.5f);
+    spro = rt_la_cie_skinred(
+        Jpro, hpro, sres, Sp, 100.0f * sqrt((100.0f * coe) / Q),
+        100.0f * sqrt((80.0f * coe) / Q), 0, rstprotect, 100.0f, spro);
+    Qpro = qpro * sqrt(Jpro);
+    const float Cp = (spro * spro * Qpro) / 1000000.0f;
+    Cpro = Cp * 100.0f;
+    sres = rt_la_cie_curve_color(cchr, Cp, 1.8f);
+    Cpro = rt_la_cie_skinred(Jpro, hpro, sres, Cp, 55.0f, 30.0f, 1,
+                             rstprotect, 100.0f, Cpro);
+    hpro = hpro + hue;
+    if (hpro < 0.0f) {
+        hpro += 360.0f;
+    }
+
+    float xx, yy, zz;
+    rt_la_cie_jch2xyz(&xx, &yy, &zz, Jpro, Cpro, hpro,
+                      rec[RT_LA_CIE_XW2], rec[RT_LA_CIE_YW2],
+                      rec[RT_LA_CIE_ZW2], rec[RT_LA_CIE_NC2],
+                      rec[RT_LA_CIE_POW1N], rec[RT_LA_CIE_NBBJ],
+                      rec[RT_LA_CIE_NCBJ], rec[RT_LA_CIE_FLJ],
+                      rec[RT_LA_CIE_DJ], rec[RT_LA_CIE_AWJ],
+                      rec[RT_LA_CIE_RECCMCZ]);
+    const float outX = fmin(fmax(xx * 655.35f, 0.0f), 65535.0f);
+    const float outY = fmin(fmax(yy * 655.35f, 0.0f), 65535.0f);
+    const float outZ = fmin(fmax(zz * 655.35f, 0.0f), 65535.0f);
+    float L, a, b;
+    rt_lt_xyz2lab(outX, outY, outZ, cachef, cachefy, &L, &a, &b);
+
+    /* The block's recovery blend: `intp(repart, original, result)`. */
+    const float repart = rec[RT_LA_CIE_REPART];
+    L = rt_lt_intp(repart, origL, L);
+    a = rt_lt_intp(repart, origA, a);
+    b = rt_lt_intp(repart, origB, b);
+
+    /* The final gain and gamut round trip at its neutral settings: Lab to
+     * XYZ, XYZ to RGB through the inverse matrix, back through the working
+     * matrix, and XYZ to Lab. The host evaluates both products in double. */
+    float rx, ry, rz;
+    rt_lt_lab2xyz(L, a, b, &rx, &ry, &rz);
+    const float rr = (float)(iws_double[0] * (double)rx +
+                             iws_double[1] * (double)ry +
+                             iws_double[2] * (double)rz);
+    const float gg = (float)(iws_double[3] * (double)rx +
+                             iws_double[4] * (double)ry +
+                             iws_double[5] * (double)rz);
+    const float bb = (float)(iws_double[6] * (double)rx +
+                             iws_double[7] * (double)ry +
+                             iws_double[8] * (double)rz);
+    const float fx = (float)(ws_double[0] * (double)rr +
+                             ws_double[1] * (double)gg +
+                             ws_double[2] * (double)bb);
+    const float fy = (float)(ws_double[3] * (double)rr +
+                             ws_double[4] * (double)gg +
+                             ws_double[5] * (double)bb);
+    const float fz = (float)(ws_double[6] * (double)rr +
+                             ws_double[7] * (double)gg +
+                             ws_double[8] * (double)bb);
+    rt_lt_xyz2lab(fx, fy, fz, cachef, cachefy, &L, &a, &b);
+
+    work[offset] = L;
+    work[plane + offset] = a;
+    work[2 * plane + offset] = b;
 }
 )CLC";
 

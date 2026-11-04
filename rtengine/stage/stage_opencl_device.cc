@@ -12940,6 +12940,8 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
         env, def, "rt_local_adjustments_reti_diff", error);
     cl_kernel reti_blend_kernel = compiled_kernel_entry(
         env, def, "rt_local_adjustments_reti_blend", error);
+    cl_kernel cie_kernel = compiled_kernel_entry(
+        env, def, "rt_local_adjustments_cie", error);
     cl_kernel cbdl_fill_kernel =
         compiled_kernel_entry(env, def, "rt_local_adjustments_cbdl_fill",
                               error);
@@ -12997,6 +12999,7 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
         reti_prepare_kernel == nullptr || reti_accum_kernel == nullptr ||
         reti_stats_kernel == nullptr || reti_gain_kernel == nullptr ||
         reti_diff_kernel == nullptr || reti_blend_kernel == nullptr ||
+        cie_kernel == nullptr ||
         cbdl_fill_kernel == nullptr || cbdl_copy_kernel == nullptr ||
         cbdl_finish_kernel == nullptr || cbdl_metric_kernel == nullptr ||
         cbdl_luma_kernel == nullptr || cbdl_chroma_kernel == nullptr ||
@@ -13142,6 +13145,7 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
     char ws_key = 0;
     char iws_key = 0;
     char ws_double_key = 0;
+    char iws_double_key = 0;
     char cachef_key = 0;
     char cachefy_key = 0;
     char gamma_srgb_key = 0;
@@ -13151,6 +13155,7 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
     StageDeviceBufferPtr ws_device;
     StageDeviceBufferPtr iws_device;
     StageDeviceBufferPtr ws_double_device;
+    StageDeviceBufferPtr iws_double_device;
     StageDeviceBufferPtr cachef_device;
     StageDeviceBufferPtr cachefy_device;
     StageDeviceBufferPtr gamma_srgb_device;
@@ -13391,6 +13396,8 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
             rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXP_TONEMAP] == 1.0f;
         const bool retinexPass =
             rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXP_RETINEX] == 1.0f;
+        const bool ciePass =
+            rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXP_CIE] == 1.0f;
         const uint32_t shape =
             static_cast<uint32_t>(rec[RT_LOCAL_ADJUSTMENTS_SLOT_SHAPE]);
         const uint32_t avoid = static_cast<uint32_t>(
@@ -13420,6 +13427,7 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
              !toneMapPass) ||
             (rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXP_RETINEX] != 0.0f &&
              !retinexPass) ||
+            (rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXP_CIE] != 0.0f && !ciePass) ||
             (rec[RT_LOCAL_ADJUSTMENTS_SLOT_MERGE] != 0.0f) ||
             (rec[RT_LOCAL_ADJUSTMENTS_SLOT_HRENABLED] != 0.0f) ||
             (rec[RT_LOCAL_ADJUSTMENTS_SLOT_REPARCOL] != 100.0f) ||
@@ -13436,7 +13444,7 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
             (!active && (colour || vibrance || localContrast ||
                          shadowsHighlights || softLight || cbdl ||
                          dehazePass || logPass || sharpenPass || blurPass ||
-                         toneMapPass || islocal))) {
+                         toneMapPass || ciePass || islocal))) {
             error = "local.adjustments record is outside the supported set";
             return RT_STAGE_FALLBACK;
         }
@@ -13723,6 +13731,11 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
             setup.iir_shadows_highlights->version !=
                 RT_LAB_TOOLS_IIR_VERSION ||
             setup.iir_shadows_highlights->double_path != 0 ||
+            (ciePass &&
+             (setup.iir_cie == nullptr ||
+              setup.iir_cie->size != sizeof(RtLabToolsIir) ||
+              setup.iir_cie->version != RT_LAB_TOOLS_IIR_VERSION ||
+              setup.iir_cie->double_path != 0)) ||
             (blurPass &&
              (setup.iir_blur == nullptr ||
               setup.iir_blur->size != sizeof(RtLabToolsIir) ||
@@ -13824,6 +13837,23 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
                             static_cast<std::size_t>(table.entries) >
                         setup.lut_count) {
                     error = "local.adjustments curve table is out of range";
+                    return RT_STAGE_FALLBACK;
+                }
+            }
+        }
+        if (ciePass) {
+            /* The two CAM16 brightness tables are always present for a CIE
+             * pass; a missing or out-of-range table is not a device
+             * execution. */
+            for (const int slot : {RT_LOCAL_ADJUSTMENTS_SLOT_CIE_CAMJ_OFFSET,
+                                   RT_LOCAL_ADJUSTMENTS_SLOT_CIE_CAMQ_OFFSET}) {
+                const float offset = rec[slot];
+                if (offset < 0.0f ||
+                    static_cast<std::size_t>(offset) +
+                            RT_LOCAL_ADJUSTMENTS_CIE_CAM_ENTRIES >
+                        setup.lut_count) {
+                    error = "local.adjustments CIE brightness table is out "
+                            "of range";
                     return RT_STAGE_FALLBACK;
                 }
             }
@@ -13958,6 +13988,14 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
                         "gate";
                 return RT_STAGE_FALLBACK;
             }
+            /* The block's CIE CAM "com" arm needs mSP = 5 px on both axes; a
+             * smaller ROI skips the whole block. */
+            if (ciePass &&
+                (bfw < RT_LOCAL_ADJUSTMENTS_CIE_MIN_ROI ||
+                 bfh < RT_LOCAL_ADJUSTMENTS_CIE_MIN_ROI)) {
+                error = "local.adjustments CIE ROI is below the block's gate";
+                return RT_STAGE_FALLBACK;
+            }
             if (retinexPass) {
                 const int stages = static_cast<int>(
                     rec[RT_LOCAL_ADJUSTMENTS_SLOT_RETI_BLUR_STAGES]);
@@ -14046,6 +14084,36 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
                 }
                 ws_double_device = matrix;
             }
+            if (setup.iws_double == nullptr) {
+                error = "local.adjustments needs the double inverse matrix";
+                return RT_STAGE_FALLBACK;
+            }
+            {
+                StageDeviceBufferPtr matrix = residency->acquire(
+                    &iws_double_key,
+                    StageBufferShape{RT_STAGE_F32, 18, 1, 1}, &error);
+                if (!matrix) {
+                    error = "local.adjustments double inverse matrix "
+                            "allocation failed";
+                    return RT_STAGE_FALLBACK;
+                }
+                RtStageBuffer host{};
+                host.size = sizeof(RtStageBuffer);
+                host.data = const_cast<double*>(setup.iws_double);
+                host.width = 18;
+                host.height = 1;
+                host.row_pitch = 18u * sizeof(float);
+                host.plane_pitch = host.row_pitch;
+                host.planes = 1;
+                host.format = RT_STAGE_F32;
+                host.flags = RT_STAGE_BUFFER_READ;
+                if (residency->upload(matrix, host) != RT_STAGE_OK) {
+                    error = "local.adjustments double inverse matrix "
+                            "upload failed";
+                    return RT_STAGE_FALLBACK;
+                }
+                iws_double_device = matrix;
+            }
             cachef_device = upload_table(setup.cachef,
                                          RT_LAB_TOOLS_CACHE_ENTRIES,
                                          &cachef_key, "cachef");
@@ -14068,6 +14136,7 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
                 setup.munsell_sizes, RT_LAB_TOOLS_MUNSELL_TABLES,
                 &munsell_sizes_key, "Munsell sizes");
             if (!ws_device || !iws_device || !ws_double_device ||
+                !iws_double_device ||
                 !cachef_device || !cachefy_device || !gamma_srgb_device ||
                 !igamma_srgb_device || !munsell_device ||
                 !munsell_sizes_device) {
@@ -17946,6 +18015,64 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
                                      static_cast<std::size_t>(bfh),
                                      "colour apply")) {
                     error = "local.adjustments colour apply failed";
+                    return RT_STAGE_FALLBACK;
+                }
+            }
+
+            /*
+             * CIE CAM. Lab_Local()'s "com" block runs after the common mask
+             * and after every tool, so it is the last pass of the spot. The
+             * ROI copy is the block's bufexpfin, which starts as the image
+             * the earlier tools left; the kernel transforms it in place with
+             * ciecamloc_02float()'s call==0 arm, the block's `repar` recovery
+             * blend and its final gain and gamut round trip. The deltaE
+             * reference is the block's own `(2 + 0.2 * blurciede) / sk`
+             * blur, and the pass is applied by transit_shapedetect2()'s
+             * senstype-31 blend.
+             */
+            if (ciePass) {
+                if (!copy_roi() || !blur_roi(*setup.iir_cie, "CIE blur")) {
+                    return RT_STAGE_FALLBACK;
+                }
+                cl_uint arg = 0;
+                cl_mem record_memory = memory_of(record_device);
+                cl_mem luts_memory = memory_of(luts_device);
+                cl_mem ws_double_memory = memory_of(ws_double_device);
+                cl_mem iws_double_memory = memory_of(iws_double_device);
+                cl_mem cachef_memory = memory_of(cachef_device);
+                cl_mem cachefy_memory = memory_of(cachefy_device);
+                cl_int rw = bfw;
+                cl_int rh = bfh;
+                bool ok = true;
+                ok = ok && set(cie_kernel, arg++, sizeof(cl_mem),
+                               &work_memory);
+                ok = ok && set(cie_kernel, arg++, sizeof(cl_mem),
+                               &record_memory);
+                ok = ok && set(cie_kernel, arg++, sizeof(cl_mem),
+                               &luts_memory);
+                ok = ok && set(cie_kernel, arg++, sizeof(cl_mem),
+                               &ws_double_memory);
+                ok = ok && set(cie_kernel, arg++, sizeof(cl_mem),
+                               &iws_double_memory);
+                ok = ok && set(cie_kernel, arg++, sizeof(cl_mem),
+                               &cachef_memory);
+                ok = ok && set(cie_kernel, arg++, sizeof(cl_mem),
+                               &cachefy_memory);
+                ok = ok && set(cie_kernel, arg++, sizeof(cl_int), &rw);
+                ok = ok && set(cie_kernel, arg++, sizeof(cl_int), &rh);
+                ok = ok && set(cie_kernel, arg++, sizeof(cl_int),
+                               &work_pitch);
+                ok = ok && set(cie_kernel, arg++, sizeof(cl_int),
+                               &work_plane);
+                if (!ok || !launch2d(cie_kernel,
+                                     static_cast<std::size_t>(bfw),
+                                     static_cast<std::size_t>(bfh),
+                                     "CIE CAM")) {
+                    error = "local.adjustments CIE CAM failed";
+                    return RT_STAGE_FALLBACK;
+                }
+                if (!run_blend("CIE CAM",
+                               rec[RT_LOCAL_ADJUSTMENTS_SLOT_CIE_SENS])) {
                     return RT_STAGE_FALLBACK;
                 }
             }

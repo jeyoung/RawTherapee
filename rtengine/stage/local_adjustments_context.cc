@@ -19,7 +19,9 @@
 
 #include "stage/local_adjustments_context.h"
 
+#include "ciecam02.h"
 #include "color.h"
+#include "colortemp.h"
 #include "curves.h"
 #include "dirpyr_equalizer.h"
 #include "gauss.h"
@@ -186,17 +188,184 @@ bool toneMapAdmitted(const procparams::LocallabParams::LocallabSpot& spot)
     return spot.recothrest == 1.0;
 }
 
-/* Every tool other than the eleven this node runs, plus the retinex tool. The
+/* Whether the spot CIE CAM tool's parameters are inside the device set.
+ *
+ * Lab_Local()'s block runs for `expcie && modecie == "com" && lp.activspot`
+ * with an ROI at least mSP on both axes. The device runs ciecamloc_02float()'s
+ * call==0 arm, which is the CAM16 appearance transform between the scene and
+ * viewing conditions, then the block's final gain and gamut round trip and
+ * transit_shapedetect2()'s senstype-31 blend.
+ *
+ * The admitted free sliders are the viewing conditions (source/target grey,
+ * absolute luminance, surround, adaptation temperature) and the acceptance,
+ * lightness, brightness, chroma, saturation, colourfulness, hue and
+ * red-protection amounts. The Jz pre-processing (`modecam == "jz"`), the
+ * pre-CAM RGB tone mapping (`expprecam`), `smoothciemet`, the CIE and per-hue
+ * curves, the contrast sliders (whose brightness tables read the ROI
+ * histogram the host builds after the earlier tools in the same spot),
+ * `detailcie`'s local contrast, the gradient, the final gain and gamut
+ * compression and every mask stay on the host. The plain CAM16 arm is
+ * `pqremapcam16 <= 100`; above it the block selects the CAM16-PQ transform.
+ *
+ * The per-hue brightness curves are FlatCurve fields, so they cannot be run
+ * through diagonalCurveActive(); the Jz curves of that shape are inert because
+ * `modecam` is fixed to `cam16` here. Only the diagonal Jz curves are checked.
+ */
+bool cieAdmitted(const procparams::LocallabParams::LocallabSpot& spot)
+{
+    if (spot.modecie != "com" || spot.modecam != "cam16") {
+        return false;
+    }
+    if (spot.smoothciemet != "none") {
+        return false;
+    }
+    if (spot.sursourcie != "Average" && spot.sursourcie != "Dim" &&
+        spot.sursourcie != "Dark" && spot.sursourcie != "exDark") {
+        return false;
+    }
+    if (spot.surroundcie != "Average" && spot.surroundcie != "Dim" &&
+        spot.surroundcie != "Dark" &&
+        spot.surroundcie != "ExtremelyDark") {
+        return false;
+    }
+    if (!finiteValue(spot.sourceGraycie) ||
+        spot.sourceGraycie < RT_LOCAL_ADJUSTMENTS_CIE_MIN_GRAY ||
+        spot.sourceGraycie > RT_LOCAL_ADJUSTMENTS_CIE_MAX_GRAY) {
+        return false;
+    }
+    if (!finiteValue(spot.targetGraycie) ||
+        spot.targetGraycie < RT_LOCAL_ADJUSTMENTS_CIE_MIN_TARGET_GRAY ||
+        spot.targetGraycie > RT_LOCAL_ADJUSTMENTS_CIE_MAX_TARGET_GRAY) {
+        return false;
+    }
+    for (const double value : {spot.sourceabscie, spot.targabscie}) {
+        if (!finiteValue(value) ||
+            value < RT_LOCAL_ADJUSTMENTS_CIE_MIN_ABS ||
+            value > RT_LOCAL_ADJUSTMENTS_CIE_MAX_ABS) {
+            return false;
+        }
+    }
+    if (!finiteValue(spot.catadcie) ||
+        spot.catadcie < RT_LOCAL_ADJUSTMENTS_CIE_MIN_CATAD ||
+        spot.catadcie > RT_LOCAL_ADJUSTMENTS_CIE_MAX_CATAD) {
+        return false;
+    }
+    for (const double value :
+         {spot.saturlcie, spot.chromlcie, spot.huecie, spot.lightlcie,
+          spot.lightqcie}) {
+        if (!finiteValue(value) ||
+            value < RT_LOCAL_ADJUSTMENTS_CIE_MIN_SLIDER ||
+            value > RT_LOCAL_ADJUSTMENTS_CIE_MAX_SLIDER) {
+            return false;
+        }
+    }
+    if (!finiteValue(spot.rstprotectcie) ||
+        spot.rstprotectcie < RT_LOCAL_ADJUSTMENTS_CIE_MIN_PROTECT ||
+        spot.rstprotectcie > RT_LOCAL_ADJUSTMENTS_CIE_MAX_PROTECT) {
+        return false;
+    }
+    if (!finiteValue(spot.reparcie) ||
+        spot.reparcie < RT_LOCAL_ADJUSTMENTS_CIE_MIN_REPART ||
+        spot.reparcie > RT_LOCAL_ADJUSTMENTS_CIE_MAX_REPART) {
+        return false;
+    }
+    if (!finiteValue(spot.blurciede) ||
+        spot.blurciede < RT_LOCAL_ADJUSTMENTS_CIE_MIN_BLUR ||
+        spot.blurciede > RT_LOCAL_ADJUSTMENTS_CIE_MAX_BLUR) {
+        return false;
+    }
+    if (spot.sensicie < RT_LOCAL_ADJUSTMENTS_CIE_MIN_SENS ||
+        spot.sensicie > RT_LOCAL_ADJUSTMENTS_CIE_MAX_SENS) {
+        return false;
+    }
+    if (!finiteValue(spot.pqremapcam16) ||
+        spot.pqremapcam16 > RT_LOCAL_ADJUSTMENTS_CIE_MAX_PLUM) {
+        return false;
+    }
+    /* The contrast sliders' tables read the ROI histogram, which depends on
+     * the earlier tools of the same spot. */
+    if (spot.contlcie != 0.0 || spot.contqcie != 0.0 ||
+        spot.contthrescie != 0.0) {
+        return false;
+    }
+    /* The per-hue brightness sliders and curves. */
+    if (spot.colorhred != 0.0 || spot.schromared != 0.0 ||
+        spot.colorhgreen != 0.0 || spot.schromagreen != 0.0 ||
+        spot.colorhblue != 0.0 || spot.schromablue != 0.0 ||
+        spot.thrhjzcie != 60.0 || spot.brighthres != 5.0 ||
+        diagonalCurveActive(spot.redcurve) ||
+        diagonalCurveActive(spot.greencurve) ||
+        diagonalCurveActive(spot.bluecurve)) {
+        return false;
+    }
+    /* The CIE tone curves and their methods. */
+    if (spot.toneMethodcie != "one" || spot.toneMethodcie2 != "onec" ||
+        diagonalCurveActive(spot.ciecurve) ||
+        diagonalCurveActive(spot.ciecurve2)) {
+        return false;
+    }
+    /* The Jz pre-processing and its curves. */
+    if (spot.expprecam || spot.ciecam || spot.logcie || spot.logcieq ||
+        spot.logjz || spot.sigjz || spot.sigjz12 || spot.forcebw ||
+        spot.qtoj || spot.sigybjz12 || !spot.chjzcie ||
+        spot.detailcie != 0.0 || spot.bwcie || spot.strgradcie != 0.0 ||
+        spot.midtcie != 0 || spot.comprcieauto || spot.gamgain != 0.0 ||
+        spot.gamutw != "none" ||
+        diagonalCurveActive(spot.jzcurve) ||
+        diagonalCurveActive(spot.czcurve) ||
+        diagonalCurveActive(spot.czjzcurve)) {
+        return false;
+    }
+    /* The Q/J sigmoid arms and the normalisation they gate. */
+    if (spot.sigq || spot.sigq12 || spot.comprcie != 0.4 ||
+        spot.modeQJ != "512" || spot.bwevMethod != "sig" ||
+        spot.bwevMethod12 != "slop" || spot.sigmoidldacie != 0.5 ||
+        spot.sigmoidthcie != 1.2 || spot.sigmoidblcie != 0.75 ||
+        spot.sigmoidsenscie != 0.9 || spot.sigmoidldacie12 != 1.8 ||
+        spot.sigmoidthcie12 != 0.0 || spot.sigmoidblcie12 != 100.0 ||
+        spot.sigcie != true || spot.normcie != true ||
+        spot.normcie12 != false || spot.smoothcie || spot.smoothcietrc ||
+        spot.smoothcieyb || spot.smoothcielum || spot.smoothcieinv ||
+        spot.smoothjcie != 0.0 || spot.smoothcieth != 1.0 ||
+        spot.smoothciethtrc != 0.0) {
+        return false;
+    }
+    /* The mask parameters and the recovery mask. Any mask blur at or above
+     * 0.25 with the FFT switch on takes optfft() even when no mask is drawn,
+     * so both stay at their defaults. `visicie` is the UI panel flag and is
+     * not read by the block; the mask display itself is a runtime argument. */
+    if (!spot.fftcieMask || spot.recothrescie != 1.0 ||
+        spot.lowthrescie != 12.0 || spot.higthrescie != 85.0 ||
+        spot.decaycie != 2.0 || spot.contcie != 0.0 ||
+        spot.blurcie != 0.2 || spot.lumask != 10 || spot.scopemask != 60 ||
+        spot.toolcie || !spot.deltae || !spot.laplac ||
+        spot.strumaskcie != 0.0 || spot.radmaskcie != 0.0 ||
+        spot.chromaskcie != 0.0 || spot.lapmaskcie != 0.0 ||
+        spot.gammaskcie != 1.0 || spot.slomaskcie != 0.0 ||
+        spot.blendmaskcie != 0 || spot.highmaskcie != 0.0 ||
+        spot.shadmaskcie != 0.0) {
+        return false;
+    }
+    /* The camera primaries and CAT matrices feed the Jz pre-processing only;
+     * a non-default value here would be silent profile data. */
+    return spot.illMethod == "d65" && spot.primMethod == "rec" &&
+           spot.catMethod == "brad" && spot.whitescie == 20 &&
+           spot.blackscie == 0 && spot.refi == 0.0 &&
+           spot.shiftxl == 0.0 && spot.shiftyl == 0.0 &&
+           spot.pqremap == 120.0 && spot.adapjzcie == 4.0 &&
+           spot.jz100 == 0.25;
+}
+
+/* Every tool other than the twelve this node runs, plus the retinex tool. The
  * exposure tool also decides the clamp arm; it is a residual here. Local
  * dehaze is not a tool of its own: Lab_Local() gates it on the retinex
  * enable, so expreti is accepted only when the retinex strength is zero
  * (dehazeAdmitted() checks that) and is otherwise a residual. Tone mapping is
- * admitted through toneMapAdmitted(). */
+ * admitted through toneMapAdmitted() and CIE CAM through cieAdmitted(). */
 bool otherToolEnabled(const procparams::LocallabParams::LocallabSpot& spot)
 {
-    return spot.expexpose ||
-           spot.expmask || spot.expcie ||
-           spot.expprecam;
+    return spot.expexpose || spot.expmask ||
+           (spot.expcie && !cieAdmitted(spot)) || spot.expprecam;
 }
 
 /* Whether the local log-encoding tool's parameters are inside the device set.
@@ -1006,7 +1175,7 @@ bool localAdjustmentsSupported(const procparams::ProcParams& params)
             spot.transitgrad < -10.0 || spot.transitgrad > 10.0) {
             return false;
         }
-        /* An active spot runs at least one of the nine tools in the device
+        /* An active spot runs at least one of the ten tools in the device
          * set, plus the local dehaze pass when the retinex enable exposes it;
          * an inactive spot does no work, so its tool settings are inert and
          * admitted. */
@@ -1018,7 +1187,7 @@ bool localAdjustmentsSupported(const procparams::ProcParams& params)
             if ((!spot.expcolor && !spot.expvibrance && !spot.expcontrast &&
                  !spot.expshadhigh && !spot.expsoft && !spot.expcbdl &&
                  !spot.explog && !spot.expsharp && !spot.expblur &&
-                 !spot.exptonemap && !dehaze && !retinex) ||
+                 !spot.exptonemap && !spot.expcie && !dehaze && !retinex) ||
                 otherToolEnabled(spot)) {
                 return false;
             }
@@ -1700,6 +1869,7 @@ int LocalAdjustmentsContext::build(int spot, const RtStageBuffer* lab,
                 ws_[row * 3 + col] = static_cast<float>(ws[row][col]);
                 wsDouble_[row * 3 + col] = ws[row][col];
                 iws_[row * 3 + col] = static_cast<float>(iws[row][col]);
+                iwsDouble_[row * 3 + col] = iws[row][col];
             }
         }
 
@@ -2252,6 +2422,242 @@ int LocalAdjustmentsContext::build(int spot, const RtStageBuffer* lab,
         (retiScale == 1 ? 0.015f : 0.03f) * lp.str;
 
     /*
+     * CIE CAM. Lab_Local()'s "com" block runs ciecamloc_02float()'s call==0
+     * arm when the tool is on, the spot is active and every explicit mask is
+     * idle; the predicate has narrowed the mode, the curves, the Jz
+     * pre-processing and the contrast sliders. Every viewing-condition scalar
+     * is built here with the block's own arithmetic, including
+     * ColorTemp::temp2mulxyz() and initcam1float()/initcam2float(). The two
+     * brightness tables depend only on the admitted light sliders, so the
+     * host builds them with curveJfloat() exactly as the block does.
+     */
+    const bool cieRun = profileSpot.expcie && lp.activspot;
+    if (cieRun && ipf_.getScale() != 1.0) {
+        return 1;
+    }
+    float cieC = 1.0f;
+    float cieNc = 1.0f;
+    float cieAw = 0.0f;
+    float cieFl = 0.0f;
+    float cieWh = 0.0f;
+    float cieNbb = 0.0f;
+    float cieNcb = 0.0f;
+    float cieCz = 0.0f;
+    float cieD = 0.0f;
+    float ciePow1 = 0.0f;
+    float ciePow1n = 0.0f;
+    float cieCoefQ = 1.0f;
+    float cieQpro = 1.0f;
+    float ciePfl = 1.0f;
+    float ciePlum = 1.0f;
+    float cieXw1 = 100.0f;
+    float cieYw1 = 100.0f;
+    float cieZw1 = 100.0f;
+    float cieXw2 = 100.0f;
+    float cieYw2 = 100.0f;
+    float cieZw2 = 100.0f;
+    float cieC2 = 1.0f;
+    float cieNc2 = 1.0f;
+    float cieAwj = 0.0f;
+    float cieFlj = 0.0f;
+    float cieNbbj = 0.0f;
+    float cieNcbj = 0.0f;
+    float cieCzj = 0.0f;
+    float cieDj = 0.0f;
+    float cieReccmcz = 1.0f;
+    float cieCoe = 1.0f;
+    float cieMchr = 0.0f;
+    float cieSchr = 0.0f;
+    float cieCchr = 0.0f;
+    float cieHue = 0.0f;
+    float cieRstprotect = 0.0f;
+    float cieSens = static_cast<float>(lp.sensicie);
+    float cieRepart =
+        1.0f - 0.01f * static_cast<float>(profileSpot.reparcie);
+    float cieHuered = 0.0f;
+    float cieSchrred = 0.0f;
+    float cieHuegreen = 0.0f;
+    float cieSchrgreen = 0.0f;
+    float cieHueblue = 0.0f;
+    float cieSchrblue = 0.0f;
+    float cieCamJOffset = RT_LOCAL_ADJUSTMENTS_NO_LUT;
+    float cieCamQOffset = RT_LOCAL_ADJUSTMENTS_NO_LUT;
+    if (cieRun) {
+        int tempo = RT_LOCAL_ADJUSTMENTS_CIE_TEMP_BASE;
+        if (profileSpot.catadcie > 0.0) {
+            tempo = RT_LOCAL_ADJUSTMENTS_CIE_TEMP_BASE -
+                    static_cast<int>(RT_LOCAL_ADJUSTMENTS_CIE_TEMP_UP *
+                                     profileSpot.catadcie);
+        } else if (profileSpot.catadcie < 0.0) {
+            tempo = RT_LOCAL_ADJUSTMENTS_CIE_TEMP_BASE -
+                    static_cast<int>(RT_LOCAL_ADJUSTMENTS_CIE_TEMP_DOWN *
+                                     profileSpot.catadcie);
+        }
+
+        /* The block's viewing conditions: sursouci selects the source
+         * surround and surroundcie the viewing surround. */
+        float f = 1.0f;
+        float c = 0.69f;
+        float nc = 1.0f;
+        if (lp.sursouci == 1) {
+            f = 0.9f;
+            c = 0.59f;
+            nc = 0.9f;
+        } else if (lp.sursouci == 2) {
+            f = 0.8f;
+            c = 0.525f;
+            nc = 0.8f;
+        } else if (lp.sursouci == 3) {
+            f = 0.8f;
+            c = 0.41f;
+            nc = 0.8f;
+        }
+        float f2 = 1.0f;
+        float c2 = 0.69f;
+        float nc2 = 1.0f;
+        if (profileSpot.surroundcie == "Dim") {
+            f2 = 0.9f;
+            c2 = 0.59f;
+            nc2 = 0.9f;
+        } else if (profileSpot.surroundcie == "Dark") {
+            f2 = 0.8f;
+            c2 = 0.525f;
+            nc2 = 0.8f;
+        } else if (profileSpot.surroundcie == "ExtremelyDark") {
+            f2 = 0.8f;
+            c2 = 0.41f;
+            nc2 = 0.8f;
+        }
+
+        double Xw = 1.0;
+        double Zw = 1.0;
+        double Xwout = 1.0;
+        double Zwout = 1.0;
+        double Xwsc = 1.0;
+        double Zwsc = 1.0;
+        ColorTemp::temp2mulxyz(params_.wb.temperature, params_.wb.method,
+                               params_.wb.observer, Xw, Zw);
+        ColorTemp::temp2mulxyz(tempo, "Custom", params_.wb.observer,
+                               Xwout, Zwout);
+        ColorTemp::temp2mulxyz(RT_LOCAL_ADJUSTMENTS_CIE_TEMP_BASE,
+                               "Custom", params_.wb.observer, Xwsc,
+                               Zwsc);
+
+        const float xw = 100.0f * static_cast<float>(Xw);
+        const float yw = 100.0f;
+        const float zw = 100.0f * static_cast<float>(Zw);
+        cieXw1 = 100.0f * static_cast<float>(Xwsc);
+        cieYw1 = 100.0f;
+        cieZw1 = 100.0f * static_cast<float>(Zwsc);
+        cieXw2 = 100.0f * static_cast<float>(Xwout);
+        cieYw2 = 100.0f;
+        cieZw2 = 100.0f * static_cast<float>(Zwout);
+
+        const float yb = static_cast<float>(profileSpot.sourceGraycie);
+        const float yb2 = static_cast<float>(profileSpot.targetGraycie);
+        const float la = static_cast<float>(profileSpot.sourceabscie);
+        const float la2 = static_cast<float>(profileSpot.targabscie);
+        const float pilot = 2.0f;
+        const float plum = static_cast<float>(profileSpot.pqremapcam16);
+        /* pqremapcam16 is at most 100 in the admitted set, so the block's
+         * plain CAM16 (c16 == 16) arm runs. */
+        const int c16 = 16;
+        float n = 0.0f;
+        float d = 0.0f;
+        float nbb = 0.0f;
+        float ncb = 0.0f;
+        float cz = 0.0f;
+        float aw = 0.0f;
+        float wh = 0.0f;
+        float pfl = 0.0f;
+        float fl = 0.0f;
+        Ciecam02::initcam1float(yb, pilot, f, la, xw, yw, zw, n, d, nbb,
+                                ncb, cz, aw, wh, pfl, fl, c, c16, plum);
+        float nj = 0.0f;
+        float dj = 0.0f;
+        float nbbj = 0.0f;
+        float ncbj = 0.0f;
+        float czj = 0.0f;
+        float awj = 0.0f;
+        float flj = 0.0f;
+        Ciecam02::initcam2float(yb2, pilot, f2, la2, cieXw2, cieYw2, cieZw2,
+                                nj, dj, nbbj, ncbj, czj, awj, flj, c16,
+                                plum);
+        cieC = c;
+        cieNc = nc;
+        cieAw = aw;
+        cieFl = fl;
+        cieWh = wh;
+        cieNbb = nbb;
+        cieNcb = ncb;
+        cieCz = cz;
+        cieD = d;
+        ciePow1 = pow_F(1.64f - pow_F(0.29f, n), 0.73f);
+        ciePow1n = pow_F(1.64f - pow_F(0.29f, nj), 0.73f);
+        cieCoefQ = 32767.0f / wh;
+        cieQpro = (0.4f / c) * (aw + 4.0f);
+        ciePfl = pfl;
+        ciePlum = plum;
+        cieC2 = c2;
+        cieNc2 = nc2;
+        cieAwj = awj;
+        cieFlj = flj;
+        cieNbbj = nbbj;
+        cieNcbj = ncbj;
+        cieCzj = czj;
+        cieDj = dj;
+        cieReccmcz = 1.0f / (c2 * czj);
+        cieCoe = pow_F(fl, 0.25f);
+
+        /* Acceptance and colour sliders, with the block's clamps. */
+        cieMchr = static_cast<float>(profileSpot.colorflcie);
+        if (cieMchr == -100.0f) {
+            cieMchr = -99.8f;
+        } else if (cieMchr == 100.0f) {
+            cieMchr = 99.9f;
+        }
+        cieSchr = static_cast<float>(profileSpot.saturlcie);
+        if (cieSchr > 0.0f) {
+            cieSchr /= 2.0f;
+        }
+        if (cieSchr == -100.0f) {
+            cieSchr = -99.8f;
+        }
+        cieCchr = static_cast<float>(profileSpot.chromlcie);
+        if (cieCchr == -100.0f) {
+            cieCchr = -99.8f;
+        }
+        cieHue = static_cast<float>(profileSpot.huecie);
+        cieRstprotect = static_cast<float>(profileSpot.rstprotectcie);
+
+        /* The two brightness tables. curveJfloat() only reads the histogram
+         * for a non-zero contrast amount, which the predicate excludes, so a
+         * zeroed histogram is exact. */
+        LUTu cieHistogram(RT_LOCAL_ADJUSTMENTS_CIE_CAM_ENTRIES,
+                          LUT_CLIP_BELOW | LUT_CLIP_ABOVE, true);
+        LUTf camJ(RT_LOCAL_ADJUSTMENTS_CIE_CAM_ENTRIES,
+                  LUT_CLIP_BELOW | LUT_CLIP_ABOVE);
+        LUTf camQ(RT_LOCAL_ADJUSTMENTS_CIE_CAM_ENTRIES,
+                  LUT_CLIP_BELOW | LUT_CLIP_ABOVE);
+        const float contL = 0.6f * static_cast<float>(profileSpot.contlcie);
+        const float lightL = 0.4f * static_cast<float>(profileSpot.lightlcie);
+        const float contQ = 0.5f * static_cast<float>(profileSpot.contqcie);
+        const float lightQ = 0.4f * static_cast<float>(profileSpot.lightqcie);
+        const float contthresL = static_cast<float>(profileSpot.contthrescie);
+        const float thL = 0.3f * contthresL + 0.6f;
+        const float thQ = 0.3f * contthresL + 0.6f;
+        Ciecam02::curveJfloat(lightL, contL, thL, cieHistogram, camJ);
+        camJ /= 327.68f;
+        Ciecam02::curveJfloat(lightQ, contQ, thQ, cieHistogram, camQ);
+        cieCamJOffset = appendTable(camJ);
+        cieCamQOffset = appendTable(camQ);
+        if (cieCamJOffset == RT_LOCAL_ADJUSTMENTS_NO_LUT ||
+            cieCamQOffset == RT_LOCAL_ADJUSTMENTS_NO_LUT) {
+            return 1;
+        }
+    }
+
+    /*
      * The per-scale blur. RetinexScales[] is retinex_scales()'s output, and
      * `kg` is the empirical correction MSRLocal() keeps across iterations,
      * so the band-limited sigma of every scale but the first is
@@ -2715,6 +3121,53 @@ int LocalAdjustmentsContext::build(int spot, const RtStageBuffer* lab,
                             index];
         }
     }
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_EXP_CIE] = cieRun ? 1.f : 0.f;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_CIE_C] = cieC;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_CIE_NC] = cieNc;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_CIE_AW] = cieAw;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_CIE_FL] = cieFl;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_CIE_WH] = cieWh;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_CIE_NBB] = cieNbb;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_CIE_NCB] = cieNcb;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_CIE_CZ] = cieCz;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_CIE_D] = cieD;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_CIE_POW1] = ciePow1;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_CIE_POW1N] = ciePow1n;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_CIE_COEFQ] = cieCoefQ;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_CIE_QPRO] = cieQpro;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_CIE_PFL] = ciePfl;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_CIE_PLUM] = ciePlum;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_CIE_XW1] = cieXw1;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_CIE_YW1] = cieYw1;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_CIE_ZW1] = cieZw1;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_CIE_XW2] = cieXw2;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_CIE_YW2] = cieYw2;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_CIE_ZW2] = cieZw2;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_CIE_C2] = cieC2;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_CIE_NC2] = cieNc2;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_CIE_AWJ] = cieAwj;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_CIE_FLJ] = cieFlj;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_CIE_NBBJ] = cieNbbj;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_CIE_NCBJ] = cieNcbj;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_CIE_CZJ] = cieCzj;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_CIE_DJ] = cieDj;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_CIE_RECCMCZ] = cieReccmcz;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_CIE_COE] = cieCoe;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_CIE_MCHR] = cieMchr;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_CIE_SCHR] = cieSchr;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_CIE_CCHR] = cieCchr;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_CIE_HUE] = cieHue;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_CIE_RSTPROTECT] = cieRstprotect;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_CIE_SENS] = cieSens;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_CIE_REPART] = cieRepart;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_CIE_CAMJ_OFFSET] = cieCamJOffset;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_CIE_CAMQ_OFFSET] = cieCamQOffset;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_CIE_HUERED] = cieHuered;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_CIE_SCHRRED] = cieSchrred;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_CIE_HUEGREEN] = cieHuegreen;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_CIE_SCHRGREEN] = cieSchrgreen;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_CIE_HUEBLUE] = cieHueblue;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_CIE_SCHRBLUE] = cieSchrblue;
     record[RT_LOCAL_ADJUSTMENTS_SLOT_EXPDENAZE] = dehazeRun ? 1.f : 0.f;
     record[RT_LOCAL_ADJUSTMENTS_SLOT_SENSH] =
         static_cast<float>(profileSpot.sensih);
@@ -2855,6 +3308,11 @@ int LocalAdjustmentsContext::build(int spot, const RtStageBuffer* lab,
                  iirBlur_)) {
         return 1;
     }
+    if (!fillIir(cieRun ? static_cast<double>(2.0f + 0.2f * lp.blurciede)
+                        : RT_LOCAL_ADJUSTMENTS_SHARPEN_SCOPE_SIGMA,
+                 iirCie_)) {
+        return 1;
+    }
 
     out.spots = spots_.data();
     out.spot_count = 1;
@@ -2864,6 +3322,7 @@ int LocalAdjustmentsContext::build(int spot, const RtStageBuffer* lab,
     out.ws = ws_;
     out.iws = iws_;
     out.ws_double = wsDouble_;
+    out.iws_double = iwsDouble_;
     out.cachef = cachef_.data();
     out.cachefy = cachefy_.data();
     out.gamma_srgb = gammaSrgb_.data();
@@ -2877,6 +3336,7 @@ int LocalAdjustmentsContext::build(int spot, const RtStageBuffer* lab,
     out.iir_local_contrast = &iirLc_;
     out.iir_shadows_highlights = &iirSh_;
     out.iir_blur = &iirBlur_;
+    out.iir_cie = &iirCie_;
     built_ = true;
     return 0;
 }

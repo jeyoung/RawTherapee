@@ -130,6 +130,13 @@ struct LocalAdjustmentsSpotParams {
      * senstype-4/5 deltaE scope sensitivity (lp.sensh). */
     float str = 0.f;
     int sensih = 0;
+    /* CIE CAM. sursouci is the block's source-surround selector (0 average,
+     * 1 dim, 2 dark, 3 extremely dark), sensicie the senstype-31 scope
+     * sensitivity and blurciede the deltaE reference blur slider (the block's
+     * lp.blurcie, sigma (2 + 0.2 * blurciede) / sk). */
+    int sursouci = 0;
+    int sensicie = 0;
+    float blurciede = 0.f;
 };
 
 } // namespace rtengine

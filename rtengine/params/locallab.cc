@@ -3998,9 +3998,15 @@ void LoadUtil::mask()
 
 void LoadUtil::ciecam()
 {
-    spot.visicie = assignFromKeyfile(keyFile, "Locallab", "Expcie_" + index_str, spot.expcie, spotEdited.expcie);
+    /* Expcie_ carries the tool enable. It also decides whether the CIE CAM
+     * panel is shown, because visicie is a UI-only flag and has no key of its
+     * own. Assigning the key to visicie alone left the tool off on reload. */
+    spot.expcie = assignFromKeyfile(keyFile, "Locallab",
+                                    "Expcie_" + index_str, spot.expcie,
+                                    spotEdited.expcie);
 
-    if (spot.visicie) {
+    if (spot.expcie) {
+        spot.visicie = true;
         spotEdited.visicie = true;
     }
     assignFromKeyfile(keyFile, "Locallab", "Expprecam_" + index_str, spot.expprecam, spotEdited.expprecam);
