@@ -73,6 +73,13 @@ export and a GUI smoke test are not yet run for this package.
 
 ## Progress log — resumed 2026-10-28 (Block 4 completion)
 
+- **`raw.demosaic` CFA split withdrawn (2026-11-04)**: the MONO/NONE unit
+  admitted a Bayer CFA split, but with `labtools-vibrance.pp3` on
+  `colorspace_flowers.pef` the split path moved three output samples by up to
+  110 LSB16 (0 differing at `650499617`, i.e. after `raw.preprocess`, and at
+  `cbf8c506b`). The CFA split is now refused and the host loop runs; the
+  monochrome copy stays on the device. The vibrance gate is exact again.
+
 - **Cleanup incident (2026-11-04)**: the build-tree purge also removed
   `build/portable`, which is the package directory and must be retained. The
   directory is restored; the deleted `.deb` is reproducible with

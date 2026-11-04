@@ -885,11 +885,13 @@ void RawImageSource::nodemosaic(bool bw)
      * which rewrites every pixel of all three planes.
      */
     if (stage::node_device("raw.demosaic") == stage::StageNodeDevice::OpenCL) {
-        const bool cfa_split =
-            !bw && ri->getSensorType() == ST_BAYER &&
-            raw_demosaic_filters_supported(ri->get_filters());
-
-        if (bw || cfa_split) {
+        /*
+         * The CFA split is refused until its coverage is proven exact: with
+         * the vibrance corpus profile the split path moved three output
+         * samples by up to 110 LSB16. Only the monochrome copy is admitted;
+         * the CFA loop below is the host reference.
+         */
+        if (bw) {
             const std::size_t row_pitch =
                 static_cast<std::size_t>(W) * sizeof(float);
             RtStageBuffer mosaic{};
