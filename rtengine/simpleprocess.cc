@@ -1860,18 +1860,18 @@ private:
         ImProcFunctions &ipf = * (ipf_p.get());
 
         /*
-         * The device node is opt-in. Its host prefix runs here, before the
-         * submission: lab2rgb() and the fixed sRGB inverse are the block's own
-         * code, so the probe, the profile and the second-pass input are
-         * byte-identical to the CPU block whatever the device compiler does.
-         * With RT_STAGE_OPENCL unset the block below is the pre-node path.
+         * The device node is opt-in. Its host prefix runs inside the
+         * launcher, after the device soft-light pre-pass when the tool is on,
+         * so the probe, the profile and the second-pass input stay
+         * byte-identical to the CPU block. With RT_STAGE_OPENCL unset the
+         * block below is the pre-node path.
          */
         if (stage::node_device("working.trc") == stage::StageNodeDevice::OpenCL) {
             const bool supported = stage::workingTrcSupported(params);
             stage::WorkingTrcContext context(params, ipf);
             RtWorkingTrcContext descriptor = context.descriptor(supported);
 
-            RtStageArg args[6] = {};
+            RtStageArg args[4] = {};
             args[0].kind = RT_STAGE_ARG_BUFFER;
             args[0].u.buffer = stage::view(*labView);
             args[1].kind = RT_STAGE_ARG_PTR;
@@ -1881,30 +1881,15 @@ private:
             args[3].kind = RT_STAGE_ARG_DOUBLE;
             args[3].u.f = params.icm.wapsat;
 
-            bool deviceReady = false;
-            if (supported) {
-                RtWorkingTrcResult setup{};
-                deviceReady = context.prepare(*labView) &&
-                              context.build(setup) == 0;
-                if (deviceReady) {
-                    args[4].kind = RT_STAGE_ARG_BUFFER;
-                    args[4].u.buffer = stage::view(context.xyz());
-                    args[5].kind = RT_STAGE_ARG_BUFFER;
-                    args[5].u.buffer = stage::view(context.linearReference());
-                }
-            }
             /*
              * A residual configuration, or a supported one whose setup the
-             * host had to refuse, is still submitted with the support flag
-             * clear: the launcher refuses it and the builtin runs the host
-             * block, which records impl=host.
+             * launcher has to refuse, falls back to the builtin: the launcher
+             * writes nothing to the caller's Lab until every pass succeeded,
+             * so the host block still sees the original image.
              */
-            descriptor.supported = deviceReady ? 1u : 0u;
-            args[2].u.i = descriptor.supported;
-
             RtStageProfiling profiling{};
             if (stage::run("working.trc",
-                           std::vector<RtStageArg>(args, args + 6),
+                           std::vector<RtStageArg>(args, args + 4),
                            &profiling) == RT_STAGE_OK) {
                 return;
             }

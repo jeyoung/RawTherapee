@@ -21,12 +21,13 @@
 /*
  * Device arithmetic for the working.trc node.
  *
- * The kernels are the second pass of ImProcFunctions::workingtrc() and its
- * neighbours for the default configuration: the matrix-shaper transform,
- * apsatur() and the return to Lab. The host prefix (lab2rgb(), the fixed sRGB
- * inverse, the probe/profile and toxyz with the optional gamut map) is not a
- * kernel: it runs on the host so the probe, the profile and the pass-2 input
- * are byte-identical to the CPU block. Everything here is single precision
+ * The kernels are the soft-light pre-pass of ImProcFunctions::softLight(),
+ * the second pass of ImProcFunctions::workingtrc() and its neighbours for
+ * the default configuration: the matrix-shaper transform, apsatur() and the
+ * return to Lab. The host prefix (lab2rgb(), the fixed sRGB inverse, the
+ * probe/profile and toxyz with the optional gamut map) is not a kernel: it
+ * runs on the host so the probe, the profile and the pass-2 input are
+ * byte-identical to the CPU block. Everything here is single precision
  * except the values the host
  * exports as float: the working matrices, the profile matrices and the
  * 16-bit tables. The host still owns the probe, the lcms profile and the
@@ -62,7 +63,9 @@ inline float rt_wt_cache_lookup(__global const float* table, const float value)
     int index = (int)value;
     if (value < 0.0f) {
         index = 0;
-    } else if (value > RT_WT_MAXVAL - 2.0f) {
+    } else if (value > RT_WT_MAXVAL - 1.0f) {
+        /* LUT::maxs is size - 2; the last interval interpolates 65534 and
+         * 65535, so values in (65534, 65535] keep fraction value - 65534. */
         index = 65534;
     }
     const float fraction = value - (float)index;
@@ -106,6 +109,65 @@ inline void rt_wt_xyz2lab(const float X, const float Y, const float Z,
     *L = rt_wt_compute_fy(Y, cachefy);
     *a = 500.0f * (fx - fy);
     *b = 200.0f * (fy - fz);
+}
+
+/* Color::Lab2XYZ(). `epskapf` is the host's L* breakpoint of the Y arm. */
+#define RT_WT_EPSKAP 8.0f
+inline void rt_wt_lab2xyz(const float L, const float a, const float b,
+                          float* X, float* Y, float* Z)
+{
+    const float LL = L / 327.68f;
+    const float aa = a / 327.68f;
+    const float bb = b / 327.68f;
+    const float fy = (1.0f / 116.0f) * LL + (16.0f / 116.0f);
+    const float fx = 0.002f * aa + fy;
+    const float fz = fy - 0.005f * bb;
+    *X = RT_WT_MAXVAL * rt_f2xyz(fx) * RT_WT_D50X;
+    *Z = RT_WT_MAXVAL * rt_f2xyz(fz) * RT_WT_D50Z;
+    /* The host's vector form cubes first and scales last; the association
+     * matters at the last bit and the first pass below amplifies it. */
+    const float cube = fy * fy * fy;
+    *Y = LL > RT_WT_EPSKAP ? RT_WT_MAXVAL * cube
+                           : (LL / RT_WT_KAPPA) * RT_WT_MAXVAL;
+}
+
+/*
+ * LUT::operator[] with a float index. The tables are built with size 65536
+ * and `maxs = size - 2`, so the clamp is to 65534 and the last interval
+ * interpolates entries 65534 and 65535. ImProcFunctions::softLight()'s SSE
+ * arm and the scalar tail both read the tables this way.
+ */
+inline float rt_wt_lut_lerp(__global const float* table, const float value)
+{
+    const float clamped = value < 0.0f
+        ? 0.0f
+        : (value > RT_WT_MAXVAL ? RT_WT_MAXVAL : value);
+    int index = (int)clamped;
+    if (index > 65534) {
+        /* LUT::maxs is size - 2; the last interval still interpolates
+         * entries 65534 and 65535. */
+        index = 65534;
+    }
+    const float low = table[index];
+    return low + (table[index + 1] - low) * (clamped - (float)index);
+}
+
+/*
+ * ImProcFunctions::softLight()'s per-channel sRGB blend.
+ */
+inline float rt_wt_softlight_channel(const float blend, const float x,
+                                     __global const float* gamma_srgb,
+                                     __global const float* igamma_srgb)
+{
+    if (x < 0.0f || x > RT_WT_MAXVAL) {
+        return x;
+    }
+    const float encoded = rt_wt_lut_lerp(gamma_srgb, x) / RT_WT_MAXVAL;
+    const float shaped =
+        encoded * encoded * (3.0f - 2.0f * encoded) * RT_WT_MAXVAL;
+    const float blended = rt_wt_lut_lerp(igamma_srgb, shaped);
+    /* rt_math.h intp(a, b, c) = a * (b - c) + c. */
+    return blend * (blended - x) + x;
 }
 
 /* Color::rgbxyz() with the working-space matrix, as rgb2lab() builds it. */
@@ -207,6 +269,63 @@ inline float rt_wt_trc_inverse(__global const float* gamma,
     return (linear >= threshold ? (pow(linear, 1.0f / g) - b) / a
                                 : linear / c)
         * RT_WT_MAXVAL;
+}
+
+/*
+ * Soft-light pre-pass: ImProcFunctions::softLight() over the Lab input. The
+ * node runs it before the host prefix because the block applies the tool to
+ * the Lab image first; the launcher reads the result back into a private copy
+ * for prepare(). `wp`/`wip` are the host's float working-space matrices and
+ * the cache tables are Color::cachef/cachefy.
+ */
+__kernel void rt_working_trc_softlight(__global float* lab,
+                                       __global const float* wp,
+                                       __global const float* wip,
+                                       __global const float* gamma_srgb,
+                                       __global const float* igamma_srgb,
+                                       __global const float* cachef,
+                                       __global const float* cachefy,
+                                       const float blend,
+                                       const int width, const int height,
+                                       const int lab_pitch,
+                                       const int lab_plane_pitch)
+{
+    const int x = get_global_id(0);
+    const int y = get_global_id(1);
+    if (x >= width || y >= height) {
+        return;
+    }
+
+    const int offset = y * lab_pitch + x;
+    const float L = lab[offset];
+    const float a = lab[lab_plane_pitch + offset];
+    const float b = lab[2 * lab_plane_pitch + offset];
+
+    float X = 0.0f;
+    float Y = 0.0f;
+    float Z = 0.0f;
+    rt_wt_lab2xyz(L, a, b, &X, &Y, &Z);
+
+    float R = wip[0] * X + wip[1] * Y + wip[2] * Z;
+    float G = wip[3] * X + wip[4] * Y + wip[5] * Z;
+    float B = wip[6] * X + wip[7] * Y + wip[8] * Z;
+
+    R = rt_wt_softlight_channel(blend, R, gamma_srgb, igamma_srgb);
+    G = rt_wt_softlight_channel(blend, G, gamma_srgb, igamma_srgb);
+    B = rt_wt_softlight_channel(blend, B, gamma_srgb, igamma_srgb);
+
+    X = wp[0] * R + wp[1] * G + wp[2] * B;
+    Y = wp[3] * R + wp[4] * G + wp[5] * B;
+    Z = wp[6] * R + wp[7] * G + wp[8] * B;
+
+    float Lout = 0.0f;
+    float aout = 0.0f;
+    float bout = 0.0f;
+    rt_wt_xyz2lab(X, Y, Z, cachef, cachefy, &Lout, &aout, &bout);
+
+    lab[offset] = Lout;
+    lab[lab_plane_pitch + offset] = aout;
+    lab[2 * lab_plane_pitch + offset] = bout;
 }
 
 /*

@@ -52,7 +52,7 @@ struct ProcParams;
  * object that owns the ProcParams and ImProcFunctions references, so the
  * pointer must not outlive them.
  */
-#define RT_WORKING_TRC_CONTEXT_VERSION 1u
+#define RT_WORKING_TRC_CONTEXT_VERSION 2u
 /* "WTRC": rejects a stale or unrelated pointer before any callback runs. */
 #define RT_WORKING_TRC_CONTEXT_MAGIC 0x57545243u
 /* The gamma table buildGpuProfile() returns. */
@@ -94,6 +94,29 @@ typedef struct RtWorkingTrcContext {
      * so a residual and a refused device request produce the CPU result.
      */
     int (*run_host)(void* self, RtStageBuffer* lab);
+    /*
+     * Runs the host prefix on `lab` and keeps the first pass and the linear
+     * reference. The launcher calls it, not the call site, because the
+     * soft-light pre-pass runs on the device first: it passes a private copy
+     * of the kernel's readback, so a later refusal leaves the caller's image
+     * untouched. Returns 0 on success.
+     */
+    int (*prepare)(void* self, const RtStageBuffer* lab);
+    /*
+     * Views over the built second-pass input and the linear pre-TRC
+     * reference, valid after build() succeeds.
+     */
+    int (*images)(void* self, RtStageBuffer* xyz, RtStageBuffer* linear);
+    /*
+     * Soft-light pre-pass. `softlight` is 1 when the device kernel runs
+     * before prepare(); `softlight_strength` is the block's blend percentage
+     * and the two row-major matrices are the host's float working-space pair
+     * (RGB -> XYZ and XYZ -> RGB). Host-only, like the rest of the context.
+     */
+    uint32_t softlight;
+    int32_t softlight_strength;
+    float softlight_wp[9];
+    float softlight_wip[9];
 } RtWorkingTrcContext;
 
 namespace rtengine::stage
@@ -125,9 +148,11 @@ bool workingTrcProfileSupported(const Glib::ustring& profile);
 
 /*
  * The subset of the block this stage runs on the device. Everything else is a
- * residual and must execute the host builtin: soft light, local contrast, both
- * tone equalisers, preservation, black-and-white output, non-default primaries
- * or illuminant, a non-relative intent, and a non-matrix-shaper profile.
+ * residual and must execute the host builtin: local contrast, both tone
+ * equalisers, preservation, black-and-white output, non-default primaries or
+ * illuminant, a non-relative intent, and a non-matrix-shaper profile. Soft
+ * light is admitted at its GUI strength range 1..100 (zero is the block's own
+ * no-op); an out-of-range batch value stays a residual.
  */
 bool workingTrcSupported(const procparams::ProcParams& params);
 
@@ -167,6 +192,19 @@ public:
      * sRGB inverse. False when the input or an allocation fails.
      */
     bool prepare(const LabImage& lab);
+
+    /*
+     * The launcher's form of prepare(): copy the supplied three-plane buffer
+     * to a private LabImage first, so the device soft-light readback never
+     * becomes the caller's image. Returns 0 on success.
+     */
+    int prepareBuffer(const RtStageBuffer& lab);
+
+    /*
+     * Views over the built second-pass input and the linear reference, for
+     * the launcher to upload. Returns 0 on success.
+     */
+    int images(RtStageBuffer& xyz, RtStageBuffer& linear) const;
 
     /*
      * Build the probe/profile on the host prefix and the second-pass input:

@@ -29,6 +29,7 @@
 #include "procparams.h"
 #include "rtengine.h"
 #include "sleef.h"
+#include "stage_buffer.h"
 #include "utils.h"
 
 #include <algorithm>
@@ -94,6 +95,16 @@ int run_host_thunk(void* self, RtStageBuffer* lab)
     return static_cast<WorkingTrcContext*>(self)->runHost(*lab);
 }
 
+int prepare_thunk(void* self, const RtStageBuffer* lab)
+{
+    return static_cast<WorkingTrcContext*>(self)->prepareBuffer(*lab);
+}
+
+int images_thunk(void* self, RtStageBuffer* xyz, RtStageBuffer* linear)
+{
+    return static_cast<WorkingTrcContext*>(self)->images(*xyz, *linear);
+}
+
 } // namespace
 
 bool workingTrcProfileSupported(const Glib::ustring& profile)
@@ -125,7 +136,11 @@ bool workingTrcSupported(const procparams::ProcParams& params)
         toUnderlying(icm.will) != ILLUMINANT_DEFAULT) {
         return false;
     }
-    if (params.softlight.enabled && params.softlight.strength != 0) {
+    /* Soft light is a per-pixel arm now. The GUI's strength range is 1..100
+     * and zero is the block's own no-op, so a value outside that range is a
+     * residual rather than a clamped device case. */
+    if (params.softlight.enabled && params.softlight.strength != 0 &&
+        (params.softlight.strength < 1 || params.softlight.strength > 100)) {
         return false;
     }
     if (icm.wmidtcie != 0.0) {
@@ -309,6 +324,31 @@ RtWorkingTrcContext WorkingTrcContext::descriptor(bool supported)
     context.self = this;
     context.build = &build_thunk;
     context.run_host = &run_host_thunk;
+    context.prepare = &prepare_thunk;
+    context.images = &images_thunk;
+
+    const bool softlight = params_.softlight.enabled &&
+                           params_.softlight.strength != 0;
+    context.softlight = softlight ? 1u : 0u;
+    context.softlight_strength = params_.softlight.strength;
+    if (softlight) {
+        /* ImProcFunctions::softLight() builds these float pairs from the
+         * double working-space matrices; the device kernel needs the same
+         * rounded values, not the doubles. */
+        const TMatrix wp = ICCStore::getInstance()->workingSpaceMatrix(
+            params_.icm.workingProfile);
+        const TMatrix wip =
+            ICCStore::getInstance()->workingSpaceInverseMatrix(
+                params_.icm.workingProfile);
+        for (int r = 0; r < 3; ++r) {
+            for (int c = 0; c < 3; ++c) {
+                context.softlight_wp[r * 3 + c] =
+                    static_cast<float>(wp[r][c]);
+                context.softlight_wip[r * 3 + c] =
+                    static_cast<float>(wip[r][c]);
+            }
+        }
+    }
     return context;
 }
 
@@ -358,9 +398,43 @@ bool WorkingTrcContext::prepare(const LabImage& lab)
     return true;
 }
 
+int WorkingTrcContext::prepareBuffer(const RtStageBuffer& lab)
+{
+    if (lab.data == nullptr || lab.format != RT_STAGE_F32 ||
+        lab.planes != 3 || lab.width <= 0 || lab.height <= 0) {
+        return 1;
+    }
+
+    LabImage image(lab.width, lab.height);
+    const auto* base = static_cast<const unsigned char*>(lab.data);
+    for (int y = 0; y < lab.height; ++y) {
+        for (uint32_t plane = 0; plane < 3; ++plane) {
+            const auto* row = reinterpret_cast<const float*>(
+                base + plane * lab.plane_pitch + y * lab.row_pitch);
+            float* dst = plane == 0 ? image.L[y]
+                        : plane == 1 ? image.a[y]
+                                     : image.b[y];
+            std::memcpy(dst, row, static_cast<std::size_t>(lab.width) *
+                                      sizeof(float));
+        }
+    }
+
+    return prepare(image) ? 0 : 1;
+}
+
 Imagefloat& WorkingTrcContext::linearReference() const
 {
     return *linearRef_;
+}
+
+int WorkingTrcContext::images(RtStageBuffer& xyz, RtStageBuffer& linear) const
+{
+    if (!built_ || xyz_ == nullptr || linearRef_ == nullptr) {
+        return 1;
+    }
+    xyz = stage::view(*xyz_);
+    linear = stage::view(*linearRef_);
+    return 0;
 }
 
 Imagefloat& WorkingTrcContext::xyz() const

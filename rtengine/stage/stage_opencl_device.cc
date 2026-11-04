@@ -3312,31 +3312,29 @@ RtStageStatus run_ciecam(const std::shared_ptr<OpenCLEnv>& env,
  * The working.trc node. Argument order:
  *   [0] Lab three-plane F32 buffer, read and written in place,
  *   [1] PTR host context (RtWorkingTrcContext), host-only,
- *   [2] int support flag, mirrored from the context descriptor (1 only when
- *       the configuration is supported and the host setup admitted it),
- *   [3] double saturation (icm.wapsat),
- *   [4] three-plane F32 second-pass XYZ image from the host prefix,
- *   [5] three-plane F32 linear pre-TRC reference for apsatur().
+ *   [2] int support flag, mirrored from the context descriptor,
+ *   [3] double saturation (icm.wapsat).
  *
- * The device work starts at the second pass: the host prefix has already run
- * lab2rgb, the fixed sRGB inverse, the probe/profile, toxyz and the optional
- * gamut map. The Lab buffer is read back only after every pass succeeded, so a
- * refusal leaves the host image untouched for the builtin.
+ * The launcher owns the host prefix. For a soft-light configuration it runs
+ * the device pre-pass on the uploaded Lab, reads the result into a private
+ * host copy and calls the context's prepare() on that copy; otherwise
+ * prepare() runs on the caller's Lab. build() then produces the probe and
+ * profile, and images() hands back the second-pass input and the linear
+ * pre-TRC reference. Nothing is written to the caller's Lab until every pass
+ * succeeded, so a refusal leaves it untouched for the builtin.
  *
  * A clear support flag, in either the argument or the context descriptor,
  * refuses before the upload: that is the residual path, and it makes the CPU
- * builtin - the original host block - execute and record impl=host. The
- * per-pixel arguments are checked here; the context is not consulted for
- * them.
+ * builtin - the original host block - execute and record impl=host.
  */
 RtStageStatus run_working_trc(const std::shared_ptr<OpenCLEnv>& env,
                               const std::shared_ptr<OpenCLResidency>& residency,
                               const std::vector<RtStageArg>& args,
                               std::string& error)
 {
-    constexpr std::size_t ARG_COUNT = 6;
+    constexpr std::size_t ARG_COUNT = 4;
     if (args.size() != ARG_COUNT) {
-        error = "working.trc expects three buffers, a context and a scalar";
+        error = "working.trc expects a buffer, a context and two scalars";
         return RT_STAGE_INVALID;
     }
     if (args[0].kind != RT_STAGE_ARG_BUFFER ||
@@ -3358,7 +3356,8 @@ RtStageStatus run_working_trc(const std::shared_ptr<OpenCLEnv>& env,
     if (context == nullptr || context->size != sizeof(RtWorkingTrcContext) ||
         context->version != RT_WORKING_TRC_CONTEXT_VERSION ||
         context->magic != RT_WORKING_TRC_CONTEXT_MAGIC ||
-        context->build == nullptr) {
+        context->build == nullptr || context->prepare == nullptr ||
+        context->images == nullptr) {
         error = "working.trc has an invalid host context";
         return RT_STAGE_INVALID;
     }
@@ -3379,22 +3378,6 @@ RtStageStatus run_working_trc(const std::shared_ptr<OpenCLEnv>& env,
         error = "working.trc saturation is outside 0..1";
         return RT_STAGE_INVALID;
     }
-    if (args[4].kind != RT_STAGE_ARG_BUFFER ||
-        args[5].kind != RT_STAGE_ARG_BUFFER) {
-        error = "working.trc has a pass-2 argument of the wrong kind";
-        return RT_STAGE_INVALID;
-    }
-    const RtStageBuffer& xyz = args[4].u.buffer;
-    const RtStageBuffer& linear = args[5].u.buffer;
-    const StageBufferShape image_shape{RT_STAGE_F32, lab.width, lab.height, 3};
-    for (const RtStageBuffer* buffer : {&xyz, &linear}) {
-        if (!valid(*buffer) || buffer->format != RT_STAGE_F32 ||
-            buffer->planes != 3 || buffer->width != lab.width ||
-            buffer->height != lab.height) {
-            error = "working.trc needs second-pass and linear RGB buffers";
-            return RT_STAGE_INVALID;
-        }
-    }
 
     const KernelDef* def = find_kernel("working.trc");
     assert(def != nullptr);
@@ -3404,33 +3387,20 @@ RtStageStatus run_working_trc(const std::shared_ptr<OpenCLEnv>& env,
         compiled_kernel_entry(env, def, "rt_working_trc_apsatur", error);
     cl_kernel lab_kernel =
         compiled_kernel_entry(env, def, "rt_working_trc_lab", error);
+    cl_kernel softlight_kernel =
+        compiled_kernel_entry(env, def, "rt_working_trc_softlight", error);
     if (second_kernel == nullptr || apsatur_kernel == nullptr ||
-        lab_kernel == nullptr) {
+        lab_kernel == nullptr || softlight_kernel == nullptr) {
         return RT_STAGE_FALLBACK;
     }
 
     const int width = lab.width;
     const int height = lab.height;
-
-    StageDeviceBufferPtr lab_device =
-        residency->acquire(lab.data, image_shape, &error);
-    StageDeviceBufferPtr xyz_device =
-        residency->acquire(xyz.data, image_shape, &error);
-    StageDeviceBufferPtr linear_device =
-        residency->acquire(linear.data, image_shape, &error);
-    char post_key = 0;
-    StageDeviceBufferPtr post =
-        residency->acquire(&post_key, image_shape, &error);
-    if (!lab_device || !xyz_device || !linear_device || !post) {
-        return RT_STAGE_FALLBACK;
-    }
-
-    if (residency->upload(lab_device, lab) != RT_STAGE_OK ||
-        residency->upload(xyz_device, xyz) != RT_STAGE_OK ||
-        residency->upload(linear_device, linear) != RT_STAGE_OK) {
-        error = "working.trc input upload failed";
-        return RT_STAGE_FALLBACK;
-    }
+    const StageBufferShape image_shape{RT_STAGE_F32, lab.width, lab.height, 3};
+    const StageBufferShape matrix_shape{RT_STAGE_F32, 9, 1, 1};
+    const StageBufferShape table_shape{
+        RT_STAGE_F32, static_cast<std::int32_t>(RT_WORKING_TRC_GAMMA_ENTRIES),
+        1, 1};
 
     auto memory_of = [](const StageDeviceBufferPtr& buffer) {
         auto device = std::dynamic_pointer_cast<OpenCLDeviceBuffer>(buffer);
@@ -3442,15 +3412,283 @@ RtStageStatus run_working_trc(const std::shared_ptr<OpenCLEnv>& env,
     const auto plane_pitch_of = [](const StageDeviceBufferPtr& buffer) {
         return buffer->plane_pitch() / sizeof(float);
     };
+    const auto covers = [&](const StageDeviceBufferPtr& buffer) {
+        return buffer->row_pitch() % sizeof(float) == 0 &&
+               buffer->plane_pitch() % sizeof(float) == 0 &&
+               pitch_of(buffer) >= static_cast<std::size_t>(width) &&
+               plane_pitch_of(buffer) >=
+                   static_cast<std::size_t>(height) * pitch_of(buffer);
+    };
+
+    const auto set_arg = [&](cl_kernel kernel, cl_uint index, std::size_t bytes,
+                             const void* value) {
+        return env->api->SetKernelArg(kernel, index, bytes, value) == CL_SUCCESS;
+    };
+    const auto launch = [&](cl_kernel kernel, const char* label) {
+        const std::size_t global[2] = {static_cast<std::size_t>(width),
+                                       static_cast<std::size_t>(height)};
+        cl_event done = nullptr;
+        if (env->api->EnqueueNDRangeKernel(env->queue, kernel, 2, nullptr,
+                                           global, nullptr, 0, nullptr,
+                                           &done) != CL_SUCCESS ||
+            done == nullptr) {
+            error = std::string(label) + " launch failed";
+            return false;
+        }
+        const cl_int wait_status = env->api->WaitForEvents(1, &done);
+        env->api->ReleaseEvent(done);
+        if (wait_status != CL_SUCCESS) {
+            error = std::string(label) + " did not complete";
+            return false;
+        }
+        return true;
+    };
+
+    StageDeviceBufferPtr lab_device;
+    std::vector<float> prepared_scratch;
+    RtStageBuffer prepared = lab;
+
+    /*
+     * The soft-light pre-pass. It writes only the private device copy; the
+     * result is read into `prepared_scratch`, which prepare() then copies
+     * into its own LabImage. Neither the caller's Lab nor the scratch can be
+     * observed by the builtin if a later step refuses.
+     */
+    if (context->softlight != 0) {
+        if (context->softlight_strength < 1 ||
+            context->softlight_strength > 100) {
+            error = "working.trc soft-light strength is outside 1..100";
+            return RT_STAGE_INVALID;
+        }
+        lab_device = residency->acquire(lab.data, image_shape, &error);
+        if (!lab_device ||
+            residency->upload(lab_device, lab) != RT_STAGE_OK) {
+            error = "working.trc soft-light upload failed";
+            return RT_STAGE_FALLBACK;
+        }
+        if (!covers(lab_device)) {
+            error = "working.trc soft-light pitch does not cover the image";
+            return RT_STAGE_FALLBACK;
+        }
+
+        std::vector<float> gamma_srgb(RT_WORKING_TRC_GAMMA_ENTRIES);
+        std::vector<float> igamma_srgb(RT_WORKING_TRC_GAMMA_ENTRIES);
+        std::vector<float> cachef_lut(RT_WORKING_TRC_GAMMA_ENTRIES);
+        std::vector<float> cachefy_lut(RT_WORKING_TRC_GAMMA_ENTRIES);
+        for (std::size_t i = 0; i < gamma_srgb.size(); ++i) {
+            const int index = static_cast<int>(i);
+            gamma_srgb[i] = Color::gammatab_srgb[index];
+            igamma_srgb[i] = Color::igammatab_srgb[index];
+            cachef_lut[i] = Color::cachef[index];
+            cachefy_lut[i] = Color::cachefy[index];
+        }
+
+        RtStageBuffer wp_host{};
+        wp_host.size = sizeof(RtStageBuffer);
+        wp_host.data = const_cast<float*>(context->softlight_wp);
+        wp_host.width = 9;
+        wp_host.height = 1;
+        wp_host.row_pitch = 9 * sizeof(float);
+        wp_host.plane_pitch = wp_host.row_pitch;
+        wp_host.planes = 1;
+        wp_host.format = RT_STAGE_F32;
+        wp_host.flags = RT_STAGE_BUFFER_READ;
+        RtStageBuffer wip_host = wp_host;
+        wip_host.data = const_cast<float*>(context->softlight_wip);
+
+        RtStageBuffer gamma_srgb_host = wp_host;
+        gamma_srgb_host.data = gamma_srgb.data();
+        gamma_srgb_host.width = RT_WORKING_TRC_GAMMA_ENTRIES;
+        gamma_srgb_host.row_pitch =
+            RT_WORKING_TRC_GAMMA_ENTRIES * sizeof(float);
+        gamma_srgb_host.plane_pitch = gamma_srgb_host.row_pitch;
+        RtStageBuffer igamma_srgb_host = gamma_srgb_host;
+        igamma_srgb_host.data = igamma_srgb.data();
+        RtStageBuffer cachef_host = gamma_srgb_host;
+        cachef_host.data = cachef_lut.data();
+        RtStageBuffer cachefy_host = gamma_srgb_host;
+        cachefy_host.data = cachefy_lut.data();
+
+        char wp_key = 0;
+        char wip_key = 0;
+        char gamma_srgb_key = 0;
+        char igamma_srgb_key = 0;
+        char soft_cachef_key = 0;
+        char soft_cachefy_key = 0;
+        StageDeviceBufferPtr wp_device =
+            residency->acquire(&wp_key, matrix_shape, &error);
+        StageDeviceBufferPtr wip_device =
+            residency->acquire(&wip_key, matrix_shape, &error);
+        StageDeviceBufferPtr gamma_srgb_device =
+            residency->acquire(&gamma_srgb_key, table_shape, &error);
+        StageDeviceBufferPtr igamma_srgb_device =
+            residency->acquire(&igamma_srgb_key, table_shape, &error);
+        StageDeviceBufferPtr cachef_device =
+            residency->acquire(&soft_cachef_key, table_shape, &error);
+        StageDeviceBufferPtr cachefy_device =
+            residency->acquire(&soft_cachefy_key, table_shape, &error);
+        if (!wp_device || !wip_device || !gamma_srgb_device ||
+            !igamma_srgb_device || !cachef_device || !cachefy_device ||
+            residency->upload(wp_device, wp_host) != RT_STAGE_OK ||
+            residency->upload(wip_device, wip_host) != RT_STAGE_OK ||
+            residency->upload(gamma_srgb_device, gamma_srgb_host) !=
+                RT_STAGE_OK ||
+            residency->upload(igamma_srgb_device, igamma_srgb_host) !=
+                RT_STAGE_OK ||
+            residency->upload(cachef_device, cachef_host) != RT_STAGE_OK ||
+            residency->upload(cachefy_device, cachefy_host) != RT_STAGE_OK) {
+            error = "working.trc soft-light table upload failed";
+            return RT_STAGE_FALLBACK;
+        }
+
+        const std::int64_t lab_pitch =
+            static_cast<std::int64_t>(pitch_of(lab_device));
+        const std::int64_t lab_plane_pitch =
+            static_cast<std::int64_t>(plane_pitch_of(lab_device));
+        if (lab_pitch > std::numeric_limits<cl_int>::max() / 3 ||
+            lab_plane_pitch > std::numeric_limits<cl_int>::max() / 3) {
+            error = "working.trc soft-light pitch does not fit the kernel's int";
+            return RT_STAGE_FALLBACK;
+        }
+        const cl_int cl_width = width;
+        const cl_int cl_height = height;
+        const cl_int cl_lab_pitch = static_cast<cl_int>(lab_pitch);
+        const cl_int cl_lab_plane = static_cast<cl_int>(lab_plane_pitch);
+        const cl_float blend =
+            static_cast<cl_float>(context->softlight_strength) / 100.0f;
+        const cl_mem lab_memory = memory_of(lab_device);
+        const cl_mem wp_memory = memory_of(wp_device);
+        const cl_mem wip_memory = memory_of(wip_device);
+        const cl_mem gamma_srgb_memory = memory_of(gamma_srgb_device);
+        const cl_mem igamma_srgb_memory = memory_of(igamma_srgb_device);
+        const cl_mem cachef_memory = memory_of(cachef_device);
+        const cl_mem cachefy_memory = memory_of(cachefy_device);
+        if (lab_memory == nullptr || wp_memory == nullptr ||
+            wip_memory == nullptr || gamma_srgb_memory == nullptr ||
+            igamma_srgb_memory == nullptr || cachef_memory == nullptr ||
+            cachefy_memory == nullptr) {
+            error = "working.trc could not address its soft-light buffers";
+            return RT_STAGE_FALLBACK;
+        }
+
+        std::lock_guard<std::recursive_mutex> lock(env->queue_mutex);
+        cl_uint arg = 0;
+        bool ok = true;
+        ok = ok && set_arg(softlight_kernel, arg++, sizeof(cl_mem),
+                           &lab_memory);
+        ok = ok && set_arg(softlight_kernel, arg++, sizeof(cl_mem),
+                           &wp_memory);
+        ok = ok && set_arg(softlight_kernel, arg++, sizeof(cl_mem),
+                           &wip_memory);
+        ok = ok && set_arg(softlight_kernel, arg++, sizeof(cl_mem),
+                           &gamma_srgb_memory);
+        ok = ok && set_arg(softlight_kernel, arg++, sizeof(cl_mem),
+                           &igamma_srgb_memory);
+        ok = ok && set_arg(softlight_kernel, arg++, sizeof(cl_mem),
+                           &cachef_memory);
+        ok = ok && set_arg(softlight_kernel, arg++, sizeof(cl_mem),
+                           &cachefy_memory);
+        ok = ok && set_arg(softlight_kernel, arg++, sizeof(cl_float), &blend);
+        ok = ok && set_arg(softlight_kernel, arg++, sizeof(cl_int), &cl_width);
+        ok = ok && set_arg(softlight_kernel, arg++, sizeof(cl_int), &cl_height);
+        ok = ok && set_arg(softlight_kernel, arg++, sizeof(cl_int),
+                           &cl_lab_pitch);
+        ok = ok && set_arg(softlight_kernel, arg++, sizeof(cl_int),
+                           &cl_lab_plane);
+        if (!ok) {
+            error = "working.trc soft-light clSetKernelArg failed";
+            return RT_STAGE_FALLBACK;
+        }
+        if (!launch(softlight_kernel, "working.trc soft light")) {
+            return RT_STAGE_FALLBACK;
+        }
+
+        const std::size_t pixels = static_cast<std::size_t>(width) *
+                                   static_cast<std::size_t>(height);
+        prepared_scratch.resize(pixels * 3);
+        prepared.size = sizeof(RtStageBuffer);
+        prepared.data = prepared_scratch.data();
+        prepared.width = width;
+        prepared.height = height;
+        prepared.row_pitch = static_cast<std::size_t>(width) * sizeof(float);
+        prepared.plane_pitch = prepared.row_pitch *
+                               static_cast<std::size_t>(height);
+        prepared.planes = 3;
+        prepared.format = RT_STAGE_F32;
+        prepared.flags = RT_STAGE_BUFFER_READ | RT_STAGE_BUFFER_WRITE;
+        if (residency->readback(lab_device, prepared) != RT_STAGE_OK) {
+            error = "working.trc soft-light readback failed";
+            return RT_STAGE_FALLBACK;
+        }
+    }
+
+    /* The host prefix runs here, after any device pre-pass, on either the
+     * caller's Lab or the frozen readback. */
+    if (context->prepare(context->self, &prepared) != 0) {
+        error = "working.trc host prefix failed";
+        return RT_STAGE_FALLBACK;
+    }
+
+    RtWorkingTrcResult setup{};
+    if (context->build(context->self, &setup) != 0 ||
+        setup.toxyz == nullptr || setup.matrix == nullptr ||
+        setup.gamma == nullptr || setup.curve == nullptr) {
+        error = "working.trc setup did not build the output profile";
+        return RT_STAGE_FALLBACK;
+    }
+
+    for (const float* table : {setup.toxyz, setup.matrix}) {
+        for (int entry = 0; entry < 9; ++entry) {
+            if (!std::isfinite(table[entry])) {
+                error = "working.trc setup produced a non-finite matrix";
+                return RT_STAGE_FALLBACK;
+            }
+        }
+    }
+    if (!std::isfinite(setup.gamma[0]) ||
+        !std::isfinite(setup.gamma[RT_WORKING_TRC_GAMMA_ENTRIES - 1])) {
+        error = "working.trc setup produced a non-finite gamma table";
+        return RT_STAGE_FALLBACK;
+    }
+
+    RtStageBuffer xyz_host{};
+    RtStageBuffer linear_host{};
+    if (context->images(context->self, &xyz_host, &linear_host) != 0 ||
+        !valid(xyz_host) || !valid(linear_host) ||
+        xyz_host.format != RT_STAGE_F32 || xyz_host.planes != 3 ||
+        linear_host.format != RT_STAGE_F32 || linear_host.planes != 3 ||
+        xyz_host.width != width || xyz_host.height != height ||
+        linear_host.width != width || linear_host.height != height) {
+        error = "working.trc setup produced unusable image buffers";
+        return RT_STAGE_FALLBACK;
+    }
+
+    char post_key = 0;
+    if (lab_device == nullptr) {
+        lab_device = residency->acquire(lab.data, image_shape, &error);
+    }
+    StageDeviceBufferPtr xyz_device =
+        residency->acquire(xyz_host.data, image_shape, &error);
+    StageDeviceBufferPtr linear_device =
+        residency->acquire(linear_host.data, image_shape, &error);
+    StageDeviceBufferPtr post =
+        residency->acquire(&post_key, image_shape, &error);
+    if (!lab_device || !xyz_device || !linear_device || !post) {
+        return RT_STAGE_FALLBACK;
+    }
+
+    if ((context->softlight == 0 &&
+         residency->upload(lab_device, lab) != RT_STAGE_OK) ||
+        residency->upload(xyz_device, xyz_host) != RT_STAGE_OK ||
+        residency->upload(linear_device, linear_host) != RT_STAGE_OK) {
+        error = "working.trc input upload failed";
+        return RT_STAGE_FALLBACK;
+    }
 
     const StageDeviceBufferPtr buffers[] = {lab_device, xyz_device,
-                                           linear_device, post};
+                                            linear_device, post};
     for (const StageDeviceBufferPtr& buffer : buffers) {
-        if (buffer->row_pitch() % sizeof(float) != 0 ||
-            buffer->plane_pitch() % sizeof(float) != 0 ||
-            pitch_of(buffer) < static_cast<std::size_t>(width) ||
-            plane_pitch_of(buffer) < static_cast<std::size_t>(height) *
-                                           pitch_of(buffer)) {
+        if (!covers(buffer)) {
             error = "working.trc row or plane pitch does not cover the image";
             return RT_STAGE_FALLBACK;
         }
@@ -3481,28 +3719,6 @@ RtStageStatus run_working_trc(const std::shared_ptr<OpenCLEnv>& env,
         rgb_pitch > std::numeric_limits<cl_int>::max() / 3 ||
         rgb_plane_pitch > std::numeric_limits<cl_int>::max() / 3) {
         error = "working.trc plane pitch does not fit the kernel's int";
-        return RT_STAGE_FALLBACK;
-    }
-
-    RtWorkingTrcResult setup{};
-    if (context->build(context->self, &setup) != 0 ||
-        setup.toxyz == nullptr || setup.matrix == nullptr ||
-        setup.gamma == nullptr || setup.curve == nullptr) {
-        error = "working.trc setup did not build the output profile";
-        return RT_STAGE_FALLBACK;
-    }
-
-    for (const float* table : {setup.toxyz, setup.matrix}) {
-        for (int entry = 0; entry < 9; ++entry) {
-            if (!std::isfinite(table[entry])) {
-                error = "working.trc setup produced a non-finite matrix";
-                return RT_STAGE_FALLBACK;
-            }
-        }
-    }
-    if (!std::isfinite(setup.gamma[0]) ||
-        !std::isfinite(setup.gamma[RT_WORKING_TRC_GAMMA_ENTRIES - 1])) {
-        error = "working.trc setup produced a non-finite gamma table";
         return RT_STAGE_FALLBACK;
     }
 
@@ -3554,7 +3770,6 @@ RtStageStatus run_working_trc(const std::shared_ptr<OpenCLEnv>& env,
     RtStageBuffer cachefy_host = gamma_host;
     cachefy_host.data = cachefy_lut.data();
 
-    const StageBufferShape matrix_shape{RT_STAGE_F32, 9, 1, 1};
     const StageBufferShape curve_shape{RT_STAGE_F32, 8, 1, 1};
     const StageBufferShape gamma_shape{
         RT_STAGE_F32, static_cast<std::int32_t>(RT_WORKING_TRC_GAMMA_ENTRIES),
@@ -3588,30 +3803,6 @@ RtStageStatus run_working_trc(const std::shared_ptr<OpenCLEnv>& env,
         error = "working.trc setup table upload failed";
         return RT_STAGE_FALLBACK;
     }
-
-    const auto set_arg = [&](cl_kernel kernel, cl_uint index, std::size_t bytes,
-                             const void* value) {
-        return env->api->SetKernelArg(kernel, index, bytes, value) == CL_SUCCESS;
-    };
-    const auto launch = [&](cl_kernel kernel, const char* label) {
-        const std::size_t global[2] = {static_cast<std::size_t>(width),
-                                       static_cast<std::size_t>(height)};
-        cl_event done = nullptr;
-        if (env->api->EnqueueNDRangeKernel(env->queue, kernel, 2, nullptr,
-                                           global, nullptr, 0, nullptr,
-                                           &done) != CL_SUCCESS ||
-            done == nullptr) {
-            error = std::string(label) + " launch failed";
-            return false;
-        }
-        const cl_int wait_status = env->api->WaitForEvents(1, &done);
-        env->api->ReleaseEvent(done);
-        if (wait_status != CL_SUCCESS) {
-            error = std::string(label) + " did not complete";
-            return false;
-        }
-        return true;
-    };
 
     const cl_float saturation = static_cast<cl_float>(saturation_double);
 
@@ -3723,7 +3914,6 @@ RtStageStatus run_working_trc(const std::shared_ptr<OpenCLEnv>& env,
 
     return RT_STAGE_OK;
 }
-
 
 /*
  * The lab.tools node. Argument order:
