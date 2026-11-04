@@ -116,6 +116,7 @@ set(RTENGINESOURCEFILES
     simpleprocess.cc
     spot.cc
     stdimagesource.cc
+    stage/ciecam_context.cc
     stage/stage_buffer.cc
     stage/stage_buffer_state.cc
     stage/stage_builtins.cc

@@ -43,6 +43,7 @@
 #include "rawimagesource.h"
 #include "rtengine.h"
 #include "stage/algorithms/gamut_cl.h"
+#include "stage/ciecam_context.h"
 #include "stage/stage_buffer.h"
 #include "stage/stage_graph.h"
 #include "stage/stage_pipeline.h"
@@ -1924,16 +1925,6 @@ private:
         ImProcFunctions &ipf = * (ipf_p.get());
 
         //Colorappearance and tone-mapping associated
-
-        int f_w = 1, f_h = 1;
-
-        if (params.colorappearance.tonecie || params.colorappearance.enabled) {
-            f_w = fw;
-            f_h = fh;
-        }
-
-        CieImage *cieView = new CieImage(f_w, (f_h));
-
         CurveFactory::curveLightBrightColor(
             params.colorappearance.curve,
             params.colorappearance.curvered,
@@ -1970,16 +1961,53 @@ private:
                 adap = std::pow(2.0, E_V - 3.0); //cd / m2
             }
 
-            LUTf CAMBrightCurveJ;
-            LUTf CAMBrightCurveQ;
-            float CAMMean = NAN;
+            /*
+             * The node is opt-in and atomic: a supported configuration runs
+             * the whole block on the device, and every residual is submitted
+             * with the support flag clear so the launcher refuses before the
+             * upload and the builtin runs the original host block. That keeps
+             * one CPU implementation and records impl=host for the residual.
+             */
+            if (stage::node_device("ciecam") ==
+                stage::StageNodeDevice::OpenCL) {
+                const bool configSupported = stage::ciecamSupported(
+                    params, customColCurve1, customColCurvered,
+                    customColCurvegreen, customColCurveblue, customColCurve2,
+                    customColCurve3);
+                stage::CiecamContext context(
+                    params, ipf, *labView, float(adap), customColCurve1,
+                    customColCurvered, customColCurvegreen, customColCurveblue,
+                    customColCurve2, customColCurve3);
+                RtCiecamContext descriptor =
+                    context.descriptor(configSupported);
+                if (configSupported) {
+                    RtCiecamResult setup{};
+                    if (context.build(setup) != 0) {
+                        descriptor.supported = 0u;
+                    }
+                }
 
-            float d, dj, yb;
-            ipf.ciecam_02float(cieView, float (adap), 1, 2, labView, &params, customColCurve1, customColCurvered, customColCurvegreen, customColCurveblue, customColCurve2, customColCurve3, dummy, dummy, CAMBrightCurveJ, CAMBrightCurveQ, CAMMean, 0, 1, true, d, dj, yb, 1);
+                RtStageArg args[3] = {};
+                args[0].kind = RT_STAGE_ARG_BUFFER;
+                args[0].u.buffer = stage::view(*labView);
+                args[1].kind = RT_STAGE_ARG_PTR;
+                args[1].u.ptr = &descriptor;
+                args[2].kind = RT_STAGE_ARG_INT;
+                args[2].u.i = descriptor.supported ? 1 : 0;
+
+                RtStageProfiling profiling{};
+                if (stage::run("ciecam",
+                               std::vector<RtStageArg>(args, args + 3),
+                               &profiling) == RT_STAGE_OK) {
+                    return;
+                }
+            }
+
+            stage::ciecamHostBlock(
+                ipf, params, *labView, float(adap), customColCurve1,
+                customColCurvered, customColCurvegreen, customColCurveblue,
+                customColCurve2, customColCurve3);
         }
-
-        delete cieView;
-        cieView = nullptr;
     }
 
     /*

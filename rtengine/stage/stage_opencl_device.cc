@@ -50,6 +50,7 @@
 #include "color.h"
 #include "rt_math.h"
 #include "sleef.h"
+#include "stage/algorithms/ciecam_cl.h"
 #include "stage/algorithms/gamut_cl.h"
 #include "stage/algorithms/lab_to_rgb_cl.h"
 #include "stage/algorithms/rgb_proc_cl.h"
@@ -66,6 +67,7 @@
 #include "stage/algorithms/munsell_lch_cl.h"
 #include "stage/algorithms/vibrance_cl.h"
 #include "stage/algorithms/working_trc_cl.h"
+#include "stage/ciecam_context.h"
 #include "stage/lab_tools_context.h"
 #include "stage/lab_wavelet_context.h"
 #include "stage/local_adjustments_context.h"
@@ -776,6 +778,23 @@ const std::string& working_trc_source()
 }
 
 /*
+ * The ciecam program: CIE-CAM 02. The host context supplies the
+ * viewing-condition scalars, the two brightness tables and the optional
+ * working-space inverse; the block's arithmetic is in ciecam_cl.h. The
+ * fragment follows lab_tools_cl.h and vibrance_cl.h because it reuses their
+ * Lab caches, gamut test and xatan2f/xsincosf.
+ */
+const std::string& ciecam_source()
+{
+    static const std::string source =
+        std::string("#pragma OPENCL FP_CONTRACT OFF\n"
+                    "#pragma STDC FP_CONTRACT OFF\n") +
+        RT_LAB_TOOLS_CL + RT_MUNSELL_LCH_CL + RT_VIBRANCE_CL +
+        RT_CIE_CAM_CL;
+    return source;
+}
+
+/*
  * The lab.tools program: the LabGrid pass, the shadows/highlights mask,
  * guided-filter and blend passes, and vibrance. lab_tools_cl.h carries the
  * block's own arithmetic and its Lab-cache lookups; the Munsell and vibrance
@@ -1358,6 +1377,7 @@ const std::vector<KernelDef>& kernels()
         {"thumbnail.rgb", rgb_proc_source().c_str(), "rt_rgb_proc"},
         {"gamut", RT_GAMUT_CL, "rt_gamut"},
         {"working.trc", working_trc_source().c_str(), "rt_working_trc_second"},
+        {"ciecam", ciecam_source().c_str(), "rt_ciecam"},
         {"lab.tools", lab_tools_source().c_str(), "rt_lab_tools_mask"},
         {"thumbnail.lab", lab_tools_source().c_str(), "rt_lab_tools_mask"},
         {"lab.tools.labcurve", lab_curve_source().c_str(), "rt_lab_tools_lab_curve"},
@@ -1990,6 +2010,7 @@ cl_kernel compiled_kernel_entry(const std::shared_ptr<OpenCLEnv>& env,
      * division to a reciprocal approximation. */
     const char* build_options =
         std::strcmp(def->name, "working.trc") == 0 ||
+                std::strcmp(def->name, "ciecam") == 0 ||
                 std::strcmp(def->name, "lab.tools") == 0 ||
                 std::strcmp(def->name, "thumbnail.lab") == 0 ||
                 std::strcmp(def->name, "lab.tools.labcurve") == 0 ||
@@ -3004,6 +3025,282 @@ RtStageStatus run_gamut(const std::shared_ptr<OpenCLEnv>& env,
 
     if (residency->readback(image, lab) != RT_STAGE_OK) {
         error = "gamut readback failed";
+        return RT_STAGE_ERROR;
+    }
+
+    return RT_STAGE_OK;
+}
+
+
+/*
+ * The ciecam node. Argument order:
+ *   [0] Lab three-plane F32 buffer, read and written in place,
+ *   [1] PTR host context (RtCiecamContext), host-only,
+ *   [2] int support flag, mirrored from the context descriptor.
+ *
+ * The host context builds the viewing-condition table, the two brightness
+ * tables and the optional working-space inverse in ciecam_context.cc. The
+ * image is uploaded, the node runs as one kernel and the three planes are read
+ * back after a wait, so a refusal leaves the host image untouched for the
+ * builtin. A clear support flag, in either the argument or the descriptor,
+ * refuses before the upload and records impl=host.
+ */
+RtStageStatus run_ciecam(const std::shared_ptr<OpenCLEnv>& env,
+                         const std::shared_ptr<OpenCLResidency>& residency,
+                         const std::vector<RtStageArg>& args,
+                         std::string& error)
+{
+    constexpr std::size_t ARG_COUNT = 3;
+    if (args.size() != ARG_COUNT) {
+        error = "ciecam expects a buffer, a context and a scalar";
+        return RT_STAGE_INVALID;
+    }
+    if (args[0].kind != RT_STAGE_ARG_BUFFER ||
+        args[1].kind != RT_STAGE_ARG_PTR ||
+        args[2].kind != RT_STAGE_ARG_INT) {
+        error = "ciecam has an argument of the wrong kind";
+        return RT_STAGE_INVALID;
+    }
+
+    const RtStageBuffer& lab = args[0].u.buffer;
+    if (!valid(lab) || lab.format != RT_STAGE_F32 || lab.planes != 3) {
+        error = "ciecam needs a three-plane F32 Lab buffer";
+        return RT_STAGE_INVALID;
+    }
+
+    const auto* context =
+        static_cast<const RtCiecamContext*>(args[1].u.ptr);
+    if (context == nullptr || context->size != sizeof(RtCiecamContext) ||
+        context->version != RT_CIECAM_CONTEXT_VERSION ||
+        context->magic != RT_CIECAM_CONTEXT_MAGIC ||
+        context->build == nullptr || context->run_host == nullptr) {
+        error = "ciecam has an invalid host context";
+        return RT_STAGE_INVALID;
+    }
+
+    const std::int64_t supported = args[2].u.i;
+    if (supported != 0 && supported != 1) {
+        error = "ciecam support flag must be 0 or 1";
+        return RT_STAGE_INVALID;
+    }
+    if (supported != 1 || context->supported != 1) {
+        error = "ciecam support flag is not set";
+        return RT_STAGE_FALLBACK;
+    }
+
+    RtCiecamResult setup{};
+    if (context->build(context->self, &setup) != 0 ||
+        setup.rec == nullptr || setup.lutj == nullptr ||
+        setup.lutq == nullptr || setup.wip == nullptr) {
+        error = "ciecam setup did not build its tables";
+        return RT_STAGE_FALLBACK;
+    }
+    for (int entry = 0; entry < RT_CIECAM_REC_COUNT; ++entry) {
+        if (!std::isfinite(setup.rec[entry])) {
+            error = "ciecam setup produced a non-finite scalar";
+            return RT_STAGE_FALLBACK;
+        }
+    }
+    for (int entry = 0; entry < 9; ++entry) {
+        if (!std::isfinite(setup.wip[entry])) {
+            error = "ciecam setup produced a non-finite matrix";
+            return RT_STAGE_FALLBACK;
+        }
+    }
+    if (!std::isfinite(setup.lutj[0]) ||
+        !std::isfinite(setup.lutj[RT_CIECAM_TABLE_ENTRIES - 1]) ||
+        !std::isfinite(setup.lutq[0]) ||
+        !std::isfinite(setup.lutq[RT_CIECAM_TABLE_ENTRIES - 1])) {
+        error = "ciecam setup produced a non-finite brightness table";
+        return RT_STAGE_FALLBACK;
+    }
+
+    const KernelDef* def = find_kernel("ciecam");
+    assert(def != nullptr);
+    cl_kernel kernel = compiled_kernel(env, def, error);
+    if (kernel == nullptr) {
+        return RT_STAGE_FALLBACK;
+    }
+
+    const int width = lab.width;
+    const int height = lab.height;
+    const StageBufferShape image_shape{RT_STAGE_F32, width, height, 3};
+    StageDeviceBufferPtr image =
+        residency->acquire(lab.data, image_shape, &error);
+    if (!image) {
+        return RT_STAGE_FALLBACK;
+    }
+    if (residency->upload(image, lab) != RT_STAGE_OK) {
+        error = "ciecam image upload failed";
+        return RT_STAGE_FALLBACK;
+    }
+
+    /* The host's Lab caches: the same 65536 samples Color::XYZ2Lab reads. */
+    std::vector<float> cachef_lut(RT_CIECAM_CACHE_ENTRIES);
+    std::vector<float> cachefy_lut(RT_CIECAM_CACHE_ENTRIES);
+    for (std::size_t i = 0; i < cachef_lut.size(); ++i) {
+        cachef_lut[i] = Color::cachef[static_cast<int>(i)];
+        cachefy_lut[i] = Color::cachefy[static_cast<int>(i)];
+    }
+
+    RtStageBuffer rec_host{};
+    rec_host.size = sizeof(RtStageBuffer);
+    rec_host.data = const_cast<float*>(setup.rec);
+    rec_host.width = RT_CIECAM_REC_COUNT;
+    rec_host.height = 1;
+    rec_host.row_pitch = RT_CIECAM_REC_COUNT * sizeof(float);
+    rec_host.plane_pitch = rec_host.row_pitch;
+    rec_host.planes = 1;
+    rec_host.format = RT_STAGE_F32;
+    rec_host.flags = RT_STAGE_BUFFER_READ;
+
+    RtStageBuffer lut_host = rec_host;
+    lut_host.width = RT_CIECAM_TABLE_ENTRIES;
+    lut_host.row_pitch = RT_CIECAM_TABLE_ENTRIES * sizeof(float);
+    lut_host.plane_pitch = lut_host.row_pitch;
+
+    RtStageBuffer wip_host = rec_host;
+    wip_host.data = const_cast<float*>(setup.wip);
+    wip_host.width = 9;
+    wip_host.row_pitch = 9 * sizeof(float);
+    wip_host.plane_pitch = wip_host.row_pitch;
+
+    RtStageBuffer cache_host = rec_host;
+    cache_host.width = RT_CIECAM_CACHE_ENTRIES;
+    cache_host.row_pitch = RT_CIECAM_CACHE_ENTRIES * sizeof(float);
+    cache_host.plane_pitch = cache_host.row_pitch;
+
+    const StageBufferShape rec_shape{RT_STAGE_F32, RT_CIECAM_REC_COUNT, 1, 1};
+    const StageBufferShape table_shape{
+        RT_STAGE_F32, RT_CIECAM_TABLE_ENTRIES, 1, 1};
+    const StageBufferShape wip_shape{RT_STAGE_F32, 9, 1, 1};
+    const StageBufferShape cache_shape{
+        RT_STAGE_F32, RT_CIECAM_CACHE_ENTRIES, 1, 1};
+
+    RtStageBuffer lutj_host = lut_host;
+    lutj_host.data = const_cast<float*>(setup.lutj);
+    RtStageBuffer lutq_host = lut_host;
+    lutq_host.data = const_cast<float*>(setup.lutq);
+
+    char rec_key = 0;
+    char lutj_key = 0;
+    char lutq_key = 0;
+    char wip_key = 0;
+    char cachef_key = 0;
+    char cachefy_key = 0;
+    RtStageBuffer cachef_host = cache_host;
+    cachef_host.data = cachef_lut.data();
+    RtStageBuffer cachefy_host = cache_host;
+    cachefy_host.data = cachefy_lut.data();
+
+    StageDeviceBufferPtr rec_device =
+        residency->acquire(&rec_key, rec_shape, &error);
+    StageDeviceBufferPtr lutj_device =
+        residency->acquire(&lutj_key, table_shape, &error);
+    StageDeviceBufferPtr lutq_device =
+        residency->acquire(&lutq_key, table_shape, &error);
+    StageDeviceBufferPtr wip_device =
+        residency->acquire(&wip_key, wip_shape, &error);
+    StageDeviceBufferPtr cachef_device =
+        residency->acquire(&cachef_key, cache_shape, &error);
+    StageDeviceBufferPtr cachefy_device =
+        residency->acquire(&cachefy_key, cache_shape, &error);
+    if (!rec_device || !lutj_device || !lutq_device || !wip_device ||
+        !cachef_device || !cachefy_device ||
+        residency->upload(rec_device, rec_host) != RT_STAGE_OK ||
+        residency->upload(lutj_device, lutj_host) != RT_STAGE_OK ||
+        residency->upload(lutq_device, lutq_host) != RT_STAGE_OK ||
+        residency->upload(wip_device, wip_host) != RT_STAGE_OK ||
+        residency->upload(cachef_device, cachef_host) != RT_STAGE_OK ||
+        residency->upload(cachefy_device, cachefy_host) != RT_STAGE_OK) {
+        error = "ciecam setup table upload failed";
+        return RT_STAGE_FALLBACK;
+    }
+
+    auto memory_of = [](const StageDeviceBufferPtr& buffer) {
+        auto device = std::dynamic_pointer_cast<OpenCLDeviceBuffer>(buffer);
+        return device != nullptr ? device->memory() : nullptr;
+    };
+
+    const std::size_t row_pitch_bytes = image->row_pitch();
+    const std::size_t plane_pitch_bytes = image->plane_pitch();
+    if (row_pitch_bytes % sizeof(float) != 0 ||
+        plane_pitch_bytes % sizeof(float) != 0 ||
+        row_pitch_bytes / sizeof(float) < static_cast<std::size_t>(width) ||
+        plane_pitch_bytes / sizeof(float) <
+            static_cast<std::size_t>(height) *
+                (row_pitch_bytes / sizeof(float))) {
+        error = "ciecam row or plane pitch does not cover the image";
+        return RT_STAGE_FALLBACK;
+    }
+    const std::int64_t plane_pitch = static_cast<std::int64_t>(
+        plane_pitch_bytes / sizeof(float));
+    if (plane_pitch > std::numeric_limits<cl_int>::max() / 3) {
+        error = "ciecam plane pitch does not fit the kernel's int arithmetic";
+        return RT_STAGE_FALLBACK;
+    }
+
+    std::lock_guard<std::recursive_mutex> lock(env->queue_mutex);
+
+    const cl_int cl_width = width;
+    const cl_int cl_height = height;
+    const cl_int cl_pitch = static_cast<cl_int>(row_pitch_bytes / sizeof(float));
+    const cl_int cl_plane = static_cast<cl_int>(plane_pitch);
+
+    const auto set_arg = [&](cl_uint index, std::size_t bytes,
+                             const void* value) {
+        return env->api->SetKernelArg(kernel, index, bytes, value) == CL_SUCCESS;
+    };
+
+    cl_uint arg = 0;
+    bool ok = true;
+    cl_mem image_memory = memory_of(image);
+    cl_mem rec_memory = memory_of(rec_device);
+    cl_mem lutj_memory = memory_of(lutj_device);
+    cl_mem lutq_memory = memory_of(lutq_device);
+    cl_mem wip_memory = memory_of(wip_device);
+    cl_mem cachef_memory = memory_of(cachef_device);
+    cl_mem cachefy_memory = memory_of(cachefy_device);
+    ok = image_memory != nullptr && rec_memory != nullptr &&
+         lutj_memory != nullptr && lutq_memory != nullptr &&
+         wip_memory != nullptr && cachef_memory != nullptr &&
+         cachefy_memory != nullptr;
+    ok = ok && set_arg(arg++, sizeof(cl_mem), &image_memory) &&
+         set_arg(arg++, sizeof(cl_mem), &rec_memory) &&
+         set_arg(arg++, sizeof(cl_mem), &lutj_memory) &&
+         set_arg(arg++, sizeof(cl_mem), &lutq_memory) &&
+         set_arg(arg++, sizeof(cl_mem), &wip_memory) &&
+         set_arg(arg++, sizeof(cl_mem), &cachef_memory) &&
+         set_arg(arg++, sizeof(cl_mem), &cachefy_memory) &&
+         set_arg(arg++, sizeof(cl_int), &cl_width) &&
+         set_arg(arg++, sizeof(cl_int), &cl_height) &&
+         set_arg(arg++, sizeof(cl_int), &cl_pitch) &&
+         set_arg(arg++, sizeof(cl_int), &cl_plane);
+    if (!ok) {
+        error = "ciecam clSetKernelArg failed";
+        return RT_STAGE_FALLBACK;
+    }
+
+    const std::size_t global[2] = {static_cast<std::size_t>(cl_width),
+                                   static_cast<std::size_t>(cl_height)};
+    cl_event done = nullptr;
+    if (env->api->EnqueueNDRangeKernel(env->queue, kernel, 2, nullptr, global,
+                                       nullptr, 0, nullptr,
+                                       &done) != CL_SUCCESS ||
+        done == nullptr) {
+        error = "ciecam launch failed";
+        return RT_STAGE_ERROR;
+    }
+
+    const cl_int wait_status = env->api->WaitForEvents(1, &done);
+    env->api->ReleaseEvent(done);
+    if (wait_status != CL_SUCCESS) {
+        error = "ciecam did not complete";
+        return RT_STAGE_ERROR;
+    }
+
+    if (residency->readback(image, lab) != RT_STAGE_OK) {
+        error = "ciecam readback failed";
         return RT_STAGE_ERROR;
     }
 
@@ -19697,6 +19994,20 @@ public:
         } else if (request.name == "gamut") {
             const RtStageStatus status =
                 run_gamut(env_, residency_, request.args, error);
+            if (status == RT_STAGE_OK) {
+                StageEvent done;
+                done.status = StageEventStatus::Complete;
+                done.result = RT_STAGE_OK;
+                done.device = StageDeviceType::OPENCL;
+                done.asynchronous = false;
+                return done;
+            }
+            StageEvent fallback = StageQueue::submit(request, profiling);
+            fallback.note = error;
+            return fallback;
+        } else if (request.name == "ciecam") {
+            const RtStageStatus status =
+                run_ciecam(env_, residency_, request.args, error);
             if (status == RT_STAGE_OK) {
                 StageEvent done;
                 done.status = StageEventStatus::Complete;
