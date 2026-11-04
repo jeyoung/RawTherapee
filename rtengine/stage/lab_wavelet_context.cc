@@ -536,10 +536,13 @@ bool denoiseAdmitted(const procparams::WaveletParams& wavelet, int width,
         return false;
     }
     /*
-     * The user chroma strength is inert for this arm: the block's `variC` is
-     * dead at the forced `local == 1`, and only `cp.chromco`'s `> 30` test
-     * changes the chroma-magnitude ramp. Balance-chroma would move `variC`
-     * and colour-by-noise changes the source, so both stay refused.
+     * The user chroma strength is inert for this arm: `Expnoise` fixes the
+     * base decomposition at six levels, so `levwava` is six, `edge` becomes
+     * one and `WaveletDenoiseAllAB()` runs with `local == 1`. At that local
+     * the block ignores `variC`/`variCb`; only `cp.chromco`'s `> 30` test
+     * changes the chroma-magnitude ramp. Balance-chroma only moves `variC`,
+     * so it is inert for the same reason and is admitted as a range-checked
+     * slider. Colour-by-noise changes the source, so it stays refused.
      */
     if (!std::isfinite(wavelet.chromfi) ||
         wavelet.chromfi < LAB_WAVELET_MIN_CHROMA_STRENGTH ||
@@ -547,7 +550,10 @@ bool denoiseAdmitted(const procparams::WaveletParams& wavelet, int width,
         !std::isfinite(wavelet.chromco) ||
         wavelet.chromco < LAB_WAVELET_MIN_CHROMA_STRENGTH ||
         wavelet.chromco > LAB_WAVELET_MAX_CHROMA_STRENGTH ||
-        wavelet.balchrom != 0.0 || wavelet.cbenab) {
+        !std::isfinite(wavelet.balchrom) ||
+        wavelet.balchrom < LAB_WAVELET_MIN_WAVELET_BALCHROM ||
+        wavelet.balchrom > LAB_WAVELET_MAX_WAVELET_BALCHROM ||
+        wavelet.cbenab) {
         return false;
     }
     /*
@@ -626,11 +632,22 @@ bool denoiseAdmitted(const procparams::WaveletParams& wavelet, int width,
             }
         }
     }
-    /* A non-identity hue curve modulates noisevarlum per pixel. */
+    /*
+     * A non-identity hue curve modulates noisevarlum per pixel. The device
+     * samples the curve's FlatCurve polyline on the half grid, so the encoded
+     * knot set must fit the denoise hue block.
+     */
     {
         const FlatCurve hue_curve(wavelet.wavhuecurve);
         if (!hue_curve.isIdentity()) {
-            return false;
+            const std::vector<double>& px = hue_curve.polylineX();
+            const std::vector<double>& py = hue_curve.polylineY();
+            const std::vector<double>& ps = hue_curve.polylineSlope();
+            if (px.empty() ||
+                px.size() > RT_LAB_WAVELET_REFINE_POLY_MAX ||
+                py.size() != px.size() || ps.size() + 1 != px.size()) {
+                return false;
+            }
         }
     }
     const double levels[5] = {
@@ -930,7 +947,7 @@ bool labWaveletWaveletSupported(const procparams::ProcParams& params,
     const bool final_curves = wavelet.expfinal;
     const bool toning = wavelet.exptoning;
     const bool denoise = wavelet.expnoise;
-    if ((!contrast && !chroma && !edge_active && !final_curves && !toning &&
+    if ((!contrast && !chroma && !edge && !final_curves && !toning &&
          !denoise) ||
         wavelet.expbl || wavelet.expresid) {
         return false;
@@ -980,11 +997,16 @@ bool labWaveletWaveletSupported(const procparams::ProcParams& params,
         }
     }
     /*
-     * An enabled edge panel with a zero strength is a no-op, but the panel is
-     * advertised as running, so refuse it rather than record a device pass
-     * that did nothing; the whole block then stays on the host.
+     * An enabled edge panel with a zero strength skips the edge block
+     * (`cp.val > 0 && cp.edgeena`), but `cp.edgeena` still disables the a/b
+     * level trim and keeps the a/b decomposition and reconstruction alive.
+     * The device reproduces that round trip, so the degenerate panel is a
+     * device pass whose only work is the block's own a/b round trip. The
+     * strength must still be inside its slider range: a negative value is
+     * not the zero-strength no-op.
      */
-    if (edge && !edge_active) {
+    if (edge && (wavelet.edgval < LAB_WAVELET_MIN_WAVELET_EDGVAL ||
+                 wavelet.edgval > LAB_WAVELET_MAX_WAVELET_EDGVAL)) {
         return false;
     }
     /*
@@ -1819,6 +1841,19 @@ int LabWaveletContext::build(RtLabWaveletResult& out)
     wavelet_denoise_ = denoiseAdmitted(params_.wavelet, width_, height_);
     wavelet_bishrink_ =
         wavelet_denoise_ && params_.wavelet.quamethod == "agre";
+    /*
+     * The L denoise pass's hue modulation: the block samples wavhuecurve at
+     * every pixel's hue and multiplies the noise variance before the shrink.
+     * The encode is the same FlatCurve polyline encoding the refinement uses.
+     */
+    wavelet_hue_curve_.clear();
+    if (wavelet_denoise_) {
+        const FlatCurve hue_curve(params_.wavelet.wavhuecurve);
+        if (!hue_curve.isIdentity() &&
+            !encodeFlatCurvePolyline(hue_curve, wavelet_hue_curve_)) {
+            return 5;
+        }
+    }
     {
         const procparams::WaveletParams& wavelet = params_.wavelet;
         /* The "cur" arm samples the block's WavCurve over wavdenoise when
@@ -2021,7 +2056,8 @@ int LabWaveletContext::build(RtLabWaveletResult& out)
     }
     wavelet_ab_ = wavelet_chroma_ || wavelet_edge_ || wavelet_final_ ||
                   wavelet_toning_ || wavelet_denoise_ || wavelet_ba_ ||
-                  (params_.wavelet.enabled && selection_active_);
+                  (params_.wavelet.enabled &&
+                   (selection_active_ || params_.wavelet.expedge));
 
     if (levels_ > 0) {
         if (width_ < 8 || height_ < 8) {
@@ -2471,12 +2507,28 @@ int LabWaveletContext::build(RtLabWaveletResult& out)
                 std::max(0.000001f, kr4 * variance(lev[4]));
             denoise_tail[6] = static_cast<float>(wavelet.ballum);
 
+            /*
+             * The L pass's hue modulation follows the squared MAD entries.
+             * The block is fixed-size and the count is zero for the identity
+             * curve, which the kernel reads as "no modulation".
+             */
+            float* hue_block =
+                denoise_tail + RT_LAB_WAVELET_DENOISE_HEADER +
+                static_cast<std::size_t>(planes) *
+                    static_cast<std::size_t>(wavelet_levels_) *
+                    RT_LAB_WAVELET_DENOISE_MAD_ENTRIES;
+            for (std::size_t index = 0;
+                 index < wavelet_hue_curve_.size(); ++index) {
+                hue_block[index] = wavelet_hue_curve_[index];
+            }
+
             if (wavelet_refine_) {
                 const std::size_t refine_offset =
                     denoise_offset + RT_LAB_WAVELET_DENOISE_HEADER +
                     static_cast<std::size_t>(planes) *
                         static_cast<std::size_t>(wavelet_levels_) *
-                        RT_LAB_WAVELET_DENOISE_MAD_ENTRIES;
+                        RT_LAB_WAVELET_DENOISE_MAD_ENTRIES +
+                    RT_LAB_WAVELET_DENOISE_HUE_ENTRIES;
                 float* refine_tail = table + refine_offset;
                 refine_tail[0] = 0.f;
                 if (wavelet_refine_active_) {
@@ -2988,7 +3040,8 @@ int LabWaveletContext::computeRefine(const float* pre_stats,
         denoise_offset + RT_LAB_WAVELET_DENOISE_HEADER +
         static_cast<std::size_t>(planes) *
             static_cast<std::size_t>(stride) *
-            RT_LAB_WAVELET_DENOISE_MAD_ENTRIES;
+            RT_LAB_WAVELET_DENOISE_MAD_ENTRIES +
+        RT_LAB_WAVELET_DENOISE_HUE_ENTRIES;
     float* tail = wavelet_params_.data() + refine_offset;
     tail[0] = 0.f;
 

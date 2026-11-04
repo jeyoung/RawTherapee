@@ -7948,7 +7948,7 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
                            static_cast<int>(
                                RT_LAB_WAVELET_TONING_MEA_ENTRIES))
                  : 0);
-        const cl_int cl_refine_offset =
+        const cl_int cl_denoise_hue_offset =
             cl_denoise_offset +
             (wavelet_denoise
                  ? static_cast<cl_int>(
@@ -7957,6 +7957,18 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
                            static_cast<int>(
                                RT_LAB_WAVELET_DENOISE_MAD_ENTRIES))
                  : 0);
+        const cl_int cl_denoise_hue_active =
+            (wavelet_denoise &&
+             wavelet_params[cl_denoise_hue_offset] >= 2.0f)
+                ? 1
+                : 0;
+        const cl_int cl_refine_offset =
+            cl_denoise_hue_offset +
+            (wavelet_denoise
+                 ? static_cast<cl_int>(
+                       RT_LAB_WAVELET_DENOISE_HUE_ENTRIES)
+                 : 0);
+
         const cl_int cl_ba_offset =
             wavelet_ba
                 ? static_cast<cl_int>(
@@ -9134,24 +9146,38 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
                     ok = ok && set_arg(shrink_l_kernel, 3, sizeof(cl_int),
                                        &l_pitch);
                     ok = ok && set_arg(shrink_l_kernel, 4, sizeof(cl_mem),
-                                       &sfave_memory);
+                                       &plane_a_memory);
                     ok = ok && set_arg(shrink_l_kernel, 5, sizeof(cl_int),
-                                       &cl_sfave_pitch);
-                    ok = ok && set_arg(shrink_l_kernel, 6, sizeof(cl_float),
-                                       &vari);
-                    ok = ok && set_arg(shrink_l_kernel, 7, sizeof(cl_float),
-                                       &mad);
-                    ok = ok && set_arg(shrink_l_kernel, 8, sizeof(cl_float),
-                                       &ballum);
+                                       &plane_a_pitch);
+                    ok = ok && set_arg(shrink_l_kernel, 6, sizeof(cl_mem),
+                                       &plane_b_memory);
+                    ok = ok && set_arg(shrink_l_kernel, 7, sizeof(cl_int),
+                                       &plane_b_pitch);
+                    ok = ok && set_arg(shrink_l_kernel, 8, sizeof(cl_mem),
+                                       &params_memory);
                     ok = ok && set_arg(shrink_l_kernel, 9, sizeof(cl_int),
-                                       &cl_level);
+                                       &cl_denoise_hue_offset);
                     ok = ok && set_arg(shrink_l_kernel, 10, sizeof(cl_int),
-                                       &cl_half_w);
-                    ok = ok && set_arg(shrink_l_kernel, 11, sizeof(cl_int),
-                                       &cl_half_h);
+                                       &cl_denoise_hue_active);
+                    ok = ok && set_arg(shrink_l_kernel, 11, sizeof(cl_mem),
+                                       &sfave_memory);
                     ok = ok && set_arg(shrink_l_kernel, 12, sizeof(cl_int),
+                                       &cl_sfave_pitch);
+                    ok = ok && set_arg(shrink_l_kernel, 13, sizeof(cl_float),
+                                       &vari);
+                    ok = ok && set_arg(shrink_l_kernel, 14, sizeof(cl_float),
+                                       &mad);
+                    ok = ok && set_arg(shrink_l_kernel, 15, sizeof(cl_float),
+                                       &ballum);
+                    ok = ok && set_arg(shrink_l_kernel, 16, sizeof(cl_int),
+                                       &cl_level);
+                    ok = ok && set_arg(shrink_l_kernel, 17, sizeof(cl_int),
+                                       &cl_half_w);
+                    ok = ok && set_arg(shrink_l_kernel, 18, sizeof(cl_int),
+                                       &cl_half_h);
+                    ok = ok && set_arg(shrink_l_kernel, 19, sizeof(cl_int),
                                        &cl_width);
-                    ok = ok && set_arg(shrink_l_kernel, 13, sizeof(cl_int),
+                    ok = ok && set_arg(shrink_l_kernel, 20, sizeof(cl_int),
                                        &cl_height);
                     if (!ok || !launch(shrink_l_kernel, half_global,
                                        "lab.wavelet shrink L")) {

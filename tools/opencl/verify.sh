@@ -352,6 +352,13 @@ quick() {
         "$ROOT/devnotes/opencl/pp3/labwavelet-denoise.pp3" lab.wavelet cpu
     run_stage_device "pef/stage-device-lab-wavelet-denoise-agre" \
         "$ROOT/devnotes/opencl/pp3/labwavelet-denoise-agre.pp3" lab.wavelet cpu
+    run_stage_device "pef/stage-device-lab-wavelet-denoise-balance" \
+        "$ROOT/devnotes/opencl/pp3/labwavelet-denoise-balance.pp3" \
+        lab.wavelet cpu
+    run_stage_device "pef/stage-device-lab-wavelet-denoise-hue" \
+        "$ROOT/devnotes/opencl/pp3/labwavelet-denoise-hue.pp3" lab.wavelet cpu
+    run_stage_device "pef/stage-device-lab-wavelet-edge-zero" \
+        "$ROOT/devnotes/opencl/pp3/labwavelet-edge-zero.pp3" lab.wavelet cpu
     run_stage_device "pef/stage-device-lab-wavelet-clarity" \
         "$ROOT/devnotes/opencl/pp3/labwavelet-clarity.pp3" lab.wavelet cpu
     run_stage_device "pef/stage-device-lab-wavelet-clarity-sup" \
@@ -788,6 +795,13 @@ stage_device() {
         "$ROOT/devnotes/opencl/pp3/labwavelet-denoise.pp3" lab.wavelet cpu
     run_stage_device "pef/stage-device-lab-wavelet-denoise-agre" \
         "$ROOT/devnotes/opencl/pp3/labwavelet-denoise-agre.pp3" lab.wavelet cpu
+    run_stage_device "pef/stage-device-lab-wavelet-denoise-balance" \
+        "$ROOT/devnotes/opencl/pp3/labwavelet-denoise-balance.pp3" \
+        lab.wavelet cpu
+    run_stage_device "pef/stage-device-lab-wavelet-denoise-hue" \
+        "$ROOT/devnotes/opencl/pp3/labwavelet-denoise-hue.pp3" lab.wavelet cpu
+    run_stage_device "pef/stage-device-lab-wavelet-edge-zero" \
+        "$ROOT/devnotes/opencl/pp3/labwavelet-edge-zero.pp3" lab.wavelet cpu
     run_stage_device "pef/stage-device-lab-wavelet-clarity" \
         "$ROOT/devnotes/opencl/pp3/labwavelet-clarity.pp3" lab.wavelet cpu
     run_stage_device "pef/stage-device-lab-wavelet-clarity-sup" \

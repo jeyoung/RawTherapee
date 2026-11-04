@@ -2111,14 +2111,30 @@ __kernel void rt_lab_wavelet_w_noisevar(
 }
 
 /*
+ * The FlatCurve hue helpers are defined with the final soft radius's cross
+ * terms further down; the L denoise pass samples the same wavhuecurve
+ * polyline, so it needs them in scope here.
+ */
+inline float rt_lw_softend_xatan2f(float y, float x);
+inline double rt_lw_softend_huehsv2(float hh);
+inline double rt_lw_softend_polyline(__global const float* source, double t);
+
+/*
  * ShrinkAllL()'s local shrinkage, before boxblur(). `vari` is vari[level] and
  * `mad` is the level's squared madL for this direction; `ballum` selects the
  * noisevarlum table entry. The host's vector and scalar forms differ only by
- * the grouping of the same product, which this form reproduces.
+ * the grouping of the same product, which this form reproduces. When
+ * `hue_active` is set the block has multiplied noisevarlum by
+ * `1 + 2 * (wavhuecurve(huelab_to_huehsv2(xatan2f(b, a))) - 0.5)` at the
+ * last full-resolution pixel of each half-grid cell, so the same sample is
+ * modulated here before the square.
  */
 __kernel void rt_lab_wavelet_w_shrink_l(
     __global const float* band, int band_pitch,
     __global const float* orig_l, int l_pitch,
+    __global const float* plane_a, int a_pitch,
+    __global const float* plane_b, int b_pitch,
+    __global const float* params, int hue_offset, int hue_active,
     __global float* sfave, int sfave_pitch,
     float vari, float mad, float ballum,
     int level, int w, int h, int width, int height)
@@ -2147,6 +2163,29 @@ __kernel void rt_lab_wavelet_w_shrink_l(
         nv = ac * l + bc;
     } else {
         nv = nvll[index];
+    }
+    if (hue_active != 0) {
+        /*
+         * The host's two full-resolution loops both write the half grid.
+         * The ramp loop overwrites, so the value left in a cell is the
+         * clamped (2y+1, 2x+1) corner sample; the hue loop then multiplies
+         * that value once per full-resolution pixel in the cell, in row-major
+         * order. The product therefore spans the whole 1x1..2x2 cell, not
+         * just the corner. Reproduce the sequential float multiplies.
+         */
+        const int y_end = min(2 * y + 1, height - 1);
+        const int x_end = min(2 * x + 1, width - 1);
+        for (int iy = 2 * y; iy <= y_end; ++iy) {
+            for (int ix = 2 * x; ix <= x_end; ++ix) {
+                const float a = plane_a[iy * a_pitch + ix];
+                const float b = plane_b[iy * b_pitch + ix];
+                const float hue = rt_lw_softend_xatan2f(b, a);
+                const double hsv = rt_lw_softend_huehsv2(hue);
+                const float curve =
+                    (float)rt_lw_softend_polyline(params + hue_offset, hsv);
+                nv *= 1.0f + 2.0f * (curve - 0.5f);
+            }
+        }
     }
     const float nvl = vari * nv * nv;
     const float level_factor = mad * 5.0f / (float)(level + 1);

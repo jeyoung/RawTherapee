@@ -277,6 +277,9 @@ struct ProcParams;
  *   then one plane-major block per plane: levels * 3 squared MAD entries,
  *   direction-major inside each level. Plane 0 is L, planes 1 and 2 are the
  *   a and b bands the forced chroma arm denoises.
+ *   then RT_LAB_WAVELET_DENOISE_HUE_ENTRIES floats: the wavhuecurve polyline
+ *   the L pass samples per pixel to modulate the noise variance. A zero count
+ *   means the identity curve, the admitted default.
  * `quaMethod` "cons" runs `WaveletDenoiseAllL()` and `WaveletDenoiseAllAB()`
  * once per plane; "agre" runs the BiShrink pair first and then those same
  * passes, reusing this tail. The MAD histogram is a separate internal device
@@ -320,6 +323,16 @@ struct ProcParams;
 #define RT_LAB_WAVELET_REFINE_CURVE_HEADER 2u
 /* FlatCurve's default polyline count is 1000 plus the closing point. */
 #define RT_LAB_WAVELET_REFINE_POLY_MAX 1024u
+/*
+ * The denoise hue curve's block, present after the denoise tail's squared MAD
+ * entries whenever the denoise arm runs. It carries the wavhuecurve FlatCurve
+ * polyline in the same encoding as the refinement tail: the knot count, the
+ * abscissae, the ordinates and count-1 slopes. A count below two means the
+ * curve is the identity and the kernel leaves the noise variance alone. The
+ * block is a fixed bound so the tail offset stays a compile-time derivation.
+ */
+#define RT_LAB_WAVELET_DENOISE_HUE_ENTRIES \
+    (3u * RT_LAB_WAVELET_REFINE_POLY_MAX)
 /*
  * The balance-chroma (BA) tail, present only when `BAmethod` is "sli" or
  * "cur". It reproduces ContAllL()/ContAllAB()'s BA arm:
@@ -378,7 +391,8 @@ inline std::size_t labWaveletParamEntries(std::uint32_t planes,
         entries += RT_LAB_WAVELET_DENOISE_HEADER +
                    static_cast<std::size_t>(planes) *
                        static_cast<std::size_t>(levels) *
-                       RT_LAB_WAVELET_DENOISE_MAD_ENTRIES;
+                       RT_LAB_WAVELET_DENOISE_MAD_ENTRIES +
+                   RT_LAB_WAVELET_DENOISE_HUE_ENTRIES;
     }
     if (refine) {
         entries += RT_LAB_WAVELET_REFINE_HEADER +
@@ -761,6 +775,11 @@ inline constexpr double LAB_WAVELET_MAX_WAVELET_BALLUM = 10.0;
 /* The wavelet chroma-denoise sliders' widget range (0..100). */
 inline constexpr double LAB_WAVELET_MIN_CHROMA_STRENGTH = 0.0;
 inline constexpr double LAB_WAVELET_MAX_CHROMA_STRENGTH = 100.0;
+/* The noise-balance (Balance chroma) slider's widget range (-100..100). At
+ * six levels the forced arm runs WaveletDenoiseAllAB() with local == 1, where
+ * the block never reads variC, so the slider is inert for this arm. */
+inline constexpr double LAB_WAVELET_MIN_WAVELET_BALCHROM = -100.0;
+inline constexpr double LAB_WAVELET_MAX_WAVELET_BALCHROM = 100.0;
 /* The Thrden slider's widget range (0..100). */
 inline constexpr double LAB_WAVELET_MIN_THRDEN = 0.0;
 inline constexpr double LAB_WAVELET_MAX_THRDEN = 100.0;
@@ -1007,6 +1026,9 @@ private:
     std::vector<float> wavelet_refine_high_x_;
     std::vector<float> wavelet_refine_high_y_;
     std::vector<float> wavelet_refine_high_slope_;
+    /* The L denoise pass's wavhuecurve polyline: knot count, abscissae,
+     * ordinates and count-1 slopes. Empty for the identity curve. */
+    std::vector<float> wavelet_hue_curve_;
     bool wavelet_ab_ = false;
     bool wavelet_final_refresh_ = false;
     /*

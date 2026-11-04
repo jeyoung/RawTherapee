@@ -11114,7 +11114,7 @@ void test_lab_wavelet_contrast(bool available)
      * block on the host, byte for byte.
      */
     const char* residual_labels[] = {
-        "expcontrast off", "expchroma on", "expedge on", "expbl on",
+        "expcontrast off", "expchroma on", "expbl on",
         "expresid on", "expnoise on",
         "Tilesmethod big", "softrad",
         "skinprotect", "avoid", "median", "sup", "daubcoeffmethod 4_",
@@ -11131,8 +11131,6 @@ void test_lab_wavelet_contrast(bool available)
             params.wavelet.expcontrast = false;
         } else if (std::strcmp(label, "expchroma on") == 0) {
             params.wavelet.expchroma = true;
-        } else if (std::strcmp(label, "expedge on") == 0) {
-            params.wavelet.expedge = true;
         } else if (std::strcmp(label, "expbl on") == 0) {
             params.wavelet.expbl = true;
         } else if (std::strcmp(label, "expresid on") == 0) {
@@ -11479,8 +11477,7 @@ void test_lab_wavelet_chroma(bool available)
     const char* residual_labels[] = {
         "CHmethod without", "CHmethod with", "chro range", "sigmacol range",
         "skin range", "hhcurve", "contrast and skin", "chroma only no "
-        "strength", "edge panel", "balance chroma method",
-        "balance chroma flag"};
+        "strength", "balance chroma method", "balance chroma flag"};
     for (const char* label : residual_labels) {
         rtengine::procparams::ProcParams params;
         const int contrast[9] = {30, 22, 14, 8, 4, 2, 0, 0, 0};
@@ -11510,8 +11507,6 @@ void test_lab_wavelet_chroma(bool available)
             params.wavelet.BAmethod = "sli";
         } else if (std::strcmp(label, "balance chroma flag") == 0) {
             params.wavelet.tmr = true;
-        } else {
-            params.wavelet.expedge = true;
         }
 
         check(!labWaveletSupported(params, 238, 64),
@@ -11700,6 +11695,14 @@ void test_lab_wavelet_edge(bool available)
          {0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, 80, 15, 10, 1.0, "less", 0, 1},
         {"edge levels 7", 179, 160, 7, false, false,
          {0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, 50, 15, 10, 1.0, "less", 0, 1},
+        {"edge zero strength", 238, 64, 6, false, false,
+         {0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, 0, 15, 10, 1.0, "less", 0, 1},
+        {"edge zero strength contrast", 238, 64, 6, true, false,
+         {30, 22, 14, 8, 4, 2, 0, 0, 0}, 0, 0, 15, 10, 1.0, "less", 0, 1},
+        {"edge zero strength contrast odd", 179, 49, 5, true, false,
+         {30, 22, 14, 8, 4, 2, 0, 0, 0}, 0, 0, 20, 20, 1.2, "less", 0, 1},
+        {"edge zero strength padded", 179, 49, 5, false, false,
+         {0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, 0, 20, 20, 1.2, "less", 0, 1},
     };
 
     unsigned seed = 0x7f4a7c15u;
@@ -11808,7 +11811,7 @@ void test_lab_wavelet_edge(bool available)
      */
     const char* residual_labels[] = {
         "edgval range", "edgrad range", "edgthresh range",
-        "edgeffect range", "Medgreinf unknown", "zero strength",
+        "edgeffect range", "Medgreinf unknown", "edgval negative",
         "skin protection", "np unknown", "edmethod unknown",
         "edgedetect range", "edgedetectthr range",
         "edgedetectthr2 range", "edgesensi range", "edgeampli range"};
@@ -11826,8 +11829,8 @@ void test_lab_wavelet_edge(bool available)
             params.wavelet.edgeffect = 3.0;
         } else if (std::strcmp(label, "Medgreinf unknown") == 0) {
             params.wavelet.Medgreinf = "bogus";
-        } else if (std::strcmp(label, "zero strength") == 0) {
-            params.wavelet.edgval = 0;
+        } else if (std::strcmp(label, "edgval negative") == 0) {
+            params.wavelet.edgval = -1;
         } else if (std::strcmp(label, "np unknown") == 0) {
             params.wavelet.NPmethod = "bogus";
         } else if (std::strcmp(label, "edmethod unknown") == 0) {
@@ -13782,6 +13785,10 @@ void test_lab_wavelet_denoise(bool available)
         double chromco;
         /* Non-zero selects the sli+Thrden refinement. */
         double thrden;
+        /* Noise balance, inert at local == 1 but admitted as a range. */
+        double balchrom;
+        /* 0 identity hue curve, 1 rising curve, 2 falling curve. */
+        int hue;
     };
 
     const DenoiseCase cases[] = {
@@ -13834,6 +13841,27 @@ void test_lab_wavelet_denoise(bool available)
          false, false, false, 0, 0.0, 0.0, 20.0},
         {"denoise thrden with final", 238, 160, 5, {40, 30, 20, 10, 0}, 7.0,
          false, false, true, false, 0, 0.0, 0.0, 40.0},
+        {"denoise balance +100", 238, 160, 6, {40, 30, 20, 10, 5}, 7.0,
+         false, false, false, false, 0, 0.0, 0.0, 0.0, 100.0},
+        {"denoise balance -100", 238, 160, 6, {40, 30, 20, 10, 5}, 7.0,
+         false, false, false, false, 1, 0.0, 0.0, 0.0, -100.0},
+        {"denoise balance +40 chroma fine", 238, 160, 6,
+         {40, 30, 20, 10, 5}, 7.0, true, false, false, false, 0, 40.0,
+         0.0, 0.0, 40.0},
+        {"denoise balance -40 chroma coarse", 238, 160, 6,
+         {40, 30, 20, 10, 5}, 7.0, false, false, false, false, 0, 0.0,
+         60.0, 0.0, -40.0},
+        {"denoise hue curve rising", 238, 160, 6, {40, 30, 20, 10, 5}, 7.0,
+         false, false, false, false, 0, 0.0, 0.0, 0.0, 0.0, 1},
+        {"denoise hue curve falling", 238, 160, 6, {40, 30, 20, 10, 5},
+         7.0, false, false, false, false, 1, 0.0, 0.0, 0.0, 0.0, 2},
+        {"denoise hue curve chroma", 238, 160, 6, {40, 30, 20, 10, 5},
+         7.0, true, false, false, false, 0, 40.0, 0.0, 0.0, 0.0, 1},
+        {"denoise hue curve contrast", 238, 160, 6,
+         {40, 30, 20, 10, 5}, 7.0, true, false, false, false, 1, 0.0,
+         0.0, 0.0, 0.0, 2},
+        {"denoise hue curve wide", 1024, 512, 6, {40, 30, 20, 10, 5},
+         7.0, false, false, false, false, 0, 0.0, 0.0, 0.0, 0.0, 1},
     };
 
     unsigned seed = 0x51b9e3a7u;
@@ -13863,6 +13891,16 @@ void test_lab_wavelet_denoise(bool available)
         params.wavelet.chromfi = item.chromfi;
         params.wavelet.chromco = item.chromco;
         params.wavelet.thrden = item.thrden;
+        params.wavelet.balchrom = item.balchrom;
+        if (item.hue == 1) {
+            params.wavelet.wavhuecurve = {
+                1.0, 0.0, 0.10, 0.35, 0.35, 0.5, 0.90, 0.35, 0.35,
+                1.0, 0.10, 0.35, 0.35};
+        } else if (item.hue == 2) {
+            params.wavelet.wavhuecurve = {
+                1.0, 0.0, 0.90, 0.35, 0.35, 0.5, 0.10, 0.35, 0.35,
+                1.0, 0.90, 0.35, 0.35};
+        }
         if (item.toning) {
             params.wavelet.exptoning = true;
             params.wavelet.sigmaton = 1.0;
@@ -13965,6 +14003,39 @@ void test_lab_wavelet_denoise(bool available)
                   (std::string("lab.wavelet denoise ") + item.label +
                    " leaves the forced arm unchanged").c_str());
         }
+        if (item.balchrom != 0.0) {
+            /* The forced six-level arm runs WaveletDenoiseAllAB() with
+             * local == 1, where the block never reads variC/variCb. The
+             * balance slider must therefore leave the host result
+             * bit-identical. */
+            rtengine::procparams::ProcParams zero = params;
+            zero.wavelet.balchrom = 0.0;
+            rtengine::ImProcFunctions zero_ipf(&zero, false);
+            LabImage zero_image(item.width, item.height);
+            zero_image.CopyFrom(&source);
+            labWaveletHostBlock(zero_ipf, zero, zero_image);
+            const Distribution bd = distribution(view(zero_image), view(cpu));
+            check(bd.max_abs == 0.0,
+                  (std::string("lab.wavelet denoise ") + item.label +
+                   " is inert at local == 1").c_str());
+        }
+        if (item.hue != 0) {
+            /* Non-vacuity: the identity hue curve must produce a different
+             * host result, otherwise the modulation did no work. */
+            rtengine::procparams::ProcParams identity = params;
+            identity.wavelet.wavhuecurve.clear();
+            rtengine::ImProcFunctions identity_ipf(&identity, false);
+            LabImage identity_image(item.width, item.height);
+            identity_image.CopyFrom(&source);
+            labWaveletHostBlock(identity_ipf, identity, identity_image);
+            const Diff hd = compare(view(identity_image), view(cpu));
+            std::printf("stage-residency: lab.wavelet denoise %s hue curve "
+                        "changes %zu of %zu samples, PAE %.6f LSB16\n",
+                        item.label, hd.differing, hd.samples, hd.max_abs);
+            check(hd.max_abs > 1.0,
+                  (std::string("lab.wavelet denoise ") + item.label +
+                   " modulates the noise variance").c_str());
+        }
 
         /* Non-vacuity: the same profile with the denoise panel off must
          * produce a different host result. */
@@ -13986,14 +14057,14 @@ void test_lab_wavelet_denoise(bool available)
     }
 
     /*
-     * Refusals: an unknown `quaMethod`, balance chroma, the hue curve,
-     * colour-by-noise, the Thrden arm, an all-zero slider set, an
-     * out-of-range slider and the 128-pixel window must run the host block
-     * byte for byte. The "cur" refinement has its own matrix below, and the
-     * `agre` BiShrink pair has one of its own.
+     * Refusals: an unknown `quaMethod`, colour-by-noise, an out-of-range
+     * balance slider, the Thrden arm, an all-zero slider set, an out-of-range
+     * slider and the 128-pixel window must run the host block byte for byte.
+     * The "cur" refinement has its own matrix below, and the `agre` BiShrink
+     * pair has one of its own.
      */
     const char* residual_labels[] = {
-        "unknown quamethod", "balance chroma", "wavhuecurve", "cbenab",
+        "unknown quamethod", "balance chroma range", "cbenab",
         "ballum range", "level range", "all sliders zero",
         "sub-128 window"};
     for (const char* label : residual_labels) {
@@ -14005,12 +14076,8 @@ void test_lab_wavelet_denoise(bool available)
 
         if (std::strcmp(label, "unknown quamethod") == 0) {
             params.wavelet.quamethod = "unknown";
-        } else if (std::strcmp(label, "balance chroma") == 0) {
-            params.wavelet.balchrom = 10.0;
-        } else if (std::strcmp(label, "wavhuecurve") == 0) {
-            params.wavelet.wavhuecurve = {1.0, 0.0, 0.5, 0.35, 0.35, 0.5,
-                                          0.2, 0.35, 0.35, 1.0, 0.5, 0.35,
-                                          0.35};
+        } else if (std::strcmp(label, "balance chroma range") == 0) {
+            params.wavelet.balchrom = 101.0;
         } else if (std::strcmp(label, "cbenab") == 0) {
             params.wavelet.cbenab = true;
         } else if (std::strcmp(label, "ballum range") == 0) {
