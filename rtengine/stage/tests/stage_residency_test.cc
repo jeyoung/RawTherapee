@@ -2971,6 +2971,35 @@ void fill_lab_in_gamut(LabImage& lab, const Glib::ustring& workingProfile)
 }
 
 /*
+ * A source that reaches both ends of the 16-bit RGB scale. It exercises the
+ * soft-light gamma tables' last interval and the near-zero nonlinearity the
+ * second-pass inverse has to amplify, which the bounded in-gamut fill above
+ * never reaches.
+ */
+void fill_lab_bright(LabImage& lab, const Glib::ustring& workingProfile)
+{
+    const TMatrix wp =
+        rtengine::ICCStore::getInstance()->workingSpaceMatrix(workingProfile);
+    for (int y = 0; y < lab.H; ++y) {
+        for (int x = 0; x < lab.W; ++x) {
+            const float u = static_cast<float>(x) /
+                            static_cast<float>(std::max(lab.W - 1, 1));
+            const float v = static_cast<float>(y) /
+                            static_cast<float>(std::max(lab.H - 1, 1));
+            const float r = 65535.f * u;
+            const float g = 65535.f * (0.5f * v + 0.5f * u);
+            const float b = 65535.f * (1.f - 0.5f * u);
+            float X = 0.f;
+            float Y = 0.f;
+            float Z = 0.f;
+            rtengine::Color::rgbxyz(r, g, b, X, Y, Z, wp);
+            rtengine::Color::XYZ2Lab(X, Y, Z, lab.L[y][x], lab.a[y][x],
+                                     lab.b[y][x]);
+        }
+    }
+}
+
+/*
  * The host block of stage_gamut(), assembled from the production functions:
  * Color::Lab2XYZ, Color::xyz2rgb, ImProcFunctions::gamutcompr, Color::rgbxyz
  * and Color::XYZ2Lab, in the same order.
@@ -3822,20 +3851,24 @@ struct SharpenCase {
 
 
 
-/* Color::init()'s sRGB inverse table, the only LUT workingtrc() uses in its
- * fixed first pass. The rest of the initialisation needs the engine-wide
- * Settings and ICC stores. */
+/* Color::init()'s sRGB gamma pair. The fixed first pass uses the inverse
+ * (igamma2), and the soft-light arm reads both the forward table through its
+ * vector LUT operator and the inverse table, so both are needed. */
 void init_srgb_inverse()
 {
     constexpr int ENTRIES = 65536;
     constexpr float MAX_VALUE = 65535.0f;
 
     rtengine::Color::igammatab_srgb(ENTRIES, 0);
+    rtengine::Color::gammatab_srgb(ENTRIES, 0);
     for (int i = 0; i < ENTRIES; ++i) {
         rtengine::Color::igammatab_srgb[i] =
             rtengine::Color::igamma2(i / 65535.0);
+        rtengine::Color::gammatab_srgb[i] =
+            rtengine::Color::gamma2(i / 65535.0);
     }
     rtengine::Color::igammatab_srgb *= MAX_VALUE;
+    rtengine::Color::gammatab_srgb *= MAX_VALUE;
 }
 
 struct WorkingTrcCase {
@@ -3847,13 +3880,24 @@ struct WorkingTrcCase {
     double slope;
     bool gamut;
     double saturation;
+    bool softlightEnabled;
+    int softlightStrength;
     /* The configuration belongs to the device set. */
     bool configSupported;
     /* The source stays inside the working gamut. */
     bool inGamut;
     /* The host setup admits the configuration (type-5 TRC, range). */
     bool setupAccepted;
+    /* Use the source that reaches both ends of the 16-bit RGB scale. */
+    bool bright;
 };
+
+/* A prepare() that fails after the device soft-light pre-pass, to prove the
+ * launcher frozen the readback on a private copy. */
+int fail_prepare(void*, const RtStageBuffer*)
+{
+    return 1;
+}
 
 /*
  * The production host block, the device node and the call-site contract.
@@ -3890,21 +3934,37 @@ void test_working_trc(bool available)
     }
 
     const WorkingTrcCase cases[] = {
-        {"gamma 2.2", 238, 24, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, true, 0.5, true, true, true},
-        {"bt709", 238, 24, WorkingTrc::BT709, 2.2, 4.5, true, 0.5, true, true, true},
-        {"srgb", 238, 24, WorkingTrc::SRGB, 2.4, 12.92310, true, 0.5, true, true, true},
-        {"gamma 1.8", 238, 24, WorkingTrc::GAMMA_1_8, 1.8, 4.5, true, 0.5, true, true, true},
-        {"linear", 238, 24, WorkingTrc::LINEAR, 1.0, 1.0, true, 0.5, true, true, true},
-        {"no gamut", 238, 24, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, false, 0.5, true, true, true},
-        {"no saturation", 179, 17, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, true, 0.0, true, true, true},
-        {"full saturation", 238, 24, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, true, 1.0, true, true, true},
-        {"odd width", 179, 17, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, true, 0.5, true, true, true},
-        {"out of gamut", 238, 24, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, true, 0.5, true, false, false},
-        {"midtone equaliser", 238, 24, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, true, 0.5, false, false, true},
-        {"soft light", 179, 17, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, true, 0.5, false, false, true},
-        {"opacity curve", 238, 24, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, true, 0.5, false, true, true},
-        {"custom gamma 0.4", 238, 24, WorkingTrc::CUSTOM, 0.4, 4.5, true, 0.5, true, true, false},
-        {"empty opacity", 238, 24, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, true, 0.5, true, true, true},
+        {"gamma 2.2", 238, 24, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, true, 0.5, false, 0, true, true, true},
+        {"bt709", 238, 24, WorkingTrc::BT709, 2.2, 4.5, true, 0.5, false, 0, true, true, true},
+        {"srgb", 238, 24, WorkingTrc::SRGB, 2.4, 12.92310, true, 0.5, false, 0, true, true, true},
+        {"gamma 1.8", 238, 24, WorkingTrc::GAMMA_1_8, 1.8, 4.5, true, 0.5, false, 0, true, true, true},
+        {"linear", 238, 24, WorkingTrc::LINEAR, 1.0, 1.0, true, 0.5, false, 0, true, true, true},
+        {"no gamut", 238, 24, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, false, 0.5, false, 0, true, true, true},
+        {"no saturation", 179, 17, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, true, 0.0, false, 0, true, true, true},
+        {"full saturation", 238, 24, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, true, 1.0, false, 0, true, true, true},
+        {"odd width", 179, 17, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, true, 0.5, false, 0, true, true, true},
+        {"out of gamut", 238, 24, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, true, 0.5, false, 0, true, false, false},
+        {"midtone equaliser", 238, 24, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, true, 0.5, false, 0, false, false, true},
+        {"soft light 3", 238, 24, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, true, 0.5, true, 3, true, true, true},
+        {"soft light 30", 238, 24, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, true, 0.5, true, 30, true, true, true},
+        {"soft light 50", 179, 17, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, true, 0.5, true, 50, true, true, true},
+        {"soft light 100", 238, 24, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, true, 0.5, true, 100, true, true, true},
+        {"soft light srgb", 238, 24, WorkingTrc::SRGB, 2.4, 12.92310, true, 0.5, true, 60, true, true, true},
+        {"soft light bt709", 238, 24, WorkingTrc::BT709, 2.2, 4.5, true, 0.5, true, 50, true, true, true},
+        {"soft light no gamut", 238, 24, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, false, 0.5, true, 50, true, true, true},
+        {"soft light no saturation", 179, 17, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, true, 0.0, true, 50, true, true, true},
+        {"soft light full saturation", 238, 24, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, true, 1.0, true, 50, true, true, true},
+        {"soft light gamma 1.8", 238, 24, WorkingTrc::GAMMA_1_8, 1.8, 4.5, true, 0.5, true, 50, true, true, true},
+        {"soft light linear", 238, 24, WorkingTrc::LINEAR, 1.0, 1.0, true, 0.5, true, 50, true, true, true},
+        {"soft light odd width", 179, 17, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, true, 0.5, true, 50, true, true, true},
+        {"soft light bright", 238, 24, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, true, 0.5, true, 50, true, true, true, true},
+        {"soft light disabled", 238, 24, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, true, 0.5, false, 50, true, true, true},
+        {"soft light zero strength", 238, 24, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, true, 0.5, true, 0, true, true, true},
+        {"soft light 101", 238, 24, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, true, 0.5, true, 101, false, false, true},
+        {"soft light negative", 238, 24, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, true, 0.5, true, -1, false, false, true},
+        {"opacity curve", 238, 24, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, true, 0.5, false, 0, false, true, true},
+        {"custom gamma 0.4", 238, 24, WorkingTrc::CUSTOM, 0.4, 4.5, true, 0.5, false, 0, true, true, false},
+        {"empty opacity", 238, 24, WorkingTrc::GAMMA_2_2, 2.4, 12.92310, true, 0.5, false, 0, true, true, true},
     };
 
     if (!available) {
@@ -3927,10 +3987,9 @@ void test_working_trc(bool available)
         params.icm.wSlope = item.slope;
         params.icm.gamut = item.gamut;
         params.icm.wapsat = item.saturation;
-        if (std::strcmp(item.label, "soft light") == 0) {
-            params.softlight.enabled = true;
-            params.softlight.strength = 50;
-        } else if (std::strcmp(item.label, "midtone equaliser") == 0) {
+        params.softlight.enabled = item.softlightEnabled;
+        params.softlight.strength = item.softlightStrength;
+        if (std::strcmp(item.label, "midtone equaliser") == 0) {
             params.icm.wmidtcie = 25.0;
         } else if (std::strcmp(item.label, "empty opacity") == 0) {
             params.icm.wavExp = true;
@@ -3965,10 +4024,12 @@ void test_working_trc(bool available)
         rtengine::ImProcFunctions ipf(&params, false);
 
         LabImage source(item.width, item.height);
-        if (item.inGamut) {
-            fill_lab_in_gamut(source, params.icm.workingProfile);
-        } else {
+        if (!item.inGamut) {
             fill_lab(source, 7u);
+        } else if (item.bright) {
+            fill_lab_bright(source, params.icm.workingProfile);
+        } else {
+            fill_lab_in_gamut(source, params.icm.workingProfile);
         }
 
         LabImage cpu(item.width, item.height);
@@ -3984,7 +4045,7 @@ void test_working_trc(bool available)
         RtWorkingTrcContext descriptor =
             context.descriptor(item.configSupported);
 
-        RtStageArg args[6] = {};
+        RtStageArg args[4] = {};
         args[0].kind = RT_STAGE_ARG_BUFFER;
         args[0].u.buffer = view(device);
         args[1].kind = RT_STAGE_ARG_PTR;
@@ -3993,29 +4054,12 @@ void test_working_trc(bool available)
         args[2].u.i = item.configSupported ? 1 : 0;
         args[3].kind = RT_STAGE_ARG_DOUBLE;
         args[3].u.f = item.saturation;
-        bool deviceReady = false;
-        if (item.configSupported) {
-            RtWorkingTrcResult setup{};
-            check(context.prepare(source), "working.trc host prefix runs");
-            deviceReady = context.build(setup) == 0;
-            check(deviceReady == item.setupAccepted,
-                  (std::string("working.trc ") + item.label +
-                   " setup acceptance matches the configuration").c_str());
-            if (deviceReady) {
-                args[4].kind = RT_STAGE_ARG_BUFFER;
-                args[4].u.buffer = view(context.xyz());
-                args[5].kind = RT_STAGE_ARG_BUFFER;
-                args[5].u.buffer = view(context.linearReference());
-            }
-        }
-        descriptor.supported = deviceReady ? 1u : 0u;
-        args[2].u.i = descriptor.supported;
 
         std::remove(profile_path.c_str());
         setenv("RT_STAGE_PROFILE", profile_path.c_str(), 1);
         set_node_device_override("working.trc", StageNodeDevice::OpenCL);
         const RtStageStatus status = run(
-            "working.trc", std::vector<RtStageArg>(args, args + 6));
+            "working.trc", std::vector<RtStageArg>(args, args + 4));
         clear_node_device_overrides();
         const std::string profile = read_file(profile_path);
         unsetenv("RT_STAGE_PROFILE");
@@ -4062,9 +4106,9 @@ void test_working_trc(bool available)
     }
 
     /*
-     * A device refusal after a successful setup must still run the builtin
-     * and record impl=host. Corrupting the second-pass buffer shape makes the
-     * launcher refuse after the context has built.
+     * A failure after the device soft-light pre-pass must still run the
+     * builtin on the caller's untouched Lab: the launcher read the kernel
+     * into a private copy, and only prepare() consumes it.
      */
     {
         rtengine::procparams::ProcParams params;
@@ -4073,6 +4117,8 @@ void test_working_trc(bool available)
         params.icm.trcExp = true;
         params.icm.gamut = true;
         params.icm.wapsat = 0.5;
+        params.softlight.enabled = true;
+        params.softlight.strength = 50;
         rtengine::ImProcFunctions ipf(&params, false);
 
         LabImage source(238, 24);
@@ -4084,11 +4130,9 @@ void test_working_trc(bool available)
         device.CopyFrom(&source);
 
         WorkingTrcContext context(params, ipf);
-        RtWorkingTrcResult setup{};
-        check(context.prepare(source), "forced fallback prefix runs");
-        check(context.build(setup) == 0, "forced fallback setup builds");
         RtWorkingTrcContext descriptor = context.descriptor(true);
-        RtStageArg args[6] = {};
+        descriptor.prepare = &fail_prepare;
+        RtStageArg args[4] = {};
         args[0].kind = RT_STAGE_ARG_BUFFER;
         args[0].u.buffer = view(device);
         args[1].kind = RT_STAGE_ARG_PTR;
@@ -4097,17 +4141,12 @@ void test_working_trc(bool available)
         args[2].u.i = 1;
         args[3].kind = RT_STAGE_ARG_DOUBLE;
         args[3].u.f = params.icm.wapsat;
-        args[4].kind = RT_STAGE_ARG_BUFFER;
-        args[4].u.buffer = view(context.xyz());
-        args[4].u.buffer.planes = 1;
-        args[5].kind = RT_STAGE_ARG_BUFFER;
-        args[5].u.buffer = view(context.linearReference());
 
         std::remove(profile_path.c_str());
         setenv("RT_STAGE_PROFILE", profile_path.c_str(), 1);
         set_node_device_override("working.trc", StageNodeDevice::OpenCL);
         const RtStageStatus status =
-            run("working.trc", std::vector<RtStageArg>(args, args + 6));
+            run("working.trc", std::vector<RtStageArg>(args, args + 4));
         clear_node_device_overrides();
         const std::string profile = read_file(profile_path);
         unsetenv("RT_STAGE_PROFILE");
@@ -4122,6 +4161,57 @@ void test_working_trc(bool available)
         const Diff diff = compare(view(device), view(cpu));
         check(diff.differing == 0 && diff.max_abs == 0.0,
               "the forced fallback matches the CPU block");
+    }
+
+    /*
+     * Soft light is non-vacuous: the arm at strength 50 must change the
+     * image inside the same node, not just record a device execution.
+     */
+    {
+        rtengine::procparams::ProcParams off;
+        off.icm.workingProfile = "Rec2020";
+        off.icm.workingTRC = WorkingTrc::GAMMA_2_2;
+        off.icm.trcExp = true;
+        off.icm.gamut = true;
+        off.icm.wapsat = 0.5;
+        rtengine::procparams::ProcParams on = off;
+        on.softlight.enabled = true;
+        on.softlight.strength = 50;
+
+        const auto render = [](const rtengine::procparams::ProcParams& params,
+                               LabImage& image) {
+            rtengine::ImProcFunctions ipf(&params, false);
+            fill_lab_in_gamut(image, params.icm.workingProfile);
+            WorkingTrcContext context(params, ipf);
+            RtWorkingTrcContext descriptor = context.descriptor(true);
+            RtStageArg args[4] = {};
+            args[0].kind = RT_STAGE_ARG_BUFFER;
+            args[0].u.buffer = view(image);
+            args[1].kind = RT_STAGE_ARG_PTR;
+            args[1].u.ptr = &descriptor;
+            args[2].kind = RT_STAGE_ARG_INT;
+            args[2].u.i = 1;
+            args[3].kind = RT_STAGE_ARG_DOUBLE;
+            args[3].u.f = params.icm.wapsat;
+            set_node_device_override("working.trc",
+                                     StageNodeDevice::OpenCL);
+            const RtStageStatus status =
+                run("working.trc", std::vector<RtStageArg>(args, args + 4));
+            clear_node_device_overrides();
+            check(status == RT_STAGE_OK,
+                  "the soft-light non-vacuity run completes");
+        };
+
+        LabImage base(238, 24);
+        LabImage lifted(238, 24);
+        render(off, base);
+        render(on, lifted);
+        const Diff diff = compare(view(base), view(lifted));
+        std::printf("stage-residency: working.trc soft-light non-vacuity: "
+                    "PAE %.6f LSB16, %zu of %zu samples differ\n",
+                    diff.max_abs, diff.differing, diff.samples);
+        check(diff.finite && diff.differing > 0 && diff.max_abs > 10.0,
+              "soft light is non-vacuous at strength 50");
     }
 
     /*
@@ -4183,12 +4273,8 @@ void test_working_trc(bool available)
         device.CopyFrom(&source);
         WorkingTrcContext context(params, ipf);
         RtWorkingTrcContext descriptor = context.descriptor(true);
-        check(context.prepare(source), "working.trc probe prefix runs");
-        RtWorkingTrcResult probeSetup{};
-        check(context.build(probeSetup) == 0,
-              "working.trc probe setup builds");
         descriptor.supported = 1u;
-        RtStageArg args[6] = {};
+        RtStageArg args[4] = {};
         args[0].kind = RT_STAGE_ARG_BUFFER;
         args[0].u.buffer = view(device);
         args[1].kind = RT_STAGE_ARG_PTR;
@@ -4197,14 +4283,10 @@ void test_working_trc(bool available)
         args[2].u.i = 1;
         args[3].kind = RT_STAGE_ARG_DOUBLE;
         args[3].u.f = params.icm.wapsat;
-        args[4].kind = RT_STAGE_ARG_BUFFER;
-        args[4].u.buffer = view(context.xyz());
-        args[5].kind = RT_STAGE_ARG_BUFFER;
-        args[5].u.buffer = view(context.linearReference());
 
         set_node_device_override("working.trc", StageNodeDevice::OpenCL);
         const RtStageStatus status =
-            run("working.trc", std::vector<RtStageArg>(args, args + 6));
+            run("working.trc", std::vector<RtStageArg>(args, args + 4));
         clear_node_device_overrides();
 
         const double deltaX =
@@ -4226,7 +4308,6 @@ void test_working_trc(bool available)
               "the probe means are the host means bit for bit");
     }
 }
-
 void test_output_sharpen(bool available)
 {
     using namespace rtengine::stage;

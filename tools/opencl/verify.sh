@@ -283,7 +283,7 @@ quick() {
         "$ROOT/devnotes/opencl/pp3/sharpen-rld-damped.pp3" output.sharpen
     run_stage_device "pef/stage-device-working-trc" \
         "$ROOT/devnotes/opencl/pp3/working-trc.pp3" working.trc
-    run_stage_host "pef/stage-host-working-trc-residual" \
+    run_stage_device "pef/stage-device-working-trc-residual" \
         "$ROOT/devnotes/opencl/pp3/working-trc-residual.pp3" working.trc
     run_stage_host "pef/stage-host-ciecam-residual" \
         "$ROOT/devnotes/opencl/pp3/ciecam-residual.pp3" ciecam
@@ -706,7 +706,7 @@ stage_device() {
         "$ROOT/devnotes/opencl/pp3/sharpen-rld-damped.pp3" output.sharpen
     run_stage_device "pef/stage-device-working-trc" \
         "$ROOT/devnotes/opencl/pp3/working-trc.pp3" working.trc
-    run_stage_host "pef/stage-host-working-trc-residual" \
+    run_stage_device "pef/stage-device-working-trc-residual" \
         "$ROOT/devnotes/opencl/pp3/working-trc-residual.pp3" working.trc
     run_stage_host "pef/stage-host-ciecam-residual" \
         "$ROOT/devnotes/opencl/pp3/ciecam-residual.pp3" ciecam
