@@ -474,7 +474,7 @@ by default.
 | `source.embedded` | -/-/-/Reduced | interactive | recompute | select the embedded JPEG | n/a |
 | `raw.preprocess` | Full/Full/Full/Full | path | reuse-output | raw black/white, hot/dead pixel, CA, flat field; the Bayer arm of `scaleColors()` is the device node | partial |
 | `raw.demosaic` | Full/Full/Full/Full | path | reuse-output | demosaic and capture sharpening; the MONO/NONE arms of `nodemosaic()` are the device node | partial |
-| `raw.base` | Full/Full/Roi/Reduced | path | reuse-output | `getImage()`, spot removal, denoise, film negative, Retinex, source-side gamut; the camera-to-working-space matrix multiply in `colorSpaceConversion_()` when no input or DCP profile is supplied is the device node | partial |
+| `raw.base` | Full/Full/Roi/Reduced | path | reuse-output | `getImage()`, spot removal, denoise, film negative, Retinex, source-side gamut; the white-balance multiply and optional clamp in `getImage()` (`raw.base.wb`) and the camera-to-working-space matrix multiply in `colorSpaceConversion_()` when no input or DCP profile is supplied (`raw.base`) are the device sub-steps | partial |
 | `analysis` | Full/Full/Roi/- | path | reuse-output | histogram and auto-exposure analysis | n/a |
 | `transform` | Full/Full/Roi/- | path | reuse-input | rotation, distortion, perspective, CA, vignetting, gradient, post-crop vignette, dehaze, Fattal | yes |
 | `local.adjustments` | Full/Full/Roi/Reduced | path | reuse-input | local lab / selective editing | partial |
@@ -501,7 +501,12 @@ by default.
 | `thumbnail.lab` | -/-/-/Reduced | interactive | reuse-input | thumbnail Lab tools on the device; working TRC, CIE CAM and gamut stay host | partial |
 | `thumbnail.output` | -/-/-/Reduced | interactive | recompute | Lab to 8-bit thumbnail with gamma | yes |
 
-`raw.base` is partial: the device runs only the camera-to-working-space matrix
+`raw.base` is partial and carries two device sub-steps. `raw.base.wb` is the
+white-balance multiply and the optional `CLIP` that `RawImageSource::getImage()`
+applies to every assembled sample; the host derives `rm`, `gm` and `bm` as
+floats and passes them unchanged, and the node is admitted only for a
+full-resolution (`skip == 1`) planar source with no D1X, Fuji SuperCCD or
+highlight-recovery line pass. `raw.base` is the camera-to-working-space matrix
 multiply of `RawImageSource::colorSpaceConversion_()` when
 `findInputProfile()` supplied neither an input ICC profile nor a DCP profile
 (`in == nullptr` and `dcpProf == nullptr`). The matrix is computed on the host
@@ -510,10 +515,11 @@ in double precision from `ICCStore::workingSpaceInverseMatrix()` and
 left-associative additions and rounds the three results to float at the write,
 so an fp64 device is required. Every other arm of `colorSpaceConversion_()` (an
 input ICC profile, a DCP profile, the LUT and Lab paths) and every other step of
-`raw.base` (white balance, `getImage()`, Retinex, spot removal, denoise, film
-negative, gamut compression and analysis) stays on the host. A device without
-fp64, a non-three-plane image or a bad buffer shape is refused and the host
-loop rewrites the image.
+`raw.base` (`getImage()`, Retinex, spot removal, denoise, film negative, gamut
+compression and analysis) stays on the host. Each node refuses a non-three-plane
+image or a bad buffer shape before the upload; the matrix node also refuses a
+device without fp64 and a non-finite matrix entry, and the host rewrites the
+image.
 
 ## Path specifications
 
@@ -2028,9 +2034,20 @@ RCD, pixel shift and dual demosaic are full multi-pass algorithms. X-Trans
 NONE, an RGB source and a four-colour filter pattern are refused by the call
 site. Capture sharpening is part of the block and stays on the host.
 
-Still CPU-only: `raw.base`, `lab.tools`, `lab.wavelet`,
-`working.trc`, `ciecam` and `thumbnail.lab`'s working-TRC, CIE CAM and gamut
-remainder.
+Partial: `raw.base` runs two pixel sub-steps on the device. `raw.base.wb` is
+the white-balance multiply and optional clamp of `getImage()`, admitted only
+for a full-resolution planar source with no D1X, Fuji SuperCCD or
+highlight-recovery line pass; the unmultiplied samples are assembled into the
+image first and the node (or its host fallback) rewrites them in place.
+`raw.base` is the no-profile, no-DCP camera-to-working-space matrix multiply of
+`colorSpaceConversion_()`. Retinex, spot removal, denoise, film negative, gamut
+compression, the analysis folded into the block and every profile/LUT/Lab arm
+of the conversion stay on the host.
+
+Still CPU-only: `lab.tools`, `lab.wavelet`, `working.trc`, `ciecam` and
+`thumbnail.lab`'s working-TRC, CIE CAM and gamut remainder. `raw.base` is
+partial: its two device sub-steps are above, and the block remainder stays on
+the host.
 
 `local.adjustments` is partial through the multi-spot tool path. The
 admitted set is any number of `norm` spots in list order: an active spot runs

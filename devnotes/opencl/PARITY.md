@@ -191,16 +191,28 @@ pairs are exact. The gate is the peak absolute error (PAE) in normalised units;
 | 2026-11-04 | uncommitted | POCL (CPU) | colorspace_flowers.pef / neutral, `raw.base` matrix arm, default internal profiles | off vs auto, 16-bit TIFF | 0 (AE=0, 0 of 30 419 712), `impl=opencl` | PASS |
 | 2026-11-04 | uncommitted | POCL (CPU) | 45.7 MP NEF / neutral, `raw.base` matrix arm, default internal profiles | off vs auto, 16-bit TIFF | 0 (AE=0, 0 of 136 918 080), `impl=opencl` | PASS |
 | 2026-11-04 | uncommitted | POCL (CPU) | colorspace_flowers.pef / `labtools-vibrance.pp3`, stage nodes only (no classic `RT_OPENCL_RGBPROC`) | off vs auto, 16-bit TIFF | 0 (0 of 30 419 712), `raw.base` and `lab.tools` `impl=opencl` | PASS |
+| 2026-11-04 | uncommitted | POCL (CPU) | 10-case `raw.base.wb` test (five shapes: full 63x31, padded rows 61x31, one pixel, one column, one row; clip off and on; coefficients `1.234567`, `0.375`, `2.7182817`), `stage-residency-test` | device vs host pass | 0 (bit-exact, every shape and clamp state) | PASS |
+| 2026-11-04 | uncommitted | POCL (CPU) | `raw.base.wb` non-vacuity: every case changes the image against its input | device vs input | non-zero, all cases | PASS |
+| 2026-11-04 | uncommitted | POCL (CPU) | `raw.base.wb` refusals: wrong argument count, U8 image, two-plane image, short row pitch, short plane pitch, clip flag 2, non-finite multiplier, int multiplier | launcher refuses before upload | 0 (host; 459 samples untouched) | PASS |
+| 2026-11-04 | uncommitted | POCL (CPU) | colorspace_flowers.pef / neutral, `raw.base.wb` white balance, default internal profiles | off vs auto, 16-bit TIFF | 0 (AE=0, 0 of 30 419 712), `raw.base` and `raw.base.wb` `impl=opencl` | PASS |
+| 2026-11-04 | uncommitted | POCL (CPU) | 45.7 MP NEF / neutral, `raw.base.wb` white balance, default internal profiles | off vs auto, 16-bit TIFF | 0 (AE=0, 0 of 136 918 080), `raw.base` and `raw.base.wb` `impl=opencl` | PASS |
+| 2026-11-04 | uncommitted | POCL (CPU) | colorspace_flowers.pef / `labtools-vibrance.pp3`, `raw.base.wb` white balance, stage nodes only (no classic `RT_OPENCL_RGBPROC`) | off vs auto, 16-bit TIFF | 0 (0 of 30 419 712), `raw.base`, `raw.base.wb` and `lab.tools` `impl=opencl` | PASS |
+| 2026-11-04 | uncommitted | POCL (CPU) | colorspace_flowers.pef / neutral, `raw.base.wb` deferred with `RT_STAGE_DEVICE_BUDGET_MB=16`, host fallback | off vs auto, 16-bit TIFF | 0 (AE=0, 0 of 30 419 712), every node refused | PASS |
 
-The `raw.base` rows cover the camera-to-working-space matrix multiply in
+The `raw.base` rows cover two sub-steps. `raw.base.wb` is the white-balance
+multiply and optional `CLIP` of `RawImageSource::getImage()`, admitted only for
+a full-resolution planar source with no D1X, Fuji SuperCCD or
+highlight-recovery line pass; the host passes its float `rm`/`gm`/`bm` and the
+kernel repeats the float product and the clamp's ordered ternaries exactly.
+`raw.base` is the camera-to-working-space matrix multiply in
 `RawImageSource::colorSpaceConversion_()` when neither an input ICC profile nor
-a DCP profile is supplied. The block is partial: that matrix arm is a device
-node; white balance, `getImage()`, Retinex, spot removal, denoise, film
-negative, gamut compression and analysis stay on the host, as do the
-input-profile, DCP, LUT and Lab arms of the conversion. The matrix is computed
-on the host in double precision and passed unchanged; the kernel repeats the
-double products and additions and rounds to float only at the write, so the
-node requires an fp64 device and refuses one without it. The vibrance canary
+a DCP profile is supplied. The block is partial: white balance outside the
+admitted case, `getImage()`, Retinex, spot removal, denoise, film negative,
+gamut compression and analysis stay on the host, as do the input-profile, DCP,
+LUT and Lab arms of the conversion. The matrix is computed on the host in
+double precision and passed unchanged; the kernel repeats the double products
+and additions and rounds to float only at the write, so the matrix node requires
+an fp64 device and refuses one without it. The vibrance canary
 must run with the stage nodes alone: `RT_OPENCL_RGBPROC` also routes the same
 RGB block through the classic backend, whose last-bit differences at three
 clipped samples move the final TIFF by up to 110 LSB16 even with every stage

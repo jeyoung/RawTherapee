@@ -48,13 +48,15 @@ pushed from 2026-10-29 on.
 - Local shadows/highlights is **done and pushed** (`509f90731..5f674e5ba`):
   worst 0.053711 LSB16, full POCL gate 28 PASS, 0 SKIP. Issue #32 is closed
   and unassigned.
-- `raw.base` now has a partial device node: the camera-to-working-space matrix
-  multiply of `colorSpaceConversion_()` when no input or DCP profile is
-  supplied. PEF and 45.7 MP NEF are AE=0, the `labtools-vibrance.pp3` canary
-  is 0 differing with the stage nodes alone, and the rest of `raw.base` stays
-  host. `verify.sh` sets `RT_OPENCL_RGBPROC` only on the `rgb.proc` row, so
-  the classic RGB block no longer perturbs every other row's parity
-  (three clipped samples, up to 110 LSB16).
+- `raw.base` now has two partial device sub-steps: the white-balance multiply
+  and optional clamp of `getImage()` (`raw.base.wb`), and the
+  camera-to-working-space matrix multiply of `colorSpaceConversion_()` when no
+  input or DCP profile is supplied (`raw.base`). PEF and 45.7 MP NEF are AE=0
+  with both sub-steps on the device, the `labtools-vibrance.pp3` canary is 0
+  differing with the stage nodes alone, and the rest of `raw.base` stays host.
+  `verify.sh` sets `RT_OPENCL_RGBPROC` only on the `rgb.proc` row, so the
+  classic RGB block no longer perturbs every other row's parity (three clipped
+  samples, up to 110 LSB16).
 - `perf-graph` is protected (no direct or force pushes by collaborators,
   linear history, one approving review, admins bypass). The claiming rule is
   in `devnotes/perf/CONTRIBUTING.md` and the PR template.
@@ -79,6 +81,18 @@ Install, `--list-formats`, a CLI export against a single-threaded host
 export and a GUI smoke test are not yet run for this package.
 
 ## Progress log — resumed 2026-10-28 (Block 4 completion)
+
+- **`raw.base.wb` white-balance sub-step (2026-11-04)**: the `rtot *= rm` and
+  optional `CLIP` of `RawImageSource::getImage()` is a `raw.base.wb` device
+  node. The host derives `rm`, `gm` and `bm` as floats and passes them
+  unchanged; the node is admitted only for a full-resolution planar source
+  with no D1X, Fuji SuperCCD or highlight-recovery line pass. The call site
+  assembles the unmultiplied samples first and applies the multiply in place,
+  so a refusal falls through to a host pass with the same arithmetic. Ten
+  device cases (five shapes, clamp off and on) are bit-exact, eight refusals
+  leave the image untouched, PEF and 45.7 MP NEF are AE=0 with
+  `raw.base.wb` recording `impl=opencl`, the `labtools-vibrance.pp3` canary is
+  0 differing, and a forced 16 MB device budget falls back with AE=0.
 
 - **`raw.base` matrix arm (2026-11-04)**: the camera-to-working-space matrix
   multiply in `RawImageSource::colorSpaceConversion_()` is the `raw.base`

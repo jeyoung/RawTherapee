@@ -503,14 +503,15 @@ regardless of the profile set.
 
 ## Raw base
 
-`raw.base` owns one coherent pixel sub-step of
-`RawImageSource::colorSpaceConversion_()` in `rtengine/rawimagesource.cc`: the
-camera-to-working-space matrix multiply when `findInputProfile()` supplied
-neither an input ICC profile nor a DCP profile (`in == nullptr` and
-`dcpProf == nullptr`). The rest of `raw.base` remains host work: white balance
-in `getImage()`, Retinex, spot removal, denoise, film negative, gamut
-compression and the analysis folded into the block. The input-profile, DCP,
-LUT and Lab arms of `colorSpaceConversion_()` are also host residuals.
+`raw.base` owns two coherent pixel sub-steps. `raw.base.wb` is the
+white-balance multiply and optional `CLIP` of `RawImageSource::getImage()` in
+`rtengine/rawimagesource.cc`; `raw.base` is the camera-to-working-space matrix
+multiply of `RawImageSource::colorSpaceConversion_()` when `findInputProfile()`
+supplied neither an input ICC profile nor a DCP profile (`in == nullptr` and
+`dcpProf == nullptr`). The rest of `raw.base` remains host work: Retinex, spot
+removal, denoise, film negative, gamut compression and the analysis folded into
+the block. The input-profile, DCP, LUT and Lab arms of
+`colorSpaceConversion_()` are also host residuals.
 
 The host computes the 3x3 matrix in double precision from
 `ICCStore::workingSpaceInverseMatrix(cmp.workingProfile)` and
@@ -533,18 +534,37 @@ also rejects a buffer that is not three-plane F32, a row or plane pitch that
 does not cover the image, a non-finite matrix entry and an argument list that
 is not one buffer plus nine doubles.
 
+`raw.base.wb` is the `rtot *= rm` and optional `CLIP` step of the `getImage()`
+line loop. The host derives `rm`, `gm` and `bm` as floats, and the node is
+entered only when the lines are a pure per-pixel copy: a full-resolution sample
+(`skip == 1`), the planar `red`/`green`/`blue` source branch and no D1X, Fuji
+SuperCCD or highlight-recovery line pass. The call site assembles the
+unmultiplied samples into the image and then submits the three-plane buffer in
+place. The ABI is `[0]` the image, `[1]` an int clamp flag and `[2..4]` `rm`,
+`gm` and `bm` as three doubles that are narrowed back to the exact host
+floats. Each product is the host float times float, rounded once, and the clamp
+repeats `CLIP()`'s two ordered ternaries (so a NaN becomes zero, as on the
+host) rather than `fmin`/`fmax`. A refused launch falls through to an in-place
+host pass that computes the same products and clamp, so the deferred form is
+never a second arithmetic.
+
 Evidence:
 
 | Case | Result |
 |---|---|
-| device test, five shapes (full 63x31, padded rows 61x31, one pixel, one column, one row) with a fractional, partly negative matrix | device execution, `device=OPENCL`, PAE 0.000000, 0 differing on every shape |
-| non-vacuity | every case changes the image against its input |
+| matrix device test, five shapes (full 63x31, padded rows 61x31, one pixel, one column, one row) with a fractional, partly negative matrix | device execution, `device=OPENCL`, PAE 0.000000, 0 differing on every shape |
+| matrix non-vacuity | every case changes the image against its input |
 | `run("raw.base", …)` with the node selected | `"stage":"raw.base".*"impl":"opencl"` in the profile |
-| refusals: wrong argument count, U8 image, two-plane image, short row pitch, short plane pitch, non-finite matrix and an int matrix entry | not `RT_STAGE_OK`, image untouched (459 samples) |
-| `colorspace_flowers.pef` (10.2 MP PEF) neutral, `--gpu=off` vs `--gpu=auto`, 16-bit TIFF | AE=0, 0 of 30 419 712 samples, record `"impl":"opencl"` |
-| 45.7 MP NEF neutral, `--gpu=off` vs `--gpu=auto`, 16-bit TIFF | AE=0, 0 of 136 918 080 samples, record `"impl":"opencl"` |
-| `labtools-vibrance.pp3` canary, `colorspace_flowers.pef`, stage nodes only, 16-bit TIFF | 0 differing of 30 419 712 samples, `raw.base` and `lab.tools` both record `"impl":"opencl"` |
+| matrix refusals: wrong argument count, U8 image, two-plane image, short row pitch, short plane pitch, non-finite matrix and an int matrix entry | not `RT_STAGE_OK`, image untouched (459 samples) |
+| `raw.base.wb` device test, the same five shapes with clip off and on, coefficients `1.234567`, `0.375`, `2.7182817` and samples from -40000 to 130000 | device execution, PAE 0.000000, 0 differing on all ten cases |
+| `raw.base.wb` non-vacuity | every case changes the image against its input |
+| `raw.base.wb` refusals: wrong argument count, U8 image, two-plane image, short row pitch, short plane pitch, clip flag 2, non-finite multiplier and an int multiplier | not `RT_STAGE_OK`, image untouched (459 samples) |
+| `colorspace_flowers.pef` (10.2 MP PEF) neutral, `--gpu=off` vs `--gpu=auto`, 16-bit TIFF | AE=0, 0 of 30 419 712 samples, `raw.base` and `raw.base.wb` both record `"impl":"opencl"` |
+| 45.7 MP NEF neutral, `--gpu=off` vs `--gpu=auto`, 16-bit TIFF | AE=0, 0 of 136 918 080 samples, `raw.base` and `raw.base.wb` both record `"impl":"opencl"` |
+| `labtools-vibrance.pp3` canary, `colorspace_flowers.pef`, stage nodes only, 16-bit TIFF | 0 differing of 30 419 712 samples, `raw.base`, `raw.base.wb` and `lab.tools` record `"impl":"opencl"` |
+| host fallback: PEF neutral with `RT_STAGE_DEVICE_BUDGET_MB=16`, 16-bit TIFF | AE=0, 0 of 30 419 712 samples; every node refused, the in-place host pass applied |
 | `verify.sh --stage-device`, `pef/stage-device-raw-base`, POCL CPU, `OMP_NUM_THREADS=1` | PASS, `max_pae=0`, `impl=opencl` on a 3888x2608 frame |
+| `verify.sh --stage-device`, `pef/stage-device-raw-base-wb`, POCL CPU, `OMP_NUM_THREADS=1` | row added; not run here because ImageMagick is absent, so the PEF/NEF/fallback rows above are the parity evidence |
 
 The vibrance canary must run with the stage nodes alone. `RT_OPENCL_RGBPROC`
 additionally routes the same RGB block through the classic backend, whose
