@@ -4433,6 +4433,110 @@ void test_output_sharpen(bool available)
         add("RLD no-op", 63, 31, 1.0, p, true, true);
     }
 
+    /* The residual switches the device now reproduces. */
+    for (double blur : {0.25, 0.3, 0.5, 0.59, 0.75, 1.0, 2.5}) {
+        auto p = base;
+        p.blurradius = blur;
+        add("blur radius " + std::to_string(blur), 63, 31, 1.0, p, false);
+    }
+    for (int halo : {0, 25, 50, 100}) {
+        auto p = base;
+        p.halocontrol = true;
+        p.halocontrol_amount = halo;
+        add("halo " + std::to_string(halo), 63, 31, 1.0, p, false);
+    }
+    for (double edge_radius : {0.4, 0.5, 0.65, 1.0, 1.6, 2.1, 3.0}) {
+        auto p = base;
+        p.edgesonly = true;
+        p.edges_radius = edge_radius;
+        p.edges_tolerance = 100;
+        add("edges " + std::to_string(edge_radius), 63, 31, 1.0, p, false);
+    }
+    for (int tolerance : {20, 100, 500}) {
+        auto p = base;
+        p.edgesonly = true;
+        p.edges_radius = 1.0;
+        p.edges_tolerance = tolerance;
+        add("edges tolerance " + std::to_string(tolerance), 63, 31, 1.0, p,
+            false);
+    }
+    {
+        auto p = base;
+        p.edgesonly = true;
+        p.edges_radius = 1.0;
+        p.edges_tolerance = 100;
+        p.radius = 1.0;
+        p.amount = 500;
+        add("edges with radius and amount", 63, 31, 1.0, p, false);
+    }
+    {
+        /* A smooth plane makes the bilateral average, like a photograph. */
+        auto p = base;
+        p.edgesonly = true;
+        p.edges_radius = 1.0;
+        p.edges_tolerance = 100;
+        p.contrast = 0.0;
+        add("edges smooth flat mask", 63, 31, 1.0, p, false, true);
+    }
+    {
+        auto p = base;
+        p.edgesonly = true;
+        p.edges_radius = 1.0;
+        p.edges_tolerance = 100;
+        add("edges smooth", 63, 31, 1.0, p, false, true);
+    }
+    {
+        auto p = base;
+        p.edgesonly = true;
+        p.edges_radius = 1.0;
+        p.edges_tolerance = 100;
+        p.halocontrol = true;
+        p.halocontrol_amount = 50;
+        add("edges with halo", 63, 31, 1.0, p, false);
+    }
+    {
+        auto p = base;
+        p.blurradius = 0.5;
+        p.halocontrol = true;
+        p.halocontrol_amount = 50;
+        add("blur radius with halo", 63, 31, 1.0, p, false);
+    }
+    {
+        auto p = base;
+        p.blurradius = 1.0;
+        p.edgesonly = true;
+        p.edges_radius = 1.0;
+        p.edges_tolerance = 100;
+        add("blur radius with edges", 63, 31, 1.0, p, false);
+    }
+    for (int damping : {20, 50, 100}) {
+        for (double deconv_radius : {0.45, 0.75, 1.0}) {
+            auto p = rld;
+            p.deconviter = 10;
+            p.deconvradius = deconv_radius;
+            p.deconvdamping = damping;
+            add("RLD damping " + std::to_string(damping) + " radius " +
+                    std::to_string(deconv_radius),
+                63, 31, 1.0, p, false, true);
+        }
+    }
+    {
+        auto p = rld;
+        p.deconviter = 10;
+        p.deconvradius = 0.45;
+        p.deconvdamping = 50;
+        p.blurradius = 0.5;
+        add("RLD damping with blur radius", 63, 31, 1.0, p, false, true);
+    }
+    {
+        auto p = rld;
+        p.deconviter = 10;
+        p.deconvradius = 0.45;
+        p.deconvdamping = 50;
+        p.deconvamount = 500;
+        add("RLD damping amount 500", 63, 31, 1.0, p, false, true);
+    }
+
     if (!available) {
         skip("output sharpening: no OpenCL device");
         return;
@@ -4488,9 +4592,10 @@ void test_output_sharpen(bool available)
 
     /*
      * A supported request must be recorded as device execution through
-     * run(), while a residual switch must execute the host builtin and report
-     * impl=host. The host result is compared with the production CPU path and
-     * with the extracted core, so the record cannot hide a mixed pass.
+     * run(); a configuration the kernels cannot reproduce must execute the
+     * host builtin and report impl=host. The host result is compared with the
+     * production CPU path and with the extracted core, so the record cannot
+     * hide a mixed pass.
      */
     const std::string profile_path =
         std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp") +
@@ -4538,15 +4643,18 @@ void test_output_sharpen(bool available)
         copy_sharpen_l(source, cpu);
         run_cpu_sharpen(p, scale, cpu);
         const Diff diff = compare_sharpen_l(target, cpu);
-        std::printf("stage-residency: output.sharpen %s: %s, %zu of %zu "
-                    "samples differ\n",
-                    label, expect_device ? "device" : "host", diff.differing,
-                    diff.samples);
+        std::printf("stage-residency: output.sharpen %s: %s, PAE %.6f LSB16, "
+                    "%zu of %zu samples differ\n",
+                    label, expect_device ? "device" : "host", diff.max_abs,
+                    diff.differing, diff.samples);
         check(diff.finite,
               (std::string(label) + " stays finite").c_str());
         if (expect_device) {
             check(diff.max_abs <= 1.0,
                   (std::string(label) + " is within one LSB16").c_str());
+            const Diff changed = compare_sharpen_l(target, source);
+            check(changed.differing > 0,
+                  (std::string(label) + " is non-vacuous").c_str());
         } else {
             check(diff.differing == 0 && diff.max_abs == 0.0,
                   (std::string(label) + " matches the CPU reference").c_str());
@@ -4568,7 +4676,8 @@ void test_output_sharpen(bool available)
     {
         auto p = base;
         p.halocontrol = true;
-        run_and_read(p, 1.0, false, "halo control residual");
+        p.halocontrol_amount = 50;
+        run_and_read(p, 1.0, true, "halo control");
     }
     {
         auto p = base;
@@ -4577,7 +4686,7 @@ void test_output_sharpen(bool available)
         p.deconvradius = 0.5;
         p.deconviter = 2;
         p.deconvdamping = 50;
-        run_and_read(p, 1.0, false, "RLD damping residual");
+        run_and_read(p, 1.0, true, "RLD damping");
     }
     {
         auto p = base;
@@ -4590,12 +4699,104 @@ void test_output_sharpen(bool available)
     {
         auto p = base;
         p.blurradius = 0.3;
-        run_and_read(p, 1.0, false, "blur radius residual");
+        run_and_read(p, 1.0, true, "blur radius");
     }
     {
         auto p = base;
         p.edgesonly = true;
-        run_and_read(p, 1.0, false, "edges only residual");
+        p.edges_radius = 1.0;
+        p.edges_tolerance = 100;
+        run_and_read(p, 1.0, true, "edges only");
+    }
+    {
+        auto p = base;
+        p.edgesonly = true;
+        p.edges_radius = 1.0;
+        p.edges_tolerance = 0;
+        run_and_read(p, 1.0, false, "non-positive edge tolerance residual");
+    }
+    {
+        auto p = base;
+        p.blurradius = 25.0;
+        run_and_read(p, 1.0, false, "double Gaussian blur radius residual");
+    }
+
+    /*
+     * The switches must change the plane relative to the plain USM arm, or
+     * the parity above would not prove that they ran.
+     */
+    {
+        const auto device_result = [&](const rtengine::procparams::
+                                           SharpeningParams& p,
+                                       bool smooth) {
+            LabImage source(63, 31);
+            if (smooth) {
+                fill_rld_l(source, 37u);
+            } else {
+                fill_sharpen_l(source, 37u);
+            }
+            LabImage target(63, 31);
+            copy_sharpen_l(source, target);
+            StageExecution execution;
+            std::string error;
+            const RtStageStatus status = run_device_sharpen(
+                context, p, 1.0, target, execution, error);
+            check(status == RT_STAGE_OK, "switch probe completes");
+            std::vector<float> plane(
+                static_cast<std::size_t>(target.W) * target.H, 0.0f);
+            for (int y = 0; y < target.H; ++y) {
+                std::memcpy(&plane[static_cast<std::size_t>(y) * target.W],
+                            target.L[y],
+                            static_cast<std::size_t>(target.W) * sizeof(float));
+            }
+            return plane;
+        };
+        const std::vector<float> plain = device_result(base, false);
+        const std::vector<float> plain_smooth = device_result(base, true);
+        const auto differs = [&](const rtengine::procparams::SharpeningParams& p,
+                                 bool smooth, const char* label) {
+            const std::vector<float> switched = device_result(p, smooth);
+            const std::vector<float>& reference =
+                smooth ? plain_smooth : plain;
+            std::size_t changed = 0;
+            float peak = 0.0f;
+            for (std::size_t i = 0; i < switched.size(); ++i) {
+                const float delta = std::fabs(switched[i] - reference[i]);
+                if (delta > 0.0f) {
+                    ++changed;
+                }
+                peak = std::max(peak, delta);
+            }
+            std::printf("stage-residency: output.sharpen %s switch: %zu of %zu "
+                        "samples differ from plain, peak %.6f\n",
+                        label, changed, switched.size(),
+                        static_cast<double>(peak));
+            check(switched != reference,
+                  (std::string(label) + " changes the device result").c_str());
+            check(peak > 1.0f,
+                  (std::string(label) + " changes the result materially")
+                      .c_str());
+        };
+        auto halo = base;
+        halo.halocontrol = true;
+        halo.halocontrol_amount = 50;
+        differs(halo, false, "halo control");
+        auto blur = base;
+        blur.blurradius = 0.5;
+        blur.contrast = 100.0;
+        differs(blur, true, "blur radius");
+        auto edges = base;
+        edges.edgesonly = true;
+        edges.edges_radius = 1.0;
+        edges.edges_tolerance = 100;
+        differs(edges, false, "edges only");
+        auto damped = base;
+        damped.method = "rld";
+        damped.deconvamount = 20;
+        damped.deconvradius = 0.5;
+        damped.deconviter = 2;
+        damped.deconvdamping = 50;
+        differs(damped, true, "RLD damping");
     }
 
     /*
@@ -4655,9 +4856,11 @@ void test_output_sharpen(bool available)
     }
 
     /*
-     * Show-mask is a valid residual, not an invalid descriptor: the device
-     * refuses it, the host builtin runs, and the host writes the mask. The
-     * contract for this case is therefore RT_STAGE_OK with impl=host.
+     * Show-mask is a valid request, not an invalid descriptor: the device
+     * refuses it because buildBlendMask()'s SIMD sigmoid uses _mm_rsqrt_ps(),
+     * whose approximation an exact kernel cannot reproduce, so the host
+     * builtin runs and writes the mask. The contract is RT_STAGE_OK with
+     * impl=host and no device record.
      */
     {
         LabImage source(63, 31);
@@ -4668,7 +4871,7 @@ void test_output_sharpen(bool available)
         SharpenNodeParams node_params;
         std::string error;
         check(sharpen_node_params(base, 1.0, true, node_params, error),
-              "show-mask residual builds its parameters");
+              "show-mask builds its parameters");
         SharpenNodeArgs node;
         sharpen_node_args(target.L[0], target.W, target.H, node_params, node);
         std::vector<RtStageArg> args(node.args, node.args + SHARPEN_NODE_ARGS);
@@ -4681,13 +4884,13 @@ void test_output_sharpen(bool available)
         const std::string profile = read_file(profile_path);
         unsetenv("RT_STAGE_PROFILE");
 
-        check(status == RT_STAGE_OK, "show-mask residual completes");
+        check(status == RT_STAGE_OK, "show-mask completes");
         check(profile.find("\"stage\":\"output.sharpen\"") != std::string::npos,
-              "show-mask residual records the node");
+              "show-mask records the node");
         check(profile.find("\"impl\":\"host\"") != std::string::npos,
-              "show-mask residual records a host execution");
+              "show-mask records a host execution");
         check(profile.find("\"impl\":\"opencl\"") == std::string::npos,
-              "show-mask residual never records a device pass");
+              "show-mask never records a device pass");
 
         LabImage cpu(63, 31);
         copy_sharpen_l(source, cpu);
@@ -4705,8 +4908,8 @@ void test_output_sharpen(bool available)
         const Diff written = compare_sharpen_l(target, source);
         check(written.differing > 0,
               "show-mask writes the mask into the plane");
-        std::printf("stage-residency: output.sharpen show-mask residual: "
-                    "impl=host, %zu of %zu samples carry the mask\n",
+        std::printf("stage-residency: output.sharpen show-mask: impl=host, "
+                    "%zu of %zu samples carry the mask\n",
                     written.differing, written.samples);
     }
 }

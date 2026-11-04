@@ -279,8 +279,10 @@ quick() {
         "$ROOT/devnotes/opencl/pp3/labsharpening-edges.pp3" lab.sharpening
     run_stage_device "pef/stage-device-lab-sharpening-micro" \
         "$ROOT/devnotes/opencl/pp3/labsharpening-micro.pp3" lab.sharpening
-    run_stage_host "pef/stage-host-sharpen-rld-damped" \
+    run_stage_device "pef/stage-device-sharpen-rld-damped" \
         "$ROOT/devnotes/opencl/pp3/sharpen-rld-damped.pp3" output.sharpen
+    run_stage_device "pef/stage-device-sharpen-usm-halo" \
+        "$ROOT/devnotes/opencl/pp3/sharpen-usm-halo.pp3" output.sharpen
     run_stage_device "pef/stage-device-working-trc" \
         "$ROOT/devnotes/opencl/pp3/working-trc.pp3" working.trc
     run_stage_device "pef/stage-device-working-trc-residual" \
@@ -702,8 +704,10 @@ stage_device() {
         "$ROOT/devnotes/opencl/pp3/sharpen-usm.pp3" output.sharpen
     run_stage_device "pef/stage-device-sharpen-rld" \
         "$ROOT/devnotes/opencl/pp3/sharpen-rld.pp3" output.sharpen
-    run_stage_host "pef/stage-host-sharpen-rld-damped" \
+    run_stage_device "pef/stage-device-sharpen-rld-damped" \
         "$ROOT/devnotes/opencl/pp3/sharpen-rld-damped.pp3" output.sharpen
+    run_stage_device "pef/stage-device-sharpen-usm-halo" \
+        "$ROOT/devnotes/opencl/pp3/sharpen-usm-halo.pp3" output.sharpen
     run_stage_device "pef/stage-device-working-trc" \
         "$ROOT/devnotes/opencl/pp3/working-trc.pp3" working.trc
     run_stage_device "pef/stage-device-working-trc-residual" \
