@@ -384,6 +384,11 @@ Notes:
 - `verify.sh --rgbproc` sets `RT_OPENCL_RGBPROC=1`, asserts that
   `opencl rgbproc:` ran, and compares neutral and exposure profiles. The
   stage is batch-only because preview supplies a tone-curve histogram.
+- The classic `RT_OPENCL_RGBPROC` backend has its own three-sample / 110 LSB16
+  clipped-pixel difference against the packaged CPU path on the vibrance
+  canary. It is not a stage-node residual; `verify.sh` sets the variable only
+  on the `rgb.proc` row so no other gate can absorb it. See
+  `devnotes/perf/STAGE_RUNTIME.md`, "Classic-backend clipped-pixel residual".
 
 ## Stage device residency
 

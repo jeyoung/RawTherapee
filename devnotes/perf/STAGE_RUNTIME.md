@@ -241,6 +241,20 @@ same tool exclusions (black and white, HSV equalizer, film simulation, colour
 toning and the rest). Parity is 1 LSB at 16-bit on 4% of pixels, and the
 classic path stays byte-identical to the package before the kernel moved.
 
+### Classic-backend clipped-pixel residual
+
+The classic `RT_OPENCL_RGBPROC` backend still differs from the packaged CPU
+path at a few clipped samples. On `colorspace_flowers.pef` with
+`labtools-vibrance.pp3` and the default internal profiles, three of 30 419 712
+16-bit samples move by up to 110 LSB16. The difference is identical whether the
+`raw.demosaic` CFA split is admitted or refused, and it disappears when
+`RT_OPENCL_RGBPROC` is unset, so it belongs to the classic RGB path and not to
+any stage node. It is not a stage-node residual: `verify.sh` sets
+`RT_OPENCL_RGBPROC` only on the `rgb.proc` row, so no other gate can absorb it.
+The three samples sit at saturated pixels; the arithmetic has not been traced
+further, and the difference stays recorded here rather than changed, because
+the packaged classic behaviour is the comparison baseline.
+
 ## Framing
 
 `framing` draws the frame in `ImProcFunctions::drawFrame()`. The block has no
