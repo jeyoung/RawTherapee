@@ -156,6 +156,11 @@ pairs are exact. The gate is the peak absolute error (PAE) in normalised units;
 | 2026-11-03 | uncommitted | POCL (CPU) | dense hue-curve non-vacuity: every dense case carries one exported table node per control point (512-40 000, plus the wrap boundary) and differs from the same profile with the family off (PAE 4 086-30 851 LSB16); `labtools-huecurve-dense.pp3` against the same profile with the three curves cleared changes 28 463 057 of 30 419 712 samples (PAE 22 575 LSB16) | device vs host block | 0 (device), non-zero against the family off | PASS |
 | 2026-11-03 | uncommitted | POCL (CPU) | 100 000-point alternating C=f(H): more knots than the slot holds and more kinks than the refiner can subdivide, so the predicate refuses it | device vs host block | 0 (host, `impl=host`) | PASS |
 
+| 2026-11-04 | uncommitted | POCL (CPU) | 4-case thumbnail RGB matrix (8-bit and 16-bit source grids x tone-only and tone+shadow+RGB-curves+channel-mixer, 24x17 padded rows), `stage-residency-test` | device vs independent reference | 0 (exact, PAE 0.000000 LSB16) | PASS |
+| 2026-11-04 | uncommitted | POCL (CPU) | colorspace_flowers.pef / `thumb-rgb.pp3` (exposure + rotation), `thumbnail.rgb` via the thumbnail stage policy, no `RT_OPENCL_RGBPROC` | off vs stage device, PPM | 0 (byte-identical: embedded 239x160 and raw 238x160) | PASS |
+| 2026-11-04 | uncommitted | POCL (CPU) | the same sidecar plus `[Channel Mixer]` (admitted sub-tool) | off vs stage device, PPM | 1 LSB8 (AE=1 of 114 240 raw samples; PAE=1) | PASS |
+| 2026-11-04 | uncommitted | POCL (CPU) | the same sidecar plus `[Black & White] Enabled=true` (refused sub-tool) | off vs stage device, PPM | 0 (host; no `thumbnail.rgb` record, byte-identical) | PASS |
+
 The clarity rows are the block's two-pass sequence, not a single kernel.
 `CLmethod`'s `one`/`inf`/`sup` selection is `finalContAllL()`'s and
 `ContAllAB()`'s coefficient zeroing plus the L0 background paint; the device
@@ -350,6 +355,13 @@ peak absolute error is zero for the synthetic node tests:
 - `thumbnail.whitebalance` runs on the device for the file-browser thumbnails;
   a 45.7 MP NEF thumbnail cache is byte-identical to a CPU-only run, and the
   device test matches an independent reference exactly.
+- `thumbnail.rgb` runs from the stage policy without `RT_OPENCL_RGBPROC`. Its
+  device test matches an independent reference exactly in four cases (8-bit and
+  16-bit source grids, tone curve alone and with the shadow curve, RGB curves
+  and channel mixer). End-to-end thumbnail PPMs are byte-identical with the
+  exposure profile; the channel mixer moves one of 114 240 raw samples by
+  1 LSB8. A black-and-white sidecar is refused: no `thumbnail.rgb` record and
+  byte-identical PPMs.
 - `rgb.proc` through the device, against the `--gpu=off` reference, has a peak
   error of 1 LSB16 on 401 708 of 10 139 424 pixels (4.0%). The classic path is
   byte-identical to the package built before the kernel moved.

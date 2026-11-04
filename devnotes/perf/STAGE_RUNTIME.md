@@ -659,8 +659,8 @@ otherwise, so the next session does not start from that assumption:
   conversion, CIE CAM and gamut compression folded into one block.
 - `thumbnail.decode` is a JPEG decode, not a kernel.
 
-`thumbnail.rgb` is also a composite, but its dominant pixel passes are the
-existing `transform` and `rgb.proc` device nodes; see *Thumbnail RGB* below.
+`thumbnail.rgb` owns its node but still has host-side residual passes; see
+*Thumbnail RGB* below.
 
 ## Thumbnail coarse transform
 
@@ -761,10 +761,12 @@ Evidence (POCL CPU device, `RT_OPENCL_ALLOW_CPU=1 RT_REQUIRE_GPU=1`,
 
 ## Thumbnail RGB
 
-`thumbnail.rgb` is the composite `Thumbnail::stageRgb()`
-(`rtengine/rtthumbnail.cc:2121`). It owns no kernel: its two dominant pixel
-passes are sub-nodes that already have device implementations, and the rest of
-the block is host-side residual. The catalogue therefore marks it `partial`.
+`thumbnail.rgb` is the RGB tone and Lab conversion pass of
+`Thumbnail::stageRgb()` (`rtengine/rtthumbnail.cc:2121`). It owns a device node
+of that name and reuses the `rgb.proc` kernel (`rt_rgb_proc`), because the
+arithmetic is the same: the host builds the tone, RGB-curve, channel-mixer and
+colour-cache LUTs, and the node consumes them exactly as the export node does.
+Only the launcher entry and the gate differ.
 
 ### Passes and coverage
 
@@ -785,109 +787,92 @@ In execution order, with the call site in `stageRgb()`:
 | `Lab_Local` | `rtthumbnail.cc:2505` | host |
 | `lab2rgb` after local adjustments | `rtthumbnail.cc:2577` | host |
 | `moyeqt` colour-toning scan | `rtthumbnail.cc:2639` | host |
-| RGB tone and Lab conversion | `rtthumbnail.cc:2672` | device node `rgb.proc` |
+| RGB tone and Lab conversion | `rtthumbnail.cc:2672` | device node `thumbnail.rgb` |
 
 The auto-exposure derivation at `:2213` reads the analysis histogram and
 produces parameters; it is not a pixel pass. The two local-adjustment passes
 and the colour-toning scan only run when their tools are enabled. The LUT
 construction around the block (`CurveFactory::complexCurve` `:2596`, `RGBCurve`
 `:2605-2607`, `colorToning.getCurves` `:2618`, `curveBW` `:2628`) is host-side
-table work whose output `rgb.proc` consumes.
+table work whose output the RGB node consumes.
 
-Both device nodes also have a classic OpenCL backend:
+Both the transform and the RGB pass also have a classic OpenCL backend:
 `opencl::transformRotateScale` (`iptransform.cc:1245`) and `opencl::rgbProc`
 (`improcfun.cc:2600`). They are tried only when the stage resolver declines the
 node. No other pass in this block has one: the remaining passes have no
 `opencl::` call site in their implementations.
 
-The device nodes are reached through their existing gates, not through a
-thumbnail-specific one. `transform` needs acceleration allowed, an enabled
-device and no lens, CA, distortion, vignette, gradient or post-crop-vignette
-work (`iptransform.cc:1225-1244`). `rgb.proc` sits inside the classic
-`RT_OPENCL_RGBPROC=1` opt-in and its tool exclusions (`improcfun.cc:2528-2543`),
-so the `rgb.proc` record needs that variable in addition to
-`RT_STAGE_OPENCL=1`. That is the documented classic gate, not a thumbnail
-wiring gap: with the variable unset the node is not offered to the runtime and
-no record is written.
+`thumbnail.rgb` is offered through the stage policy,
+`stage::node_device("thumbnail.rgb")`, which needs `RT_STAGE_OPENCL=1` and the
+user OpenCL preference. It does not need the classic `RT_OPENCL_RGBPROC`
+opt-in. `ImProcFunctions::rgbProc()` takes the node name from its last
+argument (default `rgb.proc`), so the export path keeps the classic gate and
+the thumbnail path names its own node. The classic backend remains the
+fallback when the stage node is not selected. Both gates share the same tool
+admission, so black-and-white, colour toning, the HSV equaliser, film
+simulation, saturation, custom tone curves, luma-mode RGB curves, the tone
+equaliser, the ProPhoto working space and `clampOOG` off all stay on the host.
 
 ### Evidence
 
-Sidecar: `devnotes/opencl/pp3/rgbproc-exposure.pp3` plus
-`[Rotation] Degree=90`, so `needsTransform()` is true and both sub-nodes run.
-It is kept untracked at `build/test-scratch/thumb-rgb/thumb-rgb.pp3`.
+Device test (`stage-residency-test`, POCL CPU device,
+`RT_OPENCL_ALLOW_CPU=1 RT_REQUIRE_GPU=1 OMP_NUM_THREADS=1`): four cases at
+24x17 with padded rows, two source grids (values quantised to 8 bits and to
+16 bits) and two table sets (tone curve alone; tone plus the shadow curve,
+per-channel RGB curves and the channel mixer). Each case is compared with an
+independent implementation of the kernel arithmetic: PAE 0.000000 LSB16, 0 of
+1 224 samples beyond 0.5 LSB. The full sub-tool set moves the same source by
+19 089 165 and 20 763 252 LSB16 against the tone-only reference, so the cases
+are not vacuous. The node records `"stage":"thumbnail.rgb","impl":"opencl"`.
+Refusals (missing scalar, 8-bit source buffer, aliased source and destination,
+truncated tone table) all fail and never report a device execution.
+
+End-to-end `thumbnail-stage-test` on the public 10.2 MP PEF, 160 px, sidecar
+`build/test-scratch/thumb-rgb/thumb-rgb.pp3` (exposure plus 90 degree
+rotation), POCL CPU device:
 
 ```bash
 PEF=${RT_TESTDATA:-$PWD/build/rt-testdata}/colorspace_flowers.pef
 SCRATCH=$PWD/build/test-scratch/thumb-rgb
-OCL_ICD_VENDORS=$PWD/build/test-scratch/pocl-icd RT_OPENCL_ALLOW_CPU=1 \
-OMP_NUM_THREADS=1 RT_SETTINGS=$SCRATCH/rt-settings RT_CACHE=$SCRATCH/rt-cache \
+RT_OPENCL_ALLOW_CPU=1 OMP_NUM_THREADS=1 \
+RT_SETTINGS=$SCRATCH/rt-settings RT_CACHE=$SCRATCH/rt-cache \
 RT_STAGE_OPENCL=1 RT_STAGE_PROFILE=$SCRATCH/device.jsonl \
-RT_OPENCL_RGBPROC=1 \
+tools/opencl/pocl-run.sh \
 build/opencl-perf-graph/rtengine/thumbnail-stage-test "$PEF" \
     $SCRATCH/thumb-rgb.pp3 160 $SCRATCH/device
 ```
 
-The host twin runs the same binary and arguments with `RT_STAGE_OPENCL`,
-`RT_STAGE_PROFILE` and `RT_OPENCL_RGBPROC` unset and with `OCL_ICD_VENDORS`
-pointing at an empty directory. The empty directory is required: with
-`RT_STAGE_OPENCL` unset alone, an ambient ICD (`rusticl.icd`, `mesa.icd`) is
-still found, `opencl::enabled()` is true because the user preference is on, and
-the classic backend handles `transform` and the Lab-to-RGB sinks. The "host"
-run is then a classic-backend run and agrees with the device by construction.
-With no ICD the backend is off and the reference is the CPU code; a run of the
-CPU build reproduces that hash exactly.
+`RT_OPENCL_RGBPROC` is deliberately unset: the record is produced by the
+thumbnail gate. The profile contains two `thumbnail.rgb` records (the legacy
+and graph renders run in one process), both `impl=opencl`, plus the scale,
+white-balance and transform nodes.
 
-```bash
-mkdir -p $SCRATCH/empty-icd
-OCL_ICD_VENDORS=$SCRATCH/empty-icd OMP_NUM_THREADS=1 \
-RT_SETTINGS=$SCRATCH/rt-settings RT_CACHE=$SCRATCH/rt-cache \
-build/opencl-perf-graph/rtengine/thumbnail-stage-test "$PEF" \
-    $SCRATCH/thumb-rgb.pp3 160 $SCRATCH/host
-```
+The host twin runs the same binary and arguments with `RT_STAGE_OPENCL` and
+`RT_STAGE_PROFILE` unset and `OCL_ICD_VENDORS` pointing at an empty directory,
+which disables the classic backend as well. The PPMs are byte-identical:
 
-A third run keeps `RT_STAGE_OPENCL=1` but leaves `RT_OPENCL_RGBPROC` unset, so
-`transform` and the other thumbnail nodes run on the device while `rgb.proc`
-stays on the host. POCL's CPU device is selected, so these are CPU-device runs,
-never GPU parity.
+| Run | embedded (239x160) | raw (238x160) |
+|-----|--------------------|----------------|
+| device (exposure + rotation) | `d961f0b52aaa8db2c7acd3c0a5924ad3ef22942156617bdf8fc204d52bd65514` | `86bb7b992d6de9bbfa4116f3c5df8cc0ebec50b5c0757bdf6bb7945913f05498` |
+| host, same sidecar | same | same |
 
-Both sub-node records appear, chained by their hashes: `transform` reads
-`a677044a3725d807` and writes `142265ab331fb8d6`, which is exactly `rgb.proc`'s
-input:
+A sidecar with the channel mixer enabled (`Red=90;8;2`, `Green=5;90;5`,
+`Blue=2;8;90`) exercises an admitted sub-tool: the embedded PPM stays
+byte-identical (`d961f0b5...`), and the raw PPM differs on 1 of 114 240
+samples at 1 LSB8 (AE=1, PAE=1; device `f5e79f8f...`, host `5dc1ca50...`).
+That is the 8-bit face of the documented 1 LSB16 kernel tolerance.
 
-```text
-{"stage":"transform","impl":"opencl","source":"opencl","consumer":"interactive",
- "ns":828188,"width":238,"height":160,"threads":0,"cache_hit":0,
- "input_hash":"a677044a3725d807","output_hash":"142265ab331fb8d6"}
-{"stage":"rgb.proc","impl":"opencl","source":"opencl","consumer":"interactive",
- "ns":0,"width":238,"height":160,"threads":0,"cache_hit":0,
- "input_hash":"142265ab331fb8d6","output_hash":"b5564018d6e26f03"}
-```
+Fail-closed: with `[Black & White] Enabled=true` the RGB tool is not admitted.
+The device run still records the scale, white-balance and transform nodes but
+no `thumbnail.rgb` record, and its PPMs are byte-identical to the pure host run
+(embedded `d961f0b5...`, raw `32ada47f...`).
 
-(The records above are re-wrapped for width; the file is one JSON object per
-line. The `rgb.proc` `output_hash` is stable across passes after the row-pitch
-fix.)
-
-PPM results against the pure CPU host:
-
-| Run | `raw-graph.ppm` sha256 | Samples differing from the host |
-|-----|------------------------|---------------------------------|
-| device, both nodes, 238x160 | `27a9c5f4fd5ae6cf5d05444faf7f0980af37336e95693750defbb45845696f42` | 1 of 114 240, 1 LSB8 (row 29) |
-| device, both nodes, 179x120 | `c621bad329efc65b4c6cc10f9e6d744769cbf7235797f4cb8a3ff3729b299ffc` | 1 of 64 440, 1 LSB8 |
-| device, both nodes, 267x179 | `4dfbc3dc487337f7583343b9948dcd81e4365a5f94fb10409787dd18a885f418` | 4 of 143 379, 1 LSB8 |
-| classic rgbProc, 238x160 | `27a9c5f4fd5ae6cf5d05444faf7f0980af37336e95693750defbb45845696f42` | byte-identical to the device |
-| pure host, 238x160 | `c712e74faf30ff5bd826112d52804e46a3857c1ef2d7214317d662abfb6ccf84` | reference |
-| pure host, 179x120 | `a2572fc61344b57313861764174b562fca957963f59031e0de658f12ee49fbf5` | reference |
-| pure host, 267x179 | `36b1a4e5f708777e2049fa205ff172db70673c5bdf02672f1b228e8f6259ed6a` | reference |
-
-The device and classic runs are stable across repeats: two device runs at each
-height give the same hash, and the `rgb.proc` `output_hash` is
-`b5564018d6e26f03` in both passes of a run.
-
-The device path still differs from the CPU host by 1-4 samples at 1 LSB8, the
-8-bit face of the documented 1 LSB16 kernel tolerance, so byte identity is not
-the applicable gate for this composite. The embedded-JPEG branch is
-byte-identical in every run, 239x160, sha256
-`d961f0b52aaa8db2c7acd3c0a5924ad3ef22942156617bdf8fc204d52bd65514`.
+No export gate applies: thumbnail generation is not on the
+`rawtherapee-graph-cli` export path, so `verify.sh` has no row for this node.
+The device test and the thumbnail harness are the evidence, and POCL's CPU
+device means these are CPU-device runs, never GPU parity. The stage-residency
+suite passes with one skip (the GPU-only residual), and the CPU build passes
+with 36 skips.
 
 ### `rgb.proc` row pitch
 

@@ -230,6 +230,10 @@ run_pair() {
     [ "$result" = "PASS" ]
 }
 
+# Thumbnail nodes are not on the export path, so they have no row in the
+# stage lists below. `thumbnail.rgb` is covered by the independent-reference
+# cases in `stage-residency-test` and by `tools/perf/thumbnail-stage-test`
+# (device PPMs against a pure-host run); see devnotes/perf/STAGE_RUNTIME.md.
 quick() {
     local sample="${sample_override:-$TESTDATA/colorspace_flowers.pef}"
     [ -f "$sample" ] || die "missing $sample (run tools/opencl/fetch-testdata.sh)"

@@ -489,7 +489,7 @@ by default.
 | `thumbnail.scale` | -/-/-/Reduced | interactive | reuse-output | scale to thumbnail height | yes |
 | `thumbnail.transform` | -/-/-/Reduced | interactive | reuse-input | coarse rotate and flip | yes |
 | `thumbnail.whitebalance` | -/-/-/Reduced | interactive | reuse-input | apply white balance to the thumbnail | yes |
-| `thumbnail.rgb` | -/-/-/Reduced | interactive | reuse-input | thumbnail RGB processing | partial |
+| `thumbnail.rgb` | -/-/-/Reduced | interactive | reuse-input | thumbnail RGB processing | yes |
 | `thumbnail.lab` | -/-/-/Reduced | interactive | reuse-input | thumbnail Lab tools, working TRC, CIE CAM and gamut in one pass | no |
 | `thumbnail.output` | -/-/-/Reduced | interactive | recompute | Lab to 8-bit thumbnail with gamma | yes |
 
@@ -705,7 +705,7 @@ by the graph executor.
   apply them with the highlight-recovery magenta guard.
 - `thumbnail.rgb` `stageRgb()`: colour-space conversion, first analysis,
   dehaze, Fattal tone mapping, geometry transform, local adjustments and
-  `rgbProc()`.
+  `rgbProc()`; the RGB pass runs on the `thumbnail.rgb` node.
 - `thumbnail.lab` `stageLab()`: Lab tools, local contrast, working TRC,
   CIE CAM and gamut compression in one reduced-scale pass.
 - `thumbnail.output` `stageOutput()`: Lab to 8-bit monitor or output RGB, the
@@ -1930,21 +1930,27 @@ device run is slower than the host and exists for parity and correctness.
 The `Device` column of the canonical block catalogue above is the single source
 of truth; this section records the remaining work and the naming exceptions.
 
-Device nodes today: `transform`, `rgb.proc`, `gamut`, `framing`, `lanczos3`
-(block `resize`), `output.convert`, `monitor.output`, `viewport.output`,
-`output.sharpen` (for the supported USM and undamped RLD sets), `lab.sharpening`
-(for the admitted impulse denoise, defringe, ML sharpen edges and ML
-microcontrast block), `thumbnail.output`,
-`thumbnail.whitebalance`, `thumbnail.scale` and `thumbnail.transform`, plus the
-runtime-only packed siblings `thumbnail.scale.u8` and
-`thumbnail.transform.u8`.
+Device nodes today: `transform`, `rgb.proc`, `thumbnail.rgb`, `gamut`,
+`framing`, `lanczos3` (block `resize`), `output.convert`, `monitor.output`,
+`viewport.output`, `output.sharpen` (for the supported USM and undamped RLD
+sets), `lab.sharpening` (for the admitted impulse denoise, defringe, ML sharpen
+edges and ML microcontrast block), `thumbnail.output`, `thumbnail.whitebalance`,
+`thumbnail.scale` and `thumbnail.transform`, plus the runtime-only packed
+siblings `thumbnail.scale.u8` and `thumbnail.transform.u8`.
 
-Partial: `thumbnail.rgb` is a composite. Its two dominant pixel passes are the
-`transform` and `rgb.proc` device nodes, so the block is `partial`; the
-colour-space conversion, film negative, first analysis, dehaze, Fattal tone
-mapping and local adjustments around them stay on the host. `lab.sharpening`
-runs impulse denoise, defringe, ML sharpen edges and ML microcontrast on the
-device and keeps the main sharpen pass in the shared `output.sharpen` node.
+`thumbnail.rgb` owns a node that runs the block's RGB tone and Lab conversion
+pass through the shared `rgb.proc` kernel. The node is offered under the stage
+policy rather than the classic `RT_OPENCL_RGBPROC` opt-in. Its admission is the
+kernel's: tone curve, RGB curves and channel mixer are device; black-and-white,
+colour toning, HSV equaliser, film simulation, saturation, custom tone curves,
+luma-mode RGB curves, tone equaliser, ProPhoto working space and `clampOOG`
+off stay on the host. The colour-space conversion, film negative, first
+analysis, dehaze, Fattal tone mapping, geometry transform and local adjustments
+around it also stay host-side; they are not part of the RGB pass.
+
+Partial: `lab.sharpening` runs impulse denoise, defringe, ML sharpen edges and
+ML microcontrast on the device and keeps the main sharpen pass in the shared
+`output.sharpen` node.
 The block is atomic: an image below 8x8, a threshold outside 0..100, a
 defringe radius outside 0..25, a device without fp64, a defringe window wider
 than the image, an edge pass count outside 0..4, an edge amount outside 0..100,

@@ -554,14 +554,19 @@ export and a GUI smoke test are not yet run for this package.
   device cases exact on POCL, thumbnail PPMs byte-identical, 4th-ulp gap closed
   by a padded-width test. Commits `e07aa5f4f`, `0f7da2e8a`, `39c7c3dcd`,
   `da6a81b47`.
-- **A2 `thumbnail.rgb`**: composite coverage proven (`transform` and
-  `rgb.proc` records `impl=opencl`, hash chain); the run exposed a real
-  `rgb.proc` defect — the shared kernel indexed compactly while stage buffers
-  are row-padded, so padded widths sheared and width 179 crashed. Fixed with
-  explicit source/destination pitches in the shared kernel and both backends;
-  regression test at widths 238/179 against compact-width references; classic
-  export byte-identical at a padded width. Residual 1-4 samples at 1 LSB8.
-  Commits `36fae8d35`, `2a8381228`, `c7c3387d9`, `96feabcb0`.
+- **A2 `thumbnail.rgb`**: the block now owns a `thumbnail.rgb` device node that
+  reuses the shared `rgb.proc` kernel and is offered under the stage policy,
+  without `RT_OPENCL_RGBPROC`. The classic backend stays the fallback and the
+  export `rgb.proc` gate is unchanged. The device test covers 8-bit and 16-bit
+  source grids with the tone curve, shadow curve, RGB curves and channel
+  mixer, all exact against an independent reference; black-and-white is
+  refused and leaves no device record. End-to-end PPMs are byte-identical with
+  the exposure profile; the mixer moves 1 of 114 240 raw samples at 1 LSB8.
+  The earlier composite work also exposed and fixed a real `rgb.proc` defect:
+  the shared kernel indexed compactly while stage buffers are row-padded, so
+  padded widths sheared and width 179 crashed; regression test at widths
+  238/179 against compact-width references. Commits `36fae8d35`, `2a8381228`,
+  `c7c3387d9`, `96feabcb0`, `065d3ca53`, `186988ff7`.
 - Kernel pitch audit: every other stage kernel already takes pitches; only
   `rgb.proc` was compact. Padded-width tests added for wb/permute/scale are
   listed in `STAGE_RUNTIME.md` for the next sweep.
@@ -806,11 +811,11 @@ Order (reuse before new kernels, cheapest parity first):
 5. New kernels: `gamut`, `ciecam`, `working.trc`, `framing`, `output.sharpen`.
 6. Composites: `local.adjustments`, `lab.tools`, `lab.sharpening`,
    `lab.wavelet`, `crop`.
-7. Thumbnail nodes. `thumbnail.output`, `thumbnail.whitebalance` and
-   `thumbnail.transform` (both formats) are done. `thumbnail.scale`,
-   `thumbnail.rgb`, `thumbnail.lab` and `thumbnail.decode` remain. Each new
-   kernel needs a device test as well as a call-site gate: the white-balance
-   test paid for itself immediately.
+7. Thumbnail nodes. `thumbnail.output`, `thumbnail.whitebalance`,
+   `thumbnail.transform` (both formats), `thumbnail.scale` and
+   `thumbnail.rgb` are done. `thumbnail.lab` and `thumbnail.decode` remain.
+   Each new kernel needs a device test as well as a call-site gate: the
+   white-balance test paid for itself immediately.
 8. Destructive raw nodes last: `source.select`, `source.embedded`,
    `raw.preprocess`, `raw.demosaic`, `raw.base`, `analysis`.
 9. Device-buffer reuse across consecutive nodes, then a residency policy
