@@ -167,6 +167,11 @@ pairs are exact. The gate is the peak absolute error (PAE) in normalised units;
 | 2026-11-04 | `2b3fcd5a9..4a8b1ae85` | POCL (CPU) | colorspace_flowers.pef / `working-trc-residual.pp3` (soft light on, strength 50), `working.trc` | off vs stage device, 16-bit TIFF | 1 LSB (1.5259e-05; 547,600 of 30,419,712) | PASS |
 | 2026-11-04 | `2b3fcd5a9..4a8b1ae85` | POCL (CPU) | 31-case `working.trc` matrix (five TRC values, gamut on/off, `wapsat` 0/0.5/1, soft light off/disabled/zero/3/30/50/60/100, a bright ramp, odd width, out-of-gamut, midtone-equaliser, opacity-curve, strength 101 and -1), `stage-residency-test` | device vs host block | 0.099609 LSB16 (soft light srgb worst) | PASS |
 | 2026-11-04 | `2b3fcd5a9..4a8b1ae85` | POCL (CPU) | `working.trc` soft-light kernel against the host `softLight()` on the production 3888x2608 Lab, and non-vacuity at strength 50 | device vs host block / tool off | 0 (bit-exact in the kernel; 17,136 of 17,136 samples change at PAE 4,282.638672 LSB16 in the node) | PASS |
+| 2026-11-04 | uncommitted | POCL (CPU) | 38-case output-sharpen switch matrix (blur radius 0.25-2.5, halo 0-100, edge radius 0.4-3.0 at tolerance 20/100/500, edges+halo, blur+halo, blur+edges, two smooth-plane edges cases, RLD damping 20/50/100 at radius 0.45/0.75/1.0, damping+blur and damping amount 500), `stage-residency-test` | device vs host block | 0.633 LSB16 (worst: edges only on the smooth plane with a flat mask; USM 0.541, RLD 0.523, damped 0.313) | PASS |
+| 2026-11-04 | uncommitted | POCL (CPU) | output-sharpen switch non-vacuity: halo, blur radius, edges only and RLD damping each change the device result against the plain USM arm on the same source | device vs plain arm | 319-1948 of 1953 samples, peak 50.8-7653.4 LSB16 | PASS |
+| 2026-11-04 | uncommitted | POCL (CPU) | output-sharpen refusals: `showMask`, a non-positive edge tolerance, `blurradius=25` (double Gaussian), `deconvradius/scale=1.5` (separable), a padded row and a padded plane, on the device and in the builtin | predicate/launcher refuses | 0 (host; 1953 samples untouched) | PASS |
+| 2026-11-04 | uncommitted | POCL (CPU) | colorspace_flowers.pef / `sharpen-usm.pp3`, `sharpen-rld.pp3`, `sharpen-rld-damped.pp3` and `sharpen-usm-halo.pp3`, `output.sharpen` | off vs auto, 16-bit TIFF | 1 LSB (1.5259e-05; 24,447 / 20,651 / 12,678 / 21,706 of 7,604,928), all `impl=opencl` | PASS |
+| 2026-11-04 | uncommitted | POCL (CPU) | colorspace_flowers.pef / USM edges only with a flat mask, `output.sharpen` | off vs auto, 16-bit TIFF | 4 LSB (4.578e-05; 605,915 of 7,604,928), `impl=opencl` | NOTE |
 
 The clarity rows are the block's two-pass sequence, not a single kernel.
 `CLmethod`'s `one`/`inf`/`sup` selection is `finalContAllL()`'s and
@@ -453,6 +458,23 @@ peak absolute error is zero for the synthetic node tests:
   non-zero transition is also a host residual because the block's padded
   extent does not cover the transition ring the host reads. Negative damping
   is refused by the predicate and is not a runtime case.
+- Output sharpening, through `output.sharpen`, runs its residual switches on
+  the device: the edges-only bilateral (all twenty-one sigma buckets and the
+  `0x20000`-entry range table), halo control, the blur-radius pre-pass and
+  damped RLD (both the 3x3 FIR and the IIR forward blur, with the SIMD/scalar
+  `dcdamping()` split). Thirty-eight USM and twenty-four RLD cases are within
+  0.633 LSB16; halo, blur radius, edges and damping each change the device
+  result against the plain USM arm, so the parity is not vacuous.
+  `sharpen-usm.pp3`, `sharpen-rld.pp3`, `sharpen-rld-damped.pp3` and
+  `sharpen-usm-halo.pp3` are 1 LSB16 and record `impl=opencl`. Show-mask
+  stays a host residual because the mask is the output and the host's SIMD
+  `_mm_rsqrt_ps()` sigmoid differs from the exact form by 1.8 LSB16 on the
+  mask's own scale; a non-positive edge tolerance, `blurradius >= 25` and the
+  separable RLD radius are the other named refusals. An edges-only export
+  measures 4 LSB16 even though the node is bit-exact on the same input,
+  because the upstream device pipeline supplies a slightly different L plane
+  and the bilateral's piecewise-constant range table amplifies it; that
+  profile is therefore not added to the export gate.
 - Local capture sharpening, through `local.adjustments`, runs the `"cap"`
   arm on the clipped ROI: the ROI is converted to working RGB, `RGB2L`
   builds the manual contrast mask, `CaptureDeconvSharpening_SE()`'s tiled

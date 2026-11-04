@@ -635,6 +635,24 @@ export and a GUI smoke test are not yet run for this package.
   `2b3fcd5a9..4a8b1ae85`. Residuals: local contrast, both tone equalisers,
   B&W, a soft-light strength outside 1..100, type -5 profiles and
   out-of-gamut first passes.
+- **`output.sharpen` residual switches**: the fallback arms are now device
+  kernels with host-derived scalars: edges-only (`bilateral2.h`'s twenty-one
+  sigma buckets, upper-triangle integer weights, `0x20000`-entry range table
+  and all border rules), halo control (`sharpenHaloCtrl()`'s sliding three-row
+  maximum/minimum as one work item per row), the blur-radius pre-pass (plain
+  Gaussian, mask merge before and after) and damped RLD (`dcdamping()` with
+  the sleef `xlogf()` port and its SIMD/scalar split, on the 3x3 FIR and IIR
+  forward blurs). Up to five scratch planes are sized from the switches, so
+  plain USM still allocates three. Thirty-eight USM and twenty-four RLD cases
+  are within 0.633 LSB16 (edges only on a smooth plane with a flat mask; USM
+  0.541, RLD 0.523, damped 0.313); halo, blur radius, edges and damping each
+  change the device result against the plain USM arm. `sharpen-usm.pp3`,
+  `sharpen-rld.pp3`, `sharpen-rld-damped.pp3` and `sharpen-usm-halo.pp3` are
+  1 LSB16 with `impl=opencl`. Show-mask, a non-positive edge tolerance,
+  `blurradius >= 25` and the separable RLD radius stay host residuals. The
+  edges-only export measures 4 LSB16 because the node is bit-exact on a given
+  input and the upstream device pipeline's L plane is amplified by the
+  bilateral's piecewise-constant range table; that profile is not gated.
 - Side defects found: `workingtrc` leaks the profile/transform per call
   (`iplab2rgb.cc:2145/2173`, still open); forcing the POCL CPU stage device
   under `--gpu=auto` hits a null `opencl::initLocked` call with

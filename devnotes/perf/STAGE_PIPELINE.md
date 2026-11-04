@@ -60,15 +60,19 @@ does. `partial` never means verified: it records device execution of the named
 sub-nodes and the residual beside it, not parity of the composite.
 
 `output.sharpen` is partial: the device runs the unsupported-mask path with
-`method=usm`, no edges-only, no halo control, no show-mask, `blurradius < 0.25`
-and `radius / scale < 25`, and the undamped Richardson-Lucy path with
-`method=rld`, `deconvdamping == 0`, `deconviter <= 1000`,
-`deconvradius / scale < 1.15` and `blurradius < 0.25`. The default post-resize
-profile (`rld`, radius 0.45, 100 iterations, no damping) is therefore on the
-device. Damped RLD, `deconvradius / scale >= 1.15`, `deconviter > 1000`,
-edges-only, halo control, show-mask, `blurradius >= 0.25` and the USM sigma
-limit are host residuals; they run the `output.sharpen` host builtin and are
-recorded as `impl=host`, never as a device pass.
+`method=usm` including edges-only (any positive edge tolerance), halo control
+and the blur-radius pre-pass, with `radius / scale < 25` and
+`blurradius < 25`; and the Richardson-Lucy path with `method=rld`, including
+positive `deconvdamping` (both the 3x3 FIR and the IIR forward blurs),
+`deconviter <= 1000`, `deconvradius / scale < 1.15` and `blurradius < 25`.
+The default post-resize profile (`rld`, radius 0.45, 100 iterations, no
+damping) is therefore on the device, and so is the damped profile. Show-mask,
+a non-positive edge tolerance, `deconvradius / scale >= 1.15` (the separable
+IIR radius), `deconviter > 1000`, `blurradius >= 25` (the double Gaussian) and
+the USM sigma limit are host residuals; they run the `output.sharpen` host
+builtin and are recorded as `impl=host`, never as a device pass. Show-mask
+stays on the host because the mask is the output and the host's SIMD
+`_mm_rsqrt_ps()` sigmoid reaches 1.8 LSB16 against the exact form.
 
 `working.trc` is partial: the default configuration runs a device soft-light
 pre-pass, one device second pass and the host prefix. The host prefix is
@@ -484,7 +488,7 @@ by default.
 | `output.convert` | Full/-/-/- | exact | reuse-output | Lab to output RGB and output profile conversion | yes |
 | `crop` | Full/-/-/- | exact | reuse-output | crop | yes |
 | `resize` | Full/-/-/- | exact | reuse-output | resize (`lanczos3`) | yes |
-| `output.sharpen` | Full/-/-/- | exact | reuse-input | post-resize sharpening (`output.sharpen`); USM without residual switches | partial |
+| `output.sharpen` | Full/-/-/- | exact | reuse-input | post-resize sharpening (`output.sharpen`); USM with edges-only, halo control and the blur-radius pre-pass, and RLD with damping and the blur radius | partial |
 | `framing` | Full/-/-/- | exact | reuse-output | framing and frame drawing | yes |
 | `output.icc` | Full/-/-/- | exact | recompute | attach output ICC and metadata | n/a |
 | `monitor.output` | -/Full/-/- | interactive | recompute | Lab to monitor RGB | yes |

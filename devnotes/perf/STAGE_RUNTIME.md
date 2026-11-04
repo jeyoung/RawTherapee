@@ -423,20 +423,29 @@ node call.
 
 The device supports:
 
-- `method=usm` with no edges-only, no halo control, no show-mask,
-  `blurradius < 0.25` and `radius / scale < 25`; `radius / scale >= 25`
-  follows the CPU `GAUSS_DOUBLE` limit.
-- `method=rld` with no edges-only, no halo control, no show-mask,
-  `blurradius < 0.25`, `deconvdamping == 0`, `deconviter <= 1000` and
-  `deconvradius / scale < 1.15`. A zero `deconvamount` with no blur-radius
-  pre-pass is the CPU no-op: the node reports OK with the plane unchanged.
-  `deconvdamping != 0`, `deconvradius / scale >= 1.15` (the separable IIR
-  range), `deconviter > 1000` and `blurradius >= 0.25` are named host
-  residuals in `stage/algorithms/sharpen_cl.h`.
+- `method=usm` with any edges-only and halo-control configuration,
+  `radius / scale < 25` and `blurradius < 25`. Edges-only needs a positive
+  `edges_tolerance`: a non-positive value makes the host's range-weight table
+  NaN at the centre sample, so there is no meaningful result to reproduce.
+  `blurradius >= 25` follows the CPU `GAUSS_DOUBLE` limit, whose double
+  recurrence the device does not carry.
+- `method=rld` with `deconviter <= 1000`, `deconvradius / scale < 1.15` and
+  `blurradius < 25`, including a positive `deconvdamping`. A negative damping
+  is the host's undamped arm (`needdamp = damping > 0`). A zero
+  `deconvamount` with no blur-radius pre-pass is the CPU no-op: the node
+  reports OK with the plane unchanged.
+- `showMask` stays on the host. The request replaces the plane with the mask,
+  and `buildBlendMask()`'s SIMD arm evaluates the sigmoid with
+  `_mm_rsqrt_ps()`. That approximation reaches 1.8 LSB16 against the exact
+  sigmoid on the mask's own full scale, so an exact kernel cannot hold the
+  1-LSB16 gate. `deconvradius / scale >= 1.15` (the separable IIR range) and
+  `deconviter > 1000` are the other named host residuals in
+  `stage/algorithms/sharpen_cl.h`.
 
 The default post-resize sharpening profile is therefore device-covered: it
-selects `rld`, radius 0.45, 100 iterations and no damping. Damped profiles and
-radii at or above 1.15 stay on the host and record `impl=host`.
+selects `rld`, radius 0.45, 100 iterations and no damping. Damped profiles are
+device-covered too, including the 3x3 FIR arm below sigma 0.6. A separable RLD
+radius and a show-mask request stay on the host and record `impl=host`.
 
 Kernels, in one program:
 
@@ -449,15 +458,34 @@ Kernels, in one program:
   vertically, so padded rows are handled explicitly.
 - `rt_sharpen_fir3` reproduces `gauss3x3()` for distinct source and
   destination, including the horizontal first and last rows, the vertical
-  first and last columns and the copied corners.
+  first and last columns and the copied corners. `rt_sharpen_copy` is the
+  `GAUSS_SKIP` identity copy.
+- `rt_sharpen_blend_max` is the blur-radius merge,
+  `intp(blend, L, max(blur, 0))`, used before and after the sharpening.
 - `rt_sharpen_apply` evaluates `min(fabs(diff), 2000)`, the threshold mapping
-  and `intp(a, b, c) = a * (b - c) + c` in the CPU order, in place.
+  and `intp(a, b, c) = a * (b - c) + c` in the CPU order, in place. It takes
+  the difference base as its own argument, so edges-only uses the bilateral
+  plane while the result still replaces L.
+- `rt_sharpen_halo` reproduces `sharpenHaloCtrl()`: one work item per interior
+  row because the three-row sliding maximum and minimum carry along the row.
+  The `2 * sum / 27 + centre / 3`, the deviation from the blur map, the
+  threshold and the `scale` clamp keep the host order.
+- `rt_sharpen_bilateral_lut` and `rt_sharpen_bilateral` reproduce
+  `bilateral2.h`'s range-weight table and all twenty-one sigma buckets. The
+  upper-triangle integer weights, the bucket scale, the `0x20000`-entry
+  exponential table and the `(int)(other - self + 65536)` lookup follow the
+  header, including its `sigma < 0.45` copy arm. The table is built on the
+  device once per edges-only pass.
+- `rt_sharpen_damp` reproduces `dcdamping()` with the sleef `xlogf()` port and
+  its SIMD/scalar split: the vector arm covers the columns below
+  `width - width % 4`, and the two arms group the polynomial differently.
 - `rt_sharpen_rld_init`, `rt_sharpen_div3/5/7`, `rt_sharpen_mult3/5/7` and
-  `rt_sharpen_rld_final` implement the undamped Richardson-Lucy iteration:
-  clamp L and seed the estimate, divide by the blurred estimate with the CPU
-  `GAUSS_DIV` denominator and floor, multiply the estimate by the blurred
-  ratio with `GAUSS_MULT`, and finish with
-  `intp(blend * amount, max(estimate, 0), L)`. The 3x3 kernels keep the CPU's
+  `rt_sharpen_rld_final` implement the Richardson-Lucy iteration: clamp L and
+  seed the estimate, divide by the blurred estimate with the CPU `GAUSS_DIV`
+  denominator and floor, multiply the estimate by the blurred ratio with
+  `GAUSS_MULT`, and finish with `intp(blend * amount, max(estimate, 0), L)`.
+  The damped arm replaces the division with the standard Gaussian blur, then
+  `dcdamping()` and the same `GAUSS_MULT`. The 3x3 kernels keep the CPU's
   filtered border; the 5x5 and 7x7 division kernels set their 2- and 3-pixel
   borders to 1.0, while their multiplication kernels leave them untouched.
   The 7x7 weighted sum keeps the CPU's double use of `c21`.
@@ -470,14 +498,18 @@ starting the recurrence, the forward pass, the boundary correction and the
 backward pass keep the host order. The 3x3 kernel coefficients are the
 normalized `gauss3x3()` constants. The 5x5 and 7x7 RLD coefficients reproduce
 `compute5x5kernel()` and `compute7x7kernel()` in their own float storage and
-float normalization, so the device uses the same values as the CPU. The
-Gaussian support windows follow `GAUSS_SKIP` (0.25), 0.6, 0.84 and 1.15:
-below 0.25 the RLD loop is the CPU's identity copy, and at or above 1.15 the
-node is a host residual. The mask, the blur, the RLD estimate and the RLD
-intermediate are device scratch; only the L plane is uploaded and read back.
-Each RLD iteration is two blocking kernel submissions (divide, then multiply)
-on the in-order device queue. The node is one stage submission with no
-intermediate host transfer, not one enqueue.
+float normalization, so the device uses the same values as the CPU. A plain
+`gaussianBlur()` follows `GAUSS_SKIP` (0.25), 0.6 and 25: below 0.25 it copies,
+below 0.6 it runs the 3x3 FIR and above it the SSE IIR pair. The RLD support
+windows additionally break at 0.84 and 1.15; below 0.25 the undamped loop is
+the CPU's identity copy, and at or above 1.15 the node is a host residual.
+The mask, the blur-radius plane, the edge base, the halo copy, the Gaussian
+state and the RLD estimate and intermediate are device scratch; only the L
+plane is uploaded and read back. The node sizes the scratch list from the
+enabled switches, so a plain USM request still allocates three planes. Each
+RLD iteration is two blocking kernel submissions (divide or blur, then
+multiply) on the in-order device queue. The node is one stage submission with
+no intermediate host transfer, not one enqueue.
 
 `#pragma OPENCL FP_CONTRACT OFF` is at the top of the whole kernel source, so
 it applies to the mask, apply and USM kernels as well as the RLD kernels. It
@@ -488,17 +520,20 @@ Evidence:
 
 | Case | Result |
 |---|---|
-| device test, 25 USM cases: defaults, radius 0.3/0.5/0.59/0.6/1.15/3.0, contrast 0/20/100, amounts 1/100/200/1000, threshold breakpoints and the two-value form, widths 8/63/64/65 and padded 238, sigma 0.25 and a skip case | worst PAE 0.824219 LSB16 (threshold two-value), next 0.664062 (amount 1000); width 8..238 at or below 0.136719; 1953 to 5712 samples per case |
-| device test, 15 RLD cases: radius 0.3/0.45/0.75/1.0, iterations 1/5/30/100, deconvolution amounts 1/50/100/1000, padded width 238 and the zero-amount no-op | worst PAE 0.466797 LSB16 (amount 1000), next 0.342773 (radius 0.75); iteration sweep 0.025879 to 0.071289; no-op bit-exact; 1953 to 5712 samples per case |
+| device test, 38 USM cases: defaults, radius 0.3/0.5/0.59/0.6/1.15/3.0, contrast 0/20/100, amounts 1/100/200/1000, threshold breakpoints and the two-value form, widths 8/63/64/65 and padded 238, sigma 0.25 and a skip case, blur radius 0.25/0.3/0.5/0.59/0.75/1.0/2.5, halo 0/25/50/100, edge radius 0.4/0.5/0.65/1.0/1.6/2.1/3.0 at tolerance 100, tolerance 20/100/500, edges with radius 1.0 and amount 500, edges with halo, blur with halo, blur with edges, and two smooth-plane edges cases | worst PAE 0.632812 LSB16 (edges only on the smooth plane with a flat mask), then 0.564453 (edges only smooth) and 0.541016 (threshold two-value); blur radius at or below 0.169678; halo at or below 0.069336; edges on the white-noise plane at or below 0.166992; blur with edges 0.238037; 1953 or 5712 samples per case |
+| device test, 24 RLD cases: radius 0.3/0.45/0.75/1.0, iterations 1/5/30/100, deconvolution amounts 1/50/100/1000, padded width 238, the zero-amount no-op, damping 20/50/100 at radius 0.45/0.75/1.0, damping with blur radius and damping at amount 500 | worst PAE 0.523438 LSB16 (undamped amount 1000); damped worst 0.312500 (damping 50, radius 1.0), damping 100 at radius 0.75 0.201172; damping with blur radius 0.067871; no-op bit-exact; 1953 to 5712 samples per case |
 | RLD content | the RLD fixture keeps smooth gradients, hard edges and a negative band; white noise drives the division into an unrealistic dynamic range and is not deconvolution content |
 | identity and flat-mask cases (contrast 0, threshold zeros, sigma below `GAUSS_SKIP`) | bit-exact, 0 differing samples |
-| residual request through `stage::run()` with `halocontrol=true`, `deconvdamping=50`, `deconvradius=1.5` and `blurradius=0.3` | `impl=host`, `source=device-fallback`; output bit-identical to both the production CPU path and the extracted core |
+| switch non-vacuity, device result against the plain USM arm on the same source | halo changes 319 of 1953 samples (peak 2369.8 LSB16), blur radius 1948 (peak 1798.3), edges only 484 (peak 50.8), RLD damping 1805 (peak 7653.4) |
+| residual requests through `stage::run()`: `showMask=true`, a non-positive edge tolerance, `blurradius=25` (double Gaussian), `deconvradius/scale=1.5` (separable) | `impl=host`, `source=device-fallback`; output bit-identical to the production CPU path and the extracted core; `showMask` writes all 1953 mask samples |
 | packed-plane contract through `stage::run()` with a padded row or a padded plane, on both the device and the builtin path | `RT_STAGE_INVALID`, 1953 samples untouched in every case |
-| `edgesonly=true` and `showMask=true` through `stage::run()` | both are valid host residuals: `impl=host`, no device record; edges-only is bit-identical to the CPU reference, show-mask is bit-identical to the CPU mask and writes all 1953 samples |
+| `edgesonly`, `halocontrol` and a positive `deconvdamping` through `stage::run()` | record `impl=opencl`, `source=opencl`; within 1 LSB16 of the CPU path; non-vacuous |
 | supported request through `stage::run()` | record `impl=opencl`, `source=opencl`; within 1 LSB16 of the CPU path |
-| `verify.sh --stage-device`, POCL CPU, `RT_REQUIRE_GPU=1`, `OMP_NUM_THREADS=1`, `sharpen-usm.pp3` | PASS, `max_pae=1.5259e-05` on a 1944x1304 frame; record `"stage":"output.sharpen","impl":"opencl","source":"opencl"` |
-| the same gate with the default `sharpen-rld.pp3` (radius 0.45, 100 iterations, no damping) | PASS, `max_pae=1.5259e-05`; record `"stage":"output.sharpen","impl":"opencl","source":"opencl"` |
-| the same gate with `sharpen-rld-damped.pp3` | `impl=host`, `source=device-fallback`; printed as a host residual and not counted as device parity |
+| `verify.sh --stage-device` equivalents, POCL CPU, `OMP_NUM_THREADS=1`, `sharpen-usm.pp3` | PASS, `max_pae=1.5259e-05` (1 LSB16, 24 447 of 7 604 928) on a 1944x1304 frame; record `"stage":"output.sharpen","impl":"opencl","source":"opencl"` |
+| the same gate with the default `sharpen-rld.pp3` (radius 0.45, 100 iterations, no damping) | PASS, `max_pae=1.5259e-05` (1 LSB16, 20 651 of 7 604 928) |
+| the same gate with `sharpen-rld-damped.pp3` (radius 0.45, damping 50) | PASS, `max_pae=1.5259e-05` (1 LSB16, 12 678 of 7 604 928); `impl=opencl` |
+| the same gate with `sharpen-usm-halo.pp3` (halo 50) | PASS, `max_pae=1.5259e-05` (1 LSB16, 21 706 of 7 604 928); `impl=opencl` |
+| the same gate with an edges-only profile and a flat mask | 4 LSB16 (4.578e-05, 605 915 of 7 604 928) with `impl=opencl`; the node is bit-exact on the same input, so the difference is the upstream device pipeline's L plane amplified by the bilateral's piecewise-constant range-weight table. The profile is not added to the export gate. |
 | pure CPU refactor, USM and RLD profiles, `--gpu=off`, `OMP_NUM_THREADS=1` | normalized 16-bit pixel hashes identical before and after: USM `24ffef79d50c678b4dea72d5e3f047ae32a4a34c0fd4b11c248ba1c500cb093f`, RLD `d0e6555e96fe7ab393cedea13bd4b1d6b45e80faac86af456d8e67b962816b30` |
 
 The threshold mapping uses double when the device advertises `cl_khr_fp64`,
