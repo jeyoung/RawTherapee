@@ -106,7 +106,7 @@ RtStageBuffer rgbTable(const float* data, int entries)
  * is the one `run_rgb_proc` documents in the device backend.
  */
 bool run_rgb_proc_stage(Imagefloat& working, LabImage& lab,
-                        const opencl::RgbProcData& data)
+                        const opencl::RgbProcData& data, const char* node)
 {
     constexpr int INT_ARGS = 6;
     constexpr int DOUBLE_ARGS = 3;
@@ -161,7 +161,8 @@ bool run_rgb_proc_stage(Imagefloat& working, LabImage& lab,
     }
 
     RtStageProfiling profiling{};
-    return stage::run("rgb.proc", std::vector<RtStageArg>(args, args + ARG_COUNT),
+    return stage::run(node != nullptr ? node : "rgb.proc",
+                      std::vector<RtStageArg>(args, args + ARG_COUNT),
                       &profiling) == RT_STAGE_OK;
 }
 
@@ -2231,7 +2232,8 @@ void ImProcFunctions::rgbProc(Imagefloat* working, LabImage* lab, PipetteBuffer 
                               const ColorGradientCurve& ctColorCurve, const OpacityCurve& ctOpacityCurve, bool opautili, const LUTf& clToningcurve, const LUTf& cl2Toningcurve,
                               const ToneCurve& customToneCurve1, const ToneCurve& customToneCurve2, const ToneCurve& customToneCurvebw1, const ToneCurve& customToneCurvebw2,
                               double &rrm, double &ggm, double &bbm, float &autor, float &autog, float &autob, double expcomp, int hlcompr, int hlcomprthresh,
-                              DCPProfile *dcpProf, const DCPProfileApplyState& asIn, LUTu& histToneCurve, size_t chunkSize, bool measure)
+                              DCPProfile *dcpProf, const DCPProfileApplyState& asIn, LUTu& histToneCurve, size_t chunkSize, bool measure,
+                              const char* stageNode)
 {
 
     std::unique_ptr<StopWatch> stop;
@@ -2525,10 +2527,31 @@ void ImProcFunctions::rgbProc(Imagefloat* working, LabImage* lab, PipetteBuffer 
         histToneCurveCompression = log2(65536 / toneCurveHistSize);
     }
 
-    const bool gpuRgbProc = g_getenv("RT_OPENCL_RGBPROC") != nullptr
+    /*
+     * RGB processing has two device gates. `rgb.proc` keeps the classic
+     * RT_OPENCL_RGBPROC opt-in. A thumbnail-specific node name is selected
+     * through the stage policy (RT_STAGE_OPENCL plus the user preference), so
+     * the thumbnail block can reach the same kernel without the classic
+     * backend's switch. Both gates share the tool admission below, so an
+     * unsupported sub-tool stays on the host.
+     */
+    const bool classicRgbProc = g_getenv("RT_OPENCL_RGBPROC") != nullptr
         && g_strcmp0(g_getenv("RT_OPENCL_RGBPROC"), "1") == 0
-        && openCLAllowed && opencl::enabled()
-        && opencl::stageAllowed() && opencl::rgbProcAvailable()
+        && opencl::enabled() && opencl::stageAllowed()
+        && opencl::rgbProcAvailable();
+    const bool stageNodeSelected = stageNode != nullptr
+        && stage::node_device(stageNode) == stage::StageNodeDevice::OpenCL;
+    /*
+     * `rgb.proc` keeps the classic opt-in as its gate and then prefers the
+     * stage node when it is selected. A thumbnail-specific node is gated by
+     * the stage policy itself.
+     */
+    const bool stageNodeGate =
+        g_strcmp0(stageNode, "rgb.proc") == 0
+            ? classicRgbProc
+            : (stageNodeSelected || classicRgbProc);
+    const bool gpuRgbProc = stageNodeGate
+        && openCLAllowed
         && (dcpProf == nullptr || asIn.isIdentity())
         && pipetteBuffer == nullptr && !params->blackwhite.enabled
         && !params->hsvequalizer.enabled
@@ -2592,12 +2615,11 @@ void ImProcFunctions::rgbProc(Imagefloat* working, LabImage* lab, PipetteBuffer 
         gpuData.mixChannels = mixchannels;
         gpuData.rgbCurveMask = rgbCurveMask;
 
-        if (stage::node_device("rgb.proc") ==
-            stage::StageNodeDevice::OpenCL) {
-            if (run_rgb_proc_stage(*working, *lab, gpuData)) {
-                return;
-            }
-        } else if (opencl::rgbProc(working, lab, gpuData)) {
+        if (stageNodeSelected &&
+            run_rgb_proc_stage(*working, *lab, gpuData, stageNode)) {
+            return;
+        }
+        if (classicRgbProc && opencl::rgbProc(working, lab, gpuData)) {
             return;
         }
     }

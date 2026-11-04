@@ -1355,6 +1355,7 @@ const std::vector<KernelDef>& kernels()
         {"viewport.output", lab_to_u8_source().c_str(), "rt_lab_to_u8"},
         {"thumbnail.output", lab_to_u8_source().c_str(), "rt_lab_to_u8"},
         {"rgb.proc", rgb_proc_source().c_str(), "rt_rgb_proc"},
+        {"thumbnail.rgb", rgb_proc_source().c_str(), "rt_rgb_proc"},
         {"gamut", RT_GAMUT_CL, "rt_gamut"},
         {"working.trc", working_trc_source().c_str(), "rt_working_trc_second"},
         {"lab.tools", lab_tools_source().c_str(), "rt_lab_tools_mask"},
@@ -19675,7 +19676,8 @@ public:
             StageEvent fallback = StageQueue::submit(request, profiling);
             fallback.note = error;
             return fallback;
-        } else if (request.name == "rgb.proc") {
+        } else if (request.name == "rgb.proc" ||
+                   request.name == "thumbnail.rgb") {
             const RtStageStatus status =
                 run_rgb_proc(env_, residency_, request.args, error);
             if (status == RT_STAGE_OK) {
