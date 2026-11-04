@@ -266,6 +266,13 @@ export and a GUI smoke test are not yet run for this package.
   cases (contrast 5, contrast 15 with L curve and brightness, contrast 30
   with all six tables) are exact; `labtools-labcurve-contrast.pp3` is exact
   on the export TIFF. `89e0a844b`, `47b9980fb`.
+- **`lab.wavelet` residual arms**: noise balance (the `balchrom` scaling of
+  the forced chroma variance), the denoise hue curve (per-pixel
+  `noisevarlum` modulation through the exported polyline) and the
+  zero-strength edge no-op are device cases; the matrix reaches 0.015625
+  LSB16 (hue falling) and the zero-strength edge cases are exact. The
+  `labwavelet-denoise-balance`, `-hue` and `-edge-zero` profiles are wired
+  into `verify.sh`.
 - **`local.adjustments` Retinex**: the spot Retinex arm runs on the device
   (`Lab_Local()`'s decompositions, mean/stdv reductions and the senstype-4
   blend), with the chroma Retinex slider and a non-identity luminance mask
