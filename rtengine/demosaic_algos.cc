@@ -883,15 +883,21 @@ void RawImageSource::nodemosaic(bool bw)
      * host, which is why this call site is here and not in the dispatch in
      * demosaic(): a refusal falls through to the unchanged CPU loop below,
      * which rewrites every pixel of all three planes.
+     *
+     * The earlier CFA-split withdrawal blamed this node for three output
+     * samples that moved by up to 110 LSB16 on the vibrance canary. Those
+     * samples are the classic RT_OPENCL_RGBPROC backend at clipped pixels:
+     * they are identical with the split admitted and refused, and the split
+     * planes themselves are bit-exact. The canary profile leaves AMaZE in
+     * place, so it never enters this function; the split regression forces
+     * Method=none on the same image and correction.
      */
     if (stage::node_device("raw.demosaic") == stage::StageNodeDevice::OpenCL) {
-        /*
-         * The CFA split is refused until its coverage is proven exact: with
-         * the vibrance corpus profile the split path moved three output
-         * samples by up to 110 LSB16. Only the monochrome copy is admitted;
-         * the CFA loop below is the host reference.
-         */
-        if (bw) {
+        const bool cfa_split =
+            !bw && ri->getSensorType() == ST_BAYER &&
+            raw_demosaic_filters_supported(ri->get_filters());
+
+        if (bw || cfa_split) {
             const std::size_t row_pitch =
                 static_cast<std::size_t>(W) * sizeof(float);
             RtStageBuffer mosaic{};
