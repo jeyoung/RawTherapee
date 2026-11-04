@@ -63,13 +63,13 @@ pushed from 2026-10-29 on.
 ### Validated artefact
 
 ```
-build/portable/rawtherapee-graph-5.13-342-g3871b7d0c_5.13+git13363.3871b7d0c-1_amd64.deb
-sha256 c347ed4d42753cbea8bb30848a083ee068f6de920bf40eb474b1cbc480ce5a61
+build/portable/rawtherapee-graph-5.13-663-g2dccc3ee5_5.13+git13684.2dccc3ee5-1_amd64.deb
+sha256 bc59ce0721df0262e854656c32807061b37a503e450c0b3fdee5f3093e81f5df
 ```
 
-Validated at `3871b7d0c`. The branch has advanced since with unit code and
-documentation, so the package is evidence for that build only, not for the
-current tip.
+Built 2026-11-04 from `2dccc3ee5` with `tools/build-rt.sh portable`.
+Install, `--list-formats`, a CLI export against a single-threaded host
+export and a GUI smoke test are not yet run for this package.
 
 ## Progress log — resumed 2026-10-28 (Block 4 completion)
 
