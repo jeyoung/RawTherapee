@@ -27,6 +27,7 @@
 #include "utils.h"
 #include "stage/algorithms/gamut_cl.h"
 #include "stage/algorithms/raw_cl.h"
+#include "stage/algorithms/raw_demosaic_cl.h"
 #include "stage/algorithms/sharpen_cl.h"
 #include "stage/ciecam_context.h"
 #include "stage/lab_tools_context.h"
@@ -5264,6 +5265,322 @@ void test_raw_preprocess(bool available)
     });
     expect_refusal("negative origin", [](std::vector<RtStageArg>& args) {
         args[RAW_PREPROCESS_ARG_ORIGIN_X].u.i = -1;
+    });
+}
+
+/* --------------------------------------------------------- raw.demosaic */
+
+/* The CPU loop of RawImageSource::nodemosaic(): a monochrome copy, or a CFA
+ * split that writes one plane and zeroes the other two. */
+void host_nodemosaic(const std::vector<float>& mosaic, int width, int height,
+                     bool bw, std::uint32_t filters, std::vector<float>& red,
+                     std::vector<float>& green, std::vector<float>& blue)
+{
+    red.assign(static_cast<std::size_t>(width) * height, -1.0f);
+    green.assign(static_cast<std::size_t>(width) * height, -1.0f);
+    blue.assign(static_cast<std::size_t>(width) * height, -1.0f);
+
+    for (int i = 0; i < height; ++i) {
+        for (int j = 0; j < width; ++j) {
+            const std::size_t index =
+                static_cast<std::size_t>(i) * width + j;
+            if (bw) {
+                red[index] = green[index] = blue[index] = mosaic[index];
+            } else {
+                const std::uint32_t c =
+                    (filters >> ((((static_cast<std::uint32_t>(i) << 1) &
+                                   14u) +
+                                  (static_cast<std::uint32_t>(j) & 1u))
+                                 << 1)) &
+                    3u;
+                if (c == 0u) {
+                    red[index] = mosaic[index];
+                    green[index] = blue[index] = 0.0f;
+                } else if (c == 1u) {
+                    green[index] = mosaic[index];
+                    red[index] = blue[index] = 0.0f;
+                } else {
+                    blue[index] = mosaic[index];
+                    red[index] = green[index] = 0.0f;
+                }
+            }
+        }
+    }
+}
+
+std::vector<RtStageArg> raw_demosaic_args(
+    float* mosaic, float* red, float* green, float* blue, int width,
+    int height, int mono, std::uint32_t filters)
+{
+    RtStageBuffer buffers[4];
+    float* const data[4] = {mosaic, red, green, blue};
+    for (int i = 0; i < 4; ++i) {
+        buffers[i] = {};
+        buffers[i].size = sizeof(RtStageBuffer);
+        buffers[i].data = data[i];
+        buffers[i].width = width;
+        buffers[i].height = height;
+        buffers[i].row_pitch =
+            static_cast<std::size_t>(width) * sizeof(float);
+        buffers[i].plane_pitch =
+            buffers[i].row_pitch * static_cast<std::size_t>(height);
+        buffers[i].planes = 1;
+        buffers[i].format = RT_STAGE_F32;
+        buffers[i].flags =
+            i == 0 ? RT_STAGE_BUFFER_READ
+                   : RT_STAGE_BUFFER_WRITE;
+    }
+
+    std::vector<RtStageArg> args(RAW_DEMOSAIC_ARG_COUNT);
+    args[RAW_DEMOSAIC_ARG_RAW].kind = RT_STAGE_ARG_BUFFER;
+    args[RAW_DEMOSAIC_ARG_RAW].u.buffer = buffers[0];
+    args[RAW_DEMOSAIC_ARG_RED].kind = RT_STAGE_ARG_BUFFER;
+    args[RAW_DEMOSAIC_ARG_RED].u.buffer = buffers[1];
+    args[RAW_DEMOSAIC_ARG_GREEN].kind = RT_STAGE_ARG_BUFFER;
+    args[RAW_DEMOSAIC_ARG_GREEN].u.buffer = buffers[2];
+    args[RAW_DEMOSAIC_ARG_BLUE].kind = RT_STAGE_ARG_BUFFER;
+    args[RAW_DEMOSAIC_ARG_BLUE].u.buffer = buffers[3];
+    args[RAW_DEMOSAIC_ARG_MONO].kind = RT_STAGE_ARG_INT;
+    args[RAW_DEMOSAIC_ARG_MONO].u.i = mono;
+    args[RAW_DEMOSAIC_ARG_FILTERS].kind = RT_STAGE_ARG_INT;
+    args[RAW_DEMOSAIC_ARG_FILTERS].u.i = filters;
+    return args;
+}
+
+RtStageStatus run_device_nodemosaic(
+    const std::shared_ptr<StageContext>& context, float* mosaic, float* red,
+    float* green, float* blue, int width, int height, int mono,
+    std::uint32_t filters, StageExecution& execution)
+{
+    StageRequest request;
+    request.name = "raw.demosaic";
+    request.args = raw_demosaic_args(mosaic, red, green, blue, width, height,
+                                     mono, filters);
+    set_node_device_override("raw.demosaic", StageNodeDevice::OpenCL);
+    const RtStageStatus status = context->execute(request, nullptr, &execution);
+    clear_node_device_overrides();
+    return status;
+}
+
+void test_raw_demosaic(bool available)
+{
+    using namespace rtengine::stage;
+
+    /* Four-colour patterns have no switch case in the CPU loop. */
+    check(!raw_demosaic_filters_supported(0xffffffffu),
+          "raw.demosaic refuses a four-colour filter word");
+    check(raw_demosaic_filters_supported(0x94949494u),
+          "raw.demosaic accepts RGGB");
+    check(raw_demosaic_filters_supported(0x61616161u),
+          "raw.demosaic accepts BGGR");
+    check(raw_demosaic_filters_supported(0x49494949u),
+          "raw.demosaic accepts GRBG");
+    check(raw_demosaic_filters_supported(0x16161616u),
+          "raw.demosaic accepts GBRG");
+
+    if (!available) {
+        skip("raw.demosaic: no OpenCL device");
+        return;
+    }
+
+    const auto context = opencl_device()->create_context();
+    check(context != nullptr, "raw.demosaic: the device creates a context");
+    if (context == nullptr) {
+        return;
+    }
+
+    struct DemosaicCase {
+        const char* label;
+        int width;
+        int height;
+        bool mono;
+        std::uint32_t filters;
+    };
+
+    /* Heights of nine and seventeen exercise the row-mod-8 filter word, and
+     * the one-pixel, one-column and one-row shapes pin the row loop bounds. */
+    const std::vector<DemosaicCase> cases = {
+        {"mono 63x31", 63, 31, true, 0x94949494u},
+        {"mono 17x9", 17, 9, true, 0x61616161u},
+        {"mono 17x1", 17, 1, true, 0x94949494u},
+        {"mono 1x7", 1, 7, true, 0x94949494u},
+        {"mono 1x1", 1, 1, true, 0x94949494u},
+        {"idle filters 63x31", 63, 31, true, 0xffffffffu},
+        {"split RGGB 63x31", 63, 31, false, 0x94949494u},
+        {"split BGGR 63x31", 63, 31, false, 0x61616161u},
+        {"split GRBG 63x31", 63, 31, false, 0x49494949u},
+        {"split GBRG 63x31", 63, 31, false, 0x16161616u},
+        {"split mixed 17x17", 17, 17, false, 0x94946161u},
+        {"split one row 9x1", 9, 1, false, 0x94949494u},
+        {"split one column 1x9", 1, 9, false, 0x94949494u},
+    };
+
+    unsigned seed = 97u;
+    for (const DemosaicCase& item : cases) {
+        const std::size_t samples =
+            static_cast<std::size_t>(item.width) * item.height;
+        std::vector<float> mosaic(samples, 0.0f);
+        for (std::size_t i = 0; i < samples; ++i) {
+            const unsigned value = (seed + static_cast<unsigned>(i) * 3571u) %
+                                   70000u;
+            mosaic[i] = static_cast<float>(value);
+        }
+        ++seed;
+
+        std::vector<float> cpu_red;
+        std::vector<float> cpu_green;
+        std::vector<float> cpu_blue;
+        host_nodemosaic(mosaic, item.width, item.height, item.mono,
+                        item.filters, cpu_red, cpu_green, cpu_blue);
+
+        std::vector<float> red(samples, -1.0f);
+        std::vector<float> green(samples, -1.0f);
+        std::vector<float> blue(samples, -1.0f);
+        StageExecution execution;
+        const RtStageStatus status = run_device_nodemosaic(
+            context, mosaic.data(), red.data(), green.data(), blue.data(),
+            item.width, item.height, item.mono ? 1 : 0, item.filters,
+            execution);
+
+        const std::string prefix = std::string("raw.demosaic ") + item.label;
+        check(status == RT_STAGE_OK, (prefix + " completes").c_str());
+        check(execution.device == StageDeviceType::OPENCL,
+              (prefix + " runs on the device").c_str());
+        check(!execution.asynchronous,
+              (prefix + " reads back synchronously").c_str());
+
+        const RawScaleDiff red_diff = compare_raw_scale(red, cpu_red);
+        const RawScaleDiff green_diff = compare_raw_scale(green, cpu_green);
+        const RawScaleDiff blue_diff = compare_raw_scale(blue, cpu_blue);
+        check(red_diff.finite && green_diff.finite && blue_diff.finite,
+              (prefix + " is finite").c_str());
+        check(red_diff.differing == 0 && green_diff.differing == 0 &&
+                  blue_diff.differing == 0 && red_diff.max_abs == 0.0 &&
+                  green_diff.max_abs == 0.0 && blue_diff.max_abs == 0.0,
+              (prefix + " is bit-exact").c_str());
+
+        std::size_t written = 0;
+        std::size_t mismatched = 0;
+        for (std::size_t i = 0; i < samples; ++i) {
+            if (red[i] != -1.0f && green[i] != -1.0f && blue[i] != -1.0f) {
+                ++written;
+            }
+            if (item.mono) {
+                if (red[i] != mosaic[i] || green[i] != mosaic[i] ||
+                    blue[i] != mosaic[i]) {
+                    ++mismatched;
+                }
+            } else if (red[i] + green[i] + blue[i] != mosaic[i]) {
+                ++mismatched;
+            }
+        }
+        check(written == samples,
+              (prefix + " writes every output pixel").c_str());
+        check(mismatched == 0,
+              (prefix + " carries the mosaic value into the planes").c_str());
+        std::printf("stage-residency: %s: PAE %.6f, %zu of %zu samples "
+                    "written, %zu mismatched\n",
+                    prefix.c_str(),
+                    std::max(red_diff.max_abs,
+                             std::max(green_diff.max_abs, blue_diff.max_abs)),
+                    written, samples, mismatched);
+    }
+
+    /* The accepted request records a device execution through run(). */
+    const std::string profile_path =
+        std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp") +
+        "/stage-residency-raw-demosaic.jsonl";
+
+    {
+        const int width = 31;
+        const int height = 17;
+        const std::size_t samples =
+            static_cast<std::size_t>(width) * height;
+        std::vector<float> mosaic(samples, 1234.0f);
+        std::vector<float> red(samples, -1.0f);
+        std::vector<float> green(samples, -1.0f);
+        std::vector<float> blue(samples, -1.0f);
+
+        std::remove(profile_path.c_str());
+        setenv("RT_STAGE_PROFILE", profile_path.c_str(), 1);
+        set_node_device_override("raw.demosaic", StageNodeDevice::OpenCL);
+        const RtStageStatus status = run(
+            "raw.demosaic",
+            raw_demosaic_args(mosaic.data(), red.data(), green.data(),
+                              blue.data(), width, height, 0, 0x94949494u));
+        clear_node_device_overrides();
+        const std::string profile = read_file(profile_path);
+        unsetenv("RT_STAGE_PROFILE");
+
+        check(status == RT_STAGE_OK, "raw.demosaic completes through run()");
+        check(profile.find("\"stage\":\"raw.demosaic\"") != std::string::npos,
+              "raw.demosaic records the node");
+        check(profile.find("\"impl\":\"opencl\"") != std::string::npos,
+              "raw.demosaic records a device execution");
+    }
+
+    /*
+     * Every launcher refusal runs before the upload, so the caller's CPU loop
+     * still sees its own planes. The host fallback itself lives in
+     * RawImageSource::nodemosaic().
+     */
+    const auto expect_refusal = [&](const char* label,
+                                    const std::function<void(
+                                        std::vector<RtStageArg>&)>& mutate) {
+        const int width = 17;
+        const int height = 9;
+        const std::size_t samples =
+            static_cast<std::size_t>(width) * height;
+        std::vector<float> mosaic(samples, 1234.0f);
+        std::vector<float> red(samples, -1.0f);
+        std::vector<float> green(samples, -1.0f);
+        std::vector<float> blue(samples, -1.0f);
+        std::vector<RtStageArg> args = raw_demosaic_args(
+            mosaic.data(), red.data(), green.data(), blue.data(), width,
+            height, 0, 0x94949494u);
+        mutate(args);
+
+        set_node_device_override("raw.demosaic", StageNodeDevice::OpenCL);
+        const RtStageStatus status = run("raw.demosaic", args);
+        clear_node_device_overrides();
+
+        check(status != RT_STAGE_OK,
+              (std::string(label) + " is refused").c_str());
+        bool untouched = true;
+        for (std::size_t i = 0; i < samples; ++i) {
+            untouched = untouched && red[i] == -1.0f &&
+                        green[i] == -1.0f && blue[i] == -1.0f;
+        }
+        check(untouched, (std::string(label) + " leaves the planes untouched")
+                             .c_str());
+        std::printf("stage-residency: raw.demosaic %s: refused (status %d)\n",
+                    label, static_cast<int>(status));
+    };
+
+    expect_refusal("wrong argument count", [](std::vector<RtStageArg>& args) {
+        args.pop_back();
+    });
+    expect_refusal("U8 mosaic", [](std::vector<RtStageArg>& args) {
+        args[RAW_DEMOSAIC_ARG_RAW].u.buffer.format = RT_STAGE_U8;
+    });
+    expect_refusal("two-plane red", [](std::vector<RtStageArg>& args) {
+        args[RAW_DEMOSAIC_ARG_RED].u.buffer.planes = 2;
+    });
+    expect_refusal("mismatched size", [](std::vector<RtStageArg>& args) {
+        args[RAW_DEMOSAIC_ARG_GREEN].u.buffer.width -= 1;
+    });
+    expect_refusal("shared buffer", [](std::vector<RtStageArg>& args) {
+        args[RAW_DEMOSAIC_ARG_BLUE].u.buffer =
+            args[RAW_DEMOSAIC_ARG_RED].u.buffer;
+    });
+    expect_refusal("mono flag", [](std::vector<RtStageArg>& args) {
+        args[RAW_DEMOSAIC_ARG_MONO].u.i = 2;
+    });
+    expect_refusal("filters range", [](std::vector<RtStageArg>& args) {
+        args[RAW_DEMOSAIC_ARG_FILTERS].u.i = -1;
+    });
+    expect_refusal("four-colour filters", [](std::vector<RtStageArg>& args) {
+        args[RAW_DEMOSAIC_ARG_FILTERS].u.i = 0xffffffffu;
     });
 }
 
@@ -20696,6 +21013,7 @@ int main()
     test_lab_wavelet_gpu(available);
     test_output_sharpen(available);
     test_raw_preprocess(available);
+    test_raw_demosaic(available);
     test_lab_sharpening(available);
     test_run_wiring(available);
 

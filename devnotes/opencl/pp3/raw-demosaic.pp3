@@ -1,0 +1,5 @@
+# The MONO arm of the demosaic dispatch, which is the raw.demosaic device
+# node's copy path. Every interpolating method stays on the host, so a profile
+# that leaves the default AMaZE in place would not exercise the node.
+[RAW Bayer]
+Method=mono
