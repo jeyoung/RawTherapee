@@ -397,6 +397,9 @@ quick() {
     run_stage_device "pef/stage-device-local-adjustments-capture" \
         "$ROOT/devnotes/opencl/pp3/localadjustments-capture.pp3" \
         local.adjustments cpu
+    run_stage_device "pef/stage-device-local-adjustments-exposure" \
+        "$ROOT/devnotes/opencl/pp3/localadjustments-exposure.pp3" \
+        local.adjustments cpu
 }
 
 stage() {

@@ -13541,6 +13541,15 @@ void test_local_adjustments(bool available)
             {"exposure", [](auto& p) {
                  p.locallab.spots[0].expexpose = true;
              }},
+            {"exposure gamma wrapper", [](auto& p) {
+                 auto& spot = p.locallab.spots[0];
+                 spot.expcolor = false;
+                 spot.expexpose = true;
+                 spot.expcomp = 0.5;
+                 spot.linear = 0.2;
+                 spot.laplacexp = 0.4;
+                 spot.gamex = 2.0;
+             }},
             {"shadows/highlights", [](auto& p) {
                  p.locallab.spots[0].expshadhigh = true;
              }},
@@ -14176,6 +14185,194 @@ void test_local_adjustments(bool available)
     } else {
         skip("local.adjustments: no OpenCL device");
     }
+
+    /*
+     * Local exposure's PDE arm. The Laplacian threshold is discontinuous, so
+     * each case compares the whole host block against the device node on a
+     * smooth image and requires bit-level agreement inside 1 LSB16. The
+     * admitted ROI sizes are the fftw_size[] entries the direct DCT handles;
+     * a size outside the set is refused and must record a host execution.
+     */
+    {
+        struct ExposureCase {
+            const char* label;
+            int image;
+            double expcomp;
+            int hlcompr;
+            int hlcomprthresh;
+            int shcompr;
+            double laplacexp;
+            double linear;
+            double balanexp;
+            double gamm;
+            int blurexpde;
+            int sensex;
+            bool refused;
+        };
+        const ExposureCase exposure_cases[] = {
+            {"exposure 0.7", 128, 0.7, 0, 30, 50, 0.3, 0.05, 1.0, 0.4,
+             5, 30, false},
+            {"exposure -0.5 highlight", 128, -0.5, 30, 60, 40, 0.5, 0.2,
+             0.8, 0.5, 10, 60, false},
+            {"exposure 1.5", 128, 1.5, 50, 80, 30, 0.8, 0.3, 1.2, 0.6,
+             20, 90, false},
+            {"exposure laplace 0.11", 128, 0.4, 10, 20, 50, 0.11, 0.05,
+             1.0, 0.4, 0, 50, false},
+            {"exposure laplace 1.0", 128, 0.4, 10, 20, 50, 1.0, 0.05,
+             1.0, 0.2, 5, 50, false},
+            {"exposure linear 0.9", 128, 0.4, 20, 50, 50, 0.4, 0.9, 1.0,
+             0.4, 5, 50, false},
+            {"exposure sens 0", 128, 0.4, 20, 50, 50, 0.4, 0.2, 1.0,
+             0.4, 5, 0, false},
+            {"exposure sens 100", 128, 0.4, 20, 50, 50, 0.4, 0.2, 1.0,
+             0.4, 5, 100, false},
+            {"exposure 80x80", 160, 0.7, 20, 50, 50, 0.4, 0.2, 1.0,
+             0.4, 5, 50, false},
+            {"exposure 96x96", 192, 0.7, 20, 50, 50, 0.4, 0.2, 1.0,
+             0.4, 5, 50, false},
+            {"exposure 100x100", 200, 0.7, 20, 50, 50, 0.4, 0.2, 1.0,
+             0.4, 5, 50, false},
+            {"exposure 128x128", 256, 0.7, 20, 50, 50, 0.4, 0.2, 1.0,
+             0.4, 5, 50, false},
+            {"exposure 65x65", 130, 0.7, 20, 50, 50, 0.4, 0.2, 1.0,
+             0.4, 5, 50, false},
+            {"exposure 0 foot", 128, 0.0, 20, 50, 50, 0.4, 0.2, 1.0,
+             0.4, 5, 50, false},
+            {"exposure 4 highlight fallback", 128, 4.0, 80, 100, 50,
+             0.4, 0.5, 1.0, 0.4, 5, 50, false},
+            {"exposure 200x200 refused", 400, 0.7, 20, 50, 50, 0.4,
+             0.2, 1.0, 0.4, 5, 50, true},
+            {"exposure 50x50 refused", 100, 0.7, 20, 50, 50, 0.4, 0.2,
+             1.0, 0.4, 5, 50, true},
+        };
+        int exposure_device_cases = 0;
+        for (std::size_t index = 0;
+             index < sizeof(exposure_cases) / sizeof(exposure_cases[0]);
+             ++index) {
+            const ExposureCase& c = exposure_cases[index];
+            const auto make_params = [&](rtengine::procparams::ProcParams& p) {
+                p.locallab.enabled = true;
+                p.locallab.spots.push_back(localAdjustmentsSpot(
+                    "exposure", 0, 0, 500, true, 0, 0, 0));
+                auto& spot = p.locallab.spots[0];
+                spot.expcolor = false;
+                spot.expexpose = true;
+                spot.expcomp = c.expcomp;
+                spot.hlcompr = c.hlcompr;
+                spot.hlcomprthresh = c.hlcomprthresh;
+                spot.shcompr = c.shcompr;
+                spot.laplacexp = c.laplacexp;
+                spot.linear = c.linear;
+                spot.balanexp = c.balanexp;
+                spot.gamm = c.gamm;
+                spot.blurexpde = c.blurexpde;
+                spot.sensiex = c.sensex;
+                spot.expMethod = "pde";
+                spot.black = 0;
+                spot.shadex = 0;
+                spot.expchroma = 0;
+                spot.strexp = 0.0;
+                spot.structexp = 0;
+                spot.softradiusexp = 0.0;
+                spot.reparexp = 100.0;
+                spot.exnoiseMethod = "none";
+                spot.avoidgamutMethod = "NONE";
+                spot.avoidrad = 0.0;
+                spot.enaExpMask = false;
+                spot.enaExpMaskaft = false;
+                spot.deltae = true;
+                spot.activ = true;
+            };
+
+            rtengine::procparams::ProcParams reference_params;
+            make_params(reference_params);
+            check(localAdjustmentsSupported(reference_params),
+                  "the exposure case is inside the predicate");
+
+            Imagefloat reference_base(c.image, c.image);
+            fill_tonemap_rgb(reference_base, 401u + index);
+            std::unique_ptr<LabImage> reference_lab(
+                new LabImage(c.image, c.image));
+            rtengine::ImProcFunctions reference_ipf(&reference_params, false);
+            localAdjustmentsHostBlock(reference_ipf, reference_params,
+                                      &reference_base, reference_lab.get(),
+                                      c.image, c.image);
+
+            rtengine::procparams::ProcParams node_params = reference_params;
+            Imagefloat node_base(c.image, c.image);
+            fill_tonemap_rgb(node_base, 401u + index);
+            std::unique_ptr<LabImage> node_lab(
+                new LabImage(c.image, c.image));
+            rtengine::ImProcFunctions node_ipf(&node_params, false);
+            const RtStageStatus status = run_local_adjustments_node(
+                node_base, *node_lab, node_params, node_ipf, profile_path);
+            const std::string profile = read_file(profile_path);
+            if (c.refused) {
+                check(status == RT_STAGE_OK,
+                      "an exposure ROI outside the admitted set falls back");
+                if (have_device) {
+                    check(profile.find("\"impl\":\"host\"") !=
+                              std::string::npos,
+                          "the refused exposure ROI records a host execution");
+                }
+            } else {
+                check(status == RT_STAGE_OK,
+                      "the exposure node completes through run()");
+            }
+
+            const Diff diff = compare(view(*reference_lab), view(*node_lab));
+            std::printf("stage-residency: local.adjustments %s: PAE %.6f "
+                        "LSB16, %zu of %zu samples differ\n",
+                        c.label, diff.max_abs, diff.differing, diff.samples);
+            check(diff.finite && diff.max_abs <= 1.0,
+                  "the exposure result is within 1 LSB16");
+            if (cpu_device && !c.refused) {
+                check(profile.find("\"impl\":\"opencl\"") !=
+                          std::string::npos,
+                      "the exposure case records a device pass");
+                check(profile.find("\"impl\":\"host\"") ==
+                          std::string::npos,
+                      "the exposure case never falls back");
+                ++exposure_device_cases;
+            }
+            if (!c.refused && index == 0) {
+                rtengine::procparams::ProcParams off_params =
+                    reference_params;
+                off_params.locallab.spots[0].expexpose = false;
+                off_params.locallab.spots[0].expcolor = true;
+                off_params.locallab.spots[0].chroma = 0;
+                off_params.locallab.spots[0].lightness = 0;
+                off_params.locallab.spots[0].contrast = 0;
+                Imagefloat off_base(c.image, c.image);
+                fill_tonemap_rgb(off_base, 401u + index);
+                std::unique_ptr<LabImage> off_lab(
+                    new LabImage(c.image, c.image));
+                rtengine::ImProcFunctions off_ipf(&off_params, false);
+                localAdjustmentsHostBlock(off_ipf, off_params, &off_base,
+                                          off_lab.get(), c.image, c.image);
+                const Diff changed =
+                    compare(view(*reference_lab), view(*off_lab));
+                std::printf("stage-residency: local.adjustments exposure "
+                            "non-vacuity: %zu of %zu samples differ, PAE "
+                            "%.6f LSB16\n",
+                            changed.differing, changed.samples,
+                            changed.max_abs);
+                check(changed.differing > 0,
+                      "the exposure PDE arm changes the image");
+            }
+        }
+        if (cpu_device) {
+            check(exposure_device_cases == 15,
+                  "fifteen admitted local.adjustments exposure cases ran on "
+                  "the device");
+        } else if (have_device) {
+            skip("local.adjustments exposure: GPU device selected; device "
+                 "parity not run");
+        } else {
+            skip("local.adjustments exposure: no OpenCL device");
+        }
+    }
+
 
     /*
      * Tone Mapping. Lab_Local()'s "tm" block gates itself on a 128 px ROI, so
