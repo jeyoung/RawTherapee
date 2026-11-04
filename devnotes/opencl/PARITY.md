@@ -821,14 +821,28 @@ peak absolute error is zero for the synthetic node tests:
   window and a non-fp64 device are residuals. A defringe radius below 0.25,
   zero edge passes, an edge amount of 0, microcontrast amount below 1 and
   contrast exactly 100 are the host no-ops and leave every plane untouched.
-- The CIE-CAM arm is device for the only pass it owns on the Lab image: ML
-  sharpen edges at radii 0.5 and 1.0, with and without the main sharpen pass,
-  is bit-identical (`AE=0`) and non-vacuous. The defringe hue table is not
-  built there, with defringe disabled, or below the Gaussian identity, so a
-  curve the device table cannot follow cannot refuse a pass that never reads
-  it; impulse denoise, defringe and microcontrast run in the CIE-CAM pipeline
-  on the `CieImage`, which is the separate `ciecam` node and stays a host
-  residual there.
+- The CIE-CAM arm of `lab.sharpening` is device for the only pass it owns on
+  the Lab image: ML sharpen edges at radii 0.5 and 1.0, with and without the
+  main sharpen pass, is bit-identical (`AE=0`) and non-vacuous. The defringe
+  hue table is not built there, with defringe disabled, or below the Gaussian
+  identity, so a curve the device table cannot follow cannot refuse a pass
+  that never reads it; impulse denoise, defringe and microcontrast run in the
+  CIE-CAM pipeline on the `CieImage`.
+- The separate `ciecam` node runs the single-pass CIE-CAM 02 model on the
+  device: the CAT02 forward and inverse transforms, the four algorithm arms,
+  the two brightness tables, explicit and automatic scene grey, the surround
+  classifications, the hue rotation and the optional Lab gamut control. Twelve
+  residency cases cover those axes at 68x16, 64x16 and the odd-width 179x17;
+  the worst peak error is 0.107422 LSB16, every device case changes pixels, and
+  the two residual cases plus the colourfulness case are byte-identical host
+  executions. On the export corpus `ciecam.pp3` (tone, hue, auto grey and
+  gamut) has a peak error of 1 LSB16 with `impl=opencl`, and
+  `ciecam-residual.pp3` (CAM16) is `AE=0` with `impl=host`. The chroma,
+  saturation and colourfulness sliders, the per-hue hue/saturation sliders and
+  red protection stay host residuals: they drive `Color::skinredfloat()`,
+  whose skin-range boundary turns a last-bit hue difference into a visible
+  step. Interactive tone mapping (`tonecie` with EPD), automatic CIELAB
+  sharpening, `datacie` and the CAM16/PQ models are residuals too.
 - `tools/opencl/verify.sh --stage-device`, which `--quick` also runs, asserts
   each record and its parity in one step:
 

@@ -602,7 +602,7 @@ export and a GUI smoke test are not yet run for this package.
 - **Exceptions** recorded: `source.select`, `source.embedded`, `analysis`,
   `output.icc`, `thumbnail.decode` and `crop` are `n/a` with reasons
   (`588301647`). `crop` is a row copy deferred to residency.
-- Remaining CPU-only pixel nodes: `working.trc`, `ciecam`, `lab.tools`,
+- Remaining CPU-only pixel nodes: `working.trc`, `lab.tools`,
   `lab.wavelet`, `local.adjustments`, `thumbnail.lab`'s working-TRC/CIE-CAM/
   gamut remainder, and the raw four (`raw.preprocess`, `raw.demosaic`,
   `raw.base`; `source.*`/`analysis` are exceptions).
@@ -691,7 +691,9 @@ export and a GUI smoke test are not yet run for this package.
   reproduced). The probe's summation order is the main parity risk.
   Side finding: `oprofdef`/`cmsHTRANSFORM` leak once per invocation
   (`iplab2rgb.cc:2145`, `:2173`, `:2260`) — fix separately.
-- **`ciecam`**: scoped. A faithful port needs a host mean/histogram pass, two
+- **`ciecam`**: implemented for the single-pass CAM02 surface (see Completed
+  this session). The scoping note follows. A faithful port needs a host
+  mean/histogram pass, two
   32768-entry brightness LUTs, up to six 65536 user-curve LUTs, CAT02/HPE
   matrices and a verbatim transcription of the sleef `pow_F`/`xlogf` chain.
   A single kernel covers the no-EPD/no-autocielab surface; EPD, autocielab
@@ -711,6 +713,17 @@ export and a GUI smoke test are not yet run for this package.
 
 ## Completed this session
 
+- **`ciecam`**: the single-pass CIE-CAM 02 path now runs on the device. The
+  host context rebuilds the histogram pass, the scene/viewing conditions, both
+  `initcam` calls, the two brightness tables and the optional working-space
+  inverse; one kernel reproduces CAT02/HPE, the four algorithm arms, the hue
+  rotation, `skinredfloat()` and the Lab gamut control. Twelve residency cases
+  cover the axes, worst PAE 0.107422 LSB16, eight device cases with every one
+  changing pixels; the export corpus is 1 LSB16 with `impl=opencl` and the
+  CAM16 residual `AE=0` with `impl=host`. Chroma/saturation/colourfulness
+  sliders, CAM16, tone mapping/EPD and non-identity colour curves are host
+  residuals; the chroma sliders stay out because `skinredfloat()`'s skin-range
+  boundary amplifies a last-bit hue difference.
 - **Validation matrix** (`devnotes/perf/VALIDATION.md`): Debian 12 and 13
   installed the `.deb` with `apt-get install`, 36 formats, 8/8 exports exit 0
   per distro.

@@ -475,7 +475,7 @@ by default.
 | `lab.sharpening` | Full/-/Roi/- | path | reuse-input | impulse denoise, defringe, ML sharpen edges and ML microcontrast (own node); the main sharpen pass stays the shared `output.sharpen` node | partial |
 | `lab.wavelet` | Full/Full/Roi/Reduced | path | reuse-input | directional pyramid equaliser and wavelet contrast, standard and BiShrink denoise (L and the forced chroma arm), chroma `link`, edge plain arm and Medianlev Lipschitz control, final curves, balance-chroma `sli`/`cur`, the toning zero-protection arm, CLmethod's level selection and the clarity two-pass merge | partial |
 | `working.trc` | Full/Full/Roi/- | path | reuse-input | soft light, tone equaliser and working-TRC conversion | partial |
-| `ciecam` | Full/Full/Roi/- | path | reuse-input | CIE CAM 02 | no |
+| `ciecam` | Full/Full/Roi/- | path | reuse-input | CIE CAM 02 single pass: CAT02 forward/inverse, the four algorithm arms, brightness tables, auto/explicit scene grey, surround, hue rotation and the Lab gamut control; chroma/saturation/colourfulness sliders, CAM16, tone mapping and non-identity colour curves are host residuals | partial |
 | `gamut` | Full/Full/Roi/Reduced | path | reuse-input | working-space gamut compression | yes |
 | `output.convert` | Full/-/-/- | exact | reuse-output | Lab to output RGB and output profile conversion | yes |
 | `crop` | Full/-/-/- | exact | reuse-output | crop | yes |

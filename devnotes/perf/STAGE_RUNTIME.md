@@ -549,11 +549,12 @@ unchanged; they are recorded here rather than silently approximated.
 
 In the CIE-CAM arm the Lab image carries only ML sharpen edges: impulse
 denoise, defringe and microcontrast run in the CIE-CAM pipeline on the
-`CieImage`, which is the separate `ciecam` node and stays on the host. The
-defringe hue table is therefore not built in that arm, nor with defringe
-disabled or below the Gaussian identity; the hue-curve flag in the ABI
-describes the table that was built, so a pass that cannot read it never makes
-the launcher upload one.
+`CieImage`, which is the separate `ciecam` node. That node runs the admitted
+single-pass CAM02 configuration on the device and keeps every other
+configuration on the host; see the CIE CAM section below. The defringe hue
+table is therefore not built in that arm, nor with defringe disabled or below
+the Gaussian identity; the hue-curve flag in the ABI describes the table that
+was built, so a pass that cannot read it never makes the launcher upload one.
 
 Pass order matches the host: the impulse mark, the impulse correction, then
 the defringe blurs, chromaticity, mean and apply. Kernels, in one program that
@@ -2281,6 +2282,52 @@ Evidence, with `OMP_NUM_THREADS=1` and a 3888x2608 PEF:
 | `working-trc-residual.pp3` (soft light on) | PASS as a host residual: `"stage":"working.trc","impl":"host"`, `max_pae=1.5259e-05` informational |
 | CUSTOM `WorkingTRC`, gamma 0.4, slope 4.5 (type -5) | host residual: `impl=host`, no `impl=opencl`, PAE 0 against the CPU block; observed TRC type -5, `params 2.5, 0.868743, 0.131257, 0.222222, 0.100725` |
 | `--gpu=off` CPU path, two runs | identical (`PAE 0`) |
+
+## CIE CAM
+
+`ciecam` runs `ImProcFunctions::ciecam_02float()`'s single-pass path as one
+device kernel. The host context (`CiecamContext` in `ciecam_context.cc`)
+rebuilds everything the block derives from the parameters and the input Lab:
+
+1. the block's histogram pass over the input L plane (`hist16J`, `hist16Q` and
+   the automatic scene grey mean);
+2. the scene and viewing surrounds, the scene and viewing whites through
+   `ColorTemp::temp2mulxyz()`, the explicit or automatic adapting luminance and
+   the two background greys;
+3. `Ciecam02::initcam1float()`/`initcam2float()`, `pow1`, `pow1n`, the inverse
+   chroma exponent, `coefQ`, the Q factor and the colourfulness coefficient;
+4. the two 32768-entry brightness tables through `Ciecam02::curveJfloat()`,
+   with `CAMBrightCurveJ` divided by 327.68 as the block does and
+   `CAMBrightCurveQ` left undivided;
+5. the working-space inverse for the optional old Lab gamut control.
+
+The ABI is `[0]` the three-plane F32 Lab buffer in place, `[1]` the host-only
+`RtCiecamContext` pointer and `[2]` the int support flag. The context's
+`build` callback returns the rec table, the two brightness tables and the
+9-entry working-space inverse; `run_host` runs the original block through
+`ciecam_02float()`, so a residual is byte-identical to the CPU path. The kernel
+reproduces the CAT02 and HPE transforms, the four algorithm arms, the per-hue
+hue/saturation rotation, `Color::skinredfloat()` and
+`Color::gamutLchonly()`'s Lab overload. It uploads the `Color::cachef` and
+`Color::cachefy` tables so XYZ to Lab matches `Color::XYZ2Lab()`, and it is
+built with the fixed divide/sqrt option.
+
+Residuals run the builtin and record `impl=host`: a model other than `02`,
+`tonecie`, EPD, `datacie`, `badpixsl`, a non-identity user colour curve, the
+chroma/saturation/colourfulness sliders, the per-hue hue/saturation sliders,
+red protection, `settings->autocielab`, or a `build` failure. The chroma
+controls are the named gap: they drive `Color::skinredfloat()`, whose skin
+range boundaries amplify a last-bit hue difference, so the export corpus case
+with the tone, hue, automatic grey and gamut controls is 1 LSB16.
+
+Evidence, POCL CPU, `OMP_NUM_THREADS=1`:
+
+| Case | Result |
+|---|---|
+| `stage-residency-test`, twelve cases at 68x16, 64x16 and 179x17 | eight device cases (JC/JS/QM/ALL, all four surrounds, tone, hue, gamut, automatic grey, odd width) with worst PAE 0.107422 LSB16 and every case changing pixels; CAM16, tone mapping and colourfulness residuals `impl=host`, PAE 0, 0 differing samples |
+| `ciecam.pp3` export gate | `impl=opencl`, `source=opencl`, final TIFF PAE 1 LSB16 (`max_pae=1.5259e-05`) |
+| `ciecam-residual.pp3` (CAM16) | `impl=host`, final TIFF `AE=0` |
+| `--gpu=off` CPU path | PASS, 38 skipped |
 
 ## Lab tools
 
