@@ -614,9 +614,27 @@ export and a GUI smoke test are not yet run for this package.
   matrix + inverse type-5 TRC, `apsatur`, RGB→Lab). 1 LSB16 on POCL and the
   AMD RX 550, probe means exact. Type-5 profiles only; a type -5 profile
   (CUSTOM gamma < 1) is a host residual, as are unknown working profiles,
-  non-relative intents, soft light, local contrast, both tone equalisers and
-  B&W. `e5f142741`, `d408ca0df`, `2b2fe1efc`, `67a37700c`, `897c25fd3`,
+  non-relative intents, local contrast, both tone equalisers and B&W.
+  `e5f142741`, `d408ca0df`, `2b2fe1efc`, `67a37700c`, `897c25fd3`,
   `0f1a819cc`, `b07462094`, `8fdcb2fb3`.
+- **`working.trc` soft light**: `ImProcFunctions::softLight()` now runs as a
+  device pre-pass before the host prefix, with the host's float working
+  matrices and the `gammatab_srgb`/`igammatab_srgb`/`cachef`/`cachefy`
+  tables. The launcher owns `prepare()`/`build()`, so the kernel readback is
+  frozen on a private host copy and a refusal leaves the caller's Lab
+  untouched; the ABI is four arguments plus the `prepare`/`images` callbacks.
+  The kernel is bit-exact against the host on the production 3888x2608 Lab
+  after reproducing the vector `Lab2XYZ` cube-before-scale association and
+  the LUT operator's last interval; the earlier association differed by
+  0.03 LSB16 in Lab and the second-pass inverse amplified it to four output
+  codes. Thirty-one residency cases (soft light 3/30/50/60/100, five TRCs,
+  gamut and saturation combinations, a bright ramp, the off/zero no-ops and
+  the 101/-1 refusals) are within 0.099609 LSB16; strength 50 changes all
+  17,136 samples at PAE 4,282.638672 against the tool off.
+  `working-trc-residual.pp3` is 1 LSB16 with `impl=opencl`.
+  `2b3fcd5a9..4a8b1ae85`. Residuals: local contrast, both tone equalisers,
+  B&W, a soft-light strength outside 1..100, type -5 profiles and
+  out-of-gamut first passes.
 - Side defects found: `workingtrc` leaks the profile/transform per call
   (`iplab2rgb.cc:2145/2173`, still open); forcing the POCL CPU stage device
   under `--gpu=auto` hits a null `opencl::initLocked` call with

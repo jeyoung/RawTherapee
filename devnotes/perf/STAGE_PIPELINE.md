@@ -70,19 +70,23 @@ edges-only, halo control, show-mask, `blurradius >= 0.25` and the USM sigma
 limit are host residuals; they run the `output.sharpen` host builtin and are
 recorded as `impl=host`, never as a device pass.
 
-`working.trc` is partial: the default configuration runs one device second
-pass between a host prefix and the unchanged host fallback. The host prefix is
+`working.trc` is partial: the default configuration runs a device soft-light
+pre-pass, one device second pass and the host prefix. The host prefix is
 `lab2rgb()`, the fixed sRGB inverse, the setup-only probe and the profile, and
 then `toxyz` with the optional `Color::gamutmap()`; it runs on the host so the
 probe means, the profile and the second-pass input are byte-identical to the
-CPU block on every OpenCL compiler. The device work starts at the second pass:
-the matrix-shaper transform, `apsatur()` and RGB to Lab. A configuration with
-`workingTRC == NONE`, `trcExp == false`, a profile outside the twelve-name
-list, a non-relative intent, non-default primaries or illuminant, soft light
-on, local contrast on, either tone equaliser on, black-and-white output on, a
-first pass above the working-gamut tolerance, a non-matrix-shaper profile or a
-`buildGpuProfile()` failure is a residual: it runs the `working.trc` host
-builtin and records `impl=host`, never a device pass.
+CPU block on every OpenCL compiler. The launcher owns it: with the soft-light
+tool on it first runs the per-pixel `softLight()` arm over a device copy,
+reads the result into a private host buffer and calls the prefix on that copy,
+so a later refusal leaves the caller's image untouched. The device work then
+starts at the second pass: the matrix-shaper transform, `apsatur()` and RGB to
+Lab. A configuration with `workingTRC == NONE`, `trcExp == false`, a profile
+outside the twelve-name list, a non-relative intent, non-default primaries or
+illuminant, a soft-light strength outside 1..100, local contrast on, either
+tone equaliser on, black-and-white output on, a first pass above the
+working-gamut tolerance, a non-matrix-shaper profile or a `buildGpuProfile()`
+failure is a residual: it runs the `working.trc` host builtin and records
+`impl=host`, never a device pass.
 
 `lab.tools` is partial: the Lab-grid colour-toning pass,
 shadows/highlights in both its Lab and RGB modes, local contrast, vibrance and

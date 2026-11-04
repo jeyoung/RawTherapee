@@ -164,6 +164,9 @@ pairs are exact. The gate is the peak absolute error (PAE) in normalised units;
 | 2026-11-04 | uncommitted | POCL (CPU) | colorspace_flowers.pef / `labgrid.pp3` (LabGrid only; admitted sub-tool), `thumbnail.lab` via the thumbnail stage policy | off vs stage device, PPM | 0 (byte-identical: embedded 239x160 and raw 238x160) | PASS |
 | 2026-11-04 | uncommitted | POCL (CPU) | the same image with `labcurve.pp3` (Lab curves), `vib.pp3` (vibrance) and `labfull.pp3` (all three), `thumbnail.lab` | off vs stage device, PPM | 0 (byte-identical, both thumbnail branches, every profile) | PASS |
 | 2026-11-04 | uncommitted | POCL (CPU) | `thumbnail.lab` with no admitted tool (empty profile) | device request vs host fallback | no record; the call site keeps the block on the host | PASS |
+| 2026-11-04 | `2b3fcd5a9..4a8b1ae85` | POCL (CPU) | colorspace_flowers.pef / `working-trc-residual.pp3` (soft light on, strength 50), `working.trc` | off vs stage device, 16-bit TIFF | 1 LSB (1.5259e-05; 547,600 of 30,419,712) | PASS |
+| 2026-11-04 | `2b3fcd5a9..4a8b1ae85` | POCL (CPU) | 31-case `working.trc` matrix (five TRC values, gamut on/off, `wapsat` 0/0.5/1, soft light off/disabled/zero/3/30/50/60/100, a bright ramp, odd width, out-of-gamut, midtone-equaliser, opacity-curve, strength 101 and -1), `stage-residency-test` | device vs host block | 0.099609 LSB16 (soft light srgb worst) | PASS |
+| 2026-11-04 | `2b3fcd5a9..4a8b1ae85` | POCL (CPU) | `working.trc` soft-light kernel against the host `softLight()` on the production 3888x2608 Lab, and non-vacuity at strength 50 | device vs host block / tool off | 0 (bit-exact in the kernel; 17,136 of 17,136 samples change at PAE 4,282.638672 LSB16 in the node) | PASS |
 
 The clarity rows are the block's two-pass sequence, not a single kernel.
 `CLmethod`'s `one`/`inf`/`sup` selection is `finalContAllL()`'s and

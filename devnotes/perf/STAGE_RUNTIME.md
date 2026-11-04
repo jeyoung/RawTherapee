@@ -2209,8 +2209,15 @@ applies the lcms transform exactly as before.
 
 ### Node
 
-`working.trc` runs the default configuration as a **host prefix plus one
-device second pass**. The prefix is part of the node, not a device kernel:
+`working.trc` runs the default configuration as a **device soft-light
+pre-pass, a host prefix and one device second pass**. The pre-pass is
+`ImProcFunctions::softLight()`: `Color::Lab2XYZ()`, `Color::xyz2rgb()` with
+the float working inverse, the per-channel sRGB blend through
+`gammatab_srgb`/`igammatab_srgb`, `Color::rgbxyz()` with the float working
+matrix and `Color::XYZ2Lab()`. The launcher runs it over a device copy of the
+Lab buffer, reads the result into a private host buffer and hands that copy to
+`prepare()`; a later refusal never reaches the caller's image. The prefix is
+part of the node, not a device kernel:
 
 1. `lab2rgb()` into the linear working RGB image, with a copy of that image as
    the `apsatur()` reference;
@@ -2234,12 +2241,20 @@ The ABI is `[0]` the three-plane F32 Lab buffer, read and written in place,
 `[1]` the host-only `RtWorkingTrcContext` pointer (`RT_STAGE_ARG_PTR`), `[2]`
 the int support flag, mirrored from the context descriptor; the launcher
 requires both to be 1, so a configuration or setup refusal reaches the
-builtin as `impl=host`, `[3]` the double `icm.wapsat`, `[4]` the three-plane
-F32 second-pass XYZ image from the host prefix and `[5]` the three-plane F32
-linear pre-TRC reference for `apsatur()`. The context is host-only: its
-`build` callback runs the setup-only probe, `buildGpuProfile()`, `toxyz` and
-`Color::gamutmap()` and returns the matrices, the gamma table and the
-parametric TRC. Nothing in the context is passed to a kernel.
+builtin as `impl=host`, and `[3]` the double `icm.wapsat`. The launcher calls
+the context's `prepare` callback on the caller's Lab, or on the frozen
+soft-light readback, and its `images` callback for the second-pass input and
+the linear pre-TRC reference, so the XYZ and reference buffers are no longer
+ABI arguments. The context is host-only: its `build` callback runs the
+setup-only probe, `buildGpuProfile()`, `toxyz` and `Color::gamutmap()` and
+returns the matrices, the gamma table and the parametric TRC. Nothing in the
+context is passed to a kernel except the twenty-one float descriptors of the
+soft-light arm (`softlight`, `softlight_strength` and the two 3x3 matrices).
+The soft-light arithmetic matches the host bit for bit: the host's vector
+`Lab2XYZ` cubes `fy` before scaling by 65535 and the host's LUT operator
+interpolates entries 65534 and 65535 for the last interval; both associations
+are reproduced because the second-pass inverse amplifies a last-bit difference
+into a few output codes.
 
 The profile provenance is the block's own: the whitelist name selects the
 primaries and illuminant, `setupOnly` returns the profile, and
@@ -2259,29 +2274,41 @@ the already-clamped first-pass values and has no clamp of its own.
 
 Residuals run the `working.trc` host builtin and record `impl=host`: a
 `WorkingTRC` of `NONE`, `trcExp` off, a profile outside the twelve-name list,
-a non-relative intent, non-default primaries or illuminant, soft light on,
-local contrast on, either tone equaliser on (`wmidtcie` or
-`wsmoothciesli`), black-and-white output (`fbw`), a first-pass sample above
-`WORKING_TRC_FIRST_PASS_MAX` (1.001, so a working-gamut overflow stays on the
-host), a profile that is not a matrix shaper, a TRC that is not lcms type 5, or
-a `buildGpuProfile()` failure. The inverse type -5 curve is the named case: a
-CUSTOM `WorkingTRC` with gamma below 1 builds it (`gampos` 2.5, TRC parameters
-`0.868743, 0.131257, 0.222222, 0.100725` at gamma 0.4, slope 4.5). Its steep
-inverse amplifies the remaining float-versus-lcms second-pass residual through
-the Lab a-channel cancellation, so it stays on the host. The builtin disables
-device recursion and runs the original host block on the Lab buffer.
+a non-relative intent, non-default primaries or illuminant, a soft-light
+strength outside the GUI range 1..100, local contrast on, either tone
+equaliser on (`wmidtcie` or `wsmoothciesli`), black-and-white output (`fbw`), a
+first-pass sample above `WORKING_TRC_FIRST_PASS_MAX` (1.001, so a
+working-gamut overflow stays on the host), a profile that is not a matrix
+shaper, a TRC that is not lcms type 5, or a `buildGpuProfile()` failure. The
+inverse type -5 curve is the named case: a CUSTOM `WorkingTRC` with gamma
+below 1 builds it (`gampos` 2.5, TRC parameters `0.868743, 0.131257, 0.222222,
+0.100725` at gamma 0.4, slope 4.5). Its steep inverse amplifies the remaining
+float-versus-lcms second-pass residual through the Lab a-channel cancellation,
+so it stays on the host. Soft light at strength zero, or with the tool off, is
+the block's own no-op and runs on the device with the pre-pass skipped. The
+builtin disables device recursion and runs the original host block on the Lab
+buffer.
 
 Evidence, with `OMP_NUM_THREADS=1` and a 3888x2608 PEF:
 
 | Case | Result |
 |---|---|
-| `stage-residency-test` on POCL, twelve cases at 238x24 and 179x17, gamut on/off, `wapsat` 0/0.5/1, five TRC values | supported PAE 0.015625 to 0.376953 LSB16 (linear worst), all finite; probe means `device == host` bit for bit (`delta 0/0`); out-of-gamut, midtone-equaliser and soft-light residuals `impl=host`, PAE 0, 0 differing samples |
+| `stage-residency-test` on POCL, 31 cases at 238x24 and 179x17, gamut on/off, `wapsat` 0/0.5/1, five TRC values, soft light off/disabled/zero/3/30/50/60/100 plus the bright ramp | supported PAE 0.015625 to 0.099609 LSB16 (soft light srgb worst; the bright ramp 0.091797), all finite; probe means `device == host` bit for bit (`delta 0/0`); out-of-gamut, midtone-equaliser, opacity-curve, soft-light 101 and soft-light -1 residuals `impl=host`, PAE 0, 0 differing samples |
+| soft-light non-vacuity, same node, strength 50 vs the tool off | 17,136 of 17,136 samples change at PAE 4,282.638672 LSB16 |
+| soft-light kernel against the host `softLight()` on the production 3888x2608 Lab | bit-exact (0 of 30,419,712 samples differ) after the `fy` association and the LUT last-interval fix |
 | `verify.sh --stage-device`, POCL CPU, `working-trc.pp3` | PASS, `max_pae=1.5259e-05`, record `"stage":"working.trc","impl":"opencl","source":"opencl"` |
 | `verify.sh --stage-device`, AMD RX 550 (rusticl), `working-trc.pp3` | PASS, `max_pae=1.5259e-05`, record `"stage":"working.trc","impl":"opencl","source":"opencl"` |
 | AMD RX 550, `Gamut=false` | PASS, `max_pae=1.5259e-05` |
-| `working-trc-residual.pp3` (soft light on) | PASS as a host residual: `"stage":"working.trc","impl":"host"`, `max_pae=1.5259e-05` informational |
+| `working-trc-residual.pp3` (soft light on, strength 50), 3888x2608 PEF | device row: `"stage":"working.trc","impl":"opencl"`, `max_pae=1.5259e-05` (1 LSB16, 547,600 of 30,419,712 samples). The row was 0 (host) before this unit |
 | CUSTOM `WorkingTRC`, gamma 0.4, slope 4.5 (type -5) | host residual: `impl=host`, no `impl=opencl`, PAE 0 against the CPU block; observed TRC type -5, `params 2.5, 0.868743, 0.131257, 0.222222, 0.100725` |
 | `--gpu=off` CPU path, two runs | identical (`PAE 0`) |
+
+The soft-light export row was measured with the `verify.sh` recipe directly
+(`--gpu=off` against `RT_STAGE_OPENCL=1` with `RT_OPENCL_RGBPROC=1`) because
+ImageMagick is not installed in this environment; `compare_tiff.py` reads the
+uncompressed planar 16-bit TIFF without it. The row's record is
+`"stage":"working.trc","impl":"opencl"`; the earlier host-residual record was
+`impl=host, source=device-fallback`.
 
 ## CIE CAM
 
