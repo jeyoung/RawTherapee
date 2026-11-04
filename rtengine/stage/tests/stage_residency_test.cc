@@ -14769,6 +14769,288 @@ void test_local_adjustments(bool available)
         }
     }
 
+    /*
+     * Common mask. The luminance mask curve feeds maskcalccol(); the log and
+     * CIE arms either pass the mask to transit_shapedetect2() as their deltaE
+     * reference (recovery threshold one) or run maskrecov()'s decay blend.
+     * Every case compares the host block with the device node, records the
+     * implementation and checks that the mask changes the image against the
+     * same spot with the mask disabled.
+     */
+    {
+        const auto mask_curve = [](double first, double middle,
+                                   double last) {
+            return std::vector<double>{
+                static_cast<double>(FCT_MinMaxCPoints), 0.0, first, 0.35,
+                0.35, 0.5, middle, 0.35, 0.35, 1.0, last, 0.35, 0.35};
+        };
+        struct CommonMaskCase {
+            const char* label;
+            int width;
+            int height;
+            int extent;
+            bool cie;
+            bool recovery;
+            bool inverted;
+            bool colour;
+            bool blur;
+            bool tonemap;
+            double blurcie;
+            double recoth;
+            double low;
+            double high;
+            double decay;
+            bool nomask = false;
+        };
+        const CommonMaskCase mask_cases[] = {
+            {"log mask band", 238, 64, 800, false, false, false, false,
+             false, false, 0.2, 1.0, 12.0, 85.0, 2.0},
+            {"log mask narrow band", 238, 64, 800, false, false, false,
+             false, false, false, 0.2, 1.0, 12.0, 85.0, 2.0},
+            {"log mask inverted", 238, 64, 800, false, false, true, false,
+             false, false, 0.2, 1.0, 12.0, 85.0, 2.0},
+            {"log mask recovery", 238, 64, 800, false, true, false, false,
+             false, false, 0.2, 0.5, 12.0, 85.0, 2.0},
+            {"log mask recovery decay 4", 238, 64, 800, false, true, false,
+             false, false, false, 0.2, 0.5, 12.0, 85.0, 4.0},
+            {"log mask with colour", 238, 64, 800, false, false, false,
+             true, false, false, 0.2, 1.0, 12.0, 85.0, 2.0},
+            {"log mask with blur", 238, 64, 800, false, false, false,
+             false, true, false, 0.2, 1.0, 12.0, 85.0, 2.0},
+            {"cie mask band", 260, 200, 2000, true, false, false, false,
+             false, false, 0.2, 1.0, 12.0, 85.0, 2.0},
+            {"cie mask narrow band", 260, 200, 2000, true, false, false,
+             false, false, false, 0.0, 1.0, 12.0, 85.0, 2.0},
+            {"cie mask inverted", 260, 200, 2000, true, false, true, false,
+             false, false, 0.2, 1.0, 12.0, 85.0, 2.0},
+            {"cie mask recovery", 260, 200, 2000, true, true, false, false,
+             false, false, 0.2, 0.5, 12.0, 85.0, 2.0},
+            {"cie mask recovery decay 4", 260, 200, 2000, true, true,
+             false, false, false, false, 0.2, 0.5, 12.0, 85.0, 4.0},
+            {"cie mask with colour", 260, 200, 2000, true,
+             false, false, true, false, false, 0.2, 1.0, 12.0, 85.0, 2.0},
+            {"cie tone map colour no mask", 260, 200, 2000, true,
+             false, false, true, false, true, 0.2, 1.0, 12.0, 85.0, 2.0,
+             true},
+        };
+        for (std::size_t index = 0;
+             index < sizeof(mask_cases) / sizeof(mask_cases[0]); ++index) {
+            const CommonMaskCase& c = mask_cases[index];
+            const auto make_params = [&](rtengine::procparams::ProcParams& p) {
+                p.locallab.enabled = true;
+                p.locallab.spots.push_back(localAdjustmentsSpot(
+                    "mask", 0, 0, c.extent, true, 0, 0, 0));
+                auto& spot = p.locallab.spots[0];
+                spot.deltae = c.nomask;
+                spot.expcolor = false;
+                spot.detail = 0.0;
+                const std::vector<double> curve =
+                    c.inverted
+                        ? mask_curve(0.2, 0.6, 1.0)
+                        : (index == 1
+                               ? mask_curve(1.0, 0.35, 1.0)
+                               : mask_curve(1.0, 0.2, 1.0));
+                if (c.cie) {
+                    spot.expcie = true;
+                    spot.laplac = c.nomask;
+                    if (!c.nomask) {
+                        spot.enacieMask = true;
+                    }
+                    spot.LLmaskciecurve = curve;
+                    spot.blurcie = c.blurcie;
+                    spot.recothrescie = c.recoth;
+                    spot.lowthrescie = c.low;
+                    spot.higthrescie = c.high;
+                    spot.decaycie = c.decay;
+                } else {
+                    spot.explog = true;
+                    if (!c.nomask) {
+                        spot.enaLMask = true;
+                    }
+                    spot.LLmaskcurveL = curve;
+                    spot.recothresl = c.recoth;
+                    spot.lowthresl = c.low;
+                    spot.higthresl = c.high;
+                    spot.decayl = c.decay;
+                }
+                if (c.colour) {
+                    spot.expcolor = true;
+                    spot.chroma = 35;
+                    spot.lightness = 10;
+                    spot.contrast = -5;
+                }
+                if (c.blur) {
+                    spot.expblur = true;
+                    spot.radius = 10.0;
+                    spot.locwavcurveden.clear();
+                }
+                if (c.tonemap) {
+                    spot.exptonemap = true;
+                    spot.stren = 0.8;
+                    spot.gamma = 1.0;
+                    spot.estop = 1.4;
+                    spot.scaltm = 1.0;
+                    spot.rewei = 0;
+                    spot.satur = 0.0;
+                    spot.sensitm = 60;
+                    spot.equiltm = true;
+                    spot.repartm = 100.0;
+                    spot.recothrest = 1.0;
+                }
+            };
+
+            rtengine::procparams::ProcParams reference_params;
+            make_params(reference_params);
+            check(localAdjustmentsSupported(reference_params),
+                  "the common-mask case is inside the predicate");
+
+            Imagefloat reference_base(c.width, c.height);
+            fill_tonemap_rgb(reference_base, 311u + index);
+            std::unique_ptr<LabImage> reference_lab(
+                new LabImage(c.width, c.height));
+            rtengine::ImProcFunctions reference_ipf(&reference_params,
+                                                    false);
+            localAdjustmentsHostBlock(reference_ipf, reference_params,
+                                      &reference_base, reference_lab.get(),
+                                      c.width, c.height);
+
+            rtengine::procparams::ProcParams node_params = reference_params;
+            Imagefloat node_base(c.width, c.height);
+            fill_tonemap_rgb(node_base, 311u + index);
+            std::unique_ptr<LabImage> node_lab(
+                new LabImage(c.width, c.height));
+            rtengine::ImProcFunctions node_ipf(&node_params, false);
+            const RtStageStatus status = run_local_adjustments_node(
+                node_base, *node_lab, node_params, node_ipf, profile_path);
+            check(status == RT_STAGE_OK,
+                  "the common-mask node completes through run()");
+
+            const std::string profile = read_file(profile_path);
+            if (cpu_device) {
+                check(profile.find("\"impl\":\"opencl\"") !=
+                          std::string::npos,
+                      "the common-mask case records a device pass");
+                check(profile.find("\"impl\":\"host\"") ==
+                          std::string::npos,
+                      "the common-mask case never falls back");
+            }
+
+            const Diff diff =
+                compare(view(*reference_lab), view(*node_lab));
+            std::printf("stage-residency: local.adjustments %s: PAE %.6f "
+                        "LSB16, %zu of %zu samples differ\n", c.label,
+                        diff.max_abs, diff.differing, diff.samples);
+            check(diff.finite && diff.max_abs <= 1.0,
+                  "the common-mask result is within 1 LSB16");
+
+            if (index == 0 || index == 7) {
+                rtengine::procparams::ProcParams off_params =
+                    reference_params;
+                if (c.cie) {
+                    off_params.locallab.spots[0].enacieMask = false;
+                } else {
+                    off_params.locallab.spots[0].enaLMask = false;
+                }
+                Imagefloat off_base(c.width, c.height);
+                fill_tonemap_rgb(off_base, 311u + index);
+                std::unique_ptr<LabImage> off_lab(
+                    new LabImage(c.width, c.height));
+                rtengine::ImProcFunctions off_ipf(&off_params, false);
+                localAdjustmentsHostBlock(off_ipf, off_params, &off_base,
+                                          off_lab.get(), c.width, c.height);
+                const Diff changed =
+                    compare(view(*off_lab), view(*reference_lab));
+                std::printf("stage-residency: local.adjustments %s changes "
+                            "%zu of %zu samples against the mask-off result, "
+                            "PAE %.6f LSB16\n", c.label, changed.differing,
+                            changed.samples, changed.max_abs);
+                check(changed.differing > 0,
+                      "the common-mask case is non-vacuous");
+            }
+        }
+    }
+
+    /* Common-mask refusals: every field outside the admitted arm leaves the
+     * block on the host. */
+    {
+        const auto refuse = [](const char* label, bool cie,
+                               void (*mutate)(
+                                   rtengine::procparams::LocallabParams::
+                                       LocallabSpot&)) {
+            rtengine::procparams::ProcParams params;
+            params.locallab.enabled = true;
+            params.locallab.spots.push_back(localAdjustmentsSpot(
+                "mask", 0, 0, 2000, true, 0, 0, 0));
+            auto& spot = params.locallab.spots[0];
+            spot.deltae = false;
+            spot.expcolor = false;
+            spot.detail = 0.0;
+            if (cie) {
+                spot.expcie = true;
+                spot.enacieMask = true;
+                spot.laplac = false;
+                spot.LLmaskciecurve = {static_cast<double>(FCT_MinMaxCPoints),
+                                       0.0, 1.0, 0.35, 0.35, 0.5, 0.2,
+                                       0.35, 0.35, 1.0, 1.0, 0.35, 0.35};
+            } else {
+                spot.explog = true;
+                spot.enaLMask = true;
+                spot.LLmaskcurveL = {static_cast<double>(FCT_MinMaxCPoints),
+                                     0.0, 1.0, 0.35, 0.35, 0.5, 0.2, 0.35,
+                                     0.35, 1.0, 1.0, 0.35, 0.35};
+            }
+            mutate(spot);
+            check(!localAdjustmentsSupported(params), label);
+        };
+        refuse("log mask with deltaE stays on the host", false,
+               [](auto& spot) { spot.deltae = true; });
+        refuse("log mask blend stays on the host", false,
+               [](auto& spot) { spot.blendmaskL = 5.0; });
+        refuse("log mask radius stays on the host", false,
+               [](auto& spot) { spot.radmaskL = 2.0; });
+        refuse("log mask chroma stays on the host", false,
+               [](auto& spot) { spot.chromaskL = 2.0; });
+        refuse("log mask chroma curve stays on the host", false,
+               [](auto& spot) {
+                   spot.CCmaskcurveL = {
+                       static_cast<double>(FCT_MinMaxCPoints), 0.0, 1.0,
+                       0.35, 0.35, 0.5, 0.4, 0.35, 0.35, 1.0, 1.0, 0.35,
+                       0.35};
+               });
+        refuse("log mask recovery range stays on the host", false,
+               [](auto& spot) { spot.recothresl = 2.5; });
+        refuse("log mask recovery upper half stays on the host", false,
+               [](auto& spot) { spot.recothresl = 1.5; });
+        refuse("log mask decay range stays on the host", false,
+               [](auto& spot) { spot.decayl = 20.0; });
+        refuse("CIE mask with deltaE stays on the host", true,
+               [](auto& spot) { spot.deltae = true; });
+        refuse("CIE mask blur gate stays on the host", true,
+               [](auto& spot) { spot.blurcie = 0.5; });
+        refuse("CIE mask gamma stays on the host", true,
+               [](auto& spot) { spot.gammaskcie = 2.0; });
+        refuse("CIE mask contrast stays on the host", true,
+               [](auto& spot) { spot.contcie = 20.0; });
+        refuse("CIE mask structure stays on the host", true,
+               [](auto& spot) { spot.strumaskcie = 5.0; });
+        refuse("CIE mask tool stays on the host", true,
+               [](auto& spot) { spot.toolcie = true; });
+        refuse("CIE mask recovery upper half stays on the host", true,
+               [](auto& spot) { spot.recothrescie = 1.5; });
+        refuse("CIE mask local curve stays on the host", true,
+               [](auto& spot) {
+                   spot.Lmaskciecurve = {
+                       static_cast<double>(FCT_MinMaxCPoints), 0.0, 0.0,
+                       0.35, 0.35, 1.0, 1.0, 0.35, 0.35};
+               });
+        refuse("CIE mask wavelet curve stays on the host", true,
+               [](auto& spot) {
+                   spot.LLmaskciecurvewav = {
+                       static_cast<double>(FCT_MinMaxCPoints), 0.0, 0.0,
+                       0.35, 0.35, 1.0, 1.0, 0.35, 0.35};
+               });
+    }
+
     /* CIE refusals: every configuration outside the admitted set must leave
      * the whole block on the host. */
     {
@@ -14777,6 +15059,7 @@ void test_local_adjustments(bool available)
                                    rtengine::procparams::LocallabParams::
                                        LocallabSpot&)) {
             rtengine::procparams::ProcParams params;
+            params.locallab.enabled = true;
             params.locallab.spots.push_back(localAdjustmentsSpot(
                 "cie", 0, 0, 2000, true, 0, 0, 0));
             auto& spot = params.locallab.spots[0];
