@@ -53,6 +53,7 @@
 #include "stage/algorithms/ciecam_cl.h"
 #include "stage/algorithms/gamut_cl.h"
 #include "stage/algorithms/lab_to_rgb_cl.h"
+#include "stage/algorithms/raw_base_cl.h"
 #include "stage/algorithms/raw_cl.h"
 #include "stage/algorithms/raw_demosaic_cl.h"
 #include "stage/algorithms/rgb_proc_cl.h"
@@ -1392,6 +1393,7 @@ const std::vector<KernelDef>& kernels()
          "rt_lab_sharpening_impulse_mark"},
         {"raw.preprocess", RT_RAW_CL, "rt_raw_preprocess_scale"},
         {"raw.demosaic", RT_RAW_DEMOSAIC_CL, "rt_raw_demosaic_nodemosaic"},
+        {"raw.base", RT_RAW_BASE_CL, "rt_raw_base_matrix"},
         {"framing", framing_source().c_str(), "rt_framing"},
         {"crop", crop_source().c_str(), "rt_crop"},
         {"thumbnail.whitebalance", thumbnail_wb_source().c_str(), "rt_thumbnail_wb"},
@@ -12116,6 +12118,157 @@ RtStageStatus run_raw_demosaic(
 }
 
 /*
+ * raw.base: the camera-to-working-space matrix multiply of
+ * RawImageSource::colorSpaceConversion_() when no input or DCP profile is
+ * supplied. The host computes the matrix in double precision and this
+ * launcher repeats the host loop exactly, so the node needs an fp64 device;
+ * a device without it refuses before the upload and the caller's loop runs.
+ * Only this arm is reproduced. Every profile, LUT and Lab arm stays on the
+ * host, as does every other step of the raw.base block.
+ */
+RtStageStatus run_raw_base(
+    const std::shared_ptr<OpenCLEnv>& env,
+    const std::shared_ptr<OpenCLResidency>& residency,
+    const std::vector<RtStageArg>& args, std::string& error)
+{
+    if (args.size() != RAW_BASE_ARG_COUNT ||
+        args[RAW_BASE_ARG_IMAGE].kind != RT_STAGE_ARG_BUFFER) {
+        error = "raw.base expects one buffer and nine doubles";
+        return RT_STAGE_INVALID;
+    }
+    for (int i = 0; i < RAW_BASE_MATRIX_COUNT; ++i) {
+        if (args[RAW_BASE_ARG_MATRIX + i].kind != RT_STAGE_ARG_DOUBLE) {
+            error = "raw.base expects one buffer and nine doubles";
+            return RT_STAGE_INVALID;
+        }
+        if (!std::isfinite(args[RAW_BASE_ARG_MATRIX + i].u.f)) {
+            error = "raw.base matrix has a non-finite entry";
+            return RT_STAGE_INVALID;
+        }
+    }
+
+    const RtStageBuffer& image = args[RAW_BASE_ARG_IMAGE].u.buffer;
+    if (!valid(image) || image.format != RT_STAGE_F32 ||
+        image.planes != 3 || image.width <= 0 || image.height <= 0) {
+        error = "raw.base needs a three-plane F32 image";
+        return RT_STAGE_INVALID;
+    }
+    if (image.row_pitch <
+            static_cast<std::size_t>(image.width) * sizeof(float) ||
+        image.plane_pitch <
+            image.row_pitch * static_cast<std::size_t>(image.height)) {
+        error = "raw.base image pitch does not cover the image";
+        return RT_STAGE_INVALID;
+    }
+
+    cl_device_fp_config fp_config = 0;
+    if (env->api->GetDeviceInfo(env->device, CL_DEVICE_DOUBLE_FP_CONFIG,
+                                sizeof(fp_config), &fp_config,
+                                nullptr) != CL_SUCCESS ||
+        fp_config == 0) {
+        error = "raw.base needs device fp64";
+        return RT_STAGE_FALLBACK;
+    }
+
+    const KernelDef* def = find_kernel("raw.base");
+    assert(def != nullptr);
+    cl_kernel kernel = compiled_kernel(env, def, error);
+    if (kernel == nullptr) {
+        return RT_STAGE_FALLBACK;
+    }
+
+    const StageBufferShape shape{RT_STAGE_F32, image.width, image.height, 3};
+    StageDeviceBufferPtr device = residency->acquire(image.data, shape, &error);
+    if (!device) {
+        return RT_STAGE_FALLBACK;
+    }
+    if (residency->upload(device, image) != RT_STAGE_OK) {
+        error = "raw.base image upload failed";
+        return RT_STAGE_FALLBACK;
+    }
+
+    auto device_image = std::dynamic_pointer_cast<OpenCLDeviceBuffer>(device);
+    if (!device_image) {
+        error = "raw.base device buffer mismatch";
+        return RT_STAGE_FALLBACK;
+    }
+
+    const std::size_t row_pitch_bytes = device_image->row_pitch();
+    const std::size_t plane_pitch_bytes = device_image->plane_pitch();
+    if (row_pitch_bytes % sizeof(float) != 0 ||
+        plane_pitch_bytes % sizeof(float) != 0 ||
+        row_pitch_bytes / sizeof(float) <
+            static_cast<std::size_t>(image.width) ||
+        plane_pitch_bytes / sizeof(float) <
+            static_cast<std::size_t>(image.height) *
+                (row_pitch_bytes / sizeof(float))) {
+        error = "raw.base row or plane pitch does not cover the image";
+        return RT_STAGE_FALLBACK;
+    }
+    const std::int64_t row_pitch =
+        static_cast<std::int64_t>(row_pitch_bytes / sizeof(float));
+    const std::int64_t plane_pitch =
+        static_cast<std::int64_t>(plane_pitch_bytes / sizeof(float));
+    if (row_pitch > std::numeric_limits<cl_int>::max() ||
+        plane_pitch > std::numeric_limits<cl_int>::max() / 3) {
+        error = "raw.base pitch does not fit the kernel's int arithmetic";
+        return RT_STAGE_FALLBACK;
+    }
+
+    std::lock_guard<std::recursive_mutex> lock(env->queue_mutex);
+
+    const cl_mem image_memory = device_image->memory();
+    const cl_int width = image.width;
+    const cl_int height = image.height;
+    const cl_int pitch = static_cast<cl_int>(row_pitch);
+    const cl_int plane = static_cast<cl_int>(plane_pitch);
+
+    const auto set_arg = [&](cl_uint index, std::size_t bytes,
+                             const void* value) {
+        return env->api->SetKernelArg(kernel, index, bytes, value) == CL_SUCCESS;
+    };
+
+    cl_uint arg = 0;
+    bool args_ok = set_arg(arg++, sizeof(cl_mem), &image_memory);
+    for (int i = 0; i < RAW_BASE_MATRIX_COUNT && args_ok; ++i) {
+        const cl_double entry =
+            static_cast<cl_double>(args[RAW_BASE_ARG_MATRIX + i].u.f);
+        args_ok = set_arg(arg++, sizeof(cl_double), &entry);
+    }
+    args_ok = args_ok &&
+              set_arg(arg++, sizeof(cl_int), &width) &&
+              set_arg(arg++, sizeof(cl_int), &height) &&
+              set_arg(arg++, sizeof(cl_int), &pitch) &&
+              set_arg(arg++, sizeof(cl_int), &plane);
+    if (!args_ok) {
+        error = "raw.base clSetKernelArg failed";
+        return RT_STAGE_FALLBACK;
+    }
+
+    const std::size_t global = static_cast<std::size_t>(height);
+    cl_event done = nullptr;
+    if (env->api->EnqueueNDRangeKernel(env->queue, kernel, 1, nullptr, &global,
+                                       nullptr, 0, nullptr,
+                                       &done) != CL_SUCCESS ||
+        done == nullptr) {
+        error = "raw.base launch failed";
+        return RT_STAGE_ERROR;
+    }
+    const cl_int wait_status = env->api->WaitForEvents(1, &done);
+    env->api->ReleaseEvent(done);
+    if (wait_status != CL_SUCCESS) {
+        error = "raw.base did not complete";
+        return RT_STAGE_ERROR;
+    }
+    if (residency->readback(device, image) != RT_STAGE_OK) {
+        error = "raw.base readback failed";
+        return RT_STAGE_ERROR;
+    }
+
+    return RT_STAGE_OK;
+}
+
+/*
  * Output sharpening, USM and undamped RLD. Arguments are documented in
  * stage/algorithms/sharpen_cl.h. The L plane is the only transfer: the mask,
  * the blur, the RLD estimate and the RLD intermediate live in device scratch.
@@ -20842,6 +20995,20 @@ public:
         } else if (request.name == "raw.demosaic") {
             const RtStageStatus status =
                 run_raw_demosaic(env_, residency_, request.args, error);
+            if (status == RT_STAGE_OK) {
+                StageEvent done;
+                done.status = StageEventStatus::Complete;
+                done.result = RT_STAGE_OK;
+                done.device = StageDeviceType::OPENCL;
+                done.asynchronous = false;
+                return done;
+            }
+            StageEvent fallback = StageQueue::submit(request, profiling);
+            fallback.note = error;
+            return fallback;
+        } else if (request.name == "raw.base") {
+            const RtStageStatus status =
+                run_raw_base(env_, residency_, request.args, error);
             if (status == RT_STAGE_OK) {
                 StageEvent done;
                 done.status = StageEventStatus::Complete;

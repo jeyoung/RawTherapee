@@ -51,7 +51,9 @@
 #include "rtlensfun.h"
 #include "lensmetadata.h"
 #include "rtgui/options.h"
+#include "stage/algorithms/raw_base_cl.h"
 #include "stage/algorithms/raw_cl.h"
+#include "stage/stage_buffer.h"
 #include "stage/stage_runtime.h"
 
 //#define BENCHMARK
@@ -3405,6 +3407,31 @@ void RawImageSource::colorSpaceConversion_(Imagefloat* im, const ColorManagement
                 for (int k = 0; k < 3; k++) {
                     mat[i][j] += work[i][k] * camMatrix[k][j];    // rgb_xyz * imatrices.xyz_cam
                 }
+
+        /*
+         * raw.base: the camera-to-working-space matrix multiply is the one
+         * arm of this block that is pure per-pixel double arithmetic, so it
+         * is the device node. The matrix is computed by the host above and
+         * passed unchanged; the kernel repeats the loop's products, additions
+         * and the final float write exactly. A profile, DCP or device
+         * refusal leaves the host loop below to rewrite the image.
+         */
+        if (im->getWidth() > 0 && im->getHeight() > 0 &&
+            stage::node_device("raw.base") ==
+                stage::StageNodeDevice::OpenCL) {
+            std::vector<RtStageArg> args(RAW_BASE_ARG_COUNT);
+
+            args[RAW_BASE_ARG_IMAGE].kind = RT_STAGE_ARG_BUFFER;
+            args[RAW_BASE_ARG_IMAGE].u.buffer = stage::view(*im);
+            for (int i = 0; i < RAW_BASE_MATRIX_COUNT; ++i) {
+                args[RAW_BASE_ARG_MATRIX + i].kind = RT_STAGE_ARG_DOUBLE;
+                args[RAW_BASE_ARG_MATRIX + i].u.f = mat[i / 3][i % 3];
+            }
+
+            if (stage::run("raw.base", args) == RT_STAGE_OK) {
+                return;
+            }
+        }
 
 #ifdef _OPENMP
         #pragma omp parallel for
