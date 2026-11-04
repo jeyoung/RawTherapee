@@ -2481,6 +2481,41 @@ levels and performs only the denoise preparation `getImage()`
 work, not a source-select pixel pass. None of these executions has a buffer
 boundary that a device node could take.
 
+`source.embedded` is I/O and a decoder call, with no pixel pass of its own.
+`Thumbnail::stageSourceEmbedded()` opens the container (`rtthumbnail.cc:642`),
+loads the selected frame (`:643-644`) and takes the embedded image (`:655`).
+`RawImage::getThumbnail()` copies the embedded JPEG or PPM from the recorded
+file offset and decodes it with `Image8::loadJPEGFromMemory()` or
+`loadPPMFromMemory()`, or unpacks the libraw thumbnail
+(`rawimage.cc:1941-2001`, JPEG at `:1956` and `:1987`, PPM at `:1958` and
+`:1989`, libraw at `:1973`).
+The node therefore produces a decoded `Image8`; the first pixel arithmetic is
+the nearest-neighbour rescale in the separate `thumbnail.decode` node
+(`rtthumbnail.cc:697`). There is no intermediate buffer to submit, so the node
+stays `n/a`.
+
+`analysis` has no portable Lab-histogram pass. On export it allocates the
+65 536-bin `hist16` and calls `ImProcFunctions::firstAnalysis()` on the
+working-space RGB base image (`simpleprocess.cc:1384-1393`). `firstAnalysis()`
+indexes each bin by truncating a float luminance sum of the RGB samples,
+`int(lumimulf[0] * r + lumimulf[1] * g + lumimulf[2] * b)`, over the
+working-space matrix row (`improcfun.cc:606-666`, bin at `:639` and `:661`);
+the image is still RGB, not Lab, because the geometry transform and the Lab
+conversion run in later nodes. The bins feed the tone, black-and-white and
+CIE-CAM curve tables (`simpleprocess.cc:1562`, `:1587`, `:1920`); `lab.tools`
+later refills the same buffer from the Lab image (`:1670`), which is that
+node's own Lab histogram, not this one. The preview path folds the same call
+into `raw.base` (`improccoordinator.cc:2218`; the fold is recorded above) and
+consumes `vhist16` in the viewport LUTs (`:714-722`). The crop node is not a
+histogram at all: `Crop::stageAnalysis()` runs the auto-denoise preview
+analysis (`RGB_denoise_info()`/`calcautodn_info()`, `dcrop.cc:1062-1242`) and
+the automatic denoise estimate (`:1244`) only when the denoise work item is
+set. The thumbnail path has no `analysis` node; its first analysis is part of
+`thumbnail.rgb` (`rtthumbnail.cc:2236-2238`). A device histogram would have to
+reproduce the host's float accumulation and truncation to keep the bins
+byte-identical and would read 65 536 counters back for every export; since the
+node carries no Lab histogram, it stays `n/a`.
+
 ## Final integration of the request and device branches
 
 The typed-request branch (`perf-graph-request2`, head `81e73b9be`) and the
