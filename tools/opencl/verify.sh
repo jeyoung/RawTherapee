@@ -257,6 +257,7 @@ quick() {
     run_stage_device "pef/stage-device-output" "" output.convert
     run_stage_device "pef/stage-device-raw-preprocess" "" raw.preprocess
     run_stage_device "pef/stage-device-raw-base" "" raw.base
+    run_stage_device "pef/stage-device-raw-base-wb" "" raw.base.wb
     run_stage_device "pef/stage-device-raw-demosaic" \
         "$ROOT/devnotes/opencl/pp3/raw-demosaic.pp3" raw.demosaic
     run_stage_device "pef/stage-device-raw-demosaic-split" \
@@ -705,6 +706,7 @@ stage_device() {
     run_stage_device "pef/stage-device-output" "" output.convert
     run_stage_device "pef/stage-device-raw-preprocess" "" raw.preprocess
     run_stage_device "pef/stage-device-raw-base" "" raw.base
+    run_stage_device "pef/stage-device-raw-base-wb" "" raw.base.wb
     run_stage_device "pef/stage-device-raw-demosaic" \
         "$ROOT/devnotes/opencl/pp3/raw-demosaic.pp3" raw.demosaic
     run_stage_device "pef/stage-device-raw-demosaic-split" \

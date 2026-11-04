@@ -5835,6 +5835,266 @@ void test_raw_base(bool available)
     });
 }
 
+/* The CPU white-balance pass of RawImageSource::getImage(): each assembled
+ * image sample is multiplied by a float coefficient and, when the caller's
+ * CLIP applies, clamped with its two ordered ternaries. */
+float host_clip(float value)
+{
+    value = (65535.0f < value) ? 65535.0f : value;
+    return (0.0f < value) ? value : 0.0f;
+}
+
+void host_raw_base_wb(std::vector<float>& image, int width, int height,
+                      int row_pitch, int plane_pitch, const float rm,
+                      const float gm, const float bm, bool clip)
+{
+    for (int y = 0; y < height; ++y) {
+        float* red = image.data() + static_cast<std::size_t>(y) * row_pitch;
+        float* green = red + plane_pitch;
+        float* blue = green + plane_pitch;
+        for (int x = 0; x < width; ++x) {
+            float r = red[x] * rm;
+            float g = green[x] * gm;
+            float b = blue[x] * bm;
+            if (clip) {
+                r = host_clip(r);
+                g = host_clip(g);
+                b = host_clip(b);
+            }
+            red[x] = r;
+            green[x] = g;
+            blue[x] = b;
+        }
+    }
+}
+
+std::vector<RtStageArg> raw_base_wb_args(
+    float* image, int width, int height, int row_pitch, int plane_pitch,
+    int clip, const float multipliers[RAW_BASE_WB_MULTIPLIER_COUNT])
+{
+    RtStageBuffer buffer{};
+    buffer.size = sizeof(buffer);
+    buffer.data = image;
+    buffer.width = width;
+    buffer.height = height;
+    buffer.row_pitch = static_cast<std::size_t>(row_pitch) * sizeof(float);
+    buffer.plane_pitch =
+        static_cast<std::size_t>(plane_pitch) * sizeof(float);
+    buffer.planes = 3;
+    buffer.format = RT_STAGE_F32;
+    buffer.flags = RT_STAGE_BUFFER_READ | RT_STAGE_BUFFER_WRITE;
+
+    std::vector<RtStageArg> args(RAW_BASE_WB_ARG_COUNT);
+    args[RAW_BASE_WB_ARG_IMAGE].kind = RT_STAGE_ARG_BUFFER;
+    args[RAW_BASE_WB_ARG_IMAGE].u.buffer = buffer;
+    args[RAW_BASE_WB_ARG_CLIP].kind = RT_STAGE_ARG_INT;
+    args[RAW_BASE_WB_ARG_CLIP].u.i = clip;
+    for (int i = 0; i < RAW_BASE_WB_MULTIPLIER_COUNT; ++i) {
+        args[RAW_BASE_WB_ARG_MULTIPLIERS + i].kind = RT_STAGE_ARG_DOUBLE;
+        args[RAW_BASE_WB_ARG_MULTIPLIERS + i].u.f = multipliers[i];
+    }
+    return args;
+}
+
+RtStageStatus run_device_raw_base_wb(
+    const std::shared_ptr<StageContext>& context, float* image, int width,
+    int height, int row_pitch, int plane_pitch, int clip,
+    const float multipliers[RAW_BASE_WB_MULTIPLIER_COUNT],
+    StageExecution& execution)
+{
+    using namespace rtengine::stage;
+
+    StageRequest request;
+    request.name = "raw.base.wb";
+    request.args = raw_base_wb_args(image, width, height, row_pitch,
+                                    plane_pitch, clip, multipliers);
+    set_node_device_override("raw.base.wb", StageNodeDevice::OpenCL);
+    const RtStageStatus status = context->execute(request, nullptr, &execution);
+    clear_node_device_overrides();
+    return status;
+}
+
+void test_raw_base_wb(bool available)
+{
+    using namespace rtengine::stage;
+
+    if (!available) {
+        skip("raw.base.wb: no OpenCL device");
+        return;
+    }
+    check(has_opencl_stage_node("raw.base.wb"),
+          "the raw.base.wb sub-step has a device implementation");
+
+    const auto context = opencl_device()->create_context();
+    check(context != nullptr, "raw.base.wb: the device creates a context");
+    if (context == nullptr) {
+        return;
+    }
+
+    /* Values that straddle both CLIP bounds, and coefficients that are not
+     * exact powers of two, so a wrong product or a missing clamp shows. */
+    const float multipliers[RAW_BASE_WB_MULTIPLIER_COUNT] = {
+        1.234567f, 0.375f, 2.7182817f};
+
+    struct WbCase {
+        const char* label;
+        int width;
+        int height;
+        int row_pitch;
+        int plane_pitch;
+    };
+
+    const std::vector<WbCase> cases = {
+        {"full frame 63x31", 63, 31, 63, 63 * 31},
+        {"padded rows 61x31", 61, 31, 64, 64 * 31},
+        {"one pixel", 1, 1, 1, 1},
+        {"single column", 1, 9, 1, 9},
+        {"single row", 9, 1, 9, 9},
+    };
+
+    unsigned seed = 977u;
+    for (const WbCase& item : cases) {
+        const std::size_t samples =
+            static_cast<std::size_t>(item.plane_pitch) * 3;
+        std::vector<float> source(samples, 0.0f);
+        for (int y = 0; y < item.height; ++y) {
+            for (int x = 0; x < item.width; ++x) {
+                const int value = static_cast<int>(
+                    (seed + static_cast<unsigned>(x) * 313u +
+                     static_cast<unsigned>(y) * 8191u) %
+                    170001u) - 40000;
+                const std::size_t index =
+                    static_cast<std::size_t>(y) * item.row_pitch + x;
+                source[index] = static_cast<float>(value);
+                source[index + item.plane_pitch] =
+                    static_cast<float>(value) * 0.75f;
+                source[index + 2 * item.plane_pitch] =
+                    static_cast<float>(value) * 0.5f;
+            }
+        }
+        ++seed;
+
+        for (int clip = 0; clip <= 1; ++clip) {
+            std::vector<float> cpu = source;
+            host_raw_base_wb(cpu, item.width, item.height, item.row_pitch,
+                             item.plane_pitch, multipliers[0], multipliers[1],
+                             multipliers[2], clip != 0);
+
+            std::vector<float> device = source;
+            StageExecution execution;
+            const RtStageStatus status = run_device_raw_base_wb(
+                context, device.data(), item.width, item.height,
+                item.row_pitch, item.plane_pitch, clip, multipliers,
+                execution);
+            const std::string prefix = std::string("raw.base.wb ") +
+                                       item.label +
+                                       (clip ? " clip" : " no clip");
+            check(status == RT_STAGE_OK, (prefix + " completes").c_str());
+            check(execution.device == StageDeviceType::OPENCL,
+                  (prefix + " runs on the device").c_str());
+            check(!execution.asynchronous,
+                  (prefix + " reads back synchronously").c_str());
+
+            const RawScaleDiff diff = compare_raw_scale(device, cpu);
+            check(diff.finite, (prefix + " is finite").c_str());
+            check(diff.differing == 0 && diff.max_abs == 0.0,
+                  (prefix + " is bit-exact").c_str());
+
+            const RawScaleDiff changed = compare_raw_scale(device, source);
+            check(changed.differing > 0,
+                  (prefix + " is non-vacuous").c_str());
+            std::printf("stage-residency: %s: PAE %.6f, %zu of %zu samples "
+                        "differ\n",
+                        prefix.c_str(), diff.max_abs, diff.differing,
+                        diff.samples);
+        }
+    }
+
+    /* The accepted request records a device execution through run(). */
+    const std::string profile_path =
+        std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp") +
+        "/stage-residency-raw-base-wb.jsonl";
+
+    {
+        const int width = 63;
+        const int height = 31;
+        std::vector<float> image(
+            static_cast<std::size_t>(width) * height * 3, 1234.0f);
+
+        std::remove(profile_path.c_str());
+        setenv("RT_STAGE_PROFILE", profile_path.c_str(), 1);
+        set_node_device_override("raw.base.wb", StageNodeDevice::OpenCL);
+        const RtStageStatus status = run(
+            "raw.base.wb",
+            raw_base_wb_args(image.data(), width, height, width, width * height,
+                             1, multipliers));
+        clear_node_device_overrides();
+        const std::string profile = read_file(profile_path);
+        unsetenv("RT_STAGE_PROFILE");
+
+        check(status == RT_STAGE_OK, "raw.base.wb completes through run()");
+        check(profile.find("\"stage\":\"raw.base.wb\"") != std::string::npos,
+              "raw.base.wb records the sub-step");
+        check(profile.find("\"impl\":\"opencl\"") != std::string::npos,
+              "raw.base.wb records a device execution");
+    }
+
+    /* Every refusal runs before the upload, so the caller's in-place pass
+     * still sees its own pixels. */
+    const auto expect_refusal = [&](const char* label,
+                                    const std::function<void(
+                                        std::vector<RtStageArg>&)>& mutate) {
+        const int width = 17;
+        const int height = 9;
+        std::vector<float> image(
+            static_cast<std::size_t>(width) * height * 3, 1234.0f);
+        const std::vector<float> original = image;
+        std::vector<RtStageArg> args = raw_base_wb_args(
+            image.data(), width, height, width, width * height, 1,
+            multipliers);
+        mutate(args);
+
+        set_node_device_override("raw.base.wb", StageNodeDevice::OpenCL);
+        const RtStageStatus status = run("raw.base.wb", args);
+        clear_node_device_overrides();
+
+        check(status != RT_STAGE_OK,
+              (std::string(label) + " is refused").c_str());
+        const RawScaleDiff untouched = compare_raw_scale(image, original);
+        check(untouched.differing == 0 && untouched.max_abs == 0.0,
+              (std::string(label) + " leaves the image untouched").c_str());
+        std::printf("stage-residency: raw.base.wb %s: refused (status %d), "
+                    "%zu samples untouched\n",
+                    label, static_cast<int>(status), untouched.samples);
+    };
+
+    expect_refusal("wrong argument count", [](std::vector<RtStageArg>& args) {
+        args.pop_back();
+    });
+    expect_refusal("U8 image", [](std::vector<RtStageArg>& args) {
+        args[RAW_BASE_WB_ARG_IMAGE].u.buffer.format = RT_STAGE_U8;
+    });
+    expect_refusal("two-plane image", [](std::vector<RtStageArg>& args) {
+        args[RAW_BASE_WB_ARG_IMAGE].u.buffer.planes = 2;
+    });
+    expect_refusal("short row pitch", [](std::vector<RtStageArg>& args) {
+        args[RAW_BASE_WB_ARG_IMAGE].u.buffer.row_pitch -= sizeof(float);
+    });
+    expect_refusal("short plane pitch", [](std::vector<RtStageArg>& args) {
+        args[RAW_BASE_WB_ARG_IMAGE].u.buffer.plane_pitch -= sizeof(float);
+    });
+    expect_refusal("clip flag 2", [](std::vector<RtStageArg>& args) {
+        args[RAW_BASE_WB_ARG_CLIP].u.i = 2;
+    });
+    expect_refusal("non-finite multiplier", [](std::vector<RtStageArg>& args) {
+        args[RAW_BASE_WB_ARG_MULTIPLIERS + 1].u.f =
+            std::numeric_limits<double>::infinity();
+    });
+    expect_refusal("int multiplier", [](std::vector<RtStageArg>& args) {
+        args[RAW_BASE_WB_ARG_MULTIPLIERS + 2].kind = RT_STAGE_ARG_INT;
+    });
+}
+
 /* ------------------------------------------------------- lab.sharpening */
 
 struct LabPlaneDiff {
@@ -21268,6 +21528,7 @@ int main()
     test_raw_preprocess(available);
     test_raw_demosaic(available);
     test_raw_base(available);
+    test_raw_base_wb(available);
     test_lab_sharpening(available);
     test_run_wiring(available);
 
