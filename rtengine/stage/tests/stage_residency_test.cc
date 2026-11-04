@@ -13799,8 +13799,9 @@ void test_local_adjustments(bool available)
                  p.locallab.spots[0].expcbdl = true;
                  p.locallab.spots[0].sensicb = 101;
              }},
-            {"capture sharpening", [](auto& p) {
+            {"capture auto contrast", [](auto& p) {
                  p.dirpyrequalizer.cbdlMethod = "aft";
+                 p.locallab.spots[0].expcolor = false;
                  p.locallab.spots[0].expsharp = true;
                  p.locallab.spots[0].methodcap = "cap";
              }},
@@ -14766,6 +14767,201 @@ void test_local_adjustments(bool available)
                         changed.samples, changed.max_abs);
             check(changed.differing > 0,
                   "the CIE case is non-vacuous");
+        }
+    }
+
+    /*
+     * Capture sharpening. Lab_Local()'s "cap" arm works on the clipped ROI:
+     * working RGB, an RGB2L contrast mask with the manual threshold, the
+     * tiled deconvolution on the Rec2020 luminance, the RGB ratio and the
+     * senstype-99 blend. The cases cover every sigma-selected kernel, the
+     * border change above 30 iterations, the early-stop switch, the recovery
+     * weight, an ROI clipped at the image corner and the three tools that run
+     * before the arm.
+     */
+    {
+        struct CaptureCase {
+            const char* label;
+            int width;
+            int height;
+            int centre_x;
+            int centre_y;
+            int extent;
+            double sigma;
+            int iterations;
+            int contrast;
+            int sensitivity;
+            int reparsha;
+            bool check_stop;
+            bool blur;
+            bool tonemap;
+            bool cie;
+        };
+        const CaptureCase capture_cases[] = {
+            {"capture 5x5", 300, 300, 0, 0, 1000, 0.75, 25, 20, 40, 100,
+             true, false, false, false},
+            {"capture 3x3", 300, 300, 0, 0, 1000, 0.55, 25, 20, 40, 100,
+             true, false, false, false},
+            {"capture 7x7", 300, 300, 0, 0, 1000, 1.00, 25, 20, 40, 100,
+             true, false, false, false},
+            {"capture 9x9", 300, 300, 0, 0, 1000, 1.30, 10, 20, 40, 100,
+             true, false, false, false},
+            {"capture 13x13", 300, 300, 0, 0, 1000, 2.00, 10, 20, 40, 100,
+             true, false, false, false},
+            {"capture long iterations", 300, 300, 0, 0, 1000, 0.75, 40, 60,
+             40, 100, true, false, false, false},
+            {"capture no early stop", 300, 300, 0, 0, 1000, 0.75, 25, 20, 40,
+             100, false, false, false, false},
+            {"capture recovery 50", 300, 300, 0, 0, 1000, 0.75, 25, 20, 40,
+             50, true, false, false, false},
+            {"capture edge ROI", 300, 300, -500, -500, 1000, 0.75, 25, 20,
+             40, 100, true, false, false, false},
+            {"capture with blur", 300, 300, 0, 0, 1000, 0.75, 25, 20, 40,
+             100, true, true, false, false},
+            {"capture with tone map", 300, 300, 0, 0, 1000, 0.75, 25, 20, 40,
+             100, true, false, true, false},
+            {"capture with CIE", 300, 300, 0, 0, 1000, 0.75, 25, 20, 40,
+             100, true, false, false, true},
+        };
+        for (std::size_t index = 0;
+             index < sizeof(capture_cases) / sizeof(capture_cases[0]);
+             ++index) {
+            const CaptureCase& c = capture_cases[index];
+            const auto make_params = [&](rtengine::procparams::ProcParams& p) {
+                p.locallab.enabled = true;
+                p.locallab.spots.push_back(localAdjustmentsSpot(
+                    "capture", c.centre_x, c.centre_y, c.extent, true, 0, 0,
+                    0));
+                auto& spot = p.locallab.spots[0];
+                spot.expcolor = false;
+                if (c.blur) {
+                    spot.expblur = true;
+                    spot.radius = 10.0;
+                    spot.strength = 0;
+                    spot.strengr = 0;
+                    spot.guidbl = 0;
+                    spot.invbl = false;
+                    spot.fftwbl = false;
+                    spot.enablMask = false;
+                    spot.blMethod = "blur";
+                    spot.chroMethod = "all";
+                    spot.sensibn = 40;
+                    spot.locwavcurveden.clear();
+                }
+                if (c.tonemap) {
+                    spot.exptonemap = true;
+                    spot.stren = 0.8;
+                    spot.gamma = 1.0;
+                    spot.estop = 1.4;
+                    spot.scaltm = 1.0;
+                    spot.rewei = 0;
+                    spot.satur = 0.0;
+                    spot.sensitm = 60;
+                    spot.equiltm = true;
+                    spot.repartm = 100.0;
+                    spot.recothrest = 1.0;
+                }
+                if (c.cie) {
+                    spot.expcie = true;
+                    spot.modecie = "com";
+                    spot.modecam = "cam16";
+                    spot.sursourcie = "Average";
+                    spot.surroundcie = "Average";
+                    spot.sourceGraycie = 18;
+                    spot.targetGraycie = 18;
+                    spot.sourceabscie = 2000;
+                    spot.targabscie = 16;
+                    spot.catadcie = 0;
+                    spot.saturlcie = 0;
+                    spot.chromlcie = 0;
+                    spot.huecie = 0;
+                    spot.colorflcie = 0;
+                    spot.lightlcie = 0;
+                    spot.lightqcie = 0;
+                    spot.rstprotectcie = 0;
+                    spot.reparcie = 100;
+                    spot.blurciede = 5;
+                    spot.sensicie = 60;
+                    spot.smoothciemet = "none";
+                }
+                spot.expsharp = true;
+                spot.methodcap = "cap";
+                spot.capradius = c.sigma;
+                spot.deconvCoLat = c.iterations;
+                spot.deconvCogam = 1.0;
+                spot.deconvCoBoost = 0.0;
+                spot.deconvAutoshar = false;
+                spot.sharcontrast = c.contrast;
+                spot.sensisha = c.sensitivity;
+                spot.reparsha = c.reparsha;
+                spot.itercheck = c.check_stop;
+                spot.sharshow = false;
+                spot.inverssha = false;
+            };
+
+            rtengine::procparams::ProcParams reference_params;
+            make_params(reference_params);
+            check(localAdjustmentsSupported(reference_params),
+                  "the capture case is inside the predicate");
+
+            Imagefloat reference_base(c.width, c.height);
+            fill_tonemap_rgb(reference_base, 401u + index);
+            std::unique_ptr<LabImage> reference_lab(
+                new LabImage(c.width, c.height));
+            rtengine::ImProcFunctions reference_ipf(&reference_params, false);
+            localAdjustmentsHostBlock(reference_ipf, reference_params,
+                                      &reference_base, reference_lab.get(),
+                                      c.width, c.height);
+
+            rtengine::procparams::ProcParams node_params = reference_params;
+            Imagefloat node_base(c.width, c.height);
+            fill_tonemap_rgb(node_base, 401u + index);
+            std::unique_ptr<LabImage> node_lab(
+                new LabImage(c.width, c.height));
+            rtengine::ImProcFunctions node_ipf(&node_params, false);
+            const RtStageStatus status = run_local_adjustments_node(
+                node_base, *node_lab, node_params, node_ipf, profile_path);
+            check(status == RT_STAGE_OK,
+                  "the capture node completes through run()");
+
+            const std::string profile = read_file(profile_path);
+            if (cpu_device) {
+                check(profile.find("\"impl\":\"opencl\"") !=
+                          std::string::npos,
+                      "the capture case records a device pass");
+                check(profile.find("\"impl\":\"host\"") ==
+                          std::string::npos,
+                      "the capture case never falls back");
+            }
+
+            const Diff diff =
+                compare(view(*reference_lab), view(*node_lab));
+            std::printf("stage-residency: local.adjustments %s: PAE %.6f "
+                        "LSB16, %zu of %zu samples differ\n", c.label,
+                        diff.max_abs, diff.differing, diff.samples);
+            check(diff.finite && diff.max_abs <= 1.0,
+                  "the capture case is within 1 LSB16");
+
+            rtengine::procparams::ProcParams off_params = reference_params;
+            off_params.locallab.spots[0].expsharp = false;
+            if (!c.blur && !c.tonemap && !c.cie) {
+                off_params.locallab.spots[0].expcolor = true;
+            }
+            Imagefloat off_base(c.width, c.height);
+            fill_tonemap_rgb(off_base, 401u + index);
+            std::unique_ptr<LabImage> off_lab(
+                new LabImage(c.width, c.height));
+            rtengine::ImProcFunctions off_ipf(&off_params, false);
+            localAdjustmentsHostBlock(off_ipf, off_params, &off_base,
+                                      off_lab.get(), c.width, c.height);
+            const Diff changed =
+                compare(view(*off_lab), view(*reference_lab));
+            std::printf("stage-residency: local.adjustments %s changes "
+                        "%zu of %zu samples against the tool-off result, "
+                        "PAE %.6f LSB16\n", c.label, changed.differing,
+                        changed.samples, changed.max_abs);
+            check(changed.differing > 0,
+                  "the capture case is non-vacuous");
         }
     }
 
@@ -17584,10 +17780,123 @@ void test_local_adjustments(bool available)
             {"reparcol 1", [](auto& p) {
                  p.locallab.spots[0].reparcol = 1.0;
              }},
-            {"capture sharpening", [](auto& p) {
+            {"capture auto contrast", [](auto& p) {
                  p.locallab.spots[0].expcolor = false;
                  p.locallab.spots[0].expsharp = true;
                  p.locallab.spots[0].methodcap = "cap";
+             }},
+            {"capture gamma", [](auto& p) {
+                 auto& spot = p.locallab.spots[0];
+                 spot.expcolor = false;
+                 spot.expsharp = true;
+                 spot.methodcap = "cap";
+                 spot.capradius = 0.75;
+                 spot.deconvCoLat = 25;
+                 spot.deconvAutoshar = false;
+                 spot.deconvCoBoost = 0.0;
+                 spot.deconvCogam = 1.05;
+                 spot.sharcontrast = 20;
+                 spot.sensisha = 40;
+                 spot.reparsha = 100.0;
+             }},
+            {"capture corner boost", [](auto& p) {
+                 auto& spot = p.locallab.spots[0];
+                 spot.expcolor = false;
+                 spot.expsharp = true;
+                 spot.methodcap = "cap";
+                 spot.capradius = 0.75;
+                 spot.deconvCoLat = 25;
+                 spot.deconvAutoshar = false;
+                 spot.deconvCoBoost = 0.2;
+                 spot.deconvCogam = 1.0;
+                 spot.sharcontrast = 20;
+                 spot.sensisha = 40;
+                 spot.reparsha = 100.0;
+             }},
+            {"capture sigma range", [](auto& p) {
+                 auto& spot = p.locallab.spots[0];
+                 spot.expcolor = false;
+                 spot.expsharp = true;
+                 spot.methodcap = "cap";
+                 spot.capradius = 2.6;
+                 spot.deconvCoLat = 25;
+                 spot.deconvAutoshar = false;
+                 spot.deconvCoBoost = 0.0;
+                 spot.deconvCogam = 1.0;
+                 spot.sharcontrast = 20;
+                 spot.sensisha = 40;
+                 spot.reparsha = 100.0;
+             }},
+            {"capture iterations range", [](auto& p) {
+                 auto& spot = p.locallab.spots[0];
+                 spot.expcolor = false;
+                 spot.expsharp = true;
+                 spot.methodcap = "cap";
+                 spot.capradius = 0.75;
+                 spot.deconvCoLat = 101;
+                 spot.deconvAutoshar = false;
+                 spot.deconvCoBoost = 0.0;
+                 spot.deconvCogam = 1.0;
+                 spot.sharcontrast = 20;
+                 spot.sensisha = 40;
+                 spot.reparsha = 100.0;
+             }},
+            {"capture contrast range", [](auto& p) {
+                 auto& spot = p.locallab.spots[0];
+                 spot.expcolor = false;
+                 spot.expsharp = true;
+                 spot.methodcap = "cap";
+                 spot.capradius = 0.75;
+                 spot.deconvCoLat = 25;
+                 spot.deconvAutoshar = false;
+                 spot.deconvCoBoost = 0.0;
+                 spot.deconvCogam = 1.0;
+                 spot.sharcontrast = 2;
+                 spot.sensisha = 40;
+                 spot.reparsha = 100.0;
+             }},
+            {"capture recovery range", [](auto& p) {
+                 auto& spot = p.locallab.spots[0];
+                 spot.expcolor = false;
+                 spot.expsharp = true;
+                 spot.methodcap = "cap";
+                 spot.capradius = 0.75;
+                 spot.deconvCoLat = 25;
+                 spot.deconvAutoshar = false;
+                 spot.deconvCoBoost = 0.0;
+                 spot.deconvCogam = 1.0;
+                 spot.sharcontrast = 20;
+                 spot.sensisha = 40;
+                 spot.reparsha = -1.0;
+             }},
+            {"capture mask view", [](auto& p) {
+                 auto& spot = p.locallab.spots[0];
+                 spot.expcolor = false;
+                 spot.expsharp = true;
+                 spot.methodcap = "cap";
+                 spot.capradius = 0.75;
+                 spot.deconvCoLat = 25;
+                 spot.deconvAutoshar = false;
+                 spot.deconvCoBoost = 0.0;
+                 spot.deconvCogam = 1.0;
+                 spot.sharcontrast = 20;
+                 spot.sensisha = 40;
+                 spot.reparsha = 100.0;
+                 spot.sharshow = true;
+             }},
+            {"capture sensitivity range", [](auto& p) {
+                 auto& spot = p.locallab.spots[0];
+                 spot.expcolor = false;
+                 spot.expsharp = true;
+                 spot.methodcap = "cap";
+                 spot.capradius = 0.75;
+                 spot.deconvCoLat = 25;
+                 spot.deconvAutoshar = false;
+                 spot.deconvCoBoost = 0.0;
+                 spot.deconvCogam = 1.0;
+                 spot.sharcontrast = 20;
+                 spot.sensisha = 101;
+                 spot.reparsha = 100.0;
              }},
             {"sharpen damping range", [](auto& p) {
                  p.locallab.spots[0].expcolor = false;
