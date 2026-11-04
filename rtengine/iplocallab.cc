@@ -9195,6 +9195,8 @@ void ImProcFunctions::localAdjustmentsSpotParams(
     out.repartm = lp.repartm;
     out.senstm = lp.senstm;
     out.equtm = lp.equtm;
+    out.str = lp.str;
+    out.sensih = lp.sensh;
 }
 
 void ImProcFunctions::calc_ref(int sp, LabImage * original, LabImage * transformed, int cx, int cy, int oW, int oH, int sk, double & huerefblur, double & chromarefblur, double & lumarefblur, double & hueref, double & chromaref, double & lumaref, double & sobelref, float & avg, const LocwavCurve & locwavCurveden, bool locwavdenutili)

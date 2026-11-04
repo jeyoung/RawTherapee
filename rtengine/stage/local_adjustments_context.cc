@@ -658,6 +658,89 @@ bool dehazeAdmitted(const procparams::LocallabParams::LocallabSpot& spot)
     return spot.str == 0.0;
 }
 
+/* Whether the local Retinex tool's parameters are inside the device set.
+ *
+ * Lab_Local()'s call==2 arm runs when `lp.str >= 0.2 && lp.retiena` and the
+ * ROI is at least mSP wide and more than mSP tall. The device reproduces
+ * MSRLocal() with `skip = 1`, `chrome = 0` and `scall = 4`: the iterated box
+ * blur of each scale, the log (or linear) accumulation, the darkness and
+ * lightness multipliers, the transmission and gain tables, three
+ * mean/stdv reductions, and transit_shapedetect_retinex()'s senstype-4 and
+ * senstype-5 blends.
+ *
+ * `scalereti == 1` selects MSRLocal()'s separate contrast arm, which builds a
+ * DiagonalCurve from the ROI mean; that arm stays on the host. The FFT
+ * variant (`fftwreti`), the luminance-normalisation arm (`equilret`), the
+ * chroma Retinex slider and a non-identity luminance mask are residuals. The
+ * slider ranges are the GUI's. A strength below the block's gate is the
+ * block's own no-op and is admitted without a device pass. */
+bool retinexAdmitted(const procparams::LocallabParams::LocallabSpot& spot)
+{
+    if (!finiteValue(spot.str) || !finiteValue(spot.neigh) ||
+        !finiteValue(spot.vart) || !finiteValue(spot.limd) ||
+        !finiteValue(spot.cliptm) || !finiteValue(spot.darkness) ||
+        !finiteValue(spot.lightnessreti) || !finiteValue(spot.offs) ||
+        !finiteValue(spot.softradiusret)) {
+        return false;
+    }
+    if (spot.str < RT_LOCAL_ADJUSTMENTS_RETI_MIN_STRENGTH ||
+        spot.str > RT_LOCAL_ADJUSTMENTS_RETI_MAX_STRENGTH) {
+        return false;
+    }
+    if (spot.scalereti < RT_LOCAL_ADJUSTMENTS_RETI_MIN_SCALE ||
+        spot.scalereti > RT_LOCAL_ADJUSTMENTS_RETI_MAX_SCALE ||
+        spot.scalereti != static_cast<double>(
+                                static_cast<int>(spot.scalereti))) {
+        return false;
+    }
+    if (spot.retinexMethod != "uni" && spot.retinexMethod != "low" &&
+        spot.retinexMethod != "high") {
+        return false;
+    }
+    if (spot.neigh < RT_LOCAL_ADJUSTMENTS_RETI_MIN_NEIGH ||
+        spot.neigh > RT_LOCAL_ADJUSTMENTS_RETI_MAX_NEIGH) {
+        return false;
+    }
+    if (spot.vart < RT_LOCAL_ADJUSTMENTS_RETI_MIN_VART ||
+        spot.vart > RT_LOCAL_ADJUSTMENTS_RETI_MAX_VART) {
+        return false;
+    }
+    if (spot.limd < RT_LOCAL_ADJUSTMENTS_RETI_MIN_LIMD ||
+        spot.limd > RT_LOCAL_ADJUSTMENTS_RETI_MAX_LIMD) {
+        return false;
+    }
+    if (spot.cliptm < RT_LOCAL_ADJUSTMENTS_RETI_MIN_CLIPTM ||
+        spot.cliptm > RT_LOCAL_ADJUSTMENTS_RETI_MAX_CLIPTM) {
+        return false;
+    }
+    if (spot.darkness < RT_LOCAL_ADJUSTMENTS_RETI_MIN_DARKNESS ||
+        spot.darkness > RT_LOCAL_ADJUSTMENTS_RETI_MAX_DARKNESS) {
+        return false;
+    }
+    if (spot.lightnessreti < RT_LOCAL_ADJUSTMENTS_RETI_MIN_LIGHTNESS ||
+        spot.lightnessreti > RT_LOCAL_ADJUSTMENTS_RETI_MAX_LIGHTNESS) {
+        return false;
+    }
+    if (spot.offs < RT_LOCAL_ADJUSTMENTS_RETI_MIN_OFFS ||
+        spot.offs > RT_LOCAL_ADJUSTMENTS_RETI_MAX_OFFS) {
+        return false;
+    }
+    if (spot.softradiusret <
+            RT_LOCAL_ADJUSTMENTS_RETI_MIN_SOFT_RADIUS ||
+        spot.softradiusret > RT_LOCAL_ADJUSTMENTS_RETI_MAX_SOFT_RADIUS) {
+        return false;
+    }
+    if (spot.sensih < 0 || spot.sensih > 100) {
+        return false;
+    }
+    /* The contrast arm, the FFT variant, the normalisation arm and chroma
+     * Retinex are residuals; so is a mask curve the block would apply. */
+    if (spot.fftwreti || spot.equilret || spot.chrrt != 0.0) {
+        return false;
+    }
+    return true;
+}
+
 /* LocLHCurve/LocHHCurve/LocCHCurve's own activity test: the host scans the
  * first 500 entries for a value other than the identity 0.5. */
 template<typename Curve>
@@ -725,6 +808,91 @@ bool copyToBuffer(const LabImage& image, RtStageBuffer& lab)
         }
     }
     return true;
+}
+
+/* ipretinex.cc retinex_scales(), unchanged: the caller has already forced the
+ * neighbour count to at least three. Mode 0 is "uni", 1 "low" and 2 "high". */
+void retinexScales(float* scales, int nscales, int mode, int s)
+{
+    if (s < 3) {
+        s = 3;
+    }
+
+    if (nscales == 1) {
+        scales[0] = static_cast<float>(s) / 2.f;
+    } else if (nscales == 2) {
+        scales[1] = static_cast<float>(s) / 2.f;
+        scales[0] = static_cast<float>(s);
+    } else {
+        float size_step = static_cast<float>(s) / static_cast<float>(nscales);
+
+        if (mode == 0) {
+            for (int i = 0; i < nscales; ++i) {
+                scales[nscales - i - 1] = 2.0f +
+                    static_cast<float>(i) * size_step;
+            }
+        } else if (mode == 1) {
+            size_step = static_cast<float>(std::log(s - 2.0f)) /
+                        static_cast<float>(nscales);
+
+            for (int i = 0; i < nscales; ++i) {
+                scales[nscales - i - 1] = 2.0f +
+                    static_cast<float>(std::pow(
+                        10.f, (i * size_step) / std::log(10.f)));
+            }
+        } else if (mode == 2) {
+            size_step = static_cast<float>(std::log(s - 2.0f)) /
+                        static_cast<float>(nscales);
+
+            for (int i = 0; i < nscales; ++i) {
+                scales[i] = static_cast<float>(s) -
+                    static_cast<float>(std::pow(
+                        10.f, (i * size_step) / std::log(10.f)));
+            }
+        }
+    }
+}
+
+/* gauss.cc's iterated box-blur geometry for gaussianBlur(..., useBoxBlur =
+ * true). Returns the number of iterations and writes the caller-clamped radii
+ * of each. `sigma` is the double the host passes to gaussianBlur(). */
+int retinexBoxSizes(double sigma, int width, int height, int* radii)
+{
+    int n = 1;
+    double wIdeal = std::sqrt(12.0 * sigma * sigma + 1.0);
+
+    while (wIdeal > width || wIdeal > height) {
+        ++n;
+        wIdeal = std::sqrt(12.0 * sigma * sigma / n + 1.0);
+    }
+
+    if (n < 3) {
+        n = 3;
+        wIdeal = std::sqrt(12.0 * sigma * sigma / n + 1.0);
+    } else if (n > 6) {
+        n = 6;
+    }
+
+    int wl = static_cast<int>(wIdeal);
+
+    if (wl % 2 == 0) {
+        --wl;
+    }
+
+    const int wu = wl + 2;
+    const double mIdeal =
+        (12.0 * sigma * sigma - n * wl * wl - 4.0 * n * wl - 3.0 * n) /
+        (-4.0 * wl - 4.0);
+    const int m = static_cast<int>(std::round(mIdeal));
+
+    for (int i = 0; i < n; ++i) {
+        radii[i] = ((i < m ? wl : wu) - 1) / 2;
+        radii[i] = std::min(radii[i], std::min(width - 1, height - 1));
+        if (radii[i] < 0) {
+            radii[i] = 0;
+        }
+    }
+    return n;
 }
 
 } // namespace
@@ -844,10 +1012,13 @@ bool localAdjustmentsSupported(const procparams::ProcParams& params)
          * admitted. */
         if (spot.activ) {
             const bool dehaze = spot.expreti && spot.dehaz != 0;
+            const bool retinex =
+                spot.expreti &&
+                spot.str >= RT_LOCAL_ADJUSTMENTS_RETI_MIN_STRENGTH;
             if ((!spot.expcolor && !spot.expvibrance && !spot.expcontrast &&
                  !spot.expshadhigh && !spot.expsoft && !spot.expcbdl &&
                  !spot.explog && !spot.expsharp && !spot.expblur &&
-                 !spot.exptonemap && !dehaze) ||
+                 !spot.exptonemap && !dehaze && !retinex) ||
                 otherToolEnabled(spot)) {
                 return false;
             }
@@ -858,13 +1029,16 @@ bool localAdjustmentsSupported(const procparams::ProcParams& params)
                 (params.epd.enabled || !toneMapAdmitted(spot))) {
                 return false;
             }
-            /* The retinex enable is the dehaze gate. The retinex tool itself
-             * must be a no-op; a strength other than zero is an active
-             * retinex configuration and stays on the host. A dehaze value
+            /* The retinex enable gates both the local Retinex tool and the
+             * local dehaze pass. A strength at or above the block's 0.2 gate
+             * is the Retinex arm, which retinexAdmitted() narrows; a smaller
+             * strength is the block's own no-op. Dehaze shares the enable,
+             * but dehazeAdmitted() still requires a zero Retinex strength, so
+             * a spot that asks for both stays on the host. A dehaze value
              * without the enable would be silently inert, so it is refused
              * rather than treated as a clamp-only block. */
             if (spot.expreti) {
-                if (spot.str != 0.0) {
+                if (spot.str != 0.0 && !retinexAdmitted(spot)) {
                     return false;
                 }
                 if (spot.dehaz != 0 && !dehazeAdmitted(spot)) {
@@ -2018,6 +2192,171 @@ int LocalAdjustmentsContext::build(int spot, const RtStageBuffer* lab,
     }
 
     /*
+     * Retinex. Lab_Local()'s call==2 arm runs when `lp.str >= 0.2` and
+     * `lp.retiena`, over an ROI at least mSP wide and more than mSP tall.
+     * MSRLocal() receives `skip = 1`, `chrome = 0`, `scall = 4` and
+     * `krad = 1`, so the neighbour count and the variance are not rescaled.
+     * Every scalar below is built with the block's own arithmetic; the
+     * per-scale blur is gaussianBlur()'s iterated box blur, whose geometry is
+     * host-computed because its radii depend on the ROI.
+     */
+    const int retiXStart = std::max(
+        static_cast<int>(lp.xc - lp.lxL), 0);
+    const int retiYStart = std::max(
+        static_cast<int>(lp.yc - lp.lyT), 0);
+    const int retiWidth =
+        std::min(static_cast<int>(lp.xc + lp.lx), fw_) - retiXStart;
+    const int retiHeight =
+        std::min(static_cast<int>(lp.yc + lp.ly), fh_) - retiYStart;
+    const bool retinexRun = profileSpot.expreti && lp.activspot &&
+                            lp.str >=
+                                RT_LOCAL_ADJUSTMENTS_RETI_MIN_STRENGTH &&
+                            retiWidth >=
+                                RT_LOCAL_ADJUSTMENTS_RETI_MIN_ROI &&
+                            retiHeight >
+                                RT_LOCAL_ADJUSTMENTS_RETI_MIN_ROI;
+    if (retinexRun && ipf_.getScale() != 1.0) {
+        return 1;
+    }
+    const float retiStrength = static_cast<float>(profileSpot.str) / 100.f;
+    float retiValue = 1.f;
+    if (retiStrength > 0.f) {
+        retiValue = std::pow(retiStrength, 0.4f);
+    }
+    const float retiVart = static_cast<float>(profileSpot.vart) / 100.f;
+    const int retiScale = static_cast<int>(profileSpot.scalereti);
+    int retiMode = 0;
+    if (profileSpot.retinexMethod == "low") {
+        retiMode = 1;
+    } else if (profileSpot.retinexMethod == "high") {
+        retiMode = 2;
+    }
+    int retiNei = static_cast<int>(
+        1.0f * static_cast<float>(profileSpot.neigh));
+    /* MSRLocal()'s own light/dark factor and log scale. */
+    const float retiLogBetaGain = xlogf(16384.f);
+    float retiPond = retiLogBetaGain / static_cast<float>(retiScale);
+    /* MSRLocal()'s `useHslLin` is !loglin; the log arm divides pond by
+     * log(2.71828) and the linear arm does not. */
+    if (profileSpot.loglin) {
+        retiPond /= static_cast<float>(std::log(2.71828));
+    }
+    const float retiLimit = static_cast<float>(
+        std::pow(profileSpot.limd, 1.7f));
+    const float retiInverseLimit = retiLimit > 0.f ? 1.f / retiLimit : 1.f;
+    const float retiSensiBefore =
+        0.01f * static_cast<float>(profileSpot.softradiusret) *
+            static_cast<float>(lp.sensih) +
+        (100.f - static_cast<float>(profileSpot.softradiusret));
+    const float retiStrCli =
+        (retiScale == 1 ? 0.015f : 0.03f) * lp.str;
+
+    /*
+     * The per-scale blur. RetinexScales[] is retinex_scales()'s output, and
+     * `kg` is the empirical correction MSRLocal() keeps across iterations,
+     * so the band-limited sigma of every scale but the first is
+     * sqrt(sqr(kg * scale[i]) - sqr(kg * scale[i + 1])).
+     */
+    uint32_t retiBlurStages = 0;
+    float retiBlurBox[RT_LOCAL_ADJUSTMENTS_RETI_MAX_SCALES *
+                      RT_LOCAL_ADJUSTMENTS_RETI_BLUR_STRIDE] = {};
+    if (retinexRun) {
+        float scales[RT_LOCAL_ADJUSTMENTS_RETI_MAX_SCALES] = {};
+        retinexScales(scales, retiScale, retiMode, retiNei);
+        float kg = 1.f;
+        for (int stage = 0; stage < retiScale; ++stage) {
+            const int scale = retiScale - 1 - stage;
+            const float sigm = scales[scale];
+            if (settings->fftwsigma == false) {
+                if (sigm > 400.f) {
+                    /* MSRLocal() derives `kr` and `kg` from the same sigma;
+                     * only `kg` scales the box-blur sigmas. */
+                    const float kga = -0.14f / 4600.f;
+                    const float kgb = 1.f - 400.f * kga;
+                    kg = kga * sigm + kgb;
+                    if (sigm > 5000.f) {
+                        kg = kga * 5000.f + kgb;
+                    }
+                }
+            } else {
+                kg = 1.f;
+            }
+            double sigma = 0.0;
+            if (stage == 0) {
+                sigma = static_cast<double>(kg * scales[scale]);
+            } else {
+                const float band = sqrtf(SQR(kg * scales[scale]) -
+                                         SQR(kg * scales[scale + 1]));
+                sigma = static_cast<double>(band);
+            }
+            int radii[RT_LOCAL_ADJUSTMENTS_RETI_MAX_BOX_ITERATIONS] = {};
+            const int count = retinexBoxSizes(
+                sigma, retiWidth, retiHeight, radii);
+            float* entry = retiBlurBox +
+                static_cast<std::size_t>(stage) *
+                    RT_LOCAL_ADJUSTMENTS_RETI_BLUR_STRIDE;
+            entry[0] = static_cast<float>(count);
+            for (int index = 0; index < count; ++index) {
+                entry[1 + index] = static_cast<float>(radii[index]);
+            }
+        }
+        retiBlurStages = static_cast<uint32_t>(retiScale);
+    }
+
+    /* The transmission and gain tables MSRLocal() reads. The host builds them
+     * from the spot's curves with LocretigainCurve/LocretitransCurve's 0.02
+     * floor; the device evaluates the 501 samples with LUTf's linear
+     * interpolation and clip. */
+    float retiGainOffset = RT_LOCAL_ADJUSTMENTS_NO_LUT;
+    float retiTransOffset = RT_LOCAL_ADJUSTMENTS_NO_LUT;
+    bool retiGainActive = false;
+    bool retiTransActive = false;
+    if (retinexRun) {
+        std::vector<float> gainTable;
+        std::vector<float> transTable;
+        {
+            LocretigainCurve curve;
+            curve.Set(profileSpot.localTgaincurve);
+            retiGainActive = static_cast<bool>(curve);
+            if (retiGainActive) {
+                gainTable.resize(RT_LOCAL_ADJUSTMENTS_RETI_GAIN_ENTRIES);
+                for (uint32_t index = 0;
+                     index < RT_LOCAL_ADJUSTMENTS_RETI_GAIN_ENTRIES;
+                     ++index) {
+                    gainTable[index] =
+                        curve[static_cast<float>(index)];
+                }
+            }
+        }
+        {
+            LocretitransCurve curve;
+            curve.Set(profileSpot.localTtranscurve);
+            retiTransActive = static_cast<bool>(curve);
+            if (retiTransActive) {
+                transTable.resize(RT_LOCAL_ADJUSTMENTS_RETI_TRANS_ENTRIES);
+                for (uint32_t index = 0;
+                     index < RT_LOCAL_ADJUSTMENTS_RETI_TRANS_ENTRIES;
+                     ++index) {
+                    transTable[index] =
+                        curve[static_cast<float>(index)];
+                }
+            }
+        }
+        if (retiGainActive) {
+            retiGainOffset = appendSamples(gainTable);
+            if (retiGainOffset == RT_LOCAL_ADJUSTMENTS_NO_LUT) {
+                return 1;
+            }
+        }
+        if (retiTransActive) {
+            retiTransOffset = appendSamples(transTable);
+            if (retiTransOffset == RT_LOCAL_ADJUSTMENTS_NO_LUT) {
+                return 1;
+            }
+        }
+    }
+
+    /*
      * Local dehaze. Lab_Local()'s guard is `(lp.dehaze != 0 || lp.prevdE) &&
      * lp.retiena`; the export call site passes no previous-deltaE flag and the
      * predicate has already narrowed the retinex enable, the mask state and
@@ -2332,6 +2671,50 @@ int LocalAdjustmentsContext::build(int spot, const RtStageBuffer* lab,
         static_cast<float>(tmReweight);
     record[RT_LOCAL_ADJUSTMENTS_SLOT_TM_EQUIL] =
         profileSpot.equiltm ? 1.f : 0.f;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_EXP_RETINEX] =
+        retinexRun ? 1.f : 0.f;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_RETI_STRENGTH] = lp.str;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_RETI_SCALE] =
+        static_cast<float>(retiScale);
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_RETI_VART] = retiVart;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_RETI_DARK] =
+        static_cast<float>(profileSpot.darkness);
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_RETI_LIGHT] =
+        static_cast<float>(profileSpot.lightnessreti);
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_RETI_VALUE] = retiValue;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_RETI_LIMD] = retiLimit;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_RETI_ILIMD] = retiInverseLimit;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_RETI_CLIPTM] =
+        static_cast<float>(profileSpot.cliptm);
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_RETI_OFFS] =
+        static_cast<float>(profileSpot.offs);
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_RETI_LOGLIN] =
+        profileSpot.loglin ? 1.f : 0.f;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_RETI_POND] = retiPond;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_RETI_SOFTRADIUS] =
+        static_cast<float>(profileSpot.softradiusret);
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_RETI_STRCLI] = retiStrCli;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_RETI_SENSIBEFORE] =
+        retiSensiBefore;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_RETI_GAIN_OFFSET] = retiGainOffset;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_RETI_GAIN_ACTIVE] =
+        retiGainActive ? 1.f : 0.f;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_RETI_TRANS_OFFSET] = retiTransOffset;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_RETI_TRANS_ACTIVE] =
+        retiTransActive ? 1.f : 0.f;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_RETI_BLUR_STAGES] =
+        static_cast<float>(retiBlurStages);
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_RETI_STR] = retiStrength;
+    for (uint32_t stage = 0;
+         stage < RT_LOCAL_ADJUSTMENTS_RETI_MAX_SCALES; ++stage) {
+        for (uint32_t index = 0;
+             index < RT_LOCAL_ADJUSTMENTS_RETI_BLUR_STRIDE; ++index) {
+            record[RT_LOCAL_ADJUSTMENTS_SLOT_RETI_BLUR_BASE +
+                   stage * RT_LOCAL_ADJUSTMENTS_RETI_BLUR_STRIDE + index] =
+                retiBlurBox[stage * RT_LOCAL_ADJUSTMENTS_RETI_BLUR_STRIDE +
+                            index];
+        }
+    }
     record[RT_LOCAL_ADJUSTMENTS_SLOT_EXPDENAZE] = dehazeRun ? 1.f : 0.f;
     record[RT_LOCAL_ADJUSTMENTS_SLOT_SENSH] =
         static_cast<float>(profileSpot.sensih);

@@ -158,6 +158,31 @@ inline constexpr const char* RT_LOCAL_ADJUSTMENTS_CL = R"CLC(
 #define RT_LA_TM_ITERATES 158
 #define RT_LA_TM_REWEIGHT 159
 #define RT_LA_TM_EQUIL 160
+#define RT_LA_EXP_RETINEX 161
+#define RT_LA_RETI_STRENGTH 162
+#define RT_LA_RETI_SCALE 163
+#define RT_LA_RETI_VART 164
+#define RT_LA_RETI_DARK 165
+#define RT_LA_RETI_LIGHT 166
+#define RT_LA_RETI_VALUE 167
+#define RT_LA_RETI_LIMD 168
+#define RT_LA_RETI_ILIMD 169
+#define RT_LA_RETI_CLIPTM 170
+#define RT_LA_RETI_OFFS 171
+#define RT_LA_RETI_LOGLIN 172
+#define RT_LA_RETI_POND 173
+#define RT_LA_RETI_SOFTRADIUS 174
+#define RT_LA_RETI_STRCLI 175
+#define RT_LA_RETI_SENSIBEFORE 176
+#define RT_LA_RETI_GAIN_OFFSET 177
+#define RT_LA_RETI_GAIN_ACTIVE 178
+#define RT_LA_RETI_TRANS_OFFSET 179
+#define RT_LA_RETI_TRANS_ACTIVE 180
+#define RT_LA_RETI_BLUR_STAGES 181
+#define RT_LA_RETI_STR 182
+#define RT_LA_RETI_BLUR_BASE 200
+#define RT_LA_RETI_BLUR_STRIDE 7
+#define RT_LA_RETI_MAX_BOX_ITERATIONS 6
 
 /*
  * The number of trailing columns the host takes through its scalar path.
@@ -2621,6 +2646,429 @@ __kernel void rt_local_adjustments_tonemap(
             fin[2 * fin_plane + frow + x] =
                 repart * (orig_b - epd_b) + epd_b;
         }
+    }
+}
+
+/*
+ * Retinex. LocretigainCurve/LocretitransCurve are 501-entry LUTf tables; the
+ * host's operator[] clamps below zero and above index 499 and interpolates
+ * linearly.
+ */
+#define RT_LA_RETI_LUT_LAST 499.0f
+inline float rt_la_reti_lut(__global const float* table, const float index)
+{
+    int idx = (int)index;
+    if (index < 0.0f) {
+        return table[0];
+    }
+    if (index > RT_LA_RETI_LUT_LAST) {
+        return table[500];
+    }
+    const float diff = index - (float)idx;
+    const float low = table[idx];
+    return low + (table[idx + 1] - low) * diff;
+}
+
+/* iplocallab.cc clipDE(). */
+inline float rt_la_reti_clip_de(const float x)
+{
+    return fmin(fmax(x, 0.3f), 1.0f);
+}
+
+/*
+ * MSRLocal()'s per-spot setup: the ROI copy, the deltaE reduction the block
+ * applies before the multi-scale pass, orig/orig1, src = orig + 2 and the
+ * zeroed luminance accumulator. The host's call==2 arm reads the retinex
+ * strength gate and the ROI itself; a smaller ROI never reaches here.
+ */
+__kernel void rt_local_adjustments_reti_prepare(
+    __global float* lab, __global float* work, __global float* reduc,
+    __global float* orig1, __global float* src, __global float* lum,
+    __global const float* rec, const int lab_pitch, const int lab_plane,
+    const int work_pitch, const int work_plane, const int xstart,
+    const int ystart, const int bfw, const int bfh)
+{
+    const int rx = (int)get_global_id(0);
+    const int ry = (int)get_global_id(1);
+    if (rx >= bfw || ry >= bfh) {
+        return;
+    }
+    const int o = (ystart + ry) * lab_pitch + (xstart + rx);
+    const int r = ry * work_pitch + rx;
+    const float L = lab[o];
+    const float a = lab[lab_plane + o];
+    const float b = lab[2 * lab_plane + o];
+    work[r] = L;
+    work[work_plane + r] = a;
+    work[2 * work_plane + r] = b;
+    orig1[r] = L;
+    src[r] = L + 2.0f;
+    lum[r] = 0.0f;
+
+    /* iplocallab.cc's pre-MSR reduction. The lightness term reads the b
+     * channel in the host's call==2 arm; keep the expression verbatim. */
+    const float refa = rec[RT_LA_CHROMAREF] * cos(rec[RT_LA_HUEREF]);
+    const float refb = rec[RT_LA_CHROMAREF] * sin(rec[RT_LA_HUEREF]);
+    const float refL = rec[RT_LA_LUMAREF];
+    const float dE = sqrt((refa - a / 327.68f) * (refa - a / 327.68f) +
+                          (refb - b / 327.68f) * (refb - b / 327.68f) +
+                          (refL - b / 327.68f) * (refL - b / 327.68f));
+    const float sens = rec[RT_LA_SENSH];
+    const float thr = rec[RT_LA_THR];
+    const float mindE = 4.0f + RT_LA_MINSCOPE * sens * thr;
+    const float maxdE = 5.0f + RT_LA_MAXSCOPE * sens * (1.0f + 0.1f * thr);
+    const float mindElim = 2.0f + RT_LA_MINSCOPE * (float)RT_LA_LIMSCOPE * thr;
+    const float maxdElim =
+        5.0f + RT_LA_MAXSCOPE * (float)RT_LA_LIMSCOPE * (1.0f + 0.1f * thr);
+    const int scope = (int)rec[RT_LA_RETI_SENSIBEFORE];
+    const float reducdE = rt_la_calcreducdE(
+        dE, maxdE, mindE, maxdElim, mindElim, rec[RT_LA_ITERAT],
+        RT_LA_LIMSCOPE, scope);
+    reduc[r] = rt_la_reti_clip_de(reducdE);
+}
+
+/*
+ * One scale's accumulation. At scale one the host first applies the darkness
+ * and lightness multipliers to the current blur estimate; the accumulator
+ * then adds pond times the clamped ratio, in log or linear form.
+ */
+__kernel void rt_local_adjustments_reti_accum(
+    __global float* lum, __global const float* src, __global float* out,
+    __global const float* rec, const int pitch, const int width,
+    const int height, const int scale_is_one)
+{
+    const int x = (int)get_global_id(0);
+    const int y = (int)get_global_id(1);
+    if (x >= width || y >= height) {
+        return;
+    }
+    const int r = y * pitch + x;
+    float o = out[r];
+    if (scale_is_one != 0) {
+        float buf = (src[r] - o) * rec[RT_LA_RETI_VALUE];
+        buf *= (buf > 0.0f) ? rec[RT_LA_RETI_LIGHT] : rec[RT_LA_RETI_DARK];
+        o = fmin(fmax(o + buf, -100000.0f), 100000.0f);
+        out[r] = o;
+    }
+    const float ratio =
+        fmin(fmax(src[r] / o, rec[RT_LA_RETI_ILIMD]), rec[RT_LA_RETI_LIMD]);
+    if (rec[RT_LA_RETI_LOGLIN] != 0.0f) {
+        lum[r] += rec[RT_LA_RETI_POND] * rt_lr_xlogf(ratio);
+    } else {
+        lum[r] += rec[RT_LA_RETI_POND] * ratio;
+    }
+}
+
+/*
+ * MSRLocal()'s reductions and normalisation. One work item walks the ROI in
+ * the host's row-major order three times: before the transmission curve,
+ * after it, and after subtracting mini when the gain table is active. The
+ * results go to a small parameter buffer for the gain kernel.
+ */
+__kernel void rt_local_adjustments_reti_stats(
+    __global float* lum, __global const float* rec,
+    __global const float* trans, __global float* params, const int pitch,
+    const int width, const int height)
+{
+    if (get_global_id(0) != 0) {
+        return;
+    }
+    const int count = width * height;
+    double sum = 0.0;
+    double squared = 0.0;
+    float lmax = -999999.0f;
+    float lmin = 999999.0f;
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            const float v = lum[y * pitch + x];
+            sum += (double)v;
+            squared += (double)v * (double)v;
+            lmax = v > lmax ? v : lmax;
+            lmin = v < lmin ? v : lmin;
+        }
+    }
+    const float mean = (float)(sum / (double)count);
+    float variance = squared / (double)count;
+    variance -= (double)mean * (double)mean;
+    const float stddv = (float)sqrt(variance);
+    const float maxtr = lmax;
+    const float mintr = lmin;
+
+    if (rec[RT_LA_RETI_TRANS_ACTIVE] != 0.0f) {
+        float asig = 0.166666f / stddv;
+        float bsig = 0.5f - asig * mean;
+        float amax = 0.333333f / (maxtr - mean - stddv);
+        float bmax = 1.0f - amax * maxtr;
+        float amin = 0.333333f / (mean - stddv - mintr);
+        float bmin = -amin * mintr;
+        asig *= 500.0f;
+        bsig *= 500.0f;
+        amax *= 500.0f;
+        bmax *= 500.0f;
+        amin *= 500.0f;
+        bmin *= 500.0f;
+        for (int y = 0; y < height; ++y) {
+          for (int x = 0; x < width; ++x) {
+            const int i = y * pitch + x;
+            const float v = lum[i];
+            float absciss;
+            if (fabs(v - mean) < stddv) {
+                absciss = asig * v + bsig;
+            } else if (v >= mean) {
+                absciss = amax * v + bmax;
+            } else {
+                absciss = amin * v + bmin;
+            }
+            lum[i] = v * (-1.0f + 4.0f * rt_la_reti_lut(trans, absciss));
+          }
+        }
+    }
+
+    sum = 0.0;
+    squared = 0.0;
+    lmax = -999999.0f;
+    lmin = 999999.0f;
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            const float v = lum[y * pitch + x];
+            sum += (double)v;
+            squared += (double)v * (double)v;
+            lmax = v > lmax ? v : lmax;
+            lmin = v < lmin ? v : lmin;
+        }
+    }
+    const float mean2 = (float)(sum / (double)count);
+    variance = squared / (double)count;
+    variance -= (double)mean2 * (double)mean2;
+    const float stddv2 = (float)sqrt(variance);
+    const float maxtr2 = lmax;
+    const float mintr2 = lmin;
+
+    const float vart = rec[RT_LA_RETI_VART];
+    float mini = mean2 - vart * stddv2;
+    if (mini < mintr2) {
+        mini = mintr2 + 0.1f;
+    }
+    float maxi = mean2 + vart * stddv2;
+    if (maxi > maxtr2) {
+        maxi = maxtr2 - 0.1f;
+    }
+    float delta = maxi - mini;
+    if (delta == 0.0f) {
+        delta = 1.0f;
+    }
+    float cdfactor = (rec[RT_LA_RETI_CLIPTM] * 32768.0f) / delta;
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            lum[y * pitch + x] -= mini;
+        }
+    }
+
+    float mean3 = 0.0f;
+    float stddv3 = 0.0f;
+    float maxtr3 = 0.0f;
+    float mintr3 = 0.0f;
+    int has_gain = 0;
+    if (rec[RT_LA_RETI_GAIN_ACTIVE] != 0.0f) {
+        sum = 0.0;
+        squared = 0.0;
+        lmax = -999999.0f;
+        lmin = 999999.0f;
+        for (int y = 0; y < height; ++y) {
+            for (int x = 0; x < width; ++x) {
+                const float v = lum[y * pitch + x];
+                sum += (double)v;
+                squared += (double)v * (double)v;
+                lmax = v > lmax ? v : lmax;
+                lmin = v < lmin ? v : lmin;
+            }
+        }
+        mean3 = (float)(sum / (double)count);
+        variance = squared / (double)count;
+        variance -= (double)mean3 * (double)mean3;
+        stddv3 = (float)sqrt(variance);
+        maxtr3 = lmax;
+        mintr3 = lmin;
+        has_gain = mean3 != 0.0f && stddv3 != 0.0f ? 1 : 0;
+    }
+
+    float asig = 0.0f;
+    float bsig = 0.0f;
+    float amax = 0.0f;
+    float bmax = 0.0f;
+    float amin = 0.0f;
+    float bmin = 0.0f;
+    if (has_gain != 0) {
+        asig = 0.166666f / stddv3;
+        bsig = 0.5f - asig * mean3;
+        amax = 0.333333f / (maxtr3 - mean3 - stddv3);
+        bmax = 1.0f - amax * maxtr3;
+        amin = 0.333333f / (mean3 - stddv3 - mintr3);
+        bmin = -amin * mintr3;
+        asig *= 500.0f;
+        bsig *= 500.0f;
+        amax *= 500.0f;
+        bmax *= 500.0f;
+        amin *= 500.0f;
+        bmin *= 500.0f;
+        cdfactor *= 2.0f;
+    }
+
+    params[0] = cdfactor;
+    params[1] = mean3;
+    params[2] = stddv3;
+    params[3] = (float)has_gain;
+    params[4] = asig;
+    params[5] = bsig;
+    params[6] = amax;
+    params[7] = bmax;
+    params[8] = amin;
+    params[9] = bmin;
+}
+
+/* MSRLocal()'s final intp() against the original lightness. */
+__kernel void rt_local_adjustments_reti_gain(
+    __global float* lum, __global const float* reduc,
+    __global const float* orig1, __global const float* rec,
+    __global const float* gain, __global const float* params,
+    const int pitch, const int width, const int height)
+{
+    const int x = (int)get_global_id(0);
+    const int y = (int)get_global_id(1);
+    if (x >= width || y >= height) {
+        return;
+    }
+    const int i = y * pitch + x;
+    const float v = lum[i];
+    float gan = 0.5f;
+    if (params[3] != 0.0f) {
+        float absciss;
+        if (fabs(v - params[1]) < params[2]) {
+            absciss = params[4] * v + params[5];
+        } else if (v >= params[1]) {
+            absciss = params[6] * v + params[7];
+        } else {
+            absciss = params[8] * v + params[9];
+        }
+        gan = rt_la_reti_lut(gain, absciss);
+    }
+    float cd = gan * params[0] * v + rec[RT_LA_RETI_OFFS];
+    cd = fmin(fmax(cd, 0.0f), 32768.0f);
+    const float t = rec[RT_LA_RETI_STR] * reduc[i];
+    lum[i] = t * (cd - orig1[i]) + orig1[i];
+}
+
+/*
+ * The lightness difference MSRLocal leaves for the blend, normalised by one
+ * percent of its largest magnitude. One work item reduces the ROI and writes
+ * the scaled plane.
+ */
+__kernel void rt_local_adjustments_reti_diff(
+    __global const float* lum, __global const float* orig1,
+    __global float* flight, const int pitch, const int width,
+    const int height)
+{
+    if (get_global_id(0) != 0) {
+        return;
+    }
+    float minL = lum[0] - orig1[0];
+    float maxL = minL;
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            const int i = y * pitch + x;
+            const float d = lum[i] - orig1[i];
+            minL = d < minL ? d : minL;
+            maxL = d > maxL ? d : maxL;
+        }
+    }
+    float coef = 0.01f * fmax(fabs(minL), fabs(maxL));
+    if (coef > 0.0f) {
+        coef = 1.0f / coef;
+    }
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            const int i = y * pitch + x;
+            flight[i] = (lum[i] - orig1[i]) * coef;
+        }
+    }
+}
+
+/*
+ * transit_shapedetect_retinex()'s senstype-4 blend. origblur is the full-image
+ * 3/sk Gaussian, indexed at the image coordinate; the tool's own ROI copy is
+ * `work` and the normalised lightness difference `flight`. `lab` is updated
+ * in place. The block's `rL > 0.1` guard is a per-pixel switch the host takes
+ * on the blurred lightness.
+ */
+__kernel void rt_local_adjustments_reti_blend(
+    __global float* lab, __global const float* flight,
+    __global const float* blurL, __global const float* blurA,
+    __global const float* blurB, __global const float* rec,
+    const int lab_pitch, const int lab_plane, const int work_pitch,
+    const int blur_pitch, const int bfw, const int bfh, const int xstart,
+    const int ystart)
+{
+    const int rx = (int)get_global_id(0);
+    const int ry = (int)get_global_id(1);
+    if (rx >= bfw || ry >= bfh) {
+        return;
+    }
+    const int x = xstart + rx;
+    const int y = ystart + ry;
+    int zone = 0;
+    float localFactor = 1.0f;
+    const float ach = rec[RT_LA_TRANS] / 100.0f;
+    rt_la_transition((float)x, (float)y, ach, rec, &zone, &localFactor);
+    if (zone == 0) {
+        return;
+    }
+
+    const int ro = (ystart + ry) * blur_pitch + x;
+    const float ml = blurL[ro];
+    const float ma = blurA[ro];
+    const float mb = blurB[ro];
+    const float refa = rec[RT_LA_CHROMAREF] * cos(rec[RT_LA_HUEREF]) * 327.68f;
+    const float refb = rec[RT_LA_CHROMAREF] * sin(rec[RT_LA_HUEREF]) * 327.68f;
+    const float refL = rec[RT_LA_LUMAREF] * 327.68f;
+    const float chromaref = rec[RT_LA_CHROMAREF] * 327.68f;
+    const float abdelta2 = (refa - ma) * (refa - ma) +
+                           (refb - mb) * (refb - mb);
+    const float chroma2 = sqrt(ma * ma + mb * mb) - chromaref;
+    const float chrodelta2 = chroma2 * chroma2;
+    const float huedelta2 = abdelta2 - chrodelta2;
+    const float kL = rec[RT_LA_BALANCE] / (327.68f * 327.68f);
+    const float kab = rt_la_balancedeltaE(rec[RT_LA_BALANCE]) /
+                      (327.68f * 327.68f);
+    const float kH = rec[RT_LA_BALANCEH];
+    const float kch = rt_la_balancedeltaE(rec[RT_LA_BALANCEH]);
+    const float dE = sqrt(kab * (kch * chrodelta2 + kH * huedelta2) +
+                          kL * (refL - ml) * (refL - ml));
+    const float varsens = rec[RT_LA_SENSH];
+    const float thr = rec[RT_LA_THR];
+    const float mindE = 2.0f + RT_LA_MINSCOPE * varsens * thr;
+    const float maxdE = 5.0f + RT_LA_MAXSCOPE * varsens * (1.0f + 0.1f * thr);
+    const float mindElim = 2.0f + RT_LA_MINSCOPE * (float)RT_LA_LIMSCOPE * thr;
+    const float maxdElim =
+        5.0f + RT_LA_MAXSCOPE * (float)RT_LA_LIMSCOPE * (1.0f + 0.1f * thr);
+    float reducdE = rt_la_calcreducdE(
+        dE, maxdE, mindE, maxdElim, mindElim, rec[RT_LA_ITERAT],
+        RT_LA_LIMSCOPE, (int)varsens);
+    reducdE /= 100.0f;
+
+    const int index = ry * work_pitch + rx;
+    float cli = flight[index] * reducdE * (1.0f + rec[RT_LA_RETI_STRCLI]);
+
+    const float rL = ml / 327.68f;
+    if (rL > 0.1f) {
+        /* `bufexporig` is the ROI copy taken before MSRLocal(), and no mask
+         * is admitted, so its lightness equals the pixel's own and its
+         * chroma planes are untouched: the host's difa/difb are exactly
+         * zero and only the lightness blend writes the image. */
+        const int o = y * lab_pitch + x;
+        const float originalL = lab[o];
+        float diflc = originalL * (1.0f + cli) - originalL;
+        diflc *= localFactor;
+        lab[o] = fmin(fmax(originalL + diflc, 0.0f), 65535.0f);
     }
 }
 )CLC";

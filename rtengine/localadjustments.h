@@ -126,6 +126,10 @@ struct LocalAdjustmentsSpotParams {
     float repartm = 100.f;
     int senstm = 0;
     bool equtm = true;
+    /* Retinex. str is the block's lightness strength in percent, sensih the
+     * senstype-4/5 deltaE scope sensitivity (lp.sensh). */
+    float str = 0.f;
+    int sensih = 0;
 };
 
 } // namespace rtengine

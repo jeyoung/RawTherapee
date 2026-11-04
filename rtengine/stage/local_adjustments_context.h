@@ -47,15 +47,15 @@ struct ProcParams;
  * chroma/lightness/contrast sliders and
  * L/C/H curves, the vibrance tool, the shadows/highlights tool, the soft-light
  * tool, the Gaussian local-contrast tool, the local sharpening tool, the
- * local Blur & Noise tool (Gaussian and median arms), the deltaE scope, the
- * avoid-colour-shift Munsell method and the unconditional per-spot Lab-to-RGB
- * clamp. The block also applies the final Munsell pass and the clamp for an
- * inactive spot, so a block whose spots do no tool work is still a
- * clamp-only block.
+ * local Blur & Noise tool (Gaussian and median arms), the Retinex tool, the
+ * deltaE scope, the avoid-colour-shift Munsell method and the unconditional
+ * per-spot Lab-to-RGB clamp. The block also applies the final Munsell pass and
+ * the clamp for an inactive spot, so a block whose spots do no tool work is
+ * still a clamp-only block.
  *
  * The tools run in Lab_Local()'s order: log encoding, blur, tone mapping,
- * dehaze, CBDL, vibrance, shadows/highlights, soft light, local contrast,
- * local sharpening, then Colour & Light. The context is C-compatible because the ABI is. `self`
+ * dehaze, Retinex, CBDL, vibrance, shadows/highlights, soft light, local
+ * contrast, local sharpening, then Colour & Light. The context is C-compatible because the ABI is. `self`
  * points at the C++ object that owns the ProcParams, ImProcFunctions and
  * LabImage references, so the pointer must not outlive them.
  *
@@ -64,14 +64,14 @@ struct ProcParams;
  * small, known subset reaches the supported paths. Slots are named by the
  * RT_LOCAL_ADJUSTMENTS_SLOT_* constants and are written once per spot.
  */
-#define RT_LOCAL_ADJUSTMENTS_CONTEXT_VERSION 12u
+#define RT_LOCAL_ADJUSTMENTS_CONTEXT_VERSION 13u
 /* "LAJC": rejects a stale or unrelated pointer before any callback runs. */
 #define RT_LOCAL_ADJUSTMENTS_CONTEXT_MAGIC 0x4C414A43u
 /* The block has no bounded spot count, but a profile that carries more spots
  * than this is outside the device set and runs the host block. */
 #define RT_LOCAL_ADJUSTMENTS_MAX_SPOTS 64u
 /* Floats per spot record; the slot constants below must stay inside it. */
-#define RT_LOCAL_ADJUSTMENTS_SPOT_STRIDE 161u
+#define RT_LOCAL_ADJUSTMENTS_SPOT_STRIDE 280u
 /* A curve table is one LUTf of the block's own size. */
 #define RT_LOCAL_ADJUSTMENTS_LUT_ENTRIES 65536u
 /* Color::gammatab_srgb and Color::igammatab_srgb, the sRGB gamma pair the
@@ -391,6 +391,48 @@ struct ProcParams;
  * normalize_mean_dt()'s two double-precision reductions and its `a * data + b`
  * rescale. */
 #define RT_LOCAL_ADJUSTMENTS_SLOT_TM_EQUIL 160u
+/* Retinex. EXP_RETINEX is 1 when Lab_Local()'s call==2 arm runs: the tool on
+ * an active spot, a strength of at least 0.2 (the block's own gate), no
+ * explicit mask and an ROI of at least 5 px wide and more than 5 px tall.
+ * The device reproduces MSRLocal()'s multi-scale pass, its three mean/stdv
+ * reductions, both 501-entry transmission/gain tables and
+ * transit_shapedetect_retinex()'s senstype-4 and senstype-5 blends.
+ *
+ * Every scalar the host derives is exported: the block's strength and the
+ * `pow(strength, 0.4)` light/dark factor, the variance, the darkness and
+ * lightness multipliers, `limd ^ 1.7` and its reciprocal, the clip, the
+ * offset, the log/linear switch, the `pond` scale, the soft-radius-derived
+ * deltaE sensitivity, the `strcli` boost, the senstype-4 scope argument and
+ * the two curve-table offsets. RETI_BLUR_STAGES is the scale count and
+ * RT_LOCAL_ADJUSTMENTS_SLOT_RETI_BLUR_BASE the first of ten stages, each
+ * holding the box-blur iteration count and six host-computed radii in
+ * RT_LOCAL_ADJUSTMENTS_RETI_BLUR_STRIDE floats.
+ */
+#define RT_LOCAL_ADJUSTMENTS_SLOT_EXP_RETINEX 161u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_RETI_STRENGTH 162u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_RETI_SCALE 163u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_RETI_VART 164u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_RETI_DARK 165u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_RETI_LIGHT 166u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_RETI_VALUE 167u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_RETI_LIMD 168u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_RETI_ILIMD 169u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_RETI_CLIPTM 170u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_RETI_OFFS 171u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_RETI_LOGLIN 172u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_RETI_POND 173u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_RETI_SOFTRADIUS 174u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_RETI_STRCLI 175u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_RETI_SENSIBEFORE 176u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_RETI_GAIN_OFFSET 177u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_RETI_GAIN_ACTIVE 178u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_RETI_TRANS_OFFSET 179u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_RETI_TRANS_ACTIVE 180u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_RETI_BLUR_STAGES 181u
+/* The block's `strength = str / 100`, which intp() uses on the final blend. */
+#define RT_LOCAL_ADJUSTMENTS_SLOT_RETI_STR 182u
+/* Ten box-blur stages, each n + six radii, starting here. */
+#define RT_LOCAL_ADJUSTMENTS_SLOT_RETI_BLUR_BASE 200u
 
 /* deconvsharpeningloc() has two arms. Damping zero is the undamped RLD path:
  * the division/multiplication recurrence the output.sharpen core already
@@ -492,6 +534,44 @@ struct ProcParams;
  * weights, the five system diagonals and the six incomplete-Cholesky
  * diagonals. */
 #define RT_LOCAL_ADJUSTMENTS_TM_SCRATCH_PLANES 18
+
+/*
+ * Retinex. Lab_Local()'s call==2 arm requires `bfw >= mSP && bfh > mSP` with
+ * mSP = 5, and the scale count is the GUI's 1..10. `scalereti == 1` selects
+ * MSRLocal()'s separate contrast arm, which builds a DiagonalCurve from the
+ * ROI mean; that arm is a residual here, so the admitted range starts at two.
+ * A scale's Gaussian is the host's iterated box blur: at most six iterations,
+ * each with its own radius. The two curve tables are LocretigainCurve and
+ * LocretitransCurve, 501 entries each.
+ */
+#define RT_LOCAL_ADJUSTMENTS_RETI_MIN_ROI 5
+#define RT_LOCAL_ADJUSTMENTS_RETI_MAX_SCALES 10
+#define RT_LOCAL_ADJUSTMENTS_RETI_MAX_BOX_ITERATIONS 6
+#define RT_LOCAL_ADJUSTMENTS_RETI_BLUR_STRIDE 7
+#define RT_LOCAL_ADJUSTMENTS_RETI_GAIN_ENTRIES 501
+#define RT_LOCAL_ADJUSTMENTS_RETI_TRANS_ENTRIES 501
+/* The block's strength gate; a smaller non-zero strength is a no-op. */
+#define RT_LOCAL_ADJUSTMENTS_RETI_MIN_STRENGTH 0.2
+/* The GUI ranges of the Retinex sliders. */
+#define RT_LOCAL_ADJUSTMENTS_RETI_MAX_STRENGTH 100.0
+#define RT_LOCAL_ADJUSTMENTS_RETI_MIN_SCALE 2
+#define RT_LOCAL_ADJUSTMENTS_RETI_MAX_SCALE 10
+#define RT_LOCAL_ADJUSTMENTS_RETI_MIN_NEIGH 0.1
+#define RT_LOCAL_ADJUSTMENTS_RETI_MAX_NEIGH 1500.0
+#define RT_LOCAL_ADJUSTMENTS_RETI_MIN_VART 0.1
+#define RT_LOCAL_ADJUSTMENTS_RETI_MAX_VART 500.0
+#define RT_LOCAL_ADJUSTMENTS_RETI_MIN_LIMD 1.2
+#define RT_LOCAL_ADJUSTMENTS_RETI_MAX_LIMD 100.0
+#define RT_LOCAL_ADJUSTMENTS_RETI_MIN_CLIPTM 0.02
+#define RT_LOCAL_ADJUSTMENTS_RETI_MAX_CLIPTM 2.0
+#define RT_LOCAL_ADJUSTMENTS_RETI_MIN_DARKNESS 0.01
+#define RT_LOCAL_ADJUSTMENTS_RETI_MAX_DARKNESS 6.0
+#define RT_LOCAL_ADJUSTMENTS_RETI_MIN_LIGHTNESS 0.01
+#define RT_LOCAL_ADJUSTMENTS_RETI_MAX_LIGHTNESS 4.0
+#define RT_LOCAL_ADJUSTMENTS_RETI_MIN_OFFS (-16386.0)
+#define RT_LOCAL_ADJUSTMENTS_RETI_MAX_OFFS 32768.0
+#define RT_LOCAL_ADJUSTMENTS_RETI_MIN_SOFT_RADIUS 0.0
+#define RT_LOCAL_ADJUSTMENTS_RETI_MAX_SOFT_RADIUS 100.0
 
 typedef struct RtLocalAdjustmentsResult {
     /* spot_count RT_LOCAL_ADJUSTMENTS_SPOT_STRIDE floats, spot-major. */

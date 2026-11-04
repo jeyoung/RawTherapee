@@ -12928,6 +12928,18 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
         env, def, "rt_local_adjustments_dehaze_rgb2lab", error);
     cl_kernel tonemap_kernel = compiled_kernel_entry(
         env, def, "rt_local_adjustments_tonemap", error);
+    cl_kernel reti_prepare_kernel = compiled_kernel_entry(
+        env, def, "rt_local_adjustments_reti_prepare", error);
+    cl_kernel reti_accum_kernel = compiled_kernel_entry(
+        env, def, "rt_local_adjustments_reti_accum", error);
+    cl_kernel reti_stats_kernel = compiled_kernel_entry(
+        env, def, "rt_local_adjustments_reti_stats", error);
+    cl_kernel reti_gain_kernel = compiled_kernel_entry(
+        env, def, "rt_local_adjustments_reti_gain", error);
+    cl_kernel reti_diff_kernel = compiled_kernel_entry(
+        env, def, "rt_local_adjustments_reti_diff", error);
+    cl_kernel reti_blend_kernel = compiled_kernel_entry(
+        env, def, "rt_local_adjustments_reti_blend", error);
     cl_kernel cbdl_fill_kernel =
         compiled_kernel_entry(env, def, "rt_local_adjustments_cbdl_fill",
                               error);
@@ -12982,6 +12994,9 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
         dehaze_recover_kernel == nullptr ||
         dehaze_rgb2lab_kernel == nullptr ||
         tonemap_kernel == nullptr ||
+        reti_prepare_kernel == nullptr || reti_accum_kernel == nullptr ||
+        reti_stats_kernel == nullptr || reti_gain_kernel == nullptr ||
+        reti_diff_kernel == nullptr || reti_blend_kernel == nullptr ||
         cbdl_fill_kernel == nullptr || cbdl_copy_kernel == nullptr ||
         cbdl_finish_kernel == nullptr || cbdl_metric_kernel == nullptr ||
         cbdl_luma_kernel == nullptr || cbdl_chroma_kernel == nullptr ||
@@ -13165,6 +13180,17 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
     char log_orig_key = 0;
     char tone_map_fin_key = 0;
     char tone_map_scratch_key = 0;
+    char reti_reduc_key = 0;
+    char reti_orig1_key = 0;
+    char reti_src_key = 0;
+    char reti_out_key = 0;
+    char reti_lum_key = 0;
+    char reti_scratch_key = 0;
+    char reti_scratch2_key = 0;
+    char reti_flight_key = 0;
+    char reti_params_key = 0;
+    char reti_gain_key = 0;
+    char reti_trans_key = 0;
     char blur_keys[3] = {0, 0, 0};
     char lc_h_key = 0;
     char lc_v_key = 0;
@@ -13363,6 +13389,8 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
             rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXPBLUR] == 1.0f;
         const bool toneMapPass =
             rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXP_TONEMAP] == 1.0f;
+        const bool retinexPass =
+            rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXP_RETINEX] == 1.0f;
         const uint32_t shape =
             static_cast<uint32_t>(rec[RT_LOCAL_ADJUSTMENTS_SLOT_SHAPE]);
         const uint32_t avoid = static_cast<uint32_t>(
@@ -13390,6 +13418,8 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
             (rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXPBLUR] != 0.0f && !blurPass) ||
             (rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXP_TONEMAP] != 0.0f &&
              !toneMapPass) ||
+            (rec[RT_LOCAL_ADJUSTMENTS_SLOT_EXP_RETINEX] != 0.0f &&
+             !retinexPass) ||
             (rec[RT_LOCAL_ADJUSTMENTS_SLOT_MERGE] != 0.0f) ||
             (rec[RT_LOCAL_ADJUSTMENTS_SLOT_HRENABLED] != 0.0f) ||
             (rec[RT_LOCAL_ADJUSTMENTS_SLOT_REPARCOL] != 100.0f) ||
@@ -13919,6 +13949,62 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
                 error = "local.adjustments tone-map ROI is too large";
                 return RT_STAGE_FALLBACK;
             }
+            /* The block's Retinex arm needs mSP = 5 px wide and strictly
+             * more than 5 px tall; a smaller ROI is the host's no-op. */
+            if (retinexPass &&
+                (bfw < RT_LOCAL_ADJUSTMENTS_RETI_MIN_ROI ||
+                 bfh <= RT_LOCAL_ADJUSTMENTS_RETI_MIN_ROI)) {
+                error = "local.adjustments Retinex ROI is below the block's "
+                        "gate";
+                return RT_STAGE_FALLBACK;
+            }
+            if (retinexPass) {
+                const int stages = static_cast<int>(
+                    rec[RT_LOCAL_ADJUSTMENTS_SLOT_RETI_BLUR_STAGES]);
+                if (stages < 1 ||
+                    stages > static_cast<int>(
+                                 RT_LOCAL_ADJUSTMENTS_RETI_MAX_SCALES)) {
+                    error = "local.adjustments Retinex scale count is out of "
+                            "range";
+                    return RT_STAGE_FALLBACK;
+                }
+                for (int stage = 0; stage < stages; ++stage) {
+                    const int base =
+                        static_cast<int>(
+                            RT_LOCAL_ADJUSTMENTS_SLOT_RETI_BLUR_BASE) +
+                        stage * static_cast<int>(
+                                    RT_LOCAL_ADJUSTMENTS_RETI_BLUR_STRIDE);
+                    const int count = static_cast<int>(rec[base]);
+                    if (count < 0 ||
+                        count > static_cast<int>(
+                                    RT_LOCAL_ADJUSTMENTS_RETI_MAX_BOX_ITERATIONS)) {
+                        error = "local.adjustments Retinex blur stage is out "
+                                "of range";
+                        return RT_STAGE_FALLBACK;
+                    }
+                    for (int index = 0; index < 6; ++index) {
+                        const float radius = rec[base + 1 + index];
+                        if (radius < 0.0f || radius > (float)bfw ||
+                            radius > (float)bfh) {
+                            error = "local.adjustments Retinex blur radius is "
+                                    "out of range";
+                            return RT_STAGE_FALLBACK;
+                        }
+                        /* gauss.cc's boxblur() reads two radii of source
+                         * beyond the window centre, so the host reads past
+                         * the ROI when twice a radius does not fit inside
+                         * both axes. That out-of-bounds read is not a
+                         * reproducible value; such a spot stays on the
+                         * host. */
+                        if (2.0f * radius >= (float)bfw ||
+                            2.0f * radius >= (float)bfh) {
+                            error = "local.adjustments Retinex box blur leaves "
+                                    "the ROI";
+                            return RT_STAGE_FALLBACK;
+                        }
+                    }
+                }
+            }
         }
 
         /* The matrices, caches and Munsell tables are block-global. */
@@ -14038,6 +14124,16 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
             RT_LOCAL_ADJUSTMENTS_SLOT_VIB_SKIN_OFFSET,
             RT_LOCAL_ADJUSTMENTS_SLOT_VIB_SKIN_ACTIVE,
             RT_LOCAL_ADJUSTMENTS_LUT_ENTRIES, "skin", &skin_key);
+        StageDeviceBufferPtr reti_gain_device = table_slice(
+            RT_LOCAL_ADJUSTMENTS_SLOT_RETI_GAIN_OFFSET,
+            RT_LOCAL_ADJUSTMENTS_SLOT_RETI_GAIN_ACTIVE,
+            RT_LOCAL_ADJUSTMENTS_RETI_GAIN_ENTRIES, "Retinex gain",
+            &reti_gain_key);
+        StageDeviceBufferPtr reti_trans_device = table_slice(
+            RT_LOCAL_ADJUSTMENTS_SLOT_RETI_TRANS_OFFSET,
+            RT_LOCAL_ADJUSTMENTS_SLOT_RETI_TRANS_ACTIVE,
+            RT_LOCAL_ADJUSTMENTS_RETI_TRANS_ENTRIES, "Retinex transmission",
+            &reti_trans_key);
         StageDeviceBufferPtr sh_hl_device = table_slice(
             RT_LOCAL_ADJUSTMENTS_SLOT_SH_HL_OFFSET,
             RT_LOCAL_ADJUSTMENTS_SLOT_SH_HL_ACTIVE,
@@ -14061,7 +14157,8 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
                 static_cast<int>(RT_LOCAL_ADJUSTMENTS_CBDL_LUT_ENTRIES),
             "CBDL chroma", &cbdl_chroma_key);
         if (!light_device || !satur_device || !saturmoins_device ||
-            !skin_device || !sh_hl_device || !sh_sh_device ||
+            !skin_device || !reti_gain_device || !reti_trans_device ||
+            !sh_hl_device || !sh_sh_device ||
             !cbdl_luma_device || !cbdl_chroma_device) {
             return RT_STAGE_FALLBACK;
         }
@@ -14153,7 +14250,7 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
              * radius. The two passes share the buffer and recompute it from the
              * image as each pass starts.
              */
-            if (sharpenPass || blurPass) {
+            if (sharpenPass || blurPass || retinexPass) {
                 for (int plane = 0; plane < 3; ++plane) {
                     sharpen_blur_device[plane] = residency->acquire(
                         &sharpen_blur_keys[plane],
@@ -14164,6 +14261,43 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
                     &sharpen_blur_tmp_key,
                     StageBufferShape{RT_STAGE_F32, width, height, 1},
                     &error);
+            }
+            /*
+             * Retinex's ROI scratch: the deltaE reductions, the original
+             * lightness, the log source, the blur iterate, the accumulator,
+             * the box-blur ping-pong plane, the normalised lightness
+             * difference and the ten-float statistics buffer.
+             */
+            StageDeviceBufferPtr reti_reduc_device;
+            StageDeviceBufferPtr reti_orig1_device;
+            StageDeviceBufferPtr reti_src_device;
+            StageDeviceBufferPtr reti_out_device;
+            StageDeviceBufferPtr reti_lum_device;
+            StageDeviceBufferPtr reti_box_device;
+            StageDeviceBufferPtr reti_box2_device;
+            StageDeviceBufferPtr reti_flight_device;
+            StageDeviceBufferPtr reti_params_device;
+            if (retinexPass) {
+                const StageBufferShape reti_plane{RT_STAGE_F32, bfw, bfh, 1};
+                reti_reduc_device = residency->acquire(
+                    &reti_reduc_key, reti_plane, &error);
+                reti_orig1_device = residency->acquire(
+                    &reti_orig1_key, reti_plane, &error);
+                reti_src_device = residency->acquire(
+                    &reti_src_key, reti_plane, &error);
+                reti_out_device = residency->acquire(
+                    &reti_out_key, reti_plane, &error);
+                reti_lum_device = residency->acquire(
+                    &reti_lum_key, reti_plane, &error);
+                reti_box_device = residency->acquire(
+                    &reti_scratch_key, reti_plane, &error);
+                reti_box2_device = residency->acquire(
+                    &reti_scratch2_key, reti_plane, &error);
+                reti_flight_device = residency->acquire(
+                    &reti_flight_key, reti_plane, &error);
+                reti_params_device = residency->acquire(
+                    &reti_params_key,
+                    StageBufferShape{RT_STAGE_F32, 16, 1, 1}, &error);
             }
             StageDeviceBufferPtr log_orig_device;
             if (logPass) {
@@ -14456,7 +14590,7 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
             int sharpen_pitch = 0;
             int sharpen_plane = 0;
             int sharpen_blur_pitch = 0;
-            if (sharpenPass || blurPass) {
+            if (sharpenPass || blurPass || retinexPass) {
                 sharpen_blur_pitch = int_pitch(
                     pitch_of(sharpen_blur_device[0]), "scope blur");
                 if (sharpen_blur_pitch < 0 ||
@@ -14606,7 +14740,7 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
                 sharpenPass ? memory_of(sharpen_tmp_device) : nullptr;
             cl_mem sharpen_blur_memory[3] = {};
             cl_mem sharpen_blur_tmp_memory = nullptr;
-            if (sharpenPass || blurPass) {
+            if (sharpenPass || blurPass || retinexPass) {
                 for (int plane = 0; plane < 3; ++plane) {
                     sharpen_blur_memory[plane] =
                         memory_of(sharpen_blur_device[plane]);
@@ -15116,6 +15250,39 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
                                            factors, error)) {
                         error = "local.adjustments scope reference blur "
                                 "failed";
+                        return false;
+                    }
+                }
+                return true;
+            };
+
+            /*
+             * The Retinex blend's deltaE reference is gaussianBlur() at
+             * 3 / sk over the full image, the same sigma the other tools use
+             * for their ROI copy. It runs through the lab.tools IIR line
+             * kernel with the host's SSE coefficients and its remainder-line
+             * split, so the image borders and the last rows match the host.
+             */
+            const auto full_iir_blur = [&]() -> bool {
+                const RtLabToolsIir& iir = *setup.iir_vibrance;
+                const cl_int horizontal_lines = height - (height % 4);
+                const cl_int vertical_lines = width - (width % 8);
+                cl_mem src = memory_of(image);
+                for (int plane = 0; plane < 3; ++plane) {
+                    cl_mem dst = sharpen_blur_memory[plane];
+                    const cl_int base = plane * lab_plane;
+                    if (!run_line(line_kernel, src, sharpen_blur_tmp_memory,
+                                  sharpen_blur_tmp_memory, width, height,
+                                  lab_pitch, sharpen_blur_pitch, 1, 1, base,
+                                  0, 0, horizontal_lines, iir.horizontal,
+                                  "Retinex scope blur") ||
+                        !run_line(line_kernel, sharpen_blur_tmp_memory, dst,
+                                  sharpen_blur_tmp_memory, height, width, 1, 1,
+                                  sharpen_blur_pitch, sharpen_blur_pitch, 0, 0,
+                                  0, vertical_lines, iir.vertical,
+                                  "Retinex scope blur")) {
+                        error = "local.adjustments Retinex scope reference "
+                                "blur failed";
                         return false;
                     }
                 }
@@ -16325,6 +16492,384 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
                 if (!run_blend("dehaze",
                                rec[RT_LOCAL_ADJUSTMENTS_SLOT_SENSH])) {
                     return RT_STAGE_FALLBACK;
+                }
+            }
+
+            /*
+             * Retinex. Lab_Local()'s call==2 arm copies the ROI, builds the
+             * pre-MSR deltaE reduction, runs MSRLocal() over at least two
+             * scales and blends with transit_shapedetect_retinex()'s
+             * senstype-4 arm. Each scale is a host-geometry iterated box blur
+             * (`gaussianBlur(..., useBoxBlur = true)`), followed by the
+             * darkness/lightness step at scale one and the log or linear
+             * accumulation. The three mean/stdv reductions and the two 501
+             * entry curve tables follow the host's arithmetic; the blend's
+             * deltaE reference is the full-image 3/sk Gaussian, shared with
+             * the other tools' scope blur.
+             */
+            if (retinexPass) {
+                if (!full_iir_blur()) {
+                    return RT_STAGE_FALLBACK;
+                }
+                cl_mem reti_reduc_memory = memory_of(reti_reduc_device);
+                cl_mem reti_orig1_memory = memory_of(reti_orig1_device);
+                cl_mem reti_src_memory = memory_of(reti_src_device);
+                cl_mem reti_out_memory = memory_of(reti_out_device);
+                cl_mem reti_lum_memory = memory_of(reti_lum_device);
+                cl_mem reti_box_memory = memory_of(reti_box_device);
+                cl_mem reti_box2_memory = memory_of(reti_box2_device);
+                cl_mem reti_flight_memory = memory_of(reti_flight_device);
+                cl_mem reti_params_memory = memory_of(reti_params_device);
+                const int reti_pitch =
+                    int_pitch(pitch_of(reti_out_device), "Retinex");
+                const int reti_plane =
+                    int_pitch(plane_pitch_of(work_device), "Retinex plane");
+                const int reti_work_pitch =
+                    int_pitch(pitch_of(work_device), "Retinex work");
+                cl_mem work_memory = memory_of(work_device);
+                if (reti_pitch < 0 || reti_plane < 0 ||
+                    reti_work_pitch < 0 || work_memory == nullptr ||
+                    reti_reduc_memory == nullptr ||
+                    reti_orig1_memory == nullptr ||
+                    reti_src_memory == nullptr ||
+                    reti_out_memory == nullptr ||
+                    reti_lum_memory == nullptr ||
+                    reti_box_memory == nullptr ||
+                    reti_box2_memory == nullptr ||
+                    reti_flight_memory == nullptr ||
+                    reti_params_memory == nullptr ||
+                    pitch_of(work_device) != pitch_of(reti_out_device) ||
+                    (pitch_of(reti_reduc_device) !=
+                         pitch_of(reti_out_device) ||
+                     pitch_of(reti_orig1_device) !=
+                         pitch_of(reti_out_device) ||
+                     pitch_of(reti_src_device) !=
+                         pitch_of(reti_out_device) ||
+                     pitch_of(reti_lum_device) !=
+                         pitch_of(reti_out_device) ||
+                     pitch_of(reti_box_device) !=
+                         pitch_of(reti_out_device) ||
+                     pitch_of(reti_box2_device) !=
+                         pitch_of(reti_out_device) ||
+                     pitch_of(reti_flight_device) !=
+                         pitch_of(reti_out_device))) {
+                    error = "local.adjustments Retinex buffers are invalid";
+                    return RT_STAGE_FALLBACK;
+                }
+                {
+                    cl_uint arg = 0;
+                    cl_mem lab_memory = memory_of(image);
+                    cl_mem record_memory = memory_of(record_device);
+                    cl_int lp = lab_pitch;
+                    cl_int lpl = lab_plane;
+                    cl_int wp = reti_pitch;
+                    cl_int wpl = reti_plane;
+                    cl_int x0 = xstart;
+                    cl_int y0 = ystart;
+                    cl_int rw = bfw;
+                    cl_int rh = bfh;
+                    bool ok = true;
+                    ok = ok && set(reti_prepare_kernel, arg++, sizeof(cl_mem),
+                                   &lab_memory);
+                    ok = ok && set(reti_prepare_kernel, arg++, sizeof(cl_mem),
+                                   &work_memory);
+                    ok = ok && set(reti_prepare_kernel, arg++, sizeof(cl_mem),
+                                   &reti_reduc_memory);
+                    ok = ok && set(reti_prepare_kernel, arg++, sizeof(cl_mem),
+                                   &reti_orig1_memory);
+                    ok = ok && set(reti_prepare_kernel, arg++, sizeof(cl_mem),
+                                   &reti_src_memory);
+                    ok = ok && set(reti_prepare_kernel, arg++, sizeof(cl_mem),
+                                   &reti_lum_memory);
+                    ok = ok && set(reti_prepare_kernel, arg++, sizeof(cl_mem),
+                                   &record_memory);
+                    ok = ok && set(reti_prepare_kernel, arg++, sizeof(cl_int),
+                                   &lp);
+                    ok = ok && set(reti_prepare_kernel, arg++, sizeof(cl_int),
+                                   &lpl);
+                    ok = ok && set(reti_prepare_kernel, arg++, sizeof(cl_int),
+                                   &wp);
+                    ok = ok && set(reti_prepare_kernel, arg++, sizeof(cl_int),
+                                   &wpl);
+                    ok = ok && set(reti_prepare_kernel, arg++, sizeof(cl_int),
+                                   &x0);
+                    ok = ok && set(reti_prepare_kernel, arg++, sizeof(cl_int),
+                                   &y0);
+                    ok = ok && set(reti_prepare_kernel, arg++, sizeof(cl_int),
+                                   &rw);
+                    ok = ok && set(reti_prepare_kernel, arg++, sizeof(cl_int),
+                                   &rh);
+                    if (!ok ||
+                        !launch2d(reti_prepare_kernel,
+                                  static_cast<std::size_t>(bfw),
+                                  static_cast<std::size_t>(bfh),
+                                  "Retinex prepare")) {
+                        error = "local.adjustments Retinex prepare failed";
+                        return RT_STAGE_FALLBACK;
+                    }
+                }
+
+                const int reti_stages = static_cast<int>(
+                    rec[RT_LOCAL_ADJUSTMENTS_SLOT_RETI_BLUR_STAGES]);
+                const int reti_scale_one_stage = reti_stages - 2;
+                const auto reti_box =
+                    [&](cl_mem src, cl_mem dst, cl_int radius_value) -> bool {
+                    cl_uint arg = 0;
+                    bool ok = true;
+                    ok = ok && set(sh_box_h_kernel, arg++, sizeof(cl_mem),
+                                   &src);
+                    ok = ok && set(sh_box_h_kernel, arg++, sizeof(cl_mem),
+                                   &reti_box2_memory);
+                    ok = ok && set(sh_box_h_kernel, arg++, sizeof(cl_int),
+                                   &radius_value);
+                    cl_int bw = bfw;
+                    cl_int bh = bfh;
+                    cl_int bp = reti_pitch;
+                    ok = ok && set(sh_box_h_kernel, arg++, sizeof(cl_int), &bw);
+                    ok = ok && set(sh_box_h_kernel, arg++, sizeof(cl_int), &bh);
+                    ok = ok && set(sh_box_h_kernel, arg++, sizeof(cl_int), &bp);
+                    if (!ok ||
+                        !launch2d(sh_box_h_kernel, 1,
+                                  static_cast<std::size_t>(bfh),
+                                  "Retinex horizontal box blur")) {
+                        return false;
+                    }
+                    arg = 0;
+                    ok = true;
+                    ok = ok && set(sh_box_v_kernel, arg++, sizeof(cl_mem),
+                                   &reti_box2_memory);
+                    ok = ok && set(sh_box_v_kernel, arg++, sizeof(cl_mem),
+                                   &dst);
+                    ok = ok && set(sh_box_v_kernel, arg++, sizeof(cl_int),
+                                   &radius_value);
+                    ok = ok && set(sh_box_v_kernel, arg++, sizeof(cl_int), &bw);
+                    ok = ok && set(sh_box_v_kernel, arg++, sizeof(cl_int), &bh);
+                    ok = ok && set(sh_box_v_kernel, arg++, sizeof(cl_int), &bp);
+                    if (!ok) {
+                        return false;
+                    }
+                    return launch2d(sh_box_v_kernel,
+                                    static_cast<std::size_t>(bfw), 1,
+                                    "Retinex vertical box blur");
+                };
+
+                for (int stage = 0; stage < reti_stages; ++stage) {
+                    const int base =
+                        static_cast<int>(
+                            RT_LOCAL_ADJUSTMENTS_SLOT_RETI_BLUR_BASE) +
+                        stage * static_cast<int>(
+                                    RT_LOCAL_ADJUSTMENTS_RETI_BLUR_STRIDE);
+                    const int count = static_cast<int>(rec[base]);
+                    if (stage == 0) {
+                        /* The first scale blurs `src` into `out`; every later
+                         * one blurs the previous `out` in place. */
+                        cl_uint arg = 0;
+                        cl_int src_plane = 0;
+                        cl_int src_pitch = reti_pitch;
+                        cl_int dst_plane = 0;
+                        cl_int dst_pitch = reti_pitch;
+                        cl_int w = bfw;
+                        cl_int h = bfh;
+                        bool ok = true;
+                        ok = ok && set(plane_copy_kernel, arg++,
+                                       sizeof(cl_mem), &reti_src_memory);
+                        ok = ok && set(plane_copy_kernel, arg++,
+                                       sizeof(cl_mem), &reti_out_memory);
+                        ok = ok && set(plane_copy_kernel, arg++,
+                                       sizeof(cl_int), &src_plane);
+                        ok = ok && set(plane_copy_kernel, arg++,
+                                       sizeof(cl_int), &src_pitch);
+                        ok = ok && set(plane_copy_kernel, arg++,
+                                       sizeof(cl_int), &dst_plane);
+                        ok = ok && set(plane_copy_kernel, arg++,
+                                       sizeof(cl_int), &dst_pitch);
+                        ok = ok && set(plane_copy_kernel, arg++,
+                                       sizeof(cl_int), &w);
+                        ok = ok && set(plane_copy_kernel, arg++,
+                                       sizeof(cl_int), &h);
+                        if (!ok ||
+                            !launch2d(plane_copy_kernel,
+                                      static_cast<std::size_t>(bfw),
+                                      static_cast<std::size_t>(bfh),
+                                      "Retinex source copy")) {
+                            error = "local.adjustments Retinex source copy "
+                                    "failed";
+                            return RT_STAGE_FALLBACK;
+                        }
+                    }
+                    for (int index = 0; index < count; ++index) {
+                        const cl_int radius = static_cast<cl_int>(
+                            rec[base + 1 + index]);
+                        if (radius <= 0) {
+                            continue;
+                        }
+                        if (!reti_box(reti_out_memory, reti_out_memory,
+                                      radius)) {
+                            error = "local.adjustments Retinex blur failed";
+                            return RT_STAGE_FALLBACK;
+                        }
+                    }
+                    cl_uint arg = 0;
+                    cl_mem record_memory = memory_of(record_device);
+                    cl_int rw = bfw;
+                    cl_int rh = bfh;
+                    cl_int scale_one = stage == reti_scale_one_stage ? 1 : 0;
+                    bool ok = true;
+                    ok = ok && set(reti_accum_kernel, arg++, sizeof(cl_mem),
+                                   &reti_lum_memory);
+                    ok = ok && set(reti_accum_kernel, arg++, sizeof(cl_mem),
+                                   &reti_src_memory);
+                    ok = ok && set(reti_accum_kernel, arg++, sizeof(cl_mem),
+                                   &reti_out_memory);
+                    ok = ok && set(reti_accum_kernel, arg++, sizeof(cl_mem),
+                                   &record_memory);
+                    ok = ok && set(reti_accum_kernel, arg++, sizeof(cl_int),
+                                   &reti_pitch);
+                    ok = ok && set(reti_accum_kernel, arg++, sizeof(cl_int),
+                                   &rw);
+                    ok = ok && set(reti_accum_kernel, arg++, sizeof(cl_int),
+                                   &rh);
+                    ok = ok && set(reti_accum_kernel, arg++, sizeof(cl_int),
+                                   &scale_one);
+                    if (!ok ||
+                        !launch2d(reti_accum_kernel,
+                                  static_cast<std::size_t>(bfw),
+                                  static_cast<std::size_t>(bfh),
+                                  "Retinex accumulate")) {
+                        error = "local.adjustments Retinex accumulate failed";
+                        return RT_STAGE_FALLBACK;
+                    }
+                }
+
+                /*
+                 * `lum` is MSRLocal()'s `orig` and `orig1` the untouched
+                 * lightness the final intp() blends towards.
+                 */
+                {
+                    cl_uint arg = 0;
+                    cl_mem record_memory = memory_of(record_device);
+                    cl_mem trans_memory = memory_of(reti_trans_device);
+                    cl_mem gain_memory = memory_of(reti_gain_device);
+                    cl_int rw = bfw;
+                    cl_int rh = bfh;
+                    bool ok = true;
+                    ok = ok && set(reti_stats_kernel, arg++, sizeof(cl_mem),
+                                   &reti_lum_memory);
+                    ok = ok && set(reti_stats_kernel, arg++, sizeof(cl_mem),
+                                   &record_memory);
+                    ok = ok && set(reti_stats_kernel, arg++, sizeof(cl_mem),
+                                   &trans_memory);
+                    ok = ok && set(reti_stats_kernel, arg++, sizeof(cl_mem),
+                                   &reti_params_memory);
+                    ok = ok && set(reti_stats_kernel, arg++, sizeof(cl_int),
+                                   &reti_pitch);
+                    ok = ok && set(reti_stats_kernel, arg++, sizeof(cl_int),
+                                   &rw);
+                    ok = ok && set(reti_stats_kernel, arg++, sizeof(cl_int),
+                                   &rh);
+                    if (!ok || !launch1d(reti_stats_kernel, 1,
+                                         "Retinex statistics")) {
+                        error = "local.adjustments Retinex statistics failed";
+                        return RT_STAGE_FALLBACK;
+                    }
+                    arg = 0;
+                    ok = true;
+                    ok = ok && set(reti_gain_kernel, arg++, sizeof(cl_mem),
+                                   &reti_lum_memory);
+                    ok = ok && set(reti_gain_kernel, arg++, sizeof(cl_mem),
+                                   &reti_reduc_memory);
+                    ok = ok && set(reti_gain_kernel, arg++, sizeof(cl_mem),
+                                   &reti_orig1_memory);
+                    ok = ok && set(reti_gain_kernel, arg++, sizeof(cl_mem),
+                                   &record_memory);
+                    ok = ok && set(reti_gain_kernel, arg++, sizeof(cl_mem),
+                                   &gain_memory);
+                    ok = ok && set(reti_gain_kernel, arg++, sizeof(cl_mem),
+                                   &reti_params_memory);
+                    ok = ok && set(reti_gain_kernel, arg++, sizeof(cl_int),
+                                   &reti_pitch);
+                    ok = ok && set(reti_gain_kernel, arg++, sizeof(cl_int),
+                                   &rw);
+                    ok = ok && set(reti_gain_kernel, arg++, sizeof(cl_int),
+                                   &rh);
+                    if (!ok ||
+                        !launch2d(reti_gain_kernel,
+                                  static_cast<std::size_t>(bfw),
+                                  static_cast<std::size_t>(bfh),
+                                  "Retinex gain")) {
+                        error = "local.adjustments Retinex gain failed";
+                        return RT_STAGE_FALLBACK;
+                    }
+                    /* The least-squares deltaE scope in the host reads the
+                     * chroma planes of the ROI copy; the source plane is
+                     * work's L. */
+                    arg = 0;
+                    ok = true;
+                    ok = ok && set(reti_diff_kernel, arg++, sizeof(cl_mem),
+                                   &reti_lum_memory);
+                    ok = ok && set(reti_diff_kernel, arg++, sizeof(cl_mem),
+                                   &work_memory);
+                    ok = ok && set(reti_diff_kernel, arg++, sizeof(cl_mem),
+                                   &reti_flight_memory);
+                    ok = ok && set(reti_diff_kernel, arg++, sizeof(cl_int),
+                                   &reti_pitch);
+                    ok = ok && set(reti_diff_kernel, arg++, sizeof(cl_int),
+                                   &rw);
+                    ok = ok && set(reti_diff_kernel, arg++, sizeof(cl_int),
+                                   &rh);
+                    if (!ok || !launch1d(reti_diff_kernel, 1,
+                                         "Retinex difference")) {
+                        error = "local.adjustments Retinex difference failed";
+                        return RT_STAGE_FALLBACK;
+                    }
+                    arg = 0;
+                    ok = true;
+                    cl_mem lab_memory = memory_of(image);
+                    cl_mem record_memory2 = memory_of(record_device);
+                    cl_int lab_pitch_value = lab_pitch;
+                    cl_int lab_plane_value = lab_plane;
+                    cl_mem blur_l = sharpen_blur_memory[0];
+                    cl_mem blur_a = sharpen_blur_memory[1];
+                    cl_mem blur_b = sharpen_blur_memory[2];
+                    cl_int bp = sharpen_blur_pitch;
+                    cl_int x0 = xstart;
+                    cl_int y0 = ystart;
+                    ok = ok && set(reti_blend_kernel, arg++, sizeof(cl_mem),
+                                   &lab_memory);
+                    ok = ok && set(reti_blend_kernel, arg++, sizeof(cl_mem),
+                                   &reti_flight_memory);
+                    ok = ok && set(reti_blend_kernel, arg++, sizeof(cl_mem),
+                                   &blur_l);
+                    ok = ok && set(reti_blend_kernel, arg++, sizeof(cl_mem),
+                                   &blur_a);
+                    ok = ok && set(reti_blend_kernel, arg++, sizeof(cl_mem),
+                                   &blur_b);
+                    ok = ok && set(reti_blend_kernel, arg++, sizeof(cl_mem),
+                                   &record_memory2);
+                    ok = ok && set(reti_blend_kernel, arg++, sizeof(cl_int),
+                                   &lab_pitch_value);
+                    ok = ok && set(reti_blend_kernel, arg++, sizeof(cl_int),
+                                   &lab_plane_value);
+                    ok = ok && set(reti_blend_kernel, arg++, sizeof(cl_int),
+                                   &reti_work_pitch);
+                    ok = ok && set(reti_blend_kernel, arg++, sizeof(cl_int),
+                                   &bp);
+                    ok = ok && set(reti_blend_kernel, arg++, sizeof(cl_int),
+                                   &rw);
+                    ok = ok && set(reti_blend_kernel, arg++, sizeof(cl_int),
+                                   &rh);
+                    ok = ok && set(reti_blend_kernel, arg++, sizeof(cl_int),
+                                   &x0);
+                    ok = ok && set(reti_blend_kernel, arg++, sizeof(cl_int),
+                                   &y0);
+                    if (!ok ||
+                        !launch2d(reti_blend_kernel,
+                                  static_cast<std::size_t>(bfw),
+                                  static_cast<std::size_t>(bfh),
+                                  "Retinex blend")) {
+                        error = "local.adjustments Retinex blend failed";
+                        return RT_STAGE_FALLBACK;
+                    }
                 }
             }
 
