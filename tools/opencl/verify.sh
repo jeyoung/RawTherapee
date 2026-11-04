@@ -263,6 +263,8 @@ quick() {
         "$ROOT/devnotes/opencl/pp3/crop.pp3" crop
     run_stage_device "pef/stage-device-gamut" \
         "$ROOT/devnotes/opencl/pp3/gamut.pp3" gamut
+    run_stage_device "pef/stage-device-ciecam" \
+        "$ROOT/devnotes/opencl/pp3/ciecam.pp3" ciecam
     run_stage_device "pef/stage-device-sharpen" \
         "$ROOT/devnotes/opencl/pp3/sharpen-usm.pp3" output.sharpen
     run_stage_device "pef/stage-device-sharpen-rld" \
@@ -283,6 +285,8 @@ quick() {
         "$ROOT/devnotes/opencl/pp3/working-trc.pp3" working.trc
     run_stage_host "pef/stage-host-working-trc-residual" \
         "$ROOT/devnotes/opencl/pp3/working-trc-residual.pp3" working.trc
+    run_stage_host "pef/stage-host-ciecam-residual" \
+        "$ROOT/devnotes/opencl/pp3/ciecam-residual.pp3" ciecam
     run_stage_device "pef/stage-device-lab-tools-sh" \
         "$ROOT/devnotes/opencl/pp3/labtools-sh.pp3" lab.tools
     run_stage_device "pef/stage-device-lab-tools-toning" \
@@ -692,6 +696,8 @@ stage_device() {
         "$ROOT/devnotes/opencl/pp3/crop.pp3" crop
     run_stage_device "pef/stage-device-gamut" \
         "$ROOT/devnotes/opencl/pp3/gamut.pp3" gamut
+    run_stage_device "pef/stage-device-ciecam" \
+        "$ROOT/devnotes/opencl/pp3/ciecam.pp3" ciecam
     run_stage_device "pef/stage-device-sharpen" \
         "$ROOT/devnotes/opencl/pp3/sharpen-usm.pp3" output.sharpen
     run_stage_device "pef/stage-device-sharpen-rld" \
@@ -702,6 +708,8 @@ stage_device() {
         "$ROOT/devnotes/opencl/pp3/working-trc.pp3" working.trc
     run_stage_host "pef/stage-host-working-trc-residual" \
         "$ROOT/devnotes/opencl/pp3/working-trc-residual.pp3" working.trc
+    run_stage_host "pef/stage-host-ciecam-residual" \
+        "$ROOT/devnotes/opencl/pp3/ciecam-residual.pp3" ciecam
     run_stage_device "pef/stage-device-lab-tools-sh" \
         "$ROOT/devnotes/opencl/pp3/labtools-sh.pp3" lab.tools
     run_stage_device "pef/stage-device-lab-tools-toning" \

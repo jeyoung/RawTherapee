@@ -1,0 +1,15 @@
+[Color appearance]
+Enabled=true
+ModelCat=02
+CatCat=clas
+Algorithm=ALL
+Surrsrc=Average
+Surround=Average
+AutoAdapscen=true
+Autoybscen=true
+J-Light=12
+J-Contrast=18
+Q-Bright=8
+Q-Contrast=14
+H-Hue=10
+Gamut=true

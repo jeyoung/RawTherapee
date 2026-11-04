@@ -27,6 +27,7 @@
 #include "utils.h"
 #include "stage/algorithms/gamut_cl.h"
 #include "stage/algorithms/sharpen_cl.h"
+#include "stage/ciecam_context.h"
 #include "stage/lab_tools_context.h"
 #include "stage/lab_sharpening_context.h"
 #include "stage/lab_wavelet_context.h"
@@ -3424,6 +3425,260 @@ void test_gamut(bool available)
                       square_untouched.max_abs == 0.0,
                   "a refused 3x3 table leaves the Lab buffer untouched");
         }
+    }
+}
+
+/* ------------------------------------------------------------ ciecam node */
+
+struct CiecamCurves {
+    rtengine::ColorAppearance curve1;
+    rtengine::ColorAppearance curvered;
+    rtengine::ColorAppearance curvegreen;
+    rtengine::ColorAppearance curveblue;
+    rtengine::ColorAppearance curve2;
+    rtengine::ColorAppearance curve3;
+};
+
+void build_ciecam_curves(const rtengine::procparams::ProcParams& params,
+                         CiecamCurves& curves)
+{
+    LUTu hist;
+    LUTu histC;
+    LUTu dummy;
+    rtengine::CurveFactory::curveLightBrightColor(
+        params.colorappearance.curve, params.colorappearance.curvered,
+        params.colorappearance.curvegreen, params.colorappearance.curveblue,
+        params.colorappearance.curve2, params.colorappearance.curve3, hist,
+        dummy, histC, dummy, curves.curve1, curves.curvered,
+        curves.curvegreen, curves.curveblue, curves.curve2, curves.curve3, 1);
+}
+
+struct CiecamCase {
+    const char* label;
+    int width;
+    int height;
+    const char* algo;
+    const char* surrsrc;
+    const char* surround;
+    bool autoybscen;
+    int ybscen;
+    double jlight;
+    double contrast;
+    double qbright;
+    double qcontrast;
+    double colorh;
+    double chroma;
+    double schroma;
+    double mchroma;
+    bool gamut;
+    /* The configuration belongs to the device set. */
+    bool configSupported;
+};
+
+/*
+ * The production host block, the device node and the call-site contract.
+ *
+ * The supported cases cover the four algorithm arms, the two surround
+ * classifications, explicit and automatic scene grey, the tone, hue and
+ * colourfulness controls, the optional Lab gamut control and a padded width.
+ * The final Lab is compared within one LSB16. A residual must be refused by
+ * the launcher and executed by the host builtin, byte for byte.
+ */
+void test_ciecam(bool available)
+{
+    using namespace rtengine::stage;
+
+    init_lab_caches();
+
+    static rtengine::Settings test_settings{};
+    rtengine::settings = &test_settings;
+    /* Force the host block's histogram pass so its brightness tables are
+     * built from the same input as the device context. */
+    test_settings.viewinggreySc = 1;
+    test_settings.autocielab = false;
+
+    {
+        rtengine::procparams::ProcParams defaults;
+        CiecamCurves curves;
+        build_ciecam_curves(defaults, curves);
+        check(!ciecamSupported(defaults, curves.curve1, curves.curvered,
+                               curves.curvegreen, curves.curveblue,
+                               curves.curve2, curves.curve3),
+              "ciecam refuses a disabled block");
+    }
+
+    const CiecamCase cases[] = {
+        {"average JC", 68, 16, "JC", "Average", "Average", false, 18, 0, 0, 0, 0, 0, 0, 0, 0, false, true},
+        {"dim JS", 68, 16, "JS", "Dim", "Dim", false, 18, 0, 0, 0, 0, 0, 0, 0, 0, false, true},
+        {"dark QM", 68, 16, "QM", "Dark", "Dark", false, 18, 0, 0, 0, 0, 0, 0, 0, 0, false, true},
+        {"extremely dark ALL", 68, 16, "ALL", "ExtremelyDark", "ExtremelyDark", false, 18, 0, 0, 0, 0, 0, 0, 0, 0, false, true},
+        {"tone JC", 68, 16, "JC", "Average", "Average", false, 18, 25, 40, 15, 50, 0, 0, 0, 0, false, true},
+        {"hue ALL", 68, 16, "ALL", "Average", "Average", false, 18, 0, 0, 0, 0, 30, 0, 0, 0, false, true},
+        {"colourfulness residual", 68, 16, "ALL", "Average", "Average", false, 18, 0, 0, 0, 0, 0, 20, 30, 40, false, false},
+        {"gamut JC", 68, 16, "JC", "Average", "Average", false, 18, 0, 0, 0, 0, 0, 0, 0, 0, true, true},
+        {"automatic grey", 64, 16, "ALL", "Average", "Average", true, 18, 0, 0, 0, 0, 0, 0, 0, 0, false, true},
+        {"odd width ALL", 179, 17, "ALL", "Average", "Average", false, 18, 10, 20, 10, 20, -20, 0, 0, 0, false, true},
+        {"cam16 residual", 68, 16, "JC", "Average", "Average", false, 18, 0, 0, 0, 0, 0, 0, 0, 0, false, false},
+        {"tone map residual", 68, 16, "JC", "Average", "Average", false, 18, 0, 0, 0, 0, 0, 0, 0, 0, false, false},
+    };
+
+    if (!available) {
+        skip("ciecam: no OpenCL device");
+        return;
+    }
+    check(node_has_device_implementation("ciecam"),
+          "the ciecam node has a device implementation");
+
+    const std::string profile_path =
+        std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp") +
+        "/stage-residency-ciecam.jsonl";
+
+    for (const CiecamCase& item : cases) {
+        rtengine::procparams::ProcParams params;
+        params.colorappearance.enabled = true;
+        params.colorappearance.modelmethod = "02";
+        params.colorappearance.algo = item.algo;
+        params.colorappearance.surrsrc = item.surrsrc;
+        params.colorappearance.surround = item.surround;
+        params.colorappearance.autoybscen = item.autoybscen;
+        params.colorappearance.ybscen = item.ybscen;
+        params.colorappearance.jlight = item.jlight;
+        params.colorappearance.contrast = item.contrast;
+        params.colorappearance.qbright = item.qbright;
+        params.colorappearance.qcontrast = item.qcontrast;
+        params.colorappearance.colorh = item.colorh;
+        params.colorappearance.chroma = item.chroma;
+        params.colorappearance.schroma = item.schroma;
+        params.colorappearance.mchroma = item.mchroma;
+        params.colorappearance.gamut = item.gamut;
+        if (std::strcmp(item.label, "cam16 residual") == 0) {
+            params.colorappearance.modelmethod = "16";
+        } else if (std::strcmp(item.label, "tone map residual") == 0) {
+            params.colorappearance.tonecie = true;
+        }
+
+        CiecamCurves curves;
+        build_ciecam_curves(params, curves);
+        const bool supported =
+            ciecamSupported(params, curves.curve1, curves.curvered,
+                            curves.curvegreen, curves.curveblue,
+                            curves.curve2, curves.curve3);
+        check(supported == item.configSupported,
+              (std::string("ciecam ") + item.label +
+               " resolves to the expected configuration set").c_str());
+
+        rtengine::ImProcFunctions ipf(&params, false);
+
+        LabImage source(item.width, item.height);
+        fill_lab_in_gamut(source, params.icm.workingProfile);
+
+        LabImage cpu(item.width, item.height);
+        cpu.CopyFrom(&source);
+        ciecamHostBlock(ipf, params, cpu, 2000.f, curves.curve1,
+                        curves.curvered, curves.curvegreen, curves.curveblue,
+                        curves.curve2, curves.curve3);
+
+        LabImage device(item.width, item.height);
+        device.CopyFrom(&source);
+
+        CiecamContext context(params, ipf, source, 2000.f, curves.curve1,
+                              curves.curvered, curves.curvegreen,
+                              curves.curveblue, curves.curve2, curves.curve3);
+        RtCiecamContext descriptor = context.descriptor(supported);
+        if (supported) {
+            RtCiecamResult setup{};
+            if (context.build(setup) != 0) {
+                descriptor.supported = 0u;
+            }
+        }
+
+        RtStageArg args[3] = {};
+        args[0].kind = RT_STAGE_ARG_BUFFER;
+        args[0].u.buffer = view(device);
+        args[1].kind = RT_STAGE_ARG_PTR;
+        args[1].u.ptr = &descriptor;
+        args[2].kind = RT_STAGE_ARG_INT;
+        args[2].u.i = descriptor.supported ? 1 : 0;
+
+        std::remove(profile_path.c_str());
+        setenv("RT_STAGE_PROFILE", profile_path.c_str(), 1);
+        set_node_device_override("ciecam", StageNodeDevice::OpenCL);
+        const RtStageStatus status =
+            run("ciecam", std::vector<RtStageArg>(args, args + 3));
+        clear_node_device_overrides();
+        const std::string profile = read_file(profile_path);
+        unsetenv("RT_STAGE_PROFILE");
+
+        check(status == RT_STAGE_OK,
+              (std::string("ciecam ") + item.label +
+               " completes through run()").c_str());
+        check(profile.find("\"stage\":\"ciecam\"") != std::string::npos,
+              (std::string("ciecam ") + item.label +
+               " records the node").c_str());
+
+        const Diff diff = compare(view(device), view(cpu));
+        const bool expectDevice = item.configSupported && descriptor.supported;
+        std::printf("stage-residency: ciecam %s %dx%d %s: PAE %.6f LSB16, "
+                    "%zu of %zu samples differ\n",
+                    item.label, item.width, item.height,
+                    expectDevice ? "device" : "host", diff.max_abs,
+                    diff.differing, diff.samples);
+        check(diff.finite,
+              (std::string("ciecam ") + item.label +
+               " stays finite").c_str());
+
+        if (expectDevice) {
+            check(diff.max_abs <= 1.0,
+                  (std::string("ciecam ") + item.label +
+                   " is within one LSB16").c_str());
+            check(profile.find("\"impl\":\"opencl\"") != std::string::npos,
+                  (std::string("ciecam ") + item.label +
+                   " records a device execution").c_str());
+        } else {
+            check(profile.find("\"impl\":\"host\"") != std::string::npos,
+                  (std::string("ciecam ") + item.label +
+                   " records a host execution").c_str());
+            check(profile.find("\"impl\":\"opencl\"") == std::string::npos,
+                  (std::string("ciecam ") + item.label +
+                   " never mixes a device pass").c_str());
+            check(diff.differing == 0 && diff.max_abs == 0.0,
+                  (std::string("ciecam ") + item.label +
+                   " matches the CPU block").c_str());
+        }
+    }
+
+    /*
+     * A support flag outside 0/1 is an ABI error, and the launcher must refuse
+     * it before touching the image.
+     */
+    {
+        rtengine::procparams::ProcParams params;
+        params.colorappearance.enabled = true;
+        params.colorappearance.modelmethod = "02";
+        params.colorappearance.algo = "JC";
+        params.colorappearance.autoybscen = false;
+        CiecamCurves curves;
+        build_ciecam_curves(params, curves);
+        rtengine::ImProcFunctions ipf(&params, false);
+        LabImage source(68, 16);
+        fill_lab_in_gamut(source, params.icm.workingProfile);
+        CiecamContext context(params, ipf, source, 2000.f, curves.curve1,
+                              curves.curvered, curves.curvegreen,
+                              curves.curveblue, curves.curve2, curves.curve3);
+        RtCiecamContext descriptor = context.descriptor(true);
+        RtStageArg args[3] = {};
+        args[0].kind = RT_STAGE_ARG_BUFFER;
+        args[0].u.buffer = view(source);
+        args[1].kind = RT_STAGE_ARG_PTR;
+        args[1].u.ptr = &descriptor;
+        args[2].kind = RT_STAGE_ARG_INT;
+        args[2].u.i = 2;
+        set_node_device_override("ciecam", StageNodeDevice::OpenCL);
+        const RtStageStatus status =
+            run("ciecam", std::vector<RtStageArg>(args, args + 3));
+        clear_node_device_overrides();
+        check(status != RT_STAGE_OK,
+              "ciecam refuses a support flag that is not 0 or 1");
     }
 }
 
@@ -19783,6 +20038,7 @@ int main()
     test_framing(available);
     test_crop(available);
     test_gamut(available);
+    test_ciecam(available);
     test_working_trc(available);
     test_lab_tools(available);
     test_lab_tools_vibrance(available);

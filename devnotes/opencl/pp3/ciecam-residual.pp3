@@ -1,0 +1,11 @@
+[Color appearance]
+Enabled=true
+ModelCat=16
+CatCat=clas
+Algorithm=ALL
+Surrsrc=Average
+Surround=Average
+J-Light=12
+J-Contrast=18
+H-Hue=10
+M-Chroma=25
