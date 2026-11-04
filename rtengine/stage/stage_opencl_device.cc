@@ -53,6 +53,7 @@
 #include "stage/algorithms/ciecam_cl.h"
 #include "stage/algorithms/gamut_cl.h"
 #include "stage/algorithms/lab_to_rgb_cl.h"
+#include "stage/algorithms/raw_cl.h"
 #include "stage/algorithms/rgb_proc_cl.h"
 #include "stage/algorithms/sharpen_cl.h"
 #include "stage/algorithms/transform_cl.h"
@@ -1388,6 +1389,7 @@ const std::vector<KernelDef>& kernels()
         {"output.sharpen", RT_SHARPEN_CL, "rt_sharpen_mask"},
         {"lab.sharpening", lab_sharpening_source().c_str(),
          "rt_lab_sharpening_impulse_mark"},
+        {"raw.preprocess", RT_RAW_CL, "rt_raw_preprocess_scale"},
         {"framing", framing_source().c_str(), "rt_framing"},
         {"crop", crop_source().c_str(), "rt_crop"},
         {"thumbnail.whitebalance", thumbnail_wb_source().c_str(), "rt_thumbnail_wb"},
@@ -11757,6 +11759,182 @@ RtStageStatus run_thumbnail_scale(
 }
 
 /*
+ * raw.preprocess: the Bayer arm of RawImageSource::scaleColors(), one row per
+ * work item. The host derives the black offsets and multipliers; this launcher
+ * only moves the mosaic and the eight coefficients and reads the per-row
+ * maxima back. Everything the CPU loop does not reproduce -- X-Trans,
+ * monochrome, four-colour filters and an empty rect -- is refused before the
+ * upload so the caller's host loop runs instead.
+ */
+RtStageStatus run_raw_preprocess(
+    const std::shared_ptr<OpenCLEnv>& env,
+    const std::shared_ptr<OpenCLResidency>& residency,
+    const std::vector<RtStageArg>& args, std::string& error)
+{
+    if (args.size() != RAW_PREPROCESS_ARG_COUNT ||
+        args[RAW_PREPROCESS_ARG_IMAGE].kind != RT_STAGE_ARG_BUFFER ||
+        args[RAW_PREPROCESS_ARG_COEFFS].kind != RT_STAGE_ARG_BUFFER ||
+        args[RAW_PREPROCESS_ARG_ROW_MAX].kind != RT_STAGE_ARG_BUFFER ||
+        args[RAW_PREPROCESS_ARG_FILTERS].kind != RT_STAGE_ARG_INT ||
+        args[RAW_PREPROCESS_ARG_ORIGIN_X].kind != RT_STAGE_ARG_INT ||
+        args[RAW_PREPROCESS_ARG_ORIGIN_Y].kind != RT_STAGE_ARG_INT) {
+        error = "raw.preprocess expects three buffers and three ints";
+        return RT_STAGE_INVALID;
+    }
+
+    const RtStageBuffer& image = args[RAW_PREPROCESS_ARG_IMAGE].u.buffer;
+    const RtStageBuffer& coeffs = args[RAW_PREPROCESS_ARG_COEFFS].u.buffer;
+    const RtStageBuffer& row_max = args[RAW_PREPROCESS_ARG_ROW_MAX].u.buffer;
+
+    if (!valid(image) || !valid(coeffs) || !valid(row_max)) {
+        error = "raw.preprocess has an invalid buffer";
+        return RT_STAGE_INVALID;
+    }
+    if (image.format != RT_STAGE_F32 || image.planes != 1 ||
+        image.width <= 0 || image.height <= 0) {
+        error = "raw.preprocess needs a one-plane F32 mosaic";
+        return RT_STAGE_INVALID;
+    }
+    if (coeffs.format != RT_STAGE_F32 || coeffs.planes != 1 ||
+        coeffs.width != RAW_PREPROCESS_COEFF_COUNT || coeffs.height != 1) {
+        error = "raw.preprocess needs eight F32 coefficients in one row";
+        return RT_STAGE_INVALID;
+    }
+    if (row_max.format != RT_STAGE_F32 || row_max.planes != 1 ||
+        row_max.height != 1 ||
+        row_max.width != image.height * 3) {
+        error = "raw.preprocess needs one row maximum per image row";
+        return RT_STAGE_INVALID;
+    }
+    if (image.data == row_max.data) {
+        error = "raw.preprocess needs distinct image and row-max buffers";
+        return RT_STAGE_INVALID;
+    }
+    if (image.row_pitch <
+        static_cast<std::size_t>(image.width) * sizeof(float)) {
+        error = "raw.preprocess image row pitch is too small";
+        return RT_STAGE_INVALID;
+    }
+
+    const std::int64_t filters_arg = args[RAW_PREPROCESS_ARG_FILTERS].u.i;
+    if (filters_arg < 0 ||
+        static_cast<std::uint64_t>(filters_arg) >
+            std::numeric_limits<std::uint32_t>::max()) {
+        error = "raw.preprocess filters word is out of range";
+        return RT_STAGE_INVALID;
+    }
+    const std::uint32_t filters = static_cast<std::uint32_t>(filters_arg);
+    if (!raw_scale_filters_supported(filters)) {
+        error = "raw.preprocess refuses a four-colour filter pattern";
+        return RT_STAGE_INVALID;
+    }
+
+    const std::int64_t origin_x = args[RAW_PREPROCESS_ARG_ORIGIN_X].u.i;
+    const std::int64_t origin_y = args[RAW_PREPROCESS_ARG_ORIGIN_Y].u.i;
+    if (origin_x < 0 || origin_y < 0 ||
+        origin_x > std::numeric_limits<int>::max() ||
+        origin_y > std::numeric_limits<int>::max()) {
+        error = "raw.preprocess rect origin is out of range";
+        return RT_STAGE_INVALID;
+    }
+
+    const KernelDef* def = find_kernel("raw.preprocess");
+    assert(def != nullptr);
+    cl_kernel kernel = compiled_kernel(env, def, error);
+    if (kernel == nullptr) {
+        return RT_STAGE_FALLBACK;
+    }
+
+    const StageBufferShape image_shape{RT_STAGE_F32, image.width, image.height,
+                                       1};
+    const StageBufferShape coeff_shape{RT_STAGE_F32, coeffs.width,
+                                       coeffs.height, 1};
+    const StageBufferShape max_shape{RT_STAGE_F32, row_max.width,
+                                     row_max.height, 1};
+
+    StageDeviceBufferPtr image_device =
+        residency->acquire(image.data, image_shape, &error);
+    StageDeviceBufferPtr coeff_device =
+        residency->acquire(coeffs.data, coeff_shape, &error);
+    StageDeviceBufferPtr max_device =
+        residency->acquire(row_max.data, max_shape, &error);
+    if (!image_device || !coeff_device || !max_device) {
+        return RT_STAGE_FALLBACK;
+    }
+    if (residency->upload(image_device, image) != RT_STAGE_OK ||
+        residency->upload(coeff_device, coeffs) != RT_STAGE_OK) {
+        error = "raw.preprocess upload failed";
+        return RT_STAGE_FALLBACK;
+    }
+
+    auto device_image = std::dynamic_pointer_cast<OpenCLDeviceBuffer>(image_device);
+    auto device_coeff = std::dynamic_pointer_cast<OpenCLDeviceBuffer>(coeff_device);
+    auto device_max = std::dynamic_pointer_cast<OpenCLDeviceBuffer>(max_device);
+    if (!device_image || !device_coeff || !device_max) {
+        error = "raw.preprocess device buffer mismatch";
+        return RT_STAGE_FALLBACK;
+    }
+
+    std::lock_guard<std::recursive_mutex> lock(env->queue_mutex);
+
+    const cl_mem image_memory = device_image->memory();
+    const cl_mem coeff_memory = device_coeff->memory();
+    const cl_mem max_memory = device_max->memory();
+    const cl_int width = image.width;
+    const cl_int height = image.height;
+    const cl_int pitch = static_cast<cl_int>(device_image->row_pitch()) /
+                         static_cast<cl_int>(sizeof(float));
+    const cl_uint cl_filters = filters;
+    const cl_int cl_origin_x = static_cast<cl_int>(origin_x);
+    const cl_int cl_origin_y = static_cast<cl_int>(origin_y);
+
+    const auto set_arg = [&](cl_uint index, std::size_t bytes,
+                             const void* value) {
+        return env->api->SetKernelArg(kernel, index, bytes, value) == CL_SUCCESS;
+    };
+    const bool args_ok =
+        set_arg(0, sizeof(cl_mem), &image_memory) &&
+        set_arg(1, sizeof(cl_int), &width) &&
+        set_arg(2, sizeof(cl_int), &height) &&
+        set_arg(3, sizeof(cl_int), &pitch) &&
+        set_arg(4, sizeof(cl_mem), &coeff_memory) &&
+        set_arg(5, sizeof(cl_mem), &max_memory) &&
+        set_arg(6, sizeof(cl_uint), &cl_filters) &&
+        set_arg(7, sizeof(cl_int), &cl_origin_x) &&
+        set_arg(8, sizeof(cl_int), &cl_origin_y);
+    if (!args_ok) {
+        error = "raw.preprocess clSetKernelArg failed";
+        return RT_STAGE_FALLBACK;
+    }
+
+    const std::size_t global = static_cast<std::size_t>(image.height);
+    cl_event done = nullptr;
+    if (env->api->EnqueueNDRangeKernel(env->queue, kernel, 1, nullptr, &global,
+                                       nullptr, 0, nullptr,
+                                       &done) != CL_SUCCESS ||
+        done == nullptr) {
+        error = "raw.preprocess launch failed";
+        return RT_STAGE_ERROR;
+    }
+    const cl_int wait_status = env->api->WaitForEvents(1, &done);
+    env->api->ReleaseEvent(done);
+    if (wait_status != CL_SUCCESS) {
+        error = "raw.preprocess did not complete";
+        return RT_STAGE_ERROR;
+    }
+    if (residency->readback(image_device, image) != RT_STAGE_OK) {
+        error = "raw.preprocess image readback failed";
+        return RT_STAGE_ERROR;
+    }
+    if (residency->readback(max_device, row_max) != RT_STAGE_OK) {
+        error = "raw.preprocess row-max readback failed";
+        return RT_STAGE_ERROR;
+    }
+
+    return RT_STAGE_OK;
+}
+
+/*
  * Output sharpening, USM and undamped RLD. Arguments are documented in
  * stage/algorithms/sharpen_cl.h. The L plane is the only transfer: the mask,
  * the blur, the RLD estimate and the RLD intermediate live in device scratch.
@@ -20455,6 +20633,20 @@ public:
             const RtStageStatus status =
                 run_thumbnail_scale(env_, residency_, request.args,
                                     request.name.c_str(), false, error);
+            if (status == RT_STAGE_OK) {
+                StageEvent done;
+                done.status = StageEventStatus::Complete;
+                done.result = RT_STAGE_OK;
+                done.device = StageDeviceType::OPENCL;
+                done.asynchronous = false;
+                return done;
+            }
+            StageEvent fallback = StageQueue::submit(request, profiling);
+            fallback.note = error;
+            return fallback;
+        } else if (request.name == "raw.preprocess") {
+            const RtStageStatus status =
+                run_raw_preprocess(env_, residency_, request.args, error);
             if (status == RT_STAGE_OK) {
                 StageEvent done;
                 done.status = StageEventStatus::Complete;

@@ -18,8 +18,10 @@
  */
 #include <cassert>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <vector>
 
 #include <glib.h>
 
@@ -49,6 +51,8 @@
 #include "rtlensfun.h"
 #include "lensmetadata.h"
 #include "rtgui/options.h"
+#include "stage/algorithms/raw_cl.h"
+#include "stage/stage_runtime.h"
 
 //#define BENCHMARK
 #include "StopWatch.h"
@@ -2865,6 +2869,93 @@ void RawImageSource::scaleColors(int winx, int winy, int winw, int winh, const R
     // scale image colors
 
     if (ri->getSensorType() == ST_BAYER) {
+        /*
+         * The per-pixel affine step is the raw.preprocess device node. The
+         * prelude above stays on the host: it decides the black offsets, the
+         * white levels and the multipliers. The node reproduces the Bayer
+         * loop exactly, including the chmax reduction, and is asked for only
+         * when the stage policy selects it and the filter pattern is the
+         * three-colour one the loop assumes. A refusal falls through to the
+         * CPU loop below, which rewrites every pixel.
+         */
+        if (winw > 0 && winh > 0 &&
+            stage::node_device("raw.preprocess") ==
+                stage::StageNodeDevice::OpenCL &&
+            raw_scale_filters_supported(ri->get_filters())) {
+            float coeffs[RAW_PREPROCESS_COEFF_COUNT];
+
+            for (int i = 0; i < 4; ++i) {
+                coeffs[i] = cblacksom[i];
+                coeffs[4 + i] = scale_mul[i];
+            }
+
+            std::vector<float> row_max(
+                static_cast<std::size_t>(winh) * 3, 0.0f);
+            float* const origin = static_cast<float*>(rawData) +
+                                  static_cast<std::size_t>(winy) *
+                                      rawData.getWidth() +
+                                  winx;
+
+            RtStageBuffer image{};
+            image.size = sizeof(image);
+            image.data = origin;
+            image.width = winw;
+            image.height = winh;
+            image.row_pitch =
+                static_cast<std::size_t>(rawData.getWidth()) * sizeof(float);
+            image.plane_pitch = image.row_pitch * winh;
+            image.planes = 1;
+            image.format = RT_STAGE_F32;
+            image.flags = RT_STAGE_BUFFER_READ | RT_STAGE_BUFFER_WRITE;
+
+            RtStageBuffer coeff_buffer{};
+            coeff_buffer.size = sizeof(coeff_buffer);
+            coeff_buffer.data = coeffs;
+            coeff_buffer.width = RAW_PREPROCESS_COEFF_COUNT;
+            coeff_buffer.height = 1;
+            coeff_buffer.row_pitch =
+                RAW_PREPROCESS_COEFF_COUNT * sizeof(float);
+            coeff_buffer.plane_pitch = coeff_buffer.row_pitch;
+            coeff_buffer.planes = 1;
+            coeff_buffer.format = RT_STAGE_F32;
+            coeff_buffer.flags = RT_STAGE_BUFFER_READ;
+
+            RtStageBuffer max_buffer{};
+            max_buffer.size = sizeof(max_buffer);
+            max_buffer.data = row_max.data();
+            max_buffer.width = 3 * winh;
+            max_buffer.height = 1;
+            max_buffer.row_pitch =
+                static_cast<std::size_t>(winh) * 3 * sizeof(float);
+            max_buffer.plane_pitch = max_buffer.row_pitch;
+            max_buffer.planes = 1;
+            max_buffer.format = RT_STAGE_F32;
+            max_buffer.flags = RT_STAGE_BUFFER_READ | RT_STAGE_BUFFER_WRITE;
+
+            std::vector<RtStageArg> args(RAW_PREPROCESS_ARG_COUNT);
+            args[RAW_PREPROCESS_ARG_IMAGE].kind = RT_STAGE_ARG_BUFFER;
+            args[RAW_PREPROCESS_ARG_IMAGE].u.buffer = image;
+            args[RAW_PREPROCESS_ARG_COEFFS].kind = RT_STAGE_ARG_BUFFER;
+            args[RAW_PREPROCESS_ARG_COEFFS].u.buffer = coeff_buffer;
+            args[RAW_PREPROCESS_ARG_ROW_MAX].kind = RT_STAGE_ARG_BUFFER;
+            args[RAW_PREPROCESS_ARG_ROW_MAX].u.buffer = max_buffer;
+            args[RAW_PREPROCESS_ARG_FILTERS].kind = RT_STAGE_ARG_INT;
+            args[RAW_PREPROCESS_ARG_FILTERS].u.i = ri->get_filters();
+            args[RAW_PREPROCESS_ARG_ORIGIN_X].kind = RT_STAGE_ARG_INT;
+            args[RAW_PREPROCESS_ARG_ORIGIN_X].u.i = winx;
+            args[RAW_PREPROCESS_ARG_ORIGIN_Y].kind = RT_STAGE_ARG_INT;
+            args[RAW_PREPROCESS_ARG_ORIGIN_Y].u.i = winy;
+
+            if (stage::run("raw.preprocess", args) == RT_STAGE_OK) {
+                for (int row = 0; row < winh; ++row) {
+                    chmax[0] = max(chmax[0], row_max[3 * row + 0]);
+                    chmax[1] = max(chmax[1], row_max[3 * row + 1]);
+                    chmax[2] = max(chmax[2], row_max[3 * row + 2]);
+                }
+
+                return;
+            }
+        }
 #ifdef _OPENMP
         #pragma omp parallel
 #endif
