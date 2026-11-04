@@ -472,7 +472,7 @@ by default.
 |----|----------------------------------------|----------|-------|------|--------|
 | `source.select` | Full/Full/Full/Full | path | recompute | select the frame to process | n/a |
 | `source.embedded` | -/-/-/Reduced | interactive | recompute | select the embedded JPEG | n/a |
-| `raw.preprocess` | Full/Full/Full/Full | path | reuse-output | raw black/white, hot/dead pixel, CA, flat field | no |
+| `raw.preprocess` | Full/Full/Full/Full | path | reuse-output | raw black/white, hot/dead pixel, CA, flat field; the Bayer arm of `scaleColors()` is the device node | partial |
 | `raw.demosaic` | Full/Full/Full/Full | path | reuse-output | demosaic and capture sharpening | no |
 | `raw.base` | Full/Full/Roi/Reduced | path | reuse-output | `getImage()`, spot removal, denoise, film negative, Retinex, source-side gamut | no |
 | `analysis` | Full/Full/Roi/- | path | reuse-output | histogram and auto-exposure analysis | n/a |
@@ -1997,9 +1997,16 @@ RLD, radii at or above 1.15, edges-only, halo control, show-mask and
 `blurradius >= 0.25` run the host builtin. The sub-node records, commands and
 parity results are in `STAGE_RUNTIME.md`.
 
-Still CPU-only: `raw.preprocess`, `raw.demosaic`, `raw.base`, `lab.tools`,
-`lab.wavelet`, `working.trc`, `ciecam` and `thumbnail.lab`'s working-TRC, CIE
-CAM and gamut remainder.
+Partial: `raw.preprocess` runs the Bayer arm of `scaleColors()` on the device
+and keeps every other preprocess step on the host. The node is entered only
+for a three-colour Bayer mosaic at a non-empty rect; X-Trans, monochrome,
+four-colour filter patterns and the host prelude that derives the black
+offsets and multipliers never leave the host. A refused or unavailable launch
+returns to the unchanged CPU loop, which rewrites every pixel.
+
+Still CPU-only: `raw.demosaic`, `raw.base`, `lab.tools`, `lab.wavelet`,
+`working.trc`, `ciecam` and `thumbnail.lab`'s working-TRC, CIE CAM and gamut
+remainder.
 
 `local.adjustments` is partial through the multi-spot tool path. The
 admitted set is any number of `norm` spots in list order: an active spot runs

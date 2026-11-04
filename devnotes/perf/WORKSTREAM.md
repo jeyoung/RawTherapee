@@ -604,8 +604,9 @@ export and a GUI smoke test are not yet run for this package.
   (`588301647`). `crop` is a row copy deferred to residency.
 - Remaining CPU-only pixel nodes: `working.trc`, `lab.tools`,
   `lab.wavelet`, `local.adjustments`, `thumbnail.lab`'s working-TRC/CIE-CAM/
-  gamut remainder, and the raw four (`raw.preprocess`, `raw.demosaic`,
-  `raw.base`; `source.*`/`analysis` are exceptions).
+  gamut remainder, and the raw three (`raw.demosaic`, `raw.base`; `source.*`/
+  `analysis` are exceptions). `raw.preprocess` is partial through its
+  `scaleColors()` Bayer arm.
 - **`working.trc` (partial)**: W1 exposed the probe means, the lcms-built
   profile and the probe primaries matrix via setup-only out-params
   (`78c314f00`, `92ec1641b`). W2 runs a host prefix (`lab2rgb` + fixed sRGB
@@ -653,6 +654,18 @@ export and a GUI smoke test are not yet run for this package.
   edges-only export measures 4 LSB16 because the node is bit-exact on a given
   input and the upstream device pipeline's L plane is amplified by the
   bilateral's piecewise-constant range table; that profile is not gated.
+- **`raw.preprocess` scale arm**: the Bayer arm of `scaleColors()` is a device
+  node, one work item per row. The host keeps the prelude (black-offset
+  selection, `c_white`, `calculate_scale_mul()`, clip levels); the kernel does
+  `max(0, pixel - cblacksom[c4]) * scale_mul[c4]` and writes a one-row buffer
+  of channel maxima that the host reduces into `chmax`, so no atomics and no
+  second full-image scan. The call site enters it only for a three-colour
+  Bayer mosaic at a non-empty rect; X-Trans, monochrome, four-colour filters
+  and every other preprocess step stay on the host and a refusal rewrites the
+  mosaic with the unchanged CPU loop. Nine residency cases are bit-exact with
+  exact `chmax`; both corpus images are `AE=0` (0 of 30 419 712 and 0 of
+  136 918 080 samples) with `impl=opencl`. `verify.sh` runs the neutral
+  profile as `pef/stage-device-raw-preprocess`. Not pushed.
 - Side defects found: `workingtrc` leaks the profile/transform per call
   (`iplab2rgb.cc:2145/2173`, still open); forcing the POCL CPU stage device
   under `--gpu=auto` hits a null `opencl::initLocked` call with

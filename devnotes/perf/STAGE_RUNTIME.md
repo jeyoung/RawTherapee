@@ -386,6 +386,55 @@ The device test's synthetic Lab content is L in [0, 32768] and a, b in
 [-16384, 16384], which saturates the compression. There is no residual for the
 block: the whole end-of-process gamut pass is the node.
 
+## Raw preprocess
+
+`raw.preprocess` owns one coherent pixel sub-step of
+`RawImageSource::preprocess()`: the Bayer arm of `RawImageSource::scaleColors()`
+in `rtengine/rawimagesource.cc`. The rest of the block (dark-frame and flat
+field correction, hot/dead pixels, PDAF lines, green equilibration,
+interpolation of bad pixels, line denoise, CA, the denoise histogram) stays on
+the host. The call site keeps the prelude that selects the black offsets,
+computes `c_white`, calls `calculate_scale_mul()` and builds the clip levels,
+because those depend on metadata and double-precision helpers; the node only
+performs the per-pixel affine step.
+
+The ABI is `[0]` the one-plane F32 mosaic, a rect view whose row pitch is the
+parent width, `[1]` eight F32 coefficients (`cblacksom[0..3]` then
+`scale_mul[0..3]`), `[2]` a one-row F32 buffer of `3 * height` row maxima,
+`[3]` the raw filters word, `[4]` the rect origin x and `[5]` the rect origin y.
+The coefficients are packed so a padded row cannot be read across the device
+row pitch, and the row-max buffer is one row so the residency's row alignment
+cannot split a row triple.
+
+One work item owns one row. It reproduces `FC(row, col)` from the filters word
+and the absolute origin, selects `c4` with the host's even-row green rule,
+computes `max(0, pixel - cblacksom[c4]) * scale_mul[c4]`, writes the pixel in
+place and accumulates the three channel maxima for the row. `FP_CONTRACT OFF`
+keeps the subtract-then-multiply association. The host then reduces the row
+maxima into `chmax`, which is the same max over the same float values as the
+CPU loop's per-thread accumulation. There is no second full-image scan.
+
+The call site enters the node only when the stage policy selects it, the
+sensor is `ST_BAYER`, the rect is non-empty and
+`raw_scale_filters_supported()` accepts the filter word. The launcher also
+rejects a buffer that is not one-plane F32, coefficients that are not exactly
+eight F32 values in one row, a row-max buffer that is not `3 * height` by one
+row, a row pitch below the packed row, a negative origin, an out-of-range
+filters word and a filter pattern containing colour 3 (a four-colour sensor). A refusal returns
+before the upload and the CPU loop rewrites every pixel, so the host never
+starts from a partly written mosaic.
+
+Evidence:
+
+| Case | Result |
+|---|---|
+| device test, nine shapes (padded rect 67-wide for a 63x31 view, full frame, one pixel, one column, one row, odd origin, and the RGGB/BGGR/GRBG/GBRG filter words) | device execution, `device=OPENCL`, PAE 0.000000, 0 of 2211 maximum samples differ, `chmax` exact on all three channels |
+| non-vacuity | every case changes pixels against the input at the same scale |
+| `run("raw.preprocess", …)` with the node selected | `"stage":"raw.preprocess".*"impl":"opencl"` in the profile |
+| refusals: wrong argument count, U8 image, two-plane image, seven coefficients, two-row coefficients, short row-max buffer, undersized row pitch, four-colour filters and a negative origin | not `RT_STAGE_OK`, mosaic untouched (153 samples) |
+| `colorspace_flowers.pef` (10.2 MP PEF) neutral, `--gpu=off` vs `--gpu=auto`, 16-bit TIFF | AE=0, 0 of 30 419 712 samples, record `"impl":"opencl"` |
+| 45.7 MP NEF neutral, `--gpu=off` vs `--gpu=auto`, 16-bit TIFF | AE=0, 0 of 136 918 080 samples, record `"impl":"opencl"` |
+
 ## Output sharpening
 
 `output.sharpen` runs the unsupported-mask path of

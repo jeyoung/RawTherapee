@@ -172,6 +172,18 @@ pairs are exact. The gate is the peak absolute error (PAE) in normalised units;
 | 2026-11-04 | uncommitted | POCL (CPU) | output-sharpen refusals: `showMask`, a non-positive edge tolerance, `blurradius=25` (double Gaussian), `deconvradius/scale=1.5` (separable), a padded row and a padded plane, on the device and in the builtin | predicate/launcher refuses | 0 (host; 1953 samples untouched) | PASS |
 | 2026-11-04 | uncommitted | POCL (CPU) | colorspace_flowers.pef / `sharpen-usm.pp3`, `sharpen-rld.pp3`, `sharpen-rld-damped.pp3` and `sharpen-usm-halo.pp3`, `output.sharpen` | off vs auto, 16-bit TIFF | 1 LSB (1.5259e-05; 24,447 / 20,651 / 12,678 / 21,706 of 7,604,928), all `impl=opencl` | PASS |
 | 2026-11-04 | uncommitted | POCL (CPU) | colorspace_flowers.pef / USM edges only with a flat mask, `output.sharpen` | off vs auto, 16-bit TIFF | 4 LSB (4.578e-05; 605,915 of 7,604,928), `impl=opencl` | NOTE |
+| 2026-11-04 | uncommitted | POCL (CPU) | 9-case `raw.preprocess` scale matrix (padded 67-wide rect for a 63x31 view, full frame, one pixel, one column, one row, odd origin, RGGB/BGGR/GRBG/GBRG), `stage-residency-test` | device vs host loop | 0 (bit-exact, chmax exact on all three channels) | PASS |
+| 2026-11-04 | uncommitted | POCL (CPU) | `raw.preprocess` non-vacuity: every case changes the mosaic against its input | device vs input | non-zero, all cases | PASS |
+| 2026-11-04 | uncommitted | POCL (CPU) | `raw.preprocess` refusals: wrong argument count, U8 image, two-plane image, seven coefficients, two-row coefficients, short row-max buffer, undersized row pitch, four-colour filters, negative origin | launcher refuses before upload | 0 (host; 153 samples untouched) | PASS |
+| 2026-11-04 | uncommitted | POCL (CPU) | colorspace_flowers.pef / neutral, `raw.preprocess` scale arm | off vs auto, 16-bit TIFF | 0 (AE=0, 0 of 30 419 712), `impl=opencl` | PASS |
+| 2026-11-04 | uncommitted | POCL (CPU) | 45.7 MP NEF / neutral, `raw.preprocess` scale arm | off vs auto, 16-bit TIFF | 0 (AE=0, 0 of 136 918 080), `impl=opencl` | PASS |
+
+The `raw.preprocess` rows cover the Bayer arm of `scaleColors()` only. The
+node is a partial block: the prelude that derives the black offsets and the
+multipliers, and every other preprocess step, stays on the host. A profile that
+selects the node records `impl=opencl`; an unselected run never calls the node,
+so the default path is unchanged and emits no record. X-Trans, monochrome and
+four-colour filter patterns are refused by the call site, not approximated.
 
 The clarity rows are the block's two-pass sequence, not a single kernel.
 `CLmethod`'s `one`/`inf`/`sup` selection is `finalContAllL()`'s and
