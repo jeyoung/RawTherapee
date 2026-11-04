@@ -3106,23 +3106,25 @@ mask, soft radius, merge, recursion, inversion, gradient, LabGrid, RGB or
 exposure curve, an `avoidgamutMethod` other than `"NONE"`/`"MUNS"`, and a ROI
 of at least 5 px in each dimension (12 px when shadows/highlights runs, 39 px
 when sharpening runs).
-Local sharpening requires `methodcap == "rl"`, `shargam == 1`,
-`sharblur < 0.25`, no mask view, `reparsha == 100`, a radius in `0.4..1.15`
-and the GUI ranges for amount, iterations, contrast, sensitivity and damping
-(`0..100`). Damping zero selects the undamped recurrence; a positive value
-selects `dcdamping()`'s damped recurrence, and a damped spot additionally
-needs a radius of at least `0.6`, where the forward blur is the standard IIR
-pair. The host's `shardamping` fixup raises a zero damping to one when
-`dirpyrequalizer.cbdlMethod == "bef"` (the default), even with the equalizer
-disabled; the context records that effective value and does not mutate the
-caller's params, so both `cbdlMethod` values are admitted. Capture
-sharpening, a gamma wrapper, the blur pre-pass, mask view, a separable
-radius, a damped radius below `0.6` and an out-of-range value are residuals.
-A radius at or
-below 0.42 is the block's own no-op and is recorded as a skipped pass. A
-partial spot with a non-zero transition is a residual because the block's
-blend reads the padded result across the transition ring; a zero-width
-transition keeps the ring inside the nominal extent.
+Local sharpening has two arms. The `"rl"` arm requires `methodcap == "rl"`,
+`shargam == 1`, `sharblur < 0.25`, no mask view, `reparsha == 100`, a radius
+in `0.4..1.15` and the GUI ranges for amount, iterations, contrast,
+sensitivity and damping (`0..100`). Damping zero selects the undamped
+recurrence; a positive value selects `dcdamping()`'s damped recurrence, and a
+damped spot additionally needs a radius of at least `0.6`, where the forward
+blur is the standard IIR pair. The host's `shardamping` fixup raises a zero
+damping to one when `dirpyrequalizer.cbdlMethod == "bef"` (the default), even
+with the equalizer disabled; the context records that effective value and
+does not mutate the caller's params, so both `cbdlMethod` values are admitted.
+A radius at or below 0.42 is the block's own no-op and is recorded as a
+skipped pass. A partial spot with a non-zero transition is a residual because
+the block's blend reads the padded result across the transition ring; a
+zero-width transition keeps the ring inside the nominal extent. The `"cap"`
+arm requires `deconvCogam == 1`, `deconvCoBoost == 0` and
+`deconvAutoshar == false`, with the sigma, iteration, contrast and recovery
+sliders in their GUI ranges; a clipped ROI below the block's 150 px gate is a
+no-op. The capture gamma wrapper, corner boost, automatic contrast, mask view
+and out-of-range values are residuals.
 Log encoding additionally requires `expcie`, `ciecam` and `autocompute` off,
 `detail == 0`, `strlog == 0`, and the GUI ranges for `sourceGray`,
 `targetGray`, `blackEv`, `whiteEv`, `comprlog`, `repar` and `sensilog`; the
@@ -3136,7 +3138,8 @@ residuals. Soft light requires `softMethod == "soft"` with `streng` and
 clamp-only and may carry inert tool settings. Everything else is a residual:
 exposure (FFT PDE), the other shadows/highlights methods and
 tone-eq/recovery/gradient sub-options, the local-contrast wavelet and FFT
-variants, vibrance gamma/gradients/warm, blur/denoise, capture sharpening,
+variants, vibrance gamma/gradients/warm, blur/denoise, capture
+auto contrast/gamma/corner boost,
 sharpening gamma/blur/mask view/separable radius, tone
 mapping, Retinex, log's guided-filter arm/`autocompute`/gradient,
 soft light `"reti"`, dehaze, `exc`/`full`/`main`, merge,
@@ -3201,7 +3204,10 @@ before the upload.
 | Log residuals, 11 cases | `autocompute`, `expcie`, the `ciecam` flag, non-zero `detail`, `strlog`, an explicit mask, a soft radius, source gray/compression/`repar`/sensitivity out of range: `impl=host`, no `impl=opencl`, PAE 0. The predicate matrix also covers target gray and black/white EV |
 | `localadjustments-log.pp3` (CPU-device row) | PASS, `max_pae=1.5259e-05` (1 LSB16), `impl=opencl`; log encoding at source gray 10, target gray 18, black/white EV -5/10, compression 0.4, `repar=100`, saturation on, `sensilog=60`, detail zero, combined with Colour & Light. Non-vacuous: against the neutral export the profile differs by PAE 20,952 codes on 5,254,380 of 30,419,712 channel samples |
 | Sharpen matrix, 21 cases | alone, the 3x3/5x5/7x7 radii, sensitivity 90, colour, log, dehaze, CBDL, vibrance, shadows/highlights, soft light, local contrast, all tools, MUNS, a second spot, inactive/active, ELI/RECT, a partial zero-transition spot and the 179x49/238x64/8192x64 widths: `impl=opencl`, finite, worst 0.925781 LSB16 (sensitivity 90; kernel-7 0.765625; sharpen+soft light 0.625977; all tools 0.427734; 8192x64 0.515625; sharpen alone 0.207031; partial zero-transition 0.138672). Non-vacuity: sharpen alone changes 33,709 of 45,696 samples (PAE 8,866.826172 LSB16) against the same spot with the tool off |
-| Sharpen residuals, 13 cases | capture sharpening, damping range (101), a damped radius below 0.6, gamma, the blur pre-pass, mask view, a separable radius, radius/amount/iteration/contrast/sensitivity out of range and `reparsha`: `impl=host`, no `impl=opencl`, PAE 0. A partial spot with a non-zero transition is also a host residual for the padded-extent reason. Negative damping is refused by the predicate and is not part of this runtime matrix. |
+| Sharpen residuals, 13 cases | capture auto contrast, damping range (101), a damped radius below 0.6, gamma, the blur pre-pass, mask view, a separable radius, radius/amount/iteration/contrast/sensitivity out of range and `reparsha`: `impl=host`, no `impl=opencl`, PAE 0. A partial spot with a non-zero transition is also a host residual for the padded-extent reason. Negative damping is refused by the predicate and is not part of this runtime matrix. |
+| Capture matrix, 12 cases | the 3x3/5x5/7x7/9x9/13x13 kernels at sigma 0.55/0.75/1.00/1.30/2.00, 1..40 iterations, early stop on and off, recovery 50, an ROI clipped at the image corner, and combined with Blur & Noise, tone mapping and CIE CAM: `impl=opencl`, finite, worst 0.091553 LSB16 (tone map 0.030518, blur 0.015381; the eight pure capture cases are exact). Non-vacuity: every case changes between 10,736 and 40,323 of 270,000 samples against the same spot with the tool off (recovery 50 at PAE 0.015625; the full-strength cases at PAE 0.022949) |
+| Capture residuals, 9 cases | the automatic contrast (the default profile), the gamma wrapper, the corner boost and the sigma/iteration/contrast/recovery/sensitivity ranges and the mask view: refused by the predicate, `impl=host`, PAE 0 |
+| `localadjustments-capture.pp3` (CPU-device row) | PASS, `max_pae=1.5259e-05` (1 LSB16), `impl=opencl`; the `"cap"` arm at sigma 0.75, 25 iterations, manual contrast 20, sensitivity 40, recovery 100, early stop on and a spot covering 80% of the frame. The 16-bit TIFF pair differs on 25,669 of 30,419,712 samples at 1 LSB16. The same profile at Loc 100 and Loc 200 (388x260 and 777x521 ROIs) is also 1 LSB16, as are sigma 0.55/1.00/2.00, 1/5/10/40 iterations, early stop off and contrast 3/200; the auto contrast refusal is the same default profile the residual matrix uses. Measured with the `run_stage_device` recipe directly (`--gpu=off` versus `--gpu=auto` with `RT_STAGE_OPENCL=1`, `RT_OPENCL_ALLOW_CPU=1` and `OMP_NUM_THREADS=1` under `tools/opencl/pocl-run.sh`, then ImageMagick's `compare -metric PAE`) |
 | Damped sharpen matrix, 19 cases | the default `"bef"` fixup at damping zero-to-one, the 0.6 minimum radius, damping 1/5/10/100, both `cbdlMethod` values, colour, log, dehaze, CBDL, vibrance, shadows/highlights, soft light, local contrast, all tools, MUNS, a second spot and the 179x49/238x64/8192x64 widths: `impl=opencl`, finite, worst 0.871094 LSB16 (damping 10 at radius 1.00; all tools 0.443359; soft light 0.625977; 8192x64 0.546875; default fixup 0.212891; minimum radius 0.138672). The fixup case is non-vacuous (32,446 of 45,696 samples, PAE 9,288.169922 LSB16 against the tool off), and damping changes 34,031 of 45,696 samples (PAE 2,806.058594 LSB16) against the same spot undamped |
 | `localadjustments-sharpen.pp3` (CPU-device row) | PASS, `max_pae=1.5259e-05` (1 LSB16), `impl=opencl`; the RL arm at radius 0.75, amount 100, 30 iterations, contrast 20, sensitivity 40, undamped, with a zero-transition spot. Non-vacuous: against the neutral export the profile differs by PAE 6,272 codes on 3,572,230 of 10,139,904 pixels |
 | `localadjustments-sharpen-damped.pp3` (CPU-device row) | PASS, `max_pae=1.5259e-05` (1 LSB16), `impl=opencl`; radius 0.75, `cbdlMethod=bef` and `shardamping=0`, so the host fixup's effective damping of one is exercised on the device. Non-vacuous: against the neutral export the profile differs by PAE 8,197 codes on 3,487,820 of 10,139,904 pixels |

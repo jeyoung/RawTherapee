@@ -1981,11 +1981,11 @@ is a residual.
 Local log encoding is admitted with `expcie` off, `autocompute` off, `detail`
 zero, no gradient and its GUI slider ranges; `detail` non-zero (the guided
 filter arm), `expcie`, `ciecam`, `autocompute`, `strlog`, an explicit mask,
-a soft radius and out-of-range values are residuals. Local sharpening is
-admitted only in the `"rl"` RLD arm that the output sharpening core covers:
-no capture sharpening, `shargam == 1`, `sharblur < 0.25`, no mask view,
-`reparsha == 100` and a radius in `0.4..1.15` (below 1.15 so the forward blur
-uses its 3x3/5x5/7x7 or IIR kernels rather than the separable arm). Damping is
+a soft radius and out-of-range values are residuals. Local sharpening has two
+arms. The `"rl"` arm is the output sharpening core's RLD recurrence:
+`shargam == 1`, `sharblur < 0.25`, no mask view, `reparsha == 100` and a
+radius in `0.4..1.15` (below 1.15 so the forward blur uses its
+3x3/5x5/7x7 or IIR kernels rather than the separable arm). Damping is
 supported over the GUI's `0..100` range; zero is the undamped recurrence and a
 positive value is `dcdamping()`'s damped recurrence, which additionally needs
 a radius of at least `0.6` so the forward blur is the standard IIR pair. The
@@ -1993,14 +1993,21 @@ host's `shardamping` fixup raises a zero damping to one when
 `dirpyrequalizer.cbdlMethod == "bef"` (the default), even with the equalizer
 disabled; the context records the effective value without mutating the
 caller's params, so both `cbdlMethod` values are admitted. A radius at
-or below 0.42 is the block's own no-op. Capture sharpening (`"cap"`),
+or below 0.42 is the block's own no-op. The `"cap"` arm is capture
+sharpening: `deconvCogam == 1` (no gamma wrapper), `deconvCoBoost == 0` (no
+corner radius boost) and `deconvAutoshar == false` (the manual contrast, so
+`buildBlendMask2()`'s data-dependent tile search stays on the host); the
+sigma, iteration, contrast and recovery sliders span the GUI ranges. A
+clipped ROI below the block's 150 px `mSPsharpCS` gate is a no-op.
 `shargam != 1`, `sharblur >= 0.25`, `sharshow`, a radius outside
-`0.4..1.15`, a damped radius below `0.6` and out-of-range sliders are
+`0.4..1.15`, a damped radius below `0.6`, the capture auto contrast, capture
+gamma, capture corner boost, out-of-range sliders and an unknown method are
 residuals. A partial spot with a
-non-zero transition is also a residual: `Sharp_Local()` reads the padded
-deconvolution result across the transition ring, which the block's
-`lx + lxL + 3` extent does not cover; a zero-width transition keeps the ring
-inside the nominal extent. Local dehaze is exposed through
+non-zero transition is also a residual for the `"rl"` arm: `Sharp_Local()`
+reads the padded deconvolution result across the transition ring, which the
+block's `lx + lxL + 3` extent does not cover; a zero-width transition keeps
+the ring inside the nominal extent. The capture arm works on the clipped ROI
+and the transition is part of its blend, so it does not need that exclusion. Local dehaze is exposed through
 the retinex enable: `expreti` must be on, the retinex strength must be zero
 (the retinex tool itself is a no-op), and `dehazeblack`, show-depth, an active
 retinex strength, a mask or a soft radius are residuals. `dehaz`,
@@ -2321,6 +2328,27 @@ standard IIR forward blur, `dcdamping()` factor and GAUSS_MULT kernels on the
 same padded plane. `localadjustments-sharpen-damped.pp3` is 1 LSB16 and
 exercises the default fixup.
 
+The capture-sharpening `"cap"` arm runs on the clipped ROI. The device copies
+the ROI to working RGB, samples `RGB2L()` for the manual contrast mask, seeds
+the Rec2020 luminance plane, runs `CaptureDeconvSharpening_SE()`'s tiled
+division/multiplication recurrence with the sigma-selected 3x3..13x13 kernels
+and the 3/5/7/8 border, scales each RGB channel by the new/old luminance
+ratio, returns through `rgb2lab()` and blends with
+`transit_shapedetect2()`'s senstype-99 (`lp.senssha`) scope. The tile
+geometry is the host's, including the `itercheck` early exit and the 0.01
+skipped-tile floor. The end-of-row and end-of-column tiles overlap their
+predecessor and the host's `intp()` blends with the already-written value;
+the device reproduces that last-writer chain in four ordered phases
+(interior, last column, last row, corner). Twelve cases (sigma
+0.55/0.75/1.00/1.30/2.00, 1..40 iterations, early stop on and off, recovery
+50, an ROI clipped at the image corner, and combined with Blur & Noise, tone
+mapping and CIE CAM) are within 0.091553 LSB16 (tone map 0.030518, blur
+0.015381, the eight pure capture cases exact). Every case changes between
+10,736 and 40,323 of 270,000 fixture samples against the tool-off result, so
+the parity is not vacuous. `localadjustments-capture.pp3` is 1 LSB16
+(AE=25,669 of 30,419,712) and records `impl=opencl`. The automatic contrast,
+the gamma wrapper, the corner boost and the mask display stay fail-closed.
+
 The `chromacbdl = 0.01`, default-multiplier, default-clarity case is the
 chroma block's all-ones-multiplier arm: the CPU still enters the block and
 blends the luminance result. The pre-fix device skipped it and diverged by
@@ -2350,9 +2378,9 @@ method, the shadows/highlights
 `"tone"`/`"ghs"`/`"micha"` methods, tone-eq multipliers, a non-default tone
 gamma/slope, the SH recovery blend and gradient, vibrance
 gamma/gradients/warm, the local-contrast wavelet (`"wav"`) and FFT variants,
-CBDL's `contresid` and soft radius, blur/denoise, capture sharpening,
-`shargam`, `sharshow`, a separable local-sharpening radius, a damped radius
-below 0.6,
+CBDL's `contresid` and soft radius, blur/denoise,
+capture auto contrast/gamma/corner boost, `shargam`, `sharshow`, a separable
+local-sharpening radius, a damped radius below 0.6,
 Tone Mapping's recovery threshold, its out-of-range sliders and the global
 EPD pass,
 Retinex, log's guided-filter `detail`/`autocompute`/CIE CAM/gradient,

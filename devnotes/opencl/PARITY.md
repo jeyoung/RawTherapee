@@ -118,6 +118,9 @@ pairs are exact. The gate is the peak absolute error (PAE) in normalised units;
 | 2026-11-04 | uncommitted | POCL (CPU) | colorspace_flowers.pef / `localadjustments-mask.pp3` (CIE mask, band luminance curve, recovery 0.5/decay 3), `local.adjustments` | off vs auto, 16-bit TIFF | 0 (AE=0, 0 of 30,419,712) | PASS |
 | 2026-11-04 | uncommitted | POCL (CPU) | 15-case common-mask matrix (log and CIE bands, narrow and inverted bands, recovery at decay 2 and 4, colour, blur and a no-mask control), `stage-residency-test` | device vs host block | 0.106689 LSB16 (worst: CIE recovery decay 4) | PASS |
 | 2026-11-04 | uncommitted | POCL (CPU) | 16-case common-mask refusal matrix (deltaE, blend, radius, chroma, chroma/hue curves, recovery and decay ranges, the recovery upper half, CIE blur/gamma/contrast/structure/tool, the local and wavelet mask curves), `stage-residency-test` | predicate refuses | 0 (host) | PASS |
+| 2026-11-04 | uncommitted | POCL (CPU) | colorspace_flowers.pef / `localadjustments-capture.pp3` (manual contrast, 5x5, 25 iterations), `local.adjustments` | off vs auto, 16-bit TIFF | 1 LSB (AE=25,669 of 30,419,712, PAE 1 code) | PASS |
+| 2026-11-04 | uncommitted | POCL (CPU) | 12-case local capture-sharpening matrix (3x3/5x5/7x7/9x9/13x13, 1..40 iterations, early stop on/off, recovery 50, an ROI clipped at the image corner, combined with blur, tone map and CIE), `stage-residency-test` | device vs host block | 0.091553 LSB16 (worst: combined with CIE; the pure capture cases are exact) | PASS |
+| 2026-11-04 | uncommitted | POCL (CPU) | 9-case local capture-sharpening refusal matrix (auto contrast, gamma, corner boost, sigma/iteration/contrast/recovery/sensitivity ranges, mask view), `stage-residency-test` | predicate refuses | 0 (host) | PASS |
 | 2026-11-03 | `7fc43d8a3..uncommitted` | POCL (CPU) | colorspace_flowers.pef / `labwavelet-denoise-expert.pp3` (Expnoise, `complexMethod=expert`, `sliMethod=cur`, `mixMethod=mix7`, non-identity `wavdenoise`, `Levelsigm=0.7;1.6`, `Leveldenoise=5;4`, `Limden=0.4`), `lab.wavelet` | off vs auto, 16-bit TIFF | 1 LSB (AE=1, 15,637 of 30,419,712) | PASS |
 | 2026-11-03 | `7fc43d8a3..uncommitted` | POCL (CPU) | 8-case expert-pairing matrix (`sliMethod` cur and sli+Thrden, `Levelsigm` 1/1, 3/3, 3/0.05, 0.05/3, 2.5/1.5, 0.05/0.05, 1.5/0.75, `Limden` 0, 0.5, 0.75 and 1, contrast, edge, final curves, odd 179x161), `stage-residency-test` | device vs host block | 0.158691 LSB16 (worst: odd all panels) | PASS |
 | 2026-11-03 | `7fc43d8a3..uncommitted` | POCL (CPU) | 4-case expert refusal matrix (`Levelsigm` top and bottom out of range, `Limden` above range, non-identity `Wavdenoiseh`), `stage-residency-test` | device vs host block | 0 (host) | PASS |
@@ -418,6 +421,29 @@ peak absolute error is zero for the synthetic node tests:
   non-zero transition is also a host residual because the block's padded
   extent does not cover the transition ring the host reads. Negative damping
   is refused by the predicate and is not a runtime case.
+- Local capture sharpening, through `local.adjustments`, runs the `"cap"`
+  arm on the clipped ROI: the ROI is converted to working RGB, `RGB2L`
+  builds the manual contrast mask, `CaptureDeconvSharpening_SE()`'s tiled
+  division/multiplication recurrence runs on the Rec2020 luminance with the
+  sigma-selected 3x3..13x13 kernels, each RGB channel is scaled by the
+  new/old luminance ratio, and `transit_shapedetect2()`'s senstype-99
+  (`lp.senssha`) blend follows. The deconvolution's end-of-row and
+  end-of-column tiles overlap their predecessors; the device reproduces the
+  host's last-writer chain in four ordered phases (interior, last column,
+  last row, corner) so the overlap blends with the already-written value.
+  The tile halo, the `itercheck` early exit, the 0.01 skipped-tile floor and
+  the 3/5/7/8 border are the host's. The arm matches the host block in
+  twelve cases (all five kernels at 0.55/0.75/1.00/1.30/2.00, 1..40
+  iterations, early stop on and off, recovery 50, an ROI clipped at the
+  image corner, and combined with Blur & Noise, tone mapping and CIE CAM)
+  with a worst peak error of 0.091553 LSB16 (tone map 0.030518, blur
+  0.015381; the eight pure capture cases are exact). Every case changes
+  between 10,736 and 40,323 of 270,000 samples against the tool-off result,
+  so the parity is not vacuous. `localadjustments-capture.pp3` is 1 LSB16
+  (AE=25,669 of 30,419,712) and records `impl=opencl`. The automatic
+  contrast, the gamma wrapper, the corner radius boost and the mask display
+  stay fail-closed; the auto-contrast refusal is the same default profile
+  the earlier residual matrix used.
 - Blur & Noise, through `local.adjustments`, has two arms. The Gaussian arm
   reuses the blur arm's line kernel with the context's host-built
   coefficients at the block's `lp.rad / (sk * 1.4)` sigma; the median arm

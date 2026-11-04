@@ -451,11 +451,32 @@ current tip.
   cases, worst 0.925781 LSB16. The damped arm adds the host `"bef"` fixup
   (zero -> one) without mutating params, `dcdamping()` and the 5x5/7x7
   multiply blur; 19 damped cases, worst 0.871094 LSB16, 13 runtime residuals
-  host at PAE 0, and negative damping predicate-refused only. Damped radius
-  below 0.6 and capture sharpening remain host residuals. `cd38028bb`,
+  host at PAE 0, and negative damping predicate-refused only. A damped radius
+  below 0.6 remains a host residual. `cd38028bb`,
   `476dc9f24`, `db99dc054`, `7467f563f`, `211c12597`, `2ce2a7aff`,
   `ebbeab951`, `6fe238ede`. Pushed `41d6b5507..6fe238ede`; full gate
   **35 PASS, 0 FAIL, 0 gate SKIP**; CI green.
+- **`local.adjustments` capture sharpening**: the `"cap"` arm runs on the
+  clipped ROI. The device copies the ROI to working RGB, samples `RGB2L()`
+  for the manual contrast mask, seeds the Rec2020 luminance plane, runs
+  `CaptureDeconvSharpening_SE()`'s tiled division/multiplication recurrence
+  with the sigma-selected 3x3..13x13 kernels and the 3/5/7/8 border, scales
+  each RGB channel by the new/old luminance ratio, returns through
+  `rgb2lab()` and blends with `transit_shapedetect2()`'s senstype-99
+  (`lp.senssha`) scope. The tile geometry, `itercheck` early exit and 0.01
+  skipped-tile floor are the host's. The end-of-row/column tiles overlap
+  their predecessor and the host's `intp()` blends with the already-written
+  value; the device reproduces that last-writer chain in four ordered
+  phases. Twelve cases (all five kernels, 1..40 iterations, early stop on
+  and off, recovery 50, an ROI clipped at the corner, and combined with
+  blur, tone map and CIE) are within 0.091553 LSB16; the pure capture cases
+  are exact, and every case changes 10,736..40,323 of 270,000 samples
+  against tool-off. `localadjustments-capture.pp3` records 1 LSB16
+  (AE=25,669 of 30,419,712) with `impl=opencl`; the same profile at Loc
+  100/200, sigma 0.55/1.00/2.00, 1/5/10/40 iterations, early stop off and
+  contrast 3/200 is also 1 LSB16. The automatic contrast, gamma wrapper,
+  corner boost and mask display stay fail-closed; nine residual cases are
+  host at PAE 0.
 - **`local.adjustments` blur (partial)**: Blur & Noise runs after log
   encoding and before dehaze in two arms. The Gaussian arm reuses the
   lab.tools IIR line kernel with the context's host-built coefficients at
@@ -501,7 +522,7 @@ current tip.
   image) falls back to the host. POCL gate PASS (1 skipped), CPU suite PASS
   (34 skipped).
 - **Remaining Stage C**: exposure (FFT PDE), the Blur & Noise wavelet denoise
-  and remaining denoise additions, local sharpening capture; then the wavelet
+  and remaining denoise additions; then the wavelet
   denoise/chroma/edges/final/clarity/soft-radius panels. Each is a
   separate multi-session unit. Gate environment: set `TMPDIR` to a
   project-local directory (`/dev/shm` was 100% full and the second 60 MB TIFF
@@ -1049,7 +1070,8 @@ the clarity arm with 20 cases, exact except the denoise pair at
 0.015625 LSB16, and 8 residuals at PAE 0, balance chroma with 10 cases,
 worst 0.052734 LSB16, and 11 residuals at PAE 0),
 then `local.adjustments` exposure, then the wavelet panels. The common mask,
-Retinex and CIE CAM have landed. EPD stays a permanent residual.
+Retinex, CIE CAM and local capture sharpening have landed. EPD stays a
+permanent residual.
 
 ## Next immediate task
 
