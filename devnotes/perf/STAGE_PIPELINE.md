@@ -2009,20 +2009,28 @@ a copy so a refused launch cannot leave the image half processed.
 Partial: `lab.sharpening` runs impulse denoise, defringe, ML sharpen edges and
 ML microcontrast on the device and keeps the main sharpen pass in the shared
 `output.sharpen` node.
-The block is atomic: an image below 8x8, a threshold outside 0..100, a
-defringe radius outside 0..25, a device without fp64, a defringe window wider
+The block is atomic: an image below 8x8, a scale outside `(0, 23/3]`, an
+impulse threshold outside `0..int(100 * scale)`, a defringe threshold outside
+0..100, a defringe radius outside the range the same scale derives about the
+2.0 default or at least 25, a device without fp64, a defringe window wider
 than the image, an edge pass count outside 0..4, an edge amount outside 0..100,
 a microcontrast amount outside 0..100, a contrast outside 0..200 and a
-uniformity outside 0..10 all run the original host block. The whole legal
-radius range is device: the 3x3 convolution below 0.6 and the separable-IIR
-pair from 0.6, the split `gaussianBlur()` makes for the default
-`GAUSS_STANDARD` type the defringe pass requests. In the CIE-CAM arm the node
-keeps only ML sharpen edges;
-the other three run in the CIE-CAM pipeline on the CieImage. Two prescaled
-inputs leave the admitted range while the GUI value is inside it: an export
-scale of two or more pushes the impulse threshold above 100, and a scale
-around 7.7 pushes the defringe radius to 25.0 (the host's double IIR arm);
-both are refusals, not approximations. `output.sharpen` itself is partial: damped
+uniformity outside 0..10 all run the original host block. The export scale
+travels with the node, so `labSharpeningScaleParams()` derives the prescaled
+impulse threshold and defringe radius once and the launcher validates them
+against the same bounds; a negative prescaled radius is the host's Gaussian
+identity and is admitted as a no-op. The upper scale bound is where the
+widest GUI radius reaches `gaussianBlur()`'s double-precision IIR limit
+(`2 + 3 * 23/3 = 25`). The whole legal radius range is device: the 3x3
+convolution below 0.6 and the separable-IIR pair from 0.6, the split
+`gaussianBlur()` makes for the default `GAUSS_STANDARD` type the defringe pass
+requests. In the CIE-CAM arm the node keeps only ML sharpen edges;
+the other three run in the CIE-CAM pipeline on the CieImage. `impulse_nr()`
+clamps its low-pass sigma to 2.0; at scale 1 and that clamp the device mark
+kernel matches the host, and for a scaled export or a threshold above 60 the
+launcher derives the mask with the host's `markImpulse()` and keeps the
+correction on the device, so the scaled threshold parity does not depend on a
+kernel change. `output.sharpen` itself is partial: damped
 RLD, radii at or above 1.15, edges-only, halo control, show-mask and
 `blurradius >= 0.25` run the host builtin. The sub-node records, commands and
 parity results are in `STAGE_RUNTIME.md`.

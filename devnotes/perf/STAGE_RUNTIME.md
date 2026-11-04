@@ -744,29 +744,48 @@ The ABI is `[0]` a tightly packed one-plane F32 L buffer, `[1]` a, `[2]` b,
 then the scalars `[3]` impulse enabled, `[4]` impulse threshold,
 `[5]` defringe enabled, `[6]` defringe radius, `[7]` defringe threshold, `[8]`
 the hue table (F32, one row), `[9]` its entry count, `[10]` the active-curve
-flag and `[11]` a host-only context pointer. The impulse threshold and the
-defringe radius arrive already prescaled by the export; the crop path does not
-prescale. All three planes must be tightly packed and the same size, because
-the host builtin copies them into a `LabImage` and back.
+flag, `[11]` edges enabled, `[12]` edge passes, `[13]` edge amount, `[14]` the
+three-channel flag, `[15]` microcontrast enabled, `[16]` the matrix flag,
+`[17]` microcontrast amount, `[18]` contrast, `[19]` uniformity, `[20]` the
+export scale and `[21]` a host-only context pointer. The impulse threshold
+and the defringe radius arrive already prescaled by `adjust_procparams()`,
+which `labSharpeningScaleParams()` now defines once for the call site, the
+tests and the launcher; the crop path passes scale 1. All three planes must be
+tightly packed and the same size, because the host builtin copies them into a
+`LabImage` and back.
 
 The block is atomic. The launcher refuses before the first upload when the
-image is below 8x8, either threshold is outside 0..100, defringe is enabled
-with a radius outside `0..25`, a running defringe meets a device without fp64
-(its chromaticity mean is a double sum), or the defringe window is wider than
-the image. The whole legal radius range is device, because `PF_correct_RT()`
-always calls `gaussianBlur()` with the default `GAUSS_STANDARD` type: below
-0.25 the blur is the identity, so the pass is a no-op and the node reports OK
-without touching a plane; from 0.25 to below 0.6 it is the 3x3 convolution
-(`rt_sharpen_fir3`, the same kernel as the USM blur); from 0.6 it is the
-separable-IIR pair (`rt_sharpen_iir_line` and `sharpen_iir_factors()`, with the
-sigma rounded to float exactly as `gaussHorizontalSse()` receives it). The
-5x5 and 7x7 kernels belong to `GAUSS_MULT` and `GAUSS_DIV`, which defringe
-never selects, so they are not part of the port. Two prescaled inputs can
-leave the admitted range even though the GUI value is inside it: an export
-scale of two or more raises the impulse threshold above 100, and a scale
-around 7.7 raises the defringe radius to 25.0, where the host's double IIR arm
-takes over. Both are refusals, so the block runs on the host and the output is
-unchanged; they are recorded here rather than silently approximated.
+image is below 8x8, the scale is non-finite or outside `(0, 23/3]`, the
+impulse threshold is outside `0..int(100 * scale)`, the defringe threshold is
+outside 0..100, defringe is enabled with a radius outside
+`2 + (0 - 2) * scale .. 2 + (5 - 2) * scale` or at least 25, a running
+defringe meets a device without fp64 (its chromaticity mean is a double sum),
+or the defringe window is wider than the image. The upper scale bound is the
+point where the widest GUI radius reaches `gaussianBlur()`'s double-precision
+IIR limit, `2 + 3 * 23/3 = 25`, where the host and the device recurrence part
+ways. The scaled radius may be negative when a GUI radius below the 2.0
+default is downscaled; the host blur is then the identity, so the node admits
+it as a no-op. The whole legal radius range is device, because
+`PF_correct_RT()` always calls `gaussianBlur()` with the default
+`GAUSS_STANDARD` type: below 0.25 the blur is the identity, so the pass is a
+no-op and the node reports OK without touching a plane; from 0.25 to below 0.6
+it is the 3x3 convolution (`rt_sharpen_fir3`, the same kernel as the USM
+blur); from 0.6 it is the separable-IIR pair (`rt_sharpen_iir_line` and
+`sharpen_iir_factors()`, with the sigma rounded to float exactly as
+`gaussHorizontalSse()` receives it). The 5x5 and 7x7 kernels belong to
+`GAUSS_MULT` and `GAUSS_DIV`, which defringe never selects, so they are not
+part of the port.
+
+`impulse_nr()` clamps its low-pass sigma to 2.0. At scale 1 and that clamp the
+device mark kernel reproduces the host mask, and a threshold above 60 stays
+inside the same clamp. A scaled export, or a threshold above 60, leaves the
+region where the host SSE blur and the device float recurrence round
+identically, and a one-sample difference can cross the
+`hpfabs > hfnbrave * impthrDiv24` comparison. The launcher therefore derives
+the mask with the host's own `markImpulse()` for those submissions and
+uploads it; the correction kernel still runs on the device. The kernels are
+unchanged, and the prescaled threshold reaches the same corrected output as
+the host.
 
 In the CIE-CAM arm the Lab image carries only ML sharpen edges: impulse
 denoise, defringe and microcontrast run in the CIE-CAM pipeline on the
@@ -783,6 +802,8 @@ also carries the output-sharpening kernels:
 
 - `rt_lab_sharpening_impulse_mark` reproduces `impulse_nr()`'s 5x5 high-pass
   sum and threshold, including the shortened window at both horizontal tails.
+  It runs for a scale-1 submission at or below the 60 threshold clamp; the
+  launcher uploads a host-derived mask otherwise, as described above.
 - `rt_lab_sharpening_impulse_correct` reproduces the range-weighted mean of
   L, a and b over the same window, skipping marked neighbours. Marked sources
   are never read after they are written, so the in-place update is

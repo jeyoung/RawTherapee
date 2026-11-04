@@ -894,8 +894,29 @@ peak absolute error is zero for the synthetic node tests:
   (5x5 matrix, amount 20, contrast 20, uniformity 5) is 1 LSB16, and the two
   radius gates `labsharpening-fir3.pp3` (radius 0.5) and
   `labsharpening-iir.pp3` (radius 1.0) are 1 LSB16; all record
-  `impl=opencl`. A one-refused pair (impulse on, a prescaled defringe
-  threshold 101) is `impl=host`, byte-identical to the CPU path.
+  `impl=opencl`. A one-refused pair (impulse on, a defringe threshold 101) is
+  `impl=host`, byte-identical to the CPU path.
+- The prescaled export inputs are device. `labSharpeningScaleParams()` is the
+  one definition of the export's `adjust_procparams()` formula, and the node
+  carries the scale so the launcher validates the prescaled impulse threshold
+  against `0..int(100 * scale)` and the prescaled defringe radius against
+  `2 + (0 - 2) * scale .. 2 + (5 - 2) * scale`, below the host's 25.0
+  double-IIR limit. A scale of 0, a negative or non-finite scale, a scale
+  above 23/3, a threshold above `100 * scale` and a radius above the derived
+  maximum are refusals, byte-identical to the CPU path. Ten device cases
+  cover scales 0.25, 0.5, 0.75, 1.5 and 2 combined with impulse denoise,
+  defringe, both ML arms and the main pass beside the block; the worst is
+  0.063477 LSB16 on a, every case changes pixels, and the two CIE-CAM scaled
+  cases skip the Lab impulse/defringe/microcontrast passes. A negative
+  prescaled radius (GUI 0.5 at scale 1.5) is the host Gaussian identity and is
+  a device no-op. `labsharpening-scaled.pp3` (fast export, scale 0.5, impulse
+  40) and `labsharpening-prescaled.pp3` (fast export, scale 1.5, defringe
+  radius 0.5 prescaled to -1) record `impl=opencl` at 1 LSB16.
+- `impulse_nr()` clamps its low-pass sigma to 2.0. The device mark kernel is
+  bit-compatible at scale 1 inside that clamp; a scaled export, or a
+  threshold above 60, uses the host's `markImpulse()` for the mask and keeps
+  the correction kernel on the device. The scaled impulse cases are therefore
+  within 0.053711 LSB16 even when the prescaled threshold reaches 160.
 - The defringe radius covers the whole legal range on the device because
   `PF_correct_RT()` requests the default `GAUSS_STANDARD` blur: below 0.25 it
   is the identity (a host no-op), from 0.25 to below 0.6 the 3x3 convolution,
@@ -906,8 +927,8 @@ peak absolute error is zero for the synthetic node tests:
   microcontrast the worst radius case is 0.012695 LSB16 on L and 0.004883 on
   a/b, and every case changes pixels. Eleven radius device cases cover the
   four arms, both channel combinations and the main pass beside the block.
-  A radius outside 0..25, a
-  threshold outside 0..100, an edge pass count outside 0..4, an edge amount
+  A radius outside the derived range or at least 25, a threshold outside its
+  admitted bound, an edge pass count outside 0..4, an edge amount
   outside 0..100, a microcontrast amount outside 0..100, a contrast outside
   0..200, a uniformity outside 0..10, an image narrower than its defringe
   window and a non-fp64 device are residuals. A defringe radius below 0.25,

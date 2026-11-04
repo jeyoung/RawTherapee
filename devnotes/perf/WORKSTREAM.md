@@ -1201,10 +1201,22 @@ non-vacuous; the defringe hue table is not built there, nor with defringe off
 or below 0.25, so a curve the device table cannot follow never refuses a pass
 it cannot reach. `labsharpening-fir3.pp3` (radius 0.5) and
 `labsharpening-iir.pp3` (radius 1.0) are 1 LSB16 export gates recording
-`impl=opencl`. Remaining: the CIE-CAM pipeline's own `defringecam`,
-`impulsedenoisecam` and `MLmicrocontrastcam` on the `CieImage`, which belong to
-the CPU-only `ciecam` node, and prescaled inputs that leave the admitted range
-(threshold > 100 at scale >= 2, radius >= 25 at scale ~7.7).
+`impl=opencl`. The prescaled export inputs are device too: the node carries
+the export scale, `labSharpeningScaleParams()` is the one
+`adjust_procparams()` formula, and the launcher validates the prescaled
+threshold and radius against the bounds that formula derives. Ten cases
+across scales 0.25, 0.5, 0.75, 1.5 and 2 combine impulse, defringe, both ML
+arms and the main pass; the worst is 0.063477 LSB16, all are non-vacuous, and
+the out-of-range scale, threshold and radius cases stay host residuals. Above
+the 2.0 impulse low-pass clamp the mask is host-derived from `markImpulse()`
+and only the correction stays on the device, so the scaled threshold reaches
+the host output without a kernel change. The fast-export gates
+`labsharpening-scaled.pp3` (scale 0.5, impulse) and
+`labsharpening-prescaled.pp3` (scale 1.5, radius 0.5 prescaled to -1, the
+newly admitted Gaussian no-op) are 1 LSB16 and record `impl=opencl`.
+Remaining: the CIE-CAM pipeline's own `defringecam`, `impulsedenoisecam` and
+`MLmicrocontrastcam` on the `CieImage`, which belong to the CPU-only `ciecam`
+node.
 
 After that, in order: `lab.tools` residuals. The black-and-white cheap branch
 landed at `43d6f88bd`: `chromiLuminanceCurve()`'s early return zeroes a/b when
