@@ -18,6 +18,8 @@
  */
 #include <cmath>
 #include <cassert>
+#include <cstddef>
+#include <vector>
 
 #include "rawimagesource.h"
 #include "rawimage.h"
@@ -26,6 +28,8 @@
 #include "rtgui/multilangmgr.h"
 #include "opthelper.h"
 #include "median.h"
+#include "stage/algorithms/raw_demosaic_cl.h"
+#include "stage/stage_runtime.h"
 //#define BENCHMARK
 #include "StopWatch.h"
 #ifdef _OPENMP
@@ -870,6 +874,73 @@ void RawImageSource::nodemosaic(bool bw)
     red(W, H);
     green(W, H);
     blue(W, H);
+
+    /*
+     * The MONO and NONE arms are the raw.demosaic device node: the first
+     * copies the mosaic into all three planes, the second routes each pixel
+     * to the plane named by the CFA. Both are assignments, so the device and
+     * the host produce identical planes. Every interpolating arm stays on the
+     * host, which is why this call site is here and not in the dispatch in
+     * demosaic(): a refusal falls through to the unchanged CPU loop below,
+     * which rewrites every pixel of all three planes.
+     */
+    if (stage::node_device("raw.demosaic") == stage::StageNodeDevice::OpenCL) {
+        const bool cfa_split =
+            !bw && ri->getSensorType() == ST_BAYER &&
+            raw_demosaic_filters_supported(ri->get_filters());
+
+        if (bw || cfa_split) {
+            const std::size_t row_pitch =
+                static_cast<std::size_t>(W) * sizeof(float);
+            RtStageBuffer mosaic{};
+            mosaic.size = sizeof(mosaic);
+            mosaic.data = static_cast<float*>(rawData);
+            mosaic.width = W;
+            mosaic.height = H;
+            mosaic.row_pitch = row_pitch;
+            mosaic.plane_pitch = row_pitch * static_cast<std::size_t>(H);
+            mosaic.planes = 1;
+            mosaic.format = RT_STAGE_F32;
+            mosaic.flags = RT_STAGE_BUFFER_READ;
+
+            RtStageBuffer planes[3];
+            float* const destinations[3] = {
+                static_cast<float*>(red), static_cast<float*>(green),
+                static_cast<float*>(blue)};
+            for (int plane = 0; plane < 3; ++plane) {
+                planes[plane] = {};
+                planes[plane].size = sizeof(RtStageBuffer);
+                planes[plane].data = destinations[plane];
+                planes[plane].width = W;
+                planes[plane].height = H;
+                planes[plane].row_pitch = row_pitch;
+                planes[plane].plane_pitch =
+                    row_pitch * static_cast<std::size_t>(H);
+                planes[plane].planes = 1;
+                planes[plane].format = RT_STAGE_F32;
+                planes[plane].flags = RT_STAGE_BUFFER_WRITE;
+            }
+
+            std::vector<RtStageArg> args(RAW_DEMOSAIC_ARG_COUNT);
+            args[RAW_DEMOSAIC_ARG_RAW].kind = RT_STAGE_ARG_BUFFER;
+            args[RAW_DEMOSAIC_ARG_RAW].u.buffer = mosaic;
+            args[RAW_DEMOSAIC_ARG_RED].kind = RT_STAGE_ARG_BUFFER;
+            args[RAW_DEMOSAIC_ARG_RED].u.buffer = planes[0];
+            args[RAW_DEMOSAIC_ARG_GREEN].kind = RT_STAGE_ARG_BUFFER;
+            args[RAW_DEMOSAIC_ARG_GREEN].u.buffer = planes[1];
+            args[RAW_DEMOSAIC_ARG_BLUE].kind = RT_STAGE_ARG_BUFFER;
+            args[RAW_DEMOSAIC_ARG_BLUE].u.buffer = planes[2];
+            args[RAW_DEMOSAIC_ARG_MONO].kind = RT_STAGE_ARG_INT;
+            args[RAW_DEMOSAIC_ARG_MONO].u.i = bw ? 1 : 0;
+            args[RAW_DEMOSAIC_ARG_FILTERS].kind = RT_STAGE_ARG_INT;
+            args[RAW_DEMOSAIC_ARG_FILTERS].u.i = ri->get_filters();
+
+            if (stage::run("raw.demosaic", args) == RT_STAGE_OK) {
+                return;
+            }
+        }
+    }
+
 #ifdef _OPENMP
     #pragma omp parallel for
 #endif

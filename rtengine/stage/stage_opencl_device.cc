@@ -54,6 +54,7 @@
 #include "stage/algorithms/gamut_cl.h"
 #include "stage/algorithms/lab_to_rgb_cl.h"
 #include "stage/algorithms/raw_cl.h"
+#include "stage/algorithms/raw_demosaic_cl.h"
 #include "stage/algorithms/rgb_proc_cl.h"
 #include "stage/algorithms/sharpen_cl.h"
 #include "stage/algorithms/transform_cl.h"
@@ -1390,6 +1391,7 @@ const std::vector<KernelDef>& kernels()
         {"lab.sharpening", lab_sharpening_source().c_str(),
          "rt_lab_sharpening_impulse_mark"},
         {"raw.preprocess", RT_RAW_CL, "rt_raw_preprocess_scale"},
+        {"raw.demosaic", RT_RAW_DEMOSAIC_CL, "rt_raw_demosaic_nodemosaic"},
         {"framing", framing_source().c_str(), "rt_framing"},
         {"crop", crop_source().c_str(), "rt_crop"},
         {"thumbnail.whitebalance", thumbnail_wb_source().c_str(), "rt_thumbnail_wb"},
@@ -11935,6 +11937,185 @@ RtStageStatus run_raw_preprocess(
 }
 
 /*
+ * raw.demosaic: the MONO and NONE arms of RawImageSource::nodemosaic(), one row
+ * per work item. The mosaic is read and the three planes are written; every
+ * interpolating arm stays on the host, so the caller refuses those before it
+ * calls the node. A refused launch leaves all four host buffers untouched,
+ * because nothing is read back until the kernel has completed.
+ */
+RtStageStatus run_raw_demosaic(
+    const std::shared_ptr<OpenCLEnv>& env,
+    const std::shared_ptr<OpenCLResidency>& residency,
+    const std::vector<RtStageArg>& args, std::string& error)
+{
+    if (args.size() != RAW_DEMOSAIC_ARG_COUNT ||
+        args[RAW_DEMOSAIC_ARG_RAW].kind != RT_STAGE_ARG_BUFFER ||
+        args[RAW_DEMOSAIC_ARG_RED].kind != RT_STAGE_ARG_BUFFER ||
+        args[RAW_DEMOSAIC_ARG_GREEN].kind != RT_STAGE_ARG_BUFFER ||
+        args[RAW_DEMOSAIC_ARG_BLUE].kind != RT_STAGE_ARG_BUFFER ||
+        args[RAW_DEMOSAIC_ARG_MONO].kind != RT_STAGE_ARG_INT ||
+        args[RAW_DEMOSAIC_ARG_FILTERS].kind != RT_STAGE_ARG_INT) {
+        error = "raw.demosaic expects four buffers and two ints";
+        return RT_STAGE_INVALID;
+    }
+
+    const RtStageBuffer* planes[4] = {
+        &args[RAW_DEMOSAIC_ARG_RAW].u.buffer,
+        &args[RAW_DEMOSAIC_ARG_RED].u.buffer,
+        &args[RAW_DEMOSAIC_ARG_GREEN].u.buffer,
+        &args[RAW_DEMOSAIC_ARG_BLUE].u.buffer,
+    };
+
+    for (const RtStageBuffer* plane : planes) {
+        if (!valid(*plane)) {
+            error = "raw.demosaic has an invalid buffer";
+            return RT_STAGE_INVALID;
+        }
+        if (plane->format != RT_STAGE_F32 || plane->planes != 1) {
+            error = "raw.demosaic needs four one-plane F32 buffers";
+            return RT_STAGE_INVALID;
+        }
+        if (plane->width != planes[0]->width ||
+            plane->height != planes[0]->height) {
+            error = "raw.demosaic buffers disagree on the image size";
+            return RT_STAGE_INVALID;
+        }
+    }
+    for (int i = 0; i < 4; ++i) {
+        for (int j = i + 1; j < 4; ++j) {
+            if (planes[i]->data == planes[j]->data) {
+                error = "raw.demosaic needs four distinct buffers";
+                return RT_STAGE_INVALID;
+            }
+        }
+    }
+
+    const std::int64_t mono_arg = args[RAW_DEMOSAIC_ARG_MONO].u.i;
+    if (mono_arg != 0 && mono_arg != 1) {
+        error = "raw.demosaic mono flag is not 0 or 1";
+        return RT_STAGE_INVALID;
+    }
+    const std::int64_t filters_arg = args[RAW_DEMOSAIC_ARG_FILTERS].u.i;
+    if (filters_arg < 0 ||
+        static_cast<std::uint64_t>(filters_arg) >
+            std::numeric_limits<std::uint32_t>::max()) {
+        error = "raw.demosaic filters word is out of range";
+        return RT_STAGE_INVALID;
+    }
+    const std::uint32_t filters = static_cast<std::uint32_t>(filters_arg);
+    if (mono_arg == 0 && !raw_demosaic_filters_supported(filters)) {
+        error = "raw.demosaic refuses a four-colour filter pattern";
+        return RT_STAGE_INVALID;
+    }
+
+    const KernelDef* def = find_kernel("raw.demosaic");
+    assert(def != nullptr);
+    cl_kernel kernel = compiled_kernel(env, def, error);
+    if (kernel == nullptr) {
+        return RT_STAGE_FALLBACK;
+    }
+
+    StageDeviceBufferPtr raw_device;
+    StageDeviceBufferPtr red_device;
+    StageDeviceBufferPtr green_device;
+    StageDeviceBufferPtr blue_device;
+    StageDeviceBufferPtr* devices[4] = {&raw_device, &red_device,
+                                        &green_device, &blue_device};
+    for (int i = 0; i < 4; ++i) {
+        const StageBufferShape shape{RT_STAGE_F32, planes[i]->width,
+                                     planes[i]->height, 1};
+        *devices[i] = residency->acquire(planes[i]->data, shape, &error);
+        if (!*devices[i]) {
+            return RT_STAGE_FALLBACK;
+        }
+    }
+    /* Only the mosaic has host content to preserve; the three destinations
+     * are written in full, so uploading them would be wasted traffic. */
+    if (residency->upload(raw_device, *planes[0]) != RT_STAGE_OK) {
+        error = "raw.demosaic mosaic upload failed";
+        return RT_STAGE_FALLBACK;
+    }
+
+    auto device_raw = std::dynamic_pointer_cast<OpenCLDeviceBuffer>(raw_device);
+    auto device_red = std::dynamic_pointer_cast<OpenCLDeviceBuffer>(red_device);
+    auto device_green =
+        std::dynamic_pointer_cast<OpenCLDeviceBuffer>(green_device);
+    auto device_blue =
+        std::dynamic_pointer_cast<OpenCLDeviceBuffer>(blue_device);
+    if (!device_raw || !device_red || !device_green || !device_blue) {
+        error = "raw.demosaic device buffer mismatch";
+        return RT_STAGE_FALLBACK;
+    }
+
+    const std::size_t pitch_bytes = device_raw->row_pitch();
+    if (device_red->row_pitch() != pitch_bytes ||
+        device_green->row_pitch() != pitch_bytes ||
+        device_blue->row_pitch() != pitch_bytes ||
+        pitch_bytes % sizeof(float) != 0 ||
+        pitch_bytes / sizeof(float) <
+            static_cast<std::size_t>(planes[0]->width)) {
+        error = "raw.demosaic planes disagree on the row pitch";
+        return RT_STAGE_FALLBACK;
+    }
+
+    std::lock_guard<std::recursive_mutex> lock(env->queue_mutex);
+
+    const cl_mem raw_memory = device_raw->memory();
+    const cl_mem red_memory = device_red->memory();
+    const cl_mem green_memory = device_green->memory();
+    const cl_mem blue_memory = device_blue->memory();
+    const cl_int width = planes[0]->width;
+    const cl_int height = planes[0]->height;
+    const cl_int pitch =
+        static_cast<cl_int>(pitch_bytes / sizeof(float));
+    const cl_uint cl_filters = filters;
+    const cl_int cl_mono = static_cast<cl_int>(mono_arg);
+
+    const auto set_arg = [&](cl_uint index, std::size_t bytes,
+                             const void* value) {
+        return env->api->SetKernelArg(kernel, index, bytes, value) == CL_SUCCESS;
+    };
+    const bool args_ok =
+        set_arg(0, sizeof(cl_mem), &raw_memory) &&
+        set_arg(1, sizeof(cl_mem), &red_memory) &&
+        set_arg(2, sizeof(cl_mem), &green_memory) &&
+        set_arg(3, sizeof(cl_mem), &blue_memory) &&
+        set_arg(4, sizeof(cl_int), &width) &&
+        set_arg(5, sizeof(cl_int), &height) &&
+        set_arg(6, sizeof(cl_int), &pitch) &&
+        set_arg(7, sizeof(cl_uint), &cl_filters) &&
+        set_arg(8, sizeof(cl_int), &cl_mono);
+    if (!args_ok) {
+        error = "raw.demosaic clSetKernelArg failed";
+        return RT_STAGE_FALLBACK;
+    }
+
+    const std::size_t global = static_cast<std::size_t>(height);
+    cl_event done = nullptr;
+    if (env->api->EnqueueNDRangeKernel(env->queue, kernel, 1, nullptr, &global,
+                                       nullptr, 0, nullptr,
+                                       &done) != CL_SUCCESS ||
+        done == nullptr) {
+        error = "raw.demosaic launch failed";
+        return RT_STAGE_ERROR;
+    }
+    const cl_int wait_status = env->api->WaitForEvents(1, &done);
+    env->api->ReleaseEvent(done);
+    if (wait_status != CL_SUCCESS) {
+        error = "raw.demosaic did not complete";
+        return RT_STAGE_ERROR;
+    }
+    if (residency->readback(red_device, *planes[1]) != RT_STAGE_OK ||
+        residency->readback(green_device, *planes[2]) != RT_STAGE_OK ||
+        residency->readback(blue_device, *planes[3]) != RT_STAGE_OK) {
+        error = "raw.demosaic readback failed";
+        return RT_STAGE_ERROR;
+    }
+
+    return RT_STAGE_OK;
+}
+
+/*
  * Output sharpening, USM and undamped RLD. Arguments are documented in
  * stage/algorithms/sharpen_cl.h. The L plane is the only transfer: the mask,
  * the blur, the RLD estimate and the RLD intermediate live in device scratch.
@@ -20647,6 +20828,20 @@ public:
         } else if (request.name == "raw.preprocess") {
             const RtStageStatus status =
                 run_raw_preprocess(env_, residency_, request.args, error);
+            if (status == RT_STAGE_OK) {
+                StageEvent done;
+                done.status = StageEventStatus::Complete;
+                done.result = RT_STAGE_OK;
+                done.device = StageDeviceType::OPENCL;
+                done.asynchronous = false;
+                return done;
+            }
+            StageEvent fallback = StageQueue::submit(request, profiling);
+            fallback.note = error;
+            return fallback;
+        } else if (request.name == "raw.demosaic") {
+            const RtStageStatus status =
+                run_raw_demosaic(env_, residency_, request.args, error);
             if (status == RT_STAGE_OK) {
                 StageEvent done;
                 done.status = StageEventStatus::Complete;
