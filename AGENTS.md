@@ -161,7 +161,7 @@ tools/perf/test-preview-base-cache.sh "$RT_BUILD_DIR"
 - Clear a unit's gate and export artefacts once its figures are recorded:
   `tools/opencl/clean-scratch.sh --apply`. Never remove `build/bench`, the
   `*-rocm-bench` trees, `build/test-scratch/rocm-bench`, `pocl-cache`,
-  `ccache` or `rt-testdata`.
+  `ccache`, `build/rt-testdata` or `build/portable` (the package directory).
 - `SKIP` is not `PASS`. On an OpenCL-enabled build with no selected device,
   `RT_ALLOW_CPU_PARITY=1` permits a CPU-only `--formats` comparison; record
   it as CPU-only, never as GPU parity. `--quick` and `--rgbproc` still

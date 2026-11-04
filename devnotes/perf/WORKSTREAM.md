@@ -73,6 +73,12 @@ current tip.
 
 ## Progress log — resumed 2026-10-28 (Block 4 completion)
 
+- **Cleanup incident (2026-11-04)**: the build-tree purge also removed
+  `build/portable`, which is the package directory and must be retained. The
+  directory is restored; the deleted `.deb` is reproducible with
+  `tools/build-rt.sh portable` from `3871b7d0c`. `clean-scratch.sh` and the
+  AGENTS checklist now name `build/portable` explicitly.
+
 - **Push (2026-10-29)**: `origin/perf-graph` advanced `192760b7c..03c94581c`
   (166 commits) after the publication gate; identities, range diff, messages,
   tags and manifests are clean. From now on each stable, scanned range is

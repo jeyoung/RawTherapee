@@ -17,8 +17,8 @@
 #      benchmark inputs and outputs, owned by the benchmark workstream;
 #    build/test-scratch/pocl-cache
 #      the POCL kernel cache, which avoids recompiling every kernel;
-#    build/ccache and build/rt-testdata
-#      the compiler cache and the shared corpus.
+#    build/ccache, build/rt-testdata and build/portable
+#      the compiler cache, the shared corpus and the package directory.
 #
 set -euo pipefail
 
