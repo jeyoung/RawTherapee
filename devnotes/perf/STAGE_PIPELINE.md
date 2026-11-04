@@ -2373,7 +2373,18 @@ laplacian, the standalone `enamask` tool, the recovery threshold's upper half
 (1..2, which also enables the mask deltaE reference), a CIE mask combined
 with tone mapping, and the deltaE mask (`spot.deltae`).
 
-Everything else is a residual: exposure (FFT PDE), soft light's `"reti"`
+Local exposure's PDE arm is a device case when `linear > 0`,
+`laplacexp > 0.1`, `gamex == 1` and the ROI is one of the `fftw_size[]`
+entries 64, 65, 80, 96, 100 or 128 on both axes. The tone plane is
+`exlabLocal()`'s LUT sequence; the Laplacian input is bit-identical to the
+host, and a direct double REDFT10/REDFT01 pair plus the host-built cosine and
+Poisson tables carry the PDE. Fifteen cases measure a worst 0.030518 LSB16,
+and the export profile is 1 LSB16 with `impl=opencl`. An ROI outside that set,
+`gamex != 1`, a black point, shadow recovery, chroma, gradient, structure,
+fat, mask, soft radius, the exposure curve, noise median or the gamma wrapper
+is a residual.
+
+Everything else is a residual: soft light's `"reti"`
 method, the shadows/highlights
 `"tone"`/`"ghs"`/`"micha"` methods, tone-eq multipliers, a non-default tone
 gamma/slope, the SH recovery blend and gradient, vibrance

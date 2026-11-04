@@ -8,7 +8,7 @@ records. Update it with each landed unit.
 Refreshed 2026-11-03. P0 blocks 1-4.1 are complete; block 4 device coverage is
 the remaining large piece and is scoped below. Stage C has landed local
 sharpening (base and damped), the Blur & Noise Gaussian and median arms with
-the default denoise curve admitted, `crop` and
+the default denoise curve admitted, local exposure's PDE arm, `crop` and
 the `lab.sharpening` impulse-denoise/defringe pair; the remaining Stage C
 units are multi-session and are ordered below. Each stable, scanned range is
 pushed from 2026-10-29 on.
@@ -521,7 +521,21 @@ current tip.
   planes, so a ROI beyond the device budget (a full-frame spot on a 10 MP
   image) falls back to the host. POCL gate PASS (1 skipped), CPU suite PASS
   (34 skipped).
-- **Remaining Stage C**: exposure (FFT PDE), the Blur & Noise wavelet denoise
+- **`local.adjustments` exposure (PDE arm)**: the tone plane is
+  `exlabLocal()`'s host-built highlight/shadow/tone LUT sequence and the
+  Laplacian input `pow_F(LIM01(L/32768), gamm)*32768` is bit-identical to the
+  host (`memcmp` 0, all admitted sizes). The device then runs a direct double
+  REDFT10/REDFT01 DCT pair, the host cosine/Poisson tables,
+  `normalize_mean_dt()`'s two double reductions and the senstype-1 blend.
+  Admitted ROIs are the `fftw_size[]` entries 64, 65, 80, 96, 100 and 128 on
+  each axis, so `optfft()` is the identity; outside that set, the gamma
+  wrapper, black point, shadow recovery, chroma, gradient, structure, fat,
+  masks, soft radius or noise median fall back to the host. Fifteen device
+  cases measure worst 0.030518 LSB16; the 0.7 case moves 7,607 of 49,152
+  samples against tool off; `localadjustments-exposure.pp3` records
+  `impl=opencl` and differs on 62 of 30,419,712 samples at 1 LSB16. CPU suite
+  PASS (35 skipped), POCL suite PASS (1 skipped).
+- **Remaining Stage C**: the Blur & Noise wavelet denoise
   and remaining denoise additions; then the wavelet
   denoise/chroma/edges/final/clarity/soft-radius panels. Each is a
   separate multi-session unit. Gate environment: set `TMPDIR` to a

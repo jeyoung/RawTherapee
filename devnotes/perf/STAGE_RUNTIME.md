@@ -2901,9 +2901,9 @@ submission.
 increment covers any number of `norm` spots in list order, both `ELI` and
 `RECT`, inactive clamp-only spots, the L/C/H curves, local log encoding,
 Blur & Noise (Gaussian and median), local dehaze, local CBDL, vibrance,
-Gaussian local contrast, local sharpening, Lab-mode `"std"`
-shadows/highlights, per-pixel `"soft"` soft light, the CAM16 `"com"` CIE CAM
-arm, and the
+Gaussian local contrast, local sharpening, local exposure's PDE arm,
+Lab-mode `"std"` shadows/highlights, per-pixel `"soft"` soft light, the
+CAM16 `"com"` CIE CAM arm, and the
 `avoidgamutMethod` values `"NONE"` and `"MUNS"`. The per-spot clamp
 is bit-exact against the host, so the Munsell pass runs on the device. The
 other tools, the other shadows/highlights methods (tone, GHS,
@@ -2919,7 +2919,11 @@ method, out-of-range passes, the FFT, noise, grain, bilateral and
 non-local-means additions, an active wavelet denoise (a non-zero curve with
 Quality other than "Off", or `qualityMethod "enhden"`), and this node's own
 `avoidgamutMethod` LAB/XYZ/XYZREL arms
-stay on the host. The tools run in the block's order:
+stay on the host. Local exposure is admitted only with `gamex == 1`, no
+black point, shadow recovery, chroma, gradient, structure, fat, mask or
+soft radius, and an ROI on each axis equal to one of the `fftw_size[]`
+entries 64, 65, 80, 96, 100 or 128; the other exposure settings stay on the
+host. The tools run in the block's order:
 log encoding, Blur & Noise, Tone Mapping, dehaze, CBDL, vibrance,
 shadows/highlights, soft
 light, local contrast, local sharpening, Colour & Light, then CIE CAM.
@@ -2936,7 +2940,7 @@ The launcher keeps a contiguous host staging copy of the Lab image and a
 device `reserved` copy of the initial image. For each spot it calls
 `build(self, spot, &staging, &setup)`, which runs the block's own
 `calcLocalParams()`, `calc_ref()` on the current Lab, `complexCurvelocal()`
-and the curve factories. It then uploads that spot's 352-float record and
+and the curve factories. It then uploads that spot's 384-float record and
 tables, runs the passes, and reads the device image back into the staging
 copy. Spot N+1's references therefore see spot N's result through the same
 read-back path as the CPU's `labView`. `reserved` is never updated, matching
@@ -2959,6 +2963,15 @@ lab.regions `xlogf`/`xexpf`/`pow_F` ports, and the local-adjustments kernels:
   for those. The prefilter uses `epsi0 = 1e-6`; the tail uses `epsi = 1e-5`
   and the recorded clamp arm.
 - `rt_local_adjustments_roi`: copies the active spot ROI.
+- `rt_local_adjustments_exposure_tone`, `_exposure_input`, `_exposure_laplacian`,
+  `_exposure_dct_rows`, `_exposure_dct_cols`, `_exposure_poisson`,
+  `_exposure_normalize` and `_exposure_gamma`: local exposure's PDE arm. The
+  tone kernel replays `exlabLocal()`'s LUT sequence (with the host's
+  `hlfactor * pow_F(2, addcomp)` grouping and the tone curve's
+  `LUT_CLIP_OFF` extrapolation), the input kernel builds the bit-identical
+  Laplacian plane, the direct double REDFT10/REDFT01 pair reproduces FFTW's
+  DCT, and the normalise kernel repeats `normalize_mean_dt()`'s two double
+  reductions and standard-deviation ratio.
 - `rt_local_adjustments_sharpen_fill`: the RL arm's zero-padded
   `(lx + lxL + 3) x (ly + lyT + 3)` input plane. The padding matters: the
   block's deconvolution sees zeros outside the image, not the IIR border
@@ -3135,8 +3148,15 @@ zero `multsh` multipliers, `gamSH == 2.4`, `sloSH == 12.92` and sliders inside
 their ABI ranges; the `"tone"`, `"ghs"` and `"micha"` methods are host
 residuals. Soft light requires `softMethod == "soft"` with `streng` and
 `sensisf` in `1..100`; `"reti"` is a host residual. Inactive spots are
-clamp-only and may carry inert tool settings. Everything else is a residual:
-exposure (FFT PDE), the other shadows/highlights methods and
+clamp-only and may carry inert tool settings. Local exposure requires
+`expMethod == "pde"`, `linear > 0`, `laplacexp > 0.1`, `gamex == 1`,
+`expcomp` in `-2..4`, `gamm` in `0.1..10`, zero black point, shadow
+recovery, chroma, gradient, structure, soft radius, fat and masks,
+`reparexp == 100`, and a ROI of 64, 65, 80, 96, 100 or 128 px on each axis;
+those sizes are `fftw_size[]` entries, so `optfft()` is the identity. An
+out-of-set ROI is refused before the upload and runs the host block.
+Everything else is a residual: the other exposure settings, the other
+shadows/highlights methods and
 tone-eq/recovery/gradient sub-options, the local-contrast wavelet and FFT
 variants, vibrance gamma/gradients/warm, blur/denoise, capture
 auto contrast/gamma/corner boost,

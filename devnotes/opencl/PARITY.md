@@ -121,6 +121,9 @@ pairs are exact. The gate is the peak absolute error (PAE) in normalised units;
 | 2026-11-04 | uncommitted | POCL (CPU) | colorspace_flowers.pef / `localadjustments-capture.pp3` (manual contrast, 5x5, 25 iterations), `local.adjustments` | off vs auto, 16-bit TIFF | 1 LSB (AE=25,669 of 30,419,712, PAE 1 code) | PASS |
 | 2026-11-04 | uncommitted | POCL (CPU) | 12-case local capture-sharpening matrix (3x3/5x5/7x7/9x9/13x13, 1..40 iterations, early stop on/off, recovery 50, an ROI clipped at the image corner, combined with blur, tone map and CIE), `stage-residency-test` | device vs host block | 0.091553 LSB16 (worst: combined with CIE; the pure capture cases are exact) | PASS |
 | 2026-11-04 | uncommitted | POCL (CPU) | 9-case local capture-sharpening refusal matrix (auto contrast, gamma, corner boost, sigma/iteration/contrast/recovery/sensitivity ranges, mask view), `stage-residency-test` | predicate refuses | 0 (host) | PASS |
+| 2026-11-04 | uncommitted | POCL (CPU) | colorspace_flowers.pef / `localadjustments-exposure.pp3` (128x65 ROI, `laplacexp=0.4`, `linear=0.2`, `expcomp=0.7`), `local.adjustments` | off vs auto, 16-bit TIFF | 1 LSB (62 of 30,419,712) | PASS |
+| 2026-11-04 | uncommitted | POCL (CPU) | 15-case local exposure PDE matrix (64x64, 65x65, 80x80, 96x96, 100x100 and 128x128, `laplacexp` 0.11/0.3/0.4/0.5/0.8/1.0, `linear` 0.05/0.2/0.3/0.9, `expcomp` 0/0.4/0.7/1.5/-0.5, highlight compression and thresholds, `balanexp` 0.8/1.0/1.2, `gamm` 0.2/0.4/0.6, sensitivity 0/30/50/60/90/100, the 0.001 exposure fixup), `stage-residency-test` | device vs host block | 0.030518 LSB16 (worst: 0.7 and 1.5) | PASS |
+| 2026-11-04 | uncommitted | POCL (CPU) | 2-case local exposure ROI refusal matrix (200x200 and 50x50, outside the admitted `fftw_size[]` set) and the gamma-wrapper residual, `stage-residency-test` | predicate/launcher refuses | 0 (host) | PASS |
 | 2026-11-03 | `7fc43d8a3..uncommitted` | POCL (CPU) | colorspace_flowers.pef / `labwavelet-denoise-expert.pp3` (Expnoise, `complexMethod=expert`, `sliMethod=cur`, `mixMethod=mix7`, non-identity `wavdenoise`, `Levelsigm=0.7;1.6`, `Leveldenoise=5;4`, `Limden=0.4`), `lab.wavelet` | off vs auto, 16-bit TIFF | 1 LSB (AE=1, 15,637 of 30,419,712) | PASS |
 | 2026-11-03 | `7fc43d8a3..uncommitted` | POCL (CPU) | 8-case expert-pairing matrix (`sliMethod` cur and sli+Thrden, `Levelsigm` 1/1, 3/3, 3/0.05, 0.05/3, 2.5/1.5, 0.05/0.05, 1.5/0.75, `Limden` 0, 0.5, 0.75 and 1, contrast, edge, final curves, odd 179x161), `stage-residency-test` | device vs host block | 0.158691 LSB16 (worst: odd all panels) | PASS |
 | 2026-11-03 | `7fc43d8a3..uncommitted` | POCL (CPU) | 4-case expert refusal matrix (`Levelsigm` top and bottom out of range, `Limden` above range, non-identity `Wavdenoiseh`), `stage-residency-test` | device vs host block | 0 (host) | PASS |
@@ -444,6 +447,23 @@ peak absolute error is zero for the synthetic node tests:
   contrast, the gamma wrapper, the corner radius boost and the mask display
   stay fail-closed; the auto-contrast refusal is the same default profile
   the earlier residual matrix used.
+- Local exposure, through `local.adjustments`, runs the PDE arm
+  (`expmet == 1`, `linear > 0`, `laplacexp > 0.1`) on the device. The tone
+  plane is `exlabLocal()`'s highlight/shadow/tone LUT sequence; its arithmetic
+  grouping (`L *= hlfactor * pow_F(2, addcomp)`) and the tone curve's
+  `LUT_CLIP_OFF` extrapolation are reproduced exactly, so the Laplacian input
+  `pow_F(LIM01(L / 32768), gamm) * 32768` is bit-identical to the host
+  (`memcmp` 0 of 4,096 samples on the 64x64 case and 0 on every admitted
+  size). A direct double-precision REDFT10/REDFT01 pair and the host-built
+  cosine/`rex_poisson_dct` tables reproduce FFTW's PDE to 0.005859 LSB16.
+  Fifteen cases across 64x64..128x128 (the `fftw_size[]` entries; `optfft()`
+  is then the identity) match the host block with a worst peak error of
+  0.030518 LSB16; the 0.7 case changes 7,607 of 49,152 samples against the
+  tool off, so the parity is not vacuous. `localadjustments-exposure.pp3`
+  records `impl=opencl` and matches the `--gpu=off` 16-bit TIFF on 62 of
+  30,419,712 samples at 1 LSB16. A 200x200 or 50x50 ROI, the gamma wrapper,
+  black point, shadow recovery, chroma, gradient, structure, fat, masks and
+  an ROI not in the admitted set fall back to the host block.
 - Blur & Noise, through `local.adjustments`, has two arms. The Gaussian arm
   reuses the blur arm's line kernel with the context's host-built
   coefficients at the block's `lp.rad / (sk * 1.4)` sigma; the median arm
