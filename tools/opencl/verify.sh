@@ -255,6 +255,7 @@ quick() {
     run_stage_device "pef/stage-device-transform" \
         "$ROOT/devnotes/opencl/pp3/rotate.pp3" transform
     run_stage_device "pef/stage-device-output" "" output.convert
+    run_stage_device "pef/stage-device-raw-preprocess" "" raw.preprocess
     run_stage_device "pef/stage-device-rgbproc" \
         "$ROOT/devnotes/opencl/pp3/rgbproc-exposure.pp3" rgb.proc
     run_stage_device "pef/stage-device-framing" \
@@ -690,6 +691,7 @@ stage_device() {
     run_stage_device "pef/stage-device-transform" \
         "$ROOT/devnotes/opencl/pp3/rotate.pp3" transform
     run_stage_device "pef/stage-device-output" "" output.convert
+    run_stage_device "pef/stage-device-raw-preprocess" "" raw.preprocess
     run_stage_device "pef/stage-device-rgbproc" \
         "$ROOT/devnotes/opencl/pp3/rgbproc-exposure.pp3" rgb.proc
     run_stage_device "pef/stage-device-framing" \

@@ -26,6 +26,7 @@
 #include "settings.h"
 #include "utils.h"
 #include "stage/algorithms/gamut_cl.h"
+#include "stage/algorithms/raw_cl.h"
 #include "stage/algorithms/sharpen_cl.h"
 #include "stage/ciecam_context.h"
 #include "stage/lab_tools_context.h"
@@ -4912,6 +4913,358 @@ void test_output_sharpen(bool available)
                     "%zu of %zu samples carry the mask\n",
                     written.differing, written.samples);
     }
+}
+
+/* --------------------------------------------------------- raw.preprocess */
+
+struct RawScaleDiff {
+    double max_abs = 0.0;
+    std::size_t differing = 0;
+    std::size_t samples = 0;
+    bool finite = true;
+};
+
+RawScaleDiff compare_raw_scale(const std::vector<float>& actual,
+                               const std::vector<float>& expected)
+{
+    RawScaleDiff diff;
+    if (actual.size() != expected.size()) {
+        diff.finite = false;
+        return diff;
+    }
+    for (std::size_t i = 0; i < actual.size(); ++i) {
+        ++diff.samples;
+        if (!std::isfinite(actual[i]) || !std::isfinite(expected[i])) {
+            diff.finite = false;
+        }
+        const double delta = std::fabs(static_cast<double>(actual[i]) -
+                                       static_cast<double>(expected[i]));
+        if (delta > 0.0) {
+            ++diff.differing;
+        }
+        diff.max_abs = std::max(diff.max_abs, delta);
+    }
+    return diff;
+}
+
+/* The CPU arm of RawImageSource::scaleColors() for a Bayer mosaic. */
+void host_raw_scale(std::vector<float>& mosaic, int parent_width, int winx,
+                    int winy, int winw, int winh, std::uint32_t filters,
+                    const float coeffs[RAW_PREPROCESS_COEFF_COUNT],
+                    float chmax[3])
+{
+    chmax[0] = chmax[1] = chmax[2] = 0.0f;
+    for (int row = winy; row < winy + winh; ++row) {
+        const std::uint32_t tile_row =
+            (static_cast<std::uint32_t>(row) << 1) & 14u;
+        for (int col = winx; col < winx + winw; ++col) {
+            const std::uint32_t tile_col =
+                static_cast<std::uint32_t>(col) & 1u;
+            const std::uint32_t c =
+                (filters >> ((tile_row + tile_col) << 1)) & 3u;
+            const std::uint32_t c4 =
+                (c == 1u && (row & 1) == 0) ? 3u : c;
+            const std::size_t index =
+                static_cast<std::size_t>(row) * parent_width + col;
+            const float val =
+                std::max(0.0f, mosaic[index] - coeffs[c4]) *
+                coeffs[4 + c4];
+            mosaic[index] = val;
+            if (c == 0u) {
+                chmax[0] = std::max(chmax[0], val);
+            } else if (c == 1u) {
+                chmax[1] = std::max(chmax[1], val);
+            } else if (c == 2u) {
+                chmax[2] = std::max(chmax[2], val);
+            }
+        }
+    }
+}
+
+std::vector<RtStageArg> raw_scale_args(
+    float* origin, int parent_width, int winw, int winh, float* coeffs,
+    float* row_max, std::uint32_t filters, int winx, int winy)
+{
+    RtStageBuffer image{};
+    image.size = sizeof(image);
+    image.data = origin;
+    image.width = winw;
+    image.height = winh;
+    image.row_pitch =
+        static_cast<std::size_t>(parent_width) * sizeof(float);
+    image.plane_pitch = image.row_pitch * static_cast<std::size_t>(winh);
+    image.planes = 1;
+    image.format = RT_STAGE_F32;
+    image.flags = RT_STAGE_BUFFER_READ | RT_STAGE_BUFFER_WRITE;
+
+    RtStageBuffer coeff_buffer{};
+    coeff_buffer.size = sizeof(coeff_buffer);
+    coeff_buffer.data = coeffs;
+    coeff_buffer.width = RAW_PREPROCESS_COEFF_COUNT;
+    coeff_buffer.height = 1;
+    coeff_buffer.row_pitch = RAW_PREPROCESS_COEFF_COUNT * sizeof(float);
+    coeff_buffer.plane_pitch = coeff_buffer.row_pitch;
+    coeff_buffer.planes = 1;
+    coeff_buffer.format = RT_STAGE_F32;
+    coeff_buffer.flags = RT_STAGE_BUFFER_READ;
+
+    RtStageBuffer max_buffer{};
+    max_buffer.size = sizeof(max_buffer);
+    max_buffer.data = row_max;
+    max_buffer.width = 3 * winh;
+    max_buffer.height = 1;
+    max_buffer.row_pitch =
+        static_cast<std::size_t>(winh) * 3 * sizeof(float);
+    max_buffer.plane_pitch = max_buffer.row_pitch;
+    max_buffer.planes = 1;
+    max_buffer.format = RT_STAGE_F32;
+    max_buffer.flags = RT_STAGE_BUFFER_READ | RT_STAGE_BUFFER_WRITE;
+
+    std::vector<RtStageArg> args(RAW_PREPROCESS_ARG_COUNT);
+    args[RAW_PREPROCESS_ARG_IMAGE].kind = RT_STAGE_ARG_BUFFER;
+    args[RAW_PREPROCESS_ARG_IMAGE].u.buffer = image;
+    args[RAW_PREPROCESS_ARG_COEFFS].kind = RT_STAGE_ARG_BUFFER;
+    args[RAW_PREPROCESS_ARG_COEFFS].u.buffer = coeff_buffer;
+    args[RAW_PREPROCESS_ARG_ROW_MAX].kind = RT_STAGE_ARG_BUFFER;
+    args[RAW_PREPROCESS_ARG_ROW_MAX].u.buffer = max_buffer;
+    args[RAW_PREPROCESS_ARG_FILTERS].kind = RT_STAGE_ARG_INT;
+    args[RAW_PREPROCESS_ARG_FILTERS].u.i = filters;
+    args[RAW_PREPROCESS_ARG_ORIGIN_X].kind = RT_STAGE_ARG_INT;
+    args[RAW_PREPROCESS_ARG_ORIGIN_X].u.i = winx;
+    args[RAW_PREPROCESS_ARG_ORIGIN_Y].kind = RT_STAGE_ARG_INT;
+    args[RAW_PREPROCESS_ARG_ORIGIN_Y].u.i = winy;
+    return args;
+}
+
+RtStageStatus run_device_raw_scale(
+    const std::shared_ptr<StageContext>& context, std::vector<float>& mosaic,
+    int parent_width, int winx, int winy, int winw, int winh,
+    std::uint32_t filters, float* coeffs, float* row_max,
+    StageExecution& execution, std::string& error)
+{
+    float* origin = mosaic.data() +
+                    static_cast<std::size_t>(winy) * parent_width + winx;
+    StageRequest request;
+    request.name = "raw.preprocess";
+    request.args = raw_scale_args(origin, parent_width, winw, winh, coeffs,
+                                  row_max, filters, winx, winy);
+    set_node_device_override("raw.preprocess", StageNodeDevice::OpenCL);
+    const RtStageStatus status = context->execute(request, nullptr, &execution);
+    clear_node_device_overrides();
+    return status;
+}
+
+void test_raw_preprocess(bool available)
+{
+    using namespace rtengine::stage;
+
+    /* Four-colour patterns are not the loop the node reproduces. */
+    check(!raw_scale_filters_supported(0xffffffffu),
+          "raw.preprocess refuses a four-colour filter word");
+    check(raw_scale_filters_supported(0x94949494u),
+          "raw.preprocess accepts RGGB");
+    check(raw_scale_filters_supported(0x61616161u),
+          "raw.preprocess accepts BGGR");
+    check(raw_scale_filters_supported(0x49494949u),
+          "raw.preprocess accepts GRBG");
+    check(raw_scale_filters_supported(0x16161616u),
+          "raw.preprocess accepts GBRG");
+
+    if (!available) {
+        skip("raw.preprocess: no OpenCL device");
+        return;
+    }
+
+    const auto context = opencl_device()->create_context();
+    check(context != nullptr, "raw.preprocess: the device creates a context");
+    if (context == nullptr) {
+        return;
+    }
+
+    float coeffs[RAW_PREPROCESS_COEFF_COUNT] = {
+        16.0f, 15.0f, 17.0f, 15.0f, 1.25f, 1.0f, 0.9f, 1.0f};
+    const std::uint32_t filters = 0x94949494u;
+
+    struct ScaleCase {
+        const char* label;
+        int parent_width;
+        int winx;
+        int winy;
+        int winw;
+        int winh;
+        std::uint32_t pattern;
+    };
+
+    const std::vector<ScaleCase> cases = {
+        {"padded rect", 67, 3, 2, 63, 31, filters},
+        {"full frame", 63, 0, 0, 63, 31, filters},
+        {"one pixel", 5, 2, 1, 1, 1, filters},
+        {"single column", 9, 4, 1, 1, 7, filters},
+        {"single row", 17, 2, 3, 13, 1, filters},
+        {"odd origin", 66, 1, 1, 63, 31, filters},
+        {"BGGR", 67, 3, 2, 63, 31, 0x61616161u},
+        {"GRBG", 67, 3, 2, 63, 31, 0x49494949u},
+        {"GBRG", 67, 3, 2, 63, 31, 0x16161616u},
+    };
+
+    unsigned seed = 71u;
+    for (const ScaleCase& item : cases) {
+        const int rows = item.winy + item.winh;
+        std::vector<float> source(
+            static_cast<std::size_t>(item.parent_width) * rows, 0.0f);
+        for (int y = 0; y < rows; ++y) {
+            for (int x = 0; x < item.parent_width; ++x) {
+                const unsigned value =
+                    (seed + static_cast<unsigned>(x) * 977u +
+                     static_cast<unsigned>(y) * 6151u) %
+                    70000u;
+                source[static_cast<std::size_t>(y) * item.parent_width + x] =
+                    static_cast<float>(value);
+            }
+        }
+        ++seed;
+
+        std::vector<float> cpu = source;
+        float cpu_max[3] = {0.0f, 0.0f, 0.0f};
+        host_raw_scale(cpu, item.parent_width, item.winx, item.winy,
+                       item.winw, item.winh, item.pattern, coeffs, cpu_max);
+
+        std::vector<float> device = source;
+        std::vector<float> row_max(
+            static_cast<std::size_t>(item.winh) * 3, 0.0f);
+        StageExecution execution;
+        std::string error;
+        const RtStageStatus status = run_device_raw_scale(
+            context, device, item.parent_width, item.winx, item.winy,
+            item.winw, item.winh, item.pattern, coeffs,
+            row_max.data(), execution, error);
+        const std::string prefix = std::string("raw.preprocess ") + item.label;
+        check(status == RT_STAGE_OK, (prefix + " completes").c_str());
+        check(execution.device == StageDeviceType::OPENCL,
+              (prefix + " runs on the device").c_str());
+        check(!execution.asynchronous,
+              (prefix + " reads back synchronously").c_str());
+
+        const RawScaleDiff diff = compare_raw_scale(device, cpu);
+        check(diff.finite, (prefix + " is finite").c_str());
+        check(diff.differing == 0 && diff.max_abs == 0.0,
+              (prefix + " is bit-exact").c_str());
+
+        float device_max[3] = {0.0f, 0.0f, 0.0f};
+        for (int row = 0; row < item.winh; ++row) {
+            device_max[0] = std::max(device_max[0], row_max[3 * row + 0]);
+            device_max[1] = std::max(device_max[1], row_max[3 * row + 1]);
+            device_max[2] = std::max(device_max[2], row_max[3 * row + 2]);
+        }
+        check(device_max[0] == cpu_max[0] && device_max[1] == cpu_max[1] &&
+                  device_max[2] == cpu_max[2],
+              (prefix + " reproduces chmax").c_str());
+
+        const RawScaleDiff changed = compare_raw_scale(device, source);
+        check(changed.differing > 0,
+              (prefix + " is non-vacuous").c_str());
+        std::printf("stage-residency: %s: PAE %.6f, %zu of %zu samples "
+                    "differ, chmax %.3f/%.3f/%.3f\n",
+                    prefix.c_str(), diff.max_abs, diff.differing,
+                    diff.samples, static_cast<double>(device_max[0]),
+                    static_cast<double>(device_max[1]),
+                    static_cast<double>(device_max[2]));
+    }
+
+    /* The accepted request records a device execution through run(). */
+    const std::string profile_path =
+        std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp") +
+        "/stage-residency-raw-preprocess.jsonl";
+
+    {
+        const int width = 63;
+        const int height = 31;
+        std::vector<float> mosaic(
+            static_cast<std::size_t>(width) * height, 1234.0f);
+        std::vector<float> row_max(static_cast<std::size_t>(height) * 3, 0.0f);
+
+        std::remove(profile_path.c_str());
+        setenv("RT_STAGE_PROFILE", profile_path.c_str(), 1);
+        set_node_device_override("raw.preprocess", StageNodeDevice::OpenCL);
+        const RtStageStatus status = run(
+            "raw.preprocess",
+            raw_scale_args(mosaic.data(), width, width, height,
+                           coeffs, row_max.data(),
+                           filters, 0, 0));
+        clear_node_device_overrides();
+        const std::string profile = read_file(profile_path);
+        unsetenv("RT_STAGE_PROFILE");
+
+        check(status == RT_STAGE_OK, "raw.preprocess completes through run()");
+        check(profile.find("\"stage\":\"raw.preprocess\"") != std::string::npos,
+              "raw.preprocess records the node");
+        check(profile.find("\"impl\":\"opencl\"") != std::string::npos,
+              "raw.preprocess records a device execution");
+    }
+
+    /*
+     * Every launcher refusal runs before the upload, so the caller's CPU loop
+     * still sees its own pixels. The host fallback itself lives in
+     * RawImageSource::scaleColors(): the node is entered only for a
+     * three-colour Bayer mosaic, and a refused launch returns false.
+     */
+    const auto expect_refusal = [&](const char* label,
+                                    const std::function<void(
+                                        std::vector<RtStageArg>&)>& mutate) {
+        const int width = 17;
+        const int height = 9;
+        std::vector<float> mosaic(
+            static_cast<std::size_t>(width) * height, 1234.0f);
+        const std::vector<float> original = mosaic;
+        std::vector<float> row_max(static_cast<std::size_t>(height) * 3, 0.0f);
+        std::vector<RtStageArg> args = raw_scale_args(
+            mosaic.data(), width, width, height, coeffs,
+            row_max.data(), filters, 0, 0);
+        mutate(args);
+
+        set_node_device_override("raw.preprocess", StageNodeDevice::OpenCL);
+        const RtStageStatus status = run("raw.preprocess", args);
+        clear_node_device_overrides();
+
+        check(status != RT_STAGE_OK,
+              (std::string(label) + " is refused").c_str());
+        const RawScaleDiff untouched = compare_raw_scale(mosaic, original);
+        check(untouched.differing == 0 && untouched.max_abs == 0.0,
+              (std::string(label) + " leaves the mosaic untouched").c_str());
+        std::printf("stage-residency: raw.preprocess %s: refused (status %d), "
+                    "%zu samples untouched\n",
+                    label, static_cast<int>(status), untouched.samples);
+    };
+
+    expect_refusal("wrong argument count", [](std::vector<RtStageArg>& args) {
+        args.pop_back();
+    });
+    expect_refusal("U8 image", [](std::vector<RtStageArg>& args) {
+        args[RAW_PREPROCESS_ARG_IMAGE].u.buffer.format = RT_STAGE_U8;
+    });
+    expect_refusal("two-plane image", [](std::vector<RtStageArg>& args) {
+        args[RAW_PREPROCESS_ARG_IMAGE].u.buffer.planes = 2;
+    });
+    expect_refusal("seven coefficients", [](std::vector<RtStageArg>& args) {
+        args[RAW_PREPROCESS_ARG_COEFFS].u.buffer.width = 7;
+    });
+    expect_refusal("two-row coefficients",
+                   [](std::vector<RtStageArg>& args) {
+        args[RAW_PREPROCESS_ARG_COEFFS].u.buffer.width = 4;
+        args[RAW_PREPROCESS_ARG_COEFFS].u.buffer.height = 2;
+    });
+    expect_refusal("short row-max", [](std::vector<RtStageArg>& args) {
+        args[RAW_PREPROCESS_ARG_ROW_MAX].u.buffer.height -= 1;
+    });
+    expect_refusal("image row pitch", [](std::vector<RtStageArg>& args) {
+        args[RAW_PREPROCESS_ARG_IMAGE].u.buffer.row_pitch -= sizeof(float);
+    });
+    expect_refusal("four-colour filters", [](std::vector<RtStageArg>& args) {
+        args[RAW_PREPROCESS_ARG_FILTERS].u.i = 0xffffffffu;
+    });
+    expect_refusal("negative origin", [](std::vector<RtStageArg>& args) {
+        args[RAW_PREPROCESS_ARG_ORIGIN_X].u.i = -1;
+    });
 }
 
 /* ------------------------------------------------------- lab.sharpening */
@@ -20342,6 +20695,7 @@ int main()
     test_lab_wavelet_denoise(available);
     test_lab_wavelet_gpu(available);
     test_output_sharpen(available);
+    test_raw_preprocess(available);
     test_lab_sharpening(available);
     test_run_wiring(available);
 
