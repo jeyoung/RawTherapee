@@ -14,14 +14,14 @@ generation counter.
 ## Harness
 
 ```bash
-tools/perf/bench-preview.sh /usr/local/bin/rawtherapee \
-    /path/to/image.NEF 5
+RT_BUILD_DIR=build/cpu-perf-graph \
+    tools/perf/bench-preview.sh /path/to/image.NEF 5
 ```
 
-It starts a private Xvfb display, opens the Exposure tool, drags Exposure
-Compensation, and prints warm p50/p95. See `tools/perf/README.md`. On a
-Wayland host, export `GDK_BACKEND=x11` and unset `WAYLAND_DISPLAY`; otherwise
-GDK connects to the host compositor and the Xvfb window tree stays empty.
+It runs `preview-work-order-sweep` with `OMP_NUM_THREADS=1`, applies the same
+exposure edit sequence and prints the sample count with warm p50/p95. The
+script no longer drives the GUI, so `GDK_BACKEND` and the Xvfb window tree do
+not affect the number. See `tools/perf/README.md`.
 
 ## Manual procedure
 

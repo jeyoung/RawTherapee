@@ -83,7 +83,9 @@ every published figure.
 - Image A with `(cameraICC)` is the portable parity sample. B–H reference
   DCP profiles that are not in the repository; use them for local profile
   regression only.
-- `bench-preview.sh` uses a fixed 1600×1000 Xvfb layout and dismisses the
-  first-run notice. Set `RT_PREVIEW_DISPLAY` to a free display.
+- `bench-preview.sh` now runs `preview-work-order-sweep` with
+  `OMP_NUM_THREADS=1`; no Xvfb display, fixed layout or first-run notice is
+  involved. The TIFFs and the `TIMING` log stay under
+  `build/test-scratch/bench-preview`.
 - `test-preview-parity.sh` compares screenshots under isolated settings. It
   needs a working Xvfb display and the first-run notice dismissed.
