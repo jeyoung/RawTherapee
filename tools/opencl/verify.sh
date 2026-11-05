@@ -272,6 +272,8 @@ quick() {
         "$ROOT/devnotes/opencl/pp3/gamut.pp3" gamut
     run_stage_device "pef/stage-device-ciecam" \
         "$ROOT/devnotes/opencl/pp3/ciecam.pp3" ciecam
+    run_stage_device "pef/stage-device-ciecam16" \
+        "$ROOT/devnotes/opencl/pp3/ciecam16.pp3" ciecam
     run_stage_device "pef/stage-device-sharpen" \
         "$ROOT/devnotes/opencl/pp3/sharpen-usm.pp3" output.sharpen
     run_stage_device "pef/stage-device-sharpen-rld" \
@@ -739,6 +741,8 @@ stage_device() {
         "$ROOT/devnotes/opencl/pp3/gamut.pp3" gamut
     run_stage_device "pef/stage-device-ciecam" \
         "$ROOT/devnotes/opencl/pp3/ciecam.pp3" ciecam
+    run_stage_device "pef/stage-device-ciecam16" \
+        "$ROOT/devnotes/opencl/pp3/ciecam16.pp3" ciecam
     run_stage_device "pef/stage-device-sharpen" \
         "$ROOT/devnotes/opencl/pp3/sharpen-usm.pp3" output.sharpen
     run_stage_device "pef/stage-device-sharpen-rld" \

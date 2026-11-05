@@ -3505,16 +3505,25 @@ struct CiecamCase {
     bool gamut;
     /* The configuration belongs to the device set. */
     bool configSupported;
+    /* Colour appearance model: "02" for CIECAM02, "16" for CAM16. */
+    const char* model = "02";
+    /* Refusals that must hold for both models. */
+    bool epd = false;
+    bool datacie = false;
 };
 
 /*
  * The production host block, the device node and the call-site contract.
  *
- * The supported cases cover the four algorithm arms, the two surround
- * classifications, explicit and automatic scene grey, the tone, hue and
- * colourfulness controls, the optional Lab gamut control and a padded width.
- * The final Lab is compared within one LSB16. A residual must be refused by
- * the launcher and executed by the host builtin, byte for byte.
+ * The supported cases cover both colour appearance models, the four algorithm
+ * arms, the two surround classifications, explicit and automatic scene grey,
+ * the tone, hue and colourfulness controls, the optional Lab gamut control and
+ * a padded width. The CAM16 cases repeat every algorithm arm plus the J and Q
+ * sliders, the hue rotation, the Lab gamut control, the brightness curves
+ * together and the odd width. The final Lab is compared within one LSB16 and
+ * must differ from the input, so a device case cannot pass by doing nothing. A
+ * residual must be refused by the launcher and executed by the host builtin,
+ * byte for byte.
  */
 void test_ciecam(bool available)
 {
@@ -3550,8 +3559,29 @@ void test_ciecam(bool available)
         {"gamut JC", 68, 16, "JC", "Average", "Average", false, 18, 0, 0, 0, 0, 0, 0, 0, 0, true, true},
         {"automatic grey", 64, 16, "ALL", "Average", "Average", true, 18, 0, 0, 0, 0, 0, 0, 0, 0, false, true},
         {"odd width ALL", 179, 17, "ALL", "Average", "Average", false, 18, 10, 20, 10, 20, -20, 0, 0, 0, false, true},
-        {"cam16 residual", 68, 16, "JC", "Average", "Average", false, 18, 0, 0, 0, 0, 0, 0, 0, 0, false, false},
         {"tone map residual", 68, 16, "JC", "Average", "Average", false, 18, 0, 0, 0, 0, 0, 0, 0, 0, false, false},
+
+        /*
+         * CAM16. One case per algorithm arm, then the J slider, the Q slider,
+         * the hue rotation, the Lab gamut control and both brightness curves
+         * together, plus an odd width.
+         */
+        {"cam16 average JC", 68, 16, "JC", "Average", "Average", false, 18, 0, 0, 0, 0, 0, 0, 0, 0, false, true, "16"},
+        {"cam16 dim JS", 68, 16, "JS", "Dim", "Dim", false, 18, 0, 0, 0, 0, 0, 0, 0, 0, false, true, "16"},
+        {"cam16 dark QM", 68, 16, "QM", "Dark", "Dark", false, 18, 0, 0, 0, 0, 0, 0, 0, 0, false, true, "16"},
+        {"cam16 ALL", 68, 16, "ALL", "ExtremelyDark", "ExtremelyDark", false, 18, 0, 0, 0, 0, 0, 0, 0, 0, false, true, "16"},
+        {"cam16 J slider", 68, 16, "JC", "Average", "Average", false, 18, 25, 40, 0, 0, 0, 0, 0, 0, false, true, "16"},
+        {"cam16 Q slider", 68, 16, "QM", "Average", "Average", false, 18, 0, 0, 15, 50, 0, 0, 0, 0, false, true, "16"},
+        {"cam16 hue", 68, 16, "ALL", "Average", "Average", false, 18, 0, 0, 0, 0, 30, 0, 0, 0, false, true, "16"},
+        {"cam16 gamut", 68, 16, "JC", "Average", "Average", false, 18, 0, 0, 0, 0, 0, 0, 0, 0, true, true, "16"},
+        {"cam16 curves", 68, 16, "ALL", "Average", "Average", false, 18, 20, 35, 12, 45, -15, 0, 0, 0, false, true, "16"},
+        {"cam16 odd width ALL", 179, 17, "ALL", "Average", "Average", false, 18, 10, 20, 10, 20, -20, 0, 0, 0, false, true, "16"},
+
+        /* Refusals. The CAM16 admission keeps every CIECAM02 refusal. */
+        {"unknown model residual", 68, 16, "JC", "Average", "Average", false, 18, 0, 0, 0, 0, 0, 0, 0, 0, false, false, "07"},
+        {"cam16 EPD residual", 68, 16, "JC", "Average", "Average", false, 18, 0, 0, 0, 0, 0, 0, 0, 0, false, false, "16", true},
+        {"cam16 datacie residual", 68, 16, "JC", "Average", "Average", false, 18, 0, 0, 0, 0, 0, 0, 0, 0, false, false, "16", false, true},
+        {"cam16 colourfulness residual", 68, 16, "ALL", "Average", "Average", false, 18, 0, 0, 0, 0, 0, 20, 30, 40, false, false, "16"},
     };
 
     if (!available) {
@@ -3568,7 +3598,7 @@ void test_ciecam(bool available)
     for (const CiecamCase& item : cases) {
         rtengine::procparams::ProcParams params;
         params.colorappearance.enabled = true;
-        params.colorappearance.modelmethod = "02";
+        params.colorappearance.modelmethod = item.model;
         params.colorappearance.algo = item.algo;
         params.colorappearance.surrsrc = item.surrsrc;
         params.colorappearance.surround = item.surround;
@@ -3583,9 +3613,9 @@ void test_ciecam(bool available)
         params.colorappearance.schroma = item.schroma;
         params.colorappearance.mchroma = item.mchroma;
         params.colorappearance.gamut = item.gamut;
-        if (std::strcmp(item.label, "cam16 residual") == 0) {
-            params.colorappearance.modelmethod = "16";
-        } else if (std::strcmp(item.label, "tone map residual") == 0) {
+        params.epd.enabled = item.epd;
+        params.colorappearance.datacie = item.datacie;
+        if (std::strcmp(item.label, "tone map residual") == 0) {
             params.colorappearance.tonecie = true;
         }
 
@@ -3663,6 +3693,12 @@ void test_ciecam(bool available)
             check(diff.max_abs <= 1.0,
                   (std::string("ciecam ") + item.label +
                    " is within one LSB16").c_str());
+            /* Non-vacuity: the admitted configuration must change the image,
+             * not return the input unchanged. */
+            const Diff effect = compare(view(device), view(source));
+            check(effect.differing > 0,
+                  (std::string("ciecam ") + item.label +
+                   " changes the image").c_str());
             check(profile.find("\"impl\":\"opencl\"") != std::string::npos,
                   (std::string("ciecam ") + item.label +
                    " records a device execution").c_str());
