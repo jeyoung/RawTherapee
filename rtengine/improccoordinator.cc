@@ -1509,13 +1509,17 @@ void ImProcCoordinator::stageRawDemosaic(PreviewPassState& pass)
     }
 
     /*
-     * The hand-written pass widened the payload with the reload and capture-sharpening facts when the
-     * demosaic ran, which made capture sharpening run even when the request
-     * named neither bit. `demosaicRebuilt` is that sub-step fact.
+     * Capture sharpening reads the pre-sharpening planes kept in the image
+     * source's caches, so it must run whenever this body is scheduled while
+     * the tool is on. A fresh demosaic has just replaced the planes; a
+     * pdsharpening parameter change reaches the body through the dirty set and
+     * the work order even when the request carries neither the raw nor the
+     * capture-sharpening family (a parameter-only or coalesced update). The
+     * old `(M_RAW | M_CSHARP)` mask carried that dirty-derived bit; the
+     * request intents alone do not. Re-applying the step to the caches is
+     * idempotent for an unchanged setting and applies the new one otherwise.
      */
-    if ((pass.request.rawIntent || pass.request.captureSharpenIntent
-            || pass.demosaicRebuilt)
-            && params->pdsharpening.enabled) {
+    if (params->pdsharpening.enabled) {
         double pdSharpencontrastThreshold = params->pdsharpening.contrast;
         double pdSharpenRadius = params->pdsharpening.deconvradius;
         previewBaseCache->markDirty("capture-sharpening");
@@ -1531,7 +1535,15 @@ void ImProcCoordinator::stageRawDemosaic(PreviewPassState& pass)
     }
 
 
+    /*
+     * The work order names retinexPrepare whenever the buffer inputs moved,
+     * and that can arrive without the raw family (a working-profile edit, for
+     * example). The request intents alone would skip the preparation and leave
+     * the buffers built for the previous inputs, so the work item is part of
+     * the gate.
+     */
     if (pass.request.rawIntent
+            || stage::workItemRuns(pass.work, stage::WorkItem::retinexPrepare)
             || (!highDetailRawComputed && pass.highDetailNeeded)
             //  || (params->toneCurve.hrenabled && params->toneCurve.method != "Color" && imgsrc->isRGBSourceModified())
             //  || (!params->toneCurve.hrenabled && params->toneCurve.method == "Color" && imgsrc->isRGBSourceModified())) {
