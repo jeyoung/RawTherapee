@@ -355,7 +355,8 @@ protected:
     void deferredWatcherLoop();
     void flushDeferredAnalysis();
     void dropPendingDeferred();
-    bool absorbPendingDeferred(EditorRequest& request);
+    bool absorbPendingDeferred(EditorRequest& request,
+                               stage::DirtyBlocks& blocks);
     void publishDeferredSnapshotLocked();
 
     /*
@@ -483,8 +484,6 @@ protected:
     // Blocks the pass about to run absorbed from a pending burst. They are
     // merged into the pass dirty set, never into a source or raw block, and
     // cleared when the full-frame pass records its state.
-    stage::DirtyBlocks absorbedDeferredBlocks;
-    bool absorbedDeferredActive;
     bool deferredWatcherStarted;
     bool deferredWatcherPaused;
     std::atomic<bool> deferredWatcherStop;
