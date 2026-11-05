@@ -1097,12 +1097,14 @@ is 1 byte, all on POCL CPU with `rtdata/` bound at the compiled data path.
   size; a repeated identical pass is `AE=0` with a hit; the true LRU and
   budget behave; the disabled path allocates nothing; a malformed payload is
   refused. That is the correctness evidence, not a production-performance
-  one. A preview sweep with `RT_NODE_CACHE=1` on the PEF (five exposure
-  samples) reports `hits=2 misses=3 refused=1` and a mean settled latency of
-  307.1 ms against 305.9 ms without the cache: the hit is real, but the win
-  is inside the noise. The promotion gate is therefore **not met** and the
-  default stays off. A preview-path measurement with a clear win at the
-  default budget, plus a user-visible preference, is what would flip it.
+  one. Two preview sweeps with `RT_NODE_CACHE=1` (five exposure samples)
+  hit twice each and show no win at the default budget: PEF mean 307.1 ms
+  against 305.9 ms without, NEF p50 492 ms against 484 ms and identical
+  means (485 ms). The cache restores the right bytes, but the raw.base rebuild
+  it replaces is not on the settled-latency critical path. The promotion gate
+  is therefore **not met** and the default stays off. A preview-path
+  measurement with a clear win, plus a user-visible preference, is what would
+  flip it.
 - **Stage OpenCL**: stays **opt-in** (`RT_STAGE_OPENCL=1`; the kill switches
   are `RT_STAGE_OPENCL=0` and `RT_STAGE_OPENCL_DISABLE=1`). Coverage is now
   meaningful: `verify.sh --quick` is **84 PASS / 0 FAIL** and
