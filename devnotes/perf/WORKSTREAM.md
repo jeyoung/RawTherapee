@@ -92,6 +92,28 @@ binary run on the host also matches the host build with the same data
 
 ## Progress log — resumed 2026-10-28 (Block 4 completion)
 
+- **Architecture-review fixes (2026-11-05)**: the interim review's still-live
+  findings were addressed. **F2** (shutdown race): absorbed deferred blocks
+  are now owned by the pass, copied under `paramsUpdateMutex`; the shared
+  fields and their racy clears are gone. **F1** (combined delta): the sensor
+  demosaic change is compared by a sensor-only fingerprint
+  (`addRawDemosaicFields`, no `pdsharpening`), so a pass changing the
+  demosaic method and an unused capture-sharpening setting no longer skips
+  the demosaic; the new `stage-work-test` case derived `[]` before the fix.
+  **F3** (partial readback): device downloads stage the read and commit only
+  the rows they cover after every plane succeeds, so a later-plane failure
+  leaves the CPU fallback input untouched; the sub-rect raw.preprocess cases
+  caught the first over-broad commit. **F7** (device choice): stage selection
+  matches `settings->openCLDevice` across all device types before the
+  automatic GPU order, so an explicit CPU device is not displaced. **F8**
+  (zero timings): synchronous nodes now publish the measured submit/wait
+  total. **F9** (parity helper): packed U8/U16 rows compare every sample,
+  matching NaNs and same-sign infinities are equal, and exact/tolerance
+  predicates are separate. F5 was already fixed by
+  `denoiseTileBufferCount()`. F4/F6 remain the architectural work the review
+  describes.
+
+
 - **Capture-sharpening and Retinex gate fixes (2026-11-05)**: two
   request-intent gates in `ImProcCoordinator::stageRawDemosaic` disagreed with
   the work order, which is the execution authority. (1) Capture sharpening

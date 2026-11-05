@@ -416,6 +416,12 @@ CPU-device results and must not be read as GPU parity. Restricting the ICD set
 pins the device identity; it is no longer needed to avoid the rusticl crash
 described under "Broken and unsupported ICDs", because a broken ICD is skipped.
 
+The generic comparator in `stage_parity.cc` compares packed U8/U16 RGB rows
+by their samples, treats matching NaNs and same-sign infinities as equal, and
+exposes `passes_exact()` (bit equality) separately from `passes_within()`
+(finite differences inside the tolerance). The residency and device tests
+keep their own comparators and explicit finite checks.
+
 The parity gate is 1 LSB at 16-bit (1/65535 = 1.53e-5 normalised). The measured
 peak absolute error is zero for the synthetic node tests:
 
