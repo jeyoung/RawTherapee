@@ -88,6 +88,21 @@ this validates packaging rather than the newest engine code.
 
 ## Progress log — resumed 2026-10-28 (Block 4 completion)
 
+- **Gate tooling and closure run (2026-11-05)**: `compare_tiff.py` gained
+  `--info {size,bits,pixels}` and `verify.sh` falls back to it when
+  ImageMagick is absent, so the gate runs on a host with only python3 and
+  numpy. The `pef/neutral` row now enables `RT_OPENCL_RGBPROC` for its own
+  auto run and expects `rgbproc` (the classic block's current log name), and
+  the two `raw.base` rows use a new `raw-base.pp3` with
+  `InputProfile=(camera)` so the matrix arm is selected even when the
+  installed data directory supplies a camera ICC or DCP. With `rtdata/` bound
+  at the compiled data path, `--quick` reaches 66 PASS and one FAIL:
+  `local-adjustments-munsell` differs by 19-25 LSB16 at 1,283 samples, because
+  a last-bit difference in the Colour & Light chain crosses Munsell's
+  discontinuous threshold. That row is a known red gate; the closure claim is
+  therefore not made. `--formats` passes the public PEF (1 entry) and
+  `--monitor` passes at 1 byte.
+
 - **`ciecam` CAM16 (2026-11-05)**: `colorappearance.modelmethod == "16"` is
   admitted under the same constraints as CIECAM02. The model travels in a
   new `RT_CIECAM_REC_MODEL` rec slot; the three matrix helpers branch to

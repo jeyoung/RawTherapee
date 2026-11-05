@@ -2327,7 +2327,15 @@ Laplacian clamp arm (`strng > 2 && sfena`), so the per-spot tail takes the
 `clipR()` arm rather than the notzero arm.
 
 Munsell (`avoidgamutMethod == "MUNS"`) is admitted after the clamps became
-bit-exact. The pre-fix clamp differed from the host only in the
+bit-exact. On the 10.2 MP PEF gate row, however,
+`localadjustments-munsell.pp3` currently differs by 25 LSB16 at 1,283 of
+30,419,712 samples (19 LSB16 with the installed data directory bound). The
+residency matrices that include MUNS stay within 1 LSB16 because their
+fixtures do not land on a threshold; the real image does, so a last-bit
+difference somewhere in the Colour & Light chain crosses Munsell's
+discontinuous hue/zone boundary. That row is a known failing parity row and
+`verify.sh --quick` stops at it; it is not a licence to weaken the gate. The
+pre-fix clamp differed from the host only in the
 `Color::Lab2XYZ()` cubic order: `lab2rgb()`'s SIMD loop computes
 `(fy*fy*fy) * 65535`, its scalar tail `((65535*fy)*fy)*fy`, and the tail is
 the last `width % 4` columns. That one-LSB Y difference moved Munsell's

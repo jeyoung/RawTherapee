@@ -390,6 +390,16 @@ Notes:
   on the `rgb.proc` row so no other gate can absorb it. See
   `devnotes/perf/STAGE_RUNTIME.md`, "Classic-backend clipped-pixel residual".
 
+The gate does not require ImageMagick when every comparison is an
+uncompressed, planar 16-bit TIFF: `compare_tiff.py --info` reads the size,
+bit depth and pixel count from the header, and the comparison itself already
+runs in Python. `verify.sh` falls back to that path and needs only `python3`
+with numpy; the `compare`/`identify` route is still preferred when present.
+On a build tree without an installed data directory, bind `rtdata/` at the
+compiled `DATA_SEARCH_PATH` (`/usr/local/share/rawtherapee-graph`) under
+bubblewrap for the run; otherwise the monitor self-test cannot find
+`RTv4_sRGB` and the neutral profile loads its internal defaults.
+
 ## Stage device residency
 
 The graph device path runs `lanczos3` (resize), `transform` (rotation/scale)
