@@ -824,9 +824,9 @@ export and a GUI smoke test are not yet run for this package.
   reproduced). The probe's summation order is the main parity risk.
   Side finding: `oprofdef`/`cmsHTRANSFORM` leak once per invocation
   (`iplab2rgb.cc:2145`, `:2173`, `:2260`) — fix separately.
-- **`ciecam`**: implemented for the single-pass CAM02 surface (see Completed
-  this session). The scoping note follows. A faithful port needs a host
-  mean/histogram pass, two
+- **`ciecam`**: implemented for the single-pass CIECAM02 and CAM16 surface
+  (see Completed this session). The scoping note follows. A faithful port
+  needs a host mean/histogram pass, two
   32768-entry brightness LUTs, up to six 65536 user-curve LUTs, CAT02/HPE
   matrices and a verbatim transcription of the sleef `pow_F`/`xlogf` chain.
   A single kernel covers the no-EPD/no-autocielab surface; EPD, autocielab
@@ -846,17 +846,22 @@ export and a GUI smoke test are not yet run for this package.
 
 ## Completed this session
 
-- **`ciecam`**: the single-pass CIE-CAM 02 path now runs on the device. The
-  host context rebuilds the histogram pass, the scene/viewing conditions, both
-  `initcam` calls, the two brightness tables and the optional working-space
-  inverse; one kernel reproduces CAT02/HPE, the four algorithm arms, the hue
-  rotation, `skinredfloat()` and the Lab gamut control. Twelve residency cases
-  cover the axes, worst PAE 0.107422 LSB16, eight device cases with every one
-  changing pixels; the export corpus is 1 LSB16 with `impl=opencl` and the
-  CAM16 residual `AE=0` with `impl=host`. Chroma/saturation/colourfulness
-  sliders, CAM16, tone mapping/EPD and non-identity colour curves are host
-  residuals; the chroma sliders stay out because `skinredfloat()`'s skin-range
-  boundary amplifies a last-bit hue difference.
+- **`ciecam`**: the single-pass CIE-CAM path now runs on the device for both
+  colour appearance models, CIECAM02 and CAM16. The host context rebuilds the
+  histogram pass, the scene/viewing conditions, both `initcam` calls, the two
+  brightness tables and the optional working-space inverse; one kernel
+  reproduces the CAT02/CAT16 transforms, the CAT02 HPE stage (the identity for
+  CAM16), the four algorithm arms, the hue rotation, `skinredfloat()` and the
+  Lab gamut control. The model is uniform per run in the rec table, and the
+  three matrix helpers branch on it. Twenty-five residency cases cover the
+  axes, worst PAE 0.113281 LSB16, nineteen device cases with every one
+  changing pixels; the export corpus is 1 LSB16 with `impl=opencl` for both
+  `ciecam.pp3` (CIECAM02) and `ciecam16.pp3` (CAM16), and the CAM16 plus
+  colourfulness-slider residual is `AE=0` with `impl=host`.
+  Chroma/saturation/colourfulness sliders, tone mapping/EPD, an unknown
+  `modelmethod` and non-identity colour curves are host residuals; the chroma
+  sliders stay out because `skinredfloat()`'s skin-range boundary amplifies a
+  last-bit hue difference.
 - **Validation matrix** (`devnotes/perf/VALIDATION.md`): Debian 12 and 13
   installed the `.deb` with `apt-get install`, 36 formats, 8/8 exports exit 0
   per distro.

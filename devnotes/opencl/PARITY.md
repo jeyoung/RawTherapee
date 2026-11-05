@@ -946,21 +946,25 @@ peak absolute error is zero for the synthetic node tests:
   identity, so a curve the device table cannot follow cannot refuse a pass
   that never reads it; impulse denoise, defringe and microcontrast run in the
   CIE-CAM pipeline on the `CieImage`.
-- The separate `ciecam` node runs the single-pass CIE-CAM 02 model on the
-  device: the CAT02 forward and inverse transforms, the four algorithm arms,
-  the two brightness tables, explicit and automatic scene grey, the surround
-  classifications, the hue rotation and the optional Lab gamut control. Twelve
-  residency cases cover those axes at 68x16, 64x16 and the odd-width 179x17;
-  the worst peak error is 0.107422 LSB16, every device case changes pixels, and
-  the two residual cases plus the colourfulness case are byte-identical host
-  executions. On the export corpus `ciecam.pp3` (tone, hue, auto grey and
-  gamut) has a peak error of 1 LSB16 with `impl=opencl`, and
-  `ciecam-residual.pp3` (CAM16) is `AE=0` with `impl=host`. The chroma,
-  saturation and colourfulness sliders, the per-hue hue/saturation sliders and
-  red protection stay host residuals: they drive `Color::skinredfloat()`,
-  whose skin-range boundary turns a last-bit hue difference into a visible
-  step. Interactive tone mapping (`tonecie` with EPD), automatic CIELAB
-  sharpening, `datacie` and the CAM16/PQ models are residuals too.
+- The separate `ciecam` node runs the single-pass CIECAM02 and CAM16 models on
+  the device: the CAT02 and CAT16 forward transforms, the CAT02 HPE stage (the
+  identity for CAT16), the inverse CAT02/CAT16 transforms, the four algorithm
+  arms, the two brightness tables, explicit and automatic scene grey, the
+  surround classifications, the hue rotation and the optional Lab gamut
+  control. The model is carried in the rec table, so it is uniform per run.
+  Twenty-five residency cases cover those axes at 68x16, 64x16 and the
+  odd-width 179x17; nineteen are device, the worst peak error is 0.113281 LSB16
+  (CAM16 ALL), every device case changes pixels, and the six residual cases are
+  byte-identical host executions. On the export corpus `ciecam.pp3`
+  (CIECAM02: tone, hue, auto grey and gamut) and `ciecam16.pp3` (CAM16: the
+  same controls) each have a peak error of 1 LSB16 with `impl=opencl`, and
+  `ciecam-residual.pp3` (CAM16 plus the colourfulness slider) is `AE=0` with
+  `impl=host` because of the slider, not the model. The chroma, saturation and
+  colourfulness sliders, the per-hue hue/saturation sliders and red protection
+  stay host residuals: they drive `Color::skinredfloat()`, whose skin-range
+  boundary turns a last-bit hue difference into a visible step. Interactive
+  tone mapping (`tonecie` with EPD), automatic CIELAB sharpening and `datacie`
+  are residuals too, and a `modelmethod` other than `02` or `16` is refused.
 - `tools/opencl/verify.sh --stage-device`, which `--quick` also runs, asserts
   each record and its parity in one step:
 
