@@ -1115,8 +1115,12 @@ is 1 byte, all on POCL CPU with `rtdata/` bound at the compiled data path.
   meaningful: `verify.sh --quick` is **84 PASS / 0 FAIL** and
   `--stage-device` is **73 PASS / 0 FAIL / 0 SKIP**, with every node at
   1 LSB16 or better. But every figure is POCL CPU, and the project rule says
-  a CPU-device result is not GPU parity. Promotion to default therefore waits
-  for the same rows on a real GPU, with the fp64 and `rsqrt` paths exercised.
+  a CPU-device result is not GPU parity. A POCL CPU export is also **slower**
+  than the host path (three runs each, PEF, 16-bit: host 1286/1300/1286 ms,
+  stage 1592/1580/1575 ms, AE=0), so defaulting it on the only measurable
+  device class would be a performance regression. Promotion to default
+  therefore waits for the same rows on a real GPU, with the fp64 and `rsqrt`
+  paths exercised, and a performance win on that device.
 - **Residency policy (recorded)**: the device path is opt-in and fail-closed.
   A node runs on the device only when the user preference requests OpenCL,
   `RT_STAGE_OPENCL=1` is set, the node's device requirements are met (fp64
