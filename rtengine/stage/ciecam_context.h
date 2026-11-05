@@ -88,10 +88,12 @@ namespace rtengine::stage
 /*
  * The subset of the `ciecam` node this stage runs on the device.
  *
- * The single-pass CEICAM02 path is admitted: the classical model, no tone
- * mapping, no EPD, no automatic CIELAB sharpening and no per-hue user colour
- * curve. Every other configuration is a host residual. `customColCurve*` are
- * the six curve objects the call site builds; only their identity is admitted.
+ * The single-pass CIE-CAM path is admitted for both colour appearance models,
+ * CIECAM02 (`modelmethod == "02"`) and CAM16 (`modelmethod == "16"`): the
+ * classical models, no tone mapping, no EPD, no automatic CIELAB sharpening
+ * and no per-hue user colour curve. Every other configuration is a host
+ * residual. `customColCurve*` are the six curve objects the call site builds;
+ * only their identity is admitted.
  */
 bool ciecamSupported(const procparams::ProcParams& params,
                      const ColorAppearance& customColCurve1,

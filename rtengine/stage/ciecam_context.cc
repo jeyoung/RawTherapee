@@ -111,7 +111,7 @@ bool ciecamSupported(const procparams::ProcParams& params,
     if (!ca.enabled) {
         return false;
     }
-    if (ca.modelmethod != "02") {
+    if (ca.modelmethod != "02" && ca.modelmethod != "16") {
         return false;
     }
     if (ca.tonecie || params.epd.enabled || ca.badpixsl != 0) {
@@ -482,7 +482,14 @@ int CiecamContext::build(RtCiecamResult& out)
     }
 
     const float yb2 = static_cast<float>(ca.ybout);
-    const int c16 = 1;
+    /*
+     * The model is uniform over the run: CIECAM02 (c16 == 1) or CAM16
+     * (c16 == 16), the same selector ImProcFunctions::ciecam_02float() takes
+     * from `modelmethod`. The per-pixel matrices are chosen in the kernel from
+     * the RT_CIECAM_REC_MODEL slot below; the viewing-condition setup here is
+     * already model-aware through the c16 argument.
+     */
+    const int c16 = ca.modelmethod == "16" ? 16 : 1;
     const float plum = 100.f;
     float n = 0.f;
     float d = 0.f;
@@ -558,6 +565,7 @@ int CiecamContext::build(RtCiecamResult& out)
     rec_[RT_CIECAM_REC_SCHRGREEN] = static_cast<float>(ca.schromagreen);
     rec_[RT_CIECAM_REC_HUEBLUE] = static_cast<float>(ca.colorhblue);
     rec_[RT_CIECAM_REC_SCHRBLUE] = static_cast<float>(ca.schromablue);
+    rec_[RT_CIECAM_REC_MODEL] = static_cast<float>(c16);
 
     if (buildFailed(rec_) || !(aw > 0.0f) || !(wh > 0.0f) ||
         !(cz > 0.0f) || !(czj > 0.0f)) {

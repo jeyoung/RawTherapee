@@ -24,11 +24,13 @@
  *
  * The host builds every viewing-condition scalar and the two brightness
  * tables; the kernel reproduces the per-pixel arithmetic of
- * ImProcFunctions::ciecam_02float()'s single-pass, non-EPD path. Only the
- * classical CIECAM02 model (c16 == 1) is admitted here. The forward and
- * inverse transforms, CAT02, HPE, the four algorithm arms, the colourfulness,
- * saturation and hue controls, Color::skinredfloat() and the optional Lab
- * gamut control are ports, not approximations.
+ * ImProcFunctions::ciecam_02float()'s single-pass, non-EPD path. The classical
+ * CIECAM02 model (c16 == 1) and CAM16 (c16 == 16) are admitted, selected by
+ * the uniform rec[RT_CIECAM_REC_MODEL] slot. The forward and inverse
+ * transforms, the CAT02 and CAT16 matrices, the CAT02 HPE stage, the four
+ * algorithm arms, the colourfulness, saturation and hue controls,
+ * Color::skinredfloat() and the optional Lab gamut control are ports, not
+ * approximations.
  *
  * pow_F() is the sleef chain the host calls. The host's per-pixel loop takes
  * the SIMD form on x86-64, whose xexpf evaluates `1 + (s * s) * u + s`; the
@@ -84,7 +86,9 @@
 #define RT_CIECAM_REC_SCHRGREEN 43
 #define RT_CIECAM_REC_HUEBLUE 44
 #define RT_CIECAM_REC_SCHRBLUE 45
-#define RT_CIECAM_REC_COUNT 46
+/* The colour appearance model per run: 1 = CIECAM02, 16 = CAM16. */
+#define RT_CIECAM_REC_MODEL 46
+#define RT_CIECAM_REC_COUNT 47
 
 /* The two brightness tables. `curveJfloat()` writes 32768 samples. */
 #define RT_CIECAM_TABLE_ENTRIES 32768
@@ -142,6 +146,7 @@ inline constexpr const char* RT_CIE_CAM_CL = R"CLC(
 #define RT_CIECAM_REC_SCHRGREEN 43
 #define RT_CIECAM_REC_HUEBLUE 44
 #define RT_CIECAM_REC_SCHRBLUE 45
+#define RT_CIECAM_REC_MODEL 46
 #define RT_CIECAM_TABLE_ENTRIES 32768
 
 /* sleef.h's L2Uf/L2Lf and R_LN2f, the constants pow_F() needs. */
@@ -218,31 +223,56 @@ inline float rt_cc_pow(const float a, const float b)
     return rt_cc_ldexpkf(u, q);
 }
 
-/* Ciecam02::xyz_to_cat02float(), c16 == 1. */
+/* Ciecam02::xyz_to_cat02float(). `c16` is 1 for CAT02 and 16 for CAT16. */
 inline void rt_cc_xyz_cat02(float* r, float* g, float* b, const float x,
-                            const float y, const float z)
+                            const float y, const float z, const int c16)
 {
-    *r = 1.007245f * x + 0.011136f * y - 0.018381f * z;
-    *g = -0.318061f * x + 1.314589f * y + 0.003471f * z;
-    *b = z;
+    if (c16 == 1) {
+        *r = 1.007245f * x + 0.011136f * y - 0.018381f * z;
+        *g = -0.318061f * x + 1.314589f * y + 0.003471f * z;
+        *b = z;
+    } else {
+        *r = 0.401288f * x + 0.650173f * y - 0.051461f * z;
+        *g = -0.250268f * x + 1.204414f * y + 0.045854f * z;
+        *b = -0.002079f * x + 0.048952f * y + 0.953127f * z;
+    }
 }
 
-/* Ciecam02::cat02_to_hpefloat(), c16 == 1. */
+/* Ciecam02::cat02_to_hpefloat(). CAT02 needs the HPE cone matrix; CAT16
+ * already carries the HPE primaries, so the host's c16 != 1 arm is the
+ * identity. */
 inline void rt_cc_cat02_hpe(float* rh, float* gh, float* bh, const float r,
-                            const float g, const float b)
+                            const float g, const float b, const int c16)
 {
-    *rh = 0.550930835f * r + 0.519435987f * g - 0.070356303f * b;
-    *gh = 0.055954056f * r + 0.89973132f * g + 0.044315524f * b;
-    *bh = b;
+    if (c16 == 1) {
+        *rh = 0.550930835f * r + 0.519435987f * g - 0.070356303f * b;
+        *gh = 0.055954056f * r + 0.89973132f * g + 0.044315524f * b;
+        *bh = b;
+    } else {
+        *rh = r;
+        *gh = g;
+        *bh = b;
+    }
 }
 
-/* Ciecam02::cat02_to_xyzfloat(), c16 == 1. */
+/*
+ * Ciecam02::cat02_to_xyzfloat(). The inverse CAT16 matrix takes the SIMD copy's
+ * 0.621447744f, not the scalar copy's 0.62144744f: the two host definitions
+ * disagree in the last bit and the per-pixel loop picks the SIMD form on
+ * x86-64, which is the value this port has to reproduce.
+ */
 inline void rt_cc_cat02_xyz(float* x, float* y, float* z, const float r,
-                            const float g, const float b)
+                            const float g, const float b, const int c16)
 {
-    *x = 0.99015849f * r - 0.00838772f * g + 0.018229217f * b;
-    *y = 0.239565979f * r + 0.758664642f * g + 0.001770137f * b;
-    *z = b;
+    if (c16 == 1) {
+        *x = 0.99015849f * r - 0.00838772f * g + 0.018229217f * b;
+        *y = 0.239565979f * r + 0.758664642f * g + 0.001770137f * b;
+        *z = b;
+    } else {
+        *x = 1.86206786f * r - 1.01125463f * g + 0.14918677f * b;
+        *y = 0.38752654f * r + 0.621447744f * g - 0.00897398f * b;
+        *z = -0.0158415f * r - 0.03412294f * g + 1.04996444f * b;
+    }
 }
 
 /* Ciecam02::hpe_to_xyzfloat(). */
@@ -332,7 +362,7 @@ inline void rt_cc_aab_rgb(float* r, float* g, float* b, const float A,
     *b = (0.32787f * x) - (0.15681f * aa) - (4.49038f * bb);
 }
 
-/* Ciecam02::xyz2jchqms_ciecam02float(), c16 == 1. */
+/* Ciecam02::xyz2jchqms_ciecam02float(). */
 inline void rt_cc_xyz2jchqms(float* J, float* C, float* h, float* Q, float* M,
                              float* s, const float aw, const float fl,
                              const float wh, const float x, const float y,
@@ -340,21 +370,30 @@ inline void rt_cc_xyz2jchqms(float* J, float* C, float* h, float* Q, float* M,
                              const float zw, const float c, const float nc,
                              const float pow1, const float nbb,
                              const float ncb, const float pfl,
-                             const float cz, const float d)
+                             const float cz, const float d, const int c16)
 {
     float r, g, b;
     float rw, gw, bw;
-    rt_cc_xyz_cat02(&r, &g, &b, x, y, z);
-    rt_cc_xyz_cat02(&rw, &gw, &bw, xw, yw, zw);
+    rt_cc_xyz_cat02(&r, &g, &b, x, y, z, c16);
+    rt_cc_xyz_cat02(&rw, &gw, &bw, xw, yw, zw, c16);
     const float rc = r * (((yw * d) / rw) + (1.0f - d));
     const float gc = g * (((yw * d) / gw) + (1.0f - d));
     const float bc = b * (((yw * d) / bw) + (1.0f - d));
 
     float rp, gp, bp;
-    rt_cc_cat02_hpe(&rp, &gp, &bp, rc, gc, bc);
-    rp = fmax(rp, 0.0f);
-    gp = fmax(gp, 0.0f);
-    bp = fmax(bp, 0.0f);
+    rt_cc_cat02_hpe(&rp, &gp, &bp, rc, gc, bc, c16);
+    /* The host clamps the CAT02 HPE result and, for CAT16, the post-adaptation
+     * CAT16 values; the CAT16 HPE stage is the identity, so the same clamp
+     * applies to either form. */
+    if (c16 == 1) {
+        rp = fmax(rp, 0.0f);
+        gp = fmax(gp, 0.0f);
+        bp = fmax(bp, 0.0f);
+    } else {
+        rp = fmax(rc, 0.0f);
+        gp = fmax(gc, 0.0f);
+        bp = fmax(bc, 0.0f);
+    }
 
     const float rpa = rt_cc_nonlinear(rp, fl);
     const float gpa = rt_cc_nonlinear(gp, fl);
@@ -382,16 +421,16 @@ inline void rt_cc_xyz2jchqms(float* J, float* C, float* h, float* Q, float* M,
     *h = (myh * 180.0f) / RT_LT_PI_F;
 }
 
-/* Ciecam02::jch2xyz_ciecam02float(), c16 == 1. */
+/* Ciecam02::jch2xyz_ciecam02float(). */
 inline void rt_cc_jch2xyz(float* x, float* y, float* z, const float J,
                           const float C, const float h, const float xw,
                           const float yw, const float zw, const float nc,
                           const float pow1, const float nbb, const float ncb,
                           const float fl, const float d, const float aw,
-                          const float reccmcz)
+                          const float reccmcz, const int c16)
 {
     float rw, gw, bw;
-    rt_cc_xyz_cat02(&rw, &gw, &bw, xw, yw, zw);
+    rt_cc_xyz_cat02(&rw, &gw, &bw, xw, yw, zw, c16);
     const float e = 961.53846f * nc * ncb *
                     (rt_lt_xsincosf(((h * RT_LT_PI_F) / 180.0f) + 2.0f).y +
                      3.8f);
@@ -407,14 +446,23 @@ inline void rt_cc_jch2xyz(float* x, float* y, float* z, const float J,
     const float gp = rt_cc_inverse_nonlinear(gpa, fl);
     const float bp = rt_cc_inverse_nonlinear(bpa, fl);
 
-    float xx, yy, zz;
-    rt_cc_hpe_xyz(&xx, &yy, &zz, rp, gp, bp);
-    float rc, gc, bc;
-    rt_cc_xyz_cat02(&rc, &gc, &bc, xx, yy, zz);
-    const float r = rc / (((yw * d) / rw) + (1.0f - d));
-    const float g = gc / (((yw * d) / gw) + (1.0f - d));
-    const float b = bc / (((yw * d) / bw) + (1.0f - d));
-    rt_cc_cat02_xyz(x, y, z, r, g, b);
+    float r, g, b;
+    if (c16 == 1) {
+        float xx, yy, zz;
+        rt_cc_hpe_xyz(&xx, &yy, &zz, rp, gp, bp);
+        float rc, gc, bc;
+        rt_cc_xyz_cat02(&rc, &gc, &bc, xx, yy, zz, c16);
+        r = rc / (((yw * d) / rw) + (1.0f - d));
+        g = gc / (((yw * d) / gw) + (1.0f - d));
+        b = bc / (((yw * d) / bw) + (1.0f - d));
+    } else {
+        /* CAT16 has no separate HPE stage, so the host undoes only the
+         * chromatic adaptation. */
+        r = rp / (((yw * d) / rw) + (1.0f - d));
+        g = gp / (((yw * d) / gw) + (1.0f - d));
+        b = bp / (((yw * d) / bw) + (1.0f - d));
+    }
+    rt_cc_cat02_xyz(x, y, z, r, g, b, c16);
 }
 
 /* Ciecam02::curvecolorfloat(). */
@@ -633,6 +681,8 @@ __kernel void rt_ciecam(__global float* lab,
     }
     const int offset = y * pitch + x;
 
+    const int c16 = (int)rec[RT_CIECAM_REC_MODEL];
+
     float X, Y, Z;
     rt_lt_lab2xyz(lab[offset], lab[plane + offset], lab[2 * plane + offset],
                   &X, &Y, &Z);
@@ -646,7 +696,7 @@ __kernel void rt_ciecam(__global float* lab,
                      rec[RT_CIECAM_REC_C], rec[RT_CIECAM_REC_NC],
                      rec[RT_CIECAM_REC_POW1], rec[RT_CIECAM_REC_NBB],
                      rec[RT_CIECAM_REC_NCB], rec[RT_CIECAM_REC_PFL],
-                     rec[RT_CIECAM_REC_CZ], rec[RT_CIECAM_REC_D]);
+                     rec[RT_CIECAM_REC_CZ], rec[RT_CIECAM_REC_D], c16);
 
     float Jpro = J;
     float Cpro = C;
@@ -778,7 +828,7 @@ __kernel void rt_ciecam(__global float* lab,
                   rec[RT_CIECAM_REC_POW1N], rec[RT_CIECAM_REC_NBBJ],
                   rec[RT_CIECAM_REC_NCBJ], rec[RT_CIECAM_REC_FLJ],
                   rec[RT_CIECAM_REC_DJ], rec[RT_CIECAM_REC_AWJ],
-                  rec[RT_CIECAM_REC_RECCMCZ]);
+                  rec[RT_CIECAM_REC_RECCMCZ], c16);
 
     const float epsilon = 0.00001f;
     const float xb = fmax(epsilon, xx * 655.35f);
