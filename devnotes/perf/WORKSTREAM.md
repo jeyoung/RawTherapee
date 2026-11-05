@@ -1389,7 +1389,20 @@ The two promotion gates were measured and **not met**:
    the same rows have not been run on the target device. The default stays
    opt-in.
 
-The next workstream is P2: the multi-thread determinism residuals, tile
-ordering/fusion, the `crop-stage-test` stall, and the GUI dump pairs for tone
-curve and crop geometry. Residuals are not unstarted work; the
-decisively-partial list is in `STAGE_PIPELINE.md` and `PARITY.md`.
+The P2 residuals are now measured and recorded:
+
+- Thread determinism: the NEF is `AE=0` at 1/4/8 threads and on a repeated
+  t=8 run, neutral and with denoise; the PEF with denoise keeps 24 pixels at
+  1 LSB16. The guard is `tools/perf/test-export-determinism.sh`.
+- `crop-stage-test --sequences` passes with a sharpening profile (39 plans,
+  `AE=0`); the historical stall did not reproduce.
+- Tone curve and crop geometry are covered by the deterministic sweep's
+  `tone-curve` and zoom/pan states; the screenshot harness gap is recorded.
+- Tile ordering/fusion stays an opt-in performance feature, not a parity
+  defect. rusticl is an environment limitation.
+
+What remains is product-level work rather than a defect list: finish the
+fusion/reduced-work modes, and revisit the two promotion gates only with the
+evidence named above (a preview win for the cache, a real GPU for stage
+OpenCL). Residuals are not unstarted work; the decisively-partial list is in
+`STAGE_PIPELINE.md` and `PARITY.md`.
