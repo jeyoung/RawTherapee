@@ -1406,8 +1406,11 @@ The P2 residuals are now measured and recorded:
 - Tile ordering/fusion stays an opt-in performance feature, not a parity
   defect. rusticl is an environment limitation.
 
-What remains is product-level work rather than a defect list: finish the
-fusion/reduced-work modes, and revisit the two promotion gates only with the
-evidence named above (a preview win for the cache, a real GPU for stage
-OpenCL). Residuals are not unstarted work; the decisively-partial list is in
-`STAGE_PIPELINE.md` and `PARITY.md`.
+No defect work remains. The fusion candidates are decided in `FUSION.md`,
+tile ordering is complete and opt-in (`TILE_INDEX.md`), and the viewport fast
+path is complete and default-on (`VIEWPORT_FAST_PATH.md`). The two promotion
+gates are closed as **not met**: the node cache has no workload where a
+repeated base rebuild is on the settled-latency critical path, and stage
+OpenCL has no GPU run. Flipping either default is a product decision that
+needs the named evidence, not an unfinished implementation. Residuals are
+recorded in `STAGE_PIPELINE.md` and `PARITY.md`.
