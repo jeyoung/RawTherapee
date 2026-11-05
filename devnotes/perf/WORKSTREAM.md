@@ -989,56 +989,29 @@ this validates packaging rather than the newest engine code.
 
 ## Remaining
 
-### Block 4 — device node coverage (the large piece)
+### Block 4 — device node coverage: complete
 
-Facts established this session, so the next session does not re-derive them:
+Every node is either a device node or recorded `n/a` with file:line evidence.
+The device set covers `transform`, `rgb.proc`, `gamut`, `crop`, `resize`,
+`output.convert`, `framing`, the monitor/viewport/thumbnail output family,
+`thumbnail.scale`/`rgb`/`lab`/`whitebalance`/`transform`, `lab.tools`,
+`lab.sharpening`, `lab.wavelet`, `local.adjustments`, `working.trc`,
+`output.sharpen`, `ciecam` (CIECAM02 and CAM16), `raw.preprocess`,
+`raw.demosaic` (mono and the Bayer CFA split) and `raw.base` (white balance
+and the camera-matrix arm). `source.select`, `source.embedded`, `analysis`
+and `thumbnail.decode` are `n/a`: they are I/O, pointer swaps or a
+65,536-bin histogram with no portable pixel kernel.
 
-- The catalogue has 30 nodes (`rtengine/stage/stage_pipeline.cc`); `resize`
-  is the only one with a device implementation.
-- Only one runtime call site reaches `stage::run` (`rtengine/ipresize.cc:725`).
-  The other blocks are graph and scheduling metadata; their pixels still come
-  from `ImProcFunctions`.
-- Each node therefore needs four pieces: a stage ABI argument set, a refactor
-  of that block's runtime path onto `stage::run`, a kernel (or a wrapper around
-  an existing `rtengine/opencl/openclengine.cc` kernel), and a parity test at
-  1 LSB.
-- `tools/opencl/verify.sh --quick` probes the old backend, so it reports "no
-  stage executed". Fix the gate first or every coverage run is a SKIP.
+The residuals that remain are recorded as **decisively partial** in
+`STAGE_PIPELINE.md` and `PARITY.md`: FFTW-driven transforms (local `"reti"`,
+local `DeNoise()`, `fftwreti`, exposure outside the six `fftw_size[]` ROIs),
+libc-`rand()` added noise, the host-SIMD `rsqrt` show-mask, the
+`skinredfloat()` CIE CAM chroma/hue sliders, the interpolating demosaic
+methods, EPD and `datacie`. They are not unstarted work.
 
-Order (reuse before new kernels, cheapest parity first):
-
-1. ~~Teach `verify.sh` to observe stage-device execution.~~ Done, together
-   with the precedence fix that makes the device node reachable at all.
-2. ~~`transform` (kernel exists in `openclengine`); apply the same
-   device-first precedence rule at its call site.~~ Done: shared map builder
-   and sampling helpers, device kernel, identity test, extended gate.
-3. ~~`output.convert`, `monitor.output`, `viewport.output` behind one shared
-   Lab-to-RGB wrapper (kernel exists).~~ Done, with `thumbnail.output` as well:
-   shared arithmetic, sub-rectangle views, node names threaded through
-   `lab2monitorRgb()`, export gate, packed-path reference test, and
-   `monitor.output`/`viewport.output` demonstrated on the host, and
-   `thumbnail.output` reached after fixing the missing device policy in
-   `rtthumbnail`.
-4. ~~Partial `rgb.proc`: tone curve, RGB curves, channel mixer, Lab conversion
-   only.~~ Done: the whole classic kernel runs on the device inside its existing
-   opt-in; the tools the classic kernel does not cover stay host-side. The
-   Lab-to-RGB nodes still take their profile tables from the gated classic
-   block, so a future change that disables the classic backend would strand
-   them.
-5. New kernels: `gamut`, `ciecam`, `working.trc`, `framing`, `output.sharpen`.
-6. Composites: `local.adjustments`, `lab.tools`, `lab.sharpening`,
-   `lab.wavelet`, `crop`.
-7. Thumbnail nodes. `thumbnail.output`, `thumbnail.whitebalance`,
-   `thumbnail.transform` (both formats), `thumbnail.scale`, `thumbnail.rgb`
-   and `thumbnail.lab` are done. `thumbnail.decode` remains.
-   Each new kernel needs a device test as well as a call-site gate: the
-   white-balance test paid for itself immediately.
-8. Destructive raw nodes last: `source.select`, `source.embedded`,
-   `raw.preprocess`, `raw.demosaic`, `raw.base`, `analysis`.
-9. Device-buffer reuse across consecutive nodes, then a residency policy
-   (tiers across passes, node-cache interaction, eviction under pressure).
-10. Per-node parity plus `--quick`, `--formats`, `--monitor` on a
-    device-enabled build.
+Gate evidence: `verify.sh --quick` is 84 PASS / 0 FAIL, `--stage-device` is
+73 PASS / 0 FAIL / 0 SKIP, `--formats` passes the public PEF and `--monitor`
+is 1 byte, all on POCL CPU with `rtdata/` bound at the compiled data path.
 
 ### P1 gaps
 
@@ -1066,15 +1039,38 @@ Order (reuse before new kernels, cheapest parity first):
   pairs.
 - rusticl is skipped on this host; deterministic device tests restrict to POCL.
 
-### Decisions outstanding
+### Decisions (closed 2026-11-05)
 
-- **Node cache**: default off, 6.5-8.8% on repeated passes. Needs a promotion
-  decision and a preference/kill-switch policy.
-- **Stage OpenCL**: default off, one node. Promote only when coverage is
-  meaningful.
-- **Push**: authorised 2026-10-29. The 166-commit range up to `03c94581c` is
-  pushed to `origin/perf-graph`; each later stable range is scanned and pushed
-  the same way.
+- **Node cache**: stays **opt-in**. `RT_NODE_CACHE` unset means off and
+  `RT_NODE_CACHE=0` is the kill switch; `RT_NODE_CACHE_MB` sets the budget
+  (default 256 MiB, valid 1-8192) and `RT_NODE_CACHE_STATS` prints the
+  counters at exit. `stage-node-cache-test` passes: the key rejects a
+  different image generation, profile, geometry, work order, backend, node or
+  size; a repeated identical pass is `AE=0` with a hit; the true LRU and
+  budget behave; the disabled path allocates nothing; a malformed payload is
+  refused. That is the correctness evidence, not a production-performance
+  one. Promotion to default needs a preview-path repeated-pass measurement on
+  the gate image showing `AE=0` and a latency win at the default budget,
+  plus a user-visible preference. The synthetic test alone is not that
+  evidence, so the default stays off.
+- **Stage OpenCL**: stays **opt-in** (`RT_STAGE_OPENCL=1`; the kill switches
+  are `RT_STAGE_OPENCL=0` and `RT_STAGE_OPENCL_DISABLE=1`). Coverage is now
+  meaningful: `verify.sh --quick` is **84 PASS / 0 FAIL** and
+  `--stage-device` is **73 PASS / 0 FAIL / 0 SKIP**, with every node at
+  1 LSB16 or better. But every figure is POCL CPU, and the project rule says
+  a CPU-device result is not GPU parity. Promotion to default therefore waits
+  for the same rows on a real GPU, with the fp64 and `rsqrt` paths exercised.
+- **Residency policy (recorded)**: the device path is opt-in and fail-closed.
+  A node runs on the device only when the user preference requests OpenCL,
+  `RT_STAGE_OPENCL=1` is set, the node's device requirements are met (fp64
+  where the kernel uses doubles), and the per-node budget admits the buffers.
+  A refusal runs the host builtin byte for byte and is recorded as
+  `impl=host`, `source=device-fallback`; it is never a silent skip. Buffers
+  come from the context's residency manager, are reused across that
+  context's calls and are released with it. `RT_STAGE_DEVICE_BUDGET_MB`
+  overrides the default budget; out-of-range values fall back to the default.
+- **Push**: authorised 2026-10-29. Each stable range is scanned and pushed to
+  `origin/perf-graph`.
 - **Merge**: `dev`/`perf` untouched, by instruction.
 
 ## Workspace recipes that worked
@@ -1323,61 +1319,21 @@ permanent residual.
 
 ## Next immediate task
 
-The `lab.wavelet` final soft radius (`softradend`) landed with `4f476722d`
-(engine) and `aaa41f842` (test and export gate). Only the portable sub-case
-runs on the device: `Expfinal` set, `Thrend == 0` and an identity
-`wavguidcurve`. The host exports the blend `LIM01(strend / 100)`, the epsilon
-`0.001 * 2^-detend`, the radius `max(int(softradend), 1)` and the subsampled
-box grid and four bilinear scales. The prepare kernel builds
-`guide = xlin2log(L / 32768)` and `src = xlin2log(L)` and keeps the pre-filter
-L; the clarity arm's guided-filter chain runs unchanged; the finish kernel
-applies `xlog2lin(q)` and `intp(blend, q, iL)`. It runs after the final pixel
-curve in both the denoise and the plain branch. Eighteen cases are within
-0.765625 LSB16 (the plain, odd, subsampled and smooth cases are exact), ten
-refusals run the host builtin byte for byte, and `labwavelet-softradend.pp3`
-is exact with `impl=opencl`. The coefficient-domain second block (`Thrend >
-0`) and the hue modulation remain residuals. The export gate uses identity
-final curves because the log-domain filter amplifies a one-LSB16 input
-difference by up to about five LSB16; a non-identity final curve can leave a
-sub-LSB difference that the radius amplifies.
+Block 4 (device node coverage) is closed: every node is a device node or
+recorded `n/a`, the gate is green (`--quick` 84 PASS / 0 FAIL,
+`--stage-device` 73 PASS / 0 FAIL / 0 SKIP, `--formats` 1 entry, `--monitor`
+1 byte), and the portable package is validated on Debian 12 and 13.
 
-The `lab.wavelet` clarity arm landed with `5ff287bda` (engine) and
-`dba2cc58a` (test and export gate). `CLmethod`'s `one`/`inf`/`sup` selection
-now runs on the device for every admitted panel set, the clarity sequence runs
-both `ip_wavelet()` passes with the block's forced-`all` first pass, and the
-merge kernel reproduces the `mergeL`/`mergeC` and `Backmethod` rules. The
-twenty-case matrix is bit-exact except the denoise pair at 0.015625 LSB16, and
-both `labwavelet-clarity.pp3` and `labwavelet-clarity-sup.pp3` export with
-`AE=0`. The first pass uses the trimmed level count and skips the a/b planes
-when the block's own trim drops them to zero; a profile whose `ch[]`, opacity
-curve, `cbenab`, `CHmethod`/`chro` or residual sliders would stop that trim
-short of zero stays a host residual.
+The next workstream is the P1 list above, in this order:
 
-The clarity arm's guided soft radius (`softrad`) landed: the host exports the
-block's `provradius` guide and the subsampling scales, the kernels port
-`guidedFilter()`, and the second pass now applies the block's `L <= 0 -> 1`
-tile-copy clamp while the merge keeps the soft-filtered L unclamped. Nine
-cases are exact except the denoise pair at 0.011719 LSB16, and
-`labwavelet-softrad.pp3` is exact. The standard denoise arm (and the chroma
-denoise the block forces at six levels) landed with the unit above, and its
-`cur` and `sli`+Thrden refinements followed; the expert pairing and the
-BiShrink pair (`quaMethod` `agre`) landed with the units above too, so the
-whole denoise panel now runs on the device except noise balance and the hue
-curve. A user chroma strength is admitted and inert. The final curves and the
-toning zero-protection arm landed with the
-units above. The edge panel's plain arm landed with the unit above; its
-median/Lipschitz detection (`calckoe`), `NPMethod` low/high smoothing, `Lipst`
-and `EDmethod` `SL` landed with this unit, so the whole edge panel now runs on
-the device except a zero-strength panel and L skin protection. `EDmethod` `SL`
-selects the same hard-coded `EDmet == 2` block as `CU`; the `EDmet == 1`
-threshold adjuster is unreachable, so there is nothing to port.
-The balance-chroma arm (`BAmethod` `sli`/`cur`,
-`TMr` for the a/b pass and `Expfinal` for the L pass) landed with this unit:
-the L arm rebuilds the `sigmadir` beta ramp, the a/b arm multiplies by the
-raw `kba`, and the `sli` and `cur` variants both run. The coefficient curve
-now uses `xlogf()`/`xexpf()` so the reconstructed L the a/b arm reads matches
-the host; without that, the `sli` divisor amplified the sub-LSB L difference.
-Ten device cases are within 0.052734 LSB16 (most exact), eleven refusals run
-the host byte for byte, and both `labwavelet-ba-sli.pp3` and
-`labwavelet-ba-cur.pp3` export pixel-exact with `impl=opencl`. Keep
-`OMP_NUM_THREADS=1` in every comparison.
+1. Cover fast export (`-f`) and non-raw thumbnails in the graph.
+2. Fold the five export sub-blocks and the crop raw sub-blocks into named
+   nodes, then close the preview dirty residuals (guide-only crop,
+   high-detail transitions, deferred analysis).
+3. Add node-level profiling and cache metrics to the integrated graph, then
+   run the two promotion gates recorded under "Decisions": the node cache
+   with a preview-path repeated-pass measurement, and stage OpenCL with the
+   same rows on a real GPU (the POCL CPU rows are not GPU parity).
+
+Residuals are not unstarted work; the decisively-partial list is in
+`STAGE_PIPELINE.md` and `PARITY.md`.
