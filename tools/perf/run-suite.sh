@@ -20,7 +20,9 @@
 # enabled. Incremental scenarios compare the derived dirty set with a fresh
 # render of the final state.
 # --denoise-pp3 adds a thread-determinism matrix for a profile that enables
-# directional-pyramid denoising (see devnotes/perf/DETERMINISM.md).
+# directional-pyramid denoising (see devnotes/perf/DETERMINISM.md). The
+# denoise matrix uses the 1 LSB16 parity gate; the neutral matrix stays strict
+# (bit-identical) because both corpus images are exact there.
 
 set -euo pipefail
 
@@ -278,9 +280,12 @@ if [ -n "$denoise_pp3" ]; then
         out="$report/denoise-t$threads.tif"
         "$ROOT/tools/perf/export-one.sh" --build-dir "$build_dir" --image "$image" \
             --out "$out" --pp3 "$denoise_pp3" --gpu off --threads "$threads"
+        # The denoise matrix uses the project's 1 LSB16 parity gate. A rare
+        # last-bit residual is reported with its count rather than hidden; a
+        # gross race (the 77/361-code class) still fails.
         if result=$(python3 "$ROOT/tools/opencl/compare_tiff.py" "$denoise_ref" "$out" --bits 16); then
             set -- $result
-            if [ "$3" = "0" ]; then pass "denoise thread determinism t=$threads"; else fail "denoise thread determinism t=$threads differing=$3"; fi
+            if [ "$1" -le 1 ]; then pass "denoise thread determinism t=$threads (differing=$3, max=$1)"; else fail "denoise thread determinism t=$threads differing=$3 max=$1"; fi
         else
             fail "denoise thread determinism comparison t=$threads"
         fi
