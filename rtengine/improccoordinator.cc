@@ -1655,6 +1655,26 @@ bool ImProcCoordinator::nodeCacheRestoreRawBase(
     lastPassPrevdemoBase.store(
         pass.prevdemoFull ? PrevdemoBase::SIDECAR : PrevdemoBase::FAST,
         std::memory_order_release);
+
+    /*
+     * Node-level cache metric: the raw.base tier came from the node cache, so
+     * the stage profile records a hit with the restored buffer's hash and no
+     * device time. A recompute records its own cache_hit=0 row through
+     * stage::run(), so the two outcomes are distinguishable in one profile.
+     */
+    stage::StageRecord hit;
+    hit.stage = "raw.base";
+    hit.impl = "host";
+    hit.source = "node-cache";
+    hit.consumer = "interactive";
+    hit.elapsed_ns = 0;
+    hit.width = view.width;
+    hit.height = view.height;
+    hit.cache_hit = 1;
+    hit.input_hash = stage::hash_buffer(view);
+    hit.output_hash = hit.input_hash;
+    stage::profile(hit);
+
     return true;
 }
 

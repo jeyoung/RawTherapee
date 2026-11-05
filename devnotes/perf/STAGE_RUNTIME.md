@@ -2310,6 +2310,22 @@ stage export.transform: ...        (legacy only)
 stage export.finish: ...           (legacy only, around the finish nodes)
 ```
 
+### Per-node summary and cache hits
+
+`RT_STAGE_PROFILE=<file>` writes the JSONL records. Reduce them to one row per
+node with:
+
+```bash
+python3 tools/perf/summarize-stage-profile.py "$SCRATCH/stages.jsonl"
+# node  count  total_ms  max_ms  impls  cache_hits
+```
+
+A preview raw.base tier served by the node cache writes its own record with
+`impl=host`, `source=node-cache` and `cache_hit=1`, so the summary separates a
+cache hit (zero node time) from a recompute (`cache_hit=0`, the node's own
+record). The counters behind `RT_NODE_CACHE_STATS` remain the authoritative
+LRU/budget figures.
+
 The numbers are wall time on the host and are not a substitute for a full
 benchmark; they exist to locate the next target.
 
