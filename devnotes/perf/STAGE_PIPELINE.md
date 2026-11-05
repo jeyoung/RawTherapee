@@ -485,7 +485,10 @@ by default.
 | `source.embedded` | -/-/-/Reduced | interactive | recompute | select the embedded JPEG | n/a |
 | `raw.preprocess` | Full/Full/Full/Full | path | reuse-output | raw black/white, hot/dead pixel, CA, flat field; the Bayer arm of `scaleColors()` is the device node | partial |
 | `raw.demosaic` | Full/Full/Full/Full | path | reuse-output | demosaic and capture sharpening; the MONO/NONE arms of `nodemosaic()` are the device node | partial |
-| `raw.base` | Full/Full/Roi/Reduced | path | reuse-output | `getImage()`, spot removal, denoise, film negative, Retinex, source-side gamut; the white-balance multiply and optional clamp in `getImage()` (`raw.base.wb`) and the camera-to-working-space matrix multiply in `colorSpaceConversion_()` when no input or DCP profile is supplied (`raw.base`) are the device sub-steps | partial |
+| `raw.base` | -/Full/Roi/Reduced | path | reuse-output | the composite raw finish for preview, crop and thumbnail; the canonical export names its three sub-blocks instead | partial |
+| `raw.base.source` | Full/-/-/- | exact | reuse-output | white balance, Retinex, `getImage()` and spots: the first part of `raw.base`; the `raw.base.wb` white-balance multiply is the device sub-step | partial |
+| `raw.denoise` | Full/-/-/- | exact | reuse-input | directional-pyramid denoise on the unresized base image | n/a |
+| `raw.color` | Full/-/-/- | exact | reuse-input | working-space conversion, film negative and source-side gamut; the `raw.base` camera-matrix multiply is the device sub-step | partial |
 | `analysis` | Full/Full/Roi/- | path | reuse-output | histogram and auto-exposure analysis | n/a |
 | `transform` | Full/Full/Roi/- | path | reuse-input | rotation, distortion, perspective, CA, vignetting, gradient, post-crop vignette, dehaze, Fattal | yes |
 | `local.adjustments` | Full/Full/Roi/Reduced | path | reuse-input | local lab / selective editing | partial |
@@ -512,7 +515,9 @@ by default.
 | `thumbnail.lab` | -/-/-/Reduced | interactive | reuse-input | thumbnail Lab tools on the device; working TRC, CIE CAM and gamut stay host | partial |
 | `thumbnail.output` | -/-/-/Reduced | interactive | recompute | Lab to 8-bit thumbnail with gamma | yes |
 
-`raw.base` is partial and carries two device sub-steps. `raw.base.wb` is the
+The composite `raw.base` is partial and carries two device sub-steps; in the
+canonical export they run inside `raw.base.source` and `raw.color`
+respectively. `raw.base.wb` is the
 white-balance multiply and the optional `CLIP` that `RawImageSource::getImage()`
 applies to every assembled sample; the host derives `rm`, `gm` and `bm` as
 floats and passes them unchanged, and the node is admitted only for a
@@ -532,30 +537,38 @@ image or a bad buffer shape before the upload; the matrix node also refuses a
 device without fp64 and a non-finite matrix entry, and the host rewrites the
 image.
 
-The fast-export split adds five ids that no other path runs. They are the
-`-f` implementation's own boundaries, not extra work:
+The fast-export split shares `raw.base.source` and `raw.color` with the
+canonical export and adds `early.resize`, `denoise` and `finish`, which no
+other path runs. All five are the `-f` implementation's own boundaries, not
+extra work:
 
 | Id | Domain | Consumer | Reuse | Role | Device |
 |----|--------|----------|-------|------|--------|
-| `raw.base.source` | Full | exact | reuse-output | white balance, Retinex, `getImage()` and spots: the first part of `raw.base` | partial |
-| `raw.color` | Full | exact | reuse-input | working-space conversion, film negative and source-side gamut | n/a |
+| `raw.base.source` | Full | exact | reuse-output | white balance, Retinex, `getImage()` and spots: the first part of `raw.base`, shared with the canonical export | partial |
+| `raw.color` | Full | exact | reuse-input | working-space conversion, film negative and source-side gamut, shared with the canonical export | partial |
 | `early.resize` | Full | exact | reuse-output | RGB to Lab, crop-region conversion, Lab resize and scale-parameter adjustment | yes |
 | `denoise` | Full | exact | reuse-input | directional-pyramid denoise after the early resize | n/a |
 | `finish` | Full | exact | recompute | the composite finish sequence from local adjustments to output ICC | n/a |
 
 ## Path specifications
 
-### Export: 20 nodes, 19 edges
+### Export: 22 nodes, 21 edges
 
 Root `source.select`, sink `output.icc`.
 
 ```text
-source.select -> raw.preprocess -> raw.demosaic -> raw.base -> analysis
-  -> transform -> local.adjustments -> rgb.proc -> lab.tools
-  -> lab.sharpening -> lab.wavelet -> working.trc -> ciecam -> gamut
-  -> crop -> resize -> output.sharpen -> output.convert -> framing
-  -> output.icc
+source.select -> raw.preprocess -> raw.demosaic -> raw.base.source
+  -> raw.denoise -> raw.color -> analysis -> transform -> local.adjustments
+  -> rgb.proc -> lab.tools -> lab.sharpening -> lab.wavelet -> working.trc
+  -> ciecam -> gamut -> crop -> resize -> output.sharpen -> output.convert
+  -> framing -> output.icc
 ```
+
+The raw core names the three `raw.base` sub-blocks in the order the
+implementation runs them. `raw.base.source` builds the base image, `raw.denoise`
+runs the directional-pyramid denoise on it, and `raw.color` converts to the
+working space, applies film negative and compresses the source gamut. The
+preview, crop and thumbnail specs keep the composite `raw.base` node.
 
 The last five nodes follow the implementation's data flow: the Lab image is
 cropped, resized and post-sharpened before it is converted to the output
@@ -859,15 +872,17 @@ const std::vector<ExportParamMapEntry>& exportParamMap();
 ```
 
 `exportParamMap()` is the review surface: descriptor id, consumed member names
-and pipeline order. `has_export_fingerprint()` accepts only the twenty export
-ids; preview, crop, thumbnail, monitor and viewport ids are rejected.
+and pipeline order. `has_export_fingerprint()` accepts only the twenty-two
+export ids; preview, crop, thumbnail, monitor and viewport ids are rejected.
 
 | Descriptor | `ProcParams` members |
 |------------|----------------------|
 | `source.select` | raw |
 | `raw.preprocess` | raw, lensProf, coarse, dirpyrDenoise |
 | `raw.demosaic` | raw, pdsharpening |
-| `raw.base` | raw, wb, toneCurve, spot, dirpyrDenoise, filmNegative, retinex, dehaze, fattal, cg, icm |
+| `raw.base.source` | raw, wb, toneCurve, spot, dirpyrDenoise, retinex, dehaze, fattal, icm |
+| `raw.denoise` | dirpyrDenoise, icm, raw |
+| `raw.color` | filmNegative, cg, icm, raw |
 | `analysis` | icm, toneCurve, dirpyrDenoise |
 | `transform` | coarse, commonTrans, rotate, distortion, perspective, cacorrection, vignetting, gradient, pcvignette, lensProf, crop |
 | `local.adjustments` | locallab, icm, toneCurve, raw, wb, dirpyrequalizer, dehaze, epd, rgbCurves, hsvequalizer, chmixer, colorToning |
@@ -891,8 +906,10 @@ The inventory list above is a lower bound. These members were added from the
 export entry point and the tool implementations:
 
 - `icm` is a member of every stage that converts between working spaces or
-  reads the working profile: `raw.base` (`convertColorSpace()` and Retinex),
-  `analysis` (`firstAnalysis()` luminance weights), `local.adjustments`,
+  reads the working profile: `raw.base.source` (Retinex), `raw.denoise`
+  (guide conversion), `raw.color` (`convertColorSpace()`), the composite
+  `raw.base` used by preview and crop, `analysis` (`firstAnalysis()`
+  luminance weights), `local.adjustments`,
   `rgb.proc` (working-space matrix and DCP), `lab.tools` (vibrance),
   `lab.sharpening`, `lab.wavelet`, `working.trc`, `ciecam`, `gamut`,
   `output.convert` and `output.icc`.
@@ -987,8 +1004,8 @@ test checks:
 1. every canonical export descriptor has an export fingerprint, and ids
    outside the export path do not;
 2. repeated calls and an equal `ProcParams` copy give identical fingerprints;
-3. the table has twenty unique ids in pipeline order, all inside the export
-   spec, and every field name is a `ProcParams` member;
+3. the table has twenty-two unique ids in pipeline order, all inside the
+   export spec, and every field name is a `ProcParams` member;
 4. a mutation table covering WB, demosaic, transform, local adjustments,
    RGB/tone curve, wavelet, CIE CAM, gamut, output profile, crop, resize,
    framing and the remaining descriptors changes the named descriptor;
@@ -1002,9 +1019,10 @@ The sub-struct hashers read 55 `ProcParams` types and 1567 data members.
 
 The parameter map also covers the preview and crop graphs. The preview table
 has fourteen descriptors and the crop table fifteen. Both reuse the export
-definition of every shared block, so `raw.base`, `transform`,
-`local.adjustments`, `rgb.proc`, `lab.tools`, `lab.wavelet`, `working.trc`,
-`ciecam` and `gamut` have one field list on all paths. The crop path adds
+definition of every shared block, so `transform`, `local.adjustments`,
+`rgb.proc`, `lab.tools`, `lab.wavelet`, `working.trc`, `ciecam` and `gamut`
+have one field list on all paths. `raw.base` remains shared by preview and
+crop; the export names its three split rows instead. The crop path adds
 `lab.sharpening`; preview omits it. `monitor.output` (preview) and
 `viewport.output` (crop) are separate display sinks that currently read `icm`.
 
@@ -1031,7 +1049,7 @@ vignetting reads it.
 The test checks every descriptor and table order against
 `buildPipelineSpec()`, neutral-parameter stability, a mutation matrix across
 the parameter families of both paths, and a regression guard that pins the
-twenty neutral-parameter export fingerprints. It runs as
+twenty-two neutral-parameter export fingerprints. It runs as
 `stage-param-map-test` in `build/cpu-phaseF-preview-map`.
 
 ### Render state key

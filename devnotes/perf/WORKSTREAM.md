@@ -716,9 +716,11 @@ binary run on the host also matches the host build with the same data
   (`588301647`). `crop` is a row copy deferred to residency.
 - Remaining CPU-only pixel nodes: `working.trc`, `lab.tools`,
   `lab.wavelet`, `local.adjustments`, `thumbnail.lab`'s working-TRC/CIE-CAM/
-  gamut remainder, and the raw nodes (`raw.base`; `source.*`/`analysis` are
-  exceptions). `raw.preprocess` is partial through its `scaleColors()` Bayer
-  arm and `raw.demosaic` through the MONO/NONE arms of `nodemosaic()`.
+  gamut remainder, and the raw nodes (`raw.base` on preview/thumbnail; the
+  export names `raw.base.source`, `raw.denoise` and `raw.color`;
+  `source.*`/`analysis` are exceptions). `raw.preprocess` is partial through
+  its `scaleColors()` Bayer arm and `raw.demosaic` through the MONO/NONE arms
+  of `nodemosaic()`.
 - **`raw.demosaic` (partial)**: the MONO and NONE arms of `nodemosaic()` run
   on the device; every interpolating method and capture sharpening stay on the
   host. MONO is a three-plane copy and NONE routes each pixel through
@@ -1029,8 +1031,16 @@ is 1 byte, all on POCL CPU with `rtdata/` bound at the compiled data path.
   stops at the full-size `Image8` resize (`rtthumbnail.cc:495-505`) with no
   profile pipeline, and the harness asserts that no `processImage` line
   appears.
-- Folded nodes: preview `analysis`; crop `raw.preprocess`/`raw.demosaic`; five
-  export sub-blocks.
+- Export raw split (P1-3a): the canonical export names `raw.base.source`,
+  `raw.denoise` and `raw.color`, giving 22 nodes and 21 edges. PEF (10.2 MP)
+  and NEF (45.7 MP) neutral 16-bit exports are AE=0 against `ffc7e219c` at one
+  thread, and `RT_STAGE_PROFILE` records the three nodes. The fast-export spec
+  is unchanged.
+- Folded nodes: preview `analysis`; crop `raw.preprocess`/`raw.demosaic`; four
+  export sub-blocks (framing geometry, Nearest output resize, histogram
+  allocation, forced B&W). The three `raw.base` sub-blocks are named export
+  nodes since P1-3a; none of the remaining four has a buffer boundary, so each
+  is covered by its parent's record.
 - Preview dirty residuals: guide-only crop changes, high-detail transitions,
   deferred analysis.
 - Node-level profiling and cache metrics for the integrated graph.
@@ -1336,11 +1346,13 @@ recorded `n/a`, the gate is green (`--quick` 84 PASS / 0 FAIL,
 
 The next workstream is the P1 list above, in this order:
 
-1. Fold the five export sub-blocks and the crop raw sub-blocks into named
-   nodes, then close the preview dirty residuals (guide-only crop,
-   high-detail transitions, deferred analysis). Non-raw thumbnails are
-   covered by `thumbnail-stage-test` and fast export by
-   `StagePath::FastExport`.
+1. Name the remaining four export sub-block boundaries — framing geometry,
+   Nearest output resize, histogram allocation and forced B&W each have no
+   buffer boundary and stay covered by their parent — and the crop raw
+   sub-blocks, then close the preview dirty residuals (guide-only crop,
+   high-detail transitions, deferred analysis). The three `raw.base`
+   sub-blocks are done (P1-3a). Non-raw thumbnails are covered by
+   `thumbnail-stage-test` and fast export by `StagePath::FastExport`.
 2. Add node-level profiling and cache metrics to the integrated graph, then
    run the two promotion gates recorded under "Decisions": the node cache
    with a preview-path repeated-pass measurement, and stage OpenCL with the

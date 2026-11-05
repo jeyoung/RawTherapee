@@ -522,10 +522,12 @@ white-balance multiply and optional `CLIP` of `RawImageSource::getImage()` in
 `rtengine/rawimagesource.cc`; `raw.base` is the camera-to-working-space matrix
 multiply of `RawImageSource::colorSpaceConversion_()` when `findInputProfile()`
 supplied neither an input ICC profile nor a DCP profile (`in == nullptr` and
-`dcpProf == nullptr`). The rest of `raw.base` remains host work: Retinex, spot
-removal, denoise, film negative, gamut compression and the analysis folded into
-the block. The input-profile, DCP, LUT and Lab arms of
-`colorSpaceConversion_()` are also host residuals.
+`dcpProf == nullptr`). The rest of the composite block remains host work:
+Retinex, spot removal, denoise, film negative, gamut compression and the
+analysis folded into the block. The input-profile, DCP, LUT and Lab arms of
+`colorSpaceConversion_()` are also host residuals. The device node keeps the
+name `raw.base` when the canonical export graph calls it from the `raw.color`
+node; a graph node id and a device node id are independent namespaces.
 
 The host computes the 3x3 matrix in double precision from
 `ICCStore::workingSpaceInverseMatrix(cmp.workingProfile)` and
@@ -1428,14 +1430,14 @@ sections, raw-byte framing, repeated `finish()` and 100k repeated calls.
 `ImageProcessor::normal_pipeline()` runs the canonical export inventory as a
 `StageGraph`, and that is the only export sequence: the hand-ordered version
 and its `RT_STAGE_GRAPH` kill switch have been removed.
-`stage::buildPipelineSpec(StagePath::Export)` supplies all 20 node ids, the 19
+`stage::buildPipelineSpec(StagePath::Export)` supplies all 22 node ids, the 21
 edges and each node's reuse mode, so the graph is not restated in the
 processing code. The graph is built per job, so every node is dirty and
 `plan()` must let every node run.
 
 Execution is guarded before any node runs:
 
-1. the spec node count must be 20 and every node id must have an executor;
+1. the spec node count must be 22 and every node id must have an executor;
 2. the graph must be acyclic and the topological order must cover every node;
 3. every decision must be `Recompute` or `ReuseInput` (a reuse-input node
    writes in place). A `ReuseOutput` would skip a block; this path has no
@@ -1446,7 +1448,7 @@ Execution is guarded before any node runs:
 
 Execution follows `topologicalOrder()`, and each node id selects the private
 method that implements the block, so the arithmetic is untouched. An accepted
-plan logs `stage-graph: active, 20 nodes executed from the canonical export
+plan logs `stage-graph: active, 22 nodes executed from the canonical export
 inventory` once per process.
 
 Fast export (`-f`) is the second export spec, `StagePath::FastExport`: ten
@@ -1459,19 +1461,23 @@ inventory`. When `Resize` is disabled the fast entry point still delegates to
 `normal_pipeline()`, exactly as before.
 
 `RT_STAGE_PROFILE=1` records one key per canonical export node, named by node
-id (`source.select` ... `output.icc`), from inside the node method. The fast
-path additionally emits one JSONL record per fast node, measured by the
-executor and carrying `impl` (the fast node methods are host composites; any
-device sub-node records its own impl). The pre-existing `finish.rgbproc`,
-`finish.sharpening`, `finish.wavelet`, `finish.resize` and `finish.output`
-scopes remain inside their nodes.
+id (`source.select` ... `output.icc`), from inside the node method. The three
+`raw.base` sub-blocks are measured by the executor wrapper, which also emits a
+JSONL record with `impl=host` for each. The fast path additionally emits one
+JSONL record per fast node, measured by the same wrapper (the fast node methods
+are host composites; any device sub-node records its own impl). The pre-existing
+`finish.rgbproc`, `finish.sharpening`, `finish.wavelet`, `finish.resize` and
+`finish.output` scopes remain inside their nodes.
 
-All 20 nodes execute real work. Blocks that stay folded inside a neighbour,
-because one topological order has to reproduce the implementation's pixel
-order, are listed in `devnotes/perf/STAGE_PIPELINE.md`: the framing geometry
-is computed in `crop`, the Nearest output resize is in `output.convert`,
-`raw.base` is three calls, the histogram allocation is in `analysis`, and the
-forced B&W pass is in `output.convert`.
+All 22 nodes execute real work. The three `raw.base` sub-blocks are named nodes
+of their own (`raw.base.source`, `raw.denoise`, `raw.color`) in the canonical
+export, so each has a profile record and an execution boundary. The steps that
+still stay folded inside a neighbour, because one topological order has to
+reproduce the implementation's pixel order, are listed in
+`devnotes/perf/STAGE_PIPELINE.md`: the framing geometry is computed in `crop`,
+the Nearest output resize is in `output.convert`, the histogram allocation is
+in `analysis`, and the forced B&W pass is in `output.convert`. Those four have
+no buffer boundary of their own and are covered by their parent node's record.
 
 ### Export graph evidence
 
@@ -1497,17 +1503,32 @@ neutral, sidecar, cropped and output-profile at 1 and 8 threads, after
 normalising the TIFF DateTime tag that records the render time. Every pair was
 also `AE=0`.
 
-Per-node profile, `resize.pp3`, 8 threads, one run (ms):
+Raw split (P1-3a): replacing the composite `raw.base` node with
+`raw.base.source`, `raw.denoise` and `raw.color` leaves the neutral 16-bit
+export byte-identical. The control is `ffc7e219c`, neutral profile,
+`--gpu=off`, `OMP_NUM_THREADS=1`: the 10.2 MP PEF is `AE=0` (0 of 30 419 712
+samples) and the 45.7 MP NEF is `AE=0` (0 of 136 918 080). A profiled export
+records the three nodes with `impl=host`; the device matrix sub-step keeps its
+own `raw.base` name inside `raw.color`.
+
+Per-node profile, `resize.pp3`, 8 threads, one run after the raw.base split
+(ms):
 
 ```text
-source.select 0.009   raw.preprocess 359.381   raw.demosaic 1095.558
-raw.base 902.565      analysis 79.675         transform 0.026
-local.adjustments 0.044   rgb.proc 545.215    lab.tools 0.487
-lab.sharpening 0.003  lab.wavelet 0.002       working.trc 0.005
-ciecam 0.010          gamut 0.000             crop 0.003
-resize 1053.657       output.sharpen 0.000    output.convert 1241.654
-framing 0.000         output.icc 0.040
+source.select 0.007   raw.preprocess 55.070   raw.demosaic 179.005
+raw.base.source 97.318 raw.denoise 0.010     raw.color 31.539
+analysis 17.194       transform 0.017        local.adjustments 0.028
+rgb.proc 212.578      lab.tools 0.352        lab.sharpening 0.004
+lab.wavelet 0.001     working.trc 0.001      ciecam 0.000
+gamut 0.000           crop 0.004             resize 627.878
+output.sharpen 0.000  output.convert 27.888  framing 0.000
+output.icc 0.022
 ```
+
+The `finish.rgbproc`, `finish.resize` and `finish.output` scopes remain nested
+inside their nodes and are not listed separately. The absolute times are from
+one run on a loaded host; compare rows within the table, not against the
+pre-split table.
 
 Legacy performance: 11 interleaved pairs of the pre-change and decomposed
 binaries, both on the legacy path, `resize.pp3`, 8 threads, wall time in ms.
@@ -1527,7 +1548,7 @@ order. `tools/perf/run-suite.sh --graph` runs the neutral comparison as an
 optional gate.
 
 The OpenCL configuration compiles with `--stage-modules` and gives the same
-result: all ten legacy/graph pairs are `AE=0`, the graph logs 20 executed
+result: all ten legacy/graph pairs are `AE=0`, the graph logs 22 executed
 nodes, and `stage-pipeline-test`, `stage-graph-test` and `stage-device-test`
 pass. The parity runs use `--gpu=off`. A POCL CPU run of the device tests is
 recorded in `PARITY.md`; the device path is opt-in and does not affect these
@@ -2413,8 +2434,8 @@ parity.
 
 ## Merged phase results
 
-- Export graph: the graph executes the 20 canonical
-  nodes in topological order and logs `stage-graph: active, 20 nodes executed
+- Export graph: the graph executes the 22 canonical
+  nodes in topological order and logs `stage-graph: active, 22 nodes executed
   from the canonical export inventory`. Ten legacy/graph pairs (neutral,
   sidecar, cropped, output-profile, cropped plus output-profile; 1 and 8
   threads) were `AE=0` while the switch existed, and the legacy path was
@@ -2478,7 +2499,7 @@ trigger or node-entry gate reads a mask: `RT_PREVIEW_DIRTY` and
 `RT_CROP_DIRTY` are gone.
 
 The gate is unchanged in shape. `run-suite.sh --graph` now requires the export
-log to report the 20-node inventory and the export to be byte-identical to the
+log to report the 22-node inventory and the export to be byte-identical to the
 suite reference, because there is no legacy run to difference against;
 `--thumbnail-graph` and `--crop-graph` still require their harnesses to pass
 with every plan accepted.
@@ -2493,7 +2514,7 @@ where the harness fixes `OMP_NUM_THREADS=1`.
   against the pre-change `baseline-dev` binary (the sidecar export was also
   `AE=0` with a non-neutral `Pop 2 Lab` profile in an earlier run of the same
   gate); the export log reports
-  `stage-graph: active, 20 nodes executed from the canonical export
+  `stage-graph: active, 22 nodes executed from the canonical export
   inventory`; the thumbnail harness logs all four plans active (2, 2, 4 and 6
   nodes); the crop harness logs `6 plans executed, 0 plan fallbacks` for the
   viewport states and for the stage-coverage run.
@@ -3774,7 +3795,7 @@ before the upload.
   graph path caches or reuses buffers yet. The preview executes 13 of its 14
   canonical nodes (`analysis` folded into `raw.base`), the crop 13 of 15
   (`raw.preprocess`/`raw.demosaic` folded into `source.select`), the export
-  all 20 and the thumbnail all 12.
+  all 22 and the thumbnail all 12.
 - Inspector-mode thumbnails and the thumbnail raw fallback keep their own
   non-graph loading code; they are outside the reduced-domain thumbnail
   inventory and were never part of the legacy graph switch.
@@ -3805,11 +3826,14 @@ before the upload.
   drive those panels reproducibly in both runs. Those two are covered by
   `stage-dirty-blocks-test` and by the dump pairs of the transitions that did
   run, and are recorded as a harness gap rather than a PASS.
-- Five export blocks are folded inside a neighbouring node rather than
+- Four export blocks are folded inside a neighbouring node rather than
   having an execution boundary of their own: the framing geometry (in
-  `crop`), the Nearest output resize (in `output.convert`), the three
-  `raw.base` sub-blocks, the histogram allocation (in `analysis`) and the
-  forced B&W pass (in `output.convert`). See `devnotes/perf/STAGE_PIPELINE.md`.
+  `crop`), the Nearest output resize (in `output.convert`), the histogram
+  allocation (in `analysis`) and the forced B&W pass (in `output.convert`).
+  None of them has a buffer boundary, so each is covered by its parent's
+  record. The three `raw.base` sub-blocks are no longer folded: P1-3a names
+  them `raw.base.source`, `raw.denoise` and `raw.color` in the canonical
+  export. See `devnotes/perf/STAGE_PIPELINE.md`.
 - The crop path folds the pre-RGB directional-pyramid equaliser into
   `stageTransform()` and `softLight()` into `stageWorkingTrc()` because both
   are position-sensitive in the legacy order.
