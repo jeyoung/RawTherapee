@@ -30,6 +30,7 @@
 #include <map>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace
@@ -51,6 +52,7 @@ const std::vector<StagePath>& allPaths()
 {
     static const std::vector<StagePath> paths = {
         StagePath::Export,
+        StagePath::FastExport,
         StagePath::Preview,
         StagePath::Crop,
         StagePath::Thumbnail
@@ -289,9 +291,10 @@ void checkShape(const StagePipelineSpec& spec, StagePath requested)
         check(node.domain == StageDomain::Full || node.domain == StageDomain::Roi ||
                   node.domain == StageDomain::Reduced,
               label + ": node " + node.id + " has a defined domain");
-        const StageConsumer expected = spec.path == StagePath::Export
-                                           ? StageConsumer::Exact
-                                           : StageConsumer::Interactive;
+        const bool exact = spec.path == StagePath::Export ||
+                           spec.path == StagePath::FastExport;
+        const StageConsumer expected =
+            exact ? StageConsumer::Exact : StageConsumer::Interactive;
         check(node.consumer == expected,
               label + ": node " + node.id + " serves the path consumer");
     }
@@ -335,6 +338,38 @@ void checkExport()
           "export: source.select is the single root");
     check(spec.sinks.size() == 1 && spec.sinks[0] == "output.icc",
           "export: output.icc is the single sink");
+}
+
+void checkFastExport()
+{
+    const StagePipelineSpec spec = buildPipelineSpec(StagePath::FastExport);
+
+    const std::vector<std::string> order = {
+        "source.select", "raw.preprocess", "raw.demosaic", "raw.base.source",
+        "raw.color", "analysis", "transform", "early.resize", "denoise",
+        "finish"
+    };
+
+    check(spec.nodes.size() == order.size(),
+          "fast export: node count matches the fixed fast order");
+    for (size_t i = 0; i < order.size() && i < spec.nodes.size(); ++i) {
+        check(spec.nodes[i].id == order[i],
+              "fast export: node " + std::to_string(i) + " is " + order[i]);
+    }
+
+    check(spec.edges.size() == order.size() - 1,
+          "fast export: linear graph has one edge per adjacent pair");
+    for (size_t i = 1; i < order.size(); ++i) {
+        check(spec.edges[i - 1] ==
+                  std::make_pair(order[i - 1], order[i]),
+              "fast export: edge " + std::to_string(i - 1) + " is " +
+                  order[i - 1] + " -> " + order[i]);
+    }
+
+    check(spec.roots.size() == 1 && spec.roots[0] == order.front(),
+          "fast export: source.select is the single root");
+    check(spec.sinks.size() == 1 && spec.sinks[0] == order.back(),
+          "fast export: finish is the single sink");
 }
 
 void checkPreview()
@@ -463,6 +498,8 @@ int main()
 {
     check(std::string(stagePathName(StagePath::Export)) == "export",
           "path name: export");
+    check(std::string(stagePathName(StagePath::FastExport)) == "fast_export",
+          "path name: fast_export");
     check(std::string(stageDomainName(StageDomain::Reduced)) == "reduced",
           "domain name: reduced");
     check(std::string(stageConsumerName(StageConsumer::Interactive)) ==
@@ -476,6 +513,7 @@ int main()
     }
 
     checkExport();
+    checkFastExport();
     checkPreview();
     checkCrop();
     checkSharedCore();
