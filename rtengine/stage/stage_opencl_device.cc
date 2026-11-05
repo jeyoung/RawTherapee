@@ -15244,6 +15244,39 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
         return device_buffer;
     };
 
+    /* The chroma-slider polylines are doubles; the stage shape counts bytes in
+     * float units, so a buffer of `count` doubles is 2 * count floats wide. */
+    const auto upload_double_table = [&](const double* data, int count,
+                                         char* key, const char* label)
+        -> StageDeviceBufferPtr {
+        if (data == nullptr || count <= 0) {
+            return placeholder_device;
+        }
+        StageDeviceBufferPtr device_buffer = residency->acquire(
+            key, StageBufferShape{RT_STAGE_F32, 2 * count, 1, 1}, &error);
+        if (!device_buffer) {
+            error = std::string("local.adjustments ") + label +
+                    " allocation failed";
+            return nullptr;
+        }
+        RtStageBuffer host{};
+        host.size = sizeof(RtStageBuffer);
+        host.data = const_cast<double*>(data);
+        host.width = 2 * count;
+        host.height = 1;
+        host.row_pitch = static_cast<std::size_t>(count) * sizeof(double);
+        host.plane_pitch = host.row_pitch;
+        host.planes = 1;
+        host.format = RT_STAGE_F32;
+        host.flags = RT_STAGE_BUFFER_READ;
+        if (residency->upload(device_buffer, host) != RT_STAGE_OK) {
+            error = std::string("local.adjustments ") + label +
+                    " upload failed";
+            return nullptr;
+        }
+        return device_buffer;
+    };
+
     char ws_key = 0;
     char iws_key = 0;
     char ws_double_key = 0;
@@ -15270,6 +15303,8 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
     char light_key = 0;
     char satur_key = 0;
     char saturmoins_key = 0;
+    char satur_poly_key = 0;
+    char saturmoins_poly_key = 0;
     char skin_key = 0;
     char sh_hl_key = 0;
     char sh_sh_key = 0;
@@ -16552,7 +16587,18 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
             static_cast<int>(cbdlChromaLevels) *
                 static_cast<int>(RT_LOCAL_ADJUSTMENTS_CBDL_LUT_ENTRIES),
             "CBDL chroma", &cbdl_chroma_key);
+        const int satur_poly_count =
+            static_cast<int>(setup.satur_poly_count);
+        const int saturmoins_poly_count =
+            static_cast<int>(setup.saturmoins_poly_count);
+        StageDeviceBufferPtr satur_poly_device = upload_double_table(
+            setup.satur_poly, 3 * satur_poly_count, &satur_poly_key,
+            "positive chroma polyline");
+        StageDeviceBufferPtr saturmoins_poly_device = upload_double_table(
+            setup.saturmoins_poly, 3 * saturmoins_poly_count,
+            &saturmoins_poly_key, "negative chroma polyline");
         if (!light_device || !satur_device || !saturmoins_device ||
+            !satur_poly_device || !saturmoins_poly_device ||
             !skin_device || !reti_gain_device || !reti_trans_device ||
             !sh_hl_device || !sh_sh_device ||
             !cbdl_luma_device || !cbdl_chroma_device) {
@@ -20937,6 +20983,9 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
                     cl_int fin_l_only = 1;
                     cl_int begx = sharpenBegX;
                     cl_int begy = sharpenBegY;
+                    /* transit_shapedetect2()'s scope base for the sharpen
+                     * blend: the block's default `2` (see run_blend). */
+                    cl_float scope = 2.0f;
                     bool ok = true;
                     ok = ok && set(blend_kernel, arg++, sizeof(cl_mem),
                                    &lab_memory);
@@ -20975,6 +21024,8 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
                                    &begx);
                     ok = ok && set(blend_kernel, arg++, sizeof(cl_int),
                                    &begy);
+                    ok = ok && set(blend_kernel, arg++, sizeof(cl_float),
+                                   &scope);
                     if (!ok || blend_w <= 0 || blend_h <= 0 ||
                         !launch2d(blend_kernel,
                                   static_cast<std::size_t>(blend_w),
@@ -21405,6 +21456,11 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
                 cl_mem light_memory = memory_of(light_device);
                 cl_mem satur_memory = memory_of(satur_device);
                 cl_mem saturmoins_memory = memory_of(saturmoins_device);
+                cl_mem satur_poly_memory = memory_of(satur_poly_device);
+                cl_mem saturmoins_poly_memory =
+                    memory_of(saturmoins_poly_device);
+                cl_int satur_poly_entries = satur_poly_count;
+                cl_int saturmoins_poly_entries = saturmoins_poly_count;
                 cl_int x0 = xstart;
                 cl_int y0 = ystart;
                 cl_int rw = bfw;
@@ -21428,6 +21484,14 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
                                &satur_memory);
                 ok = ok && set(apply_kernel, arg++, sizeof(cl_mem),
                                &saturmoins_memory);
+                ok = ok && set(apply_kernel, arg++, sizeof(cl_mem),
+                               &satur_poly_memory);
+                ok = ok && set(apply_kernel, arg++, sizeof(cl_int),
+                               &satur_poly_entries);
+                ok = ok && set(apply_kernel, arg++, sizeof(cl_mem),
+                               &saturmoins_poly_memory);
+                ok = ok && set(apply_kernel, arg++, sizeof(cl_int),
+                               &saturmoins_poly_entries);
                 ok = ok && set(apply_kernel, arg++, sizeof(cl_int), &lp);
                 ok = ok && set(apply_kernel, arg++, sizeof(cl_int), &lpl);
                 ok = ok && set(apply_kernel, arg++, sizeof(cl_int), &rw);

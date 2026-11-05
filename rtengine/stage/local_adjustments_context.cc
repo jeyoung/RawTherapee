@@ -2047,9 +2047,12 @@ uint32_t avoidMethod(const Glib::ustring& method)
 }
 
 /* A DiagonalCurve's sampled table for the two chroma-slider curves. The host
- * evaluates these curves per pixel; the device table is a host-sampled
- * piecewise-linear approximation over the block's [0,1] argument. */
-void sampleCurve(const std::vector<double>& points, std::vector<float>& table)
+ * evaluates these curves per pixel with DiagonalCurve::getVal() in double, so
+ * the table is a piecewise-linear approximation and cannot be bit-exact. The
+ * exact polyline is exported next to it and the device walks that instead;
+ * the table stays for the record's active flags and as a fallback. */
+void sampleCurve(const std::vector<double>& points, std::vector<float>& table,
+                 std::vector<double>& polyline)
 {
     DiagonalCurve curve(points);
     table.resize(RT_LOCAL_ADJUSTMENTS_LUT_ENTRIES);
@@ -2059,6 +2062,21 @@ void sampleCurve(const std::vector<double>& points, std::vector<float>& table)
             curve.getVal(static_cast<double>(index) /
                          static_cast<double>(RT_LOCAL_ADJUSTMENTS_LUT_ENTRIES -
                                              1u)));
+    }
+
+    const std::vector<double>& px = curve.polylineX();
+    const std::vector<double>& py = curve.polylineY();
+    const std::vector<double>& ps = curve.polylineSlope();
+    polyline.clear();
+    if (px.size() < 2 || py.size() != px.size() || ps.size() + 1 != px.size()) {
+        return;
+    }
+    const std::size_t count = px.size();
+    polyline.resize(3 * count);
+    for (std::size_t index = 0; index < count; ++index) {
+        polyline[index] = px[index];
+        polyline[count + index] = py[index];
+        polyline[2 * count + index] = index + 1 < count ? ps[index] : 0.0;
     }
 }
 
@@ -2352,6 +2370,8 @@ int LocalAdjustmentsContext::build(int spot, const RtStageBuffer* lab,
     /* The two chroma-slider curves, built exactly as the block builds them. */
     std::vector<float> saturTable;
     std::vector<float> saturMoinsTable;
+    saturPoly_.clear();
+    saturMoinsPoly_.clear();
     const float satreal = static_cast<float>(lp.chro);
     if (lp.chro != 0) {
         std::vector<double> saturPoints;
@@ -2365,7 +2385,7 @@ int LocalAdjustmentsContext::build(int spot, const RtStageBuffer* lab,
             std::min(1.f, 0.6f + satreal / 250.f)));
         saturPoints.push_back(1.0);
         saturPoints.push_back(1.0);
-        sampleCurve(saturPoints, saturTable);
+        sampleCurve(saturPoints, saturTable, saturPoly_);
 
         std::vector<double> moinsPoints;
         moinsPoints.push_back(static_cast<double>(DCT_NURBS));
@@ -2378,7 +2398,7 @@ int LocalAdjustmentsContext::build(int spot, const RtStageBuffer* lab,
         moinsPoints.push_back(0.7);
         moinsPoints.push_back(1.0);
         moinsPoints.push_back(1.0);
-        sampleCurve(moinsPoints, saturMoinsTable);
+        sampleCurve(moinsPoints, saturMoinsTable, saturMoinsPoly_);
     }
 
     /*
@@ -3516,6 +3536,16 @@ int LocalAdjustmentsContext::build(int spot, const RtStageBuffer* lab,
         static_cast<float>(chromaref);
     record[RT_LOCAL_ADJUSTMENTS_SLOT_LUMAREF] =
         static_cast<float>(lumaref);
+    /* The same narrowing and multiplication order transit_shapedetect2()
+     * uses for its reference point. */
+    const float hueRef = static_cast<float>(hueref);
+    const float chromaRef = static_cast<float>(chromaref);
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_REF_A] =
+        chromaRef * std::cos(hueRef) * 327.68f;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_REF_B] =
+        chromaRef * std::sin(hueRef) * 327.68f;
+    record[RT_LOCAL_ADJUSTMENTS_SLOT_REF_L] =
+        static_cast<float>(lumaref) * 327.68f;
     record[RT_LOCAL_ADJUSTMENTS_SLOT_SOBELREF] =
         static_cast<float>(sobelref);
     record[RT_LOCAL_ADJUSTMENTS_SLOT_AVGE] = avge;
@@ -3979,6 +4009,13 @@ int LocalAdjustmentsContext::build(int spot, const RtStageBuffer* lab,
     out.iir_cie = &iirCie_;
     out.iir_mask = &iirMask_;
     out.iir_exposure = &iirExposure_;
+    out.satur_poly =
+        saturPoly_.empty() ? nullptr : saturPoly_.data();
+    out.satur_poly_count = static_cast<uint32_t>(saturPoly_.size() / 3u);
+    out.saturmoins_poly =
+        saturMoinsPoly_.empty() ? nullptr : saturMoinsPoly_.data();
+    out.saturmoins_poly_count =
+        static_cast<uint32_t>(saturMoinsPoly_.size() / 3u);
     built_ = true;
     return 0;
 }

@@ -610,6 +610,13 @@ struct ProcParams;
 #define RT_LOCAL_ADJUSTMENTS_SLOT_EXP_POISH_OFFSET 359u
 #define RT_LOCAL_ADJUSTMENTS_SLOT_EXP_BFW 360u
 #define RT_LOCAL_ADJUSTMENTS_SLOT_EXP_BFH 361u
+/* transit_shapedetect2()'s reference point, resolved on the host. The block
+ * evaluates `chromaref * cosf(hueref) * 327.68f` and `chromaref * sinf(hueref)
+ * * 327.68f` once per spot; the device must read those floats rather than
+ * recompute them, because OpenCL's cos/sin are not glibc's cosf/sinf. */
+#define RT_LOCAL_ADJUSTMENTS_SLOT_REF_A 362u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_REF_B 363u
+#define RT_LOCAL_ADJUSTMENTS_SLOT_REF_L 364u
 /* iplocallab.cc's mSPsharpCS: buildBlendMask2() needs 150 px on both axes.
  * A smaller ROI makes the capture block a no-op, not a refusal. */
 #define RT_LOCAL_ADJUSTMENTS_CAPTURE_MIN_ROI 150
@@ -890,6 +897,14 @@ typedef struct RtLocalAdjustmentsResult {
      * final gain and gamut round trip calls Color::xyz2rgb(), which multiplies
      * with the double matrix. */
     const double* iws_double;
+    /* The two chroma-slider DiagonalCurves as exact polylines: count
+     * abscissae, count ordinates and count slopes (the last unused), all
+     * double. The host evaluates getVal() on this polyline in double, so a
+     * float sample table cannot reproduce it bit for bit. */
+    const double* satur_poly;
+    uint32_t satur_poly_count;
+    const double* saturmoins_poly;
+    uint32_t saturmoins_poly_count;
 } RtLocalAdjustmentsResult;
 
 typedef struct RtLocalAdjustmentsContext {
@@ -1133,6 +1148,8 @@ private:
     std::vector<float> igammaSrgb_;
     std::vector<float> munsell_;
     std::vector<float> munsell_sizes_;
+    std::vector<double> saturPoly_;
+    std::vector<double> saturMoinsPoly_;
     RtLabToolsIir iir_ = {};
     RtLabToolsIir iirVib_ = {};
     RtLabToolsIir iirLc_ = {};

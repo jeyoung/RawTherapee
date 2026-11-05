@@ -66,6 +66,10 @@ inline constexpr const char* RT_LOCAL_ADJUSTMENTS_CL = R"CLC(
 #define RT_LA_HUEREF 21
 #define RT_LA_CHROMAREF 22
 #define RT_LA_LUMAREF 23
+/* transit_shapedetect2()'s reference point, computed on the host. */
+#define RT_LA_REF_A 362
+#define RT_LA_REF_B 363
+#define RT_LA_REF_L 364
 #define RT_LA_SHAPE 26
 #define RT_LA_ACTIV 27
 #define RT_LA_ISLOCAL 28
@@ -331,6 +335,35 @@ inline float rt_la_satur_lut(__global const float* table, const float chroma)
     return rt_lt_lut(table, 65536, rt_lt_lim01(chroma / 35000.0f) * 65535.0f);
 }
 
+/*
+ * DiagonalCurve::getVal() for DCT_NURBS, in double, over the polyline the
+ * host exports: count abscissae, count ordinates and count slopes. The host's
+ * hash table is only a starting bracket for the binary search, so a search
+ * from the full range stops at the same adjacent pair.
+ */
+inline float rt_la_satur_curve(__global const double* poly, const int count,
+                               const float arg)
+{
+    if (count < 2) {
+        return arg;
+    }
+    __global const double* px = poly;
+    __global const double* py = poly + count;
+    __global const double* ps = poly + 2 * count;
+    const double t = (double)arg;
+    int k_lo = 0;
+    int k_hi = count - 1;
+    while (k_hi > 1 + k_lo) {
+        const int k = (k_hi + k_lo) / 2;
+        if (px[k] > t) {
+            k_hi = k;
+        } else {
+            k_lo = k;
+        }
+    }
+    return (float)(py[k_lo] + (t - px[k_lo]) * ps[k_lo]);
+}
+
 /* iplocallab.cc balancedeltaE(). */
 inline float rt_la_balancedeltaE(const float kL)
 {
@@ -343,8 +376,21 @@ inline float rt_la_balancedeltaE(const float kL)
     return abal * kL + bbal;
 }
 
-/* iplocallab.cc calcreducdE(). The host calls std::pow(float,float), so the
- * device calls pow() on the same float arguments. */
+/* iplocallab.cc calcreducdE()'s exponentiation. The host calls
+ * std::pow(float,float), which is glibc's correctly rounded powf; OpenCL's
+ * pow() is not bit-identical to it (it differs in the last bit on roughly
+ * one value in ten). powf(x, 2) is x*x, so the default iteration count is
+ * spelled out exactly, and every other exponent goes through the device's
+ * fp64 pow, whose single rounding to float matches powf's result. */
+inline float rt_la_host_pow(const float base, const float exponent)
+{
+    if (exponent == 2.0f) {
+        return base * base;
+    }
+    return (float)pow((double)base, (double)exponent);
+}
+
+/* iplocallab.cc calcreducdE(). */
 inline float rt_la_calcreducdE(const float dE, const float maxdE,
                                const float mindE, const float maxdElim,
                                const float mindElim, const float iterat,
@@ -354,8 +400,8 @@ inline float rt_la_calcreducdE(const float dE, const float maxdE,
         if (dE > maxdElim) {
             return 0.0f;
         } else if (dE > mindElim) {
-            const float reducdElim =
-                pow((dE - maxdElim) / (mindElim - maxdElim), iterat);
+            const float reducdElim = rt_la_host_pow(
+                (dE - maxdElim) / (mindElim - maxdElim), iterat);
             const float aalim = (1.0f - reducdElim) / 20.0f;
             const float bblim = 1.0f - 100.0f * aalim;
             return aalim * (float)scope + bblim;
@@ -366,7 +412,7 @@ inline float rt_la_calcreducdE(const float dE, const float maxdE,
     if (dE > maxdE) {
         return 0.0f;
     } else if (dE > mindE) {
-        return pow((dE - maxdE) / (mindE - maxdE), iterat);
+        return rt_la_host_pow((dE - maxdE) / (mindE - maxdE), iterat);
     }
     return 1.0f;
 }
@@ -389,7 +435,8 @@ inline float rt_la_calc_local_factor(const float lox, const float loy,
     const float ap = RT_LA_PI_F / (1.0f - ach);
     const float bp = RT_LA_PI_F - ap;
     const float c = rt_lt_xsincosf(degrad * ap + bp).y;
-    return pow(0.5f * (1.0f + c), gradreal * gradreal);
+    /* The host's pow_F() is xexpf(b * xlogf(a)), not libm pow(). */
+    return rt_lr_pow_F(0.5f * (1.0f + c), gradreal * gradreal);
 }
 
 /* iplocallab.cc calcLocalFactorrect(). */
@@ -415,7 +462,8 @@ inline float rt_la_calc_local_factor_rect(const float lox, const float loy,
     const float gradreal = gradient * rapy + 1.0f;
     const float coef = rad / ref;
     const float fact = (coef - 1.0f) / (ach - 1.0f);
-    return pow(fact, gradreal * gradreal);
+    /* The host's pow_F() is xexpf(b * xlogf(a)), not libm pow(). */
+    return rt_lr_pow_F(fact, gradreal * gradreal);
 }
 
 /* iplocallab.cc calcTransitionrect(). */
@@ -740,9 +788,9 @@ inline void rt_la_scope_blend(const float origL, const float origA,
                               const float scope_base, float* outL,
                               float* outA, float* outB)
 {
-    const float refa = rec[RT_LA_CHROMAREF] * cos(rec[RT_LA_HUEREF]) * 327.68f;
-    const float refb = rec[RT_LA_CHROMAREF] * sin(rec[RT_LA_HUEREF]) * 327.68f;
-    const float refL = rec[RT_LA_LUMAREF] * 327.68f;
+    const float refa = rec[RT_LA_REF_A];
+    const float refb = rec[RT_LA_REF_B];
+    const float refL = rec[RT_LA_REF_L];
 
     const float abdelta2 = (refa - ma) * (refa - ma) +
                            (refb - mb) * (refb - mb);
@@ -757,7 +805,7 @@ inline void rt_la_scope_blend(const float origL, const float origA,
     const float kH = rec[RT_LA_BALANCEH];
     const float kch = rt_la_balancedeltaE(rec[RT_LA_BALANCEH]);
     const float dE = sqrt(kab * (kch * chrodelta2 + kH * huedelta2) +
-                          kL * (refL - ml) * (refL - ml));
+                          kL * ((refL - ml) * (refL - ml)));
 
     const float thr = rec[RT_LA_THR];
     const float mindE = scope_base + RT_LA_MINSCOPE * varsens * thr;
@@ -798,6 +846,10 @@ __kernel void rt_local_adjustments_apply(__global float* lab,
                                          __global const float* light_lut,
                                          __global const float* satur_lut,
                                          __global const float* saturmoins_lut,
+                                         __global const double* satur_poly,
+                                         const int satur_count,
+                                         __global const double* saturmoins_poly,
+                                         const int saturmoins_count,
                                          const int lab_pitch,
                                          const int lab_plane,
                                          const int bfw, const int bfh,
@@ -832,9 +884,18 @@ __kernel void rt_local_adjustments_apply(__global float* lab,
         sincosval.y = chroma == 0.0f ? 1.0f : corrA / chroma;
         sincosval.x = chroma == 0.0f ? 0.0f : corrB / chroma;
         if (chro > 0.0f) {
-            chroma = rt_la_satur_lut(satur_lut, chroma) * 35000.0f;
+            chroma = (satur_count >= 2
+                          ? rt_la_satur_curve(satur_poly, satur_count,
+                                              rt_lt_lim01(chroma / 35000.0f))
+                          : rt_la_satur_lut(satur_lut, chroma)) *
+                     35000.0f;
         } else {
-            chroma = rt_la_satur_lut(saturmoins_lut, chroma) * 35000.0f;
+            chroma = (saturmoins_count >= 2
+                          ? rt_la_satur_curve(saturmoins_poly,
+                                              saturmoins_count,
+                                              rt_lt_lim01(chroma / 35000.0f))
+                          : rt_la_satur_lut(saturmoins_lut, chroma)) *
+                     35000.0f;
         }
         if (chro == -100.0f) {
             chroma = 0.0f;
