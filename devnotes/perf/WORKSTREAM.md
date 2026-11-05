@@ -1065,15 +1065,24 @@ is 1 byte, all on POCL CPU with `rtdata/` bound at the compiled data path.
 
 ### P2 residuals
 
-- Multi-threaded export is non-deterministic in the baseline; parity runs are
-  single-threaded.
-- Raw-to-RGB preparation is thread-order dependent; denoise leaves a 6/12-pixel
-  residual at 1 LSB.
-- Tile ordering is opt-in; fusion/reduced-work modes are incomplete.
-- `crop-stage-test` can stall on sharpening-only edits with a warm Lab profile.
-- GUI scenario coverage is partial: tone curve and crop geometry lack dump
-  pairs.
-- rusticl is skipped on this host; deterministic device tests restrict to POCL.
+- **Thread determinism**: the gross race is resolved. `test-export-determinism`
+  on the current tip is `AE=0` for the 45.7 MP NEF neutral and with denoise at
+  t=1/t=4/t=8 and on a repeated t=8 run, and for the PEF neutral. The PEF with
+  denoise keeps 24 pixels at 1 LSB16 between t=1 and t=8 (and on the repeated
+  t=8 pair), inside the parity tolerance but not bit-identical. The guard is
+  `tools/perf/test-export-determinism.sh`; the bisect history is in
+  `devnotes/perf/DETERMINISM.md`.
+- **Tile ordering / fusion**: still opt-in and incomplete. It is a
+  performance feature, not a parity defect; the default order is the
+  conservative one.
+- **`crop-stage-test` stall**: not reproduced on the public PEF at the current
+  tip (`--sequences` with `sharpen-usm.pp3`: PASS, 39 plans, 0 fallbacks,
+  `AE=0`). The historical flake is recorded but has no acceptance case.
+- **GUI dump coverage**: tone curve and crop geometry still lack dump pairs;
+  the xdotool harness cannot drive those panels reproducibly. This remains a
+  harness gap and is recorded as such, never as a PASS.
+- **rusticl**: skipped on this host; deterministic device tests run on POCL.
+  This is an environment fact, not a code residual.
 
 ### Decisions (closed 2026-11-05)
 

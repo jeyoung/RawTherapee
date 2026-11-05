@@ -2408,9 +2408,11 @@ parity.
   The gain is about 5% on this workload.
 - Thread matrix on the same profile: `AE=0` at 1, 2, 4 and 8 threads. The
   denoise block merge is now ordered; on a deterministic full-frame TIFF input
-  the residual falls from 215/414 differing pixels to 6/12 at 1 LSB. The raw
-  path still has upstream thread-order variation, so the full NEF denoise
-  export is not yet bit-identical; see `devnotes/perf/DETERMINISM.md`.
+  the residual fell from 215/414 differing pixels to 6/12 at 1 LSB. At the
+  current tip the 45.7 MP NEF is `AE=0` at 1/4/8 threads and on a repeated
+  t=8 run, neutral and with denoise; the PEF with denoise keeps 24 pixels at
+  1 LSB. The guard is `tools/perf/test-export-determinism.sh`; the history is
+  in `devnotes/perf/DETERMINISM.md`.
 - Build KPI on the 4C/8T host: no-op `rth-cli` build 0.56–0.80 s, one module
   rebuild 0.25 s, one translation-unit rebuild 1.48–2.28 s. The project
   ccache is `build/ccache`; the first builds after the wrapper change are

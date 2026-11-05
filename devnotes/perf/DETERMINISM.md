@@ -1,9 +1,15 @@
 # Denoise export thread determinism
 
-Status: the denoise-stage merge is now deterministic and committed
-(`perf: #0: order denoise block merge`). The export as a whole is still not
-bit-identical across thread counts because the raw-to-RGB path is
-thread-order dependent (see *Blocker*).
+Status (2026-11-05): the gross thread race is resolved. On the current tip the
+45.7 MP NEF is `AE=0` at t=1/t=4/t=8 and on a repeated t=8 run, both neutral
+and with the directional-pyramid denoise profile (Luma 30, Ldetail 25, Chroma
+30). The 10.2 MP PEF is `AE=0` neutral; with denoise it keeps a residual
+**24 pixels at 1 LSB16** between t=1 and t=8 and between a repeated t=8 pair.
+That is inside the project's 1 LSB parity tolerance but not bit-identical.
+The regression guard is `tools/perf/test-export-determinism.sh`.
+
+The historical investigation below records how the 13-14 k pixel / 77-361 LSB
+race was found and reduced; it is kept because the bisect method is reusable.
 
 ## Symptom
 
@@ -110,8 +116,9 @@ Evidence: single-thread output unchanged (`AE=0`); full-frame TIFF input
 reduced from 215/414 differing pixels to 6/12 at 1 LSB for t=4/t=8; NEF export
 at 8 threads, three runs each, median 24.4 s with the change and 24.6 s
 without (run-to-run spread 23-31 s on a loaded 4C/8T host), i.e. no measurable
-regression. The residual 6/12 pixels are not attributed to the block merge and
-remain under investigation.
+regression. The residual 6/12 pixels were not attributed to the block merge.
+At the current tip the NEF is exact and the PEF denoise residual is 24 pixels
+at 1 LSB16; the guard script is the regression check.
 
 ## Uncovered
 
