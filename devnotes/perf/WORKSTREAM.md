@@ -1021,9 +1021,14 @@ is 1 byte, all on POCL CPU with `rtdata/` bound at the compiled data path.
 - Fast export (`-f`) is in the graph: `StagePath::FastExport` carries its ten
   nodes and the executor runs the same private methods. The `-f` row is
   `AE=0` against the pre-change binary; see `STAGE_RUNTIME.md`.
-- Thumbnail `loadFromImage` for non-raw files and inspector mode are not
-  graph-covered. New evidence: the TIFF and JPEG GUI runs produce no
-  thumbnail-graph line, while the raw run does.
+- Thumbnail `loadFromImage` for non-raw files is now graph-covered:
+  `thumbnail-stage-test` accepts any raster extension, runs `processImage()`
+  on a 16-bit TIFF exported from the public PEF, and asserts the six-node
+  graph line plus byte-identical passes on the host and the POCL device.
+  Inspector mode is a deliberate `n/a`: `loadFromImage(..., inspectorMode=true)`
+  stops at the full-size `Image8` resize (`rtthumbnail.cc:495-505`) with no
+  profile pipeline, and the harness asserts that no `processImage` line
+  appears.
 - Folded nodes: preview `analysis`; crop `raw.preprocess`/`raw.demosaic`; five
   export sub-blocks.
 - Preview dirty residuals: guide-only crop changes, high-detail transitions,
@@ -1331,12 +1336,12 @@ recorded `n/a`, the gate is green (`--quick` 84 PASS / 0 FAIL,
 
 The next workstream is the P1 list above, in this order:
 
-1. Cover non-raw thumbnails in the graph (fast export is covered by
-   `StagePath::FastExport`).
-2. Fold the five export sub-blocks and the crop raw sub-blocks into named
+1. Fold the five export sub-blocks and the crop raw sub-blocks into named
    nodes, then close the preview dirty residuals (guide-only crop,
-   high-detail transitions, deferred analysis).
-3. Add node-level profiling and cache metrics to the integrated graph, then
+   high-detail transitions, deferred analysis). Non-raw thumbnails are
+   covered by `thumbnail-stage-test` and fast export by
+   `StagePath::FastExport`.
+2. Add node-level profiling and cache metrics to the integrated graph, then
    run the two promotion gates recorded under "Decisions": the node cache
    with a preview-path repeated-pass measurement, and stage OpenCL with the
    same rows on a real GPU (the POCL CPU rows are not GPU parity).

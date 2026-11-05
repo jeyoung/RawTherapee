@@ -814,6 +814,23 @@ remaining nodes are marked clean because their data is already held by the
 take. The graph executor calls the same `stage*` blocks, so there is one
 implementation.
 
+`loadFromImage()` (`rtthumbnail.cc:430`) is the non-raw producer of
+`thumbImg`: it decodes through `StdImageSource` and resizes with
+`resizeToSameType()` (`:509`), and the GUI then calls `processImage()`, so the
+six profile nodes above run unchanged for TIFF, JPEG, PNG and JXL inputs.
+`thumbnail-stage-test` covers that path on a 16-bit TIFF exported from the
+public PEF: the graph line names the six nodes and the two passes are
+byte-identical.
+
+Inspector mode is a deliberate `n/a` for the profile graph. With
+`inspectorMode=true`, `loadFromImage()` returns the decoded frame at full size
+and converts it to `Image8` with `resizeTo<Image8>()` (`rtthumbnail.cc:495-505`)
+instead of `resizeToSameType()`; `PreviewImage` reads that buffer through
+`getImage8Data()` (`previewimage.cc:45-59`). There is no profile processing and
+no call to `processImage()`, so there is no node to execute. The harness
+asserts the boundary: the Inspector load yields a full-size `Image8` and no
+`processImage` graph line.
+
 ## Parameter fields
 
 `paramFields` lists `ProcParams` member names, not individual fields. The list

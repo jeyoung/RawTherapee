@@ -1003,7 +1003,7 @@ Evidence (POCL CPU device, `RT_OPENCL_ALLOW_CPU=1 RT_REQUIRE_GPU=1`,
   case on the infinity sample.
 - `thumbnail-stage-test` on the public 10.2 MP PEF with its sidecar at 160 px
   produced `thumbnail.scale` and `thumbnail.scale.u8` records with
-  `impl=opencl`, twice each because the harness renders legacy and graph in one
+  `impl=opencl`, twice each because the harness runs the path twice in one
   process. The PPM files are byte-identical to the same binary with
   `RT_STAGE_OPENCL` unset and to a binary built from the pre-change commit:
   embedded `239x160`, sha256
@@ -1017,6 +1017,46 @@ Evidence (POCL CPU device, `RT_OPENCL_ALLOW_CPU=1 RT_REQUIRE_GPU=1`,
   thumbnail run recorded for `thumbnail.output` was not repeated with the
   scale node on the device. That interactive path is uncovered rather than
   passed.
+
+## Thumbnail non-raw and Inspector
+
+`Thumbnail::loadFromImage()` (`rtengine/rtthumbnail.cc:430`) is the non-raw
+producer of `thumbImg`. It decodes through `StdImageSource` and resizes with
+`resizeToSameType()` (`:509`); the GUI then calls `processImage()`, so the six
+profile nodes run unchanged. `thumbnail-stage-test` now accepts any raster
+extension as well as a raw: for a raster it skips the embedded/raw roots and
+exercises this path.
+
+Evidence, POCL CPU device and host (`RT_STAGE_OPENCL=1`,
+`RT_OPENCL_ALLOW_CPU=1`, `OMP_NUM_THREADS=1`, all under
+`tools/opencl/pocl-run.sh`):
+
+- Input: a 16-bit TIFF exported once from `colorspace_flowers.pef` with
+  `rawtherapee-graph-cli -t -b16` (`3888x2608`, 60 844 142 bytes; kept under
+  `build/test-scratch`, not committed).
+- Inspector load: `loadFromImage(..., inspectorMode=true)` returns a
+  `3888x2608` `Image8` with scale 1.0, `getImage8Data()` is non-null, and the
+  captured stderr contains no `thumbnail-graph: processImage` line. This is
+  the deliberate `n/a` recorded in `STAGE_PIPELINE.md`.
+- `processImage()`: the line `thumbnail-graph: processImage: active, 6
+  canonical nodes: thumbnail.scale thumbnail.transform
+  thumbnail.whitebalance thumbnail.rgb thumbnail.lab thumbnail.output` is
+  present; output `238x160`, 114 240 bytes; the two passes are byte-identical,
+  PPM sha256
+  `a619fa252b5411571e9a57bb2c07b404ce07034a2ac728840190acca02240b04`. The
+  same hash is produced with `RT_STAGE_OPENCL` unset, so the non-raw thumbnail
+  path is byte-identical between host and POCL device.
+- The raw PEF path still passes in the same harness: embedded `239x160` and
+  raw `238x160`, both with their existing graph lines.
+
+Commands:
+
+```bash
+RT_SETTINGS=$PWD/build/test-scratch/rt-settings \
+RT_CACHE=$PWD/build/test-scratch/rt-cache OMP_NUM_THREADS=1 \
+  tools/opencl/pocl-run.sh build/opencl-perf-graph/rtengine/thumbnail-stage-test \
+  build/test-scratch/p1-2/flowers.tif "" 160 build/test-scratch/p1-2/tiff-out
+```
 
 ## Thumbnail RGB
 
