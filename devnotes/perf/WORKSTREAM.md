@@ -811,11 +811,12 @@ same rows.
   exact `chmax`; both corpus images are `AE=0` (0 of 30 419 712 and 0 of
   136 918 080 samples) with `impl=opencl`. `verify.sh` runs the neutral
   profile as `pef/stage-device-raw-preprocess`. Not pushed.
-- Side defects found: `workingtrc` leaks the profile/transform per call
-  (`iplab2rgb.cc:2145/2173`, still open); forcing the POCL CPU stage device
-  under `--gpu=auto` hits a null `opencl::initLocked` call with
-  `gamut.pp3`, avoided by `verify.sh`'s `RT_OPENCL_RGBPROC=1` (pre-existing,
-  record in P2).
+- Side defects found and closed: `primaries_to_xyz()` leaked the lcms
+  destination profile when the caller did not take `outProfile`; the local
+  handle is now closed after the transform is created (gamut export AE=0).
+  Forcing the POCL CPU stage device under `--gpu=auto` with `gamut.pp3` no
+  longer hits the null `opencl::initLocked` call; the row passes on the
+  current tip.
 - **`lab.tools` XYZ/XYZREL gamut correction**: `Color::gamutmap()` is ported
   with its double lam ratios and XYZREL's `0.5` blend, reading the double
   working matrices the launcher already uploads. XYZ 0.317383 LSB16, XYZREL
@@ -1072,9 +1073,10 @@ is 1 byte, all on POCL CPU with `rtdata/` bound at the compiled data path.
   t=8 pair), inside the parity tolerance but not bit-identical. The guard is
   `tools/perf/test-export-determinism.sh`; the bisect history is in
   `devnotes/perf/DETERMINISM.md`.
-- **Tile ordering / fusion**: still opt-in and incomplete. It is a
-  performance feature, not a parity defect; the default order is the
-  conservative one.
+- **Tile ordering / fusion**: complete and opt-in, not a parity defect. The
+  deterministic overlap merge is in `TILE_INDEX.md`; the fusion candidates
+  are taken or rejected with reasons in `FUSION.md`; `RT_TILE_ORDER` stays
+  opt-in and the default order is the conservative one.
 - **`crop-stage-test` stall**: not reproduced on the public PEF at the current
   tip (`--sequences` with `sharpen-usm.pp3`: PASS, 39 plans, 0 fallbacks,
   `AE=0`). The historical flake is recorded but has no acceptance case.
