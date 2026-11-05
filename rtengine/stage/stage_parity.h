@@ -17,6 +17,11 @@ struct ParityResult {
 };
 
 ParityResult compare(const RtStageBuffer& a, const RtStageBuffer& b);
+/* Bit equality; the strict form for decoder and raw-loading gates. */
+bool passes_exact(const ParityResult& result);
+/* Finite differences inside `tolerance` are accepted. */
+bool passes_within(const ParityResult& result, double tolerance);
+/* Compatibility name for the tolerance form. */
 bool passes(const ParityResult& result, double tolerance);
 
 } // namespace rtengine::stage

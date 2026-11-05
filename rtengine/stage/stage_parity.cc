@@ -14,7 +14,8 @@ namespace
 {
 
 template<typename T>
-void compare_typed(const RtStageBuffer& a, const RtStageBuffer& b, ParityResult& result)
+void compare_typed(const RtStageBuffer& a, const RtStageBuffer& b,
+                   ParityResult& result, int samples_per_pixel)
 {
     for (uint32_t plane = 0; plane < a.planes; ++plane) {
         const T* pa = reinterpret_cast<const T*>(
@@ -30,7 +31,8 @@ void compare_typed(const RtStageBuffer& a, const RtStageBuffer& b, ParityResult&
             const T* rb = reinterpret_cast<const T*>(
                 reinterpret_cast<const unsigned char*>(pb) +
                 static_cast<size_t>(y) * b.row_pitch);
-            for (int x = 0; x < a.width; ++x) {
+            const int samples = a.width * samples_per_pixel;
+            for (int x = 0; x < samples; ++x) {
                 ++result.total;
                 if constexpr (std::is_floating_point_v<T>) {
                     const double av = static_cast<double>(ra[x]);
@@ -39,6 +41,15 @@ void compare_typed(const RtStageBuffer& a, const RtStageBuffer& b, ParityResult&
                     const bool bnan = std::isnan(bv);
                     if (anan || bnan) {
                         if (!(anan && bnan)) {
+                            ++result.differing;
+                        }
+                        continue;
+                    }
+                    const bool ainf = std::isinf(av);
+                    const bool binf = std::isinf(bv);
+                    if (ainf || binf) {
+                        if (!(ainf && binf &&
+                              std::signbit(av) == std::signbit(bv))) {
                             ++result.differing;
                         }
                         continue;
@@ -76,23 +87,55 @@ ParityResult compare(const RtStageBuffer& a, const RtStageBuffer& b)
         return result;
     }
 
+    /*
+     * A packed single-plane buffer stores several samples per pixel. The
+     * buffer ABI does not carry a channel count, so derive the known packed
+     * forms from the row pitch: U8 RGB (3 bytes) and U16 RGB (6 bytes).
+     * Three-plane views keep one sample per plane.
+     */
+    int samples_per_pixel = 1;
+    if (a.planes == 1 && a.width > 0) {
+        if (a.format == RT_STAGE_U8 &&
+            a.row_pitch == static_cast<std::size_t>(a.width) * 3) {
+            samples_per_pixel = 3;
+        } else if (a.format == RT_STAGE_U16 &&
+                   a.row_pitch ==
+                       static_cast<std::size_t>(a.width) * 3 * sizeof(uint16_t)) {
+            samples_per_pixel = 3;
+        }
+    }
+
     switch (a.format) {
     case RT_STAGE_F32:
-        compare_typed<float>(a, b, result);
+        compare_typed<float>(a, b, result, samples_per_pixel);
         break;
     case RT_STAGE_U16:
-        compare_typed<uint16_t>(a, b, result);
+        compare_typed<uint16_t>(a, b, result, samples_per_pixel);
         break;
     case RT_STAGE_U8:
-        compare_typed<uint8_t>(a, b, result);
+        compare_typed<uint8_t>(a, b, result, samples_per_pixel);
         break;
     }
     return result;
 }
 
+bool passes_exact(const ParityResult& result)
+{
+    return result.same_geometry && result.differing == 0;
+}
+
+bool passes_within(const ParityResult& result, double tolerance)
+{
+    return result.same_geometry && result.max_abs <= tolerance;
+}
+
 bool passes(const ParityResult& result, double tolerance)
 {
-    return result.same_geometry && result.differing == 0 && result.max_abs <= tolerance;
+    /*
+     * The tolerance form allows finite differences inside the bound; use
+     * passes_exact() where bit equality is the requirement.
+     */
+    return passes_within(result, tolerance);
 }
 
 } // namespace rtengine::stage

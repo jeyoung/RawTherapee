@@ -4,7 +4,9 @@
 
 #include "rtengine/imagefloat.h"
 
+#include <cstdint>
 #include <cstdio>
+#include <limits>
 #include <vector>
 
 namespace
@@ -105,6 +107,67 @@ int main()
     const auto fractional = rtengine::stage::compare(a, b);
     check(fractional.differing == 1, "fractional difference is detected");
     check(fractional.max_abs == 0.5, "fractional maximum difference is exact");
+    check(!rtengine::stage::passes_exact(fractional),
+          "the strict form rejects a fractional difference");
+    check(rtengine::stage::passes_within(fractional, 1.0),
+          "the tolerance form accepts a difference inside the bound");
+
+    /*
+     * Packed U8 RGB: one plane, three samples per pixel. The last byte of the
+     * row must be compared, not only the first `width` bytes.
+     */
+    std::uint8_t packed_a[6] = {1, 2, 3, 4, 5, 6};
+    std::uint8_t packed_b[6] = {1, 2, 3, 4, 5, 7};
+    RtStageBuffer u8{};
+    u8.size = sizeof(u8);
+    u8.data = packed_a;
+    u8.width = 2;
+    u8.height = 1;
+    u8.row_pitch = sizeof(packed_a);
+    u8.plane_pitch = sizeof(packed_a);
+    u8.planes = 1;
+    u8.format = RT_STAGE_U8;
+    RtStageBuffer u8_other = u8;
+    u8_other.data = packed_b;
+    const auto packed = rtengine::stage::compare(u8, u8_other);
+    check(packed.differing == 1, "the last packed U8 channel is compared");
+    check(packed.total == 6, "packed U8 samples the whole row");
+
+    /*
+     * Non-finite values: matching NaNs are equal, a single NaN differs, and
+     * infinities compare by sign rather than by abs(inf - inf).
+     */
+    const float nan_value = std::numeric_limits<float>::quiet_NaN();
+    const float inf_value = std::numeric_limits<float>::infinity();
+    float nan_a = nan_value;
+    float nan_b = nan_value;
+    RtStageBuffer fa = a;
+    fa.data = &nan_a;
+    RtStageBuffer fb = fa;
+    fb.data = &nan_b;
+    const auto matching_nan = rtengine::stage::compare(fa, fb);
+    check(matching_nan.differing == 0, "matching NaNs compare equal");
+    check(rtengine::stage::passes_exact(matching_nan),
+          "matching NaNs pass the strict form");
+
+    float finite = 1.0f;
+    RtStageBuffer ff = fa;
+    ff.data = &finite;
+    const auto one_nan = rtengine::stage::compare(fa, ff);
+    check(one_nan.differing == 1, "a single NaN differs");
+
+    float pos_inf = inf_value;
+    float neg_inf = -inf_value;
+    RtStageBuffer fi = fa;
+    fi.data = &pos_inf;
+    RtStageBuffer fj = fi;
+    fj.data = &pos_inf;
+    check(rtengine::stage::compare(fi, fj).differing == 0,
+          "equal infinities compare equal");
+    RtStageBuffer fk = fi;
+    fk.data = &neg_inf;
+    check(rtengine::stage::compare(fi, fk).differing == 1,
+          "infinities of opposite sign differ");
 
     if (failures == 0) {
         std::puts("stage-parity-test: PASS");
