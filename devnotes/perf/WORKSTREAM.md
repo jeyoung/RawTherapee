@@ -17,7 +17,7 @@ pushed from 2026-10-29 on.
 
 - Repository: `$REPO`
 - Worktree: the main checkout, branch `perf-graph`, clean and in sync with
-  `origin/perf-graph`; the block-4 closure tip is `80efcf992`. All pushed
+  `origin/perf-graph`; the block-4 closure tip is `e3e53df1e`. All pushed
   ranges were scanned per the publication gate. Block 4 is complete: the
   device gate is green and the portable package is validated on Debian 12 and
   13; see the progress log and the decisions below.
