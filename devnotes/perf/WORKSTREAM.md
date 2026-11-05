@@ -1041,11 +1041,26 @@ is 1 byte, all on POCL CPU with `rtdata/` bound at the compiled data path.
   allocation, forced B&W). The three `raw.base` sub-blocks are named export
   nodes since P1-3a; none of the remaining four has a buffer boundary, so each
   is covered by its parent's record.
-- Preview dirty residuals: guide-only crop changes, high-detail transitions,
-  deferred analysis.
-- Node-level profiling and cache metrics for the integrated graph.
-- `bench-preview.sh` remains unreliable; use the sweep harness and record
-  sample counts.
+- Preview dirty residuals are closed by design and tests. A guide-only crop
+  change is the `cropGuideFingerprint` field, which is deliberately unmapped:
+  it names an editor overlay no stage consumes, and `stage-dirty-blocks-test`
+  asserts it reports no aspect, so it cannot schedule a stale repaint.
+  `deferredAnalysisRequest` is a coordinator scheduling fact published from an
+  advisory snapshot; the coordinator absorbs it before building the key, so it
+  cannot order a dirty set. A high-detail transition maps to the `HighDetail`
+  aspect and the preview row `source.select`, `raw.preprocess`, `raw.demosaic`,
+  `raw.base`, `analysis`, `transform`; the test covers the four
+  high-detail fields. The remaining gap is the GUI dump coverage for tone
+  curve and crop geometry, which is P2.
+- Node-level profiling and cache metrics: `RT_STAGE_PROFILE` writes JSONL and
+  `tools/perf/summarize-stage-profile.py` reduces it to `count`, `total_ms`,
+  `max_ms`, `impls` and `cache_hits` per node. A `raw.base` tier served by the
+  node cache records `impl=host`, `source=node-cache`, `cache_hit=1`; a
+  preview sweep with `RT_NODE_CACHE=1` produced two such records and the
+  summary reports `raw.base` `cache_hits=2`.
+- `bench-preview.sh` now runs `preview-work-order-sweep` with
+  `OMP_NUM_THREADS=1` and prints `samples=N p50/p95`; the Xvfb/xdotool driver
+  was retired. A three-sample run on the PEF reported `samples=3 p50=306 ms`.
 
 ### P2 residuals
 
@@ -1069,10 +1084,12 @@ is 1 byte, all on POCL CPU with `rtdata/` bound at the compiled data path.
   size; a repeated identical pass is `AE=0` with a hit; the true LRU and
   budget behave; the disabled path allocates nothing; a malformed payload is
   refused. That is the correctness evidence, not a production-performance
-  one. Promotion to default needs a preview-path repeated-pass measurement on
-  the gate image showing `AE=0` and a latency win at the default budget,
-  plus a user-visible preference. The synthetic test alone is not that
-  evidence, so the default stays off.
+  one. A preview sweep with `RT_NODE_CACHE=1` on the PEF (five exposure
+  samples) reports `hits=2 misses=3 refused=1` and a mean settled latency of
+  307.1 ms against 305.9 ms without the cache: the hit is real, but the win
+  is inside the noise. The promotion gate is therefore **not met** and the
+  default stays off. A preview-path measurement with a clear win at the
+  default budget, plus a user-visible preference, is what would flip it.
 - **Stage OpenCL**: stays **opt-in** (`RT_STAGE_OPENCL=1`; the kill switches
   are `RT_STAGE_OPENCL=0` and `RT_STAGE_OPENCL_DISABLE=1`). Coverage is now
   meaningful: `verify.sh --quick` is **84 PASS / 0 FAIL** and
@@ -1339,24 +1356,27 @@ permanent residual.
 
 ## Next immediate task
 
-Block 4 (device node coverage) is closed: every node is a device node or
-recorded `n/a`, the gate is green (`--quick` 84 PASS / 0 FAIL,
-`--stage-device` 73 PASS / 0 FAIL / 0 SKIP, `--formats` 1 entry, `--monitor`
-1 byte), and the portable package is validated on Debian 12 and 13.
+Block 4 (device node coverage) and the P1 workstream are closed.
 
-The next workstream is the P1 list above, in this order:
+P1 evidence: fast export runs through `StagePath::FastExport` with `AE=0`
+against the pre-change binary; non-raw thumbnails are covered by
+`thumbnail-stage-test` and inspector mode is a documented `n/a`; the three
+`raw.base` sub-blocks are named export nodes (`AE=0` on PEF and NEF); the
+remaining four export folds have no buffer boundary and are covered by their
+parents; the preview dirty residuals are unmapped-by-design with tests;
+`summarize-stage-profile.py` reports per-node time and cache hits; and
+`bench-preview.sh` uses the sweep harness with a sample count.
 
-1. Name the remaining four export sub-block boundaries — framing geometry,
-   Nearest output resize, histogram allocation and forced B&W each have no
-   buffer boundary and stay covered by their parent — and the crop raw
-   sub-blocks, then close the preview dirty residuals (guide-only crop,
-   high-detail transitions, deferred analysis). The three `raw.base`
-   sub-blocks are done (P1-3a). Non-raw thumbnails are covered by
-   `thumbnail-stage-test` and fast export by `StagePath::FastExport`.
-2. Add node-level profiling and cache metrics to the integrated graph, then
-   run the two promotion gates recorded under "Decisions": the node cache
-   with a preview-path repeated-pass measurement, and stage OpenCL with the
-   same rows on a real GPU (the POCL CPU rows are not GPU parity).
+The two promotion gates were measured and **not met**:
 
-Residuals are not unstarted work; the decisively-partial list is in
-`STAGE_PIPELINE.md` and `PARITY.md`.
+1. Node cache: a preview sweep hits twice in five samples but the mean settled
+   latency is 307.1 ms against 305.9 ms without the cache, inside the noise.
+   The default stays off.
+2. Stage OpenCL: the gate is green on POCL CPU, but no GPU was available, so
+   the same rows have not been run on the target device. The default stays
+   opt-in.
+
+The next workstream is P2: the multi-thread determinism residuals, tile
+ordering/fusion, the `crop-stage-test` stall, and the GUI dump pairs for tone
+curve and crop geometry. Residuals are not unstarted work; the
+decisively-partial list is in `STAGE_PIPELINE.md` and `PARITY.md`.
