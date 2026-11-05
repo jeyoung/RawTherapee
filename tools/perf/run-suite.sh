@@ -201,7 +201,10 @@ if [ "$crop_graph_parity" -eq 1 ]; then
     if [ -n "$pp3" ]; then
         crop_args+=("$pp3")
     fi
-    crop_args+=("$crop_dir")
+    # crop-stage-test's bare positional is the optional pp3, so the output
+    # directory must use the explicit option; otherwise a run without a
+    # profile tries to load the report directory as a profile.
+    crop_args+=("--out=$crop_dir")
     if cmake --build "$build_dir" --target crop-stage-test -j 6 \
             >"$report/crop-stage-test.build.log" 2>&1 \
         && OMP_NUM_THREADS=1 "$build_dir/rtengine/crop-stage-test" \
@@ -242,7 +245,7 @@ if [ "$crop_graph_parity" -eq 1 ]; then
     if [ -n "$pp3" ]; then
         stages_args+=("$pp3")
     fi
-    stages_args+=("$stages_dir" --stages)
+    stages_args+=("--out=$stages_dir" --stages)
     if OMP_NUM_THREADS=1 "$build_dir/rtengine/crop-stage-test" \
             "${stages_args[@]}" >"$stages_log" 2>&1; then
         pass "crop graph parity (Lab, CIE CAM, gamut, local adjustments)"

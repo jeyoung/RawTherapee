@@ -52,6 +52,22 @@ cli="$(cli_for_build "$build_dir")"
 mkdir -p "$(dirname "$out")"
 log="${RT_EXPORT_LOG:-$RUN/logs/export-$(basename "$out").log}"
 
+# A fresh RT_SETTINGS has no extension filter, so the CLI would skip the
+# image. Seed only the extension this run needs; every pixel-affecting value
+# otherwise stays at the application default.
+if [ ! -f "$RT_SETTINGS/options" ]; then
+    ext="$(printf '%s' "${image##*.}" | tr '[:upper:]' '[:lower:]')"
+    mkdir -p "$RT_SETTINGS"
+    cat >"$RT_SETTINGS/options" <<EOF
+[General]
+MultiUser=true
+
+[File Browser]
+ParseExtensions=$ext;
+ParseExtensionsEnabled=1;
+EOF
+fi
+
 args=(--gpu="$gpu")
 if [ "$fast" -eq 1 ]; then
     args+=(-f)
