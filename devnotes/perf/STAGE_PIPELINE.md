@@ -2164,8 +2164,13 @@ curve amount with Quality "Conservative"/"Aggressive"/"Non-local means only"
 and `qualityMethod "enhden"` are residuals. A radius outside its arm's
 range, the guided and inverse arms, a zero median method, out-of-range passes,
 added noise or grain, a mask, an FFT request and the `"nlmean"` quality
-method are residuals too; the wavelet denoise itself and the remaining
-denoise additions stay on the host.
+method are residuals too. The wavelet denoise itself (and the remaining
+denoise additions) is decisively partial: `DeNoise()` is a multi-level,
+multi-direction wavelet denoiser with several noise models, and its tail calls
+`ImProcFunctions::fftw_denoise()` (`rtengine/iplocallab.cc:12020`), which
+builds `fftwf_plan_many_r2r` DCT plans with `FFTW_MEASURE` on 32x32 tiles.
+A measured plan is machine-chosen and its codelet order decides the float
+rounding, so there is no stable device target; the arm stays refused.
 
 Local CIE CAM is admitted only in the `modecie "com"` / `modecam "cam16"`
 arm with `smoothciemet "none"` and `pqremapcam16` at or below 100, which is
@@ -2305,7 +2310,12 @@ below `4 * 3` px is a host execution because the fast guided filter needs
 three subsampled samples per axis.
 
 Soft light admits only the per-pixel `softMethod == "soft"` curve;
-`"reti"` runs `retinex_pde()` and is a residual. It requires `streng` and
+`"reti"` calls `retinex_pde()`, whose forward and inverse transforms are
+FFTW r2r DCT-II plans (`rtengine/iplocallab.cc:6969` REDFT10, `:7040`
+REDFT01), and is decisively partial: the plan and codelet order decide the
+float rounding, so a device transform cannot be bit-exact for an arbitrary
+ROI. Local exposure avoids the problem only because the host precomputes its
+DCT matrices for six `fftw_size[]` extents. It requires `streng` and
 `sensisf` in `1..100`, the GUI ranges. The host's block guard is
 `strng > 1`, so a strength of one is a recorded no-op rather than a pass.
 `ImProcFunctions::softLight()` is one per-pixel Lab -> XYZ -> working RGB

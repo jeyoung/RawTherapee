@@ -785,9 +785,18 @@ bool localContrastAdmitted(
 }
 
 /* Whether the soft-light tool's parameters are inside the device set. The
- * per-pixel curve is softMethod "soft"; "reti" runs retinex_pde() and is a
- * residual. The GUI's strength and sensitivity ranges are 1..100, and the
- * device records the host guard's `strng > 1` run test separately. */
+ * per-pixel curve is softMethod "soft". "reti" calls
+ * ImProcFunctions::retinex_pde(), whose forward and inverse transforms are
+ * FFTW r2r DCT-II plans: `fftwf_plan_r2r_2d(..., FFTW_REDFT10, ...)` at
+ * `rtengine/iplocallab.cc:6969` and the REDFT01 pair at `:7040`. FFTW's
+ * planner and codelet order decide the float rounding, so a device transform
+ * cannot be bit-exact for an arbitrary ROI. Local exposure reaches parity
+ * only because the host precomputes its DCT matrices for the six admitted
+ * `fftw_size[]` extents and the device repeats a dense multiply; `retinex_pde()`
+ * has no such host-side matrix form. The arm is therefore decisively partial
+ * unless a product decision replaces the host solver. The GUI's strength and
+ * sensitivity ranges are 1..100, and the device records the host guard's
+ * `strng > 1` run test separately. */
 bool softLightAdmitted(const procparams::LocallabParams::LocallabSpot& spot)
 {
     if (spot.softMethod != "soft") {
@@ -952,6 +961,15 @@ bool captureAdmitted(const procparams::LocallabParams::LocallabSpot& spot)
  * The amounts are sampled from the curve at fixed indices, and
  * `wavcurvedenoi` scans the first 500 samples, so a curve that is non-zero
  * only at the last sample arms nothing.
+ *
+ * The DeNoise() body itself is decisively partial, not merely unported. It is
+ * a multi-level, multi-direction wavelet denoiser with several noise models
+ * (`WaveletDenoiseAll*`), and its tail calls ImProcFunctions::fftw_denoise()
+ * (`rtengine/iplocallab.cc:12020`), which builds `fftwf_plan_many_r2r` DCT
+ * plans with `FFTW_MEASURE` on 32x32 tiles. A measured plan is chosen by the
+ * local machine and its codelet order decides the float rounding, so there is
+ * no stable target for a device transform. The arm stays refused; the host
+ * runs it byte for byte when a profile reaches it.
  */
 bool deNoiseIdle(const procparams::LocallabParams::LocallabSpot& spot)
 {
@@ -1097,10 +1115,13 @@ bool dehazeAdmitted(const procparams::LocallabParams::LocallabSpot& spot)
  *
  * `scalereti == 1` selects MSRLocal()'s separate contrast arm, which builds a
  * DiagonalCurve from the ROI mean; that arm stays on the host. The FFT
- * variant (`fftwreti`), the luminance-normalisation arm (`equilret`), the
- * chroma Retinex slider and a non-identity luminance mask are residuals. The
- * slider ranges are the GUI's. A strength below the block's gate is the
- * block's own no-op and is admitted without a device pass. */
+ * variant (`fftwreti`) pads the ROI to an `fftw_size[]` extent through
+ * `optfft()` and runs MSRLocal()'s plan-based box blur, so its rounding comes
+ * from FFTW and it is decisively partial; the luminance-normalisation arm
+ * (`equilret`), the chroma Retinex slider and a non-identity luminance mask
+ * are residuals too. The slider ranges are the GUI's. A strength below the
+ * block's gate is the block's own no-op and is admitted without a device
+ * pass. */
 bool retinexAdmitted(const procparams::LocallabParams::LocallabSpot& spot)
 {
     if (!finiteValue(spot.str) || !finiteValue(spot.neigh) ||

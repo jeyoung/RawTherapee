@@ -82,6 +82,27 @@ export and a GUI smoke test are not yet run for this package.
 
 ## Progress log — resumed 2026-10-28 (Block 4 completion)
 
+- **`ciecam` CAM16 (2026-11-05)**: `colorappearance.modelmethod == "16"` is
+  admitted under the same constraints as CIECAM02. The model travels in a
+  new `RT_CIECAM_REC_MODEL` rec slot; the three matrix helpers branch to
+  CAT16, the CAT02 HPE stage becomes the identity, and the inverse CAT16
+  matrix uses the SIMD copy's `0.621447744f` (the scalar copy differs in the
+  last bit). Nineteen device cases, worst 0.113281 LSB16 (CAM16 `ALL`), each
+  algorithm arm and the slider/hue/gamut/curves cases non-vacuous;
+  `ciecam16.pp3` exports at 1 LSB16 with `impl=opencl` alongside the CIECAM02
+  row. The chroma/saturation/colourfulness and per-hue sliders, EPD,
+  `datacie` and `badpixsl` stay refused.
+- **FFT residuals reclassified (2026-11-05)**: the soft-light `"reti"` arm
+  and local `DeNoise()` were listed as completion-pending FFT/DCT units. They
+  are decisively partial: `retinex_pde()` drives FFTW r2r DCT-II plans
+  (`iplocallab.cc:6969`, `:7040`), and `DeNoise()`'s tail calls
+  `fftw_denoise()` (`:12020`), which builds `FFTW_MEASURE` r2r plans on 32x32
+  tiles. A measured plan is machine-chosen and its codelet order decides the
+  float rounding, so no device transform can be bit-exact for an arbitrary
+  ROI. Local exposure reaches parity only because six `fftw_size[]` extents
+  have host-precomputed DCT matrices. `fftwreti` is in the same class. The
+  refusals stay locked by the existing residency cases.
+
 - **`raw.base.wb` white-balance sub-step (2026-11-04)**: the `rtot *= rm` and
   optional `CLIP` of `RawImageSource::getImage()` is a `raw.base.wb` device
   node. The host derives `rm`, `gm` and `bm` as floats and passes them
