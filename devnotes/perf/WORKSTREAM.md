@@ -74,19 +74,20 @@ pushed from 2026-10-29 on.
 ### Validated artefact
 
 ```
-build/portable/rawtherapee-graph-5.13-663-g2dccc3ee5_5.13+git13684.2dccc3ee5-1_amd64.deb
-sha256 bc59ce0721df0262e854656c32807061b37a503e450c0b3fdee5f3093e81f5df
+build/portable/rawtherapee-graph-5.13-718-g3babc4b48_5.13+git13739.3babc4b48-1_amd64.deb
+sha256 fb7882c4c75c88fbdcc7682c49d4a63265e280b4217804774eb5b365d3f5a62f
 ```
 
-Built 2026-11-04 from `2dccc3ee5` with `tools/build-rt.sh portable`.
-Validated 2026-11-05 in fresh Debian 12 and Debian 13 containers, both PASS:
-install, `--list-formats` (36 entries, including PEF/NEF/CR2/ARW, TIFF and
-JPEG XL), neutral 16-bit CPU export against the `5.13-710-g2947dfbf1` host
-CLI (PAE 0 LSB16, 0 of 30,419,712 samples differ, both using the packaged
-data directory) and a GUI smoke test under Xvfb (20 s timeout, exit 124).
-`--gpu-test` and `--gpu-test-monitor` were not run: the containers have no
-GPU. The package was built at `2dccc3ee5`, behind the `2947dfbf1` tip, so
-this validates packaging rather than the newest engine code.
+Built 2026-11-05 from `3babc4b48` (the block-4 closure; the two later commits
+are documentation) with `tools/build-rt.sh portable`. Validated the same day
+in fresh Debian 12 and Debian 13 containers, both PASS: install,
+`--list-formats` (35 entries, including PEF/NEF/CR2/ARW, TIFF and JPEG XL),
+neutral 16-bit CPU export against the host CLI with the packaged data
+directory (PAE 0 LSB16, 0 of 30,419,712 samples, both distributions) and a
+GUI smoke test under Xvfb (20 s timeout, exit 124). `--gpu-test` and
+`--gpu-test-monitor` were not run: the containers have no GPU. The packaged
+binary run on the host also matches the host build with the same data
+(AE=0). The previous package from `2dccc3ee5` passed the same rows.
 
 ## Progress log — resumed 2026-10-28 (Block 4 completion)
 

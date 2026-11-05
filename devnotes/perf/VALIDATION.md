@@ -10,6 +10,22 @@ is recorded below.
 
 ## Artefact
 
+The current package is the block-4 closure build from `3babc4b48`:
+
+```
+rawtherapee-graph-5.13-718-g3babc4b48_5.13+git13739.3babc4b48-1_amd64.deb
+sha256 fb7882c4c75c88fbdcc7682c49d4a63265e280b4217804774eb5b365d3f5a62f
+```
+
+It passed the install, `--list-formats`, neutral export and Xvfb smoke rows on
+Debian 12 and Debian 13; the full matrix below was measured at `6fd009d74`
+and is retained as the historical comparison. The export reference must use
+the packaged data directory (the install adds the `options` file and the
+generated `camconst.json`); bare `rtdata` moves the neutral export by 1932
+codes.
+
+The earlier artefact was:
+
 ```
 rawtherapee-graph-5.13-365-g6fd009d74_5.13+git13386.6fd009d74-1_amd64.deb
 sha256 d4337ee48ce86c2ac1e996bf82495c49b99dd7fb17973058afcb27e0639cdb3f

@@ -80,18 +80,26 @@ driver and an ICD loader must be installed separately.
 - Built on Debian 12: glibc 2.36, GCC 12, `-mtune=generic`.
 - Requires Debian 12 or newer. Debian 13 t64 packages are accepted through
   their `Provides` entries.
-- 2026-11-05, package `5.13+git13684.2dccc3ee5-1` (sha256
-  `bc59ce0721df0262e854656c32807061b37a503e450c0b3fdee5f3093e81f5df`):
+- 2026-11-05, package `5.13+git13739.3babc4b48-1` from `3babc4b48`
+  (sha256
+  `fb7882c4c75c88fbdcc7682c49d4a63265e280b4217804774eb5b365d3f5a62f`):
   fresh Debian 12 and Debian 13 containers both passed
   `apt-get install -y ./...deb`; Debian 13's t64 packages satisfied the
   pre-t64 `Depends` through `Provides`, with no workaround. `--list-formats`
-  exited 0 and listed 36 formats including PEF/NEF/CR2/ARW, TIFF and JPEG XL.
+  exited 0 and listed 35 formats including PEF/NEF/CR2/ARW, TIFF and JPEG XL.
   A neutral 16-bit CPU export (`OMP_NUM_THREADS=1`, `--gpu=off`) matched the
-  `5.13-710-g2947dfbf1` host CLI exactly when both used the packaged data
-  directory: PAE 0 LSB16, 0 of 30,419,712 samples differ. GUI smoke under
-  Xvfb stayed alive to the 20 s timeout on both (exit 124, no stderr).
+  host CLI exactly when both used the packaged data directory: PAE 0 LSB16,
+  0 of 30,419,712 samples, on both distributions. Run the host reference
+  against the extracted package data, not bare `rtdata`: the install adds the
+  `options` file and the generated `camconst.json`, and bare `rtdata` moves
+  the neutral export by 1932 codes. The packaged binary run on the host
+  matches the host build with the same data (AE=0). GUI smoke under Xvfb
+  stayed alive to the 20 s timeout on both (exit 124, no stderr).
   `--gpu-test` and `--gpu-test-monitor` were not run: the containers have no
   GPU.
+- The previous package, `5.13+git13684.2dccc3ee5-1` (sha256
+  `bc59ce0721df0262e854656c32807061b37a503e450c0b3fdee5f3093e81f5df`), passed
+  the same install/formats/export/GUI rows at `2dccc3ee5`.
 - The package replaces `/usr/local/bin/rawtherapee` and
   `/usr/local/bin/rawtherapee-cli`, like a normal `/usr/local` build.
 - Remove any old self-contained bundle in `/usr/local/lib/rawtherapee` before
