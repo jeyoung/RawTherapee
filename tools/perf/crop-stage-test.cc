@@ -705,6 +705,30 @@ const std::vector<EditScenario>& editScenarios()
          [](rtengine::procparams::ProcParams& p) {
              p.pdsharpening.enabled = true;
          }},
+        /*
+         * A capture-sharpening parameter change carried by a request that
+         * names neither the raw nor the capture-sharpening family. The dirty
+         * set and the work order still schedule the demosaic body, so the
+         * capture-sharpening step must run from that fact; the request
+         * intents alone used to skip it and leave the incremental crop stale
+         * against the fresh render.
+         */
+        {"capture-sharpening-settings", rtengine::RequestIntent::AutoExposure,
+         false,
+         [](rtengine::procparams::ProcParams& p) {
+             p.pdsharpening.enabled = true;
+             p.pdsharpening.contrast += 0.2;
+         }},
+        /*
+         * Retinex buffer inputs changed without the raw family in the
+         * request. The work order names retinexPrepare, so the preparation
+         * must run even though the demosaic body itself does not.
+         */
+        {"retinex-workprofile", rtengine::RequestIntent::AutoExposure, false,
+         [](rtengine::procparams::ProcParams& p) {
+             p.retinex.enabled = true;
+             p.icm.workingProfile = "ProPhoto";
+         }},
         {"transform", rtengine::RequestIntent::Transform, false,
          [](rtengine::procparams::ProcParams& p) { p.rotate.degree = 1.5; }},
         {"local", rtengine::RequestIntent::AutoExposure, false,
