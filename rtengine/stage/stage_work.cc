@@ -35,6 +35,8 @@
 
 #include "stage_work.h"
 
+#include "stage_param_map.h"
+
 #include "procparams.h"
 
 #include <atomic>
@@ -518,8 +520,20 @@ WorkOrder derive_preview_work(const WorkInputs& inputs)
         && inputs.previousParams->pdsharpening.enabled;
     const bool captureSharpening = pdSharpeningChanged
         && (params.pdsharpening.enabled || previousCaptureSharpening);
+    /*
+     * Compare the sensor fields directly. `demosaicBlockChanged` covers the
+     * whole raw.demosaic fingerprint, so a pass that changes the demosaic
+     * method and an unused capture-sharpening setting at once would otherwise
+     * be classified as neither a sensor change (`!pdSharpeningChanged` is
+     * false) nor a capture-sharpening change (the tool was and is disabled),
+     * and the demosaic would be skipped. The sensor fingerprint excludes
+     * pdsharpening, so a combined delta still rebuilds the planes.
+     */
     const bool sensorDemosaicChanged =
-        demosaicBlockChanged && !pdSharpeningChanged;
+        history && inputs.previousParams != nullptr
+            ? rawDemosaicSensorFingerprint(*inputs.previousParams) !=
+                  rawDemosaicSensorFingerprint(params)
+            : demosaicBlockChanged;
 
     /*
      * Retinex buffer preparation lives inside the raw.demosaic body, not in

@@ -2816,4 +2816,13 @@ ParamFingerprint crop_fingerprint(const std::string& id,
     return fingerprint(cropPath(), id, params);
 }
 
+ParamFingerprint rawDemosaicSensorFingerprint(
+    const procparams::ProcParams& params)
+{
+    ParamHasher hasher;
+    hasher.addSectionLabel("raw.demosaic.sensor");
+    addRawDemosaicFields(hasher, params.raw);
+    return hasher.finish();
+}
+
 } // namespace rtengine::stage

@@ -327,6 +327,19 @@ void testParameterChanges()
              params.pdsharpening.contrast += 0.1;
          },
          {}},
+        /*
+         * A combined sensor + capture-sharpening delta. The sharpening tool is
+         * disabled on both sides, so the capture-sharpening predicate is false;
+         * the sensor predicate must still see the demosaic method change and
+         * name the body.
+         */
+        {"sensor and capture sharpening together (raw.demosaic)",
+         [](procparams::ProcParams& params) {
+             params.raw.bayersensor.method = "RCD";
+             params.pdsharpening.contrast += 0.1;
+         },
+         {WorkItem::rawDemosaic, WorkItem::rawBaseRebuild,
+          WorkItem::analysisRun}},
         {"retinex (raw.demosaic buffers, raw.base, enabled)",
          [](procparams::ProcParams& params) {
              params.retinex.enabled = true;

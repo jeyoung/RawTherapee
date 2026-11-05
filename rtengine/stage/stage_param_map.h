@@ -108,4 +108,13 @@ ParamFingerprint preview_fingerprint(const std::string& id,
 ParamFingerprint crop_fingerprint(const std::string& id,
                                   const procparams::ProcParams& params);
 
+/*
+ * Sensor-only part of the raw.demosaic fingerprint: the demosaic fields
+ * without pdsharpening. The preview work order uses it to tell a sensor
+ * change from a capture-sharpening-only delta when both arrive in one pass;
+ * the block fingerprint alone cannot separate them.
+ */
+ParamFingerprint rawDemosaicSensorFingerprint(
+    const procparams::ProcParams& params);
+
 } // namespace rtengine::stage
