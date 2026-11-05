@@ -136,7 +136,7 @@ void rgbToLabRegion(const Imagefloat& src, LabImage& dst, int x, int y,
  * STAGE_PIPELINE.md). The executor below covers exactly this many nodes; a
  * mismatch aborts, because the graph is the only export sequence.
  */
-constexpr size_t EXPORT_NODE_COUNT = 20;
+constexpr size_t EXPORT_NODE_COUNT = 22;
 
 /*
  * Export node ids the graph executor implements. buildPipelineSpec() names the
@@ -146,11 +146,11 @@ constexpr size_t EXPORT_NODE_COUNT = 20;
  * silently skipping a block.
  */
 const char* const EXPORT_NODE_IDS[] = {
-    "source.select", "raw.preprocess", "raw.demosaic", "raw.base",
-    "analysis", "transform", "local.adjustments", "rgb.proc", "lab.tools",
-    "lab.sharpening", "lab.wavelet", "working.trc", "ciecam", "gamut",
-    "crop", "resize", "output.sharpen", "output.convert", "framing",
-    "output.icc"
+    "source.select", "raw.preprocess", "raw.demosaic", "raw.base.source",
+    "raw.denoise", "raw.color", "analysis", "transform", "local.adjustments",
+    "rgb.proc", "lab.tools", "lab.sharpening", "lab.wavelet", "working.trc",
+    "ciecam", "gamut", "crop", "resize", "output.sharpen", "output.convert",
+    "framing", "output.icc"
 };
 
 static_assert(sizeof(EXPORT_NODE_IDS) / sizeof(EXPORT_NODE_IDS[0]) ==
@@ -259,17 +259,18 @@ void logFastExportGraphActive(size_t nodes)
 }
 
 /*
- * Profile one fast-export node as a whole.
+ * Profile one composite node as a whole.
  *
  * The node methods are host composites; any device sub-node they run records
  * its own impl through stage::run()/ScopedProfile. This wrapper adds the
  * missing per-node record, with impl=host, so a `-f` export emits one record
- * per fast node under RT_STAGE_PROFILE. It is a no-op when profiling is off.
+ * per fast node and the canonical export emits one per raw.base sub-block
+ * under RT_STAGE_PROFILE. It is a no-op when profiling is off.
  */
-class ScopedFastNodeProfile
+class ScopedHostNodeProfile
 {
 public:
-    explicit ScopedFastNodeProfile(const char* stage)
+    explicit ScopedHostNodeProfile(const char* stage)
         : stage_(stage),
           active_(stage::profiling_enabled()),
           begin_(active_ ? std::chrono::steady_clock::now()
@@ -277,7 +278,7 @@ public:
     {
     }
 
-    ~ScopedFastNodeProfile()
+    ~ScopedHostNodeProfile()
     {
         if (!active_) {
             return;
@@ -295,8 +296,8 @@ public:
         stage::profile(record);
     }
 
-    ScopedFastNodeProfile(const ScopedFastNodeProfile&) = delete;
-    ScopedFastNodeProfile& operator=(const ScopedFastNodeProfile&) = delete;
+    ScopedHostNodeProfile(const ScopedHostNodeProfile&) = delete;
+    ScopedHostNodeProfile& operator=(const ScopedHostNodeProfile&) = delete;
 
 private:
     const char* stage_;
@@ -405,7 +406,7 @@ private:
 
     /*
      * Graph-driven form of the export pipeline. The graph is built from the
-     * canonical export inventory every job, so its 20 nodes, 19 edges and
+     * canonical export inventory every job, so its 22 nodes, 21 edges and
      * reuse modes come from buildPipelineSpec() rather than from this file.
      * A fresh graph is fully dirty, so the plan must let every node recompute;
      * a plan that would skip a block is rejected before anything executes and
@@ -494,8 +495,15 @@ private:
             stage_raw_preprocess();
         } else if (id == "raw.demosaic") {
             stage_raw_demosaic();
-        } else if (id == "raw.base") {
-            stage_raw_base();
+        } else if (id == "raw.base.source") {
+            ScopedHostNodeProfile node_profile(id.c_str());
+            stage_raw_base_source();
+        } else if (id == "raw.denoise") {
+            ScopedHostNodeProfile node_profile(id.c_str());
+            stage_denoise();
+        } else if (id == "raw.color") {
+            ScopedHostNodeProfile node_profile(id.c_str());
+            stage_raw_color();
         } else if (id == "analysis") {
             stage_analysis();
         } else if (id == "transform") {
@@ -608,7 +616,7 @@ private:
 
         for (size_t index : order) {
             const std::string& id = graph.node(index).name;
-            ScopedFastNodeProfile node_profile(id.c_str());
+            ScopedHostNodeProfile node_profile(id.c_str());
 
             if (!executeFastExportNode(id)) {
                 return nullptr;
@@ -800,8 +808,9 @@ private:
     /*
      * raw.base, first part: white balance, denoise preparation, the base
      * image and the tone-curve analysis. Extracted from stage_init() unchanged.
-     * raw.base also runs stage_denoise() and stage_raw_color(); this split
-     * exists so the fast export can run denoise after its early resize.
+     * Both exports name this node raw.base.source; the remaining calls run as
+     * raw.denoise and raw.color (export) or after the early resize (fast
+     * export).
      */
     void stage_raw_base_source()
     {
@@ -1450,9 +1459,11 @@ private:
     }
 
     /*
-     * raw.base: the base image, denoise and source colour conversion. This is
-     * one canonical block; the three calls are its real sub-blocks and run in
-     * the order the hand-written pipeline always used.
+     * raw.base: the composite base image, denoise and source colour
+     * conversion. The canonical export names the three sub-blocks directly
+     * (raw.base.source, raw.denoise, raw.color); this wrapper stays for the
+     * preview, crop and thumbnail specs, which still use the composite id.
+     * The three calls run in the order the hand-written pipeline always used.
      */
     void stage_raw_base()
     {
@@ -1519,11 +1530,11 @@ private:
     }
 
     /*
-     * raw.base, source colour: convert to the working space, optionally
-     * through film-negative processing, then compress the source gamut.
-     * Extracted from stage_transform() unchanged. The histogram allocation
-     * moved to stage_analysis() so this block ends before analysis begins; it
-     * only allocates a LUT, so the pixel order is unchanged.
+     * raw.color: source colour conversion. Convert to the working space,
+     * optionally through film-negative processing, then compress the source
+     * gamut. Extracted from stage_transform() unchanged. The histogram
+     * allocation moved to stage_analysis() so this block ends before analysis
+     * begins; it only allocates a LUT, so the pixel order is unchanged.
      */
     void stage_raw_color()
     {

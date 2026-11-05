@@ -70,6 +70,7 @@ enum class StageBlock {
     ThumbnailLab,
     ThumbnailOutput,
     RawBaseSource,
+    RawDenoise,
     RawColor,
     EarlyResize,
     Denoise,
@@ -160,10 +161,13 @@ const std::vector<BlockMeta>& blockTable()
         {"thumbnail.rgb",          "Thumbnail RGB processing",   RT_STAGE_REUSE_INPUT,  {"toneCurve", "rgbCurves", "colorToning", "blackwhite", "chmixer", "hsvequalizer", "filmSimulation", "icm"}},
         {"thumbnail.lab",          "Thumbnail Lab processing",   RT_STAGE_REUSE_INPUT,  {"labCurve", "sh", "localContrast", "vibrance", "epd", "softlight", "toneEqualizer", "colorappearance", "cg", "icm"}},
         {"thumbnail.output",       "Thumbnail output",           RT_STAGE_RECOMPUTE,    {"icm"}},
-        // Fast-export split of raw.base, plus the early resize and the finish
-        // sequence. The ids are the node ids the `-f` executor maps to its
-        // private stage methods.
+        // Split of raw.base. The canonical export names the three real
+        // sub-blocks (raw.base.source, raw.denoise, raw.color); the fast
+        // export keeps its own denoise id because it runs after the early
+        // resize. The ids are the node ids the executors map to their private
+        // stage methods.
         {"raw.base.source",        "Base image source",          RT_STAGE_REUSE_OUTPUT, {"raw", "wb", "toneCurve", "spot", "dirpyrDenoise", "filmNegative", "retinex", "cg", "icm"}},
+        {"raw.denoise",            "Denoise",                    RT_STAGE_REUSE_INPUT,  {"dirpyrDenoise", "icm", "raw"}},
         {"raw.color",              "Source colour conversion",   RT_STAGE_REUSE_INPUT,  {"filmNegative", "cg", "icm", "raw"}},
         {"early.resize",           "Early resize",               RT_STAGE_REUSE_OUTPUT, {"resize", "crop", "icm", "prsharpening", "sharpening", "wavelet", "dirpyrDenoise", "epd", "dirpyrequalizer", "sh", "localContrast", "raw"}},
         {"denoise",                "Denoise",                    RT_STAGE_REUSE_INPUT,  {"dirpyrDenoise", "icm", "raw"}},
@@ -252,6 +256,25 @@ std::vector<StageBlock> coreBlocks()
     };
 }
 
+/*
+ * The export core names the three raw.base sub-blocks directly, in the order
+ * the hand-written pipeline runs them. Preview, crop and thumbnail keep the
+ * composite RawBase node.
+ */
+std::vector<StageBlock> exportCoreBlocks()
+{
+    return {
+        StageBlock::SourceSelect,
+        StageBlock::RawPreprocess,
+        StageBlock::RawDemosaic,
+        StageBlock::RawBaseSource,
+        StageBlock::RawDenoise,
+        StageBlock::RawColor,
+        StageBlock::Analysis,
+        StageBlock::Transform
+    };
+}
+
 std::vector<StageBlock> withTail(std::vector<StageBlock> blocks,
                                  std::initializer_list<StageBlock> tail)
 {
@@ -263,11 +286,13 @@ PathDefinition definitionFor(StagePath path)
 {
     switch (path) {
     case StagePath::Export: {
-        // The export implementation crops, resizes and post-sharpens the Lab
-        // image before converting to the output space, because lab2rgbOut()
-        // consumes the crop rectangle directly. The output blocks follow that
-        // order; the catalogue ids, edges and reuse modes are unchanged.
-        const std::vector<StageBlock> nodes = withTail(coreBlocks(), {
+        // The raw core names the three raw.base sub-blocks so each has a
+        // profile record and a real execution boundary. The export
+        // implementation crops, resizes and post-sharpens the Lab image before
+        // converting to the output space, because lab2rgbOut() consumes the
+        // crop rectangle directly. The output blocks follow that order; the
+        // catalogue ids, edges and reuse modes are unchanged.
+        const std::vector<StageBlock> nodes = withTail(exportCoreBlocks(), {
             StageBlock::LocalAdjustments,
             StageBlock::RgbProc,
             StageBlock::LabTools,

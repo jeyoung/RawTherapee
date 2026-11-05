@@ -2068,8 +2068,8 @@ void addField(ParamHasher& hasher, const procparams::MetaDataParams& value)
  *
  * A member that genuinely feeds two bodies is listed in both groups and the
  * overlap is documented at the field. The groups do not have to partition the
- * struct: a field read only by getImage() stays in `raw.base`, which hashes the
- * whole `raw` member.
+ * struct: a field read only by getImage() stays in `raw.base` (or, in the
+ * canonical export, `raw.base.source`), which hashes the whole `raw` member.
  */
 
 /* The raw frame the source selects; no image math runs here. */
@@ -2222,6 +2222,10 @@ void hashRawDemosaic(ParamHasher& hasher, const ProcParams& params)
  * tone-curve exposure, spot removal, denoise, film negative, Retinex, dehaze,
  * Fattal and source-side gamut compression. icm enters through
  * convertColorSpace() and the Retinex colour-space conversion.
+ *
+ * This composite hash serves the preview, crop and thumbnail `raw.base` node.
+ * The canonical export splits the block into the three hashers below; their
+ * field lists cover this one so no member is lost.
  */
 void hashRawBase(ParamHasher& hasher, const ProcParams& params)
 {
@@ -2239,9 +2243,46 @@ void hashRawBase(ParamHasher& hasher, const ProcParams& params)
 }
 
 /*
+ * raw.base.source: the base image, white balance, spot removal and the
+ * automatic denoise measurement that writes params.dirpyrDenoise. Retinex and
+ * icm enter through retinexPrepareBuffers()/getImage(). dehaze and fattal are
+ * retained from the composite row; the transform node is their real consumer.
+ */
+void hashRawBaseSource(ParamHasher& hasher, const ProcParams& params)
+{
+    addField(hasher, params.raw);
+    addField(hasher, params.wb);
+    addField(hasher, params.toneCurve);
+    addField(hasher, params.spot);
+    addField(hasher, params.dirpyrDenoise);
+    addField(hasher, params.retinex);
+    addField(hasher, params.dehaze);
+    addField(hasher, params.fattal);
+    addField(hasher, params.icm);
+}
+
+/* raw.denoise: RGB_denoise() and the working-space conversion of its guide. */
+void hashRawDenoise(ParamHasher& hasher, const ProcParams& params)
+{
+    addField(hasher, params.dirpyrDenoise);
+    addField(hasher, params.icm);
+    addField(hasher, params.raw);
+}
+
+/* raw.color: colour-space conversion, film negative and source gamut. */
+void hashRawColor(ParamHasher& hasher, const ProcParams& params)
+{
+    addField(hasher, params.filmNegative);
+    addField(hasher, params.cg);
+    addField(hasher, params.icm);
+    addField(hasher, params.raw);
+}
+
+/*
  * firstAnalysis() reads icm.workingProfile to build the luminance weights
  * (improcfun.cc:515-521). toneCurve is kept from the inventory because the
- * histogram feeds the auto-exposure parameters consumed by raw.base. The
+ * histogram feeds the auto-exposure parameters consumed by raw.base (or the
+ * export's raw.base.source). The
  * automatic denoise measurement reads the denoise configuration (the automatic
  * methods it selects, and the curve or slider mode), so the whole member is
  * hashed: an analysis measured for one denoise configuration must not be
@@ -2527,6 +2568,13 @@ const std::vector<DescriptorDefinition>& definitions()
          {"raw", "wb", "toneCurve", "spot", "dirpyrDenoise", "filmNegative",
           "retinex", "dehaze", "fattal", "cg", "icm"},
          hashRawBase},
+        // The canonical export's three raw.base sub-blocks.
+        {"raw.base.source",
+         {"raw", "wb", "toneCurve", "spot", "dirpyrDenoise", "retinex",
+          "dehaze", "fattal", "icm"},
+         hashRawBaseSource},
+        {"raw.denoise", {"dirpyrDenoise", "icm", "raw"}, hashRawDenoise},
+        {"raw.color", {"filmNegative", "cg", "icm", "raw"}, hashRawColor},
         {"analysis", {"icm", "toneCurve", "dirpyrDenoise"}, hashAnalysis},
         {"transform",
          {"coarse", "commonTrans", "rotate", "distortion", "perspective",
@@ -2607,7 +2655,9 @@ const PathTable& exportPath()
         "source.select",
         "raw.preprocess",
         "raw.demosaic",
-        "raw.base",
+        "raw.base.source",
+        "raw.denoise",
+        "raw.color",
         "analysis",
         "transform",
         "local.adjustments",
