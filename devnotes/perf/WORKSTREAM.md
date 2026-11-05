@@ -92,6 +92,24 @@ passed the same rows.
 
 ## Progress log — resumed 2026-10-28 (Block 4 completion)
 
+- **Capture-sharpening and Retinex gate fixes (2026-11-05)**: two
+  request-intent gates in `ImProcCoordinator::stageRawDemosaic` disagreed with
+  the work order, which is the execution authority. (1) Capture sharpening
+  ran only for `rawIntent`/`captureSharpenIntent`/`demosaicRebuilt`; a
+  `pdsharpening` change carried by a parameter-only or coalesced request
+  schedules the body but carried none of those bits, so the step was skipped.
+  It now runs whenever the body is scheduled and the tool is enabled (the
+  step is idempotent on the pre-sharpening caches). (2) The Retinex buffer
+  preparation had the same shape; a changed buffer input without the raw
+  family skipped `retinexPrepareBuffers()` and could dereference an
+  unprepared buffer. It now consults `WorkItem::retinexPrepare`. New
+  `crop-stage-test` scenarios pin both: before the fix
+  `capture-sharpening-settings` was `AE=32` (2,132,398 bytes) and
+  `retinex-workprofile` segfaulted; after the fix both are `AE=0`, the full
+  sequence is 45 plans with `AE=0`, `--quick` is 84 PASS / 0 FAIL, and the
+  POCL/CPU residency suites and the 15 host tests pass.
+
+
 - **Full device gate green (2026-11-05)**: three defects were fixed after the
   first closure run. (1) The local Colour & Light chain was not float-exact:
   the two chroma-slider curves now travel as the host's exact

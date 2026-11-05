@@ -1284,7 +1284,12 @@ The derived set is the execution-set authority. There is no
 applies the typed request of each edit to the stage bodies, then compares the
 incremental crop with a fresh render of the final state. For the
 destructive raw/core bodies the typed work order is the execution-set
-authority; the dirty-block set still schedules the downstream nodes.
+authority; the dirty-block set still schedules the downstream nodes. A body
+that gates a sub-step on a request family must also consult the work item
+when a parameter change with no such family can schedule the same sub-step:
+capture sharpening and the Retinex buffer preparation were caught by this
+rule (a parameter-only `pdsharpening` change and a working-profile change
+while Retinex was enabled).
 
 The `todo` coalescing and the plan validation in `planCropGraph()` are
 unchanged. A rejected plan aborts instead of running a full legacy loop, and
