@@ -1078,9 +1078,12 @@ is 1 byte, all on POCL CPU with `rtdata/` bound at the compiled data path.
 - **`crop-stage-test` stall**: not reproduced on the public PEF at the current
   tip (`--sequences` with `sharpen-usm.pp3`: PASS, 39 plans, 0 fallbacks,
   `AE=0`). The historical flake is recorded but has no acceptance case.
-- **GUI dump coverage**: tone curve and crop geometry still lack dump pairs;
-  the xdotool harness cannot drive those panels reproducibly. This remains a
-  harness gap and is recorded as such, never as a PASS.
+- **GUI dump coverage**: the deterministic sweep already carries the
+  `tone-curve` state and the `zoom-100`/`zoom-fit`/pan crop states, so those
+  edits have dump pairs there. The *screenshot* harness
+  (`test-preview-parity.sh`) still captures only fit/100/zoom/pan, because the
+  xdotool panel drive is not reproducible; that screenshot gap is recorded,
+  never treated as a PASS.
 - **rusticl**: skipped on this host; deterministic device tests run on POCL.
   This is an environment fact, not a code residual.
 
