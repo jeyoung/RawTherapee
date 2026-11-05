@@ -10,11 +10,11 @@ is recorded below.
 
 ## Artefact
 
-The current package is the block-4 closure build from `3babc4b48`:
+The current package is the P1 closure build from `6bc636307`:
 
 ```
-rawtherapee-graph-5.13-718-g3babc4b48_5.13+git13739.3babc4b48-1_amd64.deb
-sha256 fb7882c4c75c88fbdcc7682c49d4a63265e280b4217804774eb5b365d3f5a62f
+rawtherapee-graph-5.13-732-g6bc636307_5.13+git13753.6bc636307-1_amd64.deb
+sha256 315a9ea0f7f867a75f95981a77d517fbe90a6fc6e4ec3f546c8cb192670380e4
 ```
 
 It passed the install, `--list-formats`, neutral export and Xvfb smoke rows on
@@ -24,7 +24,14 @@ the packaged data directory (the install adds the `options` file and the
 generated `camconst.json`); bare `rtdata` moves the neutral export by 1932
 codes.
 
-The earlier artefact was:
+The earlier artefacts were:
+
+```
+rawtherapee-graph-5.13-718-g3babc4b48_5.13+git13739.3babc4b48-1_amd64.deb
+sha256 fb7882c4c75c88fbdcc7682c49d4a63265e280b4217804774eb5b365d3f5a62f
+```
+
+and
 
 ```
 rawtherapee-graph-5.13-365-g6fd009d74_5.13+git13386.6fd009d74-1_amd64.deb
