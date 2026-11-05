@@ -3304,7 +3304,16 @@ Gaussian local contrast, local sharpening, local exposure's PDE arm,
 Lab-mode `"std"` shadows/highlights, per-pixel `"soft"` soft light, the
 CAM16 `"com"` CIE CAM arm, and the
 `avoidgamutMethod` values `"NONE"` and `"MUNS"`. The per-spot clamp
-is bit-exact against the host, so the Munsell pass runs on the device. The
+is bit-exact against the host, so the Munsell pass runs on the device.
+Three details keep the Colour & Light path float-exact: the two
+chroma-slider curves are exported as the host's `DiagonalCurve` polyline and
+walked in double (a float sample table is not `getVal()`), the
+`transit_shapedetect2()` reference point is computed by the host
+(`chromaref * cosf(hueref) * 327.68f` and the sine pair) because OpenCL's
+`cos`/`sin` are not glibc's, and `calcreducdE()` and the transition factors
+use the host's `pow`/`pow_F` forms. The local sharpening blend also supplies
+`scope_base`; omitting it made every sharpen launch fail with
+`CL_INVALID_KERNEL_ARGS` and fall back to the host. The
 other tools, the other shadows/highlights methods (tone, GHS,
 Michaelis-Menten) and their tone-eq, recovery and gradient sub-options, the
 soft-light `"reti"` method, explicit masks, soft radius, merge, recursion,

@@ -88,6 +88,23 @@ this validates packaging rather than the newest engine code.
 
 ## Progress log — resumed 2026-10-28 (Block 4 completion)
 
+- **Full device gate green (2026-11-05)**: three defects were fixed after the
+  first closure run. (1) The local Colour & Light chain was not float-exact:
+  the two chroma-slider curves now travel as the host's exact
+  `DiagonalCurve` polylines evaluated in double, `transit_shapedetect2()`'s
+  reference point is resolved on the host instead of with OpenCL `cos`/`sin`,
+  and `calcreducdE()`/the transition factors use the host's `pow`/`pow_F`
+  forms. The MUNS row returns from 25 LSB16 to 1 LSB16. (2) The profile
+  loader assigned `assignFromKeyfile()`'s key-present flag to `spot.expcie`,
+  so any profile writing `Expcie_ false` (the local log profile) turned CIE
+  CAM on and the node fell back; the call now uses the same function for its
+  side effect and mirrors the enable into `visicie`. (3) The local sharpen
+  blend omitted the `scope_base` argument, so a 3113x2089 launch failed with
+  `CL_INVALID_KERNEL_ARGS` and fell back to the host. `verify.sh --quick` is
+  **84 PASS, 0 FAIL** and `--stage-device` is **73 PASS, 0 FAIL, 0 SKIP**,
+  both with `rtdata/` bound at the compiled data path; `--formats` passes the
+  public PEF and `--monitor` is 1 byte.
+
 - **Gate tooling and closure run (2026-11-05)**: `compare_tiff.py` gained
   `--info {size,bits,pixels}` and `verify.sh` falls back to it when
   ImageMagick is absent, so the gate runs on a host with only python3 and
@@ -95,13 +112,9 @@ this validates packaging rather than the newest engine code.
   auto run and expects `rgbproc` (the classic block's current log name), and
   the two `raw.base` rows use a new `raw-base.pp3` with
   `InputProfile=(camera)` so the matrix arm is selected even when the
-  installed data directory supplies a camera ICC or DCP. With `rtdata/` bound
-  at the compiled data path, `--quick` reaches 66 PASS and one FAIL:
-  `local-adjustments-munsell` differs by 19-25 LSB16 at 1,283 samples, because
-  a last-bit difference in the Colour & Light chain crosses Munsell's
-  discontinuous threshold. That row is a known red gate; the closure claim is
-  therefore not made. `--formats` passes the public PEF (1 entry) and
-  `--monitor` passes at 1 byte.
+  installed data directory supplies a camera ICC or DCP. The first run
+  reached 66 PASS and one FAIL (`local-adjustments-munsell`, 19-25 LSB16) and
+  exposed the three defects recorded above.
 
 - **`ciecam` CAM16 (2026-11-05)**: `colorappearance.modelmethod == "16"` is
   admitted under the same constraints as CIECAM02. The model travels in a
