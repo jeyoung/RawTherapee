@@ -1,9 +1,9 @@
 # Stage pipeline specification
 
 This record defines the canonical descriptor inventory and dependency graph for
-the four engine pipelines: export, preview, crop and thumbnail. It is the
-Phase A artefact for the stage runtime: the graph and its block boundaries are
-specified and tested here, before any production pipeline is rewired.
+the engine pipelines: export, fast export, preview, crop and thumbnail. It is
+the Phase A artefact for the stage runtime: the graph and its block boundaries
+are specified and tested here, before any production pipeline is rewired.
 
 Vocabulary: the typed `EditorRequest` (facts and dirty blocks) is the only
 request type. `M_*` names appear below only in historical migration mappings,
@@ -12,17 +12,18 @@ rule. The mask-era sentences are kept because they explain why the derivation
 looks the way it does.
 
 The specification is data only. `rtengine/stage/stage_pipeline.cc` builds it and
-`rtengine/stage/tests/stage_pipeline_test.cc` proves its shape. All four engine
-paths execute this graph through `StageGraph::plan()`; the hand-ordered
+`rtengine/stage/tests/stage_pipeline_test.cc` proves its shape. Every engine
+path executes this graph through `StageGraph::plan()`; the hand-ordered
 sequences and their `RT_STAGE_GRAPH`/`RT_PREVIEW_GRAPH` switches have been
-removed (see `STAGE_RUNTIME.md`).
+removed (see `STAGE_RUNTIME.md`). Fast export is the `-f` variant of export:
+it keeps the export consumer contract but has its own fixed node order.
 
 ## Scope
 
-- Four paths: `StagePath::{Export, Preview, Crop, Thumbnail}`.
+- Five paths: `StagePath::{Export, FastExport, Preview, Crop, Thumbnail}`.
 - Three domains: `Full`, `Roi`, `Reduced`.
-- Two consumers: `Exact` (export) and `Interactive` (preview, crop,
-  thumbnail).
+- Two consumers: `Exact` (export and fast export) and `Interactive` (preview,
+  crop, thumbnail).
 - One canonical block catalogue, so ids, display names, reuse modes and
   parameter provenance are defined exactly once.
 - Per path: one rooted, acyclic subgraph. Every node is reachable from a root
@@ -531,6 +532,17 @@ image or a bad buffer shape before the upload; the matrix node also refuses a
 device without fp64 and a non-finite matrix entry, and the host rewrites the
 image.
 
+The fast-export split adds five ids that no other path runs. They are the
+`-f` implementation's own boundaries, not extra work:
+
+| Id | Domain | Consumer | Reuse | Role | Device |
+|----|--------|----------|-------|------|--------|
+| `raw.base.source` | Full | exact | reuse-output | white balance, Retinex, `getImage()` and spots: the first part of `raw.base` | partial |
+| `raw.color` | Full | exact | reuse-input | working-space conversion, film negative and source-side gamut | n/a |
+| `early.resize` | Full | exact | reuse-output | RGB to Lab, crop-region conversion, Lab resize and scale-parameter adjustment | yes |
+| `denoise` | Full | exact | reuse-input | directional-pyramid denoise after the early resize | n/a |
+| `finish` | Full | exact | recompute | the composite finish sequence from local adjustments to output ICC | n/a |
+
 ## Path specifications
 
 ### Export: 20 nodes, 19 edges
@@ -579,6 +591,23 @@ Code evidence, in order:
 The line numbers refer to the hand-written pipeline before the Phase B
 decomposition; `devnotes/perf/STAGE_RUNTIME.md` records the method boundaries
 that replace them.
+
+### Fast export: 10 nodes, 9 edges
+
+Root `source.select`, sink `finish`. The order is fixed by the `-f`
+implementation; there is no parallelism to express.
+
+```text
+source.select -> raw.preprocess -> raw.demosaic -> raw.base.source
+  -> raw.color -> analysis -> transform -> early.resize -> denoise -> finish
+```
+
+The raw core is split around the early resize so denoise runs on the resized
+image, which is the historical fast order. `finish` is a composite node: it
+calls the same finish methods the export path uses, in their usual order, and
+returns the output image. `buildPipelineSpec(StagePath::FastExport)` names the
+ten ids and the nine linear edges; `stage-pipeline-test` pins both. Execution
+evidence is in `devnotes/perf/STAGE_RUNTIME.md`.
 
 ### Preview: 14 nodes, 13 edges
 

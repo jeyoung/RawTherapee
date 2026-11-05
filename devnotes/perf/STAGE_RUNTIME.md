@@ -1407,17 +1407,24 @@ Execution is guarded before any node runs:
 Execution follows `topologicalOrder()`, and each node id selects the private
 method that implements the block, so the arithmetic is untouched. An accepted
 plan logs `stage-graph: active, 20 nodes executed from the canonical export
-inventory` once per process. Fast export (`-f`) still uses its own order: it
-calls the same node methods, but runs denoise after the early resize, so it is
-not routed through the graph.
+inventory` once per process.
 
-`RT_STAGE_PROFILE=1` records one key per node, named by node id
-(`source.select` ... `output.icc`), from inside the node method.
-`stage_finish()` keeps the coarse `export.init`, `export.denoise`,
-`export.transform` and `export.finish` scopes around the same methods for the
-fast path, and the pre-existing `finish.rgbproc`, `finish.sharpening`,
-`finish.wavelet`, `finish.resize` and `finish.output` scopes remain inside
-their nodes.
+Fast export (`-f`) is the second export spec, `StagePath::FastExport`: ten
+nodes in the fixed fast order, with the raw core split so denoise runs after
+the early resize and the tail is one composite `finish` node. It uses the same
+guard: the node count must be 10, every id must have an executor, the graph
+must be acyclic, and a `ReuseOutput` decision aborts. It logs
+`stage-graph: fast-export active, 10 nodes executed from the fast_export
+inventory`. When `Resize` is disabled the fast entry point still delegates to
+`normal_pipeline()`, exactly as before.
+
+`RT_STAGE_PROFILE=1` records one key per canonical export node, named by node
+id (`source.select` ... `output.icc`), from inside the node method. The fast
+path additionally emits one JSONL record per fast node, measured by the
+executor and carrying `impl` (the fast node methods are host composites; any
+device sub-node records its own impl). The pre-existing `finish.rgbproc`,
+`finish.sharpening`, `finish.wavelet`, `finish.resize` and `finish.output`
+scopes remain inside their nodes.
 
 All 20 nodes execute real work. Blocks that stay folded inside a neighbour,
 because one topological order has to reproduce the implementation's pixel
@@ -1489,6 +1496,30 @@ export results.
 `buildTilePlan()` produces a cheap block score from a luminance plane and
 splits blocks into full and cheap work. It is the hook for selective
 denoise/wavelet work; it is not yet wired into those tools.
+
+### Fast export graph evidence
+
+Image: `colorspace_flowers.pef` (10.2 MP public PEF), profile
+`devnotes/opencl/pp3/resize.pp3` (`Resize Enabled=true, Scale=0.5, Lanczos`,
+which makes the CLI take the fast path), `-f -t -b16 -Y --gpu=off`,
+`OMP_NUM_THREADS=1`. The control is the pre-change binary at `c8af2c0c4`.
+
+| Row | Result |
+|-----|--------|
+| `-f` export versus pre-change fast export, same image and profile | `AE=0`, 0 of 7 604 928 samples differ |
+| `RT_STAGE_PROFILE` fast-node records | 10 records, one per fast node; every record carries `"impl"` (`host` for the composite node methods) |
+| `stage-graph: fast-export active` | `10 nodes executed from the fast_export inventory` |
+| `stage-pipeline-test` | PASS |
+| `stage-residency-test`, POCL CPU | PASS (1 skipped) |
+| `stage-residency-test`, CPU build | PASS (42 skipped) |
+| `verify.sh --quick` | 84 PASS / 0 FAIL |
+
+The ten profiled ids, in order, are `source.select`, `raw.preprocess`,
+`raw.demosaic`, `raw.base.source`, `raw.color`, `analysis`, `transform`,
+`early.resize`, `denoise` and `finish`. A `finish` record still contains the
+finer per-node scopes for the blocks it calls. The regression test is
+`tools/perf/test-fast-export-graph.sh`; it pins the ten profile records, the
+ten-node active line and, when `--baseline` is supplied, the `AE=0` row.
 
 ## Graph-driven thumbnail
 

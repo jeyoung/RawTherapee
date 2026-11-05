@@ -1018,7 +1018,9 @@ is 1 byte, all on POCL CPU with `rtdata/` bound at the compiled data path.
 
 ### P1 gaps
 
-- Fast export (`-f`) is outside the graph.
+- Fast export (`-f`) is in the graph: `StagePath::FastExport` carries its ten
+  nodes and the executor runs the same private methods. The `-f` row is
+  `AE=0` against the pre-change binary; see `STAGE_RUNTIME.md`.
 - Thumbnail `loadFromImage` for non-raw files and inspector mode are not
   graph-covered. New evidence: the TIFF and JPEG GUI runs produce no
   thumbnail-graph line, while the raw run does.
@@ -1329,7 +1331,8 @@ recorded `n/a`, the gate is green (`--quick` 84 PASS / 0 FAIL,
 
 The next workstream is the P1 list above, in this order:
 
-1. Cover fast export (`-f`) and non-raw thumbnails in the graph.
+1. Cover non-raw thumbnails in the graph (fast export is covered by
+   `StagePath::FastExport`).
 2. Fold the five export sub-blocks and the crop raw sub-blocks into named
    nodes, then close the preview dirty residuals (guide-only crop,
    high-detail transitions, deferred analysis).
