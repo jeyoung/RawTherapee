@@ -238,7 +238,7 @@ void checkTable(const PathUnderTest& path, size_t expectedCount)
 
 void checkTables()
 {
-    checkTable(paths()[0], 20);
+    checkTable(paths()[0], 22);
     checkTable(paths()[1], 14);
     checkTable(paths()[2], 15);
 }
@@ -365,7 +365,9 @@ const std::map<std::string, std::string>& neutralExportFingerprints()
         {"source.select", "a28f2a11dca1007b39a8e9fff24e578c"},
         {"raw.preprocess", "88942882c721eb8ec614f59d30600242"},
         {"raw.demosaic", "78ac13127d9722d02402b459d1989afa"},
-        {"raw.base", "8786a9e2404ada652d318a74b1005f4e"},
+        {"raw.base.source", "85866d015849481587e40b2934ac2c16"},
+        {"raw.denoise", "53795afc4a8b554e67b34500d7260c1d"},
+        {"raw.color", "73666727cbf02a361b87cb3988120f0a"},
         {"analysis", "653441262d4cd6d9713a0afe66ae9d3f"},
         {"transform", "a6a394fbf372e1052ebe4fb397d7ef00"},
         {"local.adjustments", "69a6d4f54577a0f76ee897f84b8df245"},
@@ -427,6 +429,14 @@ const std::vector<Mutation>& mutations()
         /* WB */
         {"raw.base", "wb.temperature",
          [](procparams::ProcParams& p) { p.wb.temperature = 7000; }, false},
+        /* Export raw.base sub-blocks: source WB, denoise and source colour. */
+        {"raw.base.source", "wb.temperature",
+         [](procparams::ProcParams& p) { p.wb.temperature = 7000; }, false},
+        {"raw.denoise", "dirpyrDenoise.luma",
+         [](procparams::ProcParams& p) { p.dirpyrDenoise.luma += 5; }, false},
+        {"raw.color", "filmNegative.enabled",
+         [](procparams::ProcParams& p) { p.filmNegative.enabled = true; },
+         false},
         /* Demosaic */
         {"raw.demosaic", "raw.bayersensor.method",
          [](procparams::ProcParams& p) { p.raw.bayersensor.method = "RCD"; },
@@ -612,7 +622,9 @@ void checkMutations()
     const std::set<std::string>& previewCovered = covered["preview"];
     const std::set<std::string>& cropCovered = covered["crop"];
 
-    check(exportCovered.count("raw.base") != 0 &&
+    check(exportCovered.count("raw.base.source") != 0 &&
+              exportCovered.count("raw.denoise") != 0 &&
+              exportCovered.count("raw.color") != 0 &&
               exportCovered.count("raw.demosaic") != 0 &&
               exportCovered.count("transform") != 0 &&
               exportCovered.count("local.adjustments") != 0 &&
@@ -649,10 +661,10 @@ void checkMutations()
 }
 
 /*
- * The three raw consumer fingerprints must not be coarser than the legacy
- * raw gates. Each edit below is one event family; it may move its own block
- * (and raw.base, which reads the whole raw member), but must leave the other
- * raw consumers alone. Before the split, every raw edit moved all three.
+ * The raw consumer fingerprints must not be coarser than the legacy raw gates.
+ * Each edit below is one event family; it may move its own block (and the
+ * composite raw.base, which reads the whole raw member), but must leave the
+ * other raw consumers alone. Before the split, every raw edit moved all three.
  */
 void checkRawConsumerSplit()
 {
@@ -684,8 +696,8 @@ void checkRawConsumerSplit()
         const FingerprintMap changed = after([](procparams::ProcParams& p) {
             p.dirpyrDenoise.luma += 5;
         });
-        check(base.at("raw.base") != changed.at("raw.base"),
-              "denoise moves raw.base");
+        check(base.at("raw.denoise") != changed.at("raw.denoise"),
+              "denoise moves raw.denoise");
         check(base.at("analysis") != changed.at("analysis"),
               "denoise moves analysis");
         check(base.at("raw.preprocess") == changed.at("raw.preprocess"),
@@ -770,7 +782,8 @@ void checkUnrelated()
         changed.rotate.degree = 2.0;
         const FingerprintMap after =
             fingerprints(exportParamMap(), export_fingerprint, changed);
-        for (const char* id : {"crop", "raw.base", "lab.tools", "ciecam"}) {
+        for (const char* id : {"crop", "raw.base.source", "lab.tools",
+                               "ciecam"}) {
             check(base.at(id) == after.at(id),
                   std::string("rotation does not affect ") + id);
         }

@@ -323,11 +323,11 @@ void checkExport()
     const std::set<std::string> ids = nodeIds(spec);
 
     const std::vector<std::string> blocks = {
-        "source.select", "raw.preprocess", "raw.demosaic", "raw.base",
-        "analysis", "transform", "local.adjustments", "rgb.proc", "lab.tools",
-        "lab.sharpening", "lab.wavelet", "working.trc", "ciecam", "gamut",
-        "output.convert", "crop", "resize", "output.sharpen", "framing",
-        "output.icc"
+        "source.select", "raw.preprocess", "raw.demosaic", "raw.base.source",
+        "raw.denoise", "raw.color", "analysis", "transform",
+        "local.adjustments", "rgb.proc", "lab.tools", "lab.sharpening",
+        "lab.wavelet", "working.trc", "ciecam", "gamut", "output.convert",
+        "crop", "resize", "output.sharpen", "framing", "output.icc"
     };
     for (const auto& block : blocks) {
         check(contains(ids, block), "export: missing block " + block);
@@ -429,8 +429,8 @@ void checkCrop()
 void checkSharedCore()
 {
     const std::vector<std::string> core = {
-        "source.select", "raw.preprocess", "raw.demosaic", "raw.base",
-        "analysis", "transform"
+        "source.select", "raw.preprocess", "raw.demosaic", "analysis",
+        "transform"
     };
     const std::vector<StagePath> paths = {
         StagePath::Export, StagePath::Preview, StagePath::Crop
@@ -438,6 +438,19 @@ void checkSharedCore()
     for (StagePath path : paths) {
         const std::set<std::string> ids = nodeIds(buildPipelineSpec(path));
         for (const auto& id : core) {
+            check(contains(ids, id),
+                  std::string("shared core: ") + stagePathName(path) +
+                      " is missing " + id);
+        }
+
+        /* The export names the raw.base sub-blocks; the viewers keep the
+         * composite node. */
+        const std::vector<std::string> base =
+            path == StagePath::Export
+                ? std::vector<std::string>{"raw.base.source", "raw.denoise",
+                                           "raw.color"}
+                : std::vector<std::string>{"raw.base"};
+        for (const auto& id : base) {
             check(contains(ids, id),
                   std::string("shared core: ") + stagePathName(path) +
                       " is missing " + id);

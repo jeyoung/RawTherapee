@@ -146,7 +146,7 @@ if [ "$graph_parity" -eq 1 ]; then
     RT_EXPORT_LOG="$log" "$ROOT/tools/perf/export-one.sh" \
         --build-dir "$build_dir" --image "$image" --out "$graphed" \
         --gpu off --threads 1
-    if grep -q "stage-graph: active, 20 nodes" "$log"; then
+    if grep -q "stage-graph: active, 22 nodes" "$log"; then
         pass "export graph executed the canonical inventory"
     else
         fail "export graph not active (see $log)"
