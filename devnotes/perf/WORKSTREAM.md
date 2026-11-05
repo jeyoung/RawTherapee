@@ -108,6 +108,14 @@ passed the same rows.
   `retinex-workprofile` segfaulted; after the fix both are `AE=0`, the full
   sequence is 45 plans with `AE=0`, `--quick` is 84 PASS / 0 FAIL, and the
   POCL/CPU residency suites and the 15 host tests pass.
+- **Harness repairs (2026-11-05)**: `export-one.sh` now writes the
+  `ParseExtensions` options file a fresh `RT_SETTINGS` needs, so
+  `run-suite.sh` no longer skips the image in a clean tree, and
+  `run-suite.sh` passes `--out=` to `crop-stage-test` (its bare positional is
+  the optional pp3, so the report directory was being loaded as a profile).
+  The suite is green: export graph `AE=0`, thumbnail and crop parity, crop
+  dirty derivation, the `--stages` coverage, and thread determinism at
+  2/4/8 threads; only the documented preview/denoise skips remain.
 
 
 - **Full device gate green (2026-11-05)**: three defects were fixed after the
