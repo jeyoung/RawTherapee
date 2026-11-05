@@ -347,9 +347,23 @@ RtStageStatus StageContext::execute(const StageRequest& request,
          * selection.
          */
         StageQueue& context_queue = queue();
+        const auto begin = std::chrono::steady_clock::now();
         StageEvent event = context_queue.submit(request, nullptr);
         const RtStageStatus status = context_queue.wait(event);
+        const auto end = std::chrono::steady_clock::now();
         if (status == RT_STAGE_OK) {
+            /*
+             * Synchronous device branches construct their event directly and
+             * leave elapsed_ns at zero. Measure the total here so the profile
+             * never publishes a completed node as 0 ms; an asynchronous
+             * submission already carries its own (narrower) kernel timing.
+             */
+            if (event.elapsed_ns == 0) {
+                event.elapsed_ns = static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        end - begin)
+                        .count());
+            }
             if (profiling != nullptr) {
                 *profiling = RtStageProfiling{};
                 profiling->elapsed_ns = event.elapsed_ns;
