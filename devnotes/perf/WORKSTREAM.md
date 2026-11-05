@@ -1101,10 +1101,13 @@ is 1 byte, all on POCL CPU with `rtdata/` bound at the compiled data path.
   hit twice each and show no win at the default budget: PEF mean 307.1 ms
   against 305.9 ms without, NEF p50 492 ms against 484 ms and identical
   means (485 ms). The cache restores the right bytes, but the raw.base rebuild
-  it replaces is not on the settled-latency critical path. The promotion gate
-  is therefore **not met** and the default stays off. A preview-path
-  measurement with a clear win, plus a user-visible preference, is what would
-  flip it.
+  it replaces is not on the settled-latency critical path. The NEF state
+  sweep is the same: 22 s of base-affecting states, `hits=0` (the state
+  sequence never repeats a key), so the cache had nothing to serve. The
+  promotion gate is therefore **not met** and the default stays off. A
+  workload where a repeated base rebuild is on the critical path, with a
+  clear win at the default budget and a user-visible preference, is what
+  would flip it.
 - **Stage OpenCL**: stays **opt-in** (`RT_STAGE_OPENCL=1`; the kill switches
   are `RT_STAGE_OPENCL=0` and `RT_STAGE_OPENCL_DISABLE=1`). Coverage is now
   meaningful: `verify.sh --quick` is **84 PASS / 0 FAIL** and
