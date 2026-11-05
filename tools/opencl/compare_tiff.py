@@ -5,7 +5,9 @@
 #  encoded samples are compared in row chunks.
 #
 #  Usage: compare_tiff.py A.tif B.tif [--bits N]
+#         compare_tiff.py --info {size,bits,pixels} A.tif
 #  Prints: max_abs normalized_max differing total
+#          (or the requested header field with --info)
 #
 import argparse
 import os
@@ -179,12 +181,33 @@ def compare(a_path, b_path):
         b.close()
 
 
+def info(path, field):
+    reader = TiffReader(path)
+    try:
+        if field == "size":
+            return f"{reader.width}x{reader.height}"
+        if field == "bits":
+            return str(reader.bits)
+        if field == "pixels":
+            return str(reader.width * reader.height)
+        raise SystemExit(f"unknown info field: {field}")
+    finally:
+        reader.close()
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("a")
-    parser.add_argument("b")
+    parser.add_argument("b", nargs="?")
     parser.add_argument("--bits", type=int, default=16)
+    parser.add_argument("--info", choices=("size", "bits", "pixels"))
     args = parser.parse_args()
+
+    if args.info is not None:
+        print(info(args.a, args.info))
+        return 0
+    if args.b is None:
+        parser.error("two inputs are required unless --info is used")
 
     with tempfile.TemporaryDirectory(prefix="rtcmp.") as directory:
         a = os.path.join(directory, "a.tif")

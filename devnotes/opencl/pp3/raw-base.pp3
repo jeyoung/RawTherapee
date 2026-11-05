@@ -1,0 +1,7 @@
+# Force the camera-matrix arm of raw.base. The profile default is
+# "(cameraICC)", which resolves a camera ICC or a standard DCP on a host whose
+# data directory is installed; either one selects the lcms or DCP path and
+# skips the raw.base matrix multiply. "(camera)" leaves both null, which is
+# the arm the device node implements.
+[Color Management]
+InputProfile=(camera)

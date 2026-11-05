@@ -41,6 +41,7 @@ device_is_cpu=0
 expect_stage=0
 expect_stage_name=""
 expect_stage_absent=""
+expect_rgbproc=0
 
 usage() {
     awk 'NR > 1 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "$0"
@@ -80,14 +81,43 @@ find_cli() {
 
     if command -v magick >/dev/null 2>&1; then
         compare_cmd=(magick compare)
+        have_imagemagick=1
     elif command -v compare >/dev/null 2>&1; then
         compare_cmd=(compare)
+        have_imagemagick=1
+    elif command -v python3 >/dev/null 2>&1 \
+            && python3 -c 'import numpy' >/dev/null 2>&1; then
+        # The TIFF rows can be compared directly in Python; ImageMagick is
+        # only needed to normalise compressed or non-16-bit inputs, which the
+        # gates do not produce.
+        compare_cmd=()
+        have_imagemagick=0
     else
-        die "ImageMagick (magick or compare) is required"
+        die "ImageMagick, or python3 with numpy, is required"
     fi
 }
 
 LAST_PAE=""
+
+# ImageMagick's identify, or the TIFF header reader, for the fields the
+# comparison needs. Keeping this in one place lets the gate run on hosts with
+# only python3 and numpy.
+image_info() {
+    local field="$1"
+    local path="$2"
+
+    if command -v identify >/dev/null 2>&1; then
+        case "$field" in
+        size) identify -format '%wx%h' "$path" 2>/dev/null ;;
+        bits) identify -format '%[bit-depth]' "$path" 2>/dev/null ;;
+        pixels) identify -format '%[fx:w*h]' "$path" 2>/dev/null \
+                    | awk '{printf "%d", $1}' ;;
+        esac
+        return
+    fi
+
+    python3 "$SCRIPT_DIR/compare_tiff.py" --info "$field" "$path" 2>/dev/null
+}
 
 compare_images() {
     local a="$1"
@@ -97,17 +127,20 @@ compare_images() {
     [ -f "$a" ] && [ -f "$b" ] || return 1
 
     local size_a size_b
-    size_a="$(identify -format '%wx%h' "$a" 2>/dev/null || true)"
-    size_b="$(identify -format '%wx%h' "$b" 2>/dev/null || true)"
+    size_a="$(image_info size "$a")"
+    size_b="$(image_info size "$b")"
     [ "$size_a" = "$size_b" ] || return 1
 
     local pixels
-    pixels="$(identify -format '%[fx:w*h]' "$a" 2>/dev/null | awk '{printf "%d", $1}')"
+    pixels="$(image_info pixels "$a")"
 
-    if [ "${pixels:-0}" -gt 30000000 ] && command -v python3 >/dev/null 2>&1 \
-            && python3 -c 'import numpy' >/dev/null 2>&1; then
+    if [ "${have_imagemagick:-1}" -eq 0 ] \
+            || { [ "${pixels:-0}" -gt 30000000 ] \
+                 && command -v python3 >/dev/null 2>&1 \
+                 && python3 -c 'import numpy' >/dev/null 2>&1; }; then
         local bits
-        bits="$(identify -format '%[bit-depth]' "$a" 2>/dev/null || echo 16)"
+        bits="$(image_info bits "$a")"
+        bits="${bits:-16}"
         local metric rc=0
         metric="$(python3 "$SCRIPT_DIR/compare_tiff.py" "$a" "$b" --bits "$bits")" || rc=$?
         LAST_PAE="$(printf '%s\n' "$metric" | awk '{print $2}')"
@@ -193,7 +226,15 @@ run_pair() {
         profileEnv=(RT_OPENCL_PROFILE=1)
     fi
 
-    if ! env OMP_NUM_THREADS="$THREADS" "${profileEnv[@]}" "$cli" --gpu=auto "${extraArgs[@]}" "${profileArg[@]}" -o "$auto" -t -b16 -Y -c "$input" \
+    # The neutral row checks the classic RGB backend, which is still opt-in
+    # through RT_OPENCL_RGBPROC. Keep it on that row only, so the other rows
+    # isolate their own stage node (see run_stage_device).
+    local -a classicEnv=()
+    if [ "${expect_rgbproc:-0}" -eq 1 ]; then
+        classicEnv=(RT_OPENCL_RGBPROC=1)
+    fi
+
+    if ! env OMP_NUM_THREADS="$THREADS" "${profileEnv[@]}" "${classicEnv[@]}" "$cli" --gpu=auto "${extraArgs[@]}" "${profileArg[@]}" -o "$auto" -t -b16 -Y -c "$input" \
             >"$outdir/auto.log" 2>&1; then
         printf 'FAIL\t%s\tload or export failed (gpu=auto)\n' "$label"
         rm -rf "$outdir"
@@ -245,8 +286,10 @@ quick() {
     detect_device
 
     expect_stage=1
-    expect_stage_name="lab2srgb"
+    expect_stage_name="rgbproc"
+    expect_rgbproc=1
     run_pair "pef/neutral" "$sample"
+    expect_rgbproc=0
     expect_stage=0
     expect_stage_name=""
     run_monitor
@@ -256,8 +299,10 @@ quick() {
         "$ROOT/devnotes/opencl/pp3/rotate.pp3" transform
     run_stage_device "pef/stage-device-output" "" output.convert
     run_stage_device "pef/stage-device-raw-preprocess" "" raw.preprocess
-    run_stage_device "pef/stage-device-raw-base" "" raw.base
-    run_stage_device "pef/stage-device-raw-base-wb" "" raw.base.wb
+    run_stage_device "pef/stage-device-raw-base" \
+        "$ROOT/devnotes/opencl/pp3/raw-base.pp3" raw.base
+    run_stage_device "pef/stage-device-raw-base-wb" \
+        "$ROOT/devnotes/opencl/pp3/raw-base.pp3" raw.base.wb
     run_stage_device "pef/stage-device-raw-demosaic" \
         "$ROOT/devnotes/opencl/pp3/raw-demosaic.pp3" raw.demosaic
     run_stage_device "pef/stage-device-raw-demosaic-split" \
@@ -725,8 +770,10 @@ stage_device() {
         "$ROOT/devnotes/opencl/pp3/rotate.pp3" transform
     run_stage_device "pef/stage-device-output" "" output.convert
     run_stage_device "pef/stage-device-raw-preprocess" "" raw.preprocess
-    run_stage_device "pef/stage-device-raw-base" "" raw.base
-    run_stage_device "pef/stage-device-raw-base-wb" "" raw.base.wb
+    run_stage_device "pef/stage-device-raw-base" \
+        "$ROOT/devnotes/opencl/pp3/raw-base.pp3" raw.base
+    run_stage_device "pef/stage-device-raw-base-wb" \
+        "$ROOT/devnotes/opencl/pp3/raw-base.pp3" raw.base.wb
     run_stage_device "pef/stage-device-raw-demosaic" \
         "$ROOT/devnotes/opencl/pp3/raw-demosaic.pp3" raw.demosaic
     run_stage_device "pef/stage-device-raw-demosaic-split" \
