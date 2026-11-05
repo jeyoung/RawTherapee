@@ -2030,9 +2030,15 @@ clamps its low-pass sigma to 2.0; at scale 1 and that clamp the device mark
 kernel matches the host, and for a scaled export or a threshold above 60 the
 launcher derives the mask with the host's `markImpulse()` and keeps the
 correction on the device, so the scaled threshold parity does not depend on a
-kernel change. `output.sharpen` itself is partial: damped
-RLD, radii at or above 1.15, edges-only, halo control, show-mask and
-`blurradius >= 0.25` run the host builtin. The sub-node records, commands and
+kernel change. `output.sharpen` runs damped RLD, the 3x3/IIR forward blur,
+halo control and the blur-radius pre-pass on the device. Show-mask and the
+edges-only export are **decisively partial**: show-mask is the mask itself
+and the host's SIMD `_mm_rsqrt_ps()` sigmoid differs from the exact form by
+1.8 LSB16, while an edges-only export measures 4 LSB16 even though the node is
+bit-exact on the same input, because the upstream device pipeline supplies a
+slightly different L plane and the bilateral's piecewise-constant range table
+amplifies it. A radius at or above 1.15 is also a host residual (the
+separable IIR arm). The sub-node records, commands and
 parity results are in `STAGE_RUNTIME.md`.
 
 Partial: `raw.preprocess` runs the Bayer arm of `scaleColors()` on the device

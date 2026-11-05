@@ -551,12 +551,12 @@ peak absolute error is zero for the synthetic node tests:
   0.633 LSB16; halo, blur radius, edges and damping each change the device
   result against the plain USM arm, so the parity is not vacuous.
   `sharpen-usm.pp3`, `sharpen-rld.pp3`, `sharpen-rld-damped.pp3` and
-  `sharpen-usm-halo.pp3` are 1 LSB16 and record `impl=opencl`. Show-mask
-  stays a host residual because the mask is the output and the host's SIMD
+  `sharpen-usm-halo.pp3` are 1 LSB16 and record `impl=opencl`. Show-mask is a decisively partial residual: the mask is the output and
+  the host's SIMD
   `_mm_rsqrt_ps()` sigmoid differs from the exact form by 1.8 LSB16 on the
   mask's own scale; a non-positive edge tolerance, `blurradius >= 25` and the
-  separable RLD radius are the other named refusals. An edges-only export
-  measures 4 LSB16 even though the node is bit-exact on the same input,
+  separable RLD radius are the other named refusals. An edges-only export is decisively partial too: it measures 4 LSB16 even
+  though the node is bit-exact on the same input,
   because the upstream device pipeline supplies a slightly different L plane
   and the bilateral's piecewise-constant range table amplifies it; that
   profile is therefore not added to the export gate.
