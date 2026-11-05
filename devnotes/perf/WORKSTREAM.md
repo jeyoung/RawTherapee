@@ -77,8 +77,14 @@ sha256 bc59ce0721df0262e854656c32807061b37a503e450c0b3fdee5f3093e81f5df
 ```
 
 Built 2026-11-04 from `2dccc3ee5` with `tools/build-rt.sh portable`.
-Install, `--list-formats`, a CLI export against a single-threaded host
-export and a GUI smoke test are not yet run for this package.
+Validated 2026-11-05 in fresh Debian 12 and Debian 13 containers, both PASS:
+install, `--list-formats` (36 entries, including PEF/NEF/CR2/ARW, TIFF and
+JPEG XL), neutral 16-bit CPU export against the `5.13-710-g2947dfbf1` host
+CLI (PAE 0 LSB16, 0 of 30,419,712 samples differ, both using the packaged
+data directory) and a GUI smoke test under Xvfb (20 s timeout, exit 124).
+`--gpu-test` and `--gpu-test-monitor` were not run: the containers have no
+GPU. The package was built at `2dccc3ee5`, behind the `2947dfbf1` tip, so
+this validates packaging rather than the newest engine code.
 
 ## Progress log — resumed 2026-10-28 (Block 4 completion)
 

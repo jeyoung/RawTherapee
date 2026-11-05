@@ -80,9 +80,18 @@ driver and an ICD loader must be installed separately.
 - Built on Debian 12: glibc 2.36, GCC 12, `-mtune=generic`.
 - Requires Debian 12 or newer. Debian 13 t64 packages are accepted through
   their `Provides` entries.
-- Tested on Debian 12 and Debian 13 containers with `apt-get install ./...deb`,
-  CPU export, `--list-formats` (including JPEG XL) and a GUI smoke test under
-  Xvfb.
+- 2026-11-05, package `5.13+git13684.2dccc3ee5-1` (sha256
+  `bc59ce0721df0262e854656c32807061b37a503e450c0b3fdee5f3093e81f5df`):
+  fresh Debian 12 and Debian 13 containers both passed
+  `apt-get install -y ./...deb`; Debian 13's t64 packages satisfied the
+  pre-t64 `Depends` through `Provides`, with no workaround. `--list-formats`
+  exited 0 and listed 36 formats including PEF/NEF/CR2/ARW, TIFF and JPEG XL.
+  A neutral 16-bit CPU export (`OMP_NUM_THREADS=1`, `--gpu=off`) matched the
+  `5.13-710-g2947dfbf1` host CLI exactly when both used the packaged data
+  directory: PAE 0 LSB16, 0 of 30,419,712 samples differ. GUI smoke under
+  Xvfb stayed alive to the 20 s timeout on both (exit 124, no stderr).
+  `--gpu-test` and `--gpu-test-monitor` were not run: the containers have no
+  GPU.
 - The package replaces `/usr/local/bin/rawtherapee` and
   `/usr/local/bin/rawtherapee-cli`, like a normal `/usr/local` build.
 - Remove any old self-contained bundle in `/usr/local/lib/rawtherapee` before
