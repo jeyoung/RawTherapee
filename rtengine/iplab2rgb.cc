@@ -2207,7 +2207,11 @@ void ImProcFunctions::workingtrc(int sp, Imagefloat* src, Imagefloat* dst, int c
 
         if (setupOnly) {
             // The caller asked for the probe means and the profile only: no
-            // transform is created and no pixel is converted.
+            // transform is created and no pixel is converted. A caller that
+            // did not take the handle must not leak it.
+            if (!outProfile && oprofdef) {
+                cmsCloseProfile(oprofdef);
+            }
             return;
         }
 
@@ -2217,6 +2221,11 @@ void ImProcFunctions::workingtrc(int sp, Imagefloat* src, Imagefloat* dst, int c
             lcmsMutex->lock();
             hTransform = cmsCreateTransform(iprof, TYPE_RGB_FLT, oprofdef, TYPE_RGB_FLT, params->icm.aRendIntent, flags);
             lcmsMutex->unlock();
+            // The transform keeps its own reference; close the local handle
+            // unless the caller took ownership through outProfile.
+            if (!outProfile) {
+                cmsCloseProfile(oprofdef);
+            }
         }
     }
 
