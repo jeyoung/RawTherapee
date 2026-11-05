@@ -96,10 +96,19 @@ const BlockList& pathIds(StagePath path)
         }
         return ids;
     }();
+    static const BlockList fastExportIds = [] {
+        BlockList ids;
+        for (const auto& node : buildPipelineSpec(StagePath::FastExport).nodes) {
+            ids.push_back(node.id);
+        }
+        return ids;
+    }();
 
     switch (path) {
     case StagePath::Export:
         return exportIds;
+    case StagePath::FastExport:
+        return fastExportIds;
     case StagePath::Preview:
         return previewIds;
     case StagePath::Crop:
@@ -262,6 +271,11 @@ FingerprintFn fingerprintFor(StagePath path)
     switch (path) {
     case StagePath::Export:
         return export_fingerprint;
+    case StagePath::FastExport:
+        // The fast path has no fingerprint table: its split raw nodes and the
+        // composite finish do not map to the export fingerprint rows, so it
+        // degrades to the full set.
+        break;
     case StagePath::Preview:
         return preview_fingerprint;
     case StagePath::Crop:
@@ -353,6 +367,7 @@ const std::vector<std::vector<std::string>>& coupled_block_groups(
     case StagePath::Preview:
         return previewGroups;
     case StagePath::Export:
+    case StagePath::FastExport:
     case StagePath::Thumbnail:
         break;
     }
@@ -484,6 +499,7 @@ const std::vector<std::string>& resident_blocks(StagePath path)
     case StagePath::Preview:
         return previewResidents;
     case StagePath::Export:
+    case StagePath::FastExport:
     case StagePath::Thumbnail:
         break;
     }
@@ -799,7 +815,8 @@ DirtyBlocks dirtyBlocksFromRenderState(const RenderStateKey& previous,
      * derivation that cannot exist, so it gets the whole path and is told not
      * to use it as one.
      */
-    if (path == StagePath::Export || path == StagePath::Thumbnail) {
+    if (path == StagePath::Export || path == StagePath::FastExport
+        || path == StagePath::Thumbnail) {
         result.forced = true;
         result.reason = "render state is not modelled on this path";
         result.blocks = pathIds(path);

@@ -69,6 +69,11 @@ enum class StageBlock {
     ThumbnailRgb,
     ThumbnailLab,
     ThumbnailOutput,
+    RawBaseSource,
+    RawColor,
+    EarlyResize,
+    Denoise,
+    Finish,
     Count
 };
 
@@ -154,7 +159,15 @@ const std::vector<BlockMeta>& blockTable()
         {"thumbnail.whitebalance", "Thumbnail white balance",    RT_STAGE_REUSE_INPUT,  {"wb", "raw", "toneCurve"}},
         {"thumbnail.rgb",          "Thumbnail RGB processing",   RT_STAGE_REUSE_INPUT,  {"toneCurve", "rgbCurves", "colorToning", "blackwhite", "chmixer", "hsvequalizer", "filmSimulation", "icm"}},
         {"thumbnail.lab",          "Thumbnail Lab processing",   RT_STAGE_REUSE_INPUT,  {"labCurve", "sh", "localContrast", "vibrance", "epd", "softlight", "toneEqualizer", "colorappearance", "cg", "icm"}},
-        {"thumbnail.output",       "Thumbnail output",           RT_STAGE_RECOMPUTE,    {"icm"}}
+        {"thumbnail.output",       "Thumbnail output",           RT_STAGE_RECOMPUTE,    {"icm"}},
+        // Fast-export split of raw.base, plus the early resize and the finish
+        // sequence. The ids are the node ids the `-f` executor maps to its
+        // private stage methods.
+        {"raw.base.source",        "Base image source",          RT_STAGE_REUSE_OUTPUT, {"raw", "wb", "toneCurve", "spot", "dirpyrDenoise", "filmNegative", "retinex", "cg", "icm"}},
+        {"raw.color",              "Source colour conversion",   RT_STAGE_REUSE_INPUT,  {"filmNegative", "cg", "icm", "raw"}},
+        {"early.resize",           "Early resize",               RT_STAGE_REUSE_OUTPUT, {"resize", "crop", "icm", "prsharpening", "sharpening", "wavelet", "dirpyrDenoise", "epd", "dirpyrequalizer", "sh", "localContrast", "raw"}},
+        {"denoise",                "Denoise",                    RT_STAGE_REUSE_INPUT,  {"dirpyrDenoise", "icm", "raw"}},
+        {"finish",                 "Finish output",              RT_STAGE_RECOMPUTE,    {"locallab", "icm", "metadata"}}
     };
     return table;
 }
@@ -171,6 +184,7 @@ StageDomain domainFor(StagePath path, StageBlock block)
 {
     switch (path) {
     case StagePath::Export:
+    case StagePath::FastExport:
     case StagePath::Preview:
         return StageDomain::Full;
     case StagePath::Crop:
@@ -199,9 +213,11 @@ StageDomain domainFor(StagePath path, StageBlock block)
 
 StageConsumer consumerFor(StagePath path)
 {
-    // Only the export pipeline has to be bit-exact; the others feed a viewer
+    // Only the export pipelines have to be bit-exact; the others feed a viewer
     // or a thumbnail cache and may reuse approximate intermediate results.
-    return path == StagePath::Export ? StageConsumer::Exact : StageConsumer::Interactive;
+    return path == StagePath::Export || path == StagePath::FastExport
+               ? StageConsumer::Exact
+               : StageConsumer::Interactive;
 }
 
 using BlockPair = std::pair<StageBlock, StageBlock>;
@@ -269,6 +285,25 @@ PathDefinition definitionFor(StagePath path)
         });
         return {path, nodes, chain(nodes), {StageBlock::SourceSelect},
                 {StageBlock::OutputIcc}};
+    }
+    case StagePath::FastExport: {
+        // The `-f` pipeline: the raw core is split so denoise runs after the
+        // early resize, and the tail is one composite finish node. The order is
+        // fixed by the fast implementation; there is no parallelism.
+        const std::vector<StageBlock> nodes = {
+            StageBlock::SourceSelect,
+            StageBlock::RawPreprocess,
+            StageBlock::RawDemosaic,
+            StageBlock::RawBaseSource,
+            StageBlock::RawColor,
+            StageBlock::Analysis,
+            StageBlock::Transform,
+            StageBlock::EarlyResize,
+            StageBlock::Denoise,
+            StageBlock::Finish
+        };
+        return {path, nodes, chain(nodes), {StageBlock::SourceSelect},
+                {StageBlock::Finish}};
     }
     case StagePath::Preview: {
         // The preview full-frame path applies neither sharpening nor the
@@ -379,6 +414,8 @@ const char* stagePathName(StagePath path)
     switch (path) {
     case StagePath::Export:
         return "export";
+    case StagePath::FastExport:
+        return "fast_export";
     case StagePath::Preview:
         return "preview";
     case StagePath::Crop:

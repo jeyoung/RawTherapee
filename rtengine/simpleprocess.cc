@@ -157,9 +157,36 @@ static_assert(sizeof(EXPORT_NODE_IDS) / sizeof(EXPORT_NODE_IDS[0]) ==
                   EXPORT_NODE_COUNT,
               "the export executor must cover the canonical node inventory");
 
+/*
+ * Number and ids of the fast-export node inventory. The order is the one the
+ * `-f` pipeline has always used: the raw core split so denoise follows the
+ * early resize, then the composite finish. buildPipelineSpec(FastExport)
+ * supplies the same ids; this list is the executor's side of the contract.
+ */
+constexpr size_t FAST_EXPORT_NODE_COUNT = 10;
+
+const char* const FAST_EXPORT_NODE_IDS[] = {
+    "source.select", "raw.preprocess", "raw.demosaic", "raw.base.source",
+    "raw.color", "analysis", "transform", "early.resize", "denoise", "finish"
+};
+
+static_assert(sizeof(FAST_EXPORT_NODE_IDS) / sizeof(FAST_EXPORT_NODE_IDS[0]) ==
+                  FAST_EXPORT_NODE_COUNT,
+              "the fast-export executor must cover the fast node inventory");
+
 bool isExportNode(const std::string& id)
 {
     for (const char* known : EXPORT_NODE_IDS) {
+        if (id == known) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool isFastExportNode(const std::string& id)
+{
+    for (const char* known : FAST_EXPORT_NODE_IDS) {
         if (id == known) {
             return true;
         }
@@ -212,6 +239,70 @@ void logStageGraphActive(size_t nodes)
                  "export inventory\n",
                  nodes);
 }
+
+/* Report the fast plan once per process, for operations and evidence. */
+void logFastExportGraphActive(size_t nodes)
+{
+    static std::mutex mutex;
+    static bool logged = false;
+
+    std::lock_guard<std::mutex> lock(mutex);
+    if (logged) {
+        return;
+    }
+    logged = true;
+
+    std::fprintf(stderr,
+                 "stage-graph: fast-export active, %zu nodes executed from "
+                 "the fast_export inventory\n",
+                 nodes);
+}
+
+/*
+ * Profile one fast-export node as a whole.
+ *
+ * The node methods are host composites; any device sub-node they run records
+ * its own impl through stage::run()/ScopedProfile. This wrapper adds the
+ * missing per-node record, with impl=host, so a `-f` export emits one record
+ * per fast node under RT_STAGE_PROFILE. It is a no-op when profiling is off.
+ */
+class ScopedFastNodeProfile
+{
+public:
+    explicit ScopedFastNodeProfile(const char* stage)
+        : stage_(stage),
+          active_(stage::profiling_enabled()),
+          begin_(active_ ? std::chrono::steady_clock::now()
+                         : std::chrono::steady_clock::time_point())
+    {
+    }
+
+    ~ScopedFastNodeProfile()
+    {
+        if (!active_) {
+            return;
+        }
+
+        const auto end = std::chrono::steady_clock::now();
+        stage::StageRecord record;
+        record.stage = stage_;
+        record.impl = "host";
+        record.source = "host";
+        record.consumer = "exact";
+        record.elapsed_ns = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin_)
+                .count());
+        stage::profile(record);
+    }
+
+    ScopedFastNodeProfile(const ScopedFastNodeProfile&) = delete;
+    ScopedFastNodeProfile& operator=(const ScopedFastNodeProfile&) = delete;
+
+private:
+    const char* stage_;
+    bool active_;
+    std::chrono::steady_clock::time_point begin_;
+};
 
 /*
  * Run the end-of-process gamut node. The argument order is the one `run_gamut`
@@ -445,6 +536,13 @@ private:
         return true;
     }
 
+    /*
+     * Graph-driven form of the fast export pipeline. The spec carries the ten
+     * nodes in the fixed fast order and the executor maps each id to the same
+     * private method the hand-ordered path called. A plan that would skip a
+     * node is rejected before anything executes: this path has no stage buffer
+     * cache, so a skip would silently drop work.
+     */
     Imagefloat *fast_pipeline()
     {
         RT_PROFILE("proc::fast_pipeline", PROCESS_IMAGE);
@@ -455,22 +553,107 @@ private:
 
         pl = nullptr;
 
-        // The fast path keeps its own order: the early resize runs after the
-        // transform and before denoise, so it calls the same node methods in a
-        // different sequence rather than through the export graph.
-        if (!stage_source_select()) {
-            return nullptr;
+        const stage::StagePipelineSpec spec =
+            stage::buildPipelineSpec(stage::StagePath::FastExport);
+
+        if (spec.nodes.size() != FAST_EXPORT_NODE_COUNT) {
+            abortStageGraph("fast-export inventory", "unexpected node count");
         }
 
-        stage_raw_preprocess();
-        stage_raw_demosaic();
-        stage_raw_base_source();
-        stage_raw_color();
-        stage_analysis();
-        stage_transform();
-        stage_early_resize();
-        stage_denoise();
-        return stage_finish();
+        stage::StageGraph graph;
+        std::vector<size_t> node;
+        node.reserve(spec.nodes.size());
+
+        for (const auto& descriptor : spec.nodes) {
+            node.push_back(graph.addNode(descriptor.id, descriptor.reuse));
+        }
+
+        for (const auto& edge : spec.edges) {
+            size_t from = spec.nodes.size();
+            size_t to = spec.nodes.size();
+
+            for (size_t i = 0; i < spec.nodes.size(); ++i) {
+                if (spec.nodes[i].id == edge.first) {
+                    from = i;
+                }
+
+                if (spec.nodes[i].id == edge.second) {
+                    to = i;
+                }
+            }
+
+            assert(from < spec.nodes.size() && to < spec.nodes.size());
+            graph.connect(node[from], node[to]);
+        }
+
+        std::vector<size_t> order;
+
+        if (!graph.topologicalOrder(order) || order.size() != spec.nodes.size()) {
+            abortStageGraph("fast-export inventory", "graph is not acyclic");
+        }
+
+        const std::vector<stage::StageDecision> plan = graph.plan();
+
+        for (size_t index : order) {
+            const std::string& id = graph.node(index).name;
+
+            if (!isFastExportNode(id)) {
+                abortStageGraph(id.c_str(), "node has no executor");
+            }
+
+            if (plan[index].action == stage::StageAction::ReuseOutput) {
+                abortStageGraph(id.c_str(), "plan would skip the node");
+            }
+        }
+
+        for (size_t index : order) {
+            const std::string& id = graph.node(index).name;
+            ScopedFastNodeProfile node_profile(id.c_str());
+
+            if (!executeFastExportNode(id)) {
+                return nullptr;
+            }
+        }
+
+        logFastExportGraphActive(order.size());
+
+        return readyImg;
+    }
+
+    /*
+     * Run one fast-export node. The ids come from
+     * buildPipelineSpec(FastExport); an unknown id has already been rejected by
+     * fast_pipeline(), so this only maps a planned node to its method.
+     */
+    bool executeFastExportNode(const std::string& id)
+    {
+        if (id == "source.select") {
+            return stage_source_select();
+        } else if (id == "raw.preprocess") {
+            stage_raw_preprocess();
+        } else if (id == "raw.demosaic") {
+            stage_raw_demosaic();
+        } else if (id == "raw.base.source") {
+            stage_raw_base_source();
+        } else if (id == "raw.color") {
+            stage_raw_color();
+        } else if (id == "analysis") {
+            stage_analysis();
+        } else if (id == "transform") {
+            stage_transform();
+        } else if (id == "early.resize") {
+            stage_early_resize();
+        } else if (id == "denoise") {
+            stage_denoise();
+        } else if (id == "finish") {
+            readyImg = stage_finish();
+            return readyImg != nullptr;
+        } else {
+            assert(false);
+            return false;
+        }
+
+        return true;
     }
 
     /*
@@ -2438,8 +2621,9 @@ private:
 
     void stage_early_resize()
     {
-        // The fast pipeline has no outer stage timings, so time this stage here
-        // to keep it comparable with export.transform and export.finish.
+        // The fast executor records the node as early.resize. Keep the
+        // historical coarse scope too, so existing timing comparisons with
+        // export.transform and export.finish remain valid.
         stage::ScopedProfile profile("export.early_resize");
 
         procparams::ProcParams& params = job->pparams;

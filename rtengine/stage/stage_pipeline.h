@@ -27,17 +27,19 @@ namespace rtengine::stage
 {
 
 /*
- * Canonical description of the four image pipelines in the engine.
+ * Canonical description of the image pipelines in the engine.
  *
  * The specification is data only: it names the blocks each pipeline runs, the
  * order they run in, the spatial domain of the buffer they consume and the
- * consumer they serve. It does not execute anything. All four paths consume
- * it; see devnotes/perf/STAGE_PIPELINE.md for the inventory and the blocks
- * that could not be mapped.
+ * consumer they serve. It does not execute anything. Every path consumes it;
+ * see devnotes/perf/STAGE_PIPELINE.md for the inventory and the blocks that
+ * could not be mapped. Fast export is the `-f` variant of export: it keeps the
+ * export consumer contract but runs denoise after its early resize.
  */
 
 enum class StagePath {
     Export,
+    FastExport,
     Preview,
     Crop,
     Thumbnail
