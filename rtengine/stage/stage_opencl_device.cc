@@ -48,6 +48,7 @@
 #include <glibmm/module.h>
 
 #include "color.h"
+#include "settings.h"
 #include "rt_algo.h"
 #include "rt_math.h"
 #include "sleef.h"
@@ -531,6 +532,81 @@ bool find_device(const Api& api, const std::vector<cl_platform_id>& platforms,
     return false;
 }
 
+/*
+ * Match the user's selected device the way the classic backend does: a
+ * substring of name + vendor + version. Unlike find_device(), this searches
+ * every device type, because the selection can name a CPU device that the
+ * automatic order would otherwise displace with a GPU.
+ */
+bool find_selected_device(const Api& api,
+                          const std::vector<cl_platform_id>& platforms,
+                          const std::vector<PlatformHealth>& health,
+                          const std::string& preferred,
+                          SelectedDevice& result)
+{
+    assert(health.size() == platforms.size());
+
+    for (std::size_t index = 0; index < platforms.size(); ++index) {
+        if (health[index] != PlatformHealth::USABLE) {
+            continue;
+        }
+        const cl_platform_id platform = platforms[index];
+        cl_uint device_count = 0;
+        if (api.GetDeviceIDs(platform, CL_DEVICE_TYPE_ALL, 0, nullptr,
+                             &device_count) != CL_SUCCESS ||
+            device_count == 0) {
+            continue;
+        }
+        std::vector<cl_device_id> devices(device_count);
+        if (api.GetDeviceIDs(platform, CL_DEVICE_TYPE_ALL, device_count,
+                             devices.data(), nullptr) != CL_SUCCESS) {
+            continue;
+        }
+        for (cl_device_id device : devices) {
+            const std::string name = device_string(api, device, CL_DEVICE_NAME);
+            const std::string vendor =
+                device_string(api, device, CL_DEVICE_VENDOR);
+            const std::string version =
+                device_string(api, device, CL_DEVICE_VERSION);
+            const std::string haystack = name + " " + vendor + " " + version;
+            if (haystack.find(preferred) == std::string::npos) {
+                continue;
+            }
+
+            cl_device_type type = 0;
+            if (api.GetDeviceInfo(device, CL_DEVICE_TYPE, sizeof(type), &type,
+                                  nullptr) != CL_SUCCESS) {
+                continue;
+            }
+            result.platform = platform;
+            result.device = device;
+            result.cpu = (type & CL_DEVICE_TYPE_CPU) != 0;
+            std::size_t name_size = 0;
+            if (api.GetPlatformInfo(platform, CL_PLATFORM_NAME, 0, nullptr,
+                                    &name_size) == CL_SUCCESS &&
+                name_size > 0) {
+                std::string platform_name(name_size, '\0');
+                if (api.GetPlatformInfo(platform, CL_PLATFORM_NAME, name_size,
+                                        &platform_name[0], &name_size) ==
+                    CL_SUCCESS) {
+                    result.platform_name.assign(platform_name.c_str());
+                }
+            }
+            result.device_name = name;
+            result.driver = device_string(api, device, CL_DRIVER_VERSION);
+            result.version = version;
+            cl_ulong memory = 0;
+            if (api.GetDeviceInfo(device, CL_DEVICE_GLOBAL_MEM_SIZE,
+                                  sizeof(memory), &memory,
+                                  nullptr) == CL_SUCCESS) {
+                result.global_memory = memory;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
 const SelectedDevice* selected_device(std::string* reason)
 {
     static std::once_flag once;
@@ -551,6 +627,27 @@ const SelectedDevice* selected_device(std::string* reason)
         }
         const PlatformProbe probe = probe_platforms(backend.api, platforms);
         icd_note() = describe_skipped_platforms(probe, platforms.size());
+
+        /*
+         * An explicit device selection wins over the automatic order, as it
+         * does in the classic backend. A selected CPU device still requires
+         * the CPU opt-in, because it is not an accelerated path.
+         */
+        if (settings != nullptr && !settings->openCLDevice.empty()) {
+            if (!find_selected_device(backend.api, platforms, probe.health,
+                                      settings->openCLDevice, choice)) {
+                failure = "selected OpenCL device not found: " +
+                          settings->openCLDevice;
+                return;
+            }
+            if (choice.cpu && !env_truthy("RT_OPENCL_ALLOW_CPU")) {
+                failure = "the selected OpenCL device is a CPU; set "
+                          "RT_OPENCL_ALLOW_CPU=1 to use it";
+                return;
+            }
+            available = true;
+            return;
+        }
 
         /* A GPU or accelerator is used unconditionally. A CPU device is the
          * last resort and needs the explicit opt-in the classic backend also
@@ -1850,6 +1947,34 @@ private:
         }
 
         std::lock_guard<std::recursive_mutex> lock(env_->queue_mutex);
+        /*
+         * A download is transactional: read into staging and commit only
+         * after every plane succeeds. A later-plane readback error would
+         * otherwise leave the caller's host image partially processed, and
+         * the CPU fallback would then run on mixed input. Uploads read the
+         * const host buffer and need no staging.
+         */
+        std::vector<unsigned char> staging;
+        unsigned char* destination =
+            static_cast<unsigned char*>(host.data);
+        if (!to_device) {
+            /*
+             * Cover the whole read region even when a view's plane pitch is
+             * not a multiple of its row pitch. The destination layout itself
+             * is preserved by the per-row commit below.
+             */
+            const std::size_t staging_bytes =
+                (host.planes > 0 ? static_cast<std::size_t>(host.planes - 1) *
+                                       host.plane_pitch
+                                 : 0) +
+                static_cast<std::size_t>(host.height) * host.row_pitch;
+            staging.assign(std::max(
+                               staging_bytes,
+                               static_cast<std::size_t>(host.plane_pitch) *
+                                   host.planes),
+                           0);
+            destination = staging.data();
+        }
         for (std::uint32_t plane = 0; plane < host.planes; ++plane) {
             /*
              * Rect origins are in rows, not bytes: a plane starts at row
@@ -1863,7 +1988,7 @@ private:
             const std::size_t host_origin[3] = {0, 0, 0};
             const std::size_t region[3] = {
                 row_bytes, static_cast<std::size_t>(host.height), 1};
-            void* host_plane = static_cast<unsigned char*>(host.data) +
+            void* host_plane = destination +
                                static_cast<std::size_t>(plane) * host.plane_pitch;
 
             const cl_int error = to_device
@@ -1877,6 +2002,23 @@ private:
                       host.row_pitch, 0, host_plane, 0, nullptr, nullptr);
             if (error != CL_SUCCESS) {
                 return RT_STAGE_ERROR;
+            }
+        }
+        if (!to_device) {
+            /*
+             * Commit only the rows the readback covered. A full-plane copy
+             * would overwrite the pixels around a sub-rectangle view with the
+             * staging's zero fill.
+             */
+            for (std::uint32_t plane = 0; plane < host.planes; ++plane) {
+                for (std::uint32_t row = 0; row < host.height; ++row) {
+                    const std::size_t offset =
+                        static_cast<std::size_t>(plane) * host.plane_pitch +
+                        static_cast<std::size_t>(row) * host.row_pitch;
+                    std::memcpy(
+                        static_cast<unsigned char*>(host.data) + offset,
+                        staging.data() + offset, row_bytes);
+                }
             }
         }
         return RT_STAGE_OK;
