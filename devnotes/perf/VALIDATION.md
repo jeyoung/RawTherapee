@@ -10,11 +10,12 @@ is recorded below.
 
 ## Artefact
 
-The current package is the residual-cleanup build from `e42d991d2`:
+The current package is the adapter-handler consolidation build from
+`4071906f7`:
 
 ```
-rawtherapee-graph-5.13-781-ge42d991d2_5.13+git13802.e42d991d2-1_amd64.deb
-sha256 3b1ed54edfc0b8edc4dbc7675397de463fcae77e0cf8721141741440f8b0fe58
+rawtherapee-graph-5.13-785-g4071906f7_5.13+git13806.4071906f7-1_amd64.deb
+sha256 587a5b699cd4adc07c9eeb3e25c3ef46b6e39fd62da799bb1668e946da6d73b4
 ```
 
 It passed the install, `--list-formats` (36 entries), neutral export and Xvfb

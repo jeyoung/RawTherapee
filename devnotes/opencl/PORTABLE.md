@@ -80,9 +80,9 @@ driver and an ICD loader must be installed separately.
 - Built on Debian 12: glibc 2.36, GCC 12, `-mtune=generic`.
 - Requires Debian 12 or newer. Debian 13 t64 packages are accepted through
   their `Provides` entries.
-- 2026-11-06, package `5.13+git13802.e42d991d2-1` from `e42d991d2`
+- 2026-11-06, package `5.13+git13806.4071906f7-1` from `4071906f7`
   (sha256
-  `3b1ed54edfc0b8edc4dbc7675397de463fcae77e0cf8721141741440f8b0fe58`):
+  `587a5b699cd4adc07c9eeb3e25c3ef46b6e39fd62da799bb1668e946da6d73b4`):
   fresh Debian 12 and Debian 13 containers both passed
   `apt-get install -y ./...deb`; Debian 13's t64 packages satisfied the
   pre-t64 `Depends` through `Provides`, with no workaround. `--list-formats`
@@ -93,7 +93,9 @@ driver and an ICD loader must be installed separately.
   stayed alive to the 20 s timeout on both (exit 124, no stderr).
   `--gpu-test` and `--gpu-test-monitor` were not run: the containers have no
   GPU.
-- The previous packages, `5.13+git13800.ade38b7b2-1` (sha256
+- The previous packages, `5.13+git13802.e42d991d2-1` (sha256
+  `3b1ed54edfc0b8edc4dbc7675397de463fcae77e0cf8721141741440f8b0fe58`),
+  `5.13+git13800.ade38b7b2-1` (sha256
   `12d8ce6823c93566d245ecd49d7ff0f6cb41693389e092d35eaecee34ebb8647`),
   `5.13+git13794.a78e6509a-1` (sha256
   `b4656385486e59f60bf79030e01080fe43e1d7bcd06f71bc3d12c9fccc7fceef`),

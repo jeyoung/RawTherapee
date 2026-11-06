@@ -17,8 +17,9 @@ pushed from 2026-10-29 on.
 
 - Repository: `$REPO`
 - Worktree: the main checkout, branch `perf-graph`, clean and in sync with
-  `origin/perf-graph`. The substantive code tip is `e42d991d2` (the residual
-  cleanup); later commits are documentation and package records. All pushed ranges were scanned per the publication gate. Block 4
+  `origin/perf-graph`. The substantive code tip is `4071906f7` (the adapter
+  handler consolidation); later commits are documentation and package
+  records. All pushed ranges were scanned per the publication gate. Block 4
   is complete: the device gate is green and the portable package is validated
   on Debian 12 and 13; see the progress log and the decisions below.
 - Stage C landed 2026-10-31: `local.adjustments` local sharpening (undamped
@@ -74,22 +75,22 @@ pushed from 2026-10-29 on.
 ### Validated artefact
 
 ```
-build/portable/rawtherapee-graph-5.13-781-ge42d991d2_5.13+git13802.e42d991d2-1_amd64.deb
-sha256 3b1ed54edfc0b8edc4dbc7675397de463fcae77e0cf8721141741440f8b0fe58
+build/portable/rawtherapee-graph-5.13-785-g4071906f7_5.13+git13806.4071906f7-1_amd64.deb
+sha256 587a5b699cd4adc07c9eeb3e25c3ef46b6e39fd62da799bb1668e946da6d73b4
 ```
 
-Built 2026-11-06 from `e42d991d2` (the residual cleanup; later commits are
-documentation) with `tools/build-rt.sh portable`. Validated the same day in
-fresh Debian 12 and Debian 13 containers, both PASS: install,
+Built 2026-11-06 from `4071906f7` (the adapter handler consolidation; later
+commits are documentation) with `tools/build-rt.sh portable`. Validated the
+same day in fresh Debian 12 and Debian 13 containers, both PASS: install,
 `--list-formats` (36 entries, including PEF/NEF/CR2/ARW, TIFF and JPEG XL),
 neutral 16-bit CPU export against the host CLI with the packaged data
 directory (PAE 0 LSB16, 0 of 30,419,712 samples, both distributions) and a
 GUI smoke test under Xvfb (20 s timeout, exit 124). `--gpu-test` and
 `--gpu-test-monitor` were not run: the containers have no GPU. The packaged
 binary run on the host also matches the host build with the same data
-(AE=0). The previous packages from `ade38b7b2`, `a78e6509a`, `ee73df905`,
-`f1e0e86a6`, `a262fab23`, `596b6fed9`, `6bc636307`, `3babc4b48` and
-`2dccc3ee5` passed the same rows.
+(AE=0). The previous packages from `e42d991d2`, `ade38b7b2`, `a78e6509a`,
+`ee73df905`, `f1e0e86a6`, `a262fab23`, `596b6fed9`, `6bc636307`,
+`3babc4b48` and `2dccc3ee5` passed the same rows.
 
 ## Progress log — resumed 2026-10-28 (Block 4 completion)
 
