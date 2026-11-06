@@ -96,6 +96,29 @@ if [ "$skip_stage_tests" -eq 0 ]; then
             fail "$target (see $report/$target.log)"
         fi
     done
+    # Host regressions omitted from the stage list above. Each uses its
+    # documented invocation; a build or run failure is a gate failure, not a
+    # skip. The AMaZE regression needs the bound from
+    # devnotes/perf/AMAZE_THREAD_PARITY.md, and the working-TRC test writes
+    # only inside its own scratch directory.
+    for target in amaze-tile-parity-test fast-preview-test \
+            preview-base-cache-test working-trc-setup-test; do
+        case "$target" in
+            amaze-tile-parity-test)
+                run_cmd=(env OMP_THREAD_LIMIT=8 "$build_dir/rtengine/$target") ;;
+            working-trc-setup-test)
+                mkdir -p "$report/working-trc-setup"
+                run_cmd=("$build_dir/rtengine/$target" "$report/working-trc-setup") ;;
+            *)
+                run_cmd=("$build_dir/rtengine/$target") ;;
+        esac
+        if cmake --build "$build_dir" --target "$target" -j 6 >"$report/$target.build.log" 2>&1 \
+            && "${run_cmd[@]}" >"$report/$target.log" 2>&1; then
+            pass "$target"
+        else
+            fail "$target (see $report/$target.log)"
+        fi
+    done
 else
     skip "stage tests (--skip-stage-tests)"
 fi
