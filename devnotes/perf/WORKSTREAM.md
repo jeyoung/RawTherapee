@@ -93,6 +93,21 @@ binary run on the host also matches the host build with the same data
 
 ## Progress log — resumed 2026-10-28 (Block 4 completion)
 
+- **Adapter handler consolidation (2026-11-06)**: the preview, crop, export,
+  fast-export and thumbnail adapters now own one `StageHandlerRegistry` each.
+  Plan validation checks every non-folded contract node against the registry,
+  execution dispatches through the same lookup, and a miss aborts in release.
+  The crop no longer has `CROP_STAGE_IDS`, `CropStage`, `cropStageOrder`,
+  `cropRunsOf` or `validateCropStageIds`; it executes the graph plan order,
+  which is the contract order (`analysis` before `raw.base`). Export and fast
+  export no longer have `EXPORT_NODE_IDS`/`FAST_EXPORT_NODE_IDS`, their counts
+  or `validateExecutorIds`. Thumbnail keeps only a small per-entry policy
+  subset; every policy id is checked against the registry before planning.
+  Evidence: full smoke suite all PASS (including stage-abi, thumbnail/crop
+  parity and thread determinism), `--quick` 84/0, `--stage-device` 73/0/0,
+  `--formats` PASS.
+
+
 - **Architecture-review cleanup (2026-11-06)**: PR #39's R1-R5 and the F4
   audit follow-ups are addressed. **R1**: `readbackAll()` stages every
   writable descriptor and commits only after all succeed; rgb.proc,
