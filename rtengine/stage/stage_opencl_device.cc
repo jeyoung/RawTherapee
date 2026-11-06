@@ -30,6 +30,8 @@
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
+#include <initializer_list>
+#include <utility>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -2070,7 +2072,7 @@ private:
              * staging's zero fill.
              */
             for (std::uint32_t plane = 0; plane < host.planes; ++plane) {
-                for (std::uint32_t row = 0; row < host.height; ++row) {
+                for (std::int32_t row = 0; row < host.height; ++row) {
                     const std::size_t offset =
                         static_cast<std::size_t>(plane) * host.plane_pitch +
                         static_cast<std::size_t>(row) * host.row_pitch;
@@ -2127,6 +2129,96 @@ private:
     bool ok_ = false;
 };
 
+/*
+ * Stage one descriptor's readback in a private buffer.
+ *
+ * `readback()` commits a successful descriptor immediately. A node that writes
+ * several descriptors would therefore leave its host input partly processed
+ * when a later descriptor fails, and the host fallback would run the whole
+ * body again on mixed input. `readbackAll()` stages every descriptor first and
+ * commits only after all of them succeeded.
+ */
+struct StagedReadback {
+    RtStageBuffer view{};
+    std::vector<unsigned char> storage;
+};
+
+bool stageReadback(const RtStageBuffer& host, StagedReadback& staged,
+                   const char* what, std::string& error)
+{
+    if (host.data == nullptr || host.width <= 0 || host.height <= 0 ||
+        host.planes == 0) {
+        error = std::string(what) + " readback has an invalid host buffer";
+        return false;
+    }
+    const std::size_t row_bytes = host_row_bytes(host);
+    if (row_bytes == 0 || host.row_pitch < row_bytes) {
+        error = std::string(what) + " readback has an invalid row pitch";
+        return false;
+    }
+    const std::size_t rows = static_cast<std::size_t>(host.height) *
+                             host.row_pitch;
+    std::size_t bytes = rows;
+    if (host.planes > 1) {
+        if (host.plane_pitch < rows) {
+            error = std::string(what) + " readback has an invalid plane pitch";
+            return false;
+        }
+        bytes = static_cast<std::size_t>(host.planes - 1) * host.plane_pitch +
+                rows;
+    }
+    staged.storage.assign(bytes, 0);
+    staged.view = host;
+    staged.view.data = staged.storage.data();
+    return true;
+}
+
+void commitReadback(const RtStageBuffer& host, const StagedReadback& staged)
+{
+    /*
+     * Copy only the rows the device covered, not the whole padded region.
+     * The staging buffer's padding is zero-filled; a whole-region copy would
+     * overwrite host padding, and for a sub-rectangle view that padding is
+     * neighbouring image data. This mirrors the per-row commit in transfer().
+     */
+    copyReadbackRows(host, staged.storage.data());
+}
+using ReadbackTransfer = std::pair<StageDeviceBufferPtr, RtStageBuffer>;
+
+/*
+ * Transactional multi-descriptor readback. All transfers are staged before any
+ * host buffer is modified. A failure leaves every host input untouched, which
+ * is what the host fallback needs.
+ */
+RtStageStatus readbackAll(
+    OpenCLResidency& residency,
+    std::initializer_list<ReadbackTransfer> transfers, const char* what,
+    std::string& error)
+{
+    std::vector<StagedReadback> staged;
+    staged.reserve(transfers.size());
+
+    for (const ReadbackTransfer& transfer : transfers) {
+        StagedReadback copy;
+        if (!stageReadback(transfer.second, copy, what, error)) {
+            return RT_STAGE_INVALID;
+        }
+        const RtStageStatus status =
+            residency.readback(transfer.first, copy.view);
+        if (status != RT_STAGE_OK) {
+            error = std::string(what) + " readback failed";
+            return status;
+        }
+        staged.push_back(std::move(copy));
+    }
+
+    std::size_t index = 0;
+    for (const ReadbackTransfer& transfer : transfers) {
+        commitReadback(transfer.second, staged[index++]);
+    }
+    return RT_STAGE_OK;
+}
+
 class OpenCLSubmission final : public StageSubmission
 {
 public:
@@ -2172,6 +2264,7 @@ public:
             env_->api->ReleaseEvent(event_);
             event_ = nullptr;
             if (error != CL_SUCCESS) {
+                note_ = "device wait failed";
                 return finish(RT_STAGE_ERROR);
             }
         }
@@ -2179,10 +2272,16 @@ public:
             const RtStageStatus status =
                 residency_->readback(output_, host_output_);
             if (status != RT_STAGE_OK) {
+                note_ = "device readback failed";
                 return finish(status);
             }
         }
         return finish(RT_STAGE_OK);
+    }
+
+    std::string note() const override
+    {
+        return note_;
     }
 
     StageEventStatus poll() override
@@ -2230,6 +2329,7 @@ private:
     }
 
     std::shared_ptr<WorkingSetReservation> reservation_;
+    std::string note_;
     std::shared_ptr<OpenCLEnv> env_;
     cl_event event_ = nullptr;
     std::vector<cl_mem> scratch_;
@@ -3101,12 +3201,12 @@ RtStageStatus run_rgb_proc(const std::shared_ptr<OpenCLEnv>& env,
         return RT_STAGE_ERROR;
     }
 
-    for (int plane = 0; plane < 3; ++plane) {
-        if (residency->readback(dst_devices[plane], plane_view(dst, plane)) !=
-            RT_STAGE_OK) {
-            error = "rgb.proc readback failed";
-            return RT_STAGE_ERROR;
-        }
+    if (readbackAll(*residency,
+                    {{dst_devices[0], plane_view(dst, 0)},
+                     {dst_devices[1], plane_view(dst, 1)},
+                     {dst_devices[2], plane_view(dst, 2)}},
+                    "rgb.proc", error) != RT_STAGE_OK) {
+        return RT_STAGE_ERROR;
     }
 
     return RT_STAGE_OK;
@@ -11518,19 +11618,18 @@ RtStageStatus run_lab_wavelet(const std::shared_ptr<OpenCLEnv>& env,
         }
     }
 
-    if (residency->readback(l_device, plane_view(lab, 0)) != RT_STAGE_OK) {
-        error = "lab.wavelet L readback failed";
-        return RT_STAGE_FALLBACK;
-    }
-
     if (wavelet_ab) {
-        if (residency->readback(plane_a_device, plane_view(lab, 1)) !=
-                RT_STAGE_OK ||
-            residency->readback(plane_b_device, plane_view(lab, 2)) !=
-                RT_STAGE_OK) {
-            error = "lab.wavelet chroma readback failed";
+        if (readbackAll(*residency,
+                        {{l_device, plane_view(lab, 0)},
+                         {plane_a_device, plane_view(lab, 1)},
+                         {plane_b_device, plane_view(lab, 2)}},
+                        "lab.wavelet", error) != RT_STAGE_OK) {
             return RT_STAGE_FALLBACK;
         }
+    } else if (readbackAll(*residency,
+                           {{l_device, plane_view(lab, 0)}}, "lab.wavelet",
+                           error) != RT_STAGE_OK) {
+        return RT_STAGE_FALLBACK;
     }
     if (!clarity_active && wavelet_chroma && !wavelet_final) {
         /*
@@ -11769,12 +11868,12 @@ RtStageStatus run_framing(const std::shared_ptr<OpenCLEnv>& env,
         return RT_STAGE_ERROR;
     }
 
-    for (int plane = 0; plane < 3; ++plane) {
-        if (residency->readback(dst_devices[plane], plane_view(dst, plane)) !=
-            RT_STAGE_OK) {
-            error = "framing readback failed";
-            return RT_STAGE_ERROR;
-        }
+    if (readbackAll(*residency,
+                    {{dst_devices[0], plane_view(dst, 0)},
+                     {dst_devices[1], plane_view(dst, 1)},
+                     {dst_devices[2], plane_view(dst, 2)}},
+                    "framing", error) != RT_STAGE_OK) {
+        return RT_STAGE_ERROR;
     }
 
     return RT_STAGE_OK;
@@ -11936,12 +12035,12 @@ RtStageStatus run_crop(const std::shared_ptr<OpenCLEnv>& env,
         return RT_STAGE_ERROR;
     }
 
-    for (int plane = 0; plane < 3; ++plane) {
-        if (residency->readback(dst_devices[plane], plane_view(dst, plane)) !=
-            RT_STAGE_OK) {
-            error = "crop readback failed";
-            return RT_STAGE_ERROR;
-        }
+    if (readbackAll(*residency,
+                    {{dst_devices[0], plane_view(dst, 0)},
+                     {dst_devices[1], plane_view(dst, 1)},
+                     {dst_devices[2], plane_view(dst, 2)}},
+                    "crop", error) != RT_STAGE_OK) {
+        return RT_STAGE_ERROR;
     }
 
     return RT_STAGE_OK;
@@ -12743,12 +12842,9 @@ RtStageStatus run_raw_preprocess(
         error = "raw.preprocess did not complete";
         return RT_STAGE_ERROR;
     }
-    if (residency->readback(image_device, image) != RT_STAGE_OK) {
-        error = "raw.preprocess image readback failed";
-        return RT_STAGE_ERROR;
-    }
-    if (residency->readback(max_device, row_max) != RT_STAGE_OK) {
-        error = "raw.preprocess row-max readback failed";
+    if (readbackAll(*residency,
+                    {{image_device, image}, {max_device, row_max}},
+                    "raw.preprocess", error) != RT_STAGE_OK) {
         return RT_STAGE_ERROR;
     }
 
@@ -12924,10 +13020,11 @@ RtStageStatus run_raw_demosaic(
         error = "raw.demosaic did not complete";
         return RT_STAGE_ERROR;
     }
-    if (residency->readback(red_device, *planes[1]) != RT_STAGE_OK ||
-        residency->readback(green_device, *planes[2]) != RT_STAGE_OK ||
-        residency->readback(blue_device, *planes[3]) != RT_STAGE_OK) {
-        error = "raw.demosaic readback failed";
+    if (readbackAll(*residency,
+                    {{red_device, *planes[1]},
+                     {green_device, *planes[2]},
+                     {blue_device, *planes[3]}},
+                    "raw.demosaic", error) != RT_STAGE_OK) {
         return RT_STAGE_ERROR;
     }
 
@@ -15134,13 +15231,12 @@ RtStageStatus run_lab_sharpening(const std::shared_ptr<OpenCLEnv>& env,
         }
     }
 
-    const RtStageStatus readback_l = residency->readback(l_device, luminance);
-    const RtStageStatus readback_a = residency->readback(a_device, a);
-    const RtStageStatus readback_b = residency->readback(b_device, b);
+    const RtStageStatus readback_status =
+        readbackAll(*residency,
+                    {{l_device, luminance}, {a_device, a}, {b_device, b}},
+                    "lab.sharpening", error);
     release_scratch();
-    if (readback_l != RT_STAGE_OK || readback_a != RT_STAGE_OK ||
-        readback_b != RT_STAGE_OK) {
-        error = "lab.sharpening plane readback failed";
+    if (readback_status != RT_STAGE_OK) {
         return RT_STAGE_ERROR;
     }
 

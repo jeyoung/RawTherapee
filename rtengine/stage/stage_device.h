@@ -28,6 +28,15 @@ enum class StageDeviceType {
 
 const char* to_string(StageDeviceType type);
 
+/*
+ * Copy a staged readback into a host buffer row by row.
+ *
+ * Only the bytes covered by the descriptor are copied, so host padding and
+ * the pixels around a sub-rectangle view are preserved. `source` has the same
+ * row and plane pitches as `host`.
+ */
+void copyReadbackRows(const RtStageBuffer& host, const unsigned char* source);
+
 struct StageCapabilities {
     bool deterministic = false;
     bool full_precision = false;
@@ -64,6 +73,16 @@ public:
 
     /* Time from submission to the last observed completion. */
     virtual std::uint64_t elapsed_ns() const = 0;
+
+    /*
+     * Why the submission failed, or empty on success. A queue event carries
+     * its own note; this accessor lets an asynchronous submission report a
+     * wait or readback failure that happened after submit() returned.
+     */
+    virtual std::string note() const
+    {
+        return {};
+    }
 };
 
 /*
@@ -315,6 +334,12 @@ struct StageExecution {
     StageDeviceType device = StageDeviceType::NONE;
     /* True when the kernel was submitted and completed asynchronously. */
     bool asynchronous = false;
+    /*
+     * Why the device path was declined, copied from the queue event. Empty
+     * after a successful device execution and on the CPU device. The caller
+     * classifies it into a stable profile category.
+     */
+    std::string note;
 };
 
 class StageContext

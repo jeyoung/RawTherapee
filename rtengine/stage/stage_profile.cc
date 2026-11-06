@@ -79,10 +79,12 @@ void profile(const StageRecord& record)
     }
     std::fprintf(file,
                  "{\"stage\":\"%s\",\"impl\":\"%s\",\"source\":\"%s\","
-                 "\"consumer\":\"%s\",\"ns\":%llu,\"width\":%d,\"height\":%d,"
-                 "\"threads\":%d,\"cache_hit\":%u,\"input_hash\":\"%016llx\","
-                 "\"output_hash\":\"%016llx\"}\n",
+                 "\"consumer\":\"%s\",\"fallback\":\"%s\","
+                 "\"diagnostic\":\"%s\",\"ns\":%llu,\"width\":%d,"
+                 "\"height\":%d,\"threads\":%d,\"cache_hit\":%u,"
+                 "\"input_hash\":\"%016llx\",\"output_hash\":\"%016llx\"}\n",
                  record.stage, record.impl, record.source, record.consumer,
+                 record.fallback, record.diagnostic,
                  static_cast<unsigned long long>(record.elapsed_ns), record.width,
                  record.height, record.threads, record.cache_hit,
                  static_cast<unsigned long long>(record.input_hash),

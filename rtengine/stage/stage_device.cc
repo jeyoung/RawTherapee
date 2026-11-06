@@ -128,6 +128,27 @@ bool stage_buffer_layout(const StageBufferShape& shape, std::size_t& row_pitch,
     return true;
 }
 
+void copyReadbackRows(const RtStageBuffer& host, const unsigned char* source)
+{
+    if (host.data == nullptr || source == nullptr || host.width <= 0 ||
+        host.height <= 0 || host.planes == 0) {
+        return;
+    }
+    const std::size_t row_bytes = stage::row_bytes(host);
+    if (row_bytes == 0 || host.row_pitch < row_bytes) {
+        return;
+    }
+    for (std::uint32_t plane = 0; plane < host.planes; ++plane) {
+        for (std::int32_t row = 0; row < host.height; ++row) {
+            const std::size_t offset =
+                static_cast<std::size_t>(plane) * host.plane_pitch +
+                static_cast<std::size_t>(row) * host.row_pitch;
+            std::memcpy(static_cast<unsigned char*>(host.data) + offset,
+                        source + offset, row_bytes);
+        }
+    }
+}
+
 const char* to_string(StageDeviceType type)
 {
     switch (type) {
@@ -351,6 +372,13 @@ RtStageStatus StageContext::execute(const StageRequest& request,
         StageEvent event = context_queue.submit(request, nullptr);
         const RtStageStatus status = context_queue.wait(event);
         const auto end = std::chrono::steady_clock::now();
+        std::string device_note = event.note;
+        if (device_note.empty() && event.submission) {
+            device_note = event.submission->note();
+        }
+        if (status != RT_STAGE_OK && device_note.empty()) {
+            device_note = "device execution failed";
+        }
         if (status == RT_STAGE_OK) {
             /*
              * Synchronous device branches construct their event directly and
@@ -371,13 +399,27 @@ RtStageStatus StageContext::execute(const StageRequest& request,
             if (execution != nullptr) {
                 execution->device = event.device;
                 execution->asynchronous = event.asynchronous;
+                execution->note = device_note;
             }
             return status;
+        }
+
+        /*
+         * The device attempt failed. Keep its note so the host fallback can
+         * publish the device cause; the host event below must not clear it.
+         */
+        if (execution != nullptr) {
+            execution->device = event.device;
+            execution->asynchronous = event.asynchronous;
+            execution->note = device_note;
         }
     }
 
     auto program = compile(request, nullptr);
     if (!program) {
+        if (execution != nullptr) {
+            execution->note = "program compilation failed";
+        }
         return RT_STAGE_FALLBACK;
     }
 
@@ -392,6 +434,9 @@ RtStageStatus StageContext::execute(const StageRequest& request,
     if (execution != nullptr) {
         execution->device = event.device;
         execution->asynchronous = event.asynchronous;
+        if (execution->note.empty()) {
+            execution->note = event.note;
+        }
     }
     return status;
 }

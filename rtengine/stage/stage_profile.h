@@ -14,6 +14,9 @@ struct StageRecord {
     const char* impl = "";
     const char* source = "";
     const char* consumer = "";
+    /* Stable fallback category and bounded diagnostic; empty on success. */
+    const char* fallback = "";
+    const char* diagnostic = "";
     uint64_t elapsed_ns = 0;
     uint64_t input_hash = 0;
     uint64_t output_hash = 0;

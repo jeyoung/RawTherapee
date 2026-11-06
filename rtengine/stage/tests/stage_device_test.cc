@@ -65,8 +65,54 @@ void fill(const RtStageBuffer& buffer)
 
 } // namespace
 
+void testCopyReadbackRows()
+{
+    constexpr int width = 5;
+    constexpr int height = 3;
+    constexpr std::size_t row_pitch = 32;
+    constexpr std::size_t plane_pitch = row_pitch * height;
+
+    std::vector<unsigned char> host_bytes(plane_pitch, 0xAA);
+    std::vector<unsigned char> source_bytes(plane_pitch, 0x00);
+    for (int row = 0; row < height; ++row) {
+        for (int column = 0; column < width * 4; ++column) {
+            source_bytes[static_cast<std::size_t>(row) * row_pitch + column] =
+                static_cast<unsigned char>(row * 16 + column + 1);
+        }
+    }
+
+    RtStageBuffer host{};
+    host.size = sizeof(RtStageBuffer);
+    host.data = host_bytes.data();
+    host.width = width;
+    host.height = height;
+    host.row_pitch = row_pitch;
+    host.plane_pitch = plane_pitch;
+    host.planes = 1;
+    host.format = RT_STAGE_F32;
+
+    rtengine::stage::copyReadbackRows(host, source_bytes.data());
+
+    for (int row = 0; row < height; ++row) {
+        const std::size_t base = static_cast<std::size_t>(row) * row_pitch;
+        for (int column = 0; column < width * 4; ++column) {
+            check(host_bytes[base + column] == source_bytes[base + column],
+                  "copied row bytes match the staged source");
+        }
+        for (std::size_t column = width * 4; column < row_pitch; ++column) {
+            check(host_bytes[base + column] == 0xAA,
+                  "readback leaves host row padding untouched");
+        }
+    }
+
+    rtengine::stage::copyReadbackRows(RtStageBuffer{}, nullptr);
+    check(true, "an empty readback is ignored");
+}
+
 int main()
 {
+    testCopyReadbackRows();
+
     using namespace rtengine::stage;
 
     /* CPU device and its guarantees. */

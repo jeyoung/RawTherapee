@@ -635,6 +635,25 @@ builtin on the host queue and `stage::run()` records `impl=host`,
 `source=device-fallback`; a device pass is never mixed with a host pass in one
 node call.
 
+A fallback record also carries `fallback` and `diagnostic`. The category is
+stable (`memory` for a residency or working-set refusal, `unsupported` for a
+refused configuration, `device-unavailable` for a missing or disabled device,
+`device-error` for a launch or readback failure); the diagnostic is the
+queue's note bounded to 160 printable characters. The category distinguishes
+the three recovery causes without changing the `impl=host` attribution.
+
+Readback is transactional per node, not only per descriptor. `readbackAll()`
+stages every writable descriptor of rgb.proc, lab.wavelet, framing, crop,
+raw.preprocess, raw.demosaic and lab.sharpening before it commits any host
+plane; a failure on the second or third transfer therefore leaves the host
+input untouched for the fallback body. The commit copies only the covered row
+bytes, so host row padding and the pixels around a sub-rectangle view are not
+overwritten. A single-descriptor node keeps the existing one-descriptor
+transaction. An asynchronous wait or readback failure carries its note through
+`StageSubmission::note()` and is published as `device-error`; the
+`working.trc` tone readback writes the context-owned `firstPass_`, not the
+caller's Lab buffer, so it has no partial-commit path.
+
 The device supports:
 
 - `method=usm` with any edges-only and halo-control configuration,
