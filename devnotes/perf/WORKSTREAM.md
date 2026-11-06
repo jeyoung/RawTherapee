@@ -74,12 +74,12 @@ pushed from 2026-10-29 on.
 ### Validated artefact
 
 ```
-build/portable/rawtherapee-graph-5.13-765-gf1e0e86a6_5.13+git13786.f1e0e86a6-1_amd64.deb
-sha256 fa2fb3b5904cdb51d84a1a397c8e5ca7bda87fc2374bc5e476ebbbf7314302fa
+build/portable/rawtherapee-graph-5.13-769-gee73df905_5.13+git13790.ee73df905-1_amd64.deb
+sha256 7f0ecd576e68da9cda58dd2d0e92e3ede175b5821ff2f63e1d5bd46531bbfe06
 ```
 
-Built 2026-11-06 from `f1e0e86a6` (the architecture-review fixes; later
-commits are documentation) with `tools/build-rt.sh portable`. Validated the same day in
+Built 2026-11-06 from `ee73df905` (the F6 working-set admission; later commits
+are documentation) with `tools/build-rt.sh portable`. Validated the same day in
 fresh Debian 12 and Debian 13 containers, both PASS: install,
 `--list-formats` (35 entries, including PEF/NEF/CR2/ARW, TIFF and JPEG XL),
 neutral 16-bit CPU export against the host CLI with the packaged data
@@ -87,7 +87,7 @@ directory (PAE 0 LSB16, 0 of 30,419,712 samples, both distributions) and a
 GUI smoke test under Xvfb (20 s timeout, exit 124). `--gpu-test` and
 `--gpu-test-monitor` were not run: the containers have no GPU. The packaged
 binary run on the host also matches the host build with the same data
-(AE=0). The previous packages from `a262fab23`, `596b6fed9`, `6bc636307`,
+(AE=0). The previous packages from `f1e0e86a6`, `a262fab23`, `596b6fed9`, `6bc636307`,
 `3babc4b48` and `2dccc3ee5` passed the same rows.
 
 ## Progress log — resumed 2026-10-28 (Block 4 completion)
