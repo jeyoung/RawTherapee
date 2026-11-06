@@ -70,10 +70,10 @@ candidate_dir="$(realpath "$candidate_dir")"
 image="$(realpath "$image")"
 
 if [ -z "$rtdata" ]; then
-    if [ -f /usr/local/share/rawtherapee/dcraw.json ]; then
-        rtdata="/usr/local/share/rawtherapee"
-    else
+    if [ -f "$ROOT/rtdata/dcraw.json" ]; then
         rtdata="$ROOT/rtdata"
+    else
+        rtdata="/usr/local/share/rawtherapee"
     fi
 fi
 [ -d "$rtdata" ] || usage_error "rtdata directory not found: $rtdata"
@@ -99,9 +99,6 @@ for profile in sharpen-usm rotate crop; do
 done
 
 mkdir -p "$report"/{logs,profiles,tiff,settings/baseline,settings/candidate,cache/baseline,cache/candidate}
-# Bind target for the data tree; used only inside the bwrap namespace.
-rtdata_stage="$report/run/rtdata-stage"
-mkdir -p "$rtdata_stage"
 
 # Seed the extension filter for the image under test in both settings trees.
 # export-one.sh only seeds a missing options file, so a report directory reused
@@ -128,8 +125,11 @@ amaze_ts="$(sed -n 's/^#define AMAZETS \([0-9][0-9]*\)$/\1/p' \
 [ -n "$amaze_ts" ] || die "cannot read AMAZETS from rtengine/amaze_demosaic_RT.cc"
 amaze_halo=16
 amaze_stride=$((amaze_ts - 2 * amaze_halo))
-# A tile-boundary set must also be small: at most 0.01% of channel samples.
-amaze_max_sample_fraction="1e-4"
+# The known AMaZE scratch-fix difference is bounded: at most 64 LSB16 and
+# 1024 channel samples, all within the tile halo. Anything larger is a
+# regression, not the known exception.
+amaze_max_lsb=64
+amaze_max_samples=1024
 
 # ------------------------------------------------------------------ profiles
 cat >"$report/profiles/vng4-neutral.pp3" <<'EOF'
@@ -150,32 +150,42 @@ for name in sharpen-usm rotate crop; do
 done
 
 # -------------------------------------------------------------------- runner
-use_bwrap=0
-if command -v bwrap >/dev/null 2>&1; then
-    use_bwrap=1
-else
-    warn "bwrap not found: running the CLIs directly; the data directories are"
-    warn "not pinned, so install both share directories or provide bwrap"
+command -v bwrap >/dev/null 2>&1 || \
+    die "bwrap is required to bind the same rtdata to both data paths"
+use_bwrap=1
+
+# A data tree under /usr/local/share would be hidden by the tmpfs that pins
+# the two compiled data paths. Copy that case to a private staging tree first;
+# a repository rtdata directory can be bound directly.
+bind_source="$rtdata"
+if [ "$use_bwrap" -eq 1 ] && [[ "$rtdata" == /usr/local/share/* ]]; then
+    rtdata_stage="$report/run/rtdata-stage"
+    rm -rf "$rtdata_stage"
+    mkdir -p "$rtdata_stage"
+    cp -a "$rtdata/." "$rtdata_stage/"
+    bind_source="$rtdata_stage"
 fi
 
 invoke() {
     if [ "$use_bwrap" -eq 1 ]; then
-        # Stage the data outside /usr/local/share first: an --rtdata path under
-        # the installed tree would otherwise disappear when the tmpfs masks its
-        # parent. The second and third binds then expose the same tree at both
-        # compiled data paths.
         bwrap --dev-bind / / \
-            --bind "$rtdata" "$rtdata_stage" \
             --tmpfs /usr/local/share \
             --dir /usr/local/share/rawtherapee \
             --dir /usr/local/share/rawtherapee-graph \
-            --bind "$rtdata_stage" /usr/local/share/rawtherapee \
-            --bind "$rtdata_stage" /usr/local/share/rawtherapee-graph \
+            --bind "$bind_source" /usr/local/share/rawtherapee \
+            --bind "$bind_source" /usr/local/share/rawtherapee-graph \
             -- "$@"
     else
         "$@"
     fi
 }
+
+if [ "$use_bwrap" -eq 1 ]; then
+    invoke test -f /usr/local/share/rawtherapee/dcraw.json || \
+        die "bwrap data bind is empty for the baseline path"
+    invoke test -f /usr/local/share/rawtherapee-graph/dcraw.json || \
+        die "bwrap data bind is empty for the candidate path"
+fi
 
 # export_row SIDE BUILD_DIR PROFILE OUTPUT
 export_row() {
@@ -204,23 +214,24 @@ compare_pair() {
 # Prints: pixels samples outside allowed
 classify_amaze() {
     python3 -B - "$ROOT" "$1" "$2" "$amaze_stride" "$amaze_halo" \
-        "$amaze_max_sample_fraction" "$3" "$4" "$5" <<'PY'
+        "$amaze_max_lsb" "$amaze_max_samples" "$3" "$4" "$5" <<'PY'
 import os
 import sys
 
 import numpy as np
 
-root, a_path, b_path, stride, halo, fraction, max_lsb, differing, total = \
-    sys.argv[1:]
+root, a_path, b_path, stride, halo, max_lsb, max_samples, reported_max, \
+    reported_differing, reported_total = sys.argv[1:]
 sys.path.insert(0, os.path.join(root, "tools", "opencl"))
 from compare_tiff import TiffReader  # noqa: E402
 
 stride = int(stride)
 halo = int(halo)
-fraction = float(fraction)
-reported_max = int(max_lsb)
-reported_differing = int(differing)
-reported_total = int(total)
+max_lsb = int(max_lsb)
+max_samples = int(max_samples)
+reported_max = int(reported_max)
+reported_differing = int(reported_differing)
+reported_total = int(reported_total)
 
 a = TiffReader(a_path)
 b = TiffReader(b_path)
@@ -254,8 +265,8 @@ finally:
 consistent = (observed_max == reported_max
               and samples == reported_differing
               and a.width * a.height * a.samples == reported_total)
-limit = reported_total * fraction
-allowed = consistent and outside == 0 and samples <= limit
+allowed = (consistent and outside == 0 and samples <= max_samples
+           and observed_max <= max_lsb)
 print(pixels, samples, outside, int(allowed))
 PY
 }
@@ -363,7 +374,9 @@ else
                 read -r pixels samples outside allowed <<<"$analysis"
                 amaze_note="$pixels differing pixels, $samples samples, "
                 amaze_note+="$outside outside the ${amaze_halo}px halo of the "
-                amaze_note+="${amaze_stride}px tile stride"
+                amaze_note+="${amaze_stride}px tile stride, "
+                amaze_note+="limits ${amaze_max_lsb} LSB16 / "
+                amaze_note+="${amaze_max_samples} samples"
                 if [ "$allowed" -eq 1 ]; then
                     record "$name" KNOWN "$max" "$differing"
                     amaze_note="KNOWN: $amaze_note"

@@ -30,7 +30,7 @@ ROOT="$(git rev-parse --show-toplevel)"
 source "$ROOT/tools/perf/lib/common.sh"
 
 build_dir=""
-baseline_dir="$ROOT/../../build/baseline-dev"
+baseline_dir=""
 image=""
 pp3=""
 denoise_pp3=""
@@ -79,6 +79,10 @@ if [ -x "$baseline_dir/rtgui/rawtherapee-graph-cli" ]; then
 elif [ -x "$baseline_dir/rtgui/rawtherapee-cli" ]; then
     baseline_cli="$baseline_dir/rtgui/rawtherapee-cli"
 fi
+baseline_parity=0
+if [ -n "$baseline_cli" ] && [ -x "$ROOT/tools/perf/test-baseline-parity.sh" ]; then
+    baseline_parity=1
+fi
 
 failures=0
 pass() { printf 'PASS\t%s\n' "$*"; }
@@ -88,7 +92,7 @@ skip() { printf 'SKIP\t%s\n' "$*"; }
 # ---------------------------------------------------------------- stage tests
 info "stage tests"
 if [ "$skip_stage_tests" -eq 0 ]; then
-    for target in stage-abi-test stage-parity-test stage-cache-test stage-graph-test stage-indexer-test stage-store-test stage-node-cache-test stage-device-test stage-residency-test stage-param-hash-test stage-pipeline-test stage-param-map-test stage-render-state-test stage-dirty-blocks-test stage-work-test editorrequest-test viewport-admission-test denoise-tile-buffers-test; do
+    for target in stage-abi-test stage-parity-test stage-cache-test stage-graph-test stage-indexer-test stage-store-test stage-node-cache-test stage-device-test stage-residency-test stage-param-hash-test stage-pipeline-test stage-param-map-test stage-render-state-test stage-dirty-blocks-test stage-work-test stage-handler-test editorrequest-test viewport-admission-test denoise-tile-buffers-test; do
         if cmake --build "$build_dir" --target "$target" -j 6 >"$report/$target.build.log" 2>&1 \
             && "$build_dir/rtengine/$target" >"$report/$target.log" 2>&1; then
             pass "$target"
@@ -119,6 +123,11 @@ if [ "$skip_stage_tests" -eq 0 ]; then
             fail "$target (see $report/$target.log)"
         fi
     done
+    if "$ROOT/tools/perf/test-coverage.sh" >"$report/test-coverage.log" 2>&1; then
+        pass "stage coverage manifest"
+    else
+        fail "stage coverage manifest (see $report/test-coverage.log)"
+    fi
 else
     skip "stage tests (--skip-stage-tests)"
 fi
@@ -133,7 +142,9 @@ base_sidecar="$report/base-sidecar.tif"
 "$ROOT/tools/perf/export-one.sh" --build-dir "$build_dir" --image "$image" \
     --out "$neutral" --gpu off --threads 1
 
-if [ -n "$baseline_cli" ]; then
+if [ "$baseline_parity" -eq 1 ]; then
+    skip "neutral parity: covered by the baseline parity gate"
+elif [ -n "$baseline_cli" ]; then
     "$ROOT/tools/perf/export-one.sh" --build-dir "$baseline_dir" --image "$image" \
         --out "$base_neutral" --gpu off --threads 1
     if result=$(python3 "$ROOT/tools/opencl/compare_tiff.py" "$base_neutral" "$neutral" --bits 16); then
@@ -149,7 +160,9 @@ fi
 if [ -n "$pp3" ]; then
     "$ROOT/tools/perf/export-one.sh" --build-dir "$build_dir" --image "$image" \
         --out "$sidecar" --pp3 "$pp3" --gpu off --threads 1
-    if [ -n "$baseline_cli" ]; then
+    if [ "$baseline_parity" -eq 1 ]; then
+        skip "sidecar parity: covered by the baseline parity gate"
+    elif [ -n "$baseline_cli" ]; then
         "$ROOT/tools/perf/export-one.sh" --build-dir "$baseline_dir" --image "$image" \
             --out "$base_sidecar" --pp3 "$pp3" --gpu off --threads 1
         if result=$(python3 "$ROOT/tools/opencl/compare_tiff.py" "$base_sidecar" "$sidecar" --bits 16); then
@@ -158,9 +171,27 @@ if [ -n "$pp3" ]; then
         else
             fail "sidecar export comparison"
         fi
+    else
+        skip "sidecar parity: no baseline CLI"
     fi
 else
     skip "sidecar parity: no profile supplied"
+fi
+
+# ------------------------------------------------------- baseline parity
+info "baseline parity"
+if [ "$baseline_parity" -eq 1 ]; then
+    log="$report/baseline-parity.log"
+    if "$ROOT/tools/perf/test-baseline-parity.sh" \
+            --baseline-dir "$baseline_dir" --candidate-dir "$build_dir" \
+            --image "$image" --report "$report/baseline-parity" \
+            >"$log" 2>&1; then
+        pass "baseline parity against dev"
+    else
+        fail "baseline parity against dev (see $log)"
+    fi
+else
+    skip "baseline parity: no baseline CLI"
 fi
 
 # -------------------------------------------------------------- graph parity
@@ -336,11 +367,10 @@ for threads in 1 8; do
 done
 
 # ------------------------------------------------------------------- preview
-if [ "$skip_preview" -eq 0 ] && [ -x "$build_dir/rtgui/rawtherapee-graph" ] \
-    && command -v Xvfb >/dev/null 2>&1 && command -v xdotool >/dev/null 2>&1; then
+if [ "$skip_preview" -eq 0 ]; then
     info "preview latency"
-    if RT_PREVIEW_DELAY=20 RT_PREVIEW_WAIT=6 \
-        "$ROOT/tools/perf/bench-preview.sh" "$build_dir/rtgui/rawtherapee-graph" "$image" 5 \
+    if RT_BUILD_DIR="$build_dir" RT_PREVIEW_OUT="$report/bench-preview" \
+        "$ROOT/tools/perf/bench-preview.sh" "$image" 5 \
         >"$report/preview.log" 2>&1; then
         pass "preview latency run"
     else

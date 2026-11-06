@@ -94,6 +94,19 @@ binary run on the host also matches the host build with the same data
 
 ## Progress log — resumed 2026-10-28 (Block 4 completion)
 
+- **Comprehensive test infrastructure (2026-11-06)**: added
+  `stage-handler-test` (release abort on duplicate/null/empty ids, missing
+  handler and ordering), `tools/perf/test-coverage.sh` with
+  `TEST_COVERAGE.md` (36 blocks, 9 work items, 5 paths, adapter registries),
+  the dedicated `tools/perf/test-baseline-parity.sh` (bwrap-pinned data,
+  VNG4/MONO/profile AE=0, bounded AMaZE KNOWN), and expanded `run-suite.sh`
+  with `amaze-tile-parity-test`, `fast-preview-test`,
+  `preview-base-cache-test`, `working-trc-setup-test`, `stage-handler-test`,
+  the coverage gate, baseline parity and the headless preview latency gate.
+  Evidence: full suite all PASS including baseline parity and preview; PEF
+  baseline VNG4/MONO/profiles 0/0, AMaZE KNOWN 56/160; NEF 0/0 with AMaZE
+  KNOWN 1/1; coverage PASS (36/9/5).
+
 - **Baseline parity (2026-11-06)**: the current `perf-graph` was compared
   with `dev` at `9c3426339` using `build/cpu-dev`, the same `rtdata` bound to
   both data paths, one thread and `--gpu=off`. VNG4 and MONO neutral, VNG4

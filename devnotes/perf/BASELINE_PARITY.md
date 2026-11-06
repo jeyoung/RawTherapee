@@ -82,6 +82,15 @@ tolerance.
 - **Device:** the device path is compared with the host path, not with `dev`
   device execution, because the baseline build has no graph/device matrix.
 
+## Automated gate
+
+`tools/perf/test-baseline-parity.sh` automates this matrix. It requires
+`bwrap`, binds one `rtdata` tree to both compiled data paths, preflights both
+bind targets, uses separate settings/cache, and applies the AMaZE bound of
+64 LSB16 and 1024 differing samples within the 16 px halo of the 128 px tile
+stride. Any VNG4/MONO/profile difference, or an AMaZE difference outside those
+bounds, is `FAIL`.
+
 ## Reproduce
 
 Run the baseline and candidate CLIs with `rtdata` bound to both

@@ -191,6 +191,33 @@ def is_blank(cell):
     return clean(cell) in {"", "-", "n/a", "N/A", "\u2014"}
 
 
+cmake_path = os.path.join(os.path.dirname(contract_path), "..", "CMakeLists.txt")
+with open(cmake_path, encoding="utf-8") as handle:
+    cmake_text = handle.read()
+known_targets = set(re.findall(r"add_executable\(([A-Za-z0-9_.+-]+)", cmake_text))
+known_scripts = set()
+repo_root = os.path.abspath(os.path.join(os.path.dirname(contract_path), "..", ".."))
+for directory in ("tools/perf", "tools/opencl"):
+    full = os.path.join(repo_root, directory)
+    if os.path.isdir(full):
+        for name in os.listdir(full):
+            if name.endswith(".sh"):
+                known_scripts.add(name)
+known_scripts.add("verify.sh")
+
+def resolvable_host_token(cell):
+    tokens = re.findall(r"`([^`]+)`", cell)
+    for token in tokens:
+        token = token.split()[0]
+        if token in known_targets or token in known_scripts:
+            return True
+        if os.path.basename(token) in known_targets or \
+            os.path.basename(token) in known_scripts:
+            return True
+        if token.startswith("test-") and token.endswith(".sh"):
+            return token in known_scripts
+    return False
+
 block_lines = section_lines("block coverage")
 work_lines = section_lines("work item coverage")
 path_lines = section_lines("path coverage")
@@ -230,6 +257,9 @@ for block_id in block_ids:
         continue
     if is_blank(cells[1]):
         missing.append(f"block row: {block_id} has no host test or profile")
+    elif not resolvable_host_token(cells[1]):
+        missing.append(
+            f"block row: {block_id} names no resolvable host test or profile")
     paths_cell = clean(cells[2])
     if not paths_cell:
         missing.append(f"block row: {block_id} has no path")
@@ -242,6 +272,21 @@ for block_id in block_ids:
                 f"block row: {block_id} names no canonical path")
     if is_blank(cells[3]):
         missing.append(f"block row: {block_id} has no verify.sh cell")
+
+# Adapter registries: every path adapter and the shared template must be
+# represented, and the template must point at the handler regression test.
+adapter_lines = section_lines("adapter registries")
+adapter_rows = data_rows(adapter_lines, "registry")
+if len(adapter_rows) < 6:
+    missing.append(
+        f"adapter registry rows: found {len(adapter_rows)}, expected at least 6")
+if "stage-handler-test" not in "\n".join(adapter_lines):
+    missing.append("adapter registry rows: no stage-handler-test reference")
+for cells in adapter_rows:
+    if len(cells) < 3 or not resolvable_host_token(cells[2]):
+        name = clean(cells[0]) if cells else "?"
+        missing.append(
+            f"adapter registry row: {name} names no resolvable coverage test")
 
 # WorkItem rows: every contract name, with a host test/profile and the blocks
 # and paths that schedule it.
@@ -264,6 +309,9 @@ for name in work_item_names:
         continue
     if is_blank(cells[1]):
         missing.append(f"work item row: {name} has no host test or profile")
+    elif not resolvable_host_token(cells[1]):
+        missing.append(
+            f"work item row: {name} names no resolvable host test or profile")
     if is_blank(cells[2]):
         missing.append(f"work item row: {name} names no block")
     if is_blank(cells[3]):
@@ -290,6 +338,9 @@ for name in path_names:
         continue
     if is_blank(cells[1]):
         missing.append(f"path row: {name} has no host test or harness")
+    elif not resolvable_host_token(cells[1]):
+        missing.append(
+            f"path row: {name} names no resolvable host test or harness")
     if len(cells) < 3 or is_blank(cells[2]):
         missing.append(f"path row: {name} has no verify.sh cell")
 
