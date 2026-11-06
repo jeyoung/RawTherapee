@@ -92,6 +92,29 @@ binary run on the host also matches the host build with the same data
 
 ## Progress log — resumed 2026-10-28 (Block 4 completion)
 
+- **F4 single stage contract (2026-11-06)**: `stage_contract.{h,cc}` is now
+  the one definition of the block vocabulary and the five path tables. Each
+  block record carries its inputs (parameter fields), ownership, side effects,
+  fold rules, work items, resident paths, raw-core flag and working-set class;
+  the coupled groups are path-level because membership differs between preview
+  and crop. The four authorities read it instead of carrying private copies:
+  the parameter map publishes the contract's field lists and only binds ids to
+  hashers, the dirty-block derivation takes the raw-core flag, residents and
+  coupled groups from it, the work order takes the `WorkItem` vocabulary
+  and validates every derived item against the path-applicable set, and the
+  planner builds every specification from the contract, validates ownership
+  against the edges and dumps the new columns. The executors read the fold
+  table instead of `isFoldedPreviewNode` / `CROP_FOLDED_NODES`. The
+  catalogue/fingerprint disagreements were reconciled (`transform` carries
+  `crop`, `raw.base`/`raw.base.source` carry `dehaze`/`fattal`, `working.trc`
+  carries `wavelet`, `crop` carries `crop`), and the fingerprint format is
+  unchanged. Evidence: the four stage specification tests pass, all host
+  tests pass (except the pre-existing `stage-abi-test` GUI link failure),
+  `verify.sh --quick` is 84 PASS / 0 FAIL, `--stage-device` is 73 PASS / 0
+  FAIL / 0 SKIP, `--formats` PASS, and the smoke suite passes the export,
+  thumbnail and crop graph parity gates and thread determinism at t=2/4/8.
+
+
 - **F6 device working-set admission (2026-11-06)**: the residency budget now
   covers the whole node working set. `OpenCLResidency::reserve()` admits
   direct scratch against the same budget (evicting idle cached entries but
@@ -125,8 +148,8 @@ binary run on the host also matches the host build with the same data
   total. **F9** (parity helper): packed U8/U16 rows compare every sample,
   matching NaNs and same-sign infinities are equal, and exact/tolerance
   predicates are separate. F5 was already fixed by
-  `denoiseTileBufferCount()`. F4/F6 remain the architectural work the review
-  describes.
+  `denoiseTileBufferCount()`. F4 was the architectural contract refactor and
+  F6 the device working-set admission; both are now implemented.
 
 
 - **Capture-sharpening and Retinex gate fixes (2026-11-05)**: two

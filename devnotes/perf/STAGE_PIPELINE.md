@@ -29,6 +29,42 @@ it keeps the export consumer contract but has its own fixed node order.
 - Per path: one rooted, acyclic subgraph. Every node is reachable from a root
   and can reach a sink.
 
+## Stage contract
+
+`rtengine/stage/stage_contract.{h,cc}` is the single definition of the stage
+vocabulary. It owns the block table, the five path tables and the `WorkItem`
+enum; no other unit restates a block id, a reuse mode, a parameter field list,
+a fold, a resident step, a coupled group, a work item or a working-set class.
+The four authorities read it:
+
+| Authority | What it consumes |
+|-----------|------------------|
+| `stage_param_map.cc` | the parameter fields of each contract block; it only binds an id to its fingerprint hasher |
+| `stage_dirty_blocks.cc` | the raw-core flag, the residents and the coupled groups |
+| `stage_work.cc` | the `WorkItem` vocabulary and the path-applicable item set |
+| `stage_pipeline.cc` | the block and path tables, including the fold table, ownership, effects and working-set class the planner validates and dumps |
+
+Each block record carries its id, display name, reuse mode, ownership
+(`produces`, `in-place`, `consumes`), side effects (source frame, raw planes,
+base image, spot buffer, analysis, display, metadata), working-set class
+(image, scratch planes, transform map, tap tables, double state), parameter
+fields, work items, fold rules, resident paths and the raw-core flag. The
+coupled groups are path-level because membership differs between preview and
+crop; they are defined once in the path record.
+
+The planner validates the structural columns when it builds a specification:
+a consumer owns no output buffer, an in-place block has exactly one buffer
+input, roots have no input, sinks have no output and a fold host is a real,
+non-folded block on the same path. A contradiction is an assertion, not a
+silent fallback.
+
+The contract also reconciles the catalogue and fingerprint disagreements that
+the earlier independent tables carried: `transform` lists `crop` and not
+`dehaze`/`fattal`; `raw.base` and `raw.base.source` keep `dehaze`/`fattal`;
+`working.trc` lists `wavelet` and not `softlight`; `crop` lists `crop` and not
+`cropGuide`. The fingerprint format itself is unchanged, so the neutral export
+regression constants stay pinned.
+
 ## Inventory sources
 
 The block boundaries and the parameter provenance come from the current
