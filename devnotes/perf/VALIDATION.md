@@ -10,11 +10,11 @@ is recorded below.
 
 ## Artefact
 
-The current package is the work-order gate fix build from `a262fab23`:
+The current package is the architecture-review fix build from `f1e0e86a6`:
 
 ```
-rawtherapee-graph-5.13-755-ga262fab23_5.13+git13776.a262fab23-1_amd64.deb
-sha256 0939a1789ec36514272010cc6ace22c15776fca895244df2950ba288edf8ba94
+rawtherapee-graph-5.13-765-gf1e0e86a6_5.13+git13786.f1e0e86a6-1_amd64.deb
+sha256 fa2fb3b5904cdb51d84a1a397c8e5ca7bda87fc2374bc5e476ebbbf7314302fa
 ```
 
 It passed the install, `--list-formats`, neutral export and Xvfb smoke rows on
@@ -25,6 +25,11 @@ generated `camconst.json`); bare `rtdata` moves the neutral export by 1932
 codes.
 
 The earlier artefacts were:
+
+```
+rawtherapee-graph-5.13-755-ga262fab23_5.13+git13776.a262fab23-1_amd64.deb
+sha256 0939a1789ec36514272010cc6ace22c15776fca895244df2950ba288edf8ba94
+```
 
 ```
 rawtherapee-graph-5.13-746-g596b6fed9_5.13+git13767.596b6fed9-1_amd64.deb
