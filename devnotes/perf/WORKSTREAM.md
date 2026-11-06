@@ -94,6 +94,15 @@ binary run on the host also matches the host build with the same data
 
 ## Progress log — resumed 2026-10-28 (Block 4 completion)
 
+- **Baseline parity (2026-11-06)**: the current `perf-graph` was compared
+  with `dev` at `9c3426339` using `build/cpu-dev`, the same `rtdata` bound to
+  both data paths, one thread and `--gpu=off`. VNG4 and MONO neutral, VNG4
+  sharpen/rotate/crop and NEF VNG4 are all AE=0. The default AMaZE neutral
+  differs by at most 56 LSB16 in 160 PEF samples and 1 LSB16 in one NEF
+  sample; this is the known AMaZE tile-scratch fix `2ebf08b0f`, which is not
+  in `dev`. The full matrix and reproduction commands are in
+  `BASELINE_PARITY.md`.
+
 - **Adapter handler consolidation (2026-11-06)**: the preview, crop, export,
   fast-export and thumbnail adapters now own one `StageHandlerRegistry` each.
   Plan validation checks every non-folded contract node against the registry,
