@@ -17,7 +17,7 @@ pushed from 2026-10-29 on.
 
 - Repository: `$REPO`
 - Worktree: the main checkout, branch `perf-graph`, clean and in sync with
-  `origin/perf-graph`; the workstream tip is `025996d4b`. All pushed
+  `origin/perf-graph`; the workstream tip is `bc1a097ba`. All pushed
   ranges were scanned per the publication gate. Block 4 is complete: the
   device gate is green and the portable package is validated on Debian 12 and
   13; see the progress log and the decisions below.
