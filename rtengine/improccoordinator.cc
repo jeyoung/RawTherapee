@@ -349,6 +349,8 @@ ImProcCoordinator::ImProcCoordinator() :
     destroying(false),
     pendingDeferred(),
     pendingDeferredSnapshot(DeferredAnalysisSnapshot{}),
+    absorbedDeferredBlocks(),
+    absorbedDeferredActive(false),
     deferredWatcherStarted(false),
     deferredWatcherPaused(false),
     deferredWatcherStop(false),
@@ -447,6 +449,8 @@ ImProcCoordinator::~ImProcCoordinator()
         pendingDeferred = DeferredRecord{};
         pendingDeferredSnapshot.store(DeferredAnalysisSnapshot{},
                                       std::memory_order_relaxed);
+        absorbedDeferredBlocks = stage::DirtyBlocks{};
+        absorbedDeferredActive = false;
     }
 
     if (watcher) {
@@ -904,8 +908,7 @@ void ImProcCoordinator::dropPendingDeferred()
     paramsUpdateMutex.unlock();
 }
 
-bool ImProcCoordinator::absorbPendingDeferred(EditorRequest& request,
-                                               stage::DirtyBlocks& blocks)
+bool ImProcCoordinator::absorbPendingDeferred(EditorRequest& request)
 {
     paramsUpdateMutex.lock();
 
@@ -919,7 +922,8 @@ bool ImProcCoordinator::absorbPendingDeferred(EditorRequest& request,
          * materialised payload for the unconverted block bodies and their
          * typed facts. Neither path names a source or raw block.
          */
-        blocks = pendingDeferred.blocks;
+        absorbedDeferredBlocks = pendingDeferred.blocks;
+        absorbedDeferredActive = true;
         request.absorbDeferredExecution(pendingDeferred.blocks);
         absorbed = true;
         pendingDeferred = DeferredRecord{};
@@ -1378,13 +1382,6 @@ struct ImProcCoordinator::PreviewPassState {
      */
     EditorRequest request;
     stage::DirtyBlocks dirty;
-    /*
-     * Deferred work absorbed by this pass. The producer copies it into the
-     * pass under the parameter mutex, so the worker never reads the shared
-     * record while stopProcessing()/the destructor clears it.
-     */
-    stage::DirtyBlocks absorbedDeferred;
-    bool absorbedDeferredActive = false;
 
     /*
      * The typed work order derived once per pass; it is the execution-set
@@ -4383,9 +4380,12 @@ stage::DirtyBlocks ImProcCoordinator::previewDirtyBlocks(
      * The set never contains a source or raw block, so the merge cannot dirty
      * the base; it just makes the skipped analysis nodes part of the plan.
      */
-    if (pass.absorbedDeferredActive) {
-        for (const std::string& id : pass.absorbedDeferred.ids) {
-            result.ids.insert(id);
+    {
+        MyMutex::MyLock lock(paramsUpdateMutex);
+        if (absorbedDeferredActive) {
+            for (const std::string& id : absorbedDeferredBlocks.ids) {
+                result.ids.insert(id);
+            }
         }
     }
 
@@ -4481,6 +4481,14 @@ void ImProcCoordinator::recordPreviewDirtyState(const PreviewPassState& pass)
     previewDirtyState = previewRenderState(pass);
     previewDirtyFingerprintsValid = true;
     previewDirtyStateValid = true;
+    // The pass consumed the absorbed deferred stages; a later pass must not
+    // schedule them again. The reader in previewDirtyBlocks takes the same
+    // mutex, so stopProcessing()/the destructor cannot clear them under it.
+    {
+        MyMutex::MyLock lock(paramsUpdateMutex);
+        absorbedDeferredBlocks = stage::DirtyBlocks{};
+        absorbedDeferredActive = false;
+    }
 }
 
 /*
@@ -4514,6 +4522,11 @@ void ImProcCoordinator::invalidatePreviewDirtyState()
     previewDirtyFingerprintsValid = false;
     previewDirtyStateValid = false;
     previewDirtyParamsValid = false;
+    {
+        MyMutex::MyLock lock(paramsUpdateMutex);
+        absorbedDeferredBlocks = stage::DirtyBlocks{};
+        absorbedDeferredActive = false;
+    }
 }
 
 /*
@@ -4885,9 +4898,7 @@ void ImProcCoordinator::updatePreviewImage(EditorRequest request,
     // work: it rebuilds the whole-frame pipeline, so the families the
     // accumulated stages name must be part of its request rather than left
     // for a later pass.
-    stage::DirtyBlocks absorbedDeferredBlocks;
-    const bool absorbedDeferred =
-        absorbPendingDeferred(request, absorbedDeferredBlocks);
+    const bool absorbedDeferred = absorbPendingDeferred(request);
     if (absorbedDeferred
             && request.kind == stage::RequestKind::RepaintOnly) {
         /*
@@ -4918,8 +4929,6 @@ void ImProcCoordinator::updatePreviewImage(EditorRequest request,
 
     bool fullPipelineRan = false;
     PreviewPassState pass;
-    pass.absorbedDeferred = absorbedDeferredBlocks;
-    pass.absorbedDeferredActive = absorbedDeferred;
     bool monitorOutputPlanned = false;
 
     if (request.fullFrameAdmission || panningRelatedChange || (highDetailNeeded && prevdemo != PD_Sidecar)) {
@@ -5914,6 +5923,8 @@ void ImProcCoordinator::stopProcessing()
     pendingDeferred = DeferredRecord{};
     pendingDeferredSnapshot.store(DeferredAnalysisSnapshot{},
                                   std::memory_order_relaxed);
+    absorbedDeferredBlocks = stage::DirtyBlocks{};
+    absorbedDeferredActive = false;
     paramsUpdateMutex.unlock();
 
     if (updaterRunning && thread) {

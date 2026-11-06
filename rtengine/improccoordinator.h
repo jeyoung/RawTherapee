@@ -355,8 +355,7 @@ protected:
     void deferredWatcherLoop();
     void flushDeferredAnalysis();
     void dropPendingDeferred();
-    bool absorbPendingDeferred(EditorRequest& request,
-                               stage::DirtyBlocks& blocks);
+    bool absorbPendingDeferred(EditorRequest& request);
     void publishDeferredSnapshotLocked();
 
     /*
@@ -456,7 +455,7 @@ protected:
     // members of the updater:
     Glib::Thread* thread;
     MyMutex updaterThreadStart;
-    MyMutex paramsUpdateMutex;
+    mutable MyMutex paramsUpdateMutex;
     /*
      * Coalesced typed request for the next preview pass. Guarded by
      * paramsUpdateMutex. The legacy mask is the opaque execution payload on
@@ -484,6 +483,8 @@ protected:
     // Blocks the pass about to run absorbed from a pending burst. They are
     // merged into the pass dirty set, never into a source or raw block, and
     // cleared when the full-frame pass records its state.
+    stage::DirtyBlocks absorbedDeferredBlocks;
+    bool absorbedDeferredActive;
     bool deferredWatcherStarted;
     bool deferredWatcherPaused;
     std::atomic<bool> deferredWatcherStop;
