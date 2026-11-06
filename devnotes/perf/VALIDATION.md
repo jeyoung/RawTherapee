@@ -10,12 +10,11 @@ is recorded below.
 
 ## Artefact
 
-The current package is the architecture-review cleanup build from
-`ade38b7b2`:
+The current package is the residual-cleanup build from `e42d991d2`:
 
 ```
-rawtherapee-graph-5.13-779-gade38b7b2_5.13+git13800.ade38b7b2-1_amd64.deb
-sha256 12d8ce6823c93566d245ecd49d7ff0f6cb41693389e092d35eaecee34ebb8647
+rawtherapee-graph-5.13-781-ge42d991d2_5.13+git13802.e42d991d2-1_amd64.deb
+sha256 3b1ed54edfc0b8edc4dbc7675397de463fcae77e0cf8721141741440f8b0fe58
 ```
 
 It passed the install, `--list-formats` (36 entries), neutral export and Xvfb
@@ -26,6 +25,11 @@ file and the generated `camconst.json`); bare `rtdata` moves the neutral
 export by 1932 codes.
 
 The earlier artefacts were:
+
+```
+rawtherapee-graph-5.13-779-gade38b7b2_5.13+git13800.ade38b7b2-1_amd64.deb
+sha256 12d8ce6823c93566d245ecd49d7ff0f6cb41693389e092d35eaecee34ebb8647
+```
 
 ```
 rawtherapee-graph-5.13-773-ga78e6509a_5.13+git13794.a78e6509a-1_amd64.deb
