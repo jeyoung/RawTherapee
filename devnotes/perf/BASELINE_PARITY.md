@@ -84,11 +84,12 @@ tolerance.
 
 ## Reproduce
 
-The exact commands are recorded in the two suite reports:
-
-- `build/test-scratch/parity-vng4-pef/report.json` (sidecar AE=0)
-- `build/test-scratch/parity-vng4-nef/report.json` (sidecar AE=0)
-
-and the manual exports are in `build/test-scratch/parity-manual/`. The default
-AMaZE row fails the suite's neutral row by design; the VNG4/MONO isolation
-rows are the parity evidence for the current architecture changes.
+Run the baseline and candidate CLIs with `rtdata` bound to both
+`/usr/local/share/rawtherapee` and `/usr/local/share/rawtherapee-graph`,
+`OMP_NUM_THREADS=1`, `--gpu=off`, and separate settings/cache directories. Use
+`export-one.sh --build-dir build/cpu-dev` for the baseline and
+`export-one.sh --build-dir build/cpu-perf-graph` for the candidate, then
+`compare_tiff.py --bits 16`. The default AMaZE row fails the suite's neutral
+row by design; the VNG4/MONO isolation rows are the parity evidence for the
+current architecture changes. The run artefacts are transient and are not
+retained in the repository.
