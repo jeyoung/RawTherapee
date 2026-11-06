@@ -17,9 +17,10 @@ pushed from 2026-10-29 on.
 
 - Repository: `$REPO`
 - Worktree: the main checkout, branch `perf-graph`, clean and in sync with
-  `origin/perf-graph`; the workstream tip is `1d92c1404`. All pushed ranges
-  were scanned per the publication gate. Block 4 is complete: the device gate
-  is green and the portable package is validated on Debian 12 and 13; see the
+  `origin/perf-graph`. The substantive tip (code and package record) is
+  `1d92c1404`; later commits are documentation-only. All pushed ranges were
+  scanned per the publication gate. Block 4 is complete: the device gate is
+  green and the portable package is validated on Debian 12 and 13; see the
   progress log and the decisions below.
 - Stage C landed 2026-10-31: `local.adjustments` local sharpening (undamped
   `cd38028bb..7467f563f`, damped `211c12597..ebbeab951`), the `crop` device
