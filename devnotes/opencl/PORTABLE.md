@@ -80,24 +80,22 @@ driver and an ICD loader must be installed separately.
 - Built on Debian 12: glibc 2.36, GCC 12, `-mtune=generic`.
 - Requires Debian 12 or newer. Debian 13 t64 packages are accepted through
   their `Provides` entries.
-- 2026-11-06, package `5.13+git13794.a78e6509a-1` from `a78e6509a`
+- 2026-11-06, package `5.13+git13800.ade38b7b2-1` from `ade38b7b2`
   (sha256
-  `b4656385486e59f60bf79030e01080fe43e1d7bcd06f71bc3d12c9fccc7fceef`):
+  `12d8ce6823c93566d245ecd49d7ff0f6cb41693389e092d35eaecee34ebb8647`):
   fresh Debian 12 and Debian 13 containers both passed
   `apt-get install -y ./...deb`; Debian 13's t64 packages satisfied the
   pre-t64 `Depends` through `Provides`, with no workaround. `--list-formats`
   exited 0 and listed 36 formats including PEF/NEF/CR2/ARW, TIFF and JPEG XL.
   A neutral 16-bit CPU export (`OMP_NUM_THREADS=1`, `--gpu=off`) matched the
   host CLI exactly when both used the packaged data directory: PAE 0 LSB16,
-  0 of 30,419,712 samples, on both distributions. Run the host reference
-  against the extracted package data, not bare `rtdata`: the install adds the
-  `options` file and the generated `camconst.json`, and bare `rtdata` moves
-  the neutral export by 1932 codes. The packaged binary run on the host
-  matches the host build with the same data (AE=0). GUI smoke under Xvfb
+  0 of 30,419,712 samples, on both distributions. GUI smoke under Xvfb
   stayed alive to the 20 s timeout on both (exit 124, no stderr).
   `--gpu-test` and `--gpu-test-monitor` were not run: the containers have no
   GPU.
-- The previous packages, `5.13+git13790.ee73df905-1` (sha256
+- The previous packages, `5.13+git13794.a78e6509a-1` (sha256
+  `b4656385486e59f60bf79030e01080fe43e1d7bcd06f71bc3d12c9fccc7fceef`),
+  `5.13+git13790.ee73df905-1` (sha256
   `7f0ecd576e68da9cda58dd2d0e92e3ede175b5821ff2f63e1d5bd46531bbfe06`),
   `5.13+git13786.f1e0e86a6-1` (sha256
   `fa2fb3b5904cdb51d84a1a397c8e5ca7bda87fc2374bc5e476ebbbf7314302fa`),

@@ -17,11 +17,11 @@ pushed from 2026-10-29 on.
 
 - Repository: `$REPO`
 - Worktree: the main checkout, branch `perf-graph`, clean and in sync with
-  `origin/perf-graph`. The substantive tip (code and package record) is
-  `1d92c1404`; later commits are documentation-only. All pushed ranges were
-  scanned per the publication gate. Block 4 is complete: the device gate is
-  green and the portable package is validated on Debian 12 and 13; see the
-  progress log and the decisions below.
+  `origin/perf-graph`. The substantive code tip is `ade38b7b2` (the
+  architecture-review cleanup); later commits are documentation and package
+  records. All pushed ranges were scanned per the publication gate. Block 4
+  is complete: the device gate is green and the portable package is validated
+  on Debian 12 and 13; see the progress log and the decisions below.
 - Stage C landed 2026-10-31: `local.adjustments` local sharpening (undamped
   `cd38028bb..7467f563f`, damped `211c12597..ebbeab951`), the `crop` device
   node (`544f01573`, `0885d952c`), the `lab.sharpening` impulse-denoise +
@@ -75,21 +75,22 @@ pushed from 2026-10-29 on.
 ### Validated artefact
 
 ```
-build/portable/rawtherapee-graph-5.13-773-ga78e6509a_5.13+git13794.a78e6509a-1_amd64.deb
-sha256 b4656385486e59f60bf79030e01080fe43e1d7bcd06f71bc3d12c9fccc7fceef
+build/portable/rawtherapee-graph-5.13-779-gade38b7b2_5.13+git13800.ade38b7b2-1_amd64.deb
+sha256 12d8ce6823c93566d245ecd49d7ff0f6cb41693389e092d35eaecee34ebb8647
 ```
 
-Built 2026-11-06 from `a78e6509a` (the single stage contract; later commits
-are documentation) with `tools/build-rt.sh portable`. Validated the same day in
-fresh Debian 12 and Debian 13 containers, both PASS: install,
+Built 2026-11-06 from `ade38b7b2` (the architecture-review cleanup; later
+commits are documentation) with `tools/build-rt.sh portable`. Validated the
+same day in fresh Debian 12 and Debian 13 containers, both PASS: install,
 `--list-formats` (36 entries, including PEF/NEF/CR2/ARW, TIFF and JPEG XL),
 neutral 16-bit CPU export against the host CLI with the packaged data
 directory (PAE 0 LSB16, 0 of 30,419,712 samples, both distributions) and a
 GUI smoke test under Xvfb (20 s timeout, exit 124). `--gpu-test` and
 `--gpu-test-monitor` were not run: the containers have no GPU. The packaged
 binary run on the host also matches the host build with the same data
-(AE=0). The previous packages from `ee73df905`, `f1e0e86a6`, `a262fab23`,
-`596b6fed9`, `6bc636307`, `3babc4b48` and `2dccc3ee5` passed the same rows.
+(AE=0). The previous packages from `a78e6509a`, `ee73df905`, `f1e0e86a6`,
+`a262fab23`, `596b6fed9`, `6bc636307`, `3babc4b48` and `2dccc3ee5` passed
+the same rows.
 
 ## Progress log — resumed 2026-10-28 (Block 4 completion)
 
