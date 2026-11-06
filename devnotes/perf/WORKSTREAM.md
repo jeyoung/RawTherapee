@@ -92,6 +92,20 @@ binary run on the host also matches the host build with the same data
 
 ## Progress log — resumed 2026-10-28 (Block 4 completion)
 
+- **F6 device working-set admission (2026-11-06)**: the residency budget now
+  covers the whole node working set. `OpenCLResidency::reserve()` admits
+  direct scratch against the same budget (evicting idle cached entries but
+  never a live reservation), and a `WorkingSetReservation` guard keeps it
+  alive until the scratch is released. The launchers that allocated outside
+  the cache now reserve first: sharpen (planes + bilateral LUT), lab
+  sharpening (impulse/defringe/ML planes), the transform geometry map, the
+  Lanczos tap tables, and the lab-tools/local-adjustments double state.
+  Evidence: residency suite PASS; `--quick` 84 PASS; a 45.7 MP transform map
+  is refused at 256 MiB but runs device at 2048 MiB (`impl=opencl`), and the
+  refused 256 MiB export is AE=0; a 16 MiB sharpen export falls back with
+  AE=0.
+
+
 - **Architecture-review fixes (2026-11-05)**: the interim review's still-live
   findings were addressed. **F2** (shutdown race): every read and clear of
   the absorbed deferred blocks now takes `paramsUpdateMutex`; the shared

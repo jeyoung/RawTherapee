@@ -89,6 +89,18 @@ entries under the byte budget, and refuses a buffer that does not fit so the
 node can run on the host. The budget defaults to 1024 MiB; `RT_STAGE_DEVICE_BUDGET_MB` overrides it, out-of-range values clamp to 16-65536 MiB, and a
 non-numeric value keeps the default.
 
+The budget covers the **whole node working set**, not only cached buffers. A
+launcher reserves its direct scratch (sharpen planes and the bilateral LUT,
+lab-sharpening planes, the transform geometry map, the Lanczos tap tables, the
+lab-tools/local-adjustments double state) through
+`OpenCLResidency::reserve()` before allocating it; the guard is released after
+the last scratch buffer is released. Admission can evict idle cached entries
+but never a live reservation, and an over-budget working set falls back to the
+host before any scratch is created. A 45.7 MP transform map is roughly 730 MiB
+(four floats per destination pixel), so a constrained budget refuses it; with
+the 2048 MiB budget the same export records `transform` `impl=opencl`, and the
+256 MiB export matches the host path at 1 LSB16.
+
 `rtengine/stage/stage_buffer_state.h` associates an `RtStageBuffer` with a
 location, a device generation and an intrusive reference count. The header
 contains no OpenCL types:
