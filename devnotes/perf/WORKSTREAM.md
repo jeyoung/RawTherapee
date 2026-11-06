@@ -93,9 +93,10 @@ binary run on the host also matches the host build with the same data
 ## Progress log — resumed 2026-10-28 (Block 4 completion)
 
 - **Architecture-review fixes (2026-11-05)**: the interim review's still-live
-  findings were addressed. **F2** (shutdown race): absorbed deferred blocks
-  are now owned by the pass, copied under `paramsUpdateMutex`; the shared
-  fields and their racy clears are gone. **F1** (combined delta): the sensor
+  findings were addressed. **F2** (shutdown race): every read and clear of
+  the absorbed deferred blocks now takes `paramsUpdateMutex`; the shared
+  record stays so a pass that absorbs without a full-frame run leaves the
+  work for the next one. **F1** (combined delta): the sensor
   demosaic change is compared by a sensor-only fingerprint
   (`addRawDemosaicFields`, no `pdsharpening`), so a pass changing the
   demosaic method and an unused capture-sharpening setting no longer skips
