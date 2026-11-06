@@ -33,6 +33,7 @@
 #include "rtengine.h"
 #include "stage/stage_cache_integration.h"
 #include "stage/stage_dirty_blocks.h"
+#include "stage/stage_handler.h"
 #include "stage/stage_render_state.h"
 #include "viewportdefer.h"
 
@@ -385,6 +386,8 @@ protected:
 
     PreviewPassPlan planPreviewPass(PreviewPassState& pass);
     using PreviewNodeHandler = void (ImProcCoordinator::*)(PreviewPassState&);
+    static const stage::StageHandlerRegistry<PreviewNodeHandler>&
+    previewRegistry();
     PreviewNodeHandler previewNodeHandler(const std::string& id) const;
     void executePreviewNode(const std::string& id, PreviewPassState& pass);
 

@@ -58,6 +58,7 @@
 #include "profiling.h"
 #include "stage/stage_graph.h"
 #include "stage/stage_pipeline.h"
+#include "stage/stage_handler.h"
 #include "stage/stage_profile.h"
 #include "stage/stage_runtime.h"
 #include "stage/stage_work.h"
@@ -4541,31 +4542,32 @@ void ImProcCoordinator::invalidatePreviewDirtyState()
 ImProcCoordinator::PreviewNodeHandler
 ImProcCoordinator::previewNodeHandler(const std::string& id) const
 {
-    struct Entry {
-        const char* id;
-        PreviewNodeHandler handler;
-    };
-    static const Entry handlers[] = {
-        {"source.select", &ImProcCoordinator::stageSourceSelect},
-        {"raw.preprocess", &ImProcCoordinator::stageRawPreprocess},
-        {"raw.demosaic", &ImProcCoordinator::stageRawDemosaic},
-        {"raw.base", &ImProcCoordinator::stageRawBase},
-        {"transform", &ImProcCoordinator::stageTransform},
-        {"local.adjustments", &ImProcCoordinator::stageLocalAdjustments},
-        {"rgb.proc", &ImProcCoordinator::stageRgbProc},
-        {"lab.tools", &ImProcCoordinator::stageLabTools},
-        {"lab.wavelet", &ImProcCoordinator::stageLabWavelet},
-        {"working.trc", &ImProcCoordinator::stageWorkingTrc},
-        {"ciecam", &ImProcCoordinator::stageCieCam},
-        {"gamut", &ImProcCoordinator::stageGamut},
-        {"monitor.output", &ImProcCoordinator::stageMonitorOutput}
-    };
-    for (const Entry& entry : handlers) {
-        if (id == entry.id) {
-            return entry.handler;
-        }
-    }
-    return nullptr;
+    return previewRegistry().find(id);
+}
+
+const rtengine::stage::StageHandlerRegistry<ImProcCoordinator::PreviewNodeHandler>&
+ImProcCoordinator::previewRegistry()
+{
+    using Registry = stage::StageHandlerRegistry<PreviewNodeHandler>;
+    static const Registry registry = [] {
+        Registry handlers;
+        handlers.add("source.select", &ImProcCoordinator::stageSourceSelect);
+        handlers.add("raw.preprocess", &ImProcCoordinator::stageRawPreprocess);
+        handlers.add("raw.demosaic", &ImProcCoordinator::stageRawDemosaic);
+        handlers.add("raw.base", &ImProcCoordinator::stageRawBase);
+        handlers.add("transform", &ImProcCoordinator::stageTransform);
+        handlers.add("local.adjustments",
+                     &ImProcCoordinator::stageLocalAdjustments);
+        handlers.add("rgb.proc", &ImProcCoordinator::stageRgbProc);
+        handlers.add("lab.tools", &ImProcCoordinator::stageLabTools);
+        handlers.add("lab.wavelet", &ImProcCoordinator::stageLabWavelet);
+        handlers.add("working.trc", &ImProcCoordinator::stageWorkingTrc);
+        handlers.add("ciecam", &ImProcCoordinator::stageCieCam);
+        handlers.add("gamut", &ImProcCoordinator::stageGamut);
+        handlers.add("monitor.output", &ImProcCoordinator::stageMonitorOutput);
+        return handlers;
+    }();
+    return registry;
 }
 
 /*

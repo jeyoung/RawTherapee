@@ -46,6 +46,7 @@
 #include "stage/ciecam_context.h"
 #include "stage/stage_buffer.h"
 #include "stage/stage_graph.h"
+#include "stage/stage_handler.h"
 #include "stage/stage_pipeline.h"
 #include "stage/stage_profile.h"
 #include "stage/lab_sharpening_context.h"
@@ -57,6 +58,7 @@
 #include "utils.h"
 
 #include <cassert>
+#include <functional>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -129,92 +131,6 @@ void rgbToLabRegion(const Imagefloat& src, LabImage& dst, int x, int y,
             Color::XYZ2Lab(X, Y, Z, dst.L[i][j], dst.a[i][j], dst.b[i][j]);
         }
     }
-}
-
-/*
- * Number of blocks in the canonical export inventory (devnotes/perf/
- * STAGE_PIPELINE.md). The executor below covers exactly this many nodes; a
- * mismatch aborts, because the graph is the only export sequence.
- */
-constexpr size_t EXPORT_NODE_COUNT = 22;
-
-/*
- * Export node ids the graph executor implements. buildPipelineSpec() names the
- * nodes; this list is the executor's side of the contract. The graph path
- * validates every planned node against it before executing anything, so an
- * inventory change that this file does not implement aborts instead of
- * silently skipping a block.
- */
-const char* const EXPORT_NODE_IDS[] = {
-    "source.select", "raw.preprocess", "raw.demosaic", "raw.base.source",
-    "raw.denoise", "raw.color", "analysis", "transform", "local.adjustments",
-    "rgb.proc", "lab.tools", "lab.sharpening", "lab.wavelet", "working.trc",
-    "ciecam", "gamut", "crop", "resize", "output.sharpen", "output.convert",
-    "framing", "output.icc"
-};
-
-static_assert(sizeof(EXPORT_NODE_IDS) / sizeof(EXPORT_NODE_IDS[0]) ==
-                  EXPORT_NODE_COUNT,
-              "the export executor must cover the canonical node inventory");
-
-/*
- * Number and ids of the fast-export node inventory. The order is the one the
- * `-f` pipeline has always used: the raw core split so denoise follows the
- * early resize, then the composite finish. buildPipelineSpec(FastExport)
- * supplies the same ids; this list is the executor's side of the contract.
- */
-constexpr size_t FAST_EXPORT_NODE_COUNT = 10;
-
-const char* const FAST_EXPORT_NODE_IDS[] = {
-    "source.select", "raw.preprocess", "raw.demosaic", "raw.base.source",
-    "raw.color", "analysis", "transform", "early.resize", "denoise", "finish"
-};
-
-static_assert(sizeof(FAST_EXPORT_NODE_IDS) / sizeof(FAST_EXPORT_NODE_IDS[0]) ==
-                  FAST_EXPORT_NODE_COUNT,
-              "the fast-export executor must cover the fast node inventory");
-
-/*
- * The executor id arrays are checked against the canonical path before the
- * first plan. The arrays exist to map a planned id to a private method; the
- * contract owns the path composition. A mismatch is a programming error and
- * aborts in release builds too.
- */
-void validateExecutorIds(stage::StagePath path, const char* const* ids,
-                         size_t count, const char* label)
-{
-    const stage::StagePipelineSpec spec = stage::buildPipelineSpec(path);
-    bool matched = spec.nodes.size() == count;
-    for (size_t i = 0; matched && i < count; ++i) {
-        matched = spec.nodes[i].id == ids[i];
-    }
-    if (!matched) {
-        std::fprintf(stderr,
-                     "export-graph: fatal: the %s executor list does not "
-                     "match the stage contract\n",
-                     label);
-        std::abort();
-    }
-}
-
-bool isExportNode(const std::string& id)
-{
-    for (const char* known : EXPORT_NODE_IDS) {
-        if (id == known) {
-            return true;
-        }
-    }
-    return false;
-}
-
-bool isFastExportNode(const std::string& id)
-{
-    for (const char* known : FAST_EXPORT_NODE_IDS) {
-        if (id == known) {
-            return true;
-        }
-    }
-    return false;
 }
 
 /*
@@ -420,6 +336,11 @@ public:
     }
 
 private:
+    using ExportHandler = std::function<bool(ImageProcessor&)>;
+    static const stage::StageHandlerRegistry<ExportHandler>& exportHandlers();
+    static const stage::StageHandlerRegistry<ExportHandler>&
+    fastExportHandlers();
+
     Imagefloat *normal_pipeline()
     {
         RT_PROFILE("proc::normal_pipeline", PROCESS_IMAGE);
@@ -438,14 +359,11 @@ private:
      */
     Imagefloat *graph_pipeline()
     {
-        validateExecutorIds(stage::StagePath::Export, EXPORT_NODE_IDS,
-                            EXPORT_NODE_COUNT, "export");
-
         const stage::StagePipelineSpec spec =
             stage::buildPipelineSpec(stage::StagePath::Export);
 
-        if (spec.nodes.size() != EXPORT_NODE_COUNT) {
-            abortStageGraph("inventory", "unexpected node count");
+        if (spec.nodes.empty()) {
+            abortStageGraph("inventory", "empty specification");
         }
 
         stage::StageGraph graph;
@@ -490,7 +408,7 @@ private:
         for (size_t index : order) {
             const std::string& id = graph.node(index).name;
 
-            if (!isExportNode(id)) {
+            if (!exportHandlers().contains(id)) {
                 abortStageGraph(id.c_str(), "node has no executor");
             }
 
@@ -514,65 +432,17 @@ private:
     }
 
     /*
-     * Run one canonical export node. The ids come from buildPipelineSpec(); an
-     * unknown id has already been rejected by graph_pipeline(), so this only
-     * maps a planned node to the method that implements it.
+     * Run one canonical export node through the adapter registry. The plan
+     * has already checked every non-folded node, so a miss here is a
+     * programming error.
      */
     bool executeExportNode(const std::string& id)
     {
-        if (id == "source.select") {
-            return stage_source_select();
-        } else if (id == "raw.preprocess") {
-            stage_raw_preprocess();
-        } else if (id == "raw.demosaic") {
-            stage_raw_demosaic();
-        } else if (id == "raw.base.source") {
-            ScopedHostNodeProfile node_profile(id.c_str());
-            stage_raw_base_source();
-        } else if (id == "raw.denoise") {
-            ScopedHostNodeProfile node_profile(id.c_str());
-            stage_denoise();
-        } else if (id == "raw.color") {
-            ScopedHostNodeProfile node_profile(id.c_str());
-            stage_raw_color();
-        } else if (id == "analysis") {
-            stage_analysis();
-        } else if (id == "transform") {
-            stage_transform();
-        } else if (id == "local.adjustments") {
-            stage_local_adjustments();
-        } else if (id == "rgb.proc") {
-            stage_rgb_proc();
-        } else if (id == "lab.tools") {
-            stage_lab_tools();
-        } else if (id == "lab.sharpening") {
-            stage_lab_sharpening();
-        } else if (id == "lab.wavelet") {
-            stage_lab_wavelet();
-        } else if (id == "working.trc") {
-            stage_working_trc();
-        } else if (id == "ciecam") {
-            stage_ciecam();
-        } else if (id == "gamut") {
-            stage_gamut();
-        } else if (id == "crop") {
-            stage_crop();
-        } else if (id == "resize") {
-            stage_resize();
-        } else if (id == "output.sharpen") {
-            stage_output_sharpen();
-        } else if (id == "output.convert") {
-            stage_output_convert();
-        } else if (id == "framing") {
-            stage_framing();
-        } else if (id == "output.icc") {
-            return stage_output_icc() != nullptr;
-        } else {
-            assert(false);
-            return false;
+        const ExportHandler handler = exportHandlers().find(id);
+        if (!handler) {
+            abortStageGraph(id.c_str(), "node has no executor");
         }
-
-        return true;
+        return handler(*this);
     }
 
     /*
@@ -592,14 +462,11 @@ private:
 
         pl = nullptr;
 
-        validateExecutorIds(stage::StagePath::FastExport, FAST_EXPORT_NODE_IDS,
-                            FAST_EXPORT_NODE_COUNT, "fast-export");
-
         const stage::StagePipelineSpec spec =
             stage::buildPipelineSpec(stage::StagePath::FastExport);
 
-        if (spec.nodes.size() != FAST_EXPORT_NODE_COUNT) {
-            abortStageGraph("fast-export inventory", "unexpected node count");
+        if (spec.nodes.empty()) {
+            abortStageGraph("fast-export inventory", "empty specification");
         }
 
         stage::StageGraph graph;
@@ -644,7 +511,7 @@ private:
         for (size_t index : order) {
             const std::string& id = graph.node(index).name;
 
-            if (!isFastExportNode(id)) {
+            if (!fastExportHandlers().contains(id)) {
                 abortStageGraph(id.c_str(), "node has no executor");
             }
 
@@ -668,39 +535,15 @@ private:
     }
 
     /*
-     * Run one fast-export node. The ids come from
-     * buildPipelineSpec(FastExport); an unknown id has already been rejected by
-     * fast_pipeline(), so this only maps a planned node to its method.
+     * Run one fast-export node through the adapter registry.
      */
     bool executeFastExportNode(const std::string& id)
     {
-        if (id == "source.select") {
-            return stage_source_select();
-        } else if (id == "raw.preprocess") {
-            stage_raw_preprocess();
-        } else if (id == "raw.demosaic") {
-            stage_raw_demosaic();
-        } else if (id == "raw.base.source") {
-            stage_raw_base_source();
-        } else if (id == "raw.color") {
-            stage_raw_color();
-        } else if (id == "analysis") {
-            stage_analysis();
-        } else if (id == "transform") {
-            stage_transform();
-        } else if (id == "early.resize") {
-            stage_early_resize();
-        } else if (id == "denoise") {
-            stage_denoise();
-        } else if (id == "finish") {
-            readyImg = stage_finish();
-            return readyImg != nullptr;
-        } else {
-            assert(false);
-            return false;
+        const ExportHandler handler = fastExportHandlers().find(id);
+        if (!handler) {
+            abortStageGraph(id.c_str(), "node has no executor");
         }
-
-        return true;
+        return handler(*this);
     }
 
     /*
@@ -2899,6 +2742,156 @@ private:
 
     bool autili, butili;
 };
+
+const stage::StageHandlerRegistry<ImageProcessor::ExportHandler>&
+ImageProcessor::exportHandlers()
+{
+    using Registry = stage::StageHandlerRegistry<ExportHandler>;
+    static const Registry registry = [] {
+        Registry handlers;
+        handlers.add("source.select", [](ImageProcessor& p) {
+            return p.stage_source_select();
+        });
+        handlers.add("raw.preprocess", [](ImageProcessor& p) {
+            p.stage_raw_preprocess();
+            return true;
+        });
+        handlers.add("raw.demosaic", [](ImageProcessor& p) {
+            p.stage_raw_demosaic();
+            return true;
+        });
+        handlers.add("raw.base.source", [](ImageProcessor& p) {
+            ScopedHostNodeProfile profile("raw.base.source");
+            p.stage_raw_base_source();
+            return true;
+        });
+        handlers.add("raw.denoise", [](ImageProcessor& p) {
+            ScopedHostNodeProfile profile("raw.denoise");
+            p.stage_denoise();
+            return true;
+        });
+        handlers.add("raw.color", [](ImageProcessor& p) {
+            ScopedHostNodeProfile profile("raw.color");
+            p.stage_raw_color();
+            return true;
+        });
+        handlers.add("analysis", [](ImageProcessor& p) {
+            p.stage_analysis();
+            return true;
+        });
+        handlers.add("transform", [](ImageProcessor& p) {
+            p.stage_transform();
+            return true;
+        });
+        handlers.add("local.adjustments", [](ImageProcessor& p) {
+            p.stage_local_adjustments();
+            return true;
+        });
+        handlers.add("rgb.proc", [](ImageProcessor& p) {
+            p.stage_rgb_proc();
+            return true;
+        });
+        handlers.add("lab.tools", [](ImageProcessor& p) {
+            p.stage_lab_tools();
+            return true;
+        });
+        handlers.add("lab.sharpening", [](ImageProcessor& p) {
+            p.stage_lab_sharpening();
+            return true;
+        });
+        handlers.add("lab.wavelet", [](ImageProcessor& p) {
+            p.stage_lab_wavelet();
+            return true;
+        });
+        handlers.add("working.trc", [](ImageProcessor& p) {
+            p.stage_working_trc();
+            return true;
+        });
+        handlers.add("ciecam", [](ImageProcessor& p) {
+            p.stage_ciecam();
+            return true;
+        });
+        handlers.add("gamut", [](ImageProcessor& p) {
+            p.stage_gamut();
+            return true;
+        });
+        handlers.add("crop", [](ImageProcessor& p) {
+            p.stage_crop();
+            return true;
+        });
+        handlers.add("resize", [](ImageProcessor& p) {
+            p.stage_resize();
+            return true;
+        });
+        handlers.add("output.sharpen", [](ImageProcessor& p) {
+            p.stage_output_sharpen();
+            return true;
+        });
+        handlers.add("output.convert", [](ImageProcessor& p) {
+            p.stage_output_convert();
+            return true;
+        });
+        handlers.add("framing", [](ImageProcessor& p) {
+            p.stage_framing();
+            return true;
+        });
+        handlers.add("output.icc", [](ImageProcessor& p) {
+            return p.stage_output_icc() != nullptr;
+        });
+        return handlers;
+    }();
+    return registry;
+}
+
+const stage::StageHandlerRegistry<ImageProcessor::ExportHandler>&
+ImageProcessor::fastExportHandlers()
+{
+    using Registry = stage::StageHandlerRegistry<ExportHandler>;
+    static const Registry registry = [] {
+        Registry handlers;
+        handlers.add("source.select", [](ImageProcessor& p) {
+            return p.stage_source_select();
+        });
+        handlers.add("raw.preprocess", [](ImageProcessor& p) {
+            p.stage_raw_preprocess();
+            return true;
+        });
+        handlers.add("raw.demosaic", [](ImageProcessor& p) {
+            p.stage_raw_demosaic();
+            return true;
+        });
+        handlers.add("raw.base.source", [](ImageProcessor& p) {
+            p.stage_raw_base_source();
+            return true;
+        });
+        handlers.add("raw.color", [](ImageProcessor& p) {
+            p.stage_raw_color();
+            return true;
+        });
+        handlers.add("analysis", [](ImageProcessor& p) {
+            p.stage_analysis();
+            return true;
+        });
+        handlers.add("transform", [](ImageProcessor& p) {
+            p.stage_transform();
+            return true;
+        });
+        handlers.add("early.resize", [](ImageProcessor& p) {
+            p.stage_early_resize();
+            return true;
+        });
+        handlers.add("denoise", [](ImageProcessor& p) {
+            p.stage_denoise();
+            return true;
+        });
+        handlers.add("finish", [](ImageProcessor& p) {
+            p.readyImg = p.stage_finish();
+            return p.readyImg != nullptr;
+        });
+        return handlers;
+    }();
+    return registry;
+}
 
 } // namespace
 

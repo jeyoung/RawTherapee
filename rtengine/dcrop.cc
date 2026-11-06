@@ -49,6 +49,7 @@
 #include "stage/lab_sharpening_context.h"
 #include "stage/stage_dirty_blocks.h"
 #include "stage/stage_graph.h"
+#include "stage/stage_handler.h"
 #include "stage/stage_pipeline.h"
 #include "stage/stage_work.h"
 #include "rt_math.h"
@@ -291,89 +292,10 @@ namespace
 {
 
 /*
- * Execution order of the crop blocks.
- *
- * This is the order of the legacy sequence, not the order of the canonical
- * specification: the crop measures noise on the freshly loaded region before
- * the base finish completes, so `analysis` runs before the rest of `raw.base`.
- * The specification folds that interleaving; the graph decides whether a block
- * runs, never the order in which the blocks run.
- */
-enum CropStage {
-    CROP_SOURCE_SELECT = 0,
-    CROP_ANALYSIS,
-    CROP_RAW_BASE,
-    CROP_TRANSFORM,
-    CROP_LOCAL_ADJUSTMENTS,
-    CROP_RGB_PROC,
-    CROP_LAB_TOOLS,
-    CROP_LAB_SHARPENING,
-    CROP_LAB_WAVELET,
-    CROP_WORKING_TRC,
-    CROP_CIE_CAM,
-    CROP_GAMUT,
-    CROP_VIEWPORT_OUTPUT,
-    CROP_STAGE_COUNT
-};
-
-constexpr const char* CROP_STAGE_IDS[CROP_STAGE_COUNT] = {
-    "source.select",
-    "analysis",
-    "raw.base",
-    "transform",
-    "local.adjustments",
-    "rgb.proc",
-    "lab.tools",
-    "lab.sharpening",
-    "lab.wavelet",
-    "working.trc",
-    "ciecam",
-    "gamut",
-    "viewport.output"
-};
-
-/*
- * The executor list is a second copy of the contract's crop node list, minus
- * the folded nodes. Keep it honest: a contract change that adds, removes or
- * reorders a block must not let the crop silently omit work. The check runs
- * once, before the first plan, and aborts in release builds too.
- */
-bool cropStageIdsMatchContract()
-{
-    const rtengine::stage::StagePipelineSpec spec =
-        rtengine::stage::buildPipelineSpec(rtengine::stage::StagePath::Crop);
-    size_t index = 0;
-    for (const auto& node : spec.nodes) {
-        if (rtengine::stage::foldHost(rtengine::stage::StagePath::Crop,
-                                      node.id)
-            != nullptr) {
-            continue;
-        }
-        if (index >= CROP_STAGE_COUNT || node.id != CROP_STAGE_IDS[index]) {
-            return false;
-        }
-        ++index;
-    }
-    return index == CROP_STAGE_COUNT;
-}
-
-void validateCropStageIds()
-{
-    static const bool matched = cropStageIdsMatchContract();
-    if (!matched) {
-        std::fprintf(stderr,
-                     "crop-graph: fatal: the executor list does not match the "
-                     "crop contract\n");
-        std::abort();
-    }
-}
-
-/*
  * Canonical nodes this path does not execute as a block of its own. The crop
  * obtains its region through one opaque ImageSource::getImage() call, which
  * performs the raw select, preprocess and demosaic steps, so those nodes are
- * carried by `source.select`. The fold table is part of the stage contract,
- * not a second list here.
+ * carried by `source.select`. The fold table is part of the stage contract.
  */
 const std::vector<std::string>& cropFoldedNodes()
 {
@@ -382,72 +304,25 @@ const std::vector<std::string>& cropFoldedNodes()
     return folded;
 }
 
-/*
- * The dirty-block set in the terms the crop execution list uses.
- *
- * The derivation works on canonical descriptor ids, while the crop sequence is
- * a list of stage blocks in its own order. These helpers translate between the
- * two and drop the folded nodes, which the crop never executes on their own.
- * They deliberately keep the canonical pipeline order, so two sets from
- * different sources can be printed and compared without a second sort.
- */
-
-/* Stage-owned ids of `blocks`, in canonical crop pipeline order. */
-std::vector<std::string> cropStageOrder(const std::vector<std::string>& blocks)
-{
-    const std::set<std::string> wanted(blocks.begin(), blocks.end());
-    std::vector<std::string> ordered;
-    for (const auto& node : rtengine::stage::buildPipelineSpec(
-             rtengine::stage::StagePath::Crop).nodes) {
-        if (wanted.find(node.id) == wanted.end()) {
-            continue;
-        }
-        for (int stage = 0; stage < CROP_STAGE_COUNT; ++stage) {
-            if (node.id == CROP_STAGE_IDS[stage]) {
-                ordered.push_back(node.id);
-                break;
-            }
-        }
-    }
-    return ordered;
-}
-
-/* Execution list implied by a set of canonical ids. */
-void cropRunsOf(const std::vector<std::string>& blocks,
-                bool runs[CROP_STAGE_COUNT])
-{
-    const std::set<std::string> dirty(blocks.begin(), blocks.end());
-    for (int stage = 0; stage < CROP_STAGE_COUNT; ++stage) {
-        runs[stage] = dirty.find(CROP_STAGE_IDS[stage]) != dirty.end();
-    }
-}
-
 struct CropGraphPlan {
     bool valid = false;
     std::string reason;
-    /* Blocks to run, in execution order. */
-    std::vector<CropStage> execute;
+    /* Blocks to run, in canonical plan order. */
+    std::vector<std::string> execute;
 };
 
 /*
  * Build the canonical crop spec, connect it into a StageGraph and ask
- * StageGraph::plan() which blocks this invocation may run. Every node named by
- * the chosen dirty set is marked dirty; every other node is clean, either
- * because it is folded into a block that is already scheduled or because its
- * output is reused.
+ * StageGraph::plan() which blocks this invocation may run.
  *
- * `dirtyIds` is the execution set in canonical ids and must contain every
- * block in `runs`: the crop always runs what the execution list names. A plan
- * is rejected, and the caller aborts, when a block the execution list names
- * would be skipped (ReuseOutput): that is the only way the graph could change
- * the result, and there is no second sequence to run.
+ * The dirty set names the blocks whose inputs changed. Folded nodes stay in
+ * the graph so the raw core is marked invalid, but they do not execute on
+ * their own. The executed list is the non-folded dirty nodes in topological
+ * order, which is the contract's crop order (analysis before raw.base).
  */
-CropGraphPlan planCropGraph(const std::vector<std::string>& dirtyIds,
-                            const bool runs[CROP_STAGE_COUNT])
+CropGraphPlan planCropGraph(const std::vector<std::string>& dirtyIds)
 {
     using namespace rtengine::stage;
-
-    validateCropStageIds();
 
     CropGraphPlan result;
     const StagePipelineSpec spec = buildPipelineSpec(StagePath::Crop);
@@ -478,29 +353,6 @@ CropGraphPlan planCropGraph(const std::vector<std::string>& dirtyIds,
         graph.connect(nodes[from], nodes[to]);
     }
 
-    std::vector<bool> active(spec.nodes.size(), false);
-    size_t activeCount = 0;
-    for (int stage = 0; stage < CROP_STAGE_COUNT; ++stage) {
-        const size_t index = indexOf(CROP_STAGE_IDS[stage]);
-        if (index == spec.nodes.size()) {
-            result.reason = std::string("unknown-node:")
-                            + CROP_STAGE_IDS[stage];
-            return result;
-        }
-        if (runs[stage]) {
-            active[index] = true;
-            ++activeCount;
-            /*
-             * The execution list must be part of the dirty set; otherwise the
-             * graph would be asked to run a block it believes is current.
-             */
-            if (dirty.find(CROP_STAGE_IDS[stage]) == dirty.end()) {
-                result.reason = std::string("dirty-missing:")
-                                + CROP_STAGE_IDS[stage];
-                return result;
-            }
-        }
-    }
     for (const std::string& id : dirty) {
         if (indexOf(id) == spec.nodes.size()) {
             result.reason = "unknown-dirty-node:" + id;
@@ -508,12 +360,6 @@ CropGraphPlan planCropGraph(const std::vector<std::string>& dirtyIds,
         }
     }
 
-    /*
-     * Dirtiness comes from the chosen dirty set, not from the execution list.
-     * The two normally agree on the stage-owned ids; the dirty set also names
-     * the folded nodes, which are marked dirty so the plan sees the raw core as
-     * invalid even though the crop carries them inside source.select.
-     */
     for (size_t i = 0; i < spec.nodes.size(); ++i) {
         if (dirty.find(spec.nodes[i].id) != dirty.end()) {
             graph.markDirty(nodes[i]);
@@ -539,19 +385,29 @@ CropGraphPlan planCropGraph(const std::vector<std::string>& dirtyIds,
         return result;
     }
 
-    for (size_t i = 0; i < spec.nodes.size(); ++i) {
-        if (active[i] && plan[i].action == StageAction::ReuseOutput) {
-            result.reason = spec.nodes[i].id;
-            return result;
+    std::size_t expected = 0;
+    for (const std::string& id : dirty) {
+        if (foldHost(StagePath::Crop, id) == nullptr) {
+            ++expected;
         }
     }
 
-    for (int stage = 0; stage < CROP_STAGE_COUNT; ++stage) {
-        if (runs[stage]) {
-            result.execute.push_back(static_cast<CropStage>(stage));
+    for (size_t index : order) {
+        const std::string& id = spec.nodes[index].id;
+        if (dirty.find(id) == dirty.end()) {
+            continue;
         }
+        if (foldHost(StagePath::Crop, id) != nullptr) {
+            continue;
+        }
+        if (plan[index].action == StageAction::ReuseOutput) {
+            result.reason = id;
+            return result;
+        }
+        result.execute.push_back(id);
     }
-    if (result.execute.size() != activeCount) {
+
+    if (result.execute.size() != expected) {
         result.reason = "missing-node";
         return result;
     }
@@ -576,8 +432,8 @@ void logCropGraph(const CropGraphPlan& plan)
     std::fprintf(stderr,
                  "crop-graph: active, %zu canonical nodes executed, %zu "
                  "folded: ", plan.execute.size(), folded.size());
-    for (CropStage stage : plan.execute) {
-        std::fprintf(stderr, "%s ", CROP_STAGE_IDS[stage]);
+    for (const std::string& id : plan.execute) {
+        std::fprintf(stderr, "%s ", id.c_str());
     }
     std::fprintf(stderr, "| folded:");
     for (const std::string& id : folded) {
@@ -699,7 +555,6 @@ void Crop::update(const EditorRequest& request)
     ctx.widIm = widIm;
     ctx.heiIm = heiIm;
 
-    bool runs[CROP_STAGE_COUNT] = {};
     std::vector<std::string> graphDirty;
 
     /*
@@ -907,55 +762,27 @@ void Crop::update(const EditorRequest& request)
     dirtyState->valid = true;
 
     graphDirty = derived.blocks;
-    cropRunsOf(cropStageOrder(derived.blocks), runs);
+    using CropHandler = void (Crop::*)(CropStageContext&);
+    static const rtengine::stage::StageHandlerRegistry<CropHandler> handlers =
+        [] {
+            rtengine::stage::StageHandlerRegistry<CropHandler> registry;
+            registry.add("source.select", &Crop::stageSourceSelect);
+            registry.add("analysis", &Crop::stageAnalysis);
+            registry.add("raw.base", &Crop::stageRawBase);
+            registry.add("transform", &Crop::stageTransform);
+            registry.add("local.adjustments", &Crop::stageLocalAdjustments);
+            registry.add("rgb.proc", &Crop::stageRgbProc);
+            registry.add("lab.tools", &Crop::stageLabTools);
+            registry.add("lab.sharpening", &Crop::stageLabSharpening);
+            registry.add("lab.wavelet", &Crop::stageLabWavelet);
+            registry.add("working.trc", &Crop::stageWorkingTrc);
+            registry.add("ciecam", &Crop::stageCieCam);
+            registry.add("gamut", &Crop::stageGamut);
+            registry.add("viewport.output", &Crop::stageViewportOutput);
+            return registry;
+        }();
 
-    const auto runStage = [this, &ctx](CropStage stage) {
-        switch (stage) {
-        case CROP_SOURCE_SELECT:
-            stageSourceSelect(ctx);
-            break;
-        case CROP_ANALYSIS:
-            stageAnalysis(ctx);
-            break;
-        case CROP_RAW_BASE:
-            stageRawBase(ctx);
-            break;
-        case CROP_TRANSFORM:
-            stageTransform(ctx);
-            break;
-        case CROP_LOCAL_ADJUSTMENTS:
-            stageLocalAdjustments(ctx);
-            break;
-        case CROP_RGB_PROC:
-            stageRgbProc(ctx);
-            break;
-        case CROP_LAB_TOOLS:
-            stageLabTools(ctx);
-            break;
-        case CROP_LAB_SHARPENING:
-            stageLabSharpening(ctx);
-            break;
-        case CROP_LAB_WAVELET:
-            stageLabWavelet(ctx);
-            break;
-        case CROP_WORKING_TRC:
-            stageWorkingTrc(ctx);
-            break;
-        case CROP_CIE_CAM:
-            stageCieCam(ctx);
-            break;
-        case CROP_GAMUT:
-            stageGamut(ctx);
-            break;
-        case CROP_VIEWPORT_OUTPUT:
-            stageViewportOutput(ctx);
-            break;
-        case CROP_STAGE_COUNT:
-            break;
-        }
-    };
-
-    const CropGraphPlan plan = planCropGraph(graphDirty, runs);
+    const CropGraphPlan plan = planCropGraph(graphDirty);
     if (!plan.valid) {
         ++cropGraphFallbacks;
         abortCropGraph(plan);
@@ -963,8 +790,15 @@ void Crop::update(const EditorRequest& request)
     logCropGraph(plan);
 
     ++cropGraphRuns;
-    for (CropStage stage : plan.execute) {
-        runStage(stage);
+    for (const std::string& id : plan.execute) {
+        const CropHandler handler = handlers.find(id);
+        if (!handler) {
+            std::fprintf(stderr,
+                         "crop-graph: fatal: no handler for node %s\n",
+                         id.c_str());
+            std::abort();
+        }
+        (this->*handler)(ctx);
     }
 
     if (cropImageListener) {

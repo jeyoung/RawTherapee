@@ -23,6 +23,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <initializer_list>
 #include <memory>
 #include <mutex>
@@ -58,6 +59,7 @@
 #include "settings.h"
 #include "stage/stage_graph.h"
 #include "stage/lab_tools_context.h"
+#include "stage/stage_handler.h"
 #include "stage/stage_pipeline.h"
 #include "stage/stage_buffer.h"
 #include "stage/stage_runtime.h"
@@ -297,8 +299,7 @@ struct ThumbnailGraphPlan {
  * skipped: that is the only way the graph could change the result, and the
  * graph is the only sequence left.
  */
-ThumbnailGraphPlan planThumbnailGraph(
-    std::initializer_list<const char*> active)
+ThumbnailGraphPlan planThumbnailGraph(const std::vector<std::string>& active)
 {
     using namespace rtengine::stage;
 
@@ -332,7 +333,7 @@ ThumbnailGraphPlan planThumbnailGraph(
     }
 
     std::vector<bool> activeNode(result.spec.nodes.size(), false);
-    for (const char* id : active) {
+    for (const std::string& id : active) {
         const size_t index = indexOf(id);
         if (index == result.spec.nodes.size()) {
             result.reason = std::string("unknown-node:") + id;
@@ -763,23 +764,25 @@ Thumbnail* Thumbnail::loadQuickFromRaw (const Glib::ustring& fname, eSensorType 
      * graph, so only normal thumbnails take the graph path.
      */
     if (!inspectorMode) {
-        const ThumbnailGraphPlan plan = planThumbnailGraph(
-            {"source.embedded", "thumbnail.decode"});
+        using Handler = std::function<bool()>;
+        stage::StageHandlerRegistry<Handler> handlers;
+        handlers.add("source.embedded", [&state] {
+            return stageSourceEmbedded(state);
+        });
+        handlers.add("thumbnail.decode", [&state] {
+            stageThumbnailDecode(state);
+            return true;
+        });
+
+        const ThumbnailGraphPlan plan = planThumbnailGraph(handlers.ids());
         if (!plan.valid) {
             abortThumbnailGraph("loadQuickFromRaw", plan.reason);
         }
         logThumbnailGraph("loadQuickFromRaw", plan);
 
-        for (const auto& id : plan.execute) {
-            if (id == "source.embedded") {
-                if (!stageSourceEmbedded(state)) {
-                    delete state.tpp;
-                    return nullptr;
-                }
-            } else if (id == "thumbnail.decode") {
-                stageThumbnailDecode(state);
-            } else {
-                assert(false);
+        for (const std::string& id : plan.execute) {
+            const Handler handler = handlers.find(id);
+            if (!handler || !handler()) {
                 delete state.tpp;
                 return nullptr;
             }
@@ -1479,27 +1482,33 @@ Thumbnail* Thumbnail::loadFromRaw (const Glib::ustring& fname, eSensorType &sens
     state.rawParams = rawParams;
     state.forHistogramMatching = forHistogramMatching;
 
-    const ThumbnailGraphPlan plan = planThumbnailGraph(
-        {"source.select", "raw.preprocess", "raw.demosaic", "raw.base"});
+    using Handler = std::function<bool()>;
+    stage::StageHandlerRegistry<Handler> handlers;
+    handlers.add("source.select", [&state] {
+        return stageSourceSelect(state);
+    });
+    handlers.add("raw.preprocess", [&state] {
+        stageRawPreprocess(state);
+        return true;
+    });
+    handlers.add("raw.demosaic", [&state] {
+        stageRawDemosaic(state);
+        return true;
+    });
+    handlers.add("raw.base", [&state] {
+        stageRawBase(state);
+        return true;
+    });
+
+    const ThumbnailGraphPlan plan = planThumbnailGraph(handlers.ids());
     if (!plan.valid) {
         abortThumbnailGraph("loadFromRaw", plan.reason);
     }
     logThumbnailGraph("loadFromRaw", plan);
 
-    for (const auto& id : plan.execute) {
-        if (id == "source.select") {
-            if (!stageSourceSelect(state)) {
-                return nullptr;
-            }
-        } else if (id == "raw.preprocess") {
-            stageRawPreprocess(state);
-        } else if (id == "raw.demosaic") {
-            stageRawDemosaic(state);
-        } else if (id == "raw.base") {
-            stageRawBase(state);
-        } else {
-            assert(false);
-            delete state.tpp;
+    for (const std::string& id : plan.execute) {
+        const Handler handler = handlers.find(id);
+        if (!handler || !handler()) {
             return nullptr;
         }
     }
@@ -1844,20 +1853,26 @@ IImage8* Thumbnail::quickProcessImage (const procparams::ProcParams& params, int
     state.rheight = rheight;
     state.interp = interp;
 
-    const ThumbnailGraphPlan plan = planThumbnailGraph(
-        {"thumbnail.scale", "thumbnail.transform"});
+    using Handler = std::function<bool()>;
+    stage::StageHandlerRegistry<Handler> handlers;
+    handlers.add("thumbnail.scale", [this, &state] {
+        stageQuickScale(state);
+        return true;
+    });
+    handlers.add("thumbnail.transform", [this, &state] {
+        stageQuickTransform(state);
+        return true;
+    });
+
+    const ThumbnailGraphPlan plan = planThumbnailGraph(handlers.ids());
     if (!plan.valid) {
         abortThumbnailGraph("quickProcessImage", plan.reason);
     }
     logThumbnailGraph("quickProcessImage", plan);
 
-    for (const auto& id : plan.execute) {
-        if (id == "thumbnail.scale") {
-            stageQuickScale(state);
-        } else if (id == "thumbnail.transform") {
-            stageQuickTransform(state);
-        } else {
-            assert(false);
+    for (const std::string& id : plan.execute) {
+        const Handler handler = handlers.find(id);
+        if (!handler || !handler()) {
             return nullptr;
         }
     }
@@ -3162,29 +3177,42 @@ IImage8* Thumbnail::processImage (const procparams::ProcParams& params, eSensorT
     state.iso = metadata->getISOSpeed();
     state.fcomp = metadata->getExpComp();
 
-    const ThumbnailGraphPlan plan = planThumbnailGraph(
-        {"thumbnail.scale", "thumbnail.transform", "thumbnail.whitebalance",
-         "thumbnail.rgb", "thumbnail.lab", "thumbnail.output"});
+    using Handler = std::function<bool()>;
+    stage::StageHandlerRegistry<Handler> handlers;
+    handlers.add("thumbnail.scale", [this, &state] {
+        stageScale(state);
+        return true;
+    });
+    handlers.add("thumbnail.transform", [this, &state] {
+        stageTransform(state);
+        return true;
+    });
+    handlers.add("thumbnail.whitebalance", [this, &state] {
+        stageWhiteBalance(state);
+        return true;
+    });
+    handlers.add("thumbnail.rgb", [this, &state] {
+        stageRgb(state);
+        return true;
+    });
+    handlers.add("thumbnail.lab", [this, &state] {
+        stageLab(state);
+        return true;
+    });
+    handlers.add("thumbnail.output", [this, &state] {
+        state.readyImg = stageOutput(state);
+        return state.readyImg != nullptr;
+    });
+
+    const ThumbnailGraphPlan plan = planThumbnailGraph(handlers.ids());
     if (!plan.valid) {
         abortThumbnailGraph("processImage", plan.reason);
     }
     logThumbnailGraph("processImage", plan);
 
-    for (const auto& id : plan.execute) {
-        if (id == "thumbnail.scale") {
-            stageScale(state);
-        } else if (id == "thumbnail.transform") {
-            stageTransform(state);
-        } else if (id == "thumbnail.whitebalance") {
-            stageWhiteBalance(state);
-        } else if (id == "thumbnail.rgb") {
-            stageRgb(state);
-        } else if (id == "thumbnail.lab") {
-            stageLab(state);
-        } else if (id == "thumbnail.output") {
-            state.readyImg = stageOutput(state);
-        } else {
-            assert(false);
+    for (const std::string& id : plan.execute) {
+        const Handler handler = handlers.find(id);
+        if (!handler || !handler()) {
             return nullptr;
         }
     }
