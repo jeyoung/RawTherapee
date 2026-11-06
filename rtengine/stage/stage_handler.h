@@ -17,13 +17,36 @@
 
 #pragma once
 
-#include <cassert>
+#include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <utility>
 #include <vector>
 
 namespace rtengine::stage
 {
+
+namespace detail
+{
+
+/*
+ * A registry is built from a fixed list of ids, so a null, empty or duplicate
+ * id is a programming error rather than a data error. The guard aborts in
+ * release builds too: a registry that silently drops or shadows an entry would
+ * dispatch the wrong body at run time, and the failure would surface far from
+ * the table that caused it.
+ */
+[[noreturn]] inline void fatalHandlerId(const char* reason, const char* id)
+{
+    if (id != nullptr) {
+        std::fprintf(stderr, "stage-handler: fatal: %s: %s\n", reason, id);
+    } else {
+        std::fprintf(stderr, "stage-handler: fatal: %s: (null)\n", reason);
+    }
+    std::abort();
+}
+
+} // namespace detail
 
 /*
  * One adapter's block-id-to-handler mapping.
@@ -43,11 +66,13 @@ class StageHandlerRegistry
 public:
     void add(const char* id, Handler handler)
     {
-        assert(id != nullptr && id[0] != '\0');
+        if (id == nullptr || id[0] == '\0') {
+            detail::fatalHandlerId("handler id is null or empty", id);
+        }
         for (const auto& entry : entries_) {
-            (void)entry;
-            assert(std::string(id) != entry.first &&
-                   "a handler id is registered twice");
+            if (entry.first == id) {
+                detail::fatalHandlerId("a handler id is registered twice", id);
+            }
         }
         entries_.emplace_back(id, std::move(handler));
     }

@@ -388,6 +388,15 @@ target_link_libraries(stage-graph-test PRIVATE rtengine)
 target_include_directories(stage-graph-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/stage")
 rt_setup_target(stage-graph-test)
 
+# Handler registry: insertion order, lookup and the fail-fast guards for a
+# null, empty or duplicate id.
+add_executable(stage-handler-test EXCLUDE_FROM_ALL
+    "${CMAKE_CURRENT_SOURCE_DIR}/stage/tests/stage_handler_test.cc"
+)
+target_link_libraries(stage-handler-test PRIVATE rtengine)
+target_include_directories(stage-handler-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/stage")
+rt_setup_target(stage-handler-test)
+
 add_executable(stage-indexer-test EXCLUDE_FROM_ALL
     "${CMAKE_CURRENT_SOURCE_DIR}/stage/tests/stage_indexer_test.cc"
 )
