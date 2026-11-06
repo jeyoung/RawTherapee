@@ -88,5 +88,12 @@ gui_drag() {
 
 gui_screenshot() {
     local path="$1"
-    import -window root -depth 8 "$path"
+    if command -v import >/dev/null 2>&1; then
+        import -window root -depth 8 "$path"
+    elif command -v scrot >/dev/null 2>&1; then
+        scrot -o "$path"
+    else
+        printf 'error: no screenshot tool (install ImageMagick or scrot)\n' >&2
+        return 1
+    fi
 }

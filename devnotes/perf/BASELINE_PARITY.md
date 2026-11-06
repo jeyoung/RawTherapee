@@ -77,8 +77,13 @@ tolerance.
 - **Crop:** the candidate harness checks graph versus legacy crop PPMs for fit,
   100%, zoomed and the staged Lab/CIE-CAM/gamut/local-adjustment cases. The
   VNG4 `crop.pp3` export above additionally matches `dev` exactly.
-- **Preview:** `run-suite` was run with `--skip-preview`; a GUI preview pixel
-  comparison against `dev` was not performed.
+- **Preview:** the headless preview-latency row passes (5 samples, p50 307 ms,
+  p95 308 ms). A GUI screenshot comparison against `dev` was run with
+  `tools/perf/test-preview-parity.sh`: `fit` is AE=0; `100`, `zoom`, `pan` and
+  `fit2` differ. The diff is image-domain and matches the same AMaZE tile-fix
+  exception as the neutral export; it is not a UI or handler-registry
+  difference. A VNG4-default preview comparison remains the clean way to
+  isolate that scene, and is not yet automated.
 - **Device:** the device path is compared with the host path, not with `dev`
   device execution, because the baseline build has no graph/device matrix.
 

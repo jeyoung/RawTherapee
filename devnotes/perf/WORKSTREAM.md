@@ -103,9 +103,10 @@ binary run on the host also matches the host build with the same data
   with `amaze-tile-parity-test`, `fast-preview-test`,
   `preview-base-cache-test`, `working-trc-setup-test`, `stage-handler-test`,
   the coverage gate, baseline parity and the headless preview latency gate.
-  Evidence: full suite all PASS including baseline parity and preview; PEF
-  baseline VNG4/MONO/profiles 0/0, AMaZE KNOWN 56/160; NEF 0/0 with AMaZE
-  KNOWN 1/1; coverage PASS (36/9/5).
+  Evidence: full suite all PASS including baseline parity, preview latency and
+  coverage; PEF baseline VNG4/MONO/profiles 0/0, AMaZE KNOWN 56/160; NEF 0/0
+  with AMaZE KNOWN 1/1; preview `fit` AE=0 and the 100%/zoom/pan screenshots
+  differ in the same AMaZE image domain. Coverage PASS (36/9/5).
 
 - **Baseline parity (2026-11-06)**: the current `perf-graph` was compared
   with `dev` at `9c3426339` using `build/cpu-dev`, the same `rtdata` bound to

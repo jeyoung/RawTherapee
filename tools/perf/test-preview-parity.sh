@@ -35,8 +35,13 @@ done
 mkdir -p "$out"
 
 require xdotool
-require import
-require magick
+if ! command -v import >/dev/null 2>&1 && ! command -v scrot >/dev/null 2>&1; then
+    die "install ImageMagick (import) or scrot"
+fi
+if ! command -v magick >/dev/null 2>&1; then
+    python3 -c 'from PIL import Image, ImageChops' 2>/dev/null || \
+        die "install ImageMagick (magick) or Python Pillow"
+fi
 
 capture() {
     local binary="$1" tag="$2"
@@ -85,14 +90,37 @@ failures=0
 for scene in fit 100 zoom pan fit2; do
     a="$out/baseline-$scene.png"
     b="$out/candidate-$scene.png"
-    value="$(magick compare -metric AE "$a" "$b" null: 2>&1 || true)"
-    if [ "$value" = "0" ]; then
-        printf 'PASS\tpreview %s AE=0\n' "$scene"
-    else
+    if command -v magick >/dev/null 2>&1; then
+        value="$(magick compare -metric AE "$a" "$b" null: 2>&1 || true)"
+        if [ "$value" = "0" ]; then
+            printf 'PASS\tpreview %s AE=0\n' "$scene"
+            continue
+        fi
         printf 'FAIL\tpreview %s AE=%s\n' "$scene" "$value"
         magick compare "$a" "$b" "$out/diff-$scene.png" 2>/dev/null || true
-        failures=$((failures + 1))
+    else
+        value="$(python3 - "$a" "$b" "$out/diff-$scene.png" <<'PY'
+import sys
+
+import numpy as np
+from PIL import Image, ImageChops
+
+a = Image.open(sys.argv[1]).convert("RGB")
+b = Image.open(sys.argv[2]).convert("RGB")
+diff = ImageChops.difference(a, b)
+count = int(np.any(np.array(diff) != 0, axis=2).sum())
+if count:
+    diff.save(sys.argv[3])
+print(count)
+PY
+)"
+        if [ "$value" = "0" ]; then
+            printf 'PASS\tpreview %s AE=0\n' "$scene"
+            continue
+        fi
+        printf 'FAIL\tpreview %s AE=%s\n' "$scene" "$value"
     fi
+    failures=$((failures + 1))
 done
 
 [ "$failures" -eq 0 ] || die "$failures preview scene(s) differ"
