@@ -174,6 +174,29 @@ static_assert(sizeof(FAST_EXPORT_NODE_IDS) / sizeof(FAST_EXPORT_NODE_IDS[0]) ==
                   FAST_EXPORT_NODE_COUNT,
               "the fast-export executor must cover the fast node inventory");
 
+/*
+ * The executor id arrays are checked against the canonical path before the
+ * first plan. The arrays exist to map a planned id to a private method; the
+ * contract owns the path composition. A mismatch is a programming error and
+ * aborts in release builds too.
+ */
+void validateExecutorIds(stage::StagePath path, const char* const* ids,
+                         size_t count, const char* label)
+{
+    const stage::StagePipelineSpec spec = stage::buildPipelineSpec(path);
+    bool matched = spec.nodes.size() == count;
+    for (size_t i = 0; matched && i < count; ++i) {
+        matched = spec.nodes[i].id == ids[i];
+    }
+    if (!matched) {
+        std::fprintf(stderr,
+                     "export-graph: fatal: the %s executor list does not "
+                     "match the stage contract\n",
+                     label);
+        std::abort();
+    }
+}
+
 bool isExportNode(const std::string& id)
 {
     for (const char* known : EXPORT_NODE_IDS) {
@@ -415,6 +438,9 @@ private:
      */
     Imagefloat *graph_pipeline()
     {
+        validateExecutorIds(stage::StagePath::Export, EXPORT_NODE_IDS,
+                            EXPORT_NODE_COUNT, "export");
+
         const stage::StagePipelineSpec spec =
             stage::buildPipelineSpec(stage::StagePath::Export);
 
@@ -454,7 +480,12 @@ private:
             abortStageGraph("inventory", "graph is not acyclic");
         }
 
-        const std::vector<stage::StageDecision> plan = graph.plan();
+        const stage::StagePlanResult plan_result = graph.plan();
+        if (!plan_result.valid) {
+            abortStageGraph("inventory", "graph plan failed");
+        }
+        const std::vector<stage::StageDecision>& plan =
+            plan_result.decisions;
 
         for (size_t index : order) {
             const std::string& id = graph.node(index).name;
@@ -561,6 +592,9 @@ private:
 
         pl = nullptr;
 
+        validateExecutorIds(stage::StagePath::FastExport, FAST_EXPORT_NODE_IDS,
+                            FAST_EXPORT_NODE_COUNT, "fast-export");
+
         const stage::StagePipelineSpec spec =
             stage::buildPipelineSpec(stage::StagePath::FastExport);
 
@@ -600,7 +634,12 @@ private:
             abortStageGraph("fast-export inventory", "graph is not acyclic");
         }
 
-        const std::vector<stage::StageDecision> plan = graph.plan();
+        const stage::StagePlanResult plan_result = graph.plan();
+        if (!plan_result.valid) {
+            abortStageGraph("fast-export inventory", "graph plan failed");
+        }
+        const std::vector<stage::StageDecision>& plan =
+            plan_result.decisions;
 
         for (size_t index : order) {
             const std::string& id = graph.node(index).name;

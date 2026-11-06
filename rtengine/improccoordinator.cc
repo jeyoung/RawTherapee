@@ -4530,6 +4530,45 @@ void ImProcCoordinator::invalidatePreviewDirtyState()
 }
 
 /*
+ * Handler registry for the preview nodes.
+ *
+ * The registry is the executor's side of the contract: plan validation asks it
+ * whether a non-folded node has a dispatch arm, and execution uses the same
+ * lookup. A contract node without a handler is therefore rejected before any
+ * body runs, in release builds too, instead of falling through an assert-only
+ * dispatch arm.
+ */
+ImProcCoordinator::PreviewNodeHandler
+ImProcCoordinator::previewNodeHandler(const std::string& id) const
+{
+    struct Entry {
+        const char* id;
+        PreviewNodeHandler handler;
+    };
+    static const Entry handlers[] = {
+        {"source.select", &ImProcCoordinator::stageSourceSelect},
+        {"raw.preprocess", &ImProcCoordinator::stageRawPreprocess},
+        {"raw.demosaic", &ImProcCoordinator::stageRawDemosaic},
+        {"raw.base", &ImProcCoordinator::stageRawBase},
+        {"transform", &ImProcCoordinator::stageTransform},
+        {"local.adjustments", &ImProcCoordinator::stageLocalAdjustments},
+        {"rgb.proc", &ImProcCoordinator::stageRgbProc},
+        {"lab.tools", &ImProcCoordinator::stageLabTools},
+        {"lab.wavelet", &ImProcCoordinator::stageLabWavelet},
+        {"working.trc", &ImProcCoordinator::stageWorkingTrc},
+        {"ciecam", &ImProcCoordinator::stageCieCam},
+        {"gamut", &ImProcCoordinator::stageGamut},
+        {"monitor.output", &ImProcCoordinator::stageMonitorOutput}
+    };
+    for (const Entry& entry : handlers) {
+        if (id == entry.id) {
+            return entry.handler;
+        }
+    }
+    return nullptr;
+}
+
+/*
  * Resolve the node sequence for this pass from the canonical preview spec.
  *
  * Every node is marked dirty from the parameter fingerprints and the render
@@ -4596,7 +4635,7 @@ ImProcCoordinator::PreviewPassPlan ImProcCoordinator::planPreviewPass(
     for (size_t i = 0; i < spec.nodes.size(); ++i) {
         const std::string& id = spec.nodes[i].id;
 
-        if (!isPreviewNode(id)) {
+        if (!isFoldedPreviewNode(id) && previewNodeHandler(id) == nullptr) {
             result.reason = "node has no executor: " + id;
             return result;
         }
@@ -4619,7 +4658,14 @@ ImProcCoordinator::PreviewPassPlan ImProcCoordinator::planPreviewPass(
         return result;
     }
 
-    const std::vector<stage::StageDecision> decisions = graph.plan();
+    const stage::StagePlanResult plan_result = graph.plan();
+    if (!plan_result.valid) {
+        result.reason = plan_result.reason;
+        return result;
+    }
+
+    const std::vector<stage::StageDecision>& decisions =
+        plan_result.decisions;
 
     if (decisions.size() != spec.nodes.size()) {
         result.reason = "incomplete plan";
@@ -4654,36 +4700,14 @@ void ImProcCoordinator::executePreviewNode(const std::string& id,
 {
     stage::ScopedProfile profile(id.c_str());
 
-    if (id == "source.select") {
-        stageSourceSelect(pass);
-    } else if (id == "raw.preprocess") {
-        stageRawPreprocess(pass);
-    } else if (id == "raw.demosaic") {
-        stageRawDemosaic(pass);
-    } else if (id == "raw.base") {
-        stageRawBase(pass);
-    } else if (id == "transform") {
-        stageTransform(pass);
-    } else if (id == "local.adjustments") {
-        stageLocalAdjustments(pass);
-    } else if (id == "rgb.proc") {
-        stageRgbProc(pass);
-    } else if (id == "lab.tools") {
-        stageLabTools(pass);
-    } else if (id == "lab.wavelet") {
-        stageLabWavelet(pass);
-    } else if (id == "working.trc") {
-        stageWorkingTrc(pass);
-    } else if (id == "ciecam") {
-        stageCieCam(pass);
-    } else if (id == "gamut") {
-        stageGamut(pass);
-    } else if (id == "monitor.output") {
-        stageMonitorOutput(pass);
-    } else {
-        // The plan rejects every node without an executor before it runs.
-        assert(false);
+    const PreviewNodeHandler handler = previewNodeHandler(id);
+    if (handler == nullptr) {
+        std::fprintf(stderr,
+                     "preview-graph: fatal: no handler for node %s\n",
+                     id.c_str());
+        std::abort();
     }
+    (this->*handler)(pass);
 }
 
 /*

@@ -333,6 +333,42 @@ constexpr const char* CROP_STAGE_IDS[CROP_STAGE_COUNT] = {
 };
 
 /*
+ * The executor list is a second copy of the contract's crop node list, minus
+ * the folded nodes. Keep it honest: a contract change that adds, removes or
+ * reorders a block must not let the crop silently omit work. The check runs
+ * once, before the first plan, and aborts in release builds too.
+ */
+bool cropStageIdsMatchContract()
+{
+    const rtengine::stage::StagePipelineSpec spec =
+        rtengine::stage::buildPipelineSpec(rtengine::stage::StagePath::Crop);
+    size_t index = 0;
+    for (const auto& node : spec.nodes) {
+        if (rtengine::stage::foldHost(rtengine::stage::StagePath::Crop,
+                                      node.id)
+            != nullptr) {
+            continue;
+        }
+        if (index >= CROP_STAGE_COUNT || node.id != CROP_STAGE_IDS[index]) {
+            return false;
+        }
+        ++index;
+    }
+    return index == CROP_STAGE_COUNT;
+}
+
+void validateCropStageIds()
+{
+    static const bool matched = cropStageIdsMatchContract();
+    if (!matched) {
+        std::fprintf(stderr,
+                     "crop-graph: fatal: the executor list does not match the "
+                     "crop contract\n");
+        std::abort();
+    }
+}
+
+/*
  * Canonical nodes this path does not execute as a block of its own. The crop
  * obtains its region through one opaque ImageSource::getImage() call, which
  * performs the raw select, preprocess and demosaic steps, so those nodes are
@@ -410,6 +446,8 @@ CropGraphPlan planCropGraph(const std::vector<std::string>& dirtyIds,
                             const bool runs[CROP_STAGE_COUNT])
 {
     using namespace rtengine::stage;
+
+    validateCropStageIds();
 
     CropGraphPlan result;
     const StagePipelineSpec spec = buildPipelineSpec(StagePath::Crop);
@@ -490,7 +528,12 @@ CropGraphPlan planCropGraph(const std::vector<std::string>& dirtyIds,
         return result;
     }
 
-    const std::vector<StageDecision> plan = graph.plan();
+    const StagePlanResult plan_result = graph.plan();
+    if (!plan_result.valid) {
+        result.reason = plan_result.reason;
+        return result;
+    }
+    const std::vector<StageDecision>& plan = plan_result.decisions;
     if (plan.size() != spec.nodes.size()) {
         result.reason = "incomplete-plan";
         return result;

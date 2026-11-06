@@ -58,17 +58,12 @@ struct StageParamMapEntry {
     std::vector<std::string> fields;
 };
 
-/* The export table keeps its original entry name for source compatibility. */
-using ExportParamMapEntry = StageParamMapEntry;
-using PreviewParamMapEntry = StageParamMapEntry;
-using CropParamMapEntry = StageParamMapEntry;
-
 /*
  * Stable descriptor-to-fields tables in pipeline order, for review.
  *
  * Each returned vector is built once and is immutable afterwards, so the
  * address is valid for the lifetime of the process. The export table has
- * twenty entries, preview fourteen and crop fifteen.
+ * twenty-two entries, preview fourteen and crop fifteen.
  */
 const std::vector<StageParamMapEntry>& exportParamMap();
 const std::vector<StageParamMapEntry>& previewParamMap();

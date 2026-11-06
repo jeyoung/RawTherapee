@@ -44,6 +44,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <initializer_list>
 #include <string>
@@ -245,16 +246,15 @@ bool hlrDemandsDemosaic(const ProcParams& params,
 /*
  * Name every item of a conservative fallback set.
  *
- * The contract is the authority for which items a path can run: an item that
- * no path block implements is a programming error, so the assertion fires in a
- * debug build instead of scheduling a body the executor does not have.
+ * The contract is the authority for which items a path can run, including the
+ * path-specific folds: preview has no denoise item, crop has no retinex
+ * preparation, and crop owns its analysis separately from the base. The
+ * fallback therefore derives its set from the contract instead of repeating
+ * those lists here.
  */
-void setAll(WorkOrder& order, StagePath path,
-            std::initializer_list<WorkItem> items)
+void setAll(WorkOrder& order, StagePath path)
 {
-    for (WorkItem item : items) {
-        assert(pathSchedulesWorkItem(path, item)
-               && "a fallback set names an item the path cannot run");
+    for (WorkItem item : pathWorkItems(path)) {
         order.set(item);
     }
 }
@@ -271,9 +271,11 @@ void validateOrder(StagePath path, const WorkOrder& order)
 {
     for (size_t i = 0; i < workItemCount; ++i) {
         const WorkItem item = static_cast<WorkItem>(i);
-        if (order.has(item)) {
-            assert(pathSchedulesWorkItem(path, item)
-                   && "the work order names an item the path cannot run");
+        if (order.has(item) && !pathSchedulesWorkItem(path, item)) {
+            std::fprintf(stderr,
+                         "stage-work: fatal: %s cannot run %s\n",
+                         stagePathName(path), workItemName(item));
+            std::abort();
         }
     }
 }
@@ -393,11 +395,7 @@ WorkOrder derive_preview_work(const WorkInputs& inputs)
      */
     if (inputs.currentState == nullptr || inputs.currentFingerprints == nullptr
         || inputs.params == nullptr) {
-        setAll(order, inputs.path,
-               {WorkItem::sourceSelect, WorkItem::rawPreprocess,
-                WorkItem::rawDemosaic, WorkItem::rawBaseRebuild,
-                WorkItem::retinexPrepare, WorkItem::spotApply,
-                WorkItem::spotRestore, WorkItem::analysisRun});
+        setAll(order, inputs.path);
         validateOrder(inputs.path, order);
         return order;
     }
@@ -672,10 +670,7 @@ WorkOrder derive_crop_work(const WorkInputs& inputs)
      */
     if (inputs.currentState == nullptr || inputs.currentFingerprints == nullptr
         || inputs.params == nullptr) {
-        setAll(order, inputs.path,
-               {WorkItem::sourceSelect, WorkItem::rawBaseRebuild,
-                WorkItem::spotApply, WorkItem::spotRestore,
-                WorkItem::analysisRun, WorkItem::denoiseRun});
+        setAll(order, inputs.path);
         validateOrder(inputs.path, order);
         return order;
     }

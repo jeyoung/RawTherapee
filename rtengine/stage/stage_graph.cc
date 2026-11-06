@@ -85,15 +85,20 @@ bool StageGraph::dirty(size_t index) const
     return index < dirty_.size() && dirty_[index];
 }
 
-std::vector<StageDecision> StageGraph::plan() const
+StagePlanResult StageGraph::plan() const
 {
+    StagePlanResult result;
     std::vector<size_t> order;
-    topologicalOrder(order);
-    std::vector<StageDecision> decisions(nodes_.size());
+    if (!topologicalOrder(order) || order.size() != nodes_.size()) {
+        result.reason = "cycle";
+        return result;
+    }
+
+    result.decisions.resize(nodes_.size());
     for (size_t index : order) {
         bool upstream_changed = false;
         for (size_t input : nodes_[index].inputs) {
-            if (decisions[input].action != StageAction::ReuseOutput) {
+            if (result.decisions[input].action != StageAction::ReuseOutput) {
                 upstream_changed = true;
                 break;
             }
@@ -109,9 +114,10 @@ std::vector<StageDecision> StageGraph::plan() const
         } else {
             action = StageAction::ReuseOutput;
         }
-        decisions[index] = StageDecision{index, action};
+        result.decisions[index] = StageDecision{index, action};
     }
-    return decisions;
+    result.valid = true;
+    return result;
 }
 
 } // namespace rtengine::stage

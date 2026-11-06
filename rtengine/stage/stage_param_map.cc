@@ -56,9 +56,10 @@
 
 #include <array>
 #include <cassert>
+#include <cstdio>
+#include <cstdlib>
 #include <cstddef>
 #include <cstdint>
-#include <initializer_list>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -2572,11 +2573,14 @@ PathTable buildPath(StagePath stagePath)
     path.reserve(contract.nodes.size());
     for (const char* id : contract.nodes) {
         const DescriptorDefinition* definition = findDefinition(id);
-        assert(definition != nullptr
-               && "a fingerprinted path names a block without a hasher");
-        if (definition != nullptr) {
-            path.push_back(definition);
+        if (definition == nullptr) {
+            std::fprintf(stderr,
+                         "stage-param-map: fatal: no fingerprint hasher for "
+                         "block %s\n",
+                         id);
+            std::abort();
         }
+        path.push_back(definition);
     }
     return path;
 }
@@ -2620,8 +2624,12 @@ std::vector<StageParamMapEntry> project(StagePath stagePath,
     const StagePathContract& contract = stagePathContract(stagePath);
     std::vector<StageParamMapEntry> entries;
     entries.reserve(path.size());
-    assert(path.size() == contract.nodes.size()
-           && "the hasher table and the path contract disagree");
+    if (path.size() != contract.nodes.size()) {
+        std::fprintf(stderr,
+                     "stage-param-map: fatal: the hasher table and the path "
+                     "contract disagree\n");
+        std::abort();
+    }
 
     /*
      * The published field lists come from the contract, which is the single

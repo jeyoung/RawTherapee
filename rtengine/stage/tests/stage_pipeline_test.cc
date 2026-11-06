@@ -26,6 +26,7 @@
 
 #include "stage_pipeline.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <map>
 #include <set>
@@ -523,9 +524,15 @@ void checkContract()
               "contract: block has a display name: " + id);
         check(!block.paramFields.empty() || id == "source.embedded",
               "contract: block lists its parameter inputs: " + id);
-        for (WorkItem item : block.workItems) {
-            check(item != WorkItem::Count,
+        for (const StageWorkItemRule& rule : block.workItems) {
+            check(rule.item != WorkItem::Count,
                   "contract: block names a real work item: " + id);
+            check(!rule.paths.empty(),
+                  "contract: work item names its paths: " + id);
+            std::set<StagePath> uniquePaths(rule.paths.begin(),
+                                            rule.paths.end());
+            check(uniquePaths.size() == rule.paths.size(),
+                  "contract: work item lists a path once: " + id);
         }
         for (const StageFoldRule& fold : block.folds) {
             check(fold.host != nullptr && fold.host[0] != '\0',
@@ -609,6 +616,30 @@ void checkContract()
           "contract: fast export runs analysis on its own");
     check(foldHost(StagePath::Thumbnail, "raw.base") == nullptr,
           "contract: thumbnail runs raw.base on its own");
+
+    /* Work-item path membership is exact, including the path-specific folds. */
+    const auto hasItem = [](StagePath path, WorkItem item) {
+        const std::vector<WorkItem> items = pathWorkItems(path);
+        return std::find(items.begin(), items.end(), item) != items.end();
+    };
+    check(hasItem(StagePath::Preview, WorkItem::analysisRun),
+          "contract: preview schedules the folded analysis");
+    check(!hasItem(StagePath::Preview, WorkItem::denoiseRun),
+          "contract: preview has no denoise item");
+    check(hasItem(StagePath::Preview, WorkItem::retinexPrepare),
+          "contract: preview schedules retinex preparation");
+    check(hasItem(StagePath::Crop, WorkItem::analysisRun),
+          "contract: crop schedules its own analysis");
+    check(hasItem(StagePath::Crop, WorkItem::denoiseRun),
+          "contract: crop schedules the base denoise tail");
+    check(!hasItem(StagePath::Crop, WorkItem::retinexPrepare),
+          "contract: crop has no retinex preparation");
+    check(!hasItem(StagePath::Crop, WorkItem::rawPreprocess),
+          "contract: crop folds preprocess into source.select");
+    check(hasItem(StagePath::Export, WorkItem::analysisRun),
+          "contract: export schedules its analysis block");
+    check(hasItem(StagePath::FastExport, WorkItem::denoiseRun),
+          "contract: fast export schedules denoise");
 
     /* The raw-core flag is the only source of the full-frame prefix. */
     for (StagePath path : allPaths()) {

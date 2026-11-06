@@ -384,6 +384,8 @@ protected:
     void stageMonitorOutput(PreviewPassState& pass);
 
     PreviewPassPlan planPreviewPass(PreviewPassState& pass);
+    using PreviewNodeHandler = void (ImProcCoordinator::*)(PreviewPassState&);
+    PreviewNodeHandler previewNodeHandler(const std::string& id) const;
     void executePreviewNode(const std::string& id, PreviewPassState& pass);
 
     /*

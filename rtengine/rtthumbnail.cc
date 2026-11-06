@@ -354,7 +354,12 @@ ThumbnailGraphPlan planThumbnailGraph(
         return result;
     }
 
-    const std::vector<StageDecision> plan = graph.plan();
+    const StagePlanResult plan_result = graph.plan();
+    if (!plan_result.valid) {
+        result.reason = plan_result.reason;
+        return result;
+    }
+    const std::vector<StageDecision>& plan = plan_result.decisions;
     if (plan.size() != result.spec.nodes.size()) {
         result.reason = "incomplete-plan";
         return result;

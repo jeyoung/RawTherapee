@@ -33,20 +33,38 @@ int main()
     check(graph.topologicalOrder(order), "graph is acyclic");
     check(order == std::vector<size_t>({init, curve, output}), "topological order");
 
-    auto decisions = graph.plan();
-    check(decisions[init].action == StageAction::Recompute, "dirty init recomputes");
-    check(decisions[curve].action == StageAction::ReuseInput, "curve reuses input");
-    check(decisions[output].action == StageAction::Recompute, "downstream recomputes");
+    StagePlanResult result = graph.plan();
+    check(result.valid, "acyclic graph plans");
+    const auto& decisions = result.decisions;
+    check(decisions[init].action == StageAction::Recompute,
+          "dirty init recomputes");
+    check(decisions[curve].action == StageAction::ReuseInput,
+          "curve reuses input");
+    check(decisions[output].action == StageAction::Recompute,
+          "downstream recomputes");
 
     graph.markClean(init);
     graph.markClean(curve);
     graph.markClean(output);
-    decisions = graph.plan();
-    check(decisions[init].action == StageAction::ReuseOutput,
+    result = graph.plan();
+    check(result.valid, "clean acyclic graph plans");
+    check(result.decisions[init].action == StageAction::ReuseOutput,
           "clean recompute node reuses its output");
-    check(decisions[curve].action == StageAction::ReuseInput, "curve reuses input");
-    check(decisions[output].action == StageAction::Recompute,
+    check(result.decisions[curve].action == StageAction::ReuseInput,
+          "curve reuses input");
+    check(result.decisions[output].action == StageAction::Recompute,
           "output follows changed curve");
+
+    StageGraph cyclic;
+    const size_t a = cyclic.addNode("a", RT_STAGE_RECOMPUTE);
+    const size_t b = cyclic.addNode("b", RT_STAGE_RECOMPUTE);
+    cyclic.connect(a, b);
+    cyclic.connect(b, a);
+    const StagePlanResult failed = cyclic.plan();
+    check(!failed.valid, "a cyclic graph is rejected");
+    check(failed.reason == "cycle", "the rejection names the cycle");
+    check(failed.decisions.empty(),
+          "a rejected plan exposes no executable decisions");
 
     if (failures == 0) {
         std::puts("stage-graph-test: PASS");

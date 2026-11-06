@@ -143,20 +143,18 @@ const char* stageOwnershipName(StageOwnership ownership);
  */
 enum class StageEffect : uint32_t {
     None = 0,
-    /* Seeds the frame identity; a change reloads the raw core. */
-    SourceFrame = 1u << 0,
     /* Rewrites the shared raw planes (preprocess, demosaic, retinex). */
-    RawPlanes = 1u << 1,
+    RawPlanes = 1u << 0,
     /* Rewrites the base image or the spot buffer. */
-    BaseImage = 1u << 2,
+    BaseImage = 1u << 1,
     /* Writes the spot buffer that a later pass restores. */
-    SpotBuffer = 1u << 3,
+    SpotBuffer = 1u << 2,
     /* Writes the analysis side channel consumed by the base. */
-    Analysis = 1u << 4,
+    Analysis = 1u << 3,
     /* Writes a display sink, which owns no processing buffer. */
-    Display = 1u << 5,
+    Display = 1u << 4,
     /* Writes output metadata or attaches a profile. */
-    Metadata = 1u << 6
+    Metadata = 1u << 5
 };
 
 inline StageEffect operator|(StageEffect a, StageEffect b)
@@ -184,8 +182,9 @@ std::string stageEffectName(StageEffect effect);
  *
  * The class names the buffers a node needs beyond its cached image plane.
  * `stage_opencl_device.cc` enforces the byte budget itself; the contract
- * declares the class so the planner can report a block's working set and a
- * future launcher can admit it before allocating.
+ * declares the class so the planner can reject a consumer that claims scratch
+ * and so the dump can report a block's working set. It is a structural
+ * declaration, not a second allocator.
  */
 enum class StageWorkingSet : uint32_t {
     None = 0,
@@ -233,6 +232,20 @@ struct StageFoldRule {
     const char* host = nullptr;
 };
 
+/*
+ * One work item a block implements, and the paths on which that body exists.
+ *
+ * The body is path-specific even when the block id is shared: preview folds
+ * the analysis into raw.base, crop runs a separate analysis before its base,
+ * and only crop runs the denoise tail inside raw.base. The path list keeps the
+ * contract exact instead of over-claiming an item for every path that carries
+ * the block.
+ */
+struct StageWorkItemRule {
+    WorkItem item = WorkItem::sourceSelect;
+    std::vector<StagePath> paths;
+};
+
 /* One canonical block, defined once for every path that carries it. */
 struct StageBlockContract {
     const char* id = "";
@@ -243,8 +256,8 @@ struct StageBlockContract {
     StageWorkingSet workingSet = StageWorkingSet::None;
     /* ProcParams members the block reads; dotted names are sub-fields. */
     std::vector<const char*> paramFields;
-    /* Destructive bodies this block implements. */
-    std::vector<WorkItem> workItems;
+    /* Destructive bodies this block implements, with their paths. */
+    std::vector<StageWorkItemRule> workItems;
     /* Paths on which another block carries this body. */
     std::vector<StageFoldRule> folds;
     /* Paths on which the block runs on every update. */
@@ -281,9 +294,6 @@ const StagePathContract& stagePathContract(StagePath path);
 
 /* The block record for `id`, or null when the id is not canonical. */
 const StageBlockContract* findStageBlockContract(const std::string& id);
-
-/* Whether `id` is a canonical block. */
-bool isStageBlockId(const std::string& id);
 
 /*
  * Folded blocks on `path`, in pipeline order. A folded block is present in the

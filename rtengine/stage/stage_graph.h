@@ -27,6 +27,17 @@ struct StageDecision {
 };
 
 /*
+ * Result of plan(). A graph that cannot be planned has no executable
+ * decisions: `valid` is false, `reason` names the failure and `decisions` is
+ * empty. Adapters must reject such a plan instead of indexing it.
+ */
+struct StagePlanResult {
+    bool valid = false;
+    std::string reason;
+    std::vector<StageDecision> decisions;
+};
+
+/*
  * A small dependency graph with explicit reuse semantics. It mirrors the
  * stage runtime object model: a node is a kernel invocation, edges are buffer
  * dependencies, and the cache is consulted by the caller using the returned
@@ -52,7 +63,7 @@ public:
      * Resolve actions for every node. A dirty node recomputes its output; a
      * clean node may reuse its input or its output according to its mode.
      */
-    std::vector<StageDecision> plan() const;
+    StagePlanResult plan() const;
 
 private:
     std::vector<StageNode> nodes_;

@@ -240,7 +240,7 @@ const std::vector<ParamMutation>& paramMutations()
          [](procparams::ProcParams& p) { p.colorappearance.enabled = true; },
          {"ciecam"}},
         {"icm", [](procparams::ProcParams& p) { p.icm.workingProfile = "ProPhoto"; },
-         {"raw.base", "analysis", "local.adjustments", "rgb.proc", "lab.tools",
+         {"analysis", "raw.base", "local.adjustments", "rgb.proc", "lab.tools",
           "lab.sharpening", "lab.wavelet", "working.trc", "ciecam", "gamut",
           "viewport.output"}}
     };
@@ -612,15 +612,18 @@ void testRequestFacts()
     }
 
     /*
-     * The Derived row is the analysis and the base, in canonical order. Both
-     * paths carry the same row: the base is listed even though it precedes the
-     * analysis in the pipeline, because the closure never walks backwards.
+     * The Derived row is the analysis and the base, in canonical order. On the
+     * crop the analysis precedes the base; on the preview the base precedes
+     * the folded analysis. Both are listed because the closure never walks
+     * backwards.
      */
     for (StagePath path : {StagePath::Crop, StagePath::Preview}) {
         check(blocks_for_render_state(path, RenderStateAspect::Derived)
-                  == setOf({"raw.base", "analysis"}),
+                  == (path == StagePath::Crop
+                          ? setOf({"analysis", "raw.base"})
+                          : setOf({"raw.base", "analysis"})),
               std::string(stagePathName(path))
-                  + " derived: the row is the base and the analysis");
+                  + " derived: the row is the analysis and the base");
     }
 }
 
@@ -635,18 +638,18 @@ void testAspectBlocks()
     const std::vector<Expected> expected = {
         /* Crop: ROI blocks follow the allocation, the raw core does not. */
         {StagePath::Crop, RenderStateAspect::Geometry,
-         setOf({"raw.base", "analysis", "transform", "local.adjustments",
+         setOf({"analysis", "raw.base", "transform", "local.adjustments",
                 "rgb.proc", "lab.tools", "lab.sharpening", "lab.wavelet",
                 "working.trc", "ciecam", "gamut", "viewport.output"})},
         {StagePath::Crop, RenderStateAspect::Source,
          setOf({"source.select", "raw.preprocess", "raw.demosaic", "raw.base"})},
         {StagePath::Crop, RenderStateAspect::HighDetail,
-         setOf({"raw.preprocess", "raw.demosaic", "raw.base", "analysis",
+         setOf({"raw.preprocess", "raw.demosaic", "analysis", "raw.base",
                 "transform"})},
         /* Derived: the analysis and the base it feeds, on both paths. raw.base
            is explicit because the closure from analysis never pulls it. */
         {StagePath::Crop, RenderStateAspect::Derived,
-         setOf({"raw.base", "analysis"})},
+         setOf({"analysis", "raw.base"})},
         {StagePath::Crop, RenderStateAspect::Display,
          setOf({"viewport.output"})},
         {StagePath::Crop, RenderStateAspect::Editor,
@@ -748,8 +751,8 @@ void testStateMutation()
           "state spot: a live buffer schedules the base without a delta");
     check(contains(fromSpot.blocks, "raw.base"),
           "state spot: the base is in the execution set");
-    check(contains(fromSpot.blocks, "analysis"),
-          "state spot: the base closure reaches the analysis");
+    check(!contains(fromSpot.blocks, "analysis"),
+          "state spot: the base does not force an upstream analysis");
 
     const DirtyBlocks previewSpot =
         dirtyBlocksFromRenderState(spot, spot, StagePath::Preview);

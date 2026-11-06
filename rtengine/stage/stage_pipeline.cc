@@ -17,8 +17,11 @@
 
 #include "stage_pipeline.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cstddef>
+#include <cstdio>
+#include <cstdlib>
 #include <set>
 #include <sstream>
 #include <string>
@@ -78,9 +81,6 @@ StageDescriptorSpec makeDescriptor(const std::string& id, StagePath path)
     descriptor.consumer = consumerFor(path);
     descriptor.reuse = block->reuse;
     descriptor.ownership = block->ownership;
-    descriptor.effects = block->effects;
-    descriptor.workingSet = block->workingSet;
-    descriptor.workItems = block->workItems;
     descriptor.outputs.push_back(descriptor.id);
     for (const char* param : block->paramFields) {
         descriptor.paramFields.emplace_back(param);
@@ -111,62 +111,139 @@ void populateInputs(StagePipelineSpec& spec)
  * Check that the contract's structural columns agree with the path edges.
  *
  * This is the planner's side of the contract: a path whose node structure
- * contradicts a block's ownership is a programming error, not a runtime
- * fallback. The checks are assertions so a release build still plans the path,
- * while every debug build and every test fails at the source of the drift.
+ * contradicts a block's ownership, effects or working-set class is a
+ * programming error, not a runtime fallback. The checks abort in release
+ * builds too, because a rejected plan is safer than a partly ordered one.
  */
+[[noreturn]] void invalidSpec(const std::string& reason)
+{
+    std::fprintf(stderr, "stage-pipeline: fatal: %s\n", reason.c_str());
+    std::abort();
+}
+
+bool hasWorkItem(StagePath path, WorkItem item)
+{
+    return pathSchedulesWorkItem(path, item);
+}
+
 void validateSpec(const StagePipelineSpec& spec)
 {
     std::set<std::string> ids;
     for (const StageDescriptorSpec& node : spec.nodes) {
-        const bool inserted = ids.insert(node.id).second;
-        assert(inserted && "a path names a block twice");
-        (void)inserted;
-        assert(!node.id.empty() && "a path names an empty block id");
+        if (!ids.insert(node.id).second) {
+            invalidSpec("a path names a block twice: " + node.id);
+        }
+        if (node.id.empty()) {
+            invalidSpec("a path names an empty block id");
+        }
     }
 
     std::set<std::pair<std::string, std::string>> uniqueEdges;
     std::set<std::string> produced;
     std::set<std::string> consumed;
     for (const auto& edge : spec.edges) {
-        assert(ids.count(edge.first) != 0 && "edge source is not on the path");
-        assert(ids.count(edge.second) != 0 && "edge target is not on the path");
-        assert(uniqueEdges.insert(edge).second && "duplicate path edge");
+        if (ids.count(edge.first) == 0 ||
+            ids.count(edge.second) == 0) {
+            invalidSpec("an edge names a block outside the path");
+        }
+        if (!uniqueEdges.insert(edge).second) {
+            invalidSpec("duplicate path edge");
+        }
         produced.insert(edge.first);
         consumed.insert(edge.second);
     }
 
+    const bool workOrdered = spec.path != StagePath::Thumbnail;
+
     for (const StageDescriptorSpec& node : spec.nodes) {
         if (!node.foldedInto.empty()) {
-            assert(ids.count(node.foldedInto) != 0
-                   && "a fold host is not on the path");
-            assert(foldHost(spec.path, node.foldedInto) == nullptr
-                   && "a fold host is itself folded");
+            if (ids.count(node.foldedInto) == 0) {
+                invalidSpec("a fold host is not on the path: " +
+                            node.foldedInto);
+            }
+            if (foldHost(spec.path, node.foldedInto) != nullptr) {
+                invalidSpec("a fold host is itself folded: " +
+                            node.foldedInto);
+            }
         }
 
         switch (node.ownership) {
         case StageOwnership::Consumes:
-            assert(produced.count(node.id) == 0
-                   && "a consumer may not produce an output buffer");
+            if (produced.count(node.id) != 0) {
+                invalidSpec("a consumer produces an output buffer: " +
+                            node.id);
+            }
             break;
         case StageOwnership::InPlace:
-            assert(node.inputs.size() == 1
-                   && "an in-place block needs exactly one buffer input");
+            if (node.inputs.size() != 1) {
+                invalidSpec("an in-place block needs one buffer input: " +
+                            node.id);
+            }
             break;
         case StageOwnership::Produces:
             break;
         }
+
+        const StageBlockContract* block =
+            findStageBlockContract(node.id);
+        if (block == nullptr) {
+            invalidSpec("a path names an unknown block: " + node.id);
+        }
+
+        /*
+         * A folded block runs its host's body, so its effects and work items
+         * belong to that body on this path. The thumbnail path has no work
+         * order, so its effects are not checked against one.
+         */
+        if (block == nullptr || !workOrdered ||
+            !node.foldedInto.empty()) {
+            continue;
+        }
+
+        if (hasEffect(block->effects, StageEffect::Display) ||
+            hasEffect(block->effects, StageEffect::Metadata)) {
+            if (node.ownership != StageOwnership::Consumes) {
+                invalidSpec("a sink effect needs a consumer: " + node.id);
+            }
+        }
+        if (hasEffect(block->effects, StageEffect::SpotBuffer) &&
+            !hasWorkItem(spec.path, WorkItem::spotApply) &&
+            !hasWorkItem(spec.path, WorkItem::spotRestore)) {
+            invalidSpec("a spot effect has no spot work item: " + node.id);
+        }
+        if (hasEffect(block->effects, StageEffect::BaseImage) &&
+            !hasWorkItem(spec.path, WorkItem::rawBaseRebuild) &&
+            !hasWorkItem(spec.path, WorkItem::denoiseRun)) {
+            invalidSpec("a base effect has no base work item: " + node.id);
+        }
+        if (hasEffect(block->effects, StageEffect::Analysis) &&
+            !hasWorkItem(spec.path, WorkItem::analysisRun)) {
+            invalidSpec("an analysis effect has no analysis item: " + node.id);
+        }
+        if (hasEffect(block->effects, StageEffect::RawPlanes) &&
+            !hasWorkItem(spec.path, WorkItem::rawPreprocess) &&
+            !hasWorkItem(spec.path, WorkItem::rawDemosaic) &&
+            !hasWorkItem(spec.path, WorkItem::retinexPrepare)) {
+            invalidSpec("a raw-plane effect has no raw work item: " + node.id);
+        }
+        if (node.ownership == StageOwnership::Consumes &&
+            (hasWorkingSet(block->workingSet, StageWorkingSet::ScratchPlanes) ||
+             hasWorkingSet(block->workingSet, StageWorkingSet::TransformMap) ||
+             hasWorkingSet(block->workingSet, StageWorkingSet::TapTables) ||
+             hasWorkingSet(block->workingSet, StageWorkingSet::DoubleState))) {
+            invalidSpec("a consumer declares device scratch: " + node.id);
+        }
     }
 
     for (const std::string& root : spec.roots) {
-        (void)root;
-        assert(ids.count(root) != 0 && "root is not on the path");
-        assert(consumed.count(root) == 0 && "root has an input edge");
+        if (ids.count(root) == 0 || consumed.count(root) != 0) {
+            invalidSpec("a root is not a root: " + root);
+        }
     }
     for (const std::string& sink : spec.sinks) {
-        (void)sink;
-        assert(ids.count(sink) != 0 && "sink is not on the path");
-        assert(produced.count(sink) == 0 && "sink has an output edge");
+        if (ids.count(sink) == 0 || produced.count(sink) != 0) {
+            invalidSpec("a sink is not a sink: " + sink);
+        }
     }
 }
 
@@ -211,19 +288,24 @@ std::string dumpPipelineSpec(StagePath path)
     out << "  // path: " << stagePathName(path) << "\n";
 
     for (const auto& node : spec.nodes) {
+        const StageBlockContract* block =
+            findStageBlockContract(node.id);
+        assert(block != nullptr && "a spec node has no contract record");
         out << "  // node: id=" << node.id << " name=\"" << node.name
             << "\" domain=" << stageDomainName(node.domain)
             << " consumer=" << stageConsumerName(node.consumer)
             << " reuse=" << stageReuseName(node.reuse)
-            << " ownership=" << stageOwnershipName(node.ownership)
-            << " effects=" << stageEffectName(node.effects)
-            << " working-set=" << stageWorkingSetName(node.workingSet)
-            << " work-items=";
-        for (size_t i = 0; i < node.workItems.size(); ++i) {
-            if (i != 0) {
-                out << ",";
+            << " ownership=" << stageOwnershipName(node.ownership);
+        if (block != nullptr) {
+            out << " effects=" << stageEffectName(block->effects)
+                << " working-set=" << stageWorkingSetName(block->workingSet)
+                << " work-items=";
+            for (size_t i = 0; i < block->workItems.size(); ++i) {
+                if (i != 0) {
+                    out << ",";
+                }
+                out << workItemName(block->workItems[i].item);
             }
-            out << workItemName(node.workItems[i]);
         }
         if (!node.foldedInto.empty()) {
             out << " folded-into=" << node.foldedInto;

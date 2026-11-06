@@ -32,8 +32,8 @@
 
 #include <algorithm>
 #include <cassert>
-#include <initializer_list>
 #include <sstream>
+#include <utility>
 #include <string>
 #include <vector>
 
@@ -49,14 +49,18 @@ const std::vector<StageBlockContract>& blockTable()
     static const std::vector<StageBlockContract> table = {
         // id                    display name              reuse                  ownership                     effects                                                          working set                                                       params
         {"source.select",        "Select source",          RT_STAGE_RECOMPUTE,
-         StageOwnership::Produces, StageEffect::SourceFrame, StageWorkingSet::None,
-         {"raw.bayersensor.imageNum"}, {WorkItem::sourceSelect}, {}, {}, true},
+         StageOwnership::Produces, StageEffect::None, StageWorkingSet::None,
+         {"raw.bayersensor.imageNum"},
+         {{WorkItem::sourceSelect,
+           {StagePath::Export, StagePath::FastExport, StagePath::Preview,
+            StagePath::Crop, StagePath::Thumbnail}}},
+         {}, {}, true},
         {"source.embedded",      "Select embedded JPEG",   RT_STAGE_RECOMPUTE,
-         StageOwnership::Produces, StageEffect::SourceFrame, StageWorkingSet::None,
+         StageOwnership::Produces, StageEffect::None, StageWorkingSet::None,
          {}, {}, {}, {}},
         {"raw.preprocess",       "Raw preprocess",         RT_STAGE_REUSE_OUTPUT,
          StageOwnership::InPlace,
-         StageEffect::SourceFrame | StageEffect::RawPlanes,
+         StageEffect::RawPlanes,
          StageWorkingSet::Image | StageWorkingSet::ScratchPlanes,
          {"raw.bayersensor.black0", "raw.bayersensor.black1",
           "raw.bayersensor.black2", "raw.bayersensor.black3",
@@ -76,11 +80,12 @@ const std::vector<StageBlockContract>& blockTable()
           "raw.hotdeadpix_thresh", "lensProf.lcMode", "lensProf.lcpFile",
           "lensProf.useVign", "lensProf.lfCameraMake",
           "lensProf.lfCameraModel", "lensProf.lfLens"},
-         {WorkItem::rawPreprocess},
+         {{WorkItem::rawPreprocess,
+           {StagePath::Export, StagePath::FastExport, StagePath::Preview}}},
          {{StagePath::Crop, "source.select"}}, {}, true},
         {"raw.demosaic",         "Demosaic",               RT_STAGE_REUSE_OUTPUT,
          StageOwnership::InPlace,
-         StageEffect::SourceFrame | StageEffect::RawPlanes,
+         StageEffect::RawPlanes,
          StageWorkingSet::Image | StageWorkingSet::ScratchPlanes,
          {"raw.bayersensor.method", "raw.bayersensor.border",
           "raw.bayersensor.dcb_iterations", "raw.bayersensor.dcb_enhance",
@@ -106,22 +111,27 @@ const std::vector<StageBlockContract>& blockTable()
           "raw.xtranssensor.dualDemosaicAutoContrast",
           "raw.xtranssensor.dualDemosaicContrast", "raw.expos",
           "pdsharpening"},
-         {WorkItem::rawDemosaic},
+         {{WorkItem::rawDemosaic,
+           {StagePath::Export, StagePath::FastExport, StagePath::Preview}}},
          {{StagePath::Crop, "source.select"}}, {}, true},
         {"raw.base",             "Base image finish",      RT_STAGE_REUSE_OUTPUT,
          StageOwnership::InPlace,
-         StageEffect::RawPlanes | StageEffect::BaseImage | StageEffect::SpotBuffer | StageEffect::Analysis,
+         StageEffect::BaseImage | StageEffect::SpotBuffer,
          StageWorkingSet::Image | StageWorkingSet::ScratchPlanes,
          {"raw", "wb", "toneCurve", "spot", "dirpyrDenoise", "filmNegative",
           "retinex", "dehaze", "fattal", "cg", "icm"},
-         {WorkItem::rawBaseRebuild, WorkItem::retinexPrepare,
-          WorkItem::spotApply, WorkItem::spotRestore, WorkItem::analysisRun,
-          WorkItem::denoiseRun},
+         {{WorkItem::rawBaseRebuild, {StagePath::Preview, StagePath::Crop}},
+          {WorkItem::retinexPrepare, {StagePath::Preview}},
+          {WorkItem::spotApply, {StagePath::Preview, StagePath::Crop}},
+          {WorkItem::spotRestore, {StagePath::Preview, StagePath::Crop}},
+          {WorkItem::analysisRun, {StagePath::Preview}},
+          {WorkItem::denoiseRun, {StagePath::Crop}}},
          {}, {StagePath::Crop}},
         {"analysis",             "Analysis",               RT_STAGE_REUSE_OUTPUT,
          StageOwnership::Produces, StageEffect::Analysis, StageWorkingSet::None,
          {"icm", "toneCurve", "dirpyrDenoise"},
-         {WorkItem::analysisRun},
+         {{WorkItem::analysisRun,
+           {StagePath::Export, StagePath::FastExport, StagePath::Crop}}},
          {{StagePath::Preview, "raw.base"}}, {}},
         {"transform",            "Geometry transform",     RT_STAGE_REUSE_INPUT,
          StageOwnership::InPlace, StageEffect::None, StageWorkingSet::Image | StageWorkingSet::TransformMap,
@@ -222,19 +232,25 @@ const std::vector<StageBlockContract>& blockTable()
         // raw.color and runs denoise after its early resize.
         {"raw.base.source",      "Base image source",      RT_STAGE_REUSE_OUTPUT,
          StageOwnership::InPlace,
-         StageEffect::BaseImage | StageEffect::SpotBuffer | StageEffect::Analysis,
+         StageEffect::BaseImage | StageEffect::SpotBuffer,
          StageWorkingSet::Image | StageWorkingSet::ScratchPlanes,
          {"raw", "wb", "toneCurve", "spot", "dirpyrDenoise", "retinex",
           "dehaze", "fattal", "icm"},
-         {WorkItem::rawBaseRebuild, WorkItem::retinexPrepare,
-          WorkItem::spotApply, WorkItem::spotRestore},
+         {{WorkItem::rawBaseRebuild,
+           {StagePath::Export, StagePath::FastExport}},
+          {WorkItem::retinexPrepare,
+           {StagePath::Export, StagePath::FastExport}},
+          {WorkItem::spotApply,
+           {StagePath::Export, StagePath::FastExport}},
+          {WorkItem::spotRestore,
+           {StagePath::Export, StagePath::FastExport}}},
          {}, {}},
         {"raw.denoise",          "Denoise",                RT_STAGE_REUSE_INPUT,
          StageOwnership::InPlace, StageEffect::BaseImage, StageWorkingSet::Image | StageWorkingSet::ScratchPlanes,
          {"dirpyrDenoise", "icm", "raw"},
-         {WorkItem::denoiseRun}, {}, {}},
+         {{WorkItem::denoiseRun, {StagePath::Export}}}, {}, {}},
         {"raw.color",            "Source colour conversion", RT_STAGE_REUSE_INPUT,
-         StageOwnership::InPlace, StageEffect::BaseImage, StageWorkingSet::Image,
+         StageOwnership::InPlace, StageEffect::None, StageWorkingSet::Image,
          {"filmNegative", "cg", "icm", "raw"},
          {}, {}, {}},
         {"early.resize",         "Early resize",           RT_STAGE_REUSE_OUTPUT,
@@ -246,7 +262,7 @@ const std::vector<StageBlockContract>& blockTable()
         {"denoise",              "Denoise",                RT_STAGE_REUSE_INPUT,
          StageOwnership::InPlace, StageEffect::BaseImage, StageWorkingSet::Image | StageWorkingSet::ScratchPlanes,
          {"dirpyrDenoise", "icm", "raw"},
-         {WorkItem::denoiseRun}, {}, {}},
+         {{WorkItem::denoiseRun, {StagePath::FastExport}}}, {}, {}},
         {"finish",               "Finish output",          RT_STAGE_RECOMPUTE,
          StageOwnership::Consumes, StageEffect::None, StageWorkingSet::Image,
          {"locallab", "icm", "metadata"},
@@ -304,9 +320,15 @@ const StagePathContract& pathContract(StagePath path)
     }();
 
     static const StagePathContract cropPath = [] {
+        /*
+         * The crop measures noise on the freshly loaded region before it
+         * finishes the base, so its analysis precedes raw.base. This is the
+         * path's actual data dependency, not the preview order where analysis
+         * is folded into the base.
+         */
         const std::vector<const char*> nodes = {
-            "source.select", "raw.preprocess", "raw.demosaic", "raw.base",
-            "analysis", "transform", "local.adjustments", "rgb.proc",
+            "source.select", "raw.preprocess", "raw.demosaic", "analysis",
+            "raw.base", "transform", "local.adjustments", "rgb.proc",
             "lab.tools", "lab.sharpening", "lab.wavelet", "working.trc",
             "ciecam", "gamut", "viewport.output"
         };
@@ -378,11 +400,6 @@ const StageBlockContract* findStageBlockContract(const std::string& id)
     return nullptr;
 }
 
-bool isStageBlockId(const std::string& id)
-{
-    return findStageBlockContract(id) != nullptr;
-}
-
 const char* foldHost(StagePath path, const std::string& id)
 {
     const StageBlockContract* block = findStageBlockContract(id);
@@ -417,9 +434,15 @@ std::vector<std::string> workItemBlocks(StagePath path, WorkItem item)
         if (block == nullptr) {
             continue;
         }
-        if (std::find(block->workItems.begin(), block->workItems.end(), item)
-            != block->workItems.end()) {
-            blocks.emplace_back(id);
+        for (const StageWorkItemRule& rule : block->workItems) {
+            if (rule.item != item) {
+                continue;
+            }
+            if (std::find(rule.paths.begin(), rule.paths.end(), path)
+                != rule.paths.end()) {
+                blocks.emplace_back(id);
+            }
+            break;
         }
     }
     return blocks;
@@ -465,7 +488,6 @@ std::string stageEffectName(StageEffect effect)
         const char* name;
     };
     static const Named names[] = {
-        {StageEffect::SourceFrame, "source-frame"},
         {StageEffect::RawPlanes, "raw-planes"},
         {StageEffect::BaseImage, "base-image"},
         {StageEffect::SpotBuffer, "spot-buffer"},

@@ -45,18 +45,21 @@ The four authorities read it:
 | `stage_pipeline.cc` | the block and path tables, including the fold table, ownership, effects and working-set class the planner validates and dumps |
 
 Each block record carries its id, display name, reuse mode, ownership
-(`produces`, `in-place`, `consumes`), side effects (source frame, raw planes,
-base image, spot buffer, analysis, display, metadata), working-set class
-(image, scratch planes, transform map, tap tables, double state), parameter
-fields, work items, fold rules, resident paths and the raw-core flag. The
-coupled groups are path-level because membership differs between preview and
-crop; they are defined once in the path record.
+(`produces`, `in-place`, `consumes`), side effects (raw planes, base image,
+spot buffer, analysis, display, metadata), working-set class (image, scratch
+planes, transform map, tap tables, double state), parameter fields, work
+items, fold rules, resident paths and the raw-core flag. A work item carries
+the paths on which that body exists: preview folds analysis into raw.base and
+has no denoise item; crop runs its analysis before the base and has no retinex
+preparation. The coupled groups are path-level because membership differs
+between preview and crop; they are defined once in the path record.
 
 The planner validates the structural columns when it builds a specification:
 a consumer owns no output buffer, an in-place block has exactly one buffer
-input, roots have no input, sinks have no output and a fold host is a real,
-non-folded block on the same path. A contradiction is an assertion, not a
-silent fallback.
+input, roots have no input, sinks have no output, a fold host is a real,
+non-folded block on the same path, a sink effect has consumer ownership, and
+an effect's work item exists on that path. A contradiction aborts in release
+builds too; it is not a silent fallback.
 
 The contract also reconciles the catalogue and fingerprint disagreements that
 the earlier independent tables carried: `transform` lists `crop` and not
@@ -752,11 +755,15 @@ preview's analysis data; the spec records `analysis` as a `Roi` node so the
 core ids stay shared with the other paths.
 
 ```text
-source.select -> raw.preprocess -> raw.demosaic -> raw.base -> analysis
+source.select -> raw.preprocess -> raw.demosaic -> analysis -> raw.base
   -> transform -> local.adjustments -> rgb.proc -> lab.tools
   -> lab.sharpening -> lab.wavelet -> working.trc -> ciecam -> gamut
   -> viewport.output
 ```
+
+The crop measures noise on the freshly loaded region before it finishes the
+base, so `analysis` precedes `raw.base`. The executor list is checked against
+this contract at startup; it is not a second order.
 
 Code evidence:
 
@@ -904,7 +911,7 @@ API:
 bool has_export_fingerprint(const std::string& id);
 ParamFingerprint export_fingerprint(const std::string& id,
                                     const procparams::ProcParams& params);
-const std::vector<ExportParamMapEntry>& exportParamMap();
+const std::vector<StageParamMapEntry>& exportParamMap();
 ```
 
 `exportParamMap()` is the review surface: descriptor id, consumed member names
@@ -1141,12 +1148,12 @@ Mapped to Derived, a new aspect between high detail and display:
 `dirPyrDenoiseExpComp`, the exposure compensation the source contributes to
 the automatic-denoise analysis; `denoiseAnalysisValid`, whether the
 coordinator holds a usable analysis for this request; and `spotBufferLive`,
-whether a spot buffer exists that the next base pass restores. The row is
-`{raw.base, analysis}` on both the preview and the crop path. `raw.base` is
-named explicitly because the canonical edge is `raw.base -> analysis`, so the
-closure from the analysis never pulls the base. `spotBufferLive` is base
-state, not an analysis input: it changes the next base pass whether or not the
-analysis moves.
+whether a spot buffer exists that the next base pass restores. The crop row is
+`{analysis, raw.base}` and the preview row is `{raw.base, analysis}`, matching
+each path's edge direction. `raw.base` is named explicitly because the closure
+from the analysis never pulls the base. `spotBufferLive` is base state, not an
+analysis input: it changes the next base pass whether or not the analysis
+moves.
 
 `spotBufferLive` also drives a standing rule: whenever the current key reports
 a live buffer, `derive_dirty_blocks()` and `dirtyBlocksFromRenderState()`
@@ -1272,10 +1279,10 @@ Changed render-state aspect to blocks:
 
 | Aspect | Crop | Preview |
 | --- | --- | --- |
-| geometry | `raw.base`, `analysis`, `transform`, `local.adjustments`, `rgb.proc`, `lab.tools`, `lab.sharpening`, `lab.wavelet`, `working.trc`, `ciecam`, `gamut`, `viewport.output` | every node |
+| geometry | `analysis`, `raw.base`, `transform`, `local.adjustments`, `rgb.proc`, `lab.tools`, `lab.sharpening`, `lab.wavelet`, `working.trc`, `ciecam`, `gamut`, `viewport.output` | every node |
 | source | `source.select`, `raw.preprocess`, `raw.demosaic`, `raw.base` | `source.select`, `raw.preprocess`, `raw.demosaic`, `raw.base` |
-| high detail | `raw.preprocess`, `raw.demosaic`, `raw.base`, `analysis`, `transform` | `source.select`, `raw.preprocess`, `raw.demosaic`, `raw.base`, `analysis`, `transform` |
-| derived | `raw.base`, `analysis` | `raw.base`, `analysis` |
+| high detail | `raw.preprocess`, `raw.demosaic`, `analysis`, `raw.base`, `transform` | `source.select`, `raw.preprocess`, `raw.demosaic`, `raw.base`, `analysis`, `transform` |
+| derived | `analysis`, `raw.base` | `raw.base`, `analysis` |
 | display | `viewport.output` | `monitor.output` |
 | editor | `lab.sharpening` | `source.select`, `raw.preprocess`, `raw.demosaic`, `raw.base`, `analysis`, `transform` |
 | request | `viewport.output` | see rule 3 |

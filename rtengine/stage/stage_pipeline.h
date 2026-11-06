@@ -49,9 +49,6 @@ struct StageDescriptorSpec {
     StageConsumer consumer = StageConsumer::Exact;
     RtReuseMode reuse = RT_STAGE_RECOMPUTE;
     StageOwnership ownership = StageOwnership::InPlace;
-    StageEffect effects = StageEffect::None;
-    StageWorkingSet workingSet = StageWorkingSet::None;
-    std::vector<WorkItem> workItems;
     /* Buffer ids this block consumes; populated from the pipeline edges. */
     std::vector<std::string> inputs;
     /* Buffer ids this block produces; always the block id itself. */
