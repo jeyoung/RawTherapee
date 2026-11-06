@@ -762,8 +762,8 @@ source.select -> raw.preprocess -> raw.demosaic -> analysis -> raw.base
 ```
 
 The crop measures noise on the freshly loaded region before it finishes the
-base, so `analysis` precedes `raw.base`. The executor list is checked against
-this contract at startup; it is not a second order.
+base, so `analysis` precedes `raw.base`. The crop executes the graph plan
+order; it has no separate stage-id list or enum order.
 
 Code evidence:
 

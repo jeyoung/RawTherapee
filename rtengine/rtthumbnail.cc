@@ -295,15 +295,24 @@ struct ThumbnailGraphPlan {
  * because its data is either already held by the Thumbnail (thumbImg) or
  * belongs to a branch this invocation does not take.
  *
- * A plan is rejected, and the caller aborts, when an active node would be
- * skipped: that is the only way the graph could change the result, and the
- * graph is the only sequence left.
+ * A plan is rejected, and the caller aborts, when a policy node has no
+ * handler or when an active node would be skipped: those are the only ways
+ * the graph could change the result, and the graph is the only sequence left.
  */
-ThumbnailGraphPlan planThumbnailGraph(const std::vector<std::string>& active)
+template <typename Handler>
+ThumbnailGraphPlan planThumbnailGraph(
+    const std::vector<std::string>& active,
+    const rtengine::stage::StageHandlerRegistry<Handler>& handlers)
 {
     using namespace rtengine::stage;
 
     ThumbnailGraphPlan result;
+    for (const std::string& id : active) {
+        if (!handlers.contains(id)) {
+            result.reason = "missing-handler:" + id;
+            return result;
+        }
+    }
     result.spec = buildPipelineSpec(StagePath::Thumbnail);
 
     const auto indexOf = [&result](const std::string& id) -> size_t {
@@ -774,7 +783,9 @@ Thumbnail* Thumbnail::loadQuickFromRaw (const Glib::ustring& fname, eSensorType 
             return true;
         });
 
-        const ThumbnailGraphPlan plan = planThumbnailGraph(handlers.ids());
+        const std::vector<std::string> active = {
+            "source.embedded", "thumbnail.decode"};
+        const ThumbnailGraphPlan plan = planThumbnailGraph(active, handlers);
         if (!plan.valid) {
             abortThumbnailGraph("loadQuickFromRaw", plan.reason);
         }
@@ -782,7 +793,13 @@ Thumbnail* Thumbnail::loadQuickFromRaw (const Glib::ustring& fname, eSensorType 
 
         for (const std::string& id : plan.execute) {
             const Handler handler = handlers.find(id);
-            if (!handler || !handler()) {
+            if (!handler) {
+                std::fprintf(stderr,
+                             "thumbnail-graph: fatal: no handler for node %s\n",
+                             id.c_str());
+                std::abort();
+            }
+            if (!handler()) {
                 delete state.tpp;
                 return nullptr;
             }
@@ -1500,7 +1517,9 @@ Thumbnail* Thumbnail::loadFromRaw (const Glib::ustring& fname, eSensorType &sens
         return true;
     });
 
-    const ThumbnailGraphPlan plan = planThumbnailGraph(handlers.ids());
+    const std::vector<std::string> active = {
+        "source.select", "raw.preprocess", "raw.demosaic", "raw.base"};
+    const ThumbnailGraphPlan plan = planThumbnailGraph(active, handlers);
     if (!plan.valid) {
         abortThumbnailGraph("loadFromRaw", plan.reason);
     }
@@ -1508,7 +1527,13 @@ Thumbnail* Thumbnail::loadFromRaw (const Glib::ustring& fname, eSensorType &sens
 
     for (const std::string& id : plan.execute) {
         const Handler handler = handlers.find(id);
-        if (!handler || !handler()) {
+        if (!handler) {
+            std::fprintf(stderr,
+                         "thumbnail-graph: fatal: no handler for node %s\n",
+                         id.c_str());
+            std::abort();
+        }
+        if (!handler()) {
             return nullptr;
         }
     }
@@ -1864,7 +1889,9 @@ IImage8* Thumbnail::quickProcessImage (const procparams::ProcParams& params, int
         return true;
     });
 
-    const ThumbnailGraphPlan plan = planThumbnailGraph(handlers.ids());
+    const std::vector<std::string> active = {
+        "thumbnail.scale", "thumbnail.transform"};
+    const ThumbnailGraphPlan plan = planThumbnailGraph(active, handlers);
     if (!plan.valid) {
         abortThumbnailGraph("quickProcessImage", plan.reason);
     }
@@ -1872,7 +1899,13 @@ IImage8* Thumbnail::quickProcessImage (const procparams::ProcParams& params, int
 
     for (const std::string& id : plan.execute) {
         const Handler handler = handlers.find(id);
-        if (!handler || !handler()) {
+        if (!handler) {
+            std::fprintf(stderr,
+                         "thumbnail-graph: fatal: no handler for node %s\n",
+                         id.c_str());
+            std::abort();
+        }
+        if (!handler()) {
             return nullptr;
         }
     }
@@ -3204,7 +3237,10 @@ IImage8* Thumbnail::processImage (const procparams::ProcParams& params, eSensorT
         return state.readyImg != nullptr;
     });
 
-    const ThumbnailGraphPlan plan = planThumbnailGraph(handlers.ids());
+    const std::vector<std::string> active = {
+        "thumbnail.scale", "thumbnail.transform", "thumbnail.whitebalance",
+        "thumbnail.rgb", "thumbnail.lab", "thumbnail.output"};
+    const ThumbnailGraphPlan plan = planThumbnailGraph(active, handlers);
     if (!plan.valid) {
         abortThumbnailGraph("processImage", plan.reason);
     }
@@ -3212,7 +3248,13 @@ IImage8* Thumbnail::processImage (const procparams::ProcParams& params, eSensorT
 
     for (const std::string& id : plan.execute) {
         const Handler handler = handlers.find(id);
-        if (!handler || !handler()) {
+        if (!handler) {
+            std::fprintf(stderr,
+                         "thumbnail-graph: fatal: no handler for node %s\n",
+                         id.c_str());
+            std::abort();
+        }
+        if (!handler()) {
             return nullptr;
         }
     }
