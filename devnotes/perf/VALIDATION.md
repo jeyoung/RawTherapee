@@ -10,21 +10,26 @@ is recorded below.
 
 ## Artefact
 
-The current package is the F6 working-set admission build from `ee73df905`:
+The current package is the single-stage-contract build from `a78e6509a`:
+
+```
+rawtherapee-graph-5.13-773-ga78e6509a_5.13+git13794.a78e6509a-1_amd64.deb
+sha256 b4656385486e59f60bf79030e01080fe43e1d7bcd06f71bc3d12c9fccc7fceef
+```
+
+It passed the install, `--list-formats` (36 entries), neutral export and Xvfb
+smoke rows on Debian 12 and Debian 13; the full matrix below was measured at
+`6fd009d74` and is retained as the historical comparison. The export
+reference must use the packaged data directory (the install adds the `options`
+file and the generated `camconst.json`); bare `rtdata` moves the neutral
+export by 1932 codes.
+
+The earlier artefacts were:
 
 ```
 rawtherapee-graph-5.13-769-gee73df905_5.13+git13790.ee73df905-1_amd64.deb
 sha256 7f0ecd576e68da9cda58dd2d0e92e3ede175b5821ff2f63e1d5bd46531bbfe06
 ```
-
-It passed the install, `--list-formats`, neutral export and Xvfb smoke rows on
-Debian 12 and Debian 13; the full matrix below was measured at `6fd009d74`
-and is retained as the historical comparison. The export reference must use
-the packaged data directory (the install adds the `options` file and the
-generated `camconst.json`); bare `rtdata` moves the neutral export by 1932
-codes.
-
-The earlier artefacts were:
 
 ```
 rawtherapee-graph-5.13-765-gf1e0e86a6_5.13+git13786.f1e0e86a6-1_amd64.deb

@@ -80,13 +80,13 @@ driver and an ICD loader must be installed separately.
 - Built on Debian 12: glibc 2.36, GCC 12, `-mtune=generic`.
 - Requires Debian 12 or newer. Debian 13 t64 packages are accepted through
   their `Provides` entries.
-- 2026-11-06, package `5.13+git13790.ee73df905-1` from `ee73df905`
+- 2026-11-06, package `5.13+git13794.a78e6509a-1` from `a78e6509a`
   (sha256
-  `7f0ecd576e68da9cda58dd2d0e92e3ede175b5821ff2f63e1d5bd46531bbfe06`):
+  `b4656385486e59f60bf79030e01080fe43e1d7bcd06f71bc3d12c9fccc7fceef`):
   fresh Debian 12 and Debian 13 containers both passed
   `apt-get install -y ./...deb`; Debian 13's t64 packages satisfied the
   pre-t64 `Depends` through `Provides`, with no workaround. `--list-formats`
-  exited 0 and listed 35 formats including PEF/NEF/CR2/ARW, TIFF and JPEG XL.
+  exited 0 and listed 36 formats including PEF/NEF/CR2/ARW, TIFF and JPEG XL.
   A neutral 16-bit CPU export (`OMP_NUM_THREADS=1`, `--gpu=off`) matched the
   host CLI exactly when both used the packaged data directory: PAE 0 LSB16,
   0 of 30,419,712 samples, on both distributions. Run the host reference
@@ -97,7 +97,9 @@ driver and an ICD loader must be installed separately.
   stayed alive to the 20 s timeout on both (exit 124, no stderr).
   `--gpu-test` and `--gpu-test-monitor` were not run: the containers have no
   GPU.
-- The previous packages, `5.13+git13786.f1e0e86a6-1` (sha256
+- The previous packages, `5.13+git13790.ee73df905-1` (sha256
+  `7f0ecd576e68da9cda58dd2d0e92e3ede175b5821ff2f63e1d5bd46531bbfe06`),
+  `5.13+git13786.f1e0e86a6-1` (sha256
   `fa2fb3b5904cdb51d84a1a397c8e5ca7bda87fc2374bc5e476ebbbf7314302fa`),
   `5.13+git13776.a262fab23-1` (sha256
   `0939a1789ec36514272010cc6ace22c15776fca895244df2950ba288edf8ba94`),
