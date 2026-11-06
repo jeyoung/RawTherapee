@@ -1870,6 +1870,64 @@ public:
         return transfer(buffer, host, false);
     }
 
+    /*
+     * Reserve device working memory that is not allocated through acquire(),
+     * such as a launcher's scratch planes. The reservation shares the same
+     * budget as the cached buffers: admission can evict cached entries but
+     * never a live reservation. The caller holds it until the scratch is
+     * released, so a node's peak working set cannot exceed the budget.
+     */
+    bool reserve(const void* key, std::size_t bytes, std::string* error)
+    {
+        const auto fail = [this, error](const std::string& message) {
+            ++stats_.refusals;
+            if (error != nullptr) {
+                *error = message;
+            }
+            return false;
+        };
+
+        if (key == nullptr) {
+            return fail("a working-set reservation needs an identity");
+        }
+        if (bytes == 0) {
+            return true;
+        }
+
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (reservations_.count(key) != 0) {
+            return fail("duplicate working-set reservation");
+        }
+        if (bytes > stats_.budget_bytes ||
+            stats_.used_bytes > stats_.budget_bytes - bytes) {
+            if (!evict_locked(bytes, nullptr) ||
+                stats_.used_bytes > stats_.budget_bytes - bytes) {
+                return fail("stage device working set of " +
+                            std::to_string(bytes) +
+                            " bytes exceeds the stage budget of " +
+                            std::to_string(stats_.budget_bytes) + " bytes");
+            }
+        }
+        reservations_[key] = bytes;
+        stats_.used_bytes += bytes;
+        stats_.peak_bytes = std::max(stats_.peak_bytes, stats_.used_bytes);
+        return true;
+    }
+
+    void release_reservation(const void* key)
+    {
+        if (key == nullptr) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto found = reservations_.find(key);
+        if (found == reservations_.end()) {
+            return;
+        }
+        stats_.used_bytes -= found->second;
+        reservations_.erase(found);
+    }
+
     StageDeviceBufferPtr find(const void* key) const override
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -1894,6 +1952,7 @@ public:
     {
         std::lock_guard<std::mutex> lock(mutex_);
         entries_.clear();
+        reservations_.clear();
         stats_.used_bytes = 0;
     }
 
@@ -2027,18 +2086,58 @@ private:
     std::shared_ptr<OpenCLEnv> env_;
     mutable std::mutex mutex_;
     std::map<const void*, Entry> entries_;
+    std::map<const void*, std::size_t> reservations_;
     StageResidencyStats stats_;
     std::uint64_t clock_ = 0;
+};
+
+/*
+ * RAII guard for a launcher's direct working memory. The key is the guard's
+ * own address, unique while it lives; the reservation is released after the
+ * scratch buffers are released.
+ */
+class WorkingSetReservation final
+{
+public:
+    WorkingSetReservation(const std::shared_ptr<OpenCLResidency>& residency,
+                          std::size_t bytes, std::string* error)
+        : residency_(residency), key_(this)
+    {
+        ok_ = residency_ != nullptr && residency_->reserve(key_, bytes, error);
+    }
+
+    ~WorkingSetReservation()
+    {
+        if (ok_ && residency_ != nullptr) {
+            residency_->release_reservation(key_);
+        }
+    }
+
+    WorkingSetReservation(const WorkingSetReservation&) = delete;
+    WorkingSetReservation& operator=(const WorkingSetReservation&) = delete;
+
+    bool ok() const
+    {
+        return ok_;
+    }
+
+private:
+    std::shared_ptr<OpenCLResidency> residency_;
+    const void* key_;
+    bool ok_ = false;
 };
 
 class OpenCLSubmission final : public StageSubmission
 {
 public:
-    OpenCLSubmission(std::shared_ptr<OpenCLEnv> env, cl_event done,
-                     std::vector<cl_mem> scratch,
-                     std::shared_ptr<OpenCLResidency> residency,
-                     StageDeviceBufferPtr output, RtStageBuffer host_output)
-        : env_(std::move(env)), event_(done), scratch_(std::move(scratch)),
+    OpenCLSubmission(
+        std::shared_ptr<OpenCLEnv> env, cl_event done,
+        std::vector<cl_mem> scratch,
+        std::shared_ptr<OpenCLResidency> residency,
+        StageDeviceBufferPtr output, RtStageBuffer host_output,
+        std::shared_ptr<WorkingSetReservation> reservation = nullptr)
+        : reservation_(std::move(reservation)), env_(std::move(env)),
+          event_(done), scratch_(std::move(scratch)),
           residency_(std::move(residency)), output_(std::move(output)),
           host_output_(host_output),
           begin_(std::chrono::steady_clock::now())
@@ -2130,6 +2229,7 @@ private:
         return result_;
     }
 
+    std::shared_ptr<WorkingSetReservation> reservation_;
     std::shared_ptr<OpenCLEnv> env_;
     cl_event event_ = nullptr;
     std::vector<cl_mem> scratch_;
@@ -2296,6 +2396,25 @@ std::shared_ptr<OpenCLSubmission> launch_lanczos(
                                      &scratch_error);
         return out != nullptr;
     };
+
+    /*
+     * The tap weights are submission scratch outside the residency cache.
+     * Reserve them before the buffers are created; the guard travels with the
+     * submission and is released after its scratch.
+     */
+    const std::size_t scratch_bytes =
+        weights.wwh.size() * sizeof(float) +
+        weights.wwv.size() * sizeof(float) +
+        weights.jj0.size() * sizeof(int) +
+        weights.jj1.size() * sizeof(int) +
+        weights.ii0.size() * sizeof(int) +
+        weights.ii1.size() * sizeof(int);
+    auto working = std::make_shared<WorkingSetReservation>(
+        residency, scratch_bytes, &error);
+    if (!working->ok()) {
+        error = "lanczos3 working set exceeds the device budget: " + error;
+        return nullptr;
+    }
 
     std::vector<cl_mem> scratch(6, nullptr);
     const bool scratch_ok =
@@ -2481,6 +2600,18 @@ std::shared_ptr<OpenCLSubmission> launch_transform(
 
     cl_kernel kernel = compiled_kernel(env, def, error);
     if (kernel == nullptr) {
+        return nullptr;
+    }
+
+    /*
+     * The geometry map is four floats per destination pixel; at 45 MP that is
+     * hundreds of MiB outside the residency cache. Admit it before the
+     * allocation, and keep the reservation with the submission.
+     */
+    auto working = std::make_shared<WorkingSetReservation>(
+        residency, map.size() * sizeof(float), &error);
+    if (!working->ok()) {
+        error = "transform working set exceeds the device budget: " + error;
         return nullptr;
     }
 
@@ -6005,6 +6136,8 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
      * back before any pass runs.
      */
     cl_mem lc_state_memory = nullptr;
+    /* Declared before the owner so the reservation outlives the buffer. */
+    std::shared_ptr<WorkingSetReservation> lc_state_working;
     std::shared_ptr<void> lc_state_owner;
     if (local_contrast && lc_iir->double_path != 0) {
         const std::size_t samples =
@@ -6015,10 +6148,11 @@ RtStageStatus run_lab_tools(const std::shared_ptr<OpenCLEnv>& env,
             return RT_STAGE_FALLBACK;
         }
         const std::size_t state_bytes = samples * sizeof(cl_double);
-        const StageResidencyStats stats = residency->stats();
-        if (stats.used_bytes > stats.budget_bytes ||
-            state_bytes > stats.budget_bytes - stats.used_bytes) {
-            error = "lab.tools local-contrast state exceeds the device budget";
+        lc_state_working = std::make_shared<WorkingSetReservation>(
+            residency, state_bytes, &error);
+        if (!lc_state_working->ok()) {
+            error = "lab.tools local-contrast state exceeds the device budget: " +
+                    error;
             return RT_STAGE_FALLBACK;
         }
         cl_int state_error = CL_SUCCESS;
@@ -13905,6 +14039,22 @@ RtStageStatus run_sharpen(const std::shared_ptr<OpenCLEnv>& env,
     std::vector<cl_mem> scratch;
     const std::size_t scratch_bytes = device->row_pitch() *
                                       static_cast<std::size_t>(height);
+    /*
+     * Admit the complete scratch set before creating any of it. The image
+     * plane is already budgeted by acquire(); the reservation covers the
+     * planes plus the bilateral LUT and weight table.
+     */
+    std::size_t working_bytes =
+        static_cast<std::size_t>(scratch_count) * scratch_bytes;
+    if (p.edgesonly) {
+        working_bytes += SHARPEN_BILATERAL_LUT_ENTRIES * sizeof(cl_float) +
+                         SHARPEN_BILATERAL_MAX_WEIGHTS * sizeof(cl_int);
+    }
+    WorkingSetReservation working(residency, working_bytes, &error);
+    if (!working.ok()) {
+        error = "output.sharpen working set exceeds the device budget: " + error;
+        return RT_STAGE_FALLBACK;
+    }
     const auto release_scratch = [&]() {
         for (cl_mem memory : scratch) {
             env->api->ReleaseMemObject(memory);
@@ -14449,6 +14599,39 @@ RtStageStatus run_lab_sharpening(const std::shared_ptr<OpenCLEnv>& env,
 
     const std::size_t plane_bytes =
         l_buffer->row_pitch() * static_cast<std::size_t>(height);
+    /*
+     * Admit the scratch set before creating it. The three uploaded planes are
+     * budgeted by acquire(); the reservation covers the impulse, defringe and
+     * ML scratch planes and their small state buffers.
+     */
+    int scratch_planes = 0;
+    if (p.impulse_enabled != 0) {
+        scratch_planes += 2;
+    }
+    if (defringe_runs) {
+        scratch_planes += (p.impulse_enabled != 0) ? 3 : 5;
+    }
+    if (edges_run || micro_run) {
+        scratch_planes += 1;
+    }
+    if (micro_run) {
+        scratch_planes += 2;
+    }
+    std::size_t working_bytes =
+        static_cast<std::size_t>(scratch_planes) * plane_bytes;
+    if (p.impulse_enabled != 0) {
+        working_bytes += static_cast<std::size_t>(width) *
+                         static_cast<std::size_t>(height);
+    }
+    if (defringe_runs) {
+        working_bytes += static_cast<std::size_t>(height) * sizeof(double) +
+                         sizeof(double);
+    }
+    WorkingSetReservation working(residency, working_bytes, &error);
+    if (!working.ok()) {
+        error = "lab.sharpening working set exceeds the device budget: " + error;
+        return RT_STAGE_FALLBACK;
+    }
     std::vector<cl_mem> scratch;
     const auto release_scratch = [&]() {
         for (cl_mem memory : scratch) {
@@ -20881,17 +21064,19 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
                  * before any pass runs.
                  */
                 cl_mem lc_state_memory = scratch_memory;
+                /* Declared before the owner so the reservation outlives it. */
+                std::shared_ptr<WorkingSetReservation> lc_state_working;
                 std::shared_ptr<void> lc_state_owner;
                 if (setup.iir_local_contrast->double_path != 0) {
                     const std::size_t samples =
                         static_cast<std::size_t>(bfw) *
                         static_cast<std::size_t>(bfh);
                     const std::size_t state_bytes = samples * sizeof(cl_double);
-                    const StageResidencyStats stats = residency->stats();
-                    if (stats.used_bytes > stats.budget_bytes ||
-                        state_bytes > stats.budget_bytes - stats.used_bytes) {
+                    lc_state_working = std::make_shared<WorkingSetReservation>(
+                        residency, state_bytes, &error);
+                    if (!lc_state_working->ok()) {
                         error = "local.adjustments local-contrast state "
-                                "exceeds the device budget";
+                                "exceeds the device budget: " + error;
                         return RT_STAGE_FALLBACK;
                     }
                     cl_int state_error = CL_SUCCESS;
