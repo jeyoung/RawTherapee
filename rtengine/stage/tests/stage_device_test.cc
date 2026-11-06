@@ -105,6 +105,58 @@ void testCopyReadbackRows()
         }
     }
 
+    /* Two planes with a gap between them: only each plane's rows change. */
+    constexpr std::size_t multi_pitch = plane_pitch + 8;
+    std::vector<unsigned char> multi_host(multi_pitch * 2, 0xAA);
+    std::vector<unsigned char> multi_source(multi_pitch * 2, 0x00);
+    for (int plane = 0; plane < 2; ++plane) {
+        for (int row = 0; row < height; ++row) {
+            for (int column = 0; column < width * 4; ++column) {
+                multi_source[static_cast<std::size_t>(plane) * multi_pitch +
+                             static_cast<std::size_t>(row) * row_pitch +
+                             column] =
+                    static_cast<unsigned char>(plane * 97 + row * 16 + column +
+                                               1);
+            }
+        }
+    }
+
+    RtStageBuffer multi{};
+    multi.size = sizeof(RtStageBuffer);
+    multi.data = multi_host.data();
+    multi.width = width;
+    multi.height = height;
+    multi.row_pitch = row_pitch;
+    multi.plane_pitch = multi_pitch;
+    multi.planes = 2;
+    multi.format = RT_STAGE_F32;
+
+    rtengine::stage::copyReadbackRows(multi, multi_source.data());
+
+    for (int plane = 0; plane < 2; ++plane) {
+        for (int row = 0; row < height; ++row) {
+            const std::size_t base =
+                static_cast<std::size_t>(plane) * multi_pitch +
+                static_cast<std::size_t>(row) * row_pitch;
+            for (int column = 0; column < width * 4; ++column) {
+                check(multi_host[base + column] ==
+                          multi_source[base + column],
+                      "multi-plane copied row bytes match the source");
+            }
+            for (std::size_t column = width * 4; column < row_pitch;
+                 ++column) {
+                check(multi_host[base + column] == 0xAA,
+                      "multi-plane readback leaves row padding untouched");
+            }
+        }
+    }
+    for (std::size_t offset = plane_pitch; offset < multi_pitch; ++offset) {
+        check(multi_host[offset] == 0xAA,
+              "multi-plane readback leaves the inter-plane gap untouched");
+        check(multi_host[multi_pitch + offset] == 0xAA,
+              "multi-plane readback leaves the trailing gap untouched");
+    }
+
     rtengine::stage::copyReadbackRows(RtStageBuffer{}, nullptr);
     check(true, "an empty readback is ignored");
 }

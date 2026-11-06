@@ -1753,12 +1753,7 @@ bool same_shape(const StageBufferShape& a, const StageBufferShape& b)
 
 std::size_t host_row_bytes(const RtStageBuffer& host)
 {
-    std::size_t row = static_cast<std::size_t>(host.width) *
-                      bytes_per_pixel(host.format);
-    if (host.format == RT_STAGE_U8 && host.planes == 1) {
-        row *= 3;
-    }
-    return row;
+    return stage::row_bytes(host);
 }
 
 class OpenCLResidency final : public StageDeviceResidency
@@ -2144,16 +2139,18 @@ struct StagedReadback {
 };
 
 bool stageReadback(const RtStageBuffer& host, StagedReadback& staged,
-                   const char* what, std::string& error)
+                   const char* what, std::size_t index, std::string& error)
 {
     if (host.data == nullptr || host.width <= 0 || host.height <= 0 ||
         host.planes == 0) {
-        error = std::string(what) + " readback has an invalid host buffer";
+        error = std::string(what) + " readback " + std::to_string(index) +
+                " has an invalid host buffer";
         return false;
     }
     const std::size_t row_bytes = host_row_bytes(host);
     if (row_bytes == 0 || host.row_pitch < row_bytes) {
-        error = std::string(what) + " readback has an invalid row pitch";
+        error = std::string(what) + " readback " + std::to_string(index) +
+                " has an invalid row pitch";
         return false;
     }
     const std::size_t rows = static_cast<std::size_t>(host.height) *
@@ -2161,7 +2158,8 @@ bool stageReadback(const RtStageBuffer& host, StagedReadback& staged,
     std::size_t bytes = rows;
     if (host.planes > 1) {
         if (host.plane_pitch < rows) {
-            error = std::string(what) + " readback has an invalid plane pitch";
+            error = std::string(what) + " readback " + std::to_string(index) +
+                    " has an invalid plane pitch";
             return false;
         }
         bytes = static_cast<std::size_t>(host.planes - 1) * host.plane_pitch +
@@ -2198,18 +2196,21 @@ RtStageStatus readbackAll(
     std::vector<StagedReadback> staged;
     staged.reserve(transfers.size());
 
+    std::size_t descriptor = 0;
     for (const ReadbackTransfer& transfer : transfers) {
         StagedReadback copy;
-        if (!stageReadback(transfer.second, copy, what, error)) {
+        if (!stageReadback(transfer.second, copy, what, descriptor, error)) {
             return RT_STAGE_INVALID;
         }
         const RtStageStatus status =
             residency.readback(transfer.first, copy.view);
         if (status != RT_STAGE_OK) {
-            error = std::string(what) + " readback failed";
+            error = std::string(what) + " readback " +
+                    std::to_string(descriptor) + " failed";
             return status;
         }
         staged.push_back(std::move(copy));
+        ++descriptor;
     }
 
     std::size_t index = 0;

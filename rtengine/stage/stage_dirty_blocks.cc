@@ -48,6 +48,8 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <initializer_list>
 #include <map>
@@ -154,9 +156,14 @@ BlockList select(StagePath path,
 {
     std::set<std::string> wanted;
     for (const char* id : candidates) {
-        if (onPath(path, id)) {
-            wanted.insert(id);
+        if (!onPath(path, id)) {
+            std::fprintf(stderr,
+                         "stage-dirty-blocks: fatal: aspect row names %s "
+                         "outside %s\n",
+                         id, stagePathName(path));
+            std::abort();
         }
+        wanted.insert(id);
     }
     return ordered(path, wanted);
 }

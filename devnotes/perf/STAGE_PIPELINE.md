@@ -1667,7 +1667,7 @@ therefore a divergence from the legacy path.
 | `retinexPrepare` | every `retinex` member, `icm.workingProfile`, `toneCurve.hrenabled`, the raw planes and the buffers | `family(retinex)`, `icm-without-output`, `preprocess`, `demosaic`, `retinexHighlight` | **gap, fixed:** `retinex()` reads `Tc.hrenabled` for the Lab-mode gamut control and the editor sends `ALLNORAW` (which carries `M_INIT`), so the legacy gate re-ran it and the typed order did not |
 | `spotApply` | `spot.entries`, `currWB`, `icm`, request bit | `spotPending`, `spotsConfigured && family(spot)` | named; a white-balance edit carries `M_SPOT`, so the request fact covers the `currWB` dependency |
 | `spotRestore` | live buffer, configured spots, base-rebuild outcome | `spotBufferLive`, `spotApply && !base` | named |
-| `analysisRun` | `icm`, `toneCurve`, `dirpyrDenoise` via `firstAnalysis()` | the rawBaseRebuild predicate (analysis is folded into raw.base) | named |
+| `analysisRun` | `icm`, `toneCurve`, `dirpyrDenoise` via `firstAnalysis()` | the rawBaseRebuild predicate on preview (analysis is folded into raw.base); the separate `analysis` block on crop | named |
 | `denoiseRun` (crop) | `dirpyrDenoise`, `cropSkip` | `reload`, `dirpyrDenoise.enabled`, `cropSkip == 1` | named; the preview has no denoise body at all |
 
 Two inputs stay out on purpose, both pre-existing legacy behaviour rather than
