@@ -16,12 +16,11 @@ pushed from 2026-10-29 on.
 ## State
 
 - Repository: `$REPO`
-- Worktree: the main checkout, branch `perf-graph`, clean. The code tip is
-  `a78e6509a` (the single stage contract) with the package-record commit on
-  top; the F4 commits are local and await an instructed push. All previously
-  pushed ranges were scanned per the publication gate. Block 4 is complete:
-  the device gate is green and the portable package is validated on Debian 12
-  and 13; see the progress log and the decisions below.
+- Worktree: the main checkout, branch `perf-graph`, clean and in sync with
+  `origin/perf-graph`; the workstream tip is `1d92c1404`. All pushed ranges
+  were scanned per the publication gate. Block 4 is complete: the device gate
+  is green and the portable package is validated on Debian 12 and 13; see the
+  progress log and the decisions below.
 - Stage C landed 2026-10-31: `local.adjustments` local sharpening (undamped
   `cd38028bb..7467f563f`, damped `211c12597..ebbeab951`), the `crop` device
   node (`544f01573`, `0885d952c`), the `lab.sharpening` impulse-denoise +
