@@ -93,6 +93,33 @@ binary run on the host also matches the host build with the same data
 
 ## Progress log — resumed 2026-10-28 (Block 4 completion)
 
+- **Architecture-review cleanup (2026-11-06)**: PR #39's R1-R5 and the F4
+  audit follow-ups are addressed. **R1**: `readbackAll()` stages every
+  writable descriptor and commits only after all succeed; rgb.proc,
+  lab.wavelet, framing, crop, raw.preprocess, raw.demosaic and lab.sharpening
+  now use it, so a failed second or third plane cannot leave the host input
+  partly processed before host fallback. **R2**: the crop contract now lists
+  `analysis` before `raw.base`, matching the executor; the executor list is
+  checked against the contract at startup. **R3**: the preview plan validates
+  a handler registry, and execution dispatches through the same registry; a
+  missing handler aborts in release builds instead of passing an assert-only
+  arm. **R4**: `StageExecution` carries the queue note, and the profile
+  publishes a stable `fallback` category (`memory`, `unsupported`,
+  `device-unavailable`, `device-error`) plus a bounded `diagnostic`.
+  **R5**: `StageGraph::plan()` returns `StagePlanResult`; a cycle is rejected
+  with no executable decisions. The contract's work items now carry their
+  paths, so preview has no denoise item and crop has no retinex preparation;
+  the conservative fallback derives from that set. Effects and working-set
+  classes are checked by the planner, the preview handler tautology is gone,
+  and the dead `isStageBlockId`/param-map aliases were removed. The
+  `stage-abi-test` target now links the same rtgui objects as the other host
+  tests, so the smoke suite is fully green. Evidence: `--quick` 84 PASS,
+  `--stage-device` 73 PASS / 0 FAIL / 0 SKIP, `--formats` PASS, POCL
+  `stage-residency-test` PASS, and the smoke suite passes all stage, export,
+  thumbnail, crop and thread-determinism rows. The async wait/readback note
+  path is code-reviewed; fault injection is still not run.
+
+
 - **F4 single stage contract (2026-11-06)**: `stage_contract.{h,cc}` is now
   the one definition of the block vocabulary and the five path tables. Each
   block record carries its inputs (parameter fields), ownership, side effects,
@@ -105,7 +132,9 @@ binary run on the host also matches the host build with the same data
   and validates every derived item against the path-applicable set, and the
   planner builds every specification from the contract, validates ownership
   against the edges and dumps the new columns. The executors read the fold
-  table instead of `isFoldedPreviewNode` / `CROP_FOLDED_NODES`. The
+  table instead of a private `CROP_FOLDED_NODES` list; the preview keeps a
+  name-only wrapper around `foldHost()`, but its plan checks handler coverage
+  rather than specification membership. The
   catalogue/fingerprint disagreements were reconciled (`transform` carries
   `crop`, `raw.base`/`raw.base.source` carry `dehaze`/`fattal`, `working.trc`
   carries `wavelet`, `crop` carries `crop`), and the fingerprint format is
