@@ -1240,29 +1240,28 @@ void dump_crop(const Image8* crop, const char* tag, int visibleX,
 namespace
 {
 
-/* Canonical preview inventory, in the execution order of the engine. */
-const char* const PREVIEW_NODE_IDS[] = {
-    "source.select", "raw.preprocess", "raw.demosaic", "raw.base", "analysis",
-    "transform", "local.adjustments", "rgb.proc", "lab.tools", "lab.wavelet",
-    "working.trc", "ciecam", "gamut", "monitor.output"
-};
+/*
+ * Canonical preview inventory, in the execution order of the engine. The
+ * specification is the contract's projection, so this file owns no block list
+ * of its own.
+ */
+const stage::StagePipelineSpec& previewSpec()
+{
+    static const stage::StagePipelineSpec spec =
+        stage::buildPipelineSpec(stage::StagePath::Preview);
+    return spec;
+}
 
-constexpr size_t PREVIEW_NODE_COUNT =
-    sizeof(PREVIEW_NODE_IDS) / sizeof(PREVIEW_NODE_IDS[0]);
-
-static_assert(PREVIEW_NODE_COUNT == 14,
-              "the executor covers exactly the canonical preview inventory");
-
-/* The node whose body runs inside raw.base; see the block comment above. */
+/* The node whose body runs inside another block on the preview path. */
 bool isFoldedPreviewNode(const std::string& id)
 {
-    return id == "analysis";
+    return stage::foldHost(stage::StagePath::Preview, id) != nullptr;
 }
 
 bool isPreviewNode(const std::string& id)
 {
-    for (const char* known : PREVIEW_NODE_IDS) {
-        if (id == known) {
+    for (const auto& node : previewSpec().nodes) {
+        if (node.id == id) {
             return true;
         }
     }
@@ -1308,8 +1307,9 @@ void logPreviewGraphActive(size_t nodes)
 
     std::fprintf(stderr,
                  "preview-graph: active, %zu of %zu canonical nodes executed "
-                 "from the preview inventory (analysis folded into raw.base)\n",
-                 nodes, PREVIEW_NODE_COUNT);
+                 "from the preview inventory (%zu folded)\n",
+                 nodes, previewSpec().nodes.size(),
+                 stage::foldedBlockIds(stage::StagePath::Preview).size());
 }
 
 /*
@@ -4545,8 +4545,8 @@ ImProcCoordinator::PreviewPassPlan ImProcCoordinator::planPreviewPass(
     const stage::StagePipelineSpec spec =
         stage::buildPipelineSpec(stage::StagePath::Preview);
 
-    if (spec.nodes.size() != PREVIEW_NODE_COUNT) {
-        result.reason = "unexpected node count";
+    if (spec.nodes.empty()) {
+        result.reason = "empty preview specification";
         return result;
     }
 

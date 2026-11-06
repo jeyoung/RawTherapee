@@ -19,8 +19,11 @@
 
 #include <cassert>
 #include <cstddef>
-#include <initializer_list>
+#include <set>
 #include <sstream>
+#include <string>
+#include <utility>
+#include <vector>
 
 namespace rtengine::stage
 {
@@ -28,163 +31,7 @@ namespace rtengine::stage
 namespace
 {
 
-/*
- * Canonical block catalogue. Every pipeline is composed from this list, so a
- * block id, its display name, its reuse contract and its parameter provenance
- * are defined exactly once. Domains and consumers vary by path and are applied
- * by domainFor() and consumerFor().
- *
- * The ids follow the processing order of the engine and group the fine-grained
- * ImProcFunctions calls into reviewable units. procparams.h is the source of
- * the paramFields names.
- */
-enum class StageBlock {
-    SourceSelect,
-    SourceEmbedded,
-    RawPreprocess,
-    RawDemosaic,
-    RawBase,
-    Analysis,
-    Transform,
-    LocalAdjustments,
-    RgbProc,
-    LabTools,
-    LabSharpening,
-    LabWavelet,
-    WorkingTrc,
-    CieCam,
-    Gamut,
-    OutputConvert,
-    Crop,
-    Resize,
-    OutputSharpen,
-    Framing,
-    OutputIcc,
-    MonitorOutput,
-    ViewportOutput,
-    ThumbnailDecode,
-    ThumbnailScale,
-    ThumbnailTransform,
-    ThumbnailWhiteBalance,
-    ThumbnailRgb,
-    ThumbnailLab,
-    ThumbnailOutput,
-    RawBaseSource,
-    RawDenoise,
-    RawColor,
-    EarlyResize,
-    Denoise,
-    Finish,
-    Count
-};
-
-struct BlockMeta {
-    const char* id;
-    const char* name;
-    RtReuseMode reuse;
-    std::vector<const char*> params;
-};
-
-const std::vector<BlockMeta>& blockTable()
-{
-    static const std::vector<BlockMeta> table = {
-        // id                      display name                 reuse                  paramFields
-        {"source.select",          "Select source",              RT_STAGE_RECOMPUTE,    {"raw.bayersensor.imageNum"}},
-        {"source.embedded",        "Select embedded JPEG",       RT_STAGE_RECOMPUTE,    {}},
-        {"raw.preprocess",         "Raw preprocess",             RT_STAGE_REUSE_OUTPUT,
-         {"raw.bayersensor.black0", "raw.bayersensor.black1",
-          "raw.bayersensor.black2", "raw.bayersensor.black3",
-          "raw.bayersensor.twogreen", "raw.bayersensor.Dehablack",
-          "raw.bayersensor.greenthresh", "raw.bayersensor.linenoise",
-          "raw.bayersensor.linenoiseDirection",
-          "raw.bayersensor.pdafLinesFilter", "raw.bayersensor.border",
-          "raw.xtranssensor.blackred", "raw.xtranssensor.blackgreen",
-          "raw.xtranssensor.blackblue", "raw.xtranssensor.Dehablackx",
-          "raw.dark_frame", "raw.df_autoselect", "raw.ff_file",
-          "raw.ff_AutoSelect", "raw.ff_FromMetaData",
-          "raw.ff_BlurRadius", "raw.ff_BlurType",
-          "raw.ff_AutoClipControl", "raw.ff_clipControl",
-          "raw.ca_autocorrect", "raw.ca_avoidcolourshift",
-          "raw.caautoiterations", "raw.cared", "raw.cablue", "raw.expos",
-          "raw.preprocessWB", "raw.hotPixelFilter", "raw.deadPixelFilter",
-          "raw.hotdeadpix_thresh", "lensProf.lcMode", "lensProf.lcpFile",
-          "lensProf.useVign", "lensProf.lfCameraMake",
-          "lensProf.lfCameraModel", "lensProf.lfLens"}},
-        {"raw.demosaic",           "Demosaic",                   RT_STAGE_REUSE_OUTPUT,
-         {"raw.bayersensor.method", "raw.bayersensor.border",
-          "raw.bayersensor.dcb_iterations", "raw.bayersensor.dcb_enhance",
-          "raw.bayersensor.lmmse_iterations",
-          "raw.bayersensor.dualDemosaicAutoContrast",
-          "raw.bayersensor.dualDemosaicContrast",
-          "raw.bayersensor.pixelShiftMotionCorrectionMethod",
-          "raw.bayersensor.pixelShiftEperIso",
-          "raw.bayersensor.pixelShiftSigma",
-          "raw.bayersensor.pixelShiftShowMotion",
-          "raw.bayersensor.pixelShiftShowMotionMaskOnly",
-          "raw.bayersensor.pixelShiftHoleFill",
-          "raw.bayersensor.pixelShiftMedian",
-          "raw.bayersensor.pixelShiftAverage",
-          "raw.bayersensor.pixelShiftGreen",
-          "raw.bayersensor.pixelShiftBlur",
-          "raw.bayersensor.pixelShiftSmoothFactor",
-          "raw.bayersensor.pixelShiftEqualBright",
-          "raw.bayersensor.pixelShiftEqualBrightChannel",
-          "raw.bayersensor.pixelShiftNonGreenCross",
-          "raw.bayersensor.pixelShiftDemosaicMethod",
-          "raw.xtranssensor.method", "raw.xtranssensor.border",
-          "raw.xtranssensor.dualDemosaicAutoContrast",
-          "raw.xtranssensor.dualDemosaicContrast", "raw.expos",
-          "pdsharpening"}},
-        {"raw.base",               "Base image finish",          RT_STAGE_REUSE_OUTPUT, {"raw", "wb", "toneCurve", "spot", "dirpyrDenoise", "filmNegative", "retinex", "cg", "icm"}},
-        {"analysis",               "Analysis",                   RT_STAGE_REUSE_OUTPUT, {"icm", "toneCurve", "dirpyrDenoise"}},
-        {"transform",              "Geometry transform",         RT_STAGE_REUSE_INPUT,  {"coarse", "commonTrans", "rotate", "distortion", "perspective", "cacorrection", "vignetting", "gradient", "pcvignette", "lensProf", "dehaze", "fattal"}},
-        {"local.adjustments",      "Local adjustments",          RT_STAGE_REUSE_INPUT,  {"locallab"}},
-        {"rgb.proc",               "RGB processing",             RT_STAGE_REUSE_INPUT,  {"toneCurve", "rgbCurves", "colorToning", "blackwhite", "chmixer", "hsvequalizer", "filmSimulation", "icm"}},
-        {"lab.tools",              "Lab tools",                  RT_STAGE_REUSE_INPUT,  {"sh", "labCurve", "localContrast", "vibrance", "epd", "colorToning"}},
-        {"lab.sharpening",         "Sharpening",                 RT_STAGE_REUSE_INPUT,  {"sharpening", "sharpenEdge", "sharpenMicro", "impulseDenoise", "defringe"}},
-        {"lab.wavelet",            "Wavelet",                    RT_STAGE_REUSE_INPUT,  {"wavelet", "dirpyrequalizer"}},
-        {"working.trc",            "Working TRC",                RT_STAGE_REUSE_INPUT,  {"toneEqualizer", "icm", "softlight"}},
-        {"ciecam",                 "CIE CAM",                    RT_STAGE_REUSE_INPUT,  {"colorappearance", "icm"}},
-        {"gamut",                  "Gamut compression",          RT_STAGE_REUSE_INPUT,  {"cg", "icm"}},
-        {"output.convert",         "Output conversion",          RT_STAGE_REUSE_OUTPUT, {"icm"}},
-        {"crop",                   "Crop",                       RT_STAGE_REUSE_OUTPUT, {"crop", "cropGuide"}},
-        {"resize",                 "Resize",                     RT_STAGE_REUSE_OUTPUT, {"resize"}},
-        {"output.sharpen",         "Output sharpening",          RT_STAGE_REUSE_INPUT,  {"prsharpening"}},
-        {"framing",                "Framing",                    RT_STAGE_REUSE_OUTPUT, {"framing"}},
-        {"output.icc",             "Output ICC",                 RT_STAGE_RECOMPUTE,    {"icm", "metadata"}},
-        {"monitor.output",         "Monitor output",             RT_STAGE_RECOMPUTE,    {"icm"}},
-        {"viewport.output",        "Viewport output",            RT_STAGE_RECOMPUTE,    {"icm"}},
-        {"thumbnail.decode",       "Decode embedded JPEG",       RT_STAGE_REUSE_OUTPUT, {"raw"}},
-        {"thumbnail.scale",        "Thumbnail scale",            RT_STAGE_REUSE_OUTPUT, {"filmNegative"}},
-        {"thumbnail.transform",    "Thumbnail coarse transform", RT_STAGE_REUSE_INPUT,  {"coarse"}},
-        {"thumbnail.whitebalance", "Thumbnail white balance",    RT_STAGE_REUSE_INPUT,  {"wb", "raw", "toneCurve"}},
-        {"thumbnail.rgb",          "Thumbnail RGB processing",   RT_STAGE_REUSE_INPUT,  {"toneCurve", "rgbCurves", "colorToning", "blackwhite", "chmixer", "hsvequalizer", "filmSimulation", "icm"}},
-        {"thumbnail.lab",          "Thumbnail Lab processing",   RT_STAGE_REUSE_INPUT,  {"labCurve", "sh", "localContrast", "vibrance", "epd", "softlight", "toneEqualizer", "colorappearance", "cg", "icm"}},
-        {"thumbnail.output",       "Thumbnail output",           RT_STAGE_RECOMPUTE,    {"icm"}},
-        // Split of raw.base. The canonical export names the three real
-        // sub-blocks (raw.base.source, raw.denoise, raw.color); the fast
-        // export keeps its own denoise id because it runs after the early
-        // resize. The ids are the node ids the executors map to their private
-        // stage methods.
-        {"raw.base.source",        "Base image source",          RT_STAGE_REUSE_OUTPUT, {"raw", "wb", "toneCurve", "spot", "dirpyrDenoise", "filmNegative", "retinex", "cg", "icm"}},
-        {"raw.denoise",            "Denoise",                    RT_STAGE_REUSE_INPUT,  {"dirpyrDenoise", "icm", "raw"}},
-        {"raw.color",              "Source colour conversion",   RT_STAGE_REUSE_INPUT,  {"filmNegative", "cg", "icm", "raw"}},
-        {"early.resize",           "Early resize",               RT_STAGE_REUSE_OUTPUT, {"resize", "crop", "icm", "prsharpening", "sharpening", "wavelet", "dirpyrDenoise", "epd", "dirpyrequalizer", "sh", "localContrast", "raw"}},
-        {"denoise",                "Denoise",                    RT_STAGE_REUSE_INPUT,  {"dirpyrDenoise", "icm", "raw"}},
-        {"finish",                 "Finish output",              RT_STAGE_RECOMPUTE,    {"locallab", "icm", "metadata"}}
-    };
-    return table;
-}
-
-const BlockMeta& meta(StageBlock block)
-{
-    const std::vector<BlockMeta>& table = blockTable();
-    // The catalogue is indexed by StageBlock, so it must cover every entry.
-    assert(table.size() == static_cast<size_t>(StageBlock::Count));
-    return table[static_cast<size_t>(block)];
-}
-
-StageDomain domainFor(StagePath path, StageBlock block)
+StageDomain domainFor(StagePath path, const StageBlockContract& block)
 {
     switch (path) {
     case StagePath::Export:
@@ -194,23 +41,9 @@ StageDomain domainFor(StagePath path, StageBlock block)
     case StagePath::Crop:
         // Raw loading is always full-frame; everything from getImage onwards
         // runs on the crop region.
-        switch (block) {
-        case StageBlock::SourceSelect:
-        case StageBlock::RawPreprocess:
-        case StageBlock::RawDemosaic:
-            return StageDomain::Full;
-        default:
-            return StageDomain::Roi;
-        }
+        return block.rawCore ? StageDomain::Full : StageDomain::Roi;
     case StagePath::Thumbnail:
-        switch (block) {
-        case StageBlock::SourceSelect:
-        case StageBlock::RawPreprocess:
-        case StageBlock::RawDemosaic:
-            return StageDomain::Full;
-        default:
-            return StageDomain::Reduced;
-        }
+        return block.rawCore ? StageDomain::Full : StageDomain::Reduced;
     }
     return StageDomain::Full;
 }
@@ -224,195 +57,37 @@ StageConsumer consumerFor(StagePath path)
                : StageConsumer::Interactive;
 }
 
-using BlockPair = std::pair<StageBlock, StageBlock>;
-
-struct PathDefinition {
-    StagePath path;
-    std::vector<StageBlock> nodes;
-    std::vector<BlockPair> edges;
-    std::vector<StageBlock> roots;
-    std::vector<StageBlock> sinks;
-};
-
-std::vector<BlockPair> chain(const std::vector<StageBlock>& nodes)
+StageDescriptorSpec makeDescriptor(const std::string& id, StagePath path)
 {
-    std::vector<BlockPair> edges;
-    for (size_t i = 1; i < nodes.size(); ++i) {
-        edges.emplace_back(nodes[i - 1], nodes[i]);
+    const StageBlockContract* block = findStageBlockContract(id);
+    assert(block != nullptr && "a path names an unknown stage block");
+    if (block == nullptr) {
+        StageDescriptorSpec descriptor;
+        descriptor.id = id;
+        descriptor.name = id;
+        descriptor.domain = StageDomain::Full;
+        descriptor.consumer = consumerFor(path);
+        descriptor.outputs.push_back(id);
+        return descriptor;
     }
-    return edges;
-}
-
-// Every full-frame path starts with the same raw core.
-std::vector<StageBlock> coreBlocks()
-{
-    return {
-        StageBlock::SourceSelect,
-        StageBlock::RawPreprocess,
-        StageBlock::RawDemosaic,
-        StageBlock::RawBase,
-        StageBlock::Analysis,
-        StageBlock::Transform
-    };
-}
-
-/*
- * The export core names the three raw.base sub-blocks directly, in the order
- * the hand-written pipeline runs them. Preview, crop and thumbnail keep the
- * composite RawBase node.
- */
-std::vector<StageBlock> exportCoreBlocks()
-{
-    return {
-        StageBlock::SourceSelect,
-        StageBlock::RawPreprocess,
-        StageBlock::RawDemosaic,
-        StageBlock::RawBaseSource,
-        StageBlock::RawDenoise,
-        StageBlock::RawColor,
-        StageBlock::Analysis,
-        StageBlock::Transform
-    };
-}
-
-std::vector<StageBlock> withTail(std::vector<StageBlock> blocks,
-                                 std::initializer_list<StageBlock> tail)
-{
-    blocks.insert(blocks.end(), tail.begin(), tail.end());
-    return blocks;
-}
-
-PathDefinition definitionFor(StagePath path)
-{
-    switch (path) {
-    case StagePath::Export: {
-        // The raw core names the three raw.base sub-blocks so each has a
-        // profile record and a real execution boundary. The export
-        // implementation crops, resizes and post-sharpens the Lab image before
-        // converting to the output space, because lab2rgbOut() consumes the
-        // crop rectangle directly. The output blocks follow that order; the
-        // catalogue ids, edges and reuse modes are unchanged.
-        const std::vector<StageBlock> nodes = withTail(exportCoreBlocks(), {
-            StageBlock::LocalAdjustments,
-            StageBlock::RgbProc,
-            StageBlock::LabTools,
-            StageBlock::LabSharpening,
-            StageBlock::LabWavelet,
-            StageBlock::WorkingTrc,
-            StageBlock::CieCam,
-            StageBlock::Gamut,
-            StageBlock::Crop,
-            StageBlock::Resize,
-            StageBlock::OutputSharpen,
-            StageBlock::OutputConvert,
-            StageBlock::Framing,
-            StageBlock::OutputIcc
-        });
-        return {path, nodes, chain(nodes), {StageBlock::SourceSelect},
-                {StageBlock::OutputIcc}};
-    }
-    case StagePath::FastExport: {
-        // The `-f` pipeline: the raw core is split so denoise runs after the
-        // early resize, and the tail is one composite finish node. The order is
-        // fixed by the fast implementation; there is no parallelism.
-        const std::vector<StageBlock> nodes = {
-            StageBlock::SourceSelect,
-            StageBlock::RawPreprocess,
-            StageBlock::RawDemosaic,
-            StageBlock::RawBaseSource,
-            StageBlock::RawColor,
-            StageBlock::Analysis,
-            StageBlock::Transform,
-            StageBlock::EarlyResize,
-            StageBlock::Denoise,
-            StageBlock::Finish
-        };
-        return {path, nodes, chain(nodes), {StageBlock::SourceSelect},
-                {StageBlock::Finish}};
-    }
-    case StagePath::Preview: {
-        // The preview full-frame path applies neither sharpening nor the
-        // export-only blocks; the crop viewport owns sharpening.
-        const std::vector<StageBlock> nodes = withTail(coreBlocks(), {
-            StageBlock::LocalAdjustments,
-            StageBlock::RgbProc,
-            StageBlock::LabTools,
-            StageBlock::LabWavelet,
-            StageBlock::WorkingTrc,
-            StageBlock::CieCam,
-            StageBlock::Gamut,
-            StageBlock::MonitorOutput
-        });
-        return {path, nodes, chain(nodes), {StageBlock::SourceSelect},
-                {StageBlock::MonitorOutput}};
-    }
-    case StagePath::Crop: {
-        const std::vector<StageBlock> nodes = withTail(coreBlocks(), {
-            StageBlock::LocalAdjustments,
-            StageBlock::RgbProc,
-            StageBlock::LabTools,
-            StageBlock::LabSharpening,
-            StageBlock::LabWavelet,
-            StageBlock::WorkingTrc,
-            StageBlock::CieCam,
-            StageBlock::Gamut,
-            StageBlock::ViewportOutput
-        });
-        return {path, nodes, chain(nodes), {StageBlock::SourceSelect},
-                {StageBlock::ViewportOutput}};
-    }
-    case StagePath::Thumbnail: {
-        const std::vector<StageBlock> nodes = {
-            StageBlock::SourceSelect,
-            StageBlock::RawPreprocess,
-            StageBlock::RawDemosaic,
-            StageBlock::RawBase,
-            StageBlock::SourceEmbedded,
-            StageBlock::ThumbnailDecode,
-            StageBlock::ThumbnailScale,
-            StageBlock::ThumbnailTransform,
-            StageBlock::ThumbnailWhiteBalance,
-            StageBlock::ThumbnailRgb,
-            StageBlock::ThumbnailLab,
-            StageBlock::ThumbnailOutput
-        };
-        // Two roots: the embedded JPEG branch and the raw fallback. They join
-        // at thumbnail.scale, exactly as Thumbnail::quickProcessImage() and
-        // Thumbnail::processImage() do on the shared thumbImg.
-        const std::vector<BlockPair> edges = {
-            {StageBlock::SourceSelect, StageBlock::RawPreprocess},
-            {StageBlock::RawPreprocess, StageBlock::RawDemosaic},
-            {StageBlock::RawDemosaic, StageBlock::RawBase},
-            {StageBlock::RawBase, StageBlock::ThumbnailScale},
-            {StageBlock::SourceEmbedded, StageBlock::ThumbnailDecode},
-            {StageBlock::ThumbnailDecode, StageBlock::ThumbnailScale},
-            {StageBlock::ThumbnailScale, StageBlock::ThumbnailTransform},
-            {StageBlock::ThumbnailTransform, StageBlock::ThumbnailWhiteBalance},
-            {StageBlock::ThumbnailWhiteBalance, StageBlock::ThumbnailRgb},
-            {StageBlock::ThumbnailRgb, StageBlock::ThumbnailLab},
-            {StageBlock::ThumbnailLab, StageBlock::ThumbnailOutput}
-        };
-        return {path, nodes, edges,
-                {StageBlock::SourceSelect, StageBlock::SourceEmbedded},
-                {StageBlock::ThumbnailOutput}};
-    }
-    }
-    return {path, {}, {}, {}, {}};
-}
-
-StageDescriptorSpec makeDescriptor(StageBlock block, StagePath path)
-{
-    const BlockMeta& m = meta(block);
 
     StageDescriptorSpec descriptor;
-    descriptor.id = m.id;
-    descriptor.name = m.name;
-    descriptor.domain = domainFor(path, block);
+    descriptor.id = block->id;
+    descriptor.name = block->name;
+    descriptor.domain = domainFor(path, *block);
     descriptor.consumer = consumerFor(path);
-    descriptor.reuse = m.reuse;
+    descriptor.reuse = block->reuse;
+    descriptor.ownership = block->ownership;
+    descriptor.effects = block->effects;
+    descriptor.workingSet = block->workingSet;
+    descriptor.workItems = block->workItems;
     descriptor.outputs.push_back(descriptor.id);
-    for (const char* param : m.params) {
+    for (const char* param : block->paramFields) {
         descriptor.paramFields.emplace_back(param);
+    }
+    const char* host = foldHost(path, descriptor.id);
+    if (host != nullptr) {
+        descriptor.foldedInto = host;
     }
     return descriptor;
 }
@@ -432,87 +107,97 @@ void populateInputs(StagePipelineSpec& spec)
     }
 }
 
+/*
+ * Check that the contract's structural columns agree with the path edges.
+ *
+ * This is the planner's side of the contract: a path whose node structure
+ * contradicts a block's ownership is a programming error, not a runtime
+ * fallback. The checks are assertions so a release build still plans the path,
+ * while every debug build and every test fails at the source of the drift.
+ */
+void validateSpec(const StagePipelineSpec& spec)
+{
+    std::set<std::string> ids;
+    for (const StageDescriptorSpec& node : spec.nodes) {
+        const bool inserted = ids.insert(node.id).second;
+        assert(inserted && "a path names a block twice");
+        (void)inserted;
+        assert(!node.id.empty() && "a path names an empty block id");
+    }
+
+    std::set<std::pair<std::string, std::string>> uniqueEdges;
+    std::set<std::string> produced;
+    std::set<std::string> consumed;
+    for (const auto& edge : spec.edges) {
+        assert(ids.count(edge.first) != 0 && "edge source is not on the path");
+        assert(ids.count(edge.second) != 0 && "edge target is not on the path");
+        assert(uniqueEdges.insert(edge).second && "duplicate path edge");
+        produced.insert(edge.first);
+        consumed.insert(edge.second);
+    }
+
+    for (const StageDescriptorSpec& node : spec.nodes) {
+        if (!node.foldedInto.empty()) {
+            assert(ids.count(node.foldedInto) != 0
+                   && "a fold host is not on the path");
+            assert(foldHost(spec.path, node.foldedInto) == nullptr
+                   && "a fold host is itself folded");
+        }
+
+        switch (node.ownership) {
+        case StageOwnership::Consumes:
+            assert(produced.count(node.id) == 0
+                   && "a consumer may not produce an output buffer");
+            break;
+        case StageOwnership::InPlace:
+            assert(node.inputs.size() == 1
+                   && "an in-place block needs exactly one buffer input");
+            break;
+        case StageOwnership::Produces:
+            break;
+        }
+    }
+
+    for (const std::string& root : spec.roots) {
+        (void)root;
+        assert(ids.count(root) != 0 && "root is not on the path");
+        assert(consumed.count(root) == 0 && "root has an input edge");
+    }
+    for (const std::string& sink : spec.sinks) {
+        (void)sink;
+        assert(ids.count(sink) != 0 && "sink is not on the path");
+        assert(produced.count(sink) == 0 && "sink has an output edge");
+    }
+}
+
 } // namespace
-
-const char* stagePathName(StagePath path)
-{
-    switch (path) {
-    case StagePath::Export:
-        return "export";
-    case StagePath::FastExport:
-        return "fast_export";
-    case StagePath::Preview:
-        return "preview";
-    case StagePath::Crop:
-        return "crop";
-    case StagePath::Thumbnail:
-        return "thumbnail";
-    }
-    return "unknown";
-}
-
-const char* stageDomainName(StageDomain domain)
-{
-    switch (domain) {
-    case StageDomain::Full:
-        return "full";
-    case StageDomain::Roi:
-        return "roi";
-    case StageDomain::Reduced:
-        return "reduced";
-    }
-    return "unknown";
-}
-
-const char* stageConsumerName(StageConsumer consumer)
-{
-    switch (consumer) {
-    case StageConsumer::Exact:
-        return "exact";
-    case StageConsumer::Interactive:
-        return "interactive";
-    }
-    return "unknown";
-}
-
-const char* stageReuseName(RtReuseMode reuse)
-{
-    switch (reuse) {
-    case RT_STAGE_RECOMPUTE:
-        return "recompute";
-    case RT_STAGE_REUSE_INPUT:
-        return "reuse-input";
-    case RT_STAGE_REUSE_OUTPUT:
-        return "reuse-output";
-    }
-    return "unknown";
-}
 
 StagePipelineSpec buildPipelineSpec(StagePath path)
 {
-    const PathDefinition definition = definitionFor(path);
+    const StagePathContract& contract = stagePathContract(path);
 
     StagePipelineSpec spec;
     spec.path = path;
 
-    spec.nodes.reserve(definition.nodes.size());
-    for (StageBlock block : definition.nodes) {
-        spec.nodes.push_back(makeDescriptor(block, path));
+    spec.nodes.reserve(contract.nodes.size());
+    for (const char* id : contract.nodes) {
+        spec.nodes.push_back(makeDescriptor(id, path));
     }
 
-    spec.edges.reserve(definition.edges.size());
-    for (const auto& edge : definition.edges) {
-        spec.edges.emplace_back(meta(edge.first).id, meta(edge.second).id);
+    spec.edges.reserve(contract.edges.size());
+    for (const auto& edge : contract.edges) {
+        spec.edges.emplace_back(edge.first, edge.second);
     }
 
-    for (StageBlock block : definition.roots) {
-        spec.roots.emplace_back(meta(block).id);
+    for (const char* root : contract.roots) {
+        spec.roots.emplace_back(root);
     }
-    for (StageBlock block : definition.sinks) {
-        spec.sinks.emplace_back(meta(block).id);
+    for (const char* sink : contract.sinks) {
+        spec.sinks.emplace_back(sink);
     }
 
     populateInputs(spec);
+    validateSpec(spec);
     return spec;
 }
 
@@ -529,7 +214,21 @@ std::string dumpPipelineSpec(StagePath path)
         out << "  // node: id=" << node.id << " name=\"" << node.name
             << "\" domain=" << stageDomainName(node.domain)
             << " consumer=" << stageConsumerName(node.consumer)
-            << " reuse=" << stageReuseName(node.reuse) << " params=";
+            << " reuse=" << stageReuseName(node.reuse)
+            << " ownership=" << stageOwnershipName(node.ownership)
+            << " effects=" << stageEffectName(node.effects)
+            << " working-set=" << stageWorkingSetName(node.workingSet)
+            << " work-items=";
+        for (size_t i = 0; i < node.workItems.size(); ++i) {
+            if (i != 0) {
+                out << ",";
+            }
+            out << workItemName(node.workItems[i]);
+        }
+        if (!node.foldedInto.empty()) {
+            out << " folded-into=" << node.foldedInto;
+        }
+        out << " params=";
         for (size_t i = 0; i < node.paramFields.size(); ++i) {
             if (i != 0) {
                 out << ",";

@@ -335,15 +335,16 @@ constexpr const char* CROP_STAGE_IDS[CROP_STAGE_COUNT] = {
 /*
  * Canonical nodes this path does not execute as a block of its own. The crop
  * obtains its region through one opaque ImageSource::getImage() call, which
- * performs the raw select, preprocess and demosaic steps, so those two nodes
- * are carried by `source.select`.
+ * performs the raw select, preprocess and demosaic steps, so those nodes are
+ * carried by `source.select`. The fold table is part of the stage contract,
+ * not a second list here.
  */
-constexpr const char* CROP_FOLDED_NODES[] = {
-    "raw.preprocess",
-    "raw.demosaic"
-};
-constexpr size_t CROP_FOLDED_COUNT =
-    sizeof(CROP_FOLDED_NODES) / sizeof(CROP_FOLDED_NODES[0]);
+const std::vector<std::string>& cropFoldedNodes()
+{
+    static const std::vector<std::string> folded =
+        rtengine::stage::foldedBlockIds(rtengine::stage::StagePath::Crop);
+    return folded;
+}
 
 /*
  * The dirty-block set in the terms the crop execution list uses.
@@ -528,15 +529,16 @@ void logCropGraph(const CropGraphPlan& plan)
     }
     logged = true;
 
+    const std::vector<std::string>& folded = cropFoldedNodes();
     std::fprintf(stderr,
                  "crop-graph: active, %zu canonical nodes executed, %zu "
-                 "folded: ", plan.execute.size(), CROP_FOLDED_COUNT);
+                 "folded: ", plan.execute.size(), folded.size());
     for (CropStage stage : plan.execute) {
         std::fprintf(stderr, "%s ", CROP_STAGE_IDS[stage]);
     }
     std::fprintf(stderr, "| folded:");
-    for (size_t i = 0; i < CROP_FOLDED_COUNT; ++i) {
-        std::fprintf(stderr, " %s", CROP_FOLDED_NODES[i]);
+    for (const std::string& id : folded) {
+        std::fprintf(stderr, " %s", id.c_str());
     }
     std::fprintf(stderr, "\n");
 }

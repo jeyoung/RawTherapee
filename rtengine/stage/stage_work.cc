@@ -242,10 +242,39 @@ bool hlrDemandsDemosaic(const ProcParams& params,
         || (!params.toneCurve.hrenabled && isColor);
 }
 
-void setAll(WorkOrder& order, std::initializer_list<WorkItem> items)
+/*
+ * Name every item of a conservative fallback set.
+ *
+ * The contract is the authority for which items a path can run: an item that
+ * no path block implements is a programming error, so the assertion fires in a
+ * debug build instead of scheduling a body the executor does not have.
+ */
+void setAll(WorkOrder& order, StagePath path,
+            std::initializer_list<WorkItem> items)
 {
     for (WorkItem item : items) {
+        assert(pathSchedulesWorkItem(path, item)
+               && "a fallback set names an item the path cannot run");
         order.set(item);
+    }
+}
+
+/*
+ * Check a completed derivation against the contract.
+ *
+ * Every named item must be implemented by at least one block on the path.
+ * This is the work order's side of the single contract: the block table owns
+ * the item vocabulary and the path composition, and the predicate table may
+ * only select from it.
+ */
+void validateOrder(StagePath path, const WorkOrder& order)
+{
+    for (size_t i = 0; i < workItemCount; ++i) {
+        const WorkItem item = static_cast<WorkItem>(i);
+        if (order.has(item)) {
+            assert(pathSchedulesWorkItem(path, item)
+                   && "the work order names an item the path cannot run");
+        }
     }
 }
 
@@ -264,34 +293,6 @@ bool requestReloadsRaw(RequestKind kind)
 }
 
 } // namespace
-
-const char* workItemName(WorkItem item)
-{
-    switch (item) {
-    case WorkItem::sourceSelect:
-        return "sourceSelect";
-    case WorkItem::rawPreprocess:
-        return "rawPreprocess";
-    case WorkItem::rawDemosaic:
-        return "rawDemosaic";
-    case WorkItem::rawBaseRebuild:
-        return "rawBaseRebuild";
-    case WorkItem::retinexPrepare:
-        return "retinexPrepare";
-    case WorkItem::spotApply:
-        return "spotApply";
-    case WorkItem::spotRestore:
-        return "spotRestore";
-    case WorkItem::analysisRun:
-        return "analysisRun";
-    case WorkItem::denoiseRun:
-        return "denoiseRun";
-    case WorkItem::Count:
-        break;
-    }
-
-    return "unknown";
-}
 
 bool WorkOrder::has(WorkItem item) const
 {
@@ -392,10 +393,12 @@ WorkOrder derive_preview_work(const WorkInputs& inputs)
      */
     if (inputs.currentState == nullptr || inputs.currentFingerprints == nullptr
         || inputs.params == nullptr) {
-        setAll(order, {WorkItem::sourceSelect, WorkItem::rawPreprocess,
-                       WorkItem::rawDemosaic, WorkItem::rawBaseRebuild,
-                       WorkItem::retinexPrepare, WorkItem::spotApply,
-                       WorkItem::spotRestore, WorkItem::analysisRun});
+        setAll(order, inputs.path,
+               {WorkItem::sourceSelect, WorkItem::rawPreprocess,
+                WorkItem::rawDemosaic, WorkItem::rawBaseRebuild,
+                WorkItem::retinexPrepare, WorkItem::spotApply,
+                WorkItem::spotRestore, WorkItem::analysisRun});
+        validateOrder(inputs.path, order);
         return order;
     }
 
@@ -643,6 +646,7 @@ WorkOrder derive_preview_work(const WorkInputs& inputs)
         order.set(WorkItem::spotRestore);
     }
 
+    validateOrder(inputs.path, order);
     return order;
 }
 
@@ -668,9 +672,11 @@ WorkOrder derive_crop_work(const WorkInputs& inputs)
      */
     if (inputs.currentState == nullptr || inputs.currentFingerprints == nullptr
         || inputs.params == nullptr) {
-        setAll(order, {WorkItem::sourceSelect, WorkItem::rawBaseRebuild,
-                       WorkItem::spotApply, WorkItem::spotRestore,
-                       WorkItem::analysisRun, WorkItem::denoiseRun});
+        setAll(order, inputs.path,
+               {WorkItem::sourceSelect, WorkItem::rawBaseRebuild,
+                WorkItem::spotApply, WorkItem::spotRestore,
+                WorkItem::analysisRun, WorkItem::denoiseRun});
+        validateOrder(inputs.path, order);
         return order;
     }
 
@@ -725,6 +731,7 @@ WorkOrder derive_crop_work(const WorkInputs& inputs)
         order.set(WorkItem::spotRestore);
     }
 
+    validateOrder(inputs.path, order);
     return order;
 }
 

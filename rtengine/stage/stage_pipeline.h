@@ -17,7 +17,7 @@
 
 #pragma once
 
-#include "stage_abi.h"
+#include "stage_contract.h"
 
 #include <string>
 #include <utility>
@@ -35,28 +35,12 @@ namespace rtengine::stage
  * see devnotes/perf/STAGE_PIPELINE.md for the inventory and the blocks that
  * could not be mapped. Fast export is the `-f` variant of export: it keeps the
  * export consumer contract but runs denoise after its early resize.
+ *
+ * The block vocabulary, the path node lists, the parameter fields, the fold
+ * table, the work items and the working-set classes come from the stage
+ * contract (stage_contract.h). This unit projects them into the graph shape
+ * the planner needs; it does not restate them.
  */
-
-enum class StagePath {
-    Export,
-    FastExport,
-    Preview,
-    Crop,
-    Thumbnail
-};
-
-/* Spatial domain of the buffer a block consumes. */
-enum class StageDomain {
-    Full,     // full processed frame
-    Roi,      // crop/viewport region of the frame
-    Reduced   // thumbnail-sized reduction
-};
-
-/* Whether a consumer requires exact output or tolerates interactive reuse. */
-enum class StageConsumer {
-    Exact,
-    Interactive
-};
 
 struct StageDescriptorSpec {
     std::string id;
@@ -64,16 +48,26 @@ struct StageDescriptorSpec {
     StageDomain domain = StageDomain::Full;
     StageConsumer consumer = StageConsumer::Exact;
     RtReuseMode reuse = RT_STAGE_RECOMPUTE;
+    StageOwnership ownership = StageOwnership::InPlace;
+    StageEffect effects = StageEffect::None;
+    StageWorkingSet workingSet = StageWorkingSet::None;
+    std::vector<WorkItem> workItems;
     /* Buffer ids this block consumes; populated from the pipeline edges. */
     std::vector<std::string> inputs;
     /* Buffer ids this block produces; always the block id itself. */
     std::vector<std::string> outputs;
     /*
-     * ProcParams sub-structs read by the block. Provisional: the names are the
-     * ProcParams member names, not the individual fields, and they are a
-     * lower bound until each block is implemented against the spec.
+     * ProcParams sub-structs read by the block, from the stage contract. The
+     * names are ProcParams member names or dotted sub-fields, not individual
+     * scalars.
      */
     std::vector<std::string> paramFields;
+    /*
+     * When non-empty, another block carries this block's body on this path.
+     * The node stays in the specification so the dirty derivation can mark it,
+     * but the executor skips it.
+     */
+    std::string foldedInto;
 };
 
 struct StagePipelineSpec {
@@ -84,12 +78,6 @@ struct StagePipelineSpec {
     std::vector<std::string> roots;
     std::vector<std::string> sinks;
 };
-
-/* Stable lower-case names for diagnostics and the dump format. */
-const char* stagePathName(StagePath path);
-const char* stageDomainName(StageDomain domain);
-const char* stageConsumerName(StageConsumer consumer);
-const char* stageReuseName(RtReuseMode reuse);
 
 /*
  * Build the rooted subgraph for one pipeline. The returned spec only contains

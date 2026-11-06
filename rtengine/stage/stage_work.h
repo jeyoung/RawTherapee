@@ -98,45 +98,6 @@ namespace rtengine::stage
  */
 
 /*
- * One destructive body job.
- *
- * The names are the diagnostic vocabulary and must stay stable: a later step
- * logs and compares orders, so renumbering or renaming an item breaks the log
- * contract. `Count` is the sentinel and is never a member of an order.
- *
- * The enumerator spelling follows the job name used by the gates rather than
- * the UpperCamelCase used by other stage enums, so a log line can be matched
- * to the gate without a translation table.
- */
-enum class WorkItem : uint8_t {
-    /* Select the frame and, on the crop, reload the ROI bookkeeping. */
-    sourceSelect = 0,
-    /* Black/white levels, flat field and the pre-interpolation pass. */
-    rawPreprocess = 1,
-    /* Demosaic, capture sharpening and the retinex buffer preparation. */
-    rawDemosaic = 2,
-    /* The destructive raw.base body: getImage, spot, denoise, film negative. */
-    rawBaseRebuild = 3,
-    /* The retinex pre-pass that rewrites the shared raw planes. */
-    retinexPrepare = 4,
-    /* Spot removal into the base image. */
-    spotApply = 5,
-    /* Spot buffer restore or copy-back. */
-    spotRestore = 6,
-    /* The analysis body, including the automatic-denoise analysis. */
-    analysisRun = 7,
-    /* The directional-pyramid denoise body. */
-    denoiseRun = 8,
-    Count = 9
-};
-
-/* Number of real WorkItem values, excluding the sentinel. */
-constexpr size_t workItemCount = static_cast<size_t>(WorkItem::Count);
-
-/* Stable lower-case name of one item, for diagnostics. Never null. */
-const char* workItemName(WorkItem item);
-
-/*
  * Fixed-size bitset over WorkItem.
  *
  * The type is a value: copyable, assignable, trivially destructible and
@@ -421,7 +382,7 @@ struct WorkInputs {
  *   the copy-back that follows finds no buffer. Naming the clear is what lets
  *   the site stop reading the spot family.
  * - analysisRun: the same predicate as rawBaseRebuild. The preview folds
- *   analysis into raw.base (`isFoldedPreviewNode("analysis")`), so the body
+ *   analysis into raw.base (the contract's preview fold table), so the body
  *   runs exactly with the rebuild branch.
  * - denoiseRun: never derived. The preview's directional-pyramid denoise call
  *   is commented out; the line-denoise family only participates through

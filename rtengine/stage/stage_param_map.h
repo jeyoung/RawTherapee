@@ -46,10 +46,11 @@ namespace rtengine::stage
  * fingerprints at the same boundary as the legacy M_PREPROC/M_RAW/M_CSHARP
  * gates, so a raw edit cannot name a block the mask does not run.
  *
- * One entry type serves every canonical pipeline. A descriptor shared by two
- * paths has exactly one definition in the implementation, so the paths cannot
- * drift apart silently. Ids are the canonical descriptor ids from
- * rtengine/stage/stage_pipeline.cc, and every field name is a ProcParams
+ * One entry type serves every canonical pipeline. The ids and field lists come
+ * from the stage contract (rtengine/stage/stage_contract.cc), which is the
+ * single definition of the block vocabulary; the implementation only binds
+ * each id to its fingerprint hasher. A descriptor shared by two paths
+ * therefore cannot drift apart silently. Every field name is a ProcParams
  * member or a dotted sub-field of one.
  */
 struct StageParamMapEntry {

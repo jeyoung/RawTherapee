@@ -505,6 +505,160 @@ void checkThumbnail()
           "thumbnail: thumbnail.output is the single sink");
 }
 
+/*
+ * The contract is the single definition of the block vocabulary. These checks
+ * prove that every consumer can rely on it: the ids are unique, every path
+ * node exists, every fold names a real host, every work item belongs to a
+ * block on the path that schedules it, and the structural columns agree with
+ * the path edges.
+ */
+void checkContract()
+{
+    std::set<std::string> ids;
+    for (const StageBlockContract& block : stageBlockContracts()) {
+        const std::string id(block.id);
+        check(!id.empty(), "contract: block id is not empty");
+        check(ids.insert(id).second, "contract: block id is unique: " + id);
+        check(block.name != nullptr && block.name[0] != '\0',
+              "contract: block has a display name: " + id);
+        check(!block.paramFields.empty() || id == "source.embedded",
+              "contract: block lists its parameter inputs: " + id);
+        for (WorkItem item : block.workItems) {
+            check(item != WorkItem::Count,
+                  "contract: block names a real work item: " + id);
+        }
+        for (const StageFoldRule& fold : block.folds) {
+            check(fold.host != nullptr && fold.host[0] != '\0',
+                  "contract: fold has a host: " + id);
+        }
+        check(stageOwnershipName(block.ownership) != std::string("unknown"),
+              "contract: block has an ownership: " + id);
+        check(stageWorkingSetName(block.workingSet) != std::string("unknown"),
+              "contract: block has a working-set class: " + id);
+    }
+
+    for (StagePath path : allPaths()) {
+        const StagePathContract& contract = stagePathContract(path);
+        const std::string label = stagePathName(path);
+        check(contract.path == path, label + ": contract carries its path");
+        check(!contract.nodes.empty(), label + ": contract has nodes");
+        check(contract.roots.size() == 1
+                  || path == StagePath::Thumbnail,
+              label + ": contract has one root except the thumbnail path");
+
+        std::set<std::string> pathIds;
+        for (const char* id : contract.nodes) {
+            check(ids.count(id) != 0,
+                  label + ": contract node is a canonical block: "
+                      + std::string(id));
+            check(pathIds.insert(id).second,
+                  label + ": contract node is unique: " + std::string(id));
+        }
+        for (const auto& edge : contract.edges) {
+            check(pathIds.count(edge.first) != 0,
+                  label + ": contract edge source is on the path");
+            check(pathIds.count(edge.second) != 0,
+                  label + ": contract edge target is on the path");
+        }
+        for (const char* root : contract.roots) {
+            check(pathIds.count(root) != 0,
+                  label + ": contract root is on the path");
+        }
+        for (const char* sink : contract.sinks) {
+            check(pathIds.count(sink) != 0,
+                  label + ": contract sink is on the path");
+        }
+
+        /* The fold host must be a real block on the same path. */
+        for (const std::string& id : foldedBlockIds(path)) {
+            const char* host = foldHost(path, id);
+            check(host != nullptr, label + ": folded block has a host: " + id);
+            check(pathIds.count(host) != 0,
+                  label + ": fold host is on the path: " + id);
+            check(std::string(host) != id,
+                  label + ": a block cannot fold into itself: " + id);
+        }
+
+        /* Every item the path can schedule has at least one implementing
+         * block, and every implementing block is on the path. */
+        for (WorkItem item : pathWorkItems(path)) {
+            const std::vector<std::string> blocks = workItemBlocks(path, item);
+            check(!blocks.empty(),
+                  label + ": work item has an implementing block: "
+                      + workItemName(item));
+            for (const std::string& id : blocks) {
+                check(pathIds.count(id) != 0,
+                      label + ": work item block is on the path: " + id);
+            }
+        }
+    }
+
+    /* The fold table is the one the executors consume. */
+    check(foldHost(StagePath::Preview, "analysis")
+              == std::string("raw.base"),
+          "contract: preview analysis folds into raw.base");
+    check(foldHost(StagePath::Crop, "raw.preprocess")
+              == std::string("source.select"),
+          "contract: crop preprocess folds into source.select");
+    check(foldHost(StagePath::Crop, "raw.demosaic")
+              == std::string("source.select"),
+          "contract: crop demosaic folds into source.select");
+    check(foldHost(StagePath::Export, "analysis") == nullptr,
+          "contract: export runs analysis on its own");
+    check(foldHost(StagePath::FastExport, "analysis") == nullptr,
+          "contract: fast export runs analysis on its own");
+    check(foldHost(StagePath::Thumbnail, "raw.base") == nullptr,
+          "contract: thumbnail runs raw.base on its own");
+
+    /* The raw-core flag is the only source of the full-frame prefix. */
+    for (StagePath path : allPaths()) {
+        if (path != StagePath::Crop && path != StagePath::Thumbnail) {
+            continue;
+        }
+        const StagePipelineSpec spec = buildPipelineSpec(path);
+        const StageDomain rest = path == StagePath::Crop
+                                     ? StageDomain::Roi
+                                     : StageDomain::Reduced;
+        for (const StageDescriptorSpec& node : spec.nodes) {
+            const StageBlockContract* block =
+                findStageBlockContract(node.id);
+            check(block != nullptr,
+                  std::string(stagePathName(path))
+                      + ": node has a contract record: " + node.id);
+            if (block == nullptr) {
+                continue;
+            }
+            check(node.domain ==
+                      (block->rawCore ? StageDomain::Full : rest),
+                  std::string(stagePathName(path)) + ": " + node.id
+                      + " follows the raw-core flag");
+        }
+    }
+
+    /* The contract's structural columns agree with the path edges. */
+    for (StagePath path : allPaths()) {
+        const StagePipelineSpec spec = buildPipelineSpec(path);
+        for (const StageDescriptorSpec& node : spec.nodes) {
+            if (node.ownership == StageOwnership::Consumes) {
+                bool produces = false;
+                for (const auto& edge : spec.edges) {
+                    if (edge.first == node.id) {
+                        produces = true;
+                    }
+                }
+                check(!produces,
+                      std::string(stagePathName(path))
+                          + ": consumer owns no output buffer: " + node.id);
+            }
+            if (node.ownership == StageOwnership::InPlace) {
+                check(node.inputs.size() == 1,
+                      std::string(stagePathName(path))
+                          + ": in-place block has one input: " + node.id);
+            }
+        }
+    }
+}
+
 } // namespace
 
 int main()
@@ -531,6 +685,7 @@ int main()
     checkCrop();
     checkSharedCore();
     checkThumbnail();
+    checkContract();
 
     if (failures == 0) {
         std::puts("stage-pipeline-test: PASS");

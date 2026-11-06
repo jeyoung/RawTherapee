@@ -161,11 +161,17 @@ BlockList select(StagePath path,
     return ordered(path, wanted);
 }
 
-/* Full-frame source blocks; never part of a crop ROI recompute. */
+/*
+ * Full-frame source blocks; never part of a crop ROI recompute. The contract
+ * records which blocks load the full-frame raw source.
+ */
 bool isSourceBlock(const std::string& id)
 {
-    return id == "source.select" || id == "raw.preprocess"
-           || id == "raw.demosaic";
+    const StageBlockContract* block = findStageBlockContract(id);
+    if (block == nullptr) {
+        return false;
+    }
+    return block->rawCore;
 }
 
 /*
@@ -350,15 +356,26 @@ const std::vector<std::vector<std::string>>& coupled_block_groups(
      * The Lab chain is seeded once per pass from laboCrop and consumed in
      * order. The crop runs six blocks on it, the preview five (the preview
      * carries no sharpening block). Every member reads the seed, so a set that
-     * names one member must name them all.
+     * names one member must name them all. The membership comes from the
+     * contract's path table, not from a second list here.
      */
-    static const std::vector<std::vector<std::string>> cropGroups = {
-        {"lab.tools", "lab.sharpening", "lab.wavelet", "working.trc", "ciecam",
-         "gamut"}
+    const auto convert = [](StagePath stagePath) {
+        std::vector<std::vector<std::string>> groups;
+        for (const auto& group : stagePathContract(stagePath).coupledGroups) {
+            std::vector<std::string> ids;
+            ids.reserve(group.size());
+            for (const char* id : group) {
+                ids.emplace_back(id);
+            }
+            groups.push_back(std::move(ids));
+        }
+        return groups;
     };
-    static const std::vector<std::vector<std::string>> previewGroups = {
-        {"lab.tools", "lab.wavelet", "working.trc", "ciecam", "gamut"}
-    };
+
+    static const std::vector<std::vector<std::string>> cropGroups =
+        convert(StagePath::Crop);
+    static const std::vector<std::vector<std::string>> previewGroups =
+        convert(StagePath::Preview);
     static const std::vector<std::vector<std::string>> noGroups;
 
     switch (path) {
@@ -485,12 +502,28 @@ const std::vector<std::string>& resident_blocks(StagePath path)
      * its base finish, its geometry transform and its viewport sink
      * (dcrop.cc: runs[CROP_RAW_BASE], runs[CROP_TRANSFORM] and
      * runs[CROP_VIEWPORT_OUTPUT] are set without a mask test). The preview
-     * always publishes the monitor sink after the pass. Other paths have no
-     * unconditional node inside the scope of this unit.
+     * always publishes the monitor sink after the pass. The contract records
+     * which blocks are residents of which path.
      */
-    static const BlockList cropResidents = {"raw.base", "transform",
-                                            "viewport.output"};
-    static const BlockList previewResidents = {"monitor.output"};
+    const auto convert = [](StagePath stagePath) {
+        BlockList residents;
+        for (const char* id : stagePathContract(stagePath).nodes) {
+            const StageBlockContract* block = findStageBlockContract(id);
+            assert(block != nullptr && "a path names an unknown block");
+            if (block == nullptr) {
+                continue;
+            }
+            if (std::find(block->residents.begin(), block->residents.end(),
+                          stagePath)
+                != block->residents.end()) {
+                residents.emplace_back(id);
+            }
+        }
+        return residents;
+    };
+
+    static const BlockList cropResidents = convert(StagePath::Crop);
+    static const BlockList previewResidents = convert(StagePath::Preview);
     static const BlockList noResidents;
 
     switch (path) {

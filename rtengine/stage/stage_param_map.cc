@@ -30,17 +30,22 @@
  * hashes the same members everywhere. The export table keeps twenty entries,
  * preview selects fourteen and crop fifteen.
  *
+ * The published descriptor-to-fields tables come from the stage contract
+ * (stage_contract.cc), which is the single definition of a block's inputs.
+ * This unit binds each canonical id to the hasher that consumes those fields.
+ *
  * Whole ProcParams sub-structs are hashed field by field. `raw` and `lensProf`
  * are the exceptions: their parts feed different raw bodies, so the three raw
- * consumer hashers add only the sub-fields the matching body reads. The field
- * lists below were generated once from the declarations in procparams.h, the
- * params headers and coord.h, reviewed, and committed as ordinary code: when a
- * member is added to one of those sub-structs it must be added here too.
- * Missing a field would let a stale cache entry survive a parameter change, so
- * the ordering and completeness of each list matter.
+ * consumer hashers add only the sub-fields the matching body reads. When a
+ * member is added to one of those sub-structs it must be added to both the
+ * contract's field list and the matching hasher below. Missing a field would
+ * let a stale cache entry survive a parameter change, so the ordering and
+ * completeness of each list matter.
  */
 
 #include "stage_param_map.h"
+
+#include "stage_contract.h"
 
 #include "coord.h"
 #include "params/advanced.h"
@@ -56,6 +61,7 @@
 #include <initializer_list>
 #include <string>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace rtengine::stage
@@ -2501,120 +2507,44 @@ using HashFn = void (*)(ParamHasher&, const ProcParams&);
 
 struct DescriptorDefinition {
     const char* id;
-    std::vector<const char*> fields;
     HashFn hash;
 };
 
 /*
- * One definition per distinct stage descriptor across the canonical paths.
- *
- * A descriptor that two paths share appears once, so preview, crop and export
- * cannot drift apart while their semantics are the same. The two display sinks
- * are separate entries so the paths can diverge later; both currently read only
- * `icm`.
+ * One fingerprint hasher per distinct stage descriptor across the canonical
+ * paths. The descriptor's parameter fields are not repeated here: they are
+ * published from the stage contract (stage_contract.h), which is the single
+ * definition of the block vocabulary. A descriptor that two paths share has
+ * one hasher, so preview, crop and export cannot drift apart.
  */
 const std::vector<DescriptorDefinition>& definitions()
 {
     static const std::vector<DescriptorDefinition> catalogue = {
-        // Export pipeline order.
-        {"source.select", {"raw.bayersensor.imageNum"}, hashSourceSelect},
-        {"raw.preprocess",
-         {"raw.bayersensor.black0", "raw.bayersensor.black1",
-          "raw.bayersensor.black2", "raw.bayersensor.black3",
-          "raw.bayersensor.twogreen", "raw.bayersensor.Dehablack",
-          "raw.bayersensor.greenthresh", "raw.bayersensor.linenoise",
-          "raw.bayersensor.linenoiseDirection",
-          "raw.bayersensor.pdafLinesFilter", "raw.bayersensor.border",
-          "raw.xtranssensor.blackred", "raw.xtranssensor.blackgreen",
-          "raw.xtranssensor.blackblue", "raw.xtranssensor.Dehablackx",
-          "raw.dark_frame", "raw.df_autoselect", "raw.ff_file",
-          "raw.ff_AutoSelect", "raw.ff_FromMetaData",
-          "raw.ff_BlurRadius", "raw.ff_BlurType",
-          "raw.ff_AutoClipControl", "raw.ff_clipControl",
-          "raw.ca_autocorrect", "raw.ca_avoidcolourshift",
-          "raw.caautoiterations", "raw.cared", "raw.cablue", "raw.expos",
-          "raw.preprocessWB", "raw.hotPixelFilter", "raw.deadPixelFilter",
-          "raw.hotdeadpix_thresh", "lensProf.lcMode", "lensProf.lcpFile",
-          "lensProf.useVign", "lensProf.lfCameraMake",
-          "lensProf.lfCameraModel", "lensProf.lfLens"},
-         hashRawPreprocess},
-        {"raw.demosaic",
-         {"raw.bayersensor.method", "raw.bayersensor.border",
-          "raw.bayersensor.dcb_iterations", "raw.bayersensor.dcb_enhance",
-          "raw.bayersensor.lmmse_iterations",
-          "raw.bayersensor.dualDemosaicAutoContrast",
-          "raw.bayersensor.dualDemosaicContrast",
-          "raw.bayersensor.pixelShiftMotionCorrectionMethod",
-          "raw.bayersensor.pixelShiftEperIso",
-          "raw.bayersensor.pixelShiftSigma",
-          "raw.bayersensor.pixelShiftShowMotion",
-          "raw.bayersensor.pixelShiftShowMotionMaskOnly",
-          "raw.bayersensor.pixelShiftHoleFill",
-          "raw.bayersensor.pixelShiftMedian",
-          "raw.bayersensor.pixelShiftAverage",
-          "raw.bayersensor.pixelShiftGreen",
-          "raw.bayersensor.pixelShiftBlur",
-          "raw.bayersensor.pixelShiftSmoothFactor",
-          "raw.bayersensor.pixelShiftEqualBright",
-          "raw.bayersensor.pixelShiftEqualBrightChannel",
-          "raw.bayersensor.pixelShiftNonGreenCross",
-          "raw.bayersensor.pixelShiftDemosaicMethod",
-          "raw.xtranssensor.method", "raw.xtranssensor.border",
-          "raw.xtranssensor.dualDemosaicAutoContrast",
-          "raw.xtranssensor.dualDemosaicContrast", "raw.expos",
-          "pdsharpening"},
-         hashRawDemosaic},
-        {"raw.base",
-         {"raw", "wb", "toneCurve", "spot", "dirpyrDenoise", "filmNegative",
-          "retinex", "dehaze", "fattal", "cg", "icm"},
-         hashRawBase},
-        // The canonical export's three raw.base sub-blocks.
-        {"raw.base.source",
-         {"raw", "wb", "toneCurve", "spot", "dirpyrDenoise", "retinex",
-          "dehaze", "fattal", "icm"},
-         hashRawBaseSource},
-        {"raw.denoise", {"dirpyrDenoise", "icm", "raw"}, hashRawDenoise},
-        {"raw.color", {"filmNegative", "cg", "icm", "raw"}, hashRawColor},
-        {"analysis", {"icm", "toneCurve", "dirpyrDenoise"}, hashAnalysis},
-        {"transform",
-         {"coarse", "commonTrans", "rotate", "distortion", "perspective",
-          "cacorrection", "vignetting", "gradient", "pcvignette", "lensProf",
-          "crop"},
-         hashTransform},
-        {"local.adjustments",
-         {"locallab", "icm", "toneCurve", "raw", "wb", "dirpyrequalizer",
-          "dehaze", "epd", "rgbCurves", "hsvequalizer", "chmixer",
-          "colorToning"},
-         hashLocalAdjustments},
-        {"rgb.proc",
-         {"toneCurve", "rgbCurves", "colorToning", "blackwhite", "chmixer",
-          "hsvequalizer", "filmSimulation", "icm"},
-         hashRgbProc},
-        {"lab.tools",
-         {"sh", "labCurve", "localContrast", "vibrance", "epd", "softlight",
-          "icm", "toneCurve"},
-         hashLabTools},
-        {"lab.sharpening",
-         {"sharpening", "sharpenEdge", "sharpenMicro", "impulseDenoise",
-          "defringe", "icm"},
-         hashLabSharpening},
-        {"lab.wavelet",
-         {"wavelet", "dirpyrequalizer", "icm", "toneCurve"},
-         hashLabWavelet},
-        {"working.trc", {"toneEqualizer", "icm", "wavelet"}, hashWorkingTrc},
-        {"ciecam", {"colorappearance", "icm", "toneCurve", "raw", "epd"},
-         hashCieCam},
-        {"gamut", {"cg", "icm"}, hashGamut},
-        {"crop", {"crop"}, hashCrop},
-        {"resize", {"resize", "crop", "framing"}, hashResize},
-        {"output.sharpen", {"prsharpening"}, hashOutputSharpen},
-        {"output.convert", {"icm"}, hashOutputConvert},
-        {"framing", {"framing", "crop", "resize"}, hashFraming},
-        {"output.icc", {"icm", "metadata"}, hashOutputIcc},
-        // Display sinks. Preview ends at monitor.output; the crop viewport
-        // ends at viewport.output.
-        {"monitor.output", {"icm"}, hashDisplayOutput},
-        {"viewport.output", {"icm"}, hashDisplayOutput}
+        {"source.select", hashSourceSelect},
+        {"raw.preprocess", hashRawPreprocess},
+        {"raw.demosaic", hashRawDemosaic},
+        {"raw.base", hashRawBase},
+        {"raw.base.source", hashRawBaseSource},
+        {"raw.denoise", hashRawDenoise},
+        {"raw.color", hashRawColor},
+        {"analysis", hashAnalysis},
+        {"transform", hashTransform},
+        {"local.adjustments", hashLocalAdjustments},
+        {"rgb.proc", hashRgbProc},
+        {"lab.tools", hashLabTools},
+        {"lab.sharpening", hashLabSharpening},
+        {"lab.wavelet", hashLabWavelet},
+        {"working.trc", hashWorkingTrc},
+        {"ciecam", hashCieCam},
+        {"gamut", hashGamut},
+        {"crop", hashCrop},
+        {"resize", hashResize},
+        {"output.sharpen", hashOutputSharpen},
+        {"output.convert", hashOutputConvert},
+        {"framing", hashFraming},
+        {"output.icc", hashOutputIcc},
+        {"monitor.output", hashDisplayOutput},
+        {"viewport.output", hashDisplayOutput}
     };
     return catalogue;
 }
@@ -2631,13 +2561,19 @@ const DescriptorDefinition* findDefinition(const std::string& id)
 
 using PathTable = std::vector<const DescriptorDefinition*>;
 
-PathTable buildPath(std::initializer_list<const char*> ids)
+/*
+ * Bind one path's contract nodes to their hashers. The order and the ids come
+ * from the contract, so the table cannot disagree with the pipeline.
+ */
+PathTable buildPath(StagePath stagePath)
 {
+    const StagePathContract& contract = stagePathContract(stagePath);
     PathTable path;
-    path.reserve(ids.size());
-    for (const char* id : ids) {
+    path.reserve(contract.nodes.size());
+    for (const char* id : contract.nodes) {
         const DescriptorDefinition* definition = findDefinition(id);
-        assert(definition != nullptr);
+        assert(definition != nullptr
+               && "a fingerprinted path names a block without a hasher");
         if (definition != nullptr) {
             path.push_back(definition);
         }
@@ -2646,78 +2582,24 @@ PathTable buildPath(std::initializer_list<const char*> ids)
 }
 
 /*
- * Path tables. The order is the execution order of
- * buildPipelineSpec(StagePath::...) and every id must exist in the catalogue.
+ * Path tables. The order is the execution order of stagePathContract(...);
+ * every id must exist in the hasher catalogue.
  */
 const PathTable& exportPath()
 {
-    static const PathTable path = buildPath({
-        "source.select",
-        "raw.preprocess",
-        "raw.demosaic",
-        "raw.base.source",
-        "raw.denoise",
-        "raw.color",
-        "analysis",
-        "transform",
-        "local.adjustments",
-        "rgb.proc",
-        "lab.tools",
-        "lab.sharpening",
-        "lab.wavelet",
-        "working.trc",
-        "ciecam",
-        "gamut",
-        "crop",
-        "resize",
-        "output.sharpen",
-        "output.convert",
-        "framing",
-        "output.icc"
-    });
+    static const PathTable path = buildPath(StagePath::Export);
     return path;
 }
 
 const PathTable& previewPath()
 {
-    static const PathTable path = buildPath({
-        "source.select",
-        "raw.preprocess",
-        "raw.demosaic",
-        "raw.base",
-        "analysis",
-        "transform",
-        "local.adjustments",
-        "rgb.proc",
-        "lab.tools",
-        "lab.wavelet",
-        "working.trc",
-        "ciecam",
-        "gamut",
-        "monitor.output"
-    });
+    static const PathTable path = buildPath(StagePath::Preview);
     return path;
 }
 
 const PathTable& cropPath()
 {
-    static const PathTable path = buildPath({
-        "source.select",
-        "raw.preprocess",
-        "raw.demosaic",
-        "raw.base",
-        "analysis",
-        "transform",
-        "local.adjustments",
-        "rgb.proc",
-        "lab.tools",
-        "lab.sharpening",
-        "lab.wavelet",
-        "working.trc",
-        "ciecam",
-        "gamut",
-        "viewport.output"
-    });
+    static const PathTable path = buildPath(StagePath::Crop);
     return path;
 }
 
@@ -2732,15 +2614,32 @@ const DescriptorDefinition* findInPath(const PathTable& path,
     return nullptr;
 }
 
-std::vector<StageParamMapEntry> project(const PathTable& path)
+std::vector<StageParamMapEntry> project(StagePath stagePath,
+                                           const PathTable& path)
 {
+    const StagePathContract& contract = stagePathContract(stagePath);
     std::vector<StageParamMapEntry> entries;
     entries.reserve(path.size());
-    for (const DescriptorDefinition* definition : path) {
-        entries.push_back(
-            {definition->id,
-             std::vector<std::string>(definition->fields.begin(),
-                                      definition->fields.end())});
+    assert(path.size() == contract.nodes.size()
+           && "the hasher table and the path contract disagree");
+
+    /*
+     * The published field lists come from the contract, which is the single
+     * definition of a block's inputs. The hashers below are the executable
+     * form of the same lists.
+     */
+    for (const char* id : contract.nodes) {
+        const StageBlockContract* block = findStageBlockContract(id);
+        assert(block != nullptr && "the path contract names an unknown block");
+        if (block == nullptr) {
+            continue;
+        }
+        std::vector<std::string> fields;
+        fields.reserve(block->paramFields.size());
+        for (const char* field : block->paramFields) {
+            fields.emplace_back(field);
+        }
+        entries.push_back({id, std::move(fields)});
     }
     return entries;
 }
@@ -2766,20 +2665,22 @@ ParamFingerprint fingerprint(const PathTable& path, const std::string& id,
 
 const std::vector<StageParamMapEntry>& exportParamMap()
 {
-    static const std::vector<StageParamMapEntry> entries = project(exportPath());
+    static const std::vector<StageParamMapEntry> entries =
+        project(StagePath::Export, exportPath());
     return entries;
 }
 
 const std::vector<StageParamMapEntry>& previewParamMap()
 {
     static const std::vector<StageParamMapEntry> entries =
-        project(previewPath());
+        project(StagePath::Preview, previewPath());
     return entries;
 }
 
 const std::vector<StageParamMapEntry>& cropParamMap()
 {
-    static const std::vector<StageParamMapEntry> entries = project(cropPath());
+    static const std::vector<StageParamMapEntry> entries =
+        project(StagePath::Crop, cropPath());
     return entries;
 }
 

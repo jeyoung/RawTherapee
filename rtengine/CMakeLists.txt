@@ -122,6 +122,7 @@ set(RTENGINESOURCEFILES
     stage/stage_builtins.cc
     stage/stage_cache.cc
     stage/stage_cache_integration.cc
+    stage/stage_contract.cc
     stage/stage_device.cc
     stage/stage_dirty_blocks.cc
     stage/stage_graph.cc
@@ -513,6 +514,7 @@ rt_setup_target(stage-parity-test)
 # specification unit directly instead of linking the whole engine.
 add_executable(stage-pipeline-test EXCLUDE_FROM_ALL
     "${CMAKE_CURRENT_SOURCE_DIR}/stage/tests/stage_pipeline_test.cc"
+    "${CMAKE_CURRENT_SOURCE_DIR}/stage/stage_contract.cc"
     "${CMAKE_CURRENT_SOURCE_DIR}/stage/stage_pipeline.cc"
 )
 target_include_directories(stage-pipeline-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/stage")
