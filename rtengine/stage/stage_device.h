@@ -54,6 +54,24 @@ enum class StageEventStatus {
 const char* to_string(StageEventStatus status);
 
 /*
+ * Test-only fault injection for the device path.
+ *
+ * This seam lets the test suite prove the transactional and fallback
+ * guarantees of a device that fails, without a vendor driver that can be made
+ * to fail. It is inert by default, is never read from the environment and is
+ * not set by any production caller.
+ *
+ * `fail_wait` fails the asynchronous wait() of a device submission before its
+ * result is read back. `fail_readback` fails the readback of one descriptor of
+ * a node, counting from one in the order the node names its outputs; zero
+ * disables the injection. A failed readback must not modify any host buffer.
+ */
+struct StageFaultPlan {
+    bool fail_wait = false;
+    int fail_readback = 0;
+};
+
+/*
  * Completion handle for a submission that may still be running.
  *
  * The handle is created by the queue that accepted the work. Its status only
@@ -152,6 +170,15 @@ public:
     virtual StageDeviceResidency* residency()
     {
         return nullptr;
+    }
+
+    /*
+     * Test-only: install a fault plan for this queue's device path. The
+     * default is inert; production callers never invoke it.
+     */
+    virtual void set_fault_plan(const StageFaultPlan& plan)
+    {
+        (void)plan;
     }
 };
 
@@ -379,6 +406,12 @@ public:
     /* Device residency of an OpenCL context; null on the CPU device. */
     StageDeviceResidency* residency();
 
+    /*
+     * Test-only: install a fault plan on the device queue. It applies to every
+     * subsequent execution on this context and is inert unless a test sets it.
+     */
+    void set_fault_plan(const StageFaultPlan& plan);
+
     void clear_program_cache();
     std::size_t program_cache_size() const;
 
@@ -389,6 +422,7 @@ private:
     std::unique_ptr<StageQueue> queue_;
     std::unique_ptr<StageQueue> host_queue_;
     std::map<std::string, std::shared_ptr<StageProgram>> programs_;
+    StageFaultPlan fault_plan_;
 };
 
 /*

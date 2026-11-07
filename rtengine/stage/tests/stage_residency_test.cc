@@ -15708,6 +15708,353 @@ void test_lab_wavelet_gpu(bool available)
           "lab.wavelet GPU residual matches the CPU block");
 }
 
+/* ------------------------------------------------- injected device faults */
+
+/*
+ * Test-only proof of the device path's transactional and fallback guarantees.
+ *
+ * The seam is StageContext::set_fault_plan(); it is never set by a production
+ * caller and never reads the environment, so none of these cases needs a
+ * production switch. A real fault is simulated inside the OpenCL submission
+ * and readback, not by corrupting the host buffers.
+ */
+
+/*
+ * An asynchronous node that also has a host builtin, so the fallback can be
+ * measured against a real host-only run. `transform` is device-only and would
+ * not exercise the fallback contract.
+ */
+void lanczos_request(const RtStageBuffer& source, const RtStageBuffer& output,
+                     StageRequest& request)
+{
+    request.name = "lanczos3";
+    request.args = {buffer_arg(source), buffer_arg(output), double_arg(0.5),
+                    int_arg(0)};
+}
+
+/*
+ * The runtime's fallbackCategory() (stage_runtime.cc) maps a note that matches
+ * none of these keywords to "device-error". Keep the list in step with that
+ * function: the assertion here is the stable-category half of the contract,
+ * because the classifier itself is not reachable from a test-owned context.
+ */
+bool note_classifies_as_device_error(const std::string& note)
+{
+    static const char* const other_categories[] = {
+        "budget",
+        "working set",
+        "exceeds the device",
+        "no OpenCL implementation",
+        "unsupported",
+        "support flag is not set",
+        "needs device fp64",
+        "requires a CPU OpenCL device",
+        "cannot run on the OpenCL queue",
+        "explicit implementation",
+        "unavailable",
+        "built without"};
+    if (note.empty()) {
+        return false;
+    }
+    for (const char* keyword : other_categories) {
+        if (note.find(keyword) != std::string::npos) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void test_injected_wait_failure(bool available)
+{
+    using namespace rtengine::stage;
+
+    if (!available) {
+        skip("injected wait failure: no OpenCL device");
+        return;
+    }
+
+    StageBufferAllocator host(StageDeviceType::CPU);
+    std::string error;
+    constexpr int SOURCE_WIDTH = 48;
+    constexpr int SOURCE_HEIGHT = 32;
+    constexpr int OUTPUT_WIDTH = 24;
+    constexpr int OUTPUT_HEIGHT = 16;
+    RtStageBuffer source =
+        host.allocate({RT_STAGE_F32, SOURCE_WIDTH, SOURCE_HEIGHT, 3}, &error);
+    RtStageBuffer reference =
+        host.allocate({RT_STAGE_F32, OUTPUT_WIDTH, OUTPUT_HEIGHT, 3}, &error);
+    RtStageBuffer output =
+        host.allocate({RT_STAGE_F32, OUTPUT_WIDTH, OUTPUT_HEIGHT, 3}, &error);
+    check(source.data != nullptr && reference.data != nullptr &&
+              output.data != nullptr,
+          "injected wait: the fixture allocates");
+    if (source.data == nullptr || reference.data == nullptr ||
+        output.data == nullptr) {
+        return;
+    }
+    fill(source, 61u);
+
+    /* The host-only reference, on a CPU context. */
+    StageRequest reference_request;
+    lanczos_request(source, reference, reference_request);
+    const auto cpu = cpu_device()->create_context();
+    check(cpu != nullptr, "injected wait: the host reference context exists");
+    check(cpu != nullptr &&
+              cpu->execute(reference_request, nullptr) == RT_STAGE_OK,
+          "injected wait: the host-only reference completes");
+
+    StageRequest request;
+    lanczos_request(source, output, request);
+
+    const auto context = opencl_device()->create_context();
+    check(context != nullptr, "injected wait: the device creates a context");
+    if (context == nullptr) {
+        return;
+    }
+    StageFaultPlan plan;
+    plan.fail_wait = true;
+    context->set_fault_plan(plan);
+
+    set_node_device_override("lanczos3", StageNodeDevice::OpenCL);
+    StageExecution execution;
+    const RtStageStatus status =
+        context->execute(request, nullptr, &execution);
+    clear_node_device_overrides();
+
+    check(status == RT_STAGE_OK,
+          "injected wait: the host fallback completes");
+    check(execution.device == StageDeviceType::CPU,
+          "injected wait: the fallback reports the host");
+    check(!execution.asynchronous,
+          "injected wait: the fallback is synchronous");
+    check(execution.note == "injected device wait failure",
+          "injected wait: the device note is preserved on the execution");
+    check(note_classifies_as_device_error(execution.note),
+          "injected wait: the note publishes as device-error");
+
+    const Diff diff = compare(output, reference);
+    check(diff.finite, "injected wait: the fallback output is finite");
+    check(diff.max_abs == 0.0 && diff.differing == 0,
+          "injected wait: the fallback output equals the host-only run");
+    std::printf("stage-residency: injected wait failure: note=\"%s\", "
+                "PAE %.6f LSB16, %zu of %zu samples differ\n",
+                execution.note.c_str(), diff.max_abs, diff.differing,
+                diff.samples);
+
+    /* An empty plan restores the device path: the seam is inert by default. */
+    context->set_fault_plan(StageFaultPlan{});
+    set_node_device_override("lanczos3", StageNodeDevice::OpenCL);
+    StageExecution recovered;
+    const RtStageStatus recovered_status =
+        context->execute(request, nullptr, &recovered);
+    clear_node_device_overrides();
+
+    check(recovered_status == RT_STAGE_OK,
+          "injected wait: the recovered device run completes");
+    check(recovered.device == StageDeviceType::OPENCL,
+          "injected wait: an empty plan leaves the device path intact");
+    check(recovered.note.empty(),
+          "injected wait: a successful device run has no note");
+    const Diff recovered_diff = compare(output, reference);
+    check(recovered_diff.max_abs <= 1.0,
+          "injected wait: the recovered device output is within one LSB16");
+
+    /* A plan set after the queue already exists must take effect too. */
+    StageFaultPlan late_plan;
+    late_plan.fail_wait = true;
+    context->set_fault_plan(late_plan);
+    set_node_device_override("lanczos3", StageNodeDevice::OpenCL);
+    StageExecution late_execution;
+    const RtStageStatus late_status =
+        context->execute(request, nullptr, &late_execution);
+    clear_node_device_overrides();
+
+    check(late_status == RT_STAGE_OK,
+          "injected wait: the late-plan fallback completes");
+    check(late_execution.device == StageDeviceType::CPU &&
+              late_execution.note == "injected device wait failure",
+          "injected wait: a plan set after queue creation also applies");
+    context->set_fault_plan(StageFaultPlan{});
+}
+
+/*
+ * Saves and restores one environment variable for the lifetime of the object,
+ * so a test that uses an existing compiler hook cannot leak it into later
+ * cases.
+ */
+class ScopedEnv
+{
+public:
+    ScopedEnv(const char* name, const char* value) : name_(name)
+    {
+        const char* previous = std::getenv(name);
+        if (previous != nullptr) {
+            previous_ = previous;
+            had_previous_ = true;
+        }
+        setenv(name, value, 1);
+    }
+
+    ~ScopedEnv()
+    {
+        if (had_previous_) {
+            setenv(name_.c_str(), previous_.c_str(), 1);
+        } else {
+            unsetenv(name_.c_str());
+        }
+    }
+
+    ScopedEnv(const ScopedEnv&) = delete;
+    ScopedEnv& operator=(const ScopedEnv&) = delete;
+
+private:
+    std::string name_;
+    std::string previous_;
+    bool had_previous_ = false;
+};
+
+void test_injected_readback_failure(bool available)
+{
+    using namespace rtengine::stage;
+
+    if (!available) {
+        skip("injected readback failure: no OpenCL device");
+        return;
+    }
+
+    /* MLmicrocontrast() reads settings->verbose, as in test_lab_sharpening. */
+    static rtengine::Settings readback_settings{};
+    rtengine::settings = &readback_settings;
+
+    rtengine::procparams::ProcParams params;
+    params.impulseDenoise.enabled = true;
+    params.impulseDenoise.thresh = 50;
+
+    LabImage source(63, 31);
+    fill_impulse_fixture(source);
+
+    /* The host-only reference: the same block the fallback runs. */
+    LabImage reference(63, 31);
+    copy_sharpen_l(source, reference);
+    run_cpu_lab_sharpening(params, reference);
+
+    /*
+     * lab.sharpening reads back three descriptors in the order L, a, b. A
+     * failure on descriptor 2 or 3 must not commit descriptor 1 or any earlier
+     * one, and the host fallback must then produce exactly the host-only
+     * result.
+     */
+    for (int descriptor : {2, 3}) {
+        LabImage output(63, 31);
+        copy_sharpen_l(source, output);
+
+        const auto context = opencl_device()->create_context();
+        check(context != nullptr,
+              "injected readback: the device creates a context");
+        if (context == nullptr) {
+            return;
+        }
+        StageFaultPlan plan;
+        plan.fail_readback = descriptor;
+        context->set_fault_plan(plan);
+
+        StageExecution execution;
+        std::string error;
+        const RtStageStatus status = run_device_lab_sharpening(
+            context, params, output, execution, error);
+
+        const std::string expected =
+            "lab.sharpening readback descriptor " +
+            std::to_string(descriptor) + " failed";
+        check(status == RT_STAGE_OK,
+              "injected readback: the host fallback completes");
+        check(execution.device == StageDeviceType::CPU,
+              "injected readback: the fallback reports the host");
+        check(!execution.asynchronous,
+              "injected readback: the fallback is synchronous");
+        check(execution.note.find(expected) != std::string::npos,
+              "injected readback: the note names the failed descriptor");
+        check(note_classifies_as_device_error(execution.note),
+              "injected readback: the note publishes as device-error");
+
+        const LabPlaneDiff diff = compare_lab_planes(output, reference);
+        check(diff.finite,
+              "injected readback: the fallback output is finite");
+        check(diff.max_l == 0.0 && diff.max_a == 0.0 && diff.max_b == 0.0 &&
+                  diff.differing == 0,
+              "injected readback: the fallback output equals the host-only run");
+        std::printf("stage-residency: injected readback descriptor %d: "
+                    "note=\"%s\", PAE L %.6f a %.6f b %.6f, %zu of %zu "
+                    "samples differ\n",
+                    descriptor, execution.note.c_str(), diff.max_l,
+                    diff.max_a, diff.max_b, diff.differing, diff.samples);
+    }
+
+    /*
+     * Direct proof that no host input was touched before the transaction
+     * failed: suppress the host fallback by asking the compiler for a module
+     * implementation and pointing the search path at a directory that holds
+     * none. The device launcher still runs, fails the selected readback, and
+     * the node's host builtin cannot run, so any partial commit would remain
+     * visible in the Lab image. This uses the existing compiler selection
+     * hook, not a new production switch.
+     */
+    StageRequest module_probe;
+    module_probe.name = "lab.sharpening";
+    module_probe.impl = "module";
+    if (StageCompiler::instance().compile(module_probe, nullptr) != nullptr) {
+        /* An installed module would run the fallback and mask a partial
+         * commit, so the direct sub-case cannot be constructed safely. */
+        skip("injected readback: a lab.sharpening module is installed; the "
+             "untouched sub-case is suppressed");
+    } else {
+        const auto context = opencl_device()->create_context();
+        check(context != nullptr,
+              "injected readback: the transactional context exists");
+        if (context == nullptr) {
+            return;
+        }
+        for (int descriptor : {2, 3}) {
+            LabImage output(63, 31);
+            copy_sharpen_l(source, output);
+            LabImage before(63, 31);
+            copy_sharpen_l(output, before);
+
+            StageFaultPlan plan;
+            plan.fail_readback = descriptor;
+            context->set_fault_plan(plan);
+
+            StageExecution execution;
+            std::string error;
+            RtStageStatus status = RT_STAGE_FALLBACK;
+            {
+                ScopedEnv impl("RT_STAGE_IMPL", "module");
+                ScopedEnv path("RT_STAGE_PATH",
+                               "/nonexistent-stage-path-for-injection");
+                status = run_device_lab_sharpening(context, params, output,
+                                                   execution, error);
+            }
+
+            check(status != RT_STAGE_OK,
+                  "injected readback: the node does not complete without a "
+                  "fallback");
+            const LabPlaneDiff untouched = compare_lab_planes(output, before);
+            check(untouched.max_l == 0.0 && untouched.max_a == 0.0 &&
+                      untouched.max_b == 0.0 && untouched.differing == 0,
+                  "injected readback: no host plane was committed");
+            std::printf("stage-residency: injected readback descriptor %d "
+                        "without a fallback: status %d, %zu of %zu samples "
+                        "differ\n",
+                        descriptor, static_cast<int>(status),
+                        untouched.differing, untouched.samples);
+
+            /* Reset the plan so the next case starts from the same state. */
+            context->set_fault_plan(StageFaultPlan{});
+        }
+    }
+}
+
+
 /* --------------------------------------------------------- run() wiring */
 
 void test_run_wiring(bool available)
@@ -21965,6 +22312,8 @@ int main()
     test_raw_base(available);
     test_raw_base_wb(available);
     test_lab_sharpening(available);
+    test_injected_wait_failure(available);
+    test_injected_readback_failure(available);
     test_run_wiring(available);
 
     if (failures == 0) {

@@ -262,6 +262,36 @@ int main()
     check(parity.differing == 0, "context and direct pixels match exactly");
     check(parity.max_abs == 0, "context and direct maximum difference is zero");
 
+    /*
+     * The fault plan is a device-only test seam. On a CPU context it is stored
+     * but must be inert: the host execution and its output are unchanged.
+     */
+    {
+        RtStageBuffer fault_output =
+            allocator.allocate({RT_STAGE_F32, 32, 24, 3}, &error);
+        check(valid(fault_output), "fault-plan fixture allocates");
+        if (valid(fault_output)) {
+            StageFaultPlan plan;
+            plan.fail_wait = true;
+            plan.fail_readback = 1;
+            context->set_fault_plan(plan);
+
+            StageRequest fault_request = request;
+            fault_request.args = {buffer_arg(source), buffer_arg(fault_output),
+                                  double_arg(0.5), int_arg(2)};
+            check(context->execute(fault_request, nullptr) == RT_STAGE_OK,
+                  "a fault plan is inert on the CPU context");
+            const ParityResult fault_parity =
+                compare(fault_output, direct_output);
+            check(fault_parity.differing == 0 && fault_parity.max_abs == 0,
+                  "a fault plan does not change the CPU output");
+
+            context->set_fault_plan(StageFaultPlan{});
+            check(allocator.release(fault_output),
+                  "fault-plan fixture releases");
+        }
+    }
+
     /* The CPU queue executes inline and reports a completed event. */
     const auto cpu_queue = cpu->create_queue();
     check(cpu_queue != nullptr, "CPU device creates a queue");

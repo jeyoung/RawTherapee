@@ -455,9 +455,21 @@ StageQueue& StageContext::queue()
     std::lock_guard<std::mutex> lock(mutex_);
     if (!queue_) {
         queue_ = device_->create_queue();
+        assert(queue_ != nullptr);
+        /* A plan may have been set before the queue was created lazily. */
+        queue_->set_fault_plan(fault_plan_);
     }
     assert(queue_ != nullptr);
     return *queue_;
+}
+
+void StageContext::set_fault_plan(const StageFaultPlan& plan)
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    fault_plan_ = plan;
+    if (queue_) {
+        queue_->set_fault_plan(plan);
+    }
 }
 
 StageBufferAllocator& StageContext::allocator()

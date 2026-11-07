@@ -1639,6 +1639,13 @@ struct OpenCLEnv {
     std::mutex program_mutex;
     std::map<std::string, cl_kernel> kernels;
 
+    /*
+     * Test-only fault injection shared by every submission and readback on
+     * this environment. Inert unless the owning queue's set_fault_plan() is
+     * called; no production path reads the environment for it.
+     */
+    StageFaultPlan fault_plan;
+
     ~OpenCLEnv()
     {
         for (auto& entry : kernels) {
@@ -1865,6 +1872,12 @@ public:
                            const RtStageBuffer& host) override
     {
         return transfer(buffer, host, false);
+    }
+
+    /* Test-only: the fault plan of the environment this residency serves. */
+    const StageFaultPlan& fault_plan() const
+    {
+        return env_->fault_plan;
     }
 
     /*
@@ -2196,8 +2209,22 @@ RtStageStatus readbackAll(
     std::vector<StagedReadback> staged;
     staged.reserve(transfers.size());
 
+    const int injected_failure = residency.fault_plan().fail_readback;
+
     std::size_t descriptor = 0;
     for (const ReadbackTransfer& transfer : transfers) {
+        /*
+         * Test-only injection: fail the selected descriptor before it is
+         * staged, so the transaction never commits and every host buffer keeps
+         * its input. The index is one-based to match the plan and the node's
+         * own output order.
+         */
+        if (injected_failure == static_cast<int>(descriptor) + 1) {
+            error = std::string(what) + " readback descriptor " +
+                    std::to_string(descriptor + 1) +
+                    " failed: injected device readback failure";
+            return RT_STAGE_ERROR;
+        }
         StagedReadback copy;
         if (!stageReadback(transfer.second, copy, what, descriptor, error)) {
             return RT_STAGE_INVALID;
@@ -2259,6 +2286,20 @@ public:
         std::lock_guard<std::recursive_mutex> lock(env_->queue_mutex);
         if (final_) {
             return result_;
+        }
+        /*
+         * Test-only injection. A real wait failure leaves the output undefined,
+         * so the injected failure also happens before the readback: the host
+         * fallback must run on its own and must not inherit partial device
+         * output.
+         */
+        if (env_->fault_plan.fail_wait) {
+            if (event_ != nullptr) {
+                env_->api->ReleaseEvent(event_);
+                event_ = nullptr;
+            }
+            note_ = "injected device wait failure";
+            return finish(RT_STAGE_ERROR);
         }
         if (event_ != nullptr) {
             const cl_int error = env_->api->WaitForEvents(1, &event_);
@@ -22471,6 +22512,11 @@ public:
     StageDeviceResidency* residency() override
     {
         return residency_.get();
+    }
+
+    void set_fault_plan(const StageFaultPlan& plan) override
+    {
+        env_->fault_plan = plan;
     }
 
 private:
