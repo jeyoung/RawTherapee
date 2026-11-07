@@ -28,11 +28,11 @@ or the POCL environment wrapper.
 ## Current package
 
 ```
-build/portable/rawtherapee-graph-5.13-801-gd6f5ef1f6_5.13+git13822.d6f5ef1f6-1_amd64.deb
-sha256 9e1905b398185d0b200dee41dcf4cd83f2550557442bb5ac80d7a89205ee7c13
+build/portable/rawtherapee-graph-5.13-805-g8e7d4e488_5.13+git13826.8e7d4e488-1_amd64.deb
+sha256 7bf7bac80fa8a6531bc9dd1ba7eb0e43c00a43dfb8043d8b2610803f427ce633
 ```
 
-Built 2026-11-07 from `d6f5ef1f6` with `tools/build-rt.sh portable`. Validated
+Built 2026-11-07 from `8e7d4e488` with `tools/build-rt.sh portable`. Validated
 in fresh Debian 12 and Debian 13 containers: install, `--list-formats` (36
 entries), a neutral 16-bit export identical to the host CLI (AE=0, 0 of
 30,419,712 samples), and a GUI smoke test under Xvfb (20 s timeout, exit 124).

@@ -8,15 +8,15 @@ contains only current evidence; earlier packages, commits and matrices are in
 ## Artefact
 
 ```
-rawtherapee-graph-5.13-801-gd6f5ef1f6_5.13+git13822.d6f5ef1f6-1_amd64.deb
-sha256 9e1905b398185d0b200dee41dcf4cd83f2550557442bb5ac80d7a89205ee7c13
+rawtherapee-graph-5.13-805-g8e7d4e488_5.13+git13826.8e7d4e488-1_amd64.deb
+sha256 7bf7bac80fa8a6531bc9dd1ba7eb0e43c00a43dfb8043d8b2610803f427ce633
 ```
 
-Built 2026-11-07 from `d6f5ef1f6` with `tools/build-rt.sh portable`. The host
-reference is the same commit in `build/cpu-perf-graph`; the StagePlan,
-coverage and typed-refusal changes preserve valid-path pixel output. The export reference
-must use the packaged data directory: the install adds the `options` file and
-the generated `camconst.json`, and bare `rtdata` moves the neutral export.
+Built 2026-11-07 from `8e7d4e488` with `tools/build-rt.sh portable`. The host
+reference is the same code change (`0f73d2ee1`) in `build/cpu-perf-graph`; the
+merged-order fix preserves valid-path pixel output. The export reference must
+use the packaged data directory: the install adds the `options` file and the
+generated `camconst.json`, and bare `rtdata` moves the neutral export.
 
 ## Environment
 
@@ -63,11 +63,13 @@ installation and export.
 
 ## Test suite
 
-The full suite `arch2-suite2` ran at `d6f5ef1f6` on `build/cpu-perf-graph` and
-reported `PASS`, `failures: 0`. The StagePlan, contract-coverage and typed-
-refusal changes are covered by `stage-plan-test`, `stage-pipeline-test`,
-`stage-device-test` and `stage-residency-test`;
-their separate runs are recorded below.
+The full suite `suite-grid-final` ran at the merged-order fix that became
+`0f73d2ee1` on `build/cpu-perf-graph` and reported `PASS`, `failures: 0`. The
+StagePlan, contract-coverage, typed-refusal and merged-order changes are
+covered by `stage-plan-test`, `stage-pipeline-test`, `stage-device-test` and
+`stage-residency-test`; their separate runs are recorded below. The Grid crash
+under a crop is covered by the `stage-plan-test` merged-order regression and by
+the GUI check recorded in `WORKSTREAM.md`.
 
 ### Stage and harness rows
 
@@ -116,7 +118,7 @@ The neutral exports are pixel-identical across thread counts.
 
 Baseline: `dev` `9c3426339` plus the AMaZE source patch from `2ebf08b0f`, on
 branch `dev-amaze`, build `build/cpu-dev-amaze`. Candidate: `perf-graph`
-`f7f3d2848`, build `build/cpu-perf-graph`. Both binaries run under `bwrap` with
+`0f73d2ee1`, build `build/cpu-perf-graph`. Both binaries run under `bwrap` with
 one `rtdata` tree bound to both data paths, `OMP_NUM_THREADS=1` and
 `--gpu=off`.
 
