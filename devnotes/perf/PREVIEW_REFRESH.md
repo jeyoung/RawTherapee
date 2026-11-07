@@ -151,14 +151,7 @@ Host GUI check on an otherwise idle host, fit zoom, Neutral profile:
 This was a functional check, not a benchmark. The local corpus did not include
 the 45.7 MP NEF, so its fit and 100 % checks remain uncovered.
 
-The Debian package
-`rawtherapee-5.13-163-gb17eb1ef7_5.13+git13184.b17eb1ef7-1_amd64.deb`
-(SHA-256 `7889815b81e29289604816efe3e2ae29ec73cb82f8a1eb424eef8b94c5425534`)
-passed install, `--list-formats` with JPEG XL, a single-threaded 16-bit TIFF
-export compared with the host export (`AE=0`), and a GUI startup under Xvfb on
-Debian 12 and Debian 13. The containers have no OpenCL ICD, so `--gpu-test` and
-`--gpu-test-monitor` were not run there. The `ISOSpeedRatings` TIFF warning is
-metadata-only; the image comparison is pixel-identical.
+Package validation is recorded in `devnotes/opencl/PORTABLE.md`.
 
 Only the 45.7 MP NEF fit and 100 % check remains uncovered.
 

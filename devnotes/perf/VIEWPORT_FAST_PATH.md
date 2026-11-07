@@ -309,16 +309,7 @@ run noise, the 6 hits / 2 analyses ratio is stable.
 
 ### Debian package
 
-`tools/build-rt.sh portable` built
-`rawtherapee-5.13-157-gfbe080bdf_5.13+git13178.fbe080bdf-1_amd64.deb`,
-SHA-256 `163ad2a19b7b736de04ced488ff3246733f7dfb26e5b03dd64c52863be661dc0`.
-
-Debian 12 and Debian 13 containers: `apt-get install ./...deb` PASS,
-`--list-formats` includes JPEG XL PASS, single-threaded 16-bit TIFF export
-compared with the host single-threaded export AE = 0, GUI startup under Xvfb
-PASS. The containers have no OpenCL ICD, so `--gpu-test` and
-`--gpu-test-monitor` were not run there; GPU parity was checked on the host
-with `verify.sh --quick` as above.
+Package validation is recorded in `devnotes/opencl/PORTABLE.md`.
 
 ## Known limitations and follow-ups
 

@@ -58,14 +58,5 @@ The CPU and OpenCL configurations compiled, and
 `tools/perf/test-fast-preview.sh` and `tools/perf/test-preview-base-cache.sh`
 passed on the CPU build.
 
-Package: `rawtherapee-5.13-168-g5eec470e7_5.13+git13189.5eec470e7-1_amd64.deb`
-(27 MB), SHA-256
-`a46bad59f8deb11505390199388ade69bc98bd9422ef9aff00a8a64247e52d58`.
-
-Debian 12 and Debian 13 containers installed the package, listed `jxl`,
-exported the public PEF as 16-bit TIFF with `OMP_NUM_THREADS=1` (AE = 0 against
-the host export) and opened the File Browser in the GUI under Xvfb. The same
-Debian 12 GUI run selected the Inspect tab, hovered the thumbnail, enabled
-**Fit to window** and produced the fitted image with the translated label. Host
-GPU diagnostics on the package binary passed: `--gpu-test` on the AMD Radeon
-RX 550 and `--gpu-test-monitor` (max 1 byte, 14 of 196608 samples).
+Package validation, including the Debian 12 Fit to window GUI check, is
+recorded in `devnotes/opencl/PORTABLE.md`.

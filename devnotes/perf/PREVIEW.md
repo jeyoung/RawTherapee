@@ -127,17 +127,7 @@ than a stale pass. `tools/perf/test-fast-preview.sh` and
 `tools/perf/test-preview-base-cache.sh` passed on the CPU build, and both the
 CPU and OpenCL configurations compiled.
 
-Package: `rawtherapee-5.13-166-g0379bb37e_5.13+git13187.0379bb37e-1_amd64.deb`
-(27 MB), SHA-256
-`3967bf4e4bbf1de29a0c7d38456fa2353d8d7090e6091bf060197148a39677d0`.
-
-Debian 12 and Debian 13 containers each installed the package, listed `jxl`,
-exported the public PEF as 16-bit TIFF with `OMP_NUM_THREADS=1` (AE = 0 against
-the host export) and opened the image in the GUI under Xvfb. The extracted
-package binary passed the same single-tab two-image sequence with AE = 0 at
-100 % against the reference. Host GPU diagnostics on the package binary
-passed: `--gpu-test` on the AMD Radeon RX 550 and `--gpu-test-monitor`
-(max 1 byte, 14 of 196608 samples).
+Package validation is recorded in `devnotes/opencl/PORTABLE.md`.
 
 
 ## Initial-load reveal
@@ -205,9 +195,10 @@ A 10 MP PEF gave a rough frame after about 7.0 s and the final frame about
 63 ms later. The long first interval is the existing raw decode and first
 full pipeline; the two-stage reveal does not try to hide it.
 
-## FAST preview toggle
+## Fast preview toggle
 
-The per-tab **FAST** control overrides the preview demosaic at every zoom.
-With it off, below 100% the Preview Demosaic Method preference applies and at
-100% and above the full `.pp3` method is used. See
-`devnotes/perf/FAST_PREVIEW_TOGGLE.md` for the truth table and evidence.
+The editor top panel has an icon-only Fast control. It is shown only when the
+Preview Demosaic Method preference is Fast, where it defaults to on at 100% and
+above. In As in PP3 the control is hidden and the full `.pp3` method is used at
+every zoom. See `devnotes/perf/FAST_PREVIEW_TOGGLE.md` for the truth table and
+implementation details.
