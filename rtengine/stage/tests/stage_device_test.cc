@@ -240,9 +240,16 @@ int main()
 
     /* Execution through the context queue. */
     RtStageProfiling profiling{};
-    check(context->execute(request, &profiling) == RT_STAGE_OK,
+    StageExecution cpu_execution;
+    check(context->execute(request, &profiling, &cpu_execution) == RT_STAGE_OK,
           "CPU context executes Lanczos");
     check(profiling.elapsed_ns > 0, "context execution reports elapsed time");
+    check(cpu_execution.device == StageDeviceType::CPU,
+          "CPU execution reports the CPU");
+    check(cpu_execution.refusal == StageRefusalCode::None,
+          "a successful CPU execution has no refusal code");
+    check(cpu_execution.note.empty(),
+          "a successful CPU execution has no diagnostic note");
 
     /* The same request executed directly must produce identical output. */
     StageRequest direct_request = request;
@@ -274,6 +281,8 @@ int main()
             StageFaultPlan plan;
             plan.fail_wait = true;
             plan.fail_readback = 1;
+            check(plan.refusal == StageRefusalCode::DeviceError,
+                  "a fault plan defaults to a device-error refusal code");
             context->set_fault_plan(plan);
 
             StageRequest fault_request = request;
@@ -308,6 +317,8 @@ int main()
         check(event.device == StageDeviceType::CPU,
               "CPU queue event names the CPU");
         check(!event.asynchronous, "CPU queue event is synchronous");
+        check(event.refusal == StageRefusalCode::None,
+              "a CPU queue event has no refusal code");
         check(cpu_queue->wait(event) == RT_STAGE_OK, "CPU queue wait reports OK");
     }
 
@@ -331,6 +342,10 @@ int main()
               "OpenCL queue reports fallback for a host program");
         check(event.device == StageDeviceType::NONE,
               "a refused host program reports that nothing executed");
+        check(event.refusal ==
+                  (ocl->available() ? StageRefusalCode::Unsupported
+                                    : StageRefusalCode::DeviceUnavailable),
+              "a refused host program reports a typed refusal");
         check(ocl_queue->wait(event) == RT_STAGE_FALLBACK,
               "OpenCL wait reports fallback");
     }
@@ -428,6 +443,21 @@ int main()
           "event statuses have stable names");
     check(std::string(to_string(StageDeviceType::NONE)) == "none",
           "a non-execution has a stable name");
+    check(std::string(stageRefusalName(StageRefusalCode::None)) == "none",
+          "the typed None refusal has a stable name");
+    check(std::string(stageRefusalName(StageRefusalCode::Memory)) == "memory",
+          "the typed memory refusal has a stable name");
+    check(std::string(stageRefusalName(StageRefusalCode::Unsupported)) ==
+              "unsupported",
+          "the typed unsupported refusal has a stable name");
+    check(std::string(stageRefusalName(StageRefusalCode::DeviceUnavailable)) ==
+              "device-unavailable",
+          "the typed unavailable refusal has a stable name");
+    check(std::string(stageRefusalName(StageRefusalCode::DeviceError)) ==
+              "device-error",
+          "the typed device-error refusal has a stable name");
+    check(std::string(stageRefusalName(StageRefusalCode::Other)) == "other",
+          "the typed other refusal has a stable name");
 
     /* Allocator guards. */
     error.clear();

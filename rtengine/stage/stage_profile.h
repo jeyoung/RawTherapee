@@ -14,6 +14,8 @@ struct StageRecord {
     const char* impl = "";
     const char* source = "";
     const char* consumer = "";
+    /* Stable typed refusal name ("none" on success) and its legacy category. */
+    const char* refusal = "";
     /* Stable fallback category and bounded diagnostic; empty on success. */
     const char* fallback = "";
     const char* diagnostic = "";

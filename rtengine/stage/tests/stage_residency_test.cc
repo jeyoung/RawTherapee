@@ -460,6 +460,8 @@ void test_cpu_events()
     check(event.device == StageDeviceType::CPU, "the CPU event names the CPU");
     check(event.done() && event.succeeded(), "the CPU event succeeded");
     check(event.note.empty(), "a CPU execution has no fallback note");
+    check(event.refusal == StageRefusalCode::None,
+          "a CPU execution has no refusal code");
     check(queue->wait(event) == RT_STAGE_OK, "the CPU wait reports OK");
 }
 
@@ -490,6 +492,11 @@ public:
         return 42;
     }
 
+    StageRefusalCode refusal() const override
+    {
+        return StageRefusalCode::DeviceError;
+    }
+
 private:
     int polls_ = 0;
     StageEventStatus status_ = StageEventStatus::Running;
@@ -512,6 +519,8 @@ void test_failed_event()
     check(!event.succeeded(), "a failed event did not succeed");
     check(event.elapsed_ns == 42,
           "a failed event keeps the measured completion time");
+    check(event.refusal == StageRefusalCode::DeviceError,
+          "a polled failure publishes the submission's typed refusal");
 }
 
 void test_device_events(bool available)
@@ -553,6 +562,9 @@ void test_device_events(bool available)
           "wait completes the event");
     check(event.succeeded(), "the completed event succeeded");
     check(event.elapsed_ns > 0, "the completed event carries timing");
+    check(event.refusal == StageRefusalCode::None,
+          "a successful device event has no refusal code");
+    check(event.note.empty(), "a successful device event has no note");
 
     /* A node that refuses device execution must fall back to the host and say
      * why, without pretending to be asynchronous. */
@@ -569,6 +581,22 @@ void test_device_events(bool available)
     check(failed.status == StageEventStatus::Failed,
           "an invalid node fails on the host");
     check(!failed.note.empty(), "a refused device node reports a reason");
+    check(failed.refusal == StageRefusalCode::Unsupported,
+          "an invalid device node reports a typed unsupported refusal");
+
+    /* The typed cause survives the host fallback. */
+    const auto context = opencl_device()->create_context();
+    check(context != nullptr, "an unsupported configuration creates a context");
+    if (context != nullptr) {
+        set_node_device_override("lanczos3", StageNodeDevice::OpenCL);
+        StageExecution refused;
+        context->execute(bad, nullptr, &refused);
+        clear_node_device_overrides();
+        check(refused.refusal == StageRefusalCode::Unsupported,
+              "an unsupported configuration reports Unsupported on the execution");
+        check(!refused.note.empty(),
+              "an unsupported configuration keeps its diagnostic");
+    }
 
     /* An unknown node has no device implementation and runs on the host. */
     StageRequest unknown;
@@ -580,6 +608,8 @@ void test_device_events(bool available)
     check(missing.status == StageEventStatus::Failed, "an unknown node fails");
     check(missing.note.find("no OpenCL implementation") != std::string::npos,
           "an unimplemented node explains the fallback");
+    check(missing.refusal == StageRefusalCode::Unsupported,
+          "an unimplemented node reports a typed unsupported refusal");
 }
 
 /*
@@ -1825,6 +1855,10 @@ void test_node_parity(bool available)
                   "an over-budget node reports the host as the executor");
             check(!over_budget.asynchronous,
                   "an over-budget node reports a synchronous execution");
+            check(over_budget.refusal == StageRefusalCode::Memory,
+                  "an over-budget node reports a typed memory refusal");
+            check(!over_budget.note.empty(),
+                  "an over-budget node keeps its diagnostic");
             check(context->residency()->stats().refusals > 0,
                   "the over-budget fallback is counted as a refusal");
 
@@ -4211,6 +4245,10 @@ void test_working_trc(bool available)
               "the forced fallback records a host execution");
         check(profile.find("\"impl\":\"opencl\"") == std::string::npos,
               "the forced fallback never mixes a device pass");
+        check(profile.find("\"refusal\":\"unsupported\"") != std::string::npos,
+              "the forced fallback records a typed unsupported refusal");
+        check(profile.find("\"fallback\":\"unsupported\"") != std::string::npos,
+              "the legacy fallback category is derived from the typed code");
         const Diff diff = compare(view(device), view(cpu));
         check(diff.differing == 0 && diff.max_abs == 0.0,
               "the forced fallback matches the CPU block");
@@ -15829,6 +15867,8 @@ void test_injected_wait_failure(bool available)
           "injected wait: the fallback is synchronous");
     check(execution.note == "injected device wait failure",
           "injected wait: the device note is preserved on the execution");
+    check(execution.refusal == StageRefusalCode::DeviceError,
+          "injected wait: the typed refusal is device-error");
     check(note_classifies_as_device_error(execution.note),
           "injected wait: the note publishes as device-error");
 
@@ -15855,13 +15895,17 @@ void test_injected_wait_failure(bool available)
           "injected wait: an empty plan leaves the device path intact");
     check(recovered.note.empty(),
           "injected wait: a successful device run has no note");
+    check(recovered.refusal == StageRefusalCode::None,
+          "injected wait: a successful device run has no refusal code");
     const Diff recovered_diff = compare(output, reference);
     check(recovered_diff.max_abs <= 1.0,
           "injected wait: the recovered device output is within one LSB16");
 
-    /* A plan set after the queue already exists must take effect too. */
+    /* A plan set after the queue already exists must take effect too, and an
+     * explicitly chosen code must be the one published. */
     StageFaultPlan late_plan;
     late_plan.fail_wait = true;
+    late_plan.refusal = StageRefusalCode::Other;
     context->set_fault_plan(late_plan);
     set_node_device_override("lanczos3", StageNodeDevice::OpenCL);
     StageExecution late_execution;
@@ -15874,6 +15918,8 @@ void test_injected_wait_failure(bool available)
     check(late_execution.device == StageDeviceType::CPU &&
               late_execution.note == "injected device wait failure",
           "injected wait: a plan set after queue creation also applies");
+    check(late_execution.refusal == StageRefusalCode::Other,
+          "injected wait: an explicitly chosen refusal code is published");
     context->set_fault_plan(StageFaultPlan{});
 }
 
@@ -15974,6 +16020,8 @@ void test_injected_readback_failure(bool available)
               "injected readback: the fallback is synchronous");
         check(execution.note.find(expected) != std::string::npos,
               "injected readback: the note names the failed descriptor");
+        check(execution.refusal == StageRefusalCode::DeviceError,
+              "injected readback: the typed refusal is device-error");
         check(note_classifies_as_device_error(execution.note),
               "injected readback: the note publishes as device-error");
 
@@ -16091,6 +16139,12 @@ void test_run_wiring(bool available)
     check(host_profile.find("\"impl\":\"builtin\"") != std::string::npos ||
               host_profile.find("\"impl\":\"module\"") != std::string::npos,
           "the switch-off run() reports a host implementation");
+    check(host_profile.find("\"refusal\":\"none\"") != std::string::npos,
+          "a successful host record reports the typed None refusal");
+    check(host_profile.find("\"fallback\":\"\"") != std::string::npos,
+          "a successful host record has an empty fallback category");
+    check(host_profile.find("\"diagnostic\":\"\"") != std::string::npos,
+          "a successful host record has an empty diagnostic");
 
     if (!available) {
         skip("run wiring: no OpenCL device");
@@ -16107,6 +16161,12 @@ void test_run_wiring(bool available)
     const std::string device_profile = read_file(profile_path);
     check(device_profile.find("\"impl\":\"opencl\"") != std::string::npos,
           "the device run() reports the OpenCL implementation");
+    check(device_profile.find("\"refusal\":\"none\"") != std::string::npos,
+          "a successful device record reports the typed None refusal");
+    check(device_profile.find("\"fallback\":\"\"") != std::string::npos,
+          "a successful device record has an empty fallback category");
+    check(device_profile.find("\"diagnostic\":\"\"") != std::string::npos,
+          "a successful device record has an empty diagnostic");
     clear_node_device_overrides();
 
     const Diff diff = compare(cpu_output, device_output);

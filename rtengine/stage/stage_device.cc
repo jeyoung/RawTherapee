@@ -179,6 +179,26 @@ const char* to_string(StageEventStatus status)
     return "unknown";
 }
 
+const char* stageRefusalName(StageRefusalCode code)
+{
+    switch (code) {
+    case StageRefusalCode::None:
+        return "none";
+    case StageRefusalCode::Memory:
+        return "memory";
+    case StageRefusalCode::Unsupported:
+        return "unsupported";
+    case StageRefusalCode::DeviceUnavailable:
+        return "device-unavailable";
+    case StageRefusalCode::DeviceError:
+        return "device-error";
+    case StageRefusalCode::Other:
+        return "other";
+    }
+    assert(false);
+    return "unknown";
+}
+
 StageEvent StageQueue::submit(const StageRequest& request,
                               RtStageProfiling* profiling)
 {
@@ -190,6 +210,7 @@ StageEvent StageQueue::submit(const StageRequest& request,
         event.result = RT_STAGE_FALLBACK;
         event.device = StageDeviceType::NONE;
         event.note = error;
+        event.refusal = StageRefusalCode::Unsupported;
         return event;
     }
 
@@ -210,6 +231,7 @@ StageEventStatus StageQueue::poll(StageEvent& event) const
     if (event.submission) {
         event.status = event.submission->poll();
         event.elapsed_ns = event.submission->elapsed_ns();
+        event.refusal = event.submission->refusal();
     }
     return event.status;
 }
@@ -379,6 +401,12 @@ RtStageStatus StageContext::execute(const StageRequest& request,
         if (status != RT_STAGE_OK && device_note.empty()) {
             device_note = "device execution failed";
         }
+        StageRefusalCode device_refusal = event.refusal;
+        if (status != RT_STAGE_OK && device_refusal == StageRefusalCode::None) {
+            /* A failed device attempt always has a typed cause; an old
+             * launcher that returned no code is a driver fault. */
+            device_refusal = StageRefusalCode::DeviceError;
+        }
         if (status == RT_STAGE_OK) {
             /*
              * Synchronous device branches construct their event directly and
@@ -400,18 +428,21 @@ RtStageStatus StageContext::execute(const StageRequest& request,
                 execution->device = event.device;
                 execution->asynchronous = event.asynchronous;
                 execution->note = device_note;
+                execution->refusal = device_refusal;
             }
             return status;
         }
 
         /*
-         * The device attempt failed. Keep its note so the host fallback can
-         * publish the device cause; the host event below must not clear it.
+         * The device attempt failed. Keep its note and typed cause so the
+         * host fallback can publish the device cause; the host event below
+         * must not clear them.
          */
         if (execution != nullptr) {
             execution->device = event.device;
             execution->asynchronous = event.asynchronous;
             execution->note = device_note;
+            execution->refusal = device_refusal;
         }
     }
 
@@ -419,6 +450,9 @@ RtStageStatus StageContext::execute(const StageRequest& request,
     if (!program) {
         if (execution != nullptr) {
             execution->note = "program compilation failed";
+            if (execution->refusal == StageRefusalCode::None) {
+                execution->refusal = StageRefusalCode::Unsupported;
+            }
         }
         return RT_STAGE_FALLBACK;
     }
@@ -436,6 +470,9 @@ RtStageStatus StageContext::execute(const StageRequest& request,
         execution->asynchronous = event.asynchronous;
         if (execution->note.empty()) {
             execution->note = event.note;
+        }
+        if (execution->refusal == StageRefusalCode::None) {
+            execution->refusal = event.refusal;
         }
     }
     return status;

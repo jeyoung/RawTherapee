@@ -1802,6 +1802,7 @@ public:
         };
 
         if (key == nullptr) {
+            set_last_refusal(StageRefusalCode::Unsupported);
             return fail("a device buffer needs a host buffer identity");
         }
 
@@ -1811,6 +1812,7 @@ public:
         std::string layout_error;
         if (!stage_buffer_layout(shape, row_pitch, plane_pitch, bytes,
                                  &layout_error)) {
+            set_last_refusal(StageRefusalCode::Unsupported);
             return fail(layout_error);
         }
 
@@ -1825,6 +1827,7 @@ public:
 
         if (bytes > stats_.budget_bytes) {
             ++stats_.refusals;
+            last_refusal_ = StageRefusalCode::Memory;
             return fail("device buffer of " + std::to_string(bytes) +
                         " bytes exceeds the stage budget of " +
                         std::to_string(stats_.budget_bytes) + " bytes");
@@ -1838,6 +1841,7 @@ public:
 
         if (!evict_locked(bytes, key)) {
             ++stats_.refusals;
+            last_refusal_ = StageRefusalCode::Memory;
             return fail("stage device budget exhausted: need " +
                         std::to_string(bytes) + " bytes, " +
                         std::to_string(stats_.budget_bytes - stats_.used_bytes) +
@@ -1849,6 +1853,10 @@ public:
                                                 bytes, nullptr, &error_code);
         if (memory == nullptr) {
             ++stats_.refusals;
+            last_refusal_ =
+                error_code == CL_MEM_OBJECT_ALLOCATION_FAILURE
+                    ? StageRefusalCode::Memory
+                    : StageRefusalCode::DeviceError;
             return fail("clCreateBuffer failed with error " +
                         std::to_string(error_code));
         }
@@ -1881,6 +1889,31 @@ public:
     }
 
     /*
+     * Typed refusal bookkeeping. A launcher clears the code before it runs;
+     * every admission failure records its cause, so the queue can publish a
+     * typed refusal after a null submission without reading the diagnostic.
+     */
+    void reset_refusal()
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        last_refusal_ = StageRefusalCode::None;
+    }
+
+    StageRefusalCode last_refusal() const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return last_refusal_;
+    }
+
+    void set_last_refusal(StageRefusalCode code)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (code != StageRefusalCode::None) {
+            last_refusal_ = code;
+        }
+    }
+
+    /*
      * Reserve device working memory that is not allocated through acquire(),
      * such as a launcher's scratch planes. The reservation shares the same
      * budget as the cached buffers: admission can evict cached entries but
@@ -1898,6 +1931,7 @@ public:
         };
 
         if (key == nullptr) {
+            set_last_refusal(StageRefusalCode::Unsupported);
             return fail("a working-set reservation needs an identity");
         }
         if (bytes == 0) {
@@ -1906,12 +1940,14 @@ public:
 
         std::lock_guard<std::mutex> lock(mutex_);
         if (reservations_.count(key) != 0) {
+            last_refusal_ = StageRefusalCode::Other;
             return fail("duplicate working-set reservation");
         }
         if (bytes > stats_.budget_bytes ||
             stats_.used_bytes > stats_.budget_bytes - bytes) {
             if (!evict_locked(bytes, nullptr) ||
                 stats_.used_bytes > stats_.budget_bytes - bytes) {
+                last_refusal_ = StageRefusalCode::Memory;
                 return fail("stage device working set of " +
                             std::to_string(bytes) +
                             " bytes exceeds the stage budget of " +
@@ -2099,6 +2135,7 @@ private:
     std::map<const void*, std::size_t> reservations_;
     StageResidencyStats stats_;
     std::uint64_t clock_ = 0;
+    StageRefusalCode last_refusal_ = StageRefusalCode::None;
 };
 
 /*
@@ -2223,6 +2260,7 @@ RtStageStatus readbackAll(
             error = std::string(what) + " readback descriptor " +
                     std::to_string(descriptor + 1) +
                     " failed: injected device readback failure";
+            residency.set_last_refusal(residency.fault_plan().refusal);
             return RT_STAGE_ERROR;
         }
         StagedReadback copy;
@@ -2299,6 +2337,7 @@ public:
                 event_ = nullptr;
             }
             note_ = "injected device wait failure";
+            refusal_ = env_->fault_plan.refusal;
             return finish(RT_STAGE_ERROR);
         }
         if (event_ != nullptr) {
@@ -2307,6 +2346,7 @@ public:
             event_ = nullptr;
             if (error != CL_SUCCESS) {
                 note_ = "device wait failed";
+                refusal_ = StageRefusalCode::DeviceError;
                 return finish(RT_STAGE_ERROR);
             }
         }
@@ -2315,6 +2355,7 @@ public:
                 residency_->readback(output_, host_output_);
             if (status != RT_STAGE_OK) {
                 note_ = "device readback failed";
+                refusal_ = StageRefusalCode::DeviceError;
                 return finish(status);
             }
         }
@@ -2324,6 +2365,11 @@ public:
     std::string note() const override
     {
         return note_;
+    }
+
+    StageRefusalCode refusal() const override
+    {
+        return refusal_;
     }
 
     StageEventStatus poll() override
@@ -2339,6 +2385,7 @@ public:
                 &status, nullptr);
             if (error == CL_SUCCESS && status < 0) {
                 /* The driver failed the command; the output is not valid. */
+                refusal_ = StageRefusalCode::DeviceError;
                 finish(RT_STAGE_ERROR);
                 return status_;
             }
@@ -2372,6 +2419,7 @@ private:
 
     std::shared_ptr<WorkingSetReservation> reservation_;
     std::string note_;
+    StageRefusalCode refusal_ = StageRefusalCode::None;
     std::shared_ptr<OpenCLEnv> env_;
     cl_event event_ = nullptr;
     std::vector<cl_mem> scratch_;
@@ -22118,6 +22166,58 @@ RtStageStatus run_local_adjustments(const std::shared_ptr<OpenCLEnv>& env,
     return RT_STAGE_OK;
 }
 
+/*
+ * Typed refusal for a launcher result. A code recorded by the residency or by
+ * an asynchronous submission wins; otherwise the stage status decides. This is
+ * the only place a launcher's status becomes a refusal code.
+ */
+StageRefusalCode refusal_from_result(RtStageStatus status,
+                                     const OpenCLResidency& residency)
+{
+    const StageRefusalCode typed = residency.last_refusal();
+    if (typed != StageRefusalCode::None) {
+        return typed;
+    }
+    if (status == RT_STAGE_ERROR) {
+        return StageRefusalCode::DeviceError;
+    }
+    /* RT_STAGE_FALLBACK and RT_STAGE_INVALID from a launcher mean the node or
+     * its parameters are unsupported on the device. */
+    return StageRefusalCode::Unsupported;
+}
+
+/*
+ * Legacy adapter for a launcher that returns a null submission and a note
+ * instead of a typed code. The primary refusal paths - residency admission,
+ * asynchronous wait/readback, device availability and the queue's own
+ * refusals - are typed at their source, so this only covers diagnostic-only
+ * launch failures in the older launchers.
+ */
+StageRefusalCode refusal_from_legacy_note(const std::string& note)
+{
+    if (note.empty()) {
+        return StageRefusalCode::None;
+    }
+    const auto has = [&note](const char* text) {
+        return note.find(text) != std::string::npos;
+    };
+    if (has("budget") || has("working set") ||
+        has("exceeds the stage budget")) {
+        return StageRefusalCode::Memory;
+    }
+    if (has("clEnqueueNDRangeKernel failed") || has("clSetKernelArg failed") ||
+        has("scratch allocation failed") || has("device upload failed") ||
+        has("clCreateBuffer failed") || has("device buffer type mismatch") ||
+        has("clBuildProgram") || has("kernel build failed") ||
+        has("did not complete") || has("device readback failed")) {
+        return StageRefusalCode::DeviceError;
+    }
+    if (has("unavailable") || has("built without")) {
+        return StageRefusalCode::DeviceUnavailable;
+    }
+    return StageRefusalCode::Unsupported;
+}
+
 class OpenCLStageQueue final : public StageQueue
 {
 public:
@@ -22147,6 +22247,7 @@ public:
         event.device = StageDeviceType::NONE;
         event.asynchronous = false;
         event.note = "a compiled host program cannot run on the OpenCL queue";
+        event.refusal = StageRefusalCode::Unsupported;
         return event;
     }
 
@@ -22156,6 +22257,7 @@ public:
         if (!request.impl.empty()) {
             StageEvent event = StageQueue::submit(request, profiling);
             event.note = "an explicit implementation is a host program";
+            event.refusal = StageRefusalCode::Unsupported;
             return event;
         }
 
@@ -22163,11 +22265,25 @@ public:
             StageEvent event = StageQueue::submit(request, profiling);
             event.note = "no OpenCL implementation for stage '" +
                          request.name + "'";
+            event.refusal = StageRefusalCode::Unsupported;
             return event;
         }
 
         StageEvent event;
         event.device = StageDeviceType::OPENCL;
+
+        const auto fallback_event =
+            [this, &request](RtStageProfiling* call_profiling,
+                             RtStageStatus status, const std::string& error) {
+                StageEvent fallback = StageQueue::submit(request, call_profiling);
+                fallback.note = error;
+                fallback.refusal = refusal_from_result(status, *residency_);
+                return fallback;
+            };
+
+        /* Each launcher starts from a clean refusal state; it records a typed
+         * code at the admission or device call that refuses the node. */
+        residency_->reset_refusal();
 
         std::string error;
         std::shared_ptr<OpenCLSubmission> submission;
@@ -22190,9 +22306,7 @@ public:
                 done.asynchronous = false;
                 return done;
             }
-            StageEvent fallback = StageQueue::submit(request, profiling);
-            fallback.note = error;
-            return fallback;
+            return fallback_event(profiling, status, error);
         } else if (request.name == "thumbnail.transform.u8") {
             const RtStageStatus status =
                 run_thumbnail_permute(env_, residency_, request.args,
@@ -22205,9 +22319,7 @@ public:
                 done.asynchronous = false;
                 return done;
             }
-            StageEvent fallback = StageQueue::submit(request, profiling);
-            fallback.note = error;
-            return fallback;
+            return fallback_event(profiling, status, error);
         } else if (request.name == "thumbnail.whitebalance") {
             const RtStageStatus status =
                 run_thumbnail_wb(env_, residency_, request.args, error);
@@ -22219,9 +22331,7 @@ public:
                 done.asynchronous = false;
                 return done;
             }
-            StageEvent fallback = StageQueue::submit(request, profiling);
-            fallback.note = error;
-            return fallback;
+            return fallback_event(profiling, status, error);
         } else if (request.name == "thumbnail.scale") {
             const RtStageStatus status =
                 run_thumbnail_scale(env_, residency_, request.args,
@@ -22234,9 +22344,7 @@ public:
                 done.asynchronous = false;
                 return done;
             }
-            StageEvent fallback = StageQueue::submit(request, profiling);
-            fallback.note = error;
-            return fallback;
+            return fallback_event(profiling, status, error);
         } else if (request.name == "raw.preprocess") {
             const RtStageStatus status =
                 run_raw_preprocess(env_, residency_, request.args, error);
@@ -22248,9 +22356,7 @@ public:
                 done.asynchronous = false;
                 return done;
             }
-            StageEvent fallback = StageQueue::submit(request, profiling);
-            fallback.note = error;
-            return fallback;
+            return fallback_event(profiling, status, error);
         } else if (request.name == "raw.demosaic") {
             const RtStageStatus status =
                 run_raw_demosaic(env_, residency_, request.args, error);
@@ -22262,9 +22368,7 @@ public:
                 done.asynchronous = false;
                 return done;
             }
-            StageEvent fallback = StageQueue::submit(request, profiling);
-            fallback.note = error;
-            return fallback;
+            return fallback_event(profiling, status, error);
         } else if (request.name == "raw.base") {
             const RtStageStatus status =
                 run_raw_base(env_, residency_, request.args, error);
@@ -22276,9 +22380,7 @@ public:
                 done.asynchronous = false;
                 return done;
             }
-            StageEvent fallback = StageQueue::submit(request, profiling);
-            fallback.note = error;
-            return fallback;
+            return fallback_event(profiling, status, error);
         } else if (request.name == "raw.base.wb") {
             const RtStageStatus status =
                 run_raw_base_wb(env_, residency_, request.args, error);
@@ -22290,9 +22392,7 @@ public:
                 done.asynchronous = false;
                 return done;
             }
-            StageEvent fallback = StageQueue::submit(request, profiling);
-            fallback.note = error;
-            return fallback;
+            return fallback_event(profiling, status, error);
         } else if (request.name == "thumbnail.scale.u8") {
             const RtStageStatus status =
                 run_thumbnail_scale(env_, residency_, request.args,
@@ -22305,9 +22405,7 @@ public:
                 done.asynchronous = false;
                 return done;
             }
-            StageEvent fallback = StageQueue::submit(request, profiling);
-            fallback.note = error;
-            return fallback;
+            return fallback_event(profiling, status, error);
         } else if (request.name == "rgb.proc" ||
                    request.name == "thumbnail.rgb") {
             const RtStageStatus status =
@@ -22320,9 +22418,7 @@ public:
                 done.asynchronous = false;
                 return done;
             }
-            StageEvent fallback = StageQueue::submit(request, profiling);
-            fallback.note = error;
-            return fallback;
+            return fallback_event(profiling, status, error);
         } else if (request.name == "gamut") {
             const RtStageStatus status =
                 run_gamut(env_, residency_, request.args, error);
@@ -22334,9 +22430,7 @@ public:
                 done.asynchronous = false;
                 return done;
             }
-            StageEvent fallback = StageQueue::submit(request, profiling);
-            fallback.note = error;
-            return fallback;
+            return fallback_event(profiling, status, error);
         } else if (request.name == "ciecam") {
             const RtStageStatus status =
                 run_ciecam(env_, residency_, request.args, error);
@@ -22348,9 +22442,7 @@ public:
                 done.asynchronous = false;
                 return done;
             }
-            StageEvent fallback = StageQueue::submit(request, profiling);
-            fallback.note = error;
-            return fallback;
+            return fallback_event(profiling, status, error);
         } else if (request.name == "working.trc") {
             const RtStageStatus status =
                 run_working_trc(env_, residency_, request.args, error);
@@ -22362,9 +22454,7 @@ public:
                 done.asynchronous = false;
                 return done;
             }
-            StageEvent fallback = StageQueue::submit(request, profiling);
-            fallback.note = error;
-            return fallback;
+            return fallback_event(profiling, status, error);
         } else if (request.name == "thumbnail.lab") {
             const RtStageStatus status =
                 run_lab_tools(env_, residency_, request.args, error,
@@ -22377,9 +22467,7 @@ public:
                 done.asynchronous = false;
                 return done;
             }
-            StageEvent fallback = StageQueue::submit(request, profiling);
-            fallback.note = error;
-            return fallback;
+            return fallback_event(profiling, status, error);
         } else if (request.name == "lab.tools") {
             const RtStageStatus status =
                 run_lab_tools(env_, residency_, request.args, error);
@@ -22391,9 +22479,7 @@ public:
                 done.asynchronous = false;
                 return done;
             }
-            StageEvent fallback = StageQueue::submit(request, profiling);
-            fallback.note = error;
-            return fallback;
+            return fallback_event(profiling, status, error);
         } else if (request.name == "local.adjustments") {
             const RtStageStatus status =
                 run_local_adjustments(env_, residency_, request.args, error);
@@ -22405,9 +22491,7 @@ public:
                 done.asynchronous = false;
                 return done;
             }
-            StageEvent fallback = StageQueue::submit(request, profiling);
-            fallback.note = error;
-            return fallback;
+            return fallback_event(profiling, status, error);
         } else if (request.name == "lab.wavelet") {
             const RtStageStatus status =
                 run_lab_wavelet(env_, residency_, request.args, error);
@@ -22419,9 +22503,7 @@ public:
                 done.asynchronous = false;
                 return done;
             }
-            StageEvent fallback = StageQueue::submit(request, profiling);
-            fallback.note = error;
-            return fallback;
+            return fallback_event(profiling, status, error);
         } else if (request.name == "output.sharpen") {
             const RtStageStatus status =
                 run_sharpen(env_, residency_, request.args, error);
@@ -22433,9 +22515,7 @@ public:
                 done.asynchronous = false;
                 return done;
             }
-            StageEvent fallback = StageQueue::submit(request, profiling);
-            fallback.note = error;
-            return fallback;
+            return fallback_event(profiling, status, error);
         } else if (request.name == "lab.sharpening") {
             const RtStageStatus status =
                 run_lab_sharpening(env_, residency_, request.args, error);
@@ -22447,9 +22527,7 @@ public:
                 done.asynchronous = false;
                 return done;
             }
-            StageEvent fallback = StageQueue::submit(request, profiling);
-            fallback.note = error;
-            return fallback;
+            return fallback_event(profiling, status, error);
         } else if (request.name == "framing") {
             const RtStageStatus status =
                 run_framing(env_, residency_, request.args, error);
@@ -22461,9 +22539,7 @@ public:
                 done.asynchronous = false;
                 return done;
             }
-            StageEvent fallback = StageQueue::submit(request, profiling);
-            fallback.note = error;
-            return fallback;
+            return fallback_event(profiling, status, error);
         } else if (request.name == "crop") {
             const RtStageStatus status =
                 run_crop(env_, residency_, request.args, error);
@@ -22475,9 +22551,7 @@ public:
                 done.asynchronous = false;
                 return done;
             }
-            StageEvent fallback = StageQueue::submit(request, profiling);
-            fallback.note = error;
-            return fallback;
+            return fallback_event(profiling, status, error);
         } else if (request.name == "monitor.output" ||
                    request.name == "viewport.output" ||
                    request.name == "thumbnail.output") {
@@ -22489,6 +22563,10 @@ public:
         if (!submission) {
             StageEvent fallback = StageQueue::submit(request, profiling);
             fallback.note = error;
+            fallback.refusal = residency_->last_refusal();
+            if (fallback.refusal == StageRefusalCode::None) {
+                fallback.refusal = refusal_from_legacy_note(error);
+            }
             return fallback;
         }
 
@@ -22506,6 +22584,7 @@ public:
         event.result = event.submission->wait();
         event.status = event.submission->poll();
         event.elapsed_ns = event.submission->elapsed_ns();
+        event.refusal = event.submission->refusal();
         return event.result;
     }
 
@@ -22559,6 +22638,7 @@ private:
         event.result = RT_STAGE_FALLBACK;
         event.device = StageDeviceType::NONE;
         event.note = "OpenCL device is unavailable";
+        event.refusal = StageRefusalCode::DeviceUnavailable;
         return event;
     }
 };
@@ -22672,6 +22752,7 @@ public:
         event.result = RT_STAGE_FALLBACK;
         event.device = StageDeviceType::NONE;
         event.note = "built without OpenCL";
+        event.refusal = StageRefusalCode::DeviceUnavailable;
         return event;
     }
 

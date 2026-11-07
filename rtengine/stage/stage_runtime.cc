@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cassert>
 #include <chrono>
 #include <cctype>
 #include <cstdlib>
@@ -235,28 +236,24 @@ std::shared_ptr<StageContext> opencl_context()
     return context;
 }
 
-/* Profile record shared by the host and device executions. */
-const char* fallbackCategory(const std::string& note)
+/* Legacy fallback category derived solely from the typed refusal code. */
+const char* fallbackCategory(StageRefusalCode code)
 {
-    if (note.empty()) {
+    switch (code) {
+    case StageRefusalCode::None:
         return "";
-    }
-    const auto has = [&note](const char* text) {
-        return note.find(text) != std::string::npos;
-    };
-    if (has("budget") || has("working set") || has("exceeds the device")) {
+    case StageRefusalCode::Memory:
         return "memory";
-    }
-    if (has("no OpenCL implementation") || has("unsupported") ||
-        has("support flag is not set") || has("needs device fp64") ||
-        has("requires a CPU OpenCL device") ||
-        has("cannot run on the OpenCL queue") ||
-        has("explicit implementation")) {
+    case StageRefusalCode::Unsupported:
         return "unsupported";
-    }
-    if (has("unavailable") || has("built without")) {
+    case StageRefusalCode::DeviceUnavailable:
         return "device-unavailable";
+    case StageRefusalCode::DeviceError:
+        return "device-error";
+    case StageRefusalCode::Other:
+        return "other";
     }
+    assert(false);
     return "device-error";
 }
 
@@ -276,7 +273,7 @@ std::string boundedDiagnostic(const std::string& note)
 }
 
 void record_stage(const char* name, const char* impl, const char* source,
-                  const char* fallback, const char* diagnostic,
+                  StageRefusalCode refusal, const char* diagnostic,
                   const std::vector<RtStageArg>& args,
                   const RtStageProfiling& local)
 {
@@ -288,7 +285,8 @@ void record_stage(const char* name, const char* impl, const char* source,
     record.impl = impl;
     record.source = source;
     record.consumer = "interactive";
-    record.fallback = fallback;
+    record.refusal = stageRefusalName(refusal);
+    record.fallback = fallbackCategory(refusal);
     record.diagnostic = diagnostic;
     record.elapsed_ns = local.elapsed_ns;
     record.width = !args.empty() && args[0].kind == RT_STAGE_ARG_BUFFER
@@ -569,6 +567,7 @@ RtStageStatus run(const char* name, const std::vector<RtStageArg>& args,
      * timing and memory are unchanged.
      */
     std::string device_failure;
+    StageRefusalCode device_refusal = StageRefusalCode::None;
 
     if (request.impl.empty() && node_device(name) == StageNodeDevice::OpenCL) {
         auto context = opencl_context();
@@ -581,6 +580,10 @@ RtStageStatus run(const char* name, const std::vector<RtStageArg>& args,
                 device_failure = execution.note.empty()
                                      ? std::string("device execution failed")
                                      : execution.note;
+                device_refusal = execution.refusal;
+                if (device_refusal == StageRefusalCode::None) {
+                    device_refusal = StageRefusalCode::DeviceError;
+                }
             }
             if (status == RT_STAGE_OK) {
                 /*
@@ -598,8 +601,8 @@ RtStageStatus run(const char* name, const std::vector<RtStageArg>& args,
                     boundedDiagnostic(execution.note);
                 record_stage(name, on_device ? "opencl" : "host",
                              on_device ? "opencl" : "device-fallback",
-                             on_device ? "" : fallbackCategory(execution.note),
-                             diagnostic.c_str(), args, local);
+                             execution.refusal, diagnostic.c_str(), args,
+                             local);
                 return status;
             }
         }
@@ -625,7 +628,7 @@ RtStageStatus run(const char* name, const std::vector<RtStageArg>& args,
         device_fallback ? boundedDiagnostic(device_failure) : std::string();
     record_stage(name, program->is_module() ? "module" : "builtin",
                  device_fallback ? "device-fallback" : program->source(),
-                 device_fallback ? fallbackCategory(device_failure) : "",
+                 device_fallback ? device_refusal : StageRefusalCode::None,
                  diagnostic.c_str(), args, local);
 
     return status;

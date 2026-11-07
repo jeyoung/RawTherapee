@@ -77,14 +77,19 @@ void profile(const StageRecord& record)
     if (file == nullptr) {
         return;
     }
+    /* Records that do not pass through stage::run() leave the field unset;
+     * a successful record is still reported as the typed None. */
+    const char* refusal =
+        record.refusal != nullptr && record.refusal[0] != '\0' ? record.refusal
+                                                               : "none";
     std::fprintf(file,
                  "{\"stage\":\"%s\",\"impl\":\"%s\",\"source\":\"%s\","
-                 "\"consumer\":\"%s\",\"fallback\":\"%s\","
+                 "\"consumer\":\"%s\",\"refusal\":\"%s\",\"fallback\":\"%s\","
                  "\"diagnostic\":\"%s\",\"ns\":%llu,\"width\":%d,"
                  "\"height\":%d,\"threads\":%d,\"cache_hit\":%u,"
                  "\"input_hash\":\"%016llx\",\"output_hash\":\"%016llx\"}\n",
                  record.stage, record.impl, record.source, record.consumer,
-                 record.fallback, record.diagnostic,
+                 refusal, record.fallback, record.diagnostic,
                  static_cast<unsigned long long>(record.elapsed_ns), record.width,
                  record.height, record.threads, record.cache_hit,
                  static_cast<unsigned long long>(record.input_hash),

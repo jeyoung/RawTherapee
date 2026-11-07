@@ -65,8 +65,8 @@ status, the executing device and timing.
 | `OpenCLStageDevice` | owns its ICD loader state, device selection, context and in-order queue; a CPU device is used only with `RT_OPENCL_ALLOW_CPU=1` |
 | `StageContext` | owns a device, a per-context program cache, the host allocator and the device residency of its queue |
 | `StageQueue` | CPU executes inline; the OpenCL queue submits a node kernel asynchronously, refuses a compiled host program, and runs a node without a device implementation on the host |
-| `StageEvent` | status, executing device (`NONE` when nothing ran), asynchronous flag, elapsed time, fallback note and completion handle |
-| `StageSubmission` | `wait()`, `poll()` and `elapsed_ns()` for an asynchronous submission |
+| `StageEvent` | status, executing device (`NONE` when nothing ran), asynchronous flag, elapsed time, typed refusal, fallback note and completion handle |
+| `StageSubmission` | `wait()`, `poll()`, `elapsed_ns()` and typed refusal for an asynchronous submission |
 | `StageDeviceResidency` | device allocations keyed by host buffer address, byte budget, LRU eviction, refusals and accounting |
 
 `StageContext::compile()` calls the existing `StageCompiler`, so the
@@ -74,10 +74,41 @@ resolution order and the built-in/module fallback are unchanged. The context
 caches the resulting program by stage name and explicit implementation;
 `clear_program_cache()` forces the next compile to resolve again. The default
 context selects CPU. `StageContext::execute()` fills a `StageExecution` with
-the device that actually executed and whether the submission was asynchronous,
-so a caller never infers device execution from the selection: the device queue
-can refuse an over-budget allocation or a launch and run the host program
-instead.
+the device that actually executed, whether the submission was asynchronous and
+the typed refusal cause, so a caller never infers device execution from the
+selection: the device queue can refuse an over-budget allocation or a launch
+and run the host program instead.
+
+### Typed device refusals
+
+A device path that declines a node reports a `StageRefusalCode` instead of
+leaving a caller to classify its diagnostic string:
+
+| Code | Meaning |
+| --- | --- |
+| `None` | no refusal; the execution completed |
+| `Memory` | byte budget or working-set admission refused the node |
+| `Unsupported` | parameters, capability, fp64 or CPU-only restriction |
+| `DeviceUnavailable` | no usable device, or the backend is disabled |
+| `DeviceError` | launch, wait or readback failed |
+| `Other` | a reserved cause with no more specific code |
+
+`StageEvent`, `StageExecution` and `StageSubmission` carry the code; the
+diagnostic `note` stays human-readable. The code is set where the refusal is
+known: the residency records `Memory` for a budget or working-set refusal and
+`Unsupported` for an inadmissible shape, the asynchronous submission records
+`DeviceError` for a wait, poll or readback failure, and the queue records
+`Unsupported` and `DeviceUnavailable` for its own capability and availability
+decisions. A launcher that returns a null submission with only a note keeps a
+small adapter in `stage_opencl_device.cc`; it is never used when a typed code
+is available, so no primary path reads strings.
+
+`stageRefusalName()` gives the stable lower-case name. The stage profile
+publishes it as `"refusal"` beside `"fallback"` and `"diagnostic"`. The legacy
+`"fallback"` category is derived from the code (`memory`, `unsupported`,
+`device-unavailable`, `device-error`, `other`) and is empty for `None`, so
+existing readers keep working. `StageFaultPlan::refusal` chooses the code an
+injected wait or readback failure publishes; it defaults to `DeviceError`.
 
 `StageBufferAllocator` is host memory only: zeroed memory with 64-byte aligned
 rows and planes, `F32`/`U16` with one to three planes, and `U8` only as a

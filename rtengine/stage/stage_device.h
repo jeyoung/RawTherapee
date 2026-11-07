@@ -29,6 +29,25 @@ enum class StageDeviceType {
 const char* to_string(StageDeviceType type);
 
 /*
+ * Why a device path declined an execution.
+ *
+ * The code is set where the refusal is known, so a caller never has to
+ * classify a diagnostic string. `stageRefusalName()` returns the stable
+ * lower-case name used by the stage profile; `None` is the only code on a
+ * successful execution.
+ */
+enum class StageRefusalCode : uint8_t {
+    None = 0,
+    Memory,
+    Unsupported,
+    DeviceUnavailable,
+    DeviceError,
+    Other
+};
+
+const char* stageRefusalName(StageRefusalCode code);
+
+/*
  * Copy a staged readback into a host buffer row by row.
  *
  * Only the bytes covered by the descriptor are copied, so host padding and
@@ -65,10 +84,15 @@ const char* to_string(StageEventStatus status);
  * result is read back. `fail_readback` fails the readback of one descriptor of
  * a node, counting from one in the order the node names its outputs; zero
  * disables the injection. A failed readback must not modify any host buffer.
+ *
+ * `refusal` is the typed code an injected failure publishes alongside its
+ * diagnostic. It defaults to DeviceError because both seams model a driver
+ * fault, and a test may choose another code to prove the propagation.
  */
 struct StageFaultPlan {
     bool fail_wait = false;
     int fail_readback = 0;
+    StageRefusalCode refusal = StageRefusalCode::DeviceError;
 };
 
 /*
@@ -101,6 +125,15 @@ public:
     {
         return {};
     }
+
+    /*
+     * Typed refusal that happened after submit() returned, or None. This is
+     * the asynchronous counterpart of StageEvent::refusal.
+     */
+    virtual StageRefusalCode refusal() const
+    {
+        return StageRefusalCode::None;
+    }
 };
 
 /*
@@ -120,6 +153,8 @@ struct StageEvent {
     bool asynchronous = false;
     /* Why a device path was declined; empty for a normal execution. */
     std::string note;
+    /* Typed reason for the note; None for a normal execution. */
+    StageRefusalCode refusal = StageRefusalCode::None;
     std::shared_ptr<StageSubmission> submission;
 
     bool done() const
@@ -363,10 +398,12 @@ struct StageExecution {
     bool asynchronous = false;
     /*
      * Why the device path was declined, copied from the queue event. Empty
-     * after a successful device execution and on the CPU device. The caller
-     * classifies it into a stable profile category.
+     * after a successful device execution and on the CPU device. `refusal`
+     * carries the typed cause and is None exactly when no device path was
+     * declined.
      */
     std::string note;
+    StageRefusalCode refusal = StageRefusalCode::None;
 };
 
 class StageContext
