@@ -28,6 +28,7 @@
 
 #include "rtengine.h"
 #include "rawimagesource.h"
+#include "amaze_demosaic.h"
 #include "rt_math.h"
 #include "rtgui/multilangmgr.h"
 #include "sleef.h"
@@ -45,24 +46,17 @@ unsigned fc(const unsigned int cfa[2][2], int r, int c) {
 namespace rtengine
 {
 
-void RawImageSource::amaze_demosaic_RT(int winx, int winy, int winw, int winh, const array2D<float> &rawData, array2D<float> &red, array2D<float> &green, array2D<float> &blue, size_t chunkSize, bool measure)
+namespace detail
 {
 
-    std::unique_ptr<StopWatch> stop;
-
-    if (measure) {
-        std::cout << "Demosaicing " << W << "x" << H << " image using AMaZE with " << chunkSize << " Tiles per Thread" << std::endl;
-        stop.reset(new StopWatch("amaze demosaic"));
-    }
-
+void amazeDemosaic(int winx, int winy, int winw, int winh,
+                  const array2D<float>& rawData, array2D<float>& red,
+                  array2D<float>& green, array2D<float>& blue,
+                  const unsigned int cfarray[2][2], double initialGain,
+                  ProgressListener* plistener, std::size_t chunkSize)
+{
     double progress = 0.0;
 
-    if (plistener) {
-        plistener->setProgressStr(Glib::ustring::compose(M("TP_RAW_DMETHOD_PROGRESSBAR"), M("TP_RAW_AMAZE")));
-        plistener->setProgress(progress);
-    }
-
-    const unsigned int cfarray[2][2] = {{FC(0,0), FC(0,1)}, {FC(1,0), FC(1,1)}};
     const int width = winw, height = winh;
     const float clip_pt = 1.0 / initialGain;
     const float clip_pt8 = 0.8 / initialGain;
@@ -135,7 +129,10 @@ void RawImageSource::amaze_demosaic_RT(int winx, int winy, int winw, int winh, c
 
         constexpr int cldf = 2; // factor to multiply cache line distance. 1 = 64 bytes, 2 = 128 bytes ...
         // assign working space
-        char *buffer = (char *) calloc(14 * sizeof(float) * ts * ts + sizeof(char) * ts * tsh + 18 * cldf * 64 + 63, 1);
+        constexpr std::size_t buffer_size =
+            14 * sizeof(float) * ts * ts + sizeof(char) * ts * tsh +
+            18 * cldf * 64 + 63;
+        char *buffer = (char *) malloc(buffer_size);
         // aligned to 64 byte boundary
         char *data = (char*)( ( uintptr_t(buffer) + uintptr_t(63)) / 64 * 64);
 
@@ -195,7 +192,10 @@ void RawImageSource::amaze_demosaic_RT(int winx, int winy, int winw, int winh, c
 
         for (int top = winy - 16; top < winy + height; top += ts - 32) {
             for (int left = winx - 16; left < winx + width; left += ts - 32) {
-                memset(&nyquist[3 * tsh], 0, sizeof(unsigned char) * (ts - 6) * tsh);
+                // Scratch arrays share storage between phases. Start every tile
+                // from the same state so unwritten halo cells cannot retain
+                // values from earlier tiles assigned to this worker.
+                memset(buffer, 0, buffer_size);
                 //location of tile bottom edge
                 int bottom = min(top + ts, winy + height + 16);
                 //location of tile right edge
@@ -1598,6 +1598,31 @@ void RawImageSource::amaze_demosaic_RT(int winx, int winy, int winw, int winh, c
         // clean up
         free(buffer);
     }
+}
+
+} // namespace detail
+
+void RawImageSource::amaze_demosaic_RT(int winx, int winy, int winw, int winh, const array2D<float> &rawData, array2D<float> &red, array2D<float> &green, array2D<float> &blue, size_t chunkSize, bool measure)
+{
+
+    std::unique_ptr<StopWatch> stop;
+
+    if (measure) {
+        std::cout << "Demosaicing " << W << "x" << H << " image using AMaZE with " << chunkSize << " Tiles per Thread" << std::endl;
+        stop.reset(new StopWatch("amaze demosaic"));
+    }
+
+    double progress = 0.0;
+
+    if (plistener) {
+        plistener->setProgressStr(Glib::ustring::compose(M("TP_RAW_DMETHOD_PROGRESSBAR"), M("TP_RAW_AMAZE")));
+        plistener->setProgress(progress);
+    }
+
+    const unsigned int cfarray[2][2] = {{FC(0,0), FC(0,1)}, {FC(1,0), FC(1,1)}};
+    detail::amazeDemosaic(winx, winy, winw, winh, rawData, red, green, blue,
+                          cfarray, initialGain, plistener, chunkSize);
+
     if(border < 4) {
         border_interpolate(W, H, 3, rawData, red, green, blue);
     }
