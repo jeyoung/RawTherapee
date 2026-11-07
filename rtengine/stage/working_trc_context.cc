@@ -25,6 +25,7 @@
 #include "imagefloat.h"
 #include "improcfun.h"
 #include "labimage.h"
+#include "rtgui/labgrid.h"
 #include "rtgui/threadutils.h"
 #include "procparams.h"
 #include "rtengine.h"
@@ -242,7 +243,8 @@ bool workingTrcSupported(const procparams::ProcParams& params)
 
 void workingTrcHostBlock(ImProcFunctions& ipf,
                          const procparams::ProcParams& params,
-                         LabImage& labView)
+                         LabImage& labView,
+                         const WorkingTrcBodyOptions& options)
 {
     ipf.softLight(&labView, params.softlight);
 
@@ -260,7 +262,13 @@ void workingTrcHostBlock(ImProcFunctions& ipf,
             procparams::ColorManagementParams Colparams = params.icm;
             WavOpacityCurveWL icmOpacityCurveWL;
             Colparams.getCurves(icmOpacityCurveWL);
-            ipf.complete_local_contrast(&labView, &labView, WaveParams, Colparams, icmOpacityCurveWL, 1, level_hr, maxlevpo, wavcurvecont);
+            ipf.complete_local_contrast(&labView, &labView, WaveParams, Colparams, icmOpacityCurveWL, options.scale, level_hr, maxlevpo, wavcurvecont);
+            if (options.notifyLocalContrast && options.listener) {
+                const bool enall = wavcurvecont && Colparams.wavExp;
+                options.listener->wavlocChanged(
+                    static_cast<double>(maxlevpo),
+                    static_cast<double>(level_hr), enall);
+            }
         }
 
         if (pres > 0.f && params.icm.wprim != procparams::ColorManagementParams::Primaries::DEFAULT) {
@@ -268,7 +276,7 @@ void workingTrcHostBlock(ImProcFunctions& ipf,
             provis->CopyFrom(&labView);
         }
 
-        const std::unique_ptr<Imagefloat> tmpImage1(new Imagefloat(GW, GH));
+        std::unique_ptr<Imagefloat> tmpImage1(new Imagefloat(GW, GH));
 
         ipf.lab2rgb(labView, *tmpImage1, params.icm.workingProfile);
 
@@ -299,7 +307,7 @@ void workingTrcHostBlock(ImProcFunctions& ipf,
         if (midton != 0) {
             ToneEqualizerParams teParams;
             midtoneEqualizerParams(midton, teParams);
-            ipf.toneEqualizer(tmpImage1.get(), teParams, prof, 1, false);
+            ipf.toneEqualizer(tmpImage1.get(), teParams, prof, options.scale, false);
         }
 
         float rdx, rdy, grx, gry, blx, bly = 0.f;
@@ -318,7 +326,28 @@ void workingTrcHostBlock(ImProcFunctions& ipf,
         if (smoothisli > 0.f) {
             ToneEqualizerParams teParams;
             smoothEqualizerParams(smoothisli, teParams);
-            ipf.toneEqualizer(tmpImage1.get(), teParams, prof, 1, false);
+            ipf.toneEqualizer(tmpImage1.get(), teParams, prof, options.scale, false);
+        }
+
+        if (options.notifyMaxData) {
+            float maxdata = 0.f;
+    #ifdef _OPENMP
+    #   pragma omp parallel for reduction(max:maxdata)
+    #endif
+            for (int i = 0; i < GH; ++i) {
+                for (int j = 0; j < GW; ++j) {
+                    const float r = tmpImage1->r(i, j);
+                    const float g = tmpImage1->g(i, j);
+                    const float b = tmpImage1->b(i, j);
+                    const float maxrgb2 = rtengine::max(r, g, b);
+                    if (maxrgb2 > maxdata) {
+                        maxdata = maxrgb2;
+                    }
+                }
+            }
+            if (options.listener) {
+                options.listener->maxdatawtrc(maxdata / 65535.f);
+            }
         }
 
         ipf.rgb2lab(*tmpImage1, labView, params.icm.workingProfile);
@@ -338,6 +367,105 @@ void workingTrcHostBlock(ImProcFunctions& ipf,
                     labView.a[x][y] = 0.f;
                     labView.b[x][y] = 0.f;
                 }
+        }
+
+        tmpImage1.reset();
+
+        if (!options.notifyPrimaries || options.listener == nullptr) {
+            return;
+        }
+
+        if (prim == 14) { // pass red gre blue xy in function of area data Ciexy
+            float redgraphx = params.icm.labgridcieALow;
+            float redgraphy = params.icm.labgridcieBLow;
+            float blugraphx = params.icm.labgridcieAHigh;
+            float blugraphy = params.icm.labgridcieBHigh;
+            float gregraphx = params.icm.labgridcieGx;
+            float gregraphy = params.icm.labgridcieGy;
+            constexpr float INV_OFFSET_MODIFIER = 1.f / OFFSET_MODIFIER;
+            float redxx = INV_OFFSET_MODIFIER * (redgraphx + 1.f) - CIExy_MARGIN;
+            redxx = rtengine::LIM(redxx, 0.41f, 1.f);
+            float redyy = INV_OFFSET_MODIFIER * (redgraphy + 1.f) - CIExy_MARGIN;
+            redyy = rtengine::LIM(redyy, 0.f, 0.7f);
+            float bluxx = INV_OFFSET_MODIFIER * (blugraphx + 1.f) - CIExy_MARGIN;
+            bluxx = rtengine::LIM(bluxx, -0.1f, 0.5f);
+            float bluyy = INV_OFFSET_MODIFIER * (blugraphy + 1.f) - CIExy_MARGIN;
+            bluyy = rtengine::LIM(bluyy, -0.1f, 0.5f);
+            float grexx = INV_OFFSET_MODIFIER * (gregraphx + 1.f) - CIExy_MARGIN;
+            grexx = rtengine::LIM(grexx, -0.1f, 0.4f);
+            float greyy = INV_OFFSET_MODIFIER * (gregraphy + 1.f) - CIExy_MARGIN;
+            greyy = rtengine::LIM(greyy, 0.5f, 1.f);
+            options.listener->primChanged(redxx, redyy, bluxx, bluyy, grexx,
+                                          greyy);
+        } else { // all other cases - pass Cie xy to update graph Ciexy
+            float r_x = params.icm.redx;
+            float r_y = params.icm.redy;
+            float b_x = params.icm.blux;
+            float b_y = params.icm.bluy;
+            float g_x = params.icm.grex;
+            float g_y = params.icm.grey;
+            float wx = 0.33f;
+            float wy = 0.33f;
+
+            switch (illum) {
+                case 1: // D41
+                    wx = 0.37798f;
+                    wy = 0.38123f;
+                    break;
+                case 2: // D50
+                    wx = 0.3457f;
+                    wy = 0.3585f;
+                    break;
+                case 3: // D55
+                    wx = 0.3324f;
+                    wy = 0.3474f;
+                    break;
+                case 4: // D60
+                    wx = 0.3217f;
+                    wy = 0.3377f;
+                    break;
+                case 5: // D65
+                    wx = 0.3127f;
+                    wy = 0.3290f;
+                    break;
+                case 6: // D80
+                    wx = 0.2937f;
+                    wy = 0.3092f;
+                    break;
+                case 7: // D120
+                    wx = 0.2697f;
+                    wy = 0.2808f;
+                    break;
+                case 8: // stdA
+                    wx = 0.4476f;
+                    wy = 0.4074f;
+                    break;
+                case 9: // 2000K
+                    wx = 0.5266f;
+                    wy = 0.4133f;
+                    break;
+                case 10: // 1500K
+                    wx = 0.5857f;
+                    wy = 0.3932f;
+                    break;
+            }
+
+            // move white point in GUI
+            const double refin = params.icm.refi;
+            const double arefi = (wy - meany) / (wx - meanx);
+            const double brefi = wy - arefi * wx;
+            const double scalrefi = meanx - wx;
+            wx = wx + scalrefi * refin;
+            wy = wx * arefi + brefi;
+
+            if (params.icm.wprim !=
+                procparams::ColorManagementParams::Primaries::CUSTOM_POL) {
+                options.listener->iprimChanged(r_x, r_y, b_x, b_y, g_x, g_y,
+                                               wx, wy, meanx, meany);
+            } else {
+                options.listener->iprimChanged(p[0], p[1], p[4], p[5], p[2],
+                                               p[3], wx, wy, meanx, meany);
+            }
         }
     }
 }

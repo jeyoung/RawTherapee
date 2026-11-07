@@ -1350,16 +1350,17 @@ bool labWaveletWaveletSupported(const procparams::ProcParams& params,
  * own width and height at this point in the export sequence.
  */
 void labWaveletHostBlock(ImProcFunctions& ipf,
-                         procparams::ProcParams& params, LabImage& labView)
+                         procparams::ProcParams& params, LabImage& labView,
+                         const LabWaveletBodyOptions& options)
 {
     const int fw = labView.W;
     const int fh = labView.H;
 
     // directional pyramid wavelet
-    if (params.dirpyrequalizer.cbdlMethod == "aft") {
+    if (options.runAfterCbdl && params.dirpyrequalizer.cbdlMethod == "aft") {
      //   if ((params.colorappearance.enabled && !settings->autocielab)  || !params.colorappearance.enabled) {
         if ((params.colorappearance.enabled && !settings->autocielab)  || !(params.colorappearance.modelmethod == "02" && params.colorappearance.enabled)) {
-            ipf.dirpyrequalizer(&labView, 1);     //TODO: this is the luminance tonecurve, not the RGB one
+            ipf.dirpyrequalizer(&labView, options.scale);     //TODO: this is the luminance tonecurve, not the RGB one
         }
     }
 
@@ -1368,9 +1369,18 @@ void labWaveletHostBlock(ImProcFunctions& ipf,
         LabImage *unshar = nullptr;
         WaveletParams WaveParams = params.wavelet;
         WavCurve wavCLVCurve;
-        /* The call site's ImageProcessor owns this table; fillLut() writes
-         * every entry, so a local instance of the same size is equivalent. */
-        LUTf wavclCurve(65536, 0);
+        /* The caller owns the final LUT on the interactive paths. Export has
+         * always built its own table at full resolution; fillLut() writes
+         * every entry, so a local instance is equivalent to the old call. */
+        LUTf localWavclCurve;
+        LUTf* wavclCurvePtr = options.wavclCurve;
+        if (wavclCurvePtr == nullptr) {
+            localWavclCurve(65536, 0);
+            CurveFactory::diagonalCurve2Lut(params.wavelet.wavclCurve,
+                                            localWavclCurve, 1);
+            wavclCurvePtr = &localWavclCurve;
+        }
+        LUTf& wavclCurve = *wavclCurvePtr;
         WavCurve wavdenoise;
         WavCurve wavdenoiseh;
         Wavblcurve wavblcurve;
@@ -1393,12 +1403,10 @@ void labWaveletHostBlock(ImProcFunctions& ipf,
 
         params.wavelet.getCurves(wavCLVCurve, wavdenoise, wavdenoiseh, wavblcurve, waOpacityCurveRG, waOpacityCurveSH, waOpacityCurveBY, waOpacityCurveW, waOpacityCurveWL);
 
-        CurveFactory::diagonalCurve2Lut(params.wavelet.wavclCurve, wavclCurve, 1);
-
         if ((WaveParams.ushamethod == "sharp" || WaveParams.ushamethod == "clari") && WaveParams.expclari && WaveParams.CLmethod != "all") {
             const Glib::ustring provis = params.wavelet.CLmethod;
             params.wavelet.CLmethod = "all";
-            ipf.ip_wavelet(&labView, &labView, 2, WaveParams, wavCLVCurve, wavdenoise, wavdenoiseh, wavblcurve, waOpacityCurveRG, waOpacityCurveSH, waOpacityCurveBY, waOpacityCurveW,  waOpacityCurveWL, wavclCurve, 1);
+            ipf.ip_wavelet(&labView, &labView, options.kall, WaveParams, wavCLVCurve, wavdenoise, wavdenoiseh, wavblcurve, waOpacityCurveRG, waOpacityCurveSH, waOpacityCurveBY, waOpacityCurveW,  waOpacityCurveWL, wavclCurve, options.scale);
             unshar = new LabImage(labView, true);
             params.wavelet.CLmethod = provis;
 
@@ -1410,7 +1418,7 @@ void labWaveletHostBlock(ImProcFunctions& ipf,
             WaveParams.expnoise = false;
         }
 
-        ipf.ip_wavelet(&labView, &labView, 2, WaveParams, wavCLVCurve, wavdenoise, wavdenoiseh, wavblcurve, waOpacityCurveRG, waOpacityCurveSH, waOpacityCurveBY, waOpacityCurveW,  waOpacityCurveWL, wavclCurve, 1);
+        ipf.ip_wavelet(&labView, &labView, options.kall, WaveParams, wavCLVCurve, wavdenoise, wavdenoiseh, wavblcurve, waOpacityCurveRG, waOpacityCurveSH, waOpacityCurveBY, waOpacityCurveW,  waOpacityCurveWL, wavclCurve, options.scale);
 
         if ((WaveParams.ushamethod == "sharp" || WaveParams.ushamethod == "clari") && WaveParams.expclari && WaveParams.CLmethod != "all") {
             WaveParams.expcontrast = procont;
@@ -1454,7 +1462,7 @@ void labWaveletHostBlock(ImProcFunctions& ipf,
                 double bepsil = epsilmin; //epsilmax - 100.f * aepsil;
                 double epsil = aepsil * WaveParams.softrad + bepsil;
 
-                float blur = 10.f / 1 * (0.5f + 0.8f * WaveParams.softrad);
+                float blur = 10.f / options.scale * (0.5f + 0.8f * WaveParams.softrad);
                 // rtengine::guidedFilter(guid, ble, ble, blur, 0.001, multiTh);
                 rtengine::guidedFilter(guid, ble, ble, blur, epsil, false);
 
@@ -1484,11 +1492,15 @@ void labWaveletHostBlock(ImProcFunctions& ipf,
             float mC = (float)(WaveParams.mergeC / 100.f);
             float mL0;
             float mC0;
+            float background = 0.f;
+            float show = 0.f;
+            float indic = 1.f;
 
             if ((WaveParams.CLmethod == "one" || WaveParams.CLmethod == "inf")  && WaveParams.Backmethod == "black") {
                 mL0 = mC0 = 0.f;
                 mL = -1.5f * mL;
                 mC = -mC;
+                background = 12000.f;
             } else if (WaveParams.CLmethod == "sup" && WaveParams.Backmethod == "resid") {
                 mL0 = mL;
                 mC0 = mC;
@@ -1496,6 +1508,13 @@ void labWaveletHostBlock(ImProcFunctions& ipf,
                 mL0 = mL = mC0 = mC = 0.f;
             }
 
+            if (options.allowShowMask && WaveParams.showmask) {
+                mL0 = mC0 = -1.f;
+                indic = -1.f;
+                mL = fabs(mL);
+                mC = fabs(mC);
+                show = 1.f;
+            }
 
 #ifdef _OPENMP
             #pragma omp parallel for
@@ -1503,9 +1522,9 @@ void labWaveletHostBlock(ImProcFunctions& ipf,
 
             for (int x = 0; x < fh; x++)
                 for (int y = 0; y < fw; y++) {
-                    labView.L[x][y] = LIM((1.f + mL0) * (unshar->L[x][y]) - mL * labView.L[x][y], 0.f, 32768.f);
-                    labView.a[x][y] = (1.f + mC0) * (unshar->a[x][y]) - mC * labView.a[x][y];
-                    labView.b[x][y] = (1.f + mC0) * (unshar->b[x][y]) - mC * labView.b[x][y];
+                    labView.L[x][y] = LIM((1.f + mL0) * (unshar->L[x][y]) + show * background - mL * indic * labView.L[x][y], 0.f, 32768.f);
+                    labView.a[x][y] = (1.f + mC0) * (unshar->a[x][y]) - mC * indic * labView.a[x][y];
+                    labView.b[x][y] = (1.f + mC0) * (unshar->b[x][y]) - mC * indic * labView.b[x][y];
                 }
 
             delete unshar;

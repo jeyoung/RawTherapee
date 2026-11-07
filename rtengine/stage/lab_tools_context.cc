@@ -663,68 +663,92 @@ void labToolsHostBlock(ImProcFunctions& ipf,
                        LabImage& lab,
                        LabToolsLuts& luts,
                        bool& autili,
-                       bool& butili)
+                       bool& butili,
+                       const LabToolsBodyOptions& options)
 {
     /* ImageProcessor::usesCieCam02(), inlined for the extracted block. */
     const bool cam02 = params.colorappearance.modelmethod == "02" &&
                        params.colorappearance.enabled;
 
-    if (params.labCurve.contrast != 0) { //only use hist16 for contrast
-        luts.hist16->clear();
+    bool utili = options.utili;
+    bool ccutili = options.ccutili;
+    bool cclutili = options.cclutili;
+    bool clcutili = options.clcutili;
+
+    if (options.buildLuts) {
+        if (params.labCurve.contrast != 0) { //only use hist16 for contrast
+            luts.hist16->clear();
 
 #ifdef _OPENMP
-        #pragma omp parallel
-#endif
-        {
-            LUTu hist16thr(luts.hist16->getSize());   // one temporary lookup table per thread
-            hist16thr.clear();
-#ifdef _OPENMP
-            #pragma omp for schedule(static) nowait
-#endif
-
-            for (int i = 0; i < lab.H; i++)
-                for (int j = 0; j < lab.W; j++) {
-                    hist16thr[(int)((lab.L[i][j]))]++;
-                }
-
-#ifdef _OPENMP
-            #pragma omp critical
+            #pragma omp parallel
 #endif
             {
-                *luts.hist16 += hist16thr;
+                LUTu hist16thr(luts.hist16->getSize());   // one temporary lookup table per thread
+                hist16thr.clear();
+#ifdef _OPENMP
+                #pragma omp for schedule(static) nowait
+#endif
+
+                for (int i = 0; i < lab.H; i++)
+                    for (int j = 0; j < lab.W; j++) {
+                        hist16thr[(int)((lab.L[i][j]))]++;
+                    }
+
+#ifdef _OPENMP
+                #pragma omp critical
+#endif
+                {
+                    *luts.hist16 += hist16thr;
+                }
             }
         }
+
+        CurveFactory::complexLCurve(params.labCurve.brightness, params.labCurve.contrast, params.labCurve.lcurve, *luts.hist16, *luts.lumacurve, *luts.dummy, options.lutScale, utili);
+
+        clcutili = CurveFactory::diagonalCurve2Lut(params.labCurve.clcurve, *luts.clcurve, options.lutScale);
+
+        CurveFactory::complexsgnCurve(autili, butili, ccutili, cclutili, params.labCurve.acurve, params.labCurve.bcurve, params.labCurve.cccurve,
+                                      params.labCurve.lccurve, *luts.curve1, *luts.curve2, *luts.satcurve, *luts.lhskcurve, options.lutScale);
     }
-
-    bool utili;
-    CurveFactory::complexLCurve(params.labCurve.brightness, params.labCurve.contrast, params.labCurve.lcurve, *luts.hist16, *luts.lumacurve, *luts.dummy, 1, utili);
-
-    const bool clcutili = CurveFactory::diagonalCurve2Lut(params.labCurve.clcurve, *luts.clcurve, 1);
-
-    bool ccutili, cclutili;
-    CurveFactory::complexsgnCurve(autili, butili, ccutili, cclutili, params.labCurve.acurve, params.labCurve.bcurve, params.labCurve.cccurve,
-                                  params.labCurve.lccurve, *luts.curve1, *luts.curve2, *luts.satcurve, *luts.lhskcurve, 1);
-
 
     if (params.colorToning.enabled && params.colorToning.method == "LabGrid") {
         ipf.colorToningLabGrid(&lab, 0, lab.W, 0, lab.H, false);
     }
 
-    ipf.shadowsHighlights(&lab, params.sh.enabled, params.sh.lab, params.sh.highlights, params.sh.shadows, params.sh.radius, LAB_TOOLS_EXPORT_SCALE, params.sh.htonalwidth, params.sh.stonalwidth);
+    ipf.shadowsHighlights(&lab, params.sh.enabled, params.sh.lab, params.sh.highlights, params.sh.shadows, params.sh.radius, options.scale, params.sh.htonalwidth, params.sh.stonalwidth);
 
     if (params.localContrast.enabled) {
         // Alberto's local contrast
-        ipf.localContrast(&lab, lab.L, params.localContrast, false, 1);//scale);
+        ipf.localContrast(&lab, lab.L, params.localContrast, false, options.scale);
     }
 
-    ipf.chromiLuminanceCurve(nullptr, 1, &lab, &lab, *luts.curve1, *luts.curve2, *luts.satcurve, *luts.lhskcurve, *luts.clcurve, *luts.lumacurve, utili, autili, butili, ccutili, cclutili, clcutili, *luts.dummy, *luts.dummy);
+    LUTu* histC = options.histC != nullptr ? options.histC : luts.dummy;
+    LUTu* histL = options.histL != nullptr ? options.histL : luts.dummy;
+    ipf.chromiLuminanceCurve(options.pipetteBuffer, options.chromiWidth, &lab, &lab, *luts.curve1, *luts.curve2, *luts.satcurve, *luts.lhskcurve, *luts.clcurve, *luts.lumacurve, utili, autili, butili, ccutili, cclutili, clcutili, *histC, *histL);
 
-    if ((params.colorappearance.enabled && !params.colorappearance.tonecie) || (!cam02)) {
-        ipf.EPDToneMap(&lab, 0, 1);
+    const auto epd = [&]() {
+        if ((params.colorappearance.enabled && !params.colorappearance.tonecie) || (!cam02)) {
+            ipf.EPDToneMap(&lab, 0, options.scale);
+        }
+    };
+
+    if (options.epdBeforeVibrance) {
+        epd();
+        ipf.vibrance(&lab, params.vibrance, params.toneCurve.hrenabled, params.icm.workingProfile);
+        ipf.labColorCorrectionRegions(&lab);
+    } else {
+        ipf.vibrance(&lab, params.vibrance, params.toneCurve.hrenabled, params.icm.workingProfile);
+        ipf.labColorCorrectionRegions(&lab);
+        epd();
     }
 
-    ipf.vibrance(&lab, params.vibrance, params.toneCurve.hrenabled, params.icm.workingProfile);
-    ipf.labColorCorrectionRegions(&lab);
+    if (options.applyAftDirpy
+        && params.dirpyrequalizer.cbdlMethod == "aft") {
+        if ((params.colorappearance.enabled && !settings->autocielab)
+            || (!cam02)) {
+            ipf.dirpyrequalizer(&lab, options.scale);
+        }
+    }
 }
 
 LabToolsContext::LabToolsContext(const procparams::ProcParams& params,

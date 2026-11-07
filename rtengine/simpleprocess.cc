@@ -44,6 +44,7 @@
 #include "rtengine.h"
 #include "stage/algorithms/gamut_cl.h"
 #include "stage/ciecam_context.h"
+#include "stage/stage_body.h"
 #include "stage/stage_buffer.h"
 #include "stage/stage_graph.h"
 #include "stage/stage_handler.h"
@@ -1485,17 +1486,23 @@ private:
         ipf.ToneMapFattal02(baseImg, params.fattal, 3, 0, nullptr, 0, 0, 0, false);
 
         // perform transform (excepted resizing)
-        if (ipf.needsTransform(fw, fh, imgsrc->getRotateDegree(), imgsrc->getMetaData())) {
-            Imagefloat* trImg = nullptr;
+        if (ipf.needsTransform(fw, fh, imgsrc->getRotateDegree(),
+                               imgsrc->getMetaData())) {
+            Imagefloat* trImg = ipf.needsLuminanceOnly()
+                                    ? baseImg
+                                    : new Imagefloat(fw, fh);
 
-            if (ipf.needsLuminanceOnly()) {
-                trImg = baseImg;
-            } else {
-                trImg = new Imagefloat(fw, fh);
-            }
-
-            ipf.transform(baseImg, trImg, 0, 0, 0, 0, fw, fh, fw, fh,
-                          imgsrc->getMetaData(), imgsrc->getRotateDegree(), true, true);
+            stage::TransformBodyOptions options;
+            options.oW = fw;
+            options.oH = fh;
+            options.fW = fw;
+            options.fH = fh;
+            options.metadata = imgsrc->getMetaData();
+            options.rotateDegree = imgsrc->getRotateDegree();
+            options.needTransform = true;
+            options.fullImage = true;
+            options.useOriginalBuffer = true;
+            stage::transformHostBlock(ipf, params, *baseImg, *trImg, options);
 
             if (trImg != baseImg) {
                 delete baseImg;
@@ -2099,70 +2106,7 @@ private:
                 return;
             }
 
-            //compression gamut and gain at the end of process
-            const int GW = labView->W;
-            const int GH = labView->H;
-            TMatrix wprof = ICCStore::getInstance()->workingSpaceMatrix(params.icm.workingProfile);
-                const double wp[3][3] = {
-                    {wprof[0][0], wprof[0][1], wprof[0][2]},
-                    {wprof[1][0], wprof[1][1], wprof[1][2]},
-                    {wprof[2][0], wprof[2][1], wprof[2][2]}
-                };
-            TMatrix wiprof = ICCStore::getInstance()->workingSpaceInverseMatrix(params.icm.workingProfile);
-                const double wip[3][3] = {//improve precision with double
-                    {wiprof[0][0], wiprof[0][1], wiprof[0][2]},
-                    {wiprof[1][0], wiprof[1][1], wiprof[1][2]},
-                    {wiprof[2][0], wiprof[2][1], wiprof[2][2]}
-                };
-            std::unique_ptr<Imagefloat> provcomp(new Imagefloat(GW, GH));
-
-#ifdef _OPENMP
-        #   pragma omp parallel for
-#endif
-                for (int i = 0; i < GH; ++i){
-                    for (int j = 0; j < GW; ++j) {
-                        float X, Y, Z = 0.f;
-                        Color::Lab2XYZ(labView->L[i][j], labView->a[i][j], labView->b[i][j] , X, Y, Z);
-                        Color::xyz2rgb(X, Y, Z, provcomp->r(i, j), provcomp->g(i, j), provcomp->b(i, j), wip);
-                    }
-                }
-
-                const float gainev = pow_F(2.f, (float) params.icm.wgamgain);
-                if (params.icm.wgamgain != 0.f) {//Final gain in Ev
-           
-#ifdef _OPENMP
-        #   pragma omp parallel for
-#endif
-                    for (int i = 0; i < GH; ++i){
-                        for (int j = 0; j < GW; ++j) {
-                            provcomp->r(i, j) *= gainev;
-                            provcomp->g(i, j) *= gainev;
-                            provcomp->b(i, j) *= gainev;
-                        }
-                    }
-                }
-
-                float mac = 0.f;
-                float mac0 = 0.f;
-                float mac1 = 0.f;
-                float mac2 = 0.f;
-                int beginend = 1;
-                int nbsegam = 0;
-                float powe = 1.f;
-                if (params.icm.wgamut != ColorManagementParams::Wwgamut::NONE) {
-                    ipf.gamutcompr(provcomp.get(), provcomp.get(), beginend, powe, nbsegam, mac, mac0, mac1, mac2);
-                }
-
-#ifdef _OPENMP
-        #   pragma omp parallel for
-#endif
-                for (int i = 0; i < GH; ++i){
-                    for (int j = 0; j < GW; ++j) {
-                        float x, y, z = 0.f;
-                        Color::rgbxyz (provcomp->r(i, j), provcomp->g(i, j), provcomp->b(i, j), x, y, z, wp);
-                        Color::XYZ2Lab(x, y, z, labView->L[i][j], labView->a[i][j], labView->b[i][j]);
-                    }
-                }
+            stage::gamutHostBlock(ipf, params, *labView);
         }
 
 

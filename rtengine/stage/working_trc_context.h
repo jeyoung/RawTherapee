@@ -29,6 +29,7 @@
 
 namespace rtengine
 {
+class AutoprimListener;
 class Imagefloat;
 class ImProcFunctions;
 class LabImage;
@@ -203,12 +204,31 @@ int workingTrcToneSubsampling(int width, int height);
 bool workingTrcSupported(const procparams::ProcParams& params);
 
 /*
+ * Call-site options of the shared working.trc body.
+ *
+ * `scale` is the sampling divisor the local-contrast and both tone equalisers
+ * receive: 1 on export and on a full-resolution preview, the preview scale or
+ * the crop skip otherwise. The listener hooks are optional and path-specific:
+ * the preview reports the maximum data value and the custom-primary geometry;
+ * the crop reports only the local-contrast levels, and only when it asked the
+ * GUI to show them.
+ */
+struct WorkingTrcBodyOptions {
+    int scale = 1;
+    AutoprimListener* listener = nullptr;
+    bool notifyLocalContrast = false;
+    bool notifyMaxData = false;
+    bool notifyPrimaries = false;
+};
+
+/*
  * The block as it ran before the device node, moved here unchanged so the call
  * site, the host builtin and the tests share exactly one CPU implementation.
  */
 void workingTrcHostBlock(ImProcFunctions& ipf,
                          const procparams::ProcParams& params,
-                         LabImage& lab);
+                         LabImage& lab,
+                         const WorkingTrcBodyOptions& options = {});
 
 /*
  * The host-owned setup for one working.trc submission.

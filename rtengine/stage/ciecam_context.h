@@ -21,11 +21,15 @@
 
 #include "stage_abi.h"
 
+#include "LUT.h"
+
 #include <cstdint>
 #include <vector>
 
 namespace rtengine
 {
+class AutoCamListener;
+class CieImage;
 class ColorAppearance;
 class ImProcFunctions;
 class LabImage;
@@ -115,6 +119,56 @@ void ciecamHostBlock(ImProcFunctions& ipf,
                      const ColorAppearance& customColCurveblue,
                      const ColorAppearance& customColCurve2,
                      const ColorAppearance& customColCurve3);
+
+/*
+ * Mutable state of one shared ciecam body call. Every pointer is borrowed.
+ * `cie` may be null, in which case the body owns a temporary CieImage for the
+ * call; preview and crop keep their persistent buffers. The histogram and
+ * brightness tables are supplied by the caller so each path keeps its own
+ * preparation order. `d`, `dj` and `yb` receive the block's results.
+ */
+struct CiecamBodyState {
+    LabImage* lab = nullptr;
+    CieImage* cie = nullptr;
+    LUTu* histLCAM = nullptr;
+    LUTu* histCCAM = nullptr;
+    LUTf* camBrightJ = nullptr;
+    LUTf* camBrightQ = nullptr;
+    float* camMean = nullptr;
+    float d = 0.f;
+    float dj = 0.f;
+    float yb = 0.f;
+};
+
+/*
+ * Call-site options of the shared ciecam body. Preview passes the real
+ * histograms, `scale`, `execsharp=false` and its callbacks; crop passes
+ * dummies, `skip`, the conditional sharpening flag and the sharpening mask;
+ * export passes dummies, scale 1 and always performs the sharpening arm.
+ */
+struct CiecamBodyOptions {
+    int widthArg = 1;
+    int scaleArg = 1;
+    bool execsharp = true;
+    bool showSharpMask = false;
+    bool resetMean = false;
+    bool notify = false;
+};
+
+/*
+ * Run the shared ciecam body and, when `options.notify` is set, the preview
+ * callbacks in their established order. `adap` is computed by the caller so
+ * the three paths keep their own arithmetic and metadata lookup.
+ */
+void ciecamBody(ImProcFunctions& ipf, const procparams::ProcParams& params,
+                float adap, const ColorAppearance& customColCurve1,
+                const ColorAppearance& customColCurvered,
+                const ColorAppearance& customColCurvegreen,
+                const ColorAppearance& customColCurveblue,
+                const ColorAppearance& customColCurve2,
+                const ColorAppearance& customColCurve3,
+                CiecamBodyState& state, const CiecamBodyOptions& options,
+                AutoCamListener* listener);
 
 /*
  * The host-owned setup for one ciecam submission.

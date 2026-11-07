@@ -31,6 +31,7 @@ namespace rtengine
 class Imagefloat;
 class ImProcFunctions;
 class LabImage;
+class PipetteBuffer;
 }
 
 namespace rtengine::procparams
@@ -420,6 +421,36 @@ struct LabToolsLuts {
 };
 
 /*
+ * Call-site options of the shared lab.tools body.
+ *
+ * The interactive paths keep their own curve preparation, viewport snapshots
+ * and shared LUT objects, so they pass `buildLuts=false` and supply the six
+ * curve flags they already computed. Export builds its own tables. `scale`
+ * reaches shadows/highlights, local contrast and EPD; `lutScale` is the
+ * sampling divisor of the curve tables the body builds. `chromiWidth` is the
+ * width argument the chromiLuminanceCurve call has always received: the
+ * preview width, or 1 on the crop and export paths. `epdBeforeVibrance`
+ * preserves export's order; the interactive paths run vibrance and the region
+ * pass first. `applyAftDirpy` runs the after-CBDL equaliser that the preview
+ * applies at the end of this block.
+ */
+struct LabToolsBodyOptions {
+    int scale = 1;
+    int lutScale = 1;
+    int chromiWidth = 1;
+    PipetteBuffer* pipetteBuffer = nullptr;
+    bool buildLuts = true;
+    bool applyAftDirpy = false;
+    bool epdBeforeVibrance = true;
+    bool utili = false;
+    bool ccutili = false;
+    bool cclutili = false;
+    bool clcutili = false;
+    LUTu* histC = nullptr;
+    LUTu* histL = nullptr;
+};
+
+/*
  * Whether the block is the lab.tools node's supported set: the LabGrid colour
  * toning pass, shadows/highlights, local contrast, vibrance and/or the Lab
  * curves, with every other pixel tool off.
@@ -482,7 +513,8 @@ void labToolsHostBlock(ImProcFunctions& ipf,
                        LabImage& lab,
                        LabToolsLuts& luts,
                        bool& autili,
-                       bool& butili);
+                       bool& butili,
+                       const LabToolsBodyOptions& options = {});
 
 /*
  * Build and submit the lab.tools node for `lab`.

@@ -48,7 +48,12 @@
 #include "procparams.h"
 #include "stage/lab_sharpening_context.h"
 #include "stage/stage_handler.h"
+#include "stage/ciecam_context.h"
+#include "stage/lab_tools_context.h"
+#include "stage/lab_wavelet_context.h"
+#include "stage/stage_body.h"
 #include "stage/stage_plan.h"
+#include "stage/working_trc_context.h"
 #include "rt_math.h"
 #include "utils.h"
 #include "iccstore.h"
@@ -1451,45 +1456,44 @@ void Crop::stageTransform(CropStageContext& ctx)
     ProcParams& params = ctx.params;
     Imagefloat*& baseCrop = ctx.baseCrop;
 
-    const bool needstransform  = parent->ipf.needsTransform(skips(parent->fw, skip), skips(parent->fh, skip), parent->imgsrc->getRotateDegree(), parent->imgsrc->getMetaData());
-    const bool cam02 = params.colorappearance.modelmethod == "02" && params.colorappearance.enabled;
+    const bool needstransform = parent->ipf.needsTransform(
+        skips(parent->fw, skip), skips(parent->fh, skip),
+        parent->imgsrc->getRotateDegree(), parent->imgsrc->getMetaData());
+    const bool cam02 = params.colorappearance.modelmethod == "02"
+                       && params.colorappearance.enabled;
     ctx.cam02 = cam02;
 
-    // transform
-   // retired mask predicate: if (needstransform || ((transformFamilyIntent) && params.dirpyrequalizer.cbdlMethod == "bef" && params.dirpyrequalizer.enabled && !params.colorappearance.enabled)) {
     const bool transformIntent =
         ctx.request.transformFamilyIntent || ctx.forcedFull;
-    if (needstransform || (transformIntent && params.dirpyrequalizer.cbdlMethod == "bef" && params.dirpyrequalizer.enabled && !cam02)) {
+    const bool transformFamily =
+        transformIntent && params.dirpyrequalizer.cbdlMethod == "bef"
+        && params.dirpyrequalizer.enabled && !cam02;
+
+    if (needstransform || transformFamily) {
         if (!transCrop) {
             transCrop = new Imagefloat(cropw, croph);
         }
 
-        if (needstransform)
-            parent->ipf.transform(baseCrop, transCrop, cropx / skip, cropy / skip, trafx / skip, trafy / skip, skips(parent->fw, skip), skips(parent->fh, skip), parent->getFullWidth(), parent->getFullHeight(),
-                                  parent->imgsrc->getMetaData(),
-                                  parent->imgsrc->getRotateDegree(), false);
-        else {
-            baseCrop->copyData(transCrop);
-        }
-
-        if (transCrop) {
-            baseCrop = transCrop;
-        }
+        stage::TransformBodyOptions options;
+        options.cx = cropx / skip;
+        options.cy = cropy / skip;
+        options.sx = trafx / skip;
+        options.sy = trafy / skip;
+        options.oW = skips(parent->fw, skip);
+        options.oH = skips(parent->fh, skip);
+        options.fW = parent->getFullWidth();
+        options.fH = parent->getFullHeight();
+        options.metadata = parent->imgsrc->getMetaData();
+        options.rotateDegree = parent->imgsrc->getRotateDegree();
+        options.needTransform = needstransform;
+        options.transformFamily = transformFamily;
+        options.scale = skip;
+        stage::transformHostBlock(parent->ipf, params, *baseCrop, *transCrop,
+                                  options);
+        baseCrop = transCrop;
     } else {
         delete transCrop;
         transCrop = nullptr;
-    }
-
-   // retired mask predicate: if ((transformFamilyIntent)  && params.dirpyrequalizer.cbdlMethod == "bef" && params.dirpyrequalizer.enabled && !params.colorappearance.enabled) {
-    if (transformIntent  && params.dirpyrequalizer.cbdlMethod == "bef" && params.dirpyrequalizer.enabled && !cam02) {
-
-        const int W = baseCrop->getWidth();
-        const int H = baseCrop->getHeight();
-        LabImage labcbdl(W, H);
-        parent->ipf.rgb2lab(*baseCrop, labcbdl, params.icm.workingProfile);
-        parent->ipf.dirpyrequalizer(&labcbdl, skip);
-        parent->ipf.lab2rgb(labcbdl, *baseCrop, params.icm.workingProfile);
-
     }
 }
 
@@ -2039,7 +2043,6 @@ void Crop::stageRgbProc(CropStageContext& ctx)
 void Crop::stageLabTools(CropStageContext& ctx)
 {
     ProcParams& params = ctx.params;
-    const bool cam02 = ctx.cam02;
     LUTu& dummy = ctx.dummy;
 
     if (!ctx.request.labChainIntent && !ctx.forcedFull) {
@@ -2047,31 +2050,25 @@ void Crop::stageLabTools(CropStageContext& ctx)
     }
     labnCrop->CopyFrom(laboCrop);
 
-    bool utili = parent->utili;
     bool autili = parent->autili;
     bool butili = parent->butili;
-    bool ccutili = parent->ccutili;
-    bool clcutili = parent->clcutili;
-    bool cclutili = parent->cclutili;
 
-    if (params.colorToning.enabled && params.colorToning.method == "LabGrid") {
-        parent->ipf.colorToningLabGrid(labnCrop, 0,labnCrop->W , 0, labnCrop->H, false);
-    }
-
-    parent->ipf.shadowsHighlights(labnCrop, params.sh.enabled, params.sh.lab,params.sh.highlights ,params.sh.shadows, params.sh.radius, skip, params.sh.htonalwidth, params.sh.stonalwidth);
-
-    if (params.localContrast.enabled) {
-    // Alberto's local contrast
-        parent->ipf.localContrast(labnCrop, labnCrop->L, params.localContrast, false, skip);
-    }
-    parent->ipf.chromiLuminanceCurve(this, 1, labnCrop, labnCrop, parent->chroma_acurve, parent->chroma_bcurve, parent->satcurve, parent->lhskcurve,  parent->clcurve, parent->lumacurve, utili, autili, butili, ccutili, cclutili, clcutili, dummy, dummy);
-    parent->ipf.vibrance(labnCrop, params.vibrance, params.toneCurve.hrenabled, params.icm.workingProfile);
-    parent->ipf.labColorCorrectionRegions(labnCrop);
-
-   // if ((params.colorappearance.enabled && !params.colorappearance.tonecie) || (!params.colorappearance.enabled)) {
-    if ((params.colorappearance.enabled && !params.colorappearance.tonecie) || (!cam02)) {
-        parent->ipf.EPDToneMap(labnCrop, 0, skip);
-    }
+    stage::LabToolsLuts luts{nullptr, &parent->lumacurve, &dummy,
+                             &parent->clcurve, &parent->chroma_acurve,
+                             &parent->chroma_bcurve, &parent->satcurve,
+                             &parent->lhskcurve};
+    stage::LabToolsBodyOptions options;
+    options.scale = skip;
+    options.chromiWidth = 1;
+    options.pipetteBuffer = this;
+    options.buildLuts = false;
+    options.epdBeforeVibrance = false;
+    options.utili = parent->utili;
+    options.ccutili = parent->ccutili;
+    options.cclutili = parent->cclutili;
+    options.clcutili = parent->clcutili;
+    stage::labToolsHostBlock(parent->ipf, params, *labnCrop, luts, autili,
+                             butili, options);
 }
 
 void Crop::stageLabSharpening(CropStageContext& ctx)
@@ -2101,19 +2098,9 @@ void Crop::stageLabSharpening(CropStageContext& ctx)
 void Crop::stageLabWavelet(CropStageContext& ctx)
 {
     ProcParams& params = ctx.params;
-    const bool cam02 = ctx.cam02;
 
     if (!ctx.request.labChainIntent && !ctx.forcedFull) {
         return;
-    }
-    //   if (skip==1) {
-
-    if (params.dirpyrequalizer.cbdlMethod == "aft") {
-       // if (((params.colorappearance.enabled && !settings->autocielab)  || (!params.colorappearance.enabled))) {
-        if (((params.colorappearance.enabled && !settings->autocielab)  || (!cam02))) {
-            parent->ipf.dirpyrequalizer(labnCrop, skip);
-            //  parent->ipf.Lanczoslab (labnCrop,labnCrop , 1.f/skip);
-        }
     }
 
     if ((params.wavelet.enabled)) {
@@ -2184,312 +2171,28 @@ void Crop::stageLabWavelet(CropStageContext& ctx)
         if (parent->awavListener) {
             parent->awavListener->wavChanged(float (maxL));
         }
-
-        WavCurve wavCLVCurve;
-        WavCurve wavdenoise;
-        WavCurve wavdenoiseh;
-        Wavblcurve wavblcurve;
-        WavOpacityCurveRG waOpacityCurveRG;
-        WavOpacityCurveSH waOpacityCurveSH;
-        WavOpacityCurveBY waOpacityCurveBY;
-        WavOpacityCurveW waOpacityCurveW;
-        WavOpacityCurveWL waOpacityCurveWL;
-        LUTf wavclCurve;
-
-        params.wavelet.getCurves(wavCLVCurve, wavdenoise, wavdenoiseh, wavblcurve, waOpacityCurveRG, waOpacityCurveSH, waOpacityCurveBY, waOpacityCurveW, waOpacityCurveWL);
-        LabImage *unshar = nullptr;
-        Glib::ustring provis;
-        LabImage *provradius = nullptr;
-        bool procont = WaveParams.expcontrast;
-        bool prochro = WaveParams.expchroma;
-        bool proedge = WaveParams.expedge;
-        bool profin = WaveParams.expfinal;
-        bool proton = WaveParams.exptoning;
-        bool pronois = WaveParams.expnoise;
-
-        if (WaveParams.showmask) {
-       //     WaveParams.showmask = false;
-       //     WaveParams.expclari = true;
-        }
-
-
-        if (WaveParams.softrad > 0.f) {
-            provradius = new LabImage(*labnCrop, true);
-        }
-
-
-
-        if ((WaveParams.ushamethod == "sharp" || WaveParams.ushamethod == "clari") && WaveParams.expclari && WaveParams.CLmethod != "all") {
-
-            provis = params.wavelet.CLmethod;
-            params.wavelet.CLmethod = "all";
-            parent->ipf.ip_wavelet(labnCrop, labnCrop, kall, WaveParams, wavCLVCurve, wavdenoise, wavdenoiseh, wavblcurve, waOpacityCurveRG, waOpacityCurveSH, waOpacityCurveBY, waOpacityCurveW, waOpacityCurveWL, parent->wavclCurve, skip);
-            unshar = new LabImage(*labnCrop, true);
-
-            params.wavelet.CLmethod = provis;
-
-            WaveParams.expcontrast = false;
-            WaveParams.expchroma = false;
-            WaveParams.expedge = false;
-            WaveParams.expfinal = false;
-            WaveParams.exptoning = false;
-            WaveParams.expnoise = false;
-        }
-
-
-
-//        parent->ipf.ip_wavelet(labnCrop, labnCrop, kall, WaveParams, wavCLVCurve, wavblcurve, waOpacityCurveRG, waOpacityCurveBY, waOpacityCurveW, waOpacityCurveWL, parent->wavclCurve, skip);
-
-    parent->ipf.ip_wavelet(labnCrop, labnCrop, kall, WaveParams, wavCLVCurve, wavdenoise, wavdenoiseh, wavblcurve, waOpacityCurveRG, waOpacityCurveSH, waOpacityCurveBY, waOpacityCurveW, waOpacityCurveWL, parent->wavclCurve, skip);
-
-        if ((WaveParams.ushamethod == "sharp" || WaveParams.ushamethod == "clari") && WaveParams.expclari && WaveParams.CLmethod != "all") {
-            WaveParams.expcontrast = procont;
-            WaveParams.expchroma = prochro;
-            WaveParams.expedge = proedge;
-            WaveParams.expfinal = profin;
-            WaveParams.exptoning = proton;
-            WaveParams.expnoise = pronois;
-            if (WaveParams.softrad > 0.f) {
-                array2D<float> ble(labnCrop->W, labnCrop->H);
-                array2D<float> guid(labnCrop->W, labnCrop->H);
-                Imagefloat *tmpImage = nullptr;
-                tmpImage = new Imagefloat(labnCrop->W, labnCrop->H);
-
-#ifdef _OPENMP
-                #pragma omp parallel for
-#endif
-
-                for (int ir = 0; ir < labnCrop->H ; ir++)
-                    for (int jr = 0; jr < labnCrop->W; jr++) {
-                        float X, Y, Z;
-                        float L = provradius->L[ir][jr];
-                        float a = provradius->a[ir][jr];
-                        float b = provradius->b[ir][jr];
-                        Color::Lab2XYZ(L, a, b, X, Y, Z);
-
-                        guid[ir][jr] = Y / 32768.f;
-                        float La = labnCrop->L[ir][jr];
-                        float aa = labnCrop->a[ir][jr];
-                        float ba = labnCrop->b[ir][jr];
-                        Color::Lab2XYZ(La, aa, ba, X, Y, Z);
-                        tmpImage->r(ir, jr) = X;
-                        tmpImage->g(ir, jr) = Y;
-                        tmpImage->b(ir, jr) = Z;
-                        ble[ir][jr] = Y / 32768.f;
-                    }
-                double epsilmax = 0.0001;
-                double epsilmin = 0.00001;
-                double aepsil = (epsilmax - epsilmin) / 100.f;
-                double bepsil = epsilmin; //epsilmax - 100.f * aepsil;
-                double epsil = aepsil * WaveParams.softrad + bepsil;
-
-                float blur = 10.f / skip * (0.5f + 0.8f * WaveParams.softrad);
-                rtengine::guidedFilter(guid, ble, ble, blur, epsil, false);
-
-
-
-#ifdef _OPENMP
-                #pragma omp parallel for
-#endif
-
-                for (int ir = 0; ir < labnCrop->H; ir++)
-                    for (int jr = 0; jr < labnCrop->W; jr++) {
-                        float X = tmpImage->r(ir, jr);
-                        float Y = 32768.f * ble[ir][jr];
-                        float Z = tmpImage->b(ir, jr);
-                        float L, a, b;
-                        Color::XYZ2Lab(X, Y, Z, L, a, b);
-                        labnCrop->L[ir][jr] = L;
-                    }
-                delete tmpImage;
-            }
-
-        }
-
-
-        if ((WaveParams.ushamethod == "sharp" || WaveParams.ushamethod == "clari")  && WaveParams.expclari && WaveParams.CLmethod != "all") {
-
-            float mL = (float)(WaveParams.mergeL / 100.f);
-            float mC = (float)(WaveParams.mergeC / 100.f);
-            float mL0;
-            float mC0;
-            float background = 0.f;
-            int show = 0;
-
-            if ((WaveParams.CLmethod == "one" || WaveParams.CLmethod == "inf")  && WaveParams.Backmethod == "black") {
-                mL0 = mC0 = 0.f;
-                mL = -1.5f * mL;
-                mC = -mC;
-                background = 12000.f;
-                show = 0;
-            } else if (WaveParams.CLmethod == "sup" && WaveParams.Backmethod == "resid") {
-                mL0 = mL;
-                mC0 = mC;
-                background = 0.f;
-                show = 0;
-            } else {
-                mL0 = mL = mC0 = mC = 0.f;
-                background = 0.f;
-                show = 0;
-            }
-
-            float indic = 1.f;
-            if (WaveParams.showmask){
-                mL0 = mC0 = -1.f;
-                indic = -1.f;
-                mL = fabs(mL);
-                mC = fabs(mC);
-                show = 1;
-            }
-
-#ifdef _OPENMP
-            #pragma omp parallel for
-#endif
-
-            for (int x = 0; x < labnCrop->H; x++)
-                for (int y = 0; y < labnCrop->W; y++) {
-                    labnCrop->L[x][y] = LIM((1.f + mL0) * (unshar->L[x][y]) + show * background - mL * indic * labnCrop->L[x][y], 0.f, 32768.f);
-                    labnCrop->a[x][y] = (1.f + mC0) * (unshar->a[x][y]) - mC * indic * labnCrop->a[x][y];
-                    labnCrop->b[x][y] = (1.f + mC0) * (unshar->b[x][y]) - mC * indic * labnCrop->b[x][y];
-                }
-
-            delete unshar;
-            unshar    = NULL;
-            if (WaveParams.softrad > 0.f) {
-                delete provradius;
-                provradius    = NULL;
-            }
-
-        }
-
     }
+
+    stage::LabWaveletBodyOptions options;
+    options.scale = skip;
+    options.kall = 0;
+    options.wavclCurve = &parent->wavclCurve;
+    options.runAfterCbdl = true;
+    options.allowShowMask = true;
+    stage::labWaveletHostBlock(parent->ipf, ctx.params, *labnCrop, options);
 }
 
 void Crop::stageWorkingTrc(CropStageContext& ctx)
 {
-    ProcParams& params = ctx.params;
     if (!ctx.request.labChainIntent && !ctx.forcedFull) {
         return;
     }
-    parent->ipf.softLight(labnCrop, params.softlight);
 
-    if (params.icm.workingTRC != ColorManagementParams::WorkingTrc::NONE && params.icm.trcExp) {
-        const int GW = labnCrop->W;
-        const int GH = labnCrop->H;
-        if(params.icm.trcExp) {//local contrast
-            int level_hr = 7;
-            int maxlevpo = 9;
-            bool wavcurvecont = false;
-            WaveletParams WaveParams = params.wavelet;
-            ColorManagementParams Colparams = params.icm;
-            WavOpacityCurveWL icmOpacityCurveWL;
-            Colparams.getCurves(icmOpacityCurveWL);
-            parent->ipf.complete_local_contrast(labnCrop, labnCrop, WaveParams, Colparams, icmOpacityCurveWL, skip, level_hr, maxlevpo, wavcurvecont);
-            bool enall = false;
-            enall = wavcurvecont && Colparams.wavExp;//enable message only if curve enable and Expander on
-            if (parent->primListener) {
-                parent->primListener->wavlocChanged(float (maxlevpo), float (level_hr), enall);
-            }
-
-        }
-
-        std::unique_ptr<LabImage> provis;
-        const float pres = 0.01f * params.icm.preser;
-        if (pres > 0.f && params.icm.wprim != ColorManagementParams::Primaries::DEFAULT) {
-            provis.reset(new LabImage(GW, GH));
-            provis->CopyFrom(labnCrop);
-        }
-
-        const std::unique_ptr<Imagefloat> tmpImage1(new Imagefloat(GW, GH));
-        const std::unique_ptr<Imagefloat> tmpImage2(new Imagefloat(GW, GH));
-
-        parent->ipf.lab2rgb(*labnCrop, *tmpImage1, params.icm.workingProfile);
-        tmpImage1.get()->copyData(tmpImage2.get());
-
-        const float gamtone = parent->params->icm.wGamma;
-        const float slotone = parent->params->icm.wSlope;
-
-        int illum = rtengine::toUnderlying(params.icm.will);
-        const int prim = rtengine::toUnderlying(params.icm.wprim);
-
-        Glib::ustring prof = params.icm.workingProfile;
-
-        cmsHTRANSFORM cmsDummy = nullptr;
-        int ill = 0;
-        int locprim = 0;
-        bool gamutcontrol = params.icm.gamut;
-        int catc = rtengine::toUnderlying(params.icm.wcat);
-
-        const int midton = params.icm.wmidtcie;
-
-        if(midton != 0) {
-            ToneEqualizerParams params;
-            params.enabled = true;
-            params.regularization = 0.f;
-            params.pivot = 0.f;
-            params.bands[0] = 0;
-            params.bands[2] = midton;
-            params.bands[4] = 0;
-            params.bands[5] = 0;
-            int mid = abs(midton);
-            int threshmid = 50;
-            if(mid > threshmid) {
-                params.bands[1] = sign(midton) * (mid - threshmid);
-                params.bands[3] = sign(midton) * (mid - threshmid);
-            }
-            parent->ipf.toneEqualizer(tmpImage1.get(), params, prof, skip, false);
-        }
-
-        float rdx, rdy, grx, gry, blx, bly = 0.f;
-        float meanx, meany, meanxe, meanye, maxdat = 0.f;
-        double p[6] = {0., 0., 0., 0., 0., 0.};
-
-        parent->ipf.workingtrc(0, tmpImage1.get(), tmpImage1.get(), GW, GH, -5, prof, 2.4, 12.92310, 0, ill, 0, 0, rdx, rdy, grx, gry, blx, bly,meanx, meany, meanxe, meanye, maxdat, p, cmsDummy, true, false, false, false);
-        parent->ipf.workingtrc(0, tmpImage1.get(), tmpImage1.get(), GW, GH, 5, prof, gamtone, slotone, catc,  illum, prim, locprim, rdx, rdy, grx, gry, blx, bly, meanx, meany, meanxe, meanye, maxdat, p, cmsDummy, false, true, true, gamutcontrol);
-        float satu = params.icm.wapsat;
-        if(satu > 0.f) {
-            parent->ipf.apsatur(0, tmpImage1.get(), tmpImage2.get(), GW, GH, satu) ;
-        }
-
-
-        const float smoothisli = params.icm.wsmoothciesli;
-        if(smoothisli > 0.f) {
-            ToneEqualizerParams params;
-            params.enabled = true;
-            params.regularization = 0.f;
-            params.pivot = 0.f;
-            params.bands[0] = 0;
-            params.bands[1] = 0;
-            params.bands[2] = 0;
-            params.bands[3] = 0;
-            params.bands[4] = -40;//arbitrary value to adapt with WhiteEvjz - here White Ev # 10
-            params.bands[5] = -80;//8 Ev and above
-            bool Evsix = true;
-            if(Evsix) {//EV = 6 majority of images
-                params.bands[4] = -30 * smoothisli;
-                float smmothsli5 = std::min(smoothisli, 1.f);
-                params.bands[5] = -80 * smmothsli5;
-            }
-
-            parent->ipf.toneEqualizer(tmpImage1.get(), params, prof, skip, false);
-        }
-
-        parent->ipf.rgb2lab(*tmpImage1, *labnCrop, params.icm.workingProfile);
-        //labnCrop and provis
-        if (provis) {
-            parent->ipf.preserv(labnCrop, provis.get(), GW, GH);
-        }
-        if (params.icm.fbw) {
-#ifdef _OPENMP
-        #pragma omp parallel for
-#endif
-        for (int x = 0; x < GH; x++)
-            for (int y = 0; y < GW; y++) {
-                labnCrop->a[x][y] = 0.f;
-                labnCrop->b[x][y] = 0.f;
-            }
-        }
-    }
+    stage::WorkingTrcBodyOptions options;
+    options.scale = skip;
+    options.listener = parent->primListener;
+    options.notifyLocalContrast = true;
+    stage::workingTrcHostBlock(parent->ipf, ctx.params, *labnCrop, options);
 }
 
 void Crop::stageCieCam(CropStageContext& ctx)
@@ -2518,19 +2221,31 @@ void Crop::stageCieCam(CropStageContext& ctx)
             // end calculation adaptation scene luminosity
         }
 
-        bool execsharp = false;
-
-        if (skip == 1) {
-            execsharp = true;
-        }
-
         if (!cieCrop) {
             cieCrop = new CieImage(cropw, croph);
         }
 
-        float d, dj, yb; // not used after this block
-        parent->ipf.ciecam_02float(cieCrop, float (adap), 1, 2, labnCrop, &params, parent->customColCurve1, parent->customColCurvered, parent->customColCurvegreen,  parent->customColCurveblue, parent->customColCurve2, parent->customColCurve3,
-                                   dummy, dummy, parent->CAMBrightCurveJ, parent->CAMBrightCurveQ, parent->CAMMean, 0, skip, execsharp, d, dj, yb, 1, parent->sharpMask);
+        stage::CiecamBodyState state;
+        state.lab = labnCrop;
+        state.cie = cieCrop;
+        state.histLCAM = &dummy;
+        state.histCCAM = &dummy;
+        state.camBrightJ = &parent->CAMBrightCurveJ;
+        state.camBrightQ = &parent->CAMBrightCurveQ;
+        state.camMean = &parent->CAMMean;
+
+        stage::CiecamBodyOptions options;
+        options.widthArg = 1;
+        options.scaleArg = skip;
+        options.execsharp = (skip == 1);
+        options.showSharpMask = parent->sharpMask;
+        stage::ciecamBody(parent->ipf, params, static_cast<float>(adap),
+                          parent->customColCurve1,
+                          parent->customColCurvered,
+                          parent->customColCurvegreen,
+                          parent->customColCurveblue,
+                          parent->customColCurve2,
+                          parent->customColCurve3, state, options, nullptr);
     } else {
         // CIECAM is disabled, we free up its image buffer to save some space
         if (cieCrop) {
@@ -2547,76 +2262,8 @@ void Crop::stageGamut(CropStageContext& ctx)
     if (!ctx.request.labChainIntent && !ctx.forcedFull) {
         return;
     }
-    bool exec = params.icm.wgamut != ColorManagementParams::Wwgamut::NONE  || params.icm.wgamgain != 0.f;
 
-    if (params.icm.workingTRC != ColorManagementParams::WorkingTrc::NONE && params.icm.trcExp  && exec) {
-
-        //compression gamut and gain at the end of process
-        const int GW = labnCrop->W;
-        const int GH = labnCrop->H;
-        TMatrix wprof = ICCStore::getInstance()->workingSpaceMatrix(params.icm.workingProfile);
-            const double wp[3][3] = {
-                {wprof[0][0], wprof[0][1], wprof[0][2]},
-                {wprof[1][0], wprof[1][1], wprof[1][2]},
-                {wprof[2][0], wprof[2][1], wprof[2][2]}
-            };
-        TMatrix wiprof = ICCStore::getInstance()->workingSpaceInverseMatrix(params.icm.workingProfile);
-            const double wip[3][3] = {//improve precision with double
-                {wiprof[0][0], wiprof[0][1], wiprof[0][2]},
-                {wiprof[1][0], wiprof[1][1], wiprof[1][2]},
-                {wiprof[2][0], wiprof[2][1], wiprof[2][2]}
-            };
-
-        std::unique_ptr<Imagefloat> provcomp(new Imagefloat(GW, GH));
-
-#ifdef _OPENMP
-    #   pragma omp parallel for
-#endif
-        for (int i = 0; i < GH; ++i){
-            for (int j = 0; j < GW; ++j) {
-                float X, Y, Z = 0.f;
-                Color::Lab2XYZ(labnCrop->L[i][j], labnCrop->a[i][j], labnCrop->b[i][j] , X, Y, Z);
-                Color::xyz2rgb(X, Y, Z, provcomp->r(i, j), provcomp->g(i, j), provcomp->b(i, j), wip);
-            }
-        }
-
-        const float gainev = pow_F(2.f, (float) params.icm.wgamgain);
-        if (params.icm.wgamgain != 0.f) {//Final gain in Ev
-
-#ifdef _OPENMP
-    #   pragma omp parallel for
-#endif
-            for (int i = 0; i < GH; ++i){
-                for (int j = 0; j < GW; ++j) {
-                    provcomp->r(i, j) *= gainev;
-                    provcomp->g(i, j) *= gainev;
-                    provcomp->b(i, j) *= gainev;
-                }
-            }
-        }
-
-        float mac = 0.f;
-        float mac0 = 0.f;
-        float mac1 = 0.f;
-        float mac2 = 0.f;
-        int beginend = 1;
-        int nbsegam = 0;
-        float powe = 1.f;
-        if (params.icm.wgamut != ColorManagementParams::Wwgamut::NONE) {
-            parent->ipf.gamutcompr(provcomp.get(), provcomp.get(), beginend, powe, nbsegam, mac, mac0, mac1, mac2);
-        }
-
-#ifdef _OPENMP
-    #   pragma omp parallel for
-#endif
-        for (int i = 0; i < GH; ++i){
-            for (int j = 0; j < GW; ++j) {
-                float x, y, z = 0.f;
-                Color::rgbxyz (provcomp->r(i, j), provcomp->g(i, j), provcomp->b(i, j), x, y, z, wp);
-                Color::XYZ2Lab(x, y, z, labnCrop->L[i][j], labnCrop->a[i][j], labnCrop->b[i][j]);
-        }
-        }
-    }
+    stage::gamutHostBlock(parent->ipf, params, *labnCrop);
 }
 
 void Crop::stageViewportOutput(CropStageContext& ctx)

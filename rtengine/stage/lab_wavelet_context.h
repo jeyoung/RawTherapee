@@ -21,6 +21,8 @@
 
 #include "stage_abi.h"
 
+#include "LUT.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -927,12 +929,34 @@ bool labWaveletSupported(const procparams::ProcParams& params, int width,
                          int height);
 
 /*
+ * Call-site options of the shared lab.wavelet body.
+ *
+ * `scale` is the sampling divisor passed to ip_wavelet() and the guided-filter
+ * blur divisor: the preview scale, the crop skip, or the export scale. `kall`
+ * is the level argument the three call sites have always passed (0 for the
+ * interactive paths, 2 for export). `wavclCurve` is the caller-built final
+ * wavelet LUT; a null pointer makes the body build the export-resolution LUT
+ * locally, so the existing export call site is unchanged. `runAfterCbdl` runs
+ * the after-CBDL directional pyramid equaliser inside the body; preview has
+ * already run it in lab.tools and passes false. `allowShowMask` enables the
+ * interactive merge overlay, which the export block never had.
+ */
+struct LabWaveletBodyOptions {
+    double scale = 1.0;
+    int kall = 2;
+    LUTf* wavclCurve = nullptr;
+    bool runAfterCbdl = true;
+    bool allowShowMask = false;
+};
+
+/*
  * The block as it ran before the device node, moved here unchanged so the
  * call site, the host builtin and the tests share exactly one CPU
  * implementation.
  */
 void labWaveletHostBlock(ImProcFunctions& ipf,
-                         procparams::ProcParams& params, LabImage& lab);
+                         procparams::ProcParams& params, LabImage& lab,
+                         const LabWaveletBodyOptions& options = {});
 
 /*
  * The host-owned setup for one lab.wavelet submission.

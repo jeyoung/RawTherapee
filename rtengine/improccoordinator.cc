@@ -58,7 +58,12 @@
 #include "profiling.h"
 #include "stage/stage_graph.h"
 #include "stage/stage_pipeline.h"
+#include "stage/ciecam_context.h"
+#include "stage/lab_tools_context.h"
+#include "stage/lab_wavelet_context.h"
+#include "stage/stage_body.h"
 #include "stage/stage_plan.h"
+#include "stage/working_trc_context.h"
 #include "stage/stage_handler.h"
 #include "stage/stage_profile.h"
 #include "stage/stage_runtime.h"
@@ -2353,29 +2358,29 @@ void ImProcCoordinator::stageTransform(PreviewPassState& pass)
     }
 
     // Remove transformation if unneeded
-    bool needstransform = ipf.needsTransform(fw, fh, imgsrc->getRotateDegree(), imgsrc->getMetaData());
+    const bool needstransform = ipf.needsTransform(
+        fw, fh, imgsrc->getRotateDegree(), imgsrc->getMetaData());
+    const bool transformFamily =
+        pass.request.transformFamilyIntent
+        && params->dirpyrequalizer.cbdlMethod == "bef"
+        && params->dirpyrequalizer.enabled && !pass.cam02;
 
-    //  retired mask predicate: if ((needstransform || ((transformFamilyIntent)  && params->dirpyrequalizer.cbdlMethod == "bef" && params->dirpyrequalizer.enabled && !params->colorappearance.enabled))) {
-    if ((needstransform || (pass.request.transformFamilyIntent  && params->dirpyrequalizer.cbdlMethod == "bef" && params->dirpyrequalizer.enabled && !pass.cam02))) {
-        // Forking the image
+    if (needstransform || transformFamily) {
         assert(oprevi);
-        Imagefloat *op = oprevi;
+        Imagefloat* source = oprevi;
         oprevi = new Imagefloat(pW, pH);
 
-        if (needstransform)
-            ipf.transform(op, oprevi, 0, 0, 0, 0, pW, pH, fw, fh,
-                          imgsrc->getMetaData(), imgsrc->getRotateDegree(), false);
-        else {
-            op->copyData(oprevi);
-        }
-    }
-    if (pass.request.transformFamilyIntent  && params->dirpyrequalizer.cbdlMethod == "bef" && params->dirpyrequalizer.enabled && !pass.cam02) {
-        const int W = oprevi->getWidth();
-        const int H = oprevi->getHeight();
-        LabImage labcbdl(W, H);
-        ipf.rgb2lab(*oprevi, labcbdl, params->icm.workingProfile);
-        ipf.dirpyrequalizer(&labcbdl, scale);
-        ipf.lab2rgb(labcbdl, *oprevi, params->icm.workingProfile);
+        stage::TransformBodyOptions options;
+        options.oW = pW;
+        options.oH = pH;
+        options.fW = fw;
+        options.fH = fh;
+        options.metadata = imgsrc->getMetaData();
+        options.rotateDegree = imgsrc->getRotateDegree();
+        options.needTransform = needstransform;
+        options.transformFamily = transformFamily;
+        options.scale = scale;
+        stage::transformHostBlock(ipf, *params, *source, *oprevi, options);
     }
 }
 
@@ -3468,32 +3473,23 @@ void ImProcCoordinator::stageLabTools(PreviewPassState& pass)
     histCCurve.clear();
     histLCurve.clear();
 
-    if (params->colorToning.enabled && params->colorToning.method == "LabGrid") {
-        ipf.colorToningLabGrid(nprevl, 0, nprevl->W, 0, nprevl->H, false);
-    }
-
-    ipf.shadowsHighlights(nprevl, params->sh.enabled, params->sh.lab, params->sh.highlights, params->sh.shadows, params->sh.radius, scale, params->sh.htonalwidth, params->sh.stonalwidth);
-
-    if (params->localContrast.enabled) {
-        // Alberto's local contrast
-        ipf.localContrast(nprevl, nprevl->L, params->localContrast, false, scale);
-    }
-
-    ipf.chromiLuminanceCurve(nullptr, pW, nprevl, nprevl, chroma_acurve, chroma_bcurve, satcurve, lhskcurve, clcurve, lumacurve, utili, autili, butili, ccutili, cclutili, clcutili, histCCurve, histLCurve);
-    ipf.vibrance(nprevl, params->vibrance, params->toneCurve.hrenabled, params->icm.workingProfile);
-    ipf.labColorCorrectionRegions(nprevl);
-
-    //   if ((params->colorappearance.enabled && !params->colorappearance.tonecie) || (!params->colorappearance.enabled)) {
-    if ((params->colorappearance.enabled && !params->colorappearance.tonecie) || (!pass.cam02)) {
-        ipf.EPDToneMap(nprevl, 0, scale);
-    }
-
-    if (params->dirpyrequalizer.cbdlMethod == "aft") {
-      //  if (((params->colorappearance.enabled && !settings->autocielab) || (!params->colorappearance.enabled))) {
-        if (((params->colorappearance.enabled && !settings->autocielab) || (!pass.cam02))) {
-            ipf.dirpyrequalizer(nprevl, scale);
-        }
-    }
+    stage::LabToolsLuts luts{&lhist16, &lumacurve, &histLCurve, &clcurve,
+                             &chroma_acurve, &chroma_bcurve, &satcurve,
+                             &lhskcurve};
+    stage::LabToolsBodyOptions options;
+    options.scale = scale;
+    options.chromiWidth = pW;
+    options.buildLuts = false;
+    options.epdBeforeVibrance = false;
+    options.applyAftDirpy = true;
+    options.utili = utili;
+    options.ccutili = ccutili;
+    options.cclutili = cclutili;
+    options.clcutili = clcutili;
+    options.histC = &histCCurve;
+    options.histL = &histLCurve;
+    stage::labToolsHostBlock(ipf, *params, *nprevl, luts, autili, butili,
+                             options);
 
     wavcontlutili = CurveFactory::diagonalCurve2Lut(params->wavelet.wavclCurve, wavclCurve, scale == 1 ? 1 : 16);
     updateViewportLutSnapshot(ViewportLutSelection::waveletOnly());
@@ -3508,216 +3504,13 @@ void ImProcCoordinator::stageLabWavelet(PreviewPassState& pass)
         return;
     }
 
-    if ((params->wavelet.enabled)) {
-        WaveletParams WaveParams = params->wavelet;
-        WaveParams.getCurves(wavCLVCurve, wavdenoise, wavdenoiseh, wavblcurve, waOpacityCurveRG, waOpacityCurveSH, waOpacityCurveBY, waOpacityCurveW, waOpacityCurveWL);
-        int kall = 0;
-        LabImage *unshar = nullptr;
-        Glib::ustring provis;
-        LabImage *provradius = nullptr;
-        bool procont = WaveParams.expcontrast;
-        bool prochro = WaveParams.expchroma;
-        bool proedge = WaveParams.expedge;
-        bool profin = WaveParams.expfinal;
-        bool proton = WaveParams.exptoning;
-        bool pronois = WaveParams.expnoise;
-
-        if (WaveParams.showmask) {
-            //   WaveParams.showmask = false;
-            //   WaveParams.expclari = true;
-        }
-
-        if (WaveParams.softrad > 0.f) {
-            provradius = new LabImage(*nprevl, true);
-        }
-
-        if ((WaveParams.ushamethod == "sharp" || WaveParams.ushamethod == "clari") && WaveParams.expclari && WaveParams.CLmethod != "all") {
-            provis = params->wavelet.CLmethod;
-            params->wavelet.CLmethod = "all";
-            ipf.ip_wavelet(nprevl, nprevl, kall, WaveParams, wavCLVCurve, wavdenoise, wavdenoiseh, wavblcurve, waOpacityCurveRG, waOpacityCurveSH, waOpacityCurveBY, waOpacityCurveW, waOpacityCurveWL, wavclCurve, scale);
-            unshar = new LabImage(*nprevl, true);
-
-            params->wavelet.CLmethod = provis;
-
-            WaveParams.expcontrast = false;
-            WaveParams.expchroma = false;
-            WaveParams.expedge = false;
-            WaveParams.expfinal = false;
-            WaveParams.exptoning = false;
-            WaveParams.expnoise = false;
-        }
-
-        ipf.ip_wavelet(nprevl, nprevl, kall, WaveParams, wavCLVCurve, wavdenoise, wavdenoiseh, wavblcurve, waOpacityCurveRG, waOpacityCurveSH, waOpacityCurveBY, waOpacityCurveW, waOpacityCurveWL, wavclCurve, scale);
-
-
-        if ((WaveParams.ushamethod == "sharp" || WaveParams.ushamethod == "clari") && WaveParams.expclari && WaveParams.CLmethod != "all") {
-            WaveParams.expcontrast = procont;
-            WaveParams.expchroma = prochro;
-            WaveParams.expedge = proedge;
-            WaveParams.expfinal = profin;
-            WaveParams.exptoning = proton;
-            WaveParams.expnoise = pronois;
-
-            if (WaveParams.softrad > 0.f) {
-
-                array2D<float> ble(pW, pH);
-                array2D<float> guid(pW, pH);
-                Imagefloat *tmpImage = nullptr;
-                tmpImage = new Imagefloat(pW, pH);
-
-    #ifdef _OPENMP
-                #pragma omp parallel for
-    #endif
-
-                for (int ir = 0; ir < pH; ir++)
-                    for (int jr = 0; jr < pW; jr++) {
-                        float X, Y, Z;
-                        float L = provradius->L[ir][jr];
-                        float a = provradius->a[ir][jr];
-                        float b = provradius->b[ir][jr];
-                        Color::Lab2XYZ(L, a, b, X, Y, Z);
-
-                        guid[ir][jr] = Y / 32768.f;
-                        float La = nprevl->L[ir][jr];
-                        float aa = nprevl->a[ir][jr];
-                        float ba = nprevl->b[ir][jr];
-                        Color::Lab2XYZ(La, aa, ba, X, Y, Z);
-                        tmpImage->r(ir, jr) = X;
-                        tmpImage->g(ir, jr) = Y;
-                        tmpImage->b(ir, jr) = Z;
-                        ble[ir][jr] = Y / 32768.f;
-                    }
-
-                double epsilmax = 0.0001;
-                double epsilmin = 0.00001;
-                double aepsil = (epsilmax - epsilmin) / 100.f;
-                double bepsil = epsilmin; //epsilmax - 100.f * aepsil;
-                double epsil = aepsil * WaveParams.softrad + bepsil;
-
-                float blur = 10.f / scale * (0.5f + 0.8f * WaveParams.softrad);
-                // rtengine::guidedFilter(guid, ble, ble, blur, 0.001, multiTh);
-                rtengine::guidedFilter(guid, ble, ble, blur, epsil, false);
-
-
-
-    #ifdef _OPENMP
-                #pragma omp parallel for
-    #endif
-
-                for (int ir = 0; ir < pH; ir++)
-                    for (int jr = 0; jr < pW; jr++) {
-                        float X = tmpImage->r(ir, jr);
-                        float Y = 32768.f * ble[ir][jr];
-                        float Z = tmpImage->b(ir, jr);
-                        float L, a, b;
-                        Color::XYZ2Lab(X, Y, Z, L, a, b);
-                        nprevl->L[ir][jr] =  L;
-                    }
-
-                delete tmpImage;
-
-            }
-
-        }
-
-        if ((WaveParams.ushamethod == "sharp" || WaveParams.ushamethod == "clari")  && WaveParams.expclari && WaveParams.CLmethod != "all") {
-            float mL = (float)(WaveParams.mergeL / 100.f);
-            float mC = (float)(WaveParams.mergeC / 100.f);
-            float mL0;
-            float mC0;
-            float background = 0.f;
-            int show = 0;
-
-
-
-            if ((WaveParams.CLmethod == "one" || WaveParams.CLmethod == "inf")  && WaveParams.Backmethod == "black") {
-                mL0 = mC0 = 0.f;
-                mL = - 1.5f * mL;
-                mC = -mC;
-                background = 12000.f;
-                show = 0;
-            } else if (WaveParams.CLmethod == "sup" && WaveParams.Backmethod == "resid") {
-                mL0 = mL;
-                mC0 = mC;
-                background = 0.f;
-                show = 0;
-            } else {
-                mL0 = mL = mC0 = mC = 0.f;
-                background = 0.f;
-                show = 0;
-            }
-
-            float indic = 1.f;
-
-            if (WaveParams.showmask) {
-                mL0 = mC0 = -1.f;
-                indic = -1.f;
-                mL = fabs(mL);
-                mC = fabs(mC);
-                show = 1;
-            }
-
-    #ifdef _OPENMP
-            #pragma omp parallel for
-    #endif
-
-            for (int x = 0; x < pH; x++)
-                for (int y = 0; y < pW; y++) {
-                    nprevl->L[x][y] = LIM((1.f + mL0) * (unshar->L[x][y]) + show * background - mL * indic * nprevl->L[x][y], 0.f, 32768.f);
-                    nprevl->a[x][y] = (1.f + mC0) * (unshar->a[x][y]) - mC * indic * nprevl->a[x][y];
-                    nprevl->b[x][y] = (1.f + mC0) * (unshar->b[x][y]) - mC * indic * nprevl->b[x][y];
-                }
-
-            delete unshar;
-            unshar    = NULL;
-
-
-            /*
-                                if (WaveParams.softrad > 0.f) {
-                                    array2D<float> ble(pW, pH);
-                                    array2D<float> guid(pW, pH);
-            #ifdef _OPENMP
-                                    #pragma omp parallel for
-            #endif
-
-                                    for (int ir = 0; ir < pH; ir++)
-                                        for (int jr = 0; jr < pW; jr++) {
-                                            ble[ir][jr] = (nprevl->L[ir][jr]  - provradius->L[ir][jr]) / 32768.f;
-                                            guid[ir][jr] = provradius->L[ir][jr] / 32768.f;
-                                        }
-                                    double epsilmax = 0.001;
-                                    double epsilmin = 0.0001;
-                                    double aepsil = (epsilmax - epsilmin) / 90.f;
-                                    double bepsil = epsilmax - 100.f * aepsil;
-                                    double epsil = aepsil * WaveParams.softrad + bepsil;
-
-                                    float blur = 10.f / scale * (0.001f + 0.8f * WaveParams.softrad);
-                                    // rtengine::guidedFilter(guid, ble, ble, blur, 0.001, multiTh);
-                                    rtengine::guidedFilter(guid, ble, ble, blur, epsil, false);
-
-
-
-            #ifdef _OPENMP
-                                    #pragma omp parallel for
-            #endif
-
-                                    for (int ir = 0; ir < pH; ir++)
-                                        for (int jr = 0; jr < pW; jr++) {
-                                            nprevl->L[ir][jr] =  provradius->L[ir][jr] + 32768.f * ble[ir][jr];
-                                        }
-                                }
-            */
-            if (WaveParams.softrad > 0.f) {
-
-                delete provradius;
-                provradius    = NULL;
-
-            }
-
-
-        }
-
-    }
+    stage::LabWaveletBodyOptions options;
+    options.scale = scale;
+    options.kall = 0;
+    options.wavclCurve = &wavclCurve;
+    options.runAfterCbdl = false;
+    options.allowShowMask = true;
+    stage::labWaveletHostBlock(ipf, *params, *nprevl, options);
 }
 
 /* working.trc: soft light, the working TRC and the preservation pass. */
@@ -3728,245 +3521,12 @@ void ImProcCoordinator::stageWorkingTrc(PreviewPassState& pass)
         return;
     }
 
-    ipf.softLight(nprevl, params->softlight);
-
-
-    if (params->icm.workingTRC != ColorManagementParams::WorkingTrc::NONE && params->icm.trcExp) {
-        const int GW = nprevl->W;
-        const int GH = nprevl->H;
-        std::unique_ptr<LabImage> provis;
-        const float pres = 0.01f * params->icm.preser;
-        if(params->icm.trcExp) {//local contrast
-            int level_hr = 7;
-            int maxlevpo = 9;
-            bool wavcurvecont = false;
-            WaveletParams WaveParams = params->wavelet;
-            ColorManagementParams Colparams = params->icm;
-            Colparams.getCurves(icmOpacityCurveWL);
-            ipf.complete_local_contrast(nprevl, nprevl, WaveParams,Colparams, icmOpacityCurveWL, scale, level_hr, maxlevpo, wavcurvecont);
-        }
-
-        if (pres > 0.f && params->icm.wprim != ColorManagementParams::Primaries::DEFAULT) {
-            provis.reset(new LabImage(GW, GH));
-            provis->CopyFrom(nprevl);
-        }
-
-        std::unique_ptr<Imagefloat> tmpImage1(new Imagefloat(GW, GH));
-        std::unique_ptr<Imagefloat> tmpImage2(new Imagefloat(GW, GH));
-
-
-
-        ipf.lab2rgb(*nprevl, *tmpImage1, params->icm.workingProfile);
-        tmpImage1.get()->copyData(tmpImage2.get());
-
-        const float gamtone = params->icm.wGamma;
-        const float slotone = params->icm.wSlope;
-        int illum = toUnderlying(params->icm.will);
-        const int prim = toUnderlying(params->icm.wprim);
-
-        Glib::ustring prof = params->icm.workingProfile;
-
-        cmsHTRANSFORM dummy = nullptr;
-        int ill = 0;
-        bool gamutcontrol = params->icm.gamut;
-        int catc = toUnderlying(params->icm.wcat);
-        int locprim = 0;
-        float rdx, rdy, grx, gry, blx, bly = 0.f;
-        float meanx, meany, meanxe, meanye, maxdat = 0.f;
-        const int midton = params->icm.wmidtcie;
-        if(midton != 0) {
-            ToneEqualizerParams params;
-            params.enabled = true;
-            params.regularization = 0.f;
-            params.pivot = 0.f;
-            params.bands[0] = 0;
-            params.bands[2] = midton;
-            params.bands[4] = 0;
-            params.bands[5] = 0;
-            int mid = abs(midton);
-            int threshmid = 50;
-            if(mid > threshmid) {
-                params.bands[1] = sign(midton) * (mid - threshmid);
-                params.bands[3] = sign(midton) * (mid - threshmid);
-            }
-            ipf.toneEqualizer(tmpImage1.get(), params, prof, scale, false);
-        }
-        double p[6] = {0., 0., 0., 0., 0., 0.};
-
-        ipf.workingtrc(0, tmpImage1.get(), tmpImage1.get(), GW, GH, -5, prof, 2.4, 12.92310, 0, ill, 0, 0,  rdx, rdy, grx, gry, blx, bly, meanx, meany, meanxe, meanye, maxdat,  p, dummy, true, false, false, false);
-        ipf.workingtrc(0, tmpImage1.get(), tmpImage1.get(), GW, GH, 5, prof, gamtone, slotone, catc, illum, prim, locprim,  rdx, rdy, grx, gry, blx, bly, meanx, meany, meanxe, meanye, maxdat, p, dummy, false, true, true, gamutcontrol);
-        float satu = params->icm.wapsat;
-        if(satu > 0.f) {
-            ipf.apsatur(0, tmpImage1.get(), tmpImage2.get(), GW, GH, satu) ;
-        }
-
-        const float smoothisli = params->icm.wsmoothciesli;
-        if(smoothisli > 0.f) {
-            ToneEqualizerParams params;
-            params.enabled = true;
-            params.regularization = 0.f;
-            params.pivot = 0.f;
-            params.bands[0] = 0;
-            params.bands[1] = 0;
-            params.bands[2] = 0;
-            params.bands[3] = 0;
-            params.bands[4] = -40;//arbitrary value to adapt with WhiteEvjz - here White Ev # 10
-            params.bands[5] = -80;//8 Ev and above
-            bool Evsix = true;
-            if(Evsix) {//EV = 6 majority of images
-                params.bands[4] = -30 * smoothisli;
-                float smmothsli5 = std::min(smoothisli, 1.f);
-                params.bands[5] = -80 * smmothsli5;
-            }
-            ipf.toneEqualizer(tmpImage1.get(), params, prof, scale, false);
-        }
-
-        float maxdata = 0.f;
-    #ifdef _OPENMP
-    #   pragma omp parallel for reduction(max:maxdata)
-    #endif
-        for (int i = 0; i < GH; ++i){
-            for (int j = 0; j < GW; ++j) {
-                const float r = tmpImage1->r(i, j);
-                const float g = tmpImage1->g(i, j);
-                const float b = tmpImage1->b(i, j);
-                float maxrgb2 = rtengine::max(r, g, b);
-                if(maxrgb2 > maxdata){
-                    maxdata = maxrgb2;
-                }
-            }
-        }
-        maxdat = maxdata / 65535.f;
-
-        if (primListener) {
-            primListener->maxdatawtrc(maxdat);
-        }
-
-        ipf.rgb2lab(*tmpImage1, *nprevl, params->icm.workingProfile);
-
-        //nprevl and provis
-        if (provis) {
-            ipf.preserv(nprevl, provis.get(), GW, GH);
-        }
-
-        if (params->icm.fbw) {
-    #ifdef _OPENMP
-            #pragma omp parallel for
-    #endif
-
-            for (int x = 0; x < GH; x++)
-                for (int y = 0; y < GW; y++) {
-                    nprevl->a[x][y] = 0.f;
-                    nprevl->b[x][y] = 0.f;
-                }
-        }
-
-        tmpImage1.reset();
-
-        if (prim == 14) {//pass red gre blue xy in function of area data Ciexy  - prim = 14 correspond to ColorManagementParams::Primaries::CUSTOM_GRID
-            float redgraphx =  params->icm.labgridcieALow;
-            float redgraphy =  params->icm.labgridcieBLow;
-            float blugraphx =  params->icm.labgridcieAHigh;
-            float blugraphy =  params->icm.labgridcieBHigh;
-            float gregraphx =  params->icm.labgridcieGx;
-            float gregraphy =  params->icm.labgridcieGy;
-            constexpr float INV_OFFSET_MODIFIER = 1.f / OFFSET_MODIFIER;
-            float redxx = INV_OFFSET_MODIFIER * (redgraphx + 1.f) - CIExy_MARGIN;
-            redxx = rtengine::LIM(redxx, 0.41f, 1.f);
-            float redyy = INV_OFFSET_MODIFIER * (redgraphy + 1.f) - CIExy_MARGIN;
-            redyy = rtengine::LIM(redyy, 0.f, 0.7f);
-            float bluxx = INV_OFFSET_MODIFIER * (blugraphx + 1.f) - CIExy_MARGIN;
-            bluxx = rtengine::LIM(bluxx, -0.1f, 0.5f);
-            float bluyy = INV_OFFSET_MODIFIER * (blugraphy + 1.f) - CIExy_MARGIN;
-            bluyy = rtengine::LIM(bluyy, -0.1f, 0.5f);
-            float grexx = INV_OFFSET_MODIFIER * (gregraphx + 1.f) - CIExy_MARGIN;
-            grexx = rtengine::LIM(grexx, -0.1f, 0.4f);
-            float greyy = INV_OFFSET_MODIFIER * (gregraphy + 1.f) - CIExy_MARGIN;
-            greyy = rtengine::LIM(greyy, 0.5f, 1.f);
-            if (primListener) {
-                primListener->primChanged(redxx, redyy, bluxx, bluyy, grexx, greyy);
-            }
-        } else {//all other cases - pass Cie xy to update graph Ciexy
-            float r_x =  params->icm.redx;
-            float r_y =  params->icm.redy;
-            float b_x =  params->icm.blux;
-            float b_y =  params->icm.bluy;
-            float g_x =  params->icm.grex;
-            float g_y =  params->icm.grey;
-            //printf("rx=%f ry=%f \n", (double) r_x, (double) r_y);
-            float wx = 0.33f;
-            float wy = 0.33f;
-
-            switch (illum) {
-                case 1://D41
-                    wx = 0.37798f;
-                    wy = 0.38123f;
-                    break;
-
-                case 2://D50
-                    wx = 0.3457f;
-                    wy = 0.3585f;
-                    break;
-
-                case 3://D55
-                    wx = 0.3324f;
-                    wy = 0.3474f;
-                    break;
-
-                case 4://D60
-                    wx = 0.3217f;
-                    wy = 0.3377f;
-                    break;
-
-                case 5://D65
-                    wx = 0.3127f;
-                    wy = 0.3290f;
-                    break;
-
-                case 6://D80
-                    wx = 0.2937f;
-                    wy = 0.3092f;
-                    break;
-
-                case 7://D120
-                    wx = 0.2697f;
-                    wy = 0.2808f;
-                    break;
-
-                case 8://stdA
-                    wx = 0.4476f;
-                    wy = 0.4074f;
-                    break;
-
-                case 9://2000K
-                    wx = 0.5266f;
-                    wy = 0.4133f;
-                    break;
-
-                case 10://1500K
-                    wx = 0.5857f;
-                    wy = 0.3932f;
-                    break;
-            }
-
-
-            //move white point in GUI
-            double refin = params->icm.refi;
-            double arefi = (wy - meany) / (wx - meanx);
-            double brefi = wy - arefi * wx;
-            double scalrefi = meanx - wx;
-            wx = wx + scalrefi * refin;
-            wy = wx * arefi + brefi;
-
-            if (primListener) {
-                if( params->icm.wprim != ColorManagementParams::Primaries::CUSTOM_POL) {
-                    primListener->iprimChanged(r_x, r_y, b_x, b_y, g_x, g_y, wx, wy, meanx, meany);
-                } else {
-                    primListener->iprimChanged(p[0], p[1], p[4] ,p[5], p[2], p[3], wx, wy, meanx, meany);
-                }
-            }
-        }
-    }
+    stage::WorkingTrcBodyOptions options;
+    options.scale = scale;
+    options.listener = primListener;
+    options.notifyMaxData = true;
+    options.notifyPrimaries = true;
+    stage::workingTrcHostBlock(ipf, *params, *nprevl, options);
 }
 
 /* ciecam: colour appearance and adaptation. */
@@ -4021,9 +3581,6 @@ void ImProcCoordinator::stageCieCam(PreviewPassState& pass)
             adap = 400.;
         }
 
-        float d, dj, yb;
-        bool execsharp = false;
-
         if (!ncie) {
             ncie = new CieImage(pW, pH);
         }
@@ -4036,82 +3593,29 @@ void ImProcCoordinator::stageCieCam(PreviewPassState& pass)
             CAMBrightCurveQ(32768, 0);
         }
 
-        // Issue 2785, only float version of ciecam02 for navigator and pan background
-        CAMMean = NAN;
         CAMBrightCurveJ.dirty = true;
         CAMBrightCurveQ.dirty = true;
 
-        ipf.ciecam_02float(ncie, float (adap), pW, 2, nprevl, params.get(), customColCurve1, customColCurvered, customColCurvegreen, customColCurveblue, customColCurve2, customColCurve3, histLCAM, histCCAM, CAMBrightCurveJ, CAMBrightCurveQ, CAMMean, 0, scale, execsharp, d, dj, yb, 1);
+        stage::CiecamBodyState state;
+        state.lab = nprevl;
+        state.cie = ncie;
+        state.histLCAM = &histLCAM;
+        state.histCCAM = &histCCAM;
+        state.camBrightJ = &CAMBrightCurveJ;
+        state.camBrightQ = &CAMBrightCurveQ;
+        state.camMean = &CAMMean;
 
-        //call listener
-        if ((params->colorappearance.autodegree || params->colorappearance.autodegreeout) && acListener && params->colorappearance.enabled) {
-            if (params->colorappearance.catmethod == "symg") { //force chromatic adaptation to 90 in symmetric
-                d = 0.9;
-                dj = 0.9;
-            }
-
-            acListener->autoCamChanged(100.* (double)d, 100.* (double)dj);
-        }
-
-        if (params->colorappearance.autoadapscen && acListener && params->colorappearance.enabled) {
-            acListener->adapCamChanged(adap);    //real value of adapt scene, force to 400 in symmetric
-        }
-
-        if (params->colorappearance.autoybscen && acListener && params->colorappearance.enabled) {
-            if (params->colorappearance.catmethod == "symg") { //force yb scene to 18 in symmetric
-                yb = 18;
-            }
-
-            acListener->ybCamChanged((int) yb);    //real value Yb scene
-        }
-
-        double tempsym = 5003.;
-        double greensym = 1.;
-        int wmodel = 0;//wmodel allows - arbitrary - choice of illuminant and temp with choice
-
-        if (params->colorappearance.wbmodel == "RawT") {
-            wmodel = 0;
-        } else if (params->colorappearance.wbmodel == "RawTCAT02") {
-            wmodel = 1;
-        } else if (params->colorappearance.wbmodel == "free") {
-            wmodel = 2;//force white balance in symmetric
-        }
-
-        if (params->colorappearance.catmethod == "symg" && wmodel == 2) {
-            tempsym = params->wb.temperature;//force white balance in symmetric
-        } else if(params->colorappearance.autotempout) {
-            if (params->colorappearance.illum == "iA") {//otherwise force illuminant source
-                tempsym = 2856.;
-                greensym = 1.;
-            } else if (params->colorappearance.illum == "i41") {
-                tempsym = 4100.;
-                greensym = 1.;
-            } else if (params->colorappearance.illum == "i50") {
-                tempsym = 5003.;
-                greensym = 1.;
-            } else if (params->colorappearance.illum == "i55") {
-                tempsym = 5503.;
-            } else if (params->colorappearance.illum == "i60") {
-                tempsym = 6000. ;
-                greensym = 1.;
-            } else if (params->colorappearance.illum == "i65") {
-                tempsym = 6504.;
-                greensym = 1.;
-            } else if (params->colorappearance.illum == "i75") {
-                tempsym = 7504.;
-                greensym = 1.;
-            } else if (params->colorappearance.illum == "ifree") {
-                tempsym = params->wb.temperature;//force white balance in symmetric
-                greensym = 1.;
-            }
-        } else {
-            tempsym = params->colorappearance.tempout;
-            greensym = params->colorappearance.greenout;
-        }
-        if (params->colorappearance.enabled  && acListener) {
-            acListener->wbCamChanged(tempsym, greensym, params->colorappearance.autotempout);    //real temp and tint.
-        }
-
+        stage::CiecamBodyOptions options;
+        options.widthArg = pW;
+        options.scaleArg = scale;
+        options.execsharp = false;
+        options.resetMean = true;
+        options.notify = true;
+        stage::ciecamBody(ipf, *params, static_cast<float>(adap),
+                          customColCurve1, customColCurvered,
+                          customColCurvegreen, customColCurveblue,
+                          customColCurve2, customColCurve3, state, options,
+                          acListener);
     } else {
         // CIECAM is disabled, we free up its image buffer to save some space
         if (ncie) {
@@ -4138,104 +3642,21 @@ void ImProcCoordinator::stageGamut(PreviewPassState& pass)
         return;
     }
 
-    bool exec = params->icm.wgamut != ColorManagementParams::Wwgamut::NONE  || params->icm.wgamgain != 0.f;
+    const bool exec = params->icm.wgamut != ColorManagementParams::Wwgamut::NONE
+                      || params->icm.wgamgain != 0.f;
     bool gamgain = false;
     float maxdatend = 0.f;
     float satdatend = 0.f;
 
-    if (params->icm.workingTRC != ColorManagementParams::WorkingTrc::NONE && params->icm.trcExp  && exec) {
-        //compression gamut and gain at the end of process
+    if (params->icm.workingTRC != ColorManagementParams::WorkingTrc::NONE
+        && params->icm.trcExp && exec) {
         gamgain = true;
-
-        const int GW = nprevl->W;
-        const int GH = nprevl->H;
-        TMatrix wprof = ICCStore::getInstance()->workingSpaceMatrix(params->icm.workingProfile);
-            const double wp[3][3] = {
-                {wprof[0][0], wprof[0][1], wprof[0][2]},
-                {wprof[1][0], wprof[1][1], wprof[1][2]},
-                {wprof[2][0], wprof[2][1], wprof[2][2]}
-            };
-        TMatrix wiprof = ICCStore::getInstance()->workingSpaceInverseMatrix(params->icm.workingProfile);
-            const double wip[3][3] = {//improve precision with double
-                {wiprof[0][0], wiprof[0][1], wiprof[0][2]},
-                {wiprof[1][0], wiprof[1][1], wiprof[1][2]},
-                {wiprof[2][0], wiprof[2][1], wiprof[2][2]}
-            };
-
-        std::unique_ptr<Imagefloat> provcomp(new Imagefloat(GW, GH));
-
-    #ifdef _OPENMP
-    #   pragma omp parallel for
-    #endif
-        for (int i = 0; i < GH; ++i){
-            for (int j = 0; j < GW; ++j) {
-                float X, Y, Z = 0.f;
-                Color::Lab2XYZ(nprevl->L[i][j], nprevl->a[i][j], nprevl->b[i][j] , X, Y, Z);
-                Color::xyz2rgb(X, Y, Z, provcomp->r(i, j), provcomp->g(i, j), provcomp->b(i, j), wip);
-            }
-        }
-
-        const float gainev = pow_F(2.f, (float) params->icm.wgamgain);
-        if (params->icm.wgamgain != 0.f) {//Final gain in Ev
-    #ifdef _OPENMP
-    #   pragma omp parallel for
-    #endif
-
-            for (int i = 0; i < GH; ++i){
-                for (int j = 0; j < GW; ++j) {
-                    provcomp->r(i, j) *= gainev;
-                    provcomp->g(i, j) *= gainev;
-                    provcomp->b(i, j) *= gainev;
-                }
-            }
-        }
-        float mac = 0.f;
-        float mac0 = 0.f;
-        float mac1 = 0.f;
-        float mac2 = 0.f;
-        int beginend = 1;
-        int nbsegam = 0;
-        float powe = 1.f;
-        if ( params->icm.wgamut != ColorManagementParams::Wwgamut::NONE) {
-            ipf.gamutcompr(provcomp.get(), provcomp.get(), beginend, powe, nbsegam, mac, mac0, mac1, mac2);
-        }
-
-        float rgbmax = 0.f;
-        float satmax = 0.f;
-    #ifdef _OPENMP
-    #   pragma omp parallel for reduction(max:rgbmax) reduction(max:satmax)
-    #endif
-        for (int i = 0; i < GH; ++i){
-            for (int j = 0; j < GW; ++j) {
-                const float r = provcomp->r(i, j);
-                const float g = provcomp->g(i, j);
-                const float b = provcomp->b(i, j);
-                float maxrgbend = rtengine::max(r, g, b);
-                if(maxrgbend> rgbmax){//RGB Max
-                    rgbmax = maxrgbend;
-                }
-                float h, s, l = 0.f;
-                Color::rgb2hsl(r, g, b, h, s, l);
-                float maxsatend = s;
-                if(maxsatend> satmax){//Saturation max
-                    satmax = maxsatend;
-                }
-            }
-        }
-        maxdatend = rgbmax / 65535.f;
-        satdatend = satmax;
-
-    #ifdef _OPENMP
-    #   pragma omp parallel for
-    #endif
-        for (int i = 0; i < GH; ++i){
-            for (int j = 0; j < GW; ++j) {
-                float x, y, z = 0.f;
-                Color::rgbxyz (provcomp->r(i, j), provcomp->g(i, j), provcomp->b(i, j), x, y, z, wp);
-                Color::XYZ2Lab(x, y, z, nprevl->L[i][j], nprevl->a[i][j], nprevl->b[i][j]);
-            }
-        }
+        stage::GamutBodyResult result;
+        stage::gamutHostBlock(ipf, *params, *nprevl, true, &result);
+        maxdatend = result.maxRgb;
+        satdatend = result.maxSat;
     }
+
     if (primListener) {
         primListener->maxdataend(maxdatend, satdatend, gamgain);
     }

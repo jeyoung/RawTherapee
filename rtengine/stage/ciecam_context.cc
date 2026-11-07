@@ -32,12 +32,15 @@
 #include "opthelper.h"
 #include "procparams.h"
 #include "rt_math.h"
+#include "rtengine.h"
 #include "settings.h"
 
 #include <algorithm>
+#include <cassert>
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <memory>
 
 namespace rtengine::stage
 {
@@ -180,20 +183,143 @@ void ciecamHostBlock(ImProcFunctions& ipf,
         return;
     }
 
-    CieImage cieView(lab.W, lab.H);
     LUTu dummyJ;
     LUTu dummyC;
     LUTf camBrightJ;
     LUTf camBrightQ;
     float mean = NAN;
-    float d = 0.f;
-    float dj = 0.f;
-    float yb = 0.f;
-    ipf.ciecam_02float(&cieView, adap, 1, 2, &lab, &params, customColCurve1,
-                       customColCurvered, customColCurvegreen,
-                       customColCurveblue, customColCurve2, customColCurve3,
-                       dummyJ, dummyC, camBrightJ, camBrightQ, mean, 0, 1,
-                       true, d, dj, yb, 1);
+
+    CiecamBodyState state;
+    state.lab = &lab;
+    state.histLCAM = &dummyJ;
+    state.histCCAM = &dummyC;
+    state.camBrightJ = &camBrightJ;
+    state.camBrightQ = &camBrightQ;
+    state.camMean = &mean;
+
+    CiecamBodyOptions options;
+    options.widthArg = 1;
+    options.scaleArg = 1;
+    options.execsharp = true;
+    options.resetMean = true;
+    ciecamBody(ipf, params, adap, customColCurve1, customColCurvered,
+               customColCurvegreen, customColCurveblue, customColCurve2,
+               customColCurve3, state, options, nullptr);
+}
+
+void ciecamBody(ImProcFunctions& ipf, const procparams::ProcParams& params,
+                float adap, const ColorAppearance& customColCurve1,
+                const ColorAppearance& customColCurvered,
+                const ColorAppearance& customColCurvegreen,
+                const ColorAppearance& customColCurveblue,
+                const ColorAppearance& customColCurve2,
+                const ColorAppearance& customColCurve3,
+                CiecamBodyState& state, const CiecamBodyOptions& options,
+                AutoCamListener* listener)
+{
+    assert(state.lab != nullptr);
+    assert(state.histLCAM != nullptr);
+    assert(state.histCCAM != nullptr);
+    assert(state.camBrightJ != nullptr);
+    assert(state.camBrightQ != nullptr);
+    assert(state.camMean != nullptr);
+
+    std::unique_ptr<CieImage> owned;
+    CieImage* cie = state.cie;
+    if (cie == nullptr) {
+        owned.reset(new CieImage(state.lab->W, state.lab->H));
+        cie = owned.get();
+    }
+
+    if (options.resetMean) {
+        *state.camMean = NAN;
+    }
+
+    ipf.ciecam_02float(cie, adap, options.widthArg, 2, state.lab, &params,
+                       customColCurve1, customColCurvered,
+                       customColCurvegreen, customColCurveblue,
+                       customColCurve2, customColCurve3, *state.histLCAM,
+                       *state.histCCAM, *state.camBrightJ, *state.camBrightQ,
+                       *state.camMean, 0, options.scaleArg, options.execsharp,
+                       state.d, state.dj, state.yb, 1,
+                       options.showSharpMask);
+
+    if (!options.notify || listener == nullptr) {
+        return;
+    }
+
+    if ((params.colorappearance.autodegree
+            || params.colorappearance.autodegreeout)
+        && params.colorappearance.enabled) {
+        float d = state.d;
+        float dj = state.dj;
+        if (params.colorappearance.catmethod == "symg") {
+            d = 0.9f;
+            dj = 0.9f;
+        }
+        listener->autoCamChanged(100. * static_cast<double>(d),
+                                 100. * static_cast<double>(dj));
+    }
+
+    if (params.colorappearance.autoadapscen
+        && params.colorappearance.enabled) {
+        listener->adapCamChanged(adap);
+    }
+
+    if (params.colorappearance.autoybscen && params.colorappearance.enabled) {
+        const int yb = params.colorappearance.catmethod == "symg"
+                           ? 18
+                           : static_cast<int>(state.yb);
+        listener->ybCamChanged(yb);
+    }
+
+    double tempsym = 5003.;
+    double greensym = 1.;
+    int wmodel = 0;
+    if (params.colorappearance.wbmodel == "RawT") {
+        wmodel = 0;
+    } else if (params.colorappearance.wbmodel == "RawTCAT02") {
+        wmodel = 1;
+    } else if (params.colorappearance.wbmodel == "free") {
+        wmodel = 2;
+    }
+
+    if (params.colorappearance.catmethod == "symg" && wmodel == 2) {
+        tempsym = params.wb.temperature;
+    } else if (params.colorappearance.autotempout) {
+        if (params.colorappearance.illum == "iA") {
+            tempsym = 2856.;
+            greensym = 1.;
+        } else if (params.colorappearance.illum == "i41") {
+            tempsym = 4100.;
+            greensym = 1.;
+        } else if (params.colorappearance.illum == "i50") {
+            tempsym = 5003.;
+            greensym = 1.;
+        } else if (params.colorappearance.illum == "i55") {
+            tempsym = 5503.;
+        } else if (params.colorappearance.illum == "i60") {
+            tempsym = 6000.;
+            greensym = 1.;
+        } else if (params.colorappearance.illum == "i65") {
+            tempsym = 6504.;
+            greensym = 1.;
+        } else if (params.colorappearance.illum == "i75") {
+            tempsym = 7504.;
+            greensym = 1.;
+        } else if (params.colorappearance.illum == "ifree") {
+            tempsym = params.wb.temperature;
+            greensym = 1.;
+        }
+    } else {
+        tempsym = params.colorappearance.tempout;
+        greensym = params.colorappearance.greenout;
+    }
+
+    if (params.colorappearance.enabled) {
+        listener->wbCamChanged(tempsym, greensym,
+                               params.colorappearance.autotempout);
+    }
 }
 
 CiecamContext::CiecamContext(
