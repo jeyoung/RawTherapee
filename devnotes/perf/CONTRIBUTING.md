@@ -5,6 +5,9 @@ against `perf-graph`, not as direct pushes. The branch is protected: force
 pushes and direct pushes by collaborators are blocked, linear history is
 required, and one approving review is required.
 
+Do not read `devnotes/perf/deprecated/` unless the user explicitly asks for an
+historical investigation.
+
 ## Claiming and dropping work
 
 - **Before starting**, comment `claiming #<issue>` and assign the issue to
