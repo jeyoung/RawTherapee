@@ -8,11 +8,11 @@ contains only current evidence; earlier packages, commits and matrices are in
 ## Artefact
 
 ```
-rawtherapee-graph-5.13-799-g4c690a041_5.13+git13820.4c690a041-1_amd64.deb
-sha256 0c92105cd6f8a5f2a7361f4074a35bb9a805fe681ab449bcbd976c88ee7413c3
+rawtherapee-graph-5.13-801-gd6f5ef1f6_5.13+git13822.d6f5ef1f6-1_amd64.deb
+sha256 9e1905b398185d0b200dee41dcf4cd83f2550557442bb5ac80d7a89205ee7c13
 ```
 
-Built 2026-11-07 from `4c690a041` with `tools/build-rt.sh portable`. The host
+Built 2026-11-07 from `d6f5ef1f6` with `tools/build-rt.sh portable`. The host
 reference is the same commit in `build/cpu-perf-graph`; the StagePlan,
 coverage and typed-refusal changes preserve valid-path pixel output. The export reference
 must use the packaged data directory: the install adds the `options` file and
@@ -63,7 +63,7 @@ installation and export.
 
 ## Test suite
 
-The full suite `arch2-suite` ran at `4c690a041` on `build/cpu-perf-graph` and
+The full suite `arch2-suite2` ran at `d6f5ef1f6` on `build/cpu-perf-graph` and
 reported `PASS`, `failures: 0`. The StagePlan, contract-coverage and typed-
 refusal changes are covered by `stage-plan-test`, `stage-pipeline-test`,
 `stage-device-test` and `stage-residency-test`;

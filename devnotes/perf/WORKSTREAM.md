@@ -13,9 +13,9 @@ progress log is in
 | Item | Value |
 |---|---|
 | Repository | `$REPO` |
-| Branch | `perf-graph`, tip `4c690a041` |
-| Worktree | main checkout, clean, 23 commits ahead of `origin/perf-graph` |
-| Latest code change | `4c690a041` (StagePlan, contract coverage, typed refusals); later commits are documentation and package records |
+| Branch | `perf-graph`, tip `d6f5ef1f6` |
+| Worktree | main checkout, clean, 24 commits ahead of `origin/perf-graph` |
+| Latest code change | `d6f5ef1f6` (StagePlan, contract coverage, typed refusals and fail-closed preview planning); later commits are documentation and package records |
 | Build trees | `build/cpu-perf-graph`, `build/opencl-perf-graph` (GCC, Release, generic target) |
 | Baseline | `dev` `9c3426339` plus the AMaZE source patch from `2ebf08b0f`, branch `dev-amaze`, build `build/cpu-dev-amaze` |
 | Test corpus | public 10.2 MP PEF; 45.7 MP NEF; TIFF and JPEG generated from the PEF |
@@ -28,11 +28,11 @@ or the POCL environment wrapper.
 ## Current package
 
 ```
-build/portable/rawtherapee-graph-5.13-799-g4c690a041_5.13+git13820.4c690a041-1_amd64.deb
-sha256 0c92105cd6f8a5f2a7361f4074a35bb9a805fe681ab449bcbd976c88ee7413c3
+build/portable/rawtherapee-graph-5.13-801-gd6f5ef1f6_5.13+git13822.d6f5ef1f6-1_amd64.deb
+sha256 9e1905b398185d0b200dee41dcf4cd83f2550557442bb5ac80d7a89205ee7c13
 ```
 
-Built 2026-11-07 from `4c690a041` with `tools/build-rt.sh portable`. Validated
+Built 2026-11-07 from `d6f5ef1f6` with `tools/build-rt.sh portable`. Validated
 in fresh Debian 12 and Debian 13 containers: install, `--list-formats` (36
 entries), a neutral 16-bit export identical to the host CLI (AE=0, 0 of
 30,419,712 samples), and a GUI smoke test under Xvfb (20 s timeout, exit 124).
