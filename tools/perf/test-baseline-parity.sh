@@ -3,15 +3,13 @@
 #
 # Usage:
 #   tools/perf/test-baseline-parity.sh \
-#       --baseline-dir build/cpu-dev \
+#       --baseline-dir build/cpu-dev-amaze \
 #       --candidate-dir build/cpu-perf-graph \
 #       --image build/rt-testdata/colorspace_flowers.pef \
 #       [--report DIR] [--rtdata DIR]
 #
-# The VNG4, MONO and composed-profile rows must be pixel-exact (AE=0). The
-# default neutral AMaZE row is KNOWN only when both VNG4 and MONO are exact and
-# every differing sample lies within the AMaZE tile halo of a tile boundary or
-# the image edge. Any other result is FAIL, and a FAIL makes the script exit
+# The VNG4, MONO, composed-profile and default neutral AMaZE rows must all be
+# pixel-exact (AE=0). Any difference is FAIL, and a FAIL makes the script exit
 # non-zero.
 #
 # Both CLIs run with OMP_NUM_THREADS=1, --gpu=off and separate settings/cache.
@@ -44,7 +42,7 @@ while [ "$#" -gt 0 ]; do
         --image) image="$2"; shift 2 ;;
         --report) report="$2"; shift 2 ;;
         --rtdata) rtdata="$2"; shift 2 ;;
-        -h|--help) sed -n '2,23p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,21p' "$0"; exit 0 ;;
         *) usage_error "unknown option: $1" ;;
     esac
 done
@@ -114,22 +112,6 @@ ParseExtensions=$image_ext;
 ParseExtensionsEnabled=1;
 EOF
 done
-
-# AMaZE runs in square tiles; the scratch reuse fix changes samples near the
-# tile edges. AMAZETS is defined in rtengine/amaze_demosaic_RT.cc and the halo
-# is the 16-pixel border each tile adds on every side. The stride is the tile
-# advance. A differing sample is accepted only within the halo of a stride
-# boundary or the right/bottom image edge.
-amaze_ts="$(sed -n 's/^#define AMAZETS \([0-9][0-9]*\)$/\1/p' \
-    "$ROOT/rtengine/amaze_demosaic_RT.cc" | head -n 1)"
-[ -n "$amaze_ts" ] || die "cannot read AMAZETS from rtengine/amaze_demosaic_RT.cc"
-amaze_halo=16
-amaze_stride=$((amaze_ts - 2 * amaze_halo))
-# The known AMaZE scratch-fix difference is bounded: at most 64 LSB16 and
-# 1024 channel samples, all within the tile halo. Anything larger is a
-# regression, not the known exception.
-amaze_max_lsb=64
-amaze_max_samples=1024
 
 # ------------------------------------------------------------------ profiles
 cat >"$report/profiles/vng4-neutral.pp3" <<'EOF'
@@ -210,67 +192,6 @@ compare_pair() {
     python3 -B "$compare_tiff" "$1" "$2" --bits 16 2>"$3"
 }
 
-# classify_amaze A B MAX DIFFERING TOTAL
-# Prints: pixels samples outside allowed
-classify_amaze() {
-    python3 -B - "$ROOT" "$1" "$2" "$amaze_stride" "$amaze_halo" \
-        "$amaze_max_lsb" "$amaze_max_samples" "$3" "$4" "$5" <<'PY'
-import os
-import sys
-
-import numpy as np
-
-root, a_path, b_path, stride, halo, max_lsb, max_samples, reported_max, \
-    reported_differing, reported_total = sys.argv[1:]
-sys.path.insert(0, os.path.join(root, "tools", "opencl"))
-from compare_tiff import TiffReader  # noqa: E402
-
-stride = int(stride)
-halo = int(halo)
-max_lsb = int(max_lsb)
-max_samples = int(max_samples)
-reported_max = int(reported_max)
-reported_differing = int(reported_differing)
-reported_total = int(reported_total)
-
-a = TiffReader(a_path)
-b = TiffReader(b_path)
-try:
-    pixels = 0
-    samples = 0
-    outside = 0
-    observed_max = 0
-    for y in range(0, a.height, 256):
-        count = min(256, a.height - y)
-        left = a.rows(y, count).astype(np.int32).reshape(
-            count, a.width, a.samples)
-        right = b.rows(y, count).astype(np.int32).reshape(
-            count, a.width, a.samples)
-        difference = np.abs(left - right)
-        observed_max = max(observed_max, int(difference.max()))
-        samples += int((difference > 0).sum())
-        ys, xs = np.nonzero(difference.max(axis=2))
-        for yy, xx in zip(ys, xs):
-            yy = int(y + yy)
-            xx = int(xx)
-            pixels += 1
-            dx = min(xx % stride, stride - (xx % stride), a.width - 1 - xx)
-            dy = min(yy % stride, stride - (yy % stride), a.height - 1 - yy)
-            if min(dx, dy) > halo:
-                outside += 1
-finally:
-    a.close()
-    b.close()
-
-consistent = (observed_max == reported_max
-              and samples == reported_differing
-              and a.width * a.height * a.samples == reported_total)
-allowed = (consistent and outside == 0 and samples <= max_samples
-           and observed_max <= max_lsb)
-print(pixels, samples, outside, int(allowed))
-PY
-}
-
 # ---------------------------------------------------------------------- rows
 rows="$report/rows.tsv"
 : >"$rows"
@@ -307,11 +228,10 @@ exact_row() {
         return
     fi
 
-    local max differing total
+    local max differing
     set -- $result
     max="$1"
     differing="$3"
-    total="$4"
 
     if [ "$max" -eq 0 ] && [ "$differing" -eq 0 ]; then
         record "$name" PASS "$max" "$differing"
@@ -319,13 +239,7 @@ exact_row() {
         record "$name" FAIL "$max" "$differing"
         failures=$((failures + 1))
     fi
-    # Expose the exact counts to the AMaZE classification below.
-    if [ "$name" = "vng4-neutral" ]; then vng4_differing="$differing"; fi
-    if [ "$name" = "mono-neutral" ]; then mono_differing="$differing"; fi
 }
-
-vng4_differing=""
-mono_differing=""
 
 info "baseline parity: $(basename "$image")"
 info "baseline  $baseline_cli"
@@ -338,65 +252,8 @@ exact_row vng4-sharpen-usm "$report/profiles/vng4-sharpen-usm.pp3"
 exact_row vng4-rotate "$report/profiles/vng4-rotate.pp3"
 exact_row vng4-crop "$report/profiles/vng4-crop.pp3"
 
-# Default neutral profile: AMaZE. The known scratch-initialization difference
-# is accepted only on the isolation evidence above and at tile boundaries.
-name="amaze-default"
-base="$report/tiff/baseline-$name.tif"
-cand="$report/tiff/candidate-$name.tif"
-log="$report/logs/compare-$name.log"
-amaze_note=""
-if ! export_row baseline "$baseline_dir" "" "$base" \
-    || ! export_row candidate "$candidate_dir" "" "$cand"; then
-    record "$name" FAIL "-" "-"
-    failures=$((failures + 1))
-else
-    result=""
-    rc=0
-    if result="$(compare_pair "$base" "$cand" "$log")"; then
-        rc=0
-    else
-        rc=$?
-    fi
-    if [ "$rc" -gt 1 ] || [ -z "$result" ]; then
-        record "$name" FAIL "-" "-"
-        failures=$((failures + 1))
-    else
-        set -- $result
-        max="$1"
-        differing="$3"
-        total="$4"
-        if [ "$max" -eq 0 ] && [ "$differing" -eq 0 ]; then
-            record "$name" PASS "$max" "$differing"
-        elif [ "${vng4_differing:-1}" -eq 0 ] \
-            && [ "${mono_differing:-1}" -eq 0 ]; then
-            if analysis="$(classify_amaze "$base" "$cand" "$max" \
-                "$differing" "$total" 2>>"$log")"; then
-                read -r pixels samples outside allowed <<<"$analysis"
-                amaze_note="$pixels differing pixels, $samples samples, "
-                amaze_note+="$outside outside the ${amaze_halo}px halo of the "
-                amaze_note+="${amaze_stride}px tile stride, "
-                amaze_note+="limits ${amaze_max_lsb} LSB16 / "
-                amaze_note+="${amaze_max_samples} samples"
-                if [ "$allowed" -eq 1 ]; then
-                    record "$name" KNOWN "$max" "$differing"
-                    amaze_note="KNOWN: $amaze_note"
-                else
-                    record "$name" FAIL "$max" "$differing"
-                    failures=$((failures + 1))
-                    amaze_note="FAIL: $amaze_note"
-                fi
-            else
-                record "$name" FAIL "$max" "$differing"
-                failures=$((failures + 1))
-                amaze_note="FAIL: tile-boundary analysis failed (see $log)"
-            fi
-        else
-            record "$name" FAIL "$max" "$differing"
-            failures=$((failures + 1))
-            amaze_note="FAIL: VNG4/MONO isolation rows are not exact"
-        fi
-    fi
-fi
+# Default neutral profile: AMaZE.
+exact_row amaze-default ""
 
 # -------------------------------------------------------------------- report
 printf '\n%-22s %-6s %9s %14s\n' "row" "status" "max LSB" "differing"
@@ -404,9 +261,6 @@ printf -- '---------------------------------------------------------------------
 while IFS=$'\t' read -r row_name status max differing; do
     printf '%-22s %-6s %9s %14s\n' "$row_name" "$status" "$max" "$differing"
 done <"$rows"
-if [ -n "$amaze_note" ]; then
-    printf '\n%s\n' "$amaze_note"
-fi
 printf '\nreport: %s\n' "$report"
 
 if [ "$failures" -ne 0 ]; then

@@ -7,13 +7,14 @@ the current RawTherapee baseline in `dev`, not only against the same commit.
 
 | Item | Value |
 |---|---|
-| Baseline branch | `dev` |
+| Baseline branch | `dev-amaze` (created from `dev`) |
 | Baseline commit | `9c3426339` (`opencl: #0: benchmark ROCm gfx1200 against the CPU path`) |
-| Baseline source | `.worktrees/dev-baseline` |
-| Baseline build | `build/cpu-dev` |
-| Baseline CLI | `build/cpu-dev/rtgui/rawtherapee-cli` (`dev` has no graph CLI) |
+| Baseline patch | `2ebf08b0f` (`perf: #0: reset AMaZE scratch before every tile`), applied to `rtengine/amaze_demosaic.h` (new) and `rtengine/amaze_demosaic_RT.cc` only |
+| Baseline source | `.worktrees/dev-amaze` |
+| Baseline build | `build/cpu-dev-amaze` |
+| Baseline CLI | `build/cpu-dev-amaze/rtgui/rawtherapee-cli` (the corrected baseline has no graph CLI) |
 | Candidate branch | `perf-graph` |
-| Candidate commit | `1098f658f` at the time of the run |
+| Candidate commit | `17a5995c5` at the time of the run |
 | Candidate build | `build/cpu-perf-graph` |
 | Data | `rtdata` bound to both `/usr/local/share/rawtherapee` and `/usr/local/share/rawtherapee-graph` |
 | Threads | `OMP_NUM_THREADS=1` |
@@ -22,6 +23,13 @@ the current RawTherapee baseline in `dev`, not only against the same commit.
 
 The binaries were run under `bwrap` with both data paths bound to the same
 `rtdata`, so a data-directory difference cannot explain a pixel difference.
+
+The cherry-pick of `2ebf08b0f` conflicted on `.github/workflows/perf-graph.yml`
+(absent from `dev`) and `rtengine/CMakeLists.txt`. Only the two source files
+above were taken from that commit; the workflow, the CMake test-target wiring
+and `rtengine/tests/amaze_tile_parity_test.cc` were not applied. The corrected
+baseline therefore builds the same engine change without the graph-workstream
+test target.
 
 ## Exact results
 
@@ -35,38 +43,39 @@ All exports are uncompressed 16-bit TIFF, compared with
 | `colorspace_flowers.pef` | VNG4 + `sharpen-usm.pp3` | 0 | 0 | PASS |
 | `colorspace_flowers.pef` | VNG4 + `rotate.pp3` | 0 | 0 | PASS |
 | `colorspace_flowers.pef` | VNG4 + `crop.pp3` | 0 | 0 | PASS |
+| `colorspace_flowers.pef` | default AMaZE neutral | 0 | 0 | PASS |
 | `nikon-z7-45mp.nef` | VNG4 neutral | 0 | 0 | PASS |
+| `nikon-z7-45mp.nef` | MONO neutral | 0 | 0 | PASS |
+| `nikon-z7-45mp.nef` | VNG4 + `sharpen-usm.pp3` | 0 | 0 | PASS |
+| `nikon-z7-45mp.nef` | VNG4 + `rotate.pp3` | 0 | 0 | PASS |
+| `nikon-z7-45mp.nef` | VNG4 + `crop.pp3` | 0 | 0 | PASS |
+| `nikon-z7-45mp.nef` | default AMaZE neutral | 0 | 0 | PASS |
 
 The suite sidecar row with `VNG4 + sharpen-usm` also reports
 `sidecar export AE=0`.
 
-## The AMaZE exception
+## The AMaZE tile-scratch fix
 
-The default neutral profile uses AMaZE and does not match `dev`:
+The default neutral profile uses AMaZE. Against the uncorrected `dev` baseline
+the row differed by 56 LSB16 / 160 samples on `colorspace_flowers.pef` and
+1 LSB16 / 1 sample on `nikon-z7-45mp.nef`. Those differences came from the
+AMaZE tile-scratch fix, commit `2ebf08b0f` (`perf: #0: reset AMaZE scratch
+before every tile`), which is present on `perf-graph` and absent from `dev` at
+`9c3426339`.
 
-| Image | Profile | Maximum LSB16 | Differing samples |
-|---|---|---:|---:|
-| `colorspace_flowers.pef` | default AMaZE neutral | 56 | 160 of 30,419,712 |
-| `nikon-z7-45mp.nef` | default AMaZE neutral | 1 | 1 of 136,918,080 |
+Once the corrected baseline includes that fix, both images are pixel-exact:
+**0 LSB16, 0 differing samples** on the default AMaZE row. The earlier
+isolation evidence remains consistent with this result:
 
-This is the **known AMaZE tile-scratch fix**, commit `2ebf08b0f`
-(`perf: #0: reset AMaZE scratch before every tile`), which is present on
-`perf-graph` and absent from `dev` at `9c3426339`. The fix zeroes each
-worker's scratch at the start of every tile; `dev` can reuse values from the
-previous tile. The differing coordinates are isolated to tile boundaries.
-
-The isolation evidence is decisive:
-
-- switching only the demosaic method to VNG4 or MONO makes the same images
-  pixel-exact (0 LSB16, 0 samples);
-- every other profile tested on top of VNG4 is also exact;
+- switching only the demosaic method to VNG4 or MONO made the same images
+  pixel-exact before the baseline was corrected;
+- every other profile tested on top of VNG4 was also exact;
 - the AMaZE fix commit is not reachable from `dev` at the baseline commit;
 - the candidate's own thread matrix is AE=0 at 1/2/4/8 threads, so the
   difference is not run-to-run nondeterminism on this host.
 
-This is an intentional correctness fix, not a regression from the contract or
-handler-registry changes. It is recorded here rather than hidden by a relaxed
-tolerance.
+The AMaZE row is therefore no longer an exception and carries no relaxed
+tolerance. It is an ordinary exact row in the automated gate.
 
 ## Coverage that is not a `dev` CLI comparison
 
@@ -78,12 +87,13 @@ tolerance.
   100%, zoomed and the staged Lab/CIE-CAM/gamut/local-adjustment cases. The
   VNG4 `crop.pp3` export above additionally matches `dev` exactly.
 - **Preview:** the headless preview-latency row passes (5 samples, p50 307 ms,
-  p95 308 ms). A GUI screenshot comparison against `dev` was run with
-  `tools/perf/test-preview-parity.sh`: `fit` is AE=0; `100`, `zoom`, `pan` and
-  `fit2` differ. The diff is image-domain and matches the same AMaZE tile-fix
-  exception as the neutral export; it is not a UI or handler-registry
-  difference. A VNG4-default preview comparison remains the clean way to
-  isolate that scene, and is not yet automated.
+  p95 308 ms). A GUI screenshot comparison against the *uncorrected* `dev`
+  baseline with `tools/perf/test-preview-parity.sh` was `AE=0` for `fit`, while
+  `100`, `zoom`, `pan` and `fit2` differed. That run predates the corrected
+  baseline and has not been repeated; its AMaZE-domain differences are
+  expected to disappear, but no exact-preview claim is made here. A VNG4-default
+  preview comparison remains the clean way to isolate that scene, and is not
+  yet automated.
 - **Device:** the device path is compared with the host path, not with `dev`
   device execution, because the baseline build has no graph/device matrix.
 
@@ -91,19 +101,16 @@ tolerance.
 
 `tools/perf/test-baseline-parity.sh` automates this matrix. It requires
 `bwrap`, binds one `rtdata` tree to both compiled data paths, preflights both
-bind targets, uses separate settings/cache, and applies the AMaZE bound of
-64 LSB16 and 1024 differing samples within the 16 px halo of the 128 px tile
-stride. Any VNG4/MONO/profile difference, or an AMaZE difference outside those
-bounds, is `FAIL`.
+bind targets, uses separate settings/cache, and requires the VNG4, MONO,
+composed-profile and default AMaZE rows to be pixel-exact (AE=0). Any
+difference is `FAIL`.
 
 ## Reproduce
 
 Run the baseline and candidate CLIs with `rtdata` bound to both
 `/usr/local/share/rawtherapee` and `/usr/local/share/rawtherapee-graph`,
 `OMP_NUM_THREADS=1`, `--gpu=off`, and separate settings/cache directories. Use
-`export-one.sh --build-dir build/cpu-dev` for the baseline and
+`export-one.sh --build-dir build/cpu-dev-amaze` for the corrected baseline and
 `export-one.sh --build-dir build/cpu-perf-graph` for the candidate, then
-`compare_tiff.py --bits 16`. The default AMaZE row fails the suite's neutral
-row by design; the VNG4/MONO isolation rows are the parity evidence for the
-current architecture changes. The run artefacts are transient and are not
-retained in the repository.
+`compare_tiff.py --bits 16`. All rows, including default AMaZE, must be exact.
+The run artefacts are transient and are not retained in the repository.
