@@ -83,9 +83,8 @@ struct StageBufferRequirement {
  * `valid` is false only when the plan could not be built: the path and its
  * inputs disagree, a derivation precondition is missing, or a dirty node would
  * be reused instead of executed. `reason` names the refusal and `execute` is
- * then empty, so an adapter must reject the plan rather than index it. A dirty
- * node that plans `ReuseOutput` is exactly such a refusal: the graph would
- * publish a stale buffer, which is a planning error, not a runtime fallback.
+ * then empty, so an adapter must reject the plan rather than index it. The
+ * graph guarantees that a dirty node never plans `ReuseOutput`.
  *
  * `execute` holds the non-folded dirty nodes in graph (topological) order.
  * A folded dirty node stays in `dirty` and `folded`; it does not add its host

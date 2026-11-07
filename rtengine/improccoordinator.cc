@@ -5162,16 +5162,11 @@ void ImProcCoordinator::updatePreviewImage(EditorRequest request,
 
             previewPlan = stage::buildStagePlan(planInputs);
 
-            if (previewPlan.valid) {
-                pass.work = previewPlan.work;
-            } else {
-                /*
-                 * The plan refusal is reported through the execution path; the
-                 * work order is still the direct derivation so the pass does
-                 * not run a half-specified destructive section.
-                 */
-                pass.work = stage::derive_preview_work(planInputs.work);
+            if (!previewPlan.valid) {
+                abortPreviewGraph("unified plan refused: "
+                                  + previewPlan.reason);
             }
+            pass.work = previewPlan.work;
         }
 
         pass.dirty = previewDirtyBlocks(pass);
@@ -5194,10 +5189,18 @@ void ImProcCoordinator::updatePreviewImage(EditorRequest request,
          * derivation, so those passes keep planPreviewPass(). planPreviewPass()
          * has already validated every execute candidate's handler.
          */
-        const bool usePlanOrder = previewPlan.valid
-            && previewPlan.dirty.ids == pass.dirty.ids
-            && previewPlan.execute == plan.order;
+        /*
+         * A canonical plan and the merged plan must agree on order whenever
+         * they agree on the dirty set. A disagreement is a planner defect and
+         * aborts; it is never silently resolved in favour of one of them.
+         */
+        if (previewPlan.dirty.ids == pass.dirty.ids
+            && previewPlan.execute != plan.order) {
+            abortPreviewGraph(
+                "canonical and merged preview plans disagree on order");
+        }
 
+        const bool usePlanOrder = previewPlan.dirty.ids == pass.dirty.ids;
         const std::vector<std::string>& order =
             usePlanOrder ? previewPlan.execute : plan.order;
 

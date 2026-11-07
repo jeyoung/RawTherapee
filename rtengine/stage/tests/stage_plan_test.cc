@@ -45,6 +45,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <map>
 #include <set>
 #include <string>
 #include <vector>
@@ -164,6 +165,11 @@ StagePlanInputs makeInputs(const PlanBundle& bundle)
 
 void checkBuffers(const StagePlan& plan)
 {
+    std::map<std::string, std::vector<std::string>> incoming;
+    for (const auto& edge : plan.spec.edges) {
+        incoming[edge.second].push_back(edge.first);
+    }
+
     check(plan.buffers.size() == plan.spec.nodes.size(),
           "buffers: one requirement per spec node");
 
@@ -184,14 +190,14 @@ void checkBuffers(const StagePlan& plan)
             continue;
         }
 
-        check(requirement.ownership == node.ownership,
-              "buffers: ownership matches the spec: " + node.id);
+        check(requirement.ownership == block->ownership,
+              "buffers: ownership matches the contract: " + node.id);
         check(requirement.workingSet == block->workingSet,
               "buffers: working set matches the contract: " + node.id);
-        check(requirement.inputs == node.inputs,
+        check(requirement.inputs == incoming[node.id],
               "buffers: inputs match the spec edges: " + node.id);
 
-        if (node.ownership == StageOwnership::Consumes) {
+        if (block->ownership == StageOwnership::Consumes) {
             check(requirement.output.empty(),
                   "buffers: a consumer owns no output: " + node.id);
         } else {
@@ -416,7 +422,8 @@ void testRefusals()
 int main()
 {
     for (StagePath path : {StagePath::Export, StagePath::FastExport,
-                           StagePath::Preview, StagePath::Crop}) {
+                           StagePath::Preview, StagePath::Crop,
+                           StagePath::Thumbnail}) {
         testPlanForPath(path);
     }
 

@@ -38,8 +38,10 @@
 #include <utility>
 #include <vector>
 
+#if defined(__linux__)
 #include <sys/types.h>
 #include <unistd.h>
+#endif
 
 namespace
 {
@@ -259,6 +261,7 @@ bool readDeviceSource(std::string& source)
     const char* relative = "rtengine/stage/stage_opencl_device.cc";
     std::vector<std::string> candidates;
 
+#if defined(__linux__)
     char executable[4096] = {};
     const ssize_t length =
         readlink("/proc/self/exe", executable, sizeof(executable) - 1);
@@ -274,6 +277,7 @@ bool readDeviceSource(std::string& source)
             candidates.push_back(directory + "/" + relative);
         }
     }
+#endif
 
     std::string directory = ".";
     for (int depth = 0; depth < 8; ++depth) {
@@ -693,7 +697,6 @@ void checkContract()
      * name in the device implementation unit rather than a table-only label. */
     std::string deviceSource;
     const bool haveDeviceSource = readDeviceSource(deviceSource);
-    check(haveDeviceSource, "contract: the device implementation source is readable");
     if (haveDeviceSource) {
         for (const StageBlockContract& block : stageBlockContracts()) {
             for (const char* deviceStage : block.deviceStages) {

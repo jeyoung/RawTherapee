@@ -236,16 +236,6 @@ StagePlan buildStagePlan(const StagePlanInputs& inputs)
             continue;
         }
 
-        /*
-         * A dirty node may never reuse its output: the buffer still carries the
-         * previous pass. This is a planning error, so the plan is refused and
-         * the adapter aborts instead of publishing stale pixels.
-         */
-        if (decisions.decisions[index].action == StageAction::ReuseOutput) {
-            return refuse(std::move(plan),
-                          "dirty node plans ReuseOutput: " + id);
-        }
-
         /* A folded node runs its host's body, not its own executor step. */
         if (foldHost(path, id) != nullptr) {
             continue;

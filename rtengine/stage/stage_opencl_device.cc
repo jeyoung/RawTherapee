@@ -2355,7 +2355,9 @@ public:
                 residency_->readback(output_, host_output_);
             if (status != RT_STAGE_OK) {
                 note_ = "device readback failed";
-                refusal_ = StageRefusalCode::DeviceError;
+                refusal_ = env_->fault_plan.refusal != StageRefusalCode::None
+                               ? env_->fault_plan.refusal
+                               : StageRefusalCode::DeviceError;
                 return finish(status);
             }
         }
