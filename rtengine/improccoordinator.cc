@@ -5190,17 +5190,25 @@ void ImProcCoordinator::updatePreviewImage(EditorRequest request,
          * has already validated every execute candidate's handler.
          */
         /*
-         * A canonical plan and the merged plan must agree on order whenever
-         * they agree on the dirty set. A disagreement is a planner defect and
-         * aborts; it is never silently resolved in favour of one of them.
+         * A canonical plan and the merged plan must agree on the order of the
+         * dirty nodes whenever they agree on the dirty set. The merged order
+         * also carries clean `ReuseInput` nodes, whose bodies the preview runs
+         * in place; those are an expected addition, not a disagreement. Only
+         * a genuine order divergence aborts.
          */
         if (previewPlan.dirty.ids == pass.dirty.ids
-            && previewPlan.execute != plan.order) {
+            && !stage::executeOrderMatches(previewPlan, plan.order)) {
             abortPreviewGraph(
                 "canonical and merged preview plans disagree on order");
         }
 
-        const bool usePlanOrder = previewPlan.dirty.ids == pass.dirty.ids;
+        /*
+         * The canonical list omits the clean `ReuseInput` bodies, so it is
+         * the execution order only when the merged order adds nothing.
+         */
+        const bool usePlanOrder =
+            previewPlan.dirty.ids == pass.dirty.ids
+            && previewPlan.execute == plan.order;
         const std::vector<std::string>& order =
             usePlanOrder ? previewPlan.execute : plan.order;
 

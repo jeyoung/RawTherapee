@@ -112,4 +112,20 @@ struct StagePlan {
  */
 StagePlan buildStagePlan(const StagePlanInputs& inputs);
 
+/*
+ * Whether a merged execution order agrees with a plan.
+ *
+ * An adapter that resolves the merged order from the graph decision runs
+ * every node whose action is not ReuseOutput, including a clean node that
+ * reuses its input buffer (`ReuseInput`). A plan's `execute` names only the
+ * dirty nodes, because an incremental adapter may skip a clean in-place body
+ * whose buffer still holds its output. The two agree when they name the
+ * dirty nodes in the same order; a clean node in `merged` is an expected
+ * addition, not a disagreement.
+ *
+ * Returns false for an invalid plan: a refused plan has no order to compare.
+ */
+bool executeOrderMatches(const StagePlan& plan,
+                         const std::vector<std::string>& merged);
+
 } // namespace rtengine::stage

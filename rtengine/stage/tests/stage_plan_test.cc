@@ -38,6 +38,7 @@
 
 #include "stage_contract.h"
 #include "stage_dirty_blocks.h"
+#include "stage_graph.h"
 #include "stage_pipeline.h"
 #include "stage_work.h"
 
@@ -48,6 +49,7 @@
 #include <map>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace
@@ -348,6 +350,118 @@ void testCleanNodesNeverExecute()
     }
 }
 
+/*
+ * Rebuild the merged order the way the preview adapter does: run every node
+ * whose graph decision is not ReuseOutput, in topological order, and skip a
+ * folded node because its host carries the body.
+ */
+std::vector<std::string> mergedExecutionOrder(const StagePlan& plan)
+{
+    StageGraph graph;
+    std::vector<size_t> nodes;
+    for (const StageDescriptorSpec& node : plan.spec.nodes) {
+        nodes.push_back(graph.addNode(node.id, node.reuse));
+    }
+
+    const auto indexOf = [&plan](const std::string& id) {
+        for (size_t i = 0; i < plan.spec.nodes.size(); ++i) {
+            if (plan.spec.nodes[i].id == id) {
+                return i;
+            }
+        }
+        return plan.spec.nodes.size();
+    };
+
+    for (const auto& edge : plan.spec.edges) {
+        graph.connect(nodes[indexOf(edge.first)],
+                      nodes[indexOf(edge.second)]);
+    }
+
+    for (size_t i = 0; i < plan.spec.nodes.size(); ++i) {
+        if (plan.dirty.ids.count(plan.spec.nodes[i].id) != 0) {
+            graph.markDirty(nodes[i]);
+        } else {
+            graph.markClean(nodes[i]);
+        }
+    }
+
+    std::vector<size_t> order;
+    graph.topologicalOrder(order);
+    const StagePlanResult decisions = graph.plan();
+
+    std::vector<std::string> merged;
+    for (size_t index : order) {
+        const std::string& id = plan.spec.nodes[index].id;
+        if (foldHost(plan.spec.path, id) != nullptr) {
+            continue;
+        }
+        if (decisions.decisions[index].action != StageAction::ReuseOutput) {
+            merged.push_back(id);
+        }
+    }
+    return merged;
+}
+
+void testMergedOrderAgreement()
+{
+    const procparams::ProcParams params;
+    const BlockFingerprints current =
+        stage_fingerprints(StagePath::Preview, params);
+    BlockFingerprints previous = current;
+    const RenderStateKey state;
+
+    const PlanBundle bundle = makeBundle(
+        StagePath::Preview, params, &previous, current, &state, state);
+    const StagePlan plan = buildStagePlan(makeInputs(bundle));
+
+    check(plan.valid, "merged order: no-change preview plans");
+    if (!plan.valid) {
+        return;
+    }
+
+    /*
+     * A guide-only repaint has no parameter or state delta. The preview's
+     * only resident is monitor.output, so it is the only dirty node; every
+     * in-place `ReuseInput` node is clean.
+     */
+    check(plan.dirty.ids.size() == 1
+              && plan.dirty.ids.count("monitor.output") != 0,
+          "merged order: a repaint pass dirties only the resident sink");
+    check(!contains(plan.execute, "transform"),
+          "merged order: the canonical plan omits a clean ReuseInput node");
+
+    const std::vector<std::string> merged = mergedExecutionOrder(plan);
+
+    check(contains(merged, "transform"),
+          "merged order: a clean ReuseInput node still runs");
+    check(plan.execute != merged,
+          "merged order: the dirty-only list differs from the merged list");
+    check(executeOrderMatches(plan, merged),
+          "merged order: the dirty nodes agree in order");
+    check(!executeOrderMatches(plan, {}),
+          "merged order: an empty merged order is a disagreement");
+
+    StagePlan truncated = plan;
+    truncated.execute.clear();
+    check(!executeOrderMatches(truncated, merged),
+          "merged order: a missing dirty node is a disagreement");
+
+    /*
+     * Two dirty nodes in the wrong relative order are a real disagreement,
+     * even when the merged list carries the same nodes.
+     */
+    const PlanBundle fullBundle = makeBundle(
+        StagePath::Preview, params, nullptr, current, nullptr, state);
+    const StagePlan full = buildStagePlan(makeInputs(fullBundle));
+    check(full.valid, "merged order: a first pass plans");
+    if (full.valid && full.execute.size() >= 2) {
+        std::vector<std::string> swapped = full.execute;
+        std::swap(swapped[0], swapped[1]);
+        check(!executeOrderMatches(full, swapped),
+              "merged order: a swapped dirty order is a disagreement");
+    }
+}
+
 void testRefusals()
 {
     const procparams::ProcParams params;
@@ -428,6 +542,7 @@ int main()
     }
 
     testCleanNodesNeverExecute();
+    testMergedOrderAgreement();
     testRefusals();
 
     if (failures == 0) {

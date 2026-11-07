@@ -249,4 +249,31 @@ StagePlan buildStagePlan(const StagePlanInputs& inputs)
     return plan;
 }
 
+bool executeOrderMatches(const StagePlan& plan,
+                         const std::vector<std::string>& merged)
+{
+    if (!plan.valid) {
+        return false;
+    }
+
+    /*
+     * The merged order carries clean `ReuseInput` nodes that the plan's
+     * dirty-only `execute` omits. Walk the merged order and require every
+     * dirty node to appear in the plan's order; the comparison is complete
+     * only when the plan order is exhausted at the same time.
+     */
+    size_t next = 0;
+    for (const std::string& id : merged) {
+        if (plan.dirty.ids.count(id) == 0) {
+            continue;
+        }
+        if (next == plan.execute.size() || plan.execute[next] != id) {
+            return false;
+        }
+        ++next;
+    }
+
+    return next == plan.execute.size();
+}
+
 } // namespace rtengine::stage
