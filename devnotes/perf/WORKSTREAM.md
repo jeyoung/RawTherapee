@@ -10,9 +10,10 @@ progress log is in
 
 ## Stream status
 
-Closed for this phase on 2026-11-07 at `099b3f9f6`. The branch is pushed to
-`origin/perf-graph` and deliberately not merged into `dev` or `perf`; the next
-work moves to the `perf` line. Revisit the remaining path-specific body
+Closed for this phase on 2026-11-07. The latest code change is
+`437575c18`; the documentation commits that record the shared layer and this
+closure follow it. The branch is pushed to `origin/perf-graph` and deliberately
+not merged into `dev` or `perf`; the next work moves to the `perf` line. Revisit the remaining path-specific body
 extraction (local-adjustments orchestration and raw-base finishing) and the
 target-neutral/OpenCL body dispatcher when the stream reopens. Do not merge or
 rebase `dev`/`perf` into `perf-graph` while it is closed.
@@ -22,8 +23,8 @@ rebase `dev`/`perf` into `perf-graph` while it is closed.
 | Item | Value |
 |---|---|
 | Repository | `$REPO` |
-| Branch | `perf-graph`, tip `437575c18` |
-| Worktree | main checkout, clean after the documentation commit, ahead of `origin/perf-graph` |
+| Branch | `perf-graph`, pushed to `origin/perf-graph` and closed for this phase |
+| Worktree | main checkout; the branch is clean and in sync with `origin/perf-graph` |
 | Latest code change | `437575c18` (shared stage CPU bodies across preview, crop and export); later commits are documentation |
 | Build trees | `build/cpu-perf-graph`, `build/opencl-perf-graph` (GCC, Release, generic target) |
 | Baseline | `dev` `9c3426339` plus the AMaZE source patch from `2ebf08b0f`, branch `dev-amaze`, build `build/cpu-dev-amaze` |
