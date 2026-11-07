@@ -13,9 +13,9 @@ progress log is in
 | Item | Value |
 |---|---|
 | Repository | `$REPO` |
-| Branch | `perf-graph`, tip `0f73d2ee1` |
+| Branch | `perf-graph`, tip `437575c18` |
 | Worktree | main checkout, clean after the documentation commit, ahead of `origin/perf-graph` |
-| Latest code change | `0f73d2ee1` (accept clean `ReuseInput` nodes in the preview merged order); later commits are documentation |
+| Latest code change | `437575c18` (shared stage CPU bodies across preview, crop and export); later commits are documentation |
 | Build trees | `build/cpu-perf-graph`, `build/opencl-perf-graph` (GCC, Release, generic target) |
 | Baseline | `dev` `9c3426339` plus the AMaZE source patch from `2ebf08b0f`, branch `dev-amaze`, build `build/cpu-dev-amaze` |
 | Test corpus | public 10.2 MP PEF; 45.7 MP NEF; TIFF and JPEG generated from the PEF |
@@ -90,18 +90,30 @@ off), `RT_STAGE_DEVICE_BUDGET_MB`, `RT_WORK_SHADOW`, `RT_OPENCL_ALLOW_CPU`,
 - **Buffer plan**: `StagePlan::buffers` describes ownership, working-set class,
   inputs and output for every block. Runtime allocation and residency still
   consume it only descriptively.
-- **Shared body layer**: not completed. Preview and crop still own separate
-  stage-body orchestration. This is the remaining architecture change and
-  requires a dedicated extraction, not a mechanical merge.
+- **Shared body layer**: `stage_body.{h,cc}` owns the transform and gamut
+  bodies; the existing `*_context` host blocks now serve preview, crop and
+  export through path options instead of export alone. `working.trc`,
+  `lab.tools`, `lab.wavelet`, `ciecam` and `lab.sharpening` have one CPU body
+  each. Preview and crop pass their scale/skip, call mode, processing order and
+  listener hooks; export keeps its old defaults. Raw acquisition and base
+  finishing, `source.select`/`analysis` and the monitor/viewport sinks remain
+  path-specific, as does the local-adjustments spot orchestration whose
+  `Lab_Local` arithmetic is already the shared `ipf` body.
 
 ## Current verification summary
 
-The full suite `suite-grid-final` (worktree at the change that became
-`0f73d2ee1`, build `cpu-perf-graph`) reports `PASS`, `failures: 0`. It covers
-the merged-order fix and its regression: stage host tests including
-`stage-plan-test`, baseline parity against the corrected `dev` baseline,
-export/thumbnail/crop graph parity, crop dirty derivation, neutral thread
-determinism and preview latency.
+The full suite `suite-arch3-final2` (worktree at the change that became
+`437575c18`, build `cpu-perf-graph`) reports `PASS`, `failures: 0`. It covers
+the shared body layer and the merged-order regression: stage host tests,
+baseline parity against the corrected `dev` baseline, export/thumbnail/crop
+graph parity, crop dirty derivation, neutral thread determinism and preview
+latency. The shared-body refactor is pixel-identical to its parent build on
+all 93 `devnotes/opencl/pp3` export profiles, the crop `--stages` and
+`--sequences` outputs, and the preview fit/100/zoom/pan/fit2 screenshots for
+the default and six tool profiles. Both CPU and OpenCL `rth-cli` builds pass.
+
+The earlier merged-order fix remains covered by `suite-grid-final` and the
+Grid-under-crop GUI check.
 
 The crash that motivated the fix is reproduced and cleared through the GUI
 path: with the Crop tool open and a non-full crop selection, enabling the Grid

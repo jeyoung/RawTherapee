@@ -1501,6 +1501,52 @@ The preview bench is not usable evidence for this change. The harness captured
 only two samples because its hard-coded slider coordinates miss on this
 layout, so no timing claim is made.
 
+## Shared stage body layer
+
+The processing bodies that were copied per adapter now live in one layer:
+
+- `stage/stage_body.{h,cc}` owns `transformHostBlock()` and
+  `gamutHostBlock()`.
+- `stage/working_trc_context.cc` owns `workingTrcHostBlock()` with
+  `WorkingTrcBodyOptions` (scale and the preview/crop listener hooks).
+- `stage/lab_tools_context.cc` owns `labToolsHostBlock()` with
+  `LabToolsBodyOptions` (sampling scale, prebuilt LUTs, the interactive curve
+  flags, the after-CBDL equaliser and the path processing order).
+- `stage/lab_wavelet_context.cc` owns `labWaveletHostBlock()` with
+  `LabWaveletBodyOptions` (scale, `kall`, the caller's final LUT and the
+  interactive mask overlay).
+- `stage/ciecam_context.cc` owns `ciecamBody()` with `CiecamBodyState`,
+  `CiecamBodyOptions` and the preview callback path; `ciecamHostBlock()` is a
+  thin export wrapper over the same body.
+- `stage/lab_sharpening_context.cc` already owned `labSharpeningRun()`.
+
+Preview, crop and export call these functions with their own options. Export
+keeps its historical defaults: scale 1, call mode 2, the export processing
+order and no listeners. Preview and crop pass their scale or skip, call mode,
+geometry, ROI offsets, listener hooks and processing order. The transform body
+leaves allocation and pointer replacement with the adapter; the gamut body
+returns the optional maximum RGB/saturation values the preview listener
+publishes.
+
+Path-specific bodies remain where the three paths do not share one operation:
+raw acquisition and base finishing (`raw.preprocess`, `raw.demosaic`,
+`raw.base`), `source.select`, `analysis`, the monitor and viewport sinks, and
+the local-adjustments spot orchestration. The last one calls the shared
+`ImProcFunctions::Lab_Local()` arithmetic; its per-path call modes (1 for
+crop, 2 for export, 3 for preview), reference sources, mask display and
+listener write-backs are the reasons its orchestration still belongs to the
+adapter.
+
+Evidence for the extraction: the pre-change build and the shared-body build
+are byte-identical on every export profile in `devnotes/opencl/pp3/` (93
+profiles covering transform, gamut, working TRC, Lab tools, wavelet, CIE CAM
+and local adjustments), on the `crop-stage-test --stages` fit/full/zoomed
+outputs and its `--sequences` rows, and on the preview screenshots for fit,
+100%, zoom, pan and fit2 for the default, wavelet, CIE CAM, working-TRC,
+Lab-tools and local-adjustments profiles. The full gate suite
+`suite-arch3-final2` is `PASS` with `failures: 0`, and both CPU and OpenCL
+`rth-cli` builds pass.
+
 ## Retired mask maps
 
 The legacy request mask and its equivalence data are deleted. There is no
