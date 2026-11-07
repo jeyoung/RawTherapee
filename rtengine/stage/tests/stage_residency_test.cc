@@ -16038,6 +16038,29 @@ void test_injected_readback_failure(bool available)
                     diff.max_a, diff.max_b, diff.differing, diff.samples);
     }
 
+    /* A caller-selected refusal code survives the injected readback. */
+    {
+        LabImage output(63, 31);
+        copy_sharpen_l(source, output);
+        const auto context = opencl_device()->create_context();
+        check(context != nullptr,
+              "injected readback refusal: the device creates a context");
+        if (context != nullptr) {
+            StageFaultPlan plan;
+            plan.fail_readback = 2;
+            plan.refusal = StageRefusalCode::Other;
+            context->set_fault_plan(plan);
+            StageExecution execution;
+            std::string error;
+            const RtStageStatus status = run_device_lab_sharpening(
+                context, params, output, execution, error);
+            check(status == RT_STAGE_OK,
+                  "injected readback refusal: host fallback completes");
+            check(execution.refusal == StageRefusalCode::Other,
+                  "injected readback refusal: the selected code survives");
+        }
+    }
+
     /*
      * Direct proof that no host input was touched before the transaction
      * failed: suppress the host fallback by asking the compiler for a module
