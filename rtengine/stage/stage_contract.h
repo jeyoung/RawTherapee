@@ -48,8 +48,9 @@ namespace rtengine::stage
  *
  * The records are data only: they execute nothing, own no buffer and do not
  * depend on ProcParams, the coordinator or a crop. A change to a block's
- * inputs, ownership, side effects, folds, work items or working set is made
- * here and observed by every authority in the same build.
+ * inputs, ownership, side effects, folds, work items, working set, host body or
+ * device coverage is made here and observed by every authority in the same
+ * build.
  */
 
 /* Canonical paths. The values are diagnostic and log vocabulary. */
@@ -132,6 +133,25 @@ enum class StageOwnership : uint8_t {
 };
 
 const char* stageOwnershipName(StageOwnership ownership);
+
+/*
+ * How far a block has moved onto the stage-ABI device path.
+ *
+ * The value is the contract's record of the device implementation, not a
+ * runtime decision: `stage_opencl_device.cc` still admits or refuses each
+ * submission. `Partial` names a composite block whose admitted passes are
+ * device nodes while the remainder stays on the host, `No` a host-only block,
+ * and `NotApplicable` a block with no portable pixel kernel to move (I/O,
+ * metadata, a histogram or a display sink).
+ */
+enum class StageDeviceCoverage : uint8_t {
+    Yes = 0,
+    Partial = 1,
+    No = 2,
+    NotApplicable = 3
+};
+
+const char* stageDeviceCoverageName(StageDeviceCoverage coverage);
 
 /*
  * Side effects that outlive the block's own output buffer.
@@ -269,6 +289,21 @@ struct StageBlockContract {
      * split, so the three raw-core ids are not repeated in stage_pipeline.cc.
      */
     bool rawCore = false;
+    /*
+     * The host executor that carries the body. Every current block names its
+     * canonical id because the adapters register their handlers under that id;
+     * a block whose host body is shared or named differently can override it.
+     */
+    const char* hostBody = "";
+    /* How far the block has moved onto the device path. */
+    StageDeviceCoverage coverage = StageDeviceCoverage::NotApplicable;
+    /*
+     * Stage node names the device implementation dispatches to. The names are
+     * the `stage::run()` or kernel-table names in `stage_opencl_device.cc`, so
+     * the coverage record is traceable to the device source rather than a
+     * second vocabulary. Empty for a host-only or non-applicable block.
+     */
+    std::vector<const char*> deviceStages;
 };
 
 /*

@@ -37,9 +37,10 @@ namespace rtengine::stage
  * export consumer contract but runs denoise after its early resize.
  *
  * The block vocabulary, the path node lists, the parameter fields, the fold
- * table, the work items and the working-set classes come from the stage
- * contract (stage_contract.h). This unit projects them into the graph shape
- * the planner needs; it does not restate them.
+ * table, the work items, the working-set classes, the host bodies and the
+ * device coverage come from the stage contract (stage_contract.h). This unit
+ * projects them into the graph shape the planner needs; it does not restate
+ * them.
  */
 
 struct StageDescriptorSpec {
@@ -59,6 +60,14 @@ struct StageDescriptorSpec {
      * scalars.
      */
     std::vector<std::string> paramFields;
+    /*
+     * Host executor body id, device coverage and the device node names, from
+     * the stage contract. The fields are exposed here so the planner can dump
+     * the implementation map without reading the block record again.
+     */
+    std::string hostBody;
+    StageDeviceCoverage coverage = StageDeviceCoverage::NotApplicable;
+    std::vector<std::string> deviceStages;
     /*
      * When non-empty, another block carries this block's body on this path.
      * The node stays in the specification so the dirty derivation can mark it,

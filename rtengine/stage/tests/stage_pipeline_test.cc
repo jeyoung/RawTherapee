@@ -20,19 +20,26 @@
  *
  * The test checks the shape of the four path specifications: unique ids,
  * known edge endpoints, roots and sinks, reachability in both directions,
- * acyclicity and the presence of the expected blocks. It does not run any
- * image processing.
+ * acyclicity and the presence of the expected blocks. It also proves the
+ * contract's implementation map: every block has a host body and a device
+ * coverage, device-covered blocks name real device stages, and host-only ones
+ * name none. It does not run any image processing.
  */
 
 #include "stage_pipeline.h"
 
 #include <algorithm>
 #include <cstdio>
+#include <fstream>
 #include <map>
 #include <set>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
+
+#include <sys/types.h>
+#include <unistd.h>
 
 namespace
 {
@@ -219,6 +226,74 @@ bool isKnownParamField(const std::string& field)
         || knownParamSubFields().count(field) != 0;
 }
 
+/*
+ * Device node names implemented in `stage_opencl_device.cc`. The set mirrors
+ * that file's kernel table and its `stage::run()` names; the source scan below
+ * keeps the mirror honest when the source tree is available.
+ */
+const std::set<std::string>& knownDeviceStages()
+{
+    static const std::set<std::string> stages = {
+        "lanczos3", "transform", "output.convert", "monitor.output",
+        "viewport.output", "thumbnail.output", "rgb.proc", "thumbnail.rgb",
+        "gamut", "working.trc", "working.trc.tone", "ciecam", "lab.tools",
+        "thumbnail.lab", "lab.tools.labcurve", "lab.tools.localcontrast",
+        "lab.tools.regions", "lab.wavelet", "local.adjustments",
+        "output.sharpen", "lab.sharpening", "raw.preprocess", "raw.demosaic",
+        "raw.base", "raw.base.wb", "framing", "crop", "thumbnail.whitebalance",
+        "thumbnail.transform", "thumbnail.transform.u8", "thumbnail.scale",
+        "thumbnail.scale.u8"
+    };
+    return stages;
+}
+
+/*
+ * Read the device implementation unit. The test is built only from the source
+ * tree, but its working directory and the compiler's recorded path both vary
+ * between a build-tree and a repository-root invocation. Walk up from the
+ * executable and from the working directory until the source file is found;
+ * if it is not, the static set above is still the authority.
+ */
+bool readDeviceSource(std::string& source)
+{
+    const char* relative = "rtengine/stage/stage_opencl_device.cc";
+    std::vector<std::string> candidates;
+
+    char executable[4096] = {};
+    const ssize_t length =
+        readlink("/proc/self/exe", executable, sizeof(executable) - 1);
+    if (length > 0) {
+        executable[length] = '\0';
+        std::string directory(executable);
+        for (int depth = 0; depth < 8; ++depth) {
+            const std::string::size_type slash = directory.find_last_of('/');
+            if (slash == std::string::npos) {
+                break;
+            }
+            directory = directory.substr(0, slash);
+            candidates.push_back(directory + "/" + relative);
+        }
+    }
+
+    std::string directory = ".";
+    for (int depth = 0; depth < 8; ++depth) {
+        candidates.push_back(directory + "/" + relative);
+        directory += "/..";
+    }
+
+    for (const std::string& path : candidates) {
+        std::ifstream in(path);
+        if (!in) {
+            continue;
+        }
+        std::ostringstream buffer;
+        buffer << in.rdbuf();
+        source = buffer.str();
+        return true;
+    }
+    return false;
+}
+
 void checkShape(const StagePipelineSpec& spec, StagePath requested)
 {
     const std::string label = stagePathName(spec.path);
@@ -236,6 +311,29 @@ void checkShape(const StagePipelineSpec& spec, StagePath requested)
             check(isKnownParamField(field),
                   label + ": node " + node.id + " uses a known ProcParams member: " +
                       field);
+        }
+        check(!node.hostBody.empty(),
+              label + ": node " + node.id + " has a host body");
+        check(std::string(stageDeviceCoverageName(node.coverage)) != "unknown",
+              label + ": node " + node.id + " has a device coverage");
+        const StageBlockContract* block = findStageBlockContract(node.id);
+        check(block != nullptr,
+              label + ": node " + node.id + " has a contract record");
+        if (block != nullptr) {
+            check(node.hostBody == block->hostBody,
+                  label + ": node " + node.id + " carries the contract host body");
+            check(node.coverage == block->coverage,
+                  label + ": node " + node.id + " carries the contract coverage");
+            check(node.deviceStages.size() == block->deviceStages.size(),
+                  label + ": node " + node.id + " carries the contract device stages");
+            for (size_t i = 0;
+                 i < node.deviceStages.size() && i < block->deviceStages.size();
+                 ++i) {
+                check(node.deviceStages[i] == block->deviceStages[i],
+                      label + ": node " + node.id
+                          + " carries the contract device stage: "
+                          + node.deviceStages[i]);
+            }
         }
     }
 
@@ -310,6 +408,17 @@ void checkShape(const StagePipelineSpec& spec, StagePath requested)
     for (const auto& node : spec.nodes) {
         check(first.find("\"" + node.id + "\"") != std::string::npos,
               label + ": dump contains node " + node.id);
+        check(first.find("host-body=" + node.hostBody) != std::string::npos,
+              label + ": dump contains the host body of " + node.id);
+        check(first.find(std::string("device-coverage=")
+                         + stageDeviceCoverageName(node.coverage))
+                  != std::string::npos,
+              label + ": dump contains the device coverage of " + node.id);
+        for (const auto& deviceStage : node.deviceStages) {
+            check(first.find(deviceStage) != std::string::npos,
+                  label + ": dump contains the device stage " + deviceStage
+                      + " of " + node.id);
+        }
     }
     for (const auto& edge : spec.edges) {
         check(first.find("\"" + edge.first + "\" -> \"" + edge.second + "\"") !=
@@ -542,6 +651,61 @@ void checkContract()
               "contract: block has an ownership: " + id);
         check(stageWorkingSetName(block.workingSet) != std::string("unknown"),
               "contract: block has a working-set class: " + id);
+
+        /* Every block states how far it has moved onto the device path, the
+         * host body that carries it, and the real device node names. */
+        const std::string coverage = stageDeviceCoverageName(block.coverage);
+        check(coverage != "unknown",
+              "contract: block has a device coverage: " + id);
+        check(block.hostBody != nullptr && block.hostBody[0] != '\0',
+              "contract: block has a host body: " + id);
+        const bool deviceCovered = block.coverage == StageDeviceCoverage::Yes
+                                   || block.coverage == StageDeviceCoverage::Partial;
+        if (deviceCovered) {
+            check(!block.deviceStages.empty(),
+                  "contract: device-covered block names a device stage: " + id);
+        } else {
+            check(block.deviceStages.empty(),
+                  "contract: host-only block names no device stage: " + id);
+        }
+        for (const char* deviceStage : block.deviceStages) {
+            check(deviceStage != nullptr && deviceStage[0] != '\0',
+                  "contract: device stage name is not empty: " + id);
+            if (deviceStage == nullptr) {
+                continue;
+            }
+            check(knownDeviceStages().count(deviceStage) != 0,
+                  "contract: device stage is a known node: " + id + " -> "
+                      + deviceStage);
+        }
+    }
+
+    /* The mapping uses every coverage value: a defaulted or unclassified
+     * block would leave one category empty. */
+    std::set<std::string> coverageValues;
+    for (const StageBlockContract& block : stageBlockContracts()) {
+        coverageValues.insert(stageDeviceCoverageName(block.coverage));
+    }
+    check(coverageValues.size() == 4,
+          "contract: every device coverage value is used");
+
+    /* When the source tree is reachable, prove every named device stage is a
+     * name in the device implementation unit rather than a table-only label. */
+    std::string deviceSource;
+    const bool haveDeviceSource = readDeviceSource(deviceSource);
+    check(haveDeviceSource, "contract: the device implementation source is readable");
+    if (haveDeviceSource) {
+        for (const StageBlockContract& block : stageBlockContracts()) {
+            for (const char* deviceStage : block.deviceStages) {
+                if (deviceStage == nullptr) {
+                    continue;
+                }
+                check(deviceSource.find(deviceStage) != std::string::npos,
+                      std::string("contract: device stage appears in "
+                                  "stage_opencl_device.cc: ")
+                          + deviceStage);
+            }
+        }
     }
 
     for (StagePath path : allPaths()) {
@@ -705,6 +869,17 @@ int main()
           "consumer name: interactive");
     check(std::string(stageReuseName(RT_STAGE_REUSE_OUTPUT)) == "reuse-output",
           "reuse name: reuse-output");
+    check(std::string(stageDeviceCoverageName(StageDeviceCoverage::Yes)) == "yes",
+          "device coverage name: yes");
+    check(std::string(stageDeviceCoverageName(StageDeviceCoverage::Partial))
+              == "partial",
+          "device coverage name: partial");
+    check(std::string(stageDeviceCoverageName(StageDeviceCoverage::No)) == "no",
+          "device coverage name: no");
+    check(std::string(stageDeviceCoverageName(
+                          StageDeviceCoverage::NotApplicable))
+              == "n/a",
+          "device coverage name: n/a");
 
     for (StagePath path : allPaths()) {
         checkShape(buildPipelineSpec(path), path);

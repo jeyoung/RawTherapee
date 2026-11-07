@@ -48,7 +48,8 @@ Each block record carries its id, display name, reuse mode, ownership
 (`produces`, `in-place`, `consumes`), side effects (raw planes, base image,
 spot buffer, analysis, display, metadata), working-set class (image, scratch
 planes, transform map, tap tables, double state), parameter fields, work
-items, fold rules, resident paths and the raw-core flag. A work item carries
+items, fold rules, resident paths, the raw-core flag, the host executor body,
+the device coverage and the device-stage names. A work item carries
 the paths on which that body exists: preview folds analysis into raw.base and
 has no denoise item; crop runs its analysis before the base and has no retinex
 preparation. The coupled groups are path-level because membership differs
@@ -95,8 +96,17 @@ spec: `buildPipelineSpec()` returns the rooted subgraph, not the union.
 | `no` | host-only: the block has no device node |
 | `n/a` | no pixel kernel to port: I/O, metadata, a histogram, or a row copy that a device round trip would make slower |
 
+The `Device` column is generated from the contract's
+`StageBlockContract::coverage` and `StageBlockContract::deviceStages` fields;
+`StageBlockContract::hostBody` names the host executor. `stage-pipeline-test`
+validates the table against the contract: every canonical block has a coverage
+value, `yes` and `partial` blocks name at least one real device stage, `no` and
+`n/a` blocks name none, and every named stage appears in
+`stage_opencl_device.cc`. Change the contract, not this table alone.
+
 A block's runtime node name can differ from its id; the name is given where it
-does. `partial` never means verified: it records device execution of the named
+does and `deviceStages` carries the actual `stage::run()` or kernel-table name.
+`partial` never means verified: it records device execution of the named
 sub-nodes and the residual beside it, not parity of the composite.
 
 `output.sharpen` is partial: the device runs the unsupported-mask path with
@@ -526,7 +536,7 @@ by default.
 | `raw.demosaic` | Full/Full/Full/Full | path | reuse-output | demosaic and capture sharpening; the MONO/NONE arms of `nodemosaic()` are the device node | partial |
 | `raw.base` | -/Full/Roi/Reduced | path | reuse-output | the composite raw finish for preview, crop and thumbnail; the canonical export names its three sub-blocks instead | partial |
 | `raw.base.source` | Full/-/-/- | exact | reuse-output | white balance, Retinex, `getImage()` and spots: the first part of `raw.base`; the `raw.base.wb` white-balance multiply is the device sub-step | partial |
-| `raw.denoise` | Full/-/-/- | exact | reuse-input | directional-pyramid denoise on the unresized base image | n/a |
+| `raw.denoise` | Full/-/-/- | exact | reuse-input | directional-pyramid denoise on the unresized base image; host-only | no |
 | `raw.color` | Full/-/-/- | exact | reuse-input | working-space conversion, film negative and source-side gamut; the `raw.base` camera-matrix multiply is the device sub-step | partial |
 | `analysis` | Full/Full/Roi/- | path | reuse-output | histogram and auto-exposure analysis | n/a |
 | `transform` | Full/Full/Roi/- | path | reuse-input | rotation, distortion, perspective, CA, vignetting, gradient, post-crop vignette, dehaze, Fattal | yes |
@@ -586,8 +596,8 @@ extra work:
 | `raw.base.source` | Full | exact | reuse-output | white balance, Retinex, `getImage()` and spots: the first part of `raw.base`, shared with the canonical export | partial |
 | `raw.color` | Full | exact | reuse-input | working-space conversion, film negative and source-side gamut, shared with the canonical export | partial |
 | `early.resize` | Full | exact | reuse-output | RGB to Lab, crop-region conversion, Lab resize and scale-parameter adjustment | yes |
-| `denoise` | Full | exact | reuse-input | directional-pyramid denoise after the early resize | n/a |
-| `finish` | Full | exact | recompute | the composite finish sequence from local adjustments to output ICC | n/a |
+| `denoise` | Full | exact | reuse-input | directional-pyramid denoise after the early resize; host-only | no |
+| `finish` | Full | exact | recompute | the composite finish sequence from local adjustments to output ICC; its sub-blocks dispatch to their device nodes | partial |
 
 ## Path specifications
 

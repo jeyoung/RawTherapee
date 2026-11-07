@@ -70,6 +70,7 @@ StageDescriptorSpec makeDescriptor(const std::string& id, StagePath path)
         descriptor.name = id;
         descriptor.domain = StageDomain::Full;
         descriptor.consumer = consumerFor(path);
+        descriptor.hostBody = id;
         descriptor.outputs.push_back(id);
         return descriptor;
     }
@@ -81,9 +82,14 @@ StageDescriptorSpec makeDescriptor(const std::string& id, StagePath path)
     descriptor.consumer = consumerFor(path);
     descriptor.reuse = block->reuse;
     descriptor.ownership = block->ownership;
+    descriptor.hostBody = block->hostBody;
+    descriptor.coverage = block->coverage;
     descriptor.outputs.push_back(descriptor.id);
     for (const char* param : block->paramFields) {
         descriptor.paramFields.emplace_back(param);
+    }
+    for (const char* deviceStage : block->deviceStages) {
+        descriptor.deviceStages.emplace_back(deviceStage);
     }
     const char* host = foldHost(path, descriptor.id);
     if (host != nullptr) {
@@ -295,7 +301,17 @@ std::string dumpPipelineSpec(StagePath path)
             << "\" domain=" << stageDomainName(node.domain)
             << " consumer=" << stageConsumerName(node.consumer)
             << " reuse=" << stageReuseName(node.reuse)
-            << " ownership=" << stageOwnershipName(node.ownership);
+            << " ownership=" << stageOwnershipName(node.ownership)
+            << " host-body=" << node.hostBody
+            << " device-coverage="
+            << stageDeviceCoverageName(node.coverage)
+            << " device-stages=";
+        for (size_t i = 0; i < node.deviceStages.size(); ++i) {
+            if (i != 0) {
+                out << ",";
+            }
+            out << node.deviceStages[i];
+        }
         if (block != nullptr) {
             out << " effects=" << stageEffectName(block->effects)
                 << " working-set=" << stageWorkingSetName(block->workingSet)
