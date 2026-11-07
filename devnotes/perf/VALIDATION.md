@@ -8,13 +8,13 @@ contains only current evidence; earlier packages, commits and matrices are in
 ## Artefact
 
 ```
-rawtherapee-graph-5.13-795-gf7f3d2848_5.13+git13816.f7f3d2848-1_amd64.deb
-sha256 41bdcd00a5997299c72d0d9b5e2f6b79c5d49bfc33be4c37a99c0103ccea73e4
+rawtherapee-graph-5.13-799-g4c690a041_5.13+git13820.4c690a041-1_amd64.deb
+sha256 0c92105cd6f8a5f2a7361f4074a35bb9a805fe681ab449bcbd976c88ee7413c3
 ```
 
-Built 2026-11-07 from `f7f3d2848` with `tools/build-rt.sh portable`. The host
-reference is the same commit in `build/cpu-perf-graph`; the test seam and
-fail-fast changes do not alter valid-path pixel output. The export reference
+Built 2026-11-07 from `4c690a041` with `tools/build-rt.sh portable`. The host
+reference is the same commit in `build/cpu-perf-graph`; the StagePlan,
+coverage and typed-refusal changes preserve valid-path pixel output. The export reference
 must use the packaged data directory: the install adds the `options` file and
 the generated `camconst.json`, and bare `rtdata` moves the neutral export.
 
@@ -63,9 +63,10 @@ installation and export.
 
 ## Test suite
 
-The full suite `final-suite` ran at `f7f3d2848` on `build/cpu-perf-graph` and
-reported `PASS`, `failures: 0`. `6cd8c8353` and `f7f3d2848` add test seams and
-test rows only;
+The full suite `arch2-suite` ran at `4c690a041` on `build/cpu-perf-graph` and
+reported `PASS`, `failures: 0`. The StagePlan, contract-coverage and typed-
+refusal changes are covered by `stage-plan-test`, `stage-pipeline-test`,
+`stage-device-test` and `stage-residency-test`;
 their separate runs are recorded below.
 
 ### Stage and harness rows

@@ -20,11 +20,11 @@ baseline.
 ## Current package
 
 ```
-build/portable/rawtherapee-graph-5.13-795-gf7f3d2848_5.13+git13816.f7f3d2848-1_amd64.deb
-sha256 41bdcd00a5997299c72d0d9b5e2f6b79c5d49bfc33be4c37a99c0103ccea73e4
+build/portable/rawtherapee-graph-5.13-799-g4c690a041_5.13+git13820.4c690a041-1_amd64.deb
+sha256 0c92105cd6f8a5f2a7361f4074a35bb9a805fe681ab449bcbd976c88ee7413c3
 ```
 
-Built 2026-11-07 from `f7f3d2848` with `tools/build-rt.sh portable`. Fresh
+Built 2026-11-07 from `4c690a041` with `tools/build-rt.sh portable`. Fresh
 Debian 12 and Debian 13 containers both installed it with
 `apt-get install -y ./...deb`; Debian 13's t64 packages satisfied the pre-t64
 `Depends` through `Provides`. `--list-formats` listed 36 formats including
@@ -39,6 +39,7 @@ have no GPU. The full matrix is in `devnotes/perf/VALIDATION.md`.
 
 These passed the same install/formats/export/GUI rows:
 
+- `5.13+git13816.f7f3d2848-1` (sha256 `41bdcd00a5997299c72d0d9b5e2f6b79c5d49bfc33be4c37a99c0103ccea73e4`)
 - `5.13+git13806.4071906f7-1` (sha256 `587a5b699cd4adc07c9eeb3e25c3ef46b6e39fd62da799bb1668e946da6d73b4`)
 - `5.13+git13802.e42d991d2-1` (sha256 `3b1ed54edfc0b8edc4dbc7675397de463fcae77e0cf8721141741440f8b0fe58`)
 - `5.13+git13800.ade38b7b2-1` (sha256 `12d8ce6823c93566d245ecd49d7ff0f6cb41693389e092d35eaecee34ebb8647`)
