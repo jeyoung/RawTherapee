@@ -47,11 +47,8 @@
 #include "mytime.h"
 #include "procparams.h"
 #include "stage/lab_sharpening_context.h"
-#include "stage/stage_dirty_blocks.h"
-#include "stage/stage_graph.h"
 #include "stage/stage_handler.h"
-#include "stage/stage_pipeline.h"
-#include "stage/stage_work.h"
+#include "stage/stage_plan.h"
 #include "rt_math.h"
 #include "utils.h"
 #include "iccstore.h"
@@ -291,133 +288,8 @@ bool Crop::hasListener()
 namespace
 {
 
-/*
- * Canonical nodes this path does not execute as a block of its own. The crop
- * obtains its region through one opaque ImageSource::getImage() call, which
- * performs the raw select, preprocess and demosaic steps, so those nodes are
- * carried by `source.select`. The fold table is part of the stage contract.
- */
-const std::vector<std::string>& cropFoldedNodes()
-{
-    static const std::vector<std::string> folded =
-        rtengine::stage::foldedBlockIds(rtengine::stage::StagePath::Crop);
-    return folded;
-}
-
-struct CropGraphPlan {
-    bool valid = false;
-    std::string reason;
-    /* Blocks to run, in canonical plan order. */
-    std::vector<std::string> execute;
-};
-
-/*
- * Build the canonical crop spec, connect it into a StageGraph and ask
- * StageGraph::plan() which blocks this invocation may run.
- *
- * The dirty set names the blocks whose inputs changed. Folded nodes stay in
- * the graph so the raw core is marked invalid, but they do not execute on
- * their own. The executed list is the non-folded dirty nodes in topological
- * order, which is the contract's crop order (analysis before raw.base).
- */
-CropGraphPlan planCropGraph(const std::vector<std::string>& dirtyIds)
-{
-    using namespace rtengine::stage;
-
-    CropGraphPlan result;
-    const StagePipelineSpec spec = buildPipelineSpec(StagePath::Crop);
-    const std::set<std::string> dirty(dirtyIds.begin(), dirtyIds.end());
-
-    const auto indexOf = [&spec](const std::string& id) -> size_t {
-        for (size_t i = 0; i < spec.nodes.size(); ++i) {
-            if (spec.nodes[i].id == id) {
-                return i;
-            }
-        }
-        return spec.nodes.size();
-    };
-
-    StageGraph graph;
-    std::vector<size_t> nodes;
-    nodes.reserve(spec.nodes.size());
-    for (const auto& node : spec.nodes) {
-        nodes.push_back(graph.addNode(node.id, node.reuse));
-    }
-    for (const auto& edge : spec.edges) {
-        const size_t from = indexOf(edge.first);
-        const size_t to = indexOf(edge.second);
-        if (from == spec.nodes.size() || to == spec.nodes.size()) {
-            result.reason = "unknown-edge";
-            return result;
-        }
-        graph.connect(nodes[from], nodes[to]);
-    }
-
-    for (const std::string& id : dirty) {
-        if (indexOf(id) == spec.nodes.size()) {
-            result.reason = "unknown-dirty-node:" + id;
-            return result;
-        }
-    }
-
-    for (size_t i = 0; i < spec.nodes.size(); ++i) {
-        if (dirty.find(spec.nodes[i].id) != dirty.end()) {
-            graph.markDirty(nodes[i]);
-        } else {
-            graph.markClean(nodes[i]);
-        }
-    }
-
-    std::vector<size_t> order;
-    if (!graph.topologicalOrder(order) || order.size() != spec.nodes.size()) {
-        result.reason = "cycle";
-        return result;
-    }
-
-    const StagePlanResult plan_result = graph.plan();
-    if (!plan_result.valid) {
-        result.reason = plan_result.reason;
-        return result;
-    }
-    const std::vector<StageDecision>& plan = plan_result.decisions;
-    if (plan.size() != spec.nodes.size()) {
-        result.reason = "incomplete-plan";
-        return result;
-    }
-
-    std::size_t expected = 0;
-    for (const std::string& id : dirty) {
-        if (foldHost(StagePath::Crop, id) == nullptr) {
-            ++expected;
-        }
-    }
-
-    for (size_t index : order) {
-        const std::string& id = spec.nodes[index].id;
-        if (dirty.find(id) == dirty.end()) {
-            continue;
-        }
-        if (foldHost(StagePath::Crop, id) != nullptr) {
-            continue;
-        }
-        if (plan[index].action == StageAction::ReuseOutput) {
-            result.reason = id;
-            return result;
-        }
-        result.execute.push_back(id);
-    }
-
-    if (result.execute.size() != expected) {
-        result.reason = "missing-node";
-        return result;
-    }
-
-    result.valid = true;
-    return result;
-}
-
 /* One diagnostic line per process, so a log stays readable. */
-void logCropGraph(const CropGraphPlan& plan)
+void logCropGraph(const rtengine::stage::StagePlan& plan)
 {
     static std::mutex mutex;
     static bool logged = false;
@@ -428,16 +300,27 @@ void logCropGraph(const CropGraphPlan& plan)
     }
     logged = true;
 
-    const std::vector<std::string>& folded = cropFoldedNodes();
     std::fprintf(stderr,
                  "crop-graph: active, %zu canonical nodes executed, %zu "
-                 "folded: ", plan.execute.size(), folded.size());
+                 "folded, %zu buffer requirements: ",
+                 plan.execute.size(), plan.folded.size(),
+                 plan.buffers.size());
     for (const std::string& id : plan.execute) {
         std::fprintf(stderr, "%s ", id.c_str());
     }
     std::fprintf(stderr, "| folded:");
-    for (const std::string& id : folded) {
+    for (const std::string& id : plan.folded) {
         std::fprintf(stderr, " %s", id.c_str());
+    }
+    std::fprintf(stderr, "\n");
+
+    std::fprintf(stderr, "crop-graph: buffers:");
+    for (const rtengine::stage::StageBufferRequirement& buffer :
+         plan.buffers) {
+        std::fprintf(stderr, " %s(%s,%s)", buffer.id.c_str(),
+                     rtengine::stage::stageOwnershipName(buffer.ownership),
+                     rtengine::stage::stageWorkingSetName(buffer.workingSet)
+                         .c_str());
     }
     std::fprintf(stderr, "\n");
 }
@@ -445,16 +328,16 @@ void logCropGraph(const CropGraphPlan& plan)
 /*
  * Report a rejected crop plan, and stop.
  *
- * The graph is the only crop sequence, so a plan that would skip a scheduled
+ * The plan is the only crop sequence, so a plan that would skip a scheduled
  * block is a programming error: aborting keeps it visible instead of
  * publishing a partly processed viewport.
  */
-[[noreturn]] void abortCropGraph(const CropGraphPlan& plan)
+[[noreturn]] void abortCropGraph(const rtengine::stage::StagePlan& plan)
 {
     std::fprintf(stderr, "crop-graph: fatal: plan rejected: %s\n",
                  plan.reason.c_str());
     std::fprintf(stderr,
-                 "crop-graph: the graph is the only crop sequence, so there is "
+                 "crop-graph: the plan is the only crop sequence, so there is "
                  "nothing to fall back to\n");
     std::abort();
 }
@@ -545,7 +428,7 @@ void Crop::update(const EditorRequest& request)
 
 
     /*
-     * The crop graph is the only sequence. StageGraph::plan() decides which
+     * The crop plan is the only sequence. buildStagePlan() decides which
      * blocks this invocation executes; all blocks call the same methods in the
      * same order, so the plan cannot change an arithmetic step or an ordering.
      */
@@ -554,8 +437,6 @@ void Crop::update(const EditorRequest& request)
     ctx.needsInitUpdate = needsinitupdate;
     ctx.widIm = widIm;
     ctx.heiIm = heiIm;
-
-    std::vector<std::string> graphDirty;
 
     /*
      * Render state of one crop pass.
@@ -708,36 +589,40 @@ void Crop::update(const EditorRequest& request)
     const bool history = dirtyState->valid && dirtyState->paramsValid;
     const bool exactHistory = wantWorkOrder && history;
 
-    {
-        rtengine::stage::WorkInputs workInputs;
+    /*
+     * One plan for this update. The dirty-block derivation and the work order
+     * are composed by buildStagePlan(); the plan's execute list is the only
+     * crop sequence from here on. The work order still sees no history when
+     * the switch is off, which is the conservative superset.
+     */
+    rtengine::stage::StagePlanInputs planInputs;
 
-        if (exactHistory) {
-            workInputs.previousState = &dirtyState->renderState;
-            workInputs.previousFingerprints = &dirtyState->fingerprints;
-            workInputs.previousParams = &dirtyState->previousParams;
-        }
-
-        workInputs.currentState = &state;
-        workInputs.currentFingerprints = &current;
-        workInputs.requestKind = state.requestKind;
-        workInputs.path = rtengine::stage::StagePath::Crop;
-        workInputs.params = &params;
-        ctx.work = rtengine::stage::derive_crop_work(workInputs);
+    if (exactHistory) {
+        planInputs.work.previousState = &dirtyState->renderState;
+        planInputs.work.previousFingerprints = &dirtyState->fingerprints;
+        planInputs.work.previousParams = &dirtyState->previousParams;
     }
 
-    rtengine::stage::DirtyBlockInputs inputs;
-    inputs.path = rtengine::stage::StagePath::Crop;
-    inputs.currentFingerprints = &current;
-    inputs.previousFingerprints =
-        dirtyState->valid ? &dirtyState->fingerprints : nullptr;
-    inputs.previousState = dirtyState->valid ? &dirtyState->renderState
-                                             : nullptr;
-    inputs.currentState = &state;
-    inputs.forceFull = needsinitupdate
-        || request.kind == rtengine::stage::RequestKind::HighQuality;
+    planInputs.work.currentState = &state;
+    planInputs.work.currentFingerprints = &current;
+    planInputs.work.requestKind = state.requestKind;
+    planInputs.work.path = rtengine::stage::StagePath::Crop;
+    planInputs.work.params = &params;
 
-    const rtengine::stage::DirtyBlocks derived =
-        rtengine::stage::derive_dirty_blocks(inputs);
+    planInputs.dirty.path = rtengine::stage::StagePath::Crop;
+    planInputs.dirty.currentFingerprints = &current;
+    planInputs.dirty.previousFingerprints =
+        dirtyState->valid ? &dirtyState->fingerprints : nullptr;
+    planInputs.dirty.previousState =
+        dirtyState->valid ? &dirtyState->renderState : nullptr;
+    planInputs.dirty.currentState = &state;
+    planInputs.dirty.forceFull = needsinitupdate
+        || request.kind == rtengine::stage::RequestKind::HighQuality;
+    planInputs.deriveWork = true;
+
+    const rtengine::stage::StagePlan plan =
+        rtengine::stage::buildStagePlan(planInputs);
+    ctx.work = plan.work;
     ++cropDirtyDerivations;
 
     if (g_getenv("RT_CROP_DIRTY_TRACE") != nullptr) {
@@ -748,20 +633,19 @@ void Crop::update(const EditorRequest& request)
                      "params=%s\n",
                      static_cast<int>(request.kind),
                      static_cast<unsigned long long>(request.identity()),
-                     needsinitupdate ? 1 : 0, derived.forced ? 1 : 0,
+                     needsinitupdate ? 1 : 0, plan.dirty.forced ? 1 : 0,
                      params.wb.temperature, params.sharpening.amount,
                      params.colorappearance.enabled ? 1 : 0,
                      params.locallab.spots.size(),
                      params.crop.enabled ? 1 : 0,
-                     rtengine::stage::format_block_ids(derived.fromParams)
-                         .c_str());
+                     rtengine::stage::format_block_ids(
+                         plan.dirty.fromParams).c_str());
     }
 
     dirtyState->fingerprints = current;
     dirtyState->renderState = state;
     dirtyState->valid = true;
 
-    graphDirty = derived.blocks;
     using CropHandler = void (Crop::*)(CropStageContext&);
     static const rtengine::stage::StageHandlerRegistry<CropHandler> handlers =
         [] {
@@ -782,7 +666,6 @@ void Crop::update(const EditorRequest& request)
             return registry;
         }();
 
-    const CropGraphPlan plan = planCropGraph(graphDirty);
     if (!plan.valid) {
         ++cropGraphFallbacks;
         abortCropGraph(plan);

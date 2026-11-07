@@ -58,6 +58,7 @@
 #include "profiling.h"
 #include "stage/stage_graph.h"
 #include "stage/stage_pipeline.h"
+#include "stage/stage_plan.h"
 #include "stage/stage_handler.h"
 #include "stage/stage_profile.h"
 #include "stage/stage_runtime.h"
@@ -1295,7 +1296,7 @@ bool isPreviewNode(const std::string& id)
 }
 
 /* Report the first accepted plan once per process, for evidence. */
-void logPreviewGraphActive(size_t nodes)
+void logPreviewGraphActive(size_t nodes, size_t buffers)
 {
     static std::mutex mutex;
     static bool logged = false;
@@ -1308,9 +1309,11 @@ void logPreviewGraphActive(size_t nodes)
 
     std::fprintf(stderr,
                  "preview-graph: active, %zu of %zu canonical nodes executed "
-                 "from the preview inventory (%zu folded)\n",
+                 "from the preview inventory (%zu folded, %zu buffer "
+                 "requirements)\n",
                  nodes, previewSpec().nodes.size(),
-                 stage::foldedBlockIds(stage::StagePath::Preview).size());
+                 stage::foldedBlockIds(stage::StagePath::Preview).size(),
+                 buffers);
 }
 
 /*
@@ -1327,6 +1330,32 @@ stage::BlockFingerprints workFingerprints(
     for (const auto& entry : snapshot) {
         fingerprints.ids.push_back(entry.first);
         fingerprints.values.push_back(entry.second);
+    }
+    return fingerprints;
+}
+
+/*
+ * Rebuild the canonical-order vector form of a parameter snapshot.
+ *
+ * The dirty-block derivation compares two tables position by position, so a
+ * snapshot taken from a map must be projected back into the pipeline order.
+ * An incomplete snapshot is not usable history: the empty result makes the
+ * derivation force the whole path rather than compare unrelated ids.
+ */
+stage::BlockFingerprints canonicalFingerprints(
+    const stage::ParamSnapshot& snapshot,
+    const stage::StagePipelineSpec& spec)
+{
+    stage::BlockFingerprints fingerprints;
+    fingerprints.ids.reserve(spec.nodes.size());
+    fingerprints.values.reserve(spec.nodes.size());
+    for (const auto& node : spec.nodes) {
+        const auto found = snapshot.find(node.id);
+        if (found == snapshot.end()) {
+            return stage::BlockFingerprints{};
+        }
+        fingerprints.ids.push_back(node.id);
+        fingerprints.values.push_back(found->second);
     }
     return fingerprints;
 }
@@ -5082,8 +5111,10 @@ void ImProcCoordinator::updatePreviewImage(EditorRequest request,
             && previewDirtyStateValid && previewDirtyParamsValid;
         const bool exactHistory = wantWorkOrder && history;
 
+        stage::StagePlan previewPlan;
+
         {
-            stage::WorkInputs inputs;
+            stage::StagePlanInputs planInputs;
             stage::BlockFingerprints currentWork;
             stage::BlockFingerprints previousWork;
 
@@ -5091,18 +5122,56 @@ void ImProcCoordinator::updatePreviewImage(EditorRequest request,
 
             if (exactHistory) {
                 previousWork = workFingerprints(previewWorkFingerprints);
-                inputs.previousState = &previewDirtyState;
-                inputs.previousFingerprints = &previousWork;
-                inputs.previousParams = &previewDirtyParams;
+                planInputs.work.previousState = &previewDirtyState;
+                planInputs.work.previousFingerprints = &previousWork;
+                planInputs.work.previousParams = &previewDirtyParams;
             }
 
-            inputs.currentState = &pass.renderState;
-            inputs.currentFingerprints = &currentWork;
-            inputs.requestKind = pass.request.kind;
-            inputs.path = stage::StagePath::Preview;
-            inputs.params = params.get();
-            inputs.colorHlrWbRequest = colorHlrWbRequest;
-            pass.work = stage::derive_preview_work(inputs);
+            planInputs.work.currentState = &pass.renderState;
+            planInputs.work.currentFingerprints = &currentWork;
+            planInputs.work.requestKind = pass.request.kind;
+            planInputs.work.path = stage::StagePath::Preview;
+            planInputs.work.params = params.get();
+            planInputs.work.colorHlrWbRequest = colorHlrWbRequest;
+
+            /*
+             * Canonical dirty inputs. This is the base the coordinator's
+             * merged set starts from; previewDirtyBlocks() still owns the
+             * producer, deferred and intent insertions, which are not part of
+             * the RenderStateKey/ProcParams derivation.
+             */
+            stage::BlockFingerprints currentDirty =
+                canonicalFingerprints(pass.fingerprints, previewSpec());
+            stage::BlockFingerprints previousDirty;
+            const bool dirtyHistory = previewDirtyFingerprintsValid
+                && previewDirtyStateValid;
+
+            if (dirtyHistory) {
+                previousDirty = canonicalFingerprints(
+                    previewDirtyFingerprints, previewSpec());
+                planInputs.dirty.previousState = &previewDirtyState;
+            }
+
+            planInputs.dirty.path = stage::StagePath::Preview;
+            planInputs.dirty.currentFingerprints = &currentDirty;
+            planInputs.dirty.previousFingerprints =
+                dirtyHistory && !previousDirty.empty() ? &previousDirty
+                                                       : nullptr;
+            planInputs.dirty.currentState = &pass.renderState;
+            planInputs.deriveWork = true;
+
+            previewPlan = stage::buildStagePlan(planInputs);
+
+            if (previewPlan.valid) {
+                pass.work = previewPlan.work;
+            } else {
+                /*
+                 * The plan refusal is reported through the execution path; the
+                 * work order is still the direct derivation so the pass does
+                 * not run a half-specified destructive section.
+                 */
+                pass.work = stage::derive_preview_work(planInputs.work);
+            }
         }
 
         pass.dirty = previewDirtyBlocks(pass);
@@ -5117,9 +5186,26 @@ void ImProcCoordinator::updatePreviewImage(EditorRequest request,
         if (!plan.valid) {
             abortPreviewGraph(plan.reason);
         }
-        logPreviewGraphActive(plan.order.size());
 
-        for (const std::string& id : plan.order) {
+        /*
+         * The unified plan resolves the same order when the coordinator's
+         * merged dirty set is exactly the canonical derivation. The merged set
+         * owns producer, deferred and intent facts that are not inputs of the
+         * derivation, so those passes keep planPreviewPass(). planPreviewPass()
+         * has already validated every execute candidate's handler.
+         */
+        const bool usePlanOrder = previewPlan.valid
+            && previewPlan.dirty.ids == pass.dirty.ids
+            && previewPlan.execute == plan.order;
+
+        const std::vector<std::string>& order =
+            usePlanOrder ? previewPlan.execute : plan.order;
+
+        logPreviewGraphActive(order.size(),
+                              previewPlan.valid ? previewPlan.buffers.size()
+                                                : 0);
+
+        for (const std::string& id : order) {
             if (id == "monitor.output") {
                 // Executed after the crop render, at its legacy position.
                 monitorOutputPlanned = true;

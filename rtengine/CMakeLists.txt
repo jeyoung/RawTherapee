@@ -137,6 +137,7 @@ set(RTENGINESOURCEFILES
     stage/stage_param_map.cc
     stage/stage_parity.cc
     stage/stage_pipeline.cc
+    stage/stage_plan.cc
     stage/stage_profile.cc
     stage/stage_render_state.cc
     stage/stage_runtime.cc
@@ -508,6 +509,26 @@ target_include_directories(stage-work-test PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/stage"
 )
 rt_setup_target(stage-work-test)
+
+# Unified stage plan: execution order, folded nodes, buffer requirements and
+# the derivations the crop and preview adapters rely on.
+add_executable(stage-plan-test EXCLUDE_FROM_ALL
+    "${CMAKE_CURRENT_SOURCE_DIR}/stage/tests/stage_plan_test.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/editcallbacks.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/multilangmgr.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/options.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/paramsedited.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/pathutils.cc"
+    "${PROJECT_SOURCE_DIR}/rtgui/threadutils.cc"
+)
+target_include_directories(stage-plan-test BEFORE PRIVATE
+    "${CMAKE_BINARY_DIR}/rtgui"
+)
+target_link_libraries(stage-plan-test PRIVATE rtengine)
+target_include_directories(stage-plan-test PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/stage"
+)
+rt_setup_target(stage-plan-test)
 
 add_executable(stage-parity-test EXCLUDE_FROM_ALL
     "${CMAKE_CURRENT_SOURCE_DIR}/stage/tests/stage_parity_test.cc"
