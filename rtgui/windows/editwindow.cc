@@ -479,3 +479,10 @@ void EditWindow::updateToolPanelToolLocations(
         panel.second->updateToolPanelToolLocations(favorites, cloneFavoriteTools);
     }
 }
+
+void EditWindow::previewDemosaicMethodChanged()
+{
+    for (const auto& panel : epanels) {
+        panel.second->previewDemosaicMethodChanged();
+    }
+}

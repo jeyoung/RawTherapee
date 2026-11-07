@@ -67,6 +67,7 @@ public:
     void updateExternalEditorWidget(int selectedIndex, const std::vector<ExternalEditor> &editors);
     void updateToolPanelToolLocations(
         const std::vector<Glib::ustring> &favorites, bool cloneFavoriteTools);
+    void previewDemosaicMethodChanged();
 
     void toFront();
     bool keyPressed (GdkEventKey* event);

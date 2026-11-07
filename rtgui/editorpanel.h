@@ -221,6 +221,7 @@ public:
         const std::vector<Glib::ustring> &favorites, bool cloneFavoriteTools);
 
     void defaultMonitorProfileChanged (const Glib::ustring &profile_name, bool auto_monitor_profile);
+    void previewDemosaicMethodChanged ();
 
     bool saveImmediately (const Glib::ustring &filename, const SaveFormat &sf);
 
@@ -297,6 +298,7 @@ private:
     Gtk::Box* afterHeaderBox;
     Gtk::ToggleButton* toggleHistogramProfile;
     Gtk::ToggleButton* toggleFastPreview = nullptr;
+    Gtk::Separator* vsepFastPreview = nullptr;
     bool fastPreviewEnabled = false;
 
     Gtk::Frame* ppframe;

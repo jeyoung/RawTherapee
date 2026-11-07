@@ -1028,10 +1028,16 @@ void RTWindow::showPreferences ()
     const auto& options = App::get().options();
     if (epanel) {
         epanel->defaultMonitorProfileChanged (options.rtSettings.monitorProfile, options.rtSettings.autoMonitorProfile);
+        epanel->previewDemosaicMethodChanged ();
     }
 
     for (const auto &p : epanels) {
         p.second->defaultMonitorProfileChanged (options.rtSettings.monitorProfile, options.rtSettings.autoMonitorProfile);
+        p.second->previewDemosaicMethodChanged ();
+    }
+
+    if (options.multiDisplayMode > 0) {
+        EditWindow::getInstance (this)->previewDemosaicMethodChanged ();
     }
 }
 

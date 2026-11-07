@@ -869,10 +869,18 @@ EditorPanel::EditorPanel (FilePanel* filePanel)
     toggleHistogramProfile->set_active (options.rtSettings.HistogramWorking);
     toggleHistogramProfile->set_tooltip_markup ( (M ("PREFERENCES_HISTOGRAM_TOOLTIP")));
 
+    fastPreviewEnabled = options.prevdemo == PD_Fast
+        && rtengine::fastPreviewAllowed();
+
     toggleFastPreview = Gtk::manage (new Gtk::ToggleButton ());
-    Gtk::Label* fastPreviewLabel = Gtk::manage (new Gtk::Label (M ("MAIN_FASTPREVIEW")));
-    toggleFastPreview->add (*fastPreviewLabel);
-    toggleFastPreview->get_style_context()->add_class("text-button");
+    Gtk::Image* fastPreviewImage = Gtk::manage (new RTImage ("fast-preview", Gtk::ICON_SIZE_LARGE_TOOLBAR));
+    toggleFastPreview->add (*fastPreviewImage);
+    // The toggle opts out of show_all() so its visibility can follow the
+    // preference. Show the child explicitly so the icon is painted when the
+    // toggle becomes visible.
+    fastPreviewImage->show ();
+    toggleFastPreview->get_accessible()->set_name (M ("MAIN_FASTPREVIEW"));
+    toggleFastPreview->set_no_show_all (true);
     toggleFastPreview->set_relief (Gtk::RELIEF_NONE);
     toggleFastPreview->set_tooltip_markup (M ("MAIN_TOOLTIP_FASTPREVIEW"));
     toggleFastPreview->set_active (fastPreviewEnabled);
@@ -911,9 +919,10 @@ EditorPanel::EditorPanel (FilePanel* filePanel)
     toolBarPanel->pack_end   (*iareapanel->imageArea->previewModePanel, Gtk::PACK_SHRINK, 0);
     toolBarPanel->pack_end   (*vsepz4, Gtk::PACK_SHRINK, 2);
 
-    Gtk::Separator* vsepFast = Gtk::manage (new Gtk::Separator(Gtk::ORIENTATION_VERTICAL));
+    vsepFastPreview = Gtk::manage (new Gtk::Separator(Gtk::ORIENTATION_VERTICAL));
+    vsepFastPreview->set_no_show_all (true);
     toolBarPanel->pack_end   (*toggleFastPreview, Gtk::PACK_SHRINK, 1);
-    toolBarPanel->pack_end   (*vsepFast, Gtk::PACK_SHRINK, 2);
+    toolBarPanel->pack_end   (*vsepFastPreview, Gtk::PACK_SHRINK, 2);
 
     afterBox = Gtk::manage (new Gtk::Box (Gtk::ORIENTATION_VERTICAL));
     afterBox->pack_start (*iareapanel);
@@ -1144,6 +1153,7 @@ EditorPanel::EditorPanel (FilePanel* filePanel)
     send_to_external->signal_pressed().connect(sigc::mem_fun(*this, &EditorPanel::sendToExternalPressed));
     toggleHistogramProfile->signal_toggled().connect( sigc::mem_fun (*this, &EditorPanel::histogramProfile_toggled) );
     toggleFastPreview->signal_toggled().connect( sigc::mem_fun (*this, &EditorPanel::fastPreviewToggled) );
+    previewDemosaicMethodChanged ();
 
     if (navPrev) {
         navPrev->signal_pressed().connect ( sigc::mem_fun (*this, &EditorPanel::openPreviousEditorImage) );
@@ -1171,6 +1181,7 @@ EditorPanel::~EditorPanel ()
     // when the panel is removed from the notebook. Do not let close() touch
     // the fast-preview button after that point.
     toggleFastPreview = nullptr;
+    vsepFastPreview = nullptr;
 
     idle_register.destroy();
 
@@ -2771,6 +2782,28 @@ void EditorPanel::fastPreviewToggled()
 
     if (beforeIpc) {
         beforeIpc->setFastPreview(fastPreviewEnabled);
+    }
+}
+
+void EditorPanel::previewDemosaicMethodChanged()
+{
+    const bool available = App::get().options().prevdemo == PD_Fast;
+    const bool enable = available && rtengine::fastPreviewAllowed();
+
+    if (toggleFastPreview) {
+        const bool wasVisible = toggleFastPreview->get_visible();
+
+        if (!available && toggleFastPreview->get_active()) {
+            toggleFastPreview->set_active(false);
+        } else if (enable && !wasVisible) {
+            toggleFastPreview->set_active(true);
+        }
+
+        toggleFastPreview->set_visible(available);
+    }
+
+    if (vsepFastPreview) {
+        vsepFastPreview->set_visible(available);
     }
 }
 

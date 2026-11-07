@@ -844,6 +844,8 @@ Gtk::Widget* Preferences::getPerformancePanel()
     vbPerformance->set_spacing (4);
 
     Gtk::Frame* fprevdemo = Gtk::manage(new Gtk::Frame(M("PREFERENCES_PREVDEMO")));
+    Gtk::Box* vbprevdemo = Gtk::manage(new Gtk::Box(Gtk::ORIENTATION_VERTICAL));
+    vbprevdemo->set_spacing(2);
     Gtk::Box* hbprevdemo = Gtk::manage(new Gtk::Box());
     hbprevdemo->set_spacing(4);
     Gtk::Label* lprevdemo = Gtk::manage (new Gtk::Label (M("PREFERENCES_PREVDEMO_LABEL"), Gtk::ALIGN_START));
@@ -853,7 +855,11 @@ Gtk::Widget* Preferences::getPerformancePanel()
     cprevdemo->set_active(1);
     hbprevdemo->pack_start(*lprevdemo, Gtk::PACK_SHRINK);
     hbprevdemo->pack_start(*cprevdemo);
-    fprevdemo->add(*hbprevdemo);
+    Gtk::Label* lprevdemoHint = Gtk::manage(new Gtk::Label(M("PREFERENCES_PREVDEMO_HINT"), Gtk::ALIGN_START));
+    lprevdemoHint->set_line_wrap(true);
+    vbprevdemo->pack_start(*hbprevdemo, Gtk::PACK_SHRINK);
+    vbprevdemo->pack_start(*lprevdemoHint, Gtk::PACK_SHRINK);
+    fprevdemo->add(*vbprevdemo);
     vbPerformance->pack_start (*fprevdemo, Gtk::PACK_SHRINK, 4);
 
     Gtk::Frame* ftiffserialize = Gtk::manage(new Gtk::Frame(M("PREFERENCES_SERIALIZE_TIFF_READ")));
