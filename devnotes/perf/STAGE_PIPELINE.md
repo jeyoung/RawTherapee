@@ -737,13 +737,24 @@ afterwards; a separate boundary would reorder the pass. The plan still
 carries the node and tracks its dirty state, but no executor exists for it, so
 the preview executes 13 of its 14 canonical nodes.
 
-The node entry is the plan: a preview node executes only when the dirty set
-names it. A node body still decides *how much* of its output the request
-allows, and it reads the typed `EditorRequest` facts for that rather than the
-mask: `raw.base` rebuilds the base for one class of requests, re-prepares
-retinex for another and re-applies spots for a third. `monitor.output`
-executes at its legacy site, after the crop render, so the monitor profile
-cache refresh it follows still feeds the crop viewport.
+The canonical node entry is the dirty set: `StagePlan::execute` names the
+dirty, non-folded nodes. A node body still decides *how much* of its output
+the request allows, and it reads the typed `EditorRequest` facts for that
+rather than the mask: `raw.base` rebuilds the base for one class of requests,
+re-prepares retinex for another and re-applies spots for a third.
+`monitor.output` executes at its legacy site, after the crop render, so the
+monitor profile cache refresh it follows still feeds the crop viewport.
+
+The preview resolves two orders. The canonical `StagePlan` names the dirty,
+non-folded nodes. `planPreviewPass()` also names every clean node whose graph
+decision is `ReuseInput`, because that body still writes in place. The
+canonical order runs only when the two lists are identical; otherwise the
+merged list runs. When the dirty sets are identical the two lists must name
+their dirty nodes in the same order, and `executeOrderMatches()` aborts the
+pass on a divergence. A clean `ReuseInput` node in the merged list is an
+expected addition, not a divergence: a guide-only repaint has no parameter
+delta and only `monitor.output` dirty, so the canonical list omits the clean
+in-place chain while the merged order still runs it.
 
 The producer side is typed too. Tools name a `RequestIntent`;
 `make_request()` builds the typed kind and facts, and the event registry stores

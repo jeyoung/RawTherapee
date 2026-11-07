@@ -13,9 +13,9 @@ progress log is in
 | Item | Value |
 |---|---|
 | Repository | `$REPO` |
-| Branch | `perf-graph`, tip `d6f5ef1f6` |
-| Worktree | main checkout, clean, 24 commits ahead of `origin/perf-graph` |
-| Latest code change | `d6f5ef1f6` (StagePlan, contract coverage, typed refusals and fail-closed preview planning); later commits are documentation and package records |
+| Branch | `perf-graph`, tip `0f73d2ee1` |
+| Worktree | main checkout, clean after the documentation commit, ahead of `origin/perf-graph` |
+| Latest code change | `0f73d2ee1` (accept clean `ReuseInput` nodes in the preview merged order); later commits are documentation |
 | Build trees | `build/cpu-perf-graph`, `build/opencl-perf-graph` (GCC, Release, generic target) |
 | Baseline | `dev` `9c3426339` plus the AMaZE source patch from `2ebf08b0f`, branch `dev-amaze`, build `build/cpu-dev-amaze` |
 | Test corpus | public 10.2 MP PEF; 45.7 MP NEF; TIFF and JPEG generated from the PEF |
@@ -78,7 +78,9 @@ off), `RT_STAGE_DEVICE_BUDGET_MB`, `RT_WORK_SHADOW`, `RT_OPENCL_ALLOW_CPU`,
 - **StagePlan**: `buildStagePlan()` composes the path specification, dirty
   blocks, work order, buffer/working-set requirements and execute order. Crop
   uses it for derivation and execution; preview uses it for the canonical
-  bundle and falls back to the coordinator-merged plan when the sets differ.
+  bundle and runs the coordinator-merged order when that order adds clean
+  `ReuseInput` bodies. `executeOrderMatches()` fails the pass closed when the
+  two orders disagree on the dirty nodes.
 - **Contract implementation map**: every block now carries `hostBody`,
   `deviceCoverage` and `deviceStages`, projected into the descriptor and
   validated against `stage_opencl_device.cc`.
@@ -94,8 +96,24 @@ off), `RT_STAGE_DEVICE_BUDGET_MB`, `RT_WORK_SHADOW`, `RT_OPENCL_ALLOW_CPU`,
 
 ## Current verification summary
 
-The full suite `final-suite` (suite tip `17a5995c5`, build `cpu-perf-graph`)
-reports `PASS`, `failures: 0`. All of its rows pass:
+The full suite `suite-grid-final` (worktree at the change that became
+`0f73d2ee1`, build `cpu-perf-graph`) reports `PASS`, `failures: 0`. It covers
+the merged-order fix and its regression: stage host tests including
+`stage-plan-test`, baseline parity against the corrected `dev` baseline,
+export/thumbnail/crop graph parity, crop dirty derivation, neutral thread
+determinism and preview latency.
+
+The crash that motivated the fix is reproduced and cleared through the GUI
+path: with the Crop tool open and a non-full crop selection, enabling the Grid
+row in Crop Guide now repaints without the
+`canonical and merged preview plans disagree on order` abort. Toggling Grid,
+Rule of Thirds, Rule of Diagonals, Harmonic Means, Crosshair, Golden
+Triangles, Golden Ratio, Biometric Passport and Centred Square leaves the
+process alive. The pre-fix tree aborted on the first Grid enable with a crop
+selection.
+
+The earlier full suite `final-suite` (suite tip `17a5995c5`, build
+`cpu-perf-graph`) also reports `PASS`, `failures: 0`. All of its rows pass:
 
 - stage host tests: `stage-abi`, `stage-parity`, `stage-cache`, `stage-graph`,
   `stage-indexer`, `stage-store`, `stage-node-cache`, `stage-device`,
