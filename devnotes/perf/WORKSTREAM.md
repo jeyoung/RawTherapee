@@ -8,6 +8,15 @@ progress log is in
 [`deprecated/WORKSTREAM-PROGRESS-2026-11.md`](deprecated/WORKSTREAM-PROGRESS-2026-11.md)
 (deprecated; historical only).
 
+## Stream status
+
+Closed for this phase on 2026-11-07 at `099b3f9f6`. The branch is pushed to
+`origin/perf-graph` and deliberately not merged into `dev` or `perf`; the next
+work moves to the `perf` line. Revisit the remaining path-specific body
+extraction (local-adjustments orchestration and raw-base finishing) and the
+target-neutral/OpenCL body dispatcher when the stream reopens. Do not merge or
+rebase `dev`/`perf` into `perf-graph` while it is closed.
+
 ## Current state
 
 | Item | Value |
