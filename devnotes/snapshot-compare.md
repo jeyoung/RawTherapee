@@ -115,11 +115,14 @@ value is recorded rather than relaxed.
 
 ## Packaging
 
-`tools/build-rt.sh portable` produced:
+`tools/build-rt.sh portable` was run from a clean clone of the pushed commit
+`083c4fb54`, so the Git-derived version is available inside the container. The
+package is stored in `build/portable/`:
 
 ```text
-rawtherapee-5.13_5.13+git0.local-1_amd64.deb
-SHA-256 71fcdaf6e8940b241f71b5522eb1e2c0d7de292df255c27060cf869f63b99635
+rawtherapee-5.13-181-g083c4fb54_5.13+git13202.083c4fb54-1_amd64.deb
+Version 5.13+git13202.083c4fb54-1
+SHA-256 e323093981988237822ffe600c4ee07a724562cebc3b6f08803791741a1ba26e
 ```
 
 The package installed and `rawtherapee-cli --list-formats` passed in the
