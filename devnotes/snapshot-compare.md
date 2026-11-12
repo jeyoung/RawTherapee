@@ -113,6 +113,23 @@ value is recorded rather than relaxed.
 - The `\` binding does not test AltGr, because on Windows `GDK_MOD2_MASK` is
   also NumLock.
 
+## Packaging
+
+`tools/build-rt.sh portable` produced:
+
+```text
+rawtherapee-5.13_5.13+git0.local-1_amd64.deb
+SHA-256 71fcdaf6e8940b241f71b5522eb1e2c0d7de292df255c27060cf869f63b99635
+```
+
+The package installed and `rawtherapee-cli --list-formats` passed in the
+Debian 12 build container and in a Debian 13 container. The Debian 13 check
+needed `libhwy1` installed explicitly; the package's dependency metadata lists
+it, so a normal `apt` install resolves it.
+
+The GUI smoke test was run from the CPU build under Xvfb, not from the
+installed package. GPU tests were not run in the containers.
+
 ## Known limitations
 
 - Source-coordinate alignment is not implemented. Geometry-different
