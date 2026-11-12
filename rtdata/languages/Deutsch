@@ -230,7 +230,6 @@ FILEBROWSER_PARTIALPASTEPROFILE;Profil selektiv einfügen
 FILEBROWSER_PASTEPROFILE;Profil einfügen
 FILEBROWSER_POPUPCANCELJOB;Job abbrechen
 FILEBROWSER_POPUPCOLORLABEL;Farbmarkierung
-FILEBROWSER_POPUPCOLORLABEL0;Markierung: Ohne
 FILEBROWSER_POPUPCOLORLABEL1;Markierung: Rot
 FILEBROWSER_POPUPCOLORLABEL2;Markierung: Gelb
 FILEBROWSER_POPUPCOLORLABEL3;Markierung: Grün
@@ -248,7 +247,6 @@ FILEBROWSER_POPUPPROCESS;Zur Warteschlange hinzufügen
 FILEBROWSER_POPUPPROCESSFAST;Zur Warteschlange hinzufügen\n(Schnell-Export)
 FILEBROWSER_POPUPPROFILEOPERATIONS;Profiloperationen
 FILEBROWSER_POPUPRANK;Bewertung
-FILEBROWSER_POPUPRANK0;Nicht bewertet
 FILEBROWSER_POPUPRANK1;Bewertung 1 *
 FILEBROWSER_POPUPRANK2;Bewertung 2 **
 FILEBROWSER_POPUPRANK3;Bewertung 3 ***
@@ -3816,7 +3814,6 @@ TP_LOCALLAB_MERNIN;Bildschirm
 TP_LOCALLAB_MERONE;Normal
 TP_LOCALLAB_MERSAT;Sättigung
 TP_LOCALLAB_MERSEV;Weiches Licht (legacy)
-TP_LOCALLAB_MERSEV0;Weiches Licht Illusion
 TP_LOCALLAB_MERSEV1;Weiches Licht W3C
 TP_LOCALLAB_MERSEV2;Hartes Licht
 TP_LOCALLAB_MERSIX;Division
@@ -4927,7 +4924,6 @@ TP_WBALANCE_SOLUX47;Solux 4700K (Vendor)
 TP_WBALANCE_SOLUX47_NG;Solux 4700K (Nat. Gallery)
 TP_WBALANCE_SPOTWB;Manuell setzen
 TP_WBALANCE_STUDLABEL;Bezugsfaktor: %1
-TP_WBALANCE_STUDLABEL0;Bezugsfaktor: %1 Durchgänge: %2 Alt=%3
 TP_WBALANCE_STUDLABEL1;Bezugsfaktor: %1 Durchgänge: %2 Beste_Alt=%3
 TP_WBALANCE_STUDLABEL_TOOLTIP;Anzeige des berechneten Bezugsfaktors.\nNiedrigere Werte sind besser, wobei <0,005 ausgezeichnet,\n<0,01 gut und> 0,5 schlecht ist.\nNiedrige Werte bedeuten jedoch nicht automatisch, dass der Weißabgleich gut ist:\nwenn die Lichtquelle nicht eindeutig ist können die Ergebnisse fehlerhaft sein.\nEin Wert von 1000 bedeutet, dass frühere Berechnungen verwendet werden und die Ergebnisse wahrscheinlich gut sind. Durchgänge: Anzahl der Berechnungen, (beste) Alt: Alternative Temperatur.
 TP_WBALANCE_TEMPBIAS;AWB-Temperatur-Korrektur
@@ -4951,7 +4947,71 @@ ZOOMPANEL_ZOOMOUT;Herauszoomen\nTaste: <b>-</b>
 ! Untranslated keys follow; remove the ! prefix after an entry is translated.
 !!!!!!!!!!!!!!!!!!!!!!!!!
 
+!HISTORY_MSG_CATBRIGHTRES;CAL - IA - Brightness curves threshold
+!HISTORY_MSG_LOCAL_BLURCIEDE;Local - CIECAM - Blur shape detection
+!HISTORY_MSG_LOCAL_CIE_GAMGAIN;Local - CIECAM - Gain
+!HISTORY_MSG_LOCAL_CIE_GAMLIST;Local - CIECAM - Target Gamut
+!HISTORY_MSG_LOCAL_CIE_GAMPOWER;Local - CIECAM - Power
+!HISTORY_MSG_LOCAL_CIE_RGB_BRIGHTHRES;Local - CIECAM - Brightness curves threshold
+!HISTORY_MSG_LOCAL_CIE_RGB_COLORHBLUE;Local - CIECAM - Hue blue
+!HISTORY_MSG_LOCAL_CIE_RGB_COLORHGREEN;Local - CIECAM - Hue green
+!HISTORY_MSG_LOCAL_CIE_RGB_COLORHRED;Local - CIECAM - Hue red
+!HISTORY_MSG_LOCAL_CIE_RGB_SCHROMABLUE;Local - CIECAM - Sat blue
+!HISTORY_MSG_LOCAL_CIE_RGB_SCHROMAGREEN;Local - CIECAM - Sat green
+!HISTORY_MSG_LOCAL_CIE_RGB_SCHROMARED;Local - CIECAM - Sat red
+!HISTORY_MSG_LOCAL_CIE_RGB_SHAPEBLUE;Local - CIECAM - Brightness blue
+!HISTORY_MSG_LOCAL_CIE_RGB_SHAPEGREEN;Local - CIECAM - Brightness green
+!HISTORY_MSG_LOCAL_CIE_RGB_SHAPERED;Local - CIECAM - Brightness red
+!HISTORY_MSG_LOCAL_CIE_SMOOTHJCIE;Local - CIECAM - Smooth
+!HISTORY_MSG_LOCAL_GRADWAV;Local- Wavelet Gradient levels
+!HISTORY_MSG_LOCAL_LIMITWAV;Local - Wavelet Prevent decomposition
+!HISTORY_SNAPSHOT_BASE;Base
+!HISTORY_SNAPSHOT_BASE_TOOLTIP;Automatically created from the image as loaded; cannot be deleted.
+!HISTORY_SNAPSHOT_COMPARE_MARKER;Comparison snapshot
+!HISTORY_SNAPSHOT_COMPARE_RESTORE;Restore Base as comparison snapshot
+!HISTORY_SNAPSHOT_COMPARE_SET;Use as comparison snapshot
+!HISTORY_SNAPSHOT_DELETE;Delete snapshot
+!INSPECTOR_FIT_WINDOW;Fit to window
+!INSPECTOR_FIT_WINDOW_TOOLTIP;Show the whole image, fitted to the Inspect tab
+!MAIN_FASTPREVIEW;Fast
+!MAIN_TOOLTIP_FASTPREVIEW;Use <b>fast demosaicing</b> for the editor preview at <b>100% and above</b>.\nTurn off to render the full demosaic method.\n\nBelow 100% zoom the <b>Preview Demosaic Method</b> preference applies. This control is available and on by default when that preference is set to <b>Fast</b>. The setting is per editor tab and lasts for the current session.
+!PREFERENCES_OPENCL;OpenCL acceleration
+!PREFERENCES_OPENCL_CAPTURE;Capture Sharpening
+!PREFERENCES_OPENCL_CAPTURE_AUTO;Auto
+!PREFERENCES_OPENCL_CAPTURE_OFF;Off (CPU)
+!PREFERENCES_OPENCL_CAPTURE_ON;On (GPU)
+!PREFERENCES_OPENCL_CAPTURE_TOOLTIP;Off keeps Capture Sharpening on the CPU. On uses the GPU when the stage is supported. Auto compares a small CPU and GPU calibration sample and chooses the faster path, falling back to the CPU when uncertain.
+!PREFERENCES_OPENCL_DEVICE;Device
+!PREFERENCES_OPENCL_DEVICE_AUTO;Automatic
+!PREFERENCES_OPENCL_ENABLE;Use OpenCL acceleration
+!PREFERENCES_OPENCL_ENABLE_TOOLTIP;Accelerate selected image processing stages on the GPU when an OpenCL device is available. The CPU path remains available and is used as a fallback.
+!PREFERENCES_OPENCL_MODE;Accelerate
+!PREFERENCES_OPENCL_MODE_ALL;Preview and export
+!PREFERENCES_OPENCL_MODE_EXPORT;Export only
+!PREFERENCES_OPENCL_RUSTICL;Rusticl driver
+!PREFERENCES_OPENCL_RUSTICL_AUTO;Auto
+!PREFERENCES_OPENCL_RUSTICL_HINT;Leave empty for automatic detection (Linux only). Mesa Rusticl needs an explicit driver; AMD uses radeonsi and Intel uses iris. A restart may be required after changing this value.
+!PREFERENCES_OPENCL_RUSTICL_TOOLTIP;Driver name passed to Mesa Rusticl through RUSTICL_ENABLE. Leave empty to detect the driver from the GPU vendor. An existing RUSTICL_ENABLE environment variable takes precedence.
+!PREFERENCES_PREVDEMO_HINT;With Fast, the preview below 100% zoom uses fast demosaicing and the editor Fast control is available and on by default for 100% and above. With As in PP3, the preview always uses the demosaicing method from the processing profile and the editor hides that control.
+!PREFERENCES_RAW_DECODER_FAST;Prefer the faster legacy decoder for supported raw files (experimental)
+!PREFERENCES_RAW_DECODER_FAST_TOOLTIP;Tries the internal dcraw decoder for supported single-frame Pentax/Nikon Bayer files. Falls back to LibRaw on failure. DNG, X-Trans, multi-frame and other cameras keep LibRaw.
 !PREFERENCES_WBAGREENDELTA;Delta temperature in green iterate loop (if Force Extra enabled)
+!SNAPSHOT_COMPARE_BADGE;SNAPSHOT: %1 — release \ to return
+!SNAPSHOT_COMPARE_BASE_DELETE_REFUSED;The Base snapshot cannot be deleted.
+!SNAPSHOT_COMPARE_NO_IMAGE;No image is available for comparison.
+!SNAPSHOT_COMPARE_RENDERING;Rendering comparison
+!SNAPSHOT_COMPARE_RETURNING;Returning to live
+!SNAPSHOT_COMPARE_TWEAK_ACTIVE;Finish the current tool adjustment before comparing.
+!TP_COLORAPP_BRIGHTHRES;Brightness curves threshold
+!TP_LOCALLAB_CIEREDGREENBLUE_FRAME;Red Green Blue
+!TP_LOCALLAB_CIE_FINALRGB;Final max RGB: %1
+!TP_LOCALLAB_CIE_FINALSAT;Final max saturation: %1
+!TP_LOCALLAB_GAMUTW_TOOLTIP; Placed at the end of Selective Editing > Color Appearance (CAM16 & JzCzHz), compresses the colors into the chosen profile. It is applied after all previous spots and the other adjustments in this tool.\n\nOutput gamut compression is much simpler than input gamut compression. Colors near the output stage of processing are rarely outside the working profile. A reduced set of adjustments is sufficient.\n\nOften, there is little to no change to the image when using Gamut Compression. This is because it does not convert the color profile, but compresses colors to fit the target gamut. Adjustments applied before compression usually keep colors in the target gamut. The effect is visible on LEDs and vibrant flowers. On normal landscapes and portraits, there is often no change.
+!TP_LOCALLAB_GRADWAV;Gradient levels
+!TP_LOCALLAB_GRADWAV_TOOLTIP;Controls the strength of the Local contrast adjustment for wavelet levels 3 and higher. Has full effect when the Wavelet levels threshold adjuster's top-right value is at least 6, half the effect for values 4 and 5, and no effect for values 3 or lower
+!TP_LOCALLAB_LIMITWAV;Protect extreme shadows and highlights
+!TP_LOCALLAB_LIMITWAV_TOOLTIP;Prevents the wavelet functions from modifying the contrast in the extreme shadows and highlights.
+!TP_LOCALLAB_RGBMAXDATA_TOOLTIP;Shows the maximum RGB value and saturation, which can be used to determine if any colors are out-of-gamut. Values greater than 1 for ‘Final max RGB’ and ‘Final max saturation’ always indicate out-of-gamut colors. Values less than 1 are inconclusive because it depends on other factors like the luminance. This check is performed at the end of the tool and considers everything applied before the current Spot. It does not consider adjustments located later in the process, such as Abstract Profile or Color Appearance & Lighting. \n\nThe maximum RGB value and saturation reflect the state of the image after the Gain (Ev) and Gamut Compression (Target Gamut and Power) adjustments. The values are shown in linear space in the working profile.\n\nData is only displayed if Target Gamut is enabled, or if Gain (Ev) is not equal to 0.
 !TP_SHARPENING_CAPFRAME;Corner boost
 !TP_SHARPENING_CONTRASTAUTO_TOOLTIP;Auto contrast level estimation.\nValue subject to variation depending on position in preview.\nBe careful, disable auto after estimation.
 !TP_SHARPENING_EDRADIUS;Capture Radius

@@ -142,7 +142,6 @@ FILEBROWSER_PARTIALPASTEPROFILE;プロファイルの貼り付け　- 一部
 FILEBROWSER_PASTEPROFILE;プロファイルの貼り付け
 FILEBROWSER_POPUPCANCELJOB;ジョブ キャンセル
 FILEBROWSER_POPUPCOLORLABEL;カラー・ラベル
-FILEBROWSER_POPUPCOLORLABEL0;ラベル：　なし
 FILEBROWSER_POPUPCOLORLABEL1;ラベル：　レッド
 FILEBROWSER_POPUPCOLORLABEL2;ラベル：　イエロー
 FILEBROWSER_POPUPCOLORLABEL3;ラベル：　グリーン
@@ -160,7 +159,6 @@ FILEBROWSER_POPUPPROCESS;キューに追加
 FILEBROWSER_POPUPPROCESSFAST;キューに追加 (高速書き出し)
 FILEBROWSER_POPUPPROFILEOPERATIONS;プロファイルの操作
 FILEBROWSER_POPUPRANK;ランク
-FILEBROWSER_POPUPRANK0;ランクなし
 FILEBROWSER_POPUPRANK1;ランク　1 *
 FILEBROWSER_POPUPRANK2;ランク　2 **
 FILEBROWSER_POPUPRANK3;ランク　3 ***
@@ -3349,7 +3347,6 @@ TP_LOCALLAB_MERNIN;スクリーン
 TP_LOCALLAB_MERONE;標準
 TP_LOCALLAB_MERSAT;彩度
 TP_LOCALLAB_MERSEV;ソフトライト（レガシー）
-TP_LOCALLAB_MERSEV0;ソフトライト　イリュージョン
 TP_LOCALLAB_MERSEV1;ソフトライト W3C
 TP_LOCALLAB_MERSEV2;ハードライト
 TP_LOCALLAB_MERSIX;分割
@@ -4396,15 +4393,16 @@ ZOOMPANEL_ZOOMOUT;ズームアウト\nショートカット: <b>-</b>
 ! Untranslated keys follow; remove the ! prefix after an entry is translated.
 !!!!!!!!!!!!!!!!!!!!!!!!!
 
-!HISTORY_MSG_CATCURVEBLUE;CAL - IA - Brightness Blue
-!HISTORY_MSG_CATCURVEGREEN;CAL - IA - Brightness Green
-!HISTORY_MSG_CATCURVERED;CAL - IA - Brightness Red
-!HISTORY_MSG_CATHUEBLUE;CAL - IA - Hue Blue
-!HISTORY_MSG_CATHUEGREEN;CAL - IA - Hue Green
-!HISTORY_MSG_CATHUERED;CAL - IA - Hue Red
-!HISTORY_MSG_CATSCHROMABLUE;CAL - IA - Saturation Blue
-!HISTORY_MSG_CATSCHROMAGREEN;CAL - IA - Saturation Green
-!HISTORY_MSG_CATSCHROMARED;CAL - IA - Saturation Red
+!HISTORY_MSG_CATBRIGHTRES;CAL - IA - Brightness curves threshold
+!HISTORY_MSG_CATCURVEBLUE;CAL - IA - Brightness blue
+!HISTORY_MSG_CATCURVEGREEN;CAL - IA - Brightness green
+!HISTORY_MSG_CATCURVERED;CAL - IA - Brightness red
+!HISTORY_MSG_CATHUEBLUE;CAL - IA - Hue blue
+!HISTORY_MSG_CATHUEGREEN;CAL - IA - Hue green
+!HISTORY_MSG_CATHUERED;CAL - IA - Hue red
+!HISTORY_MSG_CATSCHROMABLUE;CAL - IA - Saturation blue
+!HISTORY_MSG_CATSCHROMAGREEN;CAL - IA - Saturation green
+!HISTORY_MSG_CATSCHROMARED;CAL - IA - Saturation red
 !HISTORY_MSG_CG_COLORSPACE;Gamut Compression - Target
 !HISTORY_MSG_CG_CYANDC_AUTO;Gamut Compression - Auto Limits Cyan
 !HISTORY_MSG_CG_CYANDM_AUTO;Gamut Compression - Auto Limits Magenta
@@ -4466,15 +4464,30 @@ ZOOMPANEL_ZOOMOUT;ズームアウト\nショートカット: <b>-</b>
 !HISTORY_MSG_LOCAL_AUTOSHAR;Local - Sh Auto Contrast
 !HISTORY_MSG_LOCAL_AUTOSP;Local - GHS - Auto SP
 !HISTORY_MSG_LOCAL_AVOIDNEGATIVE;Local - SC - Pre-filter zero and negative values
+!HISTORY_MSG_LOCAL_BLURCIEDE;Local - CIECAM - Blur shape detection
 !HISTORY_MSG_LOCAL_CAPRADIUS;Local - Sh Capture radius
 !HISTORY_MSG_LOCAL_CIE_CONTSIG;Local CIECAM - Sigmoid contrast
-!HISTORY_MSG_LOCAL_CIE_MIDTMET;Local - CIECAM Midtones Method
-!HISTORY_MSG_LOCAL_CIE_NORM11;Local - CIECAM Normalize luminance 5.11
-!HISTORY_MSG_LOCAL_CIE_SAT;Local - CIECAM Saturation
+!HISTORY_MSG_LOCAL_CIE_GAMGAIN;Local - CIECAM - Gain
+!HISTORY_MSG_LOCAL_CIE_GAMLIST;Local - CIECAM - Target Gamut
+!HISTORY_MSG_LOCAL_CIE_GAMPOWER;Local - CIECAM - Power
+!HISTORY_MSG_LOCAL_CIE_MIDTMET;Local - CIECAM - Midtones Method
+!HISTORY_MSG_LOCAL_CIE_NORM11;Local - CIECAM - Normalize luminance 5.11
+!HISTORY_MSG_LOCAL_CIE_RGB_BRIGHTHRES;Local - CIECAM - Brightness curves threshold
+!HISTORY_MSG_LOCAL_CIE_RGB_COLORHBLUE;Local - CIECAM - Hue blue
+!HISTORY_MSG_LOCAL_CIE_RGB_COLORHGREEN;Local - CIECAM - Hue green
+!HISTORY_MSG_LOCAL_CIE_RGB_COLORHRED;Local - CIECAM - Hue red
+!HISTORY_MSG_LOCAL_CIE_RGB_SCHROMABLUE;Local - CIECAM - Sat blue
+!HISTORY_MSG_LOCAL_CIE_RGB_SCHROMAGREEN;Local - CIECAM - Sat green
+!HISTORY_MSG_LOCAL_CIE_RGB_SCHROMARED;Local - CIECAM - Sat red
+!HISTORY_MSG_LOCAL_CIE_RGB_SHAPEBLUE;Local - CIECAM - Brightness blue
+!HISTORY_MSG_LOCAL_CIE_RGB_SHAPEGREEN;Local - CIECAM - Brightness green
+!HISTORY_MSG_LOCAL_CIE_RGB_SHAPERED;Local - CIECAM - Brightness red
+!HISTORY_MSG_LOCAL_CIE_SAT;Local - CIECAM - Saturation
 !HISTORY_MSG_LOCAL_CIE_SKEWSIG;Local CIECAM - Sigmoid skew
-!HISTORY_MSG_LOCAL_CIE_SLOPESMOQ;Local - CIECAM Gray balance
-!HISTORY_MSG_LOCAL_CIE_SMOOTHINV;Local CIECAM - Inverse color
-!HISTORY_MSG_LOCAL_CIE_SMOOTHLNK;Local CIECAM - Link R G B
+!HISTORY_MSG_LOCAL_CIE_SLOPESMOQ;Local - CIECAM - Gray balance
+!HISTORY_MSG_LOCAL_CIE_SMOOTHINV;Local - CIECAM - Inverse color
+!HISTORY_MSG_LOCAL_CIE_SMOOTHJCIE;Local - CIECAM - Smooth
+!HISTORY_MSG_LOCAL_CIE_SMOOTHLNK;Local - CIECAM - Link R G B
 !HISTORY_MSG_LOCAL_CIE_SMOOTHTH;Local CIECAM - Attenuation threshold
 !HISTORY_MSG_LOCAL_CIE_SMOOTHTHTRC;Local CIECAM - Highlight attenuation threshold
 !HISTORY_MSG_LOCAL_CIE_SMOOTHTRC;Local CIECAM - Inverse color
@@ -4493,14 +4506,14 @@ ZOOMPANEL_ZOOMOUT;ズームアウト\nショートカット: <b>-</b>
 !HISTORY_MSG_LOCAL_DENOMASK;Local - Denoise Contrast mask
 !HISTORY_MSG_LOCAL_DENOMASKCURV;Local - Denoise Equalizer Denoise mask
 !HISTORY_MSG_LOCAL_DENORATIO;Local - Denoise Ratio flat-structure
-!HISTORY_MSG_LOCAL_FEATHERCIE;Local - CIECAM Gradient feather
+!HISTORY_MSG_LOCAL_FEATHERCIE;Local - CIECAM - Gradient feather
 !HISTORY_MSG_LOCAL_FEATHERCOL;Local - Color Gradient feather
 !HISTORY_MSG_LOCAL_FEATHEREXE;Local - Exp Gradient feather
 !HISTORY_MSG_LOCAL_FEATHERLOG;Local - Log Gradient feather
-!HISTORY_MSG_LOCAL_FEATHERMAS;Local - Mask Common gradient feather
+!HISTORY_MSG_LOCAL_FEATHERMAS;Local - Mask Common Gradient feather
 !HISTORY_MSG_LOCAL_FEATHERSH;Local - SH Gradient feather
-!HISTORY_MSG_LOCAL_FEATHERVIB;Local - Vib Gradient feather
-!HISTORY_MSG_LOCAL_FEATHERWAV;Local - Wav Gradient feather
+!HISTORY_MSG_LOCAL_FEATHERVIB;Local - Vibrance Gradient feather
+!HISTORY_MSG_LOCAL_FEATHERWAV;Local - Wavelet Gradient feather
 !HISTORY_MSG_LOCAL_GHSMETHOD;Local - GHS - Method
 !HISTORY_MSG_LOCAL_GHS_AGX;Local - GHS - Matrix
 !HISTORY_MSG_LOCAL_GHS_AUTOBW;Local - GHS - Auto Black point and White point
@@ -4518,6 +4531,8 @@ ZOOMPANEL_ZOOMOUT;ズームアウト\nショートカット: <b>-</b>
 !HISTORY_MSG_LOCAL_GHS_SLOPE;Local - GHS - Lab slope factor
 !HISTORY_MSG_LOCAL_GHS_SMOOTH;Local - GHS - Highlight attenuation
 !HISTORY_MSG_LOCAL_GHS_SP;Local - GHS - Symmetry point
+!HISTORY_MSG_LOCAL_GRADWAV;Local- Wavelet Gradient levels
+!HISTORY_MSG_LOCAL_LIMITWAV;Local - Wavelet Prevent decomposition
 !HISTORY_MSG_LOCAL_LOCKMADL;Local - Denoise Lock MadL
 !HISTORY_MSG_LOCAL_LOCKMADL2;Local - Manual MadL
 !HISTORY_MSG_LOCAL_LOCKMADLS;Local - Denoise - MadL
@@ -4532,9 +4547,9 @@ ZOOMPANEL_ZOOMOUT;ズームアウト\nショートカット: <b>-</b>
 !HISTORY_MSG_LOCAL_MICH_SPAR;Local - Michaelis-Menten Output Scale
 !HISTORY_MSG_LOCAL_MICH_WHITE;Local - Michaelis-Menten Dynamic range
 !HISTORY_MSG_LOCAL_NLITER;Local - Nlmeans - Iterations
-!HISTORY_MSG_LOCAL_OFFSETWAV;Local Wav offset
-!HISTORY_MSG_LOCAL_PROCESSWAV;Local - Wavelets - Show modifications
-!HISTORY_MSG_LOCAL_QJMETHOD;Local - CIECAM Tone mapping operator Q and J
+!HISTORY_MSG_LOCAL_OFFSETWAV;Local - Wavelet Offset
+!HISTORY_MSG_LOCAL_PROCESSWAV;Local - Wavelet Show modifications
+!HISTORY_MSG_LOCAL_QJMETHOD;Local - CIECAM - Tone mapping operator Q and J
 !HISTORY_MSG_LOCAL_SHARITERCHECK;Local - Sh Auto limit iterations
 !HISTORY_MSG_LOCAL_SHARREPAR;Local - Sh Strength
 !HISTORY_MSG_LOCAL_SHARSHOW;Local - Sh Show contrast mask
@@ -4556,21 +4571,58 @@ ZOOMPANEL_ZOOMOUT;ズームアウト\nショートカット: <b>-</b>
 !HISTORY_MSG_TRANS_SCALE;Geometry - Scale
 !HISTORY_MSG_TRANS_SCALE_HORIZONTALLY;Geometry - Scale horizontally
 !HISTORY_MSG_TRANS_SCALE_VERTICALLY;Geometry - Scale vertically
+!HISTORY_SNAPSHOT_BASE;Base
+!HISTORY_SNAPSHOT_BASE_TOOLTIP;Automatically created from the image as loaded; cannot be deleted.
+!HISTORY_SNAPSHOT_COMPARE_MARKER;Comparison snapshot
+!HISTORY_SNAPSHOT_COMPARE_RESTORE;Restore Base as comparison snapshot
+!HISTORY_SNAPSHOT_COMPARE_SET;Use as comparison snapshot
+!HISTORY_SNAPSHOT_DELETE;Delete snapshot
+!INSPECTOR_FIT_WINDOW;Fit to window
+!INSPECTOR_FIT_WINDOW_TOOLTIP;Show the whole image, fitted to the Inspect tab
+!MAIN_FASTPREVIEW;Fast
+!MAIN_TOOLTIP_FASTPREVIEW;Use <b>fast demosaicing</b> for the editor preview at <b>100% and above</b>.\nTurn off to render the full demosaic method.\n\nBelow 100% zoom the <b>Preview Demosaic Method</b> preference applies. This control is available and on by default when that preference is set to <b>Fast</b>. The setting is per editor tab and lasts for the current session.
 !PARTIALPASTE_COMPRESSGAMUT;Gamut Compression
 !PARTIALPASTE_CROPGUIDE;Crop Guide
 !PARTIALPASTE_FRAMING;Framing
+!PREFERENCES_OPENCL;OpenCL acceleration
+!PREFERENCES_OPENCL_CAPTURE;Capture Sharpening
+!PREFERENCES_OPENCL_CAPTURE_AUTO;Auto
+!PREFERENCES_OPENCL_CAPTURE_OFF;Off (CPU)
+!PREFERENCES_OPENCL_CAPTURE_ON;On (GPU)
+!PREFERENCES_OPENCL_CAPTURE_TOOLTIP;Off keeps Capture Sharpening on the CPU. On uses the GPU when the stage is supported. Auto compares a small CPU and GPU calibration sample and chooses the faster path, falling back to the CPU when uncertain.
+!PREFERENCES_OPENCL_DEVICE;Device
+!PREFERENCES_OPENCL_DEVICE_AUTO;Automatic
+!PREFERENCES_OPENCL_ENABLE;Use OpenCL acceleration
+!PREFERENCES_OPENCL_ENABLE_TOOLTIP;Accelerate selected image processing stages on the GPU when an OpenCL device is available. The CPU path remains available and is used as a fallback.
+!PREFERENCES_OPENCL_MODE;Accelerate
+!PREFERENCES_OPENCL_MODE_ALL;Preview and export
+!PREFERENCES_OPENCL_MODE_EXPORT;Export only
+!PREFERENCES_OPENCL_RUSTICL;Rusticl driver
+!PREFERENCES_OPENCL_RUSTICL_AUTO;Auto
+!PREFERENCES_OPENCL_RUSTICL_HINT;Leave empty for automatic detection (Linux only). Mesa Rusticl needs an explicit driver; AMD uses radeonsi and Intel uses iris. A restart may be required after changing this value.
+!PREFERENCES_OPENCL_RUSTICL_TOOLTIP;Driver name passed to Mesa Rusticl through RUSTICL_ENABLE. Leave empty to detect the driver from the GPU vendor. An existing RUSTICL_ENABLE environment variable takes precedence.
+!PREFERENCES_PREVDEMO_HINT;With Fast, the preview below 100% zoom uses fast demosaicing and the editor Fast control is available and on by default for 100% and above. With As in PP3, the preview always uses the demosaicing method from the processing profile and the editor hides that control.
 !PREFERENCES_RAW_DECODER;Raw Decoder
 !PREFERENCES_RAW_DECODER_ENABLE_LIBRAW;Use LibRaw
+!PREFERENCES_RAW_DECODER_FAST;Prefer the faster legacy decoder for supported raw files (experimental)
+!PREFERENCES_RAW_DECODER_FAST_TOOLTIP;Tries the internal dcraw decoder for supported single-frame Pentax/Nikon Bayer files. Falls back to LibRaw on failure. DNG, X-Trans, multi-frame and other cameras keep LibRaw.
 !PREFERENCES_RESET_TO_DEFAULT;Reset Preferences
 !PREFERENCES_RESET_TO_DEFAULT_CONFIRM_PROMPT;Reset all preferences to their default values? This action cannot be undone.\n\nSome changes may require restarting the application to take full effect.
 !QUEUE_LOCATION_TEMPLATE_HELP_FORMAT_BODY;<b>%e</b> will be replaced by the photo's output format, as determined from the output file's file name extension.
 !QUEUE_LOCATION_TEMPLATE_HELP_FORMAT_TITLE;Output File Format/File Name Extension
+!SNAPSHOT_COMPARE_BADGE;SNAPSHOT: %1 — release \ to return
+!SNAPSHOT_COMPARE_BASE_DELETE_REFUSED;The Base snapshot cannot be deleted.
+!SNAPSHOT_COMPARE_NO_IMAGE;No image is available for comparison.
+!SNAPSHOT_COMPARE_RENDERING;Rendering comparison
+!SNAPSHOT_COMPARE_RETURNING;Returning to live
+!SNAPSHOT_COMPARE_TWEAK_ACTIVE;Finish the current tool adjustment before comparing.
 !TC_PRIM_BLUROT;B.rot
 !TC_PRIM_BLUSAT;B.sat
 !TC_PRIM_GREROT;G.rot
 !TC_PRIM_GRESAT;G.sat
 !TC_PRIM_REDROT;R.rot
 !TC_PRIM_REDSAT;R.sat
+!TP_COLORAPP_BRIGHTHRES;Brightness curves threshold
 !TP_COLORAPP_BRIGHT_CUR_BLUE;Brightness - blue
 !TP_COLORAPP_BRIGHT_CUR_GREEN;Brightness - green
 !TP_COLORAPP_BRIGHT_CUR_RED;Brightness - red
@@ -4581,7 +4633,7 @@ ZOOMPANEL_ZOOMOUT;ズームアウト\nショートカット: <b>-</b>
 !TP_COLORAPP_HUE_GREEN;Hue - green rotation
 !TP_COLORAPP_HUE_RED;Hue - red rotation
 !TP_COLORAPP_LABEL_RGB;Red Green Blue
-!TP_COLORAPP_RGB_TOOLTIP;'Red Green Blue' allows you to either:\n* Correct any color deviations due to either: gamut overshoot following various adjustments in the process, or poor white balance.\n* Achieve a better balance of colors and luminances to satisfy your preferences.\n* Film Simulation.\n\nThe system operates after the first process (Scene) which converts the 'Working profile' data into that of 'CAM16'. At this stage, the J, Q, C, s, M, h data take into account the physiological aspects considered by CIECAM, and a chromatic adaptation is performed.\n\n For each main color of CIECAM ac-bc [chroma based] hue plane - Red, Green, Blue - you can perform a slight hue (h) rotation in degrees (sliders) , adjust the saturation (s) as a percentage (sliders) , and adjust brightness (Q) (curves).\n\n As a general rule, small adjustments are sufficient: 1° to 3° for hue rotations (h), 5 to 10% more or less for saturation (s), very limited variations in brightness (Q). Of course, if you are looking for special effects, such as simulating a film, the settings can be more pronounced.\n\n These adjustments are made just before the other CIECAM adjustments: Lightness (J), Brightness (Q), Chroma (C), Saturation (s), Colorfulness (M), hue (h), contrast (J), contrast (Q) and curves and are added to them. \n\n Next, the third process converts the data from the 'CAM16' color space to the 'Working profile', taking into account the Viewing conditions. Color adaptation is then performed.\n\n These hue, saturation and brightness adjustments do not use primaries. They are based on the principle of CAM (Color Appearance Models) in 3 processes.
+!TP_COLORAPP_RGB_TOOLTIP;'Red Green Blue' allows you to either:\n* Correct any color deviations due to either: gamut overshoot following various adjustments in the process, or poor white balance.\n* Achieve a better balance of colors and luminances to satisfy your preferences.\n* Film Simulation.\n\nThe system operates after the first process (Scene) which converts the 'Working profile' data into that of 'CAM16'. At this stage, the J, Q, C, s, M, h data take into account the physiological aspects considered by CIECAM, and a chromatic adaptation is performed.\n\n For each main color of CIECAM ac-bc [chroma based] hue plane - Red, Green, Blue - you can perform a slight hue (h) rotation in degrees (sliders) , adjust the saturation (s) as a percentage (sliders) , and adjust brightness (Q) (curves). The ‘Threshold Brightness Curves’ aims to limit artifacts due to variations in color differences.\n\n As a general rule, small adjustments are sufficient: 1° to 3° for hue rotations (h), 5 to 10% more or less for saturation (s), very limited variations in brightness (Q). Of course, if you are looking for special effects, such as simulating a film, the settings can be more pronounced.\n\n These adjustments are made just before the other CIECAM adjustments: Lightness (J), Brightness (Q), Chroma (C), Saturation (s), Colorfulness (M), hue (h), contrast (J), contrast (Q) and curves and are added to them. \n\n Next, the third process converts the data from the 'CAM16' color space to the 'Working profile', taking into account the Viewing conditions. Color adaptation is then performed.\n\n These hue, saturation and brightness adjustments do not use primaries. They are based on the principle of CAM (Color Appearance Models) in 3 processes.
 !TP_COMPRESSGAMUT_ACESP1;ACES AP1
 !TP_COMPRESSGAMUT_ADOBE;Adobe RGB *
 !TP_COMPRESSGAMUT_BETA;Beta - near Pointer's Gamut *
@@ -4665,12 +4717,11 @@ ZOOMPANEL_ZOOMOUT;ズームアウト\nショートカット: <b>-</b>
 !TP_ICM_PRIMFRAME;Primaries & Illuminant
 !TP_ICM_PRIMREDROT_TOOLTIP;Change the Red, Green, and Blue primaries. The first slider rotates the primary color, in degrees, around the white point. The second increases or decreases the saturation relative to the white point.\n\nBe very careful when using this type of tool - whether it's polar sliders, linear sliders, or CIExy graphs. If you go outside the CIExy diagram, you'll generate imaginary colors, how will they be handled? If you reduce the primary values too much, you risk out-of-gamut data. Use with caution, and with small values, while monitoring the primaries' deviation from the CIExy diagram.
 !TP_ICM_SMOOTHFRAME;Highlight attenuation
-!TP_ICM_TRC_MAX;RGB Max=%1
-!TP_ICM_TRC_MAX_END;Final RGB Max=%1
-!TP_ICM_TRC_MAX_END_NO;---
+!TP_ICM_TRC_MAX;Max RGB: %1
+!TP_ICM_TRC_MAX_END;Final max RGB: %1
 !TP_ICM_TRC_MAX_TOOLTIP;Provides information on out-of-limit RGB values. Values greater than 1 clearly indicate that we are out of gamut whereas for values less than 1, we cannot say whether the image is within gamut or not because it depends, for example, on the luminance. This check is performed at the end of the Abstract Profile and takes into account all parameters. The ‘Attenuation threshold’ slider can be used to limit the RGB values.\n\nChanges made to 'Color Appearance and Lighting', 'Final Gain and Gamut Compression' are not taken into account.
-!TP_ICM_TRC_SAT_MAX;Final Saturation Max=%1
-!TP_ICM_TRC_SAT_MAX_TOOLTIP;Provides information on out-of-limit RGB values and RGB saturation. Values greater than 1 for ‘Final RGB Max’ and ‘Final Saturation Max’ clearly indicate that we are out of gamut whereas for values less than 1, we cannot say whether the image is within gamut or not because it depends, for example, on the luminance. This check is performed at the end of the processing pipeline and takes into account all parameters. Changes made in Color Appearance & Lighting and in Final Gain & Gamut Compression are taken into account.\n\nAdjusting the Gain (Ev) and Gamut Compression (Target Gamut and Power) settings will allow you to see the impact of these adjustments. You should also observe the histogram, which takes into account the output profile therefore the gamma. This data, which is directly related to the RGB values and Saturation and is in the Working Profile, is in linear mode.\n\n The data is only displayed if Target Gamut is enabled, or if Gain (Ev) is not equal to 0.
+!TP_ICM_TRC_SAT_MAX;Final max saturation: %1
+!TP_ICM_TRC_SAT_MAX_TOOLTIP;Provides information on out-of-limit RGB values and RGB saturation. Values greater than 1 for ‘Final max RGB’ and ‘Final max saturation’ clearly indicate that we are out of gamut whereas for values less than 1, we cannot say whether the image is within gamut or not because it depends, for example, on the luminance. This check is performed at the end of the processing pipeline and takes into account all parameters. Changes made in Color Appearance & Lighting and in Final Gain & Gamut Compression are taken into account.\n\nAdjusting the Gain (Ev) and Gamut Compression (Target Gamut and Power) settings will allow you to see the impact of these adjustments. You should also observe the histogram, which takes into account the output profile therefore the gamma. This data, which is directly related to the RGB values and Saturation and is in the Working Profile, is in linear mode.\n\n The data is only displayed if Target Gamut is enabled, or if Gain (Ev) is not equal to 0.
 !TP_ICM_WAVFRAME;Contrast Enhancement
 !TP_ICM_WAVREFI;Refinement
 !TP_ICM_WORKING_PRIM_CUSPOL;Custom (Polar sliders)
@@ -4686,6 +4737,9 @@ ZOOMPANEL_ZOOMOUT;ズームアウト\nショートカット: <b>-</b>
 !TP_LOCALLAB_BWEVNONE11;None
 !TP_LOCALLAB_BWEVSIG11;Activated
 !TP_LOCALLAB_BWEVSLOP;Slope based
+!TP_LOCALLAB_CIEREDGREENBLUE_FRAME;Red Green Blue
+!TP_LOCALLAB_CIE_FINALRGB;Final max RGB: %1
+!TP_LOCALLAB_CIE_FINALSAT;Final max saturation: %1
 !TP_LOCALLAB_CIE_SMOOTHFRAME12;Tone Mapping Operators
 !TP_LOCALLAB_CIE_SMOOTH_LEVELSTRC;RGB channel TRC
 !TP_LOCALLAB_CIE_SMOOTH_SIG;Sigmoid based
@@ -4698,6 +4752,7 @@ ZOOMPANEL_ZOOMOUT;ズームアウト\nショートカット: <b>-</b>
 !TP_LOCALLAB_DENOI_MASK;Denoise contrast mask
 !TP_LOCALLAB_DENORADIUS_TOOLTIP;Allows you to differentiate the denoising action as a function of image detail and uniform background.\n The resulting action is a combination of the noise reduction and that of the mask created by 'Contrast threshold'\n On very noisy images you can reduce the mask noise.\n You can also differentiate the action with the curve 'Equalizer denoise mask'.\n The ratio flat-structured areas allows you to correct the action between the two.\n\nOn noisy images and in Raw format, you should use the 'Presharpening denoise' and ‘Postsharpening denoise’ functions for more effective mask action.
 !TP_LOCALLAB_FEATVALUE_MASK;Feather gradient (Grad. Filters Mask)
+!TP_LOCALLAB_GAMUTW_TOOLTIP; Placed at the end of Selective Editing > Color Appearance (CAM16 & JzCzHz), compresses the colors into the chosen profile. It is applied after all previous spots and the other adjustments in this tool.\n\nOutput gamut compression is much simpler than input gamut compression. Colors near the output stage of processing are rarely outside the working profile. A reduced set of adjustments is sufficient.\n\nOften, there is little to no change to the image when using Gamut Compression. This is because it does not convert the color profile, but compresses colors to fit the target gamut. Adjustments applied before compression usually keep colors in the target gamut. The effect is visible on LEDs and vibrant flowers. On normal landscapes and portraits, there is often no change.
 !TP_LOCALLAB_GHSBPWP;Clipped pixel count - Shadows:%1 Highlights:%2
 !TP_LOCALLAB_GHSBPWPVALUE;Pixel values - Darkest:%1 Lightest:%2
 !TP_LOCALLAB_GHSCOLORNO;---
@@ -4767,6 +4822,10 @@ ZOOMPANEL_ZOOMOUT;ズームアウト\nショートカット: <b>-</b>
 !TP_LOCALLAB_GHS_SMOOTH_TOOLTIP;Smooth and soften highlight areas. Amplifies 'Protect highlights (HP)' action.
 !TP_LOCALLAB_GHS_SP;Symmetry point (SP)
 !TP_LOCALLAB_GHS_SP_TOOLTIP;The default value of 0.015 is suitable for the majority of images.\n * This is the key balance value of the GHS system.\n * Sets the focus point around which the stretch is applied - contrast will be distributed symmetrically about SP.\n * While 'b' provides the degree of focus of the stretch, SP determines where that focus is applied.\n * SP should generally be placed within a histogram peak so that the stretch will widen and lower the peak by adding the most contrast in the stretch at that point. Pixel values will move away from the SP location.
+!TP_LOCALLAB_GRADWAV;Gradient levels
+!TP_LOCALLAB_GRADWAV_TOOLTIP;Controls the strength of the Local contrast adjustment for wavelet levels 3 and higher. Has full effect when the Wavelet levels threshold adjuster's top-right value is at least 6, half the effect for values 4 and 5, and no effect for values 3 or lower
+!TP_LOCALLAB_LIMITWAV;Protect extreme shadows and highlights
+!TP_LOCALLAB_LIMITWAV_TOOLTIP;Prevents the wavelet functions from modifying the contrast in the extreme shadows and highlights.
 !TP_LOCALLAB_LOCKMADL;Locks MadL noise evaluation
 !TP_LOCALLAB_LOCKMADL2;Manual settings
 !TP_LOCALLAB_LOCKMADL2_TOOLTIP;Allows you to manually control MadL values. Be careful: this function assumes mastery of the concepts of noise reduction using wavelets. Make sure that the initial values for the selected area have been set automatically.\n\nBe careful not to confuse the action on MadL which is a noise estimation only used in Wavelet Denoise where the strength is set in Selective Editing using a curve and a selected level (Aggressive / Conservative). The MadL scale is exponential and not linear.\n\nThe first levels of wavelet decomposition provide visible noise reduction, whereas the higher levels have more affect on banding.
@@ -4802,11 +4861,12 @@ ZOOMPANEL_ZOOMOUT;ズームアウト\nショートカット: <b>-</b>
 !TP_LOCALLAB_NLDENOISENLITER_TOOLTIP;Run multiple iterations of Nlmeans. Results are often better with multiple iterations and low Strength.
 !TP_LOCALLAB_NLITER;Iterations
 !TP_LOCALLAB_PROCESSWAV;Show modified areas with Wavelets
-!TP_LOCALLAB_PROCESSWAV_TOOLTIP;Wavelet decomposition:\nShows the changes made by the wavelet settings.\n\nYou see the changes made to the decomposed image, factoring in the deltaE and transitions, when you modify the wavelet settings. Note that this is different from Wavelet levels in the Advanced tab in which you always see the results of the decomposition.
+!TP_LOCALLAB_PROCESSWAV_TOOLTIP;Wavelet decomposition:\nShows the changes made by the wavelet settings (only luminance).\n\nYou see the changes made to the decomposed image, factoring in the deltaE and transitions, when you modify the wavelet settings. Note that this is different from Wavelet levels in the Advanced tab in which you always see the results of the decomposition.
 !TP_LOCALLAB_QJMODE;Tone Mapping Operators Q(CAM16) & J(Jz)
 !TP_LOCALLAB_QJMODE_511;5.11 deprecated
 !TP_LOCALLAB_QJMODE_512;5.12
 !TP_LOCALLAB_QJMODE_TOOLTIP;The tone-mapping operators that use brightness data (Q for CAM16 and J for Jz) have been modified in RawTherapee version 5.12. This allows you to select either the current or the deprecated version.
+!TP_LOCALLAB_RGBMAXDATA_TOOLTIP;Shows the maximum RGB value and saturation, which can be used to determine if any colors are out-of-gamut. Values greater than 1 for ‘Final max RGB’ and ‘Final max saturation’ always indicate out-of-gamut colors. Values less than 1 are inconclusive because it depends on other factors like the luminance. This check is performed at the end of the tool and considers everything applied before the current Spot. It does not consider adjustments located later in the process, such as Abstract Profile or Color Appearance & Lighting. \n\nThe maximum RGB value and saturation reflect the state of the image after the Gain (Ev) and Gamut Compression (Target Gamut and Power) adjustments. The values are shown in linear space in the working profile.\n\nData is only displayed if Target Gamut is enabled, or if Gain (Ev) is not equal to 0.
 !TP_LOCALLAB_SATCIE_TOOLTIP;Modifies the image saturation whenever the gamma/slope ratio is different from 2.4/12.92. It aims to compensate for the desaturation caused by significant luminance variations.\nValues between 0.2 and 1.0 are often sufficient.
 !TP_LOCALLAB_SH3;Generalized Hyperbolic Stretch (GHS)
 !TP_LOCALLAB_SH4;Tone Mapper Michaelis-Menten (MM)
@@ -4864,6 +4924,5 @@ ZOOMPANEL_ZOOMOUT;ズームアウト\nショートカット: <b>-</b>
 !TP_WAVELET_PYRWAVTRC_SIGMA_TOOLTIP;Stretches the width of the "Variable contrast" curve. A value of 1 means no stretching.
 !TP_WAVELET_PYRWAVTRC_TOOLTIP;A series of presets defining the strength of the contrast adjustment at different detail levels. Lower presets only affect fine details while higher presets affect both fine and coarse details.\n\nNote: The effect on coarse details may not be visible in the preview if the preview is too small.
 !TP_WAVELET_RESIDTRC;Residual contrast
-!TP_WBALANCE_STUDLABEL0;Correlation factor: %1 Passes:%2 Alt=%3
 !//TP_WBALANCE_ITCWBNOPURPLE_TOOLTIP;By default when "Inpaint opposed" is activated, purple colors are not taken into account. However, if the image does not need highlight reconstruction, or if this image naturally contains purple tints (flowers, etc.), it may be necessary to deactivate, to take into account all the colors.
 !//TP_WBALANCE_ITCWB_FORCED;Forces use of the entire CIE diagram
