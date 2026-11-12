@@ -18,5 +18,5 @@ if [ ! -f "$build_dir/CMakeCache.txt" ]; then
     exit 2
 fi
 
-cmake --build "$build_dir" --target snapshot-compare-geometry-test --parallel "$(nproc)"
+cmake --build "$build_dir" --target snapshot-compare-geometry-test --parallel 6
 "$build_dir/rtengine/snapshot-compare-geometry-test"
