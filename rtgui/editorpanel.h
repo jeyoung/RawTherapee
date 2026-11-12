@@ -208,6 +208,16 @@ public:
     Glib::ustring getFileName () const;
     int getSessionPreviewRefreshMs() const;
     bool handleShortcutKey (GdkEventKey* event);
+    bool handleShortcutKeyRelease (GdkEventKey* event);
+
+    void onCompareSnapshotChanged();
+    void enterCompareView();
+    void leaveCompareView();
+    void onComparisonPreviewReady();
+    void lockEditing();
+    void unlockEditing();
+    void lockViewport();
+    void unlockViewport();
 
     bool getIsProcessing() const
     {
@@ -228,6 +238,13 @@ public:
     Gtk::Paned* catalogPane;
 
 private:
+    void applyParamsToIpc(const rtengine::procparams::ProcParams& params);
+    void saveLiveState();
+    void restoreLiveView();
+    void updateComparisonBadge();
+    void cancelCompareForClose();
+    bool onComparisonRestoreTimeout();
+
     BatchQueueEntry*    createBatchQueueEntry ();
     bool                idle_imageSaved (ProgressConnector<int> *pc, rtengine::IImagefloat* img, Glib::ustring fname, SaveFormat sf, rtengine::procparams::ProcParams &pparams);
     bool                idle_saveImage (ProgressConnector<rtengine::IImagefloat*> *pc, Glib::ustring fname, SaveFormat sf, rtengine::procparams::ProcParams &pparams);
@@ -296,6 +313,9 @@ private:
     Gtk::Box* beforeAfterBox;
     Gtk::Box* beforeHeaderBox;
     Gtk::Box* afterHeaderBox;
+    Gtk::Box* toolBarPanel;
+    Gtk::Widget* iopsPanel;
+    Gtk::Label* comparisonBadge;
     Gtk::ToggleButton* toggleHistogramProfile;
     Gtk::ToggleButton* toggleFastPreview = nullptr;
     Gtk::Separator* vsepFastPreview = nullptr;
@@ -322,6 +342,28 @@ private:
     rtengine::InitialImage* isrc;
     rtengine::StagedImageProcessor* ipc;
     rtengine::StagedImageProcessor* beforeIpc;    // for the before-after view
+
+    rtengine::procparams::ProcParams liveParams;
+    rtengine::procparams::ProcParams comparisonParams;
+    Glib::ustring comparisonName;
+    bool comparisonValid = false;
+    bool comparisonActive = false;
+    bool comparisonRenderPending = false;
+    bool pendingViewRestore = false;
+    bool closingOrSwitching = false;
+    int liveAnchorX = 0;
+    int liveAnchorY = 0;
+    double liveZoom = 1.0;
+    bool savedToolBarSensitive = true;
+    bool savedIopsSensitive = true;
+    bool savedLeftSensitive = true;
+    bool savedRightSensitive = true;
+    bool savedBeforeAfterSensitive = true;
+    bool editingLocked = false;
+    bool viewportLocked = false;
+    gint64 comparisonEnterUs = 0;
+    gint64 comparisonLeaveUs = 0;
+    sigc::connection comparisonRestoreTimeout;
 
     EditorPanelIdleHelper* epih;
 

@@ -19,9 +19,12 @@
  */
 #include "editorpanel.h"
 
+#include <algorithm>
+#include <cstdio>
 #include <iostream>
 
 #include "rtengine/array2D.h"
+#include "rtengine/compareparams.h"
 #include "rtengine/imagesource.h"
 #include "rtengine/refreshmap.h"
 #include "rtengine/iccstore.h"
@@ -60,6 +63,24 @@ namespace
 {
 
 constexpr int INITIAL_ROUGH_SCALE_MULTIPLIER = 2;
+
+// Safety net for the live-state restore: if the engine never delivers a
+// preview, unlock the editor rather than leaving it stuck in compare mode.
+constexpr int COMPARISON_RESTORE_TIMEOUT_MS = 2000;
+
+bool comparisonProfileEnabled()
+{
+    static const bool enabled = []() {
+        const char* value = g_getenv("RT_COMPARE_PROFILE");
+        return value && value[0] != '\0' && g_strcmp0(value, "0") != 0;
+    }();
+    return enabled;
+}
+
+double elapsedMs(gint64 startUs)
+{
+    return (g_get_monotonic_time() - startUs) / 1000.0;
+}
 
 // The rough pass has already decoded and preprocessed the raw source, but the
 // final preview scale change reallocates the Lab buffers. Rebuild the
@@ -752,7 +773,8 @@ EditorPanel::EditorPanel (FilePanel* filePanel)
       externalEditorChangedSignal (nullptr),
       previewHandler (nullptr), beforePreviewHandler (nullptr),
       beforeIarea (nullptr), beforeBox (nullptr), afterBox (nullptr), beforeLabel (nullptr), afterLabel (nullptr),
-      beforeHeaderBox (nullptr), afterHeaderBox (nullptr), parent (nullptr), parentWindow (nullptr), openThm (nullptr),
+      beforeHeaderBox (nullptr), afterHeaderBox (nullptr), toolBarPanel (nullptr), iopsPanel (nullptr),
+      comparisonBadge (nullptr), parent (nullptr), parentWindow (nullptr), openThm (nullptr),
       selectedFrame(0), isrc (nullptr), ipc (nullptr), beforeIpc (nullptr), err (0), isProcessing (false),
       histogram_observable(nullptr), histogram_scope_type(ScopeType::NONE)
 {
@@ -794,6 +816,7 @@ EditorPanel::EditorPanel (FilePanel* filePanel)
     leftsubpaned->pack1(*navigator, false, false);
 
     history = Gtk::manage(new History());
+    history->compareSnapshotChanged.connect(sigc::mem_fun(*this, &EditorPanel::onCompareSnapshotChanged));
     leftsubpaned->pack2(*history, true, false);
 
     leftsubpaned->set_position(0);
@@ -892,7 +915,7 @@ EditorPanel::EditorPanel (FilePanel* filePanel)
     tpc->setEditProvider (iareapanel->imageArea);
     tpc->getToolBar()->setLockablePickerToolListener (iareapanel->imageArea);
 
-    Gtk::Box* toolBarPanel = Gtk::manage (new Gtk::Box (Gtk::ORIENTATION_HORIZONTAL));
+    toolBarPanel = Gtk::manage (new Gtk::Box (Gtk::ORIENTATION_HORIZONTAL));
     toolBarPanel->set_name ("EditorTopPanel");
     toolBarPanel->pack_start (*hidehp, Gtk::PACK_SHRINK, 1);
     toolBarPanel->pack_start (*vseph, Gtk::PACK_SHRINK, 2);
@@ -931,11 +954,23 @@ EditorPanel::EditorPanel (FilePanel* filePanel)
     beforeAfterBox->set_name ("BeforeAfterContainer");
     beforeAfterBox->pack_start (*afterBox);
 
+    Gtk::Overlay* viewerOverlay = Gtk::manage(new Gtk::Overlay());
+    viewerOverlay->add(*beforeAfterBox);
+
+    comparisonBadge = Gtk::manage(new Gtk::Label());
+    comparisonBadge->set_no_show_all(true);
+    comparisonBadge->set_halign(Gtk::ALIGN_CENTER);
+    comparisonBadge->set_valign(Gtk::ALIGN_START);
+    comparisonBadge->set_margin_top(4);
+    comparisonBadge->get_style_context()->add_class("Info");
+    viewerOverlay->add_overlay(*comparisonBadge);
+    viewerOverlay->set_overlay_pass_through(*comparisonBadge, true);
+
     MyScrolledToolbar *stb1 = Gtk::manage(new MyScrolledToolbar());
     stb1->set_name("EditorToolbarTop");
     stb1->add(*toolBarPanel);
     editbox->pack_start (*stb1, Gtk::PACK_SHRINK, 2);
-    editbox->pack_start (*beforeAfterBox);
+    editbox->pack_start (*viewerOverlay);
 
     // build right side panel
     vboxright = new Gtk::Paned (Gtk::ORIENTATION_VERTICAL);
@@ -953,6 +988,7 @@ EditorPanel::EditorPanel (FilePanel* filePanel)
 
     // Save buttons
     Gtk::Grid *iops = Gtk::manage(new Gtk::Grid());
+    iopsPanel = iops;
     iops->set_name ("IopsPanel");
     iops->set_orientation (Gtk::ORIENTATION_HORIZONTAL);
     iops->set_row_spacing (2);
@@ -1182,6 +1218,10 @@ EditorPanel::~EditorPanel ()
     // the fast-preview button after that point.
     toggleFastPreview = nullptr;
     vsepFastPreview = nullptr;
+    toolBarPanel = nullptr;
+    iopsPanel = nullptr;
+    comparisonBadge = nullptr;
+    beforeAfter = nullptr;
 
     idle_register.destroy();
 
@@ -1565,6 +1605,8 @@ void EditorPanel::open (Thumbnail* tmb, rtengine::InitialImage* isrc)
         sigc::mem_fun(*this, &EditorPanel::onPreviewReady));
     previewHandler->signalPreviewReady().connect(
         sigc::mem_fun(*this, &EditorPanel::onSessionPreviewReady));
+    previewHandler->signalPreviewReady().connect(
+        sigc::mem_fun(*this, &EditorPanel::onComparisonPreviewReady));
 
     this->isrc = isrc;
     ipc = rtengine::StagedImageProcessor::create (isrc);
@@ -1659,6 +1701,8 @@ void EditorPanel::open (Thumbnail* tmb, rtengine::InitialImage* isrc)
 
 void EditorPanel::close ()
 {
+    cancelCompareForClose();
+
     if (toggleFastPreview) {
         toggleFastPreview->set_sensitive(false);
     }
@@ -1715,7 +1759,12 @@ void EditorPanel::saveProfile ()
     // If the file was deleted, do not generate ghost entries
     if (Glib::file_test (fname, Glib::FILE_TEST_EXISTS)) {
         ProcParams params;
-        ipc->getParams (&params);
+
+        if (comparisonActive) {
+            params = liveParams;
+        } else {
+            ipc->getParams (&params);
+        }
 
         // Will call updateCache, which will update both the cached and sidecar files if necessary
         openThm->setProcParams (params, nullptr, EDITOR);
@@ -1900,7 +1949,13 @@ void EditorPanel::refreshProcessingState (bool inProcessingP)
         // Set proc params of thumbnail. It saves it into the cache and updates the file browser.
         if (ipc && openThm && tpc->getChangedState()) {
             rtengine::procparams::ProcParams pparams;
-            ipc->getParams (&pparams);
+
+            if (comparisonActive || pendingViewRestore) {
+                pparams = liveParams;
+            } else {
+                ipc->getParams (&pparams);
+            }
+
             openThm->setProcParams (pparams, nullptr, EDITOR, false);
         }
 
@@ -2153,6 +2208,30 @@ bool EditorPanel::handleShortcutKey (GdkEventKey* event)
             default:
                 return true;
         }
+    }
+
+    // Snapshot comparison: hold \ to show the comparison snapshot.
+    // Do not test altgr here: on Windows GDK_MOD2_MASK is also NumLock, which
+    // would make the shortcut unreachable.
+    if (!ctrl && !alt && event->keyval == GDK_KEY_backslash) {
+        if (comparisonActive) {
+            return true;
+        }
+
+        if (!ipc || !comparisonValid) {
+            setProgressStr(M("SNAPSHOT_COMPARE_NO_IMAGE"));
+            return true;
+        }
+
+        enterCompareView();
+        return true;
+    }
+
+    // While comparing, the viewport and the edit model are frozen. Consume
+    // every other shortcut, including key repeat, so no editor action or view
+    // change can run until \ is released.
+    if (comparisonActive) {
+        return true;
     }
 
     // Editor Layout
@@ -2419,6 +2498,16 @@ bool EditorPanel::handleShortcutKey (GdkEventKey* event)
         if (fPanel->handleShortcutKey (event)) {
             return true;
         }
+    }
+
+    return false;
+}
+
+bool EditorPanel::handleShortcutKeyRelease(GdkEventKey* event)
+{
+    if (event->keyval == GDK_KEY_backslash && comparisonActive) {
+        leaveCompareView();
+        return true;
     }
 
     return false;
@@ -2966,11 +3055,350 @@ void EditorPanel::historyBeforeLineChanged (const rtengine::procparams::ProcPara
     }
 }
 
+void EditorPanel::applyParamsToIpc(const ProcParams& params)
+{
+    if (!ipc) {
+        return;
+    }
+
+    ProcParams* p = ipc->beginUpdateParams();
+    *p = params;
+    ipc->endUpdateParams(rtengine::EvProfileChanged);
+}
+
+void EditorPanel::saveLiveState()
+{
+    if (!ipc) {
+        return;
+    }
+
+    ipc->getParams(&liveParams, false);
+
+    if (iareapanel && iareapanel->imageArea->mainCropWindow) {
+        iareapanel->imageArea->mainCropWindow->getCropAnchorPosition(liveAnchorX, liveAnchorY);
+        liveZoom = iareapanel->imageArea->mainCropWindow->getZoom();
+    }
+}
+
+void EditorPanel::restoreLiveView()
+{
+    if (!iareapanel || !iareapanel->imageArea->mainCropWindow) {
+        return;
+    }
+
+    int x = liveAnchorX;
+    int y = liveAnchorY;
+
+    if (ipc) {
+        const int fullW = ipc->getFullWidth();
+        const int fullH = ipc->getFullHeight();
+
+        if (fullW > 0) {
+            x = std::clamp(x, 0, fullW - 1);
+        }
+
+        if (fullH > 0) {
+            y = std::clamp(y, 0, fullH - 1);
+        }
+    }
+
+    iareapanel->imageArea->setScrollPosition(x, y, true);
+    iareapanel->imageArea->setZoom(liveZoom, true);
+    iareapanel->imageArea->queue_draw();
+}
+
+void EditorPanel::updateComparisonBadge()
+{
+    if (!comparisonBadge) {
+        return;
+    }
+
+    if (comparisonActive) {
+        comparisonBadge->set_text(Glib::ustring::compose(
+            M("SNAPSHOT_COMPARE_BADGE"), comparisonName));
+        comparisonBadge->show();
+    } else if (pendingViewRestore) {
+        comparisonBadge->set_text(M("SNAPSHOT_COMPARE_RETURNING"));
+        comparisonBadge->show();
+    } else {
+        comparisonBadge->hide();
+    }
+}
+
+void EditorPanel::onCompareSnapshotChanged()
+{
+    if (!history) {
+        return;
+    }
+
+    ProcParams params;
+    Glib::ustring name;
+
+    if (!history->getCompareSnapshotParams(params, name)) {
+        comparisonValid = false;
+        comparisonParams = ProcParams();
+        comparisonName.clear();
+
+        if (comparisonActive && !closingOrSwitching) {
+            leaveCompareView();
+        }
+
+        updateComparisonBadge();
+        return;
+    }
+
+    comparisonValid = true;
+    comparisonParams = params;
+    comparisonName = name;
+
+    if (comparisonActive) {
+        leaveCompareView();
+    }
+
+    updateComparisonBadge();
+}
+
+void EditorPanel::enterCompareView()
+{
+    if (!ipc || !comparisonValid) {
+        setProgressStr(M("SNAPSHOT_COMPARE_NO_IMAGE"));
+        return;
+    }
+
+    if (ipc->hasTweakOperator()) {
+        setProgressStr(M("SNAPSHOT_COMPARE_TWEAK_ACTIVE"));
+        return;
+    }
+
+    if (comparisonActive) {
+        return;
+    }
+
+    if (beforeAfter && beforeAfter->get_active()) {
+        beforeAfter->set_active(false);
+    }
+
+    saveLiveState();
+    comparisonEnterUs = g_get_monotonic_time();
+
+    const ProcParams effective = makeComparisonParams(liveParams, comparisonParams);
+
+    comparisonActive = true;
+    comparisonRenderPending = true;
+    pendingViewRestore = false;
+    comparisonRestoreTimeout.disconnect();
+
+    lockEditing();
+    lockViewport();
+    updateComparisonBadge();
+    setProgressStr(M("SNAPSHOT_COMPARE_RENDERING"));
+
+    applyParamsToIpc(effective);
+}
+
+void EditorPanel::leaveCompareView()
+{
+    if (!comparisonActive) {
+        return;
+    }
+
+    comparisonActive = false;
+    comparisonRenderPending = false;
+    pendingViewRestore = true;
+    comparisonLeaveUs = g_get_monotonic_time();
+
+    updateComparisonBadge();
+    setProgressStr(M("SNAPSHOT_COMPARE_RETURNING"));
+    applyParamsToIpc(liveParams);
+
+    comparisonRestoreTimeout.disconnect();
+    comparisonRestoreTimeout = Glib::signal_timeout().connect(
+        sigc::mem_fun(*this, &EditorPanel::onComparisonRestoreTimeout),
+        COMPARISON_RESTORE_TIMEOUT_MS);
+}
+
+void EditorPanel::onComparisonPreviewReady()
+{
+    if (comparisonActive && comparisonRenderPending) {
+        comparisonRenderPending = false;
+        restoreLiveView();
+        updateComparisonBadge();
+        setProgressStr("");
+
+        if (comparisonProfileEnabled()) {
+            std::fprintf(stderr, "compare: snapshot ready %.1f ms\n",
+                         elapsedMs(comparisonEnterUs));
+        }
+
+        return;
+    }
+
+    if (!comparisonActive && pendingViewRestore) {
+        pendingViewRestore = false;
+        comparisonRestoreTimeout.disconnect();
+        restoreLiveView();
+        unlockViewport();
+        unlockEditing();
+        updateComparisonBadge();
+        setProgressStr("");
+
+        if (comparisonProfileEnabled()) {
+            std::fprintf(stderr, "compare: live ready %.1f ms\n",
+                         elapsedMs(comparisonLeaveUs));
+        }
+    }
+}
+
+bool EditorPanel::onComparisonRestoreTimeout()
+{
+    if (comparisonActive || !pendingViewRestore) {
+        return false;
+    }
+
+    pendingViewRestore = false;
+    restoreLiveView();
+    unlockViewport();
+    unlockEditing();
+    updateComparisonBadge();
+    setProgressStr("");
+    return false;
+}
+
+void EditorPanel::lockEditing()
+{
+    if (editingLocked) {
+        return;
+    }
+
+    editingLocked = true;
+    savedToolBarSensitive = toolBarPanel ? toolBarPanel->get_sensitive() : true;
+    savedIopsSensitive = iopsPanel ? iopsPanel->get_sensitive() : true;
+    savedLeftSensitive = leftbox ? leftbox->get_sensitive() : true;
+    savedRightSensitive = vsubboxright ? vsubboxright->get_sensitive() : true;
+    savedBeforeAfterSensitive = beforeAfter ? beforeAfter->get_sensitive() : true;
+
+    if (toolBarPanel) {
+        toolBarPanel->set_sensitive(false);
+    }
+
+    if (iopsPanel) {
+        iopsPanel->set_sensitive(false);
+    }
+
+    if (leftbox) {
+        leftbox->set_sensitive(false);
+    }
+
+    if (vsubboxright) {
+        vsubboxright->set_sensitive(false);
+    }
+
+    if (beforeAfter) {
+        beforeAfter->set_sensitive(false);
+    }
+}
+
+void EditorPanel::unlockEditing()
+{
+    if (!editingLocked) {
+        return;
+    }
+
+    editingLocked = false;
+
+    if (toolBarPanel) {
+        toolBarPanel->set_sensitive(savedToolBarSensitive);
+    }
+
+    if (iopsPanel) {
+        iopsPanel->set_sensitive(savedIopsSensitive);
+    }
+
+    if (leftbox) {
+        leftbox->set_sensitive(savedLeftSensitive);
+    }
+
+    if (vsubboxright) {
+        vsubboxright->set_sensitive(savedRightSensitive);
+    }
+
+    if (beforeAfter) {
+        beforeAfter->set_sensitive(savedBeforeAfterSensitive);
+    }
+}
+
+void EditorPanel::lockViewport()
+{
+    if (viewportLocked) {
+        return;
+    }
+
+    viewportLocked = true;
+
+    if (iareapanel) {
+        iareapanel->imageArea->setInteractionsEnabled(false);
+
+        if (iareapanel->imageArea->mainCropWindow) {
+            iareapanel->imageArea->mainCropWindow->setShowCropGuides(false);
+            iareapanel->imageArea->queue_draw();
+        }
+    }
+}
+
+void EditorPanel::unlockViewport()
+{
+    if (!viewportLocked) {
+        return;
+    }
+
+    viewportLocked = false;
+
+    if (iareapanel) {
+        iareapanel->imageArea->setInteractionsEnabled(true);
+
+        if (iareapanel->imageArea->mainCropWindow) {
+            iareapanel->imageArea->mainCropWindow->setShowCropGuides(true);
+            iareapanel->imageArea->queue_draw();
+        }
+    }
+}
+
+void EditorPanel::cancelCompareForClose()
+{
+    closingOrSwitching = true;
+    comparisonRestoreTimeout.disconnect();
+
+    if (comparisonActive) {
+        comparisonActive = false;
+        comparisonRenderPending = false;
+        pendingViewRestore = false;
+
+        if (ipc) {
+            applyParamsToIpc(liveParams);
+        }
+    }
+
+    comparisonActive = false;
+    comparisonRenderPending = false;
+    pendingViewRestore = false;
+    comparisonValid = false;
+    comparisonName.clear();
+
+    unlockViewport();
+    unlockEditing();
+    updateComparisonBadge();
+    closingOrSwitching = false;
+}
+
 void EditorPanel::beforeAfterToggled ()
 {
 
     if (!ipc) {
         return;
+    }
+
+    if (comparisonActive) {
+        leaveCompareView();
     }
 
     removeIfThere (beforeAfterBox,  beforeBox, false);

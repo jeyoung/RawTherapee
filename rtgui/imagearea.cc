@@ -499,7 +499,7 @@ bool ImageArea::on_draw(const ::Cairo::RefPtr< Cairo::Context> &cr)
 bool ImageArea::on_motion_notify_event (GdkEventMotion* event)
 {
 
-    if (loadingPlaceholder) {
+    if (loadingPlaceholder || !interactionsEnabled) {
         return true;
     }
 
@@ -531,7 +531,7 @@ bool ImageArea::on_motion_notify_event (GdkEventMotion* event)
 bool ImageArea::on_button_press_event (GdkEventButton* event)
 {
 
-    if (loadingPlaceholder) {
+    if (loadingPlaceholder || !interactionsEnabled) {
         return true;
     }
 
@@ -551,7 +551,7 @@ bool ImageArea::on_button_press_event (GdkEventButton* event)
 bool ImageArea::on_scroll_event (GdkEventScroll* event)
 {
 
-    if (loadingPlaceholder) {
+    if (loadingPlaceholder || !interactionsEnabled) {
         return true;
     }
 
@@ -569,7 +569,7 @@ bool ImageArea::on_scroll_event (GdkEventScroll* event)
 bool ImageArea::on_button_release_event (GdkEventButton* event)
 {
 
-    if (loadingPlaceholder) {
+    if (loadingPlaceholder || !interactionsEnabled) {
         return true;
     }
 
@@ -888,8 +888,12 @@ void ImageArea::getScrollPosition (int& x, int& y)
     }
 }
 
-void ImageArea::setScrollPosition (int x, int y)
+void ImageArea::setScrollPosition (int x, int y, bool force)
 {
+
+    if (!interactionsEnabled && !force) {
+        return;
+    }
 
     if (mainCropWindow) {
         mainCropWindow->delCropWindowListener (this);
@@ -931,8 +935,12 @@ double ImageArea::getZoom ()
 }
 
 // Called by imageAreaPanel before/after views
-void ImageArea::setZoom (double zoom)
+void ImageArea::setZoom (double zoom, bool force)
 {
+
+    if (!interactionsEnabled && !force) {
+        return;
+    }
 
     if (mainCropWindow) {
         mainCropWindow->setZoom (zoom);

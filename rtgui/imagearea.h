@@ -59,6 +59,7 @@ protected:
 
     bool loadingPlaceholder = false;
     bool loadingFitMode = false;
+    bool interactionsEnabled = true;
     Glib::RefPtr<Gdk::Pixbuf> loadingPixbuf;
     bool loadingSpinnerVisible = false;
     double loadingSpinnerPhase = 0.0;
@@ -108,7 +109,7 @@ public:
 
     void getScrollImageSize (int& w, int& h);
     void getScrollPosition  (int& x, int& y);
-    void setScrollPosition  (int x, int y);     // called by the imageareapanel when the scrollbars have been changed
+    void setScrollPosition  (int x, int y, bool force = false);     // called by the imageareapanel when the scrollbars have been changed
 
     // enabling and setting text of info area
     void setInfoText (Glib::ustring&& text);
@@ -139,6 +140,14 @@ public:
     {
         return previewHandler;
     }
+    void setInteractionsEnabled(bool enabled)
+    {
+        interactionsEnabled = enabled;
+    }
+    bool getInteractionsEnabled() const
+    {
+        return interactionsEnabled;
+    }
 
     void showLoadingCanvas();
     bool hasRememberedView(int width, int height) const;
@@ -165,7 +174,7 @@ public:
 
     void zoomFit     ();
     double getZoom   ();
-    void   setZoom   (double zoom);
+    void   setZoom   (double zoom, bool force = false);
 
     // EditDataProvider interface
     void subscribe(EditSubscriber *subscriber) override;

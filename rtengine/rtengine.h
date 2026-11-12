@@ -740,6 +740,11 @@ public:
       *        It will only unset the tweak operator if tOperator is the same than the currently set operator.
       *        If it doesn't match, the currently set TweakOperator will remain set. */
     virtual void        unsetTweakOperator (TweakOperator *tOperator) = 0;
+    /** True when a temporary TweakOperator is altering the rendering parameters. */
+    virtual bool        hasTweakOperator () const
+    {
+        return false;
+    }
     /** Returns the current processing parameters.
       * Since the ProcParams can be tweaked by a GUI to operate on the image at a specific stage or with disabled tool,
       * you'll have to specify if you want the tweaked version for the current special mode, or the untweaked one.

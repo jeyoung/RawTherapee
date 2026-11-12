@@ -537,6 +537,10 @@ public:
 
     void setTweakOperator (TweakOperator *tOperator) override;
     void unsetTweakOperator (TweakOperator *tOperator) override;
+    bool hasTweakOperator () const override
+    {
+        return tweakOperator != nullptr;
+    }
     bool getAutoWB   (double& temp, double& green, double equal, StandardObserver observer, double tempBias) override;
     void getCamWB    (double& temp, double& green, StandardObserver observer) override;
     void getSpotWB   (int x, int y, int rectSize, double& temp, double& green) override;

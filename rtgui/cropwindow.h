@@ -89,6 +89,7 @@ class CropWindow final : public LWButtonListener, public CropDisplayHandler, pub
     int backColor;
     bool decorated;
     bool isFlawnOver;
+    bool showCropGuides = true;
 
     // crop frame description
     int titleHeight, sideBorderWidth, lowerBorderWidth, upperBorderWidth, sepWidth, minWidth;
@@ -160,6 +161,10 @@ public:
     void setDecorated       (bool decorated)
     {
         this->decorated = decorated;
+    }
+    void setShowCropGuides  (bool show)
+    {
+        showCropGuides = show;
     }
     void setFitZoomEnabled  (bool fze)
     {

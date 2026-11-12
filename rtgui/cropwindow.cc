@@ -1990,7 +1990,7 @@ void CropWindow::expose (Cairo::RefPtr<Cairo::Context> cr)
                 cr->fill();
             }
 
-            if (cropHandler.cropParams->enabled) {
+            if (cropHandler.cropParams->enabled && showCropGuides) {
                 hidpi::LogicalCoord offset = windowPos + imgAreaPos + imgPos;
                 ImageCoord cropPos = cropHandler.getPosition();
                 double deviceScale = RTScalable::getScaleForWidget(iarea);
@@ -2101,7 +2101,7 @@ void CropWindow::expose (Cairo::RefPtr<Cairo::Context> cr)
                                        imgAreaSize.height - imgPos.y));
                 cr->fill();
 
-                if (cropHandler.cropParams->enabled) {
+                if (cropHandler.cropParams->enabled && showCropGuides) {
                     double roughW = rough->get_width();
                     double roughH = rough->get_height();
                     double clipWidth =

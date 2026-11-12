@@ -80,6 +80,8 @@ EditWindow::EditWindow (RTWindow* p)
     mainNB->signal_switch_page().connect_notify(sigc::mem_fun(*this, &EditWindow::on_mainNB_switch_page));
 
     signal_key_press_event().connect(sigc::mem_fun(*this, &EditWindow::keyPressed));
+    signal_key_release_event().connect(sigc::mem_fun(*this, &EditWindow::keyReleased));
+    signal_focus_out_event().connect(sigc::mem_fun(*this, &EditWindow::onFocusOut));
     signal_window_state_event().connect(sigc::mem_fun(*this, &EditWindow::on_window_state_event));
     onConfEventConn = signal_configure_event().connect(sigc::mem_fun(*this, &EditWindow::on_configure_event));
 
@@ -197,6 +199,12 @@ void EditWindow::on_mainNB_switch_page(Gtk::Widget* widget, guint page_num)
 
     if (mainNB->get_n_pages() > 1 && page_num <= (filesEdited.size() - 1)) {
         set_title_decorated(ep->getFileName());
+    }
+
+    for (auto& entry : epanels) {
+        if (entry.second != ep && entry.second->isActive()) {
+            entry.second->leaveCompareView();
+        }
     }
 
     ep->setActive(true);
@@ -334,6 +342,29 @@ bool EditWindow::keyPressed (GdkEventKey* event)
 
         return false;
     }
+}
+
+bool EditWindow::keyReleased (GdkEventKey* event)
+{
+    if (mainNB->get_n_pages() > 0) {
+        EditorPanel* ep = static_cast<EditorPanel*>(mainNB->get_nth_page(mainNB->get_current_page()));
+        return ep && ep->handleShortcutKeyRelease(event);
+    }
+
+    return false;
+}
+
+bool EditWindow::onFocusOut (GdkEventFocus* event)
+{
+    if (mainNB->get_n_pages() > 0) {
+        EditorPanel* ep = static_cast<EditorPanel*>(mainNB->get_nth_page(mainNB->get_current_page()));
+
+        if (ep) {
+            ep->leaveCompareView();
+        }
+    }
+
+    return false;
 }
 
 void EditWindow::toggleFullscreen()

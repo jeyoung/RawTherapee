@@ -62,11 +62,21 @@ public:
         Gtk::TreeModelColumn<Glib::ustring>  text;
         Gtk::TreeModelColumn<rtengine::procparams::ProcParams>     params;
         Gtk::TreeModelColumn<ParamsEdited>     paramsEdited;
+        Gtk::TreeModelColumn<bool> isBase;
+        Gtk::TreeModelColumn<bool> isCompareSnapshot;
+        Gtk::TreeModelColumn<bool> editable;
+        Gtk::TreeModelColumn<bool> deletable;
+        Gtk::TreeModelColumn<Glib::ustring> marker;
         BookmarkColumns()
         {
             add(text);
             add(params);
             add(paramsEdited);
+            add(isBase);
+            add(isCompareSnapshot);
+            add(editable);
+            add(deletable);
+            add(marker);
         }
     };
     BookmarkColumns bookmarkColumns;
@@ -83,6 +93,14 @@ protected:
     Gtk::Button*            addBookmark;
     Gtk::Button*            delBookmark;
 
+    Gtk::Menu*              bookmarkMenu;
+    Gtk::MenuItem*          menuUseCompare;
+    Gtk::MenuItem*          menuRestoreBase;
+    Gtk::MenuItem*          menuDelete;
+    Gtk::TreeModel::Path    contextPath;
+    bool                    contextPathValid;
+    bool                    updatingCompareMarker;
+
     sigc::connection        selchangehist;
     sigc::connection        selchangebm;
 
@@ -92,6 +110,17 @@ protected:
     int bmnum;
 
     bool on_query_tooltip(int x, int y, bool keyboard_tooltip, const Glib::RefPtr<Gtk::Tooltip>& tooltip);
+    bool onBookmarkButtonPress(GdkEventButton* event);
+    bool onBookmarkQueryTooltip(int x, int y, bool keyboard_tooltip, const Glib::RefPtr<Gtk::Tooltip>& tooltip);
+    void onBookmarkRowChanged(const Gtk::TreeModel::Path& path, const Gtk::TreeModel::iterator& iter);
+    void onBookmarkNameEdited(const Glib::ustring& path, const Glib::ustring& newText);
+    void onMenuUseCompare();
+    void onMenuRestoreBase();
+    void onMenuDelete();
+    Gtk::TreeModel::iterator findBaseRow();
+    Gtk::TreeModel::iterator findCompareRow();
+    void setCompareSnapshotInternal(const Gtk::TreeModel::iterator& iter);
+    bool deleteBookmark(const Gtk::TreeModel::iterator& iter);
 
 public:
 
@@ -118,6 +147,19 @@ public:
     void historySelectionChanged ();
     void bookmarkSelectionChanged ();
     void initHistory ();
+
+    sigc::signal<void> compareSnapshotChanged;
+
+    void createBaseSnapshot(
+        const rtengine::procparams::ProcParams& params,
+        const ParamsEdited& paramsEdited
+    );
+    bool getCompareSnapshotParams(
+        rtengine::procparams::ProcParams& params,
+        Glib::ustring& name
+    );
+    void setCompareSnapshot(const Gtk::TreeModel::iterator& iter);
+    void restoreBaseComparison();
 
     bool getBeforeLineParams (rtengine::procparams::ProcParams& params);
 

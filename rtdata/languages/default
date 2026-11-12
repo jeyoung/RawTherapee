@@ -1801,7 +1801,19 @@ HISTORY_MSG_WBITC_THRES;Itcwb Threshold
 HISTORY_NEWSNAPSHOT;Add
 HISTORY_NEWSNAPSHOT_TOOLTIP;Shortcut: <b>Alt-s</b>
 HISTORY_SNAPSHOT;Snapshot
+HISTORY_SNAPSHOT_BASE;Base
+HISTORY_SNAPSHOT_BASE_TOOLTIP;Automatically created from the image as loaded; cannot be deleted.
+HISTORY_SNAPSHOT_COMPARE_MARKER;Comparison snapshot
+HISTORY_SNAPSHOT_COMPARE_RESTORE;Restore Base as comparison snapshot
+HISTORY_SNAPSHOT_COMPARE_SET;Use as comparison snapshot
+HISTORY_SNAPSHOT_DELETE;Delete snapshot
 HISTORY_SNAPSHOTS;Snapshots
+SNAPSHOT_COMPARE_BADGE;SNAPSHOT: %1 — release \ to return
+SNAPSHOT_COMPARE_BASE_DELETE_REFUSED;The Base snapshot cannot be deleted.
+SNAPSHOT_COMPARE_NO_IMAGE;No image is available for comparison.
+SNAPSHOT_COMPARE_RENDERING;Rendering comparison
+SNAPSHOT_COMPARE_RETURNING;Returning to live
+SNAPSHOT_COMPARE_TWEAK_ACTIVE;Finish the current tool adjustment before comparing.
 ICCPROFCREATOR_COPYRIGHT;Copyright:
 ICCPROFCREATOR_COPYRIGHT_RESET_TOOLTIP;Reset to the default copyright, granted to 'RawTherapee, CC0'.
 ICCPROFCREATOR_CUSTOM;Custom
