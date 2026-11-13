@@ -18,11 +18,11 @@ The first build downloads the Debian 12 image and installs build dependencies.
 The container is always based on Debian 12 so the package keeps the bookworm
 baseline.
 
-Current verified artefact, built from commit `2dd85e36b`:
+Current verified artefact, built from commit `71007e266`:
 
 ```
-build/portable/rawtherapee-5.13-196-g2dd85e36b_5.13+git13217.2dd85e36b-1_amd64.deb
-sha256 09cb0d5dcc046b9be1cce103779d1a9b0998cb8d681ecf914354cf020ffbf8b7
+build/portable/rawtherapee-5.13-199-g71007e266_5.13+git13220.71007e266-1_amd64.deb
+sha256 c857595f8369878067a785c6fa820e9661738ce3b06f8020a4632bd86be69ef2
 ```
 
 The package was built from a clean clone because a linked worktree exposes a
@@ -30,15 +30,16 @@ The package was built from a clean clone because a linked worktree exposes a
 makes the version resolve as `git0.local`.
 
 Fresh `debian:12` and `debian:13` containers installed the `.deb` and listed
-formats including JPEG XL. A single-threaded 16-bit TIFF export with an
-explicit PP3 was identical to the single-threaded host export except for the
-embedded version string and timestamp. The installed package started under
-Xvfb on Debian 12 with a 10.2 MP PEF. An exposure-edited comparison rendered
-with `ALLNORAW` in 32.6 ms and preserved zoom/anchor; the following hold
-logged `cache hit 0.092 ms` and its viewport was byte-identical to the first
-render. The application quit cleanly. The test containers have no OpenCL ICD,
-so `--gpu-test` and `--gpu-test-monitor` are recorded as not run. These are
-functional checks; no general performance claim is made for the package.
+36 formats including JPEG XL. A single-threaded 16-bit TIFF export with
+`devnotes/opencl/pp3/rgbproc-exposure.pp3` was pixel-identical to the
+single-threaded host export: maximum absolute difference 0 and no differing
+samples. The installed package started under Xvfb on both releases with a
+10.2 MP PEF. The exposure edit then comparison then crop flow kept the
+Exposure and Crop rows; the comparison rendered with `ALLNORAW` and reported
+snapshot/live readiness of 38.0/33.4 ms on Debian 12 and 32.7/31.8 ms on
+Debian 13. The application quit cleanly. The test containers have no OpenCL
+ICD, so `--gpu-test` and `--gpu-test-monitor` are recorded as not run. These
+are functional checks; no general performance claim is made for the package.
 
 ## Layout
 
