@@ -44,5 +44,17 @@ ProcParams makeComparisonParams(const ProcParams& live, const ProcParams& snapsh
  */
 bool geometryDiffers(const ProcParams& live, const ProcParams& snapshot);
 
+/**
+ * True when moving from current to target needs preprocessing, demosaic or a
+ * rebuild of the raw planes.
+ *
+ * Post-base fields (exposure, curves, local edits, sharpening, noise
+ * reduction, film negative, input/output profile conversion) do not require
+ * the raw stage and are handled by ALLNORAW. This is the same distinction the
+ * profile-change path makes before masking EvProfileChanged with ALLNORAW.
+ */
+bool comparisonRequiresRawStage(const ProcParams& current,
+                                const ProcParams& target);
+
 } // namespace procparams
 } // namespace rtengine

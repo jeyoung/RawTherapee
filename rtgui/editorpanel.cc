@@ -77,6 +77,15 @@ bool comparisonProfileEnabled()
     return enabled;
 }
 
+bool comparisonFullEnabled()
+{
+    static const bool enabled = []() {
+        const char* value = g_getenv("RT_COMPARE_FULL");
+        return value && value[0] != '\0' && g_strcmp0(value, "0") != 0;
+    }();
+    return enabled;
+}
+
 double elapsedMs(gint64 startUs)
 {
     return (g_get_monotonic_time() - startUs) / 1000.0;
@@ -3083,9 +3092,21 @@ void EditorPanel::applyParamsToIpc(const ProcParams& params)
         return;
     }
 
+    ProcParams current;
+    ipc->getParams(&current, false);
+
+    const bool rawStage = comparisonRequiresRawStage(current, params);
+    const bool full = comparisonFullEnabled() || rawStage;
+    const int changeFlags = full ? ALL : ALLNORAW;
+
+    if (comparisonProfileEnabled()) {
+        std::fprintf(stderr, "compare: apply %s rawStage=%d\n",
+                     full ? "ALL" : "ALLNORAW", rawStage);
+    }
+
     ProcParams* p = ipc->beginUpdateParams();
     *p = params;
-    ipc->endUpdateParams(rtengine::EvProfileChanged);
+    ipc->endUpdateParams(changeFlags);
 }
 
 void EditorPanel::saveLiveState()
