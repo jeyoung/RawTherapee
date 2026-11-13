@@ -18,11 +18,11 @@ The first build downloads the Debian 12 image and installs build dependencies.
 The container is always based on Debian 12 so the package keeps the bookworm
 baseline.
 
-Current verified artefact, built from commit `be25c8d82`:
+Current verified artefact, built from commit `9d1a546da`:
 
 ```
-build/portable/rawtherapee-5.13-190-gbe25c8d82_5.13+git13211.be25c8d82-1_amd64.deb
-sha256 0bab7ad0ac4397cc9e5be0b633d71d803560ef679171773c544a08483c2a8886
+build/portable/rawtherapee-5.13-193-g9d1a546da_5.13+git13214.9d1a546da-1_amd64.deb
+sha256 192c2533efef81595887faf1821a18bc596bab89c71e6136dcbb86ea6a109163
 ```
 
 The package was built from a clean clone because a linked worktree exposes a
@@ -33,11 +33,14 @@ Fresh `debian:12` and `debian:13` containers installed the `.deb` and listed
 formats including JPEG XL. A single-threaded 16-bit TIFF export with an
 explicit PP3 was identical to the single-threaded host export except for the
 embedded version string and timestamp. The installed package started under
-Xvfb on Debian 12 with a private 45.7 MP NEF; the comparison used `ALLNORAW`
-with `rawStage=0`, the snapshot was ready in 76.7 ms and the live view in
-83.9 ms, and the application quit cleanly. The test containers have no OpenCL
-ICD, so `--gpu-test` and `--gpu-test-monitor` are recorded as not run. These
-are functional checks; no general performance claim is made for the package.
+Xvfb on Debian 12 with a 10.2 MP PEF. An unedited `Base` comparison used the
+no-render path and the viewport was pixel-identical before, during and after
+the hold. A 100 % panned, exposure-edited comparison reported `view unchanged`
+with zoom `1`, anchor `444,404`, kept the pre-hold and post-release viewport
+byte-identical and rendered with `ALLNORAW`. The application quit cleanly. The
+test containers have no OpenCL ICD, so `--gpu-test` and
+`--gpu-test-monitor` are recorded as not run. These are functional checks; no
+general performance claim is made for the package.
 
 ## Layout
 

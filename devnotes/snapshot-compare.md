@@ -217,16 +217,16 @@ rendered result.
 
 ## Packaging
 
-`tools/build-rt.sh portable` was run from a clean clone of commit `be25c8d82`,
+`tools/build-rt.sh portable` was run from a clean clone of commit `9d1a546da`,
 so the Git-derived version is available inside the container. A linked
 worktree cannot be used: its `.git` file points outside the mounted source
 directory, so the container cannot read the version. The package is stored in
 the clone under `build/portable/`:
 
 ```text
-rawtherapee-5.13-190-gbe25c8d82_5.13+git13211.be25c8d82-1_amd64.deb
-Version 5.13+git13211.be25c8d82-1
-SHA-256 0bab7ad0ac4397cc9e5be0b633d71d803560ef679171773c544a08483c2a8886
+rawtherapee-5.13-193-g9d1a546da_5.13+git13214.9d1a546da-1_amd64.deb
+Version 5.13+git13214.9d1a546da-1
+SHA-256 192c2533efef81595887faf1821a18bc596bab89c71e6136dcbb86ea6a109163
 ```
 
 The package installed and `rawtherapee-cli --list-formats` passed in a
@@ -236,10 +236,13 @@ single-threaded host export except for the embedded version string and
 timestamp; the pixel data and file size matched exactly.
 
 The GUI smoke test was run from the installed package on Debian 12 under
-Xvfb with a private 45.7 MP NEF: the comparison used `ALLNORAW` with
-`rawStage=0`, the snapshot was ready in 76.7 ms and the live view in 83.9 ms,
-and the application quit cleanly. The multi-tab close/reopen regression was
-run on the host CPU build. GPU tests were not run in the containers.
+Xvfb with a 10.2 MP PEF. An unedited `Base` comparison took the no-render
+path and the viewport was pixel-identical before, during and after the hold.
+A 100 % panned, exposure-edited comparison reported `view unchanged` with
+zoom `1`, anchor `444,404`, kept the pre-hold and post-release viewport
+byte-identical and rendered with `ALLNORAW`. The application quit cleanly.
+The multi-tab close/reopen regression was run on the host CPU build. GPU tests
+were not run in the containers.
 
 ## Known limitations
 
