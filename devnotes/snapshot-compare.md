@@ -1,8 +1,10 @@
 # Snapshot comparison
 
 Status: implemented on `issue-0-snapshot-compare`; the teardown crash and
-interaction changes were fixed on `issue-43-snapshot-compare-fix`. GUI smoke
-checks, the geometry unit test and the preview base-cache test pass.
+interaction changes were fixed on `issue-43-snapshot-compare-fix`; the
+crop-after-comparison regression was fixed on
+`issue-47-crop-loses-edits`. GUI smoke checks, the geometry unit test and the
+preview base-cache test pass.
 
 ## Behaviour
 
@@ -130,6 +132,70 @@ capture-sharpening radii/contrast, and absolute dark-frame/flat-field paths
 that do not exist are treated as outputs rather than inputs. This prevents a
 loaded snapshot's unnormalised metadata values from forcing a demosaic.
 `RT_COMPARE_FULL=1` forces the old `ALL` path for diagnostics and A/B checks.
+
+## Crop after a comparison
+
+Issue #47: after a comparison had been used, applying a crop could leave the
+processor on the comparison snapshot and discard the live edits.
+
+The comparison state had two independent facts: `comparisonActive`, which is
+the user-interface state, and whether the image processor's parameters were
+actually the comparison parameters. The second fact was inferred from the
+first. A cached-frame release deliberately performs no parameter apply, and a
+teardown leaves the processor untouched; a stale or misordered exit could
+therefore leave the processor on the snapshot while `comparisonActive` was
+false. Crop entry did not end the comparison, so the crop write could start
+from the snapshot.
+
+`EditorPanel` now tracks `processorOnComparisonParams`. The flag is set when
+the render path applies the comparison parameters and cleared only when live
+parameters are applied or the panel is closing. Consequences:
+
+- A cached-frame comparison is not used while the processor holds comparison
+  parameters, because a cache hit assumes that the processor is already on
+  the live parameters.
+- `leaveCompareView()` and `finishCompareForEdit()` restore the live
+  parameters whenever the flag is set, even when `comparisonActive` is
+  already false. The restore is idempotent, so the normal release path is
+  unchanged.
+- Selecting the Crop tool, the Crop panel's Select button and auto-crop emit
+  `beforeParamChange`, so a comparison ends before a crop parameter can be
+  written. Auto-crop reads the processor's committed parameters, but the
+  comparison parameters keep the live geometry, so the fill calculation is
+  unaffected.
+- `liveParams` is refreshed from every committed edit in
+  `EditorPanel::procParamsChanged()`. `saveLiveState()` no longer re-reads
+  the processor's committed copy, which can lag the next parameters that
+  were just applied.
+- `saveProfile()` and `refreshProcessingState()` read `liveParams` while the
+  processor holds comparison parameters, while a view restore is pending, or
+  during teardown. The thumbnail, sidecar and cache are therefore never
+  written from the snapshot.
+
+A plain click on a snapshot remains a profile load by design; only
+`Ctrl+click` selects the comparison snapshot. The comparison-selection path
+does not apply the snapshot as a profile.
+
+### Crop evidence
+
+Environment: CPU build, GCC 14.2.0, 8 physical cores / 16 threads, Xvfb
+1600x1000, default profile, 10.2 MP PEF and 45.7 MP NEF. Each flow made a
++2.73 EV exposure edit, used `\`, then selected the Crop tool and dragged a
+crop. The pre-fix binary was tested with the same flows and did not reproduce
+the loss; the fix closes the state gap described above rather than a captured
+sequence.
+
+| Check | Result |
+|---|---|
+| Edit, `\`, release, crop | PASS: Exposure 2.73 and Crop rows retained; crop geometry applied. |
+| Second comparison (cache hit), then crop | PASS: same rows; the log reported `cache hit`. |
+| Cache disabled, second comparison, then crop | PASS: same rows; the `ALLNORAW` render path was used. |
+| Crop tool selected while `\` was held | PASS: the comparison ended, and the edit and crop were retained. |
+| `\` before any edit, then edit and crop | PASS: no comparison parameters were applied on the later crop. |
+| Tabbed and single-tab editors | PASS: both retain the edit and the crop. |
+| 45.7 MP NEF | PASS: Exposure 2.73 and Crop rows retained. |
+| `Ctrl+click` comparison selection | PASS: the live image was unchanged and only the marker moved. |
+| Close while comparing, reopen | PASS: `Ctrl+W` while `\` was held closed the tab, release after the tab was gone did not crash, and the reopened image kept the Exposure row. |
 
 ## Teardown
 
