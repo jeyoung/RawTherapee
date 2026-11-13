@@ -18,22 +18,23 @@ The first build downloads the Debian 12 image and installs build dependencies.
 The container is always based on Debian 12 so the package keeps the bookworm
 baseline.
 
-Current verified artefact, built from commit `f2d8519f4`:
+Current verified artefact, built from commit `b4513ac0e`:
 
 ```
-build/portable/rawtherapee-5.13-174-gf2d8519f4_5.13+git13195.f2d8519f4-1_amd64.deb
-sha256 9ab30cfbffc5c326e28357382ec1ffb9499492db6c7e9d5086a9e0a869b9d14a
+build/portable/rawtherapee-5.13-201-gb4513ac0e_5.13+git13222.b4513ac0e-1_amd64.deb
+sha256 c91c454d6de8e3967512070a6df205245b6644d4c4d317d521bc3d67664a7565
 ```
 
-Fresh `debian:12` and `debian:13` containers installed the `.deb`, listed
-formats including JPEG XL, exported the public 10.2 MP PEF as 16-bit TIFF with
-`OMP_NUM_THREADS=1` (AE = 0 against the single-threaded host export), and
-started the GUI under Xvfb at 1920x1200. The GUI checks confirmed the Fast
-preview toggle is visible and checked when Preview Demosaic Method is Fast, and
-that the toggle and separator are hidden when the preference is As in PP3.
-The test containers have no OpenCL ICD, so `--gpu-test` and
-`--gpu-test-monitor` exited 2 and are recorded as not run. No performance is
-claimed for the package test.
+Fresh `debian:12` and `debian:13` containers installed the `.deb`, listed 36
+formats including JPEG XL, exported the public 10.2 MP PEF with
+`OMP_NUM_THREADS=1` (maximum absolute difference 0 and no differing samples
+against the single-threaded host export), and started the GUI under Xvfb. The
+GUI checks confirmed that holding and releasing `\` leaves the frame
+pixel-identical to idle, the Snapshots panel has no `Base` row, an exposure
+edit and a crop both apply and keep their History rows, and adding a snapshot
+works. The test containers have no OpenCL ICD, so `--gpu-test` and
+`--gpu-test-monitor` are recorded as not run. No performance is claimed for
+the package test.
 
 ## Layout
 
