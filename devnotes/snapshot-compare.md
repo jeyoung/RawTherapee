@@ -69,6 +69,17 @@ is applied. The edit is therefore never merged onto the comparison
 parameters, and `profileChange` merges a partial profile onto live rather than
 comparison state.
 
+`EditorPanel::applyParamsToIpc()` no longer applies `EvProfileChanged`
+unconditionally: that event maps to `ALL`, which includes preprocess and
+demosaic. It calls `comparisonRequiresRawStage(current, target)`. Post-base
+adjustments use `ALLNORAW`; a raw-stage change (raw settings, white balance,
+lens profile, retinex, capture sharpening or highlight recovery) keeps `ALL`.
+White-balance temperatures for `Camera` and automatic methods, automatic
+capture-sharpening radii/contrast, and absolute dark-frame/flat-field paths
+that do not exist are treated as outputs rather than inputs. This prevents a
+loaded snapshot's unnormalised metadata values from forcing a demosaic.
+`RT_COMPARE_FULL=1` forces the old `ALL` path for diagnostics and A/B checks.
+
 ## Teardown
 
 Removing an editor tab calls `EditorPanel::prepareForRemoval()` before the
@@ -107,6 +118,10 @@ Environment: CPU build, GCC 14.2.0, 8 physical cores / 16 threads, Xvfb
 | Frozen viewport | PASS: before/after drag and wheel during hold were pixel-identical (central viewport crop, AE=0). |
 | Live view restore | PASS: live before/after a compare cycle were pixel-identical (central viewport crop, AE=0). |
 | Panels unchanged | PASS: right panel, left panel and toolbar crops were pixel-identical between comparison and live (`AE=0`). |
+| Transition mask | PASS: an adjustment-only comparison used `ALLNORAW` with `rawStage=0`; `RT_COMPARE_FULL=1` used `ALL`. |
+| Transition latency | PASS: private 45.7 MP NEF, fit and 100 %, p50 97 ms and 91 ms against 1209 ms and 1215 ms with the full path. |
+| Fast/full parity | PASS: the comparison frame and live before/after frames were byte-identical between the fast and full paths at both zooms. |
+| Raw-stage fallback | PASS: unit tests cover white balance, raw settings, lens profile, retinex, capture sharpening and highlight recovery; film negative and output profile remain post-base. |
 | Edit ends comparison | PASS: dragging Exposure compensation while holding `\` hid the badge immediately, added the History row, and kept the edit after releasing `\`. |
 | Non-`\` key | PASS: `z` while holding `\` ended the comparison and zoomed to 100% with the live edit retained. |
 | Auto-repeat suppression | PASS: the badge did not return while `\` stayed held after an edit ended the comparison. |
@@ -144,6 +159,23 @@ There is no second-source-sized step. The extra growth is not fully attributed;
 it includes the saved parameter copies, preview-base-cache activity and
 allocator growth. The 10 MP fit target of 250 ms was not met; the measured
 value is recorded rather than relaxed.
+
+### Transition latency
+
+Host CPU build, GCC 14.2.0, 8 physical cores / 16 threads, Xvfb 1600x1000, a
+private 45.7 MP NEF with the default profile and a +2.73 EV exposure edit.
+Five hold/release cycles per zoom for the default path and two cycles with
+`RT_COMPARE_FULL=1`. Both directions are counted.
+
+| Path | Fit p50 | 100 % p50 | Mask |
+|---|---:|---:|---|
+| `RT_COMPARE_FULL=1` (old) | 1209 ms | 1215 ms | `ALL` |
+| default | 97 ms | 91 ms | `ALLNORAW` |
+
+All fast samples reported `rawStage=0`. The comparison frame and the live
+before/after frames were byte-identical between the fast and full paths at
+both zooms (PNG SHA-256 equality), so the faster mask did not change the
+rendered result.
 
 ## Review fixes
 
@@ -194,6 +226,13 @@ build. GPU tests were not run in the containers.
 - The comparison badge is drawn as an overlay and does not change the viewport
   allocation.
 - A runtime language change does not rename an existing `Base` row.
+- A comparison whose snapshot differs in raw/base inputs (raw settings, white
+  balance, lens profile, retinex or capture sharpening) still uses the full
+  path and pays the demosaic cost. The 45.7 MP full path measured about
+  1.2 s per direction.
+- Relative dark-frame and flat-field paths are not normalised, because their
+  resolution base is not known in the comparison helper; they keep the full
+  path when they differ.
 
 ## Verification commands
 
@@ -205,7 +244,9 @@ tools/perf/test-preview-base-cache.sh build/cpu-<branch>
 ```
 
 For GUI checks, use Xvfb with `GDK_BACKEND=x11`, a scratch `RT_SETTINGS` and
-`RT_CACHE`, and `RT_COMPARE_PROFILE=1`.
+`RT_CACHE`, and `RT_COMPARE_PROFILE=1`. Add `RT_PREVIEW_PROFILE=1` for the
+preview `todo` mask and cache status. Set `RT_COMPARE_FULL=1` to force the
+old full path for A/B measurements.
 
 ## Acceptance criteria status
 
