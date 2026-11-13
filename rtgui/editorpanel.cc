@@ -20,6 +20,7 @@
 #include "editorpanel.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <iostream>
 
@@ -67,6 +68,10 @@ constexpr int INITIAL_ROUGH_SCALE_MULTIPLIER = 2;
 // Safety net for the live-state restore: if the engine never delivers a
 // preview, unlock the editor rather than leaving it stuck in compare mode.
 constexpr int COMPARISON_RESTORE_TIMEOUT_MS = 2000;
+
+// The crop window returns discrete zoom steps. Treat a re-applied step as
+// unchanged rather than forcing a redundant crop update.
+constexpr double COMPARISON_ZOOM_EPSILON = 1e-9;
 
 bool comparisonProfileEnabled()
 {
@@ -3120,6 +3125,11 @@ void EditorPanel::saveLiveState()
     if (iareapanel && iareapanel->imageArea->mainCropWindow) {
         iareapanel->imageArea->mainCropWindow->getCropAnchorPosition(liveAnchorX, liveAnchorY);
         liveZoom = iareapanel->imageArea->mainCropWindow->getZoom();
+
+        if (comparisonProfileEnabled()) {
+            std::fprintf(stderr, "compare: save view zoom=%g anchor=%d,%d\n",
+                         liveZoom, liveAnchorX, liveAnchorY);
+        }
     }
 }
 
@@ -3145,9 +3155,39 @@ void EditorPanel::restoreLiveView()
         }
     }
 
+    auto* const cropWindow = iareapanel->imageArea->mainCropWindow;
+    const double currentZoom = cropWindow->getZoom();
+    const bool zoomChanged =
+        std::abs(currentZoom - liveZoom) > COMPARISON_ZOOM_EPSILON;
+
+    int currentX = 0;
+    int currentY = 0;
+    cropWindow->getCropAnchorPosition(currentX, currentY);
+    const bool anchorChanged = currentX != x || currentY != y;
+
+    if (!zoomChanged && !anchorChanged) {
+        if (comparisonProfileEnabled()) {
+            std::fprintf(stderr, "compare: view unchanged zoom=%g anchor=%d,%d\n",
+                         currentZoom, currentX, currentY);
+        }
+
+        return;
+    }
+
+    if (zoomChanged) {
+        // Apply the zoom first: setZoom centres the anchor internally. The
+        // anchor is restored immediately afterwards in the same update.
+        iareapanel->imageArea->setZoom(liveZoom, true);
+    }
+
     iareapanel->imageArea->setScrollPosition(x, y, true);
-    iareapanel->imageArea->setZoom(liveZoom, true);
     iareapanel->imageArea->queue_draw();
+
+    if (comparisonProfileEnabled()) {
+        std::fprintf(stderr,
+                     "compare: restore view zoom %g->%g anchor %d,%d->%d,%d\n",
+                     currentZoom, liveZoom, currentX, currentY, x, y);
+    }
 }
 
 void EditorPanel::updateComparisonBadge()
@@ -3228,18 +3268,31 @@ void EditorPanel::enterCompareView()
     saveLiveState();
     comparisonEnterUs = g_get_monotonic_time();
 
-    const ProcParams effective = makeComparisonParams(liveParams, comparisonParams);
+    // Base with no live edits renders exactly the same image. Do not start a
+    // processor pass or touch the view; only the badge changes.
+    const bool noRender = history
+        && history->compareSnapshotIsBase()
+        && history->isAtLoadState();
+    const ProcParams effective =
+        noRender ? ProcParams() : makeComparisonParams(liveParams, comparisonParams);
 
     comparisonActive = true;
-    comparisonRenderPending = true;
+    comparisonNoRender = noRender;
+    comparisonRenderPending = !noRender;
     pendingViewRestore = false;
     comparisonRestoreTimeout.disconnect();
 
     lockViewport();
     updateComparisonBadge();
-    setProgressStr(M("SNAPSHOT_COMPARE_RENDERING"));
+    setProgressStr(noRender ? "" : M("SNAPSHOT_COMPARE_RENDERING"));
 
-    applyParamsToIpc(effective);
+    if (noRender) {
+        if (comparisonProfileEnabled()) {
+            std::fprintf(stderr, "compare: no render for unchanged Base\n");
+        }
+    } else {
+        applyParamsToIpc(effective);
+    }
 }
 
 void EditorPanel::leaveCompareView()
@@ -3250,6 +3303,22 @@ void EditorPanel::leaveCompareView()
 
     comparisonActive = false;
     comparisonRenderPending = false;
+
+    if (comparisonNoRender) {
+        comparisonNoRender = false;
+        pendingViewRestore = false;
+        comparisonRestoreTimeout.disconnect();
+        unlockViewport();
+        updateComparisonBadge();
+        setProgressStr("");
+
+        if (comparisonProfileEnabled()) {
+            std::fprintf(stderr, "compare: no render release\n");
+        }
+
+        return;
+    }
+
     pendingViewRestore = true;
     comparisonLeaveUs = g_get_monotonic_time();
 
@@ -3354,12 +3423,17 @@ void EditorPanel::finishCompareForEdit()
         return;
     }
 
+    const bool noRender = comparisonNoRender;
+
     comparisonActive = false;
+    comparisonNoRender = false;
     comparisonRenderPending = false;
     pendingViewRestore = false;
     comparisonRestoreTimeout.disconnect();
 
-    if (ipc) {
+    if (!noRender && ipc) {
+        // The next parameter write supplies the full live state; avoid a
+        // redundant render when the comparison never changed the image.
         applyParamsToIpc(liveParams);
     }
 
@@ -3390,7 +3464,7 @@ void EditorPanel::cancelCompareForClose()
     comparisonKeyDown = false;
     comparisonRestoreTimeout.disconnect();
 
-    if (comparisonActive) {
+    if (comparisonActive && !comparisonNoRender) {
         // Do not start a processing pass while the panel is closing. The
         // editor-thumbnail save below reads liveParamsForSave instead of the
         // image processor, which still holds the comparison parameters.
@@ -3398,6 +3472,7 @@ void EditorPanel::cancelCompareForClose()
     }
 
     comparisonActive = false;
+    comparisonNoRender = false;
     comparisonRenderPending = false;
     pendingViewRestore = false;
     comparisonValid = false;

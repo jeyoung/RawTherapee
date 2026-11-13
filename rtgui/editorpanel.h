@@ -349,6 +349,7 @@ private:
     bool comparisonValid = false;
     bool comparisonActive = false;
     bool comparisonRenderPending = false;
+    bool comparisonNoRender = false;
     bool pendingViewRestore = false;
     bool closingOrSwitching = false;
     bool removalPrepared = false;

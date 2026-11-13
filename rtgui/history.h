@@ -158,6 +158,8 @@ public:
         rtengine::procparams::ProcParams& params,
         Glib::ustring& name
     );
+    bool compareSnapshotIsBase();
+    bool isAtLoadState() const;
     void setCompareSnapshot(const Gtk::TreeModel::iterator& iter);
     void restoreBaseComparison();
 

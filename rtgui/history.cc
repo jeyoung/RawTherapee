@@ -488,6 +488,31 @@ bool History::getCompareSnapshotParams(ProcParams& params, Glib::ustring& name)
     return true;
 }
 
+bool History::compareSnapshotIsBase()
+{
+    const Gtk::TreeModel::iterator iter = findCompareRow();
+    return iter != bookmarkModel->children().end()
+        && (*iter)[bookmarkColumns.isBase];
+}
+
+bool History::isAtLoadState() const
+{
+    if (!historyModel) {
+        return true;
+    }
+
+    // The first row is the "photo loaded" state. Later rows are parameter
+    // changes; an undo may leave them in the model but select an earlier row.
+    if (historyModel->children().size() <= 1) {
+        return true;
+    }
+
+    const auto selection = hTreeView->get_selection()->get_selected();
+    return selection
+        && historyModel->get_path(selection)
+            == historyModel->get_path(historyModel->children().begin());
+}
+
 bool History::deleteBookmark(const Gtk::TreeModel::iterator& iter)
 {
     if (!iter) {
