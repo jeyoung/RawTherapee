@@ -269,16 +269,16 @@ overlays are never cached.
 
 ## Packaging
 
-`tools/build-rt.sh portable` was run from a clean clone of commit `9d1a546da`,
+`tools/build-rt.sh portable` was run from a clean clone of commit `2dd85e36b`,
 so the Git-derived version is available inside the container. A linked
 worktree cannot be used: its `.git` file points outside the mounted source
 directory, so the container cannot read the version. The package is stored in
 the clone under `build/portable/`:
 
 ```text
-rawtherapee-5.13-193-g9d1a546da_5.13+git13214.9d1a546da-1_amd64.deb
-Version 5.13+git13214.9d1a546da-1
-SHA-256 192c2533efef81595887faf1821a18bc596bab89c71e6136dcbb86ea6a109163
+rawtherapee-5.13-196-g2dd85e36b_5.13+git13217.2dd85e36b-1_amd64.deb
+Version 5.13+git13217.2dd85e36b-1
+SHA-256 09cb0d5dcc046b9be1cce103779d1a9b0998cb8d681ecf914354cf020ffbf8b7
 ```
 
 The package installed and `rawtherapee-cli --list-formats` passed in a
@@ -288,13 +288,13 @@ single-threaded host export except for the embedded version string and
 timestamp; the pixel data and file size matched exactly.
 
 The GUI smoke test was run from the installed package on Debian 12 under
-Xvfb with a 10.2 MP PEF. An unedited `Base` comparison took the no-render
-path and the viewport was pixel-identical before, during and after the hold.
-A 100 % panned, exposure-edited comparison reported `view unchanged` with
-zoom `1`, anchor `444,404`, kept the pre-hold and post-release viewport
-byte-identical and rendered with `ALLNORAW`. The application quit cleanly.
-The multi-tab close/reopen regression was run on the host CPU build. GPU tests
-were not run in the containers.
+Xvfb with a 10.2 MP PEF. A 100 % panned, exposure-edited comparison reported
+`view unchanged` with zoom `1`, anchor `444,404`, kept the pre-hold and
+post-release viewport byte-identical and rendered with `ALLNORAW`. The first
+comparison render took 32.6 ms; the following hold logged `cache hit
+0.092 ms` and its viewport was byte-identical to the first render. The
+application quit cleanly. The multi-tab close/reopen regression was run on
+the host CPU build. GPU tests were not run in the containers.
 
 ## Known limitations
 

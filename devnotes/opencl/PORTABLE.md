@@ -18,11 +18,11 @@ The first build downloads the Debian 12 image and installs build dependencies.
 The container is always based on Debian 12 so the package keeps the bookworm
 baseline.
 
-Current verified artefact, built from commit `9d1a546da`:
+Current verified artefact, built from commit `2dd85e36b`:
 
 ```
-build/portable/rawtherapee-5.13-193-g9d1a546da_5.13+git13214.9d1a546da-1_amd64.deb
-sha256 192c2533efef81595887faf1821a18bc596bab89c71e6136dcbb86ea6a109163
+build/portable/rawtherapee-5.13-196-g2dd85e36b_5.13+git13217.2dd85e36b-1_amd64.deb
+sha256 09cb0d5dcc046b9be1cce103779d1a9b0998cb8d681ecf914354cf020ffbf8b7
 ```
 
 The package was built from a clean clone because a linked worktree exposes a
@@ -33,14 +33,12 @@ Fresh `debian:12` and `debian:13` containers installed the `.deb` and listed
 formats including JPEG XL. A single-threaded 16-bit TIFF export with an
 explicit PP3 was identical to the single-threaded host export except for the
 embedded version string and timestamp. The installed package started under
-Xvfb on Debian 12 with a 10.2 MP PEF. An unedited `Base` comparison used the
-no-render path and the viewport was pixel-identical before, during and after
-the hold. A 100 % panned, exposure-edited comparison reported `view unchanged`
-with zoom `1`, anchor `444,404`, kept the pre-hold and post-release viewport
-byte-identical and rendered with `ALLNORAW`. The application quit cleanly. The
-test containers have no OpenCL ICD, so `--gpu-test` and
-`--gpu-test-monitor` are recorded as not run. These are functional checks; no
-general performance claim is made for the package.
+Xvfb on Debian 12 with a 10.2 MP PEF. An exposure-edited comparison rendered
+with `ALLNORAW` in 32.6 ms and preserved zoom/anchor; the following hold
+logged `cache hit 0.092 ms` and its viewport was byte-identical to the first
+render. The application quit cleanly. The test containers have no OpenCL ICD,
+so `--gpu-test` and `--gpu-test-monitor` are recorded as not run. These are
+functional checks; no general performance claim is made for the package.
 
 ## Layout
 
