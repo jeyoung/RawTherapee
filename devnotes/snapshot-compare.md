@@ -194,16 +194,16 @@ rendered result.
 
 ## Packaging
 
-`tools/build-rt.sh portable` was run from a clean clone of commit `58f9f0273`,
+`tools/build-rt.sh portable` was run from a clean clone of commit `be25c8d82`,
 so the Git-derived version is available inside the container. A linked
 worktree cannot be used: its `.git` file points outside the mounted source
 directory, so the container cannot read the version. The package is stored in
 the clone under `build/portable/`:
 
 ```text
-rawtherapee-5.13-187-g58f9f0273_5.13+git13208.58f9f0273-1_amd64.deb
-Version 5.13+git13208.58f9f0273-1
-SHA-256 32c407f0683bfc230a4684c808fc2968346e4d493719352bd421d38b433783da
+rawtherapee-5.13-190-gbe25c8d82_5.13+git13211.be25c8d82-1_amd64.deb
+Version 5.13+git13211.be25c8d82-1
+SHA-256 0bab7ad0ac4397cc9e5be0b633d71d803560ef679171773c544a08483c2a8886
 ```
 
 The package installed and `rawtherapee-cli --list-formats` passed in a
@@ -213,9 +213,10 @@ single-threaded host export except for the embedded version string and
 timestamp; the pixel data and file size matched exactly.
 
 The GUI smoke test was run from the installed package on Debian 12 under
-Xvfb: the image loaded, hold and release of `\` worked, and the application
-quit cleanly. The multi-tab close/reopen regression was run on the host CPU
-build. GPU tests were not run in the containers.
+Xvfb with a private 45.7 MP NEF: the comparison used `ALLNORAW` with
+`rawStage=0`, the snapshot was ready in 76.7 ms and the live view in 83.9 ms,
+and the application quit cleanly. The multi-tab close/reopen regression was
+run on the host CPU build. GPU tests were not run in the containers.
 
 ## Known limitations
 
