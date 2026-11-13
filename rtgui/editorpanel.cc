@@ -44,6 +44,7 @@
 #include "procparamchangers.h"
 #include "placesbrowser.h"
 #include "pathutils.h"
+#include "rtscalable.h"
 #include "thumbnail.h"
 #include "toolpanelcoord.h"
 #include "widgets/basic/adjuster.h"
@@ -73,6 +74,10 @@ constexpr int COMPARISON_RESTORE_TIMEOUT_MS = 2000;
 // unchanged rather than forcing a redundant crop update.
 constexpr double COMPARISON_ZOOM_EPSILON = 1e-9;
 
+// One viewport crop, not a second raw source or preview. Above this size the
+// cache is disabled and the normal render path is used.
+constexpr std::size_t COMPARISON_FRAME_MAX_BYTES = 32 * 1024 * 1024;
+
 bool comparisonProfileEnabled()
 {
     static const bool enabled = []() {
@@ -87,6 +92,16 @@ bool comparisonFullEnabled()
     static const bool enabled = []() {
         const char* value = g_getenv("RT_COMPARE_FULL");
         return value && value[0] != '\0' && g_strcmp0(value, "0") != 0;
+    }();
+    return enabled;
+}
+
+bool comparisonCacheEnabled()
+{
+    static const bool enabled = []() {
+        const char* value = g_getenv("RT_COMPARE_CACHE");
+        return value == nullptr || value[0] == '\0'
+            || g_strcmp0(value, "0") != 0;
     }();
     return enabled;
 }
@@ -928,6 +943,8 @@ EditorPanel::EditorPanel (FilePanel* filePanel)
     Gtk::Separator* vsep3 = Gtk::manage (new Gtk::Separator(Gtk::ORIENTATION_VERTICAL));
 
     iareapanel = new ImageAreaPanel ();
+    iareapanel->imageArea->cropImageUpdatedSignal.connect(
+        sigc::mem_fun(*this, &EditorPanel::onCropImageUpdated));
     tpc->setEditProvider (iareapanel->imageArea);
     tpc->getToolBar()->setLockablePickerToolListener (iareapanel->imageArea);
 
@@ -1723,6 +1740,7 @@ void EditorPanel::open (Thumbnail* tmb, rtengine::InitialImage* isrc)
 void EditorPanel::close ()
 {
     cancelCompareForClose();
+    clearComparisonFrame();
 
     if (toggleFastPreview) {
         toggleFastPreview->set_sensitive(false);
@@ -3190,6 +3208,319 @@ void EditorPanel::restoreLiveView()
     }
 }
 
+void EditorPanel::onCropImageUpdated()
+{
+    if (!comparisonCacheEnabled()) {
+        return;
+    }
+
+    if (!iareapanel || !iareapanel->imageArea
+            || !iareapanel->imageArea->mainCropWindow) {
+        return;
+    }
+
+    const auto pixbuf =
+        iareapanel->imageArea->mainCropWindow->cropHandler.cropPixbuf;
+
+    if (!pixbuf) {
+        return;
+    }
+
+    if (comparisonActive && comparisonCapturePending) {
+        captureComparisonFrame(pixbuf);
+    }
+}
+
+bool EditorPanel::comparisonPreviewOverlayActive() const
+{
+    if (!iareapanel || !iareapanel->imageArea) {
+        return false;
+    }
+
+    const ImageArea* const imageArea = iareapanel->imageArea;
+
+    if (!imageArea->previewModePanel || !imageArea->indClippedPanel) {
+        return false;
+    }
+
+    return imageArea->previewModePanel->showR()
+        || imageArea->previewModePanel->showG()
+        || imageArea->previewModePanel->showB()
+        || imageArea->previewModePanel->showL()
+        || imageArea->indClippedPanel->showClippedShadows()
+        || imageArea->indClippedPanel->showClippedHighlights()
+        || imageArea->indClippedPanel->showFocusMask()
+        || imageArea->indClippedPanel->showSharpMask();
+}
+
+void EditorPanel::captureComparisonFrame(
+    const Glib::RefPtr<Gdk::Pixbuf>& pixbuf)
+{
+    if (!comparisonCacheEnabled() || comparisonPreviewOverlayActive()) {
+        return;
+    }
+
+    if (!pixbuf || !ipc || !previewHandler || !iareapanel
+            || !iareapanel->imageArea->mainCropWindow) {
+        return;
+    }
+
+    const std::size_t bytes =
+        static_cast<std::size_t>(pixbuf->get_rowstride())
+        * static_cast<std::size_t>(pixbuf->get_height());
+
+    if (bytes == 0 || bytes > COMPARISON_FRAME_MAX_BYTES) {
+        clearComparisonFrame();
+
+        if (comparisonProfileEnabled()) {
+            std::fprintf(stderr, "compare: cache skip %zu bytes\n", bytes);
+        }
+
+        return;
+    }
+
+    ProcParams current;
+    ipc->getParams(&current, false);
+
+    int anchorX = 0;
+    int anchorY = 0;
+    iareapanel->imageArea->mainCropWindow->getCropAnchorPosition(
+        anchorX, anchorY);
+
+    ComparisonFrameKey key;
+    key.revision = comparisonRevision;
+    key.fullWidth = ipc->getFullWidth();
+    key.fullHeight = ipc->getFullHeight();
+    key.anchorX = anchorX;
+    key.anchorY = anchorY;
+    key.zoom = iareapanel->imageArea->mainCropWindow->getZoom();
+    key.previewScale = previewHandler->getPreviewScale();
+    key.pixbufWidth = pixbuf->get_width();
+    key.pixbufHeight = pixbuf->get_height();
+    key.deviceScale = RTScalable::getScaleForWidget(iareapanel->imageArea);
+
+    // Keep only the geometry fields; do not copy locallab/spot vectors into
+    // the cache key.
+    key.geometry.crop = current.crop;
+    key.geometry.cropGuide = current.cropGuide;
+    key.geometry.coarse = current.coarse;
+    key.geometry.commonTrans = current.commonTrans;
+    key.geometry.rotate = current.rotate;
+    key.geometry.distortion = current.distortion;
+    key.geometry.perspective = current.perspective;
+    key.geometry.lensProf = current.lensProf;
+    key.prevdemo = App::get().options().prevdemo;
+    key.fastPreview = fastPreviewEnabled;
+
+    ipc->getMonitorProfile(key.monitorProfile, key.monitorIntent);
+    ipc->getSoftProofing(key.softProof, key.gamutCheck);
+
+    comparisonFrame = pixbuf;
+    comparisonFrameKey = std::move(key);
+    comparisonFrameValid = true;
+
+    if (comparisonProfileEnabled()) {
+        std::fprintf(stderr,
+                     "compare: cache %dx%d bytes=%zu scale=%g zoom=%g"
+                     " anchor=%d,%d rev=%d\n",
+                     pixbuf->get_width(), pixbuf->get_height(), bytes,
+                     previewHandler->getPreviewScale(),
+                     comparisonFrameKey.zoom, anchorX, anchorY,
+                     comparisonRevision);
+    }
+}
+
+bool EditorPanel::comparisonFrameMatches()
+{
+    if (!comparisonFrameValid || !comparisonFrame || !ipc
+            || !previewHandler || !iareapanel
+            || !iareapanel->imageArea->mainCropWindow) {
+        return false;
+    }
+
+    // The cached frame is the plain monitor image. Use the render path while
+    // any preview-mode overlay is enabled; those frames are not cached.
+    if (comparisonPreviewOverlayActive()) {
+        return false;
+    }
+
+    if (comparisonRevision != comparisonFrameKey.revision) {
+        if (comparisonProfileEnabled()) {
+            std::fprintf(stderr, "compare: cache miss revision %d/%d\n",
+                         comparisonFrameKey.revision, comparisonRevision);
+        }
+
+        return false;
+    }
+
+    if (ipc->getFullWidth() != comparisonFrameKey.fullWidth
+            || ipc->getFullHeight() != comparisonFrameKey.fullHeight) {
+        if (comparisonProfileEnabled()) {
+            std::fprintf(stderr, "compare: cache miss dimensions\n");
+        }
+
+        return false;
+    }
+
+    ProcParams current;
+    ipc->getParams(&current, false);
+
+    // Crop and perspective defaults are normalised by the engine. When they
+    // are inactive, their inactive fields do not affect the rendered image.
+    const bool sameCrop =
+        current.crop.enabled == comparisonFrameKey.geometry.crop.enabled
+        && (!current.crop.enabled
+            || current.crop == comparisonFrameKey.geometry.crop);
+
+    const auto perspectiveActive = [](const PerspectiveParams& p) {
+        return p.horizontal != 0.0 || p.vertical != 0.0
+            || p.camera_pitch != 0.0 || p.camera_roll != 0.0
+            || p.camera_shift_horiz != 0.0 || p.camera_shift_vert != 0.0
+            || p.camera_yaw != 0.0 || p.projection_pitch != 0.0
+            || p.projection_rotate != 0.0
+            || p.projection_shift_horiz != 0.0
+            || p.projection_shift_vert != 0.0 || p.projection_yaw != 0.0
+            || !p.control_line_values.empty();
+    };
+
+    const bool samePerspective =
+        !perspectiveActive(current.perspective)
+            && !perspectiveActive(comparisonFrameKey.geometry.perspective)
+        ? true
+        : current.perspective == comparisonFrameKey.geometry.perspective;
+
+    const bool sameGeometry =
+        sameCrop
+        && samePerspective
+        && current.coarse == comparisonFrameKey.geometry.coarse
+        && current.commonTrans == comparisonFrameKey.geometry.commonTrans
+        && current.rotate == comparisonFrameKey.geometry.rotate
+        && current.distortion == comparisonFrameKey.geometry.distortion
+        && current.lensProf == comparisonFrameKey.geometry.lensProf;
+
+    if (!sameGeometry) {
+        if (comparisonProfileEnabled()) {
+            std::fprintf(stderr,
+                         "compare: cache miss geometry crop=%d coarse=%d"
+                         " trans=%d rotate=%d distortion=%d perspective=%d"
+                         " lens=%d\n",
+                         !sameCrop,
+                         current.coarse != comparisonFrameKey.geometry.coarse,
+                         current.commonTrans
+                             != comparisonFrameKey.geometry.commonTrans,
+                         current.rotate != comparisonFrameKey.geometry.rotate,
+                         current.distortion
+                             != comparisonFrameKey.geometry.distortion,
+                         !samePerspective,
+                         current.lensProf
+                             != comparisonFrameKey.geometry.lensProf);
+        }
+
+        return false;
+    }
+
+    auto* const cropWindow = iareapanel->imageArea->mainCropWindow;
+
+    if (!cropWindow->cropHandler.cropPixbuf) {
+        return false;
+    }
+
+    int anchorX = 0;
+    int anchorY = 0;
+    cropWindow->getCropAnchorPosition(anchorX, anchorY);
+
+    if (anchorX != comparisonFrameKey.anchorX
+            || anchorY != comparisonFrameKey.anchorY
+            || std::abs(cropWindow->getZoom() - comparisonFrameKey.zoom)
+                > COMPARISON_ZOOM_EPSILON
+            || std::abs(previewHandler->getPreviewScale()
+                - comparisonFrameKey.previewScale)
+                > COMPARISON_ZOOM_EPSILON
+            || cropWindow->cropHandler.cropPixbuf->get_width()
+                != comparisonFrameKey.pixbufWidth
+            || cropWindow->cropHandler.cropPixbuf->get_height()
+                != comparisonFrameKey.pixbufHeight
+            || RTScalable::getScaleForWidget(iareapanel->imageArea)
+                != comparisonFrameKey.deviceScale) {
+        if (comparisonProfileEnabled()) {
+            std::fprintf(stderr,
+                         "compare: cache miss view zoom=%g/%g anchor=%d,%d/%d,%d"
+                         " scale=%g/%g pixbuf=%d,%d/%d,%d deviceScale=%d/%d\n",
+                         cropWindow->getZoom(), comparisonFrameKey.zoom,
+                         anchorX, anchorY, comparisonFrameKey.anchorX,
+                         comparisonFrameKey.anchorY,
+                         previewHandler->getPreviewScale(),
+                         comparisonFrameKey.previewScale,
+                         cropWindow->cropHandler.cropPixbuf->get_width(),
+                         cropWindow->cropHandler.cropPixbuf->get_height(),
+                         comparisonFrameKey.pixbufWidth,
+                         comparisonFrameKey.pixbufHeight,
+                         RTScalable::getScaleForWidget(iareapanel->imageArea),
+                         comparisonFrameKey.deviceScale);
+        }
+
+        return false;
+    }
+
+    Glib::ustring monitorProfile;
+    rtengine::RenderingIntent monitorIntent;
+    ipc->getMonitorProfile(monitorProfile, monitorIntent);
+
+    bool softProof = false;
+    bool gamutCheck = false;
+    ipc->getSoftProofing(softProof, gamutCheck);
+
+    const bool sameColor = monitorProfile == comparisonFrameKey.monitorProfile
+        && monitorIntent == comparisonFrameKey.monitorIntent
+        && softProof == comparisonFrameKey.softProof
+        && gamutCheck == comparisonFrameKey.gamutCheck;
+    const bool samePreview = App::get().options().prevdemo
+            == comparisonFrameKey.prevdemo
+        && fastPreviewEnabled == comparisonFrameKey.fastPreview;
+
+    if (!sameColor || !samePreview) {
+        if (comparisonProfileEnabled()) {
+            std::fprintf(stderr,
+                         "compare: cache miss colour=%d preview=%d\n",
+                         sameColor, samePreview);
+        }
+
+        return false;
+    }
+
+    return true;
+}
+
+void EditorPanel::setComparisonOverlayActive(bool active)
+{
+    if (!iareapanel || !iareapanel->imageArea
+            || !iareapanel->imageArea->mainCropWindow) {
+        return;
+    }
+
+    if (active && comparisonFrame) {
+        iareapanel->imageArea->mainCropWindow->setComparisonOverlay(
+            comparisonFrame);
+        comparisonFrameActive = true;
+    } else {
+        iareapanel->imageArea->mainCropWindow->clearComparisonOverlay();
+        comparisonFrameActive = false;
+    }
+}
+
+void EditorPanel::clearComparisonFrame()
+{
+    if (iareapanel && iareapanel->imageArea
+            && iareapanel->imageArea->mainCropWindow) {
+        iareapanel->imageArea->mainCropWindow->clearComparisonOverlay();
+    }
+
+    comparisonFrame.reset();
+    comparisonFrameValid = false;
+    comparisonFrameActive = false;
+    comparisonCapturePending = false;
+}
+
 void EditorPanel::updateComparisonBadge()
 {
     if (!comparisonBadge) {
@@ -3213,6 +3544,14 @@ void EditorPanel::onCompareSnapshotChanged()
     if (closingOrSwitching || !history) {
         return;
     }
+
+    ++comparisonRevision;
+
+    if (comparisonActive) {
+        leaveCompareView();
+    }
+
+    clearComparisonFrame();
 
     ProcParams params;
     Glib::ustring name;
@@ -3265,11 +3604,36 @@ void EditorPanel::enterCompareView()
         beforeAfter->set_active(false);
     }
 
+    const gint64 entryStartUs = g_get_monotonic_time();
     saveLiveState();
     comparisonEnterUs = g_get_monotonic_time();
 
+    const bool cacheHit = comparisonCacheEnabled() && comparisonFrameMatches();
+
+    if (cacheHit) {
+        comparisonActive = true;
+        comparisonNoRender = false;
+        comparisonRenderPending = false;
+        comparisonCapturePending = false;
+        pendingViewRestore = false;
+        comparisonRestoreTimeout.disconnect();
+
+        lockViewport();
+        setComparisonOverlayActive(true);
+        updateComparisonBadge();
+        setProgressStr("");
+
+        if (comparisonProfileEnabled()) {
+            std::fprintf(stderr, "compare: cache hit %.3f ms\n",
+                         elapsedMs(entryStartUs));
+        }
+
+        return;
+    }
+
     // Base with no live edits renders exactly the same image. Do not start a
-    // processor pass or touch the view; only the badge changes.
+    // processor pass or touch the view; only the badge changes. Capture the
+    // current crop so later post-base edits can use the cache.
     const bool noRender = history
         && history->compareSnapshotIsBase()
         && history->isAtLoadState();
@@ -3279,6 +3643,8 @@ void EditorPanel::enterCompareView()
     comparisonActive = true;
     comparisonNoRender = noRender;
     comparisonRenderPending = !noRender;
+    comparisonFrameActive = false;
+    comparisonCapturePending = !noRender;
     pendingViewRestore = false;
     comparisonRestoreTimeout.disconnect();
 
@@ -3303,6 +3669,23 @@ void EditorPanel::leaveCompareView()
 
     comparisonActive = false;
     comparisonRenderPending = false;
+
+    if (comparisonFrameActive) {
+        comparisonFrameActive = false;
+        comparisonCapturePending = false;
+        pendingViewRestore = false;
+        comparisonRestoreTimeout.disconnect();
+        setComparisonOverlayActive(false);
+        unlockViewport();
+        updateComparisonBadge();
+        setProgressStr("");
+
+        if (comparisonProfileEnabled()) {
+            std::fprintf(stderr, "compare: cache release\n");
+        }
+
+        return;
+    }
 
     if (comparisonNoRender) {
         comparisonNoRender = false;
@@ -3423,11 +3806,17 @@ void EditorPanel::finishCompareForEdit()
         return;
     }
 
-    const bool noRender = comparisonNoRender;
+    const bool noRender = comparisonNoRender || comparisonFrameActive;
+
+    if (comparisonFrameActive) {
+        comparisonFrameActive = false;
+        setComparisonOverlayActive(false);
+    }
 
     comparisonActive = false;
     comparisonNoRender = false;
     comparisonRenderPending = false;
+    comparisonCapturePending = false;
     pendingViewRestore = false;
     comparisonRestoreTimeout.disconnect();
 
@@ -3445,6 +3834,7 @@ void EditorPanel::finishCompareForEdit()
 void EditorPanel::prepareForRemoval()
 {
     cancelCompareForClose();
+    clearComparisonFrame();
 
     comparisonRestoreTimeout.disconnect();
     comparisonSnapshotConn.disconnect();
@@ -3464,7 +3854,14 @@ void EditorPanel::cancelCompareForClose()
     comparisonKeyDown = false;
     comparisonRestoreTimeout.disconnect();
 
-    if (comparisonActive && !comparisonNoRender) {
+    const bool frameActive = comparisonFrameActive;
+
+    if (frameActive) {
+        comparisonFrameActive = false;
+        setComparisonOverlayActive(false);
+    }
+
+    if (comparisonActive && !comparisonNoRender && !frameActive) {
         // Do not start a processing pass while the panel is closing. The
         // editor-thumbnail save below reads liveParamsForSave instead of the
         // image processor, which still holds the comparison parameters.
@@ -3474,6 +3871,7 @@ void EditorPanel::cancelCompareForClose()
     comparisonActive = false;
     comparisonNoRender = false;
     comparisonRenderPending = false;
+    comparisonCapturePending = false;
     pendingViewRestore = false;
     comparisonValid = false;
     comparisonName.clear();

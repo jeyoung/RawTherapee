@@ -114,6 +114,8 @@ void ImageArea::on_resized (Gtk::Allocation& req)
     if (ipc && get_width() > 1) { // sometimes on_resize is called in some init state, causing wrong sizes
         if (!mainCropWindow) {
             mainCropWindow = new CropWindow (this, false, false);
+            mainCropWindow->cropImageUpdatedSignal.connect(
+                [this]() { cropImageUpdatedSignal.emit(); });
             mainCropWindow->setDecorated (false);
             mainCropWindow->setFitZoomEnabled (true);
             mainCropWindow->addCropWindowListener (this);

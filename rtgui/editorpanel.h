@@ -87,6 +87,15 @@ public:
     void setActive(bool isActive)
     {
         active = isActive;
+
+        if (!active) {
+            // Do not touch widgets here; a tab switch cancels the comparison
+            // first. Just release the retained viewport frame.
+            comparisonFrame.reset();
+            comparisonFrameValid = false;
+            comparisonFrameActive = false;
+            comparisonCapturePending = false;
+        }
     }
     bool isActive() const
     {
@@ -244,6 +253,12 @@ private:
     void finishCompareForEdit();
     void cancelCompareForClose();
     bool onComparisonRestoreTimeout();
+    void onCropImageUpdated();
+    void captureComparisonFrame(const Glib::RefPtr<Gdk::Pixbuf>& pixbuf);
+    bool comparisonPreviewOverlayActive() const;
+    bool comparisonFrameMatches();
+    void setComparisonOverlayActive(bool active);
+    void clearComparisonFrame();
 
     BatchQueueEntry*    createBatchQueueEntry ();
     bool                idle_imageSaved (ProgressConnector<int> *pc, rtengine::IImagefloat* img, Glib::ustring fname, SaveFormat sf, rtengine::procparams::ProcParams &pparams);
@@ -346,10 +361,36 @@ private:
     rtengine::procparams::ProcParams liveParams;
     rtengine::procparams::ProcParams comparisonParams;
     Glib::ustring comparisonName;
+    struct ComparisonFrameKey {
+        int revision = -1;
+        int fullWidth = 0;
+        int fullHeight = 0;
+        int anchorX = 0;
+        int anchorY = 0;
+        int pixbufWidth = 0;
+        int pixbufHeight = 0;
+        int deviceScale = 0;
+        double zoom = 0.0;
+        double previewScale = 0.0;
+        bool softProof = false;
+        bool gamutCheck = false;
+        int prevdemo = 0;
+        bool fastPreview = false;
+        Glib::ustring monitorProfile;
+        rtengine::RenderingIntent monitorIntent = rtengine::RI_PERCEPTUAL;
+        rtengine::procparams::ProcParams geometry;
+    };
+
     bool comparisonValid = false;
     bool comparisonActive = false;
     bool comparisonRenderPending = false;
     bool comparisonNoRender = false;
+    bool comparisonFrameValid = false;
+    bool comparisonFrameActive = false;
+    bool comparisonCapturePending = false;
+    int comparisonRevision = 0;
+    Glib::RefPtr<Gdk::Pixbuf> comparisonFrame;
+    ComparisonFrameKey comparisonFrameKey;
     bool pendingViewRestore = false;
     bool closingOrSwitching = false;
     bool removalPrepared = false;

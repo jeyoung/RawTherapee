@@ -302,6 +302,22 @@ void CropWindow::setCropAnchorPosition (int x, int y)
     cropHandler.setAnchorPosition(ImageCoord(x, y));
 }
 
+void CropWindow::setComparisonOverlay (const Glib::RefPtr<Gdk::Pixbuf>& overlay)
+{
+    comparisonOverlay = overlay;
+    iarea->redraw();
+}
+
+void CropWindow::clearComparisonOverlay ()
+{
+    if (!comparisonOverlay) {
+        return;
+    }
+
+    comparisonOverlay.clear();
+    iarea->redraw();
+}
+
 bool CropWindow::isInside (int x, int y)
 {
 
@@ -1561,7 +1577,24 @@ void CropWindow::expose (Cairo::RefPtr<Cairo::Context> cr)
 
         bool useBgColor = (state == SNormal || state == SDragPicker || state == SDeletePicker || state == SEditDrag1);
 
-        if (cropHandler.cropPixbuf) {
+        if (comparisonOverlay) {
+            imgSize.width = comparisonOverlay->get_width();
+            imgSize.height = comparisonOverlay->get_height();
+            exposeVersion++;
+
+            hidpi::LogicalCoord offset = windowPos + imgAreaPos + imgPos;
+            Gdk::Cairo::set_source_pixbuf(cr, comparisonOverlay, offset.x, offset.y);
+            auto pattern = hidpi::getSourceForSurface(cr);
+            int deviceScale = RTScalable::getScaleForWidget(iarea);
+            hidpi::setDeviceScale(pattern->get_surface(), deviceScale);
+            // Contain blitting area within crop window
+            cr->rectangle(offset.x, offset.y,
+                          std::min(comparisonOverlay->get_width() / deviceScale,
+                                   imgAreaSize.width - imgPos.x),
+                          std::min(comparisonOverlay->get_height() / deviceScale,
+                                   imgAreaSize.height - imgPos.y));
+            cr->fill();
+        } else if (cropHandler.cropPixbuf) {
             imgSize.width = cropHandler.cropPixbuf->get_width();
             imgSize.height = cropHandler.cropPixbuf->get_height();
             exposeVersion++;
@@ -2828,19 +2861,23 @@ void CropWindow::drawObservedFrame (const Cairo::RefPtr<Cairo::Context>& cr)
 
 void CropWindow::cropImageUpdated ()
 {
-    MyMutex::MyLock lock(cropHandler.cimg);
+    {
+        MyMutex::MyLock lock(cropHandler.cimg);
 
-    for (auto colorPicker : colorPickers) {
-        Coord imgPos, cropPos;
-        colorPicker->getImagePosition(imgPos);
-        imageCoordToCropImage(imgPos.x, imgPos.y, cropPos.x, cropPos.y);
-        float r=0.f, g=0.f, b=0.f;
-        float rpreview=0.f, gpreview=0.f, bpreview=0.f;
-        colorPicker->setValidity (checkValidity (colorPicker, cropPos));
-        cropHandler.colorPick(cropPos, r, g, b, rpreview, gpreview, bpreview, colorPicker->getSize());
-        colorPicker->setRGB (r, g, b, rpreview, gpreview, bpreview);
+        for (auto colorPicker : colorPickers) {
+            Coord imgPos, cropPos;
+            colorPicker->getImagePosition(imgPos);
+            imageCoordToCropImage(imgPos.x, imgPos.y, cropPos.x, cropPos.y);
+            float r=0.f, g=0.f, b=0.f;
+            float rpreview=0.f, gpreview=0.f, bpreview=0.f;
+            colorPicker->setValidity (checkValidity (colorPicker, cropPos));
+            cropHandler.colorPick(cropPos, r, g, b, rpreview, gpreview, bpreview, colorPicker->getSize());
+            colorPicker->setRGB (r, g, b, rpreview, gpreview, bpreview);
+        }
     }
+
     iarea->redraw ();
+    cropImageUpdatedSignal.emit();
 }
 
 void CropWindow::cropWindowChanged ()

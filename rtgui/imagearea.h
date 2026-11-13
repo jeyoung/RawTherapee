@@ -88,6 +88,7 @@ protected:
 public:
     CropWindow* mainCropWindow;
     CropWindow* flawnOverWindow;
+    sigc::signal<void> cropImageUpdatedSignal;
     ZoomPanel* zoomPanel;
     IndicateClippedPanel* indClippedPanel;
     PreviewModePanel* previewModePanel;
