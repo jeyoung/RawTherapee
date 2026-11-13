@@ -162,16 +162,16 @@ value is recorded rather than relaxed.
 
 ## Packaging
 
-`tools/build-rt.sh portable` was run from a clean clone of commit `46de4f3de`,
+`tools/build-rt.sh portable` was run from a clean clone of commit `58f9f0273`,
 so the Git-derived version is available inside the container. A linked
 worktree cannot be used: its `.git` file points outside the mounted source
 directory, so the container cannot read the version. The package is stored in
 the clone under `build/portable/`:
 
 ```text
-rawtherapee-5.13-184-g46de4f3de_5.13+git13205.46de4f3de-1_amd64.deb
-Version 5.13+git13205.46de4f3de-1
-SHA-256 6d5cd5c2e88f40febe8f3ca915134b57ff1ea609ba4c37ea5ba902a85e35ca95
+rawtherapee-5.13-187-g58f9f0273_5.13+git13208.58f9f0273-1_amd64.deb
+Version 5.13+git13208.58f9f0273-1
+SHA-256 32c407f0683bfc230a4684c808fc2968346e4d493719352bd421d38b433783da
 ```
 
 The package installed and `rawtherapee-cli --list-formats` passed in a
