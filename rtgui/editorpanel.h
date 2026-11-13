@@ -388,6 +388,7 @@ private:
     bool comparisonFrameValid = false;
     bool comparisonFrameActive = false;
     bool comparisonCapturePending = false;
+    bool processorOnComparisonParams = false;
     int comparisonRevision = 0;
     Glib::RefPtr<Gdk::Pixbuf> comparisonFrame;
     ComparisonFrameKey comparisonFrameKey;

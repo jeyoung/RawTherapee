@@ -1801,7 +1801,7 @@ void EditorPanel::saveProfile ()
     if (Glib::file_test (fname, Glib::FILE_TEST_EXISTS)) {
         ProcParams params;
 
-        if (comparisonActive || liveParamsForSave) {
+        if (processorOnComparisonParams || pendingViewRestore || liveParamsForSave) {
             params = liveParams;
         } else {
             ipc->getParams (&params);
@@ -1843,6 +1843,13 @@ void EditorPanel::procParamsChanged(
     const ParamsEdited* paramsEdited
 )
 {
+
+    // Keep the saved live state in step with every committed edit. The
+    // processor may not have promoted its next parameters yet, so do not
+    // re-read a possibly older committed copy at comparison entry.
+    if (!processorOnComparisonParams) {
+        liveParams = *params;
+    }
 
 //    if (ev!=EvPhotoLoaded)
 //        saveLabel->set_markup (Glib::ustring("<span foreground=\"#AA0000\" weight=\"bold\">") + M("MAIN_BUTTON_SAVE") + "</span>");
@@ -1991,7 +1998,7 @@ void EditorPanel::refreshProcessingState (bool inProcessingP)
         if (ipc && openThm && tpc->getChangedState()) {
             rtengine::procparams::ProcParams pparams;
 
-            if (comparisonActive || pendingViewRestore || liveParamsForSave) {
+            if (processorOnComparisonParams || pendingViewRestore || liveParamsForSave) {
                 pparams = liveParams;
             } else {
                 ipc->getParams (&pparams);
@@ -3138,8 +3145,6 @@ void EditorPanel::saveLiveState()
         return;
     }
 
-    ipc->getParams(&liveParams, false);
-
     if (iareapanel && iareapanel->imageArea->mainCropWindow) {
         iareapanel->imageArea->mainCropWindow->getCropAnchorPosition(liveAnchorX, liveAnchorY);
         liveZoom = iareapanel->imageArea->mainCropWindow->getZoom();
@@ -3608,13 +3613,15 @@ void EditorPanel::enterCompareView()
     saveLiveState();
     comparisonEnterUs = g_get_monotonic_time();
 
-    const bool cacheHit = comparisonCacheEnabled() && comparisonFrameMatches();
+    const bool cacheHit = !processorOnComparisonParams
+        && comparisonCacheEnabled() && comparisonFrameMatches();
 
     if (cacheHit) {
         comparisonActive = true;
         comparisonNoRender = false;
         comparisonRenderPending = false;
         comparisonCapturePending = false;
+        processorOnComparisonParams = false;
         pendingViewRestore = false;
         comparisonRestoreTimeout.disconnect();
 
@@ -3645,6 +3652,7 @@ void EditorPanel::enterCompareView()
     comparisonRenderPending = !noRender;
     comparisonFrameActive = false;
     comparisonCapturePending = !noRender;
+    processorOnComparisonParams = false;
     pendingViewRestore = false;
     comparisonRestoreTimeout.disconnect();
 
@@ -3658,12 +3666,13 @@ void EditorPanel::enterCompareView()
         }
     } else {
         applyParamsToIpc(effective);
+        processorOnComparisonParams = true;
     }
 }
 
 void EditorPanel::leaveCompareView()
 {
-    if (!comparisonActive) {
+    if (!comparisonActive && !processorOnComparisonParams) {
         return;
     }
 
@@ -3676,6 +3685,12 @@ void EditorPanel::leaveCompareView()
         pendingViewRestore = false;
         comparisonRestoreTimeout.disconnect();
         setComparisonOverlayActive(false);
+
+        if (processorOnComparisonParams) {
+            applyParamsToIpc(liveParams);
+            processorOnComparisonParams = false;
+        }
+
         unlockViewport();
         updateComparisonBadge();
         setProgressStr("");
@@ -3691,6 +3706,12 @@ void EditorPanel::leaveCompareView()
         comparisonNoRender = false;
         pendingViewRestore = false;
         comparisonRestoreTimeout.disconnect();
+
+        if (processorOnComparisonParams) {
+            applyParamsToIpc(liveParams);
+            processorOnComparisonParams = false;
+        }
+
         unlockViewport();
         updateComparisonBadge();
         setProgressStr("");
@@ -3708,6 +3729,7 @@ void EditorPanel::leaveCompareView()
     updateComparisonBadge();
     setProgressStr(M("SNAPSHOT_COMPARE_RETURNING"));
     applyParamsToIpc(liveParams);
+    processorOnComparisonParams = false;
 
     comparisonRestoreTimeout.disconnect();
     comparisonRestoreTimeout = Glib::signal_timeout().connect(
@@ -3802,11 +3824,10 @@ void EditorPanel::unlockViewport()
 
 void EditorPanel::finishCompareForEdit()
 {
-    if (!comparisonActive || closingOrSwitching) {
+    if ((!comparisonActive && !processorOnComparisonParams)
+            || closingOrSwitching) {
         return;
     }
-
-    const bool noRender = comparisonNoRender || comparisonFrameActive;
 
     if (comparisonFrameActive) {
         comparisonFrameActive = false;
@@ -3820,10 +3841,11 @@ void EditorPanel::finishCompareForEdit()
     pendingViewRestore = false;
     comparisonRestoreTimeout.disconnect();
 
-    if (!noRender && ipc) {
+    if (processorOnComparisonParams && ipc) {
         // The next parameter write supplies the full live state; avoid a
         // redundant render when the comparison never changed the image.
         applyParamsToIpc(liveParams);
+        processorOnComparisonParams = false;
     }
 
     unlockViewport();
@@ -3861,11 +3883,12 @@ void EditorPanel::cancelCompareForClose()
         setComparisonOverlayActive(false);
     }
 
-    if (comparisonActive && !comparisonNoRender && !frameActive) {
+    if (processorOnComparisonParams) {
         // Do not start a processing pass while the panel is closing. The
         // editor-thumbnail save below reads liveParamsForSave instead of the
         // image processor, which still holds the comparison parameters.
         liveParamsForSave = true;
+        processorOnComparisonParams = false;
     }
 
     comparisonActive = false;
