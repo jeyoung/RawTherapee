@@ -25,10 +25,11 @@ checks, the geometry unit test and the preview base-cache test pass.
 - Tool panels, the toolbar and the history panel stay enabled and visually
   unchanged during comparison. There is no sensitivity change to draw the eye
   away from the image.
-- Any real parameter edit or any non-`\` shortcut ends the comparison and
-  then performs the action. Releasing `\` without an interaction still
-  restores the live view. Auto-repeat of the held `\` cannot re-enter the
-  comparison after an edit ended it.
+- Any real parameter edit, any non-`\` shortcut, or a mouse action such as
+  Save As, Queue or Send to external editor ends the comparison and then
+  performs the action. Releasing `\` without an interaction still restores the
+  live view. Auto-repeat of the held `\` cannot re-enter the comparison after
+  an edit ended it.
 - Closing an editor tab while comparing is safe, including with the tab close
   button, `Ctrl+W`, and releasing `\` after the tab has gone. Teardown never
   starts a processing pass.
@@ -73,7 +74,11 @@ comparison state.
 Removing an editor tab calls `EditorPanel::prepareForRemoval()` before the
 page is detached. It cancels any comparison, disconnects the History
 comparison signal and the restore timeout, and leaves the callbacks inert.
-The destructor repeats the disconnection.
+The destructor also disconnects the restore timeout and keeps the callbacks
+inert. It does not disconnect the History connection again: that connection
+is disconnected while the widget is alive and otherwise dies with the History
+widget, and disconnecting it after GTK has destroyed the widget would raise a
+`g_signal_handler_disconnect` critical.
 
 `cancelCompareForClose()` must not apply parameters during teardown: doing so
 starts a processing pass while the tool panels are being destroyed. If a
