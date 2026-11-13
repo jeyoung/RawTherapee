@@ -18,22 +18,25 @@ The first build downloads the Debian 12 image and installs build dependencies.
 The container is always based on Debian 12 so the package keeps the bookworm
 baseline.
 
-Current verified artefact, built from commit `f2d8519f4`:
+Current verified artefact, built from commit `46de4f3de`:
 
 ```
-build/portable/rawtherapee-5.13-174-gf2d8519f4_5.13+git13195.f2d8519f4-1_amd64.deb
-sha256 9ab30cfbffc5c326e28357382ec1ffb9499492db6c7e9d5086a9e0a869b9d14a
+build/portable/rawtherapee-5.13-184-g46de4f3de_5.13+git13205.46de4f3de-1_amd64.deb
+sha256 6d5cd5c2e88f40febe8f3ca915134b57ff1ea609ba4c37ea5ba902a85e35ca95
 ```
 
-Fresh `debian:12` and `debian:13` containers installed the `.deb`, listed
-formats including JPEG XL, exported the public 10.2 MP PEF as 16-bit TIFF with
-`OMP_NUM_THREADS=1` (AE = 0 against the single-threaded host export), and
-started the GUI under Xvfb at 1920x1200. The GUI checks confirmed the Fast
-preview toggle is visible and checked when Preview Demosaic Method is Fast, and
-that the toggle and separator are hidden when the preference is As in PP3.
-The test containers have no OpenCL ICD, so `--gpu-test` and
-`--gpu-test-monitor` exited 2 and are recorded as not run. No performance is
-claimed for the package test.
+The package was built from a clean clone because a linked worktree exposes a
+`.git` file that points outside the container-mounted source directory, which
+makes the version resolve as `git0.local`.
+
+Fresh `debian:12` and `debian:13` containers installed the `.deb` and listed
+formats including JPEG XL. A single-threaded 16-bit TIFF export with an
+explicit PP3 was identical to the single-threaded host export except for the
+embedded version string and timestamp. The installed package started under
+Xvfb on Debian 12, held and released the snapshot comparison, and quit
+cleanly. The test containers have no OpenCL ICD, so `--gpu-test` and
+`--gpu-test-monitor` are recorded as not run. No performance is claimed for
+the package test.
 
 ## Layout
 

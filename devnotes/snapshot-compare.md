@@ -157,23 +157,28 @@ value is recorded rather than relaxed.
 
 ## Packaging
 
-`tools/build-rt.sh portable` was run from a clean clone of the pushed commit
-`083c4fb54`, so the Git-derived version is available inside the container. The
-package is stored in `build/portable/`:
+`tools/build-rt.sh portable` was run from a clean clone of commit `46de4f3de`,
+so the Git-derived version is available inside the container. A linked
+worktree cannot be used: its `.git` file points outside the mounted source
+directory, so the container cannot read the version. The package is stored in
+the clone under `build/portable/`:
 
 ```text
-rawtherapee-5.13-181-g083c4fb54_5.13+git13202.083c4fb54-1_amd64.deb
-Version 5.13+git13202.083c4fb54-1
-SHA-256 e323093981988237822ffe600c4ee07a724562cebc3b6f08803791741a1ba26e
+rawtherapee-5.13-184-g46de4f3de_5.13+git13205.46de4f3de-1_amd64.deb
+Version 5.13+git13205.46de4f3de-1
+SHA-256 6d5cd5c2e88f40febe8f3ca915134b57ff1ea609ba4c37ea5ba902a85e35ca95
 ```
 
-The package installed and `rawtherapee-cli --list-formats` passed in the
-Debian 12 build container and in a Debian 13 container. The Debian 13 check
-needed `libhwy1` installed explicitly; the package's dependency metadata lists
-it, so a normal `apt` install resolves it.
+The package installed and `rawtherapee-cli --list-formats` passed in a
+`debian:12` and a `debian:13` container. A single-threaded 16-bit TIFF export
+with `devnotes/opencl/pp3/rgbproc-exposure.pp3` was byte-identical to the
+single-threaded host export except for the embedded version string and
+timestamp; the pixel data and file size matched exactly.
 
-The GUI smoke test was run from the CPU build under Xvfb, not from the
-installed package. GPU tests were not run in the containers.
+The GUI smoke test was run from the installed package on Debian 12 under
+Xvfb: the image loaded, hold and release of `\` worked, and the application
+quit cleanly. The multi-tab close/reopen regression was run on the host CPU
+build. GPU tests were not run in the containers.
 
 ## Known limitations
 
