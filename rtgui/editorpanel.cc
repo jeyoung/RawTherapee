@@ -2635,6 +2635,8 @@ void EditorPanel::saveAsPressed ()
         return;
     }
 
+    finishCompareForEdit();
+
     bool fnameOK = false;
     Glib::ustring fnameOut;
 
@@ -2739,6 +2741,8 @@ void EditorPanel::queueImgPressed ()
         return;
     }
 
+    finishCompareForEdit();
+
     saveProfile ();
     parent->addBatchQueueJob (createBatchQueueEntry ());
 }
@@ -2748,6 +2752,8 @@ void EditorPanel::sendToExternal()
     if (!ipc || !openThm) {
         return;
     }
+
+    finishCompareForEdit();
 
     // develop image
     rtengine::procparams::ProcParams pparams;
