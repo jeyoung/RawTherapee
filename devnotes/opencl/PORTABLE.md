@@ -18,28 +18,22 @@ The first build downloads the Debian 12 image and installs build dependencies.
 The container is always based on Debian 12 so the package keeps the bookworm
 baseline.
 
-Current verified artefact, built from commit `71007e266`:
+Current verified artefact, built from commit `f2d8519f4`:
 
 ```
-build/portable/rawtherapee-5.13-199-g71007e266_5.13+git13220.71007e266-1_amd64.deb
-sha256 c857595f8369878067a785c6fa820e9661738ce3b06f8020a4632bd86be69ef2
+build/portable/rawtherapee-5.13-174-gf2d8519f4_5.13+git13195.f2d8519f4-1_amd64.deb
+sha256 9ab30cfbffc5c326e28357382ec1ffb9499492db6c7e9d5086a9e0a869b9d14a
 ```
 
-The package was built from a clean clone because a linked worktree exposes a
-`.git` file that points outside the container-mounted source directory, which
-makes the version resolve as `git0.local`.
-
-Fresh `debian:12` and `debian:13` containers installed the `.deb` and listed
-36 formats including JPEG XL. A single-threaded 16-bit TIFF export with
-`devnotes/opencl/pp3/rgbproc-exposure.pp3` was pixel-identical to the
-single-threaded host export: maximum absolute difference 0 and no differing
-samples. The installed package started under Xvfb on both releases with a
-10.2 MP PEF. The exposure edit then comparison then crop flow kept the
-Exposure and Crop rows; the comparison rendered with `ALLNORAW` and reported
-snapshot/live readiness of 38.0/33.4 ms on Debian 12 and 32.7/31.8 ms on
-Debian 13. The application quit cleanly. The test containers have no OpenCL
-ICD, so `--gpu-test` and `--gpu-test-monitor` are recorded as not run. These
-are functional checks; no general performance claim is made for the package.
+Fresh `debian:12` and `debian:13` containers installed the `.deb`, listed
+formats including JPEG XL, exported the public 10.2 MP PEF as 16-bit TIFF with
+`OMP_NUM_THREADS=1` (AE = 0 against the single-threaded host export), and
+started the GUI under Xvfb at 1920x1200. The GUI checks confirmed the Fast
+preview toggle is visible and checked when Preview Demosaic Method is Fast, and
+that the toggle and separator are hidden when the preference is As in PP3.
+The test containers have no OpenCL ICD, so `--gpu-test` and
+`--gpu-test-monitor` exited 2 and are recorded as not run. No performance is
+claimed for the package test.
 
 ## Layout
 

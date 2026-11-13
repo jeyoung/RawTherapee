@@ -323,7 +323,6 @@ RTWindow::RTWindow ()
     onConfEventConn = signal_configure_event().connect ( sigc::mem_fun (*this, &RTWindow::on_configure_event) );
     signal_key_press_event().connect ( sigc::mem_fun (*this, &RTWindow::keyPressed) );
     signal_key_release_event().connect(sigc::mem_fun(*this, &RTWindow::keyReleased));
-    signal_focus_out_event().connect(sigc::mem_fun(*this, &RTWindow::onFocusOut));
 
     if (App::get().isSimpleEditor()) {
         epanel = Gtk::manage ( new EditorPanel (nullptr) );
@@ -696,7 +695,6 @@ void RTWindow::remEditorPanel (EditorPanel* ep)
         EditWindow * wndEdit = EditWindow::getInstance (this);
         wndEdit->remEditorPanel (ep);
     } else {
-        ep->prepareForRemoval();
         bool queueHadFocus = (mainNB->get_current_page() == mainNB->page_num (*bpanel));
         ep->setExternalEditorChangedSignal(nullptr);
         ep->setActive(false);
@@ -834,47 +832,9 @@ bool RTWindow::keyPressed (GdkEventKey* event)
 
 bool RTWindow::keyReleased(GdkEventKey *event)
 {
-    if (App::get().isSimpleEditor()) {
-        return epanel && epanel->handleShortcutKeyRelease(event);
-    }
-
-    if (!fpanel || !bpanel) {
-        return false;
-    }
-
-    if (mainNB->get_current_page() == mainNB->page_num(*fpanel)) {
+    if (fpanel && mainNB->get_current_page() == mainNB->page_num(*fpanel)) {
         return fpanel->handleShortcutKeyRelease(event);
     }
-
-    if (mainNB->get_current_page() == mainNB->page_num(*bpanel)) {
-        return false;
-    }
-
-    EditorPanel* ep = static_cast<EditorPanel*>(mainNB->get_nth_page(mainNB->get_current_page()));
-    return ep && ep->handleShortcutKeyRelease(event);
-}
-
-bool RTWindow::onFocusOut (GdkEventFocus* event)
-{
-    if (App::get().isSimpleEditor()) {
-        if (epanel) {
-            epanel->leaveCompareView();
-        }
-
-        return false;
-    }
-
-    if (!fpanel || !bpanel || mainNB->get_current_page() == mainNB->page_num(*fpanel)
-            || mainNB->get_current_page() == mainNB->page_num(*bpanel)) {
-        return false;
-    }
-
-    EditorPanel* ep = static_cast<EditorPanel*>(mainNB->get_nth_page(mainNB->get_current_page()));
-
-    if (ep) {
-        ep->leaveCompareView();
-    }
-
     return false;
 }
 
@@ -923,16 +883,6 @@ bool RTWindow::on_delete_event (GdkEventAny* event)
 
     if (isProcessing) {
         return true;
-    }
-
-    // Prepare every editor while its widgets are still alive. GTK destroys the
-    // page children before the editor destructors run on quit.
-    if (epanel) {
-        epanel->prepareForRemoval();
-    }
-
-    for (auto& entry : epanels) {
-        entry.second->prepareForRemoval();
     }
 
     if ( fpanel ) {
@@ -1332,22 +1282,6 @@ int RTWindow::getSessionPreviewRefreshMs() const
 
 void RTWindow::setActiveEditorPanel(EditorPanel* panel)
 {
-    EditorPanel* previous = nullptr;
-
-    if (epanel && epanel->isActive()) {
-        previous = epanel;
-    }
-
-    for (auto& entry : epanels) {
-        if (entry.second->isActive()) {
-            previous = entry.second;
-        }
-    }
-
-    if (previous && previous != panel) {
-        previous->leaveCompareView();
-    }
-
     // The simple editor and the single-tab editor are hosted directly or as
     // the persistent editor page; tabbed editors live in epanels.
     if (epanel) {

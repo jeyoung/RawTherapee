@@ -92,7 +92,6 @@ public:
 
     bool keyPressed (GdkEventKey* event);
     bool keyReleased(GdkEventKey *event);
-    bool onFocusOut (GdkEventFocus* event);
     bool on_configure_event (GdkEventConfigure* event) override;
     bool on_delete_event (GdkEventAny* event) override;
     bool on_window_state_event (GdkEventWindowState* event) override;

@@ -19,13 +19,9 @@
  */
 #include "editorpanel.h"
 
-#include <algorithm>
-#include <cmath>
-#include <cstdio>
 #include <iostream>
 
 #include "rtengine/array2D.h"
-#include "rtengine/compareparams.h"
 #include "rtengine/imagesource.h"
 #include "rtengine/refreshmap.h"
 #include "rtengine/iccstore.h"
@@ -44,7 +40,6 @@
 #include "procparamchangers.h"
 #include "placesbrowser.h"
 #include "pathutils.h"
-#include "rtscalable.h"
 #include "thumbnail.h"
 #include "toolpanelcoord.h"
 #include "widgets/basic/adjuster.h"
@@ -65,51 +60,6 @@ namespace
 {
 
 constexpr int INITIAL_ROUGH_SCALE_MULTIPLIER = 2;
-
-// Safety net for the live-state restore: if the engine never delivers a
-// preview, unlock the editor rather than leaving it stuck in compare mode.
-constexpr int COMPARISON_RESTORE_TIMEOUT_MS = 2000;
-
-// The crop window returns discrete zoom steps. Treat a re-applied step as
-// unchanged rather than forcing a redundant crop update.
-constexpr double COMPARISON_ZOOM_EPSILON = 1e-9;
-
-// One viewport crop, not a second raw source or preview. Above this size the
-// cache is disabled and the normal render path is used.
-constexpr std::size_t COMPARISON_FRAME_MAX_BYTES = 32 * 1024 * 1024;
-
-bool comparisonProfileEnabled()
-{
-    static const bool enabled = []() {
-        const char* value = g_getenv("RT_COMPARE_PROFILE");
-        return value && value[0] != '\0' && g_strcmp0(value, "0") != 0;
-    }();
-    return enabled;
-}
-
-bool comparisonFullEnabled()
-{
-    static const bool enabled = []() {
-        const char* value = g_getenv("RT_COMPARE_FULL");
-        return value && value[0] != '\0' && g_strcmp0(value, "0") != 0;
-    }();
-    return enabled;
-}
-
-bool comparisonCacheEnabled()
-{
-    static const bool enabled = []() {
-        const char* value = g_getenv("RT_COMPARE_CACHE");
-        return value == nullptr || value[0] == '\0'
-            || g_strcmp0(value, "0") != 0;
-    }();
-    return enabled;
-}
-
-double elapsedMs(gint64 startUs)
-{
-    return (g_get_monotonic_time() - startUs) / 1000.0;
-}
 
 // The rough pass has already decoded and preprocessed the raw source, but the
 // final preview scale change reallocates the Lab buffers. Rebuild the
@@ -802,8 +752,7 @@ EditorPanel::EditorPanel (FilePanel* filePanel)
       externalEditorChangedSignal (nullptr),
       previewHandler (nullptr), beforePreviewHandler (nullptr),
       beforeIarea (nullptr), beforeBox (nullptr), afterBox (nullptr), beforeLabel (nullptr), afterLabel (nullptr),
-      beforeHeaderBox (nullptr), afterHeaderBox (nullptr), toolBarPanel (nullptr), iopsPanel (nullptr),
-      comparisonBadge (nullptr), parent (nullptr), parentWindow (nullptr), openThm (nullptr),
+      beforeHeaderBox (nullptr), afterHeaderBox (nullptr), parent (nullptr), parentWindow (nullptr), openThm (nullptr),
       selectedFrame(0), isrc (nullptr), ipc (nullptr), beforeIpc (nullptr), err (0), isProcessing (false),
       histogram_observable(nullptr), histogram_scope_type(ScopeType::NONE)
 {
@@ -820,7 +769,6 @@ EditorPanel::EditorPanel (FilePanel* filePanel)
     // construct toolpanelcoordinator
     tpc = new ToolPanelCoordinator();
     tpc->setProgressListener(this);
-    tpc->beforeParamChange.connect(sigc::mem_fun(*this, &EditorPanel::finishCompareForEdit));
 
     // build GUI
 
@@ -846,8 +794,6 @@ EditorPanel::EditorPanel (FilePanel* filePanel)
     leftsubpaned->pack1(*navigator, false, false);
 
     history = Gtk::manage(new History());
-    comparisonSnapshotConn = history->compareSnapshotChanged.connect(
-        sigc::mem_fun(*this, &EditorPanel::onCompareSnapshotChanged));
     leftsubpaned->pack2(*history, true, false);
 
     leftsubpaned->set_position(0);
@@ -943,12 +889,10 @@ EditorPanel::EditorPanel (FilePanel* filePanel)
     Gtk::Separator* vsep3 = Gtk::manage (new Gtk::Separator(Gtk::ORIENTATION_VERTICAL));
 
     iareapanel = new ImageAreaPanel ();
-    iareapanel->imageArea->cropImageUpdatedSignal.connect(
-        sigc::mem_fun(*this, &EditorPanel::onCropImageUpdated));
     tpc->setEditProvider (iareapanel->imageArea);
     tpc->getToolBar()->setLockablePickerToolListener (iareapanel->imageArea);
 
-    toolBarPanel = Gtk::manage (new Gtk::Box (Gtk::ORIENTATION_HORIZONTAL));
+    Gtk::Box* toolBarPanel = Gtk::manage (new Gtk::Box (Gtk::ORIENTATION_HORIZONTAL));
     toolBarPanel->set_name ("EditorTopPanel");
     toolBarPanel->pack_start (*hidehp, Gtk::PACK_SHRINK, 1);
     toolBarPanel->pack_start (*vseph, Gtk::PACK_SHRINK, 2);
@@ -987,23 +931,11 @@ EditorPanel::EditorPanel (FilePanel* filePanel)
     beforeAfterBox->set_name ("BeforeAfterContainer");
     beforeAfterBox->pack_start (*afterBox);
 
-    Gtk::Overlay* viewerOverlay = Gtk::manage(new Gtk::Overlay());
-    viewerOverlay->add(*beforeAfterBox);
-
-    comparisonBadge = Gtk::manage(new Gtk::Label());
-    comparisonBadge->set_no_show_all(true);
-    comparisonBadge->set_halign(Gtk::ALIGN_CENTER);
-    comparisonBadge->set_valign(Gtk::ALIGN_START);
-    comparisonBadge->set_margin_top(4);
-    comparisonBadge->get_style_context()->add_class("Info");
-    viewerOverlay->add_overlay(*comparisonBadge);
-    viewerOverlay->set_overlay_pass_through(*comparisonBadge, true);
-
     MyScrolledToolbar *stb1 = Gtk::manage(new MyScrolledToolbar());
     stb1->set_name("EditorToolbarTop");
     stb1->add(*toolBarPanel);
     editbox->pack_start (*stb1, Gtk::PACK_SHRINK, 2);
-    editbox->pack_start (*viewerOverlay);
+    editbox->pack_start (*beforeAfterBox);
 
     // build right side panel
     vboxright = new Gtk::Paned (Gtk::ORIENTATION_VERTICAL);
@@ -1021,7 +953,6 @@ EditorPanel::EditorPanel (FilePanel* filePanel)
 
     // Save buttons
     Gtk::Grid *iops = Gtk::manage(new Gtk::Grid());
-    iopsPanel = iops;
     iops->set_name ("IopsPanel");
     iops->set_orientation (Gtk::ORIENTATION_HORIZONTAL);
     iops->set_row_spacing (2);
@@ -1251,14 +1182,6 @@ EditorPanel::~EditorPanel ()
     // the fast-preview button after that point.
     toggleFastPreview = nullptr;
     vsepFastPreview = nullptr;
-    toolBarPanel = nullptr;
-    iopsPanel = nullptr;
-    comparisonBadge = nullptr;
-    beforeAfter = nullptr;
-
-    removalPrepared = true;
-    closingOrSwitching = true;
-    comparisonRestoreTimeout.disconnect();
 
     idle_register.destroy();
 
@@ -1267,7 +1190,6 @@ EditorPanel::~EditorPanel ()
     close ();
 
     history->setHistoryBeforeLineListener (nullptr);
-    history->setProfileChangeListener (nullptr);
     // the order is important!
     iareapanel->setBeforeAfterViews (nullptr, iareapanel);
     delete iareapanel;
@@ -1643,8 +1565,6 @@ void EditorPanel::open (Thumbnail* tmb, rtengine::InitialImage* isrc)
         sigc::mem_fun(*this, &EditorPanel::onPreviewReady));
     previewHandler->signalPreviewReady().connect(
         sigc::mem_fun(*this, &EditorPanel::onSessionPreviewReady));
-    previewHandler->signalPreviewReady().connect(
-        sigc::mem_fun(*this, &EditorPanel::onComparisonPreviewReady));
 
     this->isrc = isrc;
     ipc = rtengine::StagedImageProcessor::create (isrc);
@@ -1739,9 +1659,6 @@ void EditorPanel::open (Thumbnail* tmb, rtengine::InitialImage* isrc)
 
 void EditorPanel::close ()
 {
-    cancelCompareForClose();
-    clearComparisonFrame();
-
     if (toggleFastPreview) {
         toggleFastPreview->set_sensitive(false);
     }
@@ -1787,8 +1704,6 @@ void EditorPanel::close ()
             openThm->decreaseRef ();
         }
     }
-
-    liveParamsForSave = false;
 }
 
 void EditorPanel::saveProfile ()
@@ -1800,12 +1715,7 @@ void EditorPanel::saveProfile ()
     // If the file was deleted, do not generate ghost entries
     if (Glib::file_test (fname, Glib::FILE_TEST_EXISTS)) {
         ProcParams params;
-
-        if (processorOnComparisonParams || pendingViewRestore || liveParamsForSave) {
-            params = liveParams;
-        } else {
-            ipc->getParams (&params);
-        }
+        ipc->getParams (&params);
 
         // Will call updateCache, which will update both the cached and sidecar files if necessary
         openThm->setProcParams (params, nullptr, EDITOR);
@@ -1843,13 +1753,6 @@ void EditorPanel::procParamsChanged(
     const ParamsEdited* paramsEdited
 )
 {
-
-    // Keep the saved live state in step with every committed edit. The
-    // processor may not have promoted its next parameters yet, so do not
-    // re-read a possibly older committed copy at comparison entry.
-    if (!processorOnComparisonParams) {
-        liveParams = *params;
-    }
 
 //    if (ev!=EvPhotoLoaded)
 //        saveLabel->set_markup (Glib::ustring("<span foreground=\"#AA0000\" weight=\"bold\">") + M("MAIN_BUTTON_SAVE") + "</span>");
@@ -1997,13 +1900,7 @@ void EditorPanel::refreshProcessingState (bool inProcessingP)
         // Set proc params of thumbnail. It saves it into the cache and updates the file browser.
         if (ipc && openThm && tpc->getChangedState()) {
             rtengine::procparams::ProcParams pparams;
-
-            if (processorOnComparisonParams || pendingViewRestore || liveParamsForSave) {
-                pparams = liveParams;
-            } else {
-                ipc->getParams (&pparams);
-            }
-
+            ipc->getParams (&pparams);
             openThm->setProcParams (pparams, nullptr, EDITOR, false);
         }
 
@@ -2256,33 +2153,6 @@ bool EditorPanel::handleShortcutKey (GdkEventKey* event)
             default:
                 return true;
         }
-    }
-
-    // Snapshot comparison: hold \ to show the comparison snapshot.
-    // Do not test altgr here: on Windows GDK_MOD2_MASK is also NumLock, which
-    // would make the shortcut unreachable.
-    if (!ctrl && !alt && event->keyval == GDK_KEY_backslash) {
-        // Auto-repeat must not re-enter the comparison after an edit ended
-        // it while the key is still held. Only a fresh press may enter.
-        if (comparisonKeyDown) {
-            return true;
-        }
-
-        comparisonKeyDown = true;
-
-        if (!ipc || !comparisonValid) {
-            setProgressStr(M("SNAPSHOT_COMPARE_NO_IMAGE"));
-            return true;
-        }
-
-        enterCompareView();
-        return true;
-    }
-
-    // Any other key is an interaction: end the comparison and let the normal
-    // shortcut handling act. The viewport was frozen only while comparing.
-    if (comparisonActive) {
-        finishCompareForEdit();
     }
 
     // Editor Layout
@@ -2554,20 +2424,6 @@ bool EditorPanel::handleShortcutKey (GdkEventKey* event)
     return false;
 }
 
-bool EditorPanel::handleShortcutKeyRelease(GdkEventKey* event)
-{
-    if (event->keyval == GDK_KEY_backslash) {
-        comparisonKeyDown = false;
-
-        if (comparisonActive) {
-            leaveCompareView();
-            return true;
-        }
-    }
-
-    return false;
-}
-
 void EditorPanel::procParamsChanged (Thumbnail* thm, int whoChangedIt, bool upgradeHint)
 {
 
@@ -2674,8 +2530,6 @@ void EditorPanel::saveAsPressed ()
         return;
     }
 
-    finishCompareForEdit();
-
     bool fnameOK = false;
     Glib::ustring fnameOut;
 
@@ -2780,8 +2634,6 @@ void EditorPanel::queueImgPressed ()
         return;
     }
 
-    finishCompareForEdit();
-
     saveProfile ();
     parent->addBatchQueueJob (createBatchQueueEntry ());
 }
@@ -2791,8 +2643,6 @@ void EditorPanel::sendToExternal()
     if (!ipc || !openThm) {
         return;
     }
-
-    finishCompareForEdit();
 
     // develop image
     rtengine::procparams::ProcParams pparams;
@@ -3116,803 +2966,11 @@ void EditorPanel::historyBeforeLineChanged (const rtengine::procparams::ProcPara
     }
 }
 
-void EditorPanel::applyParamsToIpc(const ProcParams& params)
-{
-    if (!ipc) {
-        return;
-    }
-
-    ProcParams current;
-    ipc->getParams(&current, false);
-
-    const bool rawStage = comparisonRequiresRawStage(current, params);
-    const bool full = comparisonFullEnabled() || rawStage;
-    const int changeFlags = full ? ALL : ALLNORAW;
-
-    if (comparisonProfileEnabled()) {
-        std::fprintf(stderr, "compare: apply %s rawStage=%d\n",
-                     full ? "ALL" : "ALLNORAW", rawStage);
-    }
-
-    ProcParams* p = ipc->beginUpdateParams();
-    *p = params;
-    ipc->endUpdateParams(changeFlags);
-}
-
-void EditorPanel::saveLiveState()
-{
-    if (!ipc) {
-        return;
-    }
-
-    if (iareapanel && iareapanel->imageArea->mainCropWindow) {
-        iareapanel->imageArea->mainCropWindow->getCropAnchorPosition(liveAnchorX, liveAnchorY);
-        liveZoom = iareapanel->imageArea->mainCropWindow->getZoom();
-
-        if (comparisonProfileEnabled()) {
-            std::fprintf(stderr, "compare: save view zoom=%g anchor=%d,%d\n",
-                         liveZoom, liveAnchorX, liveAnchorY);
-        }
-    }
-}
-
-void EditorPanel::restoreLiveView()
-{
-    if (!iareapanel || !iareapanel->imageArea->mainCropWindow) {
-        return;
-    }
-
-    int x = liveAnchorX;
-    int y = liveAnchorY;
-
-    if (ipc) {
-        const int fullW = ipc->getFullWidth();
-        const int fullH = ipc->getFullHeight();
-
-        if (fullW > 0) {
-            x = std::clamp(x, 0, fullW - 1);
-        }
-
-        if (fullH > 0) {
-            y = std::clamp(y, 0, fullH - 1);
-        }
-    }
-
-    auto* const cropWindow = iareapanel->imageArea->mainCropWindow;
-    const double currentZoom = cropWindow->getZoom();
-    const bool zoomChanged =
-        std::abs(currentZoom - liveZoom) > COMPARISON_ZOOM_EPSILON;
-
-    int currentX = 0;
-    int currentY = 0;
-    cropWindow->getCropAnchorPosition(currentX, currentY);
-    const bool anchorChanged = currentX != x || currentY != y;
-
-    if (!zoomChanged && !anchorChanged) {
-        if (comparisonProfileEnabled()) {
-            std::fprintf(stderr, "compare: view unchanged zoom=%g anchor=%d,%d\n",
-                         currentZoom, currentX, currentY);
-        }
-
-        return;
-    }
-
-    if (zoomChanged) {
-        // Apply the zoom first: setZoom centres the anchor internally. The
-        // anchor is restored immediately afterwards in the same update.
-        iareapanel->imageArea->setZoom(liveZoom, true);
-    }
-
-    iareapanel->imageArea->setScrollPosition(x, y, true);
-    iareapanel->imageArea->queue_draw();
-
-    if (comparisonProfileEnabled()) {
-        std::fprintf(stderr,
-                     "compare: restore view zoom %g->%g anchor %d,%d->%d,%d\n",
-                     currentZoom, liveZoom, currentX, currentY, x, y);
-    }
-}
-
-void EditorPanel::onCropImageUpdated()
-{
-    if (!comparisonCacheEnabled()) {
-        return;
-    }
-
-    if (!iareapanel || !iareapanel->imageArea
-            || !iareapanel->imageArea->mainCropWindow) {
-        return;
-    }
-
-    const auto pixbuf =
-        iareapanel->imageArea->mainCropWindow->cropHandler.cropPixbuf;
-
-    if (!pixbuf) {
-        return;
-    }
-
-    if (comparisonActive && comparisonCapturePending) {
-        captureComparisonFrame(pixbuf);
-    }
-}
-
-bool EditorPanel::comparisonPreviewOverlayActive() const
-{
-    if (!iareapanel || !iareapanel->imageArea) {
-        return false;
-    }
-
-    const ImageArea* const imageArea = iareapanel->imageArea;
-
-    if (!imageArea->previewModePanel || !imageArea->indClippedPanel) {
-        return false;
-    }
-
-    return imageArea->previewModePanel->showR()
-        || imageArea->previewModePanel->showG()
-        || imageArea->previewModePanel->showB()
-        || imageArea->previewModePanel->showL()
-        || imageArea->indClippedPanel->showClippedShadows()
-        || imageArea->indClippedPanel->showClippedHighlights()
-        || imageArea->indClippedPanel->showFocusMask()
-        || imageArea->indClippedPanel->showSharpMask();
-}
-
-void EditorPanel::captureComparisonFrame(
-    const Glib::RefPtr<Gdk::Pixbuf>& pixbuf)
-{
-    if (!comparisonCacheEnabled() || comparisonPreviewOverlayActive()) {
-        return;
-    }
-
-    if (!pixbuf || !ipc || !previewHandler || !iareapanel
-            || !iareapanel->imageArea->mainCropWindow) {
-        return;
-    }
-
-    const std::size_t bytes =
-        static_cast<std::size_t>(pixbuf->get_rowstride())
-        * static_cast<std::size_t>(pixbuf->get_height());
-
-    if (bytes == 0 || bytes > COMPARISON_FRAME_MAX_BYTES) {
-        clearComparisonFrame();
-
-        if (comparisonProfileEnabled()) {
-            std::fprintf(stderr, "compare: cache skip %zu bytes\n", bytes);
-        }
-
-        return;
-    }
-
-    ProcParams current;
-    ipc->getParams(&current, false);
-
-    int anchorX = 0;
-    int anchorY = 0;
-    iareapanel->imageArea->mainCropWindow->getCropAnchorPosition(
-        anchorX, anchorY);
-
-    ComparisonFrameKey key;
-    key.revision = comparisonRevision;
-    key.fullWidth = ipc->getFullWidth();
-    key.fullHeight = ipc->getFullHeight();
-    key.anchorX = anchorX;
-    key.anchorY = anchorY;
-    key.zoom = iareapanel->imageArea->mainCropWindow->getZoom();
-    key.previewScale = previewHandler->getPreviewScale();
-    key.pixbufWidth = pixbuf->get_width();
-    key.pixbufHeight = pixbuf->get_height();
-    key.deviceScale = RTScalable::getScaleForWidget(iareapanel->imageArea);
-
-    // Keep only the geometry fields; do not copy locallab/spot vectors into
-    // the cache key.
-    key.geometry.crop = current.crop;
-    key.geometry.cropGuide = current.cropGuide;
-    key.geometry.coarse = current.coarse;
-    key.geometry.commonTrans = current.commonTrans;
-    key.geometry.rotate = current.rotate;
-    key.geometry.distortion = current.distortion;
-    key.geometry.perspective = current.perspective;
-    key.geometry.lensProf = current.lensProf;
-    key.prevdemo = App::get().options().prevdemo;
-    key.fastPreview = fastPreviewEnabled;
-
-    ipc->getMonitorProfile(key.monitorProfile, key.monitorIntent);
-    ipc->getSoftProofing(key.softProof, key.gamutCheck);
-
-    comparisonFrame = pixbuf;
-    comparisonFrameKey = std::move(key);
-    comparisonFrameValid = true;
-
-    if (comparisonProfileEnabled()) {
-        std::fprintf(stderr,
-                     "compare: cache %dx%d bytes=%zu scale=%g zoom=%g"
-                     " anchor=%d,%d rev=%d\n",
-                     pixbuf->get_width(), pixbuf->get_height(), bytes,
-                     previewHandler->getPreviewScale(),
-                     comparisonFrameKey.zoom, anchorX, anchorY,
-                     comparisonRevision);
-    }
-}
-
-bool EditorPanel::comparisonFrameMatches()
-{
-    if (!comparisonFrameValid || !comparisonFrame || !ipc
-            || !previewHandler || !iareapanel
-            || !iareapanel->imageArea->mainCropWindow) {
-        return false;
-    }
-
-    // The cached frame is the plain monitor image. Use the render path while
-    // any preview-mode overlay is enabled; those frames are not cached.
-    if (comparisonPreviewOverlayActive()) {
-        return false;
-    }
-
-    if (comparisonRevision != comparisonFrameKey.revision) {
-        if (comparisonProfileEnabled()) {
-            std::fprintf(stderr, "compare: cache miss revision %d/%d\n",
-                         comparisonFrameKey.revision, comparisonRevision);
-        }
-
-        return false;
-    }
-
-    if (ipc->getFullWidth() != comparisonFrameKey.fullWidth
-            || ipc->getFullHeight() != comparisonFrameKey.fullHeight) {
-        if (comparisonProfileEnabled()) {
-            std::fprintf(stderr, "compare: cache miss dimensions\n");
-        }
-
-        return false;
-    }
-
-    ProcParams current;
-    ipc->getParams(&current, false);
-
-    // Crop and perspective defaults are normalised by the engine. When they
-    // are inactive, their inactive fields do not affect the rendered image.
-    const bool sameCrop =
-        current.crop.enabled == comparisonFrameKey.geometry.crop.enabled
-        && (!current.crop.enabled
-            || current.crop == comparisonFrameKey.geometry.crop);
-
-    const auto perspectiveActive = [](const PerspectiveParams& p) {
-        return p.horizontal != 0.0 || p.vertical != 0.0
-            || p.camera_pitch != 0.0 || p.camera_roll != 0.0
-            || p.camera_shift_horiz != 0.0 || p.camera_shift_vert != 0.0
-            || p.camera_yaw != 0.0 || p.projection_pitch != 0.0
-            || p.projection_rotate != 0.0
-            || p.projection_shift_horiz != 0.0
-            || p.projection_shift_vert != 0.0 || p.projection_yaw != 0.0
-            || !p.control_line_values.empty();
-    };
-
-    const bool samePerspective =
-        !perspectiveActive(current.perspective)
-            && !perspectiveActive(comparisonFrameKey.geometry.perspective)
-        ? true
-        : current.perspective == comparisonFrameKey.geometry.perspective;
-
-    const bool sameGeometry =
-        sameCrop
-        && samePerspective
-        && current.coarse == comparisonFrameKey.geometry.coarse
-        && current.commonTrans == comparisonFrameKey.geometry.commonTrans
-        && current.rotate == comparisonFrameKey.geometry.rotate
-        && current.distortion == comparisonFrameKey.geometry.distortion
-        && current.lensProf == comparisonFrameKey.geometry.lensProf;
-
-    if (!sameGeometry) {
-        if (comparisonProfileEnabled()) {
-            std::fprintf(stderr,
-                         "compare: cache miss geometry crop=%d coarse=%d"
-                         " trans=%d rotate=%d distortion=%d perspective=%d"
-                         " lens=%d\n",
-                         !sameCrop,
-                         current.coarse != comparisonFrameKey.geometry.coarse,
-                         current.commonTrans
-                             != comparisonFrameKey.geometry.commonTrans,
-                         current.rotate != comparisonFrameKey.geometry.rotate,
-                         current.distortion
-                             != comparisonFrameKey.geometry.distortion,
-                         !samePerspective,
-                         current.lensProf
-                             != comparisonFrameKey.geometry.lensProf);
-        }
-
-        return false;
-    }
-
-    auto* const cropWindow = iareapanel->imageArea->mainCropWindow;
-
-    if (!cropWindow->cropHandler.cropPixbuf) {
-        return false;
-    }
-
-    int anchorX = 0;
-    int anchorY = 0;
-    cropWindow->getCropAnchorPosition(anchorX, anchorY);
-
-    if (anchorX != comparisonFrameKey.anchorX
-            || anchorY != comparisonFrameKey.anchorY
-            || std::abs(cropWindow->getZoom() - comparisonFrameKey.zoom)
-                > COMPARISON_ZOOM_EPSILON
-            || std::abs(previewHandler->getPreviewScale()
-                - comparisonFrameKey.previewScale)
-                > COMPARISON_ZOOM_EPSILON
-            || cropWindow->cropHandler.cropPixbuf->get_width()
-                != comparisonFrameKey.pixbufWidth
-            || cropWindow->cropHandler.cropPixbuf->get_height()
-                != comparisonFrameKey.pixbufHeight
-            || RTScalable::getScaleForWidget(iareapanel->imageArea)
-                != comparisonFrameKey.deviceScale) {
-        if (comparisonProfileEnabled()) {
-            std::fprintf(stderr,
-                         "compare: cache miss view zoom=%g/%g anchor=%d,%d/%d,%d"
-                         " scale=%g/%g pixbuf=%d,%d/%d,%d deviceScale=%d/%d\n",
-                         cropWindow->getZoom(), comparisonFrameKey.zoom,
-                         anchorX, anchorY, comparisonFrameKey.anchorX,
-                         comparisonFrameKey.anchorY,
-                         previewHandler->getPreviewScale(),
-                         comparisonFrameKey.previewScale,
-                         cropWindow->cropHandler.cropPixbuf->get_width(),
-                         cropWindow->cropHandler.cropPixbuf->get_height(),
-                         comparisonFrameKey.pixbufWidth,
-                         comparisonFrameKey.pixbufHeight,
-                         RTScalable::getScaleForWidget(iareapanel->imageArea),
-                         comparisonFrameKey.deviceScale);
-        }
-
-        return false;
-    }
-
-    Glib::ustring monitorProfile;
-    rtengine::RenderingIntent monitorIntent;
-    ipc->getMonitorProfile(monitorProfile, monitorIntent);
-
-    bool softProof = false;
-    bool gamutCheck = false;
-    ipc->getSoftProofing(softProof, gamutCheck);
-
-    const bool sameColor = monitorProfile == comparisonFrameKey.monitorProfile
-        && monitorIntent == comparisonFrameKey.monitorIntent
-        && softProof == comparisonFrameKey.softProof
-        && gamutCheck == comparisonFrameKey.gamutCheck;
-    const bool samePreview = App::get().options().prevdemo
-            == comparisonFrameKey.prevdemo
-        && fastPreviewEnabled == comparisonFrameKey.fastPreview;
-
-    if (!sameColor || !samePreview) {
-        if (comparisonProfileEnabled()) {
-            std::fprintf(stderr,
-                         "compare: cache miss colour=%d preview=%d\n",
-                         sameColor, samePreview);
-        }
-
-        return false;
-    }
-
-    return true;
-}
-
-void EditorPanel::setComparisonOverlayActive(bool active)
-{
-    if (!iareapanel || !iareapanel->imageArea
-            || !iareapanel->imageArea->mainCropWindow) {
-        return;
-    }
-
-    if (active && comparisonFrame) {
-        iareapanel->imageArea->mainCropWindow->setComparisonOverlay(
-            comparisonFrame);
-        comparisonFrameActive = true;
-    } else {
-        iareapanel->imageArea->mainCropWindow->clearComparisonOverlay();
-        comparisonFrameActive = false;
-    }
-}
-
-void EditorPanel::clearComparisonFrame()
-{
-    if (iareapanel && iareapanel->imageArea
-            && iareapanel->imageArea->mainCropWindow) {
-        iareapanel->imageArea->mainCropWindow->clearComparisonOverlay();
-    }
-
-    comparisonFrame.reset();
-    comparisonFrameValid = false;
-    comparisonFrameActive = false;
-    comparisonCapturePending = false;
-}
-
-void EditorPanel::updateComparisonBadge()
-{
-    if (!comparisonBadge) {
-        return;
-    }
-
-    if (comparisonActive) {
-        comparisonBadge->set_text(Glib::ustring::compose(
-            M("SNAPSHOT_COMPARE_BADGE"), comparisonName));
-        comparisonBadge->show();
-    } else if (pendingViewRestore) {
-        comparisonBadge->set_text(M("SNAPSHOT_COMPARE_RETURNING"));
-        comparisonBadge->show();
-    } else {
-        comparisonBadge->hide();
-    }
-}
-
-void EditorPanel::onCompareSnapshotChanged()
-{
-    if (closingOrSwitching || !history) {
-        return;
-    }
-
-    ++comparisonRevision;
-
-    if (comparisonActive) {
-        leaveCompareView();
-    }
-
-    clearComparisonFrame();
-
-    ProcParams params;
-    Glib::ustring name;
-
-    if (!history->getCompareSnapshotParams(params, name)) {
-        comparisonValid = false;
-        comparisonParams = ProcParams();
-        comparisonName.clear();
-
-        if (comparisonActive && !closingOrSwitching) {
-            leaveCompareView();
-        }
-
-        updateComparisonBadge();
-        return;
-    }
-
-    comparisonValid = true;
-    comparisonParams = params;
-    comparisonName = name;
-
-    if (comparisonActive) {
-        leaveCompareView();
-    }
-
-    updateComparisonBadge();
-}
-
-void EditorPanel::enterCompareView()
-{
-    if (closingOrSwitching) {
-        return;
-    }
-
-    if (!ipc || !comparisonValid) {
-        setProgressStr(M("SNAPSHOT_COMPARE_NO_IMAGE"));
-        return;
-    }
-
-    if (ipc->hasTweakOperator()) {
-        setProgressStr(M("SNAPSHOT_COMPARE_TWEAK_ACTIVE"));
-        return;
-    }
-
-    if (comparisonActive) {
-        return;
-    }
-
-    if (beforeAfter && beforeAfter->get_active()) {
-        beforeAfter->set_active(false);
-    }
-
-    const gint64 entryStartUs = g_get_monotonic_time();
-    saveLiveState();
-    comparisonEnterUs = g_get_monotonic_time();
-
-    const bool cacheHit = !processorOnComparisonParams
-        && comparisonCacheEnabled() && comparisonFrameMatches();
-
-    if (cacheHit) {
-        comparisonActive = true;
-        comparisonNoRender = false;
-        comparisonRenderPending = false;
-        comparisonCapturePending = false;
-        processorOnComparisonParams = false;
-        pendingViewRestore = false;
-        comparisonRestoreTimeout.disconnect();
-
-        lockViewport();
-        setComparisonOverlayActive(true);
-        updateComparisonBadge();
-        setProgressStr("");
-
-        if (comparisonProfileEnabled()) {
-            std::fprintf(stderr, "compare: cache hit %.3f ms\n",
-                         elapsedMs(entryStartUs));
-        }
-
-        return;
-    }
-
-    // Base with no live edits renders exactly the same image. Do not start a
-    // processor pass or touch the view; only the badge changes. Capture the
-    // current crop so later post-base edits can use the cache.
-    const bool noRender = history
-        && history->compareSnapshotIsBase()
-        && history->isAtLoadState();
-    const ProcParams effective =
-        noRender ? ProcParams() : makeComparisonParams(liveParams, comparisonParams);
-
-    comparisonActive = true;
-    comparisonNoRender = noRender;
-    comparisonRenderPending = !noRender;
-    comparisonFrameActive = false;
-    comparisonCapturePending = !noRender;
-    processorOnComparisonParams = false;
-    pendingViewRestore = false;
-    comparisonRestoreTimeout.disconnect();
-
-    lockViewport();
-    updateComparisonBadge();
-    setProgressStr(noRender ? "" : M("SNAPSHOT_COMPARE_RENDERING"));
-
-    if (noRender) {
-        if (comparisonProfileEnabled()) {
-            std::fprintf(stderr, "compare: no render for unchanged Base\n");
-        }
-    } else {
-        applyParamsToIpc(effective);
-        processorOnComparisonParams = true;
-    }
-}
-
-void EditorPanel::leaveCompareView()
-{
-    if (!comparisonActive && !processorOnComparisonParams) {
-        return;
-    }
-
-    comparisonActive = false;
-    comparisonRenderPending = false;
-
-    if (comparisonFrameActive) {
-        comparisonFrameActive = false;
-        comparisonCapturePending = false;
-        pendingViewRestore = false;
-        comparisonRestoreTimeout.disconnect();
-        setComparisonOverlayActive(false);
-
-        if (processorOnComparisonParams) {
-            applyParamsToIpc(liveParams);
-            processorOnComparisonParams = false;
-        }
-
-        unlockViewport();
-        updateComparisonBadge();
-        setProgressStr("");
-
-        if (comparisonProfileEnabled()) {
-            std::fprintf(stderr, "compare: cache release\n");
-        }
-
-        return;
-    }
-
-    if (comparisonNoRender) {
-        comparisonNoRender = false;
-        pendingViewRestore = false;
-        comparisonRestoreTimeout.disconnect();
-
-        if (processorOnComparisonParams) {
-            applyParamsToIpc(liveParams);
-            processorOnComparisonParams = false;
-        }
-
-        unlockViewport();
-        updateComparisonBadge();
-        setProgressStr("");
-
-        if (comparisonProfileEnabled()) {
-            std::fprintf(stderr, "compare: no render release\n");
-        }
-
-        return;
-    }
-
-    pendingViewRestore = true;
-    comparisonLeaveUs = g_get_monotonic_time();
-
-    updateComparisonBadge();
-    setProgressStr(M("SNAPSHOT_COMPARE_RETURNING"));
-    applyParamsToIpc(liveParams);
-    processorOnComparisonParams = false;
-
-    comparisonRestoreTimeout.disconnect();
-    comparisonRestoreTimeout = Glib::signal_timeout().connect(
-        sigc::mem_fun(*this, &EditorPanel::onComparisonRestoreTimeout),
-        COMPARISON_RESTORE_TIMEOUT_MS);
-}
-
-void EditorPanel::onComparisonPreviewReady()
-{
-    if (closingOrSwitching) {
-        return;
-    }
-
-    if (comparisonActive && comparisonRenderPending) {
-        comparisonRenderPending = false;
-        restoreLiveView();
-        updateComparisonBadge();
-        setProgressStr("");
-
-        if (comparisonProfileEnabled()) {
-            std::fprintf(stderr, "compare: snapshot ready %.1f ms\n",
-                         elapsedMs(comparisonEnterUs));
-        }
-
-        return;
-    }
-
-    if (!comparisonActive && pendingViewRestore) {
-        pendingViewRestore = false;
-        comparisonRestoreTimeout.disconnect();
-        restoreLiveView();
-        unlockViewport();
-        updateComparisonBadge();
-        setProgressStr("");
-
-        if (comparisonProfileEnabled()) {
-            std::fprintf(stderr, "compare: live ready %.1f ms\n",
-                         elapsedMs(comparisonLeaveUs));
-        }
-    }
-}
-
-bool EditorPanel::onComparisonRestoreTimeout()
-{
-    if (closingOrSwitching || comparisonActive || !pendingViewRestore) {
-        return false;
-    }
-
-    pendingViewRestore = false;
-    restoreLiveView();
-    unlockViewport();
-    updateComparisonBadge();
-    setProgressStr("");
-    return false;
-}
-
-void EditorPanel::lockViewport()
-{
-    if (viewportLocked) {
-        return;
-    }
-
-    viewportLocked = true;
-
-    if (iareapanel) {
-        iareapanel->imageArea->setInteractionsEnabled(false);
-
-        if (iareapanel->imageArea->mainCropWindow) {
-            iareapanel->imageArea->mainCropWindow->setShowCropGuides(false);
-            iareapanel->imageArea->queue_draw();
-        }
-    }
-}
-
-void EditorPanel::unlockViewport()
-{
-    if (!viewportLocked) {
-        return;
-    }
-
-    viewportLocked = false;
-
-    if (iareapanel) {
-        iareapanel->imageArea->setInteractionsEnabled(true);
-
-        if (iareapanel->imageArea->mainCropWindow) {
-            iareapanel->imageArea->mainCropWindow->setShowCropGuides(true);
-            iareapanel->imageArea->queue_draw();
-        }
-    }
-}
-
-void EditorPanel::finishCompareForEdit()
-{
-    if ((!comparisonActive && !processorOnComparisonParams)
-            || closingOrSwitching) {
-        return;
-    }
-
-    if (comparisonFrameActive) {
-        comparisonFrameActive = false;
-        setComparisonOverlayActive(false);
-    }
-
-    comparisonActive = false;
-    comparisonNoRender = false;
-    comparisonRenderPending = false;
-    comparisonCapturePending = false;
-    pendingViewRestore = false;
-    comparisonRestoreTimeout.disconnect();
-
-    if (processorOnComparisonParams && ipc) {
-        // The next parameter write supplies the full live state; avoid a
-        // redundant render when the comparison never changed the image.
-        applyParamsToIpc(liveParams);
-        processorOnComparisonParams = false;
-    }
-
-    unlockViewport();
-    updateComparisonBadge();
-    setProgressStr("");
-}
-
-void EditorPanel::prepareForRemoval()
-{
-    cancelCompareForClose();
-    clearComparisonFrame();
-
-    comparisonRestoreTimeout.disconnect();
-    comparisonSnapshotConn.disconnect();
-
-    if (history) {
-        history->setProfileChangeListener(nullptr);
-    }
-
-    // Keep callbacks inert until the panel is destroyed.
-    removalPrepared = true;
-    closingOrSwitching = true;
-}
-
-void EditorPanel::cancelCompareForClose()
-{
-    closingOrSwitching = true;
-    comparisonKeyDown = false;
-    comparisonRestoreTimeout.disconnect();
-
-    const bool frameActive = comparisonFrameActive;
-
-    if (frameActive) {
-        comparisonFrameActive = false;
-        setComparisonOverlayActive(false);
-    }
-
-    if (processorOnComparisonParams) {
-        // Do not start a processing pass while the panel is closing. The
-        // editor-thumbnail save below reads liveParamsForSave instead of the
-        // image processor, which still holds the comparison parameters.
-        liveParamsForSave = true;
-        processorOnComparisonParams = false;
-    }
-
-    comparisonActive = false;
-    comparisonNoRender = false;
-    comparisonRenderPending = false;
-    comparisonCapturePending = false;
-    pendingViewRestore = false;
-    comparisonValid = false;
-    comparisonName.clear();
-
-    unlockViewport();
-    updateComparisonBadge();
-    closingOrSwitching = removalPrepared;
-}
-
 void EditorPanel::beforeAfterToggled ()
 {
 
     if (!ipc) {
         return;
-    }
-
-    if (comparisonActive) {
-        leaveCompareView();
     }
 
     removeIfThere (beforeAfterBox,  beforeBox, false);

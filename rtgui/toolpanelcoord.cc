@@ -1127,7 +1127,6 @@ void ToolPanelCoordinator::refreshPreview (const rtengine::ProcEvent& event)
         return;
     }
 
-    beforeParamChange.emit();
     ProcParams* params = ipc->beginUpdateParams ();
     for (auto toolPanel : toolPanels) {
         toolPanel->write (params);
@@ -1142,7 +1141,6 @@ void ToolPanelCoordinator::panelChanged(const rtengine::ProcEvent& event, const 
         return;
     }
 
-    beforeParamChange.emit();
     int changeFlags = rtengine::RefreshMapper::getInstance()->getAction(event);
 
     ProcParams* params = ipc->beginUpdateParams();
@@ -1266,7 +1264,6 @@ void ToolPanelCoordinator::profileChange(
         return;
     }
 
-    beforeParamChange.emit();
     ProcParams *params = ipc->beginUpdateParams();
     ProcParams *mergedParams = new ProcParams();
 
@@ -1615,8 +1612,6 @@ void ToolPanelCoordinator::autoCropRequested()
         return;
     }
 
-    beforeParamChange.emit();
-
     int x1, y1, x2, y2, w, h;
     ipc->getAutoCrop(crop->getRatio(), x1, y1, w, h);
     x2 = x1 + w - 1;
@@ -1746,7 +1741,6 @@ void ToolPanelCoordinator::cropSelectRequested()
         return;
     }
 
-    beforeParamChange.emit();
     toolBar->setTool(TMCropSelect);
 }
 
@@ -1944,9 +1938,6 @@ void ToolPanelCoordinator::toolSelected(ToolMode tool)
 
     switch (tool) {
         case TMCropSelect: {
-            // Crop entry is an interaction: finish a snapshot comparison
-            // before the tool can modify the processor parameters.
-            beforeParamChange.emit();
             toolBar->blockEditDeactivation(false); // To allow deactivating Locallab when switching to another tool using toolbar
             crop->setExpanded(true);
             toolPanelNotebook->set_current_page(toolPanelNotebook->page_num(checkFavorite(crop) ? *favoritePanelSW : *transformPanelSW));

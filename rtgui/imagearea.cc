@@ -114,8 +114,6 @@ void ImageArea::on_resized (Gtk::Allocation& req)
     if (ipc && get_width() > 1) { // sometimes on_resize is called in some init state, causing wrong sizes
         if (!mainCropWindow) {
             mainCropWindow = new CropWindow (this, false, false);
-            mainCropWindow->cropImageUpdatedSignal.connect(
-                [this]() { cropImageUpdatedSignal.emit(); });
             mainCropWindow->setDecorated (false);
             mainCropWindow->setFitZoomEnabled (true);
             mainCropWindow->addCropWindowListener (this);
@@ -501,7 +499,7 @@ bool ImageArea::on_draw(const ::Cairo::RefPtr< Cairo::Context> &cr)
 bool ImageArea::on_motion_notify_event (GdkEventMotion* event)
 {
 
-    if (loadingPlaceholder || !interactionsEnabled) {
+    if (loadingPlaceholder) {
         return true;
     }
 
@@ -533,7 +531,7 @@ bool ImageArea::on_motion_notify_event (GdkEventMotion* event)
 bool ImageArea::on_button_press_event (GdkEventButton* event)
 {
 
-    if (loadingPlaceholder || !interactionsEnabled) {
+    if (loadingPlaceholder) {
         return true;
     }
 
@@ -553,7 +551,7 @@ bool ImageArea::on_button_press_event (GdkEventButton* event)
 bool ImageArea::on_scroll_event (GdkEventScroll* event)
 {
 
-    if (loadingPlaceholder || !interactionsEnabled) {
+    if (loadingPlaceholder) {
         return true;
     }
 
@@ -571,7 +569,7 @@ bool ImageArea::on_scroll_event (GdkEventScroll* event)
 bool ImageArea::on_button_release_event (GdkEventButton* event)
 {
 
-    if (loadingPlaceholder || !interactionsEnabled) {
+    if (loadingPlaceholder) {
         return true;
     }
 
@@ -890,12 +888,8 @@ void ImageArea::getScrollPosition (int& x, int& y)
     }
 }
 
-void ImageArea::setScrollPosition (int x, int y, bool force)
+void ImageArea::setScrollPosition (int x, int y)
 {
-
-    if (!interactionsEnabled && !force) {
-        return;
-    }
 
     if (mainCropWindow) {
         mainCropWindow->delCropWindowListener (this);
@@ -937,12 +931,8 @@ double ImageArea::getZoom ()
 }
 
 // Called by imageAreaPanel before/after views
-void ImageArea::setZoom (double zoom, bool force)
+void ImageArea::setZoom (double zoom)
 {
-
-    if (!interactionsEnabled && !force) {
-        return;
-    }
 
     if (mainCropWindow) {
         mainCropWindow->setZoom (zoom);

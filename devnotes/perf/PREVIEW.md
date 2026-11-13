@@ -86,43 +86,6 @@ fallback; the served hit cost 37-40 ms at fit and 57-61 ms at 100 %. See
 `VIEWPORT_FAST_PATH.md`, "Deferred analysis", for the full tables and the
 navigator/histogram MAE note.
 
-### Snapshot comparison transitions
-
-Holding and releasing `\` used to apply `EvProfileChanged`, which the refresh
-map resolves to `ALL`. Every transition therefore preprocessed and demosaiced
-the full raw image. `EditorPanel::applyParamsToIpc()` now calls
-`comparisonRequiresRawStage()` and uses `ALLNORAW` when the raw-stage inputs
-are unchanged. The white balance of `Camera`/automatic methods, automatic
-capture-sharpening outputs and non-existent absolute dark-frame/flat-field
-paths are treated as derived values rather than edits. Raw-stage changes keep
-the full path. `RT_COMPARE_FULL=1` forces it for diagnostics.
-
-Host CPU build, GCC 14.2.0, 8 physical cores / 16 threads, Xvfb 1600x1000, a
-private 45.7 MP NEF, default profile, +2.73 EV exposure edit, 5 hold/release
-cycles (2 with the full path):
-
-| Path | Fit p50 | 100 % p50 | Mask |
-|---|---:|---:|---|
-| full (`RT_COMPARE_FULL=1`) | 1209 ms | 1215 ms | `ALL` |
-| default | 97 ms | 91 ms | `ALLNORAW` |
-
-All fast samples used `rawStage=0`. The comparison frame and the live
-before/after frames were byte-identical between the fast and full paths at
-both zooms. The remaining full-path cost applies only when the snapshot
-differs in raw/base inputs.
-
-The comparison frame cache skips the render on later holds. The first render
-populates a viewport pixbuf; a hit draws that pixbuf and issues no parameter
-apply or preview update. On a 10.2 MP PEF the first render took 32 ms at fit
-and 54 ms at 100 % panned; later holds were cache hits at 0.092 ms and
-0.097 ms. The cached frames were
-419,832 bytes at fit (`457×306`) and 2,205,056 bytes at 100 % (`858×856`),
-with a 32 MiB cap and one active-editor frame. Post-base edits remain cache
-hits; view/geometry/snapshot/monitor/preview-demosaic changes invalidate.
-Clipping indicators, the focus mask and sharp mask use the render path and
-are not cached. `RT_COMPARE_CACHE=0` disables it. There is no background precompute, so the first hold after a
-miss still renders.
-
 ### Preview Refresh
 
 The adjuster debounce and the deferred analysis settle/max-wait share one

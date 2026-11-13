@@ -29,7 +29,7 @@ using namespace rtengine;
 using namespace rtengine::procparams;
 
 
-History::History (bool bookmarkSupport) : historyVPaned (nullptr), bookmarkMenu (nullptr), menuUseCompare (nullptr), menuRestoreBase (nullptr), menuDelete (nullptr), contextPathValid (false), updatingCompareMarker (false), blistener (nullptr), tpc (nullptr), bmnum (1)
+History::History (bool bookmarkSupport) : historyVPaned (nullptr), blistener (nullptr), tpc (nullptr), bmnum (1)
 {
     set_orientation(Gtk::ORIENTATION_VERTICAL);
 
@@ -108,7 +108,6 @@ History::History (bool bookmarkSupport) : historyVPaned (nullptr), bookmarkMenu 
     delBookmark->get_style_context()->add_class ("Right");
     Gtk::Image* delimg = Gtk::manage (new RTImage ("remove-small", Gtk::ICON_SIZE_BUTTON));
     delBookmark->set_image (*delimg);
-    delBookmark->set_sensitive(false);
     ahbox->pack_start (*delBookmark);
 
     bscrollw = Gtk::manage (new Gtk::ScrolledWindow ());
@@ -140,45 +139,9 @@ History::History (bool bookmarkSupport) : historyVPaned (nullptr), bookmarkMenu 
     bookmarkModel = Gtk::ListStore::create (bookmarkColumns);
     bTreeView->set_model (bookmarkModel);
     bTreeView->set_headers_visible (false);
-
-    Gtk::CellRendererText* bmarkcrt = Gtk::manage(new Gtk::CellRendererText());
-    bmarkcrt->property_xpad() = 2;
-    Gtk::TreeView::Column* bmarkcol = Gtk::manage(new Gtk::TreeView::Column(""));
-    bmarkcol->pack_start(*bmarkcrt, false);
-    bmarkcol->add_attribute(bmarkcrt->property_markup(), bookmarkColumns.marker);
-    bmarkcol->set_fixed_width(16);
-    bmarkcol->set_sizing(Gtk::TREE_VIEW_COLUMN_FIXED);
-    bTreeView->append_column(*bmarkcol);
-
-    Gtk::CellRendererText* bnamecrt = Gtk::manage(new Gtk::CellRendererText());
-    bnamecrt->property_ellipsize() = Pango::ELLIPSIZE_END;
-    Gtk::TreeView::Column* bnamecol = Gtk::manage(new Gtk::TreeView::Column(M("HISTORY_SNAPSHOTS")));
-    bnamecol->pack_start(*bnamecrt, true);
-    bnamecol->add_attribute(bnamecrt->property_text(), bookmarkColumns.text);
-    bnamecol->add_attribute(bnamecrt->property_editable(), bookmarkColumns.editable);
-    bnamecrt->signal_edited().connect(sigc::mem_fun(*this, &History::onBookmarkNameEdited));
-    bTreeView->append_column(*bnamecol);
-
-    bTreeView->set_has_tooltip(true);
-    bTreeView->signal_query_tooltip().connect(sigc::mem_fun(*this, &History::onBookmarkQueryTooltip));
-    bTreeView->signal_button_press_event().connect(sigc::mem_fun(*this, &History::onBookmarkButtonPress), false);
-
-    bookmarkMenu = Gtk::manage(new Gtk::Menu());
-    menuUseCompare = Gtk::manage(new Gtk::MenuItem(M("HISTORY_SNAPSHOT_COMPARE_SET")));
-    menuRestoreBase = Gtk::manage(new Gtk::MenuItem(M("HISTORY_SNAPSHOT_COMPARE_RESTORE")));
-    menuDelete = Gtk::manage(new Gtk::MenuItem(M("HISTORY_SNAPSHOT_DELETE")));
-    menuUseCompare->signal_activate().connect(sigc::mem_fun(*this, &History::onMenuUseCompare));
-    menuRestoreBase->signal_activate().connect(sigc::mem_fun(*this, &History::onMenuRestoreBase));
-    menuDelete->signal_activate().connect(sigc::mem_fun(*this, &History::onMenuDelete));
-    bookmarkMenu->append(*menuUseCompare);
-    bookmarkMenu->append(*menuRestoreBase);
-    bookmarkMenu->append(*Gtk::manage(new Gtk::SeparatorMenuItem()));
-    bookmarkMenu->append(*menuDelete);
-    bookmarkMenu->attach_to_widget(*bTreeView);
-    bookmarkMenu->show_all();
+    bTreeView->append_column_editable (M ("HISTORY_SNAPSHOTS"), bookmarkColumns.text);
 
     selchangebm = bTreeView->get_selection()->signal_changed().connect (sigc::mem_fun (*this, &History::bookmarkSelectionChanged));
-    bookmarkModel->signal_row_changed().connect(sigc::mem_fun(*this, &History::onBookmarkRowChanged));
 
     addBookmark->signal_clicked().connect ( sigc::mem_fun (*this, &History::addBookmarkPressed) );
     delBookmark->signal_clicked().connect ( sigc::mem_fun (*this, &History::delBookmarkPressed) );
@@ -199,8 +162,6 @@ void History::initHistory ()
     ConnectionBlocker selBlocker (selchangehist);
     historyModel->clear ();
     bookmarkModel->clear ();
-    delBookmark->set_sensitive(false);
-    compareSnapshotChanged.emit();
 }
 
 void History::historySelectionChanged ()
@@ -249,11 +210,6 @@ void History::bookmarkSelectionChanged ()
 
         if (row) {
             hTreeView->get_selection()->unselect_all ();
-            delBookmark->set_sensitive(row[bookmarkColumns.deletable]);
-            delBookmark->set_tooltip_text(
-                row[bookmarkColumns.isBase]
-                    ? M("SNAPSHOT_COMPARE_BASE_DELETE_REFUSED")
-                    : Glib::ustring());
         }
 
         if (row && tpc) {
@@ -264,8 +220,6 @@ void History::bookmarkSelectionChanged ()
             ParamsEdited paramsEdited = row[bookmarkColumns.paramsEdited];
             tpc->profileChange (&pp, EvBookmarkSelected, row[bookmarkColumns.text], &paramsEdited);
         }
-    } else {
-        delBookmark->set_sensitive(false);
     }
 }
 
@@ -349,10 +303,6 @@ void History::procParamsChanged(
         hTreeView->scroll_to_row(*selp.begin());
     }
 
-    if (ev == EvPhotoLoaded) {
-        createBaseSnapshot(*params, paramsEdited ? *paramsEdited : defParamsEdited);
-    }
-
     selchangehist.block(false);
     selchangebm.block(false);
 }
@@ -381,11 +331,6 @@ void History::addBookmarkWithText (Glib::ustring text)
     newrow[bookmarkColumns.params] = params;
     ParamsEdited paramsEdited = row[historyColumns.paramsEdited];
     newrow[bookmarkColumns.paramsEdited] = paramsEdited;
-    newrow[bookmarkColumns.isBase] = false;
-    newrow[bookmarkColumns.isCompareSnapshot] = false;
-    newrow[bookmarkColumns.editable] = true;
-    newrow[bookmarkColumns.deletable] = true;
-    newrow[bookmarkColumns.marker] = Glib::ustring();
 }
 
 void History::addBookmarkPressed ()
@@ -396,144 +341,6 @@ void History::addBookmarkPressed ()
     }
 }
 
-Gtk::TreeModel::iterator History::findBaseRow()
-{
-    for (auto it = bookmarkModel->children().begin(); it != bookmarkModel->children().end(); ++it) {
-        if ((*it)[bookmarkColumns.isBase]) {
-            return it;
-        }
-    }
-
-    return bookmarkModel->children().end();
-}
-
-Gtk::TreeModel::iterator History::findCompareRow()
-{
-    for (auto it = bookmarkModel->children().begin(); it != bookmarkModel->children().end(); ++it) {
-        if ((*it)[bookmarkColumns.isCompareSnapshot]) {
-            return it;
-        }
-    }
-
-    return bookmarkModel->children().end();
-}
-
-void History::setCompareSnapshotInternal(const Gtk::TreeModel::iterator& iter)
-{
-    if (!iter) {
-        return;
-    }
-
-    updatingCompareMarker = true;
-
-    for (auto it = bookmarkModel->children().begin(); it != bookmarkModel->children().end(); ++it) {
-        const bool selected = (it == iter);
-        (*it)[bookmarkColumns.isCompareSnapshot] = selected;
-        (*it)[bookmarkColumns.marker] = selected ? Glib::ustring("\u25cf") : Glib::ustring();
-    }
-
-    updatingCompareMarker = false;
-
-    compareSnapshotChanged.emit();
-}
-
-void History::setCompareSnapshot(const Gtk::TreeModel::iterator& iter)
-{
-    setCompareSnapshotInternal(iter);
-}
-
-void History::restoreBaseComparison()
-{
-    Gtk::TreeModel::iterator base = findBaseRow();
-
-    if (base) {
-        setCompareSnapshotInternal(base);
-    }
-}
-
-void History::createBaseSnapshot(const ProcParams& params, const ParamsEdited& paramsEdited)
-{
-    Gtk::TreeModel::iterator base = findBaseRow();
-    Gtk::TreeModel::Row row;
-
-    if (base) {
-        row = *base;
-    } else {
-        base = bookmarkModel->prepend();
-        row = *base;
-    }
-
-    row[bookmarkColumns.text] = M("HISTORY_SNAPSHOT_BASE");
-    row[bookmarkColumns.params] = params;
-    row[bookmarkColumns.paramsEdited] = paramsEdited;
-    row[bookmarkColumns.isBase] = true;
-    row[bookmarkColumns.isCompareSnapshot] = false;
-    row[bookmarkColumns.editable] = false;
-    row[bookmarkColumns.deletable] = false;
-    row[bookmarkColumns.marker] = Glib::ustring();
-
-    setCompareSnapshotInternal(base);
-}
-
-bool History::getCompareSnapshotParams(ProcParams& params, Glib::ustring& name)
-{
-    Gtk::TreeModel::iterator iter = findCompareRow();
-
-    if (iter == bookmarkModel->children().end()) {
-        return false;
-    }
-
-    params = (*iter)[bookmarkColumns.params];
-    name = (*iter)[bookmarkColumns.text];
-    return true;
-}
-
-bool History::compareSnapshotIsBase()
-{
-    const Gtk::TreeModel::iterator iter = findCompareRow();
-    return iter != bookmarkModel->children().end()
-        && (*iter)[bookmarkColumns.isBase];
-}
-
-bool History::isAtLoadState() const
-{
-    if (!historyModel) {
-        return true;
-    }
-
-    // The first row is the "photo loaded" state. Later rows are parameter
-    // changes; an undo may leave them in the model but select an earlier row.
-    if (historyModel->children().size() <= 1) {
-        return true;
-    }
-
-    const auto selection = hTreeView->get_selection()->get_selected();
-    return selection
-        && historyModel->get_path(selection)
-            == historyModel->get_path(historyModel->children().begin());
-}
-
-bool History::deleteBookmark(const Gtk::TreeModel::iterator& iter)
-{
-    if (!iter) {
-        return false;
-    }
-
-    const Gtk::TreeModel::Row row = *iter;
-
-    if (!row[bookmarkColumns.deletable]) {
-        return false;
-    }
-
-    if (row[bookmarkColumns.isCompareSnapshot]) {
-        restoreBaseComparison();
-    }
-
-    bookmarkModel->erase(iter);
-    delBookmark->set_sensitive(false);
-    return true;
-}
-
 void History::delBookmarkPressed ()
 {
 
@@ -541,141 +348,16 @@ void History::delBookmarkPressed ()
     Glib::RefPtr<Gtk::TreeSelection> selection = bTreeView->get_selection();
     Gtk::TreeModel::iterator iter = selection->get_selected();
 
-    if (!iter || !deleteBookmark(iter)) {
+    if (!iter) {
         return;
     }
 
+    // remove selected bookmark
+    bookmarkModel->erase (iter);
     // select last item in history
     int size = historyModel->children().size ();
-
-    if (size > 0) {
-        Gtk::TreeModel::Row row = historyModel->children()[size - 1];
-        hTreeView->get_selection()->select (row);
-    }
-}
-
-bool History::onBookmarkButtonPress(GdkEventButton* event)
-{
-    if (event->type != GDK_BUTTON_PRESS || (event->button != 1 && event->button != 3)) {
-        return false;
-    }
-
-    Gtk::TreeModel::Path path;
-    Gtk::TreeView::Column* column = nullptr;
-    int cellX = 0;
-    int cellY = 0;
-
-    if (!bTreeView->get_path_at_pos(static_cast<int>(event->x), static_cast<int>(event->y), path, column, cellX, cellY)) {
-        contextPathValid = false;
-        return false;
-    }
-
-    Gtk::TreeModel::iterator iter = bookmarkModel->get_iter(path);
-
-    if (!iter) {
-        contextPathValid = false;
-        return false;
-    }
-
-    if (event->button == 1 && (event->state & GDK_CONTROL_MASK)) {
-        setCompareSnapshot(iter);
-        return true;
-    }
-
-    if (event->button == 3) {
-        contextPath = path;
-        contextPathValid = true;
-        const Gtk::TreeModel::Row row = *iter;
-        const bool hasBase = findBaseRow() != bookmarkModel->children().end();
-        menuUseCompare->set_sensitive(!row[bookmarkColumns.isCompareSnapshot]);
-        menuRestoreBase->set_sensitive(hasBase && !row[bookmarkColumns.isBase]);
-        menuDelete->set_sensitive(row[bookmarkColumns.deletable]);
-        bookmarkMenu->popup(event->button, event->time);
-        return true;
-    }
-
-    return false;
-}
-
-void History::onBookmarkRowChanged(const Gtk::TreeModel::Path&, const Gtk::TreeModel::iterator& iter)
-{
-    if (!updatingCompareMarker && iter && (*iter)[bookmarkColumns.isCompareSnapshot]) {
-        compareSnapshotChanged.emit();
-    }
-}
-
-void History::onBookmarkNameEdited(const Glib::ustring& path, const Glib::ustring& newText)
-{
-    Gtk::TreeModel::iterator iter = bookmarkModel->get_iter(Gtk::TreeModel::Path(path));
-
-    if (iter && (*iter)[bookmarkColumns.editable]) {
-        (*iter)[bookmarkColumns.text] = newText;
-    }
-}
-
-void History::onMenuUseCompare()
-{
-    if (contextPathValid) {
-        Gtk::TreeModel::iterator iter = bookmarkModel->get_iter(contextPath);
-
-        if (iter) {
-            setCompareSnapshot(iter);
-        }
-    }
-}
-
-void History::onMenuRestoreBase()
-{
-    restoreBaseComparison();
-}
-
-void History::onMenuDelete()
-{
-    if (!contextPathValid) {
-        return;
-    }
-
-    Gtk::TreeModel::iterator iter = bookmarkModel->get_iter(contextPath);
-
-    if (iter && deleteBookmark(iter)) {
-        int size = historyModel->children().size();
-
-        if (size > 0) {
-            hTreeView->get_selection()->select(historyModel->children()[size - 1]);
-        }
-    }
-}
-
-bool History::onBookmarkQueryTooltip(int x, int y, bool keyboard_tooltip, const Glib::RefPtr<Gtk::Tooltip>& tooltip)
-{
-    Gtk::TreeModel::Path path;
-    int x2 = -1;
-    int y2 = -1;
-    bTreeView->convert_widget_to_bin_window_coords(x, y, x2, y2);
-
-    if (!bTreeView->get_path_at_pos(x2, y2, path)) {
-        return false;
-    }
-
-    Gtk::TreeModel::iterator iter = bookmarkModel->get_iter(path);
-
-    if (!iter) {
-        return false;
-    }
-
-    const Gtk::TreeModel::Row row = *iter;
-
-    if (row[bookmarkColumns.isBase]) {
-        tooltip->set_text(M("HISTORY_SNAPSHOT_BASE_TOOLTIP"));
-        return true;
-    }
-
-    if (row[bookmarkColumns.isCompareSnapshot]) {
-        tooltip->set_text(M("HISTORY_SNAPSHOT_COMPARE_MARKER"));
-        return true;
-    }
-
-    return false;
+    Gtk::TreeModel::Row row = historyModel->children()[size - 1];
+    hTreeView->get_selection()->select (row);
 }
 
 void History::undo ()

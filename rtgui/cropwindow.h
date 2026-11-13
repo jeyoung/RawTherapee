@@ -89,7 +89,6 @@ class CropWindow final : public LWButtonListener, public CropDisplayHandler, pub
     int backColor;
     bool decorated;
     bool isFlawnOver;
-    bool showCropGuides = true;
 
     // crop frame description
     int titleHeight, sideBorderWidth, lowerBorderWidth, upperBorderWidth, sepWidth, minWidth;
@@ -103,7 +102,6 @@ class CropWindow final : public LWButtonListener, public CropDisplayHandler, pub
     // size & pos of the piece of preview image relative to the top left corner of the crop
     hidpi::LogicalCoord imgPos;
     hidpi::DeviceSize imgSize;
-    Glib::RefPtr<Gdk::Pixbuf> comparisonOverlay;
 
     // image handling
 
@@ -162,10 +160,6 @@ public:
     void setDecorated       (bool decorated)
     {
         this->decorated = decorated;
-    }
-    void setShowCropGuides  (bool show)
-    {
-        showCropGuides = show;
     }
     void setFitZoomEnabled  (bool fze)
     {
@@ -236,10 +230,6 @@ public:
     void getCropAnchorPosition (int& w, int& h);
     void setCropAnchorPosition (int w, int h);
 
-    // Display a pre-rendered comparison crop instead of the live crop.
-    void setComparisonOverlay(const Glib::RefPtr<Gdk::Pixbuf>& overlay);
-    void clearComparisonOverlay();
-
     // listeners
     void setCropGUIListener       (CropGUIListener* cgl);
     void setPointerMotionListener (PointerMotionListener* pml);
@@ -252,7 +242,6 @@ public:
 
     // crophandlerlistener interface
     void cropImageUpdated () override;
-    sigc::signal<void> cropImageUpdatedSignal;
     void cropWindowChanged () override;
     void initialImageArrived () override;
     void setDisplayPosition (hidpi::LogicalCoord pos) override;
