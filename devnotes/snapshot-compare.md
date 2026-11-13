@@ -1,8 +1,8 @@
 # Snapshot comparison
 
-Status: implemented on `issue-0-snapshot-compare`; GUI smoke checks and the
-geometry unit test pass. Packaging and the full acceptance matrix are not yet
-complete.
+Status: implemented on `issue-0-snapshot-compare`; the teardown crash and
+interaction changes were fixed on `issue-43-snapshot-compare-fix`. GUI smoke
+checks, the geometry unit test and the preview base-cache test pass.
 
 ## Behaviour
 
@@ -15,16 +15,23 @@ complete.
   item and a guarded deletion path.
 - Hold `\` to show the comparison snapshot. Release `\` to return to the live
   edit.
-- The viewport is frozen while comparing: no pan, zoom, wheel, double-click or
-  editing. To compare another area, release `\`, navigate, then press `\`
-  again.
+- The viewport is frozen while comparing: no pan, zoom, wheel or
+  double-click. To compare another area, release `\`, navigate, then press
+  `\` again.
 - The comparison keeps the live view's geometry (crop, coarse/common
   transform, straighten, distortion, perspective, lens profile) and takes the
   snapshot's non-geometry adjustments. The visible area therefore cannot
   shift.
-- Editing controls and keyboard shortcuts are locked while comparing. The
-  lock is released when the live preview is restored, or after a bounded
-  timeout.
+- Tool panels, the toolbar and the history panel stay enabled and visually
+  unchanged during comparison. There is no sensitivity change to draw the eye
+  away from the image.
+- Any real parameter edit or any non-`\` shortcut ends the comparison and
+  then performs the action. Releasing `\` without an interaction still
+  restores the live view. Auto-repeat of the held `\` cannot re-enter the
+  comparison after an edit ended it.
+- Closing an editor tab while comparing is safe, including with the tab close
+  button, `Ctrl+W`, and releasing `\` after the tab has gone. Teardown never
+  starts a processing pass.
 
 ## Architecture
 
@@ -37,11 +44,13 @@ Key files:
 - `rtgui/history.*`: Base snapshot, comparison selection, markers, guarded
   deletion, context menu.
 - `rtgui/editorpanel.*`: live-state save/restore, parameter swap, frozen
-  viewport, interaction lock, badge, key press/release.
+  viewport, badge, key press/release, comparison teardown.
+- `rtgui/toolpanelcoord.*`: `beforeParamChange`, emitted before a parameter
+  edit reaches the image processor.
 - `rtgui/imagearea.*`: `interactionsEnabled` guard.
 - `rtgui/cropwindow.*`: `showCropGuides` flag.
 - `rtgui/windows/rtwindow.cc`, `editwindow.cc`: key-release routing, focus-out
-  and tab-change restore.
+  and tab-change restore, `prepareForRemoval()` before page removal.
 - `rtengine/compareparams.*`: `makeComparisonParams` and `geometryDiffers`.
 - `rtengine/rtengine.h`, `improccoordinator.h`: `hasTweakOperator`.
 
@@ -50,6 +59,34 @@ parameters are merged with the live geometry and applied with
 `beginUpdateParams` / `endUpdateParams(EvProfileChanged)`. The GUI model,
 history and sidecar are not notified. On release the saved live parameters are
 applied and the saved view is restored.
+
+`ToolPanelCoordinator` emits `beforeParamChange` immediately before
+`panelChanged`, `refreshPreview` and `profileChange` write parameters. The
+editor connects it to `finishCompareForEdit()`, which returns the processor to
+the live parameters, unlocks the viewport and hides the badge before the edit
+is applied. The edit is therefore never merged onto the comparison
+parameters, and `profileChange` merges a partial profile onto live rather than
+comparison state.
+
+## Teardown
+
+Removing an editor tab calls `EditorPanel::prepareForRemoval()` before the
+page is detached. It cancels any comparison, disconnects the History
+comparison signal and the restore timeout, and leaves the callbacks inert.
+The destructor repeats the disconnection.
+
+`cancelCompareForClose()` must not apply parameters during teardown: doing so
+starts a processing pass while the tool panels are being destroyed. If a
+comparison is active, it sets `liveParamsForSave`, so `saveProfile()` and
+`refreshProcessingState()` read the saved live parameters instead of the
+processor's comparison parameters. The thumbnail and profile state are still
+written correctly, without a render.
+
+The original crash was a `SIGSEGV` in
+`BayerProcess::FrameCountChanged()`'s idle callback (`sigc::slot_base::block`)
+after a comparison-time parameter apply ran during panel destruction. Closing
+the tab while holding `\` and reopening the same image reproduced it. The
+teardown rule above removes the processing pass and the use-after-free.
 
 ## Evidence
 
@@ -64,6 +101,11 @@ Environment: CPU build, GCC 14.2.0, 8 physical cores / 16 threads, Xvfb
 | Hold/release `\` | PASS: snapshot shown, live restored, no comparison history row. |
 | Frozen viewport | PASS: before/after drag and wheel during hold were pixel-identical (central viewport crop, AE=0). |
 | Live view restore | PASS: live before/after a compare cycle were pixel-identical (central viewport crop, AE=0). |
+| Panels unchanged | PASS: right panel, left panel and toolbar crops were pixel-identical between comparison and live (`AE=0`). |
+| Edit ends comparison | PASS: dragging Exposure compensation while holding `\` hid the badge immediately, added the History row, and kept the edit after releasing `\`. |
+| Non-`\` key | PASS: `z` while holding `\` ended the comparison and zoomed to 100% with the live edit retained. |
+| Auto-repeat suppression | PASS: the badge did not return while `\` stayed held after an edit ended the comparison. |
+| Close while comparing | PASS: 10 cycles (5 tab close button, 5 `Ctrl+W`) with hold, close, release and reopen of the same image; no crash and no new coredump. |
 | Delete marked snapshot | PASS: only `Base` remains and becomes the comparison. |
 | Context menu | PASS: visible for a row; delete disabled for `Base`. |
 | Geometry merge unit test | PASS: `snapshot compare geometry test: PASS`. |
@@ -142,14 +184,14 @@ installed package. GPU tests were not run in the containers.
 - The comparison badge is drawn as an overlay and does not change the viewport
   allocation.
 - A runtime language change does not rename an existing `Base` row.
-- The full package build and Debian install checks have not been run yet.
 
 ## Verification commands
 
 ```bash
 tools/build-rt.sh cpu -j 6
 tools/build-rt.sh opencl -j 6
-tools/perf/test-snapshot-compare-geometry.sh build/cpu-issue-0-snapshot-compare
+tools/perf/test-snapshot-compare-geometry.sh build/cpu-<branch>
+tools/perf/test-preview-base-cache.sh build/cpu-<branch>
 ```
 
 For GUI checks, use Xvfb with `GDK_BACKEND=x11`, a scratch `RT_SETTINGS` and
@@ -166,12 +208,12 @@ For GUI checks, use Xvfb with `GDK_BACKEND=x11`, a scratch `RT_SETTINGS` and
 | AC5 parity | PASS for identical geometry | Central image `AE=0`. |
 | AC6 live state | PASS | Pixel-identical live before/after; no history row. |
 | AC7 frozen viewport | PASS | Drag/wheel during hold produced `AE=0`. |
-| AC8 lock | PASS | Controls greyed; shortcuts consumed. |
+| AC8 interaction | PASS | Panels stay enabled and unchanged; an edit or non-`\` key ends comparison and acts. |
 | AC9 before/after exclusion | Not tested in this pass | Code restores compare first. |
 | AC10 memory | PARTIAL | No second-source step; extra growth not fully attributed. |
 | AC11 latency | PARTIAL | Measured; 10 MP target missed. |
 | AC12 interruption | Not fully tested | Timeout and restore paths implemented. |
-| AC13 multi-tab | Not tested | Tab-change restore implemented. |
+| AC13 multi-tab | PASS | 10 close/reopen cycles while comparing, including `Ctrl+W`; no crash. |
 | AC14 builds | PASS | CPU and OpenCL compile. |
 | AC15 i18n/docs | PARTIAL | Strings and diffs generated; docs added. |
 | AC16 no side effects | PASS | No history/sidecar write observed. |
