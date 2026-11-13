@@ -111,6 +111,18 @@ before/after frames were byte-identical between the fast and full paths at
 both zooms. The remaining full-path cost applies only when the snapshot
 differs in raw/base inputs.
 
+The comparison frame cache skips the render on later holds. The first render
+populates a viewport pixbuf; a hit draws that pixbuf and issues no parameter
+apply or preview update. On a 10.2 MP PEF the first render took 32 ms at fit
+and 54 ms at 100 % panned; later holds were cache hits at 0.092 ms and
+0.097 ms. The cached frames were
+419,832 bytes at fit (`457×306`) and 2,205,056 bytes at 100 % (`858×856`),
+with a 32 MiB cap and one active-editor frame. Post-base edits remain cache
+hits; view/geometry/snapshot/monitor/preview-demosaic changes invalidate.
+Clipping indicators, the focus mask and sharp mask use the render path and
+are not cached. `RT_COMPARE_CACHE=0` disables it. There is no background precompute, so the first hold after a
+miss still renders.
+
 ### Preview Refresh
 
 The adjuster debounce and the deferred analysis settle/max-wait share one

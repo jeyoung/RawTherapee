@@ -23,6 +23,12 @@ checks, the geometry unit test and the preview base-cache test pass.
 - When `Base` is selected and the image still has no parameter changes, hold
   shows the badge without applying parameters or requesting a preview, so an
   unchanged image cannot flash.
+- After the first rendered comparison at a given snapshot, geometry and view,
+  later holds display a cached viewport frame. A cache hit performs no
+  parameter apply and no preview update. Post-base edits do not invalidate the
+  cache; view, geometry, snapshot, monitor-profile and preview-demosaic changes
+  do. Clipping, focus-mask and sharp-mask overlays force a render and are not
+  cached. `RT_COMPARE_CACHE=0` disables the cache.
 - The comparison keeps the live view's geometry (crop, coarse/common
   transform, straighten, distortion, perspective, lens profile) and takes the
   snapshot's non-geometry adjustments. The visible area therefore cannot
@@ -79,6 +85,32 @@ the load row, `enterCompareView()` sets a no-render state instead of applying
 parameters. The badge appears and the viewport is locked, but no preview is
 requested. Release, an edit or a close clears the state without a render. A
 custom snapshot, or an edited live image, uses the normal render path.
+
+### Comparison frame cache
+
+A normal comparison render captures the displayed detailed crop from
+`CropHandler::cropPixbuf` into a `Glib::RefPtr<Gdk::Pixbuf>`. On a cache hit,
+`CropWindow::setComparisonOverlay()` draws that pixbuf instead of the live
+crop. The processor is not touched, so both hold and release are display
+operations.
+
+The key covers the snapshot revision, effective geometry (crop when enabled,
+coarse/common transform, rotate, distortion, perspective when active, lens
+profile), preview scale, zoom/anchor, preview pixbuf dimensions and device
+scale, monitor profile/intent, soft proof/gamut check, preview demosaic mode
+and the FAST toggle. Inactive crop and perspective defaults are ignored
+because the engine normalises them without changing the image. A post-base
+edit leaves the key unchanged, so the cache survives exposure, curve and
+colour edits.
+
+The cache retains one viewport frame, capped at 32 MiB
+(`rowstride * height`). Above the cap the normal render path is used. Only the
+active editor keeps a frame; `setActive(false)`, snapshot changes, tab close
+and panel close release it. A cache miss falls back to the `ALLNORAW` render
+and repopulates the cache. `RT_COMPARE_CACHE=0` disables capture and hits for
+A/B checks. Clipping indicators, the focus mask and sharp mask force the
+render path and are not cached, because the cached frame is the plain monitor
+image.
 
 `ToolPanelCoordinator` emits `beforeParamChange` immediately before
 `panelChanged`, `refreshPreview` and `profileChange` write parameters. The
@@ -141,6 +173,12 @@ Environment: CPU build, GCC 14.2.0, 8 physical cores / 16 threads, Xvfb
 | No-render unchanged | PASS: unedited `Base` produced `compare: no render` on entry and release, no parameter apply and no preview update; the viewport was pixel-identical and only the badge changed. |
 | Edit during no-render | PASS: dragging Exposure while the no-render state was held cleared it, applied the edit and did not start a comparison render. |
 | No-render close | PASS: `Ctrl+W` while the no-render state was held closed the tab without a crash; reopening the image worked. |
+| Cache hit | PASS: second and later adjustment-only holds logged `cache hit 0.092 ms` (fit) and `cache hit 0.097 ms` (100 %), with no parameter apply and no preview update. |
+| Cache parity | PASS: the first rendered comparison and the cached comparison at the same view were byte-identical in the viewport (`AE=0`). |
+| Cache across edits | PASS: after a further Exposure edit the next hold still logged `cache hit`; geometry and view were unchanged. |
+| Cache invalidation | PASS: at 100 % panned the first hold logged a view miss and rendered in 54 ms; the next hold hit the new 858×856 cache with anchor `444,404` unchanged. |
+| Cache memory | PASS: fit cache `457×306` = 419,832 bytes; 100 % panned cache `858×856` = 2,205,056 bytes; both below the 32 MiB cap. |
+| Cache off | PASS: `RT_COMPARE_CACHE=0` produced the normal `ALLNORAW` render and no cache hit. |
 | Transition mask | PASS: an adjustment-only comparison used `ALLNORAW` with `rawStage=0`; `RT_COMPARE_FULL=1` used `ALL`. |
 | Transition latency | PASS: private 45.7 MP NEF, fit and 100 %, p50 97 ms and 91 ms against 1209 ms and 1215 ms with the full path. |
 | Fast/full parity | PASS: the comparison frame and live before/after frames were byte-identical between the fast and full paths at both zooms. |
@@ -199,6 +237,20 @@ All fast samples reported `rawStage=0`. The comparison frame and the live
 before/after frames were byte-identical between the fast and full paths at
 both zooms (PNG SHA-256 equality), so the faster mask did not change the
 rendered result.
+
+### Cached comparison toggle
+
+The first comparison render at a given snapshot, geometry and view populates
+the cache. On the 10.2 MP PEF, fit took 32 ms and 100 % panned took 54 ms.
+The following holds reported `cache hit 0.092 ms` at fit and `0.097 ms` at
+100 %, and issued no preview update; the cached and freshly rendered
+comparison viewports were byte-identical. The cached frames were 419,832
+bytes at fit (`457×306`) and 2,205,056 bytes at 100 % (`858×856`).
+
+There is no background precompute yet, so the first hold after a cache miss
+still pays the render time. Post-base edits are cache hits; view, geometry,
+snapshot, monitor-profile and preview-demosaic changes are not. Preview
+overlays are never cached.
 
 ## Review fixes
 
@@ -260,6 +312,8 @@ were not run in the containers.
 - Relative dark-frame and flat-field paths are not normalised, because their
   resolution base is not known in the comparison helper; they keep the full
   path when they differ.
+- The first hold after a cache miss renders normally: 32 ms at fit and 54 ms
+  at 100 % on the 10.2 MP PEF. There is no background precompute.
 
 ## Verification commands
 
@@ -273,7 +327,8 @@ tools/perf/test-preview-base-cache.sh build/cpu-<branch>
 For GUI checks, use Xvfb with `GDK_BACKEND=x11`, a scratch `RT_SETTINGS` and
 `RT_CACHE`, and `RT_COMPARE_PROFILE=1`. Add `RT_PREVIEW_PROFILE=1` for the
 preview `todo` mask and cache status. Set `RT_COMPARE_FULL=1` to force the
-old full path for A/B measurements.
+old full path and `RT_COMPARE_CACHE=0` to disable the comparison frame cache
+for A/B measurements.
 
 ## Acceptance criteria status
 
