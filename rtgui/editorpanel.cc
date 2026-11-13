@@ -791,6 +791,7 @@ EditorPanel::EditorPanel (FilePanel* filePanel)
     // construct toolpanelcoordinator
     tpc = new ToolPanelCoordinator();
     tpc->setProgressListener(this);
+    tpc->beforeParamChange.connect(sigc::mem_fun(*this, &EditorPanel::finishCompareForEdit));
 
     // build GUI
 
@@ -816,7 +817,8 @@ EditorPanel::EditorPanel (FilePanel* filePanel)
     leftsubpaned->pack1(*navigator, false, false);
 
     history = Gtk::manage(new History());
-    history->compareSnapshotChanged.connect(sigc::mem_fun(*this, &EditorPanel::onCompareSnapshotChanged));
+    comparisonSnapshotConn = history->compareSnapshotChanged.connect(
+        sigc::mem_fun(*this, &EditorPanel::onCompareSnapshotChanged));
     leftsubpaned->pack2(*history, true, false);
 
     leftsubpaned->set_position(0);
@@ -1223,6 +1225,10 @@ EditorPanel::~EditorPanel ()
     comparisonBadge = nullptr;
     beforeAfter = nullptr;
 
+    removalPrepared = true;
+    closingOrSwitching = true;
+    comparisonRestoreTimeout.disconnect();
+
     idle_register.destroy();
 
     // Close the image while the image area and its crop handler are still
@@ -1230,6 +1236,7 @@ EditorPanel::~EditorPanel ()
     close ();
 
     history->setHistoryBeforeLineListener (nullptr);
+    history->setProfileChangeListener (nullptr);
     // the order is important!
     iareapanel->setBeforeAfterViews (nullptr, iareapanel);
     delete iareapanel;
@@ -1748,6 +1755,8 @@ void EditorPanel::close ()
             openThm->decreaseRef ();
         }
     }
+
+    liveParamsForSave = false;
 }
 
 void EditorPanel::saveProfile ()
@@ -1760,7 +1769,7 @@ void EditorPanel::saveProfile ()
     if (Glib::file_test (fname, Glib::FILE_TEST_EXISTS)) {
         ProcParams params;
 
-        if (comparisonActive) {
+        if (comparisonActive || liveParamsForSave) {
             params = liveParams;
         } else {
             ipc->getParams (&params);
@@ -1950,7 +1959,7 @@ void EditorPanel::refreshProcessingState (bool inProcessingP)
         if (ipc && openThm && tpc->getChangedState()) {
             rtengine::procparams::ProcParams pparams;
 
-            if (comparisonActive || pendingViewRestore) {
+            if (comparisonActive || pendingViewRestore || liveParamsForSave) {
                 pparams = liveParams;
             } else {
                 ipc->getParams (&pparams);
@@ -2214,9 +2223,13 @@ bool EditorPanel::handleShortcutKey (GdkEventKey* event)
     // Do not test altgr here: on Windows GDK_MOD2_MASK is also NumLock, which
     // would make the shortcut unreachable.
     if (!ctrl && !alt && event->keyval == GDK_KEY_backslash) {
-        if (comparisonActive) {
+        // Auto-repeat must not re-enter the comparison after an edit ended
+        // it while the key is still held. Only a fresh press may enter.
+        if (comparisonKeyDown) {
             return true;
         }
+
+        comparisonKeyDown = true;
 
         if (!ipc || !comparisonValid) {
             setProgressStr(M("SNAPSHOT_COMPARE_NO_IMAGE"));
@@ -2227,11 +2240,10 @@ bool EditorPanel::handleShortcutKey (GdkEventKey* event)
         return true;
     }
 
-    // While comparing, the viewport and the edit model are frozen. Consume
-    // every other shortcut, including key repeat, so no editor action or view
-    // change can run until \ is released.
+    // Any other key is an interaction: end the comparison and let the normal
+    // shortcut handling act. The viewport was frozen only while comparing.
     if (comparisonActive) {
-        return true;
+        finishCompareForEdit();
     }
 
     // Editor Layout
@@ -2505,9 +2517,13 @@ bool EditorPanel::handleShortcutKey (GdkEventKey* event)
 
 bool EditorPanel::handleShortcutKeyRelease(GdkEventKey* event)
 {
-    if (event->keyval == GDK_KEY_backslash && comparisonActive) {
-        leaveCompareView();
-        return true;
+    if (event->keyval == GDK_KEY_backslash) {
+        comparisonKeyDown = false;
+
+        if (comparisonActive) {
+            leaveCompareView();
+            return true;
+        }
     }
 
     return false;
@@ -3127,7 +3143,7 @@ void EditorPanel::updateComparisonBadge()
 
 void EditorPanel::onCompareSnapshotChanged()
 {
-    if (!history) {
+    if (closingOrSwitching || !history) {
         return;
     }
 
@@ -3160,6 +3176,10 @@ void EditorPanel::onCompareSnapshotChanged()
 
 void EditorPanel::enterCompareView()
 {
+    if (closingOrSwitching) {
+        return;
+    }
+
     if (!ipc || !comparisonValid) {
         setProgressStr(M("SNAPSHOT_COMPARE_NO_IMAGE"));
         return;
@@ -3188,7 +3208,6 @@ void EditorPanel::enterCompareView()
     pendingViewRestore = false;
     comparisonRestoreTimeout.disconnect();
 
-    lockEditing();
     lockViewport();
     updateComparisonBadge();
     setProgressStr(M("SNAPSHOT_COMPARE_RENDERING"));
@@ -3219,6 +3238,10 @@ void EditorPanel::leaveCompareView()
 
 void EditorPanel::onComparisonPreviewReady()
 {
+    if (closingOrSwitching) {
+        return;
+    }
+
     if (comparisonActive && comparisonRenderPending) {
         comparisonRenderPending = false;
         restoreLiveView();
@@ -3238,7 +3261,6 @@ void EditorPanel::onComparisonPreviewReady()
         comparisonRestoreTimeout.disconnect();
         restoreLiveView();
         unlockViewport();
-        unlockEditing();
         updateComparisonBadge();
         setProgressStr("");
 
@@ -3251,80 +3273,16 @@ void EditorPanel::onComparisonPreviewReady()
 
 bool EditorPanel::onComparisonRestoreTimeout()
 {
-    if (comparisonActive || !pendingViewRestore) {
+    if (closingOrSwitching || comparisonActive || !pendingViewRestore) {
         return false;
     }
 
     pendingViewRestore = false;
     restoreLiveView();
     unlockViewport();
-    unlockEditing();
     updateComparisonBadge();
     setProgressStr("");
     return false;
-}
-
-void EditorPanel::lockEditing()
-{
-    if (editingLocked) {
-        return;
-    }
-
-    editingLocked = true;
-    savedToolBarSensitive = toolBarPanel ? toolBarPanel->get_sensitive() : true;
-    savedIopsSensitive = iopsPanel ? iopsPanel->get_sensitive() : true;
-    savedLeftSensitive = leftbox ? leftbox->get_sensitive() : true;
-    savedRightSensitive = vsubboxright ? vsubboxright->get_sensitive() : true;
-    savedBeforeAfterSensitive = beforeAfter ? beforeAfter->get_sensitive() : true;
-
-    if (toolBarPanel) {
-        toolBarPanel->set_sensitive(false);
-    }
-
-    if (iopsPanel) {
-        iopsPanel->set_sensitive(false);
-    }
-
-    if (leftbox) {
-        leftbox->set_sensitive(false);
-    }
-
-    if (vsubboxright) {
-        vsubboxright->set_sensitive(false);
-    }
-
-    if (beforeAfter) {
-        beforeAfter->set_sensitive(false);
-    }
-}
-
-void EditorPanel::unlockEditing()
-{
-    if (!editingLocked) {
-        return;
-    }
-
-    editingLocked = false;
-
-    if (toolBarPanel) {
-        toolBarPanel->set_sensitive(savedToolBarSensitive);
-    }
-
-    if (iopsPanel) {
-        iopsPanel->set_sensitive(savedIopsSensitive);
-    }
-
-    if (leftbox) {
-        leftbox->set_sensitive(savedLeftSensitive);
-    }
-
-    if (vsubboxright) {
-        vsubboxright->set_sensitive(savedRightSensitive);
-    }
-
-    if (beforeAfter) {
-        beforeAfter->set_sensitive(savedBeforeAfterSensitive);
-    }
 }
 
 void EditorPanel::lockViewport()
@@ -3363,19 +3321,53 @@ void EditorPanel::unlockViewport()
     }
 }
 
+void EditorPanel::finishCompareForEdit()
+{
+    if (!comparisonActive || closingOrSwitching) {
+        return;
+    }
+
+    comparisonActive = false;
+    comparisonRenderPending = false;
+    pendingViewRestore = false;
+    comparisonRestoreTimeout.disconnect();
+
+    if (ipc) {
+        applyParamsToIpc(liveParams);
+    }
+
+    unlockViewport();
+    updateComparisonBadge();
+    setProgressStr("");
+}
+
+void EditorPanel::prepareForRemoval()
+{
+    cancelCompareForClose();
+
+    comparisonRestoreTimeout.disconnect();
+    comparisonSnapshotConn.disconnect();
+
+    if (history) {
+        history->setProfileChangeListener(nullptr);
+    }
+
+    // Keep callbacks inert until the panel is destroyed.
+    removalPrepared = true;
+    closingOrSwitching = true;
+}
+
 void EditorPanel::cancelCompareForClose()
 {
     closingOrSwitching = true;
+    comparisonKeyDown = false;
     comparisonRestoreTimeout.disconnect();
 
     if (comparisonActive) {
-        comparisonActive = false;
-        comparisonRenderPending = false;
-        pendingViewRestore = false;
-
-        if (ipc) {
-            applyParamsToIpc(liveParams);
-        }
+        // Do not start a processing pass while the panel is closing. The
+        // editor-thumbnail save below reads liveParamsForSave instead of the
+        // image processor, which still holds the comparison parameters.
+        liveParamsForSave = true;
     }
 
     comparisonActive = false;
@@ -3385,9 +3377,8 @@ void EditorPanel::cancelCompareForClose()
     comparisonName.clear();
 
     unlockViewport();
-    unlockEditing();
     updateComparisonBadge();
-    closingOrSwitching = false;
+    closingOrSwitching = removalPrepared;
 }
 
 void EditorPanel::beforeAfterToggled ()

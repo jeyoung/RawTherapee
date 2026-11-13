@@ -366,6 +366,10 @@ public:
     void updateToolLocations(
         const std::vector<Glib::ustring> &favorites, bool cloneFavoriteTools);
 
+    // Emitted before a parameter change is written to the image processor.
+    // Used by the snapshot comparison to return to the live parameters first.
+    sigc::signal<void> beforeParamChange;
+
     // multiple listeners can be added that are notified on changes (typical: profile panel and the history)
     void addPParamsChangeListener(PParamsChangeListener* pp)
     {

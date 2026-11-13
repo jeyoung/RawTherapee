@@ -1127,6 +1127,7 @@ void ToolPanelCoordinator::refreshPreview (const rtengine::ProcEvent& event)
         return;
     }
 
+    beforeParamChange.emit();
     ProcParams* params = ipc->beginUpdateParams ();
     for (auto toolPanel : toolPanels) {
         toolPanel->write (params);
@@ -1141,6 +1142,7 @@ void ToolPanelCoordinator::panelChanged(const rtengine::ProcEvent& event, const 
         return;
     }
 
+    beforeParamChange.emit();
     int changeFlags = rtengine::RefreshMapper::getInstance()->getAction(event);
 
     ProcParams* params = ipc->beginUpdateParams();
@@ -1264,6 +1266,7 @@ void ToolPanelCoordinator::profileChange(
         return;
     }
 
+    beforeParamChange.emit();
     ProcParams *params = ipc->beginUpdateParams();
     ProcParams *mergedParams = new ProcParams();
 

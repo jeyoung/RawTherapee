@@ -696,6 +696,7 @@ void RTWindow::remEditorPanel (EditorPanel* ep)
         EditWindow * wndEdit = EditWindow::getInstance (this);
         wndEdit->remEditorPanel (ep);
     } else {
+        ep->prepareForRemoval();
         bool queueHadFocus = (mainNB->get_current_page() == mainNB->page_num (*bpanel));
         ep->setExternalEditorChangedSignal(nullptr);
         ep->setActive(false);
@@ -922,6 +923,16 @@ bool RTWindow::on_delete_event (GdkEventAny* event)
 
     if (isProcessing) {
         return true;
+    }
+
+    // Prepare every editor while its widgets are still alive. GTK destroys the
+    // page children before the editor destructors run on quit.
+    if (epanel) {
+        epanel->prepareForRemoval();
+    }
+
+    for (auto& entry : epanels) {
+        entry.second->prepareForRemoval();
     }
 
     if ( fpanel ) {

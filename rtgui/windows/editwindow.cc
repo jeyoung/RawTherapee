@@ -272,6 +272,7 @@ void EditWindow::remEditorPanel (EditorPanel* ep)
         return;    // Will crash if destroyed while loading
     }
 
+    ep->prepareForRemoval();
     ep->setExternalEditorChangedSignal(nullptr);
     ep->setActive(false);
     epanels.erase (ep->getFileName());
@@ -475,6 +476,7 @@ bool EditWindow::closeOpenEditors()
     }
 
     for ( std::set <Glib::ustring>::iterator iter = filesEdited.begin(); iter != filesEdited.end(); ++iter ) {
+        epanels[*iter]->prepareForRemoval();
         mainNB->remove_page (*epanels[*iter]);
     }
 

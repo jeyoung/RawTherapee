@@ -214,8 +214,7 @@ public:
     void enterCompareView();
     void leaveCompareView();
     void onComparisonPreviewReady();
-    void lockEditing();
-    void unlockEditing();
+    void prepareForRemoval();
     void lockViewport();
     void unlockViewport();
 
@@ -242,6 +241,7 @@ private:
     void saveLiveState();
     void restoreLiveView();
     void updateComparisonBadge();
+    void finishCompareForEdit();
     void cancelCompareForClose();
     bool onComparisonRestoreTimeout();
 
@@ -351,19 +351,17 @@ private:
     bool comparisonRenderPending = false;
     bool pendingViewRestore = false;
     bool closingOrSwitching = false;
+    bool removalPrepared = false;
+    bool liveParamsForSave = false;
+    bool comparisonKeyDown = false;
     int liveAnchorX = 0;
     int liveAnchorY = 0;
     double liveZoom = 1.0;
-    bool savedToolBarSensitive = true;
-    bool savedIopsSensitive = true;
-    bool savedLeftSensitive = true;
-    bool savedRightSensitive = true;
-    bool savedBeforeAfterSensitive = true;
-    bool editingLocked = false;
     bool viewportLocked = false;
     gint64 comparisonEnterUs = 0;
     gint64 comparisonLeaveUs = 0;
     sigc::connection comparisonRestoreTimeout;
+    sigc::connection comparisonSnapshotConn;
 
     EditorPanelIdleHelper* epih;
 
