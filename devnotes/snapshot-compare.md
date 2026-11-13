@@ -18,6 +18,11 @@ checks, the geometry unit test and the preview base-cache test pass.
 - The viewport is frozen while comparing: no pan, zoom, wheel or
   double-click. To compare another area, release `\`, navigate, then press
   `\` again.
+- The comparison preserves the live anchor and zoom. It does not re-centre or
+  re-fit the view.
+- When `Base` is selected and the image still has no parameter changes, hold
+  shows the badge without applying parameters or requesting a preview, so an
+  unchanged image cannot flash.
 - The comparison keeps the live view's geometry (crop, coarse/common
   transform, straighten, distortion, perspective, lens profile) and takes the
   snapshot's non-geometry adjustments. The visible area therefore cannot
@@ -43,9 +48,10 @@ The implementation uses a parameter swap on the single main
 Key files:
 
 - `rtgui/history.*`: Base snapshot, comparison selection, markers, guarded
-  deletion, context menu.
+  deletion, context menu, load-state query.
 - `rtgui/editorpanel.*`: live-state save/restore, parameter swap, frozen
-  viewport, badge, key press/release, comparison teardown.
+  viewport, badge, key press/release, comparison teardown, conditional view
+  restore and the no-render comparison state.
 - `rtgui/toolpanelcoord.*`: `beforeParamChange`, emitted before a parameter
   edit reaches the image processor.
 - `rtgui/imagearea.*`: `interactionsEnabled` guard.
@@ -56,10 +62,23 @@ Key files:
 - `rtengine/rtengine.h`, `improccoordinator.h`: `hasTweakOperator`.
 
 The live `ProcParams` and view anchor/zoom are saved on entry. The snapshot's
-parameters are merged with the live geometry and applied with
-`beginUpdateParams` / `endUpdateParams(EvProfileChanged)`. The GUI model,
-history and sidecar are not notified. On release the saved live parameters are
-applied and the saved view is restored.
+parameters are merged with the live geometry and applied with the explicit
+`ALL`/`ALLNORAW` mask described below. The GUI model, history and sidecar are
+not notified. On release the saved live parameters are applied and the saved
+view is restored.
+
+`restoreLiveView()` compares the current anchor and zoom with the saved
+values. It restores them only when they differ. When the zoom changes it is
+applied before the anchor, because the crop window's zoom path centres the
+anchor internally; the anchor is restored immediately afterwards. An
+unchanged view is left alone, avoiding the redundant crop update and redraw
+that caused the flash.
+
+When the selected comparison snapshot is `Base` and the History selection is
+the load row, `enterCompareView()` sets a no-render state instead of applying
+parameters. The badge appears and the viewport is locked, but no preview is
+requested. Release, an edit or a close clears the state without a render. A
+custom snapshot, or an edited live image, uses the normal render path.
 
 `ToolPanelCoordinator` emits `beforeParamChange` immediately before
 `panelChanged`, `refreshPreview` and `profileChange` write parameters. The
@@ -118,6 +137,10 @@ Environment: CPU build, GCC 14.2.0, 8 physical cores / 16 threads, Xvfb
 | Frozen viewport | PASS: before/after drag and wheel during hold were pixel-identical (central viewport crop, AE=0). |
 | Live view restore | PASS: live before/after a compare cycle were pixel-identical (central viewport crop, AE=0). |
 | Panels unchanged | PASS: right panel, left panel and toolbar crops were pixel-identical between comparison and live (`AE=0`). |
+| Zoom/pan preserved | PASS: at 100 %, anchor `444,404` and zoom `1` were unchanged on both comparison and live restore; live before/after were byte-identical. |
+| No-render unchanged | PASS: unedited `Base` produced `compare: no render` on entry and release, no parameter apply and no preview update; the viewport was pixel-identical and only the badge changed. |
+| Edit during no-render | PASS: dragging Exposure while the no-render state was held cleared it, applied the edit and did not start a comparison render. |
+| No-render close | PASS: `Ctrl+W` while the no-render state was held closed the tab without a crash; reopening the image worked. |
 | Transition mask | PASS: an adjustment-only comparison used `ALLNORAW` with `rawStage=0`; `RT_COMPARE_FULL=1` used `ALL`. |
 | Transition latency | PASS: private 45.7 MP NEF, fit and 100 %, p50 97 ms and 91 ms against 1209 ms and 1215 ms with the full path. |
 | Fast/full parity | PASS: the comparison frame and live before/after frames were byte-identical between the fast and full paths at both zooms. |
