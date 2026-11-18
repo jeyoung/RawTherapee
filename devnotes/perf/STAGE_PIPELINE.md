@@ -13,10 +13,14 @@ looks the way it does.
 
 The specification is data only. `rtengine/stage/stage_pipeline.cc` builds it and
 `rtengine/stage/tests/stage_pipeline_test.cc` proves its shape. Every engine
-path executes this graph through `StageGraph::plan()`; the hand-ordered
-sequences and their `RT_STAGE_GRAPH`/`RT_PREVIEW_GRAPH` switches have been
-removed (see `STAGE_RUNTIME.md`). Fast export is the `-f` variant of export:
-it keeps the export consumer contract but has its own fixed node order.
+path uses `StageGraph::plan()` for planning; adapters still own execution
+details. In particular, crop analysis precedes raw-base finishing in the
+adapter even though the canonical graph lists `raw.base -> analysis`. See
+[the architecture review](ARCHITECTURE_REVIEW_2026-11-06.md#r2--p2-crop-graph-order-differs-from-execution-order)
+before using graph edges for generic scheduling or buffer lifetimes. The
+`RT_STAGE_GRAPH`/`RT_PREVIEW_GRAPH` switches have been removed (see
+`STAGE_RUNTIME.md`). Fast export is the `-f` variant of export: it keeps the
+export consumer contract but has its own fixed node order.
 
 ## Scope
 
